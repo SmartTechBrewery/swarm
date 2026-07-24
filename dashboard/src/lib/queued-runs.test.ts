@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { QueuedRun } from '@/types/runs.js';
 import {
 	groupQueuedRuns,
+	hideBoardRowsWithActiveRun,
 	queuedPhaseLabel,
 	queuedRunKey,
 	queuedWorkItemLabel,
@@ -329,6 +330,60 @@ describe('groupQueuedRuns', () => {
 		const rows = groupQueuedRuns([first, other, second]);
 		expect(rows.map((r) => r.representative.jobId)).toEqual(['job-first', 'job-other']);
 		expect(rows[0].boardDuplicateCount).toBe(1);
+	});
+});
+
+describe('hideBoardRowsWithActiveRun', () => {
+	const activeUrl = 'https://github.com/acme/widgets/issues/42';
+
+	it('hides a fresh board row whose work-item URL has an in-progress run', () => {
+		const rows = groupQueuedRuns([boardRun()]);
+		expect(hideBoardRowsWithActiveRun(rows, new Set([activeUrl]))).toEqual([]);
+	});
+
+	it('keeps a fresh board row whose work-item URL is not in the active set', () => {
+		const rows = groupQueuedRuns([boardRun()]);
+		const result = hideBoardRowsWithActiveRun(
+			rows,
+			new Set(['https://github.com/acme/widgets/issues/99']),
+		);
+		expect(result).toHaveLength(1);
+		expect(result[0].representative.jobId).toBe('job-board');
+	});
+
+	it('keeps a board row that owns a runId even when its URL is active', () => {
+		const rows = groupQueuedRuns([boardRun({ jobId: 'job-deferred', runId: 'run-1' })]);
+		const result = hideBoardRowsWithActiveRun(rows, new Set([activeUrl]));
+		expect(result).toHaveLength(1);
+		expect(result[0].representative.jobId).toBe('job-deferred');
+	});
+
+	it('keeps an unresolved board row (no work-item URL to match on)', () => {
+		const rows = groupQueuedRuns([boardRun({ workItemUrl: undefined })]);
+		// A non-empty set that (by construction) cannot contain an undefined URL.
+		const result = hideBoardRowsWithActiveRun(rows, new Set([activeUrl]));
+		expect(result).toHaveLength(1);
+	});
+
+	it('keeps a non-board (github) row even against a non-empty active set', () => {
+		const rows = groupQueuedRuns([githubRun({ workItemUrl: activeUrl })]);
+		const result = hideBoardRowsWithActiveRun(rows, new Set([activeUrl]));
+		expect(result).toHaveLength(1);
+	});
+
+	it('returns rows unchanged when the active set is empty', () => {
+		const rows = groupQueuedRuns([boardRun()]);
+		const result = hideBoardRowsWithActiveRun(rows, new Set());
+		expect(result).toBe(rows);
+	});
+
+	it('hides a folded board group as a single unit when the representative URL is active', () => {
+		const reordered = boardRun({ jobId: 'job-reordered', workItemNodeId: 'PVTI_card_x' });
+		const edited = boardRun({ jobId: 'job-edited', workItemNodeId: 'PVTI_card_x' });
+		const rows = groupQueuedRuns([reordered, edited]);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].boardDuplicateCount).toBe(1);
+		expect(hideBoardRowsWithActiveRun(rows, new Set([activeUrl]))).toEqual([]);
 	});
 });
 

@@ -223,6 +223,48 @@ export function groupQueuedRuns(items: QueuedRun[]): QueuedDisplayRow[] {
 	return rows;
 }
 
+/**
+ * Guards mirroring {@link boardGroupKey} for a *fresh* board display row — a
+ * `github-projects` dispatch still hinting `board` with no backing run — but
+ * joined on the resolved backing work-item URL (the one field a `runs.queued`
+ * row and a `runs.list` row share) instead of the opaque board node id.
+ */
+function isFreshBoardRowWithActiveRun(
+	row: QueuedDisplayRow,
+	activeWorkItemUrls: ReadonlySet<string>,
+): boolean {
+	const item = row.representative;
+	if (item.type !== 'github-projects') return false;
+	if (item.phaseHint !== 'board') return false;
+	if (item.runId) return false;
+	if (!item.workItemUrl) return false;
+	return activeWorkItemUrls.has(item.workItemUrl);
+}
+
+/**
+ * Hide a fresh board queued row whose card already has a Planning/Implementation
+ * run *in progress* (issue #421) — the fan-out one step past #366/#387. One
+ * board-card interaction enqueues several dispatches for the same card; when the
+ * worker claims one it leaves the waiting set and becomes a run in the Runs
+ * table, while its leftover sibling dispatches stay `pending` and linger here
+ * until they no-op at claim time. {@link groupQueuedRuns} can only dedupe within
+ * the queued list, so it can't see the running run (a claimed dispatch is no
+ * longer in `runs.queued`). This joins the two read models by exact backing
+ * work-item URL and drops the duplicate *display* row only — it never touches
+ * the dispatch flow (the leftover siblings still no-op harmlessly at claim time).
+ *
+ * Only fresh board rows are eligible (same guards as {@link boardGroupKey}): a
+ * row that owns a `runId` (its own deferred/continuation run), an unresolved row
+ * (no URL to match on), and any non-board row are always kept.
+ */
+export function hideBoardRowsWithActiveRun(
+	rows: QueuedDisplayRow[],
+	activeWorkItemUrls: ReadonlySet<string>,
+): QueuedDisplayRow[] {
+	if (activeWorkItemUrls.size === 0) return rows;
+	return rows.filter((row) => !isFreshBoardRowWithActiveRun(row, activeWorkItemUrls));
+}
+
 const REVIEW_GATE_SOURCE_LABELS: Record<QueuedReviewGateSourceEvent, string> = {
 	pull_request: 'Pull request',
 	check_suite: 'Check suite',
