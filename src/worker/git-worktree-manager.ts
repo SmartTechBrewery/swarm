@@ -20,10 +20,13 @@ import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
+import { hasLiveWorktreeLeaseOwner } from '../worktree/lease-liveness.js';
 import { BlockedRecoveryError, evaluateWorktreeReclaim } from '../worktree/reclaim.js';
 import {
 	claimWorktreeLease,
+	readWorktreeLease,
 	releaseWorktreeLease,
+	takeOverWorktreeLease,
 	tryClaimWorktreeLease,
 } from '../worktree/worktree-lease.js';
 
@@ -107,6 +110,14 @@ export interface ProvisionOptions {
 	 * best-effort — a failure (e.g. no remote yet) is logged, not fatal.
 	 */
 	fetch?: boolean;
+	/**
+	 * The run this provisioning belongs to. Used only by the collision gate, to
+	 * tell a lease held by a *different* live run from an orphan left behind by a
+	 * crashed or already-settled one — including this run's own dead previous
+	 * attempt (issue #427). Omitting it keeps the strictly fail-closed behaviour:
+	 * any held lease blocks.
+	 */
+	runId?: string;
 }
 
 /** Manages the git-worktree lifecycle for one SWARM project. Construct one per project. */
@@ -141,6 +152,11 @@ export class GitWorktreeManager {
 	 * removed and provisioning continues under a held lease; anything protected
 	 * throws {@link BlockedRecoveryError} so the run settles terminally instead of
 	 * clobbering work.
+	 *
+	 * A lease that is held but has **no live owner** — a crashed or already-settled
+	 * run never released it — is taken over rather than treated as `live-leased`
+	 * (issue #427); the checkout behind it then goes through the very same reclaim
+	 * gate, so dirty/unpushed/pinned work is still retained, never force-removed.
 	 */
 	async provision(taskId: string, options: ProvisionOptions = {}): Promise<WorktreeHandle> {
 		await this.assertGitRepo();
@@ -151,7 +167,7 @@ export class GitWorktreeManager {
 
 		const path = this.worktreePath(taskId);
 		const leaseToken = randomUUID();
-		const acquired = await tryClaimWorktreeLease(this.project.id, taskId, leaseToken);
+		const acquired = await this.acquireProvisionLease(taskId, leaseToken, options.runId);
 		if (!acquired) {
 			throw new BlockedRecoveryError(
 				'live-leased',
@@ -199,6 +215,42 @@ export class GitWorktreeManager {
 			await releaseWorktreeLease(this.project.id, taskId, leaseToken);
 			throw err;
 		}
+	}
+
+	/**
+	 * Hold the task lease under `token` for the duration of a provision, or report
+	 * that someone else legitimately owns it.
+	 *
+	 * The plain `SET NX` claim is tried first, so the uncontended and the genuinely
+	 * contended cases behave exactly as they did before #427. Only when that fails
+	 * does this ask whether the lease still *has* an owner: with a live run or an
+	 * executing dispatch for the task, it blocks as before; with none, the lease is
+	 * an orphan and is adopted by compare-and-set against the token actually
+	 * observed — so a provisioner that claimed it in between still wins the race and
+	 * this caller blocks instead. Every uncertain outcome returns `false`.
+	 */
+	private async acquireProvisionLease(
+		taskId: string,
+		token: string,
+		runId?: string,
+	): Promise<boolean> {
+		if (await tryClaimWorktreeLease(this.project.id, taskId, token)) return true;
+		if (await hasLiveWorktreeLeaseOwner(this.project.id, taskId, runId)) return false;
+
+		const staleToken = await readWorktreeLease(this.project.id, taskId);
+		// Expired or released between the claim and the read — it is simply free now.
+		if (staleToken === null) return await tryClaimWorktreeLease(this.project.id, taskId, token);
+
+		const takenOver = await takeOverWorktreeLease(this.project.id, taskId, staleToken, token);
+		if (takenOver) {
+			logger.warn('worktree lease: took over an orphaned lease with no live owner', {
+				projectId: this.project.id,
+				taskId,
+				staleToken,
+				runId,
+			});
+		}
+		return takenOver;
 	}
 
 	/**

@@ -111,6 +111,69 @@ export async function releaseWorktreeLease(
 }
 
 /**
+ * The token currently holding the lease, or `null` when it is free. Fails CLOSED
+ * for its one caller (the collision gate's stale-lease take-over, issue #427): a
+ * Redis error returns `null`, which makes the take-over fall back to a plain
+ * `SET NX` claim rather than compare-and-set against a token it never read.
+ */
+export async function readWorktreeLease(projectId: string, taskId: string): Promise<string | null> {
+	const namespacedKey = `${KEY_NS}${buildLeaseKey(projectId, taskId)}`;
+	try {
+		return await getRedis().get(namespacedKey);
+	} catch (err) {
+		logger.error('worktree lease: read failed', { projectId, taskId, error: String(err) });
+		return null;
+	}
+}
+
+/**
+ * Compare-and-set take-over: replace `expectedToken` with `token` (on a fresh
+ * TTL) only while the lease still holds `expectedToken`. Used by the collision
+ * gate to adopt an *orphaned* lease — one whose owning run/dispatch is provably
+ * gone (issue #427) — without ever stealing one a concurrent provisioner
+ * legitimately claimed in the meantime.
+ *
+ * Fails CLOSED: `false` on a token mismatch, a vanished key, or a Redis error,
+ * so an uncertain take-over blocks instead of reclaiming a checkout.
+ */
+export async function takeOverWorktreeLease(
+	projectId: string,
+	taskId: string,
+	expectedToken: string,
+	token: string,
+): Promise<boolean> {
+	const namespacedKey = `${KEY_NS}${buildLeaseKey(projectId, taskId)}`;
+	try {
+		const script = `
+			if redis.call('get', KEYS[1]) == ARGV[1] then
+				redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3])
+				return 1
+			else
+				return 0
+			end
+		`;
+		const result = await getRedis().eval(
+			script,
+			1,
+			namespacedKey,
+			expectedToken,
+			token,
+			String(LEASE_TTL_SEC),
+		);
+		return result === 1;
+	} catch (err) {
+		logger.error('worktree lease: take-over failed — failing closed (not acquired)', {
+			projectId,
+			taskId,
+			expectedToken,
+			token,
+			error: String(err),
+		});
+		return false;
+	}
+}
+
+/**
  * Fails CLOSED the opposite way from the dispatch dedups: on a Redis error this
  * returns `true` (treat as leased/in-flight), because for retention the unsafe
  * outcome is deleting something still in use, not skipping something that's

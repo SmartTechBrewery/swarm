@@ -263,7 +263,7 @@ export async function runRespondToCiPhase(
 		prBranch,
 		false,
 		resumeSessionId,
-		() => worktrees.provision(taskId, { createBranch: false, branch: prBranch }),
+		() => worktrees.provision(taskId, { createBranch: false, branch: prBranch, runId }),
 		resumeDelivery,
 		recoveryMode,
 		project.id,

@@ -12,7 +12,21 @@
  * durable record.
  */
 
-import { and, asc, desc, eq, gt, inArray, lte, ne, notInArray, sql } from 'drizzle-orm';
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNull,
+	lte,
+	ne,
+	notInArray,
+	or,
+	type SQL,
+	sql,
+} from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import { isSessionLive } from '../../identity/worker-session.js';
 import type { SwarmJob } from '../../queue/jobs.js';
@@ -43,6 +57,18 @@ export const ACTIVE_DISPATCH_STATES = [
 	'leased',
 	'running',
 	'retry-scheduled',
+] as const satisfies readonly DispatchState[];
+
+/**
+ * States in which a worker is actually executing against the task's checkout —
+ * the dispatch-side half of the worktree-lease liveness signal (issue #427).
+ * `pending`/`retry-scheduled` are deliberately excluded: a queued attempt holds
+ * no checkout, and counting it as an owner would just re-create the wedge the
+ * liveness check exists to break.
+ */
+export const EXECUTING_DISPATCH_STATES = [
+	'leased',
+	'running',
 ] as const satisfies readonly DispatchState[];
 
 /** States awaiting a wake-up — what the Queue API/UI shows. */
@@ -677,6 +703,38 @@ export async function getActiveDispatchByRunId(runId: string): Promise<DispatchR
 		.where(and(eq(dispatches.runId, runId), inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES])))
 		.limit(1);
 	return rows[0];
+}
+
+/**
+ * Whether some *other* attempt is mid-execution against this task's checkout —
+ * the dispatch-side worktree-lease liveness signal (issue #427). Counts only
+ * {@link EXECUTING_DISPATCH_STATES}, and skips the asking attempt's own run
+ * (which is already `running` by the time it provisions).
+ *
+ * A row whose `runId` is `null` always counts as live: a dispatch executing
+ * without a run row is degraded, not idle, and still owns the checkout. That leg
+ * is explicit because SQL `NULL <> 'x'` is unknown, not true, so `ne` alone would
+ * silently drop it.
+ */
+export async function hasExecutingDispatchForTask(
+	projectId: string,
+	taskId: string,
+	excludeRunId?: string,
+): Promise<boolean> {
+	const conditions: (SQL | undefined)[] = [
+		eq(dispatches.projectId, projectId),
+		eq(dispatches.taskId, taskId),
+		inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
+	];
+	if (excludeRunId) {
+		conditions.push(or(isNull(dispatches.runId), ne(dispatches.runId, excludeRunId)));
+	}
+	const rows = await getDb()
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		.where(and(...conditions))
+		.limit(1);
+	return rows.length > 0;
 }
 
 /**

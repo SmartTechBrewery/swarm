@@ -399,7 +399,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		headSha,
 		true,
 		resumeSessionId,
-		() => worktrees.provision(taskId, { detach: true, baseBranch: headSha }),
+		() => worktrees.provision(taskId, { detach: true, baseBranch: headSha, runId }),
 		resumeDelivery,
 		recoveryMode,
 		project.id,

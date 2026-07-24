@@ -131,6 +131,37 @@ export async function hasResumableDeferredRun(projectId: string, taskId: string)
 	return rows.length > 0;
 }
 
+/**
+ * Whether some *other* run is currently executing this task — the run-side half
+ * of the worktree-lease liveness signal (issue #427). A lease is only honoured as
+ * `live-leased` while an owner like this exists; without one it is an orphan left
+ * by a crashed or already-settled run and the collision gate may adopt it.
+ *
+ * `excludeRunId` is the asking attempt's own run, which is already `running` by
+ * the time it provisions, so an un-excluded query would always see itself. A
+ * zombie `running` row (worker killed without settling it) deliberately still
+ * counts as live here — `failOrphanedRunningRuns`/`failStaleRunningRuns` reap
+ * those, after which the next attempt recovers.
+ */
+export async function hasRunningRunForTask(
+	projectId: string,
+	taskId: string,
+	excludeRunId?: string,
+): Promise<boolean> {
+	const conditions = [
+		eq(runs.projectId, projectId),
+		eq(runs.taskId, taskId),
+		eq(runs.status, 'running'),
+	];
+	if (excludeRunId) conditions.push(ne(runs.id, excludeRunId));
+	const rows = await getDb()
+		.select({ id: runs.id })
+		.from(runs)
+		.where(and(...conditions))
+		.limit(1);
+	return rows.length > 0;
+}
+
 export interface CompleteRunInput {
 	status: 'completed' | 'failed' | 'deferred';
 	engine?: AgentCli;
