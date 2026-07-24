@@ -137,4 +137,98 @@ describe('reconcileTerminatedWorktree', () => {
 		expect(result).toEqual({ outcome: 'blocked', blockedReason: 'dirty' });
 		expect(manager.cleanedUpTasks).toEqual([]);
 	});
+
+	// The reset path's opt-in capabilities (issue #424). Every case above passes
+	// no options and must keep behaving exactly as before.
+	describe('reset options', () => {
+		it('reclaims a stale lease no live run owns and removes the checkout', async () => {
+			isWorktreeLeasedMock.mockResolvedValue(true);
+			const manager = makeManager();
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, false, {
+				hasLiveOwner: async () => false,
+			});
+
+			expect(result).toEqual({ outcome: 'removed', staleLeaseReleased: true });
+			expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('p1', '10');
+			expect(manager.cleanedUpTasks).toEqual(['10']);
+		});
+
+		it('honours a lease a live run still owns', async () => {
+			isWorktreeLeasedMock.mockResolvedValue(true);
+			const manager = makeManager();
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, false, {
+				hasLiveOwner: async () => true,
+			});
+
+			expect(result).toEqual({ outcome: 'blocked', blockedReason: 'live-leased' });
+			expect(manager.cleanedUpTasks).toEqual([]);
+		});
+
+		it('still honours a lease when a live-leased checkout is force-reset', async () => {
+			// `force` covers this run's own wedged state, not yanking a live agent's checkout.
+			isWorktreeLeasedMock.mockResolvedValue(true);
+			const manager = makeManager();
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, false, {
+				hasLiveOwner: async () => true,
+				discardProtectedWork: true,
+			});
+
+			expect(result).toEqual({ outcome: 'blocked', blockedReason: 'live-leased' });
+			expect(manager.cleanedUpTasks).toEqual([]);
+		});
+
+		it('discards a dirty checkout when the operator forced it', async () => {
+			const manager = makeManager();
+			manager.clean = false;
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, true, {
+				discardProtectedWork: true,
+			});
+
+			expect(result).toEqual({ outcome: 'removed', discarded: 'dirty' });
+			expect(manager.cleanedUpTasks).toEqual(['10']);
+		});
+
+		it('discards unpushed commits when the operator forced it', async () => {
+			const manager = makeManager();
+			manager.unpushed = true;
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, true, {
+				discardProtectedWork: true,
+			});
+
+			expect(result).toEqual({ outcome: 'removed', discarded: 'unpushed' });
+			expect(manager.cleanedUpTasks).toEqual(['10']);
+		});
+
+		it('reclaims a stale lease and retains protected work when the reset was not forced', async () => {
+			isWorktreeLeasedMock.mockResolvedValue(true);
+			const manager = makeManager();
+			manager.clean = false;
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, false, {
+				hasLiveOwner: async () => false,
+			});
+
+			expect(result).toEqual({ outcome: 'blocked', blockedReason: 'dirty' });
+			expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('p1', '10');
+			expect(manager.cleanedUpTasks).toEqual([]);
+		});
+
+		it('reports the first blocked reason it discarded when both gates fail', async () => {
+			const manager = makeManager();
+			manager.clean = false;
+			manager.unpushed = true;
+
+			const result = await reconcileTerminatedWorktree(manager, 'p1', '10', null, true, {
+				discardProtectedWork: true,
+			});
+
+			expect(result).toEqual({ outcome: 'removed', discarded: 'dirty' });
+			expect(manager.cleanedUpTasks).toEqual(['10']);
+		});
+	});
 });
