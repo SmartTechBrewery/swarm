@@ -58,8 +58,12 @@ import {
 	evaluateWorkerEligibility,
 	type IneligibilityReason,
 	resolveTargetCli,
+	type WorkerAvailability,
 } from '../identity/worker-eligibility.js';
-import { listProjectDispatchCandidates } from '../identity/worker-enrollment-service.js';
+import {
+	listProjectDispatchCandidates,
+	type WorkerDispatchCandidate,
+} from '../identity/worker-enrollment-service.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 
 /**
@@ -133,6 +137,24 @@ export interface DispatchGateInput {
 	pm?: Pick<PMProvider, 'type' | 'supportsAssignees'>;
 }
 
+/** Per-call tuning for {@link evaluateDispatchEligibility}. */
+export interface DispatchGateOptions {
+	/**
+	 * The **transport-connectivity** predicate (issue #407, phase 4). When the
+	 * control plane dispatches over the worker transport, a worker is reachable
+	 * only if it holds a live `/worker/stream` socket on *this* router process
+	 * (`src/router/worker-connections.ts` `isWorkerConnected`) — a distinct fact
+	 * from the DB `worker_sessions` lease liveness the availability snapshot
+	 * already carries (a lease can read live while the socket is on another router
+	 * or already gone). When supplied, a candidate counts as `connected` only if it
+	 * is *both* DB-live and socket-connected here, so a DB-live-but-not-connected
+	 * worker is never selected — it reports `worker-unavailable` and the durable
+	 * dispatch stays pending, exactly as an offline worker does. Omitted for the
+	 * in-process path, which reads connectivity from the lease alone (unchanged).
+	 */
+	isWorkerConnected?: (workerId: string) => boolean;
+}
+
 /**
  * How informative each ineligibility reason is when several candidates failed
  * for different reasons — highest first. `worker-unavailable` wins because it is
@@ -179,11 +201,33 @@ function ineligibilityMessage(
 }
 
 /**
+ * The availability the predicate judges, with transport connectivity folded in
+ * (issue #407): when a connectivity predicate is supplied a candidate is
+ * `connected` only if its DB lease is live *and* it holds a socket on this router,
+ * so the deterministic first-free/affinity walk skips a live-lease-only worker as
+ * `worker-unavailable` rather than choosing an unreachable one. Without a
+ * predicate the availability snapshot is returned untouched (the in-process path).
+ */
+function resolveAvailability(
+	candidate: WorkerDispatchCandidate,
+	isWorkerConnected: ((workerId: string) => boolean) | undefined,
+): WorkerAvailability {
+	if (!isWorkerConnected) return candidate.availability;
+	return {
+		...candidate.availability,
+		connected: candidate.availability.connected && isWorkerConnected(candidate.worker.id),
+	};
+}
+
+/**
  * Decide whether — and where — this dispatch may run. Reads only; it never
  * mutates an enrollment, session, or run, and it is safe to call again on every
  * retry (which is exactly how revocation between attempts takes effect).
  */
-export async function evaluateDispatchEligibility(input: DispatchGateInput): Promise<GateDecision> {
+export async function evaluateDispatchEligibility(
+	input: DispatchGateInput,
+	options: DispatchGateOptions = {},
+): Promise<GateDecision> {
 	const candidates = await listProjectDispatchCandidates(input.projectId);
 	// No enrollments: this project is not federated, so there is no other user's
 	// machine to gate. The local worker runs it, exactly as before #130.
@@ -221,7 +265,7 @@ export async function evaluateDispatchEligibility(input: DispatchGateInput): Pro
 			const verdict = evaluateWorkerEligibility({
 				worker: candidate.worker,
 				enrollment: candidate.enrollment,
-				availability: candidate.availability,
+				availability: resolveAvailability(candidate, options.isWorkerConnected),
 				target,
 				phaseDefaultCli: input.phaseDefaultCli,
 			});

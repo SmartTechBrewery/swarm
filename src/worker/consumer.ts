@@ -128,6 +128,7 @@ import {
 	resolveDependencyRecheckIntervalMs,
 } from './dependency-recheck.js';
 import {
+	type DispatchGateOptions,
 	type DispatchSelection,
 	evaluateDispatchEligibility,
 	type GateDecision,
@@ -154,6 +155,7 @@ import {
 import {
 	beginRunCancellationTracking,
 	linkRunAbortController,
+	RunTerminatedError,
 	unregisterRunController,
 } from './run-cancellation.js';
 import { PHASE_DEFAULT_CLI, phaseAgentConfig, resolveTargetPolicy } from './target-policy.js';
@@ -984,7 +986,7 @@ function resolveReasoning(
  * phase invocation — so all three agree on the *same* target instead of each
  * re-deriving one (issue #339's ordered-target addendum).
  */
-interface PhaseResolution {
+export interface PhaseResolution {
 	/** Global per-CLI default models — the tier between project and coded defaults. */
 	globalDefaults: AgentDefaults | undefined;
 	/** The CLIs this worker can run, for local capability routing (issue #346). */
@@ -997,6 +999,62 @@ interface PhaseResolution {
 	selection?: DispatchSelection;
 	/** Authenticated session that claimed `selection`; present exactly when selection is bound. */
 	executionIdentity?: WorkerExecutionIdentity;
+}
+
+/**
+ * The already-resolved inputs the pluggable phase executor runs from — exactly
+ * the arguments {@link runPhase} takes, plus the claimed `dispatch` (so the
+ * control-plane transport executor can build and push a `TaskAssignment` keyed by
+ * `dispatch.id`). Issue #407 splits `processJob` into a dispatcher half (claim →
+ * trigger → gates → bind → run-row → settle, all shared) and this one pluggable
+ * step: the in-process executor ignores `dispatch` and calls `runPhase`; the
+ * control-plane executor (`src/router/dispatcher.ts`) composes and pushes the
+ * assignment and awaits the worker's `TaskExecutionResult`, adapting it back to a
+ * {@link PhaseRunResult} (or throwing so the shared failure path settles it).
+ */
+export interface DispatchPhaseContext {
+	trigger: TriggerResult;
+	project: ProjectConfig;
+	resolution: PhaseResolution;
+	job: SwarmJob;
+	runId: string | undefined;
+	signal: AbortSignal;
+	implementationUnplanned: boolean;
+	dispatch: DispatchRow;
+}
+
+/**
+ * Collaborators that let the control-plane transport path (issue #407) reuse
+ * {@link processJob} verbatim while diverging only where it must. Every field is
+ * optional and the defaults reproduce today's in-process behavior exactly, so the
+ * host worker's call is unchanged.
+ */
+export interface ProcessJobDeps {
+	/**
+	 * Options folded into the eligibility gate — the transport path passes a
+	 * connectivity predicate so only socket-connected workers are selected
+	 * (`src/worker/eligibility-gate.ts`).
+	 */
+	gateOptions?: DispatchGateOptions;
+	/**
+	 * Require a selected worker. In transport mode there is no local executor, so
+	 * an unfederated/single-user project (the gate returns no selection) has
+	 * nowhere to run: it defers durably as a token-free `worker-eligibility` wait
+	 * rather than running on the host.
+	 */
+	federatedOnly?: boolean;
+	/**
+	 * Resolve the execution identity a selected worker is bound with. Default: the
+	 * host's own identity (which must equal the selection — the in-process host is
+	 * the selected worker). The transport path resolves the *selected* worker's
+	 * live session identity instead, so the control plane binds the fenced claim on
+	 * that worker's behalf.
+	 */
+	resolveBindIdentity?: (
+		selection: DispatchSelection,
+	) => Promise<WorkerExecutionIdentity | undefined>;
+	/** Run the resolved phase. Default: {@link runPhase} (in-process execution). */
+	executePhase?: (context: DispatchPhaseContext) => Promise<PhaseRunResult>;
 }
 
 /** Adapt the federated worker+target selection to the shared target-routing shape. */
@@ -2339,6 +2397,7 @@ async function handlePhaseFailure(
 	trigger: TriggerResult,
 	project: ProjectConfig,
 	runId: string | undefined,
+	deps: ProcessJobDeps = {},
 ): Promise<JobOutcome> {
 	// Delivery errors deliberately wrap a resumable checkpoint around the
 	// underlying push/hook/API failure. Preserve that cause chain in the run row,
@@ -2346,11 +2405,38 @@ async function handlePhaseFailure(
 	// "delivery deferred" wrapper.
 	const error = describeError(err);
 
+	// A control-plane transport settle raised by a worker's `cancelled` result
+	// (issue #407): the worker already cleared the durable cancellation marker in
+	// its own cleanup, so the `isRunCancellationRequested` check below cannot see
+	// it — route it through the same terminal, user-initiated failure as the
+	// in-process cancellation (never a deferral, which would re-run the killed
+	// phase). Placed first so it wins before any deferrable-failure classification.
+	if (err instanceof RunTerminatedError) {
+		logger.info(`Phase cancelled after cancellation request - ${phaseLabel(trigger.phase)}`, {
+			projectId: project.id,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			runId,
+		});
+		return {
+			status: 'phase-failed',
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			error: error || RUN_CANCELLED_MESSAGE,
+			failureDiagnosis: diagnoseFailure({ knownCondition: 'user-terminated' }),
+			cancelled: true,
+		};
+	}
+
 	// If the failure looks like a missing binary, permission issue, or authentication/login failure,
-	// run capability discovery immediately to refresh the dashboard status.
+	// run capability discovery immediately to refresh the dashboard status. Skipped
+	// on the control-plane dispatch path (issue #407): the CLIs run on the remote
+	// worker, not here, so probing the control plane's own PATH would record a
+	// bogus "unavailable" for a failure that has nothing to do with its host.
 	const isLaunchOrAuthFailure =
-		isLaunchOrAuthenticationFailure(error) ||
-		(err instanceof AgentRunError && err.failure.kind === 'error');
+		!deps.executePhase &&
+		(isLaunchOrAuthenticationFailure(error) ||
+			(err instanceof AgentRunError && err.failure.kind === 'error'));
 
 	if (isLaunchOrAuthFailure) {
 		void discoverCliQuotas()
@@ -2506,6 +2592,7 @@ async function gateDispatch(
 	trigger: TriggerResult,
 	job: SwarmJob,
 	implementationUnplanned: boolean,
+	gateOptions?: DispatchGateOptions,
 ): Promise<DispatchSelection | undefined> {
 	// Single-user mode routes every phase through the implicit local host worker
 	// (issue #373): skip the federated roster/assignee evaluation entirely and
@@ -2518,16 +2605,19 @@ async function gateDispatch(
 	const workItem = 'workItem' in trigger ? trigger.workItem : undefined;
 	let decision: GateDecision;
 	try {
-		decision = await evaluateDispatchEligibility({
-			projectId: project.id,
-			targets: resolveTargetPolicy(phaseConfig, job).targets,
-			phaseDefaultCli: PHASE_DEFAULT_CLI[trigger.phase],
-			workItem,
-			// Only an item that actually names an assignee needs the provider (for
-			// its `type`, to resolve the identity link) — an unassigned item takes
-			// the unassigned path without one being constructed.
-			pm: workItem?.assignees.length ? createGitHubProjectsProvider(project) : undefined,
-		});
+		decision = await evaluateDispatchEligibility(
+			{
+				projectId: project.id,
+				targets: resolveTargetPolicy(phaseConfig, job).targets,
+				phaseDefaultCli: PHASE_DEFAULT_CLI[trigger.phase],
+				workItem,
+				// Only an item that actually names an assignee needs the provider (for
+				// its `type`, to resolve the identity link) — an unassigned item takes
+				// the unassigned path without one being constructed.
+				pm: workItem?.assignees.length ? createGitHubProjectsProvider(project) : undefined,
+			},
+			gateOptions,
+		);
 	} catch (err) {
 		throw new WorkerIneligibleError(
 			'worker-unavailable',
@@ -2622,6 +2712,7 @@ export async function processJob(
 	registry: TriggerRegistry,
 	signal?: AbortSignal,
 	executionIdentity?: WorkerExecutionIdentity,
+	deps: ProcessJobDeps = {},
 ): Promise<JobOutcome> {
 	// Claim the durable dispatch behind this wake-up before acting on anything
 	// (issue #284): a cancelled/completed/superseded dispatch refuses the claim,
@@ -2790,14 +2881,39 @@ export async function processJob(
 		// take this phase — and on which configured target — *before* anything is
 		// provisioned or invoked. Runs on every (re)dispatch, so a revocation between
 		// attempts blocks the next one; it never touches a run already in flight.
-		const selection = await gateDispatch(project, trigger, job, implementationUnplanned);
+		const selection = await gateDispatch(
+			project,
+			trigger,
+			job,
+			implementationUnplanned,
+			deps.gateOptions,
+		);
+		// Control-plane transport dispatch has no local executor (issue #407): an
+		// unfederated/single-user project resolves no selection and has nowhere to
+		// run, so defer durably rather than falling through to the host's local path.
+		// The throw lands in the catch below as a token-free `worker-eligibility`
+		// wait — the durable dispatch stays pending exactly as the no-eligible-worker
+		// path does — and re-checks until a worker enrolls and connects.
+		if (!selection && deps.federatedOnly) {
+			throw new WorkerIneligibleError(
+				'worker-unavailable',
+				`No eligible, connected worker is enrolled for project '${project.id}'. Control-plane dispatch requires one; waiting for a worker to enroll and connect.`,
+			);
+		}
+		// Bind on the selected worker's identity: the host's own for the in-process
+		// path, or the selected worker's live session for the control-plane transport
+		// path, which claims the fenced execution slot on that worker's behalf.
+		const bindIdentity =
+			selection && deps.resolveBindIdentity
+				? await deps.resolveBindIdentity(selection)
+				: executionIdentity;
 		const resolution: PhaseResolution = {
 			globalDefaults,
 			availableClis,
 			selection,
-			executionIdentity: selection ? executionIdentity : undefined,
+			executionIdentity: selection ? bindIdentity : undefined,
 		};
-		if (selection) await bindSelectedWorker(dispatch, selection, executionIdentity);
+		if (selection) await bindSelectedWorker(dispatch, selection, bindIdentity);
 		if (!selection) {
 			slot = await acquireProjectSlot(project.id, project.maxConcurrentJobs);
 			if (!slot.acquired) return handleConcurrencyDeferral(dispatch, job, trigger, project);
@@ -2826,15 +2942,31 @@ export async function processJob(
 		// landed (a deferred run terminated as its retry was dequeued).
 		await beginRunCancellationTracking(runId, runAbort);
 
-		const result = await runPhase(
-			trigger,
-			project,
-			resolution,
-			job,
-			runId,
-			runAbort.signal,
-			implementationUnplanned,
-		);
+		// Run the resolved phase: in-process (the default {@link runPhase}) or, when
+		// the caller injects one, the control-plane transport executor that pushes a
+		// `TaskAssignment` to the selected worker and awaits its result (issue #407).
+		// Everything around this call — run-row lifecycle, dispatch settle, self-
+		// enqueue, merge automation, cancellation — is shared across both paths.
+		const result = deps.executePhase
+			? await deps.executePhase({
+					trigger,
+					project,
+					resolution,
+					job,
+					runId,
+					signal: runAbort.signal,
+					implementationUnplanned,
+					dispatch,
+				})
+			: await runPhase(
+					trigger,
+					project,
+					resolution,
+					job,
+					runId,
+					runAbort.signal,
+					implementationUnplanned,
+				);
 		// A run the harness killed for exceeding its wall-clock timeout is a terminal
 		// failure, even in the rare case the agent trapped SIGTERM and still exited 0
 		// before SIGKILL (so the phase read a stale/partial hand-off and "succeeded").
@@ -2897,7 +3029,7 @@ export async function processJob(
 			durationMs: result.agent.durationMs,
 		};
 	} catch (err) {
-		const outcome = await handlePhaseFailure(err, job, trigger, project, runId);
+		const outcome = await handlePhaseFailure(err, job, trigger, project, runId, deps);
 		preserveCancellationMarker = outcome.status === 'phase-deferred';
 		// Reconcile the terminated run's checkout before the `finally` clears
 		// cancellation tracking and releases the project slot.

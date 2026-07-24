@@ -166,6 +166,15 @@ export function succeededResult(
 		signal: result.agent.signal,
 		timedOut: result.agent.timedOut,
 		durationMs: result.agent.durationMs,
+		// The terminal PM/verdict context the control plane settles on (issue #407):
+		// a PM-driven phase's auto-advance status drives the next phase's
+		// self-enqueue on the control plane; a Review run's verdict/ordinal/outcome
+		// are persisted on its run row and gate merge automation. Absent for phases
+		// that produce none.
+		movedTo: result.movedTo,
+		verdict: result.verdict,
+		reviewOrdinal: result.reviewOrdinal,
+		reviewAutomationOutcome: result.automationOutcome,
 	};
 }
 

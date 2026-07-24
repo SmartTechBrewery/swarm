@@ -78,17 +78,43 @@ eligibility gate already consumes that signal. The in-process host worker
 directly — the transport is a second front door to the same service, so the
 single-user/same-machine path is unaffected.
 
-### §2 — Split delivery (future work, not this phase)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
-running them without direct DB/Redis access (`TaskAssignment` →
-`TaskExecutionResult`/`StreamLog`) — is deferred to a later issue. When it lands,
-its frames join the two Zod unions in `src/transport/protocol.ts`
-(`WorkerStreamMessageSchema` / `ControlPlaneMessageSchema`), which this phase
-leaves scoped to the handshake + heartbeat/ack/disconnect control frames. The
-worker-side client (connect with only the credential, reconnect, local CLI
-discovery) and the tunnel/env-var docs (`SWARM_CONTROL_PLANE_URL`) are Phase 2 of
-issue #391.
+running them without direct Redis access (`TaskAssignment` →
+`TaskExecutionResult`/`StreamLog`) — is now built, gated behind
+`SWARM_DISPATCH_MODE=transport` (default `in-process`, so nothing changes until an
+operator opts in). It landed across four phases:
+
+1. **#392** — the `TaskAssignment` frame + a non-secret payload builder
+   (`src/transport/assignment.ts`): the frame carries the non-secret project-config
+   slice, resolved target branch, and composed system prompt — never a persona
+   token.
+2. **#405** — the connected-worker registry + server→worker push primitive
+   (`src/router/worker-connections.ts`): `registerConnection`/`isWorkerConnected`/
+   `sendToWorker`, keyed by the live `/worker/stream` socket.
+3. **#406** — the worker-side phase runner (`src/worker/transport-client.ts`):
+   receive a pushed `TaskAssignment`, run the phase via the shared `runAssignedPhase`
+   switch, stream `StreamLog`/`TaskProgress`, and report a terminal
+   `TaskExecutionResult`.
+4. **#407** — the **control-plane dispatcher** (`src/router/dispatcher.ts`): the
+   router hosts the BullMQ consumer + ADR-001 eligibility gate and, on selecting a
+   connected eligible worker, composes the prompt/branch server-side, pushes the
+   assignment, and settles the durable dispatch on the worker's result. `processJob`
+   (`src/worker/consumer.ts`) is split into a shared dispatcher half and a pluggable
+   phase-execution step (`ProcessJobDeps`), so the in-process and transport paths
+   share claim → gate → bind → run-row → settle verbatim; only the execution step
+   (run locally vs. push-and-await) and the worker-bind identity differ. With no
+   eligible/connected worker the dispatch stays durably `pending` via the existing
+   `WorkerIneligibleError` token-free deferral.
+
+All frames now populate the two Zod unions in `src/transport/protocol.ts`
+(`WorkerStreamMessageSchema` / `ControlPlaneMessageSchema`). The worker-side
+session client (connect with only the credential, reconnect, local CLI discovery)
+and the tunnel/env-var docs (`SWARM_CONTROL_PLANE_URL`) shipped as Phase 2 of issue
+#391. Still out of scope (same-host MVP): a **DB-less remote** worker (persona
+tokens resolve locally today, so the worker still holds `DATABASE_URL`) and
+over-the-wire secret delivery.
 
 > **Supersedes issue #300.** #300's gRPC bidirectional control plane is re-scoped:
 > the MVP transport is WebSocket + HTTP on the router, not a gRPC stream. The gRPC

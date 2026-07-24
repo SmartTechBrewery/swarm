@@ -45,6 +45,15 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   unfederated and runs locally as before.
 - Pending work is durable in Postgres; Redis carries wake-ups, not the source
   of truth. See [`docs/pipeline.md`](./docs/pipeline.md) for lifecycle details.
+- **Where dispatch runs is a mode (`SWARM_DISPATCH_MODE`, ADR-003 §2).** By
+  default (`in-process`) the host worker dequeues and runs each phase, exactly as
+  the diagram shows. Set `transport` (on both the router and the worker) to
+  relocate the consumer + dispatch gate to the **control plane (router)**: the
+  router selects a connected, eligible worker, composes the system prompt + target
+  branch and pushes a `TaskAssignment` to it (never a persona secret), and the
+  worker runs the phase and reports the result back over the same transport for the
+  router to settle. Federated: a project with no enrolled, connected worker leaves
+  its dispatch durably pending. See [`docs/configuration.md`](./docs/configuration.md).
 
 ## Prerequisites
 

@@ -323,6 +323,20 @@ export const TaskExecutionResultSchema = z.object({
 	// `failed` — the terminal error and whether it was a user termination.
 	error: z.string().optional(),
 	cancelled: z.boolean().optional(),
+	// `succeeded` — the terminal PM/verdict context the control plane settles on
+	// (issue #407, split delivery). A PM-driven phase (planning/implementation)
+	// reports the status it auto-advanced the item to so the control plane can
+	// self-enqueue the next phase (`selfEnqueueNextPhase`, `../worker/consumer.ts`)
+	// instead of waiting on the dropped persona-authored webhook. A Review run
+	// reports its `verdict` (which gates merge automation) plus the safety-cap slot
+	// and automation outcome persisted on its run row. These mirror the
+	// `PhaseRunResult` fields the in-process path reads; the literals track
+	// `PM_STATUS_KEYS` (`../pm/pipeline.ts`) and `REVIEW_VERDICTS` /
+	// `REVIEW_AUTOMATION_OUTCOMES` (`../pipeline/review.ts`).
+	movedTo: z.enum(['backlog', 'planning', 'todo', 'inProgress', 'inReview', 'done']).optional(),
+	verdict: z.enum(['approve', 'request-changes', 'comment']).optional(),
+	reviewOrdinal: z.number().int().positive().optional(),
+	reviewAutomationOutcome: z.enum(['manual-intervention-required']).optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;
 
@@ -344,10 +358,11 @@ export type WorkerStreamMessage = z.infer<typeof WorkerStreamMessageSchema>;
 
 /**
  * Every cloud→worker stream frame, discriminated on `type`: the lease-liveness
- * control frames plus `TaskAssignment` (PROJECT.md §3), which lands here in the
- * split-delivery phase (ADR-003 §2). The back-channel frames it depends on —
- * `TaskExecutionResult`/`StreamLog` on the worker→cloud union above — remain
- * later split-delivery work.
+ * control frames plus `TaskAssignment` (PROJECT.md §3), which the control-plane
+ * dispatcher pushes to a selected connected worker (ADR-003 §2, issue #407). The
+ * back-channel frames it pairs with — `TaskExecutionResult`/`StreamLog`/
+ * `TaskProgress`/`TaskAssignmentAck` on the worker→cloud union above — settle the
+ * dispatch on the control plane.
  */
 export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 	HeartbeatAckSchema,

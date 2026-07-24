@@ -79,16 +79,19 @@ export function resolveOperatorGitHubToken(raw = process.env.SWARM_OPERATOR_GH_T
 export type DispatchMode = 'in-process' | 'transport';
 
 /**
- * Resolve the host worker's dispatch mode (`SWARM_DISPATCH_MODE`, ADR-003 §2).
+ * Resolve the dispatch mode (`SWARM_DISPATCH_MODE`, ADR-003 §2) — read by both the
+ * router (`../router/index.ts`) and the host worker (`../worker/index.ts`).
  *
- * `in-process` (the default, and what an unset/empty value keeps) runs today's
- * BullMQ consumer + `processJob` in this process. `transport` instead runs the
- * worker-side transport-dispatch client (`../worker/transport-client.ts`): the
- * worker connects to the control plane, receives pushed `TaskAssignment` frames,
- * and reports results back over the transport back-channel. Any other value
- * fails startup loudly rather than silently falling back, mirroring the other
- * worker env parsers. The mode is default-off until phase 4 wires the
- * control-plane sending side and flips the cutover.
+ * `in-process` (the default, and what an unset/empty value keeps) runs the BullMQ
+ * consumer + `processJob` on the host worker; the router serves only webhooks +
+ * the worker-session transport. `transport` relocates the consumer + eligibility
+ * gate to the control plane: the router dequeues and pushes a `TaskAssignment` to
+ * the selected connected worker (`../router/dispatcher.ts`), while the host worker
+ * runs the transport-dispatch client (`../worker/transport-client.ts`) that
+ * executes the pushed phase locally and reports results back. Any other value
+ * fails startup loudly rather than silently falling back, mirroring the other env
+ * parsers. Set it the same on both processes; default-off for backward
+ * compatibility (an operator opts into the federated transport cutover).
  */
 export function resolveDispatchMode(raw = process.env.SWARM_DISPATCH_MODE): DispatchMode {
 	const value = (raw ?? '').trim();

@@ -19,6 +19,24 @@
 import { logger } from '../lib/logger.js';
 import { isRunCancellationRequested } from '../queue/cancellation.js';
 
+/**
+ * Thrown to settle a phase as a terminal, user-initiated cancellation (issue
+ * #166) when the durable cancellation marker cannot be consulted at settle time.
+ * The in-process path detects a cancellation by re-reading the durable set in
+ * `handlePhaseFailure`, but the control-plane transport path (issue #407) settles
+ * from a worker's `TaskExecutionResult` *after* the worker already cleared that
+ * marker in its own cleanup — so the worker reports the cancellation on the frame
+ * (`cancelled: true`) and the control plane raises this to route it through the
+ * same terminal-cancelled branch (never a deferral, which would re-run the very
+ * phase the user killed).
+ */
+export class RunTerminatedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'RunTerminatedError';
+	}
+}
+
 const runControllers = new Map<string, AbortController>();
 
 /** Register a run's abort controller so a cancellation for it can reach it. */

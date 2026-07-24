@@ -2,8 +2,8 @@
  * Connected-worker registry for the router's worker transport (ADR-003 §2). A
  * process-local map of `workerId → live /worker/stream WSContext`, plus the
  * server→worker push primitive the control plane uses to hand a
- * `ControlPlaneMessage` (a `TaskAssignment`, once phase 4 composes one) to a
- * specific connected daemon.
+ * `ControlPlaneMessage` (the `TaskAssignment` the dispatcher composes — issue
+ * #407, `./dispatcher.ts`) to a specific connected daemon.
  *
  * Factored out of the socket glue (`./worker-transport.ts`) so it is unit-testable
  * with a fake `WSContext` and never needs a live socket — the same reason
@@ -16,9 +16,11 @@
  * view of who is reachable *from here*. Multi-process/multi-router fan-out (a
  * shared routing table) is out of scope and belongs to a later phase.
  *
- * This module adds no dispatch behavior. Register/deregister keep the map in step
- * with the socket lifecycle, and `sendToWorker` is the primitive a future dispatch
- * path calls — nothing composes or pushes a `TaskAssignment` yet.
+ * This module owns no scheduling decision. Register/deregister keep the map in step
+ * with the socket lifecycle; `sendToWorker` is the primitive the control-plane
+ * dispatcher (`./dispatcher.ts`) calls to push a composed `TaskAssignment`, and
+ * `isWorkerConnected` is the transport-connectivity predicate the eligibility gate
+ * folds in so only socket-connected workers are selected (issue #407).
  */
 
 import type { WSContext } from 'hono/ws';

@@ -374,6 +374,9 @@ vi.mock('@/worker/run-cancellation.js', () => ({
 	linkRunAbortController: (signal?: AbortSignal) => linkRunAbortController(signal),
 	beginRunCancellationTracking: (runId?: string, controller?: AbortController) =>
 		beginRunCancellationTracking(runId, controller),
+	// Real class so `handlePhaseFailure`'s `instanceof RunTerminatedError` guard is
+	// a valid constructor check (the in-process path never throws it).
+	RunTerminatedError: class RunTerminatedError extends Error {},
 }));
 
 // Terminated-run checkout settlement (issue #361): mocked at its boundary so the

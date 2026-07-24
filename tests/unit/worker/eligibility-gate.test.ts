@@ -379,4 +379,60 @@ describe('evaluateDispatchEligibility', () => {
 			expect(decision).toMatchObject({ status: 'selected', selection: { cli: 'codex' } });
 		});
 	});
+
+	// The control plane (issue #407) folds a transport-connectivity predicate into
+	// the gate so only socket-connected workers are selectable — a worker whose DB
+	// lease reads live but whose `/worker/stream` socket is not open on this router
+	// is not chosen. The predicate only ever narrows: passing none preserves the
+	// in-process behavior above.
+	describe('transport connectivity (issue #407)', () => {
+		it('skips a DB-live-but-not-connected worker and picks the first connected one', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-offline-socket'),
+				makeCandidate('w-connected'),
+			]);
+			// Both are DB-live and eligible; only the second holds a live socket here.
+			const isWorkerConnected = (id: string) => id === 'w-connected';
+
+			const decision = await evaluateDispatchEligibility(gateInput(), { isWorkerConnected });
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-connected' },
+			});
+		});
+
+		it('defers (ineligible) when the only eligible worker is not socket-connected', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-1')]);
+
+			const decision = await evaluateDispatchEligibility(gateInput(), {
+				isWorkerConnected: () => false,
+			});
+
+			// A live-lease-only worker resolves as `worker-unavailable`, so the durable
+			// dispatch stays pending until a worker connects — never a blind dispatch.
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
+		});
+
+		it('preserves assignee affinity — a connected worker of another user is never chosen', async () => {
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-alice', { ownerUserId: ALICE }),
+				makeCandidate('w-bob', { ownerUserId: BOB }),
+			]);
+			// Bob's worker is the connected one; Alice's is not — the assigned item must
+			// still wait for Alice's own worker rather than route to Bob's.
+			const isWorkerConnected = (id: string) => id === 'w-bob';
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ workItem: ASSIGNED_ITEM, pm: PM }),
+				{ isWorkerConnected },
+			);
+
+			expect(decision).toMatchObject({
+				status: 'ineligible',
+				reason: 'assignee-worker-unavailable',
+			});
+		});
+	});
 });

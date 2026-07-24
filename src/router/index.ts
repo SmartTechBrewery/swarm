@@ -1,5 +1,5 @@
 /**
- * Router entry point — serves the GitHub webhook receiver over HTTP.
+ * Router entry point — the control plane's process boundary.
  *
  * All the request logic lives in `webhook-receiver.ts` and
  * `worker-transport.ts` (both testable without a live server); this module is
@@ -8,13 +8,25 @@
  * webhook events are enqueued onto BullMQ at the `enqueue.ts` seam (producer in
  * `queue/producer.ts`); the worker transport keeps the `worker_sessions`
  * liveness signal fresh over the wire (ADR-003 §1).
+ *
+ * When `SWARM_DISPATCH_MODE=transport` (ADR-003 §2, issue #407) the router also
+ * hosts the **control-plane dispatch consumer** (`./dispatcher.ts`): it dequeues
+ * BullMQ wake-ups, runs the ADR-001 eligibility gate, and pushes a
+ * `TaskAssignment` to the selected connected worker — which executes the phase
+ * and reports back over the same worker transport. In the default `in-process`
+ * mode the consumer stays on the host worker (`../worker/index.ts`) and this block
+ * is skipped, so the queue is consumed by exactly one side.
  */
 
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 
+import { runMigrations } from '../db/migrate.js';
+import { resolveDispatchMode } from '../lib/env.js';
+import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
+import type { DispatchConsumerHandle } from './dispatcher.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
 import { registerWorkerTransport } from './worker-transport.js';
@@ -40,22 +52,55 @@ const server = serve({ fetch: app.fetch, port }, () => {
 });
 injectWebSocket(server);
 
+// Control-plane dispatch (ADR-003 §2): host the BullMQ consumer + eligibility
+// gate here and push assignments to connected workers. Only in `transport` mode;
+// the default `in-process` mode leaves the consumer on the host worker.
+const dispatchShutdown = new AbortController();
+let dispatchConsumer: DispatchConsumerHandle | undefined;
+if (resolveDispatchMode() === 'transport') {
+	try {
+		// Bring the schema up to date before serving any dispatch: in transport mode
+		// the control plane owns the run-row lifecycle and durable dispatch state, so
+		// it must never act against an older DB (mirrors the host worker's startup).
+		await runMigrations();
+		// Loaded dynamically so the default `in-process` router never pulls in the
+		// dispatcher's pipeline import tree — its startup surface is unchanged.
+		const { startControlPlaneDispatch } = await import('./dispatcher.js');
+		dispatchConsumer = await startControlPlaneDispatch({ shutdownSignal: dispatchShutdown.signal });
+	} catch (err) {
+		logger.error('Failed to start the control-plane dispatch consumer — refusing to start', {
+			error: describeError(err),
+		});
+		process.exit(1);
+	}
+}
+
 // Docker sends SIGTERM on `compose down`/`stop`; close the listener so the
 // container stops promptly instead of being killed after the grace period.
+let stopping = false;
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 	process.on(signal, () => {
-		// Stop accepting requests, then drain the BullMQ producer connection so the
+		if (stopping) return;
+		stopping = true;
+		// Abort any in-flight assignment wait, close the dispatch consumer (transport
+		// mode), stop accepting requests, then drain the BullMQ producer so the
 		// process exits instead of hanging on an open Redis socket.
+		dispatchShutdown.abort();
 		server.close(() => {
-			void closeQueue().then(
-				() => process.exit(0),
-				(err) => {
-					logger.error('Producer queue close failed', {
-						error: err instanceof Error ? err.message : String(err),
-					});
+			void (async () => {
+				try {
+					await dispatchConsumer?.close();
+				} catch (err) {
+					logger.error('Dispatch consumer close failed', { error: describeError(err) });
+				}
+				try {
+					await closeQueue();
+					process.exit(0);
+				} catch (err) {
+					logger.error('Producer queue close failed', { error: describeError(err) });
 					process.exit(1);
-				},
-			);
+				}
+			})();
 		});
 	});
 }

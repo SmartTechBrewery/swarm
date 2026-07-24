@@ -3,10 +3,13 @@
  * worker-session surface (ADR-003 §1). A remote `swarm-cli` daemon reaches the
  * same credential→session→heartbeat service the in-process worker uses
  * (`../identity/worker-session-service.ts`), but over the network via the
- * Cloudflare-tunnel-fronted router instead of an in-process call. This module
- * adds no scheduling/eligibility/dispatch behavior: it only keeps the existing
- * `worker_sessions` liveness signal fresh over the wire, which the eligibility
- * gate already consumes.
+ * Cloudflare-tunnel-fronted router instead of an in-process call. Its core job is
+ * keeping the `worker_sessions` liveness signal fresh over the wire (which the
+ * eligibility gate consumes); under split delivery (ADR-003 §2, issue #407) the
+ * same socket also carries the worker→cloud back-channel, which this module routes
+ * to the control-plane dispatcher awaiting each dispatch's result
+ * (`./dispatch-results.ts`) — the scheduling/eligibility decisions themselves live
+ * in the dispatcher (`./dispatcher.ts`), not here.
  *
  * Two routes, both under `/worker`:
  *   - `POST /worker/session` — the handshake (request/response): authenticate the
@@ -52,10 +55,18 @@ import { logger } from '../lib/logger.js';
 import {
 	type ControlPlaneMessage,
 	HandshakeRequestSchema,
+	type TaskAssignmentAck,
+	type TaskExecutionResult,
+	type TaskProgress,
 	TRANSPORT_PROTOCOL_VERSION,
 	WorkerStreamMessageSchema,
 	WS_CLOSE,
 } from '../transport/protocol.js';
+import {
+	deliverDispatchAck,
+	deliverDispatchProgress,
+	deliverDispatchResult,
+} from './dispatch-results.js';
 import { deregisterConnection, registerConnection } from './worker-connections.js';
 
 // The application-defined WebSocket close codes are part of the wire contract, so
@@ -84,6 +95,15 @@ export interface WorkerTransportDeps {
 	refreshWorkerCapabilities: (id: string, capabilities: AgentCli[]) => Promise<Worker | undefined>;
 	resolveHeartbeatTtlMs: () => number;
 	validateFencingToken: (workerId: string, token: number, ttlMs?: number) => Promise<boolean>;
+	/**
+	 * Split-delivery back-channel sinks (ADR-003 §2, issue #407): route a worker's
+	 * assignment ack / progress / terminal result to the control-plane dispatcher
+	 * awaiting it (`./dispatch-results.ts`). Defaulted to the in-process registry;
+	 * a unit test injects fakes. A frame for a dispatch not awaited here is a no-op.
+	 */
+	deliverDispatchResult: (result: TaskExecutionResult) => boolean;
+	deliverDispatchProgress: (progress: TaskProgress) => void;
+	deliverDispatchAck: (ack: TaskAssignmentAck) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -95,6 +115,9 @@ function defaultDeps(): WorkerTransportDeps {
 		refreshWorkerCapabilities,
 		resolveHeartbeatTtlMs,
 		validateFencingToken,
+		deliverDispatchResult,
+		deliverDispatchProgress,
+		deliverDispatchAck,
 	};
 }
 
@@ -229,10 +252,11 @@ export type WorkerStreamAction =
  * fake deps and a raw string. An unparseable frame closes (4400). A `heartbeat`
  * frame refreshes the lease: a refreshed lease acks; a lease that can no longer
  * be refreshed (lost/expired/superseded) sends a `disconnect` frame and closes
- * (4408). The split-delivery back-channel frames (assignment ack, live output,
- * execution result — ADR-003 §2) are worker→cloud but are consumed by the
- * control-plane split-delivery side (a follow-up phase); this session endpoint
- * does not act on them yet, so it ignores them rather than closing the session.
+ * (4408). The split-delivery back-channel frames (assignment ack, coarse progress,
+ * execution result — ADR-003 §2, issue #407) are routed to the control-plane
+ * dispatcher awaiting that dispatch's result (`./dispatch-results.ts`) and keep the
+ * socket open; a `stream-log` is ignored here (the same-host worker already
+ * persisted its output locally). None of these touch the lease.
  */
 export async function handleWorkerStreamFrame(
 	deps: WorkerTransportDeps,
@@ -252,10 +276,28 @@ export async function handleWorkerStreamFrame(
 	}
 
 	const frame = parsed.data;
-	// Lease liveness rides the heartbeat; the back-channel frames carry no fencing
-	// token and are not yet consumed here, so short-circuit them before the
-	// heartbeat-only lease-refresh path below.
-	if (frame.type !== 'heartbeat') {
+	// Route the split-delivery back-channel frames (ADR-003 §2, issue #407) to the
+	// control-plane dispatcher awaiting this dispatch's result on this router, then
+	// keep the socket open — they carry no fencing token and never touch the lease.
+	// A frame for a dispatch not awaited here (already settled, or on another
+	// router) is a no-op. Lease liveness rides the heartbeat handled below.
+	if (frame.type === 'task-execution-result') {
+		deps.deliverDispatchResult(frame);
+		return { action: 'ignore' };
+	}
+	if (frame.type === 'task-progress') {
+		deps.deliverDispatchProgress(frame);
+		return { action: 'ignore' };
+	}
+	if (frame.type === 'task-assignment-ack') {
+		deps.deliverDispatchAck(frame);
+		return { action: 'ignore' };
+	}
+	if (frame.type === 'stream-log') {
+		// The same-host worker already persisted its output to `run_output_events`
+		// locally (`../worker/live-output.ts`), so this router-side copy would only
+		// double-persist — ignore it. A future DB-less remote worker's output would
+		// be persisted here instead.
 		return { action: 'ignore' };
 	}
 	if (frame.fencingToken !== ctx.fencingToken) {

@@ -57,6 +57,9 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		refreshWorkerCapabilities: vi.fn().mockResolvedValue(makeWorker()),
 		resolveHeartbeatTtlMs: vi.fn().mockReturnValue(60_000),
 		validateFencingToken: vi.fn().mockResolvedValue(true),
+		deliverDispatchResult: vi.fn().mockReturnValue(true),
+		deliverDispatchProgress: vi.fn(),
+		deliverDispatchAck: vi.fn(),
 		...overrides,
 	};
 }
@@ -199,6 +202,74 @@ describe('handleWorkerStreamFrame', () => {
 		);
 		expect(action.action).toBe('close');
 		expect(deps.heartbeat).not.toHaveBeenCalled();
+	});
+
+	// Split delivery (issue #407): the back-channel frames are routed to the
+	// control-plane dispatcher and keep the socket open (never touch the lease).
+	const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+
+	it('routes a task-execution-result to the dispatcher and keeps the socket open', async () => {
+		const deps = makeDeps();
+		const action = await handleWorkerStreamFrame(
+			deps,
+			ctx,
+			JSON.stringify({
+				type: 'task-execution-result',
+				dispatchId: DISPATCH,
+				status: 'succeeded',
+				phase: 'implementation',
+				taskId: '407',
+				exitCode: 0,
+			}),
+		);
+		expect(action).toEqual({ action: 'ignore' });
+		expect(deps.deliverDispatchResult).toHaveBeenCalledWith(
+			expect.objectContaining({ dispatchId: DISPATCH, status: 'succeeded' }),
+		);
+		expect(deps.heartbeat).not.toHaveBeenCalled();
+	});
+
+	it('routes progress and ack frames to the dispatcher without closing', async () => {
+		const deps = makeDeps();
+		const progress = await handleWorkerStreamFrame(
+			deps,
+			ctx,
+			JSON.stringify({
+				type: 'task-progress',
+				dispatchId: DISPATCH,
+				phase: 'implementation',
+				taskId: '407',
+				state: 'branch-provisioned',
+			}),
+		);
+		const ack = await handleWorkerStreamFrame(
+			deps,
+			ctx,
+			JSON.stringify({ type: 'task-assignment-ack', dispatchId: DISPATCH, duplicate: false }),
+		);
+		expect(progress).toEqual({ action: 'ignore' });
+		expect(ack).toEqual({ action: 'ignore' });
+		expect(deps.deliverDispatchProgress).toHaveBeenCalledWith(
+			expect.objectContaining({ state: 'branch-provisioned' }),
+		);
+		expect(deps.deliverDispatchAck).toHaveBeenCalledWith(
+			expect.objectContaining({ dispatchId: DISPATCH }),
+		);
+	});
+
+	it('ignores a stream-log without persisting it here (same-host worker owns output)', async () => {
+		const deps = makeDeps();
+		const action = await handleWorkerStreamFrame(
+			deps,
+			ctx,
+			JSON.stringify({
+				type: 'stream-log',
+				dispatchId: DISPATCH,
+				lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
+			}),
+		);
+		expect(action).toEqual({ action: 'ignore' });
+		expect(deps.deliverDispatchResult).not.toHaveBeenCalled();
 	});
 });
 
