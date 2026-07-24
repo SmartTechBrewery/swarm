@@ -10,6 +10,7 @@ import {
 	OctagonX,
 	Play,
 	RefreshCw,
+	RotateCcw,
 	Terminal,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -20,6 +21,12 @@ import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
+import {
+	canResetRun,
+	describeResetResult,
+	resetButtonLabel,
+	resetConfirmMessage,
+} from '@/lib/run-reset.js';
 import {
 	canRetryRun,
 	type RetryActionKind,
@@ -436,6 +443,132 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 	);
 }
 
+/**
+ * "Reset & restart" action (issue #428) for a wedged `failed`/`deferred` run —
+ * the last resort when neither "Retry now" nor "Terminate" can move it because
+ * its dispatch, cancellation flag, worktree lease, and recovery record disagree.
+ * The modal names every step `runs.reset` performs and carries the explicit,
+ * default-off opt-in for the destructive `force` variant (discard uncommitted /
+ * unpushed work); success renders the per-step report the mutation returns, so
+ * an operator can tell a reset that freed the checkout from one that restarted
+ * the run but kept protected work. Pending state disables both the trigger and
+ * the confirm button so a double-click can't fire two resets.
+ */
+export function ResetRunButton({ run }: { run: RunRow }) {
+	const queryClient = useQueryClient();
+	const [confirmOpen, setConfirmOpen] = useState(false);
+	const [discardWork, setDiscardWork] = useState(false);
+
+	/** Close the modal and drop the force opt-in, so reopening never starts armed. */
+	const closeConfirm = () => {
+		setConfirmOpen(false);
+		setDiscardWork(false);
+	};
+
+	const mutation = useMutation({
+		mutationFn: (force: boolean) => trpcClient.runs.reset.mutate({ runId: run.id, force }),
+		onSuccess: () => {
+			closeConfirm();
+			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
+			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
+		},
+	});
+
+	return (
+		<div className="mt-3">
+			<button
+				type="button"
+				onClick={() => {
+					// Drop any previous report/error so the modal opens on a clean slate.
+					mutation.reset();
+					setConfirmOpen(true);
+				}}
+				disabled={mutation.isPending}
+				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+			>
+				<RotateCcw className={`h-4 w-4 ${mutation.isPending ? 'animate-spin' : ''}`} />
+				{resetButtonLabel(mutation.isPending)}
+			</button>
+
+			{mutation.isSuccess && (
+				<div className="mt-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+					<h4 className="text-xs font-semibold text-zinc-200">Reset complete</h4>
+					<ul className="mt-1.5 space-y-1 text-xs text-zinc-400">
+						{describeResetResult(mutation.data).map((line) => (
+							<li key={line}>{line}</li>
+						))}
+					</ul>
+				</div>
+			)}
+
+			{mutation.isError && !confirmOpen && (
+				<div className="mt-2 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+					{mutation.error.message}
+				</div>
+			)}
+
+			<Modal
+				open={confirmOpen}
+				onClose={() => {
+					if (!mutation.isPending) closeConfirm();
+				}}
+				title="Reset & restart run?"
+			>
+				<p className="text-sm text-zinc-300">{resetConfirmMessage(run.status, discardWork)}</p>
+
+				<label className="flex items-start gap-3 mt-4 p-3 border border-red-900/50 rounded-md bg-red-950/20 cursor-pointer hover:bg-red-950/30 transition-colors">
+					<input
+						type="checkbox"
+						checked={discardWork}
+						onChange={(event) => setDiscardWork(event.target.checked)}
+						disabled={mutation.isPending}
+						className="mt-0.5 h-4 w-4 accent-red-600 disabled:opacity-50"
+					/>
+					<span>
+						<span className="block text-sm font-medium text-red-200">
+							Also discard uncommitted / unpushed work in the checkout
+						</span>
+						<span className="block text-xs text-red-400/80 mt-1">
+							Without this, a checkout holding uncommitted changes or unpushed commits is kept and
+							the restarted run may block on it again. With it, that work is deleted and cannot be
+							recovered.
+						</span>
+					</span>
+				</label>
+
+				{mutation.isError && (
+					<div className="mt-3 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+						{mutation.error.message}
+					</div>
+				)}
+				<ModalFooter
+					primary={
+						<button
+							type="button"
+							onClick={() => mutation.mutate(discardWork)}
+							disabled={mutation.isPending}
+							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+						>
+							{mutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+							{resetButtonLabel(mutation.isPending)}
+						</button>
+					}
+					secondary={
+						<button
+							type="button"
+							onClick={closeConfirm}
+							disabled={mutation.isPending}
+							className="px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-zinc-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+						>
+							Cancel
+						</button>
+					}
+				/>
+			</Modal>
+		</div>
+	);
+}
+
 interface RecoveryCalloutProps {
 	run: RunRow;
 }
@@ -761,9 +894,10 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 						<p className="text-xs text-amber-200/70 mt-1 font-mono">
 							UTC: {new Date(run.nextRetryAt).toISOString()}
 						</p>
-						<div className="flex flex-wrap items-center gap-3">
+						<div className="flex flex-wrap items-start gap-3">
 							{canRetryRun(run.status) && <RetryNowButton run={run} />}
 							{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
+							{canResetRun(run.status) && <ResetRunButton run={run} />}
 						</div>
 					</div>
 				</div>
@@ -790,7 +924,10 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 								{describeCancellationOrigin(run.cancellation)}
 							</p>
 						)}
-						{canRetryRun(run.status) && <RetryNowButton run={run} />}
+						<div className="flex flex-wrap items-start gap-3">
+							{canRetryRun(run.status) && <RetryNowButton run={run} />}
+							{canResetRun(run.status) && <ResetRunButton run={run} />}
+						</div>
 					</div>
 				</div>
 			)}
