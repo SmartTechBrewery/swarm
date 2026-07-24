@@ -63,8 +63,9 @@ import {
 import { capabilityFor, DEFAULT_MODEL_PER_CLI, type ReasoningLevel } from '../harness/models.js';
 import { discoverCliQuotas } from '../harness/quota-discovery.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
+import type { GitHubPersona } from '../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
-import { isSingleUserMode } from '../lib/env.js';
+import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
@@ -86,6 +87,7 @@ import {
 	resolveAutomationLabel,
 } from '../pm/automation-label.js';
 import { type PmStatusKey, resolvePipelinePhaseForStatusKey } from '../pm/pipeline.js';
+import { createTransportPmDeliveryProvider } from '../pm/transport-delivery.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import {
 	type CancellationOrigin,
@@ -102,6 +104,7 @@ import {
 } from '../queue/jobs.js';
 import { priorityFor } from '../queue/producer.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
+import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
 import type { TriggerRegistry } from '../triggers/registry.js';
 import {
 	buildConflictResolutionKey,
@@ -1046,6 +1049,61 @@ function logAgentRouting(
  * types, but all carry the agent run (`.agent`); the optional fields below are
  * the ones the worker (and the transport back-channel) read off the result.
  */
+/**
+ * Resolve the SCM delivery provider for a PR-driven phase, choosing the delivery
+ * mode in one place (ADR-002 §2). In **control-plane delivery mode** — a
+ * federated worker with both `SWARM_CONTROL_PLANE_URL` and
+ * `SWARM_WORKER_CREDENTIAL` set — the metadata-only calls (`submitReview` /
+ * `postComment`) travel up the transport to the router's server-side delivery
+ * API, which performs them under the per-project reviewer PAT; the
+ * source-carrying / attribution ops (commit identity, find/create PR, push) stay
+ * local via the in-process delegate, keeping the operator's own token
+ * worker-side. Otherwise — the **local host worker**, the default — it returns
+ * `undefined`, so the phase builds today's in-process provider itself, lazily,
+ * byte-for-byte unchanged; single-user mode and the same-machine worker are
+ * unaffected.
+ */
+export async function resolveScmDelivery(
+	project: ProjectConfig,
+	persona: GitHubPersona,
+): Promise<ScmDeliveryProvider | undefined> {
+	const controlPlaneUrl = getControlPlaneUrl();
+	const workerCredential = optionalEnv('SWARM_WORKER_CREDENTIAL', '').trim();
+	if (!controlPlaneUrl || !workerCredential) return undefined;
+	return createTransportScmDeliveryProvider({
+		controlPlaneUrl,
+		workerCredential,
+		projectId: project.id,
+		localDelegate: await new GitHubSCMIntegration().deliveryProvider(project, persona),
+	});
+}
+
+/**
+ * Resolve the PM provider a board-driven phase (planning / implementation /
+ * respond-to-review) writes through, choosing the delivery mode in the same one
+ * place as {@link resolveScmDelivery} (ADR-002 §2, Phase 2/2). In **control-plane
+ * delivery mode** — a federated worker with both `SWARM_CONTROL_PLANE_URL` and
+ * `SWARM_WORKER_CREDENTIAL` set — the two metadata-only PM writes
+ * (`moveWorkItem` / `addComment`) travel up the transport to the router's
+ * server-side delivery API, which performs them under the per-project PM
+ * credential; every read and non-metadata write stays local via the in-process
+ * delegate, so the worker never holds that credential. Otherwise — the **local
+ * host worker**, the default — it returns `undefined`, so `runAssignedPhase`
+ * builds today's in-process provider itself, byte-for-byte unchanged;
+ * single-user mode and the same-machine worker are unaffected.
+ */
+export function resolvePmDelivery(project: ProjectConfig): PMProvider | undefined {
+	const controlPlaneUrl = getControlPlaneUrl();
+	const workerCredential = optionalEnv('SWARM_WORKER_CREDENTIAL', '').trim();
+	if (!controlPlaneUrl || !workerCredential) return undefined;
+	return createTransportPmDeliveryProvider({
+		controlPlaneUrl,
+		workerCredential,
+		projectId: project.id,
+		localDelegate: createGitHubProjectsProvider(project),
+	});
+}
+
 export interface PhaseRunResult {
 	agent: AgentCliResult;
 	/**
@@ -1098,6 +1156,15 @@ export interface AssignedPhaseInputs {
 	runAgent: ReturnType<typeof createLiveOutputRunner>;
 	/** planning / implementation: the board item to act on. */
 	workItem?: WorkItem;
+	/**
+	 * planning / implementation / respond-to-review only: the resolved
+	 * control-plane PM write delegate (ADR-002 §2, {@link resolvePmDelivery}) or
+	 * DB-free dispatch injection (ADR-003 §2, `../transport/assignment-execution.ts`),
+	 * or `undefined` to use the phase's own in-process provider (the local host
+	 * worker, via `createGitHubProjectsProvider`). Mirrors {@link delivery} on the
+	 * SCM side.
+	 */
+	pm?: PMProvider;
 	/** implementation: reuse an already-provisioned task branch on a resumed retry. */
 	resumeExistingBranch?: boolean;
 	/** implementation: called once the task branch has been acquired, for resume idempotency. */
@@ -1112,21 +1179,22 @@ export interface AssignedPhaseInputs {
 	baseBranch?: string;
 	baseSha?: string;
 	/**
-	 * Injected collaborators for a DB-free dispatch (`../transport/assignment-execution.ts`,
-	 * ADR-003 §2). Each is optional and additive: the in-process ({@link runPhase})
-	 * and same-host (`./transport-client.ts`) paths leave all three unset, so the
-	 * phase resolves them itself exactly as before — the PM provider from
-	 * `createGitHubProjectsProvider`, the delivery provider from
-	 * `GitHubSCMIntegration`, and the agent token from `getPersonaToken`.
+	 * review / respond-to-review only: the resolved control-plane SCM delivery
+	 * provider (ADR-002 §2, {@link resolveScmDelivery}) or DB-free dispatch
+	 * injection (ADR-003 §2, `../transport/assignment-execution.ts`), or
+	 * `undefined` to use the phase's own in-process delegate (the local host
+	 * worker, via `GitHubSCMIntegration`).
 	 *
-	 * A remote worker with no `DATABASE_URL` instead injects an operator-token
-	 * `delivery` and `agentToken` (and, for board-driven phases, a `pm`) so no
-	 * phase reaches into the secret store or the DB. Forwarding both `delivery` and
-	 * `agentToken` keeps the delivery-owning phases' `legacyMode` guard false (it is
-	 * `getToken !== undefined && delivery === undefined`), i.e. deterministic
-	 * delivery stays on.
+	 * A remote worker with no `DATABASE_URL` additionally injects an
+	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
+	 * phases, a `pm`) so no phase reaches into the secret store or the DB.
+	 * Forwarding both `delivery` and `agentToken` keeps the delivery-owning
+	 * phases' `legacyMode` guard false (it is `getToken !== undefined &&
+	 * delivery === undefined`), i.e. deterministic delivery stays on. The
+	 * in-process ({@link runPhase}) and same-host (`./transport-client.ts`)
+	 * paths leave both unset, so the phase resolves its own default exactly
+	 * as before — the agent token from `getPersonaToken`.
 	 */
-	pm?: PMProvider;
 	delivery?: ScmDeliveryProvider;
 	agentToken?: string;
 }
@@ -1135,9 +1203,11 @@ export interface AssignedPhaseInputs {
  * Dispatch already-resolved {@link AssignedPhaseInputs} to the matching
  * `runXPhase` orchestrator — the single per-phase switch both the in-process and
  * transport dispatch paths share. The phase owns its own worktree lifecycle, so
- * this provisions nothing; it only builds the concrete PM provider the
- * board-driven phases need (the one place a concrete provider is named, per
- * ai/RULES.md §2) and forwards each phase its inputs.
+ * this provisions nothing; it only forwards each phase its inputs, defaulting a
+ * board-driven phase's PM provider to the concrete in-process one when no
+ * control-plane write delegate was injected (`inputs.pm` — {@link
+ * resolvePmDelivery}). That fallback is the one place a concrete provider is
+ * named, per ai/RULES.md §2.
  *
  * A missing phase-required input (a planning/implementation call with no
  * `workItem`, a PR phase with no coordinates) throws here rather than reaching
@@ -1328,7 +1398,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
  * {@link runAssignedPhase} switch. `signal` (the worker's shutdown signal) is
  * threaded through so a graceful shutdown kills any in-flight agent CLI.
  */
-function runPhase(
+async function runPhase(
 	trigger: TriggerResult,
 	project: ProjectConfig,
 	resolution: PhaseResolution,
@@ -1381,11 +1451,17 @@ function runPhase(
 			return runAssignedPhase({
 				...base,
 				workItem: trigger.workItem,
+				pm: resolvePmDelivery(project),
 				resumeExistingBranch: job.implementationBranchProvisioned === true,
 				onBranchProvisioned: markImplementationBranchProvisioned,
 			});
 		case 'review':
-			return runAssignedPhase({ ...base, prNumber: trigger.prNumber, headSha: trigger.headSha });
+			return runAssignedPhase({
+				...base,
+				prNumber: trigger.prNumber,
+				headSha: trigger.headSha,
+				delivery: await resolveScmDelivery(project, 'reviewer'),
+			});
 		case 'respond-to-review':
 			return runAssignedPhase({
 				...base,
@@ -1393,6 +1469,8 @@ function runPhase(
 				prBranch: trigger.prBranch,
 				reviewId: trigger.reviewId,
 				headSha: trigger.headSha,
+				pm: resolvePmDelivery(project),
+				delivery: await resolveScmDelivery(project, 'implementer'),
 			});
 		case 'respond-to-ci':
 			return runAssignedPhase({

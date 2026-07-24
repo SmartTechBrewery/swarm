@@ -3565,6 +3565,18 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		expect(providerBuiltWith).toHaveLength(1);
 	});
 
+	it('uses an injected PM write delegate without building the in-process provider', async () => {
+		// Control-plane delivery mode hands `runPhase` a transport PM write delegate
+		// (`resolvePmDelivery`); the switch must forward it verbatim and never build
+		// the concrete in-process provider (which would resolve the PM credential).
+		const injectedPm = { type: 'github-projects' } as unknown as PMProvider;
+		await runAssignedPhase(
+			baseInputs({ phase: 'planning', workItem: createMockWorkItem(), pm: injectedPm }),
+		);
+		expect(phaseCalls[0].args.pm).toBe(injectedPm);
+		expect(providerBuiltWith).toHaveLength(0);
+	});
+
 	it('routes implementation and forwards the branch-resume flag + hook', async () => {
 		const onBranchProvisioned = async () => {};
 		await runAssignedPhase(
