@@ -150,6 +150,7 @@ describe('reconcileTerminatedWorktree', () => {
 			});
 
 			expect(result).toEqual({ outcome: 'removed', staleLeaseReleased: true });
+			expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('p1', '10');
 			expect(manager.cleanedUpTasks).toEqual(['10']);
 		});
 
@@ -203,7 +204,8 @@ describe('reconcileTerminatedWorktree', () => {
 			expect(manager.cleanedUpTasks).toEqual(['10']);
 		});
 
-		it('still retains protected work when the reset was not forced (fails closed)', async () => {
+		it('reclaims a stale lease and retains protected work when the reset was not forced', async () => {
+			isWorktreeLeasedMock.mockResolvedValue(true);
 			const manager = makeManager();
 			manager.clean = false;
 
@@ -212,6 +214,7 @@ describe('reconcileTerminatedWorktree', () => {
 			});
 
 			expect(result).toEqual({ outcome: 'blocked', blockedReason: 'dirty' });
+			expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('p1', '10');
 			expect(manager.cleanedUpTasks).toEqual([]);
 		});
 

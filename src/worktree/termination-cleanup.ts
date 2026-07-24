@@ -132,7 +132,7 @@ export async function reconcileTerminatedWorktree(
 		// A lease is only protective while a live run actually owns it. Without a
 		// `hasLiveOwner` resolver we cannot tell, so the lease is honoured exactly
 		// as before; a resolver that says "no live owner" makes this a stale marker
-		// the reset path may reclaim (`cleanup()` releases it with the checkout).
+		// the reset path may reclaim.
 		if (!options.hasLiveOwner || (await options.hasLiveOwner(projectId, taskId))) {
 			logger.info('termination settlement: retaining live-leased checkout', { projectId, taskId });
 			return { outcome: 'blocked', blockedReason: 'live-leased' };
@@ -141,6 +141,7 @@ export async function reconcileTerminatedWorktree(
 			projectId,
 			taskId,
 		});
+		await releaseWorktreeLease(projectId, taskId);
 		staleLeaseReleased = true;
 	}
 
