@@ -28,14 +28,14 @@ when present. The `--` separates npm's own args from the ones passed to the CLI 
 it is required.
 
 **Environment.** Commands that touch the database (`config`, `users`, `members`,
-`identities`, `workers`, `queue`, `worktrees`) need `DATABASE_URL` (and some also
-`REDIS_URL`) in the environment. `npm run swarm -- …` and the dedicated npm
+`identities`, `workers`, `queue`, `run`, `worktrees`) need `DATABASE_URL` (and some
+also `REDIS_URL`) in the environment. `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
 
 Run `swarm --help`, or `swarm <command> --help` on the multi-subcommand commands
-(`config`, `queue`, `users`, `members`, `identities`, `workers`), to print the
-authoritative usage.
+(`config`, `queue`, `run`, `users`, `members`, `identities`, `workers`), to print
+the authoritative usage.
 
 ---
 
@@ -50,6 +50,7 @@ authoritative usage.
 | [`status`](#swarm-status) | Show container states and probe the router's health |
 | [`logs`](#swarm-logs) | Tail stack logs |
 | [`queue clear`](#swarm-queue) | Cancel all pending queue work |
+| [`run reset`](#swarm-run) | Reset a wedged run and restart its phase (last resort) |
 | [`users`](#swarm-users) | Manage SWARM users and the installation admin |
 | [`members`](#swarm-members) | Manage project membership |
 | [`identities`](#swarm-identities) | Link a user to the handles they own on a provider |
@@ -140,6 +141,45 @@ swarm queue clear
   — stop the worker first if nothing should start while clearing.
 
 Requires `DATABASE_URL` and `REDIS_URL`. Wrapper: `npm run queue:clear`.
+
+### `swarm run`
+
+```bash
+swarm run reset <runId> [--force]
+```
+
+- **`reset`** — the last-resort recovery for a single **wedged** run: one whose
+  dispatch, Redis cancellation flag, worktree lease, and recovery record disagree
+  badly enough that neither "Retry now" nor "Terminate" can move it. It performs
+  one sequence and prints one line per step:
+  1. **dispatch** — cancels the run's active dispatch (`none` when there wasn't
+     one, `force-cancelled` when a worker had already claimed it);
+  2. **cancellation flag** — clears the Redis user-termination flag, or the worker
+     would kill the fresh attempt at its start-check;
+  3. **checkout** — settles the checkout and worktree lease, releasing a *stale*
+     lease no live run owns (the marker a wedged run leaves behind). Reports
+     `removed`, `retained` with its reason (`uncommitted changes`,
+     `unpushed commits`, a lease held by another live run), `kept` for a saved
+     agent session, or `none on disk`;
+  4. **recovery record** — clears it plus any captured session id;
+  5. **restarted** — re-dispatches the phase from scratch and prints the new
+     dispatch id.
+- **`--force`** — also resets a run still marked `running`, cancels a dispatch a
+  worker has already claimed, and **discards** uncommitted changes and unpushed
+  commits instead of retaining the checkout. It prints a warning before acting and
+  **cannot stop an already-spawned agent process** — only Terminate can, so a
+  forced reset of a live run is a deliberate operator choice.
+
+A refused reset (a healthy `running` run without `--force`, a dispatch a worker
+just claimed, a run with no stored job payload, a concurrent reset) changes
+nothing: the command prints the refusal and exits **1**. Every guard runs before
+the first mutation, and a failure part-way through leaves the run
+terminal-and-idle — exactly the state a second `swarm run reset` retries from.
+
+Requires `DATABASE_URL` and `REDIS_URL`. Works with the worker **and** the API
+stopped — it goes straight to Postgres and Redis, which is the point: the same
+action exists in the dashboard (a run's "Reset & restart" button), and this is how
+you reach it when the services that serve it are down.
 
 ### `swarm users`
 
