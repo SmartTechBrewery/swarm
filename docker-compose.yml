@@ -50,6 +50,11 @@ services:
       DATABASE_SSL: "false"
       REDIS_URL: redis://redis:6379
       CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY:-}
+      # Worker-local operator GitHub token (issue #396). The router resolves the
+      # implementer identity from it for isSelfAuthored loop-prevention, so it must
+      # reach this container too (the host worker + API server read it from .env
+      # directly). Never persisted; passed through from the host env.
+      SWARM_OPERATOR_GH_TOKEN: ${SWARM_OPERATOR_GH_TOKEN:-}
       # Structured logging (src/lib/logger.ts). Containers have no TTY, so the
       # logger already defaults to JSON here; set these to tune level/format.
       SWARM_LOG_LEVEL: ${SWARM_LOG_LEVEL:-info}

@@ -196,7 +196,6 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 		repoRoot: '/Users/dev/swarm/swarm',
 		githubProjects: createMockGitHubProjectsConfig(),
 		credentials: {
-			implementer: 'SCM_TOKEN_IMPLEMENTER',
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',
 		},

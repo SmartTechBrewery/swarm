@@ -53,8 +53,10 @@ const CONFIG_TEMPLATE = {
 				},
 			},
 			// References (env-var keys), never the secrets themselves — see CredentialsSchema.
+			// The implementer persona is NOT a project credential: it is the worker
+			// operator's own token, set as SWARM_OPERATOR_GH_TOKEN in `.env` on each host
+			// that runs implementer phases (issue #396).
 			credentials: {
-				implementer: 'SCM_TOKEN_IMPLEMENTER',
 				reviewer: 'SCM_TOKEN_REVIEWER',
 				webhookSecret: 'SCM_WEBHOOK_SECRET',
 			},

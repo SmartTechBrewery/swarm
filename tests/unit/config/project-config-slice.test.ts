@@ -26,13 +26,11 @@ describe('toNonSecretProjectConfig', () => {
 	it('preserves the credential reference values nowhere in the slice', () => {
 		const project = createMockProjectConfig({
 			credentials: {
-				implementer: 'SENTINEL_IMPLEMENTER_REF',
 				reviewer: 'SENTINEL_REVIEWER_REF',
 				webhookSecret: 'SENTINEL_WEBHOOK_REF',
 			},
 		});
 		const serialized = JSON.stringify(toNonSecretProjectConfig(project));
-		expect(serialized).not.toContain('SENTINEL_IMPLEMENTER_REF');
 		expect(serialized).not.toContain('SENTINEL_REVIEWER_REF');
 		expect(serialized).not.toContain('SENTINEL_WEBHOOK_REF');
 	});

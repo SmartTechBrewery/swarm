@@ -23,7 +23,6 @@ import { upsertProjectToDb } from '@/db/repositories/projectsRepository.js';
 const project = createMockProjectConfig({
 	id: 'proj-1',
 	credentials: {
-		implementer: 'IMPL_KEY',
 		reviewer: 'REV_KEY',
 		webhookSecret: 'HOOK_KEY',
 	},
@@ -34,13 +33,11 @@ describe('applyConfig', () => {
 	beforeEach(() => {
 		vi.mocked(upsertProjectToDb).mockClear();
 		vi.mocked(writeProjectCredential).mockClear();
-		process.env.IMPL_KEY = 'test-token-implementer';
 		process.env.REV_KEY = 'test-token-reviewer';
 		process.env.HOOK_KEY = 'whsec';
 	});
 
 	afterEach(() => {
-		delete process.env.IMPL_KEY;
 		delete process.env.REV_KEY;
 		delete process.env.HOOK_KEY;
 	});
@@ -50,13 +47,10 @@ describe('applyConfig', () => {
 
 		expect(upsertProjectToDb).toHaveBeenCalledWith(project);
 		expect(result.projects).toEqual(['proj-1']);
-		expect(result.credentialsWritten).toBe(3);
+		// The implementer persona is worker-local (SWARM_OPERATOR_GH_TOKEN), never a
+		// project credential, so only reviewer + webhookSecret are stored (issue #396).
+		expect(result.credentialsWritten).toBe(2);
 		expect(result.credentialsSkipped).toEqual([]);
-		expect(writeProjectCredential).toHaveBeenCalledWith(
-			'proj-1',
-			'IMPL_KEY',
-			'test-token-implementer',
-		);
 		expect(writeProjectCredential).toHaveBeenCalledWith('proj-1', 'REV_KEY', 'test-token-reviewer');
 		expect(writeProjectCredential).toHaveBeenCalledWith('proj-1', 'HOOK_KEY', 'whsec');
 	});
@@ -76,7 +70,7 @@ describe('applyConfig', () => {
 
 		const result = await applyConfig(config);
 
-		expect(result.credentialsWritten).toBe(2);
+		expect(result.credentialsWritten).toBe(1);
 		expect(result.credentialsSkipped).toEqual(['proj-1/REV_KEY']);
 		expect(writeProjectCredential).not.toHaveBeenCalledWith('proj-1', 'REV_KEY', expect.anything());
 	});
@@ -89,16 +83,16 @@ describe('applyConfig', () => {
 		expect(result.credentialsSkipped).toEqual(['proj-1/HOOK_KEY']);
 	});
 
-	it('dedupes references so a key shared by two personas is written once', async () => {
+	it('dedupes references so a key shared by two credentials is written once', async () => {
 		const shared = createMockProjectConfig({
 			id: 'proj-2',
-			credentials: { implementer: 'SHARED', reviewer: 'SHARED', webhookSecret: 'HOOK_KEY' },
+			credentials: { reviewer: 'SHARED', webhookSecret: 'SHARED' },
 		});
 		process.env.SHARED = 'test-token-shared';
 
 		const result = await applyConfig(SwarmConfigSchema.parse({ projects: [shared] }));
 
-		expect(result.credentialsWritten).toBe(2);
+		expect(result.credentialsWritten).toBe(1);
 		expect(
 			vi.mocked(writeProjectCredential).mock.calls.filter(([, key]) => key === 'SHARED'),
 		).toHaveLength(1);

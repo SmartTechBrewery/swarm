@@ -5,12 +5,10 @@ import {
 	isVerifiableRole,
 	maskedPreview,
 	SCM_PROVIDERS,
-	sameVerifiedLogin,
 } from './credentials.js';
 
 describe('isVerifiableRole', () => {
-	it('marks the two PAT roles verifiable', () => {
-		expect(isVerifiableRole('implementer')).toBe(true);
+	it('marks the reviewer PAT role verifiable', () => {
 		expect(isVerifiableRole('reviewer')).toBe(true);
 	});
 
@@ -31,23 +29,6 @@ describe('maskedPreview', () => {
 	});
 });
 
-describe('sameVerifiedLogin', () => {
-	it('returns false until both logins are known', () => {
-		expect(sameVerifiedLogin(undefined, undefined)).toBe(false);
-		expect(sameVerifiedLogin('octocat', undefined)).toBe(false);
-		expect(sameVerifiedLogin(undefined, 'octocat')).toBe(false);
-	});
-
-	it('flags identical logins case-insensitively', () => {
-		expect(sameVerifiedLogin('octocat', 'octocat')).toBe(true);
-		expect(sameVerifiedLogin('OctoCat', 'octocat')).toBe(true);
-	});
-
-	it('passes when the two PATs resolve to distinct logins', () => {
-		expect(sameVerifiedLogin('implementer-bot', 'reviewer-bot')).toBe(false);
-	});
-});
-
 describe('SCM_PROVIDERS', () => {
 	it('lists GitHub as the sole available provider', () => {
 		expect(SCM_PROVIDERS).toHaveLength(1);
@@ -63,13 +44,15 @@ describe('getScmProviderCopy', () => {
 	const copy = getScmProviderCopy('github');
 
 	it('projects GitHub-specific role descriptions', () => {
-		expect(copy.roleDescriptions.implementer).toMatch(/GitHub personal access token/);
+		expect(copy.roleDescriptions.reviewer).toMatch(/GitHub personal access token/);
 		expect(copy.roleDescriptions.webhookSecret).toMatch(/HMAC secret/);
 	});
 
-	it('projects the verify-failure and same-account-warning copy', () => {
+	it('projects the verify-failure copy', () => {
 		expect(copy.verifyFailureMessage).toMatch(/GitHub account/);
-		expect(copy.sameAccountWarningTitle('octocat')).toBe('Both PATs resolve to @octocat');
-		expect(copy.sameAccountWarningBody).toMatch(/same GitHub account/);
+	});
+
+	it('explains the implementer token is the operator env var, not a project credential', () => {
+		expect(copy.intro).toMatch(/SWARM_OPERATOR_GH_TOKEN/);
 	});
 });

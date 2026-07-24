@@ -26,16 +26,13 @@ export interface CredentialEntry {
 }
 
 export const CREDENTIAL_ROLE_LABELS: Record<CredentialRole, string> = {
-	implementer: 'Implementer PAT',
 	reviewer: 'Reviewer PAT',
 	webhookSecret: 'Webhook Secret',
 };
 
 export const CREDENTIAL_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
-	implementer:
-		'GitHub personal access token the implementer persona commits and opens pull requests with.',
 	reviewer:
-		'GitHub personal access token the reviewer persona reviews with. Must resolve to a different GitHub account than the implementer for loop prevention to work.',
+		'GitHub personal access token the reviewer persona reviews with. Must resolve to a different GitHub account than the worker operator (the implementer identity) for loop prevention to work.',
 	webhookSecret: 'HMAC secret GitHub signs webhook deliveries with. Not tied to a GitHub identity.',
 };
 
@@ -69,19 +66,14 @@ export interface ScmProviderCopy {
 	roleDescriptions: Record<CredentialRole, string>;
 	/** Shown under a verifiable field when `scm.verifyGithubToken` resolves invalid. */
 	verifyFailureMessage: string;
-	sameAccountWarningTitle: (login: string) => string;
-	sameAccountWarningBody: string;
 }
 
 const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	github: {
 		intro:
-			'The implementer and reviewer personas authenticate to GitHub with separate tokens so their pull requests and reviews are attributed to distinct accounts. Verify each PAT to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.',
+			"The reviewer persona authenticates to GitHub with this project-scoped token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GH_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Verify the PAT to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
 		roleDescriptions: CREDENTIAL_ROLE_DESCRIPTIONS,
 		verifyFailureMessage: 'Token did not resolve to a GitHub account. Check it and try again.',
-		sameAccountWarningTitle: (login) => `Both PATs resolve to @${login}`,
-		sameAccountWarningBody:
-			"The implementer and reviewer tokens map to the same GitHub account. Dual-persona loop prevention relies on two distinct identities — the reviewer's comments will be treated as the implementer's own. This is allowed but not recommended.",
 	},
 };
 
@@ -96,7 +88,7 @@ export function getScmProviderCopy(providerId: ScmProviderId): ScmProviderCopy {
  * it has no login to resolve and no Verify affordance.
  */
 export function isVerifiableRole(role: CredentialRole): boolean {
-	return role === 'implementer' || role === 'reviewer';
+	return role === 'reviewer';
 }
 
 /**
@@ -108,18 +100,4 @@ export function isVerifiableRole(role: CredentialRole): boolean {
  */
 export function maskedPreview(_maskedValue: string): string {
 	return '••••';
-}
-
-/**
- * True when both PATs have been verified in this session and resolve to the same
- * GitHub login — the condition that breaks dual-persona loop prevention. Drives a
- * non-blocking warning banner; comparison is case-insensitive because GitHub
- * logins are. Returns false until both logins are known.
- */
-export function sameVerifiedLogin(
-	implementerLogin: string | undefined,
-	reviewerLogin: string | undefined,
-): boolean {
-	if (!implementerLogin || !reviewerLogin) return false;
-	return implementerLogin.toLowerCase() === reviewerLogin.toLowerCase();
 }

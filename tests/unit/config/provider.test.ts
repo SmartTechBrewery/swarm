@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
@@ -26,7 +26,6 @@ import {
 const project = createMockProjectConfig({
 	id: 'proj-1',
 	credentials: {
-		implementer: 'IMPL_TOKEN_KEY',
 		reviewer: 'REV_TOKEN_KEY',
 		webhookSecret: 'WEBHOOK_KEY',
 	},
@@ -37,6 +36,11 @@ describe('config provider', () => {
 		vi.mocked(resolveProjectCredential).mockReset();
 		vi.mocked(findProjectByRepoFromDb).mockReset();
 		vi.mocked(findProjectByBoardFromDb).mockReset();
+		delete process.env.SWARM_OPERATOR_GH_TOKEN;
+	});
+
+	afterEach(() => {
+		delete process.env.SWARM_OPERATOR_GH_TOKEN;
 	});
 
 	describe('findProjectByRepo', () => {
@@ -56,11 +60,17 @@ describe('config provider', () => {
 	});
 
 	describe('getPersonaTokenOrNull', () => {
-		it("resolves the persona's credential reference to its secret", async () => {
-			vi.mocked(resolveProjectCredential).mockResolvedValue('test-token-implementer');
+		it('resolves the implementer persona from the worker-local operator env var', async () => {
+			process.env.SWARM_OPERATOR_GH_TOKEN = 'operator-token';
 			const token = await getPersonaTokenOrNull(project, 'implementer');
-			expect(token).toBe('test-token-implementer');
-			expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'IMPL_TOKEN_KEY');
+			expect(token).toBe('operator-token');
+			// The implementer never touches project_credentials (issue #396).
+			expect(resolveProjectCredential).not.toHaveBeenCalled();
+		});
+
+		it('returns null for the implementer when the operator env var is unset', async () => {
+			expect(await getPersonaTokenOrNull(project, 'implementer')).toBeNull();
+			expect(resolveProjectCredential).not.toHaveBeenCalled();
 		});
 
 		it('uses the reviewer reference for the reviewer persona', async () => {
@@ -69,19 +79,25 @@ describe('config provider', () => {
 			expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'REV_TOKEN_KEY');
 		});
 
-		it('returns null when the reference resolves to nothing', async () => {
+		it('returns null when the reviewer reference resolves to nothing', async () => {
 			vi.mocked(resolveProjectCredential).mockResolvedValue(null);
-			expect(await getPersonaTokenOrNull(project, 'implementer')).toBeNull();
+			expect(await getPersonaTokenOrNull(project, 'reviewer')).toBeNull();
 		});
 	});
 
 	describe('getPersonaToken', () => {
-		it('returns the token when configured', async () => {
-			vi.mocked(resolveProjectCredential).mockResolvedValue('test-token-implementer');
-			expect(await getPersonaToken(project, 'implementer')).toBe('test-token-implementer');
+		it('returns the implementer operator token when configured', async () => {
+			process.env.SWARM_OPERATOR_GH_TOKEN = 'operator-token';
+			expect(await getPersonaToken(project, 'implementer')).toBe('operator-token');
 		});
 
-		it('throws when the persona token is not configured', async () => {
+		it('throws an actionable SWARM_OPERATOR_GH_TOKEN error when the implementer token is unset', async () => {
+			await expect(getPersonaToken(project, 'implementer')).rejects.toThrow(
+				/SWARM_OPERATOR_GH_TOKEN/,
+			);
+		});
+
+		it('throws when the reviewer token is not configured', async () => {
 			vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 			await expect(getPersonaToken(project, 'reviewer')).rejects.toThrow(/reviewer token/);
 		});

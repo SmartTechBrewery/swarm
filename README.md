@@ -52,8 +52,10 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
 - Docker Compose
 - Git
 - Authenticated agent CLIs (`claude`, `agy`, and/or `codex`)
-- A GitHub repository, Projects v2 board, webhook, and separate SWARM
-  implementer/reviewer credentials
+- A GitHub repository, Projects v2 board, and webhook
+- Two distinct GitHub identities for loop prevention: the worker operator's own
+  token (`SWARM_OPERATOR_GH_TOKEN`, the implementer persona) set in `.env` on each
+  host, and a separate project-scoped reviewer credential
 
 ## Quick start
 

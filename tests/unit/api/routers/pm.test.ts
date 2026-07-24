@@ -171,12 +171,12 @@ describe('pmRouter', () => {
 			});
 		});
 
-		it('maps a missing implementer credential to safe, actionable copy', async () => {
+		it('maps a missing implementer (operator) token to safe, actionable copy', async () => {
 			const discover = vi
 				.fn()
 				.mockRejectedValue(
 					new Error(
-						"No GitHub implementer token configured for project 'swarm' (credential reference 'SCM_TOKEN_IMPLEMENTER' not found in project_credentials)",
+						"No GitHub implementer token configured: set SWARM_OPERATOR_GH_TOKEN on this host (the worker operator's own token; never stored in project_credentials)",
 					),
 				);
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig());
@@ -186,12 +186,9 @@ describe('pmRouter', () => {
 			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.toMatchObject({
 				code: 'PRECONDITION_FAILED',
 			});
-			// The credential reference / env-var key must not leak to the client.
+			// The actionable copy points the operator at the host env var.
 			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.toThrow(
-				/Source Control/,
-			);
-			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.not.toThrow(
-				/SCM_TOKEN_IMPLEMENTER/,
+				/SWARM_OPERATOR_GH_TOKEN/,
 			);
 		});
 

@@ -59,8 +59,8 @@ export const PROJECT_DEFAULTS = {
 } as const;
 
 /**
- * References to a project's GitHub credentials — the dual-persona tokens plus
- * the webhook-verification secret.
+ * References to a project's *project-scoped* GitHub credentials — the reviewer
+ * persona token plus the webhook-verification secret.
  *
  * These are *references*, never the secret values: each is a key into the
  * secret store (the Postgres `project_credentials` table / an env var name),
@@ -69,14 +69,17 @@ export const PROJECT_DEFAULTS = {
  * project config JSON would defeat that scoping and leak them into logs and
  * DB rows — PROJECT.md §6.1 keeps secrets out of config on purpose.
  *
- * The implementer/reviewer split is Cascade's loop-prevention model
- * (ai/CODING_STANDARDS.md "Loop prevention"): a persona never reacts to its own
- * output, so the two identities must resolve to two distinct credentials.
+ * The `implementer` persona is deliberately **not** here (issue #396): it is the
+ * worker operator's own token, a worker-local `SWARM_OPERATOR_GH_TOKEN` env var
+ * (`./operator-token.ts`), never persisted and never in this config. The
+ * implementer/reviewer loop-prevention split (ai/CODING_STANDARDS.md "Loop
+ * prevention") still holds — the two personas resolve to two distinct identities
+ * (author = operator ≠ reviewer). This schema stays non-strict, so a legacy
+ * `swarm.config.json` still carrying an `implementer` reference parses with the
+ * key stripped, keeping `swarm config apply` idempotent.
  */
 export const CredentialsSchema = z
 	.object({
-		/** Reference to the implementer-persona GitHub token in the secret store. */
-		implementer: z.string().min(1),
 		/** Reference to the reviewer-persona GitHub token in the secret store. */
 		reviewer: z.string().min(1),
 		/** Reference to the GitHub webhook HMAC secret used to verify inbound events. */
