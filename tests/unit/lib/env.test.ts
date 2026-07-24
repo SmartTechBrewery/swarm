@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isSingleUserMode, optionalEnv, requireEnv } from '@/lib/env.js';
+import {
+	isSingleUserMode,
+	optionalEnv,
+	requireEnv,
+	resolveOperatorGitHubToken,
+} from '@/lib/env.js';
 
 describe('requireEnv', () => {
 	it('returns the value when the variable is set', () => {
@@ -41,5 +46,32 @@ describe('isSingleUserMode', () => {
 			vi.stubEnv('SWARM_SINGLE_USER_MODE', value);
 			expect(isSingleUserMode()).toBe(false);
 		}
+	});
+});
+
+describe('resolveOperatorGitHubToken', () => {
+	it('returns the value when passed directly', () => {
+		expect(resolveOperatorGitHubToken('ghp_x')).toBe('ghp_x');
+	});
+
+	it('reads SWARM_OPERATOR_GH_TOKEN when no argument is given', () => {
+		vi.stubEnv('SWARM_OPERATOR_GH_TOKEN', 'ghp_env');
+		expect(resolveOperatorGitHubToken()).toBe('ghp_env');
+	});
+
+	it('trims surrounding whitespace', () => {
+		expect(resolveOperatorGitHubToken('  ghp_x  ')).toBe('ghp_x');
+	});
+
+	it('throws when unset (empty string)', () => {
+		expect(() => resolveOperatorGitHubToken('')).toThrow(
+			/Missing required environment variable: SWARM_OPERATOR_GH_TOKEN/,
+		);
+	});
+
+	it('throws for a whitespace-only value', () => {
+		expect(() => resolveOperatorGitHubToken('   ')).toThrow(
+			/Missing required environment variable: SWARM_OPERATOR_GH_TOKEN/,
+		);
 	});
 });
