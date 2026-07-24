@@ -1,13 +1,43 @@
 // @vitest-environment jsdom
 
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunRow } from '@/types/runs.js';
+
+// The route module builds a real tRPC client at import time; the reset-button
+// tests below drive its mutation, so the whole module is stubbed here. Every
+// other test in this file renders a pure callout that never touches it.
+vi.mock('@/lib/trpc.js', () => ({
+	trpcClient: { runs: { reset: { mutate: vi.fn() } } },
+	trpc: {
+		runs: {
+			getById: { queryKey: () => ['runs.getById'] },
+			list: { queryKey: () => ['runs.list'] },
+		},
+	},
+}));
+vi.mock('@tanstack/react-router', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@tanstack/react-router')>();
+	return {
+		...actual,
+		// biome-ignore lint/suspicious/noExplicitAny: simple test stub for Link
+		Link: ({ children, to, className }: any) => (
+			<a href={to} className={className}>
+				{children}
+			</a>
+		),
+	};
+});
+
+import { trpcClient } from '@/lib/trpc.js';
 import {
 	FailureDiagnosisCallout,
 	RecoveryCallout,
+	ResetRunButton,
 	ReviewCapCallout,
 	ReviewMergeCallout,
+	RunDetailHeader,
 } from './$runId.js';
 
 function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
@@ -283,5 +313,159 @@ describe('ReviewMergeCallout (issue #278)', () => {
 
 		expect(screen.getByRole('heading', { name: heading })).toBeDefined();
 		expect(screen.getByText('details here')).toBeDefined();
+	});
+});
+
+describe('ResetRunButton (issue #428)', () => {
+	const resetMutate = vi.mocked(trpcClient.runs.reset.mutate);
+
+	beforeEach(() => {
+		resetMutate.mockReset();
+	});
+
+	function renderResetButton(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<ResetRunButton run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	/** Open the confirmation modal from the run-detail callout's button. */
+	function openConfirm(run: RunRow = makeReviewRun({ status: 'failed', phase: 'implementation' })) {
+		renderResetButton(run);
+		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
+	}
+
+	function confirm() {
+		const buttons = screen.getAllByRole('button', { name: /reset & restart/i });
+		// The trigger renders first; the modal's confirm button is the last one.
+		fireEvent.click(buttons[buttons.length - 1]);
+	}
+
+	it('resets without force until the discard opt-in is ticked', async () => {
+		resetMutate.mockResolvedValue({
+			runId: 'run-1',
+			forced: false,
+			dispatch: 'cancelled',
+			cancellationCleared: true,
+			worktree: { outcome: 'blocked', blockedReason: 'dirty' },
+			recoveryCleared: true,
+			dispatchId: 'dispatch-9',
+		});
+		openConfirm();
+		expect(screen.getByText(/are kept/i)).toBeDefined();
+
+		confirm();
+
+		await waitFor(() => {
+			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1', force: false });
+		});
+	});
+
+	it('maps the discard opt-in to the force variant and warns it is unrecoverable', async () => {
+		resetMutate.mockResolvedValue({
+			runId: 'run-1',
+			forced: true,
+			dispatch: 'cancelled',
+			cancellationCleared: true,
+			worktree: { outcome: 'removed', discarded: 'dirty' },
+			recoveryCleared: true,
+			dispatchId: 'dispatch-9',
+		});
+		openConfirm();
+
+		fireEvent.click(screen.getByRole('checkbox'));
+		expect(screen.getByText(/discarded permanently/i)).toBeDefined();
+
+		confirm();
+
+		await waitFor(() => {
+			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1', force: true });
+		});
+	});
+
+	it('renders the per-step report on success', async () => {
+		resetMutate.mockResolvedValue({
+			runId: 'run-1',
+			forced: false,
+			dispatch: 'force-cancelled-claimed',
+			cancellationCleared: true,
+			worktree: { outcome: 'blocked', blockedReason: 'live-leased' },
+			recoveryCleared: true,
+			dispatchId: 'dispatch-9',
+		});
+		openConfirm();
+		confirm();
+
+		await waitFor(() => {
+			expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
+		});
+		expect(screen.getByText(/worker-claimed dispatch was force-cancelled/i)).toBeDefined();
+		expect(
+			screen.getByText(/Checkout: retained — a lease held by another live run/i),
+		).toBeDefined();
+		expect(screen.getByText(/dispatch dispatch-9/i)).toBeDefined();
+		// The modal closed, so its confirm button is gone.
+		expect(screen.queryByRole('checkbox')).toBeNull();
+	});
+
+	it("renders the server's refusal message inline", async () => {
+		resetMutate.mockRejectedValue(new Error('Run "run-1" is already being restarted.'));
+		openConfirm();
+		confirm();
+
+		await waitFor(() => {
+			expect(screen.getByText('Run "run-1" is already being restarted.')).toBeDefined();
+		});
+		// A refused reset keeps the modal open so the operator can adjust and retry.
+		expect(screen.getByRole('checkbox')).toBeDefined();
+	});
+
+	it('preserves the success report in RunDetailHeader post-invalidation when status transitions to running', async () => {
+		resetMutate.mockResolvedValue({
+			runId: 'run-1',
+			forced: false,
+			dispatch: 'cancelled',
+			cancellationCleared: true,
+			worktree: { outcome: 'removed' },
+			recoveryCleared: true,
+			dispatchId: 'dispatch-9',
+		});
+
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const failedRun = makeReviewRun({
+			status: 'failed',
+			phase: 'implementation',
+			error: 'some error',
+		});
+
+		const { rerender } = render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={failedRun} />
+			</QueryClientProvider>,
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
+		const buttons = screen.getAllByRole('button', { name: /reset & restart/i });
+		fireEvent.click(buttons[buttons.length - 1]);
+
+		await waitFor(() => {
+			expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
+		});
+
+		// Simulate background worker claiming new dispatch and updating run status to running
+		const runningRun = makeReviewRun({ status: 'running', phase: 'implementation', error: null });
+
+		rerender(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={runningRun} />
+			</QueryClientProvider>,
+		);
+
+		// The success report should still be visible even though run status is running and ResetRunButton unmounted
+		expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
+		expect(screen.getByText(/dispatch dispatch-9/i)).toBeDefined();
 	});
 });

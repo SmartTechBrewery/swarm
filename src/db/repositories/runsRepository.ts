@@ -497,6 +497,46 @@ export async function recordRunCleanupBlocked(
 }
 
 /**
+ * Clear a run's recovery record for a "Reset & restart" (issue #424): the fresh
+ * attempt starts from a clean slate, so a `blocked`/`preserved` record must not
+ * keep misleading retention (`hasResumableDeferredRun`), the reclaim gate, or
+ * the UI. The captured session id goes with it — a retained session must never
+ * outlive the checkout it would have resumed.
+ */
+export async function clearRunRecovery(runId: string): Promise<void> {
+	await getDb()
+		.update(runs)
+		.set({ recovery: null, agentSessionId: null })
+		.where(eq(runs.id, runId));
+}
+
+/**
+ * Whether a *different* run is still live (`running`) for this project task —
+ * the "is this worktree lease genuinely owned, or stale?" question the reset
+ * action (issue #424) asks before reclaiming a `live-leased` checkout. The run
+ * being reset is excluded: its own lease is precisely the stale marker to clear.
+ */
+export async function hasLiveRunForTask(
+	projectId: string,
+	taskId: string,
+	excludeRunId: string,
+): Promise<boolean> {
+	const rows = await getDb()
+		.select({ id: runs.id })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.taskId, taskId),
+				eq(runs.status, 'running'),
+				ne(runs.id, excludeRunId),
+			),
+		)
+		.limit(1);
+	return rows.length > 0;
+}
+
+/**
  * Resolve the most recent run for one project task and phase. Fresh webhook
  * reruns use this to find a deferred or failed row that can be reused.
  */

@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
@@ -25,6 +24,8 @@ import {
 	createAndPublishDispatch,
 	publishDispatchWakeUp,
 } from '../../dispatch/dispatcher.js';
+import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
+import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { resolvePipelinePhaseForOptionId } from '../../integrations/pm/github-projects/status-mapping.js';
@@ -203,52 +204,20 @@ const ListRunsInputSchema = z.object({
 	offset: z.number().int().nonnegative().default(0),
 });
 
-/**
- * Rebuild a retry job payload from a stored one: carry the originating `runId`
- * forward (so the retry reuses that row) and reset the rate-limit attempt
- * counter to 0 (a manual retry bypasses the automatic cap), applying any
- * cli/model overrides. Shared by the reopen-existing-dispatch path and the
- * reconstruct-from-run-row fallback.
- */
-function reconstructRetryJob(
-	jobPayload: SwarmJob,
-	runId: string,
-	phase: string,
-	cli?: z.infer<typeof AgentCliSchema>,
-	model?: string,
-	reasoning?: z.infer<typeof ReasoningLevelSchema>,
-	freshSession = false,
-	recoveryMode?: 'resume' | 'fresh',
-	expectedSessionId?: string | null,
-): SwarmJob {
-	const job = { ...jobPayload };
-	job.runId = runId;
-	job.rateLimitRetryAttempt = 0;
-	if (job.type === 'github-projects' && (phase === 'planning' || phase === 'implementation')) {
-		job.resumePmPhase = phase;
-	}
-	if (cli) job.cliOverride = cli;
-	if (model) job.modelOverride = model;
-	if (reasoning) job.reasoningOverride = reasoning;
-	if (recoveryMode) {
-		job.recoveryMode = recoveryMode;
-		if (recoveryMode === 'resume') {
-			job.resumeSession = true;
-			if (expectedSessionId) job.agentSessionId = expectedSessionId;
-		} else {
-			job.agentSessionId = randomUUID();
-			delete job.resumeSession;
-		}
-	} else if (freshSession) {
-		job.agentSessionId = randomUUID();
-		delete job.resumeSession;
-	}
-	return job;
-}
-
 function wakeJobId(dispatch: { id: string; wakeSeq: number }): string {
 	return `dispatch_${dispatch.id}_w${dispatch.wakeSeq}`;
 }
+
+/** How each reset refusal (`src/dispatch/run-reset.ts`) surfaces over tRPC. */
+const RESET_REFUSAL_CODES: Record<RunResetRefusal, TRPCError['code']> = {
+	'run-not-found': 'NOT_FOUND',
+	'already-resetting': 'CONFLICT',
+	'project-not-found': 'PRECONDITION_FAILED',
+	'missing-job-payload': 'PRECONDITION_FAILED',
+	'running-not-forced': 'PRECONDITION_FAILED',
+	'dispatch-claimed': 'PRECONDITION_FAILED',
+	'worktree-teardown-failed': 'PRECONDITION_FAILED',
+};
 
 function alreadyRetrying(): TRPCError {
 	return new TRPCError({
@@ -690,6 +659,55 @@ export const runsRouter = router({
 
 			// `running`: the worker aborts the agent and settles the row.
 			return { runId: run.id, status: 'terminating' as const };
+		}),
+
+	// Reset and restart a wedged run ("Reset & restart", issue #424).
+	//
+	// The last-resort action for a run that neither "Retry now" nor "Terminate"
+	// can move because its dispatch, Redis cancellation flag, worktree lease, and
+	// recovery record disagree — the state that today needs manual DB and git
+	// surgery. It cancels the active dispatch, clears the cancellation flag, tears
+	// down the checkout and its lease, clears the recovery record, and re-dispatches
+	// the same row from its stored payload with a fresh agent session. It is the
+	// only action able to release a **stale** `live-leased` lease (one no live run
+	// owns) and, with `force`, to discard a dirty/unpushed checkout.
+	//
+	// `force` additionally allows resetting a `running` run and cancelling a
+	// dispatch a worker already claimed. It cannot stop an already-spawned agent
+	// process (only Terminate does), so it stays an explicit operator choice.
+	//
+	// The sequence itself lives in `src/dispatch/run-reset.ts` so the CLI can call
+	// it without tRPC context; this procedure only authorizes and maps refusals.
+	reset: authedProcedure
+		.input(z.object({ runId: z.string().min(1), force: z.boolean().default(false) }))
+		.mutation(async ({ ctx, input }) => {
+			// Resolved here for authorization only — the service re-reads the row.
+			const run = await getRunByIdFromDb(input.runId);
+			if (!run) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Run with ID "${input.runId}" not found`,
+				});
+			}
+			// Resetting a run is a drive-the-run action: `member`+, like retry/terminate.
+			await assertProjectAccess(
+				ctx.user,
+				run.projectId,
+				'member',
+				`Run with ID "${input.runId}" not found`,
+			);
+
+			try {
+				return await resetRun(input.runId, { force: input.force });
+			} catch (error) {
+				if (error instanceof RunResetError) {
+					throw new TRPCError({ code: RESET_REFUSAL_CODES[error.reason], message: error.message });
+				}
+				throw new TRPCError({
+					code: 'INTERNAL_SERVER_ERROR',
+					message: `Failed to reset run "${input.runId}": ${describeError(error)}`,
+				});
+			}
 		}),
 
 	// Put back action for queued work items (issues #251, #284).

@@ -11,6 +11,7 @@ import { deleteProjectFromDb } from '../../../src/db/repositories/projectsReposi
 import {
 	appendRunOutputEvents,
 	cancelDeferredRunInDb,
+	clearRunRecovery,
 	completeRun,
 	createRun,
 	failOrphanedRunningRuns,
@@ -22,6 +23,7 @@ import {
 	getRunLogsFromDb,
 	getRunOutputEvents,
 	hasCompletedRunForTask,
+	hasLiveRunForTask,
 	hasResumableDeferredRun,
 	hasRunningRunForTask,
 	listRunsFromDb,
@@ -577,6 +579,59 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(row?.status).toBe('failed');
 			expect(row?.recovery).toEqual({ state: 'blocked', blockedReason: 'dirty' });
 			expect(row?.agentSessionId).toBeNull();
+		});
+	});
+
+	describe('reset & restart support (issue #424)', () => {
+		it('clears the recovery record and the captured session id', async () => {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '424a',
+				phase: 'implementation',
+			});
+			await completeRun(id, { status: 'failed', error: 'wedged', agentSessionId: id });
+			await recordRunCleanupBlocked(id, 'live-leased');
+
+			await clearRunRecovery(id);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.recovery).toBeNull();
+			expect(row?.agentSessionId).toBeNull();
+			// The terminal state and its reason are untouched.
+			expect(row?.status).toBe('failed');
+			expect(row?.error).toBe('wedged');
+		});
+
+		it('sees a different live run for the task but not the run being reset', async () => {
+			const resetting = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '424b',
+				phase: 'implementation',
+			});
+			// The run being reset is `running` itself — its own lease is the stale marker.
+			await expect(hasLiveRunForTask(PROJECT_ID, '424b', resetting)).resolves.toBe(false);
+
+			const other = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '424b',
+				phase: 'review',
+			});
+			await expect(hasLiveRunForTask(PROJECT_ID, '424b', resetting)).resolves.toBe(true);
+
+			// A settled run no longer owns the checkout.
+			await completeRun(other, { status: 'completed' });
+			await expect(hasLiveRunForTask(PROJECT_ID, '424b', resetting)).resolves.toBe(false);
+		});
+
+		it('ignores live runs for other tasks', async () => {
+			const resetting = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '424c',
+				phase: 'implementation',
+			});
+			await createRun({ projectId: PROJECT_ID, taskId: '424d', phase: 'implementation' });
+
+			await expect(hasLiveRunForTask(PROJECT_ID, '424c', resetting)).resolves.toBe(false);
 		});
 	});
 

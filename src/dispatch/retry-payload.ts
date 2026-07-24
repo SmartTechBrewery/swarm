@@ -5,8 +5,17 @@
  * deferral* — before any queue work — so the retry intent survives a crash
  * between settle and wake-up publication, instead of living only inside a
  * fire-and-forget BullMQ handler.
+ *
+ * It also owns {@link reconstructRetryJob}, the *manual* counterpart: the
+ * payload an operator-driven attempt runs with. It lives here rather than in
+ * the tRPC router so both operator paths — "Retry now" (`runs.retryNow`) and
+ * "Reset & restart" (`src/dispatch/run-reset.ts`, issue #424) — rebuild an
+ * attempt the same way.
  */
 
+import { randomUUID } from 'node:crypto';
+import type { AgentCli } from '../harness/agent-cli.js';
+import type { ReasoningLevel } from '../harness/models.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import type { TriggerPhase } from '../triggers/types.js';
 
@@ -104,6 +113,49 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		// retry's handler must reuse it rather than re-claim (issue #214).
 		...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),
 	};
+}
+
+/**
+ * Rebuild a retry job payload from a stored one: carry the originating `runId`
+ * forward (so the retry reuses that row) and reset the rate-limit attempt
+ * counter to 0 (a manual retry bypasses the automatic cap), applying any
+ * cli/model overrides. Shared by "Retry now"'s reopen-existing-dispatch path,
+ * its reconstruct-from-run-row fallback, and "Reset & restart".
+ */
+export function reconstructRetryJob(
+	jobPayload: SwarmJob,
+	runId: string,
+	phase: string,
+	cli?: AgentCli,
+	model?: string,
+	reasoning?: ReasoningLevel,
+	freshSession = false,
+	recoveryMode?: 'resume' | 'fresh',
+	expectedSessionId?: string | null,
+): SwarmJob {
+	const job = { ...jobPayload };
+	job.runId = runId;
+	job.rateLimitRetryAttempt = 0;
+	if (job.type === 'github-projects' && (phase === 'planning' || phase === 'implementation')) {
+		job.resumePmPhase = phase;
+	}
+	if (cli) job.cliOverride = cli;
+	if (model) job.modelOverride = model;
+	if (reasoning) job.reasoningOverride = reasoning;
+	if (recoveryMode) {
+		job.recoveryMode = recoveryMode;
+		if (recoveryMode === 'resume') {
+			job.resumeSession = true;
+			if (expectedSessionId) job.agentSessionId = expectedSessionId;
+		} else {
+			job.agentSessionId = randomUUID();
+			delete job.resumeSession;
+		}
+	} else if (freshSession) {
+		job.agentSessionId = randomUUID();
+		delete job.resumeSession;
+	}
+	return job;
 }
 
 /**

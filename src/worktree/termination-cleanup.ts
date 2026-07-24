@@ -26,6 +26,13 @@
  * any git error as unsafe (dirty / has-unpushed), so a validation failure
  * surfaces as a blocked reason and never as a forced removal of protected work.
  *
+ * The "Reset & restart" operator action (`src/dispatch/run-reset.ts`, issue
+ * #424) is the only caller that passes {@link TerminationCleanupOptions}: it
+ * needs to release a *stale* lease (a marker no live run owns — the state a
+ * wedged run leaves behind) and, on an explicit `force`, to discard a protected
+ * checkout instead of retaining it. Both are opt-in; with no options this
+ * settles exactly as described above, fail-closed included.
+ *
  * The caller must invoke this only *after* the target run is known to have
  * stopped — never while it may still be executing an agent.
  */
@@ -45,9 +52,36 @@ export type TerminationCleanupResult =
 	/** Checkout kept for an explicit resumable session; the lease was released. */
 	| { outcome: 'preserved'; agentSessionId: string }
 	/** Checkout was clean, pushed, and unleased — removed. */
-	| { outcome: 'removed' }
+	| {
+			outcome: 'removed';
+			/** Set only when {@link TerminationCleanupOptions.discardProtectedWork} overrode this blocked reason. */
+			discarded?: TerminationBlockedReason;
+			/** Set only when a stale (unowned) lease was reclaimed rather than honoured. */
+			staleLeaseReleased?: true;
+	  }
 	/** Protected work retained rather than removed. */
 	| { outcome: 'blocked'; blockedReason: TerminationBlockedReason };
+
+/**
+ * Opt-in capabilities for the "Reset & restart" path (issue #424). Omitting the
+ * options object — as every other caller does — keeps today's behavior exactly.
+ */
+export interface TerminationCleanupOptions {
+	/**
+	 * Resolve whether a *live* run still owns this task's checkout. A present
+	 * lease with no live owner is a **stale** marker (the state a wedged run
+	 * leaves behind), so it is released and the checkout reclaimed instead of
+	 * being reported `live-leased` forever. Must fail closed — return `true`
+	 * when it cannot tell.
+	 */
+	hasLiveOwner?: (projectId: string, taskId: string) => Promise<boolean>;
+	/**
+	 * Discard a dirty / unpushed checkout instead of retaining it — the
+	 * operator's explicit `--force`. Logged loudly and reported back through
+	 * `discarded` so the caller can say what was thrown away.
+	 */
+	discardProtectedWork?: boolean;
+}
 
 /**
  * Reconcile a terminated run's worktree, lease, and (implied) recovery record
@@ -63,6 +97,8 @@ export type TerminationCleanupResult =
  *   blocks removal); `false` for a deferred run that never took the lease (a
  *   present lease then belongs to a *different* live run and protects the
  *   checkout as `live-leased`).
+ * @param options the reset path's opt-in stale-lease / discard behavior; see
+ *   {@link TerminationCleanupOptions}. Omit it for today's settlement.
  */
 export async function reconcileTerminatedWorktree(
 	worktrees: GitWorktreeManager,
@@ -70,6 +106,7 @@ export async function reconcileTerminatedWorktree(
 	taskId: string,
 	sessionToPreserve: string | null,
 	stoppedRunHeldLease: boolean,
+	options: TerminationCleanupOptions = {},
 ): Promise<TerminationCleanupResult> {
 	const path = worktrees.worktreePath(taskId);
 	if (!existsSync(path)) {
@@ -90,28 +127,61 @@ export async function reconcileTerminatedWorktree(
 		return { outcome: 'preserved', agentSessionId: sessionToPreserve };
 	}
 
+	let staleLeaseReleased: true | undefined;
 	if (!stoppedRunHeldLease && (await isWorktreeLeased(projectId, taskId))) {
-		// A different live run owns this checkout — leave it and record why.
-		logger.info('termination settlement: retaining live-leased checkout', { projectId, taskId });
-		return { outcome: 'blocked', blockedReason: 'live-leased' };
-	}
-
-	if (!(await worktrees.isClean(taskId))) {
-		logger.info('termination settlement: retaining dirty checkout', { projectId, taskId });
-		return { outcome: 'blocked', blockedReason: 'dirty' };
-	}
-
-	if (await worktrees.hasUnpushedWork(taskId)) {
-		logger.info('termination settlement: retaining checkout with unpushed commits', {
+		// A lease is only protective while a live run actually owns it. Without a
+		// `hasLiveOwner` resolver we cannot tell, so the lease is honoured exactly
+		// as before; a resolver that says "no live owner" makes this a stale marker
+		// the reset path may reclaim.
+		if (!options.hasLiveOwner || (await options.hasLiveOwner(projectId, taskId))) {
+			logger.info('termination settlement: retaining live-leased checkout', { projectId, taskId });
+			return { outcome: 'blocked', blockedReason: 'live-leased' };
+		}
+		logger.warn('termination settlement: reclaiming stale worktree lease — no live run owns it', {
 			projectId,
 			taskId,
 		});
-		return { outcome: 'blocked', blockedReason: 'unpushed' };
+		await releaseWorktreeLease(projectId, taskId);
+		staleLeaseReleased = true;
+	}
+
+	let discarded: TerminationBlockedReason | undefined;
+	if (!(await worktrees.isClean(taskId))) {
+		if (!options.discardProtectedWork) {
+			logger.info('termination settlement: retaining dirty checkout', { projectId, taskId });
+			return { outcome: 'blocked', blockedReason: 'dirty' };
+		}
+		logger.warn('termination settlement: discarding uncommitted work on operator request', {
+			projectId,
+			taskId,
+			path,
+		});
+		discarded = 'dirty';
+	}
+
+	if (await worktrees.hasUnpushedWork(taskId)) {
+		if (!options.discardProtectedWork) {
+			logger.info('termination settlement: retaining checkout with unpushed commits', {
+				projectId,
+				taskId,
+			});
+			return { outcome: 'blocked', blockedReason: 'unpushed' };
+		}
+		logger.warn('termination settlement: discarding unpushed commits on operator request', {
+			projectId,
+			taskId,
+			path,
+		});
+		discarded ??= 'unpushed';
 	}
 
 	// Clean, pushed, unleased, and nothing to resume — safe to remove.
 	// `cleanup()` releases the lease and removes the checkout.
 	await worktrees.cleanup(taskId);
 	logger.info('termination settlement: removed clean checkout', { projectId, taskId });
-	return { outcome: 'removed' };
+	return {
+		outcome: 'removed',
+		...(discarded ? { discarded } : {}),
+		...(staleLeaseReleased ? { staleLeaseReleased } : {}),
+	};
 }
