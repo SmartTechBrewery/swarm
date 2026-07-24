@@ -14,7 +14,7 @@ const {
 	readWorktreeLeaseMock,
 	takeOverWorktreeLeaseMock,
 	hasResumableDeferredRunMock,
-	hasRunningRunForTaskMock,
+	hasLiveRunForTaskMock,
 	hasExecutingDispatchForTaskMock,
 } = vi.hoisted(() => ({
 	claimWorktreeLeaseMock: vi.fn(),
@@ -24,7 +24,7 @@ const {
 	readWorktreeLeaseMock: vi.fn(),
 	takeOverWorktreeLeaseMock: vi.fn(),
 	hasResumableDeferredRunMock: vi.fn(),
-	hasRunningRunForTaskMock: vi.fn(),
+	hasLiveRunForTaskMock: vi.fn(),
 	hasExecutingDispatchForTaskMock: vi.fn(),
 }));
 
@@ -42,7 +42,7 @@ vi.mock('@/worktree/worktree-lease.js', () => ({
 // check (`src/worktree/lease-liveness.ts`) to tell a live lease from an orphan.
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	hasResumableDeferredRun: hasResumableDeferredRunMock,
-	hasRunningRunForTask: hasRunningRunForTaskMock,
+	hasLiveRunForTask: hasLiveRunForTaskMock,
 }));
 
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
@@ -123,7 +123,7 @@ describe('GitWorktreeManager', () => {
 		hasResumableDeferredRunMock.mockReset().mockResolvedValue(false);
 		// Lease-liveness defaults (issue #427): nothing owns a held lease, and a
 		// take-over of one succeeds — only the tests that contend say otherwise.
-		hasRunningRunForTaskMock.mockReset().mockResolvedValue(false);
+		hasLiveRunForTaskMock.mockReset().mockResolvedValue(false);
 		hasExecutingDispatchForTaskMock.mockReset().mockResolvedValue(false);
 		readWorktreeLeaseMock.mockReset().mockResolvedValue('stale-token');
 		takeOverWorktreeLeaseMock.mockReset().mockResolvedValue(true);
@@ -312,7 +312,7 @@ describe('GitWorktreeManager', () => {
 			it('still blocks (live-leased) when another run for the task is running', async () => {
 				existingPaths.add(WORKTREE_14);
 				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
-				hasRunningRunForTaskMock.mockResolvedValue(true);
+				hasLiveRunForTaskMock.mockResolvedValue(true);
 
 				const err = await makeManager()
 					.provision('14', { runId: RUN_ID })
@@ -390,7 +390,7 @@ describe('GitWorktreeManager', () => {
 					.provision('14')
 					.catch((e) => e);
 				expect(err.reason).toBe('live-leased');
-				expect(hasRunningRunForTaskMock).not.toHaveBeenCalled();
+				expect(hasLiveRunForTaskMock).not.toHaveBeenCalled();
 				expect(hasExecutingDispatchForTaskMock).not.toHaveBeenCalled();
 				expect(takeOverWorktreeLeaseMock).not.toHaveBeenCalled();
 			});

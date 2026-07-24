@@ -25,7 +25,6 @@ import {
 	hasCompletedRunForTask,
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
-	hasRunningRunForTask,
 	listRunsFromDb,
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
@@ -1257,33 +1256,35 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 		});
 	});
 
-	describe('hasRunningRunForTask (issue #427)', () => {
+	// The optional-`excludeRunId` form the provision-time lease-liveness check uses
+	// (issue #427); the #424 reset path's always-excluded form is covered above.
+	describe('hasLiveRunForTask without an excluded run (issue #427)', () => {
 		it('is true while a run for the task is running', async () => {
 			await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'review' });
-			expect(await hasRunningRunForTask(PROJECT_ID, '85')).toBe(true);
+			expect(await hasLiveRunForTask(PROJECT_ID, '85')).toBe(true);
 		});
 
 		it('is false once that run settles', async () => {
 			const id = await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'review' });
 			await completeRun(id, { status: 'completed', engine: 'claude' });
-			expect(await hasRunningRunForTask(PROJECT_ID, '85')).toBe(false);
+			expect(await hasLiveRunForTask(PROJECT_ID, '85')).toBe(false);
 		});
 
 		it('is false when the only running run is the excluded asking run', async () => {
 			const id = await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'review' });
-			expect(await hasRunningRunForTask(PROJECT_ID, '85', id)).toBe(false);
+			expect(await hasLiveRunForTask(PROJECT_ID, '85', id)).toBe(false);
 		});
 
 		it('is true when another run for the task is running alongside the asking one', async () => {
 			const mine = await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'review' });
 			await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'respond-to-review' });
-			expect(await hasRunningRunForTask(PROJECT_ID, '85', mine)).toBe(true);
+			expect(await hasLiveRunForTask(PROJECT_ID, '85', mine)).toBe(true);
 		});
 
 		it('scopes to the given project and task', async () => {
 			await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'review' });
-			expect(await hasRunningRunForTask(PROJECT_ID, '86')).toBe(false);
-			expect(await hasRunningRunForTask('proj-other', '85')).toBe(false);
+			expect(await hasLiveRunForTask(PROJECT_ID, '86')).toBe(false);
+			expect(await hasLiveRunForTask('proj-other', '85')).toBe(false);
 		});
 	});
 

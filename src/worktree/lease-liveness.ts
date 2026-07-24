@@ -17,10 +17,23 @@
  * It fails CLOSED throughout: no identity for the asking run, or a database
  * error, reports "live", so the gate keeps #367's protection and never licenses
  * removing a checkout it is unsure about.
+ *
+ * **Scope of the signal.** Liveness is derived from the two owners the database
+ * records — a `running` run and an executing (`leased`/`running`) dispatch — which
+ * transitively covers a live *worker*, because a worker executing a phase has
+ * both. It deliberately does not consult `worker_sessions` heartbeats, so one
+ * window is knowingly left uncovered: a worker still alive and writing whose
+ * bookkeeping has already been reaped as timed out (`failStaleRunningRuns`,
+ * `failExpiredDispatchLeases`). That is accepted rather than closed here because
+ * by then SWARM has declared the phase dead by wall-clock timeout, and the
+ * checkout keeps its real protection regardless — the reclaim gate behind this
+ * one (`evaluateWorktreeReclaim`) retains any checkout that is dirty or unpushed,
+ * so a still-writing agent's work is never force-removed; only a provably clean,
+ * fully pushed checkout can be reclaimed in that window.
  */
 
 import { hasExecutingDispatchForTask } from '../db/repositories/dispatchesRepository.js';
-import { hasRunningRunForTask } from '../db/repositories/runsRepository.js';
+import { hasLiveRunForTask } from '../db/repositories/runsRepository.js';
 import { logger } from '../lib/logger.js';
 
 /** Injectable lookups for the liveness check; both default to the real repositories. */
@@ -55,7 +68,7 @@ export async function hasLiveWorktreeLeaseOwner(
 	// every answer would be "live" anyway. Keep #367's behaviour verbatim.
 	if (!currentRunId) return true;
 
-	const hasRunningRun = deps.hasRunningRun ?? hasRunningRunForTask;
+	const hasRunningRun = deps.hasRunningRun ?? hasLiveRunForTask;
 	const hasExecutingDispatch = deps.hasExecutingDispatch ?? hasExecutingDispatchForTask;
 	try {
 		if (await hasRunningRun(projectId, taskId, currentRunId)) return true;

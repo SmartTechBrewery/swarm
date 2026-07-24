@@ -715,6 +715,13 @@ export async function getActiveDispatchByRunId(runId: string): Promise<DispatchR
  * without a run row is degraded, not idle, and still owns the checkout. That leg
  * is explicit because SQL `NULL <> 'x'` is unknown, not true, so `ne` alone would
  * silently drop it.
+ *
+ * One blind spot, by construction: `dispatches.taskId` is null until the trigger
+ * registry resolves it (`src/db/schema/dispatches.ts`), so a just-claimed
+ * `leased` dispatch is invisible here. It is harmless — such an attempt has not
+ * provisioned yet and therefore holds no lease, so whichever of the two wins the
+ * take-over blocks the other at its own gate — but do not read this leg as
+ * "no executing attempt exists for this task".
  */
 export async function hasExecutingDispatchForTask(
 	projectId: string,

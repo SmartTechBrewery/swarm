@@ -1,12 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
-import { hasLiveWorktreeLeaseOwner } from '@/worktree/lease-liveness.js';
+import { hasLiveWorktreeLeaseOwner, type LeaseLivenessDeps } from '@/worktree/lease-liveness.js';
 
 const RUN_ID = 'run-current';
 
-function deps(hasRunningRun = false, hasExecutingDispatch = false) {
+/** Typed to the injected lookups' real signatures (`ai/TESTING.md`). */
+type LivenessLookup = NonNullable<LeaseLivenessDeps['hasRunningRun']>;
+
+function deps(
+	hasRunningRun = false,
+	hasExecutingDispatch = false,
+): { hasRunningRun: ReturnType<typeof vi.fn>; hasExecutingDispatch: ReturnType<typeof vi.fn> } {
 	return {
-		hasRunningRun: vi.fn().mockResolvedValue(hasRunningRun),
-		hasExecutingDispatch: vi.fn().mockResolvedValue(hasExecutingDispatch),
+		hasRunningRun: vi.fn<LivenessLookup>().mockResolvedValue(hasRunningRun),
+		hasExecutingDispatch: vi.fn<LivenessLookup>().mockResolvedValue(hasExecutingDispatch),
 	};
 }
 

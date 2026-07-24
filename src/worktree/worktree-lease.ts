@@ -111,10 +111,15 @@ export async function releaseWorktreeLease(
 }
 
 /**
- * The token currently holding the lease, or `null` when it is free. Fails CLOSED
- * for its one caller (the collision gate's stale-lease take-over, issue #427): a
- * Redis error returns `null`, which makes the take-over fall back to a plain
- * `SET NX` claim rather than compare-and-set against a token it never read.
+ * The token currently holding the lease (issue #427).
+ *
+ * `null` means **free *or* unreadable** — a Redis error is reported the same way
+ * as an absent key, so callers must never treat `null` as proof the lease is
+ * free: respond to it with a *conditional* claim (`tryClaimWorktreeLease`, i.e.
+ * `SET NX`), which cannot succeed while the key is in fact still held. That is
+ * what makes the ambiguity safe for the one caller (the collision gate's
+ * stale-lease take-over); anything that acted unconditionally on `null` would be
+ * failing open.
  */
 export async function readWorktreeLease(projectId: string, taskId: string): Promise<string | null> {
 	const namespacedKey = `${KEY_NS}${buildLeaseKey(projectId, taskId)}`;

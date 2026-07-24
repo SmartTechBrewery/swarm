@@ -1336,6 +1336,11 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				customPrompt,
 				resumeExistingBranch: inputs.resumeExistingBranch === true,
 				onBranchProvisioned: inputs.onBranchProvisioned,
+				// Identifies this attempt to the provision-time collision gate, so a
+				// lease left behind by a crashed run is recognised as an orphan instead
+				// of wedging this one as `live-leased` (issue #427). Every phase below
+				// passes it for the same reason.
+				runId,
 				...session,
 				timeoutMs,
 				signal,
@@ -1356,6 +1361,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				model,
 				reasoning,
 				customPrompt,
+				runId,
 				...session,
 				timeoutMs,
 				signal,
@@ -1386,6 +1392,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				model,
 				reasoning,
 				customPrompt,
+				runId,
 				...session,
 				timeoutMs,
 				signal,
@@ -1411,6 +1418,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				model,
 				reasoning,
 				customPrompt,
+				runId,
 				...session,
 				timeoutMs,
 				signal,
@@ -1441,6 +1449,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				model,
 				reasoning,
 				customPrompt,
+				runId,
 				...session,
 				timeoutMs,
 				signal,
