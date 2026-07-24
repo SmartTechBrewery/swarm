@@ -24,6 +24,7 @@ import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import {
 	canResetRun,
 	describeResetResult,
+	type ResetRunReport,
 	resetButtonLabel,
 	resetConfirmMessage,
 } from '@/lib/run-reset.js';
@@ -454,7 +455,13 @@ function TerminateRunButton({ run }: { run: RunRow }) {
  * the run but kept protected work. Pending state disables both the trigger and
  * the confirm button so a double-click can't fire two resets.
  */
-export function ResetRunButton({ run }: { run: RunRow }) {
+export function ResetRunButton({
+	run,
+	onResetSuccess,
+}: {
+	run: RunRow;
+	onResetSuccess?: (report: ResetRunReport) => void;
+}) {
 	const queryClient = useQueryClient();
 	const [confirmOpen, setConfirmOpen] = useState(false);
 	const [discardWork, setDiscardWork] = useState(false);
@@ -467,8 +474,9 @@ export function ResetRunButton({ run }: { run: RunRow }) {
 
 	const mutation = useMutation({
 		mutationFn: (force: boolean) => trpcClient.runs.reset.mutate({ runId: run.id, force }),
-		onSuccess: () => {
+		onSuccess: (data) => {
 			closeConfirm();
+			onResetSuccess?.(data);
 			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
 			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
 		},
@@ -490,7 +498,7 @@ export function ResetRunButton({ run }: { run: RunRow }) {
 				{resetButtonLabel(mutation.isPending)}
 			</button>
 
-			{mutation.isSuccess && (
+			{mutation.isSuccess && !onResetSuccess && (
 				<div className="mt-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded">
 					<h4 className="text-xs font-semibold text-zinc-200">Reset complete</h4>
 					<ul className="mt-1.5 space-y-1 text-xs text-zinc-400">
@@ -835,6 +843,16 @@ interface RunDetailHeaderProps {
 }
 
 export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
+	const [resetReport, setResetReport] = useState<ResetRunReport | null>(null);
+	const prevRunIdRef = useRef(run.id);
+
+	useEffect(() => {
+		if (prevRunIdRef.current !== run.id) {
+			setResetReport(null);
+			prevRunIdRef.current = run.id;
+		}
+	}, [run.id]);
+
 	return (
 		<div className="space-y-6">
 			{/* Breadcrumb */}
@@ -862,6 +880,20 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 					className="text-sm px-3 py-1"
 				/>
 			</div>
+
+			{resetReport && (
+				<div className="p-4 bg-zinc-900/50 border border-zinc-800 rounded flex items-start gap-3">
+					<CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
+					<div>
+						<h3 className="text-xs font-semibold text-zinc-200">Reset complete</h3>
+						<ul className="mt-1.5 space-y-1 text-xs text-zinc-400">
+							{describeResetResult(resetReport).map((line) => (
+								<li key={line}>{line}</li>
+							))}
+						</ul>
+					</div>
+				</div>
+			)}
 
 			{run.status === 'running' && (
 				<div className="p-4 bg-violet-950/20 border border-violet-900/30 rounded flex items-start gap-3">
@@ -897,7 +929,9 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 						<div className="flex flex-wrap items-start gap-3">
 							{canRetryRun(run.status) && <RetryNowButton run={run} />}
 							{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
-							{canResetRun(run.status) && <ResetRunButton run={run} />}
+							{canResetRun(run.status) && (
+								<ResetRunButton run={run} onResetSuccess={setResetReport} />
+							)}
 						</div>
 					</div>
 				</div>
@@ -926,7 +960,9 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 						)}
 						<div className="flex flex-wrap items-start gap-3">
 							{canRetryRun(run.status) && <RetryNowButton run={run} />}
-							{canResetRun(run.status) && <ResetRunButton run={run} />}
+							{canResetRun(run.status) && (
+								<ResetRunButton run={run} onResetSuccess={setResetReport} />
+							)}
 						</div>
 					</div>
 				</div>

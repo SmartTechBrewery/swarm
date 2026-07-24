@@ -17,6 +17,18 @@ vi.mock('@/lib/trpc.js', () => ({
 		},
 	},
 }));
+vi.mock('@tanstack/react-router', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@tanstack/react-router')>();
+	return {
+		...actual,
+		// biome-ignore lint/suspicious/noExplicitAny: simple test stub for Link
+		Link: ({ children, to, className }: any) => (
+			<a href={to} className={className}>
+				{children}
+			</a>
+		),
+	};
+});
 
 import { trpcClient } from '@/lib/trpc.js';
 import {
@@ -25,6 +37,7 @@ import {
 	ResetRunButton,
 	ReviewCapCallout,
 	ReviewMergeCallout,
+	RunDetailHeader,
 } from './$runId.js';
 
 function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
@@ -408,5 +421,51 @@ describe('ResetRunButton (issue #428)', () => {
 		});
 		// A refused reset keeps the modal open so the operator can adjust and retry.
 		expect(screen.getByRole('checkbox')).toBeDefined();
+	});
+
+	it('preserves the success report in RunDetailHeader post-invalidation when status transitions to running', async () => {
+		resetMutate.mockResolvedValue({
+			runId: 'run-1',
+			forced: false,
+			dispatch: 'cancelled',
+			cancellationCleared: true,
+			worktree: { outcome: 'removed' },
+			recoveryCleared: true,
+			dispatchId: 'dispatch-9',
+		});
+
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const failedRun = makeReviewRun({
+			status: 'failed',
+			phase: 'implementation',
+			error: 'some error',
+		});
+
+		const { rerender } = render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={failedRun} />
+			</QueryClientProvider>,
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
+		const buttons = screen.getAllByRole('button', { name: /reset & restart/i });
+		fireEvent.click(buttons[buttons.length - 1]);
+
+		await waitFor(() => {
+			expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
+		});
+
+		// Simulate background worker claiming new dispatch and updating run status to running
+		const runningRun = makeReviewRun({ status: 'running', phase: 'implementation', error: null });
+
+		rerender(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={runningRun} />
+			</QueryClientProvider>,
+		);
+
+		// The success report should still be visible even though run status is running and ResetRunButton unmounted
+		expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
+		expect(screen.getByText(/dispatch dispatch-9/i)).toBeDefined();
 	});
 });

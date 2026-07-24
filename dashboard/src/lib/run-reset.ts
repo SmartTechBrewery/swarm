@@ -93,6 +93,9 @@ function describeWorktreeOutcome(worktree: ResetWorktreeReport): string {
 		case 'preserved':
 			return 'Checkout: kept for its saved agent session; the lease was released.';
 		case 'removed': {
+			if (worktree.discarded && worktree.staleLeaseReleased) {
+				return `Checkout: removed — ${describeWorktreeReason(worktree.discarded)} discarded as requested; a stale worktree lease was released.`;
+			}
 			if (worktree.discarded) {
 				return `Checkout: removed — ${describeWorktreeReason(worktree.discarded)} discarded as requested.`;
 			}

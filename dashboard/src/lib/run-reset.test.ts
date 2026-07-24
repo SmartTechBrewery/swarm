@@ -114,6 +114,18 @@ describe('describeResetResult', () => {
 		expect(lines).toContain('Checkout: removed — uncommitted changes discarded as requested.');
 	});
 
+	it('names both discarded work and a released stale lease when both are present', () => {
+		const lines = describeResetResult(
+			makeReport({
+				forced: true,
+				worktree: { outcome: 'removed', discarded: 'dirty', staleLeaseReleased: true },
+			}),
+		);
+		expect(lines).toContain(
+			'Checkout: removed — uncommitted changes discarded as requested; a stale worktree lease was released.',
+		);
+	});
+
 	it('names the blocked reason when the checkout was retained', () => {
 		const lines = describeResetResult(
 			makeReport({ worktree: { outcome: 'blocked', blockedReason: 'unpushed' } }),
