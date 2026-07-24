@@ -33,6 +33,13 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	reopenDispatchForManualRetry: vi.fn(),
 }));
 
+// Only the reset *service* is stubbed; its real `RunResetError` is kept so the
+// router's refusal → tRPC-code mapping is exercised against the actual class.
+vi.mock('@/dispatch/run-reset.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/dispatch/run-reset.js')>()),
+	resetRun: vi.fn(),
+}));
+
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	cancelDispatchAndWake: vi.fn(),
 	cancelDispatchForRun: vi.fn(),
@@ -119,6 +126,7 @@ import {
 	createAndPublishDispatch,
 	publishDispatchWakeUp,
 } from '@/dispatch/dispatcher.js';
+import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
@@ -291,6 +299,7 @@ describe('runsRouter', () => {
 		vi.mocked(cancelDispatchForRun).mockReset();
 		vi.mocked(createAndPublishDispatch).mockReset();
 		vi.mocked(publishDispatchWakeUp).mockReset();
+		vi.mocked(resetRun).mockReset();
 	});
 
 	describe('list', () => {
@@ -1032,6 +1041,70 @@ describe('runsRouter', () => {
 		});
 	});
 
+	describe('reset', () => {
+		const RESET_RESULT = {
+			runId: 'run-1',
+			forced: false,
+			dispatch: 'cancelled' as const,
+			cancellationCleared: true,
+			worktree: { outcome: 'removed' as const },
+			recoveryCleared: true,
+			dispatchId: 'dispatch-2',
+		};
+
+		it('delegates to the reset service and returns its report verbatim', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			vi.mocked(resetRun).mockResolvedValue(RESET_RESULT);
+
+			await expect(caller.reset({ runId: 'run-1' })).resolves.toEqual(RESET_RESULT);
+			expect(resetRun).toHaveBeenCalledWith('run-1', { force: false });
+		});
+
+		it('passes the force flag through', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'running' }));
+			vi.mocked(resetRun).mockResolvedValue({ ...RESET_RESULT, forced: true });
+
+			await caller.reset({ runId: 'run-1', force: true });
+
+			expect(resetRun).toHaveBeenCalledWith('run-1', { force: true });
+		});
+
+		it('throws NOT_FOUND for an unknown run without calling the service', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(undefined);
+
+			await expect(caller.reset({ runId: 'missing' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND', message: 'Run with ID "missing" not found' }),
+			);
+			expect(resetRun).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['run-not-found', 'NOT_FOUND'],
+			['already-resetting', 'CONFLICT'],
+			['project-not-found', 'PRECONDITION_FAILED'],
+			['missing-job-payload', 'PRECONDITION_FAILED'],
+			['running-not-forced', 'PRECONDITION_FAILED'],
+			['dispatch-claimed', 'PRECONDITION_FAILED'],
+			['worktree-teardown-failed', 'PRECONDITION_FAILED'],
+		] as const)('maps the %s refusal to %s, keeping its message', async (reason, code) => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			vi.mocked(resetRun).mockRejectedValue(new RunResetError(reason, `refused: ${reason}`));
+
+			await expect(caller.reset({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({ code, message: `refused: ${reason}` }),
+			);
+		});
+
+		it('surfaces an unexpected service failure as INTERNAL_SERVER_ERROR', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			vi.mocked(resetRun).mockRejectedValue(new Error('redis unavailable'));
+
+			await expect(caller.reset({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'INTERNAL_SERVER_ERROR' }),
+			);
+		});
+	});
+
 	describe('putBack', () => {
 		// A fresh (unclaimed) board dispatch for a specific card.
 		const boardJobForCard = (itemNodeId: string) =>
@@ -1512,6 +1585,33 @@ describe('runsRouter', () => {
 					runId: 'run-1',
 					status: 'terminating',
 				});
+			});
+
+			it('denies reset to a non-member with identical error shape as unknown run', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', status: 'failed' }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.reset({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'NOT_FOUND',
+						message: 'Run with ID "run-1" not found',
+					}),
+				);
+				expect(resetRun).not.toHaveBeenCalled();
+			});
+
+			it('forbids a contributor from resetting a run', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', status: 'failed' }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+
+				await expect(ordinary.reset({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(resetRun).not.toHaveBeenCalled();
 			});
 
 			it('forbids a contributor from putting a queued item back', async () => {
