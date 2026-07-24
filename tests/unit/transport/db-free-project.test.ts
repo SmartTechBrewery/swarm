@@ -29,7 +29,6 @@ describe('reconstructProjectConfig', () => {
 		expect(() => CredentialsSchema.parse(reconstructed.credentials)).not.toThrow();
 		// The placeholder is a fixed sentinel, never a real secret reference.
 		expect(reconstructed.credentials).toEqual({
-			implementer: 'db-free-unused',
 			reviewer: 'db-free-unused',
 			webhookSecret: 'db-free-unused',
 		});
@@ -38,14 +37,12 @@ describe('reconstructProjectConfig', () => {
 	it('does not carry the original credential references onto the reconstructed config', () => {
 		const project = createMockProjectConfig({
 			credentials: {
-				implementer: 'REAL_IMPLEMENTER_REF',
 				reviewer: 'REAL_REVIEWER_REF',
 				webhookSecret: 'REAL_WEBHOOK_REF',
 			},
 		});
 		const reconstructed = reconstructProjectConfig(toNonSecretProjectConfig(project));
 
-		expect(reconstructed.credentials.implementer).not.toBe('REAL_IMPLEMENTER_REF');
 		expect(reconstructed.credentials.reviewer).not.toBe('REAL_REVIEWER_REF');
 	});
 });

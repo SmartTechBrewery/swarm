@@ -23,7 +23,6 @@ import { type ProjectConfig, ProjectConfigSchema } from '../config/schema.js';
  * string). Never resolved against any secret store — see the module header.
  */
 const PLACEHOLDER_CREDENTIALS = {
-	implementer: 'db-free-unused',
 	reviewer: 'db-free-unused',
 	webhookSecret: 'db-free-unused',
 } as const;
