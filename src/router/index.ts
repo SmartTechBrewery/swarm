@@ -28,6 +28,7 @@ import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
 import { createWebhookApp } from './webhook-receiver.js';
+import { registerWorkerDelivery } from './worker-delivery.js';
 import { registerWorkerTransport } from './worker-transport.js';
 
 // Tag every line this process emits so router and worker logs stay
@@ -42,6 +43,10 @@ const app = createWebhookApp();
 // same `app` whose `injectWebSocket` upgrades the server created by `serve`.
 const { upgradeWebSocket, injectWebSocket } = createNodeWebSocket({ app });
 registerWorkerTransport(app, upgradeWebSocket);
+// The router also hosts the server-side SCM metadata delivery API (ADR-002 §2):
+// a federated worker POSTs review/comment content here and the router performs
+// the GitHub write under the per-project reviewer PAT, which never leaves it.
+registerWorkerDelivery(app);
 const server = serve({ fetch: app.fetch, port }, () => {
 	logger.debug('swarm-router: listening', { port });
 });

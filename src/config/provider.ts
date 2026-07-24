@@ -15,6 +15,7 @@ import {
 	findProjectByRepoFromDb,
 } from '../db/repositories/projectsRepository.js';
 import type { GitHubPersona } from '../integrations/scm/github/personas.js';
+import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from './operator-token.js';
 import type { ProjectConfig } from './schema.js';
 
 /**
@@ -40,19 +41,23 @@ export async function findProjectByBoard(
 }
 
 /**
- * Resolve a persona's GitHub token for a project, or `null` if the reference
- * resolves to no stored credential.
+ * Resolve a persona's GitHub token for a project, or `null` if it resolves to no
+ * token.
  *
- * The config's `credentials` block holds the *reference* (an env-var key) for
- * each persona; this maps persona → reference → secret. The implementer/reviewer
- * split is the whole point (ai/CODING_STANDARDS.md "Loop prevention"): the two
- * personas must resolve to two distinct tokens so neither reacts to its own
- * output.
+ * The two personas resolve from *different* sources (issue #396): the
+ * `implementer` is the worker operator's own token, a worker-local env var
+ * (`SWARM_OPERATOR_GH_TOKEN`, `./operator-token.ts`) that is never persisted and
+ * never in the project config; the `reviewer` stays a project-scoped credential
+ * *reference* (an env-var key in `project.credentials`) resolved from the secret
+ * store. The implementer/reviewer split is the whole point (ai/CODING_STANDARDS.md
+ * "Loop prevention"): the two personas must resolve to two distinct identities so
+ * neither reacts to its own output — here the author (operator) ≠ reviewer.
  */
 export async function getPersonaTokenOrNull(
 	project: ProjectConfig,
 	persona: GitHubPersona,
 ): Promise<string | null> {
+	if (persona === 'implementer') return getOperatorGitHubTokenOrNull();
 	const envVarKey = project.credentials[persona];
 	return resolveProjectCredential(project.id, envVarKey);
 }
@@ -69,10 +74,11 @@ export async function getWebhookSecretOrNull(project: ProjectConfig): Promise<st
 }
 
 /**
- * Resolve a persona's GitHub token for a project. Throws if the reference
- * resolves to no stored credential — an operation that needs a persona token
- * but has none configured is a deployment error, not a soft "not found"
- * (ai/CODING_STANDARDS.md "Error handling").
+ * Resolve a persona's GitHub token for a project. Throws if it resolves to no
+ * token — an operation that needs a persona token but has none configured is a
+ * deployment error, not a soft "not found" (ai/CODING_STANDARDS.md "Error
+ * handling"). The message points at the persona's actual source: the operator
+ * env var for the implementer, the project credential reference for the reviewer.
  */
 export async function getPersonaToken(
 	project: ProjectConfig,
@@ -80,6 +86,12 @@ export async function getPersonaToken(
 ): Promise<string> {
 	const token = await getPersonaTokenOrNull(project, persona);
 	if (!token) {
+		if (persona === 'implementer') {
+			throw new Error(
+				`No GitHub implementer token configured: set ${OPERATOR_GH_TOKEN_ENV} on this host ` +
+					"(the worker operator's own token; never stored in project_credentials)",
+			);
+		}
 		throw new Error(
 			`No GitHub ${persona} token configured for project '${project.id}' ` +
 				`(credential reference '${project.credentials[persona]}' not found in project_credentials)`,

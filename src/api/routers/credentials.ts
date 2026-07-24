@@ -46,7 +46,7 @@ export const credentialsRouter = router({
 			const resolved = await resolveAllProjectCredentials(input.projectId);
 
 			return Object.entries(project.credentials).map(([role, envVarKey]) => ({
-				role: role as 'implementer' | 'reviewer' | 'webhookSecret',
+				role: role as 'reviewer' | 'webhookSecret',
 				envVarKey,
 				isConfigured: envVarKey in resolved,
 				maskedValue: maskCredential(resolved[envVarKey]),

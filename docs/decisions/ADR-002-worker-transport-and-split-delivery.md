@@ -1,6 +1,6 @@
 # ADR-002: Worker↔control-plane transport and split GitHub delivery
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-24
 - **Decision owners:** SWARM maintainers
 - **Builds on:** [ADR-001](./ADR-001-federated-workers-and-project-access.md)
@@ -152,9 +152,18 @@ PR/review even if the token model later changes.
   reading it from the DB; the config schema needs a clear split between the
   non-secret slice sent to workers and secrets that stay server-side.
 - A new server-side **delivery API** exposes exactly the metadata GitHub
-  operations (`submitReview`, `postComment`, PM `moveWorkItem`/`addComment`)
-  backed by per-project credentials; the worker calls it instead of holding
-  those tokens.
+  operations backed by per-project credentials; the worker calls it instead of
+  holding those tokens. **Shipped** as `src/router/worker-delivery.ts`: the SCM
+  half (`submitReview`/`postComment` under the reviewer PAT →
+  `POST /worker/delivery/review` + `/pr-comment`) and the PM half
+  (`moveWorkItem`/`addComment` under the per-project PM credential →
+  `POST /worker/delivery/pm/move` + `/pm/comment`), each authenticated by the
+  worker credential and gated on an active enrollment. A worker opts in with
+  `SWARM_CONTROL_PLANE_URL` + `SWARM_WORKER_CREDENTIAL` and receives
+  transport-backed `ScmDeliveryProvider`/`PMProvider` delegates
+  (`src/scm/transport-delivery.ts`, `src/pm/transport-delivery.ts`) that carry
+  only metadata up the wire; the local host worker keeps the in-process path.
+  PM **reads** stay worker-side until the broader dispatch-push work (ADR-003 §2).
 - Implementer credential provisioning changes: it is no longer a project
   `project_credentials` row but the worker operator's own token configured
   locally on their machine. `CredentialsSchema.implementer`

@@ -178,18 +178,16 @@ describe('BoardMappingPanel (issue #201)', () => {
 		expect(screen.getByRole('option', { name: 'Configured value (unavailable)' })).not.toBeNull();
 	});
 
-	it('surfaces a missing-credential precondition as an actionable Source Control callout', async () => {
+	it('surfaces a missing-credential precondition as an actionable operator-token callout', async () => {
 		discoverContainersFn.mockRejectedValue(
 			new Error(
-				'No implementer token is configured for this project. Add it on the Source Control tab, then try again.',
+				"No implementer token is configured. Set SWARM_OPERATOR_GH_TOKEN in this host's environment, then try again.",
 			),
 		);
 
 		renderHarness();
 
-		await waitFor(() =>
-			expect(screen.getByText(/Add it on the Source Control tab/)).not.toBeNull(),
-		);
+		await waitFor(() => expect(screen.getByText(/Set SWARM_OPERATOR_GH_TOKEN/)).not.toBeNull());
 	});
 
 	it('disables Save until a board and at least one status are chosen', async () => {

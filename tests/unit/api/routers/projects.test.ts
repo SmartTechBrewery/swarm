@@ -189,7 +189,6 @@ describe('projectsRouter', () => {
 		};
 
 		const defaultCredentials = {
-			implementer: 'SCM_TOKEN_IMPLEMENTER',
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',
 		};

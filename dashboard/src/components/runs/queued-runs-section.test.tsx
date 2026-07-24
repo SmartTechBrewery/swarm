@@ -27,6 +27,12 @@ vi.mock('@/lib/trpc.js', () => ({
 			queued: {
 				queryKey: () => ['runs.queued'],
 			},
+			list: {
+				queryOptions: () => ({
+					queryKey: ['runs.list'],
+					queryFn: () => Promise.resolve({ data: [], total: 0 }),
+				}),
+			},
 		},
 	},
 }));
@@ -74,11 +80,20 @@ const project = { id: 'proj-a', name: 'Acme', repo: 'acme/widgets' };
 // Seed the `projects.list` cache so queued cards/rows can resolve the project
 // name synchronously. `staleTime: Infinity` keeps the mocked queryFn from
 // refetching and clobbering the seeded value mid-test.
-function renderSection(ui: ReactElement, projects: unknown[] = [project]) {
+function renderSection(
+	ui: ReactElement,
+	projects: unknown[] = [project],
+	runningRuns: unknown[] = [],
+) {
 	const queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
 	});
 	queryClient.setQueryData(['projects.list'], projects);
+	// Seed the dedicated running-run lookup (issue #421) the component reads to
+	// hide board rows that duplicate an in-progress run. `staleTime: Infinity`
+	// plus the sub-second test lifetime keep the fixed refetchInterval from
+	// clobbering this seed.
+	queryClient.setQueryData(['runs.list'], { data: runningRuns, total: runningRuns.length });
 	return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
 }
 
@@ -347,6 +362,64 @@ describe('QueuedRunsSection', () => {
 			const card = cards()[0];
 			expect(within(card).queryByText('Project:')).toBeNull();
 			expect(within(card).queryByText('Acme')).toBeNull();
+		});
+	});
+
+	// Issue #421: a claimed board dispatch becomes a run in the Runs table while a
+	// leftover sibling dispatch for the same card lingers in the queue. The section
+	// hides the fresh board row when a running planning/implementation run shares
+	// its backing work-item URL.
+	describe('hides board rows duplicating an in-progress run (issue #421)', () => {
+		const runningBoardRun = (overrides: Record<string, unknown> = {}) => ({
+			phase: 'planning',
+			workItemUrl: boardItem.workItemUrl,
+			...overrides,
+		});
+
+		it('hides the board card when a running planning run shares its work-item URL', () => {
+			const { container } = renderSection(
+				<QueuedRunsSection items={[boardItem]} />,
+				[project],
+				[runningBoardRun()],
+			);
+			expect(screen.queryByTestId('queued-run-card')).toBeNull();
+			expect(container.firstChild).toBeNull();
+		});
+
+		it('hides the board card when a running implementation run shares its URL', () => {
+			renderSection(
+				<QueuedRunsSection items={[boardItem]} />,
+				[project],
+				[runningBoardRun({ phase: 'implementation' })],
+			);
+			expect(screen.queryByTestId('queued-run-card')).toBeNull();
+		});
+
+		it('keeps the board card when the running run URL does not match', () => {
+			renderSection(
+				<QueuedRunsSection items={[boardItem]} />,
+				[project],
+				[runningBoardRun({ workItemUrl: 'https://github.com/acme/widgets/issues/99' })],
+			);
+			expect(cards()).toHaveLength(1);
+			expect(within(cards()[0]).getByText('Fix the widget')).not.toBeNull();
+		});
+
+		it('keeps a board card that owns a runId even when the URL matches', () => {
+			const deferredBoard: QueuedRun = { ...boardItem, runId: 'run-deferred' };
+			renderSection(<QueuedRunsSection items={[deferredBoard]} />, [project], [runningBoardRun()]);
+			expect(cards()).toHaveLength(1);
+			expect(within(cards()[0]).getByRole('link', { name: 'View run' })).not.toBeNull();
+		});
+
+		it('keeps a non-board card and drops only the matching board card', () => {
+			renderSection(
+				<QueuedRunsSection items={[githubItem, boardItem]} />,
+				[project],
+				[runningBoardRun()],
+			);
+			expect(cards()).toHaveLength(1);
+			expect(within(cards()[0]).getByText(/PR #42/)).not.toBeNull();
 		});
 	});
 });

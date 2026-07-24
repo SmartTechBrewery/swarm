@@ -23,6 +23,19 @@ export function optionalEnv(name: string, fallback: string): string {
 }
 
 /**
+ * The control-plane base URL a federated worker POSTs SCM metadata delivery to
+ * (`SWARM_CONTROL_PLANE_URL`), or `undefined` when unset/empty. Set together
+ * with `SWARM_WORKER_CREDENTIAL` it opts a worker into control-plane delivery
+ * mode (ADR-002 §2): the metadata-only `submitReview`/`postComment` calls travel
+ * to the router's server-side delivery API instead of running in-process. Unset
+ * (the default, and every local host worker) keeps the in-process delivery path.
+ */
+export function getControlPlaneUrl(): string | undefined {
+	const value = process.env.SWARM_CONTROL_PLANE_URL;
+	return value === undefined || value.trim() === '' ? undefined : value.trim();
+}
+
+/**
  * Whether SWARM's local single-user mode is enabled (`SWARM_SINGLE_USER_MODE`).
  *
  * A disabled-by-default API authentication policy for a local, single-operator

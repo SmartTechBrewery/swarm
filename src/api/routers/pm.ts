@@ -18,17 +18,19 @@ type DiscoveringProvider = PMProvider & { discover: NonNullable<PMProvider['disc
  * the same procedures with no change here (ai/RULES.md §2, ai/CODING_STANDARDS.md
  * "Module shape for a provider").
  *
- * Discovery uses the project's *stored* implementer credential (the provider's
- * own credential scope) — the browser never supplies a token, and a resolved
- * board catalogue is a privileged read of the provider account, so every
- * procedure requires `projectAdmin` (the same boundary as editing config). A
- * non-member gets NOT_FOUND, so a private project's existence never leaks.
+ * Discovery uses the implementer persona's token (the worker-local operator
+ * token, `SWARM_OPERATOR_GH_TOKEN` — issue #396) — the browser never supplies a
+ * token, and a resolved board catalogue is a privileged read of the provider
+ * account, so every procedure requires `projectAdmin` (the same boundary as
+ * editing config). A non-member gets NOT_FOUND, so a private project's existence
+ * never leaks. This resolves server-side, so the API process must have the
+ * operator token in its host env.
  */
 
 /**
  * Resolve the project and build its PM provider after authorizing the caller.
- * Requires `projectAdmin`: discovery runs with the stored implementer token and
- * exposes the provider account's board catalogue. Verifies the requested
+ * Requires `projectAdmin`: discovery runs with the implementer (operator) token
+ * and exposes the provider account's board catalogue. Verifies the requested
  * capability is one the project's provider declares, so an unknown provider or
  * unsupported capability fails with a clear code instead of a raw dispatch error.
  */
@@ -67,11 +69,11 @@ async function resolveProviderForDiscovery(
 
 /**
  * Run a discovery call and translate a failure into a safe, actionable tRPC
- * error. A missing implementer credential (the most common setup gap) points the
- * operator at the Source Control tab; a provider/actionable error (board didn't
- * resolve, no Status field) surfaces its message — those are secret-free by
- * construction, and GitHub API errors never carry the token. Nothing here echoes
- * a credential value.
+ * error. A missing implementer (operator) token — the most common setup gap —
+ * points the operator at setting `SWARM_OPERATOR_GH_TOKEN` in the host env; a
+ * provider/actionable error (board didn't resolve, no Status field) surfaces its
+ * message — those are secret-free by construction, and GitHub API errors never
+ * carry the token. Nothing here echoes a credential value.
  */
 async function runDiscovery<T>(fn: () => Promise<T>): Promise<T> {
 	try {
@@ -82,7 +84,7 @@ async function runDiscovery<T>(fn: () => Promise<T>): Promise<T> {
 			throw new TRPCError({
 				code: 'PRECONDITION_FAILED',
 				message:
-					'No implementer token is configured for this project. Add it on the Source Control tab, then try again.',
+					"No implementer token is configured. Set SWARM_OPERATOR_GH_TOKEN in this host's environment, then try again.",
 			});
 		}
 		throw new TRPCError({ code: 'BAD_REQUEST', message });

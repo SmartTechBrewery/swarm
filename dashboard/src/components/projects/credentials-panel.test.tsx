@@ -24,12 +24,6 @@ vi.mock('@/lib/trpc.js', () => ({
 						queryFn: () =>
 							Promise.resolve([
 								{
-									role: 'implementer' as const,
-									envVarKey: 'IMPLEMENTER_PAT',
-									isConfigured: true,
-									maskedValue: '****abcd',
-								},
-								{
 									role: 'reviewer' as const,
 									envVarKey: 'REVIEWER_PAT',
 									isConfigured: false,
@@ -70,9 +64,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 	it('derives the intro and role copy from the selected GitHub provider, not a hard-coded path', async () => {
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 
-		await waitFor(() =>
-			expect(screen.getByText(/authenticate to GitHub with separate tokens/)).not.toBeNull(),
-		);
-		expect(screen.getByText(/GitHub personal access token the implementer persona/)).not.toBeNull();
+		await waitFor(() => expect(screen.getByText(/SWARM_OPERATOR_GH_TOKEN/)).not.toBeNull());
+		expect(screen.getByText(/GitHub personal access token the reviewer persona/)).not.toBeNull();
 	});
 });

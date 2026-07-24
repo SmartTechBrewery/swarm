@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Check, Pencil, ShieldCheck, Trash2, X } from 'lucide-react';
+import { Check, Pencil, ShieldCheck, Trash2, X } from 'lucide-react';
 import type React from 'react';
 import { useState } from 'react';
 import {
@@ -12,7 +12,6 @@ import {
 	maskedPreview,
 	SCM_PROVIDERS,
 	type ScmProviderId,
-	sameVerifiedLogin,
 } from '@/lib/credentials.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
@@ -326,8 +325,8 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 	const providerCopy = getScmProviderCopy(selectedProviderId);
 
 	// Session-only record of the login each PAT last verified to; drives the
-	// loop-prevention warning. Never persisted — the plaintext token is gone once
-	// saved, so this is best-effort within a session.
+	// per-field "✓ @login" preview. Never persisted — the plaintext token is gone
+	// once saved, so this is best-effort within a session.
 	const [verifiedLogins, setVerifiedLogins] = useState<Partial<Record<CredentialRole, string>>>({});
 	const [removeTarget, setRemoveTarget] = useState<CredentialEntry | null>(null);
 
@@ -369,10 +368,6 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 	}
 
 	const entries = credentialsQuery.data ?? [];
-	const showSameAccountWarning = sameVerifiedLogin(
-		verifiedLogins.implementer,
-		verifiedLogins.reviewer,
-	);
 
 	return (
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm space-y-6">
@@ -401,18 +396,6 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 
 				<p className="text-xs text-zinc-400 mt-4">{providerCopy.intro}</p>
 			</div>
-
-			{showSameAccountWarning && (
-				<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex gap-3">
-					<AlertTriangle className="w-5 h-5 text-amber-500 shrink-0" />
-					<div>
-						<h3 className="text-xs font-semibold text-amber-200">
-							{providerCopy.sameAccountWarningTitle(verifiedLogins.implementer ?? '')}
-						</h3>
-						<p className="text-xs text-amber-200/70 mt-1">{providerCopy.sameAccountWarningBody}</p>
-					</div>
-				</div>
-			)}
 
 			<div className="space-y-4">
 				{entries.map((entry) => (

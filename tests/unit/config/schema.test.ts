@@ -17,7 +17,7 @@ describe('ProjectConfigSchema', () => {
 	it('accepts a fully-specified project', () => {
 		const project = createMockProjectConfig();
 		expect(project.repo).toBe('jkwiecien/swarm');
-		expect(project.credentials.implementer).toBe('SCM_TOKEN_IMPLEMENTER');
+		expect(project.credentials.reviewer).toBe('SCM_TOKEN_REVIEWER');
 		expect(project.githubProjects.statusFieldId).toBe('PVTSSF_lAHOAC3TF84BcNwDzhW4MKo');
 	});
 
@@ -63,7 +63,7 @@ describe('ProjectConfigSchema', () => {
 				name: 'swarm',
 				repo: 'jkwiecien/swarm',
 				repoRoot: '/Users/dev/swarm/swarm',
-				credentials: { implementer: 'A', reviewer: 'B', webhookSecret: 'C' },
+				credentials: { reviewer: 'B', webhookSecret: 'C' },
 			}),
 		).toThrow();
 	});
@@ -72,9 +72,21 @@ describe('ProjectConfigSchema', () => {
 		expect(() => createMockProjectConfig({ credentials: undefined as never })).toThrow();
 		expect(() =>
 			createMockProjectConfig({
-				credentials: { implementer: 'A', reviewer: 'B', webhookSecret: '' },
+				credentials: { reviewer: 'B', webhookSecret: '' },
 			}),
 		).toThrow();
+	});
+
+	it('strips a legacy implementer credential reference rather than rejecting it (issue #396)', () => {
+		const project = createMockProjectConfig({
+			credentials: {
+				implementer: 'SCM_TOKEN_IMPLEMENTER',
+				reviewer: 'B',
+				webhookSecret: 'C',
+			} as never,
+		});
+		expect('implementer' in project.credentials).toBe(false);
+		expect(project.credentials.reviewer).toBe('B');
 	});
 
 	it('omits agents entirely by default (every phase keeps its coded default)', () => {
