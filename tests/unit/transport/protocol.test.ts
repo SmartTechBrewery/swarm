@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-
+import { REVIEW_AUTOMATION_OUTCOMES, REVIEW_VERDICTS } from '@/pipeline/review.js';
+import { PM_STATUS_KEYS } from '@/pm/pipeline.js';
 import {
 	ControlPlaneMessageSchema,
 	DisconnectSchema,
@@ -348,6 +349,28 @@ describe('transport protocol schemas', () => {
 			expect(
 				TaskAssignmentSchema.safeParse({ ...VALID_ASSIGNMENT, dispatchId: 'nope' }).success,
 			).toBe(false);
+		});
+	});
+
+	// The TaskExecutionResult settle-context enums (issue #407) are hand-authored
+	// literals so the wire protocol stays self-contained — no runtime import of the
+	// pm/pipeline layers. These guards keep that duplication honest: if a canonical
+	// status key / verdict / automation outcome is ever added or renamed, the frame
+	// must gain it too, or the control plane silently can't settle on the new value.
+	describe('TaskExecutionResult settle-context enums track their canonical sources', () => {
+		it('movedTo matches PM_STATUS_KEYS', () => {
+			const movedTo = TaskExecutionResultSchema.shape.movedTo.unwrap();
+			expect([...movedTo.options].sort()).toEqual([...PM_STATUS_KEYS].sort());
+		});
+
+		it('verdict matches REVIEW_VERDICTS', () => {
+			const verdict = TaskExecutionResultSchema.shape.verdict.unwrap();
+			expect([...verdict.options].sort()).toEqual([...REVIEW_VERDICTS].sort());
+		});
+
+		it('reviewAutomationOutcome matches REVIEW_AUTOMATION_OUTCOMES', () => {
+			const outcome = TaskExecutionResultSchema.shape.reviewAutomationOutcome.unwrap();
+			expect([...outcome.options].sort()).toEqual([...REVIEW_AUTOMATION_OUTCOMES].sort());
 		});
 	});
 });
