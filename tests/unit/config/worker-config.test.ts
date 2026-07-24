@@ -17,11 +17,7 @@ describe('toWorkerConfig', () => {
 	it('leaks no credential reference or webhook secret into the projection', () => {
 		const project = createMockProjectConfig();
 		const serialized = JSON.stringify(toWorkerConfig(project));
-		for (const secret of [
-			project.credentials.implementer,
-			project.credentials.reviewer,
-			project.credentials.webhookSecret,
-		]) {
+		for (const secret of [project.credentials.reviewer, project.credentials.webhookSecret]) {
 			expect(serialized).not.toContain(secret);
 		}
 	});
@@ -46,7 +42,7 @@ describe('toWorkerConfig', () => {
 		const worker = toWorkerConfig(project);
 		expect(worker).not.toBe(project);
 		// The full config the local / single-user path relies on is untouched.
-		expect(project.credentials.implementer).toBe('SCM_TOKEN_IMPLEMENTER');
+		expect(project.credentials.reviewer).toBe('SCM_TOKEN_REVIEWER');
 		expect(project.githubProjects).toBeDefined();
 	});
 });

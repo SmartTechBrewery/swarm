@@ -73,19 +73,19 @@ describe('credentialsRouter', () => {
 		it('masks a long configured value to the same fixed marker, with no secret characters in the response', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
-				SCM_TOKEN_IMPLEMENTER: 'test-token-implementer',
+				SCM_TOKEN_REVIEWER: 'test-token-reviewer',
 			});
 
 			const result = await caller.list({ projectId: 'p1' });
 			const raw = JSON.stringify(result);
 
-			expect(raw).not.toContain('test-token-implementer');
+			expect(raw).not.toContain('test-token-reviewer');
 			expect(raw).not.toContain('1234');
 
-			const entry = result.find((r) => r.role === 'implementer');
+			const entry = result.find((r) => r.role === 'reviewer');
 			expect(entry).toEqual({
-				role: 'implementer',
-				envVarKey: 'SCM_TOKEN_IMPLEMENTER',
+				role: 'reviewer',
+				envVarKey: 'SCM_TOKEN_REVIEWER',
 				isConfigured: true,
 				maskedValue: '****',
 			});
@@ -94,11 +94,11 @@ describe('credentialsRouter', () => {
 		it('masks a short configured value to the identical fixed marker as a long one', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
-				SCM_TOKEN_IMPLEMENTER: 'short',
+				SCM_TOKEN_REVIEWER: 'short',
 			});
 
 			const result = await caller.list({ projectId: 'p1' });
-			const entry = result.find((r) => r.role === 'implementer');
+			const entry = result.find((r) => r.role === 'reviewer');
 			expect(entry?.maskedValue).toBe('****');
 		});
 
@@ -106,21 +106,20 @@ describe('credentialsRouter', () => {
 			const legacyProject = createMockProjectConfig({
 				id: 'p1',
 				credentials: {
-					implementer: 'GITHUB_TOKEN_IMPLEMENTER',
 					reviewer: 'GITHUB_TOKEN_REVIEWER',
 					webhookSecret: 'GITHUB_WEBHOOK_SECRET',
 				},
 			});
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(legacyProject);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
-				GITHUB_TOKEN_IMPLEMENTER: 'test-token-implementer',
+				GITHUB_TOKEN_REVIEWER: 'test-token-reviewer',
 			});
 
 			const result = await caller.list({ projectId: 'p1' });
-			const entry = result.find((r) => r.role === 'implementer');
+			const entry = result.find((r) => r.role === 'reviewer');
 			expect(entry).toEqual({
-				role: 'implementer',
-				envVarKey: 'GITHUB_TOKEN_IMPLEMENTER',
+				role: 'reviewer',
+				envVarKey: 'GITHUB_TOKEN_REVIEWER',
 				isConfigured: true,
 				maskedValue: '****',
 			});
@@ -131,21 +130,21 @@ describe('credentialsRouter', () => {
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			const result = await caller.list({ projectId: 'p1' });
-			const entry = result.find((r) => r.role === 'implementer');
+			const entry = result.find((r) => r.role === 'reviewer');
 			expect(entry).toEqual({
-				role: 'implementer',
-				envVarKey: 'SCM_TOKEN_IMPLEMENTER',
+				role: 'reviewer',
+				envVarKey: 'SCM_TOKEN_REVIEWER',
 				isConfigured: false,
 				maskedValue: 'not set',
 			});
 		});
 
-		it('returns one entry per declared reference, in stable role order', async () => {
+		it('returns one entry per declared reference, in stable role order (implementer is not project-scoped)', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			const result = await caller.list({ projectId: 'p1' });
-			expect(result.map((r) => r.role)).toEqual(['implementer', 'reviewer', 'webhookSecret']);
+			expect(result.map((r) => r.role)).toEqual(['reviewer', 'webhookSecret']);
 		});
 
 		it('throws NOT_FOUND for an unknown project without resolving credentials', async () => {
@@ -168,11 +167,11 @@ describe('credentialsRouter', () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 			vi.mocked(writeProjectCredential).mockResolvedValue(undefined);
 
-			await caller.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_IMPLEMENTER', value: 'secret' });
+			await caller.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_REVIEWER', value: 'secret' });
 
 			expect(writeProjectCredential).toHaveBeenCalledWith(
 				'p1',
-				'SCM_TOKEN_IMPLEMENTER',
+				'SCM_TOKEN_REVIEWER',
 				'secret',
 				null,
 			);
@@ -184,14 +183,14 @@ describe('credentialsRouter', () => {
 
 			await caller.set({
 				projectId: 'p1',
-				envVarKey: 'SCM_TOKEN_IMPLEMENTER',
+				envVarKey: 'SCM_TOKEN_REVIEWER',
 				value: 'secret',
 				name: 'Implementer token',
 			});
 
 			expect(writeProjectCredential).toHaveBeenCalledWith(
 				'p1',
-				'SCM_TOKEN_IMPLEMENTER',
+				'SCM_TOKEN_REVIEWER',
 				'secret',
 				'Implementer token',
 			);
@@ -207,7 +206,7 @@ describe('credentialsRouter', () => {
 
 		it('rejects an empty value before touching the repository', async () => {
 			await expect(
-				caller.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_IMPLEMENTER', value: '' }),
+				caller.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_REVIEWER', value: '' }),
 			).rejects.toThrow();
 			expect(writeProjectCredential).not.toHaveBeenCalled();
 		});
@@ -218,7 +217,7 @@ describe('credentialsRouter', () => {
 			await expect(
 				caller.set({
 					projectId: 'missing',
-					envVarKey: 'SCM_TOKEN_IMPLEMENTER',
+					envVarKey: 'SCM_TOKEN_REVIEWER',
 					value: 'secret',
 				}),
 			).rejects.toThrowError(
@@ -238,16 +237,16 @@ describe('credentialsRouter', () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 			vi.mocked(deleteProjectCredential).mockResolvedValue(undefined);
 
-			await caller.delete({ projectId: 'p1', envVarKey: 'SCM_TOKEN_IMPLEMENTER' });
+			await caller.delete({ projectId: 'p1', envVarKey: 'SCM_TOKEN_REVIEWER' });
 
-			expect(deleteProjectCredential).toHaveBeenCalledWith('p1', 'SCM_TOKEN_IMPLEMENTER');
+			expect(deleteProjectCredential).toHaveBeenCalledWith('p1', 'SCM_TOKEN_REVIEWER');
 		});
 
 		it('throws NOT_FOUND for an unknown project without deleting', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(
-				caller.delete({ projectId: 'missing', envVarKey: 'SCM_TOKEN_IMPLEMENTER' }),
+				caller.delete({ projectId: 'missing', envVarKey: 'SCM_TOKEN_REVIEWER' }),
 			).rejects.toThrowError(
 				expect.objectContaining({
 					code: 'NOT_FOUND',
@@ -278,14 +277,14 @@ describe('credentialsRouter', () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
-			await expect(ordinary.list({ projectId: 'p1' })).resolves.toHaveLength(3);
+			await expect(ordinary.list({ projectId: 'p1' })).resolves.toHaveLength(2);
 		});
 
 		it('forbids a member from setting a credential', async () => {
 			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
 
 			await expect(
-				ordinary.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_IMPLEMENTER', value: 'secret' }),
+				ordinary.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_REVIEWER', value: 'secret' }),
 			).rejects.toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }));
 			expect(writeProjectCredential).not.toHaveBeenCalled();
 		});
@@ -295,10 +294,10 @@ describe('credentialsRouter', () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 			vi.mocked(writeProjectCredential).mockResolvedValue(undefined);
 
-			await ordinary.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_IMPLEMENTER', value: 'secret' });
+			await ordinary.set({ projectId: 'p1', envVarKey: 'SCM_TOKEN_REVIEWER', value: 'secret' });
 			expect(writeProjectCredential).toHaveBeenCalledWith(
 				'p1',
-				'SCM_TOKEN_IMPLEMENTER',
+				'SCM_TOKEN_REVIEWER',
 				'secret',
 				null,
 			);
@@ -308,7 +307,7 @@ describe('credentialsRouter', () => {
 			vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
 
 			await expect(
-				ordinary.delete({ projectId: 'p1', envVarKey: 'SCM_TOKEN_IMPLEMENTER' }),
+				ordinary.delete({ projectId: 'p1', envVarKey: 'SCM_TOKEN_REVIEWER' }),
 			).rejects.toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }));
 			expect(deleteProjectCredential).not.toHaveBeenCalled();
 		});

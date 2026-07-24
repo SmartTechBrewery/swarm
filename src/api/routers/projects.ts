@@ -35,8 +35,10 @@ export const DEFAULT_GITHUB_PROJECTS_CONFIG: GitHubProjectsIntegrationConfig = {
 	statusOptions: {},
 };
 
+// Project-scoped credential references a new project is created with. The
+// implementer persona is intentionally absent — it resolves from the worker-local
+// SWARM_OPERATOR_GH_TOKEN, not from project_credentials (issue #396).
 const DEFAULT_CREDENTIAL_REFERENCES = {
-	implementer: 'SCM_TOKEN_IMPLEMENTER',
 	reviewer: 'SCM_TOKEN_REVIEWER',
 	webhookSecret: 'SCM_WEBHOOK_SECRET',
 };

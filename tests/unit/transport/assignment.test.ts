@@ -15,7 +15,6 @@ describe('buildTaskAssignment', () => {
 		it('never lets a credential reference reach the frame', () => {
 			const project = createMockProjectConfig({
 				credentials: {
-					implementer: 'SENTINEL_IMPLEMENTER_TOKEN',
 					reviewer: 'SENTINEL_REVIEWER_TOKEN',
 					webhookSecret: 'SENTINEL_WEBHOOK_SECRET',
 				},
@@ -27,7 +26,6 @@ describe('buildTaskAssignment', () => {
 
 			// And no sentinel survives a full serialization of the whole frame.
 			const serialized = JSON.stringify(assignment);
-			expect(serialized).not.toContain('SENTINEL_IMPLEMENTER_TOKEN');
 			expect(serialized).not.toContain('SENTINEL_REVIEWER_TOKEN');
 			expect(serialized).not.toContain('SENTINEL_WEBHOOK_SECRET');
 		});

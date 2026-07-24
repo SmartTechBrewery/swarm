@@ -81,7 +81,7 @@ function RunsRouteComponent() {
 				onClear={handleClearFilters}
 			/>
 
-			<QueuedRunsSection items={queuedQuery.data ?? []} />
+			<QueuedRunsSection items={queuedQuery.data ?? []} projectId={search.projectId || undefined} />
 
 			{runsQuery.isLoading ? (
 				<div className="text-sm text-zinc-400">Loading runs history…</div>

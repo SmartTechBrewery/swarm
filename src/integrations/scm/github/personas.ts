@@ -9,6 +9,14 @@
  * (ai/CODING_STANDARDS.md "Loop prevention"). That invariant is enforced by
  * mapping every inbound event's actor to a persona (`getPersonaForLogin`) and by
  * refusing to act on events a SWARM persona itself produced (`isSwarmBot`).
+ *
+ * The two personas resolve their tokens from different sources (issue #396): the
+ * `implementer` identity is resolved from the worker operator's own token
+ * (`SWARM_OPERATOR_GH_TOKEN`, via `getPersonaTokenOrNull`), the same token the
+ * implementer phases open PRs with — so the resolved implementer login always
+ * matches the PR author. The `reviewer` stays a project-scoped credential. The
+ * two must still resolve to two distinct accounts (operator ≠ reviewer) for loop
+ * prevention to hold.
  */
 
 import { getPersonaTokenOrNull } from '../../../config/provider.js';

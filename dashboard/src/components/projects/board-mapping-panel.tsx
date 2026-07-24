@@ -18,7 +18,8 @@ import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
  * board, then maps each canonical SWARM pipeline status to one of that board's
  * discovered states. Opaque IDs stay option values and persisted data — never
  * something to type. Boards/states are discovered through the `pm` API using the
- * project's stored implementer token; the browser never handles a credential.
+ * implementer persona's token (the worker operator's own `SWARM_OPERATOR_GH_TOKEN`,
+ * resolved server-side — issue #396); the browser never handles a credential.
  *
  * The owning route holds the form state and the save/reset handlers (so the save
  * goes through the same serialized `projects.update` write as the other tabs);
@@ -51,7 +52,7 @@ const NEUTRAL_UNAVAILABLE = 'Configured value (unavailable)';
 
 /** Whether a tRPC error is the "no implementer token" precondition (actionable). */
 function isMissingCredentialError(message: string | undefined): boolean {
-	return !!message && /Source Control/i.test(message);
+	return !!message && /SWARM_OPERATOR_GH_TOKEN/i.test(message);
 }
 
 interface StateOption {
