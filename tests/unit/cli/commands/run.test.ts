@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ResetRunResult } from '@/dispatch/run-reset.js';
 
-const { resetRun, closeQueue, closeDb, RunResetError } = vi.hoisted(() => {
+const { resetRun, closeQueue, closeDb, closeCancellationRedis, RunResetError } = vi.hoisted(() => {
 	// Stands in for the service's own class, so the command's `instanceof` refusal
 	// check matches. Declared inside `vi.hoisted` because the mock factory below
 	// runs before any module-level class declaration is initialized.
@@ -15,9 +15,10 @@ const { resetRun, closeQueue, closeDb, RunResetError } = vi.hoisted(() => {
 		}
 	}
 	return {
-		resetRun: vi.fn<(runId: string, options?: { force?: boolean }) => Promise<unknown>>(),
+		resetRun: vi.fn<(runId: string, options?: { force?: boolean }) => Promise<ResetRunResult>>(),
 		closeQueue: vi.fn<() => Promise<void>>(),
 		closeDb: vi.fn<() => Promise<void>>(),
+		closeCancellationRedis: vi.fn<() => Promise<void>>(),
 		RunResetError,
 	};
 });
@@ -25,6 +26,9 @@ const { resetRun, closeQueue, closeDb, RunResetError } = vi.hoisted(() => {
 vi.mock('@/dispatch/run-reset.js', () => ({ resetRun, RunResetError }));
 vi.mock('@/queue/producer.js', () => ({ closeQueue }));
 vi.mock('@/db/client.js', () => ({ closeDb }));
+vi.mock('@/queue/cancellation.js', () => ({
+	closeRunCancellationRedis: closeCancellationRedis,
+}));
 
 import { run } from '@/cli/commands/run.js';
 
@@ -55,6 +59,7 @@ describe('run command', () => {
 		resetRun.mockReset().mockResolvedValue(resetResult());
 		closeQueue.mockReset().mockResolvedValue(undefined);
 		closeDb.mockReset().mockResolvedValue(undefined);
+		closeCancellationRedis.mockReset().mockResolvedValue(undefined);
 		vi.spyOn(console, 'log').mockImplementation((line: string) => {
 			logged.push(line);
 		});
@@ -71,6 +76,7 @@ describe('run command', () => {
 		expect(resetRun).toHaveBeenCalledExactlyOnceWith(RUN_ID, { force: false });
 		expect(closeQueue).toHaveBeenCalledOnce();
 		expect(closeDb).toHaveBeenCalledOnce();
+		expect(closeCancellationRedis).toHaveBeenCalledOnce();
 
 		const report = logged.join('\n');
 		expect(report).toContain('dispatch: the active dispatch was cancelled');
@@ -106,6 +112,45 @@ describe('run command', () => {
 
 		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
 		expect(logged.join('\n')).toContain('checkout: retained — unpushed commits');
+	});
+
+	it('reports a checkout retained by a lease another live run holds', async () => {
+		resetRun.mockResolvedValue(
+			resetResult({ worktree: { outcome: 'blocked', blockedReason: 'live-leased' } }),
+		);
+
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
+		const report = logged.join('\n');
+		expect(report).toContain('checkout: retained — a lease held by another live run');
+		// The operator needs the way out, not just the diagnosis.
+		expect(report).toContain('--force');
+	});
+
+	it('reports an absent checkout and a dispatch that was not active', async () => {
+		resetRun.mockResolvedValue(
+			resetResult({
+				dispatch: 'none',
+				cancellationCleared: false,
+				worktree: { outcome: 'absent' },
+				recoveryCleared: false,
+			}),
+		);
+
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
+		const report = logged.join('\n');
+		expect(report).toContain('dispatch: none was active');
+		expect(report).toContain('checkout: none on disk');
+		expect(report).toContain('lease marker was dropped');
+		// Steps the service did not perform are not claimed.
+		expect(report).not.toContain('cancellation flag:');
+		expect(report).not.toContain('recovery record:');
+	});
+
+	it('leaves an unknown option for the CLI dispatcher to map to exit 1', async () => {
+		// `parseArgs` throws on an unknown option rather than returning a code; the
+		// mapping to exit 1 belongs to `src/cli/index.ts`, which catches it.
+		await expect(run(['reset', RUN_ID, '--nope'])).rejects.toThrow();
+		expect(resetRun).not.toHaveBeenCalled();
 	});
 
 	it('prints a refusal verbatim and exits 1', async () => {

@@ -159,8 +159,9 @@ swarm run reset <runId> [--force]
   3. **checkout** — settles the checkout and worktree lease, releasing a *stale*
      lease no live run owns (the marker a wedged run leaves behind). Reports
      `removed`, `retained` with its reason (`uncommitted changes`,
-     `unpushed commits`, a lease held by another live run), `kept` for a saved
-     agent session, or `none on disk`;
+     `unpushed commits`, a lease held by another live run), or `none on disk`. A
+     reset never keeps a checkout for a saved agent session — restarting from
+     scratch is the point of it;
   4. **recovery record** — clears it plus any captured session id;
   5. **restarted** — re-dispatches the phase from scratch and prints the new
      dispatch id.
@@ -180,6 +181,11 @@ Requires `DATABASE_URL` and `REDIS_URL`. Works with the worker **and** the API
 stopped — it goes straight to Postgres and Redis, which is the point: the same
 action exists in the dashboard (a run's "Reset & restart" button), and this is how
 you reach it when the services that serve it are down.
+
+Run it **on the host that owns the run's worktree**: step 3 inspects and removes
+that checkout on local disk, so from any other machine the checkout looks absent,
+the report says so, and the lease is released for a checkout that still exists
+elsewhere.
 
 ### `swarm users`
 

@@ -22,8 +22,12 @@ import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { closeDb } from '../../db/client.js';
 import { type ResetRunResult, RunResetError, resetRun } from '../../dispatch/run-reset.js';
+import { closeRunCancellationRedis } from '../../queue/cancellation.js';
 import { closeQueue } from '../../queue/producer.js';
-import type { TerminationCleanupResult } from '../../worktree/termination-cleanup.js';
+import type {
+	TerminationBlockedReason,
+	TerminationCleanupResult,
+} from '../../worktree/termination-cleanup.js';
 import * as out from '../_shared/output.js';
 
 const USAGE = `swarm run — operator recovery for a single run
@@ -49,13 +53,23 @@ run is refused.
 Requires DATABASE_URL and REDIS_URL in the environment — run via
 \`npm run swarm -- run reset <runId>\` (loads .env) or export them yourself
 first. Works with the worker and the API stopped: it goes straight to Postgres
-and Redis.`;
+and Redis. Run it on the host that owns the run's worktree — it settles that
+checkout on local disk, so from anywhere else the checkout looks absent.`;
 
 /** `runs.id` is a uuid column (`src/db/schema/runs.ts`). */
 const RunIdSchema = z.string().uuid();
 
-/** Operator-facing wording for a protected-checkout reason (dirty/unpushed/leased). */
-function describeWorktreeReason(reason: string): string {
+/**
+ * Operator-facing wording for a protected-checkout reason (dirty/unpushed/leased).
+ * Typed against the service's union rather than `string` so a new blocked reason
+ * is a compile error here instead of leaking its raw key into the report.
+ *
+ * Keep the wording in this formatter and {@link describeWorktreeOutcome} in sync
+ * with the dashboard's copy of the same report (`dashboard/src/lib/run-reset.ts`),
+ * which cannot import this module: the dashboard package deliberately depends on
+ * no server code, so the two surfaces over `resetRun` duplicate these strings.
+ */
+function describeWorktreeReason(reason: TerminationBlockedReason): string {
 	switch (reason) {
 		case 'dirty':
 			return 'uncommitted changes';
@@ -63,8 +77,6 @@ function describeWorktreeReason(reason: string): string {
 			return 'unpushed commits';
 		case 'live-leased':
 			return 'a lease held by another live run';
-		default:
-			return reason;
 	}
 }
 
@@ -72,7 +84,9 @@ function describeWorktreeReason(reason: string): string {
 function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
 	switch (worktree.outcome) {
 		case 'absent':
-			return 'checkout: none on disk — nothing to remove';
+			// The service still releases the lease on this path, so a leftover marker
+			// from the wedged run is gone even though there was nothing to remove.
+			return 'checkout: none on disk — nothing to remove; any leftover lease marker was dropped';
 		case 'preserved':
 			return 'checkout: kept for its saved agent session; the lease was released';
 		case 'removed': {
@@ -89,7 +103,10 @@ function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
 				: 'checkout: removed and its lease released';
 		}
 		case 'blocked':
-			return `checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}; the restarted run re-checks it before provisioning`;
+			return (
+				`checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}; the restarted run re-checks it before provisioning ` +
+				'— push or discard that work, or re-run with --force, to actually free it'
+			);
 	}
 }
 
@@ -107,9 +124,12 @@ function reportReset(result: ResetRunResult): void {
 			out.step('dispatch: the active dispatch was cancelled');
 			break;
 		case 'force-cancelled-claimed':
-			// Warned, not stepped: the operator must know an agent may still be alive.
+			// The step belongs on stdout with every other report line (so a redirected
+			// report is complete); the live-agent caveat is warned separately because
+			// the operator must not miss it.
+			out.step('dispatch: a worker-claimed dispatch was force-cancelled');
 			out.warn(
-				'dispatch: a worker-claimed dispatch was force-cancelled — an agent process it already spawned is not stopped by a reset',
+				'an agent process that dispatch already spawned is not stopped by a reset — terminate it if it is still running',
 			);
 			break;
 	}
@@ -174,8 +194,10 @@ async function resetOneRun(argv: string[]): Promise<number> {
 		out.error(`run reset failed: ${err instanceof Error ? err.message : String(err)}`);
 		return 1;
 	} finally {
-		await closeQueue();
-		await closeDb();
+		// Every client this command opened, including the one `resetRun` creates to
+		// clear the cancellation flag. Settled together so one failing closer cannot
+		// skip the others — or replace an already-decided exit code with a throw.
+		await Promise.allSettled([closeQueue(), closeDb(), closeRunCancellationRedis()]);
 	}
 }
 
