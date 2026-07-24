@@ -23,23 +23,22 @@
 import type { ProjectConfig } from '../config/schema.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
-import { AgentRunError, agentRunError } from '../harness/agent-failure.js';
+import { agentRunError } from '../harness/agent-failure.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
-import type { WorkItem } from '../pm/types.js';
 import {
 	clearRunCancellation,
 	isRunCancellationRequested,
 	RUN_CANCELLED_MESSAGE,
 } from '../queue/cancellation.js';
-import { DeliveryDeferredError } from '../scm/delivery.js';
-import type {
-	AssignedWorkItem,
-	StreamLogLine,
-	TaskAssignment,
-	TaskExecutionResult,
-} from '../transport/protocol.js';
+import {
+	createAssignmentRunAgent,
+	deferrableOrFailedResult,
+	fromAssignedWorkItem,
+	succeededResult,
+} from '../transport/assignment-execution.js';
+import type { TaskAssignment, TaskExecutionResult } from '../transport/protocol.js';
 import {
 	type AssignmentSink,
 	type BackoffConfig,
@@ -47,13 +46,7 @@ import {
 	type TransportLogger,
 	type WorkerTransportClient,
 } from '../transport/worker-client.js';
-import {
-	type AssignedPhaseInputs,
-	type DeferrableFailure,
-	type PhaseRunResult,
-	retryDelayForFailure,
-	runAssignedPhase,
-} from './consumer.js';
+import { type AssignedPhaseInputs, type PhaseRunResult, runAssignedPhase } from './consumer.js';
 import { createLiveOutputRunner } from './live-output.js';
 import {
 	beginRunCancellationTracking,
@@ -61,9 +54,11 @@ import {
 	unregisterRunController,
 } from './run-cancellation.js';
 
-/** Batch window/size for forwarded output — mirrors `./live-output.ts`. */
-const BATCH_MS = 100;
-const BATCH_SIZE = 100;
+// The pure back-channel framing helpers now live in the shared execution
+// substrate (`../transport/assignment-execution.ts`) so the same-host and
+// DB-free executors frame identically; re-exported here so this module's public
+// surface (and its tests) are unchanged.
+export { createAssignmentRunAgent, fromAssignedWorkItem };
 
 /**
  * Collaborators the assignment executor resolves per phase. Defaulted to the real
@@ -84,81 +79,6 @@ function resolveAssignmentDeps(overrides: Partial<AssignmentDeps> = {}): Assignm
 		loadProject: overrides.loadProject ?? findProjectByIdFromDb,
 		runPhase: overrides.runPhase ?? runAssignedPhase,
 		logger: overrides.logger ?? defaultLogger,
-	};
-}
-
-/** Map the transport's serialization subset back to a PM `WorkItem` for the phase runner. */
-export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
-	return {
-		id: item.id,
-		title: item.title,
-		description: item.description,
-		url: item.url,
-		status: item.status,
-		statusId: item.statusId,
-		labels: item.labels.map((label) => ({ id: label.id, name: label.name, color: label.color })),
-		assignees: item.assignees.map((assignee) => ({
-			handle: assignee.handle,
-			displayName: assignee.displayName,
-			providerId: assignee.providerId,
-		})),
-	};
-}
-
-/**
- * Wrap the agent runner so every emitted line is forwarded to the control plane
- * as a batched `StreamLog` frame — the transport analogue of `./live-output.ts`'s
- * DB batcher, which `base` still performs (it persists to `run_output_events`
- * when the assignment carries a run id, since this worker is same-host with DB
- * access). `base` is injectable so a test can drive the forwarding without a real
- * CLI.
- */
-export function createAssignmentRunAgent(
-	assignment: TaskAssignment,
-	sink: AssignmentSink,
-	base: ReturnType<typeof createLiveOutputRunner> = createLiveOutputRunner(assignment.runId),
-): ReturnType<typeof createLiveOutputRunner> {
-	return async (options) => {
-		let queue: StreamLogLine[] = [];
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const flush = (): void => {
-			if (timer) {
-				clearTimeout(timer);
-				timer = undefined;
-			}
-			const batch = queue;
-			queue = [];
-			const [first, ...rest] = batch;
-			if (!first) return;
-			sink.send({
-				type: 'stream-log',
-				dispatchId: assignment.dispatchId,
-				runId: assignment.runId,
-				lines: [first, ...rest],
-			});
-		};
-		const enqueue = (stream: 'stdout' | 'stderr', line: string): void => {
-			queue.push({ stream, content: `${line}\n`, emittedAt: new Date().toISOString() });
-			if (queue.length >= BATCH_SIZE) flush();
-			else timer ??= setTimeout(flush, BATCH_MS);
-		};
-		try {
-			return await base({
-				...options,
-				onStdout: (line) => {
-					options.onStdout?.(line);
-					enqueue('stdout', line);
-				},
-				onStderr: (line) => {
-					options.onStderr?.(line);
-					enqueue('stderr', line);
-				},
-			});
-		} finally {
-			// Flush whatever the run produced before it settled, even on the throwing
-			// paths — the same "preserve the last output" contract `./live-output.ts` keeps.
-			flush();
-		}
 	};
 }
 
@@ -183,7 +103,9 @@ function buildAssignedPhaseInputs(
 		resumeDelivery: assignment.resumeDelivery === true,
 		runId: assignment.runId,
 		signal,
-		runAgent: createAssignmentRunAgent(assignment, sink),
+		// Same-host base: persists live output to `run_output_events` (DB access)
+		// *and* forwards it over the transport.
+		runAgent: createAssignmentRunAgent(assignment, sink, createLiveOutputRunner(assignment.runId)),
 		workItem: assignment.workItem ? fromAssignedWorkItem(assignment.workItem) : undefined,
 		resumeExistingBranch: assignment.implementationBranchProvisioned === true,
 		// Report the branch checkpoint so the control plane can persist
@@ -208,79 +130,31 @@ function buildAssignedPhaseInputs(
 }
 
 /**
- * Classify a phase failure into the deferrable failure the control plane should
- * schedule a retry for, or `undefined` for a terminal failure — the exact rule
- * the in-process `handlePhaseFailure` applies (`./consumer.ts`): a rate-limit,
- * capacity, aborted, or stalled agent error, a genuinely-interrupted timeout
- * (non-zero/absent exit — a clean SIGTERM exit already cleaned up), or a
- * deterministic-delivery deferral.
- */
-function classifyDeferrable(err: unknown): DeferrableFailure | undefined {
-	if (err instanceof DeliveryDeferredError) return { kind: 'delivery' };
-	if (err instanceof AgentRunError) {
-		const kind = err.failure.kind;
-		if (kind === 'rate-limit' || kind === 'capacity' || kind === 'aborted' || kind === 'stalled') {
-			return err.failure;
-		}
-		if (kind === 'timeout' && err.agent !== undefined && err.agent.exitCode !== 0) {
-			return err.failure;
-		}
-	}
-	return undefined;
-}
-
-/** Build the terminal `succeeded` result frame from a completed phase run. */
-function succeededResult(assignment: TaskAssignment, result: PhaseRunResult): TaskExecutionResult {
-	return {
-		type: 'task-execution-result',
-		dispatchId: assignment.dispatchId,
-		runId: assignment.runId,
-		status: 'succeeded',
-		phase: assignment.phase,
-		taskId: assignment.taskId,
-		exitCode: result.agent.exitCode,
-		signal: result.agent.signal,
-		timedOut: result.agent.timedOut,
-		durationMs: result.agent.durationMs,
-	};
-}
-
-/**
  * Build the terminal failure/deferral result frame. A user termination (issue
  * #166) settles terminal-`failed` with `cancelled: true` (never deferred, which
- * would re-run the very phase the user killed); a deferrable failure settles
- * `deferred` with the retry hint + resume flags a `phase-deferred` outcome
- * carries; everything else settles terminal-`failed`.
+ * would re-run the very phase the user killed); every other failure is classified
+ * by the shared {@link deferrableOrFailedResult} — a deferrable failure settles
+ * `deferred` with the retry hint + resume flags, everything else terminal-`failed`.
+ * The cancelled check is same-host-only (it reads Redis); the DB-free executor has
+ * no such channel.
  */
 async function settleFailure(
 	err: unknown,
 	assignment: TaskAssignment,
 ): Promise<TaskExecutionResult> {
-	const error = describeError(err);
-	const terminal = {
-		type: 'task-execution-result' as const,
-		dispatchId: assignment.dispatchId,
-		runId: assignment.runId,
-		phase: assignment.phase,
-		taskId: assignment.taskId,
-	};
 	if (assignment.runId && (await isRunCancellationRequested(assignment.runId))) {
-		return { ...terminal, status: 'failed', error: RUN_CANCELLED_MESSAGE, cancelled: true };
-	}
-	const failure = classifyDeferrable(err);
-	if (failure) {
 		return {
-			...terminal,
-			status: 'deferred',
-			retryDelayMs: retryDelayForFailure(failure, Date.now()),
-			resumable:
-				failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled',
-			resumeDelivery: failure.kind === 'delivery' || undefined,
-			failureKind: failure.kind,
-			reason: error,
+			type: 'task-execution-result',
+			dispatchId: assignment.dispatchId,
+			runId: assignment.runId,
+			phase: assignment.phase,
+			taskId: assignment.taskId,
+			status: 'failed',
+			error: RUN_CANCELLED_MESSAGE,
+			cancelled: true,
 		};
 	}
-	return { ...terminal, status: 'failed', error };
+	return deferrableOrFailedResult(err, assignment);
 }
 
 /** Options {@link runAssignment} reads — a shared in-flight set, the shutdown signal, and its deps. */

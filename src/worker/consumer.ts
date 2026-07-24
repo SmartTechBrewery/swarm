@@ -1158,9 +1158,11 @@ export interface AssignedPhaseInputs {
 	workItem?: WorkItem;
 	/**
 	 * planning / implementation / respond-to-review only: the resolved
-	 * control-plane PM write delegate (ADR-002 §2, {@link resolvePmDelivery}), or
-	 * `undefined` to use the phase's own in-process provider (the local host
-	 * worker). Mirrors {@link delivery} on the SCM side.
+	 * control-plane PM write delegate (ADR-002 §2, {@link resolvePmDelivery}) or
+	 * DB-free dispatch injection (ADR-003 §2, `../transport/assignment-execution.ts`),
+	 * or `undefined` to use the phase's own in-process provider (the local host
+	 * worker, via `createGitHubProjectsProvider`). Mirrors {@link delivery} on the
+	 * SCM side.
 	 */
 	pm?: PMProvider;
 	/** implementation: reuse an already-provisioned task branch on a resumed retry. */
@@ -1178,10 +1180,23 @@ export interface AssignedPhaseInputs {
 	baseSha?: string;
 	/**
 	 * review / respond-to-review only: the resolved control-plane SCM delivery
-	 * provider (ADR-002 §2, {@link resolveScmDelivery}), or `undefined` to use
-	 * the phase's own in-process delegate.
+	 * provider (ADR-002 §2, {@link resolveScmDelivery}) or DB-free dispatch
+	 * injection (ADR-003 §2, `../transport/assignment-execution.ts`), or
+	 * `undefined` to use the phase's own in-process delegate (the local host
+	 * worker, via `GitHubSCMIntegration`).
+	 *
+	 * A remote worker with no `DATABASE_URL` additionally injects an
+	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
+	 * phases, a `pm`) so no phase reaches into the secret store or the DB.
+	 * Forwarding both `delivery` and `agentToken` keeps the delivery-owning
+	 * phases' `legacyMode` guard false (it is `getToken !== undefined &&
+	 * delivery === undefined`), i.e. deterministic delivery stays on. The
+	 * in-process ({@link runPhase}) and same-host (`./transport-client.ts`)
+	 * paths leave both unset, so the phase resolves its own default exactly
+	 * as before — the agent token from `getPersonaToken`.
 	 */
 	delivery?: ScmDeliveryProvider;
+	agentToken?: string;
 }
 
 /**
@@ -1212,6 +1227,17 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 		resumeSessionId: inputs.resumeSessionId,
 		resumeDelivery: inputs.resumeDelivery,
 	};
+	// Additive DB-free injection (see `AssignedPhaseInputs`): forward an injected
+	// PM/delivery/token straight through, defaulting the PM to the concrete GitHub
+	// provider (the one place a concrete provider is named, per ai/RULES.md §2) and
+	// leaving delivery/`getToken` unset so a phase builds its own DB-backed default
+	// on the in-process path. `agentToken` becomes the phase's `getToken` seam.
+	const { delivery } = inputs;
+	const agentToken = inputs.agentToken;
+	const getToken = agentToken !== undefined ? async () => agentToken : undefined;
+	// Resolved lazily so a phase that takes no PM provider (review / respond-to-ci /
+	// resolve-conflicts) constructs none — preserving the in-process path exactly.
+	const resolvePm = () => inputs.pm ?? createGitHubProjectsProvider(project);
 	switch (inputs.phase) {
 		case 'planning':
 			if (!inputs.workItem) throw new Error('planning phase requires a workItem');
@@ -1219,7 +1245,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				project,
 				workItem: inputs.workItem,
 				taskId,
-				pm: inputs.pm ?? createGitHubProjectsProvider(project),
+				pm: resolvePm(),
 				cli,
 				model,
 				reasoning,
@@ -1243,7 +1269,9 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				project,
 				workItem: inputs.workItem,
 				taskId,
-				pm: inputs.pm ?? createGitHubProjectsProvider(project),
+				pm: resolvePm(),
+				delivery,
+				getToken,
 				cli,
 				model,
 				reasoning,
@@ -1264,11 +1292,12 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				prNumber: inputs.prNumber,
 				headSha: inputs.headSha,
 				taskId,
+				delivery,
+				getToken,
 				cli,
 				model,
 				reasoning,
 				customPrompt,
-				delivery: inputs.delivery,
 				...session,
 				timeoutMs,
 				signal,
@@ -1292,12 +1321,13 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				reviewId: inputs.reviewId,
 				headSha: inputs.headSha,
 				taskId,
-				pm: inputs.pm ?? createGitHubProjectsProvider(project),
+				pm: resolvePm(),
+				delivery,
+				getToken,
 				cli,
 				model,
 				reasoning,
 				customPrompt,
-				delivery: inputs.delivery,
 				...session,
 				timeoutMs,
 				signal,
@@ -1317,6 +1347,8 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				prBranch: inputs.prBranch,
 				headSha: inputs.headSha,
 				taskId,
+				delivery,
+				getToken,
 				cli,
 				model,
 				reasoning,
@@ -1346,6 +1378,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				baseBranch: inputs.baseBranch,
 				baseSha: inputs.baseSha,
 				taskId,
+				delivery,
 				cli,
 				model,
 				reasoning,

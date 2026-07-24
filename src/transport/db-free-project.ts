@@ -1,0 +1,37 @@
+/**
+ * Reconstruct a runnable `ProjectConfig` from the non-secret slice a
+ * `TaskAssignment` carries (`./protocol.ts`, `../config/project-config-slice.ts`).
+ *
+ * A DB-free remote worker (`./connect-entry.ts`) never sees credential
+ * *references*: the assignment carries `NonSecretProjectConfigSchema`, the full
+ * config with the `credentials` block omitted. But the pipeline phases are typed
+ * against the full `ProjectConfig`, so they need a `credentials` block present to
+ * type-check and parse. This fills it with an inert placeholder that satisfies
+ * `CredentialsSchema` and is **never resolved**: the DB-free execution path
+ * injects the operator token and delivery provider directly
+ * (`../worker/consumer.ts` `AssignedPhaseInputs.agentToken`/`delivery`), so
+ * `getPersonaToken` — the only reader of these references — is never called on
+ * this worker. No secret is present or resolvable here, so the placeholder leaks
+ * nothing.
+ */
+
+import type { NonSecretProjectConfig } from '../config/project-config-slice.js';
+import { type ProjectConfig, ProjectConfigSchema } from '../config/schema.js';
+
+/**
+ * Inert credential references satisfying `CredentialsSchema` (each a non-empty
+ * string). Never resolved against any secret store — see the module header.
+ */
+const PLACEHOLDER_CREDENTIALS = {
+	reviewer: 'db-free-unused',
+	webhookSecret: 'db-free-unused',
+} as const;
+
+/**
+ * Rebuild a full `ProjectConfig` from the assignment's non-secret slice, adding
+ * the inert placeholder `credentials`. Re-validates through `ProjectConfigSchema`
+ * so the result is a well-formed config the phases can run against.
+ */
+export function reconstructProjectConfig(slice: NonSecretProjectConfig): ProjectConfig {
+	return ProjectConfigSchema.parse({ ...slice, credentials: PLACEHOLDER_CREDENTIALS });
+}
