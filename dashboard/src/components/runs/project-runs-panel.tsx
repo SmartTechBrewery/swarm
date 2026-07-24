@@ -76,7 +76,7 @@ export function ProjectRunsPanel({ projectId }: ProjectRunsPanelProps) {
 				onClear={handleClearFilters}
 			/>
 
-			<QueuedRunsSection items={queuedQuery.data ?? []} showProject={false} />
+			<QueuedRunsSection items={queuedQuery.data ?? []} showProject={false} projectId={projectId} />
 
 			{runsQuery.isLoading ? (
 				<div className="text-sm text-zinc-400">Loading runs history…</div>

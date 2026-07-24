@@ -5,6 +5,7 @@ import { formatRelativeTime, formatTimeUntil } from '@/lib/format.js';
 import type { QueuedDisplayRow } from '@/lib/queued-runs.js';
 import {
 	groupQueuedRuns,
+	hideBoardRowsWithActiveRun,
 	queuedPhaseLabel,
 	queuedRunKey,
 	queuedWaitReasonLabel,
@@ -15,8 +16,9 @@ import {
 	reviewGateSourceEventLabel,
 } from '@/lib/queued-runs.js';
 import { runTableColumnWidths } from '@/lib/run-table-layout.js';
+import { runsListRefetchInterval } from '@/lib/runs-refresh.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
-import type { QueuedRun } from '@/types/runs.js';
+import type { QueuedRun, RunRow } from '@/types/runs.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
 import { RunStatusBadge } from './run-status-badge.js';
 
@@ -143,6 +145,13 @@ interface QueuedRunsSectionProps {
 	 * — matching {@link RunsTable}'s `showProject`.
 	 */
 	showProject?: boolean;
+	/**
+	 * The project scope for the in-progress-run lookup (issue #421), matching the
+	 * scope of `items`. Left undefined by the global `/runs` view, where the lookup
+	 * runs unscoped — a work-item URL is globally unique, so an unscoped match can
+	 * only be the same card.
+	 */
+	projectId?: string;
 }
 
 /**
@@ -161,13 +170,34 @@ interface QueuedRunsSectionProps {
  * - A row linked to an existing deferred attempt exposes its run detail page;
  *   fresh queued work has no run yet and therefore no detail action.
  */
-export function QueuedRunsSection({ items, showProject = true }: QueuedRunsSectionProps) {
+export function QueuedRunsSection({
+	items,
+	showProject = true,
+	projectId,
+}: QueuedRunsSectionProps) {
 	// Resolve project display names the same way RunsTable does. Hook order is
 	// stable across renders, so the early return below stays after all hooks.
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectsMap = new Map(projectsQuery.data?.map((p) => [p.id, p]) ?? []);
 	const columnWidths = runTableColumnWidths(showProject);
-	const rows = groupQueuedRuns(items);
+
+	// Dedicated running-run lookup (issue #421): a claimed board dispatch has left
+	// the waiting set and become a run in the Runs table, but its leftover sibling
+	// dispatches linger here as `pending`. Scoped only by project — deliberately
+	// independent of the Runs table's own status/phase filters and pagination — so
+	// the dedup holds even when that table is filtered away from `running`.
+	const runningRunsQuery = useQuery({
+		...trpc.runs.list.queryOptions({ projectId, status: 'running', limit: 200, offset: 0 }),
+		refetchInterval: (query) => runsListRefetchInterval(query.state.data),
+	});
+	const activeBoardRunUrls = new Set<string>();
+	for (const run of (runningRunsQuery.data?.data ?? []) as RunRow[]) {
+		if ((run.phase === 'planning' || run.phase === 'implementation') && run.workItemUrl) {
+			activeBoardRunUrls.add(run.workItemUrl);
+		}
+	}
+
+	const rows = hideBoardRowsWithActiveRun(groupQueuedRuns(items), activeBoardRunUrls);
 
 	const [confirmOpen, setConfirmOpen] = useState(false);
 	const [selectedItem, setSelectedItem] = useState<QueuedRun | null>(null);
@@ -191,7 +221,11 @@ export function QueuedRunsSection({ items, showProject = true }: QueuedRunsSecti
 		},
 	});
 
-	if (items.length === 0) return null;
+	// Collapse the section when nothing remains to show — either no queued items at
+	// all, or every queued item was a fresh board row hidden as a duplicate of an
+	// in-progress run (issue #421). Computed from `rows` (post-hide) so the header
+	// count and the section presence stay consistent.
+	if (rows.length === 0) return null;
 
 	const handleOpenConfirm = (item: QueuedRun) => {
 		setSelectedItem(item);
