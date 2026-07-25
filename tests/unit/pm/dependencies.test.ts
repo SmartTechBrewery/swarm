@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	blockedRunMessage,
 	dedupeBlockers,
+	dependencyProse,
 	findDependencyReferences,
 	openBlockers,
 } from '@/pm/dependencies.js';
@@ -66,6 +67,25 @@ describe('findDependencyReferences', () => {
 
 	it('returns [] for empty text', () => {
 		expect(findDependencyReferences('')).toEqual([]);
+	});
+});
+
+describe('dependencyProse', () => {
+	it('combines description and human comments while filtering out SWARM-generated comments', () => {
+		const preplanComment = `## 🗺️ Preplan — Phase 1 of 2\n\nRequires #100.\n<!-- swarm-preplan-comment:abc:0 -->\n---\n<!-- swarm-footer -->`;
+		const planComment = `SWARM plan for task...\nRequires #101.\n---\n<!-- swarm-footer -->`;
+		const humanComment = `Human note: this is blocked by #102.`;
+
+		const prose = dependencyProse('Parent issue description: requires #99.', [
+			preplanComment,
+			humanComment,
+			planComment,
+		]);
+
+		expect(prose).toContain('Parent issue description: requires #99.');
+		expect(prose).toContain('Human note: this is blocked by #102.');
+		expect(prose).not.toContain('Requires #100.');
+		expect(prose).not.toContain('Requires #101.');
 	});
 });
 

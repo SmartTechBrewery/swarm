@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
+import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
@@ -12,7 +13,11 @@ import {
 	fromAssignedWorkItem,
 	runAssignment,
 } from '@/worker/transport-client.js';
-import { createMockProjectConfig, createMockTaskAssignmentInput } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockTaskAssignmentInput,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 // Cancellation rides Redis; mock it so the cancelled-settlement path is testable
 // without a live datastore. Everything else is injected through `runAssignment`'s
@@ -130,6 +135,36 @@ describe('runAssignment', () => {
 			failureKind: 'delivery',
 			resumeDelivery: true,
 		});
+	});
+
+	it('settles deferred (dependency) for a DependencyBlockedError, reporting the blockers', async () => {
+		const sink = recordingSink();
+		const workItem = createMockWorkItem();
+		const blocker = {
+			reference: '#319',
+			url: 'https://github.com/jkwiecien/swarm/issues/319',
+			title: 'Session auth',
+			open: true,
+			source: 'dependency' as const,
+		};
+		const runPhase = vi.fn(async () => {
+			throw new DependencyBlockedError(workItem, [blocker]);
+		});
+		await runAssignment(assignment({ phase: 'implementation' }), sink, {
+			deps: depsWith(runPhase),
+		});
+
+		// Both executors share `deferrableOrFailedResult`, so the same-host path defers
+		// on a blocked prerequisite too rather than settling failed (issue #438).
+		const result = sink.sent.at(-1) as Record<string, unknown>;
+		expect(result).toMatchObject({
+			type: 'task-execution-result',
+			status: 'deferred',
+			failureKind: 'dependency',
+			resumable: false,
+		});
+		expect(result.blockers).toEqual([blocker]);
+		expect(result.reason).toContain('#319');
 	});
 
 	it('settles terminally failed for a generic error', async () => {

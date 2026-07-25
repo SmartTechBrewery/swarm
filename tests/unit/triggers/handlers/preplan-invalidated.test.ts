@@ -135,6 +135,13 @@ describe('preplan-invalidated trigger', () => {
 		expect(await trigger.handle(context())).toBeNull();
 	});
 
+	it('does not dispatch for a label change on a card sitting in Backlog', async () => {
+		const { trigger } = triggerFor([]);
+		expect(
+			await trigger.handle(context({ action: 'labeled', labelName: REPLAN_LABEL })),
+		).toBeNull();
+	});
+
 	it('matches only relevant issue-body and label changes', () => {
 		const { trigger } = triggerFor([]);
 		expect(trigger.matches(context())).toBe(true);

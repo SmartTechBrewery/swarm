@@ -139,25 +139,25 @@ export class GitHubProjectsRouterAdapter {
 	/**
 	 * Loop prevention: whether a SWARM persona itself produced this board change —
 	 * e.g. the worker moving a card to "In progress" as it starts implementation
-	 * would otherwise re-fire the very trigger that started it. Unlike the SCM
-	 * adapter's comment-scoped drop gate, *every* self-authored Projects status
-	 * change must be dropped, since a persona moving a card is exactly the
-	 * feedback loop to break (ai/CODING_STANDARDS.md "Loop prevention").
+	 * would otherwise re-fire the very trigger that started it. *Every* self-authored
+	 * Projects status change must be dropped, since a persona moving a card is
+	 * exactly the feedback loop to break (ai/CODING_STANDARDS.md "Loop prevention").
 	 *
-	 * On any identity-resolution failure this returns `false` but logs it —
-	 * failing *open* (enqueue) rather than closed (drop), mirroring the SCM
-	 * adapter's documented tradeoff (`src/router/adapters/github.ts`): a swallowed
-	 * error must not silently drop a real human-driven status change as "ours".
+	 * This is the one gate still keyed on a persona login, deliberately (issue
+	 * #443): a status change carries no body to inspect, so the SCM side's
+	 * marker-based test (`isSwarmGeneratedBody`) has nothing to read here. It
+	 * therefore keeps the identity resolution — and its failure mode — that the SCM
+	 * comment gate shed. On any identity-resolution failure this returns `false` but
+	 * logs it, failing *open* (enqueue) rather than closed (drop): a swallowed error
+	 * must not silently drop a real human-driven status change as "ours".
 	 *
-	 * The residual risk carries more weight here than on the SCM side, though: an
-	 * SCM false-negative re-enqueues a self-authored *comment* (usually inert),
-	 * whereas here it could re-enqueue a persona's own status move and re-fire the
-	 * trigger that produced it. Two things bound it — identity resolution failing
-	 * is the rare (credential) case, and the authoritative downstream re-read
+	 * Two things bound that residual risk — identity resolution failing is the rare
+	 * (credential) case, and the authoritative downstream re-read
 	 * (docs/github-projects-v2-api.md §5 step 4) is the second line of defense that
-	 * decides whether the re-fired transition actually starts a phase. If this
-	 * proves too loose in practice, the fix is a bounded retry on resolution here,
-	 * not flipping to fail-closed (which would strand real human changes).
+	 * decides whether the re-fired transition actually starts a phase; the worker's
+	 * `selfEnqueueNextPhase` + `pm-status-dedup.ts` compensate on the other side. If
+	 * this proves too loose in practice, the fix is a bounded retry on resolution
+	 * here, not flipping to fail-closed (which would strand real human changes).
 	 */
 	async isSelfAuthored(event: GitHubProjectsParsedEvent, project: ProjectConfig): Promise<boolean> {
 		if (!event.actorLogin) return false;

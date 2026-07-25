@@ -44,6 +44,7 @@ import {
 	embedPreplanMarker,
 	evaluatePreplan,
 	isPreplanSkip,
+	type PreplanContract,
 	SPLIT_CHILD_LABEL,
 } from '@/pipeline/preplan.js';
 import {
@@ -61,6 +62,11 @@ import {
 import { resolveAutomationLabel } from '@/pm/automation-label.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
+import {
+	SWARM_GENERATED_FOOTER,
+	SWARM_GENERATED_SIGNATURE,
+	swarmMarker,
+} from '@/scm/swarm-origin.js';
 import { GitWorktreeManager, type WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 
@@ -168,10 +174,18 @@ const DEFAULT_AUTO_ADVANCE = false;
  * independent of the board Status move `autoAdvance` may make. A fixed constant,
  * not a config option: the smallest durable change, with no speculative setting.
  *
- * Also applied at creation to every split child {@link applySplit} spawns (issue
- * #426), since such a child is already planned by construction — it carries the
- * parent's validated plan in its body — and shouldn't read as un-planned during
- * the window before its own preplanned Planning run completes.
+ * Also applied to every split child {@link applySplit} successfully prepares
+ * (issue #426), since such a child is already planned by construction — it carries
+ * the parent's validated plan in its body — and shouldn't read as un-planned while
+ * it waits its turn (no Planning run of its own follows to label it; the marker
+ * suppresses that dispatch). Applied right after that preparation rather than at
+ * `createWorkItem`, so a child whose preparation failed is never labeled up front
+ * (issue #436).
+ *
+ * On a split child the label therefore tracks *completed preparation* — marker
+ * embedded **and** card moved to Planning — so either failure leaves it unlabeled,
+ * with different consequences ({@link markSplitChildPlanned} owns the full
+ * statement).
  */
 export const PLANNED_LABEL = 'planned';
 
@@ -390,23 +404,46 @@ function enforceSingleTaskBudget(
 }
 
 /**
+ * What automatic preparation of a split child actually achieved, so its split
+ * comment reports the real state rather than a hopeful one (issue #431). Two
+ * independent facts: whether the child's plan was published as a visible comment,
+ * and whether preparation got all the way to Planning. A struct rather than two
+ * positional booleans so the call site stays readable.
+ */
+interface ChildPreparation {
+	/** The preplan was posted as a human-readable comment on the child. */
+	preplanPublished: boolean;
+	/** The marker was embedded and the child reached Planning. */
+	prepared: boolean;
+}
+
+/**
  * Comment posted on a spawned sibling so the board shows what happened: which
- * ordered phase it is, that it came from splitting the parent, whether automatic
- * preparation reached Planning or left it in Backlog, and — the first of the two
- * dependency guards (issue #330) — the exact earlier phases that block it. The
- * second guard is the native `blocked by` relationship {@link applySplit} records;
- * this human-readable list stands in for it on a provider that can't.
+ * ordered phase it is, that it came from splitting the parent, whether its plan
+ * was published as a readable comment, whether automatic preparation reached
+ * Planning or left it in Backlog, and — the first of the two dependency guards
+ * (issue #330) — the exact earlier phases that block it. The second guard is the
+ * native `blocked by` relationship {@link applySplit} records; this human-readable
+ * list stands in for it on a provider that can't.
  *
  * `predecessors` are every phase that must land before this one, in order (phase 1
  * first) — for phase N that is phases 1..N-1. Empty only for the first task, which
  * is the re-scoped parent, not a spawned sibling.
+ *
+ * `preparation` is reported honestly (issue #431): the preplan comment is only
+ * pointed at when it was really posted, so a failed publication never leaves the
+ * operator hunting for a comment that doesn't exist.
+ *
+ * Carries the {@link SWARM_GENERATED_FOOTER} like every other SWARM comment: this
+ * is the one body that has no per-delivery marker to identify it, so without the
+ * footer comment loop prevention would read it back as human input.
  */
 export function splitChildCommentBody(
 	parent: WorkItem,
 	predecessors: readonly WorkItem[],
 	phaseNumber: number,
 	totalPhases: number,
-	prepared: boolean,
+	preparation: ChildPreparation,
 ): string {
 	const lines = [
 		`## 🧩 Phase ${phaseNumber} of ${totalPhases} — split from a larger task`,
@@ -422,12 +459,21 @@ export function splitChildCommentBody(
 			'',
 		);
 	}
-	if (prepared) {
+	if (preparation.preplanPublished) {
+		lines.push(
+			'📋 The complete plan prepared for this task is published in the **Preplan** comment on',
+			'this issue — review it there before you start this phase.',
+			'',
+		);
+	}
+	if (preparation.prepared) {
 		lines.push(
 			"SWARM has already prepared this task's plan and placed it in **Planning**. Its valid",
 			'preplan marker prevents a second Planning-agent run, and it will **not** move to',
 			'**ToDo** on its own. Its implementation stays blocked until the phases above are done —',
-			'move it to **ToDo** when you are ready and its prerequisites have landed.',
+			'move it to **ToDo** when you are ready and its prerequisites have landed. Editing this',
+			"issue's description, or adding the `swarm:replan` label, discards that saved plan and",
+			'makes SWARM run Planning normally.',
 		);
 	} else {
 		lines.push(
@@ -436,7 +482,64 @@ export function splitChildCommentBody(
 			'run a Planning agent normally if that preplan is missing or invalid.',
 		);
 	}
+	lines.push('', '---', SWARM_GENERATED_FOOTER);
 	return lines.join('\n');
+}
+
+/**
+ * Prefix of the provenance marker on a split child's visible preplan comment
+ * (issue #431). Stamps the comment with the split run that produced it
+ * ({@link preplanCommentMarker}), and — being a `<!-- swarm-… -->` marker —
+ * is what makes the comment recognisably SWARM's own to `isSwarmGeneratedBody`,
+ * so comment loop prevention drops the resulting webhook and the dependency-mention
+ * scan ignores the plan's prose.
+ *
+ * A distinct token from the hidden `swarm-preplan:v1` contract marker: the two
+ * diverge right after `preplan`, so `extractPreplanBlock`
+ * (`src/pipeline/preplan.ts`) can never match this one — and it only ever reads
+ * the issue *description*, never comments. The hidden marker stays the single
+ * authoritative source for preplan validation and dispatch suppression; this
+ * comment is a human-readable copy of the same plan.
+ */
+export const PREPLAN_COMMENT_MARKER_PREFIX = '<!-- swarm-preplan-comment:';
+
+/** The full idempotency marker for one split child's published preplan comment. */
+export function preplanCommentMarker(splitId: string, childIndex: number): string {
+	return `${PREPLAN_COMMENT_MARKER_PREFIX}${splitId}:${childIndex} -->`;
+}
+
+/**
+ * Render a split child's parent-written plan as a normal, human-readable comment
+ * (issue #431). GitHub does not render the hidden `swarm-preplan:v1` marker that
+ * carries the same plan, so without this the operator asked to sequence the child
+ * has no way to review its plan short of decoding an HTML comment. The plan is
+ * emitted verbatim and untruncated — this comment is meant to be the plan, not a
+ * summary of it.
+ *
+ * Deliberately carries **no lifecycle advice**. It is published first, before the
+ * marker write and the Planning move, so at the point it is composed nothing here
+ * knows whether either will succeed — a "move this to ToDo" instruction would be
+ * wrong in exactly the Backlog fallback this ordering exists to produce (there is
+ * no saved plan to act on, and the move would dispatch Implementation on a child
+ * that was never planned). {@link splitChildCommentBody} is posted afterwards with
+ * the real {@link ChildPreparation} in hand, so it is the single place that tells
+ * the operator what to do next.
+ */
+export function preplanCommentBody(
+	contract: PreplanContract,
+	phaseNumber: number,
+	totalPhases: number,
+): string {
+	return [
+		`## 🗺️ Preplan — Phase ${phaseNumber} of ${totalPhases}`,
+		'',
+		"This is the complete plan SWARM prepared for **this** task during the parent task's",
+		'Planning run. A separate comment on this issue reports where this task stands and what to do next.',
+		'',
+		contract.plan.trim(),
+		'',
+		preplanCommentMarker(contract.splitId, contract.childIndex),
+	].join('\n');
 }
 
 /**
@@ -450,10 +553,12 @@ export function splitChildCommentBody(
  * whether *this* delivery already posted its plan comment, so a retry after a
  * later step failed reuses exactly its own comment while a genuine replan still
  * posts a new one and re-runs its split. Mirrors the SCM idempotent-comment marker
- * (`swarm-delivery`, `src/integrations/scm/github/client.ts`).
+ * (`swarm-delivery`, `src/integrations/scm/github/client.ts`), and shares its
+ * `<!-- swarm-… -->` frame so comment loop prevention recognises both
+ * (`isSwarmGeneratedBody`, `src/scm/swarm-origin.ts`).
  */
 export function planDeliveryMarker(deliveryId: string): string {
-	return `<!-- swarm-planning-delivery:${deliveryId} -->`;
+	return swarmMarker('planning-delivery', deliveryId);
 }
 
 /**
@@ -474,8 +579,8 @@ export function planCommentBody(
 	deliveryId?: string,
 ): string {
 	const hint = autoAdvance
-		? '_Generated by SWARM (Planning phase). This item is moving to **ToDo** automatically to begin implementation._'
-		: '_Generated by SWARM (Planning phase). Move this item to **ToDo** to begin implementation._';
+		? `${SWARM_GENERATED_SIGNATURE} (Planning phase). This item is moving to **ToDo** automatically to begin implementation._`
+		: `${SWARM_GENERATED_SIGNATURE} (Planning phase). Move this item to **ToDo** to begin implementation._`;
 	const lines = ['## 🗺️ Proposed implementation plan', '', plan.trim(), '', '---', hint];
 	if (deliveryId) lines.push('', planDeliveryMarker(deliveryId));
 	return lines.join('\n');
@@ -565,13 +670,27 @@ function readPlanOrThrow(
  *
  * The marker is embedded via a follow-up `updateWorkItem` (not at creation)
  * because it binds the sibling's own backing-issue URL, which only exists once
- * the item is created. Marker creation/update and the subsequent Planning move
- * are wrapped in a try/catch: a failure is logged and swallowed so the sibling is
- * still created, remains in Backlog, and receives an honest fallback comment,
- * rather than failing the whole parent run mid-loop (which a retry would then
- * duplicate it). The `createWorkItem` and split comment are deliberately outside
- * the catch — those are the split itself, not the optimization, so their failures
- * must still surface.
+ * the item is created. Publishing the visible preplan comment, marker
+ * creation/update and the subsequent Planning move are wrapped in a try/catch: a
+ * failure is logged and swallowed so the sibling is still created, remains in
+ * Backlog, and receives an honest fallback comment, rather than failing the whole
+ * parent run mid-loop (which a retry would then duplicate it). The
+ * `createWorkItem` and split comment are deliberately outside the catch — those
+ * are the split itself, not the optimization, so their failures must still surface.
+ *
+ * Ordering inside the try is deliberate (issue #431): the plan is published as a
+ * readable comment *before* the marker is written, so a failed publication leaves
+ * no marker — the child stays in Backlog and a later human move to Planning runs a
+ * normal Planning agent that posts its own visible plan. Writing the marker first
+ * would instead leave a child whose valid marker permanently suppresses Planning
+ * and whose plan nobody can read. The marker still lands before the Planning move,
+ * so the Backlog-first ordering guarantee is untouched: the extra call happens
+ * while the child sits in `backlog`, a status that starts no phase.
+ *
+ * {@link PLANNED_LABEL} is attached right after that preparation succeeds
+ * ({@link markSplitChildPlanned}), not in the `createWorkItem` labels: a child
+ * whose preparation failed has not finished being placed as planned, so the label
+ * would say the inverse of the board's truth (issue #436).
  */
 async function applySplit(
 	pm: PMProvider,
@@ -602,15 +721,12 @@ async function applySplit(
 			// The configured automation label, not a hard-coded `swarm` (issue #131):
 			// a sibling SWARM created must be opted into SWARM's own pipeline, whatever
 			// label this project gates on. Omitted entirely when the gate is disabled.
-			// PLANNED_LABEL rides along at creation (issue #426): a split child is
-			// already planned by construction — it is born carrying the parent's
-			// validated plan — so the provider-visible marker must be accurate from
-			// the moment the child exists, not only once its own preplanned reuse run
-			// completes. That later run still calls applyPlannedLabel; both label
-			// paths are idempotent at the provider, so the repeat is a no-op.
-			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL, PLANNED_LABEL],
+			// PLANNED_LABEL is deliberately *not* here — it is applied below, once the
+			// preparation that makes the child planned actually succeeded (issue #436).
+			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL],
 		});
 		let prepared = false;
+		let preplanPublished = false;
 		try {
 			const contract = buildPreplanContract({
 				splitId,
@@ -621,6 +737,8 @@ async function applySplit(
 				plan: sub.plan,
 				generatedAt,
 			});
+			await publishPreplanComment(pm, sibling, contract, childIndex + 2, totalPhases);
+			preplanPublished = true;
 			await pm.updateWorkItem(sibling.id, {
 				description: embedPreplanMarker(sub.description, contract),
 			});
@@ -632,9 +750,15 @@ async function applySplit(
 				siblingId: sibling.id,
 				splitId,
 				childIndex,
+				preplanPublished,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		// Only a child that really was prepared is planned (issue #436): the label
+		// must not outlive a failed preparation, which leaves the child in Backlog
+		// without having completed its placement as planned (see
+		// `markSplitChildPlanned` for what each failure branch actually costs).
+		if (prepared) await markSplitChildPlanned(pm, sibling, splitId, childIndex);
 		// Guard 2 (issue #330): record the native blocked-by relationship for every
 		// preceding phase, so the worker defers this phase's Implementation until they
 		// all close. Best-effort — a provider that can't model dependencies, or a
@@ -643,12 +767,98 @@ async function applySplit(
 		await linkBlockedBy(pm, sibling, predecessors, splitId, childIndex);
 		await pm.addComment(
 			sibling.id,
-			splitChildCommentBody(firstTask, predecessors, childIndex + 2, totalPhases, prepared),
+			splitChildCommentBody(firstTask, predecessors, childIndex + 2, totalPhases, {
+				prepared,
+				preplanPublished,
+			}),
 		);
 		subTaskItemIds.push(sibling.id);
 		predecessors.push(sibling);
 	}
 	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined };
+}
+
+/**
+ * Mark a *successfully prepared* split child {@link PLANNED_LABEL} (issues #426,
+ * #436). Such a child is planned by construction — its parent-written plan is
+ * embedded as a validated preplan marker and its card sits in Planning — so the
+ * provider-visible marker is accurate as soon as the child holds that plan.
+ *
+ * This write is the one that counts: a prepared child's own Planning dispatch is
+ * suppressed by `shouldSkipPreplanned` (`src/triggers/handlers/pm-status.ts`), so
+ * no preplanned reuse run normally follows to label it. Should a dispatch reach it
+ * anyway — a resumed run, or the fallback an operator forces — that run calls
+ * {@link applyPlannedLabel} and the provider makes the repeat a no-op.
+ *
+ * Called only when the preparation above succeeded — marker embedded **and** card
+ * moved to Planning. Either failure leaves the child unlabeled in Backlog (issue
+ * #436), but the two are not equivalent, and this is the canonical statement of
+ * the difference:
+ *
+ * - **Marker embed failed** — the parent's plan is lost with the unwritten marker.
+ *   The child really is un-planned and owes a full Planning agent run, which a
+ *   later move to Planning dispatches normally.
+ * - **Planning move failed** — the embedded marker is valid, so the child keeps its
+ *   plan, and `shouldSkipPreplanned` (`src/triggers/handlers/pm-status.ts`) then
+ *   suppresses the Planning dispatch when someone moves the card to Planning. No
+ *   agent is ever spent on it — but nothing applies `PLANNED_LABEL` later either,
+ *   so the card stays unlabeled until an operator forces a fallback run by getting
+ *   the card into Planning and invalidating the preplan (adding `swarm:replan` or
+ *   removing {@link SPLIT_CHILD_LABEL}); either order works, but a label change alone
+ *   does nothing while the card is in Backlog, because `preplan-invalidated` only
+ *   considers cards already in Planning.
+ *
+ * Best-effort, exactly like {@link linkBlockedBy}: a failure is logged and
+ * swallowed so a refused label can never abort the split mid-loop (a retry would
+ * duplicate the siblings). Nothing reads the label — Planning is its only consumer
+ * — so a swallowed failure costs the marker's accuracy, nothing more.
+ */
+async function markSplitChildPlanned(
+	pm: PMProvider,
+	item: WorkItem,
+	splitId: string,
+	childIndex: number,
+): Promise<void> {
+	try {
+		await pm.addLabel(item.id, PLANNED_LABEL);
+	} catch (error) {
+		logger.warn('Planning — failed to label a prepared split child planned', {
+			itemId: item.id,
+			splitId,
+			childIndex,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * Publish a split child's parent-written plan as a normal, human-readable comment
+ * (issue #431). The hidden `swarm-preplan:v1` marker that carries the same plan is
+ * invisible in GitHub's rendered issue, so an operator asked to sequence the child
+ * could not review its plan at the point the workflow asks them to act on it. This
+ * publishes a rendered copy; the marker remains authoritative for validation and
+ * for suppressing the child's redundant Planning-agent run.
+ *
+ * **No duplicate check of its own, deliberately.** The replay guarantee lives one
+ * level up: a retry of the same delivery finds its plan comment by
+ * {@link planDeliveryMarker} and skips {@link applySplit} entirely, so this never
+ * runs twice for the same child. Every child it does see was just created by
+ * `pm.createWorkItem` and therefore has no comments at all — a lookup here could
+ * only ever miss, at the cost of a `resolveItem` + a fully paginated
+ * `listComments` per child, and a *failed* lookup would strand the child in
+ * Backlog over a duplicate that cannot happen.
+ *
+ * Throws on a provider failure — the caller's catch turns that into the honest
+ * Backlog fallback rather than a marker whose plan nobody can read.
+ */
+async function publishPreplanComment(
+	pm: PMProvider,
+	child: WorkItem,
+	contract: PreplanContract,
+	phaseNumber: number,
+	totalPhases: number,
+): Promise<void> {
+	await pm.addComment(child.id, preplanCommentBody(contract, phaseNumber, totalPhases));
 }
 
 /**
@@ -692,7 +902,8 @@ async function linkBlockedBy(
  * it also writes `proposed_split.json`: the original item is re-scoped into the
  * smaller first task (`proposed_plan.md` is that task's plan) and the remaining
  * work is spawned as sibling items. Each sibling enters Planning only after its
- * validated preplan marker is written, is tagged with {@link SPLIT_CHILD_LABEL},
+ * validated preplan marker is written, is tagged with {@link SPLIT_CHILD_LABEL}
+ * (and, once that preparation succeeded, {@link PLANNED_LABEL}),
  * and gets a comment explaining the split. Its marker suppresses a second Planning
  * agent run; the human then starts implementation by moving it to ToDo in order. The original
  * (first task) still honors `autoAdvance` as usual, unless it is itself a

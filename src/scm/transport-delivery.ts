@@ -4,10 +4,12 @@
  * this provider so the two metadata-only SCM delivery calls — `submitReview`,
  * `postComment` — travel up the transport to the control-plane delivery API
  * (`../router/worker-delivery.ts`), which performs the GitHub write under the
- * reviewer PAT. Only metadata (a verdict + a comment body + the PR number)
- * crosses the wire; the repository tree never does (ai/RULES.md §1). The wire
- * mechanics — URL join, bearer header, protocol stamp, error contract — live in
- * the shared client (`../transport/delivery-client.ts`).
+ * persona this composite names: the per-project reviewer PAT for a Review's
+ * verdict and comment, the implementer for a Respond-to-review reply. Only
+ * metadata (a verdict + a comment body + the PR number) crosses the wire; the
+ * repository tree never does (ai/RULES.md §1). The wire mechanics — URL join,
+ * bearer header, protocol stamp, error contract — live in the shared client
+ * (`../transport/delivery-client.ts`).
  *
  * Everything that carries source or must be attributed to the operator's own
  * GitHub account — `commitIdentity`, `findPullRequest`, `createPullRequest`,
@@ -28,6 +30,7 @@
 
 import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
 import {
+	type DeliveryPersona,
 	PostCommentDeliveryResponseSchema,
 	SubmitReviewDeliveryResponseSchema,
 } from '../transport/protocol.js';
@@ -38,6 +41,14 @@ export type { FetchLike } from '../transport/delivery-client.js';
 export interface TransportScmDeliveryOptions extends DeliveryClientOptions {
 	/** The project id, sent so the server resolves the right reviewer PAT + enrollment. */
 	projectId: string;
+	/**
+	 * Which persona the control plane authors this composite's PR comment as — the
+	 * same persona its `localDelegate` was built for, so a Respond-to-review reply
+	 * is the implementer's rather than the reviewer answering itself (issue #444).
+	 * Required, not defaulted, so every construction site states the identity its
+	 * phase runs under instead of leaving the server to infer one.
+	 */
+	persona: DeliveryPersona;
 	/** The worker's in-process provider, handling every source-carrying / attribution op. */
 	localDelegate: ScmDeliveryProvider;
 }
@@ -55,6 +66,8 @@ export function createTransportScmDeliveryProvider(
 		findPullRequest: (branch) => localDelegate.findPullRequest(branch),
 		createPullRequest: (input) => localDelegate.createPullRequest(input),
 		pushBranch: (cwd, branch, expectedSha) => localDelegate.pushBranch(cwd, branch, expectedSha),
+		// No persona on the review frame: only the Review phase submits a review,
+		// and it is always the reviewer's.
 		submitReview: (input) =>
 			postDelivery(
 				options,
@@ -77,6 +90,7 @@ export function createTransportScmDeliveryProvider(
 					prNumber: input.prNumber,
 					body: input.body,
 					deliveryId: input.deliveryId,
+					persona: options.persona,
 				},
 				(value) => PostCommentDeliveryResponseSchema.parse(value).commentId,
 			),

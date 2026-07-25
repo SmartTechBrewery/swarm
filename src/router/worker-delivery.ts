@@ -6,13 +6,17 @@
  *
  * The two metadata-only SCM
  * delivery calls — submit a review, post a PR comment — run *here*, on the
- * router, under the **per-project reviewer PAT** the server already resolves
- * (`getPersonaToken`), instead of on a federated worker holding that token. A
- * worker sends only the verdict + comment body + PR number up the transport
+ * router, under the persona credential the server already resolves
+ * (`getPersonaToken`), instead of on a federated worker holding that token. The
+ * review route always writes as the **per-project reviewer PAT**; the PR-comment
+ * route writes as the persona its request names — the reviewer for a Review's
+ * comment, the implementer for a Respond-to-review reply — defaulting to the
+ * reviewer when a client sends none (issue #444). A worker sends only the verdict
+ * + comment body + PR number (+ that persona) up the transport
  * (`../scm/transport-delivery.ts`); this module performs the GitHub write and
- * returns the created review/comment id. The reviewer PAT is resolved *inside*
- * this process and never leaves it, and only metadata crosses the wire — the
- * repository tree never does (the local-first boundary, ai/RULES.md §1).
+ * returns the created review/comment id. The persona credential is resolved
+ * *inside* this process and never leaves it, and only metadata crosses the wire —
+ * the repository tree never does (the local-first boundary, ai/RULES.md §1).
  *
  * The review still lands on the PR as a genuine GitHub review, so the existing
  * `pull_request_review`-driven respond-to-review trigger (PROJECT.md §5.4) keeps
@@ -85,6 +89,7 @@ import { isRoutable } from '../identity/worker-enrollment.js';
 import { resolveWorkerByCredential } from '../identity/worker-service.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import { logger } from '../lib/logger.js';
 import {
 	type ScheduleFollowUpReview,
 	scheduleFollowUpReviewDefault,
@@ -156,15 +161,71 @@ function defaultDeps(): WorkerDeliveryDeps {
 	};
 }
 
-/** A delivery outcome: the HTTP status and the JSON body to return. */
+/**
+ * A delivery outcome: the HTTP status and the JSON body to return.
+ *
+ * `503` is the one server-fault member: a persona credential this host cannot
+ * resolve ({@link resolvePersonaDelivery}). It is answered rather than thrown so
+ * the worker learns *why* its write failed — an escaped throw becomes the app-level
+ * `internal error` 500, whose body carries no reason at all.
+ */
 export interface DeliveryResult {
-	status: 200 | 400 | 401 | 403 | 404;
+	status: 200 | 400 | 401 | 403 | 404 | 503;
 	json: Record<string, unknown>;
 }
 
 /**
+ * Resolve the SCM delivery provider for one persona, converting a credential this
+ * host cannot resolve into an answerable `503` instead of an escaped throw.
+ *
+ * Both SCM routes need this because the credential is only discovered at call
+ * time and its absence is ordinary misconfiguration, not a bug: the reviewer PAT
+ * is a per-project secret that may be missing, and `implementer` resolves to this
+ * host's `SWARM_OPERATOR_GH_TOKEN`, which the router did not need for
+ * `/pr-comment` before issue #444 and which ships commented out in
+ * `.env.docker.example`. Without this, the phase's only symptom is
+ * `… failed with status 500` in the worker's log, with the actionable cause
+ * visible solely in the router's own logs — for a Respond-to-review that has
+ * already pushed its fix and now gets neither a reply nor a re-review.
+ *
+ * The caught error is logged server-side and never returned: it can name the
+ * credential the module is contracted not to reflect.
+ */
+async function resolvePersonaDelivery(
+	deps: WorkerDeliveryDeps,
+	project: ProjectConfig,
+	persona: ScmPersona,
+	route: string,
+): Promise<ScmDeliveryProvider | DeliveryResult> {
+	try {
+		return await deps.buildScmDelivery(project, persona);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const isIdentityUnresolved = message.toLowerCase().includes('identity');
+
+		if (isIdentityUnresolved) {
+			logger.error('worker-delivery: persona identity unresolved', {
+				route,
+				projectId: project.id,
+				persona,
+				error: message,
+			});
+			return { status: 503, json: { reason: 'persona identity unresolved', persona } };
+		}
+
+		logger.error('worker-delivery: persona credential unavailable', {
+			route,
+			projectId: project.id,
+			persona,
+			error: message,
+		});
+		return { status: 503, json: { reason: 'persona credential unavailable', persona } };
+	}
+}
+
+/**
  * Authenticate a delivery request and resolve the project it targets — the
- * shared prelude both handlers run before touching the reviewer PAT. Returns the
+ * shared prelude both handlers run before touching a persona credential. Returns the
  * authenticated `{ worker, project }` on success, or a {@link DeliveryResult} to
  * return verbatim on any refusal. The credential is never reflected in a body.
  */
@@ -193,7 +254,8 @@ async function authenticateDelivery(
  * the request body: validate → authenticate → resolve the project → perform the
  * review write under the reviewer PAT. Returns the status/body for the route to
  * send; never throws for an expected failure (bad request, bad credential,
- * unknown project, not enrolled), and never reflects the credential in the body.
+ * unknown project, not enrolled, or a persona credential this host cannot
+ * resolve), and never reflects the credential in the body.
  */
 export async function handleSubmitReview(
 	deps: WorkerDeliveryDeps,
@@ -215,7 +277,13 @@ export async function handleSubmitReview(
 
 	// The reviewer PAT is resolved inside this process by `buildScmDelivery` and
 	// never leaves it; only the metadata below is written to GitHub.
-	const delivery = await deps.buildScmDelivery(authed.project, 'reviewer');
+	const delivery = await resolvePersonaDelivery(
+		deps,
+		authed.project,
+		'reviewer',
+		'/worker/delivery/review',
+	);
+	if ('status' in delivery) return delivery;
 	const reviewId = await delivery.submitReview({
 		prNumber: request.prNumber,
 		verdict: request.verdict,
@@ -228,7 +296,18 @@ export async function handleSubmitReview(
 /**
  * Post a top-level PR comment as a pure function of its deps, the raw bearer
  * credential, and the request body. Same prelude and contract as
- * {@link handleSubmitReview}; the reviewer PAT is resolved server-side.
+ * {@link handleSubmitReview}; the persona's credential is resolved server-side.
+ *
+ * The author persona comes from the **request**, not from this handler: a Review
+ * comments as the reviewer, while a Respond-to-review reply is the implementer
+ * answering that review, and inferring `reviewer` here had the reviewer answering
+ * itself (issue #444). The schema defaults the field to `reviewer`, so a client
+ * that sends no persona behaves exactly as before. `implementer` resolves through
+ * the same `getPersonaToken` seam to this host's `SWARM_OPERATOR_GH_TOKEN` — which
+ * the router already holds for loop prevention — and, like the reviewer PAT, that
+ * credential is resolved inside this process and never leaves it. A host that
+ * cannot resolve it answers `503` with a reason rather than throwing
+ * ({@link resolvePersonaDelivery}).
  */
 export async function handlePostComment(
 	deps: WorkerDeliveryDeps,
@@ -248,7 +327,13 @@ export async function handlePostComment(
 	const authed = await authenticateDelivery(deps, credential, request.projectId);
 	if ('status' in authed) return authed;
 
-	const delivery = await deps.buildScmDelivery(authed.project, 'reviewer');
+	const delivery = await resolvePersonaDelivery(
+		deps,
+		authed.project,
+		request.persona,
+		'/worker/delivery/pr-comment',
+	);
+	if ('status' in delivery) return delivery;
 	const commentId = await delivery.postComment({
 		prNumber: request.prNumber,
 		body: request.body,

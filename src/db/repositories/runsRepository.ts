@@ -61,6 +61,13 @@ export interface CreateRunInput {
 	taskId: string;
 	phase: TriggerPhase;
 	workerId?: string;
+	/**
+	 * The SWARM user who owns `workerId` (`DispatchSelection.ownerUserId`) —
+	 * persisted alongside the worker as the attribution record's user half
+	 * (ADR-004 §4, issue #398). Omitted for an unfederated run, which resolves no
+	 * worker at all.
+	 */
+	workerUserId?: string;
 	workerFencingToken?: number;
 	workItemId?: string;
 	workItemTitle?: string;
@@ -92,6 +99,7 @@ export async function createRun(input: CreateRunInput): Promise<string> {
 			taskId: input.taskId,
 			phase: input.phase,
 			workerId: input.workerId,
+			workerUserId: input.workerUserId,
 			workerFencingToken: input.workerFencingToken,
 			workItemId: input.workItemId,
 			workItemTitle: input.workItemTitle,
@@ -162,6 +170,13 @@ export interface CompleteRunInput {
 	 */
 	reviewAutomationOutcome?: ReviewAutomationOutcome;
 	/**
+	 * The PR this run *produced*, as reported in its phase result — the PR half of
+	 * the worker→PR attribution record (ADR-004 §4, issue #398). Set only by a
+	 * PR-producing phase (Implementation); omitted (left as-is) for every other
+	 * phase, so a non-implementation finalize never touches the column.
+	 */
+	producedPrUrl?: string;
+	/**
 	 * This run's recorded cancellation origin (issue #308) — set only on a
 	 * `failed` run whose cancellation was requested through the supported
 	 * dashboard/API `terminate` action. Pass explicit `null` for a cancelled run
@@ -199,6 +214,7 @@ export async function completeRun(runId: string, input: CompleteRunInput): Promi
 			reviewVerdict: input.reviewVerdict,
 			reviewOrdinal: input.reviewOrdinal,
 			reviewAutomationOutcome: input.reviewAutomationOutcome,
+			producedPrUrl: input.producedPrUrl,
 			recovery: input.recovery,
 			cancellation: input.cancellation,
 			planningScope: input.planningScope,
@@ -244,12 +260,14 @@ export async function resetRunToRunning(
 	recovery?: typeof runs.$inferSelect.recovery | null,
 	workerId?: string,
 	workerFencingToken?: number,
+	workerUserId?: string,
 ): Promise<boolean> {
 	const rows = await getDb()
 		.update(runs)
 		.set({
 			status: 'running',
 			workerId: workerId ?? null,
+			workerUserId: workerUserId ?? null,
 			workerFencingToken: workerFencingToken ?? null,
 			startedAt: new Date(),
 			completedAt: null,
@@ -274,6 +292,10 @@ export async function resetRunToRunning(
 			reviewMergeMessage: null,
 			reviewMergeAttempt: null,
 			reviewMergeApprovedHeadSha: null,
+			// `producedPrUrl` is deliberately *not* cleared (issue #398): the PR is a
+			// real external artifact that outlives the attempt, so a resumed
+			// Implementation retry re-reports the same URL and overwrites it, whereas
+			// clearing would erase the record of a PR that exists.
 			// A retried attempt hasn't (yet) been cancelled — clear a prior attempt's
 			// recorded origin so a genuine failure this time never shows a stale
 			// "cancelled via dashboard" origin left over from before the retry.
@@ -583,6 +605,28 @@ export async function hasCompletedRunForTask(
 				eq(runs.status, 'completed'),
 			),
 		)
+		.limit(1);
+	return rows.length > 0;
+}
+
+/**
+ * Whether this project's task has *any* run row for the given phase — running,
+ * failed, or completed. Unlike {@link hasCompletedRunForTask} the status is
+ * deliberately ignored: Implementation opens the PR from *inside* its own
+ * still-running agent process, so `pull_request opened` arrives while that row
+ * is still `running` (see `src/triggers/handlers/review.ts`'s header on that
+ * race). The Review trigger's ownership gate uses this as the durable record
+ * that SWARM dispatched this work item (issue #397).
+ */
+export async function hasRunForTask(
+	projectId: string,
+	taskId: string,
+	phase: TriggerPhase,
+): Promise<boolean> {
+	const rows = await getDb()
+		.select({ id: runs.id })
+		.from(runs)
+		.where(and(eq(runs.projectId, projectId), eq(runs.taskId, taskId), eq(runs.phase, phase)))
 		.limit(1);
 	return rows.length > 0;
 }

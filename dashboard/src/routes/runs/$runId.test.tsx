@@ -33,10 +33,12 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 import { trpcClient } from '@/lib/trpc.js';
 import {
 	FailureDiagnosisCallout,
+	GitHubReferences,
 	RecoveryCallout,
 	ResetRunButton,
 	ReviewCapCallout,
 	ReviewMergeCallout,
+	RunAttributionFields,
 	RunDetailHeader,
 } from './$runId.js';
 
@@ -50,7 +52,10 @@ function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		workItemUrl: null,
 		prNumber: '42',
 		prTitle: 'Some PR',
+		producedPrUrl: null,
 		phase: 'review',
+		workerId: null,
+		workerUserId: null,
 		engine: 'claude',
 		model: 'sonnet',
 		reasoning: null,
@@ -313,6 +318,111 @@ describe('ReviewMergeCallout (issue #278)', () => {
 
 		expect(screen.getByRole('heading', { name: heading })).toBeDefined();
 		expect(screen.getByText('details here')).toBeDefined();
+	});
+});
+
+describe('RunAttributionFields (issue #446)', () => {
+	it('names the worker and its owning SWARM user', () => {
+		render(
+			<RunAttributionFields
+				run={makeReviewRun({
+					workerId: 'worker-1',
+					workerUserId: 'user-1',
+					attribution: {
+						workerId: 'worker-1',
+						workerName: 'alice-macbook',
+						userId: 'user-1',
+						userDisplayName: 'Alice Example',
+					},
+				})}
+			/>,
+		);
+
+		expect(screen.getByText('Worker')).toBeDefined();
+		expect(screen.getByText('alice-macbook')).toBeDefined();
+		expect(screen.getByText('Worker owner')).toBeDefined();
+		expect(screen.getByText('Alice Example')).toBeDefined();
+		// Neither id is exposed once both names resolve.
+		expect(screen.queryByText('worker-1')).toBeNull();
+		expect(screen.queryByText('user-1')).toBeNull();
+	});
+
+	it('renders the neutral dash — never an id — for a run with no recorded worker', () => {
+		render(<RunAttributionFields run={makeReviewRun({ attribution: null })} />);
+
+		expect(screen.getAllByText('—')).toHaveLength(2);
+	});
+
+	it('renders the neutral dash for a pre-existing row that carries no attribution field', () => {
+		render(<RunAttributionFields run={makeReviewRun()} />);
+
+		expect(screen.getAllByText('—')).toHaveLength(2);
+	});
+
+	it('falls back to the recorded ids when the worker/user rows no longer resolve', () => {
+		render(
+			<RunAttributionFields
+				run={makeReviewRun({
+					workerId: 'worker-gone',
+					workerUserId: 'user-gone',
+					attribution: {
+						workerId: 'worker-gone',
+						workerName: null,
+						userId: 'user-gone',
+						userDisplayName: null,
+					},
+				})}
+			/>,
+		);
+
+		expect(screen.getByText('worker-gone')).toBeDefined();
+		expect(screen.getByText('user-gone')).toBeDefined();
+		expect(screen.queryByText('—')).toBeNull();
+	});
+});
+
+describe('GitHubReferences produced-PR link (issue #446)', () => {
+	it('links the PR this run opened, labelled apart from the PR it acted on', () => {
+		render(
+			<GitHubReferences
+				run={makeReviewRun({
+					phase: 'implementation',
+					prNumber: null,
+					prTitle: null,
+					producedPrUrl: 'https://github.com/acme/demo/pull/77',
+				})}
+				project={{ name: 'Demo', repo: 'acme/demo' }}
+			/>,
+		);
+
+		const link = screen.getByRole('link', { name: /pr opened by this run/i }) as HTMLAnchorElement;
+		expect(link.href).toBe('https://github.com/acme/demo/pull/77');
+		// A run whose only reference is the PR it produced no longer reads as empty.
+		expect(screen.queryByText('—')).toBeNull();
+	});
+
+	it('distinguishes the produced PR from the PR a review run acted on', () => {
+		render(
+			<GitHubReferences
+				run={makeReviewRun({ producedPrUrl: 'https://github.com/acme/demo/pull/77' })}
+				project={{ name: 'Demo', repo: 'acme/demo' }}
+			/>,
+		);
+
+		expect(screen.getByRole('link', { name: /pr opened by this run/i })).toBeDefined();
+		const actedOn = screen.getByRole('link', { name: /^PR #42$/ }) as HTMLAnchorElement;
+		expect(actedOn.href).toBe('https://github.com/acme/demo/pull/42');
+	});
+
+	it('still renders the neutral dash for a run with no references at all', () => {
+		const { container } = render(
+			<GitHubReferences
+				run={makeReviewRun({ prNumber: null, prTitle: null })}
+				project={{ name: 'Demo', repo: 'acme/demo' }}
+			/>,
+		);
+
+		expect(container.textContent).toBe('—');
 	});
 });
 

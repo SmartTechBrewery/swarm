@@ -11,7 +11,25 @@
  * reference into a live open/closed state — stays inside each adapter.
  */
 
+import { isSwarmGeneratedBody } from '../scm/swarm-origin.js';
 import type { WorkItemBlocker } from './types.js';
+
+/**
+ * Assemble the free-text prose to scan for dependency references — joining the
+ * item's description and non-SWARM-generated comments. SWARM's own comments
+ * (preplan comments, split comments, plan comments) are excluded so published
+ * plans carrying dependency bullet points never invent self-referential or
+ * circular blockers (issue #431).
+ */
+export function dependencyProse(
+	description: string | undefined,
+	commentBodies: readonly (string | undefined)[],
+): string {
+	const humanComments = commentBodies.filter(
+		(b): b is string => typeof b === 'string' && !isSwarmGeneratedBody(b),
+	);
+	return [description ?? '', ...humanComments].join('\n');
+}
 
 /**
  * Phrases that, in the same clause as an issue reference, signal that the

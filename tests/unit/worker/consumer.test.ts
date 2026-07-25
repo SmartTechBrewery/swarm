@@ -10,7 +10,7 @@ import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
-import type { PMProvider, WorkItemAssignee } from '@/pm/types.js';
+import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import {
@@ -235,6 +235,18 @@ const hasCompletedRunForTask = vi.fn(
 	async (_projectId: string, _taskId: string, _phase: string) => false,
 );
 const resetRunToRunning = vi.fn(async (_id: string, _job?: unknown, _fromStatus?: string) => true);
+/**
+ * The worker-binding tail of each `resetRunToRunning` call, named for
+ * readability: the mock above deliberately forwards only the first three
+ * positional arguments (so the existing exact-call assertions stay short), so
+ * the trailing binding args — worker, fencing token, and the owning user the
+ * attribution record needs (issue #398) — are captured here instead.
+ */
+const resetRunBindings: Array<{
+	workerId?: string;
+	fencingToken?: number;
+	workerUserId?: string;
+}> = [];
 const getRunByIdFromDb = vi.fn(
 	async (_id: string) => undefined as { agentSessionId?: string | null } | undefined,
 );
@@ -249,8 +261,14 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		getLatestCompletedPlanningScope(projectId, taskId),
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
-	resetRunToRunning: (id: string, job?: unknown, fromStatus?: string) =>
-		resetRunToRunning(id, job, fromStatus),
+	resetRunToRunning: (...args: unknown[]) => {
+		resetRunBindings.push({
+			workerId: args[9] as string | undefined,
+			fencingToken: args[10] as number | undefined,
+			workerUserId: args[11] as string | undefined,
+		});
+		return resetRunToRunning(args[0] as string, args[1], args[2] as string | undefined);
+	},
 	getRunByIdFromDb: (id: string) => getRunByIdFromDb(id),
 }));
 
@@ -397,11 +415,15 @@ vi.mock('@/worktree/termination-cleanup.js', () => ({
 		),
 }));
 
+import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 import type { TriggerContext, TriggerResult } from '@/triggers/types.js';
 import {
 	type AssignedPhaseInputs,
 	DEFAULT_AGENT_TIMEOUT_MS,
+	interruptedRunCommentBody,
+	type ProcessJobDeps,
+	phaseFailureCommentBody,
 	processJob,
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
@@ -511,6 +533,7 @@ describe('processJob', () => {
 		updateRunJobPayload.mockResolvedValue(undefined);
 		resetRunToRunning.mockClear();
 		resetRunToRunning.mockResolvedValue(true);
+		resetRunBindings.length = 0;
 		getRunByIdFromDb.mockClear();
 		getRunByIdFromDb.mockResolvedValue(undefined);
 		reconcileTerminatedWorktree.mockClear();
@@ -1808,6 +1831,63 @@ describe('processJob', () => {
 		expect(body).toMatch(/must be done first/i);
 	});
 
+	// A transport-dispatched run reports the block over the wire and the control plane
+	// rebuilds the error (`adaptResultToPhaseRun`, `@/router/dispatcher.js`); these drive
+	// the resulting throw through the pluggable executor seam to prove the shared budget
+	// applies identically to the two in-process tests above (issue #438).
+	describe('dependency block over the dispatch path (issue #438)', () => {
+		const BLOCKER = {
+			reference: '#319',
+			url: 'https://github.com/o/r/issues/319',
+			title: 'Session auth',
+			open: true,
+			source: 'dependency' as const,
+		} as const;
+
+		function blockingExecutor(workItem: WorkItem): ProcessJobDeps {
+			return {
+				executePhase: async () => {
+					throw new DependencyBlockedError(workItem, [BLOCKER]);
+				},
+			};
+		}
+
+		it('defers on the dependency-recheck budget without commenting', async () => {
+			const workItem = createMockWorkItem({ statusId: '61e4505c' });
+
+			const outcome = await processJob(
+				createMockGitHubProjectsWebhookJob(),
+				registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+				undefined,
+				undefined,
+				blockingExecutor(workItem),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', dependencyRecheck: true });
+			if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+			expect(outcome.reason).toContain('#319');
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it('fails with the same board message once the budget is exhausted', async () => {
+			const workItem = createMockWorkItem({ statusId: '61e4505c' });
+
+			const outcome = await processJob(
+				createMockGitHubProjectsWebhookJob({ dependencyRecheckAttempt: 1_000_000 }),
+				registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+				undefined,
+				undefined,
+				blockingExecutor(workItem),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(addComment).toHaveBeenCalledOnce();
+			const [, body] = addComment.mock.calls[0];
+			expect(body).toContain('#319');
+			expect(body).toMatch(/must be done first/i);
+		});
+	});
+
 	describe('federated dispatch gate (issue #339)', () => {
 		const ALICE = '11111111-1111-4111-8111-111111111111';
 		const BOB = '22222222-2222-4222-8222-222222222222';
@@ -2025,12 +2105,46 @@ describe('processJob', () => {
 			expect(createRun).toHaveBeenCalledWith(
 				expect.objectContaining({
 					workerId: 'w-claude',
+					// The worker's owning user, recorded alongside it as the attribution
+					// record's user half (issue #398).
+					workerUserId: ALICE,
 					workerFencingToken: 7,
 					engine: 'claude',
 					model: 'opus',
 					reasoning: 'high',
 				}),
 			);
+		});
+
+		it('re-binds the worker and its owning user when a retry resets the run row (issue #398)', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([candidate('w-claude')]);
+
+			await processJob(
+				createMockGitHubProjectsWebhookJob({ runId: 'run-1' }),
+				registryReturning(planningTrigger()),
+				undefined,
+				executionIdentity('w-claude'),
+			);
+
+			expect(resetRunBindings).toEqual([
+				{ workerId: 'w-claude', fencingToken: 7, workerUserId: ALICE },
+			]);
+		});
+
+		it('re-binds them on the reused terminal row of a fresh dispatch too (issue #398)', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([candidate('w-claude')]);
+			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-failed', status: 'failed' } as never);
+
+			await processJob(
+				createMockGitHubProjectsWebhookJob(),
+				registryReturning(planningTrigger()),
+				undefined,
+				executionIdentity('w-claude'),
+			);
+
+			expect(resetRunBindings).toEqual([
+				{ workerId: 'w-claude', fencingToken: 7, workerUserId: ALICE },
+			]);
 		});
 
 		describe('local single-user mode (issue #373)', () => {
@@ -2941,6 +3055,35 @@ describe('processJob', () => {
 			expect(storeRunLogs).toHaveBeenCalledExactlyOnceWith('run-1', 'o', 'e');
 		});
 
+		it('persists the PR a phase produced as the run row attribution PR (issue #398)', async () => {
+			const workItem = createMockWorkItem();
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				prUrl: 'https://github.com/jkwiecien/swarm/pull/7',
+			});
+
+			await processJob(
+				createMockGitHubProjectsWebhookJob(),
+				registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+			);
+
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'completed',
+					producedPrUrl: 'https://github.com/jkwiecien/swarm/pull/7',
+				}),
+			);
+		});
+
+		it('leaves the attribution PR untouched for a phase that produced none', async () => {
+			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+			// Omitted rather than nulled, so a settle for a non-PR-producing phase never
+			// clears a PR the row already recorded.
+			expect(completeRun.mock.calls[0][1]).toMatchObject({ producedPrUrl: undefined });
+		});
+
 		it('reuses and resets the existing run row when the job carries a runId (no new row)', async () => {
 			const outcome = await processJob(
 				createMockGitHubWebhookJob({ runId: 'run-1' }),
@@ -3670,5 +3813,15 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 			/requires prNumber and headSha/,
 		);
 		expect(phaseCalls).toHaveLength(0);
+	});
+});
+
+describe("the worker's out-of-band comments", () => {
+	// Both are posted as SWARM, so comment loop prevention must recognize them
+	// (issue #443) — an unmarked body would come back through the webhook as
+	// human input.
+	it('carry a SWARM-origin marker', () => {
+		expect(isSwarmGeneratedBody(phaseFailureCommentBody('implementation', 'boom'))).toBe(true);
+		expect(isSwarmGeneratedBody(interruptedRunCommentBody('stalled'))).toBe(true);
 	});
 });

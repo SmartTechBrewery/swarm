@@ -94,6 +94,24 @@ validated preplanned contract** (`PreplanContractSchema`, `src/pipeline/preplan.
 `<!-- swarm-preplan:v1 … -->` marker in the child's issue body — the only state that durably
 travels with a child while it enters Planning.
 
+Because GitHub does not render that hidden marker, SWARM also posts the same plan as a normal,
+human-readable **Preplan** comment on the child (issue #431), so an operator can review the actual
+plan in the issue before sequencing the child. That comment carries its own provenance marker
+(`<!-- swarm-preplan-comment:… -->`) stamping it with the split run that produced it; no duplicate
+check is needed at that point, because a retried or replayed delivery is short-circuited one level
+up (the plan-delivery marker on the parent's own comment) before any child is re-prepared. It is
+published *before* the hidden marker is written: if publishing fails, no marker exists, the child
+stays in Backlog with a comment that claims no published preplan, and a later move to Planning runs
+a normal Planning agent that posts its own plan. The hidden marker remains the single authoritative
+source for preplan validation and for suppressing the redundant Planning run.
+
+The Preplan comment carries the plan as ordinary prose, which the Implementation dependency gate
+also reads when it scans an item for prerequisites named in text. That scan therefore skips every
+comment SWARM itself wrote (`isSwarmGeneratedBody`): a plan phrased as "this phase requires #266 to
+land first" is the agent describing its own work, not an operator declaring a blocker, and treating
+it as one would defer — and eventually fail — the child's Implementation on an issue nobody gated it
+on. Prose dependencies still count in the item's description and in comments written by people.
+
 SWARM creates the card in Backlog only long enough to write that marker, then moves it to Planning.
 That ordering means both the Planning-move webhook and a delayed creation webhook find the marker
 before the trigger evaluates the card: a valid marker on a labelled split child suppresses the

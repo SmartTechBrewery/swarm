@@ -19,6 +19,7 @@ import {
 	listRunsFromDb,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
+import { getUserById } from '../../db/repositories/usersRepository.js';
 import {
 	cancelDispatchAndWake,
 	createAndPublishDispatch,
@@ -28,6 +29,7 @@ import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
+import { getWorker } from '../../identity/worker-service.js';
 import { resolvePipelinePhaseForOptionId } from '../../integrations/pm/github-projects/status-mapping.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { describeError } from '../../lib/errors.js';
@@ -301,6 +303,66 @@ async function reconcileDeferredTermination(
 	}
 }
 
+/**
+ * Display labels for the worker that executed a run and the SWARM user who owns
+ * it (ADR-004 §4, issue #446) — the read side of the attribution the row records
+ * at dispatch. Ids are carried alongside the names so the UI can fall back to an
+ * id when a name no longer resolves.
+ */
+export interface RunAttribution {
+	workerId: string | null;
+	workerName: string | null;
+	userId: string | null;
+	userDisplayName: string | null;
+}
+
+/**
+ * Resolve a run's recorded worker/user into display labels, or `null` when the
+ * row records no attribution at all — an unfederated / single-user run, and
+ * every row written before the columns existed.
+ *
+ * Each field is named explicitly rather than spreading a worker/user row, the
+ * same way `assembleDashboardWorker` assembles its dashboard view
+ * (`src/identity/worker-enrollment-service.ts`): no credential hash and no
+ * config may ride along on a run payload.
+ *
+ * `workerUserId ?? worker.ownerUserId`: a run dispatched before phase 1/2 of
+ * issue #398 has a `worker_id` but no `worker_user_id`, so the worker row's
+ * current owner is the best attribution available for it.
+ *
+ * A failed lookup degrades to null names rather than throwing — a deleted worker
+ * or user must not turn the run detail page into an error.
+ */
+async function resolveRunAttribution(run: {
+	workerId: string | null;
+	workerUserId: string | null;
+}): Promise<RunAttribution | null> {
+	if (!run.workerId && !run.workerUserId) return null;
+	try {
+		const worker = run.workerId ? await getWorker(run.workerId) : undefined;
+		const userId = run.workerUserId ?? worker?.ownerUserId ?? null;
+		const user = userId ? await getUserById(userId) : undefined;
+		return {
+			workerId: run.workerId,
+			workerName: worker?.displayName ?? null,
+			userId,
+			userDisplayName: user?.displayName ?? null,
+		};
+	} catch (error) {
+		logger.warn('runs.getById: attribution lookup failed; reporting ids without names', {
+			workerId: run.workerId,
+			workerUserId: run.workerUserId,
+			error: describeError(error),
+		});
+		return {
+			workerId: run.workerId,
+			workerName: null,
+			userId: run.workerUserId,
+			userDisplayName: null,
+		};
+	}
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } straight from the repo.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
@@ -350,6 +412,9 @@ export const runsRouter = router({
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member
 	// of the run's project (existence hidden with identical run-not-found message).
+	// The row is returned as-is plus an additive `attribution` object resolving the
+	// recorded worker/user to display labels (issue #446) — looked up only after the
+	// access check, so a non-member never triggers an identity read.
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -366,7 +431,7 @@ export const runsRouter = router({
 				'contributor',
 				`Run with ID "${input.id}" not found`,
 			);
-			return run;
+			return { ...run, attribution: await resolveRunAttribution(run) };
 		}),
 
 	// Captured stdout/stderr for a run; null when the run stored no logs (a run

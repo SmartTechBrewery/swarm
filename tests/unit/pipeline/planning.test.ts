@@ -23,12 +23,16 @@ import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js'
 import {
 	buildPlanningPrompt,
 	PLANNED_LABEL,
+	PREPLAN_COMMENT_MARKER_PREFIX,
 	PROPOSED_PLAN_FILENAME,
 	PROPOSED_SCOPE_FILENAME,
 	PROPOSED_SPLIT_FILENAME,
 	planCommentBody,
+	preplanCommentBody,
+	preplanCommentMarker,
 	runPlanningPhase,
 	SPLIT_CHILD_LABEL,
+	splitChildCommentBody,
 } from '@/pipeline/planning.js';
 import {
 	buildPreplanContract,
@@ -38,6 +42,7 @@ import {
 	REPLAN_LABEL,
 } from '@/pipeline/preplan.js';
 import type { UpdateWorkItemPatch, WorkItem } from '@/pm/types.js';
+import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
 
@@ -152,6 +157,22 @@ function makeDeps() {
 	};
 }
 
+/**
+ * The body of a comment posted on split child `itemId` — its published preplan
+ * comment when `preplan` is true (issue #431), else its split-explanation comment.
+ * A fully prepared child receives exactly those two, told apart by the preplan
+ * comment's own idempotency marker.
+ */
+function childComment(
+	deps: ReturnType<typeof makeDeps>,
+	itemId: string,
+	preplan: boolean,
+): string | undefined {
+	return deps.pm.addComment.mock.calls.find(
+		(call) => call[0] === itemId && call[1].includes(PREPLAN_COMMENT_MARKER_PREFIX) === preplan,
+	)?.[1];
+}
+
 describe('runPlanningPhase', () => {
 	beforeEach(() => {
 		planExists = true;
@@ -255,7 +276,7 @@ describe('runPlanningPhase', () => {
 		for (const call of deps.pm.createWorkItem.mock.calls) {
 			expect(call[0]).toMatchObject({
 				status: 'backlog',
-				labels: ['swarm', SPLIT_CHILD_LABEL, PLANNED_LABEL],
+				labels: ['swarm', SPLIT_CHILD_LABEL],
 			});
 		}
 		expect(deps.pm.createWorkItem.mock.calls.map((c) => c[0].title)).toEqual([
@@ -290,13 +311,17 @@ describe('runPlanningPhase', () => {
 		const secondPlanningOrder = deps.pm.moveWorkItem.mock.invocationCallOrder[0];
 		expect(secondMarkerOrder).toBeLessThan(secondPlanningOrder);
 
-		// Each sibling gets an explanatory comment (plus the original's plan comment).
+		// Each prepared child is then labeled `planned` (issues #426, #436) — planned
+		// by construction, so the marker is accurate before its own Planning run.
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
+
+		// Each sibling gets an explanatory comment and its published preplan (issue
+		// #431), plus the original's plan comment.
 		const commentTargets = deps.pm.addComment.mock.calls.map((c) => c[0]);
 		expect(commentTargets).toContain('PVTI_Second slice');
 		expect(commentTargets).toContain('PVTI_Third slice');
-		const secondComment = deps.pm.addComment.mock.calls.find(
-			(c) => c[0] === 'PVTI_Second slice',
-		)?.[1];
+		const secondComment = childComment(deps, 'PVTI_Second slice', false);
 		// Phase 2 of 3, blocked by phase 1 (the re-scoped original) and no one else.
 		expect(secondComment).toMatch(/Phase 2 of 3 — split from a larger task/);
 		expect(secondComment).toMatch(/Blocked by/);
@@ -304,9 +329,7 @@ describe('runPlanningPhase', () => {
 		expect(secondComment).not.toContain('Phase 2: Second slice');
 		expect(secondComment).toContain('placed it in **Planning**');
 
-		const thirdComment = deps.pm.addComment.mock.calls.find(
-			(c) => c[0] === 'PVTI_Third slice',
-		)?.[1];
+		const thirdComment = childComment(deps, 'PVTI_Third slice', false);
 		// Phase 3 of 3, cumulatively blocked by BOTH earlier phases.
 		expect(thirdComment).toMatch(/Phase 3 of 3 — split from a larger task/);
 		expect(thirdComment).toContain('Phase 1: First slice');
@@ -345,34 +368,57 @@ describe('runPlanningPhase', () => {
 		// Without this the sibling SWARM just created would be gated out of SWARM's
 		// own pipeline by the very label the project configured.
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL] }),
 		);
 	});
 
-	it('labels split children `planned` at creation, before their own Planning run (issue #426)', async () => {
+	it('labels a prepared split child `planned` before its own Planning run (issue #426)', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
 			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
 		});
 		const deps = makeDeps();
-		// Marker embedding fails, so the child stays in Backlog and its own preplanned
-		// Planning run never happens — the label must be on the issue regardless.
-		deps.pm.updateWorkItem = vi.fn<(id: string, patch: UpdateWorkItemPatch) => Promise<void>>(
-			async (_id, patch) => {
-				if (typeof patch.description === 'string' && patch.description.includes('swarm-preplan')) {
-					throw new Error('board rejected the update');
-				}
-			},
-		);
 
 		await runPlanningPhase(deps);
 
+		// The label is a follow-up write, not a creation label (issue #436), so a
+		// failed preparation can't leave it behind...
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: ['swarm', SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+			expect.objectContaining({ labels: ['swarm', SPLIT_CHILD_LABEL] }),
 		);
-		// Nothing else labels the child — this run only labels the parent, so the
-		// child's `planned` marker came from createWorkItem alone.
-		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		// ...but a child that really was prepared still carries it long before its own
+		// preplanned Planning run — right after its marker and Planning move landed.
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		const childLabelOrder = deps.pm.addLabel.mock.invocationCallOrder[0];
+		const childPlanningOrder = deps.pm.moveWorkItem.mock.invocationCallOrder[0];
+		expect(childLabelOrder).toBeGreaterThan(childPlanningOrder);
+	});
+
+	it('keeps splitting when labeling a prepared split child `planned` throws (issue #436)', async () => {
+		splitExists = true;
+		splitContents = JSON.stringify({
+			subTasks: [
+				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' },
+				{ title: 'Third slice', description: 'The docs', plan: '# Docs plan\n\n1. Write it.' },
+			],
+		});
+		const deps = makeDeps();
+		// Best-effort, like the blocked-by link: a refused label must never abort the
+		// split mid-loop, or a retry would duplicate the siblings.
+		deps.pm.addLabel = vi.fn<(id: string, name: string) => Promise<void>>(async (id) => {
+			if (id === 'PVTI_Second slice') throw new Error('board rejected the label');
+		});
+
+		const result = await runPlanningPhase(deps);
+
+		expect(result.split).toMatchObject({
+			subTaskItemIds: ['PVTI_Second slice', 'PVTI_Third slice'],
+		});
+		// The refused child was still prepared, so it keeps its Planning placement and
+		// the prepared comment; the next sibling is labeled as usual.
+		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Second slice', 'planning');
+		expect(childComment(deps, 'PVTI_Second slice', false)).toContain('placed it in **Planning**');
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
 	});
 
 	it('labels split children with only the split-child label when the gate is disabled', async () => {
@@ -386,7 +432,7 @@ describe('runPlanningPhase', () => {
 		await runPlanningPhase(deps);
 
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: [SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+			expect.objectContaining({ labels: [SPLIT_CHILD_LABEL] }),
 		);
 	});
 
@@ -469,14 +515,24 @@ describe('runPlanningPhase', () => {
 
 		expect(deps.pm.createWorkItem).toHaveBeenCalledTimes(1);
 		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_Second slice', 'planning');
-		expect(deps.pm.addComment).toHaveBeenCalledWith(
-			'PVTI_Second slice',
-			expect.stringContaining('remains in **Backlog**'),
-		);
-		expect(
-			deps.pm.addComment.mock.calls.find((call) => call[0] === 'PVTI_Second slice')?.[1],
-		).not.toContain('placed it in **Planning**');
+		const splitComment = childComment(deps, 'PVTI_Second slice', false);
+		expect(splitComment).toContain('remains in **Backlog**');
+		expect(splitComment).not.toContain('placed it in **Planning**');
+		// The preplan comment is published before the marker write, so it really did
+		// land here — the split comment reports that, while still being honest that
+		// preparation did not finish (issue #431). It must not contradict that with a
+		// "move it to ToDo" instruction: there is no saved plan to act on, and the move
+		// would dispatch Implementation on a child that was never planned.
+		const preplanComment = childComment(deps, 'PVTI_Second slice', true);
+		expect(preplanComment).toContain('# UI plan');
+		expect(preplanComment).not.toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(splitComment).toContain('**Preplan** comment');
 		expect(result.split).toMatchObject({ subTaskItemIds: ['PVTI_Second slice'] });
+		// Such a child is genuinely un-planned — its plan is lost with the unwritten
+		// marker and a full Planning agent run still has to produce one — so it must
+		// not be left labeled `planned` (issue #436). The parent's own run still is.
+		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', PLANNED_LABEL);
 	});
 
 	it('posts a Backlog fallback comment when moving a prepared sibling to Planning throws', async () => {
@@ -490,16 +546,152 @@ describe('runPlanningPhase', () => {
 		deps.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(async (id) => {
 			if (id === 'PVTI_Second slice') throw new Error('board rejected the move');
 		});
-
 		await runPlanningPhase({ ...deps, autoAdvance: true });
 
-		expect(deps.pm.addComment).toHaveBeenCalledWith(
+		// The marker write precedes the move, so this branch really does leave a valid
+		// embedded plan behind — the observable state the docs' "keeps its plan" claim
+		// rests on (issue #436).
+		expect(deps.pm.updateWorkItem).toHaveBeenCalledWith(
 			'PVTI_Second slice',
-			expect.stringContaining('remains in **Backlog**'),
+			expect.objectContaining({ description: expect.stringContaining('swarm-preplan:v1') }),
 		);
-		expect(
-			deps.pm.addComment.mock.calls.find((call) => call[0] === 'PVTI_Second slice')?.[1],
-		).not.toContain('placed it in **Planning**');
+		const splitComment = childComment(deps, 'PVTI_Second slice', false);
+		expect(splitComment).toContain('remains in **Backlog**');
+		expect(splitComment).not.toContain('placed it in **Planning**');
+		// The preplan was already published before the move failed, so saying so is
+		// accurate — the honesty rule is about not claiming what didn't happen. The
+		// published plan itself stays silent on what to do next; the split comment,
+		// which knows preparation failed, is the one place that says it.
+		const preplanComment = childComment(deps, 'PVTI_Second slice', true);
+		expect(preplanComment).toContain('# UI plan');
+		expect(preplanComment).not.toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(splitComment).toContain('**Preplan** comment');
+		// The other half of the preparation block, same conclusion (issue #436): a
+		// child stranded in Backlog is not `planned`, whichever step stranded it.
+		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+	});
+
+	it('short-circuits and labels a dispatched preplanned child whatever status its card is in', async () => {
+		const deps = makeDeps();
+		// A child carrying a valid marker while still sitting in Backlog — the state a
+		// failed Planning move leaves behind. This pins the *phase*: the card's status
+		// is not what the preplanned short-circuit keys on. It is not evidence that such
+		// a card ever heals on its own — `shouldSkipPreplanned` refuses to dispatch a
+		// preplanned split child at all (see
+		// `tests/unit/triggers/handlers/pm-status.test.ts`, "returns null (skips planning
+		// dispatch) when a split child entering Planning is already preplanned"), so in
+		// practice only a resumed or operator-forced run reaches this path.
+		deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.', undefined, {
+			status: 'Backlog',
+			labels: [{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL }],
+		});
+
+		const result = await runPlanningPhase({ ...deps });
+
+		expect(deps.runAgent).not.toHaveBeenCalled();
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_child', PLANNED_LABEL);
+		expect(result).toMatchObject({ preplanned: true });
+	});
+
+	// Issue #431: the hidden `swarm-preplan:v1` marker is invisible in GitHub's
+	// rendered issue, so each child also gets its complete plan as a normal comment.
+	describe('published preplan comment', () => {
+		beforeEach(() => {
+			splitExists = true;
+			splitContents = JSON.stringify({
+				mainTask: { title: 'First slice', description: 'Just the API' },
+				subTasks: [
+					{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Build it.' },
+					{ title: 'Third slice', description: 'The docs', plan: '# Docs plan\n\n1. Write it.' },
+				],
+			});
+		});
+
+		it("publishes each child's complete plan as a readable comment before its marker and Planning move", async () => {
+			const deps = makeDeps();
+			await runPlanningPhase({ ...deps, autoAdvance: true });
+
+			const second = childComment(deps, 'PVTI_Second slice', true);
+			expect(second).toContain('## 🗺️ Preplan — Phase 2 of 3');
+			// The plan itself, verbatim and readable — not base64 inside an HTML comment.
+			expect(second).toContain('# UI plan\n\n1. Build it.');
+			expect(childComment(deps, 'PVTI_Third slice', true)).toContain('## 🗺️ Preplan — Phase 3 of 3');
+			expect(childComment(deps, 'PVTI_Third slice', true)).toContain('# Docs plan\n\n1. Write it.');
+
+			// Published before the marker is embedded and before the child leaves
+			// Backlog: a failed publication must not leave a suppressing marker behind.
+			const preplanPost = deps.pm.addComment.mock.invocationCallOrder[0];
+			const markerWrite = deps.pm.updateWorkItem.mock.calls.findIndex(
+				(call) => call[0] === 'PVTI_Second slice',
+			);
+			expect(preplanPost).toBeLessThan(
+				deps.pm.updateWorkItem.mock.invocationCallOrder[markerWrite],
+			);
+			expect(preplanPost).toBeLessThan(deps.pm.moveWorkItem.mock.invocationCallOrder[0]);
+			expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Second slice', 'planning');
+
+			// The split comment points the operator at it.
+			expect(childComment(deps, 'PVTI_Second slice', false)).toContain('**Preplan** comment');
+		});
+
+		it('posts no duplicate preplan comment when the same delivery is retried', async () => {
+			const deps = makeDeps();
+			// The reachable replay path: the prior attempt of THIS delivery already
+			// posted the parent's plan comment, so the phase short-circuits on that
+			// delivery marker and never re-runs the split. That, not a per-child
+			// lookup, is what stops a second preplan comment — the children of a
+			// re-run split are freshly created issues with no comments at all.
+			deps.pm.findComment.mockImplementation(async (_id, marker) =>
+				marker.includes('run-A') ? 'existing-comment' : undefined,
+			);
+
+			await runPlanningPhase({ ...deps, runId: 'run-A', autoAdvance: true });
+
+			expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+			expect(deps.pm.addComment).not.toHaveBeenCalled();
+			// No preplan-comment lookup is made at all — the guarantee lives upstream.
+			expect(deps.pm.findComment).not.toHaveBeenCalledWith(
+				expect.anything(),
+				PREPLAN_COMMENT_MARKER_PREFIX,
+			);
+		});
+
+		it('publishes the plan without a per-child lookup on a fresh split', async () => {
+			const deps = makeDeps();
+			await runPlanningPhase({ ...deps, autoAdvance: true });
+
+			// Every child here was just created, so it cannot already carry a preplan
+			// comment: the lookup could only ever miss, at the cost of a resolveItem +
+			// a fully paginated listComments per child (issue #431 review).
+			expect(deps.pm.findComment).not.toHaveBeenCalledWith(
+				expect.anything(),
+				PREPLAN_COMMENT_MARKER_PREFIX,
+			);
+			expect(childComment(deps, 'PVTI_Second slice', true)).toContain('# UI plan');
+			expect(childComment(deps, 'PVTI_Third slice', true)).toContain('# Docs plan');
+		});
+
+		it('leaves the child in Backlog and claims no published preplan when publishing throws', async () => {
+			const deps = makeDeps();
+			deps.pm.addComment.mockImplementation(async (_id, text) => {
+				if (text.includes(PREPLAN_COMMENT_MARKER_PREFIX)) throw new Error('board rejected it');
+				return 'comment-1';
+			});
+
+			await runPlanningPhase({ ...deps, autoAdvance: true });
+
+			// No marker was written, so the child falls back to a normal Planning run
+			// that will post its own visible plan — rather than being suppressed by a
+			// marker whose plan nobody can read.
+			expect(deps.pm.updateWorkItem).not.toHaveBeenCalledWith(
+				'PVTI_Second slice',
+				expect.objectContaining({ description: expect.stringContaining('swarm-preplan:v1') }),
+			);
+			expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_Second slice', 'planning');
+			const splitComment = childComment(deps, 'PVTI_Second slice', false);
+			expect(splitComment).toContain('remains in **Backlog**');
+			expect(splitComment).not.toContain('Preplan');
+		});
 	});
 
 	it('reuses a preplanned split-child plan: skips the worktree and agent, posts the plan, never advances', async () => {
@@ -534,8 +726,8 @@ describe('runPlanningPhase', () => {
 
 	it('re-applies `planned` without failing when the split child already carries it (issue #426)', async () => {
 		const deps = makeDeps();
-		// Exactly the shape applySplit now creates: the child is labeled `planned`
-		// from birth, and its own preplanned run reaches applyPlannedLabel anyway.
+		// Exactly the shape applySplit leaves behind: a prepared child is already
+		// labeled `planned`, and its own preplanned run reaches applyPlannedLabel anyway.
 		deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.', undefined, {
 			labels: [
 				{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL },
@@ -1108,5 +1300,92 @@ describe('planCommentBody', () => {
 			'<!-- swarm-planning-delivery:run-42 -->',
 		);
 		expect(planCommentBody('step one')).not.toContain('swarm-planning-delivery');
+	});
+
+	it('is recognizable as SWARM-generated even without a delivery id (issue #443)', () => {
+		// Comment loop prevention keys on this marker; the `_Generated by SWARM…_`
+		// footer covers the direct/test invocation that has no delivery marker.
+		expect(isSwarmGeneratedBody(planCommentBody('step one'))).toBe(true);
+		expect(isSwarmGeneratedBody(planCommentBody('step one', true))).toBe(true);
+	});
+});
+
+describe('splitChildCommentBody', () => {
+	// The only SWARM comment with no per-delivery marker of its own, so the footer
+	// is the whole of its loop-prevention coverage (issue #443).
+	it('is recognizable as SWARM-generated', () => {
+		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
+		expect(
+			isSwarmGeneratedBody(
+				splitChildCommentBody(parent, [], 2, 3, { preplanPublished: true, prepared: true }),
+			),
+		).toBe(true);
+		expect(
+			isSwarmGeneratedBody(
+				splitChildCommentBody(parent, [parent], 2, 3, { preplanPublished: false, prepared: false }),
+			),
+		).toBe(true);
+	});
+
+	it('includes move-to-ToDo instruction and swarm:replan hint when prepared, and Backlog fallback when unprepared', () => {
+		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
+		const preparedBody = splitChildCommentBody(parent, [], 2, 3, {
+			preplanPublished: true,
+			prepared: true,
+		});
+		expect(preparedBody).toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(preparedBody).toContain('swarm:replan');
+		expect(preparedBody).not.toContain('remains in **Backlog**');
+
+		const unpreparedBody = splitChildCommentBody(parent, [parent], 2, 3, {
+			preplanPublished: false,
+			prepared: false,
+		});
+		expect(unpreparedBody).not.toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(unpreparedBody).not.toContain('swarm:replan');
+		expect(unpreparedBody).toContain('remains in **Backlog**');
+	});
+});
+
+describe('preplanCommentBody', () => {
+	const contract = buildPreplanContract({
+		splitId: 'split-abc',
+		childIndex: 1,
+		parentUrl: 'https://github.com/o/r/issues/18',
+		itemUrl: 'https://github.com/o/r/issues/42',
+		humanDescription: 'The UI slice.',
+		plan: '# UI plan\n\n1. Build it.',
+		generatedAt: '2026-07-14T00:00:00.000Z',
+	});
+
+	it('identifies itself as this phase’s preplan and carries the plan verbatim', () => {
+		const body = preplanCommentBody(contract, 3, 4);
+		expect(body).toContain('## 🗺️ Preplan — Phase 3 of 4');
+		expect(body).toContain('# UI plan\n\n1. Build it.');
+		expect(body).toContain(
+			'A separate comment on this issue reports where this task stands and what to do next.',
+		);
+		expect(body).not.toContain('comment below');
+	});
+
+	it('gives no lifecycle instruction — it is composed before preparation is known to succeed', () => {
+		const body = preplanCommentBody(contract, 3, 4);
+		// It is published before the marker write and the Planning move, so it cannot
+		// honestly tell the operator to move the item on: in the Backlog fallback there
+		// is no saved plan, and a move to ToDo would dispatch Implementation on a child
+		// that was never planned. The split comment, posted afterwards with the real
+		// preparation state, owns that advice.
+		expect(body).not.toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(body).not.toContain('swarm:replan');
+	});
+
+	it('ends with the split-provenance marker its own prefix identifies', () => {
+		const marker = preplanCommentMarker('split-abc', 1);
+		expect(marker).toBe('<!-- swarm-preplan-comment:split-abc:1 -->');
+		expect(marker.startsWith(PREPLAN_COMMENT_MARKER_PREFIX)).toBe(true);
+		expect(preplanCommentBody(contract, 3, 4)).toContain(marker);
+		// Distinct token from the authoritative hidden contract marker, so neither
+		// can ever be mistaken for the other.
+		expect(preplanCommentBody(contract, 3, 4)).not.toContain('<!-- swarm-preplan:v1');
 	});
 });

@@ -1,6 +1,6 @@
 # ADR-004: Worker↔control-plane transport and split GitHub delivery
 
-- **Status:** Accepted — §1 and §2 implemented, §3 and §4 outstanding (see below)
+- **Status:** Accepted — §1, §2, §3, and §4 implemented
 - **Date:** 2026-07-24 (renumbered 2026-07-25)
 - **Decision owners:** SWARM maintainers
 - **Builds on:** [ADR-001](./ADR-001-federated-workers-and-project-access.md)
@@ -99,6 +99,7 @@ to the control plane.**
 | push branch (`delivery.pushBranch`, `scm-integration.ts:300-319`) | yes | worker | **operator's own token** |
 | create PR (`delivery.createPullRequest`, `implementation.ts:495`) | no (metadata) | **worker** | **operator's own (implementer)** — kept worker-side for attribution |
 | submit review + review comments (`delivery.submitReview`, `review.ts:470`) | no | **control plane** | **per-project reviewer PAT** |
+| respond-to-review reply (`delivery.postComment`, `respond-to-review.ts`) | no | **control plane** (in control-plane delivery mode) | **implementer** — the persona named on the frame, not the reviewer being answered (issue #444) |
 | move board card / comment on issue (PM provider) | no | **control plane** | per-project PM credential |
 
 Consequences of the rule:
@@ -116,6 +117,17 @@ Consequences of the rule:
   GitHub using that PAT. The review therefore still appears on the PR as a real
   GitHub review — which keeps the existing `pull_request_review`-driven
   respond-to-review trigger (PROJECT.md §5.4) working unchanged.
+- **A moved comment is authored by the persona the phase asked for, not by
+  whichever credential the server happens to hold** (issue #444). The reviewer PAT
+  is only the *right* identity for a Review; a Respond-to-review reply is the
+  implementer answering that review, so `POST /worker/delivery/pr-comment` carries
+  the requesting `persona` (defaulting to `reviewer`, which is what keeps an older
+  client unchanged) and the router resolves that persona's credential server-side.
+  `POST /worker/delivery/review` needs no such field — only Review submits a
+  verdict. The implementer resolves to the router's own `SWARM_OPERATOR_GH_TOKEN`,
+  so attribution is exact under the same-host assumption that token already carries
+  (issue #396) and is the *server* operator's on a different-machine deployment —
+  the residual gap §3/§4 below own.
 - **PM board/issue writes also move server-side**, for the same reason the
   reviewer PAT does: they are metadata operations needing a project-scoped
   credential the worker should not hold, and the worker has no DB config under
@@ -150,40 +162,102 @@ item build out of order.
 
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
 
-> **Status: outstanding — issue #397.** Not implemented, and no longer
-> hypothetical: since §2 landed for Implementation (issue #417), a federated PR is
-> authored by the operator's own account, so the persona-authorship gate skips it
-> and **auto-review does not fire on the federated path**. This is the gating item
-> for that path being usable end to end.
+> **Status: implemented, in two phases.** Phase 1 (issue #397) — the **`pr-review`
+> trigger's ownership gate**: the three author checks in
+> `src/triggers/handlers/review.ts` collapsed into one work-item origin gate,
+> `isSwarmManagedPullRequest` (`src/triggers/swarm-managed-pr.ts`), evaluated once
+> per event inside the mergeability check, with `isSwarmAuthoredPr` and the GitHub
+> client's `getPullRequestAuthorLogin` deleted. Phase 2 (issue #443) — **comment
+> loop prevention**: `GitHubRouterAdapter.isSelfAuthored` no longer resolves or
+> matches persona identities at all; it tests the comment's own SWARM-origin marker
+> (`isSwarmGeneratedBody`, `src/scm/swarm-origin.ts`) against a new
+> `commentBody` field on the parsed event. This mattered once §2 landed for
+> Implementation (issue #417): a federated PR is authored by the operator's own
+> account, so the persona-authorship gate skipped it and auto-review did not fire on
+> the federated path at all, while the comment gate dropped that same operator's
+> hand-written comments as SWARM's own. Two identity-based filters remain,
+> deliberately: the PM board's `GitHubProjectsRouterAdapter.isSelfAuthored` (a
+> status change carries no body to mark, and `selfEnqueueNextPhase` +
+> `pm-status-dedup.ts` already compensate) and `resolve-conflicts`' candidate
+> filter, tracked separately.
 
-Today SWARM decides a PR should be auto-reviewed by checking that its **author
+SWARM used to decide a PR should be auto-reviewed by checking that its **author
 is a SWARM persona**: `isSwarmAuthoredPr` → `isSwarmBot(authorLogin, identities)`
-(`src/triggers/handlers/review.ts:181-217`), with the author taken from
-`pull_request.user.login` (`src/router/adapters/github.ts:127,209`) or a
-`pulls.get` on `check_suite` (`review.ts:321-322`); non-persona authors are
-skipped ("PR not authored by a SWARM persona — skipping", `review.ts:217`).
+in `src/triggers/handlers/review.ts`, with the author taken from
+`pull_request.user.login` (`src/router/adapters/github.ts`) or a `pulls.get` on
+`check_suite`; non-persona authors were skipped.
 
-Under §2 the PR author becomes the worker operator's own account, so this gate
-would skip every federated PR and auto-review would never fire. The trigger must
-instead recognise a PR as SWARM-managed by its **linkage to a SWARM work item
-opened by a registered worker**, not by author identity. The same re-basing
-applies to the comment-loop-prevention drop (`isSelfAuthored`,
-`github.ts:321-334`): loop prevention keys on work-item/worker origin rather
-than on a persona login. The reviewer identity remains distinct from the author
-(per-project reviewer PAT ≠ user account), so the independent-reviewer invariant
-(PROJECT.md §5.3) still holds.
+Under §2 the PR author becomes the worker operator's own account, so that gate
+skips every federated PR and auto-review never fires — and on a true federation
+the control plane cannot resolve the implementer identity at all, since that
+token is worker-local. The trigger instead recognises a PR as SWARM-managed by
+its **linkage to a SWARM work item SWARM itself ran**: the head branch decodes to
+a work-item number under the project's `branchPrefix` *and* an `implementation`
+run row exists for that work item in that project (`hasRunForTask`,
+status-agnostic, and never requiring `runs.workerId` — that column is NULL on
+every unfederated project).
+
+The same re-basing applies to the comment-loop-prevention drop (`isSelfAuthored`,
+`src/router/adapters/github.ts`), where the equivalent of "work-item origin" is the
+comment's own **SWARM origin**: SWARM marks every comment it posts with a hidden
+`<!-- swarm-… -->` marker or a `_Generated by SWARM…_` footer, so the drop tests for
+those (`isSwarmGeneratedBody`, `src/scm/swarm-origin.ts`) instead of for a persona
+login. That holds however SWARM delivered the comment — including through another
+operator's account, whose login this process could not resolve — and it stops
+claiming the operator's genuine human comments. The producers and the detector build
+their strings from the same constants so they cannot drift; a new SWARM comment body
+that carries neither marker is the one way to reopen the loop.
+
+The reviewer identity remains distinct from the author (per-project reviewer PAT
+≠ user account) and the aggregate check query and Review phase still run under it,
+so the independent-reviewer invariant (PROJECT.md §5.3) still holds. Routing
+*between* personas still resolves identities (`getPersonaForLogin`); only the drop
+gates stopped.
 
 ### 4. Record worker→PR attribution in the data model
 
-> **Status: outstanding — issue #398.** Not implemented. Note the constraint §2
-> introduced: a DB-free worker cannot write the record itself, so both ends must be
-> captured by the control plane — at push (`src/router/dispatcher.ts`) and at settle
-> — and the `TaskExecutionResult` frame carries no PR identity today.
+> **Status: built** — the record in phase 1/2 (issue #398) and its dashboard
+> surfacing in phase 2/2 (issue #446). Native comment authorship is also settled
+> on every delivery path: a comment is written by the persona the phase requested
+> (issue #444), so a Respond-to-review reply reads as the implementer's rather
+> than as the reviewer answering itself — with the caveat §2 records, that the
+> implementer credential the router resolves is its own `SWARM_OPERATOR_GH_TOKEN`,
+> so on a different-machine deployment the reply is authored by the *server*
+> operator's account rather than the worker's. The mapping lives on the existing `runs` row:
+> `work_item_id` / `phase` / `worker_id` / **`worker_user_id`** (new) /
+> **`produced_pr_url`** (new). Both ends are captured by the control plane, as the
+> §2 constraint requires — a DB-free worker cannot write the record itself: the
+> worker + its owning user (`DispatchSelection.ownerUserId`) are written at
+> dispatch through the row's normal lifecycle (`createRun` / `resetRunToRunning`),
+> and the produced PR at settle (`completeRun`). To carry the settle half back from
+> a remote worker, the `TaskExecutionResult` frame gained an optional `prUrl`
+> (`src/transport/protocol.ts`, emitted by `succeededResult` and mapped back by
+> `adaptResultToPhaseRun`) — optional and additive, so no protocol-version bump and
+> mixed-version workers stay compatible. `worker_user_id` is denormalized rather
+> than joined through `workers.owner_user_id` so the attribution survives the worker
+> row being removed (`worker_id` is `ON DELETE SET NULL`); `produced_pr_url` is
+> deliberately not cleared on a retry, since the PR outlives the attempt. Both
+> columns are nullable: an unfederated / single-user run records no worker at all,
+> and only a PR-producing phase (Implementation) reports a PR.
+>
+> Phase 2/2 reads the record back on the run detail view (`/runs/$runId`):
+> `runs.getById` resolves the two ids into display labels through the existing
+> `getWorker` + `getUserById` pair — after its project-access check, so no identity
+> read happens for a caller who may not see the run — and returns them as an
+> additive `attribution` object; the page shows them as **Worker** / **Worker
+> owner** beside the engine/model, and links `produced_pr_url` as **PR opened by
+> this run**, distinct from the `PR #n` a Review run acted on. Nullability carries
+> straight through to the UI: no recorded worker renders the neutral `—`, never a
+> raw id and never a fabricated owner, and a deleted worker/user degrades to its
+> recorded id rather than erroring the page.
 
 Independent of the native GitHub authorship, the control plane records the
 `(work item, phase, worker, user, PR url)` mapping when it dispatches and when
-delivery reports back, so the dashboard can show which worker produced a given
-PR/review even if the token model later changes.
+delivery reports back, so the dashboard **shows** which worker produced a given
+PR/review even if the token model later changes. A produced **review** needs no
+column of its own: its identity is already durable in `review_verdicts`, and the
+Review run row carries `pr_number` + `review_verdict` + `review_ordinal`, so the
+worker/user columns complete that half of the mapping too.
 
 ## Consequences
 
@@ -197,8 +271,9 @@ PR/review even if the token model later changes.
 - A new server-side **delivery API** exposes exactly the metadata GitHub
   operations backed by per-project credentials; the worker calls it instead of
   holding those tokens. **Shipped** as `src/router/worker-delivery.ts`: the SCM
-  half (`submitReview`/`postComment` under the reviewer PAT →
-  `POST /worker/delivery/review` + `/pr-comment`) and the PM half
+  half (`submitReview` under the reviewer PAT → `POST /worker/delivery/review`,
+  and `postComment` under the persona its frame names, reviewer by default →
+  `POST /worker/delivery/pr-comment`) and the PM half
   (`moveWorkItem`/`addComment` under the per-project PM credential →
   `POST /worker/delivery/pm/move` + `/pm/comment`), each authenticated by the
   worker credential and gated on an active enrollment. A worker opts in with

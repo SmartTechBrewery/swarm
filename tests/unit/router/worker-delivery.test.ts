@@ -219,6 +219,36 @@ describe('handleSubmitReview', () => {
 		expect(result.json).toMatchObject({ protocolVersion: TRANSPORT_PROTOCOL_VERSION });
 		expect(deps.resolveWorkerByCredential).not.toHaveBeenCalled();
 	});
+
+	it('answers 503 with persona credential unavailable when the reviewer PAT is missing', async () => {
+		const deps = makeDeps({
+			buildScmDelivery: vi
+				.fn()
+				.mockRejectedValue(new Error(`No reviewer credential configured: ${RESOLVED_PAT}`)),
+		});
+
+		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody());
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({ reason: 'persona credential unavailable', persona: 'reviewer' });
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+	});
+
+	it('answers 503 with persona identity unresolved when buildScmDelivery fails with a non-credential error', async () => {
+		const deps = makeDeps({
+			buildScmDelivery: vi
+				.fn()
+				.mockRejectedValue(
+					new Error(`Could not resolve GitHub identity for reviewer persona: ${RESOLVED_PAT}`),
+				),
+		});
+
+		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody());
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({ reason: 'persona identity unresolved', persona: 'reviewer' });
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+	});
 });
 
 describe('handlePostComment', () => {
@@ -241,6 +271,36 @@ describe('handlePostComment', () => {
 		});
 	});
 
+	it('posts under the persona the request names, so a review reply is authored by the implementer', async () => {
+		const postComment = vi.fn().mockResolvedValue(88);
+		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery({ postComment }));
+		const deps = makeDeps({ buildScmDelivery });
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(buildScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm' }),
+			'implementer',
+		);
+		expect(postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('falls back to the reviewer persona for a client that sends none', async () => {
+		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery());
+		const deps = makeDeps({ buildScmDelivery });
+
+		expect((await handlePostComment(deps, CREDENTIAL, commentBody())).status).toBe(200);
+		expect(buildScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm' }),
+			'reviewer',
+		);
+	});
+
 	it('enforces auth and enrollment before touching the PAT', async () => {
 		const unknown = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
 		expect((await handlePostComment(unknown, 'bogus', commentBody())).status).toBe(401);
@@ -254,6 +314,39 @@ describe('handlePostComment', () => {
 		const deps = makeDeps();
 		const result = await handlePostComment(deps, CREDENTIAL, commentBody({ body: '' }));
 		expect(result.status).toBe(400);
+	});
+
+	it('returns 400 for an unknown persona rather than guessing one', async () => {
+		const deps = makeDeps();
+		const result = await handlePostComment(deps, CREDENTIAL, commentBody({ persona: 'operator' }));
+		expect(result.status).toBe(400);
+		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
+	});
+
+	it('answers 503 with a reason when the persona credential cannot be resolved', async () => {
+		// Ordinary misconfiguration on this host: `implementer` resolves to its
+		// `SWARM_OPERATOR_GH_TOKEN`, which the router did not need for this route
+		// before issue #444. Letting the throw escape makes it a reason-less 500, so
+		// the worker's log — and the failed run's comment — never name the cause.
+		const deps = makeDeps({
+			buildScmDelivery: vi
+				.fn()
+				.mockRejectedValue(new Error(`No operator GitHub token configured: ${RESOLVED_PAT}`)),
+		});
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({
+			reason: 'persona credential unavailable',
+			persona: 'implementer',
+		});
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+		expect(JSON.stringify(result.json)).not.toContain(CREDENTIAL);
 	});
 });
 

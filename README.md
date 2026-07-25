@@ -27,7 +27,7 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
 ```
 
 - Planning and Implementation start from GitHub Projects board status changes.
-- Review starts when a SWARM-authored pull request opens or its checks complete.
+- Review starts when a SWARM-managed pull request opens or its checks complete.
 - Respond-to-review and Respond-to-CI start from pull-request lifecycle events.
 - The worker runs `claude`, `agy` (Antigravity), or `codex` in an isolated
   worktree and performs deterministic GitHub delivery after the agent exits.
