@@ -1,10 +1,10 @@
 /**
- * Worker-safe projection of a project config (issue #393, ADR-002 §1).
+ * Worker-safe projection of a project config (issue #393, ADR-004 §1).
  *
  * A pipeline phase reads project config from the DB while it runs in-process,
  * with the full `ProjectConfig` — including the `credentials` block (references
  * into the encrypted secret store, `src/config/schema.ts`) and provider-specific
- * board/field IDs. A future *remote* worker (ADR-002 split delivery) has no DB
+ * board/field IDs. A future *remote* worker (ADR-004 split delivery) has no DB
  * access and must never receive server-side secrets.
  *
  * This module is the single enforcement point for that boundary: an **allowlist**

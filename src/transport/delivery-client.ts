@@ -1,6 +1,6 @@
 /**
  * Worker-side HTTP client for the control-plane **metadata delivery API**
- * (ADR-002 §2, `../router/worker-delivery.ts`). One place owns the wire details
+ * (ADR-004 §2, `../router/worker-delivery.ts`). One place owns the wire details
  * every `POST /worker/delivery/*` call shares: the base-URL join, the
  * `Authorization: Bearer <credential>` header, the protocol-version stamp, and
  * the error contract (a non-2xx or unparseable body **throws**, so a caller

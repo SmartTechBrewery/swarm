@@ -1,7 +1,7 @@
 /**
  * Server-side delivery API for the operations a federated worker cannot perform
  * itself — the metadata GitHub writes whose credential stays on the server
- * (ADR-002 §2), plus the review-verdict ledger reads/writes whose *database*
+ * (ADR-004 §2), plus the review-verdict ledger reads/writes whose *database*
  * stays on the server (ADR-003 §2).
  *
  * The two metadata-only SCM
