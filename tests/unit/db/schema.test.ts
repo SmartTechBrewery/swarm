@@ -1,6 +1,13 @@
 import { getTableConfig } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
-import { projectCredentials, projects, reviewVerdicts, runLogs, runs } from '@/db/schema/index.js';
+import {
+	projectCredentials,
+	projects,
+	reviewVerdicts,
+	runLogs,
+	runs,
+	users,
+} from '@/db/schema/index.js';
 
 // These tests pin the persisted shape to SWARM's config model (src/config/schema.ts)
 // and single-user scope (ai/ARCHITECTURE.md) without needing a live Postgres.
@@ -165,6 +172,19 @@ describe('db schema', () => {
 			expect(columns.get('review_merge_attempt')?.notNull).toBe(false);
 			expect(columns.get('review_merge_approved_head_sha')?.getSQLType()).toBe('text');
 			expect(columns.get('review_merge_approved_head_sha')?.notNull).toBe(false);
+		});
+
+		it('carries the nullable worker→PR attribution columns (issue #398)', () => {
+			expect(columns.get('worker_user_id')?.getSQLType()).toBe('uuid');
+			expect(columns.get('worker_user_id')?.notNull).toBe(false);
+			expect(columns.get('produced_pr_url')?.getSQLType()).toBe('text');
+			expect(columns.get('produced_pr_url')?.notNull).toBe(false);
+		});
+
+		it('keeps the run row when its attribution user is removed', () => {
+			const fk = table.foreignKeys.find((f) => f.reference().foreignTable === users);
+			expect(fk).toBeDefined();
+			expect(fk?.onDelete).toBe('set null');
 		});
 	});
 

@@ -26,12 +26,8 @@ import { buildResolveConflictsPrompt } from '../pipeline/prompts/resolve-conflic
 import { buildRespondToCiPrompt } from '../pipeline/prompts/respond-to-ci.js';
 import { buildRespondToReviewPrompt } from '../pipeline/prompts/respond-to-review.js';
 import { buildReviewPrompt } from '../pipeline/prompts/review.js';
+import { taskBranch } from '../pipeline/task-branch.js';
 import type { TriggerResult } from '../triggers/types.js';
-
-/** The task branch a phase provisions/opens its PR from — `<branchPrefix><taskId>`. */
-function taskBranch(project: ProjectConfig, taskId: string): string {
-	return `${project.branchPrefix}${taskId}`;
-}
 
 /**
  * Resolve the target branch the assignment carries, from config + trigger alone
@@ -45,7 +41,7 @@ export function resolveTargetBranch(project: ProjectConfig, trigger: TriggerResu
 		case 'planning':
 		case 'implementation':
 		case 'review':
-			return taskBranch(project, trigger.taskId);
+			return taskBranch(project.branchPrefix, trigger.taskId);
 		case 'respond-to-review':
 		case 'respond-to-ci':
 		case 'resolve-conflicts':
@@ -86,7 +82,7 @@ export function composeSystemPrompt(
 				{
 					repo: project.repo,
 					taskId: trigger.taskId,
-					branch: taskBranch(project, trigger.taskId),
+					branch: taskBranch(project.branchPrefix, trigger.taskId),
 					baseBranch: project.baseBranch,
 				},
 				customPrompt,

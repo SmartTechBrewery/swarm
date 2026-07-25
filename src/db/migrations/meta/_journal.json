@@ -253,6 +253,13 @@
       "when": 1784834671124,
       "tag": "0035_next_patriot",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1784970402892,
+      "tag": "0036_thankful_payback",
+      "breakpoints": true
     }
   ]
 }

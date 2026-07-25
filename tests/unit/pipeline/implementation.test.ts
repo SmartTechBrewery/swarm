@@ -21,6 +21,7 @@ import {
 	runImplementationPhase,
 } from '@/pipeline/implementation.js';
 import type { WorkItemBlocker } from '@/pm/types.js';
+import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
 
@@ -558,5 +559,12 @@ describe('implementationCommentBody', () => {
 		const body = implementationCommentBody('https://github.com/jkwiecien/swarm/pull/99', false);
 		expect(body).toContain('Automated Review is disabled');
 		expect(body).toContain('remains **In progress**');
+	});
+
+	it('is recognizable as SWARM-generated in both variants (issue #443)', () => {
+		// Comment loop prevention keys on this marker, so an unmarked body would come
+		// back through the webhook as human input.
+		expect(isSwarmGeneratedBody(implementationCommentBody('https://x/pull/9'))).toBe(true);
+		expect(isSwarmGeneratedBody(implementationCommentBody('https://x/pull/9', false))).toBe(true);
 	});
 });

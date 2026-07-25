@@ -18,12 +18,10 @@ import type { ProjectConfig } from '../../config/schema.js';
 import {
 	type GitHubPersona,
 	getPersonaForLogin,
-	isSwarmBot,
 	type PersonaIdentities,
-	resolvePersonaIdentities,
 } from '../../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../../integrations/scm/github/scm-integration.js';
-import { logger } from '../../lib/logger.js';
+import { isSwarmGeneratedBody } from '../../scm/swarm-origin.js';
 
 /** The GitHub webhook event types SWARM acts on. */
 export const PROCESSABLE_EVENTS = [
@@ -57,6 +55,13 @@ export const GitHubParsedEventSchema = z.object({
 	actorLogin: z.string().optional(),
 	/** Comment-carrying events (`issue_comment`) — the ones a persona can author in reply. */
 	isCommentEvent: z.boolean(),
+	/**
+	 * The comment's raw markdown body, populated for `issue_comment` events only.
+	 * It exists solely for loop prevention ({@link GitHubRouterAdapter.isSelfAuthored}),
+	 * which asks whether SWARM generated this comment rather than who posted it —
+	 * no trigger handler reads comment text, so don't grow handler logic on it.
+	 */
+	commentBody: z.string().optional(),
 
 	// --- Fields the pipeline-phase trigger handlers (SWARM-53) read. All
 	// optional and populated per event type: the Review handler needs the head
@@ -117,12 +122,12 @@ export const GitHubParsedEventSchema = z.object({
 	 */
 	isDraft: z.boolean().optional(),
 	/**
-	 * The login that opened the PR (`pull_request.user.login`). The Review
-	 * handler's author-persona gate reviews only PRs a SWARM persona authored, so
-	 * a human- or third-party-bot-authored PR doesn't burn a review. Populated
-	 * only for `pull_request` events, where the payload carries the author; the
-	 * `check_suite` path has no author in its payload and fetches it instead
-	 * (`getPullRequestAuthorLogin`).
+	 * The login that opened the PR (`pull_request.user.login`), populated only for
+	 * `pull_request` events — the `check_suite` payload carries no author.
+	 * Tracing/log data only: the Review handler's ownership gate keys on the PR's
+	 * work-item origin (head branch + Implementation run history), not on the
+	 * author, since a federated PR is opened by the worker operator's own account
+	 * (issue #397).
 	 */
 	prAuthorLogin: z.string().optional(),
 	/** Base branch of a pull request, used by the conflict-resolution side-car. */
@@ -291,6 +296,10 @@ export class GitHubRouterAdapter {
 			workItemUrl: ((issue?.html_url as string) ?? (pullRequest?.html_url as string)) || undefined,
 			actorLogin,
 			isCommentEvent: eventType === 'issue_comment',
+			commentBody:
+				eventType === 'issue_comment'
+					? ((asRecord(p.comment)?.body as string) ?? undefined)
+					: undefined,
 			...extractLifecycleFields(eventType, p),
 		};
 	}
@@ -301,36 +310,36 @@ export class GitHubRouterAdapter {
 	}
 
 	/**
-	 * Loop prevention for the *comment* reply loop: whether a SWARM persona
-	 * authored this comment event, so the router can drop it instead of treating
-	 * it as new human input. This is a **drop gate**, and it is deliberately
-	 * scoped to comment events (mirroring Cascade) — a persona's own ack/reply
-	 * comments are what create the runaway feedback loop.
+	 * Loop prevention for the *comment* reply loop: whether SWARM itself generated
+	 * this comment, so the router can drop it instead of treating it as new human
+	 * input. This is a **drop gate**, and it is deliberately scoped to comment
+	 * events (mirroring Cascade) — SWARM's own ack/reply comments are what create
+	 * the runaway feedback loop.
+	 *
+	 * **It asks about the comment, not its author** (issue #443). It used to match
+	 * `event.actorLogin` against the project's persona logins, which stopped
+	 * working once the implementer credential became the worker operator's own
+	 * GitHub token (ADR-004 §2, issue #396): the operator's *hand-written* comments
+	 * were dropped as SWARM's, and comments SWARM delivered through another
+	 * operator's account were not recognised at all. Instead the gate reads the
+	 * comment's own SWARM-origin marker (`isSwarmGeneratedBody`,
+	 * `src/scm/swarm-origin.ts`), so it holds for any posting account — and needs no
+	 * credential, so there is no identity resolution left to fail.
 	 *
 	 * It intentionally does *not* fire for `pull_request` / `pull_request_review`
-	 * / `check_suite` events even when a persona produced them: those must flow
+	 * / `check_suite` events even when SWARM produced them: those must flow
 	 * through so the *other* persona can act (the implementer opens a PR → the
 	 * reviewer reviews it; the reviewer requests changes → the implementer
 	 * responds). That cross-persona routing is `personaForEvent`'s job, not this
 	 * gate's — using `isSelfAuthored` as a blanket drop for lifecycle events
 	 * would suppress exactly the events the pipeline depends on.
 	 *
-	 * On any identity-resolution failure this returns `false` but logs it: a
-	 * swallowed error must not silently drop a real comment as "ours".
+	 * `async` only to keep the shape the webhook receiver shares with the PM
+	 * adapter's still-identity-based gate (`WebhookReceiverDeps`).
 	 */
-	async isSelfAuthored(event: GitHubParsedEvent, project: ProjectConfig): Promise<boolean> {
-		if (!event.isCommentEvent || !event.actorLogin) return false;
-		try {
-			const identities = await resolvePersonaIdentities(project);
-			return isSwarmBot(event.actorLogin, identities);
-		} catch (err) {
-			logger.error('Failed to resolve persona identities; skipping loop-prevention check', {
-				projectId: project.id,
-				repoFullName: event.repoFullName,
-				error: String(err),
-			});
-			return false;
-		}
+	async isSelfAuthored(event: GitHubParsedEvent, _project: ProjectConfig): Promise<boolean> {
+		if (!event.isCommentEvent) return false;
+		return isSwarmGeneratedBody(event.commentBody);
 	}
 
 	/**
