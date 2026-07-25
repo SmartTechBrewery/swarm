@@ -74,6 +74,7 @@ import {
 	sessionRunArgs,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
+import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import {
 	DeliveryDeferredError,
 	deliveryIdentity,
@@ -190,17 +191,18 @@ export interface RunReviewPhaseOptions {
 	/**
 	 * Injectable review-verdict ledger writers (issue #235) — defaults to the
 	 * real {@link markReviewVerdictSubmittedDefault}/{@link abandonReviewVerdictDefault}
-	 * repository calls; overridden in tests.
+	 * repository calls; overridden in tests, and by a DB-free worker with the
+	 * transport-backed ledger ({@link ReviewVerdictLedger}).
 	 */
-	markReviewVerdictSubmitted?: typeof markReviewVerdictSubmittedDefault;
-	abandonReviewVerdict?: typeof abandonReviewVerdictDefault;
+	markReviewVerdictSubmitted?: ReviewVerdictLedger['markReviewVerdictSubmitted'];
+	abandonReviewVerdict?: ReviewVerdictLedger['abandonReviewVerdict'];
 	/**
 	 * Injectable prior-submitted-review lookup (issue #328) — defaults to the real
 	 * {@link getPriorSubmittedReviewDefault}; overridden in tests. Its result
 	 * decides whether this run is a re-review (a prior `request-changes` verdict)
 	 * and therefore gets the scoped, verify-the-requested-changes-only prompt.
 	 */
-	getPriorSubmittedReview?: typeof getPriorSubmittedReviewDefault;
+	getPriorSubmittedReview?: ReviewVerdictLedger['getPriorSubmittedReview'];
 }
 
 export interface ReviewPhaseResult {
@@ -261,7 +263,7 @@ interface ReviewAgentRunParams {
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	runAgent: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
-	getPriorSubmittedReview: typeof getPriorSubmittedReviewDefault;
+	getPriorSubmittedReview: ReviewVerdictLedger['getPriorSubmittedReview'];
 }
 
 /**

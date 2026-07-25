@@ -32,6 +32,7 @@ import { createOperatorDeliveryProvider } from '../integrations/scm/github/opera
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
+import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import { createWriteOnlyTransportPmProvider } from '../pm/transport-delivery.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
@@ -53,6 +54,7 @@ import type {
 	TaskExecutionResult,
 	TaskPhase,
 } from './protocol.js';
+import { createTransportReviewLedger } from './review-ledger-delivery.js';
 import type { AssignmentSink, TransportLogger } from './worker-client.js';
 
 /** Batch window/size for forwarded output — mirrors `../worker/live-output.ts`. */
@@ -233,7 +235,9 @@ export function deferrableOrFailedResult(
  * - `review` — the diff read and the agent run stay worker-side under the
  *   operator token; `submitReview` goes through the control-plane SCM delivery
  *   API under the project's **reviewer PAT**, which a federated worker must
- *   never hold.
+ *   never hold, and its three review-verdict ledger calls (the two-verdict cap
+ *   and the re-review signal) go through the control-plane ledger routes, which
+ *   own the `review_verdicts` table this worker has no database for.
  *
  * `respond-to-review` additionally needs a PM *read* to resolve its board card,
  * which no DB-free seam serves yet (issue #418); `planning`'s PM write surface is
@@ -284,6 +288,22 @@ function resolveDbFreePm(
 		projectId: project.id,
 		providerType: project.pm.type,
 	});
+}
+
+/**
+ * The review-verdict ledger a DB-free phase runs against, or `undefined` for a
+ * phase that keeps none (only Review consults the ledger). Routed to the control
+ * plane, which holds the database: skipping the ledger instead would silently
+ * disable the two-verdict cap (issue #235) and prompt every re-review as a first
+ * review (issue #328).
+ */
+function resolveDbFreeReviewLedger(
+	phase: TaskPhase,
+	projectId: string,
+	transport: DeliveryClientOptions,
+): ReviewVerdictLedger | undefined {
+	if (phase !== 'review') return undefined;
+	return createTransportReviewLedger({ ...transport, projectId });
 }
 
 /**
@@ -350,6 +370,8 @@ interface DbFreePhaseInputsParams {
 	delivery: ScmDeliveryProvider;
 	/** The PM provider this phase runs against, or undefined for a phase that takes none. */
 	pm: PMProvider | undefined;
+	/** Review only: the transport-backed review-verdict ledger ({@link resolveDbFreeReviewLedger}). */
+	reviewLedger: ReviewVerdictLedger | undefined;
 	operatorToken: string;
 	baseRunAgent: typeof runAgentCli;
 }
@@ -362,6 +384,7 @@ function buildDbFreePhaseInputs({
 	sink,
 	delivery,
 	pm,
+	reviewLedger,
 	operatorToken,
 	baseRunAgent,
 }: DbFreePhaseInputsParams): AssignedPhaseInputs {
@@ -406,6 +429,7 @@ function buildDbFreePhaseInputs({
 		// writes it cannot perform ride the control-plane delivery API.
 		delivery,
 		pm,
+		reviewLedger,
 		agentToken: operatorToken,
 	};
 }
@@ -481,6 +505,7 @@ export async function runAssignmentDbFree(
 			sink,
 			delivery: resolveDbFreeDelivery(phase, operatorDelivery, transport, project.id),
 			pm: resolveDbFreePm(phase, project, transport),
+			reviewLedger: resolveDbFreeReviewLedger(phase, project.id, transport),
 			operatorToken: options.operatorToken,
 			baseRunAgent: deps.baseRunAgent,
 		});

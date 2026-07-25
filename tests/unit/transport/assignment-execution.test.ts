@@ -241,9 +241,18 @@ describe('runAssignmentDbFree', () => {
 		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
 	});
 
-	it("skips implementation's dependency gate instead of failing a board read it cannot serve", async () => {
+	it("keeps implementation's dependency gate working through the blockers read route", async () => {
 		const sink = recordingSink();
-		const fetchImpl = vi.fn<FetchLike>();
+		const blockers = [
+			{
+				reference: '#319',
+				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				title: 'Prerequisite',
+				open: true,
+				source: 'dependency' as const,
+			},
+		];
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { blockers }));
 		let pm: AssignedPhaseInputs['pm'];
 		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
 			pm = inputs.pm;
@@ -255,15 +264,15 @@ describe('runAssignmentDbFree', () => {
 			{ ...RUN_OPTIONS, deps: depsWith(runPhase, undefined, fetchImpl) },
 		);
 
-		// The control plane owns the dependency gate on this path, so the injected
-		// provider declares the capability off and the gate short-circuits.
-		expect(pm?.supportsDependencies).toBe(false);
-		await expect(pm?.listBlockers('PVTI_item1')).resolves.toEqual([]);
-		// A board *read* is a wiring bug here, and says so rather than returning a lie.
+		// The gate must still gate on a DB-free worker: the capability stays on and the
+		// read runs server-side under the PM credential (issue #330).
+		expect(pm?.supportsDependencies).toBe(true);
+		await expect(pm?.listBlockers('PVTI_item1')).resolves.toEqual(blockers);
+		expect(fetchImpl.mock.calls[0][0]).toBe(`${CONTROL_PLANE}/worker/delivery/pm/blockers`);
+		// Every other board read is a wiring bug here, and says so rather than lying.
 		await expect(pm?.getWorkItem('PVTI_item1')).rejects.toThrow(
 			/not available on a DB-free worker/i,
 		);
-		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
 	it('runs review with submitReview on the control-plane SCM delivery API', async () => {
@@ -311,6 +320,82 @@ describe('runAssignmentDbFree', () => {
 		expect(inputs.pm).toBeUndefined();
 		await inputs.delivery?.findPullRequest('issue-17');
 		expect(operator.findPullRequest).toHaveBeenCalledWith('issue-17');
+	});
+
+	it('gives review a transport-backed verdict ledger instead of the Postgres one', async () => {
+		const sink = recordingSink();
+		// Route each call by path: the ledger and the review write have different bodies.
+		const fetchImpl = vi.fn<FetchLike>().mockImplementation(async (url) => {
+			if (url.endsWith('/review-ledger/prior')) return jsonResponse(200, { record: null });
+			if (url.endsWith('/review-ledger/mark'))
+				return jsonResponse(200, { slot: { id: 'verdict-1', ordinal: 1 } });
+			if (url.endsWith('/review-ledger/abandon')) return jsonResponse(200, {});
+			return jsonResponse(200, { reviewId: 4242 });
+		});
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			// What `runReviewPhase` does around its verdict — none of it may reach a DB.
+			await inputs.reviewLedger?.getPriorSubmittedReview(
+				'swarm',
+				'jkwiecien/swarm',
+				'99',
+				'deadbeef',
+			);
+			const slot = await inputs.reviewLedger?.markReviewVerdictSubmitted(
+				{
+					projectId: 'swarm',
+					repository: 'jkwiecien/swarm',
+					prNumber: '99',
+					headSha: 'deadbeef',
+				},
+				{ verdict: 'request-changes', reviewId: '9911' },
+			);
+			expect(slot).toEqual({ id: 'verdict-1', ordinal: 1 });
+			return { agent: agentResult(), verdict: 'request-changes' as const, reviewOrdinal: 1 };
+		});
+
+		await runAssignmentDbFree(
+			ciAssignment({ phase: 'review', pr: { prNumber: '99', headSha: 'deadbeef' } }),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, undefined, fetchImpl) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', reviewOrdinal: 1 });
+		const paths = fetchImpl.mock.calls.map(([url]) => url);
+		expect(paths).toEqual([
+			`${CONTROL_PLANE}/worker/delivery/review-ledger/prior`,
+			`${CONTROL_PLANE}/worker/delivery/review-ledger/mark`,
+		]);
+		// The two-verdict cap and re-review signal keep working because the ledger is
+		// consulted, not skipped — only its storage moved server-side.
+		expect(JSON.parse(fetchImpl.mock.calls[1][1].body)).toMatchObject({
+			projectId: PROJECT_ID,
+			prNumber: '99',
+			headSha: 'deadbeef',
+			verdict: 'request-changes',
+			reviewId: '9911',
+		});
+	});
+
+	it('leaves the verdict ledger unset for every phase but review', async () => {
+		const seen: Array<[string, unknown]> = [];
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			seen.push([inputs.phase, inputs.reviewLedger]);
+			return { agent: agentResult() };
+		});
+		for (const assignment of [
+			ciAssignment(),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+		]) {
+			await runAssignmentDbFree(assignment, recordingSink(), {
+				...RUN_OPTIONS,
+				deps: depsWith(runPhase),
+			});
+		}
+
+		expect(seen).toEqual([
+			['respond-to-ci', undefined],
+			['implementation', undefined],
+		]);
 	});
 
 	it('settles the run failed when a control-plane delivery call is refused', async () => {

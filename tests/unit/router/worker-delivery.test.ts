@@ -1,11 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
 import type { Worker } from '@/identity/worker.js';
+import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
 import {
+	handleAbandonReviewVerdict,
 	handleAddPmComment,
+	handleListBlockers,
+	handleMarkReviewVerdict,
 	handleMoveWorkItem,
 	handlePostComment,
+	handlePriorReview,
 	handleSubmitReview,
 	type WorkerDeliveryDeps,
 } from '@/router/worker-delivery.js';
@@ -65,6 +70,16 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 	};
 }
 
+/** A review-verdict ledger whose ops record their input and return fixed slots. */
+function makeReviewLedger(overrides: Partial<ReviewVerdictLedger> = {}): ReviewVerdictLedger {
+	return {
+		getPriorSubmittedReview: vi.fn().mockResolvedValue(undefined),
+		markReviewVerdictSubmitted: vi.fn().mockResolvedValue({ id: 'verdict-1', ordinal: 1 }),
+		abandonReviewVerdict: vi.fn().mockResolvedValue(undefined),
+		...overrides,
+	};
+}
+
 function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDeps {
 	const project = createMockProjectConfig();
 	return {
@@ -76,6 +91,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		isWorkerEnrolled: vi.fn().mockResolvedValue(true),
 		buildScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
 		buildPmProvider: vi.fn(() => makePmProvider()),
+		reviewLedger: makeReviewLedger(),
 		...overrides,
 	};
 }
@@ -374,5 +390,333 @@ describe('handleAddPmComment', () => {
 		const deps = makeDeps();
 		const result = await handleAddPmComment(deps, CREDENTIAL, pmCommentBody({ body: '' }));
 		expect(result.status).toBe(400);
+	});
+});
+
+/** A ledger request body — the worker sends PR coordinates only, never the repository. */
+function priorReviewBody(overrides: Record<string, unknown> = {}) {
+	return {
+		projectId: 'swarm',
+		prNumber: '42',
+		currentHeadSha: 'deadbeef',
+		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		...overrides,
+	};
+}
+
+function markLedgerBody(overrides: Record<string, unknown> = {}) {
+	return {
+		projectId: 'swarm',
+		prNumber: '42',
+		headSha: 'deadbeef',
+		verdict: 'request-changes',
+		reviewId: '9911',
+		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		...overrides,
+	};
+}
+
+describe('handlePriorReview', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it('reads the prior verdict with a key derived from the authenticated project', async () => {
+		const record = {
+			ordinal: 1,
+			state: 'submitted' as const,
+			verdict: 'request-changes',
+			headSha: 'cafe',
+		};
+		const reviewLedger = makeReviewLedger({
+			getPriorSubmittedReview: vi.fn().mockResolvedValue(record),
+		});
+		const deps = makeDeps({ reviewLedger });
+
+		const result = await handlePriorReview(deps, CREDENTIAL, priorReviewBody());
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ record });
+		// projectId + repository come from the project the credential authorized, not
+		// from the request — a worker cannot key a row to another project or repo.
+		expect(reviewLedger.getPriorSubmittedReview).toHaveBeenCalledWith(
+			'swarm',
+			'jkwiecien/swarm',
+			'42',
+			'deadbeef',
+		);
+	});
+
+	it('answers a first review with an explicit null record', async () => {
+		const result = await handlePriorReview(makeDeps(), CREDENTIAL, priorReviewBody());
+		expect(result.json).toEqual({ record: null });
+	});
+
+	it('enforces auth and enrollment before reading the ledger', async () => {
+		const unknownWorker = makeReviewLedger();
+		expect(
+			(
+				await handlePriorReview(
+					makeDeps({
+						reviewLedger: unknownWorker,
+						resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+					}),
+					'bogus',
+					priorReviewBody(),
+				)
+			).status,
+		).toBe(401);
+		expect(unknownWorker.getPriorSubmittedReview).not.toHaveBeenCalled();
+
+		const unenrolledLedger = makeReviewLedger();
+		expect(
+			(
+				await handlePriorReview(
+					makeDeps({
+						reviewLedger: unenrolledLedger,
+						isWorkerEnrolled: vi.fn().mockResolvedValue(false),
+					}),
+					CREDENTIAL,
+					priorReviewBody(),
+				)
+			).status,
+		).toBe(403);
+		expect(unenrolledLedger.getPriorSubmittedReview).not.toHaveBeenCalled();
+
+		expect(
+			(await handlePriorReview(makeDeps(), CREDENTIAL, priorReviewBody({ projectId: 'nope' })))
+				.status,
+		).toBe(404);
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect(
+			(await handlePriorReview(deps, CREDENTIAL, priorReviewBody({ prNumber: '' }))).status,
+		).toBe(400);
+		expect(
+			(
+				await handlePriorReview(
+					deps,
+					CREDENTIAL,
+					priorReviewBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.reviewLedger.getPriorSubmittedReview).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleMarkReviewVerdict', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it('marks the slot submitted and returns its ordinal', async () => {
+		const reviewLedger = makeReviewLedger({
+			markReviewVerdictSubmitted: vi.fn().mockResolvedValue({ id: 'verdict-2', ordinal: 2 }),
+		});
+
+		const result = await handleMarkReviewVerdict(
+			makeDeps({ reviewLedger }),
+			CREDENTIAL,
+			markLedgerBody(),
+		);
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ slot: { id: 'verdict-2', ordinal: 2 } });
+		expect(reviewLedger.markReviewVerdictSubmitted).toHaveBeenCalledWith(
+			{
+				projectId: 'swarm',
+				repository: 'jkwiecien/swarm',
+				prNumber: '42',
+				headSha: 'deadbeef',
+			},
+			{ verdict: 'request-changes', reviewId: '9911' },
+		);
+	});
+
+	it('reports an absent slot as an explicit null rather than omitting it', async () => {
+		const reviewLedger = makeReviewLedger({
+			markReviewVerdictSubmitted: vi.fn().mockResolvedValue(undefined),
+		});
+		const result = await handleMarkReviewVerdict(
+			makeDeps({ reviewLedger }),
+			CREDENTIAL,
+			markLedgerBody(),
+		);
+		expect(result.json).toEqual({ slot: null });
+	});
+
+	it('accepts a mark with no review id yet', async () => {
+		const reviewLedger = makeReviewLedger();
+		const body = markLedgerBody();
+		delete (body as Record<string, unknown>).reviewId;
+		const result = await handleMarkReviewVerdict(makeDeps({ reviewLedger }), CREDENTIAL, body);
+
+		expect(result.status).toBe(200);
+		expect(reviewLedger.markReviewVerdictSubmitted).toHaveBeenCalledWith(expect.anything(), {
+			verdict: 'request-changes',
+			reviewId: undefined,
+		});
+	});
+
+	it('enforces auth and enrollment before writing the ledger', async () => {
+		const unauthenticated = makeReviewLedger();
+		expect(
+			(
+				await handleMarkReviewVerdict(
+					makeDeps({
+						reviewLedger: unauthenticated,
+						resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+					}),
+					'bogus',
+					markLedgerBody(),
+				)
+			).status,
+		).toBe(401);
+		expect(unauthenticated.markReviewVerdictSubmitted).not.toHaveBeenCalled();
+
+		const unenrolled = makeReviewLedger();
+		expect(
+			(
+				await handleMarkReviewVerdict(
+					makeDeps({
+						reviewLedger: unenrolled,
+						isWorkerEnrolled: vi.fn().mockResolvedValue(false),
+					}),
+					CREDENTIAL,
+					markLedgerBody(),
+				)
+			).status,
+		).toBe(403);
+		expect(unenrolled.markReviewVerdictSubmitted).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleAbandonReviewVerdict', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it('releases the pending slot for the authenticated project', async () => {
+		const reviewLedger = makeReviewLedger();
+		const result = await handleAbandonReviewVerdict(
+			makeDeps({ reviewLedger }),
+			CREDENTIAL,
+			priorReviewBody({ headSha: 'deadbeef', currentHeadSha: undefined }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({});
+		expect(reviewLedger.abandonReviewVerdict).toHaveBeenCalledWith({
+			projectId: 'swarm',
+			repository: 'jkwiecien/swarm',
+			prNumber: '42',
+			headSha: 'deadbeef',
+		});
+	});
+
+	it('enforces auth and enrollment before releasing the slot', async () => {
+		const unauthenticated = makeReviewLedger();
+		expect(
+			(
+				await handleAbandonReviewVerdict(
+					makeDeps({
+						reviewLedger: unauthenticated,
+						resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+					}),
+					'bogus',
+					priorReviewBody({ headSha: 'deadbeef' }),
+				)
+			).status,
+		).toBe(401);
+		expect(unauthenticated.abandonReviewVerdict).not.toHaveBeenCalled();
+
+		const unenrolled = makeReviewLedger();
+		expect(
+			(
+				await handleAbandonReviewVerdict(
+					makeDeps({
+						reviewLedger: unenrolled,
+						isWorkerEnrolled: vi.fn().mockResolvedValue(false),
+					}),
+					CREDENTIAL,
+					priorReviewBody({ headSha: 'deadbeef' }),
+				)
+			).status,
+		).toBe(403);
+		expect(unenrolled.abandonReviewVerdict).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleListBlockers', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function blockersBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			itemId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('reads the item’s blockers under the server-side PM credential', async () => {
+		const blockers = [
+			{
+				id: 'PVTI_blocker',
+				reference: '#319',
+				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				title: 'Prerequisite',
+				open: true,
+				source: 'dependency' as const,
+			},
+		];
+		const listBlockers = vi.fn().mockResolvedValue(blockers);
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ listBlockers })) });
+
+		const result = await handleListBlockers(deps, CREDENTIAL, blockersBody());
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ blockers });
+		expect(listBlockers).toHaveBeenCalledWith('PVTI_item1');
+	});
+
+	it('passes through an empty list for an item nothing gates', async () => {
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() => makePmProvider({ listBlockers: vi.fn().mockResolvedValue([]) })),
+		});
+		expect((await handleListBlockers(deps, CREDENTIAL, blockersBody())).json).toEqual({
+			blockers: [],
+		});
+	});
+
+	it('enforces auth and enrollment before touching the PM credential', async () => {
+		const unknownWorker = makeDeps({
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+		expect((await handleListBlockers(unknownWorker, 'bogus', blockersBody())).status).toBe(401);
+		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
+
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleListBlockers(unenrolled, CREDENTIAL, blockersBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleListBlockers(deps, CREDENTIAL, blockersBody({ projectId: 'nope' }))).status,
+		).toBe(404);
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect((await handleListBlockers(deps, CREDENTIAL, blockersBody({ itemId: '' }))).status).toBe(
+			400,
+		);
+		expect(
+			(
+				await handleListBlockers(
+					deps,
+					CREDENTIAL,
+					blockersBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
 	});
 });

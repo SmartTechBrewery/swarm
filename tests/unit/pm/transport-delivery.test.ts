@@ -237,15 +237,39 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
-	it('declares the dependency capability off so the dependency gate skips cleanly', async () => {
-		const provider = writeOnly();
+	it('serves listBlockers over the transport so the dependency gate keeps gating', async () => {
+		const blockers = [
+			{
+				id: 'PVTI_blocker',
+				reference: '#319',
+				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				title: 'Prerequisite',
+				open: true,
+				source: 'dependency' as const,
+			},
+		];
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { blockers }));
+		const provider = writeOnly(fetchImpl);
 
-		// The control plane owns the dependency gate on this path; `listBlockers` /
-		// `addBlockedBy` follow the documented `supportsDependencies: false` contract.
-		expect(provider.supportsDependencies).toBe(false);
+		// Declared ON: stubbing it off would short-circuit `findOpenBlockers` and let a
+		// blocked item build out of order (issue #330).
+		expect(provider.supportsDependencies).toBe(true);
 		expect(provider.supportsAssignees).toBe(false);
-		await expect(provider.listBlockers('PVTI_item1')).resolves.toEqual([]);
-		await expect(provider.addBlockedBy('PVTI_item1', 'PVTI_item2')).resolves.toBeUndefined();
+		await expect(provider.listBlockers('PVTI_item1')).resolves.toEqual(blockers);
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/blockers');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it("refuses addBlockedBy — recording a dependency is Planning's move, and Planning stays local", async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+		await expect(writeOnly(fetchImpl).addBlockedBy('PVTI_item1', 'PVTI_item2')).rejects.toThrow(
+			/not available on a DB-free worker/i,
+		);
+		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
 	it('exposes no discovery capability', () => {

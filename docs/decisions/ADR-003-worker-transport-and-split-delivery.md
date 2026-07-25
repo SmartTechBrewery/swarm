@@ -124,13 +124,25 @@ two further phases, splitting each phase's delivery by which identity it needs:
    off the shutdown signal — no `DATABASE_URL`/`REDIS_URL`. A supported-phase gate
    admitted only the two fully-worker-side phases (`respond-to-ci`,
    `resolve-conflicts`).
-6. **#417** — the metadata writes the operator token cannot perform now travel to
-   the control plane's delivery API (`src/router/worker-delivery.ts`, ADR-002 §2)
-   through one shared client (`src/transport/delivery-client.ts`), authenticated by
-   the worker's own credential: **Implementation**'s two board writes under the
-   project's PM credential, **Review**'s `submitReview` under its reviewer PAT.
+6. **#417** — everything a DB-free worker cannot perform itself now travels to the
+   control plane's delivery API (`src/router/worker-delivery.ts`) through one
+   shared client (`src/transport/delivery-client.ts`), authenticated by the
+   worker's own credential. Two kinds of thing stay server-side, for two different
+   reasons:
+   - **Credentials** (ADR-002 §2): **Implementation**'s two board writes and its
+     `listBlockers` dependency lookup run under the project's PM credential;
+     **Review**'s `submitReview` runs under its reviewer PAT.
+   - **The database**: Review's three review-verdict ledger calls
+     (`/worker/delivery/review-ledger/prior|mark|abandon`) front the
+     `review_verdicts` table, so the two-verdict cap (#235) and the re-review
+     signal (#328) keep working on a worker with no `DATABASE_URL` — skipping them
+     would silently disable both.
+
    Both phases join the supported set, so a DB-free worker runs four of the six.
-   Neither credential ever reaches the worker.
+   Not carried over: the bounded dependency-recheck deferral, which every transport
+   path lacks (`classifyDeferrable` models no dependency failure), so a blocked
+   Implementation run settles terminally with the "must be done first" message
+   instead of re-checking — safe, but tracked as its own follow-up.
 
 Still out of scope: **`respond-to-review`**, which additionally needs a PM *read*
 to resolve its board card (issue #418), **`planning`**, whose PM write/split

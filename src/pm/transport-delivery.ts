@@ -20,9 +20,11 @@
  *   expect is preserved unchanged.
  * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
  *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
- *   no in-process provider to fall back on: the two writes ride the transport and
- *   every board *read* refuses with an actionable error, because on that worker
- *   reads are the control plane's job (it composed the assignment from them).
+ *   no in-process provider to fall back on: the two writes ride the transport,
+ *   `listBlockers` rides it too (the dependency gate must keep gating — see that
+ *   factory's note), and every remaining board *read* refuses with an actionable
+ *   error, because the control plane already performed the reads the assignment
+ *   was composed from.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * best-effort / board-report handling behaves exactly as it does with the
@@ -32,6 +34,7 @@
 import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
 import {
 	AddPmCommentDeliveryResponseSchema,
+	ListBlockersDeliveryResponseSchema,
 	MoveWorkItemDeliveryResponseSchema,
 } from '../transport/protocol.js';
 import type { PMProvider, PMType } from './types.js';
@@ -132,19 +135,25 @@ async function unavailableRead(operation: string): Promise<never> {
 
 /**
  * Build the delegate-less variant for a DB-free remote worker: the two metadata
- * writes ride the transport exactly as above, and every read/non-metadata write
- * refuses via {@link unavailableRead}. The phases a DB-free worker runs today
- * need only the two writes (Implementation moves the card and posts its comment);
- * a phase that reached for a read here would be a wiring bug, and the thrown
- * message says so.
+ * writes ride the transport exactly as above, `listBlockers` rides it as the one
+ * transported **read**, and everything else refuses via {@link unavailableRead}.
+ * The phases a DB-free worker runs today need exactly that surface —
+ * Implementation moves the card, posts its comment, and gates on dependencies —
+ * so a call to anything else is a wiring bug, and the thrown message says so.
  *
- * The dependency capability is declared **off** (`supportsDependencies: false`),
- * so Implementation's dependency gate (`../pipeline/dependency-guard.ts`) skips
- * cleanly instead of failing a read: on this path the control plane owns that
- * gate — it decided to dispatch this item. `listBlockers`/`addBlockedBy` follow
- * that flag's documented contract (`./types.ts`) and return `[]` / no-op.
- * Assignees are likewise unreadable here; only the server-side eligibility gate
- * reads that flag, and it never runs on a worker.
+ * `listBlockers` is transported rather than stubbed because the alternative is
+ * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
+ * (`../pipeline/dependency-guard.ts`) short-circuits, and a work item whose
+ * prerequisites are still open would be built out of order — the failure issue
+ * #330 exists to prevent. Nothing else gates it: `findOpenBlockers` is called
+ * only inside the phase, never by the dispatcher or the eligibility gate. So the
+ * capability is declared **on** and the read runs server-side under the PM
+ * credential.
+ *
+ * `addBlockedBy` still refuses: recording a dependency is Planning's
+ * task-splitting move, and Planning does not run on a DB-free worker. Assignees
+ * are unreadable here too — only the server-side eligibility gate reads that
+ * flag, and it never runs on a worker.
  */
 export function createWriteOnlyTransportPmProvider(
 	options: WriteOnlyTransportPmDeliveryOptions,
@@ -152,15 +161,21 @@ export function createWriteOnlyTransportPmProvider(
 	return {
 		type: options.providerType,
 		supportsAssignees: false,
-		supportsDependencies: false,
+		supportsDependencies: true,
 		getWorkItem: () => unavailableRead('getWorkItem'),
 		listWorkItems: () => unavailableRead('listWorkItems'),
 		findComment: () => unavailableRead('findComment'),
 		createWorkItem: () => unavailableRead('createWorkItem'),
 		updateWorkItem: () => unavailableRead('updateWorkItem'),
 		addLabel: () => unavailableRead('addLabel'),
-		listBlockers: async () => [],
-		addBlockedBy: async () => {},
+		addBlockedBy: () => unavailableRead('addBlockedBy'),
+		listBlockers: (id) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/blockers',
+				{ projectId: options.projectId, itemId: id },
+				(value) => ListBlockersDeliveryResponseSchema.parse(value).blockers,
+			),
 		...transportPmWrites(options),
 	};
 }
