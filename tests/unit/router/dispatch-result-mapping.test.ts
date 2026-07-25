@@ -56,6 +56,19 @@ describe('adaptResultToPhaseRun', () => {
 		expect(run.automationOutcome).toBe('manual-intervention-required');
 	});
 
+	it('maps the produced PR url so the control plane records the attribution (issue #398)', () => {
+		const run = adaptResultToPhaseRun(
+			base({ status: 'succeeded', exitCode: 0, prUrl: 'https://github.com/o/r/pull/7' }),
+			SELECTION,
+		);
+		expect(run.prUrl).toBe('https://github.com/o/r/pull/7');
+	});
+
+	it('tolerates a result frame from an older worker that reports no produced PR', () => {
+		const run = adaptResultToPhaseRun(base({ status: 'succeeded', exitCode: 0 }), SELECTION);
+		expect(run.prUrl).toBeUndefined();
+	});
+
 	it('throws RunTerminatedError for a cancelled failure (never a deferral)', () => {
 		expect(() =>
 			adaptResultToPhaseRun(

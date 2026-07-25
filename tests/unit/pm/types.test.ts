@@ -58,6 +58,10 @@ class InMemoryPMProvider implements PMProvider {
 		return all.filter((item) => item.statusId === optionId);
 	}
 
+	async findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined> {
+		return [...this.items.values()].find((item) => item.url.endsWith(urlSuffix));
+	}
+
 	async moveWorkItem(id: string, status: string): Promise<void> {
 		const item = await this.getWorkItem(id);
 		this.items.set(id, { ...item, statusId: this.statusOptions[status] });

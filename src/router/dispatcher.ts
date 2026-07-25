@@ -188,6 +188,9 @@ export function adaptResultToPhaseRun(
 			verdict: result.verdict,
 			reviewOrdinal: result.reviewOrdinal,
 			automationOutcome: result.reviewAutomationOutcome,
+			// Feeds the shared settle path's attribution write (issue #398); absent
+			// from a phase that produced no PR, and from an older worker's frame.
+			prUrl: result.prUrl,
 		};
 	}
 	if (result.status === 'failed') {

@@ -57,6 +57,7 @@ function makeDeps() {
 		type: 'github-projects' as const,
 		getWorkItem: vi.fn(),
 		listWorkItems: vi.fn(),
+		findWorkItemByUrlSuffix: vi.fn(async () => undefined),
 		addComment: vi.fn<(id: string, text: string) => Promise<string>>(async () => 'comment-1'),
 		findComment: vi.fn(async () => undefined),
 		moveWorkItem: vi.fn(async () => {}),

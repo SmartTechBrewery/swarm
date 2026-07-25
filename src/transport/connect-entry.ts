@@ -15,9 +15,10 @@
  * delivery uses the operator token, the reviewer/PM metadata writes go up to the
  * control plane's delivery API (`./delivery-client.ts`) so those credentials stay
  * server-side, and results stream back over the transport back-channel. Every
- * phase but `respond-to-review` (which still needs a PM read, issue #418) and
- * `planning` runs this way; the rest are failed cleanly by the supported-phase
- * gate. It never opens a database or queue connection.
+ * phase but `planning` runs this way — `respond-to-review` included, since issue
+ * #418 gave it the `pm/find-item` card lookup and `follow-up-review` enqueue
+ * seams. `planning` alone is failed cleanly by the supported-phase gate. It
+ * never opens a database or queue connection.
  */
 
 import { readFileSync } from 'node:fs';

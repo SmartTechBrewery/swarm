@@ -132,12 +132,15 @@ and executes a pushed `TaskAssignment` **DB-free**: project config comes from th
 assignment, source-carrying delivery (commit / push / create-PR) runs under the
 operator token, and everything needing something this worker must not hold goes up
 to the control plane's delivery API — Implementation's board moves/comments and
-dependency lookup under the project's PM credential, Review's submitted verdict
-under its reviewer PAT, and Review's verdict-ledger reads/writes against the
-database the control plane owns. Results stream back over the transport (ADR-003
-§2). Four phases run this way today (`respond-to-ci`, `resolve-conflicts`,
-`implementation`, `review`); `respond-to-review` and `planning` are failed cleanly
-until their remaining PM seams land. It is **additive**: the same-machine `npm run dev:worker`
+dependency lookup and Respond-to-review's card lookup + board moves under the
+project's PM credential, Review's submitted verdict under its reviewer PAT, and
+the two things backed by a database the control plane owns: Review's
+verdict-ledger reads/writes and the follow-up Review a pushed fix enqueues.
+Results stream back over the transport (ADR-003 §2). Five of the six phases run
+this way today (`respond-to-ci`, `resolve-conflicts`, `implementation`, `review`,
+`respond-to-review`); only `planning`, whose PM write/split surface is wider than
+a delivery seam should carry, is failed cleanly and stays on the local host
+worker. It is **additive**: the same-machine `npm run dev:worker`
 path above is unchanged. See
 [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md#remote-worker-transport-worker).
 

@@ -69,6 +69,7 @@ import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
+import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
 import { runImplementationPhase } from '../pipeline/implementation.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import { type ProposedScope, runPlanningPhase } from '../pipeline/planning.js';
@@ -1180,6 +1181,12 @@ export interface PhaseRunResult {
 	reviewOrdinal?: number;
 	/** This Review run's automation outcome (e.g. `manual-intervention-required`) — persisted onto its history row (issue #235). */
 	automationOutcome?: ReviewAutomationOutcome;
+	/**
+	 * The PR this phase produced (Implementation only) — persisted onto its history
+	 * row as the run's attribution PR (ADR-004 §4, issue #398). Absent for every
+	 * phase that creates no PR.
+	 */
+	prUrl?: string;
 }
 
 /**
@@ -1266,6 +1273,16 @@ export interface AssignedPhaseInputs {
 	 * same-host paths, which keep the phase's own repository defaults.
 	 */
 	reviewLedger?: ReviewVerdictLedger;
+	/**
+	 * respond-to-review only: how the phase schedules the one follow-up Review a
+	 * pushed fix owes (issue #241). Injected by a DB-free worker with the
+	 * transport-backed implementation (ADR-003 §2,
+	 * `../transport/follow-up-review-delivery.ts`), since the default writes a
+	 * dispatch row and enqueues a job — a `DATABASE_URL`/`REDIS_URL` that worker
+	 * does not have. Left unset by the in-process and same-host paths, which keep
+	 * the phase's own `scheduleFollowUpReviewDefault`.
+	 */
+	scheduleFollowUpReview?: ScheduleFollowUpReview;
 }
 
 /**
@@ -1405,6 +1422,10 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				pm: resolvePm(),
 				delivery,
 				getToken,
+				// Undefined on the in-process/same-host paths, where the phase keeps its
+				// own dispatch+queue scheduler; set only by the DB-free worker, whose
+				// follow-up enqueue travels to the control plane.
+				scheduleFollowUpReview: inputs.scheduleFollowUpReview,
 				cli,
 				model,
 				reasoning,
@@ -1700,6 +1721,7 @@ async function tryReuseLatestRun(
 		recoveryVal,
 		resolution.selection?.workerId,
 		resolution.executionIdentity?.fencingToken,
+		resolution.selection?.ownerUserId,
 	);
 	if (!claimed) return undefined;
 	job.runId = prior.id;
@@ -1738,6 +1760,7 @@ async function tryResetCarriedRun(
 			recoveryVal,
 			resolution.selection?.workerId,
 			resolution.executionIdentity?.fencingToken,
+			resolution.selection?.ownerUserId,
 		))
 			? runId
 			: undefined;
@@ -1854,6 +1877,9 @@ async function tryCreateRun(
 			taskId: trigger.taskId,
 			phase: trigger.phase,
 			workerId: resolution.selection?.workerId,
+			// The owner of that worker, already resolved by the dispatch gate — the
+			// user half of the attribution record (ADR-004 §4, issue #398).
+			workerUserId: resolution.selection?.ownerUserId,
 			workerFencingToken: resolution.executionIdentity?.fencingToken,
 			workItemId: 'workItem' in trigger ? trigger.workItem.id : undefined,
 			workItemTitle: 'workItem' in trigger ? trigger.workItem.title : undefined,
@@ -3029,6 +3055,9 @@ export async function processJob(
 				// (issue #235).
 				reviewOrdinal: result.reviewOrdinal,
 				reviewAutomationOutcome: result.automationOutcome,
+				// Only a PR-producing phase (Implementation) reports one; every other
+				// phase leaves the attribution column untouched (ADR-004 §4, issue #398).
+				producedPrUrl: result.prUrl,
 				planningScope: result.planningScope,
 			},
 			result.agent,

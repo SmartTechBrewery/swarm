@@ -449,6 +449,16 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		});
 	}
 
+	async findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined> {
+		// Projects v2 exposes no server-side filter on the backing content's URL, so
+		// the match runs client-side over the same paginated board read
+		// `listWorkItems` walks. Keeping it here rather than at the call site is what
+		// lets a federated worker ask the control plane for one card instead of the
+		// whole board (`src/pm/transport-delivery.ts`).
+		const items = await this.listWorkItems();
+		return items.find((item) => item.url.endsWith(urlSuffix));
+	}
+
 	async moveWorkItem(id: string, status: string): Promise<void> {
 		const { projectId, statusFieldId, statusOptions } = this.project.githubProjects;
 		const optionId = statusOptions[status];

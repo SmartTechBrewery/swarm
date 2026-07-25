@@ -298,10 +298,13 @@ export function resolvePushedHeadSha(
 
 /**
  * Resolve the board item wrapping issue `#{issueNumber}` to its provider-native
- * ID, or `undefined` if it isn't on the board. Provider-agnostic: matches on the
- * work item's backing `url` (which every {@link PMProvider} populates) rather
- * than anything GitHub-specific. Swallows and logs provider errors — the caller
- * treats any failure as "no board report", never a phase failure.
+ * ID, or `undefined` if it isn't on the board. Provider-agnostic: the lookup
+ * matches on the work item's backing `url` (which every {@link PMProvider}
+ * populates) rather than anything GitHub-specific, and runs inside the provider
+ * ({@link PMProvider.findWorkItemByUrlSuffix}) so a federated worker can serve it
+ * as one narrow read through the control plane instead of proxying the whole
+ * board. Swallows and logs provider errors — the caller treats any failure as
+ * "no board report", never a phase failure.
  */
 async function resolveBoardItemId(
 	pm: PMProvider,
@@ -309,10 +312,9 @@ async function resolveBoardItemId(
 	taskId: string,
 ): Promise<string | undefined> {
 	try {
-		const items = await pm.listWorkItems();
-		// `endsWith('/issues/100')` can't false-match `/issues/1001` — the char
-		// before `100` must be `/` — so no need to anchor on the repo too.
-		const match = items.find((item) => item.url.endsWith(`/issues/${issueNumber}`));
+		// A `/issues/100` suffix can't false-match `/issues/1001` — the char before
+		// `100` must be `/` — so no need to anchor on the repo too.
+		const match = await pm.findWorkItemByUrlSuffix(`/issues/${issueNumber}`);
 		if (!match) {
 			logger.debug('respond-to-review: no board item found for issue — skipping status report', {
 				taskId,
