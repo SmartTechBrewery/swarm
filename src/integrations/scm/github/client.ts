@@ -15,6 +15,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Octokit } from '@octokit/rest';
 
 import { logger } from '../../../lib/logger.js';
+import type {
+	AggregateCheckStatus,
+	CheckRunState,
+	PullRequestDetails,
+} from '../../../scm/types.js';
 
 const clientStorage = new AsyncLocalStorage<Octokit>();
 
@@ -39,20 +44,16 @@ export function withGitHubToken<T>(token: string, fn: () => Promise<T>): Promise
 	return clientStorage.run(scopedClient, fn);
 }
 
-/** One check on a commit — a workflow-run job, flattened. */
-export interface CheckRunStatus {
-	name: string;
-	/** `queued` | `in_progress` | `completed` — anything but `completed` is still pending. */
-	status: string;
-	/** `success` | `failure` | `timed_out` | … — `null` while the check hasn't finished. */
-	conclusion: string | null;
-}
+/**
+ * One check on a commit — a workflow-run job, flattened. GitHub-local name for
+ * the neutral {@link CheckRunState} (`src/scm/types.ts`); the alias keeps this
+ * module's existing importers compiling until issue #385 moves them onto the
+ * shared contract.
+ */
+export type CheckRunStatus = CheckRunState;
 
-/** Aggregate CI state across *every* check on a commit — the basis for the review-vs-defer decision. */
-export interface CheckSuiteStatus {
-	totalCount: number;
-	checkRuns: CheckRunStatus[];
-}
+/** Aggregate CI state across *every* check on a commit — GitHub-local name for {@link AggregateCheckStatus}. */
+export type CheckSuiteStatus = AggregateCheckStatus;
 
 /**
  * Aggregate the state of every check on `ref` (a commit SHA), so a caller can
@@ -153,15 +154,8 @@ export async function getPullRequestTitle(
 	return data.title ?? null;
 }
 
-export interface ConflictCandidatePullRequest {
-	number: number;
-	headBranch: string;
-	headSha: string;
-	baseBranch: string;
-	baseSha: string;
-	mergeable: boolean | null;
-	authorLogin: string | null;
-}
+/** GitHub-local name for the neutral {@link PullRequestDetails} (`src/scm/types.ts`). */
+export type ConflictCandidatePullRequest = PullRequestDetails;
 
 /** A PR's merge-relevant state — the initial lookup `mergePullRequest` needs before choosing a merge path. */
 export interface PullRequestMergeState {

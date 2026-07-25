@@ -84,7 +84,6 @@ import type { Worker } from '../identity/worker.js';
 import { isRoutable } from '../identity/worker-enrollment.js';
 import { resolveWorkerByCredential } from '../identity/worker-service.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
-import type { GitHubPersona } from '../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
 import {
 	type ScheduleFollowUpReview,
@@ -93,6 +92,7 @@ import {
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import type { PMProvider } from '../pm/types.js';
 import type { ScmDeliveryProvider } from '../scm/delivery.js';
+import type { ScmPersona } from '../scm/types.js';
 import {
 	AbandonReviewLedgerRequestSchema,
 	AddPmCommentDeliveryRequestSchema,
@@ -118,10 +118,7 @@ export interface WorkerDeliveryDeps {
 	/** Whether `workerId` may deliver to `projectId` — a routable (active + consented) enrollment. */
 	isWorkerEnrolled: (workerId: string, projectId: string) => Promise<boolean>;
 	/** Build the server-side SCM delivery provider for a project + persona (resolves the PAT here). */
-	buildScmDelivery: (
-		project: ProjectConfig,
-		persona: GitHubPersona,
-	) => Promise<ScmDeliveryProvider>;
+	buildScmDelivery: (project: ProjectConfig, persona: ScmPersona) => Promise<ScmDeliveryProvider>;
 	/** Build the server-side PM provider for a project (resolves the per-project PM credential here). */
 	buildPmProvider: (project: ProjectConfig) => PMProvider;
 	/**

@@ -63,7 +63,6 @@ import {
 import { capabilityFor, DEFAULT_MODEL_PER_CLI, type ReasoningLevel } from '../harness/models.js';
 import { discoverCliQuotas } from '../harness/quota-discovery.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
-import type { GitHubPersona } from '../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
 import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
@@ -107,6 +106,7 @@ import {
 import { priorityFor } from '../queue/producer.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
 import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
+import type { ScmPersona } from '../scm/types.js';
 import type { TriggerRegistry } from '../triggers/registry.js';
 import {
 	buildConflictResolutionKey,
@@ -1125,7 +1125,7 @@ function logAgentRouting(
  */
 export async function resolveScmDelivery(
 	project: ProjectConfig,
-	persona: GitHubPersona,
+	persona: ScmPersona,
 ): Promise<ScmDeliveryProvider | undefined> {
 	const controlPlaneUrl = getControlPlaneUrl();
 	const workerCredential = optionalEnv('SWARM_WORKER_CREDENTIAL', '').trim();
