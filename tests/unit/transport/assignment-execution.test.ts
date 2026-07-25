@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
+import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
@@ -10,7 +11,7 @@ import type { FetchLike } from '@/transport/delivery-client.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
-import { createMockTaskAssignmentInput } from '../../helpers/factories.js';
+import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
 
 const OPERATOR_TOKEN = 'operator-token';
 const CONTROL_PLANE = 'https://swarm.example';
@@ -610,6 +611,39 @@ describe('runAssignmentDbFree', () => {
 			failureKind: 'delivery',
 			resumeDelivery: true,
 		});
+	});
+
+	it('settles deferred (dependency) for a DependencyBlockedError, reporting the blockers', async () => {
+		const sink = recordingSink();
+		const workItem = createMockWorkItem();
+		const blocker = {
+			reference: '#319',
+			url: 'https://github.com/jkwiecien/swarm/issues/319',
+			title: 'Session auth',
+			open: true,
+			source: 'dependency' as const,
+		};
+		const runPhase = vi.fn(async () => {
+			throw new DependencyBlockedError(workItem, [blocker]);
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		const result = sink.sent.at(-1) as Record<string, unknown>;
+		// Deferred, not failed — the regression issue #438 fixes: the item keeps waiting
+		// on its prerequisite instead of needing a manual re-dispatch.
+		expect(result).toMatchObject({
+			type: 'task-execution-result',
+			status: 'deferred',
+			failureKind: 'dependency',
+			resumable: false,
+		});
+		// The blockers travel so the control plane's message names the prerequisite.
+		expect(result.blockers).toEqual([blocker]);
+		expect(result.reason).toContain('#319');
 	});
 
 	it('settles deferred with a retry hint for a rate-limit agent error', async () => {

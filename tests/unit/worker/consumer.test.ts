@@ -10,7 +10,7 @@ import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
-import type { PMProvider, WorkItemAssignee } from '@/pm/types.js';
+import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import {
@@ -420,6 +420,7 @@ import type { TriggerContext, TriggerResult } from '@/triggers/types.js';
 import {
 	type AssignedPhaseInputs,
 	DEFAULT_AGENT_TIMEOUT_MS,
+	type ProcessJobDeps,
 	processJob,
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
@@ -1825,6 +1826,63 @@ describe('processJob', () => {
 		const [, body] = addComment.mock.calls[0];
 		expect(body).toContain('#319');
 		expect(body).toMatch(/must be done first/i);
+	});
+
+	// A transport-dispatched run reports the block over the wire and the control plane
+	// rebuilds the error (`adaptResultToPhaseRun`, `@/router/dispatcher.js`); these drive
+	// the resulting throw through the pluggable executor seam to prove the shared budget
+	// applies identically to the two in-process tests above (issue #438).
+	describe('dependency block over the dispatch path (issue #438)', () => {
+		const BLOCKER = {
+			reference: '#319',
+			url: 'https://github.com/o/r/issues/319',
+			title: 'Session auth',
+			open: true,
+			source: 'dependency' as const,
+		} as const;
+
+		function blockingExecutor(workItem: WorkItem): ProcessJobDeps {
+			return {
+				executePhase: async () => {
+					throw new DependencyBlockedError(workItem, [BLOCKER]);
+				},
+			};
+		}
+
+		it('defers on the dependency-recheck budget without commenting', async () => {
+			const workItem = createMockWorkItem({ statusId: '61e4505c' });
+
+			const outcome = await processJob(
+				createMockGitHubProjectsWebhookJob(),
+				registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+				undefined,
+				undefined,
+				blockingExecutor(workItem),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', dependencyRecheck: true });
+			if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+			expect(outcome.reason).toContain('#319');
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it('fails with the same board message once the budget is exhausted', async () => {
+			const workItem = createMockWorkItem({ statusId: '61e4505c' });
+
+			const outcome = await processJob(
+				createMockGitHubProjectsWebhookJob({ dependencyRecheckAttempt: 1_000_000 }),
+				registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+				undefined,
+				undefined,
+				blockingExecutor(workItem),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(addComment).toHaveBeenCalledOnce();
+			const [, body] = addComment.mock.calls[0];
+			expect(body).toContain('#319');
+			expect(body).toMatch(/must be done first/i);
+		});
 	});
 
 	describe('federated dispatch gate (issue #339)', () => {
