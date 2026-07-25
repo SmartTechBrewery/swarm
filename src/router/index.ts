@@ -21,6 +21,7 @@
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 
+import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from '../config/operator-token.js';
 import { runMigrations } from '../db/migrate.js';
 import { resolveDispatchMode } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
@@ -47,6 +48,15 @@ registerWorkerTransport(app, upgradeWebSocket);
 // a federated worker POSTs review/comment content here and the router performs
 // the GitHub write under the per-project reviewer PAT, which never leaves it.
 registerWorkerDelivery(app);
+// Say so at startup rather than at the first Respond-to-review reply: without the
+// operator token this host cannot resolve the *implementer* persona, so
+// `/worker/delivery/pr-comment` answers 503 for it (issue #444). Only a warning —
+// the reviewer-persona routes, and every non-delivery route, work without it.
+if (!getOperatorGitHubTokenOrNull()) {
+	logger.warn(
+		`${OPERATOR_GH_TOKEN_ENV} is unset — POST /worker/delivery/pr-comment will refuse implementer-persona comments (Respond-to-review replies) until it is set`,
+	);
+}
 const server = serve({ fetch: app.fetch, port }, () => {
 	logger.debug('swarm-router: listening', { port });
 });

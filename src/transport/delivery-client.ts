@@ -46,6 +46,32 @@ export function deliveryUrl(base: string, path: string): string {
 }
 
 /**
+ * The message for a non-2xx delivery response, carrying the server's own `reason`
+ * when it sent one.
+ *
+ * Every refusal this API returns names its cause in that field — an unresolvable
+ * persona credential, an unenrolled worker, an unknown project — and without it a
+ * worker's log and the run's failure comment show only a bare status code, leaving
+ * the actionable cause visible solely in the router's logs. The body is read
+ * defensively: a refusal with no body, or one this client cannot parse, still
+ * throws the plain status message rather than masking the failure.
+ */
+async function failureMessage(
+	path: string,
+	response: { status: number; json: () => Promise<unknown> },
+): Promise<string> {
+	const base = `Control-plane delivery ${path} failed with status ${response.status}`;
+	try {
+		const body = await response.json();
+		const reason =
+			typeof body === 'object' && body !== null ? (body as { reason?: unknown }).reason : undefined;
+		return typeof reason === 'string' && reason.length > 0 ? `${base}: ${reason}` : base;
+	} catch {
+		return base;
+	}
+}
+
+/**
  * POST a delivery request to the control plane and return its parsed response
  * body. `parse` validates the payload (a Zod schema's `parse`), so a malformed
  * body is a throw rather than a silently-wrong value.
@@ -53,7 +79,9 @@ export function deliveryUrl(base: string, path: string): string {
  * Throws on a non-2xx status, an unreadable body, or a parse failure — the
  * caller's existing failed-write handling (a best-effort skip, or the
  * `DeliveryDeferredError` retry that preserves the worktree) then applies
- * unchanged. The server-side writes are marker-idempotent, so a retried call
+ * unchanged. A refusal's thrown message carries the server's `reason`
+ * ({@link failureMessage}) so the cause reaches the worker's log and the run's
+ * failure comment. The server-side writes are marker-idempotent, so a retried call
  * cannot double-post.
  */
 export async function postDelivery<T>(
@@ -71,8 +99,7 @@ export async function postDelivery<T>(
 		},
 		body: JSON.stringify({ ...body, protocolVersion: TRANSPORT_PROTOCOL_VERSION }),
 	});
-	if (!response.ok)
-		throw new Error(`Control-plane delivery ${path} failed with status ${response.status}`);
+	if (!response.ok) throw new Error(await failureMessage(path, response));
 	let payload: unknown;
 	try {
 		payload = await response.json();

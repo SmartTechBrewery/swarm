@@ -219,6 +219,20 @@ describe('handleSubmitReview', () => {
 		expect(result.json).toMatchObject({ protocolVersion: TRANSPORT_PROTOCOL_VERSION });
 		expect(deps.resolveWorkerByCredential).not.toHaveBeenCalled();
 	});
+
+	it('answers 503 with a reason when the reviewer PAT cannot be resolved', async () => {
+		const deps = makeDeps({
+			buildScmDelivery: vi
+				.fn()
+				.mockRejectedValue(new Error(`No reviewer credential configured: ${RESOLVED_PAT}`)),
+		});
+
+		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody());
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({ reason: 'persona credential unavailable', persona: 'reviewer' });
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+	});
 });
 
 describe('handlePostComment', () => {
@@ -291,6 +305,32 @@ describe('handlePostComment', () => {
 		const result = await handlePostComment(deps, CREDENTIAL, commentBody({ persona: 'operator' }));
 		expect(result.status).toBe(400);
 		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
+	});
+
+	it('answers 503 with a reason when the persona credential cannot be resolved', async () => {
+		// Ordinary misconfiguration on this host: `implementer` resolves to its
+		// `SWARM_OPERATOR_GH_TOKEN`, which the router did not need for this route
+		// before issue #444. Letting the throw escape makes it a reason-less 500, so
+		// the worker's log — and the failed run's comment — never name the cause.
+		const deps = makeDeps({
+			buildScmDelivery: vi
+				.fn()
+				.mockRejectedValue(new Error(`No operator GitHub token configured: ${RESOLVED_PAT}`)),
+		});
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({
+			reason: 'persona credential unavailable',
+			persona: 'implementer',
+		});
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+		expect(JSON.stringify(result.json)).not.toContain(CREDENTIAL);
 	});
 });
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { implementationCommentBody } from '@/pipeline/implementation.js';
-import { planCommentBody, splitChildCommentBody } from '@/pipeline/planning.js';
+import { planCommentBody, preplanCommentBody, splitChildCommentBody } from '@/pipeline/planning.js';
+import { buildPreplanContract } from '@/pipeline/preplan.js';
 import { isSwarmGeneratedBody, SWARM_GENERATED_FOOTER, swarmMarker } from '@/scm/swarm-origin.js';
 
 describe('SWARM-origin markers', () => {
@@ -56,6 +57,25 @@ describe('SWARM-origin markers', () => {
 			{ preplanPublished: true, prepared: true },
 		);
 		expect(isSwarmGeneratedBody(child)).toBe(true);
+
+		// The fourth SWARM comment body (issue #431). Its own
+		// `<!-- swarm-preplan-comment:… -->` marker is the only thing marking it as
+		// SWARM's, so a rename that drops the `swarm-` frame must fail here rather
+		// than silently make a published plan look human-authored.
+		const preplan = preplanCommentBody(
+			buildPreplanContract({
+				splitId: 'split-abc',
+				childIndex: 1,
+				parentUrl: 'https://github.com/jkwiecien/swarm/issues/1',
+				itemUrl: 'https://github.com/jkwiecien/swarm/issues/2',
+				humanDescription: 'The UI slice.',
+				plan: '# UI plan\n\n1. Build it.',
+				generatedAt: '2026-07-14T00:00:00.000Z',
+			}),
+			2,
+			3,
+		);
+		expect(isSwarmGeneratedBody(preplan)).toBe(true);
 
 		const bareMarker = '## Custom header\n\n<!-- swarm-delivery:run-100 -->';
 		expect(isSwarmGeneratedBody(bareMarker)).toBe(true);

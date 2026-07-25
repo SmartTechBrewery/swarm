@@ -66,6 +66,47 @@ describe('postDelivery', () => {
 		).rejects.toThrow(/\/worker\/delivery\/review failed with status 403/);
 	});
 
+	it("appends the server's reason so the worker's log names the cause, not just a status", async () => {
+		// Without this, a router that cannot resolve the implementer credential leaves
+		// the phase reporting a bare `status 503` and the actionable cause visible only
+		// in the router's own logs (issue #444 review).
+		const fetchImpl = vi
+			.fn<FetchLike>()
+			.mockResolvedValue(
+				jsonResponse(503, { reason: 'persona credential unavailable', persona: 'implementer' }),
+			);
+
+		await expect(
+			postDelivery(
+				{ controlPlaneUrl: CONTROL_PLANE, workerCredential: CREDENTIAL, fetchImpl },
+				'/worker/delivery/pr-comment',
+				{},
+				identity,
+			),
+		).rejects.toThrow(
+			'Control-plane delivery /worker/delivery/pr-comment failed with status 503: persona credential unavailable',
+		);
+	});
+
+	it('keeps the plain status message when a refusal carries no readable reason', async () => {
+		const noBody = vi.fn<FetchLike>().mockResolvedValue({
+			ok: false,
+			status: 502,
+			json: async () => {
+				throw new Error('not json');
+			},
+		});
+
+		await expect(
+			postDelivery(
+				{ controlPlaneUrl: CONTROL_PLANE, workerCredential: CREDENTIAL, fetchImpl: noBody },
+				'/worker/delivery/review',
+				{},
+				identity,
+			),
+		).rejects.toThrow(/failed with status 502$/);
+	});
+
 	it('throws when the response body cannot be read', async () => {
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue({
 			ok: true,

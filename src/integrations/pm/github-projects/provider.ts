@@ -38,6 +38,7 @@ import type {
 	WorkItemBlocker,
 	WorkItemLabel,
 } from '../../../pm/types.js';
+import { isSwarmGeneratedBody } from '../../../scm/swarm-origin.js';
 import { getScopedClient } from '../../scm/github/client.js';
 import { GitHubSCMIntegration } from '../../scm/github/scm-integration.js';
 
@@ -832,11 +833,21 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	/**
-	 * Prerequisites the item *names in prose* — its own description and comments —
-	 * that aren't native relationships. Provider-neutral reference extraction
-	 * (`findDependencyReferences`); this adapter resolves each referenced issue's
-	 * live open/closed state. A reference that doesn't resolve is skipped (a typo'd
-	 * or cross-repo number is not a gate).
+	 * Prerequisites the item *names in prose* — its own description and its
+	 * **human** comments — that aren't native relationships. Provider-neutral
+	 * reference extraction (`findDependencyReferences`); this adapter resolves each
+	 * referenced issue's live open/closed state. A reference that doesn't resolve is
+	 * skipped (a typo'd or cross-repo number is not a gate).
+	 *
+	 * SWARM's own comments are excluded (`isSwarmGeneratedBody`, issue #431): a
+	 * published plan — a split child's Preplan comment, or any phase's plan comment —
+	 * is agent prose that routinely says things like "this phase requires #266 to
+	 * land first". Read as a dependency declaration, that would gate the item on an
+	 * issue nobody declared a blocker: the dependency guard defers Implementation
+	 * while it stays open and finally fails the run. A prerequisite has to be
+	 * declared by a person (in the description or a comment of their own) or as a
+	 * native `blocked by` relationship — SWARM must not conjure one out of its own
+	 * writing.
 	 */
 	private async fetchMentionedBlockers(
 		owner: string,
@@ -856,7 +867,8 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			issue_number: issueNumber,
 			per_page: 100,
 		});
-		const prose = [description, ...comments.map((c) => c.body ?? '')].join('\n');
+		const humanComments = comments.filter((c) => !isSwarmGeneratedBody(c.body ?? undefined));
+		const prose = [description, ...humanComments.map((c) => c.body ?? '')].join('\n');
 		const refs = findDependencyReferences(prose).filter((n) => n !== String(issueNumber));
 		const resolved = await Promise.all(
 			refs.map(async (ref): Promise<WorkItemBlocker | undefined> => {
