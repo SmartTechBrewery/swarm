@@ -15,12 +15,12 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Octokit } from '@octokit/rest';
 
 import { logger } from '../../../lib/logger.js';
+import { swarmMarker } from '../../../scm/swarm-origin.js';
 import type {
 	AggregateCheckStatus,
 	CheckRunState,
 	PullRequestDetails,
 } from '../../../scm/types.js';
-import { swarmMarker } from '../../../scm/swarm-origin.js';
 
 const clientStorage = new AsyncLocalStorage<Octokit>();
 
