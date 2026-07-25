@@ -174,10 +174,16 @@ const DEFAULT_AUTO_ADVANCE = false;
  * independent of the board Status move `autoAdvance` may make. A fixed constant,
  * not a config option: the smallest durable change, with no speculative setting.
  *
- * Also applied at creation to every split child {@link applySplit} spawns (issue
- * #426), since such a child is already planned by construction — it carries the
- * parent's validated plan in its body — and shouldn't read as un-planned during
- * the window before its own preplanned Planning run completes.
+ * Also applied to every split child {@link applySplit} successfully prepares
+ * (issue #426), since such a child is already planned by construction — it carries
+ * the parent's validated plan in its body — and shouldn't read as un-planned
+ * during the window before its own preplanned Planning run completes. Applied
+ * right after that preparation rather than at `createWorkItem`, so a child whose
+ * preparation failed — left in Backlog without completing placement as planned —
+ * is never labeled up front (issue #436). If marker embedding failed, the child is
+ * un-planned and owes a full Planning agent run; if the Planning move failed, its
+ * embedded marker remains valid, so its later Planning entry reuses the plan with
+ * the agent skipped and `applyPlannedLabel` supplies the label then.
  */
 export const PLANNED_LABEL = 'planned';
 
@@ -671,6 +677,11 @@ function readPlanOrThrow(
  * and whose plan nobody can read. The marker still lands before the Planning move,
  * so the Backlog-first ordering guarantee is untouched: the extra call happens
  * while the child sits in `backlog`, a status that starts no phase.
+ *
+ * {@link PLANNED_LABEL} is attached right after that preparation succeeds
+ * ({@link markSplitChildPlanned}), not in the `createWorkItem` labels: a child
+ * whose preparation failed is genuinely un-planned, so the label would say the
+ * inverse of the board's truth (issue #436).
  */
 async function applySplit(
 	pm: PMProvider,
@@ -701,13 +712,9 @@ async function applySplit(
 			// The configured automation label, not a hard-coded `swarm` (issue #131):
 			// a sibling SWARM created must be opted into SWARM's own pipeline, whatever
 			// label this project gates on. Omitted entirely when the gate is disabled.
-			// PLANNED_LABEL rides along at creation (issue #426): a split child is
-			// already planned by construction — it is born carrying the parent's
-			// validated plan — so the provider-visible marker must be accurate from
-			// the moment the child exists, not only once its own preplanned reuse run
-			// completes. That later run still calls applyPlannedLabel; both label
-			// paths are idempotent at the provider, so the repeat is a no-op.
-			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL, PLANNED_LABEL],
+			// PLANNED_LABEL is deliberately *not* here — it is applied below, once the
+			// preparation that makes the child planned actually succeeded (issue #436).
+			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL],
 		});
 		let prepared = false;
 		let preplanPublished = false;
@@ -738,6 +745,10 @@ async function applySplit(
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		// Only a child that really was prepared is planned (issue #436): the label
+		// must not outlive a failed preparation, which leaves the child un-planned in
+		// Backlog awaiting a full Planning agent run.
+		if (prepared) await markSplitChildPlanned(pm, sibling, splitId, childIndex);
 		// Guard 2 (issue #330): record the native blocked-by relationship for every
 		// preceding phase, so the worker defers this phase's Implementation until they
 		// all close. Best-effort — a provider that can't model dependencies, or a
@@ -755,6 +766,46 @@ async function applySplit(
 		predecessors.push(sibling);
 	}
 	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined };
+}
+
+/**
+ * Mark a *successfully prepared* split child {@link PLANNED_LABEL} (issues #426,
+ * #436). Such a child is planned by construction — its parent-written plan is
+ * embedded as a validated preplan marker and its card sits in Planning — so the
+ * provider-visible marker is accurate as soon as the child holds that plan, well
+ * before its own preplanned reuse run completes. That later run still calls
+ * {@link applyPlannedLabel}; the label write is idempotent at the provider, so the
+ * repeat is a no-op.
+ *
+ * Called only when the preparation above succeeded — marker embedded and card in
+ * Planning. If marker embedding threw, the child stays in Backlog with no marker
+ * and owes a full Planning agent run; if the status move threw, the embedded marker
+ * remains valid, so its later Planning entry reuses the plan (skipping the agent)
+ * and applies `PLANNED_LABEL` then. Either failure leaves the child unlabeled in
+ * Backlog until its placement as planned completes (issue #436).
+ *
+ * Best-effort, exactly like {@link linkBlockedBy}: a failure is logged and
+ * swallowed so a refused label can never abort the split mid-loop (a retry would
+ * duplicate the siblings). Nothing reads the label — Planning is its only consumer
+ * — and the child's own preplanned Planning run applies it again anyway, so a
+ * swallowed failure heals there.
+ */
+async function markSplitChildPlanned(
+	pm: PMProvider,
+	item: WorkItem,
+	splitId: string,
+	childIndex: number,
+): Promise<void> {
+	try {
+		await pm.addLabel(item.id, PLANNED_LABEL);
+	} catch (error) {
+		logger.warn('Planning — failed to label a prepared split child planned', {
+			itemId: item.id,
+			splitId,
+			childIndex,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 }
 
 /**
@@ -832,7 +883,8 @@ async function linkBlockedBy(
  * it also writes `proposed_split.json`: the original item is re-scoped into the
  * smaller first task (`proposed_plan.md` is that task's plan) and the remaining
  * work is spawned as sibling items. Each sibling enters Planning only after its
- * validated preplan marker is written, is tagged with {@link SPLIT_CHILD_LABEL},
+ * validated preplan marker is written, is tagged with {@link SPLIT_CHILD_LABEL}
+ * (and, once that preparation succeeded, {@link PLANNED_LABEL}),
  * and gets a comment explaining the split. Its marker suppresses a second Planning
  * agent run; the human then starts implementation by moving it to ToDo in order. The original
  * (first task) still honors `autoAdvance` as usual, unless it is itself a

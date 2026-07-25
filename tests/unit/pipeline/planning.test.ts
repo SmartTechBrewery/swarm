@@ -276,7 +276,7 @@ describe('runPlanningPhase', () => {
 		for (const call of deps.pm.createWorkItem.mock.calls) {
 			expect(call[0]).toMatchObject({
 				status: 'backlog',
-				labels: ['swarm', SPLIT_CHILD_LABEL, PLANNED_LABEL],
+				labels: ['swarm', SPLIT_CHILD_LABEL],
 			});
 		}
 		expect(deps.pm.createWorkItem.mock.calls.map((c) => c[0].title)).toEqual([
@@ -310,6 +310,11 @@ describe('runPlanningPhase', () => {
 		const secondMarkerOrder = deps.pm.updateWorkItem.mock.invocationCallOrder[1];
 		const secondPlanningOrder = deps.pm.moveWorkItem.mock.invocationCallOrder[0];
 		expect(secondMarkerOrder).toBeLessThan(secondPlanningOrder);
+
+		// Each prepared child is then labeled `planned` (issues #426, #436) — planned
+		// by construction, so the marker is accurate before its own Planning run.
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
 
 		// Each sibling gets an explanatory comment and its published preplan (issue
 		// #431), plus the original's plan comment.
@@ -363,34 +368,57 @@ describe('runPlanningPhase', () => {
 		// Without this the sibling SWARM just created would be gated out of SWARM's
 		// own pipeline by the very label the project configured.
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL] }),
 		);
 	});
 
-	it('labels split children `planned` at creation, before their own Planning run (issue #426)', async () => {
+	it('labels a prepared split child `planned` before its own Planning run (issue #426)', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
 			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
 		});
 		const deps = makeDeps();
-		// Marker embedding fails, so the child stays in Backlog and its own preplanned
-		// Planning run never happens — the label must be on the issue regardless.
-		deps.pm.updateWorkItem = vi.fn<(id: string, patch: UpdateWorkItemPatch) => Promise<void>>(
-			async (_id, patch) => {
-				if (typeof patch.description === 'string' && patch.description.includes('swarm-preplan')) {
-					throw new Error('board rejected the update');
-				}
-			},
-		);
 
 		await runPlanningPhase(deps);
 
+		// The label is a follow-up write, not a creation label (issue #436), so a
+		// failed preparation can't leave it behind...
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: ['swarm', SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+			expect.objectContaining({ labels: ['swarm', SPLIT_CHILD_LABEL] }),
 		);
-		// Nothing else labels the child — this run only labels the parent, so the
-		// child's `planned` marker came from createWorkItem alone.
-		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		// ...but a child that really was prepared still carries it long before its own
+		// preplanned Planning run — right after its marker and Planning move landed.
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		const childLabelOrder = deps.pm.addLabel.mock.invocationCallOrder[0];
+		const childPlanningOrder = deps.pm.moveWorkItem.mock.invocationCallOrder[0];
+		expect(childLabelOrder).toBeGreaterThan(childPlanningOrder);
+	});
+
+	it('keeps splitting when labeling a prepared split child `planned` throws (issue #436)', async () => {
+		splitExists = true;
+		splitContents = JSON.stringify({
+			subTasks: [
+				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' },
+				{ title: 'Third slice', description: 'The docs', plan: '# Docs plan\n\n1. Write it.' },
+			],
+		});
+		const deps = makeDeps();
+		// Best-effort, like the blocked-by link: a refused label must never abort the
+		// split mid-loop, or a retry would duplicate the siblings.
+		deps.pm.addLabel = vi.fn<(id: string, name: string) => Promise<void>>(async (id) => {
+			if (id === 'PVTI_Second slice') throw new Error('board rejected the label');
+		});
+
+		const result = await runPlanningPhase(deps);
+
+		expect(result.split).toMatchObject({
+			subTaskItemIds: ['PVTI_Second slice', 'PVTI_Third slice'],
+		});
+		// The refused child was still prepared, so it keeps its Planning placement and
+		// the prepared comment; the next sibling is labeled as usual.
+		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Second slice', 'planning');
+		expect(childComment(deps, 'PVTI_Second slice', false)).toContain('placed it in **Planning**');
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
 	});
 
 	it('labels split children with only the split-child label when the gate is disabled', async () => {
@@ -404,7 +432,7 @@ describe('runPlanningPhase', () => {
 		await runPlanningPhase(deps);
 
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: [SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+			expect.objectContaining({ labels: [SPLIT_CHILD_LABEL] }),
 		);
 	});
 
@@ -496,6 +524,11 @@ describe('runPlanningPhase', () => {
 		expect(childComment(deps, 'PVTI_Second slice', true)).toContain('# UI plan');
 		expect(splitComment).toContain('**Preplan** comment');
 		expect(result.split).toMatchObject({ subTaskItemIds: ['PVTI_Second slice'] });
+		// Such a child is genuinely un-planned — its plan is lost with the unwritten
+		// marker and a full Planning agent run still has to produce one — so it must
+		// not be left labeled `planned` (issue #436). The parent's own run still is.
+		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', PLANNED_LABEL);
 	});
 
 	it('posts a Backlog fallback comment when moving a prepared sibling to Planning throws', async () => {
@@ -509,7 +542,6 @@ describe('runPlanningPhase', () => {
 		deps.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(async (id) => {
 			if (id === 'PVTI_Second slice') throw new Error('board rejected the move');
 		});
-
 		await runPlanningPhase({ ...deps, autoAdvance: true });
 
 		const splitComment = childComment(deps, 'PVTI_Second slice', false);
@@ -519,6 +551,25 @@ describe('runPlanningPhase', () => {
 		// accurate — the honesty rule is about not claiming what didn't happen.
 		expect(childComment(deps, 'PVTI_Second slice', true)).toContain('# UI plan');
 		expect(splitComment).toContain('**Preplan** comment');
+		// The other half of the preparation block, same conclusion (issue #436): a
+		// child stranded in Backlog is not `planned`, whichever step stranded it.
+		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+	});
+
+	it('completes preplanned run and applies planned label for a child stranded in Backlog with a valid marker', async () => {
+		const deps = makeDeps();
+		// A child whose Planning move failed during split preparation: status is Backlog,
+		// no planned label, but carries the valid preplan marker in its description.
+		deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.', undefined, {
+			status: 'Backlog',
+			labels: [{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL }],
+		});
+
+		const result = await runPlanningPhase({ ...deps });
+
+		expect(deps.runAgent).not.toHaveBeenCalled();
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_child', PLANNED_LABEL);
+		expect(result).toMatchObject({ preplanned: true });
 	});
 
 	// Issue #431: the hidden `swarm-preplan:v1` marker is invisible in GitHub's
@@ -643,8 +694,8 @@ describe('runPlanningPhase', () => {
 
 	it('re-applies `planned` without failing when the split child already carries it (issue #426)', async () => {
 		const deps = makeDeps();
-		// Exactly the shape applySplit now creates: the child is labeled `planned`
-		// from birth, and its own preplanned run reaches applyPlannedLabel anyway.
+		// Exactly the shape applySplit leaves behind: a prepared child is already
+		// labeled `planned`, and its own preplanned run reaches applyPlannedLabel anyway.
 		deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.', undefined, {
 			labels: [
 				{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL },
