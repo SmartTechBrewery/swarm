@@ -140,7 +140,7 @@ describe('runImplementationPhase', () => {
 		expect(deps.pm.moveWorkItem).toHaveBeenNthCalledWith(1, 'PVTI_item19', 'inProgress');
 
 		// Task-branch checkout: provisioned with defaults (createBranch), NOT detached.
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19');
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
 
 		// Claude Code is run with the worktree as CWD, the implementation prompt,
 		// and the implementer token in GH_TOKEN so gh (incl. `gh pr create`) acts
@@ -214,7 +214,17 @@ describe('runImplementationPhase', () => {
 		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
 			createBranch: false,
 			branch: 'issue-19',
+			runId: undefined,
 		});
+	});
+
+	// The collision gate needs the run's own id to tell a foreign live lease from
+	// its own dead attempt's orphan (issue #427).
+	it('threads the run id into provisioning', async () => {
+		const deps = makeDeps();
+		await runImplementationPhase({ ...deps, runId: 'run-19' });
+
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: 'run-19' });
 	});
 
 	it('reuses a preserved task worktree for a fresh-session implementation retry', async () => {
@@ -239,7 +249,7 @@ describe('runImplementationPhase', () => {
 		const deps = makeDeps();
 		await runImplementationPhase({ ...deps, resumeExistingBranch: false });
 
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19');
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
 	});
 
 	it('records branch provisioning only after worktree acquisition succeeds', async () => {
@@ -385,7 +395,7 @@ describe('runImplementationPhase', () => {
 		await runImplementationPhase({ ...deps, sessionId: 'sess-19' });
 
 		expect(deps.worktrees.reuse).not.toHaveBeenCalled();
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19');
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.sessionId).toBe('sess-19');
 		expect(runArgs.resumeSessionId).toBeUndefined();
@@ -408,7 +418,7 @@ describe('runImplementationPhase', () => {
 		await runImplementationPhase({ ...deps, sessionId: 'sess-19', resumeSessionId: 'sess-19' });
 
 		expect(deps.worktrees.reuse).toHaveBeenCalledWith('19', 'issue-19', false);
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19');
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
 		// Nothing to resume: the fresh checkout gets the first-run sessionId instead.
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.resumeSessionId).toBeUndefined();

@@ -11,6 +11,7 @@ import {
 	completeDispatch,
 	createDispatch,
 	type DispatchRow,
+	type DispatchState,
 	deferDispatchToPending,
 	failDispatch,
 	failExpiredDispatchLeases,
@@ -18,6 +19,7 @@ import {
 	getActiveDispatchByRunId,
 	getDispatchById,
 	getWorkerDispatchClaimState,
+	hasExecutingDispatchForTask,
 	listDeferredRunsWithoutActiveDispatch,
 	listWaitingDispatches,
 	listWakeablePendingDispatches,
@@ -49,6 +51,35 @@ const OWNER = 'test-worker:1';
 
 function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
 	return { ...createMockGitHubWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
+}
+
+/** States only reachable by actually executing the dispatch. */
+const EXECUTED_STATES: readonly DispatchState[] = ['running', 'completed', 'failed'];
+
+/** A review dispatch for `taskId`, driven to `state` through the real transitions. */
+async function seedDispatchInState(
+	taskId: string,
+	state: DispatchState,
+	runId: string | undefined,
+): Promise<void> {
+	// `createDispatch` can start a row directly in any waiting/leased state;
+	// everything past that is reached through the real lifecycle calls.
+	const { dispatch } = await createDispatch({
+		projectId: PROJECT_ID,
+		jobPayload: job({ runId }),
+		source: 'manual',
+		taskId,
+		phase: 'review',
+		runId,
+		state: state === 'leased' || state === 'retry-scheduled' ? state : 'pending',
+	});
+	if (state === 'cancelled') await cancelWaitingDispatch(dispatch.id, 'cleared the queue');
+	if (EXECUTED_STATES.includes(state)) {
+		await claimDispatch(dispatch.id, OWNER, 60_000);
+		await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), taskId, 'review');
+	}
+	if (state === 'completed') await completeDispatch(dispatch.id, 'phase-succeeded');
+	if (state === 'failed') await failDispatch(dispatch.id, 'boom');
 }
 
 describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (integration)', () => {
@@ -120,6 +151,48 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				runId,
 			});
 			expect(second.created).toBe(true);
+		});
+	});
+
+	describe('hasExecutingDispatchForTask (issue #427)', () => {
+		const TASK = '77';
+
+		it.each(['leased', 'running'] as const)('is true for a %s dispatch', async (state) => {
+			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			await seedDispatchInState(TASK, state, runId);
+			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK)).toBe(true);
+		});
+
+		it.each([
+			'pending',
+			'retry-scheduled',
+			'completed',
+			'failed',
+			'cancelled',
+		] as const)('is false for a %s dispatch — it owns no checkout', async (state) => {
+			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			await seedDispatchInState(TASK, state, runId);
+			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK)).toBe(false);
+		});
+
+		it('is false when the only executing dispatch belongs to the excluded run', async () => {
+			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			await seedDispatchInState(TASK, 'running', runId);
+			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK, runId)).toBe(false);
+		});
+
+		it('is true for a run-row-less executing dispatch even when a run is excluded', async () => {
+			await seedDispatchInState(TASK, 'running', undefined);
+			// SQL `NULL <> $1` is unknown, so only the explicit isNull leg keeps this true.
+			const otherRunId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK, otherRunId)).toBe(true);
+		});
+
+		it('scopes to the given project and task', async () => {
+			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			await seedDispatchInState(TASK, 'running', runId);
+			expect(await hasExecutingDispatchForTask(PROJECT_ID, '78')).toBe(false);
+			expect(await hasExecutingDispatchForTask('proj-other', TASK)).toBe(false);
 		});
 	});
 

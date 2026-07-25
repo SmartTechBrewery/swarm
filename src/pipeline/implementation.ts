@@ -283,6 +283,7 @@ async function acquireImplementationWorktree(
 	resumeDelivery: boolean,
 	recoveryMode?: 'resume' | 'fresh',
 	projectId?: string,
+	runId?: string,
 ): Promise<{ handle: WorktreeHandle; resumed: boolean; deliveryResumed: boolean }> {
 	if (recoveryMode) {
 		const { reuseHandle } = await executeRecoveryGate(
@@ -316,8 +317,8 @@ async function acquireImplementationWorktree(
 			};
 	}
 	const handle = resumeExistingBranch
-		? await worktrees.provision(taskId, { createBranch: false, branch })
-		: await worktrees.provision(taskId);
+		? await worktrees.provision(taskId, { createBranch: false, branch, runId })
+		: await worktrees.provision(taskId, { runId });
 	return { handle, resumed: false, deliveryResumed: false };
 }
 
@@ -397,6 +398,7 @@ export async function runImplementationPhase(
 		resumeDelivery,
 		recoveryMode,
 		project.id,
+		runId,
 	);
 	await onBranchProvisioned?.();
 	let preserveForResume = false;

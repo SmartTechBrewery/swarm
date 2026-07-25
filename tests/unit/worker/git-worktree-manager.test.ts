@@ -11,13 +11,21 @@ const {
 	releaseWorktreeLeaseMock,
 	tryClaimWorktreeLeaseMock,
 	isWorktreeLeasedMock,
+	readWorktreeLeaseMock,
+	takeOverWorktreeLeaseMock,
 	hasResumableDeferredRunMock,
+	hasLiveRunForTaskMock,
+	hasExecutingDispatchForTaskMock,
 } = vi.hoisted(() => ({
 	claimWorktreeLeaseMock: vi.fn(),
 	releaseWorktreeLeaseMock: vi.fn(),
 	tryClaimWorktreeLeaseMock: vi.fn(),
 	isWorktreeLeasedMock: vi.fn(),
+	readWorktreeLeaseMock: vi.fn(),
+	takeOverWorktreeLeaseMock: vi.fn(),
 	hasResumableDeferredRunMock: vi.fn(),
+	hasLiveRunForTaskMock: vi.fn(),
+	hasExecutingDispatchForTaskMock: vi.fn(),
 }));
 
 vi.mock('@/worktree/worktree-lease.js', () => ({
@@ -25,12 +33,20 @@ vi.mock('@/worktree/worktree-lease.js', () => ({
 	releaseWorktreeLease: releaseWorktreeLeaseMock,
 	tryClaimWorktreeLease: tryClaimWorktreeLeaseMock,
 	isWorktreeLeased: isWorktreeLeasedMock,
+	readWorktreeLease: readWorktreeLeaseMock,
+	takeOverWorktreeLease: takeOverWorktreeLeaseMock,
 }));
 
 // Consumed by the reclaim gate (`src/worktree/reclaim.ts`) to detect a resumable
-// deferred/failed run pinning a colliding checkout.
+// deferred/failed run pinning a colliding checkout, and by the lease-liveness
+// check (`src/worktree/lease-liveness.ts`) to tell a live lease from an orphan.
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	hasResumableDeferredRun: hasResumableDeferredRunMock,
+	hasLiveRunForTask: hasLiveRunForTaskMock,
+}));
+
+vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
+	hasExecutingDispatchForTask: hasExecutingDispatchForTaskMock,
 }));
 
 type GitOutcome =
@@ -105,6 +121,12 @@ describe('GitWorktreeManager', () => {
 		tryClaimWorktreeLeaseMock.mockReset().mockResolvedValue(true);
 		isWorktreeLeasedMock.mockReset().mockResolvedValue(false);
 		hasResumableDeferredRunMock.mockReset().mockResolvedValue(false);
+		// Lease-liveness defaults (issue #427): nothing owns a held lease, and a
+		// take-over of one succeeds — only the tests that contend say otherwise.
+		hasLiveRunForTaskMock.mockReset().mockResolvedValue(false);
+		hasExecutingDispatchForTaskMock.mockReset().mockResolvedValue(false);
+		readWorktreeLeaseMock.mockReset().mockResolvedValue('stale-token');
+		takeOverWorktreeLeaseMock.mockReset().mockResolvedValue(true);
 		// Default world: the repo root exists and is a git repo; no worktrees yet.
 		existingPaths = new Set([REPO_ROOT]);
 		realpaths = new Map();
@@ -234,6 +256,144 @@ describe('GitWorktreeManager', () => {
 			expect(gitCalls.some((c) => c[1] === 'add')).toBe(false);
 			// Never acquired, so nothing to release.
 			expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+		});
+
+		describe('stale-lease take-over (issue #427)', () => {
+			const RUN_ID = 'run-abc';
+			// Clean, on a branch, whose upstream is 2 commits behind local HEAD —
+			// keyed by `<subcommand> <first arg>` so the handler stays a lookup.
+			const UNPUSHED_BRANCH_STDOUT: Record<string, string> = {
+				'symbolic-ref --short': 'issue-14\n',
+				'rev-parse --abbrev-ref': 'origin/issue-14\n',
+				'rev-list --count': '2\n',
+			};
+
+			it('adopts an ownerless lease and reclaims the safe checkout behind it', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				const project = createMockProjectConfig({ id: 'project-1', repoRoot: REPO_ROOT });
+
+				const handle = await new GitWorktreeManager(project).provision('14', { runId: RUN_ID });
+
+				// Compare-and-set against the token actually observed, not a guess.
+				expect(takeOverWorktreeLeaseMock).toHaveBeenCalledWith(
+					'project-1',
+					'14',
+					'stale-token',
+					expect.any(String),
+				);
+				expect(gitCalls).toContainEqual(['worktree', 'remove', '--force', WORKTREE_14]);
+				expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+				expect(handle.path).toBe(WORKTREE_14);
+				expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+			});
+
+			it('provisions fresh for a bare orphan lease with no checkout on disk', async () => {
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+
+				const handle = await makeManager().provision('14', { runId: RUN_ID });
+
+				expect(takeOverWorktreeLeaseMock).toHaveBeenCalled();
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+				expect(handle.path).toBe(WORKTREE_14);
+			});
+
+			it('claims outright when the lease expired between the failed claim and the read', async () => {
+				tryClaimWorktreeLeaseMock.mockResolvedValueOnce(false).mockResolvedValue(true);
+				readWorktreeLeaseMock.mockResolvedValue(null);
+
+				const handle = await makeManager().provision('14', { runId: RUN_ID });
+
+				expect(takeOverWorktreeLeaseMock).not.toHaveBeenCalled();
+				expect(handle.path).toBe(WORKTREE_14);
+			});
+
+			it('still blocks (live-leased) when another run for the task is running', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				hasLiveRunForTaskMock.mockResolvedValue(true);
+
+				const err = await makeManager()
+					.provision('14', { runId: RUN_ID })
+					.catch((e) => e);
+				expect(err).toBeInstanceOf(BlockedRecoveryError);
+				expect(err.reason).toBe('live-leased');
+				expect(takeOverWorktreeLeaseMock).not.toHaveBeenCalled();
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+			});
+
+			it('still blocks (live-leased) when an executing dispatch owns the task', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				hasExecutingDispatchForTaskMock.mockResolvedValue(true);
+
+				const err = await makeManager()
+					.provision('14', { runId: RUN_ID })
+					.catch((e) => e);
+				expect(err.reason).toBe('live-leased');
+				expect(takeOverWorktreeLeaseMock).not.toHaveBeenCalled();
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+			});
+
+			it('blocks (live-leased) when a concurrent claimant won the take-over race', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				takeOverWorktreeLeaseMock.mockResolvedValue(false);
+
+				const err = await makeManager()
+					.provision('14', { runId: RUN_ID })
+					.catch((e) => e);
+				expect(err.reason).toBe('live-leased');
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+			});
+
+			it('retains a dirty checkout behind an adopted stale lease', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				gitHandler = (args) =>
+					args[0] === 'status' && args[1] === '--porcelain'
+						? { stdout: ' M file.ts\n' }
+						: { stdout: '' };
+
+				const err = await makeManager()
+					.provision('14', { runId: RUN_ID })
+					.catch((e) => e);
+				expect(err).toBeInstanceOf(BlockedRecoveryError);
+				expect(err.reason).toBe('dirty');
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				// The adopted lease is handed back under our own token.
+				expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('swarm', '14', expect.any(String));
+			});
+
+			it('retains a checkout with unpushed commits behind an adopted stale lease', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				gitHandler = (args) => ({
+					stdout: UNPUSHED_BRANCH_STDOUT[`${args[0]} ${args[1] ?? ''}`.trim()] ?? '',
+				});
+
+				const err = await makeManager()
+					.provision('14', { runId: RUN_ID })
+					.catch((e) => e);
+				expect(err.reason).toBe('unpushed');
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				expect(releaseWorktreeLeaseMock).toHaveBeenCalled();
+			});
+
+			it('does not consult liveness at all without a runId', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+
+				const err = await makeManager()
+					.provision('14')
+					.catch((e) => e);
+				expect(err.reason).toBe('live-leased');
+				expect(hasLiveRunForTaskMock).not.toHaveBeenCalled();
+				expect(hasExecutingDispatchForTaskMock).not.toHaveBeenCalled();
+				expect(takeOverWorktreeLeaseMock).not.toHaveBeenCalled();
+			});
 		});
 
 		it('blocks (resumable-owner) and releases the held lease without removing', async () => {

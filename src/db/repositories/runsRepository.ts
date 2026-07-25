@@ -481,26 +481,37 @@ export async function clearRunRecovery(runId: string): Promise<void> {
 
 /**
  * Whether a *different* run is still live (`running`) for this project task —
- * the "is this worktree lease genuinely owned, or stale?" question the reset
- * action (issue #424) asks before reclaiming a `live-leased` checkout. The run
- * being reset is excluded: its own lease is precisely the stale marker to clear.
+ * the "is this worktree lease genuinely owned, or stale?" question asked before
+ * reclaiming a `live-leased` checkout. Two callers share it so the two paths
+ * cannot drift apart: the reset action (issue #424,
+ * `src/dispatch/run-reset.ts`), and the run-side half of the provision-time
+ * collision gate's liveness signal (issue #427,
+ * `src/worktree/lease-liveness.ts`, which additionally weighs executing
+ * dispatches).
+ *
+ * `excludeRunId` is the asking run, and omitting it means "any live run counts".
+ * The reset path excludes the run being reset — its own lease is precisely the
+ * stale marker to clear — and the collision gate excludes the provisioning
+ * attempt, whose row is already `running` by then, so an un-excluded query would
+ * always see itself. A zombie `running` row (a worker killed without settling it)
+ * deliberately still counts as live; `failOrphanedRunningRuns` /
+ * `failStaleRunningRuns` reap those, after which the next attempt recovers.
  */
 export async function hasLiveRunForTask(
 	projectId: string,
 	taskId: string,
-	excludeRunId: string,
+	excludeRunId?: string,
 ): Promise<boolean> {
+	const conditions = [
+		eq(runs.projectId, projectId),
+		eq(runs.taskId, taskId),
+		eq(runs.status, 'running'),
+	];
+	if (excludeRunId) conditions.push(ne(runs.id, excludeRunId));
 	const rows = await getDb()
 		.select({ id: runs.id })
 		.from(runs)
-		.where(
-			and(
-				eq(runs.projectId, projectId),
-				eq(runs.taskId, taskId),
-				eq(runs.status, 'running'),
-				ne(runs.id, excludeRunId),
-			),
-		)
+		.where(and(...conditions))
 		.limit(1);
 	return rows.length > 0;
 }
