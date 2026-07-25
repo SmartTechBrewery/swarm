@@ -17,6 +17,8 @@ import * as init from './commands/init.js';
 import * as logs from './commands/logs.js';
 import * as members from './commands/members.js';
 import * as queue from './commands/queue.js';
+// Namespaced as `runCommand` because this module's own dispatcher is `run`.
+import * as runCommand from './commands/run.js';
 import * as start from './commands/start.js';
 import * as status from './commands/status.js';
 import * as stop from './commands/stop.js';
@@ -34,6 +36,7 @@ const COMMANDS: Record<string, Command> = {
 	status,
 	logs,
 	queue,
+	run: runCommand,
 	users,
 	members,
 	identities,
@@ -53,6 +56,7 @@ Commands:
   status           Show stack container states and probe the router's health
   logs [svc] [-f]  Tail stack logs (optional service, -f/--follow to stream)
   queue clear      Remove all pending queue jobs (not active runs)
+  run reset <id>   Reset a wedged run and restart its phase (last resort)
   users            Manage SWARM users and the installation admin
   members          Manage project membership (who belongs to a project)
   identities       Link a SWARM user to the handles they own on a provider
