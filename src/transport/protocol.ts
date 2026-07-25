@@ -376,9 +376,13 @@ export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
  * SCM delivery calls — submit a review, post a PR comment — move server-side so
  * the per-project reviewer PAT stays on the router and never reaches a worker: a
  * federated worker sends only the verdict + comment body + PR number up the
- * transport, and the router performs the GitHub write under that PAT (the review
- * still lands as a genuine GitHub review, keeping the `pull_request_review`
- * respond-to-review trigger working — PROJECT.md §5.4).
+ * transport, and the router performs the GitHub write under the requested
+ * persona's credential (the review still lands as a genuine GitHub review,
+ * keeping the `pull_request_review` respond-to-review trigger working —
+ * PROJECT.md §5.4).
+ *
+ * The PR-comment frame names its author persona; the review frame does not,
+ * because only the Review phase submits a review and it is always the reviewer.
  *
  * These are **HTTP request/response** frames — carried by the router's
  * `POST /worker/delivery/*` routes exactly as the handshake rides
@@ -405,15 +409,30 @@ export const SubmitReviewDeliveryResponseSchema = z.object({
 });
 export type SubmitReviewDeliveryResponse = z.infer<typeof SubmitReviewDeliveryResponseSchema>;
 
-/** `POST /worker/delivery/pr-comment` request body — a top-level PR comment. */
+/**
+ * `POST /worker/delivery/pr-comment` request body — a top-level PR comment.
+ *
+ * `persona` names who authors the comment, because only the requesting phase
+ * knows whose reply it is: a Review comments as the `reviewer`, while a
+ * Respond-to-review reply is the `implementer` answering that review. A server
+ * left to infer it defaulted to the reviewer, so the reviewer answered its own
+ * review (issue #444). Defaulting the field to `reviewer` keeps a client that
+ * sends no persona on its previous behaviour, so the frame stays
+ * wire-compatible without a protocol bump. Provider-neutral like every other
+ * field here: the two persona names, no GitHub type imported into the protocol.
+ */
 export const PostCommentDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
 	prNumber: z.number().int().positive(),
 	body: z.string().min(1),
 	deliveryId: z.string().min(1),
+	persona: z.enum(['reviewer', 'implementer']).default('reviewer'),
 	protocolVersion: z.number().int(),
 });
 export type PostCommentDeliveryRequest = z.infer<typeof PostCommentDeliveryRequestSchema>;
+
+/** The persona a delivery request names as the author of its write. */
+export type DeliveryPersona = PostCommentDeliveryRequest['persona'];
 
 /** `POST /worker/delivery/pr-comment` success body — the created comment's id. */
 export const PostCommentDeliveryResponseSchema = z.object({

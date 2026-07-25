@@ -6,13 +6,17 @@
  *
  * The two metadata-only SCM
  * delivery calls — submit a review, post a PR comment — run *here*, on the
- * router, under the **per-project reviewer PAT** the server already resolves
- * (`getPersonaToken`), instead of on a federated worker holding that token. A
- * worker sends only the verdict + comment body + PR number up the transport
+ * router, under the persona credential the server already resolves
+ * (`getPersonaToken`), instead of on a federated worker holding that token. The
+ * review route always writes as the **per-project reviewer PAT**; the PR-comment
+ * route writes as the persona its request names — the reviewer for a Review's
+ * comment, the implementer for a Respond-to-review reply — defaulting to the
+ * reviewer when a client sends none (issue #444). A worker sends only the verdict
+ * + comment body + PR number (+ that persona) up the transport
  * (`../scm/transport-delivery.ts`); this module performs the GitHub write and
- * returns the created review/comment id. The reviewer PAT is resolved *inside*
- * this process and never leaves it, and only metadata crosses the wire — the
- * repository tree never does (the local-first boundary, ai/RULES.md §1).
+ * returns the created review/comment id. The persona credential is resolved
+ * *inside* this process and never leaves it, and only metadata crosses the wire —
+ * the repository tree never does (the local-first boundary, ai/RULES.md §1).
  *
  * The review still lands on the PR as a genuine GitHub review, so the existing
  * `pull_request_review`-driven respond-to-review trigger (PROJECT.md §5.4) keeps
@@ -167,7 +171,7 @@ export interface DeliveryResult {
 
 /**
  * Authenticate a delivery request and resolve the project it targets — the
- * shared prelude both handlers run before touching the reviewer PAT. Returns the
+ * shared prelude both handlers run before touching a persona credential. Returns the
  * authenticated `{ worker, project }` on success, or a {@link DeliveryResult} to
  * return verbatim on any refusal. The credential is never reflected in a body.
  */
@@ -231,7 +235,16 @@ export async function handleSubmitReview(
 /**
  * Post a top-level PR comment as a pure function of its deps, the raw bearer
  * credential, and the request body. Same prelude and contract as
- * {@link handleSubmitReview}; the reviewer PAT is resolved server-side.
+ * {@link handleSubmitReview}; the persona's credential is resolved server-side.
+ *
+ * The author persona comes from the **request**, not from this handler: a Review
+ * comments as the reviewer, while a Respond-to-review reply is the implementer
+ * answering that review, and inferring `reviewer` here had the reviewer answering
+ * itself (issue #444). The schema defaults the field to `reviewer`, so a client
+ * that sends no persona behaves exactly as before. `implementer` resolves through
+ * the same `getPersonaToken` seam to this host's `SWARM_OPERATOR_GH_TOKEN` — which
+ * the router already holds for loop prevention — and, like the reviewer PAT, that
+ * credential is resolved inside this process and never leaves it.
  */
 export async function handlePostComment(
 	deps: WorkerDeliveryDeps,
@@ -251,7 +264,7 @@ export async function handlePostComment(
 	const authed = await authenticateDelivery(deps, credential, request.projectId);
 	if ('status' in authed) return authed;
 
-	const delivery = await deps.buildScmDelivery(authed.project, 'reviewer');
+	const delivery = await deps.buildScmDelivery(authed.project, request.persona);
 	const commentId = await delivery.postComment({
 		prNumber: request.prNumber,
 		body: request.body,

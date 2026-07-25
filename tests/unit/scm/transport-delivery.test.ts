@@ -33,6 +33,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
 		});
@@ -66,6 +67,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
 		});
@@ -78,6 +80,32 @@ describe('createTransportScmDeliveryProvider', () => {
 
 		expect(commentId).toBe(88);
 		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pr-comment');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			prNumber: 42,
+			body: 'Addressed',
+			deliveryId: 'delivery-2',
+			persona: 'reviewer',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it('carries the implementer persona on the wire so a review reply is not the reviewer answering itself', async () => {
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { commentId: 99 }));
+		const provider = createTransportScmDeliveryProvider({
+			controlPlaneUrl: CONTROL_PLANE,
+			workerCredential: CREDENTIAL,
+			projectId: PROJECT_ID,
+			persona: 'implementer',
+			localDelegate: makeLocalDelegate(),
+			fetchImpl,
+		});
+
+		await provider.postComment({ prNumber: 42, body: 'Fixed', deliveryId: 'delivery-3' });
+
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+			persona: 'implementer',
+		});
 	});
 
 	it('tolerates a trailing slash on the control-plane URL', async () => {
@@ -86,6 +114,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: 'https://swarm.example/',
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
 		});
@@ -99,6 +128,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
 		});
@@ -113,6 +143,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
 		});
@@ -128,6 +159,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			persona: 'reviewer',
 			localDelegate: local,
 			fetchImpl,
 		});

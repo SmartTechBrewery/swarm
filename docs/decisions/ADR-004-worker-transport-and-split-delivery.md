@@ -99,6 +99,7 @@ to the control plane.**
 | push branch (`delivery.pushBranch`, `scm-integration.ts:300-319`) | yes | worker | **operator's own token** |
 | create PR (`delivery.createPullRequest`, `implementation.ts:495`) | no (metadata) | **worker** | **operator's own (implementer)** — kept worker-side for attribution |
 | submit review + review comments (`delivery.submitReview`, `review.ts:470`) | no | **control plane** | **per-project reviewer PAT** |
+| respond-to-review reply (`delivery.postComment`, `respond-to-review.ts`) | no | **control plane** (in control-plane delivery mode) | **implementer** — the persona named on the frame, not the reviewer being answered (issue #444) |
 | move board card / comment on issue (PM provider) | no | **control plane** | per-project PM credential |
 
 Consequences of the rule:
@@ -116,6 +117,17 @@ Consequences of the rule:
   GitHub using that PAT. The review therefore still appears on the PR as a real
   GitHub review — which keeps the existing `pull_request_review`-driven
   respond-to-review trigger (PROJECT.md §5.4) working unchanged.
+- **A moved comment is authored by the persona the phase asked for, not by
+  whichever credential the server happens to hold** (issue #444). The reviewer PAT
+  is only the *right* identity for a Review; a Respond-to-review reply is the
+  implementer answering that review, so `POST /worker/delivery/pr-comment` carries
+  the requesting `persona` (defaulting to `reviewer`, which is what keeps an older
+  client unchanged) and the router resolves that persona's credential server-side.
+  `POST /worker/delivery/review` needs no such field — only Review submits a
+  verdict. The implementer resolves to the router's own `SWARM_OPERATOR_GH_TOKEN`,
+  so attribution is exact under the same-host assumption that token already carries
+  (issue #396) and is the *server* operator's on a different-machine deployment —
+  the residual gap §3/§4 below own.
 - **PM board/issue writes also move server-side**, for the same reason the
   reviewer PAT does: they are metadata operations needing a project-scoped
   credential the worker should not hold, and the worker has no DB config under
@@ -178,7 +190,12 @@ than on a persona login. The reviewer identity remains distinct from the author
 > **Status: outstanding — issue #398.** Not implemented. Note the constraint §2
 > introduced: a DB-free worker cannot write the record itself, so both ends must be
 > captured by the control plane — at push (`src/router/dispatcher.ts`) and at settle
-> — and the `TaskExecutionResult` frame carries no PR identity today.
+> — and the `TaskExecutionResult` frame carries no PR identity today. What *is*
+> settled is **native comment authorship**: on every delivery path a comment is
+> written by the persona the phase requested (issue #444), so a Respond-to-review
+> reply reads as the implementer's rather than as the reviewer answering itself.
+> Recording the `(work item, phase, worker, user, PR url)` mapping below is still
+> what's missing — persona authorship never identified *which worker* produced a PR.
 
 Independent of the native GitHub authorship, the control plane records the
 `(work item, phase, worker, user, PR url)` mapping when it dispatches and when
@@ -197,8 +214,9 @@ PR/review even if the token model later changes.
 - A new server-side **delivery API** exposes exactly the metadata GitHub
   operations backed by per-project credentials; the worker calls it instead of
   holding those tokens. **Shipped** as `src/router/worker-delivery.ts`: the SCM
-  half (`submitReview`/`postComment` under the reviewer PAT →
-  `POST /worker/delivery/review` + `/pr-comment`) and the PM half
+  half (`submitReview` under the reviewer PAT → `POST /worker/delivery/review`,
+  and `postComment` under the persona its frame names, reviewer by default →
+  `POST /worker/delivery/pr-comment`) and the PM half
   (`moveWorkItem`/`addComment` under the per-project PM credential →
   `POST /worker/delivery/pm/move` + `/pm/comment`), each authenticated by the
   worker credential and gated on an active enrollment. A worker opts in with

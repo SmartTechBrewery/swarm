@@ -8,6 +8,7 @@ import {
 	HandshakeResponseSchema,
 	HeartbeatAckSchema,
 	HeartbeatSchema,
+	PostCommentDeliveryRequestSchema,
 	StreamLogSchema,
 	TaskAssignmentAckSchema,
 	TaskAssignmentSchema,
@@ -371,6 +372,35 @@ describe('transport protocol schemas', () => {
 		it('reviewAutomationOutcome matches REVIEW_AUTOMATION_OUTCOMES', () => {
 			const outcome = TaskExecutionResultSchema.shape.reviewAutomationOutcome.unwrap();
 			expect([...outcome.options].sort()).toEqual([...REVIEW_AUTOMATION_OUTCOMES].sort());
+		});
+	});
+
+	describe('PostCommentDeliveryRequestSchema', () => {
+		const valid = {
+			projectId: 'swarm',
+			prNumber: 42,
+			body: 'Addressed the review',
+			deliveryId: 'delivery-2',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		};
+
+		// The frame gained `persona` after the reviewer was found answering its own
+		// review (issue #444); the default is what keeps an existing client — one
+		// that sends no persona — on its previous behaviour without a protocol bump.
+		it('defaults an absent persona to reviewer', () => {
+			const parsed = PostCommentDeliveryRequestSchema.parse(valid);
+			expect(parsed.persona).toBe('reviewer');
+		});
+
+		it('round-trips an explicit implementer persona', () => {
+			const parsed = PostCommentDeliveryRequestSchema.parse({ ...valid, persona: 'implementer' });
+			expect(parsed.persona).toBe('implementer');
+		});
+
+		it('rejects a persona that is neither', () => {
+			expect(
+				PostCommentDeliveryRequestSchema.safeParse({ ...valid, persona: 'operator' }).success,
+			).toBe(false);
 		});
 	});
 });

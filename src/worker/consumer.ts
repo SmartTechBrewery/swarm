@@ -1115,7 +1115,9 @@ function logAgentRouting(
  * federated worker with both `SWARM_CONTROL_PLANE_URL` and
  * `SWARM_WORKER_CREDENTIAL` set — the metadata-only calls (`submitReview` /
  * `postComment`) travel up the transport to the router's server-side delivery
- * API, which performs them under the per-project reviewer PAT; the
+ * API, which performs them under the persona this phase asked for — the
+ * per-project reviewer PAT for a Review, the implementer for a Respond-to-review
+ * reply, which must not be authored by the reviewer it answers (issue #444); the
  * source-carrying / attribution ops (commit identity, find/create PR, push) stay
  * local via the in-process delegate, keeping the operator's own token
  * worker-side. Otherwise — the **local host worker**, the default — it returns
@@ -1134,6 +1136,7 @@ export async function resolveScmDelivery(
 		controlPlaneUrl,
 		workerCredential,
 		projectId: project.id,
+		persona,
 		localDelegate: await new GitHubSCMIntegration().deliveryProvider(project, persona),
 	});
 }
