@@ -241,6 +241,36 @@ describe('handlePostComment', () => {
 		});
 	});
 
+	it('posts under the persona the request names, so a review reply is authored by the implementer', async () => {
+		const postComment = vi.fn().mockResolvedValue(88);
+		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery({ postComment }));
+		const deps = makeDeps({ buildScmDelivery });
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(buildScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm' }),
+			'implementer',
+		);
+		expect(postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('falls back to the reviewer persona for a client that sends none', async () => {
+		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery());
+		const deps = makeDeps({ buildScmDelivery });
+
+		expect((await handlePostComment(deps, CREDENTIAL, commentBody())).status).toBe(200);
+		expect(buildScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm' }),
+			'reviewer',
+		);
+	});
+
 	it('enforces auth and enrollment before touching the PAT', async () => {
 		const unknown = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
 		expect((await handlePostComment(unknown, 'bogus', commentBody())).status).toBe(401);
@@ -254,6 +284,13 @@ describe('handlePostComment', () => {
 		const deps = makeDeps();
 		const result = await handlePostComment(deps, CREDENTIAL, commentBody({ body: '' }));
 		expect(result.status).toBe(400);
+	});
+
+	it('returns 400 for an unknown persona rather than guessing one', async () => {
+		const deps = makeDeps();
+		const result = await handlePostComment(deps, CREDENTIAL, commentBody({ persona: 'operator' }));
+		expect(result.status).toBe(400);
+		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
 	});
 });
 

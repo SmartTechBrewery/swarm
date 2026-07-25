@@ -306,10 +306,12 @@ const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
  * Respond-to-review deliberately stays on `operator` even though it also posts a
  * PR comment: that comment is the *implementer's* reply to the review, so it must
  * be authored by the implementer identity (the operator, as in Implementation) —
- * routing it through the reviewer-PAT composite would have the reviewer answering
- * its own review, and the author-persona routing that decides what a comment event
- * means (`getPersonaForLogin`, `../router/adapters/github.ts`) would read the
- * wrong persona off it.
+ * routing it through a composite built for the reviewer persona would have the
+ * reviewer answering its own review, and the author-persona routing that decides
+ * what a comment event means (`getPersonaForLogin`, `../router/adapters/github.ts`)
+ * would read the wrong persona off it. The composite states `persona: 'reviewer'`
+ * explicitly, so the frame carries the identity this Review write runs under
+ * rather than leaving the server to infer one (issue #444).
  */
 function resolveDbFreeDelivery(
 	phase: TaskPhase,
@@ -318,7 +320,12 @@ function resolveDbFreeDelivery(
 	projectId: string,
 ): ScmDeliveryProvider {
 	if (phase !== 'review') return operator;
-	return createTransportScmDeliveryProvider({ ...transport, projectId, localDelegate: operator });
+	return createTransportScmDeliveryProvider({
+		...transport,
+		projectId,
+		persona: 'reviewer',
+		localDelegate: operator,
+	});
 }
 
 /**
