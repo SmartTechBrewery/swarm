@@ -31,11 +31,12 @@ import { AgentRunError, agentRunError } from '../harness/agent-failure.js';
 import { createOperatorDeliveryProvider } from '../integrations/scm/github/operator-delivery.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
+import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
 import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import { createWriteOnlyTransportPmProvider } from '../pm/transport-delivery.js';
-import type { PMProvider, WorkItem } from '../pm/types.js';
+import type { PMProvider, WorkItem, WorkItemBlocker } from '../pm/types.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
 import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
 import {
@@ -139,14 +140,27 @@ export function createAssignmentRunAgent(
 }
 
 /**
+ * What {@link classifyDeferrable} reports. Beyond the shared
+ * {@link DeferrableFailure} kinds it models the dependency block (issue #438),
+ * which is not an agent or delivery failure at all: the item's prerequisites are
+ * still open, so the run waits on the control plane's token-free recheck budget
+ * rather than a retry budget. It carries the open blockers, because the control
+ * plane rebuilds the error from them.
+ */
+export type DeferrableAssignmentFailure =
+	| DeferrableFailure
+	| { kind: 'dependency'; blockers: WorkItemBlocker[] };
+
+/**
  * Classify a phase failure into the deferrable failure the control plane should
- * schedule a retry for, or `undefined` for a terminal failure — the exact rule
- * the in-process `handlePhaseFailure` applies (`../worker/consumer.ts`): a
+ * wait on, or `undefined` for a terminal failure — the exact rule the in-process
+ * `handlePhaseFailure` applies (`../worker/consumer.ts`): a dependency block, a
  * rate-limit, capacity, aborted, or stalled agent error, a genuinely-interrupted
  * timeout (non-zero/absent exit — a clean SIGTERM exit already cleaned up), or a
  * deterministic-delivery deferral.
  */
-export function classifyDeferrable(err: unknown): DeferrableFailure | undefined {
+export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | undefined {
+	if (err instanceof DependencyBlockedError) return { kind: 'dependency', blockers: err.blockers };
 	if (err instanceof DeliveryDeferredError) return { kind: 'delivery' };
 	if (err instanceof AgentRunError) {
 		const kind = err.failure.kind;
@@ -185,16 +199,21 @@ export function succeededResult(
 		verdict: result.verdict,
 		reviewOrdinal: result.reviewOrdinal,
 		reviewAutomationOutcome: result.automationOutcome,
+		// The PR an Implementation run produced, so the control plane can record the
+		// worker→PR attribution this worker may have no DB to write (ADR-004 §4,
+		// issue #398). Absent for every phase that creates no PR.
+		prUrl: result.prUrl,
 	};
 }
 
 /**
  * Build the terminal failure/deferral frame for a non-cancelled failure: a
  * deferrable failure settles `deferred` with the retry hint + resume flags a
- * `phase-deferred` outcome carries; everything else settles terminal-`failed`.
- * The cancelled-settlement (a user termination) is the caller's concern — the
- * same-host client checks Redis for it; the DB-free path has no such channel and
- * so never produces one.
+ * `phase-deferred` outcome carries; a dependency block settles `deferred` too, but
+ * reports the open prerequisites instead of a delay (issue #438); everything else
+ * settles terminal-`failed`. The cancelled-settlement (a user termination) is the
+ * caller's concern — the same-host client checks Redis for it; the DB-free path has
+ * no such channel and so never produces one.
  */
 export function deferrableOrFailedResult(
 	err: unknown,
@@ -209,6 +228,21 @@ export function deferrableOrFailedResult(
 		taskId: assignment.taskId,
 	};
 	const failure = classifyDeferrable(err);
+	if (failure?.kind === 'dependency') {
+		return {
+			...terminal,
+			status: 'deferred',
+			// The recheck cadence and budget live with the dispatch record on the control
+			// plane (`deferDependencyBlock`, `../worker/consumer.ts`), so the worker reports
+			// the block — and the blockers its message must name — rather than a delay of
+			// its own. 0 mirrors the synthetic deferral frame in `../router/dispatch-results.ts`.
+			retryDelayMs: 0,
+			resumable: false,
+			failureKind: 'dependency',
+			reason: error,
+			blockers: failure.blockers,
+		};
+	}
 	if (failure) {
 		return {
 			...terminal,

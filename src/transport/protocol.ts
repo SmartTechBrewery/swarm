@@ -257,6 +257,28 @@ export const StreamLogSchema = z.object({
 export type StreamLog = z.infer<typeof StreamLogSchema>;
 
 /**
+ * A still-open prerequisite as it crosses the transport — the provider-neutral
+ * `WorkItemBlocker` shape (`../pm/types.ts`). Shared by the two frames that carry
+ * blockers: the `POST /worker/delivery/pm/blockers` response the dependency gate
+ * reads ({@link ListBlockersDeliveryResponseSchema}), and the `dependency` deferral
+ * a blocked run settles with (issue #438). No provider-specific field crosses the
+ * wire (ai/RULES.md §2).
+ */
+export const WorkItemBlockerFrameSchema = z.object({
+	id: z.string().min(1).optional(),
+	reference: z.string().min(1),
+	// Exactly as permissive as `WorkItemBlocker`, which allows an empty URL (the
+	// GitHub adapter's `issue.html_url ?? ''`). A stricter wire schema would throw
+	// here, and `findOpenBlockers` swallows a throw as "no blockers" — so tightening
+	// this field could silently un-gate the very check this serves.
+	url: z.string(),
+	title: z.string(),
+	open: z.boolean(),
+	source: z.enum(['dependency', 'mention']),
+});
+export type WorkItemBlockerFrame = z.infer<typeof WorkItemBlockerFrameSchema>;
+
+/**
  * Worker→cloud coarse progress marker for an in-flight assignment — the phase
  * lifecycle transitions the control plane surfaces on the board/run while the
  * agent works, distinct from the line-level {@link StreamLogSchema}. `running`
@@ -317,7 +339,15 @@ export const TaskExecutionResultSchema = z.object({
 	retryDelayMs: z.number().int().nonnegative().optional(),
 	resumable: z.boolean().optional(),
 	resumeDelivery: z.boolean().optional(),
+	// One of the `AgentFailureKind`s, `delivery`, or `dependency` — the last being a
+	// wait on an external condition rather than a failure of the run itself.
 	failureKind: z.string().optional(),
+	// `deferred` with `failureKind: 'dependency'` — the still-**open** prerequisites
+	// gating the run (issue #438). The control plane rebuilds a
+	// `DependencyBlockedError` from these, so its bounded token-free recheck
+	// (`deferDependencyBlock`, `../worker/consumer.ts`) applies unchanged and its
+	// log/board message names the prerequisites instead of a generic reason.
+	blockers: z.array(WorkItemBlockerFrameSchema).optional(),
 	// `deferred`/`failed` — the human-readable originating reason.
 	reason: z.string().optional(),
 	// `failed` — the terminal error and whether it was a user termination.
@@ -337,6 +367,14 @@ export const TaskExecutionResultSchema = z.object({
 	verdict: z.enum(['approve', 'request-changes', 'comment']).optional(),
 	reviewOrdinal: z.number().int().positive().optional(),
 	reviewAutomationOutcome: z.enum(['manual-intervention-required']).optional(),
+	// `succeeded` — the pull request this run *produced*, reported so the control
+	// plane can record the worker→PR attribution a DB-free worker cannot write
+	// itself (ADR-004 §4, issue #398). Only a PR-producing phase (Implementation)
+	// sends it. Validated as a non-empty string rather than a URL: a terminal
+	// result frame must never fail to parse — and so lose the whole settle — over
+	// an attribution nicety. Optional and additive in both directions, so it needs
+	// no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits it.
+	prUrl: z.string().min(1).optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;
 
@@ -493,20 +531,7 @@ export type ListBlockersDeliveryRequest = z.infer<typeof ListBlockersDeliveryReq
  * dependencies. No provider-specific fields cross the wire (ai/RULES.md §2).
  */
 export const ListBlockersDeliveryResponseSchema = z.object({
-	blockers: z.array(
-		z.object({
-			id: z.string().min(1).optional(),
-			reference: z.string().min(1),
-			// Exactly as permissive as `WorkItemBlocker`, which allows an empty URL (the
-			// GitHub adapter's `issue.html_url ?? ''`). A stricter wire schema would
-			// throw here, and `findOpenBlockers` swallows a throw as "no blockers" — so
-			// tightening this field could silently un-gate the very check this serves.
-			url: z.string(),
-			title: z.string(),
-			open: z.boolean(),
-			source: z.enum(['dependency', 'mention']),
-		}),
-	),
+	blockers: z.array(WorkItemBlockerFrameSchema),
 });
 export type ListBlockersDeliveryResponse = z.infer<typeof ListBlockersDeliveryResponseSchema>;
 

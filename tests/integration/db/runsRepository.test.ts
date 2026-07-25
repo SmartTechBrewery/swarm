@@ -25,6 +25,7 @@ import {
 	hasCompletedRunForTask,
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
+	hasRunForTask,
 	listRunsFromDb,
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
@@ -34,7 +35,10 @@ import {
 	updateReviewMergeOutcome,
 } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
+import { removeWorker } from '../../../src/db/repositories/workersRepository.js';
 import { runLogs, runs } from '../../../src/db/schema/runs.js';
+import type { SwarmUser } from '../../../src/identity/schema.js';
+import type { Worker } from '../../../src/identity/worker.js';
 import { registerWorker } from '../../../src/identity/worker-service.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
 import { createMockGitHubWebhookJob } from '../../helpers/factories.js';
@@ -43,6 +47,20 @@ import { seedProject } from '../helpers/seed.js';
 
 // `runs.project_id` FKs `projects`, so every run needs a seeded project first.
 const PROJECT_ID = 'proj-runs';
+
+/** A registered worker plus the user who owns it — the attribution record's two ids. */
+async function seedWorker(label: string): Promise<{ worker: Worker; owner: SwarmUser }> {
+	const owner = await createUser({
+		identifier: `${label}@example.com`,
+		displayName: `Owner ${label}`,
+	});
+	const { worker } = await registerWorker({
+		ownerUserId: owner.id,
+		displayName: `worker-${label}`,
+		capabilities: ['claude'],
+	});
+	return { worker, owner };
+}
 
 describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integration)', () => {
 	beforeEach(async () => {
@@ -122,6 +140,52 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 		it('returns undefined for an unknown run id', async () => {
 			expect(await getRunByIdFromDb('00000000-0000-0000-0000-000000000000')).toBeUndefined();
 		});
+
+		it('records the dispatched worker and its owning user (issue #398)', async () => {
+			const { worker, owner } = await seedWorker('attributed-create');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '398',
+				phase: 'implementation',
+				workerId: worker.id,
+				workerUserId: owner.id,
+				workerFencingToken: 7,
+			});
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.workerId).toBe(worker.id);
+			expect(row?.workerUserId).toBe(owner.id);
+			// The PR half of the record is only written at settle.
+			expect(row?.producedPrUrl).toBeNull();
+		});
+
+		it('leaves the attribution user null for an unfederated run that records no worker', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '398-local', phase: 'review' });
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.workerId).toBeNull();
+			expect(row?.workerUserId).toBeNull();
+		});
+
+		it('keeps the attribution user when the worker row is removed (issue #398)', async () => {
+			// The reason the user id is denormalized onto the row rather than joined
+			// through `workers.owner_user_id`: `worker_id` is ON DELETE SET NULL, so
+			// removing the worker would otherwise erase the whole attribution.
+			const { worker, owner } = await seedWorker('attributed-removed');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '398-removed',
+				phase: 'implementation',
+				workerId: worker.id,
+				workerUserId: owner.id,
+			});
+
+			expect(await removeWorker(worker.id)).toBe(true);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.workerId).toBeNull();
+			expect(row?.workerUserId).toBe(owner.id);
+		});
 	});
 
 	describe('completeRun', () => {
@@ -144,6 +208,25 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(row?.durationMs).toBe(9876);
 			expect(row?.completedAt).toBeInstanceOf(Date);
 			expect(row?.nextRetryAt).toBeNull();
+		});
+
+		it('persists the PR a run produced, and leaves it as-is when a later settle omits it (issue #398)', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '1b', phase: 'implementation' });
+
+			await completeRun(id, {
+				status: 'completed',
+				producedPrUrl: 'https://github.com/jkwiecien/runs-repo/pull/7',
+			});
+			expect((await getRunByIdFromDb(id))?.producedPrUrl).toBe(
+				'https://github.com/jkwiecien/runs-repo/pull/7',
+			);
+
+			// A settle that reports no produced PR must not blank the recorded one —
+			// the "omitted fields are left as-is" contract.
+			await completeRun(id, { status: 'completed' });
+			expect((await getRunByIdFromDb(id))?.producedPrUrl).toBe(
+				'https://github.com/jkwiecien/runs-repo/pull/7',
+			);
 		});
 
 		it('records a failed run with its error message', async () => {
@@ -421,6 +504,78 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			const row = await getRunByIdFromDb(id);
 			expect(row?.cancellation).toBeNull();
+		});
+
+		it('re-binds the worker and its owning user for the fresh attempt (issue #398)', async () => {
+			const first = await seedWorker('attributed-reset-a');
+			const second = await seedWorker('attributed-reset-b');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '9g',
+				phase: 'implementation',
+				workerId: first.worker.id,
+				workerUserId: first.owner.id,
+			});
+			await completeRun(id, { status: 'failed', error: 'boom' });
+
+			// A retry can land on a different worker, so the user is re-bound with it.
+			await resetRunToRunning(
+				id,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				second.worker.id,
+				11,
+				second.owner.id,
+			);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.workerId).toBe(second.worker.id);
+			expect(row?.workerUserId).toBe(second.owner.id);
+			expect(row?.workerFencingToken).toBe(11);
+		});
+
+		it('clears the worker binding when a retry resolves no worker (issue #398)', async () => {
+			const { worker, owner } = await seedWorker('attributed-reset-local');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '9h',
+				phase: 'implementation',
+				workerId: worker.id,
+				workerUserId: owner.id,
+				workerFencingToken: 7,
+			});
+			await completeRun(id, { status: 'failed', error: 'boom' });
+
+			await resetRunToRunning(id);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.workerId).toBeNull();
+			expect(row?.workerUserId).toBeNull();
+			expect(row?.workerFencingToken).toBeNull();
+		});
+
+		it('keeps a produced PR url across a retry (issue #398)', async () => {
+			// Unlike the review columns, the produced PR is a real external artifact
+			// that outlives the attempt: a resumed Implementation retry re-reports the
+			// same URL, so keeping it can never show something false, whereas clearing
+			// would erase the record of a PR that exists.
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '9i', phase: 'implementation' });
+			await completeRun(id, {
+				status: 'deferred',
+				producedPrUrl: 'https://github.com/jkwiecien/runs-repo/pull/7',
+			});
+
+			await resetRunToRunning(id);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.status).toBe('running');
+			expect(row?.producedPrUrl).toBe('https://github.com/jkwiecien/runs-repo/pull/7');
 		});
 
 		it('records the effective engine for the fresh attempt when one is passed', async () => {
@@ -830,6 +985,45 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createRun({ projectId: PROJECT_ID, taskId: '53', phase: 'planning' });
 
 			expect(await hasCompletedRunForTask(PROJECT_ID, '53', 'planning')).toBe(false);
+		});
+	});
+
+	describe('hasRunForTask (issue #397)', () => {
+		it('is true for a still-running row — the Review trigger ownership gate case', async () => {
+			// Implementation opens its PR from inside its own running process, so the
+			// gate must see the row before it settles.
+			await createRun({ projectId: PROJECT_ID, taskId: '60', phase: 'implementation' });
+
+			expect(await hasRunForTask(PROJECT_ID, '60', 'implementation')).toBe(true);
+			expect(await hasCompletedRunForTask(PROJECT_ID, '60', 'implementation')).toBe(false);
+		});
+
+		it('is true for a failed row (status-agnostic)', async () => {
+			const failed = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '61',
+				phase: 'implementation',
+			});
+			await completeRun(failed, { status: 'failed', error: 'boom' });
+
+			expect(await hasRunForTask(PROJECT_ID, '61', 'implementation')).toBe(true);
+		});
+
+		it('is scoped to the project, task, and phase', async () => {
+			await seedProject({ id: 'proj-other-runs', repo: 'jkwiecien/other-runs-repo' });
+			await createRun({ projectId: PROJECT_ID, taskId: '62', phase: 'implementation' });
+
+			expect(await hasRunForTask('proj-other-runs', '62', 'implementation')).toBe(false);
+			expect(await hasRunForTask(PROJECT_ID, '63', 'implementation')).toBe(false);
+			expect(await hasRunForTask(PROJECT_ID, '62', 'review')).toBe(false);
+		});
+
+		it('does not require a worker id (NULL on every unfederated project)', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '64', phase: 'implementation' });
+			const row = await getRunByIdFromDb(id);
+
+			expect(row?.workerId).toBeNull();
+			expect(await hasRunForTask(PROJECT_ID, '64', 'implementation')).toBe(true);
 		});
 	});
 
