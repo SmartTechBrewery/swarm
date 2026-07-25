@@ -43,7 +43,7 @@ const app = createWebhookApp();
 // same `app` whose `injectWebSocket` upgrades the server created by `serve`.
 const { upgradeWebSocket, injectWebSocket } = createNodeWebSocket({ app });
 registerWorkerTransport(app, upgradeWebSocket);
-// The router also hosts the server-side SCM metadata delivery API (ADR-002 §2):
+// The router also hosts the server-side SCM metadata delivery API (ADR-004 §2):
 // a federated worker POSTs review/comment content here and the router performs
 // the GitHub write under the per-project reviewer PAT, which never leaves it.
 registerWorkerDelivery(app);

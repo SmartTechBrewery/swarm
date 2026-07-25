@@ -1,5 +1,5 @@
 /**
- * Worker-side transport-backed PM **write** delegate (ADR-002 §2, the Phase 2/2
+ * Worker-side transport-backed PM **write** delegate (ADR-004 §2, the Phase 2/2
  * counterpart of `../scm/transport-delivery.ts`). A federated worker (one that
  * does not hold the per-project PM credential) uses this provider so the two
  * metadata-only PM board writes — `moveWorkItem`, `addComment` — travel up the

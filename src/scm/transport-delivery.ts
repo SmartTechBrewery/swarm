@@ -1,5 +1,5 @@
 /**
- * Worker-side transport-backed {@link ScmDeliveryProvider} (ADR-002 §2). A
+ * Worker-side transport-backed {@link ScmDeliveryProvider} (ADR-004 §2). A
  * federated worker (one that does not hold the per-project reviewer PAT) uses
  * this provider so the two metadata-only SCM delivery calls — `submitReview`,
  * `postComment` — travel up the transport to the control-plane delivery API
