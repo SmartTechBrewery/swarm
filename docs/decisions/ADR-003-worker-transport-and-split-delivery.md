@@ -148,10 +148,15 @@ server-side store) it needs:
 
    Both phases join the supported set, so a DB-free worker runs four of the six.
    Then #418 below takes it to five.
-   Not carried over: the bounded dependency-recheck deferral, which every transport
-   path lacks (`classifyDeferrable` models no dependency failure), so a blocked
-   Implementation run settles terminally with the "must be done first" message
-   instead of re-checking — safe, but tracked as its own follow-up.
+   The bounded dependency-recheck deferral is carried over too (**#438**), on the
+   same report-and-rebuild split: `classifyDeferrable` maps a `DependencyBlockedError`
+   to a `deferred` frame with `failureKind: 'dependency'` plus the still-open
+   blockers, and the control plane's result adaptation
+   (`adaptResultToPhaseRun`, `src/router/dispatcher.ts`) rebuilds the error from
+   them — so the budget stays where the dispatch record is
+   (`job.dependencyRecheckAttempt`) and the terminal "must be done first" board
+   message is the in-process one, unchanged. Both transport executors inherit it,
+   since both frame their failures through `deferrableOrFailedResult`.
 7. **#418** — **`respond-to-review`** joins them, on the same two seams (expanding
    the delivery API surface to ten routes; see ADR-004 §2):
    - **A PM read.** The phase resolves its board card before the best-effort

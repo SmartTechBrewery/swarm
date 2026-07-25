@@ -195,13 +195,14 @@ async function handleScmEvent(
 	});
 	if (authFailure) return authFailure;
 
-	// Loop prevention: drop SWARM'\''s own comment events so a persona never
+	// Loop prevention: drop comment events SWARM generated — recognized by the
+	// comment's own SWARM marker, not by its author (issue #443) — so SWARM never
 	// reacts to its own ack/reply. PR/review lifecycle events flow through even
-	// when a persona produced them (the *other* persona must act) — that
-	// cross-persona routing is the adapter'\''s job, not this gate'\''s.
+	// when a persona produced them (the *other* persona must act); that
+	// cross-persona routing is the adapter's job, not this gate's.
 	if (await deps.adapter.isSelfAuthored(event, project)) {
 		return c.json(
-			{ ok: true, ignored: true, reason: 'self-authored comment (loop prevention)' },
+			{ ok: true, ignored: true, reason: 'swarm-generated comment (loop prevention)' },
 			202,
 		);
 	}

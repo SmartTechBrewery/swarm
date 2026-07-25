@@ -985,17 +985,32 @@ interface GitHubReferencesProps {
 	project?: { name: string; repo: string } | null;
 }
 
-function GitHubReferences({ run, project }: GitHubReferencesProps) {
+export function GitHubReferences({ run, project }: GitHubReferencesProps) {
 	const hasWorkItem = !!run.workItemId;
 	const hasPR = !!run.prNumber;
 	const workItemRef = parseWorkItemRef(run.workItemUrl);
 
-	if (!hasWorkItem && !hasPR) {
+	if (!hasWorkItem && !hasPR && !run.producedPrUrl) {
 		return <span className="text-zinc-500 font-mono">—</span>;
 	}
 
 	return (
 		<div className="flex flex-col gap-1.5">
+			{/*
+			 * The PR this run *opened* (issue #446), labelled apart from the `PR #n`
+			 * below — which is the PR a Review / Respond-to-review run acted on.
+			 */}
+			{run.producedPrUrl && (
+				<a
+					href={run.producedPrUrl}
+					target="_blank"
+					rel="noopener noreferrer"
+					className="inline-flex items-center gap-1 text-violet-400 hover:text-violet-300 font-mono hover:underline w-fit"
+				>
+					PR opened by this run
+					<ExternalLink className="h-3 w-3" />
+				</a>
+			)}
 			{hasPR && run.prTitle && (
 				<span className="text-zinc-300" title={run.prTitle}>
 					{run.prTitle}
@@ -1034,6 +1049,51 @@ function GitHubReferences({ run, project }: GitHubReferencesProps) {
 				<span className="text-zinc-400 font-mono">Issue: #{run.taskId}</span>
 			) : null}
 		</div>
+	);
+}
+
+/**
+ * The two "Execution Environment" cells naming who ran this phase (ADR-004 §4,
+ * issue #446): the worker machine and the SWARM user who owns it, resolved
+ * server-side into `run.attribution`.
+ *
+ * A run with no recorded worker — unfederated / single-user, and every row
+ * predating the columns — renders the same neutral `—` the other optional fields
+ * use. A recorded worker whose row no longer resolves falls back to its id in the
+ * muted mono style used for the project id, so the record is never silently lost,
+ * but a raw id is never shown *instead* of a name that exists.
+ */
+export function RunAttributionFields({ run }: { run: RunRow }) {
+	const attribution = run.attribution ?? null;
+
+	return (
+		<>
+			<div>
+				<span className="block text-xs font-medium text-zinc-400">Worker</span>
+				<span className="text-sm text-zinc-200 mt-1 block">
+					{attribution?.workerName ? (
+						attribution.workerName
+					) : attribution?.workerId ? (
+						<span className="text-xs text-zinc-500 font-mono">{attribution.workerId}</span>
+					) : (
+						<span className="font-mono">—</span>
+					)}
+				</span>
+			</div>
+
+			<div>
+				<span className="block text-xs font-medium text-zinc-400">Worker owner</span>
+				<span className="text-sm text-zinc-200 mt-1 block">
+					{attribution?.userDisplayName ? (
+						attribution.userDisplayName
+					) : attribution?.userId ? (
+						<span className="text-xs text-zinc-500 font-mono">{attribution.userId}</span>
+					) : (
+						<span className="font-mono">—</span>
+					)}
+				</span>
+			</div>
+		</>
 	);
 }
 
@@ -1175,6 +1235,8 @@ function RunOverview({ run, project }: RunOverviewProps) {
 							{run.reasoning ? capitalizeLevel(run.reasoning) : 'Default'}
 						</span>
 					</div>
+
+					<RunAttributionFields run={run} />
 
 					<div>
 						<span className="block text-xs font-medium text-zinc-400">Exit Code</span>

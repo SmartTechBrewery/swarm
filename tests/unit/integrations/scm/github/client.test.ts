@@ -34,7 +34,6 @@ vi.mock('@octokit/rest', () => ({
 import {
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
-	getPullRequestAuthorLogin,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getScopedClient,
@@ -149,32 +148,6 @@ describe('github client', () => {
 				getCheckSuiteStatus('jkwiecien', 'swarm', 'deadbeef'),
 			);
 			expect(result).toEqual({ totalCount: 0, checkRuns: [] });
-		});
-	});
-
-	describe('getPullRequestAuthorLogin', () => {
-		it('returns the login that opened the PR', async () => {
-			pullsGet.mockResolvedValue({ data: { user: { login: 'swarm-impl' } } });
-			const login = await withGitHubToken('tok', () =>
-				getPullRequestAuthorLogin('jkwiecien', 'swarm', 42),
-			);
-			expect(login).toBe('swarm-impl');
-			expect(pullsGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm', pull_number: 42 });
-		});
-
-		it('returns null when the PR carries no author (e.g. deleted account)', async () => {
-			pullsGet.mockResolvedValue({ data: { user: null } });
-			const login = await withGitHubToken('tok', () =>
-				getPullRequestAuthorLogin('jkwiecien', 'swarm', 7),
-			);
-			expect(login).toBeNull();
-		});
-
-		it('propagates an API failure so the caller can degrade', async () => {
-			pullsGet.mockRejectedValue(new Error('502 Bad Gateway'));
-			await expect(
-				withGitHubToken('tok', () => getPullRequestAuthorLogin('jkwiecien', 'swarm', 9)),
-			).rejects.toThrow(/502/);
 		});
 	});
 
