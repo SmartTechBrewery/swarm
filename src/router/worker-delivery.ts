@@ -203,11 +203,24 @@ async function resolvePersonaDelivery(
 	try {
 		return await deps.buildScmDelivery(project, persona);
 	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const isIdentityUnresolved = message.toLowerCase().includes('identity');
+
+		if (isIdentityUnresolved) {
+			logger.error('worker-delivery: persona identity unresolved', {
+				route,
+				projectId: project.id,
+				persona,
+				error: message,
+			});
+			return { status: 503, json: { reason: 'persona identity unresolved', persona } };
+		}
+
 		logger.error('worker-delivery: persona credential unavailable', {
 			route,
 			projectId: project.id,
 			persona,
-			error: error instanceof Error ? error.message : String(error),
+			error: message,
 		});
 		return { status: 503, json: { reason: 'persona credential unavailable', persona } };
 	}

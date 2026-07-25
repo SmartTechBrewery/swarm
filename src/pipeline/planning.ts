@@ -534,7 +534,7 @@ export function preplanCommentBody(
 		`## 🗺️ Preplan — Phase ${phaseNumber} of ${totalPhases}`,
 		'',
 		"This is the complete plan SWARM prepared for **this** task during the parent task's",
-		'Planning run. The comment below says where this task currently stands and what to do next.',
+		'Planning run. A separate comment on this issue reports where this task stands and what to do next.',
 		'',
 		contract.plan.trim(),
 		'',
@@ -802,8 +802,11 @@ async function applySplit(
  *   plan, and `shouldSkipPreplanned` (`src/triggers/handlers/pm-status.ts`) then
  *   suppresses the Planning dispatch when someone moves the card to Planning. No
  *   agent is ever spent on it — but nothing applies `PLANNED_LABEL` later either,
- *   so the card stays unlabeled until an operator forces a fallback run by adding
- *   `swarm:replan` or removing {@link SPLIT_CHILD_LABEL}, which does spend an agent.
+ *   so the card stays unlabeled until an operator forces a fallback run by getting
+ *   the card into Planning and invalidating the preplan (adding `swarm:replan` or
+ *   removing {@link SPLIT_CHILD_LABEL}); either order works, but a label change alone
+ *   does nothing while the card is in Backlog, because `preplan-invalidated` only
+ *   considers cards already in Planning.
  *
  * Best-effort, exactly like {@link linkBlockedBy}: a failure is logged and
  * swallowed so a refused label can never abort the split mid-loop (a retry would

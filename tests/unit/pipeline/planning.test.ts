@@ -1326,6 +1326,25 @@ describe('splitChildCommentBody', () => {
 			),
 		).toBe(true);
 	});
+
+	it('includes move-to-ToDo instruction and swarm:replan hint when prepared, and Backlog fallback when unprepared', () => {
+		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
+		const preparedBody = splitChildCommentBody(parent, [], 2, 3, {
+			preplanPublished: true,
+			prepared: true,
+		});
+		expect(preparedBody).toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(preparedBody).toContain('swarm:replan');
+		expect(preparedBody).not.toContain('remains in **Backlog**');
+
+		const unpreparedBody = splitChildCommentBody(parent, [parent], 2, 3, {
+			preplanPublished: false,
+			prepared: false,
+		});
+		expect(unpreparedBody).not.toMatch(/move (the item|it) to \*\*ToDo\*\*/);
+		expect(unpreparedBody).not.toContain('swarm:replan');
+		expect(unpreparedBody).toContain('remains in **Backlog**');
+	});
 });
 
 describe('preplanCommentBody', () => {
@@ -1343,6 +1362,10 @@ describe('preplanCommentBody', () => {
 		const body = preplanCommentBody(contract, 3, 4);
 		expect(body).toContain('## 🗺️ Preplan — Phase 3 of 4');
 		expect(body).toContain('# UI plan\n\n1. Build it.');
+		expect(body).toContain(
+			'A separate comment on this issue reports where this task stands and what to do next.',
+		);
+		expect(body).not.toContain('comment below');
 	});
 
 	it('gives no lifecycle instruction — it is composed before preparation is known to succeed', () => {

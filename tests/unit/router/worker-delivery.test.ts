@@ -220,7 +220,7 @@ describe('handleSubmitReview', () => {
 		expect(deps.resolveWorkerByCredential).not.toHaveBeenCalled();
 	});
 
-	it('answers 503 with a reason when the reviewer PAT cannot be resolved', async () => {
+	it('answers 503 with persona credential unavailable when the reviewer PAT is missing', async () => {
 		const deps = makeDeps({
 			buildScmDelivery: vi
 				.fn()
@@ -231,6 +231,20 @@ describe('handleSubmitReview', () => {
 
 		expect(result.status).toBe(503);
 		expect(result.json).toEqual({ reason: 'persona credential unavailable', persona: 'reviewer' });
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+	});
+
+	it('answers 503 with persona identity unresolved when buildScmDelivery fails with a non-credential error', async () => {
+		const deps = makeDeps({
+			buildScmDelivery: vi
+				.fn()
+				.mockRejectedValue(new Error(`Could not resolve GitHub identity for reviewer persona: ${RESOLVED_PAT}`)),
+		});
+
+		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody());
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({ reason: 'persona identity unresolved', persona: 'reviewer' });
 		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
 	});
 });

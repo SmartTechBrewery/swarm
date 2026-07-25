@@ -21,7 +21,11 @@
 
 import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
-import { dedupeBlockers, findDependencyReferences } from '../../../pm/dependencies.js';
+import {
+	dedupeBlockers,
+	dependencyProse,
+	findDependencyReferences,
+} from '../../../pm/dependencies.js';
 import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
@@ -38,7 +42,6 @@ import type {
 	WorkItemBlocker,
 	WorkItemLabel,
 } from '../../../pm/types.js';
-import { isSwarmGeneratedBody } from '../../../scm/swarm-origin.js';
 import { getScopedClient } from '../../scm/github/client.js';
 import { GitHubSCMIntegration } from '../../scm/github/scm-integration.js';
 
@@ -867,8 +870,10 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			issue_number: issueNumber,
 			per_page: 100,
 		});
-		const humanComments = comments.filter((c) => !isSwarmGeneratedBody(c.body ?? undefined));
-		const prose = [description, ...humanComments.map((c) => c.body ?? '')].join('\n');
+		const prose = dependencyProse(
+			description,
+			comments.map((c) => c.body ?? undefined),
+		);
 		const refs = findDependencyReferences(prose).filter((n) => n !== String(issueNumber));
 		const resolved = await Promise.all(
 			refs.map(async (ref): Promise<WorkItemBlocker | undefined> => {
