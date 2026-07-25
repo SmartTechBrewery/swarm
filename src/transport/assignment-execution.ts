@@ -185,6 +185,10 @@ export function succeededResult(
 		verdict: result.verdict,
 		reviewOrdinal: result.reviewOrdinal,
 		reviewAutomationOutcome: result.automationOutcome,
+		// The PR an Implementation run produced, so the control plane can record the
+		// worker→PR attribution this worker may have no DB to write (ADR-004 §4,
+		// issue #398). Absent for every phase that creates no PR.
+		prUrl: result.prUrl,
 	};
 }
 

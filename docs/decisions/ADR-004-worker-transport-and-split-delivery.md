@@ -1,6 +1,6 @@
 # ADR-004: Worker↔control-plane transport and split GitHub delivery
 
-- **Status:** Accepted — §1 and §2 implemented, §3 and §4 outstanding (see below)
+- **Status:** Accepted — §1, §2, and §4's attribution record implemented; §3 and §4's dashboard surfacing outstanding (see below)
 - **Date:** 2026-07-24 (renumbered 2026-07-25)
 - **Decision owners:** SWARM maintainers
 - **Builds on:** [ADR-001](./ADR-001-federated-workers-and-project-access.md)
@@ -175,15 +175,31 @@ than on a persona login. The reviewer identity remains distinct from the author
 
 ### 4. Record worker→PR attribution in the data model
 
-> **Status: outstanding — issue #398.** Not implemented. Note the constraint §2
-> introduced: a DB-free worker cannot write the record itself, so both ends must be
-> captured by the control plane — at push (`src/router/dispatcher.ts`) and at settle
-> — and the `TaskExecutionResult` frame carries no PR identity today.
+> **Status: the record is implemented (issue #398, phase 1/2); surfacing it in the
+> dashboard is the remaining step.** The mapping lives on the existing `runs` row:
+> `work_item_id` / `phase` / `worker_id` / **`worker_user_id`** (new) /
+> **`produced_pr_url`** (new). Both ends are captured by the control plane, as the
+> §2 constraint requires — a DB-free worker cannot write the record itself: the
+> worker + its owning user (`DispatchSelection.ownerUserId`) are written at
+> dispatch through the row's normal lifecycle (`createRun` / `resetRunToRunning`),
+> and the produced PR at settle (`completeRun`). To carry the settle half back from
+> a remote worker, the `TaskExecutionResult` frame gained an optional `prUrl`
+> (`src/transport/protocol.ts`, emitted by `succeededResult` and mapped back by
+> `adaptResultToPhaseRun`) — optional and additive, so no protocol-version bump and
+> mixed-version workers stay compatible. `worker_user_id` is denormalized rather
+> than joined through `workers.owner_user_id` so the attribution survives the worker
+> row being removed (`worker_id` is `ON DELETE SET NULL`); `produced_pr_url` is
+> deliberately not cleared on a retry, since the PR outlives the attempt. Both
+> columns are nullable: an unfederated / single-user run records no worker at all,
+> and only a PR-producing phase (Implementation) reports a PR.
 
 Independent of the native GitHub authorship, the control plane records the
 `(work item, phase, worker, user, PR url)` mapping when it dispatches and when
 delivery reports back, so the dashboard can show which worker produced a given
-PR/review even if the token model later changes.
+PR/review even if the token model later changes. A produced **review** needs no
+column of its own: its identity is already durable in `review_verdicts`, and the
+Review run row carries `pr_number` + `review_verdict` + `review_ordinal`, so the
+worker/user columns complete that half of the mapping too.
 
 ## Consequences
 

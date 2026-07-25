@@ -16,6 +16,7 @@ import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import type { FailureDiagnosis } from '../../worker/failure-diagnosis.js';
 import { projects } from './projects.js';
+import { users } from './users.js';
 import { workers } from './workers.js';
 
 export const runs = pgTable(
@@ -37,9 +38,30 @@ export const runs = pgTable(
 		 * pre-existing rows have none.
 		 */
 		prTitle: text('pr_title'),
+		/**
+		 * The pull request this run *produced*, as its provider-neutral URL — the PR
+		 * end of the worker→PR attribution record (ADR-004 §4, issue #398). Distinct
+		 * from `prNumber`, which is the PR a PR-*driven* run acted on: only a phase
+		 * that creates a PR (Implementation) sets this, reported in its phase result
+		 * and persisted at settle. Nullable for every other phase and every
+		 * pre-existing row. Deliberately *not* cleared on a retry
+		 * ({@link resetRunToRunning}): the PR is a real external artifact that
+		 * outlives the attempt.
+		 */
+		producedPrUrl: text('produced_pr_url'),
 		phase: text('phase').notNull(),
 		/** Registered worker that was authenticated and capacity-claimed for this attempt. */
 		workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
+		/**
+		 * The SWARM user who owns the worker this attempt was dispatched to — the
+		 * "whose worker produced this?" half of the attribution record (ADR-004 §4,
+		 * issue #398), taken from `DispatchSelection.ownerUserId`. Stored rather than
+		 * joined through `workers.owner_user_id` so the attribution survives the
+		 * worker row being removed (`worker_id` is `ON DELETE SET NULL`). Nullable:
+		 * an unfederated / single-user run resolves no selection and records no
+		 * worker at all, as does every pre-existing row.
+		 */
+		workerUserId: uuid('worker_user_id').references(() => users.id, { onDelete: 'set null' }),
 		/** Session fencing token used to bind this attempt to that worker host. */
 		workerFencingToken: bigint('worker_fencing_token', { mode: 'number' }),
 		engine: text('engine'),

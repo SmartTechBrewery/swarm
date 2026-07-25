@@ -202,6 +202,24 @@ describe('transport protocol schemas', () => {
 			expect(WorkerStreamMessageSchema.parse(frame).type).toBe('task-execution-result');
 		});
 
+		it('round-trips a succeeded result carrying the produced PR url (issue #398)', () => {
+			const frame = {
+				type: 'task-execution-result' as const,
+				dispatchId: DISPATCH_ID,
+				runId: RUN_ID,
+				status: 'succeeded' as const,
+				phase: 'implementation' as const,
+				taskId: '17',
+				exitCode: 0,
+				prUrl: 'https://github.com/o/r/pull/7',
+			};
+			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
+			// The field is optional, so an older worker's frame — which omits it — still
+			// parses: no protocol-version bump was needed.
+			const { prUrl, ...older } = frame;
+			expect(TaskExecutionResultSchema.parse(older)).toEqual(older);
+		});
+
 		it('round-trips a deferred task-execution-result carrying the retry hint', () => {
 			const frame = {
 				type: 'task-execution-result' as const,
