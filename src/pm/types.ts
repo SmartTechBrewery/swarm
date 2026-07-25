@@ -249,6 +249,30 @@ export interface PMProvider {
 	listWorkItems(filter?: ListWorkItemsFilter): Promise<WorkItem[]>;
 
 	/**
+	 * Find the one board item whose backing Issue/PR `url` **ends with**
+	 * `urlSuffix` (e.g. `/issues/100`), or `undefined` when no card wraps it.
+	 *
+	 * A soft miss, unlike {@link getWorkItem}: the caller knows the card only by
+	 * its backing artifact — Respond-to-review resolves the card for the issue its
+	 * PR branch names — and "that issue isn't on the board" is an ordinary answer,
+	 * not bad input.
+	 *
+	 * Provider-agnostic by construction: it matches on `url`, the generic field
+	 * every provider populates (ai/RULES.md §2), so no caller pattern-matches a
+	 * GitHub URL shape itself. A *suffix* rather than a whole URL because the
+	 * caller knows the backing artifact's tail, not the host and owner/repo path a
+	 * provider's URLs carry. A suffix beginning at a path separator can't
+	 * false-match a longer number (`/issues/100` vs `/issues/1001`).
+	 *
+	 * Widening the interface rather than leaving every caller to `listWorkItems()`
+	 * and filter (ai/RULES.md §2) keeps the read narrow where that matters: a
+	 * federated worker resolves the card through the control plane
+	 * (`src/pm/transport-delivery.ts`), and proxying a whole board to find one card
+	 * would be the heavy alternative.
+	 */
+	findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined>;
+
+	/**
 	 * Move a work item to a new pipeline status. `status` is a canonical SWARM
 	 * pipeline key (e.g. `inProgress`), which the adapter resolves through the
 	 * config's `statusOptions` map to a `SingleSelectOptionId` and writes to the

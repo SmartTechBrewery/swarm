@@ -174,22 +174,110 @@ describe('runAssignmentDbFree', () => {
 		);
 	});
 
-	it('still gates respond-to-review out — it needs a PM read no DB-free seam serves yet', async () => {
+	it('runs respond-to-review with its card lookup, board move and follow-up on the delivery API', async () => {
 		const sink = recordingSink();
-		const runPhase = vi.fn();
+		const card = {
+			id: 'ITEM_17',
+			title: 'Example',
+			description: 'body',
+			url: 'https://github.com/jkwiecien/swarm/issues/17',
+			labels: [],
+			assignees: [],
+		};
+		const fetchImpl = vi.fn<FetchLike>().mockImplementation(async (url) => {
+			if (url.endsWith('/pm/find-item')) return jsonResponse(200, { item: card });
+			return jsonResponse(200, {});
+		});
+		const operator = stubDelivery();
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			// What the real phase does: resolve the card, report In progress, push the
+			// fix + reply as the implementer, schedule the follow-up Review, report In
+			// review.
+			const item = await inputs.pm?.findWorkItemByUrlSuffix('/issues/17');
+			await inputs.pm?.moveWorkItem(item?.id as string, 'inProgress');
+			await inputs.delivery?.pushBranch('/tmp/wt', 'issue-17', 'fixsha');
+			await inputs.delivery?.postComment({ prNumber: 99, body: 'Fixed', deliveryId: 'd1' });
+			await inputs.scheduleFollowUpReview?.({
+				project: inputs.project,
+				prNumber: '99',
+				prBranch: 'issue-17',
+				headSha: 'fixsha',
+			});
+			await inputs.pm?.moveWorkItem(item?.id as string, 'inReview');
+			return { agent: agentResult(), movedTo: 'inReview' as const };
+		});
+
 		await runAssignmentDbFree(
 			ciAssignment({
 				phase: 'respond-to-review',
 				pr: { prNumber: '99', prBranch: 'issue-17', headSha: 'deadbeef', reviewId: '7' },
 			}),
 			sink,
-			{ ...RUN_OPTIONS, deps: depsWith(runPhase as never) },
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => operator, fetchImpl) },
 		);
 
-		expect(runPhase).not.toHaveBeenCalled();
-		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
-			/phase respond-to-review is not yet runnable on a DB-free worker/i,
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			phase: 'respond-to-review',
+			movedTo: 'inReview',
+		});
+		expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual([
+			`${CONTROL_PLANE}/worker/delivery/pm/find-item`,
+			`${CONTROL_PLANE}/worker/delivery/pm/move`,
+			`${CONTROL_PLANE}/worker/delivery/follow-up-review`,
+			`${CONTROL_PLANE}/worker/delivery/pm/move`,
+		]);
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			urlSuffix: '/issues/17',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		expect(JSON.parse(fetchImpl.mock.calls[2][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			prNumber: '99',
+			prBranch: 'issue-17',
+			headSha: 'fixsha',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		// The fix commit and the implementer's reply stay on the operator's own token
+		// — the reply is the implementer answering, not the reviewer.
+		const inputs = runPhase.mock.calls[0][0];
+		expect(inputs.delivery).toBe(operator);
+		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
+		expect(operator.pushBranch).toHaveBeenCalledWith('/tmp/wt', 'issue-17', 'fixsha');
+		expect(operator.postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('keeps the respond-to-review board report best-effort when the card cannot be resolved', async () => {
+		const sink = recordingSink();
+		// A refused lookup throws inside the phase's own try/catch, which logs and
+		// skips the status report rather than failing an otherwise-good response.
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(500, {}));
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			let resolved: unknown;
+			try {
+				resolved = await inputs.pm?.findWorkItemByUrlSuffix('/issues/17');
+			} catch {
+				resolved = undefined;
+			}
+			expect(resolved).toBeUndefined();
+			return { agent: agentResult() };
+		});
+
+		await runAssignmentDbFree(
+			ciAssignment({
+				phase: 'respond-to-review',
+				pr: { prNumber: '99', prBranch: 'issue-17', headSha: 'deadbeef', reviewId: '7' },
+			}),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, undefined, fetchImpl) },
 		);
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			phase: 'respond-to-review',
+		});
+		expect(sink.sent.at(-1)).not.toHaveProperty('movedTo', 'inReview');
 	});
 
 	it('runs implementation with its board writes on the control-plane PM delivery API', async () => {
@@ -395,6 +483,35 @@ describe('runAssignmentDbFree', () => {
 		expect(seen).toEqual([
 			['respond-to-ci', undefined],
 			['implementation', undefined],
+		]);
+	});
+
+	it('leaves the follow-up scheduler unset for every phase but respond-to-review', async () => {
+		const seen: Array<[string, boolean]> = [];
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			seen.push([inputs.phase, inputs.scheduleFollowUpReview !== undefined]);
+			return { agent: agentResult() };
+		});
+		for (const assignment of [
+			ciAssignment(),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			ciAssignment({ phase: 'review', pr: { prNumber: '99', headSha: 'deadbeef' } }),
+			ciAssignment({
+				phase: 'respond-to-review',
+				pr: { prNumber: '99', prBranch: 'issue-17', headSha: 'deadbeef', reviewId: '7' },
+			}),
+		]) {
+			await runAssignmentDbFree(assignment, recordingSink(), {
+				...RUN_OPTIONS,
+				deps: depsWith(runPhase),
+			});
+		}
+
+		expect(seen).toEqual([
+			['respond-to-ci', false],
+			['implementation', false],
+			['review', false],
+			['respond-to-review', true],
 		]);
 	});
 

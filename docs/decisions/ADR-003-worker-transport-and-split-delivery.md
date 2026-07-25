@@ -78,7 +78,7 @@ eligibility gate already consumes that signal. The in-process host worker
 directly — the transport is a second front door to the same service, so the
 single-user/same-machine path is unaffected.
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -115,7 +115,8 @@ and the tunnel/env-var docs (`SWARM_CONTROL_PLANE_URL`) shipped as Phase 2 of is
 #391.
 
 The **DB-less remote worker** — once listed here as out of scope — then landed in
-two further phases, splitting each phase's delivery by which identity it needs:
+three further phases, splitting each phase's delivery by which identity (or which
+server-side store) it needs:
 
 5. **#394** — the DB-free executor (`src/transport/assignment-execution.ts`
    `runAssignmentDbFree`): reconstruct the project from the assignment's non-secret
@@ -139,14 +140,35 @@ two further phases, splitting each phase's delivery by which identity it needs:
      would silently disable both.
 
    Both phases join the supported set, so a DB-free worker runs four of the six.
+   Then #418 below takes it to five.
    Not carried over: the bounded dependency-recheck deferral, which every transport
    path lacks (`classifyDeferrable` models no dependency failure), so a blocked
    Implementation run settles terminally with the "must be done first" message
    instead of re-checking — safe, but tracked as its own follow-up.
+7. **#418** — **`respond-to-review`** joins them, on the same two seams:
+   - **A PM read.** The phase resolves its board card before the best-effort
+     In progress / In review report. Rather than proxy `listWorkItems` — a whole
+     board across the wire to answer a one-card question, and an enumeration a
+     worker has no business holding — `PMProvider` gains a narrow
+     `findWorkItemByUrlSuffix` (ai/RULES.md §2 "widen the interface"), served by
+     `POST /worker/delivery/pm/find-item` under the project's PM credential. The
+     match moves inside the provider, so the phase no longer pattern-matches a
+     URL shape at all. `listWorkItems` keeps refusing on the write-only provider.
+   - **A queue write.** A `fixed` response owes its new commit exactly one
+     follow-up Review (issue #241), enqueued *inside* the phase's deterministic
+     delivery so a failure defers and the retry re-schedules. That enqueue writes
+     a dispatch row and queues a job, so it rides
+     `POST /worker/delivery/follow-up-review`, whose deterministic dispatch
+     identity makes a re-sent request a no-op rather than a second Review.
 
-Still out of scope: **`respond-to-review`**, which additionally needs a PM *read*
-to resolve its board card (issue #418), **`planning`**, whose PM write/split
-surface (`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`/`findComment`)
+   The fix commit, its push, and the response comment stay on the **operator
+   token**: that reply is the *implementer* answering the review, and routing it
+   through the reviewer-PAT composite would have the reviewer answering itself.
+   The board report stays best-effort throughout — a card that can't be resolved
+   or moved is logged and skipped, never failing the response.
+
+Still out of scope: **`planning`**, whose PM write/split surface
+(`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`/`findComment`)
 is wider than a delivery seam should carry and stays on the local host worker, and
 over-the-wire secret delivery, which remains unnecessary: the split keeps every
 project credential server-side instead.

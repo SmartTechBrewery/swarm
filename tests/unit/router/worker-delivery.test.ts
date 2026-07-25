@@ -6,17 +6,19 @@ import type { PMProvider } from '@/pm/types.js';
 import {
 	handleAbandonReviewVerdict,
 	handleAddPmComment,
+	handleFindWorkItem,
 	handleListBlockers,
 	handleMarkReviewVerdict,
 	handleMoveWorkItem,
 	handlePostComment,
 	handlePriorReview,
+	handleScheduleFollowUpReview,
 	handleSubmitReview,
 	type WorkerDeliveryDeps,
 } from '@/router/worker-delivery.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
@@ -58,6 +60,7 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 		supportsDependencies: true,
 		getWorkItem: vi.fn(),
 		listWorkItems: vi.fn(),
+		findWorkItemByUrlSuffix: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('IC_kwComment'),
 		findComment: vi.fn(),
@@ -92,6 +95,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		buildScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
 		buildPmProvider: vi.fn(() => makePmProvider()),
 		reviewLedger: makeReviewLedger(),
+		scheduleFollowUpReview: vi.fn().mockResolvedValue(undefined),
 		...overrides,
 	};
 }
@@ -718,5 +722,147 @@ describe('handleListBlockers', () => {
 			).status,
 		).toBe(400);
 		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleFindWorkItem', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function findBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			urlSuffix: '/issues/21',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('resolves the card under the server-side PM credential', async () => {
+		const item = createMockWorkItem({
+			id: 'ITEM_21',
+			url: 'https://github.com/jkwiecien/swarm/issues/21',
+		});
+		const findWorkItemByUrlSuffix = vi.fn().mockResolvedValue(item);
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() => makePmProvider({ findWorkItemByUrlSuffix })),
+		});
+
+		const result = await handleFindWorkItem(deps, CREDENTIAL, findBody());
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ item });
+		expect(findWorkItemByUrlSuffix).toHaveBeenCalledWith('/issues/21');
+	});
+
+	it('answers item: null when no card wraps that URL — an ordinary miss, not a 404', async () => {
+		const deps = makeDeps();
+		const result = await handleFindWorkItem(deps, CREDENTIAL, findBody());
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ item: null });
+	});
+
+	it('enforces auth and enrollment before touching the PM credential', async () => {
+		const unknownWorker = makeDeps({
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+		expect((await handleFindWorkItem(unknownWorker, 'bogus', findBody())).status).toBe(401);
+		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
+
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleFindWorkItem(unenrolled, CREDENTIAL, findBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleFindWorkItem(deps, CREDENTIAL, findBody({ projectId: 'nope' }))).status,
+		).toBe(404);
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect((await handleFindWorkItem(deps, CREDENTIAL, findBody({ urlSuffix: '' }))).status).toBe(
+			400,
+		);
+		expect(
+			(
+				await handleFindWorkItem(
+					deps,
+					CREDENTIAL,
+					findBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleScheduleFollowUpReview', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function followUpBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			prNumber: '42',
+			prBranch: 'issue-21',
+			headSha: 'newsha',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('schedules the follow-up for the authenticated project, not one named in the body', async () => {
+		const scheduleFollowUpReview = vi.fn().mockResolvedValue(undefined);
+		const deps = makeDeps({ scheduleFollowUpReview });
+
+		const result = await handleScheduleFollowUpReview(deps, CREDENTIAL, followUpBody());
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({});
+		expect(scheduleFollowUpReview).toHaveBeenCalledWith({
+			project: createMockProjectConfig(),
+			prNumber: '42',
+			prBranch: 'issue-21',
+			headSha: 'newsha',
+		});
+	});
+
+	it('enforces auth and enrollment before enqueueing anything', async () => {
+		const unknownWorker = makeDeps({
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+		expect(
+			(await handleScheduleFollowUpReview(unknownWorker, 'bogus', followUpBody())).status,
+		).toBe(401);
+		expect(unknownWorker.scheduleFollowUpReview).not.toHaveBeenCalled();
+
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect(
+			(await handleScheduleFollowUpReview(unenrolled, CREDENTIAL, followUpBody())).status,
+		).toBe(403);
+		expect(unenrolled.scheduleFollowUpReview).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleScheduleFollowUpReview(deps, CREDENTIAL, followUpBody({ projectId: 'nope' })))
+				.status,
+		).toBe(404);
+		expect(deps.scheduleFollowUpReview).not.toHaveBeenCalled();
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect(
+			(await handleScheduleFollowUpReview(deps, CREDENTIAL, followUpBody({ headSha: '' }))).status,
+		).toBe(400);
+		expect(
+			(
+				await handleScheduleFollowUpReview(
+					deps,
+					CREDENTIAL,
+					followUpBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.scheduleFollowUpReview).not.toHaveBeenCalled();
 	});
 });

@@ -21,10 +21,10 @@
  * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
  *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
  *   no in-process provider to fall back on: the two writes ride the transport,
- *   `listBlockers` rides it too (the dependency gate must keep gating — see that
- *   factory's note), and every remaining board *read* refuses with an actionable
- *   error, because the control plane already performed the reads the assignment
- *   was composed from.
+ *   two narrow reads ride it too — `listBlockers` (the dependency gate must keep
+ *   gating) and `findWorkItemByUrlSuffix` (Respond-to-review's board card) — and
+ *   every remaining board *read* refuses with an actionable error, because the
+ *   control plane already performed the reads the assignment was composed from.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * best-effort / board-report handling behaves exactly as it does with the
@@ -34,6 +34,7 @@
 import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
 import {
 	AddPmCommentDeliveryResponseSchema,
+	FindWorkItemDeliveryResponseSchema,
 	ListBlockersDeliveryResponseSchema,
 	MoveWorkItemDeliveryResponseSchema,
 } from '../transport/protocol.js';
@@ -102,6 +103,7 @@ export function createTransportPmDeliveryProvider(options: TransportPmDeliveryOp
 		// Reads and non-metadata writes stay on the worker's in-process provider.
 		getWorkItem: (id) => localDelegate.getWorkItem(id),
 		listWorkItems: (filter) => localDelegate.listWorkItems(filter),
+		findWorkItemByUrlSuffix: (urlSuffix) => localDelegate.findWorkItemByUrlSuffix(urlSuffix),
 		findComment: (id, marker) => localDelegate.findComment(id, marker),
 		createWorkItem: (input) => localDelegate.createWorkItem(input),
 		updateWorkItem: (id, patch) => localDelegate.updateWorkItem(id, patch),
@@ -135,11 +137,12 @@ async function unavailableRead(operation: string): Promise<never> {
 
 /**
  * Build the delegate-less variant for a DB-free remote worker: the two metadata
- * writes ride the transport exactly as above, `listBlockers` rides it as the one
- * transported **read**, and everything else refuses via {@link unavailableRead}.
- * The phases a DB-free worker runs today need exactly that surface —
- * Implementation moves the card, posts its comment, and gates on dependencies —
- * so a call to anything else is a wiring bug, and the thrown message says so.
+ * writes ride the transport exactly as above, two **reads** ride it too —
+ * `listBlockers` and `findWorkItemByUrlSuffix` — and everything else refuses via
+ * {@link unavailableRead}. The phases a DB-free worker runs today need exactly
+ * that surface — Implementation moves the card, posts its comment and gates on
+ * dependencies; Respond-to-review resolves its card and moves it — so a call to
+ * anything else is a wiring bug, and the thrown message says so.
  *
  * `listBlockers` is transported rather than stubbed because the alternative is
  * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
@@ -149,6 +152,12 @@ async function unavailableRead(operation: string): Promise<never> {
  * only inside the phase, never by the dispatcher or the eligibility gate. So the
  * capability is declared **on** and the read runs server-side under the PM
  * credential.
+ *
+ * `findWorkItemByUrlSuffix` is transported for a milder reason: Respond-to-review's
+ * board report is best-effort, so refusing would merely stop the card moving. It
+ * is the *narrow* form of the board read — one suffix in, at most one card out —
+ * which is why `listWorkItems` keeps refusing rather than being widened to serve
+ * it: a worker has no business enumerating a board to answer a one-card question.
  *
  * `addBlockedBy` still refuses: recording a dependency is Planning's
  * task-splitting move, and Planning does not run on a DB-free worker. Assignees
@@ -175,6 +184,15 @@ export function createWriteOnlyTransportPmProvider(
 				'/worker/delivery/pm/blockers',
 				{ projectId: options.projectId, itemId: id },
 				(value) => ListBlockersDeliveryResponseSchema.parse(value).blockers,
+			),
+		findWorkItemByUrlSuffix: (urlSuffix) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/find-item',
+				{ projectId: options.projectId, urlSuffix },
+				// `null` (no card wraps that URL) maps back to the `undefined` the
+				// interface returns, so the phase reads one shape on both paths.
+				(value) => FindWorkItemDeliveryResponseSchema.parse(value).item ?? undefined,
 			),
 		...transportPmWrites(options),
 	};

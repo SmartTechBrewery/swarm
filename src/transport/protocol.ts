@@ -511,6 +511,75 @@ export const ListBlockersDeliveryResponseSchema = z.object({
 export type ListBlockersDeliveryResponse = z.infer<typeof ListBlockersDeliveryResponseSchema>;
 
 /**
+ * `POST /worker/delivery/pm/find-item` request body — resolve the single board
+ * card whose backing Issue/PR URL ends with `urlSuffix`. The second PM **read**
+ * the split serves (ADR-003 §2): Respond-to-review resolves the card for the
+ * issue its PR branch names before reporting In progress / In review, and a
+ * federated worker holds no PM credential to look it up with.
+ *
+ * Narrow on purpose — one suffix in, at most one card out. Proxying
+ * `listWorkItems` instead would pull a whole board across the wire to answer a
+ * one-card question, and would hand a worker an enumeration of every item on a
+ * board it only needs one card from. `urlSuffix` carries no provider vocabulary:
+ * it matches `WorkItem.url`, the generic field every provider populates
+ * (ai/RULES.md §2).
+ */
+export const FindWorkItemDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	urlSuffix: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type FindWorkItemDeliveryRequest = z.infer<typeof FindWorkItemDeliveryRequestSchema>;
+
+/**
+ * `POST /worker/delivery/pm/find-item` success body — the matching card, or
+ * `item: null` when the board has none (`null` rather than an absent key so "not
+ * on the board" is an explicit answer, never a dropped field). Reuses
+ * {@link AssignedWorkItemSchema}, the same `WorkItem` serialization subset a
+ * pushed assignment carries, so one shape describes a work item on the wire; the
+ * two optional timestamps `WorkItem` may also carry are not part of it and no
+ * caller of this route reads them.
+ *
+ * As permissive as `WorkItem` itself, deliberately: the caller
+ * (`../pipeline/respond-to-review.ts`) treats a throw as "no board report", so a
+ * stricter field here would silently turn a resolvable card into a skipped
+ * status report.
+ */
+export const FindWorkItemDeliveryResponseSchema = z.object({
+	item: AssignedWorkItemSchema.nullable(),
+});
+export type FindWorkItemDeliveryResponse = z.infer<typeof FindWorkItemDeliveryResponseSchema>;
+
+/**
+ * `POST /worker/delivery/follow-up-review` request body — schedule the one
+ * follow-up Review a `fixed` Respond-to-review response owes its newly pushed
+ * commit (issue #241). Unlike the delivery frames above this fronts no
+ * credential: what stays server-side is the **dispatch record + queue** a DB-free
+ * worker has no `DATABASE_URL`/`REDIS_URL` to reach.
+ *
+ * The enqueue must stay inside the phase's deterministic delivery — it runs
+ * before the checkpoint that guards it, so a failure defers and a resumed retry
+ * re-schedules rather than dropping the follow-up — hence a route the phase calls
+ * rather than a fact reported in the terminal result. The scheduler's own
+ * deterministic dedup identity (project, PR, new head) absorbs a retry, so a
+ * re-sent request cannot produce a second dispatch. The project is taken from the
+ * **authenticated** worker enrollment, never from this body.
+ */
+export const FollowUpReviewDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	prNumber: z.string().min(1),
+	prBranch: z.string().min(1),
+	/** The newly pushed commit SHA the follow-up Review must cover. */
+	headSha: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type FollowUpReviewDeliveryRequest = z.infer<typeof FollowUpReviewDeliveryRequestSchema>;
+
+/** `POST /worker/delivery/follow-up-review` success body — scheduling carries no return value. */
+export const FollowUpReviewDeliveryResponseSchema = z.object({});
+export type FollowUpReviewDeliveryResponse = z.infer<typeof FollowUpReviewDeliveryResponseSchema>;
+
+/**
  * Control-plane **review-verdict ledger** frames (ADR-003 §2). Unlike the
  * delivery frames above, these front no credential — they front the
  * `review_verdicts` **table** (`../db/repositories/reviewVerdictsRepository.ts`),
