@@ -167,6 +167,11 @@ const DEFAULT_AUTO_ADVANCE = false;
  * distinguishes planned, ready-for-implementation work from un-planned backlog,
  * independent of the board Status move `autoAdvance` may make. A fixed constant,
  * not a config option: the smallest durable change, with no speculative setting.
+ *
+ * Also applied at creation to every split child {@link applySplit} spawns (issue
+ * #426), since such a child is already planned by construction — it carries the
+ * parent's validated plan in its body — and shouldn't read as un-planned during
+ * the window before its own preplanned Planning run completes.
  */
 export const PLANNED_LABEL = 'planned';
 
@@ -597,7 +602,13 @@ async function applySplit(
 			// The configured automation label, not a hard-coded `swarm` (issue #131):
 			// a sibling SWARM created must be opted into SWARM's own pipeline, whatever
 			// label this project gates on. Omitted entirely when the gate is disabled.
-			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL],
+			// PLANNED_LABEL rides along at creation (issue #426): a split child is
+			// already planned by construction — it is born carrying the parent's
+			// validated plan — so the provider-visible marker must be accurate from
+			// the moment the child exists, not only once its own preplanned reuse run
+			// completes. That later run still calls applyPlannedLabel; both label
+			// paths are idempotent at the provider, so the repeat is a no-op.
+			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL, PLANNED_LABEL],
 		});
 		let prepared = false;
 		try {
