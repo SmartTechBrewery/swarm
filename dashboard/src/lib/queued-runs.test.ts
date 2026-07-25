@@ -262,7 +262,7 @@ describe('groupQueuedRuns', () => {
 		expect(rows[0].boardDuplicateCount).toBe(0);
 	});
 
-	// Regression (issue #374): one board-card drag fires `reordered` + `edited`
+	// Regression (issue #366): one board-card drag fires `reordered` + `edited`
 	// webhooks (and Planning self-enqueues Implementation), each a separate
 	// dispatch for the same card — the queue must show one row, not two/three.
 	it('folds fresh board dispatches for the same card into one row', () => {
@@ -291,6 +291,18 @@ describe('groupQueuedRuns', () => {
 
 		const rows = groupQueuedRuns([projA, projB]);
 		expect(rows).toHaveLength(2);
+	});
+
+	// Without a board item identity to join on there is nothing to prove two
+	// dispatches share a card, so each keeps its own row — the same fallback the
+	// review-gate path takes when a PR number is missing.
+	it('never folds board dispatches missing the board item identity', () => {
+		const a = boardRun({ jobId: 'job-no-node-a', workItemNodeId: undefined });
+		const b = boardRun({ jobId: 'job-no-node-b', workItemNodeId: undefined });
+
+		const rows = groupQueuedRuns([a, b]);
+		expect(rows).toHaveLength(2);
+		expect(rows.every((r) => r.boardDuplicateCount === 0)).toBe(true);
 	});
 
 	// A dispatch that already owns a run (a capacity-blocked continuation or a

@@ -129,7 +129,7 @@ export interface QueuedDisplayRow {
 	sourceEvents: QueuedReviewGateSourceEventDisplay[];
 	/**
 	 * Extra fresh board dispatches for the *same* card folded into this row beyond
-	 * the representative (issue #374). 0 for any non-board or single-dispatch row.
+	 * the representative (issue #366). 0 for any non-board or single-dispatch row.
 	 * A single board-card interaction fans out into several dispatches — the two
 	 * `projects_v2_item` webhooks a drag fires (`reordered` + `edited`) plus the
 	 * synthetic Planning→Implementation self-enqueue — none of which share a
@@ -149,7 +149,7 @@ function reviewGateGroupKey(item: QueuedRun): string | null {
 
 /**
  * Grouping identity for a *fresh* board (PM status) dispatch: same project and
- * work-item node id fold into one row (issue #374). Only unresolved board
+ * work-item node id fold into one row (issue #366). Only unresolved board
  * dispatches (`phaseHint === 'board'`) with no backing run are folded — a
  * dispatch that already resolved a phase (`planning`/`implementation`) or owns a
  * `runId` (a capacity-blocked continuation or a deferred/resuming run) is a
@@ -182,7 +182,7 @@ function toSourceEventDisplay(item: QueuedRun): QueuedReviewGateSourceEventDispl
  *   hinting `review` (see {@link QueuedRun.reviewGate}) that share the same
  *   project, repo, PR number, and head SHA.
  * - **Fresh board dispatches** — the several dispatches one board-card
- *   interaction fans out into for the same card (issue #374), keyed on project
+ *   interaction fans out into for the same card (issue #366), keyed on project
  *   and work-item node id (see {@link boardGroupKey}).
  *
  * Every other job renders one row per job, exactly as before. A row's position

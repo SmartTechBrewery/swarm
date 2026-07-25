@@ -1310,7 +1310,7 @@ describe('runsRouter', () => {
 			expect(moveWorkItem).not.toHaveBeenCalled();
 		});
 
-		// #374: one board-card interaction fans out into several fresh dispatches
+		// #366: one board-card interaction fans out into several fresh dispatches
 		// (the `reordered` + `edited` webhooks a drag fires, plus the Planning
 		// self-enqueue), which the queue view folds into one row. Putting the card
 		// back must silence that whole fold — but only the fold: never a different

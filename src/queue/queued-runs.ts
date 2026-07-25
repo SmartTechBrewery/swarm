@@ -205,7 +205,7 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
  * event-derived hint covers dispatches never claimed yet (for a
  * `github-projects` job that is always `board`). Shared so any caller deciding
  * whether a dispatch is still an unresolved `board` row agrees with the queue
- * view (issue #374).
+ * view (issue #366).
  */
 export function deriveDispatchPhaseHint(dispatch: DispatchRow): QueuedPhaseHint {
 	const resolved = QueuedPhaseHintSchema.safeParse(dispatch.phase);
