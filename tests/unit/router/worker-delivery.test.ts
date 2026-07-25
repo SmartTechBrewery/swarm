@@ -238,7 +238,9 @@ describe('handleSubmitReview', () => {
 		const deps = makeDeps({
 			buildScmDelivery: vi
 				.fn()
-				.mockRejectedValue(new Error(`Could not resolve GitHub identity for reviewer persona: ${RESOLVED_PAT}`)),
+				.mockRejectedValue(
+					new Error(`Could not resolve GitHub identity for reviewer persona: ${RESOLVED_PAT}`),
+				),
 		});
 
 		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody());
