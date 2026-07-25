@@ -22,6 +22,7 @@ vi.mock('node:fs', () => ({
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import {
 	buildPlanningPrompt,
+	PLANNED_LABEL,
 	PROPOSED_PLAN_FILENAME,
 	PROPOSED_SCOPE_FILENAME,
 	PROPOSED_SPLIT_FILENAME,
@@ -251,7 +252,10 @@ describe('runPlanningPhase', () => {
 		// human description, so the marker can be embedded before Planning is observed.
 		expect(deps.pm.createWorkItem).toHaveBeenCalledTimes(2);
 		for (const call of deps.pm.createWorkItem.mock.calls) {
-			expect(call[0]).toMatchObject({ status: 'backlog', labels: ['swarm', SPLIT_CHILD_LABEL] });
+			expect(call[0]).toMatchObject({
+				status: 'backlog',
+				labels: ['swarm', SPLIT_CHILD_LABEL, PLANNED_LABEL],
+			});
 		}
 		expect(deps.pm.createWorkItem.mock.calls.map((c) => c[0].title)).toEqual([
 			'Second slice',
@@ -340,8 +344,34 @@ describe('runPlanningPhase', () => {
 		// Without this the sibling SWARM just created would be gated out of SWARM's
 		// own pipeline by the very label the project configured.
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL] }),
+			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
 		);
+	});
+
+	it('labels split children `planned` at creation, before their own Planning run (issue #426)', async () => {
+		splitExists = true;
+		splitContents = JSON.stringify({
+			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
+		});
+		const deps = makeDeps();
+		// Marker embedding fails, so the child stays in Backlog and its own preplanned
+		// Planning run never happens — the label must be on the issue regardless.
+		deps.pm.updateWorkItem = vi.fn<(id: string, patch: UpdateWorkItemPatch) => Promise<void>>(
+			async (_id, patch) => {
+				if (typeof patch.description === 'string' && patch.description.includes('swarm-preplan')) {
+					throw new Error('board rejected the update');
+				}
+			},
+		);
+
+		await runPlanningPhase(deps);
+
+		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ labels: ['swarm', SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
+		);
+		// Nothing else labels the child — this run only labels the parent, so the
+		// child's `planned` marker came from createWorkItem alone.
+		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
 	});
 
 	it('labels split children with only the split-child label when the gate is disabled', async () => {
@@ -355,7 +385,7 @@ describe('runPlanningPhase', () => {
 		await runPlanningPhase(deps);
 
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: [SPLIT_CHILD_LABEL] }),
+			expect.objectContaining({ labels: [SPLIT_CHILD_LABEL, PLANNED_LABEL] }),
 		);
 	});
 
@@ -499,6 +529,26 @@ describe('runPlanningPhase', () => {
 		expect(deps.pm.addLabel.mock.invocationCallOrder[0]).toBeGreaterThan(
 			deps.pm.addComment.mock.invocationCallOrder[0],
 		);
+	});
+
+	it('re-applies `planned` without failing when the split child already carries it (issue #426)', async () => {
+		const deps = makeDeps();
+		// Exactly the shape applySplit now creates: the child is labeled `planned`
+		// from birth, and its own preplanned run reaches applyPlannedLabel anyway.
+		deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.', undefined, {
+			labels: [
+				{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL },
+				{ id: PLANNED_LABEL, name: PLANNED_LABEL },
+			],
+		});
+
+		const result = await runPlanningPhase(deps);
+
+		expect(result).toMatchObject({ preplanned: true });
+		// Applied once more, unconditionally — idempotence is the provider's job
+		// (addLabels is additive), so the phase never has to check first.
+		expect(deps.pm.addLabel).toHaveBeenCalledTimes(1);
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_child', PLANNED_LABEL);
 	});
 
 	it('falls back to a normal agent run when the preplan marker is malformed', async () => {
