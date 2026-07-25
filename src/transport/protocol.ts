@@ -337,6 +337,14 @@ export const TaskExecutionResultSchema = z.object({
 	verdict: z.enum(['approve', 'request-changes', 'comment']).optional(),
 	reviewOrdinal: z.number().int().positive().optional(),
 	reviewAutomationOutcome: z.enum(['manual-intervention-required']).optional(),
+	// `succeeded` — the pull request this run *produced*, reported so the control
+	// plane can record the worker→PR attribution a DB-free worker cannot write
+	// itself (ADR-004 §4, issue #398). Only a PR-producing phase (Implementation)
+	// sends it. Validated as a non-empty string rather than a URL: a terminal
+	// result frame must never fail to parse — and so lose the whole settle — over
+	// an attribution nicety. Optional and additive in both directions, so it needs
+	// no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits it.
+	prUrl: z.string().min(1).optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;
 

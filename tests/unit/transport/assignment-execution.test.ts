@@ -329,6 +329,38 @@ describe('runAssignmentDbFree', () => {
 		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
 	});
 
+	it('reports the produced PR url on the result frame so the control plane can attribute it (issue #398)', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({
+			agent: agentResult(),
+			prUrl: 'https://github.com/o/r/pull/7',
+		}));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			prUrl: 'https://github.com/o/r/pull/7',
+		});
+	});
+
+	it('reports no produced PR for a phase that creates none', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase),
+		});
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded' });
+		expect(sink.sent.at(-1)?.prUrl).toBeUndefined();
+	});
+
 	it("keeps implementation's dependency gate working through the blockers read route", async () => {
 		const sink = recordingSink();
 		const blockers = [
