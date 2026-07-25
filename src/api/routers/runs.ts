@@ -228,7 +228,7 @@ function alreadyRetrying(): TRPCError {
 
 /**
  * Cancel the *other* fresh board dispatches for one card while putting it back
- * (issue #374). A single board-card interaction fans out into several dispatches
+ * (issue #366). A single board-card interaction fans out into several dispatches
  * for the same card — the two `projects_v2_item` webhooks a drag fires
  * (`reordered` + `edited`) and the synthetic Planning→Implementation
  * self-enqueue — which the queue view folds into one row. Putting the item back
@@ -830,7 +830,7 @@ export const runsRouter = router({
 			}
 
 			// Putting a board item back must silence its duplicate dispatches too
-			// (issue #374), before the single card move below.
+			// (issue #366), before the single card move below.
 			if (jobData.type === 'github-projects') {
 				await cancelDuplicateBoardDispatches(project.id, workItemNodeId, dispatch.id);
 			}

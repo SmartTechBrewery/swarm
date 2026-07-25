@@ -25,7 +25,7 @@ import { RunStatusBadge } from './run-status-badge.js';
 /**
  * Phase content for one queued row, shared by the desktop table cell and the
  * mobile card so their wording, review-gate diagnostics, and board-duplicate
- * count (issue #374) stay identical. A review-gate group lists its folded
+ * count (issue #366) stay identical. A review-gate group lists its folded
  * source events; a board-duplicate group shows the phase plus how many queued
  * events for the card were collapsed into this one row; every other row is just
  * its phase label.
