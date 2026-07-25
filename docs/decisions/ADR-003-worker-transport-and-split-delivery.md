@@ -78,7 +78,7 @@ eligibility gate already consumes that signal. The in-process host worker
 directly — the transport is a second front door to the same service, so the
 single-user/same-machine path is unaffected.
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -112,9 +112,32 @@ All frames now populate the two Zod unions in `src/transport/protocol.ts`
 (`WorkerStreamMessageSchema` / `ControlPlaneMessageSchema`). The worker-side
 session client (connect with only the credential, reconnect, local CLI discovery)
 and the tunnel/env-var docs (`SWARM_CONTROL_PLANE_URL`) shipped as Phase 2 of issue
-#391. Still out of scope (same-host MVP): a **DB-less remote** worker (persona
-tokens resolve locally today, so the worker still holds `DATABASE_URL`) and
-over-the-wire secret delivery.
+#391.
+
+The **DB-less remote worker** — once listed here as out of scope — then landed in
+two further phases, splitting each phase's delivery by which identity it needs:
+
+5. **#394** — the DB-free executor (`src/transport/assignment-execution.ts`
+   `runAssignmentDbFree`): reconstruct the project from the assignment's non-secret
+   slice, run source-carrying delivery under the operator's own token
+   (`SWARM_OPERATOR_GH_TOKEN`), stream output over the transport only, and cancel
+   off the shutdown signal — no `DATABASE_URL`/`REDIS_URL`. A supported-phase gate
+   admitted only the two fully-worker-side phases (`respond-to-ci`,
+   `resolve-conflicts`).
+6. **#417** — the metadata writes the operator token cannot perform now travel to
+   the control plane's delivery API (`src/router/worker-delivery.ts`, ADR-002 §2)
+   through one shared client (`src/transport/delivery-client.ts`), authenticated by
+   the worker's own credential: **Implementation**'s two board writes under the
+   project's PM credential, **Review**'s `submitReview` under its reviewer PAT.
+   Both phases join the supported set, so a DB-free worker runs four of the six.
+   Neither credential ever reaches the worker.
+
+Still out of scope: **`respond-to-review`**, which additionally needs a PM *read*
+to resolve its board card (issue #418), **`planning`**, whose PM write/split
+surface (`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`/`findComment`)
+is wider than a delivery seam should carry and stays on the local host worker, and
+over-the-wire secret delivery, which remains unnecessary: the split keeps every
+project credential server-side instead.
 
 > **Supersedes issue #300.** #300's gRPC bidirectional control plane is re-scoped:
 > the MVP transport is WebSocket + HTTP on the router, not a gRPC stream. The gRPC

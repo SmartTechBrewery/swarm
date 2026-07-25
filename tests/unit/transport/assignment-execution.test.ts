@@ -6,11 +6,17 @@ import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import { runAssignmentDbFree } from '@/transport/assignment-execution.js';
+import type { FetchLike } from '@/transport/delivery-client.js';
+import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
 import { createMockTaskAssignmentInput } from '../../helpers/factories.js';
 
 const OPERATOR_TOKEN = 'operator-token';
+const CONTROL_PLANE = 'https://swarm.example';
+const WORKER_CREDENTIAL = 'raw-worker-credential-secret';
+/** The project id `createMockProjectConfig` carries — every delivery call is scoped to it. */
+const PROJECT_ID = 'swarm';
 
 const silentLogger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -55,11 +61,11 @@ function ciAssignment(overrides: Parameters<typeof createMockTaskAssignmentInput
 function stubDelivery(): ScmDeliveryProvider {
 	return {
 		commitIdentity: { name: 'op', email: 'op@users.noreply.github.com' },
-		findPullRequest: async () => undefined,
-		createPullRequest: async () => ({ number: 1, url: 'u' }),
-		pushBranch: async () => {},
-		submitReview: async () => 1,
-		postComment: async () => 1,
+		findPullRequest: vi.fn(async () => undefined),
+		createPullRequest: vi.fn(async () => ({ number: 1, url: 'u' })),
+		pushBranch: vi.fn(async () => {}),
+		submitReview: vi.fn(async () => 1),
+		postComment: vi.fn(async () => 1),
 	};
 }
 
@@ -68,16 +74,29 @@ function depsWith(
 	runPhase: (inputs: AssignedPhaseInputs) => Promise<PhaseRunResult>,
 	buildDelivery: (repo: string, token: string) => Promise<ScmDeliveryProvider> = async () =>
 		stubDelivery(),
+	fetchImpl?: FetchLike,
 ) {
 	return {
 		runPhase,
 		buildDelivery,
+		fetchImpl,
 		baseRunAgent: vi.fn(async (options: { onStdout?: (l: string) => void }) => {
 			options.onStdout?.('working…');
 			return agentResult();
 		}) as never,
 		logger: silentLogger,
 	};
+}
+
+/** The transport coordinates every run needs: the operator token + this worker's own credential. */
+const RUN_OPTIONS = {
+	operatorToken: OPERATOR_TOKEN,
+	controlPlaneUrl: CONTROL_PLANE,
+	workerCredential: WORKER_CREDENTIAL,
+} as const;
+
+function jsonResponse(status: number, body: unknown): Awaited<ReturnType<FetchLike>> {
+	return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
 describe('runAssignmentDbFree', () => {
@@ -88,7 +107,7 @@ describe('runAssignmentDbFree', () => {
 			agent: await inputs.runAgent({ cli: 'claude', args: [], cwd: '/tmp' }),
 		}));
 		await runAssignmentDbFree(ciAssignment(), sink, {
-			operatorToken: OPERATOR_TOKEN,
+			...RUN_OPTIONS,
 			deps: depsWith(runPhase, buildDelivery),
 		});
 
@@ -104,10 +123,12 @@ describe('runAssignmentDbFree', () => {
 		});
 		// Delivery was built from the reconstructed project's repo + the operator token.
 		expect(buildDelivery).toHaveBeenCalledWith('jkwiecien/swarm', OPERATOR_TOKEN);
-		// The phase received the injected operator-token delivery + agent token.
+		// The phase received the injected operator-token delivery + agent token, and no
+		// PM provider — a source-only phase writes to no board.
 		const inputs = runPhase.mock.calls[0][0];
 		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
 		expect(inputs.delivery).toBeDefined();
+		expect(inputs.pm).toBeUndefined();
 	});
 
 	it('injects the operator delivery into resolve-conflicts too', async () => {
@@ -126,10 +147,7 @@ describe('runAssignmentDbFree', () => {
 				},
 			}),
 		);
-		await runAssignmentDbFree(assignment, sink, {
-			operatorToken: OPERATOR_TOKEN,
-			deps: depsWith(runPhase),
-		});
+		await runAssignmentDbFree(assignment, sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'resolve-conflicts' });
 		expect(runPhase.mock.calls[0][0].delivery).toBeDefined();
@@ -139,10 +157,12 @@ describe('runAssignmentDbFree', () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn();
 		const buildDelivery = vi.fn(async () => stubDelivery());
+		// Planning's PM surface (create/update/label/find-comment + splitting) has no
+		// DB-free seam, so it stays on the local host worker.
 		await runAssignmentDbFree(
-			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'planning' })),
 			sink,
-			{ operatorToken: OPERATOR_TOKEN, deps: depsWith(runPhase as never, buildDelivery) },
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase as never, buildDelivery) },
 		);
 
 		expect(runPhase).not.toHaveBeenCalled();
@@ -150,8 +170,164 @@ describe('runAssignmentDbFree', () => {
 		expect(buildDelivery).not.toHaveBeenCalled();
 		expect(sink.sent.at(-1)).toMatchObject({ type: 'task-execution-result', status: 'failed' });
 		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
-			/phase implementation is not yet runnable on a DB-free worker/i,
+			/phase planning is not yet runnable on a DB-free worker/i,
 		);
+	});
+
+	it('still gates respond-to-review out — it needs a PM read no DB-free seam serves yet', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn();
+		await runAssignmentDbFree(
+			ciAssignment({
+				phase: 'respond-to-review',
+				pr: { prNumber: '99', prBranch: 'issue-17', headSha: 'deadbeef', reviewId: '7' },
+			}),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase as never) },
+		);
+
+		expect(runPhase).not.toHaveBeenCalled();
+		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
+			/phase respond-to-review is not yet runnable on a DB-free worker/i,
+		);
+	});
+
+	it('runs implementation with its board writes on the control-plane PM delivery API', async () => {
+		const sink = recordingSink();
+		const fetchImpl = vi
+			.fn<FetchLike>()
+			.mockResolvedValue(jsonResponse(200, { commentId: 'IC_1' }));
+		const operator = stubDelivery();
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			// What the real phase does: move the card to In progress, post the
+			// implementer's comment, then move it on.
+			await inputs.pm?.moveWorkItem('PVTI_item1', 'inProgress');
+			await inputs.pm?.addComment('PVTI_item1', 'Implementation done');
+			// Source ops stay on the operator's own token — no HTTP delivery for these.
+			await inputs.delivery?.pushBranch('/tmp/wt', 'issue-17', 'deadbeef');
+			return { agent: agentResult(), movedTo: 'inReview' as const };
+		});
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => operator, fetchImpl) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			phase: 'implementation',
+			movedTo: 'inReview',
+		});
+		// Both board writes went up to the control plane, project-scoped, under this
+		// worker's own credential — with a canonical status key, never an option ID.
+		expect(fetchImpl).toHaveBeenCalledTimes(2);
+		const [moveUrl, moveInit] = fetchImpl.mock.calls[0];
+		expect(moveUrl).toBe(`${CONTROL_PLANE}/worker/delivery/pm/move`);
+		expect(moveInit.headers.authorization).toBe(`Bearer ${WORKER_CREDENTIAL}`);
+		expect(JSON.parse(moveInit.body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			status: 'inProgress',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		expect(fetchImpl.mock.calls[1][0]).toBe(`${CONTROL_PLANE}/worker/delivery/pm/comment`);
+		// The source push ran on the operator provider, not over the wire.
+		expect(operator.pushBranch).toHaveBeenCalledWith('/tmp/wt', 'issue-17', 'deadbeef');
+		// Its SCM delivery is the operator provider itself: the implementer identity is
+		// the operator, so nothing about it rides the transport.
+		const inputs = runPhase.mock.calls[0][0];
+		expect(inputs.delivery).toBe(operator);
+		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
+	});
+
+	it("skips implementation's dependency gate instead of failing a board read it cannot serve", async () => {
+		const sink = recordingSink();
+		const fetchImpl = vi.fn<FetchLike>();
+		let pm: AssignedPhaseInputs['pm'];
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			pm = inputs.pm;
+			return { agent: agentResult() };
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, undefined, fetchImpl) },
+		);
+
+		// The control plane owns the dependency gate on this path, so the injected
+		// provider declares the capability off and the gate short-circuits.
+		expect(pm?.supportsDependencies).toBe(false);
+		await expect(pm?.listBlockers('PVTI_item1')).resolves.toEqual([]);
+		// A board *read* is a wiring bug here, and says so rather than returning a lie.
+		await expect(pm?.getWorkItem('PVTI_item1')).rejects.toThrow(
+			/not available on a DB-free worker/i,
+		);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it('runs review with submitReview on the control-plane SCM delivery API', async () => {
+		const sink = recordingSink();
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { reviewId: 4242 }));
+		const operator = stubDelivery();
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			const reviewId = await inputs.delivery?.submitReview({
+				prNumber: 99,
+				verdict: 'approve',
+				body: 'LGTM',
+				deliveryId: 'run-1',
+			});
+			expect(reviewId).toBe(4242);
+			return { agent: agentResult(), verdict: 'approve' as const };
+		});
+
+		await runAssignmentDbFree(
+			ciAssignment({ phase: 'review', pr: { prNumber: '99', headSha: 'deadbeef' } }),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => operator, fetchImpl) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			phase: 'review',
+			verdict: 'approve',
+		});
+		// The verdict travelled up to the control plane, which submits it under the
+		// per-project reviewer PAT — the worker never held that token.
+		const [url, init] = fetchImpl.mock.calls[0];
+		expect(url).toBe(`${CONTROL_PLANE}/worker/delivery/review`);
+		expect(init.headers.authorization).toBe(`Bearer ${WORKER_CREDENTIAL}`);
+		expect(JSON.parse(init.body)).toEqual({
+			projectId: PROJECT_ID,
+			prNumber: 99,
+			verdict: 'approve',
+			body: 'LGTM',
+			deliveryId: 'run-1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		expect(operator.submitReview).not.toHaveBeenCalled();
+		// Review writes to no board, and its source-side ops still delegate locally.
+		const inputs = runPhase.mock.calls[0][0];
+		expect(inputs.pm).toBeUndefined();
+		await inputs.delivery?.findPullRequest('issue-17');
+		expect(operator.findPullRequest).toHaveBeenCalledWith('issue-17');
+	});
+
+	it('settles the run failed when a control-plane delivery call is refused', async () => {
+		const sink = recordingSink();
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(403, {}));
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			await inputs.pm?.moveWorkItem('PVTI_item1', 'inProgress');
+			return { agent: agentResult() };
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, undefined, fetchImpl) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({ type: 'task-execution-result', status: 'failed' });
+		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(/403/);
 	});
 
 	it('is idempotent: a re-pushed dispatch already running acks duplicate and starts no second run', async () => {
@@ -167,13 +343,13 @@ describe('runAssignmentDbFree', () => {
 		const frame = ciAssignment();
 
 		const first = runAssignmentDbFree(frame, sink, {
-			operatorToken: OPERATOR_TOKEN,
+			...RUN_OPTIONS,
 			inFlight,
 			deps: depsWith(runPhase),
 		});
 		await Promise.resolve();
 		await runAssignmentDbFree(frame, sink, {
-			operatorToken: OPERATOR_TOKEN,
+			...RUN_OPTIONS,
 			inFlight,
 			deps: depsWith(runPhase),
 		});
@@ -192,10 +368,7 @@ describe('runAssignmentDbFree', () => {
 		const runPhase = vi.fn(async () => {
 			throw new DeliveryDeferredError('push failed', { cause: new Error('remote rejected') });
 		});
-		await runAssignmentDbFree(ciAssignment(), sink, {
-			operatorToken: OPERATOR_TOKEN,
-			deps: depsWith(runPhase),
-		});
+		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({
 			type: 'task-execution-result',
@@ -210,10 +383,7 @@ describe('runAssignmentDbFree', () => {
 		const runPhase = vi.fn(async () => {
 			throw new AgentRunError('rate limited', { kind: 'rate-limit' }, agentResult({ exitCode: 1 }));
 		});
-		await runAssignmentDbFree(ciAssignment(), sink, {
-			operatorToken: OPERATOR_TOKEN,
-			deps: depsWith(runPhase),
-		});
+		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		const result = sink.sent.at(-1) as Record<string, unknown>;
 		expect(result).toMatchObject({
@@ -229,10 +399,7 @@ describe('runAssignmentDbFree', () => {
 		const runPhase = vi.fn(async () => {
 			throw new Error('boom');
 		});
-		await runAssignmentDbFree(ciAssignment(), sink, {
-			operatorToken: OPERATOR_TOKEN,
-			deps: depsWith(runPhase),
-		});
+		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'failed', error: 'boom' });
 	});
@@ -242,10 +409,7 @@ describe('runAssignmentDbFree', () => {
 		const runPhase = vi.fn(async () => ({
 			agent: agentResult({ timedOut: true, exitCode: null }),
 		}));
-		await runAssignmentDbFree(ciAssignment(), sink, {
-			operatorToken: OPERATOR_TOKEN,
-			deps: depsWith(runPhase),
-		});
+		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'deferred', failureKind: 'timeout' });
 	});

@@ -5,14 +5,19 @@
  * `postComment` — travel up the transport to the control-plane delivery API
  * (`../router/worker-delivery.ts`), which performs the GitHub write under the
  * reviewer PAT. Only metadata (a verdict + a comment body + the PR number)
- * crosses the wire; the repository tree never does (ai/RULES.md §1).
+ * crosses the wire; the repository tree never does (ai/RULES.md §1). The wire
+ * mechanics — URL join, bearer header, protocol stamp, error contract — live in
+ * the shared client (`../transport/delivery-client.ts`).
  *
  * Everything that carries source or must be attributed to the operator's own
  * GitHub account — `commitIdentity`, `findPullRequest`, `createPullRequest`,
  * `pushBranch` — delegates verbatim to a `localDelegate` (the worker's own
  * in-process provider, built from the operator's token). That keeps
  * respond-to-review working: it still commits and pushes locally with the
- * operator's identity, and only the PR comment rides the transport.
+ * operator's identity, and only the PR comment rides the transport. A DB-free
+ * remote worker composes the same way, passing the operator-token delivery
+ * provider it already built as the delegate
+ * (`../transport/assignment-execution.ts`).
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * `DeliveryDeferredError` retry path (`../pipeline/review.ts`,
@@ -21,75 +26,20 @@
  * double-post a review or comment.
  */
 
+import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
 import {
 	PostCommentDeliveryResponseSchema,
 	SubmitReviewDeliveryResponseSchema,
-	TRANSPORT_PROTOCOL_VERSION,
 } from '../transport/protocol.js';
 import type { ScmDeliveryProvider } from './delivery.js';
 
-/** The `fetch` surface this module uses — injectable so tests drive it without a network. */
-export type FetchLike = (
-	input: string,
-	init: {
-		method: string;
-		headers: Record<string, string>;
-		body: string;
-	},
-) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+export type { FetchLike } from '../transport/delivery-client.js';
 
-export interface TransportScmDeliveryOptions {
-	/** Base URL of the control-plane delivery API, e.g. `https://swarm.example`. */
-	controlPlaneUrl: string;
-	/** Raw registered-worker credential (sent as `Authorization: Bearer`). */
-	workerCredential: string;
+export interface TransportScmDeliveryOptions extends DeliveryClientOptions {
 	/** The project id, sent so the server resolves the right reviewer PAT + enrollment. */
 	projectId: string;
 	/** The worker's in-process provider, handling every source-carrying / attribution op. */
 	localDelegate: ScmDeliveryProvider;
-	/** Override `fetch` in tests; defaults to the global. */
-	fetchImpl?: FetchLike;
-}
-
-/** Join the control-plane base URL with a delivery path, tolerating a trailing slash. */
-function deliveryUrl(base: string, path: string): string {
-	return `${base.replace(/\/+$/, '')}${path}`;
-}
-
-/**
- * POST a delivery request to the control plane and return the parsed response
- * body. Throws on a non-2xx status or a body that does not match `schema`, so
- * the caller's deferral/retry path can preserve the worktree and retry against
- * the idempotent server write.
- */
-async function postDelivery<T>(
-	options: TransportScmDeliveryOptions,
-	path: string,
-	body: Record<string, unknown>,
-	parse: (value: unknown) => T,
-): Promise<T> {
-	const fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
-	const response = await fetchImpl(deliveryUrl(options.controlPlaneUrl, path), {
-		method: 'POST',
-		headers: {
-			'content-type': 'application/json',
-			authorization: `Bearer ${options.workerCredential}`,
-		},
-		body: JSON.stringify({ ...body, protocolVersion: TRANSPORT_PROTOCOL_VERSION }),
-	});
-	if (!response.ok)
-		throw new Error(`Control-plane delivery ${path} failed with status ${response.status}`);
-	let payload: unknown;
-	try {
-		payload = await response.json();
-	} catch (error) {
-		throw new Error(
-			`Control-plane delivery ${path} returned an unparseable response: ${
-				error instanceof Error ? error.message : String(error)
-			}`,
-		);
-	}
-	return parse(payload);
 }
 
 /**

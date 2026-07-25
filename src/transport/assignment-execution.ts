@@ -8,12 +8,15 @@
  * `run_output_events`, cancellation via Redis). This module adds the **remote**
  * counterpart, {@link runAssignmentDbFree}, which runs entirely from the
  * assignment itself: the project config is reconstructed from the non-secret
- * slice (`./db-free-project.ts`), delivery uses the operator's own token
- * (`../integrations/scm/github/operator-delivery.ts`), live output streams over
- * the transport only (no DB write), and cancellation rides the shutdown signal
- * alone (no Redis). A supported-phase gate cleanly fails any phase not yet
- * runnable this way, so a premature push fails with a clear result rather than
- * crashing on a DB/Redis access.
+ * slice (`./db-free-project.ts`), source-carrying delivery uses the operator's
+ * own token (`../integrations/scm/github/operator-delivery.ts`), the two kinds of
+ * metadata write the operator token *cannot* perform — a review under the
+ * project's reviewer PAT, a board write under its PM credential — ride the
+ * control-plane delivery API instead (`./delivery-client.ts`, ADR-002 §2), live
+ * output streams over the transport only (no DB write), and cancellation rides
+ * the shutdown signal alone (no Redis). A supported-phase gate cleanly fails any
+ * phase not yet runnable this way, so a premature push fails with a clear result
+ * rather than crashing on a DB/Redis access.
  *
  * The pure helpers (`fromAssignedWorkItem`, `createAssignmentRunAgent`,
  * `classifyDeferrable`, `succeededResult`, `deferrableOrFailedResult`) live here
@@ -29,8 +32,10 @@ import { createOperatorDeliveryProvider } from '../integrations/scm/github/opera
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
-import type { WorkItem } from '../pm/types.js';
+import { createWriteOnlyTransportPmProvider } from '../pm/transport-delivery.js';
+import type { PMProvider, WorkItem } from '../pm/types.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
+import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
 import {
 	type AssignedPhaseInputs,
 	type DeferrableFailure,
@@ -40,6 +45,7 @@ import {
 } from '../worker/consumer.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
 import { reconstructProjectConfig } from './db-free-project.js';
+import type { DeliveryClientOptions, FetchLike } from './delivery-client.js';
 import type {
 	AssignedWorkItem,
 	StreamLogLine,
@@ -215,15 +221,70 @@ export function deferrableOrFailedResult(
 }
 
 /**
- * The pipeline phases a DB-free worker can run today: those whose entire
- * delivery is worker-side source ops (implementer `postComment` + `pushBranch`
- * under the operator's own token, ADR-003 §2) with no server API or PM write.
- * Phases 2/3 widen this set as the server delivery API and the PM read seam land.
+ * The pipeline phases a DB-free worker can run today, and how each is delivered:
+ *
+ * - `respond-to-ci` / `resolve-conflicts` — entirely worker-side source ops
+ *   (implementer `postComment` + `pushBranch` under the operator's own token,
+ *   ADR-003 §2). No server call, no board write.
+ * - `implementation` — source ops stay on the operator token (the operator *is*
+ *   the implementer identity, so the PR and its comment are authored by that
+ *   account and loop-prevention keeps working); its two board writes go through
+ *   the control-plane PM delivery API under the project's PM credential.
+ * - `review` — the diff read and the agent run stay worker-side under the
+ *   operator token; `submitReview` goes through the control-plane SCM delivery
+ *   API under the project's **reviewer PAT**, which a federated worker must
+ *   never hold.
+ *
+ * `respond-to-review` additionally needs a PM *read* to resolve its board card,
+ * which no DB-free seam serves yet (issue #418); `planning`'s PM write surface is
+ * wider still and stays on the local host worker. Both are failed cleanly by the
+ * gate below.
  */
 const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
 	'respond-to-ci',
 	'resolve-conflicts',
+	'implementation',
+	'review',
 ]);
+
+/**
+ * The SCM delivery provider a DB-free phase runs against. `operator` is the
+ * provider built from the operator's own token, which already serves every
+ * source-carrying / attribution op. Review is the one phase whose metadata write
+ * needs an identity the worker must not hold — the project's reviewer PAT — so it
+ * gets the transport-backed composite: `submitReview`/`postComment` POST to the
+ * control plane, everything else still runs on `operator`.
+ */
+function resolveDbFreeDelivery(
+	phase: TaskPhase,
+	operator: ScmDeliveryProvider,
+	transport: DeliveryClientOptions,
+	projectId: string,
+): ScmDeliveryProvider {
+	if (phase !== 'review') return operator;
+	return createTransportScmDeliveryProvider({ ...transport, projectId, localDelegate: operator });
+}
+
+/**
+ * The PM provider a DB-free phase runs against, or `undefined` for a phase that
+ * takes none (review / respond-to-ci / resolve-conflicts — `runAssignedPhase`
+ * then constructs nothing). Implementation gets the delegate-less transport
+ * writer: its two board writes ride the delivery API under the server-held PM
+ * credential, and it has no board reads to serve — the control plane performed
+ * those when it composed this assignment.
+ */
+function resolveDbFreePm(
+	phase: TaskPhase,
+	project: ProjectConfig,
+	transport: DeliveryClientOptions,
+): PMProvider | undefined {
+	if (phase !== 'implementation') return undefined;
+	return createWriteOnlyTransportPmProvider({
+		...transport,
+		projectId: project.id,
+		providerType: project.pm.type,
+	});
+}
 
 /**
  * Collaborators {@link runAssignmentDbFree} resolves. Defaulted to the shared
@@ -237,6 +298,12 @@ export interface DbFreeAssignmentDeps {
 	buildDelivery: (repo: string, token: string) => Promise<ScmDeliveryProvider>;
 	/** The underlying agent runner the streaming wrapper wraps — the raw CLI by default. */
 	baseRunAgent: typeof runAgentCli;
+	/**
+	 * The `fetch` the control-plane delivery adapters POST with — the global by
+	 * default. A test injects a fake so it can assert the metadata calls that ride
+	 * the delivery API without a network or a live router.
+	 */
+	fetchImpl?: FetchLike;
 	logger: TransportLogger;
 }
 
@@ -245,6 +312,7 @@ function resolveDbFreeDeps(overrides: Partial<DbFreeAssignmentDeps> = {}): DbFre
 		runPhase: overrides.runPhase ?? runAssignedPhase,
 		buildDelivery: overrides.buildDelivery ?? createOperatorDeliveryProvider,
 		baseRunAgent: overrides.baseRunAgent ?? runAgentCli,
+		fetchImpl: overrides.fetchImpl,
 		logger: overrides.logger ?? defaultLogger,
 	};
 }
@@ -253,6 +321,17 @@ function resolveDbFreeDeps(overrides: Partial<DbFreeAssignmentDeps> = {}): DbFre
 export interface RunAssignmentDbFreeOptions {
 	/** The worker operator's own GitHub token (`SWARM_OPERATOR_GH_TOKEN`). */
 	operatorToken: string;
+	/**
+	 * Base URL of the control plane (`SWARM_CONTROL_PLANE_URL`) — where the
+	 * metadata delivery calls this worker cannot perform itself are POSTed.
+	 */
+	controlPlaneUrl: string;
+	/**
+	 * This worker's raw registered credential (`SWARM_WORKER_CREDENTIAL`), which
+	 * authenticates those delivery calls. It is the worker's *own* identity, never
+	 * a project credential.
+	 */
+	workerCredential: string;
 	/** Worker shutdown signal — aborting kills the in-flight agent CLI. */
 	shutdownSignal?: AbortSignal;
 	/** Dedup set keyed by `dispatchId`, shared across every assignment on the session. */
@@ -261,16 +340,31 @@ export interface RunAssignmentDbFreeOptions {
 	deps?: Partial<DbFreeAssignmentDeps>;
 }
 
+/** What {@link buildDbFreePhaseInputs} assembles the normalized phase inputs from. */
+interface DbFreePhaseInputsParams {
+	assignment: TaskAssignment;
+	project: ProjectConfig;
+	signal: AbortSignal;
+	sink: AssignmentSink;
+	/** The SCM delivery provider this phase runs against ({@link resolveDbFreeDelivery}). */
+	delivery: ScmDeliveryProvider;
+	/** The PM provider this phase runs against, or undefined for a phase that takes none. */
+	pm: PMProvider | undefined;
+	operatorToken: string;
+	baseRunAgent: typeof runAgentCli;
+}
+
 /** Assemble the normalized phase inputs from a pushed assignment + the reconstructed project. */
-function buildDbFreePhaseInputs(
-	assignment: TaskAssignment,
-	project: ProjectConfig,
-	signal: AbortSignal,
-	sink: AssignmentSink,
-	delivery: ScmDeliveryProvider,
-	operatorToken: string,
-	baseRunAgent: typeof runAgentCli,
-): AssignedPhaseInputs {
+function buildDbFreePhaseInputs({
+	assignment,
+	project,
+	signal,
+	sink,
+	delivery,
+	pm,
+	operatorToken,
+	baseRunAgent,
+}: DbFreePhaseInputsParams): AssignedPhaseInputs {
 	return {
 		phase: assignment.phase,
 		taskId: assignment.taskId,
@@ -306,9 +400,12 @@ function buildDbFreePhaseInputs(
 		reviewId: assignment.reviewId,
 		baseBranch: assignment.baseBranch,
 		baseSha: assignment.baseSha,
-		// The DB-free injection seam: operator-token delivery + the operator token
-		// as the agent's `getToken`, so no phase reaches the secret store or DB.
+		// The DB-free injection seam: the phase's resolved delivery/PM providers plus
+		// the operator token as the agent's `getToken`, so no phase reaches the secret
+		// store or DB. Source ops run under the operator's own token; the metadata
+		// writes it cannot perform ride the control-plane delivery API.
 		delivery,
+		pm,
 		agentToken: operatorToken,
 	};
 }
@@ -324,9 +421,11 @@ function buildDbFreePhaseInputs(
  *
  * Unlike the same-host executor (`../worker/transport-client.ts`), it reads no
  * database and no queue: the project is reconstructed from the assignment's
- * non-secret slice, delivery uses the operator's own token, and cancellation
- * rides the shutdown signal alone. A phase not in {@link SUPPORTED_DB_FREE_PHASES}
- * is failed cleanly with a clear reason rather than crashing on a DB/Redis access.
+ * non-secret slice, source delivery uses the operator's own token, the reviewer /
+ * PM metadata writes ride the control-plane delivery API under credentials that
+ * stay on the server, and cancellation rides the shutdown signal alone. A phase
+ * not in {@link SUPPORTED_DB_FREE_PHASES} is failed cleanly with a clear reason
+ * rather than crashing on a DB/Redis access.
  */
 export async function runAssignmentDbFree(
 	assignment: TaskAssignment,
@@ -348,7 +447,7 @@ export async function runAssignmentDbFree(
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
 	try {
 		// Fail an unsupported phase cleanly, before touching the project or delivery
-		// — a DB-free worker can only run the source-only phases in Phase 1.
+		// — see {@link SUPPORTED_DB_FREE_PHASES} for what a DB-free worker can run.
 		if (!SUPPORTED_DB_FREE_PHASES.has(phase)) {
 			sink.send({
 				type: 'task-execution-result',
@@ -363,19 +462,28 @@ export async function runAssignmentDbFree(
 		}
 
 		const project = reconstructProjectConfig(assignment.projectConfig);
-		const delivery = await deps.buildDelivery(project.repo, options.operatorToken);
+		const operatorDelivery = await deps.buildDelivery(project.repo, options.operatorToken);
+		// Where a metadata write this worker cannot perform itself is delivered: the
+		// control plane, authenticated by the worker's own credential (never a
+		// project credential — those stay server-side, ADR-002 §2).
+		const transport: DeliveryClientOptions = {
+			controlPlaneUrl: options.controlPlaneUrl,
+			workerCredential: options.workerCredential,
+			fetchImpl: deps.fetchImpl,
+		};
 
 		sink.send({ type: 'task-progress', dispatchId, runId, phase, taskId, state: 'running' });
 
-		const inputs = buildDbFreePhaseInputs(
+		const inputs = buildDbFreePhaseInputs({
 			assignment,
 			project,
-			controller.signal,
+			signal: controller.signal,
 			sink,
-			delivery,
-			options.operatorToken,
-			deps.baseRunAgent,
-		);
+			delivery: resolveDbFreeDelivery(phase, operatorDelivery, transport, project.id),
+			pm: resolveDbFreePm(phase, project, transport),
+			operatorToken: options.operatorToken,
+			baseRunAgent: deps.baseRunAgent,
+		});
 		const result = await deps.runPhase(inputs);
 		// A run the harness killed for exceeding its wall-clock timeout is a terminal
 		// failure even if the agent trapped SIGTERM and still exited 0 (issue #165) —
