@@ -1,7 +1,6 @@
 # ADR-004: Worker↔control-plane transport and split GitHub delivery
 
-- **Status:** Accepted — §1, §2, §3, and §4's attribution record implemented;
-  §4's dashboard surfacing outstanding (see below)
+- **Status:** Accepted — §1, §2, §3, and §4 implemented
 - **Date:** 2026-07-24 (renumbered 2026-07-25)
 - **Decision owners:** SWARM maintainers
 - **Builds on:** [ADR-001](./ADR-001-federated-workers-and-project-access.md)
@@ -205,8 +204,8 @@ gates stopped.
 
 ### 4. Record worker→PR attribution in the data model
 
-> **Status: the record is implemented (issue #398, phase 1/2); surfacing it in the
-> dashboard is the remaining step.** The mapping lives on the existing `runs` row:
+> **Status: built** — the record in phase 1/2 (issue #398) and its dashboard
+> surfacing in phase 2/2 (issue #446). The mapping lives on the existing `runs` row:
 > `work_item_id` / `phase` / `worker_id` / **`worker_user_id`** (new) /
 > **`produced_pr_url`** (new). Both ends are captured by the control plane, as the
 > §2 constraint requires — a DB-free worker cannot write the record itself: the
@@ -222,10 +221,21 @@ gates stopped.
 > deliberately not cleared on a retry, since the PR outlives the attempt. Both
 > columns are nullable: an unfederated / single-user run records no worker at all,
 > and only a PR-producing phase (Implementation) reports a PR.
+>
+> Phase 2/2 reads the record back on the run detail view (`/runs/$runId`):
+> `runs.getById` resolves the two ids into display labels through the existing
+> `getWorker` + `getUserById` pair — after its project-access check, so no identity
+> read happens for a caller who may not see the run — and returns them as an
+> additive `attribution` object; the page shows them as **Worker** / **Worker
+> owner** beside the engine/model, and links `produced_pr_url` as **PR opened by
+> this run**, distinct from the `PR #n` a Review run acted on. Nullability carries
+> straight through to the UI: no recorded worker renders the neutral `—`, never a
+> raw id and never a fabricated owner, and a deleted worker/user degrades to its
+> recorded id rather than erroring the page.
 
 Independent of the native GitHub authorship, the control plane records the
 `(work item, phase, worker, user, PR url)` mapping when it dispatches and when
-delivery reports back, so the dashboard can show which worker produced a given
+delivery reports back, so the dashboard **shows** which worker produced a given
 PR/review even if the token model later changes. A produced **review** needs no
 column of its own: its identity is already durable in `review_verdicts`, and the
 Review run row carries `pr_number` + `review_verdict` + `review_ordinal`, so the
