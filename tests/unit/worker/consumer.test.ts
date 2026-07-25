@@ -415,12 +415,15 @@ vi.mock('@/worktree/termination-cleanup.js', () => ({
 		),
 }));
 
+import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 import type { TriggerContext, TriggerResult } from '@/triggers/types.js';
 import {
 	type AssignedPhaseInputs,
 	DEFAULT_AGENT_TIMEOUT_MS,
+	interruptedRunCommentBody,
 	type ProcessJobDeps,
+	phaseFailureCommentBody,
 	processJob,
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
@@ -3810,5 +3813,15 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 			/requires prNumber and headSha/,
 		);
 		expect(phaseCalls).toHaveLength(0);
+	});
+});
+
+describe("the worker's out-of-band comments", () => {
+	// Both are posted as SWARM, so comment loop prevention must recognize them
+	// (issue #443) — an unmarked body would come back through the webhook as
+	// human input.
+	it('carry a SWARM-origin marker', () => {
+		expect(isSwarmGeneratedBody(phaseFailureCommentBody('implementation', 'boom'))).toBe(true);
+		expect(isSwarmGeneratedBody(interruptedRunCommentBody('stalled'))).toBe(true);
 	});
 });

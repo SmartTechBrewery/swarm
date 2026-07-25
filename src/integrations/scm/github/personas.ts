@@ -7,8 +7,17 @@
  * own output — the implementer never reviews its own PR, and the reviewer's
  * `changes_requested` routes back to the implementer, not to itself
  * (ai/CODING_STANDARDS.md "Loop prevention"). That invariant is enforced by
- * mapping every inbound event's actor to a persona (`getPersonaForLogin`) and by
- * refusing to act on events a SWARM persona itself produced (`isSwarmBot`).
+ * mapping every inbound event's actor to a persona (`getPersonaForLogin`).
+ *
+ * `isSwarmBot` — "did a SWARM persona produce this?" — is the narrower, and now
+ * largely retired, half. SWARM's *drop* gates stopped asking it: under the
+ * federated model an implementer identity is the worker operator's own account, so
+ * a login no longer distinguishes SWARM's output from that human's (ADR-004 §3).
+ * The Review trigger keys on work-item origin instead (issue #397) and comment
+ * loop prevention on the comment's own marker (issue #443,
+ * `src/scm/swarm-origin.ts`); what still calls `isSwarmBot` is the board's
+ * status-change gate (`GitHubProjectsRouterAdapter`, which has no body to mark)
+ * and `resolve-conflicts`' candidate filter.
  *
  * The two personas resolve their tokens from different sources (issue #396): the
  * `implementer` identity is resolved from the worker operator's own token
