@@ -63,16 +63,22 @@
  * doesn't reliably tell us fork-ness, so that path can't pre-filter forks — an
  * unreachable SHA there surfaces as a failed job rather than a silent drop.
  *
- * **Author-persona gate.** SWARM reviews only PRs authored by one of its own
- * personas (the implementer opens every SWARM PR), mirroring Cascade's
- * `decideCheckSuiteGates` in its default `authorMode='own'` mode: a human- or
- * third-party-bot-authored PR completing its checks (or being opened) must not
- * burn a review. On the `pull_request` path the author rides in the payload
- * (`prAuthorLogin`), so the gate is free; on the `check_suite` path the payload
- * carries no author, so it costs one `pulls.get` — run *before* the aggregate
- * query so a PR we'd never review doesn't also pay for the (heavier) Actions-API
- * call. The configurable own/external/all knob and base-branch gate Cascade
- * exposes are out of scope — see `isSwarmAuthoredPr`.
+ * **Work-item origin gate.** SWARM reviews only PRs it manages itself: a
+ * human- or third-party-authored PR completing its checks (or being opened) must
+ * not burn a review. Ownership is decided from the PR's *work-item origin*, not
+ * its author — its head branch must be exact `<branchPrefix><taskId>`
+ * and SWARM must hold an `implementation` run row for that item
+ * (`isSwarmManagedPullRequest`, `../swarm-managed-pr.ts`). Author identity no
+ * longer carries the signal: under the federated model (ADR-004 §3, issue #397)
+ * a SWARM PR is opened by the worker operator's own account, so the former
+ * persona-login gate skipped every federated PR. The gate runs once for both
+ * entry events, inside `checkMergeabilityAndConflicts` — which already fetches
+ * the PR (and so its head branch) for the mergeability check — and therefore
+ * still precedes the heavier aggregate Actions-API query on the `check_suite`
+ * path, which no longer needs an author `pulls.get` at all. The configurable
+ * own/external/all `authorMode` and base-branch gate Cascade exposes stay out of
+ * scope: SWARM only ever acts on its own output, so there is nothing to
+ * configure.
  *
  * **Cross-process dedup.** A PR that opens *and* then passes checks (or a PR
  * with several check suites) would otherwise dispatch Review more than once for
@@ -93,15 +99,14 @@ import {
 	type CheckSuiteStatus,
 	type ConflictCandidatePullRequest,
 	getCheckSuiteStatus,
-	getPullRequestAuthorLogin,
 } from '../../integrations/scm/github/client.js';
-import { isSwarmBot, resolvePersonaIdentities } from '../../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../../integrations/scm/github/scm-integration.js';
 import { logger } from '../../lib/logger.js';
 import type { GitHubParsedEvent } from '../../router/adapters/github.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import { buildRespondToCiAttemptKey, claimRespondToCiAttempt } from '../respond-to-ci-attempts.js';
 import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
+import { isSwarmManagedPullRequest, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 import { decideCheckSuiteOutcome } from './check-suite-decision.js';
 
@@ -164,70 +169,21 @@ function matchesReviewShape(ctx: TriggerContext): boolean {
 }
 
 /**
- * Author-persona gate — whether `authorLogin` is one of the project's SWARM
- * personas. SWARM reviews only PRs it authored itself (the implementer opens
- * every SWARM PR), so a human- or third-party-bot-authored PR never burns a
- * review — mirroring Cascade's `decideCheckSuiteGates` in its default
- * `authorMode='own'` mode. Resolves the project's persona identities (cached,
- * 60s TTL) and defers the throw-vs-skip decision to the caller: it throws only
- * if identity resolution throws, so the `check_suite` path can degrade to a
- * bounded recheck while the `pull_request` path fails closed.
+ * The `pull_request`-only gate: a non-draft, same-repo PR is reviewable. Logs
+ * and returns `none` on a near-miss so `handle` can fall through to the
+ * registry's next handler. A `pull_request` event never routes to Respond-to-CI
+ * — that path is driven only by a failed `check_suite`.
  *
- * The configurable own/external/all `authorMode` Cascade exposes is deliberately
- * out of scope: SWARM's dual-persona loop-prevention model only ever acts on its
- * own output, and it has no MVP requirement to review human/external PRs — so
- * there is nothing to configure. Base-branch gating is subsumed for the same
- * reason: Cascade's own-authored PRs skip the base-branch check (its
- * `decideCheckSuiteGates` "Bug 2" note, so stacked PRs aren't rejected), so with
- * an own-only gate the base check could never reject anything SWARM authored.
+ * Defensively duplicates `checkMergeabilityAndConflicts`'s own draft/fork early
+ * return; the work-item origin gate already ran there for both entry events.
  */
-async function isSwarmAuthoredPr(project: ProjectConfig, authorLogin: string): Promise<boolean> {
-	const identities = await resolvePersonaIdentities(project);
-	return isSwarmBot(authorLogin, identities);
-}
-
-/**
- * The `pull_request`-only gate: a PR must be a non-draft, same-repo PR authored
- * by a SWARM persona to be reviewable. Logs and returns `none` on a near-miss so
- * `handle` can fall through to the registry's next handler. A `pull_request`
- * event never routes to Respond-to-CI — that path is driven only by a failed
- * `check_suite`.
- *
- * The author is in the payload (`prAuthorLogin`), so the persona gate costs no
- * extra fetch. On an identity-resolution failure it fails closed (skip): the
- * PR's own completing `check_suite` re-runs this same gate with its own bounded
- * recheck, so a transient blip here can't permanently drop a legit review.
- */
-async function isReviewablePullRequest(
-	project: ProjectConfig,
-	event: GitHubParsedEvent,
-	prNumber: string,
-): Promise<ReviewDisposition> {
+function isReviewablePullRequest(event: GitHubParsedEvent, prNumber: string): ReviewDisposition {
 	if (event.isDraft) {
 		logger.debug('review: PR is a draft — skipping', { prNumber });
 		return { kind: 'none' };
 	}
 	if (event.isCrossRepo) {
 		logger.debug('review: fork PR — skipping (head SHA unreachable for review)', { prNumber });
-		return { kind: 'none' };
-	}
-	if (!event.prAuthorLogin) {
-		logger.warn('review: PR event carries no author login — skipping', { prNumber });
-		return { kind: 'none' };
-	}
-	try {
-		if (!(await isSwarmAuthoredPr(project, event.prAuthorLogin))) {
-			logger.debug('review: PR not authored by a SWARM persona — skipping', {
-				prNumber,
-				prAuthorLogin: event.prAuthorLogin,
-			});
-			return { kind: 'none' };
-		}
-	} catch (err) {
-		logger.warn(
-			'review: could not resolve persona identities for author gate — skipping (check_suite will re-evaluate)',
-			{ prNumber, error: err instanceof Error ? err.message : String(err) },
-		);
 		return { kind: 'none' };
 	}
 	return { kind: 'review' };
@@ -312,48 +268,6 @@ async function resolveCheckSuiteReview(
 	const [owner, repo] = project.repo.split('/');
 	const scm = new GitHubSCMIntegration();
 
-	// Author-persona gate, *before* the aggregate query so a PR we'd never review
-	// doesn't also pay for the (heavier) Actions-API call. The `check_suite`
-	// payload carries no author, so resolve it with a single `pulls.get` as the
-	// reviewer persona (the persona whose review would follow). A resolved author
-	// that isn't ours — or a PR with no resolvable author — is a definitive skip;
-	// any *error* determining authorship degrades to the same bounded recheck as a
-	// failed aggregate query (a transient blip must not silently drop a legit
-	// review, and the cap winds a persistent failure down to one warn+drop).
-	try {
-		const authorLogin = await scm.withPersonaCredentials(project, 'reviewer', () =>
-			getPullRequestAuthorLogin(owner, repo, Number(prNumber)),
-		);
-		if (!authorLogin) {
-			logger.debug('review: check-suite PR has no resolvable author — skipping', {
-				prNumber,
-				headSha,
-			});
-			return { kind: 'none' };
-		}
-		if (!(await isSwarmAuthoredPr(project, authorLogin))) {
-			logger.debug('review: check-suite PR not authored by a SWARM persona — skipping', {
-				prNumber,
-				headSha,
-				prAuthorLogin: authorLogin,
-			});
-			return { kind: 'none' };
-		}
-	} catch (err) {
-		return scheduleCheckSuiteRecheck(
-			project,
-			event,
-			deliveryId,
-			recheckAttempt,
-			prNumber,
-			headSha,
-			{
-				reason: 'author gate failed',
-				error: err instanceof Error ? err.message : String(err),
-			},
-		);
-	}
-
 	let checkStatus: CheckSuiteStatus;
 	try {
 		checkStatus = await scm.withPersonaCredentials(project, 'reviewer', () =>
@@ -398,9 +312,9 @@ function resolveDisposition(
 	recheckAttempt: number,
 	prNumber: string,
 	headSha: string,
-): Promise<ReviewDisposition> {
+): ReviewDisposition | Promise<ReviewDisposition> {
 	if (event.eventType === 'pull_request') {
-		return isReviewablePullRequest(project, event, prNumber);
+		return isReviewablePullRequest(event, prNumber);
 	}
 	return resolveCheckSuiteReview(project, event, deliveryId, recheckAttempt, prNumber, headSha);
 }
@@ -632,19 +546,52 @@ async function scheduleMergeabilityRecheck(
 	return null;
 }
 
-async function isSwarmAuthoredPrDetails(
+/**
+ * The work-item origin gate, tri-state: `SwarmManagedPrResult` when ownership was
+ * resolved, `'error'` when the run-history lookup failed. The caller degrades
+ * `'error'` to a bounded mergeability recheck rather than a skip — a transient DB
+ * blip must not silently drop a legitimate review.
+ */
+async function resolveSwarmManagedPr(
 	project: ProjectConfig,
-	authorLogin: string | null,
-): Promise<boolean | 'error'> {
+	headBranch: string,
+): Promise<SwarmManagedPrResult | 'error'> {
 	try {
-		const identities = await resolvePersonaIdentities(project);
-		return !authorLogin || isSwarmBot(authorLogin, identities);
+		return await isSwarmManagedPullRequest(project, headBranch);
 	} catch (err) {
-		logger.error('review: author gate resolution failed', {
+		logger.error('review: ownership gate resolution failed', {
 			projectId: project.id,
+			prBranch: headBranch,
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return 'error';
+	}
+}
+
+function logOwnershipSkip(
+	projectId: string,
+	prNumber: string,
+	prBranch: string,
+	prAuthorLogin: string | null,
+	isSwarm: Extract<SwarmManagedPrResult, { managed: false }>,
+): void {
+	if (isSwarm.reason === 'no-run') {
+		logger.warn(
+			'review: PR branch matches SWARM format but has no Implementation run row — skipping',
+			{
+				projectId,
+				prNumber,
+				prBranch,
+				prAuthorLogin,
+				taskId: isSwarm.taskId,
+			},
+		);
+	} else {
+		logger.debug('review: PR is not linked to a SWARM work item — skipping', {
+			prNumber,
+			prBranch,
+			prAuthorLogin,
+		});
 	}
 }
 
@@ -681,17 +628,19 @@ async function checkMergeabilityAndConflicts(
 		return null;
 	}
 
-	const isSwarm = await isSwarmAuthoredPrDetails(project, prDetails.authorLogin);
+	// The single ownership gate for both entry events (see the module header): the
+	// PR is SWARM's iff its head branch decodes to a work item SWARM ran
+	// Implementation for. Runs here because this is the one place both events
+	// already fetch the PR, and still *before* the `check_suite` path's heavier
+	// aggregate Actions-API query.
+	const isSwarm = await resolveSwarmManagedPr(project, prDetails.headBranch);
 	if (isSwarm === 'error') {
 		return scheduleMergeabilityRecheck(ctx, prNumber, headSha, {
-			reason: 'author gate resolution failed',
+			reason: 'ownership gate resolution failed',
 		});
 	}
-	if (!isSwarm) {
-		logger.debug('review: PR not authored by a SWARM persona — skipping', {
-			prNumber,
-			prAuthorLogin: prDetails.authorLogin,
-		});
+	if (!isSwarm.managed) {
+		logOwnershipSkip(project.id, prNumber, prDetails.headBranch, prDetails.authorLogin, isSwarm);
 		return null;
 	}
 

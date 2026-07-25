@@ -117,12 +117,12 @@ export const GitHubParsedEventSchema = z.object({
 	 */
 	isDraft: z.boolean().optional(),
 	/**
-	 * The login that opened the PR (`pull_request.user.login`). The Review
-	 * handler's author-persona gate reviews only PRs a SWARM persona authored, so
-	 * a human- or third-party-bot-authored PR doesn't burn a review. Populated
-	 * only for `pull_request` events, where the payload carries the author; the
-	 * `check_suite` path has no author in its payload and fetches it instead
-	 * (`getPullRequestAuthorLogin`).
+	 * The login that opened the PR (`pull_request.user.login`), populated only for
+	 * `pull_request` events — the `check_suite` payload carries no author.
+	 * Tracing/log data only: the Review handler's ownership gate keys on the PR's
+	 * work-item origin (head branch + Implementation run history), not on the
+	 * author, since a federated PR is opened by the worker operator's own account
+	 * (issue #397).
 	 */
 	prAuthorLogin: z.string().optional(),
 	/** Base branch of a pull request, used by the conflict-resolution side-car. */

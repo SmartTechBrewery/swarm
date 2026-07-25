@@ -35,12 +35,9 @@ vi.mock('@/triggers/respond-to-ci-attempts.js', () => ({
 }));
 
 // A `check_suite` event re-queries aggregate CI state and may schedule a
-// coalesced recheck — mock both so the tests need neither GitHub nor Redis. The
-// author-persona gate also fetches the PR author on that path (`pulls.get`), so
-// mock that too.
+// coalesced recheck — mock both so the tests need neither GitHub nor Redis.
 const {
 	getCheckSuiteStatus,
-	getPullRequestAuthorLogin,
 	scheduleCoalescedJob,
 	withPersonaCredentials,
 	hasPersonaToken,
@@ -48,17 +45,13 @@ const {
 	commentOnPullRequest,
 } = vi.hoisted(() => ({
 	getCheckSuiteStatus: vi.fn(),
-	getPullRequestAuthorLogin: vi.fn(),
 	scheduleCoalescedJob: vi.fn(),
 	withPersonaCredentials: vi.fn(),
 	hasPersonaToken: vi.fn(),
 	getPullRequest: vi.fn(),
 	commentOnPullRequest: vi.fn(),
 }));
-vi.mock('@/integrations/scm/github/client.js', () => ({
-	getCheckSuiteStatus,
-	getPullRequestAuthorLogin,
-}));
+vi.mock('@/integrations/scm/github/client.js', () => ({ getCheckSuiteStatus }));
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
 vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
 	GitHubSCMIntegration: class {
@@ -69,13 +62,27 @@ vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
 	},
 }));
 
-// The author-persona gate resolves the project's persona identities; mock just
-// that (keeping the real `isSwarmBot`) so the gate is exercised end-to-end. The
-// default identities make `swarm-impl` the implementer persona.
-const { resolvePersonaIdentities } = vi.hoisted(() => ({ resolvePersonaIdentities: vi.fn() }));
-vi.mock('@/integrations/scm/github/personas.js', async (importActual) => ({
-	...(await importActual<typeof import('@/integrations/scm/github/personas.js')>()),
-	resolvePersonaIdentities,
+const { loggerWarn, loggerDebug } = vi.hoisted(() => ({
+	loggerWarn: vi.fn(),
+	loggerDebug: vi.fn(),
+}));
+vi.mock('@/lib/logger.js', () => ({
+	logger: {
+		warn: loggerWarn,
+		debug: loggerDebug,
+		info: vi.fn(),
+		error: vi.fn(),
+	},
+}));
+
+// The work-item origin gate (issue #397) reads run history; mock just that read
+// (keeping the real `isSwarmManagedPullRequest`, so the PR's head branch really
+// has to decode under the project's `branchPrefix`). Defaults to "SWARM ran
+// Implementation for this item" — the common path.
+const { hasRunForTask } = vi.hoisted(() => ({ hasRunForTask: vi.fn() }));
+vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
+	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
+	hasRunForTask,
 }));
 
 // The `review` disposition reserves a durable safety-cap slot before
@@ -110,26 +117,28 @@ beforeEach(() => {
 	withPersonaCredentials.mockImplementation(
 		(_project: unknown, _persona: unknown, fn: () => Promise<unknown>) => fn(),
 	);
-	// Author gate defaults: identities resolve, and the PR is authored by the
-	// SWARM implementer persona (the common case). Tests flip these to exercise a
-	// human-authored PR or an identity-resolution failure.
-	resolvePersonaIdentities.mockReset();
-	resolvePersonaIdentities.mockResolvedValue({ implementer: 'swarm-impl', reviewer: 'swarm-rev' });
-	getPullRequestAuthorLogin.mockReset();
-	getPullRequestAuthorLogin.mockResolvedValue('swarm-impl');
+	// Ownership-gate default: SWARM has an Implementation run for the work item the
+	// PR's branch decodes to. Tests flip it to exercise an unrelated PR or a
+	// run-history lookup failure.
+	hasRunForTask.mockReset();
+	hasRunForTask.mockResolvedValue(true);
 	reserveReviewVerdict.mockReset();
 	reserveReviewVerdict.mockResolvedValue({ status: 'reserved', id: 'v1', ordinal: 1 });
 	hasPersonaToken.mockReset();
 	hasPersonaToken.mockResolvedValue(true);
 	getPullRequest.mockReset();
+	// `issue-42` matches `createMockProjectConfig()`'s `branchPrefix`, so the
+	// ownership gate resolves this PR to work item 42. `authorLogin` is a plain
+	// user account on purpose: under the federated model that is what a SWARM PR
+	// looks like (issue #397).
 	getPullRequest.mockResolvedValue({
 		number: 42,
-		headBranch: 'task-42',
+		headBranch: 'issue-42',
 		headSha: 'head-sha-123',
 		baseBranch: 'main',
 		baseSha: 'base-sha-123',
 		mergeable: true,
-		authorLogin: 'swarm-impl',
+		authorLogin: 'operator-human',
 	});
 	commentOnPullRequest.mockReset();
 });
@@ -182,10 +191,10 @@ describe('review trigger', () => {
 			eventType: 'pull_request',
 			action: 'opened',
 			workItemId: '42',
-			prAuthorLogin: 'swarm-impl',
+			prAuthorLogin: 'operator-human',
 		} as const;
 
-		it('dispatches Review for a non-draft same-repo PR authored by a persona', async () => {
+		it('dispatches Review for a non-draft same-repo PR linked to a SWARM work item', async () => {
 			const result = await handler.handle(
 				ctx({ ...base, headSha: 'abc123', isDraft: false, isCrossRepo: false }),
 			);
@@ -206,7 +215,7 @@ describe('review trigger', () => {
 			expect(result).toMatchObject({ phase: 'review', prNumber: '42' });
 		});
 
-		it('skips before author resolution when Review is disabled', async () => {
+		it('skips before the ownership gate when Review is disabled', async () => {
 			const project = createMockProjectConfig({
 				pipeline: { review: { enabled: false }, respondToReview: { enabled: false } },
 			});
@@ -216,7 +225,7 @@ describe('review trigger', () => {
 					project,
 				}),
 			).toBeNull();
-			expect(resolvePersonaIdentities).not.toHaveBeenCalled();
+			expect(hasRunForTask).not.toHaveBeenCalled();
 		});
 
 		it('skips a draft PR', async () => {
@@ -227,28 +236,54 @@ describe('review trigger', () => {
 			expect(await handler.handle(ctx({ ...base, headSha: 'abc', isCrossRepo: true }))).toBeNull();
 		});
 
-		it('skips a PR not authored by a SWARM persona', async () => {
+		it('dispatches Review for a PR authored by a plain user account (federated worker)', async () => {
+			// The federated implementer identity is the operator's own GitHub account
+			// (issue #397): branch + run history, not authorship, decide ownership.
 			const result = await handler.handle(
-				ctx({ ...base, headSha: 'abc', isCrossRepo: false, prAuthorLogin: 'a-human' }),
+				ctx({ ...base, headSha: 'abc', isCrossRepo: false, prAuthorLogin: 'operator-human' }),
 			);
-			expect(result).toBeNull();
-			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(result).toMatchObject({ phase: 'review', prNumber: '42', headSha: 'abc' });
+			expect(hasRunForTask).toHaveBeenCalledWith(PROJECT.id, '42', 'implementation');
 		});
 
-		it('skips a PR whose author login is missing from the payload', async () => {
-			const result = await handler.handle(
-				ctx({ ...base, headSha: 'abc', isCrossRepo: false, prAuthorLogin: undefined }),
-			);
-			expect(result).toBeNull();
-		});
-
-		it('fails closed (skips) when persona identities cannot be resolved', async () => {
-			// A completing check_suite re-runs the same gate with its own recheck, so
-			// failing closed here can't permanently drop a legit review.
-			resolvePersonaIdentities.mockRejectedValue(new Error('token lookup failed'));
+		it('skips a PR on a human-named branch', async () => {
+			getPullRequest.mockResolvedValue({
+				number: 42,
+				headBranch: 'contributor-patch',
+				headSha: 'abc',
+				baseBranch: 'main',
+				baseSha: 'base-sha-123',
+				mergeable: true,
+				authorLogin: 'a-human',
+			});
 			const result = await handler.handle(ctx({ ...base, headSha: 'abc', isCrossRepo: false }));
 			expect(result).toBeNull();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			// A branch outside the prefix is a definitive no — no run-history query.
+			expect(hasRunForTask).not.toHaveBeenCalled();
+		});
+
+		it('skips a PR on a SWARM-style branch with no Implementation run', async () => {
+			hasRunForTask.mockResolvedValue(false);
+			const result = await handler.handle(ctx({ ...base, headSha: 'abc', isCrossRepo: false }));
+			expect(result).toBeNull();
+			expect(claimReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		it('degrades to a bounded recheck when the ownership lookup throws', async () => {
+			// A transient DB blip must not silently drop a legitimate review — it
+			// defers, like a failed mergeability fetch.
+			hasRunForTask.mockRejectedValue(new Error('connection reset'));
+			const result = await handler.handle(
+				ctx({ ...base, headSha: 'abc', isCrossRepo: false }, { deliveryId: 'd-7' }),
+			);
+			expect(result).toBeNull();
+			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+			expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({
+				recheckAttempt: 1,
+				deliveryId: 'd-7',
+			});
 		});
 
 		it('skips when no head SHA is present', async () => {
@@ -273,9 +308,17 @@ describe('review trigger', () => {
 			);
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
 			expect(result).toEqual({ phase: 'review', taskId: '9', prNumber: '9', headSha: 'cafe' });
-			// The author gate fetches the PR author (number, not string) before the query.
-			expect(getPullRequestAuthorLogin).toHaveBeenCalledWith('jkwiecien', 'swarm', 9);
+			// The ownership gate ran off the fetched PR's head branch — no extra
+			// author round trip on this path any more.
+			expect(hasRunForTask).toHaveBeenCalledWith(PROJECT.id, '42', 'implementation');
 			expect(getCheckSuiteStatus).toHaveBeenCalledWith('jkwiecien', 'swarm', 'cafe');
+			// The aggregate query still runs under the reviewer persona, so the
+			// reviewer identity stays independent of the PR's author (PROJECT.md §5.3).
+			expect(withPersonaCredentials).toHaveBeenCalledWith(
+				expect.objectContaining({ id: PROJECT.id }),
+				'reviewer',
+				expect.any(Function),
+			);
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 		});
 
@@ -347,27 +390,51 @@ describe('review trigger', () => {
 			});
 		});
 
-		it('skips a PR not authored by a SWARM persona — before the aggregate query', async () => {
-			getPullRequestAuthorLogin.mockResolvedValue('a-human');
+		it('skips a PR on a SWARM-style branch with no Implementation run and logs warn', async () => {
+			hasRunForTask.mockResolvedValue(false);
+			getPullRequest.mockResolvedValueOnce({
+				number: 9,
+				headBranch: 'issue-9',
+				headSha: 'cafe',
+				baseBranch: 'main',
+				baseSha: 'base123',
+				mergeable: true,
+				authorLogin: 'operator-human',
+			});
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
 			expect(result).toBeNull();
 			// Gated before the (heavier) Actions-API call, and no dispatch claimed.
 			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+			expect(loggerWarn).toHaveBeenCalledWith(
+				expect.stringContaining('no Implementation run row'),
+				expect.objectContaining({ prBranch: 'issue-9', taskId: '9' }),
+			);
 		});
 
-		it('skips a check-suite PR with no resolvable author (no query)', async () => {
-			getPullRequestAuthorLogin.mockResolvedValue(null);
-			expect(await handler.handle(ctx({ ...base, headSha: 'cafe' }))).toBeNull();
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
-			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		it('skips a PR on a non-task branch and logs debug', async () => {
+			getPullRequest.mockResolvedValueOnce({
+				number: 9,
+				headBranch: 'contributor-patch',
+				headSha: 'cafe',
+				baseBranch: 'main',
+				baseSha: 'base123',
+				mergeable: true,
+				authorLogin: 'operator-human',
+			});
+			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
+			expect(result).toBeNull();
+			expect(loggerDebug).toHaveBeenCalledWith(
+				expect.stringContaining('not linked to a SWARM work item'),
+				expect.objectContaining({ prBranch: 'contributor-patch' }),
+			);
 		});
 
-		it('degrades to a bounded recheck when the author lookup throws', async () => {
-			// A transient error determining authorship must not drop a legit review;
+		it('degrades to a bounded recheck when the ownership lookup throws', async () => {
+			// A transient error determining ownership must not drop a legit review;
 			// it defers, like a failed aggregate query.
-			getPullRequestAuthorLogin.mockRejectedValue(new Error('502 Bad Gateway'));
+			hasRunForTask.mockRejectedValue(new Error('connection reset'));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { deliveryId: 'd-2' })),
 			).toBeNull();
@@ -377,13 +444,6 @@ describe('review trigger', () => {
 				recheckAttempt: 1,
 				deliveryId: 'd-2',
 			});
-		});
-
-		it('degrades to a bounded recheck when persona identities cannot be resolved', async () => {
-			resolvePersonaIdentities.mockRejectedValue(new Error('token lookup failed'));
-			expect(await handler.handle(ctx({ ...base, headSha: 'cafe' }))).toBeNull();
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
-			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 		});
 
 		it('dispatches Respond-to-CI when a check failed', async () => {
@@ -569,7 +629,7 @@ describe('review trigger', () => {
 			headSha: 'abc123',
 			isDraft: false,
 			isCrossRepo: false,
-			prAuthorLogin: 'swarm-impl',
+			prAuthorLogin: 'operator-human',
 		} as const;
 
 		it('claims the PR+SHA slot before dispatching', async () => {
@@ -619,7 +679,7 @@ describe('review trigger', () => {
 			headSha: 'abc123',
 			isDraft: false,
 			isCrossRepo: false,
-			prAuthorLogin: 'swarm-impl',
+			prAuthorLogin: 'operator-human',
 		} as const;
 
 		it('reserves the PR/head slot after the dispatch claim, before dispatching', async () => {
@@ -698,18 +758,18 @@ describe('review trigger', () => {
 			headSha: 'abc123',
 			isDraft: false,
 			isCrossRepo: false,
-			prAuthorLogin: 'swarm-impl',
+			prAuthorLogin: 'operator-human',
 		} as const;
 
 		it('transitions to Resolve-conflicts immediately when mergeable is false (conflicting)', async () => {
 			getPullRequest.mockResolvedValue({
 				number: 42,
-				headBranch: 'task-42',
+				headBranch: 'issue-42',
 				headSha: 'abc123',
 				baseBranch: 'main',
 				baseSha: 'base123',
 				mergeable: false,
-				authorLogin: 'swarm-impl',
+				authorLogin: 'operator-human',
 			});
 
 			const result = await handler.handle(ctx(synchronized));
@@ -718,7 +778,7 @@ describe('review trigger', () => {
 				phase: 'resolve-conflicts',
 				taskId: '42-conflicts',
 				prNumber: '42',
-				prBranch: 'task-42',
+				prBranch: 'issue-42',
 				headSha: 'abc123',
 				baseBranch: 'main',
 				baseSha: 'base123',
@@ -728,12 +788,12 @@ describe('review trigger', () => {
 		it('skips (returns null) on synchronize event when PR is mergeable (true)', async () => {
 			getPullRequest.mockResolvedValue({
 				number: 42,
-				headBranch: 'task-42',
+				headBranch: 'issue-42',
 				headSha: 'abc123',
 				baseBranch: 'main',
 				baseSha: 'base123',
 				mergeable: true,
-				authorLogin: 'swarm-impl',
+				authorLogin: 'operator-human',
 			});
 
 			const result = await handler.handle(ctx(synchronized));
@@ -743,12 +803,12 @@ describe('review trigger', () => {
 		it('schedules a deferred mergeability recheck when mergeable is null (unknown)', async () => {
 			getPullRequest.mockResolvedValue({
 				number: 42,
-				headBranch: 'task-42',
+				headBranch: 'issue-42',
 				headSha: 'abc123',
 				baseBranch: 'main',
 				baseSha: 'base123',
 				mergeable: null,
-				authorLogin: 'swarm-impl',
+				authorLogin: 'operator-human',
 			});
 
 			const result = await handler.handle(ctx(synchronized));
@@ -769,12 +829,12 @@ describe('review trigger', () => {
 		it('keeps a check-suite mergeability recheck when synchronize arrives for the same head', async () => {
 			getPullRequest.mockResolvedValue({
 				number: 42,
-				headBranch: 'task-42',
+				headBranch: 'issue-42',
 				headSha: 'abc123',
 				baseBranch: 'main',
 				baseSha: 'base123',
 				mergeable: null,
-				authorLogin: 'swarm-impl',
+				authorLogin: 'operator-human',
 			});
 
 			await handler.handle(
@@ -783,7 +843,7 @@ describe('review trigger', () => {
 					action: 'completed',
 					workItemId: '42',
 					headSha: 'abc123',
-					prBranch: 'task-42',
+					prBranch: 'issue-42',
 				}),
 			);
 			await handler.handle(ctx(synchronized));
@@ -805,12 +865,12 @@ describe('review trigger', () => {
 		it('comments and gives up on mergeability rechecks once cap is reached', async () => {
 			getPullRequest.mockResolvedValue({
 				number: 42,
-				headBranch: 'task-42',
+				headBranch: 'issue-42',
 				headSha: 'abc123',
 				baseBranch: 'main',
 				baseSha: 'base123',
 				mergeable: null,
-				authorLogin: 'swarm-impl',
+				authorLogin: 'operator-human',
 			});
 
 			const result = await handler.handle(ctx(synchronized, { recheckAttempt: 20 }));

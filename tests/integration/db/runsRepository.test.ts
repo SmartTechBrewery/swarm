@@ -25,6 +25,7 @@ import {
 	hasCompletedRunForTask,
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
+	hasRunForTask,
 	listRunsFromDb,
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
@@ -984,6 +985,45 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createRun({ projectId: PROJECT_ID, taskId: '53', phase: 'planning' });
 
 			expect(await hasCompletedRunForTask(PROJECT_ID, '53', 'planning')).toBe(false);
+		});
+	});
+
+	describe('hasRunForTask (issue #397)', () => {
+		it('is true for a still-running row — the Review trigger ownership gate case', async () => {
+			// Implementation opens its PR from inside its own running process, so the
+			// gate must see the row before it settles.
+			await createRun({ projectId: PROJECT_ID, taskId: '60', phase: 'implementation' });
+
+			expect(await hasRunForTask(PROJECT_ID, '60', 'implementation')).toBe(true);
+			expect(await hasCompletedRunForTask(PROJECT_ID, '60', 'implementation')).toBe(false);
+		});
+
+		it('is true for a failed row (status-agnostic)', async () => {
+			const failed = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '61',
+				phase: 'implementation',
+			});
+			await completeRun(failed, { status: 'failed', error: 'boom' });
+
+			expect(await hasRunForTask(PROJECT_ID, '61', 'implementation')).toBe(true);
+		});
+
+		it('is scoped to the project, task, and phase', async () => {
+			await seedProject({ id: 'proj-other-runs', repo: 'jkwiecien/other-runs-repo' });
+			await createRun({ projectId: PROJECT_ID, taskId: '62', phase: 'implementation' });
+
+			expect(await hasRunForTask('proj-other-runs', '62', 'implementation')).toBe(false);
+			expect(await hasRunForTask(PROJECT_ID, '63', 'implementation')).toBe(false);
+			expect(await hasRunForTask(PROJECT_ID, '62', 'review')).toBe(false);
+		});
+
+		it('does not require a worker id (NULL on every unfederated project)', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '64', phase: 'implementation' });
+			const row = await getRunByIdFromDb(id);
+
+			expect(row?.workerId).toBeNull();
+			expect(await hasRunForTask(PROJECT_ID, '64', 'implementation')).toBe(true);
 		});
 	});
 

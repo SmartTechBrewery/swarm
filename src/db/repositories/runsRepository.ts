@@ -609,6 +609,28 @@ export async function hasCompletedRunForTask(
 	return rows.length > 0;
 }
 
+/**
+ * Whether this project's task has *any* run row for the given phase — running,
+ * failed, or completed. Unlike {@link hasCompletedRunForTask} the status is
+ * deliberately ignored: Implementation opens the PR from *inside* its own
+ * still-running agent process, so `pull_request opened` arrives while that row
+ * is still `running` (see `src/triggers/handlers/review.ts`'s header on that
+ * race). The Review trigger's ownership gate uses this as the durable record
+ * that SWARM dispatched this work item (issue #397).
+ */
+export async function hasRunForTask(
+	projectId: string,
+	taskId: string,
+	phase: TriggerPhase,
+): Promise<boolean> {
+	const rows = await getDb()
+		.select({ id: runs.id })
+		.from(runs)
+		.where(and(eq(runs.projectId, projectId), eq(runs.taskId, taskId), eq(runs.phase, phase)))
+		.limit(1);
+	return rows.length > 0;
+}
+
 export interface ReviewMergeOutcomeUpdate {
 	/** `MergePullRequestOutcome['status']` or `'retry-exhausted'` (`src/worker/merge-automation.ts`). */
 	status: string;

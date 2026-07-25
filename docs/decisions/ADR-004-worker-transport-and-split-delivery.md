@@ -1,6 +1,8 @@
 # ADR-004: Worker↔control-plane transport and split GitHub delivery
 
-- **Status:** Accepted — §1, §2, and §4's attribution record implemented; §3 and §4's dashboard surfacing outstanding (see below)
+- **Status:** Accepted — §1, §2, and §4's attribution record implemented; §3 partly
+  implemented (the review trigger's ownership gate; comment loop prevention
+  outstanding); §4's dashboard surfacing outstanding (see below)
 - **Date:** 2026-07-24 (renumbered 2026-07-25)
 - **Decision owners:** SWARM maintainers
 - **Builds on:** [ADR-001](./ADR-001-federated-workers-and-project-access.md)
@@ -150,28 +152,38 @@ item build out of order.
 
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
 
-> **Status: outstanding — issue #397.** Not implemented, and no longer
-> hypothetical: since §2 landed for Implementation (issue #417), a federated PR is
-> authored by the operator's own account, so the persona-authorship gate skips it
-> and **auto-review does not fire on the federated path**. This is the gating item
-> for that path being usable end to end.
+> **Status: partly implemented — issue #397.** The **`pr-review` trigger's
+> ownership gate is done** (phase 1): the three author checks in
+> `src/triggers/handlers/review.ts` collapsed into one work-item origin gate,
+> `isSwarmManagedPullRequest` (`src/triggers/swarm-managed-pr.ts`), evaluated once
+> per event inside the mergeability check, with `isSwarmAuthoredPr` and the GitHub
+> client's `getPullRequestAuthorLogin` deleted. **Comment loop prevention is still
+> outstanding** (phase 2): `GitHubRouterAdapter.isSelfAuthored` still keys on
+> persona logins, as does `resolve-conflicts`' own candidate filter. This mattered
+> once §2 landed for Implementation (issue #417): a federated PR is authored by the
+> operator's own account, so the persona-authorship gate skipped it and auto-review
+> did not fire on the federated path at all.
 
-Today SWARM decides a PR should be auto-reviewed by checking that its **author
+SWARM used to decide a PR should be auto-reviewed by checking that its **author
 is a SWARM persona**: `isSwarmAuthoredPr` → `isSwarmBot(authorLogin, identities)`
-(`src/triggers/handlers/review.ts:181-217`), with the author taken from
-`pull_request.user.login` (`src/router/adapters/github.ts:127,209`) or a
-`pulls.get` on `check_suite` (`review.ts:321-322`); non-persona authors are
-skipped ("PR not authored by a SWARM persona — skipping", `review.ts:217`).
+in `src/triggers/handlers/review.ts`, with the author taken from
+`pull_request.user.login` (`src/router/adapters/github.ts`) or a `pulls.get` on
+`check_suite`; non-persona authors were skipped.
 
-Under §2 the PR author becomes the worker operator's own account, so this gate
-would skip every federated PR and auto-review would never fire. The trigger must
-instead recognise a PR as SWARM-managed by its **linkage to a SWARM work item
-opened by a registered worker**, not by author identity. The same re-basing
-applies to the comment-loop-prevention drop (`isSelfAuthored`,
-`github.ts:321-334`): loop prevention keys on work-item/worker origin rather
-than on a persona login. The reviewer identity remains distinct from the author
-(per-project reviewer PAT ≠ user account), so the independent-reviewer invariant
-(PROJECT.md §5.3) still holds.
+Under §2 the PR author becomes the worker operator's own account, so that gate
+skips every federated PR and auto-review never fires — and on a true federation
+the control plane cannot resolve the implementer identity at all, since that
+token is worker-local. The trigger instead recognises a PR as SWARM-managed by
+its **linkage to a SWARM work item SWARM itself ran**: the head branch decodes to
+a work-item number under the project's `branchPrefix` *and* an `implementation`
+run row exists for that work item in that project (`hasRunForTask`,
+status-agnostic, and never requiring `runs.workerId` — that column is NULL on
+every unfederated project). The same re-basing applies to the
+comment-loop-prevention drop (`isSelfAuthored`, `src/router/adapters/github.ts`):
+loop prevention keys on work-item/worker origin rather than on a persona login.
+The reviewer identity remains distinct from the author (per-project reviewer PAT
+≠ user account) and the aggregate check query and Review phase still run under it,
+so the independent-reviewer invariant (PROJECT.md §5.3) still holds.
 
 ### 4. Record worker→PR attribution in the data model
 
