@@ -199,6 +199,20 @@ export interface AgentUsage {
 	totalTokens?: number;
 }
 
+/**
+ * Mirrors the server `RunAttribution` (`src/api/routers/runs.ts`, issue #446):
+ * display labels for the worker that executed a run and the SWARM user who owns
+ * it, resolved server-side from the row's `workerId`/`workerUserId`. A name is
+ * null when the worker/user row no longer resolves; the ids ride along so the UI
+ * can fall back to one instead of showing nothing.
+ */
+export interface RunAttribution {
+	workerId: string | null;
+	workerName: string | null;
+	userId: string | null;
+	userDisplayName: string | null;
+}
+
 export interface RunRow {
 	id: string;
 	projectId: string;
@@ -208,7 +222,24 @@ export interface RunRow {
 	workItemUrl: string | null;
 	prNumber: string | null;
 	prTitle: string | null;
+	/**
+	 * URL of the pull request *this* run opened (ADR-004 §4, issue #398) — set
+	 * only by a PR-producing phase (Implementation), and never cleared on retry
+	 * since the PR outlives the attempt. Distinct from `prNumber`, which is the PR
+	 * a run *acted on*. Null for every other phase and pre-existing rows.
+	 */
+	producedPrUrl: string | null;
 	phase: string;
+	/** The worker that executed this run; null for an unfederated/single-user run and pre-existing rows. */
+	workerId: string | null;
+	/** The SWARM user owning `workerId`, denormalized at dispatch so it survives the worker row's removal. */
+	workerUserId: string | null;
+	/**
+	 * Server-resolved display labels for `workerId`/`workerUserId` (issue #446);
+	 * null when the run recorded no worker. Returned by `runs.getById` only — the
+	 * runs list carries the raw ids without the identity lookup.
+	 */
+	attribution?: RunAttribution | null;
 	engine: string | null;
 	model: string | null;
 	/** Explicitly requested reasoning level; null = CLI/model default (issue #180). */

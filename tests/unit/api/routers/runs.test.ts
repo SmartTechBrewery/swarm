@@ -26,6 +26,16 @@ vi.mock('@/identity/membership-service.js', () => ({
 	listAccessibleProjectIds: vi.fn(),
 }));
 
+// The attribution lookups `getById` resolves (issue #446), mocked at their own
+// module boundaries like every other repository/service read in this file.
+vi.mock('@/identity/worker-service.js', () => ({
+	getWorker: vi.fn(),
+}));
+
+vi.mock('@/db/repositories/usersRepository.js', () => ({
+	getUserById: vi.fn(),
+}));
+
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	getActiveDispatchByRunId: vi.fn(),
 	getDispatchById: vi.fn(),
@@ -119,6 +129,7 @@ import {
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
 } from '@/db/repositories/runsRepository.js';
+import { getUserById } from '@/db/repositories/usersRepository.js';
 import type { runs } from '@/db/schema/runs.js';
 import {
 	cancelDispatchAndWake,
@@ -130,6 +141,7 @@ import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
+import { getWorker } from '@/identity/worker-service.js';
 import { getPMProvider } from '@/integrations/pm/registry.js';
 import {
 	clearRunCancellation,
@@ -302,6 +314,8 @@ describe('runsRouter', () => {
 		vi.mocked(createAndPublishDispatch).mockReset();
 		vi.mocked(publishDispatchWakeUp).mockReset();
 		vi.mocked(resetRun).mockReset();
+		vi.mocked(getWorker).mockReset();
+		vi.mocked(getUserById).mockReset();
 	});
 
 	describe('list', () => {
@@ -516,7 +530,7 @@ describe('runsRouter', () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(run);
 
 			const result = await caller.getById({ id: 'run-1' });
-			expect(result).toEqual(run);
+			expect(result).toEqual({ ...run, attribution: null });
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
 		});
@@ -530,6 +544,101 @@ describe('runsRouter', () => {
 					message: 'Run with ID "missing" not found',
 				}),
 			);
+		});
+
+		// Attribution enrichment (ADR-004 §4, issue #446).
+		describe('attribution', () => {
+			const WORKER = {
+				id: 'worker-1',
+				ownerUserId: 'user-1',
+				displayName: 'alice-macbook',
+				capabilities: ['claude' as const],
+				createdAt: new Date(0),
+				updatedAt: new Date(0),
+			};
+			const OWNER: SwarmUser = {
+				id: 'user-1',
+				identifier: 'alice@example.com',
+				displayName: 'Alice Example',
+				instanceAdmin: false,
+				createdAt: new Date(0),
+				updatedAt: new Date(0),
+			};
+
+			it('resolves both display names for a run dispatched to a federated worker', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', workerId: 'worker-1', workerUserId: 'user-1' }),
+				);
+				vi.mocked(getWorker).mockResolvedValue(WORKER);
+				vi.mocked(getUserById).mockResolvedValue(OWNER);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toEqual({
+					workerId: 'worker-1',
+					workerName: 'alice-macbook',
+					userId: 'user-1',
+					userDisplayName: 'Alice Example',
+				});
+				expect(getWorker).toHaveBeenCalledWith('worker-1');
+				expect(getUserById).toHaveBeenCalledWith('user-1');
+			});
+
+			it('returns null attribution — and skips both lookups — for a run with no recorded worker', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1' }));
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toBeNull();
+				expect(getWorker).not.toHaveBeenCalled();
+				expect(getUserById).not.toHaveBeenCalled();
+			});
+
+			it("falls back to the worker row's owner for a historical row with no worker_user_id", async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', workerId: 'worker-1', workerUserId: null }),
+				);
+				vi.mocked(getWorker).mockResolvedValue(WORKER);
+				vi.mocked(getUserById).mockResolvedValue(OWNER);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toEqual({
+					workerId: 'worker-1',
+					workerName: 'alice-macbook',
+					userId: 'user-1',
+					userDisplayName: 'Alice Example',
+				});
+				expect(getUserById).toHaveBeenCalledWith('user-1');
+			});
+
+			it('degrades to null names when the worker and user rows are gone', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', workerId: 'worker-gone', workerUserId: 'user-gone' }),
+				);
+				vi.mocked(getWorker).mockResolvedValue(undefined);
+				vi.mocked(getUserById).mockResolvedValue(undefined);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toEqual({
+					workerId: 'worker-gone',
+					workerName: null,
+					userId: 'user-gone',
+					userDisplayName: null,
+				});
+			});
+
+			it('degrades to the recorded ids instead of failing the page when a lookup throws', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', workerId: 'worker-1', workerUserId: 'user-1' }),
+				);
+				vi.mocked(getWorker).mockRejectedValue(new Error('identity store unreachable'));
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toEqual({
+					workerId: 'worker-1',
+					workerName: null,
+					userId: 'user-1',
+					userDisplayName: null,
+				});
+			});
 		});
 	});
 
@@ -1500,6 +1609,19 @@ describe('runsRouter', () => {
 				);
 			});
 
+			it('denies getById before resolving any attribution label (issue #446)', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', workerId: 'worker-1', workerUserId: 'user-1' }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.getById({ id: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'NOT_FOUND' }),
+				);
+				expect(getWorker).not.toHaveBeenCalled();
+				expect(getUserById).not.toHaveBeenCalled();
+			});
+
 			it('denies getLogs on a run in a project the caller cannot see with identical error shape as unknown run', async () => {
 				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', projectId: 'p1' }));
 				vi.mocked(getMembership).mockResolvedValue(undefined);
@@ -1529,7 +1651,10 @@ describe('runsRouter', () => {
 				vi.mocked(getRunByIdFromDb).mockResolvedValue(run);
 				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
 
-				await expect(ordinary.getById({ id: 'run-1' })).resolves.toEqual(run);
+				await expect(ordinary.getById({ id: 'run-1' })).resolves.toEqual({
+					...run,
+					attribution: null,
+				});
 			});
 		});
 
