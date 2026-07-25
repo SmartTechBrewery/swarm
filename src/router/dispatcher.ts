@@ -46,6 +46,8 @@ import { requireEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { parseRedisUrl } from '../lib/redis.js';
+import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
+import type { WorkItem } from '../pm/types.js';
 import { RUN_CANCELLED_MESSAGE } from '../queue/cancellation.js';
 import { QUEUE_NAME, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
 import { DeliveryDeferredError } from '../scm/delivery.js';
@@ -166,15 +168,17 @@ function resultAgent(
  * Adapt a worker's terminal `TaskExecutionResult` back into the shape
  * `processJob`'s shared settle path consumes: a `PhaseRunResult` for a success, or
  * a throw that the shared `handlePhaseFailure` classifies exactly as an in-process
- * failure would — `RunTerminatedError` for a user cancellation, `DeliveryDeferredError`
- * or an `AgentRunError` (with the reported failure kind) for a deferral, and a
- * plain terminal error otherwise. The synthetic agent result carries the reported
- * exit metadata; its non-zero exit keeps a genuinely-interrupted `timeout`
+ * failure would — `RunTerminatedError` for a user cancellation, `DependencyBlockedError`,
+ * `DeliveryDeferredError` or an `AgentRunError` (with the reported failure kind) for a
+ * deferral, and a plain terminal error otherwise. The synthetic agent result carries the
+ * reported exit metadata; its non-zero exit keeps a genuinely-interrupted `timeout`
  * deferrable, matching the in-process rule.
  */
 export function adaptResultToPhaseRun(
 	result: TaskExecutionResult,
 	selection: DispatchSelection,
+	/** The dispatched board item, for rebuilding a reported dependency block (issue #438). */
+	workItem?: WorkItem,
 ): PhaseRunResult {
 	if (result.status === 'succeeded') {
 		return {
@@ -196,6 +200,21 @@ export function adaptResultToPhaseRun(
 	}
 	// deferred: rebuild the classified failure so the shared deferral path applies
 	// its budget and retry-delay policy exactly as it does for an in-process failure.
+	//
+	// A dependency block (issue #438): rebuild the error the in-process gate throws so
+	// the shared path applies the same bounded, token-free recheck budget and posts the
+	// same "must be done first" message once it is exhausted. Both the item and a
+	// non-empty blocker list are needed for that message and the deferral log line to
+	// name the prerequisites, so a frame missing either stays terminal — today's
+	// behaviour — rather than deferring with a message that names nothing. Only
+	// Implementation gates on dependencies and its trigger always carries the work item
+	// (`../triggers/types.ts`), so that is a wiring bug, never a real case.
+	if (result.failureKind === 'dependency') {
+		if (workItem && result.blockers?.length) {
+			throw new DependencyBlockedError(workItem, result.blockers);
+		}
+		throw new Error(result.reason ?? 'Phase blocked on an unfinished prerequisite');
+	}
 	if (result.failureKind === 'delivery') {
 		throw new DeliveryDeferredError(result.reason ?? 'Delivery deferred on the worker');
 	}
@@ -347,7 +366,11 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 			selection,
 			timeoutMs + RESULT_WAIT_MARGIN_MS,
 		);
-		return adaptResultToPhaseRun(result, selection);
+		return adaptResultToPhaseRun(
+			result,
+			selection,
+			'workItem' in trigger ? trigger.workItem : undefined,
+		);
 	} finally {
 		awaiting.dispose();
 	}

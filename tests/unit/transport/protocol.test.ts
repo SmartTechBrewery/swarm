@@ -217,6 +217,32 @@ describe('transport protocol schemas', () => {
 			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
 		});
 
+		it('round-trips a dependency deferral carrying the open blockers (issue #438)', () => {
+			const frame = {
+				type: 'task-execution-result' as const,
+				dispatchId: DISPATCH_ID,
+				status: 'deferred' as const,
+				phase: 'implementation' as const,
+				taskId: '17',
+				retryDelayMs: 0,
+				resumable: false,
+				failureKind: 'dependency',
+				reason: '#319 (“Session auth”) must be done first',
+				blockers: [
+					{
+						reference: '#319',
+						url: 'https://github.com/jkwiecien/swarm/issues/319',
+						title: 'Session auth',
+						open: true,
+						source: 'dependency' as const,
+					},
+				],
+			};
+			// The blockers must survive the wire, not just the type: the control plane
+			// rebuilds `DependencyBlockedError` from them so its message names #319.
+			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
+		});
+
 		it('round-trips a failed, cancelled task-execution-result', () => {
 			const frame = {
 				type: 'task-execution-result' as const,
