@@ -146,9 +146,15 @@ export interface SCMProvider extends ScmMergeProvider {
 	personaForActor(login: string, identities: ScmPersonaIdentities): ScmPersona | null;
 
 	/**
-	 * Whether an actor login is one of SWARM's own personas — the loop-prevention
-	 * drop gate. Named in SWARM's vocabulary rather than a provider's bot
-	 * conventions; recognizing a provider's app/bot spellings is the adapter's job.
+	 * Whether an actor login matches one of SWARM's configured persona identities.
+	 * Used by the PM board's status-change gate and the conflict-candidate filter.
+	 *
+	 * Note: this is NOT SWARM's loop-prevention drop gate for events. Under the
+	 * federated model (ADR-004 §3), an implementer identity is the worker operator's
+	 * own account, so actor login alone cannot distinguish SWARM's output from human
+	 * actions. Event drop gates use SWARM-origin markers (`src/scm/swarm-origin.ts`,
+	 * issue #443) for comments and work-item origin (`src/triggers/swarm-managed-pr.ts`,
+	 * issue #397) for PR review ownership.
 	 */
 	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean;
 
@@ -176,18 +182,6 @@ export interface SCMProvider extends ScmMergeProvider {
 
 	/** A pull request's title, or `null` when the provider reports none. */
 	getPullRequestTitle(
-		project: ProjectConfig,
-		prNumber: number,
-		persona?: ScmPersona,
-	): Promise<string | null>;
-
-	/**
-	 * The login that opened a pull request, or `null` when it has no author (e.g.
-	 * a deleted account). Throws on an API failure, so a caller can distinguish
-	 * "couldn't determine authorship" (worth a bounded recheck) from a
-	 * resolved-but-not-ours author (a definitive skip).
-	 */
-	getPullRequestAuthor(
 		project: ProjectConfig,
 		prNumber: number,
 		persona?: ScmPersona,

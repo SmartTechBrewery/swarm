@@ -23,7 +23,6 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	withGitHubToken: vi.fn((_token: string, fn: () => Promise<unknown>) => fn()),
 	getGitHubUserForToken: vi.fn(),
 	getCheckSuiteStatus: vi.fn(),
-	getPullRequestAuthorLogin: vi.fn(),
 	getPullRequestMergeState: vi.fn(),
 	getPullRequestReviewDecision: vi.fn(),
 	getPullRequestReviews: vi.fn(),
@@ -34,7 +33,6 @@ import { getPersonaToken, getPersonaTokenOrNull } from '@/config/provider.js';
 import {
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
-	getPullRequestAuthorLogin,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getPullRequestReviews,
@@ -162,6 +160,18 @@ describe('GitHubSCMIntegration', () => {
 			expect(scm.isSwarmActor('swarm-impl[bot]', IDENTITIES)).toBe(true);
 			expect(scm.isSwarmActor('human', IDENTITIES)).toBe(false);
 		});
+
+		it('returns true when actor matches implementer/operator identity, showing why it cannot serve as an event drop gate (#397/#443)', () => {
+			// Under the federated model (ADR-004 §3), the implementer identity is the worker
+			// operator's own account. isSwarmActor returns true for it, which means an event drop
+			// gate based on login would silently drop human-authored events. Drop gates use
+			// SWARM-origin markers (#443) and work-item origin (#397) instead.
+			const federatedIdentities: ScmPersonaIdentities = {
+				implementer: 'jkwiecien',
+				reviewer: 'swarm-rev[bot]',
+			};
+			expect(scm.isSwarmActor('jkwiecien', federatedIdentities)).toBe(true);
+		});
 	});
 
 	describe('verifyWebhookSignature', () => {
@@ -181,34 +191,6 @@ describe('GitHubSCMIntegration', () => {
 
 		it('rejects a signature computed over a different body', () => {
 			expect(scm.verifyWebhookSignature('{"action":"closed"}', valid, secret)).toBe(false);
-		});
-	});
-
-	describe('getPullRequestAuthor', () => {
-		beforeEach(() => {
-			vi.mocked(getPullRequestAuthorLogin).mockReset();
-			vi.mocked(getPullRequestAuthorLogin).mockResolvedValue('someone');
-		});
-
-		it('reads under the reviewer persona by default, with owner/repo split from project.repo', async () => {
-			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
-			await expect(scm.getPullRequestAuthor(project, 42)).resolves.toBe('someone');
-
-			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
-			expect(withGitHubToken).toHaveBeenCalledWith('tok-rev', expect.any(Function));
-			expect(getPullRequestAuthorLogin).toHaveBeenCalledWith('jkwiecien', 'swarm', 42);
-		});
-
-		it('honours an explicit persona override', async () => {
-			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
-			await scm.getPullRequestAuthor(project, 42, 'implementer');
-			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
-		});
-
-		it('propagates an API failure rather than reporting no author', async () => {
-			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
-			vi.mocked(getPullRequestAuthorLogin).mockRejectedValue(new Error('502 Bad Gateway'));
-			await expect(scm.getPullRequestAuthor(project, 42)).rejects.toThrow(/502/);
 		});
 	});
 

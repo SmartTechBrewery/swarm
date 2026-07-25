@@ -38,7 +38,6 @@ describe('github SCM manifest registration', () => {
 			'verifyWebhookSignature',
 			'getPullRequest',
 			'getPullRequestTitle',
-			'getPullRequestAuthor',
 			'getAggregateCheckStatus',
 			'listConflictCandidates',
 			'commentOnPullRequest',

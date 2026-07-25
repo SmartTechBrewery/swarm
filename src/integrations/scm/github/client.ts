@@ -272,16 +272,6 @@ export async function getPullRequest(
 	};
 }
 
-/** Retrieve the login handle of a pull request author. */
-export async function getPullRequestAuthorLogin(
-	owner: string,
-	repo: string,
-	prNumber: number,
-): Promise<string | null> {
-	const pr = await getPullRequest(owner, repo, prNumber);
-	return pr.authorLogin;
-}
-
 /**
  * Resolve the GitHub login a token authenticates as, or `null` if the token is
  * absent or the lookup fails. Used to map a persona's token to its bot identity

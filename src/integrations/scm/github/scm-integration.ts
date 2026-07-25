@@ -14,8 +14,11 @@
  * The `implements SCMProvider` declaration below *is* the conformance check —
  * with one provider, a runtime conformance harness would be speculative
  * (ai/TESTING.md "Provider conformance"). Everything GitHub-specific — Octokit
- * types, GraphQL node IDs, `sha256=` signature framing, which REST status means
- * which merge outcome — stays inside this module and `./client.js`.
+ * types, GraphQL node IDs, which REST status means which merge outcome — stays
+ * inside this module and `./client.js` (the GitHub signature scheme's `sha256=`
+ * framing currently lives in `src/webhook/signature-verification.ts`; relocating
+ * it under `src/integrations/scm/github/` belongs to the ingress migration,
+ * issue #385).
  */
 
 import { execFile } from 'node:child_process';
@@ -38,7 +41,6 @@ import {
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
 	getPullRequest,
-	getPullRequestAuthorLogin,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getPullRequestReviews,
@@ -205,8 +207,10 @@ export class GitHubSCMIntegration implements SCMProvider {
 	}
 
 	/**
-	 * {@link SCMProvider.isSwarmActor} — GitHub's `isSwarmBot`, which also matches
-	 * the `[bot]`-suffixed forms GitHub App identities surface with on events.
+	 * {@link SCMProvider.isSwarmActor} — GitHub's `isSwarmBot`, which matches
+	 * configured persona identities and `[bot]`-suffixed App forms for the PM
+	 * board's status-change gate and conflict filter (NOT the event drop gate,
+	 * which uses markers per #443 and work-item origin per #397).
 	 */
 	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean {
 		return isSwarmBot(login, identities);
@@ -282,26 +286,6 @@ export class GitHubSCMIntegration implements SCMProvider {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
 			getPullRequestTitle(owner, repo, prNumber),
-		);
-	}
-
-	/**
-	 * {@link SCMProvider.getPullRequestAuthor} — who opened a PR, for the review
-	 * handler's author-persona gate on the `check_suite` path (that payload, unlike
-	 * a `pull_request` event, carries no author). Defaults to the **reviewer**
-	 * persona, matching the credential scope the review handler already reads it
-	 * under. Throws on an API failure, so the caller can degrade a
-	 * "can't-determine-authorship" error to a bounded recheck rather than treating
-	 * it as a definitive skip.
-	 */
-	async getPullRequestAuthor(
-		project: ProjectConfig,
-		prNumber: number,
-		persona: ScmPersona = 'reviewer',
-	): Promise<string | null> {
-		const [owner, repo] = project.repo.split('/');
-		return this.withPersonaCredentials(project, persona, () =>
-			getPullRequestAuthorLogin(owner, repo, prNumber),
 		);
 	}
 
