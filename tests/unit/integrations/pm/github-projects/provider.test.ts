@@ -335,6 +335,35 @@ describe('GitHubProjectsPMProvider', () => {
 		});
 	});
 
+	describe('findWorkItemByUrlSuffix', () => {
+		// `/issues/10` and `/issues/100`: the suffix match must not confuse them.
+		const LONGER_NUMBER_NODE = {
+			...ITEM_NODE,
+			id: 'PVTI_z',
+			content: {
+				...ITEM_NODE.content,
+				number: 100,
+				url: 'https://github.com/jkwiecien/swarm/issues/100',
+			},
+		};
+
+		it('returns the one card whose backing URL ends with the suffix', async () => {
+			graphql.mockResolvedValue({
+				node: { items: { nodes: [LONGER_NUMBER_NODE, ITEM_NODE] } },
+			});
+
+			const item = await provider.findWorkItemByUrlSuffix('/issues/10');
+
+			expect(item?.id).toBe('PVTI_x');
+		});
+
+		it('returns undefined when nothing on the board wraps that URL', async () => {
+			graphql.mockResolvedValue({ node: { items: { nodes: [ITEM_NODE] } } });
+
+			await expect(provider.findWorkItemByUrlSuffix('/issues/999')).resolves.toBeUndefined();
+		});
+	});
+
 	describe('moveWorkItem', () => {
 		it('writes the mapped option ID to the Status field', async () => {
 			graphql.mockResolvedValue({

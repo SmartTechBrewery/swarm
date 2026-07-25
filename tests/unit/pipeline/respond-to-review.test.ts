@@ -251,6 +251,11 @@ describe('runRespondToReviewPhase', () => {
 				type: 'github-projects' as const,
 				getWorkItem: vi.fn(),
 				listWorkItems: vi.fn(async () => workItems),
+				// The narrow lookup the phase actually calls — the same suffix match the
+				// real adapter runs, so a DB-free worker can serve it as one board read.
+				findWorkItemByUrlSuffix: vi.fn(async (urlSuffix: string) =>
+					workItems.find((item) => item.url.endsWith(urlSuffix)),
+				),
 				moveWorkItem: vi.fn(async (_id: string, _status: string) => {}),
 				addComment: vi.fn(async () => 'c1'),
 				findComment: vi.fn(async () => undefined),
@@ -315,10 +320,12 @@ describe('runRespondToReviewPhase', () => {
 			expect(deps.runAgent).toHaveBeenCalledTimes(1);
 		});
 
-		it('never fails the response when listing the board throws (best-effort)', async () => {
+		it('never fails the response when resolving the card throws (best-effort)', async () => {
 			const deps = makeDeps();
 			const pm = makePm();
-			pm.listWorkItems.mockRejectedValue(new Error('graphql 502'));
+			// The same skip applies whether the provider is the in-process adapter or a
+			// DB-free worker's transport delegate answering over the delivery API.
+			pm.findWorkItemByUrlSuffix.mockRejectedValue(new Error('graphql 502'));
 
 			const result = await runRespondToReviewPhase({ ...deps, pm });
 

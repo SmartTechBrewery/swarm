@@ -38,12 +38,22 @@
  * from the request — so a worker cannot key a row to a project or repository it
  * isn't enrolled in.
  *
- * Eight routes, all under `/worker/delivery`:
+ * The last route fronts neither a credential nor a table but the **dispatch store
+ * and queue**: a `fixed` Respond-to-review response owes its newly pushed commit
+ * exactly one follow-up Review (issue #241), which the default scheduler
+ * (`../pipeline/follow-up-review.ts`) delivers by writing a dispatch row and
+ * enqueueing a synthetic event. A DB-free worker can do neither, so it POSTs the
+ * PR coordinates and this route performs that same enqueue — for the
+ * **authenticated** project, never one named in the request.
+ *
+ * Ten routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
  *   - `POST /worker/delivery/pm/comment` — comment on the item's backing Issue/PR.
  *   - `POST /worker/delivery/pm/blockers` — read the item's open prerequisites.
+ *   - `POST /worker/delivery/pm/find-item` — resolve one card by its backing URL's tail.
+ *   - `POST /worker/delivery/follow-up-review` — schedule the follow-up Review a fix owes.
  *   - `POST /worker/delivery/review-ledger/prior` — the PR's prior submitted verdict.
  *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
  *   - `POST /worker/delivery/review-ledger/abandon` — release a pending slot.
@@ -51,7 +61,8 @@
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
  * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
- * `handleListBlockers`, `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
+ * `handleListBlockers`, `handleFindWorkItem`, `handleScheduleFollowUpReview`,
+ * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
  * tests drive them with fake deps and never need a live router; collaborators
  * default to the real services and are overridden in tests. Credential handling
  * matches the handshake's contract — the raw credential appears only in the
@@ -75,12 +86,18 @@ import { resolveWorkerByCredential } from '../identity/worker-service.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
 import type { GitHubPersona } from '../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import {
+	type ScheduleFollowUpReview,
+	scheduleFollowUpReviewDefault,
+} from '../pipeline/follow-up-review.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import type { PMProvider } from '../pm/types.js';
 import type { ScmDeliveryProvider } from '../scm/delivery.js';
 import {
 	AbandonReviewLedgerRequestSchema,
 	AddPmCommentDeliveryRequestSchema,
+	FindWorkItemDeliveryRequestSchema,
+	FollowUpReviewDeliveryRequestSchema,
 	ListBlockersDeliveryRequestSchema,
 	MarkReviewLedgerRequestSchema,
 	MoveWorkItemDeliveryRequestSchema,
@@ -113,6 +130,12 @@ export interface WorkerDeliveryDeps {
 	 * drift from the contract the Review phase programs against.
 	 */
 	reviewLedger: ReviewVerdictLedger;
+	/**
+	 * Schedule the follow-up Review a pushed fix owes (issue #241), defaulted to
+	 * the same dispatch+queue enqueue the local host worker runs in-process — the
+	 * exact operation a DB-free worker cannot perform itself.
+	 */
+	scheduleFollowUpReview: ScheduleFollowUpReview;
 }
 
 /** A worker may deliver to a project only via a routable enrollment (active + sharing consent). */
@@ -132,6 +155,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 			new GitHubSCMIntegration().deliveryProvider(project, persona),
 		buildPmProvider: createGitHubProjectsProvider,
 		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
+		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
 	};
 }
 
@@ -328,6 +352,83 @@ export async function handleListBlockers(
 }
 
 /**
+ * Resolve one board card by the tail of its backing Issue/PR URL — the second PM
+ * **read** the delivery API serves, so a federated worker's Respond-to-review run
+ * can still report In progress / In review on the board it holds no credential
+ * for. Same prelude and contract as {@link handleMoveWorkItem}; the match runs
+ * inside the provider (`PMProvider.findWorkItemByUrlSuffix`), so nothing here
+ * pattern-matches a provider-specific URL shape (ai/RULES.md §2), and
+ * `item: null` is the ordinary "no card wraps that URL" answer rather than a 404.
+ */
+export async function handleFindWorkItem(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = FindWorkItemDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	const item = await pm.findWorkItemByUrlSuffix(request.urlSuffix);
+	const projected = item
+		? {
+				id: item.id,
+				title: item.title,
+				url: item.url,
+				...(item.status !== undefined && { status: item.status }),
+				...(item.statusId !== undefined && { statusId: item.statusId }),
+			}
+		: null;
+	return { status: 200, json: { item: projected } };
+}
+
+/**
+ * Schedule the one follow-up Review a `fixed` Respond-to-review response owes its
+ * newly pushed commit (issue #241) — the dispatch row + queue enqueue a DB-free
+ * worker cannot perform. Same prelude and contract as {@link handleMoveWorkItem};
+ * the project comes from the **authenticated** enrollment, never from the request,
+ * so a worker cannot schedule a dispatch into a project it isn't enrolled in. The
+ * scheduler's deterministic dispatch identity absorbs a retried call, so this
+ * route is safe to re-send.
+ */
+export async function handleScheduleFollowUpReview(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = FollowUpReviewDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	await deps.scheduleFollowUpReview({
+		project: authed.project,
+		prNumber: request.prNumber,
+		prBranch: request.prBranch,
+		headSha: request.headSha,
+	});
+	return { status: 200, json: {} };
+}
+
+/**
  * Read the PR's prior submitted verdict from the ledger — the re-review signal
  * (issue #328) a DB-free worker cannot look up itself. Same prelude and contract
  * as {@link handleSubmitReview}; the ledger key's project and repository come from
@@ -482,6 +583,18 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/pm/blockers', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleListBlockers(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/find-item', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleFindWorkItem(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/follow-up-review', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleScheduleFollowUpReview(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 

@@ -40,6 +40,7 @@ function providerReturning(workItem: WorkItem, seen: string[] = []): PMProvider 
 			return workItem;
 		},
 		listWorkItems: async () => [],
+		findWorkItemByUrlSuffix: async () => undefined,
 		moveWorkItem: async () => undefined,
 		addComment: async () => 'c1',
 		findComment: async () => undefined,

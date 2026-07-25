@@ -19,6 +19,7 @@ function makeLocalDelegate(overrides: Partial<PMProvider> = {}): PMProvider {
 		supportsDependencies: true,
 		getWorkItem: vi.fn().mockResolvedValue({ id: 'i1' }),
 		listWorkItems: vi.fn().mockResolvedValue([]),
+		findWorkItemByUrlSuffix: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('local-comment'),
 		findComment: vi.fn().mockResolvedValue(undefined),
@@ -143,6 +144,7 @@ describe('createTransportPmDeliveryProvider', () => {
 
 		await provider.getWorkItem('i1');
 		await provider.listWorkItems({ status: 'todo' });
+		await provider.findWorkItemByUrlSuffix('/issues/21');
 		await provider.findComment('i1', 'marker');
 		await provider.createWorkItem({ title: 't', description: 'd', status: 'planning' });
 		await provider.updateWorkItem('i1', { title: 't2' });
@@ -152,6 +154,7 @@ describe('createTransportPmDeliveryProvider', () => {
 
 		expect(local.getWorkItem).toHaveBeenCalledWith('i1');
 		expect(local.listWorkItems).toHaveBeenCalledWith({ status: 'todo' });
+		expect(local.findWorkItemByUrlSuffix).toHaveBeenCalledWith('/issues/21');
 		expect(local.findComment).toHaveBeenCalledWith('i1', 'marker');
 		expect(local.createWorkItem).toHaveBeenCalledWith({
 			title: 't',
@@ -272,6 +275,40 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		];
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { blockers }));
 		await expect(writeOnly(fetchImpl).listBlockers('PVTI_item1')).resolves.toEqual(blockers);
+	});
+
+	it("serves respond-to-review's card lookup as one narrow read over the transport", async () => {
+		const wireItem = {
+			id: 'ITEM_21',
+			title: 'Example',
+			url: 'https://github.com/jkwiecien/swarm/issues/21',
+		};
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: wireItem }));
+
+		await expect(writeOnly(fetchImpl).findWorkItemByUrlSuffix('/issues/21')).resolves.toEqual({
+			...wireItem,
+			description: '',
+			labels: [],
+			assignees: [],
+		});
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/find-item');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			urlSuffix: '/issues/21',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		// The narrow read is served, but the heavy one it replaces still refuses: a
+		// worker has no business enumerating a board to answer a one-card question.
+		await expect(writeOnly(fetchImpl).listWorkItems()).rejects.toThrow(
+			/not available on a DB-free worker/i,
+		);
+	});
+
+	it('maps a null card back to undefined, the shape the interface returns', async () => {
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: null }));
+		await expect(
+			writeOnly(fetchImpl).findWorkItemByUrlSuffix('/issues/999'),
+		).resolves.toBeUndefined();
 	});
 
 	it("refuses addBlockedBy — recording a dependency is Planning's move, and Planning stays local", async () => {

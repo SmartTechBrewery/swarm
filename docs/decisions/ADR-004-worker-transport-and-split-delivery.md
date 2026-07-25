@@ -206,12 +206,14 @@ PR/review even if the token model later changes.
   transport-backed `ScmDeliveryProvider`/`PMProvider` delegates
   (`src/scm/transport-delivery.ts`, `src/pm/transport-delivery.ts`) that carry
   only metadata up the wire; the local host worker keeps the in-process path.
-  Since issue #417 the same API also carries the operations covered by the §2
-  amendment — `POST /worker/delivery/pm/blockers` and
-  `POST /worker/delivery/review-ledger/{prior,mark,abandon}` — for eight routes in
+  Since issue #418 the same API also carries `POST /worker/delivery/pm/find-item`
+  and `POST /worker/delivery/follow-up-review` alongside the earlier §2
+  amendment routes (`POST /worker/delivery/pm/blockers` and
+  `POST /worker/delivery/review-ledger/{prior,mark,abandon}`) — for ten routes in
   total, with the wire mechanics shared by one client
-  (`src/transport/delivery-client.ts`). Every other PM **read** stays worker-side;
-  resolving a board card from a PR url is the next one to move (issue #418).
+  (`src/transport/delivery-client.ts`). Resolving a board card from a PR URL now
+  has a route (`POST /worker/delivery/pm/find-item`); the remaining PM **reads**
+  (`getWorkItem`/`listWorkItems`/`findComment`/discovery) stay worker-side.
 - Implementer credential provisioning changes: it is no longer a project
   `project_credentials` row but the worker operator's own token configured
   locally on their machine. `CredentialsSchema.implementer`

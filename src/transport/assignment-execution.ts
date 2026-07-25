@@ -31,6 +31,7 @@ import { AgentRunError, agentRunError } from '../harness/agent-failure.js';
 import { createOperatorDeliveryProvider } from '../integrations/scm/github/operator-delivery.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
+import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import { createWriteOnlyTransportPmProvider } from '../pm/transport-delivery.js';
@@ -47,6 +48,7 @@ import {
 import { linkRunAbortController } from '../worker/run-cancellation.js';
 import { reconstructProjectConfig } from './db-free-project.js';
 import type { DeliveryClientOptions, FetchLike } from './delivery-client.js';
+import { createTransportFollowUpReviewScheduler } from './follow-up-review-delivery.js';
 import type {
 	AssignedWorkItem,
 	StreamLogLine,
@@ -238,10 +240,17 @@ export function deferrableOrFailedResult(
  *   never hold, and its three review-verdict ledger calls (the verdict cap
  *   and the re-review signal) go through the control-plane ledger routes, which
  *   own the `review_verdicts` table this worker has no database for.
+ * - `respond-to-review` — the fix commit, its push, and the response comment are
+ *   the *implementer's*, so they stay on the operator token exactly as
+ *   Implementation's do; what travels is the best-effort board report (resolve
+ *   the card by its backing issue URL, then move it In progress → In review)
+ *   under the PM credential, and the follow-up-Review enqueue a pushed fix owes
+ *   (issue #241), which needs the dispatch store and queue this worker has
+ *   neither of.
  *
- * `respond-to-review` additionally needs a PM *read* to resolve its board card,
- * which no DB-free seam serves yet (issue #418); `planning`'s PM write surface is
- * wider still and stays on the local host worker. Both are failed cleanly by the
+ * `planning`'s PM write surface (`createWorkItem`/`updateWorkItem`/`addLabel`/
+ * `addBlockedBy`/`findComment` plus the split logic) is wider than a delivery seam
+ * should carry, so it stays on the local host worker and is failed cleanly by the
  * gate below.
  */
 const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
@@ -249,6 +258,7 @@ const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
 	'resolve-conflicts',
 	'implementation',
 	'review',
+	'respond-to-review',
 ]);
 
 /**
@@ -258,6 +268,14 @@ const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
  * needs an identity the worker must not hold — the project's reviewer PAT — so it
  * gets the transport-backed composite: `submitReview`/`postComment` POST to the
  * control plane, everything else still runs on `operator`.
+ *
+ * Respond-to-review deliberately stays on `operator` even though it also posts a
+ * PR comment: that comment is the *implementer's* reply to the review, so it must
+ * be authored by the implementer identity (the operator, as in Implementation) —
+ * routing it through the reviewer-PAT composite would have the reviewer answering
+ * its own review, and the author-persona routing that decides what a comment event
+ * means (`getPersonaForLogin`, `../router/adapters/github.ts`) would read the
+ * wrong persona off it.
  */
 function resolveDbFreeDelivery(
 	phase: TaskPhase,
@@ -272,22 +290,41 @@ function resolveDbFreeDelivery(
 /**
  * The PM provider a DB-free phase runs against, or `undefined` for a phase that
  * takes none (review / respond-to-ci / resolve-conflicts — `runAssignedPhase`
- * then constructs nothing). Implementation gets the delegate-less transport
- * writer: its two board writes ride the delivery API under the server-held PM
- * credential, and it has no board reads to serve — the control plane performed
- * those when it composed this assignment.
+ * then constructs nothing). The two board-driven phases get the delegate-less
+ * transport writer: their board writes ride the delivery API under the
+ * server-held PM credential, as do the two narrow reads it serves —
+ * Implementation's `listBlockers` and Respond-to-review's card lookup. Every
+ * other board read refuses, because the control plane performed the reads this
+ * assignment was composed from.
  */
 function resolveDbFreePm(
 	phase: TaskPhase,
 	project: ProjectConfig,
 	transport: DeliveryClientOptions,
 ): PMProvider | undefined {
-	if (phase !== 'implementation') return undefined;
+	if (phase !== 'implementation' && phase !== 'respond-to-review') return undefined;
 	return createWriteOnlyTransportPmProvider({
 		...transport,
 		projectId: project.id,
 		providerType: project.pm.type,
 	});
+}
+
+/**
+ * The follow-up-Review scheduler a DB-free phase runs against, or `undefined` for
+ * a phase that schedules none (only Respond-to-review does). Routed to the
+ * control plane, which holds the dispatch store and the queue: skipping it would
+ * leave a pushed fix sitting on the PR unreviewed (issue #241). It stays *inside*
+ * the phase's deterministic delivery rather than becoming a fact reported in the
+ * terminal result, so a failed enqueue still defers and re-schedules on the retry.
+ */
+function resolveDbFreeFollowUpReview(
+	phase: TaskPhase,
+	projectId: string,
+	transport: DeliveryClientOptions,
+): ScheduleFollowUpReview | undefined {
+	if (phase !== 'respond-to-review') return undefined;
+	return createTransportFollowUpReviewScheduler({ ...transport, projectId });
 }
 
 /**
@@ -372,6 +409,11 @@ interface DbFreePhaseInputsParams {
 	pm: PMProvider | undefined;
 	/** Review only: the transport-backed review-verdict ledger ({@link resolveDbFreeReviewLedger}). */
 	reviewLedger: ReviewVerdictLedger | undefined;
+	/**
+	 * Respond-to-review only: the transport-backed follow-up-Review scheduler
+	 * ({@link resolveDbFreeFollowUpReview}).
+	 */
+	scheduleFollowUpReview: ScheduleFollowUpReview | undefined;
 	operatorToken: string;
 	baseRunAgent: typeof runAgentCli;
 }
@@ -385,6 +427,7 @@ function buildDbFreePhaseInputs({
 	delivery,
 	pm,
 	reviewLedger,
+	scheduleFollowUpReview,
 	operatorToken,
 	baseRunAgent,
 }: DbFreePhaseInputsParams): AssignedPhaseInputs {
@@ -430,6 +473,7 @@ function buildDbFreePhaseInputs({
 		delivery,
 		pm,
 		reviewLedger,
+		scheduleFollowUpReview,
 		agentToken: operatorToken,
 	};
 }
@@ -506,6 +550,7 @@ export async function runAssignmentDbFree(
 			delivery: resolveDbFreeDelivery(phase, operatorDelivery, transport, project.id),
 			pm: resolveDbFreePm(phase, project, transport),
 			reviewLedger: resolveDbFreeReviewLedger(phase, project.id, transport),
+			scheduleFollowUpReview: resolveDbFreeFollowUpReview(phase, project.id, transport),
 			operatorToken: options.operatorToken,
 			baseRunAgent: deps.baseRunAgent,
 		});
