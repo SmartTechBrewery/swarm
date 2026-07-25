@@ -62,6 +62,19 @@ vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
 	},
 }));
 
+const { loggerWarn, loggerDebug } = vi.hoisted(() => ({
+	loggerWarn: vi.fn(),
+	loggerDebug: vi.fn(),
+}));
+vi.mock('@/lib/logger.js', () => ({
+	logger: {
+		warn: loggerWarn,
+		debug: loggerDebug,
+		info: vi.fn(),
+		error: vi.fn(),
+	},
+}));
+
 // The work-item origin gate (issue #397) reads run history; mock just that read
 // (keeping the real `isSwarmManagedPullRequest`, so the PR's head branch really
 // has to decode under the project's `branchPrefix`). Defaults to "SWARM ran
@@ -377,14 +390,45 @@ describe('review trigger', () => {
 			});
 		});
 
-		it('skips a PR not linked to a SWARM work item — before the aggregate query', async () => {
+		it('skips a PR on a SWARM-style branch with no Implementation run and logs warn', async () => {
 			hasRunForTask.mockResolvedValue(false);
+			getPullRequest.mockResolvedValueOnce({
+				number: 9,
+				headBranch: 'issue-9',
+				headSha: 'cafe',
+				baseBranch: 'main',
+				baseSha: 'base123',
+				mergeable: true,
+				authorLogin: 'operator-human',
+			});
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
 			expect(result).toBeNull();
 			// Gated before the (heavier) Actions-API call, and no dispatch claimed.
 			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+			expect(loggerWarn).toHaveBeenCalledWith(
+				expect.stringContaining('no Implementation run row'),
+				expect.objectContaining({ prBranch: 'issue-9', taskId: '9' }),
+			);
+		});
+
+		it('skips a PR on a non-task branch and logs debug', async () => {
+			getPullRequest.mockResolvedValueOnce({
+				number: 9,
+				headBranch: 'contributor-patch',
+				headSha: 'cafe',
+				baseBranch: 'main',
+				baseSha: 'base123',
+				mergeable: true,
+				authorLogin: 'operator-human',
+			});
+			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
+			expect(result).toBeNull();
+			expect(loggerDebug).toHaveBeenCalledWith(
+				expect.stringContaining('not linked to a SWARM work item'),
+				expect.objectContaining({ prBranch: 'contributor-patch' }),
+			);
 		});
 
 		it('degrades to a bounded recheck when the ownership lookup throws', async () => {

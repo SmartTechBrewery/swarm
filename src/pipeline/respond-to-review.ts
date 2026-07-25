@@ -94,6 +94,7 @@ import {
 	type ScheduleFollowUpReview,
 	scheduleFollowUpReviewDefault,
 } from '@/pipeline/follow-up-review.js';
+import { issueNumberFromBranch } from './task-branch.js';
 import { buildRespondToReviewPrompt } from '@/pipeline/prompts/respond-to-review.js';
 import {
 	acquireResumableWorktree,
@@ -277,17 +278,7 @@ export interface RespondToReviewPhaseResult {
 	pushedHeadSha?: string;
 }
 
-/**
- * The backing issue number encoded in a SWARM task branch (`<branchPrefix><n>`,
- * e.g. `issue-100` or `issue-100-runs-list` → `100`), or `undefined` when the
- * branch doesn't follow the convention (a human-named PR branch). Used only to
- * resolve the board card for a best-effort status report, so a miss is fine.
- */
-export function issueNumberFromBranch(branch: string, branchPrefix: string): string | undefined {
-	if (!branch.startsWith(branchPrefix)) return undefined;
-	const match = branch.slice(branchPrefix.length).match(/^(\d+)/);
-	return match ? match[1] : undefined;
-}
+export { issueNumberFromBranch } from './task-branch.js';
 
 /**
  * The pushed commit SHA a follow-up Review should be scheduled for (issue

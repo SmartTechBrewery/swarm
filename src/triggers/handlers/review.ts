@@ -66,8 +66,8 @@
  * **Work-item origin gate.** SWARM reviews only PRs it manages itself: a
  * human- or third-party-authored PR completing its checks (or being opened) must
  * not burn a review. Ownership is decided from the PR's *work-item origin*, not
- * its author — its head branch must decode to a work item under the project's
- * `branchPrefix` and SWARM must hold an `implementation` run row for that item
+ * its author — its head branch must be exact `<branchPrefix><taskId>`
+ * and SWARM must hold an `implementation` run row for that item
  * (`isSwarmManagedPullRequest`, `../swarm-managed-pr.ts`). Author identity no
  * longer carries the signal: under the federated model (ADR-004 §3, issue #397)
  * a SWARM PR is opened by the worker operator's own account, so the former
@@ -106,7 +106,10 @@ import type { GitHubParsedEvent } from '../../router/adapters/github.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import { buildRespondToCiAttemptKey, claimRespondToCiAttempt } from '../respond-to-ci-attempts.js';
 import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
-import { isSwarmManagedPullRequest } from '../swarm-managed-pr.js';
+import {
+	type SwarmManagedPrResult,
+	isSwarmManagedPullRequest,
+} from '../swarm-managed-pr.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 import { decideCheckSuiteOutcome } from './check-suite-decision.js';
 
@@ -547,7 +550,7 @@ async function scheduleMergeabilityRecheck(
 }
 
 /**
- * The work-item origin gate, tri-state: `true`/`false` when ownership was
+ * The work-item origin gate, tri-state: `SwarmManagedPrResult` when ownership was
  * resolved, `'error'` when the run-history lookup failed. The caller degrades
  * `'error'` to a bounded mergeability recheck rather than a skip — a transient DB
  * blip must not silently drop a legitimate review.
@@ -555,7 +558,7 @@ async function scheduleMergeabilityRecheck(
 async function resolveSwarmManagedPr(
 	project: ProjectConfig,
 	headBranch: string,
-): Promise<boolean | 'error'> {
+): Promise<SwarmManagedPrResult | 'error'> {
 	try {
 		return await isSwarmManagedPullRequest(project, headBranch);
 	} catch (err) {
@@ -565,6 +568,33 @@ async function resolveSwarmManagedPr(
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return 'error';
+	}
+}
+
+function logOwnershipSkip(
+	projectId: string,
+	prNumber: string,
+	prBranch: string,
+	prAuthorLogin: string | null,
+	isSwarm: Extract<SwarmManagedPrResult, { managed: false }>,
+): void {
+	if (isSwarm.reason === 'no-run') {
+		logger.warn(
+			'review: PR branch matches SWARM format but has no Implementation run row — skipping',
+			{
+				projectId,
+				prNumber,
+				prBranch,
+				prAuthorLogin,
+				taskId: isSwarm.taskId,
+			},
+		);
+	} else {
+		logger.debug('review: PR is not linked to a SWARM work item — skipping', {
+			prNumber,
+			prBranch,
+			prAuthorLogin,
+		});
 	}
 }
 
@@ -612,12 +642,8 @@ async function checkMergeabilityAndConflicts(
 			reason: 'ownership gate resolution failed',
 		});
 	}
-	if (!isSwarm) {
-		logger.debug('review: PR is not linked to a SWARM work item — skipping', {
-			prNumber,
-			prBranch: prDetails.headBranch,
-			prAuthorLogin: prDetails.authorLogin,
-		});
+	if (!isSwarm.managed) {
+		logOwnershipSkip(project.id, prNumber, prDetails.headBranch, prDetails.authorLogin, isSwarm);
 		return null;
 	}
 
