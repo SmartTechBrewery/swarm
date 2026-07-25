@@ -528,6 +528,12 @@ describe('runPlanningPhase', () => {
 
 		await runPlanningPhase({ ...deps, autoAdvance: true });
 
+		expect(deps.pm.updateWorkItem).toHaveBeenCalledWith(
+			'PVTI_Second slice',
+			expect.objectContaining({
+				description: expect.stringContaining('swarm-preplan:v1'),
+			}),
+		);
 		expect(deps.pm.addComment).toHaveBeenCalledWith(
 			'PVTI_Second slice',
 			expect.stringContaining('remains in **Backlog**'),
@@ -538,6 +544,22 @@ describe('runPlanningPhase', () => {
 		// The other half of the preparation block, same conclusion (issue #436): a
 		// child stranded in Backlog is not `planned`, whichever step stranded it.
 		expect(deps.pm.addLabel).not.toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+	});
+
+	it('completes preplanned run and applies planned label for a child stranded in Backlog with a valid marker', async () => {
+		const deps = makeDeps();
+		// A child whose Planning move failed during split preparation: status is Backlog,
+		// no planned label, but carries the valid preplan marker in its description.
+		deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.', undefined, {
+			status: 'Backlog',
+			labels: [{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL }],
+		});
+
+		const result = await runPlanningPhase({ ...deps });
+
+		expect(deps.runAgent).not.toHaveBeenCalled();
+		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_child', PLANNED_LABEL);
+		expect(result).toMatchObject({ preplanned: true });
 	});
 
 	it('reuses a preplanned split-child plan: skips the worktree and agent, posts the plan, never advances', async () => {

@@ -173,8 +173,11 @@ const DEFAULT_AUTO_ADVANCE = false;
  * the parent's validated plan in its body — and shouldn't read as un-planned
  * during the window before its own preplanned Planning run completes. Applied
  * right after that preparation rather than at `createWorkItem`, so a child whose
- * preparation failed — genuinely un-planned, still in Backlog, still needing a
- * full Planning agent run — is never labeled (issue #436).
+ * preparation failed — left in Backlog without completing placement as planned —
+ * is never labeled up front (issue #436). If marker embedding failed, the child is
+ * un-planned and owes a full Planning agent run; if the Planning move failed, its
+ * embedded marker remains valid, so its later Planning entry reuses the plan with
+ * the agent skipped and `applyPlannedLabel` supplies the label then.
  */
 export const PLANNED_LABEL = 'planned';
 
@@ -668,11 +671,12 @@ async function applySplit(
  * {@link applyPlannedLabel}; the label write is idempotent at the provider, so the
  * repeat is a no-op.
  *
- * Called only when the preparation above succeeded, which is the whole point: a
- * child whose marker/status preparation threw is genuinely *un-planned* — it stays
- * in Backlog, the parent's plan is lost with the unwritten marker, and its comment
- * says a Planning agent may run normally — so labeling it `planned` would assert
- * the opposite (issue #436).
+ * Called only when the preparation above succeeded — marker embedded and card in
+ * Planning. If marker embedding threw, the child stays in Backlog with no marker
+ * and owes a full Planning agent run; if the status move threw, the embedded marker
+ * remains valid, so its later Planning entry reuses the plan (skipping the agent)
+ * and applies `PLANNED_LABEL` then. Either failure leaves the child unlabeled in
+ * Backlog until its placement as planned completes (issue #436).
  *
  * Best-effort, exactly like {@link linkBlockedBy}: a failure is logged and
  * swallowed so a refused label can never abort the split mid-loop (a retry would
