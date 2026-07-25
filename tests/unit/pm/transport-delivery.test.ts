@@ -264,6 +264,16 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		});
 	});
 
+	it('accepts a blocker whose URL the provider left empty, rather than un-gating on a parse error', async () => {
+		// `findOpenBlockers` treats a throw as "no blockers", so this wire schema must be
+		// exactly as permissive as `WorkItemBlocker` (issue #330).
+		const blockers = [
+			{ reference: '#319', url: '', title: 'Prerequisite', open: true, source: 'mention' as const },
+		];
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { blockers }));
+		await expect(writeOnly(fetchImpl).listBlockers('PVTI_item1')).resolves.toEqual(blockers);
+	});
+
 	it("refuses addBlockedBy — recording a dependency is Planning's move, and Planning stays local", async () => {
 		const fetchImpl = vi.fn<FetchLike>();
 		await expect(writeOnly(fetchImpl).addBlockedBy('PVTI_item1', 'PVTI_item2')).rejects.toThrow(
