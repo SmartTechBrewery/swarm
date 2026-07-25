@@ -137,7 +137,7 @@ resource the worker must not or cannot hold — a project credential **or** the
 database — runs on the control plane.*
 
 The instance is the Review phase's **review-verdict ledger** (`review_verdicts`):
-it carries the two-verdict safety cap (issue #235) and the prior-submitted-verdict
+it carries the review-verdict safety cap (issue #235) and the prior-submitted-verdict
 signal that makes a run a re-review (issue #328), so a Review run cannot skip it,
 yet a DB-free worker cannot reach the table. Its three operations moved
 server-side behind the same worker-credential + enrollment auth as the metadata

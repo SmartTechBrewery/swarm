@@ -11,7 +11,7 @@
  * `pr-review` trigger handler (`src/triggers/handlers/review.ts`) a real
  * completed check suite would: the aggregate-check decision (review / respond-
  * to-ci / bounded recheck), the author-persona gate, the PR+SHA dispatch dedup,
- * and the durable two-verdict ledger reservation all apply unchanged — this
+ * and the durable review-verdict ledger reservation all apply unchanged — this
  * module only ever constructs the trigger *input*, never touches those
  * decisions itself.
  *

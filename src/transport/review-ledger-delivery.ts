@@ -4,7 +4,7 @@
  * delegates (`../scm/transport-delivery.ts`, `../pm/transport-delivery.ts`).
  *
  * A DB-free remote worker holds no `DATABASE_URL`, so it cannot read or write
- * `review_verdicts` — the table carrying the two-verdict safety cap (issue #235)
+ * `review_verdicts` — the table carrying the review-verdict safety cap (issue #235)
  * and the prior-submitted-verdict answer that makes a run a re-review (issue
  * #328). Skipping them is not an option: the cap would stop capping and every
  * re-review would be prompted as a first review. So the three operations travel

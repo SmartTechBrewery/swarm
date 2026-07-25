@@ -8,7 +8,10 @@ vi.mock('node:fs', () => ({
 	readFileSync: () => verdictFileContents,
 }));
 
-import type { ReviewVerdictRecord } from '@/db/repositories/reviewVerdictsRepository.js';
+import {
+	REVIEW_VERDICT_CAP,
+	type ReviewVerdictRecord,
+} from '@/db/repositories/reviewVerdictsRepository.js';
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { buildReviewPrompt, REVIEW_VERDICT_FILENAME, runReviewPhase } from '@/pipeline/review.js';
 import { ReviewHandoffSchema } from '@/scm/delivery.js';
@@ -206,7 +209,7 @@ describe('runReviewPhase', () => {
 		expect(result.verdict).toBe(expected);
 	});
 
-	describe('two-verdict safety-cap ledger (issue #235)', () => {
+	describe('review-verdict safety-cap ledger (issue #235)', () => {
 		it('marks the reserved head submitted with the verdict, by natural key', async () => {
 			verdictFileContents = 'approve\n';
 			const deps = makeDeps();
@@ -235,7 +238,7 @@ describe('runReviewPhase', () => {
 			expect(result.automationOutcome).toBeUndefined();
 		});
 
-		it('records manual-intervention-required when the second verdict is request-changes', async () => {
+		it('leaves an intermediate request-changes verdict on the automatic cycle', async () => {
 			verdictFileContents = 'request-changes\n';
 			const deps = makeDeps();
 			deps.markReviewVerdictSubmitted = vi.fn(async () => ({ id: 'verdict-2', ordinal: 2 }));
@@ -243,13 +246,30 @@ describe('runReviewPhase', () => {
 			const result = await runReviewPhase(deps);
 
 			expect(result.reviewOrdinal).toBe(2);
+			expect(result.automationOutcome).toBeUndefined();
+		});
+
+		it('records manual-intervention-required when the cap-reaching verdict is request-changes', async () => {
+			verdictFileContents = 'request-changes\n';
+			const deps = makeDeps();
+			deps.markReviewVerdictSubmitted = vi.fn(async () => ({
+				id: 'verdict-last',
+				ordinal: REVIEW_VERDICT_CAP,
+			}));
+
+			const result = await runReviewPhase(deps);
+
+			expect(result.reviewOrdinal).toBe(REVIEW_VERDICT_CAP);
 			expect(result.automationOutcome).toBe('manual-intervention-required');
 		});
 
-		it('does not record manual-intervention-required for a second-slot approval', async () => {
+		it('does not record manual-intervention-required for a cap-reaching approval', async () => {
 			verdictFileContents = 'approve\n';
 			const deps = makeDeps();
-			deps.markReviewVerdictSubmitted = vi.fn(async () => ({ id: 'verdict-2', ordinal: 2 }));
+			deps.markReviewVerdictSubmitted = vi.fn(async () => ({
+				id: 'verdict-last',
+				ordinal: REVIEW_VERDICT_CAP,
+			}));
 
 			const result = await runReviewPhase(deps);
 

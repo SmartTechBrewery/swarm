@@ -46,23 +46,23 @@ function initialReviewInstructions({ repo, prNumber }: ReviewPromptContext): str
  * already received a `request-changes` review, and the implementer has pushed
  * new commits in response. A re-review has exactly one job: verify that the
  * previously requested changes were implemented correctly. It must NOT widen the
- * review by surfacing pre-existing issues the first review missed — doing so
- * burns the PR's last permitted verdict on unrelated work and restarts the
- * change cycle instead of confirming (or correcting) the fix. Approve when every
+ * review by surfacing pre-existing issues an earlier review missed — doing so
+ * burns one of the PR's few permitted verdicts on unrelated work and restarts
+ * the change cycle instead of confirming (or correcting) the fix. Approve when every
  * requested change is correctly addressed; otherwise request changes with a
  * strong, specific instruction on how to fix each outstanding item.
  */
 function reReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[] {
 	return [
-		'This PR was already reviewed once and that review REQUESTED CHANGES; the',
+		'This PR was already reviewed and the most recent review REQUESTED CHANGES; the',
 		'implementer has since pushed new commits in response. This is a RE-REVIEW, and',
 		'it has exactly one job: verify that the previously requested changes were',
 		'implemented correctly. Do NOT broaden the review.',
 		'',
 		'Do all of the following, in order:',
-		`1. Read the PR and its earlier review: \`gh pr view ${prNumber} --repo ${repo} --comments\`. Find the previous SWARM review that requested changes and list the specific changes it required — its findings and proposed fix plans are recorded in that review body. If the PR references an issue, read it too (\`gh issue view <n> --repo ${repo} --comments\`) for the agreed ground truth.`,
+		`1. Read the PR and its earlier review: \`gh pr view ${prNumber} --repo ${repo} --comments\`. Find the most recent SWARM review that requested changes and list the specific changes it required — its findings and proposed fix plans are recorded in that review body. If the PR references an issue, read it too (\`gh issue view <n> --repo ${repo} --comments\`) for the agreed ground truth.`,
 		`2. Read the diff: \`gh pr diff ${prNumber} --repo ${repo}\`. For each change the previous review required, trace it in this checkout and decide whether it is now correctly and completely implemented. Use the checked-out code and existing tests as evidence.`,
-		'3. STAY IN SCOPE. Do NOT raise new findings for pre-existing issues the first review did not flag, even if you notice them now — a re-review must not restart the cycle over problems that were missed earlier. The ONLY issues you may report are: (a) a previously requested change that is still missing or was implemented incorrectly, or (b) a defect the new commits themselves introduced — a regression in the fix, including a README the new changes made stale. Everything else is out of scope; leave it for a human.',
+		'3. STAY IN SCOPE. Do NOT raise new findings for pre-existing issues an earlier review did not flag, even if you notice them now — a re-review must not restart the cycle over problems that were missed earlier. The ONLY issues you may report are: (a) a previously requested change that is still missing or was implemented incorrectly, or (b) a defect the new commits themselves introduced — a regression in the fix, including a README the new changes made stale. Everything else is out of scope; leave it for a human.',
 		'4. Verify before claiming: demonstrate each conclusion against the checked-out code and its tests. Do not invent problems or restate personal preferences as defects. Do not create disposable repositories or alter Git configuration to reproduce a concern, and never run destructive cleanup commands such as `rm -rf`. If an optional command is unavailable or blocked, continue with the evidence already available and still write the required hand-off file.',
 		'5. Decide the verdict:',
 		'   - If every previously requested change is now correctly implemented and the new commits introduced no defect, use verdict approve.',
@@ -81,7 +81,7 @@ function reReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[]
  * verify findings against the checkout before reporting them, and to record its
  * verdict to the hand-off file so this phase can validate the hand-off.
  *
- * When `isReReview` is set (issue #328) the PR has already had a
+ * When `isReReview` is set (issue #328) the PR has already had at least one
  * `request-changes` review, so the agent gets the re-review variant of the
  * instructions: verify only whether the previously requested changes were
  * implemented correctly, never surface newly-noticed pre-existing issues.

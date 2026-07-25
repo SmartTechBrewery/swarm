@@ -109,10 +109,10 @@ export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 
 /**
  * Review-automation outcomes recorded on a completed Review run's history row
- * (issue #235) — currently only the terminal one: this run submitted the
- * second `request-changes` verdict the two-verdict safety cap allows, so
- * Respond-to-review stops the automatic cycle instead of dispatching a third
- * review. Every other outcome (an approval, the first verdict) leaves the
+ * (issue #235) — currently only the terminal one: this run submitted the last
+ * `request-changes` verdict the review-verdict safety cap allows, so
+ * Respond-to-review stops the automatic cycle instead of dispatching a further
+ * review. Every other outcome (an approval, an earlier verdict) leaves the
  * run's `reviewAutomationOutcome` column unset.
  */
 export const REVIEW_AUTOMATION_OUTCOMES = ['manual-intervention-required'] as const;
@@ -211,13 +211,13 @@ export interface ReviewPhaseResult {
 	/** The agent run's result (exit code, duration, captured output). */
 	agent: AgentCliResult;
 	/**
-	 * This run's slot number in the two-verdict safety-cap ledger (1 or 2),
-	 * `undefined` if the ledger had no reservation for this PR/head to mark
-	 * submitted (issue #235).
+	 * This run's slot number in the review-verdict safety-cap ledger (1…
+	 * `REVIEW_VERDICT_CAP`), `undefined` if the ledger had no reservation for
+	 * this PR/head to mark submitted (issue #235).
 	 */
 	reviewOrdinal?: number;
 	/**
-	 * Set to `manual-intervention-required` when this run submitted the second
+	 * Set to `manual-intervention-required` when this run submitted the last
 	 * `request-changes` verdict the cap allows; `undefined` for every other
 	 * verdict/ordinal.
 	 */

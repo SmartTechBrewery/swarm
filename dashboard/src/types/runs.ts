@@ -221,16 +221,18 @@ export interface RunRow {
 	 */
 	reviewVerdict: string | null;
 	/**
-	 * This Review run's slot in the two-verdict safety-cap ledger (1 or 2,
+	 * This Review run's slot in the review-verdict safety-cap ledger (1 = the
+	 * initial review, then one slot per permitted re-review — `REVIEW_VERDICT_CAP`
+	 * in `src/db/repositories/reviewVerdictsRepository.ts` is the ceiling,
 	 * issue #235); null for non-Review phases, a Review run whose verdict wasn't
 	 * ledgered, and pre-existing rows.
 	 */
 	reviewOrdinal: number | null;
 	/**
 	 * This Review run's automation outcome (issue #235) — currently only
-	 * `manual-intervention-required`, set when this run submitted the second
+	 * `manual-intervention-required`, set when this run submitted the last
 	 * `request-changes` verdict the cap allows, so Respond-to-review stopped the
-	 * automatic cycle instead of dispatching a third review. Null for every other
+	 * automatic cycle instead of dispatching a further review. Null for every other
 	 * outcome and pre-existing rows. Drives the "Manual action required" badge
 	 * and run-detail callout (issue #242).
 	 */

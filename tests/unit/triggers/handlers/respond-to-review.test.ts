@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
 import type { PersonaIdentities } from '@/integrations/scm/github/personas.js';
 import { GitHubRouterAdapter } from '@/router/adapters/github.js';
 import { createRespondToReviewTrigger } from '@/triggers/handlers/respond-to-review.js';
@@ -194,10 +195,10 @@ describe('respond-to-review trigger', () => {
 		});
 	});
 
-	describe('two-verdict safety cap (issue #235)', () => {
-		it('stops the cycle on the second changes-requested verdict', async () => {
+	describe('review-verdict safety cap (issue #235)', () => {
+		it('stops the cycle on the cap-reaching changes-requested verdict', async () => {
 			const getReviewVerdictByReviewId = vi.fn(async () => ({
-				ordinal: 2,
+				ordinal: REVIEW_VERDICT_CAP,
 				state: 'submitted' as const,
 				verdict: 'request-changes',
 				headSha: HEAD_SHA,
@@ -219,7 +220,7 @@ describe('respond-to-review trigger', () => {
 		it('falls back to the PR/head lookup when the review id is not yet in the ledger', async () => {
 			const byReviewId = vi.fn(async () => undefined);
 			const byHead = vi.fn(async () => ({
-				ordinal: 2,
+				ordinal: REVIEW_VERDICT_CAP,
 				state: 'submitted' as const,
 				verdict: 'request-changes',
 				headSha: HEAD_SHA,
@@ -236,7 +237,7 @@ describe('respond-to-review trigger', () => {
 		it('falls back to mapping reviewState when record.verdict is null/undefined (webhook race)', async () => {
 			const byReviewId = vi.fn(async () => undefined);
 			const byHead = vi.fn(async () => ({
-				ordinal: 2,
+				ordinal: REVIEW_VERDICT_CAP,
 				state: 'pending' as const,
 				verdict: null,
 				headSha: HEAD_SHA,

@@ -26,7 +26,7 @@ interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	reviewVerdict?: string | null;
 	/**
 	 * This Review run's automation outcome (issue #235) — `manual-intervention-required`
-	 * when it submitted the second `request-changes` verdict the two-review safety
+	 * when it submitted the last `request-changes` verdict the review-verdict safety
 	 * cap allows. Only takes effect alongside a `request-changes` {@link reviewVerdict}
 	 * on a completed Review run; null/absent otherwise keeps the plain verdict badge
 	 * (issue #242).
@@ -109,7 +109,7 @@ const REVIEW_VERDICT_CONFIGS: Record<string, BadgeConfig> = {
 
 /**
  * Distinct, high-attention treatment for a completed Review run whose verdict
- * was the second `request-changes` the two-review safety cap allows (issue
+ * was the last `request-changes` the review-verdict safety cap allows (issue
  * #242): SWARM stopped the automatic Respond-to-review/re-review cycle, so the
  * PR needs a human decision instead of another automatic pass. Reuses the same
  * red "Danger" hue as the lifecycle "Failed" badge — the two never appear on
@@ -122,7 +122,7 @@ const MANUAL_INTERVENTION_CONFIG: BadgeConfig = {
 	classes: 'bg-red-500/10 text-red-400 border-red-500/20',
 	dotClass: 'bg-red-400',
 	title:
-		'Second changes-requested verdict — SWARM stopped automatic re-review; this PR needs a human decision.',
+		'Final changes-requested verdict — SWARM stopped automatic re-review; this PR needs a human decision.',
 };
 
 /** Title-case a hyphenated verdict key for a label ('some-verdict' → 'Some verdict'). */

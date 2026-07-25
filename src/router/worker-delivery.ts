@@ -29,7 +29,7 @@
  *
  * The last three routes front the **review-verdict ledger** — the `review_verdicts`
  * table (`../db/repositories/reviewVerdictsRepository.ts`) a Review run consults
- * for the two-verdict safety cap (issue #235) and the prior-submitted-verdict
+ * for the review-verdict safety cap (issue #235) and the prior-submitted-verdict
  * re-review signal (issue #328). A DB-free remote worker holds no `DATABASE_URL`,
  * so those three calls run here instead (`../transport/review-ledger-delivery.ts`
  * is the client). No credential is involved: what stays server-side is the
@@ -464,7 +464,7 @@ export async function handlePriorReview(
 
 /**
  * Mark this PR/head's reserved ledger slot `submitted` and return it, so the
- * worker's Review run learns its ordinal — the two-verdict cap signal (issue
+ * worker's Review run learns its ordinal — the verdict-cap signal (issue
  * #235). Same prelude and contract as {@link handlePriorReview}; `{ slot: null }`
  * when no record exists for this PR/head.
  */

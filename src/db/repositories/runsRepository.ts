@@ -149,13 +149,14 @@ export interface CompleteRunInput {
 	 */
 	reviewVerdict?: ReviewVerdict;
 	/**
-	 * This Review run's two-verdict safety-cap slot (1 or 2, issue #235). Set
+	 * This Review run's review-verdict safety-cap slot (1…`REVIEW_VERDICT_CAP`,
+	 * issue #235). Set
 	 * only alongside `reviewVerdict`; omitted for every other phase.
 	 */
 	reviewOrdinal?: number;
 	/**
 	 * This Review run's automation outcome (issue #235), e.g.
-	 * `manual-intervention-required` when it submitted the second
+	 * `manual-intervention-required` when it submitted the last
 	 * `request-changes` verdict the cap allows. Set only alongside
 	 * `reviewVerdict`; omitted for every other phase.
 	 */

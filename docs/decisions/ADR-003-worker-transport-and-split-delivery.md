@@ -142,7 +142,7 @@ server-side store) it needs:
      **Review**'s `submitReview` runs under its reviewer PAT.
    - **The database**: Review's three review-verdict ledger calls
      (`/worker/delivery/review-ledger/prior|mark|abandon`) front the
-     `review_verdicts` table, so the two-verdict cap (#235) and the re-review
+     `review_verdicts` table, so the review-verdict cap (#235) and the re-review
      signal (#328) keep working on a worker with no `DATABASE_URL` — skipping them
      would silently disable both.
 

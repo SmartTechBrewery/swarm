@@ -19,11 +19,11 @@
  *    `getPersonaForLogin` confirms the review's author is the *reviewer* persona
  *    before dispatching — the same routing primitive the router adapter uses.
  *
- * **The two-verdict safety cap (issue #235).** A `changes_requested` event that
- * is the second (and last permitted) verdict the review-verdict ledger allowed
+ * **The review-verdict safety cap (issue #235).** A `changes_requested` event
+ * that is the last permitted verdict the review-verdict ledger allowed
  * (`src/db/repositories/reviewVerdictsRepository.ts`) stops the cycle here
  * instead of dispatching another Respond-to-review run: the PR needs a human
- * to intervene, not a third automatic review. The ledger record is resolved by
+ * to intervene, not a further automatic review. The ledger record is resolved by
  * the submitted review's id, falling back to PR/head for the narrow webhook
  * race before the Review phase has stored it; a lookup error or a missing
  * record for a `changes_requested` event fails closed (skips the dispatch)

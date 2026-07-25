@@ -102,14 +102,14 @@ describe('FailureDiagnosisCallout (issue #269)', () => {
 });
 
 describe('ReviewCapCallout (issue #242)', () => {
-	it('explains the cap-stopping second verdict and cites its ordinal', () => {
+	it('explains the cap-stopping final verdict and cites its ordinal', () => {
 		render(
 			<ReviewCapCallout run={makeReviewRun()} project={{ name: 'Demo', repo: 'acme/demo' }} />,
 		);
 
 		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
-		expect(screen.getByText(/second changes-requested verdict/i)).toBeDefined();
-		expect(screen.getByText(/review 2 of 2/i)).toBeDefined();
+		expect(screen.getByText(/last changes-requested verdict/i)).toBeDefined();
+		expect(screen.getByText(/review 2 of this PR/i)).toBeDefined();
 		expect(screen.getByText(/will not automatically enqueue another/i)).toBeDefined();
 	});
 
