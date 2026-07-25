@@ -81,6 +81,7 @@ import {
 	type ReviewVerdict,
 	runReviewPhase,
 } from '../pipeline/review.js';
+import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import {
 	hasAutomationLabel,
 	missingAutomationLabelMessage,
@@ -1245,7 +1246,8 @@ export interface AssignedPhaseInputs {
 	 *
 	 * A remote worker with no `DATABASE_URL` additionally injects an
 	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
-	 * phases, a `pm`) so no phase reaches into the secret store or the DB.
+	 * phases, a `pm`; for review, a `reviewLedger`) so no phase reaches into the
+	 * secret store or the DB.
 	 * Forwarding both `delivery` and `agentToken` keeps the delivery-owning
 	 * phases' `legacyMode` guard false (it is `getToken !== undefined &&
 	 * delivery === undefined`), i.e. deterministic delivery stays on. The
@@ -1255,6 +1257,15 @@ export interface AssignedPhaseInputs {
 	 */
 	delivery?: ScmDeliveryProvider;
 	agentToken?: string;
+	/**
+	 * review only: the review-verdict ledger the phase reads the re-review signal
+	 * and writes its submitted slot through (`../pipeline/review-ledger.ts`).
+	 * Injected by a DB-free worker with the transport-backed implementation
+	 * (ADR-003 §2, `../transport/review-ledger-delivery.ts`), since that worker
+	 * cannot reach `review_verdicts` itself. Left unset by the in-process and
+	 * same-host paths, which keep the phase's own repository defaults.
+	 */
+	reviewLedger?: ReviewVerdictLedger;
 }
 
 /**
@@ -1357,6 +1368,12 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				taskId,
 				delivery,
 				getToken,
+				// Undefined on the in-process/same-host paths, where the phase keeps its
+				// own `review_verdicts` repository defaults; set only by the DB-free
+				// worker, whose ledger calls travel to the control plane.
+				getPriorSubmittedReview: inputs.reviewLedger?.getPriorSubmittedReview,
+				markReviewVerdictSubmitted: inputs.reviewLedger?.markReviewVerdictSubmitted,
+				abandonReviewVerdict: inputs.reviewLedger?.abandonReviewVerdict,
 				cli,
 				model,
 				reasoning,

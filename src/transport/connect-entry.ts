@@ -11,11 +11,13 @@
  * declares the CLIs it can run, and heartbeats to keep its `worker_sessions` lease
  * live so the eligibility gate sees it as connected. On each pushed
  * `TaskAssignment` it runs the phase **DB-free** (`./assignment-execution.ts`):
- * the project config comes from the assignment's non-secret slice, delivery uses
- * the operator token, and results stream back over the transport back-channel. In
- * Phase 1 only the source-only phases (`respond-to-ci`, `resolve-conflicts`) run;
- * any other phase is failed cleanly by the supported-phase gate. It never opens a
- * database or queue connection.
+ * the project config comes from the assignment's non-secret slice, source-carrying
+ * delivery uses the operator token, the reviewer/PM metadata writes go up to the
+ * control plane's delivery API (`./delivery-client.ts`) so those credentials stay
+ * server-side, and results stream back over the transport back-channel. Every
+ * phase but `respond-to-review` (which still needs a PM read, issue #418) and
+ * `planning` runs this way; the rest are failed cleanly by the supported-phase
+ * gate. It never opens a database or queue connection.
  */
 
 import { readFileSync } from 'node:fs';
@@ -82,6 +84,11 @@ async function main(): Promise<void> {
 		onAssignment: (assignment, sink) => {
 			void runAssignmentDbFree(assignment, sink, {
 				operatorToken,
+				// The delivery seam for the metadata writes this worker holds no
+				// credential for (a review, a board move/comment): POSTed to the control
+				// plane under this worker's own credential (ADR-002 §2).
+				controlPlaneUrl,
+				workerCredential: credential,
 				shutdownSignal: shutdownSignal.signal,
 				inFlight,
 			});

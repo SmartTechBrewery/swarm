@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createTransportPmDeliveryProvider, type FetchLike } from '@/pm/transport-delivery.js';
+import {
+	createTransportPmDeliveryProvider,
+	createWriteOnlyTransportPmProvider,
+	type FetchLike,
+} from '@/pm/transport-delivery.js';
 import type { PMProvider } from '@/pm/types.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 
@@ -174,5 +178,111 @@ describe('createTransportPmDeliveryProvider', () => {
 		});
 		expect(provider.discover).toBeUndefined();
 		expect(discover).not.toHaveBeenCalled();
+	});
+});
+
+describe('createWriteOnlyTransportPmProvider', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function writeOnly(fetchImpl?: FetchLike) {
+		return createWriteOnlyTransportPmProvider({
+			controlPlaneUrl: CONTROL_PLANE,
+			workerCredential: CREDENTIAL,
+			projectId: PROJECT_ID,
+			providerType: 'github-projects',
+			fetchImpl,
+		});
+	}
+
+	it('rides the same two delivery routes as the composite, with no local delegate', async () => {
+		const fetchImpl = vi
+			.fn<FetchLike>()
+			.mockResolvedValueOnce(jsonResponse(200, {}))
+			.mockResolvedValueOnce(jsonResponse(200, { commentId: 'IC_kw99' }));
+		const provider = writeOnly(fetchImpl);
+
+		await provider.moveWorkItem('PVTI_item1', 'inProgress');
+		const commentId = await provider.addComment('PVTI_item1', 'Implementation done');
+
+		expect(commentId).toBe('IC_kw99');
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/move');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			status: 'inProgress',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		expect(fetchImpl.mock.calls[1][0]).toBe('https://swarm.example/worker/delivery/pm/comment');
+	});
+
+	it('reports the project’s configured provider type rather than hard-coding one', () => {
+		expect(writeOnly().type).toBe('github-projects');
+	});
+
+	it('rejects every board read with an actionable reason instead of inventing a result', async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+		const provider = writeOnly(fetchImpl);
+
+		for (const call of [
+			() => provider.getWorkItem('PVTI_item1'),
+			() => provider.listWorkItems({ status: 'todo' }),
+			() => provider.findComment('PVTI_item1', 'marker'),
+			() => provider.createWorkItem({ title: 't', description: 'd', status: 'planning' }),
+			() => provider.updateWorkItem('PVTI_item1', { title: 't2' }),
+			() => provider.addLabel('PVTI_item1', 'planned'),
+		]) {
+			await expect(call()).rejects.toThrow(/not available on a DB-free worker/i);
+		}
+		// A refused read is local — it never reaches the delivery API.
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it('serves listBlockers over the transport so the dependency gate keeps gating', async () => {
+		const blockers = [
+			{
+				id: 'PVTI_blocker',
+				reference: '#319',
+				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				title: 'Prerequisite',
+				open: true,
+				source: 'dependency' as const,
+			},
+		];
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { blockers }));
+		const provider = writeOnly(fetchImpl);
+
+		// Declared ON: stubbing it off would short-circuit `findOpenBlockers` and let a
+		// blocked item build out of order (issue #330).
+		expect(provider.supportsDependencies).toBe(true);
+		expect(provider.supportsAssignees).toBe(false);
+		await expect(provider.listBlockers('PVTI_item1')).resolves.toEqual(blockers);
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/blockers');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it('accepts a blocker whose URL the provider left empty, rather than un-gating on a parse error', async () => {
+		// `findOpenBlockers` treats a throw as "no blockers", so this wire schema must be
+		// exactly as permissive as `WorkItemBlocker` (issue #330).
+		const blockers = [
+			{ reference: '#319', url: '', title: 'Prerequisite', open: true, source: 'mention' as const },
+		];
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { blockers }));
+		await expect(writeOnly(fetchImpl).listBlockers('PVTI_item1')).resolves.toEqual(blockers);
+	});
+
+	it("refuses addBlockedBy — recording a dependency is Planning's move, and Planning stays local", async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+		await expect(writeOnly(fetchImpl).addBlockedBy('PVTI_item1', 'PVTI_item2')).rejects.toThrow(
+			/not available on a DB-free worker/i,
+		);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it('exposes no discovery capability', () => {
+		expect(writeOnly().discover).toBeUndefined();
 	});
 });

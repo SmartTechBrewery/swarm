@@ -129,10 +129,15 @@ operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`. It performs the
 `/worker/session` handshake (declaring the CLIs it can run), keeps its session
 live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
 and executes a pushed `TaskAssignment` **DB-free**: project config comes from the
-assignment, delivery runs under the operator token, and results stream back over
-the transport (ADR-003 §2). Only the source-only phases (`respond-to-ci`,
-`resolve-conflicts`) run today; other phases are failed cleanly until the server
-delivery API lands. It is **additive**: the same-machine `npm run dev:worker`
+assignment, source-carrying delivery (commit / push / create-PR) runs under the
+operator token, and everything needing something this worker must not hold goes up
+to the control plane's delivery API — Implementation's board moves/comments and
+dependency lookup under the project's PM credential, Review's submitted verdict
+under its reviewer PAT, and Review's verdict-ledger reads/writes against the
+database the control plane owns. Results stream back over the transport (ADR-003
+§2). Four phases run this way today (`respond-to-ci`, `resolve-conflicts`,
+`implementation`, `review`); `respond-to-review` and `planning` are failed cleanly
+until their remaining PM seams land. It is **additive**: the same-machine `npm run dev:worker`
 path above is unchanged. See
 [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md#remote-worker-transport-worker).
 

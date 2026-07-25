@@ -6,90 +6,86 @@
  * transport to the control-plane delivery API (`../router/worker-delivery.ts`),
  * which performs the board write under the PM credential. Only metadata (a
  * canonical status key or a comment body) crosses the wire; the repository tree
- * never does (ai/RULES.md §1).
+ * never does (ai/RULES.md §1). The wire mechanics live in the shared client
+ * (`../transport/delivery-client.ts`).
  *
- * Every remaining `PMProvider` method — the reads (`getWorkItem`,
- * `listWorkItems`, `findComment`, `listBlockers`), the other writes
- * (`createWorkItem`, `updateWorkItem`, `addLabel`, `addBlockedBy`), and
- * `discover` — delegates verbatim to a `localDelegate` (the worker's own
- * in-process provider), so the full interface the pipeline phases expect is
- * preserved unchanged. This task moves only the two metadata *writes*
- * server-side; the reads move server-side later with the broader dispatch-push
- * work (ADR-003 §2), not here.
+ * Two shapes share those writes, for the two kinds of worker:
+ *
+ * - {@link createTransportPmDeliveryProvider} — the **composite**, for a worker
+ *   that still holds `DATABASE_URL` and can build an in-process provider: every
+ *   remaining `PMProvider` method (the reads `getWorkItem`/`listWorkItems`/
+ *   `findComment`/`listBlockers`, the other writes `createWorkItem`/
+ *   `updateWorkItem`/`addLabel`/`addBlockedBy`, and `discover`) delegates
+ *   verbatim to a `localDelegate`, so the full interface the pipeline phases
+ *   expect is preserved unchanged.
+ * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
+ *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
+ *   no in-process provider to fall back on: the two writes ride the transport,
+ *   `listBlockers` rides it too (the dependency gate must keep gating — see that
+ *   factory's note), and every remaining board *read* refuses with an actionable
+ *   error, because the control plane already performed the reads the assignment
+ *   was composed from.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * best-effort / board-report handling behaves exactly as it does with the
  * in-process provider today.
  */
 
+import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
 import {
 	AddPmCommentDeliveryResponseSchema,
+	ListBlockersDeliveryResponseSchema,
 	MoveWorkItemDeliveryResponseSchema,
-	TRANSPORT_PROTOCOL_VERSION,
 } from '../transport/protocol.js';
-import type { PMProvider } from './types.js';
+import type { PMProvider, PMType } from './types.js';
 
-/** The `fetch` surface this module uses — injectable so tests drive it without a network. */
-export type FetchLike = (
-	input: string,
-	init: {
-		method: string;
-		headers: Record<string, string>;
-		body: string;
-	},
-) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+export type { FetchLike } from '../transport/delivery-client.js';
 
-export interface TransportPmDeliveryOptions {
-	/** Base URL of the control-plane delivery API, e.g. `https://swarm.example`. */
-	controlPlaneUrl: string;
-	/** Raw registered-worker credential (sent as `Authorization: Bearer`). */
-	workerCredential: string;
+/** What both shapes need to reach the control plane's PM delivery routes. */
+interface TransportPmWriteOptions extends DeliveryClientOptions {
 	/** The project id, sent so the server resolves the right PM credential + enrollment. */
 	projectId: string;
-	/** The worker's in-process provider, handling every read + non-metadata-write op. */
-	localDelegate: PMProvider;
-	/** Override `fetch` in tests; defaults to the global. */
-	fetchImpl?: FetchLike;
 }
 
-/** Join the control-plane base URL with a delivery path, tolerating a trailing slash. */
-function deliveryUrl(base: string, path: string): string {
-	return `${base.replace(/\/+$/, '')}${path}`;
+export interface TransportPmDeliveryOptions extends TransportPmWriteOptions {
+	/** The worker's in-process provider, handling every read + non-metadata-write op. */
+	localDelegate: PMProvider;
+}
+
+export interface WriteOnlyTransportPmDeliveryOptions extends TransportPmWriteOptions {
+	/**
+	 * The project's configured PM provider type (`project.pm.type`), reported as
+	 * this provider's own `type`. Taken from the config rather than hard-coded so
+	 * no concrete provider is named here (ai/RULES.md §2).
+	 */
+	providerType: PMType;
 }
 
 /**
- * POST a delivery request to the control plane and return the parsed response
- * body. Throws on a non-2xx status or a body that does not match the parser, so
- * the caller behaves as the in-process provider would on a failed write.
+ * The two metadata board writes, as they ride the transport. Shared by both
+ * factories below so the request shapes can't drift apart.
  */
-async function postDelivery<T>(
-	options: TransportPmDeliveryOptions,
-	path: string,
-	body: Record<string, unknown>,
-	parse: (value: unknown) => T,
-): Promise<T> {
-	const fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
-	const response = await fetchImpl(deliveryUrl(options.controlPlaneUrl, path), {
-		method: 'POST',
-		headers: {
-			'content-type': 'application/json',
-			authorization: `Bearer ${options.workerCredential}`,
-		},
-		body: JSON.stringify({ ...body, protocolVersion: TRANSPORT_PROTOCOL_VERSION }),
-	});
-	if (!response.ok)
-		throw new Error(`Control-plane PM delivery ${path} failed with status ${response.status}`);
-	let payload: unknown;
-	try {
-		payload = await response.json();
-	} catch (error) {
-		throw new Error(
-			`Control-plane PM delivery ${path} returned an unparseable response: ${
-				error instanceof Error ? error.message : String(error)
-			}`,
-		);
-	}
-	return parse(payload);
+function transportPmWrites(
+	options: TransportPmWriteOptions,
+): Pick<PMProvider, 'moveWorkItem' | 'addComment'> {
+	return {
+		moveWorkItem: (id, status) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/move',
+				{ projectId: options.projectId, itemId: id, status },
+				(value) => {
+					MoveWorkItemDeliveryResponseSchema.parse(value);
+				},
+			),
+		addComment: (id, text) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/comment',
+				{ projectId: options.projectId, itemId: id, body: text },
+				(value) => AddPmCommentDeliveryResponseSchema.parse(value).commentId,
+			),
+	};
 }
 
 /**
@@ -118,21 +114,68 @@ export function createTransportPmDeliveryProvider(options: TransportPmDeliveryOp
 		// transport delegate leaves it absent (a valid `PMProvider` — `discover` is
 		// optional) rather than routing discovery over the metadata-write transport.
 		// The two metadata writes ride the transport under the server-side PM credential.
-		moveWorkItem: (id, status) =>
+		...transportPmWrites(options),
+	};
+}
+
+/**
+ * A board read a DB-free worker cannot serve: it holds no PM credential and no
+ * in-process provider, and the control plane already performed every read the
+ * assignment needed before pushing it. Refusing loudly beats inventing an empty
+ * result a phase would then act on.
+ *
+ * Rejects rather than throwing synchronously, so it fails exactly where a real
+ * provider's failed call would — inside the caller's `await`.
+ */
+async function unavailableRead(operation: string): Promise<never> {
+	throw new Error(
+		`PM read '${operation}' is not available on a DB-free worker — board reads stay on the control plane (ADR-003 §2)`,
+	);
+}
+
+/**
+ * Build the delegate-less variant for a DB-free remote worker: the two metadata
+ * writes ride the transport exactly as above, `listBlockers` rides it as the one
+ * transported **read**, and everything else refuses via {@link unavailableRead}.
+ * The phases a DB-free worker runs today need exactly that surface —
+ * Implementation moves the card, posts its comment, and gates on dependencies —
+ * so a call to anything else is a wiring bug, and the thrown message says so.
+ *
+ * `listBlockers` is transported rather than stubbed because the alternative is
+ * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
+ * (`../pipeline/dependency-guard.ts`) short-circuits, and a work item whose
+ * prerequisites are still open would be built out of order — the failure issue
+ * #330 exists to prevent. Nothing else gates it: `findOpenBlockers` is called
+ * only inside the phase, never by the dispatcher or the eligibility gate. So the
+ * capability is declared **on** and the read runs server-side under the PM
+ * credential.
+ *
+ * `addBlockedBy` still refuses: recording a dependency is Planning's
+ * task-splitting move, and Planning does not run on a DB-free worker. Assignees
+ * are unreadable here too — only the server-side eligibility gate reads that
+ * flag, and it never runs on a worker.
+ */
+export function createWriteOnlyTransportPmProvider(
+	options: WriteOnlyTransportPmDeliveryOptions,
+): PMProvider {
+	return {
+		type: options.providerType,
+		supportsAssignees: false,
+		supportsDependencies: true,
+		getWorkItem: () => unavailableRead('getWorkItem'),
+		listWorkItems: () => unavailableRead('listWorkItems'),
+		findComment: () => unavailableRead('findComment'),
+		createWorkItem: () => unavailableRead('createWorkItem'),
+		updateWorkItem: () => unavailableRead('updateWorkItem'),
+		addLabel: () => unavailableRead('addLabel'),
+		addBlockedBy: () => unavailableRead('addBlockedBy'),
+		listBlockers: (id) =>
 			postDelivery(
 				options,
-				'/worker/delivery/pm/move',
-				{ projectId: options.projectId, itemId: id, status },
-				(value) => {
-					MoveWorkItemDeliveryResponseSchema.parse(value);
-				},
+				'/worker/delivery/pm/blockers',
+				{ projectId: options.projectId, itemId: id },
+				(value) => ListBlockersDeliveryResponseSchema.parse(value).blockers,
 			),
-		addComment: (id, text) =>
-			postDelivery(
-				options,
-				'/worker/delivery/pm/comment',
-				{ projectId: options.projectId, itemId: id, body: text },
-				(value) => AddPmCommentDeliveryResponseSchema.parse(value).commentId,
-			),
+		...transportPmWrites(options),
 	};
 }

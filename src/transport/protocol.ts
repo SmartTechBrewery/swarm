@@ -470,3 +470,124 @@ export const AddPmCommentDeliveryResponseSchema = z.object({
 	commentId: z.string().min(1),
 });
 export type AddPmCommentDeliveryResponse = z.infer<typeof AddPmCommentDeliveryResponseSchema>;
+
+/**
+ * `POST /worker/delivery/pm/blockers` request body — the prerequisites gating a
+ * work item. The one PM **read** the split serves (ADR-003 §2): Implementation's
+ * dependency gate (`../pipeline/dependency-guard.ts`) must not be skipped on a
+ * federated worker, or a task whose prerequisites are still open would be built
+ * out of order — the failure issue #330 exists to prevent. The read runs
+ * server-side under the per-project PM credential, like the writes above.
+ */
+export const ListBlockersDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	itemId: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type ListBlockersDeliveryRequest = z.infer<typeof ListBlockersDeliveryRequestSchema>;
+
+/**
+ * `POST /worker/delivery/pm/blockers` success body — the item's blockers in the
+ * provider-neutral shape `PMProvider.listBlockers` returns (`../pm/types.ts`);
+ * `[]` both when nothing gates the item and when the provider models no
+ * dependencies. No provider-specific fields cross the wire (ai/RULES.md §2).
+ */
+export const ListBlockersDeliveryResponseSchema = z.object({
+	blockers: z.array(
+		z.object({
+			id: z.string().min(1).optional(),
+			reference: z.string().min(1),
+			// Exactly as permissive as `WorkItemBlocker`, which allows an empty URL (the
+			// GitHub adapter's `issue.html_url ?? ''`). A stricter wire schema would
+			// throw here, and `findOpenBlockers` swallows a throw as "no blockers" — so
+			// tightening this field could silently un-gate the very check this serves.
+			url: z.string(),
+			title: z.string(),
+			open: z.boolean(),
+			source: z.enum(['dependency', 'mention']),
+		}),
+	),
+});
+export type ListBlockersDeliveryResponse = z.infer<typeof ListBlockersDeliveryResponseSchema>;
+
+/**
+ * Control-plane **review-verdict ledger** frames (ADR-003 §2). Unlike the
+ * delivery frames above, these front no credential — they front the
+ * `review_verdicts` **table** (`../db/repositories/reviewVerdictsRepository.ts`),
+ * which a DB-free worker cannot reach at all. The Review phase must still consult
+ * it: it carries the two-verdict safety cap (issue #235) and the
+ * prior-submitted-verdict answer that makes a run a re-review (issue #328).
+ *
+ * The worker sends only the PR coordinates (and, when marking, the verdict it
+ * submitted); the server derives the ledger key's `projectId`/`repository` from
+ * the **authenticated** project, so a worker can never key a row to a project or
+ * repository it isn't enrolled in. Carried by `POST /worker/delivery/review-ledger/*`
+ * (`../router/worker-delivery.ts`), same auth and `protocolVersion` handshake as
+ * the delivery routes.
+ */
+export const PriorReviewLedgerRequestSchema = z.object({
+	projectId: z.string().min(1),
+	prNumber: z.string().min(1),
+	/** The head being reviewed now — excluded from the lookup, so a same-head retry isn't a re-review. */
+	currentHeadSha: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type PriorReviewLedgerRequest = z.infer<typeof PriorReviewLedgerRequestSchema>;
+
+/**
+ * `POST /worker/delivery/review-ledger/prior` success body — the prior submitted
+ * verdict's slot, or `record: null` when this is the PR's first review (`null`
+ * rather than an absent key so "no prior review" is an explicit answer, never a
+ * dropped field).
+ */
+export const PriorReviewLedgerResponseSchema = z.object({
+	record: z
+		.object({
+			ordinal: z.number().int().positive(),
+			state: z.enum(['pending', 'submitted', 'abandoned']),
+			verdict: z.string().nullable(),
+			headSha: z.string().min(1),
+		})
+		.nullable(),
+});
+export type PriorReviewLedgerResponse = z.infer<typeof PriorReviewLedgerResponseSchema>;
+
+/** `POST /worker/delivery/review-ledger/mark` request body — the verdict this run submitted. */
+export const MarkReviewLedgerRequestSchema = z.object({
+	projectId: z.string().min(1),
+	prNumber: z.string().min(1),
+	headSha: z.string().min(1),
+	verdict: z.string().min(1),
+	/** The created review's id, once GitHub has confirmed it. */
+	reviewId: z.string().min(1).optional(),
+	protocolVersion: z.number().int(),
+});
+export type MarkReviewLedgerRequest = z.infer<typeof MarkReviewLedgerRequestSchema>;
+
+/**
+ * `POST /worker/delivery/review-ledger/mark` success body — the marked slot, or
+ * `slot: null` when no record exists for this PR/head (a reservation that was
+ * never made; the phase treats it as an unknown ordinal rather than an error).
+ */
+export const MarkReviewLedgerResponseSchema = z.object({
+	slot: z
+		.object({
+			id: z.string().min(1),
+			ordinal: z.number().int().positive(),
+		})
+		.nullable(),
+});
+export type MarkReviewLedgerResponse = z.infer<typeof MarkReviewLedgerResponseSchema>;
+
+/** `POST /worker/delivery/review-ledger/abandon` request body — release a pending slot. */
+export const AbandonReviewLedgerRequestSchema = z.object({
+	projectId: z.string().min(1),
+	prNumber: z.string().min(1),
+	headSha: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type AbandonReviewLedgerRequest = z.infer<typeof AbandonReviewLedgerRequestSchema>;
+
+/** `POST /worker/delivery/review-ledger/abandon` success body — the release carries no return value. */
+export const AbandonReviewLedgerResponseSchema = z.object({});
+export type AbandonReviewLedgerResponse = z.infer<typeof AbandonReviewLedgerResponseSchema>;

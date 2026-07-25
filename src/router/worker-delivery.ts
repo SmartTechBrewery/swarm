@@ -1,5 +1,10 @@
 /**
- * Server-side SCM metadata delivery API (ADR-002 §2). The two metadata-only SCM
+ * Server-side delivery API for the operations a federated worker cannot perform
+ * itself — the metadata GitHub writes whose credential stays on the server
+ * (ADR-002 §2), plus the review-verdict ledger reads/writes whose *database*
+ * stays on the server (ADR-003 §2).
+ *
+ * The two metadata-only SCM
  * delivery calls — submit a review, post a PR comment — run *here*, on the
  * router, under the **per-project reviewer PAT** the server already resolves
  * (`getPersonaToken`), instead of on a federated worker holding that token. A
@@ -22,18 +27,34 @@
  * the status crossing the wire is a canonical `PmStatusKey`, never a board
  * option ID (ai/RULES.md §2) — the adapter resolves it server-side.
  *
- * Four routes, all under `/worker/delivery`:
+ * The last three routes front the **review-verdict ledger** — the `review_verdicts`
+ * table (`../db/repositories/reviewVerdictsRepository.ts`) a Review run consults
+ * for the two-verdict safety cap (issue #235) and the prior-submitted-verdict
+ * re-review signal (issue #328). A DB-free remote worker holds no `DATABASE_URL`,
+ * so those three calls run here instead (`../transport/review-ledger-delivery.ts`
+ * is the client). No credential is involved: what stays server-side is the
+ * database. The worker sends only PR coordinates, and the ledger key's
+ * `projectId`/`repository` are taken from the **authenticated** project — never
+ * from the request — so a worker cannot key a row to a project or repository it
+ * isn't enrolled in.
+ *
+ * Eight routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
  *   - `POST /worker/delivery/pm/comment` — comment on the item's backing Issue/PR.
+ *   - `POST /worker/delivery/pm/blockers` — read the item's open prerequisites.
+ *   - `POST /worker/delivery/review-ledger/prior` — the PR's prior submitted verdict.
+ *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
+ *   - `POST /worker/delivery/review-ledger/abandon` — release a pending slot.
  *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
- * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`) so tests drive
- * them with fake deps and never need a live router; collaborators default to the
- * real services and are overridden in tests. Credential handling matches the
- * handshake's contract — the raw credential appears only in the
+ * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
+ * `handleListBlockers`, `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
+ * tests drive them with fake deps and never need a live router; collaborators
+ * default to the real services and are overridden in tests. Credential handling
+ * matches the handshake's contract — the raw credential appears only in the
  * `Authorization: Bearer` header, is never logged, never placed in a URL, and
  * never reflected in a response body.
  */
@@ -42,6 +63,11 @@ import type { Context, Hono } from 'hono';
 
 import type { ProjectConfig } from '../config/schema.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import {
+	abandonReviewVerdict,
+	getPriorSubmittedReview,
+	markReviewVerdictSubmitted,
+} from '../db/repositories/reviewVerdictsRepository.js';
 import { listEnrollmentsForWorker } from '../db/repositories/workerEnrollmentsRepository.js';
 import type { Worker } from '../identity/worker.js';
 import { isRoutable } from '../identity/worker-enrollment.js';
@@ -49,12 +75,17 @@ import { resolveWorkerByCredential } from '../identity/worker-service.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
 import type { GitHubPersona } from '../integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import type { PMProvider } from '../pm/types.js';
 import type { ScmDeliveryProvider } from '../scm/delivery.js';
 import {
+	AbandonReviewLedgerRequestSchema,
 	AddPmCommentDeliveryRequestSchema,
+	ListBlockersDeliveryRequestSchema,
+	MarkReviewLedgerRequestSchema,
 	MoveWorkItemDeliveryRequestSchema,
 	PostCommentDeliveryRequestSchema,
+	PriorReviewLedgerRequestSchema,
 	SubmitReviewDeliveryRequestSchema,
 	TRANSPORT_PROTOCOL_VERSION,
 } from '../transport/protocol.js';
@@ -76,6 +107,12 @@ export interface WorkerDeliveryDeps {
 	) => Promise<ScmDeliveryProvider>;
 	/** Build the server-side PM provider for a project (resolves the per-project PM credential here). */
 	buildPmProvider: (project: ProjectConfig) => PMProvider;
+	/**
+	 * The review-verdict ledger, defaulted to the repository this process reaches
+	 * over `DATABASE_URL`. Injected as one object so the three routes below cannot
+	 * drift from the contract the Review phase programs against.
+	 */
+	reviewLedger: ReviewVerdictLedger;
 }
 
 /** A worker may deliver to a project only via a routable enrollment (active + sharing consent). */
@@ -94,6 +131,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		buildScmDelivery: (project, persona) =>
 			new GitHubSCMIntegration().deliveryProvider(project, persona),
 		buildPmProvider: createGitHubProjectsProvider,
+		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
 	};
 }
 
@@ -256,6 +294,141 @@ export async function handleAddPmComment(
 	return { status: 200, json: { commentId } };
 }
 
+/**
+ * Read a work item's blockers — the one PM **read** the delivery API serves, so a
+ * federated worker's Implementation run still gates on unfinished prerequisites
+ * (issue #330) instead of skipping the check it has no credential for. Same
+ * prelude and contract as {@link handleMoveWorkItem}; the PM credential is
+ * resolved server-side, and the blockers come back in the provider-neutral shape
+ * `PMProvider.listBlockers` defines.
+ */
+export async function handleListBlockers(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = ListBlockersDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	// `[]` for a provider that models no dependencies is the interface's own
+	// contract (`../pm/types.ts`), so no capability branch is needed here.
+	const blockers = await pm.listBlockers(request.itemId);
+	return { status: 200, json: { blockers } };
+}
+
+/**
+ * Read the PR's prior submitted verdict from the ledger — the re-review signal
+ * (issue #328) a DB-free worker cannot look up itself. Same prelude and contract
+ * as {@link handleSubmitReview}; the ledger key's project and repository come from
+ * the authenticated project, never from the request body. Returns
+ * `{ record: null }` when the PR has no earlier submitted verdict.
+ */
+export async function handlePriorReview(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = PriorReviewLedgerRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const record = await deps.reviewLedger.getPriorSubmittedReview(
+		authed.project.id,
+		authed.project.repo,
+		request.prNumber,
+		request.currentHeadSha,
+	);
+	return { status: 200, json: { record: record ?? null } };
+}
+
+/**
+ * Mark this PR/head's reserved ledger slot `submitted` and return it, so the
+ * worker's Review run learns its ordinal — the two-verdict cap signal (issue
+ * #235). Same prelude and contract as {@link handlePriorReview}; `{ slot: null }`
+ * when no record exists for this PR/head.
+ */
+export async function handleMarkReviewVerdict(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = MarkReviewLedgerRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const slot = await deps.reviewLedger.markReviewVerdictSubmitted(
+		{
+			projectId: authed.project.id,
+			repository: authed.project.repo,
+			prNumber: request.prNumber,
+			headSha: request.headSha,
+		},
+		{ verdict: request.verdict, reviewId: request.reviewId },
+	);
+	return { status: 200, json: { slot: slot ?? null } };
+}
+
+/**
+ * Release this PR/head's still-pending ledger slot after a Review run that
+ * certainly submitted nothing. Same prelude and contract as
+ * {@link handlePriorReview}; idempotent, and a no-op on an already-submitted slot.
+ */
+export async function handleAbandonReviewVerdict(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = AbandonReviewLedgerRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	await deps.reviewLedger.abandonReviewVerdict({
+		projectId: authed.project.id,
+		repository: authed.project.repo,
+		prNumber: request.prNumber,
+		headSha: request.headSha,
+	});
+	return { status: 200, json: {} };
+}
+
 /** Extract the raw credential from an `Authorization: Bearer <credential>` header. */
 function extractBearerCredential(authorization: string | undefined): string | undefined {
 	if (!authorization) return undefined;
@@ -264,7 +437,7 @@ function extractBearerCredential(authorization: string | undefined): string | un
 }
 
 /**
- * Wire the two delivery routes onto the router's Hono `app`, next to
+ * Wire the delivery routes onto the router's Hono `app`, next to
  * `registerWorkerTransport`. Pass `overrides` to substitute collaborators in
  * tests; omit for production wiring.
  */
@@ -303,6 +476,30 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/pm/comment', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleAddPmComment(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/blockers', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleListBlockers(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/review-ledger/prior', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handlePriorReview(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/review-ledger/mark', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleMarkReviewVerdict(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/review-ledger/abandon', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleAbandonReviewVerdict(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 }
