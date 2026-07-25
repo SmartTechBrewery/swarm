@@ -31,18 +31,22 @@
 import { getPersonaTokenOrNull } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
+import type { ScmPersona, ScmPersonaIdentities } from '../../../scm/types.js';
 import { getGitHubUserForToken } from './client.js';
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export type GitHubPersona = 'implementer' | 'reviewer';
+/**
+ * The persona role model is provider-neutral (`ScmPersona`, `src/scm/types.ts`);
+ * these are the GitHub module's local names for it. Kept as aliases rather than
+ * renamed at every call site: ~10 files still spell `GitHubPersona`, and issues
+ * #385/#386 retire the alias as they migrate those call sites onto the registry.
+ */
+export type GitHubPersona = ScmPersona;
 
-export interface PersonaIdentities {
-	implementer: string;
-	reviewer: string;
-}
+export type PersonaIdentities = ScmPersonaIdentities;
 
 // ============================================================================
 // Agent → Persona mapping

@@ -14,7 +14,7 @@ import {
 	findProjectByBoardFromDb,
 	findProjectByRepoFromDb,
 } from '../db/repositories/projectsRepository.js';
-import type { GitHubPersona } from '../integrations/scm/github/personas.js';
+import type { ScmPersona } from '../scm/types.js';
 import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from './operator-token.js';
 import type { ProjectConfig } from './schema.js';
 
@@ -55,7 +55,7 @@ export async function findProjectByBoard(
  */
 export async function getPersonaTokenOrNull(
 	project: ProjectConfig,
-	persona: GitHubPersona,
+	persona: ScmPersona,
 ): Promise<string | null> {
 	if (persona === 'implementer') return getOperatorGitHubTokenOrNull();
 	const envVarKey = project.credentials[persona];
@@ -82,7 +82,7 @@ export async function getWebhookSecretOrNull(project: ProjectConfig): Promise<st
  */
 export async function getPersonaToken(
 	project: ProjectConfig,
-	persona: GitHubPersona,
+	persona: ScmPersona,
 ): Promise<string> {
 	const token = await getPersonaTokenOrNull(project, persona);
 	if (!token) {

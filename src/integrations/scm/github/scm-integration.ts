@@ -1,14 +1,24 @@
 /**
- * GitHubSCMIntegration — GitHub SCM credential resolution, ported from Cascade's
+ * GitHubSCMIntegration — GitHub's implementation of the provider-neutral
+ * {@link SCMProvider} contract (`src/scm/types.ts`), ported from Cascade's
  * `src/github/scm-integration.ts`.
  *
- * The one job of this class is to run a block of GitHub operations under the
+ * The core job of this class is to run a block of GitHub operations under the
  * correct persona's credentials. Callers hand it a project + persona and a
  * function; it resolves that persona's token and binds it to the async context
  * (via `withGitHubToken`) for the duration of the call. Because resolution
  * happens per invocation, a single pipeline can review as the reviewer and push
  * fixes as the implementer without either token ever appearing in a signature
  * (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
+ *
+ * The `implements SCMProvider` declaration below *is* the conformance check —
+ * with one provider, a runtime conformance harness would be speculative
+ * (ai/TESTING.md "Provider conformance"). Everything GitHub-specific — Octokit
+ * types, GraphQL node IDs, which REST status means which merge outcome — stays
+ * inside this module and `./client.js` (the GitHub signature scheme's `sha256=`
+ * framing currently lives in `src/webhook/signature-verification.ts`; relocating
+ * it under `src/integrations/scm/github/` belongs to the ingress migration,
+ * issue #385).
  */
 
 import { execFile } from 'node:child_process';
@@ -17,10 +27,18 @@ import { getPersonaToken, getPersonaTokenOrNull } from '../../../config/provider
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { MergePullRequestOutcome } from '../../../scm/merge.js';
+import type {
+	AggregateCheckStatus,
+	PullRequestDetails,
+	SCMProvider,
+	ScmPersona,
+	ScmPersonaIdentities,
+} from '../../../scm/types.js';
+import { verifyGitHubSignature } from '../../../webhook/signature-verification.js';
 import {
-	type ConflictCandidatePullRequest,
 	createPullRequest,
 	findOpenPullRequest,
+	getCheckSuiteStatus,
 	getGitHubUserForToken,
 	getPullRequest,
 	getPullRequestMergeState,
@@ -34,7 +52,7 @@ import {
 	submitPullRequestReview,
 	withGitHubToken,
 } from './client.js';
-import type { GitHubPersona } from './personas.js';
+import { getPersonaForLogin, isSwarmBot, resolvePersonaIdentities } from './personas.js';
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -150,7 +168,7 @@ async function mergeReadyPullRequest(
 	}
 }
 
-export class GitHubSCMIntegration {
+export class GitHubSCMIntegration implements SCMProvider {
 	readonly type = 'github' as const;
 	readonly category = 'scm' as const;
 
@@ -168,9 +186,45 @@ export class GitHubSCMIntegration {
 	}
 
 	/** Whether a specific persona's token is configured for a project. */
-	async hasPersonaToken(project: ProjectConfig, persona: GitHubPersona): Promise<boolean> {
+	async hasPersonaToken(project: ProjectConfig, persona: ScmPersona): Promise<boolean> {
 		const token = await getPersonaTokenOrNull(project, persona);
 		return token !== null;
+	}
+
+	/**
+	 * {@link SCMProvider.resolvePersonaIdentities} — the contract's view of the
+	 * module-level `resolvePersonaIdentities`, including its per-project TTL cache.
+	 * The module function stays exported: ingress and three trigger handlers still
+	 * import it directly until issue #385.
+	 */
+	async resolvePersonaIdentities(project: ProjectConfig): Promise<ScmPersonaIdentities> {
+		return resolvePersonaIdentities(project);
+	}
+
+	/** {@link SCMProvider.personaForActor} — GitHub's `getPersonaForLogin`. */
+	personaForActor(login: string, identities: ScmPersonaIdentities): ScmPersona | null {
+		return getPersonaForLogin(login, identities);
+	}
+
+	/**
+	 * {@link SCMProvider.isSwarmActor} — GitHub's `isSwarmBot`, which matches
+	 * configured persona identities and `[bot]`-suffixed App forms for the PM
+	 * board's status-change gate and conflict filter (NOT the event drop gate,
+	 * which uses markers per #443 and work-item origin per #397).
+	 */
+	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean {
+		return isSwarmBot(login, identities);
+	}
+
+	/**
+	 * {@link SCMProvider.verifyWebhookSignature} — GitHub signs the raw payload
+	 * with HMAC-SHA256 and sends `sha256=<hex>` in `X-Hub-Signature-256`. The
+	 * timing-safe comparison and the prefix framing live in
+	 * `src/webhook/signature-verification.ts`; which header carries the signature
+	 * is the receiver's business (issue #385), not this method's.
+	 */
+	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean {
+		return verifyGitHubSignature(rawBody, signature, secret);
 	}
 
 	/**
@@ -181,7 +235,7 @@ export class GitHubSCMIntegration {
 	 */
 	async withPersonaCredentials<T>(
 		project: ProjectConfig,
-		persona: GitHubPersona,
+		persona: ScmPersona,
 		fn: () => Promise<T>,
 	): Promise<T> {
 		const token = await getPersonaToken(project, persona);
@@ -210,7 +264,7 @@ export class GitHubSCMIntegration {
 		project: ProjectConfig,
 		prNumber: number,
 		body: string,
-		persona: GitHubPersona = 'implementer',
+		persona: ScmPersona = 'implementer',
 	): Promise<number> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
@@ -227,11 +281,27 @@ export class GitHubSCMIntegration {
 	async getPullRequestTitle(
 		project: ProjectConfig,
 		prNumber: number,
-		persona: GitHubPersona = 'implementer',
+		persona: ScmPersona = 'implementer',
 	): Promise<string | null> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
 			getPullRequestTitle(owner, repo, prNumber),
+		);
+	}
+
+	/**
+	 * {@link SCMProvider.getAggregateCheckStatus} — every check on `ref`,
+	 * aggregated. Reads under the **reviewer** persona by default, the same scope
+	 * the review handler's aggregate query uses today.
+	 */
+	async getAggregateCheckStatus(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<AggregateCheckStatus> {
+		const [owner, repo] = project.repo.split('/');
+		return this.withPersonaCredentials(project, persona, () =>
+			getCheckSuiteStatus(owner, repo, ref),
 		);
 	}
 
@@ -266,7 +336,7 @@ export class GitHubSCMIntegration {
 	async listConflictCandidates(
 		project: ProjectConfig,
 		baseBranch: string,
-	): Promise<ConflictCandidatePullRequest[]> {
+	): Promise<PullRequestDetails[]> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, 'implementer', () =>
 			listOpenPullRequestsForBase(owner, repo, baseBranch),
@@ -276,17 +346,22 @@ export class GitHubSCMIntegration {
 	async getPullRequest(
 		project: ProjectConfig,
 		prNumber: number,
-		persona: GitHubPersona = 'reviewer',
-	): Promise<ConflictCandidatePullRequest> {
+		persona: ScmPersona = 'reviewer',
+	): Promise<PullRequestDetails> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
 			getPullRequest(owner, repo, prNumber),
 		);
 	}
 
+	/**
+	 * {@link SCMProvider.deliveryProvider} — the same-host, per-persona delivery
+	 * seam. Not the only producer of an {@link ScmDeliveryProvider}: see the
+	 * contract's note on `operator-delivery.ts` and `src/scm/transport-delivery.ts`.
+	 */
 	async deliveryProvider(
 		project: ProjectConfig,
-		persona: GitHubPersona,
+		persona: ScmPersona,
 	): Promise<ScmDeliveryProvider> {
 		const [owner, repo] = project.repo.split('/');
 		const token = await getPersonaToken(project, persona);

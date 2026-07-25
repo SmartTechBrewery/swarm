@@ -10,6 +10,7 @@ Early implementation. Summary by area:
 - Postgres persistence layer in place: Drizzle schema + migrations for project config, encrypted-at-rest credentials, and agent-run history.
 
 ### GitHub SCM layer
+- The SCM provider self-registers through a manifest + registry loaded from the same canonical entrypoint as the PM one (`src/integrations/entrypoint.ts`), behind the provider-neutral `SCMProvider` contract (`src/scm/types.ts`) that `GitHubSCMIntegration` implements — so a consumer can resolve the whole contract by id without importing the concrete class. Ingress, triggers, phases, and the worker still construct GitHub directly; moving those call sites onto the registry (and neutralizing the webhook event model) is deliberately deferred to the ingress and pipeline/worker phases (#385/#386).
 - Dual-persona (`implementer`/`reviewer`) credential scoping via `AsyncLocalStorage`, with per-persona token resolution from Postgres.
 - A router adapter parses inbound webhooks, resolves the project, and enforces loop prevention.
 - The router serves the HTTP webhook receiver: HMAC-SHA256 signature verification on `POST /github/webhook`, feeding the adapter through to an enqueue seam that shapes each verified event into a `SwarmJob`, records it as a durable dispatch (dedup-keyed on the delivery id — ADR-002), and publishes its wake-up onto the `swarm-jobs` BullMQ queue (SWARM-35, issue #284).

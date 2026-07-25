@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createMockProjectConfig } from '../../../../helpers/factories.js';
@@ -21,6 +22,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	// Pass-through so we can assert the token that would be scoped without a real Octokit.
 	withGitHubToken: vi.fn((_token: string, fn: () => Promise<unknown>) => fn()),
 	getGitHubUserForToken: vi.fn(),
+	getCheckSuiteStatus: vi.fn(),
 	getPullRequestMergeState: vi.fn(),
 	getPullRequestReviewDecision: vi.fn(),
 	getPullRequestReviews: vi.fn(),
@@ -29,6 +31,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 
 import { getPersonaToken, getPersonaTokenOrNull } from '@/config/provider.js';
 import {
+	getCheckSuiteStatus,
 	getGitHubUserForToken,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
@@ -36,9 +39,16 @@ import {
 	mergePullRequestDirect,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
+import {
+	_resetPersonaIdentityCache,
+	getPersonaForLogin,
+	isSwarmBot,
+} from '@/integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '@/integrations/scm/github/scm-integration.js';
+import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
+const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 
 describe('GitHubSCMIntegration', () => {
 	const scm = new GitHubSCMIntegration();
@@ -106,6 +116,107 @@ describe('GitHubSCMIntegration', () => {
 		it('defaults to the implementer persona', async () => {
 			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
 			await scm.withCredentials(project, async () => undefined);
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
+		});
+	});
+
+	describe('persona/actor resolution (SCMProvider contract wrappers)', () => {
+		beforeEach(() => {
+			_resetPersonaIdentityCache();
+		});
+
+		it('resolves both persona identities from their own tokens', async () => {
+			vi.mocked(getPersonaTokenOrNull).mockImplementation(async (_p, persona) => `tok-${persona}`);
+			vi.mocked(getGitHubUserForToken).mockImplementation(async (token) =>
+				token === 'tok-implementer' ? 'swarm-impl' : 'swarm-rev',
+			);
+			await expect(scm.resolvePersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+		});
+
+		it('propagates the throw when an identity cannot be resolved', async () => {
+			vi.mocked(getPersonaTokenOrNull).mockResolvedValue('tok');
+			vi.mocked(getGitHubUserForToken).mockResolvedValue(null);
+			await expect(scm.resolvePersonaIdentities(project)).rejects.toThrow(/implementer/);
+		});
+
+		it('personaForActor answers the same as the module-level mapping, bot suffix included', () => {
+			for (const login of [
+				'swarm-impl',
+				'swarm-impl[bot]',
+				'swarm-rev',
+				'swarm-rev[bot]',
+				'human',
+			]) {
+				expect(scm.personaForActor(login, IDENTITIES)).toBe(getPersonaForLogin(login, IDENTITIES));
+			}
+			expect(scm.personaForActor('swarm-rev[bot]', IDENTITIES)).toBe('reviewer');
+			expect(scm.personaForActor('human', IDENTITIES)).toBeNull();
+		});
+
+		it('isSwarmActor answers the same as the module-level bot check', () => {
+			for (const login of ['swarm-impl', 'swarm-rev[bot]', 'human']) {
+				expect(scm.isSwarmActor(login, IDENTITIES)).toBe(isSwarmBot(login, IDENTITIES));
+			}
+			expect(scm.isSwarmActor('swarm-impl[bot]', IDENTITIES)).toBe(true);
+			expect(scm.isSwarmActor('human', IDENTITIES)).toBe(false);
+		});
+
+		it('returns true when actor matches implementer/operator identity, showing why it cannot serve as an event drop gate (#397/#443)', () => {
+			// Under the federated model (ADR-004 §3), the implementer identity is the worker
+			// operator's own account. isSwarmActor returns true for it, which means an event drop
+			// gate based on login would silently drop human-authored events. Drop gates use
+			// SWARM-origin markers (#443) and work-item origin (#397) instead.
+			const federatedIdentities: ScmPersonaIdentities = {
+				implementer: 'jkwiecien',
+				reviewer: 'swarm-rev[bot]',
+			};
+			expect(scm.isSwarmActor('jkwiecien', federatedIdentities)).toBe(true);
+		});
+	});
+
+	describe('verifyWebhookSignature', () => {
+		const rawBody = '{"action":"opened"}';
+		const secret = 'shhh';
+		const valid = `sha256=${createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')}`;
+
+		it('accepts a correctly computed signature', () => {
+			expect(scm.verifyWebhookSignature(rawBody, valid, secret)).toBe(true);
+		});
+
+		it('rejects a forged signature, a missing prefix, and an empty one', () => {
+			expect(scm.verifyWebhookSignature(rawBody, `${valid.slice(0, -1)}0`, secret)).toBe(false);
+			expect(scm.verifyWebhookSignature(rawBody, valid.replace('sha256=', ''), secret)).toBe(false);
+			expect(scm.verifyWebhookSignature(rawBody, '', secret)).toBe(false);
+		});
+
+		it('rejects a signature computed over a different body', () => {
+			expect(scm.verifyWebhookSignature('{"action":"closed"}', valid, secret)).toBe(false);
+		});
+	});
+
+	describe('getAggregateCheckStatus', () => {
+		const aggregate = {
+			totalCount: 1,
+			checkRuns: [{ name: 'test', status: 'completed', conclusion: 'success' }],
+		};
+
+		beforeEach(() => {
+			vi.mocked(getCheckSuiteStatus).mockReset();
+			vi.mocked(getCheckSuiteStatus).mockResolvedValue(aggregate);
+		});
+
+		it('reads under the reviewer persona by default, with owner/repo split from project.repo', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
+			await expect(scm.getAggregateCheckStatus(project, 'cafe')).resolves.toEqual(aggregate);
+
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
+			expect(withGitHubToken).toHaveBeenCalledWith('tok-rev', expect.any(Function));
+			expect(getCheckSuiteStatus).toHaveBeenCalledWith('jkwiecien', 'swarm', 'cafe');
+		});
+
+		it('honours an explicit persona override', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			await scm.getAggregateCheckStatus(project, 'cafe', 'implementer');
 			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
 		});
 	});
