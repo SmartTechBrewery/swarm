@@ -26,14 +26,13 @@
  * to be ambient on the worker's host. Since issue #396 the implementer token is
  * the worker operator's own token (`SWARM_OPERATOR_GH_TOKEN`, resolved through
  * the same `getPersonaToken(project, 'implementer')` seam), so the PR is authored
- * by the operator's account — and that *is* the identity loop-prevention resolves
- * for the implementer (`resolvePersonaIdentities`, from the same token), so the
- * author-persona gate (`ai/ARCHITECTURE.md`, `src/triggers/handlers/review.ts`)
- * still recognises the PR as SWARM-authored. Confirmed live before that change:
- * without a persona `GH_TOKEN` the PR came back under whatever ambient `gh auth`
- * login the host had, which the gate refuses to review — "not a SWARM persona" —
- * silently stranding the item in "In review" forever with nothing to trigger
- * Review, let alone Respond-to-review after it.
+ * by the operator's account. Review's ownership gate no longer reads that author
+ * at all (issue #397): it recognises the PR from its **branch**
+ * (`<branchPrefix><issueNumber>`, the branch this phase's worktree provisions)
+ * plus this phase's own `runs` row — see `src/triggers/swarm-managed-pr.ts`.
+ * Which is why the branch name matters: an off-convention branch is a PR Review
+ * will not recognise, silently stranding the item in "In review" forever with
+ * nothing to trigger Review, let alone Respond-to-review after it.
  *
  * This is the phase's orchestration only. It composes the building blocks that
  * already exist — `GitWorktreeManager` (SWARM-14), `graftEnvironment` (SWARM-15),
