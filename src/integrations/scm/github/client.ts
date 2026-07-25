@@ -15,6 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Octokit } from '@octokit/rest';
 
 import { logger } from '../../../lib/logger.js';
+import { swarmMarker } from '../../../scm/swarm-origin.js';
 
 const clientStorage = new AsyncLocalStorage<Octokit>();
 
@@ -323,7 +324,7 @@ export async function postIssueComment(
 	return data.id;
 }
 
-const DELIVERY_MARKER = (deliveryId: string) => `<!-- swarm-delivery:${deliveryId} -->`;
+const DELIVERY_MARKER = (deliveryId: string) => swarmMarker('delivery', deliveryId);
 
 export async function findOpenPullRequest(
 	owner: string,
