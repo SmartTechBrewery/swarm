@@ -1111,7 +1111,7 @@ function logAgentRouting(
  */
 /**
  * Resolve the SCM delivery provider for a PR-driven phase, choosing the delivery
- * mode in one place (ADR-002 §2). In **control-plane delivery mode** — a
+ * mode in one place (ADR-004 §2). In **control-plane delivery mode** — a
  * federated worker with both `SWARM_CONTROL_PLANE_URL` and
  * `SWARM_WORKER_CREDENTIAL` set — the metadata-only calls (`submitReview` /
  * `postComment`) travel up the transport to the router's server-side delivery
@@ -1141,7 +1141,7 @@ export async function resolveScmDelivery(
 /**
  * Resolve the PM provider a board-driven phase (planning / implementation /
  * respond-to-review) writes through, choosing the delivery mode in the same one
- * place as {@link resolveScmDelivery} (ADR-002 §2, Phase 2/2). In **control-plane
+ * place as {@link resolveScmDelivery} (ADR-004 §2, Phase 2/2). In **control-plane
  * delivery mode** — a federated worker with both `SWARM_CONTROL_PLANE_URL` and
  * `SWARM_WORKER_CREDENTIAL` set — the two metadata-only PM writes
  * (`moveWorkItem` / `addComment`) travel up the transport to the router's
@@ -1218,7 +1218,7 @@ export interface AssignedPhaseInputs {
 	workItem?: WorkItem;
 	/**
 	 * planning / implementation / respond-to-review only: the resolved
-	 * control-plane PM write delegate (ADR-002 §2, {@link resolvePmDelivery}) or
+	 * control-plane PM write delegate (ADR-004 §2, {@link resolvePmDelivery}) or
 	 * DB-free dispatch injection (ADR-003 §2, `../transport/assignment-execution.ts`),
 	 * or `undefined` to use the phase's own in-process provider (the local host
 	 * worker, via `createGitHubProjectsProvider`). Mirrors {@link delivery} on the
@@ -1240,7 +1240,7 @@ export interface AssignedPhaseInputs {
 	baseSha?: string;
 	/**
 	 * review / respond-to-review only: the resolved control-plane SCM delivery
-	 * provider (ADR-002 §2, {@link resolveScmDelivery}) or DB-free dispatch
+	 * provider (ADR-004 §2, {@link resolveScmDelivery}) or DB-free dispatch
 	 * injection (ADR-003 §2, `../transport/assignment-execution.ts`), or
 	 * `undefined` to use the phase's own in-process delegate (the local host
 	 * worker, via `GitHubSCMIntegration`).

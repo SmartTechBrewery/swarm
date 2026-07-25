@@ -86,7 +86,7 @@ async function main(): Promise<void> {
 				operatorToken,
 				// The delivery seam for the metadata writes this worker holds no
 				// credential for (a review, a board move/comment): POSTed to the control
-				// plane under this worker's own credential (ADR-002 §2).
+				// plane under this worker's own credential (ADR-004 §2).
 				controlPlaneUrl,
 				workerCredential: credential,
 				shutdownSignal: shutdownSignal.signal,

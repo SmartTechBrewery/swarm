@@ -1,9 +1,20 @@
-# ADR-002: Worker↔control-plane transport and split GitHub delivery
+# ADR-004: Worker↔control-plane transport and split GitHub delivery
 
-- **Status:** Accepted
-- **Date:** 2026-07-24
+- **Status:** Accepted — §1 and §2 implemented, §3 and §4 outstanding (see below)
+- **Date:** 2026-07-24 (renumbered 2026-07-25)
 - **Decision owners:** SWARM maintainers
 - **Builds on:** [ADR-001](./ADR-001-federated-workers-and-project-access.md)
+- **Implementation record:** [ADR-003](./ADR-003-worker-transport-and-split-delivery.md)
+
+> **Renumbering note.** This record was originally filed as `ADR-002`, colliding
+> with [ADR-002: durable dispatch state machine](./ADR-002-durable-dispatch-state-machine.md)
+> (issue #284) — two accepted ADRs shared one number, so a citation of "ADR-002 §2"
+> was ambiguous. It takes the next free number, **ADR-004**; every code and doc
+> citation that meant *this* document was rewritten accordingly, and bare
+> `ADR-002` citations (all of which mean the durable-dispatch record) were left
+> alone. **The numbering is chronological, not a dependency order:** ADR-003 is
+> the phase-by-phase *implementation* record for §1–§2 of this decision, written
+> while this file was still numbered ADR-002.
 
 ## Context
 
@@ -108,15 +119,42 @@ Consequences of the rule:
 - **PM board/issue writes also move server-side**, for the same reason the
   reviewer PAT does: they are metadata operations needing a project-scoped
   credential the worker should not hold, and the worker has no DB config under
-  §1 anyway. Today they run inline on the worker
-  (`createGitHubProjectsProvider(project)` passed into phases,
-  `src/worker/consumer.ts:1113`).
+  §1 anyway. **Shipped** (issue #413): in
+  control-plane delivery mode `resolvePmDelivery` (`src/worker/consumer.ts`) hands
+  the phase a transport-backed `PMProvider`; only the local host worker still uses
+  the in-process `createGitHubProjectsProvider(project)`.
 - **Review comments (which may quote a few code lines) pass through the control
   plane.** This is consistent with the local-first boundary: RULES.md §1 admits
   the cloud may see "issue metadata, comments, and logs," and the comment is the
   exact artifact being published to the PR. The repository tree never crosses.
 
+**Amendment (2026-07-25, issue #417).** The rule above splits operations by *what
+they carry*. Making a worker DB-free surfaced a third category it does not
+describe: an operation that carries no source and needs no project credential, but
+reads or writes **server-side state** the worker has no connection to. The rule is
+therefore: *source-carrying operations stay on the worker; an operation needing a
+resource the worker must not or cannot hold — a project credential **or** the
+database — runs on the control plane.*
+
+The instance is the Review phase's **review-verdict ledger** (`review_verdicts`):
+it carries the two-verdict safety cap (issue #235) and the prior-submitted-verdict
+signal that makes a run a re-review (issue #328), so a Review run cannot skip it,
+yet a DB-free worker cannot reach the table. Its three operations moved
+server-side behind the same worker-credential + enrollment auth as the metadata
+routes (`POST /worker/delivery/review-ledger/{prior,mark,abandon}`), fronted by the
+`ReviewVerdictLedger` seam (`src/pipeline/review-ledger.ts`). The same reasoning
+admitted the one PM **read** now served server-side,
+`POST /worker/delivery/pm/blockers`: Implementation's dependency gate must keep
+gating (issue #330), and stubbing it out on the worker would have let a blocked
+item build out of order.
+
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
+
+> **Status: outstanding — issue #397.** Not implemented, and no longer
+> hypothetical: since §2 landed for Implementation (issue #417), a federated PR is
+> authored by the operator's own account, so the persona-authorship gate skips it
+> and **auto-review does not fire on the federated path**. This is the gating item
+> for that path being usable end to end.
 
 Today SWARM decides a PR should be auto-reviewed by checking that its **author
 is a SWARM persona**: `isSwarmAuthoredPr` → `isSwarmBot(authorLogin, identities)`
@@ -136,6 +174,11 @@ than on a persona login. The reviewer identity remains distinct from the author
 (PROJECT.md §5.3) still holds.
 
 ### 4. Record worker→PR attribution in the data model
+
+> **Status: outstanding — issue #398.** Not implemented. Note the constraint §2
+> introduced: a DB-free worker cannot write the record itself, so both ends must be
+> captured by the control plane — at push (`src/router/dispatcher.ts`) and at settle
+> — and the `TaskExecutionResult` frame carries no PR identity today.
 
 Independent of the native GitHub authorship, the control plane records the
 `(work item, phase, worker, user, PR url)` mapping when it dispatches and when
@@ -163,16 +206,20 @@ PR/review even if the token model later changes.
   transport-backed `ScmDeliveryProvider`/`PMProvider` delegates
   (`src/scm/transport-delivery.ts`, `src/pm/transport-delivery.ts`) that carry
   only metadata up the wire; the local host worker keeps the in-process path.
-  PM **reads** stay worker-side until the broader dispatch-push work (ADR-003 §2).
+  Since issue #417 the same API also carries the operations covered by the §2
+  amendment — `POST /worker/delivery/pm/blockers` and
+  `POST /worker/delivery/review-ledger/{prior,mark,abandon}` — for eight routes in
+  total, with the wire mechanics shared by one client
+  (`src/transport/delivery-client.ts`). Every other PM **read** stays worker-side;
+  resolving a board card from a PR url is the next one to move (issue #418).
 - Implementer credential provisioning changes: it is no longer a project
   `project_credentials` row but the worker operator's own token configured
   locally on their machine. `CredentialsSchema.implementer`
   (`src/config/schema.ts:71-80`) becomes reviewer-only at the project scope.
 - The Cloudflare tunnel ingress must additionally route the worker transport
   endpoint (today it only fronts the router webhook, `docs/cloudflare-tunnel.md`).
-- `docs/configuration.md`, `README.md`, and `ai/ARCHITECTURE.md` will need
-  updating **when this is implemented** (per RULES.md §1/§2), not while it is
-  Proposed.
+- `docs/configuration.md`, `README.md`, and `ai/ARCHITECTURE.md` are kept current
+  with each phase as it lands (per RULES.md §1/§2); they describe §1–§2 as built.
 
 ## Non-goals
 

@@ -12,7 +12,7 @@
  * own token (`../integrations/scm/github/operator-delivery.ts`), the two kinds of
  * metadata write the operator token *cannot* perform — a review under the
  * project's reviewer PAT, a board write under its PM credential — ride the
- * control-plane delivery API instead (`./delivery-client.ts`, ADR-002 §2), live
+ * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2), live
  * output streams over the transport only (no DB write), and cancellation rides
  * the shutdown signal alone (no Redis). A supported-phase gate cleanly fails any
  * phase not yet runnable this way, so a premature push fails with a clear result
@@ -533,7 +533,7 @@ export async function runAssignmentDbFree(
 		const operatorDelivery = await deps.buildDelivery(project.repo, options.operatorToken);
 		// Where a metadata write this worker cannot perform itself is delivered: the
 		// control plane, authenticated by the worker's own credential (never a
-		// project credential — those stay server-side, ADR-002 §2).
+		// project credential — those stay server-side, ADR-004 §2).
 		const transport: DeliveryClientOptions = {
 			controlPlaneUrl: options.controlPlaneUrl,
 			workerCredential: options.workerCredential,

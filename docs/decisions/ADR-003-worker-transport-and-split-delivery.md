@@ -5,12 +5,19 @@
 - **Date:** 2026-07-24
 - **Decision owners:** SWARM maintainers
 
-> **ADR numbering note.** Issue #391 references
-> `ADR-002-worker-transport-and-split-delivery.md §1`, but `ADR-002` on disk is
-> `durable-dispatch-state-machine` (issue #284). The transport design had no ADR
-> of its own — it lived only in the issue and PROJECT.md §2.2/§3 — so this record
-> takes the next free number, **ADR-003**, and documents the decision the stale
-> link pointed at.
+> **ADR numbering note (corrected 2026-07-25).** This file's original note claimed
+> the transport design "had no ADR of its own". That was already wrong when written:
+> [ADR-004](./ADR-004-worker-transport-and-split-delivery.md) — filed the same day
+> as `ADR-002-worker-transport-and-split-delivery.md`, and since renumbered out of
+> its collision with [ADR-002: durable dispatch state machine](./ADR-002-durable-dispatch-state-machine.md)
+> — **is** the decision record issue #391 points at.
+>
+> So the two files divide as follows, and the numbers are chronological rather than
+> a dependency order: **ADR-004 is the decision** (§1 transport, §2 split delivery,
+> §3 review-trigger re-basing, §4 attribution); **this record is its implementation
+> log**, documenting how §1–§2 were built phase by phase and what each phase
+> actually shipped. A citation of "ADR-003 §2" means the implementation of split
+> delivery; "ADR-004 §2" means the decision that governs it.
 
 ## Context
 
@@ -130,7 +137,7 @@ server-side store) it needs:
    shared client (`src/transport/delivery-client.ts`), authenticated by the
    worker's own credential. Two kinds of thing stay server-side, for two different
    reasons:
-   - **Credentials** (ADR-002 §2): **Implementation**'s two board writes and its
+   - **Credentials** (ADR-004 §2): **Implementation**'s two board writes and its
      `listBlockers` dependency lookup run under the project's PM credential;
      **Review**'s `submitReview` runs under its reviewer PAT.
    - **The database**: Review's three review-verdict ledger calls

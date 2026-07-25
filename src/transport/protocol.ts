@@ -372,7 +372,7 @@ export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 
 /**
- * Control-plane SCM metadata delivery frames (ADR-002 §2). The metadata-only
+ * Control-plane SCM metadata delivery frames (ADR-004 §2). The metadata-only
  * SCM delivery calls — submit a review, post a PR comment — move server-side so
  * the per-project reviewer PAT stays on the router and never reaches a worker: a
  * federated worker sends only the verdict + comment body + PR number up the
@@ -422,7 +422,7 @@ export const PostCommentDeliveryResponseSchema = z.object({
 export type PostCommentDeliveryResponse = z.infer<typeof PostCommentDeliveryResponseSchema>;
 
 /**
- * Control-plane PM metadata delivery frames (ADR-002 §2, the independent Phase
+ * Control-plane PM metadata delivery frames (ADR-004 §2, the independent Phase
  * 2/2 half of the SCM frames above). The metadata-only PM board writes — move a
  * card to a canonical pipeline status, add a comment on the item's backing
  * Issue/PR — move server-side so the **per-project PM credential** stays on the
