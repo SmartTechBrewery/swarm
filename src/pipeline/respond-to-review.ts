@@ -94,7 +94,6 @@ import {
 	type ScheduleFollowUpReview,
 	scheduleFollowUpReviewDefault,
 } from '@/pipeline/follow-up-review.js';
-import { issueNumberFromBranch } from './task-branch.js';
 import { buildRespondToReviewPrompt } from '@/pipeline/prompts/respond-to-review.js';
 import {
 	acquireResumableWorktree,
@@ -120,6 +119,7 @@ import {
 } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
+import { issueNumberFromBranch } from './task-branch.js';
 
 /** The file the respond agent is instructed to write its outcome to, at the worktree root. */
 export const RESPOND_OUTCOME_FILENAME = HANDOFF_FILENAMES.respondToReview;

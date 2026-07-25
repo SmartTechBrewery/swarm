@@ -106,10 +106,7 @@ import type { GitHubParsedEvent } from '../../router/adapters/github.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import { buildRespondToCiAttemptKey, claimRespondToCiAttempt } from '../respond-to-ci-attempts.js';
 import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
-import {
-	type SwarmManagedPrResult,
-	isSwarmManagedPullRequest,
-} from '../swarm-managed-pr.js';
+import { isSwarmManagedPullRequest, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 import { decideCheckSuiteOutcome } from './check-suite-decision.js';
 
