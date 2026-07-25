@@ -83,7 +83,10 @@ vi.mock('@/integrations/scm/github/personas.js', async (importActual) => ({
 // Defaults to granting a fresh reservation (the common path); individual
 // tests flip it to exercise `blocked`/`capped`/a persistence error.
 const { reserveReviewVerdict } = vi.hoisted(() => ({ reserveReviewVerdict: vi.fn() }));
-vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({ reserveReviewVerdict }));
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
+	reserveReviewVerdict,
+	REVIEW_VERDICT_CAP: 3,
+}));
 
 /** Build a `CheckSuiteStatus` from `[name, status, conclusion]` triples. */
 function checkStatus(runs: Array<[string, string, string | null]>): CheckSuiteStatus {
@@ -640,7 +643,7 @@ describe('review trigger', () => {
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
 		});
 
-		it('skips the dispatch once two verdicts are already submitted (capped)', async () => {
+		it('skips the dispatch once every permitted verdict is submitted (capped)', async () => {
 			reserveReviewVerdict.mockResolvedValue({ status: 'capped' });
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
 		});

@@ -4,8 +4,8 @@
  * contract so a caller can substitute where they run.
  *
  * The ledger itself is a Postgres table (`review_verdicts`,
- * `../db/repositories/reviewVerdictsRepository.ts`): it enforces the two-verdict
- * safety cap (issue #235) and answers "did this PR already receive a submitted
+ * `../db/repositories/reviewVerdictsRepository.ts`): it enforces the
+ * verdict safety cap (issue #235) and answers "did this PR already receive a submitted
  * verdict at an earlier head?", which turns the next run into a re-review (issue
  * #328). Both matter to correctness, so a Review run cannot simply skip them.
  *
@@ -43,7 +43,7 @@ export interface ReviewVerdictLedger {
 
 	/**
 	 * Mark this PR/head's reserved slot `submitted` and return its ordinal — which
-	 * decides whether this verdict is the cap-reaching second `request-changes`
+	 * decides whether this verdict is the cap-reaching final `request-changes`
 	 * (issue #235). Idempotent by natural key.
 	 */
 	markReviewVerdictSubmitted(

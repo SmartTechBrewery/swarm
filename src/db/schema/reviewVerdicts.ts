@@ -3,15 +3,16 @@ import { index, integer, pgTable, text, timestamp, uniqueIndex, uuid } from 'dri
 import { projects } from './projects.js';
 
 /**
- * The durable, restart-safe ledger backing the two-verdict SWARM Review safety
+ * The durable, restart-safe ledger backing the SWARM Review verdict safety
  * cap (issue #235). One logical delivery record per `(project, repository, PR,
  * head SHA)` — a "review slot" — reserved by the `pr-review` trigger
  * (`src/triggers/handlers/review.ts`) before the Review phase runs and marked
  * `submitted` by the phase itself (`src/pipeline/review.ts`) once
  * `ScmDeliveryProvider.submitReview` has returned/recovered a `reviewId`.
  *
- * `ordinal` numbers a PR's review slots (1 = the initial review, 2 = the one
- * permitted re-review); `reviewVerdictsRepository.ts` never creates a third.
+ * `ordinal` numbers a PR's review slots (1 = the initial review, 2–3 = the two
+ * permitted re-reviews); `reviewVerdictsRepository.ts` never creates a slot
+ * past its `REVIEW_VERDICT_CAP`.
  * `state` starts `pending` (reserved, not yet known to have submitted),
  * flips to `submitted` once delivery confirms it, or `abandoned` when the
  * phase knows for certain the review was never submitted (freeing that
@@ -33,7 +34,7 @@ export const reviewVerdicts = pgTable(
 		repository: text('repository').notNull(),
 		prNumber: text('pr_number').notNull(),
 		headSha: text('head_sha').notNull(),
-		/** This PR's review-slot number — 1 (initial) or 2 (the one permitted re-review). */
+		/** This PR's review-slot number — 1 (initial) or 2–3 (the two permitted re-reviews). */
 		ordinal: integer('ordinal').notNull(),
 		/** `pending` (reserved) | `submitted` (delivered) | `abandoned` (known never submitted). */
 		state: text('state').notNull().default('pending'),

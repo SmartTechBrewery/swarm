@@ -705,11 +705,16 @@ export function FailureDiagnosisCallout({ diagnosis }: { diagnosis: FailureDiagn
 }
 
 /**
- * Run-detail warning for a completed Review run whose verdict was the second
- * `request-changes` the two-review safety cap allows (issue #242): SWARM
+ * Run-detail warning for a completed Review run whose verdict was the last
+ * `request-changes` the review-verdict safety cap allows (issue #242): SWARM
  * stopped the automatic Respond-to-review/re-review cycle, so this explains
  * why to the operator and links to the PR that now needs a human decision.
  * A no-op for every other run (wrong status/phase, or no cap outcome).
+ *
+ * The copy deliberately doesn't name the cap's numeric value — that lives once,
+ * in `REVIEW_VERDICT_CAP` (`src/db/repositories/reviewVerdictsRepository.ts`),
+ * a DB-bound module the dashboard bundle can't import — so bumping the cap
+ * never leaves a stale number here.
  */
 export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 	if (
@@ -727,8 +732,8 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 			<div>
 				<h3 className="text-xs font-semibold text-red-200">Manual action required</h3>
 				<p className="text-xs text-red-400/80 mt-1">
-					This was the second changes-requested verdict SWARM's two-review safety cap allows
-					{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of 2)` : ''}. SWARM will not
+					This was the last changes-requested verdict SWARM's review safety cap allows
+					{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}. SWARM will not
 					automatically enqueue another Respond-to-review or re-review — this PR needs a human
 					decision.
 				</p>

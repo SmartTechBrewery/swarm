@@ -62,9 +62,9 @@ export const runs = pgTable(
 		 */
 		reviewVerdict: text('review_verdict'),
 		/**
-		 * This Review run's slot number in the two-verdict safety-cap ledger
-		 * (`review_verdicts`, issue #235) — 1 (initial review) or 2 (the one
-		 * permitted re-review). Nullable: only a completed Review run whose
+		 * This Review run's slot number in the review-verdict safety-cap ledger
+		 * (`review_verdicts`, issue #235) — 1 (initial review) or 2–3 (the two
+		 * permitted re-reviews). Nullable: only a completed Review run whose
 		 * verdict was recorded in the ledger sets it; every other phase, and any
 		 * pre-existing row, leaves it null. Cleared on a retry alongside
 		 * `reviewVerdict` ({@link resetRunToRunning}).
@@ -72,9 +72,9 @@ export const runs = pgTable(
 		reviewOrdinal: integer('review_ordinal'),
 		/**
 		 * The review-automation outcome for a completed Review run — currently only
-		 * `manual-intervention-required`, set when this run submitted the second
+		 * `manual-intervention-required`, set when this run submitted the last
 		 * `request-changes` verdict the cap allows, so Respond-to-review stops the
-		 * automatic cycle instead of dispatching a third review. Nullable: every
+		 * automatic cycle instead of dispatching a further review. Nullable: every
 		 * other outcome (approvals, the first verdict, non-Review phases) leaves it
 		 * null. Cleared on a retry alongside `reviewVerdict`.
 		 */

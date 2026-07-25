@@ -1,20 +1,21 @@
 /**
- * The two-verdict SWARM Review safety-cap ledger (issue #235) — an atomic,
+ * The SWARM Review verdict safety-cap ledger (issue #235) — an atomic,
  * restart-safe record of how many formal reviews a PR has received, so a
- * PR/head retry never "charges" a second slot and no more than two verdicts
- * are ever submitted for one PR.
+ * PR/head retry never "charges" a second slot and no more than
+ * {@link REVIEW_VERDICT_CAP} verdicts are ever submitted for one PR.
  *
  * {@link reserveReviewVerdict} is the only writer that creates a slot, and it
  * serializes every reservation decision for a PR behind a Postgres
  * transaction-scoped advisory lock keyed on `(projectId, repository,
  * prNumber)` (`pg_advisory_xact_lock`, released automatically at commit/
  * rollback) — so two workers racing to review the same PR can never both
- * allocate the third slot. Within that lock: a retry of an already-reserved
+ * allocate the last slot. Within that lock: a retry of an already-reserved
  * head reuses its existing record (`reused`); a different head is blocked
  * while another reservation for this PR is still `pending` (`blocked`, since
- * exactly one review is ever in flight per PR); once two `submitted` records
- * exist, a third reservation is rejected (`capped`); otherwise a fresh
- * `pending` record is created at the next ordinal (`reserved`).
+ * exactly one review is ever in flight per PR); once {@link REVIEW_VERDICT_CAP}
+ * `submitted` records exist, a further reservation is rejected (`capped`);
+ * otherwise a fresh `pending` record is created at the next ordinal
+ * (`reserved`).
  *
  * `pending` state is not itself a submitted verdict — the cap counts only
  * `submitted` records (or an in-flight `pending` one, via the `blocked`
@@ -27,8 +28,13 @@ import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
 import { getDb } from '../client.js';
 import { reviewVerdicts } from '../schema/reviewVerdicts.js';
 
-/** No PR may receive more than this many submitted SWARM Review verdicts. */
-export const REVIEW_VERDICT_CAP = 2;
+/**
+ * No PR may receive more than this many submitted SWARM Review verdicts — an
+ * initial review plus at most two re-reviews. The one place the cap is
+ * defined: every reservation decision, "is this the last permitted verdict?"
+ * check, and doc reference derives from it.
+ */
+export const REVIEW_VERDICT_CAP = 3;
 
 export type ReviewVerdictState = 'pending' | 'submitted' | 'abandoned';
 
@@ -49,7 +55,7 @@ export type ReviewVerdictReservation =
 /**
  * Reserve (or reuse) this PR/head's review slot, serialized behind a
  * transaction-scoped Postgres advisory lock so concurrent reservations for
- * the same PR can't race past the two-verdict cap. See the module header for
+ * the same PR can't race past {@link REVIEW_VERDICT_CAP}. See the module header for
  * the full decision order.
  */
 export async function reserveReviewVerdict(
@@ -183,7 +189,7 @@ const reviewVerdictRecordColumns = {
 /**
  * Resolve a submitted verdict's slot by its GitHub review id — the
  * Respond-to-review trigger's primary lookup (`src/triggers/handlers/respond-to-review.ts`)
- * for deciding whether this event is the cap-reaching second `request-changes`
+ * for deciding whether this event is the cap-reaching last `request-changes`
  * verdict.
  */
 export async function getReviewVerdictByReviewId(
@@ -267,7 +273,7 @@ export async function getPriorSubmittedReview(
 }
 
 /**
- * Whether `ordinal`/`verdict` together are the cap-reaching second
+ * Whether `ordinal`/`verdict` together are the cap-reaching final
  * `request-changes` verdict — the one condition both the Review phase
  * (recording its own run's automation outcome, `src/pipeline/review.ts`) and
  * the Respond-to-review trigger (deciding whether to stop the automatic

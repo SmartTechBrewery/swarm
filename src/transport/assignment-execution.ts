@@ -235,7 +235,7 @@ export function deferrableOrFailedResult(
  * - `review` — the diff read and the agent run stay worker-side under the
  *   operator token; `submitReview` goes through the control-plane SCM delivery
  *   API under the project's **reviewer PAT**, which a federated worker must
- *   never hold, and its three review-verdict ledger calls (the two-verdict cap
+ *   never hold, and its three review-verdict ledger calls (the verdict cap
  *   and the re-review signal) go through the control-plane ledger routes, which
  *   own the `review_verdicts` table this worker has no database for.
  *
@@ -294,7 +294,7 @@ function resolveDbFreePm(
  * The review-verdict ledger a DB-free phase runs against, or `undefined` for a
  * phase that keeps none (only Review consults the ledger). Routed to the control
  * plane, which holds the database: skipping the ledger instead would silently
- * disable the two-verdict cap (issue #235) and prompt every re-review as a first
+ * disable the review-verdict cap (issue #235) and prompt every re-review as a first
  * review (issue #328).
  */
 function resolveDbFreeReviewLedger(

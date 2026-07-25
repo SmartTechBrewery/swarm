@@ -365,7 +365,7 @@ describe('runAssignmentDbFree', () => {
 			`${CONTROL_PLANE}/worker/delivery/review-ledger/prior`,
 			`${CONTROL_PLANE}/worker/delivery/review-ledger/mark`,
 		]);
-		// The two-verdict cap and re-review signal keep working because the ledger is
+		// The review-verdict cap and re-review signal keep working because the ledger is
 		// consulted, not skipped — only its storage moved server-side.
 		expect(JSON.parse(fetchImpl.mock.calls[1][1].body)).toMatchObject({
 			projectId: PROJECT_ID,

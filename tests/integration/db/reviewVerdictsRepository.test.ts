@@ -7,6 +7,7 @@ import {
 	getReviewVerdictByHead,
 	getReviewVerdictByReviewId,
 	markReviewVerdictSubmitted,
+	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../../src/db/repositories/reviewVerdictsRepository.js';
 import { reviewVerdicts } from '../../../src/db/schema/reviewVerdicts.js';
@@ -59,16 +60,25 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(second).toMatchObject({ status: 'reserved', ordinal: 2 });
 			});
 
-			it('rejects a third reservation once two verdicts are submitted (the safety cap)', async () => {
+			it('still allocates the last slot at the cap (an initial review plus two re-reviews)', async () => {
 				await reserveReviewVerdict(key('sha-1'));
 				await markReviewVerdictSubmitted(key('sha-1'), { verdict: 'request-changes' });
 				await reserveReviewVerdict(key('sha-2'));
 				await markReviewVerdictSubmitted(key('sha-2'), { verdict: 'request-changes' });
 				const third = await reserveReviewVerdict(key('sha-3'));
-				expect(third).toEqual({ status: 'capped' });
+				expect(third).toMatchObject({ status: 'reserved', ordinal: REVIEW_VERDICT_CAP });
 			});
 
-			it('never allocates more than two submitted slots across concurrent distinct-head reservations', async () => {
+			it('rejects the reservation past the cap once every permitted verdict is submitted', async () => {
+				for (let i = 1; i <= REVIEW_VERDICT_CAP; i++) {
+					await reserveReviewVerdict(key(`sha-${i}`));
+					await markReviewVerdictSubmitted(key(`sha-${i}`), { verdict: 'request-changes' });
+				}
+				const past = await reserveReviewVerdict(key(`sha-${REVIEW_VERDICT_CAP + 1}`));
+				expect(past).toEqual({ status: 'capped' });
+			});
+
+			it('lets only one distinct head hold the single pending slot at a time', async () => {
 				const reservations = await Promise.all(
 					['sha-a', 'sha-b', 'sha-c', 'sha-d'].map((sha) => reserveReviewVerdict(key(sha))),
 				);

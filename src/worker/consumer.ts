@@ -1176,7 +1176,7 @@ export interface PhaseRunResult {
 	planningScope?: ProposedScope;
 	/** The submitted verdict of a Review run — persisted onto its history row (issue #218). */
 	verdict?: ReviewVerdict;
-	/** This Review run's two-verdict safety-cap slot (1 or 2) — persisted onto its history row (issue #235). */
+	/** This Review run's review-verdict safety-cap slot (1…`REVIEW_VERDICT_CAP`) — persisted onto its history row (issue #235). */
 	reviewOrdinal?: number;
 	/** This Review run's automation outcome (e.g. `manual-intervention-required`) — persisted onto its history row (issue #235). */
 	automationOutcome?: ReviewAutomationOutcome;

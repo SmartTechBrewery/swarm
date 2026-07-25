@@ -84,7 +84,10 @@
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
-import { reserveReviewVerdict } from '../../db/repositories/reviewVerdictsRepository.js';
+import {
+	REVIEW_VERDICT_CAP,
+	reserveReviewVerdict,
+} from '../../db/repositories/reviewVerdictsRepository.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import {
 	type CheckSuiteStatus,
@@ -458,13 +461,13 @@ async function dispatchRespondToCi(
 
 /**
  * Reserve (or reuse) this PR/head's durable review-verdict slot — the
- * two-verdict safety cap (issue #235) — after the Redis dispatch dedup claim
+ * review-verdict safety cap (issue #235) — after the Redis dispatch dedup claim
  * and before returning a `review` dispatch. Only the `review` disposition
  * reserves a slot: Respond-to-CI shares the same PR+SHA dedup key but never
  * consumes a review verdict.
  *
  * Fails closed: a `blocked` (another head's reservation is still pending) or
- * `capped` (two verdicts already submitted) result skips the dispatch, as
+ * `capped` (every permitted verdict already submitted) result skips the dispatch, as
  * does a persistence error — a re-review the ledger can't currently account
  * for must not run ahead of it. A `reserved`/`reused` result (the common
  * case, including a same-head retry) proceeds.
@@ -498,9 +501,10 @@ async function reserveDurableReviewSlot(
 			return false;
 		}
 		if (reservation.status === 'capped') {
-			logger.warn('review: PR already has two submitted verdicts — skipping (safety cap)', {
+			logger.warn('review: PR already used every permitted verdict — skipping (safety cap)', {
 				prNumber,
 				headSha,
+				cap: REVIEW_VERDICT_CAP,
 			});
 			return false;
 		}

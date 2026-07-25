@@ -515,7 +515,7 @@ export type ListBlockersDeliveryResponse = z.infer<typeof ListBlockersDeliveryRe
  * delivery frames above, these front no credential — they front the
  * `review_verdicts` **table** (`../db/repositories/reviewVerdictsRepository.ts`),
  * which a DB-free worker cannot reach at all. The Review phase must still consult
- * it: it carries the two-verdict safety cap (issue #235) and the
+ * it: it carries the review-verdict safety cap (issue #235) and the
  * prior-submitted-verdict answer that makes a run a re-review (issue #328).
  *
  * The worker sends only the PR coordinates (and, when marking, the verdict it
