@@ -192,7 +192,16 @@ export function createWriteOnlyTransportPmProvider(
 				{ projectId: options.projectId, urlSuffix },
 				// `null` (no card wraps that URL) maps back to the `undefined` the
 				// interface returns, so the phase reads one shape on both paths.
-				(value) => FindWorkItemDeliveryResponseSchema.parse(value).item ?? undefined,
+				(value) => {
+					const item = FindWorkItemDeliveryResponseSchema.parse(value).item;
+					if (!item) return undefined;
+					return {
+						...item,
+						description: '',
+						labels: [],
+						assignees: [],
+					};
+				},
 			),
 		...transportPmWrites(options),
 	};

@@ -737,10 +737,13 @@ describe('handleFindWorkItem', () => {
 		};
 	}
 
-	it('resolves the card under the server-side PM credential', async () => {
+	it('resolves the card under the server-side PM credential and projects onto the narrow wire frame', async () => {
 		const item = createMockWorkItem({
 			id: 'ITEM_21',
 			url: 'https://github.com/jkwiecien/swarm/issues/21',
+			description: 'Sensitive body text that should not cross wire',
+			labels: [{ id: 'l1', name: 'bug' }],
+			assignees: [{ handle: 'octocat' }],
 		});
 		const findWorkItemByUrlSuffix = vi.fn().mockResolvedValue(item);
 		const deps = makeDeps({
@@ -750,7 +753,15 @@ describe('handleFindWorkItem', () => {
 		const result = await handleFindWorkItem(deps, CREDENTIAL, findBody());
 
 		expect(result.status).toBe(200);
-		expect(result.json).toEqual({ item });
+		expect(result.json).toEqual({
+			item: {
+				id: 'ITEM_21',
+				title: item.title,
+				url: 'https://github.com/jkwiecien/swarm/issues/21',
+				status: item.status,
+				statusId: item.statusId,
+			},
+		});
 		expect(findWorkItemByUrlSuffix).toHaveBeenCalledWith('/issues/21');
 	});
 

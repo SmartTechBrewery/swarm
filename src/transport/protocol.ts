@@ -532,21 +532,28 @@ export const FindWorkItemDeliveryRequestSchema = z.object({
 export type FindWorkItemDeliveryRequest = z.infer<typeof FindWorkItemDeliveryRequestSchema>;
 
 /**
+ * Dedicated schema for the card resolved by `POST /worker/delivery/pm/find-item`.
+ * Narrow wire frame containing only what `findWorkItemByUrlSuffix` needs to identify
+ * and move the card (`id`, `title`, `url`, `status?`, `statusId?`) — omitting labels,
+ * assignees, and description so assignees never cross the wire from a provider where
+ * `supportsAssignees: false` (ai/RULES.md §2).
+ */
+export const FoundWorkItemSchema = z.object({
+	id: z.string().min(1),
+	title: z.string(),
+	url: z.string(),
+	status: z.string().optional(),
+	statusId: z.string().optional(),
+});
+export type FoundWorkItem = z.infer<typeof FoundWorkItemSchema>;
+
+/**
  * `POST /worker/delivery/pm/find-item` success body — the matching card, or
  * `item: null` when the board has none (`null` rather than an absent key so "not
- * on the board" is an explicit answer, never a dropped field). Reuses
- * {@link AssignedWorkItemSchema}, the same `WorkItem` serialization subset a
- * pushed assignment carries, so one shape describes a work item on the wire; the
- * two optional timestamps `WorkItem` may also carry are not part of it and no
- * caller of this route reads them.
- *
- * As permissive as `WorkItem` itself, deliberately: the caller
- * (`../pipeline/respond-to-review.ts`) treats a throw as "no board report", so a
- * stricter field here would silently turn a resolvable card into a skipped
- * status report.
+ * on the board" is an explicit answer, never a dropped field).
  */
 export const FindWorkItemDeliveryResponseSchema = z.object({
-	item: AssignedWorkItemSchema.nullable(),
+	item: FoundWorkItemSchema.nullable(),
 });
 export type FindWorkItemDeliveryResponse = z.infer<typeof FindWorkItemDeliveryResponseSchema>;
 

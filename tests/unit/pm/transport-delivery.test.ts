@@ -278,17 +278,19 @@ describe('createWriteOnlyTransportPmProvider', () => {
 	});
 
 	it("serves respond-to-review's card lookup as one narrow read over the transport", async () => {
-		const item = {
+		const wireItem = {
 			id: 'ITEM_21',
 			title: 'Example',
-			description: 'body',
 			url: 'https://github.com/jkwiecien/swarm/issues/21',
+		};
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: wireItem }));
+
+		await expect(writeOnly(fetchImpl).findWorkItemByUrlSuffix('/issues/21')).resolves.toEqual({
+			...wireItem,
+			description: '',
 			labels: [],
 			assignees: [],
-		};
-		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item }));
-
-		await expect(writeOnly(fetchImpl).findWorkItemByUrlSuffix('/issues/21')).resolves.toEqual(item);
+		});
 		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/find-item');
 		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
 			projectId: PROJECT_ID,

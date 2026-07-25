@@ -380,7 +380,16 @@ export async function handleFindWorkItem(
 
 	const pm = deps.buildPmProvider(authed.project);
 	const item = await pm.findWorkItemByUrlSuffix(request.urlSuffix);
-	return { status: 200, json: { item: item ?? null } };
+	const projected = item
+		? {
+				id: item.id,
+				title: item.title,
+				url: item.url,
+				...(item.status !== undefined && { status: item.status }),
+				...(item.statusId !== undefined && { statusId: item.statusId }),
+			}
+		: null;
+	return { status: 200, json: { item: projected } };
 }
 
 /**

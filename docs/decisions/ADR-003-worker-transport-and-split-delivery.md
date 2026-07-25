@@ -152,7 +152,8 @@ server-side store) it needs:
    path lacks (`classifyDeferrable` models no dependency failure), so a blocked
    Implementation run settles terminally with the "must be done first" message
    instead of re-checking — safe, but tracked as its own follow-up.
-7. **#418** — **`respond-to-review`** joins them, on the same two seams:
+7. **#418** — **`respond-to-review`** joins them, on the same two seams (expanding
+   the delivery API surface to ten routes; see ADR-004 §2):
    - **A PM read.** The phase resolves its board card before the best-effort
      In progress / In review report. Rather than proxy `listWorkItems` — a whole
      board across the wire to answer a one-card question, and an enumeration a
