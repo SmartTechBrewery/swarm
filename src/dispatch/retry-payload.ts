@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentCli } from '../harness/agent-cli.js';
 import type { ReasoningLevel } from '../harness/models.js';
-import type { SwarmJob } from '../queue/jobs.js';
+import { normalizeStoredJobPayload, type SwarmJob } from '../queue/jobs.js';
 import type { TriggerPhase } from '../triggers/types.js';
 
 /** The slice of a `phase-deferred` outcome the payload derivation needs. */
@@ -121,6 +121,10 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
  * counter to 0 (a manual retry bypasses the automatic cap), applying any
  * cli/model overrides. Shared by "Retry now"'s reopen-existing-dispatch path,
  * its reconstruct-from-run-row fallback, and "Reset & restart".
+ *
+ * The stored payload is normalized first: two of those three callers pass a raw
+ * `run.jobPayload` straight out of `jsonb`, so a pre-#385 row would otherwise be
+ * re-persisted in its legacy envelope on every manual retry and never heal.
  */
 export function reconstructRetryJob(
 	jobPayload: SwarmJob,
@@ -133,7 +137,7 @@ export function reconstructRetryJob(
 	recoveryMode?: 'resume' | 'fresh',
 	expectedSessionId?: string | null,
 ): SwarmJob {
-	const job = { ...jobPayload };
+	const job = { ...normalizeStoredJobPayload(jobPayload) };
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	if (job.type === 'github-projects' && (phase === 'planning' || phase === 'implementation')) {

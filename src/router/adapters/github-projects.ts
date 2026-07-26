@@ -1,12 +1,12 @@
 /**
  * GitHubProjectsRouterAdapter — the router-side handling of the
- * `projects_v2_item` webhook, the PM-board analogue of the SCM adapter
- * (`src/router/adapters/github.ts`). This is SWARM's `pm:status-changed` trigger
- * ingress (ai/ARCHITECTURE.md "PM: GitHub Projects").
+ * `projects_v2_item` webhook, the PM-board analogue of the SCM webhook parser
+ * (`src/integrations/scm/github/webhook.ts`). This is SWARM's `pm:status-changed`
+ * trigger ingress (ai/ARCHITECTURE.md "PM: GitHub Projects").
  *
  * Its job: parse the raw webhook into a normalized event, resolve which SWARM
  * project owns the *board* (by `project_node_id` — a Projects event carries no
- * repo, unlike the SCM adapter which resolves by `owner/repo`), filter to the
+ * repo, unlike SCM ingress which resolves by `owner/repo`), filter to the
  * transitions the pipeline reacts to (a Status-field edit, or a card added to
  * the board), and drop transitions a SWARM persona itself produced (loop
  * prevention). The authoritative "which Status option is it now?" re-read and
