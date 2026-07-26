@@ -2,7 +2,7 @@ import type { QueueOptions } from 'bullmq';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	createMockGitHubProjectsWebhookJob,
-	createMockGitHubWebhookJob,
+	createMockScmWebhookJob,
 } from '../../helpers/factories.js';
 
 // Mock BullMQ's Queue so nothing touches Redis — capture constructor args and
@@ -82,7 +82,7 @@ beforeEach(() => {
 describe('enqueueJob', () => {
 	it('creates the queue on QUEUE_NAME with the parsed Redis connection', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		await enqueueJob(createMockGitHubWebhookJob());
+		await enqueueJob(createMockScmWebhookJob());
 
 		expect(QueueMock).toHaveBeenCalledOnce();
 		const [name, opts] = QueueMock.mock.calls[0];
@@ -92,7 +92,7 @@ describe('enqueueJob', () => {
 
 	it('configures the load-bearing default job options', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		await enqueueJob(createMockGitHubWebhookJob());
+		await enqueueJob(createMockScmWebhookJob());
 
 		const [, opts] = QueueMock.mock.calls[0];
 		// The retry-safety + Redis-hygiene story hinges on these exact values —
@@ -107,13 +107,13 @@ describe('enqueueJob', () => {
 		});
 	});
 
-	it('adds a github job named by its type, using deliveryId as the job id', async () => {
+	it('adds an scm job named by its type, using deliveryId as the job id', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		const job = createMockGitHubWebhookJob();
+		const job = createMockScmWebhookJob();
 
 		const id = await enqueueJob(job);
 
-		expect(add).toHaveBeenCalledWith('github', job, { jobId: job.deliveryId });
+		expect(add).toHaveBeenCalledWith('scm', job, { jobId: job.deliveryId });
 		expect(id).toBe('bull-assigned-id');
 	});
 
@@ -124,16 +124,16 @@ describe('enqueueJob', () => {
 		await enqueueJob(job);
 
 		// PM-board jobs (planning/implementation) must not queue ahead of a
-		// review-lifecycle (`github`) job — see priorityFor's rationale.
+		// review-lifecycle (`scm`) job — see priorityFor's rationale.
 		expect(add).toHaveBeenCalledWith('github-projects', job, {
 			jobId: job.deliveryId,
 			priority: 10,
 		});
 	});
 
-	it('leaves a github job at the default (unset) priority', async () => {
+	it('leaves an scm job at the default (unset) priority', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		const job = createMockGitHubWebhookJob();
+		const job = createMockScmWebhookJob();
 
 		await enqueueJob(job);
 
@@ -141,12 +141,12 @@ describe('enqueueJob', () => {
 		expect(opts).not.toHaveProperty('priority');
 	});
 
-	it('demotes an issue invalidation job because it dispatches Planning', async () => {
+	it('demotes a work-item invalidation job because it dispatches Planning', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		const job = createMockGitHubWebhookJob({
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'issues',
+				...createMockScmWebhookJob().event,
+				kind: 'work-item',
 				action: 'edited',
 				workItemBodyChanged: true,
 			},
@@ -154,7 +154,7 @@ describe('enqueueJob', () => {
 
 		await enqueueJob(job);
 
-		expect(add).toHaveBeenCalledWith('github', job, {
+		expect(add).toHaveBeenCalledWith('scm', job, {
 			jobId: job.deliveryId,
 			priority: 10,
 		});
@@ -162,16 +162,16 @@ describe('enqueueJob', () => {
 
 	it('omits the job id when the event carries no deliveryId', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		const { deliveryId: _dropped, ...job } = createMockGitHubWebhookJob();
+		const { deliveryId: _dropped, ...job } = createMockScmWebhookJob();
 
 		await enqueueJob(job);
 
-		expect(add).toHaveBeenCalledWith('github', job, undefined);
+		expect(add).toHaveBeenCalledWith('scm', job, undefined);
 	});
 
 	it('reuses the one queue singleton across enqueues', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		await enqueueJob(createMockGitHubWebhookJob());
+		await enqueueJob(createMockScmWebhookJob());
 		await enqueueJob(createMockGitHubProjectsWebhookJob());
 
 		expect(QueueMock).toHaveBeenCalledOnce();
@@ -182,7 +182,7 @@ describe('enqueueJob', () => {
 		process.env.REDIS_URL = '';
 		const { enqueueJob } = await import('@/queue/producer.js');
 
-		await expect(enqueueJob(createMockGitHubWebhookJob())).rejects.toThrow(/REDIS_URL/);
+		await expect(enqueueJob(createMockScmWebhookJob())).rejects.toThrow(/REDIS_URL/);
 		expect(QueueMock).not.toHaveBeenCalled();
 	});
 });
@@ -190,11 +190,11 @@ describe('enqueueJob', () => {
 describe('enqueueDispatchWakeUp', () => {
 	it('adds the wake-up under its deterministic job id with the given delay', async () => {
 		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
-		const job = createMockGitHubWebhookJob();
+		const job = createMockScmWebhookJob();
 
 		await enqueueDispatchWakeUp(job, 'dispatch_abc_w2', 60_000);
 
-		expect(add).toHaveBeenCalledWith('github', job, {
+		expect(add).toHaveBeenCalledWith('scm', job, {
 			jobId: 'dispatch_abc_w2',
 			delay: 60_000,
 		});
@@ -202,7 +202,7 @@ describe('enqueueDispatchWakeUp', () => {
 
 	it('omits the delay for an immediately-due wake-up', async () => {
 		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
-		const job = createMockGitHubWebhookJob();
+		const job = createMockScmWebhookJob();
 
 		await enqueueDispatchWakeUp(job, 'dispatch_abc_w0', 0);
 
@@ -271,7 +271,7 @@ describe('clearPendingJobs', () => {
 describe('closeQueue', () => {
 	it('closes the queue once it has been created', async () => {
 		const { enqueueJob, closeQueue } = await import('@/queue/producer.js');
-		await enqueueJob(createMockGitHubWebhookJob());
+		await enqueueJob(createMockScmWebhookJob());
 
 		await closeQueue();
 
@@ -287,9 +287,9 @@ describe('closeQueue', () => {
 
 	it('recreates the queue on the next enqueue after a close', async () => {
 		const { enqueueJob, closeQueue } = await import('@/queue/producer.js');
-		await enqueueJob(createMockGitHubWebhookJob());
+		await enqueueJob(createMockScmWebhookJob());
 		await closeQueue();
-		await enqueueJob(createMockGitHubWebhookJob());
+		await enqueueJob(createMockScmWebhookJob());
 
 		expect(QueueMock).toHaveBeenCalledTimes(2);
 	});

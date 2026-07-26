@@ -1,15 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '@/triggers/types.js';
-import { createMockGitHubParsedEvent, createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockScmTriggerContext } from '../../helpers/factories.js';
 
 function makeContext(): TriggerContext {
-	return {
-		project: createMockProjectConfig(),
-		deliveryId: 'delivery-uuid-1',
-		source: 'github',
-		event: createMockGitHubParsedEvent(),
-	};
+	return createMockScmTriggerContext({ deliveryId: 'delivery-uuid-1' });
 }
 
 function makeResult(taskId = '17'): TriggerResult {

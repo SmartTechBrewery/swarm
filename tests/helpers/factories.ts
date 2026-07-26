@@ -19,15 +19,17 @@ import type { WorkItem } from '@/pm/types.js';
 import {
 	type GitHubProjectsWebhookJob,
 	GitHubProjectsWebhookJobSchema,
-	type GitHubWebhookJob,
-	GitHubWebhookJobSchema,
+	type ScmWebhookJob,
+	ScmWebhookJobSchema,
 } from '@/queue/jobs.js';
-import { type GitHubParsedEvent, GitHubParsedEventSchema } from '@/router/adapters/github.js';
 import {
 	type GitHubProjectsParsedEvent,
 	GitHubProjectsParsedEventSchema,
 } from '@/router/adapters/github-projects.js';
+import { type ScmEvent, ScmEventSchema } from '@/scm/events.js';
+import type { SCMProvider } from '@/scm/types.js';
 import type { BuildTaskAssignmentInput } from '@/transport/assignment.js';
+import type { TriggerContext } from '@/triggers/types.js';
 
 /**
  * `runAgentCli` options with the two required fields defaulted. `RunAgentCliOptions`
@@ -133,11 +135,9 @@ export function createMockProjectsV2ItemPayload(
 	return payload;
 }
 
-export function createMockGitHubParsedEvent(
-	overrides: Partial<GitHubParsedEvent> = {},
-): GitHubParsedEvent {
-	return GitHubParsedEventSchema.parse({
-		eventType: 'pull_request',
+export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent {
+	return ScmEventSchema.parse({
+		kind: 'pull-request',
 		action: 'opened',
 		repoFullName: 'jkwiecien/swarm',
 		workItemId: '17',
@@ -164,14 +164,13 @@ export function createMockGitHubProjectsParsedEvent(
 	});
 }
 
-export function createMockGitHubWebhookJob(
-	overrides: Partial<GitHubWebhookJob> = {},
-): GitHubWebhookJob {
-	return GitHubWebhookJobSchema.parse({
-		type: 'github',
+export function createMockScmWebhookJob(overrides: Partial<ScmWebhookJob> = {}): ScmWebhookJob {
+	return ScmWebhookJobSchema.parse({
+		type: 'scm',
+		providerId: 'github',
 		projectId: 'swarm',
 		deliveryId: 'delivery-uuid-1',
-		event: createMockGitHubParsedEvent(),
+		event: createMockScmEvent(),
 		...overrides,
 	});
 }
@@ -223,6 +222,63 @@ export function createMockTaskAssignmentInput(
 		systemPrompt: 'You are the SWARM planning agent. Do the thing.',
 		target: { cli: 'claude' },
 		workItem: createMockWorkItem(),
+		...overrides,
+	};
+}
+
+/**
+ * A typed fake {@link SCMProvider} for the trigger handlers, which reach every
+ * source-control operation through `ctx.scm` (`src/triggers/types.ts`). Each
+ * method throws by default, so a handler that calls an operation the test didn't
+ * stub fails loudly instead of silently seeing `undefined`; override exactly the
+ * ones under test.
+ *
+ * Prefer this over `vi.mock`ing the GitHub integration: it is the contract, so a
+ * handler that reaches around it (importing a concrete provider) no longer
+ * type-checks.
+ */
+export function createFakeScmProvider(overrides: Partial<SCMProvider> = {}): SCMProvider {
+	const unstubbed = (name: string) => () => {
+		throw new Error(`createFakeScmProvider: unstubbed SCMProvider.${name}() call`);
+	};
+	return {
+		type: 'github',
+		category: 'scm',
+		hasIntegration: unstubbed('hasIntegration'),
+		hasPersonaToken: unstubbed('hasPersonaToken'),
+		withPersonaCredentials: unstubbed('withPersonaCredentials'),
+		resolvePersonaIdentities: unstubbed('resolvePersonaIdentities'),
+		personaForActor: unstubbed('personaForActor'),
+		isSwarmActor: unstubbed('isSwarmActor'),
+		verifyWebhookSignature: unstubbed('verifyWebhookSignature'),
+		readWebhookRequest: unstubbed('readWebhookRequest'),
+		parseWebhookEvent: unstubbed('parseWebhookEvent'),
+		isSwarmGeneratedEvent: unstubbed('isSwarmGeneratedEvent'),
+		getPullRequest: unstubbed('getPullRequest'),
+		getPullRequestTitle: unstubbed('getPullRequestTitle'),
+		getAggregateCheckStatus: unstubbed('getAggregateCheckStatus'),
+		listConflictCandidates: unstubbed('listConflictCandidates'),
+		commentOnPullRequest: unstubbed('commentOnPullRequest'),
+		mergePullRequest: unstubbed('mergePullRequest'),
+		deliveryProvider: unstubbed('deliveryProvider'),
+		...overrides,
+	};
+}
+
+/**
+ * An SCM {@link TriggerContext} — the shape `buildTriggerContext`
+ * (`src/worker/consumer.ts`) hands a handler, with a fake provider attached.
+ * Pass `scm` to stub the operations the handler under test performs.
+ */
+export function createMockScmTriggerContext(
+	overrides: Partial<Extract<TriggerContext, { source: 'scm' }>> = {},
+): Extract<TriggerContext, { source: 'scm' }> {
+	return {
+		project: createMockProjectConfig(),
+		source: 'scm',
+		providerId: 'github',
+		event: createMockScmEvent(),
+		scm: createFakeScmProvider(),
 		...overrides,
 	};
 }

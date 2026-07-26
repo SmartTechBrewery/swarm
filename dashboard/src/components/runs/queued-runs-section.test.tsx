@@ -44,7 +44,8 @@ import { RunStatusBadge } from './run-status-badge.js';
 const githubItem: QueuedRun = {
 	jobId: 'job-1',
 	projectId: 'proj-a',
-	type: 'github',
+	type: 'scm',
+	providerId: 'github',
 	state: 'waiting',
 	phaseHint: 'review',
 	repo: 'acme/widgets',
@@ -271,23 +272,23 @@ describe('QueuedRunsSection', () => {
 
 	describe('review-gate grouping (issue #275)', () => {
 		// A fixed Respond-to-review push enqueues both SWARM's synthetic
-		// `check_suite` follow-up and GitHub's real `pull_request:synchronize`
+		// `checks` follow-up and the provider's real pull-request-update
 		// webhook for the same PR/SHA — the exact duplicate the grouping folds
 		// into one row instead of two apparent "Review" rows.
 		const followUpItem: QueuedRun = {
 			...githubItem,
 			jobId: 'job-followup',
-			reviewGate: { sourceEvent: 'check_suite', sourceAction: 'completed', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'checks', sourceAction: 'completed', headSha: 'sha-fix' },
 		};
-		const synchronizeItem: QueuedRun = {
+		const prUpdatedItem: QueuedRun = {
 			...githubItem,
-			jobId: 'job-synchronize',
+			jobId: 'job-pr-updated',
 			enqueuedAt: '2026-07-17T10:00:05.000Z',
-			reviewGate: { sourceEvent: 'pull_request', sourceAction: 'synchronize', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'pull-request', sourceAction: 'updated', headSha: 'sha-fix' },
 		};
 
 		it('renders duplicate review-gate jobs for the same PR/SHA as one card with gate wording and diagnostics', () => {
-			renderSection(<QueuedRunsSection items={[followUpItem, synchronizeItem]} />);
+			renderSection(<QueuedRunsSection items={[followUpItem, prUpdatedItem]} />);
 			const section = screen.getByTestId('queued-runs-section');
 
 			expect(cards()).toHaveLength(1);
@@ -295,15 +296,15 @@ describe('QueuedRunsSection', () => {
 			expect(within(section).queryByText('Review')).toBeNull();
 			expect(within(card).getByText('Awaiting review decision/checks')).not.toBeNull();
 			expect(within(card).getByText('2 source events')).not.toBeNull();
-			expect(within(card).getByText('Check suite · completed')).not.toBeNull();
-			expect(within(card).getByText('Pull request · synchronize')).not.toBeNull();
+			expect(within(card).getByText('Checks · completed')).not.toBeNull();
+			expect(within(card).getByText('Pull request · updated')).not.toBeNull();
 		});
 
 		it('does not group review-gate jobs for a different PR or head SHA', () => {
 			const otherSha: QueuedRun = {
 				...githubItem,
 				jobId: 'job-other-sha',
-				reviewGate: { sourceEvent: 'pull_request', sourceAction: 'opened', headSha: 'sha-other' },
+				reviewGate: { sourceEvent: 'pull-request', sourceAction: 'opened', headSha: 'sha-other' },
 			};
 			renderSection(<QueuedRunsSection items={[followUpItem, otherSha]} />);
 			const section = screen.getByTestId('queued-runs-section');
@@ -313,7 +314,7 @@ describe('QueuedRunsSection', () => {
 		});
 
 		it('still renders an ordinary (non-review-gate) queued job one-to-one alongside a grouped card', () => {
-			renderSection(<QueuedRunsSection items={[followUpItem, synchronizeItem, boardItem]} />);
+			renderSection(<QueuedRunsSection items={[followUpItem, prUpdatedItem, boardItem]} />);
 
 			expect(cards()).toHaveLength(2);
 			expect(within(cards()[1]).getByText('Board (Planning/Impl)')).not.toBeNull();
@@ -323,17 +324,18 @@ describe('QueuedRunsSection', () => {
 			const groupedBoardFollowUp: QueuedRun = {
 				...boardItem,
 				jobId: 'job-board-followup',
-				type: 'github',
+				type: 'scm',
+				providerId: 'github',
 				repo: 'acme/widgets',
 				prNumber: '42',
-				reviewGate: { sourceEvent: 'check_suite', sourceAction: 'completed', headSha: 'sha-fix' },
+				reviewGate: { sourceEvent: 'checks', sourceAction: 'completed', headSha: 'sha-fix' },
 			};
 			const groupedBoardSync: QueuedRun = {
 				...groupedBoardFollowUp,
 				jobId: 'job-board-sync',
 				reviewGate: {
-					sourceEvent: 'pull_request',
-					sourceAction: 'synchronize',
+					sourceEvent: 'pull-request',
+					sourceAction: 'updated',
 					headSha: 'sha-fix',
 				},
 			};

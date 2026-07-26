@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMockProjectConfig } from '../../../helpers/factories.js';
+import {
+	createFakeScmProvider,
+	createMockProjectConfig,
+	createMockScmTriggerContext,
+} from '../../../helpers/factories.js';
 
 const {
 	listConflictCandidates,
@@ -13,19 +17,6 @@ const {
 	claimConflictResolution: vi.fn(),
 }));
 
-vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
-	GitHubSCMIntegration: class {
-		listConflictCandidates = listConflictCandidates;
-		commentOnPullRequest = commentOnPullRequest;
-	},
-}));
-vi.mock('@/integrations/scm/github/personas.js', () => ({
-	resolvePersonaIdentities: vi.fn(async () => ({
-		implementer: 'swarm-impl',
-		reviewer: 'swarm-rev',
-	})),
-	isSwarmBot: vi.fn((login: string) => login.startsWith('swarm-')),
-}));
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
 vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 	claimConflictResolution,
@@ -36,18 +27,28 @@ vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 import { createResolveConflictsTrigger } from '@/triggers/handlers/resolve-conflicts.js';
 
 const project = createMockProjectConfig({ repo: 'acme/widgets' });
-const mergedEvent = {
+
+// Every source-control read/write the handler performs goes through the injected
+// `SCMProvider`, so the fake *is* the seam under test — no GitHub module is mocked.
+const scm = createFakeScmProvider({
+	listConflictCandidates,
+	commentOnPullRequest,
+	resolvePersonaIdentities: async () => ({ implementer: 'swarm-impl', reviewer: 'swarm-rev' }),
+	isSwarmActor: (login: string) => login.startsWith('swarm-'),
+});
+
+const mergedEvent = createMockScmTriggerContext({
 	project,
-	source: 'github' as const,
+	scm,
 	event: {
-		eventType: 'pull_request' as const,
+		kind: 'pull-request',
 		action: 'closed',
 		repoFullName: project.repo,
 		isCommentEvent: false,
 		merged: true,
 		baseBranch: 'main',
 	},
-};
+});
 const candidate = {
 	number: 42,
 	headBranch: 'issue-42',
@@ -66,7 +67,7 @@ describe('resolve-conflicts trigger', () => {
 		scheduleCoalescedJob.mockResolvedValue(undefined);
 	});
 
-	it('matches only a merged pull_request.closed event', () => {
+	it('matches only a merged pull-request `closed` event', () => {
 		const trigger = createResolveConflictsTrigger();
 		expect(trigger.matches(mergedEvent)).toBe(true);
 		expect(

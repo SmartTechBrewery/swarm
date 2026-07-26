@@ -20,14 +20,14 @@ import {
 } from '../../../src/dispatch/dispatcher.js';
 import { QUEUE_NAME, type SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
-import { createMockGitHubWebhookJob } from '../../helpers/factories.js';
+import { createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
 const PROJECT_ID = 'proj-dispatcher';
 
 function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
-	return { ...createMockGitHubWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
+	return { ...createMockScmWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
 }
 
 // Real Postgres + Redis/BullMQ (issue #284's acceptance criteria): these tests

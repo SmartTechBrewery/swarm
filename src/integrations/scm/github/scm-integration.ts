@@ -15,10 +15,9 @@
  * with one provider, a runtime conformance harness would be speculative
  * (ai/TESTING.md "Provider conformance"). Everything GitHub-specific — Octokit
  * types, GraphQL node IDs, which REST status means which merge outcome — stays
- * inside this module and `./client.js` (the GitHub signature scheme's `sha256=`
- * framing currently lives in `src/webhook/signature-verification.ts`; relocating
- * it under `src/integrations/scm/github/` belongs to the ingress migration,
- * issue #385).
+ * inside this module, `./client.js`, and `./webhook.js` (which owns every raw
+ * webhook name, header, payload path, and the `sha256=` signature framing since
+ * issue #385 moved ingress behind this contract).
  */
 
 import { execFile } from 'node:child_process';
@@ -26,6 +25,7 @@ import { promisify } from 'node:util';
 import { getPersonaToken, getPersonaTokenOrNull } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import type { ScmEvent } from '../../../scm/events.js';
 import type { MergePullRequestOutcome } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
@@ -33,8 +33,9 @@ import type {
 	SCMProvider,
 	ScmPersona,
 	ScmPersonaIdentities,
+	ScmWebhookRequest,
+	WebhookHeaderReader,
 } from '../../../scm/types.js';
-import { verifyGitHubSignature } from '../../../webhook/signature-verification.js';
 import {
 	createPullRequest,
 	findOpenPullRequest,
@@ -53,6 +54,12 @@ import {
 	withGitHubToken,
 } from './client.js';
 import { getPersonaForLogin, isSwarmBot, resolvePersonaIdentities } from './personas.js';
+import {
+	isSwarmGeneratedGitHubEvent,
+	parseGitHubWebhook,
+	readGitHubWebhookRequest,
+	verifyGitHubSignature,
+} from './webhook.js';
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -194,8 +201,8 @@ export class GitHubSCMIntegration implements SCMProvider {
 	/**
 	 * {@link SCMProvider.resolvePersonaIdentities} — the contract's view of the
 	 * module-level `resolvePersonaIdentities`, including its per-project TTL cache.
-	 * The module function stays exported: ingress and three trigger handlers still
-	 * import it directly until issue #385.
+	 * The module function stays exported for direct utility usage (the PM adapter
+	 * `src/router/adapters/github-projects.ts` is the last direct importer).
 	 */
 	async resolvePersonaIdentities(project: ProjectConfig): Promise<ScmPersonaIdentities> {
 		return resolvePersonaIdentities(project);
@@ -218,13 +225,32 @@ export class GitHubSCMIntegration implements SCMProvider {
 
 	/**
 	 * {@link SCMProvider.verifyWebhookSignature} — GitHub signs the raw payload
-	 * with HMAC-SHA256 and sends `sha256=<hex>` in `X-Hub-Signature-256`. The
-	 * timing-safe comparison and the prefix framing live in
-	 * `src/webhook/signature-verification.ts`; which header carries the signature
-	 * is the receiver's business (issue #385), not this method's.
+	 * with HMAC-SHA256 and sends `sha256=<hex>` in `X-Hub-Signature-256`
+	 * (`./webhook.js`, over the neutral timing-safe `verifyHmac`).
 	 */
 	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean {
 		return verifyGitHubSignature(rawBody, signature, secret);
+	}
+
+	/**
+	 * {@link SCMProvider.readWebhookRequest} — GitHub's `X-GitHub-Event`,
+	 * `X-GitHub-Delivery`, and `X-Hub-Signature-256` headers (`./webhook.js`).
+	 */
+	readWebhookRequest(header: WebhookHeaderReader): ScmWebhookRequest {
+		return readGitHubWebhookRequest(header);
+	}
+
+	/**
+	 * {@link SCMProvider.parseWebhookEvent} — maps GitHub's five processable event
+	 * types and their payload shapes onto the neutral event (`./webhook.js`).
+	 */
+	parseWebhookEvent(eventName: string, payload: unknown): ScmEvent | null {
+		return parseGitHubWebhook(eventName, payload);
+	}
+
+	/** {@link SCMProvider.isSwarmGeneratedEvent} — the comment-marker drop gate (`./webhook.js`). */
+	async isSwarmGeneratedEvent(event: ScmEvent, project: ProjectConfig): Promise<boolean> {
+		return isSwarmGeneratedGitHubEvent(event, project);
 	}
 
 	/**

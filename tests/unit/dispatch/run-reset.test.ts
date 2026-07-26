@@ -60,10 +60,11 @@ import { createMockProjectConfig } from '../../helpers/factories.js';
 type RunRow = typeof runs.$inferSelect;
 
 const JOB_PAYLOAD: SwarmJob = {
-	type: 'github',
+	type: 'scm',
+	providerId: 'github',
 	projectId: 'p1',
 	event: {
-		eventType: 'pull_request',
+		kind: 'pull-request',
 		repoFullName: 'jkwiecien/swarm',
 		isCommentEvent: false,
 	},

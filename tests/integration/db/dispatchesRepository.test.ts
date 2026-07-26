@@ -42,7 +42,7 @@ import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { projects } from '../../../src/db/schema/projects.js';
 import { describeError } from '../../../src/lib/errors.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
-import { createMockGitHubWebhookJob } from '../../helpers/factories.js';
+import { createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -50,7 +50,7 @@ const PROJECT_ID = 'proj-dispatches';
 const OWNER = 'test-worker:1';
 
 function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
-	return { ...createMockGitHubWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
+	return { ...createMockScmWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
 }
 
 /** States only reachable by actually executing the dispatch. */

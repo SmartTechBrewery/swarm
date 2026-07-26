@@ -41,7 +41,7 @@ import type { SwarmUser } from '../../../src/identity/schema.js';
 import type { Worker } from '../../../src/identity/worker.js';
 import { registerWorker } from '../../../src/identity/worker-service.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
-import { createMockGitHubWebhookJob } from '../../helpers/factories.js';
+import { createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -1148,7 +1148,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: {
-					...createMockGitHubWebhookJob(),
+					...createMockScmWebhookJob(),
 					projectId: PROJECT_ID,
 					runId: rateLimitedRunId,
 				} as SwarmJob,
@@ -1167,7 +1167,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: {
-					...createMockGitHubWebhookJob({ deliveryId: 'capacity-dispatch' }),
+					...createMockScmWebhookJob({ deliveryId: 'capacity-dispatch' }),
 					projectId: PROJECT_ID,
 					runId: capacityRunId,
 				} as SwarmJob,
@@ -1180,7 +1180,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			// No runId means no attempt exists for Runs to display yet.
 			const fresh = await createDispatch({
 				projectId: PROJECT_ID,
-				jobPayload: createMockGitHubWebhookJob({
+				jobPayload: createMockScmWebhookJob({
 					deliveryId: 'fresh-dispatch',
 					projectId: PROJECT_ID,
 				}),
@@ -1196,7 +1196,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			const settled = await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: {
-					...createMockGitHubWebhookJob({ deliveryId: 'settled-dispatch' }),
+					...createMockScmWebhookJob({ deliveryId: 'settled-dispatch' }),
 					projectId: PROJECT_ID,
 					runId: settledRunId,
 				} as SwarmJob,

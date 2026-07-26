@@ -24,8 +24,9 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import { enqueueJob, priorityFor } from '../queue/producer.js';
-import type { GitHubParsedEvent } from '../router/adapters/github.js';
 import type { GitHubProjectsParsedEvent } from '../router/adapters/github-projects.js';
+import type { ScmEvent } from '../scm/events.js';
+import type { ScmType } from '../scm/types.js';
 
 async function dispatchWebhookJob(job: SwarmJob): Promise<void> {
 	try {
@@ -55,25 +56,29 @@ async function dispatchWebhookJob(job: SwarmJob): Promise<void> {
 }
 
 /**
- * Hand a verified, project-matched, non-self-authored webhook event off to the
- * dispatch layer. `deliveryId` is GitHub's `X-GitHub-Delivery` — the dispatch's
- * dedup identity and the tracing handle.
+ * Hand a verified, project-matched, non-SWARM-generated SCM event off to the
+ * dispatch layer. `providerId` records which registered provider owns the event so
+ * the worker can resolve the same one back; `deliveryId` is the provider's
+ * per-delivery id — the dispatch's dedup identity and the tracing handle.
  */
-export async function enqueueWebhookEvent(
-	event: GitHubParsedEvent,
+export async function enqueueScmEvent(
+	providerId: ScmType,
+	event: ScmEvent,
 	project: ProjectConfig,
 	deliveryId: string | undefined,
 ): Promise<void> {
 	await dispatchWebhookJob({
-		type: 'github',
+		type: 'scm',
+		providerId,
 		projectId: project.id,
 		deliveryId,
 		event,
 	});
 	logger.debug('Webhook event dispatched', {
+		providerId,
 		projectId: project.id,
 		repo: event.repoFullName,
-		eventType: event.eventType,
+		eventKind: event.kind,
 		action: event.action,
 		workItemId: event.workItemId,
 		deliveryId,
@@ -83,7 +88,7 @@ export async function enqueueWebhookEvent(
 /**
  * Hand a verified, project-matched, non-self-authored `projects_v2_item` status
  * change off to the dispatch layer — the PM-side counterpart of
- * {@link enqueueWebhookEvent}. The worker re-reads the authoritative item state
+ * {@link enqueueScmEvent}. The worker re-reads the authoritative item state
  * itself (`src/worker/consumer.ts` re-reads config from Postgres and dispatches
  * against the parsed event), so this stays symmetric with the SCM path.
  */

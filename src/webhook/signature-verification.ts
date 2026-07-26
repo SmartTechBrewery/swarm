@@ -1,6 +1,12 @@
 /**
  * HMAC signature verification for inbound webhooks — ported from Cascade's
- * `src/webhook/signatureVerification.ts`, trimmed to SWARM's single SCM (GitHub).
+ * `src/webhook/signatureVerification.ts`.
+ *
+ * Provider-neutral on purpose: each provider's own framing (algorithm, header
+ * prefix, encoding) is passed in by that provider's
+ * {@link import('../scm/types.js').SCMProvider.verifyWebhookSignature}
+ * implementation — GitHub's `sha256=<hex>` framing lives in
+ * `src/integrations/scm/github/webhook.ts` (issue #385).
  *
  * The comparison is timing-safe: a naive `===` on the digest would leak, through
  * response-time differences, how many leading bytes of a forged signature were
@@ -55,24 +61,4 @@ export function verifyHmac({
 	if (expected.length !== actual.length) return false;
 
 	return timingSafeEqual(expected, actual);
-}
-
-/**
- * Verify a GitHub webhook signature. GitHub signs the raw payload with
- * HMAC-SHA256 and sends `sha256=<hex>` in the `X-Hub-Signature-256` header.
- *
- * @param rawBody - The raw request body, byte-for-byte as received (re-serializing
- *   parsed JSON would change the bytes and break the signature).
- * @param signature - The `X-Hub-Signature-256` header value.
- * @param secret - The webhook secret configured on the GitHub side.
- */
-export function verifyGitHubSignature(rawBody: string, signature: string, secret: string): boolean {
-	return verifyHmac({
-		algorithm: 'sha256',
-		data: rawBody,
-		secret,
-		signature,
-		encoding: 'hex',
-		prefix: 'sha256=',
-	});
 }

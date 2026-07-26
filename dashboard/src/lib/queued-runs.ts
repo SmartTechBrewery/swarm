@@ -78,7 +78,7 @@ export function queuedWaitReasonLabel(reason: QueuedWaitReason): string {
 export function queuedWorkItemLabel(item: QueuedRun): string {
 	const workItemRef = parseWorkItemRef(item.workItemUrl);
 	if (workItemRef) return workItemLabel(workItemRef);
-	if ((item.type === 'github' || item.type === 'merge-automation') && item.prNumber)
+	if ((item.type === 'scm' || item.type === 'merge-automation') && item.prNumber)
 		return `PR #${item.prNumber}`;
 	return '—';
 }
@@ -90,7 +90,7 @@ export function queuedWorkItemTitle(item: QueuedRun): string | undefined {
 export function queuedWorkItemUrl(item: QueuedRun): string | undefined {
 	if (item.workItemUrl) return item.workItemUrl;
 	if (
-		(item.type === 'github' || item.type === 'merge-automation') &&
+		(item.type === 'scm' || item.type === 'merge-automation') &&
 		item.repo &&
 		item.prNumber &&
 		PR_DRIVEN_PHASES.has(item.phaseHint)
@@ -178,7 +178,7 @@ function toSourceEventDisplay(item: QueuedRun): QueuedReviewGateSourceEventDispl
  * Turn the server's already-ordered `runs.queued` rows into display rows,
  * folding two kinds of duplicate into one logical row:
  *
- * - **Review-gate jobs** — raw `pull_request`/`check_suite` lifecycle events
+ * - **Review-gate jobs** — raw `pull-request`/`checks` lifecycle events
  *   hinting `review` (see {@link QueuedRun.reviewGate}) that share the same
  *   project, repo, PR number, and head SHA.
  * - **Fresh board dispatches** — the several dispatches one board-card
@@ -188,8 +188,8 @@ function toSourceEventDisplay(item: QueuedRun): QueuedReviewGateSourceEventDispl
  * Every other job renders one row per job, exactly as before. A row's position
  * is the position of the first job that started its group, so this never
  * reorders the server's dispatch order; it only folds later duplicates into an
- * earlier row. The two group kinds are mutually exclusive (review-gate is a
- * `github` job, board is a `github-projects` job), so a job joins at most one.
+ * earlier row. The two group kinds are mutually exclusive (review-gate is an
+ * `scm` job, board is a `github-projects` job), so a job joins at most one.
  */
 export function groupQueuedRuns(items: QueuedRun[]): QueuedDisplayRow[] {
 	const rowByGroupKey = new Map<string, QueuedDisplayRow>();
@@ -266,8 +266,8 @@ export function hideBoardRowsWithActiveRun(
 }
 
 const REVIEW_GATE_SOURCE_LABELS: Record<QueuedReviewGateSourceEvent, string> = {
-	pull_request: 'Pull request',
-	check_suite: 'Check suite',
+	'pull-request': 'Pull request',
+	checks: 'Checks',
 };
 
 /** Compact diagnostic label for one source event folded into a review-gate group. */

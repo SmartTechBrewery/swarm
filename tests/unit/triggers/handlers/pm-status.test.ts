@@ -87,12 +87,12 @@ describe('pm-status trigger', () => {
 		});
 
 		it('ignores non-projects sources', () => {
-			const githubCtx = {
+			const scmCtx = {
 				project: PROJECT,
-				source: 'github',
-				event: { eventType: 'pull_request', repoFullName: 'x/y', isCommentEvent: false },
+				source: 'scm',
+				event: { kind: 'pull-request', repoFullName: 'x/y', isCommentEvent: false },
 			} as unknown as TriggerContext;
-			expect(trigger(createMockWorkItem()).matches(githubCtx)).toBe(false);
+			expect(trigger(createMockWorkItem()).matches(scmCtx)).toBe(false);
 		});
 	});
 

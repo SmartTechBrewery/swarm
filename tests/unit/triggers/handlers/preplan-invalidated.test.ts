@@ -10,8 +10,9 @@ import type { PMProvider, WorkItem } from '@/pm/types.js';
 import { createPreplanInvalidatedTrigger } from '@/triggers/handlers/preplan-invalidated.js';
 import type { TriggerContext } from '@/triggers/types.js';
 import {
-	createMockGitHubParsedEvent,
 	createMockProjectConfig,
+	createMockScmEvent,
+	createMockScmTriggerContext,
 	createMockWorkItem,
 } from '../../../helpers/factories.js';
 
@@ -62,20 +63,19 @@ function providerReturning(items: WorkItem[]) {
 }
 
 function context(
-	overrides: Partial<Parameters<typeof createMockGitHubParsedEvent>[0]> = {},
+	overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {},
 ): TriggerContext {
-	return {
+	return createMockScmTriggerContext({
 		project: PROJECT,
-		source: 'github',
-		event: createMockGitHubParsedEvent({
-			eventType: 'issues',
+		event: createMockScmEvent({
+			kind: 'work-item',
 			action: 'edited',
 			workItemId: '10',
 			workItemUrl: ITEM_URL,
 			workItemBodyChanged: true,
 			...overrides,
 		}),
-	};
+	});
 }
 
 function triggerFor(items: WorkItem[]) {

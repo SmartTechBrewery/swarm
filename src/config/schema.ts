@@ -326,7 +326,7 @@ export const AgentsConfigSchema = z
 
 /**
  * Review-trigger policy for a head SHA with zero registered checks
- * (`decideCheckSuiteOutcome`, `src/triggers/handlers/check-suite-decision.ts`).
+ * (`decideAggregateCheckOutcome`, `src/triggers/handlers/aggregate-check-decision.ts`).
  * `required` (the default) defers, treating zero checks the same as CI not
  * having caught up yet. `if-present` dispatches Review immediately on zero
  * checks — for projects with no CI at all — while still waiting on any

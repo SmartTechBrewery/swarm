@@ -65,8 +65,8 @@ function queuedWorkItemCacheKey(item: QueuedRun): string | null {
 	if (item.type === 'github-projects' && item.workItemNodeId) {
 		return `${item.projectId}:${item.workItemNodeId}`;
 	}
-	if (item.type === 'github' && item.prNumber) {
-		return `${item.projectId}:github:${item.prNumber}`;
+	if (item.type === 'scm' && item.prNumber) {
+		return `${item.projectId}:${item.providerId ?? 'scm'}:${item.prNumber}`;
 	}
 	return null;
 }
@@ -135,7 +135,7 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 					phaseHint: resolved.isSupported ? 'board' : 'unknown',
 				};
 			}
-		} else if (item.type === 'github' && item.prNumber) {
+		} else if (item.type === 'scm' && item.prNumber) {
 			const project = await getProjectByIdFromDb(item.projectId);
 			if (project) {
 				const manifest = getPMProvider(project.pm.type);
@@ -857,7 +857,7 @@ export const runsRouter = router({
 						message: `Work item status does not start a Planning or Implementation phase.`,
 					});
 				}
-			} else if (jobData.type === 'github') {
+			} else if (jobData.type === 'scm') {
 				const prNumber = jobData.event.workItemId;
 				const repoFullName = jobData.event.repoFullName;
 				if (prNumber && repoFullName) {

@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-	createMockGitHubParsedEvent,
 	createMockGitHubProjectsParsedEvent,
 	createMockProjectConfig,
+	createMockScmEvent,
 } from '../../helpers/factories.js';
 
 // The seam's job is to shape the event into a SwarmJob and record it as a
@@ -21,7 +21,7 @@ vi.mock('@/queue/producer.js', () => ({
 	priorityFor: (job: { type: string }) => (job.type === 'github-projects' ? 10 : undefined),
 }));
 
-import { enqueueProjectsEvent, enqueueWebhookEvent } from '@/router/enqueue.js';
+import { enqueueProjectsEvent, enqueueScmEvent } from '@/router/enqueue.js';
 
 beforeEach(() => {
 	createAndPublishDispatch.mockReset();
@@ -30,16 +30,22 @@ beforeEach(() => {
 	enqueueJob.mockResolvedValue('bull-job-id');
 });
 
-describe('enqueueWebhookEvent', () => {
-	it('records a github dispatch carrying the event, project id, and delivery dedup identity', async () => {
-		const event = createMockGitHubParsedEvent();
+describe('enqueueScmEvent', () => {
+	it('records an scm dispatch carrying the provider id, event, project id, and delivery dedup identity', async () => {
+		const event = createMockScmEvent();
 		const project = createMockProjectConfig({ id: 'acme' });
 
-		await enqueueWebhookEvent(event, project, 'delivery-1');
+		await enqueueScmEvent('github', event, project, 'delivery-1');
 
 		expect(createAndPublishDispatch).toHaveBeenCalledWith({
 			projectId: 'acme',
-			jobPayload: { type: 'github', projectId: 'acme', deliveryId: 'delivery-1', event },
+			jobPayload: {
+				type: 'scm',
+				providerId: 'github',
+				projectId: 'acme',
+				deliveryId: 'delivery-1',
+				event,
+			},
 			dedupKey: 'delivery:delivery-1',
 			priority: 0,
 			source: 'webhook',
@@ -48,10 +54,10 @@ describe('enqueueWebhookEvent', () => {
 	});
 
 	it('records no dedup identity when the delivery id is absent', async () => {
-		const event = createMockGitHubParsedEvent();
+		const event = createMockScmEvent();
 		const project = createMockProjectConfig();
 
-		await enqueueWebhookEvent(event, project, undefined);
+		await enqueueScmEvent('github', event, project, undefined);
 
 		expect(createAndPublishDispatch).toHaveBeenCalledWith(
 			expect.objectContaining({ dedupKey: undefined }),
@@ -65,20 +71,21 @@ describe('enqueueWebhookEvent', () => {
 		});
 
 		await expect(
-			enqueueWebhookEvent(createMockGitHubParsedEvent(), createMockProjectConfig(), 'delivery-1'),
+			enqueueScmEvent('github', createMockScmEvent(), createMockProjectConfig(), 'delivery-1'),
 		).resolves.toBeUndefined();
 		expect(enqueueJob).not.toHaveBeenCalled();
 	});
 
 	it('falls back to a legacy queue job when the dispatch table is unavailable (mid-deploy)', async () => {
 		createAndPublishDispatch.mockRejectedValue(new Error('relation "dispatches" does not exist'));
-		const event = createMockGitHubParsedEvent();
+		const event = createMockScmEvent();
 		const project = createMockProjectConfig({ id: 'acme' });
 
-		await enqueueWebhookEvent(event, project, 'delivery-1');
+		await enqueueScmEvent('github', event, project, 'delivery-1');
 
 		expect(enqueueJob).toHaveBeenCalledWith({
-			type: 'github',
+			type: 'scm',
+			providerId: 'github',
 			projectId: 'acme',
 			deliveryId: 'delivery-1',
 			event,

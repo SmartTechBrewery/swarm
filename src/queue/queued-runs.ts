@@ -15,7 +15,8 @@
 
 import { z } from 'zod';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
-import type { SwarmJob } from './jobs.js';
+import { ScmProviderIdSchema } from '../scm/events.js';
+import { normalizeStoredJobPayload, type SwarmJob } from './jobs.js';
 
 /**
  * Best-effort phase the dispatch will likely run, derived from the resolved
@@ -63,13 +64,13 @@ export const QueuedWaitReasonSchema = z.enum([
 ]);
 export type QueuedWaitReason = z.infer<typeof QueuedWaitReasonSchema>;
 
-/** The raw GitHub lifecycle event a review-gate job's metadata was derived from. */
-export const ReviewGateSourceEventSchema = z.enum(['pull_request', 'check_suite']);
+/** The normalized SCM lifecycle event kind a review-gate job's metadata was derived from. */
+export const ReviewGateSourceEventSchema = z.enum(['pull-request', 'checks']);
 export type ReviewGateSourceEvent = z.infer<typeof ReviewGateSourceEventSchema>;
 
 /**
  * Diagnostic metadata for a dispatch whose best-effort {@link QueuedPhaseHint}
- * is `review` (issue #275): a raw `pull_request`/`check_suite` lifecycle event
+ * is `review` (issue #275): a `pull-request`/`checks` lifecycle event
  * that *enters* the `pr-review` trigger handler as a gate input, not proof that
  * a Review agent is already queued — the handler's own PR+SHA dispatch dedup
  * (`review-dispatch-dedup.ts`) folds every such event for the same head SHA
@@ -79,11 +80,11 @@ export type ReviewGateSourceEvent = z.infer<typeof ReviewGateSourceEventSchema>;
  */
 export const QueuedReviewGateSchema = z.object({
 	sourceEvent: ReviewGateSourceEventSchema,
-	/** The webhook `action` on the source event (e.g. `opened`, `synchronize`, `completed`). */
+	/** The normalized `action` on the source event (e.g. `opened`, `updated`, `completed`). */
 	sourceAction: z.string().optional(),
 	/** The PR head commit SHA this event evaluates — the review dispatch dedup key. */
 	headSha: z.string(),
-	/** Deferred check-suite recheck attempt count, when this job is a coalesced recheck. */
+	/** Deferred aggregate-check recheck attempt count, when this job is a coalesced recheck. */
 	recheckAttempt: z.number().int().nonnegative().optional(),
 });
 export type QueuedReviewGate = z.infer<typeof QueuedReviewGateSchema>;
@@ -93,7 +94,13 @@ export const QueuedRunSchema = z.object({
 	/** The canonical dispatch id — the handle Put back / cancel operate on. */
 	jobId: z.string(),
 	projectId: z.string(),
-	type: z.enum(['github', 'github-projects', 'merge-automation']),
+	/**
+	 * What produced the dispatch: `scm` for an SCM job (carrying `providerId`
+	 * separately), `github-projects` for a board job, or `merge-automation`.
+	 */
+	type: z.enum(['scm', 'github-projects', 'merge-automation']),
+	/** SCM jobs only — the SCM provider's id (`github`). */
+	providerId: ScmProviderIdSchema.optional(),
 	state: PendingJobStateSchema,
 	phaseHint: QueuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */
@@ -102,9 +109,9 @@ export const QueuedRunSchema = z.object({
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
 	attempt: z.number().int().nonnegative().optional(),
-	/** `github` and `merge-automation` jobs only — `owner/repo`. */
+	/** SCM and `merge-automation` jobs only — `owner/repo`. */
 	repo: z.string().optional(),
-	/** `github` and `merge-automation` jobs only — the PR/issue number. */
+	/** SCM and `merge-automation` jobs only — the PR/issue number. */
 	prNumber: z.string().optional(),
 	/** `github-projects` jobs only — the opaque board item node id. */
 	workItemNodeId: z.string().optional(),
@@ -139,7 +146,7 @@ export const QueuedRunSchema = z.object({
 	/** ISO 8601 — `delayed` dispatches only, scheduled run time. */
 	runsAt: z.string().optional(),
 	/**
-	 * Present only for a `review`-hinted `github` job carrying the PR number and
+	 * Present only for a `review`-hinted SCM job carrying the PR number and
 	 * head SHA needed to classify it safely (see {@link QueuedReviewGateSchema}).
 	 */
 	reviewGate: QueuedReviewGateSchema.optional(),
@@ -157,12 +164,12 @@ export function deriveQueuedPhaseHint(job: SwarmJob): QueuedPhaseHint {
 	if (job.type === 'merge-automation') return 'merge-automation';
 
 	const { event } = job;
-	switch (event.eventType) {
-		case 'pull_request_review':
+	switch (event.kind) {
+		case 'pull-request-review':
 			return event.reviewState === 'approved' ? 'review' : 'respond-to-review';
-		case 'check_suite':
+		case 'checks':
 			return event.checkConclusion === 'failure' ? 'respond-to-ci' : 'review';
-		case 'pull_request':
+		case 'pull-request':
 			return event.action === 'closed' && event.merged === true ? 'resolve-conflicts' : 'review';
 		default:
 			return 'unknown';
@@ -171,20 +178,20 @@ export function deriveQueuedPhaseHint(job: SwarmJob): QueuedPhaseHint {
 
 /**
  * Extract review-gate diagnostic metadata (see {@link QueuedReviewGateSchema})
- * for a `github` job whose best-effort phase hint is `review` — `undefined`
+ * for an SCM job whose best-effort phase hint is `review` — `undefined`
  * for every other job, and for a review-hinting event missing the PR number or
- * head SHA a safe grouping needs. Never calls GitHub — derived purely from the
- * job's already-parsed event, same as {@link deriveQueuedPhaseHint}.
+ * head SHA a safe grouping needs. Never calls the provider — derived purely from
+ * the job's already-normalized event, same as {@link deriveQueuedPhaseHint}.
  */
 export function deriveReviewGate(job: SwarmJob): QueuedReviewGate | undefined {
-	if (job.type !== 'github') return undefined;
+	if (job.type !== 'scm') return undefined;
 	const { event } = job;
-	if (event.eventType !== 'pull_request' && event.eventType !== 'check_suite') return undefined;
+	if (event.kind !== 'pull-request' && event.kind !== 'checks') return undefined;
 	if (deriveQueuedPhaseHint(job) !== 'review') return undefined;
 	if (!event.workItemId || !event.headSha) return undefined;
 
 	return QueuedReviewGateSchema.parse({
-		sourceEvent: event.eventType,
+		sourceEvent: event.kind,
 		sourceAction: event.action,
 		headSha: event.headSha,
 		recheckAttempt: job.recheckAttempt,
@@ -209,17 +216,22 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
  */
 export function deriveDispatchPhaseHint(dispatch: DispatchRow): QueuedPhaseHint {
 	const resolved = QueuedPhaseHintSchema.safeParse(dispatch.phase);
-	return resolved.success ? resolved.data : deriveQueuedPhaseHint(dispatch.jobPayload);
+	return resolved.success
+		? resolved.data
+		: deriveQueuedPhaseHint(normalizeStoredJobPayload(dispatch.jobPayload));
 }
 
 function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): QueuedRun {
-	const data = dispatch.jobPayload;
+	// A row written before issue #385 still carries the legacy envelope, and the
+	// `jsonb` column is typed rather than validated — normalize before reading.
+	const data = normalizeStoredJobPayload(dispatch.jobPayload);
 	const state = deriveQueuedState(dispatch);
 	const reviewGate = deriveReviewGate(data);
 	const shared = {
 		jobId: dispatch.id,
 		projectId: dispatch.projectId,
 		type: data.type,
+		...(data.type === 'scm' ? { providerId: data.providerId } : {}),
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
 		waitReason: dispatch.waitReason ?? undefined,
@@ -235,7 +247,7 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 	};
 
 	return QueuedRunSchema.parse(
-		data.type === 'github'
+		data.type === 'scm'
 			? { ...shared, repo: data.event.repoFullName, prNumber: data.event.workItemId }
 			: data.type === 'merge-automation'
 				? { ...shared, repo: data.repo, prNumber: data.prNumber }

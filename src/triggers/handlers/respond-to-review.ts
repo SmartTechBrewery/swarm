@@ -10,14 +10,14 @@
  * responsible for addressing the batched findings it receives.
  *
  * Two gates make this fire on exactly the right event:
- *  - **The final submitted review, not line comments.** Only `pull_request_review`
- *    `submitted` matches; individual line comments arrive as a different event
- *    (`pull_request_review_comment`, which SWARM doesn't process) and edits /
+ *  - **The final submitted review, not line comments.** Only a
+ *    `pull-request-review` `submitted` event matches; individual line comments
+ *    arrive as a different provider event (which SWARM doesn't process) and edits /
  *    dismissals carry a non-`submitted` action.
- *  - **Authored by the reviewer persona.** GitHub self-review is impossible, so
- *    a human's review or the implementer's own event must not start a response.
- *    `getPersonaForLogin` confirms the review's author is the *reviewer* persona
- *    before dispatching — the same routing primitive the router adapter uses.
+ *  - **Authored by the reviewer persona.** Self-review is impossible, so a human's
+ *    review or the implementer's own event must not start a response.
+ *    `SCMProvider.personaForActor` confirms the review's author is the *reviewer*
+ *    persona before dispatching.
  *
  * **The review-verdict safety cap (issue #235).** A `changes_requested` event
  * that is the last permitted verdict the review-verdict ledger allowed
@@ -36,23 +36,19 @@ import {
 	getReviewVerdictByReviewId as getReviewVerdictByReviewIdDefault,
 	isCapReachingRequestChanges,
 } from '../../db/repositories/reviewVerdictsRepository.js';
-import {
-	getPersonaForLogin,
-	resolvePersonaIdentities,
-} from '../../integrations/scm/github/personas.js';
 import { logger } from '../../lib/logger.js';
-import type { GitHubParsedEvent } from '../../router/adapters/github.js';
+import type { ScmEvent } from '../../scm/events.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 /**
  * Resolve the webhook coordinates that cannot be recovered from the verdict
  * ledger, or `null` — logging why — when any is missing from the event. The
- * head SHA is deliberately excluded: GitHub can omit both of its webhook SHA
+ * head SHA is deliberately excluded: a provider can omit both of its webhook SHA
  * fields, while a SWARM-submitted review has already recorded its exact head in
  * the durable ledger under `reviewId`.
  */
 function resolveWebhookCoordinates(
-	event: GitHubParsedEvent,
+	event: ScmEvent,
 ): { prNumber: string; prBranch: string; reviewId: string } | null {
 	const { workItemId: prNumber, prBranch, reviewId } = event;
 	if (!prNumber || !prBranch || !reviewId) {
@@ -67,13 +63,11 @@ function resolveWebhookCoordinates(
 }
 
 export interface RespondToReviewTriggerDeps {
-	/** Injectable persona-identity resolver — defaults to the cached resolver; overridden in tests. */
-	resolveIdentities?: (
-		project: ProjectConfig,
-	) => Promise<Awaited<ReturnType<typeof resolvePersonaIdentities>>>;
 	/**
 	 * Injectable review-verdict ledger lookups (issue #235) — default to the real
-	 * repository calls; overridden in tests.
+	 * repository calls; overridden in tests. Persona identities are *not* injected:
+	 * they resolve through the context's `SCMProvider`, which a test substitutes
+	 * wholesale.
 	 */
 	getReviewVerdictByReviewId?: typeof getReviewVerdictByReviewIdDefault;
 	getReviewVerdictByHead?: typeof getReviewVerdictByHeadDefault;
@@ -82,7 +76,6 @@ export interface RespondToReviewTriggerDeps {
 export function createRespondToReviewTrigger(
 	deps: RespondToReviewTriggerDeps = {},
 ): TriggerHandler {
-	const resolveIdentities = deps.resolveIdentities ?? resolvePersonaIdentities;
 	const getReviewVerdictByReviewId =
 		deps.getReviewVerdictByReviewId ?? getReviewVerdictByReviewIdDefault;
 	const getReviewVerdictByHead = deps.getReviewVerdictByHead ?? getReviewVerdictByHeadDefault;
@@ -134,10 +127,10 @@ export function createRespondToReviewTrigger(
 
 	async function resolveDispatchHeadSha(
 		project: ProjectConfig,
-		event: GitHubParsedEvent,
+		event: ScmEvent,
 		coords: { prNumber: string; reviewId: string },
 	): Promise<string | null> {
-		if (event.reviewState !== 'changes_requested') return event.headSha ?? null;
+		if (event.reviewState !== 'changes-requested') return event.headSha ?? null;
 
 		const record = await resolveChangesRequestedVerdict(
 			project,
@@ -166,9 +159,9 @@ export function createRespondToReviewTrigger(
 			'Starts Respond-to-review on a reviewer-persona changes-requested review (or every verdict when skipOnMinors is false)',
 
 		matches(ctx: TriggerContext): boolean {
-			if (ctx.source !== 'github') return false;
+			if (ctx.source !== 'scm') return false;
 			const { event } = ctx;
-			if (event.eventType !== 'pull_request_review') return false;
+			if (event.kind !== 'pull-request-review') return false;
 			// Only a submitted review — not an edit or a dismissal. `handle` applies
 			// the configured verdict policy after this cheap shape match.
 			if (event.action !== 'submitted') return false;
@@ -176,7 +169,7 @@ export function createRespondToReviewTrigger(
 		},
 
 		async handle(ctx: TriggerContext): Promise<TriggerResult | null> {
-			if (ctx.source !== 'github') return null;
+			if (ctx.source !== 'scm') return null;
 			const { event, project } = ctx;
 			if (project.pipeline?.respondToReview?.enabled === false) {
 				logger.debug('respond-to-review: phase disabled — skipping');
@@ -184,7 +177,7 @@ export function createRespondToReviewTrigger(
 			}
 			if (
 				project.pipeline?.respondToReview?.skipOnMinors !== false &&
-				event.reviewState !== 'changes_requested'
+				event.reviewState !== 'changes-requested'
 			) {
 				logger.debug('respond-to-review: minor review skipped by project setting', {
 					reviewState: event.reviewState,
@@ -197,8 +190,8 @@ export function createRespondToReviewTrigger(
 				return null;
 			}
 
-			const identities = await resolveIdentities(project);
-			const persona = getPersonaForLogin(event.actorLogin, identities);
+			const identities = await ctx.scm.resolvePersonaIdentities(project);
+			const persona = ctx.scm.personaForActor(event.actorLogin, identities);
 			if (persona !== 'reviewer') {
 				// A human review, or the implementer's own event — not the reviewer
 				// persona's batched review, so not an auto-response trigger.
