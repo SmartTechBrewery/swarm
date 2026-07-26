@@ -15,6 +15,7 @@
 
 import { z } from 'zod';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
+import { ScmProviderIdSchema } from '../scm/events.js';
 import { normalizeStoredJobPayload, type SwarmJob } from './jobs.js';
 
 /**
@@ -94,14 +95,12 @@ export const QueuedRunSchema = z.object({
 	jobId: z.string(),
 	projectId: z.string(),
 	/**
-	 * What produced the dispatch: an SCM job reports its *provider id*
-	 * (`github`), a board job the PM provider's id, and a merge-automation
-	 * dispatch its own kind. Historically these were the queue's `type`
-	 * discriminators; the SCM envelope's discriminator became the neutral `scm`
-	 * in issue #385, but the read model keeps naming the provider because that
-	 * is what the Queue UI shows.
+	 * What produced the dispatch: `scm` for an SCM job (carrying `providerId`
+	 * separately), `github-projects` for a board job, or `merge-automation`.
 	 */
-	type: z.enum(['github', 'github-projects', 'merge-automation']),
+	type: z.enum(['scm', 'github-projects', 'merge-automation']),
+	/** SCM jobs only — the SCM provider's id (`github`). */
+	providerId: ScmProviderIdSchema.optional(),
 	state: PendingJobStateSchema,
 	phaseHint: QueuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */
@@ -231,7 +230,8 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 	const shared = {
 		jobId: dispatch.id,
 		projectId: dispatch.projectId,
-		type: data.type === 'scm' ? data.providerId : data.type,
+		type: data.type,
+		...(data.type === 'scm' ? { providerId: data.providerId } : {}),
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
 		waitReason: dispatch.waitReason ?? undefined,

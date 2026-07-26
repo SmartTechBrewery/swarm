@@ -135,7 +135,8 @@ export const queuedRunSchema = z.object({
 	/** The canonical dispatch id (issue #284) — the handle Put back operates on. */
 	jobId: z.string(),
 	projectId: z.string(),
-	type: z.enum(['github', 'github-projects', 'merge-automation']),
+	type: z.enum(['scm', 'github-projects', 'merge-automation']),
+	providerId: z.string().optional(),
 	state: queuedRunStateSchema,
 	phaseHint: queuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */

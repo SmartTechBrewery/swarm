@@ -15,7 +15,8 @@ function githubRun(overrides: Partial<QueuedRun> = {}): QueuedRun {
 	return {
 		jobId: 'job-gh',
 		projectId: 'proj',
-		type: 'github',
+		type: 'scm',
+		providerId: 'github',
 		state: 'waiting',
 		phaseHint: 'review',
 		repo: 'acme/widgets',

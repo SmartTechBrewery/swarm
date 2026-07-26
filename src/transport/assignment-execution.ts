@@ -308,7 +308,7 @@ const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
  * be authored by the implementer identity (the operator, as in Implementation) —
  * routing it through a composite built for the reviewer persona would have the
  * reviewer answering its own review, and the author-persona routing that decides
- * what a comment event means (`getPersonaForLogin`, `../router/adapters/github.ts`)
+ * what a comment event means (`getPersonaForLogin`, `../integrations/scm/github/webhook.ts`)
  * would read the wrong persona off it. The composite states `persona: 'reviewer'`
  * explicitly, so the frame carries the identity this Review write runs under
  * rather than leaving the server to infer one (issue #444).

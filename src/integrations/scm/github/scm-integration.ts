@@ -201,8 +201,8 @@ export class GitHubSCMIntegration implements SCMProvider {
 	/**
 	 * {@link SCMProvider.resolvePersonaIdentities} — the contract's view of the
 	 * module-level `resolvePersonaIdentities`, including its per-project TTL cache.
-	 * The module function stays exported: ingress and three trigger handlers still
-	 * import it directly until issue #385.
+	 * The module function stays exported for direct utility usage (the PM adapter
+	 * `src/router/adapters/github-projects.ts` is the last direct importer).
 	 */
 	async resolvePersonaIdentities(project: ProjectConfig): Promise<ScmPersonaIdentities> {
 		return resolvePersonaIdentities(project);

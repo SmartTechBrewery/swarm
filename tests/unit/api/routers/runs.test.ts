@@ -462,7 +462,8 @@ describe('runsRouter', () => {
 			const queuedItem = {
 				jobId: 'dispatch-review-gate',
 				projectId: 'p1',
-				type: 'github' as const,
+				type: 'scm' as const,
+				providerId: 'github' as const,
 				state: 'waiting' as const,
 				phaseHint: 'review' as const,
 				repo: 'acme/widgets',

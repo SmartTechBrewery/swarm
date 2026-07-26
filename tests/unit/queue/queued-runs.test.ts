@@ -297,8 +297,9 @@ describe('toQueuedRuns', () => {
 		expect(ordinaryItem.continuation).toBe(false);
 	});
 
-	it('maps a github job to repo + prNumber, no board fields', () => {
+	it('maps an scm job to repo + prNumber, carrying providerId separately', () => {
 		const job = createMockScmWebhookJob({
+			providerId: 'github',
 			event: {
 				...createMockScmWebhookJob().event,
 				repoFullName: 'jkwiecien/swarm',
@@ -309,7 +310,8 @@ describe('toQueuedRuns', () => {
 		const [item] = toQueuedRuns([makeDispatch({ jobPayload: job })]);
 
 		expect(item).toMatchObject({
-			type: 'github',
+			type: 'scm',
+			providerId: 'github',
 			repo: 'jkwiecien/swarm',
 			prNumber: '42',
 			state: 'waiting',
@@ -414,7 +416,7 @@ describe('toQueuedRuns', () => {
 
 		const [item] = toQueuedRuns([makeDispatch({ jobPayload: legacy })]);
 
-		expect(item).toMatchObject({ type: 'github', repo: 'jkwiecien/swarm', prNumber: '42' });
+		expect(item).toMatchObject({ type: 'scm', providerId: 'github', repo: 'jkwiecien/swarm', prNumber: '42' });
 		expect(item.phaseHint).toBe('review');
 		expect(item.reviewGate).toEqual({
 			sourceEvent: 'checks',
