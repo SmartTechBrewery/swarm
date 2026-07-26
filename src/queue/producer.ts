@@ -20,21 +20,20 @@ import { QUEUE_NAME, type SwarmJob } from './jobs.js';
 let queue: Queue<SwarmJob> | null = null;
 
 /**
- * PM-driven events (`github-projects` card status changes, plus `github` issue
- * invalidations that dispatch fallback Planning) are demoted below
- * BullMQ's implicit default priority so PR review-lifecycle events (`github`:
- * opened / checks / reviews) never sit queued behind one. BullMQ ranks 0
- * (unset) as highest, so review-lifecycle jobs need no override — only
- * PM-driven jobs get pushed down. Without this, a card dragged into
- * Planning/In progress right as a PR opens can leave that PR's review waiting
- * out the whole implementation run under `SWARM_WORKER_CONCURRENCY=1`, and
- * even at 2 it still competes for the same limited slots.
+ * PM-driven events (`github-projects` card status changes, plus SCM `work-item`
+ * invalidations that dispatch fallback Planning) are demoted below BullMQ's
+ * implicit default priority so PR review-lifecycle events (`scm`: opened /
+ * checks / reviews) never sit queued behind one. BullMQ ranks 0 (unset) as
+ * highest, so review-lifecycle jobs need no override — only PM-driven jobs get
+ * pushed down. Without this, a card dragged into Planning/In progress right as a
+ * PR opens can leave that PR's review waiting out the whole implementation run
+ * under `SWARM_WORKER_CONCURRENCY=1`, and even at 2 it still competes for the
+ * same limited slots.
  */
 export const PM_BOARD_JOB_PRIORITY = 10;
 
 export function priorityFor(job: SwarmJob): number | undefined {
-	return job.type === 'github-projects' ||
-		(job.type === 'github' && job.event.eventType === 'issues')
+	return job.type === 'github-projects' || (job.type === 'scm' && job.event.kind === 'work-item')
 		? PM_BOARD_JOB_PRIORITY
 		: undefined;
 }
@@ -73,7 +72,7 @@ function getQueue(): Queue<SwarmJob> {
  * adopts such a job into a dispatch record at dequeue — `ADR-002`). All normal
  * enqueue paths go through `src/dispatch/dispatcher.ts`.
  *
- * `deliveryId` (GitHub's `X-GitHub-Delivery`) is used as the BullMQ job id when
+ * `deliveryId` (the provider's per-delivery id) is used as the BullMQ job id when
  * present so a redelivered webhook dedupes while the completed job is retained.
  */
 export async function enqueueJob(job: SwarmJob): Promise<string | undefined> {

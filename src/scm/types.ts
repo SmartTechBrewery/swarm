@@ -22,19 +22,16 @@
  * (`src/scm/delivery.ts`), so PR creation, push, formal review submission, and
  * idempotent comments keep flowing through the already-tested delivery seam.
  *
+ * Webhook ingress joined the contract with issue #385: the receiver now reads
+ * headers, parses, and applies loop prevention entirely through the provider, so
+ * `src/router/webhook-receiver.ts` names no provider and knows no raw event name.
+ *
  * Deliberately **not** here yet:
  *
- * - **Webhook event parsing.** A provider's parsed event is also SWARM's durable
- *   queue job payload (`src/queue/jobs.ts`), so neutralizing it means changing
- *   the serialized envelope and reading legacy dispatch rows — that is issue
- *   #385's job, which widens this interface with the parse/resolve methods once
- *   a provider-neutral event shape exists (ai/RULES.md §2 "widen the interface,
- *   don't special-case"). Only {@link SCMProvider.verifyWebhookSignature}, the
- *   one webhook concern that needs no event model, is declared now.
  * - **Provider selection, fallback, or per-provider config.** There is one
- *   provider, one `/github/webhook` route, and one HMAC secret; a project's SCM
- *   config is `repo` + `credentials` (`src/config/schema.ts`) with no
- *   per-provider block to declare.
+ *   provider, one webhook route (declared on its manifest), and one HMAC secret;
+ *   a project's SCM config is `repo` + `credentials` (`src/config/schema.ts`)
+ *   with no per-provider block to declare.
  * - **`withCredentials`** — the implementer-persona convenience wrapper on the
  *   GitHub class. It is sugar over {@link SCMProvider.withPersonaCredentials};
  *   putting it in the contract would oblige a second provider to implement two
@@ -43,6 +40,7 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import type { ScmDeliveryProvider } from './delivery.js';
+import type { ScmEvent } from './events.js';
 import type { ScmMergeProvider } from './merge.js';
 
 export type ScmType = 'github';
@@ -94,6 +92,30 @@ export interface CheckRunState {
 export interface AggregateCheckStatus {
 	totalCount: number;
 	checkRuns: CheckRunState[];
+}
+
+/**
+ * Case-insensitive reader over an inbound request's headers — the only thing a
+ * provider gets to see of the HTTP request besides the raw body, so the receiver
+ * stays free of any provider's header names.
+ */
+export type WebhookHeaderReader = (name: string) => string | undefined;
+
+/**
+ * What a provider reads out of an inbound webhook's headers.
+ *
+ * `eventName` stays the provider's *own* event name (GitHub's `pull_request`,
+ * `projects_v2_item`, …), deliberately opaque to the receiver: it is only ever
+ * handed straight back to {@link SCMProvider.parseWebhookEvent} — which owns the
+ * mapping onto {@link ScmEvent}'s neutral kinds — and logged.
+ */
+export interface ScmWebhookRequest {
+	/** The provider's own event name, or `'unknown'` when the request carries none. */
+	eventName: string;
+	/** Per-delivery id, when the provider sends one — the dispatch's dedup identity. */
+	deliveryId?: string;
+	/** The signature to verify the raw body against; `''` when the request carries none. */
+	signature: string;
 }
 
 /**
@@ -167,6 +189,38 @@ export interface SCMProvider extends ScmMergeProvider {
 	 * than throwing: an unverifiable webhook is an ordinary rejection, not a bug.
 	 */
 	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean;
+
+	/**
+	 * Interpret an inbound webhook's headers — which one names the event, which
+	 * carries the per-delivery id, which carries the signature. Pure header
+	 * reading, so it runs before the body is authenticated.
+	 */
+	readWebhookRequest(header: WebhookHeaderReader): ScmWebhookRequest;
+
+	/**
+	 * Normalize a raw webhook body into an {@link ScmEvent}. `eventName` is the
+	 * value this provider itself reported from
+	 * {@link SCMProvider.readWebhookRequest}. Returns `null` for events SWARM
+	 * doesn't act on, so the receiver acknowledges them without branching on any
+	 * provider's event vocabulary.
+	 */
+	parseWebhookEvent(eventName: string, payload: unknown): ScmEvent | null;
+
+	/**
+	 * Loop prevention's drop gate: whether SWARM itself generated this event, so
+	 * ingress can drop it instead of reacting to its own output.
+	 *
+	 * Deliberately narrow — it is scoped to *comment* events, which are what create
+	 * the runaway reply loop. PR/review/check lifecycle events must flow through
+	 * even when SWARM produced them, because the *other* persona has to act on
+	 * them (the implementer opens a PR → the reviewer reviews it; the reviewer
+	 * requests changes → the implementer responds).
+	 *
+	 * It asks about the event, not its author (issue #443): under the federated
+	 * model an implementer identity is the worker operator's own account (ADR-004
+	 * §3), so an actor login cannot distinguish SWARM's output from that human's.
+	 */
+	isSwarmGeneratedEvent(event: ScmEvent, project: ProjectConfig): Promise<boolean>;
 
 	/**
 	 * Read one pull request's state. `prNumber` is deliberately generic — GitLab

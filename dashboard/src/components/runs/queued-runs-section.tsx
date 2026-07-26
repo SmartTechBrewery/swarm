@@ -166,7 +166,7 @@ interface QueuedRunsSectionProps {
  *   jobs sharing the same project/repo/PR/head SHA into one logical row via
  *   {@link groupQueuedRuns} (issue #275), so a duplicate raw lifecycle event
  *   (e.g. a Respond-to-review follow-up alongside GitHub's own
- *   `pull_request:synchronize`) doesn't read as two queued Review agents.
+ *   a pull-request update) doesn't read as two queued Review agents.
  * - A row linked to an existing deferred attempt exposes its run detail page;
  *   fresh queued work has no run yet and therefore no detail action.
  */

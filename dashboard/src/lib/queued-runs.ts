@@ -266,8 +266,8 @@ export function hideBoardRowsWithActiveRun(
 }
 
 const REVIEW_GATE_SOURCE_LABELS: Record<QueuedReviewGateSourceEvent, string> = {
-	pull_request: 'Pull request',
-	check_suite: 'Check suite',
+	'pull-request': 'Pull request',
+	checks: 'Checks',
 };
 
 /** Compact diagnostic label for one source event folded into a review-gate group. */

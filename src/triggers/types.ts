@@ -19,16 +19,24 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import type { WorkItem } from '../pm/types.js';
-import type { GitHubParsedEvent } from '../router/adapters/github.js';
 import type { GitHubProjectsParsedEvent } from '../router/adapters/github-projects.js';
+import type { ScmEvent } from '../scm/events.js';
+import type { SCMProvider, ScmType } from '../scm/types.js';
 
 /**
- * What a trigger handler sees: the resolved project plus the parsed event,
- * discriminated by which router adapter produced it.
+ * What a trigger handler sees: the resolved project plus the normalized event,
+ * discriminated by which ingress produced it.
+ *
+ * The SCM variant also carries the `SCMProvider` that owns the event, resolved
+ * once from `scmProviderRegistry` at the composition root that builds this
+ * context (`src/worker/consumer.ts`'s `buildTriggerContext`) — the same way the
+ * worker supplies the other ambient dependencies. Handlers therefore perform
+ * every SCM read/write through `ctx.scm` and never name a provider, and a test
+ * substitutes a typed fake by setting this one field (ai/RULES.md §2).
  */
 export type TriggerContext = {
 	project: ProjectConfig;
-	/** GitHub's `X-GitHub-Delivery`, when the job carried one. */
+	/** The provider's per-delivery webhook id, when the job carried one. */
 	deliveryId?: string;
 	/**
 	 * How many times this job has already been re-enqueued as a deferred
@@ -54,9 +62,12 @@ export type TriggerContext = {
 	 */
 	continuationDispatchClaimed?: boolean;
 } & (
-	| { source: 'github'; event: GitHubParsedEvent }
+	| { source: 'scm'; providerId: ScmType; event: ScmEvent; scm: SCMProvider }
 	| { source: 'github-projects'; event: GitHubProjectsParsedEvent }
 );
+
+/** A trigger context narrowed to the SCM ingress — what every SCM-driven handler takes. */
+export type ScmTriggerContext = Extract<TriggerContext, { source: 'scm' }>;
 
 export type TriggerSource = TriggerContext['source'];
 

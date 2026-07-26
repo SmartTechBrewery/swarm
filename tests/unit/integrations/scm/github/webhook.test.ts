@@ -1,73 +1,45 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHmac } from 'node:crypto';
+import { describe, expect, it } from 'vitest';
 
-import { createMockProjectConfig } from '../../../helpers/factories.js';
-
-vi.mock('@/config/provider.js', () => ({
-	findProjectByRepo: vi.fn(),
-}));
-vi.mock('@/integrations/scm/github/personas.js', () => ({
-	resolvePersonaIdentities: vi.fn(),
-	isSwarmBot: vi.fn(),
-	getPersonaForLogin: vi.fn(),
-}));
-const withPersonaCredentials = vi.fn(
-	(_project: unknown, _persona: unknown, fn: () => Promise<unknown>) => fn(),
-);
-vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
-	GitHubSCMIntegration: class {
-		withPersonaCredentials = withPersonaCredentials;
-	},
-}));
-
-import { findProjectByRepo } from '@/config/provider.js';
 import {
-	getPersonaForLogin,
-	isSwarmBot,
-	type PersonaIdentities,
-	resolvePersonaIdentities,
-} from '@/integrations/scm/github/personas.js';
-import { GitHubRouterAdapter } from '@/router/adapters/github.js';
+	isSwarmGeneratedGitHubEvent,
+	parseGitHubWebhook,
+	readGitHubWebhookRequest,
+	verifyGitHubSignature,
+} from '@/integrations/scm/github/webhook.js';
+import type { ScmPersonaIdentities } from '@/scm/types.js';
+import { createMockProjectConfig } from '../../../../helpers/factories.js';
 
-const IDENTITIES: PersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 const project = createMockProjectConfig({ id: 'proj-1', repo: 'jkwiecien/swarm' });
 
 function repo() {
 	return { full_name: 'jkwiecien/swarm' };
 }
 
-describe('GitHubRouterAdapter', () => {
-	const adapter = new GitHubRouterAdapter();
-
-	// The event types under test are all processable, so parseWebhook never
+describe('GitHub webhook ingress', () => {
+	// The event types under test are all processable, so parseGitHubWebhook never
 	// returns null here — narrow it once so the assertions don't repeat `!`.
 	function parse(eventType: string, payload: unknown) {
-		const event = adapter.parseWebhook(eventType, payload);
+		const event = parseGitHubWebhook(eventType, payload);
 		if (!event) throw new Error(`expected ${eventType} to parse`);
 		return event;
 	}
 
-	beforeEach(() => {
-		vi.mocked(findProjectByRepo).mockReset();
-		vi.mocked(resolvePersonaIdentities).mockReset();
-		vi.mocked(isSwarmBot).mockReset();
-		vi.mocked(getPersonaForLogin).mockReset();
-		withPersonaCredentials.mockClear();
-	});
-
-	describe('parseWebhook', () => {
+	describe('parseGitHubWebhook', () => {
 		it('returns null for an event type SWARM does not act on', () => {
-			expect(adapter.parseWebhook('projects_v2_item', { repository: repo() })).toBeNull();
+			expect(parseGitHubWebhook('projects_v2_item', { repository: repo() })).toBeNull();
 		});
 
 		it('parses a pull_request event', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: { number: 42 },
 				sender: { login: 'a-human' },
 			});
 			expect(parsed).toEqual({
-				eventType: 'pull_request',
+				kind: 'pull-request',
 				action: 'opened',
 				repoFullName: 'jkwiecien/swarm',
 				workItemId: '42',
@@ -77,7 +49,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('parses an issue_comment event and flags it as a comment event', () => {
-			const parsed = adapter.parseWebhook('issue_comment', {
+			const parsed = parseGitHubWebhook('issue_comment', {
 				action: 'created',
 				repository: repo(),
 				issue: { number: 7 },
@@ -87,12 +59,12 @@ describe('GitHubRouterAdapter', () => {
 			expect(parsed?.workItemId).toBe('7');
 			expect(parsed?.isCommentEvent).toBe(true);
 			expect(parsed?.actorLogin).toBe('swarm-rev');
-			// Carried for loop prevention only (`isSelfAuthored`).
+			// Carried for loop prevention only (`isSwarmGeneratedGitHubEvent`).
 			expect(parsed?.commentBody).toBe('looks good');
 		});
 
 		it('leaves commentBody undefined for a non-comment event that carries a body', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: { number: 42, body: 'Closes #7' },
@@ -102,7 +74,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('parses an issue body edit used to invalidate a preplan', () => {
-			const parsed = adapter.parseWebhook('issues', {
+			const parsed = parseGitHubWebhook('issues', {
 				action: 'edited',
 				repository: repo(),
 				issue: {
@@ -113,7 +85,7 @@ describe('GitHubRouterAdapter', () => {
 				sender: { login: 'a-human' },
 			});
 			expect(parsed).toMatchObject({
-				eventType: 'issues',
+				kind: 'work-item',
 				action: 'edited',
 				workItemId: '7',
 				workItemUrl: 'https://github.com/jkwiecien/swarm/issues/7',
@@ -123,21 +95,21 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('parses the label changed by an issues event', () => {
-			const parsed = adapter.parseWebhook('issues', {
+			const parsed = parseGitHubWebhook('issues', {
 				action: 'labeled',
 				repository: repo(),
 				issue: { number: 7 },
 				label: { name: 'swarm:replan' },
 			});
 			expect(parsed).toMatchObject({
-				eventType: 'issues',
+				kind: 'work-item',
 				labelName: 'swarm:replan',
 				workItemBodyChanged: false,
 			});
 		});
 
 		it('extracts the PR number from a check_suite event', () => {
-			const parsed = adapter.parseWebhook('check_suite', {
+			const parsed = parseGitHubWebhook('check_suite', {
 				action: 'completed',
 				repository: repo(),
 				check_suite: { conclusion: 'success', pull_requests: [{ number: 9 }] },
@@ -147,7 +119,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('leaves workItemId undefined for a check_suite with no PRs', () => {
-			const parsed = adapter.parseWebhook('check_suite', {
+			const parsed = parseGitHubWebhook('check_suite', {
 				action: 'completed',
 				repository: repo(),
 				check_suite: { conclusion: 'success', pull_requests: [] },
@@ -156,24 +128,24 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('falls back to "unknown" when the payload has no repository', () => {
-			const parsed = adapter.parseWebhook('pull_request', { pull_request: { number: 1 } });
+			const parsed = parseGitHubWebhook('pull_request', { pull_request: { number: 1 } });
 			expect(parsed?.repoFullName).toBe('unknown');
 		});
 
 		it('parses a pull_request_review event', () => {
-			const parsed = adapter.parseWebhook('pull_request_review', {
+			const parsed = parseGitHubWebhook('pull_request_review', {
 				action: 'submitted',
 				repository: repo(),
 				pull_request: { number: 3 },
 				review: { state: 'changes_requested' },
 				sender: { login: 'swarm-rev' },
 			});
-			expect(parsed?.eventType).toBe('pull_request_review');
+			expect(parsed?.kind).toBe('pull-request-review');
 			expect(parsed?.workItemId).toBe('3');
 		});
 
 		it('enriches a pull_request event with head SHA, branch, draft and fork state', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: {
@@ -192,7 +164,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('extracts the PR author login from a pull_request event', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: {
@@ -206,7 +178,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('extracts merged and base branch fields from a closed pull_request event', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'closed',
 				repository: repo(),
 				pull_request: { number: 42, merged: true, base: { ref: 'main' } },
@@ -215,7 +187,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('leaves prAuthorLogin undefined when the pull_request has no user', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: { number: 42 },
@@ -224,7 +196,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('marks a same-repo pull_request as not cross-repo', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: {
@@ -237,7 +209,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('leaves isCrossRepo undefined when a repo is missing from the payload', () => {
-			const parsed = adapter.parseWebhook('pull_request', {
+			const parsed = parseGitHubWebhook('pull_request', {
 				action: 'opened',
 				repository: repo(),
 				pull_request: {
@@ -251,7 +223,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('enriches a pull_request_review event with state, id, branch and head SHA', () => {
-			const parsed = adapter.parseWebhook('pull_request_review', {
+			const parsed = parseGitHubWebhook('pull_request_review', {
 				action: 'submitted',
 				repository: repo(),
 				pull_request: { number: 3, head: { sha: 'deadbeef', ref: 'issue-3' } },
@@ -259,7 +231,7 @@ describe('GitHubRouterAdapter', () => {
 				sender: { login: 'swarm-rev' },
 			});
 			expect(parsed).toMatchObject({
-				reviewState: 'changes_requested',
+				reviewState: 'changes-requested',
 				reviewId: '987654',
 				prBranch: 'issue-3',
 				headSha: 'deadbeef',
@@ -267,7 +239,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('falls back to the review commit SHA when the pull request head SHA is absent', () => {
-			const parsed = adapter.parseWebhook('pull_request_review', {
+			const parsed = parseGitHubWebhook('pull_request_review', {
 				action: 'submitted',
 				repository: repo(),
 				pull_request: { number: 3, head: { ref: 'issue-3' } },
@@ -282,7 +254,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('leaves the review head SHA undefined when neither SHA source is present', () => {
-			const parsed = adapter.parseWebhook('pull_request_review', {
+			const parsed = parseGitHubWebhook('pull_request_review', {
 				action: 'submitted',
 				repository: repo(),
 				pull_request: { number: 3, head: { ref: 'issue-3' } },
@@ -293,7 +265,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('enriches a check_suite event with head SHA, conclusion, and the PR branch', () => {
-			const parsed = adapter.parseWebhook('check_suite', {
+			const parsed = parseGitHubWebhook('check_suite', {
 				action: 'completed',
 				repository: repo(),
 				check_suite: {
@@ -311,7 +283,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 
 		it('leaves prBranch undefined for a check_suite with no PRs', () => {
-			const parsed = adapter.parseWebhook('check_suite', {
+			const parsed = parseGitHubWebhook('check_suite', {
 				action: 'completed',
 				repository: repo(),
 				check_suite: { conclusion: 'failure', head_sha: 'cafe', pull_requests: [] },
@@ -320,27 +292,7 @@ describe('GitHubRouterAdapter', () => {
 		});
 	});
 
-	describe('resolveProject', () => {
-		it('returns the owning project', async () => {
-			vi.mocked(findProjectByRepo).mockResolvedValue(project);
-			const event = parse('pull_request', {
-				repository: repo(),
-				pull_request: { number: 1 },
-			});
-			expect(await adapter.resolveProject(event)).toBe(project);
-		});
-
-		it('returns null when the repo is untracked', async () => {
-			vi.mocked(findProjectByRepo).mockResolvedValue(undefined);
-			const event = parse('pull_request', {
-				repository: { full_name: 'someone/else' },
-				pull_request: { number: 1 },
-			});
-			expect(await adapter.resolveProject(event)).toBeNull();
-		});
-	});
-
-	describe('isSelfAuthored (loop prevention)', () => {
+	describe('isSwarmGeneratedGitHubEvent (loop prevention)', () => {
 		/** An `issue_comment` webhook carrying `body`, posted by `login`. */
 		function comment(body: string | undefined, login = 'the-operator') {
 			return parse('issue_comment', {
@@ -353,26 +305,24 @@ describe('GitHubRouterAdapter', () => {
 
 		it('drops a comment carrying a hidden SWARM delivery marker', async () => {
 			const event = comment('## 👀 Review\n\n<!-- swarm-delivery:run-42 -->');
-			expect(await adapter.isSelfAuthored(event, project)).toBe(true);
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(true);
 		});
 
 		it('drops a comment carrying a planning-delivery marker', async () => {
 			const event = comment('## 🗺️ Proposed plan\n\n<!-- swarm-planning-delivery:run-42 -->');
-			expect(await adapter.isSelfAuthored(event, project)).toBe(true);
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(true);
 		});
 
 		it('drops a comment carrying the generated-by-SWARM footer', async () => {
 			const event = comment('## ⚠️ SWARM run failed\n\n---\n_Generated by SWARM._');
-			expect(await adapter.isSelfAuthored(event, project)).toBe(true);
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(true);
 		});
 
 		it('drops a marked comment whatever account posted it', async () => {
 			// The federated case the marker exists for: SWARM delivered this through
 			// some *other* operator's account, whose login this process cannot resolve.
 			const event = comment('plan\n\n<!-- swarm-planning-delivery:run-9 -->', 'someone-else');
-			expect(await adapter.isSelfAuthored(event, project)).toBe(true);
-			expect(resolvePersonaIdentities).not.toHaveBeenCalled();
-			expect(isSwarmBot).not.toHaveBeenCalled();
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(true);
 		});
 
 		it('does NOT drop a human comment posted from the login SWARM implements as', async () => {
@@ -380,20 +330,18 @@ describe('GitHubRouterAdapter', () => {
 			// credential is the operator's own token, so an author check swallowed the
 			// operator's genuine review feedback (ADR-004 §2/§3, issues #396/#443).
 			const event = comment('Please also handle the empty-list case.', IDENTITIES.implementer);
-			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
-			expect(resolvePersonaIdentities).not.toHaveBeenCalled();
-			expect(isSwarmBot).not.toHaveBeenCalled();
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(false);
 		});
 
 		it('does NOT drop a human quote-reply quoting a prior SWARM comment', async () => {
 			const quoteReplyBody =
 				'> ## 🗺️ Proposed implementation plan\n> \n> plan\n> \n> ---\n> _Generated by SWARM (Planning phase). Move this item..._\n> <!-- swarm-planning-delivery:run-42 -->\n\nI disagree with step 2.';
 			const event = comment(quoteReplyBody, 'a-human');
-			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(false);
 		});
 
 		it('does not drop a comment event whose body is absent', async () => {
-			expect(await adapter.isSelfAuthored(comment(undefined), project)).toBe(false);
+			expect(await isSwarmGeneratedGitHubEvent(comment(undefined), project)).toBe(false);
 		});
 
 		it.each([
@@ -411,40 +359,94 @@ describe('GitHubRouterAdapter', () => {
 				check_suite: { pull_requests: [{ number: 1 }] },
 				sender: { login: IDENTITIES.reviewer },
 			});
-			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
+			expect(await isSwarmGeneratedGitHubEvent(event, project)).toBe(false);
 		});
 	});
 
-	describe('personaForEvent', () => {
-		it('returns the persona that authored the event', () => {
-			vi.mocked(getPersonaForLogin).mockReturnValue('reviewer');
-			const event = parse('pull_request_review', {
+	describe('neutral vocabulary mapping', () => {
+		it("maps GitHub's `synchronize` action to the neutral `updated`", () => {
+			const parsed = parseGitHubWebhook('pull_request', {
+				action: 'synchronize',
 				repository: repo(),
-				pull_request: { number: 1 },
-				sender: { login: 'swarm-rev' },
+				pull_request: { number: 42 },
 			});
-			expect(adapter.personaForEvent(event, IDENTITIES)).toBe('reviewer');
+			expect(parsed?.action).toBe('updated');
 		});
 
-		it('returns null when there is no actor', () => {
-			const event = parse('check_suite', {
+		it('passes an action SWARM does not act on through verbatim', () => {
+			// It must still normalize and enqueue — the worker completes it as
+			// `no-trigger` — rather than fail the durable envelope's validation.
+			const parsed = parseGitHubWebhook('pull_request', {
+				action: 'review_requested',
 				repository: repo(),
-				check_suite: { pull_requests: [{ number: 1 }] },
+				pull_request: { number: 42 },
 			});
-			expect(adapter.personaForEvent(event, IDENTITIES)).toBeNull();
-			expect(getPersonaForLogin).not.toHaveBeenCalled();
+			expect(parsed?.action).toBe('review_requested');
+		});
+
+		it('passes a review state SWARM does not act on through verbatim', () => {
+			const parsed = parseGitHubWebhook('pull_request_review', {
+				action: 'submitted',
+				repository: repo(),
+				pull_request: { number: 3 },
+				review: { id: 1, state: 'approved' },
+			});
+			expect(parsed?.reviewState).toBe('approved');
 		});
 	});
 
-	describe('dispatchWithPersona', () => {
-		it("runs the handler within the persona's credential scope", async () => {
-			const result = await adapter.dispatchWithPersona(project, 'implementer', async () => 'ran');
-			expect(withPersonaCredentials).toHaveBeenCalledWith(
-				project,
-				'implementer',
-				expect.any(Function),
-			);
-			expect(result).toBe('ran');
+	describe('readGitHubWebhookRequest', () => {
+		it("reads GitHub's event, delivery and signature headers", () => {
+			const headers: Record<string, string> = {
+				'x-github-event': 'pull_request',
+				'x-github-delivery': 'delivery-1',
+				'x-hub-signature-256': 'sha256=abc',
+			};
+			expect(readGitHubWebhookRequest((name) => headers[name])).toEqual({
+				eventName: 'pull_request',
+				deliveryId: 'delivery-1',
+				signature: 'sha256=abc',
+			});
+		});
+
+		it('falls back to an unknown event name and an empty signature', () => {
+			// An unrecognized POST must be acknowledged as an unhandled event type,
+			// not crash the receiver.
+			expect(readGitHubWebhookRequest(() => undefined)).toEqual({
+				eventName: 'unknown',
+				signature: '',
+			});
+		});
+	});
+
+	describe('verifyGitHubSignature', () => {
+		const BODY = '{"action":"opened"}';
+		const SECRET = 'whsec_test';
+		const signature = (body: string, secret: string) =>
+			`sha256=${createHmac('sha256', secret).update(body, 'utf8').digest('hex')}`;
+
+		it('accepts a correctly signed body', () => {
+			expect(verifyGitHubSignature(BODY, signature(BODY, SECRET), SECRET)).toBe(true);
+		});
+
+		it('rejects a signature computed with the wrong secret', () => {
+			expect(verifyGitHubSignature(BODY, signature(BODY, 'wrong'), SECRET)).toBe(false);
+		});
+
+		it('rejects a body that changed after signing', () => {
+			expect(verifyGitHubSignature(`${BODY} `, signature(BODY, SECRET), SECRET)).toBe(false);
+		});
+
+		it('rejects an absent signature', () => {
+			expect(verifyGitHubSignature(BODY, '', SECRET)).toBe(false);
+		});
+
+		it("rejects a signature missing GitHub's `sha256=` prefix", () => {
+			expect(verifyGitHubSignature(BODY, signature(BODY, SECRET).slice(7), SECRET)).toBe(false);
+		});
+
+		it('rejects a signature of the wrong length', () => {
+			expect(verifyGitHubSignature(BODY, 'sha256=deadbeef', SECRET)).toBe(false);
 		});
 	});
 });

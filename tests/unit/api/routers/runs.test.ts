@@ -81,10 +81,10 @@ vi.mock('@/queue/queued-runs.js', () => {
 	const deriveQueuedPhaseHint = vi.fn((job) => {
 		if (job.type === 'github-projects') return 'board';
 		const { event } = job;
-		if (event.eventType === 'pull_request_review') {
+		if (event.kind === 'pull-request-review') {
 			return event.reviewState === 'approved' ? 'review' : 'respond-to-review';
 		}
-		if (event.eventType === 'pull_request' && event.action === 'closed' && event.merged === true) {
+		if (event.kind === 'pull-request' && event.action === 'closed' && event.merged === true) {
 			return 'resolve-conflicts';
 		}
 		return 'unknown';
@@ -210,11 +210,12 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	};
 }
 
-const GITHUB_PAYLOAD: SwarmJob = {
-	type: 'github',
+const SCM_PAYLOAD: SwarmJob = {
+	type: 'scm',
+	providerId: 'github',
 	projectId: 'p1',
 	event: {
-		eventType: 'pull_request',
+		kind: 'pull-request',
 		repoFullName: 'jkwiecien/swarm',
 		isCommentEvent: false,
 	},
@@ -236,7 +237,7 @@ function makeDispatch(overrides: Partial<DispatchRow> = {}): DispatchRow {
 		attempt: 1,
 		wakeSeq: 1,
 		availableAt: new Date('2026-07-10T00:30:00Z'),
-		jobPayload: GITHUB_PAYLOAD,
+		jobPayload: SCM_PAYLOAD,
 		runId: 'run-1',
 		selectedWorkerId: null,
 		workerSessionId: null,
@@ -472,7 +473,7 @@ describe('runsRouter', () => {
 				enqueuedAt: '2026-07-17T10:00:00.000Z',
 				availableAt: '2026-07-17T10:00:00.000Z',
 				reviewGate: {
-					sourceEvent: 'check_suite' as const,
+					sourceEvent: 'checks' as const,
 					sourceAction: 'completed',
 					headSha: 'sha-fix',
 				},
@@ -745,7 +746,7 @@ describe('runsRouter', () => {
 
 		it('creates a fresh dispatch with overrides for a failed run if jobPayload is present', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
-				makeRun({ id: 'run-1', status: 'failed', jobPayload: GITHUB_PAYLOAD }),
+				makeRun({ id: 'run-1', status: 'failed', jobPayload: SCM_PAYLOAD }),
 			);
 			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
 			vi.mocked(createAndPublishDispatch).mockResolvedValue({
@@ -780,7 +781,7 @@ describe('runsRouter', () => {
 
 		it('assigns a new session for a failed retry instead of reusing its old one', async () => {
 			const mockPayload: SwarmJob = {
-				...GITHUB_PAYLOAD,
+				...SCM_PAYLOAD,
 				agentSessionId: '11111111-1111-4111-8111-111111111111',
 				resumeSession: true,
 			};
@@ -853,7 +854,7 @@ describe('runsRouter', () => {
 			// reopen resets the counter. Guard: a deferred run always retries.
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
 			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
-				makeDispatch({ attempt: 6, jobPayload: { ...GITHUB_PAYLOAD, rateLimitRetryAttempt: 6 } }),
+				makeDispatch({ attempt: 6, jobPayload: { ...SCM_PAYLOAD, rateLimitRetryAttempt: 6 } }),
 			);
 			vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(makeDispatch());
 
@@ -867,7 +868,7 @@ describe('runsRouter', () => {
 		});
 
 		it('reconstructs from jobPayload when a deferred run has no active dispatch (legacy orphan)', async () => {
-			const mockPayload: SwarmJob = { ...GITHUB_PAYLOAD, resumeDelivery: true };
+			const mockPayload: SwarmJob = { ...SCM_PAYLOAD, resumeDelivery: true };
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
 				makeRun({ id: 'run-1', status: 'deferred', jobPayload: mockPayload }),
 			);
@@ -913,7 +914,7 @@ describe('runsRouter', () => {
 
 		it('rejects with CONFLICT when a concurrent retry already created the run’s dispatch', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
-				makeRun({ status: 'failed', jobPayload: GITHUB_PAYLOAD }),
+				makeRun({ status: 'failed', jobPayload: SCM_PAYLOAD }),
 			);
 			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
 			vi.mocked(createAndPublishDispatch).mockRejectedValue(
@@ -1253,15 +1254,16 @@ describe('runsRouter', () => {
 			expect(moveWorkItem).toHaveBeenCalledWith(jobData.event.itemNodeId, 'backlog');
 		});
 
-		it('cancels a github dispatch and moves the card found by its url', async () => {
+		it('cancels an scm dispatch and moves the card found by its url', async () => {
 			const project = createMockProjectConfig({ id: 'p1' });
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 
 			const jobData = {
 				projectId: 'p1',
-				type: 'github' as const,
+				type: 'scm' as const,
+				providerId: 'github' as const,
 				event: {
-					eventType: 'pull_request_review' as const,
+					kind: 'pull-request-review' as const,
 					reviewState: 'approved',
 					repoFullName: 'acme/widgets',
 					workItemId: '42',
@@ -1322,9 +1324,10 @@ describe('runsRouter', () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 			const jobData = {
 				projectId: 'p1',
-				type: 'github' as const,
+				type: 'scm' as const,
+				providerId: 'github' as const,
 				event: {
-					eventType: 'pull_request' as const,
+					kind: 'pull-request' as const,
 					action: 'closed',
 					merged: true,
 					repoFullName: 'acme/widgets',
@@ -1345,9 +1348,10 @@ describe('runsRouter', () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 			const jobData = {
 				projectId: 'p1',
-				type: 'github' as const,
+				type: 'scm' as const,
+				providerId: 'github' as const,
 				event: {
-					eventType: 'pull_request_review' as const,
+					kind: 'pull-request-review' as const,
 					reviewState: 'approved',
 					repoFullName: 'acme/widgets',
 					workItemId: '42',

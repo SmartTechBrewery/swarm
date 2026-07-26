@@ -5,8 +5,8 @@
  * (`src/pipeline/respond-to-review.ts`) as a typed operation with a real
  * GitHub/queue-backed default, overridden in tests.
  *
- * The default builds a synthetic `check_suite`-shaped `GitHubParsedEvent` for
- * the new head SHA and enqueues it exactly like a real webhook
+ * The default builds a synthetic `checks`-kind {@link ScmEvent} for the new head
+ * SHA and enqueues it exactly like a real webhook
  * (`src/queue/producer.ts`'s `enqueueJob`), so it re-enters the *same*
  * `pr-review` trigger handler (`src/triggers/handlers/review.ts`) a real
  * completed check suite would: the aggregate-check decision (review / respond-
@@ -25,8 +25,8 @@
 
 import type { ProjectConfig } from '@/config/schema.js';
 import { createAndPublishDispatch, deliveryDedupKey } from '@/dispatch/dispatcher.js';
-import type { GitHubParsedEvent } from '@/router/adapters/github.js';
 import { deliveryIdentity } from '@/scm/delivery.js';
+import type { ScmEvent } from '@/scm/events.js';
 
 export interface FollowUpReviewInput {
 	project: ProjectConfig;
@@ -57,13 +57,16 @@ export function followUpReviewDeliveryId(
 }
 
 /**
- * Production default — enqueues a synthetic `check_suite` `completed` event for
- * the new head SHA, carrying the same PR number/branch/repo data a real GitHub
- * webhook would. `getCheckSuiteStatus` (called inside the `pr-review` handler)
- * queries live Actions-API state for this SHA, so a synthetic dispatch behaves
- * identically to a real one whether or not the new commit's checks have
- * finished yet — an incomplete suite defers to the handler's own bounded
- * recheck rather than anything special-cased here.
+ * Production default — enqueues a synthetic `checks` `completed` event for the new
+ * head SHA, carrying the same PR number/branch/repo data a real webhook would.
+ * `getAggregateCheckStatus` (called inside the `pr-review` handler) queries live
+ * provider state for this SHA, so a synthetic dispatch behaves identically to a
+ * real one whether or not the new commit's checks have finished yet — an
+ * incomplete suite defers to the handler's own bounded recheck rather than
+ * anything special-cased here.
+ *
+ * `providerId` is `github` because that is the only registered SCM provider; a
+ * future multi-provider deployment resolves it from the run's project instead.
  */
 export const scheduleFollowUpReviewDefault: ScheduleFollowUpReview = async ({
 	project,
@@ -71,8 +74,8 @@ export const scheduleFollowUpReviewDefault: ScheduleFollowUpReview = async ({
 	prBranch,
 	headSha,
 }) => {
-	const event: GitHubParsedEvent = {
-		eventType: 'check_suite',
+	const event: ScmEvent = {
+		kind: 'checks',
 		action: 'completed',
 		repoFullName: project.repo,
 		workItemId: prNumber,
@@ -84,7 +87,8 @@ export const scheduleFollowUpReviewDefault: ScheduleFollowUpReview = async ({
 	await createAndPublishDispatch({
 		projectId: project.id,
 		jobPayload: {
-			type: 'github',
+			type: 'scm',
+			providerId: 'github',
 			projectId: project.id,
 			deliveryId,
 			event,

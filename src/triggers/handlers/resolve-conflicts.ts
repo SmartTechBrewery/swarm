@@ -1,24 +1,23 @@
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
-import { isSwarmBot, resolvePersonaIdentities } from '../../integrations/scm/github/personas.js';
-import { GitHubSCMIntegration } from '../../integrations/scm/github/scm-integration.js';
 import { logger } from '../../lib/logger.js';
-import type { GitHubParsedEvent } from '../../router/adapters/github.js';
+import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
-import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
+import type { ScmTriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 const RECHECK_DELAY_MS = 30_000;
 const MAX_RECHECKS = 20;
 
 async function scheduleCandidate(
-	ctx: Extract<TriggerContext, { source: 'github' }>,
+	ctx: ScmTriggerContext,
 	prNumber: string,
 	delay: number,
 ): Promise<void> {
-	const event: GitHubParsedEvent = { ...ctx.event, conflictPrNumber: prNumber };
+	const event: ScmEvent = { ...ctx.event, conflictPrNumber: prNumber };
 	await scheduleCoalescedDispatch(
 		{
-			type: 'github',
+			type: 'scm',
+			providerId: ctx.providerId,
 			projectId: ctx.project.id,
 			event,
 			recheckAttempt: (ctx.recheckAttempt ?? 0) + 1,
@@ -34,14 +33,14 @@ export function createResolveConflictsTrigger(): TriggerHandler {
 		description: 'Resolve genuine conflicts after a pull request advances its base branch',
 		matches(ctx) {
 			return (
-				ctx.source === 'github' &&
-				ctx.event.eventType === 'pull_request' &&
+				ctx.source === 'scm' &&
+				ctx.event.kind === 'pull-request' &&
 				ctx.event.action === 'closed' &&
 				ctx.event.merged === true
 			);
 		},
 		async handle(ctx): Promise<TriggerResult | null> {
-			if (ctx.source !== 'github' || !ctx.event.baseBranch) return null;
+			if (ctx.source !== 'scm' || !ctx.event.baseBranch) return null;
 			const ours = await listSwarmCandidates(ctx);
 
 			if (!ctx.event.conflictPrNumber) {
@@ -83,10 +82,7 @@ export function createResolveConflictsTrigger(): TriggerHandler {
 	};
 }
 
-async function deferUnknownMergeability(
-	ctx: Extract<TriggerContext, { source: 'github' }>,
-	prNumber: number,
-): Promise<void> {
+async function deferUnknownMergeability(ctx: ScmTriggerContext, prNumber: number): Promise<void> {
 	if ((ctx.recheckAttempt ?? 0) < MAX_RECHECKS) {
 		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS);
 		return;
@@ -98,14 +94,14 @@ async function deferUnknownMergeability(
 }
 
 async function scmCommentUnknownMergeability(
-	ctx: Extract<TriggerContext, { source: 'github' }>,
+	ctx: ScmTriggerContext,
 	prNumber: number,
 ): Promise<void> {
 	try {
-		await new GitHubSCMIntegration().commentOnPullRequest(
+		await ctx.scm.commentOnPullRequest(
 			ctx.project,
 			prNumber,
-			`## ⚠️ SWARM conflict check needs attention\n\nGitHub did not produce a mergeability result after repeated checks. No branch changes were made. Please inspect this PR manually and retry after GitHub reports its mergeability.\n\n---\n${SWARM_GENERATED_FOOTER}`,
+			`## ⚠️ SWARM conflict check needs attention\n\nThe source-control provider did not produce a mergeability result after repeated checks. No branch changes were made. Please inspect this PR manually and retry after the provider reports its mergeability.\n\n---\n${SWARM_GENERATED_FOOTER}`,
 		);
 	} catch (error) {
 		logger.error('resolve-conflicts: failed to post terminal mergeability comment', {
@@ -115,11 +111,13 @@ async function scmCommentUnknownMergeability(
 	}
 }
 
-async function listSwarmCandidates(ctx: Extract<TriggerContext, { source: 'github' }>) {
-	const candidates = await new GitHubSCMIntegration().listConflictCandidates(
+async function listSwarmCandidates(ctx: ScmTriggerContext) {
+	const candidates = await ctx.scm.listConflictCandidates(
 		ctx.project,
 		ctx.event.baseBranch ?? ctx.project.baseBranch,
 	);
-	const identities = await resolvePersonaIdentities(ctx.project);
-	return candidates.filter((pr) => pr.authorLogin && isSwarmBot(pr.authorLogin, identities));
+	const identities = await ctx.scm.resolvePersonaIdentities(ctx.project);
+	return candidates.filter(
+		(pr) => pr.authorLogin && ctx.scm.isSwarmActor(pr.authorLogin, identities),
+	);
 }

@@ -1,6 +1,6 @@
 /**
  * "Did SWARM write this?" — the provider-neutral origin test behind comment loop
- * prevention (`GitHubRouterAdapter.isSelfAuthored`, issue #443).
+ * prevention (`SCMProvider.isSwarmGeneratedEvent`, issue #443).
  *
  * **Why not the comment's author.** SWARM used to answer this by matching the
  * comment's author against its own persona logins (`isSwarmBot`). Under the

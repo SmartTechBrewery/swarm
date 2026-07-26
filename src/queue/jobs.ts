@@ -5,20 +5,23 @@
  * The router's producer (SWARM-35, at the `src/router/enqueue.ts` seam) turns an
  * authenticated, project-matched webhook event into one of these jobs; the
  * worker's consumer (`src/worker/consumer.ts`) validates it back through this
- * schema before acting. A job carries the already-parsed event — not the raw
+ * schema before acting. A job carries the already-normalized event — not the raw
  * webhook body — so the worker never re-does the router's parsing, plus the
  * project id (config is re-read from Postgres on the worker side, never
- * serialized into the job) and GitHub's delivery id for idempotency/tracing.
+ * serialized into the job) and the provider's delivery id for idempotency/tracing.
  *
- * The `type` discriminator matches the producing router adapter's `type` const
- * (`github` / `github-projects`).
+ * The `type` discriminator names the *category* of work, not a provider: one
+ * `scm` variant covers every SCM provider (which one produced it is the
+ * `providerId` field, resolved through `scmProviderRegistry`), so adding a
+ * provider never edits this file (ai/RULES.md §2). `github-projects` stays the PM
+ * board's own variant until the PM ingress gets the same treatment.
  */
 
 import { z } from 'zod';
 import { AgentCliSchema } from '../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../harness/models.js';
-import { GitHubParsedEventSchema } from '../router/adapters/github.js';
 import { GitHubProjectsParsedEventSchema } from '../router/adapters/github-projects.js';
+import { ScmEventSchema, ScmProviderIdSchema } from '../scm/events.js';
 
 /** The single BullMQ queue the router produces onto and the worker consumes. */
 export const QUEUE_NAME = 'swarm-jobs';
@@ -26,7 +29,7 @@ export const QUEUE_NAME = 'swarm-jobs';
 const jobBase = z.object({
 	/** The SWARM project (`ProjectConfig.id`) the event was matched to. */
 	projectId: z.string().min(1),
-	/** GitHub's `X-GitHub-Delivery` header — stable per webhook delivery. */
+	/** The provider's per-delivery id — stable per webhook delivery. */
 	deliveryId: z.string().min(1).optional(),
 	/**
 	 * How many times this job has already been re-enqueued as a deferred
@@ -150,10 +153,16 @@ const jobBase = z.object({
 	dispatchId: z.string().uuid().optional(),
 });
 
-/** An SCM webhook event (`pull_request`, `issue_comment`, …) bound for the worker. */
-export const GitHubWebhookJobSchema = jobBase.extend({
-	type: z.literal('github'),
-	event: GitHubParsedEventSchema,
+/** A normalized SCM webhook event (a pull request, a review, checks, …) bound for the worker. */
+export const ScmWebhookJobSchema = jobBase.extend({
+	type: z.literal('scm'),
+	/**
+	 * Which registered SCM provider produced (and therefore owns) this event — the
+	 * key the worker resolves through `scmProviderRegistry` to get the
+	 * `SCMProvider` it injects into the trigger context.
+	 */
+	providerId: ScmProviderIdSchema,
+	event: ScmEventSchema,
 });
 
 /** A `projects_v2_item` board event (Status change / card added) bound for the worker. */
@@ -184,13 +193,46 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	approvedHeadSha: z.string().min(1),
 });
 
-export const SwarmJobSchema = z.discriminatedUnion('type', [
-	GitHubWebhookJobSchema,
+const swarmJobVariants = z.discriminatedUnion('type', [
+	ScmWebhookJobSchema,
 	GitHubProjectsWebhookJobSchema,
 	MergeAutomationJobSchema,
 ]);
 
-export type GitHubWebhookJob = z.infer<typeof GitHubWebhookJobSchema>;
+/**
+ * Upgrade the pre-#385 SCM envelope, when the discriminator *was* the provider id
+ * (`type: 'github'`). Durable dispatch rows and historical `runs.jobPayload`
+ * snapshots still carry it — a dependency recheck can wait days, and a "Retry now"
+ * re-parses a run's stored payload indefinitely — so a deploy must read them
+ * rather than fail their in-flight work. The event inside upgrades in
+ * {@link ScmEventSchema}'s own preprocess.
+ *
+ * Frozen: this is the queue's serialization history, not provider logic. A second
+ * provider is written by ingress as `{ type: 'scm', providerId }` from day one.
+ */
+function upgradeLegacyJobEnvelope(value: unknown): unknown {
+	if (typeof value !== 'object' || value === null) return value;
+	const raw = value as Record<string, unknown>;
+	if (raw.type !== 'github') return value;
+	return { ...raw, type: 'scm', providerId: 'github' };
+}
+
+export const SwarmJobSchema = z.preprocess(upgradeLegacyJobEnvelope, swarmJobVariants);
+
+export type ScmWebhookJob = z.infer<typeof ScmWebhookJobSchema>;
 export type GitHubProjectsWebhookJob = z.infer<typeof GitHubProjectsWebhookJobSchema>;
 export type MergeAutomationJob = z.infer<typeof MergeAutomationJobSchema>;
-export type SwarmJob = z.infer<typeof SwarmJobSchema>;
+export type SwarmJob = z.infer<typeof swarmJobVariants>;
+
+/**
+ * Normalize a payload read straight out of Postgres, where `jobPayload` is a
+ * `jsonb` column typed (not validated) as {@link SwarmJob} — so a row written
+ * before #385 is *typed* current while still carrying the legacy envelope. Read
+ * models must funnel through this before switching on `type`/`kind`; a payload
+ * that no longer validates at all is returned untouched, exactly as an unvalidated
+ * cast behaved before.
+ */
+export function normalizeStoredJobPayload(payload: SwarmJob): SwarmJob {
+	const parsed = SwarmJobSchema.safeParse(payload);
+	return parsed.success ? parsed.data : payload;
+}

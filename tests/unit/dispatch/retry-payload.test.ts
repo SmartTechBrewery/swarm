@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '@/dispatch/retry-payload.js';
 import {
 	createMockGitHubProjectsWebhookJob,
-	createMockGitHubWebhookJob,
+	createMockScmWebhookJob,
 } from '../../helpers/factories.js';
 
 // The payload derivation previously lived inside the fire-and-forget re-enqueue
@@ -10,7 +10,7 @@ import {
 // worker persists the derived intent on the dispatch record at settle time.
 describe('deriveRetryJobPayload', () => {
 	it('consumes one retry attempt and carries the run row forward', () => {
-		const next = deriveRetryJobPayload(createMockGitHubWebhookJob({ rateLimitRetryAttempt: 1 }), {
+		const next = deriveRetryJobPayload(createMockScmWebhookJob({ rateLimitRetryAttempt: 1 }), {
 			phase: 'review',
 			runId: 'run-1',
 			resumable: false,
@@ -88,7 +88,7 @@ describe('deriveRetryJobPayload', () => {
 	});
 
 	it('retries delivery with its own worktree-resume signal, not an agent session', () => {
-		const next = deriveRetryJobPayload(createMockGitHubWebhookJob(), {
+		const next = deriveRetryJobPayload(createMockScmWebhookJob(), {
 			phase: 'review',
 			runId: 'run-1',
 			resumable: false,
@@ -117,7 +117,7 @@ describe('deriveRetryJobPayload', () => {
 	});
 
 	it('threads the held dispatch dedup claim onto the retry', () => {
-		const next = deriveRetryJobPayload(createMockGitHubWebhookJob(), {
+		const next = deriveRetryJobPayload(createMockScmWebhookJob(), {
 			phase: 'review',
 			resumable: false,
 			continuationDispatchClaimed: true,
@@ -130,7 +130,7 @@ describe('deriveRetryJobPayload', () => {
 describe('deriveCapacityPendingPayload', () => {
 	it('does not consume a retry attempt while waiting for a slot', () => {
 		const pending = deriveCapacityPendingPayload(
-			createMockGitHubWebhookJob({ rateLimitRetryAttempt: 3 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 3 }),
 			{ phase: 'review', runId: 'run-1', resumable: false },
 		);
 
@@ -149,7 +149,7 @@ describe('deriveCapacityPendingPayload', () => {
 	});
 
 	it('keeps the held dedup claim for a blocked SCM continuation', () => {
-		const pending = deriveCapacityPendingPayload(createMockGitHubWebhookJob(), {
+		const pending = deriveCapacityPendingPayload(createMockScmWebhookJob(), {
 			phase: 'review',
 			resumable: false,
 			continuationDispatchClaimed: true,

@@ -43,7 +43,7 @@ const TRIGGERING_ACTIONS = new Set(['edited', 'created', 'reordered']);
  * A raw `projects_v2_item` webhook parsed into the fields the router needs. A
  * Zod schema (not a hand-written interface) because the parsed event rides
  * inside a queue job across the router→Redis→worker boundary
- * (`src/queue/jobs.ts`) — same rationale as `GitHubParsedEventSchema`.
+ * (`src/queue/jobs.ts`) — same rationale as the SCM side's `ScmEventSchema`.
  */
 export const GitHubProjectsParsedEventSchema = z.object({
 	eventType: z.literal(PROJECTS_V2_ITEM_EVENT),

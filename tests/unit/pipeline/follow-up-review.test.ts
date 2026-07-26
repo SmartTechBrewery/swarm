@@ -46,7 +46,7 @@ describe('followUpReviewDeliveryId', () => {
 });
 
 describe('scheduleFollowUpReviewDefault', () => {
-	it('enqueues a synthetic check_suite completed event carrying the new head, keyed by a deterministic delivery id', async () => {
+	it('enqueues a synthetic checks-completed event carrying the new head, keyed by a deterministic delivery id', async () => {
 		enqueueJob.mockClear();
 
 		await scheduleFollowUpReviewDefault({
@@ -61,11 +61,12 @@ describe('scheduleFollowUpReviewDefault', () => {
 			source: 'synthetic',
 			dedupKey: `delivery:${followUpReviewDeliveryId(PROJECT, '42', 'newsha123')}`,
 			jobPayload: {
-				type: 'github',
+				type: 'scm',
+				providerId: 'github',
 				projectId: PROJECT.id,
 				deliveryId: followUpReviewDeliveryId(PROJECT, '42', 'newsha123'),
 				event: {
-					eventType: 'check_suite',
+					kind: 'checks',
 					action: 'completed',
 					repoFullName: PROJECT.repo,
 					workItemId: '42',
@@ -93,7 +94,7 @@ describe('scheduleFollowUpReviewDefault', () => {
 	it('carries no check-run data of its own — a no-CI project relies entirely on the pr-review handler policy', async () => {
 		// This module only ever builds and dedups the delivery; whether a fixed
 		// response on a PR with zero checks reaches Review is decided by
-		// `decideCheckSuiteOutcome`'s `pipeline.review.checks` policy once the
+		// `decideAggregateCheckOutcome`'s `pipeline.review.checks` policy once the
 		// `pr-review` handler re-queries live check state for this event
 		// (see `tests/unit/triggers/handlers/review.test.ts`'s "if-present" cases,
 		// issue #274) — never by anything encoded on this synthetic event.
@@ -111,9 +112,9 @@ describe('scheduleFollowUpReviewDefault', () => {
 		expect(Object.keys(job.event).sort()).toEqual(
 			[
 				'action',
-				'eventType',
 				'headSha',
 				'isCommentEvent',
+				'kind',
 				'prBranch',
 				'repoFullName',
 				'workItemId',

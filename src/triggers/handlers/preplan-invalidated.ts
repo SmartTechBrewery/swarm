@@ -14,17 +14,17 @@ import {
 	SPLIT_CHILD_LABEL,
 } from '../../pipeline/preplan.js';
 import type { PMProvider, WorkItem } from '../../pm/types.js';
-import type { GitHubParsedEvent } from '../../router/adapters/github.js';
+import type { ScmEvent } from '../../scm/events.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
-function isInvalidationEvent(event: GitHubParsedEvent): boolean {
-	if (event.eventType !== 'issues') return false;
+function isInvalidationEvent(event: ScmEvent): boolean {
+	if (event.kind !== 'work-item') return false;
 	if (event.action === 'edited') return event.workItemBodyChanged === true;
 	if (event.action === 'labeled') return event.labelName === REPLAN_LABEL;
 	return event.action === 'unlabeled' && event.labelName === SPLIT_CHILD_LABEL;
 }
 
-function shouldReplan(workItem: WorkItem, event: GitHubParsedEvent): boolean {
+function shouldReplan(workItem: WorkItem, event: ScmEvent): boolean {
 	const isSplitChild = workItem.labels.some((label) => label.name === SPLIT_CHILD_LABEL);
 	const preplan = evaluatePreplan(workItem);
 	if (isSplitChild && isPreplanSkip(preplan)) return false;
@@ -50,11 +50,11 @@ export function createPreplanInvalidatedTrigger(
 		description: 'Restarts Planning when a preplanned child is explicitly invalidated',
 
 		matches(ctx: TriggerContext): boolean {
-			return ctx.source === 'github' && isInvalidationEvent(ctx.event);
+			return ctx.source === 'scm' && isInvalidationEvent(ctx.event);
 		},
 
 		async handle(ctx: TriggerContext): Promise<TriggerResult | null> {
-			if (ctx.source !== 'github' || !isInvalidationEvent(ctx.event)) return null;
+			if (ctx.source !== 'scm' || !isInvalidationEvent(ctx.event)) return null;
 			const { event, project } = ctx;
 			if (!event.workItemId || !event.workItemUrl) return null;
 

@@ -2,19 +2,21 @@ import { createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ProjectConfig } from '@/config/schema.js';
+import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import { logger } from '@/lib/logger.js';
-import type { GitHubParsedEvent, GitHubRouterAdapter } from '@/router/adapters/github.js';
 import type {
 	GitHubProjectsParsedEvent,
 	GitHubProjectsRouterAdapter,
 } from '@/router/adapters/github-projects.js';
 import { createWebhookApp, type WebhookReceiverDeps } from '@/router/webhook-receiver.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import type { ScmEvent } from '@/scm/events.js';
+import type { SCMProvider } from '@/scm/types.js';
+import { createFakeScmProvider, createMockProjectConfig } from '../../helpers/factories.js';
 
 const project = createMockProjectConfig({ id: 'proj-1', repo: 'jkwiecien/swarm' });
 
-const prEvent: GitHubParsedEvent = {
-	eventType: 'pull_request',
+const prEvent: ScmEvent = {
+	kind: 'pull-request',
 	action: 'opened',
 	repoFullName: 'jkwiecien/swarm',
 	workItemId: '1',
@@ -23,29 +25,52 @@ const prEvent: GitHubParsedEvent = {
 };
 
 /**
+ * A registered SCM manifest whose provider is a typed fake — the receiver mounts
+ * routes and delegates every provider-specific decision through this, so a test
+ * substitutes one manifest instead of the four collaborators it replaced.
+ */
+function fakeManifest(overrides: Partial<SCMProvider> = {}): SCMProviderManifest {
+	return {
+		id: 'github',
+		label: 'GitHub',
+		category: 'scm',
+		webhookRoute: '/github/webhook',
+		provider: createFakeScmProvider({
+			readWebhookRequest: (header) => ({
+				eventName: header('x-github-event') ?? 'unknown',
+				...(header('x-github-delivery') ? { deliveryId: header('x-github-delivery') } : {}),
+				signature: header('x-hub-signature-256') ?? '',
+			}),
+			parseWebhookEvent: () => prEvent,
+			isSwarmGeneratedEvent: async () => false,
+			verifyWebhookSignature: () => true,
+			...overrides,
+		}),
+	};
+}
+
+/**
  * Build an app with fully-faked collaborators. Defaults describe the happy path
  * (event parses, repo is tracked, secret exists, signature valid, not
- * self-authored); each test overrides only the stage it exercises.
+ * SWARM-generated); each test overrides only the stage it exercises.
  */
-function makeApp(overrides: Partial<WebhookReceiverDeps> = {}) {
+function makeApp(
+	overrides: Partial<WebhookReceiverDeps> = {},
+	providerOverrides: Partial<SCMProvider> = {},
+) {
 	const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
-	const adapter = {
-		parseWebhook: vi.fn().mockReturnValue(prEvent),
-		isSelfAuthored: vi.fn().mockResolvedValue(false),
-	} as unknown as GitHubRouterAdapter;
 
 	const deps: Partial<WebhookReceiverDeps> = {
-		adapter,
+		scmProviders: [fakeManifest(providerOverrides)],
 		findProject: vi
 			.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
 			.mockResolvedValue(project),
 		getWebhookSecret: vi.fn<WebhookReceiverDeps['getWebhookSecret']>().mockResolvedValue('whsec'),
-		verifySignature: vi.fn<WebhookReceiverDeps['verifySignature']>().mockReturnValue(true),
 		enqueue,
 		...overrides,
 	};
 
-	return { app: createWebhookApp(deps), deps, enqueue, adapter };
+	return { app: createWebhookApp(deps), deps, enqueue };
 }
 
 /** Fire a POST at the webhook endpoint with sensible default headers. */
@@ -80,7 +105,7 @@ describe('createWebhookApp', () => {
 			expect(await res.json()).toEqual({ status: 'ok', service: 'router' });
 		});
 
-		it('answers the GitHub GET ping on the webhook path', async () => {
+		it("answers the provider's GET ping on its registered webhook path", async () => {
 			const { app } = makeApp();
 			const res = await app.request('/github/webhook');
 			expect(res.status).toBe(200);
@@ -93,7 +118,7 @@ describe('createWebhookApp', () => {
 			const res = await post(app, VALID_BODY);
 			expect(res.status).toBe(202);
 			expect(await res.json()).toEqual({ ok: true, accepted: true });
-			expect(enqueue).toHaveBeenCalledWith(prEvent, project, 'delivery-1');
+			expect(enqueue).toHaveBeenCalledWith('github', prEvent, project, 'delivery-1');
 		});
 
 		it('rejects a malformed JSON body with 400', async () => {
@@ -104,11 +129,7 @@ describe('createWebhookApp', () => {
 		});
 
 		it('acknowledges but ignores an unhandled event type', async () => {
-			const adapter = {
-				parseWebhook: vi.fn().mockReturnValue(null),
-				isSelfAuthored: vi.fn(),
-			} as unknown as GitHubRouterAdapter;
-			const { app, enqueue } = makeApp({ adapter });
+			const { app, enqueue } = makeApp({}, { parseWebhookEvent: () => null });
 			const res = await post(app, VALID_BODY, { 'x-github-event': 'star' });
 			expect(res.status).toBe(202);
 			expect((await res.json()).ignored).toBe(true);
@@ -138,33 +159,31 @@ describe('createWebhookApp', () => {
 			expect(enqueue).not.toHaveBeenCalled();
 		});
 
-		it('rejects with 401 when the signature does not verify', async () => {
-			const { app, enqueue } = makeApp({
-				verifySignature: vi.fn<WebhookReceiverDeps['verifySignature']>().mockReturnValue(false),
-			});
+		it("rejects with 401 when the provider's signature check fails", async () => {
+			const { app, enqueue } = makeApp({}, { verifyWebhookSignature: () => false });
 			const res = await post(app, VALID_BODY);
 			expect(res.status).toBe(401);
 			expect(enqueue).not.toHaveBeenCalled();
 		});
 
-		it('passes the raw body (not a re-serialized copy) to signature verification', async () => {
+		it("passes the raw body (not a re-serialized copy) to the provider's verifier", async () => {
 			// A body with unusual spacing would not survive a JSON round-trip; assert
 			// the exact received bytes reach the verifier.
 			const raw = '{"action":"opened",   "number":1}';
-			const verifySignature = vi.fn<WebhookReceiverDeps['verifySignature']>().mockReturnValue(true);
-			const { app } = makeApp({ verifySignature });
+			const verifyWebhookSignature = vi.fn().mockReturnValue(true);
+			const { app } = makeApp({}, { verifyWebhookSignature });
 			await post(app, raw);
-			expect(verifySignature).toHaveBeenCalledWith(raw, 'sha256=abc', 'whsec');
+			expect(verifyWebhookSignature).toHaveBeenCalledWith(raw, 'sha256=abc', 'whsec');
 		});
 
-		it('drops a self-authored comment event (loop prevention) without enqueueing', async () => {
-			const adapter = {
-				parseWebhook: vi
-					.fn()
-					.mockReturnValue({ ...prEvent, isCommentEvent: true, actorLogin: 'swarm-bot' }),
-				isSelfAuthored: vi.fn().mockResolvedValue(true),
-			} as unknown as GitHubRouterAdapter;
-			const { app, enqueue } = makeApp({ adapter });
+		it('drops a SWARM-generated comment event (loop prevention) without enqueueing', async () => {
+			const { app, enqueue } = makeApp(
+				{},
+				{
+					parseWebhookEvent: () => ({ ...prEvent, isCommentEvent: true, actorLogin: 'swarm-bot' }),
+					isSwarmGeneratedEvent: async () => true,
+				},
+			);
 			const res = await post(app, VALID_BODY, { 'x-github-event': 'issue_comment' });
 			expect(res.status).toBe(202);
 			expect((await res.json()).ignored).toBe(true);
@@ -184,7 +203,7 @@ describe('createWebhookApp', () => {
 				body: VALID_BODY,
 			});
 			expect(res.status).toBe(202);
-			expect(enqueue).toHaveBeenCalledWith(prEvent, project, undefined);
+			expect(enqueue).toHaveBeenCalledWith('github', prEvent, project, undefined);
 		});
 
 		it('logs and returns 500 when a collaborator throws', async () => {
@@ -225,6 +244,7 @@ describe('createWebhookApp', () => {
 			} as unknown as GitHubProjectsRouterAdapter;
 
 			const app = createWebhookApp({
+				scmProviders: [fakeManifest()],
 				pmAdapter,
 				findProjectByBoard: vi
 					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
@@ -232,7 +252,6 @@ describe('createWebhookApp', () => {
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
 					.mockResolvedValue('whsec'),
-				verifySignature: vi.fn<WebhookReceiverDeps['verifySignature']>().mockReturnValue(true),
 				enqueueProjects,
 				...overrides,
 			});
@@ -303,9 +322,9 @@ describe('createWebhookApp', () => {
 			expect(enqueueProjects).not.toHaveBeenCalled();
 		});
 
-		it('rejects with 401 when the signature does not verify', async () => {
+		it("rejects with 401 when the provider's signature check fails", async () => {
 			const { app, enqueueProjects } = makePmApp({
-				verifySignature: vi.fn<WebhookReceiverDeps['verifySignature']>().mockReturnValue(false),
+				scmProviders: [fakeManifest({ verifyWebhookSignature: () => false })],
 			});
 			const res = await postPm(app);
 			expect(res.status).toBe(401);
@@ -339,21 +358,24 @@ describe('createWebhookApp', () => {
 		});
 	});
 
-	// The receiver tests above inject a fake `verifySignature`; these exercise the
-	// real `verifyGitHubSignature` wired by `defaultDeps()`, so a regression that
-	// points the default at the wrong function is caught.
-	describe('real signature verification (defaultDeps wiring)', () => {
+	// The tests above inject a fake provider; these exercise the *real* registered
+	// GitHub manifest that `defaultDeps()` resolves from `scmProviderRegistry` —
+	// its route, its header names, its signature scheme, and its parser — so a
+	// regression in that wiring (a wrong route, a renamed header, the wrong
+	// verifier) is caught end to end.
+	describe('real registered GitHub provider (defaultDeps wiring)', () => {
 		const secret = 'topsecret';
+		const signedBody = JSON.stringify({
+			action: 'opened',
+			repository: { full_name: 'jkwiecien/swarm' },
+			pull_request: { number: 1, head: { sha: 'abc', ref: 'issue-1' } },
+			sender: { login: 'human-dev' },
+		});
 
-		function realVerifierApp() {
+		function realProviderApp() {
 			const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
-			const adapter = {
-				parseWebhook: vi.fn().mockReturnValue(prEvent),
-				isSelfAuthored: vi.fn().mockResolvedValue(false),
-			} as unknown as GitHubRouterAdapter;
-			// Fake only the secret + repo lookups; leave verifySignature to the default.
+			// Fake only the secret + repo lookups; leave the provider to the registry.
 			const app = createWebhookApp({
-				adapter,
 				findProject: vi
 					.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
 					.mockResolvedValue(project),
@@ -365,18 +387,28 @@ describe('createWebhookApp', () => {
 			return { app, enqueue };
 		}
 
+		it("serves the registered manifest's `/github/webhook` route", async () => {
+			const { app } = realProviderApp();
+			expect((await app.request('/github/webhook')).status).toBe(200);
+		});
+
 		it('accepts a body signed with the genuine HMAC-SHA256 signature', async () => {
-			const { app, enqueue } = realVerifierApp();
-			const signature = `sha256=${createHmac('sha256', secret).update(VALID_BODY, 'utf8').digest('hex')}`;
-			const res = await post(app, VALID_BODY, { 'x-hub-signature-256': signature });
+			const { app, enqueue } = realProviderApp();
+			const signature = `sha256=${createHmac('sha256', secret).update(signedBody, 'utf8').digest('hex')}`;
+			const res = await post(app, signedBody, { 'x-hub-signature-256': signature });
 			expect(res.status).toBe(202);
-			expect(enqueue).toHaveBeenCalledWith(prEvent, project, 'delivery-1');
+			expect(enqueue).toHaveBeenCalledWith(
+				'github',
+				expect.objectContaining({ kind: 'pull-request', action: 'opened', workItemId: '1' }),
+				project,
+				'delivery-1',
+			);
 		});
 
 		it('rejects a body whose real signature does not match with 401', async () => {
-			const { app, enqueue } = realVerifierApp();
-			const signature = `sha256=${createHmac('sha256', 'wrong-secret').update(VALID_BODY, 'utf8').digest('hex')}`;
-			const res = await post(app, VALID_BODY, { 'x-hub-signature-256': signature });
+			const { app, enqueue } = realProviderApp();
+			const signature = `sha256=${createHmac('sha256', 'wrong-secret').update(signedBody, 'utf8').digest('hex')}`;
+			const res = await post(app, signedBody, { 'x-hub-signature-256': signature });
 			expect(res.status).toBe(401);
 			expect(enqueue).not.toHaveBeenCalled();
 		});

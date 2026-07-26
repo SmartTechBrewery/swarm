@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import { createMockScmTriggerContext, createMockWorkItem } from '../../helpers/factories.js';
 
 const { listWorkItems } = vi.hoisted(() => ({ listWorkItems: vi.fn() }));
 vi.mock('@/integrations/pm/github-projects/provider.js', () => ({
@@ -11,7 +11,7 @@ vi.mock('@/integrations/pm/github-projects/provider.js', () => ({
 	}),
 }));
 
-import { GitHubRouterAdapter } from '@/router/adapters/github.js';
+import { parseGitHubWebhook } from '@/integrations/scm/github/webhook.js';
 import { registerBuiltInTriggers } from '@/triggers/builtins.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 
@@ -33,7 +33,7 @@ describe('raw issues webhook → preplan invalidation trigger', () => {
 			],
 		});
 		listWorkItems.mockResolvedValue([workItem]);
-		const parsed = new GitHubRouterAdapter().parseWebhook('issues', {
+		const parsed = parseGitHubWebhook('issues', {
 			action: 'labeled',
 			repository: { full_name: 'jkwiecien/swarm' },
 			issue: {
@@ -47,11 +47,7 @@ describe('raw issues webhook → preplan invalidation trigger', () => {
 
 		const registry = createTriggerRegistry();
 		registerBuiltInTriggers(registry);
-		const result = await registry.dispatch({
-			project: createMockProjectConfig(),
-			source: 'github',
-			event: parsed,
-		});
+		const result = await registry.dispatch(createMockScmTriggerContext({ event: parsed }));
 
 		expect(listWorkItems).toHaveBeenCalledWith({ status: 'planning' });
 		expect(result).toEqual({ phase: 'planning', taskId: '339', workItem });

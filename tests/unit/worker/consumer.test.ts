@@ -14,10 +14,10 @@ import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import {
-	createMockGitHubParsedEvent,
 	createMockGitHubProjectsWebhookJob,
-	createMockGitHubWebhookJob,
 	createMockProjectConfig,
+	createMockScmEvent,
+	createMockScmWebhookJob,
 	createMockWorkItem,
 } from '../../helpers/factories.js';
 
@@ -290,8 +290,12 @@ vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
 
 // The PR-comment path of `reportInterruptedJobToBoard` goes through the concrete
 // SCM integration (the PM provider has no PR → comment mapping); mock it at the
-// module boundary the same way the PM provider is mocked above.
-const commentOnPullRequest = vi.fn(async (_p: ProjectConfig, _n: number, _b: string) => 99);
+// module boundary the same way the PM provider is mocked above. Hoisted, because
+// the consumer's provider-registry side-effect import constructs this class at
+// module load (issue #385) — before a plain `const` would be initialized.
+const { commentOnPullRequest } = vi.hoisted(() => ({
+	commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 99),
+}));
 vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
 	GitHubSCMIntegration: class {
 		commentOnPullRequest = commentOnPullRequest;
@@ -573,10 +577,7 @@ describe('processJob', () => {
 	});
 
 	it('runs under the project limit and releases the slot on success', async () => {
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-succeeded');
 		expect(acquireProjectSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.maxConcurrentJobs);
@@ -587,10 +588,7 @@ describe('processJob', () => {
 	it('defers at the project limit without running or releasing an unacquired slot', async () => {
 		acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome).toMatchObject({
 			status: 'phase-deferred',
@@ -603,7 +601,7 @@ describe('processJob', () => {
 		expect(phaseCalls).toEqual([]);
 		expect(releaseProjectSlot).not.toHaveBeenCalled();
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 		expect(phaseCalls).toHaveLength(1);
 	});
 
@@ -630,7 +628,7 @@ describe('processJob', () => {
 		acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
 		const outcome = await processJob(
-			createMockGitHubWebhookJob({ rateLimitRetryAttempt: 6 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -646,7 +644,7 @@ describe('processJob', () => {
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -679,7 +677,7 @@ describe('processJob', () => {
 		] as const)('retains a concurrency-blocked %s phase as an observable pending continuation', async (_label, trigger) => {
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
-			const outcome = await processJob(createMockGitHubWebhookJob(), registryReturning(trigger));
+			const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
 
 			expect(outcome).toMatchObject({
 				status: 'phase-deferred',
@@ -695,7 +693,7 @@ describe('processJob', () => {
 
 		it('refreshes the Respond-to-CI PR+SHA claim without refreshing Respond-to-review', async () => {
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
-			await processJob(createMockGitHubWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
 
 			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(
 				`${PROJECT.repo}:17:deadbeef`,
@@ -704,7 +702,7 @@ describe('processJob', () => {
 
 			refreshReviewDispatchClaim.mockClear();
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
-			await processJob(createMockGitHubWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
 
 			// The dispatch claim stays held even without priority so immediate
 			// slot-release dispatch cannot be deduplicated as a fresh webhook.
@@ -713,7 +711,7 @@ describe('processJob', () => {
 		it('refreshes the Resolve-conflicts head/base claim while pending', async () => {
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
 
 			expect(refreshConflictResolutionClaim).toHaveBeenCalledWith(
 				`${PROJECT.repo}:17:deadbeef:cafebabe`,
@@ -726,7 +724,7 @@ describe('processJob', () => {
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
 
@@ -757,7 +755,7 @@ describe('processJob', () => {
 
 		it('wakes the next capacity-blocked dispatch when a slot frees on success', async () => {
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -770,7 +768,7 @@ describe('processJob', () => {
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob({ runId: undefined }),
+				createMockScmWebhookJob({ runId: undefined }),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -801,7 +799,7 @@ describe('processJob', () => {
 				createMockProjectConfig({ pipeline: { prioritizeContinuations: false } });
 			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
 
-			const outcome = await processJob(createMockGitHubWebhookJob(), registryReturning(trigger));
+			const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
 
 			expect(outcome).toMatchObject({
 				status: 'phase-deferred',
@@ -818,17 +816,17 @@ describe('processJob', () => {
 			projectLookup = () =>
 				createMockProjectConfig({ pipeline: { prioritizeContinuations: false } });
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(releaseProjectSlot).toHaveBeenCalledOnce();
 			expect(promoteNextCapacityDispatch).toHaveBeenCalledWith(PROJECT.id, false);
 		});
 
 		it('finalizes the run row and releases the claim if a pending continuation re-resolves to no-trigger', async () => {
-			const job = createMockGitHubWebhookJob({
+			const job = createMockScmWebhookJob({
 				runId: 'run-123',
 				continuationDispatchClaimed: true,
-				event: createMockGitHubParsedEvent({ headSha: 'deadbeef' }),
+				event: createMockScmEvent({ headSha: 'deadbeef' }),
 			});
 
 			const outcome = await processJob(job, registryReturning(null));
@@ -846,20 +844,20 @@ describe('processJob', () => {
 		phaseImpl = async () => {
 			throw new Error('failed');
 		};
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 		expect(releaseProjectSlot).toHaveBeenCalledTimes(1);
 
 		releaseProjectSlot.mockClear();
 		phaseImpl = async () => {
 			throw new AgentRunError('aborted', { kind: 'aborted' });
 		};
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 		expect(releaseProjectSlot).toHaveBeenCalledTimes(1);
 
 		releaseProjectSlot.mockClear();
 		acquireProjectSlot.mockResolvedValueOnce({ acquired: true, tracked: false });
 		phaseImpl = async () => ({ agent: agentResult() });
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 		expect(releaseProjectSlot).not.toHaveBeenCalled();
 	});
 
@@ -867,7 +865,7 @@ describe('processJob', () => {
 		projectLookup = () => undefined;
 
 		await expect(
-			processJob(createMockGitHubWebhookJob({ projectId: 'ghost' }), registryReturning(null)),
+			processJob(createMockScmWebhookJob({ projectId: 'ghost' }), registryReturning(null)),
 		).rejects.toThrow("unknown project 'ghost'");
 		expect(phaseCalls).toEqual([]);
 	});
@@ -875,20 +873,29 @@ describe('processJob', () => {
 	it('completes as no-trigger without running a phase', async () => {
 		const registry = createTriggerRegistry();
 
-		await expect(processJob(createMockGitHubWebhookJob(), registry)).resolves.toEqual({
+		await expect(processJob(createMockScmWebhookJob(), registry)).resolves.toEqual({
 			status: 'no-trigger',
 		});
 		expect(phaseCalls).toEqual([]);
 	});
 
-	it('hands the trigger a context built from the job', async () => {
+	it('hands the trigger a context built from the job, with the provider resolved from the registry', async () => {
 		const seen: TriggerContext[] = [];
-		const job = createMockGitHubWebhookJob();
+		const job = createMockScmWebhookJob();
 
 		await processJob(job, registryReturning(null, seen));
 
 		expect(seen).toEqual([
-			{ project: PROJECT, deliveryId: job.deliveryId, source: 'github', event: job.event },
+			expect.objectContaining({
+				project: PROJECT,
+				deliveryId: job.deliveryId,
+				source: 'scm',
+				providerId: 'github',
+				event: job.event,
+				// Resolved once here, at the composition root, so no handler names a
+				// concrete provider (issue #385).
+				scm: expect.objectContaining({ commentOnPullRequest: expect.any(Function) }),
+			}),
 		]);
 	});
 
@@ -898,7 +905,7 @@ describe('processJob', () => {
 		// that attempt in the ctx so the review handler re-matches and can enforce
 		// its recheck cap rather than looping forever.
 		const seen: TriggerContext[] = [];
-		const job = createMockGitHubWebhookJob({ recheckAttempt: 5 });
+		const job = createMockScmWebhookJob({ recheckAttempt: 5 });
 
 		await processJob(job, registryReturning(REVIEW_TRIGGER, seen));
 
@@ -993,7 +1000,7 @@ describe('processJob', () => {
 		getRunByIdFromDb.mockResolvedValue({ agentSessionId: 'sess-review' });
 
 		await processJob(
-			createMockGitHubWebhookJob({ resumeSession: true, runId: 'run-1' }),
+			createMockScmWebhookJob({ resumeSession: true, runId: 'run-1' }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -1008,7 +1015,7 @@ describe('processJob', () => {
 		getRunByIdFromDb.mockResolvedValue({ agentSessionId: null });
 
 		await processJob(
-			createMockGitHubWebhookJob({ resumeDelivery: true, runId: 'run-1' }),
+			createMockScmWebhookJob({ resumeDelivery: true, runId: 'run-1' }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -1028,10 +1035,7 @@ describe('processJob', () => {
 	});
 
 	it('runs the Review phase for a review trigger and maps the outcome', async () => {
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(phaseCalls).toHaveLength(1);
 		expect(phaseCalls[0].phase).toBe('review');
@@ -1182,7 +1186,7 @@ describe('processJob', () => {
 		});
 
 		it('does not self-enqueue for a non-PM (PR-driven) phase', async () => {
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(createAndPublishDispatch).not.toHaveBeenCalled();
 		});
@@ -1311,7 +1315,7 @@ describe('processJob', () => {
 		});
 
 		it('does not query planning history for non-implementation phases', async () => {
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(hasCompletedRunForTask).not.toHaveBeenCalledWith(PROJECT.id, '17', 'planning');
 		});
@@ -1575,7 +1579,7 @@ describe('processJob', () => {
 		};
 
 		await processJob(
-			createMockGitHubWebhookJob(),
+			createMockScmWebhookJob(),
 			registryReturning(REVIEW_TRIGGER),
 			controller.signal,
 		);
@@ -1595,7 +1599,7 @@ describe('processJob', () => {
 		};
 
 		await processJob(
-			createMockGitHubWebhookJob(),
+			createMockScmWebhookJob(),
 			registryReturning(REVIEW_TRIGGER),
 			controller.signal,
 		);
@@ -1608,10 +1612,7 @@ describe('processJob', () => {
 			throw new Error('review agent exited with code 3');
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome).toEqual({
 			status: 'phase-failed',
@@ -2250,10 +2251,7 @@ describe('processJob', () => {
 			throw new Error('review agent exited with code 3');
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-failed');
 		expect(addComment).not.toHaveBeenCalled();
@@ -2285,10 +2283,7 @@ describe('processJob', () => {
 			});
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-deferred');
 		if (outcome.status !== 'phase-deferred') throw new Error('unreachable');
@@ -2308,10 +2303,7 @@ describe('processJob', () => {
 			});
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
 		expect(outcome.retryDelayMs).toBeGreaterThanOrEqual(6 * 60 * 1000);
@@ -2322,10 +2314,7 @@ describe('processJob', () => {
 			throw new AgentRunError('rate limited', { kind: 'rate-limit' });
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
 		expect(outcome.retryDelayMs).toBe(30 * 60 * 1000);
@@ -2341,10 +2330,7 @@ describe('processJob', () => {
 			throw new AgentRunError('rate limited', { kind: 'rate-limit' });
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
 		expect(outcome.runId).toBe('run-1');
@@ -2359,7 +2345,7 @@ describe('processJob', () => {
 		};
 
 		const outcome = await processJob(
-			createMockGitHubWebhookJob({ rateLimitRetryAttempt: 6 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -2377,10 +2363,7 @@ describe('processJob', () => {
 			throw new AgentRunError('Review agent (claude) exited with code 1', { kind: 'error' });
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-failed');
 	});
@@ -2392,10 +2375,7 @@ describe('processJob', () => {
 			});
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-deferred');
 		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
@@ -2414,7 +2394,7 @@ describe('processJob', () => {
 		};
 
 		const outcome = await processJob(
-			createMockGitHubWebhookJob({ rateLimitRetryAttempt: 6 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -2432,10 +2412,7 @@ describe('processJob', () => {
 			throw new AgentRunError('Review agent (claude) exited with code 1', { kind: 'error' });
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-failed');
 	});
@@ -2450,10 +2427,7 @@ describe('processJob', () => {
 			});
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-deferred');
 		if (outcome.status !== 'phase-deferred') throw new Error('unreachable');
@@ -2503,7 +2477,7 @@ describe('processJob', () => {
 		};
 
 		const outcome = await processJob(
-			createMockGitHubWebhookJob({ rateLimitRetryAttempt: 6 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -2523,7 +2497,7 @@ describe('processJob', () => {
 			return { agent: agentResult() };
 		};
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(registerRunController).toHaveBeenCalledWith('run-1', expect.any(AbortController));
 		expect(seenSignal).toBeInstanceOf(AbortSignal);
@@ -2543,10 +2517,7 @@ describe('processJob', () => {
 			});
 		};
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome).toMatchObject({
 			status: 'phase-failed',
@@ -2590,7 +2561,7 @@ describe('processJob', () => {
 			});
 		};
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(completeRun).toHaveBeenCalledWith(
 			'run-1',
@@ -2611,7 +2582,7 @@ describe('processJob', () => {
 			});
 		};
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		// The settlement removed a clean checkout: no recovery state, and — crucially —
 		// no session id survives the removed checkout.
@@ -2642,7 +2613,7 @@ describe('processJob', () => {
 			});
 		};
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(completeRun).toHaveBeenCalledWith(
 			'run-1',
@@ -2663,7 +2634,7 @@ describe('processJob', () => {
 			});
 		};
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(completeRun).toHaveBeenCalledWith(
 			'run-1',
@@ -2686,7 +2657,7 @@ describe('processJob', () => {
 			return { agent: agentResult() };
 		};
 
-		await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(signalAborted).toBe(true);
 	});
@@ -2702,10 +2673,7 @@ describe('processJob', () => {
 		commentOnPullRequest.mockClear();
 		completeRun.mockClear();
 
-		const outcome = await processJob(
-			createMockGitHubWebhookJob(),
-			registryReturning(REVIEW_TRIGGER),
-		);
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		// Terminal, not deferred — no retry is scheduled for a protected collision.
 		expect(outcome.status).toBe('phase-failed');
@@ -2731,7 +2699,7 @@ describe('processJob', () => {
 		completeRun.mockClear();
 
 		const outcome = await processJob(
-			createMockGitHubWebhookJob({ rateLimitRetryAttempt: 0 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 0 }),
 			registryReturning(REVIEW_TRIGGER),
 		);
 
@@ -2908,7 +2876,7 @@ describe('processJob', () => {
 
 		it('leaves the SCM continuation phases ungated (phase 2/2)', async () => {
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -2936,15 +2904,12 @@ describe('processJob', () => {
 				return { agent: agentResult() };
 			};
 
-			const first = processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			const first = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 			// Let the first call get past its awaits (project lookup, dispatch) and into
 			// runPhase, so it has registered taskId 17 as in-flight.
 			await new Promise((r) => setTimeout(r, 0));
 
-			const second = await processJob(
-				createMockGitHubWebhookJob(),
-				registryReturning(REVIEW_TRIGGER),
-			);
+			const second = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(second).toEqual({ status: 'skipped-in-flight', phase: 'review', taskId: '17' });
 			expect(phaseCalls).toHaveLength(1); // the phase ran once, not twice
@@ -2954,12 +2919,12 @@ describe('processJob', () => {
 		});
 
 		it('releases the slot after the phase settles, so a later dispatch for the same task runs', async () => {
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 			expect(phaseCalls).toHaveLength(1);
 
 			// Same taskId again, now that the first has finished — must not be skipped.
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -2971,15 +2936,12 @@ describe('processJob', () => {
 			phaseImpl = async () => {
 				throw new Error('boom');
 			};
-			const failed = await processJob(
-				createMockGitHubWebhookJob(),
-				registryReturning(REVIEW_TRIGGER),
-			);
+			const failed = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 			expect(failed.status).toBe('phase-failed');
 
 			phaseImpl = async () => ({ agent: agentResult() });
 			const retried = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -2996,12 +2958,12 @@ describe('processJob', () => {
 				return { agent: agentResult() };
 			};
 
-			const first = processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			const first = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 			await new Promise((r) => setTimeout(r, 0));
 
 			// A different taskId must run, not be skipped by task 17's in-flight slot.
 			const other: TriggerResult = { ...REVIEW_TRIGGER, taskId: '18', prNumber: '18' };
-			const second = await processJob(createMockGitHubWebhookJob(), registryReturning(other));
+			const second = await processJob(createMockScmWebhookJob(), registryReturning(other));
 
 			expect(second.status).toBe('phase-succeeded');
 
@@ -3023,7 +2985,7 @@ describe('processJob', () => {
 			});
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3077,7 +3039,7 @@ describe('processJob', () => {
 		});
 
 		it('leaves the attribution PR untouched for a phase that produced none', async () => {
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			// Omitted rather than nulled, so a settle for a non-PR-producing phase never
 			// clears a PR the row already recorded.
@@ -3086,7 +3048,7 @@ describe('processJob', () => {
 
 		it('reuses and resets the existing run row when the job carries a runId (no new row)', async () => {
 			const outcome = await processJob(
-				createMockGitHubWebhookJob({ runId: 'run-1' }),
+				createMockScmWebhookJob({ runId: 'run-1' }),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3109,7 +3071,7 @@ describe('processJob', () => {
 			resetRunToRunning.mockResolvedValueOnce(false); // row was pruned
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob({ runId: 'run-gone' }),
+				createMockScmWebhookJob({ runId: 'run-gone' }),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3123,7 +3085,7 @@ describe('processJob', () => {
 		});
 
 		it('inserts a fresh row (no reset) for a job without a runId', async () => {
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(resetRunToRunning).not.toHaveBeenCalled();
 			expect(createRun).toHaveBeenCalledOnce();
@@ -3131,7 +3093,7 @@ describe('processJob', () => {
 
 		it('records a job cli override as the fresh row engine (issue #169)', async () => {
 			await processJob(
-				createMockGitHubWebhookJob({ cliOverride: 'codex' }),
+				createMockScmWebhookJob({ cliOverride: 'codex' }),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3146,7 +3108,7 @@ describe('processJob', () => {
 		] as const)('reuses the latest %s row for a fresh webhook', async (status) => {
 			getLatestRunForTask.mockResolvedValueOnce({ id: `run-${status}`, status } as never);
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, '17', 'review');
 			expect(resetRunToRunning).toHaveBeenCalledWith(
@@ -3167,7 +3129,7 @@ describe('processJob', () => {
 				status: 'completed',
 			} as never);
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(resetRunToRunning).not.toHaveBeenCalled();
 			expect(createRun).toHaveBeenCalledOnce();
@@ -3177,7 +3139,7 @@ describe('processJob', () => {
 			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-failed', status: 'failed' } as never);
 			resetRunToRunning.mockResolvedValueOnce(false);
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(createRun).toHaveBeenCalledOnce();
 			expect(createRun).toHaveBeenCalledWith(
@@ -3192,7 +3154,7 @@ describe('processJob', () => {
 				agent: agentResult({ usage: { inputTokens: 100, outputTokens: 50 } }),
 			});
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
@@ -3203,7 +3165,7 @@ describe('processJob', () => {
 		it('forwards a completed Review run’s verdict into completeRun (issue #218)', async () => {
 			phaseImpl = async () => ({ agent: agentResult(), verdict: 'request-changes' });
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
@@ -3219,7 +3181,7 @@ describe('processJob', () => {
 				automationOutcome: 'manual-intervention-required',
 			});
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
@@ -3239,7 +3201,7 @@ describe('processJob', () => {
 				projectLookup = () => autoMergeProject;
 				phaseImpl = async () => ({ agent: agentResult(), verdict: 'approve' });
 
-				await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 				expect(requestMergeAutomation).toHaveBeenCalledExactlyOnceWith({
 					project: autoMergeProject,
@@ -3253,7 +3215,7 @@ describe('processJob', () => {
 			it('does not persist a merge dispatch when autoMerge is off', async () => {
 				phaseImpl = async () => ({ agent: agentResult(), verdict: 'approve' });
 
-				await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
 			});
@@ -3262,7 +3224,7 @@ describe('processJob', () => {
 				projectLookup = () => autoMergeProject;
 				phaseImpl = async () => ({ agent: agentResult(), verdict: 'request-changes' });
 
-				await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
 			});
@@ -3340,7 +3302,7 @@ describe('processJob', () => {
 			};
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3368,7 +3330,7 @@ describe('processJob', () => {
 				);
 			};
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
@@ -3389,7 +3351,7 @@ describe('processJob', () => {
 			};
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3422,7 +3384,7 @@ describe('processJob', () => {
 			};
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3450,7 +3412,7 @@ describe('processJob', () => {
 			createRun.mockRejectedValueOnce(new Error('postgres down'));
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3464,7 +3426,7 @@ describe('processJob', () => {
 			completeRun.mockRejectedValueOnce(new Error('postgres down'));
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3472,7 +3434,7 @@ describe('processJob', () => {
 		});
 
 		it('does not create a run row for a no-trigger job', async () => {
-			await processJob(createMockGitHubWebhookJob(), createTriggerRegistry());
+			await processJob(createMockScmWebhookJob(), createTriggerRegistry());
 			expect(createRun).not.toHaveBeenCalled();
 		});
 
@@ -3486,10 +3448,10 @@ describe('processJob', () => {
 				return { agent: agentResult() };
 			};
 
-			const first = processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			const first = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 			await new Promise((r) => setTimeout(r, 0));
 
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			// Only the first (in-flight) run created a row; the skipped duplicate did not.
 			expect(createRun).toHaveBeenCalledTimes(1);
@@ -3501,7 +3463,7 @@ describe('processJob', () => {
 
 	describe('wall-clock timeout & retry lifecycle (issue #165)', () => {
 		it('passes the worker default timeout to a phase the project sets no override for', async () => {
-			await processJob(createMockGitHubWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(phaseCalls[0].args.timeoutMs).toBe(DEFAULT_AGENT_TIMEOUT_MS);
 		});
@@ -3522,7 +3484,7 @@ describe('processJob', () => {
 			};
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3546,7 +3508,7 @@ describe('processJob', () => {
 			phaseImpl = async () => ({ agent: agentResult({ exitCode: 0, timedOut: true }) });
 
 			const outcome = await processJob(
-				createMockGitHubWebhookJob(),
+				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -3618,9 +3580,9 @@ describe('reportInterruptedJobToBoard', () => {
 	});
 
 	it('comments on the PR for a github (PR/check) job', async () => {
-		// createMockGitHubWebhookJob's event carries workItemId '17'.
+		// createMockScmWebhookJob's event carries workItemId '17'.
 		await reportInterruptedJobToBoard(
-			createMockGitHubWebhookJob(),
+			createMockScmWebhookJob(),
 			'job stalled more than allowable limit',
 		);
 
@@ -3649,15 +3611,15 @@ describe('reportInterruptedJobToBoard', () => {
 		projectLookup = () => undefined;
 
 		await expect(
-			reportInterruptedJobToBoard(createMockGitHubWebhookJob(), 'stalled'),
+			reportInterruptedJobToBoard(createMockScmWebhookJob(), 'stalled'),
 		).resolves.toBeUndefined();
 		expect(commentOnPullRequest).not.toHaveBeenCalled();
 		expect(addComment).not.toHaveBeenCalled();
 	});
 
 	it('skips a github job that carries no PR/issue number', async () => {
-		const job = createMockGitHubWebhookJob({
-			event: createMockGitHubParsedEvent({ workItemId: undefined }),
+		const job = createMockScmWebhookJob({
+			event: createMockScmEvent({ workItemId: undefined }),
 		});
 
 		await reportInterruptedJobToBoard(job, 'stalled');
@@ -3676,7 +3638,7 @@ describe('reportInterruptedJobToBoard', () => {
 		commentOnPullRequest.mockRejectedValue(new Error('github 500'));
 
 		await expect(
-			reportInterruptedJobToBoard(createMockGitHubWebhookJob(), 'stalled'),
+			reportInterruptedJobToBoard(createMockScmWebhookJob(), 'stalled'),
 		).resolves.toBeUndefined();
 	});
 });

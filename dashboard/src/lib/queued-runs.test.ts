@@ -105,7 +105,7 @@ describe('queuedRunKey', () => {
 
 function reviewGateRun(overrides: Partial<QueuedRun> = {}): QueuedRun {
 	return githubRun({
-		reviewGate: { sourceEvent: 'pull_request', sourceAction: 'opened', headSha: 'sha-1' },
+		reviewGate: { sourceEvent: 'pull-request', sourceAction: 'opened', headSha: 'sha-1' },
 		...overrides,
 	});
 }
@@ -125,7 +125,7 @@ describe('groupQueuedRuns', () => {
 		expect(rows[0].sourceEvents).toEqual([
 			{
 				jobId: 'job-gh',
-				sourceEvent: 'pull_request',
+				sourceEvent: 'pull-request',
 				sourceAction: 'opened',
 				recheckAttempt: undefined,
 			},
@@ -134,16 +134,16 @@ describe('groupQueuedRuns', () => {
 
 	// Regression (issue #275): a fixed Respond-to-review push produces both
 	// SWARM's synthetic `check_suite` follow-up and GitHub's real
-	// `pull_request:synchronize` webhook for the same PR/SHA — the exact
+	// pull-request-update webhook for the same PR/SHA — the exact
 	// scenario the grouping must collapse into one logical row.
-	it('groups a synthetic check_suite follow-up with a real pull_request:synchronize webhook for the same PR/SHA', () => {
+	it('groups a synthetic checks follow-up with a real pull-request-update webhook for the same PR/SHA', () => {
 		const followUp = reviewGateRun({
 			jobId: 'job-followup',
-			reviewGate: { sourceEvent: 'check_suite', sourceAction: 'completed', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'checks', sourceAction: 'completed', headSha: 'sha-fix' },
 		});
 		const synchronize = reviewGateRun({
 			jobId: 'job-synchronize',
-			reviewGate: { sourceEvent: 'pull_request', sourceAction: 'synchronize', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'pull-request', sourceAction: 'updated', headSha: 'sha-fix' },
 		});
 
 		const rows = groupQueuedRuns([followUp, synchronize]);
@@ -154,14 +154,14 @@ describe('groupQueuedRuns', () => {
 		expect(rows[0].sourceEvents).toEqual([
 			{
 				jobId: 'job-followup',
-				sourceEvent: 'check_suite',
+				sourceEvent: 'checks',
 				sourceAction: 'completed',
 				recheckAttempt: undefined,
 			},
 			{
 				jobId: 'job-synchronize',
-				sourceEvent: 'pull_request',
-				sourceAction: 'synchronize',
+				sourceEvent: 'pull-request',
+				sourceAction: 'updated',
 				recheckAttempt: undefined,
 			},
 		]);
@@ -171,12 +171,12 @@ describe('groupQueuedRuns', () => {
 		const before = boardRun({ jobId: 'job-before', workItemNodeId: 'PVTI_card_before' });
 		const followUp = reviewGateRun({
 			jobId: 'job-followup',
-			reviewGate: { sourceEvent: 'check_suite', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'checks', headSha: 'sha-fix' },
 		});
 		const after = boardRun({ jobId: 'job-after', workItemNodeId: 'PVTI_card_after' });
 		const synchronize = reviewGateRun({
 			jobId: 'job-synchronize',
-			reviewGate: { sourceEvent: 'pull_request', sourceAction: 'synchronize', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'pull-request', sourceAction: 'updated', headSha: 'sha-fix' },
 		});
 
 		const rows = groupQueuedRuns([before, followUp, after, synchronize]);
@@ -194,12 +194,12 @@ describe('groupQueuedRuns', () => {
 		const first = reviewGateRun({
 			jobId: 'job-pr-42',
 			prNumber: '42',
-			reviewGate: { sourceEvent: 'check_suite', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'checks', headSha: 'sha-fix' },
 		});
 		const second = reviewGateRun({
 			jobId: 'job-pr-43',
 			prNumber: '43',
-			reviewGate: { sourceEvent: 'pull_request', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'pull-request', headSha: 'sha-fix' },
 		});
 
 		const rows = groupQueuedRuns([first, second]);
@@ -210,11 +210,11 @@ describe('groupQueuedRuns', () => {
 	it('never groups across a different head SHA', () => {
 		const first = reviewGateRun({
 			jobId: 'job-sha-1',
-			reviewGate: { sourceEvent: 'check_suite', headSha: 'sha-1' },
+			reviewGate: { sourceEvent: 'checks', headSha: 'sha-1' },
 		});
 		const second = reviewGateRun({
 			jobId: 'job-sha-2',
-			reviewGate: { sourceEvent: 'pull_request', headSha: 'sha-2' },
+			reviewGate: { sourceEvent: 'pull-request', headSha: 'sha-2' },
 		});
 
 		const rows = groupQueuedRuns([first, second]);
@@ -226,12 +226,12 @@ describe('groupQueuedRuns', () => {
 		const first = reviewGateRun({
 			jobId: 'job-proj-a',
 			projectId: 'proj-a',
-			reviewGate: { sourceEvent: 'check_suite', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'checks', headSha: 'sha-fix' },
 		});
 		const second = reviewGateRun({
 			jobId: 'job-proj-b',
 			projectId: 'proj-b',
-			reviewGate: { sourceEvent: 'pull_request', headSha: 'sha-fix' },
+			reviewGate: { sourceEvent: 'pull-request', headSha: 'sha-fix' },
 		});
 
 		const rows = groupQueuedRuns([first, second]);
@@ -400,29 +400,29 @@ describe('hideBoardRowsWithActiveRun', () => {
 });
 
 describe('reviewGateSourceEventLabel', () => {
-	it('labels a pull_request source event with its action', () => {
+	it('labels a pull-request source event with its action', () => {
 		expect(
 			reviewGateSourceEventLabel({
 				jobId: 'j1',
-				sourceEvent: 'pull_request',
-				sourceAction: 'synchronize',
+				sourceEvent: 'pull-request',
+				sourceAction: 'updated',
 			}),
-		).toBe('Pull request · synchronize');
+		).toBe('Pull request · updated');
 	});
 
-	it('labels a check_suite source event and includes its recheck attempt', () => {
+	it('labels a checks source event and includes its recheck attempt', () => {
 		expect(
 			reviewGateSourceEventLabel({
 				jobId: 'j1',
-				sourceEvent: 'check_suite',
+				sourceEvent: 'checks',
 				sourceAction: 'completed',
 				recheckAttempt: 3,
 			}),
-		).toBe('Check suite · completed · recheck #3');
+		).toBe('Checks · completed · recheck #3');
 	});
 
 	it('omits the action/recheck segments when absent', () => {
-		expect(reviewGateSourceEventLabel({ jobId: 'j1', sourceEvent: 'pull_request' })).toBe(
+		expect(reviewGateSourceEventLabel({ jobId: 'j1', sourceEvent: 'pull-request' })).toBe(
 			'Pull request',
 		);
 	});

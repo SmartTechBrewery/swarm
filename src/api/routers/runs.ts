@@ -857,7 +857,7 @@ export const runsRouter = router({
 						message: `Work item status does not start a Planning or Implementation phase.`,
 					});
 				}
-			} else if (jobData.type === 'github') {
+			} else if (jobData.type === 'scm') {
 				const prNumber = jobData.event.workItemId;
 				const repoFullName = jobData.event.repoFullName;
 				if (prNumber && repoFullName) {

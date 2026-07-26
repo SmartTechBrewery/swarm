@@ -1,22 +1,32 @@
 import { describe, expect, it, vi } from 'vitest';
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
-import type { PersonaIdentities } from '@/integrations/scm/github/personas.js';
-import { GitHubRouterAdapter } from '@/router/adapters/github.js';
+import { getPersonaForLogin } from '@/integrations/scm/github/personas.js';
+import { parseGitHubWebhook } from '@/integrations/scm/github/webhook.js';
+import type { ScmPersonaIdentities } from '@/scm/types.js';
 import { createRespondToReviewTrigger } from '@/triggers/handlers/respond-to-review.js';
 import type { TriggerContext } from '@/triggers/types.js';
 import {
-	createMockGitHubParsedEvent,
+	createFakeScmProvider,
 	createMockProjectConfig,
+	createMockScmEvent,
+	createMockScmTriggerContext,
 } from '../../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig();
-const IDENTITIES: PersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 const HEAD_SHA = 'deadbeef1234deadbeef1234deadbeef1234dead';
 
-// Real getPersonaForLogin runs against these identities — only identity
-// *resolution* is stubbed (it would otherwise hit GitHub). The ledger lookups
-// default to the first (non-capping) verdict slot so the existing dispatch
-// tests exercise the common case without needing a live database.
+// The handler resolves persona identities through the injected `SCMProvider`, so
+// only identity *resolution* is stubbed (it would otherwise hit the provider's
+// API); the real `personaForActor` mapping runs against these identities, which
+// is what keeps the `[bot]`-suffix case honest.
+const SCM = createFakeScmProvider({
+	resolvePersonaIdentities: async () => IDENTITIES,
+	personaForActor: getPersonaForLogin,
+});
+
+// The ledger lookups default to the first (non-capping) verdict slot so the
+// existing dispatch tests exercise the common case without needing a live database.
 const getReviewVerdictByReviewId = vi.fn(async () => ({
 	ordinal: 1,
 	state: 'submitted' as const,
@@ -25,17 +35,16 @@ const getReviewVerdictByReviewId = vi.fn(async () => ({
 }));
 const getReviewVerdictByHead = vi.fn(async () => undefined);
 const handler = createRespondToReviewTrigger({
-	resolveIdentities: async () => IDENTITIES,
 	getReviewVerdictByReviewId,
 	getReviewVerdictByHead,
 });
 
-function reviewEvent(overrides: Partial<Parameters<typeof createMockGitHubParsedEvent>[0]> = {}) {
-	return createMockGitHubParsedEvent({
-		eventType: 'pull_request_review',
+function reviewEvent(overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {}) {
+	return createMockScmEvent({
+		kind: 'pull-request-review',
 		action: 'submitted',
 		workItemId: '17',
-		reviewState: 'changes_requested',
+		reviewState: 'changes-requested',
 		reviewId: '555',
 		prBranch: 'issue-17',
 		headSha: HEAD_SHA,
@@ -44,15 +53,13 @@ function reviewEvent(overrides: Partial<Parameters<typeof createMockGitHubParsed
 	});
 }
 
-function ctx(
-	overrides: Partial<Parameters<typeof createMockGitHubParsedEvent>[0]> = {},
-): TriggerContext {
-	return { project: PROJECT, source: 'github', event: reviewEvent(overrides) };
+function ctx(overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {}): TriggerContext {
+	return createMockScmTriggerContext({ project: PROJECT, scm: SCM, event: reviewEvent(overrides) });
 }
 
 describe('respond-to-review trigger', () => {
 	describe('matches', () => {
-		it('matches a submitted changes_requested review', () => {
+		it('matches a submitted changes-requested review', () => {
 			expect(handler.matches(ctx())).toBe(true);
 		});
 
@@ -69,7 +76,7 @@ describe('respond-to-review trigger', () => {
 		});
 
 		it('ignores other event types', () => {
-			expect(handler.matches(ctx({ eventType: 'pull_request', action: 'opened' }))).toBe(false);
+			expect(handler.matches(ctx({ kind: 'pull-request', action: 'opened' }))).toBe(false);
 		});
 	});
 
@@ -87,7 +94,7 @@ describe('respond-to-review trigger', () => {
 		});
 
 		it('dispatches with the review-pinned SHA when the PR head SHA is absent', async () => {
-			const event = new GitHubRouterAdapter().parseWebhook('pull_request_review', {
+			const event = parseGitHubWebhook('pull_request_review', {
 				action: 'submitted',
 				repository: { full_name: PROJECT.repo },
 				pull_request: { number: 17, head: { ref: 'issue-17' } },
@@ -100,12 +107,14 @@ describe('respond-to-review trigger', () => {
 			});
 			if (!event) throw new Error('expected pull_request_review to parse');
 
-			const result = await handler.handle({ project: PROJECT, source: 'github', event });
+			const result = await handler.handle(
+				createMockScmTriggerContext({ project: PROJECT, scm: SCM, event }),
+			);
 			expect(result).toMatchObject({ phase: 'respond-to-review', headSha: HEAD_SHA });
 		});
 
 		it('recovers a parsed review webhook with neither SHA source from the verdict ledger', async () => {
-			const event = new GitHubRouterAdapter().parseWebhook('pull_request_review', {
+			const event = parseGitHubWebhook('pull_request_review', {
 				action: 'submitted',
 				repository: { full_name: PROJECT.repo },
 				pull_request: { number: 17, head: { ref: 'issue-17' } },
@@ -114,10 +123,9 @@ describe('respond-to-review trigger', () => {
 			});
 			if (!event) throw new Error('expected pull_request_review to parse');
 
-			expect(await handler.handle({ project: PROJECT, source: 'github', event })).toMatchObject({
-				phase: 'respond-to-review',
-				headSha: HEAD_SHA,
-			});
+			expect(
+				await handler.handle(createMockScmTriggerContext({ project: PROJECT, scm: SCM, event })),
+			).toMatchObject({ phase: 'respond-to-review', headSha: HEAD_SHA });
 		});
 
 		it('re-dispatches the same review once on a prioritized continuation retry', async () => {
@@ -183,7 +191,6 @@ describe('respond-to-review trigger', () => {
 
 		it('skips a missing-SHA review only when its verdict ledger record is unavailable', async () => {
 			const noRecordHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId: vi.fn(async () => undefined),
 				getReviewVerdictByHead: vi.fn(async () => undefined),
 			});
@@ -204,7 +211,6 @@ describe('respond-to-review trigger', () => {
 				headSha: HEAD_SHA,
 			}));
 			const cappedHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId,
 				getReviewVerdictByHead: vi.fn(async () => undefined),
 			});
@@ -226,7 +232,6 @@ describe('respond-to-review trigger', () => {
 				headSha: HEAD_SHA,
 			}));
 			const cappedHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId: byReviewId,
 				getReviewVerdictByHead: byHead,
 			});
@@ -243,17 +248,15 @@ describe('respond-to-review trigger', () => {
 				headSha: HEAD_SHA,
 			}));
 			const cappedHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId: byReviewId,
 				getReviewVerdictByHead: byHead,
 			});
-			expect(await cappedHandler.handle(ctx({ reviewState: 'changes_requested' }))).toBeNull();
+			expect(await cappedHandler.handle(ctx({ reviewState: 'changes-requested' }))).toBeNull();
 			expect(byHead).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '17', HEAD_SHA);
 		});
 
 		it('fails closed (skips) when no ledger record is found for a changes-requested event', async () => {
 			const noRecordHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId: vi.fn(async () => undefined),
 				getReviewVerdictByHead: vi.fn(async () => undefined),
 			});
@@ -262,7 +265,6 @@ describe('respond-to-review trigger', () => {
 
 		it('fails closed (skips) when the ledger lookup throws', async () => {
 			const throwingHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId: vi.fn(async () => {
 					throw new Error('connection reset');
 				}),
@@ -277,7 +279,6 @@ describe('respond-to-review trigger', () => {
 			});
 			const byReviewId = vi.fn(async () => undefined);
 			const noopHandler = createRespondToReviewTrigger({
-				resolveIdentities: async () => IDENTITIES,
 				getReviewVerdictByReviewId: byReviewId,
 				getReviewVerdictByHead: vi.fn(async () => undefined),
 			});

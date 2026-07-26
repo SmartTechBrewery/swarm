@@ -62,8 +62,14 @@ import {
 } from '../harness/agent-failure.js';
 import { capabilityFor, DEFAULT_MODEL_PER_CLI, type ReasoningLevel } from '../harness/models.js';
 import { discoverCliQuotas } from '../harness/quota-discovery.js';
+// Side-effect import: registers every provider manifest into its registry before
+// `buildTriggerContext` resolves a dequeued job's `providerId` below. Declared here,
+// not only in the worker entrypoint, because the control plane's own dispatch
+// consumer (`src/router/dispatcher.ts`) drives `processJob` too.
+import '../integrations/entrypoint.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
 import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import { requireSCMProvider } from '../integrations/scm/registry.js';
 import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -99,7 +105,7 @@ import {
 } from '../queue/cancellation.js';
 import {
 	type GitHubProjectsWebhookJob,
-	type GitHubWebhookJob,
+	type ScmWebhookJob,
 	type SwarmJob,
 	SwarmJobSchema,
 } from '../queue/jobs.js';
@@ -2335,9 +2341,9 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 
 		const prNumber = job.event.workItemId;
 		if (!prNumber) {
-			logger.debug('Interrupted-job report: github job carries no PR/issue number — skipping', {
+			logger.debug('Interrupted-job report: SCM job carries no PR/issue number — skipping', {
 				projectId: project.id,
-				eventType: job.event.eventType,
+				eventKind: job.event.kind,
 			});
 			return;
 		}
@@ -2385,10 +2391,10 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
  * (SIGTERM→SIGKILL) so graceful shutdown doesn't hang behind a long run.
  */
 function buildTriggerContext(
-	job: GitHubWebhookJob | GitHubProjectsWebhookJob,
+	job: ScmWebhookJob | GitHubProjectsWebhookJob,
 	project: ProjectConfig,
 ): TriggerContext {
-	return job.type === 'github'
+	return job.type === 'scm'
 		? {
 				project,
 				deliveryId: job.deliveryId,
@@ -2396,8 +2402,12 @@ function buildTriggerContext(
 				rateLimitRetryAttempt: job.rateLimitRetryAttempt,
 				runId: job.runId,
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
-				source: 'github',
+				source: 'scm',
+				providerId: job.providerId,
 				event: job.event,
+				// The composition root resolves the concrete provider exactly once, from
+				// the registry, so no trigger handler ever names one (ai/RULES.md §2).
+				scm: requireSCMProvider(job.providerId),
 			}
 		: {
 				project,
@@ -2822,7 +2832,7 @@ export async function processJob(
 		logger.debug('Job matched no trigger — completing as a no-op', {
 			projectId: project.id,
 			source: ctx.source,
-			eventType: job.event.eventType,
+			event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.eventType,
 			deliveryId: job.deliveryId,
 		});
 		if (job.runId) {
@@ -2831,7 +2841,7 @@ export async function processJob(
 				error:
 					'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
 			});
-			if (job.type === 'github' && job.event.workItemId && job.event.headSha) {
+			if (job.type === 'scm' && job.event.workItemId && job.event.headSha) {
 				const dispatchKey = buildReviewDispatchKey(
 					project.repo,
 					job.event.workItemId,

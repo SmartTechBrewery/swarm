@@ -20,6 +20,10 @@ export const githubScmManifest: SCMProviderManifest = {
 	id: 'github',
 	label: 'GitHub',
 	category: 'scm',
+	// Unchanged from before the registry existed: GitHub Projects' `projects_v2_item`
+	// board webhook is delivered to this same path and shares its HMAC secret
+	// (docs/github-projects-v2-api.md §5), so the path must stay exactly this.
+	webhookRoute: '/github/webhook',
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).
 	provider: new GitHubSCMIntegration(),

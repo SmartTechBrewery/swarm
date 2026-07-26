@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
+import type { SwarmJob } from '@/queue/jobs.js';
 import {
 	deriveDispatchPhaseHint,
 	deriveQueuedPhaseHint,
@@ -10,7 +11,7 @@ import {
 } from '@/queue/queued-runs.js';
 import {
 	createMockGitHubProjectsWebhookJob,
-	createMockGitHubWebhookJob,
+	createMockScmWebhookJob,
 } from '../../helpers/factories.js';
 
 /** A waiting dispatch row, shaped like `listWaitingDispatches()` returns them. */
@@ -32,7 +33,7 @@ function makeDispatch(overrides: Partial<DispatchRow> = {}): DispatchRow {
 		// In the past relative to the test run, so a plain pending row is
 		// eligible now (`waiting`), not `delayed`.
 		availableAt: new Date(1_700_000_000_000),
-		jobPayload: createMockGitHubWebhookJob(),
+		jobPayload: createMockScmWebhookJob(),
 		runId: null,
 		selectedWorkerId: null,
 		workerSessionId: null,
@@ -67,55 +68,55 @@ describe('deriveQueuedPhaseHint', () => {
 		expect(deriveQueuedPhaseHint(MERGE_JOB)).toBe('merge-automation');
 	});
 
-	it('hints respond-to-review for a non-approved pull_request_review', () => {
-		const job = createMockGitHubWebhookJob({
+	it('hints respond-to-review for a non-approved pull-request review', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'pull_request_review',
-				reviewState: 'changes_requested',
+				...createMockScmWebhookJob().event,
+				kind: 'pull-request-review',
+				reviewState: 'changes-requested',
 			},
 		});
 		expect(deriveQueuedPhaseHint(job)).toBe('respond-to-review');
 	});
 
-	it('hints review for an approved pull_request_review', () => {
-		const job = createMockGitHubWebhookJob({
+	it('hints review for an approved pull-request review', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'pull_request_review',
+				...createMockScmWebhookJob().event,
+				kind: 'pull-request-review',
 				reviewState: 'approved',
 			},
 		});
 		expect(deriveQueuedPhaseHint(job)).toBe('review');
 	});
 
-	it('hints respond-to-ci for a failed check_suite', () => {
-		const job = createMockGitHubWebhookJob({
+	it('hints respond-to-ci for failed checks', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				checkConclusion: 'failure',
 			},
 		});
 		expect(deriveQueuedPhaseHint(job)).toBe('respond-to-ci');
 	});
 
-	it('hints review for a successful check_suite', () => {
-		const job = createMockGitHubWebhookJob({
+	it('hints review for successful checks', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				checkConclusion: 'success',
 			},
 		});
 		expect(deriveQueuedPhaseHint(job)).toBe('review');
 	});
 
-	it('hints resolve-conflicts for a merged, closed pull_request', () => {
-		const job = createMockGitHubWebhookJob({
+	it('hints resolve-conflicts for a merged, closed pull request', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'pull_request',
+				...createMockScmWebhookJob().event,
+				kind: 'pull-request',
 				action: 'closed',
 				merged: true,
 			},
@@ -123,18 +124,18 @@ describe('deriveQueuedPhaseHint', () => {
 		expect(deriveQueuedPhaseHint(job)).toBe('resolve-conflicts');
 	});
 
-	it('hints review for an opened pull_request', () => {
-		const job = createMockGitHubWebhookJob({
-			event: { ...createMockGitHubWebhookJob().event, eventType: 'pull_request', action: 'opened' },
+	it('hints review for an opened pull request', () => {
+		const job = createMockScmWebhookJob({
+			event: { ...createMockScmWebhookJob().event, kind: 'pull-request', action: 'opened' },
 		});
 		expect(deriveQueuedPhaseHint(job)).toBe('review');
 	});
 
 	it('hints unknown for an issue_comment', () => {
-		const job = createMockGitHubWebhookJob({
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'issue_comment',
+				...createMockScmWebhookJob().event,
+				kind: 'work-item-comment',
 				isCommentEvent: true,
 			},
 		});
@@ -169,37 +170,37 @@ describe('deriveDispatchPhaseHint', () => {
 });
 
 describe('deriveReviewGate', () => {
-	it('classifies a completed check_suite carrying a PR number and head SHA', () => {
-		const job = createMockGitHubWebhookJob({
+	it('classifies a completed checks event carrying a PR number and head SHA', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				action: 'completed',
 				workItemId: '42',
 				headSha: 'abc123',
 			},
 		});
 		expect(deriveReviewGate(job)).toEqual({
-			sourceEvent: 'check_suite',
+			sourceEvent: 'checks',
 			sourceAction: 'completed',
 			headSha: 'abc123',
 		});
 	});
 
-	it('classifies a synchronize pull_request event and carries its recheckAttempt', () => {
-		const job = createMockGitHubWebhookJob({
+	it('classifies an updated pull-request event and carries its recheckAttempt', () => {
+		const job = createMockScmWebhookJob({
 			recheckAttempt: 2,
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'pull_request',
-				action: 'synchronize',
+				...createMockScmWebhookJob().event,
+				kind: 'pull-request',
+				action: 'updated',
 				workItemId: '42',
 				headSha: 'abc123',
 			},
 		});
 		expect(deriveReviewGate(job)).toEqual({
-			sourceEvent: 'pull_request',
-			sourceAction: 'synchronize',
+			sourceEvent: 'pull-request',
+			sourceAction: 'updated',
 			headSha: 'abc123',
 			recheckAttempt: 2,
 		});
@@ -209,11 +210,11 @@ describe('deriveReviewGate', () => {
 		expect(deriveReviewGate(createMockGitHubProjectsWebhookJob())).toBeUndefined();
 	});
 
-	it('is undefined for a non-review-hinted github job (e.g. a failed check_suite)', () => {
-		const job = createMockGitHubWebhookJob({
+	it('is undefined for a non-review-hinted scm job (e.g. failed checks)', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				checkConclusion: 'failure',
 				workItemId: '42',
 				headSha: 'abc123',
@@ -223,10 +224,10 @@ describe('deriveReviewGate', () => {
 	});
 
 	it('is undefined when the event carries no head SHA', () => {
-		const job = createMockGitHubWebhookJob({
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'pull_request',
+				...createMockScmWebhookJob().event,
+				kind: 'pull-request',
 				action: 'opened',
 				workItemId: '42',
 				headSha: undefined,
@@ -236,10 +237,10 @@ describe('deriveReviewGate', () => {
 	});
 
 	it('is undefined when the event carries no PR number', () => {
-		const job = createMockGitHubWebhookJob({
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				action: 'completed',
 				workItemId: undefined,
 				headSha: 'abc123',
@@ -258,7 +259,7 @@ describe('toQueuedRuns', () => {
 			runId: 'run-1',
 			attempt: 2,
 			availableAt: new Date(1_700_000_030_000),
-			jobPayload: createMockGitHubWebhookJob({ runId: 'run-1' }),
+			jobPayload: createMockScmWebhookJob({ runId: 'run-1' }),
 		});
 		const fresh = makeDispatch({ id: 'fresh' });
 
@@ -297,9 +298,9 @@ describe('toQueuedRuns', () => {
 	});
 
 	it('maps a github job to repo + prNumber, no board fields', () => {
-		const job = createMockGitHubWebhookJob({
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
+				...createMockScmWebhookJob().event,
 				repoFullName: 'jkwiecien/swarm',
 				workItemId: '42',
 			},
@@ -372,11 +373,11 @@ describe('toQueuedRuns', () => {
 		expect(item.phaseHint).toBe('implementation');
 	});
 
-	it('carries reviewGate metadata through for a review-hinted github job', () => {
-		const job = createMockGitHubWebhookJob({
+	it('carries reviewGate metadata through for a review-hinted scm job', () => {
+		const job = createMockScmWebhookJob({
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				action: 'completed',
 				workItemId: '42',
 				headSha: 'abc123',
@@ -386,9 +387,40 @@ describe('toQueuedRuns', () => {
 		const [item] = toQueuedRuns([makeDispatch({ jobPayload: job })]);
 
 		expect(item.reviewGate).toEqual({
-			sourceEvent: 'check_suite',
+			sourceEvent: 'checks',
 			sourceAction: 'completed',
 			headSha: 'abc123',
+		});
+	});
+
+	// `dispatches.job_payload` is a `jsonb` column typed (not validated) as
+	// `SwarmJob`, so a row written before issue #385 reaches the read model still
+	// carrying the legacy envelope — it must render, not degrade to `unknown`.
+	it('renders a legacy pre-#385 dispatch row through the normalized read model', () => {
+		const legacy = {
+			type: 'github',
+			projectId: 'swarm',
+			deliveryId: 'delivery-legacy',
+			recheckAttempt: 1,
+			event: {
+				eventType: 'check_suite',
+				action: 'completed',
+				repoFullName: 'jkwiecien/swarm',
+				isCommentEvent: false,
+				workItemId: '42',
+				headSha: 'abc123',
+			},
+		} as unknown as SwarmJob;
+
+		const [item] = toQueuedRuns([makeDispatch({ jobPayload: legacy })]);
+
+		expect(item).toMatchObject({ type: 'github', repo: 'jkwiecien/swarm', prNumber: '42' });
+		expect(item.phaseHint).toBe('review');
+		expect(item.reviewGate).toEqual({
+			sourceEvent: 'checks',
+			sourceAction: 'completed',
+			headSha: 'abc123',
+			recheckAttempt: 1,
 		});
 	});
 
@@ -400,29 +432,29 @@ describe('toQueuedRuns', () => {
 	});
 
 	// Regression (issue #275): a fixed Respond-to-review push enqueues both a
-	// synthetic `check_suite` `completed` follow-up (`src/pipeline/follow-up-review.ts`)
-	// and GitHub delivers its own `pull_request` `synchronize` webhook for that
+	// synthetic `checks` `completed` follow-up (`src/pipeline/follow-up-review.ts`)
+	// and the provider delivers its own pull-request update webhook for that
 	// same push — two raw events, same PR + new head SHA. The dispatch dedup
 	// folds these into at most one Review run; this asserts the read model
 	// exposes matching reviewGate identity so the UI can group them into one row.
-	it('exposes matching reviewGate identity for a synthetic follow-up and the real pull_request:synchronize webhook', () => {
-		const followUp = createMockGitHubWebhookJob({
+	it('exposes matching reviewGate identity for a synthetic follow-up and the real pull-request update webhook', () => {
+		const followUp = createMockScmWebhookJob({
 			deliveryId: 'respond-to-review-followup-jkwiecien-swarm-42-def456',
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'check_suite',
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
 				action: 'completed',
 				repoFullName: 'jkwiecien/swarm',
 				workItemId: '42',
 				headSha: 'def456',
 			},
 		});
-		const synchronize = createMockGitHubWebhookJob({
+		const synchronize = createMockScmWebhookJob({
 			deliveryId: 'delivery-real-webhook',
 			event: {
-				...createMockGitHubWebhookJob().event,
-				eventType: 'pull_request',
-				action: 'synchronize',
+				...createMockScmWebhookJob().event,
+				kind: 'pull-request',
+				action: 'updated',
 				repoFullName: 'jkwiecien/swarm',
 				workItemId: '42',
 				headSha: 'def456',
@@ -437,10 +469,7 @@ describe('toQueuedRuns', () => {
 		expect(items).toHaveLength(2);
 		expect(items.every((item) => item.phaseHint === 'review')).toBe(true);
 		expect(items.map((item) => item.reviewGate?.headSha)).toEqual(['def456', 'def456']);
-		expect(items.map((item) => item.reviewGate?.sourceEvent)).toEqual([
-			'check_suite',
-			'pull_request',
-		]);
+		expect(items.map((item) => item.reviewGate?.sourceEvent)).toEqual(['checks', 'pull-request']);
 	});
 
 	it('computes runsAt only for a scheduled (delayed) dispatch', () => {

@@ -3,22 +3,22 @@
  * (`src/triggers/handlers/review.ts`), ported from Cascade's
  * `check-suite-decision.ts`.
  *
- * GitHub fires one `check_suite.completed` per workflow, so no single event
- * knows whether CI as a whole is done. Given the aggregate state of *every*
- * check on the head SHA (`getCheckSuiteStatus`), this decides the one thing the
- * handler needs: review now (all passed), respond-to-ci (a check failed), or
- * defer and re-check later (some check still running). It is a pure function of
- * the aggregate — the author/draft/fork gates live in the handler — so it
- * unit-tests without any GitHub or queue plumbing.
+ * A provider fires one check-completion event per CI workflow, so no single event
+ * knows whether CI as a whole is done. Given the aggregate state of *every* check
+ * on the head SHA (`SCMProvider.getAggregateCheckStatus`), this decides the one
+ * thing the handler needs: review now (all passed), respond-to-ci (a check
+ * failed), or defer and re-check later (some check still running). It is a pure
+ * function of the aggregate — the draft/fork/ownership gates live in the handler —
+ * so it unit-tests without any provider or queue plumbing.
  */
 
 import type { ReviewChecksPolicy } from '../../config/schema.js';
-import type { CheckSuiteStatus } from '../../integrations/scm/github/client.js';
+import type { AggregateCheckStatus } from '../../scm/types.js';
 
-/** Conclusions that count as a failed check — a suite in any of these is not reviewable. */
+/** Conclusions that count as a failed check — a commit with any of these is not reviewable. */
 const FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'action_required']);
 
-export type CheckSuiteDecision =
+export type AggregateCheckDecision =
 	| { action: 'defer'; incompleteChecks: string[]; message: string }
 	| { action: 'respond-to-ci'; failedChecks: string[] }
 	| { action: 'review' };
@@ -27,24 +27,24 @@ export type CheckSuiteDecision =
  * Decide what to do with a PR's aggregate CI state:
  *
  *  - `defer`  — some check hasn't reached `completed`. The caller schedules a
- *    coalesced re-check so a stale Actions API (which can lag the webhook that
+ *    coalesced re-check so a stale checks API (which can lag the webhook that
  *    woke us) is re-queried rather than trusted once.
  *  - `respond-to-ci` — every check completed and at least one failed. Routes
  *    the PR to the Respond-to-CI phase (`src/pipeline/respond-to-ci.ts`), which
  *    runs the implementer to fix the build — mirroring Cascade's respond-to-ci
  *    agent. `failedChecks` names the failing runs for the handler's log line.
  *  - `review` — every check completed and none failed. A zero-check result
- *    defers under the default `required` policy: the Actions API can
+ *    defers under the default `required` policy: the provider's checks API can
  *    temporarily return no runs just after a new commit, and treating that as
  *    green would bypass CI. Projects with no CI at all opt into `if-present`
  *    (`pipeline.review.checks`, `src/config/schema.ts`), where a zero-check
  *    result reviews immediately instead — see the `policy` parameter (issue #274).
  */
-export function decideCheckSuiteOutcome(
-	checkStatus: CheckSuiteStatus,
+export function decideAggregateCheckOutcome(
+	checkStatus: AggregateCheckStatus,
 	prNumber: string,
 	policy: ReviewChecksPolicy = 'required',
-): CheckSuiteDecision {
+): AggregateCheckDecision {
 	if (checkStatus.totalCount === 0) {
 		if (policy === 'if-present') return { action: 'review' };
 		return {

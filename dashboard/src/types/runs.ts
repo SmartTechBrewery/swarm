@@ -109,24 +109,24 @@ export const queuedWaitReasonSchema = z.enum([
 ]);
 export type QueuedWaitReason = z.infer<typeof queuedWaitReasonSchema>;
 
-/** The raw GitHub lifecycle event a review-gate job's metadata was derived from (mirrors `ReviewGateSourceEventSchema`). */
-export const queuedReviewGateSourceEventSchema = z.enum(['pull_request', 'check_suite']);
+/** The normalized SCM lifecycle event kind a review-gate job's metadata was derived from (mirrors `ReviewGateSourceEventSchema`). */
+export const queuedReviewGateSourceEventSchema = z.enum(['pull-request', 'checks']);
 export type QueuedReviewGateSourceEvent = z.infer<typeof queuedReviewGateSourceEventSchema>;
 
 /**
  * Mirrors the server `QueuedReviewGateSchema` (`src/queue/queued-runs.ts`,
- * issue #275): diagnostic metadata for a `review`-hinted `github` job — a raw
+ * issue #275): diagnostic metadata for a `review`-hinted SCM job — a normalized
  * lifecycle event *entering* the review-gate, not proof a Review agent is
  * already queued. Present only when the job carries the PR number and head SHA
  * needed to classify it safely.
  */
 export const queuedReviewGateSchema = z.object({
 	sourceEvent: queuedReviewGateSourceEventSchema,
-	/** The webhook `action` on the source event (e.g. `opened`, `synchronize`, `completed`). */
+	/** The normalized `action` on the source event (e.g. `opened`, `updated`, `completed`). */
 	sourceAction: z.string().optional(),
 	/** The PR head commit SHA this event evaluates — the review dispatch dedup key. */
 	headSha: z.string(),
-	/** Deferred check-suite recheck attempt count, when this job is a coalesced recheck. */
+	/** Deferred aggregate-check recheck attempt count, when this job is a coalesced recheck. */
 	recheckAttempt: z.number().int().nonnegative().optional(),
 });
 export type QueuedReviewGate = z.infer<typeof queuedReviewGateSchema>;

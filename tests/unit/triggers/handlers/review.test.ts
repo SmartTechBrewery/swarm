@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CheckSuiteStatus } from '@/integrations/scm/github/client.js';
+import type { AggregateCheckStatus } from '@/scm/types.js';
 import { createReviewTrigger } from '@/triggers/handlers/review.js';
 import type { TriggerContext } from '@/triggers/types.js';
 import {
-	createMockGitHubParsedEvent,
+	createFakeScmProvider,
 	createMockProjectConfig,
+	createMockScmEvent,
+	createMockScmTriggerContext,
 } from '../../../helpers/factories.js';
 
 // The handler gates dispatch on a Redis-backed dedup claim; mock it so these
@@ -34,33 +36,31 @@ vi.mock('@/triggers/respond-to-ci-attempts.js', () => ({
 	buildRespondToCiAttemptKey: (repo: string, prNumber: string) => `${repo}:${prNumber}`,
 }));
 
-// A `check_suite` event re-queries aggregate CI state and may schedule a
-// coalesced recheck — mock both so the tests need neither GitHub nor Redis.
+// A `checks` event re-queries aggregate CI state and may schedule a coalesced
+// recheck. The CI/PR/comment reads are stubs on the injected `SCMProvider` — no
+// GitHub module is mocked, so a handler that reached around the contract would
+// stop type-checking — and only the dispatcher is module-mocked (it needs Redis).
 const {
-	getCheckSuiteStatus,
+	getAggregateCheckStatus,
 	scheduleCoalescedJob,
-	withPersonaCredentials,
 	hasPersonaToken,
 	getPullRequest,
 	commentOnPullRequest,
 } = vi.hoisted(() => ({
-	getCheckSuiteStatus: vi.fn(),
+	getAggregateCheckStatus: vi.fn(),
 	scheduleCoalescedJob: vi.fn(),
-	withPersonaCredentials: vi.fn(),
 	hasPersonaToken: vi.fn(),
 	getPullRequest: vi.fn(),
 	commentOnPullRequest: vi.fn(),
 }));
-vi.mock('@/integrations/scm/github/client.js', () => ({ getCheckSuiteStatus }));
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
-vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
-	GitHubSCMIntegration: class {
-		withPersonaCredentials = withPersonaCredentials;
-		hasPersonaToken = hasPersonaToken;
-		getPullRequest = getPullRequest;
-		commentOnPullRequest = commentOnPullRequest;
-	},
-}));
+
+const SCM = createFakeScmProvider({
+	getAggregateCheckStatus,
+	hasPersonaToken,
+	getPullRequest,
+	commentOnPullRequest,
+});
 
 const { loggerWarn, loggerDebug } = vi.hoisted(() => ({
 	loggerWarn: vi.fn(),
@@ -95,8 +95,8 @@ vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	REVIEW_VERDICT_CAP: 3,
 }));
 
-/** Build a `CheckSuiteStatus` from `[name, status, conclusion]` triples. */
-function checkStatus(runs: Array<[string, string, string | null]>): CheckSuiteStatus {
+/** Build an `AggregateCheckStatus` from `[name, status, conclusion]` triples. */
+function checkStatus(runs: Array<[string, string, string | null]>): AggregateCheckStatus {
 	return {
 		totalCount: runs.length,
 		checkRuns: runs.map(([name, status, conclusion]) => ({ name, status, conclusion })),
@@ -110,13 +110,8 @@ beforeEach(() => {
 	claimRespondToCiAttempt.mockResolvedValue({ allowed: true, attempt: 1 });
 	claimConflictResolution.mockReset();
 	claimConflictResolution.mockResolvedValue(true);
-	getCheckSuiteStatus.mockReset();
+	getAggregateCheckStatus.mockReset();
 	scheduleCoalescedJob.mockReset();
-	// The integration just runs the callback under (mocked) credentials.
-	withPersonaCredentials.mockReset();
-	withPersonaCredentials.mockImplementation(
-		(_project: unknown, _persona: unknown, fn: () => Promise<unknown>) => fn(),
-	);
 	// Ownership-gate default: SWARM has an Implementation run for the work item the
 	// PR's branch decodes to. Tests flip it to exercise an unrelated PR or a
 	// run-history lookup failure.
@@ -147,33 +142,33 @@ const PROJECT = createMockProjectConfig();
 const handler = createReviewTrigger();
 
 function ctx(
-	overrides: Partial<Parameters<typeof createMockGitHubParsedEvent>[0]> = {},
+	overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {},
 	extra: {
 		recheckAttempt?: number;
 		deliveryId?: string;
 		continuationDispatchClaimed?: boolean;
 	} = {},
 ): TriggerContext {
-	return {
+	return createMockScmTriggerContext({
 		project: PROJECT,
-		source: 'github',
-		event: createMockGitHubParsedEvent(overrides),
+		scm: SCM,
+		event: createMockScmEvent(overrides),
 		...extra,
-	};
+	});
 }
 
 describe('review trigger', () => {
 	describe('matches', () => {
 		it('matches a PR opened', () => {
-			expect(handler.matches(ctx({ eventType: 'pull_request', action: 'opened' }))).toBe(true);
+			expect(handler.matches(ctx({ kind: 'pull-request', action: 'opened' }))).toBe(true);
 		});
 
 		it('matches a completed check suite', () => {
-			expect(handler.matches(ctx({ eventType: 'check_suite', action: 'completed' }))).toBe(true);
+			expect(handler.matches(ctx({ kind: 'checks', action: 'completed' }))).toBe(true);
 		});
 
 		it('ignores other PR actions', () => {
-			expect(handler.matches(ctx({ eventType: 'pull_request', action: 'closed' }))).toBe(false);
+			expect(handler.matches(ctx({ kind: 'pull-request', action: 'closed' }))).toBe(false);
 		});
 
 		it('ignores a projects source', () => {
@@ -186,9 +181,9 @@ describe('review trigger', () => {
 		});
 	});
 
-	describe('handle — pull_request opened', () => {
+	describe('handle — pull-request opened', () => {
 		const base = {
-			eventType: 'pull_request',
+			kind: 'pull-request',
 			action: 'opened',
 			workItemId: '42',
 			prAuthorLogin: 'operator-human',
@@ -292,15 +287,15 @@ describe('review trigger', () => {
 
 		it('does not query check state for a PR event', async () => {
 			await handler.handle(ctx({ ...base, headSha: 'abc123', isDraft: false, isCrossRepo: false }));
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
+			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 		});
 	});
 
 	describe('handle — check_suite', () => {
-		const base = { eventType: 'check_suite', action: 'completed', workItemId: '9' } as const;
+		const base = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
 
 		it('dispatches Review when all checks completed and none failed', async () => {
-			getCheckSuiteStatus.mockResolvedValue(
+			getAggregateCheckStatus.mockResolvedValue(
 				checkStatus([
 					['build', 'completed', 'success'],
 					['test', 'completed', 'success'],
@@ -311,19 +306,18 @@ describe('review trigger', () => {
 			// The ownership gate ran off the fetched PR's head branch — no extra
 			// author round trip on this path any more.
 			expect(hasRunForTask).toHaveBeenCalledWith(PROJECT.id, '42', 'implementation');
-			expect(getCheckSuiteStatus).toHaveBeenCalledWith('jkwiecien', 'swarm', 'cafe');
-			// The aggregate query still runs under the reviewer persona, so the
-			// reviewer identity stays independent of the PR's author (PROJECT.md §5.3).
-			expect(withPersonaCredentials).toHaveBeenCalledWith(
+			// The aggregate query goes through the provider contract, which reads under
+			// its own documented default persona (the reviewer), so the reviewer identity
+			// stays independent of the PR's author (PROJECT.md §5.3).
+			expect(getAggregateCheckStatus).toHaveBeenCalledWith(
 				expect.objectContaining({ id: PROJECT.id }),
-				'reviewer',
-				expect.any(Function),
+				'cafe',
 			);
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 		});
 
 		it('defers on zero checks by default (required policy)', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { deliveryId: 'd-3' })),
 			).toBeNull();
@@ -341,7 +335,7 @@ describe('review trigger', () => {
 			// a synthetic `check_suite completed` carrying only the new head SHA and
 			// PR branch, no check-run data of its own — the real decision happens
 			// here once the handler re-queries live Actions-API state (issue #274).
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
 			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
 			const result = await handler.handle({
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
@@ -356,7 +350,7 @@ describe('review trigger', () => {
 			// A second delivery of the same follow-up event (retry, or a sibling
 			// check_suite for the same commit) must not burn a second Review.
 			claimReviewDispatch.mockResolvedValue(false);
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
 			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
 			const result = await handler.handle({
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
@@ -367,7 +361,7 @@ describe('review trigger', () => {
 		});
 
 		it('still defers a present but incomplete check under if-present', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
 			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
 			expect(await handler.handle({ ...ctx({ ...base, headSha: 'cafe' }), project })).toBeNull();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
@@ -375,7 +369,7 @@ describe('review trigger', () => {
 		});
 
 		it('still routes a present failed check to Respond-to-CI under if-present', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
 			const result = await handler.handle({
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
@@ -404,7 +398,7 @@ describe('review trigger', () => {
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
 			expect(result).toBeNull();
 			// Gated before the (heavier) Actions-API call, and no dispatch claimed.
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
+			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 			expect(loggerWarn).toHaveBeenCalledWith(
@@ -438,7 +432,7 @@ describe('review trigger', () => {
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { deliveryId: 'd-2' })),
 			).toBeNull();
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
+			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 			expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({
 				recheckAttempt: 1,
@@ -447,7 +441,7 @@ describe('review trigger', () => {
 		});
 
 		it('dispatches Respond-to-CI when a check failed', async () => {
-			getCheckSuiteStatus.mockResolvedValue(
+			getAggregateCheckStatus.mockResolvedValue(
 				checkStatus([
 					['build', 'completed', 'success'],
 					['test', 'completed', 'failure'],
@@ -474,7 +468,7 @@ describe('review trigger', () => {
 		});
 
 		it('reuses both held claims on a prioritized Respond-to-CI retry', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 
 			const result = await handler.handle(
 				ctx(
@@ -495,7 +489,7 @@ describe('review trigger', () => {
 		});
 
 		it('skips Respond-to-CI when the phase is disabled', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 			const project = createMockProjectConfig({ pipeline: { respondToCi: { enabled: false } } });
 			expect(
 				await handler.handle({
@@ -509,7 +503,7 @@ describe('review trigger', () => {
 
 		it('does not dispatch Respond-to-CI when the PR+SHA slot is already claimed', async () => {
 			claimReviewDispatch.mockResolvedValue(false);
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' })),
 			).toBeNull();
@@ -518,21 +512,21 @@ describe('review trigger', () => {
 
 		it('drops the CI-fix dispatch once the per-PR attempt cap is hit', async () => {
 			claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 4 });
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' })),
 			).toBeNull();
 		});
 
 		it('skips Respond-to-CI when the check suite carries no PR branch', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 			// prBranch absent — the fix phase would have no branch to check out.
 			expect(await handler.handle(ctx({ ...base, headSha: 'cafe' }))).toBeNull();
 			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 		});
 
 		it('defers and schedules a coalesced recheck when a check is still running', async () => {
-			getCheckSuiteStatus.mockResolvedValue(
+			getAggregateCheckStatus.mockResolvedValue(
 				checkStatus([
 					['build', 'completed', 'success'],
 					['test', 'in_progress', null],
@@ -547,7 +541,8 @@ describe('review trigger', () => {
 			expect(coalesceKey).toBe(`check-suite:${PROJECT.repo}:9:cafe`);
 			expect(delayMs).toBe(30_000);
 			expect(job).toMatchObject({
-				type: 'github',
+				type: 'scm',
+				providerId: 'github',
 				projectId: PROJECT.id,
 				deliveryId: 'd-1',
 				recheckAttempt: 1,
@@ -555,13 +550,13 @@ describe('review trigger', () => {
 		});
 
 		it('increments recheckAttempt across successive rechecks', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'queued', null]]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'queued', null]]));
 			await handler.handle(ctx({ ...base, headSha: 'cafe' }, { recheckAttempt: 4 }));
 			expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({ recheckAttempt: 5 });
 		});
 
 		it('stops rescheduling once the recheck cap is reached', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { recheckAttempt: 20 })),
 			).toBeNull();
@@ -572,7 +567,7 @@ describe('review trigger', () => {
 			// A transient Actions-API error (or an unresolvable reviewer token) must
 			// not escape the handler — that would fail the job and burn its BullMQ
 			// retries. It defers a recheck instead.
-			getCheckSuiteStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+			getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { deliveryId: 'd-9' })),
 			).toBeNull();
@@ -584,16 +579,15 @@ describe('review trigger', () => {
 		});
 
 		it('degrades to a bounded recheck when the reviewer token cannot be resolved', async () => {
-			// `withPersonaCredentials` throws before the API call when the persona's
-			// token is unconfigured — same degrade path, no job failure.
-			withPersonaCredentials.mockRejectedValue(new Error('no reviewer token configured'));
+			// The provider throws before the API call when the persona's token is
+			// unconfigured — same degrade path, no job failure.
+			getAggregateCheckStatus.mockRejectedValue(new Error('no reviewer token configured'));
 			expect(await handler.handle(ctx({ ...base, headSha: 'cafe' }))).toBeNull();
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 		});
 
 		it('gives up (no reschedule) when the query keeps failing past the cap', async () => {
-			getCheckSuiteStatus.mockRejectedValue(new Error('still 502'));
+			getAggregateCheckStatus.mockRejectedValue(new Error('still 502'));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { recheckAttempt: 20 })),
 			).toBeNull();
@@ -605,25 +599,25 @@ describe('review trigger', () => {
 			expect(
 				await handler.handle(
 					ctx({
-						eventType: 'check_suite',
+						kind: 'checks',
 						action: 'completed',
 						workItemId: undefined,
 						headSha: 'cafe',
 					}),
 				),
 			).toBeNull();
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
+			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 		});
 
 		it('skips a suite with no head SHA (no query)', async () => {
 			expect(await handler.handle(ctx({ ...base, headSha: undefined }))).toBeNull();
-			expect(getCheckSuiteStatus).not.toHaveBeenCalled();
+			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 		});
 	});
 
 	describe('handle — dedup gate', () => {
 		const reviewable = {
-			eventType: 'pull_request',
+			kind: 'pull-request',
 			action: 'opened',
 			workItemId: '42',
 			headSha: 'abc123',
@@ -673,7 +667,7 @@ describe('review trigger', () => {
 
 	describe('handle — durable review-verdict reservation (issue #235)', () => {
 		const reviewable = {
-			eventType: 'pull_request',
+			kind: 'pull-request',
 			action: 'opened',
 			workItemId: '42',
 			headSha: 'abc123',
@@ -735,10 +729,10 @@ describe('review trigger', () => {
 		});
 
 		it('does not reserve a slot for the Respond-to-CI disposition', async () => {
-			getCheckSuiteStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
 			const result = await handler.handle(
 				ctx({
-					eventType: 'check_suite',
+					kind: 'checks',
 					action: 'completed',
 					workItemId: '9',
 					headSha: 'cafe',
@@ -752,8 +746,8 @@ describe('review trigger', () => {
 
 	describe('handle — mergeability and conflict triggers (issue #265)', () => {
 		const synchronized = {
-			eventType: 'pull_request',
-			action: 'synchronize',
+			kind: 'pull-request',
+			action: 'updated',
 			workItemId: '42',
 			headSha: 'abc123',
 			isDraft: false,
@@ -817,16 +811,16 @@ describe('review trigger', () => {
 				expect.objectContaining({
 					recheckAttempt: 1,
 					event: expect.objectContaining({
-						eventType: 'pull_request',
-						action: 'synchronize',
+						kind: 'pull-request',
+						action: 'updated',
 					}),
 				}),
-				'review-mergeability:jkwiecien/swarm:42:abc123:pull_request',
+				'review-mergeability:jkwiecien/swarm:42:abc123:pull-request',
 				30000,
 			);
 		});
 
-		it('keeps a check-suite mergeability recheck when synchronize arrives for the same head', async () => {
+		it('keeps a checks-event mergeability recheck when a PR update arrives for the same head', async () => {
 			getPullRequest.mockResolvedValue({
 				number: 42,
 				headBranch: 'issue-42',
@@ -839,7 +833,7 @@ describe('review trigger', () => {
 
 			await handler.handle(
 				ctx({
-					eventType: 'check_suite',
+					kind: 'checks',
 					action: 'completed',
 					workItemId: '42',
 					headSha: 'abc123',
@@ -851,13 +845,13 @@ describe('review trigger', () => {
 			expect(scheduleCoalescedJob).toHaveBeenNthCalledWith(
 				1,
 				expect.any(Object),
-				'review-mergeability:jkwiecien/swarm:42:abc123:check_suite',
+				'review-mergeability:jkwiecien/swarm:42:abc123:checks',
 				30000,
 			);
 			expect(scheduleCoalescedJob).toHaveBeenNthCalledWith(
 				2,
 				expect.any(Object),
-				'review-mergeability:jkwiecien/swarm:42:abc123:pull_request',
+				'review-mergeability:jkwiecien/swarm:42:abc123:pull-request',
 				30000,
 			);
 		});
