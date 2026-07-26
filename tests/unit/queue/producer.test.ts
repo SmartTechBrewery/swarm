@@ -1,5 +1,6 @@
 import type { QueueOptions } from 'bullmq';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SwarmJob } from '@/queue/jobs.js';
 import {
 	createMockGitHubProjectsWebhookJob,
 	createMockScmWebhookJob,
@@ -160,6 +161,35 @@ describe('enqueueJob', () => {
 		});
 	});
 
+	// A dispatch/run row written before issue #385 still carries the legacy
+	// envelope (`type: 'github'`), and every manual-retry and reconciler path hands
+	// that raw `jsonb` to `priorityFor`. Without normalizing first it matches
+	// neither arm and falls through to `priority: 0` — BullMQ's *highest* — so a
+	// resurrected board job would dequeue ahead of PR review-lifecycle jobs.
+	it('demotes a legacy pre-#385 work-item envelope read straight from jsonb', async () => {
+		const { enqueueJob } = await import('@/queue/producer.js');
+		const legacy = {
+			type: 'github',
+			projectId: 'swarm',
+			deliveryId: 'delivery-legacy',
+			event: {
+				eventType: 'issues',
+				action: 'labeled',
+				repoFullName: 'jkwiecien/swarm',
+				workItemId: '42',
+				isCommentEvent: false,
+				labelName: 'swarm-replan',
+			},
+		} as unknown as SwarmJob;
+
+		await enqueueJob(legacy);
+
+		expect(add).toHaveBeenCalledWith('github', legacy, {
+			jobId: 'delivery-legacy',
+			priority: 10,
+		});
+	});
+
 	it('omits the job id when the event carries no deliveryId', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
 		const { deliveryId: _dropped, ...job } = createMockScmWebhookJob();
@@ -220,6 +250,29 @@ describe('enqueueDispatchWakeUp', () => {
 			jobId: 'dispatch_board_w0',
 			priority: 10,
 		});
+	});
+
+	// The reconciler's `republishWakeUps` repairs *every* wakeable dispatch on
+	// startup, legacy rows included, so the wake-up path needs the same demotion.
+	it('demotes a legacy pre-#385 work-item wake-up', async () => {
+		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
+		const legacy = {
+			type: 'github',
+			projectId: 'swarm',
+			event: {
+				eventType: 'issues',
+				action: 'labeled',
+				repoFullName: 'jkwiecien/swarm',
+				workItemId: '42',
+				isCommentEvent: false,
+				labelName: 'swarm-replan',
+			},
+		} as unknown as SwarmJob;
+
+		await enqueueDispatchWakeUp(legacy, 'dispatch_legacy_w0', 0);
+
+		const [, , opts] = add.mock.calls[0];
+		expect(opts).toEqual({ jobId: 'dispatch_legacy_w0', priority: 10 });
 	});
 });
 

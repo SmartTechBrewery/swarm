@@ -15,7 +15,7 @@
 import { Job, Queue } from 'bullmq';
 import { requireEnv } from '../lib/env.js';
 import { parseRedisUrl } from '../lib/redis.js';
-import { QUEUE_NAME, type SwarmJob } from './jobs.js';
+import { normalizeStoredJobPayload, QUEUE_NAME, type SwarmJob } from './jobs.js';
 
 let queue: Queue<SwarmJob> | null = null;
 
@@ -32,8 +32,19 @@ let queue: Queue<SwarmJob> | null = null;
  */
 export const PM_BOARD_JOB_PRIORITY = 10;
 
+/**
+ * Normalizes before branching: most callers hand this a payload read straight out
+ * of a `jsonb` column (`dispatch.jobPayload`, `run.jobPayload`), which is *typed*
+ * {@link SwarmJob} but may still carry the pre-#385 `{ type: 'github' }` envelope
+ * — and that envelope matches neither arm, so a resurrected legacy board job would
+ * silently fall through to `undefined` → `priority: 0`, BullMQ's *highest*, the
+ * exact inversion this demotion exists to prevent. Doing it here rather than at
+ * each call site covers every current and future caller.
+ */
 export function priorityFor(job: SwarmJob): number | undefined {
-	return job.type === 'github-projects' || (job.type === 'scm' && job.event.kind === 'work-item')
+	const normalized = normalizeStoredJobPayload(job);
+	return normalized.type === 'github-projects' ||
+		(normalized.type === 'scm' && normalized.event.kind === 'work-item')
 		? PM_BOARD_JOB_PRIORITY
 		: undefined;
 }

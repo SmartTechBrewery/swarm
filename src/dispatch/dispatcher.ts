@@ -25,7 +25,7 @@ import {
 } from '../db/repositories/dispatchesRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
+import { normalizeStoredJobPayload, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
 import {
 	clearPendingJobs,
 	enqueueDispatchWakeUp,
@@ -56,7 +56,13 @@ export function deliveryDedupKey(deliveryId: string): string {
  * reconciler calls this for every wakeable dispatch it finds.
  */
 export async function publishDispatchWakeUp(dispatch: DispatchRow): Promise<void> {
-	const payload: SwarmJob = { ...dispatch.jobPayload, dispatchId: dispatch.id };
+	// Normalized so a repaired pre-#385 row publishes under the current job *name*
+	// (`scm`, not `github`) and matching payload — observability only, since the
+	// worker re-parses the claimed dispatch's stored payload as authoritative.
+	const payload: SwarmJob = {
+		...normalizeStoredJobPayload(dispatch.jobPayload),
+		dispatchId: dispatch.id,
+	};
 	const delayMs = Math.max(0, dispatch.availableAt.getTime() - Date.now());
 	await enqueueDispatchWakeUp(payload, wakeJobId(dispatch), delayMs);
 }

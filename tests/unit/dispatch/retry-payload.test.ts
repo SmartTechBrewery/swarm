@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '@/dispatch/retry-payload.js';
+import {
+	deriveCapacityPendingPayload,
+	deriveRetryJobPayload,
+	reconstructRetryJob,
+} from '@/dispatch/retry-payload.js';
+import type { SwarmJob } from '@/queue/jobs.js';
 import {
 	createMockGitHubProjectsWebhookJob,
 	createMockScmWebhookJob,
@@ -156,5 +161,43 @@ describe('deriveCapacityPendingPayload', () => {
 		});
 
 		expect(pending.continuationDispatchClaimed).toBe(true);
+	});
+});
+
+describe('reconstructRetryJob', () => {
+	// Two of the three callers ("Retry now"'s reconstruct-from-run-row fallback and
+	// "Reset & restart") pass a raw `run.jobPayload` straight out of `jsonb`, so a
+	// pre-#385 row must be upgraded here — otherwise the rebuilt dispatch persists
+	// the legacy envelope forward and the row never heals.
+	it('upgrades a legacy pre-#385 envelope instead of rewriting it forward', () => {
+		const legacy = {
+			type: 'github',
+			projectId: 'swarm',
+			event: {
+				eventType: 'issues',
+				action: 'labeled',
+				repoFullName: 'jkwiecien/swarm',
+				workItemId: '42',
+				isCommentEvent: false,
+				labelName: 'swarm-replan',
+			},
+		} as unknown as SwarmJob;
+
+		const job = reconstructRetryJob(legacy, 'run-1', 'planning');
+
+		expect(job).toMatchObject({
+			type: 'scm',
+			providerId: 'github',
+			event: { kind: 'work-item' },
+		});
+		expect(job.runId).toBe('run-1');
+		expect(job.rateLimitRetryAttempt).toBe(0);
+	});
+
+	it('leaves a current envelope untouched while carrying the run row forward', () => {
+		const job = reconstructRetryJob(createMockScmWebhookJob(), 'run-2', 'review');
+
+		expect(job).toMatchObject({ type: 'scm', providerId: 'github' });
+		expect(job.runId).toBe('run-2');
 	});
 });
