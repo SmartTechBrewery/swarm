@@ -416,7 +416,12 @@ describe('toQueuedRuns', () => {
 
 		const [item] = toQueuedRuns([makeDispatch({ jobPayload: legacy })]);
 
-		expect(item).toMatchObject({ type: 'scm', providerId: 'github', repo: 'jkwiecien/swarm', prNumber: '42' });
+		expect(item).toMatchObject({
+			type: 'scm',
+			providerId: 'github',
+			repo: 'jkwiecien/swarm',
+			prNumber: '42',
+		});
 		expect(item.phaseHint).toBe('review');
 		expect(item.reviewGate).toEqual({
 			sourceEvent: 'checks',

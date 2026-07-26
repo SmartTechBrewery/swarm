@@ -44,7 +44,8 @@ import { RunStatusBadge } from './run-status-badge.js';
 const githubItem: QueuedRun = {
 	jobId: 'job-1',
 	projectId: 'proj-a',
-	type: 'github',
+	type: 'scm',
+	providerId: 'github',
 	state: 'waiting',
 	phaseHint: 'review',
 	repo: 'acme/widgets',
@@ -323,7 +324,8 @@ describe('QueuedRunsSection', () => {
 			const groupedBoardFollowUp: QueuedRun = {
 				...boardItem,
 				jobId: 'job-board-followup',
-				type: 'github',
+				type: 'scm',
+				providerId: 'github',
 				repo: 'acme/widgets',
 				prNumber: '42',
 				reviewGate: { sourceEvent: 'checks', sourceAction: 'completed', headSha: 'sha-fix' },
