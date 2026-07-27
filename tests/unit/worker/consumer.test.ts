@@ -288,17 +288,22 @@ vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
 	getAllCliQuotas: () => getAllCliQuotas(),
 }));
 
-// The PR-comment path of `reportInterruptedJobToBoard` goes through the concrete
-// SCM integration (the PM provider has no PR → comment mapping); mock it at the
-// module boundary the same way the PM provider is mocked above. Hoisted, because
-// the consumer's provider-registry side-effect import constructs this class at
-// module load (issue #385) — before a plain `const` would be initialized.
-const { commentOnPullRequest } = vi.hoisted(() => ({
+// The consumer's own SCM writes and reads — the interrupted-job and phase-failure
+// PR comments, and the run row's PR-title lookup — resolve their provider from
+// `scmProviderRegistry` (issue #386). Mocking the concrete class still stubs them
+// all out, because the consumer's provider-registry side-effect import registers
+// `new GitHubSCMIntegration()`, so the registry holds *this* stub instance and
+// both `requireProjectSCMProvider(project)` and `requireSCMProvider('github')`
+// hand it back. Hoisted, because that registration runs at module load — before a
+// plain `const` would be initialized.
+const { commentOnPullRequest, getPullRequestTitle } = vi.hoisted(() => ({
 	commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 99),
+	getPullRequestTitle: vi.fn(async (_p: unknown, _n: number) => 'Fix the flaky trigger test'),
 }));
 vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
 	GitHubSCMIntegration: class {
 		commentOnPullRequest = commentOnPullRequest;
+		getPullRequestTitle = getPullRequestTitle;
 	},
 }));
 
@@ -419,6 +424,12 @@ vi.mock('@/worktree/termination-cleanup.js', () => ({
 		),
 }));
 
+import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
+import {
+	_resetSCMProviderRegistryForTesting,
+	getSCMProvider,
+	registerSCMProvider,
+} from '@/integrations/scm/registry.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 import type { TriggerContext, TriggerResult } from '@/triggers/types.js';
@@ -3593,6 +3604,32 @@ describe('reportInterruptedJobToBoard', () => {
 		expect(body).toContain('SWARM run interrupted');
 		expect(body).toContain('job stalled more than allowable limit');
 		expect(addComment).not.toHaveBeenCalled();
+	});
+
+	// Resolution is by the job's own `providerId`, not by the project (issue #386):
+	// the job already names the provider its ingress parsed the event with, so the
+	// comment lands on the provider the event came from. A second registered
+	// manifest is what tells the two apart — the project-scoped lookup refuses to
+	// pick between them, while the id lookup is unambiguous.
+	it('resolves the commenting provider from the job’s providerId', async () => {
+		const github = getSCMProvider('github') as SCMProviderManifest;
+		registerSCMProvider({
+			id: 'bitbucket',
+			label: 'Bitbucket',
+			category: 'scm',
+			webhookRoute: '/bitbucket/webhook',
+			provider: { commentOnPullRequest: vi.fn() },
+		} as unknown as SCMProviderManifest);
+		try {
+			await reportInterruptedJobToBoard(createMockScmWebhookJob(), 'stalled');
+
+			expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
+		} finally {
+			// The registry is a process singleton with no unregister; restore the
+			// entrypoint's own registration so later cases see one provider again.
+			_resetSCMProviderRegistryForTesting();
+			registerSCMProvider(github);
+		}
 	});
 
 	it('comments on the work item for a github-projects (board) job', async () => {

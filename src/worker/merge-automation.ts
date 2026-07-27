@@ -27,7 +27,7 @@ import {
 } from '../db/repositories/dispatchesRepository.js';
 import { updateReviewMergeOutcome } from '../db/repositories/runsRepository.js';
 import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
-import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { MergeAutomationJob } from '../queue/jobs.js';
@@ -171,9 +171,9 @@ async function persistMergeOutcome(
 	}
 }
 
-/** The default provider: GitHub's adapter, resolved fresh per attempt. */
-function defaultMergePullRequest(): MergePullRequest {
-	const scm = new GitHubSCMIntegration();
+/** The default merge capability: the project's registered provider, resolved fresh per attempt. */
+function defaultMergePullRequest(project: ProjectConfig): MergePullRequest {
+	const scm = requireProjectSCMProvider(project);
 	return scm.mergePullRequest.bind(scm);
 }
 
@@ -189,7 +189,7 @@ export async function processMergeAutomationDispatch(
 	dispatch: DispatchRow,
 	job: MergeAutomationJob,
 	project: ProjectConfig,
-	mergePullRequest: MergePullRequest = defaultMergePullRequest(),
+	mergePullRequest: MergePullRequest = defaultMergePullRequest(project),
 ): Promise<MergeAutomationSettledOutcome> {
 	const attempt = dispatch.attempt;
 	let outcome: MergePullRequestOutcome;

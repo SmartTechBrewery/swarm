@@ -87,8 +87,13 @@ import { listEnrollmentsForWorker } from '../db/repositories/workerEnrollmentsRe
 import type { Worker } from '../identity/worker.js';
 import { isRoutable } from '../identity/worker-enrollment.js';
 import { resolveWorkerByCredential } from '../identity/worker-service.js';
+// Side-effect import: registers every PM and SCM provider manifest into its
+// registry before defaultDeps() resolves the project's SCM provider below. This
+// module reads the registry at request time, so it must not rely on a sibling
+// module having loaded the entrypoint first (matching `./webhook-receiver.ts`).
+import '../integrations/entrypoint.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
-import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import {
 	type ScheduleFollowUpReview,
@@ -154,7 +159,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		findProjectById: findProjectByIdFromDb,
 		isWorkerEnrolled: isWorkerEnrolledDefault,
 		buildScmDelivery: (project, persona) =>
-			new GitHubSCMIntegration().deliveryProvider(project, persona),
+			requireProjectSCMProvider(project).deliveryProvider(project, persona),
 		buildPmProvider: createGitHubProjectsProvider,
 		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,

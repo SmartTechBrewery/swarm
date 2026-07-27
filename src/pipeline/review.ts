@@ -65,7 +65,7 @@ import {
 } from '@/harness/agent-cli.js';
 import { agentRunError } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
-import { GitHubSCMIntegration } from '@/integrations/scm/github/scm-integration.js';
+import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
 import { buildReviewPrompt } from '@/pipeline/prompts/review.js';
 import {
@@ -464,7 +464,8 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		}
 		const handoff = readHandoff(handle.path, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
 		const delivery =
-			options.delivery ?? (await new GitHubSCMIntegration().deliveryProvider(project, 'reviewer'));
+			options.delivery ??
+			(await requireProjectSCMProvider(project).deliveryProvider(project, 'reviewer'));
 		const deliveryId = deliveryIdentity(['review', project.repo, prNumber, headSha]);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);

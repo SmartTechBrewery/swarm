@@ -29,15 +29,12 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
 }));
 
-// The default provider path constructs the concrete GitHub integration; these
-// tests always inject `mergePullRequest`, so the class is stubbed out entirely.
-vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
-	GitHubSCMIntegration: class {
-		mergePullRequest = vi.fn();
-	},
-}));
-
 import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
+import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
+import {
+	_resetSCMProviderRegistryForTesting,
+	registerSCMProvider,
+} from '@/integrations/scm/registry.js';
 import type { MergeAutomationJob } from '@/queue/jobs.js';
 import type { MergePullRequestOutcome } from '@/scm/merge.js';
 import {
@@ -76,7 +73,29 @@ function mergeReturning(outcome: MergePullRequestOutcome) {
 	return vi.fn(async (_p: unknown, _n: number, _sha: string) => outcome);
 }
 
+/**
+ * The registered provider standing in for GitHub. Every case below injects
+ * `mergePullRequest` explicitly except the one that exercises the default, which
+ * resolves the project's provider through `scmProviderRegistry` (issue #386) —
+ * so the registry gets one fake manifest rather than the real integration's
+ * module graph.
+ */
+const registeredMergePullRequest = vi.fn(async (_p: unknown, _n: number, _sha: string) => ({
+	status: 'merged' as const,
+	message: 'merged',
+	sha: 'abc',
+}));
+
 beforeEach(() => {
+	_resetSCMProviderRegistryForTesting();
+	registeredMergePullRequest.mockClear();
+	registerSCMProvider({
+		id: 'github',
+		label: 'GitHub',
+		category: 'scm',
+		webhookRoute: '/github/webhook',
+		provider: { mergePullRequest: registeredMergePullRequest },
+	} as unknown as SCMProviderManifest);
 	completeDispatch.mockClear();
 	failDispatch.mockClear();
 	scheduleDispatchRetry.mockClear();
@@ -290,6 +309,29 @@ describe('processMergeAutomationDispatch', () => {
 			result: 'provider-error',
 			prNumber: '17',
 		});
+	});
+
+	// The only path the argument-injecting cases above leave uncovered: the default
+	// merge capability, which now comes from the project's registered provider
+	// instead of a concrete GitHub construction (issue #386).
+	it('defaults to the registered provider’s merge capability when none is injected', async () => {
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project);
+
+		expect(registeredMergePullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'deadbeef');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'merged',
+			prNumber: '17',
+		});
+	});
+
+	it('surfaces the unresolvable-provider throw when no provider is registered', async () => {
+		_resetSCMProviderRegistryForTesting();
+
+		await expect(processMergeAutomationDispatch(mockDispatchRow(), job, project)).rejects.toThrow(
+			/Cannot resolve the SCM provider/,
+		);
 	});
 
 	it('still settles the dispatch when persisting the outcome onto the run fails', async () => {

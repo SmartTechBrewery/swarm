@@ -68,8 +68,7 @@ import { discoverCliQuotas } from '../harness/quota-discovery.js';
 // consumer (`src/router/dispatcher.ts`) drives `processJob` too.
 import '../integrations/entrypoint.js';
 import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
-import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
-import { requireSCMProvider } from '../integrations/scm/registry.js';
+import { requireProjectSCMProvider, requireSCMProvider } from '../integrations/scm/registry.js';
 import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -1144,7 +1143,7 @@ export async function resolveScmDelivery(
 		workerCredential,
 		projectId: project.id,
 		persona,
-		localDelegate: await new GitHubSCMIntegration().deliveryProvider(project, persona),
+		localDelegate: await requireProjectSCMProvider(project).deliveryProvider(project, persona),
 	});
 }
 
@@ -1259,7 +1258,7 @@ export interface AssignedPhaseInputs {
 	 * provider (ADR-004 §2, {@link resolveScmDelivery}) or DB-free dispatch
 	 * injection (ADR-003 §2, `../transport/assignment-execution.ts`), or
 	 * `undefined` to use the phase's own in-process delegate (the local host
-	 * worker, via `GitHubSCMIntegration`).
+	 * worker, via the project's registered SCM provider).
 	 *
 	 * A remote worker with no `DATABASE_URL` additionally injects an
 	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
@@ -1810,7 +1809,10 @@ async function tryFetchPrTitle(
 	prNumber: string,
 ): Promise<string | undefined> {
 	try {
-		const title = await new GitHubSCMIntegration().getPullRequestTitle(project, Number(prNumber));
+		const title = await requireProjectSCMProvider(project).getPullRequestTitle(
+			project,
+			Number(prNumber),
+		);
 		return title ?? undefined;
 	} catch (err) {
 		logger.debug('Failed to fetch PR title for run row (continuing without it)', {
@@ -2224,7 +2226,7 @@ async function reportPhaseFailureToBoardOrPr(
 				commentId,
 			});
 		} else if ('prNumber' in trigger) {
-			const scm = new GitHubSCMIntegration();
+			const scm = requireProjectSCMProvider(project);
 			const commentId = await scm.commentOnPullRequest(project, Number(trigger.prNumber), body);
 			logger.debug('Posted phase-failure comment to the PR', {
 				projectId: project.id,
@@ -2291,8 +2293,8 @@ export function interruptedRunCommentBody(error: string): string {
  * comment must not throw out of an event handler. The target is derived straight
  * from the job's event (no trigger re-dispatch, which would re-run dedup claims
  * and API calls): a board event → the work item (Issue) via the PM provider; a
- * PR/check event → the PR via the SCM integration (the PM provider has no
- * PR-number → comment mapping, mirroring {@link reportPhaseFailureToBoard}).
+ * PR/check event → the PR via the provider the job itself names (the PM provider
+ * has no PR-number → comment mapping, mirroring {@link reportPhaseFailureToBoard}).
  */
 export async function reportInterruptedJobToBoard(jobData: unknown, error: string): Promise<void> {
 	let job: SwarmJob;
@@ -2347,7 +2349,9 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 			});
 			return;
 		}
-		const scm = new GitHubSCMIntegration();
+		// The job carries the provider its own ingress wrote, so resolve by that id
+		// rather than by project — the event-accurate lookup (issue #385's pattern).
+		const scm = requireSCMProvider(job.providerId);
 		const commentId = await scm.commentOnPullRequest(project, Number(prNumber), body);
 		logger.info('Posted interrupted-run comment on PR', {
 			projectId: project.id,
