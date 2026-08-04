@@ -207,17 +207,30 @@ if (rawWorkerCredential) {
 			workerId: executionSession.identity.workerId,
 			sessionId: executionSession.identity.sessionId,
 		});
-		// Declare this program's phase repertoire now that the fenced session proves it
-		// owns the row (the same ordering the transport handshake uses). This process
-		// runs every phase through the full `processJob` switch — it holds
-		// `DATABASE_URL`, so `planning`'s board write/split surface is available — and
-		// saying so is what keeps a row from carrying the narrower set a previous
-		// `dev:worker:connect` run declared, which would otherwise refuse `planning`
-		// here forever (issue #467). Only the phases are written; the CLI set stays the
-		// operator-registered one.
-		await declareWorkerSupportedPhases(executionSession.identity.workerId, [...ALL_TRIGGER_PHASES]);
 	} catch (err) {
 		logger.error('Failed to acquire configured worker execution session — refusing to start', {
+			error: describeError(err),
+		});
+		process.exit(1);
+	}
+	// Declare this program's phase repertoire now that the fenced session proves it
+	// owns the row (the same ordering the transport handshake uses). This process runs
+	// every phase through the full `processJob` switch — it holds `DATABASE_URL`, so
+	// `planning`'s board write/split surface is available — and saying so is what keeps
+	// a row from carrying the narrower set a previous `dev:worker:connect` run
+	// declared, which would otherwise refuse `planning` here forever (issue #467). Only
+	// the phases are written; the CLI set stays the operator-registered one.
+	//
+	// Its own try/catch, outside the acquire above, so a failure here is reported as
+	// what it is rather than as a session-acquisition failure. Still fatal: this
+	// process cannot serve jobs without the database anyway, and starting with a
+	// stale narrow set would silently refuse phases this host can run — the exact
+	// failure #467 closes.
+	try {
+		await declareWorkerSupportedPhases(executionSession.identity.workerId, [...ALL_TRIGGER_PHASES]);
+	} catch (err) {
+		logger.error('Failed to declare this worker’s runnable phases — refusing to start', {
+			workerId: executionSession.identity.workerId,
 			error: describeError(err),
 		});
 		process.exit(1);
