@@ -94,6 +94,23 @@ capability, and available capacity. Routing follows these rules:
 Assignment is therefore an execution-affinity rule, not a grant of access and
 not a way for a project administrator to bypass the worker owner's consent.
 
+> **Amended (issue #469): affinity applies per phase, and `planning` is exempt.**
+> Rule 1's "must not fall back to another user's worker" is unconditional as
+> written, which is right for a phase whose *point* is running on the owner's
+> machine — `implementation`, which writes source in a worktree under the
+> operator's own token. It is wrong for `planning`, because the ability to run that
+> phase is deliberately **not** distributed: a DB-free remote worker refuses it
+> (its board write/split surface is wider than the control plane's delivery seam
+> carries, ADR-003). An item assigned to a user whose only machine is such a worker
+> was therefore never plannable at all — the permitted set held one worker that
+> refuses the phase, and the dispatch deferred to a terminal failure while a
+> capable worker sat idle. Two individually correct rules composed into work that
+> could never run. `planning` is now dispatched to any eligible, capable worker
+> regardless of assignment (`AFFINITY_GATED_PHASES`,
+> `src/worker/eligibility-gate.ts`); every other phase is unchanged. If Planning
+> ever becomes runnable without a database, this exemption is worth revisiting —
+> the reason for it is a capability asymmetry, not a property of planning as such.
+
 For community-contributed workers, execution results are untrusted until they
 pass the project's normal delivery controls. Changes are isolated in a
 worktree and delivered through the repository's branch/PR, review, and CI
