@@ -4,6 +4,7 @@ const {
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	enrollWorker,
+	getDashboardWorkerDetail,
 	getEnrollment,
 	listDashboardWorkers,
 	listOwnerWorkers,
@@ -25,6 +26,7 @@ const {
 		AllowedClisNotCapableError,
 		approveEnrollment: vi.fn(),
 		enrollWorker: vi.fn(),
+		getDashboardWorkerDetail: vi.fn(),
 		getEnrollment: vi.fn(),
 		listDashboardWorkers: vi.fn(),
 		listOwnerWorkers: vi.fn(),
@@ -44,6 +46,7 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	enrollWorker,
+	getDashboardWorkerDetail,
 	getEnrollment,
 	listDashboardWorkers,
 	listOwnerWorkers,
@@ -115,6 +118,7 @@ beforeEach(() => {
 	for (const m of [
 		approveEnrollment,
 		enrollWorker,
+		getDashboardWorkerDetail,
 		getEnrollment,
 		listDashboardWorkers,
 		listOwnerWorkers,
@@ -171,6 +175,95 @@ describe('workers.list (installation roster, issue #133)', () => {
 
 		expect(rows[0].lastSeenAt).toBe('2026-07-01T12:00:00.000Z');
 		expect(rows[1].lastSeenAt).toBeNull();
+	});
+});
+
+describe('workers.getById (worker detail, issue #477)', () => {
+	/** The service view the router decorates — only the fields this suite asserts on. */
+	function detailView(overrides: Record<string, unknown> = {}) {
+		return {
+			workerId: WORKER_ID,
+			displayName: 'ada-laptop',
+			ownerUserId: OWNER_ID,
+			lastSeenAt: new Date('2026-07-01T12:00:00.000Z'),
+			enrollments: [{ enrollmentId: ENROLLMENT_ID, projectId: 'p1', status: 'active' }],
+			...overrides,
+		};
+	}
+
+	it('scopes the read exactly like the list, and serializes last-seen to ISO', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(detailView());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		const detail = await owner.getById({ workerId: WORKER_ID });
+
+		expect(getDashboardWorkerDetail).toHaveBeenCalledWith(WORKER_ID, ['p1']);
+		expect(detail.lastSeenAt).toBe('2026-07-01T12:00:00.000Z');
+	});
+
+	it('is NOT_FOUND for a worker the viewer may not see, exactly like a missing one', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(null);
+
+		await expect(owner.getById({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+	});
+
+	it('reports the owner as able to change the owner-controlled values', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(detailView());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		const detail = await owner.getById({ workerId: WORKER_ID });
+
+		expect(detail.viewerIsOwner).toBe(true);
+	});
+
+	it('reports another user as unable to, so no owner control is offered', async () => {
+		const other = workersRouter.createCaller({ user: { ...OWNER_USER, id: OTHER_ID } });
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(detailView());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		const detail = await other.getById({ workerId: WORKER_ID });
+
+		expect(detail.viewerIsOwner).toBe(false);
+	});
+
+	it('treats an instanceAdmin as owner-capable, mirroring the mutations’ own override', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getDashboardWorkerDetail.mockResolvedValue(detailView());
+
+		const detail = await admin.getById({ workerId: WORKER_ID });
+
+		expect(detail.viewerIsOwner).toBe(true);
+		// Layer-1 override: no membership lookup for either flag.
+		expect(getMembership).not.toHaveBeenCalled();
+		expect(detail.enrollments[0].viewerCanAdminister).toBe(true);
+	});
+
+	it('reports approve/suspend capability per project, from the same role check the mutations run', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1', 'p2']);
+		getDashboardWorkerDetail.mockResolvedValue(
+			detailView({
+				enrollments: [
+					{ enrollmentId: ENROLLMENT_ID, projectId: 'p1', status: 'pending' },
+					{ enrollmentId: 'e2', projectId: 'p2', status: 'active' },
+				],
+			}),
+		);
+		getMembership.mockImplementation(async (_userId: string, projectId: string) =>
+			projectId === 'p1' ? membershipFor('projectAdmin', 'p1') : membershipFor('member', 'p2'),
+		);
+
+		const detail = await owner.getById({ workerId: WORKER_ID });
+
+		expect(detail.enrollments.map((enrollment) => enrollment.viewerCanAdminister)).toEqual([
+			true,
+			false,
+		]);
 	});
 });
 

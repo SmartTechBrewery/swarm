@@ -634,6 +634,65 @@ describe('WorkersTable read-only surface for non-owners', () => {
 	});
 });
 
+describe('WorkersTable row navigation (issue #477)', () => {
+	it('opens the worker detail view on a row click', () => {
+		const onSelectWorker = vi.fn();
+		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={onSelectWorker} />);
+
+		fireEvent.click(screen.getByText('ada-laptop'));
+
+		expect(onSelectWorker).toHaveBeenCalledWith('worker-1');
+	});
+
+	it('gives keyboard/AT users an explicitly named control in the trailing cell', () => {
+		const onSelectWorker = vi.fn();
+		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={onSelectWorker} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Open ada-laptop details' }));
+
+		expect(onSelectWorker).toHaveBeenCalledTimes(1);
+		expect(onSelectWorker).toHaveBeenCalledWith('worker-1');
+	});
+
+	it('keeps the Available toggle working without navigating', async () => {
+		const onSelectWorker = vi.fn();
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+		rosterQueryFn.mockResolvedValue([makeRosterEntry()]);
+		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={onSelectWorker} />);
+
+		fireEvent.click(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' }));
+
+		// The confirmation opened (the switch did its own job) and the row did not
+		// navigate out from under it.
+		expect(screen.getByText('Stop sharing this worker?')).toBeDefined();
+		expect(onSelectWorker).not.toHaveBeenCalled();
+	});
+
+	it('keeps the Active job links working without navigating', async () => {
+		const onSelectWorker = vi.fn();
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ currentRun: makeActiveRun() })]}
+				onSelectWorker={onSelectWorker}
+			/>,
+		);
+
+		fireEvent.click(await screen.findByRole('link', { name: 'Teach the dispatcher to count' }));
+		fireEvent.click(await screen.findByRole('link', { name: /Issue: #42/ }));
+
+		expect(onSelectWorker).not.toHaveBeenCalled();
+	});
+
+	it('renders no row-open control when the caller offers no detail view', () => {
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		expect(screen.queryByRole('button', { name: /Open ada-laptop/ })).toBeNull();
+	});
+});
+
 describe('WorkersTable polling and delayed/error roster query behavior', () => {
 	it('polls supplemental queries and updates availability on cadence', async () => {
 		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);

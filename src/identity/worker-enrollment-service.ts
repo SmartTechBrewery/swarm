@@ -20,6 +20,9 @@
  * - `listDashboardWorkers(projectScope)` — the cross-project connectivity roster
  *   the dashboard's Workers screen renders (#133), scoped to what the viewer may
  *   see.
+ * - `getDashboardWorkerDetail(workerId, projectScope)` — that same row for **one**
+ *   worker (#477), widened with the full enrollment detail per visible project,
+ *   for the Workers screen's per-worker detail view.
  * - `listProjectDispatchCandidates(projectId)` — the same project scope in the
  *   shape the #130 dispatch gate judges (`src/worker/eligibility-gate.ts`):
  *   worker + enrollment + resolved availability, in the deterministic
@@ -376,6 +379,42 @@ export interface DashboardWorkerView {
 }
 
 /**
+ * One enrollment on the per-worker detail view (issue #477) — the same
+ * secret-free enrollment facts {@link WorkerRosterEntry} carries for a project,
+ * minus the worker/owner fields the surrounding view already states. These are
+ * exactly the facts that answer "why is this machine not taking work here?":
+ * approval `status`, the effective `allowedClis`, the `concurrencyAllocation`,
+ * the owner's `sharingConsent`, and the derived {@link isRoutable} verdict.
+ */
+export interface DashboardWorkerEnrollmentDetail {
+	enrollmentId: string;
+	projectId: string;
+	status: EnrollmentStatus;
+	allowedClis: AgentCli[];
+	/** `null` = no per-worker sub-limit for this project (see `ConcurrencyAllocationSchema`). */
+	concurrencyAllocation: number | null;
+	sharingConsent: boolean;
+	isRoutable: boolean;
+}
+
+/**
+ * One worker as its detail view shows it (issue #477): the cross-project roster
+ * row, plus the full enrollment detail per visible project. Secret-free by
+ * construction for the same reason the row is — it is assembled from the row's
+ * own assembler and named enrollment fields, never from a spread table row.
+ */
+export interface DashboardWorkerDetailView extends DashboardWorkerView {
+	/**
+	 * The owner's user id — the same non-secret identity `owner.userId` carries,
+	 * repeated here because it stays authoritative when the owner's user row no
+	 * longer resolves (`owner` is `null` then). A caller tests ownership against
+	 * this rather than performing a second worker read.
+	 */
+	ownerUserId: string;
+	enrollments: DashboardWorkerEnrollmentDetail[];
+}
+
+/**
  * The project ids a dashboard viewer may see: `null` for an installation
  * administrator (no restriction at all), otherwise the exact set of projects
  * they are a member of. Mirrors `accessibleProjectScope` (`src/api/authz.ts`),
@@ -416,6 +455,56 @@ export async function listDashboardWorkers(
 		views.push(await assembleDashboardWorker(worker, visible, accessible));
 	}
 	return views;
+}
+
+/**
+ * One worker's detail view (issue #477), or `null` when the viewer may not see
+ * it — the same visibility rule {@link listDashboardWorkers} applies, so this
+ * adds no second answer to "which machines may I see": an administrator
+ * (`projectScope === null`) sees any registered worker including an un-enrolled
+ * one, and any other viewer only a worker enrolled in a project they may access,
+ * with the inaccessible enrollments stripped from the view. `null` is
+ * indistinguishable from "no such worker" on purpose — the caller turns both into
+ * one `NOT_FOUND` so worker existence never leaks.
+ *
+ * Where the roster row carries only `(projectId, status)` per enrollment, this
+ * carries the full per-project enrollment detail, so the detail screen can
+ * explain routability without a roster query per project.
+ */
+export async function getDashboardWorkerDetail(
+	workerId: string,
+	projectScope: DashboardProjectScope,
+): Promise<DashboardWorkerDetailView | null> {
+	if (projectScope !== null && projectScope.length === 0) return null;
+	const worker = await getWorkerById(workerId);
+	if (!worker) return null;
+	const accessible = projectScope === null ? null : new Set(projectScope);
+	const enrollments = await listEnrollmentsForWorker(worker.id);
+	const visible = accessible
+		? enrollments.filter((enrollment) => accessible.has(enrollment.projectId))
+		: enrollments;
+	if (accessible && visible.length === 0) return null;
+	// Spreading the *assembled view* (not a row) keeps the one place that names
+	// the safe worker fields — `assembleDashboardWorker` — as the only assembler.
+	const row = await assembleDashboardWorker(worker, visible, accessible);
+	return {
+		...row,
+		ownerUserId: worker.ownerUserId,
+		enrollments: visible.map(assembleEnrollmentDetail),
+	};
+}
+
+/** Assemble one detail-view enrollment by naming each safe field explicitly. */
+function assembleEnrollmentDetail(enrollment: WorkerEnrollment): DashboardWorkerEnrollmentDetail {
+	return {
+		enrollmentId: enrollment.id,
+		projectId: enrollment.projectId,
+		status: enrollment.status,
+		allowedClis: enrollment.allowedClis,
+		concurrencyAllocation: enrollment.concurrencyAllocation,
+		sharingConsent: enrollment.sharingConsent,
+		isRoutable: isRoutable(enrollment),
+	};
 }
 
 /** Assemble one dashboard row by naming each safe field explicitly (never spreading a row). */
