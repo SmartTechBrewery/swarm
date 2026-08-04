@@ -528,6 +528,19 @@ describe('classifyAgentFailure', () => {
 		expect(classifyAgentFailure(result({ stdout: banner }), NOW)).toEqual({ kind: 'auth' });
 	});
 
+	it('classifies the observed two-line OAuth and login banner as auth', () => {
+		expect(
+			classifyAgentFailure(
+				result({
+					stdout:
+						'Failed to authenticate: OAuth session expired and could not be refreshed\n' +
+						'Not logged in · Please run /login',
+				}),
+				NOW,
+			),
+		).toEqual({ kind: 'auth' });
+	});
+
 	it('detects an auth banner on stderr too', () => {
 		// The scan reads stdout and stderr as one blob, so the banner can arrive on
 		// either stream — the real incident printed it to stderr.
@@ -544,6 +557,44 @@ describe('classifyAgentFailure', () => {
 		expect(classifyAgentFailure(result({ stdout, aborted: true }), NOW)).toEqual({
 			kind: 'aborted',
 		});
+	});
+
+	it('prioritizes structural Claude and Antigravity quota failures over an auth banner', () => {
+		const authBanner = 'Not logged in · Please run /login';
+		expect(
+			classifyAgentFailure(
+				result({
+					cli: 'claude',
+					stdout: authBanner,
+					claudeFailure: { subtype: 'rate_limit_error', message: 'rate_limit_error' },
+				}),
+				NOW,
+			),
+		).toEqual({ kind: 'rate-limit', resetHint: undefined, retryAfter: undefined });
+		expect(
+			classifyAgentFailure(
+				result({
+					cli: 'antigravity',
+					stdout: authBanner,
+					antigravityFailure: { status: 'RESOURCE_EXHAUSTED', message: 'quota' },
+				}),
+				NOW,
+			),
+		).toEqual({ kind: 'rate-limit', resetHint: undefined, retryAfter: undefined });
+	});
+
+	it('prioritizes a terminal rate-limit banner over an auth banner', () => {
+		const failure = classifyAgentFailure(
+			result({
+				stdout:
+					'Invalid API key · Please run /login\n' +
+					"you've hit your session limit — resets 1:40pm (Europe/Warsaw)",
+			}),
+			NOW,
+		);
+		expect(failure.kind).toBe('rate-limit');
+		expect(failure.resetHint).toBe('1:40pm (Europe/Warsaw)');
+		expect(failure.retryAfter?.toISOString()).toBe('2026-07-07T11:40:00.000Z');
 	});
 
 	it('prioritizes an auth banner over a trailing response-stall marker', () => {
@@ -582,9 +633,24 @@ describe('classifyAgentFailure', () => {
 				'Error: process completed with exit code 1.',
 			'The handler should return 401 when the api key is invalid.',
 			'expect(res.body.error).toBe("authentication required")',
+			'npm ERR! Failed to authenticate with the registry\nTypeError: cannot read property of undefined',
+			'Reviewed src/auth/session.ts: the handler returns 401 when the caller is Not logged in.',
+			'The configuration is rejected for an Invalid API key.',
 		]) {
 			expect(classifyAgentFailure(result({ stdout: text }), NOW).kind).toBe('error');
 		}
+	});
+
+	it('keeps a trailing stall marker ahead of borrowed auth prose', () => {
+		const failure = classifyAgentFailure(
+			result({
+				stdout:
+					'Reviewed src/auth/session.ts: the handler returns 401 when the caller is Not logged in.\n' +
+					'Error: timeout waiting for response',
+			}),
+			NOW,
+		);
+		expect(failure).toEqual({ kind: 'stalled' });
 	});
 
 	it('treats a timed-out run as a timeout regardless of its output', () => {

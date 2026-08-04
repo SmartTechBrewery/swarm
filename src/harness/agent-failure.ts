@@ -102,21 +102,16 @@ const CODEX_CAPACITY_RE = /selected model is at capacity/i;
 // "overloaded", or the literal `overloaded_error` type token — never a bare 529,
 // which reviewed code, tool output, or an unrelated log can mention innocuously.
 const CLAUDE_CAPACITY_RE = /\b529\s+overloaded\b|\boverloaded_error\b/i;
-// The distinctive shapes of an agent CLI's own "you are not authenticated"
-// banner (issue #343). Same discipline as the limit banners above — only ever
-// matched against the terminal output window, so a run whose output merely
-// *discusses* auth (a reviewed login handler, a CI log's
-// `Authentication failed for 'https://…'`) is not misread as the CLI itself
-// being logged out. Covers the forms observed live on `claude`, the default
-// engine: `Not logged in · Please run /login`, the unrefreshable OAuth session,
-// `Failed to authenticate`, plus a rejected credential (`Invalid API key`, or
-// Anthropic's `authentication_error` type token from the JSON error body). The
-// bare phrase "authentication failed" is deliberately NOT matched: that is
-// exactly what borrowed git/CI output prints. Ungated by `cli` — unlike the
-// per-provider capacity banners, these are the generic "logged out" vocabulary
-// rather than one provider's unique phrasing, and the tail window is the guard.
+// The distinctive, CLI-owned forms of an agent CLI's "you are not authenticated"
+// banner (issue #343). These are matched only in the terminal output window.
+// Broad prose such as "not logged in", "invalid API key", and "failed to
+// authenticate" is deliberately excluded: a review or CI log can use those
+// phrases without the agent CLI itself being logged out. The real observed
+// banners remain covered by their `/login`, OAuth-session, or
+// `authentication_error` marker. Like a login banner, they are provider-generic
+// rather than tied to a particular CLI.
 const AUTH_BANNER_RE =
-	/\bnot logged in\b|\brun \/login\b|\boauth session expired\b|\bsession expired and could not be refreshed\b|\bfailed to authenticate\b|\binvalid api key\b|\bauthentication_error\b/i;
+	/\brun \/login\b|\boauth session expired\b|\bsession expired and could not be refreshed\b|\bauthentication_error\b/i;
 // Claude's terminal `result` stream event is rendered as a single
 // `Claude run failed (…)` line ({@link ./claude-stream.ts}). That line is a
 // structural signal — it exists only because the CLI itself reported the run
@@ -274,19 +269,19 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
  * output and `signal: null`, since it trapped SIGTERM and called `process.exit`
  * itself rather than being torn down by the OS — {@link AgentCliResult.aborted}
  * exists precisely because `result.signal` can't be trusted to reflect this).
- * Otherwise a stalled run is classified as `stalled`. Next, a provider-capacity
- * error is `capacity`, matched per CLI so one CLI's provider error can't be
- * triggered by another CLI merely quoting or discussing the text: Codex's
- * structured `error` / `turn.failed` events anywhere in its output, or its
- * terminal `selected model is at capacity` banner; and Claude's terminal
- * `529 Overloaded` / `overloaded_error` banner. Then a CLI's own "not
- * authenticated" banner is `auth` — recognised for its message, not to retry:
- * checked before the limit scan and the stall marker so an unauthenticated run
- * can never be deferred (and resumed) onto a login only a human can restore.
- * A recognisable terminal limit banner is a `rate-limit` — as is a quota signal
- * reported by a CLI's own structural terminal failure record (Claude's failed
- * `result` event, or Antigravity's non-`SUCCESS` `status`), which needs no reset
- * hint to be trusted — and everything else is a plain `error`.
+ * Next, a provider-capacity error is `capacity`, matched per CLI so one CLI's
+ * provider error can't be triggered by another CLI merely quoting or discussing
+ * the text: Codex's structured `error` / `turn.failed` events anywhere in its
+ * output, or its terminal `selected model is at capacity` banner; and Claude's
+ * terminal `529 Overloaded` / `overloaded_error` banner. A recognisable terminal
+ * limit banner is then a `rate-limit` — as is a quota signal reported by a CLI's
+ * own structural terminal failure record (Claude's failed `result` event, or
+ * Antigravity's non-`SUCCESS` `status`), which needs no reset hint to be trusted.
+ * Then a CLI's own "not authenticated" banner is `auth` — recognised for its
+ * message, not to retry, and checked before the trailing stall marker so an
+ * unauthenticated run cannot be deferred and resumed onto a login only a human
+ * can restore. Otherwise a stalled run is classified as `stalled`, and
+ * everything else is a plain `error`.
  */
 export function classifyAgentFailure(result: AgentCliResult, now: Date = new Date()): AgentFailure {
 	if (result.timedOut) return { kind: 'timeout' };
@@ -302,14 +297,6 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 	)
 		return { kind: 'capacity' };
 	if (result.cli === 'claude' && CLAUDE_CAPACITY_RE.test(tail)) return { kind: 'capacity' };
-
-	// An unauthenticated CLI is terminal, not transient: no amount of waiting
-	// restores a login, so this is recognised for the headline's sake rather than
-	// to retry. Checked before the rate-limit scan and — like the capacity banners
-	// — ahead of the trailing stall marker below, so an auth failure can never be
-	// deferred as a `rate-limit`/`stalled` retry that cannot possibly succeed.
-	// `timedOut`/`aborted` still win: they return above.
-	if (AUTH_BANNER_RE.test(tail)) return { kind: 'auth' };
 
 	const hasClaudeRateLimit =
 		result.cli === 'claude' &&
@@ -339,6 +326,13 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 				result.rateLimitResetAt ?? (resetHint ? parseRetryAfter(resetHint, now) : undefined),
 		};
 	}
+
+	// An unauthenticated CLI is terminal, not transient: no amount of waiting
+	// restores a login, so this is recognised for the headline's sake rather than
+	// to retry. Rate-limit signals return above because a structural quota result
+	// or terminal limit banner is more specific; auth still outranks the generic
+	// trailing stall marker below. `timedOut`/`aborted` still win above both.
+	if (AUTH_BANNER_RE.test(tail)) return { kind: 'auth' };
 
 	// The CLI's own give-up-waiting phrasing (matched case-insensitively). Checked
 	// after timeout/abort and recognised provider conditions, so a trailing stall
