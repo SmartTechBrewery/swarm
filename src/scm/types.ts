@@ -10,9 +10,10 @@
  * (`src/integrations/scm/{manifest,registry}.ts`) exactly as the PM side
  * registers GitHub Projects. Bitbucket (`BitbucketSCMIntegration`, issue #296)
  * satisfies the whole contract as of its phase 4/4 but registers with
- * `runtimeReady: false`, because nothing selects a project's SCM provider yet;
- * GitLab is still planned and deliberately not built (ai/CODING_STANDARDS.md
- * "don't build it speculatively").
+ * `runtimeReady: false`, because nothing selects a project's SCM provider yet.
+ * GitLab (`GitLabSCMIntegration`, issue #295) is being built out phase by phase
+ * along the same seams and is **not registered at all** until its last stub is
+ * gone, so nothing can resolve it by id yet.
  *
  * This file defines **types only** — every importer uses `import type`, so the
  * module adds no runtime edge. That's what lets `src/config/provider.ts` (which
@@ -50,7 +51,7 @@ import type { ScmDeliveryProvider } from './delivery.js';
 import type { ScmEvent } from './events.js';
 import type { ScmMergeProvider } from './merge.js';
 
-export type ScmType = 'github' | 'bitbucket';
+export type ScmType = 'github' | 'bitbucket' | 'gitlab';
 
 /**
  * SWARM's dual-persona role model — the provider-neutral name for what the

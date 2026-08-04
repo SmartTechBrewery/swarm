@@ -96,7 +96,9 @@ describe('SwarmJobSchema', () => {
 	});
 
 	it('rejects an scm job whose providerId is not a known provider', () => {
-		const job = { ...createMockScmWebhookJob(), providerId: 'gitlab' };
+		// Not `gitlab`: that became a known id when the provider's foundation landed
+		// (issue #295), even though nothing registers it yet.
+		const job = { ...createMockScmWebhookJob(), providerId: 'gitea' };
 		expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
 	});
 
