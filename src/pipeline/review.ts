@@ -29,9 +29,15 @@
  * the review to exactly the commit CI validated.
  *
  * No PM interaction: the item already sits at "In review" (the Implementation
- * phase moved it), and a submitted review doesn't change board status — any
- * verdict drives SWARM-21 (the implementer always responds, even to an
- * approval). Merging is not this phase's job either: after an eligible
+ * phase moved it), and a submitted review doesn't change board status. Which
+ * verdicts drive SWARM-21 is the *trigger's* policy, not this phase's: under the
+ * default `pipeline.respondToReview.skipOnMinors` only `request-changes`
+ * dispatches Respond-to-review (`src/triggers/handlers/respond-to-review.ts`), so
+ * an `approve` is answered by the merge path rather than by the implementer. (This
+ * phase originally submitted a third verdict, `comment`, from when every verdict
+ * was answered; it satisfied neither path once that default changed, and was
+ * removed in issue #470 — see {@link REVIEW_VERDICTS}.) Merging is not this
+ * phase's job either: after an eligible
  * `approve` the worker persists a durable merge dispatch (issue #292,
  * `src/worker/merge-automation.ts`) executed through the provider-neutral
  * merge capability (`src/scm/merge.ts`), or the PR is left to a human.
@@ -56,6 +62,7 @@ import {
 	getPriorSubmittedReview as getPriorSubmittedReviewDefault,
 	isCapReachingRequestChanges,
 	markReviewVerdictSubmitted as markReviewVerdictSubmittedDefault,
+	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
 	type AgentCli,
@@ -74,12 +81,14 @@ import {
 	sessionRunArgs,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
+import { renderReviewBody } from '@/pipeline/review-body.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import {
 	DeliveryDeferredError,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	hasDeliveryProgress,
+	LegacyReviewHandoffSchema,
 	loadDeliveryProgress,
 	ReviewHandoffSchema,
 	readHandoff,
@@ -99,11 +108,22 @@ export const REVIEW_VERDICT_FILENAME = HANDOFF_FILENAMES.review;
 export { buildReviewPrompt };
 
 /**
- * The verdicts the agent may submit — `gh pr review`'s three event flags. The
- * agent hands back which one it used via {@link REVIEW_VERDICT_FILENAME};
- * anything else is a failed run, not a fourth outcome.
+ * The verdicts the agent may submit. The agent hands back which one it used via
+ * {@link REVIEW_VERDICT_FILENAME}; anything else is a failed run, not a third
+ * outcome.
+ *
+ * `comment` was removed (issue #470). It existed only to mirror `gh pr review`'s
+ * third event flag, and it closed every exit at once: it never clears the review
+ * gate (only `approve` persists a merge dispatch), it dispatches no
+ * Respond-to-review run under the default `skipOnMinors`, it still charges the PR
+ * a slot against {@link REVIEW_VERDICT_CAP}, and it sets no
+ * `manual-intervention-required` signal — so the PR looked reviewed and was
+ * silently terminal. A reviewer that cannot reach a verdict must fail its run,
+ * which retries, rather than post a terminal non-verdict. Note this is SWARM's
+ * *outbound* vocabulary only: `ScmReviewState` (`src/scm/events.ts`) still
+ * observes an inbound `commented` review, which humans submit routinely.
  */
-export const REVIEW_VERDICTS = ['approve', 'request-changes', 'comment'] as const;
+export const REVIEW_VERDICTS = ['approve', 'request-changes'] as const;
 
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 
@@ -279,7 +299,7 @@ interface ReviewAgentRunParams {
  */
 async function produceReviewAgentResult(
 	params: ReviewAgentRunParams,
-): Promise<{ agent: AgentCliResult; isReReview: boolean }> {
+): Promise<{ agent: AgentCliResult; isReReview: boolean; passOrdinal: number }> {
 	const {
 		shouldResumeDelivery,
 		cli,
@@ -306,9 +326,18 @@ async function produceReviewAgentResult(
 	// completion log reports `isReReview` accurately on a resumed delivery too.
 	const priorReview = await getPriorSubmittedReview(project.id, project.repo, prNumber, headSha);
 	const isReReview = priorReview?.verdict === 'request-changes';
+	// This run's own slot number, for the rendered body's pass label (issue #470).
+	// Derived from the prior *submitted* verdict rather than read back from the
+	// reservation: `reserveReviewVerdict` blocks while another slot is still
+	// pending and numbers active slots contiguously from 1, so the prior submitted
+	// ordinal plus one *is* this run's ordinal — and deriving it here keeps the
+	// three-method `ReviewVerdictLedger` seam (and its transport implementation for
+	// DB-free workers, ADR-003 §2) unchanged. The authoritative ordinal still comes
+	// from `markReviewVerdictSubmitted` after delivery, and drives the cap.
+	const passOrdinal = (priorReview?.ordinal ?? 0) + 1;
 
 	if (shouldResumeDelivery) {
-		return { agent: resumedDeliveryAgent(cli), isReReview };
+		return { agent: resumedDeliveryAgent(cli), isReReview, passOrdinal };
 	}
 
 	if (isReReview) {
@@ -335,7 +364,62 @@ async function produceReviewAgentResult(
 		signal,
 		env: { GH_TOKEN: agentToken },
 	});
-	return { agent, isReReview };
+	return { agent, isReReview, passOrdinal };
+}
+
+/**
+ * Read the review hand-off and produce what gets submitted: the verdict, and the
+ * body **rendered by SWARM** from the hand-off's fields (issue #470) rather than
+ * authored by the agent, so the review's structure is identical whichever CLI or
+ * model produced it.
+ *
+ * `allowLegacy` is set only when resuming a delivery. A worktree preserved by a
+ * half-failed submission may hold a pre-#470 hand-off that an older agent wrote,
+ * and that shape can no longer satisfy `ReviewHandoffSchema`; without this
+ * fallback the retry would fail validation forever instead of finishing the
+ * submission it had already started. A fresh run gets no such latitude — its
+ * hand-off must be the structured shape, which is what makes the format
+ * enforceable at all.
+ */
+function readReviewSubmission(
+	worktreePath: string,
+	context: {
+		cli: AgentCli;
+		headSha: string;
+		ordinal: number;
+		isReReview: boolean;
+		minorsAnswered: boolean;
+		allowLegacy: boolean;
+	},
+): { verdict: ReviewVerdict; body: string } {
+	try {
+		const handoff = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
+		return {
+			verdict: handoff.verdict,
+			body: renderReviewBody({
+				handoff,
+				headSha: context.headSha,
+				ordinal: context.ordinal,
+				cap: REVIEW_VERDICT_CAP,
+				isReReview: context.isReReview,
+				minorsAnswered: context.minorsAnswered,
+			}),
+		};
+	} catch (error) {
+		if (!context.allowLegacy) throw error;
+		const legacy = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, LegacyReviewHandoffSchema);
+		if (legacy.verdict === 'comment')
+			throw new Error(
+				`Review agent (${context.cli}) resumed a legacy hand-off with the removed 'comment' verdict; ` +
+					'it submits no actionable review (issue #470) — re-run the phase from a fresh worktree',
+			);
+		logger.warn('Review — resumed a pre-#470 hand-off; posting its authored body verbatim', {
+			headSha: context.headSha,
+			verdict: legacy.verdict,
+			reason: error instanceof Error ? error.message : String(error),
+		});
+		return { verdict: legacy.verdict, body: legacy.body };
+	}
 }
 
 /**
@@ -411,7 +495,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		graft(project.repoRoot, handle.path);
 
 		const shouldResumeDelivery = !legacyMode && deliveryResumed;
-		const { agent, isReReview } = await produceReviewAgentResult({
+		const { agent, isReReview, passOrdinal } = await produceReviewAgentResult({
 			shouldResumeDelivery,
 			cli,
 			model,
@@ -462,7 +546,14 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 				automationOutcome,
 			};
 		}
-		const handoff = readHandoff(handle.path, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
+		const submission = readReviewSubmission(handle.path, {
+			cli,
+			headSha,
+			ordinal: passOrdinal,
+			isReReview,
+			minorsAnswered: project.pipeline?.respondToReview?.skipOnMinors === false,
+			allowLegacy: shouldResumeDelivery,
+		});
 		const delivery =
 			options.delivery ??
 			(await requireProjectSCMProvider(project).deliveryProvider(project, 'reviewer'));
@@ -472,12 +563,12 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		if (!progress.reviewId)
 			progress.reviewId = await delivery.submitReview({
 				prNumber: Number(prNumber),
-				verdict: handoff.verdict,
-				body: handoff.body,
+				verdict: submission.verdict,
+				body: submission.body,
 				deliveryId,
 			});
 		saveDeliveryProgress(handle.path, progress);
-		const verdict = handoff.verdict;
+		const verdict = submission.verdict;
 		// Marked after delivery confirms the review id — idempotent, so a crash
 		// between GitHub delivery and this write is repaired by a retry without
 		// submitting a second review (issue #235).

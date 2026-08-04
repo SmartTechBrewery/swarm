@@ -14,7 +14,6 @@ import {
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { buildReviewPrompt, REVIEW_VERDICT_FILENAME, runReviewPhase } from '@/pipeline/review.js';
-import { ReviewHandoffSchema } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
@@ -190,10 +189,20 @@ describe('runReviewPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
 	});
 
-	it('throws and cleans up when the verdict is not one of the known three', async () => {
+	it('throws and cleans up when the verdict is not one of the known two', async () => {
 		verdictFileContents = 'LGTM!\n';
 		const deps = makeDeps();
 		await expect(runReviewPhase(deps)).rejects.toThrow(/unrecognized verdict 'LGTM!'/);
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
+	});
+
+	// `comment` was removed as a verdict (issue #470): it cleared no review gate and
+	// dispatched no follow-up, so a PR that received one was silently terminal. It
+	// must now fail the run — which retries — rather than be accepted.
+	it('rejects the removed comment verdict instead of submitting it', async () => {
+		verdictFileContents = 'comment\n';
+		const deps = makeDeps();
+		await expect(runReviewPhase(deps)).rejects.toThrow(/unrecognized verdict 'comment'/);
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
 	});
 
@@ -201,7 +210,6 @@ describe('runReviewPhase', () => {
 		['approve\n', 'approve'],
 		['Approve', 'approve'],
 		['REQUEST-CHANGES\n', 'request-changes'],
-		['comment', 'comment'],
 	])('normalizes verdict %j to %j', async (contents, expected) => {
 		verdictFileContents = contents;
 		const deps = makeDeps();
@@ -363,7 +371,7 @@ describe('runReviewPhase', () => {
 describe('buildReviewPrompt', () => {
 	const context = { repo: 'SmartTechBrewery/swarm', prNumber: '99', headSha: HEAD_SHA };
 
-	it('instructs reading the PR, the full diff, submitting one formal review, and recording the verdict', () => {
+	it('instructs reading the PR, the full diff, and recording the verdict in the hand-off', () => {
 		const prompt = buildReviewPrompt(context);
 		expect(prompt).toContain('gh pr view 99 --repo SmartTechBrewery/swarm --comments');
 		expect(prompt).toContain('gh pr diff 99 --repo SmartTechBrewery/swarm');
@@ -372,13 +380,34 @@ describe('buildReviewPrompt', () => {
 		expect(prompt).toContain('--request-changes');
 		expect(prompt).toContain('--comment');
 		expect(prompt).toContain(REVIEW_VERDICT_FILENAME);
-		expect(prompt).toContain('Confirm README.md remains accurate for the changes in this PR.');
-		expect(prompt).toContain('report the missing README update as a review finding');
-		expect(prompt).toContain('For every notable issue, provide an actionable proposed fix plan.');
-		expect(prompt).toContain('findings [{title,body,fixPlan}]');
-		expect(prompt).toContain(
-			"The final review body must also include each finding's evidence, impact, and proposed fix plan",
-		);
+		expect(prompt).toContain('Judge every documentation file this repo requires to stay current');
+		expect(prompt).toContain('`docsChecked`');
+	});
+
+	// The prompt specifies content, not layout (issue #470): SWARM renders the body
+	// from the hand-off's fields, so an instruction describing the review's *shape*
+	// is a second source of truth that will drift from the renderer.
+	it('asks for hand-off fields and never for an authored review body', () => {
+		const prompt = buildReviewPrompt(context);
+		expect(prompt).toContain('SWARM renders the review from them');
+		expect(prompt).toContain('anything you format yourself is discarded');
+		expect(prompt).not.toContain('The final review body');
+		expect(prompt).not.toContain('findings [{title,body,fixPlan}]');
+	});
+
+	it('states the severity rubric and that the verdict follows from it', () => {
+		const prompt = buildReviewPrompt(context);
+		for (const severity of ['`blocker`', '`major`', '`minor`', '`nit`'])
+			expect(prompt).toContain(severity);
+		expect(prompt).toContain('`blocker` and `major` block the PR');
+		expect(prompt).toContain('any `blocker`/`major` means `request-changes`');
+	});
+
+	it('offers no comment-only verdict and tells the agent to fail instead', () => {
+		const prompt = buildReviewPrompt(context);
+		expect(prompt).toContain('`verdict`: `approve` or `request-changes`. Those are the only two.');
+		expect(prompt).toContain('There is no comment-only or no-opinion verdict');
+		expect(prompt).toContain('stop and fail rather than submitting a verdict you cannot support');
 	});
 
 	it('pins the review to the head SHA and forbids modifying the repository', () => {
@@ -403,28 +432,6 @@ describe('buildReviewPrompt', () => {
 		expect(prompt).toContain('gh auth switch');
 	});
 
-	it('requires a proposed fix plan on every structured finding', () => {
-		const withoutPlan = ReviewHandoffSchema.safeParse({
-			verdict: 'request-changes',
-			body: 'A notable issue exists.',
-			findings: [{ title: 'Issue', body: 'Evidence and impact.' }],
-		});
-		const withPlan = ReviewHandoffSchema.safeParse({
-			verdict: 'request-changes',
-			body: 'A notable issue exists. Proposed fix plan: update the handler and add a regression test.',
-			findings: [
-				{
-					title: 'Issue',
-					body: 'Evidence and impact.',
-					fixPlan: 'Update the handler and add a regression test.',
-				},
-			],
-		});
-
-		expect(withoutPlan.success).toBe(false);
-		expect(withPlan.success).toBe(true);
-	});
-
 	describe('re-review variant (issue #328)', () => {
 		it('scopes the re-review to verifying previously requested changes and forbids new findings', () => {
 			const prompt = buildReviewPrompt(context, undefined, true);
@@ -432,9 +439,17 @@ describe('buildReviewPrompt', () => {
 			expect(prompt).toContain('verify that the previously requested changes were');
 			expect(prompt).toContain('STAY IN SCOPE');
 			expect(prompt).toContain('Do NOT raise new findings for pre-existing issues');
-			// Approve-when-fixed / otherwise-request-changes-with-a-strong-fix framing.
-			expect(prompt).toContain('use verdict approve');
-			expect(prompt).toContain('strong, specific, actionable instruction on exactly how to fix it');
+		});
+
+		// Finding ids are how a re-review's disposition table, and the
+		// respond-to-review flow, track one item across passes (issue #470).
+		it('requires the previous pass’s finding ids to be reused in `carried`', () => {
+			const prompt = buildReviewPrompt(context, undefined, true);
+			expect(prompt).toContain('`carried`');
+			expect(prompt).toContain("Reuse the previous review's finding ids");
+			expect(prompt).toContain('Continue past the highest id the previous review used');
+			// The initial pass has nothing to carry, so it must not be asked to.
+			expect(buildReviewPrompt(context)).not.toContain('`carried`');
 		});
 
 		it('keeps the shared review contract (read-only, no gh mutation, hand-off, no merge)', () => {

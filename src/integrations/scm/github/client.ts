@@ -376,7 +376,7 @@ export async function submitPullRequestReview(
 	repo: string,
 	input: {
 		prNumber: number;
-		verdict: 'approve' | 'request-changes' | 'comment';
+		verdict: 'approve' | 'request-changes';
 		body: string;
 		deliveryId: string;
 	},
@@ -391,12 +391,10 @@ export async function submitPullRequestReview(
 	});
 	const existing = reviews.find((review) => review.body?.includes(marker));
 	if (existing) return existing.id;
-	const event =
-		input.verdict === 'approve'
-			? 'APPROVE'
-			: input.verdict === 'request-changes'
-				? 'REQUEST_CHANGES'
-				: 'COMMENT';
+	// GitHub's third event flag, `COMMENT`, is deliberately unreachable: a
+	// comment-only review clears no gate and dispatches no follow-up, so SWARM
+	// stopped producing one (issue #470, `src/pipeline/review.ts` REVIEW_VERDICTS).
+	const event = input.verdict === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES';
 	const { data } = await client.pulls.createReview({
 		owner,
 		repo,

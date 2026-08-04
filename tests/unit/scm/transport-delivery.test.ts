@@ -118,7 +118,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
 		});
-		await provider.submitReview({ prNumber: 1, verdict: 'comment', body: 'x', deliveryId: 'd' });
+		await provider.submitReview({ prNumber: 1, verdict: 'approve', body: 'x', deliveryId: 'd' });
 		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/review');
 	});
 

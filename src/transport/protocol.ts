@@ -371,6 +371,13 @@ export const TaskExecutionResultSchema = z.object({
 	// `PM_STATUS_KEYS` (`../pm/pipeline.ts`) and `REVIEW_VERDICTS` /
 	// `REVIEW_AUTOMATION_OUTCOMES` (`../pipeline/review.ts`).
 	movedTo: z.enum(['backlog', 'planning', 'todo', 'inProgress', 'inReview', 'done']).optional(),
+	// `comment` is retired (issue #470) but stays accepted here: this is a terminal
+	// result frame, so rejecting it would fail the whole settle — losing the run's
+	// outcome — over one optional telemetry field an older worker might still send.
+	// `../router/dispatcher.ts` drops it when adapting the frame, and
+	// `../router/worker-delivery.ts` rejects any attempt to *submit* it. Narrowing
+	// this enum instead would need a `TRANSPORT_PROTOCOL_VERSION` bump, which
+	// rejects every frame from that worker rather than just this field.
 	verdict: z.enum(['approve', 'request-changes', 'comment']).optional(),
 	reviewOrdinal: z.number().int().positive().optional(),
 	reviewAutomationOutcome: z.enum(['manual-intervention-required']).optional(),
