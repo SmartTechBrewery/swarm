@@ -8,9 +8,9 @@ import { rootRoute } from '../__root.js';
 
 /**
  * The **Workers** screen (issue #133): which machines are enrolled and
- * connected, what they can run, and what they are running right now. Per project
- * it also shows sharing/availability state, and lets the signed-in operator
- * toggle sharing consent on the workers they own (issue #282).
+ * connected, what they can run, and which job they are running right now. Per
+ * project it also shows availability for automatic dispatch, and lets the
+ * signed-in operator toggle it on the workers they own (issue #282).
  *
  * Polling, not realtime — {@link WORKERS_REFETCH_MS} is comfortably below the
  * default 60s heartbeat TTL, so a worker that stops heartbeating flips to
@@ -28,8 +28,10 @@ export function WorkersRouteComponent() {
 		refetchInterval: WORKERS_REFETCH_MS,
 	});
 
+	// Full container width (issue #473): the table's Active job column reads as
+	// prose, so the freed space goes to it rather than to a right-hand gutter.
 	return (
-		<div className="space-y-6 max-w-5xl">
+		<div className="space-y-6">
 			<div>
 				<h1 className="text-2xl font-semibold tracking-tight text-zinc-100 flex items-center gap-2">
 					<Server className="h-6 w-6 text-violet-400" />
@@ -37,8 +39,8 @@ export function WorkersRouteComponent() {
 				</h1>
 				<p className="text-xs text-zinc-500 mt-1">
 					Registered machines you can see, their connection state, the agent CLIs they declare, the
-					run each is currently executing, and — per project — whether it is shared for automatic
-					dispatch. Toggle sharing on the workers you own.
+					job each is running now, and — per project — whether it is available for automatic
+					dispatch. Toggle availability on the workers you own.
 				</p>
 			</div>
 

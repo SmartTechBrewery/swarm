@@ -1,34 +1,38 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
+import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { formatRelativeTime } from '@/lib/format.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	OwnerWorker,
 	WorkerEnrollmentStatus,
-	WorkerEnrollmentSummary,
 	WorkerRosterEntry,
 	WorkerRow,
 } from '@/types/workers.js';
 
 /**
  * The worker roster (issue #133): one row per worker the viewer may see, with
- * connectivity, declared CLI capabilities, the run it is executing, and its
- * enrollment/approval state per visible project.
+ * connectivity, declared CLI capabilities, the job it is executing, and — per
+ * visible project — whether it is available for automatic dispatch.
  *
  * The one operable affordance (issue #282) is the owner-controlled **sharing
- * consent** switch: it renders only for an enrollment the signed-in operator
- * *owns* — established by its presence in `workers.listMine`, never inferred from
- * a client-supplied owner claim — and toggling it calls `workers.setConsent`,
- * which re-checks ownership server-side. Disabling opens a confirmation because
- * it blocks *future* automatic dispatch immediately; it never kills a running
- * agent. Everything else here stays read-only — approval, routing, and machine
- * lifecycle are out of scope for this screen.
+ * consent** switch, which the **Available** column is named for: it is actionable
+ * only for an enrollment the signed-in operator *owns* — established by its
+ * presence in `workers.listMine`, never inferred from a client-supplied owner
+ * claim — and toggling it calls `workers.setConsent`, which re-checks ownership
+ * server-side. Disabling opens a confirmation because it blocks *future*
+ * automatic dispatch immediately; it never kills a running agent. Someone else's
+ * worker shows the same switch **disabled**, so a project administrator can see
+ * that an enrolled worker isn't shared without gaining a control over it.
+ * Approval, routing, and machine lifecycle stay off this screen entirely.
  *
- * Availability/consent state, effective allowed CLIs, and per-project busy state
- * come from `workers.roster` (readable by any project `contributor`), so a
- * project administrator can see when an enrolled worker is unavailable because
- * its owner revoked sharing — with no machine path, token, or credential.
+ * Consent state comes from `workers.roster` (readable by any project
+ * `contributor`), so that unavailability is visible with no machine path, token,
+ * or credential. The screen deliberately shows *less* than the roster read model
+ * carries (issue #473): approval state, effective allowed CLIs, and per-project
+ * busy/idle were dropped from the old Enrollment cell rather than crowding one
+ * column with five unrelated facts — busy already reads off **Active job**.
  */
 
 interface WorkersTableProps {
@@ -36,16 +40,19 @@ interface WorkersTableProps {
 	refetchInterval?: number;
 }
 
-const ENROLLMENT_LABELS: Record<WorkerEnrollmentStatus, string> = {
-	pending: 'Pending',
-	active: 'Active',
-	suspended: 'Suspended',
-};
-
-const ENROLLMENT_BADGE_CLASSES: Record<WorkerEnrollmentStatus, string> = {
-	pending: 'text-amber-400 bg-amber-950/20 border-amber-900/30',
-	active: 'text-emerald-400 bg-emerald-950/20 border-emerald-900/30',
-	suspended: 'text-red-400 bg-red-950/20 border-red-900/30',
+/**
+ * Fixed desktop column widths (issue #473). The table spans its container, and
+ * the freed width goes to the Active job description — the one cell holding prose
+ * — rather than to empty space on the right; everything else is sized to its own
+ * content.
+ */
+const COLUMN_WIDTHS = {
+	machine: 'w-[16%]',
+	owner: 'w-[14%]',
+	status: 'w-[18%]',
+	capabilities: 'w-[12%]',
+	activeJob: 'w-[30%]',
+	available: 'w-[10%]',
 };
 
 /** A stable key for one `(worker, project)` enrollment across the roster/owner read models. */
@@ -77,59 +84,38 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
 	);
 }
 
-/** The availability line derived from server-side `isRoutable` — never inferred client-side. */
-function AvailabilityLabel({
-	status,
-	roster,
-	rosterUnavailable,
-	rosterLoading,
-}: {
-	status: WorkerEnrollmentStatus;
-	roster: WorkerRosterEntry | undefined;
-	rosterUnavailable: boolean;
-	rosterLoading: boolean;
-}) {
-	if (rosterUnavailable || rosterLoading || !roster) {
-		// Don't infer a sharing state from incomplete data: only note it when the
-		// roster query for this project actually failed or is loading, otherwise stay silent.
-		return rosterUnavailable || rosterLoading ? (
-			<span className="text-[10px] text-zinc-500">Sharing state unavailable</span>
-		) : null;
-	}
-	if (roster.isRoutable) {
-		return (
-			<span className="text-[10px] font-medium text-emerald-400">Available to this project</span>
-		);
-	}
-	if (status === 'active' && !roster.sharingConsent) {
-		return <span className="text-[10px] font-medium text-zinc-400">Not sharing</span>;
-	}
-	return <span className="text-[10px] text-zinc-500">Not routable</span>;
-}
-
-/** An accessible on/off switch for owner-controlled sharing consent. */
+/** An accessible on/off switch for sharing consent — read-only unless the viewer owns the worker. */
 function ConsentSwitch({
 	sharing,
 	pending,
+	readOnly,
 	label,
+	title,
 	onToggle,
 }: {
 	sharing: boolean;
 	pending: boolean;
+	/** A worker the viewer doesn't own: the state is shown, the control is not offered. */
+	readOnly: boolean;
 	label: string;
+	title: string;
 	onToggle: (next: boolean) => void;
 }) {
+	const disabled = pending || readOnly;
 	return (
 		<button
 			type="button"
 			role="switch"
 			aria-checked={sharing}
 			aria-label={label}
-			disabled={pending}
-			onClick={() => onToggle(!sharing)}
-			className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-1 focus:ring-offset-panel disabled:opacity-50 disabled:cursor-not-allowed ${
-				sharing ? 'bg-emerald-600' : 'bg-zinc-700'
-			}`}
+			title={title}
+			disabled={disabled}
+			onClick={() => {
+				if (!readOnly) onToggle(!sharing);
+			}}
+			className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-1 focus:ring-offset-panel disabled:cursor-not-allowed ${
+				readOnly ? 'opacity-60' : 'disabled:opacity-50'
+			} ${sharing ? 'bg-emerald-600' : 'bg-zinc-700'}`}
 		>
 			<span
 				className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
@@ -140,16 +126,14 @@ function ConsentSwitch({
 	);
 }
 
-interface EnrollmentItemProps {
-	enrollment: WorkerEnrollmentSummary;
-	projectName: string;
+interface AvailabilityCellProps {
 	worker: WorkerRow;
-	roster: WorkerRosterEntry | undefined;
-	rosterUnavailable: boolean;
-	rosterLoading: boolean;
-	ownedEnrollmentId: string | undefined;
-	pending: boolean;
-	error: string | null;
+	projectNames: Map<string, string>;
+	rosterByKey: Map<string, WorkerRosterEntry>;
+	ownedEnrollmentIdByKey: Map<string, string>;
+	pendingEnrollmentId: string | undefined;
+	inlineErrorEnrollmentId: string | undefined;
+	errorMessage: string | null;
 	onToggle: (args: {
 		enrollmentId: string;
 		projectId: string;
@@ -159,73 +143,82 @@ interface EnrollmentItemProps {
 	}) => void;
 }
 
-/** One `(worker, project)` enrollment: name, approval state, availability, allowed CLIs, and — for an owned enrollment — the consent switch. */
-function EnrollmentItem({
-	enrollment,
-	projectName,
+/**
+ * Availability for automatic dispatch, one switch per visible enrollment: the
+ * consent state, actionable for a worker the viewer owns and read-only otherwise.
+ * The project each switch belongs to is carried by its accessible name and
+ * tooltip rather than a repeated label — a worker is usually enrolled in one
+ * project, and naming it in the cell is what made the old column unreadable.
+ *
+ * A switch is withheld entirely while the project's roster query is loading or
+ * failed: consent is unknown then, and rendering an "off" switch would state
+ * something the server never said.
+ */
+function AvailabilityCell({
 	worker,
-	roster,
-	rosterUnavailable,
-	rosterLoading,
-	ownedEnrollmentId,
-	pending,
-	error,
+	projectNames,
+	rosterByKey,
+	ownedEnrollmentIdByKey,
+	pendingEnrollmentId,
+	inlineErrorEnrollmentId,
+	errorMessage,
 	onToggle,
-}: EnrollmentItemProps) {
-	const sharing = roster?.sharingConsent ?? false;
+}: AvailabilityCellProps) {
+	if (worker.enrollments.length === 0) {
+		return <span className="text-sm text-zinc-500">—</span>;
+	}
 	return (
-		<li className="space-y-1 text-xs text-zinc-300">
-			<div className="flex items-center gap-2">
-				<span className="font-mono">{projectName}</span>
-				<span
-					className={`px-2 py-0.5 text-[10px] font-semibold rounded-full border ${ENROLLMENT_BADGE_CLASSES[enrollment.status]}`}
-				>
-					{ENROLLMENT_LABELS[enrollment.status]}
-				</span>
-				{roster?.runState.busy ? (
-					<span className="text-[10px] font-medium text-amber-400">Busy</span>
-				) : roster ? (
-					<span className="text-[10px] text-zinc-500">Idle</span>
-				) : null}
-				{ownedEnrollmentId && roster && !rosterUnavailable && !rosterLoading ? (
-					<ConsentSwitch
-						sharing={sharing}
-						pending={pending}
-						label={`Share ${worker.displayName} with ${projectName}`}
-						onToggle={(next) =>
-							onToggle({
-								enrollmentId: ownedEnrollmentId,
-								projectId: enrollment.projectId,
-								workerName: worker.displayName,
-								projectName,
-								next,
-							})
-						}
-					/>
-				) : null}
-			</div>
-			<div className="flex flex-wrap items-center gap-1.5">
-				<AvailabilityLabel
-					status={enrollment.status}
-					roster={roster}
-					rosterUnavailable={rosterUnavailable}
-					rosterLoading={rosterLoading}
-				/>
-				{roster && roster.allowedClis.length > 0 ? (
-					<span className="flex flex-wrap gap-1" title="Effective allowed CLIs for this project">
-						{roster.allowedClis.map((cli) => (
-							<span
-								key={cli}
-								className="px-1.5 py-0.5 text-[9px] uppercase font-mono font-bold tracking-wider bg-violet-950/30 text-violet-300 rounded border border-violet-900/30"
-							>
-								{cli}
+		<ul className="space-y-2">
+			{worker.enrollments.map((enrollment) => {
+				const key = enrollmentKey(worker.workerId, enrollment.projectId);
+				const roster = rosterByKey.get(key);
+				const projectName = projectNames.get(enrollment.projectId) ?? enrollment.projectId;
+				const ownedEnrollmentId = ownedEnrollmentIdByKey.get(key);
+				if (!roster) {
+					return (
+						<li key={enrollment.projectId}>
+							<span className="text-sm text-zinc-500" title="Sharing state unavailable">
+								—
 							</span>
-						))}
-					</span>
-				) : null}
-			</div>
-			{error ? <div className="text-[10px] text-red-400">{error}</div> : null}
-		</li>
+						</li>
+					);
+				}
+				return (
+					<li key={enrollment.projectId} className="space-y-1">
+						<ConsentSwitch
+							sharing={roster.sharingConsent}
+							pending={ownedEnrollmentId !== undefined && pendingEnrollmentId === ownedEnrollmentId}
+							readOnly={ownedEnrollmentId === undefined}
+							label={
+								ownedEnrollmentId
+									? `Share ${worker.displayName} with ${projectName}`
+									: `Sharing of ${worker.displayName} with ${projectName}`
+							}
+							title={
+								ownedEnrollmentId
+									? `Share ${worker.displayName} with ${projectName}`
+									: `Only ${worker.owner?.displayName ?? 'the owner'} can change sharing for ${projectName}`
+							}
+							onToggle={(next) => {
+								if (!ownedEnrollmentId) return;
+								onToggle({
+									enrollmentId: ownedEnrollmentId,
+									projectId: enrollment.projectId,
+									workerName: worker.displayName,
+									projectName,
+									next,
+								});
+							}}
+						/>
+						{ownedEnrollmentId !== undefined &&
+						inlineErrorEnrollmentId === ownedEnrollmentId &&
+						errorMessage ? (
+							<div className="text-[10px] text-red-400">{errorMessage}</div>
+						) : null}
+					</li>
+				);
+			})}
+		</ul>
 	);
 }
 
@@ -239,13 +232,15 @@ interface ConfirmTarget {
 export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 	const queryClient = useQueryClient();
 
-	// Resolve project display names the same way RunsTable does; the roster falls
-	// back to the raw project id when this auxiliary lookup is unavailable.
+	// Resolve projects the same way RunsTable does — names for the consent
+	// switches' accessible labels, repo for an active job's PR link. The roster
+	// falls back to the raw project id when this auxiliary lookup is unavailable.
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectNames = new Map(projectsQuery.data?.map((p) => [p.id, p.name]) ?? []);
+	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, p.repo]) ?? []);
 
-	// The signed-in operator's own workers — presence here is what authorizes a
-	// consent control for an enrollment.
+	// The signed-in operator's own workers — presence here is what authorizes an
+	// actionable consent switch for an enrollment.
 	const mineQuery = useQuery({
 		...trpc.workers.listMine.queryOptions(),
 		refetchInterval,
@@ -253,8 +248,8 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 
 	// Every project any visible worker is enrolled in is, by construction, one the
 	// viewer may access (the server strips inaccessible enrollments), so a roster
-	// query per project is authorized. This supplies consent/routability/allowed
-	// CLIs/busy for all viewers, including a project admin looking at others' workers.
+	// query per project is authorized. This supplies consent state for all viewers,
+	// including a project admin looking at others' workers.
 	const projectIds = [...new Set(workers.flatMap((w) => w.enrollments.map((e) => e.projectId)))];
 	const rosterQueries = useQueries({
 		queries: projectIds.map((projectId) => ({
@@ -264,12 +259,7 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 	});
 
 	const rosterByKey = new Map<string, WorkerRosterEntry>();
-	const rosterLoadingProjects = new Set<string>();
-	const rosterErrorProjects = new Set<string>();
-	rosterQueries.forEach((query, index) => {
-		const projectId = projectIds[index];
-		if (query.isLoading) rosterLoadingProjects.add(projectId);
-		if (query.isError) rosterErrorProjects.add(projectId);
+	rosterQueries.forEach((query) => {
 		for (const entry of query.data ?? []) {
 			rosterByKey.set(enrollmentKey(entry.workerId, entry.projectId), entry);
 		}
@@ -391,7 +381,15 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 
 	return (
 		<div className="border border-zinc-800 rounded-md overflow-hidden bg-panel/20 shadow-sm">
-			<table className="w-full text-left border-collapse">
+			<table className="w-full table-fixed text-left border-collapse">
+				<colgroup>
+					<col className={COLUMN_WIDTHS.machine} />
+					<col className={COLUMN_WIDTHS.owner} />
+					<col className={COLUMN_WIDTHS.status} />
+					<col className={COLUMN_WIDTHS.capabilities} />
+					<col className={COLUMN_WIDTHS.activeJob} />
+					<col className={COLUMN_WIDTHS.available} />
+				</colgroup>
 				<thead>
 					<tr className="bg-zinc-800/30 border-b border-zinc-800">
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
@@ -407,28 +405,30 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 							Capabilities
 						</th>
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-							Active run
+							Active job
 						</th>
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-							Enrollment
+							Available
 						</th>
 					</tr>
 				</thead>
 				<tbody className="divide-y divide-zinc-800/60">
 					{workers.map((worker) => (
 						<tr key={worker.workerId} className="hover:bg-zinc-800/40 transition-colors">
-							<td className="px-3 py-3 text-sm font-medium text-zinc-100">{worker.displayName}</td>
-							<td className="px-3 py-3 text-sm text-zinc-300">
+							<td className="px-3 py-3 align-top text-sm font-medium text-zinc-100 break-words">
+								{worker.displayName}
+							</td>
+							<td className="px-3 py-3 align-top text-sm text-zinc-300 break-words">
 								{worker.owner ? (
 									<span title={worker.owner.identifier}>{worker.owner.displayName}</span>
 								) : (
 									<span className="text-zinc-500">—</span>
 								)}
 							</td>
-							<td className="px-3 py-3">
+							<td className="px-3 py-3 align-top">
 								<ConnectionCell worker={worker} />
 							</td>
-							<td className="px-3 py-3">
+							<td className="px-3 py-3 align-top">
 								<div className="flex flex-wrap gap-1">
 									{worker.capabilities.length > 0 ? (
 										worker.capabilities.map((cli) => (
@@ -444,54 +444,31 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 									)}
 								</div>
 							</td>
-							<td className="px-3 py-3 text-sm font-mono">
-								{worker.currentRunId ? (
-									<a
-										href={`/runs/${worker.currentRunId}`}
-										className="text-violet-400 hover:text-violet-300 hover:underline"
-									>
-										{worker.currentRunId}
-									</a>
+							<td className="px-3 py-3 align-top text-sm">
+								{worker.currentRun ? (
+									// The same description `/runs` gives the run, with the title
+									// linking to its detail page — the run id itself is a UUID and
+									// says nothing about the work (issue #473).
+									<WorkItemCell
+										run={worker.currentRun}
+										repo={projectRepos.get(worker.currentRun.projectId)}
+										titleHref={`/runs/${worker.currentRun.runId}`}
+									/>
 								) : (
 									<span className="text-zinc-500">—</span>
 								)}
 							</td>
-							<td className="px-3 py-3">
-								{worker.enrollments.length > 0 ? (
-									<ul className="space-y-2">
-										{worker.enrollments.map((enrollment) => {
-											const key = enrollmentKey(worker.workerId, enrollment.projectId);
-											const ownedEnrollmentId = ownedEnrollmentIdByKey.get(key);
-											return (
-												<EnrollmentItem
-													key={enrollment.projectId}
-													enrollment={enrollment}
-													projectName={
-														projectNames.get(enrollment.projectId) ?? enrollment.projectId
-													}
-													worker={worker}
-													roster={rosterByKey.get(key)}
-													rosterUnavailable={rosterErrorProjects.has(enrollment.projectId)}
-													rosterLoading={rosterLoadingProjects.has(enrollment.projectId)}
-													ownedEnrollmentId={ownedEnrollmentId}
-													pending={
-														ownedEnrollmentId !== undefined &&
-														pendingEnrollmentId === ownedEnrollmentId
-													}
-													error={
-														ownedEnrollmentId !== undefined &&
-														inlineErrorEnrollmentId === ownedEnrollmentId
-															? (consentMutation.error?.message ?? null)
-															: null
-													}
-													onToggle={handleToggle}
-												/>
-											);
-										})}
-									</ul>
-								) : (
-									<span className="text-xs text-zinc-500">Not enrolled</span>
-								)}
+							<td className="px-3 py-3 align-top">
+								<AvailabilityCell
+									worker={worker}
+									projectNames={projectNames}
+									rosterByKey={rosterByKey}
+									ownedEnrollmentIdByKey={ownedEnrollmentIdByKey}
+									pendingEnrollmentId={pendingEnrollmentId}
+									inlineErrorEnrollmentId={inlineErrorEnrollmentId}
+									errorMessage={consentMutation.error?.message ?? null}
+									onToggle={handleToggle}
+								/>
 							</td>
 						</tr>
 					))}

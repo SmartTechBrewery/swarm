@@ -324,6 +324,30 @@ export interface DashboardEnrollmentView {
 }
 
 /**
+ * The job a worker is executing right now, as the Workers screen's **Active job**
+ * column describes it (issue #473). It carries the same work-item fields the Runs
+ * table's Task cell renders — the resolved Issue/PR title and its reference — so
+ * both screens describe one run identically instead of the Workers screen showing
+ * a run UUID that means nothing to an operator.
+ *
+ * The fields are named explicitly rather than passing the run row through: a run
+ * carries a job payload, error text, and usage that have no business on a roster
+ * read model.
+ */
+export interface DashboardWorkerRun {
+	runId: string;
+	/** The run's project — the Workers screen resolves its repo for the PR link from this. */
+	projectId: string;
+	taskId: string;
+	phase: string;
+	workItemId: string | null;
+	workItemTitle: string | null;
+	workItemUrl: string | null;
+	prNumber: string | null;
+	prTitle: string | null;
+}
+
+/**
  * One row of the cross-project dashboard roster (#133) — secret-free by
  * construction, and read-only: it carries no machine path, credential, allowed-CLI
  * constraint, or consent/approval affordance, only what the Workers screen renders.
@@ -336,8 +360,8 @@ export interface DashboardWorkerView {
 	connection: WorkerConnectionState;
 	/** When the worker was last heard from, or `null` if it never connected. */
 	lastSeenAt: Date | null;
-	/** The run it is executing right now, or `null` when idle or the run is out of the viewer's scope. */
-	currentRunId: string | null;
+	/** The job it is executing right now, or `null` when idle or the run is out of the viewer's scope. */
+	currentRun: DashboardWorkerRun | null;
 	enrollments: DashboardEnrollmentView[];
 }
 
@@ -360,7 +384,7 @@ export type DashboardProjectScope = string[] | null;
  *
  * Connectivity is derived, never client-supplied: `connection` comes from the
  * live-session TTL, `lastSeenAt` from the retained session row (so an expired or
- * released worker keeps its last heartbeat), and `currentRunId` is exposed only
+ * released worker keeps its last heartbeat), and `currentRun` is exposed only
  * while that run is actually `running` **and** belongs to a project in scope —
  * an in-flight run from an inaccessible project never leaks through a worker the
  * viewer happens to share another project with.
@@ -408,11 +432,7 @@ async function assembleDashboardWorker(
 		capabilities: worker.capabilities,
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
-		currentRunId: await resolveVisibleRunId(
-			worker.id,
-			liveSession?.currentRunId ?? null,
-			accessible,
-		),
+		currentRun: await resolveVisibleRun(worker.id, liveSession?.currentRunId ?? null, accessible),
 		enrollments: enrollments.map((enrollment) => ({
 			projectId: enrollment.projectId,
 			status: enrollment.status,
@@ -423,32 +443,41 @@ async function assembleDashboardWorker(
 async function getIfRunningAndAccessible(
 	runId: string,
 	accessible: Set<string> | null,
-): Promise<string | null> {
+): Promise<DashboardWorkerRun | null> {
 	const run = await getRunByIdFromDb(runId);
-	if (run && run.status === 'running' && (!accessible || accessible.has(run.projectId))) {
-		return run.id;
-	}
-	return null;
+	if (!run || run.status !== 'running') return null;
+	if (accessible && !accessible.has(run.projectId)) return null;
+	return {
+		runId: run.id,
+		projectId: run.projectId,
+		taskId: run.taskId,
+		phase: run.phase,
+		workItemId: run.workItemId,
+		workItemTitle: run.workItemTitle,
+		workItemUrl: run.workItemUrl,
+		prNumber: run.prNumber,
+		prTitle: run.prTitle,
+	};
 }
 
 /**
- * The run id a viewer may see for a worker's active work, or `null`.
+ * The job a viewer may see for a worker's active work, or `null`.
  * Derives the candidate run from active, unexpired durable dispatch claims,
  * falling back to the legacy session pointer.
  * Validates the pointer against run lifecycle exactly as {@link deriveWorkerRunState}
  * does — a stale pointer to a completed/failed/deleted run reads as idle — and
  * additionally withholds a run whose project is outside a restricted viewer's scope.
  */
-async function resolveVisibleRunId(
+async function resolveVisibleRun(
 	workerId: string,
 	legacyRunId: string | null,
 	accessible: Set<string> | null,
-): Promise<string | null> {
+): Promise<DashboardWorkerRun | null> {
 	const activeClaims = await getActiveWorkerClaims(workerId);
 	for (const claim of activeClaims) {
 		if (claim.runId) {
-			const runId = await getIfRunningAndAccessible(claim.runId, accessible);
-			if (runId) return runId;
+			const run = await getIfRunningAndAccessible(claim.runId, accessible);
+			if (run) return run;
 		}
 	}
 

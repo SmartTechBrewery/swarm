@@ -4,7 +4,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { OwnerWorker, WorkerRosterEntry, WorkerRow } from '@/types/workers.js';
+import type {
+	OwnerWorker,
+	WorkerActiveRun,
+	WorkerRosterEntry,
+	WorkerRow,
+} from '@/types/workers.js';
 
 const { projectsListQueryFn, listMineQueryFn, rosterQueryFn, setConsentMutate } = vi.hoisted(
 	() => ({
@@ -51,8 +56,24 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		capabilities: ['claude', 'codex'],
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
-		currentRunId: null,
+		currentRun: null,
 		enrollments: [{ projectId: 'proj-a', status: 'active' }],
+		...overrides,
+	};
+}
+
+/** A board-driven active job, as `workers.list` reports it (issue #473). */
+function makeActiveRun(overrides: Partial<WorkerActiveRun> = {}): WorkerActiveRun {
+	return {
+		runId: 'run-7',
+		projectId: 'proj-a',
+		taskId: '42',
+		phase: 'implementation',
+		workItemId: 'I_kwitem',
+		workItemTitle: 'Teach the dispatcher to count',
+		workItemUrl: 'https://github.com/acme/widgets/issues/42',
+		prNumber: null,
+		prTitle: null,
 		...overrides,
 	};
 }
@@ -96,8 +117,8 @@ function makeOwnerWorker(overrides: Partial<OwnerWorker> = {}): OwnerWorker {
 	};
 }
 
-// The table resolves project names via `projects.list`, its own enrollments via
-// `workers.listMine`, and per-project consent via `workers.roster`. Wrap in a
+// The table resolves project names/repos via `projects.list`, its own enrollments
+// via `workers.listMine`, and per-project consent via `workers.roster`. Wrap in a
 // QueryClient (retry off). By default `projects.list` stays pending (raw id
 // fallback) and the owner/roster queries are empty so no control renders — each
 // test overrides only what it exercises.
@@ -159,20 +180,6 @@ describe('WorkersTable row content', () => {
 		expect(screen.getByText('codex')).toBeDefined();
 	});
 
-	it('links an in-flight run to its detail page', () => {
-		renderTable(<WorkersTable workers={[makeWorker({ currentRunId: 'run-7' })]} />);
-
-		const link = screen.getByRole('link', { name: 'run-7' });
-		expect(link.getAttribute('href')).toBe('/runs/run-7');
-	});
-
-	it('renders an em dash when the worker has no visible in-flight run', () => {
-		renderTable(<WorkersTable workers={[makeWorker({ currentRunId: null })]} />);
-
-		expect(screen.queryByRole('link')).toBeNull();
-		expect(screen.getAllByText('—').length).toBeGreaterThan(0);
-	});
-
 	it('renders one row per worker', () => {
 		renderTable(
 			<WorkersTable
@@ -185,54 +192,164 @@ describe('WorkersTable row content', () => {
 	});
 });
 
-describe('WorkersTable enrollment states', () => {
-	it('labels each visible enrollment with its approval state', () => {
+describe('WorkersTable active job (issue #473)', () => {
+	it('describes a board-driven job by its work-item title and reference, never by the run id', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
+		renderTable(<WorkersTable workers={[makeWorker({ currentRun: makeActiveRun() })]} />);
+
+		// The title is the primary line and links to the run — the run's UUID never
+		// appears as the cell's text.
+		const title = await screen.findByRole('link', { name: 'Teach the dispatcher to count' });
+		expect(title.getAttribute('href')).toBe('/runs/run-7');
+		expect(screen.queryByText('run-7')).toBeNull();
+		// The work item itself stays one click away, exactly as in the Runs table —
+		// the reference line needs the project's repo, so it lands with that query.
+		const issue = await screen.findByRole('link', { name: /Issue: #42/ });
+		expect(issue.getAttribute('href')).toBe('https://github.com/acme/widgets/issues/42');
+	});
+
+	it('leads a PR-driven job with the PR title and PR reference', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						currentRun: makeActiveRun({
+							phase: 'review',
+							prNumber: '19',
+							prTitle: 'Count dispatches correctly',
+						}),
+					}),
+				]}
+			/>,
+		);
+
+		expect(await screen.findByRole('link', { name: 'Count dispatches correctly' })).toBeDefined();
+		const pr = await screen.findByRole('link', { name: /PR #19/ });
+		expect(pr.getAttribute('href')).toBe('https://github.com/acme/widgets/pull/19');
+	});
+
+	it('still links a job whose title has not resolved, so a busy worker never reads as idle', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ currentRun: makeActiveRun({ workItemTitle: null }) })]}
+			/>,
+		);
+
+		const link = await screen.findByRole('link', { name: 'View run' });
+		expect(link.getAttribute('href')).toBe('/runs/run-7');
+	});
+
+	it('renders an em dash when the worker has no visible active job', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ currentRun: null })]} />);
+
+		expect(screen.queryByRole('link')).toBeNull();
+		expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+	});
+});
+
+describe('WorkersTable Available column (issue #473)', () => {
+	it('carries the consent switch alone — no approval badge, project label, allowed CLIs, or busy text', async () => {
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+		rosterQueryFn.mockResolvedValue([
+			makeRosterEntry({ runState: { busy: true, currentRunId: 'run-9' } }),
+		]);
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		const toggle = await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' });
+		const cell = toggle.closest('td');
+		expect(cell?.textContent).toBe('');
+		// The facts the old Enrollment cell crowded in are gone from the screen.
+		expect(screen.queryByText('Active')).toBeNull();
+		expect(screen.queryByText('Busy')).toBeNull();
+		expect(screen.queryByText('Idle')).toBeNull();
+		expect(screen.queryByText('Available to this project')).toBeNull();
+		expect(screen.queryByTitle('Effective allowed CLIs for this project')).toBeNull();
+	});
+
+	it('shows an em dash for a registered-but-un-enrolled machine', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ enrollments: [] })]} />);
+
+		expect(screen.queryByRole('switch')).toBeNull();
+		expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+	});
+
+	it('renders one switch per visible enrollment, each naming its project', async () => {
+		listMineQueryFn.mockResolvedValue([
+			makeOwnerWorker({
+				enrollments: [
+					...makeOwnerWorker().enrollments,
+					{
+						enrollmentId: 'enr-2',
+						projectId: 'proj-b',
+						status: 'active',
+						allowedClis: ['codex'],
+						concurrencyAllocation: null,
+						sharingConsent: false,
+						isRoutable: false,
+					},
+				],
+			}),
+		]);
+		rosterQueryFn.mockImplementation(async ({ projectId }: { projectId: string }) =>
+			projectId === 'proj-a'
+				? [makeRosterEntry()]
+				: [
+						makeRosterEntry({
+							enrollmentId: 'enr-2',
+							projectId: 'proj-b',
+							sharingConsent: false,
+							isRoutable: false,
+						}),
+					],
+		);
 		renderTable(
 			<WorkersTable
 				workers={[
 					makeWorker({
 						enrollments: [
 							{ projectId: 'proj-a', status: 'active' },
-							{ projectId: 'proj-b', status: 'pending' },
-							{ projectId: 'proj-c', status: 'suspended' },
+							{ projectId: 'proj-b', status: 'active' },
 						],
 					}),
 				]}
 			/>,
 		);
 
-		expect(screen.getByText('Active')).toBeDefined();
-		expect(screen.getByText('Pending')).toBeDefined();
-		expect(screen.getByText('Suspended')).toBeDefined();
-	});
-
-	it('falls back to the project id when the project-name lookup is unavailable', () => {
-		renderTable(<WorkersTable workers={[makeWorker()]} />);
-		expect(screen.getByText('proj-a')).toBeDefined();
-	});
-
-	it('shows a registered-but-un-enrolled machine as Not enrolled', () => {
-		renderTable(<WorkersTable workers={[makeWorker({ enrollments: [] })]} />);
-		expect(screen.getByText('Not enrolled')).toBeDefined();
+		expect(
+			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('true');
+		expect(
+			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-b' })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('false');
 	});
 });
 
 describe('WorkersTable sharing consent (issue #282)', () => {
-	it('shows an owner an actionable switch and the available/routable state', async () => {
+	it('shows an owner an actionable switch reflecting the server-derived consent state', async () => {
 		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
 		rosterQueryFn.mockResolvedValue([makeRosterEntry()]);
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
-		expect(await screen.findByText('Available to this project')).toBeDefined();
 		const toggle = await screen.findByRole('switch', {
 			name: 'Share ada-laptop with proj-a',
 		});
 		expect(toggle.getAttribute('aria-checked')).toBe('true');
-		// Effective allowed CLIs for the project are shown nearby.
-		expect(screen.getByTitle('Effective allowed CLIs for this project')).toBeDefined();
+		expect((toggle as HTMLButtonElement).disabled).toBe(false);
 	});
 
-	it('enables sharing directly, with the exact payload and the resulting routable state', async () => {
+	it('enables sharing directly, with the exact payload and the resulting state', async () => {
 		listMineQueryFn.mockResolvedValue([
 			makeOwnerWorker({
 				enrollments: [
@@ -267,7 +384,6 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 		});
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
-		expect(await screen.findByText('Not sharing')).toBeDefined();
 		const toggle = await screen.findByRole('switch', {
 			name: 'Share ada-laptop with proj-a',
 		});
@@ -277,7 +393,11 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 
 		// No confirmation for enabling — the mutation fires directly.
 		expect(screen.queryByText('Stop sharing this worker?')).toBeNull();
-		expect(await screen.findByText('Available to this project')).toBeDefined();
+		expect(
+			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('true');
 		expect(setConsentMutate).toHaveBeenCalledWith({
 			enrollmentId: 'enr-1',
 			sharingConsent: true,
@@ -313,15 +433,22 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 
 		fireEvent.click(screen.getByRole('button', { name: 'Stop sharing' }));
 
-		// Immediately effective: the row flips to non-routable before reconciliation.
-		expect(await screen.findByText('Not sharing')).toBeDefined();
+		// Immediately effective: the switch flips before reconciliation.
+		expect(
+			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('false');
 		expect(setConsentMutate).toHaveBeenCalledWith({
 			enrollmentId: 'enr-1',
 			sharingConsent: false,
 		});
 	});
 
-	it('keeps an active run visible after sharing is disabled (routing state effective immediately, run untouched)', async () => {
+	it('keeps the active job visible after sharing is disabled (routing state effective immediately, run untouched)', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
 		listMineQueryFn.mockResolvedValue([
 			makeOwnerWorker({ runState: { busy: true, currentRunId: 'run-9' } }),
 		]);
@@ -339,18 +466,24 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 			createdAt: NOW.toISOString(),
 			updatedAt: NOW.toISOString(),
 		});
-		renderTable(<WorkersTable workers={[makeWorker({ currentRunId: 'run-9' })]} />);
+		renderTable(
+			<WorkersTable workers={[makeWorker({ currentRun: makeActiveRun({ runId: 'run-9' }) })]} />,
+		);
 
-		fireEvent.click(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' }));
+		fireEvent.click(await screen.findByRole('switch', { name: /Share ada-laptop with/ }));
 		fireEvent.click(screen.getByRole('button', { name: 'Stop sharing' }));
 
-		expect(await screen.findByText('Not sharing')).toBeDefined();
-		// The in-flight run link is still shown — disabling sharing never kills it.
-		expect(screen.getByRole('link', { name: 'run-9' })).toBeDefined();
-		expect(screen.getAllByText('Busy').length).toBeGreaterThan(0);
+		expect(
+			(await screen.findByRole('switch', { name: /Share ada-laptop with/ })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('false');
+		// The in-flight job is still described — disabling sharing never kills it.
+		const job = screen.getByRole('link', { name: 'Teach the dispatcher to count' });
+		expect(job.getAttribute('href')).toBe('/runs/run-9');
 	});
 
-	it('shows a project admin another owner’s revoked-sharing state with no control', async () => {
+	it('shows a project admin another owner’s revoked-sharing state as a disabled switch', async () => {
 		// The viewer owns nothing (listMine empty) but can read the project roster,
 		// where the worker's owner has consent off.
 		listMineQueryFn.mockResolvedValue([]);
@@ -363,8 +496,15 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 		]);
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
-		expect(await screen.findByText('Not sharing')).toBeDefined();
-		expect(screen.queryByRole('switch')).toBeNull();
+		const readOnly = await screen.findByRole('switch', {
+			name: 'Sharing of ada-laptop with proj-a',
+		});
+		expect(readOnly.getAttribute('aria-checked')).toBe('false');
+		// Visible, but not a control: it cannot be operated and says whose it is.
+		expect((readOnly as HTMLButtonElement).disabled).toBe(true);
+		expect(readOnly.getAttribute('title')).toContain('Ada Lovelace');
+		fireEvent.click(readOnly);
+		expect(setConsentMutate).not.toHaveBeenCalled();
 		expect(screen.queryByRole('button', { name: 'Stop sharing' })).toBeNull();
 	});
 
@@ -397,7 +537,6 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 
 		expect(await screen.findByText('Enrollment with ID "enr-1" not found')).toBeDefined();
 		// The displayed state never falsely flipped to available.
-		expect(screen.getByText('Not sharing')).toBeDefined();
 		expect(
 			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' })).getAttribute(
 				'aria-checked',
@@ -407,60 +546,56 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 });
 
 describe('WorkersTable read-only surface for non-owners', () => {
-	it('offers no consent control when the viewer owns no worker', async () => {
+	it('offers no operable control when the viewer owns no worker', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
 		listMineQueryFn.mockResolvedValue([]);
 		rosterQueryFn.mockResolvedValue([makeRosterEntry()]);
-		renderTable(<WorkersTable workers={[makeWorker({ currentRunId: 'run-7' })]} />);
+		renderTable(<WorkersTable workers={[makeWorker({ currentRun: makeActiveRun() })]} />);
 
-		await screen.findByText('Available to this project');
-		expect(screen.queryAllByRole('switch')).toHaveLength(0);
+		const readOnly = await screen.findByRole('switch', {
+			name: /Sharing of ada-laptop with/,
+		});
+		expect((readOnly as HTMLButtonElement).disabled).toBe(true);
 		expect(screen.queryAllByRole('textbox')).toHaveLength(0);
 		expect(screen.queryAllByRole('combobox')).toHaveLength(0);
-		// Only the run link is interactive.
-		const table = screen.getAllByRole('row')[1];
-		expect(within(table).getAllByRole('link')).toHaveLength(1);
+		// Only the job's own links navigate: the run detail page and the work item.
+		const row = screen.getAllByRole('row')[1];
+		expect(
+			within(row)
+				.getAllByRole('link')
+				.map((link) => link.getAttribute('href')),
+		).toEqual(['/runs/run-7', 'https://github.com/acme/widgets/issues/42']);
 	});
 });
 
 describe('WorkersTable polling and delayed/error roster query behavior', () => {
-	it('polls supplemental queries and updates both Busy/Idle and sharing availability on cadence', async () => {
+	it('polls supplemental queries and updates availability on cadence', async () => {
 		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
-		// The next roster response flips two independent server-derived facts at
-		// once: run state (Idle -> Busy) and routability (routable/"Available to
-		// this project" -> consent-off/"Not sharing"). Both must reflect on the
-		// polled cadence without the row remounting.
+		// The next roster response revokes consent server-side; the switch must
+		// follow on the polled cadence without the row remounting.
 		rosterQueryFn
-			.mockResolvedValueOnce([
-				makeRosterEntry({
-					sharingConsent: true,
-					isRoutable: true,
-					runState: { busy: false, currentRunId: null },
-				}),
-			])
-			.mockResolvedValueOnce([
-				makeRosterEntry({
-					sharingConsent: false,
-					isRoutable: false,
-					runState: { busy: true, currentRunId: 'run-9' },
-				}),
-			]);
+			.mockResolvedValueOnce([makeRosterEntry({ sharingConsent: true, isRoutable: true })])
+			.mockResolvedValueOnce([makeRosterEntry({ sharingConsent: false, isRoutable: false })]);
 
 		renderTable(<WorkersTable workers={[makeWorker()]} refetchInterval={100} />);
 
-		// Initial roster response: idle and available to this project.
 		const initialRow = (await screen.findByText('ada-laptop')).closest('tr');
-		expect(await screen.findByText('Idle')).toBeDefined();
-		expect(screen.getByText('Available to this project')).toBeDefined();
-		expect(screen.queryByText('Busy')).toBeNull();
-		expect(screen.queryByText('Not sharing')).toBeNull();
+		expect(
+			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('true');
 
-		// After the poll interval, the second roster response updates both the
-		// Busy/Idle indicator and the sharing-availability label. findByText waits
-		// for the refetch-driven re-render.
-		expect(await screen.findByText('Busy')).toBeDefined();
-		expect(await screen.findByText('Not sharing')).toBeDefined();
-		expect(screen.queryByText('Idle')).toBeNull();
-		expect(screen.queryByText('Available to this project')).toBeNull();
+		// After the poll interval, the second roster response flips the switch.
+		await vi.waitFor(() => {
+			expect(
+				screen
+					.getByRole('switch', { name: 'Share ada-laptop with proj-a' })
+					.getAttribute('aria-checked'),
+			).toBe('false');
+		});
 
 		// Same row element throughout — the update was a refetch, not a remount.
 		expect((await screen.findByText('ada-laptop')).closest('tr')).toBe(initialRow);
@@ -468,7 +603,7 @@ describe('WorkersTable polling and delayed/error roster query behavior', () => {
 		expect(listMineQueryFn.mock.calls.length).toBeGreaterThanOrEqual(2);
 	});
 
-	it('withholds the switch and shows sharing state unavailable when roster query is delayed', async () => {
+	it('withholds the switch while the roster query is delayed rather than implying a state', async () => {
 		listMineQueryFn.mockResolvedValue([
 			makeOwnerWorker({
 				enrollments: [
@@ -495,31 +630,27 @@ describe('WorkersTable polling and delayed/error roster query behavior', () => {
 
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
-		// Since listMine resolved, the row shows. But roster is pending.
-		// Control should be withheld, and "Sharing state unavailable" should be shown.
-		expect(await screen.findByText('Sharing state unavailable')).toBeDefined();
+		// listMine resolved, so the row shows — but consent is unknown until the
+		// roster lands, so no switch is drawn, just an explained em dash.
+		expect(await screen.findByTitle('Sharing state unavailable')).toBeDefined();
 		expect(screen.queryByRole('switch')).toBeNull();
 
-		// Now resolve the roster query
 		resolveRoster([makeRosterEntry({ sharingConsent: true, isRoutable: true })]);
 
-		// The switch should appear and be checked
 		const toggle = await screen.findByRole('switch', {
 			name: 'Share ada-laptop with proj-a',
 		});
 		expect(toggle.getAttribute('aria-checked')).toBe('true');
-		expect(screen.queryByText('Sharing state unavailable')).toBeNull();
-		expect(screen.getByText('Available to this project')).toBeDefined();
+		expect(screen.queryByTitle('Sharing state unavailable')).toBeNull();
 	});
 
-	it('withholds the switch and shows sharing state unavailable when roster query fails', async () => {
+	it('withholds the switch when the roster query fails', async () => {
 		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
 		rosterQueryFn.mockRejectedValue(new Error('Roster query failed'));
 
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
-		// Should show sharing state unavailable and withhold control
-		expect(await screen.findByText('Sharing state unavailable')).toBeDefined();
+		expect(await screen.findByTitle('Sharing state unavailable')).toBeDefined();
 		expect(screen.queryByRole('switch')).toBeNull();
 	});
 });

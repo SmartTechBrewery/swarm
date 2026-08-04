@@ -30,6 +30,25 @@ export interface WorkerOwner {
 	displayName: string;
 }
 
+/**
+ * The job a worker is executing right now (mirrors the service
+ * `DashboardWorkerRun`, issue #473) — the same work-item fields the Runs table's
+ * Task cell renders, so the Workers screen's **Active job** column describes a run
+ * the way `/runs` does instead of printing its UUID.
+ */
+export interface WorkerActiveRun {
+	runId: string;
+	/** The run's project — the row resolves its repo from this for the PR link. */
+	projectId: string;
+	taskId: string;
+	phase: string;
+	workItemId: string | null;
+	workItemTitle: string | null;
+	workItemUrl: string | null;
+	prNumber: string | null;
+	prTitle: string | null;
+}
+
 export interface WorkerRow {
 	workerId: string;
 	displayName: string;
@@ -39,8 +58,8 @@ export interface WorkerRow {
 	connection: WorkerConnectionState;
 	/** ISO 8601 — when the worker was last heard from; null if it never connected. */
 	lastSeenAt: string | null;
-	/** The run it is executing right now; null when idle or the run is out of scope. */
-	currentRunId: string | null;
+	/** The job it is executing right now; null when idle or the run is out of scope. */
+	currentRun: WorkerActiveRun | null;
 	/** Only enrollments in projects the viewer may access; empty for an un-enrolled machine. */
 	enrollments: WorkerEnrollmentSummary[];
 }

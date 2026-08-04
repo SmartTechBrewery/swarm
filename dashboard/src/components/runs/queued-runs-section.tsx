@@ -63,7 +63,7 @@ function QueuedPhaseContent({ row }: { row: QueuedDisplayRow }) {
 	return phaseLabel;
 }
 
-/** Task / ID reference for one queued row, shared by the table cell and the card. */
+/** Task reference for one queued row, shared by the table cell and the card. */
 function QueuedWorkItemContent({
 	item,
 	variant = 'cell',
@@ -251,7 +251,7 @@ export function QueuedRunsSection({
 			)}
 			{/*
 			 * Mobile (< md): one card per grouped queued row — no horizontal scroll
-			 * (issue #381). Task / ID + Queued badge are the primary line, phase (with
+			 * (issue #381). Task + Queued badge are the primary line, phase (with
 			 * review-gate diagnostics) and Enqueued details are lighter metadata, and
 			 * the View-run / Put-back actions sit in a clearly separated action row
 			 * with generous tap targets.
@@ -341,7 +341,7 @@ export function QueuedRunsSection({
 								</th>
 							)}
 							<th className="px-2 py-2 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-								Task / ID
+								Task
 							</th>
 							<th className="px-2 py-2 text-xs font-semibold uppercase tracking-wider text-zinc-400">
 								Status

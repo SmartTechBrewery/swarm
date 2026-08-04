@@ -110,7 +110,7 @@ describe('QueuedRunsSection', () => {
 		expect(screen.queryByTestId('queued-runs-section')).toBeNull();
 	});
 
-	it('renders a card per item with the right phase label and Task / ID reference', () => {
+	it('renders a card per item with the right phase label and Task reference', () => {
 		renderSection(<QueuedRunsSection items={[githubItem, boardItem]} />);
 		const [reviewCard, boardCard] = cards();
 
@@ -121,8 +121,8 @@ describe('QueuedRunsSection', () => {
 		expect(within(boardCard).getByText('Fix the widget')).not.toBeNull();
 		expect(within(boardCard).getByText('Issue: #42')).not.toBeNull();
 
-		// The desktop table stays present (its Task / ID header included).
-		expect(within(screen.getByTestId('queued-runs-section')).getByText('Task / ID')).not.toBeNull();
+		// The desktop table stays present (its Task header included).
+		expect(within(screen.getByTestId('queued-runs-section')).getByText('Task')).not.toBeNull();
 	});
 
 	it('renders cards below md and the table only from md, without a horizontal-scroll crutch', () => {
