@@ -18,7 +18,9 @@
  *    someone else's (assignment is execution affinity, not a grant of access).
  *    An item with no assignees — or whose assignees are not linked to any SWARM
  *    user — takes the unassigned path (ADR-001 open question 5), so an unlinked
- *    handle never wedges a project.
+ *    handle never wedges a project. Affinity applies **per phase**
+ *    ({@link AFFINITY_GATED_PHASES}): to `implementation` but not to `planning`,
+ *    which runs centrally (issue #469).
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
  *    connection/health → free capacity → declared phase support (issue #467) →
@@ -74,6 +76,10 @@ import type { TriggerPhase } from '../triggers/types.js';
  * assignee's workers as a set cannot take the work right now (none enrolled here,
  * or all of them busy/disconnected). Structural reasons stay per-worker so the
  * message names the thing an operator must fix.
+ *
+ * Only an affinity-gated phase can reach `assignee-worker-unavailable`
+ * ({@link AFFINITY_GATED_PHASES}, issue #469): `planning` never narrows to one
+ * user's machines, so it can never be refused for their unavailability.
  */
 export type DispatchIneligibilityReason = IneligibilityReason | 'assignee-worker-unavailable';
 
@@ -131,14 +137,17 @@ export interface DispatchGateInput {
 	/** The phase's coded default CLI, for a target that names none. */
 	phaseDefaultCli: AgentCli;
 	/**
-	 * The phase being dispatched, matched against each candidate's declared
-	 * `supportedPhases` (issue #467) so a worker whose daemon cannot run this phase
-	 * is never selected for it.
+	 * The phase being dispatched. Read twice: matched against each candidate's
+	 * declared `supportedPhases` (issue #467) so a worker whose daemon cannot run this
+	 * phase is never selected for it, and against {@link AFFINITY_GATED_PHASES} (issue
+	 * #469) to decide whether assignee affinity applies at all.
 	 */
 	phase: TriggerPhase;
 	/**
 	 * The work item being dispatched, when the phase has one. PR-driven phases
-	 * (review / respond-*) carry no item, so they take the unassigned path.
+	 * (review / respond-*) carry no item, so they take the unassigned path — as does
+	 * `planning`, which carries one but is not affinity-gated
+	 * ({@link AFFINITY_GATED_PHASES}).
 	 */
 	workItem?: Pick<WorkItem, 'assignees'>;
 	/** The project's PM provider — only its `type`/`supportsAssignees` are read. */
@@ -161,6 +170,37 @@ export interface DispatchGateOptions {
 	 * in-process path, which reads connectivity from the lease alone (unchanged).
 	 */
 	isWorkerConnected?: (workerId: string) => boolean;
+}
+
+/**
+ * The phases assignee affinity applies to (issue #469).
+ *
+ * Affinity has always covered only the phases that carry a `WorkItem` — the two
+ * board-driven ones — since the PR-driven phases have no assignee to read
+ * (`src/triggers/types.ts`). This narrows that set by one more: **`planning` is a
+ * central phase and is not affinity-gated.**
+ *
+ * The reason is that affinity and phase capability compose badly for `planning`
+ * specifically. Affinity is a hard rule with no cross-user fallback, while the
+ * ability to run `planning` is deliberately *not* distributed — a DB-free remote
+ * worker refuses it, because its PM write/split surface is wider than the control
+ * plane's delivery seam carries (`SUPPORTED_DB_FREE_PHASES`,
+ * `src/transport/assignment-execution.ts`). An item assigned to a user whose only
+ * machine is such a worker was therefore never plannable at all: the permitted set
+ * held one worker that refuses the phase, and the dispatch deferred to a terminal
+ * failure while a capable worker sat idle. Two individually correct rules produced
+ * work that could never run.
+ *
+ * `implementation` keeps affinity, and the rationale still holds there: it writes
+ * source in a worktree on the operator's own machine under their own token, so
+ * *whose* machine runs it is the point. Planning produces a plan comment and board
+ * writes, and every DB-holding worker can do that equally.
+ */
+const AFFINITY_GATED_PHASES: ReadonlySet<TriggerPhase> = new Set<TriggerPhase>(['implementation']);
+
+/** Whether a phase routes to its assignee's own workers (see {@link AFFINITY_GATED_PHASES}). */
+export function isAffinityGatedPhase(phase: TriggerPhase): boolean {
+	return AFFINITY_GATED_PHASES.has(phase);
 }
 
 /**
@@ -251,8 +291,14 @@ export async function evaluateDispatchEligibility(
 	// machine to gate. The local worker runs it, exactly as before #130.
 	if (candidates.length === 0) return { status: 'unfederated' };
 
+	// Resolving the assignee is what *applies* affinity, so a phase that is not
+	// affinity-gated skips it entirely rather than resolving and then ignoring the
+	// answer (issue #469). That keeps every downstream consequence consistent: no
+	// narrowed `permitted` set, no `assignedUserId` on the selection, and no
+	// `assignee-worker-unavailable` framing — all of which would otherwise describe a
+	// wait for the assignee's own worker that this phase is not waiting for.
 	const assigned =
-		input.workItem && input.pm?.supportsAssignees
+		input.workItem && input.pm?.supportsAssignees && isAffinityGatedPhase(input.phase)
 			? await resolveAssignedUser(input.workItem, input.pm.type)
 			: undefined;
 	const permitted = assigned

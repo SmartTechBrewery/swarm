@@ -27,7 +27,11 @@ vi.mock('@/identity/assignee-resolver.js', () => ({
 		resolveAssignedUser(workItem, provider),
 }));
 
-import { type DispatchGateInput, evaluateDispatchEligibility } from '@/worker/eligibility-gate.js';
+import {
+	type DispatchGateInput,
+	evaluateDispatchEligibility,
+	isAffinityGatedPhase,
+} from '@/worker/eligibility-gate.js';
 
 const ALICE = '11111111-1111-4111-8111-111111111111';
 const BOB = '22222222-2222-4222-8222-222222222222';
@@ -99,6 +103,29 @@ function gateInput(overrides: Partial<DispatchGateInput> = {}): DispatchGateInpu
 
 /** A DB-free remote daemon: every phase it can run, which excludes `planning`. */
 const DB_FREE_PHASES: Worker['supportedPhases'] = [...SUPPORTED_DB_FREE_PHASES];
+
+// Issue #469. Stated as its own contract because the set is a policy decision, not
+// an implementation detail: which phases route to their assignee's own machine.
+describe('isAffinityGatedPhase', () => {
+	it('gates implementation, the phase that writes source on the owner’s machine', () => {
+		expect(isAffinityGatedPhase('implementation')).toBe(true);
+	});
+
+	it('does not gate planning, which runs centrally', () => {
+		expect(isAffinityGatedPhase('planning')).toBe(false);
+	});
+
+	it('does not gate the PR-driven phases, which carry no assignee', () => {
+		for (const phase of [
+			'review',
+			'respond-to-review',
+			'respond-to-ci',
+			'resolve-conflicts',
+		] as const) {
+			expect(isAffinityGatedPhase(phase)).toBe(false);
+		}
+	});
+});
 
 describe('evaluateDispatchEligibility', () => {
 	beforeEach(() => {
@@ -192,6 +219,125 @@ describe('evaluateDispatchEligibility', () => {
 				status: 'ineligible',
 				reason: 'assignee-worker-unavailable',
 			});
+		});
+
+		// Issue #469 — the bug this closes. Affinity is a hard rule with no cross-user
+		// fallback, while the ability to run `planning` is deliberately not distributed
+		// (a DB-free worker refuses it). Applied to Planning, the two composed into work
+		// that could never run at all, so Planning is no longer affinity-gated.
+		it('routes planning to another user’s worker despite the assignment', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-bob', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			// The same fixture is `ineligible` for implementation (the test below it).
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-bob' },
+			});
+		});
+
+		// The literal production shape from #469, with both rules composed in one case:
+		// the assignee's only machine is a DB-free worker that refuses `planning`, and the
+		// DB-capable one belongs to somebody else. Before the fix this item could never be
+		// planned; the two assertions below pin each half of the policy against the *same*
+		// fixture, so a change to either the phase-capability filter or the affinity
+		// predicate cannot silently re-open it.
+		it('plans an item whose assignee owns only a worker that cannot plan', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-host', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-host' } });
+		});
+
+		it('still holds the assignee to their own worker for implementation on that fixture', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-host', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			// Implementation is in `SUPPORTED_DB_FREE_PHASES`, so Alice's own worker takes it
+			// — Bob's is never considered. The exemption is Planning's alone.
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'implementation', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-db-free', assignedUserId: ALICE },
+			});
+		});
+
+		it('records no assignedUserId on a planning selection', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-alice', { ownerUserId: ALICE }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			// Downstream (`bindSelectedWorker`) reads this to decide between
+			// `assignee-worker-unavailable` and `worker-unavailable`. A central phase is
+			// not waiting for the assignee's machine, so it must not claim to be.
+			if (decision.status !== 'selected') throw new Error('unreachable');
+			expect(decision.selection.assignedUserId).toBeUndefined();
+		});
+
+		it('does not even resolve the assignee for planning', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-alice')]);
+
+			await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			// Resolving is what *applies* affinity; skipping it is what keeps every
+			// downstream consequence consistent rather than resolving and ignoring it.
+			expect(resolveAssignedUser).not.toHaveBeenCalled();
+		});
+
+		it('plans an item whose assignee owns no enrolled worker at all', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-bob', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-bob' } });
+		});
+
+		it('refuses a busy planning dispatch as worker-unavailable, never assignee-worker-unavailable', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a1', { activeRuns: 1 }),
+				makeCandidate('w-a2', { connected: false }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			// The message frames the wait around the project, not the assignee.
+			expect(decision.message).not.toContain('octocat');
 		});
 
 		it('never falls back to another user’s free worker', async () => {

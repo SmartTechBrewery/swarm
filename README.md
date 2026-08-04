@@ -34,9 +34,11 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   worktree and performs deterministic GitHub delivery after the agent exits.
 - Before any worktree or agent, a dispatch gate confirms an *eligible* worker may
   take the phase — active enrollment, the owner's sharing consent, a live
-  connection, free capacity, and the configured CLI. An assigned item runs only
-  on a worker owned by its assignee (never someone else's); an unassigned one
-  takes the first free eligible worker. (When single-user mode is enabled via
+  connection, free capacity, and the configured CLI. For Implementation, an
+  assigned item runs only on a worker owned by its assignee (never someone
+  else's); an unassigned one takes the first free eligible worker. **Planning is
+  central** — it is never routed by assignment, because only a worker with
+  database access can run it (issue #469). (When single-user mode is enabled via
   `SWARM_SINGLE_USER_MODE=true`, this entire federated dispatch gate is bypassed
   and every phase executes locally on the host worker without a credential.)
   When single-user mode is disabled, each federated host must authenticate with
