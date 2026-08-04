@@ -26,6 +26,7 @@ import {
 	reconcileSupersededWorkerClaims,
 } from '../dispatch/reconciler.js';
 import { discoverCliQuotas } from '../harness/quota-discovery.js';
+import { declareWorkerSupportedPhases } from '../identity/worker-service.js';
 import { optionalEnv, requireEnv, resolveDispatchMode } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { addFileSink, configureLogger, logger } from '../lib/logger.js';
@@ -34,6 +35,7 @@ import { closeRunCancellationRedis, subscribeToRunCancellations } from '../queue
 import { QUEUE_NAME, SwarmJobSchema } from '../queue/jobs.js';
 import { discoverAvailableClis, parseDeclaredClisOverride } from '../transport/cli-discovery.js';
 import { createTriggerRegistry, registerBuiltInTriggers } from '../triggers/index.js';
+import { ALL_TRIGGER_PHASES } from '../triggers/types.js';
 import { pruneStaleWorktrees } from '../worktree/retention.js';
 import {
 	type JobOutcome,
@@ -205,6 +207,15 @@ if (rawWorkerCredential) {
 			workerId: executionSession.identity.workerId,
 			sessionId: executionSession.identity.sessionId,
 		});
+		// Declare this program's phase repertoire now that the fenced session proves it
+		// owns the row (the same ordering the transport handshake uses). This process
+		// runs every phase through the full `processJob` switch — it holds
+		// `DATABASE_URL`, so `planning`'s board write/split surface is available — and
+		// saying so is what keeps a row from carrying the narrower set a previous
+		// `dev:worker:connect` run declared, which would otherwise refuse `planning`
+		// here forever (issue #467). Only the phases are written; the CLI set stays the
+		// operator-registered one.
+		await declareWorkerSupportedPhases(executionSession.identity.workerId, [...ALL_TRIGGER_PHASES]);
 	} catch (err) {
 		logger.error('Failed to acquire configured worker execution session — refusing to start', {
 			error: describeError(err),

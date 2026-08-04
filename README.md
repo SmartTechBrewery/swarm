@@ -127,7 +127,8 @@ npm run dev:worker:connect        # remote worker: connect over the tunnel, run 
 
 This client holds **only** the credential, the control-plane URL, and the
 operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`. It performs the
-`/worker/session` handshake (declaring the CLIs it can run), keeps its session
+`/worker/session` handshake (declaring the CLIs it can run and the pipeline phases
+it can execute), keeps its session
 live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
 and executes a pushed `TaskAssignment` **DB-free**: project config comes from the
 assignment, source-carrying delivery (commit / push / create-PR) runs under the
@@ -140,8 +141,11 @@ verdict-ledger reads/writes and the follow-up Review a pushed fix enqueues.
 Results stream back over the transport (ADR-003 §2). Five of the six phases run
 this way today (`respond-to-ci`, `resolve-conflicts`, `implementation`, `review`,
 `respond-to-review`); only `planning`, whose PM write/split surface is wider than
-a delivery seam should carry, is failed cleanly and stays on the local host
-worker. It is **additive**: the same-machine `npm run dev:worker`
+a delivery seam should carry, stays on the local host worker. Because the daemon
+declares its phase repertoire at handshake, the control plane never routes
+Planning to a worker that cannot run it and the work waits for one that can
+(issue #467); the worker-side gate still fails such an assignment cleanly as a
+backstop. It is **additive**: the same-machine `npm run dev:worker`
 path above is unchanged. See
 [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md#remote-worker-transport-worker).
 

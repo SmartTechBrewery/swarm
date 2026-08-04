@@ -8,8 +8,8 @@
  * It combines ADR-001's routing prerequisites — "an eligible, connected worker
  * with active owner sharing consent, project enrollment, required CLI
  * capability, and available capacity" — in that order: active enrollment →
- * active sharing consent → connection/health → free capacity → declared CLI
- * capability. The first missing signal wins, so a caller always gets *the* reason
+ * active sharing consent → connection/health → free capacity → declared phase
+ * support (issue #467) → declared CLI capability. The first missing signal wins, so a caller always gets *the* reason
  * to show rather than a set to prioritize itself. The first two checks together
  * are exactly `isRoutable` (`./worker-enrollment.ts`, #337's named seam); they are
  * evaluated separately only so a revoked consent is reported as `missing-consent`

@@ -439,6 +439,22 @@ describe('evaluateDispatchEligibility', () => {
 			});
 		});
 
+		// The refusal text is posted on the board item once the recheck budget is spent,
+		// so it must describe the phase that actually failed rather than always narrating
+		// the planning/DB-free case.
+		it('names the refused phase without asserting it is planning', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-narrow', { supportedPhases: ['implementation'] }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'review' }));
+
+			expect(decision.status).toBe('ineligible');
+			if (decision.status !== 'ineligible') return;
+			expect(decision.message).toContain("'review'");
+			expect(decision.message).not.toContain('planning');
+		});
+
 		it('still selects that DB-free worker for a phase it does declare', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
 				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),

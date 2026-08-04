@@ -14,7 +14,10 @@
  * result is a discriminated union so each phase only carries the inputs it
  * actually uses, and the worker's `switch` is exhaustive at compile time. These
  * are in-process shapes (the queue boundary is `src/queue/jobs.ts`), so plain
- * types, not Zod.
+ * types, not Zod — with one deliberate exception: the phase vocabulary itself
+ * ({@link TriggerPhaseSchema}) does get a validator here, because it *is* parsed at
+ * boundaries (a transport handshake frame, the persisted worker read model) and
+ * those layers should share one rather than each rebuilding its own.
  */
 
 import { z } from 'zod';

@@ -1,14 +1,20 @@
 import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { createWorker, findWorkerByCredentialHash, getWorkerById, updateWorkerCapabilities } =
-	vi.hoisted(() => ({
-		createWorker: vi.fn(),
-		findWorkerByCredentialHash: vi.fn(),
-		getWorkerById: vi.fn(),
-		updateWorkerCapabilities: vi.fn(),
-		listWorkersForOwner: vi.fn(),
-	}));
+const {
+	createWorker,
+	findWorkerByCredentialHash,
+	getWorkerById,
+	updateWorkerCapabilities,
+	updateWorkerSupportedPhases,
+} = vi.hoisted(() => ({
+	createWorker: vi.fn(),
+	findWorkerByCredentialHash: vi.fn(),
+	getWorkerById: vi.fn(),
+	updateWorkerCapabilities: vi.fn(),
+	updateWorkerSupportedPhases: vi.fn(),
+	listWorkersForOwner: vi.fn(),
+}));
 const { listWorkersForOwner } = vi.hoisted(() => ({ listWorkersForOwner: vi.fn() }));
 
 vi.mock('@/db/repositories/workersRepository.js', () => ({
@@ -16,11 +22,13 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 	findWorkerByCredentialHash,
 	getWorkerById,
 	updateWorkerCapabilities,
+	updateWorkerSupportedPhases,
 	listWorkersForOwner,
 }));
 
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import {
+	declareWorkerSupportedPhases,
 	hashWorkerCredential,
 	issueWorkerCredential,
 	refreshWorkerCapabilities,
@@ -51,6 +59,7 @@ beforeEach(() => {
 	findWorkerByCredentialHash.mockReset();
 	getWorkerById.mockReset();
 	updateWorkerCapabilities.mockReset();
+	updateWorkerSupportedPhases.mockReset();
 	listWorkersForOwner.mockReset();
 });
 
@@ -161,6 +170,41 @@ describe('refreshWorkerCapabilities', () => {
 		await expect(refreshWorkerCapabilities('worker-1', ['codex'])).rejects.toThrow(
 			WorkerCapabilityReductionError,
 		);
+	});
+});
+
+// Issue #467: the in-process host worker's declaration seam. It authenticates by
+// acquiring an execution session rather than handshaking, so it must be able to state
+// its phase repertoire without overwriting the operator-registered CLI set.
+describe('declareWorkerSupportedPhases', () => {
+	it('validates and de-duplicates the set, then delegates to the phase-only writer', async () => {
+		updateWorkerSupportedPhases.mockImplementation(async (id, supportedPhases) =>
+			makeWorker({ id, supportedPhases }),
+		);
+
+		const updated = await declareWorkerSupportedPhases('worker-1', [
+			'planning',
+			'planning',
+			'implementation',
+		]);
+
+		expect(updated?.supportedPhases).toEqual(['planning', 'implementation']);
+		expect(updateWorkerSupportedPhases).toHaveBeenCalledWith('worker-1', [
+			'planning',
+			'implementation',
+		]);
+		// Never routed through the CLI writer, which would need a capability set it has none of.
+		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	it('rejects an empty set without hitting the repository', async () => {
+		await expect(declareWorkerSupportedPhases('worker-1', [])).rejects.toThrow();
+		expect(updateWorkerSupportedPhases).not.toHaveBeenCalled();
+	});
+
+	it('rejects an unknown phase without hitting the repository', async () => {
+		await expect(declareWorkerSupportedPhases('worker-1', ['deploy' as never])).rejects.toThrow();
+		expect(updateWorkerSupportedPhases).not.toHaveBeenCalled();
 	});
 });
 

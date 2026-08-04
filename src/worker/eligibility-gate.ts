@@ -21,7 +21,8 @@
  *    handle never wedges a project.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
- *    connection/health → free capacity → declared/allowed CLI.
+ *    connection/health → free capacity → declared phase support (issue #467) →
+ *    declared/allowed CLI.
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes the first
@@ -208,8 +209,12 @@ function ineligibilityMessage(
 			return `No worker for ${owner} has an active enrollment in this project. A project admin must approve the worker's enrollment before it can take work.`;
 		case 'missing-cli-capability':
 			return `No enrolled worker for ${owner} can run any configured model target for this phase (${context.clis.join(', ')}). Enroll a worker that declares and is allowed one of those CLIs, or configure a target this project's workers can run.`;
+		// Phase-generic on purpose: this text is posted on the board item once the
+		// recheck budget is spent, and a daemon may declare any subset — naming
+		// `planning`/DB-free specifically would hand the operator a wrong diagnosis for
+		// every other narrowed phase.
 		case 'missing-phase-capability':
-			return `No enrolled worker for ${owner} declared that it can run the '${context.phase}' phase. A DB-free remote worker cannot run 'planning' (it needs the board write/split surface only a database-holding worker has), so this phase waits for such a worker to connect.`;
+			return `No enrolled worker for ${owner} declared that it can run the '${context.phase}' phase. A worker declares which phases it can execute when it connects, and a remote worker running without a database declares a smaller set than a host worker does. Connect a worker that can run this phase — this work waits until one is available.`;
 	}
 }
 
