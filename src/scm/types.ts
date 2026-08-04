@@ -31,7 +31,11 @@
  * - **Provider selection, fallback, or per-provider config.** There is one
  *   provider, one webhook route (declared on its manifest), and one HMAC secret;
  *   a project's SCM config is `repo` + `credentials` (`src/config/schema.ts`)
- *   with no per-provider block to declare.
+ *   with no per-provider block to declare. Issue #386 pinned that as an
+ *   assertion rather than a guess: the project-scoped lookup every outbound call
+ *   site uses (`requireProjectSCMProvider`,
+ *   `src/integrations/scm/registry.ts`) throws unless exactly one provider is
+ *   registered, so selection gets designed with the second provider.
  * - **`withCredentials`** — the implementer-persona convenience wrapper on the
  *   GitHub class. It is sugar over {@link SCMProvider.withPersonaCredentials};
  *   putting it in the contract would oblige a second provider to implement two

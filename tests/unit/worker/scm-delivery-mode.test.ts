@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
-// The in-process delivery provider is built by GitHubSCMIntegration; mock it at
-// the module boundary so the control-plane branch never resolves a real PAT or
-// hits GitHub. The transport wrapper (`@/scm/transport-delivery.js`) stays real
-// — it's a pure function of the delegate + config.
+// The in-process delivery provider comes from the project's registered SCM
+// provider (issue #386). Mocking the concrete class still stubs it out: the
+// consumer's provider-registry side-effect import registers
+// `new GitHubSCMIntegration()`, so `requireProjectSCMProvider(project)` returns
+// this stub and the control-plane branch never resolves a real PAT or hits
+// GitHub. The transport wrapper (`@/scm/transport-delivery.js`) stays real — it's
+// a pure function of the delegate + config.
 const localDelegate: ScmDeliveryProvider = {
 	commitIdentity: { name: 'ada', email: 'ada@users.noreply.github.com' },
 	findPullRequest: vi.fn(),

@@ -53,7 +53,7 @@ import {
 } from '@/harness/agent-cli.js';
 import { agentRunError } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
-import { GitHubSCMIntegration } from '@/integrations/scm/github/scm-integration.js';
+import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
 import { buildRespondToCiPrompt } from '@/pipeline/prompts/respond-to-ci.js';
 import {
@@ -335,7 +335,7 @@ export async function runRespondToCiPhase(
 		}
 		const delivery =
 			options.delivery ??
-			(await new GitHubSCMIntegration().deliveryProvider(project, 'implementer'));
+			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
 		const deliveryId = deliveryIdentity(['respond-to-ci', project.repo, prNumber, headSha]);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);

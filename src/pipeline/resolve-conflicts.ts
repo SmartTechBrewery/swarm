@@ -8,7 +8,7 @@ import {
 } from '../harness/agent-cli.js';
 import { agentRunError } from '../harness/agent-failure.js';
 import type { ReasoningLevel } from '../harness/models.js';
-import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import {
 	assertRemoteHead,
@@ -179,7 +179,7 @@ export async function runResolveConflictsPhase(
 		);
 		const delivery =
 			options.delivery ??
-			(await new GitHubSCMIntegration().deliveryProvider(project, 'implementer'));
+			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
 		const deliveryId = deliveryIdentity([
 			'resolve-conflicts',
 			project.repo,

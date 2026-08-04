@@ -27,7 +27,7 @@ import {
 } from '../db/repositories/dispatchesRepository.js';
 import { updateReviewMergeOutcome } from '../db/repositories/runsRepository.js';
 import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
-import { GitHubSCMIntegration } from '../integrations/scm/github/scm-integration.js';
+import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { MergeAutomationJob } from '../queue/jobs.js';
@@ -171,9 +171,9 @@ async function persistMergeOutcome(
 	}
 }
 
-/** The default provider: GitHub's adapter, resolved fresh per attempt. */
-function defaultMergePullRequest(): MergePullRequest {
-	const scm = new GitHubSCMIntegration();
+/** The default merge capability: the project's registered provider, resolved fresh per attempt. */
+function defaultMergePullRequest(project: ProjectConfig): MergePullRequest {
+	const scm = requireProjectSCMProvider(project);
 	return scm.mergePullRequest.bind(scm);
 }
 
@@ -189,12 +189,20 @@ export async function processMergeAutomationDispatch(
 	dispatch: DispatchRow,
 	job: MergeAutomationJob,
 	project: ProjectConfig,
-	mergePullRequest: MergePullRequest = defaultMergePullRequest(),
+	mergePullRequest?: MergePullRequest,
 ): Promise<MergeAutomationSettledOutcome> {
 	const attempt = dispatch.attempt;
 	let outcome: MergePullRequestOutcome;
+	// Resolving the default *inside* the try, not in a default parameter: an
+	// unresolvable provider (nothing registered, or a second one registered before
+	// project→provider selection exists — `requireProjectSCMProvider`) would
+	// otherwise throw during parameter binding, before this function can settle the
+	// dispatch it was handed. It must fail the same way any other provider failure
+	// does — `provider-error` → outcome persisted on the Review run → `failDispatch`
+	// — rather than escaping `processJob` and leaving a claimed dispatch in flight.
 	try {
-		outcome = await mergePullRequest(project, Number(job.prNumber), job.approvedHeadSha);
+		const merge = mergePullRequest ?? defaultMergePullRequest(project);
+		outcome = await merge(project, Number(job.prNumber), job.approvedHeadSha);
 	} catch (err) {
 		outcome = { status: 'provider-error', message: describeError(err) };
 	}
