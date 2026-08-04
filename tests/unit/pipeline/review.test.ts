@@ -361,13 +361,13 @@ describe('runReviewPhase', () => {
 });
 
 describe('buildReviewPrompt', () => {
-	const context = { repo: 'jkwiecien/swarm', prNumber: '99', headSha: HEAD_SHA };
+	const context = { repo: 'SmartTechBrewery/swarm', prNumber: '99', headSha: HEAD_SHA };
 
 	it('instructs reading the PR, the full diff, submitting one formal review, and recording the verdict', () => {
 		const prompt = buildReviewPrompt(context);
-		expect(prompt).toContain('gh pr view 99 --repo jkwiecien/swarm --comments');
-		expect(prompt).toContain('gh pr diff 99 --repo jkwiecien/swarm');
-		expect(prompt).toContain('gh pr review 99 --repo jkwiecien/swarm');
+		expect(prompt).toContain('gh pr view 99 --repo SmartTechBrewery/swarm --comments');
+		expect(prompt).toContain('gh pr diff 99 --repo SmartTechBrewery/swarm');
+		expect(prompt).toContain('gh pr review 99 --repo SmartTechBrewery/swarm');
 		expect(prompt).toContain('--approve');
 		expect(prompt).toContain('--request-changes');
 		expect(prompt).toContain('--comment');
@@ -441,8 +441,8 @@ describe('buildReviewPrompt', () => {
 			const prompt = buildReviewPrompt(context, undefined, true);
 			expect(prompt).toContain('REVIEW ONLY');
 			expect(prompt).toContain(HEAD_SHA);
-			expect(prompt).toContain(`gh pr view 99 --repo jkwiecien/swarm --comments`);
-			expect(prompt).toContain(`gh pr review 99 --repo jkwiecien/swarm`);
+			expect(prompt).toContain(`gh pr view 99 --repo SmartTechBrewery/swarm --comments`);
+			expect(prompt).toContain(`gh pr review 99 --repo SmartTechBrewery/swarm`);
 			expect(prompt).toContain(REVIEW_VERDICT_FILENAME);
 			expect(prompt).toContain('Do not merge the PR');
 			expect(prompt).toContain('GH_TOKEN');

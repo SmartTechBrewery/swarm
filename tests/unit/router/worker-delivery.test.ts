@@ -536,7 +536,7 @@ describe('handlePriorReview', () => {
 		// from the request — a worker cannot key a row to another project or repo.
 		expect(reviewLedger.getPriorSubmittedReview).toHaveBeenCalledWith(
 			'swarm',
-			'jkwiecien/swarm',
+			'SmartTechBrewery/swarm',
 			'42',
 			'deadbeef',
 		);
@@ -621,7 +621,7 @@ describe('handleMarkReviewVerdict', () => {
 		expect(reviewLedger.markReviewVerdictSubmitted).toHaveBeenCalledWith(
 			{
 				projectId: 'swarm',
-				repository: 'jkwiecien/swarm',
+				repository: 'SmartTechBrewery/swarm',
 				prNumber: '42',
 				headSha: 'deadbeef',
 			},
@@ -702,7 +702,7 @@ describe('handleAbandonReviewVerdict', () => {
 		expect(result.json).toEqual({});
 		expect(reviewLedger.abandonReviewVerdict).toHaveBeenCalledWith({
 			projectId: 'swarm',
-			repository: 'jkwiecien/swarm',
+			repository: 'SmartTechBrewery/swarm',
 			prNumber: '42',
 			headSha: 'deadbeef',
 		});
@@ -758,7 +758,7 @@ describe('handleListBlockers', () => {
 			{
 				id: 'PVTI_blocker',
 				reference: '#319',
-				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 				title: 'Prerequisite',
 				open: true,
 				source: 'dependency' as const,
@@ -833,7 +833,7 @@ describe('handleFindWorkItem', () => {
 	it('resolves the card under the server-side PM credential and projects onto the narrow wire frame', async () => {
 		const item = createMockWorkItem({
 			id: 'ITEM_21',
-			url: 'https://github.com/jkwiecien/swarm/issues/21',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/21',
 			description: 'Sensitive body text that should not cross wire',
 			labels: [{ id: 'l1', name: 'bug' }],
 			assignees: [{ handle: 'octocat' }],
@@ -850,7 +850,7 @@ describe('handleFindWorkItem', () => {
 			item: {
 				id: 'ITEM_21',
 				title: item.title,
-				url: 'https://github.com/jkwiecien/swarm/issues/21',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/21',
 				status: item.status,
 				statusId: item.statusId,
 			},

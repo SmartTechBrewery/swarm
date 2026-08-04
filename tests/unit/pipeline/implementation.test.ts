@@ -87,7 +87,7 @@ function makeDeps() {
 describe('runImplementationPhase', () => {
 	beforeEach(() => {
 		prFileExists = true;
-		prFileContents = 'https://github.com/jkwiecien/swarm/pull/99\n';
+		prFileContents = 'https://github.com/SmartTechBrewery/swarm/pull/99\n';
 		blockedReasonFileExists = false;
 		blockedReasonFileContents = '';
 	});
@@ -161,7 +161,7 @@ describe('runImplementationPhase', () => {
 		expect(deps.pm.addComment).toHaveBeenCalledTimes(1);
 		expect(deps.pm.addComment.mock.calls[0][0]).toBe('PVTI_item19');
 		expect(deps.pm.addComment.mock.calls[0][1]).toContain(
-			'https://github.com/jkwiecien/swarm/pull/99',
+			'https://github.com/SmartTechBrewery/swarm/pull/99',
 		);
 		expect(deps.pm.moveWorkItem).toHaveBeenNthCalledWith(2, 'PVTI_item19', 'inReview');
 		expect(deps.pm.moveWorkItem).toHaveBeenCalledTimes(2);
@@ -170,7 +170,7 @@ describe('runImplementationPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 
 		expect(result).toMatchObject({
-			prUrl: 'https://github.com/jkwiecien/swarm/pull/99',
+			prUrl: 'https://github.com/SmartTechBrewery/swarm/pull/99',
 			branch: 'issue-19',
 			commentId: 'comment-1',
 			movedTo: 'inReview',
@@ -469,7 +469,7 @@ describe('runImplementationPhase', () => {
 
 describe('buildImplementationPrompt', () => {
 	const context = {
-		repo: 'jkwiecien/swarm',
+		repo: 'SmartTechBrewery/swarm',
 		taskId: '19',
 		branch: 'issue-19',
 		baseBranch: 'main',
@@ -548,15 +548,18 @@ describe('buildImplementationPrompt', () => {
 
 describe('implementationCommentBody', () => {
 	it('wraps the PR URL with a header and, by default, an already-moved note', () => {
-		const body = implementationCommentBody('https://github.com/jkwiecien/swarm/pull/99');
+		const body = implementationCommentBody('https://github.com/SmartTechBrewery/swarm/pull/99');
 		expect(body).toContain('Implementation complete');
-		expect(body).toContain('https://github.com/jkwiecien/swarm/pull/99');
+		expect(body).toContain('https://github.com/SmartTechBrewery/swarm/pull/99');
 		expect(body).toContain('In review');
 		expect(body).toMatch(/has moved to/);
 	});
 
 	it('reports that the item remains in progress when Review is disabled', () => {
-		const body = implementationCommentBody('https://github.com/jkwiecien/swarm/pull/99', false);
+		const body = implementationCommentBody(
+			'https://github.com/SmartTechBrewery/swarm/pull/99',
+			false,
+		);
 		expect(body).toContain('Automated Review is disabled');
 		expect(body).toContain('remains **In progress**');
 	});

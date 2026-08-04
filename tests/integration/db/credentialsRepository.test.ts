@@ -110,7 +110,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('credentialsRepository (in
 	describe('resolution through the config provider', () => {
 		it('resolves the reviewer token and the webhook secret via their references', async () => {
 			vi.stubEnv('CREDENTIAL_MASTER_KEY', MASTER_KEY_HEX);
-			const project = await seedProject({ id: 'swarm-2', repo: 'jkwiecien/swarm-2' });
+			const project = await seedProject({ id: 'swarm-2', repo: 'SmartTechBrewery/swarm-2' });
 
 			await writeProjectCredential('swarm-2', project.credentials.reviewer, 'test-token-reviewer');
 			await writeProjectCredential('swarm-2', project.credentials.webhookSecret, 'hmac-secret');
@@ -121,13 +121,13 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('credentialsRepository (in
 
 		it('resolves the implementer token from the operator env var, not project credentials', async () => {
 			vi.stubEnv('SWARM_OPERATOR_GH_TOKEN', 'operator-token');
-			const project = await seedProject({ id: 'swarm-op', repo: 'jkwiecien/swarm-op' });
+			const project = await seedProject({ id: 'swarm-op', repo: 'SmartTechBrewery/swarm-op' });
 
 			expect(await getPersonaTokenOrNull(project, 'implementer')).toBe('operator-token');
 		});
 
 		it('resolves the reviewer token to null when the referenced credential is not stored', async () => {
-			const project = await seedProject({ id: 'swarm-3', repo: 'jkwiecien/swarm-3' });
+			const project = await seedProject({ id: 'swarm-3', repo: 'SmartTechBrewery/swarm-3' });
 
 			expect(await getPersonaTokenOrNull(project, 'reviewer')).toBeNull();
 		});

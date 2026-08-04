@@ -54,7 +54,7 @@ const MERGE_JOB = {
 	type: 'merge-automation' as const,
 	projectId: 'p1',
 	reviewRunId: 'run-1',
-	repo: 'jkwiecien/swarm',
+	repo: 'SmartTechBrewery/swarm',
 	prNumber: '17',
 	approvedHeadSha: 'deadbeef',
 };
@@ -302,7 +302,7 @@ describe('toQueuedRuns', () => {
 			providerId: 'github',
 			event: {
 				...createMockScmWebhookJob().event,
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				workItemId: '42',
 			},
 		});
@@ -312,7 +312,7 @@ describe('toQueuedRuns', () => {
 		expect(item).toMatchObject({
 			type: 'scm',
 			providerId: 'github',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			prNumber: '42',
 			state: 'waiting',
 		});
@@ -336,7 +336,7 @@ describe('toQueuedRuns', () => {
 		expect(item).toMatchObject({
 			type: 'merge-automation',
 			phaseHint: 'merge-automation',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			prNumber: '17',
 			state: 'delayed',
 			waitReason: 'recheck',
@@ -407,7 +407,7 @@ describe('toQueuedRuns', () => {
 			event: {
 				eventType: 'check_suite',
 				action: 'completed',
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				isCommentEvent: false,
 				workItemId: '42',
 				headSha: 'abc123',
@@ -419,7 +419,7 @@ describe('toQueuedRuns', () => {
 		expect(item).toMatchObject({
 			type: 'scm',
 			providerId: 'github',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			prNumber: '42',
 		});
 		expect(item.phaseHint).toBe('review');
@@ -451,7 +451,7 @@ describe('toQueuedRuns', () => {
 				...createMockScmWebhookJob().event,
 				kind: 'checks',
 				action: 'completed',
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				workItemId: '42',
 				headSha: 'def456',
 			},
@@ -462,7 +462,7 @@ describe('toQueuedRuns', () => {
 				...createMockScmWebhookJob().event,
 				kind: 'pull-request',
 				action: 'updated',
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				workItemId: '42',
 				headSha: 'def456',
 			},

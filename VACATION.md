@@ -162,7 +162,7 @@ services to see it.
 - The board: <https://github.com/orgs/SmartTechBrewery/projects/6/views/1>. Check
   **In review** and **In progress** for items SWARM started and did not finish, and
   the Runs page for `failed` / `deferred` runs.
-- Open PRs SWARM authored: `gh pr list --repo jkwiecien/swarm --state open`.
+- Open PRs SWARM authored: `gh pr list --repo SmartTechBrewery/swarm --state open`.
 - Known-gap issues opened in this period, in priority order: **#397** (federated
   auto-review), **#398** (attribution), **#438** (dependency deferral over the
   transport), **#418** (DB-free respond-to-review).

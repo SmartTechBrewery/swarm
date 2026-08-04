@@ -46,8 +46,8 @@ describe('config provider', () => {
 	describe('findProjectByRepo', () => {
 		it('delegates to the repository', async () => {
 			vi.mocked(findProjectByRepoFromDb).mockResolvedValue(project);
-			expect(await findProjectByRepo('jkwiecien/swarm')).toBe(project);
-			expect(findProjectByRepoFromDb).toHaveBeenCalledWith('jkwiecien/swarm');
+			expect(await findProjectByRepo('SmartTechBrewery/swarm')).toBe(project);
+			expect(findProjectByRepoFromDb).toHaveBeenCalledWith('SmartTechBrewery/swarm');
 		});
 	});
 

@@ -82,7 +82,7 @@ export function createMockWorkItem(overrides: Partial<WorkItem> = {}): WorkItem 
 		id: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
 		title: 'Example work item',
 		description: 'An example work item body.',
-		url: 'https://github.com/jkwiecien/swarm/issues/10',
+		url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 		status: 'In progress',
 		statusId: '47fc9ee4',
 		labels: [{ id: 'LA_swarm', name: DEFAULT_AUTOMATION_LABEL }],
@@ -139,7 +139,7 @@ export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent 
 	return ScmEventSchema.parse({
 		kind: 'pull-request',
 		action: 'opened',
-		repoFullName: 'jkwiecien/swarm',
+		repoFullName: 'SmartTechBrewery/swarm',
 		workItemId: '17',
 		actorLogin: 'human-dev',
 		isCommentEvent: false,
@@ -191,7 +191,7 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 	return ProjectConfigSchema.parse({
 		id: 'swarm',
 		name: 'swarm',
-		repo: 'jkwiecien/swarm',
+		repo: 'SmartTechBrewery/swarm',
 		repoRoot: '/Users/dev/swarm/swarm',
 		githubProjects: createMockGitHubProjectsConfig(),
 		credentials: {

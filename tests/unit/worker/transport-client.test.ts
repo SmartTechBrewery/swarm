@@ -142,7 +142,7 @@ describe('runAssignment', () => {
 		const workItem = createMockWorkItem();
 		const blocker = {
 			reference: '#319',
-			url: 'https://github.com/jkwiecien/swarm/issues/319',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 			title: 'Session auth',
 			open: true,
 			source: 'dependency' as const,

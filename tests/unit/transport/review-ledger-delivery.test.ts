@@ -9,7 +9,7 @@ const CREDENTIAL = 'raw-worker-credential-secret';
 const PROJECT_ID = 'swarm';
 const KEY = {
 	projectId: PROJECT_ID,
-	repository: 'jkwiecien/swarm',
+	repository: 'SmartTechBrewery/swarm',
 	prNumber: '42',
 	headSha: 'deadbeef',
 };
@@ -39,7 +39,7 @@ describe('createTransportReviewLedger', () => {
 
 		const prior = await ledger(fetchImpl).getPriorSubmittedReview(
 			PROJECT_ID,
-			'jkwiecien/swarm',
+			'SmartTechBrewery/swarm',
 			'42',
 			'deadbeef',
 		);
@@ -61,7 +61,12 @@ describe('createTransportReviewLedger', () => {
 	it('maps a null record back to undefined, the shape the repository returns', async () => {
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { record: null }));
 		await expect(
-			ledger(fetchImpl).getPriorSubmittedReview(PROJECT_ID, 'jkwiecien/swarm', '42', 'deadbeef'),
+			ledger(fetchImpl).getPriorSubmittedReview(
+				PROJECT_ID,
+				'SmartTechBrewery/swarm',
+				'42',
+				'deadbeef',
+			),
 		).resolves.toBeUndefined();
 	});
 
@@ -113,7 +118,12 @@ describe('createTransportReviewLedger', () => {
 	it('throws on a refused or malformed response, exactly as a failed repository call would', async () => {
 		const refused = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(403, {}));
 		await expect(
-			ledger(refused).getPriorSubmittedReview(PROJECT_ID, 'jkwiecien/swarm', '42', 'deadbeef'),
+			ledger(refused).getPriorSubmittedReview(
+				PROJECT_ID,
+				'SmartTechBrewery/swarm',
+				'42',
+				'deadbeef',
+			),
 		).rejects.toThrow(/403/);
 
 		const malformed = vi

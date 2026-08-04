@@ -9,7 +9,7 @@ import type { TriggerResult } from '@/triggers/types.js';
 // resolution read (repo, baseBranch, branchPrefix, planning knobs).
 const PROJECT = {
 	id: 'swarm',
-	repo: 'jkwiecien/swarm',
+	repo: 'SmartTechBrewery/swarm',
 	baseBranch: 'main',
 	branchPrefix: 'swarm/',
 	pipeline: {},
@@ -19,7 +19,7 @@ const WORK_ITEM: WorkItem = {
 	id: 'PVTI_item',
 	title: 'Add a widget',
 	description: 'Implement the widget end to end.',
-	url: 'https://github.com/jkwiecien/swarm/issues/407',
+	url: 'https://github.com/SmartTechBrewery/swarm/issues/407',
 	labels: [],
 	assignees: [],
 };
@@ -82,7 +82,7 @@ describe('composeSystemPrompt', () => {
 			workItem: WORK_ITEM,
 		});
 		expect(prompt).toContain('implementing a work item');
-		expect(prompt).toContain('jkwiecien/swarm');
+		expect(prompt).toContain('SmartTechBrewery/swarm');
 		expect(prompt).toContain('swarm/407');
 		expect(prompt).toContain('main');
 		expect(prompt).toContain(WORK_ITEM.title);

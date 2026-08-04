@@ -17,14 +17,14 @@ import {
 } from '../../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig();
-const ITEM_URL = 'https://github.com/jkwiecien/swarm/issues/10';
+const ITEM_URL = 'https://github.com/SmartTechBrewery/swarm/issues/10';
 
 function preplannedChild(overrides: Partial<WorkItem> = {}): WorkItem {
 	const humanDescription = 'Original child scope.';
 	const contract = buildPreplanContract({
 		splitId: 'split-1',
 		childIndex: 0,
-		parentUrl: 'https://github.com/jkwiecien/swarm/issues/9',
+		parentUrl: 'https://github.com/SmartTechBrewery/swarm/issues/9',
 		itemUrl: ITEM_URL,
 		humanDescription,
 		plan: '# Child plan',

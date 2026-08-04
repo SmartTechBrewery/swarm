@@ -53,7 +53,7 @@ describe('SwarmJobSchema', () => {
 			type: 'merge-automation',
 			projectId: 'swarm',
 			reviewRunId: 'run-1',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			prNumber: '17',
 			approvedHeadSha: 'deadbeef',
 		};
@@ -65,7 +65,7 @@ describe('SwarmJobSchema', () => {
 			type: 'merge-automation',
 			projectId: 'swarm',
 			reviewRunId: 'run-1',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			prNumber: '17',
 		};
 		expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
@@ -110,7 +110,7 @@ describe('SwarmJobSchema', () => {
 				type: 'github',
 				projectId: 'swarm',
 				deliveryId: 'delivery-uuid-1',
-				event: { repoFullName: 'jkwiecien/swarm', isCommentEvent: false, ...event },
+				event: { repoFullName: 'SmartTechBrewery/swarm', isCommentEvent: false, ...event },
 			};
 		}
 

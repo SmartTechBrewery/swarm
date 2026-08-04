@@ -16,7 +16,7 @@ import { createMockProjectConfig } from '../../helpers/factories.js';
 describe('ProjectConfigSchema', () => {
 	it('accepts a fully-specified project', () => {
 		const project = createMockProjectConfig();
-		expect(project.repo).toBe('jkwiecien/swarm');
+		expect(project.repo).toBe('SmartTechBrewery/swarm');
 		expect(project.credentials.reviewer).toBe('SCM_TOKEN_REVIEWER');
 		expect(project.githubProjects.statusFieldId).toBe('PVTSSF_lAHOAC3TF84BcNwDzhW4MKo');
 	});
@@ -25,7 +25,7 @@ describe('ProjectConfigSchema', () => {
 		const project = ProjectConfigSchema.parse({
 			id: 'swarm',
 			name: 'swarm',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			repoRoot: '/Users/dev/swarm/swarm',
 			githubProjects: {
 				projectId: 'PVT_x',
@@ -61,7 +61,7 @@ describe('ProjectConfigSchema', () => {
 			ProjectConfigSchema.parse({
 				id: 'swarm',
 				name: 'swarm',
-				repo: 'jkwiecien/swarm',
+				repo: 'SmartTechBrewery/swarm',
 				repoRoot: '/Users/dev/swarm/swarm',
 				credentials: { reviewer: 'B', webhookSecret: 'C' },
 			}),

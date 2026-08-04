@@ -250,7 +250,7 @@ describe('transport protocol schemas', () => {
 				blockers: [
 					{
 						reference: '#319',
-						url: 'https://github.com/jkwiecien/swarm/issues/319',
+						url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 						title: 'Session auth',
 						open: true,
 						source: 'dependency' as const,
@@ -365,7 +365,7 @@ describe('transport protocol schemas', () => {
 					id: 'PVTI_1',
 					title: 'Do it',
 					description: 'body',
-					url: 'https://github.com/jkwiecien/swarm/issues/17',
+					url: 'https://github.com/SmartTechBrewery/swarm/issues/17',
 					labels: [{ id: 'LA_1', name: 'swarm' }],
 					assignees: [],
 				},

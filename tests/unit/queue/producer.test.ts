@@ -175,7 +175,7 @@ describe('enqueueJob', () => {
 			event: {
 				eventType: 'issues',
 				action: 'labeled',
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				workItemId: '42',
 				isCommentEvent: false,
 				labelName: 'swarm-replan',
@@ -262,7 +262,7 @@ describe('enqueueDispatchWakeUp', () => {
 			event: {
 				eventType: 'issues',
 				action: 'labeled',
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				workItemId: '42',
 				isCommentEvent: false,
 				labelName: 'swarm-replan',

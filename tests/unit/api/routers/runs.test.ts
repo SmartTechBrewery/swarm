@@ -216,7 +216,7 @@ const SCM_PAYLOAD: SwarmJob = {
 	projectId: 'p1',
 	event: {
 		kind: 'pull-request',
-		repoFullName: 'jkwiecien/swarm',
+		repoFullName: 'SmartTechBrewery/swarm',
 		isCommentEvent: false,
 	},
 };

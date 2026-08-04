@@ -53,8 +53,8 @@ const ITEM_NODE = {
 		number: 10,
 		title: 'Wire triggers',
 		body: 'Do the thing.',
-		url: 'https://github.com/jkwiecien/swarm/issues/10',
-		repository: { nameWithOwner: 'jkwiecien/swarm' },
+		url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+		repository: { nameWithOwner: 'SmartTechBrewery/swarm' },
 		labels: { nodes: [{ id: 'L1', name: 'phase-4', color: 'blue' }] },
 	},
 	fieldValueByName: { name: 'In progress', optionId: '47fc9ee4' },
@@ -91,7 +91,7 @@ describe('GitHubProjectsPMProvider', () => {
 				id: 'PVTI_x',
 				title: 'Wire triggers',
 				description: 'Do the thing.',
-				url: 'https://github.com/jkwiecien/swarm/issues/10',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 				status: 'In progress',
 				statusId: '47fc9ee4',
 				labels: [{ id: 'L1', name: 'phase-4', color: 'blue' }],
@@ -343,7 +343,7 @@ describe('GitHubProjectsPMProvider', () => {
 			content: {
 				...ITEM_NODE.content,
 				number: 100,
-				url: 'https://github.com/jkwiecien/swarm/issues/100',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/100',
 			},
 		};
 
@@ -399,7 +399,7 @@ describe('GitHubProjectsPMProvider', () => {
 			const id = await provider.addComment('PVTI_x', 'a plan');
 
 			expect(createComment).toHaveBeenCalledWith({
-				owner: 'jkwiecien',
+				owner: 'SmartTechBrewery',
 				repo: 'swarm',
 				issue_number: 10,
 				body: 'a plan',
@@ -430,7 +430,7 @@ describe('GitHubProjectsPMProvider', () => {
 
 			// All pages are scanned via octokit's paginate, not a single listComments page.
 			expect(paginate).toHaveBeenCalledWith(listComments, {
-				owner: 'jkwiecien',
+				owner: 'SmartTechBrewery',
 				repo: 'swarm',
 				issue_number: 10,
 				per_page: 100,
@@ -479,7 +479,7 @@ describe('GitHubProjectsPMProvider', () => {
 					number: 42,
 					title: 'Sibling task',
 					body: 'Second half',
-					html_url: 'https://github.com/jkwiecien/swarm/issues/42',
+					html_url: 'https://github.com/SmartTechBrewery/swarm/issues/42',
 					labels: [{ id: 1, name: 'swarm:split-child', color: 'ededed' }],
 				},
 			});
@@ -495,7 +495,7 @@ describe('GitHubProjectsPMProvider', () => {
 			});
 
 			expect(createIssue).toHaveBeenCalledWith({
-				owner: 'jkwiecien',
+				owner: 'SmartTechBrewery',
 				repo: 'swarm',
 				title: 'Sibling task',
 				body: 'Second half',
@@ -521,7 +521,7 @@ describe('GitHubProjectsPMProvider', () => {
 				id: 'PVTI_new',
 				title: 'Sibling task',
 				statusId: '61e4505c',
-				url: 'https://github.com/jkwiecien/swarm/issues/42',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/42',
 			});
 			expect(created.labels.map((l) => l.name)).toContain('swarm:split-child');
 		});
@@ -544,7 +544,11 @@ describe('GitHubProjectsPMProvider', () => {
 			});
 
 			expect(createLabel).toHaveBeenCalledWith(
-				expect.objectContaining({ owner: 'jkwiecien', repo: 'swarm', name: 'swarm:split-child' }),
+				expect.objectContaining({
+					owner: 'SmartTechBrewery',
+					repo: 'swarm',
+					name: 'swarm:split-child',
+				}),
 			);
 		});
 
@@ -564,7 +568,7 @@ describe('GitHubProjectsPMProvider', () => {
 			await provider.updateWorkItem('PVTI_x', { title: 'Renamed' });
 
 			expect(updateIssue).toHaveBeenCalledWith({
-				owner: 'jkwiecien',
+				owner: 'SmartTechBrewery',
 				repo: 'swarm',
 				issue_number: 10,
 				title: 'Renamed',
@@ -598,7 +602,7 @@ describe('GitHubProjectsPMProvider', () => {
 
 			expect(createLabel).not.toHaveBeenCalled();
 			expect(addLabels).toHaveBeenCalledWith({
-				owner: 'jkwiecien',
+				owner: 'SmartTechBrewery',
 				repo: 'swarm',
 				issue_number: 10,
 				labels: ['planned'],
@@ -614,7 +618,7 @@ describe('GitHubProjectsPMProvider', () => {
 			await provider.addLabel('PVTI_x', 'planned');
 
 			expect(createLabel).toHaveBeenCalledWith(
-				expect.objectContaining({ owner: 'jkwiecien', repo: 'swarm', name: 'planned' }),
+				expect.objectContaining({ owner: 'SmartTechBrewery', repo: 'swarm', name: 'planned' }),
 			);
 			expect(addLabels).toHaveBeenCalledWith(
 				expect.objectContaining({ issue_number: 10, labels: ['planned'] }),
@@ -638,7 +642,7 @@ describe('GitHubProjectsPMProvider', () => {
 
 	describe('listBlockers', () => {
 		it('merges native "blocked by" relationships with prerequisites mentioned in prose', async () => {
-			// resolveItem → the item (issue #10 in jkwiecien/swarm, body has no refs).
+			// resolveItem → the item (issue #10 in SmartTechBrewery/swarm, body has no refs).
 			graphql.mockResolvedValue({ node: ITEM_NODE });
 			// Native blocked-by: issue #5, still open.
 			request.mockResolvedValue({
@@ -647,7 +651,7 @@ describe('GitHubProjectsPMProvider', () => {
 						id: 500,
 						number: 5,
 						title: 'Prereq',
-						html_url: 'https://github.com/jkwiecien/swarm/issues/5',
+						html_url: 'https://github.com/SmartTechBrewery/swarm/issues/5',
 						state: 'open',
 					},
 				],
@@ -658,7 +662,7 @@ describe('GitHubProjectsPMProvider', () => {
 				data: {
 					number: 7,
 					title: 'Seven',
-					html_url: 'https://github.com/jkwiecien/swarm/issues/7',
+					html_url: 'https://github.com/SmartTechBrewery/swarm/issues/7',
 					state: 'closed',
 				},
 			});
@@ -667,7 +671,7 @@ describe('GitHubProjectsPMProvider', () => {
 
 			expect(request).toHaveBeenCalledWith(
 				'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-				expect.objectContaining({ owner: 'jkwiecien', repo: 'swarm', issue_number: 10 }),
+				expect.objectContaining({ owner: 'SmartTechBrewery', repo: 'swarm', issue_number: 10 }),
 			);
 			expect(blockers).toEqual([
 				expect.objectContaining({ reference: '#5', open: true, source: 'dependency' }),
@@ -694,7 +698,7 @@ describe('GitHubProjectsPMProvider', () => {
 				data: {
 					number: issue_number,
 					title: `Issue ${issue_number}`,
-					html_url: `https://github.com/jkwiecien/swarm/issues/${issue_number}`,
+					html_url: `https://github.com/SmartTechBrewery/swarm/issues/${issue_number}`,
 					state: 'open',
 				},
 			}));
@@ -745,7 +749,7 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(request).toHaveBeenCalledWith(
 				'POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
 				expect.objectContaining({
-					owner: 'jkwiecien',
+					owner: 'SmartTechBrewery',
 					repo: 'swarm',
 					issue_number: 20,
 					issue_id: 9999,

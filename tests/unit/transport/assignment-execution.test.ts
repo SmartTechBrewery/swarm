@@ -123,7 +123,7 @@ describe('runAssignmentDbFree', () => {
 			phase: 'respond-to-ci',
 		});
 		// Delivery was built from the reconstructed project's repo + the operator token.
-		expect(buildDelivery).toHaveBeenCalledWith('jkwiecien/swarm', OPERATOR_TOKEN);
+		expect(buildDelivery).toHaveBeenCalledWith('SmartTechBrewery/swarm', OPERATOR_TOKEN);
 		// The phase received the injected operator-token delivery + agent token, and no
 		// PM provider — a source-only phase writes to no board.
 		const inputs = runPhase.mock.calls[0][0];
@@ -181,7 +181,7 @@ describe('runAssignmentDbFree', () => {
 			id: 'ITEM_17',
 			title: 'Example',
 			description: 'body',
-			url: 'https://github.com/jkwiecien/swarm/issues/17',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/17',
 			labels: [],
 			assignees: [],
 		};
@@ -367,7 +367,7 @@ describe('runAssignmentDbFree', () => {
 		const blockers = [
 			{
 				reference: '#319',
-				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 				title: 'Prerequisite',
 				open: true,
 				source: 'dependency' as const,
@@ -457,14 +457,14 @@ describe('runAssignmentDbFree', () => {
 			// What `runReviewPhase` does around its verdict — none of it may reach a DB.
 			await inputs.reviewLedger?.getPriorSubmittedReview(
 				'swarm',
-				'jkwiecien/swarm',
+				'SmartTechBrewery/swarm',
 				'99',
 				'deadbeef',
 			);
 			const slot = await inputs.reviewLedger?.markReviewVerdictSubmitted(
 				{
 					projectId: 'swarm',
-					repository: 'jkwiecien/swarm',
+					repository: 'SmartTechBrewery/swarm',
 					prNumber: '99',
 					headSha: 'deadbeef',
 				},
@@ -618,7 +618,7 @@ describe('runAssignmentDbFree', () => {
 		const workItem = createMockWorkItem();
 		const blocker = {
 			reference: '#319',
-			url: 'https://github.com/jkwiecien/swarm/issues/319',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 			title: 'Session auth',
 			open: true,
 			source: 'dependency' as const,

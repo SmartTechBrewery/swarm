@@ -26,7 +26,7 @@ const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 /** The still-open prerequisite a `dependency` deferral frame reports. */
 const BLOCKER = {
 	reference: '#319',
-	url: 'https://github.com/jkwiecien/swarm/issues/319',
+	url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 	title: 'Session auth',
 	open: true,
 	source: 'dependency' as const,

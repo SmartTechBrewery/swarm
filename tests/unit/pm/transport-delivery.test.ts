@@ -245,7 +245,7 @@ describe('createWriteOnlyTransportPmProvider', () => {
 			{
 				id: 'PVTI_blocker',
 				reference: '#319',
-				url: 'https://github.com/jkwiecien/swarm/issues/319',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
 				title: 'Prerequisite',
 				open: true,
 				source: 'dependency' as const,
@@ -281,7 +281,7 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		const wireItem = {
 			id: 'ITEM_21',
 			title: 'Example',
-			url: 'https://github.com/jkwiecien/swarm/issues/21',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/21',
 		};
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: wireItem }));
 

@@ -1,7 +1,7 @@
 # ADR-002: One durable dispatch state machine for orchestration
 
 - **Status**: accepted
-- **Issue**: [#284](https://github.com/jkwiecien/swarm/issues/284)
+- **Issue**: [#284](https://github.com/SmartTechBrewery/swarm/issues/284)
 - **Date**: 2026-07-18
 
 ## Context

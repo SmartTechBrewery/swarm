@@ -243,7 +243,7 @@ describe('runRespondToReviewPhase', () => {
 		// so the phase resolves the backing issue as #21 and matches this card.
 		function makePm(
 			items: Array<{ id: string; url: string }> = [
-				{ id: 'ITEM_21', url: 'https://github.com/jkwiecien/swarm/issues/21' },
+				{ id: 'ITEM_21', url: 'https://github.com/SmartTechBrewery/swarm/issues/21' },
 			],
 		) {
 			const workItems = items.map(({ id, url }) => createMockWorkItem({ id, url }));
@@ -298,7 +298,9 @@ describe('runRespondToReviewPhase', () => {
 
 		it('skips reports (best-effort) when the board has no item for the PR issue', async () => {
 			const deps = makeDeps();
-			const pm = makePm([{ id: 'ITEM_OTHER', url: 'https://github.com/jkwiecien/swarm/issues/7' }]);
+			const pm = makePm([
+				{ id: 'ITEM_OTHER', url: 'https://github.com/SmartTechBrewery/swarm/issues/7' },
+			]);
 
 			const result = await runRespondToReviewPhase({ ...deps, pm });
 
@@ -350,7 +352,7 @@ describe('runRespondToReviewPhase', () => {
 
 describe('buildRespondToReviewPrompt', () => {
 	const context = {
-		repo: 'jkwiecien/swarm',
+		repo: 'SmartTechBrewery/swarm',
 		prNumber: '99',
 		prBranch: PR_BRANCH,
 		reviewId: '4242',
@@ -362,10 +364,10 @@ describe('buildRespondToReviewPrompt', () => {
 		// Explicit remote/branch on the push — the checkout may have no upstream
 		// configured (e.g. a human-created PR branch), so a bare `git push` could fail.
 		expect(prompt).toContain(`git push origin ${PR_BRANCH}`);
-		expect(prompt).toContain('gh api repos/jkwiecien/swarm/pulls/99/reviews/4242');
-		expect(prompt).toContain('gh api repos/jkwiecien/swarm/pulls/99/reviews/4242/comments');
-		expect(prompt).toContain('gh pr view 99 --repo jkwiecien/swarm --comments');
-		expect(prompt).toContain('gh pr comment 99 --repo jkwiecien/swarm');
+		expect(prompt).toContain('gh api repos/SmartTechBrewery/swarm/pulls/99/reviews/4242');
+		expect(prompt).toContain('gh api repos/SmartTechBrewery/swarm/pulls/99/reviews/4242/comments');
+		expect(prompt).toContain('gh pr view 99 --repo SmartTechBrewery/swarm --comments');
+		expect(prompt).toContain('gh pr comment 99 --repo SmartTechBrewery/swarm');
 		expect(prompt).toContain(RESPOND_OUTCOME_FILENAME);
 	});
 

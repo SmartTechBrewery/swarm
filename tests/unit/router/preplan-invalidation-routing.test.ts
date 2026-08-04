@@ -23,7 +23,7 @@ describe('raw issues webhook → preplan invalidation trigger', () => {
 	it('parses, routes, authoritatively re-reads, and dispatches fallback Planning', async () => {
 		const workItem = createMockWorkItem({
 			id: 'PVTI_child',
-			url: 'https://github.com/jkwiecien/swarm/issues/339',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/339',
 			status: 'Planning',
 			statusId: '3fe662f4',
 			description: 'The operator requested a fresh plan.',
@@ -35,10 +35,10 @@ describe('raw issues webhook → preplan invalidation trigger', () => {
 		listWorkItems.mockResolvedValue([workItem]);
 		const parsed = parseGitHubWebhook('issues', {
 			action: 'labeled',
-			repository: { full_name: 'jkwiecien/swarm' },
+			repository: { full_name: 'SmartTechBrewery/swarm' },
 			issue: {
 				number: 339,
-				html_url: 'https://github.com/jkwiecien/swarm/issues/339',
+				html_url: 'https://github.com/SmartTechBrewery/swarm/issues/339',
 			},
 			label: { name: 'swarm:replan' },
 			sender: { login: 'jkwiecien' },

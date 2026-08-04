@@ -42,7 +42,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 
 import { createOperatorDeliveryProvider } from '@/integrations/scm/github/operator-delivery.js';
 
-const REPO = 'jkwiecien/swarm';
+const REPO = 'SmartTechBrewery/swarm';
 const TOKEN = 'operator-token-abc';
 
 describe('createOperatorDeliveryProvider', () => {
@@ -80,14 +80,14 @@ describe('createOperatorDeliveryProvider', () => {
 		});
 		await delivery.postComment({ prNumber: 7, body: 'hi', deliveryId: 'd1' });
 
-		expect(findOpenPullRequest).toHaveBeenCalledWith('jkwiecien', 'swarm', 'issue-1');
+		expect(findOpenPullRequest).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 'issue-1');
 		expect(createPullRequest).toHaveBeenCalledWith(
-			'jkwiecien',
+			'SmartTechBrewery',
 			'swarm',
 			expect.objectContaining({ branch: 'issue-1' }),
 		);
 		expect(postIdempotentPullRequestComment).toHaveBeenCalledWith(
-			'jkwiecien',
+			'SmartTechBrewery',
 			'swarm',
 			expect.objectContaining({ prNumber: 7, deliveryId: 'd1' }),
 		);

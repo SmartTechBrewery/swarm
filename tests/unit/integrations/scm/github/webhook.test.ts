@@ -11,10 +11,10 @@ import type { ScmPersonaIdentities } from '@/scm/types.js';
 import { createMockProjectConfig } from '../../../../helpers/factories.js';
 
 const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
-const project = createMockProjectConfig({ id: 'proj-1', repo: 'jkwiecien/swarm' });
+const project = createMockProjectConfig({ id: 'proj-1', repo: 'SmartTechBrewery/swarm' });
 
 function repo() {
-	return { full_name: 'jkwiecien/swarm' };
+	return { full_name: 'SmartTechBrewery/swarm' };
 }
 
 describe('GitHub webhook ingress', () => {
@@ -41,7 +41,7 @@ describe('GitHub webhook ingress', () => {
 			expect(parsed).toEqual({
 				kind: 'pull-request',
 				action: 'opened',
-				repoFullName: 'jkwiecien/swarm',
+				repoFullName: 'SmartTechBrewery/swarm',
 				workItemId: '42',
 				actorLogin: 'a-human',
 				isCommentEvent: false,
@@ -79,7 +79,7 @@ describe('GitHub webhook ingress', () => {
 				repository: repo(),
 				issue: {
 					number: 7,
-					html_url: 'https://github.com/jkwiecien/swarm/issues/7',
+					html_url: 'https://github.com/SmartTechBrewery/swarm/issues/7',
 				},
 				changes: { body: { from: 'old scope' } },
 				sender: { login: 'a-human' },
@@ -88,7 +88,7 @@ describe('GitHub webhook ingress', () => {
 				kind: 'work-item',
 				action: 'edited',
 				workItemId: '7',
-				workItemUrl: 'https://github.com/jkwiecien/swarm/issues/7',
+				workItemUrl: 'https://github.com/SmartTechBrewery/swarm/issues/7',
 				workItemBodyChanged: true,
 				isCommentEvent: false,
 			});
@@ -152,7 +152,7 @@ describe('GitHub webhook ingress', () => {
 					number: 42,
 					draft: true,
 					head: { sha: 'abc123', ref: 'issue-42', repo: { full_name: 'a-fork/swarm' } },
-					base: { ref: 'main', repo: { full_name: 'jkwiecien/swarm' } },
+					base: { ref: 'main', repo: { full_name: 'SmartTechBrewery/swarm' } },
 				},
 			});
 			expect(parsed).toMatchObject({
@@ -170,8 +170,8 @@ describe('GitHub webhook ingress', () => {
 				pull_request: {
 					number: 42,
 					user: { login: 'swarm-impl' },
-					head: { sha: 'abc', ref: 'issue-42', repo: { full_name: 'jkwiecien/swarm' } },
-					base: { ref: 'main', repo: { full_name: 'jkwiecien/swarm' } },
+					head: { sha: 'abc', ref: 'issue-42', repo: { full_name: 'SmartTechBrewery/swarm' } },
+					base: { ref: 'main', repo: { full_name: 'SmartTechBrewery/swarm' } },
 				},
 			});
 			expect(parsed?.prAuthorLogin).toBe('swarm-impl');
@@ -201,8 +201,8 @@ describe('GitHub webhook ingress', () => {
 				repository: repo(),
 				pull_request: {
 					number: 42,
-					head: { sha: 'abc', ref: 'issue-42', repo: { full_name: 'jkwiecien/swarm' } },
-					base: { ref: 'main', repo: { full_name: 'jkwiecien/swarm' } },
+					head: { sha: 'abc', ref: 'issue-42', repo: { full_name: 'SmartTechBrewery/swarm' } },
+					base: { ref: 'main', repo: { full_name: 'SmartTechBrewery/swarm' } },
 				},
 			});
 			expect(parsed?.isCrossRepo).toBe(false);
@@ -215,7 +215,7 @@ describe('GitHub webhook ingress', () => {
 				pull_request: {
 					number: 42,
 					// base carries no repo — can't tell fork from same-repo, so don't guess.
-					head: { sha: 'abc', ref: 'issue-42', repo: { full_name: 'jkwiecien/swarm' } },
+					head: { sha: 'abc', ref: 'issue-42', repo: { full_name: 'SmartTechBrewery/swarm' } },
 					base: { ref: 'main' },
 				},
 			});

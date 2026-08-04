@@ -13,12 +13,12 @@ import type { ScmEvent } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
 import { createFakeScmProvider, createMockProjectConfig } from '../../helpers/factories.js';
 
-const project = createMockProjectConfig({ id: 'proj-1', repo: 'jkwiecien/swarm' });
+const project = createMockProjectConfig({ id: 'proj-1', repo: 'SmartTechBrewery/swarm' });
 
 const prEvent: ScmEvent = {
 	kind: 'pull-request',
 	action: 'opened',
-	repoFullName: 'jkwiecien/swarm',
+	repoFullName: 'SmartTechBrewery/swarm',
 	workItemId: '1',
 	actorLogin: 'human-dev',
 	isCommentEvent: false,
@@ -389,7 +389,7 @@ describe('createWebhookApp', () => {
 		const secret = 'topsecret';
 		const signedBody = JSON.stringify({
 			action: 'opened',
-			repository: { full_name: 'jkwiecien/swarm' },
+			repository: { full_name: 'SmartTechBrewery/swarm' },
 			pull_request: { number: 1, head: { sha: 'abc', ref: 'issue-1' } },
 			sender: { login: 'human-dev' },
 		});

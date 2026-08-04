@@ -217,7 +217,7 @@ describe('runRespondToCiPhase', () => {
 
 describe('buildRespondToCiPrompt', () => {
 	const context = {
-		repo: 'jkwiecien/swarm',
+		repo: 'SmartTechBrewery/swarm',
 		prNumber: '99',
 		prBranch: PR_BRANCH,
 		headSha: HEAD_SHA,
@@ -229,9 +229,9 @@ describe('buildRespondToCiPrompt', () => {
 		// Explicit remote/branch on the push — the checkout may have no upstream
 		// configured (e.g. a human-created PR branch), so a bare `git push` could fail.
 		expect(prompt).toContain(`git push origin ${PR_BRANCH}`);
-		expect(prompt).toContain('gh pr checks 99 --repo jkwiecien/swarm');
-		expect(prompt).toContain(`gh run list --repo jkwiecien/swarm --commit ${HEAD_SHA}`);
-		expect(prompt).toContain('gh pr comment 99 --repo jkwiecien/swarm');
+		expect(prompt).toContain('gh pr checks 99 --repo SmartTechBrewery/swarm');
+		expect(prompt).toContain(`gh run list --repo SmartTechBrewery/swarm --commit ${HEAD_SHA}`);
+		expect(prompt).toContain('gh pr comment 99 --repo SmartTechBrewery/swarm');
 		expect(prompt).toContain(RESPOND_CI_OUTCOME_FILENAME);
 	});
 

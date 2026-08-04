@@ -39,14 +39,14 @@ describe('SWARM-origin markers', () => {
 		const plan = planCommentBody('step one', false, 'run-42');
 		expect(isSwarmGeneratedBody(plan)).toBe(true);
 
-		const impl = implementationCommentBody('https://github.com/jkwiecien/swarm/pull/449');
+		const impl = implementationCommentBody('https://github.com/SmartTechBrewery/swarm/pull/449');
 		expect(isSwarmGeneratedBody(impl)).toBe(true);
 
 		const child = splitChildCommentBody(
 			{
 				id: '1',
 				title: 'Parent',
-				url: 'https://github.com/jkwiecien/swarm/issues/1',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/1',
 				description: '',
 				labels: [],
 				assignees: [],
@@ -66,8 +66,8 @@ describe('SWARM-origin markers', () => {
 			buildPreplanContract({
 				splitId: 'split-abc',
 				childIndex: 1,
-				parentUrl: 'https://github.com/jkwiecien/swarm/issues/1',
-				itemUrl: 'https://github.com/jkwiecien/swarm/issues/2',
+				parentUrl: 'https://github.com/SmartTechBrewery/swarm/issues/1',
+				itemUrl: 'https://github.com/SmartTechBrewery/swarm/issues/2',
 				humanDescription: 'The UI slice.',
 				plan: '# UI plan\n\n1. Build it.',
 				generatedAt: '2026-07-14T00:00:00.000Z',

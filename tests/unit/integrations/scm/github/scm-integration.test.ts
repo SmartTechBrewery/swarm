@@ -211,7 +211,7 @@ describe('GitHubSCMIntegration', () => {
 
 			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
 			expect(withGitHubToken).toHaveBeenCalledWith('tok-rev', expect.any(Function));
-			expect(getCheckSuiteStatus).toHaveBeenCalledWith('jkwiecien', 'swarm', 'cafe');
+			expect(getCheckSuiteStatus).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 'cafe');
 		});
 
 		it('honours an explicit persona override', async () => {
@@ -443,7 +443,7 @@ describe('GitHubSCMIntegration', () => {
 				sha: 'deadbeef',
 			});
 			expect(mergePullRequestDirect).toHaveBeenCalledWith(
-				'jkwiecien',
+				'SmartTechBrewery',
 				'swarm',
 				42,
 				'reviewed-head',
@@ -603,7 +603,7 @@ describe('GitHubSCMIntegration', () => {
 				[
 					'push',
 					'--no-verify',
-					'https://github.com/jkwiecien/swarm.git',
+					'https://github.com/SmartTechBrewery/swarm.git',
 					'abc1234:refs/heads/issue-241',
 				],
 				expect.objectContaining({ cwd: '/worktree' }),

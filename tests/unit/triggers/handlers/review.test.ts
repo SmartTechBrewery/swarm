@@ -815,7 +815,7 @@ describe('review trigger', () => {
 						action: 'updated',
 					}),
 				}),
-				'review-mergeability:jkwiecien/swarm:42:abc123:pull-request',
+				'review-mergeability:SmartTechBrewery/swarm:42:abc123:pull-request',
 				30000,
 			);
 		});
@@ -845,13 +845,13 @@ describe('review trigger', () => {
 			expect(scheduleCoalescedJob).toHaveBeenNthCalledWith(
 				1,
 				expect.any(Object),
-				'review-mergeability:jkwiecien/swarm:42:abc123:checks',
+				'review-mergeability:SmartTechBrewery/swarm:42:abc123:checks',
 				30000,
 			);
 			expect(scheduleCoalescedJob).toHaveBeenNthCalledWith(
 				2,
 				expect.any(Object),
-				'review-mergeability:jkwiecien/swarm:42:abc123:pull-request',
+				'review-mergeability:SmartTechBrewery/swarm:42:abc123:pull-request',
 				30000,
 			);
 		});

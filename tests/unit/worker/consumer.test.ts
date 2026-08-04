@@ -1072,7 +1072,7 @@ describe('processJob', () => {
 			type: 'merge-automation' as const,
 			projectId: PROJECT.id,
 			reviewRunId: 'run-1',
-			repo: 'jkwiecien/swarm',
+			repo: 'SmartTechBrewery/swarm',
 			prNumber: '17',
 			approvedHeadSha: 'deadbeef',
 		};
@@ -3032,7 +3032,7 @@ describe('processJob', () => {
 			const workItem = createMockWorkItem();
 			phaseImpl = async () => ({
 				agent: agentResult(),
-				prUrl: 'https://github.com/jkwiecien/swarm/pull/7',
+				prUrl: 'https://github.com/SmartTechBrewery/swarm/pull/7',
 			});
 
 			await processJob(
@@ -3044,7 +3044,7 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({
 					status: 'completed',
-					producedPrUrl: 'https://github.com/jkwiecien/swarm/pull/7',
+					producedPrUrl: 'https://github.com/SmartTechBrewery/swarm/pull/7',
 				}),
 			);
 		});

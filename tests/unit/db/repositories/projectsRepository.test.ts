@@ -42,7 +42,7 @@ function stubInsert(): {
 const row = {
 	id: 'proj-1',
 	name: 'swarm',
-	repo: 'jkwiecien/swarm',
+	repo: 'SmartTechBrewery/swarm',
 	repoRoot: '/Users/dev/swarm',
 	worktreeRoot: '.swarm-workspaces',
 	baseBranch: 'main',
@@ -67,10 +67,10 @@ describe('projectsRepository', () => {
 	describe('findProjectByRepoFromDb', () => {
 		it('maps a row back to a ProjectConfig', async () => {
 			stubDb([row]);
-			const project = await findProjectByRepoFromDb('jkwiecien/swarm');
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
 			expect(project).toMatchObject({
 				id: 'proj-1',
-				repo: 'jkwiecien/swarm',
+				repo: 'SmartTechBrewery/swarm',
 				maxConcurrentJobs: 4,
 				pm: { type: 'github-projects' },
 				credentials: { implementer: 'IMPL', reviewer: 'REV', webhookSecret: 'HOOK' },
@@ -86,14 +86,14 @@ describe('projectsRepository', () => {
 
 		it('maps a null agents column to undefined (the common case: no override configured)', async () => {
 			stubDb([{ ...row, agents: null }]);
-			const project = await findProjectByRepoFromDb('jkwiecien/swarm');
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
 			expect(project?.agents).toBeUndefined();
 		});
 
 		it('round-trips a populated agents column', async () => {
 			const agents = { review: { cli: 'claude' as const, model: 'opus' } };
 			stubDb([{ ...row, agents }]);
-			const project = await findProjectByRepoFromDb('jkwiecien/swarm');
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
 			expect(project?.agents).toEqual(agents);
 		});
 	});
@@ -197,7 +197,7 @@ describe('projectsRepository', () => {
 			// migration, but it must survive serialization in priority order.
 			const written = values.mock.calls[0][0] as { agents: unknown };
 			stubDb([{ ...row, agents: JSON.parse(JSON.stringify(written.agents)) }]);
-			const project = await findProjectByRepoFromDb('jkwiecien/swarm');
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
 			expect(project?.agents?.planning?.targets).toEqual([
 				{ cli: 'claude', model: 'opus', reasoning: 'high' },
 				{ cli: 'codex', model: 'gpt-5.6-terra' },
