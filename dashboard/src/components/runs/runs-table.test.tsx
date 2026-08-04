@@ -65,7 +65,7 @@ const baseRun: RunRow = {
 const project = { id: 'proj-a', name: 'Acme', repo: 'acme/widgets' };
 
 // Seed the `projects.list` cache so run cards/rows can resolve the repo (needed
-// for the Task / ID work-item link) synchronously. `staleTime: Infinity` keeps
+// for the Task work-item link) synchronously. `staleTime: Infinity` keeps
 // the mocked queryFn from refetching and clobbering the seeded value mid-test.
 function renderTable(ui: ReactElement, projects: unknown[] = [project]) {
 	const queryClient = new QueryClient({
@@ -99,7 +99,7 @@ describe('RunsTable', () => {
 			expect(headers).toEqual([
 				'Phase',
 				'Project',
-				'Task / ID',
+				'Task',
 				'Status',
 				'Started',
 				'Duration',

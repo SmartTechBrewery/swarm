@@ -276,6 +276,26 @@ describe('listDashboardWorkers (issue #133)', () => {
 		return { currentRunId, lastHeartbeatAt: new Date('2026-07-01T12:00:00Z') };
 	}
 
+	/**
+	 * A `running` run row as `getRunByIdFromDb` returns it, carrying the work-item
+	 * fields the Active job description is assembled from (issue #473).
+	 */
+	function runningRun(overrides: Record<string, unknown> = {}) {
+		return {
+			id: RUN_ID,
+			status: 'running',
+			projectId: 'proj-a',
+			taskId: '42',
+			phase: 'implementation',
+			workItemId: 'I_kwitem',
+			workItemTitle: 'Teach the dispatcher to count',
+			workItemUrl: 'https://github.com/acme/widgets/issues/42',
+			prNumber: null,
+			prTitle: null,
+			...overrides,
+		};
+	}
+
 	describe('connectivity and last-seen', () => {
 		it('reports a worker with a live session online, with its live heartbeat as last seen', async () => {
 			listAllWorkers.mockResolvedValue([makeWorker()]);
@@ -306,7 +326,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 			expect(view.connection).toBe('offline');
 			expect(view.lastSeenAt).toEqual(new Date('2026-06-30T09:00:00Z'));
 			// An offline worker is running nothing, whatever its stale row still points at.
-			expect(view.currentRunId).toBeNull();
+			expect(view.currentRun).toBeNull();
 			expect(getRunByIdFromDb).not.toHaveBeenCalled();
 		});
 
@@ -319,20 +339,62 @@ describe('listDashboardWorkers (issue #133)', () => {
 
 			const [view] = await listDashboardWorkers(null);
 
-			expect(view).toMatchObject({ connection: 'offline', lastSeenAt: null, currentRunId: null });
+			expect(view).toMatchObject({ connection: 'offline', lastSeenAt: null, currentRun: null });
 		});
 	});
 
 	describe('active run', () => {
-		it('exposes the run id only while that run is actually running', async () => {
+		it('describes the active job — not just its id — while that run is actually running', async () => {
 			listAllWorkers.mockResolvedValue([makeWorker()]);
 			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
-			getRunByIdFromDb.mockResolvedValue({ id: RUN_ID, status: 'running', projectId: 'proj-a' });
+			getRunByIdFromDb.mockResolvedValue(runningRun());
 
 			const [view] = await listDashboardWorkers(null);
-			expect(view.currentRunId).toBe(RUN_ID);
+			// The Workers screen renders the same work-item description `/runs` does
+			// (issue #473), so the read model carries the run's task fields.
+			expect(view.currentRun).toEqual({
+				runId: RUN_ID,
+				projectId: 'proj-a',
+				taskId: '42',
+				phase: 'implementation',
+				workItemId: 'I_kwitem',
+				workItemTitle: 'Teach the dispatcher to count',
+				workItemUrl: 'https://github.com/acme/widgets/issues/42',
+				prNumber: null,
+				prTitle: null,
+			});
+		});
+
+		it('carries nothing beyond the job description — no payload, error, or usage from the run row', async () => {
+			listAllWorkers.mockResolvedValue([makeWorker()]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
+			getRunByIdFromDb.mockResolvedValue({
+				...runningRun(),
+				jobPayload: { credentials: { reviewer: 'ghp_secret' } },
+				error: 'boom',
+				usage: { inputTokens: 1 },
+			});
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(Object.keys(view.currentRun ?? {}).sort()).toEqual(
+				[
+					'phase',
+					'prNumber',
+					'prTitle',
+					'projectId',
+					'runId',
+					'taskId',
+					'workItemId',
+					'workItemTitle',
+					'workItemUrl',
+				].sort(),
+			);
+			expect(JSON.stringify(view.currentRun)).not.toMatch(/ghp_secret|boom|inputTokens/);
 		});
 
 		it('reads a stale pointer to a completed run as idle', async () => {
@@ -340,10 +402,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
-			getRunByIdFromDb.mockResolvedValue({ id: RUN_ID, status: 'completed', projectId: 'proj-a' });
+			getRunByIdFromDb.mockResolvedValue(runningRun({ status: 'completed' }));
 
 			const [view] = await listDashboardWorkers(null);
-			expect(view.currentRunId).toBeNull();
+			expect(view.currentRun).toBeNull();
 		});
 
 		it('derives candidate current run from active, unexpired durable dispatch claims when currentRunId is null', async () => {
@@ -352,10 +414,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(null));
 			getActiveWorkerClaims.mockResolvedValue([{ runId: RUN_ID, projectId: 'proj-a' }]);
-			getRunByIdFromDb.mockResolvedValue({ id: RUN_ID, status: 'running', projectId: 'proj-a' });
+			getRunByIdFromDb.mockResolvedValue(runningRun());
 
 			const [view] = await listDashboardWorkers(null);
-			expect(view.currentRunId).toBe(RUN_ID);
+			expect(view.currentRun?.runId).toBe(RUN_ID);
 			expect(getActiveWorkerClaims).toHaveBeenCalledWith(WORKER_ID);
 		});
 
@@ -365,10 +427,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(null));
 			getActiveWorkerClaims.mockResolvedValue([{ runId: RUN_ID, projectId: 'proj-a' }]);
-			getRunByIdFromDb.mockResolvedValue({ id: RUN_ID, status: 'completed', projectId: 'proj-a' });
+			getRunByIdFromDb.mockResolvedValue(runningRun({ status: 'completed' }));
 
 			const [view] = await listDashboardWorkers(null);
-			expect(view.currentRunId).toBeNull();
+			expect(view.currentRun).toBeNull();
 		});
 
 		it('withholds the claim run id if its project is outside the accessible scope for a restricted viewer', async () => {
@@ -380,14 +442,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(null));
 			getActiveWorkerClaims.mockResolvedValue([{ runId: RUN_ID, projectId: 'proj-secret' }]);
-			getRunByIdFromDb.mockResolvedValue({
-				id: RUN_ID,
-				status: 'running',
-				projectId: 'proj-secret',
-			});
+			getRunByIdFromDb.mockResolvedValue(runningRun({ projectId: 'proj-secret' }));
 
 			const [view] = await listDashboardWorkers(['proj-a']);
-			expect(view.currentRunId).toBeNull();
+			expect(view.currentRun).toBeNull();
 		});
 
 		it('chooses only the claim/run whose project is in the accessible scope when the worker has concurrent work', async () => {
@@ -404,14 +462,13 @@ describe('listDashboardWorkers (issue #133)', () => {
 				{ runId: OTHER_RUN_ID, projectId: 'proj-a' },
 			]);
 			getRunByIdFromDb.mockImplementation(async (id: string) => {
-				if (id === RUN_ID) return { id: RUN_ID, status: 'running', projectId: 'proj-secret' };
-				if (id === OTHER_RUN_ID)
-					return { id: OTHER_RUN_ID, status: 'running', projectId: 'proj-a' };
+				if (id === RUN_ID) return runningRun({ projectId: 'proj-secret' });
+				if (id === OTHER_RUN_ID) return runningRun({ id: OTHER_RUN_ID });
 				return null;
 			});
 
 			const [view] = await listDashboardWorkers(['proj-a']);
-			expect(view.currentRunId).toBe(OTHER_RUN_ID);
+			expect(view.currentRun?.runId).toBe(OTHER_RUN_ID);
 		});
 
 		it('falls back to the legacy session pointer if there are no active claims', async () => {
@@ -420,10 +477,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
 			getActiveWorkerClaims.mockResolvedValue([]);
-			getRunByIdFromDb.mockResolvedValue({ id: RUN_ID, status: 'running', projectId: 'proj-a' });
+			getRunByIdFromDb.mockResolvedValue(runningRun());
 
 			const [view] = await listDashboardWorkers(null);
-			expect(view.currentRunId).toBe(RUN_ID);
+			expect(view.currentRun?.runId).toBe(RUN_ID);
 		});
 	});
 
@@ -507,17 +564,13 @@ describe('listDashboardWorkers (issue #133)', () => {
 			]);
 			getUserById.mockResolvedValue(makeOwner());
 			getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
-			getRunByIdFromDb.mockResolvedValue({
-				id: RUN_ID,
-				status: 'running',
-				projectId: 'proj-secret',
-			});
+			getRunByIdFromDb.mockResolvedValue(runningRun({ projectId: 'proj-secret' }));
 
 			const [view] = await listDashboardWorkers(['proj-a']);
 
-			// The worker is visible (shared project) but its run is not.
+			// The worker is visible (shared project) but its job is not.
 			expect(view.connection).toBe('online');
-			expect(view.currentRunId).toBeNull();
+			expect(view.currentRun).toBeNull();
 		});
 
 		it('returns nothing — and reads no workers — for a viewer with no accessible project', async () => {
@@ -531,7 +584,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
 		getUserById.mockResolvedValue(makeOwner());
 		getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
-		getRunByIdFromDb.mockResolvedValue({ id: RUN_ID, status: 'running', projectId: 'proj-a' });
+		getRunByIdFromDb.mockResolvedValue(runningRun());
 
 		const [view] = await listDashboardWorkers(null);
 
@@ -539,7 +592,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 			[
 				'capabilities',
 				'connection',
-				'currentRunId',
+				'currentRun',
 				'displayName',
 				'enrollments',
 				'lastSeenAt',

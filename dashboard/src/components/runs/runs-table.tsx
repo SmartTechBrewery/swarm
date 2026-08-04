@@ -1,6 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
-import { ExternalLink } from 'lucide-react';
 import {
 	formatDuration,
 	formatPhase,
@@ -10,9 +9,9 @@ import {
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import { runTableColumnWidths } from '@/lib/run-table-layout.js';
 import { trpc } from '@/lib/trpc.js';
-import { parseWorkItemRef, workItemLabel } from '@/lib/work-item.js';
 import type { RunRow } from '@/types/runs.js';
 import { RunStatusBadge } from './run-status-badge.js';
+import { WorkItemCell } from './work-item-cell.js';
 
 interface RunsTableProps {
 	runs: RunRow[];
@@ -23,90 +22,9 @@ interface RunsTableProps {
 	/**
 	 * Whether to render the Project column. `true` for the global `/runs` view;
 	 * `false` for the project-scoped Runs tab, where every row is the same project
-	 * and the freed width goes to the Task / ID column (issue #168).
+	 * and the freed width goes to the Task column (issue #168).
 	 */
 	showProject?: boolean;
-}
-
-const PR_DRIVEN_PHASES = new Set([
-	'review',
-	'respond-to-review',
-	'respond-to-ci',
-	'resolve-conflicts',
-]);
-
-function WorkItemCell({
-	run,
-	repo,
-	variant = 'cell',
-}: {
-	run: RunRow;
-	repo?: string;
-	/**
-	 * `'cell'` truncates the title to one line for the fixed-width desktop table;
-	 * `'card'` lets it grow to the dominant, wrapping primary line of a mobile
-	 * run card (issue #381) so nothing is clipped and no field forces horizontal
-	 * scroll.
-	 */
-	variant?: 'cell' | 'card';
-}) {
-	const hasWorkItem = !!run.workItemId;
-	const hasPR = !!run.prNumber;
-	const workItemRef = parseWorkItemRef(run.workItemUrl);
-	const isPrDriven = PR_DRIVEN_PHASES.has(run.phase);
-	const title = isPrDriven ? run.prTitle : run.workItemTitle;
-	const isCard = variant === 'card';
-
-	if (!repo || (!hasWorkItem && !hasPR)) {
-		return <span className="text-zinc-500 font-mono">—</span>;
-	}
-
-	const stopPropagation = (event: React.MouseEvent) => event.stopPropagation();
-	const handleLinkKeyDown = (event: React.KeyboardEvent) => {
-		event.stopPropagation();
-	};
-
-	return (
-		<div className="flex w-full min-w-0 flex-col gap-1 text-xs">
-			{title &&
-				(isCard ? (
-					<span className="block w-full break-words text-sm font-medium text-zinc-100">
-						{title}
-					</span>
-				) : (
-					<span className="block w-full truncate text-zinc-200" title={title}>
-						{title}
-					</span>
-				))}
-			{isPrDriven && hasPR ? (
-				<a
-					href={`https://github.com/${repo}/pull/${run.prNumber}`}
-					target="_blank"
-					rel="noopener noreferrer"
-					onClick={stopPropagation}
-					onKeyDown={handleLinkKeyDown}
-					className="inline-flex self-start items-center gap-1 text-violet-400 hover:text-violet-300 font-mono hover:underline"
-				>
-					PR #{run.prNumber}
-					<ExternalLink className="h-3 w-3" />
-				</a>
-			) : hasWorkItem && workItemRef ? (
-				<a
-					href={run.workItemUrl ?? undefined}
-					target="_blank"
-					rel="noopener noreferrer"
-					onClick={stopPropagation}
-					onKeyDown={handleLinkKeyDown}
-					className="inline-flex self-start items-center gap-1 text-zinc-400 hover:text-zinc-300 font-mono hover:underline"
-				>
-					{workItemLabel(workItemRef)}
-					<ExternalLink className="h-3 w-3" />
-				</a>
-			) : hasWorkItem ? (
-				<span className="text-zinc-400 font-mono">Issue: #{run.taskId}</span>
-			) : null}
-		</div>
-	);
 }
 
 export function RunsTable({
@@ -143,7 +61,7 @@ export function RunsTable({
 			{/*
 			 * Mobile (< md): each run reads top-to-bottom as a self-contained,
 			 * tappable card — no horizontal scroll (issue #381). Deliberate
-			 * hierarchy: the Task / ID + status form the primary scan line, Phase +
+			 * hierarchy: the Task + status form the primary scan line, Phase +
 			 * Started are lighter supporting metadata, and Duration / Model / Tokens
 			 * sit in a subordinate footer. No field is dropped, just de-emphasized.
 			 */}
@@ -236,7 +154,7 @@ export function RunsTable({
 							<th
 								className={`${columnWidths.task} px-2 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400`}
 							>
-								Task / ID
+								Task
 							</th>
 							<th className="px-2 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
 								Status
