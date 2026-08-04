@@ -167,6 +167,30 @@ describe('runAssignment', () => {
 		expect(result.reason).toContain('#319');
 	});
 
+	it('settles terminally failed for an auth failure, carrying its actionable message', async () => {
+		// Issue #343: `auth` is deliberately not deferrable, so it must settle `failed`
+		// rather than `deferred` — a `deferred` frame carrying an unrecognised kind is
+		// re-read as a rate-limit by the control plane (`../router/dispatcher.ts`),
+		// which would retry a run only a human re-`/login` can unblock. The suffixed
+		// message rides along in `error`, so the remote path's dashboard headline is
+		// the same actionable one the in-process path produces.
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => {
+			throw new AgentRunError(
+				'Review agent (claude) exited with code 1 (authentication failed)',
+				{ kind: 'auth' },
+				agentResult({ exitCode: 1 }),
+			);
+		});
+		await runAssignment(assignment(), sink, { deps: depsWith(runPhase) });
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			type: 'task-execution-result',
+			status: 'failed',
+			error: 'Review agent (claude) exited with code 1 (authentication failed)',
+		});
+	});
+
 	it('settles terminally failed for a generic error', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => {

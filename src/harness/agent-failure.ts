@@ -12,9 +12,14 @@
  * This module is where the CLI-specific knowledge of *what a limit looks like*
  * lives, mirroring how {@link ./agent-cli.ts} owns the per-CLI flag quirks: it
  * reads an {@link AgentCliResult} and says whether the failure is a `rate-limit`
- * (retry later), a `timeout` (the harness killed it), or a plain `error`. For a
- * rate-limit it also lifts the CLI's own "resets …" hint out of the output and,
- * best-effort, resolves it to an absolute instant the worker can defer until.
+ * (retry later), a `timeout` (the harness killed it), an `auth` failure (the CLI
+ * is logged out), or a plain `error`. For a rate-limit it also lifts the CLI's
+ * own "resets …" hint out of the output and, best-effort, resolves it to an
+ * absolute instant the worker can defer until.
+ *
+ * Not every recognised kind is a retry signal: `auth` (issue #343) is terminal
+ * and classified purely so the run's headline says *why* — waiting cannot restore
+ * a login, only a human re-running `/login` can.
  */
 
 import type { AgentCliResult } from './agent-cli.js';
@@ -23,6 +28,7 @@ import type { AgentCliResult } from './agent-cli.js';
 export type AgentFailureKind =
 	| 'rate-limit'
 	| 'capacity'
+	| 'auth'
 	| 'timeout'
 	| 'aborted'
 	| 'stalled'
@@ -96,6 +102,16 @@ const CODEX_CAPACITY_RE = /selected model is at capacity/i;
 // "overloaded", or the literal `overloaded_error` type token — never a bare 529,
 // which reviewed code, tool output, or an unrelated log can mention innocuously.
 const CLAUDE_CAPACITY_RE = /\b529\s+overloaded\b|\boverloaded_error\b/i;
+// The distinctive, CLI-owned forms of an agent CLI's "you are not authenticated"
+// banner (issue #343). These are matched only in the terminal output window.
+// Broad prose such as "not logged in", "invalid API key", and "failed to
+// authenticate" is deliberately excluded: a review or CI log can use those
+// phrases without the agent CLI itself being logged out. The real observed
+// banners remain covered by their `/login`, OAuth-session, or
+// `authentication_error` marker. Like a login banner, they are provider-generic
+// rather than tied to a particular CLI.
+const AUTH_BANNER_RE =
+	/\brun \/login\b|\boauth session expired\b|\bsession expired and could not be refreshed\b|\bauthentication_error\b/i;
 // Claude's terminal `result` stream event is rendered as a single
 // `Claude run failed (…)` line ({@link ./claude-stream.ts}). That line is a
 // structural signal — it exists only because the CLI itself reported the run
@@ -253,16 +269,19 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
  * output and `signal: null`, since it trapped SIGTERM and called `process.exit`
  * itself rather than being torn down by the OS — {@link AgentCliResult.aborted}
  * exists precisely because `result.signal` can't be trusted to reflect this).
- * Otherwise a stalled run is classified as `stalled`. Next, a provider-capacity
- * error is `capacity`, matched per CLI so one CLI's provider error can't be
- * triggered by another CLI merely quoting or discussing the text: Codex's
- * structured `error` / `turn.failed` events anywhere in its output, or its
- * terminal `selected model is at capacity` banner; and Claude's terminal
- * `529 Overloaded` / `overloaded_error` banner. A recognisable terminal limit
- * banner is a `rate-limit` — as is a quota signal reported by a CLI's own
- * structural terminal failure record (Claude's failed `result` event, or
- * Antigravity's non-`SUCCESS` `status`), which needs no reset hint to be
- * trusted — and everything else is a plain `error`.
+ * Next, a provider-capacity error is `capacity`, matched per CLI so one CLI's
+ * provider error can't be triggered by another CLI merely quoting or discussing
+ * the text: Codex's structured `error` / `turn.failed` events anywhere in its
+ * output, or its terminal `selected model is at capacity` banner; and Claude's
+ * terminal `529 Overloaded` / `overloaded_error` banner. A recognisable terminal
+ * limit banner is then a `rate-limit` — as is a quota signal reported by a CLI's
+ * own structural terminal failure record (Claude's failed `result` event, or
+ * Antigravity's non-`SUCCESS` `status`), which needs no reset hint to be trusted.
+ * Then a CLI's own "not authenticated" banner is `auth` — recognised for its
+ * message, not to retry, and checked before the trailing stall marker so an
+ * unauthenticated run cannot be deferred and resumed onto a login only a human
+ * can restore. Otherwise a stalled run is classified as `stalled`, and
+ * everything else is a plain `error`.
  */
 export function classifyAgentFailure(result: AgentCliResult, now: Date = new Date()): AgentFailure {
 	if (result.timedOut) return { kind: 'timeout' };
@@ -308,6 +327,13 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 		};
 	}
 
+	// An unauthenticated CLI is terminal, not transient: no amount of waiting
+	// restores a login, so this is recognised for the headline's sake rather than
+	// to retry. Rate-limit signals return above because a structural quota result
+	// or terminal limit banner is more specific; auth still outranks the generic
+	// trailing stall marker below. `timedOut`/`aborted` still win above both.
+	if (AUTH_BANNER_RE.test(tail)) return { kind: 'auth' };
+
 	// The CLI's own give-up-waiting phrasing (matched case-insensitively). Checked
 	// after timeout/abort and recognised provider conditions, so a trailing stall
 	// marker cannot hide a rate-limit or capacity banner. We match narrowly: only
@@ -317,6 +343,20 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 
 	return { kind: 'error' };
 }
+
+/**
+ * The reason marker each recognised kind splices into the phase's message. A
+ * kind absent from the table (a plain `error`, or a non-agent kind like
+ * `worktree-exists`) leaves the stem as the phase built it.
+ */
+const FAILURE_REASONS: Partial<Record<AgentFailureKind, string>> = {
+	timeout: ' (timed out)',
+	'rate-limit': ' (rate limited)',
+	capacity: ' (model at capacity)',
+	aborted: ' (aborted)',
+	stalled: ' (stalled)',
+	auth: ' (authentication failed)',
+};
 
 /**
  * Build the {@link AgentRunError} a pipeline phase throws on a non-zero exit.
@@ -332,17 +372,6 @@ export function agentRunError(
 	now: Date = new Date(),
 ): AgentRunError {
 	const failure = classifyAgentFailure(result, now);
-	const reason =
-		failure.kind === 'timeout'
-			? ' (timed out)'
-			: failure.kind === 'rate-limit'
-				? ' (rate limited)'
-				: failure.kind === 'capacity'
-					? ' (model at capacity)'
-					: failure.kind === 'aborted'
-						? ' (aborted)'
-						: failure.kind === 'stalled'
-							? ' (stalled)'
-							: '';
+	const reason = FAILURE_REASONS[failure.kind] ?? '';
 	return new AgentRunError(`${prefix}${reason}${tail}`, failure, result);
 }

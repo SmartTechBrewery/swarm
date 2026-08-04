@@ -159,6 +159,13 @@ export type DeferrableAssignmentFailure =
  * rate-limit, capacity, aborted, or stalled agent error, a genuinely-interrupted
  * timeout (non-zero/absent exit — a clean SIGTERM exit already cleaned up), or a
  * deterministic-delivery deferral.
+ *
+ * An `auth` failure is deliberately absent (issue #343): the remote CLI is logged
+ * out, so it settles terminal-`failed` carrying the already-suffixed
+ * `(authentication failed)` message — the same actionable headline the in-process
+ * path produces. That also keeps it out of the `deferred` frame, whose
+ * unrecognised-kind fallback on the control plane re-reads a kind it doesn't model
+ * as a `rate-limit` retry (`../router/dispatcher.ts`).
  */
 export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | undefined {
 	if (err instanceof DependencyBlockedError) return { kind: 'dependency', blockers: err.blockers };
