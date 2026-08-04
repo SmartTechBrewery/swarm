@@ -277,6 +277,26 @@ export function createMockBitbucketPullRequestResponse(
 }
 
 /**
+ * A Bitbucket Cloud **REST** top-level pull-request comment, as
+ * `GET /2.0/repositories/{w}/{s}/pullrequests/{id}/comments` returns each `values`
+ * entry. `content.raw` is where a delivery's idempotency marker travels, so it is
+ * what the marker scan reads.
+ */
+export function createMockBitbucketCommentResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		type: 'pullrequest_comment',
+		id: 118571088,
+		content: { raw: 'looks good', markup: 'markdown' },
+		user: bitbucketAccount('swarm-rev'),
+		deleted: false,
+		created_on: '2026-08-04T10:00:00.000000+00:00',
+		...overrides,
+	};
+}
+
+/**
  * A Bitbucket Cloud **REST** commit build status, as
  * `GET /2.0/repositories/{w}/{s}/commit/{sha}/statuses` returns each `values`
  * entry. `key` is what identifies a build definition across re-runs, so it is what

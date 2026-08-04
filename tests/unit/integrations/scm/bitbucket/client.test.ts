@@ -3,8 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	BITBUCKET_API_BASE,
 	BitbucketApiError,
+	bitbucketGitBasicCredential,
 	bitbucketRequest,
 	getBitbucketUserForCredential,
+	getScopedBitbucketUserEmail,
 	getScopedCredential,
 	MAX_PAGES,
 	paginateBitbucket,
@@ -260,6 +262,56 @@ describe('bitbucket client', () => {
 		it('returns null for an absent credential without calling the API', async () => {
 			await expect(getBitbucketUserForCredential(null)).resolves.toBeNull();
 			expect(fetchMock).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('getScopedBitbucketUserEmail', () => {
+		it('resolves the primary confirmed address', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({
+					values: [
+						{ email: 'secondary@example.com', is_primary: false, is_confirmed: true },
+						{ email: 'primary@example.com', is_primary: true, is_confirmed: true },
+					],
+				}),
+			);
+
+			await expect(withBitbucketCredential('token-abc', getScopedBitbucketUserEmail)).resolves.toBe(
+				'primary@example.com',
+			);
+			expect(new URL(String(fetchMock.mock.calls[0]?.[0])).pathname).toBe('/2.0/user/emails');
+		});
+
+		it('ignores an unconfirmed primary — Bitbucket attributes commits by a confirmed address', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({
+					values: [{ email: 'primary@example.com', is_primary: true, is_confirmed: false }],
+				}),
+			);
+
+			await expect(
+				withBitbucketCredential('token-abc', getScopedBitbucketUserEmail),
+			).resolves.toBeNull();
+		});
+
+		// A workspace/repository access token cannot hold the `email` scope at all, so a
+		// refusal here is ordinary and must not fail the delivery that asked.
+		it('returns null — never throws — when the endpoint is unavailable', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ error: { message: 'Forbidden' } }, 403));
+
+			await expect(
+				withBitbucketCredential('token-abc', getScopedBitbucketUserEmail),
+			).resolves.toBeNull();
+		});
+	});
+
+	describe('bitbucketGitBasicCredential', () => {
+		it('authenticates an access token as the reserved x-token-auth user', () => {
+			expect(bitbucketGitBasicCredential('token-abc')).toBe('x-token-auth:token-abc');
+		});
+
+		it('passes an app password through as the pair it already is', () => {
+			expect(bitbucketGitBasicCredential('swarm-bot:app-password')).toBe('swarm-bot:app-password');
 		});
 	});
 });

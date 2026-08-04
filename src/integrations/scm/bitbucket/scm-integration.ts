@@ -1,12 +1,15 @@
 /**
  * BitbucketSCMIntegration — Bitbucket Cloud's implementation of the
  * provider-neutral {@link SCMProvider} contract (`src/scm/types.ts`), built out
- * over four phases (issue #296). Landed so far: availability probing, persona
+ * over four phases (issue #296) and now complete: availability probing, persona
  * credential scoping, and persona identity / actor resolution (phase 1/4);
  * webhook signature verification, header reading, event normalization, and the
- * comment loop-prevention gate (phase 2/4, delegated to `./webhook.ts`); and the
+ * comment loop-prevention gate (phase 2/4, delegated to `./webhook.ts`); the
  * pull-request / build-status reads (phase 3/4, delegated to
- * `./pull-requests.ts`).
+ * `./pull-requests.ts`); and comments, the delivery seam, and the direct merge
+ * (phase 4/4, delegated to `./writes.ts` / `./operator-delivery.ts`). No contract
+ * method is stubbed — the multi-provider conformance suite
+ * (`tests/unit/integrations/scm/scm-conformance.test.ts`) asserts that.
  *
  * Its core job is the same as the GitHub class's: run a block of Bitbucket
  * operations under the correct persona's credential. Callers hand it a project +
@@ -16,14 +19,15 @@
  * reviewer and push as the implementer without either credential appearing in a
  * signature (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Every method a later phase owns throws** — loudly, naming the method and the
- * phase that fills it in — rather than returning `null`, `[]`, or
- * a no-op that would read as a real answer. Nothing selects this provider at
- * runtime yet (its manifest registers with `runtimeReady: false`,
- * `./index.ts`), so a throw here means a premature call, which is a wiring bug
- * worth surfacing.
+ * **Implemented is still not reachable.** The manifest keeps `runtimeReady: false`
+ * (`./index.ts`): nothing selects a project's SCM provider, so no served route or
+ * project-scoped lookup resolves to Bitbucket. That wiring — project→provider
+ * selection plus a served ingress route — is a separate follow-up, not part of
+ * #296 (ai/RULES.md §2).
  */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
@@ -37,16 +41,26 @@ import type {
 	ScmWebhookRequest,
 	WebhookHeaderReader,
 } from '../../../scm/types.js';
-import { withBitbucketCredential } from './client.js';
+import {
+	bitbucketGitBasicCredential,
+	getBitbucketUserForCredential,
+	getScopedBitbucketUserEmail,
+	withBitbucketCredential,
+} from './client.js';
+import { sameBitbucketCommit } from './commits.js';
 import { getBitbucketCredential, getBitbucketCredentialOrNull } from './credentials.js';
+import { createBitbucketOperatorDeliveryProvider } from './operator-delivery.js';
 import {
 	getBitbucketPersonaForLogin,
 	isSwarmBitbucketActor,
 	resolveBitbucketPersonaIdentities,
 } from './personas.js';
 import {
+	findOpenBitbucketPullRequest,
 	getBitbucketCommitBuildStatus,
 	getBitbucketPullRequest,
+	getBitbucketPullRequestApprovals,
+	getBitbucketPullRequestMergeState,
 	getBitbucketPullRequestTitle,
 	listOpenBitbucketPullRequestsForBase,
 } from './pull-requests.js';
@@ -56,19 +70,13 @@ import {
 	readBitbucketWebhookRequest,
 	verifyBitbucketSignature,
 } from './webhook.js';
-
-/**
- * The single exit for every contract method a later phase owns. `phase`
- * names the follow-up that implements it, so the error tells a caller what to
- * wait for rather than just that something is missing.
- */
-function notImplementedYet(method: string, phase: string): never {
-	throw new Error(
-		`Bitbucket SCM: ${method}() is not implemented yet — it lands in ${phase} of issue #296`,
-	);
-}
-
-const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
+import {
+	createBitbucketPullRequest,
+	mergeBitbucketPullRequestDirect,
+	postBitbucketPullRequestComment,
+	postIdempotentBitbucketPullRequestComment,
+	submitBitbucketReview,
+} from './writes.js';
 
 /**
  * Bitbucket's `workspace` / `repo_slug` pair, which a project's `owner/repo`
@@ -78,6 +86,132 @@ const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
 function repoCoordinates(project: ProjectConfig): [workspace: string, slug: string] {
 	const [workspace, slug] = project.repo.split('/');
 	return [workspace, slug];
+}
+
+/** Bitbucket's git-over-HTTPS host — the push remote and the `extraheader` scope. */
+const BITBUCKET_GIT_ORIGIN = 'https://bitbucket.org/';
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** `BitbucketApiError#status`, if `error` carries one (it mirrors Octokit's field name). */
+function errorStatus(error: unknown): number | undefined {
+	const status = (error as { status?: unknown } | null)?.status;
+	return typeof status === 'number' ? status : undefined;
+}
+
+/**
+ * Classify a thrown Bitbucket error from the direct-merge endpoint into the
+ * provider-neutral outcome — the Bitbucket twin of GitHub's
+ * `classifyDirectMergeError`.
+ *
+ * 409 is Bitbucket's merge conflict and **555** its own non-standard "the merge took
+ * too long, it may still complete" status; both are transient, so `not-ready` and
+ * the merge dispatch retries. 403 means the repository's branch restrictions refuse
+ * the merge for this account outright — `policy-blocked`. Bitbucket also refuses with
+ * a 400 when a **merge check** (approvals, resolved tasks, passing builds) is
+ * unsatisfied, naming it in the error body; that is a policy the merge dispatch
+ * cannot retry its way past either, so it is `policy-blocked` too. Anything else
+ * (401, 404, other 5xx, a network failure) is an unexpected `provider-error`.
+ *
+ * Nothing maps to `unsupported`: that status is for a repository configuration the
+ * adapter has no way to satisfy, and Bitbucket Cloud has no merge-queue analogue —
+ * the case GitHub's classifier reserves it for.
+ */
+function classifyBitbucketDirectMergeError(error: unknown): MergePullRequestOutcome {
+	const message = errorMessage(error);
+	const status = errorStatus(error);
+	if (status === 409 || status === 555) return { status: 'not-ready', message };
+	if (status === 403) return { status: 'policy-blocked', message };
+	if (/merge check/i.test(message)) return { status: 'policy-blocked', message };
+	return { status: 'provider-error', message };
+}
+
+/**
+ * The credential-scoped body of {@link BitbucketSCMIntegration.mergePullRequest},
+ * mirroring GitHub's `mergeReadyPullRequest`: re-read the pull request's current
+ * state on every call, so a durable retry re-evaluates eligibility from scratch
+ * rather than merging stale approval context.
+ *
+ * The re-read carries more weight here than on GitHub, because Bitbucket's merge
+ * endpoint takes **no expected-head parameter** — GitHub pins its merge to the
+ * approved SHA and gets a stale-head refusal for free. These checks are the whole of
+ * Bitbucket's protection against merging a commit nobody reviewed.
+ *
+ * Two reads of the same pull request (state, then participant verdicts) rather than
+ * one: they are the phase-3 reads the adapter already exposes, and a merge attempt is
+ * not a hot path.
+ */
+async function mergeReadyBitbucketPullRequest(
+	workspace: string,
+	slug: string,
+	prNumber: number,
+	approvedHeadSha: string,
+): Promise<MergePullRequestOutcome> {
+	let state: Awaited<ReturnType<typeof getBitbucketPullRequestMergeState>>;
+	try {
+		state = await getBitbucketPullRequestMergeState(workspace, slug, prNumber);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (state.merged) return { status: 'merged', message: 'pull request already merged' };
+	// The approval this attempt was requested for covers one exact commit. A push
+	// since then (including a rebase that keeps the same diff) means nobody has
+	// reviewed the pull request's *current* head, so merging would silently ship
+	// unreviewed content — that needs a fresh review, not a retry.
+	if (!sameBitbucketCommit(state.headSha, approvedHeadSha))
+		return {
+			status: 'not-eligible',
+			message: `pull request head changed since the reviewed commit (reviewed ${approvedHeadSha}, now ${state.headSha}); a fresh review is required before merge automation can proceed`,
+		};
+	if (state.draft)
+		return {
+			status: 'not-eligible',
+			message: 'pull request was converted back to a draft after the review was approved',
+		};
+	if (state.state !== 'open')
+		return { status: 'not-eligible', message: `pull request is ${state.state}` };
+
+	// The head is unchanged, but the verdicts on it may no longer be. Bitbucket
+	// records a *standing* participant state rather than a review history, so
+	// "dismissed" simply means the approval is no longer in the list — there is no
+	// GitHub-style `REVIEW_REQUIRED` propagation window to tolerate.
+	let approvals: Awaited<ReturnType<typeof getBitbucketPullRequestApprovals>>;
+	try {
+		approvals = await getBitbucketPullRequestApprovals(workspace, slug, prNumber);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (approvals.some((approval) => approval.state === 'CHANGES_REQUESTED'))
+		return {
+			status: 'not-eligible',
+			message: 'the approving review is no longer in effect — changes have since been requested',
+		};
+	if (
+		!approvals.some(
+			(approval) =>
+				approval.state === 'APPROVED' && sameBitbucketCommit(approval.commitId, approvedHeadSha),
+		)
+	)
+		return {
+			status: 'not-eligible',
+			message: 'the approving review is no longer in effect — it has since been dismissed',
+		};
+
+	try {
+		const merge = await mergeBitbucketPullRequestDirect(
+			workspace,
+			slug,
+			prNumber,
+			`Merge pull request #${prNumber}`,
+		);
+		return merge.merged
+			? { status: 'merged', message: merge.message, sha: merge.sha }
+			: { status: 'not-ready', message: merge.message };
+	} catch (error) {
+		return classifyBitbucketDirectMergeError(error);
+	}
 }
 
 export class BitbucketSCMIntegration implements SCMProvider {
@@ -225,22 +359,131 @@ export class BitbucketSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: comments, delivery, merge — phase 4/4
+	// Writes: comments, delivery, merge — phase 4/4, in `./writes.ts`
 	// ==========================================================================
 
-	async commentOnPullRequest(): Promise<number> {
-		notImplementedYet('commentOnPullRequest', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.commentOnPullRequest} — a top-level comment as `persona`,
+	 * returning the new comment's id. The PR-driven phases normally comment from
+	 * *inside* the agent run; this is the out-of-band path for the worker's
+	 * stalled-job safety net, where the run was reclaimed before it could comment
+	 * itself. Defaults to the **implementer** (the PR's author, whose credential is
+	 * always configured for a project that opens PRs) for the same reason GitHub's
+	 * does: a comment triggers no pipeline phase, so the persona choice is immaterial
+	 * to loop prevention.
+	 */
+	async commentOnPullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		body: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<number> {
+		const [workspace, slug] = repoCoordinates(project);
+		return this.withPersonaCredentials(project, persona, () =>
+			postBitbucketPullRequestComment(workspace, slug, prNumber, body),
+		);
 	}
 
-	async deliveryProvider(): Promise<ScmDeliveryProvider> {
-		notImplementedYet('deliveryProvider', WRITE_PHASE);
+	/**
+	 * {@link ScmMergeProvider.mergePullRequest} for Bitbucket: merge an approved,
+	 * ready pull request as the **implementer** through Bitbucket's direct merge
+	 * endpoint. Idempotent — a pull request found already merged reports `merged`
+	 * without attempting anything — and re-reads current state on every call, so a
+	 * durable retry re-checks eligibility rather than trusting stale approval context
+	 * ({@link mergeReadyBitbucketPullRequest}). Never throws: every refusal or
+	 * unexpected failure comes back as a terminal, non-`merged`
+	 * {@link MergePullRequestOutcome}, so a completed, already-submitted Review can't
+	 * be retroactively failed by this call.
+	 */
+	async mergePullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		approvedHeadSha: string,
+	): Promise<MergePullRequestOutcome> {
+		const [workspace, slug] = repoCoordinates(project);
+		try {
+			return await this.withPersonaCredentials(project, 'implementer', () =>
+				mergeReadyBitbucketPullRequest(workspace, slug, prNumber, approvedHeadSha),
+			);
+		} catch (error) {
+			// Credential resolution runs *outside* the recheck's own try/catch, so an
+			// unconfigured implementer credential would otherwise be the one way this
+			// capability throws.
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
 	}
 
-	async operatorDeliveryProvider(): Promise<ScmDeliveryProvider> {
-		notImplementedYet('operatorDeliveryProvider', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.deliveryProvider} — the same-host, per-persona delivery seam.
+	 * The persona's credential is resolved once and bound to every operation, so a
+	 * rotation mid-delivery can't leave one write authenticating as somebody else.
+	 *
+	 * `commitIdentity` is where Bitbucket differs from GitHub. The name is the
+	 * account's `nickname` (Bitbucket exposes no `username`). Delivery requires an
+	 * app password: workspace/repository access tokens cannot resolve `GET /2.0/user`
+	 * and fail before the email lookup. An app password without the `email` scope
+	 * falls back to `<nickname>@users.noreply.bitbucket.org` so delivery still
+	 * commits. Bitbucket attributes a commit by matching a **confirmed** account
+	 * email, so that placeholder keeps the name but leaves the commit unlinked. Grant
+	 * the app password the `email` scope for attributed commits.
+	 */
+	async deliveryProvider(
+		project: ProjectConfig,
+		persona: ScmPersona,
+	): Promise<ScmDeliveryProvider> {
+		const [workspace, slug] = repoCoordinates(project);
+		const credential = await getBitbucketCredential(project, persona);
+		const nickname = await getBitbucketUserForCredential(credential);
+		if (!nickname) throw new Error(`Could not resolve Bitbucket identity for ${persona} persona`);
+		const scoped = <T>(fn: () => Promise<T>): Promise<T> => withBitbucketCredential(credential, fn);
+		const email =
+			(await scoped(getScopedBitbucketUserEmail)) ?? `${nickname}@users.noreply.bitbucket.org`;
+		return {
+			commitIdentity: { name: nickname, email },
+			findPullRequest: (branch) =>
+				scoped(() => findOpenBitbucketPullRequest(workspace, slug, branch)),
+			createPullRequest: (input) =>
+				scoped(() => createBitbucketPullRequest(workspace, slug, input)),
+			pushBranch: async (cwd, branch, expectedSha) => {
+				// The credential travels in a git config value, never in argv — an
+				// `extraheader` keeps it out of the process listing and any git error
+				// echoing the remote. The refspec pushes the *exact* commit the caller
+				// verified rather than whatever HEAD happens to be, which is what makes a
+				// resumed delivery safe.
+				const authorization = Buffer.from(bitbucketGitBasicCredential(credential)).toString(
+					'base64',
+				);
+				await promisify(execFile)(
+					'git',
+					[
+						'push',
+						'--no-verify',
+						`${BITBUCKET_GIT_ORIGIN}${workspace}/${slug}.git`,
+						`${expectedSha}:refs/heads/${branch}`,
+					],
+					{
+						cwd,
+						env: {
+							...process.env,
+							GIT_CONFIG_COUNT: '1',
+							GIT_CONFIG_KEY_0: `http.${BITBUCKET_GIT_ORIGIN}.extraheader`,
+							GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${authorization}`,
+						},
+					},
+				);
+			},
+			submitReview: (input) => scoped(() => submitBitbucketReview(workspace, slug, input)),
+			postComment: (input) =>
+				scoped(() => postIdempotentBitbucketPullRequestComment(workspace, slug, input)),
+		};
 	}
 
-	async mergePullRequest(): Promise<MergePullRequestOutcome> {
-		notImplementedYet('mergePullRequest', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.operatorDeliveryProvider} — operator-credential delivery
+	 * for DB-free workers. The worker supplies its own credential, so no project
+	 * secret-store lookup is involved.
+	 */
+	async operatorDeliveryProvider(repo: string, credential: string): Promise<ScmDeliveryProvider> {
+		return createBitbucketOperatorDeliveryProvider(repo, credential);
 	}
 }

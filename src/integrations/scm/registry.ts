@@ -79,9 +79,9 @@ export function requireSCMProvider(id: string): SCMProvider {
  * resolving to whichever manifest happened to register first.
  *
  * The assertion counts only *runtime-ready* manifests
- * ({@link SCMProviderManifest.runtimeReady}), so a provider being built out phase
- * by phase — Bitbucket, issue #296 — can register without answering for every
- * project while half its contract still throws. The forcing function is
+ * ({@link SCMProviderManifest.runtimeReady}), so a provider nothing selects yet —
+ * Bitbucket, issue #296, whose contract is complete but which no project resolves
+ * to — can register without answering for every project. The forcing function is
  * unchanged: the second manifest to claim runtime readiness lands here as a
  * throw.
  */

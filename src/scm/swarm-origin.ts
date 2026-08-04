@@ -16,7 +16,7 @@
  * producer and this detector cannot drift apart:
  *
  * - a hidden {@link swarmMarker} — the per-delivery idempotency markers
- *   `<!-- swarm-delivery:… -->` (`src/integrations/scm/github/client.ts`) and
+ *   `<!-- swarm-delivery:… -->` ({@link deliveryMarker}) and
  *   `<!-- swarm-planning-delivery:… -->` (`src/pipeline/planning.ts`);
  * - the visible {@link SWARM_GENERATED_FOOTER} (or a phase-qualified variant of
  *   {@link SWARM_GENERATED_SIGNATURE}) on the phase, split-child, and
@@ -37,6 +37,22 @@ export const SWARM_MARKER_PREFIX = '<!-- swarm-';
 /** A hidden SWARM marker: `<!-- swarm-<kind>:<id> -->`. */
 export function swarmMarker(kind: string, id: string): string {
 	return `${SWARM_MARKER_PREFIX}${kind}:${id} -->`;
+}
+
+/**
+ * The per-delivery idempotency marker a delivery write appends to the body it
+ * posts: `<!-- swarm-delivery:<id> -->`.
+ *
+ * Deliberately **provider-neutral** rather than a constant inside one adapter: the
+ * marker *is* the retry contract a resumed delivery matches its own earlier write
+ * on, so every SCM provider has to spell it identically (GitHub's
+ * `postIdempotentPullRequestComment` / `submitPullRequestReview`,
+ * `src/integrations/scm/github/client.ts`; Bitbucket's equivalents in
+ * `src/integrations/scm/bitbucket/writes.ts`). A second spelling would make a
+ * retried delivery post a duplicate instead of recognising what it already wrote.
+ */
+export function deliveryMarker(deliveryId: string): string {
+	return swarmMarker('delivery', deliveryId);
 }
 
 /**

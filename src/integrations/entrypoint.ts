@@ -28,9 +28,9 @@
 import './pm/github-projects/index.js';
 // SCM: GitHub. Registers its manifest into scmProviderRegistry.
 import './scm/github/index.js';
-// SCM: Bitbucket (issue #296). Registers with `runtimeReady: false` — discoverable
-// by id, but not selectable and not served a webhook route until phases 2–4 fill
-// in the rest of the contract.
+// SCM: Bitbucket (issue #296, contract complete). Registers with
+// `runtimeReady: false` — discoverable by id, but not selectable and not served a
+// webhook route until project→provider selection exists (a follow-up).
 import './scm/bitbucket/index.js';
 
 /**
