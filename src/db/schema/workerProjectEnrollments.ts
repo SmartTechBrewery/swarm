@@ -10,6 +10,7 @@ import {
 	uuid,
 } from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
+import { DEFAULT_CONCURRENCY_ALLOCATION } from '../../identity/worker-enrollment.js';
 import { projects } from './projects.js';
 import { workers } from './workers.js';
 
@@ -33,15 +34,17 @@ import { workers } from './workers.js';
  * the source of truth for the values), matching how `project_members.role` /
  * `project_membership_requests.status` persist their enums. `allowed_clis` is a
  * `jsonb` of `AgentCli[]` (a subset of the worker's `capabilities`), the same
- * treatment `workers.capabilities` gets. `concurrency_allocation` is **nullable**
- * and defaults to `NULL` — an *optional* per-worker sub-limit: `NULL` means the
- * worker imposes no project-scoped cap of its own, so its concurrency for this
- * project is bounded only by its process-wide `SWARM_WORKER_CONCURRENCY`
- * (`src/worker/index.ts`, overridable per launch with `--concurrency`) and the
- * project's own `max_concurrent_jobs`. A positive integer narrows it further for
- * this one project. `sharing_consent` defaults to `false` (a fresh enrollment is
- * never routable until the owner opts in), so revoking consent is the owner's
- * explicit lever for flipping the routability predicate (`isRoutable`).
+ * treatment `workers.capabilities` gets. `concurrency_allocation` is **`NOT NULL`
+ * and defaults to `1`** (issue #480): every enrollment states this worker's share
+ * of the project, and a new one claims a single slot unless the operator says
+ * otherwise. "No per-worker cap" is deliberately not expressible — as `NULL` it
+ * was a second way of saying a number, and on a default install already resolved
+ * to an effective 1 (both limits it deferred to, `SWARM_WORKER_CONCURRENCY` and
+ * `max_concurrent_jobs`, default to 1). A larger integer widens this one
+ * project's share of the worker. `sharing_consent` defaults to `false` (a fresh
+ * enrollment is never routable until the owner opts in), so revoking consent is
+ * the owner's explicit lever for flipping the routability predicate
+ * (`isRoutable`).
  *
  * The two secondary indexes serve the two read models: `project_id` for the
  * project roster (`listEnrollmentsForProject`) and `worker_id` for the owner
@@ -62,11 +65,14 @@ export const workerProjectEnrollments = pgTable(
 		/** Subset of the worker's `capabilities` this project may run (source of truth in `worker-enrollment.ts`). */
 		allowedClis: jsonb('allowed_clis').$type<AgentCli[]>().notNull(),
 		/**
-		 * Optional per-worker, per-project concurrency sub-limit. `NULL` (the
-		 * default) = no cap of its own; a positive integer narrows this project's
-		 * share of the worker. See the table doc-comment.
+		 * This worker's share of the project: a positive integer, never null,
+		 * defaulting to `DEFAULT_CONCURRENCY_ALLOCATION`
+		 * (`src/identity/worker-enrollment.ts`, the source of truth for the shape).
+		 * See the table doc-comment.
 		 */
-		concurrencyAllocation: integer('concurrency_allocation'),
+		concurrencyAllocation: integer('concurrency_allocation')
+			.notNull()
+			.default(DEFAULT_CONCURRENCY_ALLOCATION),
 		/** Owner-controlled, revocable; defaults false so a fresh enrollment is not routable until the owner opts in. */
 		sharingConsent: boolean('sharing_consent').notNull().default(false),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	ConcurrencyAllocationSchema,
+	DEFAULT_CONCURRENCY_ALLOCATION,
 	ENROLLMENT_STATUSES,
 	EnrollmentAllowedClisSchema,
 	EnrollmentStatusSchema,
@@ -61,6 +62,15 @@ describe('ConcurrencyAllocationSchema', () => {
 		expect(() => ConcurrencyAllocationSchema.parse(-1)).toThrow();
 		expect(() => ConcurrencyAllocationSchema.parse(1.5)).toThrow();
 	});
+
+	it('has no "unbounded" value — null is not an allocation (issue #480)', () => {
+		expect(() => ConcurrencyAllocationSchema.parse(null)).toThrow();
+	});
+
+	it('defaults to 1, matching the other concurrency defaults', () => {
+		expect(DEFAULT_CONCURRENCY_ALLOCATION).toBe(1);
+		expect(ConcurrencyAllocationSchema.parse(DEFAULT_CONCURRENCY_ALLOCATION)).toBe(1);
+	});
 });
 
 describe('WorkerEnrollmentSchema', () => {
@@ -81,6 +91,14 @@ describe('WorkerEnrollmentSchema', () => {
 		expect(() =>
 			WorkerEnrollmentSchema.parse({ ...validEnrollment, concurrencyAllocation: 0 }),
 		).toThrow();
+	});
+
+	it('rejects a null or missing concurrency allocation (issue #480)', () => {
+		expect(() =>
+			WorkerEnrollmentSchema.parse({ ...validEnrollment, concurrencyAllocation: null }),
+		).toThrow();
+		const { concurrencyAllocation: _omitted, ...withoutAllocation } = validEnrollment;
+		expect(() => WorkerEnrollmentSchema.parse(withoutAllocation)).toThrow();
 	});
 
 	it('has no secret field in the read model', () => {

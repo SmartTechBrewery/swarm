@@ -91,7 +91,7 @@ function makeDetail(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 				projectId: 'proj-a',
 				status: 'active',
 				allowedClis: ['claude'],
-				concurrencyAllocation: null,
+				concurrencyAllocation: 1,
 				sharingConsent: true,
 				isRoutable: true,
 				viewerCanAdminister: false,

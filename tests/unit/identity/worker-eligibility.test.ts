@@ -12,6 +12,7 @@ import {
 	type WorkerEligibilityInput,
 } from '@/identity/worker-eligibility.js';
 import {
+	DEFAULT_CONCURRENCY_ALLOCATION,
 	ENROLLMENT_STATUSES,
 	isRoutable,
 	type WorkerEnrollment,
@@ -142,22 +143,23 @@ describe('evaluateWorkerEligibility', () => {
 		});
 	});
 
-	it('imposes no per-worker slot cap when the allocation is null', () => {
-		// A null allocation means the enrollment adds no sub-limit: the worker
-		// stays eligible however many runs it already has for this project (the
-		// process-wide SWARM_WORKER_CONCURRENCY and the project cap bound it).
-		const enrollment = makeEnrollment({ concurrencyAllocation: null });
-		expect(evaluate({ enrollment, availability: { connected: true, activeRuns: 5 } })).toEqual({
-			eligible: true,
+	it('gates on the default allocation of 1 — there is no uncapped enrollment (issue #480)', () => {
+		// The capacity test lost its null case with #480: every enrollment states its
+		// share of the project, so one active run already fills a default allocation
+		// rather than the worker being bounded only by SWARM_WORKER_CONCURRENCY.
+		const enrollment = makeEnrollment({
+			concurrencyAllocation: DEFAULT_CONCURRENCY_ALLOCATION,
+		});
+		expect(evaluate({ enrollment, availability: { connected: true, activeRuns: 1 } })).toEqual({
+			eligible: false,
+			reason: 'worker-unavailable',
 		});
 	});
 
-	it('still reports worker-unavailable with a null allocation when disconnected', () => {
-		// Null only removes the capacity check — a dead session is still unavailable.
-		const enrollment = makeEnrollment({ concurrencyAllocation: null });
-		expect(evaluate({ enrollment, availability: { connected: false, activeRuns: 0 } })).toEqual({
-			eligible: false,
-			reason: 'worker-unavailable',
+	it('lets a widened allocation take several of the project’s slots on one machine', () => {
+		const enrollment = makeEnrollment({ concurrencyAllocation: 3 });
+		expect(evaluate({ enrollment, availability: { connected: true, activeRuns: 2 } })).toEqual({
+			eligible: true,
 		});
 	});
 

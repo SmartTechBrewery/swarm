@@ -355,7 +355,7 @@ describe('WorkersTable Available column (issue #473)', () => {
 						projectId: 'proj-b',
 						status: 'active',
 						allowedClis: ['codex'],
-						concurrencyAllocation: null,
+						concurrencyAllocation: 1,
 						sharingConsent: false,
 						isRoutable: false,
 					},

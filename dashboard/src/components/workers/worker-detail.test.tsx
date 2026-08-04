@@ -268,7 +268,7 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		expect(updateConstraintsMutate).not.toHaveBeenCalled();
 	});
 
-	it('applies a concurrency allocation on demand, and clears it when emptied', async () => {
+	it('applies a concurrency allocation on demand', async () => {
 		updateConstraintsMutate.mockResolvedValue({});
 		renderWorker();
 
@@ -281,15 +281,18 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 				concurrencyAllocation: 4,
 			}),
 		);
+	});
 
-		fireEvent.change(input, { target: { value: '' } });
-		fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
-		await waitFor(() =>
-			expect(updateConstraintsMutate).toHaveBeenLastCalledWith({
-				enrollmentId: 'enr-1',
-				concurrencyAllocation: null,
-			}),
+	it('treats an emptied allocation as a validation error, never a silent clear (issue #480)', () => {
+		renderWorker();
+
+		fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '' } });
+
+		expect(screen.getByText(/whole number of 1 or more/)).toBeDefined();
+		expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(
+			true,
 		);
+		expect(updateConstraintsMutate).not.toHaveBeenCalled();
 	});
 
 	it('blocks an out-of-range allocation client-side, with the reason', () => {
@@ -355,13 +358,14 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		expect(setConsentMutate).not.toHaveBeenCalled();
 	});
 
-	it('says "No limit" for a cleared allocation rather than showing 0', () => {
+	it('states the default allocation of 1 to a non-owner, with no "No limit" wording', () => {
 		renderWorker({
 			viewerIsOwner: false,
-			enrollments: [makeEnrollment({ concurrencyAllocation: null })],
+			enrollments: [makeEnrollment({ concurrencyAllocation: 1 })],
 		});
 
-		expect(screen.getByText('No limit')).toBeDefined();
+		expect(within(section('Project enrollments')).getByText('1')).toBeDefined();
+		expect(screen.queryByText('No limit')).toBeNull();
 	});
 });
 

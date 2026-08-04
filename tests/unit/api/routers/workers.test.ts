@@ -434,6 +434,66 @@ describe('workers.enroll (owner offers a worker to a project)', () => {
 	});
 });
 
+describe('workers concurrency inputs (issue #480)', () => {
+	it('rejects a null allocation on enroll — there is no "clear it" value', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		await expect(
+			owner.enroll({
+				workerId: WORKER_ID,
+				projectId: 'p1',
+				allowedClis: ['claude'],
+				// @ts-expect-error the input no longer accepts null — asserted at runtime too
+				concurrencyAllocation: null,
+			}),
+		).rejects.toThrow();
+		expect(enrollWorker).not.toHaveBeenCalled();
+	});
+
+	it('omits the allocation on enroll so the service applies its default', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		enrollWorker.mockResolvedValue(makeEnrollment());
+
+		await owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ concurrencyAllocation: undefined }),
+		);
+	});
+
+	it('rejects a null allocation on updateConstraints, leaving the stored value alone', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(
+			owner.updateConstraints({
+				enrollmentId: ENROLLMENT_ID,
+				// @ts-expect-error the input no longer accepts null — asserted at runtime too
+				concurrencyAllocation: null,
+			}),
+		).rejects.toThrow();
+		expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+	});
+
+	it('passes a positive allocation through on updateConstraints', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker());
+		updateEnrollmentConstraints.mockResolvedValue(makeEnrollment({ concurrencyAllocation: 3 }));
+
+		const result = await owner.updateConstraints({
+			enrollmentId: ENROLLMENT_ID,
+			concurrencyAllocation: 3,
+		});
+
+		expect(result.concurrencyAllocation).toBe(3);
+		expect(updateEnrollmentConstraints).toHaveBeenCalledWith(
+			expect.objectContaining({ enrollmentId: ENROLLMENT_ID, concurrencyAllocation: 3 }),
+		);
+	});
+});
+
 describe('workers.setConsent (owner controls sharing consent)', () => {
 	it('is NOT_FOUND for an unknown enrollment', async () => {
 		getEnrollment.mockResolvedValue(undefined);

@@ -78,8 +78,9 @@ export interface WorkerRow {
  * One enrollment on the worker detail view (`workers.getById`, issue #477,
  * mirroring the service `DashboardWorkerEnrollmentDetail` plus the router's
  * viewer-capability flag). These five facts are what answer "why is this machine
- * not taking work here?" — approval state, the effective CLIs, the concurrency
- * allocation, the owner's consent, and the derived routing verdict. Secret-free.
+ * not taking work here?" — approval state, the effective CLIs, this worker's share
+ * of the project, the owner's consent, and the derived routing verdict.
+ * Secret-free.
  */
 export interface WorkerDetailEnrollment {
 	enrollmentId: string;
@@ -87,8 +88,8 @@ export interface WorkerDetailEnrollment {
 	status: WorkerEnrollmentStatus;
 	/** Effective CLIs this project may run on the worker — a subset of its capabilities. */
 	allowedClis: string[];
-	/** Optional per-worker sub-limit for this project; `null` = none (bounded by worker + project caps). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer, never absent (issue #480). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	/** Server-derived: `active` **and** consented. The only field the dispatch gate reads. */
 	isRoutable: boolean;
@@ -144,8 +145,8 @@ export interface WorkerRosterEntry {
 	status: WorkerEnrollmentStatus;
 	/** Effective CLIs this project may run on the worker — a subset of its capabilities. */
 	allowedClis: string[];
-	/** Optional per-worker sub-limit for this project; `null` = none (bounded by worker + project caps). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer, never absent (issue #480). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	/** Server-derived: `active` **and** consented. The only field the dispatch gate reads. */
 	isRoutable: boolean;
@@ -158,8 +159,8 @@ export interface OwnerEnrollment {
 	projectId: string;
 	status: WorkerEnrollmentStatus;
 	allowedClis: string[];
-	/** Optional per-worker sub-limit for this project; `null` = none (bounded by worker + project caps). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer, never absent (issue #480). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	isRoutable: boolean;
 }

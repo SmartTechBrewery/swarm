@@ -75,12 +75,14 @@ Usage:
   set-cli    Replace a worker's declared CLIs by worker id.
   remove     Deregister a worker by worker id.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
-             the worker's capabilities) and an optional --concurrency per-project
-             sub-limit. Omit --concurrency for no sub-limit (the default): the
-             worker's concurrency here is then governed by its --concurrency launch
-             flag (SWARM_WORKER_CONCURRENCY) and the project's Maximum Concurrent Jobs.
-             Starts pending with sharing consent off; --active approves it and
-             --consent grants sharing consent at once (operator seeding).
+             the worker's capabilities) and --concurrency, this worker's share of
+             the project. Omit --concurrency for 1 (the default): one of the
+             project's jobs at a time on this machine. A larger value lets the
+             project run several jobs here at once, still bounded by the worker's
+             own --concurrency launch flag (SWARM_WORKER_CONCURRENCY) and the
+             project's Maximum Concurrent Jobs. Starts pending with sharing consent
+             off; --active approves it and --consent grants sharing consent at once
+             (operator seeding).
   approve    Approve a pending enrollment (worker + project) → active.
   consent    Turn an enrollment's owner-controlled sharing consent on or off.
              Revoking it blocks future dispatch without stopping a running agent.
@@ -324,8 +326,10 @@ async function resolveWorkerAndProject(workerId: string, projectId: string) {
 
 /**
  * Parse the optional `--concurrency` flag into a positive integer, printing a
- * friendly error on an invalid value. `{ ok: true, value: undefined }` means the
- * flag was omitted (the service defaults it).
+ * friendly error on an invalid value — including a value-less `--concurrency`,
+ * which must not read as "clear the allocation" (issue #480).
+ * `{ ok: true, value: undefined }` means the flag was omitted, and the service
+ * then applies `DEFAULT_CONCURRENCY_ALLOCATION`.
  */
 function parseConcurrencyFlag(
 	raw: string | undefined,
@@ -357,12 +361,8 @@ async function performEnroll(
 			status: active ? 'active' : undefined,
 			sharingConsent: consent,
 		});
-		const concurrencyLabel =
-			enrollment.concurrencyAllocation === null
-				? 'unbounded (worker/project caps)'
-				: String(enrollment.concurrencyAllocation);
 		out.info(
-			`enrolled worker '${worker.displayName}' (${worker.id}) in '${projectId}' — status ${enrollment.status}, CLIs ${enrollment.allowedClis.join(', ')}, concurrency ${concurrencyLabel}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}`,
+			`enrolled worker '${worker.displayName}' (${worker.id}) in '${projectId}' — status ${enrollment.status}, CLIs ${enrollment.allowedClis.join(', ')}, concurrency ${enrollment.concurrencyAllocation}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}`,
 		);
 		return 0;
 	} catch (err) {
