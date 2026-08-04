@@ -5,6 +5,7 @@ import {
 	withBitbucketCredential,
 } from '@/integrations/scm/bitbucket/client.js';
 import {
+	findOpenBitbucketPullRequest,
 	getBitbucketCommitBuildStatus,
 	getBitbucketPullRequest,
 	getBitbucketPullRequestApprovals,
@@ -203,6 +204,53 @@ describe('bitbucket pull-request reads', () => {
 			await expect(
 				scoped(() => getBitbucketPullRequestApprovals(WORKSPACE, SLUG, 17)),
 			).resolves.toEqual([]);
+		});
+	});
+
+	describe('findOpenBitbucketPullRequest', () => {
+		it('filters server-side on state and source branch', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({ values: [createMockBitbucketPullRequestResponse()] }),
+			);
+
+			await expect(
+				scoped(() => findOpenBitbucketPullRequest(WORKSPACE, SLUG, 'swarm/issue-17')),
+			).resolves.toEqual({
+				number: 17,
+				url: 'https://bitbucket.org/jkwiecien/swarm/pull-requests/17',
+			});
+			const url = new URL(requestedUrl(fetchMock));
+			expect(url.pathname).toBe(`/2.0/repositories/${WORKSPACE}/${SLUG}/pullrequests`);
+			expect(url.searchParams.get('q')).toBe(
+				'state="OPEN" AND source.branch.name="swarm/issue-17"',
+			);
+		});
+
+		it('is undefined when the branch has no open pull request', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ values: [] }));
+
+			await expect(
+				scoped(() => findOpenBitbucketPullRequest(WORKSPACE, SLUG, 'swarm/issue-17')),
+			).resolves.toBeUndefined();
+		});
+
+		it('derives the web URL when the response carries no html link', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ values: [{ id: 18 }] }));
+
+			await expect(
+				scoped(() => findOpenBitbucketPullRequest(WORKSPACE, SLUG, 'topic')),
+			).resolves.toEqual({
+				number: 18,
+				url: 'https://bitbucket.org/jkwiecien/swarm/pull-requests/18',
+			});
+		});
+
+		it('throws rather than referencing a pull request Bitbucket gave no id for', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ values: [{ title: 'no id' }] }));
+
+			await expect(
+				scoped(() => findOpenBitbucketPullRequest(WORKSPACE, SLUG, 'topic')),
+			).rejects.toThrow(/carries no id/);
 		});
 	});
 

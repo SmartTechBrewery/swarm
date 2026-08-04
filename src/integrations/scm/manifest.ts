@@ -44,14 +44,15 @@ export interface SCMProviderManifest {
 	 * Whether shared code may route real traffic to this provider. Absent means
 	 * yes — a registered provider is live unless it says otherwise.
 	 *
-	 * `false` marks a provider that is registered but still being built out phase
-	 * by phase (Bitbucket, issue #296): discoverable by id so its own tests and
-	 * follow-up phases can resolve it, and deliberately unreachable at runtime, so
-	 * registering it changes no existing behavior. Two things read it — the
-	 * project-scoped lookup (`requireProjectSCMProvider`, `./registry.ts`) and the
-	 * receiver's route mounting (`src/router/webhook-receiver.ts`) — which is
-	 * exactly the pair that would otherwise start answering for a provider whose
-	 * contract methods still throw.
+	 * `false` marks a provider that is registered but not wired up: discoverable by
+	 * id so its own tests and follow-up work can resolve it, and deliberately
+	 * unreachable at runtime, so registering it changes no existing behavior. Two
+	 * things read it — the project-scoped lookup (`requireProjectSCMProvider`,
+	 * `./registry.ts`) and the receiver's route mounting
+	 * (`src/router/webhook-receiver.ts`) — which is exactly the pair that would
+	 * otherwise start answering for a provider nothing has chosen. Bitbucket (issue
+	 * #296) sits here with a **complete** contract: what it still lacks is
+	 * project→provider selection, not an implementation.
 	 *
 	 * It is **not** a selection mechanism and does not soften the single-provider
 	 * assertion: the second provider to claim runtime readiness still makes the

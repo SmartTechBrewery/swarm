@@ -58,8 +58,9 @@ export function withBitbucketCredential<T>(credential: string, fn: () => Promise
 /**
  * A non-2xx Bitbucket response. `status` deliberately mirrors Octokit's
  * `RequestError#status`, which is the field the GitHub adapter's merge-outcome
- * classifier reads — so the Bitbucket classifier (phase 4/4) can be written the
- * same way instead of inventing a second error shape.
+ * classifier reads — so `classifyBitbucketDirectMergeError`
+ * (`./scm-integration.ts`) reads it the same way instead of inventing a second
+ * error shape.
  */
 export class BitbucketApiError extends Error {
 	constructor(
@@ -87,6 +88,21 @@ function authorizationHeader(credential: string): string {
 		return `Basic ${Buffer.from(credential).toString('base64')}`;
 	}
 	return `Bearer ${credential}`;
+}
+
+/**
+ * The same credential as an HTTP Basic `user:password` pair, for the one caller
+ * that cannot use {@link authorizationHeader}: `git push` over HTTPS, which
+ * Bitbucket only accepts as Basic (there is no bearer form on the git endpoint).
+ * An access token authenticates as the reserved `x-token-auth` user; an app
+ * password already *is* the pair.
+ *
+ * Kept here so this module stays the only place that branches on the credential's
+ * form — the caller base64-encodes the result into a git `extraheader`
+ * (`./scm-integration.ts`) and never inspects it.
+ */
+export function bitbucketGitBasicCredential(credential: string): string {
+	return credential.includes(':') ? credential : `x-token-auth:${credential}`;
 }
 
 /**
@@ -210,6 +226,35 @@ export async function getBitbucketUserForCredential(
 		// `BitbucketApiError` is built from method/path/status/response body only, so
 		// this can't leak the credential.
 		logger.warn('Failed to resolve Bitbucket identity for credential', { error: String(err) });
+		return null;
+	}
+}
+
+/** One address from `GET /2.0/user/emails`. */
+interface BitbucketUserEmail {
+	email?: string;
+	is_primary?: boolean;
+	is_confirmed?: boolean;
+}
+
+/**
+ * The primary **confirmed** email of the account the scoped credential
+ * authenticates as, or `null` when Bitbucket won't say — the commit-author address
+ * a delivery signs its commits with (`./scm-integration.ts`).
+ *
+ * `null` rather than a throw for every failure mode, because they are all ordinary:
+ * `GET /user/emails` needs the `email` scope, which a workspace or repository
+ * access token cannot hold at all, and an account whose primary address is
+ * unconfirmed has nothing usable to report. The caller substitutes a documented
+ * placeholder; a missing scope must not fail a delivery.
+ */
+export async function getScopedBitbucketUserEmail(): Promise<string | null> {
+	try {
+		const addresses = await paginateBitbucket<BitbucketUserEmail>('/user/emails');
+		const primary = addresses.find((entry) => entry.is_primary === true && entry.is_confirmed);
+		return primary?.email ?? null;
+	} catch (err) {
+		logger.warn('Failed to resolve a Bitbucket commit-author email', { error: String(err) });
 		return null;
 	}
 }

@@ -15,9 +15,9 @@ describe('github SCM manifest registration', () => {
 	it('registers exactly once, and is the only runtime-ready SCM provider', () => {
 		const registered = listSCMProviders();
 		expect(registered.filter((m) => m.id === 'github')).toHaveLength(1);
-		// Bitbucket registers too (issue #296) but opts out of runtime traffic until
-		// its contract is complete, so GitHub is still the provider every
-		// project-scoped call site resolves.
+		// Bitbucket registers too, with a complete contract as of issue #296 phase 4/4,
+		// but opts out of runtime traffic because nothing selects a project's SCM
+		// provider — so GitHub is still what every project-scoped call site resolves.
 		expect(registered.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual(['github']);
 	});
 

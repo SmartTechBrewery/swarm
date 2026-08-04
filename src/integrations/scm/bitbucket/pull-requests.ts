@@ -22,8 +22,9 @@
  *   so a value read here and a value parsed off a webhook are the same string for
  *   the same commit.
  *
- * Writes — comments, approvals, review submission, delivery, merge — are phase
- * 4/4 and deliberately absent.
+ * Writes — comments, approvals, review submission, PR creation, merge — live in
+ * `./writes.ts` (phase 4/4), which reuses the mapping helpers here so a found pull
+ * request and a just-created one are described identically.
  */
 
 import type {
@@ -75,6 +76,7 @@ interface BitbucketPullRequest {
 	source?: BitbucketPullRequestRef;
 	destination?: BitbucketPullRequestRef;
 	participants?: BitbucketParticipant[];
+	links?: { html?: { href?: string } };
 }
 
 /** One build status on a commit — Bitbucket's equivalent of a GitHub check run. */
@@ -88,7 +90,7 @@ interface BitbucketBuildStatus {
 	updated_on?: string;
 }
 
-/** A PR's merge-relevant state — the lookup phase 4/4's merge needs before choosing a path. */
+/** A PR's merge-relevant state — the lookup the merge-eligibility recheck starts from. */
 export interface BitbucketPullRequestMergeState {
 	merged: boolean;
 	/** `open` | `closed` — the neutral spelling GitHub's `pulls.get` reports. */
@@ -105,6 +107,12 @@ export interface BitbucketPullRequestMergeState {
 export interface BitbucketApprovalState {
 	state: 'APPROVED' | 'CHANGES_REQUESTED';
 	commitId: string;
+}
+
+/** A pull request as the delivery seam names one — `{ number, url }` (`src/scm/delivery.ts`). */
+export interface BitbucketPullRequestReference {
+	number: number;
+	url: string;
 }
 
 /** A pull request a commit belongs to — enough to tie a build status back to its PR. */
@@ -227,10 +235,11 @@ export async function getBitbucketPullRequestMergeState(
  * **`commitId` is an approximation.** Bitbucket pins a participant's verdict to no
  * commit, so every returned verdict carries the PR's *current* head SHA. That is
  * only exactly right when the repository enables "reset approvals on new commit";
- * without it, a stale approval reads as covering the current head. Phase 4/4's
- * merge-eligibility recheck compares this against the head it was asked to merge,
- * so the effect is that Bitbucket leans on the repository setting for
- * head-change protection where GitHub gets it from the review's own `commit_id`.
+ * without it, a stale approval reads as covering the current head. The
+ * merge-eligibility recheck (`mergeReadyBitbucketPullRequest`,
+ * `./scm-integration.ts`) compares this against the head it was asked to merge, so
+ * the effect is that Bitbucket leans on the repository setting for head-change
+ * protection where GitHub gets it from the review's own `commit_id`.
  */
 export async function getBitbucketPullRequestApprovals(
 	workspace: string,
@@ -254,6 +263,62 @@ export async function getBitbucketPullRequestApprovals(
  */
 function queryLiteral(value: string): string {
 	return `"${value.replace(/(["\\])/g, '\\$1')}"`;
+}
+
+/**
+ * `{ number, url }` for a pull-request object — the shape the delivery seam names a
+ * pull request by, shared with the creation write (`./writes.ts`) so a found PR and
+ * a just-created one are described identically.
+ *
+ * Bitbucket normally carries the web URL in `links.html.href`; when a response omits
+ * it, the canonical web path is derived from the coordinates rather than left empty,
+ * because the delivery checkpoint validates `pullRequestUrl` as a URL
+ * (`DeliveryProgressSchema`, `src/scm/delivery.ts`) and would otherwise fail a
+ * delivery over a cosmetic field. `id` is load-bearing, so its absence throws.
+ */
+export function toBitbucketPullRequestReference(
+	workspace: string,
+	slug: string,
+	pr: { id?: number; links?: { html?: { href?: string } } },
+): BitbucketPullRequestReference {
+	if (pr.id === undefined) {
+		throw new Error(
+			`Bitbucket pull-request response for ${workspace}/${slug} carries no id, so it cannot be referenced`,
+		);
+	}
+	return {
+		number: pr.id,
+		url:
+			pr.links?.html?.href ?? `https://bitbucket.org/${workspace}/${slug}/pull-requests/${pr.id}`,
+	};
+}
+
+/**
+ * The open pull request whose **source** branch is `branch`, or `undefined` when
+ * none is open — the delivery seam's "has this branch already got a PR?" lookup,
+ * which is what makes a resumed delivery reuse its own pull request instead of
+ * opening a second one.
+ *
+ * Bitbucket has no `head=` filter like GitHub's, so the branch match goes through
+ * the query language. When more than one open PR shares a source branch (Bitbucket
+ * permits it — one per destination), the first is taken, matching GitHub's
+ * `findOpenPullRequest`.
+ */
+export async function findOpenBitbucketPullRequest(
+	workspace: string,
+	slug: string,
+	branch: string,
+): Promise<BitbucketPullRequestReference | undefined> {
+	const query = new URLSearchParams({
+		q: `state=${queryLiteral('OPEN')} AND source.branch.name=${queryLiteral(branch)}`,
+		pagelen: PAGE_LENGTH,
+	});
+	const page = await bitbucketRequest<{ values?: BitbucketPullRequest[] }>(
+		'GET',
+		`${repositoryPath(workspace, slug)}/pullrequests?${query}`,
+	);
+	const pull = page.values?.[0];
+	return pull ? toBitbucketPullRequestReference(workspace, slug, pull) : undefined;
 }
 
 /**

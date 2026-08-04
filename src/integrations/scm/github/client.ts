@@ -15,7 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Octokit } from '@octokit/rest';
 
 import { logger } from '../../../lib/logger.js';
-import { swarmMarker } from '../../../scm/swarm-origin.js';
+import { deliveryMarker } from '../../../scm/swarm-origin.js';
 import type {
 	AggregateCheckStatus,
 	CheckRunState,
@@ -318,8 +318,6 @@ export async function postIssueComment(
 	return data.id;
 }
 
-const DELIVERY_MARKER = (deliveryId: string) => swarmMarker('delivery', deliveryId);
-
 export async function findOpenPullRequest(
 	owner: string,
 	repo: string,
@@ -382,7 +380,7 @@ export async function submitPullRequestReview(
 	},
 ): Promise<number> {
 	const client = getScopedClient();
-	const marker = DELIVERY_MARKER(input.deliveryId);
+	const marker = deliveryMarker(input.deliveryId);
 	const reviews = await client.paginate(client.pulls.listReviews, {
 		owner,
 		repo,
@@ -411,7 +409,7 @@ export async function postIdempotentPullRequestComment(
 	input: { prNumber: number; body: string; deliveryId: string },
 ): Promise<number> {
 	const client = getScopedClient();
-	const marker = DELIVERY_MARKER(input.deliveryId);
+	const marker = deliveryMarker(input.deliveryId);
 	const comments = await client.paginate(client.issues.listComments, {
 		owner,
 		repo,

@@ -26,9 +26,9 @@ describe('bitbucket SCM manifest registration', () => {
 		});
 	});
 
-	// The whole point of this phase's registration: discoverable by id, but not
-	// answering for any project and not served a webhook route while phases 2–4
-	// still throw (issue #296).
+	// The contract is complete (issue #296 phase 4/4), and this still holds:
+	// discoverable by id, but not answering for any project and not served a webhook
+	// route, because nothing selects a project's SCM provider yet.
 	it('opts out of runtime traffic', () => {
 		expect(bitbucketScmManifest.runtimeReady).toBe(false);
 		expect(isRuntimeReadySCMProvider(bitbucketScmManifest)).toBe(false);

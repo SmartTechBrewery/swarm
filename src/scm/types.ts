@@ -8,10 +8,11 @@
  * (`GitHubSCMIntegration`, `src/integrations/scm/github/scm-integration.ts`),
  * registered through the SCM manifest + registry
  * (`src/integrations/scm/{manifest,registry}.ts`) exactly as the PM side
- * registers GitHub Projects. Bitbucket is being built out phase by phase (issue
- * #296) and registers with `runtimeReady: false` until it satisfies the whole
- * contract; GitLab is still planned and deliberately not built
- * (ai/CODING_STANDARDS.md "don't build it speculatively").
+ * registers GitHub Projects. Bitbucket (`BitbucketSCMIntegration`, issue #296)
+ * satisfies the whole contract as of its phase 4/4 but registers with
+ * `runtimeReady: false`, because nothing selects a project's SCM provider yet;
+ * GitLab is still planned and deliberately not built (ai/CODING_STANDARDS.md
+ * "don't build it speculatively").
  *
  * This file defines **types only** — every importer uses `import type`, so the
  * module adds no runtime edge. That's what lets `src/config/provider.ts` (which
