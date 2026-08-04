@@ -21,6 +21,10 @@ import { isRuntimeReadySCMProvider } from '@/integrations/scm/manifest.js';
 import { listSCMProviders } from '@/integrations/scm/registry.js';
 import type { SCMProvider } from '@/scm/types.js';
 
+type SCMContractMethod = {
+	[Key in keyof SCMProvider]: SCMProvider[Key] extends (...args: never[]) => unknown ? Key : never;
+}[keyof SCMProvider];
+
 /**
  * Every method `SCMProvider` (`src/scm/types.ts`) declares. TypeScript checks this
  * at compile time for a provider that says `implements SCMProvider`; the list is
@@ -44,8 +48,11 @@ const SCM_CONTRACT_METHODS = [
 	'listConflictCandidates',
 	'commentOnPullRequest',
 	'deliveryProvider',
+	'operatorDeliveryProvider',
 	'mergePullRequest',
-] as const satisfies ReadonlyArray<keyof SCMProvider>;
+] as const satisfies ReadonlyArray<SCMContractMethod>;
+
+type AssertNever<T extends never> = T;
 
 const manifests = listSCMProviders();
 
@@ -64,6 +71,13 @@ describe('SCM provider conformance', () => {
 	// must land together with project→provider selection, so this fails loudly first.
 	it('has exactly one runtime-ready provider, since nothing selects between them yet', () => {
 		expect(manifests.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual(['github']);
+	});
+
+	it('lists every SCMProvider method', () => {
+		const allMethodsAreListed: AssertNever<
+			Exclude<SCMContractMethod, (typeof SCM_CONTRACT_METHODS)[number]>
+		> = undefined as never;
+		expect(allMethodsAreListed).toBeUndefined();
 	});
 
 	for (const manifest of manifests) {
@@ -86,24 +100,25 @@ describe('SCM provider conformance', () => {
 				}
 			});
 
-			// A provider under construction reports "not implemented yet — it lands in
-			// phase N" rather than a misleading empty value (issue #296). That is the right
-			// behavior *while* it is being built and the wrong thing to register as
-			// conformant, so the harness reads each method's own source for the sentinel:
-			// a stub is a function of the right arity and satisfies every assertion above.
-			// The pattern spans both spellings the sentinel appears in — the thrown message
-			// (`… is not implemented yet …`) and the `notImplementedYet()` call a method
-			// body delegates to, since only the latter is in the method's own source.
+			// A stub still has the right function shape, so inspect its own source for the
+			// generic sentinel rather than relying on the surface assertion above.
 			it('implements every contract method rather than stubbing it', () => {
 				for (const method of SCM_CONTRACT_METHODS) {
 					expect(
 						String(manifest.provider[method]),
 						`${manifest.id}.${method} still throws the not-implemented sentinel`,
-					).not.toMatch(/not\s*implemented\s*yet/i);
+					).not.toMatch(/\bnot\s+implemented\b/i);
 				}
 			});
 		});
 	}
+
+	it('recognizes generic provider-stub wording', () => {
+		function operatorDeliveryProvider(): never {
+			throw new Error('operatorDeliveryProvider is not implemented for Bitbucket SCM');
+		}
+		expect(String(operatorDeliveryProvider)).toMatch(/\bnot\s+implemented\b/i);
+	});
 
 	// A separate, mounted webhook route per provider is what lets the receiver serve
 	// them all without naming one — two providers sharing a path would shadow.

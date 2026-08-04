@@ -7,8 +7,8 @@
  * comment loop-prevention gate (phase 2/4, delegated to `./webhook.ts`); the
  * pull-request / build-status reads (phase 3/4, delegated to
  * `./pull-requests.ts`); and comments, the delivery seam, and the direct merge
- * (phase 4/4, delegated to `./writes.ts`). No contract method is stubbed — the
- * multi-provider conformance suite
+ * (phase 4/4, delegated to `./writes.ts` / `./operator-delivery.ts`). No contract
+ * method is stubbed — the multi-provider conformance suite
  * (`tests/unit/integrations/scm/scm-conformance.test.ts`) asserts that.
  *
  * Its core job is the same as the GitHub class's: run a block of Bitbucket
@@ -49,6 +49,7 @@ import {
 } from './client.js';
 import { sameBitbucketCommit } from './commits.js';
 import { getBitbucketCredential, getBitbucketCredentialOrNull } from './credentials.js';
+import { createBitbucketOperatorDeliveryProvider } from './operator-delivery.js';
 import {
 	getBitbucketPersonaForLogin,
 	isSwarmBitbucketActor,
@@ -418,14 +419,13 @@ export class BitbucketSCMIntegration implements SCMProvider {
 	 * rotation mid-delivery can't leave one write authenticating as somebody else.
 	 *
 	 * `commitIdentity` is where Bitbucket differs from GitHub. The name is the
-	 * account's `nickname` (Bitbucket exposes no `username`), and the email comes from
-	 * `GET /2.0/user/emails` — which needs the `email` scope a workspace/repository
-	 * access token cannot hold. When it is unavailable, a
-	 * `<nickname>@users.noreply.bitbucket.org` placeholder stands in so a delivery
-	 * still commits. Be aware of what that costs: Bitbucket attributes a commit to an
-	 * account by matching a **confirmed** account email, so a commit authored under
-	 * the placeholder shows the right name but stays unlinked to the account. Grant
-	 * the credential the `email` scope for attributed commits.
+	 * account's `nickname` (Bitbucket exposes no `username`). Delivery requires an
+	 * app password: workspace/repository access tokens cannot resolve `GET /2.0/user`
+	 * and fail before the email lookup. An app password without the `email` scope
+	 * falls back to `<nickname>@users.noreply.bitbucket.org` so delivery still
+	 * commits. Bitbucket attributes a commit by matching a **confirmed** account
+	 * email, so that placeholder keeps the name but leaves the commit unlinked. Grant
+	 * the app password the `email` scope for attributed commits.
 	 */
 	async deliveryProvider(
 		project: ProjectConfig,
@@ -480,9 +480,10 @@ export class BitbucketSCMIntegration implements SCMProvider {
 
 	/**
 	 * {@link SCMProvider.operatorDeliveryProvider} — operator-credential delivery
-	 * for DB-free workers. Not implemented for Bitbucket.
+	 * for DB-free workers. The worker supplies its own credential, so no project
+	 * secret-store lookup is involved.
 	 */
-	async operatorDeliveryProvider(_repo: string, _credential: string): Promise<ScmDeliveryProvider> {
-		throw new Error('operatorDeliveryProvider is not implemented for Bitbucket SCM');
+	async operatorDeliveryProvider(repo: string, credential: string): Promise<ScmDeliveryProvider> {
+		return createBitbucketOperatorDeliveryProvider(repo, credential);
 	}
 }
