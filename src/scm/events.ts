@@ -66,6 +66,7 @@ export type ScmEventAction =
 	| 'updated'
 	| 'closed'
 	| 'submitted'
+	| 'dismissed'
 	| 'completed'
 	| 'created'
 	| 'edited'

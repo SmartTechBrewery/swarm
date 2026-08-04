@@ -20,19 +20,15 @@
  *
  * ## The abbreviated-hash invariant
  *
- * Bitbucket abbreviates commit hashes in its payloads: a pull request's
- * `source.commit.hash` is **12 characters**, not the full 40 (Atlassian's own
- * event-payload reference shows `"hash": "d3022fc0ca3d"`). A build status, by
- * contrast, identifies its commit through `links.commit.href`, whose last path
- * segment is the **full** SHA. So two events about the very same commit yield
- * `headSha` values of different lengths, and:
- *
- * - a `headSha` must always be sourced from the same field for a given event
- *   kind (never mixed with an API read's spelling), and
- * - **any SHA equality check inside this provider must be prefix-tolerant** —
- *   `a.startsWith(b) || b.startsWith(a)`, never `===`. Phase 4/4's
- *   merge-eligibility recheck compares the approved head SHA against the PR's
- *   current one and would refuse every eligible merge under a strict compare.
+ * Bitbucket abbreviates a pull request's `source.commit.hash` to **12
+ * characters** (Atlassian's own event-payload reference shows
+ * `"hash": "d3022fc0ca3d"`), while a build status identifies its commit through
+ * `links.commit.href`, whose last path segment is the full SHA. The adapter
+ * therefore emits Bitbucket's 12-character spelling for every `headSha`.
+ * Shared consumers use this value as an exact database or deduplication key, so
+ * they must never see two spellings for the same commit. A later API read that
+ * returns a full SHA must likewise be abbreviated before comparison with an
+ * event `headSha`.
  */
 
 import type { ProjectConfig } from '../../../config/schema.js';
@@ -108,9 +104,10 @@ const EVENT_KINDS: Readonly<Record<ProcessableEventKey, ScmEventKind>> = {
  * `action` field in the body — the key *is* the action — so unlike GitHub's
  * alias table this is a total mapping rather than a list of exceptions.
  *
- * A review verdict is `submitted` for all four of its keys (which verdict it was
- * is `reviewState`'s job), and a build status's entry is overridden to
- * `completed` once its state is terminal — see {@link extractAction}.
+ * Submitted verdicts use `submitted`; verdict removals use `dismissed` so they
+ * cannot pass the Respond-to-review trigger's submitted-review gate. A build
+ * status's entry is overridden to `completed` once its state is terminal — see
+ * {@link extractAction}.
  */
 const EVENT_ACTIONS: Readonly<Record<ProcessableEventKey, ScmEventAction>> = {
 	'pullrequest:created': 'opened',
@@ -118,9 +115,9 @@ const EVENT_ACTIONS: Readonly<Record<ProcessableEventKey, ScmEventAction>> = {
 	'pullrequest:fulfilled': 'closed',
 	'pullrequest:rejected': 'closed',
 	'pullrequest:approved': 'submitted',
-	'pullrequest:unapproved': 'submitted',
+	'pullrequest:unapproved': 'dismissed',
 	'pullrequest:changes_request_created': 'submitted',
-	'pullrequest:changes_request_removed': 'submitted',
+	'pullrequest:changes_request_removed': 'dismissed',
 	'pullrequest:comment_created': 'created',
 	'repo:commit_status_created': 'created',
 	'repo:commit_status_updated': 'updated',
@@ -129,9 +126,9 @@ const EVENT_ACTIONS: Readonly<Record<ProcessableEventKey, ScmEventAction>> = {
 /**
  * Review-verdict event key → neutral {@link ScmReviewState}. Both *removal*
  * events map to `dismissed`, which is the neutral vocabulary's name for "a
- * previously submitted verdict no longer stands" — and, importantly, is not
- * `changes-requested`, so withdrawing a change request doesn't re-trigger the
- * Respond-to-review phase (`src/triggers/handlers/respond-to-review.ts`).
+ * previously submitted verdict no longer stands". Their `dismissed` action
+ * keeps them out of the Respond-to-review trigger unconditionally, including
+ * when a project opts into responding to minor verdicts.
  */
 const REVIEW_STATES: Readonly<Record<string, ScmReviewState>> = {
 	'pullrequest:approved': 'approved',
@@ -242,9 +239,14 @@ interface LifecycleFields {
 	merged?: boolean;
 }
 
-/** A PR's head commit hash — 12 characters, per the abbreviated-hash invariant above. */
+/** Bitbucket's canonical 12-character commit spelling for normalized events. */
+function abbreviateSha(sha: string | undefined): string | undefined {
+	return sha?.slice(0, 12);
+}
+
+/** A PR's head commit hash, normalized to Bitbucket's canonical 12-character spelling. */
 function headShaOf(pr: Record<string, unknown> | undefined): string | undefined {
-	return str(asRecord(asRecord(pr?.source)?.commit)?.hash);
+	return abbreviateSha(str(asRecord(asRecord(pr?.source)?.commit)?.hash));
 }
 
 function headBranchOf(pr: Record<string, unknown> | undefined): string | undefined {
@@ -329,18 +331,17 @@ function reviewFields(eventKey: ProcessableEventKey, p: Record<string, unknown>)
 /**
  * The commit a build status belongs to. Bitbucket's documented `commit_status`
  * object exposes it only through `links.commit.href` (`…/commit/<sha>`), whose
- * last path segment is the **full** 40-character SHA — so this is the one
- * `headSha` source in this module that is not abbreviated (see the module
- * header). A `commit.hash` is preferred when a payload does carry one, since it
- * needs no URL parsing.
+ * last path segment is the full SHA. It is narrowed to Bitbucket's canonical
+ * 12-character event spelling. A `commit.hash` is preferred when a payload does
+ * carry one, since it needs no URL parsing.
  */
 function commitStatusSha(status: Record<string, unknown> | undefined): string | undefined {
 	const hash = str(asRecord(status?.commit)?.hash);
-	if (hash !== undefined) return hash;
+	if (hash !== undefined) return abbreviateSha(hash);
 	const href = str(asRecord(asRecord(status?.links)?.commit)?.href);
 	if (href === undefined) return undefined;
 	const path = href.split(/[?#]/)[0].replace(/\/+$/, '');
-	return str(path.slice(path.lastIndexOf('/') + 1));
+	return abbreviateSha(str(path.slice(path.lastIndexOf('/') + 1)));
 }
 
 /**

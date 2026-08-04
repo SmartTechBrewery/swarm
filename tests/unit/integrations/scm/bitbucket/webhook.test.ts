@@ -8,6 +8,7 @@ import {
 	verifyBitbucketSignature,
 } from '@/integrations/scm/bitbucket/webhook.js';
 import { SWARM_GENERATED_FOOTER, swarmMarker } from '@/scm/swarm-origin.js';
+import { buildReviewDispatchKey } from '@/triggers/review-dispatch-dedup.js';
 import {
 	createMockBitbucketApprovalPayload,
 	createMockBitbucketCommitStatusPayload,
@@ -166,15 +167,25 @@ describe('Bitbucket webhook ingress', () => {
 		});
 
 		it('maps both verdict removals to dismissed, so neither re-triggers Respond-to-review', () => {
-			expect(
-				parse('pullrequest:unapproved', createMockBitbucketApprovalPayload()).reviewState,
-			).toBe('dismissed');
+			const unapproved = parse('pullrequest:unapproved', createMockBitbucketApprovalPayload());
+			const changesRequestRemoved = parse(
+				'pullrequest:changes_request_removed',
+				createMockBitbucketApprovalPayload({ verdictKey: 'changes_request' }),
+			);
+			expect(unapproved).toMatchObject({ action: 'dismissed', reviewState: 'dismissed' });
+			expect(changesRequestRemoved).toMatchObject({
+				action: 'dismissed',
+				reviewState: 'dismissed',
+			});
+			expect(parse('pullrequest:approved', createMockBitbucketApprovalPayload()).action).toBe(
+				'submitted',
+			);
 			expect(
 				parse(
-					'pullrequest:changes_request_removed',
+					'pullrequest:changes_request_created',
 					createMockBitbucketApprovalPayload({ verdictKey: 'changes_request' }),
-				).reviewState,
-			).toBe('dismissed');
+				).action,
+			).toBe('submitted');
 		});
 
 		it("prefers the verdict user's login over the event actor", () => {
@@ -224,7 +235,7 @@ describe('Bitbucket webhook ingress', () => {
 			expect(parsed.kind).toBe('checks');
 			expect(parsed.action).toBe('completed');
 			expect(parsed.checkConclusion).toBe('success');
-			expect(parsed.headSha).toBe(FULL_SHA);
+			expect(parsed.headSha).toBe(ABBREVIATED_SHA);
 		});
 
 		it('leaves the PR association unset on a commit status, which Bitbucket does not send', () => {
@@ -296,13 +307,18 @@ describe('Bitbucket webhook ingress', () => {
 			expect(parsed.headSha).toHaveLength(12);
 		});
 
-		it('yields a full-length SHA for the same commit on a commit-status event', () => {
-			const parsed = parse('repo:commit_status_updated', createMockBitbucketCommitStatusPayload());
-			expect(parsed.headSha).toHaveLength(40);
-			// The two spellings of one commit are prefix-related, never equal — which is
-			// why a SHA comparison inside this provider must be prefix-tolerant.
+		it('narrows a commit-status full SHA to the PR event spelling', () => {
+			const pullRequest = parse('pullrequest:created', createMockBitbucketPullRequestPayload());
+			const commitStatus = parse(
+				'repo:commit_status_updated',
+				createMockBitbucketCommitStatusPayload(),
+			);
 			expect(FULL_SHA.startsWith(ABBREVIATED_SHA)).toBe(true);
-			expect(parsed.headSha).not.toBe(ABBREVIATED_SHA);
+			expect(commitStatus.headSha).toBe(ABBREVIATED_SHA);
+			expect(commitStatus.headSha).toBe(pullRequest.headSha);
+			expect(buildReviewDispatchKey('jkwiecien/swarm', '17', commitStatus.headSha ?? '')).toBe(
+				buildReviewDispatchKey('jkwiecien/swarm', '17', pullRequest.headSha ?? ''),
+			);
 		});
 	});
 

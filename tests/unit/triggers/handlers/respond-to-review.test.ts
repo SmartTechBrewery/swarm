@@ -75,6 +75,18 @@ describe('respond-to-review trigger', () => {
 			expect(handler.matches(ctx({ action: 'edited' }))).toBe(false);
 		});
 
+		it('ignores a dismissed Bitbucket verdict even when minor verdicts are enabled', () => {
+			const project = createMockProjectConfig({
+				pipeline: { respondToReview: { skipOnMinors: false } },
+			});
+			const dismissed = createMockScmTriggerContext({
+				project,
+				scm: SCM,
+				event: reviewEvent({ action: 'dismissed', reviewState: 'dismissed' }),
+			});
+			expect(handler.matches(dismissed)).toBe(false);
+		});
+
 		it('ignores other event types', () => {
 			expect(handler.matches(ctx({ kind: 'pull-request', action: 'opened' }))).toBe(false);
 		});
