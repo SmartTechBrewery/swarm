@@ -47,6 +47,7 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { parseRedisUrl } from '../lib/redis.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
+import type { ReviewVerdict } from '../pipeline/review.js';
 import type { WorkItem } from '../pm/types.js';
 import { RUN_CANCELLED_MESSAGE } from '../queue/cancellation.js';
 import { QUEUE_NAME, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
@@ -174,6 +175,28 @@ function resultAgent(
  * reported exit metadata; its non-zero exit keeps a genuinely-interrupted `timeout`
  * deferrable, matching the in-process rule.
  */
+/**
+ * Narrow a worker's reported Review verdict to the two SWARM still produces.
+ *
+ * The completion frame's enum (`src/transport/protocol.ts`) deliberately still
+ * accepts `comment` so that an older worker's whole frame isn't rejected over one
+ * optional telemetry field — but the verdict is what gates merge automation, and
+ * `comment` never gated it, so dropping it here changes no behaviour while
+ * keeping the removed verdict out of the run record (issue #470). An old worker
+ * can no longer *submit* one either: the delivery route rejects it explicitly
+ * (`src/router/worker-delivery.ts`).
+ */
+function reportedVerdict(verdict: TaskExecutionResult['verdict']): ReviewVerdict | undefined {
+	if (verdict === undefined) return undefined;
+	if (verdict === 'comment') {
+		logger.warn('dispatcher: worker reported the removed comment verdict — recording none', {
+			verdict,
+		});
+		return undefined;
+	}
+	return verdict;
+}
+
 export function adaptResultToPhaseRun(
 	result: TaskExecutionResult,
 	selection: DispatchSelection,
@@ -189,7 +212,7 @@ export function adaptResultToPhaseRun(
 				timedOut: result.timedOut ?? false,
 			}),
 			movedTo: result.movedTo,
-			verdict: result.verdict,
+			verdict: reportedVerdict(result.verdict),
 			reviewOrdinal: result.reviewOrdinal,
 			automationOutcome: result.reviewAutomationOutcome,
 			// Feeds the shared settle path's attribution write (issue #398); absent

@@ -147,6 +147,26 @@ function pmCommentBody(overrides: Record<string, unknown> = {}) {
 describe('handleSubmitReview', () => {
 	beforeEach(() => vi.clearAllMocks());
 
+	// The wire schema still accepts `comment` so an older worker's frame isn't
+	// rejected wholesale, but SWARM stopped producing the verdict (issue #470): it
+	// clears no review gate and dispatches no follow-up, so submitting one strands
+	// the PR. The rejection is explicit here rather than schema-level so the worker
+	// gets a legible reason.
+	it('rejects the removed comment verdict with a legible reason, before authenticating', async () => {
+		const submitReview = vi.fn();
+		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery({ submitReview }));
+		const deps = makeDeps({ buildScmDelivery });
+
+		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody({ verdict: 'comment' }));
+
+		expect(result.status).toBe(400);
+		expect(result.json).toEqual({
+			reason: 'the comment verdict was removed (issue #470) — upgrade the worker',
+		});
+		expect(submitReview).not.toHaveBeenCalled();
+		expect(buildScmDelivery).not.toHaveBeenCalled();
+	});
+
 	it('submits the review under the reviewer persona and returns the id', async () => {
 		const submitReview = vi.fn().mockResolvedValue(77);
 		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery({ submitReview }));

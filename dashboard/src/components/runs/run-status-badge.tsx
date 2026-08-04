@@ -19,9 +19,10 @@ interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	 */
 	phase?: string;
 	/**
-	 * The verdict a completed Review run submitted (`approve` / `request-changes`
-	 * / `comment`). Null/absent for non-review phases and pre-existing rows, which
-	 * keep the lifecycle badge (issue #218).
+	 * The verdict a completed Review run submitted (`approve` / `request-changes`;
+	 * rows written before issue #470 can also hold the retired `comment`).
+	 * Null/absent for non-review phases and pre-existing rows, which keep the
+	 * lifecycle badge (issue #218).
 	 */
 	reviewVerdict?: string | null;
 	/**
@@ -84,10 +85,14 @@ const TIMED_OUT_CONFIG: BadgeConfig = {
 /**
  * Human-readable, semantically-coloured labels for a completed Review run's
  * submitted verdict (issue #218): approval reuses the green "Completed" hue,
- * changes-requested the amber "Deferred" hue, and any other verdict (today just
- * `comment`) a distinct violet so it reads as neither a pass nor a rejection.
- * The label text — not colour alone — carries the meaning, so the badges stay
- * legible to colour-blind users and screen readers.
+ * changes-requested the amber "Deferred" hue, and any other verdict a distinct
+ * violet so it reads as neither a pass nor a rejection. The label text — not
+ * colour alone — carries the meaning, so the badges stay legible to colour-blind
+ * users and screen readers.
+ *
+ * `comment` is kept as a row here even though SWARM stopped submitting it (issue
+ * #470): runs recorded before that still hold the verdict, and their badge would
+ * otherwise fall back to the raw key.
  */
 const REVIEW_VERDICT_CONFIGS: Record<string, BadgeConfig> = {
 	approve: {

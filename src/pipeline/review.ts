@@ -29,9 +29,15 @@
  * the review to exactly the commit CI validated.
  *
  * No PM interaction: the item already sits at "In review" (the Implementation
- * phase moved it), and a submitted review doesn't change board status — any
- * verdict drives SWARM-21 (the implementer always responds, even to an
- * approval). Merging is not this phase's job either: after an eligible
+ * phase moved it), and a submitted review doesn't change board status. Which
+ * verdicts drive SWARM-21 is the *trigger's* policy, not this phase's: under the
+ * default `pipeline.respondToReview.skipOnMinors` only `request-changes`
+ * dispatches Respond-to-review (`src/triggers/handlers/respond-to-review.ts`), so
+ * an `approve` is answered by the merge path rather than by the implementer. (This
+ * phase originally submitted a third verdict, `comment`, from when every verdict
+ * was answered; it satisfied neither path once that default changed, and was
+ * removed in issue #470 — see {@link REVIEW_VERDICTS}.) Merging is not this
+ * phase's job either: after an eligible
  * `approve` the worker persists a durable merge dispatch (issue #292,
  * `src/worker/merge-automation.ts`) executed through the provider-neutral
  * merge capability (`src/scm/merge.ts`), or the PR is left to a human.
@@ -56,6 +62,7 @@ import {
 	getPriorSubmittedReview as getPriorSubmittedReviewDefault,
 	isCapReachingRequestChanges,
 	markReviewVerdictSubmitted as markReviewVerdictSubmittedDefault,
+	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
 	type AgentCli,
@@ -67,19 +74,22 @@ import { agentRunError } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
-import { buildReviewPrompt } from '@/pipeline/prompts/review.js';
+import { buildReviewHandoffRepairPrompt, buildReviewPrompt } from '@/pipeline/prompts/review.js';
 import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
 	sessionRunArgs,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
+import { renderReviewBody } from '@/pipeline/review-body.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import {
 	DeliveryDeferredError,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	hasDeliveryProgress,
+	type LegacyReviewHandoff,
+	LegacyReviewHandoffSchema,
 	loadDeliveryProgress,
 	ReviewHandoffSchema,
 	readHandoff,
@@ -99,11 +109,22 @@ export const REVIEW_VERDICT_FILENAME = HANDOFF_FILENAMES.review;
 export { buildReviewPrompt };
 
 /**
- * The verdicts the agent may submit — `gh pr review`'s three event flags. The
- * agent hands back which one it used via {@link REVIEW_VERDICT_FILENAME};
- * anything else is a failed run, not a fourth outcome.
+ * The verdicts the agent may submit. The agent hands back which one it used via
+ * {@link REVIEW_VERDICT_FILENAME}; anything else is a failed run, not a third
+ * outcome.
+ *
+ * `comment` was removed (issue #470). It existed only to mirror `gh pr review`'s
+ * third event flag, and it closed every exit at once: it never clears the review
+ * gate (only `approve` persists a merge dispatch), it dispatches no
+ * Respond-to-review run under the default `skipOnMinors`, it still charges the PR
+ * a slot against {@link REVIEW_VERDICT_CAP}, and it sets no
+ * `manual-intervention-required` signal — so the PR looked reviewed and was
+ * silently terminal. A reviewer that cannot reach a verdict must fail its run,
+ * which retries, rather than post a terminal non-verdict. Note this is SWARM's
+ * *outbound* vocabulary only: `ScmReviewState` (`src/scm/events.ts`) still
+ * observes an inbound `commented` review, which humans submit routinely.
  */
-export const REVIEW_VERDICTS = ['approve', 'request-changes', 'comment'] as const;
+export const REVIEW_VERDICTS = ['approve', 'request-changes'] as const;
 
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 
@@ -279,7 +300,7 @@ interface ReviewAgentRunParams {
  */
 async function produceReviewAgentResult(
 	params: ReviewAgentRunParams,
-): Promise<{ agent: AgentCliResult; isReReview: boolean }> {
+): Promise<{ agent: AgentCliResult; isReReview: boolean; passOrdinal: number }> {
 	const {
 		shouldResumeDelivery,
 		cli,
@@ -306,9 +327,18 @@ async function produceReviewAgentResult(
 	// completion log reports `isReReview` accurately on a resumed delivery too.
 	const priorReview = await getPriorSubmittedReview(project.id, project.repo, prNumber, headSha);
 	const isReReview = priorReview?.verdict === 'request-changes';
+	// This run's own slot number, for the rendered body's pass label (issue #470).
+	// Derived from the prior *submitted* verdict rather than read back from the
+	// reservation: `reserveReviewVerdict` blocks while another slot is still
+	// pending and numbers active slots contiguously from 1, so the prior submitted
+	// ordinal plus one *is* this run's ordinal — and deriving it here keeps the
+	// three-method `ReviewVerdictLedger` seam (and its transport implementation for
+	// DB-free workers, ADR-003 §2) unchanged. The authoritative ordinal still comes
+	// from `markReviewVerdictSubmitted` after delivery, and drives the cap.
+	const passOrdinal = (priorReview?.ordinal ?? 0) + 1;
 
 	if (shouldResumeDelivery) {
-		return { agent: resumedDeliveryAgent(cli), isReReview };
+		return { agent: resumedDeliveryAgent(cli), isReReview, passOrdinal };
 	}
 
 	if (isReReview) {
@@ -335,7 +365,230 @@ async function produceReviewAgentResult(
 		signal,
 		env: { GH_TOKEN: agentToken },
 	});
-	return { agent, isReReview };
+	return { agent, isReReview, passOrdinal };
+}
+
+interface RepairReviewHandoffParams {
+	validationError: string;
+	isReReview: boolean;
+	cli: AgentCli;
+	model?: string;
+	reasoning?: ReasoningLevel;
+	/** The session to continue, so the repair pass still has the review in context. */
+	resumeSessionId?: string;
+	worktreePath: string;
+	taskId: string;
+	prNumber: string;
+	headSha: string;
+	agentToken: string;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	runAgent: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
+}
+
+/**
+ * Re-run the review agent once, in the same worktree, with nothing but the
+ * validator's complaint and the hand-off contract — see {@link
+ * readReviewSubmission} for why the failure is worth one pass rather than three
+ * whole reviews.
+ *
+ * It resumes the session the review just ran (`AgentCliResult.sessionId`, captured
+ * per CLI), so the agent still holds its own reasoning about the diff rather than
+ * re-deriving it. Where no id was recoverable the pass is still not wasted: the
+ * hand-off it must repair, and the checkout its evidence came from, are both
+ * still on disk.
+ *
+ * Never throws. A repair run that fails leaves the invalid hand-off in place, and
+ * the caller rethrows the original validation error — which names the actual
+ * defect, unlike whatever this pass may have gone wrong with.
+ */
+async function repairReviewHandoff(params: RepairReviewHandoffParams): Promise<void> {
+	const { cli, taskId, prNumber, headSha } = params;
+	try {
+		const agent = await params.runAgent({
+			cli,
+			model: params.model,
+			reasoning: params.reasoning,
+			resumeSessionId: params.resumeSessionId,
+			cwd: params.worktreePath,
+			args: [buildReviewHandoffRepairPrompt(params.validationError, params.isReReview)],
+			maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
+			logContext: { taskId, phase: 'review-handoff-repair', prNumber, headSha },
+			// Its own budget: the harness has no notion of a phase's remaining time,
+			// and a repair pass is short next to the review it follows.
+			timeoutMs: params.timeoutMs,
+			signal: params.signal,
+			env: { GH_TOKEN: params.agentToken },
+		});
+		if (agent.exitCode !== 0)
+			logger.warn('Review — the hand-off repair pass exited non-zero', {
+				taskId,
+				prNumber,
+				headSha,
+				cli,
+				exitCode: agent.exitCode,
+			});
+	} catch (error) {
+		logger.warn('Review — the hand-off repair pass could not be run', {
+			taskId,
+			prNumber,
+			headSha,
+			cli,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * The session a repair pass should continue: the id the run actually reported
+ * ({@link AgentCliResult.sessionId}, captured per CLI), falling back to whichever
+ * id this phase handed the agent when the CLI recovered none.
+ */
+function repairSessionId(
+	agent: AgentCliResult,
+	session: { sessionId?: string; resumeSessionId?: string },
+	resumed: boolean,
+): string | undefined {
+	return agent.sessionId ?? (resumed ? session.resumeSessionId : session.sessionId);
+}
+
+/**
+ * Whether a non-blocking finding this review reports will be answered by an agent
+ * at all. Both conditions have to hold: a disabled Respond-to-review skips every
+ * verdict regardless of `skipOnMinors`, and the rendered body must not promise a
+ * run that will not happen.
+ */
+function minorsAreAnswered(project: ProjectConfig): boolean {
+	const respondToReview = project.pipeline?.respondToReview;
+	return respondToReview?.enabled !== false && respondToReview?.skipOnMinors === false;
+}
+
+/**
+ * Bind {@link repairReviewHandoff} to this run, so the submission reader can call
+ * it with nothing but the validator's message. Split out to keep the closure —
+ * and its long argument list — out of {@link runReviewPhase}'s complexity budget.
+ */
+function reviewRepairStep(
+	params: Omit<RepairReviewHandoffParams, 'validationError'>,
+): (validationError: string) => Promise<void> {
+	return (validationError) => repairReviewHandoff({ ...params, validationError });
+}
+
+interface ReviewSubmissionContext {
+	cli: AgentCli;
+	headSha: string;
+	ordinal: number;
+	isReReview: boolean;
+	minorsAnswered: boolean;
+	/** Accept a pre-#470 hand-off — set only when resuming a delivery (see below). */
+	allowLegacy: boolean;
+	/**
+	 * Re-run the agent once against the validator's own complaint, for a run whose
+	 * hand-off didn't validate. Never reached on a resumed delivery — `allowLegacy`
+	 * is answered first, and that run's agent has already exited for good — so the
+	 * phase passes this unconditionally; only a caller with no agent to re-run
+	 * (a test) leaves it out.
+	 */
+	repair?: (validationError: string) => Promise<void>;
+}
+
+/** Parse the structured hand-off and render the body SWARM will post. Throws if it doesn't validate. */
+function renderSubmission(
+	worktreePath: string,
+	context: ReviewSubmissionContext,
+): { verdict: ReviewVerdict; body: string } {
+	const handoff = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
+	return {
+		verdict: handoff.verdict,
+		body: renderReviewBody({
+			handoff,
+			headSha: context.headSha,
+			ordinal: context.ordinal,
+			cap: REVIEW_VERDICT_CAP,
+			isReReview: context.isReReview,
+			minorsAnswered: context.minorsAnswered,
+		}),
+	};
+}
+
+/**
+ * The pre-#470 escape hatch, taken only when resuming a delivery. A worktree
+ * preserved by a half-failed submission may hold a hand-off an older agent wrote,
+ * and that shape can no longer satisfy `ReviewHandoffSchema`; without this the
+ * retry would fail validation forever instead of finishing the submission it had
+ * already started. A fresh run gets no such latitude — its hand-off must be the
+ * structured shape, which is what makes the format enforceable at all.
+ *
+ * `structuredError` is rethrown when the file isn't the legacy shape either: the
+ * structured schema's complaint is then the real one, and surfacing the legacy
+ * schema's "body Required" in its place would bury it.
+ */
+function legacySubmission(
+	worktreePath: string,
+	context: ReviewSubmissionContext,
+	structuredError: unknown,
+): { verdict: ReviewVerdict; body: string } {
+	let legacy: LegacyReviewHandoff;
+	try {
+		legacy = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, LegacyReviewHandoffSchema);
+	} catch {
+		throw structuredError;
+	}
+	if (legacy.verdict === 'comment')
+		throw new Error(
+			`Review agent (${context.cli}) resumed a legacy hand-off with the removed 'comment' verdict; ` +
+				'it submits no actionable review (issue #470) — re-run the phase from a fresh worktree',
+		);
+	logger.warn('Review — resumed a pre-#470 hand-off; posting its authored body verbatim', {
+		headSha: context.headSha,
+		verdict: legacy.verdict,
+		reason: structuredError instanceof Error ? structuredError.message : String(structuredError),
+	});
+	return { verdict: legacy.verdict, body: legacy.body };
+}
+
+/**
+ * Read the review hand-off and produce what gets submitted: the verdict, and the
+ * body **rendered by SWARM** from the hand-off's fields (issue #470) rather than
+ * authored by the agent, so the review's structure is identical whichever CLI or
+ * model produced it.
+ *
+ * A hand-off that doesn't validate gets **one** repair pass before the run fails.
+ * The agent never sees the validator's complaint otherwise: the phase throws, the
+ * queue retries the job, and the whole review runs again from scratch — three
+ * full passes (`attempts`, `src/queue/producer.ts`) for a model that mis-shapes
+ * the JSON the same way each time. Since #470 moved the format's enforcement into
+ * the schema, this is the only feedback path that enforcement has. A second
+ * failure rethrows the *first* error, so the logs name the original defect rather
+ * than whatever the repair pass made of it.
+ */
+async function readReviewSubmission(
+	worktreePath: string,
+	context: ReviewSubmissionContext,
+): Promise<{ verdict: ReviewVerdict; body: string }> {
+	try {
+		return renderSubmission(worktreePath, context);
+	} catch (error) {
+		if (context.allowLegacy) return legacySubmission(worktreePath, context, error);
+		if (!context.repair) throw error;
+		const validationError = error instanceof Error ? error.message : String(error);
+		logger.warn('Review — hand-off failed validation; running one repair pass', {
+			headSha: context.headSha,
+			cli: context.cli,
+			reason: validationError,
+		});
+		await context.repair(validationError);
+		try {
+			return renderSubmission(worktreePath, context);
+		} catch (repairError) {
+			logger.error('Review — the repair pass did not produce a valid hand-off', {
+				headSha: context.headSha,
+				cli: context.cli,
+				reason: repairError instanceof Error ? repairError.message : String(repairError),
+			});
+			throw error;
+		}
+	}
 }
 
 /**
@@ -411,7 +664,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		graft(project.repoRoot, handle.path);
 
 		const shouldResumeDelivery = !legacyMode && deliveryResumed;
-		const { agent, isReReview } = await produceReviewAgentResult({
+		const { agent, isReReview, passOrdinal } = await produceReviewAgentResult({
 			shouldResumeDelivery,
 			cli,
 			model,
@@ -462,7 +715,29 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 				automationOutcome,
 			};
 		}
-		const handoff = readHandoff(handle.path, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
+		const submission = await readReviewSubmission(handle.path, {
+			cli,
+			headSha,
+			ordinal: passOrdinal,
+			isReReview,
+			minorsAnswered: minorsAreAnswered(project),
+			allowLegacy: shouldResumeDelivery,
+			repair: reviewRepairStep({
+				isReReview,
+				cli,
+				model,
+				reasoning,
+				resumeSessionId: repairSessionId(agent, { sessionId, resumeSessionId }, resumed),
+				worktreePath: handle.path,
+				taskId,
+				prNumber,
+				headSha,
+				agentToken,
+				timeoutMs,
+				signal,
+				runAgent,
+			}),
+		});
 		const delivery =
 			options.delivery ??
 			(await requireProjectSCMProvider(project).deliveryProvider(project, 'reviewer'));
@@ -472,12 +747,12 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		if (!progress.reviewId)
 			progress.reviewId = await delivery.submitReview({
 				prNumber: Number(prNumber),
-				verdict: handoff.verdict,
-				body: handoff.body,
+				verdict: submission.verdict,
+				body: submission.body,
 				deliveryId,
 			});
 		saveDeliveryProgress(handle.path, progress);
-		const verdict = handoff.verdict;
+		const verdict = submission.verdict;
 		// Marked after delivery confirms the review id — idempotent, so a crash
 		// between GitHub delivery and this write is repaired by a retry without
 		// submitting a second review (issue #235).

@@ -69,6 +69,21 @@ describe('adaptResultToPhaseRun', () => {
 		expect(run.automationOutcome).toBe('manual-intervention-required');
 	});
 
+	// The frame's enum still accepts the retired `comment` verdict so an older
+	// worker's terminal result isn't rejected wholesale — losing the run's outcome
+	// over one optional telemetry field — but it must not reach the run record
+	// (issue #470). Dropping it changes no behaviour: `comment` never gated merge
+	// automation, which is the only thing the verdict feeds.
+	it('drops a retired comment verdict reported by an older worker', () => {
+		const run = adaptResultToPhaseRun(
+			base({ status: 'succeeded', exitCode: 0, verdict: 'comment', reviewOrdinal: 2 }),
+			SELECTION,
+		);
+		expect(run.verdict).toBeUndefined();
+		// The rest of the settle context still lands, so the run isn't lost.
+		expect(run.reviewOrdinal).toBe(2);
+	});
+
 	it('maps the produced PR url so the control plane records the attribution (issue #398)', () => {
 		const run = adaptResultToPhaseRun(
 			base({ status: 'succeeded', exitCode: 0, prUrl: 'https://github.com/o/r/pull/7' }),

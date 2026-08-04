@@ -408,9 +408,19 @@ describe('transport protocol schemas', () => {
 			expect([...movedTo.options].sort()).toEqual([...PM_STATUS_KEYS].sort());
 		});
 
-		it('verdict matches REVIEW_VERDICTS', () => {
+		// `comment` is a *retired* verdict SWARM no longer produces (issue #470) that
+		// the frame deliberately still accepts: rejecting it would fail an older
+		// worker's whole completion frame over one optional telemetry field, losing
+		// the run's result. `src/router/dispatcher.ts` drops it when adapting the
+		// frame. Asserting the exact superset keeps the guard's real job — a *new*
+		// verdict that the frame didn't gain still fails here.
+		const RETIRED_WIRE_VERDICTS = ['comment'] as const;
+
+		it('verdict matches REVIEW_VERDICTS plus the retired wire values', () => {
 			const verdict = TaskExecutionResultSchema.shape.verdict.unwrap();
-			expect([...verdict.options].sort()).toEqual([...REVIEW_VERDICTS].sort());
+			expect([...verdict.options].sort()).toEqual(
+				[...REVIEW_VERDICTS, ...RETIRED_WIRE_VERDICTS].sort(),
+			);
 		});
 
 		it('reviewAutomationOutcome matches REVIEW_AUTOMATION_OUTCOMES', () => {

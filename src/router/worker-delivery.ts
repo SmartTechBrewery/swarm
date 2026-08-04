@@ -277,6 +277,20 @@ export async function handleSubmitReview(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
+	// The wire schema still accepts `comment` so that an older worker gets this
+	// legible reason rather than a schema-level "invalid delivery request", and so
+	// that removing the verdict needed no `TRANSPORT_PROTOCOL_VERSION` bump (which
+	// would reject every frame from that worker, not just this one). SWARM stopped
+	// producing the verdict in issue #470: it clears no review gate and dispatches
+	// no follow-up, so submitting it strands the PR.
+	if (request.verdict === 'comment')
+		return {
+			status: 400,
+			json: {
+				reason: 'the comment verdict was removed (issue #470) — upgrade the worker',
+			},
+		};
+
 	const authed = await authenticateDelivery(deps, credential, request.projectId);
 	if ('status' in authed) return authed;
 

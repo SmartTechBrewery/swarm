@@ -28,6 +28,223 @@ function agentResult(): AgentCliResult {
 	};
 }
 
+/** A valid structured hand-off (issue #470); `overrides` merge over the defaults. */
+function structuredHandoff(overrides: Record<string, unknown> = {}) {
+	return {
+		verdict: 'approve',
+		summary: 'Adds Bitbucket webhook signature verification.',
+		verification: [{ command: 'npm run typecheck', outcome: 'passed' }],
+		docsChecked: [{ path: 'README.md', status: 'not-applicable' }],
+		...overrides,
+	};
+}
+
+/**
+ * Delivery-mode phase options (a `delivery` provider is present, so this is not
+ * the legacy bare-verdict path), with the agent writing `handoff` to the worktree.
+ * Pass an array to give successive agent runs different hand-offs — that is how
+ * the repair pass is exercised, since it is a second run against the same
+ * worktree; the last entry repeats once the array is exhausted.
+ */
+function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {}) {
+	const handoffs = Array.isArray(handoff) ? [...handoff] : [handoff];
+	const path = mkdtempSync(join(tmpdir(), 'swarm-review-render-'));
+	roots.push(path);
+	const handle: WorktreeHandle = { taskId: 'review-42', path, branch: 'abc', detached: true };
+	const worktrees = {
+		provision: vi.fn(async () => handle),
+		reuse: vi.fn(async () => handle),
+		cleanup: vi.fn(async () => undefined),
+	} as unknown as GitWorktreeManager;
+	// Typed so the assertions below can read the submitted body off `mock.calls`.
+	const submitReview = vi.fn<
+		(input: { prNumber: number; verdict: string; body: string }) => Promise<number>
+	>(async () => 77);
+	return {
+		path,
+		submitReview,
+		options: {
+			project: createMockProjectConfig(),
+			prNumber: '42',
+			headSha: 'abc1234',
+			taskId: 'review-42',
+			worktrees,
+			runAgent: vi.fn(async () => {
+				const next = handoffs.length > 1 ? handoffs.shift() : handoffs[0];
+				writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(next));
+				return agentResult();
+			}),
+			graft: vi.fn(() => []),
+			getToken: vi.fn(async () => 'review-token'),
+			delivery: {
+				commitIdentity: { name: 'reviewer', email: 'reviewer@users.noreply.github.com' },
+				findPullRequest: vi.fn(),
+				createPullRequest: vi.fn(),
+				pushBranch: vi.fn(),
+				submitReview,
+				postComment: vi.fn(),
+			} as unknown as ScmDeliveryProvider,
+			markReviewVerdictSubmitted: vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 })),
+			abandonReviewVerdict: vi.fn(async () => undefined),
+			getPriorSubmittedReview: vi.fn(async () => undefined),
+			...overrides,
+		},
+	};
+}
+
+/**
+ * The posted body is rendered by SWARM from the hand-off's fields (issue #470),
+ * not authored by the agent — that is what makes a review's structure identical
+ * whichever CLI produced it.
+ */
+describe('review body rendering', () => {
+	it('posts a rendered body, not anything the agent formatted', async () => {
+		const { submitReview, options } = deliveryDeps(
+			structuredHandoff({ body: '## MY OWN HEADING\nplease keep this' }),
+		);
+
+		await runReviewPhase(options);
+
+		const posted = submitReview.mock.calls[0][0].body;
+		expect(posted).toContain('> **Review** · pass 1 of 3 · `approve` · head `abc1234`');
+		expect(posted).toContain('## Scope');
+		expect(posted).toContain('Adds Bitbucket webhook signature verification.');
+		expect(posted).toContain('| `npm run typecheck` | passed |');
+		// A stray `body` field the agent invents is discarded, not appended.
+		expect(posted).not.toContain('MY OWN HEADING');
+	});
+
+	// The pass number comes from the ledger's ordinal, which already exists and was
+	// previously discarded — never from an agent-side count, which a retry would
+	// drift.
+	it('derives the pass number from the prior submitted verdict', async () => {
+		const { submitReview, options } = deliveryDeps(
+			structuredHandoff({
+				verdict: 'request-changes',
+				findings: [
+					{
+						id: 'F1',
+						title: 'Still wrong',
+						severity: 'blocker',
+						category: 'correctness',
+						evidence: '`webhook.ts:245`.',
+						failureScenario: 'Two keys for one commit.',
+						impact: 'A duplicate reviewer run.',
+						fixPlan: ['Abbreviate at the boundary.'],
+						tests: 'Assert equality.',
+					},
+				],
+			}),
+			{
+				getPriorSubmittedReview: vi.fn(async () => ({
+					id: 'verdict-1',
+					ordinal: 1,
+					verdict: 'request-changes',
+				})),
+			},
+		);
+
+		await runReviewPhase(options);
+
+		const posted = submitReview.mock.calls[0][0].body;
+		expect(posted).toContain('**First re-review** · pass 2 of 3');
+	});
+
+	it('rejects a fresh run whose hand-off is the pre-#470 authored-body shape', async () => {
+		const { options } = deliveryDeps({ verdict: 'approve', body: 'Looks good', findings: [] });
+
+		await expect(runReviewPhase(options)).rejects.toThrow(/Invalid hand-off/);
+		// The review was never submitted, so the run must not charge the PR one of
+		// its three verdict slots (issue #235) — a malformed hand-off is a failed
+		// attempt, not a spent verdict.
+		expect(options.abandonReviewVerdict).toHaveBeenCalled();
+		expect(options.markReviewVerdictSubmitted).not.toHaveBeenCalled();
+	});
+
+	// Without this the agent never learns why its hand-off was rejected: the phase
+	// throws, the queue re-runs the whole review, and a model that mis-shapes the
+	// JSON the same way each time burns every attempt.
+	it('gives an invalid hand-off one repair pass carrying the validator’s complaint', async () => {
+		const { submitReview, options } = deliveryDeps([
+			structuredHandoff({ verdict: 'nonsense' }),
+			structuredHandoff(),
+		]);
+
+		await runReviewPhase(options);
+
+		const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+		expect(runAgent).toHaveBeenCalledTimes(2);
+		const repairPrompt = runAgent.mock.calls[1][0].args[0];
+		expect(repairPrompt).toContain("failed SWARM's validation");
+		expect(repairPrompt).toContain('Invalid hand-off review_handoff.json');
+		expect(repairPrompt).toContain('this is a formatting repair, not a re-review');
+		// It continues the review's own session, so the repair still has the diff in
+		// context rather than re-deriving it.
+		expect(runAgent.mock.calls[1][0].resumeSessionId).toBe('session-1');
+		expect(submitReview).toHaveBeenCalledOnce();
+	});
+
+	it('fails with the original complaint when the repair pass does not fix it', async () => {
+		const { submitReview, options } = deliveryDeps(structuredHandoff({ verdict: 'nonsense' }));
+
+		await expect(runReviewPhase(options)).rejects.toThrow(/Invalid hand-off/);
+		expect(options.runAgent).toHaveBeenCalledTimes(2);
+		expect(submitReview).not.toHaveBeenCalled();
+	});
+
+	// The body must not promise a follow-up that a disabled Respond-to-review will
+	// never run, whatever `skipOnMinors` says.
+	it('states that nothing will act on minors when Respond-to-review is off', async () => {
+		const { submitReview, options } = deliveryDeps(
+			structuredHandoff({
+				findings: [
+					{
+						id: 'F1',
+						title: 'naming',
+						severity: 'nit',
+						category: 'consistency',
+						evidence: '`webhook.ts:337`.',
+						suggestion: 'Rename for symmetry.',
+					},
+				],
+			}),
+			{
+				project: createMockProjectConfig({
+					pipeline: { respondToReview: { enabled: false, skipOnMinors: false } },
+				}),
+			},
+		);
+
+		await runReviewPhase(options);
+
+		expect(submitReview.mock.calls[0][0].body).toContain('**no agent will act on them**');
+	});
+
+	// A worktree preserved by a half-failed submission may hold an older agent's
+	// hand-off; without this fallback the retry would fail validation forever
+	// instead of finishing the submission it had already started.
+	it('accepts the legacy shape when resuming a delivery, posting its body verbatim', async () => {
+		const legacy = { verdict: 'approve', body: 'Looks good', findings: [] };
+		const { path, submitReview, options } = deliveryDeps(legacy);
+		// Seed the delivery progress a half-failed submission would have left behind.
+		writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(legacy));
+
+		await runReviewPhase({ ...options, resumeDelivery: true });
+
+		expect(submitReview.mock.calls[0][0].body).toBe('Looks good');
+	});
+
+	it('refuses a resumed legacy hand-off carrying the removed comment verdict', async () => {
+		const legacy = { verdict: 'comment', body: 'Some notes', findings: [] };
+		const { path, options } = deliveryDeps(legacy);
+		writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(legacy));
+
+		await expect(runReviewPhase({ ...options, resumeDelivery: true })).rejects.toThrow(
+			/removed 'comment' verdict/,
+		);
+	});
+});
+
 describe('review production delivery', () => {
 	it('preserves progress after a step failure and resumes before the agent without duplicating delivery', async () => {
 		const path = mkdtempSync(join(tmpdir(), 'swarm-review-delivery-'));
@@ -44,7 +261,9 @@ describe('review production delivery', () => {
 				join(path, 'review_handoff.json'),
 				JSON.stringify({
 					verdict: 'approve',
-					body: 'Looks good',
+					summary: 'Adds a normalization helper.',
+					verification: [{ command: 'npx vitest run tests/unit', outcome: 'passed' }],
+					docsChecked: [{ path: 'README.md', status: 'not-applicable' }],
 					findings: [],
 				}),
 			);
