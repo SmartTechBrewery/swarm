@@ -1,8 +1,39 @@
 # ARCHITECTURE DESIGN DOCUMENT (ADD) & PROJECT SPECIFICATION
 ## System Name: SWARM (Federated Multi-Agent Automation Framework)
-**Status:** MVP scope defined — local (Cascade-shaped) implementation in progress. See the [GitHub Projects board](https://github.com/users/jkwiecien/projects/3/views/1) for the active backlog and `ai/ARCHITECTURE.md` for the agent-facing summary of §2.1.
+**Status:** **Frozen historical baseline — not maintained** (frozen 2026-08-04).
 **Target Audience:** Engineering Team, Core Architects
 **Version:** 1.2.0
+
+---
+
+> ## ⚠️ This document is a historical baseline, not a description of the system
+>
+> `PROJECT.md` is the original design document SWARM was founded on. It is kept for
+> **original design intent** and because ~40 code comments cite its section numbers
+> (`PROJECT.md §5.1`, `§6.1`, …) as a shared vocabulary. It is **no longer
+> maintained and is not authoritative on current behavior.**
+>
+> **Where this document disagrees with any of the following, they win:**
+>
+> - **[`ai/ARCHITECTURE.md`](./ai/ARCHITECTURE.md)** — the architecture as actually built.
+> - **[`docs/decisions/`](./docs/decisions/)** — the ADRs; every deliberate divergence from this document is recorded there.
+> - **[`docs/`](./docs/)** — the maintained references: [`configuration.md`](./docs/configuration.md), [`pipeline.md`](./docs/pipeline.md), [`operations.md`](./docs/operations.md), [`cli.md`](./docs/cli.md), [`status.md`](./docs/status.md).
+> - **The code and its Zod schemas** — the source of truth for every contract (`ai/CODING_STANDARDS.md`).
+>
+> Known divergences, as examples rather than an exhaustive list — do not trust an
+> unlisted section merely because it is unlisted:
+>
+> | Section | This document says | Reality |
+> | --- | --- | --- |
+> | §2.2, §3, §6.2, §8 Phase 6 | GCP orchestrator, gRPC control plane, Secret Manager | Never built. The transport is WebSocket + HTTP on the router ([ADR-004](./docs/decisions/ADR-004-worker-transport-and-split-delivery.md) §1); §3's `.proto` is retained only as a message-*shape* reference ([ADR-003](./docs/decisions/ADR-003-worker-transport-and-split-delivery.md)). |
+> | §4.1 | Human workspace is `~/swarm/{project-name}/` | It is the project's configured `repoRoot` (`swarm.config.json`), anywhere on disk. Only the `.swarm-workspaces/` agent root still holds. |
+> | §5.1 | Planning runs Google Antigravity | Planning runs `claude`; the agent per phase is configurable (`src/harness/models.ts`, the dashboard's Agent Configuration). |
+> | §5.x | "Ready for Dev" | The canonical status key is `todo`, surfaced on the board as `Ready` (`ai/RULES.md` §5). |
+> | §7.1 | An inline `PMProvider`/`WorkItem` TypeScript listing | Superseded — see the note in that section. |
+>
+> The live task board is **not** linked from here; `ai/RULES.md` §5 owns that and is
+> maintained. This document's original roadmap (§8) is likewise historical —
+> [`docs/status.md`](./docs/status.md) tracks where the MVP actually stands.
 
 ---
 
@@ -27,7 +58,7 @@ The two concrete product differences from Cascade — what makes SWARM its own p
 1. **PM provider = GitHub Projects** (v2), not Trello/JIRA/Linear — Cascade has no GitHub Projects adapter; this is net-new.
 2. **SCM = GitHub**, same as Cascade — this piece is copied closely.
 
-MVP scope is single-user (see `ai/ARCHITECTURE.md` and the [GitHub Projects board](https://github.com/users/jkwiecien/projects/3/views/1)); multi-tenancy is deferred to the long-term vision along with the cloud engine.
+MVP scope is single-user (see `ai/ARCHITECTURE.md`); multi-tenancy is deferred to the long-term vision along with the cloud engine. *(Historical: multi-user authentication, project membership, and federated worker enrollment have since been built — see `ai/ARCHITECTURE.md` and ADR-001.)*
 
 ---
 
@@ -207,7 +238,7 @@ When the worker receives a `TaskAssignment`-shaped job (from BullMQ in the MVP, 
 
 ## 5. Multi-Agent Pipeline Flows & Lifecycle Management
 
-SWARM treats multi-agent execution as independent, sequential, and entirely stateless phases connected by **GitHub Projects**. All four phases below are in MVP scope (granular tasks: [GitHub Projects board](https://github.com/users/jkwiecien/projects/3/views/1)).
+SWARM treats multi-agent execution as independent, sequential, and entirely stateless phases connected by **GitHub Projects**. All four phases below are in MVP scope. *(The live task board is owned by `ai/RULES.md` §5; `docs/pipeline.md` describes the phases as built, including the Respond-to-CI and resolve-conflicts phases this document predates.)*
 
 ### 5.1. Phase 1: Planning (Antigravity Pipeline)
 
@@ -267,51 +298,23 @@ To mimic the scalable architecture of Cascade, SWARM implements a provider-agnos
 
 ### 7.1. Interface Contract (`PMProvider`)
 
-This mirrors Cascade's `src/pm/types.ts` shape (see `ai/ARCHITECTURE.md`) — no `any` types, unlike this document's earlier draft of this interface:
-
-```typescript
-export interface WorkItemLabel {
-  id: string;
-  name: string;
-  color?: string;
-}
-
-export interface WorkItem {
-  id: string;
-  title: string;
-  description: string;
-  url: string;
-  status: string;
-  statusId: string;
-  labels: WorkItemLabel[];
-  repositoryUrl?: string;
-  targetBranch?: string;
-}
-
-export interface ListWorkItemsFilter {
-  status?: string;
-  label?: string;
-  limit?: number;
-}
-
-export interface ParsedWebhookEvent {
-  projectIdentifier: string;
-  eventType: string;
-  workItemId?: string;
-}
-
-export interface PMProvider {
-  readonly type: string; // 'github-projects' for the MVP's only provider
-
-  verifyWebhookSignature(rawBody: string, headers: Record<string, string>, secret: string): boolean;
-  parseWebhook(payload: unknown): ParsedWebhookEvent | null;
-
-  getWorkItem(id: string): Promise<WorkItem>;
-  listWorkItems(filter?: ListWorkItemsFilter): Promise<WorkItem[]>;
-  moveWorkItem(id: string, destinationStatus: string): Promise<void>;
-  addComment(id: string, text: string): Promise<string>;
-}
-```
+> **Superseded — the contract lives in [`src/pm/types.ts`](./src/pm/types.ts).**
+>
+> This section originally carried an inline TypeScript listing of `PMProvider` /
+> `WorkItem`. It has been removed rather than corrected: a hand-copied contract is a
+> second source of truth, which `ai/CODING_STANDARDS.md` ("Zod is the source of
+> truth") exists to prevent — and it had already drifted. The real interface has
+> grown well past the four methods drafted here (`findWorkItemByUrlSuffix`,
+> `findComment`, `createWorkItem`, `updateWorkItem`, `addLabel`, `listBlockers`,
+> `addBlockedBy`, …), and `WorkItem` gained `assignees`/`createdAt`/`updatedAt`
+> while `status`/`statusId` became optional.
+>
+> The *design intent* this section recorded still stands and is the part worth
+> keeping: **project-management features are programmed against the provider
+> interface, never against a concrete board.** That rule is stated normatively, with
+> its current obligations, in `ai/RULES.md` §2 ("Project-management features must
+> stay provider-agnostic"). Widening the interface for every provider is the
+> supported move; special-casing one at a call site is not.
 
 GitHub Projects (v2) is the MVP's only concrete implementation — see `ai/ARCHITECTURE.md` for how its GraphQL-only API, custom `Status` field, and `projects_v2_item` webhook event map onto this interface. Adding a second provider later (e.g. re-adding Trello/JIRA/Linear support, or Asana) should require zero changes to router/worker dispatch code — only a new provider folder plus one registry import, per Cascade's single-entrypoint invariant.
 
@@ -319,7 +322,7 @@ GitHub Projects (v2) is the MVP's only concrete implementation — see `ai/ARCHI
 
 ## 8. Implementation Roadmap
 
-Granular tasks live on the [GitHub Projects board](https://github.com/users/jkwiecien/projects/3/views/1); this is the phase-level view.
+This is the *original* phase-level roadmap, kept as written. For where the MVP actually stands see [`docs/status.md`](./docs/status.md); for the live task board see `ai/RULES.md` §5.
 
 ### Phase 1: Local Foundation
 * Scaffold the Node.js/TypeScript project with Cascade's tooling (strict TS, Biome, Vitest, Lefthook).

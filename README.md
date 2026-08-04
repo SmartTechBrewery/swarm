@@ -12,9 +12,10 @@ GitHub reaches the router through a public HTTPS webhook endpoint, usually via a
 Cloudflare Tunnel. The router also exposes an authenticated worker-transport
 endpoint (`POST /worker/session` + a `GET /worker/stream` WebSocket) so a remote
 worker can establish and heartbeat its session over that same tunnel (ADR-003).
-The long-term architecture and protocol are documented in
-[`PROJECT.md`](./PROJECT.md); this README is the shortest path to a working
-checkout.
+The architecture as built is documented in
+[`ai/ARCHITECTURE.md`](./ai/ARCHITECTURE.md) and the ADRs under
+[`docs/decisions/`](./docs/decisions/); this README is the shortest path to a
+working checkout.
 
 ## How it works
 
@@ -240,7 +241,7 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`docs/github-projects-v2-api.md`](./docs/github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./docs/decisions/) — architecture decision records
-- [`PROJECT.md`](./PROJECT.md) — long-term architecture design and protocol
+- [`PROJECT.md`](./PROJECT.md) — the original design document, **frozen as a historical baseline**; read it for original intent, not current behavior
 
 The live task backlog is the [SWARM GitHub Projects board](https://github.com/orgs/SmartTechBrewery/projects/6/views/1).
 
