@@ -167,8 +167,8 @@ progresses, so its live Status will differ from the `Planning`/`61e4505c` shown 
     "number": 10,
     "title": "Spike: GitHub Projects v2 GraphQL API …",
     "state": "OPEN",
-    "url": "https://github.com/jkwiecien/swarm/issues/10",
-    "repository": { "nameWithOwner": "jkwiecien/swarm" }
+    "url": "https://github.com/SmartTechBrewery/swarm/issues/10",
+    "repository": { "nameWithOwner": "SmartTechBrewery/swarm" }
   },
   "fieldValueByName": {
     "name": "Planning",

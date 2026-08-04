@@ -1,7 +1,7 @@
 # ADR-003: Worker↔control-plane transport (WebSocket + HTTP), and split delivery
 
 - **Status:** Accepted
-- **Issue:** [#391](https://github.com/jkwiecien/swarm/issues/391)
+- **Issue:** [#391](https://github.com/SmartTechBrewery/swarm/issues/391)
 - **Date:** 2026-07-24
 - **Decision owners:** SWARM maintainers
 
