@@ -2,9 +2,11 @@
  * BitbucketSCMIntegration — Bitbucket Cloud's implementation of the
  * provider-neutral {@link SCMProvider} contract (`src/scm/types.ts`), built out
  * over four phases (issue #296). Landed so far: availability probing, persona
- * credential scoping, and persona identity / actor resolution (phase 1/4), plus
+ * credential scoping, and persona identity / actor resolution (phase 1/4);
  * webhook signature verification, header reading, event normalization, and the
- * comment loop-prevention gate (phase 2/4, delegated to `./webhook.ts`).
+ * comment loop-prevention gate (phase 2/4, delegated to `./webhook.ts`); and the
+ * pull-request / build-status reads (phase 3/4, delegated to
+ * `./pull-requests.ts`).
  *
  * Its core job is the same as the GitHub class's: run a block of Bitbucket
  * operations under the correct persona's credential. Callers hand it a project +
@@ -43,6 +45,12 @@ import {
 	resolveBitbucketPersonaIdentities,
 } from './personas.js';
 import {
+	getBitbucketCommitBuildStatus,
+	getBitbucketPullRequest,
+	getBitbucketPullRequestTitle,
+	listOpenBitbucketPullRequestsForBase,
+} from './pull-requests.js';
+import {
 	isSwarmGeneratedBitbucketEvent,
 	parseBitbucketWebhook,
 	readBitbucketWebhookRequest,
@@ -60,8 +68,17 @@ function notImplementedYet(method: string, phase: string): never {
 	);
 }
 
-const READ_PHASE = 'phase 3/4 (pull-request reads)';
 const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
+
+/**
+ * Bitbucket's `workspace` / `repo_slug` pair, which a project's `owner/repo`
+ * doubles as — see `./credentials.ts` for why that let the provider land without
+ * a config-schema field.
+ */
+function repoCoordinates(project: ProjectConfig): [workspace: string, slug: string] {
+	const [workspace, slug] = project.repo.split('/');
+	return [workspace, slug];
+}
 
 export class BitbucketSCMIntegration implements SCMProvider {
 	readonly type = 'bitbucket' as const;
@@ -140,23 +157,71 @@ export class BitbucketSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: pull-request reads — phase 3/4
+	// Pull-request reads — phase 3/4, in `./pull-requests.ts`
 	// ==========================================================================
 
-	async getPullRequest(): Promise<PullRequestDetails> {
-		notImplementedYet('getPullRequest', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getPullRequest}. Reads under the **reviewer** persona by
+	 * default, the persona GitHub's adapter reads a PR as on the review path.
+	 * `mergeable` always comes back `null` — Bitbucket Cloud exposes no
+	 * mergeability flag (see `./pull-requests.ts`).
+	 */
+	async getPullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		persona: ScmPersona = 'reviewer',
+	): Promise<PullRequestDetails> {
+		const [workspace, slug] = repoCoordinates(project);
+		return this.withPersonaCredentials(project, persona, () =>
+			getBitbucketPullRequest(workspace, slug, prNumber),
+		);
 	}
 
-	async getPullRequestTitle(): Promise<string | null> {
-		notImplementedYet('getPullRequestTitle', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getPullRequestTitle}. Defaults to the **implementer** — the
+	 * PR's author, whose credential is always configured for a project that opens
+	 * PRs — matching GitHub's default for the same read.
+	 */
+	async getPullRequestTitle(
+		project: ProjectConfig,
+		prNumber: number,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		const [workspace, slug] = repoCoordinates(project);
+		return this.withPersonaCredentials(project, persona, () =>
+			getBitbucketPullRequestTitle(workspace, slug, prNumber),
+		);
 	}
 
-	async getAggregateCheckStatus(): Promise<AggregateCheckStatus> {
-		notImplementedYet('getAggregateCheckStatus', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getAggregateCheckStatus} — every build status on `ref`,
+	 * aggregated. Reads under the **reviewer** persona by default, the same scope
+	 * GitHub's adapter uses for the review handler's aggregate query.
+	 */
+	async getAggregateCheckStatus(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<AggregateCheckStatus> {
+		const [workspace, slug] = repoCoordinates(project);
+		return this.withPersonaCredentials(project, persona, () =>
+			getBitbucketCommitBuildStatus(workspace, slug, ref),
+		);
 	}
 
-	async listConflictCandidates(): Promise<PullRequestDetails[]> {
-		notImplementedYet('listConflictCandidates', READ_PHASE);
+	/**
+	 * {@link SCMProvider.listConflictCandidates} — open same-repository PRs
+	 * targeting `baseBranch`, read as the **implementer** (the persona that would
+	 * push the resolution), same as GitHub's.
+	 */
+	async listConflictCandidates(
+		project: ProjectConfig,
+		baseBranch: string,
+	): Promise<PullRequestDetails[]> {
+		const [workspace, slug] = repoCoordinates(project);
+		return this.withPersonaCredentials(project, 'implementer', () =>
+			listOpenBitbucketPullRequestsForBase(workspace, slug, baseBranch),
+		);
 	}
 
 	// ==========================================================================
