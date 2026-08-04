@@ -38,10 +38,18 @@ concurrent workers (`SWARM_WORKER_CONCURRENCY > 1`). SWARM always resumes by exp
   output's `session_id`; the harness reads that (falling back to the assigned id).
 - **codex** — `codex exec --json` emits `{"type":"thread.started","thread_id":"…"}` as its
   first stdout line; `parseAgentOutput` lifts the `thread_id`. A resume re-emits the same id.
-- **agy** — has no assign flag and prints no id, so `antigravity-session.ts` snapshots the
-  conversation store (`~/.gemini/antigravity-cli/conversations/<id>.db`, overridable via
+- **agy** — has no assign flag, but `agy --output-format stream-json` prints a
+  `conversation_id` in its opening `init` event and repeats it on every record after, so
+  `parseAgentOutput` lifts it from there (issue #465). The empty string a *failed* run
+  reports is rejected, so a failure falls back to the id its `init` event named.
+  `antigravity-session.ts` is now the **fallback** for the two cases that stream can't
+  cover — an `agy` predating `--output-format` (1.1.3), and a run killed before its opening
+  event was captured. It snapshots the conversation store
+  (`~/.gemini/antigravity-cli/conversations/<id>.db`, overridable via
   `SWARM_ANTIGRAVITY_CONVERSATIONS_DIR`) immediately before spawn and diffs it at close; the
-  new `.db` basename is the conversation id. Concurrent runs disambiguate by newest mtime.
+  new `.db` basename is the conversation id. Concurrent runs are **not** disambiguated: more
+  than one new `.db` makes the diff ambiguous and capture deliberately gives up rather than
+  guess, since resuming a sibling task's session is worse than starting fresh.
 
 ### (b) Per-CLI resume-arg shape — `buildSessionArgs` in `agent-cli.ts`
 

@@ -11,6 +11,16 @@ const claudeText = (text: string) => ({
 	message: { role: 'assistant', content: [{ type: 'text', text }] },
 });
 
+/** One `agy --output-format stream-json` transcript. */
+const agyStream = (...events: unknown[]): string =>
+	`${events.map((event) => JSON.stringify(event)).join('\n')}\n`;
+
+const agyInit = (conversationId: string) => ({
+	event: 'init',
+	conversation_id: conversationId,
+	init: { cwd: '/scratch', tools: ['view_file'] },
+});
+
 describe('parseAgentOutput', () => {
 	describe('claude', () => {
 		it('normalizes a full usage block and extracts the readable result text', () => {
@@ -207,13 +217,133 @@ describe('parseAgentOutput', () => {
 	});
 
 	describe('antigravity', () => {
-		it('returns {} because agy cannot emit structured usage', () => {
-			const stdout = JSON.stringify({
-				result: 'done',
-				usage: { input_tokens: 1, output_tokens: 2 },
+		it('normalizes the terminal result usage, text, and conversation id', () => {
+			const stdout = agyStream(
+				agyInit('d42f7419-1111-2222-3333-444455556666'),
+				{
+					event: 'step_update',
+					step_update: { step_index: 2, state: 'DONE', step_type: 'agent_response' },
+				},
+				{
+					event: 'result',
+					result: {
+						conversation_id: 'd42f7419-1111-2222-3333-444455556666',
+						status: 'SUCCESS',
+						response: 'STREAM_OK\n',
+						usage: {
+							input_tokens: 18267,
+							output_tokens: 28,
+							thinking_tokens: 22,
+							cache_read_tokens: 0,
+							total_tokens: 18295,
+						},
+					},
+				},
+			);
+
+			expect(parseAgentOutput('antigravity', stdout)).toEqual({
+				usage: {
+					inputTokens: 18267,
+					outputTokens: 28,
+					reasoningTokens: 22,
+					cacheReadTokens: 0,
+					totalTokens: 18295,
+				},
+				logText: 'STREAM_OK\n',
+				sessionId: 'd42f7419-1111-2222-3333-444455556666',
+			});
+		});
+
+		it('accepts input/output-only usage, leaving optional fields absent', () => {
+			const stdout = agyStream({
+				event: 'result',
+				result: {
+					status: 'SUCCESS',
+					response: 'ok',
+					usage: { input_tokens: 10, output_tokens: 5 },
+				},
+			});
+			expect(parseAgentOutput('antigravity', stdout)).toEqual({
+				usage: { inputTokens: 10, outputTokens: 5 },
+				logText: 'ok',
+			});
+		});
+
+		it('renders a failed status as the log text and a structural failure', () => {
+			// The live shape from agy 1.1.10 with a bogus --model: the detail lands in
+			// `error`, `response` is empty, and `conversation_id` is the empty string.
+			const stdout = agyStream(agyInit('ef894758-aaaa-bbbb-cccc-ddddeeeeffff'), {
+				event: 'result',
+				result: {
+					conversation_id: '',
+					status: 'ERROR',
+					response: '',
+					error: 'invalid model selection (--model "nope"):\n  model nope is not recognized',
+					usage: { input_tokens: 0, output_tokens: 0 },
+				},
 			});
 
-			expect(parseAgentOutput('antigravity', stdout)).toEqual({});
+			expect(parseAgentOutput('antigravity', stdout)).toEqual({
+				usage: { inputTokens: 0, outputTokens: 0 },
+				logText:
+					'Antigravity run failed (ERROR): invalid model selection (--model "nope"): model nope is not recognized',
+				// The empty conversation_id is rejected in favour of the init event's.
+				sessionId: 'ef894758-aaaa-bbbb-cccc-ddddeeeeffff',
+				antigravityFailure: {
+					status: 'ERROR',
+					message: 'invalid model selection (--model "nope"): model nope is not recognized',
+				},
+			});
+		});
+
+		it('recovers the conversation id from a tail that lost the init event', () => {
+			// The rolling tail the harness keeps starts wherever the byte budget fell,
+			// so the opening `init` record can be gone or half-eaten. Every
+			// `step_update` repeats the id, and that is what has to carry the resume.
+			const full = agyStream(
+				agyInit('d42f7419-1111-2222-3333-444455556666'),
+				{
+					event: 'step_update',
+					step_update: {
+						conversation_id: 'd42f7419-1111-2222-3333-444455556666',
+						step_index: 2,
+						state: 'DONE',
+						step_type: 'agent_response',
+					},
+				},
+				// A failed result reports an empty id, so it cannot be the source here.
+				{ event: 'result', result: { conversation_id: '', status: 'SUCCESS', response: 'done' } },
+			);
+			const tail = full.slice(40);
+			expect(tail).not.toContain('"event":"init"');
+			expect(parseAgentOutput('antigravity', tail).sessionId).toBe(
+				'd42f7419-1111-2222-3333-444455556666',
+			);
+		});
+
+		it('returns {} for the plain text an agy without --output-format prints', () => {
+			expect(parseAgentOutput('antigravity', 'Here is your answer.\nAll done.\n')).toEqual({});
+		});
+
+		it('skips malformed and truncated records without throwing', () => {
+			const stdout = [
+				'not json at all',
+				'{"event":"step_update","step_update":{"text_delta":"half',
+				JSON.stringify({ event: 'unknown_future_event', payload: {} }),
+				JSON.stringify({
+					event: 'result',
+					result: {
+						status: 'SUCCESS',
+						response: 'done',
+						usage: { input_tokens: 1, output_tokens: 2 },
+					},
+				}),
+			].join('\n');
+
+			expect(parseAgentOutput('antigravity', stdout)).toEqual({
+				usage: { inputTokens: 1, outputTokens: 2 },
+				logText: 'done',
+			});
 		});
 	});
 });

@@ -1,16 +1,27 @@
 /**
- * Antigravity session capture — the out-of-band half of "resume an `agy` run".
+ * Antigravity session capture — the **fallback** half of "resume an `agy` run".
+ *
+ * The primary source is the CLI's own output: `agy --output-format stream-json`
+ * prints a `conversation_id` in its opening event and repeats it on every
+ * record after ({@link ./antigravity-stream.ts}), and the harness prefers that
+ * ({@link ./agent-cli.ts}'s `resolveSessionId`). This module covers the two
+ * cases that stream can't:
+ *
+ *  1. **An `agy` predating `--output-format`** — 1.1.3 has no such flag, so the
+ *     harness's capability probe ({@link ./antigravity-capabilities.ts}) drops
+ *     it and the run prints plain text with no id in it.
+ *  2. **A run killed before its opening event was captured** — precisely the
+ *     rate-limited and timed-out runs that resume exists for.
  *
  * Unlike `claude` (which lets SWARM *assign* a session UUID via `--session-id`)
- * and `codex` (which emits its `thread_id` on stdout as a `thread.started`
- * event), `agy --print` neither accepts an id to assign nor prints the
- * conversation id anywhere — its stdout is just the answer, and the conversation
- * `.db` it writes doesn't embed the working directory (both verified live). So
- * the only way to learn the id a run created is to watch its on-disk
- * conversation store: snapshot the set of conversation files *before* the run,
- * then diff *after* it, and the new file's basename is this run's conversation
- * id — the value `agy --conversation <id>` takes to resume it (ai/RULES.md §6:
- * each CLI's resume mechanism differs; the harness owns these quirks).
+ * `agy` has no assign-upfront flag at all, so a fresh run's id can only ever be
+ * learned after the fact. When stdout carries none, the remaining route is its
+ * on-disk conversation store: snapshot the set of conversation files *before*
+ * the run, then diff *after* it, and the new file's basename is this run's
+ * conversation id — the value `agy --conversation <id>` takes to resume it
+ * (ai/RULES.md §6: each CLI's resume mechanism differs; the harness owns these
+ * quirks). The conversation `.db` doesn't embed the working directory (verified
+ * live), so the diff is the only handle on "which one was mine".
  *
  * This is best-effort: if the store is missing, unreadable, or the diff is
  * ambiguous, capture returns `undefined` and the run simply isn't resumable —

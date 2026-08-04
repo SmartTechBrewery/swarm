@@ -5,14 +5,23 @@
  * type is inferred from it.
  *
  * Usage extraction is per-CLI (each CLI reports its own output shape, if any
- * — ai/RULES.md §6 "don't assume identical flag/output semantics"). Only
- * `claude` and `codex` are implemented here. Antigravity cannot emit
- * structured usage, so it intentionally returns the graceful "usage
- * unavailable" result.
+ * — ai/RULES.md §6 "don't assume identical flag/output semantics"). All three
+ * CLIs are implemented here: `claude` and `antigravity` each report a terminal
+ * record on their own `--output-format stream-json` stream, and `codex` reports
+ * a `turn.completed` event on its `--json` stream. Their shapes have nothing in
+ * common beyond being NDJSON, so each gets its own decoder module.
  */
 
 import { z } from 'zod';
 import type { AgentCli } from './agent-cli.js';
+import {
+	antigravityErrorDetail,
+	antigravityUsageFields,
+	findAntigravityConversationId,
+	findAntigravityResultEvent,
+	formatAntigravityResultError,
+	isAntigravityErrorResult,
+} from './antigravity-stream.js';
 import {
 	errorDetail,
 	findClaudeResultEvent,
@@ -93,9 +102,11 @@ export interface ParsedAgentOutput {
 	logText?: string;
 	/**
 	 * The CLI session/thread id recovered from this run's output, to resume it
-	 * later. Only `claude` (`session_id`) and `codex` (`thread.started`) emit one
-	 * on stdout; Antigravity does not (it's captured out-of-band — see
-	 * `./antigravity-session.ts`), so this is absent for it.
+	 * later. All three CLIs report one on stdout when running structured:
+	 * `claude`'s `session_id`, `codex`'s `thread.started`, and Antigravity's
+	 * `conversation_id`. Absent when the stream carried none — an `agy` too old
+	 * for `--output-format`, malformed output, or a run killed before it got
+	 * that far (`./antigravity-session.ts` is the fallback for those).
 	 */
 	sessionId?: string;
 	/**
@@ -104,6 +115,17 @@ export interface ParsedAgentOutput {
 	 */
 	claudeFailure?: {
 		subtype?: string;
+		message?: string;
+	};
+	/**
+	 * For Antigravity: the same signal from its own terminal `result` event — a
+	 * `status` other than `SUCCESS`. Kept as a separate field rather than merged
+	 * with {@link claudeFailure} because the two CLIs' failure vocabularies
+	 * differ (a `subtype` versus a `status`) and classification trusts different
+	 * tokens in each.
+	 */
+	antigravityFailure?: {
+		status?: string;
 		message?: string;
 	};
 }
@@ -160,6 +182,47 @@ function parseClaudeOutput(stdout: string): ParsedAgentOutput {
 	return { usage: usage.data, ...base };
 }
 
+/**
+ * Parse `agy --output-format stream-json`'s stdout: newline-delimited events
+ * whose terminal `result` record carries the run's final text, conversation id,
+ * status, and aggregate usage ({@link ./antigravity-stream.ts}).
+ *
+ * The conversation id is read separately from the result, because the two can
+ * disagree: a *failed* run reports `conversation_id: ""` in its result while
+ * the `init` event that opened the stream still names the real one.
+ *
+ * An `agy` predating `--output-format` prints plain text, which yields no
+ * parseable events and so returns `{}` — the same graceful "usage unavailable"
+ * result this path returned before, now reached by reading the output's shape
+ * instead of by assuming the CLI can't produce one. Never throws: a parse miss
+ * must never turn a successful agent run into a failed one.
+ */
+function parseAntigravityOutput(stdout: string): ParsedAgentOutput {
+	const sessionId = findAntigravityConversationId(stdout);
+	const result = findAntigravityResultEvent(stdout);
+	if (!result) return sessionId === undefined ? {} : { sessionId };
+
+	const isError = isAntigravityErrorResult(result);
+	const logText = isError
+		? formatAntigravityResultError(result)
+		: result.response?.trim()
+			? result.response
+			: undefined;
+	const base: ParsedAgentOutput = {
+		...(logText === undefined ? {} : { logText }),
+		...(sessionId === undefined ? {} : { sessionId }),
+		...(isError
+			? { antigravityFailure: { status: result.status, message: antigravityErrorDetail(result) } }
+			: {}),
+	};
+	if (!result.usage) return base;
+
+	const usage = AgentUsageSchema.safeParse(antigravityUsageFields(result.usage));
+	if (!usage.success) return base;
+
+	return { usage: usage.data, ...base };
+}
+
 /** Parse the JSONL event stream emitted by `codex exec --json`. */
 function parseCodexOutput(stdout: string): ParsedAgentOutput {
 	const { rawUsage, messages, sessionId } = collectCodexEvents(stdout);
@@ -192,9 +255,7 @@ export function parseAgentOutput(cli: AgentCli, stdout: string): ParsedAgentOutp
 		case 'claude':
 			return parseClaudeOutput(stdout);
 		case 'antigravity':
-			// agy has no structured/usage output flag (verified live, ai/RULES.md §6),
-			// so usage is unavailable by design.
-			return {};
+			return parseAntigravityOutput(stdout);
 		case 'codex':
 			return parseCodexOutput(stdout);
 	}

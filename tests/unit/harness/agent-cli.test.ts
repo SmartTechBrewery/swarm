@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock the subprocess boundary — unit tests never spawn a real CLI
@@ -7,6 +10,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const spawnMock = vi.fn();
 vi.mock('node:child_process', () => ({
 	spawn: (...args: unknown[]) => spawnMock(...args),
+}));
+
+// The `agy --help` capability probe (issue #465) is mocked at the module rather
+// than the process boundary: the real module calls `promisify(execFile)` at load
+// time, which the `node:child_process` mock above doesn't provide. Its own
+// behavior is covered in antigravity-capabilities.test.ts.
+const supportsOutputFormatMock = vi.fn<() => Promise<boolean>>();
+vi.mock('@/harness/antigravity-capabilities.js', () => ({
+	supportsOutputFormat: () => supportsOutputFormatMock(),
 }));
 
 import { type AgentCliResult, describeAgent, runAgentCli } from '@/harness/agent-cli.js';
@@ -30,6 +42,38 @@ const lastChild = (): FakeChild => {
 	if (!child) throw new Error('spawn was not called');
 	return child;
 };
+
+/**
+ * The child of the `index`-th spawn (0-based, matching `spawnMock.mock.calls`),
+ * awaited — antigravity resolves its capability probe before spawning, so its
+ * child exists a microtask later rather than synchronously. Only the agy path is
+ * asynchronous; claude/codex tests keep calling `lastChild()` directly, which is
+ * the assertion that the probe's `await` didn't leak onto their path.
+ */
+const spawnedChild = async (index: number): Promise<FakeChild> => {
+	await vi.waitFor(() => expect(children.length).toBeGreaterThan(index));
+	const child = children[index];
+	if (!child) throw new Error(`spawn #${index} did not happen`);
+	return child;
+};
+
+/** One chunk of `agy --output-format stream-json` NDJSON. */
+const agyStream = (...events: unknown[]): string =>
+	`${events.map((event) => JSON.stringify(event)).join('\n')}\n`;
+
+const agyInit = (conversationId: string) => ({
+	event: 'init',
+	conversation_id: conversationId,
+	init: { cwd: '/scratch', tools: ['view_file'], permission_mode: 'request-review' },
+});
+const agyTextDelta = (stepIndex: number, textDelta: string, state = 'ACTIVE') => ({
+	event: 'step_update',
+	step_update: { step_index: stepIndex, state, step_type: 'agent_response', text_delta: textDelta },
+});
+const agyResult = (fields: Record<string, unknown>) => ({
+	event: 'result',
+	result: { status: 'SUCCESS', ...fields },
+});
 
 /** One chunk of `claude -p --output-format stream-json` NDJSON. */
 const claudeStream = (...events: unknown[]): string =>
@@ -69,6 +113,10 @@ function track(promise: Promise<unknown>): { settled: boolean } {
 
 beforeEach(() => {
 	children = [];
+	// Default to an `agy` that supports --output-format; the older-binary path is
+	// exercised explicitly by the tests that override this.
+	supportsOutputFormatMock.mockReset();
+	supportsOutputFormatMock.mockResolvedValue(true);
 	spawnMock.mockReset();
 	spawnMock.mockImplementation(() => {
 		const child = new FakeChild();
@@ -211,12 +259,14 @@ describe('runAgentCli', () => {
 				args: ['continue'],
 			}),
 		);
-		lastChild().emit('close', 0, null);
+		(await spawnedChild(0)).emit('close', 0, null);
 		await resumed;
 		expect(spawnMock.mock.calls[0][1]).toEqual([
 			'--dangerously-skip-permissions',
 			'--add-dir',
 			'/wt',
+			'--output-format',
+			'stream-json',
 			'--conversation',
 			'08bbd753-411b-4797-a252-9b49087b26e5',
 			'-p',
@@ -224,16 +274,22 @@ describe('runAgentCli', () => {
 		]);
 	});
 
-	it('requests each supported structured output while leaving antigravity plain', async () => {
+	it('requests each CLI its own structured output format', async () => {
 		const claude = runAgentCli(createMockRunAgentCliOptions());
 		lastChild().emit('close', 0, null);
 		await claude;
-		expect(spawnMock.mock.calls[0][1]).toContain('--output-format');
+		expect(spawnMock.mock.calls[0][1]).toEqual(
+			expect.arrayContaining(['--output-format', 'stream-json', '--verbose']),
+		);
 
 		const agy = runAgentCli(createMockRunAgentCliOptions({ cli: 'antigravity' }));
-		lastChild().emit('close', 0, null);
+		(await spawnedChild(1)).emit('close', 0, null);
 		await agy;
-		expect(spawnMock.mock.calls[1][1]).not.toContain('--output-format');
+		expect(spawnMock.mock.calls[1][1]).toEqual(
+			expect.arrayContaining(['--output-format', 'stream-json']),
+		);
+		// --verbose is claude's requirement alone; agy takes no such flag.
+		expect(spawnMock.mock.calls[1][1]).not.toContain('--verbose');
 		expect(spawnMock.mock.calls[1][1]).not.toContain('--json');
 
 		const codex = runAgentCli(createMockRunAgentCliOptions({ cli: 'codex' }));
@@ -241,6 +297,35 @@ describe('runAgentCli', () => {
 		await codex;
 		expect(spawnMock.mock.calls[2][1]).toContain('--json');
 		expect(spawnMock.mock.calls[2][1]?.[0]).toBe('exec');
+	});
+
+	it('omits --output-format entirely for an agy that does not advertise it', async () => {
+		// agy 1.1.3 has no such flag, so passing it unconditionally would hand an
+		// unknown flag to that binary (issue #465). The args must be byte-for-byte
+		// what SWARM sent before the flag existed.
+		supportsOutputFormatMock.mockResolvedValue(false);
+		const agy = runAgentCli(
+			createMockRunAgentCliOptions({ cli: 'antigravity', args: ['do the thing'] }),
+		);
+		const child = await spawnedChild(0);
+		child.stdout.emit('data', 'plain text answer\n');
+		child.emit('close', 0, null);
+
+		const result = await agy;
+		expect(spawnMock.mock.calls[0][1]).toEqual([
+			'--dangerously-skip-permissions',
+			'--add-dir',
+			'/wt',
+			'-p',
+			'do the thing',
+		]);
+		// And the pre-#465 behavior all the way through: raw stdout as the log, no
+		// usage, no structural verdict.
+		expect(result).toMatchObject<Partial<AgentCliResult>>({
+			stdout: 'plain text answer\n',
+			usage: undefined,
+		});
+		expect(result.antigravityFailure).toBeUndefined();
 	});
 
 	it('spawns the agy binary for antigravity, with -p immediately before the prompt too', async () => {
@@ -251,12 +336,20 @@ describe('runAgentCli', () => {
 		const promise = runAgentCli(
 			createMockRunAgentCliOptions({ cli: 'antigravity', args: ['do the thing'] }),
 		);
-		lastChild().emit('close', 0, null);
+		(await spawnedChild(0)).emit('close', 0, null);
 		await promise;
 
 		expect(spawnMock).toHaveBeenCalledWith(
 			'agy',
-			['--dangerously-skip-permissions', '--add-dir', '/wt', '-p', 'do the thing'],
+			[
+				'--dangerously-skip-permissions',
+				'--add-dir',
+				'/wt',
+				'--output-format',
+				'stream-json',
+				'-p',
+				'do the thing',
+			],
 			expect.anything(),
 		);
 	});
@@ -273,7 +366,7 @@ describe('runAgentCli', () => {
 				args: ['do the thing'],
 			}),
 		);
-		lastChild().emit('close', 0, null);
+		(await spawnedChild(0)).emit('close', 0, null);
 		await agy;
 		const agyArgs = spawnMock.mock.calls[0][1] as string[];
 		expect(agyArgs).toContain('--add-dir');
@@ -429,7 +522,7 @@ describe('runAgentCli', () => {
 				args: ['implement the thing'],
 			}),
 		);
-		lastChild().emit('close', 0, null);
+		(await spawnedChild(0)).emit('close', 0, null);
 		await promise;
 
 		const args = spawnMock.mock.calls[0][1] as string[];
@@ -449,7 +542,7 @@ describe('runAgentCli', () => {
 				onStderr: (line) => stderrLines.push(line),
 			}),
 		);
-		const child = lastChild();
+		const child = await spawnedChild(0);
 		// Split mid-line across chunks; the buffer should stitch it back together.
 		child.stdout.emit('data', 'first\r\nseco');
 		child.stdout.emit('data', 'nd\nno-newline-yet');
@@ -766,6 +859,245 @@ describe('runAgentCli', () => {
 				'Claude run failed (error_during_execution): API Error: 429 rate_limit_error',
 			);
 			expect(classifyAgentFailure(result).kind).toBe('rate-limit');
+		});
+	});
+
+	describe('antigravity stream decoding (issue #465)', () => {
+		/** Start an agy run and hand back its promise plus the spawned child. */
+		const startAgyRun = async (
+			options: Partial<Parameters<typeof createMockRunAgentCliOptions>[0]> = {},
+		) => {
+			const lines: string[] = [];
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({
+					cli: 'antigravity',
+					onStdout: (line) => lines.push(line),
+					...options,
+				}),
+			);
+			return { promise, child: await spawnedChild(0), lines };
+		};
+
+		it('populates the live log while the run is still in flight (the #356 guard)', async () => {
+			// The regression this protects against is "log empty until the process
+			// exits" — the reason claude moved off `--output-format json`. agy's
+			// `json` format has the same problem, so the harness must decode
+			// stream-json progress as it arrives, not at close.
+			const { promise, child, lines } = await startAgyRun();
+			const settledState = track(promise);
+
+			child.stdout.emit(
+				'data',
+				agyStream(
+					agyInit('d42f7419-1111-2222-3333-444455556666'),
+					agyTextDelta(2, 'Reading the '),
+					agyTextDelta(2, 'source files.\n'),
+				),
+			);
+
+			// The decoded line is already out, and the run has NOT finished.
+			expect(lines).toEqual(['Reading the source files.']);
+			expect(settledState.settled).toBe(false);
+
+			child.emit('close', 0, null);
+			await promise;
+		});
+
+		it('coalesces deltas into whole lines instead of one event per fragment', async () => {
+			const { promise, child, lines } = await startAgyRun();
+			// Six deltas that together make two lines — a per-delta forward would
+			// write six `run_output_events` rows for what a reader sees as two.
+			child.stdout.emit(
+				'data',
+				agyStream(
+					agyTextDelta(2, 'The '),
+					agyTextDelta(2, 'first'),
+					agyTextDelta(2, ' line.\nThe '),
+					agyTextDelta(2, 'second'),
+					agyTextDelta(2, ' line.'),
+					agyTextDelta(2, '', 'DONE'),
+				),
+			);
+			child.emit('close', 0, null);
+			await promise;
+
+			// The unterminated remainder still lands, flushed by the DONE step.
+			expect(lines).toEqual(['The first line.', 'The second line.']);
+		});
+
+		it('reports tool activity by name only, never its parameters or output', async () => {
+			// `tool_info` was observed live carrying file paths and command output —
+			// the payload class that must not reach the run page.
+			const { promise, child, lines } = await startAgyRun();
+			child.stdout.emit(
+				'data',
+				agyStream(
+					{
+						event: 'step_update',
+						step_update: {
+							step_index: 3,
+							state: 'ACTIVE',
+							step_type: 'tool',
+							tool_name: 'view_file',
+							tool_info: { parameters: { AbsolutePath: '/secret/path.env' } },
+						},
+					},
+					{
+						event: 'step_update',
+						step_update: {
+							step_index: 3,
+							state: 'DONE',
+							step_type: 'tool',
+							tool_name: 'view_file',
+							tool_info: { output: 'API_KEY=hunter2' },
+						},
+					},
+				),
+			);
+			child.emit('close', 0, null);
+			await promise;
+
+			expect(lines).toEqual(['Tool started: view_file', 'Tool completed: view_file']);
+			expect(lines.join('\n')).not.toContain('hunter2');
+			expect(lines.join('\n')).not.toContain('/secret/path.env');
+		});
+
+		it('extracts usage, the conversation id, and the final text from the terminal result', async () => {
+			const { promise, child, lines } = await startAgyRun();
+			child.stdout.emit(
+				'data',
+				agyStream(
+					agyInit('d42f7419-1111-2222-3333-444455556666'),
+					agyTextDelta(2, 'STREAM_OK\n', 'DONE'),
+					agyResult({
+						conversation_id: 'd42f7419-1111-2222-3333-444455556666',
+						response: 'STREAM_OK\n',
+						usage: {
+							input_tokens: 18267,
+							output_tokens: 28,
+							thinking_tokens: 22,
+							cache_read_tokens: 0,
+							total_tokens: 18295,
+						},
+					}),
+				),
+			);
+			child.emit('close', 0, null);
+			const result = await promise;
+
+			expect(result.usage).toEqual({
+				inputTokens: 18267,
+				outputTokens: 28,
+				reasoningTokens: 22,
+				cacheReadTokens: 0,
+				totalTokens: 18295,
+			});
+			expect(result.sessionId).toBe('d42f7419-1111-2222-3333-444455556666');
+			// The stored log is the readable answer, never the NDJSON protocol.
+			expect(result.stdout).toBe('STREAM_OK\n');
+			// …and the terminal response isn't echoed a second time after its deltas.
+			expect(lines).toEqual(['STREAM_OK']);
+		});
+
+		it('surfaces a non-SUCCESS status as a structural failure, not just an exit code', async () => {
+			// Verified live against agy 1.1.10 with a bogus --model: status ERROR,
+			// detail in `error`, empty `response`, empty `conversation_id`, exit 1.
+			const { promise, child, lines } = await startAgyRun();
+			child.stdout.emit(
+				'data',
+				agyStream(agyInit('ef894758-aaaa-bbbb-cccc-ddddeeeeffff'), {
+					event: 'result',
+					result: {
+						conversation_id: '',
+						status: 'ERROR',
+						response: '',
+						error: 'invalid model selection (--model "nope"): model nope is not recognized',
+						usage: { input_tokens: 0, output_tokens: 0 },
+					},
+				}),
+			);
+			child.emit('close', 1, null);
+			const result = await promise;
+
+			expect(result.antigravityFailure).toEqual({
+				status: 'ERROR',
+				message: 'invalid model selection (--model "nope"): model nope is not recognized',
+			});
+			// The reason reaches the live log as it happens, not only the result.
+			expect(lines.at(-1)).toContain('Antigravity run failed (ERROR)');
+			expect(result.stdout).toContain('invalid model selection');
+			// The empty conversation_id in the result must not become the session
+			// handle — the init event's real id does.
+			expect(result.sessionId).toBe('ef894758-aaaa-bbbb-cccc-ddddeeeeffff');
+		});
+
+		it('classifies a structural quota failure as a rate limit with no reset hint', async () => {
+			const { promise, child } = await startAgyRun();
+			child.stdout.emit(
+				'data',
+				agyStream({
+					event: 'result',
+					result: { status: 'ERROR', error: 'RESOURCE_EXHAUSTED: quota exceeded for model' },
+				}),
+			);
+			child.emit('close', 1, null);
+			const result = await promise;
+
+			expect(classifyAgentFailure(result).kind).toBe('rate-limit');
+		});
+
+		it('falls back to the conversation store when the stream carried no id', async () => {
+			// A run killed before its `init` event reached us — precisely the
+			// rate-limited/timed-out runs resume exists for.
+			const dir = mkdtempSync(path.join(tmpdir(), 'agy-conversations-'));
+			const previous = process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR;
+			process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR = dir;
+			try {
+				const { promise, child } = await startAgyRun();
+				writeFileSync(path.join(dir, 'aaaaaaaa-1111-2222-3333-444444444444.db'), '');
+				child.emit('close', 143, null);
+				const result = await promise;
+
+				expect(result.sessionId).toBe('aaaaaaaa-1111-2222-3333-444444444444');
+			} finally {
+				if (previous === undefined) delete process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR;
+				else process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR = previous;
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it('keeps the id it resumed with rather than re-reading the stream', async () => {
+			const { promise, child } = await startAgyRun({
+				resumeSessionId: '08bbd753-411b-4797-a252-9b49087b26e5',
+				args: ['continue'],
+			});
+			child.stdout.emit(
+				'data',
+				agyStream(agyResult({ conversation_id: '08bbd753-411b-4797-a252-9b49087b26e5' })),
+			);
+			child.emit('close', 0, null);
+			const result = await promise;
+
+			expect(result.sessionId).toBe('08bbd753-411b-4797-a252-9b49087b26e5');
+			// --conversation stays before -p, which stays immediately before the prompt.
+			expect((spawnMock.mock.calls[0][1] as string[]).slice(-4)).toEqual([
+				'--conversation',
+				'08bbd753-411b-4797-a252-9b49087b26e5',
+				'-p',
+				'continue',
+			]);
+		});
+
+		it('passes out-of-protocol plain text through, keeping the stall signal readable', async () => {
+			// `timeout waiting for response` is load-bearing: failure classification
+			// keys its `stalled` verdict off that exact trailing line.
+			const { promise, child, lines } = await startAgyRun();
+			child.stdout.emit('data', 'timeout waiting for response\n');
+			child.emit('close', 1, null);
+			const result = await promise;
+
+			expect(lines).toEqual(['timeout waiting for response']);
+			expect(classifyAgentFailure(result).kind).toBe('stalled');
 		});
 	});
 
