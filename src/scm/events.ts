@@ -29,7 +29,7 @@ import type { ScmType } from './types.js';
  * type so the two can't drift: adding a provider to one without the other stops
  * type-checking.
  */
-export const ScmProviderIdSchema: z.ZodType<ScmType> = z.enum(['github']);
+export const ScmProviderIdSchema: z.ZodType<ScmType> = z.enum(['github', 'bitbucket']);
 
 /**
  * The inbound event kinds SWARM acts on, named for the domain concept rather

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 // file, so this registration is independent of registry.test.ts's resets.
 import '@/integrations/entrypoint.js';
 import { githubScmManifest } from '@/integrations/scm/github/index.js';
+import { isRuntimeReadySCMProvider } from '@/integrations/scm/manifest.js';
 import { getSCMProvider, listSCMProviders } from '@/integrations/scm/registry.js';
 
 describe('github SCM manifest registration', () => {
@@ -11,16 +12,22 @@ describe('github SCM manifest registration', () => {
 		expect(getSCMProvider('github')).toBe(githubScmManifest);
 	});
 
-	it('registers exactly once (the entrypoint has one SCM provider today)', () => {
-		expect(listSCMProviders().map((m) => m.id)).toEqual(['github']);
+	it('registers exactly once, and is the only runtime-ready SCM provider', () => {
+		const registered = listSCMProviders();
+		expect(registered.filter((m) => m.id === 'github')).toHaveLength(1);
+		// Bitbucket registers too (issue #296) but opts out of runtime traffic until
+		// its contract is complete, so GitHub is still the provider every
+		// project-scoped call site resolves.
+		expect(registered.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual(['github']);
 	});
 
-	it('declares the expected identity', () => {
+	it('declares the expected identity, and claims runtime readiness by omission', () => {
 		expect(githubScmManifest).toMatchObject({
 			id: 'github',
 			label: 'GitHub',
 			category: 'scm',
 		});
+		expect(isRuntimeReadySCMProvider(githubScmManifest)).toBe(true);
 	});
 
 	it('exposes a provider that satisfies the SCMProvider contract without naming the class', () => {

@@ -11,8 +11,10 @@
  * fixes as the implementer without either token ever appearing in a signature
  * (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * The `implements SCMProvider` declaration below *is* the conformance check —
- * with one provider, a runtime conformance harness would be speculative
+ * The `implements SCMProvider` declaration below *is* the conformance check — a
+ * runtime harness stays deferred while the second provider
+ * (`../bitbucket/scm-integration.ts`) still throws for the half of the contract
+ * it hasn't built, since it would only assert those throws exist
  * (ai/TESTING.md "Provider conformance"). Everything GitHub-specific — Octokit
  * types, GraphQL node IDs, which REST status means which merge outcome — stays
  * inside this module, `./client.js`, and `./webhook.js` (which owns every raw

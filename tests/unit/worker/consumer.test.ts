@@ -3613,9 +3613,17 @@ describe('reportInterruptedJobToBoard', () => {
 	// pick between them, while the id lookup is unambiguous.
 	it('resolves the commenting provider from the job’s providerId', async () => {
 		const github = getSCMProvider('github');
-		// Asserted, not cast: if the entrypoint ever stops registering GitHub, fail
+		const bitbucket = getSCMProvider('bitbucket');
+		// Asserted, not cast: if the entrypoint ever stops registering these, fail
 		// here rather than in the restore below with an opaque TypeError.
 		expect(github).not.toBeNull();
+		expect(bitbucket).not.toBeNull();
+		// The entrypoint's own Bitbucket manifest is deliberately *not* runtime-ready
+		// (issue #296), so the project-scoped lookup would still resolve GitHub and
+		// prove nothing. Swap in a runtime-ready stand-in: two providers competing for
+		// that lookup is what makes the id lookup's answer meaningful.
+		_resetSCMProviderRegistryForTesting();
+		if (github) registerSCMProvider(github);
 		registerSCMProvider({
 			id: 'bitbucket',
 			label: 'Bitbucket',
@@ -3629,9 +3637,10 @@ describe('reportInterruptedJobToBoard', () => {
 			expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
 		} finally {
 			// The registry is a process singleton with no unregister; restore the
-			// entrypoint's own registration so later cases see one provider again.
+			// entrypoint's own registrations so later cases see the real pair again.
 			_resetSCMProviderRegistryForTesting();
 			if (github) registerSCMProvider(github);
+			if (bitbucket) registerSCMProvider(bitbucket);
 		}
 	});
 
