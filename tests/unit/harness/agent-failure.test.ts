@@ -386,6 +386,101 @@ describe('classifyAgentFailure', () => {
 		});
 	});
 
+	// agy's terminal `result` event reports its own `status`; a non-SUCCESS one is
+	// a structural signal (issue #465), so a quota token inside it is trusted
+	// without the "resets …" co-occurrence free text needs.
+	it('classifies a structural Antigravity quota failure as rate-limit with no reset hint', () => {
+		for (const message of [
+			'RESOURCE_EXHAUSTED: quota exceeded for model gemini-3.5-flash',
+			'API error 429: too many requests',
+			'rate_limit_exceeded for this project',
+		]) {
+			const failure = classifyAgentFailure(
+				result({
+					cli: 'antigravity',
+					stdout: `Antigravity run failed (ERROR): ${message}`,
+					antigravityFailure: { status: 'ERROR', message },
+				}),
+				NOW,
+			);
+			expect(failure.kind).toBe('rate-limit');
+			expect(failure.retryAfter).toBeUndefined();
+		}
+	});
+
+	it('leaves an ordinary structural Antigravity failure a plain error', () => {
+		// The live shape from a bogus --model: a real structural failure carrying no
+		// quota signal must stay terminal, not defer the job waiting for a reset.
+		const failure = classifyAgentFailure(
+			result({
+				cli: 'antigravity',
+				stdout:
+					'Antigravity run failed (ERROR): invalid model selection (--model "nope"): model nope is not recognized',
+				antigravityFailure: {
+					status: 'ERROR',
+					message: 'invalid model selection (--model "nope"): model nope is not recognized',
+				},
+			}),
+			NOW,
+		);
+		expect(failure).toEqual({ kind: 'error' });
+	});
+
+	it('does not read a 429 an agy run merely mentioned as a structural rate limit', () => {
+		// Without the structural field there is no CLI verdict, only transcript text
+		// — an agent that reviewed HTTP 429 handling must not defer its own job.
+		const failure = classifyAgentFailure(
+			result({
+				cli: 'antigravity',
+				stdout: 'Tool completed: view_file\nAdded a test for the HTTP 429 path.',
+			}),
+			NOW,
+		);
+		expect(failure.kind).toBe('error');
+	});
+
+	it('keeps timeout and abort ahead of a structural Antigravity rate limit', () => {
+		const stdout = 'Antigravity run failed (ERROR): RESOURCE_EXHAUSTED';
+		const antigravityFailure = { status: 'ERROR', message: 'RESOURCE_EXHAUSTED' };
+		expect(
+			classifyAgentFailure(
+				result({ cli: 'antigravity', stdout, antigravityFailure, timedOut: true }),
+				NOW,
+			),
+		).toEqual({ kind: 'timeout' });
+		expect(
+			classifyAgentFailure(
+				result({ cli: 'antigravity', stdout, antigravityFailure, aborted: true }),
+				NOW,
+			),
+		).toEqual({ kind: 'aborted' });
+	});
+
+	it('does not let one CLI structural failure fire on another CLI', () => {
+		// Each structural matcher is gated on its own `cli`, so a claude run can't
+		// be classified by an antigravity field and vice versa.
+		expect(
+			classifyAgentFailure(
+				result({
+					cli: 'claude',
+					stdout: 'something went wrong',
+					antigravityFailure: { status: 'ERROR', message: 'RESOURCE_EXHAUSTED' },
+				}),
+				NOW,
+			).kind,
+		).toBe('error');
+		expect(
+			classifyAgentFailure(
+				result({
+					cli: 'antigravity',
+					stdout: 'something went wrong',
+					claudeFailure: { subtype: 'error', message: 'API Error: 429 rate_limit_error' },
+				}),
+				NOW,
+			).kind,
+		).toBe('error');
+	});
+
 	it('does not classify a bare 529 with no "overloaded" as Claude capacity', () => {
 		// The issue forbids a bare-status-code matcher: reviewed code, tool output,
 		// or a quoted HTTP number can mention 529 innocuously. Only 529 paired with

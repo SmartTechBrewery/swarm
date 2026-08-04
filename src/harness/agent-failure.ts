@@ -102,6 +102,15 @@ const CLAUDE_CAPACITY_RE = /\b529\s+overloaded\b|\boverloaded_error\b/i;
 // as failed — so a 429/`rate_limit_error` inside it is trusted on its own,
 // without the "resets …" co-occurrence the softer free-text signals need.
 const CLAUDE_RATE_LIMIT_ERROR_RE = /\b429\b|\brate_limit_error\b/i;
+// agy's terminal `result` event reports its own `status`, rendered as a single
+// `Antigravity run failed (…)` line ({@link ./antigravity-stream.ts}). Like
+// Claude's, that line is structural — it exists only because the CLI itself
+// reported the run as failed — so a quota signal inside it is trusted without
+// the "resets …" co-occurrence free text needs. agy's exact quota wording is
+// *unverified* (only `status:"ERROR"` from a bad `--model` was observed live),
+// so the token set stays narrow and structural-only: a miss degrades to
+// `error`, a terminal failure, never to a false rate-limit defer.
+const ANTIGRAVITY_RATE_LIMIT_ERROR_RE = /\b429\b|\brate_limit\w*\b|\bresource_exhausted\b/i;
 // Unstructured provider errors are terminal output; borrowed task/code/CI text
 // lives earlier in the transcript. Fifteen non-empty lines comfortably contain
 // real banners while keeping those unrelated body matches out of classification.
@@ -250,9 +259,10 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
  * structured `error` / `turn.failed` events anywhere in its output, or its
  * terminal `selected model is at capacity` banner; and Claude's terminal
  * `529 Overloaded` / `overloaded_error` banner. A recognisable terminal limit
- * banner is a `rate-limit` — as is a 429 reported by Claude's own terminal
- * failure line, which needs no reset hint to be trusted — and everything else
- * is a plain `error`.
+ * banner is a `rate-limit` — as is a quota signal reported by a CLI's own
+ * structural terminal failure record (Claude's failed `result` event, or
+ * Antigravity's non-`SUCCESS` `status`), which needs no reset hint to be
+ * trusted — and everything else is a plain `error`.
  */
 export function classifyAgentFailure(result: AgentCliResult, now: Date = new Date()): AgentFailure {
 	if (result.timedOut) return { kind: 'timeout' };
@@ -274,10 +284,16 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 		result.claudeFailure !== undefined &&
 		(CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.subtype ?? '') ||
 			CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.message ?? ''));
+	const hasAntigravityRateLimit =
+		result.cli === 'antigravity' &&
+		result.antigravityFailure !== undefined &&
+		(ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.status ?? '') ||
+			ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.message ?? ''));
 	const resetMatch = RESET_RE.exec(tail);
 	const isRateLimited =
 		LIMIT_BANNER_RE.test(tail) ||
 		hasClaudeRateLimit ||
+		hasAntigravityRateLimit ||
 		((USAGE_LIMIT_RE.test(tail) || RATE_HTTP_RE.test(tail)) && resetMatch !== null);
 
 	if (isRateLimited) {

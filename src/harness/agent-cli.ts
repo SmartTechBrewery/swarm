@@ -17,7 +17,9 @@ import { spawn } from 'node:child_process';
 import { z } from 'zod';
 
 import { logger } from '@/lib/logger.js';
+import { supportsOutputFormat } from './antigravity-capabilities.js';
 import { detectNewConversationId, snapshotConversationIds } from './antigravity-session.js';
+import { createAntigravityStreamNormalizer } from './antigravity-stream.js';
 import { createClaudeStreamNormalizer, findClaudeRateLimitReset } from './claude-stream.js';
 import { type ReasoningLevel, resolveModelLaunch } from './models.js';
 import { type AgentUsage, parseAgentOutput } from './usage.js';
@@ -128,14 +130,22 @@ const PRINT_FLAG: Record<AgentCli, string> = {
  * usage — which `./usage.js` extracts unchanged.
  *
  * `codex exec --json` emits JSONL events; `./usage.js` extracts the final
- * `turn.completed` usage and readable agent-message text. Antigravity has no
- * structured-output or usage flag (verified via `agy --help` and a live run),
- * so it stays on the graceful-unavailable path. Its empty entry also preserves
- * the load-bearing `-p`-immediately-before-prompt order described above.
+ * `turn.completed` usage and readable agent-message text.
+ *
+ * `agy --output-format text|json|stream-json` exists too, as of some release at
+ * or before 1.1.10 (issue #465). SWARM asks for `stream-json` for the same
+ * reason it does for claude — `json` buffers until exit — but the two protocols
+ * only share the flag *name*: agy's events are `{"event":"step_update",…}`
+ * records streaming *deltas*, decoded by its own `./antigravity-stream.js`
+ * (ai/RULES.md §6). Notably it needs **no** `--verbose`; that is claude's
+ * requirement alone. Because agy 1.1.3 has no such flag, this entry is the only
+ * one gated at runtime: `runAgentCli` drops it when `./antigravity-capabilities.js`
+ * reports the installed binary doesn't advertise it, so an older worker keeps
+ * today's plain-text behavior instead of being handed an unknown flag.
  */
 const OUTPUT_FORMAT_ARGS: Record<AgentCli, string[]> = {
 	claude: ['--output-format', 'stream-json', '--verbose'],
-	antigravity: [],
+	antigravity: ['--output-format', 'stream-json'],
 	codex: ['--json'],
 };
 
@@ -282,19 +292,20 @@ export interface AgentCliResult {
 	 * The CLI session/thread id this run used, to `--resume` it later. Captured
 	 * per CLI: `claude` echoes it in its JSON output (and SWARM assigned it via
 	 * `--session-id`), `codex` emits it as its `thread.started` event, and
-	 * `antigravity` is recovered out-of-band by diffing its conversation store
-	 * ({@link ./antigravity-session.ts}). Absent when the CLI produced no
-	 * recoverable id — an unsupported/older CLI, malformed output, or a run that
-	 * never got far enough to create a session.
+	 * `antigravity` prints its `conversation_id` on its own stream — falling back
+	 * to a diff of its on-disk conversation store ({@link ./antigravity-session.ts})
+	 * when that stream is unavailable or was cut off. Absent when the CLI produced
+	 * no recoverable id — an unsupported/older CLI, malformed output, or a run
+	 * that never got far enough to create a session.
 	 */
 	sessionId?: string;
 	/**
 	 * Normalized token usage extracted from this run's stdout (`./usage.js`),
-	 * or `undefined` when the CLI/output didn't yield any — an unsupported CLI
-	 * (Antigravity cannot report it), malformed output, or a run that never
-	 * produced output at all. A truncated run (`outputTruncated`) can still
-	 * report usage: the trailing usage summary is recovered from the retained
-	 * tail of stdout, unless it too was cut off.
+	 * or `undefined` when the CLI/output didn't yield any — an `agy` too old for
+	 * `--output-format`, malformed output, or a run that never produced output at
+	 * all. A truncated run (`outputTruncated`) can still report usage: the
+	 * trailing usage summary is recovered from the retained tail of stdout,
+	 * unless it too was cut off.
 	 */
 	usage?: AgentUsage;
 	/**
@@ -310,6 +321,16 @@ export interface AgentCliResult {
 	 */
 	claudeFailure?: {
 		subtype?: string;
+		message?: string;
+	};
+	/**
+	 * For Antigravity: the equivalent signal from its terminal `result` event —
+	 * a `status` other than `SUCCESS` (observed: `ERROR`), with whatever detail
+	 * the event carried. Set only when the run streamed structured output, so
+	 * its absence means "no structural verdict", never "the run succeeded".
+	 */
+	antigravityFailure?: {
+		status?: string;
 		message?: string;
 	};
 }
@@ -492,25 +513,39 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	// leading flags — never between `-p` and the prompt, the one position that is
 	// load-bearing for agy (see DEFAULT_ARGS/PRINT_FLAG above).
 	const addDirArgs = cli === 'antigravity' ? ['--add-dir', options.cwd] : [];
+	// agy is the one CLI whose structured-output flag has to be asked for: 1.1.3
+	// has no `--output-format`, and passing it there would hand an unknown flag to
+	// the binary (issue #465). claude/codex are never probed, so their path stays
+	// synchronous through to `spawn`.
+	const outputFormatArgs =
+		cli === 'antigravity' && !(await supportsOutputFormat(command)) ? [] : OUTPUT_FORMAT_ARGS[cli];
+	// Empty only for an agy that didn't advertise the flag — that run prints plain
+	// text and keeps every pre-#465 behavior below.
+	const agyStreams = cli === 'antigravity' && outputFormatArgs.length > 0;
 	const args = [
 		...baseArgs,
 		...addDirArgs,
 		...modelArgs,
 		...launch.providerArgs,
 		...(options.providerArgs ?? []),
-		...OUTPUT_FORMAT_ARGS[cli],
+		...outputFormatArgs,
 		...sessionArgs,
 		...(printFlag ? [printFlag] : []),
 		...(options.args ?? []),
 	];
 	const start = Date.now();
 
-	// Antigravity neither assigns nor prints its conversation id, so capture it by
-	// diffing its on-disk conversation store around the run. Snapshot the "before"
-	// set here (synchronously, immediately before spawn) so the "after" diff in the
-	// close handler attributes only this run's new conversation. A resume run
-	// reuses the existing conversation and creates no new file — its id is
-	// `resumeId`, so we skip the snapshot entirely in that case.
+	// Antigravity has no flag to *assign* a conversation id, so a fresh run learns
+	// its own only after the fact. The stream's `conversation_id` is the primary
+	// source (see {@link resolveSessionId}); this snapshot backs the fallback for
+	// the two cases that stream can't cover — an `agy` predating
+	// `--output-format`, and a run killed before its opening event was captured
+	// (precisely the rate-limited/timed-out runs resume exists for). Taken
+	// synchronously immediately before spawn so the "after" diff in the close
+	// handler attributes only this run's new conversation; it is a cheap local
+	// `readdir`, so paying for it unconditionally is cheaper than being wrong. A
+	// resume run reuses the existing conversation and creates no new file — its id
+	// is `resumeId`, so we skip the snapshot entirely in that case.
 	const antigravityBefore =
 		cli === 'antigravity' && !resumeId ? snapshotConversationIds() : undefined;
 
@@ -526,12 +561,19 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 		// Retains the tail of stdout so a trailing usage summary survives even when
 		// the head-capped `stdout` buffer truncates (see {@link tailBuffer}).
 		const stdoutTail = tailBuffer(options.maxOutputBytes);
-		// Claude's stdout is NDJSON protocol, not text: it is decoded into readable
-		// lines as it streams (issue #356), kept separately from the raw capture
-		// above so the run's stored log never contains protocol records — and so a
-		// raw stream flooding its cap doesn't drag the far smaller readable
-		// transcript down with it.
-		const claudeStream = cli === 'claude' ? createClaudeStreamNormalizer() : undefined;
+		// A structured CLI's stdout is NDJSON protocol, not text: it is decoded into
+		// readable lines as it streams (issue #356), kept separately from the raw
+		// capture above so the run's stored log never contains protocol records —
+		// and so a raw stream flooding its cap doesn't drag the far smaller readable
+		// transcript down with it. Each protocol gets its own decoder: the flag name
+		// is shared but the event shapes are not (ai/RULES.md §6). Codex has no
+		// decoder — its readable text is extracted after the fact by `./usage.js`.
+		const streamNormalizer =
+			cli === 'claude'
+				? createClaudeStreamNormalizer()
+				: agyStreams
+					? createAntigravityStreamNormalizer()
+					: undefined;
 		const display = cappedBuffer(options.maxOutputBytes);
 		let timedOut = false;
 		let aborted = false;
@@ -541,8 +583,8 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 		let graceTimer: NodeJS.Timeout | undefined;
 
 		const forwardStdout = lineForwarder((raw) => {
-			for (const line of claudeStream ? claudeStream.translate(raw) : [raw]) {
-				if (claudeStream) display.add(`${line}\n`);
+			for (const line of streamNormalizer ? streamNormalizer.translate(raw) : [raw]) {
+				if (streamNormalizer) display.add(`${line}\n`);
 				if (options.logLines) logger.debug('agent stdout', { cli, line });
 				options.onStdout?.(line);
 			}
@@ -613,17 +655,18 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 			// dropped from `stdout.text` — but the rolling `stdoutTail` still holds
 			// it, so parse usage from the tail in that case (a big test suite exiting
 			// 0 would otherwise lose its usage). `stdoutTail.text` is the last
-			// `maxOutputBytes`, so it starts mid-line/mid-JSON; for codex/agy only
-			// usage is trusted from it and the log stays the (truncated) head text,
-			// while claude's log comes from the decoder either way (see
-			// {@link resolveLogText}). A non-truncated run parses the full text.
+			// `maxOutputBytes`, so it starts mid-line/mid-JSON; for codex (and a
+			// plain-text agy) only usage is trusted from it and the log stays the
+			// (truncated) head text, while a decoded run's log comes from the
+			// normalizer either way (see {@link resolveLogText}). A non-truncated run
+			// parses the full text.
 			const captured = stdout.truncated ? stdoutTail.text : stdout.text;
 			const parsed = parseAgentOutput(cli, captured);
-			// Resolve the resumable session id per CLI. claude/codex emit it in
-			// their output (`parsed.sessionId`); claude also falls back to the id
-			// SWARM assigned/resumed with, in case an older build omits it.
-			// Antigravity has no output id, so diff its conversation store — or, on a
-			// resume run, keep the id we resumed with.
+			// Resolve the resumable session id per CLI. All three emit it in their
+			// output (`parsed.sessionId`) when running structured; claude also falls
+			// back to the id SWARM assigned/resumed with, in case an older build omits
+			// it, and antigravity falls back to its conversation-store diff — or, on a
+			// resume run, keeps the id we resumed with.
 			const sessionId = resolveSessionId(parsed.sessionId);
 			const result: AgentCliResult = {
 				cli,
@@ -635,15 +678,18 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 				durationMs: Date.now() - start,
 				timedOut,
 				aborted,
-				// Claude's visible log is the decoded transcript, so its truncation —
+				// A decoded run's visible log is the transcript, so its truncation —
 				// not the raw protocol stream's — is what a reader lost.
 				outputTruncated:
-					(cli === 'claude' ? display.truncated : stdout.truncated) || stderr.truncated,
+					(streamNormalizer ? display.truncated : stdout.truncated) || stderr.truncated,
 				usage: parsed.usage,
 				sessionId,
 				...(cli === 'claude' ? { rateLimitResetAt: findClaudeRateLimitReset(captured) } : {}),
 				...(cli === 'claude' && parsed.claudeFailure
 					? { claudeFailure: parsed.claudeFailure }
+					: {}),
+				...(cli === 'antigravity' && parsed.antigravityFailure
+					? { antigravityFailure: parsed.antigravityFailure }
 					: {}),
 			};
 			logger.debug('agent run finished', {
@@ -661,14 +707,15 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 		});
 
 		/**
-		 * The human-readable text to store as this run's log. Claude never falls
-		 * back to its raw stdout — that is NDJSON protocol — so it keeps the
+		 * The human-readable text to store as this run's log. A decoded run never
+		 * falls back to its raw stdout — that is NDJSON protocol — so it keeps the
 		 * decoded transcript when the terminal record carried no final text (a
-		 * killed or errored run). The other CLIs keep today's behavior: a
-		 * truncated head stays the log, since their tail-parsed text is partial.
+		 * killed or errored run). Codex, and an `agy` too old to stream, keep
+		 * today's behavior: a truncated head stays the log, since their tail-parsed
+		 * text is partial.
 		 */
 		function resolveLogText(logText: string | undefined): string {
-			if (cli === 'claude') return logText ?? display.text;
+			if (streamNormalizer) return logText ?? display.text;
 			return stdout.truncated ? stdout.text : (logText ?? stdout.text);
 		}
 
@@ -677,7 +724,13 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 			if (cli === 'claude') return parsedSessionId ?? resumeId ?? options.sessionId;
 			if (cli === 'antigravity') {
 				if (resumeId) return resumeId;
-				return antigravityBefore ? detectNewConversationId(antigravityBefore) : undefined;
+				// The stream's own `conversation_id` first; the store diff only when it
+				// carried none — an `agy` predating `--output-format`, or a run killed
+				// before its opening event reached us.
+				return (
+					parsedSessionId ??
+					(antigravityBefore ? detectNewConversationId(antigravityBefore) : undefined)
+				);
 			}
 			// codex: `thread.started` re-emits the same id on resume, so the parsed
 			// value already reflects a resumed session; fall back to resumeId if the

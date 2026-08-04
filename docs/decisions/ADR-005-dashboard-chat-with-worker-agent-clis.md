@@ -51,6 +51,16 @@ continue a phase. That fixes the turn model (§Decision 1).
 
 ### 2. `agy` gained structured output; the code still says it hasn't
 
+> **Resolved by [#465](https://github.com/SmartTechBrewery/swarm/issues/465).** The
+> harness now passes `--output-format stream-json` (gated on an `agy --help`
+> capability probe, since 1.1.3 has no such flag) and reads usage, the
+> `conversation_id`, and the terminal `status` from it;
+> `src/harness/antigravity-session.ts` was demoted to the documented fallback.
+> The rest of this finding is left as the dated record that prompted it. One
+> correction learned while implementing: a *failed* run reports its detail in
+> `result.error`, not `response`, and reports `conversation_id` as the empty
+> string — so the id has to come from the `init` event, not the result.
+
 `OUTPUT_FORMAT_ARGS.antigravity` is `[]`, `parseAgentOutput` returns `{}` for
 antigravity, and comments in `src/harness/agent-cli.ts`, `src/harness/usage.ts`
 and `ai/RULES.md` §6 all state that `agy` has no structured-output or usage flag.
