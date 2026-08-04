@@ -74,7 +74,7 @@ import { agentRunError } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
-import { buildReviewPrompt } from '@/pipeline/prompts/review.js';
+import { buildReviewHandoffRepairPrompt, buildReviewPrompt } from '@/pipeline/prompts/review.js';
 import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
@@ -88,6 +88,7 @@ import {
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	hasDeliveryProgress,
+	type LegacyReviewHandoff,
 	LegacyReviewHandoffSchema,
 	loadDeliveryProgress,
 	ReviewHandoffSchema,
@@ -367,58 +368,226 @@ async function produceReviewAgentResult(
 	return { agent, isReReview, passOrdinal };
 }
 
+interface RepairReviewHandoffParams {
+	validationError: string;
+	isReReview: boolean;
+	cli: AgentCli;
+	model?: string;
+	reasoning?: ReasoningLevel;
+	/** The session to continue, so the repair pass still has the review in context. */
+	resumeSessionId?: string;
+	worktreePath: string;
+	taskId: string;
+	prNumber: string;
+	headSha: string;
+	agentToken: string;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	runAgent: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
+}
+
+/**
+ * Re-run the review agent once, in the same worktree, with nothing but the
+ * validator's complaint and the hand-off contract — see {@link
+ * readReviewSubmission} for why the failure is worth one pass rather than three
+ * whole reviews.
+ *
+ * It resumes the session the review just ran (`AgentCliResult.sessionId`, captured
+ * per CLI), so the agent still holds its own reasoning about the diff rather than
+ * re-deriving it. Where no id was recoverable the pass is still not wasted: the
+ * hand-off it must repair, and the checkout its evidence came from, are both
+ * still on disk.
+ *
+ * Never throws. A repair run that fails leaves the invalid hand-off in place, and
+ * the caller rethrows the original validation error — which names the actual
+ * defect, unlike whatever this pass may have gone wrong with.
+ */
+async function repairReviewHandoff(params: RepairReviewHandoffParams): Promise<void> {
+	const { cli, taskId, prNumber, headSha } = params;
+	try {
+		const agent = await params.runAgent({
+			cli,
+			model: params.model,
+			reasoning: params.reasoning,
+			resumeSessionId: params.resumeSessionId,
+			cwd: params.worktreePath,
+			args: [buildReviewHandoffRepairPrompt(params.validationError, params.isReReview)],
+			maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
+			logContext: { taskId, phase: 'review-handoff-repair', prNumber, headSha },
+			// Its own budget: the harness has no notion of a phase's remaining time,
+			// and a repair pass is short next to the review it follows.
+			timeoutMs: params.timeoutMs,
+			signal: params.signal,
+			env: { GH_TOKEN: params.agentToken },
+		});
+		if (agent.exitCode !== 0)
+			logger.warn('Review — the hand-off repair pass exited non-zero', {
+				taskId,
+				prNumber,
+				headSha,
+				cli,
+				exitCode: agent.exitCode,
+			});
+	} catch (error) {
+		logger.warn('Review — the hand-off repair pass could not be run', {
+			taskId,
+			prNumber,
+			headSha,
+			cli,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * The session a repair pass should continue: the id the run actually reported
+ * ({@link AgentCliResult.sessionId}, captured per CLI), falling back to whichever
+ * id this phase handed the agent when the CLI recovered none.
+ */
+function repairSessionId(
+	agent: AgentCliResult,
+	session: { sessionId?: string; resumeSessionId?: string },
+	resumed: boolean,
+): string | undefined {
+	return agent.sessionId ?? (resumed ? session.resumeSessionId : session.sessionId);
+}
+
+/**
+ * Whether a non-blocking finding this review reports will be answered by an agent
+ * at all. Both conditions have to hold: a disabled Respond-to-review skips every
+ * verdict regardless of `skipOnMinors`, and the rendered body must not promise a
+ * run that will not happen.
+ */
+function minorsAreAnswered(project: ProjectConfig): boolean {
+	const respondToReview = project.pipeline?.respondToReview;
+	return respondToReview?.enabled !== false && respondToReview?.skipOnMinors === false;
+}
+
+/**
+ * Bind {@link repairReviewHandoff} to this run, so the submission reader can call
+ * it with nothing but the validator's message. Split out to keep the closure —
+ * and its long argument list — out of {@link runReviewPhase}'s complexity budget.
+ */
+function reviewRepairStep(
+	params: Omit<RepairReviewHandoffParams, 'validationError'>,
+): (validationError: string) => Promise<void> {
+	return (validationError) => repairReviewHandoff({ ...params, validationError });
+}
+
+interface ReviewSubmissionContext {
+	cli: AgentCli;
+	headSha: string;
+	ordinal: number;
+	isReReview: boolean;
+	minorsAnswered: boolean;
+	/** Accept a pre-#470 hand-off — set only when resuming a delivery (see below). */
+	allowLegacy: boolean;
+	/**
+	 * Re-run the agent once against the validator's own complaint, for a run whose
+	 * hand-off didn't validate. Never reached on a resumed delivery — `allowLegacy`
+	 * is answered first, and that run's agent has already exited for good — so the
+	 * phase passes this unconditionally; only a caller with no agent to re-run
+	 * (a test) leaves it out.
+	 */
+	repair?: (validationError: string) => Promise<void>;
+}
+
+/** Parse the structured hand-off and render the body SWARM will post. Throws if it doesn't validate. */
+function renderSubmission(
+	worktreePath: string,
+	context: ReviewSubmissionContext,
+): { verdict: ReviewVerdict; body: string } {
+	const handoff = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
+	return {
+		verdict: handoff.verdict,
+		body: renderReviewBody({
+			handoff,
+			headSha: context.headSha,
+			ordinal: context.ordinal,
+			cap: REVIEW_VERDICT_CAP,
+			isReReview: context.isReReview,
+			minorsAnswered: context.minorsAnswered,
+		}),
+	};
+}
+
+/**
+ * The pre-#470 escape hatch, taken only when resuming a delivery. A worktree
+ * preserved by a half-failed submission may hold a hand-off an older agent wrote,
+ * and that shape can no longer satisfy `ReviewHandoffSchema`; without this the
+ * retry would fail validation forever instead of finishing the submission it had
+ * already started. A fresh run gets no such latitude — its hand-off must be the
+ * structured shape, which is what makes the format enforceable at all.
+ *
+ * `structuredError` is rethrown when the file isn't the legacy shape either: the
+ * structured schema's complaint is then the real one, and surfacing the legacy
+ * schema's "body Required" in its place would bury it.
+ */
+function legacySubmission(
+	worktreePath: string,
+	context: ReviewSubmissionContext,
+	structuredError: unknown,
+): { verdict: ReviewVerdict; body: string } {
+	let legacy: LegacyReviewHandoff;
+	try {
+		legacy = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, LegacyReviewHandoffSchema);
+	} catch {
+		throw structuredError;
+	}
+	if (legacy.verdict === 'comment')
+		throw new Error(
+			`Review agent (${context.cli}) resumed a legacy hand-off with the removed 'comment' verdict; ` +
+				'it submits no actionable review (issue #470) — re-run the phase from a fresh worktree',
+		);
+	logger.warn('Review — resumed a pre-#470 hand-off; posting its authored body verbatim', {
+		headSha: context.headSha,
+		verdict: legacy.verdict,
+		reason: structuredError instanceof Error ? structuredError.message : String(structuredError),
+	});
+	return { verdict: legacy.verdict, body: legacy.body };
+}
+
 /**
  * Read the review hand-off and produce what gets submitted: the verdict, and the
  * body **rendered by SWARM** from the hand-off's fields (issue #470) rather than
  * authored by the agent, so the review's structure is identical whichever CLI or
  * model produced it.
  *
- * `allowLegacy` is set only when resuming a delivery. A worktree preserved by a
- * half-failed submission may hold a pre-#470 hand-off that an older agent wrote,
- * and that shape can no longer satisfy `ReviewHandoffSchema`; without this
- * fallback the retry would fail validation forever instead of finishing the
- * submission it had already started. A fresh run gets no such latitude — its
- * hand-off must be the structured shape, which is what makes the format
- * enforceable at all.
+ * A hand-off that doesn't validate gets **one** repair pass before the run fails.
+ * The agent never sees the validator's complaint otherwise: the phase throws, the
+ * queue retries the job, and the whole review runs again from scratch — three
+ * full passes (`attempts`, `src/queue/producer.ts`) for a model that mis-shapes
+ * the JSON the same way each time. Since #470 moved the format's enforcement into
+ * the schema, this is the only feedback path that enforcement has. A second
+ * failure rethrows the *first* error, so the logs name the original defect rather
+ * than whatever the repair pass made of it.
  */
-function readReviewSubmission(
+async function readReviewSubmission(
 	worktreePath: string,
-	context: {
-		cli: AgentCli;
-		headSha: string;
-		ordinal: number;
-		isReReview: boolean;
-		minorsAnswered: boolean;
-		allowLegacy: boolean;
-	},
-): { verdict: ReviewVerdict; body: string } {
+	context: ReviewSubmissionContext,
+): Promise<{ verdict: ReviewVerdict; body: string }> {
 	try {
-		const handoff = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
-		return {
-			verdict: handoff.verdict,
-			body: renderReviewBody({
-				handoff,
-				headSha: context.headSha,
-				ordinal: context.ordinal,
-				cap: REVIEW_VERDICT_CAP,
-				isReReview: context.isReReview,
-				minorsAnswered: context.minorsAnswered,
-			}),
-		};
+		return renderSubmission(worktreePath, context);
 	} catch (error) {
-		if (!context.allowLegacy) throw error;
-		const legacy = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, LegacyReviewHandoffSchema);
-		if (legacy.verdict === 'comment')
-			throw new Error(
-				`Review agent (${context.cli}) resumed a legacy hand-off with the removed 'comment' verdict; ` +
-					'it submits no actionable review (issue #470) — re-run the phase from a fresh worktree',
-			);
-		logger.warn('Review — resumed a pre-#470 hand-off; posting its authored body verbatim', {
+		if (context.allowLegacy) return legacySubmission(worktreePath, context, error);
+		if (!context.repair) throw error;
+		const validationError = error instanceof Error ? error.message : String(error);
+		logger.warn('Review — hand-off failed validation; running one repair pass', {
 			headSha: context.headSha,
-			verdict: legacy.verdict,
-			reason: error instanceof Error ? error.message : String(error),
+			cli: context.cli,
+			reason: validationError,
 		});
-		return { verdict: legacy.verdict, body: legacy.body };
+		await context.repair(validationError);
+		try {
+			return renderSubmission(worktreePath, context);
+		} catch (repairError) {
+			logger.error('Review — the repair pass did not produce a valid hand-off', {
+				headSha: context.headSha,
+				cli: context.cli,
+				reason: repairError instanceof Error ? repairError.message : String(repairError),
+			});
+			throw error;
+		}
 	}
 }
 
@@ -546,13 +715,28 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 				automationOutcome,
 			};
 		}
-		const submission = readReviewSubmission(handle.path, {
+		const submission = await readReviewSubmission(handle.path, {
 			cli,
 			headSha,
 			ordinal: passOrdinal,
 			isReReview,
-			minorsAnswered: project.pipeline?.respondToReview?.skipOnMinors === false,
+			minorsAnswered: minorsAreAnswered(project),
 			allowLegacy: shouldResumeDelivery,
+			repair: reviewRepairStep({
+				isReReview,
+				cli,
+				model,
+				reasoning,
+				resumeSessionId: repairSessionId(agent, { sessionId, resumeSessionId }, resumed),
+				worktreePath: handle.path,
+				taskId,
+				prNumber,
+				headSha,
+				agentToken,
+				timeoutMs,
+				signal,
+				runAgent,
+			}),
 		});
 		const delivery =
 			options.delivery ??

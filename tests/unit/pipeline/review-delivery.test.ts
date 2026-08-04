@@ -42,8 +42,12 @@ function structuredHandoff(overrides: Record<string, unknown> = {}) {
 /**
  * Delivery-mode phase options (a `delivery` provider is present, so this is not
  * the legacy bare-verdict path), with the agent writing `handoff` to the worktree.
+ * Pass an array to give successive agent runs different hand-offs — that is how
+ * the repair pass is exercised, since it is a second run against the same
+ * worktree; the last entry repeats once the array is exhausted.
  */
 function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {}) {
+	const handoffs = Array.isArray(handoff) ? [...handoff] : [handoff];
 	const path = mkdtempSync(join(tmpdir(), 'swarm-review-render-'));
 	roots.push(path);
 	const handle: WorktreeHandle = { taskId: 'review-42', path, branch: 'abc', detached: true };
@@ -66,7 +70,8 @@ function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {})
 			taskId: 'review-42',
 			worktrees,
 			runAgent: vi.fn(async () => {
-				writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(handoff));
+				const next = handoffs.length > 1 ? handoffs.shift() : handoffs[0];
+				writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(next));
 				return agentResult();
 			}),
 			graft: vi.fn(() => []),
@@ -149,6 +154,70 @@ describe('review body rendering', () => {
 		const { options } = deliveryDeps({ verdict: 'approve', body: 'Looks good', findings: [] });
 
 		await expect(runReviewPhase(options)).rejects.toThrow(/Invalid hand-off/);
+		// The review was never submitted, so the run must not charge the PR one of
+		// its three verdict slots (issue #235) — a malformed hand-off is a failed
+		// attempt, not a spent verdict.
+		expect(options.abandonReviewVerdict).toHaveBeenCalled();
+		expect(options.markReviewVerdictSubmitted).not.toHaveBeenCalled();
+	});
+
+	// Without this the agent never learns why its hand-off was rejected: the phase
+	// throws, the queue re-runs the whole review, and a model that mis-shapes the
+	// JSON the same way each time burns every attempt.
+	it('gives an invalid hand-off one repair pass carrying the validator’s complaint', async () => {
+		const { submitReview, options } = deliveryDeps([
+			structuredHandoff({ verdict: 'nonsense' }),
+			structuredHandoff(),
+		]);
+
+		await runReviewPhase(options);
+
+		const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+		expect(runAgent).toHaveBeenCalledTimes(2);
+		const repairPrompt = runAgent.mock.calls[1][0].args[0];
+		expect(repairPrompt).toContain("failed SWARM's validation");
+		expect(repairPrompt).toContain('Invalid hand-off review_handoff.json');
+		expect(repairPrompt).toContain('this is a formatting repair, not a re-review');
+		// It continues the review's own session, so the repair still has the diff in
+		// context rather than re-deriving it.
+		expect(runAgent.mock.calls[1][0].resumeSessionId).toBe('session-1');
+		expect(submitReview).toHaveBeenCalledOnce();
+	});
+
+	it('fails with the original complaint when the repair pass does not fix it', async () => {
+		const { submitReview, options } = deliveryDeps(structuredHandoff({ verdict: 'nonsense' }));
+
+		await expect(runReviewPhase(options)).rejects.toThrow(/Invalid hand-off/);
+		expect(options.runAgent).toHaveBeenCalledTimes(2);
+		expect(submitReview).not.toHaveBeenCalled();
+	});
+
+	// The body must not promise a follow-up that a disabled Respond-to-review will
+	// never run, whatever `skipOnMinors` says.
+	it('states that nothing will act on minors when Respond-to-review is off', async () => {
+		const { submitReview, options } = deliveryDeps(
+			structuredHandoff({
+				findings: [
+					{
+						id: 'F1',
+						title: 'naming',
+						severity: 'nit',
+						category: 'consistency',
+						evidence: '`webhook.ts:337`.',
+						suggestion: 'Rename for symmetry.',
+					},
+				],
+			}),
+			{
+				project: createMockProjectConfig({
+					pipeline: { respondToReview: { enabled: false, skipOnMinors: false } },
+				}),
+			},
+		);
+
+		await runReviewPhase(options);
+
+		expect(submitReview.mock.calls[0][0].body).toContain('**no agent will act on them**');
 	});
 
 	// A worktree preserved by a half-failed submission may hold an older agent's

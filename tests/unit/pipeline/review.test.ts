@@ -13,6 +13,7 @@ import {
 	type ReviewVerdictRecord,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import { buildReviewHandoffRepairPrompt } from '@/pipeline/prompts/review.js';
 import { buildReviewPrompt, REVIEW_VERDICT_FILENAME, runReviewPhase } from '@/pipeline/review.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
@@ -403,6 +404,17 @@ describe('buildReviewPrompt', () => {
 		expect(prompt).toContain('any `blocker`/`major` means `request-changes`');
 	});
 
+	// The Review phase runs against every project SWARM manages, so the prompt must
+	// ask for documentation by its role in the repository rather than naming this
+	// one's layout — `docs/status.md` does not exist in someone else's repo.
+	it('asks for docs by role, never by SWARM’s own paths', () => {
+		const prompt = buildReviewPrompt(context);
+		expect(prompt).toContain('one entry per document THIS repository requires to stay current');
+		expect(prompt).toContain('its own contributor/agent guide');
+		for (const path of ['docs/configuration.md', 'docs/status.md', 'ai/*.md'])
+			expect(prompt).not.toContain(path);
+	});
+
 	it('offers no comment-only verdict and tells the agent to fail instead', () => {
 		const prompt = buildReviewPrompt(context);
 		expect(prompt).toContain('`verdict`: `approve` or `request-changes`. Those are the only two.');
@@ -447,7 +459,13 @@ describe('buildReviewPrompt', () => {
 			const prompt = buildReviewPrompt(context, undefined, true);
 			expect(prompt).toContain('`carried`');
 			expect(prompt).toContain("Reuse the previous review's finding ids");
-			expect(prompt).toContain('Continue past the highest id the previous review used');
+			// A re-reported item keeps its id rather than being minted a new one —
+			// otherwise the disposition table and the findings section name the same
+			// defect twice, and the id stops tracking anything across passes.
+			expect(prompt).toContain("Re-reporting an item from `carried` KEEPS that item's original id");
+			expect(prompt).toContain('continuing past the highest id the previous review used');
+			// The schema enforces the other half: an unresolved item must be there.
+			expect(prompt).toContain('Every entry that is NOT `resolved` must also appear in `findings`');
 			// The initial pass has nothing to carry, so it must not be asked to.
 			expect(buildReviewPrompt(context)).not.toContain('`carried`');
 		});
@@ -473,5 +491,34 @@ describe('buildReviewPrompt', () => {
 			expect(buildReviewPrompt(context)).not.toContain('This is a RE-REVIEW');
 			expect(buildReviewPrompt(context, undefined, false)).not.toContain('This is a RE-REVIEW');
 		});
+	});
+});
+
+/**
+ * The repair prompt is the only feedback path the hand-off schema's enforcement
+ * has — the agent otherwise never learns why its hand-off was rejected.
+ */
+describe('buildReviewHandoffRepairPrompt', () => {
+	it('carries the validator’s complaint and the contract to satisfy', () => {
+		const prompt = buildReviewHandoffRepairPrompt('F1 is nit, so fixPlan must be omitted');
+		expect(prompt).toContain('F1 is nit, so fixPlan must be omitted');
+		expect(prompt).toContain(REVIEW_VERDICT_FILENAME);
+		expect(prompt).toContain('SEVERITY — pick from exactly these four');
+		expect(prompt).toContain('`verdict`: `approve` or `request-changes`');
+	});
+
+	// A repair that quietly re-judged the PR to satisfy a slot rule would be worse
+	// than the failure it replaces.
+	it('scopes itself to reformatting, and keeps the read-only guard', () => {
+		const prompt = buildReviewHandoffRepairPrompt('verification: Array must contain at least 1');
+		expect(prompt).toContain('this is a formatting repair, not a re-review');
+		expect(prompt).toContain('Keep your findings, your severities, and your verdict as they are');
+		expect(prompt).toContain('REVIEW ONLY');
+		expect(prompt).toContain('do not submit a review or perform any GitHub mutation');
+	});
+
+	it('asks a re-review to repair its `carried` list too', () => {
+		expect(buildReviewHandoffRepairPrompt('x', true)).toContain('`carried`');
+		expect(buildReviewHandoffRepairPrompt('x')).not.toContain('`carried`');
 	});
 });

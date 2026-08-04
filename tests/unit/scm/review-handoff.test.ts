@@ -179,6 +179,66 @@ describe('ReviewHandoffSchema', () => {
 		});
 	});
 
+	// Without this coupling the disposition table and the verdict are independent:
+	// a re-review could render "F1 ❌ not addressed" above `approve`, clearing the
+	// review gate and — with autoMerge on — merging a PR whose requested changes
+	// were never made.
+	describe('an unresolved carried item must be re-reported as a finding', () => {
+		const carried = (status: string) => [
+			{ id: 'F1', title: 'Two spellings per commit', status, detail: 'Traced again.' },
+		];
+
+		it.each([
+			'outstanding',
+			'regressed',
+			'partial',
+		])('rejects a %s carried item that appears in no finding', (status) => {
+			const result = parse({ verdict: 'approve', carried: carried(status) });
+			expect(result.success).toBe(false);
+			expect(errorFor(result)).toContain('must also appear in findings under the same id');
+		});
+
+		it('accepts a resolved item that appears in no finding — that is the normal case', () => {
+			expect(parse({ verdict: 'approve', carried: carried('resolved') }).success).toBe(true);
+		});
+
+		// Re-reported under the same id, the existing severity rule takes over: a
+		// still-outstanding blocker forces request-changes…
+		it('forces request-changes once the re-reported item is blocking', () => {
+			expect(
+				parse({ verdict: 'approve', carried: carried('outstanding'), findings: [finding()] })
+					.success,
+			).toBe(false);
+			expect(
+				parse({
+					verdict: 'request-changes',
+					carried: carried('outstanding'),
+					findings: [finding()],
+				}).success,
+			).toBe(true);
+		});
+
+		// …while a nit an earlier pass raised and nobody fixed can still be approved,
+		// which is why the rule routes through `findings` rather than the verdict.
+		it('still allows approving an outstanding item the reviewer reports as a nit', () => {
+			const result = parse({
+				verdict: 'approve',
+				carried: carried('outstanding'),
+				findings: [
+					{
+						id: 'F1',
+						title: 'naming',
+						severity: 'nit',
+						category: 'consistency',
+						evidence: '`webhook.ts:337`.',
+						suggestion: 'Rename for symmetry.',
+					},
+				],
+			});
+			expect(result.success).toBe(true);
+		});
+	});
+
 	describe('finding ids', () => {
 		it.each(['1', 'f1', 'F', 'F1a', 'finding-1'])('rejects %j as an id', (id) => {
 			expect(parse({ verdict: 'request-changes', findings: [finding({ id })] }).success).toBe(

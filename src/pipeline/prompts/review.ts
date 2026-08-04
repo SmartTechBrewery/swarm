@@ -58,17 +58,17 @@ function handoffContract(isReReview: boolean): readonly string[] {
 		`Write "${REVIEW_VERDICT_FILENAME}" as JSON with these fields. SWARM renders the review from them — do not write a review body, headings, or a prose summary of your findings anywhere; anything you format yourself is discarded.`,
 		'  - `verdict`: `approve` or `request-changes`. Those are the only two. It follows mechanically from your severities — any `blocker`/`major` means `request-changes`, otherwise `approve` — and the hand-off is rejected if it disagrees, so the verdict is not a separate judgement call. There is no comment-only or no-opinion verdict: if you could not verify the change at all (a command you needed is blocked, the diff is unreadable), stop and fail rather than submitting a verdict you cannot support.',
 		'  - `summary`: at most three sentences. What the change does, and what you confirmed about its shape. No praise, and do not restate your findings here.',
-		'  - `verification`: every command you actually ran, as `{command, outcome}` with outcome `passed` or `failed`. Report a failing command — it is evidence, not something to hide. Do not list commands you did not run.',
-		'  - `docsChecked`: one entry per doc this repo requires to stay current (`README.md`, the `ai/*.md` guides, `docs/configuration.md`, `docs/status.md`), as `{path, status, note?}` with status `accurate`, `updated`, `not-applicable`, or `stale`. Judge every one — `not-applicable` is a real answer when the PR changes nothing that doc describes. A `stale` doc is itself a defect: also report it in `findings`.',
+		'  - `verification`: every command you actually ran, as `{command, outcome}` with outcome `passed` or `failed`. At least one entry is required — the commands you read the PR with count. Report a failing command, and report one that was blocked or unavailable the same way with outcome `failed`: both are evidence, not something to hide. Do not list commands you did not run.',
+		"  - `docsChecked`: one entry per document THIS repository requires to stay current — its README, plus whatever its own contributor/agent guide (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, or equivalent) says must not go stale. Read that guide to find out; do not assume another project's layout. Each entry is `{path, status, note?}` with status `accurate`, `updated`, `not-applicable`, or `stale`. Judge every one you identify — `not-applicable` is a real answer when the PR changes nothing that document describes. A `stale` document is itself a defect: also report it in `findings`.",
 		'  - `preExisting`: conditions you noticed that predate this PR (pre-existing lint warnings, unrelated failures), so they are not charged to it. Empty array if none.',
 		'  - `findings`: see below. Empty array when there is nothing to report.',
 		...(isReReview
 			? [
-					"  - `carried`: one entry per finding the previous review raised, as `{id, title, status, detail}` with status `resolved`, `partial`, `outstanding`, or `regressed`. Reuse the previous review's finding ids (`F1`, `F2`, …) exactly — they are how SWARM tracks an item across passes. `detail` is your evidence for that status, traced in this checkout.",
+					"  - `carried`: one entry per finding the previous review raised, as `{id, title, status, detail}` with status `resolved`, `partial`, `outstanding`, or `regressed`. Reuse the previous review's finding ids (`F1`, `F2`, …) exactly — they are how SWARM tracks an item across passes. `detail` is your evidence for that status, traced in this checkout. Every entry that is NOT `resolved` must also appear in `findings` under that same id, so it carries a severity and a fix plan; the hand-off is rejected if one does not.",
 				]
 			: []),
 		'Each finding is `{id, title, severity, category, evidence, …}`:',
-		`  - \`id\`: \`F1\`, \`F2\`, … numbered in the order you report them.${isReReview ? ' Continue past the highest id the previous review used — never reuse an id for a different problem.' : ''}`,
+		`  - \`id\`: \`F1\`, \`F2\`, … numbered in the order you report them.${isReReview ? " Re-reporting an item from `carried` KEEPS that item's original id — that is what lets SWARM follow one problem across passes. Mint a new id only for a problem no earlier pass raised, continuing past the highest id the previous review used; never reuse an id for a different problem." : ''}`,
 		'  - `category`: one of `correctness`, `security`, `contract`, `performance`, `test-coverage`, `docs`, `consistency`.',
 		'  - `evidence`: the `file:line` references the claim rests on, and what is there. Required at every severity. Quote the offending code only when it is under ten lines.',
 		'  - For a `blocker` or `major`, additionally: `failureScenario` (concrete inputs or sequence of events → the wrong outcome, traced through this checkout), `impact` (what it costs when it happens), `fixPlan` (an array of steps naming the files or components to change), and `tests` (the tests to add or change, named specifically; `"None — doc-only."` is a valid answer).',
@@ -121,7 +121,7 @@ function reReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[]
 		`2. Read the diff: \`gh pr diff ${prNumber} --repo ${repo}\`. For each change the previous review required, trace it in this checkout and decide whether it is now correctly and completely implemented. Use the checked-out code and existing tests as evidence.`,
 		'3. STAY IN SCOPE. Do NOT raise new findings for pre-existing issues an earlier review did not flag, even if you notice them now — a re-review must not restart the cycle over problems that were missed earlier. The ONLY issues you may report as new findings are: (a) a previously requested change that is still missing or was implemented incorrectly, or (b) a defect the new commits themselves introduced — a regression in the fix, including a doc the new changes made stale. Everything else is out of scope; leave it for a human.',
 		'4. Verify before claiming: demonstrate each conclusion against the checked-out code and its tests. Do not invent problems or restate personal preferences as defects. Do not create disposable repositories or alter Git configuration to reproduce a concern, and never run destructive cleanup commands such as `rm -rf`. If an optional command is unavailable or blocked, continue with the evidence already available and still write the required hand-off file.',
-		'5. Record what became of every previously requested change in `carried` — including the ones that are now correct, since a resolved item is the result a human most needs to see. An item still missing or incorrect also becomes a finding, so it carries a severity and a fix plan.',
+		'5. Record what became of every previously requested change in `carried` — including the ones that are now correct, since a resolved item is the result a human most needs to see. Anything you did not mark `resolved` also becomes a finding under its original id, so it carries a severity and a fix plan; that is what keeps the verdict honest about work still outstanding.',
 		'6. Do not submit a review or perform any GitHub mutation. SWARM submits the decision after you exit.',
 		`In particular, do not run \`gh pr review ${prNumber} --repo ${repo}\`, \`--approve\`, \`--request-changes\`, or \`--comment\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
 		'',
@@ -171,5 +171,38 @@ export function buildReviewPrompt(
 		'',
 		'Do not merge the PR.',
 		...projectInstructionsSection(customPrompt),
+	].join('\n');
+}
+
+/**
+ * The prompt for the single repair pass a malformed hand-off gets
+ * (`src/pipeline/review.ts`). The agent never sees `ReviewHandoffSchema`'s
+ * complaint otherwise — the run just fails and the queue re-runs the *whole*
+ * review, so a model that mis-shapes the JSON burns every attempt without ever
+ * being told why. Handing it the validation error is far cheaper than a second
+ * full pass, and it is the only feedback path the schema's enforcement has.
+ *
+ * Deliberately narrow: the review itself already happened and its conclusions
+ * stand. This asks for the hand-off file to be rewritten, not re-judged — a
+ * repair that quietly changes the verdict to satisfy a slot rule would be worse
+ * than the failure it replaces.
+ */
+export function buildReviewHandoffRepairPrompt(
+	validationError: string,
+	isReReview = false,
+): string {
+	return [
+		`The review you just completed is NOT submitted: the hand-off you wrote to "${REVIEW_VERDICT_FILENAME}" failed SWARM's validation.`,
+		'',
+		'The validator reported:',
+		validationError,
+		'',
+		`Rewrite "${REVIEW_VERDICT_FILENAME}" so it satisfies every rule below. Keep your findings, your severities, and your verdict as they are — this is a formatting repair, not a re-review. Change a severity or the verdict only where the validator says they contradict each other, and where a required slot is missing, fill it from the evidence you already gathered (re-read the checkout if you must; never invent one).`,
+		'',
+		'REVIEW ONLY, as before: do not edit any other file, do not commit, do not push, do not submit a review or perform any GitHub mutation. SWARM submits the decision after you exit.',
+		'',
+		...SEVERITY_RUBRIC,
+		'',
+		...handoffContract(isReReview),
 	].join('\n');
 }

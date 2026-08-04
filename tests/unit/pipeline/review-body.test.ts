@@ -69,6 +69,15 @@ describe('renderReviewBody', () => {
 			expect(renderReviewBody(context({ ordinal: 1 }))).not.toContain('final permitted verdict');
 		});
 
+		// A pass after an approval that didn't merge is a full initial review sitting
+		// at ordinal 2 — naming it a re-review would claim it verified earlier
+		// findings it was never shown.
+		it('names a non-re-review pass "Review" whatever its ordinal', () => {
+			const body = renderReviewBody(context({ ordinal: 2, isReReview: false }));
+			expect(body).toContain('**Review** · pass 2 of 3');
+			expect(body).not.toContain('re-review');
+		});
+
 		it('falls back to an unnumbered label when the ledger had no reservation', () => {
 			expect(renderReviewBody(context({ ordinal: undefined }))).toContain('**Review** · `approve`');
 			expect(renderReviewBody(context({ ordinal: undefined, isReReview: true }))).toContain(
@@ -182,6 +191,19 @@ describe('renderReviewBody', () => {
 			expect(body).toContain('`ai/ARCHITECTURE.md` ❌ stale (documents the old invariant)');
 		});
 
+		// A piped command is ordinary, and a raw `|` would open a third column and
+		// break every row after it.
+		it('escapes a pipe in a command so the table survives it', () => {
+			const body = renderReviewBody(
+				context({
+					handoff: handoff({
+						verification: [{ command: 'npx vitest run 2>&1 | tail -20', outcome: 'passed' }],
+					}),
+				}),
+			);
+			expect(body).toContain('| `npx vitest run 2>&1 \\| tail -20` | passed |');
+		});
+
 		it('separates pre-existing conditions from this PR, and omits the line when there are none', () => {
 			expect(
 				renderReviewBody(
@@ -193,14 +215,17 @@ describe('renderReviewBody', () => {
 	});
 
 	describe('re-review disposition', () => {
+		// An unresolved carried item is re-reported as a finding under the same id
+		// (the schema rejects a hand-off where it isn't), so `F1` appears in both
+		// lists here exactly as a real re-review would send it.
 		const carried = [
+			{ id: 'F1', title: 'headSha spellings', status: 'outstanding', detail: 'Still two.' },
 			{
-				id: 'F1',
-				title: 'headSha spellings',
+				id: 'F2',
+				title: 'verdict removals',
 				status: 'resolved',
-				detail: 'abbreviateSha applied.',
+				detail: 'Both call sites narrowed.',
 			},
-			{ id: 'F2', title: 'verdict removals', status: 'outstanding', detail: 'Still submitted.' },
 		];
 
 		it('tabulates every carried finding with its status', () => {
@@ -212,21 +237,53 @@ describe('renderReviewBody', () => {
 				}),
 			);
 			expect(body).toContain('## Disposition');
-			expect(body).toContain('| F1 | headSha spellings | ✅ resolved |');
-			expect(body).toContain('| F2 | verdict removals | ❌ not addressed |');
-			expect(body).toContain('### F1 · ✅ resolved');
-			expect(body).toContain('abbreviateSha applied.');
+			expect(body).toContain('| F1 | headSha spellings | ❌ not addressed |');
+			expect(body).toContain('| F2 | verdict removals | ✅ resolved |');
+			expect(body).toContain('### F2 · ✅ resolved');
+			expect(body).toContain('Both call sites narrowed.');
 		});
 
-		it('summarizes carried counts instead of the finding histogram', () => {
+		it('summarizes carried counts, and the histogram of anything new', () => {
 			const body = renderReviewBody(
-				context({ ordinal: 2, isReReview: true, handoff: handoff({ carried }) }),
+				context({
+					ordinal: 2,
+					isReReview: true,
+					handoff: handoff({ carried, verdict: 'request-changes', findings: [blocker] }),
+				}),
 			);
-			expect(body).toContain('**Carried: 1 resolved · 1 outstanding** — **0 new findings**');
+			expect(body).toContain(
+				'**Carried: 1 resolved · 1 outstanding** — **1 new** (1 blocker · 0 major · 0 minor · 0 nits)',
+			);
+		});
+
+		it('reports a fully resolved re-review as zero new findings', () => {
+			const body = renderReviewBody(
+				context({
+					ordinal: 2,
+					isReReview: true,
+					handoff: handoff({ carried: carried.map((c) => ({ ...c, status: 'resolved' })) }),
+				}),
+			);
+			expect(body).toContain('**Carried: 2 resolved · 0 outstanding** — **0 new findings**');
 		});
 
 		it('omits the disposition entirely on an initial review', () => {
 			expect(renderReviewBody(context())).not.toContain('## Disposition');
+		});
+
+		it('escapes a pipe in a carried title so the disposition table survives it', () => {
+			const body = renderReviewBody(
+				context({
+					ordinal: 2,
+					isReReview: true,
+					handoff: handoff({
+						carried: [
+							{ id: 'F1', title: 'the `a | b` union', status: 'resolved', detail: 'Narrowed.' },
+						],
+					}),
+				}),
+			);
+			expect(body).toContain('| F1 | the `a \\| b` union | ✅ resolved |');
 		});
 	});
 

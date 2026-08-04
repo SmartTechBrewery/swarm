@@ -175,6 +175,36 @@ function checkFindingSlots(finding: ReviewFinding, index: number, ctx: z.Refinem
 }
 
 /**
+ * Every carried item a re-review did **not** resolve must reappear in `findings`
+ * under the same id.
+ *
+ * Without this the two lists are independent, so a re-review could render a
+ * disposition table reading "F1 ❌ not addressed" above the verdict `approve` —
+ * clearing the review gate and, with `pipeline.respondToReview.autoMerge` on,
+ * merging a PR whose requested changes were never made. Routing the item through
+ * `findings` instead of coupling it to the verdict directly is deliberate: it
+ * lets {@link checkVerdictMatchesSeverities} do the verdict work from the
+ * severity the reviewer assigns, so a still-outstanding *nit* from an earlier
+ * pass can be approved while a still-outstanding blocker cannot. It is also what
+ * makes an `F<n>` id stable across passes rather than merely unique within one.
+ */
+function checkCarriedItemsAreReported(
+	carried: readonly ReviewCarriedFinding[],
+	findings: readonly ReviewFinding[],
+	ctx: z.RefinementCtx,
+): void {
+	const reported = new Set(findings.map((f) => f.id));
+	for (const [index, item] of carried.entries()) {
+		if (item.status === 'resolved' || reported.has(item.id)) continue;
+		ctx.addIssue({
+			code: 'custom',
+			path: ['carried', index, 'status'],
+			message: `${item.id} is ${item.status}, so it must also appear in findings under the same id`,
+		});
+	}
+}
+
+/**
  * The verdict is a pure function of the severity histogram, so it is enforced
  * rather than instructed — this is what makes "blocker" and "approve" mean the
  * same thing whichever model produced the review, which prose alone never
@@ -222,16 +252,27 @@ export const ReviewHandoffSchema = z
 		/** The `## Scope` paragraph: what the change is and what was confirmed. */
 		summary: z.string().min(1),
 		verification: z.array(ReviewVerificationSchema).min(1),
-		/** One row per doc `ai/RULES.md` §1–2 requires to stay current. */
+		/**
+		 * One row per document the reviewed repository requires to stay current —
+		 * its README plus whatever its own contributor/agent guide names. Which
+		 * documents those are is the repository's business, not SWARM's: this phase
+		 * reviews any project SWARM manages, so nothing here names a path.
+		 */
 		docsChecked: z.array(ReviewDocCheckSchema).min(1),
 		/** Conditions the reviewer found but that predate this PR, so they aren't charged to it. */
 		preExisting: z.array(z.string().min(1)).default([]),
 		findings: z.array(ReviewFindingSchema).default([]),
-		/** Re-review only: what became of each finding an earlier pass raised. */
+		/**
+		 * Re-review only: what became of each finding an earlier pass raised. Anything
+		 * not `resolved` must also be reported in `findings` under the same id
+		 * ({@link checkCarriedItemsAreReported}), which is what keeps the disposition
+		 * table and the verdict from contradicting each other.
+		 */
 		carried: z.array(ReviewCarriedSchema).default([]),
 	})
 	.superRefine((handoff, ctx) => {
 		checkFindingTiers(handoff.findings, ctx);
+		checkCarriedItemsAreReported(handoff.carried, handoff.findings, ctx);
 		checkVerdictMatchesSeverities(handoff.verdict, handoff.findings, ctx);
 	});
 
@@ -257,6 +298,8 @@ export const LegacyReviewHandoffSchema = z.object({
 		)
 		.default([]),
 });
+
+export type LegacyReviewHandoff = z.infer<typeof LegacyReviewHandoffSchema>;
 
 export const ReviewResponseHandoffSchema = z.object({
 	outcome: z.enum(['fixed', 'pushed-back', 'no-findings']),

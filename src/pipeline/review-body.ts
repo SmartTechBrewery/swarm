@@ -46,11 +46,23 @@ export interface ReviewBodyContext {
 	isReReview: boolean;
 	/**
 	 * Whether a non-`changes-requested` verdict still dispatches Respond-to-review
-	 * for this project (`pipeline.respondToReview.skipOnMinors === false`). When it
-	 * doesn't, an approval's minor findings are stated as notes for a human,
-	 * because nothing in the pipeline will pick them up.
+	 * for this project — Respond-to-review enabled *and*
+	 * `pipeline.respondToReview.skipOnMinors === false`. When it doesn't, an
+	 * approval's minor findings are stated as notes for a human, because nothing in
+	 * the pipeline will pick them up.
 	 */
 	minorsAnswered: boolean;
+}
+
+/**
+ * Markdown table cells can carry neither a raw `|` (it opens a new column) nor a
+ * newline (it ends the row). Agent-authored text reaches three of them —
+ * a verification command, a carried finding's id and title — and a piped command
+ * like `npx vitest run | tail -20` is ordinary enough to break the table in
+ * practice.
+ */
+function cell(text: string): string {
+	return text.replace(/\|/g, '\\|').replace(/\s*\r?\n\s*/g, ' ');
 }
 
 const SEVERITY_ORDER: Record<ReviewFinding['severity'], number> = {
@@ -60,13 +72,20 @@ const SEVERITY_ORDER: Record<ReviewFinding['severity'], number> = {
 	nit: 3,
 };
 
-/** Ordinal → the name a human uses for that pass. Bounded by `REVIEW_VERDICT_CAP`. */
-const RE_REVIEW_NAMES = ['First re-review', 'Second re-review', 'Third re-review'] as const;
+/**
+ * Ordinal → the name a human uses for that re-review pass. Only the two the
+ * default `REVIEW_VERDICT_CAP` permits are named; a raised cap falls back to the
+ * numbered form below.
+ */
+const RE_REVIEW_NAMES = ['First re-review', 'Second re-review'] as const;
 
 function passLabel({ ordinal, cap, isReReview }: ReviewBodyContext): string {
 	if (ordinal === undefined) return isReReview ? '**Re-review**' : '**Review**';
-	const name =
-		ordinal === 1 ? 'Review' : (RE_REVIEW_NAMES[ordinal - 2] ?? `Re-review ${ordinal - 1}`);
+	// `isReReview` — not the ordinal — decides the *name*. A pass after an approval
+	// that didn't merge (a later push re-triggers Review) is a full initial review
+	// sitting at ordinal 2; calling that a re-review would claim it verified
+	// earlier findings it was never shown. The ordinal still names the *slot*.
+	const name = isReReview ? (RE_REVIEW_NAMES[ordinal - 2] ?? `Re-review ${ordinal - 1}`) : 'Review';
 	// Naming the last permitted pass in the line a human reads first: a
 	// cap-reaching `request-changes` stops the automatic cycle, and today that is
 	// visible only in a log field.
@@ -96,10 +115,19 @@ function findingsSummary(handoff: ReviewHandoff): string {
 	return `**${findings.length} ${noun}** — ${severityHistogram(findings)}${suffix}`;
 }
 
-function carriedSummary(carried: readonly ReviewCarriedFinding[], newCount: number): string {
+function carriedSummary(
+	carried: readonly ReviewCarriedFinding[],
+	findings: readonly ReviewFinding[],
+): string {
 	const resolved = carried.filter((c) => c.status === 'resolved').length;
 	const outstanding = carried.length - resolved;
-	const news = newCount === 0 ? '**0 new findings**' : `**${newCount} new**`;
+	// The disposition counts answer "was every point addressed", but they say
+	// nothing about how hard the remaining work is — so the histogram still rides
+	// along whenever this pass reported anything.
+	const news =
+		findings.length === 0
+			? '**0 new findings**'
+			: `**${findings.length} new** (${severityHistogram(findings)})`;
 	return `**Carried: ${resolved} resolved · ${outstanding} outstanding** — ${news}`;
 }
 
@@ -108,7 +136,7 @@ function header(context: ReviewBodyContext): string[] {
 	const { handoff, headSha } = context;
 	const counts =
 		handoff.carried.length > 0
-			? carriedSummary(handoff.carried, handoff.findings.length)
+			? carriedSummary(handoff.carried, handoff.findings)
 			: findingsSummary(handoff);
 	return [
 		`> ${passLabel(context)} · \`${handoff.verdict}\` · head \`${headSha}\``,
@@ -132,7 +160,9 @@ function disposition(carried: readonly ReviewCarriedFinding[]): string[] {
 		'',
 		'| ID | Finding | Status |',
 		'| --- | --- | --- |',
-		...carried.map((c) => `| ${c.id} | ${c.title} | ${CARRIED_STATUS_LABELS[c.status]} |`),
+		...carried.map(
+			(c) => `| ${cell(c.id)} | ${cell(c.title)} | ${CARRIED_STATUS_LABELS[c.status]} |`,
+		),
 		'',
 		...carried.flatMap((c) => [
 			`### ${c.id} · ${CARRIED_STATUS_LABELS[c.status]}`,
@@ -160,7 +190,7 @@ function verification(handoff: ReviewHandoff): string[] {
 		'| Command | Result |',
 		'| --- | --- |',
 		...handoff.verification.map(
-			(v) => `| \`${v.command}\` | ${v.outcome === 'passed' ? 'passed' : '**failed**'} |`,
+			(v) => `| \`${cell(v.command)}\` | ${v.outcome === 'passed' ? 'passed' : '**failed**'} |`,
 		),
 		'',
 		`**Docs checked** — ${docs}`,
@@ -184,6 +214,9 @@ function blockingFinding(finding: ReviewFinding): string[] {
 		'',
 		'**Fix plan.**',
 		'',
+		// The refinement guarantees all four blocking slots are present; the `??`
+		// is only for the type checker, which cannot see a `superRefine`. The three
+		// string slots above need no equivalent — they interpolate as-is.
 		...(finding.fixPlan ?? []).map((step, index) => `${index + 1}. ${step}`),
 		'',
 		`**Tests.** ${finding.tests}`,
