@@ -55,6 +55,7 @@ import {
 	submitPullRequestReview,
 	withGitHubToken,
 } from './client.js';
+import { createOperatorDeliveryProvider } from './operator-delivery.js';
 import { getPersonaForLogin, isSwarmBot, resolvePersonaIdentities } from './personas.js';
 import {
 	isSwarmGeneratedGitHubEvent,
@@ -384,8 +385,9 @@ export class GitHubSCMIntegration implements SCMProvider {
 
 	/**
 	 * {@link SCMProvider.deliveryProvider} — the same-host, per-persona delivery
-	 * seam. Not the only producer of an {@link ScmDeliveryProvider}: see the
-	 * contract's note on `operator-delivery.ts` and `src/scm/transport-delivery.ts`.
+	 * seam. Not the only producer of an {@link ScmDeliveryProvider}: see
+	 * {@link GitHubSCMIntegration.operatorDeliveryProvider} and
+	 * `src/scm/transport-delivery.ts`.
 	 */
 	async deliveryProvider(
 		project: ProjectConfig,
@@ -424,5 +426,17 @@ export class GitHubSCMIntegration implements SCMProvider {
 			submitReview: (input) => scoped(() => submitPullRequestReview(owner, repo, input)),
 			postComment: (input) => scoped(() => postIdempotentPullRequestComment(owner, repo, input)),
 		};
+	}
+
+	/**
+	 * {@link SCMProvider.operatorDeliveryProvider} — the operator-credential
+	 * delivery seam a DB-free federated worker runs its source-carrying ops on,
+	 * built by `./operator-delivery.js` (which keeps every GitHub specific — the
+	 * `x-access-token` push header, the noreply commit email — inside this module).
+	 * `submitReview` on the returned provider deliberately throws: a reviewer
+	 * verdict is the server's write to make under the project's reviewer PAT.
+	 */
+	async operatorDeliveryProvider(repo: string, credential: string): Promise<ScmDeliveryProvider> {
+		return createOperatorDeliveryProvider(repo, credential);
 	}
 }

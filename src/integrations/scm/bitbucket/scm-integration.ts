@@ -477,4 +477,15 @@ export class BitbucketSCMIntegration implements SCMProvider {
 				scoped(() => postIdempotentBitbucketPullRequestComment(workspace, slug, input)),
 		};
 	}
+
+	/**
+	 * {@link SCMProvider.operatorDeliveryProvider} — operator-credential delivery
+	 * for DB-free workers. Not implemented for Bitbucket.
+	 */
+	async operatorDeliveryProvider(
+		_repo: string,
+		_credential: string,
+	): Promise<ScmDeliveryProvider> {
+		throw new Error('operatorDeliveryProvider is not implemented for Bitbucket SCM');
+	}
 }

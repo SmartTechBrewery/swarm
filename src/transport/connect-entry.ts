@@ -12,7 +12,8 @@
  * live so the eligibility gate sees it as connected. On each pushed
  * `TaskAssignment` it runs the phase **DB-free** (`./assignment-execution.ts`):
  * the project config comes from the assignment's non-secret slice, source-carrying
- * delivery uses the operator token, the reviewer/PM metadata writes go up to the
+ * delivery uses the operator token through the registered SCM provider
+ * (`SCMProvider.operatorDeliveryProvider`), the reviewer/PM metadata writes go up to the
  * control plane's delivery API (`./delivery-client.ts`) so those credentials stay
  * server-side, and results stream back over the transport back-channel. Every
  * phase but `planning` runs this way — `respond-to-review` included, since issue
@@ -25,6 +26,13 @@ import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
+// Register every integration, so the DB-free executor can resolve this project's
+// SCM provider from the registry instead of naming one (ai/RULES.md §2) — the same
+// side-effect import `../router/webhook-receiver.ts` and `../api/router.ts` do.
+// Safe on a DB-free worker: nothing in that module graph opens a Postgres or Redis
+// connection at load (`getDb()` is lazy, `src/db/client.ts`), so this process still
+// connects to neither.
+import '../integrations/entrypoint.js';
 import { requireEnv, resolveOperatorGitHubToken } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';

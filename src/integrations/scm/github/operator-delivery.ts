@@ -11,6 +11,10 @@
  * comment) sourced from that single token instead, per RULES §2 (GitHub
  * specifics stay under `src/integrations/scm/github/`).
  *
+ * Shared code never imports this directly: it is GitHub's implementation of
+ * `SCMProvider.operatorDeliveryProvider` (`../../../scm/types.ts`), which the
+ * DB-free executor resolves through the registry (issue #462).
+ *
  * `submitReview` is intentionally unavailable: a reviewer verdict is a metadata
  * write the server owns (the Phase-2 delivery API), never something a worker
  * performs under the operator's implementer identity. The Phase-1 source-only

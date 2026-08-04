@@ -444,6 +444,7 @@ export function createFakeScmProvider(overrides: Partial<SCMProvider> = {}): SCM
 		commentOnPullRequest: unstubbed('commentOnPullRequest'),
 		mergePullRequest: unstubbed('mergePullRequest'),
 		deliveryProvider: unstubbed('deliveryProvider'),
+		operatorDeliveryProvider: unstubbed('operatorDeliveryProvider'),
 		...overrides,
 	};
 }
