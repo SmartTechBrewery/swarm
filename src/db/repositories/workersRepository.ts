@@ -133,6 +133,26 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * (`allowedClis`) and has no phase dimension. A daemon that stops supporting a
  * phase narrows its own eligibility rather than invalidating an enrollment.
  */
+/**
+ * The CLIs some enrollment still requires that `capabilities` would no longer
+ * provide — the reduction {@link updateWorkerCapabilities} refuses. Pure and
+ * extracted so that transaction reads as its three steps (lock → validate →
+ * write) rather than carrying the set arithmetic inline.
+ */
+function clisRequiredByEnrollments(
+	enrollments: { allowedClis: unknown }[],
+	capabilities: AgentCli[],
+): AgentCli[] {
+	const declared = new Set(capabilities);
+	const offending = new Set<AgentCli>();
+	for (const enrollment of enrollments) {
+		for (const cli of enrollment.allowedClis as AgentCli[]) {
+			if (!declared.has(cli)) offending.add(cli);
+		}
+	}
+	return [...offending];
+}
+
 export async function updateWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
@@ -153,20 +173,9 @@ export async function updateWorkerCapabilities(
 			.from(workerProjectEnrollments)
 			.where(eq(workerProjectEnrollments.workerId, id));
 
-		const newCapSet = new Set(capabilities);
-		const offendingSet = new Set<AgentCli>();
-
-		for (const enrollment of enrollments) {
-			const allowedClis = enrollment.allowedClis as AgentCli[];
-			for (const cli of allowedClis) {
-				if (!newCapSet.has(cli)) {
-					offendingSet.add(cli);
-				}
-			}
-		}
-
-		if (offendingSet.size > 0) {
-			throw new WorkerCapabilityReductionError(id, Array.from(offendingSet));
+		const offending = clisRequiredByEnrollments(enrollments, capabilities);
+		if (offending.length > 0) {
+			throw new WorkerCapabilityReductionError(id, offending);
 		}
 
 		const [updatedRow] = await tx
