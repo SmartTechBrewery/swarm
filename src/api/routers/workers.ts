@@ -7,6 +7,7 @@ import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	enrollWorker,
+	getDashboardWorkerDetail,
 	getEnrollment,
 	listDashboardWorkers,
 	listOwnerWorkers,
@@ -16,7 +17,7 @@ import {
 	updateEnrollmentConstraints,
 } from '../../identity/worker-enrollment-service.js';
 import { getWorker, type Worker } from '../../identity/worker-service.js';
-import { accessibleProjectScope, assertProjectAccess } from '../authz.js';
+import { accessibleProjectScope, assertProjectAccess, mayAccessProject } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
 /**
@@ -27,7 +28,10 @@ import { authedProcedure, router } from '../trpc.js';
  * - **Installation roster** (`list`, #133): the read-only cross-project
  *   connectivity view the dashboard's Workers screen renders, bounded by
  *   `accessibleProjectScope` — an `instanceAdmin` sees every registered worker,
- *   anyone else only workers enrolled in projects they may access.
+ *   anyone else only workers enrolled in projects they may access. `getById`
+ *   (#477) returns that same row for one worker, widened with per-project
+ *   enrollment detail and with what the *viewer* may change, so the detail screen
+ *   offers only controls that would succeed.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
  *   (`enroll`), and controls the revocable sharing consent (`setConsent`) and
@@ -112,6 +116,40 @@ export const workersRouter = router({
 			lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
 		}));
 	}),
+
+	// One worker in detail (#477) — the same row `list` returns, widened with the
+	// full enrollment detail per visible project and with the two capability flags
+	// the detail screen needs to decide which controls to offer. Visibility is the
+	// same `accessibleProjectScope` rule as `list`, and an invisible worker is
+	// `NOT_FOUND` exactly like a missing one, so existence never leaks. Read-only:
+	// the flags *report* the authorization each mutation re-checks for itself.
+	getById: authedProcedure
+		.input(z.object({ workerId: z.string().uuid() }))
+		.query(async ({ ctx, input }) => {
+			const scope = await accessibleProjectScope(ctx.user);
+			const detail = await getDashboardWorkerDetail(input.workerId, scope);
+			if (!detail) throw workerNotFound(input.workerId);
+			// The owner-controlled values (sharing consent, execution constraints) are
+			// gated by `resolveOwnedEnrollment` below, so the flag mirrors it exactly.
+			const viewerIsOwner = isInstanceAdmin(ctx.user) || detail.ownerUserId === ctx.user.id;
+			const enrollments = await Promise.all(
+				detail.enrollments.map(async (enrollment) => ({
+					...enrollment,
+					// Approval and suspend/reactivate are the project administrator's.
+					viewerCanAdminister: await mayAccessProject(
+						ctx.user,
+						enrollment.projectId,
+						'projectAdmin',
+					),
+				})),
+			);
+			return {
+				...detail,
+				lastSeenAt: detail.lastSeenAt?.toISOString() ?? null,
+				viewerIsOwner,
+				enrollments,
+			};
+		}),
 
 	// --- Owner self-service (scoped to ctx.user) ---
 

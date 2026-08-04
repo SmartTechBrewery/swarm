@@ -66,6 +66,7 @@ import {
 	approveEnrollment,
 	deriveWorkerRunState,
 	enrollWorker,
+	getDashboardWorkerDetail,
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
@@ -760,5 +761,100 @@ describe('status / consent write delegation', () => {
 		setEnrollmentSharingConsent.mockResolvedValue(makeEnrollment({ sharingConsent: false }));
 		await setSharingConsent(ENROLLMENT_ID, false);
 		expect(setEnrollmentSharingConsent).toHaveBeenCalledWith(ENROLLMENT_ID, false);
+	});
+});
+
+describe('getDashboardWorkerDetail (issue #477)', () => {
+	beforeEach(() => {
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getRetainedSessionForWorker.mockResolvedValue(undefined);
+		getUserById.mockResolvedValue(makeOwner());
+	});
+
+	it('carries the full enrollment detail per project, not just project + status', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ allowedClis: ['claude'], concurrencyAllocation: 2, sharingConsent: true }),
+		]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.enrollments).toEqual([
+			{
+				enrollmentId: ENROLLMENT_ID,
+				projectId: 'proj-a',
+				status: 'active',
+				allowedClis: ['claude'],
+				concurrencyAllocation: 2,
+				sharingConsent: true,
+				isRoutable: true,
+			},
+		]);
+		// The roster row's own fields come along unchanged, so the detail view needs
+		// no second query for identity, connectivity, or the capability axes.
+		expect(detail?.displayName).toBe('ada-laptop');
+		expect(detail?.connection).toBe('offline');
+		expect(detail?.capabilities).toEqual(['claude', 'codex']);
+		expect(detail?.supportedPhases.length).toBeGreaterThan(0);
+		expect(detail?.ownerUserId).toBe(OWNER_ID);
+	});
+
+	it('reports an unapproved or unshared enrollment as not routable', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ status: 'pending', sharingConsent: true }),
+			makeEnrollment({ id: 'e2', projectId: 'proj-b', status: 'active', sharingConsent: false }),
+		]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.enrollments.map((e) => e.isRoutable)).toEqual([false, false]);
+	});
+
+	it('strips enrollments in projects a restricted viewer may not access', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ projectId: 'proj-a' }),
+			makeEnrollment({ id: 'e2', projectId: 'proj-secret' }),
+		]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, ['proj-a']);
+
+		expect(detail?.enrollments.map((e) => e.projectId)).toEqual(['proj-a']);
+	});
+
+	it('hides a worker a restricted viewer shares no project with', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment({ projectId: 'proj-secret' })]);
+
+		expect(await getDashboardWorkerDetail(WORKER_ID, ['proj-a'])).toBeNull();
+	});
+
+	it('shows an administrator a registered-but-un-enrolled machine', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.enrollments).toEqual([]);
+	});
+
+	it('is null for an unknown worker and for a viewer with no accessible project', async () => {
+		getWorkerById.mockResolvedValue(undefined);
+		expect(await getDashboardWorkerDetail(WORKER_ID, null)).toBeNull();
+
+		getWorkerById.mockResolvedValue(makeWorker());
+		expect(await getDashboardWorkerDetail(WORKER_ID, [])).toBeNull();
+		// A viewer with no accessible project is answered without a worker read at all.
+		expect(getWorkerById).toHaveBeenCalledTimes(1);
+	});
+
+	it('leaks no secret from the worker, owner, or enrollment rows', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(JSON.stringify(detail)).not.toMatch(/credential|password|token|repoRoot/i);
 	});
 });

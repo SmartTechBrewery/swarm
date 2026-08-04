@@ -46,10 +46,15 @@ function WorkItemTitle({
 		: 'block w-full truncate text-zinc-200';
 	if (titleHref) {
 		// A run whose title hasn't resolved still needs a way in, so the link falls
-		// back to naming itself rather than leaving the cell blank.
+		// back to naming itself rather than leaving the cell blank. It stops
+		// propagation for the same reason the reference line below does: the Workers
+		// row navigates to the *worker* on click (issue #477), and this link is the
+		// way to the *run* — the row must not swallow it.
 		return (
 			<a
 				href={titleHref}
+				onClick={(event) => event.stopPropagation()}
+				onKeyDown={(event) => event.stopPropagation()}
 				className={`${titleClass} hover:text-violet-300 hover:underline`}
 				title={title ?? undefined}
 			>

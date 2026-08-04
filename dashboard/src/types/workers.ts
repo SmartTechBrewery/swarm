@@ -6,10 +6,13 @@
  * `OwnerWorkerView`.
  *
  * Everything here is secret-free by construction on the server: no machine path,
- * credential, token, or credential hash crosses the wire. The one operable field
- * the Workers screen exposes is the owner-controlled `sharingConsent` toggle
- * (#282) — wired to `workers.setConsent`, which enforces ownership server-side;
- * everything else (approval, routing, machine lifecycle) stays read-only.
+ * credential, token, or credential hash crosses the wire. The Workers *table*
+ * exposes one operable field, the owner-controlled `sharingConsent` toggle
+ * (#282); the per-worker detail view (#477) adds the enrollment's execution
+ * constraints (owner) and its approval/suspension (project administrator), each
+ * offered only where the server-declared capability flag says the viewer may
+ * change it. Self-declared facts — `capabilities` and `supportedPhases`, which a
+ * daemon states at handshake — stay read-only everywhere.
  */
 
 /** Whether the worker's lease is live under the heartbeat TTL right now. */
@@ -69,6 +72,51 @@ export interface WorkerRow {
 	currentRun: WorkerActiveRun | null;
 	/** Only enrollments in projects the viewer may access; empty for an un-enrolled machine. */
 	enrollments: WorkerEnrollmentSummary[];
+}
+
+/**
+ * One enrollment on the worker detail view (`workers.getById`, issue #477,
+ * mirroring the service `DashboardWorkerEnrollmentDetail` plus the router's
+ * viewer-capability flag). These five facts are what answer "why is this machine
+ * not taking work here?" — approval state, the effective CLIs, the concurrency
+ * allocation, the owner's consent, and the derived routing verdict. Secret-free.
+ */
+export interface WorkerDetailEnrollment {
+	enrollmentId: string;
+	projectId: string;
+	status: WorkerEnrollmentStatus;
+	/** Effective CLIs this project may run on the worker — a subset of its capabilities. */
+	allowedClis: string[];
+	/** Optional per-worker sub-limit for this project; `null` = none (bounded by worker + project caps). */
+	concurrencyAllocation: number | null;
+	sharingConsent: boolean;
+	/** Server-derived: `active` **and** consented. The only field the dispatch gate reads. */
+	isRoutable: boolean;
+	/**
+	 * Whether the viewer administers this enrollment's project, so approval and
+	 * suspend/reactivate may be offered. Declared by the server — the same check
+	 * `workers.approveEnrollment`/`setStatus` re-run — never inferred client-side.
+	 */
+	viewerCanAdminister: boolean;
+}
+
+/**
+ * One worker in full (`workers.getById`, issue #477): the roster row's identity,
+ * connectivity, declared capabilities and active job, plus one enrollment block
+ * per project the viewer may see. Secret-free like every other worker read model
+ * — no machine path, worker credential, credential hash, or project PAT.
+ */
+export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
+	/** The owner's user id — the non-secret identity, never a credential. */
+	ownerUserId: string;
+	/**
+	 * Whether the viewer may change the owner-controlled values (sharing consent
+	 * and execution constraints). Declared by the server, which re-checks
+	 * ownership on every such mutation; `true` for the owner and for an
+	 * installation administrator, exactly as the mutations resolve it.
+	 */
+	viewerIsOwner: boolean;
+	enrollments: WorkerDetailEnrollment[];
 }
 
 /**

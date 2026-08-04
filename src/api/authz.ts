@@ -75,6 +75,29 @@ export async function assertProjectAccess(
 }
 
 /**
+ * Whether `user` may act on `projectId` at (at least) `minRole` — the
+ * non-throwing counterpart to {@link assertProjectAccess}, applying the identical
+ * rule (an `instanceAdmin` always may; anyone else needs a membership at
+ * `minRole` or above).
+ *
+ * For a procedure that *reports* a capability instead of enforcing it: a read
+ * model telling the dashboard which controls to offer (issue #477 — the Workers
+ * detail view asks whether the viewer administers each project so it never draws
+ * an approve/suspend control that would come back `FORBIDDEN`). Enforcement still
+ * happens in the mutation itself, which calls `assertProjectAccess`; this only
+ * spares the client from guessing.
+ */
+export async function mayAccessProject(
+	user: SwarmUser,
+	projectId: string,
+	minRole: ProjectRole,
+): Promise<boolean> {
+	if (isInstanceAdmin(user)) return true;
+	const membership = await getMembership(user.id, projectId);
+	return membership !== undefined && roleAtLeast(membership.role, minRole);
+}
+
+/**
  * The set of project ids `user` may access, or `null` when there is no
  * restriction at all (an `instanceAdmin` sees every project). Callers scoping a
  * cross-project query treat `null` as "no filter" and an empty array as "match

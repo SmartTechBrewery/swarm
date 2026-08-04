@@ -1,6 +1,8 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { ChevronRight } from 'lucide-react';
 import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
+import { Badge } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
@@ -30,15 +32,24 @@ import type {
  *
  * Consent state comes from `workers.roster` (readable by any project
  * `contributor`), so that unavailability is visible with no machine path, token,
- * or credential. The screen deliberately shows *less* than the roster read model
+ * or credential. The table deliberately shows *less* than the roster read model
  * carries (issue #473): approval state, effective allowed CLIs, and per-project
  * busy/idle were dropped from the old Enrollment cell rather than crowding one
- * column with five unrelated facts — busy already reads off **Active job**.
+ * column with five unrelated facts — busy already reads off **Active job**. Those
+ * facts, and the controls that administer them, now live one click away on the
+ * per-worker detail view (issue #477): a row click opens it, so the table stays
+ * the scannable index.
  */
 
 interface WorkersTableProps {
 	workers: WorkerRow[];
 	refetchInterval?: number;
+	/**
+	 * Opens one machine's detail view (issue #477). The table stays the scannable
+	 * index and knows nothing about the router: the route passes a navigate
+	 * callback, exactly as the Agent Configuration summary hands its phase rows one.
+	 */
+	onSelectWorker?: (workerId: string) => void;
 }
 
 /**
@@ -53,9 +64,11 @@ const COLUMN_WIDTHS = {
 	machine: 'w-[16%]',
 	owner: 'w-[14%]',
 	status: 'w-[9%]',
-	capabilities: 'w-[21%]',
-	activeJob: 'w-[30%]',
+	capabilities: 'w-[20%]',
+	activeJob: 'w-[27%]',
 	available: 'w-[10%]',
+	// Just the chevron that opens the detail view — the narrowest column that fits it.
+	open: 'w-[4%]',
 };
 
 /** A stable key for one `(worker, project)` enrollment across the roster/owner read models. */
@@ -89,10 +102,6 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
 	);
 }
 
-/** The meta-pill geometry every capability badge shares; only the hue differs. */
-const BADGE_BASE =
-	'px-2 py-0.5 text-[10px] uppercase font-mono font-bold tracking-wider rounded border';
-
 /**
  * What the machine can run, on both capability axes (issue #467). A `PLANNING`
  * badge leads when the daemon declared that phase, in the violet accent so it
@@ -111,17 +120,12 @@ function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
 	return (
 		<div className="flex flex-wrap gap-1">
 			{canPlan ? (
-				<span
-					title="This machine's daemon can run the Planning phase"
-					className={`${BADGE_BASE} bg-violet-950/30 text-violet-300 border-violet-900/30`}
-				>
+				<Badge tone="accent" title="This machine's daemon can run the Planning phase">
 					planning
-				</span>
+				</Badge>
 			) : null}
 			{worker.capabilities.map((cli) => (
-				<span key={cli} className={`${BADGE_BASE} bg-zinc-850 text-zinc-400 border-zinc-800`}>
-					{cli}
-				</span>
+				<Badge key={cli}>{cli}</Badge>
 			))}
 		</div>
 	);
@@ -265,7 +269,7 @@ interface ConfirmTarget {
 	projectName: string;
 }
 
-export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
+export function WorkersTable({ workers, refetchInterval, onSelectWorker }: WorkersTableProps) {
 	const queryClient = useQueryClient();
 
 	// Resolve projects the same way RunsTable does — names for the consent
@@ -425,6 +429,7 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 					<col className={COLUMN_WIDTHS.capabilities} />
 					<col className={COLUMN_WIDTHS.activeJob} />
 					<col className={COLUMN_WIDTHS.available} />
+					<col className={COLUMN_WIDTHS.open} />
 				</colgroup>
 				<thead>
 					<tr className="bg-zinc-800/30 border-b border-zinc-800">
@@ -446,11 +451,26 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
 							Available
 						</th>
+						<th className="px-3 py-3">
+							<span className="sr-only">Open</span>
+						</th>
 					</tr>
 				</thead>
 				<tbody className="divide-y divide-zinc-800/60">
 					{workers.map((worker) => (
-						<tr key={worker.workerId} className="hover:bg-zinc-800/40 transition-colors">
+						// Mouse users can click anywhere on the row; keyboard/AT users reach
+						// the explicit button in the trailing cell, which carries the
+						// accessible name and focus (the same shape the Agent Configuration
+						// summary uses — a role="button" <tr> trips Biome a11y and is worse
+						// for AT than a real control). The in-row controls and links stop
+						// propagation, so they still do their own thing.
+						<tr
+							key={worker.workerId}
+							onClick={() => onSelectWorker?.(worker.workerId)}
+							className={`hover:bg-zinc-800/40 focus-within:bg-zinc-800/40 transition-colors ${
+								onSelectWorker ? 'cursor-pointer' : ''
+							}`}
+						>
 							<td className="px-3 py-3 align-top text-sm font-medium text-zinc-100 break-words">
 								{worker.displayName}
 							</td>
@@ -494,6 +514,21 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 									errorMessage={consentMutation.error?.message ?? null}
 									onToggle={handleToggle}
 								/>
+							</td>
+							<td className="px-3 py-3 align-top text-right">
+								{onSelectWorker ? (
+									<button
+										type="button"
+										onClick={(event) => {
+											event.stopPropagation();
+											onSelectWorker(worker.workerId);
+										}}
+										aria-label={`Open ${worker.displayName} details`}
+										className="inline-flex items-center justify-center rounded p-1 text-zinc-500 hover:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
+									>
+										<ChevronRight className="h-4 w-4" aria-hidden="true" />
+									</button>
+								) : null}
 							</td>
 						</tr>
 					))}

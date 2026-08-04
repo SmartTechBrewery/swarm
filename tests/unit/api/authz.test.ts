@@ -14,6 +14,7 @@ import {
 	accessibleProjectScope,
 	assertProjectAccess,
 	filterAccessibleProjects,
+	mayAccessProject,
 } from '@/api/authz.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import type { SwarmUser } from '@/identity/schema.js';
@@ -91,6 +92,36 @@ describe('assertProjectAccess', () => {
 	it('lets a projectAdmin through the projectAdmin floor', async () => {
 		getMembership.mockResolvedValue(membership('projectAdmin'));
 		await expect(assertProjectAccess(user(), 'proj-a', 'projectAdmin')).resolves.toBeUndefined();
+	});
+});
+
+describe('mayAccessProject (issue #477)', () => {
+	beforeEach(() => {
+		getMembership.mockReset();
+		listAccessibleProjectIds.mockReset();
+	});
+
+	it('reports true for an instanceAdmin without consulting membership', async () => {
+		await expect(
+			mayAccessProject(user({ instanceAdmin: true }), 'proj-a', 'projectAdmin'),
+		).resolves.toBe(true);
+		expect(getMembership).not.toHaveBeenCalled();
+	});
+
+	it('reports false for a non-member rather than throwing', async () => {
+		getMembership.mockResolvedValue(undefined);
+		await expect(mayAccessProject(user(), 'proj-a', 'contributor')).resolves.toBe(false);
+	});
+
+	it('reports false for a member below the required role', async () => {
+		getMembership.mockResolvedValue(membership('member'));
+		await expect(mayAccessProject(user(), 'proj-a', 'projectAdmin')).resolves.toBe(false);
+	});
+
+	it('reports true for a member at or above the required role', async () => {
+		getMembership.mockResolvedValue(membership('projectAdmin'));
+		await expect(mayAccessProject(user(), 'proj-a', 'projectAdmin')).resolves.toBe(true);
+		expect(getMembership).toHaveBeenCalledWith(USER_ID, 'proj-a');
 	});
 });
 
