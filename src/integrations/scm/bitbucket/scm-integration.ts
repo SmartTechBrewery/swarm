@@ -236,6 +236,10 @@ export class BitbucketSCMIntegration implements SCMProvider {
 		notImplementedYet('deliveryProvider', WRITE_PHASE);
 	}
 
+	async operatorDeliveryProvider(): Promise<ScmDeliveryProvider> {
+		notImplementedYet('operatorDeliveryProvider', WRITE_PHASE);
+	}
+
 	async mergePullRequest(): Promise<MergePullRequestOutcome> {
 		notImplementedYet('mergePullRequest', WRITE_PHASE);
 	}

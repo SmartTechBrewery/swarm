@@ -9,7 +9,8 @@
  * counterpart, {@link runAssignmentDbFree}, which runs entirely from the
  * assignment itself: the project config is reconstructed from the non-secret
  * slice (`./db-free-project.ts`), source-carrying delivery uses the operator's
- * own token (`../integrations/scm/github/operator-delivery.ts`), the two kinds of
+ * own credential through the registered SCM provider
+ * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`), the two kinds of
  * metadata write the operator token *cannot* perform — a review under the
  * project's reviewer PAT, a board write under its PM credential — ride the
  * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2), live
@@ -28,7 +29,7 @@
 import type { ProjectConfig } from '../config/schema.js';
 import { runAgentCli } from '../harness/agent-cli.js';
 import { AgentRunError, agentRunError } from '../harness/agent-failure.js';
-import { createOperatorDeliveryProvider } from '../integrations/scm/github/operator-delivery.js';
+import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
@@ -308,7 +309,7 @@ export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhas
  * be authored by the implementer identity (the operator, as in Implementation) —
  * routing it through a composite built for the reviewer persona would have the
  * reviewer answering its own review, and the author-persona routing that decides
- * what a comment event means (`getPersonaForLogin`, `../integrations/scm/github/webhook.ts`)
+ * what a comment event means (`SCMProvider.personaForActor`, `../scm/types.ts`)
  * would read the wrong persona off it. The composite states `persona: 'reviewer'`
  * explicitly, so the frame carries the identity this Review write runs under
  * rather than leaving the server to infer one (issue #444).
@@ -386,14 +387,20 @@ function resolveDbFreeReviewLedger(
 
 /**
  * Collaborators {@link runAssignmentDbFree} resolves. Defaulted to the shared
- * phase-runner switch and the operator-token delivery builder; a unit test
- * injects fakes so it can drive succeeded/deferred/failed settlements without a
- * real agent CLI or a live GitHub client — and, by never providing a DB, prove
- * the path touches neither Postgres nor Redis.
+ * phase-runner switch and the registered provider's operator-credential delivery;
+ * a unit test injects fakes so it can drive succeeded/deferred/failed settlements
+ * without a real agent CLI or a live provider client — and, by never providing a
+ * DB, prove the path touches neither Postgres nor Redis.
  */
 export interface DbFreeAssignmentDeps {
 	runPhase: (inputs: AssignedPhaseInputs) => Promise<PhaseRunResult>;
-	buildDelivery: (repo: string, token: string) => Promise<ScmDeliveryProvider>;
+	/**
+	 * Build the operator-credential delivery provider for a repo. Omitted in
+	 * production, where it resolves through the registry
+	 * ({@link resolveOperatorDelivery}); kept provider-free — `(repo, credential)`,
+	 * no `ProjectConfig` — so a test injects a stub without standing up a manifest.
+	 */
+	buildDelivery?: (repo: string, credential: string) => Promise<ScmDeliveryProvider>;
 	/** The underlying agent runner the streaming wrapper wraps — the raw CLI by default. */
 	baseRunAgent: typeof runAgentCli;
 	/**
@@ -408,16 +415,42 @@ export interface DbFreeAssignmentDeps {
 function resolveDbFreeDeps(overrides: Partial<DbFreeAssignmentDeps> = {}): DbFreeAssignmentDeps {
 	return {
 		runPhase: overrides.runPhase ?? runAssignedPhase,
-		buildDelivery: overrides.buildDelivery ?? createOperatorDeliveryProvider,
+		buildDelivery: overrides.buildDelivery,
 		baseRunAgent: overrides.baseRunAgent ?? runAgentCli,
 		fetchImpl: overrides.fetchImpl,
 		logger: overrides.logger ?? defaultLogger,
 	};
 }
 
+/**
+ * Build the operator-credential delivery provider every DB-free phase runs its
+ * source-carrying ops on, through the project's registered SCM provider
+ * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`) rather than by
+ * naming a concrete one (ai/RULES.md §2, issue #462). The registry is populated by
+ * the entrypoint import in `./connect-entry.ts`.
+ *
+ * Resolved here — the one place holding the reconstructed project — rather than in
+ * {@link resolveDbFreeDeps}, which runs before the project exists and must stay
+ * able to log a duplicate ack without one. That also keeps
+ * {@link DbFreeAssignmentDeps.buildDelivery} on its provider-free
+ * `(repo, credential)` shape.
+ */
+function resolveOperatorDelivery(
+	project: ProjectConfig,
+	credential: string,
+	override: DbFreeAssignmentDeps['buildDelivery'],
+): Promise<ScmDeliveryProvider> {
+	if (override) return override(project.repo, credential);
+	return requireProjectSCMProvider(project).operatorDeliveryProvider(project.repo, credential);
+}
+
 /** Options {@link runAssignmentDbFree} reads. */
 export interface RunAssignmentDbFreeOptions {
-	/** The worker operator's own GitHub token (`SWARM_OPERATOR_GH_TOKEN`). */
+	/**
+	 * The worker operator's own account credential for the project's SCM provider,
+	 * resolved from this machine's environment by `./connect-entry.ts`
+	 * (`SWARM_OPERATOR_GH_TOKEN` on GitHub) — never a project credential.
+	 */
 	operatorToken: string;
 	/**
 	 * Base URL of the control plane (`SWARM_CONTROL_PLANE_URL`) — where the
@@ -434,7 +467,7 @@ export interface RunAssignmentDbFreeOptions {
 	shutdownSignal?: AbortSignal;
 	/** Dedup set keyed by `dispatchId`, shared across every assignment on the session. */
 	inFlight?: Set<string>;
-	/** Collaborators (defaulted to the shared phase runner + operator delivery). */
+	/** Collaborators (defaulted to the shared phase runner + registry-resolved operator delivery). */
 	deps?: Partial<DbFreeAssignmentDeps>;
 }
 
@@ -571,7 +604,11 @@ export async function runAssignmentDbFree(
 		}
 
 		const project = reconstructProjectConfig(assignment.projectConfig);
-		const operatorDelivery = await deps.buildDelivery(project.repo, options.operatorToken);
+		const operatorDelivery = await resolveOperatorDelivery(
+			project,
+			options.operatorToken,
+			deps.buildDelivery,
+		);
 		// Where a metadata write this worker cannot perform itself is delivered: the
 		// control plane, authenticated by the worker's own credential (never a
 		// project credential — those stay server-side, ADR-004 §2).

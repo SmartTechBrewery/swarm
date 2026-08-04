@@ -49,6 +49,7 @@ describe('github SCM manifest registration', () => {
 			'listConflictCandidates',
 			'commentOnPullRequest',
 			'deliveryProvider',
+			'operatorDeliveryProvider',
 			'mergePullRequest',
 		] as const) {
 			expect(provider?.[member], member).toBeTypeOf('function');

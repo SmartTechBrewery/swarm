@@ -276,13 +276,31 @@ export interface SCMProvider extends ScmMergeProvider {
 	 *
 	 * Deliberately not asserted to be the *only* source of a delivery provider,
 	 * nor that a delivery provider does all its work in-process. SWARM already
-	 * composes three producers (ADR-002/ADR-003/ADR-004): this method, the
-	 * operator-token provider a DB-free worker uses
-	 * (`src/integrations/scm/github/operator-delivery.ts`), and the
+	 * composes three producers (ADR-002/ADR-003/ADR-004): this method,
+	 * {@link SCMProvider.operatorDeliveryProvider} (the neutral name for the
+	 * operator-credential producer a DB-free worker uses), and the
 	 * transport-backed composite (`src/scm/transport-delivery.ts`) whose
 	 * metadata-only ops POST to the control plane while source-carrying ops
 	 * delegate locally. A caller that has a delivery provider must therefore not
 	 * assume it came from here.
 	 */
 	deliveryProvider(project: ProjectConfig, persona: ScmPersona): Promise<ScmDeliveryProvider>;
+
+	/**
+	 * Build a delivery provider authenticated as the worker *operator's own*
+	 * account rather than a per-project persona credential — the producer a DB-free
+	 * federated worker uses (ADR-003 §2 / ADR-004 §3), which holds no secret store
+	 * to resolve a persona credential from.
+	 *
+	 * `repo` is the provider-neutral `owner/repo` from {@link ProjectConfig}, and
+	 * `credential` the operator's own account token, resolved from the worker's
+	 * environment by its entry point (`src/transport/connect-entry.ts`) rather than
+	 * behind this contract — the credential is the operator's, not the project's,
+	 * so no project config names it.
+	 *
+	 * Metadata-only writes the server owns (a reviewer verdict) may be
+	 * *unavailable* on the returned provider; the caller composes them over the
+	 * transport instead (`src/scm/transport-delivery.ts`).
+	 */
+	operatorDeliveryProvider(repo: string, credential: string): Promise<ScmDeliveryProvider>;
 }

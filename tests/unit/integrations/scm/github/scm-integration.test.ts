@@ -611,4 +611,36 @@ describe('GitHubSCMIntegration', () => {
 			);
 		});
 	});
+
+	// The operator-credential producer a DB-free federated worker resolves through
+	// the registry (issue #462) instead of importing `operator-delivery.ts` itself.
+	describe('operatorDeliveryProvider', () => {
+		it('resolves commit identity from the operator credential, not a persona token', async () => {
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('operator-login');
+			const delivery = await scm.operatorDeliveryProvider(project.repo, 'operator-token');
+
+			expect(delivery.commitIdentity).toEqual({
+				name: 'operator-login',
+				email: 'operator-login@users.noreply.github.com',
+			});
+			// The credential is the operator's own — no secret store is consulted, which
+			// is the whole point on a worker that holds none.
+			expect(getGitHubUserForToken).toHaveBeenCalledWith('operator-token');
+			expect(getPersonaToken).not.toHaveBeenCalled();
+		});
+
+		it('refuses submitReview — a reviewer verdict stays the server delivery API write', async () => {
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('operator-login');
+			const delivery = await scm.operatorDeliveryProvider(project.repo, 'operator-token');
+
+			expect(() =>
+				delivery.submitReview({
+					prNumber: 7,
+					verdict: 'approve',
+					body: 'lgtm',
+					deliveryId: 'd1',
+				}),
+			).toThrow(/submitReview is not available on a worker/i);
+		});
+	});
 });
