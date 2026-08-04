@@ -135,6 +135,114 @@ export function createMockProjectsV2ItemPayload(
 	return payload;
 }
 
+/** A Bitbucket `Account` object as it appears in a webhook body. */
+function bitbucketAccount(nickname: string): Record<string, unknown> {
+	return {
+		nickname,
+		display_name: nickname,
+		uuid: `{uuid-${nickname}}`,
+		account_id: `account-${nickname}`,
+	};
+}
+
+/**
+ * A raw Bitbucket Cloud `pullrequest:*` webhook body, for driving the Bitbucket
+ * webhook adapter. Defaults follow Atlassian's own event-payload reference —
+ * including its **12-character** `source.commit.hash`, which is the abbreviated-hash
+ * invariant `src/integrations/scm/bitbucket/webhook.ts` documents. Nested
+ * overrides replace the whole sub-object (shallow merge), same as
+ * {@link createMockProjectsV2ItemPayload}. Returns a plain object — a webhook
+ * payload is untrusted input the adapter parses, not a validated config shape.
+ */
+export function createMockBitbucketPullRequestPayload(
+	overrides: {
+		actor?: Record<string, unknown>;
+		pullrequest?: Record<string, unknown>;
+		repository?: Record<string, unknown>;
+	} = {},
+): Record<string, unknown> {
+	return {
+		actor: overrides.actor ?? bitbucketAccount('human-dev'),
+		pullrequest: {
+			id: 17,
+			title: 'Add a thing',
+			state: 'OPEN',
+			draft: false,
+			author: bitbucketAccount('human-dev'),
+			source: {
+				branch: { name: 'swarm/issue-17' },
+				commit: { hash: 'd3022fc0ca3d' },
+				repository: { full_name: 'jkwiecien/swarm' },
+			},
+			destination: {
+				branch: { name: 'main' },
+				commit: { hash: 'ce5965ddd289' },
+				repository: { full_name: 'jkwiecien/swarm' },
+			},
+			links: { html: { href: 'https://bitbucket.org/jkwiecien/swarm/pull-requests/17' } },
+			...overrides.pullrequest,
+		},
+		repository: overrides.repository ?? { full_name: 'jkwiecien/swarm' },
+	};
+}
+
+/**
+ * A Bitbucket review-verdict webhook body — a pull-request payload plus the
+ * `{ date, user }` verdict wrapper. `verdictKey` picks the wrapper Bitbucket uses
+ * for the event under test: `approval` for `pullrequest:approved` /
+ * `:unapproved`, `changes_request` for the `changes_request_*` pair. The verdict's
+ * user doubles as the event `actor` by default, which is what Bitbucket sends.
+ */
+export function createMockBitbucketApprovalPayload(
+	overrides: {
+		actor?: Record<string, unknown>;
+		pullrequest?: Record<string, unknown>;
+		repository?: Record<string, unknown>;
+		verdictKey?: 'approval' | 'changes_request';
+		user?: Record<string, unknown>;
+	} = {},
+): Record<string, unknown> {
+	const { verdictKey = 'approval', user, ...prOverrides } = overrides;
+	const verdictUser = user ?? bitbucketAccount('swarm-rev');
+	return {
+		...createMockBitbucketPullRequestPayload({ actor: verdictUser, ...prOverrides }),
+		[verdictKey]: { date: '2026-08-04T10:00:00.000000+00:00', user: verdictUser },
+	};
+}
+
+/**
+ * A raw Bitbucket `repo:commit_status_*` webhook body. Note what it does *not*
+ * carry: no `pullrequest`, and no `commit_status.commit` — the commit is named
+ * only by `links.commit.href`, whose last segment is the **full** 40-character
+ * SHA (unlike a PR payload's abbreviated one).
+ */
+export function createMockBitbucketCommitStatusPayload(
+	overrides: {
+		actor?: Record<string, unknown>;
+		commitStatus?: Record<string, unknown>;
+		repository?: Record<string, unknown>;
+	} = {},
+): Record<string, unknown> {
+	return {
+		actor: overrides.actor ?? bitbucketAccount('ci-bot'),
+		repository: overrides.repository ?? { full_name: 'jkwiecien/swarm' },
+		commit_status: {
+			name: 'Unit Tests',
+			description: 'All tests passed',
+			state: 'SUCCESSFUL',
+			key: 'mybuildtool',
+			type: 'build',
+			url: 'https://my-build-tool.com/builds/MY-PROJECT/BUILD-792',
+			links: {
+				commit: {
+					href: 'https://api.bitbucket.org/2.0/repositories/jkwiecien/swarm/commit/d3022fc0ca3d65c7f6654eea129d6bf0cf0ee08e',
+				},
+			},
+			...overrides.commitStatus,
+		},
+	};
+}
+
 export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent {
 	return ScmEventSchema.parse({
 		kind: 'pull-request',
