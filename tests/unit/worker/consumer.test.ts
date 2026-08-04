@@ -285,8 +285,18 @@ vi.mock('@/db/repositories/appSettingsRepository.js', () => ({
 // #346). Mocked at the same boundary; defaults to "discovery never ran", which
 // keeps every phase on its preferred target.
 const getAllCliQuotas = vi.fn<() => Promise<CliQuotaSnapshot[]>>(async () => []);
+const upsertCliQuota = vi.fn(async () => {});
 vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
 	getAllCliQuotas: () => getAllCliQuotas(),
+	upsertCliQuota: () => upsertCliQuota(),
+}));
+
+// The recovery capability/quota discovery a launch or authentication failure
+// fires (`handlePhaseFailure`) — mocked so the terminal-auth test can assert it
+// ran without shelling out to the real CLIs.
+const discoverCliQuotas = vi.fn(async () => [] as unknown[]);
+vi.mock('@/harness/quota-discovery.js', () => ({
+	discoverCliQuotas: () => discoverCliQuotas(),
 }));
 
 // The consumer's own SCM writes and reads — the interrupted-job and phase-failure
@@ -564,6 +574,7 @@ describe('processJob', () => {
 		getAppSettings.mockResolvedValue({});
 		getAllCliQuotas.mockClear();
 		getAllCliQuotas.mockResolvedValue([]);
+		discoverCliQuotas.mockClear();
 		listProjectDispatchCandidates.mockClear();
 		listProjectDispatchCandidates.mockResolvedValue([]);
 		resolveAssignedUser.mockClear();
@@ -2379,6 +2390,29 @@ describe('processJob', () => {
 		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(outcome.status).toBe('phase-failed');
+	});
+
+	it('fails an auth failure terminally and still refreshes CLI quota discovery', async () => {
+		// Issue #343: an unauthenticated CLI must not be re-enqueued (a retry cannot
+		// succeed until a human re-`/login`s), and must keep firing the recovery
+		// discovery it used to reach through the catch-all `error` kind. `attempt` is
+		// 0 on this job, so `phase-failed` proves terminality, not an exhausted budget.
+		phaseImpl = async () => {
+			throw new AgentRunError('Review agent (claude) exited with code 1 (authentication failed)', {
+				kind: 'auth',
+			});
+		};
+
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+		expect(outcome).toMatchObject({
+			status: 'phase-failed',
+			phase: 'review',
+			taskId: '17',
+			error: 'Review agent (claude) exited with code 1 (authentication failed)',
+			failureDiagnosis: { kind: 'launch-or-authentication' },
+		});
+		expect(discoverCliQuotas).toHaveBeenCalled();
 	});
 
 	it('defers a stalled phase instead of failing it, using minimum delayed-retry floor', async () => {

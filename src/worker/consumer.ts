@@ -2439,6 +2439,9 @@ function knownFailureCondition(
 	if (failureKind === 'rate-limit') return 'provider-rate-limit';
 	if (failureKind === 'capacity') return 'provider-capacity';
 	if (failureKind === 'aborted') return 'worker-shutdown';
+	// A classified auth failure (issue #343) diagnoses off its kind, like the three
+	// above, rather than depending on the exact wording of its message.
+	if (failureKind === 'auth') return 'launch-or-authentication';
 	if (isLaunchOrAuthenticationFailure(error)) return 'launch-or-authentication';
 	return undefined;
 }
@@ -2506,7 +2509,11 @@ async function handlePhaseFailure(
 	const isLaunchOrAuthFailure =
 		!deps.executePhase &&
 		(isLaunchOrAuthenticationFailure(error) ||
-			(err instanceof AgentRunError && err.failure.kind === 'error'));
+			(err instanceof AgentRunError &&
+				// `auth` is named explicitly (issue #343): it used to reach here through
+				// the catch-all `error` kind, and the dashboard's CLI/quota status must
+				// still refresh after a login failure now that it classifies separately.
+				(err.failure.kind === 'error' || err.failure.kind === 'auth')));
 
 	if (isLaunchOrAuthFailure) {
 		void discoverCliQuotas()
@@ -2581,7 +2588,10 @@ async function handlePhaseFailure(
 	// collision is deliberately NOT deferrable (issue #367): provisioning already
 	// reclaimed the checkout if it was safe, so a surviving collision is a protected
 	// checkout raised as a terminal BlockedRecoveryError — re-deferring it would just
-	// loop on the same protected worktree.
+	// loop on the same protected worktree. An `auth` failure is deliberately absent
+	// too (issue #343): the CLI is logged out, so retrying burns the shared retry
+	// budget on a run only a human re-`/login` can unblock — it stays terminal and
+	// its `(authentication failed)` headline tells the operator what to do.
 	const isDeferrable =
 		(err instanceof AgentRunError &&
 			(err.failure.kind === 'rate-limit' ||

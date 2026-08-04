@@ -517,6 +517,76 @@ describe('classifyAgentFailure', () => {
 		expect(failure.kind).toBe('error');
 	});
 
+	// The CLI being logged out (issue #343): terminal, but recognised so the run's
+	// headline says so instead of a bare "exited with code 1".
+	it.each([
+		'Failed to authenticate: OAuth session expired and could not be refreshed',
+		'Not logged in · Please run /login',
+		'Invalid API key · Please run /login',
+		'{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+	])('classifies the observed auth banner %s as auth', (banner) => {
+		expect(classifyAgentFailure(result({ stdout: banner }), NOW)).toEqual({ kind: 'auth' });
+	});
+
+	it('detects an auth banner on stderr too', () => {
+		// The scan reads stdout and stderr as one blob, so the banner can arrive on
+		// either stream — the real incident printed it to stderr.
+		expect(
+			classifyAgentFailure(result({ stderr: 'Not logged in · Please run /login' }), NOW),
+		).toEqual({ kind: 'auth' });
+	});
+
+	it('keeps timeout and abort ahead of an auth banner', () => {
+		const stdout = 'Failed to authenticate: OAuth session expired and could not be refreshed';
+		expect(classifyAgentFailure(result({ stdout, timedOut: true }), NOW)).toEqual({
+			kind: 'timeout',
+		});
+		expect(classifyAgentFailure(result({ stdout, aborted: true }), NOW)).toEqual({
+			kind: 'aborted',
+		});
+	});
+
+	it('prioritizes an auth banner over a trailing response-stall marker', () => {
+		// A definite cause beats the generic give-up marker (as capacity already
+		// does): classified `stalled`, this run would be deferred *and resumed* while
+		// the CLI is still logged out.
+		const failure = classifyAgentFailure(
+			result({
+				stdout:
+					'Failed to authenticate: OAuth session expired and could not be refreshed\n' +
+					'Error: timeout waiting for response',
+			}),
+			NOW,
+		);
+		expect(failure).toEqual({ kind: 'auth' });
+	});
+
+	it('does not classify an auth banner outside the terminal window as auth', () => {
+		// An auth line the agent quoted earlier in the transcript (then continued
+		// past) is borrowed text, not the run's terminal cause.
+		const body = [
+			'Failed to authenticate: OAuth session expired and could not be refreshed',
+			...Array(16).fill('work'),
+		];
+		expect(
+			classifyAgentFailure(result({ stdout: `${body.join('\n')}\nTypeError: boom` }), NOW).kind,
+		).toBe('error');
+	});
+
+	it('does not misread borrowed CI or reviewed-code text about authentication as auth', () => {
+		// respond-to-ci feeds the agent CI logs and review phases read code about
+		// login handling; neither is the CLI reporting itself logged out. The bare
+		// "authentication failed" phrasing git/CI prints is deliberately unmatched.
+		for (const text of [
+			"remote: Authentication failed for 'https://github.com/acme/repo.git'\n" +
+				'Error: process completed with exit code 1.',
+			'The handler should return 401 when the api key is invalid.',
+			'expect(res.body.error).toBe("authentication required")',
+		]) {
+			expect(classifyAgentFailure(result({ stdout: text }), NOW).kind).toBe('error');
+		}
+	});
+
 	it('treats a timed-out run as a timeout regardless of its output', () => {
 		const failure = classifyAgentFailure(
 			result({ exitCode: null, timedOut: true, stdout: "you've hit your session limit" }),
@@ -638,6 +708,22 @@ describe('agentRunError', () => {
 		);
 		expect(err.message).toBe('x exited (stalled) for y');
 		expect(err.failure.kind).toBe('stalled');
+	});
+
+	it('notes an authentication failure', () => {
+		// The real incident's headline (issue #343, run 17b9b573…): the operator sees
+		// what to do without opening the raw run output. Every phase builds its stem
+		// this way, so the suffix reaches all six.
+		const err = agentRunError(
+			result({ stdout: 'Not logged in · Please run /login' }),
+			'Implementation agent (claude) exited with code 1',
+			" for task '337'",
+			NOW,
+		);
+		expect(err.message).toBe(
+			"Implementation agent (claude) exited with code 1 (authentication failed) for task '337'",
+		);
+		expect(err.failure).toEqual({ kind: 'auth' });
 	});
 
 	it('attaches the failed run result so its output can be persisted', () => {
