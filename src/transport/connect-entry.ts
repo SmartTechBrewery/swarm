@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { requireEnv, resolveOperatorGitHubToken } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
-import { runAssignmentDbFree } from './assignment-execution.js';
+import { runAssignmentDbFree, SUPPORTED_DB_FREE_PHASES } from './assignment-execution.js';
 import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discovery.js';
 import { connectWorkerTransport } from './worker-client.js';
 
@@ -76,10 +76,17 @@ async function main(): Promise<void> {
 	// graceful stop before the session is released.
 	const inFlight = new Set<string>();
 	const shutdownSignal = new AbortController();
+	// Declare *which phases* this daemon can execute, not just which CLIs it has
+	// (issue #467). A DB-free daemon runs a strict subset — `planning` needs the PM
+	// write/split surface only a DB-holding worker has — and the control plane cannot
+	// infer that, so it is stated here and the eligibility gate honours it. The gate
+	// in `runAssignmentDbFree` stays as the backstop.
+	const supportedPhases = [...SUPPORTED_DB_FREE_PHASES];
 	const client = connectWorkerTransport({
 		controlPlaneUrl,
 		credential,
 		capabilities,
+		supportedPhases,
 		hostname: host,
 		daemonVersion: resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {
@@ -100,6 +107,7 @@ async function main(): Promise<void> {
 		controlPlaneUrl,
 		hostname: host,
 		capabilities,
+		supportedPhases,
 	});
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session

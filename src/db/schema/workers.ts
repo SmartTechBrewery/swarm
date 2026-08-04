@@ -1,5 +1,6 @@
 import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
+import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../triggers/types.js';
 import { users } from './users.js';
 
 /**
@@ -35,6 +36,22 @@ export const workers = pgTable(
 		displayName: text('display_name').notNull(),
 		/** One of `AgentCliSchema` per element (source of truth in `worker.ts`). */
 		capabilities: jsonb('capabilities').$type<AgentCli[]>().notNull(),
+		/**
+		 * The pipeline phases this worker's daemon declared it can execute (issue
+		 * #467) — the second capability axis alongside `capabilities`, since the
+		 * DB-free remote daemon runs a strict subset of the phases the same-host
+		 * worker does and the two are otherwise indistinguishable to the dispatcher.
+		 * One `TriggerPhase` per element.
+		 *
+		 * `NOT NULL` with an every-phase default so the eligibility gate never has a
+		 * null case to interpret: a worker registered before it ever connects, a row
+		 * that predates this column, and a daemon too old to declare the field all
+		 * read as "every phase" — exactly the behaviour that pre-dated the column.
+		 */
+		supportedPhases: jsonb('supported_phases')
+			.$type<TriggerPhase[]>()
+			.notNull()
+			.default(ALL_TRIGGER_PHASES as TriggerPhase[]),
 		/** SHA-256 of the worker credential — never the raw token; dropped by `rowToWorker`. */
 		credentialHash: text('credential_hash').notNull().unique(),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

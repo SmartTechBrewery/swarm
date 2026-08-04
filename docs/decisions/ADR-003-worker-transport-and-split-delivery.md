@@ -186,6 +186,22 @@ is wider than a delivery seam should carry and stays on the local host worker, a
 over-the-wire secret delivery, which remains unnecessary: the split keeps every
 project credential server-side instead.
 
+> **"Stays on the local host worker" is now enforced, not merely asserted (issue #467).**
+> As originally written this sentence was a statement of fact that no code was
+> responsible for. The handshake declared only CLI capabilities, so the control plane
+> could not tell a DB-free daemon from a same-host one and would select either for
+> `planning`; the DB-free worker then answered with a terminal `status: 'failed'`
+> frame carrying no `failureKind`, which the dispatcher rethrows as a plain error —
+> no deferral budget, no failover, so the dispatch died even with a capable worker
+> connected. The daemon now declares its phase repertoire at handshake
+> (`HandshakeRequestSchema.supportedPhases`, persisted as `workers.supported_phases`),
+> the eligibility gate refuses an incapable candidate (`missing-phase-capability`),
+> and the dispatch takes the existing token-free "wait for an eligible worker"
+> deferral instead. The worker-side gate stays as the backstop. Whoever later widens
+> the delivery API to cover Planning's PM surface only has to grow
+> `SUPPORTED_DB_FREE_PHASES`: the declaration and the gate follow it with no
+> control-plane change.
+
 > **Supersedes issue #300.** #300's gRPC bidirectional control plane is re-scoped:
 > the MVP transport is WebSocket + HTTP on the router, not a gRPC stream. The gRPC
 > `.proto` in PROJECT.md §3 remains the reference for message *shapes* and stays

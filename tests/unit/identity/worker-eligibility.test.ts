@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AgentTarget } from '@/config/schema.js';
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import {
 	type EligibilityResult,
 	evaluateWorkerEligibility,
@@ -20,8 +20,14 @@ import {
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const ENROLLMENT_ID = '22222222-2222-4222-8222-222222222222';
 
-function makeWorker(overrides: Partial<Worker> = {}): Pick<Worker, 'capabilities'> {
-	return { capabilities: ['claude', 'codex'], ...overrides };
+function makeWorker(
+	overrides: Partial<Worker> = {},
+): Pick<Worker, 'capabilities' | 'supportedPhases'> {
+	return {
+		capabilities: ['claude', 'codex'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		...overrides,
+	};
 }
 
 function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnrollment {
@@ -47,6 +53,7 @@ function makeInput(overrides: Partial<WorkerEligibilityInput> = {}): WorkerEligi
 		availability: { connected: true, activeRuns: 0 },
 		target: { cli: 'claude' } satisfies AgentTarget,
 		phaseDefaultCli: 'claude',
+		phase: 'implementation',
 		...overrides,
 	};
 }
@@ -56,11 +63,12 @@ function evaluate(overrides: Partial<WorkerEligibilityInput> = {}): EligibilityR
 }
 
 describe('IneligibilityReasonSchema', () => {
-	it('covers exactly the four predicate reasons', () => {
+	it('covers exactly the five predicate reasons', () => {
 		expect(INELIGIBILITY_REASONS).toEqual([
 			'missing-enrollment',
 			'missing-consent',
 			'worker-unavailable',
+			'missing-phase-capability',
 			'missing-cli-capability',
 		]);
 	});
@@ -150,6 +158,35 @@ describe('evaluateWorkerEligibility', () => {
 		expect(evaluate({ enrollment, availability: { connected: false, activeRuns: 0 } })).toEqual({
 			eligible: false,
 			reason: 'worker-unavailable',
+		});
+	});
+
+	// Issue #467: a DB-free daemon declares every phase but `planning`, and the gate
+	// must refuse it for that phase rather than letting the dispatch reach a worker
+	// that answers with a terminal failure.
+	it('missing-phase-capability when the worker did not declare the dispatched phase', () => {
+		const worker = makeWorker({
+			supportedPhases: ['implementation', 'review', 'respond-to-review', 'respond-to-ci'],
+		});
+		expect(evaluate({ worker, phase: 'planning' })).toEqual({
+			eligible: false,
+			reason: 'missing-phase-capability',
+		});
+	});
+
+	it('is eligible for a phase the worker did declare, with the same narrowed set', () => {
+		const worker = makeWorker({ supportedPhases: ['implementation'] });
+		expect(evaluate({ worker, phase: 'implementation' })).toEqual({ eligible: true });
+	});
+
+	// Phase support is a property of the machine, the CLI one of the candidate target,
+	// so the coarser check reports first — a worker missing both is described as unable
+	// to run the phase rather than as missing a CLI it would never have reached.
+	it('reports the phase before the CLI when the worker is missing both', () => {
+		const worker = makeWorker({ capabilities: ['claude'], supportedPhases: ['implementation'] });
+		expect(evaluate({ worker, phase: 'planning', target: { cli: 'codex' } })).toEqual({
+			eligible: false,
+			reason: 'missing-phase-capability',
 		});
 	});
 

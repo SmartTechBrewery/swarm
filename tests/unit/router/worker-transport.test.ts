@@ -1,8 +1,11 @@
 import { Hono } from 'hono';
 import type { WSContext } from 'hono/ws';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Worker } from '@/identity/worker.js';
-import { WorkerCapabilityReductionError } from '@/identity/worker.js';
+import {
+	DEFAULT_WORKER_SUPPORTED_PHASES,
+	type Worker,
+	WorkerCapabilityReductionError,
+} from '@/identity/worker.js';
 import type { AcquiredSession } from '@/identity/worker-session-service.js';
 import { WorkerSessionHeldError } from '@/identity/worker-session-service.js';
 import { logger } from '@/lib/logger.js';
@@ -15,6 +18,7 @@ import {
 	WS_CLOSE,
 } from '@/router/worker-transport.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
+import type { TriggerPhase } from '@/triggers/types.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
@@ -27,6 +31,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -91,7 +96,23 @@ describe('handleHandshake', () => {
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
 		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000);
-		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['claude']);
+		// `validBody()` declares no `supportedPhases` — the older-daemon shape — so the
+		// handshake records every phase, the behaviour that pre-dated the field (#467).
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+		);
+	});
+
+	it('records a declared phase subset verbatim, without widening it', async () => {
+		const deps = makeDeps();
+		const declared: TriggerPhase[] = ['implementation', 'review'];
+
+		const result = await handleHandshake(deps, { ...validBody(), supportedPhases: declared });
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['claude'], declared);
 	});
 
 	it('rejects a malformed body with 400', async () => {

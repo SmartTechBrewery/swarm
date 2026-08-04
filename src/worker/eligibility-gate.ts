@@ -65,6 +65,7 @@ import {
 	type WorkerDispatchCandidate,
 } from '../identity/worker-enrollment-service.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
+import type { TriggerPhase } from '../triggers/types.js';
 
 /**
  * Why a *dispatch* was refused — Phase 2's per-worker vocabulary plus the one
@@ -129,6 +130,12 @@ export interface DispatchGateInput {
 	/** The phase's coded default CLI, for a target that names none. */
 	phaseDefaultCli: AgentCli;
 	/**
+	 * The phase being dispatched, matched against each candidate's declared
+	 * `supportedPhases` (issue #467) so a worker whose daemon cannot run this phase
+	 * is never selected for it.
+	 */
+	phase: TriggerPhase;
+	/**
 	 * The work item being dispatched, when the phase has one. PR-driven phases
 	 * (review / respond-*) carry no item, so they take the unassigned path.
 	 */
@@ -165,6 +172,10 @@ export interface DispatchGateOptions {
 const REASON_PRIORITY: readonly IneligibilityReason[] = [
 	'worker-unavailable',
 	'missing-cli-capability',
+	// Below `missing-cli-capability` by the same "closer to eligible wins" rule: the
+	// predicate checks phase support *before* the CLI, so a candidate that reported a
+	// missing CLI cleared the phase check and came nearer to eligible (issue #467).
+	'missing-phase-capability',
 	'missing-consent',
 	'missing-enrollment',
 ];
@@ -181,7 +192,7 @@ function aggregateReason(reported: Set<IneligibilityReason>): IneligibilityReaso
 /** Where the refusal message should point a human, per reason. */
 function ineligibilityMessage(
 	reason: DispatchIneligibilityReason,
-	context: { projectId: string; assignee?: string; clis: AgentCli[] },
+	context: { projectId: string; assignee?: string; clis: AgentCli[]; phase: TriggerPhase },
 ): string {
 	const owner = context.assignee
 		? `assignee '${context.assignee}'`
@@ -197,6 +208,8 @@ function ineligibilityMessage(
 			return `No worker for ${owner} has an active enrollment in this project. A project admin must approve the worker's enrollment before it can take work.`;
 		case 'missing-cli-capability':
 			return `No enrolled worker for ${owner} can run any configured model target for this phase (${context.clis.join(', ')}). Enroll a worker that declares and is allowed one of those CLIs, or configure a target this project's workers can run.`;
+		case 'missing-phase-capability':
+			return `No enrolled worker for ${owner} declared that it can run the '${context.phase}' phase. A DB-free remote worker cannot run 'planning' (it needs the board write/split surface only a database-holding worker has), so this phase waits for such a worker to connect.`;
 	}
 }
 
@@ -247,6 +260,7 @@ export async function evaluateDispatchEligibility(
 		projectId: input.projectId,
 		assignee: assigned?.assignee.handle,
 		clis,
+		phase: input.phase,
 	};
 	if (permitted.length === 0) {
 		return {
@@ -268,6 +282,7 @@ export async function evaluateDispatchEligibility(
 				availability: resolveAvailability(candidate, options.isWorkerConnected),
 				target,
 				phaseDefaultCli: input.phaseDefaultCli,
+				phase: input.phase,
 			});
 			if (verdict.eligible) {
 				return {

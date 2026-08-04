@@ -26,7 +26,7 @@ import { z } from 'zod';
 import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js';
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
-import type { TriggerPhase } from '../triggers/types.js';
+import { TriggerPhaseSchema } from '../triggers/types.js';
 
 /**
  * Transport protocol version, sent in both handshake directions. A mismatch is
@@ -70,18 +70,47 @@ export const WorkerHealthSchema = z.object({
 export type WorkerHealth = z.infer<typeof WorkerHealthSchema>;
 
 /**
+ * The transport's name for the pipeline phase vocabulary. It *is* the pipeline's
+ * validator (`TriggerPhaseSchema`, `../triggers/types.ts`) rather than a
+ * re-declaration, so the transport enum and the phase union cannot drift apart —
+ * adding a phase there propagates here with no edit. The alias is kept because
+ * `TaskPhase`/`TaskPhaseSchema` is the vocabulary every frame shape below is
+ * written in.
+ */
+export const TaskPhaseSchema = TriggerPhaseSchema;
+export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
+
+/**
  * `POST /worker/session` request body — the handshake that opens an authenticated
  * session. The raw `credential` authenticates the worker against the roster
  * (never logged, never echoed back); `capabilities` is the CLI set the daemon
  * declares it can run, applied to the worker on connect. `daemonVersion` and
  * `hostname` are diagnostic. Connect-time health is implicit in a successful
  * handshake; ongoing health rides the heartbeat.
+ *
+ * `supportedPhases` is the second capability axis (issue #467): *which pipeline
+ * phases* this daemon can actually execute, not just which CLIs it has. The two
+ * worker programs differ here — the same-host client (`../worker/transport-client.ts`)
+ * holds `DATABASE_URL` and runs every phase, while the DB-free remote daemon
+ * (`./connect-entry.ts`) runs only `SUPPORTED_DB_FREE_PHASES`
+ * (`./assignment-execution.ts`) — and they are otherwise indistinguishable to the
+ * control plane, so without this the eligibility gate could select a worker for a
+ * phase it refuses, failing the dispatch terminally instead of routing it to a
+ * capable worker.
+ *
+ * **Optional on purpose.** A daemon built before this field simply omits it; the
+ * router then treats it as "every phase", which is exactly the behaviour that
+ * pre-dated the field. That keeps a version skew from silently narrowing an older
+ * worker's eligibility, so the field needs no protocol-version bump: it is an
+ * additive, backward-compatible frame change (see {@link TRANSPORT_PROTOCOL_VERSION},
+ * which is reserved for *incompatible* shape changes).
  */
 export const HandshakeRequestSchema = z.object({
 	credential: z.string().min(1),
 	daemonVersion: z.string().min(1),
 	hostname: z.string().min(1),
 	capabilities: z.array(AgentCliSchema).nonempty(),
+	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
 	protocolVersion: z.number().int(),
 });
 export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
@@ -134,28 +163,6 @@ export const DisconnectSchema = z.object({
 	reason: z.string(),
 });
 export type Disconnect = z.infer<typeof DisconnectSchema>;
-
-/**
- * The worker-runnable pipeline phases, keyed so the object literal must name
- * *exactly* the `TriggerPhase` members (`../triggers/types.ts`): a missing phase
- * or an extra one both fail to type-check here, so this transport enum and the
- * pipeline's phase union can never drift apart. Consumed by `TaskPhaseSchema`
- * below (via `Object.keys`), so it is not dead code.
- */
-const TASK_PHASE_KEYS: Record<TriggerPhase, true> = {
-	planning: true,
-	implementation: true,
-	review: true,
-	'respond-to-review': true,
-	'respond-to-ci': true,
-	'resolve-conflicts': true,
-};
-
-/** The transport's Zod mirror of `TriggerPhase`, built from the parity map above. */
-export const TaskPhaseSchema = z.enum(
-	Object.keys(TASK_PHASE_KEYS) as [TriggerPhase, ...TriggerPhase[]],
-);
-export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
 
 /**
  * The transport's serialization view of a PM `WorkItem` (`../pm/types.ts`) — the

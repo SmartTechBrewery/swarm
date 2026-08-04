@@ -17,6 +17,8 @@
  * types, not Zod.
  */
 
+import { z } from 'zod';
+
 import type { ProjectConfig } from '../config/schema.js';
 import type { WorkItem } from '../pm/types.js';
 import type { GitHubProjectsParsedEvent } from '../router/adapters/github-projects.js';
@@ -79,6 +81,41 @@ export type TriggerPhase =
 	| 'respond-to-review'
 	| 'respond-to-ci'
 	| 'resolve-conflicts';
+
+/**
+ * Every `TriggerPhase`, keyed so the object literal must name *exactly* the union
+ * members: a missing phase or an extra one both fail to type-check, so the runtime
+ * enumeration below can never drift from the type above.
+ *
+ * This is the phase vocabulary's single runtime source. Two other layers need it
+ * and used to each keep their own copy: the transport's Zod mirror
+ * (`TaskPhaseSchema`, `../transport/protocol.ts`) and the `workers.supported_phases`
+ * column's default (`../db/schema/workers.ts`, issue #467). Both now build on
+ * {@link ALL_TRIGGER_PHASES}, so adding a phase to the union above is a one-place
+ * change that the type-checker propagates.
+ */
+const TRIGGER_PHASE_KEYS: Record<TriggerPhase, true> = {
+	planning: true,
+	implementation: true,
+	review: true,
+	'respond-to-review': true,
+	'respond-to-ci': true,
+	'resolve-conflicts': true,
+};
+
+/** Every pipeline phase, as a runtime list (see {@link TRIGGER_PHASE_KEYS}). */
+export const ALL_TRIGGER_PHASES: readonly TriggerPhase[] = Object.keys(
+	TRIGGER_PHASE_KEYS,
+) as TriggerPhase[];
+
+/**
+ * The phase vocabulary's validator, living with the vocabulary itself
+ * (ai/CODING_STANDARDS.md "Zod is the source of truth") so every boundary that
+ * parses a phase — the transport frame (`TaskPhaseSchema`,
+ * `../transport/protocol.ts`) and the persisted worker read model (`WorkerSchema`,
+ * `../identity/worker.ts`) — shares one, rather than each rebuilding its own.
+ */
+export const TriggerPhaseSchema = z.enum(ALL_TRIGGER_PHASES as [TriggerPhase, ...TriggerPhase[]]);
 
 const PRIORITIZED_CONTINUATION_PHASES: ReadonlySet<TriggerPhase> = new Set([
 	'review',

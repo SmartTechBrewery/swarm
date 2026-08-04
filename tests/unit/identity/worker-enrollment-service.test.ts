@@ -59,7 +59,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 }));
 
 import type { SwarmUser } from '@/identity/schema.js';
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import {
 	AllowedClisNotCapableError,
@@ -84,6 +84,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,

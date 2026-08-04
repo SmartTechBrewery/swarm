@@ -22,6 +22,7 @@ import { asc, eq } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import { type Worker, WorkerCapabilityReductionError } from '../../identity/worker.js';
+import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workers } from '../schema/workers.js';
@@ -44,6 +45,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		ownerUserId: row.ownerUserId,
 		displayName: row.displayName,
 		capabilities: row.capabilities as AgentCli[],
+		supportedPhases: row.supportedPhases as TriggerPhase[],
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -119,10 +121,22 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * `undefined` if no worker has that id (nothing to update). Rejects with
  * {@link WorkerCapabilityReductionError} if any existing enrollment for the worker
  * requires a CLI not present in the updated capabilities.
+ *
+ * `supportedPhases` (issue #467) is written in the **same transaction** when
+ * given, because a handshake declares both axes at once and a partial write would
+ * leave the roster describing a machine that never existed. Omit it to leave the
+ * stored phases untouched — the CLI-only path (`swarm workers set-cli`) knows
+ * nothing about phases and must not silently reset them.
+ *
+ * Note the asymmetry with the CLI check above: phases are deliberately *not*
+ * validated against enrollments, because an enrollment constrains CLIs
+ * (`allowedClis`) and has no phase dimension. A daemon that stops supporting a
+ * phase narrows its own eligibility rather than invalidating an enrollment.
  */
 export async function updateWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
+	supportedPhases?: TriggerPhase[],
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -157,7 +171,7 @@ export async function updateWorkerCapabilities(
 
 		const [updatedRow] = await tx
 			.update(workers)
-			.set({ capabilities })
+			.set(supportedPhases ? { capabilities, supportedPhases } : { capabilities })
 			.where(eq(workers.id, id))
 			.returning();
 

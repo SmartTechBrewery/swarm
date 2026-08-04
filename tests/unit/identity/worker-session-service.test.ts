@@ -27,7 +27,7 @@ vi.mock('@/db/repositories/workerSessionsRepository.js', () => ({
 }));
 vi.mock('@/identity/worker-service.js', () => ({ resolveWorkerByCredential }));
 
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { WorkerSession } from '@/identity/worker-session.js';
 import {
 	acquireSession,
@@ -51,6 +51,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,

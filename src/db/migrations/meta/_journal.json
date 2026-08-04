@@ -260,6 +260,13 @@
       "when": 1784970402892,
       "tag": "0036_thankful_payback",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1785839847394,
+      "tag": "0037_brainy_sentinels",
+      "breakpoints": true
     }
   ]
 }

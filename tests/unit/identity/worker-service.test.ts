@@ -19,7 +19,7 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 	listWorkersForOwner,
 }));
 
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import {
 	hashWorkerCredential,
 	issueWorkerCredential,
@@ -39,6 +39,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -117,7 +118,34 @@ describe('refreshWorkerCapabilities', () => {
 
 		const updated = await refreshWorkerCapabilities('worker-1', ['codex', 'codex']);
 		expect(updated?.capabilities).toEqual(['codex']);
-		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['codex']);
+		// No phases passed through: the caller declared none, so the stored repertoire is
+		// left untouched rather than reset to the every-phase default (issue #467) — the
+		// `swarm workers set-cli` path, which knows nothing about phases.
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['codex'], undefined);
+	});
+
+	it('validates and forwards a declared phase set when one is given', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities(
+			'worker-1',
+			['claude'],
+			['implementation', 'implementation', 'review'],
+		);
+
+		// De-duplicated by `WorkerSupportedPhasesSchema`, exactly as the CLI set is.
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			['implementation', 'review'],
+		);
+	});
+
+	it('rejects an empty phase set without hitting the repository', async () => {
+		await expect(refreshWorkerCapabilities('worker-1', ['claude'], [])).rejects.toThrow();
+		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
 	});
 
 	it('rejects an empty set without hitting the repository', async () => {

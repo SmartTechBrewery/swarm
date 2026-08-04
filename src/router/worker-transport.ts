@@ -35,7 +35,7 @@ import type { Hono } from 'hono';
 import type { WSContext } from 'hono/ws';
 
 import type { AgentCli } from '../harness/agent-cli.js';
-import type { Worker } from '../identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '../identity/worker.js';
 import {
 	refreshWorkerCapabilities,
 	resolveWorkerByCredential,
@@ -62,6 +62,7 @@ import {
 	WorkerStreamMessageSchema,
 	WS_CLOSE,
 } from '../transport/protocol.js';
+import type { TriggerPhase } from '../triggers/types.js';
 import {
 	deliverDispatchAck,
 	deliverDispatchProgress,
@@ -92,7 +93,11 @@ export interface WorkerTransportDeps {
 	acquireSession: (rawCredential: string, ttlMs: number) => Promise<AcquiredSession>;
 	heartbeat: (rawCredential: string, fencingToken: number, ttlMs: number) => Promise<boolean>;
 	releaseSession: (rawCredential: string, fencingToken: number) => Promise<boolean>;
-	refreshWorkerCapabilities: (id: string, capabilities: AgentCli[]) => Promise<Worker | undefined>;
+	refreshWorkerCapabilities: (
+		id: string,
+		capabilities: AgentCli[],
+		supportedPhases: TriggerPhase[],
+	) => Promise<Worker | undefined>;
 	resolveHeartbeatTtlMs: () => number;
 	validateFencingToken: (workerId: string, token: number, ttlMs?: number) => Promise<boolean>;
 	/**
@@ -185,13 +190,22 @@ export async function handleHandshake(
 		throw err;
 	}
 
-	// Declare the daemon's CLIs only after proving this daemon holds the lease, so
-	// a second daemon cannot mutate the roster's capabilities while another owns
-	// the session. If the declared set drops a CLI an enrollment needs, release the
-	// lease we just took (so a corrected retry isn't blocked by a held session) and
-	// report the offending CLIs.
+	// Declare the daemon's CLIs and phases only after proving this daemon holds the
+	// lease, so a second daemon cannot mutate the roster's capabilities while another
+	// owns the session. If the declared set drops a CLI an enrollment needs, release
+	// the lease we just took (so a corrected retry isn't blocked by a held session)
+	// and report the offending CLIs.
+	//
+	// A daemon that omits `supportedPhases` predates the field (issue #467), so it is
+	// recorded as supporting every phase — the dispatcher's behaviour before phases
+	// were declarable. Normalizing here, at the boundary, is what keeps the
+	// eligibility gate free of a "declaration unknown" case.
 	try {
-		await deps.refreshWorkerCapabilities(worker.id, request.capabilities);
+		await deps.refreshWorkerCapabilities(
+			worker.id,
+			request.capabilities,
+			request.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		);
 	} catch (err) {
 		if (err instanceof WorkerCapabilityReductionError) {
 			await deps.releaseSession(request.credential, session.fencingToken).catch(() => {});

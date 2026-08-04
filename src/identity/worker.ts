@@ -29,6 +29,7 @@
 
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../harness/agent-cli.js';
+import { ALL_TRIGGER_PHASES, type TriggerPhase, TriggerPhaseSchema } from '../triggers/types.js';
 
 /**
  * A worker's declared CLI capabilities: a de-duplicated, non-empty set of
@@ -44,6 +45,30 @@ export const WorkerCapabilitiesSchema = z
 	.transform((clis) => [...new Set(clis)]);
 
 /**
+ * A worker's declared **phase** capabilities (issue #467): which pipeline phases
+ * its daemon can actually execute. De-duplicated and non-empty on the same
+ * reasoning as {@link WorkerCapabilitiesSchema} — a daemon that can run no phase
+ * could never be dispatched to, so declaring an empty set is a bug, not a way to
+ * pause a worker (revoking enrollment consent is).
+ *
+ * Also self-declared and trusted: the worker-side unsupported-phase gate
+ * (`SUPPORTED_DB_FREE_PHASES`, `src/transport/assignment-execution.ts`) remains the
+ * backstop if a declaration is ever wrong.
+ */
+export const WorkerSupportedPhasesSchema = z
+	.array(TriggerPhaseSchema)
+	.nonempty()
+	.transform((phases) => [...new Set(phases)]);
+
+/**
+ * What a worker is taken to support when nothing has been declared — every phase,
+ * which is how the dispatcher behaved before phases were declarable at all. Used
+ * for a worker registered but never connected, and for a daemon whose handshake
+ * omits `supportedPhases` (see `HandshakeRequestSchema`).
+ */
+export const DEFAULT_WORKER_SUPPORTED_PHASES: readonly TriggerPhase[] = ALL_TRIGGER_PHASES;
+
+/**
  * A safe machine display name — human-facing, shown on rosters and owner
  * self-service. Trimmed and bounded (1–80 chars); a "safe display name" carries
  * no path/secret semantics, it is only a label.
@@ -54,7 +79,10 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * A registered worker. `ownerUserId` is a `users.id` (`uuid`, the SWARM user who
  * operates the machine); `displayName` is its human-facing label, unique per
  * owner (`src/db/schema/workers.ts`); `capabilities` is the declared set of agent
- * CLIs it can run. `id` is generated (`uuid`), not externally supplied.
+ * CLIs it can run and `supportedPhases` the set of pipeline phases its daemon
+ * declared it can execute (issue #467 — the DB-free remote daemon runs a strict
+ * subset of what the same-host worker does). `id` is generated (`uuid`), not
+ * externally supplied.
  *
  * The worker credential hash is intentionally **not** a field here — it is a
  * secret that never leaves the DB layer (`rowToWorker` drops it), the same
@@ -65,6 +93,7 @@ export const WorkerSchema = z.object({
 	ownerUserId: z.string().uuid(),
 	displayName: WorkerDisplayNameSchema,
 	capabilities: z.array(AgentCliSchema),
+	supportedPhases: z.array(TriggerPhaseSchema),
 	createdAt: z.date(),
 	updatedAt: z.date(),
 });

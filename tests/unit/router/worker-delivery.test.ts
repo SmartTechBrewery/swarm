@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
 import {
@@ -33,6 +33,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,

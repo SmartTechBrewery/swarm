@@ -58,7 +58,7 @@ vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessib
 import { workersRouter } from '@/api/routers/workers.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import type { SwarmUser } from '@/identity/schema.js';
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 
 const OWNER_ID = '00000000-0000-4000-8000-0000000000aa';
@@ -83,6 +83,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
+		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,

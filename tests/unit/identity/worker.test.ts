@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	DEFAULT_WORKER_SUPPORTED_PHASES,
 	WorkerCapabilitiesSchema,
 	WorkerDisplayNameSchema,
 	WorkerSchema,
+	WorkerSupportedPhasesSchema,
 } from '@/identity/worker.js';
 
 const validWorker = {
@@ -11,6 +13,7 @@ const validWorker = {
 	ownerUserId: '22222222-2222-4222-8222-222222222222',
 	displayName: 'ada-laptop',
 	capabilities: ['claude', 'codex'],
+	supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };
@@ -44,6 +47,32 @@ describe('WorkerDisplayNameSchema', () => {
 
 	it('rejects a name longer than 80 chars', () => {
 		expect(() => WorkerDisplayNameSchema.parse('a'.repeat(81))).toThrow();
+	});
+});
+
+// Issue #467 — the phase axis alongside the CLI one. Mirrors the CLI schema's
+// contract, and the default is what a worker means before its daemon declares
+// anything (a row that predates the column, or a machine never yet connected).
+describe('WorkerSupportedPhasesSchema', () => {
+	it('rejects an empty set (a daemon that can run no phase is a bug)', () => {
+		expect(() => WorkerSupportedPhasesSchema.parse([])).toThrow();
+	});
+
+	it('de-duplicates repeated phases', () => {
+		expect(WorkerSupportedPhasesSchema.parse(['review', 'review', 'planning'])).toEqual([
+			'review',
+			'planning',
+		]);
+	});
+
+	it('rejects an unknown phase', () => {
+		expect(() => WorkerSupportedPhasesSchema.parse(['deploy'])).toThrow();
+	});
+
+	it('accepts the DB-free subset, which omits planning', () => {
+		const parsed = WorkerSupportedPhasesSchema.parse(['implementation', 'review']);
+		expect(parsed).toEqual(['implementation', 'review']);
+		expect(DEFAULT_WORKER_SUPPORTED_PHASES).toContain('planning');
 	});
 });
 

@@ -3,10 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentTarget } from '@/config/schema.js';
 import type { ResolvedAssignee } from '@/identity/assignee-resolver.js';
 import type { SwarmUser } from '@/identity/schema.js';
-import type { Worker } from '@/identity/worker.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-service.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
+import { SUPPORTED_DB_FREE_PHASES } from '@/transport/assignment-execution.js';
 
 // The gate's two DB-backed collaborators are mocked at their module boundary
 // (ai/TESTING.md): the project's enrolled workers and the assignee → SWARM user
@@ -42,6 +43,7 @@ function makeCandidate(
 	overrides: {
 		ownerUserId?: string;
 		capabilities?: Worker['capabilities'];
+		supportedPhases?: Worker['supportedPhases'];
 		enrollment?: Partial<WorkerEnrollment>;
 		connected?: boolean;
 		activeRuns?: number;
@@ -53,6 +55,7 @@ function makeCandidate(
 			ownerUserId: overrides.ownerUserId ?? ALICE,
 			displayName: `worker-${id}`,
 			capabilities: overrides.capabilities ?? ['claude'],
+			supportedPhases: overrides.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
 		},
@@ -89,9 +92,13 @@ function gateInput(overrides: Partial<DispatchGateInput> = {}): DispatchGateInpu
 		projectId: 'swarm',
 		targets: [{}] satisfies AgentTarget[],
 		phaseDefaultCli: 'claude',
+		phase: 'implementation',
 		...overrides,
 	};
 }
+
+/** A DB-free remote daemon: every phase it can run, which excludes `planning`. */
+const DB_FREE_PHASES: Worker['supportedPhases'] = [...SUPPORTED_DB_FREE_PHASES];
 
 describe('evaluateDispatchEligibility', () => {
 	beforeEach(() => {
@@ -412,6 +419,54 @@ describe('evaluateDispatchEligibility', () => {
 			// A live-lease-only worker resolves as `worker-unavailable`, so the durable
 			// dispatch stays pending until a worker connects — never a blind dispatch.
 			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
+		});
+
+		// Issue #467 — the bug this closes. A DB-free daemon refuses `planning`, and the
+		// dispatcher used to learn that only from the worker's terminal failure frame,
+		// which it cannot re-route. The gate now refuses the candidate up front.
+		it('never selects a DB-free worker for planning, deferring instead of dispatching', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'planning' }));
+
+			// Ineligible, not selected: the shared path defers this as a wait for an
+			// eligible worker instead of settling the run as failed.
+			expect(decision).toMatchObject({
+				status: 'ineligible',
+				reason: 'missing-phase-capability',
+			});
+		});
+
+		it('still selects that DB-free worker for a phase it does declare', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'implementation' }));
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-db-free' },
+			});
+		});
+
+		// The mixed fleet: selection order (first-free) would have offered the DB-free
+		// worker first, so this is what previously made a Planning dispatch die at
+		// random even though a capable worker was connected and eligible.
+		it('routes planning past a DB-free worker to the DB-capable one behind it', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-host'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'planning' }));
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-host' },
+			});
 		});
 
 		it('preserves assignee affinity — a connected worker of another user is never chosen', async () => {
