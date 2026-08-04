@@ -13,6 +13,11 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	deliveryDedupKey: (deliveryId: string) => `delivery:${deliveryId}`,
 }));
 
+const requireProjectSCMProvider = vi.fn((_project?: unknown) => ({ type: 'github' as const }));
+vi.mock('@/integrations/scm/registry.js', () => ({
+	requireProjectSCMProvider: (project: unknown) => requireProjectSCMProvider(project),
+}));
+
 import {
 	followUpReviewDeliveryId,
 	scheduleFollowUpReviewDefault,
@@ -48,6 +53,7 @@ describe('followUpReviewDeliveryId', () => {
 describe('scheduleFollowUpReviewDefault', () => {
 	it('enqueues a synthetic checks-completed event carrying the new head, keyed by a deterministic delivery id', async () => {
 		enqueueJob.mockClear();
+		requireProjectSCMProvider.mockClear();
 
 		await scheduleFollowUpReviewDefault({
 			project: PROJECT,
@@ -56,6 +62,7 @@ describe('scheduleFollowUpReviewDefault', () => {
 			headSha: 'newsha123',
 		});
 
+		expect(requireProjectSCMProvider).toHaveBeenCalledWith(PROJECT);
 		expect(enqueueJob).toHaveBeenCalledExactlyOnceWith({
 			projectId: PROJECT.id,
 			source: 'synthetic',

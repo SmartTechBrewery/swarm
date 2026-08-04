@@ -16,6 +16,8 @@
  *   (header reading, parsing, signature verification, loop prevention), so there
  *   is no adapter object to register — only the path to mount those methods on,
  *   which the receiver needs before it has a request to hand the provider.
+ * - **A `runtimeReady` opt-out** (issue #296), so a provider can be registered
+ *   and discoverable while its contract is still being filled in phase by phase.
  * - **Nothing else yet, on purpose** (ai/CODING_STANDARDS.md "don't build it
  *   speculatively"): no `configSchema` (a project's SCM config is `repo` +
  *   `credentials`, with no per-provider block — `src/config/schema.ts`), no
@@ -38,6 +40,34 @@ export interface SCMProviderManifest {
 	 * route, with no receiver edit.
 	 */
 	readonly webhookRoute: string;
+	/**
+	 * Whether shared code may route real traffic to this provider. Absent means
+	 * yes — a registered provider is live unless it says otherwise.
+	 *
+	 * `false` marks a provider that is registered but still being built out phase
+	 * by phase (Bitbucket, issue #296): discoverable by id so its own tests and
+	 * follow-up phases can resolve it, and deliberately unreachable at runtime, so
+	 * registering it changes no existing behavior. Two things read it — the
+	 * project-scoped lookup (`requireProjectSCMProvider`, `./registry.ts`) and the
+	 * receiver's route mounting (`src/router/webhook-receiver.ts`) — which is
+	 * exactly the pair that would otherwise start answering for a provider whose
+	 * contract methods still throw.
+	 *
+	 * It is **not** a selection mechanism and does not soften the single-provider
+	 * assertion: the second provider to claim runtime readiness still makes the
+	 * project-scoped lookup throw, so project→provider selection gets designed
+	 * then rather than resolving to whichever manifest registered first.
+	 *
+	 * `requireSCMProvider(id)` deliberately does not consult `runtimeReady`: an
+	 * explicit ID lookup for an enqueued job identity is intentionally exempt since
+	 * the envelope provider ID is explicitly specified.
+	 */
+	readonly runtimeReady?: boolean;
 	/** The provider implementation — one shared, stateless instance (see above). */
 	readonly provider: SCMProvider;
+}
+
+/** Whether shared code may route real traffic to `manifest` — see {@link SCMProviderManifest.runtimeReady}. */
+export function isRuntimeReadySCMProvider(manifest: SCMProviderManifest): boolean {
+	return manifest.runtimeReady !== false;
 }

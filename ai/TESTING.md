@@ -15,7 +15,7 @@ Use factory functions (`createMockProject()`, `createMockGitHubProjectsItem()`, 
 
 ## Provider conformance
 
-Once there's more than one PM or SCM provider (there won't be for a while — MVP has exactly one of each), add a conformance test suite mirroring Cascade's `tests/unit/integrations/pm-conformance.test.ts`: assert every registered provider's manifest has the required shape (unique id, webhook route convention, required methods present) so a new provider can't silently skip part of the contract. Not needed before then — don't build it speculatively for a single provider.
+Once there's more than one PM or SCM provider *implementing its whole contract*, add a conformance test suite mirroring Cascade's `tests/unit/integrations/pm-conformance.test.ts`: assert every registered provider's manifest has the required shape (unique id, webhook route convention, required methods present) so a new provider can't silently skip part of the contract. There is still exactly one PM provider, and the second SCM provider (Bitbucket, `src/integrations/scm/bitbucket/`) is registered with `runtimeReady: false` while it deliberately throws for the methods its later phases own (issue #296) — a shared harness run against it today would only assert those throws exist. Each provider's own manifest test covers its shape until then; the conformance suite lands with #296's final phase. Don't build it speculatively before that.
 
 ## Type-checking (tests included)
 

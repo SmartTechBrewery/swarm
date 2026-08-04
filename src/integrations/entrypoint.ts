@@ -13,10 +13,11 @@
  * plus its own folder — never an edit to dispatch/orchestration code
  * (ai/CODING_STANDARDS.md "Module shape for a provider").
  *
- * With exactly one provider per category today, this imports each provider index
- * directly. A `src/integrations/<kind>/index.ts` barrel (mirroring Cascade's)
- * gets introduced when a second provider of that kind lands, at which point this
- * file imports the barrel instead of each provider.
+ * This imports each provider index directly. A `src/integrations/<kind>/index.ts`
+ * barrel (mirroring Cascade's) is still deferred: with three imports the list is
+ * shorter than the barrel that would front it, and one of them is a provider
+ * being built out phase by phase whose registration reads better named here than
+ * hidden behind an aggregate.
  *
  * Registering SCM here adds no module-load weight to any surface: the GitHub
  * Projects provider already imports `GitHubSCMIntegration` for its own credential
@@ -27,6 +28,10 @@
 import './pm/github-projects/index.js';
 // SCM: GitHub. Registers its manifest into scmProviderRegistry.
 import './scm/github/index.js';
+// SCM: Bitbucket (issue #296). Registers with `runtimeReady: false` — discoverable
+// by id, but not selectable and not served a webhook route until phases 2–4 fill
+// in the rest of the contract.
+import './scm/bitbucket/index.js';
 
 /**
  * Explicit no-op for call sites that want registration to be visible rather than

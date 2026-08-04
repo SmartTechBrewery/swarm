@@ -110,6 +110,28 @@ describe('createWebhookApp', () => {
 			const res = await app.request('/github/webhook');
 			expect(res.status).toBe(200);
 		});
+
+		// A provider still being built out phase by phase (Bitbucket, issue #296)
+		// registers with `runtimeReady: false`. Mounting its route would expose an
+		// unauthenticated endpoint whose first act is a contract method that throws,
+		// so the receiver serves nothing for it — not even the GET ping.
+		it('serves no route for a provider that is not runtime-ready', async () => {
+			const { app } = makeApp({
+				scmProviders: [
+					fakeManifest(),
+					{ ...fakeManifest(), webhookRoute: '/unbuilt/webhook', runtimeReady: false },
+				],
+			});
+
+			expect((await app.request('/github/webhook')).status).toBe(200);
+			expect((await app.request('/unbuilt/webhook')).status).toBe(404);
+			const posted = await app.request('/unbuilt/webhook', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: VALID_BODY,
+			});
+			expect(posted.status).toBe(404);
+		});
 	});
 
 	describe('POST /github/webhook', () => {

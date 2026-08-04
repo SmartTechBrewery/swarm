@@ -4,12 +4,14 @@
  * concrete provider or speak a provider's own vocabulary (ai/RULES.md §2
  * "Source-control features must not hard-code GitHub").
  *
- * GitHub is the only implementation today (`GitHubSCMIntegration`,
- * `src/integrations/scm/github/scm-integration.ts`), registered through the SCM
- * manifest + registry (`src/integrations/scm/{manifest,registry}.ts`) exactly as
- * the PM side registers GitHub Projects. Bitbucket and GitLab are planned but
- * deliberately not built (ai/CODING_STANDARDS.md "don't build it
- * speculatively").
+ * GitHub is the only implementation that carries runtime traffic today
+ * (`GitHubSCMIntegration`, `src/integrations/scm/github/scm-integration.ts`),
+ * registered through the SCM manifest + registry
+ * (`src/integrations/scm/{manifest,registry}.ts`) exactly as the PM side
+ * registers GitHub Projects. Bitbucket is being built out phase by phase (issue
+ * #296) and registers with `runtimeReady: false` until it satisfies the whole
+ * contract; GitLab is still planned and deliberately not built
+ * (ai/CODING_STANDARDS.md "don't build it speculatively").
  *
  * This file defines **types only** — every importer uses `import type`, so the
  * module adds no runtime edge. That's what lets `src/config/provider.ts` (which
@@ -29,13 +31,13 @@
  * Deliberately **not** here yet:
  *
  * - **Provider selection, fallback, or per-provider config.** There is one
- *   provider, one webhook route (declared on its manifest), and one HMAC secret;
- *   a project's SCM config is `repo` + `credentials` (`src/config/schema.ts`)
- *   with no per-provider block to declare. Issue #386 pinned that as an
- *   assertion rather than a guess: the project-scoped lookup every outbound call
- *   site uses (`requireProjectSCMProvider`,
- *   `src/integrations/scm/registry.ts`) throws unless exactly one provider is
- *   registered, so selection gets designed with the second provider.
+ *   runtime-ready provider, one served webhook route, and one HMAC secret; a
+ *   project's SCM config is `repo` + `credentials` (`src/config/schema.ts`) with
+ *   no per-provider block to declare. Issue #386 pinned that as an assertion
+ *   rather than a guess: the project-scoped lookup every outbound call site uses
+ *   (`requireProjectSCMProvider`, `src/integrations/scm/registry.ts`) throws
+ *   unless exactly one *runtime-ready* provider is registered, so selection gets
+ *   designed with the second one that claims runtime readiness.
  * - **`withCredentials`** — the implementer-persona convenience wrapper on the
  *   GitHub class. It is sugar over {@link SCMProvider.withPersonaCredentials};
  *   putting it in the contract would oblige a second provider to implement two
@@ -47,7 +49,7 @@ import type { ScmDeliveryProvider } from './delivery.js';
 import type { ScmEvent } from './events.js';
 import type { ScmMergeProvider } from './merge.js';
 
-export type ScmType = 'github';
+export type ScmType = 'github' | 'bitbucket';
 
 /**
  * SWARM's dual-persona role model — the provider-neutral name for what the

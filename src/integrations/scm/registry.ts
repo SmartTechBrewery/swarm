@@ -12,7 +12,7 @@
  * PM one is: nothing needs to enumerate both categories together yet.
  *
  * Ingress and the SCM-driven triggers resolve their provider here as of issue
- * #385 (the receiver mounts every registered manifest's `webhookRoute`; the
+ * #385 (the receiver mounts every runtime-ready registered manifest's `webhookRoute`; the
  * worker resolves a dequeued job's `providerId` into the provider it injects
  * into the trigger context). The outbound, project-scoped mutations joined with
  * issue #386 via {@link requireProjectSCMProvider} — phase delivery, the
@@ -26,7 +26,7 @@
 
 import type { ProjectConfig } from '../../config/schema.js';
 import type { SCMProvider } from '../../scm/types.js';
-import type { SCMProviderManifest } from './manifest.js';
+import { isRuntimeReadySCMProvider, type SCMProviderManifest } from './manifest.js';
 
 const registry: SCMProviderManifest[] = [];
 const byId = new Map<string, SCMProviderManifest>();
@@ -71,20 +71,29 @@ export function requireSCMProvider(id: string): SCMProvider {
  *
  * Deliberately **no selection logic and no fallback ordering**: `ProjectConfig`
  * carries no provider discriminator (`src/config/schema.ts`) and exactly one SCM
- * provider is registered, so "this project's provider" is unambiguous today.
+ * provider is runtime-ready, so "this project's provider" is unambiguous today.
  * Inventing a config field or a preference order before a second provider exists
  * would be speculative (ai/CODING_STANDARDS.md); instead this asserts the
  * invariant and throws the moment it stops holding, so project→provider
  * selection gets designed *with* the second provider rather than silently
  * resolving to whichever manifest happened to register first.
+ *
+ * The assertion counts only *runtime-ready* manifests
+ * ({@link SCMProviderManifest.runtimeReady}), so a provider being built out phase
+ * by phase — Bitbucket, issue #296 — can register without answering for every
+ * project while half its contract still throws. The forcing function is
+ * unchanged: the second manifest to claim runtime readiness lands here as a
+ * throw.
  */
 export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
-	const only = registry[0];
-	if (registry.length !== 1 || !only) {
+	const runtimeReady = registry.filter(isRuntimeReadySCMProvider);
+	const only = runtimeReady[0];
+	if (runtimeReady.length !== 1 || !only) {
 		throw new Error(
-			`Cannot resolve the SCM provider for project '${project.id}': ${registry.length} registered, ` +
-				'expected exactly one — did src/integrations/entrypoint.ts fail to load, or did a second ' +
-				'provider register before project→provider selection existed?',
+			`Cannot resolve the SCM provider for project '${project.id}': ` +
+				`${runtimeReady.length} runtime-ready of ${registry.length} registered, expected exactly ` +
+				'one — did src/integrations/entrypoint.ts fail to load, or did a second provider register ' +
+				'as runtime-ready before project→provider selection existed?',
 		);
 	}
 	return only.provider;

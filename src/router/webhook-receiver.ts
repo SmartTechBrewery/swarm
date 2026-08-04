@@ -2,13 +2,14 @@
  * SCM webhook receiver — the router's HTTP surface, modeled on Cascade's
  * `src/router/index.ts` route wiring.
  *
- * One POST route per registered SCM provider (`manifest.webhookRoute` —
- * `/github/webhook` for the only provider today) is the whole pipeline up to the
- * queue: read the raw body, let the provider interpret its own headers,
- * authenticate the body (HMAC), normalize the event, match it to a SWARM project,
- * drop events SWARM itself generated (loop prevention), then hand the normalized
- * event to the enqueue seam. Everything downstream of the seam — trigger routing,
- * the worker — is a later phase (see `enqueue.ts`).
+ * One POST route per registered, runtime-ready SCM provider
+ * (`manifest.webhookRoute` — `/github/webhook` for the only one serving traffic
+ * today) is the whole pipeline up to the queue: read the raw body, let the
+ * provider interpret its own headers, authenticate the body (HMAC), normalize the
+ * event, match it to a SWARM project, drop events SWARM itself generated (loop
+ * prevention), then hand the normalized event to the enqueue seam. Everything
+ * downstream of the seam — trigger routing, the worker — is a later phase (see
+ * `enqueue.ts`).
  *
  * Since issue #385 the receiver names no provider and knows no provider's
  * vocabulary: header names, event names, payload shapes, signature framing, and
@@ -40,7 +41,10 @@ import type { ProjectConfig } from '../config/schema.js';
 // registry before defaultDeps() reads them below.
 import '../integrations/entrypoint.js';
 import { getPMProvider } from '../integrations/pm/registry.js';
-import type { SCMProviderManifest } from '../integrations/scm/manifest.js';
+import {
+	isRuntimeReadySCMProvider,
+	type SCMProviderManifest,
+} from '../integrations/scm/manifest.js';
 import { listSCMProviders } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import type { ScmEvent } from '../scm/events.js';
@@ -62,7 +66,7 @@ const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
  * so production wiring is a bare `createWebhookApp()`; tests inject fakes.
  */
 export interface WebhookReceiverDeps {
-	/** Registered SCM providers whose `webhookRoute`s this app serves. */
+	/** Runtime-ready registered SCM providers whose `webhookRoute`s this app serves. */
 	scmProviders: readonly SCMProviderManifest[];
 	pmAdapter: GitHubProjectsRouterAdapter;
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;
@@ -315,7 +319,10 @@ export function createWebhookApp(overrides: Partial<WebhookReceiverDeps> = {}): 
 	// Liveness probe for the Docker Compose healthcheck.
 	app.get('/health', (c) => c.json({ status: 'ok', service: 'router' }));
 
-	for (const manifest of deps.scmProviders) {
+	// A provider still being built out phase by phase (issue #296) gets no route:
+	// serving one would expose an unauthenticated endpoint whose first act is to
+	// call a contract method that throws (`manifest.runtimeReady`).
+	for (const manifest of deps.scmProviders.filter(isRuntimeReadySCMProvider)) {
 		// Providers ping the endpoint with a GET when a webhook is (re)configured.
 		app.get(manifest.webhookRoute, (c) => c.text('OK', 200));
 
