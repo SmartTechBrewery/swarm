@@ -81,8 +81,10 @@ describe('requireProjectSCMProvider', () => {
 	});
 
 	it('throws naming the project when nothing is registered', () => {
+		// Substring, not a built RegExp: the project id is data, and a factory id
+		// that ever grew a regex metacharacter would silently stop matching.
 		expect(() => requireProjectSCMProvider(project)).toThrow(
-			new RegExp(`Cannot resolve the SCM provider for project '${project.id}': 0 registered`),
+			`Cannot resolve the SCM provider for project '${project.id}': 0 registered`,
 		);
 	});
 

@@ -3612,7 +3612,10 @@ describe('reportInterruptedJobToBoard', () => {
 	// manifest is what tells the two apart — the project-scoped lookup refuses to
 	// pick between them, while the id lookup is unambiguous.
 	it('resolves the commenting provider from the job’s providerId', async () => {
-		const github = getSCMProvider('github') as SCMProviderManifest;
+		const github = getSCMProvider('github');
+		// Asserted, not cast: if the entrypoint ever stops registering GitHub, fail
+		// here rather than in the restore below with an opaque TypeError.
+		expect(github).not.toBeNull();
 		registerSCMProvider({
 			id: 'bitbucket',
 			label: 'Bitbucket',
@@ -3628,7 +3631,7 @@ describe('reportInterruptedJobToBoard', () => {
 			// The registry is a process singleton with no unregister; restore the
 			// entrypoint's own registration so later cases see one provider again.
 			_resetSCMProviderRegistryForTesting();
-			registerSCMProvider(github);
+			if (github) registerSCMProvider(github);
 		}
 	});
 

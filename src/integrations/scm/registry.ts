@@ -79,8 +79,8 @@ export function requireSCMProvider(id: string): SCMProvider {
  * resolving to whichever manifest happened to register first.
  */
 export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
-	const [only] = registry;
-	if (!only || registry.length > 1) {
+	const only = registry[0];
+	if (registry.length !== 1 || !only) {
 		throw new Error(
 			`Cannot resolve the SCM provider for project '${project.id}': ${registry.length} registered, ` +
 				'expected exactly one — did src/integrations/entrypoint.ts fail to load, or did a second ' +

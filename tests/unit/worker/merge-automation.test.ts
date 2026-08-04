@@ -326,12 +326,27 @@ describe('processMergeAutomationDispatch', () => {
 		});
 	});
 
-	it('surfaces the unresolvable-provider throw when no provider is registered', async () => {
+	// An unresolvable provider is a provider failure like any other: it must settle
+	// the claimed dispatch rather than escape `processJob`, which would leave the
+	// dispatch in flight until the reconciler's lease expiry with nothing recorded
+	// on the Review run. Hence the default is resolved inside the attempt's `try`,
+	// not in a default parameter (which binds before the body can catch anything).
+	it('settles the dispatch as provider-error when no provider is registered', async () => {
 		_resetSCMProviderRegistryForTesting();
 
-		await expect(processMergeAutomationDispatch(mockDispatchRow(), job, project)).rejects.toThrow(
-			/Cannot resolve the SCM provider/,
-		);
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project);
+
+		expect(failDispatch).toHaveBeenCalledOnce();
+		expect(failDispatch.mock.calls[0]?.[1]).toMatch(/Cannot resolve the SCM provider/);
+		expect(updateReviewMergeOutcome).toHaveBeenCalledOnce();
+		expect(updateReviewMergeOutcome.mock.calls[0]?.[1]).toMatchObject({
+			status: 'provider-error',
+		});
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'provider-error',
+			prNumber: '17',
+		});
 	});
 
 	it('still settles the dispatch when persisting the outcome onto the run fails', async () => {
