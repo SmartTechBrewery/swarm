@@ -242,6 +242,45 @@ describe('evaluateDispatchEligibility', () => {
 			});
 		});
 
+		// The literal production shape from #469, with both rules composed in one case:
+		// the assignee's only machine is a DB-free worker that refuses `planning`, and the
+		// DB-capable one belongs to somebody else. Before the fix this item could never be
+		// planned; the two assertions below pin each half of the policy against the *same*
+		// fixture, so a change to either the phase-capability filter or the affinity
+		// predicate cannot silently re-open it.
+		it('plans an item whose assignee owns only a worker that cannot plan', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-host', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'planning', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-host' } });
+		});
+
+		it('still holds the assignee to their own worker for implementation on that fixture', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-host', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			// Implementation is in `SUPPORTED_DB_FREE_PHASES`, so Alice's own worker takes it
+			// — Bob's is never considered. The exemption is Planning's alone.
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'implementation', workItem: ASSIGNED_ITEM, pm: PM }),
+			);
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-db-free', assignedUserId: ALICE },
+			});
+		});
+
 		it('records no assignedUserId on a planning selection', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
 				makeCandidate('w-alice', { ownerUserId: ALICE }),
