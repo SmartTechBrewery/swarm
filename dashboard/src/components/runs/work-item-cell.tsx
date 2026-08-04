@@ -124,6 +124,7 @@ export function WorkItemCell({
 	repo,
 	variant = 'cell',
 	titleHref,
+	phaseLabel,
 }: {
 	run: WorkItemCellRun;
 	repo?: string;
@@ -140,24 +141,37 @@ export function WorkItemCell({
 	 * row navigates to the run, and a nested link there would just swallow clicks.
 	 */
 	titleHref?: string;
+	/**
+	 * Names the phase on a leading line of its own, above the title — for a caller
+	 * with no Phase column to put it in (the Workers table's Active job, issue
+	 * #473). The runs list omits it: its Phase column already says this, in the
+	 * same words.
+	 */
+	phaseLabel?: string;
 }) {
 	const isPrDriven = PR_DRIVEN_PHASES.has(run.phase);
 	const title = isPrDriven ? run.prTitle : run.workItemTitle;
-	const titleNode = (
-		<WorkItemTitle title={title} isCard={variant === 'card'} titleHref={titleHref} />
-	);
+	// The reference line needs the repo to build a PR URL, and something to point
+	// at; without both there is nothing to reference.
+	const referenceRepo = repo && (run.workItemId || run.prNumber) ? repo : null;
 
-	// The reference line needs the repo to build a PR URL; with neither that nor a
-	// work item there is nothing to reference. A caller that asked for a run link
-	// still gets it — a running job must never read as idle.
-	if (!repo || (!run.workItemId && !run.prNumber)) {
-		return titleHref ? titleNode : <span className="text-zinc-500 font-mono">—</span>;
+	// Nothing to say at all — the runs list's long-standing behaviour, which drops
+	// even a resolved title when the reference is unavailable.
+	if (!referenceRepo && !titleHref && !phaseLabel) {
+		return <span className="text-zinc-500 font-mono">—</span>;
 	}
 
 	return (
 		<div className="flex w-full min-w-0 flex-col gap-1 text-xs">
-			{titleNode}
-			<WorkItemReference run={run} repo={repo} isPrDriven={isPrDriven} />
+			{phaseLabel ? (
+				<span className="block w-full truncate font-semibold capitalize text-zinc-100">
+					{phaseLabel}
+				</span>
+			) : null}
+			<WorkItemTitle title={title} isCard={variant === 'card'} titleHref={titleHref} />
+			{referenceRepo ? (
+				<WorkItemReference run={run} repo={referenceRepo} isPrDriven={isPrDriven} />
+			) : null}
 		</div>
 	);
 }

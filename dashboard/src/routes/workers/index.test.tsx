@@ -53,6 +53,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		displayName: 'ada-laptop',
 		owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
 		capabilities: ['claude'],
+		supportedPhases: ['planning', 'implementation'],
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
 		currentRun: null,

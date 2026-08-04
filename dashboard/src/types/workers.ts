@@ -55,6 +55,13 @@ export interface WorkerRow {
 	owner: WorkerOwner | null;
 	/** Declared agent CLIs (`claude` | `antigravity` | `codex`). */
 	capabilities: string[];
+	/**
+	 * Pipeline phases the machine's daemon declared it can execute (issue #467) —
+	 * the capability axis independent of the CLIs above: a DB-free remote daemon
+	 * has every CLI and still refuses `planning`. The Capabilities column leads
+	 * with a `PLANNING` badge when this includes it.
+	 */
+	supportedPhases: string[];
 	connection: WorkerConnectionState;
 	/** ISO 8601 — when the worker was last heard from; null if it never connected. */
 	lastSeenAt: string | null;

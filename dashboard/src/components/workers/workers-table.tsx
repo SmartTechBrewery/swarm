@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
-import { formatRelativeTime } from '@/lib/format.js';
+import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	OwnerWorker,
@@ -86,6 +86,44 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
 				{worker.lastSeenAt ? `· ${formatRelativeTime(worker.lastSeenAt)}` : '· Never connected'}
 			</span>
 		</span>
+	);
+}
+
+/** The meta-pill geometry every capability badge shares; only the hue differs. */
+const BADGE_BASE =
+	'px-2 py-0.5 text-[10px] uppercase font-mono font-bold tracking-wider rounded border';
+
+/**
+ * What the machine can run, on both capability axes (issue #467). A `PLANNING`
+ * badge leads when the daemon declared that phase, in the violet accent so it
+ * reads ahead of the neutral CLI badges beside it: unlike a CLI, it is the one
+ * capability an operator cannot infer from the machine's tooling — a DB-free
+ * remote daemon has every CLI and still refuses Planning — and it decides whether
+ * board work can start here at all. Every other declared phase is deliberately
+ * left off: they are the common case, and listing six chips per row would bury
+ * the one that distinguishes machines.
+ */
+function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
+	const canPlan = worker.supportedPhases.includes('planning');
+	if (!canPlan && worker.capabilities.length === 0) {
+		return <span className="text-sm text-zinc-500">—</span>;
+	}
+	return (
+		<div className="flex flex-wrap gap-1">
+			{canPlan ? (
+				<span
+					title="This machine's daemon can run the Planning phase"
+					className={`${BADGE_BASE} bg-violet-950/30 text-violet-300 border-violet-900/30`}
+				>
+					planning
+				</span>
+			) : null}
+			{worker.capabilities.map((cli) => (
+				<span key={cli} className={`${BADGE_BASE} bg-zinc-850 text-zinc-400 border-zinc-800`}>
+					{cli}
+				</span>
+			))}
+		</div>
 	);
 }
 
@@ -427,30 +465,19 @@ export function WorkersTable({ workers, refetchInterval }: WorkersTableProps) {
 								<ConnectionCell worker={worker} />
 							</td>
 							<td className="px-3 py-3 align-top">
-								<div className="flex flex-wrap gap-1">
-									{worker.capabilities.length > 0 ? (
-										worker.capabilities.map((cli) => (
-											<span
-												key={cli}
-												className="px-2 py-0.5 text-[10px] uppercase font-mono font-bold tracking-wider bg-zinc-850 text-zinc-400 rounded border border-zinc-800"
-											>
-												{cli}
-											</span>
-										))
-									) : (
-										<span className="text-sm text-zinc-500">—</span>
-									)}
-								</div>
+								<CapabilitiesCell worker={worker} />
 							</td>
 							<td className="px-3 py-3 align-top text-sm">
 								{worker.currentRun ? (
 									// The same description `/runs` gives the run, with the title
 									// linking to its detail page — the run id itself is a UUID and
-									// says nothing about the work (issue #473).
+									// says nothing about the work (issue #473). The phase leads the
+									// line here because this table has no Phase column of its own.
 									<WorkItemCell
 										run={worker.currentRun}
 										repo={projectRepos.get(worker.currentRun.projectId)}
 										titleHref={`/runs/${worker.currentRun.runId}`}
+										phaseLabel={formatPhase(worker.currentRun.phase)}
 									/>
 								) : (
 									<span className="text-zinc-500">—</span>

@@ -59,6 +59,7 @@ import {
 	listWorkersForOwner,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
 import type { WorkerAvailability } from './worker-eligibility.js';
 import {
@@ -357,6 +358,15 @@ export interface DashboardWorkerView {
 	displayName: string;
 	owner: RosterOwner | null;
 	capabilities: AgentCli[];
+	/**
+	 * The pipeline phases the machine's daemon declared it can execute (issue
+	 * #467) — the second capability axis, independent of the CLIs above: a DB-free
+	 * remote daemon has every CLI and still refuses `planning`
+	 * (`SUPPORTED_DB_FREE_PHASES`, `../transport/assignment-execution.ts`). The
+	 * Workers screen reads it to say so, rather than leaving an operator to infer
+	 * it from work that never starts.
+	 */
+	supportedPhases: TriggerPhase[];
 	connection: WorkerConnectionState;
 	/** When the worker was last heard from, or `null` if it never connected. */
 	lastSeenAt: Date | null;
@@ -430,6 +440,7 @@ async function assembleDashboardWorker(
 				}
 			: null,
 		capabilities: worker.capabilities,
+		supportedPhases: worker.supportedPhases,
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
 		currentRun: await resolveVisibleRun(worker.id, liveSession?.currentRunId ?? null, accessible),

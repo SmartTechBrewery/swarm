@@ -54,6 +54,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		displayName: 'ada-laptop',
 		owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
 		capabilities: ['claude', 'codex'],
+		supportedPhases: ['planning', 'implementation', 'review'],
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		currentRun: null,
@@ -180,6 +181,36 @@ describe('WorkersTable row content', () => {
 		expect(screen.getByText('codex')).toBeDefined();
 	});
 
+	it('leads Capabilities with a planning badge when the daemon declared that phase', () => {
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		const badges = screen.getByText('claude').parentElement;
+		// Planning first, then the CLIs — it is the capability an operator cannot
+		// infer from the machine's tooling (issue #467).
+		expect([...(badges?.children ?? [])].map((node) => node.textContent)).toEqual([
+			'planning',
+			'claude',
+			'codex',
+		]);
+		expect(screen.getByText('planning').getAttribute('title')).toContain('Planning phase');
+	});
+
+	it('omits the planning badge for a machine whose daemon refuses that phase', () => {
+		// What a DB-free remote daemon declares: every CLI, no planning.
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						supportedPhases: ['implementation', 'review', 'respond-to-review'],
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.queryByText('planning')).toBeNull();
+		expect(screen.getByText('claude')).toBeDefined();
+	});
+
 	it('renders one row per worker', () => {
 		renderTable(
 			<WorkersTable
@@ -208,6 +239,39 @@ describe('WorkersTable active job (issue #473)', () => {
 		// the reference line needs the project's repo, so it lands with that query.
 		const issue = await screen.findByRole('link', { name: /Issue: #42/ });
 		expect(issue.getAttribute('href')).toBe('https://github.com/acme/widgets/issues/42');
+	});
+
+	it('names the executing phase on a leading line of its own, above title and reference', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+		]);
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						currentRun: makeActiveRun({
+							phase: 'respond-to-review',
+							prNumber: '19',
+							prTitle: 'Count dispatches correctly',
+						}),
+					}),
+				]}
+			/>,
+		);
+
+		// Three lines in order: phase (this table has no Phase column, and it is
+		// spelled the way /runs spells it), then the title as the run link, then the
+		// provider reference.
+		const phase = await screen.findByText('respond to review');
+		await screen.findByRole('link', { name: /PR #19/ });
+		expect([...(phase.parentElement?.children ?? [])].map((node) => node.textContent)).toEqual([
+			'respond to review',
+			'Count dispatches correctly',
+			'PR #19',
+		]);
+		expect(
+			screen.getByRole('link', { name: 'Count dispatches correctly' }).getAttribute('href'),
+		).toBe('/runs/run-7');
 	});
 
 	it('leads a PR-driven job with the PR title and PR reference', async () => {

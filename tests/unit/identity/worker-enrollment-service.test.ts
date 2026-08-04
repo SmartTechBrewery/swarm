@@ -484,6 +484,25 @@ describe('listDashboardWorkers (issue #133)', () => {
 		});
 	});
 
+	describe('declared capabilities', () => {
+		it('reports the phase repertoire the daemon declared, so the screen can say a machine refuses Planning', async () => {
+			// What a DB-free remote daemon declares (`SUPPORTED_DB_FREE_PHASES`): every
+			// CLI, no `planning`. The dispatch gate reads the same field (issue #467).
+			listAllWorkers.mockResolvedValue([
+				makeWorker({ supportedPhases: ['implementation', 'review', 'respond-to-review'] }),
+			]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(undefined);
+			getRetainedSessionForWorker.mockResolvedValue(undefined);
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(view.supportedPhases).toEqual(['implementation', 'review', 'respond-to-review']);
+			expect(view.capabilities).toEqual(['claude', 'codex']);
+		});
+	});
+
 	describe('authorization scope', () => {
 		it('gives an administrator every registered worker, including an un-enrolled one', async () => {
 			listAllWorkers.mockResolvedValue([
@@ -597,6 +616,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'enrollments',
 				'lastSeenAt',
 				'owner',
+				'supportedPhases',
 				'workerId',
 			].sort(),
 		);
