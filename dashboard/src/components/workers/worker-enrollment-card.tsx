@@ -95,25 +95,27 @@ function ControlHeading({ title, children }: { title: string; children: string }
 	);
 }
 
-/** `null` when the text is a valid allocation (empty = clear the sub-limit), else the reason. */
+/**
+ * `null` when the text is a valid allocation, else the reason. An empty field is a
+ * validation error rather than "no per-worker limit" — an enrollment always states
+ * its share of the project (issue #480), so emptying the input can't clear it.
+ */
 function concurrencyDraftError(draft: string): string | null {
 	const trimmed = draft.trim();
-	if (trimmed === '') return null;
 	if (!/^\d+$/.test(trimmed) || Number(trimmed) < 1) {
-		return 'Enter a whole number of 1 or more, or leave it empty for no per-worker limit.';
+		return 'Enter a whole number of 1 or more.';
 	}
 	return null;
 }
 
-/** The allocation a draft stands for: `null` = no per-worker sub-limit. */
-function parseConcurrencyDraft(draft: string): number | null {
-	const trimmed = draft.trim();
-	return trimmed === '' ? null : Number(trimmed);
+/** The allocation an (already validated) draft stands for. */
+function parseConcurrencyDraft(draft: string): number {
+	return Number(draft.trim());
 }
 
-/** How the server's value reads in the input — `null` shows as empty, not as `0`. */
-function concurrencyToDraft(value: number | null): string {
-	return value === null ? '' : String(value);
+/** How the server's value reads in the input. */
+function concurrencyToDraft(value: number): string {
+	return String(value);
 }
 
 interface WorkerEnrollmentCardProps {
@@ -292,7 +294,7 @@ export function WorkerEnrollmentCard({
 		onSuccess: onChanged,
 	});
 	const concurrencyMutation = useMutation({
-		mutationFn: (concurrencyAllocation: number | null) =>
+		mutationFn: (concurrencyAllocation: number) =>
 			trpcClient.workers.updateConstraints.mutate({
 				enrollmentId: enrollment.enrollmentId,
 				concurrencyAllocation,
@@ -408,8 +410,8 @@ export function WorkerEnrollmentCard({
 
 				<div className="space-y-2">
 					<ControlHeading title="Concurrency allocation">
-						An optional per-worker sub-limit for this project. Empty means no sub-limit — the
-						machine's own concurrency and the project cap still apply.
+						How many of this project's jobs run on this machine at once — 1 unless it was raised.
+						The machine's own concurrency and the project cap still apply on top.
 					</ControlHeading>
 					<ConcurrencyControl
 						enrollmentId={enrollment.enrollmentId}
@@ -578,10 +580,12 @@ function AllowedClisControl({
 }
 
 /**
- * The per-worker concurrency sub-limit. Unlike the switches and checkboxes, a free
+ * This worker's share of the project. Unlike the switches and checkboxes, a free
  * text field can't save on every keystroke, so it keeps a draft and applies on
  * demand; the draft re-syncs whenever the server's value actually changes, so the
- * screen's polling can't overwrite what is being typed.
+ * screen's polling can't overwrite what is being typed. An empty or out-of-range
+ * draft disables **Apply** rather than sending anything — no allocation means
+ * "unlimited" (issue #480).
  */
 function ConcurrencyControl({
 	enrollmentId,
@@ -592,11 +596,11 @@ function ConcurrencyControl({
 	onApply,
 }: {
 	enrollmentId: string;
-	value: number | null;
+	value: number;
 	editable: boolean;
 	pending: boolean;
 	ownerName: string;
-	onApply: (next: number | null) => void;
+	onApply: (next: number) => void;
 }) {
 	const [draft, setDraft] = useState(() => concurrencyToDraft(value));
 	const lastServerValue = useRef(value);
@@ -613,7 +617,7 @@ function ConcurrencyControl({
 				className="text-sm text-zinc-300 font-mono"
 				title={`Only ${ownerName} can change the concurrency allocation for this project`}
 			>
-				{value === null ? 'No limit' : value}
+				{value}
 			</p>
 		);
 	}
@@ -630,7 +634,6 @@ function ConcurrencyControl({
 					min="1"
 					step="1"
 					inputMode="numeric"
-					placeholder="No limit"
 					value={draft}
 					onChange={(event) => setDraft(event.target.value)}
 					disabled={pending}

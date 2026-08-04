@@ -271,11 +271,35 @@ describe('swarm workers', () => {
 			expect(enrollWorker).not.toHaveBeenCalled();
 		});
 
-		it('rejects a non-positive --concurrency without hitting the service', async () => {
+		it('rejects a non-positive or empty --concurrency without hitting the service', async () => {
 			expect(
 				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--concurrency', '0']),
 			).toBe(1);
+			// Issue #480: an empty value must not read as "clear the allocation".
+			expect(
+				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--concurrency', '']),
+			).toBe(1);
 			expect(enrollWorker).not.toHaveBeenCalled();
+		});
+
+		it('leaves --concurrency to the service default and reports the stored allocation', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude'])).toBe(0);
+			// Omitted, so the service applies DEFAULT_CONCURRENCY_ALLOCATION rather
+			// than the CLI inventing a value or sending null (issue #480).
+			expect(enrollWorker).toHaveBeenCalledWith(
+				expect.objectContaining({ concurrencyAllocation: undefined }),
+			);
+			expect(log).toHaveBeenCalledWith(expect.stringContaining('concurrency 1'));
+		});
+
+		it('passes an explicit --concurrency through for a wider worker', async () => {
+			expect(
+				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--concurrency', '3']),
+			).toBe(0);
+			expect(enrollWorker).toHaveBeenCalledWith(
+				expect.objectContaining({ concurrencyAllocation: 3 }),
+			);
 		});
 
 		it('fails cleanly for a missing worker or project', async () => {

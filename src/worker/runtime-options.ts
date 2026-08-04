@@ -31,8 +31,8 @@ function readConcurrencyFlag(argv: string[]): string | undefined {
  * falling back, naming whichever source supplied the bad value.
  *
  * This is the worker's *process-wide* cap across every project it serves; a
- * project's own `maxConcurrentJobs` and an enrollment's optional
- * `concurrencyAllocation` bound it further (see `worker-eligibility.ts`).
+ * project's own `maxConcurrentJobs` and an enrollment's `concurrencyAllocation`
+ * bound it further (see `worker-eligibility.ts`).
  */
 export function resolveWorkerConcurrency(
 	argv: string[] = process.argv.slice(2),

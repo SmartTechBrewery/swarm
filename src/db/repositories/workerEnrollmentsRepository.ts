@@ -50,8 +50,8 @@ export interface CreateEnrollmentInput {
 	projectId: string;
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
-	/** `null` = no per-worker sub-limit (bounded only by worker + project caps). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer (issue #480). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 }
 
@@ -183,8 +183,8 @@ export async function setEnrollmentSharingConsent(
 /** The mutable execution constraints; each field is optional so a caller updates only what changed. */
 export interface UpdateEnrollmentConstraintsInput {
 	allowedClis?: AgentCli[];
-	/** `null` clears the sub-limit; a positive integer sets it; omit to leave unchanged. */
-	concurrencyAllocation?: number | null;
+	/** A positive integer sets the allocation; omit to leave the stored value alone. */
+	concurrencyAllocation?: number;
 }
 
 /**
@@ -198,9 +198,7 @@ export async function updateEnrollmentConstraints(
 	id: string,
 	input: UpdateEnrollmentConstraintsInput,
 ): Promise<WorkerEnrollment | undefined> {
-	const patch: Partial<Pick<EnrollmentRow, 'allowedClis'>> & {
-		concurrencyAllocation?: number | null;
-	} = {};
+	const patch: Partial<Pick<EnrollmentRow, 'allowedClis' | 'concurrencyAllocation'>> = {};
 	if (input.allowedClis !== undefined) patch.allowedClis = input.allowedClis;
 	if (input.concurrencyAllocation !== undefined) {
 		patch.concurrencyAllocation = input.concurrencyAllocation;

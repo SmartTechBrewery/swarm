@@ -267,6 +267,13 @@
       "when": 1785839847394,
       "tag": "0037_brainy_sentinels",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1785876097815,
+      "tag": "0038_fancy_daimon_hellstrom",
+      "breakpoints": true
     }
   ]
 }

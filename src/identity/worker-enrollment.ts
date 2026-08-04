@@ -55,16 +55,33 @@ export const EnrollmentAllowedClisSchema = z
 	.transform((clis) => [...new Set(clis)]);
 
 /**
- * An *optional* per-worker, per-project concurrency sub-limit. When set it is a
- * positive integer — an enrollment that can take on no work is a `suspended`
- * status, not a zero allocation, so the two concepts don't overlap. When
- * **unset** (`null`) the enrollment imposes no cap of its own: the worker's
- * concurrency for this project is bounded only by its process-wide
- * `SWARM_WORKER_CONCURRENCY` (the `--concurrency` launch flag) and the project's
- * `maxConcurrentJobs`. This schema validates a *provided* value; the `null` case
- * is modelled on {@link WorkerEnrollmentSchema} directly (`.nullable()`).
+ * The per-worker, per-project concurrency allocation — always a positive
+ * integer, never absent (issue #480). It is this worker's share of the project:
+ * how many of the project's jobs it will run at once. An enrollment that can
+ * take on no work is a `suspended` status, not a zero allocation, so the two
+ * concepts don't overlap.
+ *
+ * There is deliberately **no "unbounded" value**: "no per-worker cap" used to be
+ * expressible as `NULL`, which was a second way of saying a number — on a default
+ * install it already resolved to an effective 1, because the two limits it
+ * deferred to (`SWARM_WORKER_CONCURRENCY` and the project's `maxConcurrentJobs`)
+ * both default to 1. Every enrollment now states its share outright; a worker
+ * meant to take several of a project's slots says so with a larger allocation.
  */
 export const ConcurrencyAllocationSchema = z.number().int().positive();
+
+/**
+ * The allocation a new enrollment gets when the operator names none — the safe
+ * value, and the one every other concurrency default in SWARM already carries:
+ * `DEFAULT_WORKER_CONCURRENCY` (`src/worker/runtime-options.ts`) and
+ * `PROJECT_DEFAULTS.maxConcurrentJobs` (`src/config/schema.ts`) are both `1`
+ * too. Kept separate from those rather than derived from them: they bound
+ * different things (a process, a project, one worker's share of a project) and
+ * happen to agree on the value, so re-defaulting one must not silently move the
+ * others. The `worker_project_enrollments.concurrency_allocation` column default
+ * mirrors this constant.
+ */
+export const DEFAULT_CONCURRENCY_ALLOCATION = 1;
 
 /**
  * A single worker-project enrollment. `workerId` is a `workers.id` (`uuid`);
@@ -84,7 +101,7 @@ export const WorkerEnrollmentSchema = z.object({
 	projectId: z.string().min(1),
 	status: EnrollmentStatusSchema,
 	allowedClis: z.array(AgentCliSchema),
-	concurrencyAllocation: z.number().int().positive().nullable(),
+	concurrencyAllocation: ConcurrencyAllocationSchema,
 	sharingConsent: z.boolean(),
 	createdAt: z.date(),
 	updatedAt: z.date(),

@@ -64,6 +64,7 @@ import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
+	DEFAULT_CONCURRENCY_ALLOCATION,
 	deriveWorkerRunState,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -639,7 +640,7 @@ describe('enrollWorker', () => {
 		expect(createEnrollment).not.toHaveBeenCalled();
 	});
 
-	it('de-dupes allowed CLIs, defaults status pending / consent off / no concurrency sub-limit', async () => {
+	it('de-dupes allowed CLIs, defaults status pending / consent off / allocation 1', async () => {
 		const worker = makeWorker({ capabilities: ['claude', 'codex'] });
 		createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
 
@@ -650,11 +651,11 @@ describe('enrollWorker', () => {
 			projectId: 'proj-a',
 			status: 'pending',
 			allowedClis: ['claude'],
-			// Omitting the sub-limit now defaults to null (bounded only by the
-			// worker's --concurrency launch flag and the project cap), not 1.
-			concurrencyAllocation: null,
+			// Issue #480: an omitted allocation is the safe value, not "uncapped".
+			concurrencyAllocation: DEFAULT_CONCURRENCY_ALLOCATION,
 			sharingConsent: false,
 		});
+		expect(DEFAULT_CONCURRENCY_ALLOCATION).toBe(1);
 	});
 
 	it('passes through an explicit status, consent, and concurrency', async () => {
@@ -715,23 +716,19 @@ describe('updateEnrollmentConstraints', () => {
 		});
 	});
 
-	it('clears the sub-limit when the allocation is null', async () => {
-		// `null` clears an existing per-worker cap (e.g. an enrollment created
-		// before the sub-limit became optional), leaving the worker bounded only
-		// by its --concurrency and the project cap. It must pass straight through
-		// — not be rejected by the positive-integer validator.
+	it('rejects a non-positive allocation instead of storing it (issue #480)', async () => {
+		// There is no "clear the allocation" value any more: an enrollment always
+		// states its share of the project, so 0 is a validation error rather than a
+		// route to the old unbounded state.
 		const worker = makeWorker();
-		updateEnrollmentConstraintsRow.mockResolvedValue(makeEnrollment());
-
-		await updateEnrollmentConstraints({
-			worker,
-			enrollmentId: ENROLLMENT_ID,
-			concurrencyAllocation: null,
-		});
-
-		expect(updateEnrollmentConstraintsRow).toHaveBeenCalledWith(ENROLLMENT_ID, {
-			concurrencyAllocation: null,
-		});
+		await expect(
+			updateEnrollmentConstraints({
+				worker,
+				enrollmentId: ENROLLMENT_ID,
+				concurrencyAllocation: 0,
+			}),
+		).rejects.toThrow();
+		expect(updateEnrollmentConstraintsRow).not.toHaveBeenCalled();
 	});
 
 	it('omits an unspecified allocation from the patch (leaves it unchanged)', async () => {

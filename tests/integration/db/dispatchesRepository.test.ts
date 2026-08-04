@@ -254,7 +254,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 	});
 
 	describe('federated worker execution claims', () => {
-		async function seedFederatedWorker(allocation: number | null = 1, suffix = String(allocation)) {
+		async function seedFederatedWorker(allocation = 1, suffix = String(allocation)) {
 			const owner = await createUser({
 				identifier: `owner-${suffix}@example.com`,
 				displayName: 'Owner',
@@ -342,15 +342,17 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect((await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).activeRuns).toBe(1);
 		});
 
-		it('a null allocation imposes no per-worker cap — one worker fills the project slots', async () => {
+		it('a widened allocation lets one worker fill both project slots', async () => {
 			// With allocation=1 the previous test capped a single worker at one run
-			// even when the project allowed two. A null allocation removes that
-			// per-worker sub-limit, so the same worker fills both project slots.
+			// even when the project allowed two. Raising the enrollment's share to 2
+			// is how an operator lets the same worker fill both project slots — issue
+			// #480 removed the `null`/"uncapped" allocation that used to do this
+			// implicitly.
 			await getDb()
 				.update(projects)
 				.set({ maxConcurrentJobs: 2 })
 				.where(eq(projects.id, PROJECT_ID));
-			const { worker, session } = await seedFederatedWorker(null, 'unbounded');
+			const { worker, session } = await seedFederatedWorker(2, 'wide');
 			const [first, second] = await Promise.all([
 				leasedDispatch('host-a:1'),
 				leasedDispatch('host-a:2'),

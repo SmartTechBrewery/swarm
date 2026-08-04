@@ -50,10 +50,8 @@ import type { WorkerEnrollment } from './worker-enrollment.js';
  * - `missing-consent` — enrolled and active, but the worker's owner has not
  *   granted (or has revoked) sharing consent for this project.
  * - `worker-unavailable` — the worker is disconnected/unhealthy (no live
- *   session) or already at its enrolled concurrency allocation (only when that
- *   allocation is set; a `null` allocation imposes no per-worker slot cap). One
- *   value, since both resolve the same way: wait for the worker to come back or
- *   free a slot.
+ *   session) or already at its enrolled concurrency allocation. One value, since
+ *   both resolve the same way: wait for the worker to come back or free a slot.
  * - `missing-phase-capability` — the worker's daemon did not declare this pipeline
  *   phase as one it can execute (issue #467). Distinct from a missing CLI: the
  *   machine may have every CLI and still refuse the phase, as the DB-free remote
@@ -100,8 +98,8 @@ export type EligibilityResult =
  * `activeRuns` is how many runs it is executing for this project right now,
  * derived from run lifecycle and never client-supplied (the same rule
  * `deriveWorkerRunState` follows); it is compared against the enrollment's
- * `concurrencyAllocation` to decide whether a slot is free — unless that
- * allocation is `null`, in which case no per-worker slot cap applies.
+ * `concurrencyAllocation` — always a positive integer (issue #480) — to decide
+ * whether a slot is free.
  */
 export interface WorkerAvailability {
 	connected: boolean;
@@ -150,12 +148,11 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	if (!enrollment.sharingConsent) {
 		return { eligible: false, reason: 'missing-consent' };
 	}
-	// A `null` `concurrencyAllocation` imposes no per-worker slot cap (the worker
-	// is bounded only by its process-wide `SWARM_WORKER_CONCURRENCY` and the
-	// project's cap); only a set positive allocation gates on a free slot here.
-	const atCapacity =
-		enrollment.concurrencyAllocation !== null &&
-		availability.activeRuns >= enrollment.concurrencyAllocation;
+	// Every enrollment states this worker's share of the project (issue #480), so
+	// the capacity test is unconditional: the worker's process-wide
+	// `SWARM_WORKER_CONCURRENCY` and the project's cap bound it further, they never
+	// stand in for a missing allocation.
+	const atCapacity = availability.activeRuns >= enrollment.concurrencyAllocation;
 	if (!availability.connected || atCapacity) {
 		return { eligible: false, reason: 'worker-unavailable' };
 	}

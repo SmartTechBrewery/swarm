@@ -342,18 +342,16 @@ function eligibilityClaimRefusal(
 }
 
 /**
- * Whether a worker's active-run count meets or exceeds its per-worker allocation
- * for this project. A `null` `concurrencyAllocation` means the enrollment imposes
- * no per-worker sub-limit — the worker is bounded only by the project's
- * `maxConcurrentJobs` and its process-wide `SWARM_WORKER_CONCURRENCY` — so it is
- * never "exceeded". Only a set positive allocation gates on a free slot.
+ * Whether a worker's active-run count meets or exceeds its share of this project
+ * (`concurrencyAllocation`, always a positive integer — issue #480). A missing
+ * enrollment is refused earlier by {@link eligibilityClaimRefusal}, so it cannot
+ * exceed anything here.
  */
 function workerAllocationExceeded(
 	enrollment: typeof workerProjectEnrollments.$inferSelect | undefined,
 	activeRuns: number,
 ): boolean {
-	const allocation = enrollment?.concurrencyAllocation;
-	return allocation != null && activeRuns >= allocation;
+	return enrollment !== undefined && activeRuns >= enrollment.concurrencyAllocation;
 }
 
 /**

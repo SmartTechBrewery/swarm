@@ -68,6 +68,7 @@ import type { WorkerAvailability } from './worker-eligibility.js';
 import {
 	AllowedClisNotCapableError,
 	ConcurrencyAllocationSchema,
+	DEFAULT_CONCURRENCY_ALLOCATION,
 	EnrollmentAllowedClisSchema,
 	type EnrollmentStatus,
 	isRoutable,
@@ -78,6 +79,7 @@ import { getLiveSessionForWorker, getRetainedSessionForWorker } from './worker-s
 export {
 	AllowedClisNotCapableError,
 	ConcurrencyAllocationSchema,
+	DEFAULT_CONCURRENCY_ALLOCATION,
 	ENROLLMENT_STATUSES,
 	EnrollmentAllowedClisSchema,
 	type EnrollmentStatus,
@@ -114,8 +116,8 @@ export interface WorkerRosterEntry {
 	capabilities: AgentCli[];
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
-	/** `null` = no per-worker sub-limit for this project (see `ConcurrencyAllocationSchema`). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer (see `ConcurrencyAllocationSchema`). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	isRoutable: boolean;
 	runState: WorkerRunState;
@@ -127,8 +129,8 @@ export interface OwnerEnrollmentView {
 	projectId: string;
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
-	/** `null` = no per-worker sub-limit for this project (see `ConcurrencyAllocationSchema`). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer (see `ConcurrencyAllocationSchema`). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	isRoutable: boolean;
 }
@@ -391,8 +393,8 @@ export interface DashboardWorkerEnrollmentDetail {
 	projectId: string;
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
-	/** `null` = no per-worker sub-limit for this project (see `ConcurrencyAllocationSchema`). */
-	concurrencyAllocation: number | null;
+	/** This worker's share of the project — a positive integer (see `ConcurrencyAllocationSchema`). */
+	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	isRoutable: boolean;
 }
@@ -595,12 +597,12 @@ export interface EnrollWorkerInput {
 	projectId: string;
 	allowedClis: AgentCli[];
 	/**
-	 * Optional per-worker concurrency sub-limit for this project. Omit (or pass
-	 * `null`) for no sub-limit — the default — so the worker's concurrency here is
-	 * governed by its `--concurrency` launch flag and the project's cap. A positive
-	 * integer narrows it further for this one project.
+	 * This worker's share of the project. Omit for
+	 * {@link DEFAULT_CONCURRENCY_ALLOCATION} (`1`) — the safe value an operator
+	 * almost always wants when adding a machine; a larger positive integer lets
+	 * this one project take several of the worker's slots at once.
 	 */
-	concurrencyAllocation?: number | null;
+	concurrencyAllocation?: number;
 	/** Initial status; defaults to `pending` (awaiting a projectAdmin's approval). */
 	status?: EnrollmentStatus;
 	/** Initial sharing consent; defaults to `false` (owner opts in explicitly). */
@@ -612,16 +614,17 @@ export interface EnrollWorkerInput {
  * de-duplicated) and enforces that it is a **subset of the worker's declared
  * capabilities** — throwing {@link AllowedClisNotCapableError} otherwise — then
  * persists a `pending` enrollment (unless a status is given) with sharing
- * consent off by default. A duplicate `(worker, project)` surfaces the
- * repository's pg `23505` for the caller to translate.
+ * consent off by default and, unless the caller names one, a concurrency
+ * allocation of {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate
+ * `(worker, project)` surfaces the repository's pg `23505` for the caller to
+ * translate.
  */
 export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnrollment> {
 	const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
 	assertClisWithinCapabilities(input.worker, allowedClis);
-	const concurrencyAllocation =
-		input.concurrencyAllocation == null
-			? null
-			: ConcurrencyAllocationSchema.parse(input.concurrencyAllocation);
+	const concurrencyAllocation = ConcurrencyAllocationSchema.parse(
+		input.concurrencyAllocation ?? DEFAULT_CONCURRENCY_ALLOCATION,
+	);
 	return createEnrollment({
 		workerId: input.worker.id,
 		projectId: input.projectId,
@@ -688,31 +691,29 @@ export interface UpdateEnrollmentConstraintsInput {
 	worker: Worker;
 	enrollmentId: string;
 	allowedClis?: AgentCli[];
-	/** A positive integer sets the sub-limit; `null` clears it; omit to leave unchanged. */
-	concurrencyAllocation?: number | null;
+	/** A positive integer sets the allocation; omit to leave the stored value alone. */
+	concurrencyAllocation?: number;
 }
 
 /**
  * Update an enrollment's execution constraints. When `allowedClis` is given it
  * is re-validated (non-empty, de-duplicated) and re-checked against the worker's
- * capabilities; `concurrencyAllocation`, when a number, must be a positive
- * integer, or `null` to clear the sub-limit. Returns the updated enrollment, or
- * `undefined` if no enrollment has that id.
+ * capabilities; `concurrencyAllocation`, when given, must be a positive integer.
+ * There is no "clear it" value — an enrollment always states its share of the
+ * project (issue #480), so omitting the field leaves the stored one alone.
+ * Returns the updated enrollment, or `undefined` if no enrollment has that id.
  */
 export async function updateEnrollmentConstraints(
 	input: UpdateEnrollmentConstraintsInput,
 ): Promise<WorkerEnrollment | undefined> {
-	const patch: { allowedClis?: AgentCli[]; concurrencyAllocation?: number | null } = {};
+	const patch: { allowedClis?: AgentCli[]; concurrencyAllocation?: number } = {};
 	if (input.allowedClis !== undefined) {
 		const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
 		assertClisWithinCapabilities(input.worker, allowedClis);
 		patch.allowedClis = allowedClis;
 	}
 	if (input.concurrencyAllocation !== undefined) {
-		patch.concurrencyAllocation =
-			input.concurrencyAllocation === null
-				? null
-				: ConcurrencyAllocationSchema.parse(input.concurrencyAllocation);
+		patch.concurrencyAllocation = ConcurrencyAllocationSchema.parse(input.concurrencyAllocation);
 	}
 	return updateEnrollmentConstraintsRow(input.enrollmentId, patch);
 }
