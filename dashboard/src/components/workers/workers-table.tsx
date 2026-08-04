@@ -2,6 +2,7 @@ import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/rea
 import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
+import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { formatRelativeTime } from '@/lib/format.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
@@ -44,13 +45,15 @@ interface WorkersTableProps {
  * Fixed desktop column widths (issue #473). The table spans its container, and
  * the freed width goes to the Active job description — the one cell holding prose
  * — rather than to empty space on the right; everything else is sized to its own
- * content.
+ * content. Status needs little: `Online` is two words and an offline row's
+ * last-seen time wraps under it, so half its former width goes to Capabilities,
+ * whose CLI chips otherwise wrap one-per-line for a three-CLI machine.
  */
 const COLUMN_WIDTHS = {
 	machine: 'w-[16%]',
 	owner: 'w-[14%]',
-	status: 'w-[18%]',
-	capabilities: 'w-[12%]',
+	status: 'w-[9%]',
+	capabilities: 'w-[21%]',
 	activeJob: 'w-[30%]',
 	available: 'w-[10%]',
 };
@@ -71,7 +74,9 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
 		);
 	}
 	return (
-		<span className="inline-flex items-center gap-2 text-sm text-zinc-400">
+		// Wrapping, not one line: the narrow Status column (see COLUMN_WIDTHS) fits
+		// the word and its dot, and drops the last-seen time onto a second line.
+		<span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-zinc-400">
 			<span className="h-2 w-2 rounded-full bg-zinc-600 ring-4 ring-zinc-600/10" />
 			Offline
 			<span
@@ -84,7 +89,12 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
 	);
 }
 
-/** An accessible on/off switch for sharing consent — read-only unless the viewer owns the worker. */
+/**
+ * Sharing consent as the shared design-system switch (`components/ui/toggle-switch.tsx`,
+ * the one the Agent Configuration phase toggles use), so a switch looks and
+ * behaves the same everywhere. Read-only for a worker the viewer doesn't own: it
+ * renders disabled, with the `title` saying who can change it.
+ */
 function ConsentSwitch({
 	sharing,
 	pending,
@@ -101,28 +111,16 @@ function ConsentSwitch({
 	title: string;
 	onToggle: (next: boolean) => void;
 }) {
-	const disabled = pending || readOnly;
 	return (
-		<button
-			type="button"
-			role="switch"
-			aria-checked={sharing}
-			aria-label={label}
+		<ToggleSwitch
+			checked={sharing}
+			label={label}
 			title={title}
-			disabled={disabled}
-			onClick={() => {
+			disabled={pending || readOnly}
+			onChange={() => {
 				if (!readOnly) onToggle(!sharing);
 			}}
-			className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-1 focus:ring-offset-panel disabled:cursor-not-allowed ${
-				readOnly ? 'opacity-60' : 'disabled:opacity-50'
-			} ${sharing ? 'bg-emerald-600' : 'bg-zinc-700'}`}
-		>
-			<span
-				className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
-					sharing ? 'translate-x-3.5' : 'translate-x-0.5'
-				}`}
-			/>
-		</button>
+		/>
 	);
 }
 

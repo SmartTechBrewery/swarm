@@ -20,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { BoardMappingPanel } from '@/components/projects/board-mapping-panel.js';
 import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
+import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import {
 	addTarget,
 	areTargetsDirty,
@@ -627,7 +628,7 @@ export function PhaseEnabledCell({
 	const togglesBusy = savingToggleKey !== undefined;
 	return (
 		<span className="inline-flex items-center gap-2">
-			<PhaseToggleSwitch
+			<ToggleSwitch
 				checked={enabled === true}
 				label={`${label} enabled`}
 				disabled={Boolean(isPending || enabledDisabled || togglesBusy)}
@@ -635,40 +636,6 @@ export function PhaseEnabledCell({
 			/>
 			<ToggleSaveIndicator saving={savingToggleKey === key} />
 		</span>
-	);
-}
-
-/** A compact design-system switch shared by the phase controls. */
-export function PhaseToggleSwitch({
-	checked,
-	label,
-	disabled,
-	onChange,
-}: {
-	checked: boolean;
-	label: string;
-	disabled: boolean;
-	onChange?: () => void;
-}) {
-	return (
-		<button
-			type="button"
-			role="switch"
-			aria-checked={checked}
-			aria-label={label}
-			disabled={disabled}
-			// The row navigates on click; keep the toggle from bubbling up to it
-			// (ai/DESIGN_SYSTEM.md: trailing row action calls stopPropagation).
-			onClick={(e) => {
-				e.stopPropagation();
-				onChange?.();
-			}}
-			className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-1 focus:ring-offset-[#0F0F11] disabled:opacity-50 disabled:cursor-not-allowed ${checked ? 'bg-violet-600' : 'bg-zinc-700'}`}
-		>
-			<span
-				className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-4' : 'translate-x-0.5'}`}
-			/>
-		</button>
 	);
 }
 
@@ -751,7 +718,7 @@ export function PhaseConfigRow({
 					<span className="text-xs text-zinc-500">N/A</span>
 				) : (
 					<span className="inline-flex items-center gap-2">
-						<PhaseToggleSwitch
+						<ToggleSwitch
 							checked={autoAdvance}
 							label={`${phaseLabel.label} auto-advance`}
 							disabled={isPending || savingToggleKey !== undefined}
@@ -1146,7 +1113,7 @@ export function PhaseSettingsDetail({
 				<div className="space-y-4 p-4 border border-zinc-800 rounded-md bg-panel/20">
 					<div className="flex items-start gap-3">
 						{enabled === undefined ? (
-							<PhaseToggleSwitch
+							<ToggleSwitch
 								checked={true}
 								label={`${phaseLabel.label} enabled (always on)`}
 								disabled={true}
@@ -1177,7 +1144,7 @@ export function PhaseSettingsDetail({
 					{autoAdvance !== undefined && (
 						<div className="flex items-start gap-3">
 							<span className="inline-flex items-center gap-2">
-								<PhaseToggleSwitch
+								<ToggleSwitch
 									checked={autoAdvance}
 									label={`${phaseLabel.label} auto-advance`}
 									disabled={isPending || savingToggleKey !== undefined}

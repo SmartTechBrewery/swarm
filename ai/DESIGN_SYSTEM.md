@@ -90,6 +90,8 @@ Each entry is the Tailwind "recipe" to reuse — treat these as the contract, no
 
 **Label** — `block text-xs font-medium text-zinc-400`, required marker as `<span class="text-red-500">*</span>`.
 
+**Toggle switch** — there is exactly one: `ToggleSwitch` (`dashboard/src/components/ui/toggle-switch.tsx`). Render it for every boolean; never hand-roll a second switch with its own size or colour. Track `h-5 w-9 rounded-full`, `bg-violet-600` on / `bg-zinc-700` off, a `h-4 w-4` white knob, `disabled:opacity-50 disabled:cursor-not-allowed`. It carries `role="switch"` + `aria-checked` and takes `label` as its accessible name — name what it controls, not its current state. It always calls `stopPropagation` so it can sit in a row that navigates on click. A state the viewer may see but not change (someone else's worker on `/workers`) renders it `disabled` with a `title` saying who can change it — a disabled switch states the fact; suppressing it entirely would hide it. When the value is genuinely unknown (its query is loading or failed), show a muted em dash with an explaining `title` instead — never an off switch.
+
 **Card/panel** — `border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm` (drop the alpha fraction to `/20`–`/30` for a nested sub-panel inside another panel, so depth reads without a heavier border).
 
 **Table** — bordered wrapper `border border-zinc-800 rounded-md overflow-hidden bg-panel/20 shadow-sm`; header row `bg-zinc-800/30 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-400`; body rows `divide-y divide-zinc-800/60`, `hover:bg-zinc-800/40 transition-colors`. Whole-row-clickable-to-navigate is fine (`cursor-pointer` on `<tr>`) as long as any trailing per-row action button calls `stopPropagation`.

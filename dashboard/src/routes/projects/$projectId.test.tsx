@@ -68,7 +68,6 @@ import {
 	PhaseConfigRow,
 	PhaseEnabledCell,
 	PhaseSettingsDetail,
-	PhaseToggleSwitch,
 	PipelineSettingsForm,
 	ToggleSaveIndicator,
 	toggleSaveKey,
@@ -93,52 +92,6 @@ function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
 		...overrides,
 	} as ProjectConfig;
 }
-
-describe('PhaseToggleSwitch', () => {
-	it('renders as a switch with the correct accessible label and state', () => {
-		render(
-			<PhaseToggleSwitch checked={true} label="Test label" disabled={false} onChange={() => {}} />,
-		);
-
-		const switchElement = screen.getByRole('switch') as HTMLButtonElement;
-		expect(switchElement).toBeDefined();
-		expect(switchElement.getAttribute('aria-checked')).toBe('true');
-		expect(switchElement.getAttribute('aria-label')).toBe('Test label');
-		expect(switchElement.disabled).toBe(false);
-	});
-
-	it('respects the disabled prop', () => {
-		render(
-			<PhaseToggleSwitch checked={false} label="Test label" disabled={true} onChange={() => {}} />,
-		);
-
-		const switchElement = screen.getByRole('switch') as HTMLButtonElement;
-		expect(switchElement.disabled).toBe(true);
-		expect(switchElement.getAttribute('aria-checked')).toBe('false');
-	});
-
-	it('triggers onChange and stops propagation when clicked', () => {
-		const handleChange = vi.fn();
-
-		render(
-			<PhaseToggleSwitch
-				checked={false}
-				label="Test label"
-				disabled={false}
-				onChange={handleChange}
-			/>,
-		);
-
-		const switchElement = screen.getByRole('switch') as HTMLButtonElement;
-		const event = new MouseEvent('click', { bubbles: true, cancelable: true });
-		const stopPropagationSpy = vi.spyOn(event, 'stopPropagation');
-
-		fireEvent(switchElement, event);
-
-		expect(handleChange).toHaveBeenCalledTimes(1);
-		expect(stopPropagationSpy).toHaveBeenCalledTimes(1);
-	});
-});
 
 describe('toggleSaveKey', () => {
 	it('builds a stable per-phase, per-kind key', () => {
