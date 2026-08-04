@@ -243,6 +243,61 @@ export function createMockBitbucketCommitStatusPayload(
 	};
 }
 
+/**
+ * A Bitbucket Cloud **REST** pull-request object, as
+ * `GET /2.0/repositories/{w}/{s}/pullrequests/{id}` returns it — the read
+ * counterpart of {@link createMockBitbucketPullRequestPayload}'s webhook body.
+ * Unlike the webhook shape it carries `participants` (Bitbucket's stand-in for
+ * reviews) and no `actor`. Top-level overrides are shallow-merged, so passing
+ * `source` replaces the whole sub-object.
+ */
+export function createMockBitbucketPullRequestResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: 17,
+		title: 'Add a thing',
+		state: 'OPEN',
+		draft: false,
+		author: bitbucketAccount('human-dev'),
+		source: {
+			branch: { name: 'swarm/issue-17' },
+			commit: { hash: 'd3022fc0ca3d' },
+			repository: { full_name: 'jkwiecien/swarm' },
+		},
+		destination: {
+			branch: { name: 'main' },
+			commit: { hash: 'ce5965ddd289' },
+			repository: { full_name: 'jkwiecien/swarm' },
+		},
+		participants: [],
+		links: { html: { href: 'https://bitbucket.org/jkwiecien/swarm/pull-requests/17' } },
+		...overrides,
+	};
+}
+
+/**
+ * A Bitbucket Cloud **REST** commit build status, as
+ * `GET /2.0/repositories/{w}/{s}/commit/{sha}/statuses` returns each `values`
+ * entry. `key` is what identifies a build definition across re-runs, so it is what
+ * the aggregate read dedupes on.
+ */
+export function createMockBitbucketBuildStatusResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		type: 'build',
+		key: 'UNIT-TESTS',
+		name: 'Unit Tests',
+		state: 'SUCCESSFUL',
+		description: 'All tests passed',
+		url: 'https://my-build-tool.com/builds/MY-PROJECT/BUILD-792',
+		created_on: '2026-08-04T10:00:00.000000+00:00',
+		updated_on: '2026-08-04T10:05:00.000000+00:00',
+		...overrides,
+	};
+}
+
 export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent {
 	return ScmEventSchema.parse({
 		kind: 'pull-request',

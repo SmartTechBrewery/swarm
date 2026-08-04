@@ -18,17 +18,10 @@
  * Center is out of scope, as is every `issue:*` event — SWARM's work items live
  * on the PM board, not in Bitbucket Issues.
  *
- * ## The abbreviated-hash invariant
- *
- * Bitbucket abbreviates a pull request's `source.commit.hash` to **12
- * characters** (Atlassian's own event-payload reference shows
- * `"hash": "d3022fc0ca3d"`), while a build status identifies its commit through
- * `links.commit.href`, whose last path segment is the full SHA. The adapter
- * therefore emits Bitbucket's 12-character spelling for every `headSha`.
- * Shared consumers use this value as an exact database or deduplication key, so
- * they must never see two spellings for the same commit. A later API read that
- * returns a full SHA must likewise be abbreviated before comparison with an
- * event `headSha`.
+ * The commit vocabulary this shares with the REST reads — the abbreviated-hash
+ * invariant every `headSha` obeys and the build-status state table — lives in
+ * `./commits.ts`, since an event and an API read of the same commit must not
+ * produce two spellings.
  */
 
 import type { ProjectConfig } from '../../../config/schema.js';
@@ -41,6 +34,11 @@ import type {
 import { isSwarmGeneratedBody } from '../../../scm/swarm-origin.js';
 import type { ScmWebhookRequest, WebhookHeaderReader } from '../../../scm/types.js';
 import { verifyHmac } from '../../../webhook/signature-verification.js';
+import {
+	abbreviateBitbucketSha,
+	buildStatusConclusion,
+	isTerminalBuildStatusState,
+} from './commits.js';
 
 /** Header Bitbucket delivers the event key in (not carried in the body). */
 const EVENT_KEY_HEADER = 'x-event-key';
@@ -137,26 +135,6 @@ const REVIEW_STATES: Readonly<Record<string, ScmReviewState>> = {
 	'pullrequest:changes_request_removed': 'dismissed',
 };
 
-/**
- * Bitbucket build-status state → the neutral conclusion vocabulary the queue read
- * model reads (`src/queue/queued-runs.ts` keys on `failure`) and
- * `aggregate-check-decision.ts` classifies. An unrecognized state rides through
- * verbatim, same as an unmapped action.
- */
-const CHECK_CONCLUSIONS: Readonly<Record<string, string>> = {
-	SUCCESSFUL: 'success',
-	FAILED: 'failure',
-	INPROGRESS: 'pending',
-	STOPPED: 'cancelled',
-};
-
-/** Build-status states that mean CI is finished, not still progressing. */
-const TERMINAL_COMMIT_STATUS_STATES: ReadonlySet<string> = new Set([
-	'SUCCESSFUL',
-	'FAILED',
-	'STOPPED',
-]);
-
 /** Stand-in for a missing component of the synthetic review id (see {@link synthesizeReviewId}). */
 const UNKNOWN_ID_PART = 'unknown';
 
@@ -184,9 +162,10 @@ function isCommitStatusEvent(eventKey: ProcessableEventKey): boolean {
  *
  * `undefined` for a build status: a Bitbucket `commit_status` payload carries
  * **no pull-request association at all** (unlike GitHub's
- * `check_suite.pull_requests`), only the commit. Resolving the PR needs a REST
- * lookup — phase 3/4's `listBitbucketPullRequestsForCommit`, called by the
- * ingress layer — so this is a known gap of this phase, not an oversight.
+ * `check_suite.pull_requests`), only the commit. Resolving the PR takes a REST
+ * lookup — `listBitbucketPullRequestsForCommit` (`./pull-requests.ts`) — which is
+ * a credential-scoped call, so it belongs to whichever ingress layer serves this
+ * provider's route, not to this pure parse.
  */
 function extractWorkItemId(p: Record<string, unknown>): string | undefined {
 	const pr = asRecord(p.pullrequest);
@@ -220,7 +199,7 @@ function extractActorLogin(p: Record<string, unknown>): string | undefined {
 function extractAction(eventKey: ProcessableEventKey, p: Record<string, unknown>): ScmEventAction {
 	if (!isCommitStatusEvent(eventKey)) return EVENT_ACTIONS[eventKey];
 	const state = str(asRecord(p.commit_status)?.state);
-	return state !== undefined && TERMINAL_COMMIT_STATUS_STATES.has(state)
+	return state !== undefined && isTerminalBuildStatusState(state)
 		? 'completed'
 		: EVENT_ACTIONS[eventKey];
 }
@@ -239,14 +218,9 @@ interface LifecycleFields {
 	merged?: boolean;
 }
 
-/** Bitbucket's canonical 12-character commit spelling for normalized events. */
-function abbreviateSha(sha: string | undefined): string | undefined {
-	return sha?.slice(0, 12);
-}
-
 /** A PR's head commit hash, normalized to Bitbucket's canonical 12-character spelling. */
 function headShaOf(pr: Record<string, unknown> | undefined): string | undefined {
-	return abbreviateSha(str(asRecord(asRecord(pr?.source)?.commit)?.hash));
+	return abbreviateBitbucketSha(str(asRecord(asRecord(pr?.source)?.commit)?.hash));
 }
 
 function headBranchOf(pr: Record<string, unknown> | undefined): string | undefined {
@@ -337,24 +311,24 @@ function reviewFields(eventKey: ProcessableEventKey, p: Record<string, unknown>)
  */
 function commitStatusSha(status: Record<string, unknown> | undefined): string | undefined {
 	const hash = str(asRecord(status?.commit)?.hash);
-	if (hash !== undefined) return abbreviateSha(hash);
+	if (hash !== undefined) return abbreviateBitbucketSha(hash);
 	const href = str(asRecord(asRecord(status?.links)?.commit)?.href);
 	if (href === undefined) return undefined;
 	const path = href.split(/[?#]/)[0].replace(/\/+$/, '');
-	return abbreviateSha(str(path.slice(path.lastIndexOf('/') + 1)));
+	return abbreviateBitbucketSha(str(path.slice(path.lastIndexOf('/') + 1)));
 }
 
 /**
  * A build status carries the commit and its state — and no PR. `prBranch` and
- * `workItemId` therefore stay unset (see {@link extractWorkItemId}), which the
- * ingress layer resolves via phase 3/4's commit→PR lookup.
+ * `workItemId` therefore stay unset (see {@link extractWorkItemId}), for the
+ * ingress layer to resolve through the commit→PR lookup.
  */
 function commitStatusFields(p: Record<string, unknown>): LifecycleFields {
 	const status = asRecord(p.commit_status);
 	const state = str(status?.state);
 	return {
 		headSha: commitStatusSha(status),
-		checkConclusion: state === undefined ? undefined : (CHECK_CONCLUSIONS[state] ?? state),
+		checkConclusion: state === undefined ? undefined : buildStatusConclusion(state),
 	};
 }
 

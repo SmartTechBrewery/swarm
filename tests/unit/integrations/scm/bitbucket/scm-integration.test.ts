@@ -20,6 +20,12 @@ vi.mock('@/integrations/scm/bitbucket/personas.js', () => ({
 	isSwarmBitbucketActor: vi.fn(),
 	getBitbucketPersonaForLogin: vi.fn(),
 }));
+vi.mock('@/integrations/scm/bitbucket/pull-requests.js', () => ({
+	getBitbucketPullRequest: vi.fn(),
+	getBitbucketPullRequestTitle: vi.fn(),
+	getBitbucketCommitBuildStatus: vi.fn(),
+	listOpenBitbucketPullRequestsForBase: vi.fn(),
+}));
 
 import { withBitbucketCredential } from '@/integrations/scm/bitbucket/client.js';
 import {
@@ -31,9 +37,15 @@ import {
 	isSwarmBitbucketActor,
 	resolveBitbucketPersonaIdentities,
 } from '@/integrations/scm/bitbucket/personas.js';
+import {
+	getBitbucketCommitBuildStatus,
+	getBitbucketPullRequest,
+	getBitbucketPullRequestTitle,
+	listOpenBitbucketPullRequestsForBase,
+} from '@/integrations/scm/bitbucket/pull-requests.js';
 import { BitbucketSCMIntegration } from '@/integrations/scm/bitbucket/scm-integration.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
+import type { PullRequestDetails, ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
 const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
@@ -191,15 +203,90 @@ describe('BitbucketSCMIntegration', () => {
 		});
 	});
 
+	// The four read methods delegate to `./pull-requests.ts`, whose own suite covers
+	// every endpoint path and field mapping. These assert the two things only the
+	// class decides: that the repo coordinates come off `project.repo`, and that each
+	// read runs under the same persona GitHub's adapter uses for it.
+	describe('pull-request reads', () => {
+		const PR_DETAILS: PullRequestDetails = {
+			number: 17,
+			headBranch: 'swarm/issue-17',
+			headSha: 'd3022fc0ca3d',
+			baseBranch: 'main',
+			baseSha: 'ce5965ddd289',
+			mergeable: null,
+			authorLogin: 'human-dev',
+		};
+
+		beforeEach(() => {
+			vi.mocked(getBitbucketCredential).mockImplementation(
+				async (_p, persona) => `cred-${persona}`,
+			);
+		});
+
+		it('reads a pull request as the reviewer by default', async () => {
+			vi.mocked(getBitbucketPullRequest).mockResolvedValue(PR_DETAILS);
+
+			await expect(scm.getPullRequest(project, 17)).resolves.toEqual(PR_DETAILS);
+			expect(vi.mocked(getBitbucketPullRequest)).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				17,
+			);
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
+		});
+
+		it('honours an explicitly requested persona', async () => {
+			vi.mocked(getBitbucketPullRequest).mockResolvedValue(PR_DETAILS);
+
+			await scm.getPullRequest(project, 17, 'implementer');
+
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+		});
+
+		it('reads a title as the implementer — the PR’s own author', async () => {
+			vi.mocked(getBitbucketPullRequestTitle).mockResolvedValue('Add a thing');
+
+			await expect(scm.getPullRequestTitle(project, 17)).resolves.toBe('Add a thing');
+			expect(vi.mocked(getBitbucketPullRequestTitle)).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				17,
+			);
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+		});
+
+		it('aggregates build statuses as the reviewer', async () => {
+			const aggregate = { totalCount: 0, checkRuns: [] };
+			vi.mocked(getBitbucketCommitBuildStatus).mockResolvedValue(aggregate);
+
+			await expect(scm.getAggregateCheckStatus(project, 'd3022fc0ca3d')).resolves.toBe(aggregate);
+			expect(vi.mocked(getBitbucketCommitBuildStatus)).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				'd3022fc0ca3d',
+			);
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
+		});
+
+		it('lists conflict candidates as the implementer, the persona that pushes the fix', async () => {
+			vi.mocked(listOpenBitbucketPullRequestsForBase).mockResolvedValue([PR_DETAILS]);
+
+			await expect(scm.listConflictCandidates(project, 'main')).resolves.toEqual([PR_DETAILS]);
+			expect(vi.mocked(listOpenBitbucketPullRequestsForBase)).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				'main',
+			);
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+		});
+	});
+
 	// Every contract method a later phase owns must fail loudly and name that
 	// phase — never return a misleading `null`/`[]`/no-op that a caller
 	// would mistake for a real answer (issue #296).
 	describe('deferred contract methods', () => {
 		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['getPullRequest', 'phase 3/4', () => scm.getPullRequest()],
-			['getPullRequestTitle', 'phase 3/4', () => scm.getPullRequestTitle()],
-			['getAggregateCheckStatus', 'phase 3/4', () => scm.getAggregateCheckStatus()],
-			['listConflictCandidates', 'phase 3/4', () => scm.listConflictCandidates()],
 			['commentOnPullRequest', 'phase 4/4', () => scm.commentOnPullRequest()],
 			['deliveryProvider', 'phase 4/4', () => scm.deliveryProvider()],
 			['mergePullRequest', 'phase 4/4', () => scm.mergePullRequest()],
