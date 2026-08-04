@@ -12,7 +12,7 @@
  * PM one is: nothing needs to enumerate both categories together yet.
  *
  * Ingress and the SCM-driven triggers resolve their provider here as of issue
- * #385 (the receiver mounts every registered manifest's `webhookRoute`; the
+ * #385 (the receiver mounts every runtime-ready registered manifest's `webhookRoute`; the
  * worker resolves a dequeued job's `providerId` into the provider it injects
  * into the trigger context). The outbound, project-scoped mutations joined with
  * issue #386 via {@link requireProjectSCMProvider} — phase delivery, the

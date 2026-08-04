@@ -111,6 +111,17 @@ describe('bitbucket personas', () => {
 			await expect(resolveBitbucketPersonaIdentities(project)).rejects.toThrow(/reviewer/);
 		});
 
+		it('fails closed when an account exposes no nickname', async () => {
+			vi.mocked(getBitbucketCredentialOrNull).mockImplementation(async (_p, persona) =>
+				persona === 'implementer' ? 'cred-impl' : 'cred-rev',
+			);
+			vi.mocked(getBitbucketUserForCredential).mockImplementation(async (credential) =>
+				credential === 'cred-impl' ? 'swarm-impl' : null,
+			);
+
+			await expect(resolveBitbucketPersonaIdentities(project)).rejects.toThrow(/reviewer/);
+		});
+
 		it('does not cache a failure — the next call retries', async () => {
 			vi.mocked(getBitbucketCredentialOrNull).mockResolvedValue(null);
 			vi.mocked(getBitbucketUserForCredential).mockResolvedValue(null);

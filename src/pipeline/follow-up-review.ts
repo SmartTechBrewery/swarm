@@ -25,6 +25,7 @@
 
 import type { ProjectConfig } from '@/config/schema.js';
 import { createAndPublishDispatch, deliveryDedupKey } from '@/dispatch/dispatcher.js';
+import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { deliveryIdentity } from '@/scm/delivery.js';
 import type { ScmEvent } from '@/scm/events.js';
 
@@ -65,8 +66,8 @@ export function followUpReviewDeliveryId(
  * incomplete suite defers to the handler's own bounded recheck rather than
  * anything special-cased here.
  *
- * `providerId` is `github` because that is the only registered SCM provider; a
- * future multi-provider deployment resolves it from the run's project instead.
+ * `providerId` is resolved via {@link requireProjectSCMProvider} from the project's
+ * registered runtime-ready SCM provider.
  */
 export const scheduleFollowUpReviewDefault: ScheduleFollowUpReview = async ({
 	project,
@@ -74,6 +75,7 @@ export const scheduleFollowUpReviewDefault: ScheduleFollowUpReview = async ({
 	prBranch,
 	headSha,
 }) => {
+	const provider = requireProjectSCMProvider(project);
 	const event: ScmEvent = {
 		kind: 'checks',
 		action: 'completed',
@@ -88,7 +90,7 @@ export const scheduleFollowUpReviewDefault: ScheduleFollowUpReview = async ({
 		projectId: project.id,
 		jobPayload: {
 			type: 'scm',
-			providerId: 'github',
+			providerId: provider.type,
 			projectId: project.id,
 			deliveryId,
 			event,

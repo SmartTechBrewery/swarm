@@ -6,6 +6,7 @@ import {
 	bitbucketRequest,
 	getBitbucketUserForCredential,
 	getScopedCredential,
+	MAX_PAGES,
 	paginateBitbucket,
 	withBitbucketCredential,
 } from '@/integrations/scm/bitbucket/client.js';
@@ -171,6 +172,52 @@ describe('bitbucket client', () => {
 			expect(fetchMock.mock.calls[1]?.[0]).toBe(`${BITBUCKET_API_BASE}/things?page=2`);
 		});
 
+		it('rejects an off-origin next cursor, calls fetch once, and does not leak credentials in error', async () => {
+			fetchMock.mockResolvedValueOnce(
+				jsonResponse({ values: [{ id: 1 }], next: 'https://attacker.example.com/exfil' }),
+			);
+
+			const err = await withBitbucketCredential('super-secret-token', () =>
+				paginateBitbucket('/things').catch((e: unknown) => e),
+			);
+
+			expect(err).toBeInstanceOf(Error);
+			const message = (err as Error).message;
+			expect(message).toContain('attacker.example.com');
+			expect(message).not.toContain('super-secret-token');
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(headersOf(fetchMock).authorization).toBe('Bearer super-secret-token');
+		});
+
+		it('allows a same-origin next cursor with a different path', async () => {
+			fetchMock
+				.mockResolvedValueOnce(
+					jsonResponse({ values: [{ id: 1 }], next: `${BITBUCKET_API_BASE}/other-path?page=2` }),
+				)
+				.mockResolvedValueOnce(jsonResponse({ values: [{ id: 2 }] }));
+
+			const all = await withBitbucketCredential('token-abc', () =>
+				paginateBitbucket<{ id: number }>('/things'),
+			);
+
+			expect(all).toEqual([{ id: 1 }, { id: 2 }]);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		});
+
+		it('throws when MAX_PAGES pagination cap is exceeded', async () => {
+			for (let i = 0; i < MAX_PAGES + 1; i++) {
+				fetchMock.mockResolvedValueOnce(
+					jsonResponse({ values: [{ id: i }], next: `${BITBUCKET_API_BASE}/things?page=${i + 2}` }),
+				);
+			}
+
+			await expect(
+				withBitbucketCredential('token-abc', () => paginateBitbucket('/things')),
+			).rejects.toThrow(/exceeded maximum page count/);
+
+			expect(fetchMock).toHaveBeenCalledTimes(MAX_PAGES);
+		});
+
 		it('tolerates a page that carries no values array', async () => {
 			fetchMock.mockResolvedValue(jsonResponse({}));
 
@@ -198,10 +245,10 @@ describe('bitbucket client', () => {
 			expect(headersOf(fetchMock).authorization).toBe('Bearer token-abc');
 		});
 
-		it('falls back to the account id when no nickname is exposed', async () => {
+		it('returns null when no nickname is exposed so resolution fails closed', async () => {
 			fetchMock.mockResolvedValue(jsonResponse({ account_id: 'acc-1' }));
 
-			await expect(getBitbucketUserForCredential('token-abc')).resolves.toBe('acc-1');
+			await expect(getBitbucketUserForCredential('token-abc')).resolves.toBeNull();
 		});
 
 		it('returns null — never throws — when the lookup fails', async () => {

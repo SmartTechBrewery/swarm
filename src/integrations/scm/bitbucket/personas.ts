@@ -87,6 +87,11 @@ export function _resetBitbucketPersonaIdentityCache(): void {
  * `nickname` is a user-editable field with no canonical-case guarantee, and loop
  * prevention has to fail *closed* — treating a casing difference as "not SWARM"
  * is the dangerous direction.
+ *
+ * Both persona identities are stored strictly as `nickname` (resolved from
+ * `user.nickname` in `getBitbucketUserForCredential`); an account lacking a nickname
+ * fails closed at persona resolution rather than falling back to `account_id`, which
+ * lives in a different namespace and would never match an inbound actor's nickname.
  */
 function sameAccount(login: string, identity: string): boolean {
 	return login.toLowerCase() === identity.toLowerCase();

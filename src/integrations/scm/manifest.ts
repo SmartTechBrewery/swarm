@@ -57,6 +57,10 @@ export interface SCMProviderManifest {
 	 * assertion: the second provider to claim runtime readiness still makes the
 	 * project-scoped lookup throw, so project→provider selection gets designed
 	 * then rather than resolving to whichever manifest registered first.
+	 *
+	 * `requireSCMProvider(id)` deliberately does not consult `runtimeReady`: an
+	 * explicit ID lookup for an enqueued job identity is intentionally exempt since
+	 * the envelope provider ID is explicitly specified.
 	 */
 	readonly runtimeReady?: boolean;
 	/** The provider implementation — one shared, stateless instance (see above). */

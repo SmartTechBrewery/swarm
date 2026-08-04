@@ -66,7 +66,7 @@ const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
  * so production wiring is a bare `createWebhookApp()`; tests inject fakes.
  */
 export interface WebhookReceiverDeps {
-	/** Registered SCM providers whose `webhookRoute`s this app serves. */
+	/** Runtime-ready registered SCM providers whose `webhookRoute`s this app serves. */
 	scmProviders: readonly SCMProviderManifest[];
 	pmAdapter: GitHubProjectsRouterAdapter;
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;

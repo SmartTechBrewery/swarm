@@ -24,6 +24,12 @@ import { logger } from '../../../lib/logger.js';
 /** Bitbucket Cloud's REST base — every path below is relative to it. */
 export const BITBUCKET_API_BASE = 'https://api.bitbucket.org/2.0';
 
+/** Expected origin for Bitbucket API responses — used to reject off-origin pagination links. */
+export const BITBUCKET_API_ORIGIN = new URL(BITBUCKET_API_BASE).origin;
+
+/** Cap on the maximum number of pages `paginateBitbucket` will fetch. */
+export const MAX_PAGES = 100;
+
 /** Cap on how much of a non-JSON error body is echoed into a thrown message. */
 const MAX_ERROR_BODY_CHARS = 200;
 
@@ -107,6 +113,7 @@ async function bitbucketFetch<T>(method: string, url: string, body?: unknown): P
 			accept: 'application/json',
 			...(body === undefined ? {} : { 'content-type': 'application/json' }),
 		},
+		redirect: 'manual',
 		...(body === undefined ? {} : { body: JSON.stringify(body) }),
 	});
 
@@ -138,10 +145,10 @@ interface BitbucketPage<T> {
 }
 
 /**
- * Follow Bitbucket's `next` cursor and flatten every page's `values`. A
- * malformed response that points back at a page already fetched throws rather
- * than looping forever — pagination is driven by server-supplied URLs, so the
- * client cannot bound it any other way.
+ * Follow Bitbucket's `next` cursor and flatten every page's `values`. Page bounds
+ * are capped at {@link MAX_PAGES} to prevent infinite pagination loops, and any
+ * `next` cursor pointing to a different origin or non-HTTPS URL is rejected.
+ * Cyclic cursors are also detected and thrown.
  */
 export async function paginateBitbucket<T>(path: string): Promise<T[]> {
 	const collected: T[] = [];
@@ -153,9 +160,20 @@ export async function paginateBitbucket<T>(path: string): Promise<T[]> {
 		// into the loop variable would make its narrowed type depend on the response
 		// it is used to fetch (TS7022).
 		const url: string = nextUrl;
+		const parsedUrl = new URL(url, BITBUCKET_API_BASE);
+		if (parsedUrl.protocol !== 'https:' || parsedUrl.origin !== BITBUCKET_API_ORIGIN) {
+			throw new Error(
+				`Bitbucket pagination rejected cross-origin or non-HTTPS cursor ${parsedUrl.origin} — refusing to follow off-origin next link`,
+			);
+		}
+		if (fetched.size >= MAX_PAGES) {
+			throw new Error(
+				`Bitbucket pagination exceeded maximum page count of ${MAX_PAGES} — refusing to follow endless next cursor`,
+			);
+		}
 		if (fetched.has(url)) {
 			throw new Error(
-				`Bitbucket pagination revisited ${new URL(url).pathname} — refusing to follow a cyclic next cursor`,
+				`Bitbucket pagination revisited ${parsedUrl.pathname} — refusing to follow a cyclic next cursor`,
 			);
 		}
 		fetched.add(url);
@@ -175,9 +193,9 @@ export async function paginateBitbucket<T>(path: string): Promise<T[]> {
  * yes).
  *
  * Bitbucket removed `username` from its API, so `nickname` is the closest thing
- * to a login; `account_id` is the stable fallback for an account that exposes no
- * nickname. Either way this returns one opaque string, which is all loop
- * prevention compares.
+ * to a login. Returns `user.nickname ?? null` — an account without a nickname
+ * returns `null` so persona resolution fails closed rather than caching an
+ * `account_id` string that webhook actor nickname comparisons can never match.
  */
 export async function getBitbucketUserForCredential(
 	credential: string | null,
@@ -187,7 +205,7 @@ export async function getBitbucketUserForCredential(
 		const user = await withBitbucketCredential(credential, () =>
 			bitbucketRequest<{ nickname?: string; account_id?: string }>('GET', '/user'),
 		);
-		return user.nickname ?? user.account_id ?? null;
+		return user.nickname ?? null;
 	} catch (err) {
 		// `BitbucketApiError` is built from method/path/status/response body only, so
 		// this can't leak the credential.
