@@ -1,7 +1,12 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
+import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
+import {
+	_resetSCMProviderRegistryForTesting,
+	registerSCMProvider,
+} from '@/integrations/scm/registry.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
@@ -100,7 +105,25 @@ function jsonResponse(status: number, body: unknown): Awaited<ReturnType<FetchLi
 	return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
+/**
+ * Deps with no `buildDelivery` override, so the operator delivery resolves the way
+ * production does — through the SCM registry.
+ */
+function depsWithoutDeliveryOverride(
+	runPhase: (inputs: AssignedPhaseInputs) => Promise<PhaseRunResult>,
+) {
+	return {
+		runPhase,
+		baseRunAgent: vi.fn(async () => agentResult()) as never,
+		logger: silentLogger,
+	};
+}
+
 describe('runAssignmentDbFree', () => {
+	// This file never imports the integrations entrypoint, so the registry starts
+	// empty and only the tests below that register a manifest see one.
+	beforeEach(_resetSCMProviderRegistryForTesting);
+
 	it('acks, reports running, streams output, and settles succeeded for a source-only phase', async () => {
 		const sink = recordingSink();
 		const buildDelivery = vi.fn(async () => stubDelivery());
@@ -130,6 +153,50 @@ describe('runAssignmentDbFree', () => {
 		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
 		expect(inputs.delivery).toBeDefined();
 		expect(inputs.pm).toBeUndefined();
+	});
+
+	it('defaults its operator delivery to the registered SCM provider (issue #462)', async () => {
+		const operator = stubDelivery();
+		const operatorDeliveryProvider = vi.fn(async () => operator);
+		registerSCMProvider({
+			id: 'github',
+			label: 'GitHub',
+			category: 'scm',
+			webhookRoute: '/github/webhook',
+			provider: { type: 'github', category: 'scm', operatorDeliveryProvider },
+		} as unknown as SCMProviderManifest);
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWithoutDeliveryOverride(runPhase),
+		});
+
+		// Resolved through the registry rather than by importing the GitHub
+		// operator-delivery builder, and handed the neutral `owner/repo` plus the
+		// operator's own credential.
+		expect(operatorDeliveryProvider).toHaveBeenCalledWith('SmartTechBrewery/swarm', OPERATOR_TOKEN);
+		expect(runPhase.mock.calls[0][0].delivery).toBe(operator);
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'respond-to-ci' });
+	});
+
+	it('settles failed, not crashes, when no runtime-ready SCM provider is registered', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWithoutDeliveryOverride(runPhase),
+		});
+
+		// `runAssignmentDbFree` never throws — an unloaded entrypoint is reported as a
+		// terminal frame naming the wiring problem, and the phase never runs.
+		expect(runPhase).not.toHaveBeenCalled();
+		expect(sink.sent.at(-1)).toMatchObject({ type: 'task-execution-result', status: 'failed' });
+		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
+			/Cannot resolve the SCM provider for project/i,
+		);
 	});
 
 	it('injects the operator delivery into resolve-conflicts too', async () => {
