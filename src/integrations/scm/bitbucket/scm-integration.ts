@@ -1,8 +1,10 @@
 /**
  * BitbucketSCMIntegration — Bitbucket Cloud's implementation of the
  * provider-neutral {@link SCMProvider} contract (`src/scm/types.ts`), built out
- * over four phases (issue #296). This is phase 1/4: availability probing, persona
- * credential scoping, and persona identity / actor resolution.
+ * over four phases (issue #296). Landed so far: availability probing, persona
+ * credential scoping, and persona identity / actor resolution (phase 1/4), plus
+ * webhook signature verification, header reading, event normalization, and the
+ * comment loop-prevention gate (phase 2/4, delegated to `./webhook.ts`).
  *
  * Its core job is the same as the GitHub class's: run a block of Bitbucket
  * operations under the correct persona's credential. Callers hand it a project +
@@ -12,8 +14,8 @@
  * reviewer and push as the implementer without either credential appearing in a
  * signature (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Every method this phase does not implement throws** — loudly, naming the
- * method and the phase that fills it in — rather than returning `null`, `[]`, or
+ * **Every method a later phase owns throws** — loudly, naming the method and the
+ * phase that fills it in — rather than returning `null`, `[]`, or
  * a no-op that would read as a real answer. Nothing selects this provider at
  * runtime yet (its manifest registers with `runtimeReady: false`,
  * `./index.ts`), so a throw here means a premature call, which is a wiring bug
@@ -31,6 +33,7 @@ import type {
 	ScmPersona,
 	ScmPersonaIdentities,
 	ScmWebhookRequest,
+	WebhookHeaderReader,
 } from '../../../scm/types.js';
 import { withBitbucketCredential } from './client.js';
 import { getBitbucketCredential, getBitbucketCredentialOrNull } from './credentials.js';
@@ -39,9 +42,15 @@ import {
 	isSwarmBitbucketActor,
 	resolveBitbucketPersonaIdentities,
 } from './personas.js';
+import {
+	isSwarmGeneratedBitbucketEvent,
+	parseBitbucketWebhook,
+	readBitbucketWebhookRequest,
+	verifyBitbucketSignature,
+} from './webhook.js';
 
 /**
- * The single exit for every contract method this phase leaves unbuilt. `phase`
+ * The single exit for every contract method a later phase owns. `phase`
  * names the follow-up that implements it, so the error tells a caller what to
  * wait for rather than just that something is missing.
  */
@@ -51,7 +60,6 @@ function notImplementedYet(method: string, phase: string): never {
 	);
 }
 
-const WEBHOOK_PHASE = 'phase 2/4 (webhook ingress)';
 const READ_PHASE = 'phase 3/4 (pull-request reads)';
 const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
 
@@ -108,23 +116,27 @@ export class BitbucketSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: webhook ingress — phase 2/4
+	// Webhook ingress — phase 2/4, in `./webhook.ts`
 	// ==========================================================================
 
-	verifyWebhookSignature(): boolean {
-		notImplementedYet('verifyWebhookSignature', WEBHOOK_PHASE);
+	/** {@link SCMProvider.verifyWebhookSignature} — `X-Hub-Signature`'s `sha256=<hex>` framing. */
+	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean {
+		return verifyBitbucketSignature(rawBody, signature, secret);
 	}
 
-	readWebhookRequest(): ScmWebhookRequest {
-		notImplementedYet('readWebhookRequest', WEBHOOK_PHASE);
+	/** {@link SCMProvider.readWebhookRequest} — Bitbucket's event-key/request-uuid/signature headers. */
+	readWebhookRequest(header: WebhookHeaderReader): ScmWebhookRequest {
+		return readBitbucketWebhookRequest(header);
 	}
 
-	parseWebhookEvent(): ScmEvent | null {
-		notImplementedYet('parseWebhookEvent', WEBHOOK_PHASE);
+	/** {@link SCMProvider.parseWebhookEvent} — `X-Event-Key` → the neutral {@link ScmEvent}. */
+	parseWebhookEvent(eventName: string, payload: unknown): ScmEvent | null {
+		return parseBitbucketWebhook(eventName, payload);
 	}
 
-	async isSwarmGeneratedEvent(): Promise<boolean> {
-		notImplementedYet('isSwarmGeneratedEvent', WEBHOOK_PHASE);
+	/** {@link SCMProvider.isSwarmGeneratedEvent} — comment-scoped SWARM-origin gate. */
+	async isSwarmGeneratedEvent(event: ScmEvent, project: ProjectConfig): Promise<boolean> {
+		return isSwarmGeneratedBitbucketEvent(event, project);
 	}
 
 	// ==========================================================================

@@ -1,6 +1,7 @@
+import { createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig } from '../../../../helpers/factories.js';
+import { createMockProjectConfig, createMockScmEvent } from '../../../../helpers/factories.js';
 
 vi.mock('@/integrations/scm/bitbucket/client.js', () => ({
 	// Pass-through so a probe inside the scope can observe the credential that
@@ -31,6 +32,7 @@ import {
 	resolveBitbucketPersonaIdentities,
 } from '@/integrations/scm/bitbucket/personas.js';
 import { BitbucketSCMIntegration } from '@/integrations/scm/bitbucket/scm-integration.js';
+import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
@@ -131,15 +133,69 @@ describe('BitbucketSCMIntegration', () => {
 		});
 	});
 
-	// Every contract method this phase leaves unbuilt must fail loudly and name its
-	// follow-up phase — never return a misleading `null`/`[]`/no-op that a caller
+	// The four webhook-ingress methods delegate to `./webhook.ts`, whose own suite
+	// covers the header names, every event-key mapping, and the signature framing.
+	// These assert only that the contract methods are wired to it rather than still
+	// throwing their phase-1 stub.
+	describe('webhook ingress', () => {
+		it('reads Bitbucket headers through the provider', () => {
+			const headers: Record<string, string> = {
+				'x-event-key': 'pullrequest:created',
+				'x-request-uuid': 'req-1',
+				'x-hub-signature': 'sha256=deadbeef',
+			};
+			expect(scm.readWebhookRequest((name) => headers[name.toLowerCase()])).toEqual({
+				eventName: 'pullrequest:created',
+				deliveryId: 'req-1',
+				signature: 'sha256=deadbeef',
+			});
+		});
+
+		it('verifies a correctly signed body and rejects a forged one', () => {
+			const rawBody = '{"pullrequest":{"id":17}}';
+			const secret = 'sh4red-s3cret';
+			const valid = `sha256=${createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')}`;
+
+			expect(scm.verifyWebhookSignature(rawBody, valid, secret)).toBe(true);
+			expect(scm.verifyWebhookSignature(rawBody, valid, 'other-secret')).toBe(false);
+			expect(scm.verifyWebhookSignature(rawBody, '', secret)).toBe(false);
+		});
+
+		it('normalizes a supported event key and drops an unsupported one', () => {
+			const payload = {
+				repository: { full_name: 'jkwiecien/swarm' },
+				pullrequest: { id: 17 },
+			};
+			expect(scm.parseWebhookEvent('pullrequest:created', payload)).toMatchObject({
+				kind: 'pull-request',
+				action: 'opened',
+				workItemId: '17',
+			});
+			expect(scm.parseWebhookEvent('repo:push', payload)).toBeNull();
+		});
+
+		it('applies the comment-scoped SWARM-origin gate', async () => {
+			const marked = createMockScmEvent({
+				kind: 'work-item-comment',
+				isCommentEvent: true,
+				commentBody: `Done.\n\n${SWARM_GENERATED_FOOTER}`,
+			});
+			await expect(scm.isSwarmGeneratedEvent(marked, project)).resolves.toBe(true);
+
+			const human = createMockScmEvent({
+				kind: 'work-item-comment',
+				isCommentEvent: true,
+				commentBody: 'please rebase',
+			});
+			await expect(scm.isSwarmGeneratedEvent(human, project)).resolves.toBe(false);
+		});
+	});
+
+	// Every contract method a later phase owns must fail loudly and name that
+	// phase — never return a misleading `null`/`[]`/no-op that a caller
 	// would mistake for a real answer (issue #296).
 	describe('deferred contract methods', () => {
 		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['verifyWebhookSignature', 'phase 2/4', () => scm.verifyWebhookSignature()],
-			['readWebhookRequest', 'phase 2/4', () => scm.readWebhookRequest()],
-			['parseWebhookEvent', 'phase 2/4', () => scm.parseWebhookEvent()],
-			['isSwarmGeneratedEvent', 'phase 2/4', () => scm.isSwarmGeneratedEvent()],
 			['getPullRequest', 'phase 3/4', () => scm.getPullRequest()],
 			['getPullRequestTitle', 'phase 3/4', () => scm.getPullRequestTitle()],
 			['getAggregateCheckStatus', 'phase 3/4', () => scm.getAggregateCheckStatus()],
