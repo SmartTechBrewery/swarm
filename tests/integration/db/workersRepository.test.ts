@@ -11,12 +11,14 @@ import {
 	listWorkersForOwner,
 	removeWorker,
 	updateWorkerCapabilities,
+	updateWorkerSupportedPhases,
 } from '../../../src/db/repositories/workersRepository.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import { WorkerCapabilityReductionError } from '../../../src/identity/worker.js';
 import { AllowedClisNotCapableError } from '../../../src/identity/worker-enrollment.js';
+import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../../src/triggers/types.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -118,6 +120,96 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			});
 			expect(await findWorkerByCredentialHash('hash-a')).toEqual(created);
 			expect(await findWorkerByCredentialHash('unknown-hash')).toBeUndefined();
+		});
+	});
+
+	// Issue #467 — the phase axis, against real Postgres. The unit tests mock the
+	// repository, so only these can catch a wrong `.set()` payload, a missing column
+	// default, or a jsonb round-trip problem.
+	describe('supportedPhases', () => {
+		it('gives a newly created worker every phase', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-fresh',
+				capabilities: ['claude'],
+				credentialHash: 'hash-fresh',
+			});
+
+			// Asserted against the runtime constant, not a literal: this fails the moment
+			// `TriggerPhase` grows without `createWorker` following, which is exactly the
+			// drift that would otherwise refuse the new phase on capable workers.
+			expect(created.supportedPhases).toEqual([...ALL_TRIGGER_PHASES]);
+			expect((await getWorkerById(created.id))?.supportedPhases).toEqual([...ALL_TRIGGER_PHASES]);
+		});
+
+		it('writes a narrowed set, and leaves it untouched when capabilities change alone', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-dbfree',
+				capabilities: ['claude'],
+				credentialHash: 'hash-dbfree',
+			});
+			const narrowed: TriggerPhase[] = ['implementation', 'review'];
+
+			await updateWorkerCapabilities(created.id, ['claude'], narrowed);
+			expect((await getWorkerById(created.id))?.supportedPhases).toEqual(narrowed);
+
+			// The `swarm workers set-cli` shape: no phases passed, so the narrowed set must
+			// survive rather than being reset to the every-phase default.
+			await updateWorkerCapabilities(created.id, ['claude', 'codex']);
+			const after = await getWorkerById(created.id);
+			expect(after?.capabilities).toEqual(['claude', 'codex']);
+			expect(after?.supportedPhases).toEqual(narrowed);
+		});
+
+		it('rolls the phase write back with the capability write when a reduction is refused', async () => {
+			await seedProject({ id: 'proj-phase-tx', repo: 'SmartTechBrewery/repo-phase-tx' });
+			const worker = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-tx',
+				capabilities: ['claude', 'codex'],
+				credentialHash: 'hash-tx',
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: 'proj-phase-tx',
+				status: 'active',
+				allowedClis: ['codex'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+
+			// The enrollment still requires codex, so this whole call must fail — and the
+			// phase set it also carried must not have landed (the same-transaction claim).
+			await expect(
+				updateWorkerCapabilities(worker.id, ['claude'], ['implementation']),
+			).rejects.toThrow(WorkerCapabilityReductionError);
+
+			expect((await getWorkerById(worker.id))?.supportedPhases).toEqual([...ALL_TRIGGER_PHASES]);
+		});
+
+		it('replaces the phase set alone, without touching capabilities', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-phases-only',
+				capabilities: ['claude', 'codex'],
+				credentialHash: 'hash-phases-only',
+			});
+			await updateWorkerCapabilities(created.id, ['claude', 'codex'], ['implementation']);
+
+			// The in-process host worker's declaration path: it must be able to widen a row
+			// a previous DB-free run narrowed, or `planning` would be refused there forever.
+			const widened = await updateWorkerSupportedPhases(created.id, [...ALL_TRIGGER_PHASES]);
+			expect(widened?.supportedPhases).toEqual([...ALL_TRIGGER_PHASES]);
+			expect(widened?.capabilities).toEqual(['claude', 'codex']);
+		});
+
+		it('returns undefined when replacing the phase set of a missing id', async () => {
+			expect(
+				await updateWorkerSupportedPhases('00000000-0000-4000-8000-000000000000', [
+					'implementation',
+				]),
+			).toBeUndefined();
 		});
 	});
 

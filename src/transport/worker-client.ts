@@ -40,6 +40,7 @@ import {
 	HandshakeResponseSchema,
 	type Heartbeat,
 	type TaskAssignment,
+	type TaskPhase,
 	TRANSPORT_PROTOCOL_VERSION,
 	type WorkerHealth,
 	type WorkerStreamMessage,
@@ -114,18 +115,27 @@ export class WorkerTransportTransientError extends Error {
 
 // --- Wire helpers (pure) ----------------------------------------------------
 
-/** Build the handshake request body, stamping the current protocol version. */
+/**
+ * Build the handshake request body, stamping the current protocol version.
+ *
+ * `supportedPhases` is the caller's phase repertoire (issue #467): the DB-free
+ * daemon passes `SUPPORTED_DB_FREE_PHASES`, the same-host client passes every
+ * phase. It is required here — the two callers genuinely differ, so defaulting it
+ * would let the DB-free daemon silently claim phases it refuses.
+ */
 export function buildHandshakeRequest(input: {
 	credential: string;
 	daemonVersion: string;
 	hostname: string;
 	capabilities: AgentCli[];
+	supportedPhases: readonly TaskPhase[];
 }): HandshakeRequest {
 	return HandshakeRequestSchema.parse({
 		credential: input.credential,
 		daemonVersion: input.daemonVersion,
 		hostname: input.hostname,
 		capabilities: input.capabilities,
+		supportedPhases: [...input.supportedPhases],
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
 }
@@ -337,6 +347,13 @@ export interface WorkerTransportOptions {
 	controlPlaneUrl: string;
 	credential: string;
 	capabilities: AgentCli[];
+	/**
+	 * The pipeline phases this daemon can execute (issue #467), declared at
+	 * handshake so the control plane never selects it for a phase it would refuse.
+	 * The DB-free remote daemon passes `SUPPORTED_DB_FREE_PHASES`; the same-host
+	 * dispatch client passes every phase.
+	 */
+	supportedPhases: readonly TaskPhase[];
 	hostname: string;
 	daemonVersion: string;
 	/** Optional advisory host-health provider, attached to each heartbeat. */

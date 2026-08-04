@@ -46,6 +46,7 @@ import {
 	type TransportLogger,
 	type WorkerTransportClient,
 } from '../transport/worker-client.js';
+import { ALL_TRIGGER_PHASES } from '../triggers/types.js';
 import { type AssignedPhaseInputs, type PhaseRunResult, runAssignedPhase } from './consumer.js';
 import { createLiveOutputRunner } from './live-output.js';
 import {
@@ -275,6 +276,10 @@ export function startWorkerTransportDispatch(
 		controlPlaneUrl: options.controlPlaneUrl,
 		credential: options.credential,
 		capabilities: options.capabilities,
+		// This client holds `DATABASE_URL` and runs phases through the full
+		// `runAssignedPhase` switch, so it declares every phase — including
+		// `planning`, the one the DB-free daemon must refuse (issue #467).
+		supportedPhases: ALL_TRIGGER_PHASES,
 		hostname: options.hostname,
 		daemonVersion: options.daemonVersion,
 		backoff: options.backoff,

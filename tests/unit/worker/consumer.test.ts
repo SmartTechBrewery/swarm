@@ -5,6 +5,7 @@ import { AgentRunError, agentRunError } from '@/harness/agent-failure.js';
 import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import type { ResolvedAssignee } from '@/identity/assignee-resolver.js';
 import type { SwarmUser } from '@/identity/schema.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-service.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
@@ -1920,6 +1921,7 @@ describe('processJob', () => {
 					ownerUserId: overrides.ownerUserId ?? ALICE,
 					displayName: `worker-${id}`,
 					capabilities,
+					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 					createdAt: new Date('2026-01-01T00:00:00Z'),
 					updatedAt: new Date('2026-01-01T00:00:00Z'),
 				},

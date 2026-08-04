@@ -21,7 +21,12 @@
 import { asc, eq } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
-import { type Worker, WorkerCapabilityReductionError } from '../../identity/worker.js';
+import {
+	DEFAULT_WORKER_SUPPORTED_PHASES,
+	type Worker,
+	WorkerCapabilityReductionError,
+} from '../../identity/worker.js';
+import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workers } from '../schema/workers.js';
@@ -44,6 +49,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		ownerUserId: row.ownerUserId,
 		displayName: row.displayName,
 		capabilities: row.capabilities as AgentCli[],
+		supportedPhases: row.supportedPhases as TriggerPhase[],
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -61,6 +67,13 @@ export async function createWorker(input: CreateWorkerInput): Promise<Worker> {
 			ownerUserId: input.ownerUserId,
 			displayName: input.displayName,
 			capabilities: input.capabilities,
+			// Stated explicitly rather than left to the column's SQL default: that
+			// default is frozen at migration time, so a phase added to `TriggerPhase`
+			// later would silently be missing from every newly registered worker and —
+			// since only the operating program rewrites the set — refuse that phase on
+			// machines that can run it. The runtime constant is the authority for new
+			// rows; the SQL default remains only as the backfill for rows predating it.
+			supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 			credentialHash: input.credentialHash,
 		})
 		.returning();
@@ -119,10 +132,42 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * `undefined` if no worker has that id (nothing to update). Rejects with
  * {@link WorkerCapabilityReductionError} if any existing enrollment for the worker
  * requires a CLI not present in the updated capabilities.
+ *
+ * `supportedPhases` (issue #467) is written in the **same transaction** when
+ * given, because a handshake declares both axes at once and a partial write would
+ * leave the roster describing a machine that never existed. Omit it to leave the
+ * stored phases untouched — the CLI-only path (`swarm workers set-cli`) knows
+ * nothing about phases and must not silently reset them.
+ *
+ * Note the asymmetry with the CLI check above: phases are deliberately *not*
+ * validated against enrollments, because an enrollment constrains CLIs
+ * (`allowedClis`) and has no phase dimension. A daemon that stops supporting a
+ * phase narrows its own eligibility rather than invalidating an enrollment.
  */
+/**
+ * The CLIs some enrollment still requires that `capabilities` would no longer
+ * provide — the reduction {@link updateWorkerCapabilities} refuses. Pure and
+ * extracted so that transaction reads as its three steps (lock → validate →
+ * write) rather than carrying the set arithmetic inline.
+ */
+function clisRequiredByEnrollments(
+	enrollments: { allowedClis: unknown }[],
+	capabilities: AgentCli[],
+): AgentCli[] {
+	const declared = new Set(capabilities);
+	const offending = new Set<AgentCli>();
+	for (const enrollment of enrollments) {
+		for (const cli of enrollment.allowedClis as AgentCli[]) {
+			if (!declared.has(cli)) offending.add(cli);
+		}
+	}
+	return [...offending];
+}
+
 export async function updateWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
+	supportedPhases?: TriggerPhase[],
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -139,30 +184,48 @@ export async function updateWorkerCapabilities(
 			.from(workerProjectEnrollments)
 			.where(eq(workerProjectEnrollments.workerId, id));
 
-		const newCapSet = new Set(capabilities);
-		const offendingSet = new Set<AgentCli>();
-
-		for (const enrollment of enrollments) {
-			const allowedClis = enrollment.allowedClis as AgentCli[];
-			for (const cli of allowedClis) {
-				if (!newCapSet.has(cli)) {
-					offendingSet.add(cli);
-				}
-			}
-		}
-
-		if (offendingSet.size > 0) {
-			throw new WorkerCapabilityReductionError(id, Array.from(offendingSet));
+		const offending = clisRequiredByEnrollments(enrollments, capabilities);
+		if (offending.length > 0) {
+			throw new WorkerCapabilityReductionError(id, offending);
 		}
 
 		const [updatedRow] = await tx
 			.update(workers)
-			.set({ capabilities })
+			.set(supportedPhases ? { capabilities, supportedPhases } : { capabilities })
 			.where(eq(workers.id, id))
 			.returning();
 
 		return updatedRow ? rowToWorker(updatedRow) : undefined;
 	});
+}
+
+/**
+ * Replace a worker's declared **phase** repertoire alone, leaving `capabilities`
+ * untouched. Returns the updated worker, or `undefined` if no worker has that id.
+ *
+ * Separate from {@link updateWorkerCapabilities} because the two declarations have
+ * different owners: the CLI set is registered by an operator and re-declared by a
+ * *transport* handshake, while the phase set is a property of whichever **program**
+ * currently operates the row — and the in-process host worker
+ * (`src/worker/index.ts`) authenticates by acquiring an execution session rather
+ * than by handshaking, so it has a CLI set it must not overwrite and a phase
+ * repertoire it must state. Without this, a row narrowed by one `connect` run
+ * would stay narrowed for every later in-process run, permanently refusing
+ * `planning` on a host that can in fact run it (issue #467).
+ *
+ * No enrollment validation, for the reason given on {@link updateWorkerCapabilities}:
+ * an enrollment constrains CLIs, not phases.
+ */
+export async function updateWorkerSupportedPhases(
+	id: string,
+	supportedPhases: TriggerPhase[],
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({ supportedPhases })
+		.where(eq(workers.id, id))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
 }
 
 /**

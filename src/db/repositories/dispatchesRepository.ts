@@ -314,6 +314,20 @@ function sessionClaimRefusal(
 	return undefined;
 }
 
+/**
+ * Re-checks, under the session-row lock, the structural signals the gate observed
+ * a moment earlier — closing the observe-then-execute race.
+ *
+ * Deliberately **not** re-checking the worker's declared `supportedPhases` (issue
+ * #467), even though the gate does: the claim input carries a `cli`, not a phase,
+ * and the only way the phase set changes mid-flight is a daemon re-handshaking as
+ * the *other* worker program (in-process ↔ DB-free) inside that window. If that
+ * ever happens the DB-free worker's own unsupported-phase gate
+ * (`SUPPORTED_DB_FREE_PHASES`, `src/transport/assignment-execution.ts`) refuses the
+ * assignment — the pre-#467 symptom, not a worse one. Widening the claim to carry
+ * a phase is the fix if that race is ever observed; it is not worth the surface
+ * today.
+ */
 function eligibilityClaimRefusal(
 	worker: typeof workers.$inferSelect | undefined,
 	enrollment: typeof workerProjectEnrollments.$inferSelect | undefined,

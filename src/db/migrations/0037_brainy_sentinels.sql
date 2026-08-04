@@ -1,0 +1,1 @@
+ALTER TABLE "workers" ADD COLUMN "supported_phases" jsonb DEFAULT '["planning","implementation","review","respond-to-review","respond-to-ci","resolve-conflicts"]'::jsonb NOT NULL;

@@ -21,7 +21,8 @@
  *    handle never wedges a project.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
- *    connection/health → free capacity → declared/allowed CLI.
+ *    connection/health → free capacity → declared phase support (issue #467) →
+ *    declared/allowed CLI.
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes the first
@@ -65,6 +66,7 @@ import {
 	type WorkerDispatchCandidate,
 } from '../identity/worker-enrollment-service.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
+import type { TriggerPhase } from '../triggers/types.js';
 
 /**
  * Why a *dispatch* was refused — Phase 2's per-worker vocabulary plus the one
@@ -129,6 +131,12 @@ export interface DispatchGateInput {
 	/** The phase's coded default CLI, for a target that names none. */
 	phaseDefaultCli: AgentCli;
 	/**
+	 * The phase being dispatched, matched against each candidate's declared
+	 * `supportedPhases` (issue #467) so a worker whose daemon cannot run this phase
+	 * is never selected for it.
+	 */
+	phase: TriggerPhase;
+	/**
 	 * The work item being dispatched, when the phase has one. PR-driven phases
 	 * (review / respond-*) carry no item, so they take the unassigned path.
 	 */
@@ -165,6 +173,10 @@ export interface DispatchGateOptions {
 const REASON_PRIORITY: readonly IneligibilityReason[] = [
 	'worker-unavailable',
 	'missing-cli-capability',
+	// Below `missing-cli-capability` by the same "closer to eligible wins" rule: the
+	// predicate checks phase support *before* the CLI, so a candidate that reported a
+	// missing CLI cleared the phase check and came nearer to eligible (issue #467).
+	'missing-phase-capability',
 	'missing-consent',
 	'missing-enrollment',
 ];
@@ -181,7 +193,7 @@ function aggregateReason(reported: Set<IneligibilityReason>): IneligibilityReaso
 /** Where the refusal message should point a human, per reason. */
 function ineligibilityMessage(
 	reason: DispatchIneligibilityReason,
-	context: { projectId: string; assignee?: string; clis: AgentCli[] },
+	context: { projectId: string; assignee?: string; clis: AgentCli[]; phase: TriggerPhase },
 ): string {
 	const owner = context.assignee
 		? `assignee '${context.assignee}'`
@@ -197,6 +209,12 @@ function ineligibilityMessage(
 			return `No worker for ${owner} has an active enrollment in this project. A project admin must approve the worker's enrollment before it can take work.`;
 		case 'missing-cli-capability':
 			return `No enrolled worker for ${owner} can run any configured model target for this phase (${context.clis.join(', ')}). Enroll a worker that declares and is allowed one of those CLIs, or configure a target this project's workers can run.`;
+		// Phase-generic on purpose: this text is posted on the board item once the
+		// recheck budget is spent, and a daemon may declare any subset — naming
+		// `planning`/DB-free specifically would hand the operator a wrong diagnosis for
+		// every other narrowed phase.
+		case 'missing-phase-capability':
+			return `No enrolled worker for ${owner} declared that it can run the '${context.phase}' phase. A worker declares which phases it can execute when it connects, and a remote worker running without a database declares a smaller set than a host worker does. Connect a worker that can run this phase — this work waits until one is available.`;
 	}
 }
 
@@ -247,6 +265,7 @@ export async function evaluateDispatchEligibility(
 		projectId: input.projectId,
 		assignee: assigned?.assignee.handle,
 		clis,
+		phase: input.phase,
 	};
 	if (permitted.length === 0) {
 		return {
@@ -268,6 +287,7 @@ export async function evaluateDispatchEligibility(
 				availability: resolveAvailability(candidate, options.isWorkerConnected),
 				target,
 				phaseDefaultCli: input.phaseDefaultCli,
+				phase: input.phase,
 			});
 			if (verdict.eligible) {
 				return {

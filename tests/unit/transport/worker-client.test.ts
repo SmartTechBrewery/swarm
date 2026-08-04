@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SUPPORTED_DB_FREE_PHASES } from '@/transport/assignment-execution.js';
 import { TRANSPORT_PROTOCOL_VERSION, WS_CLOSE } from '@/transport/protocol.js';
 import {
 	buildHandshakeRequest,
@@ -19,6 +20,7 @@ import {
 	type WorkerTransportOverrides,
 	WorkerTransportProtocolError,
 } from '@/transport/worker-client.js';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const SESSION_ID = '33333333-3333-4333-8333-333333333333';
@@ -53,14 +55,42 @@ describe('buildHandshakeRequest', () => {
 			daemonVersion: '0.1.0',
 			hostname: 'ada-laptop',
 			capabilities: ['claude', 'codex'],
+			supportedPhases: ALL_TRIGGER_PHASES,
 		});
 		expect(request).toEqual({
 			credential: CREDENTIAL,
 			daemonVersion: '0.1.0',
 			hostname: 'ada-laptop',
 			capabilities: ['claude', 'codex'],
+			supportedPhases: [...ALL_TRIGGER_PHASES],
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
+	});
+
+	// A DB-free daemon declares a strict subset (issue #467): the handshake must carry
+	// exactly what it can run, so the control plane never selects it for `planning`.
+	it('carries a narrowed phase set verbatim without widening it', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: [...SUPPORTED_DB_FREE_PHASES],
+		});
+		expect(request.supportedPhases).toEqual([...SUPPORTED_DB_FREE_PHASES]);
+		expect(request.supportedPhases).not.toContain('planning');
+	});
+
+	it('rejects an empty phase set (a daemon that can run nothing is a bug)', () => {
+		expect(() =>
+			buildHandshakeRequest({
+				credential: CREDENTIAL,
+				daemonVersion: '0.1.0',
+				hostname: 'ada-laptop',
+				capabilities: ['claude'],
+				supportedPhases: [],
+			}),
+		).toThrow();
 	});
 
 	it('rejects an empty capability set (the protocol requires at least one CLI)', () => {
@@ -70,6 +100,7 @@ describe('buildHandshakeRequest', () => {
 				daemonVersion: '0.1.0',
 				hostname: 'ada-laptop',
 				capabilities: [],
+				supportedPhases: ALL_TRIGGER_PHASES,
 			}),
 		).toThrow();
 	});
@@ -162,6 +193,7 @@ describe('performHandshake', () => {
 		daemonVersion: '0.1.0',
 		hostname: 'ada-laptop',
 		capabilities: ['claude'],
+		supportedPhases: ALL_TRIGGER_PHASES,
 	});
 
 	it('returns the parsed session on 200 and sends the credential only in the body', async () => {
@@ -275,6 +307,7 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		controlPlaneUrl: 'http://localhost:3100',
 		credential: CREDENTIAL,
 		capabilities: ['claude'] as const,
+		supportedPhases: ALL_TRIGGER_PHASES,
 		hostname: 'ada-laptop',
 		daemonVersion: '0.1.0',
 	};

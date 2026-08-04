@@ -29,10 +29,16 @@ import {
 	getWorkerById,
 	listWorkersForOwner as listWorkersForOwnerRows,
 	updateWorkerCapabilities,
+	updateWorkerSupportedPhases,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
-import { WorkerCapabilitiesSchema, WorkerDisplayNameSchema } from './worker.js';
+import {
+	WorkerCapabilitiesSchema,
+	WorkerDisplayNameSchema,
+	WorkerSupportedPhasesSchema,
+} from './worker.js';
 
 export type { Worker } from './worker.js';
 export { WorkerCapabilityReductionError } from './worker.js';
@@ -105,13 +111,42 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * Refresh a worker's declared capabilities. Validates the set (non-empty,
  * de-duplicated `AgentCli` values) and updates it. Returns the updated worker, or
  * `undefined` if no worker has that id.
+ *
+ * `supportedPhases` (issue #467) is the daemon's declared phase repertoire, written
+ * in the same transaction when supplied. Omit it — as `swarm workers set-cli` does —
+ * to leave the stored phases as they are; a caller that knows nothing about phases
+ * must not reset them to the every-phase default.
  */
 export async function refreshWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
+	supportedPhases?: TriggerPhase[],
 ): Promise<Worker | undefined> {
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
-	return updateWorkerCapabilities(id, validated);
+	const validatedPhases =
+		supportedPhases === undefined ? undefined : WorkerSupportedPhasesSchema.parse(supportedPhases);
+	return updateWorkerCapabilities(id, validated, validatedPhases);
+}
+
+/**
+ * Declare the phase repertoire of the program currently operating a worker row,
+ * without touching its CLI set (issue #467). Validates the set
+ * ({@link WorkerSupportedPhasesSchema}: non-empty, de-duplicated) and returns the
+ * updated worker, or `undefined` if no worker has that id.
+ *
+ * The transport handshake declares both axes at once
+ * (`refreshWorkerCapabilities`); this is the seam for the **in-process** host
+ * worker, which authenticates by acquiring an execution session instead of
+ * handshaking and must not overwrite the operator-registered CLI set. Keeping both
+ * programs declarative is what stops a stored set from outliving the program that
+ * wrote it.
+ */
+export async function declareWorkerSupportedPhases(
+	id: string,
+	supportedPhases: TriggerPhase[],
+): Promise<Worker | undefined> {
+	const validated = WorkerSupportedPhasesSchema.parse(supportedPhases);
+	return updateWorkerSupportedPhases(id, validated);
 }
 
 /** Resolve a worker by id. Returns `undefined` if unknown. */

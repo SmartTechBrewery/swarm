@@ -2680,6 +2680,9 @@ async function gateDispatch(
 				projectId: project.id,
 				targets: resolveTargetPolicy(phaseConfig, job).targets,
 				phaseDefaultCli: PHASE_DEFAULT_CLI[trigger.phase],
+				// Gates on the worker's declared phase repertoire too, so a phase a
+				// candidate's daemon cannot run never selects it (issue #467).
+				phase: trigger.phase,
 				workItem,
 				// Only an item that actually names an assignee needs the provider (for
 				// its `type`, to resolve the identity link) — an unassigned item takes

@@ -4,6 +4,7 @@ import { createNodeWebSocket } from '@hono/node-ws';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { registerWorker } from '../../../src/identity/worker-service.js';
@@ -81,6 +82,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('worker transport client (
 			controlPlaneUrl: transport.httpBase,
 			credential,
 			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
 			hostname: 'ada-laptop',
 			daemonVersion: 'test',
 		});
@@ -108,6 +110,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('worker transport client (
 				controlPlaneUrl: transport.httpBase,
 				credential,
 				capabilities: ['claude'],
+				supportedPhases: ALL_TRIGGER_PHASES,
 				hostname: 'ada-laptop',
 				daemonVersion: 'test',
 				backoff: { baseMs: 20, maxMs: 120 },

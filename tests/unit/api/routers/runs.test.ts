@@ -141,6 +141,7 @@ import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
+import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { getWorker } from '@/identity/worker-service.js';
 import { getPMProvider } from '@/integrations/pm/registry.js';
 import {
@@ -555,6 +556,7 @@ describe('runsRouter', () => {
 				ownerUserId: 'user-1',
 				displayName: 'alice-macbook',
 				capabilities: ['claude' as const],
+				supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 				createdAt: new Date(0),
 				updatedAt: new Date(0),
 			};

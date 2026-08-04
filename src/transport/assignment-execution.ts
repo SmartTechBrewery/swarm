@@ -287,7 +287,7 @@ export function deferrableOrFailedResult(
  * should carry, so it stays on the local host worker and is failed cleanly by the
  * gate below.
  */
-const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
+export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
 	'respond-to-ci',
 	'resolve-conflicts',
 	'implementation',
