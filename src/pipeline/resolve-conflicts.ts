@@ -10,6 +10,7 @@ import { agentRunError } from '../harness/agent-failure.js';
 import type { ReasoningLevel } from '../harness/models.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
+import type { RecoveryMode } from '../queue/jobs.js';
 import {
 	assertRemoteHead,
 	ConflictHandoffSchema,
@@ -73,7 +74,7 @@ export interface RunResolveConflictsPhaseOptions {
 	/** The database run id. */
 	runId?: string;
 	/** Mode for recovering a cancelled preserved worktree. */
-	recoveryMode?: 'resume' | 'fresh';
+	recoveryMode?: RecoveryMode;
 	/** Resume deterministic delivery from a preserved worktree without rerunning the agent. */
 	resumeDelivery?: boolean;
 	timeoutMs?: number;
@@ -122,9 +123,10 @@ export async function runResolveConflictsPhase(
 	);
 	// On a resume retry, reuse the preserved checkout so a partial merge resolution
 	// and the agent's session carry over.
-	const { handle, resumed, deliveryResumed } = await acquireResumableWorktree(
+	const { handle, resumed, deliveryResumed, checkpoint } = await acquireResumableWorktree(
 		worktrees,
 		taskId,
+		'resolve-conflicts',
 		prBranch,
 		false,
 		resumeSessionId,
@@ -143,7 +145,7 @@ export async function runResolveConflictsPhase(
 					cli,
 					model,
 					reasoning,
-					...sessionRunArgs({ sessionId, resumeSessionId }, resumed),
+					...sessionRunArgs({ sessionId, resumeSessionId }, resumed, recoveryMode),
 					cwd: handle.path,
 					args: [
 						buildResolveConflictsPrompt(
@@ -154,6 +156,7 @@ export async function runResolveConflictsPhase(
 								headSha,
 								baseBranch,
 								baseSha,
+								checkpoint,
 							},
 							customPrompt,
 						),

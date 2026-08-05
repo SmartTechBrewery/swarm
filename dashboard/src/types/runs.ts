@@ -301,7 +301,14 @@ export interface RunRow {
 	 */
 	recovery?: {
 		state: 'preserved' | 'recovered' | 'blocked';
-		blockedReason?: 'dirty' | 'unpushed' | 'live-leased' | 'missing-validation' | 'resumable-owner';
+		/** Mirrors `BlockedRecoveryReason` (`src/worktree/reclaim.ts`); keep the unions in sync. */
+		blockedReason?:
+			| 'dirty'
+			| 'unpushed'
+			| 'live-leased'
+			| 'missing-validation'
+			| 'resumable-owner'
+			| 'checkpoint-divergent';
 		agentSessionId?: string | null;
 	} | null;
 	/**

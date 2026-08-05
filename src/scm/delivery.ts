@@ -30,7 +30,15 @@ const repositoryLocalGitEnvironment = [
 	'GIT_COMMON_DIR',
 ] as const;
 
-function gitEnvironmentForCwd(): NodeJS.ProcessEnv {
+/**
+ * The environment a `git` invocation must run with when `cwd` alone decides which
+ * repository it acts on. Exported because every worktree-scoped git read needs the
+ * same scrubbing, not only delivery's writes — the checkpoint continuation gate
+ * (`src/pipeline/checkpoint.ts`) reads `git status` inside a worktree and would
+ * otherwise be redirected by an inherited `GIT_DIR`/`GIT_WORK_TREE`. One list, so
+ * the two cannot drift.
+ */
+export function gitEnvironmentForCwd(): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	for (const key of repositoryLocalGitEnvironment) delete env[key];
 	return env;

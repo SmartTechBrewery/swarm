@@ -1,7 +1,33 @@
-import { describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { isWorktreeLeasedMock, claimWorktreeLeaseMock, releaseWorktreeLeaseMock } = vi.hoisted(
+	() => ({
+		isWorktreeLeasedMock: vi.fn(async () => false),
+		claimWorktreeLeaseMock: vi.fn(async () => {}),
+		releaseWorktreeLeaseMock: vi.fn(async () => {}),
+	}),
+);
+
+vi.mock('@/worktree/worktree-lease.js', () => ({
+	isWorktreeLeased: isWorktreeLeasedMock,
+	claimWorktreeLease: claimWorktreeLeaseMock,
+	releaseWorktreeLease: releaseWorktreeLeaseMock,
+}));
+
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
-import { shouldPreserveForResume } from '@/pipeline/resume.js';
+import { CHECKPOINT_FILENAME } from '@/pipeline/checkpoint.js';
+import {
+	acquireResumableWorktree,
+	executeRecoveryGate,
+	sessionRunArgs,
+	shouldPreserveForResume,
+} from '@/pipeline/resume.js';
+import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 
 function mockAgentResult(sessionId?: string): AgentCliResult {
 	return {
@@ -80,5 +106,287 @@ describe('shouldPreserveForResume', () => {
 			mockAgentResult('session-123'),
 		);
 		expect(shouldPreserveForResume(error)).toBe(false);
+	});
+});
+
+/**
+ * The recovery gate's Tier 2 branch (issue #502). The fixtures are real
+ * directories and real repositories, because the branch's whole job is to compare
+ * a checkpoint against the working tree actually on disk.
+ */
+const roots: string[] = [];
+const fixtureGitEnvironment = Object.fromEntries(
+	Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
+);
+
+function fixtureGit(cwd: string, args: string[]): string {
+	return execFileSync('git', args, { cwd, encoding: 'utf8', env: fixtureGitEnvironment });
+}
+
+/** A checkpoint matching what {@link preservedCheckout} leaves dirty. */
+const CHECKPOINT = {
+	phase: 'implementation',
+	completed: ['Added the schema'],
+	remaining: ['Update the docs', 'Run the focused tests'],
+	decisions: [],
+	workingTree: { modified: ['a.ts'], added: [], deleted: [] },
+};
+
+/** A preserved checkout with one committed-then-edited file, carrying `checkpoint` if given. */
+function preservedCheckout(checkpoint?: unknown): string {
+	const root = mkdtempSync(join(tmpdir(), 'swarm-recovery-gate-'));
+	roots.push(root);
+	fixtureGit(root, ['init']);
+	fixtureGit(root, ['config', 'user.name', 'Fixture']);
+	fixtureGit(root, ['config', 'user.email', 'fixture@example.com']);
+	writeFileSync(join(root, 'a.ts'), 'base\n');
+	fixtureGit(root, ['add', '--all']);
+	fixtureGit(root, ['commit', '-m', 'base']);
+	writeFileSync(join(root, 'a.ts'), 'edited\n');
+	if (checkpoint !== undefined)
+		writeFileSync(join(root, CHECKPOINT_FILENAME), JSON.stringify(checkpoint));
+	return root;
+}
+
+/** The structural slice of `GitWorktreeManager` the gate uses, including its private `git`. */
+function stubWorktrees(path: string) {
+	return {
+		worktreePath: vi.fn(() => path),
+		git: vi.fn(async (args: string[]) =>
+			args[0] === 'symbolic-ref' ? 'issue-19\n' : 'abc1234def\n',
+		),
+		isClean: vi.fn(async () => true),
+		hasUnpushedWork: vi.fn(async () => false),
+		cleanup: vi.fn(async () => {}),
+	};
+}
+
+function gate(
+	path: string,
+	mode: 'resume' | 'fresh' | 'checkpoint' | undefined,
+	sessionId: string | undefined,
+	phase: 'implementation' | 'respond-to-ci' = 'implementation',
+) {
+	return executeRecoveryGate(
+		stubWorktrees(path) as unknown as GitWorktreeManager,
+		'19',
+		mode,
+		sessionId,
+		'project-1',
+		phase,
+	);
+}
+
+describe("executeRecoveryGate — the 'checkpoint' continuation branch (issue #502)", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isWorktreeLeasedMock.mockResolvedValue(false);
+	});
+
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	it('adopts the preserved checkout and returns the validated checkpoint', async () => {
+		const path = preservedCheckout(CHECKPOINT);
+		const result = await gate(path, 'checkpoint', undefined);
+		expect(result.reuseHandle).toEqual({ taskId: '19', path, branch: 'issue-19', detached: false });
+		expect(result.checkpoint?.remaining).toEqual(CHECKPOINT.remaining);
+		// The adopted checkout stays leased for the continuation that is about to run.
+		expect(claimWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
+		expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+	});
+
+	it('needs no session id — the continuation resumes none', async () => {
+		const path = preservedCheckout(CHECKPOINT);
+		await expect(gate(path, 'checkpoint', undefined)).resolves.toMatchObject({
+			checkpoint: { phase: 'implementation' },
+		});
+	});
+
+	it('blocks with missing-validation when the checkout is gone', async () => {
+		const path = join(tmpdir(), 'swarm-recovery-gate-absent-19');
+		await expect(gate(path, 'checkpoint', undefined)).rejects.toMatchObject({
+			name: 'BlockedRecoveryError',
+			reason: 'missing-validation',
+		});
+	});
+
+	it.each([
+		{ case: 'no checkpoint at all', body: undefined, reason: 'missing-validation' },
+		{ case: 'a malformed checkpoint', body: 'not json', reason: 'checkpoint-divergent' },
+		{
+			case: 'a schema-violating checkpoint',
+			body: JSON.stringify({ ...CHECKPOINT, remaining: [] }),
+			reason: 'checkpoint-divergent',
+		},
+		{
+			case: 'a divergent working tree',
+			body: JSON.stringify({
+				...CHECKPOINT,
+				workingTree: { modified: ['src/never-touched.ts'], added: [], deleted: [] },
+			}),
+			reason: 'checkpoint-divergent',
+		},
+	])('blocks on $case and releases the lease first', async ({ body, reason }) => {
+		const path = preservedCheckout();
+		if (body !== undefined) writeFileSync(join(path, CHECKPOINT_FILENAME), body);
+		await expect(gate(path, 'checkpoint', undefined)).rejects.toMatchObject({
+			name: 'BlockedRecoveryError',
+			reason,
+		});
+		expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
+	});
+
+	it("refuses another phase's checkpoint left in the reused checkout", async () => {
+		const path = preservedCheckout(CHECKPOINT);
+		await expect(gate(path, 'checkpoint', undefined, 'respond-to-ci')).rejects.toMatchObject({
+			name: 'BlockedRecoveryError',
+			reason: 'checkpoint-divergent',
+		});
+		expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
+	});
+});
+
+describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isWorktreeLeasedMock.mockResolvedValue(false);
+	});
+
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	it("'resume' adopts the checkout on a session id and never consults the checkpoint", async () => {
+		// A checkpoint that would be rejected as divergent must not affect Tier 1.
+		const path = preservedCheckout({
+			...CHECKPOINT,
+			workingTree: { modified: ['src/never-touched.ts'], added: [], deleted: [] },
+		});
+		await expect(gate(path, 'resume', 'session-19')).resolves.toEqual({
+			reuseHandle: { taskId: '19', path, branch: 'issue-19', detached: false },
+		});
+		expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+	});
+
+	it("'resume' still blocks with missing-validation when no session id is known", async () => {
+		const path = preservedCheckout();
+		await expect(gate(path, 'resume', undefined)).rejects.toMatchObject({
+			name: 'BlockedRecoveryError',
+			reason: 'missing-validation',
+		});
+		expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
+	});
+
+	it("'fresh' still removes a clean checkout and returns no handle", async () => {
+		const path = preservedCheckout();
+		const worktrees = stubWorktrees(path);
+		const result = await executeRecoveryGate(
+			worktrees as unknown as GitWorktreeManager,
+			'19',
+			'fresh',
+			undefined,
+			'project-1',
+			'implementation',
+		);
+		expect(result).toEqual({ reuseHandle: null });
+		expect(worktrees.cleanup).toHaveBeenCalledWith('19');
+	});
+
+	it('still blocks a live-leased checkout when no recovery was requested', async () => {
+		isWorktreeLeasedMock.mockResolvedValue(true);
+		const path = preservedCheckout();
+		await expect(gate(path, undefined, undefined)).rejects.toMatchObject({
+			name: 'BlockedRecoveryError',
+			reason: 'live-leased',
+		});
+	});
+});
+
+describe('acquireResumableWorktree — a checkpoint continuation resumes no session', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isWorktreeLeasedMock.mockResolvedValue(false);
+	});
+
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	async function acquire(mode: 'resume' | 'checkpoint', path: string) {
+		const worktrees = {
+			...stubWorktrees(path),
+			reuse: vi.fn(async () => undefined),
+		};
+		return acquireResumableWorktree(
+			worktrees as unknown as GitWorktreeManager,
+			'19',
+			'implementation',
+			'issue-19',
+			false,
+			'session-19',
+			async (): Promise<WorktreeHandle> => {
+				throw new Error('must not provision a fresh checkout');
+			},
+			false,
+			mode,
+			'project-1',
+		);
+	}
+
+	it('reports resumed: false and hands the checkpoint back for the prompt', async () => {
+		const path = preservedCheckout(CHECKPOINT);
+		const result = await acquire('checkpoint', path);
+		expect(result.handle.path).toBe(path);
+		expect(result.resumed).toBe(false);
+		expect(result.deliveryResumed).toBe(false);
+		expect(result.checkpoint?.remaining).toEqual(CHECKPOINT.remaining);
+	});
+
+	it("still reports resumed: true with no checkpoint for 'resume' (regression)", async () => {
+		const path = preservedCheckout();
+		const result = await acquire('resume', path);
+		expect(result.resumed).toBe(true);
+		expect(result.checkpoint).toBeUndefined();
+	});
+});
+
+describe('sessionRunArgs', () => {
+	const session = { sessionId: 'fresh-19', resumeSessionId: 'prior-19' };
+
+	it('resumes the prior session when a checkout was reused', () => {
+		expect(sessionRunArgs(session, true)).toEqual({
+			sessionId: undefined,
+			resumeSessionId: 'prior-19',
+		});
+	});
+
+	it('assigns a fresh id on a first run', () => {
+		expect(sessionRunArgs(session, false)).toEqual({
+			sessionId: 'fresh-19',
+			resumeSessionId: undefined,
+		});
+	});
+
+	it('forces a fresh, sessionless run for a checkpoint continuation', () => {
+		// Unconditional: even a caller that (wrongly) claimed a resume gets no resume id,
+		// which is what makes the continuation runnable on a different CLI.
+		for (const resumed of [false, true])
+			expect(sessionRunArgs(session, resumed, 'checkpoint')).toEqual({
+				sessionId: 'fresh-19',
+				resumeSessionId: undefined,
+			});
+	});
+
+	it("leaves the 'resume' and 'fresh' modes exactly as before (regression)", () => {
+		expect(sessionRunArgs(session, true, 'resume')).toEqual({
+			sessionId: undefined,
+			resumeSessionId: 'prior-19',
+		});
+		expect(sessionRunArgs(session, false, 'fresh')).toEqual({
+			sessionId: 'fresh-19',
+			resumeSessionId: undefined,
+		});
 	});
 });

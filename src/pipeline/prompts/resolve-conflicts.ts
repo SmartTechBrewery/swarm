@@ -9,7 +9,11 @@
 
 import type { ProjectConfig } from '@/config/schema.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
-import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	checkpointContinuationSection,
+	checkpointInstructions,
+} from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsParagraph } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 
@@ -24,6 +28,8 @@ export interface ResolveConflictsPromptInput {
 	headSha: string;
 	baseBranch: string;
 	baseSha: string;
+	/** The validated checkpoint a Tier 2 continuation adopted this worktree on; unset on an ordinary run. */
+	checkpoint?: Checkpoint;
 }
 
 /**
@@ -53,6 +59,7 @@ export function buildResolveConflictsPrompt(
 		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge in the working tree for SWARM.',
 		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", body (the concise result comment), and verification [{command,outcome:"passed"}].`,
 		...checkpointInstructions('resolve-conflicts'),
+		...(input.checkpoint ? checkpointContinuationSection(input.checkpoint) : []),
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');
 }

@@ -193,7 +193,11 @@ export interface RunReviewPhaseOptions {
 	resumeSessionId?: string;
 	/** The database run id. */
 	runId?: string;
-	/** Mode for recovering a cancelled preserved worktree. */
+	/**
+	 * Mode for recovering a cancelled preserved worktree. Deliberately narrower than
+	 * {@link RecoveryMode}: this phase writes no checkpoint (`docs/CHECKPOINTS.md`),
+	 * so there is never one to continue it from.
+	 */
 	recoveryMode?: 'resume' | 'fresh';
 	/** Resume deterministic delivery from a preserved worktree without rerunning the agent. */
 	resumeDelivery?: boolean;
@@ -651,6 +655,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 	const { handle, resumed, deliveryResumed } = await acquireResumableWorktree(
 		worktrees,
 		taskId,
+		'review',
 		headSha,
 		true,
 		resumeSessionId,

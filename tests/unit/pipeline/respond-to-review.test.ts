@@ -8,7 +8,21 @@ vi.mock('node:fs', () => ({
 	readFileSync: () => outcomeFileContents,
 }));
 
+// A checkpoint continuation's gate verdict. The gate itself (validation, lease
+// release, blocked reasons) is covered in `resume.test.ts` against real fixtures;
+// here it is stubbed so this file can assert what the *phase* does with it.
+const { acquireResumableWorktreeMock } = vi.hoisted(() => ({
+	acquireResumableWorktreeMock: vi.fn(),
+}));
+vi.mock('@/pipeline/resume.js', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/pipeline/resume.js')>();
+	// Delegates by default, so every existing test keeps the real acquisition path.
+	acquireResumableWorktreeMock.mockImplementation(actual.acquireResumableWorktree);
+	return { ...actual, acquireResumableWorktree: acquireResumableWorktreeMock };
+});
+
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import {
 	buildRespondToReviewPrompt,
 	issueNumberFromBranch,
@@ -37,6 +51,15 @@ function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 		...overrides,
 	};
 }
+
+/** What an involuntarily stopped run of this phase left behind. */
+const CONTINUATION: Checkpoint = {
+	phase: 'respond-to-review',
+	completed: ['Read the review and fixed the first finding'],
+	remaining: ['Address the second finding', 'Re-run the focused tests'],
+	decisions: [],
+	workingTree: { modified: ['src/pipeline/review.ts'], added: [], deleted: [] },
+};
 
 function makeDeps() {
 	// The PR's existing task branch — not detached, the agent pushes fixes here.
@@ -104,6 +127,49 @@ describe('runRespondToReviewPhase', () => {
 
 		expect(result.outcome).toBe('fixed');
 		expect(result.agent.exitCode).toBe(0);
+	});
+
+	it('continues from a checkpoint on a fresh session, on a different CLI (issue #502)', async () => {
+		const deps = makeDeps();
+		acquireResumableWorktreeMock.mockResolvedValueOnce({
+			handle: { taskId: 'respond-21', path: WORKTREE_PATH, branch: PR_BRANCH, detached: false },
+			resumed: false,
+			deliveryResumed: false,
+			checkpoint: CONTINUATION,
+		});
+
+		await runRespondToReviewPhase({
+			...deps,
+			// The stopped run captured 'prior-21' on claude; this continuation carries
+			// no session, so it may run on any engine.
+			cli: 'codex',
+			sessionId: 'fresh-21',
+			resumeSessionId: 'prior-21',
+			recoveryMode: 'checkpoint',
+		});
+
+		// The mode and this phase's own name reached the recovery gate.
+		expect(acquireResumableWorktreeMock).toHaveBeenCalledWith(
+			expect.anything(),
+			'respond-21',
+			'respond-to-review',
+			PR_BRANCH,
+			false,
+			'prior-21',
+			expect.any(Function),
+			false,
+			'checkpoint',
+			deps.project.id,
+		);
+
+		const runArgs = deps.runAgent.mock.calls[0][0];
+		// A fresh session and no resume id, despite `resumeSessionId` being known.
+		expect(runArgs.sessionId).toBe('fresh-21');
+		expect(runArgs.resumeSessionId).toBeUndefined();
+		// The prompt carries the recorded remainder instead of the CLI's own context.
+		expect(runArgs.args?.[0]).toContain('--- CONTINUING FROM A CHECKPOINT ---');
+		expect(runArgs.args?.[0]).toContain('Address the second finding');
+		expect(runArgs.args?.[0]).toContain('Complete only the remainder');
 	});
 
 	it('forwards timeoutMs, signal, and maxOutputBytes to the agent runner', async () => {

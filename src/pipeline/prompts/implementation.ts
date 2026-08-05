@@ -7,8 +7,11 @@
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
-import { CHECKPOINT_FILENAME } from '@/pipeline/checkpoint.js';
-import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
+import { CHECKPOINT_FILENAME, type Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	checkpointContinuationSection,
+	checkpointInstructions,
+} from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import type { WorkItem } from '@/pm/types.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
@@ -49,10 +52,17 @@ export function buildImplementationPrompt(
 		 * their prompt is unchanged.
 		 */
 		worktreePath?: string;
+		/**
+		 * The validated checkpoint a Tier 2 continuation adopted this worktree on
+		 * (`recoveryMode: 'checkpoint'`). Set only then: it seeds this fresh session
+		 * with the stopped run's remainder so it completes that instead of the whole
+		 * work item. Unset on every ordinary run, leaving the prompt unchanged.
+		 */
+		checkpoint?: Checkpoint;
 	},
 	customPrompt?: string,
 ): string {
-	const { repo, branch, baseBranch, worktreePath } = context;
+	const { repo, branch, baseBranch, worktreePath, checkpoint } = context;
 	// When the worktree path is named, the agent must not trust its own working
 	// directory: point every edit, command, and hand-off file at that absolute
 	// path, so SWARM's delivery validation finds the hand-off where it looks.
@@ -95,6 +105,7 @@ export function buildImplementationPrompt(
 		'',
 		...checkpointInstructions('implementation'),
 		'',
+		...(checkpoint ? [...checkpointContinuationSection(checkpoint), ''] : []),
 		'Do not merge the PR. Keep the change scoped to the work item.',
 		...projectInstructionsSection(customPrompt),
 		'',

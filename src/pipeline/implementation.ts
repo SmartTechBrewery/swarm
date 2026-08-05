@@ -58,6 +58,7 @@ import { agentRunError } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import { DependencyBlockedError, findOpenBlockers } from '@/pipeline/dependency-guard.js';
 import {
 	BLOCKED_REASON_FILENAME,
@@ -71,6 +72,7 @@ import {
 } from '@/pipeline/resume.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
+import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	commitPreparedTree,
 	DeliveryDeferredError,
@@ -162,7 +164,7 @@ export interface RunImplementationPhaseOptions {
 	/** The database run id. */
 	runId?: string;
 	/** Mode for recovering a cancelled preserved worktree. */
-	recoveryMode?: 'resume' | 'fresh';
+	recoveryMode?: RecoveryMode;
 	/** Resume deterministic delivery from a preserved worktree without rerunning the agent. */
 	resumeDelivery?: boolean;
 	/** Resume a deferred implementation from its existing task branch. */
@@ -272,7 +274,9 @@ function readBlockedReason(worktreePath: string): string | undefined {
  * provisioned its branch also reuses that checkout, but starts a fresh agent
  * session. If the checkout is gone, it falls through to provision the existing
  * task branch (`resumeExistingBranch`) or a new one. `resumed` reports whether
- * an agent session, not merely the worktree, was resumed.
+ * an agent session, not merely the worktree, was resumed — a Tier 2 checkpoint
+ * continuation resumes none, and hands its `checkpoint` back for the prompt
+ * instead.
  */
 async function acquireImplementationWorktree(
 	worktrees: GitWorktreeManager,
@@ -281,27 +285,34 @@ async function acquireImplementationWorktree(
 	resumeSessionId: string | undefined,
 	resumeExistingBranch: boolean,
 	resumeDelivery: boolean,
-	recoveryMode?: 'resume' | 'fresh',
+	recoveryMode?: RecoveryMode,
 	projectId?: string,
 	runId?: string,
-): Promise<{ handle: WorktreeHandle; resumed: boolean; deliveryResumed: boolean }> {
+): Promise<{
+	handle: WorktreeHandle;
+	resumed: boolean;
+	deliveryResumed: boolean;
+	checkpoint?: Checkpoint;
+}> {
 	if (recoveryMode) {
-		const { reuseHandle } = await executeRecoveryGate(
+		const { reuseHandle, checkpoint } = await executeRecoveryGate(
 			worktrees,
 			taskId,
 			recoveryMode,
 			resumeSessionId,
 			projectId ?? '',
+			'implementation',
 		);
 		if (reuseHandle) {
 			return {
 				handle: reuseHandle,
-				resumed: true,
+				resumed: recoveryMode !== 'checkpoint',
 				deliveryResumed: false,
+				checkpoint,
 			};
 		}
 	}
-	// A checkpoint means this run already owns the task branch. Reuse its checkout
+	// A prior attempt on this task already owns the task branch. Reuse its checkout
 	// when it survived a failed/manual retry so a fresh agent session does not
 	// collide with `task-<id>` or discard partial, unpushed work. A session is only
 	// resumed when an actual resume id is present.
@@ -389,7 +400,7 @@ export async function runImplementationPhase(
 
 	// Task-branch checkout (createBranch defaults to true): the agent commits and
 	// pushes here, so — unlike Planning — this is not a detached, throwaway HEAD.
-	const { handle, resumed, deliveryResumed } = await acquireImplementationWorktree(
+	const { handle, resumed, deliveryResumed, checkpoint } = await acquireImplementationWorktree(
 		worktrees,
 		taskId,
 		`${project.branchPrefix}${taskId}`,
@@ -412,7 +423,7 @@ export async function runImplementationPhase(
 					cli,
 					model,
 					reasoning,
-					...sessionRunArgs({ sessionId, resumeSessionId }, resumed),
+					...sessionRunArgs({ sessionId, resumeSessionId }, resumed, recoveryMode),
 					cwd: handle.path,
 					args: [
 						buildImplementationPrompt(
@@ -427,6 +438,10 @@ export async function runImplementationPhase(
 								// require edits/hand-off be written there. Claude/Codex run from `cwd`,
 								// so it stays unset and their prompt is unchanged.
 								worktreePath: cli === 'antigravity' ? handle.path : undefined,
+								// Set only by a Tier 2 continuation (`recoveryMode: 'checkpoint'`):
+								// this fresh session has no CLI context to resume, so the prompt
+								// carries the stopped run's recorded remainder instead.
+								checkpoint,
 							},
 							customPrompt,
 						),
