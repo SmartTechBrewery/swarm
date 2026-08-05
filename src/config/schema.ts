@@ -597,10 +597,9 @@ export const ProjectConfigBaseSchema = z.object({
  * 2. Every non-optional role must be configured. A role that declares
  *    `inheritsSharedCredential` is exempt: it already resolves without an entry.
  *
- * Rule 2 applies **only when the block is present**. An absent `credentials.pm` is
- * how every config written before this existed looks, and for GitHub Projects it is
- * still the norm — the block is the opt-in to per-provider references, not a new
- * required field, so demanding it would break every current config for no gain.
+ * `credentials.pm` remains optional for providers whose roles are all optional or
+ * inherit a shared credential. A provider with a non-optional, non-inherited role
+ * still requires it even when the entire map is absent.
  *
  * Skipped entirely when no manifest is registered for `pm.type` — a config can be
  * parsed by a surface that never loaded `src/integrations/entrypoint.js` (a
@@ -615,8 +614,7 @@ function validatePmCredentialRoles(
 	project: z.infer<typeof ProjectConfigBaseSchema>,
 	ctx: z.RefinementCtx,
 ): void {
-	const references = project.credentials.pm;
-	if (!references) return;
+	const references = project.credentials.pm ?? {};
 
 	const manifest = getPMProvider(project.pm.type);
 	if (!manifest) return;

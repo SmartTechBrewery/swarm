@@ -69,9 +69,9 @@ export interface PmCredentialRoleSpec {
 	/** Human-readable name, for logs and any future credential UI. */
 	readonly label: string;
 	/**
-	 * Host-environment variable read as the last-resort fallback when the project
-	 * configures no reference for this role — and, for `swarm config apply`, the
-	 * conventional key an operator exports the secret under.
+	 * Host-environment variable read as the last-resort fallback only when the
+	 * project explicitly configures a reference for this role — and, for `swarm
+	 * config apply`, the conventional key an operator exports the secret under.
 	 */
 	readonly envVarKey: string;
 	/** When `true`, the provider still works without this credential. */

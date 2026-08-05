@@ -89,14 +89,17 @@ export async function getWebhookSecretOrNull(project: ProjectConfig): Promise<st
  *    (`inheritsSharedCredential`) — also a store reference, so it belongs above the
  *    host env; this is what keeps GitHub Projects' webhook secret *exactly* the
  *    project's existing SCM webhook secret;
- * 3. the role's `envVarKey` in this host's environment — the escape hatch for a host
- *    that exports the secret directly rather than storing it;
+ * 3. the role's `envVarKey` in this host's environment — only when the project
+ *    explicitly configured `credentials.pm[role]`, as the escape hatch for a host
+ *    that exports that opted-in secret directly rather than storing it;
  * 4. `null`.
  *
  * A configured reference that resolves to nothing falls through rather than
  * short-circuiting: `swarm config apply` warns-and-skips a reference whose env var
  * was unset, so "reference configured, store row absent, env var present on the
- * worker" is a legitimate state and resolving it is what an operator expects.
+ * worker" is a legitimate state and resolving it is what an operator expects. A
+ * role with no configured PM reference never reads a host environment variable,
+ * preserving the fail-closed behavior of inherited webhook credentials.
  *
  * Throws when the role isn't one the project's provider declares — asking for a
  * credential a provider has no notion of is a wiring bug, not a lookup miss
@@ -122,7 +125,7 @@ export async function resolvePmCredential(
 		if (inherited) return inherited;
 	}
 
-	return process.env[spec.envVarKey] || null;
+	return configured ? process.env[spec.envVarKey] || null : null;
 }
 
 /**
@@ -137,7 +140,7 @@ export async function requirePmCredential(project: ProjectConfig, role: string):
 		const spec = requireProjectPMCredentialRole(project, role);
 		throw new Error(
 			`No PM ${spec.label} (role '${role}') configured for project '${project.id}' ` +
-				`(set credentials.pm.${role} to a stored reference, or export ${spec.envVarKey} on this host)`,
+				`(set credentials.pm.${role} to a stored reference; ${spec.envVarKey} is its conventional config-apply key)`,
 		);
 	}
 	return secret;

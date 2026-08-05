@@ -34,11 +34,15 @@ function registerRoles(credentialRoles: readonly PmCredentialRoleSpec[]): void {
 	registerPMProvider({ ...githubProjectsManifest, credentialRoles });
 }
 
+// Keep this parsed while the real GitHub Projects manifest is registered. The
+// validation tests intentionally replace that manifest with stricter synthetic
+// roles, then pass raw inputs to the schema under test.
+const baselineProject = createMockProjectConfig();
+
 /** A project config input with the given PM credential references. */
 function configWithPmReferences(pm: Record<string, string> | undefined): unknown {
-	const project = createMockProjectConfig();
 	return {
-		...project,
+		...baselineProject,
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',
@@ -58,6 +62,12 @@ afterEach(() => {
 	_resetPMProviderRegistryForTesting();
 	registerPMProvider(githubProjectsManifest);
 	vi.unstubAllEnvs();
+});
+
+beforeEach(() => {
+	// This project conventionally exports the shared webhook variable. Negative
+	// cases must be independent of whether the runner inherited that environment.
+	vi.stubEnv('SCM_WEBHOOK_SECRET', '');
 });
 
 describe('credentials.pm validation against the declared roles', () => {
@@ -81,6 +91,13 @@ describe('credentials.pm validation against the declared roles', () => {
 		expect(errors).toContain("requires the 'apiToken' credential (API Token)");
 		expect(errors).toContain('credentials.pm.apiToken');
 		expect(errors).toContain('JIRA_API_TOKEN');
+	});
+
+	it('rejects an absent block when the provider has a non-optional role', () => {
+		registerRoles([{ role: 'apiToken', label: 'API Token', envVarKey: 'JIRA_API_TOKEN' }]);
+		const errors = parseErrors(configWithPmReferences(undefined));
+		expect(errors).toContain("requires the 'apiToken' credential (API Token)");
+		expect(errors).toContain('credentials.pm.apiToken');
 	});
 
 	it('does not require an optional role', () => {
@@ -154,13 +171,21 @@ describe('resolvePmCredential', () => {
 		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'SHARED_WEBHOOK_KEY');
 	});
 
-	it("falls back to the role's env var when nothing resolves from the store", async () => {
+	it("falls back to the role's env var when an explicitly configured role resolves nowhere", async () => {
 		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 
 		expect(await resolvePmCredential(project, 'webhookSecret')).toBe('from-env');
 		// Both store references were tried before the env — the configured one first.
 		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'PM_WEBHOOK_KEY');
+		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'SHARED_WEBHOOK_KEY');
+	});
+
+	it('fails closed for an inherited role with no PM reference even when its env var is set', async () => {
+		vi.stubEnv('SCM_WEBHOOK_SECRET', 'ambient-secret');
+		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
+
+		expect(await resolvePmCredential(projectWithoutPmReferences, 'webhookSecret')).toBeNull();
 		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'SHARED_WEBHOOK_KEY');
 	});
 

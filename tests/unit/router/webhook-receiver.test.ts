@@ -740,6 +740,16 @@ describe('createWebhookApp', () => {
 				expect(res.status).toBe(401);
 				expect(enqueuePm).not.toHaveBeenCalled();
 			});
+
+			it('fails closed when the PM credential is unavailable despite an ambient secret', async () => {
+				vi.stubEnv('SCM_WEBHOOK_SECRET', 'ambient-secret');
+				const { app, enqueuePm, getPmCredential } = realProviderApp();
+				getPmCredential.mockResolvedValue(null);
+				const res = await postBoard(app, sign(boardBody, 'ambient-secret'));
+				expect(res.status).toBe(401);
+				expect(getPmCredential).toHaveBeenCalledWith(project, PM_WEBHOOK_SECRET_ROLE);
+				expect(enqueuePm).not.toHaveBeenCalled();
+			});
 		});
 	});
 });
