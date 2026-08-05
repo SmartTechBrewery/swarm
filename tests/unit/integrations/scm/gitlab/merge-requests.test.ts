@@ -424,6 +424,35 @@ describe('gitlab merge-request reads', () => {
 			expect(candidates.map((mr) => mr.number)).toEqual([17, 18]);
 		});
 
+		it('limits concurrent candidate detail reads', async () => {
+			const listEntry = (iid: number) => ({
+				iid,
+				source_branch: `swarm/issue-${iid}`,
+				target_branch: 'main',
+				source_project_id: 42,
+				target_project_id: 42,
+			});
+			let releaseDetails: (() => void) | undefined;
+			const detailsReady = new Promise<void>((resolve) => {
+				releaseDetails = resolve;
+			});
+			fetchMock.mockImplementation(async (input) => {
+				const url = new URL(String(input));
+				if (url.pathname.endsWith('/merge_requests')) {
+					return jsonResponse(Array.from({ length: 11 }, (_, index) => listEntry(index + 17)));
+				}
+				await detailsReady;
+				const iid = Number(url.pathname.split('/').at(-1));
+				return jsonResponse(createMockGitLabMergeRequestResponse({ iid }));
+			});
+
+			const candidates = scoped(() => listOpenGitLabMergeRequestsForBase(REPO, 'main'));
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(11));
+			releaseDetails?.();
+
+			await expect(candidates).resolves.toHaveLength(11);
+		});
+
 		it('drops fork merge requests, whose source branch this project does not have', async () => {
 			routeFetch(fetchMock, [
 				['/merge_requests/17', createMockGitLabMergeRequestResponse()],
@@ -550,6 +579,58 @@ describe('gitlab merge-request reads', () => {
 			await expect(scoped(() => getGitLabCommitStatuses(REPO, HEAD_SHA))).resolves.toEqual({
 				totalCount: 1,
 				checkRuns: [{ name: 'unit-tests', status: 'in_progress', conclusion: null }],
+			});
+		});
+
+		it('maps advisory failures and manual jobs to skipped so they cannot block CI', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse([
+					createMockGitLabCommitStatusResponse(),
+					createMockGitLabCommitStatusResponse({
+						name: 'bundler:audit',
+						status: 'failed',
+						allow_failure: true,
+					}),
+					createMockGitLabCommitStatusResponse({
+						name: 'optional deploy',
+						status: 'manual',
+						allow_failure: true,
+					}),
+				]),
+			);
+
+			await expect(scoped(() => getGitLabCommitStatuses(REPO, HEAD_SHA))).resolves.toEqual({
+				totalCount: 3,
+				checkRuns: [
+					{ name: 'unit-tests', status: 'completed', conclusion: 'success' },
+					{ name: 'bundler:audit', status: 'completed', conclusion: 'skipped' },
+					{ name: 'optional deploy', status: 'completed', conclusion: 'skipped' },
+				],
+			});
+		});
+
+		it('keeps all-advisory pipelines reviewable', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse([
+					createMockGitLabCommitStatusResponse({
+						name: 'bundler:audit',
+						status: 'failed',
+						allow_failure: true,
+					}),
+					createMockGitLabCommitStatusResponse({
+						name: 'optional deploy',
+						status: 'manual',
+						allow_failure: true,
+					}),
+				]),
+			);
+
+			await expect(scoped(() => getGitLabCommitStatuses(REPO, HEAD_SHA))).resolves.toEqual({
+				totalCount: 2,
+				checkRuns: [
+					{ name: 'bundler:audit', status: 'completed', conclusion: 'skipped' },
+					{ name: 'optional deploy', status: 'completed', conclusion: 'skipped' },
+				],
 			});
 		});
 

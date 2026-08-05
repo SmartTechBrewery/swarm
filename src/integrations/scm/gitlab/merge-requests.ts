@@ -39,6 +39,9 @@ import { isTerminalPipelineStatus, pipelineConclusion } from './pipelines.js';
 /** Name reported for a commit status GitLab exposes no `name` for. */
 const UNNAMED_COMMIT_STATUS = '<unnamed commit status>';
 
+/** Keep conflict-candidate refreshes below GitLab's request burst limits. */
+const CONFLICT_CANDIDATE_READ_CONCURRENCY = 10;
+
 /**
  * A merge request, typed to the fields these reads depend on.
  *
@@ -76,6 +79,8 @@ interface GitLabCommitStatus {
 	created_at?: string | null;
 	/** `null` until the job settles, which is why the dedupe falls back to `created_at`. */
 	finished_at?: string | null;
+	/** GitLab does not let this job affect the pipeline result. */
+	allow_failure?: boolean;
 }
 
 /**
@@ -333,10 +338,11 @@ function isSameProjectMergeRequest(mr: GitLabMergeRequest): boolean {
  * force it: the list endpoint omits `diff_refs` entirely (so there would be no merge
  * base to key a claim on), and it reports whatever `merge_status` was last cached
  * rather than a fresh one — GitLab recomputes mergeability *when a single merge
- * request is read*. Mapping the list entries directly would therefore produce
- * candidates with no `baseSha` and a stale `mergeable`; the extra read is what makes
- * both trustworthy, and what makes the trigger's bounded recheck converge instead of
- * re-reading the same cached answer 20 times.
+ * request is read*. `with_merge_status_recheck=true` asks the list endpoint to refresh
+ * its half too, but cannot supply the omitted merge base. Mapping list entries directly
+ * would therefore produce candidates with no `baseSha`; the extra read is what makes
+ * both fields trustworthy, and what makes the trigger's bounded recheck converge
+ * instead of re-reading the same cached answer 20 times.
  *
  * A candidate GitLab has not finished preparing (no `diff_refs` yet) fails the whole
  * listing rather than being quietly dropped — same all-or-nothing as the other two
@@ -347,19 +353,30 @@ export async function listOpenGitLabMergeRequestsForBase(
 	repo: string,
 	targetBranch: string,
 ): Promise<PullRequestDetails[]> {
-	const query = new URLSearchParams({ state: 'opened', target_branch: targetBranch });
+	const query = new URLSearchParams({
+		state: 'opened',
+		target_branch: targetBranch,
+		with_merge_status_recheck: 'true',
+	});
 	const listed = await paginateGitLab<GitLabMergeRequest>(
 		`${projectPath(repo)}/merge_requests?${query}`,
 	);
 	const sameProject = listed.filter(isSameProjectMergeRequest);
-	return Promise.all(
-		sameProject.map(async (mr) => {
-			if (mr.iid === undefined) {
-				throw new Error(`GitLab merge-request list entry for ${repo} carries no iid`);
-			}
-			return getGitLabMergeRequest(repo, mr.iid);
-		}),
-	);
+	const candidates: PullRequestDetails[] = [];
+	for (let index = 0; index < sameProject.length; index += CONFLICT_CANDIDATE_READ_CONCURRENCY) {
+		const batch = sameProject.slice(index, index + CONFLICT_CANDIDATE_READ_CONCURRENCY);
+		candidates.push(
+			...(await Promise.all(
+				batch.map(async (mr) => {
+					if (mr.iid === undefined) {
+						throw new Error(`GitLab merge-request list entry for ${repo} carries no iid`);
+					}
+					return getGitLabMergeRequest(repo, mr.iid);
+				}),
+			)),
+		);
+	}
+	return candidates;
 }
 
 /** When a commit status last changed, for picking the newest of a re-run pair. */
@@ -379,6 +396,9 @@ function statusChangedAt(status: GitLabCommitStatus): number {
  */
 function toCheckRunState(status: GitLabCommitStatus): CheckRunState {
 	const name = status.name ?? UNNAMED_COMMIT_STATUS;
+	// GitLab's own pipeline result ignores advisory jobs, including manual ones.
+	// Represent them as skipped so an all-advisory pipeline is immediately reviewable.
+	if (status.allow_failure) return { name, status: 'completed', conclusion: 'skipped' };
 	if (status.status === undefined || !isTerminalPipelineStatus(status.status)) {
 		return { name, status: 'in_progress', conclusion: null };
 	}
@@ -393,7 +413,9 @@ function toCheckRunState(status: GitLabCommitStatus): CheckRunState {
  * same reason Bitbucket dedupes by status `key` and GitHub by `workflow_id`: a re-run
  * reports under the same name, and letting its stale failure into the aggregate would
  * make a green commit look failed. An unnamed status can't be identified, so it is
- * counted on its own rather than collapsed with its neighbours.
+ * counted on its own rather than collapsed with its neighbours. A status GitLab marks
+ * `allow_failure` is retained as a completed, skipped run, so it cannot fail or defer
+ * the aggregate while an all-advisory pipeline remains reviewable.
  */
 export async function getGitLabCommitStatuses(
 	repo: string,
