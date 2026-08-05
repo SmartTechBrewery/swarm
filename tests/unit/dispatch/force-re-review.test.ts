@@ -214,18 +214,91 @@ describe('forceReReview (issue #511)', () => {
 			expect(first[0].dedupKey).toBeDefined();
 			expect(second[0].dedupKey).toBe(first[0].dedupKey);
 		});
-		it('reports a completed forced cycle without presenting it as scheduled', async () => {
+
+		it('reports a genuinely completed forced cycle without presenting it as scheduled', async () => {
 			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
 			vi.mocked(createAndPublishDispatch).mockResolvedValue(
-				dispatchResult(false, 'completed', 'no-trigger'),
+				dispatchResult(false, 'completed', 'phase-succeeded'),
 			);
 
 			await expect(forceReReview('run-1')).resolves.toMatchObject({
 				capOverride: 'already-granted',
 				dispatch: 'already-completed',
 				dispatchState: 'completed',
-				dispatchOutcome: 'no-trigger',
+				dispatchOutcome: 'phase-succeeded',
 			});
+		});
+	});
+
+	// A dead dispatch is one whose deterministic dedup key is already spent by a
+	// completion that never actually started Respond-to-review — the gap a stale
+	// worker exposed live (see the module header). These assert the recovery
+	// `publishForcedDispatch` performs instead of reporting the dead row as done.
+	describe('recovering from a dead prior attempt', () => {
+		it.each([
+			['no-trigger', dispatchResult(false, 'completed', 'no-trigger')],
+			['skipped-not-eligible', dispatchResult(false, 'completed', 'skipped-not-eligible')],
+			['skipped-duplicate', dispatchResult(false, 'completed', 'skipped-duplicate')],
+			['superseded', dispatchResult(false, 'completed', 'superseded')],
+			['failed', dispatchResult(false, 'failed', null)],
+			['cancelled', dispatchResult(false, 'cancelled', null)],
+		])('chains a fresh dispatch past a dead %s prior attempt', async (_outcome, deadResult) => {
+			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+			const deadDispatch = { ...deadResult.dispatch, id: 'dispatch-dead' };
+			vi.mocked(createAndPublishDispatch)
+				.mockResolvedValueOnce({ dispatch: deadDispatch, created: false } as CreateDispatchResult)
+				.mockResolvedValueOnce(dispatchResult(true, 'pending', null));
+
+			const result = await forceReReview('run-1');
+
+			expect(createAndPublishDispatch).toHaveBeenCalledTimes(2);
+			const [first, second] = vi.mocked(createAndPublishDispatch).mock.calls;
+			expect(second[0].dedupKey).not.toBe(first[0].dedupKey);
+			expect(result).toMatchObject({
+				dispatch: 'retried',
+				dispatchId: 'dispatch-9',
+				previousAttemptOutcome: deadDispatch.outcome,
+			});
+		});
+
+		it('does not chain past a dispatch that is genuinely still active', async () => {
+			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+			vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(false, 'running'));
+
+			const result = await forceReReview('run-1');
+
+			expect(createAndPublishDispatch).toHaveBeenCalledTimes(1);
+			expect(result).toMatchObject({ dispatch: 'already-scheduled' });
+		});
+
+		it('chains again off the newest dead attempt when that one is also dead', async () => {
+			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+			const firstDead = { id: 'dispatch-dead-1', state: 'completed', outcome: 'no-trigger' };
+			const secondDead = { id: 'dispatch-dead-2', state: 'completed', outcome: 'no-trigger' };
+			vi.mocked(createAndPublishDispatch)
+				.mockResolvedValueOnce({ dispatch: firstDead, created: false } as CreateDispatchResult)
+				.mockResolvedValueOnce({ dispatch: secondDead, created: false } as CreateDispatchResult)
+				.mockResolvedValueOnce(dispatchResult(true, 'pending', null));
+
+			const result = await forceReReview('run-1');
+
+			expect(createAndPublishDispatch).toHaveBeenCalledTimes(3);
+			const [first, second, third] = vi.mocked(createAndPublishDispatch).mock.calls;
+			expect(new Set([first[0].dedupKey, second[0].dedupKey, third[0].dedupKey]).size).toBe(3);
+			expect(result).toMatchObject({ dispatch: 'retried', previousAttemptOutcome: 'no-trigger' });
+		});
+
+		it('fails loudly instead of chaining forever when the corrective path stays broken', async () => {
+			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+			vi.mocked(createAndPublishDispatch).mockImplementation(
+				async (input) =>
+					({
+						dispatch: { id: `dead-${input.dedupKey}`, state: 'completed', outcome: 'no-trigger' },
+						created: false,
+					}) as CreateDispatchResult,
+			);
+
+			await expect(forceReReview('run-1')).rejects.toThrow(/exhausted/i);
 		});
 	});
 
