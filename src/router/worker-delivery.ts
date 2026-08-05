@@ -25,7 +25,7 @@
  * The independent Phase 2/2 half does the same for the two metadata-only **PM**
  * board writes — move a card, comment on the backing Issue/PR — under the
  * **per-project PM credential** the server resolves via
- * `createGitHubProjectsProvider(project)`; the worker sends only the canonical
+ * `requireProjectPMProvider(project)`; the worker sends only the canonical
  * status key / comment body up the transport (`../pm/transport-delivery.ts`).
  * The PM credential is resolved *inside* this process and never leaves it, and
  * the status crossing the wire is a canonical `PmStatusKey`, never a board
@@ -92,7 +92,7 @@ import { resolveWorkerByCredential } from '../identity/worker-service.js';
 // module reads the registry at request time, so it must not rely on a sibling
 // module having loaded the entrypoint first (matching `./webhook-receiver.ts`).
 import '../integrations/entrypoint.js';
-import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
+import { requireProjectPMProvider } from '../integrations/pm/index.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -160,7 +160,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		isWorkerEnrolled: isWorkerEnrolledDefault,
 		buildScmDelivery: (project, persona) =>
 			requireProjectSCMProvider(project).deliveryProvider(project, persona),
-		buildPmProvider: createGitHubProjectsProvider,
+		buildPmProvider: requireProjectPMProvider,
 		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
 	};

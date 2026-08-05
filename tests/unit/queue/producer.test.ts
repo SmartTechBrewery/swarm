@@ -1,10 +1,7 @@
 import type { QueueOptions } from 'bullmq';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SwarmJob } from '@/queue/jobs.js';
-import {
-	createMockGitHubProjectsWebhookJob,
-	createMockScmWebhookJob,
-} from '../../helpers/factories.js';
+import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
 // Mock BullMQ's Queue so nothing touches Redis — capture constructor args and
 // the add()/close() calls the producer makes. Hoisted so the vi.mock factory
@@ -118,15 +115,15 @@ describe('enqueueJob', () => {
 		expect(id).toBe('bull-assigned-id');
 	});
 
-	it('adds a github-projects job named by its type, demoted below the default priority', async () => {
+	it('adds a pm job named by its type, demoted below the default priority', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
-		const job = createMockGitHubProjectsWebhookJob();
+		const job = createMockPmWebhookJob();
 
 		await enqueueJob(job);
 
 		// PM-board jobs (planning/implementation) must not queue ahead of a
 		// review-lifecycle (`scm`) job — see priorityFor's rationale.
-		expect(add).toHaveBeenCalledWith('github-projects', job, {
+		expect(add).toHaveBeenCalledWith('pm', job, {
 			jobId: job.deliveryId,
 			priority: 10,
 		});
@@ -202,7 +199,7 @@ describe('enqueueJob', () => {
 	it('reuses the one queue singleton across enqueues', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
 		await enqueueJob(createMockScmWebhookJob());
-		await enqueueJob(createMockGitHubProjectsWebhookJob());
+		await enqueueJob(createMockPmWebhookJob());
 
 		expect(QueueMock).toHaveBeenCalledOnce();
 		expect(add).toHaveBeenCalledTimes(2);
@@ -240,13 +237,13 @@ describe('enqueueDispatchWakeUp', () => {
 		expect(opts).toEqual({ jobId: 'dispatch_abc_w0' });
 	});
 
-	it('demotes a github-projects wake-up below the default priority', async () => {
+	it('demotes a pm wake-up below the default priority', async () => {
 		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
-		const job = createMockGitHubProjectsWebhookJob();
+		const job = createMockPmWebhookJob();
 
 		await enqueueDispatchWakeUp(job, 'dispatch_board_w0', 0);
 
-		expect(add).toHaveBeenCalledWith('github-projects', job, {
+		expect(add).toHaveBeenCalledWith('pm', job, {
 			jobId: 'dispatch_board_w0',
 			priority: 10,
 		});

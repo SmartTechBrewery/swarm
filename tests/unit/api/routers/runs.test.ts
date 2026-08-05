@@ -62,7 +62,7 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 }));
 
 vi.mock('@/queue/producer.js', () => ({
-	priorityFor: (job: { type: string }) => (job.type === 'github-projects' ? 10 : undefined),
+	priorityFor: (job: { type: string }) => (job.type === 'pm' ? 10 : undefined),
 	removePendingJobById: vi.fn().mockResolvedValue(true),
 }));
 
@@ -79,7 +79,7 @@ vi.mock('@/queue/queued-runs.js', () => {
 		'unknown',
 	]);
 	const deriveQueuedPhaseHint = vi.fn((job) => {
-		if (job.type === 'github-projects') return 'board';
+		if (job.type === 'pm') return 'board';
 		const { event } = job;
 		if (event.kind === 'pull-request-review') {
 			return event.reviewState === 'approved' ? 'review' : 'respond-to-review';
@@ -93,7 +93,7 @@ vi.mock('@/queue/queued-runs.js', () => {
 		toQueuedRuns: vi.fn(),
 		deriveQueuedPhaseHint,
 		// Mirrors the real helper: a resolved `dispatch.phase` wins, else the
-		// event-derived hint (always `board` for a github-projects job).
+		// event-derived hint (always `board` for a pm job).
 		deriveDispatchPhaseHint: vi.fn((dispatch) =>
 			typeof dispatch.phase === 'string' && PHASE_HINTS.has(dispatch.phase)
 				? dispatch.phase
@@ -153,8 +153,8 @@ import type { SwarmJob } from '@/queue/jobs.js';
 import { toQueuedRuns } from '@/queue/queued-runs.js';
 import { reconcileTerminatedWorktree } from '@/worktree/termination-cleanup.js';
 import {
-	createMockGitHubProjectsParsedEvent,
-	createMockGitHubProjectsWebhookJob,
+	createMockPmEvent,
+	createMockPmWebhookJob,
 	createMockProjectConfig,
 	createMockWorkItem,
 } from '../../../helpers/factories.js';
@@ -393,7 +393,7 @@ describe('runsRouter', () => {
 			const queuedItem = {
 				jobId: 'dispatch-board',
 				projectId: 'p1',
-				type: 'github-projects' as const,
+				type: 'pm' as const,
 				state: 'prioritized' as const,
 				phaseHint: 'board' as const,
 				workItemNodeId: 'PVTI_item',
@@ -443,7 +443,7 @@ describe('runsRouter', () => {
 			const queuedItem = {
 				jobId: 'dispatch-board-missing',
 				projectId: 'missing-project',
-				type: 'github-projects' as const,
+				type: 'pm' as const,
 				state: 'prioritized' as const,
 				phaseHint: 'board' as const,
 				workItemNodeId: 'PVTI_missing',
@@ -805,7 +805,7 @@ describe('runsRouter', () => {
 		});
 
 		it('marks a failed PM retry for dispatch without inventing a branch checkpoint', async () => {
-			const mockPayload = createMockGitHubProjectsWebhookJob();
+			const mockPayload = createMockPmWebhookJob();
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
 				makeRun({ id: 'run-1', status: 'failed', jobPayload: mockPayload }),
 			);
@@ -1222,24 +1222,25 @@ describe('runsRouter', () => {
 
 	describe('putBack', () => {
 		// A fresh (unclaimed) board dispatch for a specific card.
-		const boardJobForCard = (itemNodeId: string) =>
-			createMockGitHubProjectsWebhookJob({
+		const boardJobForCard = (itemId: string) =>
+			createMockPmWebhookJob({
 				projectId: 'p1',
-				event: createMockGitHubProjectsParsedEvent({ itemNodeId }),
+				event: createMockPmEvent({ itemId }),
 			});
 
-		it('cancels a waiting github-projects dispatch and moves its card to backlog', async () => {
+		it('cancels a waiting pm dispatch and moves its card to backlog', async () => {
 			const project = createMockProjectConfig({ id: 'p1' });
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 
-			const jobData = createMockGitHubProjectsWebhookJob({ projectId: 'p1' });
+			const jobData = createMockPmWebhookJob({ projectId: 'p1' });
 			const dispatch = makeDispatch({ state: 'pending', jobPayload: jobData, runId: null });
 			vi.mocked(getDispatchById).mockResolvedValue(dispatch);
 			vi.mocked(cancelDispatchAndWake).mockResolvedValue(dispatch);
 
 			const getWorkItem = vi.fn().mockResolvedValue({
-				id: jobData.event.itemNodeId,
+				id: jobData.event.itemId,
 				statusId: '61e4505c', // Planning status (starts planning phase)
+				statusKey: 'planning',
 				title: 'Test Card',
 				url: 'https://github.com/acme/widgets/issues/1',
 			});
@@ -1253,8 +1254,8 @@ describe('runsRouter', () => {
 			expect(result).toEqual({ success: true });
 			expect(getDispatchById).toHaveBeenCalledWith('dispatch-1');
 			expect(cancelDispatchAndWake).toHaveBeenCalledWith('dispatch-1', expect.any(String));
-			expect(getWorkItem).toHaveBeenCalledWith(jobData.event.itemNodeId);
-			expect(moveWorkItem).toHaveBeenCalledWith(jobData.event.itemNodeId, 'backlog');
+			expect(getWorkItem).toHaveBeenCalledWith(jobData.event.itemId);
+			expect(moveWorkItem).toHaveBeenCalledWith(jobData.event.itemId, 'backlog');
 		});
 
 		it('cancels an scm dispatch and moves the card found by its url', async () => {
@@ -1378,18 +1379,19 @@ describe('runsRouter', () => {
 			expect(cancelDispatchAndWake).not.toHaveBeenCalled();
 		});
 
-		it('throws PRECONDITION_FAILED when the github-projects job status does not start planning or implementation', async () => {
+		it('throws PRECONDITION_FAILED when the pm job status does not start planning or implementation', async () => {
 			const project = createMockProjectConfig({ id: 'p1' });
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 
-			const jobData = createMockGitHubProjectsWebhookJob({ projectId: 'p1' });
+			const jobData = createMockPmWebhookJob({ projectId: 'p1' });
 			vi.mocked(getDispatchById).mockResolvedValue(
 				makeDispatch({ state: 'pending', jobPayload: jobData }),
 			);
 
 			const getWorkItem = vi.fn().mockResolvedValue({
-				id: jobData.event.itemNodeId,
+				id: jobData.event.itemId,
 				statusId: 'df73e18b', // In Review status (does not start planning or implementation)
+				statusKey: 'inReview',
 				title: 'Test Card',
 				url: 'https://github.com/acme/widgets/issues/1',
 			});
@@ -1405,15 +1407,16 @@ describe('runsRouter', () => {
 		it('surfaces a claimed-in-the-meantime dispatch instead of moving the card', async () => {
 			const project = createMockProjectConfig({ id: 'p1' });
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
-			const jobData = createMockGitHubProjectsWebhookJob({ projectId: 'p1' });
+			const jobData = createMockPmWebhookJob({ projectId: 'p1' });
 			vi.mocked(getDispatchById).mockResolvedValue(
 				makeDispatch({ state: 'pending', jobPayload: jobData }),
 			);
 			vi.mocked(cancelDispatchAndWake).mockResolvedValue(null);
 
 			const getWorkItem = vi.fn().mockResolvedValue({
-				id: jobData.event.itemNodeId,
+				id: jobData.event.itemId,
 				statusId: '61e4505c',
+				statusKey: 'planning',
 				title: 'Test Card',
 				url: 'https://github.com/acme/widgets/issues/1',
 			});
@@ -1487,6 +1490,7 @@ describe('runsRouter', () => {
 			const getWorkItem = vi.fn().mockResolvedValue({
 				id: CARD,
 				statusId: '61e4505c', // Planning status
+				statusKey: 'planning',
 				title: 'X',
 				url: 'https://github.com/acme/widgets/issues/1',
 			});
@@ -1506,6 +1510,68 @@ describe('runsRouter', () => {
 			expect(cancelledIds).not.toContain('owns-run');
 			expect(cancelledIds).not.toContain('resolved-planning');
 			expect(moveWorkItem).toHaveBeenCalledWith(CARD, 'backlog');
+		});
+
+		it('cancels a legacy duplicate for the same card, but not a different legacy card', async () => {
+			const project = createMockProjectConfig({ id: 'p1' });
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+
+			const CARD = 'PVTI_legacy_card';
+			const legacyBoardJobForCard = (itemNodeId: string) =>
+				({
+					type: 'github-projects',
+					projectId: 'p1',
+					event: {
+						eventType: 'projects_v2_item',
+						action: 'edited',
+						itemNodeId,
+						projectNodeId: 'PVT_board',
+					},
+				}) as never;
+			const primary = makeDispatch({
+				id: 'dispatch-1',
+				state: 'pending',
+				phase: 'board',
+				runId: null,
+				jobPayload: boardJobForCard(CARD),
+			});
+			vi.mocked(getDispatchById).mockResolvedValue(primary);
+			vi.mocked(cancelDispatchAndWake).mockResolvedValue(primary);
+			vi.mocked(listWaitingDispatches).mockResolvedValue([
+				primary,
+				makeDispatch({
+					id: 'legacy-same-card',
+					phase: 'board',
+					runId: null,
+					jobPayload: legacyBoardJobForCard(CARD),
+				}),
+				makeDispatch({
+					id: 'legacy-other-card',
+					phase: 'board',
+					runId: null,
+					jobPayload: legacyBoardJobForCard('PVTI_other_legacy_card'),
+				}),
+			]);
+
+			const getWorkItem = vi.fn().mockResolvedValue({
+				id: CARD,
+				statusId: '61e4505c',
+				statusKey: 'planning',
+				title: 'Legacy Card',
+				url: 'https://github.com/acme/widgets/issues/1',
+			});
+			const moveWorkItem = vi.fn().mockResolvedValue(undefined);
+			vi.mocked(getPMProvider).mockReturnValue({
+				createProvider: () => ({ getWorkItem, moveWorkItem }),
+			} as never);
+
+			await expect(caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' })).resolves.toEqual({
+				success: true,
+			});
+
+			const cancelledIds = vi.mocked(cancelDispatchAndWake).mock.calls.map((call) => call[0]);
+			expect(cancelledIds).toContain('legacy-same-card');
+			expect(cancelledIds).not.toContain('legacy-other-card');
 		});
 
 		it('still moves the card to backlog when cancelling a duplicate fails (best-effort)', async () => {
@@ -1538,6 +1604,7 @@ describe('runsRouter', () => {
 			const getWorkItem = vi.fn().mockResolvedValue({
 				id: CARD,
 				statusId: '61e4505c',
+				statusKey: 'planning',
 				title: 'Y',
 				url: 'https://github.com/acme/widgets/issues/2',
 			});

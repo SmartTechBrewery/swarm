@@ -30,17 +30,17 @@ import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/ru
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { getWorker } from '../../identity/worker-service.js';
-import { resolvePipelinePhaseForOptionId } from '../../integrations/pm/github-projects/status-mapping.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
+import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import {
 	type CancellationOrigin,
 	clearRunCancellation,
 	RUN_CANCELLED_MESSAGE,
 	requestRunCancellation,
 } from '../../queue/cancellation.js';
-import { type SwarmJob, SwarmJobSchema } from '../../queue/jobs.js';
+import { normalizeStoredJobPayload, type SwarmJob, SwarmJobSchema } from '../../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../../queue/producer.js';
 import {
 	deriveDispatchPhaseHint,
@@ -62,7 +62,7 @@ const queuedWorkItemCache = new Map<
 >();
 
 function queuedWorkItemCacheKey(item: QueuedRun): string | null {
-	if (item.type === 'github-projects' && item.workItemNodeId) {
+	if (item.type === 'pm' && item.workItemNodeId) {
 		return `${item.projectId}:${item.workItemNodeId}`;
 	}
 	if (item.type === 'scm' && item.prNumber) {
@@ -95,9 +95,11 @@ async function resolveQueuedWorkItemDetails(
 	if (!manifest) return null;
 
 	const workItem = await manifest.createProvider(project).getWorkItem(workItemNodeId);
+	// The provider already resolved its opaque native status into the canonical
+	// pipeline key on the way out of the board read (ai/RULES.md §2).
 	let isSupported = false;
-	if (workItem.statusId) {
-		const targetPhase = resolvePipelinePhaseForOptionId(project.githubProjects, workItem.statusId);
+	if (workItem.statusKey) {
+		const targetPhase = resolvePipelinePhaseForStatusKey(workItem.statusKey);
 		if (targetPhase === 'planning' || targetPhase === 'implementation') {
 			isSupported = true;
 		}
@@ -125,7 +127,7 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 			nodeId?: string;
 			phaseHint?: QueuedPhaseHint;
 		} | null = null;
-		if (item.type === 'github-projects' && item.workItemNodeId) {
+		if (item.type === 'pm' && item.workItemNodeId) {
 			const resolved = await resolveQueuedWorkItemDetails(item, item.workItemNodeId);
 			if (resolved) {
 				details = {
@@ -252,14 +254,16 @@ async function cancelDuplicateBoardDispatches(
 	keepDispatchId: string,
 ): Promise<void> {
 	const siblings = await listWaitingDispatches(projectId);
-	const duplicates = siblings.filter(
-		(sibling) =>
+	const duplicates = siblings.filter((sibling) => {
+		const payload = normalizeStoredJobPayload(sibling.jobPayload);
+		return (
 			sibling.id !== keepDispatchId &&
 			!sibling.runId &&
-			sibling.jobPayload.type === 'github-projects' &&
-			sibling.jobPayload.event.itemNodeId === workItemNodeId &&
-			deriveDispatchPhaseHint(sibling) === 'board',
-	);
+			payload.type === 'pm' &&
+			payload.event.itemId === workItemNodeId &&
+			deriveDispatchPhaseHint(sibling) === 'board'
+		);
+	});
 	for (const duplicate of duplicates) {
 		await cancelDispatchAndWake(
 			duplicate.id,
@@ -838,8 +842,8 @@ export const runsRouter = router({
 			}
 			const pm = pmManifest.createProvider(project);
 
-			if (jobData.type === 'github-projects') {
-				workItemNodeId = jobData.event.itemNodeId;
+			if (jobData.type === 'pm') {
+				workItemNodeId = jobData.event.itemId;
 				const workItem = await pm.getWorkItem(workItemNodeId);
 				if (!workItem.statusId) {
 					throw new TRPCError({
@@ -847,10 +851,12 @@ export const runsRouter = router({
 						message: `Work item has no status ID.`,
 					});
 				}
-				const targetPhase = resolvePipelinePhaseForOptionId(
-					project.githubProjects,
-					workItem.statusId,
-				);
+				// The provider resolved its native status into the canonical pipeline key
+				// on the way out of the board read (ai/RULES.md §2); an unmapped status
+				// carries none and simply starts no phase.
+				const targetPhase = workItem.statusKey
+					? resolvePipelinePhaseForStatusKey(workItem.statusKey)
+					: undefined;
 				if (!targetPhase) {
 					throw new TRPCError({
 						code: 'PRECONDITION_FAILED',
@@ -896,7 +902,7 @@ export const runsRouter = router({
 
 			// Putting a board item back must silence its duplicate dispatches too
 			// (issue #366), before the single card move below.
-			if (jobData.type === 'github-projects') {
+			if (jobData.type === 'pm') {
 				await cancelDuplicateBoardDispatches(project.id, workItemNodeId, dispatch.id);
 			}
 

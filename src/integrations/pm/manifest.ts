@@ -31,17 +31,17 @@
  *   deferred: the board-mapping screen (issue #201) is a real consumer, so the
  *   manifest declares each provider's `discovery` capabilities below.
  *
- * `routerAdapter` is typed to the concrete `GitHubProjectsRouterAdapter` because
- * there's one provider: a shared `PMRouterAdapter` interface would be
- * speculative today (ai/TESTING.md "don't build it speculatively"). It gets
- * extracted the moment a second PM provider lands — the same point a `pm/index.ts`
- * barrel and the conformance harness arrive.
+ * `routerAdapter` is typed to the provider-neutral `PMRouterAdapter` interface
+ * (`src/pm/router-adapter.ts`), extracted from the concrete
+ * `GitHubProjectsRouterAdapter` by issue #297 along with the `PmEvent` its methods
+ * speak and the `src/integrations/pm/index.ts` barrel this module is re-exported
+ * through. The conformance harness is still deferred (a later phase of #297).
  */
 
 import type { z } from 'zod';
 import type { ProjectConfig } from '../../config/schema.js';
+import type { PMRouterAdapter } from '../../pm/router-adapter.js';
 import type { PMDiscoveryCapability, PMProvider, PMType } from '../../pm/types.js';
-import type { GitHubProjectsRouterAdapter } from '../../router/adapters/github-projects.js';
 
 export interface PMProviderManifest {
 	/** Stable registry key / provider discriminator, e.g. `github-projects`. */
@@ -64,11 +64,11 @@ export interface PMProviderManifest {
 
 	/**
 	 * The provider's router-side webhook adapter (parse → resolve project → filter
-	 * → loop-prevention). Held as a shared instance because the adapter is
-	 * stateless (see `GitHubProjectsRouterAdapter`), so the receiver reuses one
+	 * → loop-prevention → synthesize). Held as a shared instance because an adapter
+	 * is stateless (see `GitHubProjectsRouterAdapter`), so the receiver reuses one
 	 * rather than constructing it per request.
 	 */
-	readonly routerAdapter: GitHubProjectsRouterAdapter;
+	readonly routerAdapter: PMRouterAdapter;
 
 	/**
 	 * The discovery capabilities this provider answers through

@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { QUEUE_NAME, SwarmJobSchema } from '@/queue/jobs.js';
-import {
-	createMockGitHubProjectsWebhookJob,
-	createMockScmWebhookJob,
-} from '../../helpers/factories.js';
+import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
 // Jobs cross the router→Redis→worker boundary as JSON, so every case parses a
 // JSON round-trip of the fixture — what the consumer actually receives.
@@ -17,8 +14,8 @@ describe('SwarmJobSchema', () => {
 		expect(SwarmJobSchema.parse(roundTrip(job))).toEqual(job);
 	});
 
-	it('parses a github-projects webhook job', () => {
-		const job = createMockGitHubProjectsWebhookJob();
+	it('parses a pm webhook job', () => {
+		const job = createMockPmWebhookJob();
 		expect(SwarmJobSchema.parse(roundTrip(job))).toEqual(job);
 	});
 
@@ -81,10 +78,10 @@ describe('SwarmJobSchema', () => {
 		expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
 	});
 
-	it('rejects an scm job carrying a projects_v2_item event', () => {
+	it('rejects an scm job carrying a PM board event', () => {
 		const job = {
 			...createMockScmWebhookJob(),
-			event: createMockGitHubProjectsWebhookJob().event,
+			event: createMockPmWebhookJob().event,
 		};
 		expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
 	});
@@ -170,13 +167,94 @@ describe('SwarmJobSchema', () => {
 			});
 		});
 
-		it('leaves a `github-projects` board row untouched — the PM envelope did not change', () => {
-			const job = createMockGitHubProjectsWebhookJob();
+		it('rejects a legacy row whose event name was never processable', () => {
+			expect(() => SwarmJobSchema.parse(roundTrip(legacyJob({ eventType: 'push' })))).toThrow();
+		});
+	});
+
+	// The PM side got the same treatment in issue #297: `type` *was* the provider id
+	// (`github-projects`) and the event *was* GitHub's own webhook vocabulary. Live
+	// dispatch rows and `runs.jobPayload` snapshots written before that deploy must
+	// still parse — this is the acceptance criterion for the migration.
+	describe('legacy durable envelope (pre-#297, PM)', () => {
+		/** A dispatch row as the router wrote a board event before the PM migration. */
+		const LEGACY_BOARD_ROW = {
+			type: 'github-projects',
+			projectId: 'swarm',
+			deliveryId: 'delivery-uuid-2',
+			event: {
+				eventType: 'projects_v2_item',
+				action: 'edited',
+				itemNodeId: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
+				projectNodeId: 'PVT_kwHOAC3TF84BcNwD',
+				contentNodeId: 'I_kwDONODE',
+				contentType: 'Issue',
+				changedFieldNodeId: 'PVTSSF_lAHOAC3TF84BcNwDzhW4MKo',
+				changedFieldType: 'single_select',
+				actorLogin: 'human-dev',
+			},
+		};
+
+		it('upgrades the envelope and every event field to the neutral encoding', () => {
+			expect(SwarmJobSchema.parse(roundTrip(LEGACY_BOARD_ROW))).toEqual({
+				type: 'pm',
+				providerId: 'github-projects',
+				projectId: 'swarm',
+				deliveryId: 'delivery-uuid-2',
+				event: {
+					action: 'updated',
+					itemId: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
+					containerId: 'PVT_kwHOAC3TF84BcNwD',
+					contentId: 'I_kwDONODE',
+					contentType: 'Issue',
+					changedField: 'PVTSSF_lAHOAC3TF84BcNwDzhW4MKo',
+					changedFieldType: 'single_select',
+					actorHandle: 'human-dev',
+				},
+			});
+		});
+
+		it.each([
+			['edited', 'updated'],
+			['reordered', 'moved'],
+			['created', 'created'],
+			['deleted', 'deleted'],
+			// Outside the neutral vocabulary — rides through verbatim and matches no
+			// trigger, exactly as before.
+			['archived', 'archived'],
+		])('remaps the legacy %s action to %s', (legacy, neutral) => {
+			const parsed = SwarmJobSchema.parse(
+				roundTrip({ ...LEGACY_BOARD_ROW, event: { ...LEGACY_BOARD_ROW.event, action: legacy } }),
+			);
+			expect(parsed).toMatchObject({ type: 'pm', event: { action: neutral } });
+		});
+
+		it('preserves the retry/recheck counters a waiting legacy board row was deferred with', () => {
+			const parsed = SwarmJobSchema.parse(
+				roundTrip({
+					...LEGACY_BOARD_ROW,
+					resumePmPhase: 'implementation',
+					rateLimitRetryAttempt: 2,
+					runId: 'run-1',
+				}),
+			);
+			expect(parsed).toMatchObject({
+				type: 'pm',
+				providerId: 'github-projects',
+				resumePmPhase: 'implementation',
+				rateLimitRetryAttempt: 2,
+				runId: 'run-1',
+			});
+		});
+
+		it('leaves an already-neutral board event untouched', () => {
+			const job = createMockPmWebhookJob();
 			expect(SwarmJobSchema.parse(roundTrip(job))).toEqual(job);
 		});
 
-		it('rejects a legacy row whose event name was never processable', () => {
-			expect(() => SwarmJobSchema.parse(roundTrip(legacyJob({ eventType: 'push' })))).toThrow();
+		it('rejects a pm job whose providerId is not a known provider', () => {
+			const job = { ...createMockPmWebhookJob(), providerId: 'asana' };
+			expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
 		});
 	});
 

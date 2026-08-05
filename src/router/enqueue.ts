@@ -22,9 +22,10 @@ import type { ProjectConfig } from '../config/schema.js';
 import { createAndPublishDispatch, deliveryDedupKey } from '../dispatch/dispatcher.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import type { PmEvent } from '../pm/events.js';
+import type { PMType } from '../pm/types.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import { enqueueJob, priorityFor } from '../queue/producer.js';
-import type { GitHubProjectsParsedEvent } from '../router/adapters/github-projects.js';
 import type { ScmEvent } from '../scm/events.js';
 import type { ScmType } from '../scm/types.js';
 
@@ -86,30 +87,33 @@ export async function enqueueScmEvent(
 }
 
 /**
- * Hand a verified, project-matched, non-self-authored `projects_v2_item` status
- * change off to the dispatch layer — the PM-side counterpart of
- * {@link enqueueScmEvent}. The worker re-reads the authoritative item state
+ * Hand a verified, project-matched, non-self-authored PM board state change off to
+ * the dispatch layer — the PM-side counterpart of {@link enqueueScmEvent}.
+ * `providerId` records which registered provider owns the event so the worker can
+ * resolve the same one back. The worker re-reads the authoritative item state
  * itself (`src/worker/consumer.ts` re-reads config from Postgres and dispatches
- * against the parsed event), so this stays symmetric with the SCM path.
+ * against the normalized event), so this stays symmetric with the SCM path.
  */
-export async function enqueueProjectsEvent(
-	event: GitHubProjectsParsedEvent,
+export async function enqueuePmEvent(
+	providerId: PMType,
+	event: PmEvent,
 	project: ProjectConfig,
 	deliveryId: string | undefined,
 ): Promise<void> {
 	await dispatchWebhookJob({
-		type: 'github-projects',
+		type: 'pm',
+		providerId,
 		projectId: project.id,
 		deliveryId,
 		event,
 	});
-	logger.debug('Projects webhook event dispatched', {
+	logger.debug('PM board event dispatched', {
+		providerId,
 		projectId: project.id,
-		projectNodeId: event.projectNodeId,
-		eventType: event.eventType,
+		containerId: event.containerId,
 		action: event.action,
-		itemNodeId: event.itemNodeId,
-		changedFieldNodeId: event.changedFieldNodeId,
+		itemId: event.itemId,
+		changedField: event.changedField,
 		deliveryId,
 	});
 }

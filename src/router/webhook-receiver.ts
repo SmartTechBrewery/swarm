@@ -17,11 +17,17 @@
  * (`src/scm/types.ts`), resolved from `scmProviderRegistry`. Adding Bitbucket or
  * GitLab therefore adds a manifest, not a branch here.
  *
- * The one deliberate exception is the GitHub Projects board event: GitHub delivers
+ * The one deliberate exception is the PM board event: GitHub delivers
  * `projects_v2_item` to the *same* URL with the same secret
  * (docs/github-projects-v2-api.md §5), so an SCM route also carries SWARM's
- * `pm:status-changed` ingress and routes it through the PM adapter. That branch is
- * PM-side and stays as it was.
+ * `pm:status-changed` ingress and routes it through the PM adapter. Since issue
+ * #297 that branch names no PM provider's vocabulary either — parsing, project
+ * resolution, the state-change filter, and loop prevention all live behind
+ * `PMRouterAdapter` (`src/pm/router-adapter.ts`) and the enqueued job carries a PM
+ * `providerId` plus a normalized `PmEvent`. What it *does* still name is the raw
+ * event name it branches on and the single PM provider it resolves
+ * ({@link PM_PROVIDER_ON_SCM_ROUTE}); replacing those with per-manifest route
+ * mounting is a later phase of #297.
  *
  * The app is built by a factory taking its collaborators as parameters so tests
  * can drive it via `app.request()` with fakes, without a live server, DB, or real
@@ -40,18 +46,20 @@ import type { ProjectConfig } from '../config/schema.js';
 // Side-effect import: registers every PM and SCM provider manifest into its
 // registry before defaultDeps() reads them below.
 import '../integrations/entrypoint.js';
-import { getPMProvider } from '../integrations/pm/registry.js';
+import { getPMProvider } from '../integrations/pm/index.js';
 import {
 	isRuntimeReadySCMProvider,
 	type SCMProviderManifest,
 } from '../integrations/scm/manifest.js';
 import { listSCMProviders } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
+import type { PmEvent } from '../pm/events.js';
+import type { PMRouterAdapter } from '../pm/router-adapter.js';
+import type { PMType } from '../pm/types.js';
 import type { ScmEvent } from '../scm/events.js';
 import type { ScmType, ScmWebhookRequest } from '../scm/types.js';
-import type { GitHubProjectsRouterAdapter } from './adapters/github-projects.js';
 import { PROJECTS_V2_ITEM_EVENT } from './adapters/github-projects.js';
-import { enqueueProjectsEvent, enqueueScmEvent } from './enqueue.js';
+import { enqueuePmEvent, enqueueScmEvent } from './enqueue.js';
 
 /**
  * Upper bound on the webhook body we'll buffer. GitHub never sends deliveries
@@ -68,10 +76,10 @@ const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export interface WebhookReceiverDeps {
 	/** Runtime-ready registered SCM providers whose `webhookRoute`s this app serves. */
 	scmProviders: readonly SCMProviderManifest[];
-	pmAdapter: GitHubProjectsRouterAdapter;
+	pmAdapter: PMRouterAdapter;
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;
-	/** Resolve the SWARM project owning a Projects v2 board, by its node ID. */
-	findProjectByBoard: (projectNodeId: string) => Promise<ProjectConfig | undefined>;
+	/** Resolve the SWARM project owning a PM board, by the provider's container id. */
+	findProjectByBoard: (containerId: string) => Promise<ProjectConfig | undefined>;
 	getWebhookSecret: (project: ProjectConfig) => Promise<string | null>;
 	enqueue: (
 		providerId: ScmType,
@@ -79,25 +87,35 @@ export interface WebhookReceiverDeps {
 		project: ProjectConfig,
 		deliveryId: string | undefined,
 	) => Promise<void>;
-	enqueueProjects: (
-		event: import('./adapters/github-projects.js').GitHubProjectsParsedEvent,
+	enqueuePm: (
+		providerId: PMType,
+		event: PmEvent,
 		project: ProjectConfig,
 		deliveryId: string | undefined,
 	) => Promise<void>;
 }
 
 /**
- * Resolve the GitHub Projects router adapter from the manifest registry rather
- * than constructing it here, so the receiver never hardcodes a concrete PM
- * provider (ai/CODING_STANDARDS.md "Module shape for a provider"). The
- * entrypoint import above guarantees registration ran; a missing manifest means
- * the entrypoint failed to load, which is a wiring bug, not a runtime condition.
+ * The PM provider whose board events arrive on an SCM route. Still named here
+ * (rather than mounted per manifest) because GitHub delivers `projects_v2_item` to
+ * the *same* URL with the same secret as its SCM events — untangling that into a
+ * per-manifest `webhookRoute` is a later phase of issue #297, and doing it here
+ * would have to answer the shared-`/github/webhook`-path question at the same time.
  */
-function resolvePmAdapter(): GitHubProjectsRouterAdapter {
-	const manifest = getPMProvider('github-projects');
+const PM_PROVIDER_ON_SCM_ROUTE: PMType = 'github-projects';
+
+/**
+ * Resolve the PM router adapter from the manifest registry rather than
+ * constructing it here, so the receiver never hardcodes a concrete PM provider
+ * (ai/CODING_STANDARDS.md "Module shape for a provider"). The entrypoint import
+ * above guarantees registration ran; a missing manifest means the entrypoint
+ * failed to load, which is a wiring bug, not a runtime condition.
+ */
+function resolvePmAdapter(id: PMType): PMRouterAdapter {
+	const manifest = getPMProvider(id);
 	if (!manifest) {
 		throw new Error(
-			"PM provider 'github-projects' is not registered — did src/integrations/entrypoint.ts fail to load?",
+			`PM provider '${id}' is not registered — did src/integrations/entrypoint.ts fail to load?`,
 		);
 	}
 	return manifest.routerAdapter;
@@ -106,12 +124,12 @@ function resolvePmAdapter(): GitHubProjectsRouterAdapter {
 function defaultDeps(): WebhookReceiverDeps {
 	return {
 		scmProviders: listSCMProviders(),
-		pmAdapter: resolvePmAdapter(),
+		pmAdapter: resolvePmAdapter(PM_PROVIDER_ON_SCM_ROUTE),
 		findProject: findProjectByRepo,
 		findProjectByBoard,
 		getWebhookSecret: getWebhookSecretOrNull,
 		enqueue: enqueueScmEvent,
-		enqueueProjects: enqueueProjectsEvent,
+		enqueuePm: enqueuePmEvent,
 	};
 }
 
@@ -237,12 +255,12 @@ async function handleScmEvent(
 }
 
 /**
- * Handle the `projects_v2_item` board event — SWARM's `pm:status-changed`
- * ingress. Unlike the SCM path it resolves the project by board node ID (a
- * Projects event carries no repo) and filters to Status-field edits before
- * enqueueing.
+ * Handle the PM board event — SWARM's `pm:status-changed` ingress. Unlike the SCM
+ * path it resolves the project by the board's container id (a board event carries
+ * no repo) and filters to state-field changes before enqueueing. Every
+ * provider-specific step is behind `PMRouterAdapter` (`src/pm/router-adapter.ts`).
  */
-async function handleProjectsEvent(
+async function handlePmEvent(
 	c: Context,
 	deps: WebhookReceiverDeps,
 	manifest: SCMProviderManifest,
@@ -252,14 +270,11 @@ async function handleProjectsEvent(
 ): Promise<Response> {
 	const event = deps.pmAdapter.parseWebhook(request.eventName, payload);
 	if (!event) {
-		return c.json(
-			{ ok: true, ignored: true, reason: 'unactionable projects_v2_item payload' },
-			202,
-		);
+		return c.json({ ok: true, ignored: true, reason: 'unactionable board payload' }, 202);
 	}
 
 	// Untracked board → not ours. Ack without work (and before touching secrets).
-	const project = await deps.findProjectByBoard(event.projectNodeId);
+	const project = await deps.findProjectByBoard(event.containerId);
 	if (!project) {
 		return c.json({ ok: true, ignored: true, reason: 'board not tracked by any project' }, 202);
 	}
@@ -271,7 +286,7 @@ async function handleProjectsEvent(
 		project,
 		rawBody,
 		request.signature,
-		{ projectNodeId: event.projectNodeId, eventType: event.eventType, action: event.action },
+		{ containerId: event.containerId, pmProviderId: deps.pmAdapter.type, action: event.action },
 	);
 	if (authFailure) return authFailure;
 
@@ -290,7 +305,7 @@ async function handleProjectsEvent(
 		);
 	}
 
-	await deps.enqueueProjects(event, project, request.deliveryId);
+	await deps.enqueuePm(deps.pmAdapter.type, event, project, request.deliveryId);
 	return c.json({ ok: true, accepted: true }, 202);
 }
 
@@ -335,11 +350,11 @@ export function createWebhookApp(overrides: Partial<WebhookReceiverDeps> = {}): 
 			// delivery id, and carries the signature.
 			const request = manifest.provider.readWebhookRequest((name) => c.req.header(name));
 
-			// A Projects board event carries no repo, so it routes through the PM
-			// adapter (which resolves by board node ID); everything else is a
-			// repo-scoped SCM event.
+			// A board event carries no repo, so it routes through the PM adapter
+			// (which resolves by container id); everything else is a repo-scoped SCM
+			// event.
 			if (request.eventName === PROJECTS_V2_ITEM_EVENT) {
-				return handleProjectsEvent(c, deps, manifest, rawBody, payload, request);
+				return handlePmEvent(c, deps, manifest, rawBody, payload, request);
 			}
 			return handleScmEvent(c, deps, manifest, rawBody, payload, request);
 		});

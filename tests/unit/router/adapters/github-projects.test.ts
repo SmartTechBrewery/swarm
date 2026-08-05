@@ -45,25 +45,39 @@ describe('GitHubProjectsRouterAdapter', () => {
 			expect(adapter.parseWebhook('pull_request', createMockProjectsV2ItemPayload())).toBeNull();
 		});
 
-		it('parses a Status-field edit', () => {
+		it('normalizes a Status-field edit into the provider-neutral event', () => {
 			const parsed = adapter.parseWebhook('projects_v2_item', createMockProjectsV2ItemPayload());
 			expect(parsed).toEqual({
-				eventType: 'projects_v2_item',
-				action: 'edited',
-				itemNodeId: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
-				projectNodeId: 'PVT_kwHOAC3TF84BcNwD',
-				contentNodeId: 'I_kwDONODE',
+				action: 'updated',
+				itemId: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
+				containerId: 'PVT_kwHOAC3TF84BcNwD',
+				contentId: 'I_kwDONODE',
 				contentType: 'Issue',
-				changedFieldNodeId: STATUS_FIELD_ID,
+				changedField: STATUS_FIELD_ID,
 				changedFieldType: 'single_select',
-				actorLogin: 'human-dev',
+				actorHandle: 'human-dev',
 			});
+		});
+
+		it.each([
+			['edited', 'updated'],
+			['reordered', 'moved'],
+			['created', 'created'],
+			['deleted', 'deleted'],
+		])("maps GitHub's %s action to the neutral %s", (action, neutral) => {
+			expect(parse(createMockProjectsV2ItemPayload({ action })).action).toBe(neutral);
+		});
+
+		it('carries an action outside the neutral vocabulary through verbatim', () => {
+			expect(parse(createMockProjectsV2ItemPayload({ action: 'archived' })).action).toBe(
+				'archived',
+			);
 		});
 
 		it('parses a created event (no changes block)', () => {
 			const parsed = parse(createMockProjectsV2ItemPayload({ action: 'created', changes: null }));
 			expect(parsed.action).toBe('created');
-			expect(parsed.changedFieldNodeId).toBeUndefined();
+			expect(parsed.changedField).toBeUndefined();
 		});
 
 		it('returns null when the item node ID is missing', () => {
@@ -107,7 +121,7 @@ describe('GitHubProjectsRouterAdapter', () => {
 			expect(adapter.isStatusChange(event, project)).toBe(true);
 		});
 
-		it('is true for a reordered event (Board-view drag between columns), even though its changes block carries no field_value', () => {
+		it('is true for a reordered/moved event (Board-view drag between columns), even though its changes block carries no field_value', () => {
 			const event = parse(
 				createMockProjectsV2ItemPayload({
 					action: 'reordered',
@@ -165,6 +179,20 @@ describe('GitHubProjectsRouterAdapter', () => {
 			vi.mocked(resolvePersonaIdentities).mockRejectedValue(new Error('no token'));
 			const event = parse(createMockProjectsV2ItemPayload({ sender: { login: 'swarm-impl' } }));
 			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
+		});
+	});
+
+	describe('synthesizeStateChange', () => {
+		it('produces an event this adapter’s own isStatusChange accepts', () => {
+			const event = adapter.synthesizeStateChange(project, 'PVTI_next');
+			expect(event).toEqual({
+				itemId: 'PVTI_next',
+				containerId: project.githubProjects.projectId,
+				action: 'updated',
+				changedField: STATUS_FIELD_ID,
+				changedFieldType: 'single_select',
+			});
+			expect(adapter.isStatusChange(event, project)).toBe(true);
 		});
 	});
 });

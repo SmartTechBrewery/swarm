@@ -60,7 +60,7 @@ const githubItem: QueuedRun = {
 const boardItem: QueuedRun = {
 	jobId: 'job-2',
 	projectId: 'proj-a',
-	type: 'github-projects',
+	type: 'pm',
 	state: 'delayed',
 	phaseHint: 'board',
 	workItemNodeId: 'PVTI_lADODb1Ycc4Bcnwuzabc123',

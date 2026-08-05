@@ -1,14 +1,16 @@
 /**
- * GitHub Projects status resolution — the provider-specific half of the
- * `pm:status-changed` trigger (ai/ARCHITECTURE.md "PM: GitHub Projects").
+ * GitHub Projects status resolution — the provider-specific translation the
+ * `pm:status-changed` trigger depends on (ai/ARCHITECTURE.md "PM: GitHub
+ * Projects").
  *
  * The board speaks in opaque single-select *option IDs* (`47fc9ee4`), the
  * pipeline speaks in canonical status *keys* (`inProgress`). The config's
- * `statusOptions` map (`config-schema.ts`) is authored key → optionId; these
- * helpers invert that to answer "a card just landed on option X — which
- * pipeline phase, if any, does that start?". This is the piece the worker calls
- * after the authoritative item re-read (docs/github-projects-v2-api.md §5 step
- * 4): never branch on a status value lifted from the webhook body.
+ * `statusOptions` map (`config-schema.ts`) is authored key → optionId; this
+ * inverts it so the provider can populate `WorkItem.statusKey` on every board
+ * read and shared code never sees an option ID at all (ai/RULES.md §2). Resolving
+ * the *phase* from that key is the neutral `resolvePipelinePhaseForStatusKey`
+ * (`src/pm/pipeline.ts`) — this module deliberately stops at the key, so no
+ * option-id→phase shortcut exists for a caller to reach for.
  *
  * IDs are matched by option ID, never by display name — names are rename-prone
  * and display-only (docs/github-projects-v2-api.md §2).
@@ -16,8 +18,6 @@
 
 import type { SingleSelectOptionId } from '../../../pm/ids.js';
 import { unwrap } from '../../../pm/ids.js';
-import type { PipelinePhase } from '../../../pm/pipeline.js';
-import { resolvePipelinePhaseForStatusKey } from '../../../pm/pipeline.js';
 import type { GitHubProjectsIntegrationConfig } from './config-schema.js';
 
 /**
@@ -35,18 +35,4 @@ export function resolveStatusKeyByOptionId(
 		if (mappedOptionId === target) return statusKey;
 	}
 	return undefined;
-}
-
-/**
- * The pipeline phase a board option ID starts, or `undefined` when the option
- * either isn't mapped in `statusOptions` or maps to a status that doesn't begin
- * a PM-driven phase (e.g. `backlog`, `inReview`, `done`) — a "not applicable"
- * lookup, not an error.
- */
-export function resolvePipelinePhaseForOptionId(
-	config: GitHubProjectsIntegrationConfig,
-	optionId: SingleSelectOptionId | string,
-): PipelinePhase | undefined {
-	const statusKey = resolveStatusKeyByOptionId(config, optionId);
-	return statusKey === undefined ? undefined : resolvePipelinePhaseForStatusKey(statusKey);
 }

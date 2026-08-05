@@ -156,7 +156,7 @@ function reviewGateGroupKey(item: QueuedRun): string | null {
  * distinct, legitimate unit of work and always renders on its own row.
  */
 function boardGroupKey(item: QueuedRun): string | null {
-	if (item.type !== 'github-projects') return null;
+	if (item.type !== 'pm') return null;
 	if (item.phaseHint !== 'board') return null;
 	if (item.runId) return null;
 	if (!item.workItemNodeId) return null;
@@ -189,7 +189,7 @@ function toSourceEventDisplay(item: QueuedRun): QueuedReviewGateSourceEventDispl
  * is the position of the first job that started its group, so this never
  * reorders the server's dispatch order; it only folds later duplicates into an
  * earlier row. The two group kinds are mutually exclusive (review-gate is an
- * `scm` job, board is a `github-projects` job), so a job joins at most one.
+ * `scm` job, board is a `pm` job), so a job joins at most one.
  */
 export function groupQueuedRuns(items: QueuedRun[]): QueuedDisplayRow[] {
 	const rowByGroupKey = new Map<string, QueuedDisplayRow>();
@@ -225,7 +225,7 @@ export function groupQueuedRuns(items: QueuedRun[]): QueuedDisplayRow[] {
 
 /**
  * Guards mirroring {@link boardGroupKey} for a *fresh* board display row — a
- * `github-projects` dispatch still hinting `board` with no backing run — but
+ * `pm` dispatch still hinting `board` with no backing run — but
  * joined on the resolved backing work-item URL (the one field a `runs.queued`
  * row and a `runs.list` row share) instead of the opaque board node id.
  */
@@ -234,7 +234,7 @@ function isFreshBoardRowWithActiveRun(
 	activeWorkItemUrls: ReadonlySet<string>,
 ): boolean {
 	const item = row.representative;
-	if (item.type !== 'github-projects') return false;
+	if (item.type !== 'pm') return false;
 	if (item.phaseHint !== 'board') return false;
 	if (item.runId) return false;
 	if (!item.workItemUrl) return false;

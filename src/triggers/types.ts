@@ -23,8 +23,8 @@
 import { z } from 'zod';
 
 import type { ProjectConfig } from '../config/schema.js';
-import type { WorkItem } from '../pm/types.js';
-import type { GitHubProjectsParsedEvent } from '../router/adapters/github-projects.js';
+import type { PmEvent } from '../pm/events.js';
+import type { PMProvider, PMType, WorkItem } from '../pm/types.js';
 import type { ScmEvent } from '../scm/events.js';
 import type { SCMProvider, ScmType } from '../scm/types.js';
 
@@ -32,12 +32,13 @@ import type { SCMProvider, ScmType } from '../scm/types.js';
  * What a trigger handler sees: the resolved project plus the normalized event,
  * discriminated by which ingress produced it.
  *
- * The SCM variant also carries the `SCMProvider` that owns the event, resolved
- * once from `scmProviderRegistry` at the composition root that builds this
- * context (`src/worker/consumer.ts`'s `buildTriggerContext`) — the same way the
- * worker supplies the other ambient dependencies. Handlers therefore perform
- * every SCM read/write through `ctx.scm` and never name a provider, and a test
- * substitutes a typed fake by setting this one field (ai/RULES.md §2).
+ * Each variant also carries the provider that owns its event — the `SCMProvider`
+ * resolved from `scmProviderRegistry`, the `PMProvider` from `pmProviderRegistry`
+ * — resolved once at the composition root that builds this context
+ * (`src/worker/consumer.ts`'s `buildTriggerContext`), the same way the worker
+ * supplies the other ambient dependencies. Handlers therefore perform every
+ * read/write through `ctx.scm` / `ctx.pm` and never name a provider, and a test
+ * substitutes a typed fake by setting that one field (ai/RULES.md §2).
  */
 export type TriggerContext = {
 	project: ProjectConfig;
@@ -68,11 +69,14 @@ export type TriggerContext = {
 	continuationDispatchClaimed?: boolean;
 } & (
 	| { source: 'scm'; providerId: ScmType; event: ScmEvent; scm: SCMProvider }
-	| { source: 'github-projects'; event: GitHubProjectsParsedEvent }
+	| { source: 'pm'; providerId: PMType; event: PmEvent; pm: PMProvider }
 );
 
 /** A trigger context narrowed to the SCM ingress — what every SCM-driven handler takes. */
 export type ScmTriggerContext = Extract<TriggerContext, { source: 'scm' }>;
+
+/** A trigger context narrowed to the PM ingress — what every board-driven handler takes. */
+export type PmTriggerContext = Extract<TriggerContext, { source: 'pm' }>;
 
 export type TriggerSource = TriggerContext['source'];
 

@@ -15,6 +15,7 @@
 
 import { z } from 'zod';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
+import { PmProviderIdSchema } from '../pm/events.js';
 import { ScmProviderIdSchema } from '../scm/events.js';
 import { normalizeStoredJobPayload, type SwarmJob } from './jobs.js';
 
@@ -95,12 +96,12 @@ export const QueuedRunSchema = z.object({
 	jobId: z.string(),
 	projectId: z.string(),
 	/**
-	 * What produced the dispatch: `scm` for an SCM job (carrying `providerId`
-	 * separately), `github-projects` for a board job, or `merge-automation`.
+	 * What produced the dispatch: `scm` for an SCM job, `pm` for a board job (both
+	 * carrying `providerId` separately), or `merge-automation`.
 	 */
-	type: z.enum(['scm', 'github-projects', 'merge-automation']),
-	/** SCM jobs only — the SCM provider's id (`github`). */
-	providerId: ScmProviderIdSchema.optional(),
+	type: z.enum(['scm', 'pm', 'merge-automation']),
+	/** SCM and `pm` jobs only — the producing provider's id (`github`, `github-projects`). */
+	providerId: z.union([ScmProviderIdSchema, PmProviderIdSchema]).optional(),
 	state: PendingJobStateSchema,
 	phaseHint: QueuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */
@@ -113,9 +114,9 @@ export const QueuedRunSchema = z.object({
 	repo: z.string().optional(),
 	/** SCM and `merge-automation` jobs only — the PR/issue number. */
 	prNumber: z.string().optional(),
-	/** `github-projects` jobs only — the opaque board item node id. */
+	/** `pm` jobs only — the opaque board item id. */
 	workItemNodeId: z.string().optional(),
-	/** `github-projects` jobs only — `Issue` | `PullRequest` | `DraftIssue`. */
+	/** `pm` jobs only — the provider's display-only content descriptor (`Issue`, `PullRequest`, …). */
 	contentType: z.string().optional(),
 	/** Resolved backing Issue/PR title for a board job, when the PM provider can read it. */
 	workItemTitle: z.string().optional(),
@@ -160,7 +161,7 @@ export type QueuedRun = z.infer<typeof QueuedRunSchema>;
  * at dispatch time.
  */
 export function deriveQueuedPhaseHint(job: SwarmJob): QueuedPhaseHint {
-	if (job.type === 'github-projects') return 'board';
+	if (job.type === 'pm') return 'board';
 	if (job.type === 'merge-automation') return 'merge-automation';
 
 	const { event } = job;
@@ -209,8 +210,8 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 /**
  * The queue-facing phase hint for a waiting dispatch, exactly as the read model
  * renders it: a worker-resolved phase (`dispatch.phase`) is authoritative; the
- * event-derived hint covers dispatches never claimed yet (for a
- * `github-projects` job that is always `board`). Shared so any caller deciding
+ * event-derived hint covers dispatches never claimed yet (for a `pm` job that is
+ * always `board`). Shared so any caller deciding
  * whether a dispatch is still an unresolved `board` row agrees with the queue
  * view (issue #366).
  */
@@ -222,7 +223,7 @@ export function deriveDispatchPhaseHint(dispatch: DispatchRow): QueuedPhaseHint 
 }
 
 function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): QueuedRun {
-	// A row written before issue #385 still carries the legacy envelope, and the
+	// A row written before issue #385/#297 still carries the legacy envelope, and the
 	// `jsonb` column is typed rather than validated — normalize before reading.
 	const data = normalizeStoredJobPayload(dispatch.jobPayload);
 	const state = deriveQueuedState(dispatch);
@@ -231,7 +232,7 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 		jobId: dispatch.id,
 		projectId: dispatch.projectId,
 		type: data.type,
-		...(data.type === 'scm' ? { providerId: data.providerId } : {}),
+		...(data.type === 'scm' || data.type === 'pm' ? { providerId: data.providerId } : {}),
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
 		waitReason: dispatch.waitReason ?? undefined,
@@ -251,7 +252,7 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 			? { ...shared, repo: data.event.repoFullName, prNumber: data.event.workItemId }
 			: data.type === 'merge-automation'
 				? { ...shared, repo: data.repo, prNumber: data.prNumber }
-				: { ...shared, workItemNodeId: data.event.itemNodeId, contentType: data.event.contentType },
+				: { ...shared, workItemNodeId: data.event.itemId, contentType: data.event.contentType },
 	);
 }
 

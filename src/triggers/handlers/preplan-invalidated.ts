@@ -5,7 +5,7 @@
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
-import { createGitHubProjectsProvider } from '../../integrations/pm/github-projects/provider.js';
+import { requireProjectPMProvider } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
 import {
 	evaluatePreplan,
@@ -36,14 +36,19 @@ function shouldReplan(workItem: WorkItem, event: ScmEvent): boolean {
 }
 
 export interface PreplanInvalidatedTriggerDeps {
-	/** Injectable PM-provider factory; overridden by unit tests. */
+	/**
+	 * Injectable PM-provider factory; overridden by unit tests. This handler is
+	 * SCM-sourced (`ctx.source === 'scm'`) yet needs a *PM* provider, so it can't
+	 * take one off the trigger context the way `pm-status` does — it resolves the
+	 * project's provider through the registry instead (ai/RULES.md §2).
+	 */
 	createProvider?: (project: ProjectConfig) => PMProvider;
 }
 
 export function createPreplanInvalidatedTrigger(
 	deps: PreplanInvalidatedTriggerDeps = {},
 ): TriggerHandler {
-	const createProvider = deps.createProvider ?? createGitHubProjectsProvider;
+	const createProvider = deps.createProvider ?? requireProjectPMProvider;
 
 	return {
 		name: 'preplan-invalidated',

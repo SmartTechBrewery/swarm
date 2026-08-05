@@ -135,7 +135,7 @@ export const queuedRunSchema = z.object({
 	/** The canonical dispatch id (issue #284) — the handle Put back operates on. */
 	jobId: z.string(),
 	projectId: z.string(),
-	type: z.enum(['scm', 'github-projects', 'merge-automation']),
+	type: z.enum(['scm', 'pm', 'merge-automation']),
 	providerId: z.string().optional(),
 	state: queuedRunStateSchema,
 	phaseHint: queuedPhaseHintSchema,
@@ -149,9 +149,9 @@ export const queuedRunSchema = z.object({
 	repo: z.string().optional(),
 	/** `github` and `merge-automation` jobs only — the PR/issue number. */
 	prNumber: z.string().optional(),
-	/** `github-projects` jobs only — the opaque board item node id. */
+	/** `pm` jobs only — the opaque board item id. */
 	workItemNodeId: z.string().optional(),
-	/** `github-projects` jobs only — `Issue` | `PullRequest` | `DraftIssue`. */
+	/** `pm` jobs only — the provider's display-only content descriptor (`Issue`, `PullRequest`, …). */
 	contentType: z.string().optional(),
 	/** Resolved backing Issue/PR title for a board job, when available. */
 	workItemTitle: z.string().optional(),
