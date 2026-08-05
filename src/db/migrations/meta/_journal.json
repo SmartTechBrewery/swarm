@@ -281,6 +281,13 @@
       "when": 1785928886124,
       "tag": "0039_pm_config_rename",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1785949486322,
+      "tag": "0040_enrollment_allowed_phases",
+      "breakpoints": true
     }
   ]
 }

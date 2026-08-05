@@ -8,6 +8,7 @@ import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-service.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 import { SUPPORTED_DB_FREE_PHASES } from '@/transport/assignment-execution.js';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 // The gate's two DB-backed collaborators are mocked at their module boundary
 // (ai/TESTING.md): the project's enrolled workers and the assignee → SWARM user
@@ -69,6 +70,7 @@ function makeCandidate(
 			projectId: 'swarm',
 			status: 'active',
 			allowedClis: overrides.capabilities ?? ['claude'],
+			allowedPhases: [...ALL_TRIGGER_PHASES],
 			concurrencyAllocation: 1,
 			sharingConsent: true,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
@@ -629,6 +631,47 @@ describe('evaluateDispatchEligibility', () => {
 				status: 'selected',
 				selection: { workerId: 'w-host' },
 			});
+		});
+
+		// Issue #509: the owner's per-enrollment selection is the second phase gate, and
+		// the fleet-level behaviour has to match the machine-declaration one — defer,
+		// name the phase, and route past the narrowed worker to one that permits it.
+		it('never selects a worker whose enrollment does not permit the phase', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-1', { enrollment: { allowedPhases: ['implementation'] } }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'review' }));
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'phase-not-permitted' });
+			if (decision.status !== 'ineligible') return;
+			// Points at the owner, who is the only one who can widen the selection.
+			expect(decision.message).toContain("'review'");
+			expect(decision.message).toMatch(/worker owner/);
+		});
+
+		it('routes the phase past a narrowed enrollment to one that permits it', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-narrow', { enrollment: { allowedPhases: ['implementation'] } }),
+				makeCandidate('w-wide'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'review' }));
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-wide' } });
+		});
+
+		// Two individually correct refusals must not be conflated: the fix for one is to
+		// connect a capable daemon, for the other to widen an enrollment.
+		it('prefers the enrollment’s refusal over the machine’s when both appear in the fleet', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-incapable', { supportedPhases: ['implementation'] }),
+				makeCandidate('w-not-permitted', { enrollment: { allowedPhases: ['implementation'] } }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'review' }));
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'phase-not-permitted' });
 		});
 
 		it('preserves assignee affinity — a connected worker of another user is never chosen', async () => {

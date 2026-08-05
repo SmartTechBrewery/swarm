@@ -17,6 +17,7 @@ import {
 	updateEnrollmentConstraints,
 } from '../../identity/worker-enrollment-service.js';
 import { getWorker, type Worker } from '../../identity/worker-service.js';
+import { TriggerPhaseSchema } from '../../triggers/types.js';
 import { accessibleProjectScope, assertProjectAccess, mayAccessProject } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
@@ -95,6 +96,15 @@ async function resolveOwnedEnrollment(user: SwarmUser, enrollmentId: string) {
 }
 
 const AllowedClisInput = z.array(AgentCliSchema).min(1);
+/**
+ * The phases an enrollment may be given (issue #509). Non-empty for the same
+ * reason `AllowedClisInput` is: "no work here" is a suspended enrollment or
+ * revoked consent, not an empty constraint. The service re-validates and
+ * de-duplicates (`EnrollmentAllowedPhasesSchema`); it deliberately does not check
+ * the set against the machine's declared repertoire, which the daemon rewrites on
+ * every reconnect.
+ */
+const AllowedPhasesInput = z.array(TriggerPhaseSchema).min(1);
 const ConcurrencyInput = z.number().int().positive();
 
 export const workersRouter = router({
@@ -169,6 +179,9 @@ export const workersRouter = router({
 				workerId: z.string().uuid(),
 				projectId: z.string().min(1),
 				allowedClis: AllowedClisInput,
+				// Omit for every phase (issue #509) — a new enrollment constrains nothing
+				// its machine's daemon and the project don't already constrain.
+				allowedPhases: AllowedPhasesInput.optional(),
 				// Omit for the default share of one project slot (issue #480); there is
 				// deliberately no value meaning "no per-worker cap".
 				concurrencyAllocation: ConcurrencyInput.optional(),
@@ -182,6 +195,7 @@ export const workersRouter = router({
 					worker,
 					projectId: input.projectId,
 					allowedClis: input.allowedClis,
+					allowedPhases: input.allowedPhases,
 					concurrencyAllocation: input.concurrencyAllocation,
 				});
 			} catch (error) {
@@ -210,9 +224,11 @@ export const workersRouter = router({
 			return updated;
 		}),
 
-	// Update the execution constraints (allowed CLIs / concurrency) on one of the
-	// caller's enrollments. An `allowedClis` change is re-validated against the
-	// worker's capabilities (BAD_REQUEST if it exceeds them). For
+	// Update the execution constraints (allowed CLIs / allowed phases / concurrency)
+	// on one of the caller's enrollments. An `allowedClis` change is re-validated
+	// against the worker's capabilities (BAD_REQUEST if it exceeds them). An
+	// `allowedPhases` change is the owner's per-project routing choice (issue #509):
+	// it takes effect on the next dispatch and never interrupts a running phase. For
 	// `concurrencyAllocation`, send a positive integer to set this worker's share of
 	// the project, or omit it to leave the stored value alone — no value clears it
 	// (issue #480).
@@ -221,6 +237,7 @@ export const workersRouter = router({
 			z.object({
 				enrollmentId: z.string().uuid(),
 				allowedClis: AllowedClisInput.optional(),
+				allowedPhases: AllowedPhasesInput.optional(),
 				concurrencyAllocation: ConcurrencyInput.optional(),
 			}),
 		)
@@ -231,6 +248,7 @@ export const workersRouter = router({
 					worker,
 					enrollmentId: input.enrollmentId,
 					allowedClis: input.allowedClis,
+					allowedPhases: input.allowedPhases,
 					concurrencyAllocation: input.concurrencyAllocation,
 				});
 				if (!updated) throw enrollmentNotFound(input.enrollmentId);

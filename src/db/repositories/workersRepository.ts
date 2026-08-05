@@ -140,9 +140,16 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * nothing about phases and must not silently reset them.
  *
  * Note the asymmetry with the CLI check above: phases are deliberately *not*
- * validated against enrollments, because an enrollment constrains CLIs
- * (`allowedClis`) and has no phase dimension. A daemon that stops supporting a
- * phase narrows its own eligibility rather than invalidating an enrollment.
+ * validated against enrollments, even though an enrollment does now constrain them
+ * (`allowedPhases`, issue #509). The two constraints are maintained differently on
+ * purpose. A CLI reduction is refused while an enrollment still requires the CLI,
+ * which is what makes `allowedClis ⊆ capabilities` an invariant; a daemon must stay
+ * free to re-declare a *narrower* phase repertoire on reconnect, because that
+ * declaration describes the program now running, not a promise to the enrollment.
+ * So a daemon that stops supporting a phase narrows its own eligibility — the
+ * dispatch gate ANDs the two sets — rather than invalidating an owner's selection,
+ * which is exactly the guarantee #509 needs: an owner's choice is never overwritten
+ * by a reconnect, and a reconnect is never blocked by an owner's choice.
  */
 /**
  * The CLIs some enrollment still requires that `capabilities` would no longer
@@ -214,7 +221,8 @@ export async function updateWorkerCapabilities(
  * `planning` on a host that can in fact run it (issue #467).
  *
  * No enrollment validation, for the reason given on {@link updateWorkerCapabilities}:
- * an enrollment constrains CLIs, not phases.
+ * an enrollment's own phase selection (`allowedPhases`, issue #509) is the owner's
+ * and is never overwritten here, and this declaration is never blocked by it.
  */
 export async function updateWorkerSupportedPhases(
 	id: string,

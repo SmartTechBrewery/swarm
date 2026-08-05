@@ -23,7 +23,10 @@ import { createWorker } from '../../../src/db/repositories/workersRepository.js'
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import { workerSessions } from '../../../src/db/schema/workerSessions.js';
 import { workers } from '../../../src/db/schema/workers.js';
-import { isRoutable } from '../../../src/identity/worker-enrollment.js';
+import {
+	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
+	isRoutable,
+} from '../../../src/identity/worker-enrollment.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -67,6 +70,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				projectId,
 				status: 'active',
 				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
 				concurrencyAllocation: 1,
 				sharingConsent: true,
 				...overrides,
@@ -156,16 +160,34 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 		});
 
 		describe('updateConstraints', () => {
-			it('updates allowed CLIs and concurrency, leaving the rest intact', async () => {
+			it('updates allowed CLIs, phases and concurrency, leaving the rest intact', async () => {
 				const created = await enroll(workerA, PROJECT_A);
 				const updated = await updateEnrollmentConstraints(created.id, {
 					allowedClis: ['claude', 'codex'],
+					allowedPhases: ['review', 'implementation'],
 					concurrencyAllocation: 3,
 				});
 				expect(updated).toMatchObject({
 					allowedClis: ['claude', 'codex'],
+					allowedPhases: ['review', 'implementation'],
 					concurrencyAllocation: 3,
 					status: 'active',
+				});
+			});
+
+			// Issue #509: the phase selection is the owner's alone, so widening it must not
+			// disturb the CLI constraint, the allocation, or the approval state.
+			it('changes only the phase selection when that is the whole patch', async () => {
+				const created = await enroll(workerA, PROJECT_A, { concurrencyAllocation: 2 });
+				const updated = await updateEnrollmentConstraints(created.id, {
+					allowedPhases: ['planning'],
+				});
+				expect(updated).toMatchObject({
+					allowedPhases: ['planning'],
+					allowedClis: created.allowedClis,
+					concurrencyAllocation: 2,
+					status: 'active',
+					sharingConsent: true,
 				});
 			});
 		});
@@ -220,6 +242,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const created = await enroll(workerA, PROJECT_A, {
 					status: 'pending',
 					allowedClis: ['codex'],
+					allowedPhases: ['implementation'],
 					concurrencyAllocation: 2,
 					sharingConsent: false,
 				});
@@ -232,9 +255,28 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					projectId: PROJECT_A,
 					status: 'pending',
 					allowedClis: ['codex'],
+					allowedPhases: ['implementation'],
 					concurrencyAllocation: 2,
 					sharingConsent: false,
 				});
+			});
+
+			// The migration backfills existing rows with this default, so a row written
+			// without a phase selection must permit every phase — which is what keeps
+			// dispatch behaviour identical for enrollments that predate issue #509.
+			it('defaults allowed_phases to every phase when the insert names none', async () => {
+				const [row] = await getDb()
+					.insert(workerProjectEnrollments)
+					.values({
+						workerId: workerA,
+						projectId: PROJECT_A,
+						status: 'active',
+						allowedClis: ['claude'],
+						concurrencyAllocation: 1,
+						sharingConsent: true,
+					})
+					.returning();
+				expect(row.allowedPhases).toEqual([...DEFAULT_ENROLLMENT_ALLOWED_PHASES]);
 			});
 		});
 	},

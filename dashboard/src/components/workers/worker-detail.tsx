@@ -96,6 +96,13 @@ interface WorkerDetailViewProps {
 	projectNames: Map<string, string>;
 	/** Project id → repo, for the active job's provider reference. */
 	projectRepos: Map<string, string>;
+	/**
+	 * Project id → the phases that project has turned off for every worker
+	 * (`pipeline.<phase>.enabled: false`), so the Allowed-pipeline-phases control can
+	 * say that a phase is off project-wide rather than offering a selection that
+	 * could never take work (issue #509).
+	 */
+	projectDisabledPhases: Map<string, string[]>;
 	/** Called after a mutation lands, so the caller refetches the authoritative view. */
 	onChanged: () => void;
 }
@@ -104,6 +111,7 @@ export function WorkerDetailView({
 	worker,
 	projectNames,
 	projectRepos,
+	projectDisabledPhases,
 	onChanged,
 }: WorkerDetailViewProps) {
 	const ownerName = worker.owner?.displayName ?? 'the owner';
@@ -207,6 +215,8 @@ export function WorkerDetailView({
 								enrollment={enrollment}
 								workerName={worker.displayName}
 								capabilities={worker.capabilities}
+								supportedPhases={worker.supportedPhases}
+								projectDisabledPhases={projectDisabledPhases.get(enrollment.projectId) ?? []}
 								projectName={projectNames.get(enrollment.projectId) ?? enrollment.projectId}
 								viewerIsOwner={worker.viewerIsOwner}
 								ownerName={ownerName}

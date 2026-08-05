@@ -10,7 +10,11 @@ import {
 	uuid,
 } from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
-import { DEFAULT_CONCURRENCY_ALLOCATION } from '../../identity/worker-enrollment.js';
+import {
+	DEFAULT_CONCURRENCY_ALLOCATION,
+	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
+} from '../../identity/worker-enrollment.js';
+import type { TriggerPhase } from '../../triggers/types.js';
 import { projects } from './projects.js';
 import { workers } from './workers.js';
 
@@ -34,7 +38,13 @@ import { workers } from './workers.js';
  * the source of truth for the values), matching how `project_members.role` /
  * `project_membership_requests.status` persist their enums. `allowed_clis` is a
  * `jsonb` of `AgentCli[]` (a subset of the worker's `capabilities`), the same
- * treatment `workers.capabilities` gets. `concurrency_allocation` is **`NOT NULL`
+ * treatment `workers.capabilities` gets, and `allowed_phases` a `jsonb` of
+ * `TriggerPhase[]` (issue #509) — the owner's per-project routing choice, which is
+ * **not** the same axis as `workers.supported_phases`: that column is what the
+ * daemon declares it can execute and is rewritten on every reconnect, while this
+ * one is only ever written by its owner. It defaults to every phase so a row
+ * created (or migrated) without a deliberate choice constrains nothing on its own.
+ * `concurrency_allocation` is **`NOT NULL`
  * and defaults to `1`** (issue #480): every enrollment states this worker's share
  * of the project, and a new one claims a single slot unless the operator says
  * otherwise. "No per-worker cap" is deliberately not expressible — as `NULL` it
@@ -64,6 +74,17 @@ export const workerProjectEnrollments = pgTable(
 		status: text('status').notNull().default('pending'),
 		/** Subset of the worker's `capabilities` this project may run (source of truth in `worker-enrollment.ts`). */
 		allowedClis: jsonb('allowed_clis').$type<AgentCli[]>().notNull(),
+		/**
+		 * The pipeline phases this project may route to the worker — the owner's
+		 * choice (issue #509), distinct from the daemon-declared
+		 * `workers.supported_phases`. Defaults to
+		 * `DEFAULT_ENROLLMENT_ALLOWED_PHASES` (`src/identity/worker-enrollment.ts`,
+		 * the source of truth for the shape). See the table doc-comment.
+		 */
+		allowedPhases: jsonb('allowed_phases')
+			.$type<TriggerPhase[]>()
+			.notNull()
+			.default([...DEFAULT_ENROLLMENT_ALLOWED_PHASES]),
 		/**
 		 * This worker's share of the project: a positive integer, never null,
 		 * defaulting to `DEFAULT_CONCURRENCY_ALLOCATION`

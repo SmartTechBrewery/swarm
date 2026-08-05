@@ -63,6 +63,7 @@ import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 const OWNER_ID = '00000000-0000-4000-8000-0000000000aa';
 const OTHER_ID = '00000000-0000-4000-8000-0000000000bb';
@@ -100,6 +101,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		projectId: 'p1',
 		status: 'pending',
 		allowedClis: ['claude'],
+		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
 		sharingConsent: false,
 		createdAt: new Date(0),
@@ -490,6 +492,75 @@ describe('workers concurrency inputs (issue #480)', () => {
 		expect(result.concurrencyAllocation).toBe(3);
 		expect(updateEnrollmentConstraints).toHaveBeenCalledWith(
 			expect.objectContaining({ enrollmentId: ENROLLMENT_ID, concurrencyAllocation: 3 }),
+		);
+	});
+});
+
+describe('workers allowed-phase inputs (issue #509)', () => {
+	it('passes a phase selection through on updateConstraints', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker());
+		updateEnrollmentConstraints.mockResolvedValue(
+			makeEnrollment({ allowedPhases: ['implementation', 'review'] }),
+		);
+
+		const result = await owner.updateConstraints({
+			enrollmentId: ENROLLMENT_ID,
+			allowedPhases: ['implementation', 'review'],
+		});
+
+		expect(result.allowedPhases).toEqual(['implementation', 'review']);
+		expect(updateEnrollmentConstraints).toHaveBeenCalledWith(
+			expect.objectContaining({
+				enrollmentId: ENROLLMENT_ID,
+				allowedPhases: ['implementation', 'review'],
+			}),
+		);
+	});
+
+	it('rejects an empty phase selection before it reaches the service', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(
+			owner.updateConstraints({ enrollmentId: ENROLLMENT_ID, allowedPhases: [] }),
+		).rejects.toThrow();
+		expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+	});
+
+	it('rejects a phase outside the pipeline vocabulary', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(
+			owner.updateConstraints({
+				enrollmentId: ENROLLMENT_ID,
+				// @ts-expect-error only the pipeline phases are accepted — asserted at runtime too
+				allowedPhases: ['deploy'],
+			}),
+		).rejects.toThrow();
+		expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+	});
+
+	it('hides another owner’s enrollment before validating the selection (NOT_FOUND)', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(
+			owner.updateConstraints({ enrollmentId: ENROLLMENT_ID, allowedPhases: ['review'] }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+	});
+
+	it('omits the selection on enroll so the service applies its default', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		enrollWorker.mockResolvedValue(makeEnrollment());
+
+		await owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ allowedPhases: undefined }),
 		);
 	});
 });

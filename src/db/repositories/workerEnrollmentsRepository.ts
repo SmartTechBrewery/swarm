@@ -7,9 +7,10 @@
  *
  * A row already carries the domain's exact types, so mapping it back to
  * `WorkerEnrollment` is a re-assembly, not a re-validation — same as
- * `rowToWorker` (`allowedClis` comes back typed from `jsonb` and is cast to
- * `AgentCli[]`, `status` is cast back to the `EnrollmentStatus` enum the writers
- * here only ever store). Creating a second enrollment for the same
+ * `rowToWorker` (`allowedClis`/`allowedPhases` come back typed from `jsonb` and
+ * are cast to `AgentCli[]` / `TriggerPhase[]`, `status` is cast back to the
+ * `EnrollmentStatus` enum the writers here only ever store). Creating a second
+ * enrollment for the same
  * `(worker, project)` surfaces the raw pg `23505` unique violation; the caller
  * translates it. Lookups that find nothing return `undefined`/`[]` — a
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
@@ -23,6 +24,7 @@ import {
 	type EnrollmentStatus,
 	type WorkerEnrollment,
 } from '../../identity/worker-enrollment.js';
+import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workers } from '../schema/workers.js';
@@ -37,6 +39,7 @@ function rowToEnrollment(row: EnrollmentRow): WorkerEnrollment {
 		projectId: row.projectId,
 		status: row.status as EnrollmentStatus,
 		allowedClis: row.allowedClis as AgentCli[],
+		allowedPhases: row.allowedPhases as TriggerPhase[],
 		concurrencyAllocation: row.concurrencyAllocation,
 		sharingConsent: row.sharingConsent,
 		createdAt: row.createdAt,
@@ -50,6 +53,8 @@ export interface CreateEnrollmentInput {
 	projectId: string;
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
+	/** The pipeline phases this project may route to the worker (issue #509). */
+	allowedPhases: TriggerPhase[];
 	/** This worker's share of the project — a positive integer (issue #480). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
@@ -85,6 +90,7 @@ export async function createEnrollment(input: CreateEnrollmentInput): Promise<Wo
 				projectId: input.projectId,
 				status: input.status,
 				allowedClis: input.allowedClis,
+				allowedPhases: input.allowedPhases,
 				concurrencyAllocation: input.concurrencyAllocation,
 				sharingConsent: input.sharingConsent,
 			})
@@ -183,23 +189,31 @@ export async function setEnrollmentSharingConsent(
 /** The mutable execution constraints; each field is optional so a caller updates only what changed. */
 export interface UpdateEnrollmentConstraintsInput {
 	allowedClis?: AgentCli[];
+	/** The phases this project may route here; omit to leave the stored set alone (issue #509). */
+	allowedPhases?: TriggerPhase[];
 	/** A positive integer sets the allocation; omit to leave the stored value alone. */
 	concurrencyAllocation?: number;
 }
 
 /**
- * Update an enrollment's execution constraints (`allowedClis` and/or
- * `concurrencyAllocation`). A no-field update is a no-op that still returns the
- * current row. Returns `undefined` if no enrollment has that id. Locks the associated
+ * Update an enrollment's execution constraints (`allowedClis`, `allowedPhases`,
+ * and/or `concurrencyAllocation`). A no-field update is a no-op that still returns
+ * the current row. Returns `undefined` if no enrollment has that id. Locks the associated
  * worker row FOR UPDATE inside a transaction and throws {@link AllowedClisNotCapableError} if `allowedClis`
- * contains CLIs not in the worker's capabilities.
+ * contains CLIs not in the worker's capabilities. `allowedPhases` carries no such
+ * check — a daemon narrows its declared repertoire freely, so containment in
+ * `workers.supported_phases` is not an invariant to enforce (see
+ * `EnrollmentAllowedPhasesSchema`, `src/identity/worker-enrollment.ts`).
  */
 export async function updateEnrollmentConstraints(
 	id: string,
 	input: UpdateEnrollmentConstraintsInput,
 ): Promise<WorkerEnrollment | undefined> {
-	const patch: Partial<Pick<EnrollmentRow, 'allowedClis' | 'concurrencyAllocation'>> = {};
+	const patch: Partial<
+		Pick<EnrollmentRow, 'allowedClis' | 'allowedPhases' | 'concurrencyAllocation'>
+	> = {};
 	if (input.allowedClis !== undefined) patch.allowedClis = input.allowedClis;
+	if (input.allowedPhases !== undefined) patch.allowedPhases = input.allowedPhases;
 	if (input.concurrencyAllocation !== undefined) {
 		patch.concurrencyAllocation = input.concurrencyAllocation;
 	}
