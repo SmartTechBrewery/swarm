@@ -712,6 +712,28 @@ describe('GitWorktreeManager', () => {
 			expect(gitOpts[lastCallIndex]).toEqual({ cwd: WORKTREE_14 });
 		});
 
+		it('excludes SWARM scratch artifacts so they do not block reclaim', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'status' && args[1] === '--porcelain') return { stdout: '' };
+				return { stdout: '' };
+			};
+			const result = await makeManager().isClean('14');
+			expect(result).toBe(true);
+			expect(gitCalls.find((args) => args[0] === 'status')).toEqual([
+				'status',
+				'--porcelain',
+				'--',
+				'.',
+				':(exclude)implementation_handoff.json',
+				':(exclude)review_handoff.json',
+				':(exclude)respond_to_review_handoff.json',
+				':(exclude)respond_to_ci_handoff.json',
+				':(exclude)resolve_conflicts_handoff.json',
+				':(exclude)swarm_checkpoint.json',
+				':(exclude).swarm_delivery.json',
+			]);
+		});
+
 		it('returns false when git status --porcelain is non-empty', async () => {
 			gitHandler = (args) => {
 				if (args[0] === 'status' && args[1] === '--porcelain') {

@@ -7,13 +7,16 @@ worktree and restarting the phase from scratch. It is a two-tier design:
 1. **Primary — native CLI session resume. _Implemented._** Re-enter the same CLI session the
    run was using, so the agent keeps its own context. This now covers all three CLIs
    (`claude`, `agy`, `codex`), every pipeline phase, and both rate-limit and timeout stops.
-2. **Fallback — a checkpoint file. _Deferred._** A short, structured handoff written to the
-   worktree for the cases native resume cannot cover (session expired/pruned, worktree
-   survived but the session did not, or a continuation on a different CLI).
+2. **Fallback — a checkpoint file. _Artifact landed; continuation deferred._** A short,
+   structured handoff written to the worktree for the cases native resume cannot cover
+   (session expired/pruned, worktree survived but the session did not, or a continuation on a
+   different CLI).
 
-Tier 1 is live. Tier 2 and the speculative self-checkpoint *trigger* (§ "Soft budget")
-remain unimplemented; the resume-from-preserved-state mechanics Tier 2 would build on are
-proven by Tier 1.
+Tier 1 is live. Tier 2's *artifact* now exists — the file, its schema, and the prompt that
+makes the implementer phases keep it current (issue #299 phase 1/4, below); nothing reads it
+yet, so the continuation path is still to build. The speculative self-checkpoint *trigger*
+(§ "Soft budget") remains unimplemented; the resume-from-preserved-state mechanics Tier 2
+builds on are proven by Tier 1.
 
 ## Tier 1 — native CLI session resume (implemented)
 
@@ -76,41 +79,72 @@ A timeout that trapped SIGTERM and still exited 0 is the one exception: its phas
 finished and cleaned up its worktree, so it stays a terminal failure rather than resuming
 onto a checkout that no longer exists.
 
-## Tier 2 — the checkpoint file (fallback, deferred)
+## Tier 2 — the checkpoint file (fallback; artifact implemented)
 
 Native resume covers the common case but not every case: the CLI session can expire or be
 pruned, the worktree can survive when the session does not, or a continuation may need to
-run on a different CLI than the one that started the work. For those, SWARM should fall back
-to a short, structured checkpoint file written to the worktree — a degraded path that
-re-seeds a fresh session with a factual handoff rather than the agent's own context.
+run on a different CLI than the one that started the work. For those, SWARM falls back to a
+short, structured checkpoint file written to the worktree — a degraded path that re-seeds a
+fresh session with a factual handoff rather than the agent's own context. The file is written
+today; the continuation that consumes it is the remaining work (below).
 
-The checkpoint is a safe handoff point, not a hard token-limit termination: the agent writes
-it and exits cleanly at a safe boundary (never in the middle of an edit or command). A
-continuation validates the actual worktree, reads the checkpoint first, and completes only
-the recorded remainder — it must not re-explore or redesign completed work unless
-verification shows it is necessary.
+The checkpoint is kept current at safe boundaries (never in the middle of an edit or command),
+not written as a wind-down step before the agent exits. That way an involuntary stop finds an
+up-to-date handoff. A continuation validates the actual worktree, reads the checkpoint first,
+and completes only the recorded remainder — it must not re-explore or redesign completed work
+unless verification shows it is necessary.
 
 ### Checkpoint contents
 
-The handoff should be short and factual:
+The handoff is `swarm_checkpoint.json` at the worktree root — short, factual, and validated by
+`CheckpointSchema` (`src/pipeline/checkpoint.ts`):
 
-```md
-# Implementation checkpoint
-
-## Completed
-- Added `ProjectConfigSchema.retryPolicy` and focused validation tests.
-
-## Remaining
-- Update the README configuration table.
-- Run lint, type-check, and `tests/unit/config/schema.test.ts`.
-- Commit, push, and open the PR.
-
-## Decisions / caveats
-- Storage-migration coverage is out of scope for this item.
-
-## Working-tree state
-- Modified: `src/config/schema.ts`, `tests/unit/config/schema.test.ts`
+```json
+{
+  "phase": "implementation",
+  "completed": ["Added `ProjectConfigSchema.retryPolicy` and focused validation tests."],
+  "remaining": [
+    "Update the README configuration table.",
+    "Run lint, type-check, and `tests/unit/config/schema.test.ts`.",
+    "Write the implementation hand-off file."
+  ],
+  "decisions": ["Storage-migration coverage is out of scope for this item."],
+  "workingTree": {
+    "modified": ["src/config/schema.ts", "tests/unit/config/schema.test.ts"],
+    "added": [],
+    "deleted": []
+  }
+}
 ```
+
+Three constraints are deliberate. `phase` is required because a task's checkout is reused
+across phases, so a continuation can reject a checkpoint another phase left behind. `remaining`
+must be non-empty — a phase with nothing left finished, and wrote its real hand-off instead.
+`workingTree` must name at least one path: it is what a continuation compares against
+`git status --porcelain`, and a checkpoint describing an empty tree describes nothing worth
+continuing. `decisions` and the three `workingTree` arrays default to empty.
+
+### Which phases write it
+
+The four phases that edit a worktree — **Implementation**, **Respond-to-review**,
+**Respond-to-CI**, and **Resolve-conflicts** — carry one shared instruction block
+(`src/pipeline/prompts/checkpoint.ts`) telling the agent to rewrite the file at every safe
+boundary. **Planning** and **Review** do not: Planning has no partial-edit state to hand over,
+and Review makes no worktree edits.
+
+The instruction is deliberately a *rolling* one rather than a wind-down the agent decides to
+perform — an involuntary stop arrives without warning, so the file has to already be current
+when it does. Having the agent judge its own remaining budget is the speculative trigger below.
+
+### It is a scratch artifact, never a commit
+
+The filename is registered in `HANDOFF_FILENAMES` (`src/scm/delivery.ts`), which is what puts
+it in `SCRATCH_PATHSPECS`: `validatePreparedTree` refuses to deliver a tree where the file is
+tracked, `commitPreparedTree` unstages it after its `git add --all`, and worktree cleanliness
+checks exclude it when deciding whether a checkout may be reclaimed, freshly retried, or pruned.
+It is also listed in `.gitignore` alongside the phase hand-offs. So a checkpoint can never
+reach a commit, a pushed branch, or a customer PR — and cannot keep a scratch-only checkout
+from being cleaned up. The prompt tells the agent not to `git add` it either.
 
 ## Soft budget, completion reserve, self-checkpoint trigger (speculative)
 
@@ -133,9 +167,13 @@ it now ships as Tier 1. Treat the trigger as a later experiment.
 
 **Tier 2 — fallback checkpoint file**
 
-- Define a checkpointed run status and a durable continuation job for the fallback path.
-- Validate the checkpoint file and working tree before a fallback continuation.
-- Support a cross-CLI continuation seeded from the checkpoint file.
+The artifact itself has landed (issue #299 phase 1/4): the file, its schema and reader, and the
+implementer-phase prompts that keep it current. What still reads and acts on it:
+
+- Validate the checkpoint file and working tree before a fallback continuation, and support a
+  cross-CLI continuation seeded from it.
+- Define a checkpointed run status, preserve the worktree because a checkpoint exists, and
+  dispatch the bounded continuation.
 
 **Shared**
 

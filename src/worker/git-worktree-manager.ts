@@ -20,6 +20,7 @@ import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
+import { SCRATCH_PATHSPECS } from '../scm/delivery.js';
 import { hasLiveWorktreeLeaseOwner } from '../worktree/lease-liveness.js';
 import { BlockedRecoveryError, evaluateWorktreeReclaim } from '../worktree/reclaim.js';
 import {
@@ -369,16 +370,27 @@ export class GitWorktreeManager {
 	}
 
 	/**
-	 * Whether the worktree for `taskId` has no uncommitted changes (tracked or
-	 * untracked) — `git status --porcelain` in the worktree itself, not the main
-	 * repo root. Fails CLOSED on any error (missing worktree, git failure): treats
-	 * it as *not* clean, so a caller using this as a prune safety gate skips
-	 * rather than risks discarding someone's in-progress work.
+	 * Whether the worktree for `taskId` has no uncommitted non-scratch changes —
+	 * `git status --porcelain` in the worktree itself, not the main repo root.
+	 * Phase hand-offs and delivery progress are SWARM-owned scratch artifacts, so
+	 * they must not pin an otherwise-discardable checkout. Fails CLOSED on any
+	 * error (missing worktree, git failure): treats it as *not* clean, so a caller
+	 * using this as a prune safety gate skips rather than risks discarding someone's
+	 * in-progress work.
 	 */
 	async isClean(taskId: string): Promise<boolean> {
 		const path = this.worktreePath(taskId);
 		try {
-			const stdout = await this.git(['status', '--porcelain'], path);
+			const stdout = await this.git(
+				[
+					'status',
+					'--porcelain',
+					'--',
+					'.',
+					...SCRATCH_PATHSPECS.map((scratch) => `:(exclude)${scratch}`),
+				],
+				path,
+			);
 			return stdout.trim().length === 0;
 		} catch (err) {
 			logger.warn('worktree cleanliness check failed — treating as dirty', {

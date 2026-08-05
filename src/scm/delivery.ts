@@ -368,10 +368,20 @@ export const HANDOFF_FILENAMES = {
 	respondToReview: 'respond_to_review_handoff.json',
 	respondToCi: 'respond_to_ci_handoff.json',
 	resolveConflicts: 'resolve_conflicts_handoff.json',
+	/**
+	 * Not a phase delivery contract like the five above — the continuation
+	 * hand-off an implementer phase keeps current so a run cut short can be
+	 * continued from the recorded remainder (`src/pipeline/checkpoint.ts`,
+	 * `docs/CHECKPOINTS.md` Tier 2). It is registered here precisely because
+	 * {@link SCRATCH_PATHSPECS} is derived from this object: that is what makes
+	 * `validatePreparedTree` reject it when tracked and `commitPreparedTree`
+	 * unstage it, so it can never land in a customer PR.
+	 */
+	checkpoint: 'swarm_checkpoint.json',
 } as const;
 
 const PROGRESS_FILENAME = '.swarm_delivery.json';
-const SCRATCH_PATHSPECS = [...Object.values(HANDOFF_FILENAMES), PROGRESS_FILENAME] as const;
+export const SCRATCH_PATHSPECS = [...Object.values(HANDOFF_FILENAMES), PROGRESS_FILENAME] as const;
 
 export class DeliveryDeferredError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
