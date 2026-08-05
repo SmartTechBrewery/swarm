@@ -1,6 +1,6 @@
 {
-  "id": "fc44a472-e24e-445f-819f-8ad6fbad9bfa",
-  "prevId": "4826d474-6b68-44c3-a785-a87d40780e23",
+  "id": "b82dccbb-8904-4002-9754-63e3d60d84eb",
+  "prevId": "fc44a472-e24e-445f-819f-8ad6fbad9bfa",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -603,6 +603,19 @@
           "type": "uuid",
           "primaryKey": false,
           "notNull": false
+        },
+        "checkpoint": {
+          "name": "checkpoint",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "continuation_count": {
+          "name": "continuation_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "output_bytes": {
           "name": "output_bytes",

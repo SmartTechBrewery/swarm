@@ -67,6 +67,13 @@ export type TriggerContext = {
 	 * the refreshed claim TTL, would drop the run as a duplicate).
 	 */
 	continuationDispatchClaimed?: boolean;
+	/**
+	 * Set on the synthetic review event an operator's "Force re-review" enqueues
+	 * (issue #511): the `pr-review-submitted` handler treats this changes-requested
+	 * verdict as an authorized continuation past the review-verdict safety cap
+	 * rather than failing closed on it.
+	 */
+	forcedReReview?: boolean;
 } & (
 	| { source: 'scm'; providerId: ScmType; event: ScmEvent; scm: SCMProvider }
 	| { source: 'pm'; providerId: PMType; event: PmEvent; pm: PMProvider }

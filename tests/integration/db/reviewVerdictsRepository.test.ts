@@ -6,6 +6,8 @@ import {
 	getPriorSubmittedReview,
 	getReviewVerdictByHead,
 	getReviewVerdictByReviewId,
+	getSubmittedReviewSlot,
+	grantReviewCapOverride,
 	markReviewVerdictSubmitted,
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
@@ -240,6 +242,99 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				await markReviewVerdictSubmitted(key('sha-2'), { verdict: 'approve' });
 				const prior = await getPriorSubmittedReview(PROJECT_ID, REPO, PR, 'sha-3');
 				expect(prior).toMatchObject({ ordinal: 2, verdict: 'approve', headSha: 'sha-2' });
+			});
+		});
+
+		// Issue #511 — an operator's explicit "Force re-review" grant. It is the only
+		// thing that can push a PR past `REVIEW_VERDICT_CAP`, and it is worth exactly
+		// one slot.
+		describe('operator cap overrides', () => {
+			/** Submit every verdict the automatic cap allows, leaving the PR capped. */
+			async function fillToCap(): Promise<void> {
+				for (let i = 1; i <= REVIEW_VERDICT_CAP; i++) {
+					await reserveReviewVerdict(key(`sha-${i}`));
+					await markReviewVerdictSubmitted(key(`sha-${i}`), { verdict: 'request-changes' });
+				}
+			}
+
+			const cappedKey = () => key(`sha-${REVIEW_VERDICT_CAP}`);
+
+			it('lets one more reservation through, at the next ordinal', async () => {
+				await fillToCap();
+				expect(await grantReviewCapOverride(cappedKey())).toBe('granted');
+
+				const forced = await reserveReviewVerdict(key('sha-forced'));
+				expect(forced).toMatchObject({
+					status: 'reserved',
+					ordinal: REVIEW_VERDICT_CAP + 1,
+					capOverride: true,
+				});
+			});
+
+			it('is spent by that reservation, so one grant can never license two reviews', async () => {
+				await fillToCap();
+				await grantReviewCapOverride(cappedKey());
+				await reserveReviewVerdict(key('sha-forced'));
+				await markReviewVerdictSubmitted(key('sha-forced'), { verdict: 'request-changes' });
+
+				expect(await reserveReviewVerdict(key('sha-forced-2'))).toEqual({ status: 'capped' });
+			});
+
+			it('is idempotent — repeated clicks grant one slot, not one each', async () => {
+				await fillToCap();
+				expect(await grantReviewCapOverride(cappedKey())).toBe('granted');
+				expect(await grantReviewCapOverride(cappedKey())).toBe('already-granted');
+
+				await reserveReviewVerdict(key('sha-forced'));
+				await markReviewVerdictSubmitted(key('sha-forced'), { verdict: 'request-changes' });
+				expect(await reserveReviewVerdict(key('sha-forced-2'))).toEqual({ status: 'capped' });
+			});
+
+			it('survives concurrent reservations racing for the single granted slot', async () => {
+				await fillToCap();
+				await grantReviewCapOverride(cappedKey());
+
+				const reservations = await Promise.all(
+					['sha-x', 'sha-y', 'sha-z'].map((sha) => reserveReviewVerdict(key(sha))),
+				);
+				// One wins the granted slot; the rest are blocked behind it (a pending
+				// slot exists) rather than each redeeming the same grant.
+				expect(reservations.filter((r) => r.status === 'reserved')).toHaveLength(1);
+				expect(reservations.filter((r) => r.status === 'blocked')).toHaveLength(2);
+			});
+
+			it('refuses to grant when the PR/head has no submitted verdict', async () => {
+				await reserveReviewVerdict(key('sha-1'));
+				expect(await grantReviewCapOverride(key('sha-1'))).toBe('no-submitted-slot');
+				expect(await grantReviewCapOverride(key('sha-unknown'))).toBe('no-submitted-slot');
+			});
+
+			it('changes nothing while no operator grants an override', async () => {
+				await fillToCap();
+				expect(await reserveReviewVerdict(key('sha-forced'))).toEqual({ status: 'capped' });
+			});
+		});
+
+		describe('getSubmittedReviewSlot (issue #511)', () => {
+			it('returns the submitted slot with the review id the forced response needs', async () => {
+				await reserveReviewVerdict(key('sha-1'));
+				await markReviewVerdictSubmitted(key('sha-1'), {
+					verdict: 'request-changes',
+					reviewId: '900123',
+				});
+
+				expect(await getSubmittedReviewSlot(key('sha-1'))).toMatchObject({
+					ordinal: 1,
+					verdict: 'request-changes',
+					reviewId: '900123',
+					capOverrideGrantedAt: null,
+					capOverrideConsumedAt: null,
+				});
+			});
+
+			it('ignores a slot that was only reserved, never submitted', async () => {
+				await reserveReviewVerdict(key('sha-1'));
+				expect(await getSubmittedReviewSlot(key('sha-1'))).toBeUndefined();
 			});
 		});
 	},
