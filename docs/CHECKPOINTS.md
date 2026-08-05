@@ -17,8 +17,8 @@ the implementer phases keep it current (issue #299 phase 1/4) — and so does th
 that continues a phase from one: the `checkpoint` recovery mode, its validation gate, the
 guaranteed-fresh session, and the prompt that re-seeds it (phase 2/4). What is still missing is
 the **policy**: nothing in production asks for `recoveryMode: 'checkpoint'`, so the path is not
-yet reachable at runtime. The speculative self-checkpoint *trigger* (§ "Soft budget") remains
-unimplemented; the resume-from-preserved-state mechanics Tier 2 builds on are proven by Tier 1.
+yet reachable at runtime. The self-checkpoint *trigger* has been dropped from the design
+(§ "Rejected"); the resume-from-preserved-state mechanics Tier 2 builds on are proven by Tier 1.
 
 ## Tier 1 — native CLI session resume (implemented)
 
@@ -143,7 +143,7 @@ and Review makes no worktree edits.
 
 The instruction is deliberately a *rolling* one rather than a wind-down the agent decides to
 perform — an involuntary stop arrives without warning, so the file has to already be current
-when it does. Having the agent judge its own remaining budget is the speculative trigger below.
+when it does. Having the agent judge its own remaining budget is the rejected trigger below.
 
 ### It is a scratch artifact, never a commit
 
@@ -197,26 +197,22 @@ prompt: the completed steps (not to be redone), the remaining ones in order, the
 decisions, the working tree it will find, and the instruction that governs them — complete only
 the remainder, and do not re-explore settled work unless verification requires it.
 
-## Soft budget, completion reserve, self-checkpoint trigger (speculative)
+## Rejected: soft quota budgets and the self-checkpoint trigger
 
-Tier 1 covers *involuntary* stops (the host cut the run short). A separate, more speculative
-idea is to have an agent *voluntarily* wind down before a budget is exhausted:
+An earlier draft of this design proposed a second, *voluntary* mechanism: phases would run
+with a soft quota budget and a completion reserve, and an agent reaching the soft threshold
+would decide mid-run whether it could still finish, then either wind down normally or hand
+off and exit at a safe boundary.
 
-1. A phase runs with a soft quota budget and a small completion reserve.
-2. At the soft threshold, the agent stops starting broad investigation, refactors, or new
-   optional work, and decides whether it can finish verification and its phase handoff
-   within the reserve.
-3. If it can, it receives one bounded grace period and completes normally. If it cannot, it
-   either lets the session be preserved for native resume (Tier 1) or writes a checkpoint
-   file (Tier 2) and exits at a safe boundary.
-
-The **self-checkpoint trigger** — an agent reliably deciding mid-run to wind down and hand
-off — is the unproven part of this design. The *resume-from-preserved-state* half is not:
-it now ships as Tier 1. Treat the trigger as a later experiment.
+**This idea has been dropped and should not be re-proposed.** Both tiers here deliberately
+handle only *involuntary* stops — the host cut the run short. The unproven half was the
+trigger itself: an agent reliably judging its own remaining budget mid-run and choosing to
+stop. Nothing in the two tiers depends on it, so it is not deferred work; it is out of
+scope for the design.
 
 ## Required future work
 
-**Tier 2 — fallback checkpoint file**
+**Tier 2 — fallback checkpoint file** (issue #299)
 
 The artifact has landed (issue #299 phase 1/4) and so has the continuation mechanism
 (phase 2/4): validation, the fresh sessionless run, and the prompt seeded from the checkpoint.
@@ -224,8 +220,5 @@ What still has to land before any of it runs:
 
 - The policy that selects `recoveryMode: 'checkpoint'` — a `checkpointed` run status, preserving
   the worktree because a checkpoint exists, and dispatching the bounded continuation.
-
-**Shared**
-
-- Define phase-specific soft budgets, reserves, and a maximum continuation count.
+- Bound the fallback with a maximum continuation count.
 - Add dashboard visibility and an operator action to continue or terminate a checkpointed run.
