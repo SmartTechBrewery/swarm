@@ -14,6 +14,7 @@ import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
+import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import {
 	createMockPmWebhookJob,
 	createMockProjectConfig,
@@ -3779,6 +3780,9 @@ describe('processJob', () => {
 		});
 
 		it('does not select checkpoint recovery when run tracking is unavailable', async () => {
+			const cleanup = vi
+				.spyOn(GitWorktreeManager.prototype, 'cleanup')
+				.mockResolvedValue(undefined);
 			createRun.mockRejectedValueOnce(new Error('database unavailable'));
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
 
@@ -3789,6 +3793,28 @@ describe('processJob', () => {
 
 			expect(outcome.status).toBe('phase-deferred');
 			expect(retriedPayload().recoveryMode).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledExactlyOnceWith(RESPOND_TO_CI_TRIGGER.taskId);
+			cleanup.mockRestore();
+		});
+
+		it('releases the checkout when reading the continuation budget fails', async () => {
+			const cleanup = vi
+				.spyOn(GitWorktreeManager.prototype, 'cleanup')
+				.mockResolvedValue(undefined);
+			getRunByIdFromDb
+				.mockResolvedValueOnce(undefined)
+				.mockRejectedValueOnce(new Error('database unavailable'));
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(retriedPayload().recoveryMode).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledExactlyOnceWith(RESPOND_TO_CI_TRIGGER.taskId);
+			cleanup.mockRestore();
 		});
 
 		it('fails terminally once the continuation budget is exhausted', async () => {

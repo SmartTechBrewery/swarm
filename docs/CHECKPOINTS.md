@@ -216,9 +216,10 @@ A *first*, non-resume stop that did capture a session id is Tier 1's, unchanged 
 is the regression the unit suite pins.
 
 Each of the four implementer phases then keeps its checkout when *either* tier can use it
-(`shouldPreserveFailedCheckout`). The Tier 2 half is deliberately shallow — it only asks whether
-the file is *there*, because a phase's `finally` block must not run git: parsing is the settle
-path's job and comparing against the tree is the continuation gate's.
+(`shouldPreserveFailedCheckout`). The Tier 2 half reads the hand-off file and requires it to parse
+and name this phase, matching the settle predicate so a checkout is never retained for a
+continuation that will decline it. Comparing the checkpoint against the working tree remains the
+continuation gate's job, because that requires git and a phase's `finally` block must not run git.
 
 ### Settling `checkpointed`, and the bounded continuation
 

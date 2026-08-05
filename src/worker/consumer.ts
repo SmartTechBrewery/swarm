@@ -520,13 +520,14 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
 /**
  * The Tier 2 decision for a deferrable failure (issue #503, `docs/CHECKPOINTS.md`):
  * either continue the run from the checkpoint in its preserved checkout, or report
- * that its budget for doing so is spent. Resolved by
- * {@link resolveCheckpointFallback}; `undefined` there means "not a Tier 2 case" and
- * the deferral proceeds exactly as it did before.
+ * that its budget for doing so is spent. When the budget cannot be read, it instead
+ * releases the checkout before the ordinary retry. Resolved by {@link resolveCheckpointFallback};
+ * `undefined` there means "not a Tier 2 case" and the deferral proceeds exactly as it did before.
  */
 type CheckpointFallback =
 	| { kind: 'continue'; checkpoint: Checkpoint; continuationCount: number }
-	| { kind: 'exhausted'; spent: number; max: number };
+	| { kind: 'exhausted'; spent: number; max: number }
+	| { kind: 'release' };
 
 /**
  * Decide whether this deferrable failure becomes a Tier 2 checkpoint continuation.
@@ -545,8 +546,8 @@ type CheckpointFallback =
  * the tree — a settle cannot ask git about a worktree on another machine, and a
  * mismatch there is exactly the `checkpoint-divergent` block phase 2 records.
  *
- * Fails closed on any DB error reading the count: without it the budget is unknowable,
- * and an unbounded continuation loop is worse than an ordinary deferral.
+ * A missing run row or DB error reading the count makes the budget unknowable, so this
+ * declines continuation and tells the caller to release the checkout before an ordinary retry.
  */
 async function resolveCheckpointFallback(
 	err: unknown,
@@ -576,7 +577,7 @@ async function resolveCheckpointFallback(
 		return undefined;
 	}
 
-	if (!runId) return undefined;
+	if (!runId) return { kind: 'release' };
 	let spent = 0;
 	try {
 		spent = (await getRunByIdFromDb(runId))?.continuationCount ?? 0;
@@ -585,7 +586,7 @@ async function resolveCheckpointFallback(
 			runId,
 			error: describeError(readErr),
 		});
-		return undefined;
+		return { kind: 'release' };
 	}
 	const max = resolveMaxContinuations(project);
 	if (spent >= max) return { kind: 'exhausted', spent, max };
@@ -624,6 +625,8 @@ function deferAgentRunError(
 		});
 		return undefined;
 	}
+	const checkpointContinuation =
+		checkpointFallback?.kind === 'continue' ? checkpointFallback : undefined;
 	const attempt = job.rateLimitRetryAttempt ?? 0;
 	const maxRetries = failure.kind === 'capacity' ? MAX_CAPACITY_RETRIES : MAX_RATE_LIMIT_RETRIES;
 	if (attempt >= maxRetries) {
@@ -647,7 +650,7 @@ function deferAgentRunError(
 		resetHint: 'resetHint' in failure ? failure.resetHint : undefined,
 		// Tier 2: this retry re-seeds a fresh session from the checkpoint rather than
 		// re-entering the stopped run's own session.
-		continuation: checkpointFallback ? checkpointFallback.continuationCount : undefined,
+		continuation: checkpointContinuation?.continuationCount,
 		error,
 	});
 	return {
@@ -678,8 +681,8 @@ function deferAgentRunError(
 		resumable:
 			checkpointFallback === undefined &&
 			(failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled'),
-		checkpoint: checkpointFallback?.checkpoint,
-		continuationCount: checkpointFallback?.continuationCount,
+		checkpoint: checkpointContinuation?.checkpoint,
+		continuationCount: checkpointContinuation?.continuationCount,
 		resumeDelivery: failure.kind === 'delivery' || undefined,
 		pmPhaseStarted:
 			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
@@ -2771,6 +2774,9 @@ async function handlePhaseFailure(
 	const checkpointFallback = isDeferrable
 		? await resolveCheckpointFallback(err, job, trigger, project, runId)
 		: undefined;
+	if (checkpointFallback?.kind === 'release') {
+		await new GitWorktreeManager(project).cleanup(trigger.taskId);
+	}
 	if (isDeferrable) {
 		const failure: DeferrableFailure =
 			err instanceof AgentRunError ? err.failure : { kind: 'delivery' };
