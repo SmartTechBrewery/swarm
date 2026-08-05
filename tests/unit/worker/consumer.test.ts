@@ -56,9 +56,9 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 	requireProjectPMAdapter: () => ({
 		synthesizeStateChange: (project: ProjectConfig, itemId: string) => ({
 			itemId,
-			containerId: project.githubProjects.projectId,
+			containerId: project.pm.projectId,
 			action: 'updated',
-			changedField: project.githubProjects.statusFieldId,
+			changedField: project.pm.statusFieldId,
 			changedFieldType: 'single_select',
 		}),
 	}),
@@ -1188,9 +1188,9 @@ describe('processJob', () => {
 					// The synthetic event is the provider adapter's, not the worker's.
 					event: {
 						itemId: workItem.id,
-						containerId: PROJECT.githubProjects.projectId,
+						containerId: PROJECT.pm.projectId,
 						action: 'updated',
-						changedField: PROJECT.githubProjects.statusFieldId,
+						changedField: PROJECT.pm.statusFieldId,
 						changedFieldType: 'single_select',
 					},
 				},

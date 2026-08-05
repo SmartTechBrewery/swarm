@@ -29,6 +29,19 @@ describe('toWorkerConfig', () => {
 		}
 	});
 
+	it('strips the board mapping along with the pm block it now lives under', () => {
+		const project = createMockProjectConfig();
+		const worker = toWorkerConfig(project) as Record<string, unknown>;
+		expect('pm' in worker).toBe(false);
+		// Since issue #495 the board's opaque node ids live *inside* `pm`, so dropping
+		// the block is what keeps them off the wire — there is no sibling key left that
+		// could carry them to a worker.
+		const serialized = JSON.stringify(worker);
+		for (const boardId of [project.pm.projectId, project.pm.statusFieldId]) {
+			expect(serialized).not.toContain(boardId);
+		}
+	});
+
 	it('preserves every worker-safe field value-for-value', () => {
 		const project = createMockProjectConfig();
 		const worker = toWorkerConfig(project) as Record<string, unknown>;
@@ -43,7 +56,7 @@ describe('toWorkerConfig', () => {
 		expect(worker).not.toBe(project);
 		// The full config the local / single-user path relies on is untouched.
 		expect(project.credentials.reviewer).toBe('SCM_TOKEN_REVIEWER');
-		expect(project.githubProjects).toBeDefined();
+		expect(project.pm).toBeDefined();
 	});
 });
 

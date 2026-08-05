@@ -454,6 +454,35 @@ export type ProjectVisibility = z.infer<typeof ProjectVisibilitySchema>;
 /** Every visibility value — for CLI/dashboard copy and validation. */
 export const PROJECT_VISIBILITIES = ProjectVisibilitySchema.options;
 
+/**
+ * The project's PM provider *and* that provider's own config, as one
+ * discriminated union over `type` (issue #495). Each member is
+ * `{ type: <provider id> } & <that provider's configSchema>` — composed by
+ * import from the provider's `config-schema.ts`, which stays the single source of
+ * truth for its own shape (ai/CODING_STANDARDS.md "Zod is the source of truth";
+ * the same schema the provider declares on its manifest as `configSchema`).
+ *
+ * Why a union rather than a discriminator field beside a sibling provider block:
+ * a board mapping is meaningless outside the provider it maps, so the config that
+ * belongs to a provider lives under it. Adding a second provider (Jira, Linear,
+ * Trello — `PMType`, `src/pm/types.ts`) is one new member here plus its manifest;
+ * no other central shape, the `projects` table, the repository, or the
+ * dashboard's provider-neutral board-mapping form changes.
+ *
+ * Narrowing a member back to a concrete provider's config is the *provider's* job
+ * — `requireGitHubProjectsConfig`
+ * (`src/integrations/pm/github-projects/config-schema.ts`) — never a `pm.type`
+ * branch in shared code (ai/RULES.md §2).
+ *
+ * Routing the member list through the PM registry instead of importing each
+ * provider's schema here stays deferred, exactly as `PMProviderManifest`'s own
+ * doc-comment says: the manifest already declares `configSchema`, so the day that
+ * indirection earns its keep this list is what it replaces.
+ */
+export const ProjectPmSchema = z.discriminatedUnion('type', [
+	z.object({ type: z.literal('github-projects') }).merge(githubProjectsConfigSchema),
+]);
+
 export const ProjectConfigSchema = z.object({
 	/** Stable internal identifier for this SWARM project (one Postgres row per project). */
 	id: z.string().min(1),
@@ -491,18 +520,12 @@ export const ProjectConfigSchema = z.object({
 	visibility: ProjectVisibilitySchema.default('private'),
 
 	/**
-	 * PM provider discriminator. SWARM has exactly one provider for the MVP;
-	 * the object shape (rather than a bare field) mirrors Cascade so a second
-	 * provider could be added later without reshaping the config.
+	 * The project's PM provider and its board mapping (`ProjectPmSchema`) —
+	 * **required**, and carrying no default: the provider that owns a project's
+	 * board is a deliberate choice, and its mapping (opaque board/state ids) has no
+	 * sensible default to fall back on.
 	 */
-	pm: z
-		.object({
-			type: z.literal('github-projects').default('github-projects'),
-		})
-		.default({ type: 'github-projects' }),
-
-	/** The GitHub Projects board mapping — composed from the provider's own schema. */
-	githubProjects: githubProjectsConfigSchema,
+	pm: ProjectPmSchema,
 
 	/** References to the project's GitHub credentials (see `CredentialsSchema`). */
 	credentials: CredentialsSchema,
@@ -528,6 +551,22 @@ export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;
 export type AgentsConfig = z.infer<typeof AgentsConfigSchema>;
 export type PipelineConfig = z.infer<typeof PipelineConfigSchema>;
 export type WorktreeRetentionConfig = z.infer<typeof WorktreeRetentionConfigSchema>;
+export type ProjectPm = z.infer<typeof ProjectPmSchema>;
+
+/**
+ * The *config half* of a `pm` member — the union with its `type` discriminator
+ * dropped, distributed per member so it stays a union rather than collapsing into
+ * the members' shared keys. This is what the `projects.pm_config` jsonb column
+ * holds: `pm` is persisted split into `pm_type` + this blob, so the table carries
+ * one generic column per project instead of one column per provider
+ * (`src/db/schema/projects.ts`).
+ */
+export type ProjectPmConfig = ProjectPm extends infer Member
+	? Member extends { type: unknown }
+		? Omit<Member, 'type'>
+		: never
+	: never;
+
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
 export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
 

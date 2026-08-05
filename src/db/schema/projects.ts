@@ -4,10 +4,10 @@ import type {
 	AgentsConfig,
 	Credentials,
 	PipelineConfig,
+	ProjectPmConfig,
 	WorktreeRetentionConfig,
 } from '../../config/schema.js';
 import { PROJECT_DEFAULTS } from '../../config/schema.js';
-import type { GitHubProjectsIntegrationConfig } from '../../integrations/pm/github-projects/config-schema.js';
 
 /**
  * One row per SWARM project — the persisted form of `ProjectConfig`
@@ -45,8 +45,22 @@ export const projects = pgTable('projects', {
 	 * join-request flow (#281 task 5). Never wired to execution or routing.
 	 */
 	visibility: text('visibility').notNull().default('private'),
+	/**
+	 * PM provider id — the `pm` union's discriminator (`PMType`, `src/pm/types.ts`),
+	 * stored as free `text` like `visibility`. Together with `pm_config` below it is
+	 * the persisted form of `ProjectConfig.pm`; the repository re-assembles the two
+	 * into the union member (`src/db/repositories/projectsRepository.ts`).
+	 */
 	pmType: text('pm_type').notNull().default('github-projects'),
-	githubProjects: jsonb('github_projects').$type<GitHubProjectsIntegrationConfig>().notNull(),
+	/**
+	 * The `pm_type` provider's own config — for GitHub Projects the board mapping
+	 * (`githubProjectsConfigSchema`). One *generic* jsonb column keyed by `pm_type`,
+	 * not a column per provider (issue #495): a second PM provider persists its own
+	 * config here without a migration, and nothing in this table reads inside the
+	 * blob. (The one query that does is `findProjectByBoardFromDb`'s board lookup,
+	 * which is provider-specific by construction — see its comment.)
+	 */
+	pmConfig: jsonb('pm_config').$type<ProjectPmConfig>().notNull(),
 	credentials: jsonb('credentials').$type<Credentials>().notNull(),
 	/** Per-phase agent CLI/model overrides (`AgentsConfig`) — nullable: most projects omit it entirely. */
 	agents: jsonb('agents').$type<AgentsConfig>(),

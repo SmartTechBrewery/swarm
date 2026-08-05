@@ -44,7 +44,10 @@ import type {
 } from '../../../pm/types.js';
 import { getScopedClient } from '../../scm/github/client.js';
 import { GitHubSCMIntegration } from '../../scm/github/scm-integration.js';
-import type { GitHubProjectsIntegrationConfig } from './config-schema.js';
+import {
+	type GitHubProjectsIntegrationConfig,
+	requireGitHubProjectsConfig,
+} from './config-schema.js';
 import { resolveStatusKeyByOptionId } from './status-mapping.js';
 
 /** Shape of the `content` node a Projects item wraps (Issue / PullRequest). */
@@ -391,7 +394,17 @@ export class GitHubProjectsPMProvider implements PMProvider {
 
 	private readonly scm = new GitHubSCMIntegration();
 
-	constructor(private readonly project: ProjectConfig) {}
+	/**
+	 * This project's board mapping, narrowed out of the `pm` union once at
+	 * construction (`requireGitHubProjectsConfig`) instead of at each read — the
+	 * only place this provider asserts which union member it was built for
+	 * (issue #495).
+	 */
+	private readonly config: GitHubProjectsIntegrationConfig;
+
+	constructor(private readonly project: ProjectConfig) {
+		this.config = requireGitHubProjectsConfig(project);
+	}
 
 	/** Run `fn` with the implementer persona's GitHub client bound to scope. */
 	private run<T>(fn: () => Promise<T>): Promise<T> {
@@ -409,7 +422,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			if (!item?.id) {
 				throw new Error(`GitHub Projects item '${id}' did not resolve`);
 			}
-			return toResolvedItem(item, this.project.githubProjects);
+			return toResolvedItem(item, this.config);
 		});
 	}
 
@@ -425,7 +438,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		// this board's option ID.
 		let wantedOptionId: string | undefined;
 		if (filter?.status !== undefined) {
-			wantedOptionId = this.project.githubProjects.statusOptions[filter.status];
+			wantedOptionId = this.config.statusOptions[filter.status];
 			// A status key with no mapping is a config/logic error, not "match
 			// everything": leaving it undefined would fall through to the no-filter
 			// path below and return all items. Fail loudly, matching moveWorkItem
@@ -441,7 +454,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			let cursor: string | undefined;
 			for (;;) {
 				const data = await getScopedClient().graphql<ListItemsResponse>(LIST_ITEMS_QUERY, {
-					projectId: this.project.githubProjects.projectId,
+					projectId: this.config.projectId,
 					cursor,
 				});
 				const page = data.node?.items;
@@ -458,7 +471,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			}
 			return nodes
 				.filter((n): n is ItemNode => !!n?.id)
-				.map((n) => toResolvedItem(n, this.project.githubProjects).workItem)
+				.map((n) => toResolvedItem(n, this.config).workItem)
 				.filter((wi) => wantedOptionId === undefined || wi.statusId === wantedOptionId);
 		});
 	}
@@ -474,7 +487,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	async moveWorkItem(id: string, status: string): Promise<void> {
-		const { projectId, statusFieldId, statusOptions } = this.project.githubProjects;
+		const { projectId, statusFieldId, statusOptions } = this.config;
 		const optionId = statusOptions[status];
 		if (!optionId) {
 			// A status the board mapping can't resolve is a config/logic error, not a
@@ -542,7 +555,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 
 	async createWorkItem(input: CreateWorkItemInput): Promise<WorkItem> {
 		const [owner, repo] = this.project.repo.split('/');
-		const { projectId, statusFieldId, statusOptions } = this.project.githubProjects;
+		const { projectId, statusFieldId, statusOptions } = this.config;
 		const optionId = statusOptions[input.status];
 		if (!optionId) {
 			// Same fail-loud contract as moveWorkItem: an unmappable status is a
@@ -595,7 +608,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				statusId: optionId,
 				// The caller named the canonical key, and `optionId` is its resolution —
 				// carry it back so the fresh item reads like one off a board read.
-				statusKey: resolveStatusKeyByOptionId(this.project.githubProjects, optionId),
+				statusKey: resolveStatusKeyByOptionId(this.config, optionId),
 				labels: (issue.labels ?? [])
 					.map((l) =>
 						typeof l === 'string'

@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/client.js', () => ({ getDb: vi.fn() }));
 
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
+
 import { getDb } from '@/db/client.js';
 import {
 	createProjectInDb,
@@ -27,6 +30,22 @@ function stubDb(rows: unknown[]): void {
 	vi.mocked(getDb).mockReturnValue(builder as unknown as ReturnType<typeof getDb>);
 }
 
+/** Like {@link stubDb}, but also captures the `.where()` predicate for inspection. */
+function stubDbCapturingWhere(rows: unknown[]): { where: () => SQL | undefined } {
+	let captured: SQL | undefined;
+	const builder = {
+		select: () => builder,
+		from: () => builder,
+		where: (predicate: SQL) => {
+			captured = predicate;
+			return builder;
+		},
+		limit: () => Promise.resolve(rows),
+	};
+	vi.mocked(getDb).mockReturnValue(builder as unknown as ReturnType<typeof getDb>);
+	return { where: () => captured };
+}
+
 /** Capture the `.values()` / `.onConflictDoUpdate()` args of an insert-upsert chain. */
 function stubInsert(): {
 	values: ReturnType<typeof vi.fn>;
@@ -49,7 +68,9 @@ const row = {
 	branchPrefix: 'issue-',
 	maxConcurrentJobs: 4,
 	pmType: 'github-projects',
-	githubProjects: {
+	// `pm` persists split: the discriminator in `pm_type`, the provider's own config
+	// in the generic `pm_config` blob (issue #495).
+	pmConfig: {
 		projectId: 'PVT_x',
 		statusFieldId: 'PVTSSF_x',
 		statusOptions: { backlog: 'a', planning: 'b', inProgress: 'c', inReview: 'd', done: 'e' },
@@ -104,13 +125,30 @@ describe('projectsRepository', () => {
 			const project = await findProjectByBoardFromDb('PVT_x');
 			expect(project).toMatchObject({
 				id: 'proj-1',
-				githubProjects: { projectId: 'PVT_x' },
+				pm: { type: 'github-projects', projectId: 'PVT_x' },
 			});
 		});
 
 		it('returns undefined when no project owns the board', async () => {
 			stubDb([]);
 			expect(await findProjectByBoardFromDb('PVT_unknown')).toBeUndefined();
+		});
+
+		// The board mapping moved into the renamed `pm_config` column (issue #495), and
+		// this jsonb lookup is the one query that reaches inside the blob — so assert the
+		// rendered predicate, not just the row mapping, or a stale column name would
+		// silently resolve no project for every board webhook.
+		it('matches the board node id inside the pm_config column', async () => {
+			const captured = stubDbCapturingWhere([row]);
+
+			await findProjectByBoardFromDb('PVT_x');
+
+			const predicate = captured.where();
+			expect(predicate).toBeDefined();
+			const query = new PgDialect().sqlToQuery(predicate as SQL);
+			expect(query.sql).toContain('"pm_config"->>\'projectId\'');
+			expect(query.sql).not.toContain('github_projects');
+			expect(query.params).toEqual(['PVT_x']);
 		});
 	});
 
@@ -144,13 +182,50 @@ describe('projectsRepository', () => {
 
 			const inserted = values.mock.calls[0][0];
 			expect(inserted).toMatchObject({ id: 'proj-1', pmType: 'github-projects' });
-			// The row shape is columns, not the nested `pm` object of the config.
+			// The row shape is columns, not the nested `pm` object of the config: the
+			// discriminator goes to `pm_type` and the rest of the member to `pm_config`,
+			// with no `type` key left inside the blob (issue #495).
 			expect(inserted).not.toHaveProperty('pm');
+			expect(inserted.pmConfig).toEqual({
+				projectId: project.pm.projectId,
+				statusFieldId: project.pm.statusFieldId,
+				statusOptions: project.pm.statusOptions,
+			});
 
 			const [conflict] = onConflictDoUpdate.mock.calls[0];
 			// Keyed on the id, which is itself excluded from the update set.
 			expect(conflict.set).not.toHaveProperty('id');
 			expect(conflict.set).toMatchObject({ pmType: 'github-projects' });
+		});
+
+		it('round-trips the pm union member through the two columns it persists as', async () => {
+			const { values } = stubInsert();
+			const project = createMockProjectConfig({
+				id: 'proj-1',
+				pm: {
+					type: 'github-projects',
+					projectId: 'PVT_round_trip',
+					statusFieldId: 'PVTSSF_round_trip',
+					statusOptions: { backlog: 'a', todo: 'b' },
+					phaseLabels: { 'phase-0': 'phase-0' },
+				},
+			});
+
+			await upsertProjectToDb(project);
+
+			// Read the written row back the way Postgres would hand it over — through
+			// JSON — and the config's `pm` must come out deep-equal, `phaseLabels` and
+			// all. This is the guarantee the column rename has to preserve.
+			const written = values.mock.calls[0][0] as { pmType: string; pmConfig: unknown };
+			stubDb([
+				{
+					...row,
+					pmType: written.pmType,
+					pmConfig: JSON.parse(JSON.stringify(written.pmConfig)),
+				},
+			]);
+			const reread = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
+			expect(reread?.pm).toEqual(project.pm);
 		});
 
 		it('writes agents as null when the config omits it', async () => {

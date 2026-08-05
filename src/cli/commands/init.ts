@@ -39,8 +39,10 @@ const CONFIG_TEMPLATE = {
 			worktreeRoot: PROJECT_DEFAULTS.worktreeRoot,
 			baseBranch: PROJECT_DEFAULTS.baseBranch,
 			branchPrefix: PROJECT_DEFAULTS.branchPrefix,
-			pm: { type: 'github-projects' },
-			githubProjects: {
+			// `pm` carries the provider id *and* that provider's own config — for
+			// GitHub Projects the board mapping below (`ProjectPmSchema`).
+			pm: {
+				type: 'github-projects',
 				projectId: 'PVT_xxxxxxxxxxxxxxxxxxxx',
 				statusFieldId: 'PVTSSF_xxxxxxxxxxxxxxxxxxxx',
 				statusOptions: {

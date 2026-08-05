@@ -18,16 +18,18 @@ describe('ProjectConfigSchema', () => {
 		const project = createMockProjectConfig();
 		expect(project.repo).toBe('SmartTechBrewery/swarm');
 		expect(project.credentials.reviewer).toBe('SCM_TOKEN_REVIEWER');
-		expect(project.githubProjects.statusFieldId).toBe('PVTSSF_lAHOAC3TF84BcNwDzhW4MKo');
+		expect(project.pm.type).toBe('github-projects');
+		expect(project.pm.statusFieldId).toBe('PVTSSF_lAHOAC3TF84BcNwDzhW4MKo');
 	});
 
-	it('applies worktree/branch/pm defaults when omitted', () => {
+	it('applies worktree/branch defaults when omitted', () => {
 		const project = ProjectConfigSchema.parse({
 			id: 'swarm',
 			name: 'swarm',
 			repo: 'SmartTechBrewery/swarm',
 			repoRoot: '/Users/dev/swarm/swarm',
-			githubProjects: {
+			pm: {
+				type: 'github-projects',
 				projectId: 'PVT_x',
 				statusFieldId: 'PVTSSF_y',
 				statusOptions: { backlog: 'opt-1' },
@@ -42,7 +44,6 @@ describe('ProjectConfigSchema', () => {
 		expect(project.baseBranch).toBe(PROJECT_DEFAULTS.baseBranch);
 		expect(project.branchPrefix).toBe(PROJECT_DEFAULTS.branchPrefix);
 		expect(project.maxConcurrentJobs).toBe(PROJECT_DEFAULTS.maxConcurrentJobs);
-		expect(project.pm.type).toBe('github-projects');
 	});
 
 	it('accepts only positive integer maximum concurrent jobs', () => {
@@ -56,16 +57,51 @@ describe('ProjectConfigSchema', () => {
 		expect(() => createMockProjectConfig({ repo: 'not-a-slug' })).toThrow(/owner\/repo/);
 	});
 
-	it('requires the githubProjects board mapping', () => {
+	// `pm` carries the board mapping since issue #495, so it has no default: a
+	// project with no PM block, or one naming a provider SWARM has no config member
+	// for, is rejected rather than silently defaulted onto GitHub Projects.
+	it('requires the pm block with its provider board mapping', () => {
+		const base = {
+			id: 'swarm',
+			name: 'swarm',
+			repo: 'SmartTechBrewery/swarm',
+			repoRoot: '/Users/dev/swarm/swarm',
+			credentials: { reviewer: 'B', webhookSecret: 'C' },
+		};
+		expect(() => ProjectConfigSchema.parse(base)).toThrow();
+		// Present, but without the provider's own mapping.
+		expect(() => ProjectConfigSchema.parse({ ...base, pm: { type: 'github-projects' } })).toThrow();
+		// A `PMType` value whose provider has no config member yet (src/pm/types.ts).
 		expect(() =>
-			ProjectConfigSchema.parse({
-				id: 'swarm',
-				name: 'swarm',
-				repo: 'SmartTechBrewery/swarm',
-				repoRoot: '/Users/dev/swarm/swarm',
-				credentials: { reviewer: 'B', webhookSecret: 'C' },
+			ProjectConfigSchema.parse({ ...base, pm: { type: 'jira', projectId: 'PROJ' } }),
+		).toThrow();
+	});
+
+	// The union discriminates on `type`, so each member's own schema validates the
+	// rest of the block — a GitHub Projects mapping is rejected on its own terms.
+	it('validates the selected provider member of the pm union', () => {
+		expect(() =>
+			createMockProjectConfig({
+				pm: { type: 'github-projects', projectId: 'PVT_x', statusFieldId: '', statusOptions: {} },
 			}),
 		).toThrow();
+		expect(
+			createMockProjectConfig({
+				pm: {
+					type: 'github-projects',
+					projectId: 'PVT_x',
+					statusFieldId: 'PVTSSF_y',
+					statusOptions: { backlog: 'opt-1' },
+					phaseLabels: { 'phase-0': 'phase-0' },
+				},
+			}).pm,
+		).toEqual({
+			type: 'github-projects',
+			projectId: 'PVT_x',
+			statusFieldId: 'PVTSSF_y',
+			statusOptions: { backlog: 'opt-1' },
+			phaseLabels: { 'phase-0': 'phase-0' },
+		});
 	});
 
 	it('requires every credential reference', () => {

@@ -18,7 +18,7 @@ describe('reconstructProjectConfig', () => {
 		expect(reconstructed.repo).toBe(project.repo);
 		expect(reconstructed.repoRoot).toBe(project.repoRoot);
 		expect(reconstructed.baseBranch).toBe(project.baseBranch);
-		expect(reconstructed.githubProjects).toEqual(project.githubProjects);
+		expect(reconstructed.pm).toEqual(project.pm);
 	});
 
 	it('fills an inert placeholder credentials block that satisfies CredentialsSchema', () => {

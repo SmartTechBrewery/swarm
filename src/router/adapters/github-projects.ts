@@ -25,6 +25,7 @@
 
 import { findProjectByBoard } from '../../config/provider.js';
 import type { ProjectConfig } from '../../config/schema.js';
+import { requireGitHubProjectsConfig } from '../../integrations/pm/github-projects/config-schema.js';
 import { isSwarmBot, resolvePersonaIdentities } from '../../integrations/scm/github/personas.js';
 import { logger } from '../../lib/logger.js';
 import type { PmEvent, PmEventAction } from '../../pm/events.js';
@@ -133,7 +134,7 @@ export class GitHubProjectsRouterAdapter implements PMRouterAdapter {
 	isStatusChange(event: PmEvent, project: ProjectConfig): boolean {
 		if (!event.action || !TRIGGERING_ACTIONS.has(event.action)) return false;
 		if (event.action === 'created' || event.action === 'moved') return true;
-		return event.changedField === project.githubProjects.statusFieldId;
+		return event.changedField === requireGitHubProjectsConfig(project).statusFieldId;
 	}
 
 	/**
@@ -193,11 +194,12 @@ export class GitHubProjectsRouterAdapter implements PMRouterAdapter {
 	 * leak into the worker.
 	 */
 	synthesizeStateChange(project: ProjectConfig, itemId: string): PmEvent {
+		const config = requireGitHubProjectsConfig(project);
 		return {
 			itemId,
-			containerId: project.githubProjects.projectId,
+			containerId: config.projectId,
 			action: 'updated',
-			changedField: project.githubProjects.statusFieldId,
+			changedField: config.statusFieldId,
 			changedFieldType: 'single_select',
 		};
 	}

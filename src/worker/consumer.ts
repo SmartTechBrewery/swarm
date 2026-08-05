@@ -2089,7 +2089,7 @@ async function selfEnqueueNextPhase(
 	try {
 		// The synthetic event is the *provider's* to shape: assembling one needs its
 		// own board mapping, so it comes off the adapter rather than being built from
-		// `project.githubProjects` here (ai/RULES.md §2).
+		// `project.pm`'s provider config here (ai/RULES.md §2).
 		const job: SwarmJob = {
 			type: 'pm',
 			providerId: project.pm.type,

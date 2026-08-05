@@ -23,6 +23,8 @@
 
 import { z } from 'zod';
 
+import type { ProjectConfig } from '../../../config/schema.js';
+
 export const githubProjectsConfigSchema = z
 	.object({
 		/**
@@ -71,3 +73,38 @@ export const githubProjectsConfigSchema = z
 	.describe('GitHub Projects (v2) board integration config');
 
 export type GitHubProjectsIntegrationConfig = z.infer<typeof githubProjectsConfigSchema>;
+
+/**
+ * Narrow a project's `pm` union member (`ProjectPmSchema`, `src/config/schema.ts`)
+ * to *this* provider's board mapping.
+ *
+ * Since issue #495 the board mapping lives under `project.pm`, keyed by
+ * `pm.type` — so reading it means narrowing the union, and narrowing it is the
+ * provider's own job: this helper is the single place a `pm.type === 'github-projects'`
+ * assertion is allowed to live, and every read inside this folder (plus the
+ * provider's router adapter, `src/router/adapters/github-projects.ts`) goes
+ * through it. Shared code never branches on `pm.type` (ai/RULES.md §2) — it
+ * resolves a `PMProvider`/`PMRouterAdapter` through the registry, and the
+ * implementation it gets back is the one that knows which member it holds.
+ *
+ * A mismatch is a wiring bug, not a runtime condition: the registry resolved this
+ * provider *from* `pm.type`, so the only way to get here with another provider's
+ * config is a call site that named this provider directly
+ * (ai/CODING_STANDARDS.md "Error handling").
+ */
+export function requireGitHubProjectsConfig(
+	project: ProjectConfig,
+): GitHubProjectsIntegrationConfig {
+	const pm = project.pm;
+	// Read for the message before the guard narrows `pm` — with one union member the
+	// narrowed-away branch has no `type` left to interpolate.
+	const providerId: string = pm.type;
+	if (pm.type !== 'github-projects') {
+		throw new Error(
+			`Project '${project.id}' is configured for PM provider '${providerId}', not 'github-projects' — ` +
+				'the GitHub Projects provider was resolved for a board it does not own',
+		);
+	}
+	const { type: _type, ...config } = pm;
+	return config;
+}

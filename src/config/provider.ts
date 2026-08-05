@@ -29,7 +29,7 @@ export async function findProjectByRepo(repo: string): Promise<ProjectConfig | u
 
 /**
  * Resolve the SWARM project that owns a GitHub Projects (v2) board, by its node
- * ID (`githubProjects.projectId`). The PM-side counterpart of
+ * ID (`pm.projectId`). The PM-side counterpart of
  * {@link findProjectByRepo}: a `projects_v2_item` webhook is a board event with
  * no repo, so the board node ID is what identifies the project. Returns
  * `undefined` when the board isn't tracked — "not ours", not an error.

@@ -11,6 +11,9 @@ import { createMockProjectConfig } from '../../helpers/factories.js';
  */
 export async function seedProject(overrides: Partial<ProjectConfig> = {}): Promise<ProjectConfig> {
 	const config = createMockProjectConfig(overrides);
+	// `pm` persists split into its discriminator and the provider's own config blob
+	// (`src/db/schema/projects.ts`), the same way the repository writes it.
+	const { type: pmType, ...pmConfig } = config.pm;
 	await getDb().insert(projects).values({
 		id: config.id,
 		name: config.name,
@@ -20,8 +23,8 @@ export async function seedProject(overrides: Partial<ProjectConfig> = {}): Promi
 		baseBranch: config.baseBranch,
 		branchPrefix: config.branchPrefix,
 		visibility: config.visibility,
-		pmType: config.pm.type,
-		githubProjects: config.githubProjects,
+		pmType,
+		pmConfig,
 		credentials: config.credentials,
 	});
 	return config;

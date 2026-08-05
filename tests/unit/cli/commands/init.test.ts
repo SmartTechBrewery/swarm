@@ -17,7 +17,8 @@ const VALID_CONFIG = {
 			name: 'P',
 			repo: 'owner/repo',
 			repoRoot: '/tmp/p',
-			githubProjects: {
+			pm: {
+				type: 'github-projects',
 				projectId: 'PVT_x',
 				statusFieldId: 'PVTSSF_x',
 				statusOptions: { backlog: 'OPT' },

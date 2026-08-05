@@ -13,7 +13,7 @@
 
 import { asc, eq, sql } from 'drizzle-orm';
 
-import type { ProjectConfig, ProjectVisibility } from '../../config/schema.js';
+import type { ProjectConfig, ProjectPm, ProjectVisibility } from '../../config/schema.js';
 import { getDb } from '../client.js';
 import { projectMembers } from '../schema/projectMembers.js';
 import { projects } from '../schema/projects.js';
@@ -33,8 +33,12 @@ function rowToProjectConfig(row: ProjectRow): ProjectConfig {
 		branchPrefix: row.branchPrefix,
 		maxConcurrentJobs: row.maxConcurrentJobs,
 		visibility: row.visibility as ProjectVisibility,
-		pm: { type: row.pmType as 'github-projects' },
-		githubProjects: row.githubProjects,
+		// `pm` is persisted split — the discriminator in `pm_type`, the provider's own
+		// config in the generic `pm_config` blob — so re-assembling the union member is
+		// a re-join, not a re-validation (see this file's header). The cast is what
+		// asserts the row's provider id and its blob belong to the same member; the
+		// write side below is the only thing that ever splits them apart.
+		pm: { type: row.pmType, ...row.pmConfig } as ProjectPm,
 		credentials: row.credentials,
 		agents: row.agents ?? undefined,
 		pipeline: row.pipeline ?? undefined,
@@ -44,6 +48,10 @@ function rowToProjectConfig(row: ProjectRow): ProjectConfig {
 
 /** Flatten a `ProjectConfig` into the columns needed for insertion/upsertion. */
 function projectConfigToRow(config: ProjectConfig) {
+	// Split the `pm` union member back into its two columns — the discriminator and
+	// the provider's opaque config. The counterpart of the re-join in
+	// `rowToProjectConfig`.
+	const { type: pmType, ...pmConfig } = config.pm;
 	return {
 		id: config.id,
 		name: config.name,
@@ -54,8 +62,8 @@ function projectConfigToRow(config: ProjectConfig) {
 		branchPrefix: config.branchPrefix,
 		maxConcurrentJobs: config.maxConcurrentJobs,
 		visibility: config.visibility,
-		pmType: config.pm.type,
-		githubProjects: config.githubProjects,
+		pmType,
+		pmConfig,
 		credentials: config.credentials,
 		agents: config.agents ?? null,
 		pipeline: config.pipeline ?? null,
@@ -76,12 +84,19 @@ export async function findProjectByRepoFromDb(repo: string): Promise<ProjectConf
 
 /**
  * Resolve a project by its GitHub Projects (v2) board node ID
- * (`githubProjects.projectId`, e.g. `PVT_kwHOAC3TF84BcNwD`). This is the PM-side
- * analogue of {@link findProjectByRepoFromDb}: a `projects_v2_item` webhook
- * carries the board node ID, not a repo, so the board mapping is how its SWARM
- * project is found. Matches inside the jsonb `github_projects` column via its
- * `projectId` key. Returns `undefined` for an untracked board — not our board
- * isn't an error (ai/CODING_STANDARDS.md "Error handling").
+ * (`pm.projectId`, e.g. `PVT_kwHOAC3TF84BcNwD`). This is the PM-side analogue of
+ * {@link findProjectByRepoFromDb}: a `projects_v2_item` webhook carries the board
+ * node ID, not a repo, so the board mapping is how its SWARM project is found.
+ * Returns `undefined` for an untracked board — not our board isn't an error
+ * (ai/CODING_STANDARDS.md "Error handling").
+ *
+ * Matches inside the generic jsonb `pm_config` column via its `projectId` key.
+ * That key is **provider-specific** — it is only meaningful for a row whose
+ * `pm_type` is `github-projects`, since another provider's config names its
+ * container differently — so this lookup is deliberately GitHub-Projects-shaped
+ * and only its router adapter calls it. A second provider resolving a project
+ * from a board event gets its own lookup (or this one grows a `pm_type` filter
+ * and a per-provider key), rather than sharing this predicate.
  */
 export async function findProjectByBoardFromDb(
 	projectNodeId: string,
@@ -89,7 +104,7 @@ export async function findProjectByBoardFromDb(
 	const rows = await getDb()
 		.select()
 		.from(projects)
-		.where(sql`${projects.githubProjects}->>'projectId' = ${projectNodeId}`)
+		.where(sql`${projects.pmConfig}->>'projectId' = ${projectNodeId}`)
 		.limit(1);
 	const row = rows[0];
 	return row ? rowToProjectConfig(row) : undefined;
