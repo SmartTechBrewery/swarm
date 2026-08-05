@@ -1,5 +1,7 @@
+import { join } from 'node:path';
 import { z } from 'zod';
 import type { ProjectConfig } from '../config/schema.js';
+import { validateMigrationJournal } from '../db/migration-journal.js';
 import {
 	type AgentCli,
 	type AgentCliResult,
@@ -9,6 +11,7 @@ import {
 import { agentRunError } from '../harness/agent-failure.js';
 import type { ReasoningLevel } from '../harness/models.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
+import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { RecoveryMode } from '../queue/jobs.js';
 import {
@@ -27,7 +30,10 @@ import {
 } from '../scm/delivery.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
-import { buildResolveConflictsPrompt } from './prompts/resolve-conflicts.js';
+import {
+	buildMigrationJournalRepairPrompt,
+	buildResolveConflictsPrompt,
+} from './prompts/resolve-conflicts.js';
 import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
@@ -83,6 +89,88 @@ export interface RunResolveConflictsPhaseOptions {
 	runAgent?: typeof runAgentCli;
 	graft?: typeof graftEnvironment;
 	delivery?: ScmDeliveryProvider;
+}
+
+interface GuardMigrationJournalOptions {
+	worktreePath: string;
+	cli: AgentCli;
+	model?: string;
+	reasoning?: ReasoningLevel;
+	/** The session to continue, so the repair pass still holds the merge it just did. */
+	resumeSessionId?: string;
+	taskId: string;
+	prNumber: string;
+	headSha: string;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	runAgent: typeof runAgentCli;
+}
+
+/**
+ * Deterministic backstop behind {@link buildResolveConflictsPrompt}'s migration
+ * guidance (see that prompt's `MIGRATION_CONFLICT_GUIDANCE` and this module's
+ * header — issue #503/#508's own incident): validate the merge this call just
+ * produced against drizzle's own migration-journal invariants, and — mirroring
+ * `readReviewSubmission`/`repairReviewHandoff`'s one-repair-pass shape in
+ * `src/pipeline/review.ts` — give the same agent session exactly one chance to
+ * fix it with the validator's own complaint before failing the phase outright.
+ *
+ * Runs before any commit/push (the caller places this ahead of
+ * `commitPreparedTree`), so a still-broken journal after the repair pass fails
+ * the phase with nothing delivered — never a broken migration state pushed to
+ * the PR for a human or a future review pass to discover instead.
+ */
+async function guardMigrationJournal(options: GuardMigrationJournalOptions): Promise<void> {
+	const { worktreePath, taskId, prNumber, headSha } = options;
+	const migrationsDir = join(worktreePath, 'src/db/migrations');
+	const issues = validateMigrationJournal(migrationsDir);
+	if (issues.length === 0) return;
+
+	logger.warn(
+		'resolve-conflicts: merged migration journal failed validation — running one repair pass',
+		{ taskId, prNumber, headSha, issues },
+	);
+	try {
+		const repairAgent = await options.runAgent({
+			cli: options.cli,
+			model: options.model,
+			reasoning: options.reasoning,
+			resumeSessionId: options.resumeSessionId,
+			cwd: worktreePath,
+			args: [buildMigrationJournalRepairPrompt(issues)],
+			maxOutputBytes: 1_000_000,
+			logContext: { taskId, phase: 'resolve-conflicts-migration-repair', prNumber, headSha },
+			timeoutMs: options.timeoutMs,
+			signal: options.signal,
+		});
+		if (repairAgent.exitCode !== 0) {
+			logger.warn('resolve-conflicts: migration-journal repair pass exited non-zero', {
+				taskId,
+				prNumber,
+				headSha,
+				exitCode: repairAgent.exitCode,
+			});
+		}
+	} catch (error) {
+		logger.warn('resolve-conflicts: migration-journal repair pass could not be run', {
+			taskId,
+			prNumber,
+			headSha,
+			error: describeError(error),
+		});
+	}
+
+	const remaining = validateMigrationJournal(migrationsDir);
+	if (remaining.length > 0) {
+		throw new Error(
+			`resolve-conflicts: merged migration journal for PR #${prNumber} still fails validation after one repair pass: ${remaining.join(' ')}`,
+		);
+	}
+	logger.info('resolve-conflicts: migration-journal repair pass fixed the merge', {
+		taskId,
+		prNumber,
+		headSha,
+	});
 }
 
 export async function runResolveConflictsPhase(
@@ -187,6 +275,26 @@ export async function runResolveConflictsPhase(
 			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
 			ConflictHandoffSchema,
 		);
+		// A resumed delivery already passed this gate in the attempt that first
+		// wrote `handoff` — delivery progress only exists past this point — so it
+		// is safe to skip here; only a fresh merge this call actually produced
+		// needs checking. See the module header and `validateMigrationJournal`'s
+		// own header for why this exists at all (issue #503/#508).
+		if (!shouldResumeDelivery) {
+			await guardMigrationJournal({
+				worktreePath: handle.path,
+				cli,
+				model,
+				reasoning,
+				resumeSessionId: agent.sessionId ?? (resumed ? resumeSessionId : sessionId),
+				taskId,
+				prNumber,
+				headSha,
+				timeoutMs,
+				signal,
+				runAgent,
+			});
+		}
 		const delivery =
 			options.delivery ??
 			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
