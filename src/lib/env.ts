@@ -36,6 +36,33 @@ export function getControlPlaneUrl(): string | undefined {
 }
 
 /**
+ * SWARM's own public base URL (`WEBHOOK_CALLBACK_BASE_URL`), or `undefined` when
+ * unset/empty — the ingress half of the same value GitHub's webhook (and the
+ * Cloudflare Tunnel serving it) is configured with, e.g.
+ * `https://swarm.example.com`.
+ *
+ * Needed because a PM provider's signature scheme can cover SWARM's *own*
+ * callback URL rather than the body alone: Trello signs
+ * `HMAC(rawBody + callbackUrl)` (Cascade's `buildTrelloCallbackUrl`), so a
+ * verifier that cannot name the URL the delivery arrived at cannot verify at all.
+ * Deriving that URL from the request's own `Host` header works behind a
+ * well-behaved proxy but is attacker-controlled and silently wrong behind one
+ * that rewrites it, so this setting is the authoritative override
+ * (`src/router/webhook-callback-url.ts` resolves the effective URL, warning when
+ * neither is available).
+ *
+ * A trailing slash is trimmed so callers can concatenate a route path without
+ * producing a double slash — the signed string must match the provider's byte for
+ * byte.
+ */
+export function resolveWebhookCallbackBaseUrl(
+	raw = process.env.WEBHOOK_CALLBACK_BASE_URL,
+): string | undefined {
+	const value = (raw ?? '').trim().replace(/\/+$/, '');
+	return value === '' ? undefined : value;
+}
+
+/**
  * Whether SWARM's local single-user mode is enabled (`SWARM_SINGLE_USER_MODE`).
  *
  * A disabled-by-default API authentication policy for a local, single-operator
