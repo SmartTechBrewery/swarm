@@ -40,6 +40,7 @@ import {
 	getLatestRunForTask,
 	getRunByIdFromDb,
 	hasCompletedRunForTask,
+	isRetryPendingStatus,
 	resetRunToRunning,
 	storeRunLogs,
 	updateRunJobPayload,
@@ -575,17 +576,16 @@ async function resolveCheckpointFallback(
 		return undefined;
 	}
 
+	if (!runId) return undefined;
 	let spent = 0;
-	if (runId) {
-		try {
-			spent = (await getRunByIdFromDb(runId))?.continuationCount ?? 0;
-		} catch (readErr) {
-			logger.error('Failed to read the continuation count — deferring without a continuation', {
-				runId,
-				error: describeError(readErr),
-			});
-			return undefined;
-		}
+	try {
+		spent = (await getRunByIdFromDb(runId))?.continuationCount ?? 0;
+	} catch (readErr) {
+		logger.error('Failed to read the continuation count — deferring without a continuation', {
+			runId,
+			error: describeError(readErr),
+		});
+		return undefined;
 	}
 	const max = resolveMaxContinuations(project);
 	if (spent >= max) return { kind: 'exhausted', spent, max };
@@ -1835,7 +1835,8 @@ async function tryReuseLatestRun(
 	implementationUnplanned = false,
 ): Promise<string | undefined> {
 	const prior = await getLatestRunForTask(project.id, trigger.taskId, trigger.phase);
-	if (!prior || (prior.status !== 'deferred' && prior.status !== 'failed')) return undefined;
+	if (!prior || (!isRetryPendingStatus(prior.status) && prior.status !== 'failed'))
+		return undefined;
 	if (job.resumeSession && prior.agentSessionId) {
 		job.agentSessionId = prior.agentSessionId;
 	} else if (!job.resumeSession) {

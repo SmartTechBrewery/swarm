@@ -308,7 +308,12 @@ export async function runRespondToCiPhase(
 			);
 			// Either tier may claim this checkout: Tier 1's resumable session, or — when it
 			// cannot apply — the Tier 2 checkpoint the agent left in the worktree.
-			preserveForResume = shouldPreserveFailedCheckout(error, handle.path, resumed);
+			preserveForResume = shouldPreserveFailedCheckout(
+				error,
+				handle.path,
+				'respond-to-ci',
+				resumed,
+			);
 			throw error;
 		}
 

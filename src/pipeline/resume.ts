@@ -32,7 +32,7 @@ import type { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
 import {
 	type Checkpoint,
-	hasCheckpoint,
+	tryReadCheckpoint,
 	validateCheckpointForContinuation,
 } from '@/pipeline/checkpoint.js';
 import { isRunCancellationRequested } from '@/queue/cancellation.js';
@@ -100,23 +100,25 @@ export function checkpointFallbackApplies(
 
 /**
  * Whether a failed run's worktree must be kept for a Tier 2 *checkpoint*
- * continuation: {@link checkpointFallbackApplies} holds and the checkout actually
- * carries a checkpoint file to continue from.
+ * continuation: {@link checkpointFallbackApplies} holds and the checkout carries a
+ * parseable checkpoint for this phase to continue from.
  *
- * Deliberately synchronous and shallow — it only asks whether the file is *there*.
- * Parsing it is the settle path's job (`src/worker/consumer.ts`) and validating it
- * against the tree on disk is the continuation gate's
+ * Deliberately synchronous and shallow — it reads only the hand-off file. Tree
+ * validation remains the continuation gate's
  * ({@link validateCheckpointForContinuation}); a phase's `finally` block must not
- * run git to decide whether to clean up. Each implementer phase ORs this with
+ * run git to decide whether to clean up. Matching the settle path's file and phase
+ * predicate ensures no checkout is retained for a continuation it will decline.
+ * Each implementer phase ORs this with
  * {@link shouldPreserveForResume} so the checkout survives whichever tier claims it.
  */
 export function shouldPreserveForCheckpoint(
 	error: AgentRunError,
 	worktreePath: string,
+	phase: TriggerPhase,
 	wasSessionResume = false,
 ): boolean {
 	if (!checkpointFallbackApplies(error, wasSessionResume)) return false;
-	return hasCheckpoint(worktreePath);
+	return tryReadCheckpoint(worktreePath)?.phase === phase;
 }
 
 /**
@@ -133,10 +135,12 @@ export function shouldPreserveForCheckpoint(
 export function shouldPreserveFailedCheckout(
 	error: AgentRunError,
 	worktreePath: string,
+	phase: TriggerPhase,
 	resumed: boolean,
 ): boolean {
 	return (
-		shouldPreserveForResume(error) || shouldPreserveForCheckpoint(error, worktreePath, resumed)
+		shouldPreserveForResume(error) ||
+		shouldPreserveForCheckpoint(error, worktreePath, phase, resumed)
 	);
 }
 

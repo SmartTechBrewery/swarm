@@ -465,7 +465,12 @@ export async function runImplementationPhase(
 			);
 			// Either tier may claim this checkout: Tier 1's resumable session, or — when it
 			// cannot apply — the Tier 2 checkpoint the agent left in the worktree.
-			preserveForResume = shouldPreserveFailedCheckout(error, handle.path, resumed);
+			preserveForResume = shouldPreserveFailedCheckout(
+				error,
+				handle.path,
+				'implementation',
+				resumed,
+			);
 			throw error;
 		}
 

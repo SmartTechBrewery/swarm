@@ -284,6 +284,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		getLatestCompletedPlanningScope(projectId, taskId),
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
+	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
 	resetRunToRunning: (...args: unknown[]) => {
 		resetRunSessionColumns.push(args[7] as string | null | undefined);
 		resetRunBindings.push({
@@ -3194,6 +3195,7 @@ describe('processJob', () => {
 		it.each([
 			'failed',
 			'deferred',
+			'checkpointed',
 		] as const)('reuses the latest %s row for a fresh webhook', async (status) => {
 			getLatestRunForTask.mockResolvedValueOnce({ id: `run-${status}`, status } as never);
 
@@ -3774,6 +3776,19 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({ status: 'deferred', checkpoint: undefined }),
 			);
+		});
+
+		it('does not select checkpoint recovery when run tracking is unavailable', async () => {
+			createRun.mockRejectedValueOnce(new Error('database unavailable'));
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: undefined }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(retriedPayload().recoveryMode).toBeUndefined();
 		});
 
 		it('fails terminally once the continuation budget is exhausted', async () => {

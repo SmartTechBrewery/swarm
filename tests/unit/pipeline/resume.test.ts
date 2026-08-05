@@ -231,39 +231,55 @@ describe('checkpointFallbackApplies / shouldPreserveForCheckpoint (issue #503)',
 
 	it('preserves the checkout when the fallback applies and a checkpoint is there', () => {
 		const path = preservedCheckout(CHECKPOINT);
-		expect(shouldPreserveForCheckpoint(stopped('rate-limit'), path)).toBe(true);
+		expect(shouldPreserveForCheckpoint(stopped('rate-limit'), path, 'implementation')).toBe(true);
 	});
 
 	it('does not preserve the checkout when no checkpoint was written', () => {
 		const path = preservedCheckout();
-		expect(shouldPreserveForCheckpoint(stopped('rate-limit'), path)).toBe(false);
+		expect(shouldPreserveForCheckpoint(stopped('rate-limit'), path, 'implementation')).toBe(false);
 	});
 
-	// Presence is all this predicate asks about: parsing is the settle path's job and
-	// the tree comparison is the continuation gate's, so a checkout carrying a bad file
-	// is still kept rather than deleted before anything can diagnose it.
-	it('preserves the checkout for an unparseable checkpoint, leaving the verdict to the gate', () => {
+	it('does not preserve the checkout for an unparseable checkpoint', () => {
 		const path = preservedCheckout({ nonsense: true });
-		expect(shouldPreserveForCheckpoint(stopped('timeout'), path)).toBe(true);
+		expect(shouldPreserveForCheckpoint(stopped('timeout'), path, 'implementation')).toBe(false);
+	});
+
+	it('does not preserve the checkout for a checkpoint another phase wrote', () => {
+		const path = preservedCheckout({ ...CHECKPOINT, phase: 'respond-to-ci' });
+		expect(shouldPreserveForCheckpoint(stopped('timeout'), path, 'implementation')).toBe(false);
 	});
 
 	it('does not preserve the checkout when Tier 1 can serve the stop', () => {
 		const path = preservedCheckout(CHECKPOINT);
-		expect(shouldPreserveForCheckpoint(stopped('rate-limit', 'session-123'), path, false)).toBe(
-			false,
-		);
+		expect(
+			shouldPreserveForCheckpoint(
+				stopped('rate-limit', 'session-123'),
+				path,
+				'implementation',
+				false,
+			),
+		).toBe(false);
 	});
 
 	it('keeps either tier able to claim the checkout', () => {
 		const path = preservedCheckout(CHECKPOINT);
 		// Tier 1's own case — no checkpoint needed.
 		expect(
-			shouldPreserveFailedCheckout(stopped('timeout', 'session-123'), '/nonexistent', false),
+			shouldPreserveFailedCheckout(
+				stopped('timeout', 'session-123'),
+				'/nonexistent',
+				'implementation',
+				false,
+			),
 		).toBe(true);
 		// Tier 2's — no session, but a checkpoint.
-		expect(shouldPreserveFailedCheckout(stopped('timeout'), path, false)).toBe(true);
+		expect(shouldPreserveFailedCheckout(stopped('timeout'), path, 'implementation', false)).toBe(
+			true,
+		);
 		// Neither.
-		expect(shouldPreserveFailedCheckout(stopped('timeout'), '/nonexistent', false)).toBe(false);
+		expect(
+			shouldPreserveFailedCheckout(stopped('timeout'), '/nonexistent', 'implementation', false),
+		).toBe(false);
 	});
 });
 

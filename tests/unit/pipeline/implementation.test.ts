@@ -5,10 +5,8 @@ let prFileExists: boolean;
 let prFileContents: string;
 let blockedReasonFileExists: boolean;
 let blockedReasonFileContents: string;
-// The Tier 2 checkpoint's presence is what decides whether a sessionless
-// involuntary stop preserves the checkout, so it gets its own switch rather than
-// riding on the PR-URL file's (issue #503).
 let checkpointFileExists: boolean;
+let checkpointFileContents: string;
 vi.mock('node:fs', () => ({
 	existsSync: (path: unknown) => {
 		const name = String(path);
@@ -16,8 +14,12 @@ vi.mock('node:fs', () => ({
 		if (name.endsWith('swarm_checkpoint.json')) return checkpointFileExists;
 		return prFileExists;
 	},
-	readFileSync: (path: unknown) =>
-		String(path).endsWith('blocked_reason.md') ? blockedReasonFileContents : prFileContents,
+	readFileSync: (path: unknown) => {
+		const name = String(path);
+		if (name.endsWith('blocked_reason.md')) return blockedReasonFileContents;
+		if (name.endsWith('swarm_checkpoint.json')) return checkpointFileContents;
+		return prFileContents;
+	},
 }));
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
@@ -118,6 +120,7 @@ describe('runImplementationPhase', () => {
 		blockedReasonFileExists = false;
 		blockedReasonFileContents = '';
 		checkpointFileExists = false;
+		checkpointFileContents = '';
 	});
 
 	it('defers (throws DependencyBlockedError) when the item is blocked by an open prerequisite', async () => {
@@ -542,10 +545,9 @@ describe('runImplementationPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 	});
 
-	// Tier 2 (issue #503): with no session to resume, the checkpoint the agent left
-	// behind is the only thing worth keeping the checkout for — so it is kept.
 	it('preserves the worktree for a checkpoint continuation when a sessionless stop left one', async () => {
 		checkpointFileExists = true;
+		checkpointFileContents = JSON.stringify(CONTINUATION);
 		const deps = makeDeps();
 		deps.runAgent = vi.fn(async () =>
 			agentResult({
@@ -555,6 +557,20 @@ describe('runImplementationPhase', () => {
 		);
 		await expect(runImplementationPhase(deps)).rejects.toThrow(/rate limited/);
 		expect(deps.worktrees.cleanup).not.toHaveBeenCalled();
+	});
+
+	it('cleans up when a sessionless stop left an invalid checkpoint', async () => {
+		checkpointFileExists = true;
+		checkpointFileContents = JSON.stringify({ nonsense: true });
+		const deps = makeDeps();
+		deps.runAgent = vi.fn(async () =>
+			agentResult({
+				exitCode: 1,
+				stdout: "You've hit your session limit · resets 1:40pm (Europe/Warsaw)\n",
+			}),
+		);
+		await expect(runImplementationPhase(deps)).rejects.toThrow(/rate limited/);
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 	});
 });
 

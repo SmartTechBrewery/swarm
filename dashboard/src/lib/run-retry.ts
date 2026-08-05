@@ -28,8 +28,8 @@ export type RetryActionKind = 'resume' | 'recheck' | 'retry';
  * Which primary action the run offers. A `deferred` run that still holds a
  * captured `agentSessionId` is one whose pending retry will *continue* that
  * session (the exact condition the router pins the worktree for —
- * `hasResumableDeferredRun`: `status = 'deferred' AND agent_session_id IS NOT
- * NULL`), so it's a "resume"; a terminally `failed` run whose worktree was
+ * `hasResumableDeferredRun`: `status IN ('deferred', 'failed', 'checkpointed') AND
+ * (agent_session_id IS NOT NULL OR status = 'checkpointed')`), so it's a "resume"; a terminally `failed` run whose worktree was
  * `preserved` for its captured session is likewise a "resume".
  *
  * A `failed` run whose worktree stayed `blocked` (dirty/unpushed/live-leased/

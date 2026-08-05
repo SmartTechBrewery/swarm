@@ -72,7 +72,9 @@ type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed
 export const RETRY_PENDING_RUN_STATUSES = ['deferred', 'checkpointed'] as const;
 
 /** Whether a stored status string is one of {@link RETRY_PENDING_RUN_STATUSES}. */
-export function isRetryPendingStatus(status: string): boolean {
+export function isRetryPendingStatus(
+	status: string,
+): status is (typeof RETRY_PENDING_RUN_STATUSES)[number] {
 	return (RETRY_PENDING_RUN_STATUSES as readonly string[]).includes(status);
 }
 
