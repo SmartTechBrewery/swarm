@@ -1,9 +1,11 @@
 /**
  * GitLabSCMIntegration — GitLab.com's implementation of the provider-neutral
  * {@link SCMProvider} contract (`src/scm/types.ts`), built out over four phases
- * (issue #295) along the same seams Bitbucket used. This is phase 1/4:
- * availability probing, persona credential scoping, and persona identity / actor
- * resolution.
+ * (issue #295) along the same seams Bitbucket used. Built so far: availability
+ * probing, persona credential scoping, and persona identity / actor resolution
+ * (phase 1/4), plus the whole inbound half — header interpretation, delivery
+ * authentication, event normalization, and the comment loop-prevention gate,
+ * which all delegate to `./webhook.ts` (phase 2/4).
  *
  * Its core job is the same as the GitHub and Bitbucket classes': run a block of
  * GitLab operations under the correct persona's token. Callers hand it a project
@@ -13,11 +15,11 @@
  * push as the implementer without either token appearing in a signature
  * (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Every method this phase does not implement throws** — loudly, naming the
- * method and the phase that fills it in — rather than returning `null`, `[]`, or
- * a no-op that would read as a real answer. `verifyWebhookSignature`,
- * `readWebhookRequest`, `personaForActor` and `isSwarmActor` are synchronous in
- * the contract, so their stubs throw synchronously rather than rejecting.
+ * **Every method a later phase owns throws** — loudly, naming the method and the
+ * phase that fills it in — rather than returning `null`, `[]`, or a no-op that
+ * would read as a real answer. What is left is the merge-request reads (phase
+ * 3/4) and the comments/delivery/merge writes (phase 4/4), all of them `async` in
+ * the contract, so those stubs reject rather than throwing synchronously.
  *
  * Unlike Bitbucket's phase 1, **nothing registers this provider yet**: the
  * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
@@ -39,6 +41,7 @@ import type {
 	ScmPersona,
 	ScmPersonaIdentities,
 	ScmWebhookRequest,
+	WebhookHeaderReader,
 } from '../../../scm/types.js';
 import { withGitLabToken } from './client.js';
 import { getGitLabToken, getGitLabTokenOrNull } from './credentials.js';
@@ -47,6 +50,12 @@ import {
 	isSwarmGitLabActor,
 	resolveGitLabPersonaIdentities,
 } from './personas.js';
+import {
+	isSwarmGeneratedGitLabEvent,
+	parseGitLabWebhook,
+	readGitLabWebhookRequest,
+	verifyGitLabWebhookToken,
+} from './webhook.js';
 
 /**
  * The single exit for every contract method this phase leaves unbuilt. `phase`
@@ -59,7 +68,6 @@ function notImplementedYet(method: string, phase: string): never {
 	);
 }
 
-const WEBHOOK_PHASE = 'phase 2/4 (webhook ingress)';
 const READ_PHASE = 'phase 3/4 (merge-request reads)';
 const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
 
@@ -116,23 +124,33 @@ export class GitLabSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: webhook ingress — phase 2/4
+	// Webhook ingress — phase 2/4
 	// ==========================================================================
 
-	verifyWebhookSignature(): boolean {
-		notImplementedYet('verifyWebhookSignature', WEBHOOK_PHASE);
+	/**
+	 * {@link SCMProvider.verifyWebhookSignature} — a timing-safe comparison of the
+	 * `X-Gitlab-Token` value against the project's secret, *not* an HMAC over the
+	 * body: that is the mechanism GitLab itself provides. `./webhook.ts` records the
+	 * GitLab 19.0 signing-token upgrade as a follow-up and why it needs the contract
+	 * widened first.
+	 */
+	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean {
+		return verifyGitLabWebhookToken(rawBody, signature, secret);
 	}
 
-	readWebhookRequest(): ScmWebhookRequest {
-		notImplementedYet('readWebhookRequest', WEBHOOK_PHASE);
+	/** {@link SCMProvider.readWebhookRequest} — GitLab's event / event-UUID / token headers. */
+	readWebhookRequest(header: WebhookHeaderReader): ScmWebhookRequest {
+		return readGitLabWebhookRequest(header);
 	}
 
-	parseWebhookEvent(): ScmEvent | null {
-		notImplementedYet('parseWebhookEvent', WEBHOOK_PHASE);
+	/** {@link SCMProvider.parseWebhookEvent} — merge-request, note and pipeline hooks; `null` otherwise. */
+	parseWebhookEvent(eventName: string, payload: unknown): ScmEvent | null {
+		return parseGitLabWebhook(eventName, payload);
 	}
 
-	async isSwarmGeneratedEvent(): Promise<boolean> {
-		notImplementedYet('isSwarmGeneratedEvent', WEBHOOK_PHASE);
+	/** {@link SCMProvider.isSwarmGeneratedEvent} — the comment-scoped loop-prevention gate. */
+	async isSwarmGeneratedEvent(event: ScmEvent, project: ProjectConfig): Promise<boolean> {
+		return isSwarmGeneratedGitLabEvent(event, project);
 	}
 
 	// ==========================================================================

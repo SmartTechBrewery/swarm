@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig } from '../../../../helpers/factories.js';
+import {
+	createMockGitLabMergeRequestPayload,
+	createMockProjectConfig,
+	createMockScmEvent,
+} from '../../../../helpers/factories.js';
 
 vi.mock('@/integrations/scm/gitlab/client.js', () => ({
 	// Pass-through so a probe inside the scope can observe the token that would
@@ -25,6 +29,7 @@ import {
 	resolveGitLabPersonaIdentities,
 } from '@/integrations/scm/gitlab/personas.js';
 import { GitLabSCMIntegration } from '@/integrations/scm/gitlab/scm-integration.js';
+import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
@@ -125,15 +130,65 @@ describe('GitLabSCMIntegration', () => {
 		});
 	});
 
-	// Every contract method this phase leaves unbuilt must fail loudly and name its
-	// follow-up phase — never return a misleading `null`/`[]`/no-op that a caller
-	// would mistake for a real answer (issue #295).
+	// The four webhook-ingress methods delegate to `./webhook.ts`, whose own suite
+	// covers the header names, every event mapping, and the token comparison. These
+	// assert only that the contract methods are wired to it rather than still
+	// throwing their phase-1 stub.
+	describe('webhook ingress', () => {
+		it('reads GitLab headers through the provider', () => {
+			const headers: Record<string, string> = {
+				'x-gitlab-event': 'Merge Request Hook',
+				'x-gitlab-event-uuid': 'delivery-1',
+				'x-gitlab-token': 'sh4red-t0ken',
+			};
+			expect(scm.readWebhookRequest((name) => headers[name.toLowerCase()])).toEqual({
+				eventName: 'Merge Request Hook',
+				deliveryId: 'delivery-1',
+				signature: 'sh4red-t0ken',
+			});
+		});
+
+		it('accepts the configured secret token and rejects anything else', () => {
+			const rawBody = '{"object_kind":"merge_request"}';
+			const secret = 'sh4red-t0ken';
+
+			expect(scm.verifyWebhookSignature(rawBody, secret, secret)).toBe(true);
+			expect(scm.verifyWebhookSignature(rawBody, 'other-token', secret)).toBe(false);
+			expect(scm.verifyWebhookSignature(rawBody, '', secret)).toBe(false);
+		});
+
+		it('normalizes a supported event and drops an unsupported one', () => {
+			const payload = createMockGitLabMergeRequestPayload();
+			expect(scm.parseWebhookEvent('Merge Request Hook', payload)).toMatchObject({
+				kind: 'pull-request',
+				action: 'opened',
+				workItemId: '17',
+			});
+			expect(scm.parseWebhookEvent('Push Hook', payload)).toBeNull();
+		});
+
+		it('applies the comment-scoped SWARM-origin gate', async () => {
+			const marked = createMockScmEvent({
+				kind: 'work-item-comment',
+				isCommentEvent: true,
+				commentBody: `Done.\n\n${SWARM_GENERATED_FOOTER}`,
+			});
+			await expect(scm.isSwarmGeneratedEvent(marked, project)).resolves.toBe(true);
+
+			const human = createMockScmEvent({
+				kind: 'work-item-comment',
+				isCommentEvent: true,
+				commentBody: 'please rebase',
+			});
+			await expect(scm.isSwarmGeneratedEvent(human, project)).resolves.toBe(false);
+		});
+	});
+
+	// Every contract method a later phase owns must fail loudly and name that
+	// phase — never return a misleading `null`/`[]`/no-op that a caller would
+	// mistake for a real answer (issue #295).
 	describe('deferred contract methods', () => {
 		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['verifyWebhookSignature', 'phase 2/4', () => scm.verifyWebhookSignature()],
-			['readWebhookRequest', 'phase 2/4', () => scm.readWebhookRequest()],
-			['parseWebhookEvent', 'phase 2/4', () => scm.parseWebhookEvent()],
-			['isSwarmGeneratedEvent', 'phase 2/4', () => scm.isSwarmGeneratedEvent()],
 			['getPullRequest', 'phase 3/4', () => scm.getPullRequest()],
 			['getPullRequestTitle', 'phase 3/4', () => scm.getPullRequestTitle()],
 			['getAggregateCheckStatus', 'phase 3/4', () => scm.getAggregateCheckStatus()],

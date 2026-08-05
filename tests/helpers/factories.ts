@@ -318,6 +318,182 @@ export function createMockBitbucketBuildStatusResponse(
 	};
 }
 
+/** A GitLab user object as it appears in a webhook body (`user`, `reviewers[]`). */
+function gitlabUser(username: string, id: number): Record<string, unknown> {
+	return {
+		id,
+		name: username,
+		username,
+		avatar_url: `https://gitlab.com/uploads/-/system/user/avatar/${id}/avatar.png`,
+		email: `${username}@example.com`,
+	};
+}
+
+/** The GitLab `project` object every hook carries — `path_with_namespace` is what SWARM matches on. */
+function gitlabProject(): Record<string, unknown> {
+	return {
+		id: 42,
+		name: 'swarm',
+		path_with_namespace: 'jkwiecien/swarm',
+		web_url: 'https://gitlab.com/jkwiecien/swarm',
+		default_branch: 'main',
+	};
+}
+
+/** The `last_commit` object a merge request carries — GitLab reports **full** 40-character SHAs. */
+function gitlabLastCommit(): Record<string, unknown> {
+	return {
+		id: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		message: 'Add a thing',
+		url: 'https://gitlab.com/jkwiecien/swarm/-/commit/da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		author: { name: 'human-dev', email: 'human-dev@example.com' },
+	};
+}
+
+/**
+ * A raw GitLab `Merge Request Hook` webhook body, for driving the GitLab webhook
+ * adapter. Defaults follow GitLab's own webhook-events reference — including the
+ * **full 40-character** `last_commit.id`, since GitLab (unlike Bitbucket) never
+ * abbreviates. Nested overrides replace the whole sub-object (shallow merge),
+ * same as {@link createMockBitbucketPullRequestPayload}. Returns a plain object —
+ * a webhook payload is untrusted input the adapter parses, not a validated config
+ * shape.
+ */
+export function createMockGitLabMergeRequestPayload(
+	overrides: {
+		user?: Record<string, unknown>;
+		objectAttributes?: Record<string, unknown>;
+		project?: Record<string, unknown>;
+		reviewers?: Array<Record<string, unknown>>;
+		objectKind?: string;
+	} = {},
+): Record<string, unknown> {
+	return {
+		object_kind: overrides.objectKind ?? 'merge_request',
+		event_type: 'merge_request',
+		user: overrides.user ?? gitlabUser('human-dev', 6),
+		project: overrides.project ?? gitlabProject(),
+		object_attributes: {
+			id: 99,
+			iid: 17,
+			title: 'Add a thing',
+			state: 'opened',
+			action: 'open',
+			draft: false,
+			work_in_progress: false,
+			author_id: 6,
+			source_branch: 'swarm/issue-17',
+			target_branch: 'main',
+			source_project_id: 42,
+			target_project_id: 42,
+			last_commit: gitlabLastCommit(),
+			url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+			...overrides.objectAttributes,
+		},
+		reviewers: overrides.reviewers ?? [],
+		labels: [],
+	};
+}
+
+/**
+ * A raw GitLab `Note Hook` webhook body. `noteable_type` defaults to
+ * `MergeRequest` — the only target SWARM acts on — and `system` to `false`, since
+ * GitLab's own bookkeeping notes are the case the adapter drops.
+ */
+export function createMockGitLabNotePayload(
+	overrides: {
+		user?: Record<string, unknown>;
+		objectAttributes?: Record<string, unknown>;
+		project?: Record<string, unknown>;
+		mergeRequest?: Record<string, unknown> | null;
+		objectKind?: string;
+	} = {},
+): Record<string, unknown> {
+	const payload: Record<string, unknown> = {
+		object_kind: overrides.objectKind ?? 'note',
+		event_type: 'note',
+		user: overrides.user ?? gitlabUser('human-dev', 6),
+		project: overrides.project ?? gitlabProject(),
+		object_attributes: {
+			id: 1244,
+			note: 'can you rebase this?',
+			noteable_type: 'MergeRequest',
+			noteable_id: 99,
+			system: false,
+			author_id: 6,
+			url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17#note_1244',
+			...overrides.objectAttributes,
+		},
+	};
+	// A note on a non-merge-request target carries no `merge_request`; pass `null`
+	// to model that.
+	if (overrides.mergeRequest !== null) {
+		payload.merge_request = overrides.mergeRequest ?? {
+			id: 99,
+			iid: 17,
+			title: 'Add a thing',
+			state: 'opened',
+			source_branch: 'swarm/issue-17',
+			target_branch: 'main',
+			source_project_id: 42,
+			target_project_id: 42,
+			last_commit: gitlabLastCommit(),
+			url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+		};
+	}
+	return payload;
+}
+
+/**
+ * A raw GitLab `Pipeline Hook` webhook body. The nested `merge_request` is what a
+ * **merge-request** pipeline carries and a **branch** pipeline does not — pass
+ * `null` to model the branch case the adapter leaves `workItemId` unset for.
+ */
+export function createMockGitLabPipelinePayload(
+	overrides: {
+		user?: Record<string, unknown>;
+		objectAttributes?: Record<string, unknown>;
+		project?: Record<string, unknown>;
+		mergeRequest?: Record<string, unknown> | null;
+		objectKind?: string;
+	} = {},
+): Record<string, unknown> {
+	const payload: Record<string, unknown> = {
+		object_kind: overrides.objectKind ?? 'pipeline',
+		object_attributes: {
+			id: 31,
+			iid: 3,
+			ref: 'swarm/issue-17',
+			tag: false,
+			sha: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+			source: 'merge_request_event',
+			status: 'success',
+			detailed_status: 'passed',
+			stages: ['test'],
+			url: 'https://gitlab.com/jkwiecien/swarm/-/pipelines/31',
+			...overrides.objectAttributes,
+		},
+		user: overrides.user ?? gitlabUser('ci-bot', 7),
+		project: overrides.project ?? gitlabProject(),
+		commit: { id: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7', message: 'Add a thing' },
+		builds: [],
+	};
+	if (overrides.mergeRequest !== null) {
+		payload.merge_request = overrides.mergeRequest ?? {
+			id: 99,
+			iid: 17,
+			title: 'Add a thing',
+			source_branch: 'swarm/issue-17',
+			target_branch: 'main',
+			source_project_id: 42,
+			target_project_id: 42,
+			state: 'opened',
+			url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+		};
+	}
+	return payload;
+}
+
 export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent {
 	return ScmEventSchema.parse({
 		kind: 'pull-request',

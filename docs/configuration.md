@@ -119,7 +119,7 @@ The file is `{ "projects": [ … ] }` — a non-empty array of project objects. 
 | Field | Purpose |
 | --- | --- |
 | `reviewer` | Reference to the reviewer-persona SCM token. |
-| `webhookSecret` | Reference to the SCM webhook HMAC secret. |
+| `webhookSecret` | Reference to the SCM webhook secret. What the provider does with it differs: GitHub and Bitbucket HMAC-sign the raw body with it, while GitLab echoes it verbatim in `X-Gitlab-Token` and the adapter compares the two (issue #295) — so for a GitLab project this value is a shared *token*, not an HMAC key, and it authenticates the sender rather than the body. |
 
 **`githubProjects`** — `githubProjectsConfigSchema`
 | Field | Required / Default | Purpose |
