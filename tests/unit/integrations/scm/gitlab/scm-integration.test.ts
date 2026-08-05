@@ -1,16 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+	createMockGitLabCommitStatusResponse,
 	createMockGitLabMergeRequestPayload,
+	createMockGitLabMergeRequestResponse,
 	createMockProjectConfig,
 	createMockScmEvent,
 } from '../../../../helpers/factories.js';
 
-vi.mock('@/integrations/scm/gitlab/client.js', () => ({
-	// Pass-through so a probe inside the scope can observe the token that would
-	// have been bound, without a real API call.
-	withGitLabToken: vi.fn((_token: string, fn: () => Promise<unknown>): Promise<unknown> => fn()),
-}));
+// Only the persona-credential seam is stubbed. `withGitLabToken` is spied but still
+// establishes the *real* async-context scope, so a read test can assert both the
+// token the class chose to bind and the `PRIVATE-TOKEN` header the underlying
+// request went out with — the two halves of "this read ran as that persona".
+vi.mock('@/integrations/scm/gitlab/client.js', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/integrations/scm/gitlab/client.js')>();
+	return { ...actual, withGitLabToken: vi.fn(actual.withGitLabToken) };
+});
 vi.mock('@/integrations/scm/gitlab/credentials.js', () => ({
 	getGitLabToken: vi.fn<(project: unknown, persona: string) => Promise<string>>(),
 	getGitLabTokenOrNull: vi.fn<(project: unknown, persona: string) => Promise<string | null>>(),
@@ -21,7 +26,7 @@ vi.mock('@/integrations/scm/gitlab/personas.js', () => ({
 	getGitLabPersonaForLogin: vi.fn(),
 }));
 
-import { withGitLabToken } from '@/integrations/scm/gitlab/client.js';
+import { GitLabApiError, withGitLabToken } from '@/integrations/scm/gitlab/client.js';
 import { getGitLabToken, getGitLabTokenOrNull } from '@/integrations/scm/gitlab/credentials.js';
 import {
 	getGitLabPersonaForLogin,
@@ -184,15 +189,108 @@ describe('GitLabSCMIntegration', () => {
 		});
 	});
 
+	// The four read methods delegate to `./merge-requests.ts`, whose own suite covers
+	// every endpoint path and field mapping. These assert what only the class decides:
+	// that the project comes off `project.repo`, and that each read runs inside the
+	// documented persona's credential scope — asserted on the token the request itself
+	// carried, not just on the wrapper call.
+	describe('merge-request reads', () => {
+		let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
+
+		function jsonResponse(body: unknown): Response {
+			return new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { 'content-type': 'application/json' },
+			});
+		}
+
+		/** The token the first outbound GitLab request authenticated as. */
+		function tokenOnTheWire(): string | undefined {
+			const headers = (fetchMock.mock.calls[0]?.[1]?.headers ?? {}) as Record<string, string>;
+			return headers['private-token'];
+		}
+
+		function requestedPath(): string {
+			return new URL(String(fetchMock.mock.calls[0]?.[0])).pathname;
+		}
+
+		beforeEach(() => {
+			fetchMock = vi.fn<typeof fetch>();
+			vi.stubGlobal('fetch', fetchMock);
+			vi.mocked(getGitLabToken).mockImplementation(async (_p, persona) => `token-${persona}`);
+		});
+
+		it('reads a merge request as the reviewer by default', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockGitLabMergeRequestResponse()));
+
+			await expect(scm.getPullRequest(project, 17)).resolves.toMatchObject({
+				number: 17,
+				headBranch: 'swarm/issue-17',
+				mergeable: true,
+			});
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'reviewer');
+			expect(tokenOnTheWire()).toBe('token-reviewer');
+			expect(requestedPath()).toBe('/api/v4/projects/SmartTechBrewery%2Fswarm/merge_requests/17');
+		});
+
+		it('honours an explicitly requested persona', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockGitLabMergeRequestResponse()));
+
+			await scm.getPullRequest(project, 17, 'implementer');
+
+			expect(tokenOnTheWire()).toBe('token-implementer');
+		});
+
+		it('reads a title as the implementer — the merge request’s own author', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockGitLabMergeRequestResponse()));
+
+			await expect(scm.getPullRequestTitle(project, 17)).resolves.toBe('Add a thing');
+			expect(tokenOnTheWire()).toBe('token-implementer');
+		});
+
+		it('aggregates commit statuses as the reviewer', async () => {
+			fetchMock.mockResolvedValue(jsonResponse([createMockGitLabCommitStatusResponse()]));
+
+			await expect(scm.getAggregateCheckStatus(project, 'abc123')).resolves.toEqual({
+				totalCount: 1,
+				checkRuns: [{ name: 'unit-tests', status: 'completed', conclusion: 'success' }],
+			});
+			expect(tokenOnTheWire()).toBe('token-reviewer');
+			expect(requestedPath()).toBe(
+				'/api/v4/projects/SmartTechBrewery%2Fswarm/repository/commits/abc123/statuses',
+			);
+		});
+
+		it('lists conflict candidates as the implementer, the persona that pushes the fix', async () => {
+			fetchMock.mockResolvedValue(jsonResponse([]));
+
+			await expect(scm.listConflictCandidates(project, 'main')).resolves.toEqual([]);
+			expect(tokenOnTheWire()).toBe('token-implementer');
+			expect(requestedPath()).toBe('/api/v4/projects/SmartTechBrewery%2Fswarm/merge_requests');
+		});
+
+		it('lets a GitLabApiError propagate instead of reporting an empty read', async () => {
+			// A fresh `Response` per call — one body can only be consumed once.
+			fetchMock.mockImplementation(
+				async () =>
+					new Response(JSON.stringify({ message: '404 Project Not Found' }), { status: 404 }),
+			);
+
+			await expect(scm.listConflictCandidates(project, 'main')).rejects.toBeInstanceOf(
+				GitLabApiError,
+			);
+			await expect(scm.getAggregateCheckStatus(project, 'abc123')).rejects.toBeInstanceOf(
+				GitLabApiError,
+			);
+			await expect(scm.getPullRequest(project, 17)).rejects.toBeInstanceOf(GitLabApiError);
+		});
+	});
+
 	// Every contract method a later phase owns must fail loudly and name that
 	// phase — never return a misleading `null`/`[]`/no-op that a caller would
 	// mistake for a real answer (issue #295).
 	describe('deferred contract methods', () => {
 		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['getPullRequest', 'phase 3/4', () => scm.getPullRequest()],
-			['getPullRequestTitle', 'phase 3/4', () => scm.getPullRequestTitle()],
-			['getAggregateCheckStatus', 'phase 3/4', () => scm.getAggregateCheckStatus()],
-			['listConflictCandidates', 'phase 3/4', () => scm.listConflictCandidates()],
 			['commentOnPullRequest', 'phase 4/4', () => scm.commentOnPullRequest()],
 			['deliveryProvider', 'phase 4/4', () => scm.deliveryProvider()],
 			['operatorDeliveryProvider', 'phase 4/4', () => scm.operatorDeliveryProvider()],
