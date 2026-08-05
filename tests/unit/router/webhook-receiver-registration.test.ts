@@ -37,6 +37,10 @@ describe('createWebhookApp — PM routes come from the registry', () => {
 				.fn<(id: string) => Promise<ProjectConfig | undefined>>()
 				.mockResolvedValue(project),
 			getWebhookSecret: vi.fn<WebhookReceiverDeps['getWebhookSecret']>().mockResolvedValue(secret),
+			// The board half resolves the PM provider's own `webhookSecret` role (issue
+			// #497); for GitHub Projects that role inherits `credentials.webhookSecret`,
+			// so it resolves to the same secret the repo half uses.
+			getPmCredential: vi.fn<WebhookReceiverDeps['getPmCredential']>().mockResolvedValue(secret),
 			enqueue,
 			enqueuePm,
 		});

@@ -13,7 +13,7 @@
  */
 
 import { GitHubProjectsRouterAdapter } from '../../../router/adapters/github-projects.js';
-import type { PMProviderManifest } from '../manifest.js';
+import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
 import { githubProjectsConfigSchema } from './config-schema.js';
 import { createGitHubProjectsProvider } from './provider.js';
@@ -26,6 +26,26 @@ export const githubProjectsManifest: PMProviderManifest = {
 	createProvider: createGitHubProjectsProvider,
 	configSchema: githubProjectsConfigSchema,
 	routerAdapter: new GitHubProjectsRouterAdapter(),
+	// The one credential this provider resolves for itself (issue #497), and it is
+	// the *shared* GitHub webhook secret: the board and the repo are literally the
+	// same webhook, so the role inherits `credentials.webhookSecret` rather than
+	// asking a project to configure the same reference twice. Declaring that as data
+	// keeps the reach out of shared resolution code (ai/RULES.md §2).
+	//
+	// Its **persona tokens** are deliberately absent: GitHub Projects scopes board
+	// writes with `GitHubSCMIntegration`'s persona helpers (`./provider.ts`), because
+	// board and repo are the same account — the named cross-category reach in
+	// ai/RULES.md §2, not a credential of its own. Declaring `reviewer`/implementer
+	// roles here would duplicate that resolution and imply a project could point the
+	// board at a different account than the repo, which GitHub does not allow.
+	credentialRoles: [
+		{
+			role: PM_WEBHOOK_SECRET_ROLE,
+			label: 'Webhook Secret',
+			envVarKey: 'SCM_WEBHOOK_SECRET',
+			inheritsSharedCredential: 'webhookSecret',
+		},
+	],
 	// The same route and secret as the GitHub SCM provider: GitHub delivers
 	// `projects_v2_item` on the very webhook the repo's events arrive on
 	// (docs/github-projects-v2-api.md §5), so the receiver serves this as a

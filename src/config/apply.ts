@@ -53,9 +53,14 @@ export async function applyConfig(config: SwarmConfig): Promise<ApplyResult> {
 		await upsertProjectToDb(project);
 		result.projects.push(project.id);
 
-		// The credentials block maps persona → env-var key; distinct personas may
+		// The credentials block maps persona → env-var key, plus the PM provider's own
+		// role → env-var key map (`credentials.pm`, issue #497); distinct roles may
 		// point at the same key, so dedupe before writing to avoid redundant upserts.
-		const references = new Set(Object.values(project.credentials));
+		const { pm: pmReferences, ...scmReferences } = project.credentials;
+		const references = new Set([
+			...Object.values(scmReferences),
+			...Object.values(pmReferences ?? {}),
+		]);
 		for (const envVarKey of references) {
 			const value = process.env[envVarKey];
 			if (value === undefined || value === '') {

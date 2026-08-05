@@ -14,6 +14,7 @@ import {
 	findProjectByBoardFromDb,
 	findProjectByRepoFromDb,
 } from '../db/repositories/projectsRepository.js';
+import { requireProjectPMCredentialRole } from '../integrations/pm/registry.js';
 import type { ScmPersona } from '../scm/types.js';
 import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from './operator-token.js';
 import type { ProjectConfig } from './schema.js';
@@ -71,6 +72,75 @@ export async function getPersonaTokenOrNull(
  */
 export async function getWebhookSecretOrNull(project: ProjectConfig): Promise<string | null> {
 	return resolveProjectCredential(project.id, project.credentials.webhookSecret);
+}
+
+/**
+ * Resolve one of a project's PM-provider credentials by the *role* its provider
+ * declares (`PMProviderManifest.credentialRoles`, issue #497), or `null` when the
+ * role resolves to nothing. The PM twin of {@link getPersonaTokenOrNull}: shared
+ * code asks for `(project, role)` and never learns which reference, env var, or
+ * store row it came from.
+ *
+ * Resolution order, most specific first:
+ *
+ * 1. the reference the project configured for the role (`credentials.pm[role]`),
+ *    through the secret store;
+ * 2. the shared `credentials` reference the role declares it inherits
+ *    (`inheritsSharedCredential`) — also a store reference, so it belongs above the
+ *    host env; this is what keeps GitHub Projects' webhook secret *exactly* the
+ *    project's existing SCM webhook secret;
+ * 3. the role's `envVarKey` in this host's environment — the escape hatch for a host
+ *    that exports the secret directly rather than storing it;
+ * 4. `null`.
+ *
+ * A configured reference that resolves to nothing falls through rather than
+ * short-circuiting: `swarm config apply` warns-and-skips a reference whose env var
+ * was unset, so "reference configured, store row absent, env var present on the
+ * worker" is a legitimate state and resolving it is what an operator expects.
+ *
+ * Throws when the role isn't one the project's provider declares — asking for a
+ * credential a provider has no notion of is a wiring bug, not a lookup miss
+ * (ai/CODING_STANDARDS.md "Error handling").
+ */
+export async function resolvePmCredential(
+	project: ProjectConfig,
+	role: string,
+): Promise<string | null> {
+	const spec = requireProjectPMCredentialRole(project, role);
+
+	const configured = project.credentials.pm?.[role];
+	if (configured) {
+		const stored = await resolveProjectCredential(project.id, configured);
+		if (stored) return stored;
+	}
+
+	if (spec.inheritsSharedCredential) {
+		const inherited = await resolveProjectCredential(
+			project.id,
+			project.credentials[spec.inheritsSharedCredential],
+		);
+		if (inherited) return inherited;
+	}
+
+	return process.env[spec.envVarKey] || null;
+}
+
+/**
+ * Resolve a PM-provider credential, throwing when it resolves to nothing — the
+ * `require`-shaped twin of {@link resolvePmCredential} for the provider operations
+ * that cannot run without it, worded like {@link getPersonaToken} so the message
+ * names both the role and the ways it can be supplied.
+ */
+export async function requirePmCredential(project: ProjectConfig, role: string): Promise<string> {
+	const secret = await resolvePmCredential(project, role);
+	if (!secret) {
+		const spec = requireProjectPMCredentialRole(project, role);
+		throw new Error(
+			`No PM ${spec.label} (role '${role}') configured for project '${project.id}' ` +
+				`(set credentials.pm.${role} to a stored reference, or export ${spec.envVarKey} on this host)`,
+		);
+	}
+	return secret;
 }
 
 /**

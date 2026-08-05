@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import type { ProjectConfig } from '@/config/schema.js';
-import type { PMProviderManifest } from '@/integrations/pm/manifest.js';
+import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import { logger } from '@/lib/logger.js';
 import type { PmEvent } from '@/pm/events.js';
@@ -74,6 +74,7 @@ function fakePmManifest(
 		webhookRoute?: string;
 		adapter?: Partial<PMRouterAdapter>;
 		verifyWebhookSignature?: PMProviderManifest['verifyWebhookSignature'];
+		credentialRoles?: PMProviderManifest['credentialRoles'];
 	} = {},
 ): PMProviderManifest {
 	const id = overrides.id ?? 'github-projects';
@@ -82,6 +83,12 @@ function fakePmManifest(
 		label: `Fake PM (${id})`,
 		category: 'pm',
 		webhookRoute: overrides.webhookRoute ?? '/github/webhook',
+		// Declares the webhook-secret role by default, so the receiver resolves one
+		// (issue #497); a test that needs the "provider signs with something else"
+		// shape passes an empty list.
+		credentialRoles: overrides.credentialRoles ?? [
+			{ role: PM_WEBHOOK_SECRET_ROLE, label: 'Webhook Secret', envVarKey: 'PM_WEBHOOK_SECRET' },
+		],
 		verifyWebhookSignature: overrides.verifyWebhookSignature ?? (({ secret }) => secret !== null),
 		routerAdapter: {
 			type: id,
@@ -311,9 +318,13 @@ describe('createWebhookApp', () => {
 				findProjectByBoard: vi
 					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
 					.mockResolvedValue(project),
+				// The board side resolves the PM provider's own role, not the SCM secret
+				// (issue #497) — the SCM dep is still stubbed so a test can assert it is
+				// left untouched.
+				getPmCredential: vi.fn<WebhookReceiverDeps['getPmCredential']>().mockResolvedValue('whsec'),
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
-					.mockResolvedValue('whsec'),
+					.mockResolvedValue('scm-whsec'),
 				enqueue,
 				enqueuePm,
 				...overrides,
@@ -362,30 +373,78 @@ describe('createWebhookApp', () => {
 		});
 
 		it('ignores an event for an untracked board (before touching secrets)', async () => {
-			const getWebhookSecret = vi
-				.fn<WebhookReceiverDeps['getWebhookSecret']>()
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
 				.mockResolvedValue('whsec');
 			const { app, enqueuePm } = makePmApp({
 				findProjectByBoard: vi
 					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
 					.mockResolvedValue(undefined),
-				getWebhookSecret,
+				getPmCredential,
 			});
 			const res = await postPm(app);
 			expect(res.status).toBe(202);
 			expect((await res.json()).ignored).toBe(true);
-			expect(getWebhookSecret).not.toHaveBeenCalled();
+			expect(getPmCredential).not.toHaveBeenCalled();
 			expect(enqueuePm).not.toHaveBeenCalled();
 		});
 
 		it('rejects with 401 when the project has no webhook secret configured', async () => {
 			const { app, enqueuePm } = makePmApp({
-				getWebhookSecret: vi.fn<WebhookReceiverDeps['getWebhookSecret']>().mockResolvedValue(null),
+				getPmCredential: vi.fn<WebhookReceiverDeps['getPmCredential']>().mockResolvedValue(null),
 			});
 			const res = await postPm(app);
 			expect(res.status).toBe(401);
 			expect((await res.json()).reason).toBe('webhook secret not configured');
 			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+
+		// Issue #497: the board path authenticates against the *PM provider's*
+		// `webhookSecret` role. For GitHub Projects that role inherits
+		// `credentials.webhookSecret`, so it resolves to the same secret as before —
+		// but it is resolved as the PM credential, not by borrowing the SCM lookup.
+		it("resolves the secret through the PM provider's declared webhookSecret role", async () => {
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
+				.mockResolvedValue('whsec');
+			const getWebhookSecret = vi
+				.fn<WebhookReceiverDeps['getWebhookSecret']>()
+				.mockResolvedValue('scm-whsec');
+			const verifyWebhookSignature = vi.fn().mockReturnValue(true);
+			const { app, enqueuePm } = makePmApp(
+				{ getPmCredential, getWebhookSecret },
+				fakePmManifest({ verifyWebhookSignature }),
+			);
+
+			const res = await postPm(app);
+
+			expect(res.status).toBe(202);
+			expect(getPmCredential).toHaveBeenCalledWith(project, PM_WEBHOOK_SECRET_ROLE);
+			expect(getWebhookSecret).not.toHaveBeenCalled();
+			expect(verifyWebhookSignature).toHaveBeenCalledWith(
+				expect.objectContaining({ secret: 'whsec' }),
+			);
+			expect(enqueuePm).toHaveBeenCalled();
+		});
+
+		// A provider whose scheme signs with something else declares no such role; it
+		// must reach its verifier with `secret: null` rather than a resolution error.
+		it('hands a provider that declares no webhookSecret role a null secret', async () => {
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
+				.mockResolvedValue('whsec');
+			const verifyWebhookSignature = vi.fn().mockReturnValue(true);
+			const { app } = makePmApp(
+				{ getPmCredential },
+				fakePmManifest({ credentialRoles: [], verifyWebhookSignature }),
+			);
+
+			await postPm(app);
+
+			expect(getPmCredential).not.toHaveBeenCalled();
+			expect(verifyWebhookSignature).toHaveBeenCalledWith(
+				expect.objectContaining({ secret: null }),
+			);
 		});
 
 		// The board path authenticates through the *PM manifest's* verifier, not the
@@ -483,6 +542,7 @@ describe('createWebhookApp', () => {
 				findProjectByBoard: vi
 					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
 					.mockResolvedValue(project),
+				getPmCredential: vi.fn<WebhookReceiverDeps['getPmCredential']>().mockResolvedValue('whsec'),
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
 					.mockResolvedValue('whsec'),
@@ -576,6 +636,12 @@ describe('createWebhookApp', () => {
 		function realProviderApp() {
 			const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
 			const enqueuePm = vi.fn<WebhookReceiverDeps['enqueuePm']>().mockResolvedValue(undefined);
+			// Both secret lookups resolve to the *same* value, which is the truth for
+			// GitHub: the board and the repo share one webhook and one secret, expressed
+			// since issue #497 as the PM role inheriting `credentials.webhookSecret`.
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
+				.mockResolvedValue(secret);
 			// Fake only the secret + project lookups; leave both providers to the registry.
 			const app = createWebhookApp({
 				findProject: vi
@@ -587,10 +653,11 @@ describe('createWebhookApp', () => {
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
 					.mockResolvedValue(secret),
+				getPmCredential,
 				enqueue,
 				enqueuePm,
 			});
-			return { app, enqueue, enqueuePm };
+			return { app, enqueue, enqueuePm, getPmCredential };
 		}
 
 		function sign(body: string, key = secret) {
@@ -651,9 +718,12 @@ describe('createWebhookApp', () => {
 			}
 
 			it('enqueues a genuinely-signed board event under the PM provider id', async () => {
-				const { app, enqueue, enqueuePm } = realProviderApp();
+				const { app, enqueue, enqueuePm, getPmCredential } = realProviderApp();
 				const res = await postBoard(app, sign(boardBody));
 				expect(res.status).toBe(202);
+				// Authenticated against the registered manifest's own declared role
+				// (issue #497), which resolves to the shared GitHub webhook secret.
+				expect(getPmCredential).toHaveBeenCalledWith(project, PM_WEBHOOK_SECRET_ROLE);
 				expect(enqueuePm).toHaveBeenCalledWith(
 					'github-projects',
 					expect.objectContaining({ itemId: 'PVTI_1', containerId: 'PVT_1', action: 'created' }),

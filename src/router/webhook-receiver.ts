@@ -49,12 +49,17 @@ import {
 	findProjectByBoard,
 	findProjectByRepo,
 	getWebhookSecretOrNull,
+	resolvePmCredential,
 } from '../config/provider.js';
 import type { ProjectConfig } from '../config/schema.js';
 // Side-effect import: registers every PM and SCM provider manifest into its
 // registry before defaultDeps() reads them below.
 import '../integrations/entrypoint.js';
-import { listPMProviders, type PMProviderManifest } from '../integrations/pm/index.js';
+import {
+	listPMProviders,
+	PM_WEBHOOK_SECRET_ROLE,
+	type PMProviderManifest,
+} from '../integrations/pm/index.js';
 import {
 	isRuntimeReadySCMProvider,
 	type SCMProviderManifest,
@@ -105,7 +110,17 @@ export interface WebhookReceiverDeps {
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;
 	/** Resolve the SWARM project owning a PM board, by the provider's container id. */
 	findProjectByBoard: (containerId: string) => Promise<ProjectConfig | undefined>;
+	/** The SCM webhook secret — the repo side's `credentials.webhookSecret` reference. */
 	getWebhookSecret: (project: ProjectConfig) => Promise<string | null>;
+	/**
+	 * Resolve one credential role a PM provider declares
+	 * (`PMProviderManifest.credentialRoles`, issue #497). The board side resolves its
+	 * webhook secret through this rather than borrowing `getWebhookSecret`: what
+	 * authenticates a board delivery is the *PM provider's* credential, even when — as
+	 * for GitHub Projects, whose role inherits `credentials.webhookSecret` — it
+	 * resolves to the very same secret the repo side uses.
+	 */
+	getPmCredential: (project: ProjectConfig, role: string) => Promise<string | null>;
 	enqueue: (
 		providerId: ScmType,
 		event: ScmEvent,
@@ -127,6 +142,7 @@ function defaultDeps(): WebhookReceiverDeps {
 		findProject: findProjectByRepo,
 		findProjectByBoard,
 		getWebhookSecret: getWebhookSecretOrNull,
+		getPmCredential: resolvePmCredential,
 		enqueue: enqueueScmEvent,
 		enqueuePm: enqueuePmEvent,
 	};
@@ -210,6 +226,11 @@ async function authenticateScmWebhook(
  * secret rides through to it — GitHub Projects' verifier fails closed on it, as any
  * verifier that needs a secret must. The missing secret is still reported as its
  * own diagnostic, since it is the likeliest cause of a 401 here.
+ *
+ * The secret is the provider's own {@link PM_WEBHOOK_SECRET_ROLE} credential, and it
+ * is resolved only when the manifest *declares* that role: a provider whose scheme
+ * signs with something else declares none and its verifier is handed `null`, exactly
+ * as the paragraph above describes.
  */
 async function authenticatePmWebhook(
 	c: Context,
@@ -219,7 +240,12 @@ async function authenticatePmWebhook(
 	rawBody: string,
 	logContext: Record<string, unknown>,
 ): Promise<Response | null> {
-	const secret = await deps.getWebhookSecret(project);
+	const declaresSecret = manifest.credentialRoles.some(
+		(role) => role.role === PM_WEBHOOK_SECRET_ROLE,
+	);
+	const secret = declaresSecret
+		? await deps.getPmCredential(project, PM_WEBHOOK_SECRET_ROLE)
+		: null;
 	const headers = (name: string) => c.req.header(name);
 
 	const verified = manifest.verifyWebhookSignature({
@@ -230,7 +256,10 @@ async function authenticatePmWebhook(
 	});
 	if (verified) return null;
 
-	if (!secret) {
+	// Only the likeliest cause when the provider actually asked for a secret: a
+	// provider that declares no such role is *expected* to see `null`, so reporting
+	// an unconfigured credential for it would send the operator after a non-problem.
+	if (declaresSecret && !secret) {
 		logger.error('No webhook secret configured for project; rejecting board webhook', {
 			providerId: manifest.id,
 			projectId: project.id,

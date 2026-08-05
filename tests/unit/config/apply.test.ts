@@ -99,6 +99,27 @@ describe('applyConfig', () => {
 		delete process.env.SHARED;
 	});
 
+	// The PM provider's role map is a nested record beside the SCM references
+	// (issue #497), so its values are references too and must be applied the same way.
+	it("stores the PM provider's credential references from the environment", async () => {
+		const withPmReferences = createMockProjectConfig({
+			id: 'proj-4',
+			repo: 'owner/pm',
+			credentials: {
+				reviewer: 'REV_KEY',
+				webhookSecret: 'HOOK_KEY',
+				pm: { webhookSecret: 'PM_HOOK_KEY' },
+			},
+		});
+		process.env.PM_HOOK_KEY = 'pm-whsec';
+
+		const result = await applyConfig(SwarmConfigSchema.parse({ projects: [withPmReferences] }));
+
+		expect(result.credentialsWritten).toBe(3);
+		expect(writeProjectCredential).toHaveBeenCalledWith('proj-4', 'PM_HOOK_KEY', 'pm-whsec');
+		delete process.env.PM_HOOK_KEY;
+	});
+
 	it('applies every project in the config', async () => {
 		const other = createMockProjectConfig({ id: 'proj-3', repo: 'owner/other' });
 		const result = await applyConfig(SwarmConfigSchema.parse({ projects: [project, other] }));

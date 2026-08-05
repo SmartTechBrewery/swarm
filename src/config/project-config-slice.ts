@@ -10,17 +10,19 @@
  * those reference keys — a strictly tighter boundary than stripping secrets that
  * were never present.
  *
- * Derived from `ProjectConfigSchema.omit(...)` rather than a hand-rewritten
+ * Derived from `ProjectConfigBaseSchema.omit(...)` rather than a hand-rewritten
  * object so it can never drift from the config schema: a new *non-secret* field
  * is included automatically, and a future *secret* field would have to be added
- * to the `.omit()` list — a deliberate one-line decision at this seam.
+ * to the `.omit()` list — a deliberate one-line decision at this seam. The base
+ * (rather than `ProjectConfigSchema`) is the bare `z.object` `.omit()` needs; its
+ * cross-field check reads `credentials`, which this slice removes outright.
  */
 
 import type { z } from 'zod';
-import { type ProjectConfig, ProjectConfigSchema } from './schema.js';
+import { type ProjectConfig, ProjectConfigBaseSchema } from './schema.js';
 
 /** The project config a worker may see — everything except the credential references. */
-export const NonSecretProjectConfigSchema = ProjectConfigSchema.omit({ credentials: true });
+export const NonSecretProjectConfigSchema = ProjectConfigBaseSchema.omit({ credentials: true });
 export type NonSecretProjectConfig = z.infer<typeof NonSecretProjectConfigSchema>;
 
 /**

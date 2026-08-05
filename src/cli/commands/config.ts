@@ -18,6 +18,10 @@ import { parseArgs } from 'node:util';
 import { applyConfig } from '../../config/apply.js';
 import { validateConfig } from '../../config/schema.js';
 import { closeDb } from '../../db/client.js';
+// Side-effect import: registers every provider manifest, so `validateConfig` can
+// check each project's `credentials.pm` references against the roles its PM provider
+// declares (issue #497) instead of skipping that check.
+import '../../integrations/entrypoint.js';
 import * as out from '../_shared/output.js';
 import { REPO_ROOT } from '../_shared/paths.js';
 
