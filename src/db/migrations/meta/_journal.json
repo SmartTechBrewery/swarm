@@ -285,8 +285,22 @@
     {
       "idx": 40,
       "version": "7",
-      "when": 1785940532850,
-      "tag": "0040_run_checkpoint_continuation",
+      "when": 1785949486322,
+      "tag": "0040_enrollment_allowed_phases",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1785949500000,
+      "tag": "0041_run_checkpoint_continuation",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1785951594355,
+      "tag": "0042_parched_wrecking_crew",
       "breakpoints": true
     }
   ]

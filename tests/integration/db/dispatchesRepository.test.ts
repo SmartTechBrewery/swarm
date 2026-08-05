@@ -270,6 +270,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				projectId: PROJECT_ID,
 				status: 'active',
 				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
 				concurrencyAllocation: allocation,
 				sharingConsent: true,
 			});

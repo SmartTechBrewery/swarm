@@ -162,7 +162,7 @@ export class GitHubProjectsRouterAdapter implements PMRouterAdapter {
 	 *
 	 * Reaching into the *SCM* provider's persona helpers is legitimate **only for
 	 * this provider**, because a GitHub Projects board and the GitHub repo are the
-	 * same account (ai/RULES.md §2 names it as one of two deliberate reaches). The
+	 * same account (ai/RULES.md §2 names it as one of three deliberate reaches). The
 	 * contract on {@link PMRouterAdapter.isSelfAuthored} spells out that a provider
 	 * whose board is a different account than its repo must establish its own
 	 * identity instead.

@@ -15,8 +15,10 @@ import {
 	DEFAULT_CONCURRENCY_ALLOCATION,
 	ENROLLMENT_STATUSES,
 	isRoutable,
+	permitsPhase,
 	type WorkerEnrollment,
 } from '@/identity/worker-enrollment.js';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const ENROLLMENT_ID = '22222222-2222-4222-8222-222222222222';
@@ -38,6 +40,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		projectId: 'proj-alpha',
 		status: 'active',
 		allowedClis: ['claude', 'codex'],
+		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
 		sharingConsent: true,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
@@ -64,12 +67,13 @@ function evaluate(overrides: Partial<WorkerEligibilityInput> = {}): EligibilityR
 }
 
 describe('IneligibilityReasonSchema', () => {
-	it('covers exactly the five predicate reasons', () => {
+	it('covers exactly the six predicate reasons', () => {
 		expect(INELIGIBILITY_REASONS).toEqual([
 			'missing-enrollment',
 			'missing-consent',
 			'worker-unavailable',
 			'missing-phase-capability',
+			'phase-not-permitted',
 			'missing-cli-capability',
 		]);
 	});
@@ -181,6 +185,44 @@ describe('evaluateWorkerEligibility', () => {
 		expect(evaluate({ worker, phase: 'implementation' })).toEqual({ eligible: true });
 	});
 
+	// Issue #509: the owner's per-project selection, judged as its own signal so the
+	// message can point at the person who can widen it.
+	it('phase-not-permitted when the enrollment does not allow the dispatched phase here', () => {
+		const enrollment = makeEnrollment({ allowedPhases: ['implementation'] });
+		expect(evaluate({ enrollment, phase: 'review' })).toEqual({
+			eligible: false,
+			reason: 'phase-not-permitted',
+		});
+	});
+
+	it('is eligible for a phase the enrollment does allow, with the same narrowed set', () => {
+		const enrollment = makeEnrollment({ allowedPhases: ['implementation'] });
+		expect(evaluate({ enrollment, phase: 'implementation' })).toEqual({ eligible: true });
+	});
+
+	// The same worker, two projects: only the enrollment differs, so the verdict does.
+	it('scopes the selection to the enrollment — one machine, different phases per project', () => {
+		const worker = makeWorker();
+		const inAlpha = makeEnrollment({ projectId: 'proj-alpha', allowedPhases: ['implementation'] });
+		const inBeta = makeEnrollment({ projectId: 'proj-beta', allowedPhases: ['review'] });
+		expect(evaluate({ worker, enrollment: inAlpha, phase: 'review' })).toEqual({
+			eligible: false,
+			reason: 'phase-not-permitted',
+		});
+		expect(evaluate({ worker, enrollment: inBeta, phase: 'review' })).toEqual({ eligible: true });
+	});
+
+	// The machine's declaration is the coarser, more fundamental fact, and its fix
+	// belongs to whoever operates the machine rather than to the enrollment's owner.
+	it('reports the machine’s missing declaration before the enrollment’s selection', () => {
+		const worker = makeWorker({ supportedPhases: ['implementation'] });
+		const enrollment = makeEnrollment({ allowedPhases: ['implementation'] });
+		expect(evaluate({ worker, enrollment, phase: 'planning' })).toEqual({
+			eligible: false,
+			reason: 'missing-phase-capability',
+		});
+	});
+
 	// Phase support is a property of the machine, the CLI one of the candidate target,
 	// so the coarser check reports first — a worker missing both is described as unable
 	// to run the phase rather than as missing a CLI it would never have reached.
@@ -266,6 +308,19 @@ describe('evaluateWorkerEligibility', () => {
 		)('status=$status sharingConsent=$sharingConsent', ({ status, sharingConsent }) => {
 			const enrollment = makeEnrollment({ status, sharingConsent });
 			expect(evaluate({ enrollment }).eligible).toBe(isRoutable(enrollment));
+		});
+	});
+
+	// Likewise for the #509 seam: the phase half of the predicate must stay exactly
+	// `permitsPhase` ANDed with the machine's own declaration, so neither can drift
+	// into routing a phase the other refuses.
+	describe('the phase checks agree with permitsPhase AND the declared repertoire', () => {
+		it.each(ALL_TRIGGER_PHASES)('phase=%s', (phase) => {
+			const worker = makeWorker({ supportedPhases: ['implementation', 'review'] });
+			const enrollment = makeEnrollment({ allowedPhases: ['planning', 'implementation'] });
+			expect(evaluate({ worker, enrollment, phase }).eligible).toBe(
+				worker.supportedPhases.includes(phase) && permitsPhase(enrollment, phase),
+			);
 		});
 	});
 });

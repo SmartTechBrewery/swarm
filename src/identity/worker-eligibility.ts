@@ -9,7 +9,8 @@
  * with active owner sharing consent, project enrollment, required CLI
  * capability, and available capacity" — in that order: active enrollment →
  * active sharing consent → connection/health → free capacity → declared phase
- * support (issue #467) → declared CLI capability. The first missing signal wins, so a caller always gets *the* reason
+ * support (issue #467) → the enrollment's own allowed phases (issue #509) →
+ * declared CLI capability. The first missing signal wins, so a caller always gets *the* reason
  * to show rather than a set to prioritize itself. The first two checks together
  * are exactly `isRoutable` (`./worker-enrollment.ts`, #337's named seam); they are
  * evaluated separately only so a revoked consent is reported as `missing-consent`
@@ -38,7 +39,7 @@ import type { AgentTarget } from '../config/schema.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
-import type { WorkerEnrollment } from './worker-enrollment.js';
+import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
 
 /**
  * Why a worker may not take a piece of work — the structured vocabulary Phase 3's
@@ -58,6 +59,11 @@ import type { WorkerEnrollment } from './worker-enrollment.js';
  *   daemon refuses `planning` (`SUPPORTED_DB_FREE_PHASES`,
  *   `../transport/assignment-execution.ts`). It is a property of the whole worker,
  *   not of one target, so it is judged before the per-target CLI check.
+ * - `phase-not-permitted` — the machine *can* run this phase, but its owner did not
+ *   include the phase in this enrollment's `allowedPhases` (issue #509). Distinct
+ *   from `missing-phase-capability` because the fix is different and belongs to a
+ *   different person: the worker's owner widens the enrollment, rather than a
+ *   capable daemon being connected.
  * - `missing-cli-capability` — the candidate target's effective CLI is not among
  *   the worker's declared capabilities, or the enrollment does not allow it on
  *   this project.
@@ -72,6 +78,7 @@ export const IneligibilityReasonSchema = z.enum([
 	'missing-consent',
 	'worker-unavailable',
 	'missing-phase-capability',
+	'phase-not-permitted',
 	'missing-cli-capability',
 ]);
 
@@ -119,9 +126,10 @@ export interface WorkerEligibilityInput {
 	phaseDefaultCli: AgentCli;
 	/**
 	 * The phase being dispatched, checked against the worker's declared
-	 * `supportedPhases` (issue #467). Required rather than optional: a caller that
-	 * forgot to pass it would silently reopen the very hole this closes, so the
-	 * type-checker makes every call site name its phase.
+	 * `supportedPhases` (issue #467) **and** the enrollment's own `allowedPhases`
+	 * (issue #509). Required rather than optional: a caller that forgot to pass it
+	 * would silently reopen the very hole this closes, so the type-checker makes
+	 * every call site name its phase.
 	 */
 	phase: TriggerPhase;
 }
@@ -138,7 +146,8 @@ export function resolveTargetCli(target: AgentTarget, phaseDefaultCli: AgentCli)
 /**
  * Judge one worker against one candidate target, returning the first missing
  * signal in ADR-001's order (enrollment → consent → connection → capacity → phase
- * capability → CLI capability). Pure: it reads only what it is given.
+ * capability → phase permission → CLI capability). Pure: it reads only what it is
+ * given.
  */
 export function evaluateWorkerEligibility(input: WorkerEligibilityInput): EligibilityResult {
 	const { worker, enrollment, availability, target, phaseDefaultCli, phase } = input;
@@ -162,6 +171,14 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	// and reports a terminal failure the dispatcher cannot re-route.
 	if (!worker.supportedPhases.includes(phase)) {
 		return { eligible: false, reason: 'missing-phase-capability' };
+	}
+	// The owner's per-project routing choice, judged after the machine's own
+	// repertoire because it is the narrower, more specific statement of the two
+	// (issue #509): a phase the daemon cannot run at all is the more fundamental
+	// diagnosis, and the fix belongs to whoever operates the machine rather than to
+	// whoever owns the enrollment.
+	if (!permitsPhase(enrollment, phase)) {
+		return { eligible: false, reason: 'phase-not-permitted' };
 	}
 	const cli = resolveTargetCli(target, phaseDefaultCli);
 	// Both constraints are required: the worker must declare the CLI, and the

@@ -267,7 +267,9 @@ swarm workers consent <worker-id> <project-id> <on|off>
   (`SWARM_WORKER_CONCURRENCY`) and the project's Maximum Concurrent Jobs. There is
   no value meaning "no per-worker limit" — every enrollment states its share.
   Starts pending with sharing consent off; `--active` approves it and `--consent`
-  grants sharing consent at once (operator seeding).
+  grants sharing consent at once (operator seeding). The enrollment's **allowed
+  pipeline phases** start as every phase — narrow them per project on the worker
+  detail screen (`/workers/<id>`); there is no flag for them yet.
 - **`approve`** — approve a pending enrollment (worker + project) → active.
 - **`consent`** — turn an enrollment's owner-controlled sharing consent on or off.
   Revoking it blocks future dispatch without stopping a running agent.
@@ -278,8 +280,10 @@ active AND sharing consent is on**. A project with no enrolled workers is
 unfederated and runs locally.
 
 > **Known gap:** there is no CLI command to change an *existing* enrollment's
-> allowed CLIs — `enroll` refuses when the worker is already enrolled. Until one
-> is added, widen it with a direct `UPDATE` on `worker_project_enrollments.allowed_clis`.
+> execution constraints — `enroll` refuses when the worker is already enrolled.
+> The worker detail screen (`/workers/<id>`) edits them; from the CLI, widen one
+> with a direct `UPDATE` on `worker_project_enrollments.allowed_clis` /
+> `.allowed_phases`.
 
 ### `swarm worktrees`
 

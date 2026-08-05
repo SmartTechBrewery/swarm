@@ -4,6 +4,7 @@ import {
 	optionalEnv,
 	requireEnv,
 	resolveOperatorGitHubToken,
+	resolveWebhookCallbackBaseUrl,
 } from '@/lib/env.js';
 
 describe('requireEnv', () => {
@@ -46,6 +47,27 @@ describe('isSingleUserMode', () => {
 			vi.stubEnv('SWARM_SINGLE_USER_MODE', value);
 			expect(isSingleUserMode()).toBe(false);
 		}
+	});
+});
+
+describe('resolveWebhookCallbackBaseUrl', () => {
+	it('reads WEBHOOK_CALLBACK_BASE_URL', () => {
+		vi.stubEnv('WEBHOOK_CALLBACK_BASE_URL', 'https://swarm.example.com');
+		expect(resolveWebhookCallbackBaseUrl()).toBe('https://swarm.example.com');
+	});
+
+	it('is undefined when unset or whitespace-only', () => {
+		vi.stubEnv('WEBHOOK_CALLBACK_BASE_URL', '');
+		expect(resolveWebhookCallbackBaseUrl()).toBeUndefined();
+		expect(resolveWebhookCallbackBaseUrl('   ')).toBeUndefined();
+	});
+
+	// A route path is concatenated onto it, and the signed string must match the
+	// provider's byte for byte.
+	it('trims trailing slashes so a route path concatenates cleanly', () => {
+		expect(resolveWebhookCallbackBaseUrl('https://swarm.example.com//')).toBe(
+			'https://swarm.example.com',
+		);
 	});
 });
 
