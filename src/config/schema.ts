@@ -619,7 +619,7 @@ function validatePmCredentialRoles(
 	const manifest = getPMProvider(project.pm.type);
 	if (!manifest) return;
 
-	const declared = manifest.credentialRoles;
+	const declared = manifest.credentialRoles ?? [];
 	const declaredNames = declared.map((spec) => spec.role);
 
 	for (const role of Object.keys(references)) {
