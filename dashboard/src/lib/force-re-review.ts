@@ -14,10 +14,12 @@ export interface ForceReReviewReport {
 	prNumber: string;
 	headSha: string;
 	capOverride: 'granted' | 'already-granted';
-	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed';
+	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed' | 'retried';
 	dispatchId: string;
 	dispatchState?: string;
 	dispatchOutcome?: string | null;
+	/** Set only when `dispatch === 'retried'`: why the prior attempt didn't count. */
+	previousAttemptOutcome?: string | null;
 }
 
 /** The run fields the availability rule reads — the subset `RunRow` and the API row share. */
@@ -78,20 +80,28 @@ export function forceReReviewConfirmMessage(prNumber?: string | null): string {
 /**
  * The success report, one line per durable step, in the order `forceReReview`
  * performs them. Operators use this to tell a force that actually scheduled work
- * from one that found the cycle already continued (a second click, a refresh).
+ * from one that found the cycle already continued (a second click, a refresh),
+ * and from one that found a *dead* prior attempt — one that never actually
+ * started Respond-to-review (e.g. a stale worker refused it) — and scheduled a
+ * fresh one in its place (`dispatch === 'retried'`).
  */
 export function describeForceReReviewResult(result: ForceReReviewReport): string[] {
+	const dispatchLine =
+		result.dispatch === 'scheduled'
+			? `Respond-to-review: scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId}.`
+			: result.dispatch === 'retried'
+				? `Respond-to-review: the previous forced attempt never actually started one${result.previousAttemptOutcome ? ` (${result.previousAttemptOutcome})` : ''} — scheduled a fresh attempt as dispatch ${result.dispatchId}.`
+				: result.dispatch === 'already-completed'
+					? `Respond-to-review: prior forced dispatch ${result.dispatchId} already completed${result.dispatchOutcome ? ` (${result.dispatchOutcome})` : ''}.`
+					: `Respond-to-review: already scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId} — nothing duplicated.`;
+
 	return [
 		result.capOverride === 'granted'
 			? 'Review cap: one extra review slot granted for this PR.'
 			: 'Review cap: an extra review slot was already granted for this review.',
-		result.dispatch === 'scheduled'
-			? `Respond-to-review: scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId}.`
-			: result.dispatch === 'already-completed'
-				? `Respond-to-review: prior forced dispatch ${result.dispatchId} already completed${result.dispatchOutcome ? ` (${result.dispatchOutcome})` : ''}.`
-				: `Respond-to-review: already scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId} — nothing duplicated.`,
+		dispatchLine,
 		result.dispatch === 'already-completed'
-			? 'Re-review: no new review was scheduled by that completed corrective cycle.'
+			? 'Re-review: the corrective response already ran — check the PR for its follow-up review.'
 			: 'Re-review: runs automatically once the response pushes a commit.',
 	];
 }

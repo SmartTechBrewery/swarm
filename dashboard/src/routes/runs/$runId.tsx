@@ -596,7 +596,9 @@ export function ResetRunButton({
  * confirm button so a double-click can't fire twice, a per-step success report,
  * and the mutation error surfaced verbatim. The server is idempotent regardless
  * (`src/dispatch/force-re-review.ts`), so a concurrent request resolves to the
- * same corrective cycle rather than a second one.
+ * same corrective cycle rather than a second one — and if that cycle's prior
+ * attempt turns out to have been dead (never actually started Respond-to-review),
+ * the server chains a fresh one rather than reporting the dead one as done.
  */
 export function ForceReReviewButton({ run }: { run: RunRow }) {
 	const queryClient = useQueryClient();
