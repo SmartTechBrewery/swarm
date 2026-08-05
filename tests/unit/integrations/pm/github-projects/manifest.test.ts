@@ -60,4 +60,28 @@ describe('github-projects manifest registration', () => {
 	it('declares the board and state discovery capabilities', () => {
 		expect(githubProjectsManifest.discovery).toEqual(['containers', 'states']);
 	});
+
+	// Issue #497: the one credential this provider resolves for itself. It inherits
+	// the shared SCM webhook-secret reference rather than asking a project to
+	// configure a second one, because board and repo are literally the same webhook —
+	// which is what keeps this provider's effective credentials unchanged.
+	it('declares only the webhook-secret role, inheriting the shared reference', () => {
+		expect(githubProjectsManifest.credentialRoles).toEqual([
+			{
+				role: 'webhookSecret',
+				label: 'Webhook Secret',
+				envVarKey: 'SCM_WEBHOOK_SECRET',
+				inheritsSharedCredential: 'webhookSecret',
+			},
+		]);
+	});
+
+	// Its persona tokens deliberately resolve through the GitHub SCM provider
+	// (`provider.ts`) — one of ai/RULES.md §2's named reaches — so they are not
+	// credential roles of this provider.
+	it('declares no persona-token roles', () => {
+		expect(githubProjectsManifest.credentialRoles.map((role) => role.role)).not.toContain(
+			'reviewer',
+		);
+	});
 });

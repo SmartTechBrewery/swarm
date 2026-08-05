@@ -228,6 +228,28 @@ describe('projectsRepository', () => {
 			expect(reread?.pm).toEqual(project.pm);
 		});
 
+		// The `credentials` jsonb column is persisted as-is, so the PM provider's role
+		// map (issue #497) must survive a write/read cycle without a column change.
+		it("round-trips the credentials block's PM role references", async () => {
+			const { values } = stubInsert();
+			const project = createMockProjectConfig({
+				id: 'proj-1',
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: { webhookSecret: 'PM_WEBHOOK_SECRET' },
+				},
+			});
+
+			await upsertProjectToDb(project);
+
+			const written = values.mock.calls[0][0] as { credentials: unknown };
+			expect(written.credentials).toEqual(project.credentials);
+			stubDb([{ ...row, credentials: JSON.parse(JSON.stringify(written.credentials)) }]);
+			const reread = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
+			expect(reread?.credentials).toEqual(project.credentials);
+		});
+
 		it('writes agents as null when the config omits it', async () => {
 			const { values } = stubInsert();
 			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1' }));

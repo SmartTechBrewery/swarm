@@ -22,6 +22,9 @@ import {
 	splitAntigravityModel,
 } from '../harness/models.js';
 import { githubProjectsConfigSchema } from '../integrations/pm/github-projects/config-schema.js';
+// Registry lookup only — `./registry.js` imports nothing at runtime, so this stays a
+// leaf import rather than pulling the provider implementations in behind it.
+import { getPMProvider } from '../integrations/pm/registry.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
 
 /**
@@ -59,8 +62,11 @@ export const PROJECT_DEFAULTS = {
 } as const;
 
 /**
- * References to a project's *project-scoped* GitHub credentials — the reviewer
- * persona token plus the webhook-verification secret.
+ * References to a project's *project-scoped* source-control credentials — the
+ * reviewer persona token plus the webhook-verification secret. These two are
+ * provider-neutral and shared by every SCM provider (issue #290); the PM side's
+ * per-provider roles are the sibling {@link PmCredentialReferencesSchema}, which
+ * does not reshape these.
  *
  * These are *references*, never the secret values: each is a key into the
  * secret store (the Postgres `project_credentials` table / an env var name),
@@ -78,14 +84,39 @@ export const PROJECT_DEFAULTS = {
  * `swarm.config.json` still carrying an `implementer` reference parses with the
  * key stripped, keeping `swarm config apply` idempotent.
  */
-export const CredentialsSchema = z
-	.object({
-		/** Reference to the reviewer-persona GitHub token in the secret store. */
-		reviewer: z.string().min(1),
-		/** Reference to the GitHub webhook HMAC secret used to verify inbound events. */
-		webhookSecret: z.string().min(1),
-	})
-	.describe('References to a project GitHub credentials (never the secrets themselves)');
+export const ScmCredentialReferencesSchema = z.object({
+	/** Reference to the reviewer-persona GitHub token in the secret store. */
+	reviewer: z.string().min(1),
+	/** Reference to the GitHub webhook HMAC secret used to verify inbound events. */
+	webhookSecret: z.string().min(1),
+});
+
+/**
+ * The PM provider's credential references, keyed by the roles *that provider*
+ * declares on its manifest (`PMProviderManifest.credentialRoles`, issue #497) —
+ * references into the same secret store, never the secrets.
+ *
+ * A record keyed by role rather than a per-provider object schema: the roles are
+ * the provider's to declare (Jira needs an email + API token, Linear an API key,
+ * Trello a key + token + secret), so this central schema would otherwise have to be
+ * rebuilt every time a provider registers. What the record *may* contain is still
+ * validated — `ProjectConfigSchema` checks it against the registered manifest for
+ * `pm.type`, so an undeclared role or an unconfigured non-optional one fails
+ * validation with the declared roles named.
+ */
+export const PmCredentialReferencesSchema = z
+	.record(z.string().min(1))
+	.describe("References to the PM provider's credentials, keyed by its declared roles");
+
+/**
+ * `credentials.pm` is optional and stays so deliberately: a provider whose roles
+ * all resolve from elsewhere needs no entry (GitHub Projects' webhook secret
+ * inherits `credentials.webhookSecret`), and every config written before this
+ * existed keeps parsing and resolving exactly as it did.
+ */
+export const CredentialsSchema = ScmCredentialReferencesSchema.extend({
+	pm: PmCredentialReferencesSchema.optional(),
+}).describe('References to a project credentials (never the secrets themselves)');
 
 /**
  * One agent model target — a CLI, the logical model to run on it, and the
@@ -497,7 +528,19 @@ export const ProjectPmSchema = z.discriminatedUnion('type', [
 	z.object({ type: z.literal('github-projects') }).merge(githubProjectsConfigSchema),
 ]);
 
-export const ProjectConfigSchema = z.object({
+/**
+ * The project config's field shape, without the cross-field checks
+ * {@link ProjectConfigSchema} adds — the same base/refined split
+ * `PipelineBaseSchema`/`PipelineConfigSchema` uses above.
+ *
+ * Exists because `.pick()`/`.omit()` are `z.object` methods: the worker-safe
+ * projection (`./worker-config.ts`), the non-secret transport slice
+ * (`./project-config-slice.ts`), and the projects API's write input all derive a
+ * narrower schema from these fields, and every one of them drops either
+ * `credentials` or nothing the refinement reads. Parse **`ProjectConfigSchema`**,
+ * not this, when validating a whole project config.
+ */
+export const ProjectConfigBaseSchema = z.object({
 	/** Stable internal identifier for this SWARM project (one Postgres row per project). */
 	id: z.string().min(1),
 
@@ -541,7 +584,7 @@ export const ProjectConfigSchema = z.object({
 	 */
 	pm: ProjectPmSchema,
 
-	/** References to the project's GitHub credentials (see `CredentialsSchema`). */
+	/** References to the project's credentials (see `CredentialsSchema`). */
 	credentials: CredentialsSchema,
 
 	/** Per-phase agent CLI/model overrides. Omit entirely to keep every phase's coded default. */
@@ -554,11 +597,86 @@ export const ProjectConfigSchema = z.object({
 	worktreeRetention: WorktreeRetentionConfigSchema.optional(),
 });
 
+/**
+ * Validate `credentials.pm` against the roles the project's PM provider actually
+ * declares (`PMProviderManifest.credentialRoles`, issue #497) — the cross-field
+ * check neither schema can make alone, since the roles live on the manifest for
+ * `pm.type` and the references live under `credentials`.
+ *
+ * Two rules, both aimed at the operator who mistyped a role or forgot one:
+ *
+ * 1. A reference for a role the provider does not declare is an error naming the
+ *    roles it does — silently ignoring it would leave the operator believing they
+ *    configured a credential that will never be read.
+ * 2. Every non-optional role must be configured. A role that declares
+ *    `inheritsSharedCredential` is exempt: it already resolves without an entry.
+ *
+ * `credentials.pm` remains optional for providers whose roles are all optional or
+ * inherit a shared credential. A provider with a non-optional, non-inherited role
+ * still requires it even when the entire map is absent.
+ *
+ * Skipped entirely when no manifest is registered for `pm.type` — a config can be
+ * parsed by a surface that never loaded `src/integrations/entrypoint.js` (a
+ * dashboard bundle, a focused unit test), and validation must not depend on which
+ * modules a process happens to import. `requireProjectPMProvider`
+ * (`src/integrations/pm/registry.ts`) is the loud check for an unregistered
+ * provider.
+ */
+function validatePmCredentialRoles(
+	// Not `ProjectConfig`: that type is inferred *from* this schema, so naming it
+	// here would make the inference circular.
+	project: z.infer<typeof ProjectConfigBaseSchema>,
+	ctx: z.RefinementCtx,
+): void {
+	const references = project.credentials.pm ?? {};
+
+	const manifest = getPMProvider(project.pm.type);
+	if (!manifest) return;
+
+	const declared = manifest.credentialRoles ?? [];
+	const declaredNames = declared.map((spec) => spec.role);
+
+	for (const role of Object.keys(references)) {
+		if (declaredNames.includes(role)) continue;
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['credentials', 'pm', role],
+			message:
+				`PM provider '${manifest.id}' declares no credential role '${role}' — ` +
+				(declaredNames.length
+					? `its roles are: ${declaredNames.join(', ')}`
+					: 'it declares no credential roles'),
+		});
+	}
+
+	for (const spec of declared) {
+		if (spec.optional || spec.inheritsSharedCredential) continue;
+		if (references[spec.role]) continue;
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['credentials', 'pm', spec.role],
+			message:
+				`PM provider '${manifest.id}' requires the '${spec.role}' credential (${spec.label}): ` +
+				`set credentials.pm.${spec.role} to the secret-store reference holding it ` +
+				`(conventionally '${spec.envVarKey}', which is also the host env var it falls back to)`,
+		});
+	}
+}
+
+/**
+ * A whole project config: {@link ProjectConfigBaseSchema}'s fields plus the
+ * cross-field PM-credential-role check. This is what `validateConfig` and every
+ * config-parsing call site uses.
+ */
+export const ProjectConfigSchema = ProjectConfigBaseSchema.superRefine(validatePmCredentialRoles);
+
 export const SwarmConfigSchema = z.object({
 	projects: z.array(ProjectConfigSchema).min(1),
 });
 
 export type Credentials = z.infer<typeof CredentialsSchema>;
+export type ScmCredentialReferences = z.infer<typeof ScmCredentialReferencesSchema>;
+export type PmCredentialReferences = z.infer<typeof PmCredentialReferencesSchema>;
 export type AgentTarget = z.infer<typeof AgentTargetSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;

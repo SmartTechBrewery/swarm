@@ -5,7 +5,7 @@ import {
 	PipelineBaseSchema,
 	type PipelineConfig,
 	PipelineConfigSchema,
-	ProjectConfigSchema,
+	ProjectConfigBaseSchema,
 	type ProjectPm,
 } from '../../config/schema.js';
 import {
@@ -56,7 +56,10 @@ const DEFAULT_CREDENTIAL_REFERENCES = {
 	webhookSecret: 'SCM_WEBHOOK_SECRET',
 };
 
-const ProjectWriteInputSchema = ProjectConfigSchema.omit({ credentials: true });
+// Derived from the base object (`.omit()` needs a bare `z.object`); credentials are
+// not client-writable here, so the config schema's `credentials.pm` cross-field
+// check has nothing to validate on this input.
+const ProjectWriteInputSchema = ProjectConfigBaseSchema.omit({ credentials: true });
 // `pm` is omitted from the create input, not accepted from the client: a new
 // project always starts on `DEFAULT_PM_CONFIG`'s placeholder mapping.
 const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true });

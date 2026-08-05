@@ -21,7 +21,7 @@
  */
 
 import type { z } from 'zod';
-import { type ProjectConfig, ProjectConfigSchema } from './schema.js';
+import { type ProjectConfig, ProjectConfigBaseSchema } from './schema.js';
 
 /**
  * Fields safe to travel to a worker inside a task assignment: project identity
@@ -63,12 +63,13 @@ const workerSafeMask = Object.fromEntries(WORKER_SAFE_KEYS.map((k) => [k, true a
 };
 
 /**
- * The worker-safe slice of a project config. Built from `ProjectConfigSchema` via
- * `.pick()` so each safe field keeps its own validation. (`.pick()` is valid only
- * while `ProjectConfigSchema` is a bare `z.object`; if it is ever wrapped in
- * `.refine()`/`.transform()`, pick from the inner object instead.)
+ * The worker-safe slice of a project config. Built from `ProjectConfigBaseSchema`
+ * via `.pick()` so each safe field keeps its own validation — the base is the bare
+ * `z.object` `.pick()` requires, and `ProjectConfigSchema`'s cross-field check
+ * (`credentials.pm` against the PM manifest) reads only fields this projection
+ * drops, so picking from the base loses no validation.
  */
-export const WorkerProjectConfigSchema = ProjectConfigSchema.pick(workerSafeMask).describe(
+export const WorkerProjectConfigSchema = ProjectConfigBaseSchema.pick(workerSafeMask).describe(
 	'Worker-safe projection of a project config — no secrets, no server-only policy',
 );
 

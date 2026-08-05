@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ProjectConfigSchema } from '@/config/schema.js';
+import { ProjectConfigBaseSchema } from '@/config/schema.js';
 import {
 	SERVER_ONLY_KEYS,
 	toWorkerConfig,
@@ -67,7 +67,7 @@ describe('worker/server key classification', () => {
 		expect(new Set(classified).size).toBe(classified.length);
 		// Exhaustive: every field on the live schema is classified, so a future
 		// ProjectConfig field forces a conscious safe-vs-server decision here.
-		expect(new Set(classified)).toEqual(new Set(Object.keys(ProjectConfigSchema.shape)));
+		expect(new Set(classified)).toEqual(new Set(Object.keys(ProjectConfigBaseSchema.shape)));
 	});
 
 	it('exposes exactly the worker-safe keys on the projection schema', () => {

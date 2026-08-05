@@ -18,13 +18,16 @@
 export type { PMRouterAdapter } from '../../pm/router-adapter.js';
 export type {
 	PMProviderManifest,
+	PmCredentialRoleSpec,
 	PmWebhookVerification,
 	PmWebhookVerifier,
 } from './manifest.js';
+export { PM_WEBHOOK_SECRET_ROLE } from './manifest.js';
 export {
 	getPMProvider,
 	listPMProviders,
 	registerPMProvider,
 	requireProjectPMAdapter,
+	requireProjectPMCredentialRole,
 	requireProjectPMProvider,
 } from './registry.js';

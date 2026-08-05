@@ -12,9 +12,6 @@
  * until the phase that needs them, so the manifest doesn't advertise a contract
  * nothing implements:
  *
- * - `credentialRoles` — credentials are still a fixed
- *   implementer/reviewer/webhookSecret triple (`src/config/schema.ts`), not a
- *   provider-specific role list.
  * - `triggerHandlers`, `platformClientFactory`, `extractProjectIdFromJob`. The
  *   concrete `PMProvider` (`github-projects/provider.ts`) is exposed through
  *   the manifest's `createProvider` factory for provider-agnostic reads; the
@@ -33,6 +30,14 @@
  * speak and the `src/integrations/pm/index.ts` barrel this module is re-exported
  * through. The conformance harness is still deferred (a later phase of #297).
  *
+ * `credentialRoles` arrived with issue #497: the shared `credentials` block is a
+ * fixed `{ reviewer, webhookSecret }` pair shaped for GitHub (`src/config/schema.ts`),
+ * which cannot express what the providers `PMType` already names need — Jira an
+ * email plus an API token, Linear an API key, Trello a key + token + secret. So each
+ * provider *declares* its own roles here and a project supplies a reference per role
+ * under `credentials.pm`, resolved through `resolvePmCredential`
+ * (`src/config/provider.ts`).
+ *
  * `webhookRoute` + `verifyWebhookSignature` arrived with issue #496, replacing the
  * receiver's hardcoded `getPMProvider('github-projects')` + `projects_v2_item`
  * branch: the receiver now mounts one route per registered PM manifest, exactly as
@@ -44,9 +49,64 @@
  */
 
 import type { z } from 'zod';
-import type { ProjectConfig } from '../../config/schema.js';
+import type { ProjectConfig, ScmCredentialReferences } from '../../config/schema.js';
 import type { PMRouterAdapter } from '../../pm/router-adapter.js';
 import type { PMDiscoveryCapability, PMProvider, PMType } from '../../pm/types.js';
+
+/**
+ * One credential a PM provider needs, declared by the provider rather than baked
+ * into the central config schema (issue #497). Mirrors Cascade's
+ * `CredentialRoleSpec` (`cascade/src/integrations/pm/manifest.ts`,
+ * `cascade/src/config/integrationRoles.ts`).
+ *
+ * A project supplies a *reference* per role under `credentials.pm`
+ * (`src/config/schema.ts`) — never the secret — and `resolvePmCredential`
+ * (`src/config/provider.ts`) turns `(project, role)` into the secret.
+ */
+export interface PmCredentialRoleSpec {
+	/** Stable key the project's `credentials.pm` map and every resolver call name. */
+	readonly role: string;
+	/** Human-readable name, for logs and any future credential UI. */
+	readonly label: string;
+	/**
+	 * Host-environment variable read as the last-resort fallback only when the
+	 * project explicitly configures a reference for this role — and, for `swarm
+	 * config apply`, the conventional key an operator exports the secret under.
+	 */
+	readonly envVarKey: string;
+	/** When `true`, the provider still works without this credential. */
+	readonly optional?: boolean;
+	/**
+	 * Key of the project's shared `credentials` block this role falls back to when
+	 * `credentials.pm` names no reference for it — the *data* form of a deliberate
+	 * cross-category reach (ai/RULES.md §2), so shared code never branches on a
+	 * provider id to honor one.
+	 *
+	 * Exists for exactly one case today: GitHub Projects' webhook secret **is** the
+	 * GitHub SCM webhook secret, because the board and the repo are literally the
+	 * same webhook — one URL, one secret (docs/github-projects-v2-api.md §5). A role
+	 * declaring this is also exempt from the "every non-optional role must be
+	 * configured" check, since it already resolves without a `credentials.pm` entry.
+	 *
+	 * A provider whose board is a separate system (Jira, Linear, Trello) must not
+	 * declare it: borrowing another category's secret is only honest when the two
+	 * are the same account.
+	 */
+	readonly inheritsSharedCredential?: keyof ScmCredentialReferences;
+}
+
+/**
+ * Role a provider declares when its webhook scheme authenticates deliveries with a
+ * project-scoped secret — the one the receiver resolves into
+ * {@link PmWebhookVerification.secret} before calling
+ * {@link PMProviderManifest.verifyWebhookSignature}.
+ *
+ * Named here rather than in the receiver so the receiver resolves a *declared*
+ * role instead of assuming every provider has one: a provider that declares no
+ * such role sees `secret: null` and its verifier decides, which is exactly the
+ * documented contract for a scheme that signs with something else.
+ */
+export const PM_WEBHOOK_SECRET_ROLE = 'webhookSecret';
 
 /**
  * Everything a PM provider could need to authenticate an inbound webhook —
@@ -100,6 +160,17 @@ export interface PMProviderManifest {
 	 * through the registry is a later cleanup, not part of this contract.
 	 */
 	readonly configSchema: z.ZodTypeAny;
+
+	/**
+	 * The credentials this provider needs, each as a {@link PmCredentialRoleSpec}
+	 * (issue #497). This is the *declaration* a project's `credentials.pm` map is
+	 * validated against (`src/config/schema.ts`): a reference for a role that isn't
+	 * declared here, or a missing non-optional role, fails config validation.
+	 *
+	 * Declare only what the provider actually resolves — an empty list is legal for a
+	 * provider that needs no project-scoped secret of its own.
+	 */
+	readonly credentialRoles: readonly PmCredentialRoleSpec[];
 
 	/**
 	 * The provider's router-side webhook adapter (parse → resolve project → filter

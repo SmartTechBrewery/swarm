@@ -6,16 +6,21 @@
  * `dashboard/vitest.config.ts`), mirroring the `board-mapping.ts`/`.test.ts` split.
  */
 
-import type { Credentials } from '../../../src/config/schema.js';
+import type { ScmCredentialReferences } from '../../../src/config/schema.js';
 
 /**
- * The credential references a project carries — derived from the Zod-owned
- * `CredentialsSchema` (`src/config/schema.ts`) per "Zod is the source of truth"
- * (`ai/CODING_STANDARDS.md`), so adding/removing a role in the schema surfaces
- * here as a type error. The actual env-var keys are project-configured and come
- * from `projects.credentials.list`; the role is the stable discriminator.
+ * The credential references this screen edits — derived from the Zod-owned
+ * `ScmCredentialReferencesSchema` (`src/config/schema.ts`) per "Zod is the source of
+ * truth" (`ai/CODING_STANDARDS.md`), so adding/removing a role in the schema
+ * surfaces here as a type error. The actual env-var keys are project-configured and
+ * come from `projects.credentials.list`; the role is the stable discriminator.
+ *
+ * The shared SCM references, not the whole `credentials` block: the PM provider's
+ * own roles (`credentials.pm`, issue #497) are declared per provider on its manifest
+ * and configured in `swarm.config.json` — this tab has no UI for them, and
+ * `credentials.list` excludes them for the same reason.
  */
-export type CredentialRole = keyof Credentials;
+export type CredentialRole = keyof ScmCredentialReferences;
 
 /** One entry from `projects.credentials.list` (see `src/api/routers/credentials.ts`). */
 export interface CredentialEntry {
