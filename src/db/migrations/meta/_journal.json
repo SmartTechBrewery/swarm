@@ -299,15 +299,8 @@
     {
       "idx": 42,
       "version": "7",
-      "when": 1785949500000,
-      "tag": "0042_run_checkpoint_continuation",
-      "breakpoints": true
-    },
-    {
-      "idx": 43,
-      "version": "7",
       "when": 1785955210287,
-      "tag": "0043_overconfident_medusa",
+      "tag": "0042_run_checkpoint_continuation",
       "breakpoints": true
     }
   ]
