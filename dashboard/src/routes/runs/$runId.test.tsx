@@ -5,11 +5,12 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunRow } from '@/types/runs.js';
 
-// The route module builds a real tRPC client at import time; the reset-button
-// tests below drive its mutation, so the whole module is stubbed here. Every
-// other test in this file renders a pure callout that never touches it.
+// The route module builds a real tRPC client at import time; the reset- and
+// force-re-review-button tests below drive its mutations, so the whole module is
+// stubbed here. Every other test in this file renders a pure callout that never
+// touches it.
 vi.mock('@/lib/trpc.js', () => ({
-	trpcClient: { runs: { reset: { mutate: vi.fn() } } },
+	trpcClient: { runs: { reset: { mutate: vi.fn() }, forceReReview: { mutate: vi.fn() } } },
 	trpc: {
 		runs: {
 			getById: { queryKey: () => ['runs.getById'] },
@@ -33,6 +34,7 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 import { trpcClient } from '@/lib/trpc.js';
 import {
 	FailureDiagnosisCallout,
+	ForceReReviewButton,
 	GitHubReferences,
 	RecoveryCallout,
 	ResetRunButton,
@@ -107,10 +109,23 @@ describe('FailureDiagnosisCallout (issue #269)', () => {
 });
 
 describe('ReviewCapCallout (issue #242)', () => {
-	it('explains the cap-stopping final verdict and cites its ordinal', () => {
-		render(
-			<ReviewCapCallout run={makeReviewRun()} project={{ name: 'Demo', repo: 'acme/demo' }} />,
+	// The callout hosts the "Force re-review" action (issue #511), which owns a
+	// mutation — so a capped callout needs the query client the app provides.
+	// The `renders nothing` cases below return before that and stay provider-free.
+	function renderCapCallout(
+		run: RunRow = makeReviewRun(),
+		project: { name: string; repo: string } | null = { name: 'Demo', repo: 'acme/demo' },
+	) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<ReviewCapCallout run={run} project={project} />
+			</QueryClientProvider>,
 		);
+	}
+
+	it('explains the cap-stopping final verdict and cites its ordinal', () => {
+		renderCapCallout();
 
 		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
 		expect(screen.getByText(/last changes-requested verdict/i)).toBeDefined();
@@ -118,17 +133,21 @@ describe('ReviewCapCallout (issue #242)', () => {
 		expect(screen.getByText(/will not automatically enqueue another/i)).toBeDefined();
 	});
 
+	it('exposes the Force re-review action from the capped callout (issue #511)', () => {
+		renderCapCallout();
+
+		expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
+	});
+
 	it('links to the PR when the project repo is known', () => {
-		render(
-			<ReviewCapCallout run={makeReviewRun()} project={{ name: 'Demo', repo: 'acme/demo' }} />,
-		);
+		renderCapCallout();
 
 		const link = screen.getByRole('link', { name: /view pr #42/i }) as HTMLAnchorElement;
 		expect(link.href).toBe('https://github.com/acme/demo/pull/42');
 	});
 
 	it('omits the PR link when no project is known', () => {
-		render(<ReviewCapCallout run={makeReviewRun()} project={null} />);
+		renderCapCallout(makeReviewRun(), null);
 
 		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
 		expect(screen.queryByRole('link', { name: /view pr/i })).toBeNull();
@@ -577,5 +596,99 @@ describe('ResetRunButton (issue #428)', () => {
 		// The success report should still be visible even though run status is running and ResetRunButton unmounted
 		expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
 		expect(screen.getByText(/dispatch dispatch-9/i)).toBeDefined();
+	});
+});
+
+describe('ForceReReviewButton (issue #511)', () => {
+	const forceMutate = vi.mocked(trpcClient.runs.forceReReview.mutate);
+
+	beforeEach(() => {
+		forceMutate.mockReset();
+	});
+
+	function renderButton(run: RunRow = makeReviewRun()) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<ForceReReviewButton run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	/** Open the confirmation modal from the callout's trigger button. */
+	function openConfirm(run?: RunRow) {
+		renderButton(run);
+		fireEvent.click(screen.getByRole('button', { name: /force re-review/i }));
+	}
+
+	function confirm() {
+		const buttons = screen.getAllByRole('button', { name: /force re-review/i });
+		// The trigger renders first; the modal's confirm button is the last one.
+		fireEvent.click(buttons[buttons.length - 1]);
+	}
+
+	const scheduled = {
+		runId: 'run-1',
+		prNumber: '42',
+		headSha: 'cafebabe',
+		capOverride: 'granted' as const,
+		dispatch: 'scheduled' as const,
+		dispatchId: 'dispatch-9',
+	};
+
+	it('confirms before scheduling anything', async () => {
+		forceMutate.mockResolvedValue(scheduled);
+		openConfirm();
+
+		expect(screen.getByRole('heading', { name: 'Force re-review?' })).toBeDefined();
+		expect(screen.getByText(/bypasses SWARM's review safety cap for PR #42/i)).toBeDefined();
+		expect(forceMutate).not.toHaveBeenCalled();
+
+		confirm();
+
+		await waitFor(() => {
+			expect(forceMutate).toHaveBeenCalledWith({ runId: 'run-1' });
+		});
+	});
+
+	it('renders the per-step report on success', async () => {
+		forceMutate.mockResolvedValue(scheduled);
+		openConfirm();
+		confirm();
+
+		await waitFor(() => {
+			expect(screen.getByRole('heading', { name: 'Re-review scheduled' })).toBeDefined();
+		});
+		expect(screen.getByText(/one extra review slot granted/i)).toBeDefined();
+		expect(screen.getByText(/scheduled for PR #42 as dispatch dispatch-9/i)).toBeDefined();
+	});
+
+	it('reports a repeated force as duplicating nothing', async () => {
+		forceMutate.mockResolvedValue({
+			...scheduled,
+			capOverride: 'already-granted',
+			dispatch: 'already-scheduled',
+		});
+		openConfirm();
+		confirm();
+
+		await waitFor(() => {
+			expect(screen.getByText(/nothing duplicated/i)).toBeDefined();
+		});
+	});
+
+	it("renders the server's refusal message and keeps the modal open", async () => {
+		forceMutate.mockRejectedValue(
+			new Error('Run "run-1" is not a completed Review run stopped by the review cap.'),
+		);
+		openConfirm();
+		confirm();
+
+		await waitFor(() => {
+			expect(
+				screen.getByText('Run "run-1" is not a completed Review run stopped by the review cap.'),
+			).toBeDefined();
+		});
+		expect(screen.getByRole('heading', { name: 'Force re-review?' })).toBeDefined();
 	});
 });

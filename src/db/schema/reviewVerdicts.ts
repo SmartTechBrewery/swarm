@@ -44,6 +44,22 @@ export const reviewVerdicts = pgTable(
 		reviewId: text('review_id'),
 		reservedAt: timestamp('reserved_at').defaultNow().notNull(),
 		submittedAt: timestamp('submitted_at'),
+		/**
+		 * When an operator deliberately forced the corrective cycle to continue past
+		 * this slot's cap-reaching verdict ("Force re-review", issue #511). Set on
+		 * the *capped* slot itself, so the override is recorded next to the verdict
+		 * it overrides and a later operator can tell a cap-bypassed re-review from an
+		 * ordinary automatic one. Each grant is worth exactly one extra reservation:
+		 * `reserveReviewVerdict` raises the PR's effective cap by the number of
+		 * granted-but-unconsumed overrides.
+		 */
+		capOverrideGrantedAt: timestamp('cap_override_granted_at'),
+		/**
+		 * When the extra slot {@link capOverrideGrantedAt} granted was actually taken
+		 * by a reservation. Consumed inside the same advisory-locked transaction that
+		 * creates that slot, so one grant can never license two reviews.
+		 */
+		capOverrideConsumedAt: timestamp('cap_override_consumed_at'),
 	},
 	(table) => [
 		// One *active* record per head — the same-head retry/reuse identity the

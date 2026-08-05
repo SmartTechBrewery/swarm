@@ -28,6 +28,16 @@
  * race before the Review phase has stored it; a lookup error or a missing
  * record for a `changes_requested` event fails closed (skips the dispatch)
  * rather than risk reopening an unbounded cycle on a persistence outage.
+ *
+ * **Forcing the cycle past the cap (issue #511).** An authorized operator can
+ * deliberately continue that stopped cycle from the run-detail view, which
+ * enqueues a synthetic review event carrying `forcedReReview`
+ * (`src/dispatch/force-re-review.ts`). That flag — and only that flag — skips the
+ * cap gate here, and with it the reviewer-persona gate: the forced event is
+ * SWARM's own durable ledger record replayed by an operator, not an inbound
+ * webhook whose author still has to be established. The extra Review slot the
+ * follow-up needs is granted separately, on the ledger record itself, so nothing
+ * about the automatic cap changes for events SWARM produces on its own.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
@@ -38,7 +48,7 @@ import {
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import { logger } from '../../lib/logger.js';
 import type { ScmEvent } from '../../scm/events.js';
-import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
+import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 /**
  * Resolve the webhook coordinates that cannot be recovered from the verdict
@@ -73,6 +83,56 @@ export interface RespondToReviewTriggerDeps {
 	getReviewVerdictByHead?: typeof getReviewVerdictByHeadDefault;
 }
 
+/**
+ * Whether a resolved ledger record stops the automatic cycle here: the
+ * cap-reaching `request-changes` case, unless an operator explicitly forced the
+ * continuation past it (issue #511). Both outcomes log, because each is the
+ * answer to "why did (or didn't) a Respond-to-review run start for this PR?".
+ */
+function stopsAtReviewCap(
+	record: { ordinal: number; verdict: string | null },
+	forced: boolean,
+	context: { prNumber: string; headSha?: string; reviewId: string },
+): boolean {
+	if (!isCapReachingRequestChanges(record.ordinal, record.verdict ?? 'request-changes')) {
+		return false;
+	}
+	if (forced) {
+		logger.warn(
+			'respond-to-review: continuing past the review cap on an operator-forced re-review (issue #511)',
+			{ ...context, ordinal: record.ordinal },
+		);
+		return false;
+	}
+	logger.warn(
+		'respond-to-review: changes-requested verdict reached the review cap — stopping the automatic cycle (manual intervention required)',
+		context,
+	);
+	return true;
+}
+
+/**
+ * The reviewer-persona gate: whether this submitted review is the *reviewer*
+ * persona's own batched review, rather than a human's or the implementer's.
+ * Self-review is impossible, so anything else must not start a response.
+ */
+async function isReviewerPersonaReview(ctx: ScmTriggerContext): Promise<boolean> {
+	const { event, project } = ctx;
+	if (!event.actorLogin) {
+		logger.debug('respond-to-review: review has no author — skipping');
+		return false;
+	}
+	const identities = await ctx.scm.resolvePersonaIdentities(project);
+	if (ctx.scm.personaForActor(event.actorLogin, identities) !== 'reviewer') {
+		logger.debug('respond-to-review: review not authored by reviewer persona — skipping', {
+			reviewAuthor: event.actorLogin,
+			expectedReviewer: identities.reviewer,
+		});
+		return false;
+	}
+	return true;
+}
+
 export function createRespondToReviewTrigger(
 	deps: RespondToReviewTriggerDeps = {},
 ): TriggerHandler {
@@ -84,13 +144,16 @@ export function createRespondToReviewTrigger(
 	 * Resolve the safety-cap record for a changes-requested verdict. A matching
 	 * record also supplies the authoritative reviewed SHA when GitHub omitted it
 	 * from the webhook. Returns `null` for a cap-reaching verdict, lookup error,
-	 * or missing record — all fail closed (see the module header).
+	 * or missing record — all fail closed (see the module header). `forced` is the
+	 * operator's explicit override (issue #511): the record is still resolved (for
+	 * its reviewed SHA), but a cap-reaching ordinal no longer stops the dispatch.
 	 */
 	async function resolveChangesRequestedVerdict(
 		project: ProjectConfig,
 		prNumber: string,
 		reviewId: string,
 		headSha: string | undefined,
+		forced: boolean,
 	): Promise<Awaited<ReturnType<typeof getReviewVerdictByReviewId>> | null> {
 		try {
 			const record =
@@ -105,14 +168,7 @@ export function createRespondToReviewTrigger(
 				);
 				return null;
 			}
-			const verdict = record.verdict ?? 'request-changes';
-			if (isCapReachingRequestChanges(record.ordinal, verdict)) {
-				logger.warn(
-					'respond-to-review: second changes-requested verdict reached the review cap — stopping the automatic cycle (manual intervention required)',
-					{ prNumber, headSha, reviewId },
-				);
-				return null;
-			}
+			if (stopsAtReviewCap(record, forced, { prNumber, headSha, reviewId })) return null;
 			return record;
 		} catch (err) {
 			logger.error('respond-to-review: failed to read review-verdict cap state — failing closed', {
@@ -129,6 +185,7 @@ export function createRespondToReviewTrigger(
 		project: ProjectConfig,
 		event: ScmEvent,
 		coords: { prNumber: string; reviewId: string },
+		forced: boolean,
 	): Promise<string | null> {
 		if (event.reviewState !== 'changes-requested') return event.headSha ?? null;
 
@@ -137,6 +194,7 @@ export function createRespondToReviewTrigger(
 			coords.prNumber,
 			coords.reviewId,
 			event.headSha,
+			forced,
 		);
 		if (!record) return null;
 
@@ -185,27 +243,16 @@ export function createRespondToReviewTrigger(
 				return null;
 			}
 
-			if (!event.actorLogin) {
-				logger.debug('respond-to-review: review has no author — skipping');
-				return null;
-			}
-
-			const identities = await ctx.scm.resolvePersonaIdentities(project);
-			const persona = ctx.scm.personaForActor(event.actorLogin, identities);
-			if (persona !== 'reviewer') {
-				// A human review, or the implementer's own event — not the reviewer
-				// persona's batched review, so not an auto-response trigger.
-				logger.debug('respond-to-review: review not authored by reviewer persona — skipping', {
-					reviewAuthor: event.actorLogin,
-					expectedReviewer: identities.reviewer,
-				});
-				return null;
-			}
+			// An operator-forced continuation replays SWARM's own ledger record rather
+			// than an inbound webhook, so the author question is already answered and
+			// the persona gate is skipped with it (issue #511).
+			const forced = ctx.forcedReReview === true;
+			if (!forced && !(await isReviewerPersonaReview(ctx))) return null;
 
 			const coords = resolveWebhookCoordinates(event);
 			if (!coords) return null;
 			const { prNumber, prBranch, reviewId } = coords;
-			const headSha = await resolveDispatchHeadSha(project, event, coords);
+			const headSha = await resolveDispatchHeadSha(project, event, coords, forced);
 			if (!headSha) return null;
 
 			logger.debug('respond-to-review: dispatching Respond-to-review phase', {

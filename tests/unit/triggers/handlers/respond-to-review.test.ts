@@ -59,6 +59,29 @@ function ctx(overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {}):
 	return createMockScmTriggerContext({ project: PROJECT, scm: SCM, event: reviewEvent(overrides) });
 }
 
+/** The same context as {@link ctx}, carrying an operator's explicit cap override (issue #511). */
+function forcedCtx(
+	overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {},
+): TriggerContext {
+	return {
+		...createMockScmTriggerContext({ project: PROJECT, scm: SCM, event: reviewEvent(overrides) }),
+		forcedReReview: true,
+	};
+}
+
+/** A handler whose ledger reports this PR's slot as the cap-reaching final verdict. */
+function cappedHandler() {
+	return createRespondToReviewTrigger({
+		getReviewVerdictByReviewId: vi.fn(async () => ({
+			ordinal: REVIEW_VERDICT_CAP,
+			state: 'submitted' as const,
+			verdict: 'request-changes',
+			headSha: HEAD_SHA,
+		})),
+		getReviewVerdictByHead: vi.fn(async () => undefined),
+	});
+}
+
 describe('respond-to-review trigger', () => {
 	describe('matches', () => {
 		it('matches a submitted changes-requested review', () => {
@@ -315,6 +338,21 @@ describe('respond-to-review trigger', () => {
 			expect(await throwingHandler.handle(ctx())).toBeNull();
 		});
 
+		it('keeps stopping the cycle for an ordinal past the cap', async () => {
+			// Only an operator's override can produce an ordinal above the cap; the
+			// pass it licensed must still stop the automatic cycle afterwards.
+			const pastCapHandler = createRespondToReviewTrigger({
+				getReviewVerdictByReviewId: vi.fn(async () => ({
+					ordinal: REVIEW_VERDICT_CAP + 1,
+					state: 'submitted' as const,
+					verdict: 'request-changes',
+					headSha: HEAD_SHA,
+				})),
+				getReviewVerdictByHead: vi.fn(async () => undefined),
+			});
+			expect(await pastCapHandler.handle(ctx())).toBeNull();
+		});
+
 		it('does not consult the ledger for a non-changes-requested verdict', async () => {
 			const project = createMockProjectConfig({
 				pipeline: { respondToReview: { skipOnMinors: false } },
@@ -327,6 +365,56 @@ describe('respond-to-review trigger', () => {
 			const result = await noopHandler.handle({ ...ctx({ reviewState: 'approved' }), project });
 			expect(result).toMatchObject({ phase: 'respond-to-review' });
 			expect(byReviewId).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('operator-forced continuation past the cap (issue #511)', () => {
+		it('dispatches the capped verdict when the operator forced it', async () => {
+			expect(await cappedHandler().handle(forcedCtx())).toMatchObject({
+				phase: 'respond-to-review',
+				taskId: '17-respond',
+				prNumber: '17',
+				prBranch: 'issue-17',
+				reviewId: '555',
+				headSha: HEAD_SHA,
+			});
+		});
+
+		it('leaves the automatic cap untouched for the same event without the flag', async () => {
+			expect(await cappedHandler().handle(ctx())).toBeNull();
+		});
+
+		it('skips the reviewer-persona gate, since the forced event replays SWARM\u2019s own ledger record', async () => {
+			const scm = createFakeScmProvider({
+				resolvePersonaIdentities: async () => {
+					throw new Error('identities should not be resolved for a forced continuation');
+				},
+				personaForActor: getPersonaForLogin,
+			});
+			const forced = {
+				...createMockScmTriggerContext({
+					project: PROJECT,
+					scm,
+					event: reviewEvent({ actorLogin: undefined }),
+				}),
+				forcedReReview: true,
+			};
+			expect(await cappedHandler().handle(forced)).toMatchObject({ phase: 'respond-to-review' });
+		});
+
+		it('still fails closed when the forced event has no ledger record at all', async () => {
+			const noRecordHandler = createRespondToReviewTrigger({
+				getReviewVerdictByReviewId: vi.fn(async () => undefined),
+				getReviewVerdictByHead: vi.fn(async () => undefined),
+			});
+			expect(await noRecordHandler.handle(forcedCtx())).toBeNull();
+		});
+
+		it('still honours a project that disabled Respond-to-review', async () => {
+			const project = createMockProjectConfig({
+				pipeline: { respondToReview: { enabled: false } },
+			});
+			expect(await cappedHandler().handle({ ...forcedCtx(), project })).toBeNull();
 		});
 	});
 });
