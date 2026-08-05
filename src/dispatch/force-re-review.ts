@@ -173,6 +173,13 @@ const MAX_DISPATCH_CHAIN_ATTEMPTS = 5;
  * `skipped-not-eligible`, `skipped-duplicate`, `superseded`) means the trigger
  * refused the event or the worker decided against a run, not that Respond-to-review
  * actually started.
+ *
+ * `DispatchOutcome` also names merge-automation-only completions (`merged`,
+ * `merge-not-eligible`, …), which this would likewise call dead. That's outside
+ * what a Respond-to-review dispatch can ever actually record — this module
+ * always creates one with `phase: 'respond-to-review'`, never `merge-automation`
+ * — so it's a harmless breadth mismatch, not a bug: the check is scoped to
+ * "is this a real outcome", and no code path here ever produces a merge one.
  */
 function isDeadDispatch(dispatch: Pick<DispatchRow, 'state' | 'outcome'>): boolean {
 	if (ACTIVE_DISPATCH_STATES.includes(dispatch.state as (typeof ACTIVE_DISPATCH_STATES)[number])) {
@@ -198,9 +205,12 @@ async function publishForcedDispatch(
 	prNumber: string,
 	headSha: string,
 	event: ScmEvent,
-): Promise<{ dispatch: DispatchRow; created: boolean; deadPriorAttempt?: DispatchRow }> {
+): Promise<{ dispatch: DispatchRow; created: boolean; deadChain: DispatchRow[] }> {
 	let deliveryId = deliveryIdentity(['force-re-review', project.repo, prNumber, headSha]);
-	let deadPriorAttempt: DispatchRow | undefined;
+	// Every dead row this call walked past, oldest first — not just the latest —
+	// so the caller's own log line can name the whole chain, not only its last
+	// hop (a multi-hop chain is already an anomaly worth seeing in full).
+	const deadChain: DispatchRow[] = [];
 	for (let attempt = 0; attempt < MAX_DISPATCH_CHAIN_ATTEMPTS; attempt++) {
 		const { dispatch, created } = await createAndPublishDispatch({
 			projectId: project.id,
@@ -218,7 +228,7 @@ async function publishForcedDispatch(
 			phase: 'respond-to-review',
 		});
 		if (created || !isDeadDispatch(dispatch)) {
-			return { dispatch, created, deadPriorAttempt };
+			return { dispatch, created, deadChain };
 		}
 		logger.warn('force re-review: prior forced dispatch resolved dead — chaining a fresh attempt', {
 			projectId: project.id,
@@ -229,7 +239,7 @@ async function publishForcedDispatch(
 			deadDispatchOutcome: dispatch.outcome,
 			attempt,
 		});
-		deadPriorAttempt = dispatch;
+		deadChain.push(dispatch);
 		deliveryId = deliveryIdentity([
 			'force-re-review',
 			project.repo,
@@ -329,12 +339,16 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		headSha,
 		prBranch,
 	};
-	const { dispatch, created, deadPriorAttempt } = await publishForcedDispatch(
+	const { dispatch, created, deadChain } = await publishForcedDispatch(
 		project,
 		prNumber,
 		headSha,
 		event,
 	);
+	// The chain's last hop — the dead dispatch this call's fresh attempt directly
+	// replaces — vs. the full chain, which the warn logs above already carried
+	// one hop at a time.
+	const deadPriorAttempt = deadChain.at(-1);
 
 	logger.info('force re-review scheduled', {
 		runId: run.id,
@@ -346,6 +360,7 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		dispatchId: dispatch.id,
 		created,
 		chainedPastDeadDispatchId: deadPriorAttempt?.id,
+		deadDispatchChain: deadChain.map((d) => d.id),
 	});
 
 	return {
