@@ -62,6 +62,11 @@ services:
       # reach this container too (the host worker + API server read it from .env
       # directly). Never persisted; passed through from the host env.
       SWARM_OPERATOR_GH_TOKEN: ${SWARM_OPERATOR_GH_TOKEN:-}
+      # SWARM's own public base URL (issue #496). The receiver hands each route's
+      # callback URL to the PM provider's signature verifier, because some providers
+      # sign it with the body (Trello). Unset is fine for GitHub / GitHub Projects:
+      # the receiver then derives it from the request's Host header.
+      WEBHOOK_CALLBACK_BASE_URL: ${WEBHOOK_CALLBACK_BASE_URL:-}
       # Structured logging (src/lib/logger.ts). Containers have no TTY, so the
       # logger already defaults to JSON here; set these to tune level/format.
       SWARM_LOG_LEVEL: ${SWARM_LOG_LEVEL:-info}

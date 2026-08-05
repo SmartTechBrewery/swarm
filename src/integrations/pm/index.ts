@@ -16,7 +16,11 @@
  */
 
 export type { PMRouterAdapter } from '../../pm/router-adapter.js';
-export type { PMProviderManifest } from './manifest.js';
+export type {
+	PMProviderManifest,
+	PmWebhookVerification,
+	PmWebhookVerifier,
+} from './manifest.js';
 export {
 	getPMProvider,
 	listPMProviders,

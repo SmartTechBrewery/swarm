@@ -50,6 +50,13 @@ describe('github-projects manifest registration', () => {
 		}
 	});
 
+	// Issue #496: the receiver mounts routes from the registry, so the shared
+	// `/github/webhook` path is declared here as data rather than hardcoded there.
+	it('declares the shared GitHub webhook route and a signature verifier', () => {
+		expect(githubProjectsManifest.webhookRoute).toBe('/github/webhook');
+		expect(githubProjectsManifest.verifyWebhookSignature).toBeTypeOf('function');
+	});
+
 	it('declares the board and state discovery capabilities', () => {
 		expect(githubProjectsManifest.discovery).toEqual(['containers', 'states']);
 	});
