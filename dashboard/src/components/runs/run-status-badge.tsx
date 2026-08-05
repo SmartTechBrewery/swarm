@@ -1,6 +1,6 @@
 import type { ComponentProps } from 'react';
 
-type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'queued';
+type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed' | 'queued';
 
 interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	status: RunStatus;
@@ -65,6 +65,21 @@ const STATUS_CONFIGS: Record<RunStatus, BadgeConfig> = {
 		text: 'Deferred',
 		classes: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
 		dotClass: 'bg-amber-400',
+	},
+	// The *other* retry-pending status (issue #503): waiting to be continued from
+	// its Tier 2 checkpoint, not waiting on quota. It must not read as amber
+	// "Deferred", so it takes `sky` — the one status hue `ai/DESIGN_SYSTEM.md` §1
+	// documents (and `index.css` light-theme-overrides) that no badge had claimed
+	// yet, rather than an invented colour. It shares the blue *family* with
+	// "Running" but never the row: this status has no live agent, so it carries no
+	// pulse, and the label — not the hue — is what says which state it is. `title`
+	// keeps the "why it's waiting" context a one-word label can't.
+	checkpointed: {
+		text: 'Checkpointed',
+		classes: 'bg-sky-500/10 text-sky-400 border-sky-500/20',
+		dotClass: 'bg-sky-400',
+		title:
+			'Stopped with a checkpoint — waiting to be continued from its recorded remainder, not waiting on quota.',
 	},
 	// Enqueued but not yet picked up (issue #238). Neutral zinc and, crucially, no
 	// pulse — it must read as clearly *not running* against the blue pulsing

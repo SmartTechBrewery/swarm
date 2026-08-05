@@ -14,10 +14,11 @@ worktree and restarting the phase from scratch. It is a two-tier design:
 Both tiers are live. Tier 2 arrived in phases: the *artifact* — the file, its schema, and the
 prompt that makes the implementer phases keep it current (issue #299 phase 1/4); the
 *mechanism* that continues a phase from one — the `checkpoint` recovery mode, its validation
-gate, the guaranteed-fresh session, and the prompt that re-seeds it (phase 2/4); and now the
+gate, the guaranteed-fresh session, and the prompt that re-seeds it (phase 2/4); the
 *policy* that selects it — the `checkpointed` run status, worktree preservation on the strength
-of a checkpoint, and the bounded continuation dispatch (phase 3/4, issue #503). What is left is
-operator surface only: dashboard rendering and a "continue or terminate" action (phase 4/4).
+of a checkpoint, and the bounded continuation dispatch (phase 3/4, issue #503); and the
+*operator surface* that makes it visible and actionable — the status badge, the checkpoint
+panel, and the continue/terminate actions (phase 4/4, issue #504). Tier 2 is therefore complete.
 The speculative self-checkpoint *trigger* (§ "Rejected") remains unimplemented; the
 resume-from-preserved-state mechanics Tier 2 builds on are proven by Tier 1.
 
@@ -255,6 +256,37 @@ is spent, the next involuntary stop is a terminal failure whose reason and
 hand-off. A continuation also consumes an ordinary rate-limit retry attempt, so the coarser
 `MAX_RATE_LIMIT_RETRIES` cap still applies underneath.
 
+### The operator surface — seeing one and acting on it
+
+A `checkpointed` run is not something to wait out silently: it holds a preserved checkout, has
+recorded work left, and spends a bounded budget. So the dashboard renders it as its own state
+(issue #504), never folded into `deferred`:
+
+- **Its own badge.** A `Checkpointed` badge in the documented `sky` hue — the label, not the
+  colour, carries the meaning (`ai/DESIGN_SYSTEM.md` §1) — with a tooltip saying it is waiting on
+  a continuation rather than on quota. Both the Runs table and the run detail page use it, and
+  the Status filter offers it.
+- **The hand-off itself.** The run detail page shows a **Checkpoint hand-off** panel: the
+  remaining work numbered in the order a continuation works through it, what is already
+  completed, the decisions carried over, and the working tree the checkpoint recorded — read off
+  the persisted `checkpoint` column, so it renders for a federated worker's run too. The panel is
+  gated on the checkpoint's *presence*, not on the status, because the column survives an
+  ordinary retry as the record of what the current attempt was seeded from. Its spent
+  `continuation_count` reads against the project's ceiling, which `runs.getById` resolves
+  server-side (`maxContinuations`) so `pipeline.maxContinuations`'s default is never re-declared
+  in the web bundle.
+- **Continue now / Terminate / Reset & restart.** The same three actions a deferred run offers,
+  relabelled for what they actually do here. "Continue now" fires the *existing* `runs.retryNow`
+  mutation, which sends a `checkpointed` row through `recoveryMode: 'checkpoint'` unconditionally
+  — so a CLI/model override composes with it rather than turning it into a fresh start.
+  "Terminate" settles it down the same branch a deferred run takes (`isRetryPendingStatus`), and
+  its confirmation says what that abandons. Every guard is server-side; the buttons only mirror
+  it, so a hidden button is never the thing keeping an unsafe action from happening.
+- **The `checkpoint-divergent` block** gets its own recovery copy in the run detail page's
+  recovery callout: unlike a dirty or leased checkout, no amount of tidying restores a hand-off
+  the tree no longer matches, so the guidance is to start the phase over rather than to resolve
+  and recheck.
+
 ### A federated worker reports the same settle
 
 The control plane owns the policy and the budget, but only the worker's host holds the worktree.
@@ -280,13 +312,9 @@ scope for the design.
 
 ## Required future work
 
-**Tier 2 — fallback checkpoint file** (issue #299)
-
-Tier 2 runs end to end as of issue #503 (phase 3/4): the artifact (phase 1/4), the continuation
-mechanism (phase 2/4), and the policy that selects it. What is left is operator surface:
-
-- Dashboard visibility for a `checkpointed` run — its recorded remainder, its spent continuation
-  count — and an operator action to continue or terminate it (phase 4/4).
+**Tier 2 — fallback checkpoint file** (issue #299) — **complete.** The artifact (phase 1/4), the
+continuation mechanism (phase 2/4), the policy that selects it (phase 3/4), and the operator
+surface (phase 4/4) have all landed. Nothing is outstanding.
 
 **Shared**
 

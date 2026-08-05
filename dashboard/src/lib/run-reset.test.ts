@@ -26,6 +26,12 @@ describe('canResetRun', () => {
 		expect(canResetRun('deferred')).toBe(true);
 	});
 
+	it('allows reset for a checkpointed run (issue #503)', () => {
+		// `resetRun` refuses only a `running` row unless forced, so withholding the
+		// button here would hide an action the server accepts.
+		expect(canResetRun('checkpointed')).toBe(true);
+	});
+
 	it('disallows reset for running and completed runs', () => {
 		expect(canResetRun('running')).toBe(false);
 		expect(canResetRun('completed')).toBe(false);
@@ -58,6 +64,16 @@ describe('resetConfirmMessage', () => {
 	it('mentions the scheduled retry for a deferred run', () => {
 		expect(resetConfirmMessage('deferred', false)).toContain('scheduled retry');
 		expect(resetConfirmMessage('failed', false)).not.toContain('scheduled retry');
+	});
+
+	it('says a checkpointed reset discards the checkpoint and its spent budget (issue #503)', () => {
+		const message = resetConfirmMessage('checkpointed', false);
+		expect(message).toContain('scheduled continuation');
+		expect(message).toContain('checkpoint');
+		expect(message).toContain('continuation count');
+		// The remainder is given up, not carried into the restarted phase.
+		expect(message).toContain('not carried over');
+		expect(resetConfirmMessage('failed', false)).not.toContain('checkpoint');
 	});
 
 	it('says protected work is kept when force is off', () => {

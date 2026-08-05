@@ -38,14 +38,15 @@ export interface ResetRunReport {
 /**
  * Whether a run can be reset. Reset is the last resort for a *wedged* run, so it
  * is offered exactly where the run is stuck but no longer live: a `failed` run
- * (including one whose recovery is `blocked`) and a `deferred` run whose pending
- * retry can't get it moving. A `running` run should be terminated first and a
- * `completed` one has nothing to restart — mirroring the server's own guard
- * (`resetRun` refuses a `running` run unless forced) so the button never offers
- * an action the router would reject.
+ * (including one whose recovery is `blocked`) and either retry-pending status —
+ * `deferred`, or `checkpointed` (issue #503) — whose waiting dispatch can't get
+ * it moving. A `running` run should be terminated first and a `completed` one has
+ * nothing to restart — mirroring the server's own guard (`resetRun` refuses a
+ * `running` run unless forced, and nothing else) so the button never offers an
+ * action the router would reject, nor withholds one it would accept.
  */
 export function canResetRun(status: string): boolean {
-	return status === 'failed' || status === 'deferred';
+	return status === 'failed' || status === 'deferred' || status === 'checkpointed';
 }
 
 /** Confirm-button label: reads "Resetting…" while the mutation is pending. */
@@ -58,13 +59,24 @@ export function resetButtonLabel(isPending: boolean): string {
  * this is the one action that throws away state no other button touches, and
  * changes its second half with the `force` opt-in: without it a dirty/unpushed
  * checkout is retained rather than removed, with it that work is gone for good.
+ *
+ * A `checkpointed` run gets the extra sentence its state earns (issue #503): reset
+ * is the only action that discards the recorded checkpoint and returns the spent
+ * continuation budget, so restarting one deliberately gives up the remainder
+ * "Continue now" would have picked up.
  */
 export function resetConfirmMessage(status: string, discardWork: boolean): string {
 	const scope =
-		status === 'deferred'
-			? "This cancels the run's scheduled retry and its active dispatch"
-			: "This cancels the run's active dispatch";
-	const sequence = `${scope}, removes its checkout and releases the worktree lease, clears its recovery record, and restarts this phase from scratch with a fresh agent session.`;
+		status === 'checkpointed'
+			? "This cancels the run's scheduled continuation and its active dispatch"
+			: status === 'deferred'
+				? "This cancels the run's scheduled retry and its active dispatch"
+				: "This cancels the run's active dispatch";
+	const checkpoint =
+		status === 'checkpointed'
+			? ' Its checkpoint and spent continuation count are cleared too, so the remainder it recorded is not carried over.'
+			: '';
+	const sequence = `${scope}, removes its checkout and releases the worktree lease, clears its recovery record, and restarts this phase from scratch with a fresh agent session.${checkpoint}`;
 	const work = discardWork
 		? 'Uncommitted changes and unpushed commits in the checkout are discarded permanently — they cannot be recovered.'
 		: 'Uncommitted changes and unpushed commits are kept: a checkout holding either is retained instead of removed.';

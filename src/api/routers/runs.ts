@@ -39,6 +39,7 @@ import { getWorker } from '../../identity/worker-service.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
+import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import {
 	type CancellationOrigin,
@@ -388,6 +389,36 @@ async function resolveRunAttribution(run: {
 	}
 }
 
+/**
+ * The checkpoint-continuation budget that bounds this run's Tier 2 fallback
+ * (issue #504) — the project's `pipeline.maxContinuations`, or the coded default
+ * ({@link resolveMaxContinuations}). Resolved server-side, so the dashboard can
+ * show the spent `continuationCount` against its ceiling without re-declaring
+ * that default in the web bundle where it would go stale.
+ *
+ * Only a row that actually carries a checkpoint has a budget worth reporting, so
+ * every other run skips the project read entirely — the same shape
+ * {@link resolveRunAttribution} uses for a run with no recorded worker. Returns
+ * `null` when the project no longer resolves or the read throws, so the panel
+ * shows the spent count alone rather than a fabricated ceiling.
+ */
+async function resolveContinuationBudget(run: {
+	projectId: string;
+	checkpoint: Checkpoint | null;
+}): Promise<number | null> {
+	if (!run.checkpoint) return null;
+	try {
+		const project = await getProjectByIdFromDb(run.projectId);
+		return project ? resolveMaxContinuations(project) : null;
+	} catch (error) {
+		logger.warn('runs.getById: continuation-budget lookup failed; reporting the count alone', {
+			projectId: run.projectId,
+			error: describeError(error),
+		});
+		return null;
+	}
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } straight from the repo.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
@@ -437,9 +468,13 @@ export const runsRouter = router({
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member
 	// of the run's project (existence hidden with identical run-not-found message).
-	// The row is returned as-is plus an additive `attribution` object resolving the
-	// recorded worker/user to display labels (issue #446) — looked up only after the
-	// access check, so a non-member never triggers an identity read.
+	// The row is returned as-is — including the persisted Tier 2 `checkpoint` and
+	// `continuationCount` (issue #503) the detail page's checkpoint panel renders —
+	// plus two additive, server-resolved fields: an `attribution` object resolving
+	// the recorded worker/user to display labels (issue #446), and the
+	// `maxContinuations` ceiling that count reads against (issue #504). Both are
+	// looked up only after the access check, so a non-member never triggers an
+	// identity or project read.
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -456,7 +491,11 @@ export const runsRouter = router({
 				'contributor',
 				`Run with ID "${input.id}" not found`,
 			);
-			return { ...run, attribution: await resolveRunAttribution(run) };
+			return {
+				...run,
+				attribution: await resolveRunAttribution(run),
+				maxContinuations: await resolveContinuationBudget(run),
+			};
 		}),
 
 	// Captured stdout/stderr for a run; null when the run stored no logs (a run
