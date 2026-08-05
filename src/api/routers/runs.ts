@@ -25,6 +25,11 @@ import {
 	createAndPublishDispatch,
 	publishDispatchWakeUp,
 } from '../../dispatch/dispatcher.js';
+import {
+	ForceReReviewError,
+	type ForceReReviewRefusal,
+	forceReReview,
+} from '../../dispatch/force-re-review.js';
 import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
@@ -221,6 +226,16 @@ const RESET_REFUSAL_CODES: Record<RunResetRefusal, TRPCError['code']> = {
 	'running-not-forced': 'PRECONDITION_FAILED',
 	'dispatch-claimed': 'PRECONDITION_FAILED',
 	'worktree-teardown-failed': 'PRECONDITION_FAILED',
+};
+
+/** How each force refusal (`src/dispatch/force-re-review.ts`) surfaces over tRPC. */
+const FORCE_RE_REVIEW_REFUSAL_CODES: Record<ForceReReviewRefusal, TRPCError['code']> = {
+	'run-not-found': 'NOT_FOUND',
+	'project-not-found': 'PRECONDITION_FAILED',
+	'respond-to-review-disabled': 'PRECONDITION_FAILED',
+	'not-capped': 'PRECONDITION_FAILED',
+	'missing-coordinates': 'PRECONDITION_FAILED',
+	'missing-review-record': 'PRECONDITION_FAILED',
 };
 
 function alreadyRetrying(): TRPCError {
@@ -775,6 +790,58 @@ export const runsRouter = router({
 				throw new TRPCError({
 					code: 'INTERNAL_SERVER_ERROR',
 					message: `Failed to reset run "${input.runId}": ${describeError(error)}`,
+				});
+			}
+		}),
+
+	// Force a re-review past the review-verdict safety cap ("Force re-review",
+	// issue #511).
+	//
+	// The recovery action for the one state the cap deliberately leaves stopped: a
+	// completed Review run whose last permitted `request-changes` verdict set
+	// `manual-intervention-required`, so no further Respond-to-review/re-review is
+	// enqueued automatically. Invoking it grants the PR exactly one extra review
+	// slot and enqueues the corrective Respond-to-review run; the normal pipeline
+	// (response → follow-up Review) carries on from there unchanged.
+	//
+	// Authorized exactly like the comparable run-recovery action, "Reset &
+	// restart": driving a run is `member`+ on its project, and a non-member gets
+	// the same run-not-found shape rather than learning the run exists.
+	//
+	// The sequence lives in `src/dispatch/force-re-review.ts`, where its guards run
+	// before any mutation and both writes are conditional (so repeated clicks and
+	// concurrent requests resolve to one corrective cycle); this procedure only
+	// authorizes and maps refusals.
+	forceReReview: authedProcedure
+		.input(z.object({ runId: z.string().min(1) }))
+		.mutation(async ({ ctx, input }) => {
+			// Resolved here for authorization only — the service re-reads the row.
+			const run = await getRunByIdFromDb(input.runId);
+			if (!run) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Run with ID "${input.runId}" not found`,
+				});
+			}
+			await assertProjectAccess(
+				ctx.user,
+				run.projectId,
+				'member',
+				`Run with ID "${input.runId}" not found`,
+			);
+
+			try {
+				return await forceReReview(input.runId);
+			} catch (error) {
+				if (error instanceof ForceReReviewError) {
+					throw new TRPCError({
+						code: FORCE_RE_REVIEW_REFUSAL_CODES[error.reason],
+						message: error.message,
+					});
+				}
+				throw new TRPCError({
+					code: 'INTERNAL_SERVER_ERROR',
+					message: `Failed to force a re-review for run "${input.runId}": ${describeError(error)}`,
 				});
 			}
 		}),

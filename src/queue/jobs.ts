@@ -157,6 +157,16 @@ const jobBase = z.object({
 	 */
 	continuationDispatchClaimed: z.boolean().optional(),
 	/**
+	 * Set on the synthetic `pull-request-review` job an operator's "Force
+	 * re-review" enqueues (issue #511): this Respond-to-review dispatch is a
+	 * deliberate, authorized continuation of a cycle the review-verdict safety cap
+	 * stopped, so the `pr-review-submitted` handler skips the cap gate (and the
+	 * reviewer-persona gate, which SWARM's own ledger record already answered)
+	 * instead of failing closed. Nothing in the automatic path ever sets it, so the
+	 * cap is unchanged for every event SWARM produces on its own.
+	 */
+	forcedReReview: z.boolean().optional(),
+	/**
 	 * The durable dispatch record this job wakes up (issue #284, ADR-002). Every
 	 * queue job produced by the dispatch layer carries it; the worker acts only
 	 * after atomically claiming that record, so a cancelled/completed dispatch

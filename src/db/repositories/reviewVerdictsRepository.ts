@@ -22,17 +22,30 @@
  * case), so a same-head retry after a failure that's known to have never
  * reached submission ({@link abandonReviewVerdict}) doesn't cost the PR its
  * slot.
+ *
+ * **Operator cap overrides (issue #511).** {@link REVIEW_VERDICT_CAP} is the
+ * *automatic* cap: nothing SWARM does on its own raises it. An operator who
+ * deliberately forces the corrective cycle to continue past a cap-reaching
+ * `request-changes` verdict ({@link grantReviewCapOverride}, the "Force
+ * re-review" action) grants that PR exactly one extra slot, recorded on the
+ * capped record itself. {@link reserveReviewVerdict} spends one such grant —
+ * inside the same advisory-locked transaction that creates the slot, so a grant
+ * can never license two reviews — and the raised ordinal still trips
+ * {@link isCapReachingRequestChanges}, so the forced pass stops the automatic
+ * cycle again rather than reopening it.
  */
 
-import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, ne, sql } from 'drizzle-orm';
 import { getDb } from '../client.js';
 import { reviewVerdicts } from '../schema/reviewVerdicts.js';
 
 /**
- * No PR may receive more than this many submitted SWARM Review verdicts — an
- * initial review plus at most two re-reviews. The one place the cap is
- * defined: every reservation decision, "is this the last permitted verdict?"
- * check, and doc reference derives from it.
+ * No PR may receive more than this many *automatically* submitted SWARM Review
+ * verdicts — an initial review plus at most two re-reviews. The one place the
+ * cap is defined: every reservation decision, "is this the last permitted
+ * verdict?" check, and doc reference derives from it. An explicit operator
+ * override ({@link grantReviewCapOverride}) adds one slot on top per grant; it
+ * never changes this number.
  */
 export const REVIEW_VERDICT_CAP = 3;
 
@@ -47,7 +60,8 @@ export interface ReviewVerdictKey {
 }
 
 export type ReviewVerdictReservation =
-	| { status: 'reserved'; id: string; ordinal: number }
+	/** `capOverride` marks a slot that only exists because an operator forced it (issue #511). */
+	| { status: 'reserved'; id: string; ordinal: number; capOverride?: true }
 	| { status: 'reused'; id: string; ordinal: number; state: 'pending' | 'submitted' }
 	| { status: 'blocked'; ordinal: number }
 	| { status: 'capped' };
@@ -101,9 +115,22 @@ export async function reserveReviewVerdict(
 			return { status: 'blocked', ordinal: pendingOther.ordinal };
 		}
 
+		// Past the automatic cap, the PR proceeds only on an operator's explicit
+		// grant (issue #511) — and that grant is spent here, in the same lock that
+		// creates the slot it pays for, so two racing reservations can never both
+		// redeem it.
 		const submittedCount = active.filter((row) => row.state === 'submitted').length;
+		let capOverride = false;
 		if (submittedCount >= REVIEW_VERDICT_CAP) {
-			return { status: 'capped' };
+			const grant = active.find(
+				(row) => row.capOverrideGrantedAt !== null && row.capOverrideConsumedAt === null,
+			);
+			if (!grant) return { status: 'capped' };
+			await tx
+				.update(reviewVerdicts)
+				.set({ capOverrideConsumedAt: new Date() })
+				.where(eq(reviewVerdicts.id, grant.id));
+			capOverride = true;
 		}
 
 		const ordinal = active.length + 1;
@@ -111,8 +138,53 @@ export async function reserveReviewVerdict(
 			.insert(reviewVerdicts)
 			.values({ projectId, repository, prNumber, headSha, ordinal, state: 'pending' })
 			.returning({ id: reviewVerdicts.id });
-		return { status: 'reserved', id: inserted[0].id, ordinal };
+		return {
+			status: 'reserved',
+			id: inserted[0].id,
+			ordinal,
+			...(capOverride ? { capOverride: true as const } : {}),
+		};
 	});
+}
+
+/** Whether an operator's cap override was recorded, or why it could not be. */
+export type ReviewCapOverrideResult = 'granted' | 'already-granted' | 'no-submitted-slot';
+
+/**
+ * Record an operator's deliberate decision to continue the corrective cycle past
+ * this PR/head's cap-reaching verdict ("Force re-review", issue #511), granting
+ * the PR exactly one extra review slot.
+ *
+ * Written on the *capped* record itself rather than a side table, so the
+ * override sits next to the verdict it overrides and stays visible to anyone
+ * reading the PR's ledger later. Idempotent by construction: the conditional
+ * update only fires while no grant exists, so repeated clicks and concurrent
+ * requests resolve to one grant and the loser is told so rather than adding a
+ * second slot.
+ */
+export async function grantReviewCapOverride(
+	key: ReviewVerdictKey,
+): Promise<ReviewCapOverrideResult> {
+	const match = and(
+		eq(reviewVerdicts.projectId, key.projectId),
+		eq(reviewVerdicts.repository, key.repository),
+		eq(reviewVerdicts.prNumber, key.prNumber),
+		eq(reviewVerdicts.headSha, key.headSha),
+		eq(reviewVerdicts.state, 'submitted'),
+	);
+	const granted = await getDb()
+		.update(reviewVerdicts)
+		.set({ capOverrideGrantedAt: new Date() })
+		.where(and(match, isNull(reviewVerdicts.capOverrideGrantedAt)))
+		.returning({ id: reviewVerdicts.id });
+	if (granted[0]) return 'granted';
+
+	const existing = await getDb()
+		.select({ id: reviewVerdicts.id })
+		.from(reviewVerdicts)
+		.where(match)
+		.limit(1);
+	return existing[0] ? 'already-granted' : 'no-submitted-slot';
 }
 
 /**
@@ -273,15 +345,62 @@ export async function getPriorSubmittedReview(
 }
 
 /**
+ * This PR/head's `submitted` slot with the fields the "Force re-review" service
+ * needs (issue #511) — the review id it must point the forced Respond-to-review
+ * run at, and whether an override was already granted from it. Deliberately its
+ * own read rather than a widened {@link ReviewVerdictRecord}: that shape crosses
+ * the DB-free worker's ledger transport (`src/pipeline/review-ledger.ts`), and
+ * this operator-only lookup has no business on that wire.
+ */
+export interface SubmittedReviewSlot {
+	ordinal: number;
+	verdict: string | null;
+	reviewId: string | null;
+	capOverrideGrantedAt: Date | null;
+	capOverrideConsumedAt: Date | null;
+}
+
+export async function getSubmittedReviewSlot(
+	key: ReviewVerdictKey,
+): Promise<SubmittedReviewSlot | undefined> {
+	const rows = await getDb()
+		.select({
+			ordinal: reviewVerdicts.ordinal,
+			verdict: reviewVerdicts.verdict,
+			reviewId: reviewVerdicts.reviewId,
+			capOverrideGrantedAt: reviewVerdicts.capOverrideGrantedAt,
+			capOverrideConsumedAt: reviewVerdicts.capOverrideConsumedAt,
+		})
+		.from(reviewVerdicts)
+		.where(
+			and(
+				eq(reviewVerdicts.projectId, key.projectId),
+				eq(reviewVerdicts.repository, key.repository),
+				eq(reviewVerdicts.prNumber, key.prNumber),
+				eq(reviewVerdicts.headSha, key.headSha),
+				eq(reviewVerdicts.state, 'submitted'),
+			),
+		)
+		.limit(1);
+	return rows[0];
+}
+
+/**
  * Whether `ordinal`/`verdict` together are the cap-reaching final
  * `request-changes` verdict — the one condition both the Review phase
  * (recording its own run's automation outcome, `src/pipeline/review.ts`) and
  * the Respond-to-review trigger (deciding whether to stop the automatic
  * cycle, `src/triggers/handlers/respond-to-review.ts`) must agree on.
+ *
+ * `>=`, not `===`: only an operator's explicit cap override (issue #511) can
+ * produce an ordinal above {@link REVIEW_VERDICT_CAP}, and that forced pass must
+ * stop the automatic cycle exactly like the one it continued — otherwise a
+ * single override would reopen the cycle indefinitely. Below the cap nothing
+ * changes.
  */
 export function isCapReachingRequestChanges(
 	ordinal: number | undefined,
 	verdict: string | null | undefined,
 ): boolean {
-	return ordinal === REVIEW_VERDICT_CAP && verdict === 'request-changes';
+	return ordinal !== undefined && ordinal >= REVIEW_VERDICT_CAP && verdict === 'request-changes';
 }

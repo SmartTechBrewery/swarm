@@ -18,6 +18,12 @@ import { type LiveOutputEvent, LiveOutputViewer } from '@/components/runs/live-o
 import { LogViewer } from '@/components/runs/log-viewer.js';
 import { RunStatusBadge } from '@/components/runs/run-status-badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
+import {
+	canForceReReview,
+	describeForceReReviewResult,
+	forceReReviewButtonLabel,
+	forceReReviewConfirmMessage,
+} from '@/lib/force-re-review.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
@@ -577,6 +583,110 @@ export function ResetRunButton({
 	);
 }
 
+/**
+ * "Force re-review" action (issue #511) for a completed Review run the
+ * review-verdict safety cap stopped — the run-level recovery for the one state
+ * SWARM deliberately leaves for a human, rendered inside the same "Manual action
+ * required" callout that explains it.
+ *
+ * Deliberately built to the "Reset & restart" pattern above (`ResetRunButton`),
+ * because that is the established operator-facing shape for a run-recovery
+ * action: the same red-tinted trigger, a confirmation modal naming what the
+ * mutation actually does, pending state disabling both the trigger and the
+ * confirm button so a double-click can't fire twice, a per-step success report,
+ * and the mutation error surfaced verbatim. The server is idempotent regardless
+ * (`src/dispatch/force-re-review.ts`), so a concurrent request resolves to the
+ * same corrective cycle rather than a second one.
+ */
+export function ForceReReviewButton({ run }: { run: RunRow }) {
+	const queryClient = useQueryClient();
+	const [confirmOpen, setConfirmOpen] = useState(false);
+
+	const mutation = useMutation({
+		mutationFn: () => trpcClient.runs.forceReReview.mutate({ runId: run.id }),
+		onSuccess: () => {
+			setConfirmOpen(false);
+			// Refresh to the authoritative state: the run row and the runs list both
+			// change once the corrective dispatch exists.
+			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
+			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
+		},
+	});
+
+	return (
+		<div className="mt-3">
+			<button
+				type="button"
+				onClick={() => {
+					// Drop any previous report/error so the modal opens on a clean slate.
+					mutation.reset();
+					setConfirmOpen(true);
+				}}
+				disabled={mutation.isPending}
+				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+			>
+				<RefreshCw className={`h-4 w-4 ${mutation.isPending ? 'animate-spin' : ''}`} />
+				{forceReReviewButtonLabel(mutation.isPending)}
+			</button>
+
+			{mutation.isSuccess && (
+				<div className="mt-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+					<h4 className="text-xs font-semibold text-zinc-200">Re-review scheduled</h4>
+					<ul className="mt-1.5 space-y-1 text-xs text-zinc-400">
+						{describeForceReReviewResult(mutation.data).map((line) => (
+							<li key={line}>{line}</li>
+						))}
+					</ul>
+				</div>
+			)}
+
+			{mutation.isError && !confirmOpen && (
+				<div className="mt-2 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+					{mutation.error.message}
+				</div>
+			)}
+
+			<Modal
+				open={confirmOpen}
+				onClose={() => {
+					if (!mutation.isPending) setConfirmOpen(false);
+				}}
+				title="Force re-review?"
+			>
+				<p className="text-sm text-zinc-300">{forceReReviewConfirmMessage(run.prNumber)}</p>
+				{mutation.isError && (
+					<div className="mt-3 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+						{mutation.error.message}
+					</div>
+				)}
+				<ModalFooter
+					primary={
+						<button
+							type="button"
+							onClick={() => mutation.mutate()}
+							disabled={mutation.isPending}
+							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+						>
+							{mutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+							{forceReReviewButtonLabel(mutation.isPending)}
+						</button>
+					}
+					secondary={
+						<button
+							type="button"
+							onClick={() => setConfirmOpen(false)}
+							disabled={mutation.isPending}
+							className="px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-zinc-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+						>
+							Cancel
+						</button>
+					}
+				/>
+			</Modal>
+		</div>
+	);
+}
+
 interface RecoveryCalloutProps {
 	run: RunRow;
 }
@@ -681,7 +791,11 @@ export function RecoveryCallout({ run }: RecoveryCalloutProps) {
 
 interface ReviewCapCalloutProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	project?: {
+		name: string;
+		repo: string;
+		pipeline?: { respondToReview?: { enabled?: boolean } };
+	} | null;
 }
 
 /**
@@ -717,14 +831,7 @@ export function FailureDiagnosisCallout({ diagnosis }: { diagnosis: FailureDiagn
  * never leaves a stale number here.
  */
 export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
-	if (
-		run.status !== 'completed' ||
-		run.phase !== 'review' ||
-		run.reviewVerdict !== 'request-changes' ||
-		run.reviewAutomationOutcome !== 'manual-intervention-required'
-	) {
-		return null;
-	}
+	if (!canForceReReview(run)) return null;
 
 	return (
 		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
@@ -735,7 +842,8 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 					This was the last changes-requested verdict SWARM's review safety cap allows
 					{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}. SWARM will not
 					automatically enqueue another Respond-to-review or re-review — this PR needs a human
-					decision.
+					decision. If that decision is to keep going, "Force re-review" continues the normal
+					corrective cycle once.
 				</p>
 				{project?.repo && run.prNumber && (
 					<a
@@ -748,6 +856,7 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 						<ExternalLink className="h-3 w-3" />
 					</a>
 				)}
+				{canForceReReview(run, project?.pipeline) && <ForceReReviewButton run={run} />}
 			</div>
 		</div>
 	);

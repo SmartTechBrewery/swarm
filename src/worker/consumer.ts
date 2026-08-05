@@ -2427,6 +2427,7 @@ function buildTriggerContext(
 				rateLimitRetryAttempt: job.rateLimitRetryAttempt,
 				runId: job.runId,
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
+				forcedReReview: job.forcedReReview,
 				source: 'scm',
 				providerId: job.providerId,
 				event: job.event,

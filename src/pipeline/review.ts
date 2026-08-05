@@ -508,7 +508,12 @@ function renderSubmission(
 			handoff,
 			headSha: context.headSha,
 			ordinal: context.ordinal,
-			cap: REVIEW_VERDICT_CAP,
+			// An operator-forced re-review (issue #511) runs at an ordinal above the
+			// automatic cap, having been granted exactly one extra slot — so the pass
+			// label states the cap this pass actually ran under ("pass 4 of 4 — final
+			// permitted verdict") rather than the nonsensical "pass 4 of 3". An
+			// ordinary pass is at or below the cap, so this is a no-op for it.
+			cap: Math.max(REVIEW_VERDICT_CAP, context.ordinal),
 			isReReview: context.isReReview,
 			minorsAnswered: context.minorsAnswered,
 		}),

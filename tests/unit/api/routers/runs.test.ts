@@ -50,6 +50,13 @@ vi.mock('@/dispatch/run-reset.js', async (importOriginal) => ({
 	resetRun: vi.fn(),
 }));
 
+// Same treatment for the "Force re-review" service (issue #511): only the
+// service is stubbed, its real `ForceReReviewError` kept for the mapping.
+vi.mock('@/dispatch/force-re-review.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/dispatch/force-re-review.js')>()),
+	forceReReview: vi.fn(),
+}));
+
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	cancelDispatchAndWake: vi.fn(),
 	cancelDispatchForRun: vi.fn(),
@@ -137,6 +144,7 @@ import {
 	createAndPublishDispatch,
 	publishDispatchWakeUp,
 } from '@/dispatch/dispatcher.js';
+import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js';
 import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
@@ -316,6 +324,7 @@ describe('runsRouter', () => {
 		vi.mocked(createAndPublishDispatch).mockReset();
 		vi.mocked(publishDispatchWakeUp).mockReset();
 		vi.mocked(resetRun).mockReset();
+		vi.mocked(forceReReview).mockReset();
 		vi.mocked(getWorker).mockReset();
 		vi.mocked(getUserById).mockReset();
 	});
@@ -1220,6 +1229,85 @@ describe('runsRouter', () => {
 		});
 	});
 
+	// Issue #511 — the recovery action for a Review run the verdict cap stopped.
+	describe('forceReReview', () => {
+		const FORCE_RESULT = {
+			runId: 'run-1',
+			prNumber: '508',
+			headSha: 'cafebabe',
+			capOverride: 'granted' as const,
+			dispatch: 'scheduled' as const,
+			dispatchId: 'dispatch-9',
+		};
+
+		const cappedReviewRun = () =>
+			makeRun({
+				id: 'run-1',
+				status: 'completed',
+				phase: 'review',
+				prNumber: '508',
+				reviewVerdict: 'request-changes',
+				reviewAutomationOutcome: 'manual-intervention-required',
+			});
+
+		it('delegates to the force service and returns its report verbatim', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(cappedReviewRun());
+			vi.mocked(forceReReview).mockResolvedValue(FORCE_RESULT);
+
+			await expect(caller.forceReReview({ runId: 'run-1' })).resolves.toEqual(FORCE_RESULT);
+			expect(forceReReview).toHaveBeenCalledWith('run-1');
+		});
+
+		it('reports an already-scheduled cycle as a success rather than an error', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(cappedReviewRun());
+			vi.mocked(forceReReview).mockResolvedValue({
+				...FORCE_RESULT,
+				capOverride: 'already-granted',
+				dispatch: 'already-scheduled',
+			});
+
+			await expect(caller.forceReReview({ runId: 'run-1' })).resolves.toMatchObject({
+				dispatch: 'already-scheduled',
+			});
+		});
+
+		it('throws NOT_FOUND for an unknown run without calling the service', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(undefined);
+
+			await expect(caller.forceReReview({ runId: 'missing' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND', message: 'Run with ID "missing" not found' }),
+			);
+			expect(forceReReview).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['run-not-found', 'NOT_FOUND'],
+			['project-not-found', 'PRECONDITION_FAILED'],
+			['respond-to-review-disabled', 'PRECONDITION_FAILED'],
+			['not-capped', 'PRECONDITION_FAILED'],
+			['missing-coordinates', 'PRECONDITION_FAILED'],
+			['missing-review-record', 'PRECONDITION_FAILED'],
+		] as const)('maps the %s refusal to %s, keeping its message', async (reason, code) => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(cappedReviewRun());
+			vi.mocked(forceReReview).mockRejectedValue(
+				new ForceReReviewError(reason, `refused: ${reason}`),
+			);
+
+			await expect(caller.forceReReview({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({ code, message: `refused: ${reason}` }),
+			);
+		});
+
+		it('surfaces an unexpected service failure as INTERNAL_SERVER_ERROR', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(cappedReviewRun());
+			vi.mocked(forceReReview).mockRejectedValue(new Error('queue unavailable'));
+
+			await expect(caller.forceReReview({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'INTERNAL_SERVER_ERROR' }),
+			);
+		});
+	});
+
 	describe('putBack', () => {
 		// A fresh (unclaimed) board dispatch for a specific card.
 		const boardJobForCard = (itemId: string) =>
@@ -1813,6 +1901,52 @@ describe('runsRouter', () => {
 					expect.objectContaining({ code: 'FORBIDDEN' }),
 				);
 				expect(resetRun).not.toHaveBeenCalled();
+			});
+
+			it('denies forceReReview to a non-member with identical error shape as unknown run', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', status: 'completed', phase: 'review' }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.forceReReview({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'NOT_FOUND',
+						message: 'Run with ID "run-1" not found',
+					}),
+				);
+				expect(forceReReview).not.toHaveBeenCalled();
+			});
+
+			it('forbids a contributor from forcing a re-review', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', status: 'completed', phase: 'review' }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+
+				await expect(ordinary.forceReReview({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(forceReReview).not.toHaveBeenCalled();
+			});
+
+			it('lets a member force a re-review', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', status: 'completed', phase: 'review' }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+				vi.mocked(forceReReview).mockResolvedValue({
+					runId: 'run-1',
+					prNumber: '508',
+					headSha: 'cafebabe',
+					capOverride: 'granted',
+					dispatch: 'scheduled',
+					dispatchId: 'dispatch-9',
+				});
+
+				await expect(ordinary.forceReReview({ runId: 'run-1' })).resolves.toMatchObject({
+					dispatch: 'scheduled',
+				});
 			});
 
 			it('forbids a contributor from putting a queued item back', async () => {
