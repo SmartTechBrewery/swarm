@@ -12,7 +12,17 @@ vi.mock('node:fs', () => ({
 		String(path).endsWith('blocked_reason.md') ? blockedReasonFileContents : prFileContents,
 }));
 
+// A checkpoint continuation's gate verdict. The gate itself (validation, lease
+// release, blocked reasons) is covered in `resume.test.ts` against real fixtures;
+// here it is stubbed so this file can assert what the *phase* does with it.
+const { executeRecoveryGateMock } = vi.hoisted(() => ({ executeRecoveryGateMock: vi.fn() }));
+vi.mock('@/pipeline/resume.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/pipeline/resume.js')>()),
+	executeRecoveryGate: executeRecoveryGateMock,
+}));
+
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import {
 	BLOCKED_REASON_FILENAME,
 	buildImplementationPrompt,
@@ -41,6 +51,15 @@ function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 		...overrides,
 	};
 }
+
+/** What an involuntarily stopped implementation run left behind. */
+const CONTINUATION: Checkpoint = {
+	phase: 'implementation',
+	completed: ['Added `ProjectConfigSchema.retryPolicy` and its validation tests'],
+	remaining: ['Update the README table', 'Run lint, type-check, and the focused tests'],
+	decisions: [],
+	workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+};
 
 function makeDeps() {
 	const handle: WorktreeHandle = {
@@ -425,6 +444,54 @@ describe('runImplementationPhase', () => {
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.resumeSessionId).toBeUndefined();
 		expect(runArgs.sessionId).toBe('sess-19');
+	});
+
+	it('continues from a checkpoint on a fresh session, on a different CLI (issue #502)', async () => {
+		const deps = makeDeps();
+		executeRecoveryGateMock.mockResolvedValueOnce({
+			reuseHandle: { taskId: '19', path: WORKTREE_PATH, branch: 'issue-19', detached: false },
+			checkpoint: CONTINUATION,
+		});
+
+		await runImplementationPhase({
+			...deps,
+			// The stopped run was a `claude` one that captured `prior-19`; this
+			// continuation carries no session, so it may run on any engine.
+			cli: 'codex',
+			sessionId: 'fresh-19',
+			resumeSessionId: 'prior-19',
+			recoveryMode: 'checkpoint',
+		});
+
+		// The gate validated the checkpoint against *this* phase.
+		expect(executeRecoveryGateMock).toHaveBeenCalledWith(
+			expect.anything(),
+			'19',
+			'checkpoint',
+			'prior-19',
+			deps.project.id,
+			'implementation',
+		);
+		// The adopted checkout is used as-is.
+		expect(deps.worktrees.provision).not.toHaveBeenCalled();
+		expect(deps.worktrees.reuse).not.toHaveBeenCalled();
+
+		const runArgs = deps.runAgent.mock.calls[0][0];
+		expect(runArgs.cwd).toBe(WORKTREE_PATH);
+		// A fresh session and no resume id, despite `resumeSessionId` being known.
+		expect(runArgs.sessionId).toBe('fresh-19');
+		expect(runArgs.resumeSessionId).toBeUndefined();
+		// The prompt carries the recorded remainder instead of the CLI's own context.
+		expect(runArgs.args?.[0]).toContain('--- CONTINUING FROM A CHECKPOINT ---');
+		expect(runArgs.args?.[0]).toContain('Update the README table');
+		expect(runArgs.args?.[0]).toContain('Complete only the remainder');
+	});
+
+	it('leaves the prompt and session threading alone without a checkpoint continuation', async () => {
+		const deps = makeDeps();
+		await runImplementationPhase({ ...deps, sessionId: 'sess-19' });
+		expect(executeRecoveryGateMock).not.toHaveBeenCalled();
+		expect(deps.runAgent.mock.calls[0][0].args?.[0]).not.toContain('CONTINUING FROM A CHECKPOINT');
 	});
 
 	it('preserves the worktree (skips cleanup) when a session run fails on a rate limit', async () => {

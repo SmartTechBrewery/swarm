@@ -7,16 +7,18 @@ worktree and restarting the phase from scratch. It is a two-tier design:
 1. **Primary — native CLI session resume. _Implemented._** Re-enter the same CLI session the
    run was using, so the agent keeps its own context. This now covers all three CLIs
    (`claude`, `agy`, `codex`), every pipeline phase, and both rate-limit and timeout stops.
-2. **Fallback — a checkpoint file. _Artifact landed; continuation deferred._** A short,
-   structured handoff written to the worktree for the cases native resume cannot cover
-   (session expired/pruned, worktree survived but the session did not, or a continuation on a
-   different CLI).
+2. **Fallback — a checkpoint file. _Artifact and continuation mechanism landed; nothing
+   selects it yet._** A short, structured handoff written to the worktree for the cases native
+   resume cannot cover (session expired/pruned, worktree survived but the session did not, or a
+   continuation on a different CLI).
 
-Tier 1 is live. Tier 2's *artifact* now exists — the file, its schema, and the prompt that
-makes the implementer phases keep it current (issue #299 phase 1/4, below); nothing reads it
-yet, so the continuation path is still to build. The speculative self-checkpoint *trigger*
-(§ "Soft budget") remains unimplemented; the resume-from-preserved-state mechanics Tier 2
-builds on are proven by Tier 1.
+Tier 1 is live. Tier 2's *artifact* exists — the file, its schema, and the prompt that makes
+the implementer phases keep it current (issue #299 phase 1/4) — and so does the *mechanism*
+that continues a phase from one: the `checkpoint` recovery mode, its validation gate, the
+guaranteed-fresh session, and the prompt that re-seeds it (phase 2/4). What is still missing is
+the **policy**: nothing in production asks for `recoveryMode: 'checkpoint'`, so the path is not
+yet reachable at runtime. The speculative self-checkpoint *trigger* (§ "Soft budget") remains
+unimplemented; the resume-from-preserved-state mechanics Tier 2 builds on are proven by Tier 1.
 
 ## Tier 1 — native CLI session resume (implemented)
 
@@ -79,14 +81,15 @@ A timeout that trapped SIGTERM and still exited 0 is the one exception: its phas
 finished and cleaned up its worktree, so it stays a terminal failure rather than resuming
 onto a checkout that no longer exists.
 
-## Tier 2 — the checkpoint file (fallback; artifact implemented)
+## Tier 2 — the checkpoint file (fallback; artifact and mechanism implemented)
 
 Native resume covers the common case but not every case: the CLI session can expire or be
 pruned, the worktree can survive when the session does not, or a continuation may need to
 run on a different CLI than the one that started the work. For those, SWARM falls back to a
 short, structured checkpoint file written to the worktree — a degraded path that re-seeds a
 fresh session with a factual handoff rather than the agent's own context. The file is written
-today; the continuation that consumes it is the remaining work (below).
+today and the continuation that consumes it is built; what still has to land is the policy that
+*asks* for one (below).
 
 The checkpoint is kept current at safe boundaries (never in the middle of an edit or command),
 not written as a wind-down step before the agent exits. That way an involuntary stop finds an
@@ -146,6 +149,48 @@ It is also listed in `.gitignore` alongside the phase hand-offs. So a checkpoint
 reach a commit, a pushed branch, or a customer PR — and cannot keep a scratch-only checkout
 from being cleaned up. The prompt tells the agent not to `git add` it either.
 
+### Continuing from one — `recoveryMode: 'checkpoint'`
+
+A continuation is the third value of the recovery mode a run carries
+(`RecoveryModeSchema`, `src/queue/jobs.ts`), alongside Tier 1's `'resume'` and the
+start-over `'fresh'`. **Tier 1 still wins whenever a session id is resumable**: `'checkpoint'`
+is for the cases it cannot serve, and nothing selects it yet.
+
+The recovery gate (`executeRecoveryGate`, `src/pipeline/resume.ts`) adopts the preserved
+checkout for a continuation only after `validateCheckpointForContinuation`
+(`src/pipeline/checkpoint.ts`) confirms three things — otherwise the run settles terminally with
+a `BlockedRecoveryError`, having released the worktree lease first:
+
+| Failure | Blocked reason |
+| --- | --- |
+| The checkout, or the checkpoint file in it, is absent | `missing-validation` |
+| The file does not parse against `CheckpointSchema` | `checkpoint-divergent` |
+| It names another phase (a task's checkout is reused across phases) | `checkpoint-divergent` |
+| It records a path `git status --porcelain` no longer reports as changed | `checkpoint-divergent` |
+
+**The working-tree rule is deliberately one-sided.** A *recorded* path missing from
+`git status` blocks (as does a clean tree — the schema guarantees a checkpoint records at least
+one path, so a clean tree contradicts it), and the error names the specific missing paths.
+*Extra, unrecorded* paths do **not** block: the scratch and hand-off files are untracked, and an
+agent enumerating its own edits does not do so perfectly. That fails in the safe direction —
+never continue against a tree the checkpoint does not describe — without being brittle about an
+honest under-report. The read uses `-z --untracked-files=all` so quoted paths compare literally
+and a brand-new untracked directory isn't collapsed to `dir/`, and it scrubs inherited
+`GIT_DIR`/`GIT_WORK_TREE`-style variables (`gitEnvironmentForCwd`, `src/scm/delivery.ts`) so
+`cwd` alone decides which repository is read.
+
+**A continuation always runs on a fresh session, and never resumes one.** `sessionRunArgs`
+forces `{ sessionId, resumeSessionId: undefined }` for the mode unconditionally, and the gate
+reports `resumed: false` because no session was re-entered. That is what makes Tier 2
+**CLI-agnostic by construction**: with no session to carry, a continuation may run on a
+different engine than the deferred run did — `claude` picking up what `agy` started.
+
+The checkpoint's own contents are then the continuation's only context. The four implementer
+phases splice `checkpointContinuationSection` (`src/pipeline/prompts/checkpoint.ts`) into their
+prompt: the completed steps (not to be redone), the remaining ones in order, the settled
+decisions, the working tree it will find, and the instruction that governs them — complete only
+the remainder, and do not re-explore settled work unless verification requires it.
+
 ## Soft budget, completion reserve, self-checkpoint trigger (speculative)
 
 Tier 1 covers *involuntary* stops (the host cut the run short). A separate, more speculative
@@ -167,13 +212,12 @@ it now ships as Tier 1. Treat the trigger as a later experiment.
 
 **Tier 2 — fallback checkpoint file**
 
-The artifact itself has landed (issue #299 phase 1/4): the file, its schema and reader, and the
-implementer-phase prompts that keep it current. What still reads and acts on it:
+The artifact has landed (issue #299 phase 1/4) and so has the continuation mechanism
+(phase 2/4): validation, the fresh sessionless run, and the prompt seeded from the checkpoint.
+What still has to land before any of it runs:
 
-- Validate the checkpoint file and working tree before a fallback continuation, and support a
-  cross-CLI continuation seeded from it.
-- Define a checkpointed run status, preserve the worktree because a checkpoint exists, and
-  dispatch the bounded continuation.
+- The policy that selects `recoveryMode: 'checkpoint'` — a `checkpointed` run status, preserving
+  the worktree because a checkpoint exists, and dispatching the bounded continuation.
 
 **Shared**
 

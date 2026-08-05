@@ -26,6 +26,23 @@ import { ScmEventSchema, ScmProviderIdSchema } from '../scm/events.js';
 /** The single BullMQ queue the router produces onto and the worker consumes. */
 export const QUEUE_NAME = 'swarm-jobs';
 
+/**
+ * How a run recovers a preserved `task-<id>` checkout, enforced by the recovery
+ * gate (`executeRecoveryGate`, `src/pipeline/resume.ts`):
+ *
+ * - `resume` — validate the checkout and re-enter the agent's own CLI session
+ *   (Tier 1, `docs/CHECKPOINTS.md`). Requires a resumable session id.
+ * - `fresh` — the checkout carries nothing worth keeping: remove it and start over.
+ * - `checkpoint` — Tier 2. Adopt the checkout and continue from the checkpoint
+ *   file the stopped run left in it, on a **fresh** session with no resume id, so
+ *   the continuation may run on a different CLI than the deferred run did.
+ *
+ * Lives here because the job payload is the contract that carries the value; the
+ * pipeline imports the type rather than restating the union.
+ */
+export const RecoveryModeSchema = z.enum(['resume', 'fresh', 'checkpoint']);
+export type RecoveryMode = z.infer<typeof RecoveryModeSchema>;
+
 const jobBase = z.object({
 	/** The SWARM project (`ProjectConfig.id`) the event was matched to. */
 	projectId: z.string().min(1),
@@ -128,11 +145,8 @@ const jobBase = z.object({
 	 * launched. Rides `...jobPayload` spreads through deferred/manual retries.
 	 */
 	reasoningOverride: ReasoningLevelSchema.optional(),
-	/**
-	 * Mode for recovering a cancelled preserved worktree: 'resume' to validate and resume the
-	 * session, or 'fresh' to clean it up and start fresh.
-	 */
-	recoveryMode: z.enum(['resume', 'fresh']).optional(),
+	/** How this run recovers a preserved worktree ({@link RecoveryModeSchema}). */
+	recoveryMode: RecoveryModeSchema.optional(),
 	/**
 	 * Set on a concurrency-deferred continuation's retry (issue #214): its dispatch
 	 * dedup slot was already claimed by the original dispatch attempt, so the

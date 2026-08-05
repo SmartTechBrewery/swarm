@@ -103,6 +103,7 @@ import {
 } from '@/pipeline/resume.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider } from '@/pm/types.js';
+import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	commitPreparedTree,
 	DeliveryDeferredError,
@@ -236,7 +237,7 @@ export interface RunRespondToReviewPhaseOptions {
 	/** The database run id. */
 	runId?: string;
 	/** Mode for recovering a cancelled preserved worktree. */
-	recoveryMode?: 'resume' | 'fresh';
+	recoveryMode?: RecoveryMode;
 	/** Resume deterministic delivery from a preserved worktree without rerunning the agent. */
 	resumeDelivery?: boolean;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
@@ -451,9 +452,10 @@ export async function runRespondToReviewPhase(
 	// the PR here (see the module header for the local-branch precondition). On a
 	// resume retry, reuse the preserved checkout so partial fixes and the agent's
 	// session carry over.
-	const { handle, resumed, deliveryResumed } = await acquireResumableWorktree(
+	const { handle, resumed, deliveryResumed, checkpoint } = await acquireResumableWorktree(
 		worktrees,
 		taskId,
+		'respond-to-review',
 		prBranch,
 		false,
 		resumeSessionId,
@@ -473,11 +475,11 @@ export async function runRespondToReviewPhase(
 					cli,
 					model,
 					reasoning,
-					...sessionRunArgs({ sessionId, resumeSessionId }, resumed),
+					...sessionRunArgs({ sessionId, resumeSessionId }, resumed, recoveryMode),
 					cwd: handle.path,
 					args: [
 						buildRespondToReviewPrompt(
-							{ repo: project.repo, prNumber, prBranch, reviewId },
+							{ repo: project.repo, prNumber, prBranch, reviewId, checkpoint },
 							customPrompt,
 						),
 					],

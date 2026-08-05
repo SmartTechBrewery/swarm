@@ -261,7 +261,11 @@ export interface RunPlanningPhaseOptions {
 	resumeSessionId?: string;
 	/** The database run id. */
 	runId?: string;
-	/** Mode for recovering a cancelled preserved worktree. */
+	/**
+	 * Mode for recovering a cancelled preserved worktree. Deliberately narrower than
+	 * {@link RecoveryMode}: this phase writes no checkpoint (`docs/CHECKPOINTS.md`),
+	 * so there is never one to continue it from.
+	 */
 	recoveryMode?: 'resume' | 'fresh';
 	/**
 	 * Whether to move the item to "ToDo" once the plan is posted. Defaults to
@@ -941,6 +945,7 @@ async function acquirePlanningWorktree(
 	const res = await acquireResumableWorktree(
 		worktrees,
 		taskId,
+		'planning',
 		baseBranch,
 		true,
 		resumeSessionId,

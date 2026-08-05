@@ -7,7 +7,11 @@
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
-import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	checkpointContinuationSection,
+	checkpointInstructions,
+} from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 
@@ -33,10 +37,12 @@ export function buildRespondToReviewPrompt(
 		prNumber: string;
 		prBranch: string;
 		reviewId: string;
+		/** The validated checkpoint a Tier 2 continuation adopted this worktree on; unset on an ordinary run. */
+		checkpoint?: Checkpoint;
 	},
 	customPrompt?: string,
 ): string {
-	const { repo, prNumber, prBranch, reviewId } = context;
+	const { repo, prNumber, prBranch, reviewId, checkpoint } = context;
 	return [
 		'You are a senior software engineer responding to a code review on a pull request',
 		'you authored.',
@@ -66,6 +72,7 @@ export function buildRespondToReviewPrompt(
 		'',
 		...checkpointInstructions('respond-to-review'),
 		'',
+		...(checkpoint ? [...checkpointContinuationSection(checkpoint), ''] : []),
 		'Do not merge the PR, and do not submit a review of your own — you are the author.',
 		...projectInstructionsSection(customPrompt),
 	].join('\n');

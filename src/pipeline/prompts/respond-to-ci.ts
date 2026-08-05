@@ -7,7 +7,11 @@
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
-import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	checkpointContinuationSection,
+	checkpointInstructions,
+} from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 
@@ -31,10 +35,12 @@ export function buildRespondToCiPrompt(
 		prNumber: string;
 		prBranch: string;
 		headSha: string;
+		/** The validated checkpoint a Tier 2 continuation adopted this worktree on; unset on an ordinary run. */
+		checkpoint?: Checkpoint;
 	},
 	customPrompt?: string,
 ): string {
-	const { repo, prNumber, prBranch, headSha } = context;
+	const { repo, prNumber, prBranch, headSha, checkpoint } = context;
 	return [
 		'You are a senior software engineer whose pull request has failing CI checks.',
 		'',
@@ -56,6 +62,7 @@ export function buildRespondToCiPrompt(
 		'',
 		...checkpointInstructions('respond-to-ci'),
 		'',
+		...(checkpoint ? [...checkpointContinuationSection(checkpoint), ''] : []),
 		'Do not merge the PR, and do not review it — you are the author.',
 		...projectInstructionsSection(customPrompt),
 	].join('\n');

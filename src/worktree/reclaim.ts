@@ -27,14 +27,19 @@ import { isWorktreeLeased } from './worktree-lease.js';
  * - `resumable-owner` — a deferred/failed run intends to resume this checkout.
  * - `dirty` — the checkout has uncommitted changes (tracked or untracked).
  * - `unpushed` — the checkout has local commits that were never pushed.
- * - `missing-validation` — a recovery precondition (checkout, session id) is absent.
+ * - `missing-validation` — a recovery precondition (checkout, session id, checkpoint file) is absent.
+ * - `checkpoint-divergent` — a checkpoint continuation's checkpoint does not describe a
+ *   state this phase can continue from: it does not parse, it names another phase, or it
+ *   no longer matches the working tree on disk (`validateCheckpointForContinuation`,
+ *   `src/pipeline/checkpoint.ts`).
  */
 export type BlockedRecoveryReason =
 	| 'dirty'
 	| 'unpushed'
 	| 'live-leased'
 	| 'missing-validation'
-	| 'resumable-owner';
+	| 'resumable-owner'
+	| 'checkpoint-divergent';
 
 /** Thrown when a worktree cannot be safely reclaimed and the phase must settle terminally. */
 export class BlockedRecoveryError extends Error {
@@ -47,8 +52,16 @@ export class BlockedRecoveryError extends Error {
 	}
 }
 
-/** The subset of {@link BlockedRecoveryReason}s the reclaim gate itself can return. */
-export type ReclaimBlockedReason = Exclude<BlockedRecoveryReason, 'missing-validation'>;
+/**
+ * The subset of {@link BlockedRecoveryReason}s the reclaim gate itself can return.
+ * `missing-validation` and `checkpoint-divergent` are recovery-gate-only reasons —
+ * both describe a *requested* recovery whose preconditions failed, which is not
+ * something a reclaim decision about an existing checkout can conclude.
+ */
+export type ReclaimBlockedReason = Exclude<
+	BlockedRecoveryReason,
+	'missing-validation' | 'checkpoint-divergent'
+>;
 
 /**
  * The gate's verdict: either the checkout is safe to reclaim, or it is protected
