@@ -31,8 +31,8 @@ import type { TriggerPhase } from '@/triggers/types.js';
  */
 export function checkpointInstructions(phase: TriggerPhase): readonly string[] {
 	return [
-		`Throughout the work above, keep a rolling progress checkpoint in "${CHECKPOINT_FILENAME}" at the worktree root. Rewrite the whole file (never append) after each completed step and before starting any long operation, so it always describes where you actually are.`,
-		`Write it as JSON with: phase (exactly "${phase}"), completed (an array of the steps already done), remaining (an array of what is still left, in order), decisions (an array of choices or caveats worth not re-deriving; may be empty), and workingTree ({"modified":[…],"added":[…],"deleted":[…]} — the repository paths you have changed so far, naming at least one path).`,
+		`Throughout the work above, keep a rolling progress checkpoint in "${CHECKPOINT_FILENAME}" at the worktree root. After each completed step — and, once at least one repository path has changed, before starting any long operation — rewrite the whole file (never append) so it always describes where you actually are. Do not create one before a completed step.`,
+		`Write it as JSON with: phase (exactly "${phase}"), completed (a non-empty array of the steps already done), remaining (a non-empty array of what is still left, in order), decisions (an array of choices or caveats worth not re-deriving; may be empty), and workingTree ({"modified":[…],"added":[…],"deleted":[…]} — the repository paths you have changed so far, naming at least one path).`,
 		'It exists so that if this run is stopped involuntarily — a usage limit, a wall-clock timeout, an interruption — SWARM can continue from the recorded remainder instead of re-doing your work. Update it only at a safe boundary: never mid-edit and never mid-command.',
 		`Keep it short and factual. It is not a design document, and it is not this phase's hand-off — the hand-off file named above is still what reports the outcome. Do NOT \`git add\` or commit "${CHECKPOINT_FILENAME}".`,
 	];

@@ -92,9 +92,7 @@ describe('readCheckpoint / hasCheckpoint (issue #299)', () => {
 	it('reports no checkpoint when the file is absent', () => {
 		const root = checkpointRoot();
 		expect(hasCheckpoint(root)).toBe(false);
-		expect(() => readCheckpoint(root)).toThrow(
-			`Agent did not write required hand-off ${CHECKPOINT_FILENAME}`,
-		);
+		expect(() => readCheckpoint(root)).toThrow(`No checkpoint ${CHECKPOINT_FILENAME} in ${root}`);
 	});
 
 	it('fails with an actionable, filename-naming error on malformed JSON', () => {
@@ -163,6 +161,13 @@ describe.each(IMPLEMENTER_BUILDERS)('$name prompt asks for a checkpoint', ({ nam
 
 	it('names its own phase, so a continuation can tell whose checkpoint it is', () => {
 		expect(build()).toContain(`phase (exactly "${name}")`);
+	});
+
+	it('only asks for a checkpoint once its required contents exist', () => {
+		const prompt = build();
+		expect(prompt).toContain('Do not create one before a completed step.');
+		expect(prompt).toContain('completed (a non-empty array');
+		expect(prompt).toContain('remaining (a non-empty array');
 	});
 });
 

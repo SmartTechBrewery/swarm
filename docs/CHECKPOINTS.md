@@ -88,11 +88,11 @@ short, structured checkpoint file written to the worktree — a degraded path th
 fresh session with a factual handoff rather than the agent's own context. The file is written
 today; the continuation that consumes it is the remaining work (below).
 
-The checkpoint is a safe handoff point, not a hard token-limit termination: the agent writes
-it and exits cleanly at a safe boundary (never in the middle of an edit or command). A
-continuation validates the actual worktree, reads the checkpoint first, and completes only
-the recorded remainder — it must not re-explore or redesign completed work unless
-verification shows it is necessary.
+The checkpoint is kept current at safe boundaries (never in the middle of an edit or command),
+not written as a wind-down step before the agent exits. That way an involuntary stop finds an
+up-to-date handoff. A continuation validates the actual worktree, reads the checkpoint first,
+and completes only the recorded remainder — it must not re-explore or redesign completed work
+unless verification shows it is necessary.
 
 ### Checkpoint contents
 
@@ -140,9 +140,11 @@ when it does. Having the agent judge its own remaining budget is the speculative
 
 The filename is registered in `HANDOFF_FILENAMES` (`src/scm/delivery.ts`), which is what puts
 it in `SCRATCH_PATHSPECS`: `validatePreparedTree` refuses to deliver a tree where the file is
-tracked, and `commitPreparedTree` unstages it after its `git add --all`. It is also listed in
-`.gitignore` alongside the phase hand-offs. So a checkpoint can never reach a commit, a pushed
-branch, or a customer PR — and the prompt tells the agent not to `git add` it either.
+tracked, `commitPreparedTree` unstages it after its `git add --all`, and worktree cleanliness
+checks exclude it when deciding whether a checkout may be reclaimed, freshly retried, or pruned.
+It is also listed in `.gitignore` alongside the phase hand-offs. So a checkpoint can never
+reach a commit, a pushed branch, or a customer PR — and cannot keep a scratch-only checkout
+from being cleaned up. The prompt tells the agent not to `git add` it either.
 
 ## Soft budget, completion reserve, self-checkpoint trigger (speculative)
 

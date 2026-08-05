@@ -381,7 +381,7 @@ export const HANDOFF_FILENAMES = {
 } as const;
 
 const PROGRESS_FILENAME = '.swarm_delivery.json';
-const SCRATCH_PATHSPECS = [...Object.values(HANDOFF_FILENAMES), PROGRESS_FILENAME] as const;
+export const SCRATCH_PATHSPECS = [...Object.values(HANDOFF_FILENAMES), PROGRESS_FILENAME] as const;
 
 export class DeliveryDeferredError extends Error {
 	constructor(message: string, options?: ErrorOptions) {

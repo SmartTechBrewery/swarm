@@ -85,10 +85,12 @@ export function hasCheckpoint(cwd: string): boolean {
 
 /**
  * Read and validate the checkpoint in `cwd`. Built on `readHandoff` so a
- * missing, malformed, or schema-violating file fails with the same actionable,
- * filename-naming error every other hand-off produces — callers report that
- * rather than silently continuing from a checkpoint they could not parse.
+ * malformed or schema-violating file fails with the same actionable,
+ * filename-naming error every other hand-off produces. Absence is distinct from
+ * a failed required hand-off: callers can use {@link hasCheckpoint} to select a
+ * fallback continuation path before reading it.
  */
 export function readCheckpoint(cwd: string): Checkpoint {
+	if (!hasCheckpoint(cwd)) throw new Error(`No checkpoint ${CHECKPOINT_FILENAME} in ${cwd}`);
 	return readHandoff(cwd, CHECKPOINT_FILENAME, CheckpointSchema);
 }
