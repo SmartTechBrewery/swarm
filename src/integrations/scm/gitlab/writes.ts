@@ -37,6 +37,7 @@ import {
 	type GitLabMergeRequestReference,
 	toGitLabMergeRequestReference,
 } from './merge-requests.js';
+import { gitLabRequestChangesMarker } from './review-marker.js';
 
 /** The verdicts the delivery seam can ask for — `src/scm/delivery.ts`'s own enum. */
 type ReviewVerdict = z.infer<typeof ReviewHandoffSchema>['verdict'];
@@ -166,11 +167,11 @@ async function applyVerdict(
  * no REST endpoint on either the merge-requests or the merge-request-approvals API
  * (verified against GitLab 19.1's REST reference), so there is nothing native to
  * prefer. `unapprove` is what SWARM can do: it removes this reviewer's own
- * approval, and the verdict then lives in the *absence* of an approval plus the
- * findings in the note. The limitation is real and worth naming — GitLab's own
- * `requested_changes` reviewer state, which blocks the merge on its own, is not
- * set, so a human reading the merge request sees an unapproved merge request with a
- * findings note rather than a red "changes requested" badge.
+ * approval, and the findings note carries a dedicated hidden marker. GitLab ingress
+ * recognizes that marker and synthesizes the submitted `changes-requested` review
+ * event that dispatches Respond-to-review. GitLab's own `requested_changes` state,
+ * which blocks the merge on its own, is still not set, so a human sees an unapproved
+ * merge request with a findings note rather than a red "changes requested" badge.
  *
  * **The verdict is applied before the note**, inverting the reading order. The note
  * is the anchor a retry matches on, so it has to be the *last* write: a crash
@@ -198,7 +199,13 @@ export async function submitGitLabReview(
 	} else {
 		await applyVerdict(repo, input.iid, 'unapprove');
 	}
-	return postGitLabMergeRequestNote(repo, input.iid, `${input.body}\n\n${marker}`);
+	const requestChangesMarker =
+		input.verdict === 'request-changes' ? `\n${gitLabRequestChangesMarker(input.deliveryId)}` : '';
+	return postGitLabMergeRequestNote(
+		repo,
+		input.iid,
+		`${input.body}\n\n${marker}${requestChangesMarker}`,
+	);
 }
 
 /** Open a merge request, returning the delivery seam's `{ number, url }`. */

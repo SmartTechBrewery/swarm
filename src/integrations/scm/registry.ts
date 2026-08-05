@@ -79,11 +79,11 @@ export function requireSCMProvider(id: string): SCMProvider {
  * resolving to whichever manifest happened to register first.
  *
  * The assertion counts only *runtime-ready* manifests
- * ({@link SCMProviderManifest.runtimeReady}), so a provider nothing selects yet —
- * Bitbucket, issue #296, whose contract is complete but which no project resolves
- * to — can register without answering for every project. The forcing function is
- * unchanged: the second manifest to claim runtime readiness lands here as a
- * throw.
+ * ({@link SCMProviderManifest.runtimeReady}), so providers nothing selects yet —
+ * Bitbucket (issue #296) and GitLab (issue #295), whose contracts are complete
+ * but which no project resolves to — can register without answering for every
+ * project. The forcing function is unchanged: the second manifest to claim
+ * runtime readiness lands here as a throw.
  */
 export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
 	const runtimeReady = registry.filter(isRuntimeReadySCMProvider);

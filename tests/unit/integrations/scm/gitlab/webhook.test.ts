@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-
+import { gitLabRequestChangesMarker } from '@/integrations/scm/gitlab/review-marker.js';
 import {
 	isSwarmGeneratedGitLabEvent,
 	parseGitLabWebhook,
@@ -312,6 +312,32 @@ describe('GitLab webhook ingress', () => {
 				}),
 			);
 			expect(parsed).toMatchObject({ kind: 'pull-request', action: 'updated' });
+		});
+
+		it('turns a SWARM request-changes findings note into a submitted review event', () => {
+			const parsed = parse(
+				'Note Hook',
+				createMockGitLabNotePayload({
+					user: swarmRev,
+					objectAttributes: {
+						note: `Please address the findings.\n\n${gitLabRequestChangesMarker('delivery-1')}`,
+					},
+				}),
+			);
+			expect(parsed).toEqual({
+				kind: 'pull-request-review',
+				action: 'submitted',
+				repoFullName: 'jkwiecien/swarm',
+				workItemId: '17',
+				workItemUrl: MERGE_REQUEST_URL,
+				actorLogin: 'swarm-rev',
+				isCommentEvent: false,
+				commentBody: undefined,
+				headSha: FULL_SHA,
+				prBranch: 'swarm/issue-17',
+				reviewState: 'changes-requested',
+				reviewId: `17:changes-requested:9:${FULL_SHA}`,
+			});
 		});
 	});
 

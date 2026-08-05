@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitLabApiError, withGitLabToken } from '@/integrations/scm/gitlab/client.js';
+import { gitLabRequestChangesMarker } from '@/integrations/scm/gitlab/review-marker.js';
 import {
 	createGitLabMergeRequest,
 	mergeGitLabMergeRequestDirect,
@@ -197,8 +198,8 @@ describe('gitlab merge-request writes', () => {
 		});
 
 		// GitLab exposes no REST endpoint for a reviewer's `requested_changes` state, so
-		// clearing the standing approval is what the verdict amounts to.
-		it('clears a standing approval for request-changes, then posts the findings note', async () => {
+		// ingress recognizes the marker-bearing findings note as the submitted verdict.
+		it('clears a standing approval for request-changes, then posts the marked findings note', async () => {
 			fetchMock
 				.mockResolvedValueOnce(jsonResponse([]))
 				.mockResolvedValueOnce(jsonResponse(createMockGitLabMergeRequestResponse()))
@@ -210,6 +211,9 @@ describe('gitlab merge-request writes', () => {
 				['POST', `${MR_PATH}/unapprove`],
 				['POST', `${MR_PATH}/notes`],
 			]);
+			expect(requestBody(fetchMock, 2)).toEqual({
+				body: `LGTM\n\n${MARKER}\n${gitLabRequestChangesMarker(DELIVERY_ID)}`,
+			});
 		});
 
 		it('short-circuits on an existing marker — no re-vote, no second note', async () => {
