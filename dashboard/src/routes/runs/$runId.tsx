@@ -6,8 +6,10 @@ import {
 	ChevronDown,
 	ExternalLink,
 	Info,
+	ListChecks,
 	Loader2,
 	OctagonX,
+	PauseCircle,
 	Play,
 	RefreshCw,
 	RotateCcw,
@@ -60,7 +62,17 @@ import {
 } from '../../../../src/harness/models.js';
 import { rootRoute } from '../__root.js';
 
-type RunStatus = 'running' | 'completed' | 'failed' | 'deferred';
+type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed';
+
+/**
+ * The two statuses that are waiting on a dispatch rather than on an agent —
+ * mirrors the server's `RETRY_PENDING_RUN_STATUSES` (`isRetryPendingStatus`,
+ * `src/db/repositories/runsRepository.ts`). Both can still change on their own, so
+ * both keep the detail page polling.
+ */
+function isRetryPending(status: string | undefined): boolean {
+	return status === 'deferred' || status === 'checkpointed';
+}
 
 const RUN_AGENTS = ['claude', 'antigravity', 'codex'] as const;
 type RunAgent = AgentCli;
@@ -71,13 +83,28 @@ function capitalizeLevel(value: string): string {
 }
 
 /**
- * The split button's color treatment (issue #227): emerald for a session
- * "Resume", violet for a fresh "Retry now". Shared by the wrapper (shadow), the
- * main button, and the chevron so the whole control reads as one green/violet
- * piece.
+ * Whether the action adopts the run's preserved checkout instead of starting the
+ * phase over — a session "Resume" (issue #227) or a Tier 2 checkpoint "Continue
+ * now" (issue #503). The two differ in *what* they carry over (a live session vs a
+ * written hand-off), but both pick work up rather than discard it, which is what
+ * the control's colour and glyph communicate.
  */
-function retrySplitPalette(isResume: boolean): { wrapper: string; main: string; chevron: string } {
-	return isResume
+function continuesPriorWork(kind: RetryActionKind): boolean {
+	return kind === 'resume' || kind === 'continue';
+}
+
+/**
+ * The split button's color treatment (issue #227): emerald for an action that
+ * carries prior work forward ("Resume" / "Continue now"), violet for a fresh
+ * "Retry now". Shared by the wrapper (shadow), the main button, and the chevron so
+ * the whole control reads as one green/violet piece.
+ */
+function retrySplitPalette(kind: RetryActionKind): {
+	wrapper: string;
+	main: string;
+	chevron: string;
+} {
+	return continuesPriorWork(kind)
 		? {
 				wrapper: 'shadow-emerald-950/10',
 				main: 'bg-emerald-600 hover:bg-emerald-500 focus:ring-emerald-500 border-emerald-700/50',
@@ -91,8 +118,23 @@ function retrySplitPalette(isResume: boolean): { wrapper: string; main: string; 
 }
 
 /**
+ * The chevron's tooltip, which has to be honest about what an override does to
+ * *this* run's semantics: it turns a session resume into a fresh start, but it
+ * composes with a checkpoint continuation unchanged — the server keeps
+ * `recoveryMode: 'checkpoint'` regardless, because a continuation runs a fresh
+ * session anyway and is CLI-agnostic by construction.
+ */
+function retryOverrideTitle(kind: RetryActionKind): string {
+	if (kind === 'resume') return 'Retry with a different model/agent (starts fresh, not a resume)';
+	if (kind === 'continue')
+		return 'Continue with a different model/agent (still continues from the checkpoint)';
+	return 'Retry with different model/agent';
+}
+
+/**
  * The main-action + chevron pair of the retry control. A resumable run shows a
- * green "Resume" (Play glyph); a blocked run shows the violet "Recheck and
+ * green "Resume" and a checkpointed one a green "Continue now" (both the Play
+ * glyph — they pick work up); a blocked run shows the violet "Recheck and
  * retry" and every other retryable run the violet "Retry now" (both RefreshCw).
  * The chevron opens the override popup the parent owns.
  */
@@ -109,17 +151,16 @@ function RetrySplitButton({
 	onPrimary: () => void;
 	onToggle: () => void;
 }) {
-	const isResume = kind === 'resume';
 	return (
 		<>
-			{/* Main Button — resume or fresh retry, per the run's server semantics. */}
+			{/* Main Button — resume, continue, or fresh retry, per the run's server semantics. */}
 			<button
 				type="button"
 				onClick={onPrimary}
 				disabled={isPending}
 				className={`inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white rounded-l-md focus:outline-none focus:ring-1 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed border-r cursor-pointer ${palette.main}`}
 			>
-				{isResume ? (
+				{continuesPriorWork(kind) ? (
 					<Play className={`h-4 w-4 ${isPending ? 'animate-pulse' : ''}`} />
 				) : (
 					<RefreshCw className={`h-4 w-4 ${isPending ? 'animate-spin' : ''}`} />
@@ -133,16 +174,45 @@ function RetrySplitButton({
 				onClick={onToggle}
 				disabled={isPending}
 				className={`inline-flex items-center px-2 py-2 text-sm font-semibold text-white rounded-r-md focus:outline-none focus:ring-1 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer ${palette.chevron}`}
-				title={
-					isResume
-						? 'Retry with a different model/agent (starts fresh, not a resume)'
-						: 'Retry with different model/agent'
-				}
+				title={retryOverrideTitle(kind)}
 			>
 				<ChevronDown className="h-4 w-4" />
 			</button>
 		</>
 	);
+}
+
+/**
+ * The override popup's heading and the one caveat that varies by action kind: an
+ * override abandons a session resume, but a checkpoint continuation carries on
+ * regardless (a continuation always runs a fresh session, so it is CLI-agnostic).
+ * Every other kind is already a fresh retry and needs no caveat.
+ */
+function RetryOverrideHeading({ kind }: { kind: RetryActionKind }) {
+	const caveat =
+		kind === 'resume'
+			? "Choosing a different CLI or model starts a fresh retry instead of resuming this run's session."
+			: kind === 'continue'
+				? "A continuation always runs a fresh session seeded from the checkpoint, so choosing a different CLI or model still continues this run's recorded work."
+				: null;
+
+	return (
+		<div className="mb-3">
+			<h4 className="text-xs font-semibold text-zinc-300 tracking-wide uppercase">
+				{kind === 'continue' ? 'Continuation Options' : 'Retry Options'}
+			</h4>
+			{caveat && (
+				<p className="mt-1.5 text-[11px] font-normal normal-case tracking-normal leading-snug text-zinc-500">
+					{caveat}
+				</p>
+			)}
+		</div>
+	);
+}
+
+/** The override popup's confirm label — the only kind it doesn't turn into a plain retry. */
+function retryOverrideActionLabel(kind: RetryActionKind): string {
+	return kind === 'continue' ? 'Continue Now' : 'Retry Now';
 }
 
 /**
@@ -156,7 +226,9 @@ function RetrySplitButton({
  * session-resume job) — while a non-resumable deferred run and a terminally
  * failed run relaunch from scratch as the original violet "Retry now". The
  * override popup is always a fresh retry, so choosing a different CLI/model never
- * masquerades as a resume.
+ * masquerades as a resume — except for a `checkpointed` run (issue #503), where the
+ * server keeps `recoveryMode: 'checkpoint'` regardless, so an override composes
+ * with the continuation instead of replacing it.
  */
 function RetryNowButton({ run }: { run: RunRow }) {
 	const queryClient = useQueryClient();
@@ -208,12 +280,12 @@ function RetryNowButton({ run }: { run: RunRow }) {
 	const reasoningOptions = reasoningChoicesFor(selectedCli, selectedModel);
 
 	// A resumable run continues its captured CLI session (green "Resume"); a
+	// checkpointed one continues from its written hand-off (green "Continue now"); a
 	// blocked run rechecks its protected worktree first ("Recheck and retry");
-	// everything else relaunches from scratch (violet "Retry now"). All three
+	// everything else relaunches from scratch (violet "Retry now"). All four
 	// fire the same unchanged mutation — the label only reflects server intent.
 	const kind = retryActionKind(run.status, run.agentSessionId, run.recovery);
-	const isResume = kind === 'resume';
-	const palette = retrySplitPalette(isResume);
+	const palette = retrySplitPalette(kind);
 
 	return (
 		<div className="mt-3">
@@ -239,17 +311,7 @@ function RetryNowButton({ run }: { run: RunRow }) {
 
 						{/* The actual popover */}
 						<div className="absolute left-0 top-full mt-2 z-50 w-72 bg-zinc-900 border border-zinc-850 rounded-lg shadow-2xl p-4 animate-in fade-in slide-in-from-top-2 duration-150">
-							<div className="mb-3">
-								<h4 className="text-xs font-semibold text-zinc-300 tracking-wide uppercase">
-									Retry Options
-								</h4>
-								{isResume && (
-									<p className="mt-1.5 text-[11px] font-normal normal-case tracking-normal leading-snug text-zinc-500">
-										Choosing a different CLI or model starts a fresh retry instead of resuming this
-										run's session.
-									</p>
-								)}
-							</div>
+							<RetryOverrideHeading kind={kind} />
 
 							<div className="space-y-3 text-left">
 								<div>
@@ -362,7 +424,7 @@ function RetryNowButton({ run }: { run: RunRow }) {
 										}}
 										className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors cursor-pointer"
 									>
-										Retry Now
+										{retryOverrideActionLabel(kind)}
 									</button>
 								</div>
 							</div>
@@ -754,6 +816,19 @@ export function RecoveryCallout({ run }: RecoveryCalloutProps) {
 							"The preserved checkout or its saved agent session is gone, so this run can't be resumed.",
 						resolution: 'Use "Recheck and retry" to provision a fresh checkout and start over.',
 					};
+				case 'checkpoint-divergent':
+					// Issue #502's block: the continuation gate compared the checkpoint
+					// against the checkout and refused it, so there is nothing safe to
+					// continue *from* — unlike the reasons above, waiting or tidying the
+					// checkout doesn't restore the hand-off it describes. The run's own
+					// error names the specific mismatch (wrong phase, or the paths the
+					// working tree no longer changes).
+					return {
+						condition:
+							"This run's checkpoint no longer describes the checkout it was going to continue from, so SWARM refused to continue rather than work against a tree it can't account for.",
+						resolution:
+							'The error above names the mismatch. Use "Recheck and retry" to start this phase over from a fresh checkout — the recorded remainder can\'t be picked up.',
+					};
 				default:
 					return {
 						condition: "This run's worktree failed a safety check, so SWARM kept it protected.",
@@ -789,6 +864,114 @@ export function RecoveryCallout({ run }: RecoveryCalloutProps) {
 	}
 
 	return null;
+}
+
+/**
+ * How much of the Tier 2 continuation budget this run has spent (issue #504).
+ * `maxContinuations` is resolved server-side (`runs.getById`), so the ceiling is
+ * the project's real `pipeline.maxContinuations` rather than a default re-declared
+ * here that could drift — and when the server couldn't resolve it, the spent count
+ * is reported alone instead of against a fabricated ceiling.
+ */
+function describeContinuationBudget(count: number, max: number | null | undefined): string {
+	return typeof max === 'number' ? `Continuation ${count} of ${max}` : `Continuation ${count}`;
+}
+
+/** One labelled group of checkpoint lines; renders nothing when the group is empty. */
+function CheckpointList({
+	label,
+	items,
+	ordered = false,
+	mono = false,
+}: {
+	label: string;
+	items: string[];
+	/** Numbered, for the remainder — its order is the order a continuation works in. */
+	ordered?: boolean;
+	/** For repository paths, per `ai/DESIGN_SYSTEM.md` §2: machine values are mono. */
+	mono?: boolean;
+}) {
+	if (items.length === 0) return null;
+
+	const itemClass = mono ? 'font-mono break-all' : '';
+	return (
+		<div>
+			<span className="block text-xs font-medium text-zinc-400">{label}</span>
+			{ordered ? (
+				<ol className="mt-1.5 space-y-1 list-decimal list-inside text-xs text-zinc-300">
+					{items.map((item) => (
+						<li key={item} className={itemClass}>
+							{item}
+						</li>
+					))}
+				</ol>
+			) : (
+				<ul className="mt-1.5 space-y-1 list-disc list-inside text-xs text-zinc-400">
+					{items.map((item) => (
+						<li key={item} className={itemClass}>
+							{item}
+						</li>
+					))}
+				</ul>
+			)}
+		</div>
+	);
+}
+
+/**
+ * The Tier 2 checkpoint hand-off a stopped run recorded (`docs/CHECKPOINTS.md`,
+ * issues #503/#504): the remainder a continuation picks up, what is already done
+ * and must not be re-derived, the settled decisions, and the working tree the
+ * checkpoint claims it left behind — read off the persisted `checkpoint` column,
+ * never a worker's filesystem, so it renders for a remote worker's run too.
+ *
+ * Gated on the checkpoint's *presence* rather than on `status === 'checkpointed'`,
+ * because the column survives an ordinary retry as the record of what the current
+ * attempt was seeded from: an operator watching a running continuation, or
+ * diagnosing one that then failed, needs exactly this. The spent continuation
+ * count rides here so the state and its budget are read in one place.
+ *
+ * Remaining work leads, and is numbered — its order is the order a continuation
+ * works in.
+ */
+export function CheckpointPanel({ run }: { run: RunRow }) {
+	const { checkpoint } = run;
+	if (!checkpoint) return null;
+
+	const { modified, added, deleted } = checkpoint.workingTree;
+	const count = run.continuationCount ?? 0;
+
+	return (
+		<div className="p-4 border border-zinc-800 rounded-lg bg-panel/20 shadow-sm">
+			<div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-2">
+				<h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
+					<ListChecks className="h-4 w-4 text-sky-400" />
+					Checkpoint hand-off
+				</h3>
+				{count > 0 && (
+					<span className="text-xs font-medium text-zinc-400">
+						{describeContinuationBudget(count, run.maxContinuations)}
+					</span>
+				)}
+			</div>
+
+			<div className="mt-4 space-y-4">
+				<CheckpointList label="Remaining work" items={checkpoint.remaining} ordered />
+				<CheckpointList label="Already completed" items={checkpoint.completed} />
+				<CheckpointList label="Decisions carried over" items={checkpoint.decisions} />
+				<div>
+					<span className="block text-xs font-medium text-zinc-400">Working tree it recorded</span>
+					{/* Indented rather than re-labelled: the three change kinds are one
+					    group under the heading above, not three peers of it. */}
+					<div className="mt-1.5 pl-3 border-l border-zinc-800/60 space-y-2">
+						<CheckpointList label="Modified" items={modified} mono />
+						<CheckpointList label="Added" items={added} mono />
+						<CheckpointList label="Deleted" items={deleted} mono />
+					</div>
+				</div>
+			</div>
+		</div>
+	);
 }
 
 interface ReviewCapCalloutProps {
@@ -1053,6 +1236,51 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				</div>
 			)}
 
+			{/* The other retry-pending status (issue #503) — deliberately its own callout
+			    rather than a branch of the amber deferred one above, because what it is
+			    waiting on is different: a continuation from its recorded checkpoint, not
+			    a quota window. Sky matches its badge; the actions are the same three the
+			    deferred callout offers, all server-guarded (`retryNow`'s
+			    checkpointed-status branch, `terminate`'s `isRetryPendingStatus`, and
+			    `resetRun`, which refuses only a `running` row). */}
+			{run.status === 'checkpointed' && (
+				<div className="p-4 bg-sky-950/20 border border-sky-900/30 rounded flex items-start gap-3">
+					<PauseCircle className="h-5 w-5 text-sky-400 shrink-0 mt-0.5" />
+					<div>
+						<h3 className="text-xs font-semibold text-sky-200">
+							Checkpointed — continuation scheduled
+						</h3>
+						<p className="text-xs text-sky-200/70 mt-1">
+							This run stopped before finishing and left a checkpoint. Its checkout is preserved,
+							and a continuation will start a fresh agent session from the remaining work recorded
+							below. It is not waiting on quota.
+						</p>
+						{run.error && (
+							<p className="text-xs text-sky-200/70 mt-2 font-mono whitespace-pre-wrap">
+								{normalizeRunError(run.error)}
+							</p>
+						)}
+						{run.nextRetryAt && (
+							<>
+								<p className="text-xs text-sky-200/70 mt-2 font-mono">
+									{new Date(run.nextRetryAt).toLocaleString()} ({formatTimeUntil(run.nextRetryAt)})
+								</p>
+								<p className="text-xs text-sky-200/70 mt-1 font-mono">
+									UTC: {new Date(run.nextRetryAt).toISOString()}
+								</p>
+							</>
+						)}
+						<div className="flex flex-wrap items-start gap-3">
+							{canRetryRun(run.status) && <RetryNowButton run={run} />}
+							{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
+							{canResetRun(run.status) && (
+								<ResetRunButton run={run} onResetSuccess={setResetReport} />
+							)}
+						</div>
+					</div>
+				</div>
+			)}
+
 			{run.status === 'failed' && <FailureDiagnosisCallout diagnosis={run.failureDiagnosis} />}
 
 			{run.status === 'failed' && run.error && (
@@ -1084,6 +1312,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				</div>
 			)}
 
+			<CheckpointPanel run={run} />
 			<RecoveryCallout run={run} />
 			<ReviewCapCallout run={run} project={project} />
 			<ReviewMergeCallout run={run} project={project} />
@@ -1417,12 +1646,14 @@ function RunDetailRouteComponent() {
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectsMap = new Map(projectsQuery.data?.map((p) => [p.id, p]) ?? []);
 
-	// Fetch run details and poll while the run can still change automatically.
+	// Fetch run details and poll while the run can still change automatically —
+	// which includes a `checkpointed` run (issue #503), whose scheduled continuation
+	// flips it to `running` with no operator action.
 	const runQuery = useQuery({
 		...trpc.runs.getById.queryOptions({ id: runId }),
 		refetchInterval: (query) => {
 			const run = query.state.data;
-			return run && (run.status === 'running' || run.status === 'deferred') ? 2000 : false;
+			return run && (run.status === 'running' || isRetryPending(run.status)) ? 2000 : false;
 		},
 	});
 
@@ -1431,7 +1662,7 @@ function RunDetailRouteComponent() {
 		...trpc.runs.getLogs.queryOptions({ runId }),
 		refetchInterval: () => {
 			return runQuery.data &&
-				(runQuery.data.status === 'running' || runQuery.data.status === 'deferred')
+				(runQuery.data.status === 'running' || isRetryPending(runQuery.data.status))
 				? 2000
 				: false;
 		},

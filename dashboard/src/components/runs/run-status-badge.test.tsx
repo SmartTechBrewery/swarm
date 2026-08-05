@@ -80,6 +80,28 @@ describe('RunStatusBadge', () => {
 		});
 	});
 
+	describe('checkpointed runs read distinctly from deferred (issues #503, #504)', () => {
+		it('renders a "Checkpointed" badge in its own hue, not the amber Deferred one', () => {
+			render(<RunStatusBadge status="checkpointed" phase="implementation" />);
+			const badge = screen.getByText('Checkpointed');
+			expect(badge.className).toContain('text-sky-400');
+			expect(badge.className).not.toContain('amber');
+			expect(screen.queryByText('Deferred')).toBeNull();
+		});
+
+		it('says in its title that it waits on a continuation rather than on quota', () => {
+			render(<RunStatusBadge status="checkpointed" phase="implementation" />);
+			const title = screen.getByText('Checkpointed').getAttribute('title') ?? '';
+			expect(title).toMatch(/continued/i);
+			expect(title).toMatch(/not waiting on quota/i);
+		});
+
+		it('does not pulse — no live agent is running', () => {
+			const { container } = render(<RunStatusBadge status="checkpointed" />);
+			expect(container.querySelector('.animate-pulse')).toBeNull();
+		});
+	});
+
 	describe('lifecycle status is kept where a verdict must not show', () => {
 		it('shows "Completed" for a completed non-Review run even if a verdict slipped through', () => {
 			render(<RunStatusBadge status="completed" phase="implementation" reviewVerdict="approve" />);
