@@ -86,5 +86,6 @@ review_handoff.json
 respond_to_review_handoff.json
 respond_to_ci_handoff.json
 resolve_conflicts_handoff.json
+swarm_checkpoint.json
 .swarm_delivery.json
 .swarm-delegation-*

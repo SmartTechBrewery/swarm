@@ -6,10 +6,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
 	commitPreparedTree,
 	deliveryIdentity,
+	HANDOFF_FILENAMES,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
 	readHandoff,
 	saveDeliveryProgress,
+	validatePreparedTree,
 } from '@/scm/delivery.js';
 
 const roots: string[] = [];
@@ -113,5 +115,40 @@ describe('SCM delivery hand-offs', () => {
 		});
 		const committed = fixtureGit(root, ['show', '--format=', '--name-only', sha]);
 		expect(committed.trim().split('\n')).toEqual(['.gitignore', 'change.txt']);
+	});
+
+	// The Tier 2 checkpoint (issue #299) is a scratch artifact only because it is
+	// registered in `HANDOFF_FILENAMES`. Assert that against real git rather than
+	// inheriting it from the entry: it is the acceptance criterion that a
+	// checkpoint can never reach a commit, and therefore never a pushed branch.
+	it('keeps a checkpoint file out of the delivered commit', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-delivery-'));
+		roots.push(root);
+		fixtureGit(root, ['init']);
+		writeFileSync(join(root, '.gitignore'), `${HANDOFF_FILENAMES.checkpoint}\n`);
+		writeFileSync(join(root, 'change.txt'), 'prepared\n');
+		writeFileSync(join(root, HANDOFF_FILENAMES.checkpoint), '{"phase":"implementation"}\n');
+
+		const sha = await commitPreparedTree(root, 'feat: deliver', {
+			name: 'swarm-implementer',
+			email: 'swarm-implementer@users.noreply.github.com',
+		});
+		const committed = fixtureGit(root, ['show', '--format=', '--name-only', sha]);
+		expect(committed.trim().split('\n')).toEqual(['.gitignore', 'change.txt']);
+		expect(fixtureGit(root, ['ls-files'])).not.toContain(HANDOFF_FILENAMES.checkpoint);
+	});
+
+	it('refuses to deliver a tree where the checkpoint has been force-added', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-delivery-'));
+		roots.push(root);
+		fixtureGit(root, ['init']);
+		writeFileSync(join(root, '.gitignore'), `${HANDOFF_FILENAMES.checkpoint}\n`);
+		writeFileSync(join(root, 'change.txt'), 'prepared\n');
+		writeFileSync(join(root, HANDOFF_FILENAMES.checkpoint), '{"phase":"implementation"}\n');
+		fixtureGit(root, ['add', '--force', '--', HANDOFF_FILENAMES.checkpoint]);
+
+		await expect(validatePreparedTree(root)).rejects.toThrow(
+			`scratch artifact is tracked (${HANDOFF_FILENAMES.checkpoint})`,
+		);
 	});
 });

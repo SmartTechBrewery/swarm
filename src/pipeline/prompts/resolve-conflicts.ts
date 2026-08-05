@@ -9,6 +9,7 @@
 
 import type { ProjectConfig } from '@/config/schema.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
+import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsParagraph } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 
@@ -51,6 +52,7 @@ export function buildResolveConflictsPrompt(
 		`Merge origin/${input.baseBranch} into the checked-out PR branch with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent.`,
 		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge in the working tree for SWARM.',
 		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", body (the concise result comment), and verification [{command,outcome:"passed"}].`,
+		...checkpointInstructions('resolve-conflicts'),
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');
 }

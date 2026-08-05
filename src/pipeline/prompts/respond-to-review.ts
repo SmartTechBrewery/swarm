@@ -7,6 +7,7 @@
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
+import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 
@@ -62,6 +63,8 @@ export function buildRespondToReviewPrompt(
 		`Do not run \`git push origin ${prBranch}\` or \`gh pr comment ${prNumber} --repo ${repo}\`; GH_TOKEN is read-only context authentication and you must not run gh auth switch. Do NOT \`git add\`/commit the hand-off.`,
 		`5. Write "${RESPOND_OUTCOME_FILENAME}" as JSON with outcome (fixed, pushed-back, or no-findings), body (the point-by-point PR reply), optional commitSubject when fixed, and verification [{command,outcome:"passed"}].`,
 		'The outcome strings are exactly `fixed`, `pushed-back`, and `no-findings`. The body must ALWAYS reply on the PR point by point; with no findings, post a short comment thanking the reviewer — never skip this step, even when there is nothing to fix.',
+		'',
+		...checkpointInstructions('respond-to-review'),
 		'',
 		'Do not merge the PR, and do not submit a review of your own — you are the author.',
 		...projectInstructionsSection(customPrompt),

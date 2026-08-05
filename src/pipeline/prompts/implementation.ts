@@ -7,6 +7,8 @@
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
+import { CHECKPOINT_FILENAME } from '@/pipeline/checkpoint.js';
+import { checkpointInstructions } from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import type { WorkItem } from '@/pm/types.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
@@ -60,7 +62,8 @@ export function buildImplementationPrompt(
 				`worktree at the absolute path ${worktreePath}. The repository is ${repo} on GitHub.`,
 				`Your process's working directory may be a different, unrelated directory — do not`,
 				`rely on it. Make every repository edit, run every command, and write every hand-off`,
-				`file (including "${OPENED_PR_FILENAME}" and "${BLOCKED_REASON_FILENAME}") inside`,
+				`file (including "${OPENED_PR_FILENAME}", "${BLOCKED_REASON_FILENAME}", and`,
+				`"${CHECKPOINT_FILENAME}") inside`,
 				`${worktreePath}. SWARM only reads files from there.`,
 			]
 		: [
@@ -89,6 +92,8 @@ export function buildImplementationPrompt(
 		'After step 7, STOP immediately and exit. Do not wait for a review, review the PR,',
 		'respond to a review, post any additional PR comment, or invoke another agent.',
 		'SWARM runs Review and Respond-to-review as separate phases after you exit.',
+		'',
+		...checkpointInstructions('implementation'),
 		'',
 		'Do not merge the PR. Keep the change scoped to the work item.',
 		...projectInstructionsSection(customPrompt),
