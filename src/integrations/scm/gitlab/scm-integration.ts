@@ -1,12 +1,17 @@
 /**
  * GitLabSCMIntegration — GitLab.com's implementation of the provider-neutral
  * {@link SCMProvider} contract (`src/scm/types.ts`), built out over four phases
- * (issue #295) along the same seams Bitbucket used. Built so far: availability
- * probing, persona credential scoping, and persona identity / actor resolution
- * (phase 1/4); the whole inbound half — header interpretation, delivery
- * authentication, event normalization, and the comment loop-prevention gate,
- * which all delegate to `./webhook.ts` (phase 2/4); and the merge-request /
- * commit-status reads, which delegate to `./merge-requests.ts` (phase 3/4).
+ * (issue #295) along the same seams Bitbucket used, and now complete:
+ * availability probing, persona credential scoping, and persona identity / actor
+ * resolution (phase 1/4); the whole inbound half — header interpretation,
+ * delivery authentication, event normalization, and the comment loop-prevention
+ * gate (phase 2/4, delegated to `./webhook.ts`); the merge-request /
+ * commit-status reads (phase 3/4, delegated to `./merge-requests.ts`); and notes,
+ * the delivery seam, and the direct merge (phase 4/4, delegated to `./writes.ts`
+ * / `./operator-delivery.ts`). No contract method is stubbed — the multi-provider
+ * conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
+ * asserts that for every registered manifest, which is why the manifest
+ * (`./index.ts`) could only land with this phase.
  *
  * Its core job is the same as the GitHub and Bitbucket classes': run a block of
  * GitLab operations under the correct persona's token. Callers hand it a project
@@ -16,21 +21,15 @@
  * push as the implementer without either token appearing in a signature
  * (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Every method a later phase owns throws** — loudly, naming the method and the
- * phase that fills it in — rather than returning `null`, `[]`, or a no-op that
- * would read as a real answer. What is left is the comments/delivery/merge writes
- * (phase 4/4), all of them `async` in the contract, so those stubs reject rather
- * than throwing synchronously.
- *
- * Unlike Bitbucket's phase 1, **nothing registers this provider yet**: the
- * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
- * asserts that no *registered* manifest stubs a contract method, and
- * `ai/TESTING.md` frames that assertion as the gate on the third provider — so
- * the manifest lands in phase 4/4 together with the last stub's removal, and
- * nothing can resolve `GitLabSCMIntegration` by id until then. A throw here
- * therefore means a caller constructed the class directly and called too early.
+ * **Implemented is still not reachable.** The manifest keeps `runtimeReady: false`
+ * (`./index.ts`): nothing selects a project's SCM provider, so no served route or
+ * project-scoped lookup resolves to GitLab. That wiring — project→provider
+ * selection plus a served ingress route — is a separate follow-up, not part of
+ * #295, and Bitbucket is waiting on the same one (ai/RULES.md §2).
  */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
@@ -44,14 +43,18 @@ import type {
 	ScmWebhookRequest,
 	WebhookHeaderReader,
 } from '../../../scm/types.js';
-import { withGitLabToken } from './client.js';
+import { getScopedGitLabUser, withGitLabToken } from './client.js';
 import { getGitLabToken, getGitLabTokenOrNull } from './credentials.js';
 import {
+	findOpenGitLabMergeRequest,
 	getGitLabCommitStatuses,
 	getGitLabMergeRequest,
+	getGitLabMergeRequestApprovals,
+	getGitLabMergeRequestMergeState,
 	getGitLabMergeRequestTitle,
 	listOpenGitLabMergeRequestsForBase,
 } from './merge-requests.js';
+import { createGitLabOperatorDeliveryProvider } from './operator-delivery.js';
 import {
 	getGitLabPersonaForLogin,
 	isSwarmGitLabActor,
@@ -63,19 +66,162 @@ import {
 	readGitLabWebhookRequest,
 	verifyGitLabWebhookToken,
 } from './webhook.js';
+import {
+	createGitLabMergeRequest,
+	mergeGitLabMergeRequestDirect,
+	postGitLabMergeRequestNote,
+	postIdempotentGitLabMergeRequestNote,
+	submitGitLabReview,
+} from './writes.js';
+
+/** GitLab.com's git-over-HTTPS host — the push remote and the `extraheader` scope. */
+const GITLAB_GIT_ORIGIN = 'https://gitlab.com/';
 
 /**
- * The single exit for every contract method this phase leaves unbuilt. `phase`
- * names the follow-up that implements it, so the error tells a caller what to
- * wait for rather than just that something is missing.
+ * GitLab authenticates a git push with any token form under the reserved `oauth2`
+ * user, so — unlike Bitbucket, whose `client.ts` must branch on whether the
+ * credential is already a `user:password` pair — there is one spelling here.
  */
-function notImplementedYet(method: string, phase: string): never {
-	throw new Error(
-		`GitLab SCM: ${method}() is not implemented yet — it lands in ${phase} of issue #295`,
-	);
+function gitlabGitBasicCredential(token: string): string {
+	return `oauth2:${token}`;
 }
 
-const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** `GitLabApiError#status`, if `error` carries one (it mirrors Octokit's field name). */
+function errorStatus(error: unknown): number | undefined {
+	const status = (error as { status?: unknown } | null)?.status;
+	return typeof status === 'number' ? status : undefined;
+}
+
+/**
+ * Classify a thrown GitLab error from the direct-merge endpoint into the
+ * provider-neutral outcome — the GitLab twin of GitHub's
+ * `classifyDirectMergeError` and `classifyBitbucketDirectMergeError`. The statuses
+ * are GitLab's own documented set for `PUT .../merge` (checked against GitLab
+ * 19.1's REST reference), which is **not** the set the other two adapters see:
+ *
+ * - **409** is GitLab's "the `sha` no longer matches the head of the source
+ *   branch". Since the pre-merge recheck ({@link mergeReadyGitLabMergeRequest})
+ *   just verified that head against the reviewed commit, a 409 means the branch
+ *   moved inside that window — so nobody has reviewed the current head and this
+ *   needs a fresh review, `not-eligible`. That is the one place GitLab's mapping
+ *   deliberately differs from GitHub's, where a 409 is a stale-head *race* on a
+ *   merge that was never pinned to a reviewed commit.
+ * - **405** ("the merge request cannot merge") covers every readiness blocker
+ *   GitLab collapses into one status — a required pipeline still running,
+ *   unresolved discussions, missing approvals, a draft — while **422** and **406**
+ *   ("branch cannot be merged") mean a conflict. All are `not-ready`, which the merge
+ *   dispatch retries. GitLab renamed that refusal from 406 to 422, so both
+ *   spellings map rather than making the table depend on the instance's version.
+ * - **401** is where GitLab diverges most: its merge endpoint documents 401, not
+ *   403, for "this user does not have permission to accept this merge request".
+ *   Both map to `policy-blocked`. Reading 401 as a dead credential would be wrong
+ *   here — the recheck's two reads ran on this same token moments earlier, so the
+ *   token is demonstrably live and a 401 from the merge itself is the documented
+ *   permission refusal.
+ *
+ * Anything else (404, 5xx, a network failure) is an unexpected `provider-error`.
+ *
+ * Nothing maps to `unsupported`. GitLab's merge trains are the configuration that
+ * would earn it — the case GitHub reserves it for, where a merge queue makes the
+ * direct endpoint unusable outright — but they have no unsatisfiable path: a
+ * train-configured project refuses the direct merge with 405 while its required
+ * pipeline is unfinished and accepts it once the pipeline is green, so retrying is
+ * the correct response rather than declaring the merge impossible.
+ */
+function classifyGitLabDirectMergeError(error: unknown): MergePullRequestOutcome {
+	const message = errorMessage(error);
+	const status = errorStatus(error);
+	if (status === 409) return { status: 'not-eligible', message };
+	if (status === 405 || status === 406 || status === 422) return { status: 'not-ready', message };
+	if (status === 401 || status === 403) return { status: 'policy-blocked', message };
+	return { status: 'provider-error', message };
+}
+
+/**
+ * The token-scoped body of {@link GitLabSCMIntegration.mergePullRequest},
+ * mirroring GitHub's `mergeReadyPullRequest` and Bitbucket's equivalent: re-read
+ * the merge request's current state on every call, so a durable retry re-evaluates
+ * eligibility from scratch rather than merging stale approval context.
+ *
+ * GitLab's endpoint *does* take an expected head (`sha`), so — unlike Bitbucket,
+ * where this re-read is the whole protection — these checks are defence in depth
+ * rather than the only line. They still earn their place: they turn refusals GitLab
+ * would answer with one undifferentiated 405 into the specific terminal outcomes
+ * the merge dispatch needs, and they distinguish "the approval no longer holds"
+ * (never retry) from "not ready yet" (retry).
+ *
+ * Two reads of the same merge request (state, then standing approvals) rather than
+ * one: they are the phase-3 reads the adapter already exposes, and a merge attempt
+ * is not a hot path.
+ */
+async function mergeReadyGitLabMergeRequest(
+	repo: string,
+	iid: number,
+	approvedHeadSha: string,
+): Promise<MergePullRequestOutcome> {
+	let state: Awaited<ReturnType<typeof getGitLabMergeRequestMergeState>>;
+	try {
+		state = await getGitLabMergeRequestMergeState(repo, iid);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (state.merged) return { status: 'merged', message: 'merge request already merged' };
+	// The approval this attempt was requested for covers one exact commit. A push
+	// since then (including a rebase that keeps the same diff) means nobody has
+	// reviewed the merge request's *current* head, so merging would silently ship
+	// unreviewed content — that needs a fresh review, not a retry. GitLab reports
+	// full 40-character SHAs everywhere, so this is an exact comparison and needs no
+	// prefix tolerance of the kind Bitbucket's abbreviated spelling forces.
+	if (state.headSha !== approvedHeadSha)
+		return {
+			status: 'not-eligible',
+			message: `merge request head changed since the reviewed commit (reviewed ${approvedHeadSha}, now ${state.headSha}); a fresh review is required before merge automation can proceed`,
+		};
+	if (state.draft)
+		return {
+			status: 'not-eligible',
+			message: 'merge request was converted back to a draft after the review was approved',
+		};
+	if (state.state !== 'open')
+		return { status: 'not-eligible', message: `merge request is ${state.state}` };
+	// A reviewer's standing "request changes" is a decision, not a readiness
+	// condition, so it is terminal here rather than the `not-ready` GitLab's own 405
+	// would produce (see `GitLabMergeRequestMergeState.changesRequested`).
+	if (state.changesRequested)
+		return {
+			status: 'not-eligible',
+			message: 'the approving review is no longer in effect — changes have since been requested',
+		};
+
+	// The head is unchanged, but the approvals standing on it may no longer be.
+	// GitLab records a *standing* approval rather than a review history, so
+	// "dismissed" simply means the approval is no longer listed — there is no
+	// GitHub-style `REVIEW_REQUIRED` propagation window to tolerate.
+	let approvals: Awaited<ReturnType<typeof getGitLabMergeRequestApprovals>>;
+	try {
+		approvals = await getGitLabMergeRequestApprovals(repo, iid);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (!approvals.some((approval) => approval.commitId === approvedHeadSha))
+		return {
+			status: 'not-eligible',
+			message: 'the approving review is no longer in effect — it has since been dismissed',
+		};
+
+	try {
+		const merge = await mergeGitLabMergeRequestDirect(repo, iid, approvedHeadSha);
+		return merge.merged
+			? { status: 'merged', message: merge.message, sha: merge.sha }
+			: { status: 'not-ready', message: merge.message };
+	} catch (error) {
+		return classifyGitLabDirectMergeError(error);
+	}
+}
 
 export class GitLabSCMIntegration implements SCMProvider {
 	readonly type = 'gitlab' as const;
@@ -224,22 +370,146 @@ export class GitLabSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: comments, delivery, merge — phase 4/4
+	// Writes: notes, delivery, merge — phase 4/4, in `./writes.ts`
 	// ==========================================================================
 
-	async commentOnPullRequest(): Promise<number> {
-		notImplementedYet('commentOnPullRequest', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.commentOnPullRequest} — a note on the merge request as
+	 * `persona`, returning the new note's id. The PR-driven phases normally comment
+	 * from *inside* the agent run; this is the out-of-band path for the worker's
+	 * stalled-job safety net, where the run was reclaimed before it could comment
+	 * itself. Defaults to the **implementer** (the merge request's author, whose token
+	 * is always configured for a project that opens them) for the same reason GitHub's
+	 * and Bitbucket's do: a comment triggers no pipeline phase, so the persona choice
+	 * is immaterial to loop prevention.
+	 */
+	async commentOnPullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		body: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<number> {
+		return this.withPersonaCredentials(project, persona, () =>
+			postGitLabMergeRequestNote(project.repo, prNumber, body),
+		);
 	}
 
-	async deliveryProvider(): Promise<ScmDeliveryProvider> {
-		notImplementedYet('deliveryProvider', WRITE_PHASE);
+	/**
+	 * {@link ScmMergeProvider.mergePullRequest} for GitLab: merge an approved, ready
+	 * merge request as the **implementer** through GitLab's direct merge endpoint,
+	 * pinned to `approvedHeadSha`. Idempotent — a merge request found already merged
+	 * reports `merged` without attempting anything — and re-reads current state on
+	 * every call, so a durable retry re-checks eligibility rather than trusting stale
+	 * approval context ({@link mergeReadyGitLabMergeRequest}). Never throws: every
+	 * refusal or unexpected failure comes back as a terminal, non-`merged`
+	 * {@link MergePullRequestOutcome}, so a completed, already-submitted Review can't
+	 * be retroactively failed by this call.
+	 */
+	async mergePullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		approvedHeadSha: string,
+	): Promise<MergePullRequestOutcome> {
+		try {
+			return await this.withPersonaCredentials(project, 'implementer', () =>
+				mergeReadyGitLabMergeRequest(project.repo, prNumber, approvedHeadSha),
+			);
+		} catch (error) {
+			// Token resolution runs *outside* the recheck's own try/catch, so an
+			// unconfigured implementer token would otherwise be the one way this
+			// capability throws.
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
 	}
 
-	async operatorDeliveryProvider(): Promise<ScmDeliveryProvider> {
-		notImplementedYet('operatorDeliveryProvider', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.deliveryProvider} — the same-host, per-persona delivery seam.
+	 * The persona's token is resolved once and bound to every operation, so a rotation
+	 * mid-delivery can't leave one write authenticating as somebody else.
+	 *
+	 * `commitIdentity` comes from a single `GET /user`, where Bitbucket needs a second
+	 * call for the address. A token whose scope doesn't expose an email — and a
+	 * project/group access token's bot user, which has none — falls back to
+	 * `<username>@users.noreply.gitlab.com` so delivery still commits. The cost is the
+	 * same as Bitbucket's: GitLab links a commit to an account by matching a
+	 * **verified** account email, so that placeholder keeps the right name but leaves
+	 * the commit unlinked. Use a token whose scope exposes the email for attributed
+	 * commits.
+	 *
+	 * `submitReview` resolves the head to pin the approval to by reading the merge
+	 * request first. The contract's `submitReview` input carries no reviewed head
+	 * (`ScmDeliveryProvider`, `src/scm/delivery.ts`), so this pins the approval to a
+	 * commit the delivery itself observed one request earlier — enough that a push
+	 * landing in that window fails the approve instead of silently approving a
+	 * different commit. Pinning to the head the *Review phase* actually read would
+	 * need that input widened for all three providers, which is a follow-up.
+	 */
+	async deliveryProvider(
+		project: ProjectConfig,
+		persona: ScmPersona,
+	): Promise<ScmDeliveryProvider> {
+		const repo = project.repo;
+		const token = await getGitLabToken(project, persona);
+		const scoped = <T>(fn: () => Promise<T>): Promise<T> => withGitLabToken(token, fn);
+		const user = await scoped(getScopedGitLabUser);
+		if (!user.username) throw new Error(`Could not resolve GitLab identity for ${persona} persona`);
+		const email = user.email ?? `${user.username}@users.noreply.gitlab.com`;
+		return {
+			commitIdentity: { name: user.username, email },
+			findPullRequest: (branch) => scoped(() => findOpenGitLabMergeRequest(repo, branch)),
+			createPullRequest: (input) => scoped(() => createGitLabMergeRequest(repo, input)),
+			pushBranch: async (cwd, branch, expectedSha) => {
+				// The token travels in a git config value, never in argv — an `extraheader`
+				// keeps it out of the process listing and any git error echoing the remote.
+				// The refspec pushes the *exact* commit the caller verified rather than
+				// whatever HEAD happens to be, which is what makes a resumed delivery safe.
+				const authorization = Buffer.from(gitlabGitBasicCredential(token)).toString('base64');
+				await promisify(execFile)(
+					'git',
+					[
+						'push',
+						'--no-verify',
+						`${GITLAB_GIT_ORIGIN}${repo}.git`,
+						`${expectedSha}:refs/heads/${branch}`,
+					],
+					{
+						cwd,
+						env: {
+							...process.env,
+							GIT_CONFIG_COUNT: '1',
+							GIT_CONFIG_KEY_0: `http.${GITLAB_GIT_ORIGIN}.extraheader`,
+							GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${authorization}`,
+						},
+					},
+				);
+			},
+			submitReview: (input) =>
+				scoped(async () =>
+					submitGitLabReview(repo, {
+						iid: input.prNumber,
+						verdict: input.verdict,
+						body: input.body,
+						deliveryId: input.deliveryId,
+						headSha: (await getGitLabMergeRequestMergeState(repo, input.prNumber)).headSha,
+					}),
+				),
+			postComment: (input) =>
+				scoped(() =>
+					postIdempotentGitLabMergeRequestNote(repo, {
+						iid: input.prNumber,
+						body: input.body,
+						deliveryId: input.deliveryId,
+					}),
+				),
+		};
 	}
 
-	async mergePullRequest(): Promise<MergePullRequestOutcome> {
-		notImplementedYet('mergePullRequest', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.operatorDeliveryProvider} — operator-credential delivery for
+	 * DB-free workers. The worker supplies its own token, so no project secret-store
+	 * lookup is involved.
+	 */
+	async operatorDeliveryProvider(repo: string, credential: string): Promise<ScmDeliveryProvider> {
+		return createGitLabOperatorDeliveryProvider(repo, credential);
 	}
 }
