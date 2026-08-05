@@ -44,14 +44,15 @@ export const WORKER_SAFE_KEYS = [
  * Fields that never leave the control plane: the secret-bearing `credentials`
  * block (persona token references + webhook secret — the hard exclusion the
  * acceptance criteria require), plus control-plane-only policy and
- * provider-specific IDs (PM discriminator, board/field IDs, pipeline board-move
- * policy, visibility, and the scheduler concurrency knob) that a remote worker
- * cannot act on and does not need.
+ * provider-specific IDs (pipeline board-move policy, visibility, the scheduler
+ * concurrency knob, and `pm` — which since issue #495 is the provider
+ * discriminator *and* its board/field IDs in one union, so excluding the block
+ * excludes the mapping with it) that a remote worker cannot act on and does not
+ * need.
  */
 export const SERVER_ONLY_KEYS = [
 	'credentials',
 	'pm',
-	'githubProjects',
 	'pipeline',
 	'visibility',
 	'maxConcurrentJobs',

@@ -52,8 +52,9 @@ export interface PMRouterAdapter {
 	 * edit (priority, size, assignees, …) is dropped here.
 	 *
 	 * The provider compares {@link PmEvent.changedField} against its own board
-	 * mapping; shared code never reads a provider's config
-	 * (`project.githubProjects.statusFieldId` and friends stay inside the adapter).
+	 * mapping; shared code never reads a provider's config (a GitHub Projects
+	 * `statusFieldId` and friends stay inside the adapter, narrowed out of
+	 * `project.pm` by the provider itself).
 	 *
 	 * It deliberately does **not** assert *which* state the item moved to: this
 	 * gate answers "is this worth waking the pipeline for?", not "which phase?".

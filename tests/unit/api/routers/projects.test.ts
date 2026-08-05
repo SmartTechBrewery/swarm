@@ -29,7 +29,7 @@ vi.mock('@/identity/membership-service.js', () => ({
 	listAccessibleProjectIds: vi.fn(),
 }));
 
-import { DEFAULT_GITHUB_PROJECTS_CONFIG, projectsRouter } from '@/api/routers/projects.js';
+import { DEFAULT_PM_CONFIG, projectsRouter } from '@/api/routers/projects.js';
 import {
 	approveMembershipRequestInDb,
 	createMembershipRequest,
@@ -185,7 +185,6 @@ describe('projectsRouter', () => {
 			worktreeRoot: '.swarm-workspaces',
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
-			pm: { type: 'github-projects' as const },
 		};
 
 		const defaultCredentials = {
@@ -202,7 +201,7 @@ describe('projectsRouter', () => {
 				...validProjectInput,
 				maxConcurrentJobs: 1,
 				visibility: 'private',
-				githubProjects: DEFAULT_GITHUB_PROJECTS_CONFIG,
+				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
 
@@ -233,8 +232,7 @@ describe('projectsRouter', () => {
 				branchPrefix: 'issue-',
 				maxConcurrentJobs: 1,
 				visibility: 'private',
-				pm: { type: 'github-projects' as const },
-				githubProjects: DEFAULT_GITHUB_PROJECTS_CONFIG,
+				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
 
@@ -265,7 +263,7 @@ describe('projectsRouter', () => {
 				...validProjectInput,
 				maxConcurrentJobs: 1,
 				visibility: 'private',
-				githubProjects: DEFAULT_GITHUB_PROJECTS_CONFIG,
+				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
 
@@ -277,26 +275,28 @@ describe('projectsRouter', () => {
 			});
 		});
 
-		it('strips client-supplied githubProjects and uses the placeholder default', async () => {
+		it('strips a client-supplied pm block and uses the placeholder default', async () => {
 			vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
 
-			// Cast as any to simulate client sending custom githubProjects
-			const inputWithGithubProjects = {
+			// Cast to simulate a client sending its own board mapping — since issue #495
+			// that arrives inside `pm`, which `create` omits from its input entirely.
+			const inputWithPm = {
 				...validProjectInput,
-				githubProjects: {
+				pm: {
+					type: 'github-projects',
 					projectId: 'CLIENT_ID',
 					statusFieldId: 'CLIENT_FIELD_ID',
 					statusOptions: { backlog: 'client-backlog' },
 				},
 			} as unknown as Parameters<typeof caller.create>[0];
 
-			const result = await caller.create(inputWithGithubProjects);
+			const result = await caller.create(inputWithPm);
 
 			const expectedConfig = {
 				...validProjectInput,
 				maxConcurrentJobs: 1,
 				visibility: 'private',
-				githubProjects: DEFAULT_GITHUB_PROJECTS_CONFIG,
+				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
 

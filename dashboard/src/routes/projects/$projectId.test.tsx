@@ -86,8 +86,7 @@ function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
 		branchPrefix: 'issue-',
 		maxConcurrentJobs: 1,
 		visibility: 'private',
-		pm: { type: 'github-projects' },
-		githubProjects: {} as ProjectConfig['githubProjects'],
+		pm: { type: 'github-projects' } as ProjectConfig['pm'],
 		credentials: {} as ProjectConfig['credentials'],
 		...overrides,
 	} as ProjectConfig;

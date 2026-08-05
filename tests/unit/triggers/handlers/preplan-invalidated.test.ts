@@ -34,7 +34,7 @@ function preplannedChild(overrides: Partial<WorkItem> = {}): WorkItem {
 		id: 'PVTI_child',
 		url: ITEM_URL,
 		status: 'Planning',
-		statusId: PROJECT.githubProjects.statusOptions.planning,
+		statusId: PROJECT.pm.statusOptions.planning,
 		description: embedPreplanMarker(humanDescription, contract),
 		labels: [{ id: 'split-label', name: SPLIT_CHILD_LABEL }],
 		...overrides,

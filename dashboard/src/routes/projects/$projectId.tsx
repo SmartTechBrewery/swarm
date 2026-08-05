@@ -39,7 +39,7 @@ import {
 } from '@/lib/agent-targets.js';
 import {
 	type BoardMappingForm,
-	buildGithubProjectsUpdate,
+	buildPmUpdate,
 	blankStatusOptions as emptyBoardStatusOptions,
 	isBoardMappingDirty,
 	toBoardMappingForm,
@@ -82,6 +82,7 @@ import type {
 	AgentTarget,
 	PipelineConfig,
 	ProjectConfig,
+	ProjectPm,
 	ReviewChecksPolicy,
 } from '../../../../src/config/schema.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
@@ -91,7 +92,6 @@ import {
 	type ReasoningLevel,
 	reasoningChoicesFor,
 } from '../../../../src/harness/models.js';
-import type { GitHubProjectsIntegrationConfig } from '../../../../src/integrations/pm/github-projects/config-schema.js';
 import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 import { rootRoute } from '../__root.js';
 
@@ -1747,7 +1747,7 @@ export function diffProjectForSync(
 			next.maxConcurrentJobs !== prev.maxConcurrentJobs,
 		agents: JSON.stringify(next.agents) !== JSON.stringify(prev.agents),
 		pipeline: JSON.stringify(next.pipeline) !== JSON.stringify(prev.pipeline),
-		boardMapping: JSON.stringify(next.githubProjects) !== JSON.stringify(prev.githubProjects),
+		boardMapping: JSON.stringify(next.pm) !== JSON.stringify(prev.pm),
 	};
 }
 
@@ -1855,7 +1855,7 @@ function ProjectDetailRouteComponent() {
 			}
 
 			if (changed.boardMapping) {
-				setBoardMapping(toBoardMappingForm(project.githubProjects, project.pm.type));
+				setBoardMapping(toBoardMappingForm(project.pm));
 			}
 
 			lastSyncedProjectRef.current = project;
@@ -1874,7 +1874,7 @@ function ProjectDetailRouteComponent() {
 			maxConcurrentJobs?: number;
 			agents?: AgentsConfig;
 			pipeline?: PipelineConfig;
-			githubProjects?: GitHubProjectsIntegrationConfig;
+			pm?: ProjectPm;
 		}) => trpcClient.projects.update.mutate(variables),
 		onSuccess: () => {
 			queryClient.invalidateQueries({
@@ -1956,7 +1956,7 @@ function ProjectDetailRouteComponent() {
 	);
 
 	const isBoardMappingFormDirty = useMemo(
-		() => isBoardMappingDirty(boardMapping, project?.githubProjects),
+		() => isBoardMappingDirty(boardMapping, project?.pm),
 		[boardMapping, project],
 	);
 
@@ -2089,7 +2089,7 @@ function ProjectDetailRouteComponent() {
 	};
 
 	const handleBoardMappingReset = () => {
-		setBoardMapping(toBoardMappingForm(project?.githubProjects, project?.pm.type));
+		setBoardMapping(toBoardMappingForm(project?.pm));
 		updateMutation.reset();
 	};
 
@@ -2098,7 +2098,7 @@ function ProjectDetailRouteComponent() {
 		if (configWriteInFlight) return;
 		updateMutation.mutate({
 			id: projectId,
-			githubProjects: buildGithubProjectsUpdate(boardMapping, project?.githubProjects),
+			pm: buildPmUpdate(boardMapping, project?.pm),
 		});
 	};
 

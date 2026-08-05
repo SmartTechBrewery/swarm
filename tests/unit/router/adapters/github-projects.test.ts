@@ -187,7 +187,7 @@ describe('GitHubProjectsRouterAdapter', () => {
 			const event = adapter.synthesizeStateChange(project, 'PVTI_next');
 			expect(event).toEqual({
 				itemId: 'PVTI_next',
-				containerId: project.githubProjects.projectId,
+				containerId: project.pm.projectId,
 				action: 'updated',
 				changedField: STATUS_FIELD_ID,
 				changedFieldType: 'single_select',

@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { githubProjectsConfigSchema } from '@/integrations/pm/github-projects/config-schema.js';
-import { createMockGitHubProjectsConfig } from '../../../../helpers/factories.js';
+import type { ProjectPm } from '@/config/schema.js';
+import {
+	githubProjectsConfigSchema,
+	requireGitHubProjectsConfig,
+} from '@/integrations/pm/github-projects/config-schema.js';
+import {
+	createMockGitHubProjectsConfig,
+	createMockProjectConfig,
+} from '../../../../helpers/factories.js';
 
 describe('githubProjectsConfigSchema', () => {
 	it('accepts a valid board mapping', () => {
@@ -71,5 +78,31 @@ describe('githubProjectsConfigSchema', () => {
 				statusOptions: { backlog: 'opt-1' },
 			}),
 		).toThrow();
+	});
+});
+
+describe('requireGitHubProjectsConfig', () => {
+	it('narrows the project pm union member to this provider board mapping', () => {
+		const project = createMockProjectConfig();
+
+		const config = requireGitHubProjectsConfig(project);
+
+		// The provider's own config, with the union discriminator left behind.
+		expect(config).toEqual(createMockGitHubProjectsConfig());
+		expect(config).not.toHaveProperty('type');
+		// And it validates as the provider's own schema — the narrowing loses nothing.
+		expect(githubProjectsConfigSchema.parse(config)).toEqual(config);
+	});
+
+	it('throws when the project is configured for another PM provider', () => {
+		// Assembled around the schema, not through it: `ProjectPm` has one member today,
+		// so the only way to reach this guard is a call site naming this provider for a
+		// board it does not own — a wiring bug, which is what the throw reports.
+		const project = {
+			...createMockProjectConfig(),
+			pm: { type: 'jira', projectId: 'PROJ' } as unknown as ProjectPm,
+		};
+
+		expect(() => requireGitHubProjectsConfig(project)).toThrow(/'jira'/);
 	});
 });

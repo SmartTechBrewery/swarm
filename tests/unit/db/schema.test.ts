@@ -30,7 +30,7 @@ describe('db schema', () => {
 				'base_branch',
 				'branch_prefix',
 				'pm_type',
-				'github_projects',
+				'pm_config',
 				'credentials',
 			]) {
 				expect(columns.has(name), `missing column ${name}`).toBe(true);
@@ -41,10 +41,10 @@ describe('db schema', () => {
 			expect(columns.has('org_id')).toBe(false);
 		});
 
-		it('stores structured config (github_projects, credentials) as jsonb', () => {
-			expect(columns.get('github_projects')?.getSQLType()).toBe('jsonb');
+		it('stores structured config (pm_config, credentials) as jsonb', () => {
+			expect(columns.get('pm_config')?.getSQLType()).toBe('jsonb');
 			expect(columns.get('credentials')?.getSQLType()).toBe('jsonb');
-			expect(columns.get('github_projects')?.notNull).toBe(true);
+			expect(columns.get('pm_config')?.notNull).toBe(true);
 			expect(columns.get('credentials')?.notNull).toBe(true);
 		});
 

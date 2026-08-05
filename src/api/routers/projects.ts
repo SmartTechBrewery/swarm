@@ -6,6 +6,7 @@ import {
 	type PipelineConfig,
 	PipelineConfigSchema,
 	ProjectConfigSchema,
+	type ProjectPm,
 } from '../../config/schema.js';
 import {
 	approveMembershipRequestInDb,
@@ -24,12 +25,24 @@ import {
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
 import { getMembership } from '../../identity/membership-service.js';
-import type { GitHubProjectsIntegrationConfig } from '../../integrations/pm/github-projects/config-schema.js';
 import { accessibleProjectScope, assertProjectAccess, filterAccessibleProjects } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { credentialsRouter } from './credentials.js';
 
-export const DEFAULT_GITHUB_PROJECTS_CONFIG: GitHubProjectsIntegrationConfig = {
+/**
+ * The `pm` block a dashboard-created project starts with: SWARM's default PM
+ * provider and an *empty* board mapping placeholder. The operator fills it in on
+ * the Board Mapping tab (issue #201) by picking a discovered board and its states,
+ * so `create` never asks the client for opaque node IDs — and never trusts them
+ * either (see `create` below).
+ *
+ * The blank mapping deliberately does not satisfy `ProjectPmSchema` (a persisted
+ * mapping needs at least one status option): it is a placeholder for a project
+ * that has not been mapped yet, and the board reads that would use it fail loudly
+ * on the unmappable status rather than writing to a wrong board.
+ */
+export const DEFAULT_PM_CONFIG: ProjectPm = {
+	type: 'github-projects',
 	projectId: '',
 	statusFieldId: '',
 	statusOptions: {},
@@ -44,7 +57,9 @@ const DEFAULT_CREDENTIAL_REFERENCES = {
 };
 
 const ProjectWriteInputSchema = ProjectConfigSchema.omit({ credentials: true });
-const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ githubProjects: true });
+// `pm` is omitted from the create input, not accepted from the client: a new
+// project always starts on `DEFAULT_PM_CONFIG`'s placeholder mapping.
+const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true });
 
 function mergePipelineConfig(
 	existing: PipelineConfig | undefined,
@@ -140,7 +155,7 @@ export const projectsRouter = router({
 	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input }) => {
 		const config = {
 			...input,
-			githubProjects: DEFAULT_GITHUB_PROJECTS_CONFIG,
+			pm: DEFAULT_PM_CONFIG,
 			credentials: DEFAULT_CREDENTIAL_REFERENCES,
 		};
 		try {

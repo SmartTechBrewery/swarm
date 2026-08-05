@@ -223,7 +223,7 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(items.map((i) => i.id)).toEqual(['PVTI_x', 'PVTI_y']);
 			expect(graphql).toHaveBeenCalledTimes(1);
 			expect(graphql).toHaveBeenCalledWith(expect.stringContaining('ProjectV2'), {
-				projectId: PROJECT.githubProjects.projectId,
+				projectId: PROJECT.pm.projectId,
 				cursor: undefined,
 			});
 		});
@@ -234,7 +234,7 @@ describe('GitHubProjectsPMProvider', () => {
 			await provider.listWorkItems();
 
 			expect(graphql).toHaveBeenCalledWith(expect.stringContaining('labels(first: 100)'), {
-				projectId: PROJECT.githubProjects.projectId,
+				projectId: PROJECT.pm.projectId,
 				cursor: undefined,
 			});
 		});
@@ -263,11 +263,11 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(items.map((i) => i.id)).toEqual(['PVTI_x', 'PVTI_y']);
 			expect(graphql).toHaveBeenCalledTimes(2);
 			expect(graphql).toHaveBeenNthCalledWith(1, expect.any(String), {
-				projectId: PROJECT.githubProjects.projectId,
+				projectId: PROJECT.pm.projectId,
 				cursor: undefined,
 			});
 			expect(graphql).toHaveBeenNthCalledWith(2, expect.any(String), {
-				projectId: PROJECT.githubProjects.projectId,
+				projectId: PROJECT.pm.projectId,
 				cursor: 'CURSOR_1',
 			});
 		});
@@ -378,9 +378,9 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(graphql).toHaveBeenCalledWith(
 				expect.stringContaining('updateProjectV2ItemFieldValue'),
 				{
-					projectId: PROJECT.githubProjects.projectId,
+					projectId: PROJECT.pm.projectId,
 					itemId: 'PVTI_x',
-					fieldId: PROJECT.githubProjects.statusFieldId,
+					fieldId: PROJECT.pm.statusFieldId,
 					optionId: '47fc9ee4',
 				},
 			);
@@ -506,7 +506,7 @@ describe('GitHubProjectsPMProvider', () => {
 			});
 			// Added to the board...
 			expect(graphql).toHaveBeenNthCalledWith(1, expect.stringContaining('addProjectV2ItemById'), {
-				projectId: PROJECT.githubProjects.projectId,
+				projectId: PROJECT.pm.projectId,
 				contentId: 'I_new',
 			});
 			// ...then placed in Planning (option 61e4505c per the mock config).
@@ -514,9 +514,9 @@ describe('GitHubProjectsPMProvider', () => {
 				2,
 				expect.stringContaining('updateProjectV2ItemFieldValue'),
 				{
-					projectId: PROJECT.githubProjects.projectId,
+					projectId: PROJECT.pm.projectId,
 					itemId: 'PVTI_new',
-					fieldId: PROJECT.githubProjects.statusFieldId,
+					fieldId: PROJECT.pm.statusFieldId,
 					optionId: '61e4505c',
 				},
 			);

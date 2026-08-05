@@ -652,7 +652,8 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 		name: 'swarm',
 		repo: 'SmartTechBrewery/swarm',
 		repoRoot: '/Users/dev/swarm/swarm',
-		githubProjects: createMockGitHubProjectsConfig(),
+		// The board mapping lives under the provider that owns it (issue #495).
+		pm: { type: 'github-projects', ...createMockGitHubProjectsConfig() },
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',

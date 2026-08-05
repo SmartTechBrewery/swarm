@@ -6,11 +6,11 @@ import { useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	blankStatusOptions,
-	buildGithubProjectsUpdate,
+	buildPmUpdate,
 	isBoardMappingDirty,
 	toBoardMappingForm,
 } from '@/lib/board-mapping.js';
-import type { GitHubProjectsIntegrationConfig } from '../../../../src/integrations/pm/github-projects/config-schema.js';
+import type { ProjectPm } from '../../../../src/config/schema.js';
 import { BoardMappingPanel } from './board-mapping-panel.js';
 
 const { listProvidersFn, discoverContainersFn, discoverStatesFn } = vi.hoisted(() => ({
@@ -49,8 +49,8 @@ function Harness({
 	initial,
 	onSubmit,
 }: {
-	initial?: GitHubProjectsIntegrationConfig;
-	onSubmit?: (patch: GitHubProjectsIntegrationConfig) => void;
+	initial?: ProjectPm;
+	onSubmit?: (patch: ProjectPm) => void;
 }) {
 	const [form, setForm] = useState(() => toBoardMappingForm(initial));
 	return (
@@ -71,7 +71,7 @@ function Harness({
 			onStatesContext={(context) => setForm((f) => ({ ...f, providerContext: context }))}
 			handleSubmit={(e) => {
 				e.preventDefault();
-				onSubmit?.(buildGithubProjectsUpdate(form, initial));
+				onSubmit?.(buildPmUpdate(form, initial));
 			}}
 			handleReset={() => setForm(toBoardMappingForm(initial))}
 			isDirty={isBoardMappingDirty(form, initial)}
@@ -95,7 +95,8 @@ const PROVIDERS = [
 	{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
 ];
 
-const CONFIG: GitHubProjectsIntegrationConfig = {
+const CONFIG: ProjectPm = {
+	type: 'github-projects',
 	projectId: 'PVT_saved',
 	statusFieldId: 'PVTSSF_saved',
 	statusOptions: { todo: 'opt_ready' },

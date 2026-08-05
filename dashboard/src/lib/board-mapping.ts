@@ -1,4 +1,4 @@
-import type { GitHubProjectsIntegrationConfig } from '../../../src/integrations/pm/github-projects/config-schema.js';
+import type { ProjectPm } from '../../../src/config/schema.js';
 import { PM_STATUS_KEYS, type PmStatusKey } from '../../../src/pm/pipeline.js';
 
 /**
@@ -8,9 +8,8 @@ import { PM_STATUS_KEYS, type PmStatusKey } from '../../../src/pm/pipeline.js';
  * and container (board), one discovered-state ID per canonical pipeline status,
  * and an opaque `providerContext` the provider threads through save time
  * (GitHub Projects stores the discovered Status *field* ID there). It is
- * projected to/from the provider's persisted {@link GitHubProjectsIntegrationConfig}
- * by the adapter helpers below rather than the component reaching into config
- * internals.
+ * projected to/from the project's persisted {@link ProjectPm} member by the
+ * adapter helpers below rather than the component reaching into config internals.
  */
 export interface BoardMappingForm {
 	/** Selected PM provider id — the project's `pm.type` (only `github-projects` today). */
@@ -91,27 +90,32 @@ export function blankStatusOptions(): Record<PmStatusKey, string> {
 }
 
 /**
- * Project the stored `githubProjects` config onto the provider-neutral form,
+ * Project the project's stored `pm` member onto the provider-neutral form,
  * filling a blank for any status key the board hasn't mapped so every selector
- * is controlled. `statusOptions` is an open record on the config (a board may
- * carry non-canonical keys); only the canonical keys are surfaced here. The
- * stored Status field id is carried in `providerContext` so a saved mapping
- * survives a round-trip even when discovery can't currently reach the board.
+ * is controlled. The selected provider comes from the member's own `type`
+ * discriminator (issue #495) — the mapping and the provider it belongs to are one
+ * value now, so the form no longer takes them as two arguments.
+ *
+ * `statusOptions` is an open record on the config (a board may carry
+ * non-canonical keys); only the canonical keys are surfaced here. The stored
+ * Status field id is carried in `providerContext` so a saved mapping survives a
+ * round-trip even when discovery can't currently reach the board.
+ *
+ * Reading the GitHub-Projects fields directly is sound while `ProjectPm` has one
+ * member: a second provider maps its own container/state ids to this same neutral
+ * form here, alongside its dashboard mapping.
  */
-export function toBoardMappingForm(
-	config: GitHubProjectsIntegrationConfig | undefined,
-	providerId: string = DEFAULT_PM_PROVIDER_ID,
-): BoardMappingForm {
+export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm {
 	const statusOptions = blankStatusOptions();
 	for (const key of STATUS_KEYS) {
-		const value = config?.statusOptions?.[key];
+		const value = pm?.statusOptions?.[key];
 		if (value) statusOptions[key] = value;
 	}
 	return {
-		providerId: providerId || DEFAULT_PM_PROVIDER_ID,
-		containerId: config?.projectId ?? '',
+		providerId: pm?.type ?? DEFAULT_PM_PROVIDER_ID,
+		containerId: pm?.projectId ?? '',
 		statusOptions,
-		providerContext: config?.statusFieldId ? { statusFieldId: config.statusFieldId } : {},
+		providerContext: pm?.statusFieldId ? { statusFieldId: pm.statusFieldId } : {},
 	};
 }
 
@@ -128,15 +132,18 @@ export function cleanStatusOptions(
 }
 
 /**
- * Build the `githubProjects` payload for `projects.update` from the form state,
- * preserving any `phaseLabels` already on the stored config — the mapping screen
- * doesn't edit those, so they must survive a save unchanged.
+ * Build the `pm` payload for `projects.update` from the form state, preserving any
+ * `phaseLabels` already on the stored config — the mapping screen doesn't edit
+ * those, so they must survive a save unchanged.
+ *
+ * The payload is a whole `pm` union member, discriminator included: the mapping is
+ * only meaningful under the provider it maps (issue #495). The member built here
+ * is GitHub Projects' — the same one-member note on {@link toBoardMappingForm}
+ * applies, and a second provider builds its own from the neutral form.
  */
-export function buildGithubProjectsUpdate(
-	form: BoardMappingForm,
-	existing: GitHubProjectsIntegrationConfig | undefined,
-): GitHubProjectsIntegrationConfig {
+export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | undefined): ProjectPm {
 	return {
+		type: 'github-projects',
 		projectId: form.containerId.trim(),
 		statusFieldId: (form.providerContext.statusFieldId ?? '').trim(),
 		statusOptions: cleanStatusOptions(form.statusOptions),
@@ -150,11 +157,8 @@ export function buildGithubProjectsUpdate(
  * mapped status). The provider selector is excluded — GitHub Projects is the
  * only selectable provider and it isn't persisted independently of the mapping.
  */
-export function isBoardMappingDirty(
-	form: BoardMappingForm,
-	config: GitHubProjectsIntegrationConfig | undefined,
-): boolean {
-	const stored = toBoardMappingForm(config, form.providerId);
+export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | undefined): boolean {
+	const stored = toBoardMappingForm(pm);
 	if (form.containerId.trim() !== stored.containerId) return true;
 	if (
 		(form.providerContext.statusFieldId ?? '').trim() !==

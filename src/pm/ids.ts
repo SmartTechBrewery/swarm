@@ -12,7 +12,7 @@
  * Usage:
  *
  *   // At the boundary (config load, webhook payload, DB row), parse once:
- *   const fieldId = parseFieldId(config.githubProjects.statusFieldId);
+ *   const fieldId = parseFieldId(boardMapping.statusFieldId);
  *
  *   // Internally, everything accepts only the branded ID:
  *   setStatus(itemId, fieldId, optionId);   // compiles

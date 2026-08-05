@@ -8,6 +8,7 @@ import {
 	createProjectInDb,
 	createProjectWithMemberInDb,
 	deleteProjectFromDb,
+	findProjectByBoardFromDb,
 	findProjectByIdFromDb,
 	getProjectByIdFromDb,
 	listAllProjectsFromDb,
@@ -55,6 +56,32 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 			const resolved = await findProjectByIdFromDb('proj-review-checks');
 			expect(resolved?.pipeline?.review?.checks).toBe('if-present');
 			expect(resolved?.pipeline?.planning?.autoAdvance).toBe(true);
+		});
+
+		// The board mapping now lives under `pm`, persisted as `pm_type` + the renamed
+		// `pm_config` jsonb column (issue #495). Assert the union member survives a real
+		// Postgres round-trip, and that the board lookup still matches inside the blob —
+		// that jsonb predicate is how every board webhook finds its project.
+		it('round-trips the pm union member and resolves the project by its board node id', async () => {
+			const config = createMockProjectConfig({
+				id: 'proj-pm-config',
+				name: 'PM Config Project',
+				repo: 'jkwiecien/pm-config',
+				pm: {
+					type: 'github-projects',
+					projectId: 'PVT_kwDOpersisted',
+					statusFieldId: 'PVTSSF_persisted',
+					statusOptions: { backlog: 'opt-backlog', todo: 'opt-ready' },
+					phaseLabels: { 'phase-6': 'phase-6' },
+				},
+			});
+			await createProjectInDb(config);
+
+			expect((await findProjectByIdFromDb('proj-pm-config'))?.pm).toEqual(config.pm);
+
+			const byBoard = await findProjectByBoardFromDb('PVT_kwDOpersisted');
+			expect(byBoard?.id).toBe('proj-pm-config');
+			expect(await findProjectByBoardFromDb('PVT_untracked')).toBeUndefined();
 		});
 
 		it('rejects if the project ID already exists', async () => {
