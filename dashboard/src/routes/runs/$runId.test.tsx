@@ -40,6 +40,7 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 
 import { trpcClient } from '@/lib/trpc.js';
 import {
+	CheckpointedCallout,
 	CheckpointPanel,
 	FailureDiagnosisCallout,
 	ForceReReviewButton,
@@ -400,10 +401,14 @@ describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 	it('explains it waits on a continuation rather than on quota', () => {
 		renderHeader();
 
-		expect(
-			screen.getByRole('heading', { name: /checkpointed — continuation scheduled/i }),
-		).toBeDefined();
-		expect(screen.getByText(/not waiting on quota/i)).toBeDefined();
+		const heading = screen.getByRole('heading', { name: /checkpointed — continuation scheduled/i });
+		expect(heading.classList.contains('text-sky-200')).toBe(true);
+		expect(screen.getByText(/not waiting on quota/i).classList.contains('text-sky-200/70')).toBe(
+			true,
+		);
+		const callout = heading.parentElement?.parentElement;
+		expect(callout?.classList.contains('bg-sky-950/20')).toBe(true);
+		expect(callout?.classList.contains('border-sky-900/30')).toBe(true);
 		// The badge next to the title states the same status.
 		expect(screen.getByText('Checkpointed')).toBeDefined();
 		// Never the amber deferred callout, which would claim a scheduled *retry*.
@@ -453,6 +458,19 @@ describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 		renderHeader();
 		expect(screen.getByRole('heading', { name: /checkpoint hand-off/i })).toBeDefined();
 		expect(screen.getByText('Update the configuration table.')).toBeDefined();
+	});
+
+	it('is directly renderable as its own checkpoint-specific component', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<CheckpointedCallout run={makeCheckpointedRun()} onResetSuccess={vi.fn()} />
+			</QueryClientProvider>,
+		);
+
+		expect(
+			screen.getByRole('heading', { name: /checkpointed — continuation scheduled/i }),
+		).toBeDefined();
 	});
 });
 

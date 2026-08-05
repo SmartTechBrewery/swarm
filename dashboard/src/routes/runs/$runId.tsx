@@ -894,21 +894,27 @@ function CheckpointList({
 	if (items.length === 0) return null;
 
 	const itemClass = mono ? 'font-mono break-all' : '';
+	const occurrences = new Map<string, number>();
+	const keyedItems = items.map((item) => {
+		const occurrence = occurrences.get(item) ?? 0;
+		occurrences.set(item, occurrence + 1);
+		return { item, key: `${item}-${occurrence}` };
+	});
 	return (
 		<div>
 			<span className="block text-xs font-medium text-zinc-400">{label}</span>
 			{ordered ? (
 				<ol className="mt-1.5 space-y-1 list-decimal list-inside text-xs text-zinc-300">
-					{items.map((item) => (
-						<li key={item} className={itemClass}>
+					{keyedItems.map(({ item, key }) => (
+						<li key={key} className={itemClass}>
 							{item}
 						</li>
 					))}
 				</ol>
 			) : (
 				<ul className="mt-1.5 space-y-1 list-disc list-inside text-xs text-zinc-400">
-					{items.map((item) => (
-						<li key={item} className={itemClass}>
+					{keyedItems.map(({ item, key }) => (
+						<li key={key} className={itemClass}>
 							{item}
 						</li>
 					))}
@@ -968,6 +974,50 @@ export function CheckpointPanel({ run }: { run: RunRow }) {
 						<CheckpointList label="Added" items={added} mono />
 						<CheckpointList label="Deleted" items={deleted} mono />
 					</div>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+interface CheckpointedCalloutProps {
+	run: RunRow;
+	onResetSuccess: (report: ResetRunReport) => void;
+}
+
+/** Status-specific recovery controls for a run awaiting a checkpoint continuation. */
+export function CheckpointedCallout({ run, onResetSuccess }: CheckpointedCalloutProps) {
+	return (
+		<div className="p-4 bg-sky-950/20 border border-sky-900/30 rounded flex items-start gap-3">
+			<PauseCircle className="h-5 w-5 text-sky-400 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-sky-200">
+					Checkpointed — continuation scheduled
+				</h3>
+				<p className="text-xs text-sky-200/70 mt-1">
+					This run stopped before finishing and left a checkpoint. Its checkout is preserved, and a
+					continuation will start a fresh agent session from the remaining work recorded below. It
+					is not waiting on quota.
+				</p>
+				{run.error && (
+					<p className="text-xs text-sky-200/70 mt-2 font-mono whitespace-pre-wrap">
+						{normalizeRunError(run.error)}
+					</p>
+				)}
+				{run.nextRetryAt && (
+					<>
+						<p className="text-xs text-sky-200/70 mt-2 font-mono">
+							{new Date(run.nextRetryAt).toLocaleString()} ({formatTimeUntil(run.nextRetryAt)})
+						</p>
+						<p className="text-xs text-sky-200/70 mt-1 font-mono">
+							UTC: {new Date(run.nextRetryAt).toISOString()}
+						</p>
+					</>
+				)}
+				<div className="flex flex-wrap items-start gap-3">
+					{canRetryRun(run.status) && <RetryNowButton run={run} />}
+					{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
+					{canResetRun(run.status) && <ResetRunButton run={run} onResetSuccess={onResetSuccess} />}
 				</div>
 			</div>
 		</div>
@@ -1236,49 +1286,8 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				</div>
 			)}
 
-			{/* The other retry-pending status (issue #503) — deliberately its own callout
-			    rather than a branch of the amber deferred one above, because what it is
-			    waiting on is different: a continuation from its recorded checkpoint, not
-			    a quota window. Sky matches its badge; the actions are the same three the
-			    deferred callout offers, all server-guarded (`retryNow`'s
-			    checkpointed-status branch, `terminate`'s `isRetryPendingStatus`, and
-			    `resetRun`, which refuses only a `running` row). */}
 			{run.status === 'checkpointed' && (
-				<div className="p-4 bg-sky-950/20 border border-sky-900/30 rounded flex items-start gap-3">
-					<PauseCircle className="h-5 w-5 text-sky-400 shrink-0 mt-0.5" />
-					<div>
-						<h3 className="text-xs font-semibold text-sky-200">
-							Checkpointed — continuation scheduled
-						</h3>
-						<p className="text-xs text-sky-200/70 mt-1">
-							This run stopped before finishing and left a checkpoint. Its checkout is preserved,
-							and a continuation will start a fresh agent session from the remaining work recorded
-							below. It is not waiting on quota.
-						</p>
-						{run.error && (
-							<p className="text-xs text-sky-200/70 mt-2 font-mono whitespace-pre-wrap">
-								{normalizeRunError(run.error)}
-							</p>
-						)}
-						{run.nextRetryAt && (
-							<>
-								<p className="text-xs text-sky-200/70 mt-2 font-mono">
-									{new Date(run.nextRetryAt).toLocaleString()} ({formatTimeUntil(run.nextRetryAt)})
-								</p>
-								<p className="text-xs text-sky-200/70 mt-1 font-mono">
-									UTC: {new Date(run.nextRetryAt).toISOString()}
-								</p>
-							</>
-						)}
-						<div className="flex flex-wrap items-start gap-3">
-							{canRetryRun(run.status) && <RetryNowButton run={run} />}
-							{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
-							{canResetRun(run.status) && (
-								<ResetRunButton run={run} onResetSuccess={setResetReport} />
-							)}
-						</div>
-					</div>
-				</div>
+				<CheckpointedCallout run={run} onResetSuccess={setResetReport} />
 			)}
 
 			{run.status === 'failed' && <FailureDiagnosisCallout diagnosis={run.failureDiagnosis} />}
