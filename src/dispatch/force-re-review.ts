@@ -39,10 +39,33 @@
  * all resolve to one corrective cycle, and a second call reports what it found
  * rather than duplicating it or erroring.
  *
+ * **A dead prior attempt is not "already recorded".** The dedup key above is
+ * deterministic *and permanent* — nothing ever changes a `dispatches` row's
+ * `dedup_key` once written, and the unique index that backs it is not
+ * partial-by-state. That is exactly right while the prior attempt is still
+ * in flight or actually succeeded (a real Respond-to-review run started), but
+ * it is wrong for every other terminal outcome: `no-trigger` (the one
+ * surfaced live — a stale worker process still running pre-#511 code
+ * evaluated the synthetic event before it understood `forcedReReview` and
+ * refused it for having no reviewer-persona author), `skipped-not-eligible`,
+ * `skipped-duplicate`, `superseded`, or a hard `failed`/`cancelled` dispatch
+ * state. None of those produced a corrective run, yet the dedup key is
+ * already spent — every future click for that PR/head would find the same
+ * dead row forever and report it as "already completed" without ever
+ * scheduling real work again. {@link isDeadDispatch} names that condition, and
+ * {@link publishForcedDispatch} chains a fresh dedup key off a dead row's own
+ * id — deterministically, so concurrent retries still collide with each other
+ * — instead of accepting its dead outcome as the last word.
+ *
  * Like `run-reset.ts`, this module knows nothing about tRPC: the API router is a
  * thin surface over it.
  */
 
+import type { ProjectConfig } from '../config/schema.js';
+import {
+	ACTIVE_DISPATCH_STATES,
+	type DispatchRow,
+} from '../db/repositories/dispatchesRepository.js';
 import { getProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	getSubmittedReviewSlot,
@@ -84,13 +107,24 @@ export interface ForceReReviewResult {
 	headSha: string;
 	/** Whether this call granted the extra review slot or found one already granted. */
 	capOverride: 'granted' | 'already-granted';
-	/** Whether this call enqueued the corrective run, found it active, or found it complete. */
-	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed';
+	/**
+	 * Whether this call enqueued the corrective run, found it active, found it
+	 * genuinely complete, or — {@link isDeadDispatch} — found a prior attempt
+	 * that resolved to a dead terminal outcome and scheduled a fresh one in its
+	 * place ('retried').
+	 */
+	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed' | 'retried';
 	dispatchId: string;
 	/** The durable dispatch state, including an existing terminal state on a repeated force. */
 	dispatchState?: string;
 	/** The completed dispatch's outcome, when the worker recorded one. */
 	dispatchOutcome?: string | null;
+	/**
+	 * Set only when `dispatch === 'retried'`: the dead prior attempt's own
+	 * outcome, so the caller can explain *why* a fresh dispatch was needed
+	 * instead of just reporting the new one as if it were the first.
+	 */
+	previousAttemptOutcome?: string | null;
 }
 
 /**
@@ -120,6 +154,103 @@ function reviewCoordinates(run: {
 		);
 	}
 	return { prNumber, headSha, prBranch };
+}
+
+/**
+ * Bounds {@link publishForcedDispatch}'s chain walk. Reached only if several
+ * forced attempts in a row all resolved dead before this call started — a
+ * persistently broken corrective path, not a single stale-worker miss — so the
+ * function throws past this rather than inventing a plausible-looking result.
+ */
+const MAX_DISPATCH_CHAIN_ATTEMPTS = 5;
+
+/**
+ * Whether a dispatch's outcome means the corrective cycle it was meant to run
+ * never actually happened (see the module header). A non-terminal dispatch is
+ * never dead — it may yet succeed, and forcing past one still in flight would
+ * race the attempt already running. A `completed` dispatch is dead unless its
+ * outcome is `phase-succeeded`: every other completion (`no-trigger`,
+ * `skipped-not-eligible`, `skipped-duplicate`, `superseded`) means the trigger
+ * refused the event or the worker decided against a run, not that Respond-to-review
+ * actually started.
+ *
+ * `DispatchOutcome` also names merge-automation-only completions (`merged`,
+ * `merge-not-eligible`, …), which this would likewise call dead. That's outside
+ * what a Respond-to-review dispatch can ever actually record — this module
+ * always creates one with `phase: 'respond-to-review'`, never `merge-automation`
+ * — so it's a harmless breadth mismatch, not a bug: the check is scoped to
+ * "is this a real outcome", and no code path here ever produces a merge one.
+ */
+function isDeadDispatch(dispatch: Pick<DispatchRow, 'state' | 'outcome'>): boolean {
+	if (ACTIVE_DISPATCH_STATES.includes(dispatch.state as (typeof ACTIVE_DISPATCH_STATES)[number])) {
+		return false;
+	}
+	if (dispatch.state === 'completed') return dispatch.outcome !== 'phase-succeeded';
+	// 'cancelled' or 'failed'.
+	return true;
+}
+
+/**
+ * Publish the forced Respond-to-review dispatch under its deterministic
+ * (repo, PR, reviewed head) dedup key, or — when that key already names a dead
+ * dispatch (issue #511 follow-up; see the module header) — chain a fresh key
+ * off the dead row's own id and retry. Each chained key is derived only from
+ * data already durable on the dead row, so two callers who both find the same
+ * dead row (a genuine double-click, not a webhook redelivery) still derive the
+ * same next key and collide with each other rather than each minting their own
+ * corrective attempt.
+ */
+async function publishForcedDispatch(
+	project: ProjectConfig,
+	prNumber: string,
+	headSha: string,
+	event: ScmEvent,
+): Promise<{ dispatch: DispatchRow; created: boolean; deadChain: DispatchRow[] }> {
+	let deliveryId = deliveryIdentity(['force-re-review', project.repo, prNumber, headSha]);
+	// Every dead row this call walked past, oldest first — not just the latest —
+	// so the caller's own log line can name the whole chain, not only its last
+	// hop (a multi-hop chain is already an anomaly worth seeing in full).
+	const deadChain: DispatchRow[] = [];
+	for (let attempt = 0; attempt < MAX_DISPATCH_CHAIN_ATTEMPTS; attempt++) {
+		const { dispatch, created } = await createAndPublishDispatch({
+			projectId: project.id,
+			jobPayload: {
+				type: 'scm',
+				providerId: requireProjectSCMProvider(project).type,
+				projectId: project.id,
+				deliveryId,
+				forcedReReview: true,
+				event,
+			},
+			dedupKey: deliveryDedupKey(deliveryId),
+			source: 'manual',
+			taskId: `${prNumber}-respond`,
+			phase: 'respond-to-review',
+		});
+		if (created || !isDeadDispatch(dispatch)) {
+			return { dispatch, created, deadChain };
+		}
+		logger.warn('force re-review: prior forced dispatch resolved dead — chaining a fresh attempt', {
+			projectId: project.id,
+			prNumber,
+			headSha,
+			deadDispatchId: dispatch.id,
+			deadDispatchState: dispatch.state,
+			deadDispatchOutcome: dispatch.outcome,
+			attempt,
+		});
+		deadChain.push(dispatch);
+		deliveryId = deliveryIdentity([
+			'force-re-review',
+			project.repo,
+			prNumber,
+			headSha,
+			dispatch.id,
+		]);
+	}
+	throw new Error(
+		`force re-review: exhausted ${MAX_DISPATCH_CHAIN_ATTEMPTS} chained dispatch attempts for PR #${prNumber} at ${headSha} without reaching a live or successful one — the corrective path is persistently broken (check the worker), not a single stale miss`,
+	);
 }
 
 /**
@@ -208,22 +339,16 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		headSha,
 		prBranch,
 	};
-	const deliveryId = deliveryIdentity(['force-re-review', project.repo, prNumber, headSha]);
-	const { dispatch, created } = await createAndPublishDispatch({
-		projectId: project.id,
-		jobPayload: {
-			type: 'scm',
-			providerId: requireProjectSCMProvider(project).type,
-			projectId: project.id,
-			deliveryId,
-			forcedReReview: true,
-			event,
-		},
-		dedupKey: deliveryDedupKey(deliveryId),
-		source: 'manual',
-		taskId: `${prNumber}-respond`,
-		phase: 'respond-to-review',
-	});
+	const { dispatch, created, deadChain } = await publishForcedDispatch(
+		project,
+		prNumber,
+		headSha,
+		event,
+	);
+	// The chain's last hop — the dead dispatch this call's fresh attempt directly
+	// replaces — vs. the full chain, which the warn logs above already carried
+	// one hop at a time.
+	const deadPriorAttempt = deadChain.at(-1);
 
 	logger.info('force re-review scheduled', {
 		runId: run.id,
@@ -234,6 +359,8 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		capOverride,
 		dispatchId: dispatch.id,
 		created,
+		chainedPastDeadDispatchId: deadPriorAttempt?.id,
+		deadDispatchChain: deadChain.map((d) => d.id),
 	});
 
 	return {
@@ -241,13 +368,16 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		prNumber,
 		headSha,
 		capOverride,
-		dispatch: created
-			? 'scheduled'
-			: dispatch.state === 'completed'
-				? 'already-completed'
-				: 'already-scheduled',
+		dispatch: deadPriorAttempt
+			? 'retried'
+			: created
+				? 'scheduled'
+				: dispatch.state === 'completed'
+					? 'already-completed'
+					: 'already-scheduled',
 		dispatchId: dispatch.id,
 		dispatchState: dispatch.state,
 		dispatchOutcome: dispatch.outcome,
+		previousAttemptOutcome: deadPriorAttempt?.outcome,
 	};
 }

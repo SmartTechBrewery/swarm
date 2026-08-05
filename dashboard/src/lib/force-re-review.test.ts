@@ -83,15 +83,30 @@ describe('describeForceReReviewResult', () => {
 		expect(lines[1]).toMatch(/nothing duplicated/i);
 	});
 
-	it('does not promise a new review after a completed forced dispatch', () => {
+	it('points at the follow-up review after a genuinely completed forced dispatch', () => {
 		const lines = describeForceReReviewResult(
 			report({
 				capOverride: 'already-granted',
 				dispatch: 'already-completed',
-				dispatchOutcome: 'no-trigger',
+				dispatchOutcome: 'phase-succeeded',
 			}),
 		);
-		expect(lines[1]).toMatch(/already completed.*no-trigger/i);
-		expect(lines[2]).toMatch(/no new review was scheduled/i);
+		expect(lines[1]).toMatch(/already completed.*phase-succeeded/i);
+		expect(lines[2]).toMatch(/already ran/i);
+	});
+
+	it('reports a fresh attempt when the previous forced dispatch never started one', () => {
+		const lines = describeForceReReviewResult(
+			report({
+				capOverride: 'already-granted',
+				dispatch: 'retried',
+				dispatchId: 'dispatch-10',
+				previousAttemptOutcome: 'no-trigger',
+			}),
+		);
+		expect(lines[1]).toMatch(/never actually started one/i);
+		expect(lines[1]).toMatch(/no-trigger/);
+		expect(lines[1]).toMatch(/dispatch-10/);
+		expect(lines[2]).toMatch(/runs automatically once the response pushes/i);
 	});
 });
