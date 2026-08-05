@@ -1691,6 +1691,18 @@ async function loadGlobalDefaults(): Promise<AgentDefaults | undefined> {
 	}
 }
 
+/**
+ * The `agent_session_id` column a run reset writes. A resume leaves the stored
+ * id untouched (`undefined`) — it is the very id being resumed. An attempt that
+ * *assigns* instead records the id it is about to hand the CLI, mirroring
+ * `createRun`'s `agentSessionId: id` for a first attempt, so a retry that dies
+ * before it can finalize still leaves a recoverable session behind rather than a
+ * null column.
+ */
+function resetSessionColumn(job: SwarmJob): string | null | undefined {
+	return job.resumeSession ? undefined : (job.agentSessionId ?? null);
+}
+
 async function tryReuseLatestRun(
 	project: ProjectConfig,
 	resolution: PhaseResolution,
@@ -1703,6 +1715,10 @@ async function tryReuseLatestRun(
 	if (job.resumeSession && prior.agentSessionId) {
 		job.agentSessionId = prior.agentSessionId;
 	} else if (!job.resumeSession) {
+		// Deliberately stricter than the carried-run path below: a job that names no
+		// run row can be an older payload whose id was never re-derived, and this
+		// path has no row-level check to tell a spent id from a fresh one. Dropping
+		// it lets the CLI mint its own rather than risk re-assigning a used one.
 		delete job.agentSessionId;
 	}
 	const overrides = agentOverrideFor(
@@ -1723,7 +1739,7 @@ async function tryReuseLatestRun(
 		overrides.timeoutMs,
 		overrides.reasoning ?? null,
 		overrides.engine,
-		job.resumeSession ? undefined : null,
+		resetSessionColumn(job),
 		recoveryVal,
 		resolution.selection?.workerId,
 		resolution.executionIdentity?.fencingToken,
@@ -1762,7 +1778,7 @@ async function tryResetCarriedRun(
 			overrides.timeoutMs,
 			overrides.reasoning ?? null,
 			overrides.engine,
-			job.resumeSession ? undefined : null,
+			resetSessionColumn(job),
 			recoveryVal,
 			resolution.selection?.workerId,
 			resolution.executionIdentity?.fencingToken,
@@ -1841,7 +1857,18 @@ async function reuseRunRow(
 	if (existingRunId) {
 		try {
 			const existing = await getRunByIdFromDb(existingRunId);
-			if (existing?.agentSessionId) job.agentSessionId = existing.agentSessionId;
+			// Only when this attempt is actually resuming that session. An attempt
+			// that isn't *assigns* its `agentSessionId` (`claude --session-id`), and
+			// the payload already carries a freshly minted, unused id for that
+			// (`deriveRetryJobPayload` / `reconstructRetryJob`); overwriting it with
+			// the row's spent id makes the attempt exit 1 on `Session ID <id> is
+			// already in use` before doing any work. The row can still hold one — a
+			// terminated run preserves its session, and a swallowed finalize error
+			// leaves the previous attempt's id in place — so the flag, not the
+			// column, decides.
+			if (job.resumeSession && existing?.agentSessionId) {
+				job.agentSessionId = existing.agentSessionId;
+			}
 		} catch (err) {
 			logger.debug('Failed to load resumable agent session (retrying from scratch)', {
 				runId: existingRunId,

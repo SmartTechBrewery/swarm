@@ -123,6 +123,19 @@ describe('deriveRetryJobPayload', () => {
 		expect(next).toMatchObject({ resumeSession: true, agentSessionId: prior });
 	});
 
+	// The id is destructured out of the rest spread, so the resumable branch has to
+	// put it back — and must not invent one when the deferred run captured none
+	// (the retry then starts a session the CLI names itself).
+	it('invents no session id for a resumable retry that captured none', () => {
+		const next = deriveRetryJobPayload(createMockPmWebhookJob(), {
+			phase: 'implementation',
+			resumable: true,
+		});
+
+		expect(next.resumeSession).toBe(true);
+		expect(next.agentSessionId).toBeUndefined();
+	});
+
 	it('retries delivery with its own worktree-resume signal, not an agent session', () => {
 		const next = deriveRetryJobPayload(createMockScmWebhookJob(), {
 			phase: 'review',
