@@ -34,7 +34,9 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   worktree and performs deterministic GitHub delivery after the agent exits.
 - Before any worktree or agent, a dispatch gate confirms an *eligible* worker may
   take the phase — active enrollment, the owner's sharing consent, a live
-  connection, free capacity, and the configured CLI. For Implementation, an
+  connection, free capacity, the phase (both the machine's declared repertoire and
+  the phases the enrollment permits in this project) and the configured CLI. For
+  Implementation, an
   assigned item runs only on a worker owned by its assignee (never someone
   else's); an unassigned one takes the first free eligible worker. **Planning is
   central** — it is never routed by assignment, because only a worker with

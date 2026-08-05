@@ -3,6 +3,7 @@ import { createRoute, Link } from '@tanstack/react-router';
 import { Server } from 'lucide-react';
 import { WorkerDetailView } from '@/components/workers/worker-detail.js';
 import { trpc } from '@/lib/trpc.js';
+import { projectDisabledPhases } from '@/lib/worker-enrollment-phases.js';
 import type { WorkerDetail } from '@/types/workers.js';
 import { rootRoute } from '../__root.js';
 import { WORKERS_REFETCH_MS } from './index.js';
@@ -38,6 +39,15 @@ export function WorkerDetailRouteComponent() {
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectNames = new Map(projectsQuery.data?.map((p) => [p.id, p.name]) ?? []);
 	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, p.repo]) ?? []);
+	// Which phases each project has switched off for every worker (issue #509) — read
+	// from the same project config the Agents tab edits, so the phase control names a
+	// project-wide "off" instead of offering a phase that can never run. A project
+	// whose config hasn't loaded contributes nothing, which reads as "disables
+	// nothing" — the safe default, since the daemon and the dispatch gate still gate
+	// the phase either way.
+	const disabledPhasesByProject = new Map<string, string[]>(
+		projectsQuery.data?.map((p) => [p.id, projectDisabledPhases(p.pipeline)]) ?? [],
+	);
 
 	// Annotated, not cast: the query's inferred type has to *satisfy* the
 	// hand-mirrored read model (`types/workers.ts`), so a server-side field the
@@ -80,6 +90,7 @@ export function WorkerDetailRouteComponent() {
 					worker={worker}
 					projectNames={projectNames}
 					projectRepos={projectRepos}
+					projectDisabledPhases={disabledPhasesByProject}
 					onChanged={() => queryClient.invalidateQueries({ queryKey: workerQueryOptions.queryKey })}
 				/>
 			) : workerQuery.isLoading ? (

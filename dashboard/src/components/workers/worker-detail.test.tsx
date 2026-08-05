@@ -37,6 +37,7 @@ function makeEnrollment(overrides: Partial<WorkerDetailEnrollment> = {}): Worker
 		projectId: 'proj-a',
 		status: 'active',
 		allowedClis: ['claude'],
+		allowedPhases: ['planning', 'implementation'],
 		concurrencyAllocation: 2,
 		sharingConsent: true,
 		isRoutable: true,
@@ -86,15 +87,24 @@ function renderDetail(ui: ReactElement) {
 	return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
 }
 
-function renderWorker(overrides: Partial<WorkerDetail> = {}) {
+function renderWorker(
+	overrides: Partial<WorkerDetail> = {},
+	disabledPhases: Map<string, string[]> = new Map(),
+) {
 	return renderDetail(
 		<WorkerDetailView
 			worker={makeWorker(overrides)}
 			projectNames={PROJECT_NAMES}
 			projectRepos={PROJECT_REPOS}
+			projectDisabledPhases={disabledPhases}
 			onChanged={onChanged}
 		/>,
 	);
+}
+
+/** The Allowed-pipeline-phases checkbox for one phase, by its rendered label. */
+function phaseCheckbox(phase: string): HTMLInputElement {
+	return screen.getByRole('checkbox', { name: phase }) as HTMLInputElement;
 }
 
 beforeEach(() => {
@@ -191,7 +201,7 @@ describe('WorkerDetailView sections (issue #477)', () => {
 });
 
 describe('WorkerDetailView enrollment blocks', () => {
-	it('shows the approval state, allowed CLIs, allocation, consent, and routability per project', () => {
+	it('shows the approval state, allowed CLIs, allowed phases, allocation, consent, and routability per project', () => {
 		renderWorker();
 
 		expect(screen.getByRole('link', { name: 'Widgets' }).getAttribute('href')).toBe(
@@ -203,6 +213,11 @@ describe('WorkerDetailView enrollment blocks', () => {
 		expect((screen.getByRole('checkbox', { name: 'claude' }) as HTMLInputElement).checked).toBe(
 			true,
 		);
+		// One checkbox per pipeline phase, so "not offered here" is distinguishable
+		// from "does not exist" (issue #509).
+		expect(phaseCheckbox('planning').checked).toBe(true);
+		expect(phaseCheckbox('review').checked).toBe(false);
+		expect(phaseCheckbox('resolve conflicts')).toBeDefined();
 		expect((screen.getByRole('spinbutton') as HTMLInputElement).value).toBe('2');
 	});
 
@@ -229,6 +244,39 @@ describe('WorkerDetailView enrollment blocks', () => {
 		expect(screen.getByRole('switch', { name: 'Share ada-laptop with Widgets' })).toBeDefined();
 		// An unresolved project name degrades to its id rather than going blank.
 		expect(screen.getByRole('switch', { name: 'Share ada-laptop with proj-b' })).toBeDefined();
+	});
+
+	it('scopes the phase selection to its own enrollment (issue #509)', async () => {
+		updateConstraintsMutate.mockResolvedValue({});
+		renderWorker({
+			enrollments: [
+				makeEnrollment({ allowedPhases: ['implementation'] }),
+				makeEnrollment({
+					enrollmentId: 'enr-2',
+					projectId: 'proj-b',
+					allowedPhases: ['planning', 'implementation', 'review'],
+				}),
+			],
+		});
+
+		// Each block shows its own selection: the same machine is offered different
+		// phase sets in the two projects.
+		const [widgets, other] = screen.getAllByRole('checkbox', { name: 'review' }) as [
+			HTMLInputElement,
+			HTMLInputElement,
+		];
+		expect(widgets.checked).toBe(false);
+		expect(other.checked).toBe(true);
+
+		fireEvent.click(widgets);
+
+		// ...and a change names only that enrollment.
+		await waitFor(() =>
+			expect(updateConstraintsMutate).toHaveBeenCalledWith({
+				enrollmentId: 'enr-1',
+				allowedPhases: ['implementation', 'review'],
+			}),
+		);
 	});
 });
 
@@ -266,6 +314,97 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		expect(onlyAllowed.getAttribute('title')).toMatch(/At least one CLI/);
 		fireEvent.click(onlyAllowed);
 		expect(updateConstraintsMutate).not.toHaveBeenCalled();
+	});
+
+	it('applies a widened phase selection immediately, in the pipeline’s own order', async () => {
+		updateConstraintsMutate.mockResolvedValue({});
+		renderWorker();
+
+		fireEvent.click(phaseCheckbox('review'));
+
+		expect(await screen.findByText('Saved')).toBeDefined();
+		expect(updateConstraintsMutate).toHaveBeenCalledWith({
+			enrollmentId: 'enr-1',
+			allowedPhases: ['planning', 'implementation', 'review'],
+		});
+		expect(onChanged).toHaveBeenCalled();
+	});
+
+	it('drops a phase from the selection without touching the other constraints', async () => {
+		updateConstraintsMutate.mockResolvedValue({});
+		renderWorker();
+
+		fireEvent.click(phaseCheckbox('planning'));
+
+		await waitFor(() =>
+			expect(updateConstraintsMutate).toHaveBeenCalledWith({
+				enrollmentId: 'enr-1',
+				allowedPhases: ['implementation'],
+			}),
+		);
+	});
+
+	it('shows the server’s rejection of a phase selection verbatim', async () => {
+		updateConstraintsMutate.mockRejectedValue(new Error('At least one phase must be allowed'));
+		renderWorker();
+
+		fireEvent.click(phaseCheckbox('review'));
+
+		expect(await screen.findByText('At least one phase must be allowed')).toBeDefined();
+	});
+
+	it('refuses to leave an enrollment with no allowed phase', () => {
+		renderWorker({ enrollments: [makeEnrollment({ allowedPhases: ['implementation'] })] });
+
+		const onlyAllowed = phaseCheckbox('implementation');
+		expect(onlyAllowed.disabled).toBe(true);
+		expect(onlyAllowed.getAttribute('title')).toMatch(/At least one pipeline phase/);
+		fireEvent.click(onlyAllowed);
+		expect(updateConstraintsMutate).not.toHaveBeenCalled();
+	});
+
+	it('cannot select a phase the machine’s daemon does not declare, and says so', () => {
+		// The worker declares planning/implementation/review — `respond to ci` is absent.
+		renderWorker();
+
+		const undeclared = phaseCheckbox('respond to ci');
+		expect(undeclared.checked).toBe(false);
+		expect(undeclared.disabled).toBe(true);
+		expect(undeclared.getAttribute('title')).toMatch(/does not declare this phase/);
+		// ...and the reason is spelled out beside the group, not only in a tooltip.
+		expect(screen.getAllByText(/does not declare this phase/).length).toBeGreaterThan(0);
+		fireEvent.click(undeclared);
+		expect(updateConstraintsMutate).not.toHaveBeenCalled();
+	});
+
+	it('cannot select a phase the project has turned off, and says so', () => {
+		renderWorker({}, new Map([['proj-a', ['review']]]));
+
+		const disabledByProject = phaseCheckbox('review');
+		expect(disabledByProject.disabled).toBe(true);
+		expect(disabledByProject.getAttribute('title')).toMatch(/turned off for every worker/);
+		expect(screen.getByText(/turned off for every worker/)).toBeDefined();
+		fireEvent.click(disabledByProject);
+		expect(updateConstraintsMutate).not.toHaveBeenCalled();
+	});
+
+	it('still lets the owner give up a phase that has become unavailable', async () => {
+		// The daemon narrowed its repertoire after the selection was stored: `planning`
+		// stays permitted here and must remain removable, or the owner would be stuck.
+		updateConstraintsMutate.mockResolvedValue({});
+		renderWorker({ supportedPhases: ['implementation', 'review'] });
+
+		const stale = phaseCheckbox('planning');
+		expect(stale.checked).toBe(true);
+		expect(stale.disabled).toBe(false);
+		fireEvent.click(stale);
+
+		await waitFor(() =>
+			expect(updateConstraintsMutate).toHaveBeenCalledWith({
+				enrollmentId: 'enr-1',
+				allowedPhases: ['implementation'],
+			}),
+		);
 	});
 
 	it('applies a concurrency allocation on demand', async () => {
@@ -352,6 +491,9 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		const enrollments = within(section('Project enrollments'));
 		expect(enrollments.getByText('claude')).toBeDefined();
 		expect(enrollments.getByText('2')).toBeDefined();
+		// Including the allowed phases: stated, and only the allowed ones.
+		expect(enrollments.getAllByText('planning').length).toBeGreaterThan(0);
+		expect(enrollments.queryByText('respond to ci')).toBeNull();
 		expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
 		expect(screen.queryAllByRole('spinbutton')).toHaveLength(0);
 		fireEvent.click(readOnly);

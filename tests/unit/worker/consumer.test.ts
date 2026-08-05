@@ -6,6 +6,7 @@ import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import type { ResolvedAssignee } from '@/identity/assignee-resolver.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
+import { DEFAULT_ENROLLMENT_ALLOWED_PHASES } from '@/identity/worker-enrollment.js';
 import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-service.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
@@ -1982,6 +1983,7 @@ describe('processJob', () => {
 					projectId: 'swarm',
 					status: 'active',
 					allowedClis: capabilities,
+					allowedPhases: [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
 					concurrencyAllocation: 1,
 					sharingConsent: overrides.sharingConsent ?? true,
 					createdAt: new Date('2026-01-01T00:00:00Z'),

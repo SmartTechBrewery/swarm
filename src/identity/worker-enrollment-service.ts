@@ -12,9 +12,9 @@
  * `setEnrollmentStatus`) and the two provider-neutral read models:
  *
  * - `listProjectRoster(projectId)` — every worker enrolled in a project, with
- *   display name, owner, capabilities, status, allowed CLIs, concurrency,
- *   sharing consent, the derived {@link isRoutable} verdict, and derived
- *   busy/current-run state.
+ *   display name, owner, capabilities, status, allowed CLIs, allowed phases,
+ *   concurrency, sharing consent, the derived {@link isRoutable} verdict, and
+ *   derived busy/current-run state.
  * - `listOwnerWorkers(ownerUserId)` — an owner's self-service view of their own
  *   workers and each worker's enrollments across projects.
  * - `listDashboardWorkers(projectScope)` — the cross-project connectivity roster
@@ -69,7 +69,9 @@ import {
 	AllowedClisNotCapableError,
 	ConcurrencyAllocationSchema,
 	DEFAULT_CONCURRENCY_ALLOCATION,
+	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	EnrollmentAllowedClisSchema,
+	EnrollmentAllowedPhasesSchema,
 	type EnrollmentStatus,
 	isRoutable,
 	type WorkerEnrollment,
@@ -80,11 +82,14 @@ export {
 	AllowedClisNotCapableError,
 	ConcurrencyAllocationSchema,
 	DEFAULT_CONCURRENCY_ALLOCATION,
+	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	ENROLLMENT_STATUSES,
 	EnrollmentAllowedClisSchema,
+	EnrollmentAllowedPhasesSchema,
 	type EnrollmentStatus,
 	EnrollmentStatusSchema,
 	isRoutable,
+	permitsPhase,
 	type WorkerEnrollment,
 } from './worker-enrollment.js';
 
@@ -116,6 +121,8 @@ export interface WorkerRosterEntry {
 	capabilities: AgentCli[];
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
+	/** The pipeline phases this project may route to the worker (issue #509). */
+	allowedPhases: TriggerPhase[];
 	/** This worker's share of the project — a positive integer (see `ConcurrencyAllocationSchema`). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
@@ -129,6 +136,8 @@ export interface OwnerEnrollmentView {
 	projectId: string;
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
+	/** The pipeline phases this project may route to the worker (issue #509). */
+	allowedPhases: TriggerPhase[];
 	/** This worker's share of the project — a positive integer (see `ConcurrencyAllocationSchema`). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
@@ -201,6 +210,7 @@ function assembleRosterEntry(
 		capabilities: worker.capabilities,
 		status: enrollment.status,
 		allowedClis: enrollment.allowedClis,
+		allowedPhases: enrollment.allowedPhases,
 		concurrencyAllocation: enrollment.concurrencyAllocation,
 		sharingConsent: enrollment.sharingConsent,
 		isRoutable: isRoutable(enrollment),
@@ -215,6 +225,7 @@ function assembleOwnerEnrollmentView(enrollment: WorkerEnrollment): OwnerEnrollm
 		projectId: enrollment.projectId,
 		status: enrollment.status,
 		allowedClis: enrollment.allowedClis,
+		allowedPhases: enrollment.allowedPhases,
 		concurrencyAllocation: enrollment.concurrencyAllocation,
 		sharingConsent: enrollment.sharingConsent,
 		isRoutable: isRoutable(enrollment),
@@ -385,14 +396,22 @@ export interface DashboardWorkerView {
  * secret-free enrollment facts {@link WorkerRosterEntry} carries for a project,
  * minus the worker/owner fields the surrounding view already states. These are
  * exactly the facts that answer "why is this machine not taking work here?":
- * approval `status`, the effective `allowedClis`, the `concurrencyAllocation`,
- * the owner's `sharingConsent`, and the derived {@link isRoutable} verdict.
+ * approval `status`, the effective `allowedClis`, the effective `allowedPhases`,
+ * the `concurrencyAllocation`, the owner's `sharingConsent`, and the derived
+ * {@link isRoutable} verdict.
  */
 export interface DashboardWorkerEnrollmentDetail {
 	enrollmentId: string;
 	projectId: string;
 	status: EnrollmentStatus;
 	allowedClis: AgentCli[];
+	/**
+	 * The pipeline phases this project may route to the worker (issue #509) — the
+	 * owner's choice, read against the machine's declared `supportedPhases` (on the
+	 * surrounding view) rather than in place of it: a phase is dispatched here only
+	 * when both name it.
+	 */
+	allowedPhases: TriggerPhase[];
 	/** This worker's share of the project — a positive integer (see `ConcurrencyAllocationSchema`). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
@@ -503,6 +522,7 @@ function assembleEnrollmentDetail(enrollment: WorkerEnrollment): DashboardWorker
 		projectId: enrollment.projectId,
 		status: enrollment.status,
 		allowedClis: enrollment.allowedClis,
+		allowedPhases: enrollment.allowedPhases,
 		concurrencyAllocation: enrollment.concurrencyAllocation,
 		sharingConsent: enrollment.sharingConsent,
 		isRoutable: isRoutable(enrollment),
@@ -597,6 +617,13 @@ export interface EnrollWorkerInput {
 	projectId: string;
 	allowedClis: AgentCli[];
 	/**
+	 * The pipeline phases this project may route to the worker (issue #509). Omit
+	 * for {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES} (every phase) — an enrollment
+	 * created without a deliberate choice constrains nothing beyond what the
+	 * machine's daemon and the project already do.
+	 */
+	allowedPhases?: TriggerPhase[];
+	/**
 	 * This worker's share of the project. Omit for
 	 * {@link DEFAULT_CONCURRENCY_ALLOCATION} (`1`) — the safe value an operator
 	 * almost always wants when adding a machine; a larger positive integer lets
@@ -612,16 +639,20 @@ export interface EnrollWorkerInput {
 /**
  * Enroll a worker into a project. Validates `allowedClis` (non-empty,
  * de-duplicated) and enforces that it is a **subset of the worker's declared
- * capabilities** — throwing {@link AllowedClisNotCapableError} otherwise — then
- * persists a `pending` enrollment (unless a status is given) with sharing
- * consent off by default and, unless the caller names one, a concurrency
- * allocation of {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate
- * `(worker, project)` surfaces the repository's pg `23505` for the caller to
- * translate.
+ * capabilities** — throwing {@link AllowedClisNotCapableError} otherwise —
+ * validates `allowedPhases` (non-empty, de-duplicated, defaulting to
+ * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES}), then persists a `pending` enrollment
+ * (unless a status is given) with sharing consent off by default and, unless the
+ * caller names one, a concurrency allocation of
+ * {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate `(worker, project)` surfaces
+ * the repository's pg `23505` for the caller to translate.
  */
 export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnrollment> {
 	const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
 	assertClisWithinCapabilities(input.worker, allowedClis);
+	const allowedPhases = EnrollmentAllowedPhasesSchema.parse(
+		input.allowedPhases ?? [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
+	);
 	const concurrencyAllocation = ConcurrencyAllocationSchema.parse(
 		input.concurrencyAllocation ?? DEFAULT_CONCURRENCY_ALLOCATION,
 	);
@@ -630,6 +661,7 @@ export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnro
 		projectId: input.projectId,
 		status: input.status ?? 'pending',
 		allowedClis,
+		allowedPhases,
 		concurrencyAllocation,
 		sharingConsent: input.sharingConsent ?? false,
 	});
@@ -691,6 +723,13 @@ export interface UpdateEnrollmentConstraintsInput {
 	worker: Worker;
 	enrollmentId: string;
 	allowedClis?: AgentCli[];
+	/**
+	 * The phases this project may route here (issue #509) — non-empty when given;
+	 * omit to leave the stored set alone. There is no "allow nothing" value: a
+	 * worker that should take no work here is a `suspended` enrollment or revoked
+	 * sharing consent.
+	 */
+	allowedPhases?: TriggerPhase[];
 	/** A positive integer sets the allocation; omit to leave the stored value alone. */
 	concurrencyAllocation?: number;
 }
@@ -698,19 +737,35 @@ export interface UpdateEnrollmentConstraintsInput {
 /**
  * Update an enrollment's execution constraints. When `allowedClis` is given it
  * is re-validated (non-empty, de-duplicated) and re-checked against the worker's
- * capabilities; `concurrencyAllocation`, when given, must be a positive integer.
- * There is no "clear it" value — an enrollment always states its share of the
- * project (issue #480), so omitting the field leaves the stored one alone.
- * Returns the updated enrollment, or `undefined` if no enrollment has that id.
+ * capabilities; `allowedPhases`, when given, is re-validated (non-empty,
+ * de-duplicated) but deliberately **not** checked against the worker's declared
+ * `supportedPhases` (see `EnrollmentAllowedPhasesSchema` — a daemon narrows that
+ * set freely, so containment is not an invariant and eligibility ANDs the two);
+ * `concurrencyAllocation`, when given, must be a positive integer. There is no
+ * "clear it" value for any of them — an enrollment always states its share of the
+ * project (issue #480) and always permits at least one CLI and one phase, so
+ * omitting a field leaves the stored one alone. Returns the updated enrollment, or
+ * `undefined` if no enrollment has that id.
+ *
+ * A phase change takes effect on the **next** dispatch: the gate re-reads the
+ * enrollment before every phase starts and never touches a run already in flight,
+ * exactly as revoking sharing consent behaves.
  */
 export async function updateEnrollmentConstraints(
 	input: UpdateEnrollmentConstraintsInput,
 ): Promise<WorkerEnrollment | undefined> {
-	const patch: { allowedClis?: AgentCli[]; concurrencyAllocation?: number } = {};
+	const patch: {
+		allowedClis?: AgentCli[];
+		allowedPhases?: TriggerPhase[];
+		concurrencyAllocation?: number;
+	} = {};
 	if (input.allowedClis !== undefined) {
 		const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
 		assertClisWithinCapabilities(input.worker, allowedClis);
 		patch.allowedClis = allowedClis;
+	}
+	if (input.allowedPhases !== undefined) {
+		patch.allowedPhases = EnrollmentAllowedPhasesSchema.parse(input.allowedPhases);
 	}
 	if (input.concurrencyAllocation !== undefined) {
 		patch.concurrencyAllocation = ConcurrencyAllocationSchema.parse(input.concurrencyAllocation);

@@ -2,7 +2,10 @@ import { eq } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
-import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
+import {
+	createEnrollment,
+	getEnrollmentById,
+} from '../../../src/db/repositories/workerEnrollmentsRepository.js';
 import {
 	createWorker,
 	findWorkerByCredentialHash,
@@ -175,6 +178,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				projectId: 'proj-phase-tx',
 				status: 'active',
 				allowedClis: ['codex'],
+				allowedPhases: ['implementation'],
 				concurrencyAllocation: 1,
 				sharingConsent: true,
 			});
@@ -211,6 +215,41 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				]),
 			).toBeUndefined();
 		});
+
+		// Issue #509: the daemon keeps refreshing its own declaration on every reconnect,
+		// and neither of the two declaration paths may overwrite the owner's per-project
+		// selection — nor be refused because of it (a narrowing reconnect must land).
+		it('leaves an enrollment’s allowed phases untouched when the daemon re-declares', async () => {
+			await seedProject({ id: 'proj-phase-keep', repo: 'SmartTechBrewery/repo-phase-keep' });
+			const worker = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-phase-keep',
+				capabilities: ['claude'],
+				credentialHash: 'hash-phase-keep',
+			});
+			const enrollment = await createEnrollment({
+				workerId: worker.id,
+				projectId: 'proj-phase-keep',
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['planning', 'implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+
+			await updateWorkerSupportedPhases(worker.id, ['implementation']);
+			expect((await getEnrollmentById(enrollment.id))?.allowedPhases).toEqual([
+				'planning',
+				'implementation',
+			]);
+
+			await updateWorkerCapabilities(worker.id, ['claude'], ['review']);
+			expect((await getWorkerById(worker.id))?.supportedPhases).toEqual(['review']);
+			expect((await getEnrollmentById(enrollment.id))?.allowedPhases).toEqual([
+				'planning',
+				'implementation',
+			]);
+		});
 	});
 
 	describe('updateWorkerCapabilities', () => {
@@ -245,6 +284,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				projectId: 'proj-repo-test',
 				status: 'active',
 				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
 				concurrencyAllocation: 1,
 				sharingConsent: true,
 			});
@@ -271,6 +311,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				projectId: 'proj-compat-test',
 				status: 'active',
 				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
 				concurrencyAllocation: 1,
 				sharingConsent: true,
 			});
@@ -303,6 +344,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 					projectId: 'proj-race-test',
 					status: 'active',
 					allowedClis: ['codex'],
+					allowedPhases: ['implementation'],
 					concurrencyAllocation: 1,
 					sharingConsent: true,
 				}),

@@ -77,10 +77,10 @@ export interface WorkerRow {
 /**
  * One enrollment on the worker detail view (`workers.getById`, issue #477,
  * mirroring the service `DashboardWorkerEnrollmentDetail` plus the router's
- * viewer-capability flag). These five facts are what answer "why is this machine
- * not taking work here?" — approval state, the effective CLIs, this worker's share
- * of the project, the owner's consent, and the derived routing verdict.
- * Secret-free.
+ * viewer-capability flag). These facts are what answer "why is this machine not
+ * taking work here?" — approval state, the effective CLIs, the effective pipeline
+ * phases, this worker's share of the project, the owner's consent, and the derived
+ * routing verdict. Secret-free.
  */
 export interface WorkerDetailEnrollment {
 	enrollmentId: string;
@@ -88,6 +88,13 @@ export interface WorkerDetailEnrollment {
 	status: WorkerEnrollmentStatus;
 	/** Effective CLIs this project may run on the worker — a subset of its capabilities. */
 	allowedClis: string[];
+	/**
+	 * Pipeline phases this project may route to the worker (issue #509) — the
+	 * owner's per-enrollment choice, read *with* the machine's declared
+	 * `supportedPhases` rather than instead of it: a phase runs here only when both
+	 * name it, and only while the project has that phase enabled.
+	 */
+	allowedPhases: string[];
 	/** This worker's share of the project — a positive integer, never absent (issue #480). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
@@ -145,6 +152,8 @@ export interface WorkerRosterEntry {
 	status: WorkerEnrollmentStatus;
 	/** Effective CLIs this project may run on the worker — a subset of its capabilities. */
 	allowedClis: string[];
+	/** Effective pipeline phases this project may route to the worker (issue #509). */
+	allowedPhases: string[];
 	/** This worker's share of the project — a positive integer, never absent (issue #480). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
@@ -159,6 +168,8 @@ export interface OwnerEnrollment {
 	projectId: string;
 	status: WorkerEnrollmentStatus;
 	allowedClis: string[];
+	/** Effective pipeline phases this project may route to the worker (issue #509). */
+	allowedPhases: string[];
 	/** This worker's share of the project — a positive integer, never absent (issue #480). */
 	concurrencyAllocation: number;
 	sharingConsent: boolean;

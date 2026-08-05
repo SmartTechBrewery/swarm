@@ -65,6 +65,7 @@ import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	DEFAULT_CONCURRENCY_ALLOCATION,
+	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	deriveWorkerRunState,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -74,6 +75,7 @@ import {
 	setSharingConsent,
 	updateEnrollmentConstraints,
 } from '@/identity/worker-enrollment-service.js';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
@@ -112,6 +114,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		projectId: 'proj-a',
 		status: 'active',
 		allowedClis: ['claude'],
+		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
 		sharingConsent: true,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
@@ -194,6 +197,7 @@ describe('listProjectRoster', () => {
 		expect(Object.keys(entry).sort()).toEqual(
 			[
 				'allowedClis',
+				'allowedPhases',
 				'capabilities',
 				'concurrencyAllocation',
 				'displayName',
@@ -651,6 +655,9 @@ describe('enrollWorker', () => {
 			projectId: 'proj-a',
 			status: 'pending',
 			allowedClis: ['claude'],
+			// Issue #509: an omitted phase selection constrains nothing on its own — the
+			// machine's declaration and the project's own toggles still apply.
+			allowedPhases: [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
 			// Issue #480: an omitted allocation is the safe value, not "uncapped".
 			concurrencyAllocation: DEFAULT_CONCURRENCY_ALLOCATION,
 			sharingConsent: false,
@@ -687,6 +694,49 @@ describe('enrollWorker', () => {
 			}),
 		).rejects.toThrow();
 		expect(createEnrollment).not.toHaveBeenCalled();
+	});
+
+	it('de-dupes an explicit phase selection and stores it as given (issue #509)', async () => {
+		const worker = makeWorker();
+		createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+		await enrollWorker({
+			worker,
+			projectId: 'proj-a',
+			allowedClis: ['claude'],
+			allowedPhases: ['implementation', 'implementation', 'review'],
+		});
+
+		expect(createEnrollment).toHaveBeenCalledWith(
+			expect.objectContaining({ allowedPhases: ['implementation', 'review'] }),
+		);
+	});
+
+	it('rejects an empty phase selection — that is a suspension, not a constraint', async () => {
+		const worker = makeWorker();
+		await expect(
+			enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude'], allowedPhases: [] }),
+		).rejects.toThrow();
+		expect(createEnrollment).not.toHaveBeenCalled();
+	});
+
+	// Deliberately unlike the CLI rule: the daemon rewrites its declared repertoire on
+	// every reconnect, so containment can't be an invariant, and the eligibility
+	// predicate ANDs the two sets instead.
+	it('does not require the phase selection to be within the machine’s declared repertoire', async () => {
+		const worker = makeWorker({ supportedPhases: ['implementation'] });
+		createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+		await enrollWorker({
+			worker,
+			projectId: 'proj-a',
+			allowedClis: ['claude'],
+			allowedPhases: ['planning'],
+		});
+
+		expect(createEnrollment).toHaveBeenCalledWith(
+			expect.objectContaining({ allowedPhases: ['planning'] }),
+		);
 	});
 });
 
@@ -745,6 +795,29 @@ describe('updateEnrollmentConstraints', () => {
 			allowedClis: ['claude'],
 		});
 	});
+
+	it('patches only the phase selection when that is all that changed (issue #509)', async () => {
+		const worker = makeWorker();
+		updateEnrollmentConstraintsRow.mockResolvedValue(makeEnrollment());
+
+		await updateEnrollmentConstraints({
+			worker,
+			enrollmentId: ENROLLMENT_ID,
+			allowedPhases: ['review', 'review', 'implementation'],
+		});
+
+		expect(updateEnrollmentConstraintsRow).toHaveBeenCalledWith(ENROLLMENT_ID, {
+			allowedPhases: ['review', 'implementation'],
+		});
+	});
+
+	it('rejects an empty phase selection instead of storing it', async () => {
+		const worker = makeWorker();
+		await expect(
+			updateEnrollmentConstraints({ worker, enrollmentId: ENROLLMENT_ID, allowedPhases: [] }),
+		).rejects.toThrow();
+		expect(updateEnrollmentConstraintsRow).not.toHaveBeenCalled();
+	});
 });
 
 describe('status / consent write delegation', () => {
@@ -782,6 +855,7 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 				projectId: 'proj-a',
 				status: 'active',
 				allowedClis: ['claude'],
+				allowedPhases: [...ALL_TRIGGER_PHASES],
 				concurrencyAllocation: 2,
 				sharingConsent: true,
 				isRoutable: true,

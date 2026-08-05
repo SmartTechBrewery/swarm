@@ -24,7 +24,7 @@
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
  *    connection/health → free capacity → declared phase support (issue #467) →
- *    declared/allowed CLI.
+ *    the enrollment's allowed phases (issue #509) → declared/allowed CLI.
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes the first
@@ -137,10 +137,12 @@ export interface DispatchGateInput {
 	/** The phase's coded default CLI, for a target that names none. */
 	phaseDefaultCli: AgentCli;
 	/**
-	 * The phase being dispatched. Read twice: matched against each candidate's
+	 * The phase being dispatched. Read three times: matched against each candidate's
 	 * declared `supportedPhases` (issue #467) so a worker whose daemon cannot run this
-	 * phase is never selected for it, and against {@link AFFINITY_GATED_PHASES} (issue
-	 * #469) to decide whether assignee affinity applies at all.
+	 * phase is never selected for it, against each enrollment's `allowedPhases` (issue
+	 * #509) so an owner's per-project selection is honored, and against
+	 * {@link AFFINITY_GATED_PHASES} (issue #469) to decide whether assignee affinity
+	 * applies at all.
 	 */
 	phase: TriggerPhase;
 	/**
@@ -213,9 +215,12 @@ export function isAffinityGatedPhase(phase: TriggerPhase): boolean {
 const REASON_PRIORITY: readonly IneligibilityReason[] = [
 	'worker-unavailable',
 	'missing-cli-capability',
-	// Below `missing-cli-capability` by the same "closer to eligible wins" rule: the
-	// predicate checks phase support *before* the CLI, so a candidate that reported a
-	// missing CLI cleared the phase check and came nearer to eligible (issue #467).
+	// The two phase reasons sit below `missing-cli-capability` by the same "closer to
+	// eligible wins" rule: the predicate checks both phase conditions *before* the
+	// CLI, so a candidate that reported a missing CLI cleared them and came nearer to
+	// eligible (issues #467, #509). Between the two, the enrollment's own choice is the
+	// nearer miss — the machine can run the phase, its owner just hasn't offered it here.
+	'phase-not-permitted',
 	'missing-phase-capability',
 	'missing-consent',
 	'missing-enrollment',
@@ -255,6 +260,11 @@ function ineligibilityMessage(
 		// every other narrowed phase.
 		case 'missing-phase-capability':
 			return `No enrolled worker for ${owner} declared that it can run the '${context.phase}' phase. A worker declares which phases it can execute when it connects, and a remote worker running without a database declares a smaller set than a host worker does. Connect a worker that can run this phase — this work waits until one is available.`;
+		// Deliberately points at the owner rather than the machine: unlike the reason
+		// above, a capable worker *is* connected — it just isn't allowed this phase here
+		// (issue #509), and only its owner can widen that.
+		case 'phase-not-permitted':
+			return `No enrolled worker for ${owner} is allowed the '${context.phase}' phase in this project. A worker owner chooses which pipeline phases their worker may be given per project enrollment; widen that selection on the worker's detail screen — this work waits until one permits the phase.`;
 	}
 }
 

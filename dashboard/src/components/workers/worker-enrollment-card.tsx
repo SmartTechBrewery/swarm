@@ -4,10 +4,13 @@ import { useEffect, useRef, useState } from 'react';
 import { Badge, type BadgeTone } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
+import { formatPhase } from '@/lib/format.js';
 import { trpcClient } from '@/lib/trpc.js';
+import { enrollmentPhaseOptions } from '@/lib/worker-enrollment-phases.js';
 import { ENROLLMENT_STATUS_LABELS, routabilityBlockers } from '@/lib/worker-enrollment-view.js';
 import type { WorkerDetailEnrollment } from '@/types/workers.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
+import type { TriggerPhase } from '../../../../src/triggers/types.js';
 
 /**
  * One project's enrollment on the worker detail view (issue #477): the facts that
@@ -19,8 +22,9 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * "enabled" control:
  *
  * - the worker's **owner** grants sharing consent and sets the execution
- *   constraints (`workers.setConsent` / `workers.updateConstraints`, which
- *   re-check ownership);
+ *   constraints — allowed agent CLIs, allowed pipeline phases (issue #509), and
+ *   concurrency allocation (`workers.setConsent` / `workers.updateConstraints`,
+ *   which re-check ownership);
  * - a **project administrator** approves the enrollment and suspends/reactivates
  *   it (`workers.approveEnrollment` / `workers.setStatus`, which re-check the
  *   project role).
@@ -123,6 +127,10 @@ interface WorkerEnrollmentCardProps {
 	workerName: string;
 	/** The machine's declared CLIs — the only ones an enrollment may allow. */
 	capabilities: string[];
+	/** The machine's declared phase repertoire — a phase it doesn't declare can't be added. */
+	supportedPhases: string[];
+	/** Phases this project has turned off for every worker (`pipeline.<phase>.enabled: false`). */
+	projectDisabledPhases: string[];
 	projectName: string;
 	/** Whether the viewer may change the owner-controlled values (consent, constraints). */
 	viewerIsOwner: boolean;
@@ -265,6 +273,8 @@ export function WorkerEnrollmentCard({
 	enrollment,
 	workerName,
 	capabilities,
+	supportedPhases,
+	projectDisabledPhases,
 	projectName,
 	viewerIsOwner,
 	ownerName,
@@ -290,6 +300,14 @@ export function WorkerEnrollmentCard({
 			trpcClient.workers.updateConstraints.mutate({
 				enrollmentId: enrollment.enrollmentId,
 				allowedClis,
+			}),
+		onSuccess: onChanged,
+	});
+	const phasesMutation = useMutation({
+		mutationFn: (allowedPhases: TriggerPhase[]) =>
+			trpcClient.workers.updateConstraints.mutate({
+				enrollmentId: enrollment.enrollmentId,
+				allowedPhases,
 			}),
 		onSuccess: onChanged,
 	});
@@ -405,6 +423,27 @@ export function WorkerEnrollmentCard({
 						pending={clisMutation.isPending}
 						saved={clisMutation.isSuccess}
 						error={clisMutation.error?.message ?? null}
+					/>
+				</div>
+
+				<div className="space-y-2">
+					<ControlHeading title="Allowed pipeline phases">
+						Which phases this project may give this machine. A phase left out here is routed to
+						another worker; changing the selection affects future dispatches only.
+					</ControlHeading>
+					<AllowedPhasesControl
+						allowedPhases={enrollment.allowedPhases}
+						supportedPhases={supportedPhases}
+						projectDisabledPhases={projectDisabledPhases}
+						editable={viewerIsOwner}
+						pending={phasesMutation.isPending}
+						ownerName={ownerName}
+						onChange={(next) => phasesMutation.mutate(next)}
+					/>
+					<ControlFeedback
+						pending={phasesMutation.isPending}
+						saved={phasesMutation.isSuccess}
+						error={phasesMutation.error?.message ?? null}
 					/>
 				</div>
 
@@ -575,6 +614,122 @@ function AllowedClisControl({
 					</label>
 				);
 			})}
+		</div>
+	);
+}
+
+/**
+ * The phases this project may route here (issue #509), as one checkbox per
+ * pipeline phase — the same treatment {@link AllowedClisControl} gives the CLIs, so
+ * an owner learns one control model rather than two.
+ *
+ * Where that control offers only the machine's declared CLIs, this offers **every**
+ * phase and explains the ones that can't take work: a phase the daemon does not
+ * declare, or one the project has turned off, is stated as such instead of quietly
+ * missing — the difference between "not offered here" and "does not exist" is the
+ * whole question an operator is asking.
+ *
+ * Selecting is blocked for such a phase; **unselecting is never blocked**. The two
+ * conditions are outside this enrollment's control and change without it — a daemon
+ * re-declares its repertoire on every reconnect, a project administrator flips a
+ * phase off — so a stored selection can name a phase that is currently
+ * unavailable, and an owner must always be able to give that phase up. Only the
+ * last remaining phase is pinned, exactly as the last allowed CLI is: the server
+ * rejects an empty set, and a disabled checkbox reads better than a round trip that
+ * comes back invalid.
+ */
+function AllowedPhasesControl({
+	allowedPhases,
+	supportedPhases,
+	projectDisabledPhases,
+	editable,
+	pending,
+	ownerName,
+	onChange,
+}: {
+	allowedPhases: string[];
+	supportedPhases: string[];
+	projectDisabledPhases: string[];
+	editable: boolean;
+	pending: boolean;
+	ownerName: string;
+	onChange: (next: TriggerPhase[]) => void;
+}) {
+	const options = enrollmentPhaseOptions({
+		allowedPhases,
+		supportedPhases,
+		projectDisabledPhases,
+	});
+	if (!editable) {
+		return (
+			<div
+				className="flex flex-wrap gap-1"
+				title={`Only ${ownerName} can change the allowed pipeline phases for this project`}
+			>
+				{allowedPhases.length === 0 ? (
+					<span className="text-sm text-zinc-500">—</span>
+				) : (
+					options
+						.filter((option) => option.allowed)
+						.map((option) => (
+							<Badge key={option.phase} tone={option.unavailable ? 'caution' : 'neutral'}>
+								{formatPhase(option.phase)}
+							</Badge>
+						))
+				)}
+			</div>
+		);
+	}
+	const isLastAllowed = (phase: string) =>
+		allowedPhases.length === 1 && allowedPhases.includes(phase);
+	return (
+		<div className="space-y-2">
+			<div className="flex flex-wrap gap-x-4 gap-y-2">
+				{options.map(({ phase, allowed, unavailable }) => {
+					// A phase that can't take work may still be given up — only adding one is
+					// blocked, and only the last remaining phase is pinned.
+					const blocked = unavailable !== null && !allowed;
+					const pinned = isLastAllowed(phase);
+					return (
+						<label key={phase} className="inline-flex items-center gap-2 text-sm text-zinc-300">
+							<input
+								type="checkbox"
+								checked={allowed}
+								disabled={pending || blocked || pinned}
+								title={
+									pinned
+										? 'At least one pipeline phase must stay allowed for this project'
+										: (unavailable ?? undefined)
+								}
+								// Derived from the options rather than by patching the read model's
+								// `string[]`, so the payload is typed as the phase vocabulary and stays
+								// in the pipeline's own order.
+								onChange={() =>
+									onChange(
+										options
+											.filter((option) => (option.phase === phase ? !allowed : option.allowed))
+											.map((option) => option.phase),
+									)
+								}
+								className="h-4 w-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:cursor-not-allowed"
+							/>
+							<span className="font-mono">{formatPhase(phase)}</span>
+						</label>
+					);
+				})}
+			</div>
+			{options.some((option) => option.unavailable !== null) ? (
+				<ul className="space-y-1 text-xs text-zinc-500">
+					{options
+						.filter((option) => option.unavailable !== null)
+						.map((option) => (
+							<li key={option.phase}>
+								· <span className="font-mono">{formatPhase(option.phase)}</span>:{' '}
+								{option.unavailable}
+							</li>
+						))}
+				</ul>
+			) : null}
 		</div>
 	);
 }
