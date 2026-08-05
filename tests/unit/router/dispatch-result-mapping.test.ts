@@ -192,6 +192,43 @@ describe('adaptResultToPhaseRun', () => {
 		}
 	});
 
+	// Tier 2 across the wire (issue #503). The worker parses the checkpoint on its own
+	// host because only it holds that worktree; the wire status stays `deferred`, and the
+	// checkpoint rides the rebuilt error so the control plane's shared deferral path
+	// applies the identical policy and budget it applies in-process.
+	it('carries a reported checkpoint onto the rebuilt AgentRunError', () => {
+		const checkpoint = {
+			phase: 'implementation' as const,
+			completed: ['Wrote the schema'],
+			remaining: ['Run the tests'],
+			decisions: [],
+			workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+		};
+
+		try {
+			adaptResultToPhaseRun(
+				base({ status: 'deferred', failureKind: 'rate-limit', reason: 'rate limited', checkpoint }),
+				SELECTION,
+			);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect(err).toBeInstanceOf(AgentRunError);
+			expect((err as AgentRunError).checkpoint).toEqual(checkpoint);
+		}
+	});
+
+	it('leaves the checkpoint unset for a deferral frame that reports none', () => {
+		try {
+			adaptResultToPhaseRun(
+				base({ status: 'deferred', failureKind: 'rate-limit', reason: 'rate limited' }),
+				SELECTION,
+			);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect((err as AgentRunError).checkpoint).toBeUndefined();
+		}
+	});
+
 	it('keeps a genuinely-interrupted timeout deferrable (non-zero synthetic exit)', () => {
 		try {
 			adaptResultToPhaseRun(

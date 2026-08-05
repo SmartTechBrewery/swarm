@@ -32,6 +32,7 @@ import { AgentRunError, agentRunError } from '../harness/agent-failure.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
+import { tryReadCheckpoint } from '../pipeline/checkpoint.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
 import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
@@ -47,6 +48,7 @@ import {
 	retryDelayForFailure,
 	runAssignedPhase,
 } from '../worker/consumer.js';
+import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
 import { reconstructProjectConfig } from './db-free-project.js';
 import type { DeliveryClientOptions, FetchLike } from './delivery-client.js';
@@ -223,10 +225,19 @@ export function succeededResult(
  * settles terminal-`failed`. The cancelled-settlement (a user termination) is the
  * caller's concern — the same-host client checks Redis for it; the DB-free path has
  * no such channel and so never produces one.
+ *
+ * `worktreePath` is this task's checkout on *this* host, present once the assignment
+ * got far enough to reconstruct the project. It is what lets a remote worker report
+ * the same Tier 2 settle the in-process one does (issue #503): the control plane owns
+ * the continuation policy and its budget but cannot read this filesystem, so the
+ * worker parses the checkpoint the stopped agent left behind and attaches it to the
+ * deferral. Read for the same `rate-limit`/`timeout`/`stalled` set that preserves the
+ * checkout at all, so a failure that discards the worktree never reports one.
  */
 export function deferrableOrFailedResult(
 	err: unknown,
 	assignment: TaskAssignment,
+	worktreePath?: string,
 ): TaskExecutionResult {
 	const error = describeError(err);
 	const terminal = {
@@ -253,15 +264,20 @@ export function deferrableOrFailedResult(
 		};
 	}
 	if (failure) {
+		const resumable =
+			failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled';
 		return {
 			...terminal,
 			status: 'deferred',
 			retryDelayMs: retryDelayForFailure(failure, Date.now()),
-			resumable:
-				failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled',
+			resumable,
 			resumeDelivery: failure.kind === 'delivery' || undefined,
 			failureKind: failure.kind,
 			reason: error,
+			// The control plane decides whether this becomes a checkpoint continuation
+			// (Tier 1 keeps priority, and the continuation budget lives with the dispatch
+			// record); the worker only reports what it can see on its own disk.
+			checkpoint: resumable && worktreePath ? tryReadCheckpoint(worktreePath) : undefined,
 		};
 	}
 	return { ...terminal, status: 'failed', error };
@@ -595,6 +611,10 @@ export async function runAssignmentDbFree(
 	inFlight.add(dispatchId);
 
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
+	// Resolved as soon as the project is, so the failure path below can read the Tier 2
+	// checkpoint out of this host's checkout (issue #503). Still unset for a failure
+	// that happened before there was a project — and so before there was a worktree.
+	let worktreePath: string | undefined;
 	try {
 		// Fail an unsupported phase cleanly, before touching the project or delivery
 		// — see {@link SUPPORTED_DB_FREE_PHASES} for what a DB-free worker can run.
@@ -612,6 +632,7 @@ export async function runAssignmentDbFree(
 		}
 
 		const project = reconstructProjectConfig(assignment.projectConfig);
+		worktreePath = new GitWorktreeManager(project).worktreePath(taskId);
 		const operatorDelivery = await resolveOperatorDelivery(
 			project,
 			options.operatorToken,
@@ -659,7 +680,7 @@ export async function runAssignmentDbFree(
 			taskId,
 			error: describeError(err),
 		});
-		sink.send(deferrableOrFailedResult(err, assignment));
+		sink.send(deferrableOrFailedResult(err, assignment, worktreePath));
 	} finally {
 		detach();
 		inFlight.delete(dispatchId);

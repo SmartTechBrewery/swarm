@@ -249,6 +249,11 @@ export function adaptResultToPhaseRun(
 		result.reason ?? `Phase deferred (${kind}) on the worker`,
 		{ kind },
 		resultAgent(selection.cli, { exitCode: result.exitCode ?? 1, aborted: kind === 'aborted' }),
+		// The Tier 2 checkpoint the worker read off its own disk (issue #503). Carried on
+		// the rebuilt error so the shared deferral path applies the identical continuation
+		// policy and budget it applies in-process — the control plane cannot read that
+		// worktree itself, and this is the only channel that reaches `deferAgentRunError`.
+		result.checkpoint,
 	);
 }
 

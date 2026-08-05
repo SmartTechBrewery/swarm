@@ -17,17 +17,24 @@
  * — the id a run created is captured into {@link AgentCliResult.sessionId} by the
  * harness for all three CLIs, so this code never special-cases one.
  *
- * It also owns the recovery gate's Tier 2 branch ({@link RecoveryMode}'s
- * `'checkpoint'`): the *sessionless* continuation, which adopts a preserved
- * checkout on the strength of the checkpoint file in it rather than a resumable
- * session, and therefore always runs fresh. Nothing selects it in production yet
- * — that policy is a later phase of issue #299.
+ * It also owns both halves of Tier 2's *selection* (`docs/CHECKPOINTS.md`, issue
+ * #503): the recovery gate's `'checkpoint'` branch ({@link RecoveryMode}), which
+ * adopts a preserved checkout on the strength of the checkpoint file in it rather
+ * than a resumable session and therefore always runs fresh, and the predicates that
+ * decide when the fallback may be reached at all
+ * ({@link checkpointFallbackApplies} / {@link shouldPreserveFailedCheckout}). Those
+ * are written so Tier 1 keeps absolute priority: they only *add* a path for stops a
+ * resumable session cannot serve.
  */
 
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import type { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
-import { type Checkpoint, validateCheckpointForContinuation } from '@/pipeline/checkpoint.js';
+import {
+	type Checkpoint,
+	hasCheckpoint,
+	validateCheckpointForContinuation,
+} from '@/pipeline/checkpoint.js';
 import { isRunCancellationRequested } from '@/queue/cancellation.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
 import { hasDeliveryProgress } from '@/scm/delivery.js';
@@ -61,6 +68,76 @@ export function shouldPreserveForResume(error: AgentRunError): boolean {
 	const kind = error.failure.kind;
 	if (kind !== 'rate-limit' && kind !== 'timeout' && kind !== 'stalled') return false;
 	return error.agent?.sessionId !== undefined;
+}
+
+/**
+ * Whether Tier 2 may take over from Tier 1 for this failure
+ * (`docs/CHECKPOINTS.md`). Two things must hold, and the first is Tier 1's
+ * absolute priority:
+ *
+ * - The stop was involuntary in a way a continuation can pick up — the same
+ *   `rate-limit` / `timeout` / `stalled` set {@link shouldPreserveForResume}
+ *   accepts. Nothing else (a hard error, an abort, a capacity banner, a logged-out
+ *   CLI) becomes a continuation.
+ * - Tier 1 cannot serve it: either the run captured **no** session id, or this
+ *   attempt *was* the resume of one and failed anyway — the "session expired or was
+ *   pruned" case, where every CLI still reports the id it was asked to resume
+ *   (`resolveSessionId`, `src/harness/agent-cli.ts`), so a present id is no longer
+ *   evidence that resuming works. Re-resuming it would fail the same way; the
+ *   checkpoint takes over instead of the checkout being discarded.
+ *
+ * A *first*, non-resume failure that did capture a session id is Tier 1's,
+ * unchanged — that is the regression this ordering protects.
+ */
+export function checkpointFallbackApplies(
+	error: AgentRunError,
+	wasSessionResume: boolean,
+): boolean {
+	const kind = error.failure.kind;
+	if (kind !== 'rate-limit' && kind !== 'timeout' && kind !== 'stalled') return false;
+	return wasSessionResume || error.agent?.sessionId === undefined;
+}
+
+/**
+ * Whether a failed run's worktree must be kept for a Tier 2 *checkpoint*
+ * continuation: {@link checkpointFallbackApplies} holds and the checkout actually
+ * carries a checkpoint file to continue from.
+ *
+ * Deliberately synchronous and shallow — it only asks whether the file is *there*.
+ * Parsing it is the settle path's job (`src/worker/consumer.ts`) and validating it
+ * against the tree on disk is the continuation gate's
+ * ({@link validateCheckpointForContinuation}); a phase's `finally` block must not
+ * run git to decide whether to clean up. Each implementer phase ORs this with
+ * {@link shouldPreserveForResume} so the checkout survives whichever tier claims it.
+ */
+export function shouldPreserveForCheckpoint(
+	error: AgentRunError,
+	worktreePath: string,
+	wasSessionResume = false,
+): boolean {
+	if (!checkpointFallbackApplies(error, wasSessionResume)) return false;
+	return hasCheckpoint(worktreePath);
+}
+
+/**
+ * The whole preservation decision an *implementer* phase's failure path makes:
+ * keep the checkout when either tier can continue from it. Tier 1 is asked first
+ * and is untouched, so the OR only *adds* the sessionless Tier 2 case — no run
+ * that resumes today stops doing so.
+ *
+ * `resumed` is whether this attempt re-entered an agent session (the flag
+ * {@link acquireResumableWorktree} returns), which is what makes a still-present
+ * session id stop counting as evidence Tier 1 works. Planning and Review keep
+ * calling {@link shouldPreserveForResume} directly: neither writes a checkpoint.
+ */
+export function shouldPreserveFailedCheckout(
+	error: AgentRunError,
+	worktreePath: string,
+	resumed: boolean,
+): boolean {
+	return (
+		shouldPreserveForResume(error) || shouldPreserveForCheckpoint(error, worktreePath, resumed)
+	);
 }
 
 import { existsSync } from 'node:fs';

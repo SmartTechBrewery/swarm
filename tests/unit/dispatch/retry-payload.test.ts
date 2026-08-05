@@ -127,6 +127,51 @@ describe('deriveRetryJobPayload', () => {
 
 		expect(next.continuationDispatchClaimed).toBe(true);
 	});
+
+	// Tier 2 (issue #503): the retry adopts the preserved checkout on the strength of
+	// its checkpoint, so it must ask for the `'checkpoint'` recovery mode with a *fresh*
+	// session — never carry the dead session id the stopped attempt was using.
+	it('derives a checkpoint continuation: recovery mode, a fresh session, and no resume', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({
+				runId: 'run-1',
+				agentSessionId: '11111111-1111-4111-8111-111111111111',
+				resumeSession: true,
+			}),
+			{ phase: 'respond-to-ci', runId: 'run-1', resumable: false, checkpointed: true },
+		);
+
+		expect(next.recoveryMode).toBe('checkpoint');
+		expect(next.resumeSession).toBeUndefined();
+		expect(next.resumeDelivery).toBeUndefined();
+		expect(next.agentSessionId).toBeDefined();
+		expect(next.agentSessionId).not.toBe('11111111-1111-4111-8111-111111111111');
+		// A continuation is still a failure retry, so it spends a rate-limit attempt —
+		// the second, coarser bound on the loop.
+		expect(next.rateLimitRetryAttempt).toBe(1);
+	});
+
+	// A continuation that stops again *and* captures a resumable session this time goes
+	// back to Tier 1, so the stale `'checkpoint'` mode must not survive and re-run the
+	// gate's adopt-a-checkpoint branch.
+	it('drops a stale checkpoint recovery mode when the next attempt resumes a session', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ recoveryMode: 'checkpoint', runId: 'run-1' }),
+			{ phase: 'respond-to-ci', runId: 'run-1', resumable: true },
+		);
+
+		expect(next.recoveryMode).toBeUndefined();
+		expect(next.resumeSession).toBe(true);
+	});
+
+	it('leaves an operator-selected recovery mode alone', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ recoveryMode: 'resume', runId: 'run-1' }),
+			{ phase: 'review', runId: 'run-1', resumable: true },
+		);
+
+		expect(next.recoveryMode).toBe('resume');
+	});
 });
 
 describe('deriveCapacityPendingPayload', () => {
@@ -196,5 +241,27 @@ describe('reconstructRetryJob', () => {
 
 		expect(job).toMatchObject({ type: 'scm', providerId: 'github' });
 		expect(job.runId).toBe('run-2');
+	});
+
+	// The operator path phase 4 drives (issue #503). Like `'fresh'`, a continuation runs
+	// a brand-new session — it has none to re-enter — so an expected session id is
+	// deliberately not honoured for it.
+	it("rebuilds a 'checkpoint' continuation with a fresh session and no resume flag", () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ resumeSession: true }),
+			'run-3',
+			'implementation',
+			undefined,
+			undefined,
+			undefined,
+			false,
+			'checkpoint',
+			'11111111-1111-4111-8111-111111111111',
+		);
+
+		expect(job.recoveryMode).toBe('checkpoint');
+		expect(job.resumeSession).toBeUndefined();
+		expect(job.agentSessionId).toBeDefined();
+		expect(job.agentSessionId).not.toBe('11111111-1111-4111-8111-111111111111');
 	});
 });

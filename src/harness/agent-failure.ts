@@ -22,6 +22,7 @@
  * a login, only a human re-running `/login` can.
  */
 
+import type { Checkpoint } from '../pipeline/checkpoint.js';
 import type { AgentCliResult } from './agent-cli.js';
 
 /** Why an agent run failed, from the worker's point of view. */
@@ -70,11 +71,27 @@ export class AgentRunError extends Error {
 	 * `.agent` is populated for every real failure.
 	 */
 	readonly agent?: AgentCliResult;
-	constructor(message: string, failure: AgentFailure, agent?: AgentCliResult) {
+	/**
+	 * The Tier 2 checkpoint (`docs/CHECKPOINTS.md`) the stopped run left in its
+	 * worktree, when that worktree is somewhere the process handling this error
+	 * cannot read it: a federated worker parses the file itself and reports it in its
+	 * deferral frame (`../transport/protocol.ts`), and the control plane rebuilds the
+	 * error with it here. The in-process worker leaves it unset and reads the file
+	 * from the checkout it owns — see `deferAgentRunError` (`../worker/consumer.ts`),
+	 * which treats the two sources identically from there on.
+	 */
+	readonly checkpoint?: Checkpoint;
+	constructor(
+		message: string,
+		failure: AgentFailure,
+		agent?: AgentCliResult,
+		checkpoint?: Checkpoint,
+	) {
 		super(message);
 		this.name = 'AgentRunError';
 		this.failure = failure;
 		this.agent = agent;
+		this.checkpoint = checkpoint;
 	}
 }
 

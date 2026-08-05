@@ -72,6 +72,11 @@ import { requireProjectSCMProvider, requireSCMProvider } from '../integrations/s
 import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import {
+	type Checkpoint,
+	resolveMaxContinuations,
+	tryReadCheckpoint,
+} from '../pipeline/checkpoint.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
 import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
 import { runImplementationPhase } from '../pipeline/implementation.js';
@@ -80,7 +85,7 @@ import { type ProposedScope, runPlanningPhase } from '../pipeline/planning.js';
 import { runResolveConflictsPhase } from '../pipeline/resolve-conflicts.js';
 import { runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
-import { BlockedRecoveryError } from '../pipeline/resume.js';
+import { BlockedRecoveryError, checkpointFallbackApplies } from '../pipeline/resume.js';
 import {
 	type ReviewAutomationOutcome,
 	type ReviewVerdict,
@@ -243,6 +248,19 @@ export type JobOutcome =
 			 * whether the captured `agentSessionId` is kept on the deferred row.
 			 */
 			resumable: boolean;
+			/**
+			 * Set when this deferral is a **Tier 2 checkpoint continuation** (issue #503,
+			 * `docs/CHECKPOINTS.md`): native session resume could not serve the stop, but
+			 * the preserved checkout carries this parsed `swarm_checkpoint.json`. Its
+			 * presence is the marker — there is deliberately no second boolean beside it
+			 * that could disagree — and it makes the settle record `checkpointed` with the
+			 * checkpoint on the row instead of `deferred` with a session id, and the retry
+			 * carry `recoveryMode: 'checkpoint'`. Always accompanied by
+			 * `resumable: false`: a continuation resumes no session.
+			 */
+			checkpoint?: Checkpoint;
+			/** The run's checkpoint-continuation count after this settle — set with {@link checkpoint}. */
+			continuationCount?: number;
 			/** True when the retry must reuse deterministic-delivery progress, not an agent session. */
 			resumeDelivery?: boolean;
 			/**
@@ -499,6 +517,82 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
 }
 
 /**
+ * The Tier 2 decision for a deferrable failure (issue #503, `docs/CHECKPOINTS.md`):
+ * either continue the run from the checkpoint in its preserved checkout, or report
+ * that its budget for doing so is spent. Resolved by
+ * {@link resolveCheckpointFallback}; `undefined` there means "not a Tier 2 case" and
+ * the deferral proceeds exactly as it did before.
+ */
+type CheckpointFallback =
+	| { kind: 'continue'; checkpoint: Checkpoint; continuationCount: number }
+	| { kind: 'exhausted'; spent: number; max: number };
+
+/**
+ * Decide whether this deferrable failure becomes a Tier 2 checkpoint continuation.
+ *
+ * Tier 1 keeps absolute priority — {@link checkpointFallbackApplies} rejects any stop
+ * a resumable session can still serve — so this only ever *adds* a path for stops
+ * that would otherwise restart the phase from scratch. Everything after that gate is
+ * evidence gathering: a parseable checkpoint that names this phase, and the run's
+ * remaining continuation budget.
+ *
+ * The checkpoint has two sources and one meaning. A federated worker parsed the file
+ * on its own host and reported it in the deferral frame (`AgentRunError.checkpoint`,
+ * rebuilt by `../router/dispatcher.ts`); the in-process worker reads the checkout it
+ * owns. Either way the *divergence* check is deliberately left to the continuation's
+ * own gate (`validateCheckpointForContinuation`), which runs on the host that holds
+ * the tree — a settle cannot ask git about a worktree on another machine, and a
+ * mismatch there is exactly the `checkpoint-divergent` block phase 2 records.
+ *
+ * Fails closed on any DB error reading the count: without it the budget is unknowable,
+ * and an unbounded continuation loop is worse than an ordinary deferral.
+ */
+async function resolveCheckpointFallback(
+	err: unknown,
+	job: SwarmJob,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+	runId: string | undefined,
+): Promise<CheckpointFallback | undefined> {
+	if (!(err instanceof AgentRunError)) return undefined;
+	const wasSessionResume = job.resumeSession === true || job.recoveryMode === 'resume';
+	if (!checkpointFallbackApplies(err, wasSessionResume)) return undefined;
+
+	const checkpoint =
+		err.checkpoint ??
+		tryReadCheckpoint(new GitWorktreeManager(project).worktreePath(trigger.taskId));
+	if (!checkpoint) return undefined;
+	// A task's checkout is reused across phases, so a checkpoint another phase left
+	// behind must not settle this one as continuable — the continuation gate would
+	// only block on it (`checkpoint-divergent`) after paying for a dispatch.
+	if (checkpoint.phase !== trigger.phase) {
+		logger.debug('Ignoring a checkpoint written by another phase — no checkpoint continuation', {
+			projectId: project.id,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			checkpointPhase: checkpoint.phase,
+		});
+		return undefined;
+	}
+
+	let spent = 0;
+	if (runId) {
+		try {
+			spent = (await getRunByIdFromDb(runId))?.continuationCount ?? 0;
+		} catch (readErr) {
+			logger.error('Failed to read the continuation count — deferring without a continuation', {
+				runId,
+				error: describeError(readErr),
+			});
+			return undefined;
+		}
+	}
+	const max = resolveMaxContinuations(project);
+	if (spent >= max) return { kind: 'exhausted', spent, max };
+	return { kind: 'continue', checkpoint, continuationCount: spent + 1 };
+}
+
+/**
  * Handle a deferrable {@link AgentRunError} (`rate-limit`, `capacity`, or `aborted`) —
  * `processJob`'s one non-terminal failure path, split out to keep that
  * function's branching within the complexity budget. Returns the
@@ -513,7 +607,23 @@ function deferAgentRunError(
 	projectId: string,
 	error: string,
 	runId: string | undefined,
+	checkpointFallback?: CheckpointFallback,
 ): Extract<JobOutcome, { status: 'phase-deferred' }> | undefined {
+	// The Tier 2 bound sits with the other caps rather than in the settle: a run that
+	// has already spent every continuation the project allows must fall through to a
+	// terminal failure, which the caller reports as an exhausted continuation budget.
+	// Checked first because it is the more specific of the two exhausted budgets.
+	if (checkpointFallback?.kind === 'exhausted') {
+		logger.error(`Phase failed - ${phaseLabel(trigger.phase)} — continuation budget exhausted`, {
+			projectId,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			continuationsUsed: checkpointFallback.spent,
+			maxContinuations: checkpointFallback.max,
+			error,
+		});
+		return undefined;
+	}
 	const attempt = job.rateLimitRetryAttempt ?? 0;
 	const maxRetries = failure.kind === 'capacity' ? MAX_CAPACITY_RETRIES : MAX_RATE_LIMIT_RETRIES;
 	if (attempt >= maxRetries) {
@@ -535,6 +645,9 @@ function deferAgentRunError(
 		attempt,
 		retryDelayMs,
 		resetHint: 'resetHint' in failure ? failure.resetHint : undefined,
+		// Tier 2: this retry re-seeds a fresh session from the checkpoint rather than
+		// re-entering the stopped run's own session.
+		continuation: checkpointFallback ? checkpointFallback.continuationCount : undefined,
 		error,
 	});
 	return {
@@ -558,8 +671,15 @@ function deferAgentRunError(
 		// resume, and the captured session id (if any) points at a run that never
 		// progressed. Starting fresh matches the pre-existing Codex-capacity
 		// contract; only an explicit safety case would justify resuming instead.
+		//
+		// A Tier 2 continuation is never `resumable` (issue #503): there is no session
+		// worth carrying — that is precisely why it fell back to the checkpoint — so the
+		// settle drops the captured id and the retry mints a fresh one.
 		resumable:
-			failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled',
+			checkpointFallback === undefined &&
+			(failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled'),
+		checkpoint: checkpointFallback?.checkpoint,
+		continuationCount: checkpointFallback?.continuationCount,
 		resumeDelivery: failure.kind === 'delivery' || undefined,
 		pmPhaseStarted:
 			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
@@ -749,6 +869,10 @@ async function settleDispatchRetry(
 		phase: outcome.phase,
 		runId: outcome.runId,
 		resumable: outcome.resumable,
+		// Tier 2 (issue #503): the retry adopts the preserved checkout on the strength of
+		// the checkpoint rather than a session, so it runs `recoveryMode: 'checkpoint'`
+		// with a fresh session id.
+		checkpointed: outcome.checkpoint !== undefined,
 		resumeDelivery: outcome.resumeDelivery,
 		pmPhaseStarted: outcome.pmPhaseStarted,
 		continuationDispatchClaimed: outcome.continuationDispatchClaimed,
@@ -1962,15 +2086,23 @@ async function finalizeFailedRun(
 		await finalizeRun(
 			runId,
 			{
-				status: 'deferred',
+				// A Tier 2 continuation settles as its own retry-pending status (issue
+				// #503) so every read model can tell "waiting to resume its session" from
+				// "waiting to continue from a checkpoint" — the latter having no session id
+				// at all. The checkpoint travels onto the row so the API/dashboard can show
+				// the recorded remainder without reading a (possibly remote) worker's disk.
+				status: outcome.checkpoint ? 'checkpointed' : 'deferred',
 				error: outcome.reason,
 				nextRetryAt: outcome.pendingDispatch ? null : new Date(Date.now() + outcome.retryDelayMs),
 				...agentColumns(agent),
 				// Persist the session id the run captured so the retry can resume it —
 				// for claude the id it assigned/echoed, for codex/agy the id captured
 				// from their output/store. `null` when not resumable, or when the run
-				// created no session to resume (retry then starts from scratch).
+				// created no session to resume (retry then starts from scratch) — which
+				// includes every checkpoint continuation.
 				agentSessionId: outcome.resumable ? (agent?.sessionId ?? null) : null,
+				checkpoint: outcome.checkpoint,
+				continuationCount: outcome.continuationCount,
 			},
 			agent,
 		);
@@ -2605,31 +2737,54 @@ async function handlePhaseFailure(
 				// a checkout that's gone.
 				(err.failure.kind === 'timeout' && err.agent !== undefined && err.agent.exitCode !== 0))) ||
 		err instanceof DeliveryDeferredError;
+	// Tier 2's decision (issue #503) is resolved once and used twice: by the deferral,
+	// which turns it into a `checkpointed` settle, and by the terminal path below, which
+	// reports an exhausted continuation budget as the reason the run stopped for good.
+	const checkpointFallback = isDeferrable
+		? await resolveCheckpointFallback(err, job, trigger, project, runId)
+		: undefined;
 	if (isDeferrable) {
 		const failure: DeferrableFailure =
 			err instanceof AgentRunError ? err.failure : { kind: 'delivery' };
-		const deferred = deferAgentRunError(failure, job, trigger, project.id, error, runId);
+		const deferred = deferAgentRunError(
+			failure,
+			job,
+			trigger,
+			project.id,
+			error,
+			runId,
+			checkpointFallback,
+		);
 		if (deferred) return deferred;
 	}
 
+	// A stop that Tier 2 would have continued from, had the run not already used every
+	// continuation the project allows. Say so in the run's own `error`, not only in the
+	// diagnosis, so the reason survives wherever the raw message is shown.
+	const budgetExhausted = checkpointFallback?.kind === 'exhausted' ? checkpointFallback : undefined;
+	const terminalError = budgetExhausted
+		? `${error} — checkpoint continuation budget exhausted (${budgetExhausted.spent} of ${budgetExhausted.max} used)`
+		: error;
 	logger.error(`Phase failed - ${phaseLabel(trigger.phase)}`, {
 		projectId: project.id,
 		phase: trigger.phase,
 		taskId: trigger.taskId,
-		error,
+		error: terminalError,
 	});
 	const planningScope = await tryLoadPlanningScope(project.id, trigger.taskId, failureKind);
 	const failureDiagnosis = diagnoseFailure({
 		failureKind,
 		agent: err instanceof AgentRunError ? err.agent : undefined,
 		planningScope,
-		knownCondition: knownFailureCondition(failureKind, error),
+		knownCondition: budgetExhausted
+			? 'continuation-budget-exhausted'
+			: knownFailureCondition(failureKind, error),
 	});
 	// Report the terminal failure on the backing Issue or PR so a human sees why
 	// the item stalled. Reached only for non-deferrable failures (the deferral
 	// above returns early), so a run that's about to be retried never posts a
 	// premature "failed".
-	await reportPhaseFailureToBoardOrPr(trigger, project, error, failureDiagnosis);
+	await reportPhaseFailureToBoardOrPr(trigger, project, terminalError, failureDiagnosis);
 	// The review handler's claim intentionally survives a failed run: the review
 	// agent submits its formal `gh pr review` *inside* the run, so a phase that
 	// threw afterward may have already posted the review — releasing the claim
@@ -2640,7 +2795,7 @@ async function handlePhaseFailure(
 		status: 'phase-failed',
 		phase: trigger.phase,
 		taskId: trigger.taskId,
-		error,
+		error: terminalError,
 		failureDiagnosis,
 	};
 }

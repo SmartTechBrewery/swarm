@@ -68,7 +68,7 @@ import {
 	cleanupUnlessPreserved,
 	executeRecoveryGate,
 	sessionRunArgs,
-	shouldPreserveForResume,
+	shouldPreserveFailedCheckout,
 } from '@/pipeline/resume.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
@@ -463,7 +463,9 @@ export async function runImplementationPhase(
 				`Implementation agent (${cli}) exited with code ${agent.exitCode}`,
 				` for task '${taskId}'`,
 			);
-			preserveForResume = shouldPreserveForResume(error);
+			// Either tier may claim this checkout: Tier 1's resumable session, or — when it
+			// cannot apply — the Tier 2 checkpoint the agent left in the worktree.
+			preserveForResume = shouldPreserveFailedCheckout(error, handle.path, resumed);
 			throw error;
 		}
 

@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentCli } from '../harness/agent-cli.js';
 import type { ReasoningLevel } from '../harness/models.js';
-import { normalizeStoredJobPayload, type SwarmJob } from '../queue/jobs.js';
+import { normalizeStoredJobPayload, type RecoveryMode, type SwarmJob } from '../queue/jobs.js';
 import type { TriggerPhase } from '../triggers/types.js';
 
 /** The slice of a `phase-deferred` outcome the payload derivation needs. */
@@ -25,6 +25,14 @@ export interface DeferredRetryIntent {
 	runId?: string;
 	/** Resume the preserved agent session on retry (rate-limit/timeout/stalled). */
 	resumable: boolean;
+	/**
+	 * Continue from the Tier 2 checkpoint in the preserved worktree instead of a
+	 * session (issue #503, `docs/CHECKPOINTS.md`). Mutually exclusive with
+	 * {@link resumable} by construction — the fallback is only chosen when no session
+	 * can be resumed — and it is what puts `recoveryMode: 'checkpoint'` and a freshly
+	 * minted session id on the next attempt.
+	 */
+	checkpointed?: boolean;
 	/** Resume deterministic-delivery progress from the preserved worktree. */
 	resumeDelivery?: boolean;
 	/** A PM-driven phase was actually entered before it deferred. */
@@ -76,16 +84,24 @@ function attemptCounterPatch(
  * pre-provisioning capacity retry into a branch resume, so the prior
  * `resumePmPhase`/`resumeSession`/`resumeDelivery` flags are dropped and
  * re-derived.
+ *
+ * `recoveryMode` is dropped and re-derived only for the value this function itself
+ * sets, `'checkpoint'` (issue #503): a continuation that stops involuntarily again
+ * and *can* resume its session this time must not still ask the recovery gate to
+ * adopt a checkpoint. An operator-selected `'resume'`/`'fresh'` is left alone, as
+ * before.
  */
 export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryIntent): SwarmJob {
 	const {
 		resumePmPhase,
 		resumeSession: _resumeSession,
 		resumeDelivery: _resumeDelivery,
+		recoveryMode,
 		...job
 	} = parsed;
 	return {
 		...job,
+		...(recoveryMode && recoveryMode !== 'checkpoint' ? { recoveryMode } : {}),
 		// A re-check waits on an external condition, not a failure, so it spends its
 		// own budget and leaves the rate-limit one untouched; every other deferral
 		// consumes a rate-limit attempt as before.
@@ -106,6 +122,13 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		// resumable one; separate from `resumePmPhase`, which is only the PM
 		// board-dispatch signal.
 		...(intent.resumable ? { resumeSession: true } : {}),
+		// Tier 2 (issue #503): the preserved checkout is adopted on the strength of its
+		// checkpoint, so the attempt runs through the recovery gate's `'checkpoint'`
+		// branch — with a *fresh* session id, since a continuation carries no session to
+		// re-enter and may even run on a different CLI than the stopped run did.
+		...(intent.checkpointed
+			? { recoveryMode: 'checkpoint' as const, agentSessionId: randomUUID() }
+			: {}),
 		// Delivery retries reuse a valid progress-marked worktree, independent of
 		// whether the completed agent run exposed a session id.
 		...(intent.resumeDelivery ? { resumeDelivery: true } : {}),
@@ -134,7 +157,7 @@ export function reconstructRetryJob(
 	model?: string,
 	reasoning?: ReasoningLevel,
 	freshSession = false,
-	recoveryMode?: 'resume' | 'fresh',
+	recoveryMode?: RecoveryMode,
 	expectedSessionId?: string | null,
 ): SwarmJob {
 	const job = { ...normalizeStoredJobPayload(jobPayload) };
@@ -152,6 +175,10 @@ export function reconstructRetryJob(
 			job.resumeSession = true;
 			if (expectedSessionId) job.agentSessionId = expectedSessionId;
 		} else {
+			// `'fresh'` (start over) and `'checkpoint'` (continue from the checkpoint,
+			// issue #503) both run a brand-new session: neither re-enters the stopped
+			// run's, and a checkpoint continuation is CLI-agnostic precisely because it
+			// has no session to carry, so a cli/model override composes with it.
 			job.agentSessionId = randomUUID();
 			delete job.resumeSession;
 		}

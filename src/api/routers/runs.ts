@@ -16,6 +16,7 @@ import {
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	isRetryPendingStatus,
 	listRunsFromDb,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
@@ -40,7 +41,12 @@ import {
 	RUN_CANCELLED_MESSAGE,
 	requestRunCancellation,
 } from '../../queue/cancellation.js';
-import { normalizeStoredJobPayload, type SwarmJob, SwarmJobSchema } from '../../queue/jobs.js';
+import {
+	normalizeStoredJobPayload,
+	type RecoveryMode,
+	type SwarmJob,
+	SwarmJobSchema,
+} from '../../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../../queue/producer.js';
 import {
 	deriveDispatchPhaseHint,
@@ -190,7 +196,7 @@ async function enrichQueuedWorkItems(items: QueuedRun[]): Promise<QueuedRun[]> {
 // `RunStatus`/`RunRow` are local (non-exported) types in the repository, so the
 // router declares its own filter enums — keeping Zod the source of truth for the
 // API boundary and rejecting garbage filter values before they reach the DB.
-const RunStatusEnum = z.enum(['running', 'completed', 'failed', 'deferred']);
+const RunStatusEnum = z.enum(['running', 'completed', 'failed', 'deferred', 'checkpointed']);
 const RunPhaseEnum = z.enum([
 	'planning',
 	'implementation',
@@ -529,10 +535,10 @@ export const runsRouter = router({
 				'member',
 				`Run with ID "${input.runId}" not found`,
 			);
-			if (run.status !== 'deferred' && run.status !== 'failed') {
+			if (run.status !== 'deferred' && run.status !== 'failed' && run.status !== 'checkpointed') {
 				throw new TRPCError({
 					code: 'PRECONDITION_FAILED',
-					message: `Only a deferred or failed run can be retried; run "${input.runId}" is ${run.status}.`,
+					message: `Only a deferred, checkpointed, or failed run can be retried; run "${input.runId}" is ${run.status}.`,
 				});
 			}
 
@@ -546,10 +552,19 @@ export const runsRouter = router({
 			const applyingOverride =
 				input.cli !== undefined || input.model !== undefined || input.reasoning !== undefined;
 			let startFresh = run.status === 'failed' || run.agentSessionId === null || applyingOverride;
-			let recoveryMode: 'resume' | 'fresh' | undefined;
+			let recoveryMode: RecoveryMode | undefined;
 			if (isRecovery) {
 				recoveryMode = applyingOverride ? 'fresh' : 'resume';
 				startFresh = applyingOverride;
+			}
+			// A `checkpointed` run's preserved checkout is adopted on the strength of its
+			// Tier 2 checkpoint, never a session (issue #503) — and a cli/model override is
+			// compatible with that, since a continuation always runs a fresh session and is
+			// CLI-agnostic by construction. Without this the manual retry would try to
+			// provision over a deliberately preserved worktree and settle blocked.
+			if (run.status === 'checkpointed') {
+				recoveryMode = 'checkpoint';
+				startFresh = false;
 			}
 
 			const active = await getActiveDispatchByRunId(run.id);
@@ -694,7 +709,9 @@ export const runsRouter = router({
 			};
 			await requestRunCancellation(run.id, origin);
 
-			if (run.status === 'deferred') {
+			// Both retry-pending statuses settle the same way (issue #503): a `checkpointed`
+			// run has a waiting dispatch and no live agent, exactly like a `deferred` one.
+			if (isRetryPendingStatus(run.status)) {
 				// Cancel the canonical dispatch and fail the row atomically while still deferred (issue #284).
 				// Preserves session info and payload for future recovery retry (issue #306).
 				const res = await cancelDeferredRunInDb(run.id, RUN_CANCELLED_MESSAGE, origin);

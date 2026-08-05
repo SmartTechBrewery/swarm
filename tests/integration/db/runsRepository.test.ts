@@ -1450,6 +1450,120 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 		});
 	});
 
+	/**
+	 * The `checkpointed` retry-pending status (issue #503). These run against real SQL
+	 * because every one of them is a *query* claim: which rows the retention pin sees,
+	 * which the runs list hides, and which columns survive a retry.
+	 */
+	describe('checkpointed runs (Tier 2, issue #503)', () => {
+		const CHECKPOINT = {
+			phase: 'implementation' as const,
+			completed: ['Added the schema and its tests'],
+			remaining: ['Update the docs', 'Run the focused tests'],
+			decisions: [],
+			workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+		};
+
+		async function checkpointedRun(taskId: string, continuationCount = 1): Promise<string> {
+			const id = await createRun({ projectId: PROJECT_ID, taskId, phase: 'implementation' });
+			await completeRun(id, {
+				status: 'checkpointed',
+				engine: 'claude',
+				error: 'rate limited',
+				agentSessionId: null,
+				checkpoint: CHECKPOINT,
+				continuationCount,
+			});
+			return id;
+		}
+
+		it('persists the checkpoint and the spent continuation count', async () => {
+			const id = await checkpointedRun('120');
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.status).toBe('checkpointed');
+			expect(row?.agentSessionId).toBeNull();
+			expect(row?.checkpoint).toEqual(CHECKPOINT);
+			expect(row?.continuationCount).toBe(1);
+		});
+
+		// The retention pin cannot key on `agent_session_id` here: a checkpointed row has
+		// none by design, and pruning its checkout would delete the tree its checkpoint
+		// describes.
+		it('pins the task checkout even though it holds no session id', async () => {
+			await checkpointedRun('121');
+			expect(await hasResumableDeferredRun(PROJECT_ID, '121')).toBe(true);
+		});
+
+		it('is hidden from the runs list while a dispatch is waiting on it, like a deferred row', async () => {
+			const id = await checkpointedRun('122');
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: {
+					...createMockScmWebhookJob({ deliveryId: 'checkpointed-dispatch' }),
+					projectId: PROJECT_ID,
+					runId: id,
+				} as SwarmJob,
+				source: 'synthetic',
+				waitReason: 'rate-limit',
+				runId: id,
+				state: 'retry-scheduled',
+			});
+
+			const { data } = await listRunsFromDb({ projectId: PROJECT_ID, limit: 50, offset: 0 });
+			expect(data.map((row) => row.id)).not.toContain(id);
+		});
+
+		// The count is the bound on the fallback, so the very retry the fallback scheduled
+		// must not reset it — otherwise the loop is unbounded.
+		it('keeps the continuation count and checkpoint through a retry', async () => {
+			const id = await checkpointedRun('123', 2);
+
+			expect(await resetRunToRunning(id, undefined, 'checkpointed')).toBe(true);
+			const row = await getRunByIdFromDb(id);
+			expect(row?.status).toBe('running');
+			expect(row?.continuationCount).toBe(2);
+			expect(row?.checkpoint).toEqual(CHECKPOINT);
+		});
+
+		// "Reset & restart" is the one action that forgives the spent budget: it discards
+		// the checkout, so the checkpoint describes a tree that no longer exists.
+		it('clears both on a reset-and-restart', async () => {
+			const id = await checkpointedRun('124', 2);
+
+			await clearRunRecovery(id);
+			const row = await getRunByIdFromDb(id);
+			expect(row?.continuationCount).toBe(0);
+			expect(row?.checkpoint).toBeNull();
+		});
+
+		it('can be terminated through the deferred-cancellation path, preserving no session', async () => {
+			const id = await checkpointedRun('125');
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: {
+					...createMockScmWebhookJob({ deliveryId: 'checkpointed-cancel' }),
+					projectId: PROJECT_ID,
+					runId: id,
+				} as SwarmJob,
+				source: 'synthetic',
+				waitReason: 'rate-limit',
+				runId: id,
+				state: 'retry-scheduled',
+			});
+
+			const result = await cancelDeferredRunInDb(id, 'Cancelled by user', {
+				source: 'dashboard',
+				requestedAt: new Date().toISOString(),
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.dispatch).not.toBeNull();
+			expect(result.preservedSession).toBeNull();
+			expect((await getRunByIdFromDb(id))?.status).toBe('failed');
+		});
+	});
+
 	// The optional-`excludeRunId` form the provision-time lease-liveness check uses
 	// (issue #427); the #424 reset path's always-excluded form is covered above.
 	describe('hasLiveRunForTask without an excluded run (issue #427)', () => {
