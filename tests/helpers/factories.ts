@@ -494,6 +494,70 @@ export function createMockGitLabPipelinePayload(
 	return payload;
 }
 
+/**
+ * A GitLab **REST** merge-request object, as
+ * `GET /projects/:id/merge_requests/:iid` returns it — the read counterpart of
+ * {@link createMockGitLabMergeRequestPayload}'s webhook body. Unlike the webhook
+ * shape it names the head commit in `sha` and carries `diff_refs` (whose
+ * `base_sha` is the **merge base**) and the mergeability pair
+ * `merge_status`/`detailed_merge_status`. Top-level overrides are shallow-merged,
+ * so passing `diff_refs` replaces the whole sub-object.
+ */
+export function createMockGitLabMergeRequestResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: 99,
+		iid: 17,
+		project_id: 42,
+		title: 'Add a thing',
+		state: 'opened',
+		draft: false,
+		work_in_progress: false,
+		author: gitlabUser('human-dev', 6),
+		source_branch: 'swarm/issue-17',
+		target_branch: 'main',
+		source_project_id: 42,
+		target_project_id: 42,
+		sha: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		merge_status: 'can_be_merged',
+		detailed_merge_status: 'mergeable',
+		diff_refs: {
+			base_sha: 'ce5965ddd2890b1e39d0f7b0d5b1e3f0b2c4a6d8',
+			head_sha: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+			start_sha: 'ce5965ddd2890b1e39d0f7b0d5b1e3f0b2c4a6d8',
+		},
+		web_url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+		...overrides,
+	};
+}
+
+/**
+ * A GitLab **REST** commit status, as
+ * `GET /projects/:id/repository/commits/:sha/statuses` returns each array entry.
+ * `name` is what identifies a job across re-runs, so it is what the aggregate read
+ * dedupes on, and `status` uses the same vocabulary a pipeline reports.
+ */
+export function createMockGitLabCommitStatusResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: 91,
+		name: 'unit-tests',
+		status: 'success',
+		ref: 'swarm/issue-17',
+		sha: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		allow_failure: false,
+		description: null,
+		target_url: 'https://gitlab.com/jkwiecien/swarm/-/jobs/91',
+		author: gitlabUser('ci-bot', 7),
+		created_at: '2026-08-04T10:00:00.000Z',
+		started_at: '2026-08-04T10:01:00.000Z',
+		finished_at: '2026-08-04T10:05:00.000Z',
+		...overrides,
+	};
+}
+
 export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent {
 	return ScmEventSchema.parse({
 		kind: 'pull-request',

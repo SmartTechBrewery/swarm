@@ -3,9 +3,10 @@
  * {@link SCMProvider} contract (`src/scm/types.ts`), built out over four phases
  * (issue #295) along the same seams Bitbucket used. Built so far: availability
  * probing, persona credential scoping, and persona identity / actor resolution
- * (phase 1/4), plus the whole inbound half — header interpretation, delivery
+ * (phase 1/4); the whole inbound half — header interpretation, delivery
  * authentication, event normalization, and the comment loop-prevention gate,
- * which all delegate to `./webhook.ts` (phase 2/4).
+ * which all delegate to `./webhook.ts` (phase 2/4); and the merge-request /
+ * commit-status reads, which delegate to `./merge-requests.ts` (phase 3/4).
  *
  * Its core job is the same as the GitHub and Bitbucket classes': run a block of
  * GitLab operations under the correct persona's token. Callers hand it a project
@@ -17,9 +18,9 @@
  *
  * **Every method a later phase owns throws** — loudly, naming the method and the
  * phase that fills it in — rather than returning `null`, `[]`, or a no-op that
- * would read as a real answer. What is left is the merge-request reads (phase
- * 3/4) and the comments/delivery/merge writes (phase 4/4), all of them `async` in
- * the contract, so those stubs reject rather than throwing synchronously.
+ * would read as a real answer. What is left is the comments/delivery/merge writes
+ * (phase 4/4), all of them `async` in the contract, so those stubs reject rather
+ * than throwing synchronously.
  *
  * Unlike Bitbucket's phase 1, **nothing registers this provider yet**: the
  * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
@@ -46,6 +47,12 @@ import type {
 import { withGitLabToken } from './client.js';
 import { getGitLabToken, getGitLabTokenOrNull } from './credentials.js';
 import {
+	getGitLabCommitStatuses,
+	getGitLabMergeRequest,
+	getGitLabMergeRequestTitle,
+	listOpenGitLabMergeRequestsForBase,
+} from './merge-requests.js';
+import {
 	getGitLabPersonaForLogin,
 	isSwarmGitLabActor,
 	resolveGitLabPersonaIdentities,
@@ -68,7 +75,6 @@ function notImplementedYet(method: string, phase: string): never {
 	);
 }
 
-const READ_PHASE = 'phase 3/4 (merge-request reads)';
 const WRITE_PHASE = 'phase 4/4 (comments, delivery, merge)';
 
 export class GitLabSCMIntegration implements SCMProvider {
@@ -154,23 +160,67 @@ export class GitLabSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: merge-request reads — phase 3/4
+	// Merge-request reads — phase 3/4, in `./merge-requests.ts`
 	// ==========================================================================
 
-	async getPullRequest(): Promise<PullRequestDetails> {
-		notImplementedYet('getPullRequest', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getPullRequest}. `prNumber` is GitLab's `iid`, as the
+	 * contract's doc allows. Reads under the **reviewer** persona by default, the
+	 * persona GitHub's and Bitbucket's adapters read one as on the review path.
+	 * Unlike Bitbucket, `mergeable` carries GitLab's real tri-state.
+	 */
+	async getPullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		persona: ScmPersona = 'reviewer',
+	): Promise<PullRequestDetails> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getGitLabMergeRequest(project.repo, prNumber),
+		);
 	}
 
-	async getPullRequestTitle(): Promise<string | null> {
-		notImplementedYet('getPullRequestTitle', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getPullRequestTitle}. Defaults to the **implementer** — the
+	 * merge request's author, whose credential is always configured for a project that
+	 * opens them — matching the other two adapters' default for the same read.
+	 */
+	async getPullRequestTitle(
+		project: ProjectConfig,
+		prNumber: number,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getGitLabMergeRequestTitle(project.repo, prNumber),
+		);
 	}
 
-	async getAggregateCheckStatus(): Promise<AggregateCheckStatus> {
-		notImplementedYet('getAggregateCheckStatus', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getAggregateCheckStatus} — every commit status on `ref`,
+	 * aggregated. Reads under the **reviewer** persona by default, the same scope the
+	 * other two adapters use for the review handler's aggregate query.
+	 */
+	async getAggregateCheckStatus(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<AggregateCheckStatus> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getGitLabCommitStatuses(project.repo, ref),
+		);
 	}
 
-	async listConflictCandidates(): Promise<PullRequestDetails[]> {
-		notImplementedYet('listConflictCandidates', READ_PHASE);
+	/**
+	 * {@link SCMProvider.listConflictCandidates} — open same-project merge requests
+	 * targeting `baseBranch`, read as the **implementer** (the persona that would push
+	 * the resolution), same as GitHub's and Bitbucket's.
+	 */
+	async listConflictCandidates(
+		project: ProjectConfig,
+		baseBranch: string,
+	): Promise<PullRequestDetails[]> {
+		return this.withPersonaCredentials(project, 'implementer', () =>
+			listOpenGitLabMergeRequestsForBase(project.repo, baseBranch),
+		);
 	}
 
 	// ==========================================================================
