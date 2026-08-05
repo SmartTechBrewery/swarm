@@ -67,7 +67,7 @@ import { discoverCliQuotas } from '../harness/quota-discovery.js';
 // not only in the worker entrypoint, because the control plane's own dispatch
 // consumer (`src/router/dispatcher.ts`) drives `processJob` too.
 import '../integrations/entrypoint.js';
-import { createGitHubProjectsProvider } from '../integrations/pm/github-projects/provider.js';
+import { requireProjectPMAdapter, requireProjectPMProvider } from '../integrations/pm/registry.js';
 import { requireProjectSCMProvider, requireSCMProvider } from '../integrations/scm/registry.js';
 import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
@@ -103,7 +103,7 @@ import {
 	RUN_CANCELLED_MESSAGE,
 } from '../queue/cancellation.js';
 import {
-	type GitHubProjectsWebhookJob,
+	type PmWebhookJob,
 	type ScmWebhookJob,
 	type SwarmJob,
 	SwarmJobSchema,
@@ -562,8 +562,7 @@ function deferAgentRunError(
 			failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled',
 		resumeDelivery: failure.kind === 'delivery' || undefined,
 		pmPhaseStarted:
-			job.type === 'github-projects' &&
-			(trigger.phase === 'planning' || trigger.phase === 'implementation'),
+			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
 		failureKind: failure.kind,
 	};
 }
@@ -612,8 +611,7 @@ function deferDependencyBlock(
 		// The phase was entered (its gate ran) — preserve board dispatch intent so the
 		// re-check re-enters Implementation even though the card never moved.
 		pmPhaseStarted:
-			job.type === 'github-projects' &&
-			(trigger.phase === 'planning' || trigger.phase === 'implementation'),
+			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
 		runId,
 	};
 }
@@ -664,8 +662,7 @@ function deferWorkerIneligible(
 		// exactly as the dependency gate does — the re-check must re-enter the same
 		// phase even though the card never moved.
 		pmPhaseStarted:
-			job.type === 'github-projects' &&
-			(trigger.phase === 'planning' || trigger.phase === 'implementation'),
+			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
 		// The gate refuses before `tryCreateRun`, so a fresh dispatch has no row yet
 		// (`runId` is undefined). A retry carries its originating row, which must
 		// survive so the next re-check keeps re-using it rather than orphaning it —
@@ -1169,7 +1166,7 @@ export function resolvePmDelivery(project: ProjectConfig): PMProvider | undefine
 		controlPlaneUrl,
 		workerCredential,
 		projectId: project.id,
-		localDelegate: createGitHubProjectsProvider(project),
+		localDelegate: requireProjectPMProvider(project),
 	});
 }
 
@@ -1236,7 +1233,7 @@ export interface AssignedPhaseInputs {
 	 * control-plane PM write delegate (ADR-004 §2, {@link resolvePmDelivery}) or
 	 * DB-free dispatch injection (ADR-003 §2, `../transport/assignment-execution.ts`),
 	 * or `undefined` to use the phase's own in-process provider (the local host
-	 * worker, via `createGitHubProjectsProvider`). Mirrors {@link delivery} on the
+	 * worker, via `requireProjectPMProvider`). Mirrors {@link delivery} on the
 	 * SCM side.
 	 */
 	pm?: PMProvider;
@@ -1323,8 +1320,8 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 		resumeDelivery: inputs.resumeDelivery,
 	};
 	// Additive DB-free injection (see `AssignedPhaseInputs`): forward an injected
-	// PM/delivery/token straight through, defaulting the PM to the concrete GitHub
-	// provider (the one place a concrete provider is named, per ai/RULES.md §2) and
+	// PM/delivery/token straight through, defaulting the PM to the project's
+	// registry-resolved provider (never a concrete one, per ai/RULES.md §2) and
 	// leaving delivery/`getToken` unset so a phase builds its own DB-backed default
 	// on the in-process path. `agentToken` becomes the phase's `getToken` seam.
 	const { delivery } = inputs;
@@ -1332,7 +1329,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 	const getToken = agentToken !== undefined ? async () => agentToken : undefined;
 	// Resolved lazily so a phase that takes no PM provider (review / respond-to-ci /
 	// resolve-conflicts) constructs none — preserving the in-process path exactly.
-	const resolvePm = () => inputs.pm ?? createGitHubProjectsProvider(project);
+	const resolvePm = () => inputs.pm ?? requireProjectPMProvider(project);
 	switch (inputs.phase) {
 		case 'planning':
 			if (!inputs.workItem) throw new Error('planning phase requires a workItem');
@@ -2058,10 +2055,10 @@ function agentColumns(agent: AgentCliResult | undefined): Partial<CompleteRunInp
  * After a PM-driven phase's own `autoAdvance` moves the item to a status that
  * starts the *next* phase (currently only Planning → "ToDo" → Implementation,
  * `src/pm/pipeline.ts`), self-enqueue a synthetic board-status job for it
- * instead of waiting on GitHub's webhook echo of that move.
+ * instead of waiting on the provider's webhook echo of that move.
  *
- * The router's loop-prevention gate (`GitHubProjectsRouterAdapter.isSelfAuthored`)
- * drops *every* Projects status-change webhook authored by a SWARM persona —
+ * The router's loop-prevention gate (`PMRouterAdapter.isSelfAuthored`)
+ * drops *every* board status-change webhook authored by a SWARM persona —
  * correctly, since that's exactly the feedback loop it exists to break. But
  * Planning moves its own card using the `implementer` persona
  * (`src/integrations/scm/github/personas.ts`), the very identity that move's
@@ -2090,17 +2087,14 @@ async function selfEnqueueNextPhase(
 	if (!nextPhase) return;
 
 	try {
+		// The synthetic event is the *provider's* to shape: assembling one needs its
+		// own board mapping, so it comes off the adapter rather than being built from
+		// `project.githubProjects` here (ai/RULES.md §2).
 		const job: SwarmJob = {
-			type: 'github-projects',
+			type: 'pm',
+			providerId: project.pm.type,
 			projectId: project.id,
-			event: {
-				eventType: 'projects_v2_item',
-				action: 'edited',
-				itemNodeId: workItem.id,
-				projectNodeId: project.githubProjects.projectId,
-				changedFieldNodeId: project.githubProjects.statusFieldId,
-				changedFieldType: 'single_select',
-			},
+			event: requireProjectPMAdapter(project).synthesizeStateChange(project, workItem.id),
 		};
 		await createAndPublishDispatch({
 			projectId: project.id,
@@ -2110,14 +2104,14 @@ async function selfEnqueueNextPhase(
 		});
 		logger.debug('pm-status: self-enqueued next phase after auto-advance', {
 			projectId: project.id,
-			itemNodeId: workItem.id,
+			itemId: workItem.id,
 			movedTo,
 			nextPhase,
 		});
 	} catch (err) {
 		logger.error('Failed to self-enqueue next phase after auto-advance', {
 			projectId: project.id,
-			itemNodeId: workItem.id,
+			itemId: workItem.id,
 			movedTo,
 			nextPhase,
 			error: err instanceof Error ? err.message : String(err),
@@ -2216,7 +2210,7 @@ async function reportPhaseFailureToBoardOrPr(
 	try {
 		const body = phaseFailureCommentBody(trigger.phase, error, failureDiagnosis);
 		if ('workItem' in trigger) {
-			const pm = createGitHubProjectsProvider(project);
+			const pm = requireProjectPMProvider(project);
 			const commentId = await pm.addComment(trigger.workItem.id, body);
 			logger.debug('Posted phase-failure comment to the board item', {
 				projectId: project.id,
@@ -2330,12 +2324,12 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 
 		const body = interruptedRunCommentBody(error);
 
-		if (job.type === 'github-projects') {
-			const pm = createGitHubProjectsProvider(project);
-			const commentId = await pm.addComment(job.event.itemNodeId, body);
+		if (job.type === 'pm') {
+			const pm = requireProjectPMProvider(project);
+			const commentId = await pm.addComment(job.event.itemId, body);
 			logger.info('Posted interrupted-run comment on board item', {
 				projectId: project.id,
-				itemNodeId: job.event.itemNodeId,
+				itemId: job.event.itemId,
 				commentId,
 			});
 			return;
@@ -2395,7 +2389,7 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
  * (SIGTERM→SIGKILL) so graceful shutdown doesn't hang behind a long run.
  */
 function buildTriggerContext(
-	job: ScmWebhookJob | GitHubProjectsWebhookJob,
+	job: ScmWebhookJob | PmWebhookJob,
 	project: ProjectConfig,
 ): TriggerContext {
 	return job.type === 'scm'
@@ -2421,8 +2415,13 @@ function buildTriggerContext(
 				runId: job.runId,
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
 				resumePmPhase: job.resumePmPhase,
-				source: 'github-projects',
+				source: 'pm',
+				providerId: job.providerId,
 				event: job.event,
+				// Same as the SCM branch: the composition root resolves the concrete
+				// provider exactly once, from the registry, so no trigger handler ever
+				// names one (ai/RULES.md §2).
+				pm: requireProjectPMProvider(project),
 			};
 }
 
@@ -2697,7 +2696,7 @@ async function gateDispatch(
 				// Only an item that actually names an assignee needs the provider (for
 				// its `type`, to resolve the identity link) — an unassigned item takes
 				// the unassigned path without one being constructed.
-				pm: workItem?.assignees.length ? createGitHubProjectsProvider(project) : undefined,
+				pm: workItem?.assignees.length ? requireProjectPMProvider(project) : undefined,
 			},
 			gateOptions,
 		);
@@ -2849,7 +2848,7 @@ export async function processJob(
 		logger.debug('Job matched no trigger — completing as a no-op', {
 			projectId: project.id,
 			source: ctx.source,
-			event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.eventType,
+			event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
 			deliveryId: job.deliveryId,
 		});
 		if (job.runId) {

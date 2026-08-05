@@ -98,13 +98,13 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		// the outcome says the phase started. Branch reuse is governed by the
 		// separate durable provisioning checkpoint on `job`.
 		...((intent.pmPhaseStarted || resumePmPhase !== undefined) &&
-		job.type === 'github-projects' &&
+		job.type === 'pm' &&
 		(intent.phase === 'planning' || intent.phase === 'implementation')
 			? { resumePmPhase: intent.phase }
 			: {}),
 		// Continue the prior agent session on the retry when the deferral was a
-		// resumable one; separate from `resumePmPhase`, which is only the
-		// github-projects board-dispatch signal.
+		// resumable one; separate from `resumePmPhase`, which is only the PM
+		// board-dispatch signal.
 		...(intent.resumable ? { resumeSession: true } : {}),
 		// Delivery retries reuse a valid progress-marked worktree, independent of
 		// whether the completed agent run exposed a session id.
@@ -123,7 +123,7 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
  * its reconstruct-from-run-row fallback, and "Reset & restart".
  *
  * The stored payload is normalized first: two of those three callers pass a raw
- * `run.jobPayload` straight out of `jsonb`, so a pre-#385 row would otherwise be
+ * `run.jobPayload` straight out of `jsonb`, so a pre-#385/#297 row would otherwise be
  * re-persisted in its legacy envelope on every manual retry and never heal.
  */
 export function reconstructRetryJob(
@@ -140,7 +140,7 @@ export function reconstructRetryJob(
 	const job = { ...normalizeStoredJobPayload(jobPayload) };
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
-	if (job.type === 'github-projects' && (phase === 'planning' || phase === 'implementation')) {
+	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
 		job.resumePmPhase = phase;
 	}
 	if (cli) job.cliOverride = cli;
@@ -176,8 +176,7 @@ export function deriveCapacityPendingPayload(
 	return {
 		...parsed,
 		...(intent.runId ? { runId: intent.runId } : {}),
-		...(parsed.type === 'github-projects' &&
-		(intent.phase === 'planning' || intent.phase === 'implementation')
+		...(parsed.type === 'pm' && (intent.phase === 'planning' || intent.phase === 'implementation')
 			? { resumePmPhase: intent.phase }
 			: {}),
 		...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),

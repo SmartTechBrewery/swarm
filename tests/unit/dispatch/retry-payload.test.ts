@@ -5,10 +5,7 @@ import {
 	reconstructRetryJob,
 } from '@/dispatch/retry-payload.js';
 import type { SwarmJob } from '@/queue/jobs.js';
-import {
-	createMockGitHubProjectsWebhookJob,
-	createMockScmWebhookJob,
-} from '../../helpers/factories.js';
+import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
 // The payload derivation previously lived inside the fire-and-forget re-enqueue
 // handler (`src/worker/deferred-retry.ts`); issue #284 made it pure so the
@@ -27,7 +24,7 @@ describe('deriveRetryJobPayload', () => {
 
 	it('spends the dependency-recheck budget, not the rate-limit one, for a dependency deferral', () => {
 		const next = deriveRetryJobPayload(
-			createMockGitHubProjectsWebhookJob({ dependencyRecheckAttempt: 2, rateLimitRetryAttempt: 1 }),
+			createMockPmWebhookJob({ dependencyRecheckAttempt: 2, rateLimitRetryAttempt: 1 }),
 			{
 				phase: 'implementation',
 				runId: 'run-1',
@@ -45,7 +42,7 @@ describe('deriveRetryJobPayload', () => {
 
 	it('spends the worker-eligibility budget for a gate deferral, leaving the others alone', () => {
 		const next = deriveRetryJobPayload(
-			createMockGitHubProjectsWebhookJob({
+			createMockPmWebhookJob({
 				workerEligibilityRecheckAttempt: 4,
 				dependencyRecheckAttempt: 2,
 				rateLimitRetryAttempt: 1,
@@ -66,7 +63,7 @@ describe('deriveRetryJobPayload', () => {
 	});
 
 	it('keeps PM resume for an interrupted Implementation', () => {
-		const next = deriveRetryJobPayload(createMockGitHubProjectsWebhookJob(), {
+		const next = deriveRetryJobPayload(createMockPmWebhookJob(), {
 			phase: 'implementation',
 			runId: 'run-1',
 			resumable: true,
@@ -78,7 +75,7 @@ describe('deriveRetryJobPayload', () => {
 
 	it('drops stale resume flags for a fresh (non-resumable) retry', () => {
 		const next = deriveRetryJobPayload(
-			createMockGitHubProjectsWebhookJob({
+			createMockPmWebhookJob({
 				resumePmPhase: 'implementation',
 				resumeSession: true,
 				resumeDelivery: true,
@@ -106,7 +103,7 @@ describe('deriveRetryJobPayload', () => {
 
 	it('preserves an explicit branch checkpoint and prior PM intent through a re-deferral', () => {
 		const next = deriveRetryJobPayload(
-			createMockGitHubProjectsWebhookJob({
+			createMockPmWebhookJob({
 				runId: 'run-1',
 				resumePmPhase: 'implementation',
 				implementationBranchProvisioned: true,
@@ -144,7 +141,7 @@ describe('deriveCapacityPendingPayload', () => {
 	});
 
 	it('records exact PM dispatch intent so a stale board status cannot dedupe the wake-up', () => {
-		const pending = deriveCapacityPendingPayload(createMockGitHubProjectsWebhookJob(), {
+		const pending = deriveCapacityPendingPayload(createMockPmWebhookJob(), {
 			phase: 'implementation',
 			runId: 'run-1',
 			resumable: false,

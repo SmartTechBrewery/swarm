@@ -20,7 +20,7 @@ import { normalizeStoredJobPayload, QUEUE_NAME, type SwarmJob } from './jobs.js'
 let queue: Queue<SwarmJob> | null = null;
 
 /**
- * PM-driven events (`github-projects` card status changes, plus SCM `work-item`
+ * PM-driven events (`pm` card status changes, plus SCM `work-item`
  * invalidations that dispatch fallback Planning) are demoted below BullMQ's
  * implicit default priority so PR review-lifecycle events (`scm`: opened /
  * checks / reviews) never sit queued behind one. BullMQ ranks 0 (unset) as
@@ -35,15 +35,16 @@ export const PM_BOARD_JOB_PRIORITY = 10;
 /**
  * Normalizes before branching: most callers hand this a payload read straight out
  * of a `jsonb` column (`dispatch.jobPayload`, `run.jobPayload`), which is *typed*
- * {@link SwarmJob} but may still carry the pre-#385 `{ type: 'github' }` envelope
- * — and that envelope matches neither arm, so a resurrected legacy board job would
- * silently fall through to `undefined` → `priority: 0`, BullMQ's *highest*, the
- * exact inversion this demotion exists to prevent. Doing it here rather than at
- * each call site covers every current and future caller.
+ * {@link SwarmJob} but may still carry a pre-#385/#297 `{ type: 'github' }` /
+ * `{ type: 'github-projects' }` envelope — and that envelope matches neither arm,
+ * so a resurrected legacy board job would silently fall through to `undefined` →
+ * `priority: 0`, BullMQ's *highest*, the exact inversion this demotion exists to
+ * prevent. Doing it here rather than at each call site covers every current and
+ * future caller.
  */
 export function priorityFor(job: SwarmJob): number | undefined {
 	const normalized = normalizeStoredJobPayload(job);
-	return normalized.type === 'github-projects' ||
+	return normalized.type === 'pm' ||
 		(normalized.type === 'scm' && normalized.event.kind === 'work-item')
 		? PM_BOARD_JOB_PRIORITY
 		: undefined;

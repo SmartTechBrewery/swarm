@@ -94,6 +94,9 @@ describe('GitHubProjectsPMProvider', () => {
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 				status: 'In progress',
 				statusId: '47fc9ee4',
+				// The provider resolves the board option id to its canonical pipeline key
+				// so shared code never inverts `statusOptions` itself (issue #297).
+				statusKey: 'inProgress',
 				labels: [{ id: 'L1', name: 'phase-4', color: 'blue' }],
 				// The node carries no `assignees` at all — an unassigned item is `[]`.
 				assignees: [],

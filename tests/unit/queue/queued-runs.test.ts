@@ -9,10 +9,7 @@ import {
 	sortQueuedRuns,
 	toQueuedRuns,
 } from '@/queue/queued-runs.js';
-import {
-	createMockGitHubProjectsWebhookJob,
-	createMockScmWebhookJob,
-} from '../../helpers/factories.js';
+import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
 /** A waiting dispatch row, shaped like `listWaitingDispatches()` returns them. */
 function makeDispatch(overrides: Partial<DispatchRow> = {}): DispatchRow {
@@ -60,8 +57,8 @@ const MERGE_JOB = {
 };
 
 describe('deriveQueuedPhaseHint', () => {
-	it('hints board for every github-projects job', () => {
-		expect(deriveQueuedPhaseHint(createMockGitHubProjectsWebhookJob())).toBe('board');
+	it('hints board for every pm job', () => {
+		expect(deriveQueuedPhaseHint(createMockPmWebhookJob())).toBe('board');
 	});
 
 	it('hints merge-automation for a merge-automation job', () => {
@@ -147,7 +144,7 @@ describe('deriveDispatchPhaseHint', () => {
 	it('returns the event-derived hint for a never-claimed board dispatch', () => {
 		const dispatch = makeDispatch({
 			phase: null,
-			jobPayload: createMockGitHubProjectsWebhookJob(),
+			jobPayload: createMockPmWebhookJob(),
 		});
 		expect(deriveDispatchPhaseHint(dispatch)).toBe('board');
 	});
@@ -155,7 +152,7 @@ describe('deriveDispatchPhaseHint', () => {
 	it('prefers a worker-resolved phase over the event-derived hint', () => {
 		const dispatch = makeDispatch({
 			phase: 'planning',
-			jobPayload: createMockGitHubProjectsWebhookJob(),
+			jobPayload: createMockPmWebhookJob(),
 		});
 		expect(deriveDispatchPhaseHint(dispatch)).toBe('planning');
 	});
@@ -163,7 +160,7 @@ describe('deriveDispatchPhaseHint', () => {
 	it('falls back to the event-derived hint when the stored phase is not a known hint', () => {
 		const dispatch = makeDispatch({
 			phase: 'not-a-real-phase',
-			jobPayload: createMockGitHubProjectsWebhookJob(),
+			jobPayload: createMockPmWebhookJob(),
 		});
 		expect(deriveDispatchPhaseHint(dispatch)).toBe('board');
 	});
@@ -206,8 +203,8 @@ describe('deriveReviewGate', () => {
 		});
 	});
 
-	it('is undefined for a github-projects job', () => {
-		expect(deriveReviewGate(createMockGitHubProjectsWebhookJob())).toBeUndefined();
+	it('is undefined for a pm job', () => {
+		expect(deriveReviewGate(createMockPmWebhookJob())).toBeUndefined();
 	});
 
 	it('is undefined for a non-review-hinted scm job (e.g. failed checks)', () => {
@@ -346,11 +343,11 @@ describe('toQueuedRuns', () => {
 		expect(item.workItemNodeId).toBeUndefined();
 	});
 
-	it('maps a github-projects job to workItemNodeId + contentType, no repo fields', () => {
-		const job = createMockGitHubProjectsWebhookJob({
+	it('maps a pm job to providerId + workItemNodeId + contentType, no repo fields', () => {
+		const job = createMockPmWebhookJob({
 			event: {
-				...createMockGitHubProjectsWebhookJob().event,
-				itemNodeId: 'PVTI_abc',
+				...createMockPmWebhookJob().event,
+				itemId: 'PVTI_abc',
 				contentType: 'Issue',
 			},
 		});
@@ -358,7 +355,8 @@ describe('toQueuedRuns', () => {
 		const [item] = toQueuedRuns([makeDispatch({ jobPayload: job, priority: 10 })]);
 
 		expect(item).toMatchObject({
-			type: 'github-projects',
+			type: 'pm',
+			providerId: 'github-projects',
 			workItemNodeId: 'PVTI_abc',
 			contentType: 'Issue',
 			state: 'prioritized',
@@ -370,7 +368,7 @@ describe('toQueuedRuns', () => {
 
 	it('prefers the worker-resolved phase over the event-derived hint', () => {
 		const [item] = toQueuedRuns([
-			makeDispatch({ phase: 'implementation', jobPayload: createMockGitHubProjectsWebhookJob() }),
+			makeDispatch({ phase: 'implementation', jobPayload: createMockPmWebhookJob() }),
 		]);
 		expect(item.phaseHint).toBe('implementation');
 	});
@@ -432,9 +430,7 @@ describe('toQueuedRuns', () => {
 	});
 
 	it('omits reviewGate for a job that is not a review-gate input', () => {
-		const [item] = toQueuedRuns([
-			makeDispatch({ jobPayload: createMockGitHubProjectsWebhookJob() }),
-		]);
+		const [item] = toQueuedRuns([makeDispatch({ jobPayload: createMockPmWebhookJob() })]);
 		expect(item.reviewGate).toBeUndefined();
 	});
 
@@ -503,7 +499,7 @@ describe('toQueuedRuns', () => {
 
 	it('carries the effective priority through', () => {
 		const [item] = toQueuedRuns([
-			makeDispatch({ priority: 10, jobPayload: createMockGitHubProjectsWebhookJob() }),
+			makeDispatch({ priority: 10, jobPayload: createMockPmWebhookJob() }),
 		]);
 		expect(item.priority).toBe(10);
 	});
@@ -629,12 +625,12 @@ describe('sortQueuedRuns', () => {
 		expect(items.map((i) => i.jobId)).toEqual(['earlier-available', 'later-available']);
 	});
 
-	it('orders priority-0 github ahead of priority-10 github-projects within the runnable group', () => {
+	it('orders priority-0 github ahead of priority-10 pm board work within the runnable group', () => {
 		const items = toQueuedRuns([
 			makeDispatch({
 				id: 'board',
 				priority: 10,
-				jobPayload: createMockGitHubProjectsWebhookJob(),
+				jobPayload: createMockPmWebhookJob(),
 				createdAt: new Date(1_700_000_000_000),
 			}),
 			makeDispatch({ id: 'review', priority: 0, createdAt: new Date(1_700_000_005_000) }),

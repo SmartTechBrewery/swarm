@@ -74,6 +74,7 @@ export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
 		url: item.url,
 		status: item.status,
 		statusId: item.statusId,
+		statusKey: item.statusKey,
 		labels: item.labels.map((label) => ({ id: label.id, name: label.name, color: label.color })),
 		assignees: item.assignees.map((assignee) => ({
 			handle: assignee.handle,

@@ -178,6 +178,8 @@ export const AssignedWorkItemSchema = z.object({
 	url: z.string(),
 	status: z.string().optional(),
 	statusId: z.string().optional(),
+	/** The canonical pipeline status key (`WorkItem.statusKey`) the provider resolved. */
+	statusKey: z.string().optional(),
 	labels: z.array(z.object({ id: z.string(), name: z.string(), color: z.string().optional() })),
 	assignees: z.array(
 		z.object({

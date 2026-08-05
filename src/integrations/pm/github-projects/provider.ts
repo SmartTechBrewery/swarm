@@ -44,6 +44,8 @@ import type {
 } from '../../../pm/types.js';
 import { getScopedClient } from '../../scm/github/client.js';
 import { GitHubSCMIntegration } from '../../scm/github/scm-integration.js';
+import type { GitHubProjectsIntegrationConfig } from './config-schema.js';
+import { resolveStatusKeyByOptionId } from './status-mapping.js';
 
 /** Shape of the `content` node a Projects item wraps (Issue / PullRequest). */
 interface ContentNode {
@@ -347,16 +349,24 @@ function ownerRepoFrom(content: ContentNode | null | undefined): {
 	return { owner, repo };
 }
 
-function toResolvedItem(item: ItemNode): ResolvedItem {
+/**
+ * Map a board item onto a `WorkItem`. `config` is the project's board mapping, and
+ * it is needed for exactly one thing: translating the opaque Status option ID into
+ * the canonical `statusKey` shared code resolves a pipeline phase from, so no
+ * caller has to invert `statusOptions` itself (ai/RULES.md §2).
+ */
+function toResolvedItem(item: ItemNode, config: GitHubProjectsIntegrationConfig): ResolvedItem {
 	const content = item.content ?? undefined;
 	const { owner, repo } = ownerRepoFrom(content);
+	const optionId = item.fieldValueByName?.optionId;
 	const workItem: WorkItem = {
 		id: item.id ?? '',
 		title: content?.title ?? '',
 		description: content?.body ?? '',
 		url: content?.url ?? '',
 		status: item.fieldValueByName?.name,
-		statusId: item.fieldValueByName?.optionId,
+		statusId: optionId,
+		statusKey: optionId === undefined ? undefined : resolveStatusKeyByOptionId(config, optionId),
 		labels: mapLabels(content),
 		assignees: mapAssignees(content),
 		createdAt: item.createdAt,
@@ -399,7 +409,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			if (!item?.id) {
 				throw new Error(`GitHub Projects item '${id}' did not resolve`);
 			}
-			return toResolvedItem(item);
+			return toResolvedItem(item, this.project.githubProjects);
 		});
 	}
 
@@ -448,7 +458,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			}
 			return nodes
 				.filter((n): n is ItemNode => !!n?.id)
-				.map((n) => toResolvedItem(n).workItem)
+				.map((n) => toResolvedItem(n, this.project.githubProjects).workItem)
 				.filter((wi) => wantedOptionId === undefined || wi.statusId === wantedOptionId);
 		});
 	}
@@ -583,6 +593,9 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				description: issue.body ?? '',
 				url: issue.html_url,
 				statusId: optionId,
+				// The caller named the canonical key, and `optionId` is its resolution —
+				// carry it back so the fresh item reads like one off a board read.
+				statusKey: resolveStatusKeyByOptionId(this.project.githubProjects, optionId),
 				labels: (issue.labels ?? [])
 					.map((l) =>
 						typeof l === 'string'

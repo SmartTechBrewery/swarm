@@ -11,16 +11,16 @@
  * serialized into the job) and the provider's delivery id for idempotency/tracing.
  *
  * The `type` discriminator names the *category* of work, not a provider: one
- * `scm` variant covers every SCM provider (which one produced it is the
- * `providerId` field, resolved through `scmProviderRegistry`), so adding a
- * provider never edits this file (ai/RULES.md §2). `github-projects` stays the PM
- * board's own variant until the PM ingress gets the same treatment.
+ * `scm` variant covers every SCM provider and one `pm` variant covers every PM
+ * provider (which one produced it is the `providerId` field, resolved through
+ * `scmProviderRegistry` / `pmProviderRegistry`), so adding a provider never edits
+ * this file (ai/RULES.md §2).
  */
 
 import { z } from 'zod';
 import { AgentCliSchema } from '../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../harness/models.js';
-import { GitHubProjectsParsedEventSchema } from '../router/adapters/github-projects.js';
+import { PmEventSchema, PmProviderIdSchema } from '../pm/events.js';
 import { ScmEventSchema, ScmProviderIdSchema } from '../scm/events.js';
 
 /** The single BullMQ queue the router produces onto and the worker consumes. */
@@ -75,7 +75,7 @@ const jobBase = z.object({
 	 * PM phase to resume after an agent failure. A retried implementation has
 	 * already moved its card to In progress, which normally is deliberately not
 	 * a phase-triggering status; this preserves the original dispatch intent.
-	 * Board-dispatch concern only (github-projects jobs) — session continuation is
+	 * Board-dispatch concern only (`pm` jobs) — session continuation is
 	 * the separate {@link resumeSession} flag, which spans every phase and CLI.
 	 */
 	resumePmPhase: z.enum(['planning', 'implementation']).optional(),
@@ -165,10 +165,16 @@ export const ScmWebhookJobSchema = jobBase.extend({
 	event: ScmEventSchema,
 });
 
-/** A `projects_v2_item` board event (Status change / card added) bound for the worker. */
-export const GitHubProjectsWebhookJobSchema = jobBase.extend({
-	type: z.literal('github-projects'),
-	event: GitHubProjectsParsedEventSchema,
+/** A normalized PM board event (status change / card added) bound for the worker. */
+export const PmWebhookJobSchema = jobBase.extend({
+	type: z.literal('pm'),
+	/**
+	 * Which registered PM provider produced (and therefore owns) this event — the
+	 * key the worker resolves through `pmProviderRegistry` to get the `PMProvider`
+	 * it injects into the trigger context.
+	 */
+	providerId: PmProviderIdSchema,
+	event: PmEventSchema,
 });
 
 /**
@@ -195,39 +201,52 @@ export const MergeAutomationJobSchema = jobBase.extend({
 
 const swarmJobVariants = z.discriminatedUnion('type', [
 	ScmWebhookJobSchema,
-	GitHubProjectsWebhookJobSchema,
+	PmWebhookJobSchema,
 	MergeAutomationJobSchema,
 ]);
 
 /**
- * Upgrade the pre-#385 SCM envelope, when the discriminator *was* the provider id
- * (`type: 'github'`). Durable dispatch rows and historical `runs.jobPayload`
- * snapshots still carry it — a dependency recheck can wait days, and a "Retry now"
+ * The envelopes whose discriminator *was* the provider id, before each category
+ * grew a `providerId` field: `github` (pre-#385, SCM) and `github-projects`
+ * (pre-#297, PM). Durable dispatch rows and historical `runs.jobPayload` snapshots
+ * still carry them — a dependency recheck can wait days, and a "Retry now"
  * re-parses a run's stored payload indefinitely — so a deploy must read them
- * rather than fail their in-flight work. The event inside upgrades in
- * {@link ScmEventSchema}'s own preprocess.
+ * rather than fail their in-flight work.
  *
- * Frozen: this is the queue's serialization history, not provider logic. A second
- * provider is written by ingress as `{ type: 'scm', providerId }` from day one.
+ * Frozen: this is the *queue's own* serialization history, not provider logic. A
+ * second provider in either category is written by ingress as
+ * `{ type, providerId }` from day one.
+ */
+const LEGACY_ENVELOPE_BY_TYPE: Readonly<
+	Record<string, { readonly type: string; readonly providerId: string }>
+> = {
+	github: { type: 'scm', providerId: 'github' },
+	'github-projects': { type: 'pm', providerId: 'github-projects' },
+};
+
+/**
+ * Upgrade a legacy job envelope (see {@link LEGACY_ENVELOPE_BY_TYPE}) in place.
+ * The event inside upgrades in {@link ScmEventSchema} / {@link PmEventSchema}'s own
+ * preprocess, so this only rewrites the envelope's two fields.
  */
 function upgradeLegacyJobEnvelope(value: unknown): unknown {
 	if (typeof value !== 'object' || value === null) return value;
 	const raw = value as Record<string, unknown>;
-	if (raw.type !== 'github') return value;
-	return { ...raw, type: 'scm', providerId: 'github' };
+	const upgraded = typeof raw.type === 'string' ? LEGACY_ENVELOPE_BY_TYPE[raw.type] : undefined;
+	return upgraded ? { ...raw, ...upgraded } : value;
 }
 
 export const SwarmJobSchema = z.preprocess(upgradeLegacyJobEnvelope, swarmJobVariants);
 
 export type ScmWebhookJob = z.infer<typeof ScmWebhookJobSchema>;
-export type GitHubProjectsWebhookJob = z.infer<typeof GitHubProjectsWebhookJobSchema>;
+export type PmWebhookJob = z.infer<typeof PmWebhookJobSchema>;
 export type MergeAutomationJob = z.infer<typeof MergeAutomationJobSchema>;
 export type SwarmJob = z.infer<typeof swarmJobVariants>;
 
 /**
  * Normalize a payload read straight out of Postgres, where `jobPayload` is a
  * `jsonb` column typed (not validated) as {@link SwarmJob} — so a row written
- * before #385 is *typed* current while still carrying the legacy envelope. Read
+ * before #385/#297 is *typed* current while still carrying the legacy envelope. Read
  * models must funnel through this before switching on `type`/`kind`; a payload
  * that no longer validates at all is returned untouched, exactly as an unvalidated
  * cast behaved before.

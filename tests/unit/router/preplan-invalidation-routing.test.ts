@@ -2,9 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createMockScmTriggerContext, createMockWorkItem } from '../../helpers/factories.js';
 
+// The handler resolves the project's PM provider through the registry (issue
+// #297), so fake it there. `registerPMProvider` must stay callable for any
+// provider module that registers itself at load.
 const { listWorkItems } = vi.hoisted(() => ({ listWorkItems: vi.fn() }));
-vi.mock('@/integrations/pm/github-projects/provider.js', () => ({
-	createGitHubProjectsProvider: () => ({
+vi.mock('@/integrations/pm/registry.js', () => ({
+	registerPMProvider: vi.fn(),
+	getPMProvider: vi.fn(),
+	requireProjectPMAdapter: vi.fn(),
+	requireProjectPMProvider: () => ({
 		type: 'github-projects',
 		supportsAssignees: true,
 		listWorkItems,

@@ -81,6 +81,7 @@ function toAssignedWorkItem(workItem: WorkItem): AssignedWorkItem {
 		url: workItem.url,
 		status: workItem.status,
 		statusId: workItem.statusId,
+		statusKey: workItem.statusKey,
 		labels: workItem.labels.map((label) => ({
 			id: label.id,
 			name: label.name,

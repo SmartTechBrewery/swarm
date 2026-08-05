@@ -34,7 +34,7 @@ function boardRun(overrides: Partial<QueuedRun> = {}): QueuedRun {
 	return {
 		jobId: 'job-board',
 		projectId: 'proj',
-		type: 'github-projects',
+		type: 'pm',
 		state: 'delayed',
 		phaseHint: 'board',
 		workItemNodeId: 'PVTI_lADODb1Ycc4Bcnwuzabc123',
@@ -73,7 +73,7 @@ describe('queuedWorkItemLabel', () => {
 		expect(queuedWorkItemLabel(githubRun({ repo: undefined }))).toBe('PR #42');
 	});
 
-	it('renders a resolved github-projects job using the persisted run label rules', () => {
+	it('renders a resolved pm board job using the persisted run label rules', () => {
 		expect(queuedWorkItemLabel(boardRun())).toBe('Issue: #42');
 		expect(queuedWorkItemTitle(boardRun())).toBe('Fix the widget');
 		expect(queuedWorkItemUrl(githubRun())).toBe('https://github.com/acme/widgets/pull/42');

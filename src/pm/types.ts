@@ -5,15 +5,18 @@
  *
  * Mirrors Cascade's `src/pm/types.ts`, scoped down to SWARM's MVP: Cascade
  * ships Trello/JIRA/Linear and a much wider surface (checklists, attachments,
- * custom fields, PR linking, discovery); SWARM has exactly one PM provider —
- * GitHub Projects (v2) — and the pipeline only needs four operations. The rest
- * are deliberately left out until a second provider or a phase actually needs
- * them; adding them speculatively would be a standards violation
- * (ai/CODING_STANDARDS.md "Comments" / "don't build it speculatively").
+ * custom fields, PR linking); SWARM has exactly one *implemented* PM provider —
+ * GitHub Projects (v2) — and this interface carries only the operations the
+ * pipeline actually performs. The rest are deliberately left out until a second
+ * provider or a phase actually needs them; adding them speculatively would be a
+ * standards violation (ai/CODING_STANDARDS.md "Comments" / "don't build it
+ * speculatively").
  *
- * This file defines *types only* — the adapter that implements it against the
- * GitHub Projects GraphQL API lives under
- * `src/integrations/pm/github-projects/` and is a separate Phase-2 issue.
+ * This file defines *types only* — no runtime import edge. The two companion
+ * halves of the PM contract are `src/pm/events.ts` (the Zod normalized inbound
+ * event, which crosses the queue boundary) and `src/pm/router-adapter.ts` (the
+ * ingress interface). The adapter that implements all three against the GitHub
+ * Projects GraphQL API lives under `src/integrations/pm/github-projects/`.
  *
  * IDs are plain `string` at this interface, on purpose: the contract is
  * provider-agnostic, so it can't name GitHub-specific branded types
@@ -23,7 +26,17 @@
  * narrows to its own branded IDs.
  */
 
-export type PMType = 'github-projects';
+/**
+ * Every PM provider id SWARM's shared surface recognizes. Vocabulary only —
+ * widened past the one implemented provider exactly as `ScmType`
+ * (`src/scm/types.ts`) named `bitbucket`/`gitlab` before either registered, so a
+ * new connector's own issue adds a folder and a manifest rather than editing the
+ * shared type. Nothing resolves `jira`/`linear`/`trello` until their manifests
+ * register: `getPMProvider` returns `null` and
+ * {@link import('../integrations/pm/registry.js').requireProjectPMProvider}
+ * throws a wiring-bug error.
+ */
+export type PMType = 'github-projects' | 'jira' | 'linear' | 'trello';
 
 /**
  * The discovery capabilities the board-mapping screen needs a provider to answer:
@@ -140,6 +153,19 @@ export interface WorkItem {
 	 * `status` for logic; `status` is display-only.
 	 */
 	statusId?: string;
+	/**
+	 * The canonical SWARM pipeline status key (`PM_STATUS_KEYS`,
+	 * `src/pm/pipeline.ts`) this item's status maps to, or `undefined` when it maps
+	 * to none. The provider owns the translation from its opaque native status
+	 * ({@link statusId}) — shared code resolves a pipeline phase from this key and
+	 * never from a board option id (ai/RULES.md §2).
+	 *
+	 * A plain field rather than a new {@link PMProvider} method: every provider
+	 * already resolves this on the way out of its own board read, so the mapping
+	 * rides along with the item instead of costing a second lookup that would need
+	 * the provider's config at the call site.
+	 */
+	statusKey?: string;
 	labels: WorkItemLabel[];
 	/**
 	 * Who the item is assigned to — always present, `[]` when nobody is assigned
@@ -224,9 +250,12 @@ export interface ListWorkItemsFilter {
 }
 
 /**
- * The contract every SWARM PM provider implements. MVP surface = the four
- * operations the pipeline (ai/ARCHITECTURE.md "Pipeline phases") needs to read
- * the board, move a card through it, and report back.
+ * The contract every SWARM PM provider implements: the operations the pipeline
+ * (ai/ARCHITECTURE.md "Pipeline phases") needs to read the board, create and
+ * update items, move a card through it, gate on dependencies, and report back —
+ * plus the optional `discover` the board-mapping screen dispatches through the
+ * manifest. The *inbound* half of a provider is the separate
+ * {@link import('./router-adapter.js').PMRouterAdapter}.
  */
 export interface PMProvider {
 	readonly type: PMType;
@@ -384,8 +413,8 @@ export interface PMProvider {
 	 * and throws for one it does not.
 	 *
 	 * Optional because discovery is a per-provider capability declared on the
-	 * manifest (`discovery`), not part of the four-method pipeline surface every
-	 * provider needs: a provider whose manifest declares no capabilities can omit
+	 * manifest (`discovery`), not part of the pipeline surface every provider
+	 * needs: a provider whose manifest declares no capabilities can omit
 	 * it entirely. Dispatch stays provider-agnostic — the router looks the method
 	 * up through the manifest rather than branching on a concrete provider
 	 * (ai/RULES.md §2).

@@ -1,15 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ProjectConfig } from '@/config/schema.js';
+import type { PmEvent } from '@/pm/events.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 
 vi.mock('@/triggers/pm-status-dedup.js', () => ({ recordStatusAndDetectChange: vi.fn() }));
 
+// The handler resolves the project's board adapter through the PM registry, which
+// is populated by the integrations entrypoint at module load — import it so the
+// `github-projects` manifest (and its real `isStatusChange`) is registered.
+import '@/integrations/entrypoint.js';
 import { buildPreplanContract, embedPreplanMarker } from '@/pipeline/preplan.js';
 import { createPmStatusTrigger } from '@/triggers/handlers/pm-status.js';
 import { recordStatusAndDetectChange } from '@/triggers/pm-status-dedup.js';
-import type { TriggerContext } from '@/triggers/types.js';
+import type { PmTriggerContext, TriggerContext } from '@/triggers/types.js';
 import {
-	createMockGitHubProjectsParsedEvent,
+	createMockPmEvent,
 	createMockProjectConfig,
 	createMockWorkItem,
 } from '../../../helpers/factories.js';
@@ -21,17 +25,11 @@ beforeEach(() => {
 	vi.mocked(recordStatusAndDetectChange).mockResolvedValue(true);
 });
 
-function ctx(
-	overrides: Partial<Parameters<typeof createMockGitHubProjectsParsedEvent>[0]> = {},
-): TriggerContext {
-	return {
-		project: PROJECT,
-		source: 'github-projects',
-		event: createMockGitHubProjectsParsedEvent(overrides),
-	};
-}
-
-/** A PM provider whose `getWorkItem` returns `workItem`, recording the id read. */
+/**
+ * A PM provider whose `getWorkItem` returns `workItem`, recording the id read.
+ * The handler reaches the board only through `ctx.pm` (issue #297), so a test
+ * substitutes this one field rather than injecting a factory.
+ */
 function providerReturning(workItem: WorkItem, seen: string[] = []): PMProvider {
 	return {
 		type: 'github-projects',
@@ -54,45 +52,64 @@ function providerReturning(workItem: WorkItem, seen: string[] = []): PMProvider 
 	};
 }
 
-function trigger(workItem: WorkItem) {
-	return createPmStatusTrigger({ createProvider: () => providerReturning(workItem) });
+function ctx(
+	workItem: WorkItem,
+	eventOverrides: Partial<PmEvent> = {},
+	seen: string[] = [],
+): PmTriggerContext {
+	return {
+		project: PROJECT,
+		source: 'pm',
+		providerId: 'github-projects',
+		event: createMockPmEvent(eventOverrides),
+		pm: providerReturning(workItem, seen),
+	};
 }
+
+const trigger = createPmStatusTrigger();
 
 describe('pm-status trigger', () => {
 	describe('matches', () => {
-		it('matches a Status-field edit on the project board', () => {
-			expect(trigger(createMockWorkItem()).matches(ctx())).toBe(true);
+		it('matches a state-field edit on the project board', () => {
+			expect(trigger.matches(ctx(createMockWorkItem()))).toBe(true);
 		});
 
 		it('matches a created card', () => {
-			expect(trigger(createMockWorkItem()).matches(ctx({ action: 'created' }))).toBe(true);
+			expect(trigger.matches(ctx(createMockWorkItem(), { action: 'created' }))).toBe(true);
 		});
 
-		it('matches a reordered card (Board-view drag between columns) regardless of the changed field', () => {
+		it('matches a moved card (Board-view drag between columns) regardless of the changed field', () => {
 			expect(
-				trigger(createMockWorkItem()).matches(
-					ctx({ action: 'reordered', changedFieldNodeId: undefined }),
-				),
+				trigger.matches(ctx(createMockWorkItem(), { action: 'moved', changedField: undefined })),
 			).toBe(true);
 		});
 
-		it('ignores an edit to a non-Status field', () => {
+		it('ignores an edit to a non-state field', () => {
 			expect(
-				trigger(createMockWorkItem()).matches(ctx({ changedFieldNodeId: 'PVTF_someOtherField' })),
+				trigger.matches(ctx(createMockWorkItem(), { changedField: 'PVTF_someOtherField' })),
 			).toBe(false);
 		});
 
 		it('ignores non-triggering actions', () => {
-			expect(trigger(createMockWorkItem()).matches(ctx({ action: 'deleted' }))).toBe(false);
+			expect(trigger.matches(ctx(createMockWorkItem(), { action: 'deleted' }))).toBe(false);
 		});
 
-		it('ignores non-projects sources', () => {
+		it('matches a resumed PM phase even when the event is not a state change', () => {
+			expect(
+				trigger.matches({
+					...ctx(createMockWorkItem(), { changedField: 'PVTF_someOtherField' }),
+					resumePmPhase: 'implementation',
+				}),
+			).toBe(true);
+		});
+
+		it('ignores non-PM sources', () => {
 			const scmCtx = {
 				project: PROJECT,
 				source: 'scm',
 				event: { kind: 'pull-request', repoFullName: 'x/y', isCommentEvent: false },
 			} as unknown as TriggerContext;
-			expect(trigger(createMockWorkItem()).matches(scmCtx)).toBe(false);
+			expect(trigger.matches(scmCtx)).toBe(false);
 		});
 	});
 
@@ -102,7 +119,7 @@ describe('pm-status trigger', () => {
 				statusId: '61e4505c', // Planning
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 			});
-			const result = await trigger(workItem).handle(ctx());
+			const result = await trigger.handle(ctx(workItem));
 			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
 		});
 
@@ -123,8 +140,7 @@ describe('pm-status trigger', () => {
 				description: embedPreplanMarker('Subtask 1 description', contract),
 				labels: [{ id: 'l1', name: 'swarm:split-child' }],
 			});
-			const result = await trigger(workItem).handle(ctx());
-			expect(result).toBeNull();
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
 		it('dispatches Planning when a valid preplan marker has no split-child label', async () => {
@@ -144,7 +160,7 @@ describe('pm-status trigger', () => {
 				description: embedPreplanMarker('Subtask 1 description', contract),
 				labels: [],
 			});
-			const result = await trigger(workItem).handle(ctx());
+			const result = await trigger.handle(ctx(workItem));
 			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
 		});
 
@@ -168,7 +184,7 @@ describe('pm-status trigger', () => {
 					{ id: 'l2', name: 'swarm:replan' },
 				],
 			});
-			const result = await trigger(workItem).handle(ctx());
+			const result = await trigger.handle(ctx(workItem));
 			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
 		});
 
@@ -177,13 +193,25 @@ describe('pm-status trigger', () => {
 				statusId: '3121a97d', // ToDo
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/12',
 			});
-			const result = await trigger(workItem).handle(ctx());
+			const result = await trigger.handle(ctx(workItem));
 			expect(result).toEqual({ phase: 'implementation', taskId: '12', workItem });
+		});
+
+		it('resolves the phase from the canonical status key, not the board option id', async () => {
+			// A board option the project's mapping does not cover carries no
+			// `statusKey`, so it starts no phase — the provider owns that translation
+			// (ai/RULES.md §2).
+			const workItem = createMockWorkItem({
+				statusId: 'PVTSSO_unmapped',
+				statusKey: undefined,
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+			});
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
 		it('returns null for a status that starts no phase', async () => {
 			const workItem = createMockWorkItem({ statusId: 'f75ad846' }); // Backlog
-			expect(await trigger(workItem).handle(ctx())).toBeNull();
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
 		it('resumes a deferred implementation despite its In progress status', async () => {
@@ -191,8 +219,8 @@ describe('pm-status trigger', () => {
 				statusId: '47fc9ee4', // In progress
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/138',
 			});
-			const result = await trigger(workItem).handle({
-				...ctx(),
+			const result = await trigger.handle({
+				...ctx(workItem),
 				resumePmPhase: 'implementation',
 			});
 			expect(result).toEqual({ phase: 'implementation', taskId: '138', workItem });
@@ -204,8 +232,8 @@ describe('pm-status trigger', () => {
 				statusId: '47fc9ee4',
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/138',
 			});
-			const result = await trigger(workItem).handle({
-				...ctx(),
+			const result = await trigger.handle({
+				...ctx(workItem),
 				resumePmPhase: 'implementation',
 			});
 			expect(result).toEqual({ phase: 'implementation', taskId: '138', workItem });
@@ -216,16 +244,16 @@ describe('pm-status trigger', () => {
 			// a subsequent move back to ToDo/Planning register as a genuine change
 			// rather than a same-status no-op.
 			const workItem = createMockWorkItem({ statusId: 'f75ad846' }); // Backlog
-			await trigger(workItem).handle(ctx({ itemNodeId: 'PVTI_backlog' }));
+			await trigger.handle(ctx(workItem, { itemId: 'PVTI_backlog' }));
 			expect(recordStatusAndDetectChange).toHaveBeenCalledWith('PVTI_backlog', 'f75ad846');
 		});
 
-		it('records the item node ID and re-read status before dispatching', async () => {
+		it('records the item id and re-read status before dispatching', async () => {
 			const workItem = createMockWorkItem({
 				statusId: '61e4505c', // Planning
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 			});
-			await trigger(workItem).handle(ctx({ itemNodeId: 'PVTI_dedup' }));
+			await trigger.handle(ctx(workItem, { itemId: 'PVTI_dedup' }));
 			expect(recordStatusAndDetectChange).toHaveBeenCalledWith('PVTI_dedup', '61e4505c');
 		});
 
@@ -235,12 +263,12 @@ describe('pm-status trigger', () => {
 				statusId: '61e4505c', // Planning
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 			});
-			expect(await trigger(workItem).handle(ctx())).toBeNull();
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
 		it('returns null when the item has no resolvable status', async () => {
 			const workItem = createMockWorkItem({ statusId: undefined });
-			expect(await trigger(workItem).handle(ctx())).toBeNull();
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
 		it('returns null when the work item URL carries no issue number (e.g. a draft)', async () => {
@@ -248,29 +276,14 @@ describe('pm-status trigger', () => {
 				statusId: '61e4505c',
 				url: 'https://github.com/SmartTechBrewery/swarm',
 			});
-			expect(await trigger(workItem).handle(ctx())).toBeNull();
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
-		it('re-reads the exact item from the event', async () => {
+		it('re-reads the exact item from the event through the injected provider', async () => {
 			const seen: string[] = [];
 			const workItem = createMockWorkItem({ statusId: '61e4505c' });
-			const handler = createPmStatusTrigger({
-				createProvider: () => providerReturning(workItem, seen),
-			});
-			await handler.handle(ctx({ itemNodeId: 'PVTI_specific' }));
+			await trigger.handle(ctx(workItem, { itemId: 'PVTI_specific' }, seen));
 			expect(seen).toEqual(['PVTI_specific']);
-		});
-
-		it('builds the provider from the event project', async () => {
-			const seenProjects: ProjectConfig[] = [];
-			const handler = createPmStatusTrigger({
-				createProvider: (project) => {
-					seenProjects.push(project);
-					return providerReturning(createMockWorkItem({ statusId: '61e4505c' }));
-				},
-			});
-			await handler.handle(ctx());
-			expect(seenProjects).toEqual([PROJECT]);
 		});
 	});
 });

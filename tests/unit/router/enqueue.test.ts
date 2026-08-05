@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-	createMockGitHubProjectsParsedEvent,
+	createMockPmEvent,
 	createMockProjectConfig,
 	createMockScmEvent,
 } from '../../helpers/factories.js';
@@ -18,10 +18,10 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 }));
 vi.mock('@/queue/producer.js', () => ({
 	enqueueJob,
-	priorityFor: (job: { type: string }) => (job.type === 'github-projects' ? 10 : undefined),
+	priorityFor: (job: { type: string }) => (job.type === 'pm' ? 10 : undefined),
 }));
 
-import { enqueueProjectsEvent, enqueueScmEvent } from '@/router/enqueue.js';
+import { enqueuePmEvent, enqueueScmEvent } from '@/router/enqueue.js';
 
 beforeEach(() => {
 	createAndPublishDispatch.mockReset();
@@ -93,17 +93,18 @@ describe('enqueueScmEvent', () => {
 	});
 });
 
-describe('enqueueProjectsEvent', () => {
-	it('records a demoted github-projects dispatch carrying the event, project id, and dedup identity', async () => {
-		const event = createMockGitHubProjectsParsedEvent();
+describe('enqueuePmEvent', () => {
+	it('records a demoted pm dispatch carrying the provider id, event, project id, and dedup identity', async () => {
+		const event = createMockPmEvent();
 		const project = createMockProjectConfig({ id: 'acme' });
 
-		await enqueueProjectsEvent(event, project, 'delivery-2');
+		await enqueuePmEvent('github-projects', event, project, 'delivery-2');
 
 		expect(createAndPublishDispatch).toHaveBeenCalledWith({
 			projectId: 'acme',
 			jobPayload: {
-				type: 'github-projects',
+				type: 'pm',
+				providerId: 'github-projects',
 				projectId: 'acme',
 				deliveryId: 'delivery-2',
 				event,

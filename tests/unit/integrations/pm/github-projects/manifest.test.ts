@@ -34,6 +34,22 @@ describe('github-projects manifest registration', () => {
 		expect(githubProjectsManifest.routerAdapter.type).toBe('github-projects');
 	});
 
+	it("satisfies the whole PMRouterAdapter contract the manifest's field is typed to", () => {
+		// The field is now the provider-neutral interface (issue #297), so a provider
+		// that implements only part of the ingress seam must fail here rather than at
+		// the first webhook that reaches the missing method.
+		const adapter = githubProjectsManifest.routerAdapter;
+		for (const method of [
+			'parseWebhook',
+			'resolveProject',
+			'isStatusChange',
+			'isSelfAuthored',
+			'synthesizeStateChange',
+		] as const) {
+			expect(adapter[method], method).toBeTypeOf('function');
+		}
+	});
+
 	it('declares the board and state discovery capabilities', () => {
 		expect(githubProjectsManifest.discovery).toEqual(['containers', 'states']);
 	});

@@ -14,18 +14,16 @@ import {
 	type GitHubProjectsIntegrationConfig,
 	githubProjectsConfigSchema,
 } from '@/integrations/pm/github-projects/config-schema.js';
+import { resolveStatusKeyByOptionId } from '@/integrations/pm/github-projects/status-mapping.js';
 import { DEFAULT_AUTOMATION_LABEL } from '@/pm/automation-label.js';
+import { type PmEvent, PmEventSchema } from '@/pm/events.js';
 import type { WorkItem } from '@/pm/types.js';
 import {
-	type GitHubProjectsWebhookJob,
-	GitHubProjectsWebhookJobSchema,
+	type PmWebhookJob,
+	PmWebhookJobSchema,
 	type ScmWebhookJob,
 	ScmWebhookJobSchema,
 } from '@/queue/jobs.js';
-import {
-	type GitHubProjectsParsedEvent,
-	GitHubProjectsParsedEventSchema,
-} from '@/router/adapters/github-projects.js';
 import { type ScmEvent, ScmEventSchema } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
 import type { BuildTaskAssignmentInput } from '@/transport/assignment.js';
@@ -78,7 +76,7 @@ export function createMockGitHubProjectsConfig(
  * the unusual case, and every dispatch-level test would be gated out.
  */
 export function createMockWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
-	return {
+	const item: WorkItem = {
 		id: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
 		title: 'Example work item',
 		description: 'An example work item body.',
@@ -88,6 +86,17 @@ export function createMockWorkItem(overrides: Partial<WorkItem> = {}): WorkItem 
 		labels: [{ id: 'LA_swarm', name: DEFAULT_AUTOMATION_LABEL }],
 		assignees: [],
 		...overrides,
+	};
+	// A real provider resolves `statusKey` from its board mapping on every read
+	// (issue #297), so derive it here from the fixture board too — a test that
+	// overrides only `statusId` still gets the matching canonical key, and one that
+	// names `statusKey` explicitly keeps its value.
+	if ('statusKey' in overrides) return item;
+	return {
+		...item,
+		statusKey: item.statusId
+			? resolveStatusKeyByOptionId(createMockGitHubProjectsConfig(), item.statusId)
+			: undefined,
 	};
 }
 
@@ -570,19 +579,22 @@ export function createMockScmEvent(overrides: Partial<ScmEvent> = {}): ScmEvent 
 	});
 }
 
-export function createMockGitHubProjectsParsedEvent(
-	overrides: Partial<GitHubProjectsParsedEvent> = {},
-): GitHubProjectsParsedEvent {
-	return GitHubProjectsParsedEventSchema.parse({
-		eventType: 'projects_v2_item',
-		action: 'edited',
-		itemNodeId: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
-		projectNodeId: 'PVT_kwHOAC3TF84BcNwD',
-		contentNodeId: 'I_kwDONODE',
+/**
+ * A normalized {@link PmEvent} (`src/pm/events.ts`) — the provider-neutral board
+ * event the queue and the triggers speak. Defaults describe a Status-field edit on
+ * the real board's IDs, matching what `GitHubProjectsRouterAdapter.parseWebhook`
+ * produces from {@link createMockProjectsV2ItemPayload}.
+ */
+export function createMockPmEvent(overrides: Partial<PmEvent> = {}): PmEvent {
+	return PmEventSchema.parse({
+		action: 'updated',
+		itemId: 'PVTI_lAHOAC3TF84BcNwDzgxczms',
+		containerId: 'PVT_kwHOAC3TF84BcNwD',
+		contentId: 'I_kwDONODE',
 		contentType: 'Issue',
-		changedFieldNodeId: 'PVTSSF_lAHOAC3TF84BcNwDzhW4MKo',
+		changedField: 'PVTSSF_lAHOAC3TF84BcNwDzhW4MKo',
 		changedFieldType: 'single_select',
-		actorLogin: 'human-dev',
+		actorHandle: 'human-dev',
 		...overrides,
 	});
 }
@@ -598,14 +610,13 @@ export function createMockScmWebhookJob(overrides: Partial<ScmWebhookJob> = {}):
 	});
 }
 
-export function createMockGitHubProjectsWebhookJob(
-	overrides: Partial<GitHubProjectsWebhookJob> = {},
-): GitHubProjectsWebhookJob {
-	return GitHubProjectsWebhookJobSchema.parse({
-		type: 'github-projects',
+export function createMockPmWebhookJob(overrides: Partial<PmWebhookJob> = {}): PmWebhookJob {
+	return PmWebhookJobSchema.parse({
+		type: 'pm',
+		providerId: 'github-projects',
 		projectId: 'swarm',
 		deliveryId: 'delivery-uuid-2',
-		event: createMockGitHubProjectsParsedEvent(),
+		event: createMockPmEvent(),
 		...overrides,
 	});
 }
