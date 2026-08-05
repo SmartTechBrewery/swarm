@@ -76,8 +76,6 @@ const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export interface WebhookReceiverDeps {
 	/** Runtime-ready registered SCM providers whose `webhookRoute`s this app serves. */
 	scmProviders: readonly SCMProviderManifest[];
-	/** The PM provider whose board events an SCM route also carries — see the header. */
-	pmProviderId: PMType;
 	pmAdapter: PMRouterAdapter;
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;
 	/** Resolve the SWARM project owning a PM board, by the provider's container id. */
@@ -126,7 +124,6 @@ function resolvePmAdapter(id: PMType): PMRouterAdapter {
 function defaultDeps(): WebhookReceiverDeps {
 	return {
 		scmProviders: listSCMProviders(),
-		pmProviderId: PM_PROVIDER_ON_SCM_ROUTE,
 		pmAdapter: resolvePmAdapter(PM_PROVIDER_ON_SCM_ROUTE),
 		findProject: findProjectByRepo,
 		findProjectByBoard,
@@ -289,7 +286,7 @@ async function handlePmEvent(
 		project,
 		rawBody,
 		request.signature,
-		{ containerId: event.containerId, pmProviderId: deps.pmProviderId, action: event.action },
+		{ containerId: event.containerId, pmProviderId: deps.pmAdapter.type, action: event.action },
 	);
 	if (authFailure) return authFailure;
 
@@ -308,7 +305,7 @@ async function handlePmEvent(
 		);
 	}
 
-	await deps.enqueuePm(deps.pmProviderId, event, project, request.deliveryId);
+	await deps.enqueuePm(deps.pmAdapter.type, event, project, request.deliveryId);
 	return c.json({ ok: true, accepted: true }, 202);
 }
 

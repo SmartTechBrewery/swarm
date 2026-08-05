@@ -1512,6 +1512,68 @@ describe('runsRouter', () => {
 			expect(moveWorkItem).toHaveBeenCalledWith(CARD, 'backlog');
 		});
 
+		it('cancels a legacy duplicate for the same card, but not a different legacy card', async () => {
+			const project = createMockProjectConfig({ id: 'p1' });
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+
+			const CARD = 'PVTI_legacy_card';
+			const legacyBoardJobForCard = (itemNodeId: string) =>
+				({
+					type: 'github-projects',
+					projectId: 'p1',
+					event: {
+						eventType: 'projects_v2_item',
+						action: 'edited',
+						itemNodeId,
+						projectNodeId: 'PVT_board',
+					},
+				}) as never;
+			const primary = makeDispatch({
+				id: 'dispatch-1',
+				state: 'pending',
+				phase: 'board',
+				runId: null,
+				jobPayload: boardJobForCard(CARD),
+			});
+			vi.mocked(getDispatchById).mockResolvedValue(primary);
+			vi.mocked(cancelDispatchAndWake).mockResolvedValue(primary);
+			vi.mocked(listWaitingDispatches).mockResolvedValue([
+				primary,
+				makeDispatch({
+					id: 'legacy-same-card',
+					phase: 'board',
+					runId: null,
+					jobPayload: legacyBoardJobForCard(CARD),
+				}),
+				makeDispatch({
+					id: 'legacy-other-card',
+					phase: 'board',
+					runId: null,
+					jobPayload: legacyBoardJobForCard('PVTI_other_legacy_card'),
+				}),
+			]);
+
+			const getWorkItem = vi.fn().mockResolvedValue({
+				id: CARD,
+				statusId: '61e4505c',
+				statusKey: 'planning',
+				title: 'Legacy Card',
+				url: 'https://github.com/acme/widgets/issues/1',
+			});
+			const moveWorkItem = vi.fn().mockResolvedValue(undefined);
+			vi.mocked(getPMProvider).mockReturnValue({
+				createProvider: () => ({ getWorkItem, moveWorkItem }),
+			} as never);
+
+			await expect(caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' })).resolves.toEqual({
+				success: true,
+			});
+
+			const cancelledIds = vi.mocked(cancelDispatchAndWake).mock.calls.map((call) => call[0]);
+			expect(cancelledIds).toContain('legacy-same-card');
+			expect(cancelledIds).not.toContain('legacy-other-card');
+		});
+
 		it('still moves the card to backlog when cancelling a duplicate fails (best-effort)', async () => {
 			const project = createMockProjectConfig({ id: 'p1' });
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);

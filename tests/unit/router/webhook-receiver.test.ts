@@ -255,6 +255,7 @@ describe('createWebhookApp', () => {
 		function makePmApp(overrides: Partial<WebhookReceiverDeps> = {}) {
 			const enqueuePm = vi.fn<WebhookReceiverDeps['enqueuePm']>().mockResolvedValue(undefined);
 			const pmAdapter = {
+				type: 'github-projects',
 				parseWebhook: vi.fn().mockReturnValue(pmEvent),
 				isStatusChange: vi.fn().mockReturnValue(true),
 				isSelfAuthored: vi.fn().mockResolvedValue(false),
@@ -302,6 +303,7 @@ describe('createWebhookApp', () => {
 
 		it('ignores an unactionable board payload', async () => {
 			const pmAdapter = {
+				type: 'github-projects',
 				parseWebhook: vi.fn().mockReturnValue(null),
 				isStatusChange: vi.fn(),
 				isSelfAuthored: vi.fn(),
@@ -350,6 +352,7 @@ describe('createWebhookApp', () => {
 
 		it('ignores a non-Status field edit without enqueueing', async () => {
 			const pmAdapter = {
+				type: 'github-projects',
 				parseWebhook: vi.fn().mockReturnValue(pmEvent),
 				isStatusChange: vi.fn().mockReturnValue(false),
 				isSelfAuthored: vi.fn().mockResolvedValue(false),
@@ -363,6 +366,7 @@ describe('createWebhookApp', () => {
 
 		it('drops a self-authored status change (loop prevention)', async () => {
 			const pmAdapter = {
+				type: 'github-projects',
 				parseWebhook: vi.fn().mockReturnValue(pmEvent),
 				isStatusChange: vi.fn().mockReturnValue(true),
 				isSelfAuthored: vi.fn().mockResolvedValue(true),

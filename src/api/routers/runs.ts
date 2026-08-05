@@ -40,7 +40,7 @@ import {
 	RUN_CANCELLED_MESSAGE,
 	requestRunCancellation,
 } from '../../queue/cancellation.js';
-import { type SwarmJob, SwarmJobSchema } from '../../queue/jobs.js';
+import { normalizeStoredJobPayload, type SwarmJob, SwarmJobSchema } from '../../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../../queue/producer.js';
 import {
 	deriveDispatchPhaseHint,
@@ -254,14 +254,16 @@ async function cancelDuplicateBoardDispatches(
 	keepDispatchId: string,
 ): Promise<void> {
 	const siblings = await listWaitingDispatches(projectId);
-	const duplicates = siblings.filter(
-		(sibling) =>
+	const duplicates = siblings.filter((sibling) => {
+		const payload = normalizeStoredJobPayload(sibling.jobPayload);
+		return (
 			sibling.id !== keepDispatchId &&
 			!sibling.runId &&
-			sibling.jobPayload.type === 'pm' &&
-			sibling.jobPayload.event.itemId === workItemNodeId &&
-			deriveDispatchPhaseHint(sibling) === 'board',
-	);
+			payload.type === 'pm' &&
+			payload.event.itemId === workItemNodeId &&
+			deriveDispatchPhaseHint(sibling) === 'board'
+		);
+	});
 	for (const duplicate of duplicates) {
 		await cancelDispatchAndWake(
 			duplicate.id,
