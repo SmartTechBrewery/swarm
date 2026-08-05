@@ -38,7 +38,7 @@ import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
 	sessionRunArgs,
-	shouldPreserveForResume,
+	shouldPreserveFailedCheckout,
 } from './resume.js';
 
 export const RESOLVE_CONFLICTS_OUTCOME_FILENAME = HANDOFF_FILENAMES.resolveConflicts;
@@ -260,7 +260,14 @@ export async function runResolveConflictsPhase(
 				`Resolve-conflicts agent (${cli}) exited with code ${agent.exitCode}`,
 				` for PR #${prNumber}`,
 			);
-			preserveForResume = shouldPreserveForResume(error);
+			// Either tier may claim this checkout: Tier 1's resumable session, or — when it
+			// cannot apply — the Tier 2 checkpoint the agent left in the worktree.
+			preserveForResume = shouldPreserveFailedCheckout(
+				error,
+				handle.path,
+				'resolve-conflicts',
+				resumed,
+			);
 			throw error;
 		}
 		const handoff = readHandoff(

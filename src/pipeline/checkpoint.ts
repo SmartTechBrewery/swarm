@@ -1,6 +1,5 @@
 /**
- * The Tier 2 checkpoint hand-off (`docs/CHECKPOINTS.md`) — the *artifact*, not
- * yet its continuation path.
+ * The Tier 2 checkpoint hand-off (`docs/CHECKPOINTS.md`) — the *artifact* half.
  *
  * Tier 1 (native CLI session resume, `src/pipeline/resume.ts`) covers the common
  * involuntary stop by re-entering the agent's own session. It cannot cover every
@@ -11,14 +10,21 @@
  * working tree looks like — enough to re-seed a *fresh* session with a hand-off
  * instead of re-doing the work.
  *
- * This module owns the file's shape, how to read it, and whether it may be
- * *continued from* ({@link validateCheckpointForContinuation}, consumed by the
- * `'checkpoint'` branch of the recovery gate in `src/pipeline/resume.ts`).
- * Nothing in production selects a checkpoint continuation yet: the policy that
- * does, the `checkpointed` run status, and the operator surface land in the
- * follow-up phases of issue #299. The prompt half — what makes the four
- * implementer phases write it, and what re-seeds a continuation with its
- * contents — is `src/pipeline/prompts/checkpoint.ts`.
+ * This module owns the file's shape and the two ways it is read, which differ in
+ * what a bad file means:
+ *
+ * - {@link validateCheckpointForContinuation} — may this preserved checkout be
+ *   *continued from*? Consumed by the `'checkpoint'` branch of the recovery gate
+ *   (`src/pipeline/resume.ts`), where a bad answer must block the run.
+ * - {@link tryReadCheckpoint} — is there a hand-off worth *settling* a stopped run
+ *   on? Consumed by the deferral path (`src/worker/consumer.ts`) and by a federated
+ *   worker reporting its own disk (`src/transport/assignment-execution.ts`), where a
+ *   bad file just means "not a Tier 2 case" and must never fail the settle.
+ *
+ * It also owns the continuation *budget* ({@link resolveMaxContinuations}), the bound
+ * that keeps a phase which keeps stopping from handing itself off forever. The prompt
+ * half — what makes the four implementer phases write the file, and what re-seeds a
+ * continuation with its contents — is `src/pipeline/prompts/checkpoint.ts`.
  *
  * It lives under `src/pipeline/` rather than in `src/scm/delivery.ts` because
  * its semantics are pipeline/resume, not SCM delivery; only the *filename* has
@@ -31,6 +37,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
+import type { ProjectConfig } from '@/config/schema.js';
+import { logger } from '@/lib/logger.js';
 import { gitEnvironmentForCwd, HANDOFF_FILENAMES, readHandoff } from '@/scm/delivery.js';
 import { type TriggerPhase, TriggerPhaseSchema } from '@/triggers/types.js';
 import type { BlockedRecoveryReason } from '@/worktree/reclaim.js';
@@ -101,6 +109,39 @@ export function hasCheckpoint(cwd: string): boolean {
 export function readCheckpoint(cwd: string): Checkpoint {
 	if (!hasCheckpoint(cwd)) throw new Error(`No checkpoint ${CHECKPOINT_FILENAME} in ${cwd}`);
 	return readHandoff(cwd, CHECKPOINT_FILENAME, CheckpointSchema);
+}
+
+/**
+ * {@link readCheckpoint} for the *settle* path, which must never turn a bad
+ * hand-off into a failed settle: an absent or malformed file simply means "there is
+ * nothing to continue from", which the caller reads as "this is not a Tier 2 case"
+ * and settles as an ordinary deferral/failure instead. A parse failure is logged
+ * because it is the agent writing the file wrong, not an expected state.
+ */
+export function tryReadCheckpoint(cwd: string): Checkpoint | undefined {
+	if (!hasCheckpoint(cwd)) return undefined;
+	try {
+		return readCheckpoint(cwd);
+	} catch (error) {
+		logger.warn(`Ignoring an unreadable ${CHECKPOINT_FILENAME} — no checkpoint continuation`, {
+			cwd,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * How many checkpoint continuations one run gets by default. Two is deliberately
+ * small: each continuation pays for a fresh session seeded from a degraded
+ * hand-off, so a phase that keeps stopping involuntarily is better surfaced to a
+ * human than handed off indefinitely.
+ */
+export const DEFAULT_MAX_CONTINUATIONS = 2;
+
+/** The project's checkpoint-continuation budget — `pipeline.maxContinuations`, or the coded default. */
+export function resolveMaxContinuations(project: ProjectConfig): number {
+	return project.pipeline?.maxContinuations ?? DEFAULT_MAX_CONTINUATIONS;
 }
 
 /**

@@ -114,6 +114,8 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		agentSessionId: 'stale-session',
 		recovery: { state: 'blocked', blockedReason: 'live-leased' },
 		cancellation: null,
+		checkpoint: null,
+		continuationCount: 0,
 		outputBytes: 0,
 		outputTruncated: false,
 		...overrides,

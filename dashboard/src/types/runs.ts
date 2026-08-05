@@ -52,6 +52,7 @@ export const failureDiagnosisSchema = z.object({
 		'launch-or-authentication',
 		'worker-shutdown',
 		'user-terminated',
+		'continuation-budget-exhausted',
 	]),
 	title: z.string(),
 	message: z.string(),

@@ -38,6 +38,7 @@ import { runs } from '../schema/runs.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workerSessions } from '../schema/workerSessions.js';
 import { workers } from '../schema/workers.js';
+import { RETRY_PENDING_RUN_STATUSES } from './runsRepository.js';
 
 export type DispatchRow = typeof dispatches.$inferSelect;
 
@@ -939,10 +940,10 @@ export async function listProjectsWithCapacityPending(): Promise<string[]> {
 }
 
 /**
- * Deferred runs with no active dispatch — legacy orphans whose retry intent
- * survives only on the run row (`job_payload`, `next_retry_at`). The startup
- * backfill turns each into a `retry-scheduled` dispatch (issue #284's #269/#279
- * repair).
+ * Retry-pending runs (`deferred`, or `checkpointed` — issue #503) with no active
+ * dispatch — legacy orphans whose retry intent survives only on the run row
+ * (`job_payload`, `next_retry_at`). The startup backfill turns each into a
+ * `retry-scheduled` dispatch (issue #284's #269/#279 repair).
  */
 export async function listDeferredRunsWithoutActiveDispatch(): Promise<
 	Array<typeof runs.$inferSelect>
@@ -959,7 +960,7 @@ export async function listDeferredRunsWithoutActiveDispatch(): Promise<
 	return getDb()
 		.select()
 		.from(runs)
-		.where(and(eq(runs.status, 'deferred'), notInArray(runs.id, active)));
+		.where(and(inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]), notInArray(runs.id, active)));
 }
 
 /** Whether any dispatch rows exist at all — used to gate one-time backfills. */

@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/db/repositories/runsRepository.js', () => ({
+vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
+	// `isRetryPendingStatus` is a pure predicate over the status vocabulary, so the
+	// real one is kept: stubbing it would let the router and the repository disagree
+	// about which statuses are retry-pending.
+	...(await importOriginal<typeof import('@/db/repositories/runsRepository.js')>()),
 	listRunsFromDb: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
@@ -213,6 +217,8 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		agentSessionId: null,
 		recovery: null,
 		cancellation: null,
+		checkpoint: null,
+		continuationCount: 0,
 		outputBytes: 0,
 		outputTruncated: false,
 		...overrides,

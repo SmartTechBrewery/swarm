@@ -398,6 +398,20 @@ export const PipelineBaseSchema = z.object({
 	 */
 	prioritizeContinuations: z.boolean().optional(),
 	/**
+	 * How many times one run may be continued from its Tier 2 checkpoint
+	 * (`docs/CHECKPOINTS.md`) before the fallback gives up and the run fails
+	 * terminally with a "continuation budget exhausted" reason. Unset (or the whole
+	 * `pipeline` block omitted) defaults to
+	 * `DEFAULT_MAX_CONTINUATIONS` (`src/pipeline/checkpoint.ts`).
+	 *
+	 * The bound matters because a checkpoint continuation re-seeds a *fresh* session
+	 * from a degraded hand-off: a phase that keeps stopping involuntarily would
+	 * otherwise hand itself off forever, each time paying for a new session that
+	 * re-reads the same remainder. Counted per run row (`runs.continuation_count`)
+	 * and cleared only by "Reset & restart", not by an ordinary retry.
+	 */
+	maxContinuations: z.number().int().positive().optional(),
+	/**
 	 * Label a work item must carry before SWARM starts a board-driven agent
 	 * phase (Planning, Implementation) for it — the explicit, human-controlled
 	 * automation opt-in (issue #131). Provider-neutral: it is a work-item label

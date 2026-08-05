@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentCliResult } from '@/harness/agent-cli.js';
@@ -7,11 +10,12 @@ import {
 	_resetSCMProviderRegistryForTesting,
 	registerSCMProvider,
 } from '@/integrations/scm/registry.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
-import { runAssignmentDbFree } from '@/transport/assignment-execution.js';
+import { deferrableOrFailedResult, runAssignmentDbFree } from '@/transport/assignment-execution.js';
 import type { FetchLike } from '@/transport/delivery-client.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
@@ -118,6 +122,15 @@ function depsWithoutDeliveryOverride(
 		logger: silentLogger,
 	};
 }
+
+/** What an involuntarily stopped implementation run left behind on the worker's disk. */
+const CHECKPOINT: Checkpoint = {
+	phase: 'implementation',
+	completed: ['Wrote the schema and its tests'],
+	remaining: ['Update the docs', 'Run the focused tests'],
+	decisions: [],
+	workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+};
 
 describe('runAssignmentDbFree', () => {
 	// This file never imports the integrations entrypoint, so the registry starts
@@ -727,6 +740,62 @@ describe('runAssignmentDbFree', () => {
 			resumable: true,
 		});
 		expect(result.retryDelayMs as number).toBeGreaterThan(0);
+	});
+
+	// Tier 2 across the wire (issue #503): only this host holds the worktree, so the
+	// worker parses the checkpoint the stopped agent left in it and attaches it to the
+	// deferral. The control plane owns the policy and the budget; this reports evidence.
+	it('reports the Tier 2 checkpoint from its own checkout on a resumable deferral', async () => {
+		const worktree = mkdtempSync(join(tmpdir(), 'swarm-dbfree-checkpoint-'));
+		try {
+			writeFileSync(join(worktree, 'swarm_checkpoint.json'), JSON.stringify(CHECKPOINT));
+			const frame = deferrableOrFailedResult(
+				new AgentRunError('rate limited', { kind: 'rate-limit' }, agentResult({ exitCode: 1 })),
+				buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+				worktree,
+			);
+
+			// The wire status is unchanged — a continuation *is* a deferral — so no
+			// protocol-version bump is needed for an older control plane.
+			expect(frame).toMatchObject({ status: 'deferred', failureKind: 'rate-limit' });
+			expect(frame.checkpoint).toEqual(CHECKPOINT);
+		} finally {
+			rmSync(worktree, { recursive: true, force: true });
+		}
+	});
+
+	// A failure that discards the checkout has nothing to continue from, so it must not
+	// report a checkpoint even if a stale file happens to be lying there.
+	it('reports no checkpoint for a non-resumable deferral', () => {
+		const worktree = mkdtempSync(join(tmpdir(), 'swarm-dbfree-checkpoint-'));
+		try {
+			writeFileSync(join(worktree, 'swarm_checkpoint.json'), JSON.stringify(CHECKPOINT));
+			const frame = deferrableOrFailedResult(
+				new AgentRunError('at capacity', { kind: 'capacity' }, agentResult({ exitCode: 1 })),
+				buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+				worktree,
+			);
+
+			expect(frame).toMatchObject({ status: 'deferred', failureKind: 'capacity' });
+			expect(frame.checkpoint).toBeUndefined();
+		} finally {
+			rmSync(worktree, { recursive: true, force: true });
+		}
+	});
+
+	it('reports no checkpoint when the checkout carries none', () => {
+		const worktree = mkdtempSync(join(tmpdir(), 'swarm-dbfree-checkpoint-'));
+		try {
+			const frame = deferrableOrFailedResult(
+				new AgentRunError('rate limited', { kind: 'rate-limit' }, agentResult({ exitCode: 1 })),
+				buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+				worktree,
+			);
+
+			expect(frame.checkpoint).toBeUndefined();
+		} finally {
+			rmSync(worktree, { recursive: true, force: true });
+		}
 	});
 
 	it('settles terminally failed for a generic error', async () => {

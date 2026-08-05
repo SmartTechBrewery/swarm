@@ -15,6 +15,7 @@ import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
+import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import {
 	createMockPmWebhookJob,
 	createMockProjectConfig,
@@ -271,7 +272,8 @@ const resetRunBindings: Array<{
  */
 const resetRunSessionColumns: Array<string | null | undefined> = [];
 const getRunByIdFromDb = vi.fn(
-	async (_id: string) => undefined as { agentSessionId?: string | null } | undefined,
+	async (_id: string) =>
+		undefined as { agentSessionId?: string | null; continuationCount?: number } | undefined,
 );
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
@@ -284,6 +286,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		getLatestCompletedPlanningScope(projectId, taskId),
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
+	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
 	resetRunToRunning: (...args: unknown[]) => {
 		resetRunSessionColumns.push(args[7] as string | null | undefined);
 		resetRunBindings.push({
@@ -464,6 +467,7 @@ import {
 	getSCMProvider,
 	registerSCMProvider,
 } from '@/integrations/scm/registry.js';
+import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 import type { TriggerContext, TriggerResult } from '@/triggers/types.js';
@@ -3194,6 +3198,7 @@ describe('processJob', () => {
 		it.each([
 			'failed',
 			'deferred',
+			'checkpointed',
 		] as const)('reuses the latest %s row for a fresh webhook', async (status) => {
 			getLatestRunForTask.mockResolvedValueOnce({ id: `run-${status}`, status } as never);
 
@@ -3654,6 +3659,224 @@ describe('processJob', () => {
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
 				expect.objectContaining({ status: 'failed', engine: 'codex' }),
+			);
+		});
+	});
+
+	/**
+	 * Tier 2 — the checkpoint continuation the deferral selects (issue #503,
+	 * `docs/CHECKPOINTS.md`). The checkpoint arrives on the thrown `AgentRunError`,
+	 * which is the federated channel (a remote worker parses the file on its own host
+	 * and the control plane rebuilds the error with it) and is the same value the
+	 * in-process path reads off its own disk, so the settle logic under test is
+	 * identical either way.
+	 */
+	describe('checkpoint continuation (Tier 2, issue #503)', () => {
+		// `clearMocks` clears calls but keeps implementations, so the budget tests below
+		// would otherwise leak their run row into every later test in this file.
+		beforeEach(() => {
+			getRunByIdFromDb.mockResolvedValue(undefined);
+		});
+
+		const CHECKPOINT: Checkpoint = {
+			phase: 'respond-to-ci',
+			completed: ['Fixed the failing config test'],
+			remaining: ['Re-run lint and the focused tests', 'Write the hand-off file'],
+			decisions: [],
+			workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+		};
+
+		/** A stopped run: `rate-limit`, optionally with a captured session, optionally reporting a checkpoint. */
+		const stoppedRun =
+			(options: { sessionId?: string; checkpoint?: Checkpoint } = {}) =>
+			async () => {
+				throw new AgentRunError(
+					'respond-to-ci agent (claude) exited with code 1 (rate limited)',
+					{ kind: 'rate-limit' },
+					agentResult({ exitCode: 1, sessionId: options.sessionId }),
+					options.checkpoint,
+				);
+			};
+
+		const retriedPayload = () =>
+			scheduleDispatchRetry.mock.calls[0][1].jobPayload as Record<string, unknown>;
+
+		it('settles `checkpointed` with the parsed checkpoint and dispatches the continuation', async () => {
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			// The row records the hand-off and spends one continuation; it deliberately
+			// holds no session id, which is what the retention pin keys on instead.
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'checkpointed',
+					agentSessionId: null,
+					checkpoint: CHECKPOINT,
+					continuationCount: 1,
+				}),
+			);
+			// …and the continuation goes out through the existing durable dispatch, asking
+			// the recovery gate for the checkpoint branch on a fresh session.
+			expect(retriedPayload()).toMatchObject({ recoveryMode: 'checkpoint' });
+			expect(retriedPayload().resumeSession).toBeUndefined();
+			expect(retriedPayload().agentSessionId).toBeDefined();
+		});
+
+		// The regression that keeps Tier 1 in front: a first stop that captured a
+		// resumable session behaves exactly as it did before this feature existed, even
+		// though a checkpoint is sitting right there.
+		it('leaves a session-resumable stop on Tier 1, checkpoint or not', async () => {
+			phaseImpl = stoppedRun({ sessionId: 'sess-ci', checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'deferred',
+					agentSessionId: 'sess-ci',
+					checkpoint: undefined,
+				}),
+			);
+			expect(retriedPayload()).toMatchObject({ resumeSession: true });
+			expect(retriedPayload().recoveryMode).toBeUndefined();
+		});
+
+		// Once that resume has itself failed, the id every CLI echoes back is no longer
+		// evidence the session can be re-entered — so the checkpoint takes over rather
+		// than the checkout being discarded.
+		it('continues from the checkpoint when the failed attempt was itself a resume', async () => {
+			phaseImpl = stoppedRun({ sessionId: 'sess-ci', checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ resumeSession: true, runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'checkpointed', agentSessionId: null }),
+			);
+		});
+
+		it('ignores a checkpoint another phase left in the shared checkout', async () => {
+			phaseImpl = stoppedRun({ checkpoint: { ...CHECKPOINT, phase: 'implementation' } });
+
+			await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'deferred', checkpoint: undefined }),
+			);
+		});
+
+		it('does not select checkpoint recovery when run tracking is unavailable', async () => {
+			const cleanup = vi
+				.spyOn(GitWorktreeManager.prototype, 'cleanup')
+				.mockResolvedValue(undefined);
+			createRun.mockRejectedValueOnce(new Error('database unavailable'));
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: undefined }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(retriedPayload().recoveryMode).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledExactlyOnceWith(RESPOND_TO_CI_TRIGGER.taskId);
+			cleanup.mockRestore();
+		});
+
+		it('releases the checkout when reading the continuation budget fails', async () => {
+			const cleanup = vi
+				.spyOn(GitWorktreeManager.prototype, 'cleanup')
+				.mockResolvedValue(undefined);
+			getRunByIdFromDb
+				.mockResolvedValueOnce(undefined)
+				.mockRejectedValueOnce(new Error('database unavailable'));
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(retriedPayload().recoveryMode).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledExactlyOnceWith(RESPOND_TO_CI_TRIGGER.taskId);
+			cleanup.mockRestore();
+		});
+
+		it('still settles the deferral when releasing the checkout fails', async () => {
+			const cleanup = vi
+				.spyOn(GitWorktreeManager.prototype, 'cleanup')
+				.mockRejectedValue(new Error('git worktree remove failed'));
+			getRunByIdFromDb
+				.mockResolvedValueOnce(undefined)
+				.mockRejectedValueOnce(new Error('database unavailable'));
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(retriedPayload().recoveryMode).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledExactlyOnceWith(RESPOND_TO_CI_TRIGGER.taskId);
+			cleanup.mockRestore();
+		});
+
+		it('fails terminally once the continuation budget is exhausted', async () => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			// The reason is on the run's own `error`, not only in the diagnosis, so it
+			// survives wherever the raw message is shown.
+			expect(outcome).toMatchObject({
+				error: expect.stringContaining('checkpoint continuation budget exhausted (2 of 2 used)'),
+				failureDiagnosis: { kind: 'continuation-budget-exhausted' },
+			});
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'failed' }),
+			);
+			// Nothing was scheduled: the fallback gave up rather than handing off again.
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
+		it('reads the budget from pipeline.maxContinuations', async () => {
+			projectLookup = () => createMockProjectConfig({ pipeline: { maxContinuations: 3 } });
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'checkpointed', continuationCount: 3 }),
 			);
 		});
 	});

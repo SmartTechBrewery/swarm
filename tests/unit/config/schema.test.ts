@@ -589,6 +589,27 @@ describe('PipelineConfigSchema', () => {
 		expect(PipelineConfigSchema.safeParse({ prioritizeContinuations: 'yes' }).success).toBe(false);
 	});
 
+	// The Tier 2 continuation budget (issue #503). Left unset here so
+	// `resolveMaxContinuations` supplies the coded default — a Zod default would never
+	// be seen, since the whole `pipeline` block is optional.
+	it('leaves maxContinuations unset by default (read as the coded default)', () => {
+		expect(PipelineConfigSchema.parse({}).maxContinuations).toBeUndefined();
+	});
+
+	it('accepts a positive integer maxContinuations', () => {
+		expect(PipelineConfigSchema.parse({ maxContinuations: 4 })).toMatchObject({
+			maxContinuations: 4,
+		});
+	});
+
+	// Zero or a negative budget would be a silently disabled fallback rather than a
+	// configured one; a fraction is a typo.
+	it('rejects a non-positive or fractional maxContinuations', () => {
+		expect(PipelineConfigSchema.safeParse({ maxContinuations: 0 }).success).toBe(false);
+		expect(PipelineConfigSchema.safeParse({ maxContinuations: -1 }).success).toBe(false);
+		expect(PipelineConfigSchema.safeParse({ maxContinuations: 1.5 }).success).toBe(false);
+	});
+
 	it('leaves automationLabel unset by default (read as the coded default)', () => {
 		// Absent → undefined; `resolveAutomationLabel` supplies `swarm`, since the
 		// whole `pipeline` block is optional and a Zod default would never be seen.

@@ -11,6 +11,7 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'launch-or-authentication',
 	'worker-shutdown',
 	'user-terminated',
+	'continuation-budget-exhausted',
 ]);
 
 export type FailureDiagnosisKind = z.infer<typeof FailureDiagnosisKindSchema>;
@@ -90,6 +91,13 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 				'Known condition: user termination',
 				'The run was terminated by a user request.',
 				'Retry the phase only if you want to run it again.',
+			);
+		case 'continuation-budget-exhausted':
+			return diagnosis(
+				condition,
+				'Known condition: continuation budget exhausted',
+				'The run was stopped involuntarily again after using every checkpoint continuation the project allows, so it was not handed off a further time.',
+				'Inspect the checkpoint recorded on this run, then either raise `pipeline.maxContinuations`, narrow the task, or reset and restart the phase.',
 			);
 	}
 }

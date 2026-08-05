@@ -26,6 +26,7 @@ import { z } from 'zod';
 import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js';
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
+import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { TriggerPhaseSchema } from '../triggers/types.js';
 
 /**
@@ -348,6 +349,16 @@ export const TaskExecutionResultSchema = z.object({
 	retryDelayMs: z.number().int().nonnegative().optional(),
 	resumable: z.boolean().optional(),
 	resumeDelivery: z.boolean().optional(),
+	// `deferred` — the Tier 2 checkpoint the stopped run left in its worktree
+	// (`docs/CHECKPOINTS.md`, issue #503), parsed by the worker because only the
+	// worker's host holds that worktree: the control plane cannot read the file, so it
+	// takes the worker's word for it and maps a deferral carrying one onto the
+	// `checkpointed` run status. The wire `status` stays `deferred` deliberately — a
+	// continuation *is* a deferral whose retry happens to run from a checkpoint, and
+	// keeping the status set unchanged means no `TRANSPORT_PROTOCOL_VERSION` bump.
+	// Optional and additive in both directions: an older worker simply omits it and its
+	// deferrals behave exactly as before.
+	checkpoint: CheckpointSchema.optional(),
 	// One of the `AgentFailureKind`s, `delivery`, or `dependency` — the last being a
 	// wait on an external condition rather than a failure of the run itself.
 	failureKind: z.string().optional(),

@@ -7,8 +7,11 @@ import {
 	CHECKPOINT_FILENAME,
 	type Checkpoint,
 	CheckpointSchema,
+	DEFAULT_MAX_CONTINUATIONS,
 	hasCheckpoint,
 	readCheckpoint,
+	resolveMaxContinuations,
+	tryReadCheckpoint,
 	validateCheckpointForContinuation,
 } from '@/pipeline/checkpoint.js';
 import { buildImplementationPrompt } from '@/pipeline/implementation.js';
@@ -19,7 +22,7 @@ import { buildRespondToCiPrompt } from '@/pipeline/respond-to-ci.js';
 import { buildRespondToReviewPrompt } from '@/pipeline/respond-to-review.js';
 import { buildReviewPrompt } from '@/pipeline/review.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
-import { createMockWorkItem } from '../../helpers/factories.js';
+import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
 
 const roots: string[] = [];
 
@@ -151,6 +154,35 @@ describe('readCheckpoint / hasCheckpoint (issue #299)', () => {
 	it('fails with an actionable, filename-naming error on a schema-violating body', () => {
 		const root = checkpointRoot(JSON.stringify({ ...VALID, remaining: [] }));
 		expect(() => readCheckpoint(root)).toThrow(`Invalid hand-off ${CHECKPOINT_FILENAME}`);
+	});
+});
+
+/**
+ * The *settle*-path read (issue #503). Unlike {@link readCheckpoint} it must never
+ * throw: a settle that failed over a bad hand-off would lose the run's outcome, and
+ * "there is nothing to continue from" is a perfectly good answer.
+ */
+describe('tryReadCheckpoint / resolveMaxContinuations (issue #503)', () => {
+	it('reads a valid checkpoint', () => {
+		expect(tryReadCheckpoint(checkpointRoot(JSON.stringify(VALID)))).toEqual(VALID);
+	});
+
+	it('reports undefined instead of throwing when the file is absent', () => {
+		expect(tryReadCheckpoint(checkpointRoot())).toBeUndefined();
+	});
+
+	it('reports undefined instead of throwing on a malformed or schema-violating body', () => {
+		expect(tryReadCheckpoint(checkpointRoot('{ not json'))).toBeUndefined();
+		expect(
+			tryReadCheckpoint(checkpointRoot(JSON.stringify({ ...VALID, remaining: [] }))),
+		).toBeUndefined();
+	});
+
+	it('reads the continuation budget from the project, defaulting when unset', () => {
+		expect(resolveMaxContinuations(createMockProjectConfig())).toBe(DEFAULT_MAX_CONTINUATIONS);
+		expect(
+			resolveMaxContinuations(createMockProjectConfig({ pipeline: { maxContinuations: 5 } })),
+		).toBe(5);
 	});
 });
 

@@ -1,7 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { and, desc, eq, isNotNull } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import { getDb } from '../db/client.js';
+import { RETRY_PENDING_RUN_STATUSES } from '../db/repositories/runsRepository.js';
 import { runs } from '../db/schema/runs.js';
 import { logger } from '../lib/logger.js';
 import type { AgentCli } from './agent-cli.js';
@@ -49,7 +50,16 @@ export async function getFallbackRateLimitInfo(cli: AgentCli) {
 				completedAt: runs.completedAt,
 			})
 			.from(runs)
-			.where(and(eq(runs.engine, cli), eq(runs.status, 'deferred'), isNotNull(runs.nextRetryAt)))
+			// Both retry-pending statuses count (issue #503): a `checkpointed` settle is a
+			// deferral whose continuation happens to run from a checkpoint rather than a
+			// resumed session, and it records the same `next_retry_at` reset hint.
+			.where(
+				and(
+					eq(runs.engine, cli),
+					inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]),
+					isNotNull(runs.nextRetryAt),
+				),
+			)
 			.orderBy(desc(runs.completedAt))
 			.limit(1);
 
