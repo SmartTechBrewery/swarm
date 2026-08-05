@@ -76,6 +76,15 @@ function attemptCounterPatch(
  * pre-provisioning capacity retry into a branch resume, so the prior
  * `resumePmPhase`/`resumeSession`/`resumeDelivery` flags are dropped and
  * re-derived.
+ *
+ * {@link SwarmJob.agentSessionId} is re-derived with them, because `resumeSession`
+ * is what decides *which of its two meanings* the id carries: the session to
+ * `--resume` when the flag is set, the session to **assign** (`claude
+ * --session-id`) when it is not. Those are not interchangeable — an id `claude`
+ * has already opened a session under cannot be assigned a second time; it exits 1
+ * with `Session ID <id> is already in use` before doing any work. So a
+ * non-resumable retry mints a fresh id rather than carrying the spent one
+ * forward.
  */
 export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryIntent): SwarmJob {
 	const {
@@ -104,8 +113,14 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 			: {}),
 		// Continue the prior agent session on the retry when the deferral was a
 		// resumable one; separate from `resumePmPhase`, which is only the PM
-		// board-dispatch signal.
-		...(intent.resumable ? { resumeSession: true } : {}),
+		// board-dispatch signal. A non-resumable retry re-assigns instead of
+		// resuming, so it needs an *unused* id: keeping the spent one made every such
+		// retry of an already-started run die instantly on `claude`'s
+		// already-in-use check. Minted here rather than left undefined so the id is
+		// still known before the agent starts — the harness falls back to it when a
+		// run dies before emitting a parseable `session_id`, which is what lets Tier 1
+		// resume a run that produced no output.
+		...(intent.resumable ? { resumeSession: true } : { agentSessionId: randomUUID() }),
 		// Delivery retries reuse a valid progress-marked worktree, independent of
 		// whether the completed agent run exposed a session id.
 		...(intent.resumeDelivery ? { resumeDelivery: true } : {}),

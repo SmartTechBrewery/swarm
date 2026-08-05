@@ -89,6 +89,40 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.resumeDelivery).toBeUndefined();
 	});
 
+	// A non-resumable retry *assigns* `agentSessionId` as `claude --session-id`
+	// rather than resuming it, so carrying the spent id forward made every such
+	// retry of an already-started run exit 1 on `Session ID <id> is already in use`
+	// before doing any work — the 529-capacity retry that surfaced this.
+	it('mints a fresh session id for a non-resumable retry instead of re-assigning the spent one', () => {
+		const spent = '1d1c134d-0a61-43bd-b4fe-8d95f6b7061c';
+
+		const next = deriveRetryJobPayload(
+			createMockPmWebhookJob({ runId: spent, agentSessionId: spent }),
+			{ phase: 'implementation', runId: spent, resumable: false },
+		);
+
+		expect(next.resumeSession).toBeUndefined();
+		expect(next.agentSessionId).toBeDefined();
+		expect(next.agentSessionId).not.toBe(spent);
+		// Still assigned up front, so Tier 1 can resume a run that died before it
+		// emitted a parseable `session_id`.
+		expect(next.agentSessionId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+		);
+	});
+
+	it('keeps the prior session id when the retry does resume it', () => {
+		const prior = '92340ec7-709e-4ffa-9297-3899caca4830';
+
+		const next = deriveRetryJobPayload(createMockPmWebhookJob({ agentSessionId: prior }), {
+			phase: 'implementation',
+			resumable: true,
+			pmPhaseStarted: true,
+		});
+
+		expect(next).toMatchObject({ resumeSession: true, agentSessionId: prior });
+	});
+
 	it('retries delivery with its own worktree-resume signal, not an agent session', () => {
 		const next = deriveRetryJobPayload(createMockScmWebhookJob(), {
 			phase: 'review',

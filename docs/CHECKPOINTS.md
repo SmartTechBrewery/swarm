@@ -40,7 +40,10 @@ concurrent workers (`SWARM_WORKER_CONCURRENCY > 1`). SWARM always resumes by exp
 `AgentCliResult.sessionId` carries the id a run created, captured per CLI:
 
 - **claude** — assigned up front as `--session-id <runId>` and echoed back in the JSON
-  output's `session_id`; the harness reads that (falling back to the assigned id).
+  output's `session_id`; the harness reads that (falling back to the assigned id). Only a
+  *first* attempt assigns the run id: `claude` refuses to open a second session under an id it
+  already used, so a retry that is not resuming assigns a freshly minted uuid instead
+  (`deriveRetryJobPayload`, `src/dispatch/retry-payload.ts`).
 - **codex** — `codex exec --json` emits `{"type":"thread.started","thread_id":"…"}` as its
   first stdout line; `parseAgentOutput` lifts the `thread_id`. A resume re-emits the same id.
 - **agy** — has no assign flag, but `agy --output-format stream-json` prints a
