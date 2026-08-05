@@ -263,6 +263,12 @@ const resetRunBindings: Array<{
 	fencingToken?: number;
 	workerUserId?: string;
 }> = [];
+/**
+ * The `agent_session_id` column value each `resetRunToRunning` call writes, for
+ * the same reason — `undefined` leaves the stored id alone (a resume), anything
+ * else is the id this attempt hands the CLI.
+ */
+const resetRunSessionColumns: Array<string | null | undefined> = [];
 const getRunByIdFromDb = vi.fn(
 	async (_id: string) =>
 		undefined as { agentSessionId?: string | null; continuationCount?: number } | undefined,
@@ -279,6 +285,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
 	resetRunToRunning: (...args: unknown[]) => {
+		resetRunSessionColumns.push(args[7] as string | null | undefined);
 		resetRunBindings.push({
 			workerId: args[9] as string | undefined,
 			fencingToken: args[10] as number | undefined,
@@ -577,6 +584,7 @@ describe('processJob', () => {
 		resetRunToRunning.mockClear();
 		resetRunToRunning.mockResolvedValue(true);
 		resetRunBindings.length = 0;
+		resetRunSessionColumns.length = 0;
 		getRunByIdFromDb.mockClear();
 		getRunByIdFromDb.mockResolvedValue(undefined);
 		reconcileTerminatedWorktree.mockClear();
@@ -1043,6 +1051,40 @@ describe('processJob', () => {
 		expect(phaseCalls[0].phase).toBe('review');
 		expect(phaseCalls[0].args.resumeSessionId).toBe('sess-review');
 		expect(phaseCalls[0].args.sessionId).toBeUndefined();
+	});
+
+	// A non-resuming retry *assigns* its `agentSessionId` (`claude --session-id`),
+	// and the payload's is the freshly minted one. The carried row can still hold
+	// the spent id — a terminated run preserves its session, and a swallowed
+	// finalize error leaves the previous attempt's id in place — and restoring it
+	// here would make the attempt exit 1 on `Session ID <id> is already in use`
+	// before doing any work.
+	it('assigns the payload session id, not the row one, when the retry is not resuming', async () => {
+		getRunByIdFromDb.mockResolvedValue({ agentSessionId: 'sess-spent' });
+		const fresh = '9a4bd3d0-2d64-4a58-9d1a-7d84f4b2d0c1';
+
+		await processJob(
+			createMockScmWebhookJob({ runId: 'run-1', agentSessionId: fresh }),
+			registryReturning(REVIEW_TRIGGER),
+		);
+
+		expect(phaseCalls[0].args.sessionId).toBe(fresh);
+		expect(phaseCalls[0].args.resumeSessionId).toBeUndefined();
+		// And the row records the id this attempt assigns, so a run that dies before
+		// it can finalize still leaves a recoverable session behind.
+		expect(resetRunSessionColumns).toEqual([fresh]);
+	});
+
+	it('leaves the stored session untouched when the retry resumes it', async () => {
+		getRunByIdFromDb.mockResolvedValue({ agentSessionId: 'sess-restored' });
+
+		await processJob(
+			createMockScmWebhookJob({ runId: 'run-1', resumeSession: true }),
+			registryReturning(REVIEW_TRIGGER),
+		);
+
+		// `undefined` is "don't write the column" — it already holds the id being resumed.
+		expect(resetRunSessionColumns).toEqual([undefined]);
 	});
 
 	it('threads delivery resume separately when no agent session was captured', async () => {

@@ -18,7 +18,7 @@ gate, the guaranteed-fresh session, and the prompt that re-seeds it (phase 2/4);
 *policy* that selects it — the `checkpointed` run status, worktree preservation on the strength
 of a checkpoint, and the bounded continuation dispatch (phase 3/4, issue #503). What is left is
 operator surface only: dashboard rendering and a "continue or terminate" action (phase 4/4).
-The speculative self-checkpoint *trigger* (§ "Soft budget") remains unimplemented; the
+The speculative self-checkpoint *trigger* (§ "Rejected") remains unimplemented; the
 resume-from-preserved-state mechanics Tier 2 builds on are proven by Tier 1.
 
 ## Tier 1 — native CLI session resume (implemented)
@@ -41,7 +41,13 @@ concurrent workers (`SWARM_WORKER_CONCURRENCY > 1`). SWARM always resumes by exp
 `AgentCliResult.sessionId` carries the id a run created, captured per CLI:
 
 - **claude** — assigned up front as `--session-id <runId>` and echoed back in the JSON
-  output's `session_id`; the harness reads that (falling back to the assigned id).
+  output's `session_id`; the harness reads that (falling back to the assigned id). The run id
+  is assigned by a *first* attempt only: `claude` refuses to open a second session under an id
+  it already used, so an attempt that is not resuming assigns a freshly minted uuid instead —
+  automatically in `deriveRetryJobPayload` and manually in `reconstructRetryJob`
+  (`src/dispatch/retry-payload.ts`). Because the flag, not the column, says which meaning the
+  id carries, the worker restores a run row's stored session onto a retry only when that retry
+  is resuming it (`reuseRunRow`, `src/worker/consumer.ts`).
 - **codex** — `codex exec --json` emits `{"type":"thread.started","thread_id":"…"}` as its
   first stdout line; `parseAgentOutput` lifts the `thread_id`. A resume re-emits the same id.
 - **agy** — has no assign flag, but `agy --output-format stream-json` prints a
@@ -136,7 +142,7 @@ and Review makes no worktree edits.
 
 The instruction is deliberately a *rolling* one rather than a wind-down the agent decides to
 perform — an involuntary stop arrives without warning, so the file has to already be current
-when it does. Having the agent judge its own remaining budget is the speculative trigger below.
+when it does. Having the agent judge its own remaining budget is the rejected trigger below.
 
 ### It is a scratch artifact, never a commit
 
@@ -258,26 +264,22 @@ identical policy it applies in-process. The wire `status` stays `deferred` — a
 a deferral whose retry happens to run from a checkpoint — so the frame change is additive and
 needs no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits the field.
 
-## Soft budget, completion reserve, self-checkpoint trigger (speculative)
+## Rejected: soft quota budgets and the self-checkpoint trigger
 
-Tier 1 covers *involuntary* stops (the host cut the run short). A separate, more speculative
-idea is to have an agent *voluntarily* wind down before a budget is exhausted:
+An earlier draft of this design proposed a second, *voluntary* mechanism: phases would run
+with a soft quota budget and a completion reserve, and an agent reaching the soft threshold
+would decide mid-run whether it could still finish, then either wind down normally or hand
+off and exit at a safe boundary.
 
-1. A phase runs with a soft quota budget and a small completion reserve.
-2. At the soft threshold, the agent stops starting broad investigation, refactors, or new
-   optional work, and decides whether it can finish verification and its phase handoff
-   within the reserve.
-3. If it can, it receives one bounded grace period and completes normally. If it cannot, it
-   either lets the session be preserved for native resume (Tier 1) or writes a checkpoint
-   file (Tier 2) and exits at a safe boundary.
-
-The **self-checkpoint trigger** — an agent reliably deciding mid-run to wind down and hand
-off — is the unproven part of this design. The *resume-from-preserved-state* half is not:
-it now ships as Tier 1. Treat the trigger as a later experiment.
+**This idea has been dropped and should not be re-proposed.** Both tiers here deliberately
+handle only *involuntary* stops — the host cut the run short. The unproven half was the
+trigger itself: an agent reliably judging its own remaining budget mid-run and choosing to
+stop. Nothing in the two tiers depends on it, so it is not deferred work; it is out of
+scope for the design.
 
 ## Required future work
 
-**Tier 2 — fallback checkpoint file**
+**Tier 2 — fallback checkpoint file** (issue #299)
 
 Tier 2 runs end to end as of issue #503 (phase 3/4): the artifact (phase 1/4), the continuation
 mechanism (phase 2/4), and the policy that selects it. What is left is operator surface:
