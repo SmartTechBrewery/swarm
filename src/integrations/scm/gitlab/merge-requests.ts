@@ -5,7 +5,7 @@
  * `getGitLabMergeRequest`, `getGitLabMergeRequestTitle`,
  * `getGitLabMergeRequestMergeState`, `getGitLabMergeRequestApprovals`,
  * `listOpenGitLabMergeRequestsForBase`, `getGitLabCommitStatuses`,
- * `listGitLabMergeRequestsForCommit`.
+ * `listGitLabMergeRequestsForCommit`, `findOpenGitLabMergeRequest`.
  *
  * They live in their own file rather than in `./client.ts` because that module is
  * the credential/transport primitive (token scoping, auth header, error envelope,
@@ -24,8 +24,10 @@
  *   value read here and a value parsed off a webhook are the same string for the
  *   same commit — there is no abbreviation invariant to honour as Bitbucket has.
  *
- * Writes — notes, verdicts, merge-request creation, delivery, merge — land in
- * phase 4/4.
+ * Writes — notes, verdicts, merge-request creation, the direct merge — live next
+ * door in `./writes.ts` (phase 4/4), which shares this module's
+ * {@link GitLabMergeRequestReference} so a found and a created merge request are
+ * the same shape to the delivery seam.
  */
 
 import type {
@@ -68,6 +70,7 @@ interface GitLabMergeRequest {
 	/** The successor to `merge_status`, which also reports *policy* blockers. */
 	detailed_merge_status?: string;
 	diff_refs?: { base_sha?: string } | null;
+	web_url?: string;
 }
 
 /** One commit status — GitLab's equivalent of a GitHub check run. */
@@ -93,7 +96,7 @@ interface GitLabMergeRequestApprovals {
 	approved_by?: unknown[];
 }
 
-/** A merge request's merge-relevant state — where phase 4's eligibility recheck starts. */
+/** A merge request's merge-relevant state — where the eligibility recheck starts. */
 export interface GitLabMergeRequestMergeState {
 	merged: boolean;
 	/** `open` | `closed` — the neutral spelling GitHub's `pulls.get` reports. */
@@ -101,6 +104,17 @@ export interface GitLabMergeRequestMergeState {
 	draft: boolean;
 	/** The exact head commit a merge attempt is allowed to merge. */
 	headSha: string;
+	/**
+	 * Whether a reviewer's "request changes" verdict currently blocks the merge.
+	 *
+	 * Read from `detailed_merge_status`, not from {@link getGitLabMergeRequestApprovals}:
+	 * GitLab records that verdict on `reviewers[].state` and the approvals entity does
+	 * not carry it at all, so this single merge-request read is the only place one
+	 * request exposes it. Without it a standing changes-requested verdict would only
+	 * surface as the merge endpoint's own 405 — classified `not-ready`, which the merge
+	 * dispatch would retry even though a reviewer decision cannot clear on its own.
+	 */
+	changesRequested: boolean;
 }
 
 /**
@@ -110,6 +124,12 @@ export interface GitLabMergeRequestMergeState {
 export interface GitLabApprovalState {
 	state: 'APPROVED';
 	commitId: string;
+}
+
+/** A merge request as the delivery seam refers to one, where `number` is the `iid`. */
+export interface GitLabMergeRequestReference {
+	number: number;
+	url: string;
 }
 
 /** A merge request a commit belongs to — enough to tie a branch pipeline back to it. */
@@ -282,7 +302,60 @@ export async function getGitLabMergeRequestMergeState(
 		state: mr.state === 'opened' ? 'open' : 'closed',
 		draft: Boolean(mr.draft),
 		headSha: mr.sha,
+		changesRequested: mr.detailed_merge_status === 'requested_changes',
 	};
+}
+
+/**
+ * Map a merge-request response onto the delivery seam's `{ number, url }`.
+ *
+ * A missing `iid` throws — every merge-request path is addressed by it, so a
+ * delivery that could not name its own merge request has nothing to resume. A
+ * missing `web_url` is derived instead: the URL is only ever shown to a human (a
+ * merge-request comment, a run-history row), so deriving beats failing the
+ * delivery over it. Same split as `toBitbucketPullRequestReference`, and the
+ * derivation is safe for the same reason the client's base URL is a constant —
+ * this adapter is GitLab.com-only.
+ */
+export function toGitLabMergeRequestReference(
+	repo: string,
+	mr: { iid?: number; web_url?: string },
+): GitLabMergeRequestReference {
+	if (mr.iid === undefined) {
+		throw new Error(
+			`GitLab merge-request response for ${repo} carries no iid, so it cannot be referenced`,
+		);
+	}
+	return {
+		number: mr.iid,
+		url: mr.web_url ?? `https://gitlab.com/${repo}/-/merge_requests/${mr.iid}`,
+	};
+}
+
+/**
+ * The open merge request whose **source** branch is `branch`, or `undefined` when
+ * none is open — the delivery seam's "has this branch already got a merge request?"
+ * lookup, which is what makes a resumed delivery reuse its own merge request
+ * instead of opening a second one.
+ *
+ * Filtered server-side, and unlike Bitbucket there is no query language to go
+ * through: GitLab exposes the same `source_branch=` filter GitHub's `head=` gives.
+ * When more than one open merge request shares a source branch (GitLab permits it,
+ * one per target branch), the first is taken — matching GitHub's and Bitbucket's
+ * find. One page suffices for that, so this is a plain request rather than a
+ * paginated walk.
+ */
+export async function findOpenGitLabMergeRequest(
+	repo: string,
+	branch: string,
+): Promise<GitLabMergeRequestReference | undefined> {
+	const query = new URLSearchParams({ state: 'opened', source_branch: branch });
+	const listed = await gitlabRequest<GitLabMergeRequest[] | undefined>(
+		'GET',
+		`${projectPath(repo)}/merge_requests?${query}`,
+	);
+	const mr = listed?.[0];
+	return mr ? toGitLabMergeRequestReference(repo, mr) : undefined;
 }
 
 /**

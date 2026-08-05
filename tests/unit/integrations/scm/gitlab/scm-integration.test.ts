@@ -8,13 +8,34 @@ import {
 	createMockScmEvent,
 } from '../../../../helpers/factories.js';
 
-// Only the persona-credential seam is stubbed. `withGitLabToken` is spied but still
-// establishes the *real* async-context scope, so a read test can assert both the
-// token the class chose to bind and the `PRIVATE-TOKEN` header the underlying
-// request went out with — the two halves of "this read ran as that persona".
+// Capture git invocations without spawning a process. `promisify(execFile)` calls
+// the mocked `execFile` with a node-style callback, so resolve it successfully.
+const execFileCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv; cwd: string }> = [];
+vi.mock('node:child_process', () => ({
+	execFile: (
+		_cmd: string,
+		args: string[],
+		opts: { env: NodeJS.ProcessEnv; cwd: string },
+		cb: (err: unknown, res: { stdout: string; stderr: string }) => void,
+	) => {
+		execFileCalls.push({ args, env: opts.env, cwd: opts.cwd });
+		cb(null, { stdout: '', stderr: '' });
+	},
+}));
+
+// Only the persona-credential and identity seams are stubbed. `withGitLabToken` is
+// spied but still establishes the *real* async-context scope, so a read test can
+// assert both the token the class chose to bind and the `PRIVATE-TOKEN` header the
+// underlying request went out with — the two halves of "this read ran as that
+// persona" — and `GitLabApiError` stays real so the merge classifier is exercised
+// against the actual shape.
 vi.mock('@/integrations/scm/gitlab/client.js', async (importOriginal) => {
 	const actual = await importOriginal<typeof import('@/integrations/scm/gitlab/client.js')>();
-	return { ...actual, withGitLabToken: vi.fn(actual.withGitLabToken) };
+	return {
+		...actual,
+		withGitLabToken: vi.fn(actual.withGitLabToken),
+		getScopedGitLabUser: vi.fn<() => Promise<{ username: string | null; email: string | null }>>(),
+	};
 });
 vi.mock('@/integrations/scm/gitlab/credentials.js', () => ({
 	getGitLabToken: vi.fn<(project: unknown, persona: string) => Promise<string>>(),
@@ -25,20 +46,66 @@ vi.mock('@/integrations/scm/gitlab/personas.js', () => ({
 	isSwarmGitLabActor: vi.fn(),
 	getGitLabPersonaForLogin: vi.fn(),
 }));
+vi.mock('@/integrations/scm/gitlab/operator-delivery.js', () => ({
+	createGitLabOperatorDeliveryProvider: vi.fn(),
+}));
+// The reads keep their **real** implementations behind spies: their own suite proves
+// each endpoint and mapping, and the read tests below assert the request that
+// actually went out. The merge tests then override only the two reads the
+// eligibility recheck consults, so the outcome matrix drives state directly instead
+// of staging a fetch script per case.
+vi.mock('@/integrations/scm/gitlab/merge-requests.js', async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import('@/integrations/scm/gitlab/merge-requests.js')>();
+	return {
+		...actual,
+		findOpenGitLabMergeRequest: vi.fn(actual.findOpenGitLabMergeRequest),
+		getGitLabMergeRequestApprovals: vi.fn(actual.getGitLabMergeRequestApprovals),
+		getGitLabMergeRequestMergeState: vi.fn(actual.getGitLabMergeRequestMergeState),
+	};
+});
+vi.mock('@/integrations/scm/gitlab/writes.js', () => ({
+	createGitLabMergeRequest: vi.fn(),
+	mergeGitLabMergeRequestDirect: vi.fn(),
+	postGitLabMergeRequestNote: vi.fn(),
+	postIdempotentGitLabMergeRequestNote: vi.fn(),
+	submitGitLabReview: vi.fn(),
+}));
 
-import { GitLabApiError, withGitLabToken } from '@/integrations/scm/gitlab/client.js';
+import {
+	GitLabApiError,
+	getScopedGitLabUser,
+	withGitLabToken,
+} from '@/integrations/scm/gitlab/client.js';
 import { getGitLabToken, getGitLabTokenOrNull } from '@/integrations/scm/gitlab/credentials.js';
+import {
+	findOpenGitLabMergeRequest,
+	getGitLabMergeRequestApprovals,
+	getGitLabMergeRequestMergeState,
+} from '@/integrations/scm/gitlab/merge-requests.js';
+import { createGitLabOperatorDeliveryProvider } from '@/integrations/scm/gitlab/operator-delivery.js';
 import {
 	getGitLabPersonaForLogin,
 	isSwarmGitLabActor,
 	resolveGitLabPersonaIdentities,
 } from '@/integrations/scm/gitlab/personas.js';
 import { GitLabSCMIntegration } from '@/integrations/scm/gitlab/scm-integration.js';
+import {
+	createGitLabMergeRequest,
+	mergeGitLabMergeRequestDirect,
+	postGitLabMergeRequestNote,
+	postIdempotentGitLabMergeRequestNote,
+	submitGitLabReview,
+} from '@/integrations/scm/gitlab/writes.js';
+import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
 const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+/** GitLab reports full 40-character SHAs, so a reviewed head is compared exactly. */
+const APPROVED_SHA = 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7';
+const OTHER_SHA = 'aaaa560886d4f094c3e6c9ef40349f7d38b5d27d7';
 
 describe('GitLabSCMIntegration', () => {
 	const scm = new GitLabSCMIntegration();
@@ -286,31 +353,351 @@ describe('GitLabSCMIntegration', () => {
 		});
 	});
 
-	// Every contract method a later phase owns must fail loudly and name that
-	// phase — never return a misleading `null`/`[]`/no-op that a caller would
-	// mistake for a real answer (issue #295).
-	describe('deferred contract methods', () => {
-		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['commentOnPullRequest', 'phase 4/4', () => scm.commentOnPullRequest()],
-			['deliveryProvider', 'phase 4/4', () => scm.deliveryProvider()],
-			['operatorDeliveryProvider', 'phase 4/4', () => scm.operatorDeliveryProvider()],
-			['mergePullRequest', 'phase 4/4', () => scm.mergePullRequest()],
+	describe('commentOnPullRequest', () => {
+		beforeEach(() => {
+			vi.mocked(getGitLabToken).mockImplementation(async (_p, persona) => `token-${persona}`);
+			vi.mocked(postGitLabMergeRequestNote).mockResolvedValue(991);
+		});
+
+		it('comments as the implementer by default — the merge request’s own author', async () => {
+			await expect(scm.commentOnPullRequest(project, 17, 'reclaimed mid-run')).resolves.toBe(991);
+			expect(vi.mocked(postGitLabMergeRequestNote)).toHaveBeenCalledWith(
+				'SmartTechBrewery/swarm',
+				17,
+				'reclaimed mid-run',
+			);
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'implementer');
+		});
+
+		it('honours an explicitly requested persona', async () => {
+			await scm.commentOnPullRequest(project, 17, 'note', 'reviewer');
+
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'reviewer');
+		});
+	});
+
+	// The merge capability is the one contract method that must never throw: every
+	// refusal maps onto a terminal `MergePullRequestOutcome` so a completed Review
+	// can't be retroactively failed (issue #253/#292).
+	describe('mergePullRequest', () => {
+		function openAt(headSha: string) {
+			return {
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha,
+				changesRequested: false,
+			};
+		}
+
+		beforeEach(() => {
+			vi.mocked(getGitLabToken).mockImplementation(async (_p, persona) => `token-${persona}`);
+			vi.mocked(getGitLabMergeRequestMergeState).mockReset();
+			vi.mocked(getGitLabMergeRequestApprovals).mockReset();
+			vi.mocked(mergeGitLabMergeRequestDirect).mockReset();
+			vi.mocked(getGitLabMergeRequestApprovals).mockResolvedValue([
+				{ state: 'APPROVED', commitId: APPROVED_SHA },
+			]);
+		});
+
+		it('merges as the implementer, pinned to the approved head', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+			vi.mocked(mergeGitLabMergeRequestDirect).mockResolvedValue({
+				merged: true,
+				message: 'merge request merged',
+				sha: 'abcdef0123456789abcdef0123456789abcdef01',
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
+				status: 'merged',
+				message: 'merge request merged',
+				sha: 'abcdef0123456789abcdef0123456789abcdef01',
+			});
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(mergeGitLabMergeRequestDirect)).toHaveBeenCalledWith(
+				'SmartTechBrewery/swarm',
+				17,
+				APPROVED_SHA,
+			);
+		});
+
+		it('reports an already-merged merge request as merged without attempting a merge', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				...openAt(APPROVED_SHA),
+				merged: true,
+				state: 'closed',
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
+				status: 'merged',
+				message: 'merge request already merged',
+			});
+			expect(vi.mocked(mergeGitLabMergeRequestDirect)).not.toHaveBeenCalled();
+		});
+
+		it('refuses when the head moved since the reviewed commit', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(OTHER_SHA));
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'not-eligible',
+				message: expect.stringContaining('head changed'),
+			});
+			expect(vi.mocked(mergeGitLabMergeRequestDirect)).not.toHaveBeenCalled();
+		});
+
+		it('refuses a merge request converted back to a draft', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				...openAt(APPROVED_SHA),
+				draft: true,
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'not-eligible',
+				message: expect.stringContaining('draft'),
+			});
+		});
+
+		it('refuses a closed merge request', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				...openAt(APPROVED_SHA),
+				state: 'closed',
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'not-eligible',
+				message: 'merge request is closed',
+			});
+		});
+
+		// Terminal rather than the `not-ready` GitLab's own 405 would produce: a reviewer
+		// decision does not clear on its own, so retrying it is wrong.
+		it('refuses when a reviewer has since requested changes', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				...openAt(APPROVED_SHA),
+				changesRequested: true,
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'not-eligible',
+				message: expect.stringContaining('changes have since been requested'),
+			});
+			expect(vi.mocked(mergeGitLabMergeRequestDirect)).not.toHaveBeenCalled();
+		});
+
+		it('refuses when the approval has been dismissed', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+			vi.mocked(getGitLabMergeRequestApprovals).mockResolvedValue([]);
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'not-eligible',
+				message: expect.stringContaining('dismissed'),
+			});
+		});
+
+		it('reports a non-merged 2xx as not-ready rather than a silent success', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+			vi.mocked(mergeGitLabMergeRequestDirect).mockResolvedValue({
+				merged: false,
+				message: 'still opened',
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
+				status: 'not-ready',
+				message: 'still opened',
+			});
+		});
+
+		const classifications: Array<[status: number, detail: string, expected: string]> = [
+			[409, 'SHA does not match HEAD of source branch', 'not-eligible'],
+			[405, 'Method Not Allowed', 'not-ready'],
+			[406, 'Branch cannot be merged', 'not-ready'],
+			[422, 'Branch cannot be merged', 'not-ready'],
+			[401, 'Unauthorized', 'policy-blocked'],
+			[403, 'Forbidden', 'policy-blocked'],
+			[404, 'Not found', 'provider-error'],
+			[500, 'Internal server error', 'provider-error'],
 		];
 
-		for (const [method, phase, call] of deferred) {
-			it(`${method} throws naming itself and ${phase}`, async () => {
-				// Sync methods throw, async ones reject — assert on whichever happens.
-				const thrown = await Promise.resolve()
-					.then(call)
-					.then(
-						() => null,
-						(err: unknown) => err,
-					);
+		for (const [status, detail, expected] of classifications) {
+			it(`maps a ${status} merge refusal onto ${expected}`, async () => {
+				vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+				vi.mocked(mergeGitLabMergeRequestDirect).mockRejectedValue(
+					new GitLabApiError(status, 'PUT', '/merge_requests/17/merge', detail),
+				);
 
-				expect(String(thrown)).toContain(`${method}() is not implemented yet`);
-				expect(String(thrown)).toContain(phase);
-				expect(String(thrown)).toContain('issue #295');
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: expected,
+				});
 			});
 		}
+
+		it('reports a failed state read as provider-error rather than throwing', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockRejectedValue(
+				new GitLabApiError(404, 'GET', '/merge_requests/17', '404 Not found'),
+			);
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'provider-error',
+			});
+		});
+
+		it('reports a failed approvals read as provider-error rather than throwing', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+			vi.mocked(getGitLabMergeRequestApprovals).mockRejectedValue(
+				new GitLabApiError(500, 'GET', '/merge_requests/17/approvals', 'boom'),
+			);
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'provider-error',
+			});
+		});
+
+		it('reports a missing implementer token as provider-error rather than throwing', async () => {
+			vi.mocked(getGitLabToken).mockRejectedValue(
+				new Error('No GitLab implementer token configured'),
+			);
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
+				status: 'provider-error',
+				message: 'No GitLab implementer token configured',
+			});
+		});
+	});
+
+	describe('deliveryProvider', () => {
+		beforeEach(() => {
+			execFileCalls.length = 0;
+			vi.mocked(getGitLabToken).mockImplementation(async (_p, persona) => `token-${persona}`);
+			vi.mocked(getScopedGitLabUser).mockResolvedValue({
+				username: 'swarm-impl',
+				email: 'impl@example.com',
+			});
+		});
+
+		it('signs commits with the account username and its exposed email', async () => {
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			expect(delivery.commitIdentity).toEqual({
+				name: 'swarm-impl',
+				email: 'impl@example.com',
+			});
+		});
+
+		it('falls back to the noreply placeholder when the token exposes no email', async () => {
+			vi.mocked(getScopedGitLabUser).mockResolvedValue({ username: 'swarm-impl', email: null });
+
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			expect(delivery.commitIdentity.email).toBe('swarm-impl@users.noreply.gitlab.com');
+		});
+
+		it('throws when the token resolves to no GitLab account', async () => {
+			vi.mocked(getScopedGitLabUser).mockResolvedValue({ username: null, email: null });
+
+			await expect(scm.deliveryProvider(project, 'reviewer')).rejects.toThrow(
+				/Could not resolve GitLab identity for reviewer persona/,
+			);
+		});
+
+		it('runs every scoped operation under the requested persona’s token', async () => {
+			vi.mocked(findOpenGitLabMergeRequest).mockResolvedValue(undefined);
+			vi.mocked(createGitLabMergeRequest).mockResolvedValue({
+				number: 21,
+				url: 'https://gitlab.com/SmartTechBrewery/swarm/-/merge_requests/21',
+			});
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha: APPROVED_SHA,
+				changesRequested: false,
+			});
+			vi.mocked(submitGitLabReview).mockResolvedValue(55);
+			vi.mocked(postIdempotentGitLabMergeRequestNote).mockResolvedValue(42);
+			const delivery = await scm.deliveryProvider(project, 'reviewer');
+			vi.mocked(withGitLabToken).mockClear();
+
+			await delivery.findPullRequest('issue-485');
+			await delivery.createPullRequest({
+				baseBranch: 'main',
+				branch: 'issue-485',
+				title: 't',
+				body: 'b',
+			});
+			await delivery.submitReview({
+				prNumber: 21,
+				verdict: 'approve',
+				body: 'LGTM',
+				deliveryId: 'd1',
+			});
+			await delivery.postComment({ prNumber: 21, body: 'note', deliveryId: 'd1' });
+
+			expect(vi.mocked(findOpenGitLabMergeRequest)).toHaveBeenCalledWith(
+				'SmartTechBrewery/swarm',
+				'issue-485',
+			);
+			expect(vi.mocked(createGitLabMergeRequest)).toHaveBeenCalledWith(
+				'SmartTechBrewery/swarm',
+				expect.objectContaining({ branch: 'issue-485' }),
+			);
+			// The contract's `submitReview` carries no reviewed head, so the seam reads the
+			// merge request's own head and pins the approval to it.
+			expect(vi.mocked(submitGitLabReview)).toHaveBeenCalledWith('SmartTechBrewery/swarm', {
+				iid: 21,
+				verdict: 'approve',
+				body: 'LGTM',
+				deliveryId: 'd1',
+				headSha: APPROVED_SHA,
+			});
+			expect(vi.mocked(postIdempotentGitLabMergeRequestNote)).toHaveBeenCalledWith(
+				'SmartTechBrewery/swarm',
+				{ iid: 21, body: 'note', deliveryId: 'd1' },
+			);
+			for (const call of vi.mocked(withGitLabToken).mock.calls) {
+				expect(call[0]).toBe('token-reviewer');
+			}
+			expect(vi.mocked(withGitLabToken)).toHaveBeenCalledTimes(4);
+		});
+
+		it('pushes the exact expected commit to GitLab with the token out of argv', async () => {
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			await delivery.pushBranch('/worktree', 'issue-485', 'abc1234');
+
+			expect(execFileCalls).toHaveLength(1);
+			const call = execFileCalls[0];
+			expect(call.cwd).toBe('/worktree');
+			expect(call.args).toEqual([
+				'push',
+				'--no-verify',
+				'https://gitlab.com/SmartTechBrewery/swarm.git',
+				'abc1234:refs/heads/issue-485',
+			]);
+			expect(call.env.GIT_CONFIG_COUNT).toBe('1');
+			expect(call.env.GIT_CONFIG_KEY_0).toBe('http.https://gitlab.com/.extraheader');
+			// GitLab authenticates any token form as the reserved `oauth2` user.
+			expect(call.env.GIT_CONFIG_VALUE_0).toBe(
+				`AUTHORIZATION: basic ${Buffer.from('oauth2:token-implementer').toString('base64')}`,
+			);
+			expect(call.args.join(' ')).not.toContain('token-implementer');
+		});
+	});
+
+	describe('operatorDeliveryProvider', () => {
+		it('builds the operator-credential seam with no project lookup', async () => {
+			const operatorDelivery = { commitIdentity: { name: 'op', email: 'op@example.com' } };
+			vi.mocked(createGitLabOperatorDeliveryProvider).mockResolvedValue(
+				operatorDelivery as unknown as ScmDeliveryProvider,
+			);
+
+			await expect(
+				scm.operatorDeliveryProvider('SmartTechBrewery/swarm', 'operator-token'),
+			).resolves.toBe(operatorDelivery);
+			expect(vi.mocked(createGitLabOperatorDeliveryProvider)).toHaveBeenCalledWith(
+				'SmartTechBrewery/swarm',
+				'operator-token',
+			);
+			expect(vi.mocked(getGitLabToken)).not.toHaveBeenCalled();
+		});
 	});
 });

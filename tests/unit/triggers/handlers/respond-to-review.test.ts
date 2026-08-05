@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
 import { getPersonaForLogin } from '@/integrations/scm/github/personas.js';
 import { parseGitHubWebhook } from '@/integrations/scm/github/webhook.js';
+import { gitLabRequestChangesMarker } from '@/integrations/scm/gitlab/review-marker.js';
+import { parseGitLabWebhook } from '@/integrations/scm/gitlab/webhook.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 import { createRespondToReviewTrigger } from '@/triggers/handlers/respond-to-review.js';
 import type { TriggerContext } from '@/triggers/types.js';
@@ -61,6 +63,34 @@ describe('respond-to-review trigger', () => {
 	describe('matches', () => {
 		it('matches a submitted changes-requested review', () => {
 			expect(handler.matches(ctx())).toBe(true);
+		});
+
+		it('dispatches for GitLab’s marker-normalized request-changes review', async () => {
+			const event = parseGitLabWebhook('Note Hook', {
+				object_kind: 'note',
+				user: { id: 9, username: 'swarm-rev' },
+				project: { path_with_namespace: PROJECT.repo },
+				object_attributes: {
+					noteable_type: 'MergeRequest',
+					system: false,
+					note: `Findings\n\n${gitLabRequestChangesMarker('delivery-1')}`,
+				},
+				merge_request: {
+					iid: 17,
+					source_branch: 'issue-17',
+					last_commit: { id: HEAD_SHA },
+					url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+				},
+			});
+			if (!event) throw new Error('expected marker-bearing GitLab note to parse');
+			await expect(
+				handler.handle(createMockScmTriggerContext({ project: PROJECT, scm: SCM, event })),
+			).resolves.toMatchObject({
+				phase: 'respond-to-review',
+				prNumber: '17',
+				prBranch: 'issue-17',
+				headSha: HEAD_SHA,
+			});
 		});
 
 		it('matches a submitted commented review so an opt-out project can dispatch it', () => {

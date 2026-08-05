@@ -14,10 +14,10 @@
  * (ai/CODING_STANDARDS.md "Module shape for a provider").
  *
  * This imports each provider index directly. A `src/integrations/<kind>/index.ts`
- * barrel (mirroring Cascade's) is still deferred: with three imports the list is
- * shorter than the barrel that would front it, and one of them is a provider
- * being built out phase by phase whose registration reads better named here than
- * hidden behind an aggregate.
+ * barrel (mirroring Cascade's) is still deferred: with four imports the list is
+ * shorter than the barrel that would front it, and each line's comment is where
+ * a reader learns which providers actually carry traffic — a distinction an
+ * aggregate would hide.
  *
  * Registering SCM here adds no module-load weight to any surface: the GitHub
  * Projects provider already imports `GitHubSCMIntegration` for its own credential
@@ -32,6 +32,9 @@ import './scm/github/index.js';
 // `runtimeReady: false` — discoverable by id, but not selectable and not served a
 // webhook route until project→provider selection exists (a follow-up).
 import './scm/bitbucket/index.js';
+// SCM: GitLab (issue #295, contract complete as of its phase 4/4). Registers with
+// `runtimeReady: false` for the same reason Bitbucket does.
+import './scm/gitlab/index.js';
 
 /**
  * Explicit no-op for call sites that want registration to be visible rather than

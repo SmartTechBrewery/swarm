@@ -51,8 +51,8 @@ export interface SCMProviderManifest {
 	 * `./registry.ts`) and the receiver's route mounting
 	 * (`src/router/webhook-receiver.ts`) — which is exactly the pair that would
 	 * otherwise start answering for a provider nothing has chosen. Bitbucket (issue
-	 * #296) sits here with a **complete** contract: what it still lacks is
-	 * project→provider selection, not an implementation.
+	 * #296) and GitLab (issue #295) sit here with **complete** contracts: what they
+	 * still lack is project→provider selection, not an implementation.
 	 *
 	 * It is **not** a selection mechanism and does not soften the single-provider
 	 * assertion: the second provider to claim runtime readiness still makes the

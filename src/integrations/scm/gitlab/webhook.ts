@@ -64,6 +64,7 @@ import type { ScmEvent, ScmEventAction, ScmReviewState } from '../../../scm/even
 import { isSwarmGeneratedBody } from '../../../scm/swarm-origin.js';
 import type { ScmWebhookRequest, WebhookHeaderReader } from '../../../scm/types.js';
 import { isTerminalPipelineStatus, pipelineConclusion } from './pipelines.js';
+import { isGitLabRequestChangesMarker } from './review-marker.js';
 
 /** Header GitLab delivers the event name in (not carried in the body). */
 const EVENT_HEADER = 'x-gitlab-event';
@@ -219,6 +220,16 @@ function classifyNote(p: Record<string, unknown>): EventClassification | null {
 	// them narrate actions SWARM itself just took.
 	if (note?.system === true) return null;
 	if (str(note?.noteable_type) !== MERGE_REQUEST_NOTEABLE) return null;
+	// GitLab has no REST endpoint for a requested-changes reviewer state. Its review
+	// delivery writes this marker-bearing note instead, which must bypass the normal
+	// comment loop gate so Respond-to-review receives the reviewer verdict.
+	if (isGitLabRequestChangesMarker(str(note?.note))) {
+		return {
+			kind: 'pull-request-review',
+			action: 'submitted',
+			reviewState: 'changes-requested',
+		};
+	}
 	return { kind: 'work-item-comment', action: 'created' };
 }
 
@@ -340,7 +351,10 @@ function synthesizeReviewId(
 }
 
 function reviewFields(p: Record<string, unknown>, reviewState: ScmReviewState): LifecycleFields {
-	const mr = asRecord(p.object_attributes);
+	const attributes = asRecord(p.object_attributes);
+	// A merge-request hook puts MR fields in `object_attributes`; a Note Hook puts
+	// them in `merge_request`. The latter is the request-changes delivery path.
+	const mr = attributes?.iid == null ? asRecord(p.merge_request) : attributes;
 	const headSha = headShaOf(mr);
 	return {
 		headSha,

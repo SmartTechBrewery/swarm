@@ -12,16 +12,18 @@
  * Mirrors `src/scm/delivery.ts`'s `ScmDeliveryProvider` seam: dispatch/worker
  * code depends on {@link ScmMergeProvider} only, never on a provider's own
  * client or vocabulary ("pull request" here, not GitHub's `pulls.merge` or
- * GitLab's "merge request"). Two adapters implement it —
+ * GitLab's "merge request"). Three adapters implement it —
  * `GitHubSCMIntegration.mergePullRequest`
  * (`src/integrations/scm/github/scm-integration.ts`) and
  * `BitbucketSCMIntegration.mergePullRequest`
- * (`src/integrations/scm/bitbucket/scm-integration.ts`) — and both do the same
- * three things: re-read current PR state, verify the approved head and approval
- * still hold, call the native direct merge endpoint, and map the response onto
- * {@link MergePullRequestOutcome}, with no dispatch or worker changes. Bitbucket's
- * endpoint takes no expected-head parameter, so that re-read is the whole of its
- * protection where GitHub also pins the merge to the approved SHA.
+ * (`src/integrations/scm/bitbucket/scm-integration.ts`), and
+ * `GitLabSCMIntegration.mergePullRequest`
+ * (`src/integrations/scm/gitlab/scm-integration.ts`) — and all re-read current PR
+ * state, verify the approved head and approval still hold, call the native direct
+ * merge endpoint, and map the response onto {@link MergePullRequestOutcome}, with
+ * no dispatch or worker changes. Bitbucket's endpoint takes no expected-head
+ * parameter, so that re-read is the whole of its protection; GitHub and GitLab
+ * also pin the merge to the approved SHA.
  */
 
 import type { ProjectConfig } from '../config/schema.js';

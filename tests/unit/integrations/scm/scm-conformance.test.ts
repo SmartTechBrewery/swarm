@@ -4,12 +4,17 @@
  * (ai/TESTING.md "Provider conformance", mirroring Cascade's
  * `tests/unit/integrations/pm-conformance.test.ts`).
  *
- * Deliberately deferred until now (issue #296 phase 4/4): while Bitbucket still
- * threw for the methods its later phases owned, a shared harness would only have
- * asserted that those throws existed. Both providers now implement the whole
- * contract, so the harness asserts the surface *and* that no method is a stub —
- * which is what makes it a gate on the third provider rather than a description of
- * the second.
+ * Deliberately deferred until issue #296's phase 4/4: while Bitbucket still threw
+ * for the methods its later phases owned, a shared harness would only have asserted
+ * that those throws existed. It landed once both providers implemented the whole
+ * contract, so it asserts the surface *and* that no method is a stub — which is
+ * what made it a gate on the third provider rather than a description of the second.
+ *
+ * **The third provider has now passed that gate.** GitLab (issue #295) built its
+ * contract over four phases while registering nothing, precisely so it could not
+ * claim an exemption from the no-stub assertion, and registered in its phase 4/4
+ * together with the last stub's removal. A fourth provider adds a manifest to the
+ * list below and inherits every assertion unchanged.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -57,8 +62,8 @@ type AssertNever<T extends never> = T;
 const manifests = listSCMProviders();
 
 describe('SCM provider conformance', () => {
-	it('registers at least the two providers the suite exists for', () => {
-		expect(manifests.map((manifest) => manifest.id)).toEqual(['github', 'bitbucket']);
+	it('registers every provider the suite runs over', () => {
+		expect(manifests.map((manifest) => manifest.id)).toEqual(['github', 'bitbucket', 'gitlab']);
 	});
 
 	it('gives every provider a unique id', () => {

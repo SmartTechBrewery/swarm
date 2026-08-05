@@ -253,3 +253,33 @@ export async function getGitLabUserForToken(token: string | null): Promise<strin
 		return null;
 	}
 }
+
+/** The `GET /user` fields a delivery's commit identity is built from. */
+export interface GitLabScopedUser {
+	username: string | null;
+	/** `null` whenever GitLab withholds it — see {@link getScopedGitLabUser}. */
+	email: string | null;
+}
+
+/**
+ * The account the **scoped** token authenticates as, for the delivery seam's
+ * commit identity. One request answers both halves, where Bitbucket needs a
+ * second call to `/user/emails`.
+ *
+ * Two divergences from {@link getGitLabUserForToken}, which resolves the same
+ * endpoint for persona identity: the token comes from the async context rather
+ * than an argument, and a `GitLabApiError` **propagates** instead of being logged
+ * and flattened to `null`. Persona resolution must survive one bad credential; a
+ * delivery must not commit under an identity it failed to resolve, and the API
+ * error says why (a token without `read_user`/`api` scope cannot read `/user` at
+ * all) where a bare `null` would not.
+ *
+ * `email` comes back `null` — not an error — when GitLab returns none: the field
+ * is omitted for a token whose scope doesn't expose it, and a project/group
+ * access token's bot user has no address to expose. The caller substitutes the
+ * noreply placeholder.
+ */
+export async function getScopedGitLabUser(): Promise<GitLabScopedUser> {
+	const user = await gitlabRequest<{ username?: string; email?: string | null }>('GET', '/user');
+	return { username: user.username ?? null, email: user.email?.trim() || null };
+}

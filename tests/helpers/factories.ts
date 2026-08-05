@@ -533,6 +533,31 @@ export function createMockGitLabMergeRequestResponse(
 }
 
 /**
+ * A GitLab **REST** merge-request note, as
+ * `GET /projects/:id/merge_requests/:iid/notes` returns each array entry. `body` is
+ * where a delivery's idempotency marker travels, so it is what the marker scan
+ * reads, and `system` distinguishes a human comment from one of GitLab's own
+ * activity entries — the case the scan must skip.
+ */
+export function createMockGitLabNoteResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: 301,
+		body: 'looks good',
+		author: gitlabUser('swarm-rev', 8),
+		system: false,
+		noteable_type: 'MergeRequest',
+		noteable_iid: 17,
+		resolvable: false,
+		internal: false,
+		created_at: '2026-08-05T10:00:00.000Z',
+		updated_at: '2026-08-05T10:00:00.000Z',
+		...overrides,
+	};
+}
+
+/**
  * A GitLab **REST** commit status, as
  * `GET /projects/:id/repository/commits/:sha/statuses` returns each array entry.
  * `name` is what identifies a job across re-runs, so it is what the aggregate read

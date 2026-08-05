@@ -7,6 +7,7 @@ import {
 	withGitLabToken,
 } from '@/integrations/scm/gitlab/client.js';
 import {
+	findOpenGitLabMergeRequest,
 	getGitLabCommitStatuses,
 	getGitLabMergeRequest,
 	getGitLabMergeRequestApprovals,
@@ -247,6 +248,7 @@ describe('gitlab merge-request reads', () => {
 					...expected,
 					draft: false,
 					headSha: HEAD_SHA,
+					changesRequested: false,
 				});
 			});
 		}
@@ -261,6 +263,23 @@ describe('gitlab merge-request reads', () => {
 			});
 		});
 
+		// The verdict lives on `reviewers[].state`, which the approvals endpoint does not
+		// carry — `detailed_merge_status` is where a single merge-request read exposes it.
+		it('reports a standing changes-requested verdict off detailed_merge_status', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(
+					createMockGitLabMergeRequestResponse({
+						merge_status: 'can_be_merged',
+						detailed_merge_status: 'requested_changes',
+					}),
+				),
+			);
+
+			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).resolves.toMatchObject({
+				changesRequested: true,
+			});
+		});
+
 		it('throws rather than reporting a merge state with no head to pin a merge to', async () => {
 			fetchMock.mockResolvedValue(
 				jsonResponse(createMockGitLabMergeRequestResponse({ sha: undefined })),
@@ -269,6 +288,53 @@ describe('gitlab merge-request reads', () => {
 			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).rejects.toThrow(
 				/carries no sha/,
 			);
+		});
+	});
+
+	describe('findOpenGitLabMergeRequest', () => {
+		it('filters server-side on the source branch and maps the first match', async () => {
+			fetchMock.mockResolvedValue(jsonResponse([createMockGitLabMergeRequestResponse()]));
+
+			await expect(
+				scoped(() => findOpenGitLabMergeRequest(REPO, 'swarm/issue-17')),
+			).resolves.toEqual({
+				number: 17,
+				url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+			});
+			const url = new URL(requestedUrl(fetchMock));
+			expect(url.pathname).toBe(`/api/v4${PROJECT_PATH}/merge_requests`);
+			expect(url.searchParams.get('state')).toBe('opened');
+			expect(url.searchParams.get('source_branch')).toBe('swarm/issue-17');
+		});
+
+		it('reports no open merge request rather than throwing', async () => {
+			fetchMock.mockResolvedValue(jsonResponse([]));
+
+			await expect(
+				scoped(() => findOpenGitLabMergeRequest(REPO, 'swarm/issue-17')),
+			).resolves.toBeUndefined();
+		});
+
+		it('derives the web URL when GitLab’s response carries none', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse([createMockGitLabMergeRequestResponse({ web_url: undefined })]),
+			);
+
+			await expect(
+				scoped(() => findOpenGitLabMergeRequest(REPO, 'swarm/issue-17')),
+			).resolves.toMatchObject({
+				url: 'https://gitlab.com/jkwiecien/swarm/-/merge_requests/17',
+			});
+		});
+
+		it('throws rather than referencing a merge request with no iid', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse([createMockGitLabMergeRequestResponse({ iid: undefined })]),
+			);
+
+			await expect(
+				scoped(() => findOpenGitLabMergeRequest(REPO, 'swarm/issue-17')),
+			).rejects.toThrow(/carries no iid/);
 		});
 	});
 
