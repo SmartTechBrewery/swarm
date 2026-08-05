@@ -114,7 +114,11 @@ describe('ReviewCapCallout (issue #242)', () => {
 	// The `renders nothing` cases below return before that and stay provider-free.
 	function renderCapCallout(
 		run: RunRow = makeReviewRun(),
-		project: { name: string; repo: string } | null = { name: 'Demo', repo: 'acme/demo' },
+		project: {
+			name: string;
+			repo: string;
+			pipeline?: { respondToReview?: { enabled?: boolean } };
+		} | null = { name: 'Demo', repo: 'acme/demo' },
 	) {
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 		return render(
@@ -137,6 +141,17 @@ describe('ReviewCapCallout (issue #242)', () => {
 		renderCapCallout();
 
 		expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
+	});
+
+	it('withholds Force re-review when Respond-to-review is disabled', () => {
+		renderCapCallout(makeReviewRun(), {
+			name: 'Demo',
+			repo: 'acme/demo',
+			pipeline: { respondToReview: { enabled: false } },
+		});
+
+		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+		expect(screen.queryByRole('button', { name: /force re-review/i })).toBeNull();
 	});
 
 	it('links to the PR when the project repo is known', () => {

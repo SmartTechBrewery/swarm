@@ -116,8 +116,17 @@ const cappedSlot = {
 	capOverrideConsumedAt: null,
 };
 
-function dispatchResult(created: boolean) {
-	return { dispatch: { id: 'dispatch-9' }, created };
+type CreateDispatchResult = Awaited<ReturnType<typeof createAndPublishDispatch>>;
+
+function dispatchResult(
+	created: boolean,
+	state = 'pending',
+	outcome: string | null = null,
+): CreateDispatchResult {
+	return {
+		dispatch: { id: 'dispatch-9', state, outcome },
+		created,
+	} as unknown as CreateDispatchResult;
 }
 
 describe('forceReReview (issue #511)', () => {
@@ -127,8 +136,7 @@ describe('forceReReview (issue #511)', () => {
 		vi.mocked(getProjectByIdFromDb).mockResolvedValue(PROJECT);
 		vi.mocked(getSubmittedReviewSlot).mockResolvedValue(cappedSlot);
 		vi.mocked(grantReviewCapOverride).mockResolvedValue('granted');
-		// biome-ignore lint/suspicious/noExplicitAny: only the two fields the service reads matter
-		vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(true) as any);
+		vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(true));
 	});
 
 	describe('the forced continuation', () => {
@@ -187,8 +195,7 @@ describe('forceReReview (issue #511)', () => {
 	describe('deduplication', () => {
 		it('reports an already-scheduled cycle instead of duplicating it', async () => {
 			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
-			// biome-ignore lint/suspicious/noExplicitAny: only the two fields the service reads matter
-			vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(false) as any);
+			vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(false));
 
 			const result = await forceReReview('run-1');
 
@@ -206,6 +213,19 @@ describe('forceReReview (issue #511)', () => {
 			const [first, second] = vi.mocked(createAndPublishDispatch).mock.calls;
 			expect(first[0].dedupKey).toBeDefined();
 			expect(second[0].dedupKey).toBe(first[0].dedupKey);
+		});
+		it('reports a completed forced cycle without presenting it as scheduled', async () => {
+			vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+			vi.mocked(createAndPublishDispatch).mockResolvedValue(
+				dispatchResult(false, 'completed', 'no-trigger'),
+			);
+
+			await expect(forceReReview('run-1')).resolves.toMatchObject({
+				capOverride: 'already-granted',
+				dispatch: 'already-completed',
+				dispatchState: 'completed',
+				dispatchOutcome: 'no-trigger',
+			});
 		});
 	});
 
@@ -265,5 +285,18 @@ describe('forceReReview (issue #511)', () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(undefined);
 			await expect(forceReReview('run-1')).rejects.toBeInstanceOf(ForceReReviewError);
 		});
+	});
+
+	it('refuses before mutating when Respond-to-review is disabled', async () => {
+		vi.mocked(getProjectByIdFromDb).mockResolvedValue(
+			createMockProjectConfig({ pipeline: { respondToReview: { enabled: false } } }),
+		);
+
+		await expect(forceReReview('run-1')).rejects.toMatchObject({
+			reason: 'respond-to-review-disabled',
+		});
+		expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
+		expect(grantReviewCapOverride).not.toHaveBeenCalled();
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
 	});
 });

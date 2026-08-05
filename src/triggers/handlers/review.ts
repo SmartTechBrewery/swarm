@@ -409,6 +409,7 @@ async function reserveDurableReviewSlot(
 			headSha,
 			ordinal: reservation.ordinal,
 			reused: reservation.status === 'reused',
+			capOverride: reservation.status === 'reserved' && reservation.capOverride === true,
 		});
 		return true;
 	} catch (err) {

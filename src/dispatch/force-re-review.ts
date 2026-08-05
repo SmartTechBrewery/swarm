@@ -61,6 +61,7 @@ import { createAndPublishDispatch, deliveryDedupKey } from './dispatcher.js';
 export type ForceReReviewRefusal =
 	| 'run-not-found'
 	| 'project-not-found'
+	| 'respond-to-review-disabled'
 	| 'not-capped'
 	| 'missing-coordinates'
 	| 'missing-review-record';
@@ -83,9 +84,13 @@ export interface ForceReReviewResult {
 	headSha: string;
 	/** Whether this call granted the extra review slot or found one already granted. */
 	capOverride: 'granted' | 'already-granted';
-	/** Whether this call enqueued the corrective run or found it already scheduled. */
-	dispatch: 'scheduled' | 'already-scheduled';
+	/** Whether this call enqueued the corrective run, found it active, or found it complete. */
+	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed';
 	dispatchId: string;
+	/** The durable dispatch state, including an existing terminal state on a repeated force. */
+	dispatchState?: string;
+	/** The completed dispatch's outcome, when the worker recorded one. */
+	dispatchOutcome?: string | null;
 }
 
 /**
@@ -146,6 +151,12 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		throw new ForceReReviewError(
 			'project-not-found',
 			`Cannot force a re-review for run "${runId}" — its project "${run.projectId}" no longer exists.`,
+		);
+	}
+	if (project.pipeline?.respondToReview?.enabled === false) {
+		throw new ForceReReviewError(
+			'respond-to-review-disabled',
+			`Cannot force a re-review for run "${runId}" because Respond-to-review is disabled for this project. Enable pipeline.respondToReview.enabled before continuing the corrective cycle.`,
 		);
 	}
 
@@ -230,7 +241,13 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 		prNumber,
 		headSha,
 		capOverride,
-		dispatch: created ? 'scheduled' : 'already-scheduled',
+		dispatch: created
+			? 'scheduled'
+			: dispatch.state === 'completed'
+				? 'already-completed'
+				: 'already-scheduled',
 		dispatchId: dispatch.id,
+		dispatchState: dispatch.state,
+		dispatchOutcome: dispatch.outcome,
 	};
 }

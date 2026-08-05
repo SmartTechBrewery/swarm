@@ -14,8 +14,10 @@ export interface ForceReReviewReport {
 	prNumber: string;
 	headSha: string;
 	capOverride: 'granted' | 'already-granted';
-	dispatch: 'scheduled' | 'already-scheduled';
+	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed';
 	dispatchId: string;
+	dispatchState?: string;
+	dispatchOutcome?: string | null;
 }
 
 /** The run fields the availability rule reads — the subset `RunRow` and the API row share. */
@@ -26,6 +28,11 @@ export interface ForceReReviewRunState {
 	reviewAutomationOutcome?: string | null;
 }
 
+/** The project setting that can disable the forced corrective sequence. */
+export interface ForceReReviewPipeline {
+	respondToReview?: { enabled?: boolean };
+}
+
 /**
  * Whether a run can have its re-review forced: exactly the state the run-detail
  * view renders as "Manual action required" — a completed Review run whose
@@ -34,12 +41,16 @@ export interface ForceReReviewRunState {
  * guard (`forceReReview` refuses anything else) so the button never offers an
  * action the router would reject.
  */
-export function canForceReReview(run: ForceReReviewRunState): boolean {
+export function canForceReReview(
+	run: ForceReReviewRunState,
+	pipeline?: ForceReReviewPipeline,
+): boolean {
 	return (
 		run.status === 'completed' &&
 		run.phase === 'review' &&
 		run.reviewVerdict === 'request-changes' &&
-		run.reviewAutomationOutcome === 'manual-intervention-required'
+		run.reviewAutomationOutcome === 'manual-intervention-required' &&
+		pipeline?.respondToReview?.enabled !== false
 	);
 }
 
@@ -76,7 +87,11 @@ export function describeForceReReviewResult(result: ForceReReviewReport): string
 			: 'Review cap: an extra review slot was already granted for this review.',
 		result.dispatch === 'scheduled'
 			? `Respond-to-review: scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId}.`
-			: `Respond-to-review: already scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId} — nothing duplicated.`,
-		'Re-review: runs automatically once the response pushes a commit.',
+			: result.dispatch === 'already-completed'
+				? `Respond-to-review: prior forced dispatch ${result.dispatchId} already completed${result.dispatchOutcome ? ` (${result.dispatchOutcome})` : ''}.`
+				: `Respond-to-review: already scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId} — nothing duplicated.`,
+		result.dispatch === 'already-completed'
+			? 'Re-review: no new review was scheduled by that completed corrective cycle.'
+			: 'Re-review: runs automatically once the response pushes a commit.',
 	];
 }

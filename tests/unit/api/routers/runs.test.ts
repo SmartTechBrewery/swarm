@@ -1283,6 +1283,7 @@ describe('runsRouter', () => {
 		it.each([
 			['run-not-found', 'NOT_FOUND'],
 			['project-not-found', 'PRECONDITION_FAILED'],
+			['respond-to-review-disabled', 'PRECONDITION_FAILED'],
 			['not-capped', 'PRECONDITION_FAILED'],
 			['missing-coordinates', 'PRECONDITION_FAILED'],
 			['missing-review-record', 'PRECONDITION_FAILED'],

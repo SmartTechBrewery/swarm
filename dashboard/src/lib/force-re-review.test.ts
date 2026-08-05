@@ -31,6 +31,11 @@ describe('canForceReReview (issue #511)', () => {
 		expect(canForceReReview(CAPPED)).toBe(true);
 	});
 
+	it('withholds the action when Respond-to-review is disabled', () => {
+		expect(canForceReReview(CAPPED, { respondToReview: { enabled: false } })).toBe(false);
+		expect(canForceReReview(CAPPED, { respondToReview: { enabled: true } })).toBe(true);
+	});
+
 	it.each([
 		['a run still in progress', { status: 'running' }],
 		['a non-Review phase', { phase: 'respond-to-review' }],
@@ -76,5 +81,17 @@ describe('describeForceReReviewResult', () => {
 		);
 		expect(lines[0]).toMatch(/already granted/i);
 		expect(lines[1]).toMatch(/nothing duplicated/i);
+	});
+
+	it('does not promise a new review after a completed forced dispatch', () => {
+		const lines = describeForceReReviewResult(
+			report({
+				capOverride: 'already-granted',
+				dispatch: 'already-completed',
+				dispatchOutcome: 'no-trigger',
+			}),
+		);
+		expect(lines[1]).toMatch(/already completed.*no-trigger/i);
+		expect(lines[2]).toMatch(/no new review was scheduled/i);
 	});
 });

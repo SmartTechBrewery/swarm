@@ -232,6 +232,7 @@ const RESET_REFUSAL_CODES: Record<RunResetRefusal, TRPCError['code']> = {
 const FORCE_RE_REVIEW_REFUSAL_CODES: Record<ForceReReviewRefusal, TRPCError['code']> = {
 	'run-not-found': 'NOT_FOUND',
 	'project-not-found': 'PRECONDITION_FAILED',
+	'respond-to-review-disabled': 'PRECONDITION_FAILED',
 	'not-capped': 'PRECONDITION_FAILED',
 	'missing-coordinates': 'PRECONDITION_FAILED',
 	'missing-review-record': 'PRECONDITION_FAILED',

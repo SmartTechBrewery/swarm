@@ -791,7 +791,11 @@ export function RecoveryCallout({ run }: RecoveryCalloutProps) {
 
 interface ReviewCapCalloutProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	project?: {
+		name: string;
+		repo: string;
+		pipeline?: { respondToReview?: { enabled?: boolean } };
+	} | null;
 }
 
 /**
@@ -852,7 +856,7 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 						<ExternalLink className="h-3 w-3" />
 					</a>
 				)}
-				<ForceReReviewButton run={run} />
+				{canForceReReview(run, project?.pipeline) && <ForceReReviewButton run={run} />}
 			</div>
 		</div>
 	);
