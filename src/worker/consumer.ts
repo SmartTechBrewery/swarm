@@ -593,6 +593,23 @@ async function resolveCheckpointFallback(
 	return { kind: 'continue', checkpoint, continuationCount: spent + 1 };
 }
 
+async function tryReleaseCheckpointFallbackCheckout(
+	project: ProjectConfig,
+	taskId: string,
+	runId: string | undefined,
+): Promise<void> {
+	try {
+		await new GitWorktreeManager(project).cleanup(taskId);
+	} catch (error) {
+		logger.error('Tier 2 checkpoint fallback checkout release failed', {
+			projectId: project.id,
+			taskId,
+			runId,
+			error: describeError(error),
+		});
+	}
+}
+
 /**
  * Handle a deferrable {@link AgentRunError} (`rate-limit`, `capacity`, or `aborted`) —
  * `processJob`'s one non-terminal failure path, split out to keep that
@@ -2776,7 +2793,7 @@ async function handlePhaseFailure(
 		? await resolveCheckpointFallback(err, job, trigger, project, runId)
 		: undefined;
 	if (checkpointFallback?.kind === 'release') {
-		await new GitWorktreeManager(project).cleanup(trigger.taskId);
+		await tryReleaseCheckpointFallbackCheckout(project, trigger.taskId, runId);
 	}
 	if (isDeferrable) {
 		const failure: DeferrableFailure =

@@ -3819,6 +3819,26 @@ describe('processJob', () => {
 			cleanup.mockRestore();
 		});
 
+		it('still settles the deferral when releasing the checkout fails', async () => {
+			const cleanup = vi
+				.spyOn(GitWorktreeManager.prototype, 'cleanup')
+				.mockRejectedValue(new Error('git worktree remove failed'));
+			getRunByIdFromDb
+				.mockResolvedValueOnce(undefined)
+				.mockRejectedValueOnce(new Error('database unavailable'));
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(retriedPayload().recoveryMode).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledExactlyOnceWith(RESPOND_TO_CI_TRIGGER.taskId);
+			cleanup.mockRestore();
+		});
+
 		it('fails terminally once the continuation budget is exhausted', async () => {
 			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
