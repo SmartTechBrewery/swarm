@@ -211,10 +211,24 @@ server-side store) it needs:
    the server-side credential), the board a worker may write to still comes from its
    authenticated routable enrollment rather than the request body, and each write is
    idempotent or best-effort at the provider. The split's two idempotency mechanisms
-   travel intact: `findComment` on the plan-delivery marker short-circuits a replayed
-   delivery *before* `applySplit` runs, so a retry cannot create a second set of
-   children, and `PLANNED_LABEL` still marks only children whose preparation actually
-   completed. Deliberately **not** taken: relocating `applySplit` behind one coarse
+   travel unchanged: `findComment` on the plan-delivery marker short-circuits a
+   replayed delivery *before* `applySplit` runs, and `PLANNED_LABEL` still marks only
+   children whose preparation actually completed.
+
+   **Unchanged is not the same as sufficient, and this move raises the stakes on one
+   gap.** The marker that makes a replay a no-op is the *plan comment*, and
+   `applySplit` runs **before** that comment is posted — so the guard only covers a
+   delivery that got as far as posting. A split that dies partway (a `createWorkItem`
+   throwing on child 2 of 3) leaves child 1 on the board with no marker anywhere, and
+   the retry re-runs the whole split: child 1 is created a second time. That is
+   pre-existing behaviour, identical on the same-host path and not introduced here —
+   but `createWorkItem` is the one write outside the per-child `try`, and putting it
+   on the wire adds transport failure modes (a 5xx, a socket reset, a control-plane
+   restart) to precisely the call whose failure duplicates board structure. Closing it
+   needs a change to the split's own idempotency — a marker written before the first
+   child, or a resumable split — which is pipeline semantics shared with the same-host
+   path, so it is tracked separately rather than smuggled into a transport change.
+   Deliberately **not** taken: relocating `applySplit` behind one coarse
    "apply this split" route. That would carry agent-authored preplan contracts and
    per-child ordering up to the control plane and re-implement Planning's per-child
    failure handling there — moving pipeline logic off the phase that owns it, and

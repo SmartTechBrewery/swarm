@@ -737,13 +737,22 @@ export type CreateWorkItemDeliveryResponse = z.infer<typeof CreateWorkItemDelive
  * string, which a re-scope may legitimately write; `title` does not, since no
  * provider models an untitled item.
  */
-export const UpdateWorkItemDeliveryRequestSchema = z.object({
-	projectId: z.string().min(1),
-	itemId: z.string().min(1),
-	title: z.string().min(1).optional(),
-	description: z.string().optional(),
-	protocolVersion: z.number().int(),
-});
+export const UpdateWorkItemDeliveryRequestSchema = z
+	.object({
+		projectId: z.string().min(1),
+		itemId: z.string().min(1),
+		title: z.string().min(1).optional(),
+		description: z.string().optional(),
+		protocolVersion: z.number().int(),
+	})
+	// Both fields optional means "leave this one alone", so *neither* means the
+	// request asks for nothing — a caller bug that would otherwise reach the provider
+	// as an empty patch and spend a board write saying nothing. Planning never sends
+	// one (`buildMainTaskPatch` returns undefined when nothing changed, and the call
+	// is guarded on that), so rejecting it costs no legitimate traffic.
+	.refine((request) => request.title !== undefined || request.description !== undefined, {
+		message: 'update-item requires at least one of title or description',
+	});
 export type UpdateWorkItemDeliveryRequest = z.infer<typeof UpdateWorkItemDeliveryRequestSchema>;
 
 /** `POST /worker/delivery/pm/update-item` success body — a patch carries no return value. */

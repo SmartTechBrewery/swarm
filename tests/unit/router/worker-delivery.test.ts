@@ -1175,6 +1175,12 @@ describe('handleUpdateWorkItem', () => {
 		expect((await handleUpdateWorkItem(deps, CREDENTIAL, updateBody({ title: '' }))).status).toBe(
 			400,
 		);
+		// Both fields optional means "leave this one alone", so neither means the
+		// request asks for nothing — reject it rather than spend a board write on an
+		// empty patch (issue #536 review).
+		expect(
+			(await handleUpdateWorkItem(deps, CREDENTIAL, updateBody({ title: undefined }))).status,
+		).toBe(400);
 		expect(deps.buildPmProvider).not.toHaveBeenCalled();
 	});
 });

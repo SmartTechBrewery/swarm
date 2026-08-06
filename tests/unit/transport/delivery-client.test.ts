@@ -107,6 +107,27 @@ describe('postDelivery', () => {
 		).rejects.toThrow(/failed with status 502$/);
 	});
 
+	// The protocol version is bumped only when a frame changes shape, so a route
+	// added in a later release reaches an older control plane as a plain 404 with
+	// nothing upstream to catch it. The message has to name the cause, or an operator
+	// sees a bare status code for a version-skew problem (issue #536 review).
+	it('names a version-skewed control plane when a delivery route is missing', async () => {
+		const missingRoute = vi.fn<FetchLike>().mockResolvedValue({
+			ok: false,
+			status: 404,
+			json: async () => ({}),
+		});
+
+		await expect(
+			postDelivery(
+				{ controlPlaneUrl: CONTROL_PLANE, workerCredential: CREDENTIAL, fetchImpl: missingRoute },
+				'/worker/delivery/pm/create-item',
+				{},
+				identity,
+			),
+		).rejects.toThrow(/older build than this worker/);
+	});
+
 	it('throws when the response body cannot be read', async () => {
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue({
 			ok: true,
