@@ -1,6 +1,30 @@
 import { useQuery } from '@tanstack/react-query';
 import { X } from 'lucide-react';
+import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpc } from '@/lib/trpc.js';
+import { type RunPhaseFilter, runPhaseFilterSchema } from '@/types/runs.js';
+
+/**
+ * The Phase filter's labels. Title Case with an upper-case "CI", which `formatPhase`
+ * (`@/lib/format.ts`, a hyphen→space replace) does not produce, so they are stated
+ * rather than derived. Keyed by `RunPhaseFilter`, so a phase added to the filter
+ * vocabulary fails to type-check until it is labelled here.
+ */
+const PHASE_FILTER_LABELS: Record<RunPhaseFilter, string> = {
+	planning: 'Planning',
+	implementation: 'Implementation',
+	review: 'Review',
+	'respond-to-review': 'Respond to Review',
+	'respond-to-ci': 'Respond to CI',
+	'resolve-conflicts': 'Resolve Conflicts',
+};
+
+/**
+ * The phases this view can filter by, in the one canonical display order (issue
+ * #548) — the sequence comes from the pipeline vocabulary, not from the order the
+ * values happen to be written in above or in `runPhaseFilterSchema`.
+ */
+const PHASE_FILTER_OPTIONS = sortPipelinePhases(runPhaseFilterSchema.options);
 
 interface RunFiltersProps {
 	projectId?: string;
@@ -93,12 +117,11 @@ export function RunFilters({
 					className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
 				>
 					<option value="">All Phases</option>
-					<option value="planning">Planning</option>
-					<option value="implementation">Implementation</option>
-					<option value="review">Review</option>
-					<option value="respond-to-review">Respond to Review</option>
-					<option value="respond-to-ci">Respond to CI</option>
-					<option value="resolve-conflicts">Resolve Conflicts</option>
+					{PHASE_FILTER_OPTIONS.map((phaseOption) => (
+						<option key={phaseOption} value={phaseOption}>
+							{PHASE_FILTER_LABELS[phaseOption]}
+						</option>
+					))}
 				</select>
 			</div>
 

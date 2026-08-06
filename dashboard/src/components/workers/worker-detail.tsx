@@ -4,6 +4,7 @@ import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
+import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpcClient } from '@/lib/trpc.js';
 import { useDraftSync } from '@/lib/use-draft-sync.js';
 import type { WorkerDetail } from '@/types/workers.js';
@@ -146,6 +147,12 @@ function ConnectionState({ worker }: { worker: WorkerDetail }) {
  * phase on the same terms (issue #542). What it answers is version skew: a daemon
  * built before issue #536 declares five phases rather than six, and the dispatch
  * gate routes around the missing one instead of failing (issue #467).
+ *
+ * Rendered in the pipeline's own order ({@link sortPipelinePhases}, issue #548) —
+ * never the order the daemon happened to declare, which differs between a same-host
+ * worker and a remote DB-free daemon. That makes this list read the same way as the
+ * enrollment's Allowed pipeline phases below it, so "what the machine declares" and
+ * "what this project allows" can be compared line for line.
  */
 function SupportedPhases({ phases }: { phases: string[] }) {
 	if (phases.length === 0) {
@@ -157,7 +164,7 @@ function SupportedPhases({ phases }: { phases: string[] }) {
 	}
 	return (
 		<div className="flex flex-wrap gap-1">
-			{phases.map((phase) => (
+			{sortPipelinePhases(phases).map((phase) => (
 				<Badge key={phase}>{formatPhase(phase)}</Badge>
 			))}
 		</div>
