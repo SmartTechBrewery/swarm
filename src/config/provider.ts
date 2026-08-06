@@ -129,16 +129,51 @@ export async function resolvePmCredential(
 }
 
 /**
+ * Thrown by {@link requirePmCredential} when a declared PM role resolves to
+ * nothing. A distinct type rather than a bare `Error` because two surfaces have to
+ * *recognize* this case and not merely report it: the discovery API turns it into
+ * an actionable `PRECONDITION_FAILED` naming the role to configure
+ * (`src/api/routers/pm.ts`), and the dashboard renders the "configure this
+ * credential" affordance off that code. Matching on message text would break the
+ * moment the wording changed (issue #537).
+ *
+ * It carries the role's declared metadata — never the credential — so a caller can
+ * name what is missing without re-resolving the manifest.
+ */
+export class MissingPmCredentialError extends Error {
+	readonly name = 'MissingPmCredentialError';
+
+	constructor(
+		readonly projectId: string,
+		readonly role: string,
+		readonly label: string,
+		readonly envVarKey: string,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+/**
  * Resolve a PM-provider credential, throwing when it resolves to nothing — the
  * `require`-shaped twin of {@link resolvePmCredential} for the provider operations
  * that cannot run without it, worded like {@link getPersonaToken} so the message
  * names both the role and the ways it can be supplied.
+ *
+ * It never falls back to an SCM credential — in particular not to the worker-local
+ * operator token (`SWARM_OPERATOR_GH_TOKEN`), which is a source-control identity
+ * (issue #537). A project whose board credential is unconfigured fails here,
+ * loudly, rather than silently borrowing whichever token the host happens to hold.
  */
 export async function requirePmCredential(project: ProjectConfig, role: string): Promise<string> {
 	const secret = await resolvePmCredential(project, role);
 	if (!secret) {
 		const spec = requireProjectPMCredentialRole(project, role);
-		throw new Error(
+		throw new MissingPmCredentialError(
+			project.id,
+			role,
+			spec.label,
+			spec.envVarKey,
 			`No PM ${spec.label} (role '${role}') configured for project '${project.id}' ` +
 				`(set credentials.pm.${role} to a stored reference; ${spec.envVarKey} is its conventional config-apply key)`,
 		);

@@ -76,7 +76,13 @@ describe('pmProviderRegistry', () => {
 				category: 'pm',
 				createProvider: () => provider,
 				routerAdapter,
-				credentialRoles: [],
+				// Declares the role the mock project config names (`createMockProjectConfig`),
+				// so parsing that config against this stand-in manifest still validates —
+				// `ProjectConfigSchema` checks `credentials.pm` against the *registered*
+				// manifest's declared roles (issue #497).
+				credentialRoles: [
+					{ role: 'apiToken', label: 'API Token', envVarKey: 'PM_GITHUB_PROJECTS_TOKEN' },
+				],
 			} as unknown as PMProviderManifest;
 		}
 

@@ -25,6 +25,7 @@ import {
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
 import { getMembership } from '../../identity/membership-service.js';
+import { getPMProvider } from '../../integrations/pm/registry.js';
 import { accessibleProjectScope, assertProjectAccess, filterAccessibleProjects } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { credentialsRouter } from './credentials.js';
@@ -32,7 +33,7 @@ import { credentialsRouter } from './credentials.js';
 /**
  * The `pm` block a dashboard-created project starts with: SWARM's default PM
  * provider and an *empty* board mapping placeholder. The operator fills it in on
- * the Board Mapping tab (issue #201) by picking a discovered board and its states,
+ * the Project Management tab (issues #201/#537) by picking a discovered board and its states,
  * so `create` never asks the client for opaque node IDs — and never trusts them
  * either (see `create` below).
  *
@@ -51,10 +52,33 @@ export const DEFAULT_PM_CONFIG: ProjectPm = {
 // Project-scoped credential references a new project is created with. The
 // implementer persona is intentionally absent — it resolves from the worker-local
 // SWARM_OPERATOR_GH_TOKEN, not from project_credentials (issue #396).
-const DEFAULT_CREDENTIAL_REFERENCES = {
+const DEFAULT_SCM_CREDENTIAL_REFERENCES = {
 	reviewer: 'SCM_TOKEN_REVIEWER',
 	webhookSecret: 'SCM_WEBHOOK_SECRET',
 };
+
+/**
+ * The `credentials.pm` map a new project starts with: one reference per credential
+ * role its PM provider *requires and owns*, named by that role's own declared
+ * conventional key (issue #537). Nothing is stored yet — the reference is a slot the
+ * Project Management tab (or `swarm config apply`) fills — so board operations fail
+ * with the actionable "credential not configured" error until it is, which is the
+ * point.
+ *
+ * Read off the manifest rather than hardcoded, so a project created for a different
+ * PM provider seeds *its* roles with no edit here (ai/RULES.md §2). Optional and
+ * shared-credential-inheriting roles are skipped: neither needs an entry to resolve.
+ * An unregistered provider seeds nothing.
+ */
+function defaultPmCredentialReferences(pm: ProjectPm): Record<string, string> | undefined {
+	const roles = getPMProvider(pm.type)?.credentialRoles ?? [];
+	const references = Object.fromEntries(
+		roles
+			.filter((role) => !role.optional && !role.inheritsSharedCredential)
+			.map((role) => [role.role, role.envVarKey]),
+	);
+	return Object.keys(references).length > 0 ? references : undefined;
+}
 
 // Derived from the base object (`.omit()` needs a bare `z.object`); credentials are
 // not client-writable here, so the config schema's `credentials.pm` cross-field
@@ -156,10 +180,14 @@ export const projectsRouter = router({
 	// role is later removed. Creation and membership insertion are performed
 	// atomically in one transaction so a partial failure never leaves an unowned project.
 	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input }) => {
+		const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
 		const config = {
 			...input,
 			pm: DEFAULT_PM_CONFIG,
-			credentials: DEFAULT_CREDENTIAL_REFERENCES,
+			credentials: {
+				...DEFAULT_SCM_CREDENTIAL_REFERENCES,
+				...(pmReferences ? { pm: pmReferences } : {}),
+			},
 		};
 		try {
 			await createProjectWithMemberInDb(config, {

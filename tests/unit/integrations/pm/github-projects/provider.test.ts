@@ -12,6 +12,10 @@ const listComments = vi.fn();
 const paginate = vi.fn();
 const request = vi.fn();
 vi.mock('@/integrations/scm/github/client.js', () => ({
+	// The credential-scoping wrapper the PM credential seam binds through
+	// (`withGitHubProjectsCredentials`) — run straight through, so the provider's own
+	// logic is what's under test.
+	withGitHubToken: <T>(_token: string, fn: () => Promise<T>) => fn(),
 	getScopedClient: () => ({
 		graphql,
 		request,
@@ -28,15 +32,16 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 		},
 	}),
 }));
-// Run the credential-scoped fn straight through — token resolution is out of
-// scope for the provider's own logic.
-vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
-	GitHubSCMIntegration: class {
-		withPersonaCredentials = <T>(_p: unknown, _persona: unknown, fn: () => Promise<T>) => fn();
-	},
+// The board credential this provider resolves for itself (issue #537). Stubbed at
+// the `credentials.pm` resolution seam rather than at the SCM persona helper it used
+// to borrow: that borrowing is precisely what #537 removed.
+vi.mock('@/config/provider.js', () => ({
+	requirePmCredential: vi.fn(async () => 'ghp_board_token'),
 }));
 
+import { requirePmCredential } from '@/config/provider.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
+import { GITHUB_PROJECTS_API_TOKEN_ROLE } from '@/integrations/pm/github-projects/credentials.js';
 import {
 	createGitHubProjectsProvider,
 	GitHubProjectsPMProvider,
@@ -81,6 +86,17 @@ describe('GitHubProjectsPMProvider', () => {
 
 	it('createGitHubProjectsProvider builds the provider', () => {
 		expect(createGitHubProjectsProvider(PROJECT)).toBeInstanceOf(GitHubProjectsPMProvider);
+	});
+
+	// Issue #537: every board operation authenticates with the *provider's own*
+	// declared credential role, never the SCM implementer persona / operator token it
+	// used to borrow.
+	it("authenticates board work with the project's declared PM apiToken role", async () => {
+		graphql.mockResolvedValue({ node: ITEM_NODE });
+
+		await provider.getWorkItem('PVTI_x');
+
+		expect(requirePmCredential).toHaveBeenCalledWith(PROJECT, GITHUB_PROJECTS_API_TOKEN_ROLE);
 	});
 
 	describe('getWorkItem', () => {
@@ -947,6 +963,25 @@ describe('GitHubProjectsPMProvider', () => {
 
 				expect(viewerCalls).toBe(2);
 				expect(result?.containers.map((c) => c.id).sort()).toEqual(['PVT_1', 'PVT_2']);
+			});
+
+			// The reported #537 failure: a board token with `repo`/`project` but no
+			// `read:org` can't answer `viewer.organizations`. The operator needs to be told
+			// which permission to grant, not GitHub's raw resource wording.
+			it('names the missing read:org permission when org enumeration is refused', async () => {
+				graphql.mockImplementation(async (query: string) => {
+					if (query.includes('organizations')) {
+						throw new Error('Resource not accessible by personal access token');
+					}
+					return { viewer: { projectsV2: { nodes: [], pageInfo: { hasNextPage: false } } } };
+				});
+
+				const error = await provider.discover?.('containers', {}).catch((err) => err);
+
+				expect(String(error?.message)).toContain('read:org');
+				expect(String(error?.message)).toContain('Resource not accessible');
+				// Never the credential itself.
+				expect(String(error?.message)).not.toContain('ghp_board_token');
 			});
 		});
 

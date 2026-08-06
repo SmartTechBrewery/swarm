@@ -8,21 +8,20 @@ import {
 vi.mock('@/config/provider.js', () => ({
 	findProjectByBoard: vi.fn(),
 }));
-vi.mock('@/integrations/scm/github/personas.js', () => ({
-	resolvePersonaIdentities: vi.fn(),
-	isSwarmBot: vi.fn(),
+// Only the credential-resolving half is stubbed; the login comparison itself is pure,
+// so the real one runs (`[bot]` suffix handling included).
+vi.mock('@/integrations/pm/github-projects/credentials.js', async (importOriginal) => ({
+	...(await importOriginal<object>()),
+	resolveGitHubProjectsIdentity: vi.fn(),
 }));
 
 import { findProjectByBoard } from '@/config/provider.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
-import {
-	isSwarmBot,
-	type PersonaIdentities,
-	resolvePersonaIdentities,
-} from '@/integrations/scm/github/personas.js';
+import { resolveGitHubProjectsIdentity } from '@/integrations/pm/github-projects/credentials.js';
 import { GitHubProjectsRouterAdapter } from '@/router/adapters/github-projects.js';
 
-const IDENTITIES: PersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+/** The login the project's board credential authenticates as (issue #537). */
+const BOARD_IDENTITY = 'swarm-board';
 const STATUS_FIELD_ID = 'PVTSSF_lAHOAC3TF84BcNwDzhW4MKo';
 const project = createMockProjectConfig({ id: 'proj-1' });
 const projectPm = requireGitHubProjectsConfig(project);
@@ -38,8 +37,7 @@ describe('GitHubProjectsRouterAdapter', () => {
 
 	beforeEach(() => {
 		vi.mocked(findProjectByBoard).mockReset();
-		vi.mocked(resolvePersonaIdentities).mockReset();
-		vi.mocked(isSwarmBot).mockReset();
+		vi.mocked(resolveGitHubProjectsIdentity).mockReset();
 	});
 
 	describe('parseWebhook', () => {
@@ -153,33 +151,44 @@ describe('GitHubProjectsRouterAdapter', () => {
 		});
 	});
 
+	// Since issue #537 this gate keys on the *board credential's* identity — the
+	// account every SWARM board write is now made by — instead of the SCM personas the
+	// provider used to borrow.
 	describe('isSelfAuthored (loop prevention)', () => {
-		it('is true when a SWARM persona moved the card', async () => {
-			vi.mocked(resolvePersonaIdentities).mockResolvedValue(IDENTITIES);
-			vi.mocked(isSwarmBot).mockReturnValue(true);
-			const event = parse(createMockProjectsV2ItemPayload({ sender: { login: 'swarm-impl' } }));
+		it('is true when the board credential itself moved the card', async () => {
+			vi.mocked(resolveGitHubProjectsIdentity).mockResolvedValue(BOARD_IDENTITY);
+			const event = parse(createMockProjectsV2ItemPayload({ sender: { login: BOARD_IDENTITY } }));
 			expect(await adapter.isSelfAuthored(event, project)).toBe(true);
-			expect(isSwarmBot).toHaveBeenCalledWith('swarm-impl', IDENTITIES);
+			expect(resolveGitHubProjectsIdentity).toHaveBeenCalledWith(project);
+		});
+
+		it('is true for the GitHub App form of that identity', async () => {
+			vi.mocked(resolveGitHubProjectsIdentity).mockResolvedValue(BOARD_IDENTITY);
+			const event = parse(
+				createMockProjectsV2ItemPayload({ sender: { login: `${BOARD_IDENTITY}[bot]` } }),
+			);
+			expect(await adapter.isSelfAuthored(event, project)).toBe(true);
 		});
 
 		it('is false for a human actor', async () => {
-			vi.mocked(resolvePersonaIdentities).mockResolvedValue(IDENTITIES);
-			vi.mocked(isSwarmBot).mockReturnValue(false);
+			vi.mocked(resolveGitHubProjectsIdentity).mockResolvedValue(BOARD_IDENTITY);
 			const event = parse(createMockProjectsV2ItemPayload({ sender: { login: 'human-dev' } }));
 			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
 		});
 
-		it('is false (without resolving identities) when there is no actor', async () => {
+		it('is false (without resolving the identity) when there is no actor', async () => {
 			const payload = createMockProjectsV2ItemPayload();
 			delete (payload as { sender?: unknown }).sender;
 			const event = parse(payload);
 			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
-			expect(resolvePersonaIdentities).not.toHaveBeenCalled();
+			expect(resolveGitHubProjectsIdentity).not.toHaveBeenCalled();
 		});
 
 		it('fails safe to false (and does not throw) when identity resolution errors', async () => {
-			vi.mocked(resolvePersonaIdentities).mockRejectedValue(new Error('no token'));
-			const event = parse(createMockProjectsV2ItemPayload({ sender: { login: 'swarm-impl' } }));
+			vi.mocked(resolveGitHubProjectsIdentity).mockRejectedValue(
+				new Error('no PM credential configured'),
+			);
+			const event = parse(createMockProjectsV2ItemPayload({ sender: { login: BOARD_IDENTITY } }));
 			expect(await adapter.isSelfAuthored(event, project)).toBe(false);
 		});
 	});

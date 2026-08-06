@@ -10,7 +10,11 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	findProjectByBoardFromDb: vi.fn(),
 }));
 
-import { requirePmCredential, resolvePmCredential } from '@/config/provider.js';
+import {
+	MissingPmCredentialError,
+	requirePmCredential,
+	resolvePmCredential,
+} from '@/config/provider.js';
 import { type ProjectConfig, ProjectConfigSchema } from '@/config/schema.js';
 import { resolveProjectCredential } from '@/db/repositories/credentialsRepository.js';
 // Registers the real github-projects manifest, whose declared roles both halves of
@@ -71,8 +75,28 @@ beforeEach(() => {
 });
 
 describe('credentials.pm validation against the declared roles', () => {
-	it('accepts a config with no credentials.pm at all (every config written before #497)', () => {
+	it('accepts an absent credentials.pm when every declared role resolves without one', () => {
+		// GitHub Projects' pre-#537 shape: a single role that inherits the shared
+		// webhook secret, so an absent block is still a complete configuration.
+		registerRoles([
+			{
+				role: 'webhookSecret',
+				label: 'Webhook Secret',
+				envVarKey: 'SCM_WEBHOOK_SECRET',
+				inheritsSharedCredential: 'webhookSecret',
+			},
+		]);
 		expect(ProjectConfigSchema.safeParse(configWithPmReferences(undefined)).success).toBe(true);
+	});
+
+	// The role GitHub Projects gained in #537: the board's own API token, required,
+	// so a config that names no reference for it fails instead of quietly falling
+	// back to the worker operator's SCM token.
+	it("requires GitHub Projects' own apiToken role", () => {
+		const errors = parseErrors(configWithPmReferences({}));
+		expect(errors).toContain("requires the 'apiToken' credential (GitHub Projects API Token)");
+		expect(errors).toContain('credentials.pm.apiToken');
+		expect(errors).toContain('PM_GITHUB_PROJECTS_TOKEN');
 	});
 
 	it('rejects a reference for a role the provider does not declare, naming the declared roles', () => {
@@ -115,10 +139,14 @@ describe('credentials.pm validation against the declared roles', () => {
 		).toBe(true);
 	});
 
-	// GitHub Projects' own shape: a non-optional role that already resolves from the
-	// shared block, so a project need not name it even when it configures others.
+	// GitHub Projects' own shape: `webhookSecret` is a non-optional role that already
+	// resolves from the shared block, so a project names only `apiToken`.
 	it('does not require a role that inherits a shared credential reference', () => {
-		expect(ProjectConfigSchema.safeParse(configWithPmReferences({})).success).toBe(true);
+		expect(
+			ProjectConfigSchema.safeParse(
+				configWithPmReferences({ apiToken: 'PM_GITHUB_PROJECTS_TOKEN' }),
+			).success,
+		).toBe(true);
 	});
 
 	it('skips the check when no manifest is registered for pm.type', () => {
@@ -130,20 +158,29 @@ describe('credentials.pm validation against the declared roles', () => {
 });
 
 describe('resolvePmCredential', () => {
-	// `credentials.webhookSecret` is what the github-projects role inherits.
+	// `credentials.webhookSecret` is what the github-projects role inherits. Both
+	// configs name the provider's required `apiToken` role, since #537 made it a
+	// condition of a valid config.
 	const project: ProjectConfig = createMockProjectConfig({
 		id: 'proj-1',
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SHARED_WEBHOOK_KEY',
-			pm: { webhookSecret: 'PM_WEBHOOK_KEY' },
+			pm: { apiToken: 'PM_TOKEN_KEY', webhookSecret: 'PM_WEBHOOK_KEY' },
 		},
 	});
 
-	/** The same project with no PM references configured — the common case today. */
+	/**
+	 * The same project with no PM reference for the *webhook* role — the common case,
+	 * since that role inherits the shared SCM secret rather than being configured.
+	 */
 	const projectWithoutPmReferences: ProjectConfig = createMockProjectConfig({
 		id: 'proj-1',
-		credentials: { reviewer: 'SCM_TOKEN_REVIEWER', webhookSecret: 'SHARED_WEBHOOK_KEY' },
+		credentials: {
+			reviewer: 'SCM_TOKEN_REVIEWER',
+			webhookSecret: 'SHARED_WEBHOOK_KEY',
+			pm: { apiToken: 'PM_TOKEN_KEY' },
+		},
 	});
 
 	beforeEach(() => {
@@ -196,9 +233,19 @@ describe('resolvePmCredential', () => {
 
 	it('throws for a role the provider does not declare', async () => {
 		vi.mocked(resolveProjectCredential).mockResolvedValue('anything');
-		await expect(resolvePmCredential(project, 'apiToken')).rejects.toThrow(
-			/declares no credential role 'apiToken'/,
+		await expect(resolvePmCredential(project, 'notARole')).rejects.toThrow(
+			/declares no credential role 'notARole'/,
 		);
+	});
+
+	// The whole point of #537: the board's token is a project credential, and nothing
+	// in this resolution path reaches for the worker-local operator SCM token.
+	it('never falls back to the operator SCM token for the board API token', async () => {
+		vi.stubEnv('SWARM_OPERATOR_GH_TOKEN', 'ghp_operator');
+		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
+
+		expect(await resolvePmCredential(project, 'apiToken')).toBeNull();
+		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'PM_TOKEN_KEY');
 	});
 });
 
@@ -219,5 +266,23 @@ describe('requirePmCredential', () => {
 		await expect(requirePmCredential(project, 'webhookSecret')).rejects.toThrow(
 			/credentials\.pm\.webhookSecret.*SCM_WEBHOOK_SECRET/s,
 		);
+	});
+
+	// Typed, because two surfaces recognize this condition rather than reporting it:
+	// the discovery API maps it to PRECONDITION_FAILED and the dashboard renders the
+	// "configure this credential" affordance off that code (issue #537).
+	it('throws a MissingPmCredentialError carrying the role metadata', async () => {
+		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
+		const error = await requirePmCredential(project, 'apiToken').catch((err) => err);
+
+		expect(error).toBeInstanceOf(MissingPmCredentialError);
+		expect(error).toMatchObject({
+			projectId: 'proj-1',
+			role: 'apiToken',
+			label: 'GitHub Projects API Token',
+			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
+		});
+		// It names what is missing, never a credential value.
+		expect(String(error.message)).not.toContain('whsec');
 	});
 });

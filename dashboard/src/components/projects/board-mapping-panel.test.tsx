@@ -179,16 +179,34 @@ describe('BoardMappingPanel (issue #201)', () => {
 		expect(screen.getByRole('option', { name: 'Configured value (unavailable)' })).not.toBeNull();
 	});
 
-	it('surfaces a missing-credential precondition as an actionable operator-token callout', async () => {
-		discoverContainersFn.mockRejectedValue(
+	// Issue #537: the recognized precondition is an unconfigured *PM* credential, and it
+	// is recognized by the tRPC error code rather than by matching a token name in the
+	// message. It renders as an actionable callout, not as a "failed to load" error.
+	it('surfaces a missing-PM-credential precondition as an actionable callout', async () => {
+		const error = Object.assign(
 			new Error(
-				"No implementer token is configured. Set SWARM_OPERATOR_GH_TOKEN in this host's environment, then try again.",
+				'No GitHub Projects API Token is configured for this project. Add it under Project Management → Credentials',
 			),
+			{ data: { code: 'PRECONDITION_FAILED' } },
+		);
+		discoverContainersFn.mockRejectedValue(error);
+
+		renderHarness();
+
+		await waitFor(() =>
+			expect(screen.getByText(/No GitHub Projects API Token is configured/)).not.toBeNull(),
+		);
+		expect(screen.queryByText(/Failed to load boards/)).toBeNull();
+	});
+
+	it('still reports an ordinary discovery failure as a load error', async () => {
+		discoverContainersFn.mockRejectedValue(
+			Object.assign(new Error('GitHub is unavailable'), { data: { code: 'BAD_REQUEST' } }),
 		);
 
 		renderHarness();
 
-		await waitFor(() => expect(screen.getByText(/Set SWARM_OPERATOR_GH_TOKEN/)).not.toBeNull());
+		await waitFor(() => expect(screen.getByText(/Failed to load boards/)).not.toBeNull());
 	});
 
 	it('disables Save until a board and at least one status are chosen', async () => {

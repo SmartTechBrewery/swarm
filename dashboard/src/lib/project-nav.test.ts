@@ -28,6 +28,15 @@ describe('projectDetailSearchSchema', () => {
 		});
 	});
 
+	// Issue #537 renamed the `boardMapping` tab to `projectManagement`. A bookmarked
+	// link must land on the tab that replaced it, not degrade to Runs.
+	it('maps the legacy boardMapping tab onto Project Management', () => {
+		expect(projectDetailSearchSchema.parse({ tab: 'boardMapping' })).toEqual({
+			tab: 'projectManagement',
+			phase: undefined,
+		});
+	});
+
 	it('strips unknown params', () => {
 		expect(projectDetailSearchSchema.parse({ tab: 'pipeline', extra: 'x' })).toEqual({
 			tab: 'pipeline',

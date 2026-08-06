@@ -19,6 +19,7 @@ import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BoardMappingPanel } from '@/components/projects/board-mapping-panel.js';
 import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
+import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import {
@@ -2226,15 +2227,15 @@ function ProjectDetailRouteComponent() {
 				</button>
 				<button
 					type="button"
-					onClick={() => goToTab('boardMapping')}
+					onClick={() => goToTab('projectManagement')}
 					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'boardMapping'
+						activeTab === 'projectManagement'
 							? 'border-violet-500 text-white bg-zinc-800/20'
 							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
 					}`}
 				>
 					<SquareKanban className="h-4 w-4 text-violet-400" />
-					Board Mapping
+					Project Management
 				</button>
 				<button
 					type="button"
@@ -2338,22 +2339,31 @@ function ProjectDetailRouteComponent() {
 				/>
 			)}
 
-			{activeTab === 'boardMapping' && (
-				<BoardMappingPanel
-					projectId={projectId}
-					form={boardMapping}
-					onProviderChange={handleBoardMappingProvider}
-					onSelectContainer={handleBoardMappingSelectContainer}
-					onStatusOptionChange={handleBoardMappingStatusOption}
-					onStatesContext={handleBoardMappingStatesContext}
-					handleSubmit={handleBoardMappingSubmit}
-					handleReset={handleBoardMappingReset}
-					isDirty={isBoardMappingFormDirty}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-				/>
+			{/*
+			 * Project Management (issue #537): one tab, three coherent sections — the
+			 * provider and its declared credentials, then the board picker, then the
+			 * status mapping. The credential panel owns its own queries, so it renders
+			 * above the mapping form rather than inside it.
+			 */}
+			{activeTab === 'projectManagement' && (
+				<div className="space-y-6">
+					<PmCredentialsPanel projectId={projectId} />
+					<BoardMappingPanel
+						projectId={projectId}
+						form={boardMapping}
+						onProviderChange={handleBoardMappingProvider}
+						onSelectContainer={handleBoardMappingSelectContainer}
+						onStatusOptionChange={handleBoardMappingStatusOption}
+						onStatesContext={handleBoardMappingStatesContext}
+						handleSubmit={handleBoardMappingSubmit}
+						handleReset={handleBoardMappingReset}
+						isDirty={isBoardMappingFormDirty}
+						isPending={configWriteInFlight}
+						isSuccess={updateMutation.isSuccess}
+						isError={updateMutation.isError}
+						errorMessage={updateMutation.error?.message}
+					/>
+				</div>
 			)}
 
 			{activeTab === 'credentials' && <CredentialsPanel projectId={projectId} />}

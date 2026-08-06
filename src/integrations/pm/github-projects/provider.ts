@@ -12,11 +12,16 @@
  * the ones that doc verified against the real board.
  *
  * Credentials are never passed in: each method runs its GitHub work inside
- * `GitHubSCMIntegration.withPersonaCredentials(project, 'implementer', …)`, so
- * the scoped Octokit client (`getScopedClient`) authenticates as the
- * implementer persona — the bot that owns board interactions. Moving a card or
- * commenting as the implementer is also what the router's loop-prevention drops
- * as self-authored, so the pipeline doesn't re-trigger itself.
+ * `withGitHubProjectsCredentials(project, …)` (`./credentials.ts`), so the scoped
+ * Octokit client (`getScopedClient`) authenticates as the project's **own** board
+ * credential — the `apiToken` role this provider declares on its manifest,
+ * resolved through `credentials.pm` (issue #537). It is deliberately *not* the SCM
+ * implementer persona it used to borrow: the worker-local `SWARM_OPERATOR_GH_TOKEN`
+ * is an SCM credential, and depending on it made board access a property of
+ * whichever host happened to run the code. Because that credential is the account
+ * every SWARM board write is attributed to, it is also the identity the router's
+ * loop-prevention gate recognizes as its own (`resolveGitHubProjectsIdentity`), so
+ * the pipeline doesn't re-trigger itself.
  */
 
 import type { ProjectConfig } from '../../../config/schema.js';
@@ -44,11 +49,11 @@ import type {
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { getScopedClient } from '../../scm/github/client.js';
-import { GitHubSCMIntegration } from '../../scm/github/scm-integration.js';
 import {
 	type GitHubProjectsIntegrationConfig,
 	requireGitHubProjectsConfig,
 } from './config-schema.js';
+import { withGitHubProjectsCredentials } from './credentials.js';
 import { resolveStatusKeyByOptionId } from './status-mapping.js';
 
 /** Shape of the `content` node a Projects item wraps (Issue / PullRequest). */
@@ -397,8 +402,6 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	// `false` and every item stays unassigned.
 	readonly supportsAssignees = true;
 
-	private readonly scm = new GitHubSCMIntegration();
-
 	/**
 	 * This project's board mapping, narrowed out of the `pm` union once at
 	 * construction (`requireGitHubProjectsConfig`) instead of at each read — the
@@ -411,9 +414,9 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		this.config = requireGitHubProjectsConfig(project);
 	}
 
-	/** Run `fn` with the implementer persona's GitHub client bound to scope. */
+	/** Run `fn` with this project's board credential bound to the GitHub client. */
 	private run<T>(fn: () => Promise<T>): Promise<T> {
-		return this.scm.withPersonaCredentials(this.project, 'implementer', fn);
+		return withGitHubProjectsCredentials(this.project, fn);
 	}
 
 	private async resolveItem(id: string): Promise<ResolvedItem> {
@@ -760,11 +763,17 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	/**
-	 * Enumerate the Projects v2 boards the implementer persona can pick from: the
-	 * boards it owns directly, plus the boards owned by each organization it
-	 * belongs to. Every connection is paginated to the end and the result is
+	 * Enumerate the Projects v2 boards this project's board credential can pick
+	 * from: the boards it owns directly, plus the boards owned by each organization
+	 * it belongs to. Every connection is paginated to the end and the result is
 	 * deduplicated by node ID (a board can surface through more than one path),
 	 * then sorted by title so the picker is stable.
+	 *
+	 * Org enumeration is the one step whose failure is almost always a *permission*
+	 * problem rather than an outage — `viewer.organizations` needs `read:org`, which
+	 * a token minted with only `repo`/`project` lacks (issue #537's reported
+	 * failure) — so it is translated into an error that names the missing permission
+	 * instead of surfacing GitHub's raw wording. Never echoes the credential.
 	 */
 	private async discoverContainers(): Promise<ContainerDiscoveryResult> {
 		return this.run(async () => {
@@ -775,10 +784,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				});
 				return data.viewer?.projectsV2 ?? null;
 			});
-			const orgs = await collectConnection<{ login?: string }>(async (cursor) => {
-				const data = await client.graphql<ViewerOrgsResponse>(VIEWER_ORGS_QUERY, { cursor });
-				return data.viewer?.organizations ?? null;
-			});
+			const orgs = await this.collectViewerOrganizations(client);
 			const orgBoards: ProjectV2Node[] = [];
 			for (const org of orgs) {
 				if (!org.login) continue;
@@ -794,6 +800,29 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			}
 			return { containers: normalizeContainers([...own, ...orgBoards]) };
 		});
+	}
+
+	/**
+	 * The organizations the board credential belongs to, or an actionable error
+	 * naming the permission it is missing. Must run inside a scoped-credentials
+	 * context (its caller does).
+	 */
+	private async collectViewerOrganizations(
+		client: ReturnType<typeof getScopedClient>,
+	): Promise<Array<{ login?: string }>> {
+		try {
+			return await collectConnection<{ login?: string }>(async (cursor) => {
+				const data = await client.graphql<ViewerOrgsResponse>(VIEWER_ORGS_QUERY, { cursor });
+				return data.viewer?.organizations ?? null;
+			});
+		} catch (err) {
+			throw new Error(
+				'The GitHub Projects API token cannot list the organizations it belongs to, so ' +
+					"organization-owned boards can't be discovered. Grant it the 'read:org' scope " +
+					'(classic token) or organization read access (fine-grained token), then try again. ' +
+					`GitHub reported: ${errorMessage(err)}`,
+			);
+		}
 	}
 
 	/**
@@ -1026,6 +1055,15 @@ function normalizeContainers(nodes: ProjectV2Node[]): DiscoveredContainer[] {
 	return [...byId.values()].sort((a, b) =>
 		a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
 	);
+}
+
+/**
+ * A thrown value's message, for wrapping one API failure in a more actionable
+ * error. GitHub's own errors never carry the credential, so this is safe to
+ * surface (the API layer shows a provider message verbatim — `src/api/routers/pm.ts`).
+ */
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
 }
 
 /** Whether an Octokit error carries a specific HTTP status. */

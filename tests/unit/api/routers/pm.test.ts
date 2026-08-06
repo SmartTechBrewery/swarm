@@ -15,6 +15,7 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 }));
 
 import { pmRouter } from '@/api/routers/pm.js';
+import { MissingPmCredentialError } from '@/config/provider.js';
 import { getProjectByIdFromDb } from '@/db/repositories/projectsRepository.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership } from '@/identity/membership-service.js';
@@ -171,12 +172,20 @@ describe('pmRouter', () => {
 			});
 		});
 
-		it('maps a missing implementer (operator) token to safe, actionable copy', async () => {
+		// Issue #537: an unconfigured *PM* credential is the recognized precondition, and
+		// it is recognized by type rather than by message text. The copy names the role
+		// to configure, and never the worker-local operator SCM token — discovery no
+		// longer resolves one.
+		it('maps a missing PM credential to safe, actionable copy naming the role', async () => {
 			const discover = vi
 				.fn()
 				.mockRejectedValue(
-					new Error(
-						"No GitHub implementer token configured: set SWARM_OPERATOR_GH_TOKEN on this host (the worker operator's own token; never stored in project_credentials)",
+					new MissingPmCredentialError(
+						'swarm',
+						'apiToken',
+						'GitHub Projects API Token',
+						'PM_GITHUB_PROJECTS_TOKEN',
+						"No PM GitHub Projects API Token (role 'apiToken') configured for project 'swarm'",
 					),
 				);
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig());
@@ -185,9 +194,12 @@ describe('pmRouter', () => {
 
 			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.toMatchObject({
 				code: 'PRECONDITION_FAILED',
+				message: expect.stringContaining('GitHub Projects API Token'),
 			});
-			// The actionable copy points the operator at the host env var.
 			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.toThrow(
+				/credentials\.pm\.apiToken.*PM_GITHUB_PROJECTS_TOKEN/s,
+			);
+			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.not.toThrow(
 				/SWARM_OPERATOR_GH_TOKEN/,
 			);
 		});

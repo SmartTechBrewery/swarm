@@ -96,11 +96,19 @@ rename-prone; the option ID (`47fc9ee4`) is stable. This is why `config-schema.t
 
 ### 2b. Discovering boards for the dashboard picker (issue #201)
 
-The dashboard's **Board Mapping** tab no longer asks an operator to type the `projectId`,
+The dashboard's **Project Management** tab no longer asks an operator to type the `projectId`,
 `statusFieldId`, and option IDs above. It discovers them read-only through the provider's
-`discover()` method (surfaced by the `pm` tRPC router, run under the project's implementer
-token) and the operator picks from real names; the persisted representation is still the
-opaque IDs documented above.
+`discover()` method (surfaced by the `pm` tRPC router, run under the project's own board
+credential — `credentials.pm.apiToken`, issue #537) and the operator picks from real names;
+the persisted representation is still the opaque IDs documented above.
+
+**Token permissions.** That credential needs `repo` + `project` (read *and* write — SWARM
+moves cards and writes on the backing Issues) and, for the org-board half of discovery
+below, **`read:org`**: `viewer.organizations` is refused outright without it, which the
+provider translates into an error naming the missing scope rather than surfacing GitHub's
+raw "Resource not accessible" wording. A fine-grained token needs repository Issues +
+Pull requests read/write and organization Projects read/write. See
+[`docs/configuration.md`](./configuration.md#credentialspm).
 
 Board discovery enumerates the authenticated user's boards and the boards of each
 organization they belong to (every connection is paginated to the end and results are

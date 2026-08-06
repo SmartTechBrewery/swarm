@@ -70,6 +70,12 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
 - Two distinct GitHub identities for loop prevention: the worker operator's own
   token (`SWARM_OPERATOR_GH_TOKEN`, the implementer persona) set in `.env` on each
   host, and a separate project-scoped reviewer credential
+- A GitHub token for the **board** — a project credential, separate from the two
+  above: `credentials.pm.apiToken` (conventionally `PM_GITHUB_PROJECTS_TOKEN`),
+  needing `repo`, `project`, and `read:org`. Every board read, write, and the
+  dashboard's board discovery authenticate with it, and it is configurable from the
+  dashboard's **Project Management** tab. See
+  [`docs/configuration.md`](docs/configuration.md)
 
 ## Quick start
 
@@ -225,7 +231,8 @@ Configuration has three layers:
 - `.env` — host and process settings such as database, Redis, ports, logging,
   dashboard authentication, and credential encryption.
 - `swarm.config.json` — per-project repository, worktree, GitHub Projects,
-  credential references, agent, and pipeline settings. Apply changes with
+  credential references (the SCM reviewer/webhook pair plus the PM provider's own
+  roles under `credentials.pm`), agent, and pipeline settings. Apply changes with
   `npm run db:seed` or `swarm config apply`.
 - Dashboard global settings — app-wide settings stored in Postgres and edited
   through the dashboard API.
