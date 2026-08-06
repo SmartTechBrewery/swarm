@@ -33,6 +33,12 @@ export interface WorkerOwner {
 	userId: string;
 	identifier: string;
 	displayName: string;
+	/**
+	 * Whether this owner is an instance admin — the fact that decides, independent
+	 * of the worker's self-declared `supportedPhases`, whether `planning` may ever
+	 * be allowed on one of their workers.
+	 */
+	instanceAdmin: boolean;
 }
 
 /**

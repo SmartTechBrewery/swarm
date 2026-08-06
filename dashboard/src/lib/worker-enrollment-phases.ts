@@ -65,6 +65,8 @@ export interface EnrollmentPhaseOption {
 const UNDECLARED_REASON =
 	"This machine's daemon does not declare this phase, so it never runs here.";
 const PROJECT_DISABLED_REASON = 'The project has this phase turned off for every worker.';
+const PLANNING_REQUIRES_INSTANCE_ADMIN_REASON =
+	"Planning writes directly to the project board, so it can only be allowed on an instance admin's own worker.";
 
 /**
  * One option per pipeline phase, in the pipeline's own order — never only the
@@ -72,19 +74,26 @@ const PROJECT_DISABLED_REASON = 'The project has this phase turned off for every
  * tell "not offered here" from "does not exist", which is the distinction the
  * `unavailable` reason exists to draw.
  *
- * Takes the three sets as `readonly string[]` because the read models mirror the
- * phase vocabulary as plain strings (`types/workers.ts`); anything outside the
- * vocabulary simply never matches a phase.
+ * Takes the three phase sets as `readonly string[]` because the read models mirror
+ * the phase vocabulary as plain strings (`types/workers.ts`); anything outside the
+ * vocabulary simply never matches a phase. `ownerIsInstanceAdmin` is the fourth,
+ * `planning`-only condition (server-enforced in `updateEnrollmentConstraints`,
+ * independent of the daemon's self-declared `supportedPhases`): only an instance
+ * admin's own worker may ever be allowed it.
  */
 export function enrollmentPhaseOptions(input: {
 	allowedPhases: readonly string[];
 	supportedPhases: readonly string[];
 	projectDisabledPhases: readonly string[];
+	ownerIsInstanceAdmin: boolean;
 }): EnrollmentPhaseOption[] {
 	return ALL_TRIGGER_PHASES.map((phase) => {
 		const reasons: string[] = [];
 		if (!input.supportedPhases.includes(phase)) reasons.push(UNDECLARED_REASON);
 		if (input.projectDisabledPhases.includes(phase)) reasons.push(PROJECT_DISABLED_REASON);
+		if (phase === 'planning' && !input.ownerIsInstanceAdmin) {
+			reasons.push(PLANNING_REQUIRES_INSTANCE_ADMIN_REASON);
+		}
 		return {
 			phase,
 			allowed: input.allowedPhases.includes(phase),

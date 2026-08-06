@@ -301,6 +301,7 @@ export function WorkerDetailView({
 								capabilities={worker.capabilities}
 								supportedPhases={worker.supportedPhases}
 								projectDisabledPhases={projectDisabledPhases.get(enrollment.projectId) ?? []}
+								ownerIsInstanceAdmin={worker.owner?.instanceAdmin ?? false}
 								projectName={projectNames.get(enrollment.projectId) ?? enrollment.projectId}
 								viewerIsOwner={worker.viewerIsOwner}
 								ownerName={ownerName}
