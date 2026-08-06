@@ -178,6 +178,27 @@ export class AllowedClisNotCapableError extends Error {
 }
 
 /**
+ * Raised when an enrollment's `allowedPhases` would permit `planning` on a
+ * worker whose owner is not an instance admin. `planning` writes directly to
+ * the project board (create/update a work item, add a label, split) and, in
+ * production, only the instance admin's own machine ever holds the
+ * `DATABASE_URL`/`REDIS_URL` a process needs to run it — every other owner's
+ * worker is a `swarm worker connect` DB-free daemon by construction. That
+ * guarantee lives in which credential an owner is handed, not in anything the
+ * daemon self-declares (`Worker.supportedPhases`), so this check is independent
+ * of it: an owner who is not an instance admin can never be granted `planning`,
+ * no matter what their daemon claims to support.
+ */
+export class PlanningRequiresInstanceAdminError extends Error {
+	constructor(public readonly workerId: string) {
+		super(
+			`Worker ${workerId} cannot be allowed the planning phase — its owner is not an instance admin`,
+		);
+		this.name = 'PlanningRequiresInstanceAdminError';
+	}
+}
+
+/**
  * The routability predicate — the named seam the #130 dispatch gate checks
  * before it lets a worker receive *future* automatic dispatch (the enrollment
  * analogue of `canReadProject` etc. in `./membership.ts`). A worker is routable

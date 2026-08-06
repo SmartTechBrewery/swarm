@@ -52,7 +52,12 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 	return {
 		workerId: 'worker-1',
 		displayName: 'ada-laptop',
-		owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+		owner: {
+			userId: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: false,
+		},
 		capabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
 		connection: 'online',
@@ -85,7 +90,12 @@ function makeRosterEntry(overrides: Partial<WorkerRosterEntry> = {}): WorkerRost
 		workerId: 'worker-1',
 		projectId: 'proj-a',
 		displayName: 'ada-laptop',
-		owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+		owner: {
+			userId: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: false,
+		},
 		capabilities: ['claude', 'codex'],
 		status: 'active',
 		allowedClis: ['claude'],
@@ -643,7 +653,12 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 		listMineQueryFn.mockResolvedValue([]);
 		rosterQueryFn.mockResolvedValue([
 			makeRosterEntry({
-				owner: { userId: 'u2', identifier: 'grace@example.com', displayName: 'Grace Hopper' },
+				owner: {
+					userId: 'u2',
+					identifier: 'grace@example.com',
+					displayName: 'Grace Hopper',
+					instanceAdmin: false,
+				},
 				sharingConsent: false,
 				isRoutable: false,
 			}),

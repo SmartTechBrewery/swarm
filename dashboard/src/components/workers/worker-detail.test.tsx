@@ -51,7 +51,12 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 	return {
 		workerId: 'worker-1',
 		displayName: 'ada-laptop',
-		owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+		owner: {
+			userId: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: false,
+		},
 		ownerUserId: 'u1',
 		capabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
@@ -383,6 +388,19 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		expect(updateConstraintsMutate).not.toHaveBeenCalled();
 	});
 
+	it('cannot select planning on a worker whose owner is not an instance admin, and says so', () => {
+		// The daemon declares planning and the project allows it — only ownership blocks it.
+		renderWorker({ enrollments: [makeEnrollment({ allowedPhases: ['implementation'] })] });
+
+		const planning = phaseCheckbox('planning');
+		expect(planning.checked).toBe(false);
+		expect(planning.disabled).toBe(true);
+		expect(planning.getAttribute('title')).toMatch(/instance admin/);
+		expect(screen.getAllByText(/instance admin/).length).toBeGreaterThan(0);
+		fireEvent.click(planning);
+		expect(updateConstraintsMutate).not.toHaveBeenCalled();
+	});
+
 	it('cannot select a phase the project has turned off, and says so', () => {
 		renderWorker({}, new Map([['proj-a', ['review']]]));
 
@@ -508,6 +526,24 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		expect(screen.queryAllByRole('spinbutton')).toHaveLength(0);
 		fireEvent.click(readOnly);
 		expect(setConsentMutate).not.toHaveBeenCalled();
+	});
+
+	it('keeps planning’s accent tone in the read-only allowed-phases badges, same as the declared Capabilities column', () => {
+		renderWorker({
+			viewerIsOwner: false,
+			owner: {
+				userId: 'u1',
+				identifier: 'ada@example.com',
+				displayName: 'Ada Lovelace',
+				instanceAdmin: true,
+			},
+		});
+
+		const enrollments = within(section('Project enrollments'));
+		const [planningBadge] = enrollments.getAllByText('planning');
+		expect(planningBadge.className).toContain('text-violet-300');
+		const [implementationBadge] = enrollments.getAllByText('implementation');
+		expect(implementationBadge.className).not.toContain('text-violet-300');
 	});
 
 	it('states the default allocation of 1 to a non-owner, with no "No limit" wording', () => {

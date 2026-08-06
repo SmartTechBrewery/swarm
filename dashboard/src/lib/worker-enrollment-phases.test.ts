@@ -36,6 +36,7 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['implementation'],
 			supportedPhases: [...ALL_TRIGGER_PHASES],
 			projectDisabledPhases: [],
+			ownerIsInstanceAdmin: true,
 		});
 
 		expect(options.map((option) => option.phase)).toEqual([...ALL_TRIGGER_PHASES]);
@@ -50,6 +51,7 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['implementation'],
 			supportedPhases: ['implementation'],
 			projectDisabledPhases: [],
+			ownerIsInstanceAdmin: true,
 		});
 
 		expect(planning.phase).toBe('planning');
@@ -61,6 +63,7 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['review'],
 			supportedPhases: [...ALL_TRIGGER_PHASES],
 			projectDisabledPhases: ['review'],
+			ownerIsInstanceAdmin: true,
 		});
 		const review = options.find((option) => option.phase === 'review');
 
@@ -75,10 +78,38 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['implementation'],
 			supportedPhases: ['implementation'],
 			projectDisabledPhases: ['review'],
+			ownerIsInstanceAdmin: true,
 		});
 		const review = options.find((option) => option.phase === 'review');
 
 		expect(review?.unavailable).toMatch(/does not declare this phase/);
 		expect(review?.unavailable).toMatch(/turned off for every worker/);
+	});
+
+	it('blocks planning on a non-instance-admin’s worker even though the daemon declares it', () => {
+		const [planning] = enrollmentPhaseOptions({
+			allowedPhases: ['implementation'],
+			supportedPhases: [...ALL_TRIGGER_PHASES],
+			projectDisabledPhases: [],
+			ownerIsInstanceAdmin: false,
+		});
+
+		expect(planning.phase).toBe('planning');
+		expect(planning.unavailable).toMatch(/instance admin/);
+	});
+
+	it('never blocks any other phase on ownership — only planning is instance-admin-gated', () => {
+		const options = enrollmentPhaseOptions({
+			allowedPhases: ['implementation'],
+			supportedPhases: [...ALL_TRIGGER_PHASES],
+			projectDisabledPhases: [],
+			ownerIsInstanceAdmin: false,
+		});
+
+		expect(
+			options
+				.filter((option) => option.phase !== 'planning')
+				.every((option) => option.unavailable === null),
+		).toBe(true);
 	});
 });

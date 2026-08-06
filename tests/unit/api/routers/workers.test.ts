@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
 	AllowedClisNotCapableError,
+	PlanningRequiresInstanceAdminError,
 	approveEnrollment,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -22,8 +23,15 @@ const {
 			this.name = 'AllowedClisNotCapableError';
 		}
 	}
+	class PlanningRequiresInstanceAdminError extends Error {
+		constructor(public workerId: string) {
+			super(`planning requires an instance admin owner: ${workerId}`);
+			this.name = 'PlanningRequiresInstanceAdminError';
+		}
+	}
 	return {
 		AllowedClisNotCapableError,
+		PlanningRequiresInstanceAdminError,
 		approveEnrollment: vi.fn(),
 		enrollWorker: vi.fn(),
 		getDashboardWorkerDetail: vi.fn(),
@@ -47,6 +55,7 @@ const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 
 vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	AllowedClisNotCapableError,
+	PlanningRequiresInstanceAdminError,
 	approveEnrollment,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -430,6 +439,21 @@ describe('workers.enroll (owner offers a worker to a project)', () => {
 		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
 	});
 
+	it('translates a planning-requires-instance-admin rejection to BAD_REQUEST', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		enrollWorker.mockRejectedValue(new PlanningRequiresInstanceAdminError(WORKER_ID));
+
+		await expect(
+			owner.enroll({
+				workerId: WORKER_ID,
+				projectId: 'p1',
+				allowedClis: ['claude'],
+				allowedPhases: ['planning'],
+			}),
+		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+	});
+
 	it('an instanceAdmin may enroll any worker', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
@@ -556,6 +580,18 @@ describe('workers allowed-phase inputs (issue #509)', () => {
 			owner.updateConstraints({ enrollmentId: ENROLLMENT_ID, allowedPhases: ['review'] }),
 		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
 		expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+	});
+
+	it('translates a planning-requires-instance-admin rejection to BAD_REQUEST', async () => {
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker());
+		updateEnrollmentConstraints.mockRejectedValue(
+			new PlanningRequiresInstanceAdminError(WORKER_ID),
+		);
+
+		await expect(
+			owner.updateConstraints({ enrollmentId: ENROLLMENT_ID, allowedPhases: ['planning'] }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
 	});
 
 	it('omits the selection on enroll so the service applies its default', async () => {
