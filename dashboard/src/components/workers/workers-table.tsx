@@ -126,8 +126,9 @@ function effectiveClis(worker: WorkerRow): string[] {
 
 /**
  * What the machine can run, on both capability axes (issue #467). A `PLANNING`
- * badge leads when the daemon declared that phase, in the violet accent so it
- * reads ahead of the neutral CLI badges beside it: unlike a CLI, it is the one
+ * badge leads when the daemon declared that phase, in the same caution amber as
+ * the Allowed-pipeline-phases planning badge, so it reads ahead of the neutral
+ * CLI badges beside it: unlike a CLI, it is the one
  * capability an operator cannot infer from the machine's tooling — a DB-free
  * remote daemon has every CLI and still refuses Planning — and it decides whether
  * board work can start here at all. Every other declared phase is deliberately
@@ -144,7 +145,7 @@ function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
 	return (
 		<div className="flex flex-wrap gap-1">
 			{canPlan ? (
-				<Badge tone="accent" title="This machine's daemon can run the Planning phase">
+				<Badge tone="caution" title="This machine's daemon can run the Planning phase">
 					planning
 				</Badge>
 			) : null}

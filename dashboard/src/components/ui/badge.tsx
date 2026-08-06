@@ -7,9 +7,11 @@ import type { ReactNode } from 'react';
  * routing verdict. One geometry everywhere, so the same fact reads identically
  * wherever it appears and nothing is emphasized by being *bigger*.
  *
- * Only the hue varies: `accent` promotes one badge in a set (the `planning` phase,
- * issue #467), and the three status hues carry state (approved / awaiting-approval
- * / suspended). Reach for a new tone here rather than hand-rolling a second pill.
+ * Only the hue varies: the three status hues carry state (approved /
+ * awaiting-approval / suspended), and `caution` doubles as the one that
+ * promotes a badge in a set (the `planning` phase, issue #467) — the same amber
+ * whether or not that instance of `planning` is otherwise flagged unavailable.
+ * Reach for a new tone here rather than hand-rolling a second pill.
  */
 
 const BADGE_BASE =
@@ -17,7 +19,6 @@ const BADGE_BASE =
 
 const BADGE_TONES = {
 	neutral: 'bg-zinc-850 text-zinc-400 border-zinc-800',
-	accent: 'bg-violet-950/30 text-violet-300 border-violet-900/30',
 	positive: 'bg-emerald-950/30 text-emerald-300 border-emerald-900/30',
 	caution: 'bg-amber-950/20 text-amber-200 border-amber-900/30',
 	negative: 'bg-red-950/30 text-red-400 border-red-900/30',

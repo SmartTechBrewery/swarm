@@ -682,13 +682,7 @@ function AllowedPhasesControl({
 						.map((option) => (
 							<Badge
 								key={option.phase}
-								tone={
-									option.unavailable
-										? 'caution'
-										: option.phase === 'planning'
-											? 'accent'
-											: 'neutral'
-								}
+								tone={option.unavailable || option.phase === 'planning' ? 'caution' : 'neutral'}
 							>
 								{formatPhase(option.phase)}
 							</Badge>

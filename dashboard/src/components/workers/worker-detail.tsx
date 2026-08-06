@@ -155,7 +155,7 @@ function SupportedPhases({ phases }: { phases: string[] }) {
 			{phases.map((phase) => (
 				<Badge
 					key={phase}
-					tone={phase === 'planning' ? 'accent' : 'neutral'}
+					tone={phase === 'planning' ? 'caution' : 'neutral'}
 					title={
 						phase === 'planning' ? "This machine's daemon can run the Planning phase" : undefined
 					}

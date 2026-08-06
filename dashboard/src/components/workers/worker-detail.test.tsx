@@ -528,7 +528,7 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 		expect(setConsentMutate).not.toHaveBeenCalled();
 	});
 
-	it('keeps planning’s accent tone in the read-only allowed-phases badges, same as the declared Capabilities column', () => {
+	it('keeps planning’s caution tone in the read-only allowed-phases badges, same as the declared Capabilities column', () => {
 		renderWorker({
 			viewerIsOwner: false,
 			owner: {
@@ -541,9 +541,9 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 
 		const enrollments = within(section('Project enrollments'));
 		const [planningBadge] = enrollments.getAllByText('planning');
-		expect(planningBadge.className).toContain('text-violet-300');
+		expect(planningBadge.className).toContain('text-amber-200');
 		const [implementationBadge] = enrollments.getAllByText('implementation');
-		expect(implementationBadge.className).not.toContain('text-violet-300');
+		expect(implementationBadge.className).not.toContain('text-amber-200');
 	});
 
 	it('states the default allocation of 1 to a non-owner, with no "No limit" wording', () => {
