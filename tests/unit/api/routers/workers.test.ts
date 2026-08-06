@@ -36,7 +36,10 @@ const {
 		updateEnrollmentConstraints: vi.fn(),
 	};
 });
-const { getWorker } = vi.hoisted(() => ({ getWorker: vi.fn() }));
+const { getWorker, renameWorker } = vi.hoisted(() => ({
+	getWorker: vi.fn(),
+	renameWorker: vi.fn(),
+}));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
@@ -55,7 +58,7 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	setSharingConsent,
 	updateEnrollmentConstraints,
 }));
-vi.mock('@/identity/worker-service.js', () => ({ getWorker }));
+vi.mock('@/identity/worker-service.js', () => ({ getWorker, renameWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
 
 import { workersRouter } from '@/api/routers/workers.js';
@@ -129,6 +132,7 @@ beforeEach(() => {
 		setSharingConsent,
 		updateEnrollmentConstraints,
 		getWorker,
+		renameWorker,
 		getMembership,
 		listAccessibleProjectIds,
 	]) {
@@ -234,14 +238,16 @@ describe('workers.getById (worker detail, issue #477)', () => {
 		expect(detail.viewerIsOwner).toBe(false);
 	});
 
-	it('treats an instanceAdmin as owner-capable, mirroring the mutations’ own override', async () => {
+	it('does not treat an instanceAdmin as owner-capable — no override on the owner-controlled values', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		getDashboardWorkerDetail.mockResolvedValue(detailView());
 
 		const detail = await admin.getById({ workerId: WORKER_ID });
 
-		expect(detail.viewerIsOwner).toBe(true);
-		// Layer-1 override: no membership lookup for either flag.
+		expect(detail.viewerIsOwner).toBe(false);
+		// viewerCanAdminister is a *project*-role flag, unaffected: an instanceAdmin
+		// still administers every project (mayAccessProject's own override), with
+		// no membership lookup needed for it.
 		expect(getMembership).not.toHaveBeenCalled();
 		expect(detail.enrollments[0].viewerCanAdminister).toBe(true);
 	});
@@ -585,6 +591,17 @@ describe('workers.setConsent (owner controls sharing consent)', () => {
 		expect(setSharingConsent).not.toHaveBeenCalled();
 	});
 
+	it('hides the enrollment from an instanceAdmin who does not own the worker either — no override', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getEnrollment.mockResolvedValue(makeEnrollment());
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		await expect(
+			admin.setConsent({ enrollmentId: ENROLLMENT_ID, sharingConsent: false }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(setSharingConsent).not.toHaveBeenCalled();
+	});
+
 	it('lets the owner revoke sharing consent', async () => {
 		getEnrollment.mockResolvedValue(makeEnrollment({ sharingConsent: true }));
 		getWorker.mockResolvedValue(makeWorker());
@@ -593,5 +610,61 @@ describe('workers.setConsent (owner controls sharing consent)', () => {
 		const result = await owner.setConsent({ enrollmentId: ENROLLMENT_ID, sharingConsent: false });
 		expect(result.sharingConsent).toBe(false);
 		expect(setSharingConsent).toHaveBeenCalledWith(ENROLLMENT_ID, false);
+	});
+});
+
+describe('workers.rename (owner-only, no instanceAdmin override)', () => {
+	it('is NOT_FOUND for an unknown worker', async () => {
+		getWorker.mockResolvedValue(undefined);
+
+		await expect(
+			owner.rename({ workerId: WORKER_ID, displayName: 'new-name' }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(renameWorker).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(
+			owner.rename({ workerId: WORKER_ID, displayName: 'new-name' }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(renameWorker).not.toHaveBeenCalled();
+	});
+
+	it('hides another owner’s worker from an instanceAdmin too — unlike enroll, no override', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		await expect(
+			admin.rename({ workerId: WORKER_ID, displayName: 'new-name' }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(renameWorker).not.toHaveBeenCalled();
+	});
+
+	it('lets the owner rename their own worker', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		renameWorker.mockResolvedValue(makeWorker({ displayName: 'new-name' }));
+
+		const result = await owner.rename({ workerId: WORKER_ID, displayName: 'new-name' });
+
+		expect(result.displayName).toBe('new-name');
+		expect(renameWorker).toHaveBeenCalledWith(WORKER_ID, 'new-name');
+	});
+
+	it('translates a duplicate name (23505) to CONFLICT', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		renameWorker.mockRejectedValue(Object.assign(new Error('dup'), { code: '23505' }));
+
+		await expect(
+			owner.rename({ workerId: WORKER_ID, displayName: 'new-name' }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'CONFLICT' }));
+	});
+
+	it('rejects an empty display name before it reaches the service', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(owner.rename({ workerId: WORKER_ID, displayName: '  ' })).rejects.toThrow();
+		expect(renameWorker).not.toHaveBeenCalled();
 	});
 });

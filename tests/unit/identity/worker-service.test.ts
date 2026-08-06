@@ -6,12 +6,14 @@ const {
 	findWorkerByCredentialHash,
 	getWorkerById,
 	updateWorkerCapabilities,
+	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
 } = vi.hoisted(() => ({
 	createWorker: vi.fn(),
 	findWorkerByCredentialHash: vi.fn(),
 	getWorkerById: vi.fn(),
 	updateWorkerCapabilities: vi.fn(),
+	updateWorkerDisplayName: vi.fn(),
 	updateWorkerSupportedPhases: vi.fn(),
 	listWorkersForOwner: vi.fn(),
 }));
@@ -22,6 +24,7 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 	findWorkerByCredentialHash,
 	getWorkerById,
 	updateWorkerCapabilities,
+	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
 	listWorkersForOwner,
 }));
@@ -33,6 +36,7 @@ import {
 	issueWorkerCredential,
 	refreshWorkerCapabilities,
 	registerWorker,
+	renameWorker,
 	resolveWorkerByCredential,
 	WorkerCapabilityReductionError,
 } from '@/identity/worker-service.js';
@@ -59,6 +63,7 @@ beforeEach(() => {
 	findWorkerByCredentialHash.mockReset();
 	getWorkerById.mockReset();
 	updateWorkerCapabilities.mockReset();
+	updateWorkerDisplayName.mockReset();
 	updateWorkerSupportedPhases.mockReset();
 	listWorkersForOwner.mockReset();
 });
@@ -205,6 +210,29 @@ describe('declareWorkerSupportedPhases', () => {
 	it('rejects an unknown phase without hitting the repository', async () => {
 		await expect(declareWorkerSupportedPhases('worker-1', ['deploy' as never])).rejects.toThrow();
 		expect(updateWorkerSupportedPhases).not.toHaveBeenCalled();
+	});
+});
+
+describe('renameWorker', () => {
+	it('validates and trims the name, then delegates to the display-name writer', async () => {
+		updateWorkerDisplayName.mockImplementation(async (id, displayName) =>
+			makeWorker({ id, displayName }),
+		);
+
+		const updated = await renameWorker('worker-1', '  new-name  ');
+
+		expect(updated?.displayName).toBe('new-name');
+		expect(updateWorkerDisplayName).toHaveBeenCalledWith('worker-1', 'new-name');
+	});
+
+	it('rejects an empty (or whitespace-only) name without hitting the repository', async () => {
+		await expect(renameWorker('worker-1', '   ')).rejects.toThrow();
+		expect(updateWorkerDisplayName).not.toHaveBeenCalled();
+	});
+
+	it('rejects a name over 80 characters without hitting the repository', async () => {
+		await expect(renameWorker('worker-1', 'x'.repeat(81))).rejects.toThrow();
+		expect(updateWorkerDisplayName).not.toHaveBeenCalled();
 	});
 });
 

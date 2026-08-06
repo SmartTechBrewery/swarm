@@ -561,8 +561,8 @@ describe('listDashboardWorkers (issue #133)', () => {
 
 			expect(views).toHaveLength(1);
 			expect(views[0].enrollments).toEqual([
-				{ projectId: 'proj-a', status: 'active' },
-				{ projectId: 'proj-b', status: 'pending' },
+				{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+				{ projectId: 'proj-b', status: 'pending', allowedClis: ['claude'] },
 			]);
 		});
 
@@ -578,7 +578,9 @@ describe('listDashboardWorkers (issue #133)', () => {
 
 			const [view] = await listDashboardWorkers(['proj-a']);
 
-			expect(view.enrollments).toEqual([{ projectId: 'proj-a', status: 'active' }]);
+			expect(view.enrollments).toEqual([
+				{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+			]);
 		});
 
 		it('withholds an in-flight run belonging to a project outside the viewer’s scope', async () => {
@@ -627,9 +629,12 @@ describe('listDashboardWorkers (issue #133)', () => {
 			].sort(),
 		);
 		expect(Object.keys(view.owner ?? {}).sort()).toEqual(['displayName', 'identifier', 'userId']);
-		// Enrollment summaries carry approval state only — no consent/allowed-CLI/
-		// concurrency knob the screen could turn into a control.
-		expect(Object.keys(view.enrollments[0]).sort()).toEqual(['projectId', 'status']);
+		// Enrollment summaries carry approval state plus the effective allowed CLIs
+		// (for the roster's Capabilities column) — no consent/concurrency knob the
+		// screen could turn into a control.
+		expect(Object.keys(view.enrollments[0]).sort()).toEqual(
+			['allowedClis', 'projectId', 'status'].sort(),
+		);
 		expect(JSON.stringify(view)).not.toMatch(/credential|password|token|repoRoot|worktree/i);
 	});
 });

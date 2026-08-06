@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
+import { WorkerDisplayNameSchema } from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
@@ -16,7 +17,7 @@ import {
 	setSharingConsent,
 	updateEnrollmentConstraints,
 } from '../../identity/worker-enrollment-service.js';
-import { getWorker, type Worker } from '../../identity/worker-service.js';
+import { getWorker, renameWorker, type Worker } from '../../identity/worker-service.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import { accessibleProjectScope, assertProjectAccess, mayAccessProject } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
@@ -35,10 +36,16 @@ import { authedProcedure, router } from '../trpc.js';
  *   offers only controls that would succeed.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
- *   (`enroll`), and controls the revocable sharing consent (`setConsent`) and
- *   execution constraints (`updateConstraints`). Ownership is checked per call;
- *   a caller who does not own the worker (and is not an `instanceAdmin`) gets
- *   `NOT_FOUND`, so worker/enrollment existence never leaks across owners.
+ *   (`enroll`), renames a machine (`rename`), and controls the revocable
+ *   sharing consent (`setConsent`) and execution constraints
+ *   (`updateConstraints`). Ownership is checked per call. `enroll` alone lets
+ *   an `instanceAdmin` act on any worker (layer-1 override, `resolveOwnedWorker`)
+ *   — offering a worker to a project reads as administering the project side
+ *   of that offer; `rename`, `setConsent`, and `updateConstraints` are the
+ *   machine owner's own call about their own machine and admit no such
+ *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
+ *   way, a caller who does not own the worker gets `NOT_FOUND`, so
+ *   worker/enrollment existence never leaks across owners.
  * - **Project roster**, gated by `assertProjectAccess` exactly like
  *   `routers/projects.ts`: a `contributor` reads the roster (`roster`); only a
  *   `projectAdmin` approves an enrollment (`approveEnrollment`) or revokes/
@@ -67,8 +74,9 @@ function enrollmentNotFound(enrollmentId: string): TRPCError {
 
 /**
  * Resolve a worker the caller may act on as its owner. An `instanceAdmin` may
- * act on any worker (layer-1 override); any other user only on their own. A
- * missing worker and a worker owned by someone else both surface the same
+ * act on any worker (layer-1 override) for this one act — offering a worker to
+ * a project is closer to project administration than to owning the machine.
+ * A missing worker and a worker owned by someone else both surface the same
  * `NOT_FOUND`, so ownership never leaks which worker ids are real.
  */
 async function resolveOwnedWorker(user: SwarmUser, workerId: string): Promise<Worker> {
@@ -80,16 +88,35 @@ async function resolveOwnedWorker(user: SwarmUser, workerId: string): Promise<Wo
 }
 
 /**
+ * Resolve a worker the caller **strictly** owns — no `instanceAdmin` override.
+ * Used for acts that are the machine owner's own call about their machine
+ * (its display name; an enrollment's sharing consent and execution
+ * constraints, via {@link resolveOwnedEnrollment}), as opposed to
+ * {@link resolveOwnedWorker}'s `enroll`, which reads as administering the
+ * *project* side of the offer. A missing worker and one owned by someone else
+ * both surface the same `NOT_FOUND`.
+ */
+async function resolveStrictlyOwnedWorker(user: SwarmUser, workerId: string): Promise<Worker> {
+	const worker = await getWorker(workerId);
+	if (!worker || worker.ownerUserId !== user.id) {
+		throw workerNotFound(workerId);
+	}
+	return worker;
+}
+
+/**
  * Resolve an enrollment plus its worker, hiding both behind one `NOT_FOUND`
- * unless the caller owns the worker (or is an `instanceAdmin`). Used by the
- * owner-scoped enrollment mutations so a non-owner cannot even learn an
- * enrollment id exists.
+ * unless the caller **strictly** owns the worker — no `instanceAdmin`
+ * override; sharing consent and execution constraints (allowed CLIs, allowed
+ * phases, concurrency) are the machine owner's own call, not an
+ * administrative one. Used by the owner-scoped enrollment mutations so a
+ * non-owner cannot even learn an enrollment id exists.
  */
 async function resolveOwnedEnrollment(user: SwarmUser, enrollmentId: string) {
 	const enrollment = await getEnrollment(enrollmentId);
 	if (!enrollment) throw enrollmentNotFound(enrollmentId);
 	const worker = await getWorker(enrollment.workerId);
-	if (!worker || (!isInstanceAdmin(user) && worker.ownerUserId !== user.id)) {
+	if (!worker || worker.ownerUserId !== user.id) {
 		throw enrollmentNotFound(enrollmentId);
 	}
 	return { enrollment, worker };
@@ -139,9 +166,10 @@ export const workersRouter = router({
 			const scope = await accessibleProjectScope(ctx.user);
 			const detail = await getDashboardWorkerDetail(input.workerId, scope);
 			if (!detail) throw workerNotFound(input.workerId);
-			// The owner-controlled values (sharing consent, execution constraints) are
-			// gated by `resolveOwnedEnrollment` below, so the flag mirrors it exactly.
-			const viewerIsOwner = isInstanceAdmin(ctx.user) || detail.ownerUserId === ctx.user.id;
+			// The owner-controlled values (display name, sharing consent, execution
+			// constraints) are gated by `resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`
+			// below, so the flag mirrors them exactly — no `instanceAdmin` override.
+			const viewerIsOwner = detail.ownerUserId === ctx.user.id;
 			const enrollments = await Promise.all(
 				detail.enrollments.map(async (enrollment) => ({
 					...enrollment,
@@ -168,6 +196,30 @@ export const workersRouter = router({
 	listMine: authedProcedure.query(async ({ ctx }) => {
 		return await listOwnerWorkers(ctx.user.id);
 	}),
+
+	// Rename one of the caller's own workers — the machine's own label, not a
+	// project-scoped fact, so it is gated by strict ownership
+	// (`resolveStrictlyOwnedWorker`) rather than `resolveOwnedWorker`'s
+	// `instanceAdmin` override. A name collision with another of the owner's
+	// workers surfaces as `CONFLICT`, exactly like a duplicate on `enroll`.
+	rename: authedProcedure
+		.input(z.object({ workerId: z.string().uuid(), displayName: WorkerDisplayNameSchema }))
+		.mutation(async ({ ctx, input }) => {
+			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			try {
+				const updated = await renameWorker(input.workerId, input.displayName);
+				if (!updated) throw workerNotFound(input.workerId);
+				return updated;
+			} catch (error) {
+				if (isUniqueViolation(error)) {
+					throw new TRPCError({
+						code: 'CONFLICT',
+						message: 'You already have a worker with this name.',
+					});
+				}
+				throw error;
+			}
+		}),
 
 	// Offer one of the caller's workers to a project (a `pending` enrollment
 	// awaiting a projectAdmin's approval). The caller must own the worker

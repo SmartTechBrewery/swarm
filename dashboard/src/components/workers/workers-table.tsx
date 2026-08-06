@@ -16,7 +16,7 @@ import type {
 
 /**
  * The worker roster (issue #133): one row per worker the viewer may see, with
- * connectivity, declared CLI capabilities, the job it is executing, and — per
+ * connectivity, effective CLI capabilities, the job it is executing, and — per
  * visible project — whether it is available for automatic dispatch.
  *
  * The one operable affordance (issue #282) is the owner-controlled **sharing
@@ -33,12 +33,15 @@ import type {
  * Consent state comes from `workers.roster` (readable by any project
  * `contributor`), so that unavailability is visible with no machine path, token,
  * or credential. The table deliberately shows *less* than the roster read model
- * carries (issue #473): approval state, effective allowed CLIs, and per-project
- * busy/idle were dropped from the old Enrollment cell rather than crowding one
- * column with five unrelated facts — busy already reads off **Active job**. Those
- * facts, and the controls that administer them, now live one click away on the
- * per-worker detail view (issue #477): a row click opens it, so the table stays
- * the scannable index.
+ * carries (issue #473): approval state and per-project busy/idle were dropped
+ * from the old Enrollment cell rather than crowding one column with five
+ * unrelated facts — busy already reads off **Active job**. Those facts, and the
+ * controls that administer them, now live one click away on the per-worker
+ * detail view (issue #477): a row click opens it, so the table stays the
+ * scannable index. Effective allowed CLIs stayed, but folded into
+ * **Capabilities** as a cross-project union ({@link effectiveClis}) rather than
+ * broken out per project — a per-project breakdown is what the detail view is
+ * for.
  */
 
 interface WorkersTableProps {
@@ -103,6 +106,21 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
 }
 
 /**
+ * The CLIs at least one visible enrollment actually allows — a subset of the
+ * machine's declared `capabilities`. Declared-but-unallowed CLIs (e.g. a
+ * machine that speaks three but is only enrolled with one turned on) never ran
+ * here and would mislead an operator scanning the roster for what a project can
+ * actually dispatch. Preserves `capabilities`' own order rather than the
+ * enrollments' insertion order, so the chips read the same as the worker detail
+ * screen's declared-capabilities list. Empty for an un-enrolled machine — no
+ * project has allowed anything on it yet.
+ */
+function effectiveClis(worker: WorkerRow): string[] {
+	const allowed = new Set(worker.enrollments.flatMap((enrollment) => enrollment.allowedClis));
+	return worker.capabilities.filter((cli) => allowed.has(cli));
+}
+
+/**
  * What the machine can run, on both capability axes (issue #467). A `PLANNING`
  * badge leads when the daemon declared that phase, in the violet accent so it
  * reads ahead of the neutral CLI badges beside it: unlike a CLI, it is the one
@@ -110,11 +128,13 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
  * remote daemon has every CLI and still refuses Planning — and it decides whether
  * board work can start here at all. Every other declared phase is deliberately
  * left off: they are the common case, and listing six chips per row would bury
- * the one that distinguishes machines.
+ * the one that distinguishes machines. The CLI chips themselves are the
+ * *effective* set ({@link effectiveClis}), not the raw declared capabilities.
  */
 function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
 	const canPlan = worker.supportedPhases.includes('planning');
-	if (!canPlan && worker.capabilities.length === 0) {
+	const clis = effectiveClis(worker);
+	if (!canPlan && clis.length === 0) {
 		return <span className="text-sm text-zinc-500">—</span>;
 	}
 	return (
@@ -124,7 +144,7 @@ function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
 					planning
 				</Badge>
 			) : null}
-			{worker.capabilities.map((cli) => (
+			{clis.map((cli) => (
 				<Badge key={cli}>{cli}</Badge>
 			))}
 		</div>

@@ -75,7 +75,7 @@ function makeRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
 		currentRun: null,
-		enrollments: [{ projectId: 'proj-a', status: 'active' }],
+		enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] }],
 		...overrides,
 	};
 }
