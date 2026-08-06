@@ -18,17 +18,22 @@
  *   trigger handlers (`src/triggers/handlers/`) remain in the trigger registry.
  *   The remaining fields get added the day a second provider makes the
  *   registry lookup earn its keep, not before.
- * - wizard / lifecycle-conformance fields — SWARM has no setup wizard, and the
- *   conformance harness is explicitly deferred until there's a second provider
- *   (ai/TESTING.md "Provider conformance"). Discovery, by contrast, is no longer
- *   deferred: the board-mapping screen (issue #201) is a real consumer, so the
- *   manifest declares each provider's `discovery` capabilities below.
+ * - wizard / lifecycle-conformance fields — SWARM has no setup wizard, and
+ *   *behavioral* conformance (Cascade's `lifecycle` fixture harness) stays out of
+ *   scope; the harness SWARM does run asserts this manifest's surface and that no
+ *   method is a stub (ai/TESTING.md "Provider conformance"). Discovery, by
+ *   contrast, is not deferred at all: the board-mapping screen (issue #201) is a
+ *   real consumer, so the manifest declares each provider's `discovery`
+ *   capabilities below.
  *
  * `routerAdapter` is typed to the provider-neutral `PMRouterAdapter` interface
  * (`src/pm/router-adapter.ts`), extracted from the concrete
  * `GitHubProjectsRouterAdapter` by issue #297 along with the `PmEvent` its methods
  * speak and the `src/integrations/pm/index.ts` barrel this module is re-exported
- * through. The conformance harness is still deferred (a later phase of #297).
+ * through. Every field below is asserted for each *registered* manifest by
+ * `tests/unit/integrations/pm/pm-conformance.test.ts` (issue #499), the gate a
+ * second PM provider passes by implementing the contract rather than by
+ * registering early — so add a provider's fixture there, never an exemption.
  *
  * `credentialRoles` arrived with issue #497: the shared `credentials` block is a
  * fixed `{ reviewer, webhookSecret }` pair shaped for GitHub (`src/config/schema.ts`),
