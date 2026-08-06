@@ -271,10 +271,24 @@ describe('pm-status trigger', () => {
 			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
-		it('returns null when the work item URL carries no issue number (e.g. a draft)', async () => {
+		// The card→artifact seam (issue #498): the provider decides, from its own
+		// linkage, whether a card has an SCM artifact. Shared code only reads the
+		// answer, so a board that links to nothing skips exactly like a draft card.
+		it('keys the dispatch on the provider-supplied taskRef, not on the item URL', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c',
+				url: 'https://swarm.example.test/browse/PROJ-7',
+				taskRef: '77',
+			});
+			const result = await trigger.handle(ctx(workItem));
+			expect(result).toEqual({ phase: 'planning', taskId: '77', workItem });
+		});
+
+		it('returns null when the work item has no backing SCM artifact (e.g. a draft)', async () => {
 			const workItem = createMockWorkItem({
 				statusId: '61e4505c',
 				url: 'https://github.com/SmartTechBrewery/swarm',
+				taskRef: undefined,
 			});
 			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});

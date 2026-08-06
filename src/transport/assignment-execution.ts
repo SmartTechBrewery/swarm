@@ -74,6 +74,7 @@ export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
 		title: item.title,
 		description: item.description,
 		url: item.url,
+		taskRef: item.taskRef,
 		status: item.status,
 		statusId: item.statusId,
 		statusKey: item.statusKey,
@@ -562,6 +563,9 @@ function buildDbFreePhaseInputs({
 		prBranch: assignment.prBranch,
 		headSha: assignment.headSha,
 		reviewId: assignment.reviewId,
+		// Resolved control-plane side (issue #498) — this worker has no DB to read
+		// the `runs.work_item_id` link from itself.
+		boardItemId: assignment.boardItemId,
 		baseBranch: assignment.baseBranch,
 		baseSha: assignment.baseSha,
 		// The DB-free injection seam: the phase's resolved delivery/PM providers plus

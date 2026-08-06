@@ -45,6 +45,7 @@ import {
 	storeRunLogs,
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
+import { resolveBoardItemIdForPrBranch } from '../dispatch/board-card.js';
 import {
 	claimDispatchForJob,
 	createAndPublishDispatch,
@@ -1391,6 +1392,15 @@ export interface AssignedPhaseInputs {
 	headSha?: string;
 	/** respond-to-review only. */
 	reviewId?: string;
+	/**
+	 * respond-to-review only: the board card this PR's task was dispatched from,
+	 * resolved control-plane side from the durable `runs.work_item_id` link
+	 * (`../dispatch/board-card.ts`, issue #498) so the DB-free worker needs no
+	 * database to report board status (ADR-003 §2). Undefined when nothing links
+	 * the task to a card, in which case the phase falls back to its legacy
+	 * URL-suffix lookup.
+	 */
+	boardItemId?: string;
 	/** resolve-conflicts only. */
 	baseBranch?: string;
 	baseSha?: string;
@@ -1570,6 +1580,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				headSha: inputs.headSha,
 				taskId,
 				pm: resolvePm(),
+				boardItemId: inputs.boardItemId,
 				delivery,
 				getToken,
 				// Undefined on the in-process/same-host paths, where the phase keeps its
@@ -1725,6 +1736,9 @@ async function runPhase(
 				reviewId: trigger.reviewId,
 				headSha: trigger.headSha,
 				pm: resolvePmDelivery(project),
+				// Resolved here, where the DB is — the phase itself must run without one
+				// (ADR-003 §2). Best-effort: `undefined` simply falls back in the phase.
+				boardItemId: await resolveBoardItemIdForPrBranch(project, trigger.prBranch),
 				delivery: await resolveScmDelivery(project, 'implementer'),
 			});
 		case 'respond-to-ci':
