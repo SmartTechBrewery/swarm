@@ -21,6 +21,7 @@ import {
 	getWorkerDispatchClaimState,
 	hasExecutingDispatchForTask,
 	listDeferredRunsWithoutActiveDispatch,
+	listRunnableDispatchesForPool,
 	listWaitingDispatches,
 	listWakeablePendingDispatches,
 	markDispatchRunning,
@@ -797,6 +798,105 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				expect(await claimDispatch(d.id, OWNER, 60_000)).toBeNull();
 			}
 			expect(await listWaitingDispatches(PROJECT_ID)).toHaveLength(0);
+		});
+	});
+
+	// Issue #533's demand read: what the dispatch gate matches against the pool's free
+	// worker slots. Its whole value is in the filter, so it is pinned against real SQL.
+	describe('pool-scheduling demand read', () => {
+		it('returns the dispatches that still need a worker, in queue order', async () => {
+			const board = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-board' }),
+				dedupKey: 'delivery:d-board',
+				source: 'webhook',
+				// A PM-driven job is demoted below review-lifecycle work (`priorityFor`), and
+				// the demand read must preserve that ranking.
+				priority: 10,
+				phase: 'planning',
+			});
+			const review = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-review' }),
+				dedupKey: 'delivery:d-review',
+				source: 'webhook',
+				phase: 'review',
+			});
+			// Being gated right now — the contender that most needs a scarce worker is
+			// often one another consumer is deciding on at this very moment.
+			const leased = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-leased' }),
+				dedupKey: 'delivery:d-leased',
+				source: 'webhook',
+				state: 'leased',
+				phase: 'implementation',
+			});
+			// Scheduled into the future: not demand on the pool now.
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-later' }),
+				dedupKey: 'delivery:d-later',
+				source: 'recovered',
+				state: 'retry-scheduled',
+				availableAt: new Date(Date.now() + 60_000),
+				phase: 'review',
+			});
+			await seedDispatchInState('task-running', 'running', undefined);
+			await seedDispatchInState('task-done', 'completed', undefined);
+
+			const runnable = await listRunnableDispatchesForPool(PROJECT_ID);
+
+			expect(runnable.map((row) => row.id)).toEqual([
+				review.dispatch.id,
+				leased.dispatch.id,
+				board.dispatch.id,
+			]);
+		});
+
+		it('drops a dispatch that already claimed its worker', async () => {
+			// Its capacity is spent — the worker's availability snapshot already reflects
+			// it, so counting it as demand would double-book the same run.
+			const owner = await createUser({ identifier: 'pool@example.com', displayName: 'Owner' });
+			const worker = await createWorker({
+				ownerUserId: owner.id,
+				displayName: 'worker-pool',
+				capabilities: ['claude'],
+				credentialHash: 'hash-pool',
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: PROJECT_ID,
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+			const session = await acquireLease(worker.id, 60_000);
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				phase: 'implementation',
+			});
+			await claimDispatch(dispatch.id, OWNER, 60_000);
+			expect(await listRunnableDispatchesForPool(PROJECT_ID)).toHaveLength(1);
+
+			const claim = await claimWorkerForDispatch({
+				dispatchId: dispatch.id,
+				dispatchLeaseOwner: OWNER,
+				projectId: PROJECT_ID,
+				selectedWorkerId: worker.id,
+				executionWorkerId: worker.id,
+				workerSessionId: session.id,
+				workerFencingToken: session.fencingToken,
+				cli: 'claude',
+				heartbeatTtlMs: 60_000,
+			});
+
+			expect(claim.claimed).toBe(true);
+			expect(await listRunnableDispatchesForPool(PROJECT_ID)).toEqual([]);
 		});
 	});
 

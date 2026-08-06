@@ -38,7 +38,9 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   the phases the enrollment permits in this project) and the configured CLI. For
   Implementation, an
   assigned item runs only on a worker owned by its assignee (never someone
-  else's); an unassigned one takes the first free eligible worker. **Planning is
+  else's); an unassigned one takes a free eligible worker — chosen across the
+  whole pool, so a phase several machines can run does not consume the one machine
+  another waiting phase needs (issue #533). **Planning is
   central** — it is never routed by assignment, because only a worker with
   database access can run it (issue #469). (When single-user mode is enabled via
   `SWARM_SINGLE_USER_MODE=true`, this entire federated dispatch gate is bypassed
