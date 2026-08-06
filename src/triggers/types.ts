@@ -166,6 +166,14 @@ export type TriggerResult =
 			phase: 'review';
 			/** The PR under review. */
 			prNumber: string;
+			/**
+			 * The PR head branch. The Review phase itself checks out the head SHA
+			 * detached and never uses it; it is carried because the automation-label
+			 * gate resolves the PR back to its board work item through this branch
+			 * (`<branchPrefix><itemNumber>`, issue #354), and the handler already holds
+			 * the PR details a second SCM round-trip would have re-fetched.
+			 */
+			prBranch: string;
 			/** The PR head commit the review is pinned to (`src/pipeline/review.ts`). */
 			headSha: string;
 	  })
