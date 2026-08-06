@@ -6,9 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { isWorktreeLeasedMock, claimWorktreeLeaseMock, releaseWorktreeLeaseMock } = vi.hoisted(
 	() => ({
-		isWorktreeLeasedMock: vi.fn(async () => false),
-		claimWorktreeLeaseMock: vi.fn(async () => {}),
-		releaseWorktreeLeaseMock: vi.fn(async () => {}),
+		isWorktreeLeasedMock: vi.fn<(projectId: string, taskId: string) => Promise<boolean>>(
+			async () => false,
+		),
+		claimWorktreeLeaseMock: vi.fn<(projectId: string, taskId: string) => Promise<void>>(
+			async () => {},
+		),
+		releaseWorktreeLeaseMock: vi.fn<(projectId: string, taskId: string) => Promise<void>>(
+			async () => {},
+		),
 	}),
 );
 
@@ -160,6 +166,9 @@ function stubWorktrees(path: string) {
 		),
 		isClean: vi.fn(async () => true),
 		hasUnpushedWork: vi.fn(async () => false),
+		isLeased: vi.fn(async (taskId: string) => isWorktreeLeasedMock('project-1', taskId)),
+		claimLease: vi.fn(async (taskId: string) => claimWorktreeLeaseMock('project-1', taskId)),
+		releaseLease: vi.fn(async (taskId: string) => releaseWorktreeLeaseMock('project-1', taskId)),
 		cleanup: vi.fn(async () => {}),
 	};
 }
@@ -175,7 +184,6 @@ function gate(
 		'19',
 		mode,
 		sessionId,
-		'project-1',
 		phase,
 	);
 }
@@ -393,7 +401,6 @@ describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', (
 			'19',
 			'fresh',
 			undefined,
-			'project-1',
 			'implementation',
 		);
 		expect(result).toEqual({ reuseHandle: null });
@@ -437,7 +444,6 @@ describe('acquireResumableWorktree — a checkpoint continuation resumes no sess
 			},
 			false,
 			mode,
-			'project-1',
 		);
 	}
 

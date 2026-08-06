@@ -24,15 +24,13 @@ import type { z } from 'zod';
 import { type ProjectConfig, ProjectConfigBaseSchema } from './schema.js';
 
 /**
- * Fields safe to travel to a worker inside a task assignment: project identity
- * and the worktree/branch/agent settings the worker needs to run a phase inside
- * a git worktree. None of these is a secret or a control-plane-only ID.
+ * Fields safe and meaningful to travel to a worker inside a task assignment:
+ * project identity and the worktree/branch/agent settings shared across hosts.
  */
 export const WORKER_SAFE_KEYS = [
 	'id',
 	'name',
 	'repo',
-	'repoRoot',
 	'worktreeRoot',
 	'baseBranch',
 	'branchPrefix',
@@ -41,8 +39,8 @@ export const WORKER_SAFE_KEYS = [
 ] as const;
 
 /**
- * Fields that never leave the control plane: the secret-bearing `credentials`
- * block (persona token references + webhook secret — the hard exclusion the
+ * Fields that never leave the control plane: the host-specific `repoRoot`, the
+ * secret-bearing `credentials` block (persona token references + webhook secret — the hard exclusion the
  * acceptance criteria require), plus control-plane-only policy and
  * provider-specific IDs (pipeline board-move policy, visibility, the scheduler
  * concurrency knob, and `pm` — which since issue #495 is the provider
@@ -52,6 +50,7 @@ export const WORKER_SAFE_KEYS = [
  */
 export const SERVER_ONLY_KEYS = [
 	'credentials',
+	'repoRoot',
 	'pm',
 	'pipeline',
 	'visibility',

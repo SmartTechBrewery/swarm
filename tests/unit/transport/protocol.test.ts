@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { toNonSecretProjectConfig } from '@/config/project-config-slice.js';
 import { REVIEW_AUTOMATION_OUTCOMES, REVIEW_VERDICTS } from '@/pipeline/review.js';
 import { PM_STATUS_KEYS } from '@/pm/pipeline.js';
 import {
@@ -26,8 +27,7 @@ const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
 
 /** The non-secret project-config slice a valid frame embeds. */
 const PROJECT_SLICE = (() => {
-	const { credentials: _credentials, ...rest } = createMockProjectConfig();
-	return rest;
+	return toNonSecretProjectConfig(createMockProjectConfig());
 })();
 
 /** A minimal well-formed `task-assignment` frame for the union/round-trip tests. */

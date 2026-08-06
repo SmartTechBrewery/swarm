@@ -160,6 +160,39 @@ admitted the one PM **read** now served server-side,
 gating (issue #330), and stubbing it out on the worker would have let a blocked
 item build out of order.
 
+**Amendment (2026-08-06, issue #535).** The DB-free boundary also distinguishes
+server state from **host-local execution state**. A worktree lease, its live owner,
+a preserved-checkout pin, and `repoRoot` describe one machine's filesystem; no
+other host can observe or act on that checkout, so centralizing them in Redis or
+Postgres creates false cross-host coupling. Remote execution therefore coordinates
+worktrees with atomic filesystem locks and preservation pins under its own
+`worktreeRoot`, while the same-host path retains its existing store-backed runtime.
+The control plane omits `repoRoot` from `TaskAssignment`; the daemon resolves its
+own checkout with `SWARM_WORKER_REPO_ROOT` (default cwd). Shared collision policy
+still fails closed in the same order (live lease, resumable pin, dirty, unpushed).
+
+Two properties the store gave away for free have to be rebuilt explicitly on a
+filesystem, and both are load-bearing rather than defensive polish:
+
+- **Expiry.** The Redis lease's 4h TTL was what bounded an orphan; issue #427
+  exists because a held lease with no owner and no expiry wedged every later run
+  for a task. A file has no TTL, so each artifact records `createdAt` and every
+  reader treats an expired one as reclaimable — otherwise a crash mid-takeover, a
+  truncated lease file, or a pin whose run was reset control-plane side (something
+  this worker cannot learn: the run lifecycle lives in a database it cannot read)
+  would each be terminal, recoverable only by an operator deleting a file on a
+  machine the instance admin may not have access to. Liveness stays the fast path;
+  the timestamp covers what liveness cannot see. Expiring a *marker* never
+  force-removes work — the reclaim gate behind it still refuses a dirty or
+  unpushed checkout.
+- **Repository identity.** `repoRoot` came from the project config, so a same-host
+  worker's checkout matched the assignment by construction. A remote daemon
+  resolves one path from its own environment and reuses it for **every** project
+  it is enrolled in, so "is a git repository" stopped being a sufficient sanity
+  check: provisioning also asserts the checkout's `origin` resolves to
+  `project.repo`. Best-effort by design — a clone with no `origin` cannot be
+  identified and is accepted; only a remote naming a *different* repository fails.
+
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
 
 > **Status: implemented, in two phases.** Phase 1 (issue #397) — the **`pr-review`

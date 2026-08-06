@@ -180,6 +180,21 @@ server-side store) it needs:
    The board report stays best-effort throughout — a card that can't be resolved
    or moved is logged and skipped, never failing the response.
 
+8. **#535** — worktree provisioning now satisfies #394's DB-free constraint too.
+   `GitWorktreeManager` receives a runtime: the same-host path keeps its existing
+   Redis lease and Postgres liveness/preservation lookups, while
+   `runAssignmentDbFree` injects a host-local filesystem runtime. Atomic lock
+   directories + takeover guards serialize provisioners on that machine; local
+   preservation pins and the existing dirty/unpushed checks retain resumable work.
+   The remote checkout path is also host-owned: `project.repoRoot` no longer rides
+   `TaskAssignment`, and the daemon supplies `SWARM_WORKER_REPO_ROOT` (default cwd).
+   A real Respond-to-CI phase test runs through provision → agent handoff → delivery
+   → cleanup with both `DATABASE_URL` and `REDIS_URL` absent. Each host-local
+   artifact carries the expiry the Redis lease got from its TTL, so crash debris is
+   reaped by the next provisioner instead of wedging the task (see ADR-004's
+   amendment), and provisioning asserts the checkout is the assigned repository
+   before it writes anything into it.
+
 Still out of scope: **`planning`**, whose PM write/split surface
 (`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`/`findComment`)
 is wider than a delivery seam should carry and stays on the local host worker, and

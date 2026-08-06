@@ -1379,6 +1379,8 @@ export interface AssignedPhaseInputs {
 	signal?: AbortSignal;
 	/** Agent runner (live-output-wrapped by the caller); defaults are the phase's own. */
 	runAgent: ReturnType<typeof createLiveOutputRunner>;
+	/** Worktree runtime selected by the executor; unset keeps the store-backed host path. */
+	worktrees?: GitWorktreeManager;
 	/** planning / implementation: the board item to act on. */
 	workItem?: WorkItem;
 	/**
@@ -1497,6 +1499,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			if (!inputs.workItem) throw new Error('planning phase requires a workItem');
 			return runPlanningPhase({
 				project,
+				worktrees: inputs.worktrees,
 				workItem: inputs.workItem,
 				taskId,
 				pm: resolvePm(),
@@ -1521,6 +1524,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			if (!inputs.workItem) throw new Error('implementation phase requires a workItem');
 			return runImplementationPhase({
 				project,
+				worktrees: inputs.worktrees,
 				workItem: inputs.workItem,
 				taskId,
 				pm: resolvePm(),
@@ -1548,6 +1552,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			}
 			return runReviewPhase({
 				project,
+				worktrees: inputs.worktrees,
 				prNumber: inputs.prNumber,
 				headSha: inputs.headSha,
 				taskId,
@@ -1582,6 +1587,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			}
 			return runRespondToReviewPhase({
 				project,
+				worktrees: inputs.worktrees,
 				prNumber: inputs.prNumber,
 				prBranch: inputs.prBranch,
 				reviewId: inputs.reviewId,
@@ -1615,6 +1621,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			}
 			return runRespondToCiPhase({
 				project,
+				worktrees: inputs.worktrees,
 				prNumber: inputs.prNumber,
 				prBranch: inputs.prBranch,
 				headSha: inputs.headSha,
@@ -1645,6 +1652,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			}
 			return runResolveConflictsPhase({
 				project,
+				worktrees: inputs.worktrees,
 				prNumber: inputs.prNumber,
 				prBranch: inputs.prBranch,
 				headSha: inputs.headSha,

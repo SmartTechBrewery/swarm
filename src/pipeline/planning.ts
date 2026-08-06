@@ -939,7 +939,6 @@ async function acquirePlanningWorktree(
 	baseBranch: string,
 	resumeSessionId: string | undefined,
 	recoveryMode?: 'resume' | 'fresh',
-	projectId?: string,
 	runId?: string,
 ): Promise<{ handle: WorktreeHandle; resumed: boolean }> {
 	const res = await acquireResumableWorktree(
@@ -952,7 +951,6 @@ async function acquirePlanningWorktree(
 		() => worktrees.provision(taskId, { detach: true, runId }),
 		false,
 		recoveryMode,
-		projectId,
 	);
 	return { handle: res.handle, resumed: res.resumed };
 }
@@ -1248,7 +1246,6 @@ export async function runPlanningPhase(
 		project.baseBranch,
 		resumeSessionId,
 		recoveryMode,
-		project.id,
 		runId,
 	);
 	let preserveForResume = false;

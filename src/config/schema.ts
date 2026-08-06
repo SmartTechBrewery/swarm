@@ -562,8 +562,8 @@ export const ProjectConfigBaseSchema = z.object({
 
 	/**
 	 * Directory under `repoRoot` where per-task git worktrees live
-	 * (ai/ARCHITECTURE.md "Worktree lifecycle"). Relative, not absolute, so it
-	 * travels with `repoRoot`.
+	 * (ai/ARCHITECTURE.md "Worktree lifecycle"). Relative, not absolute, so the
+	 * same value is meaningful beneath each execution host's own `repoRoot`.
 	 */
 	worktreeRoot: z.string().min(1).default(PROJECT_DEFAULTS.worktreeRoot),
 

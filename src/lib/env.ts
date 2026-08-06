@@ -1,3 +1,5 @@
+import { resolve } from 'node:path';
+
 /**
  * Read a required environment variable, throwing if it is unset or empty.
  *
@@ -100,6 +102,15 @@ export function resolveOperatorGitHubToken(raw = process.env.SWARM_OPERATOR_GH_T
 		);
 	}
 	return value;
+}
+
+/** Resolve the assigned repository checkout on the remote worker's own host. */
+export function resolveWorkerRepoRoot(
+	raw = process.env.SWARM_WORKER_REPO_ROOT,
+	cwd = process.cwd(),
+): string {
+	const value = (raw ?? '').trim();
+	return resolve(value === '' ? cwd : value);
 }
 
 /** How the host worker receives its work (`SWARM_DISPATCH_MODE`). */

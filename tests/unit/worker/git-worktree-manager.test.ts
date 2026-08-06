@@ -155,6 +155,8 @@ describe('GitWorktreeManager', () => {
 
 			expect(gitCalls).toEqual([
 				['rev-parse', '--is-inside-work-tree'],
+				// The sanity check also confirms this is the *assigned* repo (issue #535).
+				['remote', 'get-url', 'origin'],
 				['fetch', 'origin'],
 				['branch', '--list', 'issue-14'],
 				['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main'],
@@ -256,6 +258,18 @@ describe('GitWorktreeManager', () => {
 			expect(gitCalls.some((c) => c[1] === 'add')).toBe(false);
 			// Never acquired, so nothing to release.
 			expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+		});
+
+		it('reports real provisioning contention when no checkout exists yet', async () => {
+			tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+
+			const err = await makeManager()
+				.provision('14')
+				.catch((error) => error);
+			expect(err).toBeInstanceOf(BlockedRecoveryError);
+			expect(err.message).toContain('provisioning');
+			expect(err.message).toContain('already in progress');
+			expect(err.message).not.toContain('existing checkout');
 		});
 
 		describe('stale-lease take-over (issue #427)', () => {
@@ -798,6 +812,46 @@ describe('GitWorktreeManager', () => {
 				].join('\n'),
 			});
 			expect(await makeManager({ repoRoot: SYMLINKED_ROOT }).list()).toEqual([REAL_WORKTREE]);
+		});
+	});
+
+	// A remote worker resolves `repoRoot` from its own environment and reuses that
+	// one path for every project it is enrolled in, so "is a git repo" is no longer
+	// enough — it has to be the *assigned* repo (issue #535 review).
+	describe('repo identity', () => {
+		function handlerWithRemote(url: string | Error) {
+			return (args: string[]) => {
+				if (args[0] === 'remote') return url instanceof Error ? url : { stdout: `${url}\n` };
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				return { stdout: '' };
+			};
+		}
+
+		it('refuses to provision in a checkout of a different repository', async () => {
+			gitHandler = handlerWithRemote('git@github.com:someone-else/other-repo.git');
+
+			await expect(makeManager().provision('14')).rejects.toThrow(
+				/is a checkout of 'someone-else\/other-repo'/,
+			);
+		});
+
+		it.each([
+			['scp-style ssh', 'git@github.com:SmartTechBrewery/swarm.git'],
+			['ssh url', 'ssh://git@github.com/SmartTechBrewery/swarm.git'],
+			['https url', 'https://github.com/SmartTechBrewery/swarm'],
+			['mixed case', 'https://github.com/smarttechbrewery/Swarm.git'],
+		])('accepts the assigned repository via %s', async (_form, url) => {
+			gitHandler = handlerWithRemote(url);
+
+			await expect(makeManager().provision('14')).resolves.toMatchObject({ taskId: '14' });
+		});
+
+		it('skips verification when the checkout has no origin remote', async () => {
+			// A local-only clone cannot be identified; refusing it would break every
+			// fixture and every checkout that has not been pushed anywhere yet.
+			gitHandler = handlerWithRemote(new Error('fatal: No such remote'));
+
+			await expect(makeManager().provision('14')).resolves.toMatchObject({ taskId: '14' });
 		});
 	});
 });

@@ -15,9 +15,6 @@
  * so the ordered checks — and the reasons they surface — stay identical.
  */
 
-import { hasResumableDeferredRun } from '../db/repositories/runsRepository.js';
-import { isWorktreeLeased } from './worktree-lease.js';
-
 /**
  * Why a preserved checkout may not be discarded. Persisted verbatim onto
  * `runs.recovery.blockedReason` (`src/db/schema/runs.ts`) so the dashboard can
@@ -77,12 +74,12 @@ export interface WorktreeSafetyChecker {
 	hasUnpushedWork(taskId: string): Promise<boolean>;
 }
 
-/** Injectable lookups for the reclaim gate; both default to the real implementations. */
+/** Runtime-selected lookups for the reclaim gate. */
 export interface ReclaimGateDeps {
 	/** Whether the task's worktree is currently leased by a live run. */
-	isLeased?: (projectId: string, taskId: string) => Promise<boolean>;
+	isLeased: (projectId: string, taskId: string) => Promise<boolean>;
 	/** Whether a resumable deferred/failed run pins the task's checkout. */
-	isResumablePinned?: (projectId: string, taskId: string) => Promise<boolean>;
+	isResumablePinned: (projectId: string, taskId: string) => Promise<boolean>;
 }
 
 /**
@@ -96,15 +93,12 @@ export async function evaluateWorktreeReclaim(
 	worktrees: WorktreeSafetyChecker,
 	projectId: string,
 	taskId: string,
-	deps: ReclaimGateDeps = {},
+	deps: ReclaimGateDeps,
 ): Promise<ReclaimDecision> {
-	const isLeased = deps.isLeased ?? isWorktreeLeased;
-	const isResumablePinned = deps.isResumablePinned ?? hasResumableDeferredRun;
-
-	if (await isLeased(projectId, taskId)) {
+	if (await deps.isLeased(projectId, taskId)) {
 		return { safe: false, reason: 'live-leased', detail: 'is leased by a live run' };
 	}
-	if (await isResumablePinned(projectId, taskId)) {
+	if (await deps.isResumablePinned(projectId, taskId)) {
 		return {
 			safe: false,
 			reason: 'resumable-owner',

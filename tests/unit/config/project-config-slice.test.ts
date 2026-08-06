@@ -7,14 +7,14 @@ import {
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 describe('toNonSecretProjectConfig', () => {
-	it('drops the credentials block and preserves every other field', () => {
+	it('drops credentials and the control-plane repoRoot, preserving every transport field', () => {
 		const project = createMockProjectConfig();
 		const slice = toNonSecretProjectConfig(project);
 
 		expect('credentials' in slice).toBe(false);
+		expect('repoRoot' in slice).toBe(false);
 
-		// Every non-credential field survives unchanged.
-		const { credentials: _credentials, ...rest } = project;
+		const { credentials: _credentials, repoRoot: _repoRoot, ...rest } = project;
 		expect(slice).toEqual(rest);
 	});
 
@@ -41,6 +41,7 @@ describe('NonSecretProjectConfigSchema', () => {
 		const project = createMockProjectConfig();
 		const parsed = NonSecretProjectConfigSchema.parse(project);
 		expect('credentials' in parsed).toBe(false);
+		expect('repoRoot' in parsed).toBe(false);
 		expect(parsed.id).toBe(project.id);
 	});
 });
