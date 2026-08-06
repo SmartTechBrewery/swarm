@@ -24,6 +24,8 @@ export type WorkerEnrollmentStatus = 'pending' | 'active' | 'suspended';
 export interface WorkerEnrollmentSummary {
 	projectId: string;
 	status: WorkerEnrollmentStatus;
+	/** Effective CLIs this project may run on the worker — a subset of its capabilities. */
+	allowedClis: string[];
 }
 
 /** The owner shown beside a worker — a non-secret identity, never a credential. */
@@ -118,10 +120,11 @@ export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
 	/** The owner's user id — the non-secret identity, never a credential. */
 	ownerUserId: string;
 	/**
-	 * Whether the viewer may change the owner-controlled values (sharing consent
-	 * and execution constraints). Declared by the server, which re-checks
-	 * ownership on every such mutation; `true` for the owner and for an
-	 * installation administrator, exactly as the mutations resolve it.
+	 * Whether the viewer may change the owner-controlled values (display name,
+	 * sharing consent, and execution constraints). Declared by the server, which
+	 * re-checks ownership on every such mutation; `true` only for the worker's
+	 * actual owner — an installation administrator gets no override here, exactly
+	 * as `rename`/`setConsent`/`updateConstraints` resolve it.
 	 */
 	viewerIsOwner: boolean;
 	enrollments: WorkerDetailEnrollment[];

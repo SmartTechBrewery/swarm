@@ -14,6 +14,7 @@ import {
 	listWorkersForOwner,
 	removeWorker,
 	updateWorkerCapabilities,
+	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
 } from '../../../src/db/repositories/workersRepository.js';
 import { users } from '../../../src/db/schema/users.js';
@@ -385,6 +386,43 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 					expect(workerCapSet.has(cli)).toBe(true);
 				}
 			}
+		});
+	});
+
+	describe('updateWorkerDisplayName', () => {
+		it('changes the display name', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-laptop',
+				capabilities: ['claude'],
+				credentialHash: 'hash-rename',
+			});
+			const updated = await updateWorkerDisplayName(created.id, 'ada-desktop');
+			expect(updated?.displayName).toBe('ada-desktop');
+			expect((await getWorkerById(created.id))?.displayName).toBe('ada-desktop');
+		});
+
+		it('returns undefined for a missing id', async () => {
+			expect(
+				await updateWorkerDisplayName('00000000-0000-4000-8000-000000000000', 'new-name'),
+			).toBeUndefined();
+		});
+
+		it('rejects with a unique violation when the owner already has another worker by that name', async () => {
+			await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-laptop',
+				capabilities: ['claude'],
+				credentialHash: 'hash-rename-a',
+			});
+			const second = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-desktop',
+				capabilities: ['claude'],
+				credentialHash: 'hash-rename-b',
+			});
+
+			await expect(updateWorkerDisplayName(second.id, 'ada-laptop')).rejects.toThrow();
 		});
 	});
 

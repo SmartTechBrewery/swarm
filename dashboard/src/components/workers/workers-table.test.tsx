@@ -58,7 +58,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		currentRun: null,
-		enrollments: [{ projectId: 'proj-a', status: 'active' }],
+		enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude', 'codex'] }],
 		...overrides,
 	};
 }
@@ -211,6 +211,89 @@ describe('WorkersTable row content', () => {
 
 		expect(screen.queryByText('planning')).toBeNull();
 		expect(screen.getByText('claude')).toBeDefined();
+	});
+
+	it('shows only the CLIs at least one enrollment actually allows, not every declared capability', () => {
+		// The machine declares three CLIs but this project only turned on one —
+		// the chip for the other two would mislead an operator into thinking they
+		// can be dispatched here.
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						capabilities: ['claude', 'antigravity', 'codex'],
+						enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] }],
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.getByText('claude')).toBeDefined();
+		expect(screen.queryByText('antigravity')).toBeNull();
+		expect(screen.queryByText('codex')).toBeNull();
+	});
+
+	it('unions allowed CLIs across every visible enrollment rather than picking one project', () => {
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						capabilities: ['claude', 'antigravity', 'codex'],
+						enrollments: [
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+							{ projectId: 'proj-b', status: 'active', allowedClis: ['antigravity'] },
+						],
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.getByText('claude')).toBeDefined();
+		expect(screen.getByText('antigravity')).toBeDefined();
+		expect(screen.queryByText('codex')).toBeNull();
+	});
+
+	it('ignores allowed CLIs from a pending or suspended enrollment, not just an active one', () => {
+		// A pending or revoked enrollment's allowedClis are not currently
+		// dispatchable — unioning them in would show a chip for a CLI no
+		// active enrollment actually permits on this machine.
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						capabilities: ['claude', 'antigravity', 'codex'],
+						enrollments: [
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+							{ projectId: 'proj-b', status: 'pending', allowedClis: ['antigravity'] },
+							{ projectId: 'proj-c', status: 'suspended', allowedClis: ['codex'] },
+						],
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.getByText('claude')).toBeDefined();
+		expect(screen.queryByText('antigravity')).toBeNull();
+		expect(screen.queryByText('codex')).toBeNull();
+	});
+
+	it('shows no CLI chip for a registered-but-un-enrolled machine, even though it declares CLIs', () => {
+		// No project has allowed anything on it yet — the planning badge (a
+		// separate axis) may still show, but no CLI chip should.
+		renderTable(<WorkersTable workers={[makeWorker({ enrollments: [] })]} />);
+
+		expect(screen.queryByText('claude')).toBeNull();
+		expect(screen.queryByText('codex')).toBeNull();
+	});
+
+	it('shows an em dash when a machine can neither plan nor run any allowed CLI', () => {
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ supportedPhases: ['implementation'], enrollments: [] })]}
+			/>,
+		);
+
+		expect(screen.getAllByText('—').length).toBeGreaterThan(0);
 	});
 
 	it('renders one row per worker', () => {
@@ -382,8 +465,8 @@ describe('WorkersTable Available column (issue #473)', () => {
 				workers={[
 					makeWorker({
 						enrollments: [
-							{ projectId: 'proj-a', status: 'active' },
-							{ projectId: 'proj-b', status: 'active' },
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude', 'codex'] },
+							{ projectId: 'proj-b', status: 'active', allowedClis: ['claude', 'codex'] },
 						],
 					}),
 				]}

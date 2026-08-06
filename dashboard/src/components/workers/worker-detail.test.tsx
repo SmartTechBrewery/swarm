@@ -6,14 +6,14 @@ import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerDetail, WorkerDetailEnrollment } from '@/types/workers.js';
 
-const { setConsentMutate, updateConstraintsMutate, approveMutate, setStatusMutate } = vi.hoisted(
-	() => ({
+const { setConsentMutate, updateConstraintsMutate, approveMutate, setStatusMutate, renameMutate } =
+	vi.hoisted(() => ({
 		setConsentMutate: vi.fn(),
 		updateConstraintsMutate: vi.fn(),
 		approveMutate: vi.fn(),
 		setStatusMutate: vi.fn(),
-	}),
-);
+		renameMutate: vi.fn(),
+	}));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {},
@@ -23,6 +23,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			updateConstraints: { mutate: updateConstraintsMutate },
 			approveEnrollment: { mutate: approveMutate },
 			setStatus: { mutate: setStatusMutate },
+			rename: { mutate: renameMutate },
 		},
 	},
 }));
@@ -112,6 +113,7 @@ beforeEach(() => {
 	updateConstraintsMutate.mockReset();
 	approveMutate.mockReset();
 	setStatusMutate.mockReset();
+	renameMutate.mockReset();
 	onChanged.mockReset();
 	vi.useFakeTimers({ toFake: ['Date'] });
 	vi.setSystemTime(NOW);
@@ -125,7 +127,11 @@ describe('WorkerDetailView sections (issue #477)', () => {
 	it('reports identity and owner, including the worker id the table drops', () => {
 		renderWorker();
 
-		expect(screen.getByText('ada-laptop')).toBeDefined();
+		// The owner sees the Machine name as an editable field (issue below), not
+		// plain text — its value is what carries the name here.
+		expect((screen.getByRole('textbox', { name: 'Machine name' }) as HTMLInputElement).value).toBe(
+			'ada-laptop',
+		);
 		expect(screen.getByText('worker-1')).toBeDefined();
 		expect(screen.getByText('Ada Lovelace')).toBeDefined();
 		expect(screen.getByText('ada@example.com')).toBeDefined();
@@ -484,6 +490,10 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 	it('shows a non-owner every value, with no control that would be rejected', () => {
 		renderWorker({ viewerIsOwner: false });
 
+		// The Machine name is plain text for a non-owner, not the editable field.
+		expect(screen.queryByRole('textbox', { name: 'Machine name' })).toBeNull();
+		expect(screen.getByText('ada-laptop')).toBeDefined();
+
 		const readOnly = screen.getByRole('switch', { name: 'Sharing of ada-laptop with Widgets' });
 		expect((readOnly as HTMLButtonElement).disabled).toBe(true);
 		expect(readOnly.getAttribute('title')).toContain('Ada Lovelace');
@@ -508,6 +518,51 @@ describe('WorkerDetailView owner-controlled values (issue #282 authorization)', 
 
 		expect(within(section('Project enrollments')).getByText('1')).toBeDefined();
 		expect(screen.queryByText('No limit')).toBeNull();
+	});
+});
+
+describe('WorkerDetailView machine name (owner-only rename)', () => {
+	it('lets the owner rename the machine, applying it and reporting the outcome', async () => {
+		renameMutate.mockResolvedValue({});
+		renderWorker();
+
+		const input = screen.getByRole('textbox', { name: 'Machine name' }) as HTMLInputElement;
+		fireEvent.change(input, { target: { value: 'ada-desktop' } });
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+		await waitFor(() =>
+			expect(renameMutate).toHaveBeenCalledWith({
+				workerId: 'worker-1',
+				displayName: 'ada-desktop',
+			}),
+		);
+		await waitFor(() => expect(onChanged).toHaveBeenCalled());
+	});
+
+	it('disables Save until the draft actually changes', () => {
+		renderWorker();
+
+		expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+	});
+
+	it('disables Save for an empty draft rather than sending it', () => {
+		renderWorker();
+
+		const input = screen.getByRole('textbox', { name: 'Machine name' }) as HTMLInputElement;
+		fireEvent.change(input, { target: { value: '   ' } });
+
+		expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+	});
+
+	it('shows the server’s rejection verbatim — a duplicate name', async () => {
+		renameMutate.mockRejectedValue(new Error('You already have a worker with this name.'));
+		renderWorker();
+
+		const input = screen.getByRole('textbox', { name: 'Machine name' }) as HTMLInputElement;
+		fireEvent.change(input, { target: { value: 'ada-desktop' } });
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+		expect(await screen.findByText('You already have a worker with this name.')).toBeDefined();
 	});
 });
 

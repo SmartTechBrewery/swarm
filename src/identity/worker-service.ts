@@ -6,11 +6,11 @@
  * (ADR-001).
  *
  * Unlike those read-only services this one also owns the worker's credential and
- * the register/refresh writes — the same way `./auth.ts` bundles the session
- * token primitives with `createSession`, rather than splitting a two-line secret
- * into its own module. Reads (`getWorker`, `listWorkersForOwner`) and the
- * authentication seam (`resolveWorkerByCredential`) round out the surface Phase
- * 2's lease/heartbeat operations authenticate through.
+ * the register/refresh/rename writes — the same way `./auth.ts` bundles the
+ * session token primitives with `createSession`, rather than splitting a
+ * two-line secret into its own module. Reads (`getWorker`, `listWorkersForOwner`)
+ * and the authentication seam (`resolveWorkerByCredential`) round out the
+ * surface Phase 2's lease/heartbeat operations authenticate through.
  *
  * The worker credential is a high-entropy random token (not a low-entropy
  * password), so — exactly like a session token (`./auth.ts` `hashSessionToken`)
@@ -29,6 +29,7 @@ import {
 	getWorkerById,
 	listWorkersForOwner as listWorkersForOwnerRows,
 	updateWorkerCapabilities,
+	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
@@ -147,6 +148,18 @@ export async function declareWorkerSupportedPhases(
 ): Promise<Worker | undefined> {
 	const validated = WorkerSupportedPhasesSchema.parse(supportedPhases);
 	return updateWorkerSupportedPhases(id, validated);
+}
+
+/**
+ * Rename a worker — the owner's own label for their machine. Validates the name
+ * ({@link WorkerDisplayNameSchema}) and returns the updated worker, or
+ * `undefined` if no worker has that id. Rejects with the repository's pg
+ * `23505` unique violation if the owner already has another worker by that
+ * name; the caller decides how to surface that.
+ */
+export async function renameWorker(id: string, displayName: string): Promise<Worker | undefined> {
+	const validated = WorkerDisplayNameSchema.parse(displayName);
+	return updateWorkerDisplayName(id, validated);
 }
 
 /** Resolve a worker by id. Returns `undefined` if unknown. */

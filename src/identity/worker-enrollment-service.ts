@@ -334,10 +334,17 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
  */
 export type WorkerConnectionState = 'online' | 'offline';
 
-/** One enrollment as the dashboard roster shows it — project + approval state, nothing operable. */
+/**
+ * One enrollment as the dashboard roster shows it — project + approval state,
+ * nothing operable, plus the enrollment's own `allowedClis` (a subset of the
+ * worker's declared `capabilities`) so the roster's Capabilities column can
+ * show what this project may actually run on the worker rather than everything
+ * the machine merely declares.
+ */
 export interface DashboardEnrollmentView {
 	projectId: string;
 	status: EnrollmentStatus;
+	allowedClis: AgentCli[];
 }
 
 /**
@@ -558,6 +565,7 @@ async function assembleDashboardWorker(
 		enrollments: enrollments.map((enrollment) => ({
 			projectId: enrollment.projectId,
 			status: enrollment.status,
+			allowedClis: enrollment.allowedClis,
 		})),
 	};
 }

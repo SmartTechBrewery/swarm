@@ -237,6 +237,25 @@ export async function updateWorkerSupportedPhases(
 }
 
 /**
+ * Rename a worker (the owner's own machine label). Rejects with the pg `23505`
+ * unique violation if the owner already has another worker by that
+ * `displayName` — the caller decides how to surface that, exactly as
+ * {@link createWorker} does. Returns the updated worker, or `undefined` if no
+ * worker has that id.
+ */
+export async function updateWorkerDisplayName(
+	id: string,
+	displayName: string,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({ displayName })
+		.where(eq(workers.id, id))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
  * Remove a worker (owner deregistration). Returns `true` if a worker was removed,
  * `false` if none had that id (a no-op, not an error).
  */

@@ -1,8 +1,11 @@
+import { useMutation } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
+import { trpcClient } from '@/lib/trpc.js';
+import { useDraftSync } from '@/lib/use-draft-sync.js';
 import type { WorkerDetail } from '@/types/workers.js';
 
 /**
@@ -18,6 +21,13 @@ import type { WorkerDetail } from '@/types/workers.js';
  * view reports them and never offers to edit them — an edit here would only make
  * the dashboard disagree with the machine until its next heartbeat.
  *
+ * **The machine's own name is the one Identity-card fact that *is* editable** —
+ * unlike the self-declared facts above, `displayName` is the owner's own label,
+ * not something the daemon states, so there is nothing for an edit to disagree
+ * with ({@link WorkerNameField}). Gated by `viewerIsOwner` exactly like the
+ * enrollment card's owner-controlled values, and by the same strict-ownership
+ * check server-side (`workers.rename`, no `instanceAdmin` override).
+ *
  * **Nothing secret is on this surface**, by construction rather than by filtering:
  * its only source is the `workers.getById` read model, which names each safe field
  * explicitly, so no machine path, worker credential, credential hash, or project
@@ -31,6 +41,10 @@ const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm'
 const SECTION_HEADING_CLASS =
 	'text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4';
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400';
+const FIELD_CLASS =
+	'block w-full max-w-xs px-3 py-1.5 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
+const SECONDARY_BUTTON_CLASS =
+	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
 /** One labelled read-only field of the identity/connectivity grids. */
 function Field({ label, children, mono }: { label: string; children: ReactNode; mono?: boolean }) {
@@ -47,6 +61,69 @@ function Field({ label, children, mono }: { label: string; children: ReactNode; 
 }
 
 const EM_DASH = <span className="text-zinc-500">—</span>;
+
+/**
+ * The machine's own label, editable only by its owner (`workers.rename`, strict
+ * ownership, no `instanceAdmin` override — mirrors the enrollment card's
+ * {@link WorkerEnrollmentCard} controls). A non-owner sees the plain name, same
+ * as every other Identity field. Draft-and-save rather than save-per-keystroke,
+ * the same shape as the enrollment card's concurrency control: a free-text field
+ * can't safely fire a mutation on every keystroke, and a draft re-syncs from the
+ * server's value whenever it actually changes so the screen's polling can't
+ * clobber a half-typed edit.
+ */
+function WorkerNameField({
+	workerId,
+	displayName,
+	editable,
+	onChanged,
+}: {
+	workerId: string;
+	displayName: string;
+	editable: boolean;
+	onChanged: () => void;
+}) {
+	const [draft, setDraft] = useDraftSync(displayName, (name) => name);
+
+	const renameMutation = useMutation({
+		mutationFn: (nextDisplayName: string) =>
+			trpcClient.workers.rename.mutate({ workerId, displayName: nextDisplayName }),
+		onSuccess: onChanged,
+	});
+
+	if (!editable) return <>{displayName}</>;
+
+	const trimmed = draft.trim();
+	const unchanged = trimmed === displayName;
+	const invalid = trimmed.length === 0;
+
+	return (
+		<div className="space-y-1.5">
+			<div className="flex items-center gap-2">
+				<input
+					aria-label="Machine name"
+					type="text"
+					value={draft}
+					onChange={(event) => setDraft(event.target.value)}
+					disabled={renameMutation.isPending}
+					maxLength={80}
+					className={FIELD_CLASS}
+				/>
+				<button
+					type="button"
+					onClick={() => renameMutation.mutate(trimmed)}
+					disabled={renameMutation.isPending || unchanged || invalid}
+					className={SECONDARY_BUTTON_CLASS}
+				>
+					Save
+				</button>
+			</div>
+			{renameMutation.isError ? (
+				<p className="text-xs text-red-400">{renameMutation.error.message}</p>
+			) : null}
+		</div>
+	);
+}
 
 function ConnectionState({ worker }: { worker: WorkerDetail }) {
 	const online = worker.connection === 'online';
@@ -121,7 +198,14 @@ export function WorkerDetailView({
 			<div className={CARD_CLASS}>
 				<h2 className={SECTION_HEADING_CLASS}>Identity</h2>
 				<div className="grid gap-4 grid-cols-1 md:grid-cols-2">
-					<Field label="Machine">{worker.displayName}</Field>
+					<Field label="Machine">
+						<WorkerNameField
+							workerId={worker.workerId}
+							displayName={worker.displayName}
+							editable={worker.viewerIsOwner}
+							onChanged={onChanged}
+						/>
+					</Field>
 					<Field label="Worker ID" mono>
 						{worker.workerId}
 					</Field>
