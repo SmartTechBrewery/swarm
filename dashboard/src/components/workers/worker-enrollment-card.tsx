@@ -132,8 +132,6 @@ interface WorkerEnrollmentCardProps {
 	supportedPhases: string[];
 	/** Phases this project has turned off for every worker (`pipeline.<phase>.enabled: false`). */
 	projectDisabledPhases: string[];
-	/** Whether `planning` may ever be allowed here — only an instance admin's own worker. */
-	ownerIsInstanceAdmin: boolean;
 	projectName: string;
 	/** Whether the viewer may change the owner-controlled values (consent, constraints). */
 	viewerIsOwner: boolean;
@@ -278,7 +276,6 @@ export function WorkerEnrollmentCard({
 	capabilities,
 	supportedPhases,
 	projectDisabledPhases,
-	ownerIsInstanceAdmin,
 	projectName,
 	viewerIsOwner,
 	ownerName,
@@ -439,7 +436,6 @@ export function WorkerEnrollmentCard({
 						allowedPhases={enrollment.allowedPhases}
 						supportedPhases={supportedPhases}
 						projectDisabledPhases={projectDisabledPhases}
-						ownerIsInstanceAdmin={ownerIsInstanceAdmin}
 						editable={viewerIsOwner}
 						pending={phasesMutation.isPending}
 						ownerName={ownerName}
@@ -647,7 +643,6 @@ function AllowedPhasesControl({
 	allowedPhases,
 	supportedPhases,
 	projectDisabledPhases,
-	ownerIsInstanceAdmin,
 	editable,
 	pending,
 	ownerName,
@@ -656,7 +651,6 @@ function AllowedPhasesControl({
 	allowedPhases: string[];
 	supportedPhases: string[];
 	projectDisabledPhases: string[];
-	ownerIsInstanceAdmin: boolean;
 	editable: boolean;
 	pending: boolean;
 	ownerName: string;
@@ -666,7 +660,6 @@ function AllowedPhasesControl({
 		allowedPhases,
 		supportedPhases,
 		projectDisabledPhases,
-		ownerIsInstanceAdmin,
 	});
 	if (!editable) {
 		return (
@@ -680,10 +673,7 @@ function AllowedPhasesControl({
 					options
 						.filter((option) => option.allowed)
 						.map((option) => (
-							<Badge
-								key={option.phase}
-								tone={option.unavailable || option.phase === 'planning' ? 'caution' : 'neutral'}
-							>
+							<Badge key={option.phase} tone={option.unavailable ? 'caution' : 'neutral'}>
 								{formatPhase(option.phase)}
 							</Badge>
 						))

@@ -63,7 +63,6 @@ import {
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import type { TriggerPhase } from '../triggers/types.js';
-import { isInstanceAdmin } from './schema.js';
 import type { Worker } from './worker.js';
 import type { WorkerAvailability } from './worker-eligibility.js';
 import {
@@ -75,7 +74,6 @@ import {
 	EnrollmentAllowedPhasesSchema,
 	type EnrollmentStatus,
 	isRoutable,
-	PlanningRequiresInstanceAdminError,
 	type WorkerEnrollment,
 } from './worker-enrollment.js';
 import { getLiveSessionForWorker, getRetainedSessionForWorker } from './worker-session-service.js';
@@ -91,7 +89,6 @@ export {
 	type EnrollmentStatus,
 	EnrollmentStatusSchema,
 	isRoutable,
-	PlanningRequiresInstanceAdminError,
 	permitsPhase,
 	type WorkerEnrollment,
 } from './worker-enrollment.js';
@@ -112,12 +109,6 @@ export interface RosterOwner {
 	userId: string;
 	identifier: string;
 	displayName: string;
-	/**
-	 * Whether this owner is an instance admin — the fact that decides, independent
-	 * of anything a daemon self-declares, whether `planning` may ever be allowed on
-	 * one of their workers ({@link PlanningRequiresInstanceAdminError}).
-	 */
-	instanceAdmin: boolean;
 }
 
 /** One row of the project roster read model — secret-free by construction. */
@@ -261,7 +252,6 @@ export async function listProjectRoster(projectId: string): Promise<WorkerRoster
 					userId: ownerUser.id,
 					identifier: ownerUser.identifier,
 					displayName: ownerUser.displayName,
-					instanceAdmin: isInstanceAdmin(ownerUser),
 				}
 			: null;
 		const runState = await deriveWorkerRunState(worker.id);
@@ -566,7 +556,6 @@ async function assembleDashboardWorker(
 					userId: ownerUser.id,
 					identifier: ownerUser.identifier,
 					displayName: ownerUser.displayName,
-					instanceAdmin: isInstanceAdmin(ownerUser),
 				}
 			: null,
 		capabilities: worker.capabilities,
@@ -670,13 +659,8 @@ export interface EnrollWorkerInput {
 export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnrollment> {
 	const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
 	assertClisWithinCapabilities(input.worker, allowedClis);
-	const parsedAllowedPhases = EnrollmentAllowedPhasesSchema.parse(
+	const allowedPhases = EnrollmentAllowedPhasesSchema.parse(
 		input.allowedPhases ?? [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
-	);
-	const allowedPhases = await restrictPlanningToInstanceAdminOwner(
-		input.worker,
-		parsedAllowedPhases,
-		input.allowedPhases !== undefined,
 	);
 	const concurrencyAllocation = ConcurrencyAllocationSchema.parse(
 		input.concurrencyAllocation ?? DEFAULT_CONCURRENCY_ALLOCATION,
@@ -699,43 +683,6 @@ function assertClisWithinCapabilities(worker: Worker, allowedClis: AgentCli[]): 
 	if (offending.length > 0) {
 		throw new AllowedClisNotCapableError(worker.id, offending);
 	}
-}
-
-/**
- * `planning` may only ever be allowed on an instance admin's own worker
- * ({@link PlanningRequiresInstanceAdminError}) — independent of what the
- * worker's daemon self-declares in `supportedPhases`. `explicit` distinguishes
- * the two ways `planning` can end up in `allowedPhases`: a caller who asked for
- * it by name gets a clean rejection (mirrors
- * {@link assertClisWithinCapabilities}); `enrollWorker`'s
- * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES} fallback, which names every phase
- * because a new enrollment is meant to constrain nothing beyond what already
- * constrains the worker, has it filtered out silently instead — ownership is
- * exactly such a pre-existing constraint, not a deliberate ask.
- *
- * **One of the two reasons this rule had is gone (issue #536), and the rule is
- * deliberately unchanged.** It used to rest partly on capability: only the instance
- * admin's machine was ever handed the `DATABASE_URL`/`REDIS_URL` Planning needed, so
- * granting the phase elsewhere could only produce work that never ran. A DB-free
- * worker now runs Planning, so that half no longer applies. What remains is the
- * *authorization* half, which was always the stronger one: Planning is the only
- * phase that creates board structure — new work items, dependency edges, a re-scoped
- * parent — so a mistaken or hostile run writes wrong structure onto a live board
- * rather than failing one task. Widening who may be granted it is a trust decision
- * about board authorship, not a consequence of the phase becoming portable, and it
- * needs its own issue. Until then a hosted instance runs Planning on an admin-owned
- * DB-free daemon, which #536 makes possible for the first time.
- */
-async function restrictPlanningToInstanceAdminOwner(
-	worker: Worker,
-	allowedPhases: TriggerPhase[],
-	explicit: boolean,
-): Promise<TriggerPhase[]> {
-	if (!allowedPhases.includes('planning')) return allowedPhases;
-	const ownerUser = await getUserById(worker.ownerUserId);
-	if (ownerUser && isInstanceAdmin(ownerUser)) return allowedPhases;
-	if (explicit) throw new PlanningRequiresInstanceAdminError(worker.id);
-	return allowedPhases.filter((phase) => phase !== 'planning');
 }
 
 /** Resolve an enrollment by id — the read the router uses before an ownership/authz check. */
@@ -827,12 +774,7 @@ export async function updateEnrollmentConstraints(
 		patch.allowedClis = allowedClis;
 	}
 	if (input.allowedPhases !== undefined) {
-		const allowedPhases = EnrollmentAllowedPhasesSchema.parse(input.allowedPhases);
-		patch.allowedPhases = await restrictPlanningToInstanceAdminOwner(
-			input.worker,
-			allowedPhases,
-			true,
-		);
+		patch.allowedPhases = EnrollmentAllowedPhasesSchema.parse(input.allowedPhases);
 	}
 	if (input.concurrencyAllocation !== undefined) {
 		patch.concurrencyAllocation = ConcurrencyAllocationSchema.parse(input.concurrencyAllocation);

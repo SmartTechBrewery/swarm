@@ -13,7 +13,6 @@ import {
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
-	PlanningRequiresInstanceAdminError,
 	setEnrollmentStatus,
 	setSharingConsent,
 	updateEnrollmentConstraints,
@@ -255,9 +254,6 @@ export const workersRouter = router({
 				if (error instanceof AllowedClisNotCapableError) {
 					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
 				}
-				if (error instanceof PlanningRequiresInstanceAdminError) {
-					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
-				}
 				if (isUniqueViolation(error)) {
 					throw new TRPCError({
 						code: 'CONFLICT',
@@ -311,9 +307,6 @@ export const workersRouter = router({
 				return updated;
 			} catch (error) {
 				if (error instanceof AllowedClisNotCapableError) {
-					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
-				}
-				if (error instanceof PlanningRequiresInstanceAdminError) {
 					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
 				}
 				throw error;

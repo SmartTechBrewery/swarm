@@ -7,11 +7,12 @@ import type { ReactNode } from 'react';
  * routing verdict. One geometry everywhere, so the same fact reads identically
  * wherever it appears and nothing is emphasized by being *bigger*.
  *
- * Only the hue varies: the three status hues carry state (approved /
- * awaiting-approval / suspended), and `caution` doubles as the one that
- * promotes a badge in a set (the `planning` phase, issue #467) — the same amber
- * whether or not that instance of `planning` is otherwise flagged unavailable.
- * Reach for a new tone here rather than hand-rolling a second pill.
+ * Only the hue varies, and it always carries *state*: approved / awaiting-approval
+ * / suspended, or an allowed phase that currently cannot take work. It is
+ * deliberately not a way to promote one member of a set — `caution` used to double
+ * as that for the `planning` phase, which is how Planning came to read as a
+ * special, differently-trusted thing on two screens (issue #542). Reach for a new
+ * tone here rather than hand-rolling a second pill.
  */
 
 const BADGE_BASE =

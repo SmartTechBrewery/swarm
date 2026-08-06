@@ -125,30 +125,25 @@ function effectiveClis(worker: WorkerRow): string[] {
 }
 
 /**
- * What the machine can run, on both capability axes (issue #467). A `PLANNING`
- * badge leads when the daemon declared that phase, in the same caution amber as
- * the Allowed-pipeline-phases planning badge, so it reads ahead of the neutral
- * CLI badges beside it: unlike a CLI, it is the one
- * capability an operator cannot infer from the machine's tooling — a DB-free
- * remote daemon has every CLI and still refuses Planning — and it decides whether
- * board work can start here at all. Every other declared phase is deliberately
- * left off: they are the common case, and listing six chips per row would bury
- * the one that distinguishes machines. The CLI chips themselves are the
+ * What the machine can run: the CLIs at least one visible enrollment allows — the
  * *effective* set ({@link effectiveClis}), not the raw declared capabilities.
+ *
+ * No phase is listed here (issue #542). This column used to lead with an amber
+ * `PLANNING` badge, on the argument that Planning was the one capability an
+ * operator could not infer from the machine's tooling because a DB-free remote
+ * daemon refused it; issue #536 made every daemon run every phase, so the badge
+ * distinguished nothing while still reading as though Planning were a special,
+ * differently-trusted thing. The declared phase repertoire — which still varies
+ * across daemon builds (issue #467) — is on the worker detail screen, in full and
+ * with no phase promoted over another.
  */
 function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
-	const canPlan = worker.supportedPhases.includes('planning');
 	const clis = effectiveClis(worker);
-	if (!canPlan && clis.length === 0) {
+	if (clis.length === 0) {
 		return <span className="text-sm text-zinc-500">—</span>;
 	}
 	return (
 		<div className="flex flex-wrap gap-1">
-			{canPlan ? (
-				<Badge tone="caution" title="This machine's daemon can run the Planning phase">
-					planning
-				</Badge>
-			) : null}
 			{clis.map((cli) => (
 				<Badge key={cli}>{cli}</Badge>
 			))}

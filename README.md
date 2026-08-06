@@ -164,10 +164,10 @@ the daemon declares its phase repertoire at handshake, the control plane never
 routes a phase to a worker that cannot run it and the work waits for one that can
 (issue #467) — which still matters for a daemon built before #536, since it declares
 only five; the worker-side gate fails such an assignment cleanly as a backstop.
-Separately, an enrollment may be *permitted* `planning` only on an instance admin's
-own worker: Planning is the only phase that creates board structure, so who may
-author it is a trust decision rather than a capability one. It is **additive**: the
-same-machine `npm run dev:worker` path above is unchanged. See
+Every worker has the same permissions: which phases a project may give a machine is
+the enrollment's own choice, made by the worker's owner and approved by a project
+administrator, with no reference to who owns the machine (issue #542). It is
+**additive**: the same-machine `npm run dev:worker` path above is unchanged. See
 [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md#remote-worker-transport-worker).
 
 Open <http://localhost:5173>. For a compiled self-hosted dashboard, run
