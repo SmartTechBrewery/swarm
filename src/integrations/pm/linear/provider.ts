@@ -57,8 +57,11 @@ import { requireStateIdForStatusKey, resolveStatusKeyByStateId } from './status-
  * deliberately generous, as on the GitHub side: `WorkItem.labels` drives the
  * automation gate (ai/ARCHITECTURE.md "Automation opt-in gate"), so a label
  * truncated off the end of the page would read as "not opted in" and silently
- * halt the pipeline. Linear's `state.type` is not selected — see
- * {@link LinearPMProvider.discoverStates} for why it has nowhere to go.
+ * halt the pipeline. Attachments use the same generous page size: the original
+ * GitHub issue link supplies `taskRef`, and missing it would make the phase
+ * dispatcher log-and-skip an otherwise linked card. Linear's `state.type` is
+ * not selected — see {@link LinearPMProvider.discoverStates} for why it has
+ * nowhere to go.
  */
 const ISSUE_FIELDS = /* GraphQL */ `
 	id
@@ -221,10 +224,12 @@ function mapAssignees(issue: IssueNode): WorkItemAssignee[] {
  * shared code resolves a pipeline phase from, so no caller inverts
  * `statusOptions` itself (ai/RULES.md §2).
  *
- * `taskRef` comes only from a GitHub issue or pull-request attachment in this
- * project's repository. A Linear-native number would name an unrelated GitHub
- * issue in the PR closing keyword, so an unlinked card leaves it unset and cannot
- * start an SCM-driven phase (ai/ARCHITECTURE.md "Task identity").
+ * `taskRef` comes only from a GitHub issue attachment in this project's
+ * repository. A pull-request attachment is an artifact link, not a task id, so
+ * it cannot replace the issue link when a card has both. A Linear-native number
+ * would name an unrelated GitHub issue in the PR closing keyword, so an unlinked
+ * card leaves it unset and cannot start an SCM-driven phase (ai/ARCHITECTURE.md
+ * "Task identity").
  */
 function toWorkItem(
 	issue: IssueNode & { id: string },
@@ -250,7 +255,7 @@ function toWorkItem(
 
 function taskRefFromAttachments(issue: IssueNode, repository: string): string | undefined {
 	const artifactUrl = new RegExp(
-		`^https://github\\.com/${escapeRegExp(repository)}/(?:issues|pull)/(\\d+)(?:[/?#]|$)`,
+		`^https://github\\.com/${escapeRegExp(repository)}/issues/(\\d+)(?:[/?#]|$)`,
 	);
 	for (const attachment of issue.attachments?.nodes ?? []) {
 		const match = attachment?.url?.match(artifactUrl);

@@ -109,20 +109,55 @@ describe('LinearPMProvider', () => {
 			expect(linearGraphQL.mock.calls[0]?.[0]).not.toContain('identifier');
 		});
 
-		it('takes taskRef only from a GitHub artifact attachment in this project repository', async () => {
+		it('takes taskRef only from a GitHub issue attachment in this project repository', async () => {
 			linearGraphQL.mockResolvedValue({
 				issue: {
 					...ISSUE_NODE,
 					attachments: {
 						nodes: [
 							{ url: 'https://github.com/another/repo/issues/9' },
-							{ url: 'https://github.com/SmartTechBrewery/swarm/pull/19/files' },
+							{ url: 'https://github.com/SmartTechBrewery/swarm/issues/19/comments' },
 						],
 					},
 				},
 			});
 
 			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({ taskRef: '19' });
+		});
+
+		it.each([
+			[
+				'https://github.com/SmartTechBrewery/swarm/pull/205',
+				'https://github.com/SmartTechBrewery/swarm/issues/100',
+			],
+			[
+				'https://github.com/SmartTechBrewery/swarm/issues/100',
+				'https://github.com/SmartTechBrewery/swarm/pull/205',
+			],
+		])('uses the issue attachment as taskRef regardless of attachment order', async (...urls) => {
+			linearGraphQL.mockResolvedValue({
+				issue: {
+					...ISSUE_NODE,
+					attachments: { nodes: urls.map((url) => ({ url })) },
+				},
+			});
+
+			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({ taskRef: '100' });
+		});
+
+		it('does not use a pull-request attachment as a taskRef fallback', async () => {
+			linearGraphQL.mockResolvedValue({
+				issue: {
+					...ISSUE_NODE,
+					attachments: {
+						nodes: [{ url: 'https://github.com/SmartTechBrewery/swarm/pull/205' }],
+					},
+				},
+			});
+
+			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({
+				taskRef: undefined,
+			});
 		});
 
 		it('leaves statusKey unset for an unmapped state and assignees empty when nobody is assigned', async () => {
