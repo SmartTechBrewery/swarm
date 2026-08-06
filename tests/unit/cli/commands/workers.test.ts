@@ -32,24 +32,30 @@ const { findUserByIdentifier, listUsers } = vi.hoisted(() => ({
 const { closeDb } = vi.hoisted(() => ({ closeDb: vi.fn() }));
 const { findProjectByIdFromDb } = vi.hoisted(() => ({ findProjectByIdFromDb: vi.fn() }));
 const { getEnrollment } = vi.hoisted(() => ({ getEnrollment: vi.fn() }));
-const { enrollWorker, approveEnrollment, setSharingConsent, AllowedClisNotCapableError } =
-	vi.hoisted(() => {
-		class AllowedClisNotCapableError extends Error {
-			constructor(
-				public workerId: string,
-				public offending: string[],
-			) {
-				super(`not capable: ${offending.join(', ')}`);
-				this.name = 'AllowedClisNotCapableError';
-			}
+const {
+	enrollWorker,
+	approveEnrollment,
+	setSharingConsent,
+	updateEnrollmentConstraints,
+	AllowedClisNotCapableError,
+} = vi.hoisted(() => {
+	class AllowedClisNotCapableError extends Error {
+		constructor(
+			public workerId: string,
+			public offending: string[],
+		) {
+			super(`not capable: ${offending.join(', ')}`);
+			this.name = 'AllowedClisNotCapableError';
 		}
-		return {
-			enrollWorker: vi.fn(),
-			approveEnrollment: vi.fn(),
-			setSharingConsent: vi.fn(),
-			AllowedClisNotCapableError,
-		};
-	});
+	}
+	return {
+		enrollWorker: vi.fn(),
+		approveEnrollment: vi.fn(),
+		setSharingConsent: vi.fn(),
+		updateEnrollmentConstraints: vi.fn(),
+		AllowedClisNotCapableError,
+	};
+});
 
 vi.mock('@/identity/worker-service.js', () => ({
 	registerWorker,
@@ -62,6 +68,7 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	enrollWorker,
 	approveEnrollment,
 	setSharingConsent,
+	updateEnrollmentConstraints,
 	AllowedClisNotCapableError,
 }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
@@ -132,6 +139,15 @@ describe('swarm workers', () => {
 		}));
 		approveEnrollment.mockReset().mockResolvedValue({ id: 'enr-1', status: 'active' });
 		setSharingConsent.mockReset().mockResolvedValue({ id: 'enr-1', sharingConsent: false });
+		updateEnrollmentConstraints.mockReset().mockImplementation(async (input) => ({
+			id: input.enrollmentId,
+			workerId: WORKER_ID,
+			projectId: PROJECT_ID,
+			status: 'active',
+			allowedClis: input.allowedClis ?? ['claude'],
+			concurrencyAllocation: input.concurrencyAllocation ?? 1,
+			sharingConsent: true,
+		}));
 	});
 
 	describe('register', () => {
@@ -324,6 +340,86 @@ describe('swarm workers', () => {
 		});
 	});
 
+	describe('update-enrollment', () => {
+		it('updates allowed CLIs without changing the stored concurrency', async () => {
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--cli', 'claude,codex'])).toBe(
+				0,
+			);
+			expect(updateEnrollmentConstraints).toHaveBeenCalledWith({
+				worker: expect.objectContaining({ id: WORKER_ID }),
+				enrollmentId: 'enr-1',
+				allowedClis: ['claude', 'codex'],
+				concurrencyAllocation: undefined,
+			});
+		});
+
+		it('updates concurrency without changing the allowed CLIs', async () => {
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--concurrency', '3'])).toBe(0);
+			expect(updateEnrollmentConstraints).toHaveBeenCalledWith({
+				worker: expect.objectContaining({ id: WORKER_ID }),
+				enrollmentId: 'enr-1',
+				allowedClis: undefined,
+				concurrencyAllocation: 3,
+			});
+		});
+
+		it('updates both constraints and reports the stored values', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(
+				await run([
+					'update-enrollment',
+					WORKER_ID,
+					PROJECT_ID,
+					'--cli',
+					'claude,codex',
+					'--concurrency',
+					'3',
+				]),
+			).toBe(0);
+			expect(log).toHaveBeenCalledWith(
+				expect.stringContaining('CLIs claude, codex, concurrency 3'),
+			);
+		});
+
+		it('requires a worker, project, and at least one constraint flag', async () => {
+			expect(await run(['update-enrollment'])).toBe(1);
+			expect(await run(['update-enrollment', WORKER_ID])).toBe(1);
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID])).toBe(1);
+			expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+		});
+
+		it('rejects invalid CLI and concurrency values before resolving an enrollment', async () => {
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--cli', 'claude,vim'])).toBe(
+				1,
+			);
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--concurrency', '0'])).toBe(1);
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--concurrency', ''])).toBe(1);
+			expect(getWorker).not.toHaveBeenCalled();
+			expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+		});
+
+		it('fails cleanly for a missing worker, project, or enrollment', async () => {
+			getWorker.mockResolvedValueOnce(undefined);
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--cli', 'claude'])).toBe(1);
+			findProjectByIdFromDb.mockResolvedValueOnce(undefined);
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--cli', 'claude'])).toBe(1);
+			getEnrollment.mockResolvedValueOnce(undefined);
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--cli', 'claude'])).toBe(1);
+			expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
+		});
+
+		it('translates an out-of-capability CLI set to a friendly error', async () => {
+			updateEnrollmentConstraints.mockRejectedValue(
+				new AllowedClisNotCapableError(WORKER_ID, ['antigravity']),
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update-enrollment', WORKER_ID, PROJECT_ID, '--cli', 'antigravity'])).toBe(
+				1,
+			);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('not capable'));
+		});
+	});
+
 	describe('approve', () => {
 		it('approves an existing enrollment', async () => {
 			expect(await run(['approve', WORKER_ID, PROJECT_ID])).toBe(0);
@@ -364,8 +460,10 @@ describe('swarm workers', () => {
 		});
 
 		it('returns 1 with no subcommand and 0 for explicit --help', async () => {
+			const log = vi.spyOn(console, 'log');
 			expect(await run([])).toBe(1);
 			expect(await run(['--help'])).toBe(0);
+			expect(log).toHaveBeenCalledWith(expect.stringContaining('update-enrollment'));
 			expect(registerWorker).not.toHaveBeenCalled();
 			expect(closeDb).not.toHaveBeenCalled();
 		});

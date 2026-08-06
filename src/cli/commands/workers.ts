@@ -25,6 +25,7 @@
  *   swarm workers set-cli <worker-id> --cli <c1,c2,...>
  *   swarm workers remove <worker-id>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
+ *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
  *   swarm workers consent <worker-id> <project-id> <on|off>
  */
@@ -42,6 +43,7 @@ import {
 	approveEnrollment,
 	enrollWorker,
 	setSharingConsent,
+	updateEnrollmentConstraints,
 } from '../../identity/worker-enrollment-service.js';
 import {
 	getWorker,
@@ -62,6 +64,7 @@ Usage:
   swarm workers set-cli <worker-id> --cli <c1,c2,...>
   swarm workers remove <worker-id>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
+  swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
   swarm workers consent <worker-id> <project-id> <on|off>
 
@@ -83,6 +86,14 @@ Usage:
              project's Maximum Concurrent Jobs. Starts pending with sharing consent
              off; --active approves it and --consent grants sharing consent at once
              (operator seeding).
+  update-enrollment
+             Change an existing enrollment's execution constraints: --cli (a
+             subset of the worker's capabilities) replaces the allowed CLIs and
+             --concurrency replaces this worker's share of the project. At least
+             one is required; an omitted flag leaves the stored value alone.
+             Approval status and sharing consent are untouched (see approve /
+             consent). Takes effect on the next dispatch — a running agent is
+             never interrupted.
   approve    Approve a pending enrollment (worker + project) → active.
   consent    Turn an enrollment's owner-controlled sharing consent on or off.
              Revoking it blocks future dispatch without stopping a running agent.
@@ -91,7 +102,16 @@ Requires DATABASE_URL. A worker is a local execution environment owned by a
 SWARM user; an enrollment offers it to a project, and it is routable only while
 active AND sharing consent is on.`;
 
-const SUBCOMMANDS = ['register', 'list', 'set-cli', 'remove', 'enroll', 'approve', 'consent'];
+const SUBCOMMANDS = [
+	'register',
+	'list',
+	'set-cli',
+	'remove',
+	'enroll',
+	'update-enrollment',
+	'approve',
+	'consent',
+];
 
 /**
  * A duplicate `(owner, displayName)` surfaces the pg `23505` unique violation,
@@ -425,6 +445,76 @@ async function enrollCommand(argv: string[]): Promise<number> {
 	);
 }
 
+async function updateEnrollmentCommand(argv: string[]): Promise<number> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		options: {
+			cli: { type: 'string' },
+			concurrency: { type: 'string' },
+			help: { type: 'boolean', short: 'h' },
+		},
+		allowPositionals: true,
+	});
+	if (values.help) {
+		out.info(USAGE);
+		return 0;
+	}
+
+	const [workerId, projectId] = positionals;
+	if (!workerId || !projectId) {
+		out.error('workers update-enrollment: <worker-id> and <project-id> are required');
+		out.info(USAGE);
+		return 1;
+	}
+	if (values.cli === undefined && values.concurrency === undefined) {
+		out.error(
+			'workers update-enrollment: pass --cli and/or --concurrency — there is nothing to update',
+		);
+		out.info(USAGE);
+		return 1;
+	}
+
+	let allowedClis: AgentCli[] | undefined;
+	if (values.cli !== undefined) {
+		allowedClis = parseClis(values.cli);
+		if (!allowedClis) return 1;
+	}
+	const concurrency = parseConcurrencyFlag(values.concurrency);
+	if (!concurrency.ok) return 1;
+
+	const resolved = await resolveWorkerAndProject(workerId, projectId);
+	if (!resolved) return 1;
+
+	const enrollment = await getEnrollment(workerId, projectId);
+	if (!enrollment) {
+		out.error(`no enrollment for worker '${workerId}' in '${projectId}'`);
+		return 1;
+	}
+
+	try {
+		const updated = await updateEnrollmentConstraints({
+			worker: resolved.worker,
+			enrollmentId: enrollment.id,
+			allowedClis,
+			concurrencyAllocation: concurrency.value,
+		});
+		if (!updated) {
+			out.error(`no enrollment for worker '${workerId}' in '${projectId}'`);
+			return 1;
+		}
+		out.info(
+			`updated enrollment for worker '${resolved.worker.displayName}' (${workerId}) in '${projectId}' — CLIs ${updated.allowedClis.join(', ')}, concurrency ${updated.concurrencyAllocation}`,
+		);
+		return 0;
+	} catch (err) {
+		if (err instanceof AllowedClisNotCapableError) {
+			out.error(err.message);
+			return 1;
+		}
+		throw err;
+	}
+}
+
 async function approveCommand(argv: string[]): Promise<number> {
 	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
 	const [workerId, projectId] = positionals;
@@ -492,6 +582,8 @@ export async function run(argv: string[]): Promise<number> {
 				return await setCliCommand(rest);
 			case 'enroll':
 				return await enrollCommand(rest);
+			case 'update-enrollment':
+				return await updateEnrollmentCommand(rest);
 			case 'approve':
 				return await approveCommand(rest);
 			case 'consent':

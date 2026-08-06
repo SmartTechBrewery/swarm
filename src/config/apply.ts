@@ -77,7 +77,7 @@ export async function applyConfig(config: SwarmConfig): Promise<ApplyResult> {
 		for (const snapshot of snapshots) {
 			await upsertCliQuota(snapshot.cli, snapshot.status, snapshot);
 		}
-	} catch (err) {
+	} catch (_err) {
 		// Log but don't fail config apply
 	}
 
