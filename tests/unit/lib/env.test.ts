@@ -5,6 +5,7 @@ import {
 	requireEnv,
 	resolveOperatorGitHubToken,
 	resolveWebhookCallbackBaseUrl,
+	resolveWorkerRepoRoot,
 } from '@/lib/env.js';
 
 describe('requireEnv', () => {
@@ -95,5 +96,15 @@ describe('resolveOperatorGitHubToken', () => {
 		expect(() => resolveOperatorGitHubToken('   ')).toThrow(
 			/Missing required environment variable: SWARM_OPERATOR_GH_TOKEN/,
 		);
+	});
+});
+
+describe('resolveWorkerRepoRoot', () => {
+	it('uses the worker-local override when configured', () => {
+		expect(resolveWorkerRepoRoot('  /remote/checkout  ', '/fallback')).toBe('/remote/checkout');
+	});
+
+	it('defaults to the daemon working directory', () => {
+		expect(resolveWorkerRepoRoot('', '/worker/swarm')).toBe('/worker/swarm');
 	});
 });

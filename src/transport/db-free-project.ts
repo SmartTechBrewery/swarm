@@ -28,10 +28,17 @@ const PLACEHOLDER_CREDENTIALS = {
 } as const;
 
 /**
- * Rebuild a full `ProjectConfig` from the assignment's non-secret slice, adding
- * the inert placeholder `credentials`. Re-validates through `ProjectConfigSchema`
- * so the result is a well-formed config the phases can run against.
+ * Rebuild a full `ProjectConfig` from the assignment's transport slice, adding
+ * the worker's own checkout path and inert placeholder `credentials`.
  */
-export function reconstructProjectConfig(slice: NonSecretProjectConfig): ProjectConfig {
-	return ProjectConfigSchema.parse({ ...slice, credentials: PLACEHOLDER_CREDENTIALS });
+export function reconstructProjectConfig(
+	slice: NonSecretProjectConfig,
+	workerRepoRoot: string,
+): ProjectConfig {
+	return ProjectConfigSchema.parse({
+		...slice,
+		// `repoRoot` is host-local execution state and never travels from the control plane.
+		repoRoot: workerRepoRoot,
+		credentials: PLACEHOLDER_CREDENTIALS,
+	});
 }

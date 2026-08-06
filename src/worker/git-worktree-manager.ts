@@ -21,15 +21,12 @@ import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
 import { SCRATCH_PATHSPECS } from '../scm/delivery.js';
-import { hasLiveWorktreeLeaseOwner } from '../worktree/lease-liveness.js';
-import { BlockedRecoveryError, evaluateWorktreeReclaim } from '../worktree/reclaim.js';
 import {
-	claimWorktreeLease,
-	readWorktreeLease,
-	releaseWorktreeLease,
-	takeOverWorktreeLease,
-	tryClaimWorktreeLease,
-} from '../worktree/worktree-lease.js';
+	BlockedRecoveryError,
+	evaluateWorktreeReclaim,
+	type ReclaimDecision,
+} from '../worktree/reclaim.js';
+import { storeBackedWorktreeRuntime, type WorktreeRuntime } from '../worktree/worktree-runtime.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -58,6 +55,13 @@ function collisionMessage(taskId: string, path: string, detail: string): string 
 		`Worktree collision for task '${taskId}' at ${path}: the existing checkout ${detail}, ` +
 		'so SWARM will not reclaim it automatically. Inspect it, push or discard any work, then ' +
 		'remove it (`git worktree remove` or `swarm worktrees prune`) before re-running.'
+	);
+}
+
+function provisionContentionMessage(taskId: string, path: string, detail: string): string {
+	return (
+		`Worktree provisioning for task '${taskId}' at ${path} is already in progress: ${detail}. ` +
+		'Wait for the host-local provisioner to finish, then re-run the task.'
 	);
 }
 
@@ -130,7 +134,10 @@ type ProvisionLeaseOutcome = 'acquired' | 'live-owner' | 'contended';
 
 /** Manages the git-worktree lifecycle for one SWARM project. Construct one per project. */
 export class GitWorktreeManager {
-	constructor(private readonly project: ProjectConfig) {}
+	constructor(
+		private readonly project: ProjectConfig,
+		private readonly runtime: WorktreeRuntime = storeBackedWorktreeRuntime,
+	) {}
 
 	/** Absolute path to the worktree for `taskId` — `<repoRoot>/<worktreeRoot>/task-<id>` (§4.1). */
 	worktreePath(taskId: string): string {
@@ -147,8 +154,39 @@ export class GitWorktreeManager {
 		const path = this.worktreePath(taskId);
 		if (!existsSync(path)) return undefined;
 		if (isReusable && !isReusable(path)) return undefined;
-		await claimWorktreeLease(this.project.id, taskId);
+		await this.runtime.claim(this.project.id, taskId);
 		return { taskId, path, branch, detached };
+	}
+
+	/** Store/runtime-backed helpers shared with the resume/recovery gate. */
+	async claimLease(taskId: string): Promise<void> {
+		await this.runtime.claim(this.project.id, taskId);
+	}
+
+	async releaseLease(taskId: string): Promise<void> {
+		await this.runtime.release(this.project.id, taskId);
+	}
+
+	async isLeased(taskId: string): Promise<boolean> {
+		return this.runtime.isLeased(this.project.id, taskId);
+	}
+
+	async isCancellationRequested(runId: string): Promise<boolean> {
+		return this.runtime.isCancellationRequested(runId);
+	}
+
+	async preserve(taskId: string, runId?: string): Promise<void> {
+		await this.runtime.preserve(this.project.id, taskId, runId);
+	}
+
+	async evaluateReclaim(
+		taskId: string,
+		isResumablePinned = this.runtime.isResumablePinned,
+	): Promise<ReclaimDecision> {
+		return evaluateWorktreeReclaim(this, this.project.id, taskId, {
+			isLeased: this.runtime.isLeased,
+			isResumablePinned,
+		});
 	}
 
 	/**
@@ -182,13 +220,21 @@ export class GitWorktreeManager {
 			// live owner that did not exist (issue #427).
 			throw new BlockedRecoveryError(
 				'live-leased',
-				collisionMessage(
-					taskId,
-					path,
-					acquired === 'live-owner'
-						? 'is leased by a live run'
-						: 'is leased, and the lease was claimed by another provisioner first or could not be verified',
-				),
+				existsSync(path)
+					? collisionMessage(
+							taskId,
+							path,
+							acquired === 'live-owner'
+								? 'is leased by a live run'
+								: 'is leased, and the lease was claimed by another provisioner first or could not be verified',
+						)
+					: provisionContentionMessage(
+							taskId,
+							path,
+							acquired === 'live-owner'
+								? 'a live phase on this host holds the task lease'
+								: 'another provisioner claimed the host-local task lease first or its ownership could not be verified',
+						),
 			);
 		}
 
@@ -208,6 +254,7 @@ export class GitWorktreeManager {
 
 				const decision = await evaluateWorktreeReclaim(this, this.project.id, taskId, {
 					isLeased: async () => false,
+					isResumablePinned: this.runtime.isResumablePinned,
 				});
 				if (!decision.safe) {
 					throw new BlockedRecoveryError(
@@ -217,6 +264,8 @@ export class GitWorktreeManager {
 				}
 				logger.info('worktree collision: reclaiming safe stale checkout', { taskId, path });
 				await this.removeWorktreeCheckout(path);
+			} else {
+				await this.runtime.clearPreservation(this.project.id, taskId);
 			}
 
 			if (reclaimedBranch) {
@@ -229,7 +278,7 @@ export class GitWorktreeManager {
 
 			return await this.createFreshWorktree(taskId, path, options, leaseToken);
 		} catch (err) {
-			await releaseWorktreeLease(this.project.id, taskId, leaseToken);
+			await this.runtime.release(this.project.id, taskId, leaseToken);
 			throw err;
 		}
 	}
@@ -261,21 +310,21 @@ export class GitWorktreeManager {
 		token: string,
 		runId?: string,
 	): Promise<ProvisionLeaseOutcome> {
-		if (await tryClaimWorktreeLease(this.project.id, taskId, token)) return 'acquired';
+		if (await this.runtime.tryClaim(this.project.id, taskId, token)) return 'acquired';
 
-		const staleToken = await readWorktreeLease(this.project.id, taskId);
+		const staleToken = await this.runtime.read(this.project.id, taskId);
 		// Expired or released between the claim and the read — it is simply free now.
 		// (Also the Redis-error case: `readWorktreeLease` reports `null`, and a
 		// conditional `SET NX` cannot succeed while the key is in fact still held.)
 		if (staleToken === null) {
-			return (await tryClaimWorktreeLease(this.project.id, taskId, token))
+			return (await this.runtime.tryClaim(this.project.id, taskId, token))
 				? 'acquired'
 				: 'contended';
 		}
 
-		if (await hasLiveWorktreeLeaseOwner(this.project.id, taskId, runId)) return 'live-owner';
+		if (await this.runtime.hasLiveOwner(this.project.id, taskId, runId)) return 'live-owner';
 
-		const takenOver = await takeOverWorktreeLease(this.project.id, taskId, staleToken, token);
+		const takenOver = await this.runtime.takeOver(this.project.id, taskId, staleToken, token);
 		if (!takenOver) return 'contended';
 		logger.warn('worktree lease: took over an orphaned lease with no live owner', {
 			projectId: this.project.id,
@@ -328,7 +377,7 @@ export class GitWorktreeManager {
 		logger.debug('Provisioning worktree', { taskId, path, branch, createBranch, detached });
 		await this.git(args);
 
-		await claimWorktreeLease(this.project.id, taskId, leaseToken);
+		await this.runtime.claim(this.project.id, taskId, leaseToken);
 
 		// SWARM-15 grafts untracked build state (node_modules, .env, caches) in here
 		// via symlinks before the agent runs; git-tracked files (incl. the committed
@@ -348,13 +397,15 @@ export class GitWorktreeManager {
 	 */
 	async cleanup(taskId: string): Promise<void> {
 		const path = this.worktreePath(taskId);
-		await releaseWorktreeLease(this.project.id, taskId);
+		await this.runtime.release(this.project.id, taskId);
 		if (!existsSync(path)) {
+			await this.runtime.clearPreservation(this.project.id, taskId);
 			logger.warn('Worktree cleanup skipped — path does not exist', { taskId, path });
 			return;
 		}
 		logger.debug('Removing worktree', { taskId, path });
 		await this.removeWorktreeCheckout(path);
+		await this.runtime.clearPreservation(this.project.id, taskId);
 	}
 
 	/**

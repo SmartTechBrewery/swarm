@@ -128,6 +128,7 @@ client instead of (or alongside) the in-process worker:
 SWARM_CONTROL_PLANE_URL=https://<your-tunnel> \
 SWARM_WORKER_CREDENTIAL=<from `swarm workers register`> \
 SWARM_OPERATOR_GH_TOKEN=<your own GitHub token> \
+SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout \
 npm run dev:worker:connect        # remote worker: connect over the tunnel, run pushed phases
 ```
 
@@ -137,9 +138,10 @@ operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`. It performs the
 it can execute), keeps its session
 live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
 and executes a pushed `TaskAssignment` **DB-free**: project config comes from the
-assignment, source-carrying delivery (commit / push / create-PR) runs under the
-operator token, and everything needing something this worker must not hold goes up
-to the control plane's delivery API — Implementation's board moves/comments and
+assignment while `repoRoot` is resolved from this host (`SWARM_WORKER_REPO_ROOT`,
+defaulting to the launch directory), source-carrying delivery (commit / push /
+create-PR) runs under the operator token, and everything needing something this
+worker must not hold goes up to the control plane's delivery API — Implementation's board moves/comments and
 dependency lookup and Respond-to-review's card lookup + board moves under the
 project's PM credential, Review's submitted verdict under its reviewer PAT, and
 the two things backed by a database the control plane owns: Review's

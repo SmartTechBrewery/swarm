@@ -4,7 +4,6 @@ import type { ProjectConfig } from '../config/schema.js';
 import { PROJECT_DEFAULTS } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
-import { evaluateWorktreeReclaim } from './reclaim.js';
 
 export interface PruneStaleWorktreesOptions {
 	/** Injectable for tests; defaults to `new GitWorktreeManager(project)`. */
@@ -81,7 +80,6 @@ function getMatchedEntries(
 
 async function processCandidateEntries(
 	candidates: MatchedEntry[],
-	project: ProjectConfig,
 	worktrees: GitWorktreeManager,
 	options: PruneStaleWorktreesOptions,
 	pruned: string[],
@@ -95,9 +93,7 @@ async function processCandidateEntries(
 		// Share the provision-time reclaim gate (issue #367) so retention preserves
 		// exactly the same protected checkouts, in the same order, and additionally
 		// never prunes one carrying unpushed commits.
-		const decision = await evaluateWorktreeReclaim(worktrees, project.id, taskId, {
-			isResumablePinned: options.isDeferredPinned,
-		});
+		const decision = await worktrees.evaluateReclaim(taskId, options.isDeferredPinned);
 		if (!decision.safe) {
 			switch (decision.reason) {
 				case 'live-leased':
@@ -158,7 +154,6 @@ export async function pruneStaleWorktrees(
 
 	await processCandidateEntries(
 		candidateEntries,
-		project,
 		worktrees,
 		options,
 		pruned,

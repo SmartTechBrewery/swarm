@@ -50,6 +50,7 @@ import {
 } from '../worker/consumer.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
+import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
 import { reconstructProjectConfig } from './db-free-project.js';
 import type { DeliveryClientOptions, FetchLike } from './delivery-client.js';
 import { createTransportFollowUpReviewScheduler } from './follow-up-review-delivery.js';
@@ -471,6 +472,8 @@ function resolveOperatorDelivery(
 
 /** Options {@link runAssignmentDbFree} reads. */
 export interface RunAssignmentDbFreeOptions {
+	/** Absolute path to this worker host's checkout of the assigned repository. */
+	repoRoot: string;
 	/**
 	 * The worker operator's own account credential for the project's SCM provider,
 	 * resolved from this machine's environment by `./connect-entry.ts`
@@ -515,6 +518,7 @@ interface DbFreePhaseInputsParams {
 	scheduleFollowUpReview: ScheduleFollowUpReview | undefined;
 	operatorToken: string;
 	baseRunAgent: typeof runAgentCli;
+	worktrees: GitWorktreeManager;
 }
 
 /** Assemble the normalized phase inputs from a pushed assignment + the reconstructed project. */
@@ -529,6 +533,7 @@ function buildDbFreePhaseInputs({
 	scheduleFollowUpReview,
 	operatorToken,
 	baseRunAgent,
+	worktrees,
 }: DbFreePhaseInputsParams): AssignedPhaseInputs {
 	return {
 		phase: assignment.phase,
@@ -543,6 +548,7 @@ function buildDbFreePhaseInputs({
 		resumeSessionId: assignment.resumeSession ? assignment.agentSessionId : undefined,
 		resumeDelivery: assignment.resumeDelivery === true,
 		runId: assignment.runId,
+		worktrees,
 		signal,
 		// Non-persisting base: lines stream over the transport only — this worker
 		// has no `run_output_events` table to write to.
@@ -635,8 +641,19 @@ export async function runAssignmentDbFree(
 			return;
 		}
 
-		const project = reconstructProjectConfig(assignment.projectConfig);
-		worktreePath = new GitWorktreeManager(project).worktreePath(taskId);
+		const project = reconstructProjectConfig(assignment.projectConfig, options.repoRoot);
+		const worktrees = new GitWorktreeManager(
+			project,
+			createHostLocalWorktreeRuntime({
+				repoRoot: project.repoRoot,
+				worktreeRoot: project.worktreeRoot,
+				ownerId: dispatchId,
+				runId,
+				isOwnerLive: (ownerId) => inFlight.has(ownerId),
+				shutdownSignal: options.shutdownSignal,
+			}),
+		);
+		worktreePath = worktrees.worktreePath(taskId);
 		const operatorDelivery = await resolveOperatorDelivery(
 			project,
 			options.operatorToken,
@@ -664,6 +681,7 @@ export async function runAssignmentDbFree(
 			scheduleFollowUpReview: resolveDbFreeFollowUpReview(phase, project.id, transport),
 			operatorToken: options.operatorToken,
 			baseRunAgent: deps.baseRunAgent,
+			worktrees,
 		});
 		const result = await deps.runPhase(inputs);
 		// A run the harness killed for exceeding its wall-clock timeout is a terminal

@@ -258,6 +258,18 @@ describe('GitWorktreeManager', () => {
 			expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
 		});
 
+		it('reports real provisioning contention when no checkout exists yet', async () => {
+			tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+
+			const err = await makeManager()
+				.provision('14')
+				.catch((error) => error);
+			expect(err).toBeInstanceOf(BlockedRecoveryError);
+			expect(err.message).toContain('provisioning');
+			expect(err.message).toContain('already in progress');
+			expect(err.message).not.toContain('existing checkout');
+		});
+
 		describe('stale-lease take-over (issue #427)', () => {
 			const RUN_ID = 'run-abc';
 			// Clean, on a branch, whose upstream is 2 commits behind local HEAD —

@@ -10,13 +10,13 @@ describe('reconstructProjectConfig', () => {
 		const project = createMockProjectConfig();
 		const slice = toNonSecretProjectConfig(project);
 
-		const reconstructed = reconstructProjectConfig(slice);
+		const reconstructed = reconstructProjectConfig(slice, '/remote-worker/swarm');
 
 		// Every non-secret field is preserved verbatim.
 		expect(reconstructed.id).toBe(project.id);
 		expect(reconstructed.name).toBe(project.name);
 		expect(reconstructed.repo).toBe(project.repo);
-		expect(reconstructed.repoRoot).toBe(project.repoRoot);
+		expect(reconstructed.repoRoot).toBe('/remote-worker/swarm');
 		expect(reconstructed.baseBranch).toBe(project.baseBranch);
 		expect(reconstructed.pm).toEqual(project.pm);
 	});
@@ -24,6 +24,7 @@ describe('reconstructProjectConfig', () => {
 	it('fills an inert placeholder credentials block that satisfies CredentialsSchema', () => {
 		const reconstructed = reconstructProjectConfig(
 			toNonSecretProjectConfig(createMockProjectConfig()),
+			'/remote-worker/swarm',
 		);
 
 		expect(() => CredentialsSchema.parse(reconstructed.credentials)).not.toThrow();
@@ -41,8 +42,21 @@ describe('reconstructProjectConfig', () => {
 				webhookSecret: 'REAL_WEBHOOK_REF',
 			},
 		});
-		const reconstructed = reconstructProjectConfig(toNonSecretProjectConfig(project));
+		const reconstructed = reconstructProjectConfig(
+			toNonSecretProjectConfig(project),
+			'/remote-worker/swarm',
+		);
 
 		expect(reconstructed.credentials.reviewer).not.toBe('REAL_REVIEWER_REF');
+	});
+
+	it('replaces the control-plane repoRoot with this worker host checkout', () => {
+		const project = createMockProjectConfig({ repoRoot: '/control-plane/swarm' });
+		const reconstructed = reconstructProjectConfig(
+			toNonSecretProjectConfig(project),
+			'/remote-worker/swarm',
+		);
+
+		expect(reconstructed.repoRoot).toBe('/remote-worker/swarm');
 	});
 });

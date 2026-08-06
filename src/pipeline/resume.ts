@@ -35,7 +35,6 @@ import {
 	tryReadCheckpoint,
 	validateCheckpointForContinuation,
 } from '@/pipeline/checkpoint.js';
-import { isRunCancellationRequested } from '@/queue/cancellation.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
 import { hasDeliveryProgress } from '@/scm/delivery.js';
 import type { TriggerPhase } from '@/triggers/types.js';
@@ -149,11 +148,6 @@ import { existsSync } from 'node:fs';
 // union so the provision-time collision path and this recovery gate throw one
 // shared type (issue #367); re-exported here for existing importers.
 import { BlockedRecoveryError, type BlockedRecoveryReason } from '@/worktree/reclaim.js';
-import {
-	claimWorktreeLease,
-	isWorktreeLeased,
-	releaseWorktreeLease,
-} from '@/worktree/worktree-lease.js';
 
 export { BlockedRecoveryError };
 
@@ -191,12 +185,12 @@ async function resolveReuseHandle(
  * which is what lets the compiler narrow the branch that follows.
  */
 async function releaseAndBlock(
-	projectId: string,
+	worktrees: GitWorktreeManager,
 	taskId: string,
 	reason: BlockedRecoveryReason,
 	message: string,
 ): Promise<BlockedRecoveryError> {
-	await releaseWorktreeLease(projectId, taskId);
+	await worktrees.releaseLease(taskId);
 	return new BlockedRecoveryError(reason, message);
 }
 
@@ -208,19 +202,18 @@ async function releaseAndBlock(
 async function reclaimForFreshRetry(
 	worktrees: GitWorktreeManager,
 	taskId: string,
-	projectId: string,
 	path: string,
 ): Promise<void> {
 	if (!(await worktrees.isClean(taskId)))
 		throw await releaseAndBlock(
-			projectId,
+			worktrees,
 			taskId,
 			'dirty',
 			`Worktree for task '${taskId}' has uncommitted changes.`,
 		);
 	if (await worktrees.hasUnpushedWork(taskId))
 		throw await releaseAndBlock(
-			projectId,
+			worktrees,
 			taskId,
 			'unpushed',
 			`Worktree for task '${taskId}' has unpushed commits.`,
@@ -242,14 +235,13 @@ async function reclaimForFreshRetry(
 async function adoptCheckpointContinuation(
 	worktrees: GitWorktreeManager,
 	taskId: string,
-	projectId: string,
 	path: string,
 	phase: TriggerPhase,
 ): Promise<{ reuseHandle: WorktreeHandle; checkpoint: Checkpoint }> {
 	const validation = await validateCheckpointForContinuation(path, phase);
 	if (!validation.valid)
 		throw await releaseAndBlock(
-			projectId,
+			worktrees,
 			taskId,
 			validation.reason,
 			`Cannot continue task '${taskId}' (${phase}) from a checkpoint — ${validation.detail}.`,
@@ -275,7 +267,7 @@ export async function executeRecoveryGate(
 	taskId: string,
 	recoveryMode: RecoveryMode | undefined,
 	expectedSessionId: string | undefined,
-	projectId: string,
+	_projectId: string,
 	phase: TriggerPhase,
 ): Promise<{ reuseHandle: WorktreeHandle | null; checkpoint?: Checkpoint }> {
 	const path = worktrees.worktreePath(taskId);
@@ -297,7 +289,7 @@ export async function executeRecoveryGate(
 		return { reuseHandle: null };
 	}
 
-	const leased = await isWorktreeLeased(projectId, taskId);
+	const leased = await worktrees.isLeased(taskId);
 	if (leased && !recoveryMode) {
 		throw new BlockedRecoveryError(
 			'live-leased',
@@ -305,12 +297,12 @@ export async function executeRecoveryGate(
 		);
 	}
 
-	await claimWorktreeLease(projectId, taskId);
+	await worktrees.claimLease(taskId);
 
 	if (recoveryMode === 'resume') {
 		if (!expectedSessionId)
 			throw await releaseAndBlock(
-				projectId,
+				worktrees,
 				taskId,
 				'missing-validation',
 				`Cannot resume task '${taskId}' — missing expected session ID.`,
@@ -319,9 +311,9 @@ export async function executeRecoveryGate(
 	}
 
 	if (recoveryMode === 'checkpoint')
-		return adoptCheckpointContinuation(worktrees, taskId, projectId, path, phase);
+		return adoptCheckpointContinuation(worktrees, taskId, path, phase);
 
-	if (recoveryMode === 'fresh') await reclaimForFreshRetry(worktrees, taskId, projectId, path);
+	if (recoveryMode === 'fresh') await reclaimForFreshRetry(worktrees, taskId, path);
 
 	return { reuseHandle: null };
 }
@@ -417,9 +409,10 @@ export async function cleanupUnlessPreserved(
 	runId?: string,
 ): Promise<void> {
 	try {
-		const isCancelled = runId ? await isRunCancellationRequested(runId) : false;
+		const isCancelled = runId ? await worktrees.isCancellationRequested(runId) : false;
 		if (preserveForResume || isCancelled) {
 			logger.debug(`${phaseName}: preserving worktree for agent session resume`, { taskId, runId });
+			await worktrees.preserve(taskId, runId);
 			return;
 		}
 		await worktrees.cleanup(taskId);

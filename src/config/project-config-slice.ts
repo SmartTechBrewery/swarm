@@ -1,7 +1,8 @@
 /**
  * The non-secret slice of a `ProjectConfig` — the only view of a project's
  * config a worker may ever see over the transport (`src/transport/protocol.ts`).
- * It is the full config with the `credentials` block removed.
+ * It omits credentials and the control-plane host's `repoRoot`; the remote
+ * daemon resolves its own checkout path locally.
  *
  * Persona secrets are never in `ProjectConfig` to begin with: `CredentialsSchema`
  * (`./schema.ts`) stores only *references* into the secret store, and the
@@ -21,8 +22,11 @@
 import type { z } from 'zod';
 import { type ProjectConfig, ProjectConfigBaseSchema } from './schema.js';
 
-/** The project config a worker may see — everything except the credential references. */
-export const NonSecretProjectConfigSchema = ProjectConfigBaseSchema.omit({ credentials: true });
+/** The project config a worker may see — credential references and host-local paths excluded. */
+export const NonSecretProjectConfigSchema = ProjectConfigBaseSchema.omit({
+	credentials: true,
+	repoRoot: true,
+});
 export type NonSecretProjectConfig = z.infer<typeof NonSecretProjectConfigSchema>;
 
 /**
@@ -32,6 +36,6 @@ export type NonSecretProjectConfig = z.infer<typeof NonSecretProjectConfigSchema
  * config that still carries a `credentials` key.
  */
 export function toNonSecretProjectConfig(project: ProjectConfig): NonSecretProjectConfig {
-	const { credentials: _credentials, ...rest } = project;
+	const { credentials: _credentials, repoRoot: _repoRoot, ...rest } = project;
 	return NonSecretProjectConfigSchema.parse(rest);
 }

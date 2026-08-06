@@ -100,6 +100,7 @@ function depsWith(
 
 /** The transport coordinates every run needs: the operator token + this worker's own credential. */
 const RUN_OPTIONS = {
+	repoRoot: '/worker-local/swarm',
 	operatorToken: OPERATOR_TOKEN,
 	controlPlaneUrl: CONTROL_PLANE,
 	workerCredential: WORKER_CREDENTIAL,

@@ -160,6 +160,17 @@ admitted the one PM **read** now served server-side,
 gating (issue #330), and stubbing it out on the worker would have let a blocked
 item build out of order.
 
+**Amendment (2026-08-06, issue #535).** The DB-free boundary also distinguishes
+server state from **host-local execution state**. A worktree lease, its live owner,
+a preserved-checkout pin, and `repoRoot` describe one machine's filesystem; no
+other host can observe or act on that checkout, so centralizing them in Redis or
+Postgres creates false cross-host coupling. Remote execution therefore coordinates
+worktrees with atomic filesystem locks and preservation pins under its own
+`worktreeRoot`, while the same-host path retains its existing store-backed runtime.
+The control plane omits `repoRoot` from `TaskAssignment`; the daemon resolves its
+own checkout with `SWARM_WORKER_REPO_ROOT` (default cwd). Shared collision policy
+still fails closed in the same order (live lease, resumable pin, dirty, unpushed).
+
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
 
 > **Status: implemented, in two phases.** Phase 1 (issue #397) — the **`pr-review`

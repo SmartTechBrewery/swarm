@@ -6,7 +6,8 @@
  * This is the **remote** worker mode: unlike the in-process host worker
  * (`../worker/index.ts`), which holds `DATABASE_URL`/`REDIS_URL` and pulls jobs off
  * BullMQ, this process holds **only** `SWARM_WORKER_CREDENTIAL`,
- * `SWARM_CONTROL_PLANE_URL`, and the operator's own `SWARM_OPERATOR_GH_TOKEN`. It
+ * `SWARM_CONTROL_PLANE_URL`, the operator's own `SWARM_OPERATOR_GH_TOKEN`, and
+ * its host-local checkout path (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd). It
  * connects to the control plane over the network (through the Cloudflare tunnel),
  * declares the CLIs it can run, and heartbeats to keep its `worker_sessions` lease
  * live so the eligibility gate sees it as connected. On each pushed
@@ -33,7 +34,7 @@ import { fileURLToPath } from 'node:url';
 // connection at load (`getDb()` is lazy, `src/db/client.ts`), so this process still
 // connects to neither.
 import '../integrations/entrypoint.js';
-import { requireEnv, resolveOperatorGitHubToken } from '../lib/env.js';
+import { requireEnv, resolveOperatorGitHubToken, resolveWorkerRepoRoot } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { runAssignmentDbFree, SUPPORTED_DB_FREE_PHASES } from './assignment-execution.js';
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
 	// every source-carrying delivery op runs as (ADR-003 §2). Resolved up front so
 	// a missing token fails startup rather than mid-assignment.
 	const operatorToken = resolveOperatorGitHubToken();
+	const repoRoot = resolveWorkerRepoRoot();
 
 	// Declare the CLIs this host can run: an explicit override if set, otherwise
 	// probe PATH. An empty set can't handshake (the protocol requires a non-empty
@@ -99,6 +101,7 @@ async function main(): Promise<void> {
 		daemonVersion: resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {
 			void runAssignmentDbFree(assignment, sink, {
+				repoRoot,
 				operatorToken,
 				// The delivery seam for the metadata writes this worker holds no
 				// credential for (a review, a board move/comment): POSTed to the control
@@ -116,6 +119,7 @@ async function main(): Promise<void> {
 		hostname: host,
 		capabilities,
 		supportedPhases,
+		repoRoot,
 	});
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session
