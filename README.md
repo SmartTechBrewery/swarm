@@ -246,6 +246,8 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`ai/TESTING.md`](./ai/TESTING.md) — test strategy and verification guidance
 - [`docs/cloudflare-tunnel.md`](./docs/cloudflare-tunnel.md) — exposing the
   local router to GitHub
+- [`docs/onboarding-worker.md`](./docs/onboarding-worker.md) — adding a new
+  user + remote worker to a federated (`transport`-mode) instance
 - [`docs/github-projects-v2-api.md`](./docs/github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./docs/decisions/) — architecture decision records
