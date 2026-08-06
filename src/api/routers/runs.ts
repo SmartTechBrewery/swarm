@@ -17,6 +17,7 @@ import {
 	getRunLogsFromDb,
 	getRunOutputEvents,
 	isRetryPendingStatus,
+	type ListRunsFilter,
 	listRunsFromDb,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
@@ -35,7 +36,7 @@ import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
-import { getWorker } from '../../identity/worker-service.js';
+import { getWorker, getWorkers } from '../../identity/worker-service.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
@@ -390,6 +391,46 @@ async function resolveRunAttribution(run: {
 }
 
 /**
+ * Label a page of runs with the display name of the worker machine that
+ * executed each one (issue #523) — the list-shaped counterpart to
+ * {@link resolveRunAttribution}, which `getById` resolves for the detail view.
+ * A run row records only the worker's id, and the dashboard must not have to
+ * join a separate roster query to turn it into a machine name, so the name is
+ * resolved here the same way every other server-resolved display label is.
+ *
+ * One batched read per page over the *distinct* recorded ids, so a full page
+ * costs a single query rather than one per row. A run with no recorded worker
+ * (unfederated / single-user, and every row predating the columns), a worker
+ * whose row no longer resolves, and a failed lookup all yield `null`: the UI
+ * then shows no machine at all rather than a stale or invented one.
+ */
+async function withWorkerNames<T extends { workerId: string | null }>(
+	rows: T[],
+): Promise<(T & { workerName: string | null })[]> {
+	const ids = [...new Set(rows.map((row) => row.workerId).filter((id) => id !== null))];
+	let names = new Map<string, string>();
+	if (ids.length > 0) {
+		try {
+			names = new Map((await getWorkers(ids)).map((worker) => [worker.id, worker.displayName]));
+		} catch (error) {
+			logger.warn('runs.list: worker-name lookup failed; listing runs without machine names', {
+				error: describeError(error),
+			});
+		}
+	}
+	return rows.map((row) => ({
+		...row,
+		workerName: row.workerId ? (names.get(row.workerId) ?? null) : null,
+	}));
+}
+
+/** {@link listRunsFromDb}, with each row's executing machine named (issue #523). */
+async function listRunsWithWorkerNames(filter: ListRunsFilter) {
+	const { data, total } = await listRunsFromDb(filter);
+	return { data: await withWorkerNames(data), total };
+}
+
+/**
  * The checkpoint-continuation budget that bounds this run's Tier 2 fallback
  * (issue #504) — the project's `pipeline.maxContinuations`, or the coded default
  * ({@link resolveMaxContinuations}). Resolved server-side, so the dashboard can
@@ -420,7 +461,11 @@ async function resolveContinuationBudget(run: {
 }
 
 export const runsRouter = router({
-	// Paginated, filtered list; returns { data, total } straight from the repo.
+	// Paginated, filtered list; returns { data, total } from the repo, each row
+	// widened with the additive, server-resolved `workerName` naming the machine
+	// that executed it (issue #523 — see `withWorkerNames`). The name is resolved
+	// only after the access check below, so a non-member never triggers an
+	// identity read.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
 	// access to that project; without one the result is bounded to the caller's
 	// accessible projects (every project for an `instanceAdmin`), so a non-member
@@ -428,12 +473,12 @@ export const runsRouter = router({
 	list: authedProcedure.input(ListRunsInputSchema).query(async ({ ctx, input }) => {
 		if (input.projectId) {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
-			return await listRunsFromDb(input);
+			return await listRunsWithWorkerNames(input);
 		}
 		const scope = await accessibleProjectScope(ctx.user);
-		if (scope === null) return await listRunsFromDb(input);
+		if (scope === null) return await listRunsWithWorkerNames(input);
 		if (scope.length === 0) return { data: [], total: 0 };
-		return await listRunsFromDb({ ...input, projectIds: scope });
+		return await listRunsWithWorkerNames({ ...input, projectIds: scope });
 	}),
 
 	// Every canonical waiting dispatch (pending / capacity-blocked /

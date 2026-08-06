@@ -101,6 +101,17 @@ export function RunsTable({
 								<span className="font-semibold capitalize text-zinc-300">
 									{formatPhase(run.phase)}
 								</span>
+								{run.workerName ? (
+									<>
+										<span className="text-zinc-600">·</span>
+										<span
+											data-testid="run-worker-name"
+											className="min-w-0 break-all font-mono text-zinc-500"
+										>
+											{run.workerName}
+										</span>
+									</>
+								) : null}
 								<span className="text-zinc-600">·</span>
 								<span>{formatRelativeTime(run.startedAt)}</span>
 								{showProject && (
@@ -184,6 +195,15 @@ export function RunsTable({
 							>
 								<td className="px-2 py-3 text-sm font-semibold text-zinc-100 capitalize">
 									{formatPhase(run.phase)}
+									{run.workerName ? (
+										<span
+											data-testid="run-worker-name"
+											className="mt-0.5 block truncate font-mono text-xs font-normal normal-case text-zinc-500"
+											title={run.workerName}
+										>
+											{run.workerName}
+										</span>
+									) : null}
 								</td>
 								{showProject && (
 									<td className="px-2 py-3 text-sm text-zinc-300 font-mono">
