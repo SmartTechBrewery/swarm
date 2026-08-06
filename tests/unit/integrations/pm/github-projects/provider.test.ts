@@ -407,6 +407,28 @@ describe('GitHubProjectsPMProvider', () => {
 		});
 	});
 
+	describe('findWorkItemForArtifact', () => {
+		it('selects the card from the requested repository when a board contains same-numbered issues', async () => {
+			const foreignNode = {
+				...ITEM_NODE,
+				id: 'PVTI_foreign',
+				content: {
+					...ITEM_NODE.content,
+					url: 'https://github.com/SmartTechBrewery/other/issues/10',
+				},
+			};
+			graphql.mockResolvedValue({ node: { items: { nodes: [foreignNode, ITEM_NODE] } } });
+
+			const item = await provider.findWorkItemForArtifact({
+				repository: 'SmartTechBrewery/swarm',
+				kind: 'issue',
+				number: '10',
+			});
+
+			expect(item?.id).toBe('PVTI_x');
+		});
+	});
+
 	describe('moveWorkItem', () => {
 		it('writes the mapped option ID to the Status field', async () => {
 			graphql.mockResolvedValue({

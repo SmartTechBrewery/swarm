@@ -8,7 +8,13 @@ function makeContext(): TriggerContext {
 }
 
 function makeResult(taskId = '17'): TriggerResult {
-	return { phase: 'review', taskId, prNumber: taskId, headSha: 'deadbeef' };
+	return {
+		phase: 'review',
+		taskId,
+		prNumber: taskId,
+		prBranch: `issue-${taskId}`,
+		headSha: 'deadbeef',
+	};
 }
 
 function makeHandler(overrides: Partial<TriggerHandler> = {}): TriggerHandler {

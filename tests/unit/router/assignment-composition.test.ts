@@ -36,6 +36,7 @@ describe('resolveTargetBranch', () => {
 			phase: 'review',
 			taskId: '407',
 			prNumber: '88',
+			prBranch: 'swarm/407',
 			headSha: 'abc',
 		};
 		expect(resolveTargetBranch(PROJECT, planning)).toBe('swarm/407');
@@ -103,6 +104,7 @@ describe('composeSystemPrompt', () => {
 			phase: 'review',
 			taskId: '407',
 			prNumber: '88',
+			prBranch: 'swarm/407',
 			headSha: 'deadbeef',
 		});
 		expect(prompt).toContain('reviewing a pull request');

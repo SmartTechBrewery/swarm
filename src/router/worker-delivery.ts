@@ -57,6 +57,7 @@
  *   - `POST /worker/delivery/pm/comment` — comment on the item's backing Issue/PR.
  *   - `POST /worker/delivery/pm/blockers` — read the item's open prerequisites.
  *   - `POST /worker/delivery/pm/find-item` — resolve one card by its backing URL's tail.
+ *   - `POST /worker/delivery/pm/find-artifact` — resolve one card by a repository-scoped artifact.
  *   - `POST /worker/delivery/follow-up-review` — schedule the follow-up Review a fix owes.
  *   - `POST /worker/delivery/review-ledger/prior` — the PR's prior submitted verdict.
  *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
@@ -107,6 +108,7 @@ import {
 	AbandonReviewLedgerRequestSchema,
 	AddPmCommentDeliveryRequestSchema,
 	FindWorkItemDeliveryRequestSchema,
+	FindWorkItemForArtifactDeliveryRequestSchema,
 	FollowUpReviewDeliveryRequestSchema,
 	ListBlockersDeliveryRequestSchema,
 	MarkReviewLedgerRequestSchema,
@@ -493,6 +495,39 @@ export async function handleFindWorkItem(
 	return { status: 200, json: { item: projected } };
 }
 
+/** Resolve one board card by its repository-scoped backing artifact. */
+export async function handleFindWorkItemForArtifact(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = FindWorkItemForArtifactDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+	const item = await deps.buildPmProvider(authed.project).findWorkItemForArtifact({
+		repository: request.repository,
+		kind: request.kind,
+		number: request.number,
+	});
+	const projected = item
+		? {
+				id: item.id,
+				title: item.title,
+				url: item.url,
+				...(item.status !== undefined && { status: item.status }),
+				...(item.statusId !== undefined && { statusId: item.statusId }),
+			}
+		: null;
+	return { status: 200, json: { item: projected } };
+}
+
 /**
  * Schedule the one follow-up Review a `fixed` Respond-to-review response owes its
  * newly pushed commit (issue #241) — the dispatch row + queue enqueue a DB-free
@@ -690,6 +725,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/pm/find-item', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleFindWorkItem(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/find-artifact', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleFindWorkItemForArtifact(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 

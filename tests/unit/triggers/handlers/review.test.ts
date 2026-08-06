@@ -197,6 +197,9 @@ describe('review trigger', () => {
 				phase: 'review',
 				taskId: '42',
 				prNumber: '42',
+				// Carried from the PR the mergeability gate already fetched, so the
+				// automation-label gate can resolve the backing board item (issue #354).
+				prBranch: 'issue-42',
 				headSha: 'abc123',
 			});
 		});
@@ -302,7 +305,14 @@ describe('review trigger', () => {
 				]),
 			);
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
-			expect(result).toEqual({ phase: 'review', taskId: '9', prNumber: '9', headSha: 'cafe' });
+			expect(result).toEqual({
+				phase: 'review',
+				taskId: '9',
+				prNumber: '9',
+				// The fetched PR's head branch (the default mock's), not the event's.
+				prBranch: 'issue-42',
+				headSha: 'cafe',
+			});
 			// The ownership gate ran off the fetched PR's head branch — no extra
 			// author round trip on this path any more.
 			expect(hasRunForTask).toHaveBeenCalledWith(PROJECT.id, '42', 'implementation');
@@ -341,7 +351,14 @@ describe('review trigger', () => {
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
 				project,
 			});
-			expect(result).toEqual({ phase: 'review', taskId: '9', prNumber: '9', headSha: 'cafe' });
+			expect(result).toEqual({
+				phase: 'review',
+				taskId: '9',
+				prNumber: '9',
+				// The fetched PR's head branch (the default mock's), not the event's.
+				prBranch: 'issue-42',
+				headSha: 'cafe',
+			});
 			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 		});
@@ -654,6 +671,7 @@ describe('review trigger', () => {
 				phase: 'review',
 				taskId: '42',
 				prNumber: '42',
+				prBranch: 'issue-42',
 				headSha: 'abc123',
 			});
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
@@ -682,6 +700,7 @@ describe('review trigger', () => {
 				phase: 'review',
 				taskId: '42',
 				prNumber: '42',
+				prBranch: 'issue-42',
 				headSha: 'abc123',
 			});
 			expect(reserveReviewVerdict).toHaveBeenCalledWith({

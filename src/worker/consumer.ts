@@ -32,6 +32,7 @@ import {
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import { abandonReviewVerdict } from '../db/repositories/reviewVerdictsRepository.js';
 import {
 	type CompleteRunInput,
 	completeRun,
@@ -94,12 +95,14 @@ import {
 	runReviewPhase,
 } from '../pipeline/review.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
+import { issueNumberFromBranch } from '../pipeline/task-branch.js';
 import {
 	hasAutomationLabel,
 	missingAutomationLabelMessage,
 	resolveAutomationLabel,
 } from '../pm/automation-label.js';
 import { type PmStatusKey, resolvePipelinePhaseForStatusKey } from '../pm/pipeline.js';
+import { findWorkItemForPullRequest } from '../pm/pull-request-work-item.js';
 import { createTransportPmDeliveryProvider } from '../pm/transport-delivery.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import {
@@ -124,7 +127,12 @@ import type { TriggerRegistry } from '../triggers/registry.js';
 import {
 	buildConflictResolutionKey,
 	refreshConflictResolutionClaim,
+	releaseConflictResolution,
 } from '../triggers/resolve-conflicts-dedup.js';
+import {
+	buildRespondToCiAttemptKey,
+	releaseRespondToCiAttempt,
+} from '../triggers/respond-to-ci-attempts.js';
 import {
 	buildReviewDispatchKey,
 	refreshReviewDispatchClaim,
@@ -2620,6 +2628,56 @@ function buildTriggerContext(
 			};
 }
 
+/**
+ * The work item the automation-label gate judges a dispatch on, or `undefined`
+ * when there is none to judge.
+ *
+ * A board-driven phase carries its item on the trigger. The four SCM
+ * continuation phases (Review, Respond-to-review, Respond-to-CI,
+ * Resolve-conflicts) carry a pull request instead, so their item is resolved
+ * from the board here (issue #354) — through the PM contract and the PR's task
+ * branch, never a provider-specific URL shape (ai/RULES.md §2). Costs one board
+ * read per SCM dispatch; the gate calls it only while it is enabled.
+ *
+ * **Fails open**: an unlinked PR, a branch outside the project's `branchPrefix`,
+ * an unreadable board, and an unresolvable PM provider all return `undefined`,
+ * which the gate treats as eligible. A board blip must never wedge review/CI work.
+ */
+async function resolveGatedWorkItem(
+	project: ProjectConfig,
+	trigger: TriggerResult,
+): Promise<WorkItem | undefined> {
+	if ('workItem' in trigger) return trigger.workItem;
+	const logContext = {
+		projectId: project.id,
+		phase: trigger.phase,
+		taskId: trigger.taskId,
+		prNumber: trigger.prNumber,
+	};
+	try {
+		return await findWorkItemForPullRequest(
+			requireProjectPMProvider(project),
+			{
+				repository: project.repo,
+				// SWARM opens every PR from `<branchPrefix><itemNumber>`, so the branch
+				// names the backing item (the same decode `src/pipeline/respond-to-review.ts`
+				// performs for its board report).
+				issueNumber: issueNumberFromBranch(trigger.prBranch, project.branchPrefix),
+				prNumber: trigger.prNumber,
+			},
+			logContext,
+		);
+	} catch (error) {
+		// Only resolving the provider can throw — the lookup swallows its own board
+		// errors — so this is a wiring/credential problem. Fail open all the same.
+		logger.warn('Automation-label gate could not resolve the PM provider — dispatching anyway', {
+			...logContext,
+			error: describeError(error),
+		});
+		return undefined;
+	}
+}
+
 function isLaunchOrAuthenticationFailure(error: string): boolean {
 	return /(?:failed to launch|\benoent\b|permission denied|\beacces\b|not authenticated|authentication (?:failed|required)|login required|please log in)/i.test(
 		error,
@@ -3102,29 +3160,29 @@ export async function processJob(
 		});
 	}
 
-	// Explicit automation opt-in (issue #131): a work item must carry the project's
-	// configured automation label before SWARM starts an agent phase for it. Checked
-	// here, at the composition root, on *every* dispatch — a fresh webhook, a delayed
-	// retry, a self-enqueued next phase, a capacity promotion, a reconciler
-	// republish, a manual "Retry now" — so removing the label stops all later
-	// dispatches (it never terminates a run already in flight). It runs before the
-	// in-flight guard and `acquireProjectSlot`, so a skip costs no slot, no worktree,
-	// and no tokens. This is also where #339's worker-eligibility check belongs: a
-	// dispatch is eligible only when the worker is authorized *and* the item is
-	// opted in. Only the board-driven phases carry a work item today; the SCM
-	// continuation phases are gated in the follow-up task (phase 2/2).
+	// Explicit automation opt-in (issues #131 and #354): the work item behind a
+	// dispatch must carry the project's configured automation label before SWARM
+	// starts an agent phase for it. Checked here, at the composition root, on *every*
+	// dispatch — a fresh webhook, a delayed retry, a self-enqueued next phase, a
+	// capacity promotion, a reconciler republish, a manual "Retry now" — so removing
+	// the label stops all later dispatches (it never terminates a run already in
+	// flight). It runs before the in-flight guard and `acquireProjectSlot`, so a skip
+	// costs no slot, no worktree, and no tokens. This is also where #339's
+	// worker-eligibility check belongs: a dispatch is eligible only when the worker is
+	// authorized *and* the item is opted in. Every phase is gated: the board-driven
+	// ones carry their work item on the trigger, and the four SCM continuation phases
+	// resolve theirs from the pull request ({@link resolveGatedWorkItem}).
 	const automationLabel = resolveAutomationLabel(project.pipeline);
-	if (
-		automationLabel &&
-		'workItem' in trigger &&
-		!hasAutomationLabel(trigger.workItem, automationLabel)
-	) {
+	// Resolved only when the gate is on, so a project that opted out
+	// (`automationLabel: ""`) pays no board read on an SCM dispatch.
+	const gatedItem = automationLabel ? await resolveGatedWorkItem(project, trigger) : undefined;
+	if (automationLabel && gatedItem && !hasAutomationLabel(gatedItem, automationLabel)) {
 		const reason = missingAutomationLabelMessage(automationLabel);
 		logger.info('Phase skipped — work item is missing the automation label', {
 			projectId: project.id,
 			phase: trigger.phase,
 			taskId: trigger.taskId,
-			workItemId: trigger.workItem.id,
+			workItemId: gatedItem.id,
 			label: automationLabel,
 		});
 		// A deferred run being retried after the label was pulled must not sit in
@@ -3132,6 +3190,45 @@ export async function processJob(
 		// the `no-trigger` branch above does.
 		if (job.runId) {
 			await finalizeRun(job.runId, { status: 'failed', error: reason });
+		}
+		// Hand back every handler-side claim this dispatch took before the gate. A
+		// skipped phase consumes nothing, so a later correctly labelled attempt must
+		// not be treated as a duplicate, remain blocked by a ledger reservation, or
+		// spend a CI-fix attempt.
+		if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
+			await releaseReviewDispatch(
+				buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+			);
+		}
+		if (trigger.phase === 'review') {
+			try {
+				await abandonReviewVerdict({
+					projectId: project.id,
+					repository: project.repo,
+					prNumber: trigger.prNumber,
+					headSha: trigger.headSha,
+				});
+			} catch (error) {
+				logger.warn('Could not abandon skipped Review verdict reservation', {
+					projectId: project.id,
+					prNumber: trigger.prNumber,
+					headSha: trigger.headSha,
+					error: describeError(error),
+				});
+			}
+		}
+		if (trigger.phase === 'resolve-conflicts') {
+			await releaseConflictResolution(
+				buildConflictResolutionKey(
+					project.repo,
+					trigger.prNumber,
+					trigger.headSha,
+					trigger.baseSha,
+				),
+			);
+		}
+		if (trigger.phase === 'respond-to-ci') {
+			await releaseRespondToCiAttempt(buildRespondToCiAttemptKey(project.repo, trigger.prNumber));
 		}
 		await tryCompleteDispatch(dispatch.id, 'skipped-not-eligible');
 		return {

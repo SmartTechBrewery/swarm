@@ -36,12 +36,23 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 }));
 
 const addComment = vi.fn(async (_id: string, _text: string) => 'comment-1');
+// The narrow board-card read the automation-label gate resolves an SCM-driven
+// phase's work item through (issue #354). Defaults to "no card backs this PR",
+// which is the fail-open answer — the gate then dispatches.
+const findWorkItemForArtifact = vi.fn(
+	async (_artifact: {
+		repository: string;
+		kind: string;
+		number: string;
+	}): Promise<WorkItem | undefined> => undefined,
+);
 const provider = {
 	type: 'github-projects',
 	// The real GitHub Projects adapter reports assignee support; the eligibility
 	// gate reads this flag to decide whether to resolve an item's assignee.
 	supportsAssignees: true,
 	addComment,
+	findWorkItemForArtifact,
 } as unknown as PMProvider;
 const providerBuiltWith: ProjectConfig[] = [];
 // The consumer resolves both PM halves through the registry (issue #297), so the
@@ -218,11 +229,24 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 }));
 
 const refreshConflictResolutionClaim = vi.fn(async (_key: string, _ttlSec: number) => {});
+const releaseConflictResolution = vi.fn(async (_key: string) => {});
 vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 	refreshConflictResolutionClaim: (key: string, ttlSec: number) =>
 		refreshConflictResolutionClaim(key, ttlSec),
 	buildConflictResolutionKey: (repo: string, prNumber: string, headSha: string, baseSha: string) =>
 		`${repo}:${prNumber}:${headSha}:${baseSha}`,
+	releaseConflictResolution: (key: string) => releaseConflictResolution(key),
+}));
+
+const releaseRespondToCiAttempt = vi.fn(async (_key: string) => {});
+vi.mock('@/triggers/respond-to-ci-attempts.js', () => ({
+	buildRespondToCiAttemptKey: (repo: string, prNumber: string) => `${repo}:${prNumber}`,
+	releaseRespondToCiAttempt: (key: string) => releaseRespondToCiAttempt(key),
+}));
+
+const abandonReviewVerdict = vi.fn(async (_key: unknown) => {});
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
+	abandonReviewVerdict: (key: unknown) => abandonReviewVerdict(key),
 }));
 
 const refreshReviewDispatchClaim = vi.fn(async (_key: string, _ttlSec: number) => {});
@@ -513,10 +537,13 @@ function registryReturning(result: TriggerResult | null, seenContexts: TriggerCo
 	return registry;
 }
 
-const REVIEW_TRIGGER: TriggerResult = {
+// Narrowed to the `review` variant (rather than the whole union) so a test can
+// spread it into a variation — see the in-flight guard's second-taskId case.
+const REVIEW_TRIGGER: Extract<TriggerResult, { phase: 'review' }> = {
 	phase: 'review',
 	taskId: '17',
 	prNumber: '17',
+	prBranch: 'issue-17',
 	headSha: 'deadbeef',
 };
 const RESPOND_TO_REVIEW_TRIGGER: TriggerResult = {
@@ -552,6 +579,11 @@ describe('processJob', () => {
 		phaseImpl = async () => ({ agent: agentResult() });
 		addComment.mockClear();
 		addComment.mockResolvedValue('comment-1');
+		findWorkItemForArtifact.mockClear();
+		findWorkItemForArtifact.mockResolvedValue(undefined);
+		releaseConflictResolution.mockClear();
+		releaseRespondToCiAttempt.mockClear();
+		abandonReviewVerdict.mockClear();
 		claimDispatchForJob.mockClear();
 		claimDispatchForJob.mockImplementation(async (job: Record<string, unknown>) => ({
 			claimed: true,
@@ -2967,13 +2999,200 @@ describe('processJob', () => {
 			expect(dispatched.status).toBe('phase-succeeded');
 		});
 
-		it('leaves the SCM continuation phases ungated (phase 2/2)', async () => {
-			const outcome = await processJob(
-				createMockScmWebhookJob(),
-				registryReturning(REVIEW_TRIGGER),
-			);
+		describe('SCM continuation phases (issue #354)', () => {
+			// These four phases carry a pull request, not a work item, so the gate
+			// resolves the PR back to its board card through the PM contract — and must
+			// fail *open* when no card backs the PR or the board can't be read, since an
+			// unlinked PR or a network blip must never wedge review/CI work.
 
-			expect(outcome.status).toBe('phase-succeeded');
+			/** The board card wrapping issue 17 — the item `issue-17` (the PR branch) decodes to. */
+			function card(labels: { id: string; name: string }[]) {
+				return createMockWorkItem({
+					id: 'item-17',
+					url: 'https://github.com/SmartTechBrewery/swarm/issues/17',
+					labels,
+				});
+			}
+
+			const SCM_TRIGGERS: [string, TriggerResult][] = [
+				['Review', REVIEW_TRIGGER],
+				['Respond-to-review', RESPOND_TO_REVIEW_TRIGGER],
+				['Respond-to-CI', RESPOND_TO_CI_TRIGGER],
+				['Resolve-conflicts', RESOLVE_CONFLICTS_TRIGGER],
+			];
+
+			it.each(SCM_TRIGGERS)("runs %s when the PR's card carries the label", async (_n, trigger) => {
+				findWorkItemForArtifact.mockResolvedValue(card([{ id: 'LA_1', name: 'swarm' }]));
+
+				const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(phaseCalls).toHaveLength(1);
+				// Resolved from the PR's task branch (`issue-17`), through the provider's
+				// own narrow lookup — no GitHub URL shape is parsed here (ai/RULES.md §2).
+				expect(findWorkItemForArtifact).toHaveBeenCalledWith({
+					repository: PROJECT.repo,
+					kind: 'issue',
+					number: '17',
+				});
+			});
+
+			it.each(SCM_TRIGGERS)("skips %s when the PR's card lacks the label", async (_n, trigger) => {
+				findWorkItemForArtifact.mockResolvedValue(card([]));
+
+				const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+
+				expect(outcome).toMatchObject({
+					status: 'skipped-not-eligible',
+					phase: trigger.phase,
+					taskId: trigger.taskId,
+				});
+				expect(phaseCalls).toEqual([]);
+				expect(acquireProjectSlot).not.toHaveBeenCalled();
+				expect(createRun).not.toHaveBeenCalled();
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
+			});
+
+			it.each([
+				['Review', REVIEW_TRIGGER],
+				['Respond-to-CI', RESPOND_TO_CI_TRIGGER],
+			] as [
+				string,
+				TriggerResult,
+			][])('hands back the PR+SHA dispatch dedup claim when %s is skipped', async (_n, trigger) => {
+				// Otherwise the labelled retry at the same head — the operator adding
+				// the label and re-running checks — is dropped as a duplicate.
+				findWorkItemForArtifact.mockResolvedValue(card([]));
+
+				await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+			});
+
+			it('leaves the shared claim alone for a phase that never took it', async () => {
+				findWorkItemForArtifact.mockResolvedValue(card([]));
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+			});
+
+			it('abandons only a skipped Review verdict reservation', async () => {
+				findWorkItemForArtifact.mockResolvedValue(card([]));
+
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(abandonReviewVerdict).toHaveBeenCalledWith({
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					prNumber: '17',
+					headSha: 'deadbeef',
+				});
+				abandonReviewVerdict.mockClear();
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+			});
+
+			it('returns only the skipped Resolve-conflicts and Respond-to-CI claims', async () => {
+				findWorkItemForArtifact.mockResolvedValue(card([]));
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
+				expect(releaseConflictResolution).toHaveBeenCalledWith(
+					`${PROJECT.repo}:17:deadbeef:cafebabe`,
+				);
+				expect(releaseRespondToCiAttempt).not.toHaveBeenCalled();
+
+				releaseConflictResolution.mockClear();
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+				expect(releaseRespondToCiAttempt).toHaveBeenCalledWith(`${PROJECT.repo}:17`);
+				expect(releaseConflictResolution).not.toHaveBeenCalled();
+			});
+
+			it('runs the phase when no board card backs the PR (fails open)', async () => {
+				findWorkItemForArtifact.mockResolvedValue(undefined);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				// Both suffixes tried — the backing item first, then the PR itself, for a
+				// board that tracks pull requests as cards.
+				expect(findWorkItemForArtifact.mock.calls.map(([artifact]) => artifact)).toEqual([
+					{ repository: PROJECT.repo, kind: 'issue', number: '17' },
+					{ repository: PROJECT.repo, kind: 'pullRequest', number: '17' },
+				]);
+			});
+
+			it('runs the phase when the board lookup fails (fails open)', async () => {
+				const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+				findWorkItemForArtifact.mockRejectedValue(new Error('graphql 502'));
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(warn).toHaveBeenCalledWith(
+					expect.stringContaining('Could not resolve the board work item'),
+					expect.objectContaining({ error: 'graphql 502' }),
+				);
+				warn.mockRestore();
+			});
+
+			it('reads no board at all when the project disables the gate', async () => {
+				projectLookup = () =>
+					createMockProjectConfig({ pipeline: { automationLabel: '' } }) as ProjectConfig;
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(findWorkItemForArtifact).not.toHaveBeenCalled();
+			});
+
+			it('falls back to the PR card for a PR outside the task-branch convention', async () => {
+				const prCard = createMockWorkItem({
+					id: 'item-pr-17',
+					url: 'https://github.com/SmartTechBrewery/swarm/pull/17',
+					labels: [],
+				});
+				findWorkItemForArtifact.mockResolvedValue(prCard);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({ ...REVIEW_TRIGGER, prBranch: 'contributor-patch' }),
+				);
+
+				expect(outcome.status).toBe('skipped-not-eligible');
+				expect(findWorkItemForArtifact).toHaveBeenCalledExactlyOnceWith({
+					repository: PROJECT.repo,
+					kind: 'pullRequest',
+					number: '17',
+				});
+			});
+
+			it('finalizes a retried run row instead of leaving it deferred', async () => {
+				findWorkItemForArtifact.mockResolvedValue(card([]));
+
+				const outcome = await processJob(
+					createMockScmWebhookJob({ runId: 'run-9' }),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('skipped-not-eligible');
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-9',
+					expect.objectContaining({
+						status: 'failed',
+						error: expect.stringContaining('automation label'),
+					}),
+				);
+			});
 		});
 	});
 

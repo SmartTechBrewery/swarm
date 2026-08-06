@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // are spies on the chain; `execResult` is what exec() resolves to (the per-command
 // `[err, res]` tuples). Hoisted so the vi.mock factory (itself hoisted above
 // imports) can reference them.
-const { RedisMock, incr, expire, exec, on, setExecResult } = vi.hoisted(() => {
+const { RedisMock, incr, eval_, expire, exec, on, setExecResult } = vi.hoisted(() => {
 	let execResult: unknown = [
 		[null, 1],
 		[null, 1],
@@ -15,13 +15,14 @@ const { RedisMock, incr, expire, exec, on, setExecResult } = vi.hoisted(() => {
 		execResult = r;
 	};
 	const exec = vi.fn(() => Promise.resolve(execResult));
+	const eval_ = vi.fn().mockResolvedValue(1);
 	const chain = { incr: vi.fn(), expire: vi.fn(), exec };
 	chain.incr.mockReturnValue(chain);
 	chain.expire.mockReturnValue(chain);
 	const multi = vi.fn(() => chain);
 	const on = vi.fn();
-	const RedisMock = vi.fn(() => ({ multi, on }));
-	return { RedisMock, incr: chain.incr, expire: chain.expire, exec, on, setExecResult };
+	const RedisMock = vi.fn(() => ({ multi, eval: eval_, on }));
+	return { RedisMock, incr: chain.incr, eval_, expire: chain.expire, exec, on, setExecResult };
 });
 
 vi.mock('ioredis', () => ({ Redis: RedisMock }));
@@ -34,6 +35,8 @@ beforeEach(() => {
 	// Clear call history but keep the chain-returning behaviour so `.incr().expire()`
 	// stays fluent; exec() defaults to a successful INCR→1, EXPIRE→1 pair.
 	incr.mockClear();
+	eval_.mockClear();
+	eval_.mockResolvedValue(1);
 	expire.mockClear();
 	exec.mockClear();
 	setExecResult([
@@ -148,5 +151,17 @@ describe('claimRespondToCiAttempt', () => {
 		await claimRespondToCiAttempt('acme/widgets:1', { prNumber: '1', headSha: 'a' });
 		expect(RedisMock).toHaveBeenCalledWith(expect.objectContaining({ maxRetriesPerRequest: 1 }));
 		expect(on).toHaveBeenCalledWith('error', expect.any(Function));
+	});
+});
+
+describe('releaseRespondToCiAttempt', () => {
+	it('atomically returns a skipped pre-gate attempt without deleting a concurrent later claim', async () => {
+		const { releaseRespondToCiAttempt } = await import('@/triggers/respond-to-ci-attempts.js');
+		await releaseRespondToCiAttempt('acme/widgets:42');
+		expect(eval_).toHaveBeenCalledWith(
+			expect.stringContaining("redis.call('GET'"),
+			1,
+			`${NS}acme/widgets:42`,
+		);
 	});
 });

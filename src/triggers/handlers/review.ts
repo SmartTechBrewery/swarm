@@ -580,13 +580,20 @@ function logOwnershipSkip(
 	}
 }
 
+/**
+ * The mergeability gate's "carry on to the disposition" answer. It carries the PR
+ * head branch the gate already fetched, so the Review dispatch can name it
+ * (`TriggerResult`'s `prBranch`) without a second provider round-trip.
+ */
+type MergeabilityCleared = { cleared: true; prBranch: string };
+
 async function checkMergeabilityAndConflicts(
 	ctx: ScmTriggerContext,
 	event: ScmEvent,
 	project: ProjectConfig,
 	prNumber: string,
 	headSha: string,
-): Promise<TriggerResult | null | 'continue'> {
+): Promise<TriggerResult | null | MergeabilityCleared> {
 	if (event.isDraft || event.isCrossRepo) {
 		logger.debug('review: draft or fork PR — skipping mergeability check', {
 			prNumber,
@@ -647,7 +654,7 @@ async function checkMergeabilityAndConflicts(
 		return null;
 	}
 
-	return 'continue';
+	return { cleared: true, prBranch: prDetails.headBranch };
 }
 
 async function handleConflictingPullRequest(
@@ -711,7 +718,9 @@ export function createReviewTrigger(): TriggerHandler {
 				prNumber,
 				headSha,
 			);
-			if (mergeCheck !== 'continue') return mergeCheck;
+			// Anything but the cleared marker is this handler's answer already — a skip
+			// (`null`) or a Resolve-conflicts dispatch.
+			if (!mergeCheck || !('cleared' in mergeCheck)) return mergeCheck;
 
 			const disposition = await resolveDisposition(ctx, ctx.recheckAttempt ?? 0, prNumber, headSha);
 			if (disposition.kind === 'none') return null;
@@ -759,7 +768,13 @@ export function createReviewTrigger(): TriggerHandler {
 			if (!(await reserveDurableReviewSlot(ctx.project, prNumber, headSha))) return null;
 
 			logger.debug('review: dispatching Review phase', { prNumber, headSha });
-			return { phase: 'review', taskId: prNumber, prNumber, headSha };
+			return {
+				phase: 'review',
+				taskId: prNumber,
+				prNumber,
+				prBranch: mergeCheck.prBranch,
+				headSha,
+			};
 		},
 	};
 }

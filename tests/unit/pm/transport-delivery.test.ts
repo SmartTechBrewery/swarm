@@ -20,6 +20,7 @@ function makeLocalDelegate(overrides: Partial<PMProvider> = {}): PMProvider {
 		getWorkItem: vi.fn().mockResolvedValue({ id: 'i1' }),
 		listWorkItems: vi.fn().mockResolvedValue([]),
 		findWorkItemByUrlSuffix: vi.fn().mockResolvedValue(undefined),
+		findWorkItemForArtifact: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('local-comment'),
 		findComment: vi.fn().mockResolvedValue(undefined),
@@ -302,6 +303,33 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		await expect(writeOnly(fetchImpl).listWorkItems()).rejects.toThrow(
 			/not available on a DB-free worker/i,
 		);
+	});
+
+	it('serves a repository-scoped artifact lookup as one narrow read over the transport', async () => {
+		const wireItem = {
+			id: 'ITEM_21',
+			title: 'Example',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/21',
+		};
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: wireItem }));
+
+		await expect(
+			writeOnly(fetchImpl).findWorkItemForArtifact({
+				repository: 'SmartTechBrewery/swarm',
+				kind: 'issue',
+				number: '21',
+			}),
+		).resolves.toEqual({ ...wireItem, description: '', labels: [], assignees: [] });
+		expect(fetchImpl.mock.calls[0][0]).toBe(
+			'https://swarm.example/worker/delivery/pm/find-artifact',
+		);
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			repository: 'SmartTechBrewery/swarm',
+			kind: 'issue',
+			number: '21',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
 	});
 
 	it('maps a null card back to undefined, the shape the interface returns', async () => {

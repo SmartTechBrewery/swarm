@@ -136,3 +136,27 @@ export async function claimRespondToCiAttempt(
 		return { allowed: true, attempt: 0 };
 	}
 }
+
+/**
+ * Give back an attempt a handler claimed before the automation gate skipped its
+ * dispatch. The Lua script avoids creating a negative TTL-less key when the
+ * claim already expired, and atomically deletes a one-count key so a concurrent
+ * later claim cannot be removed after it increments.
+ */
+export async function releaseRespondToCiAttempt(key: string): Promise<void> {
+	try {
+		await getRedis().eval(
+			`local value = redis.call('GET', KEYS[1])
+if not value then return 0 end
+if tonumber(value) <= 1 then return redis.call('DEL', KEYS[1]) end
+return redis.call('DECR', KEYS[1])`,
+			1,
+			`${KEY_NS}${key}`,
+		);
+	} catch (err) {
+		logger.warn('respond-to-ci attempts: attempt release failed (TTL will reap)', {
+			respondToCiAttemptKey: key,
+			error: String(err),
+		});
+	}
+}
