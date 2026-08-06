@@ -286,7 +286,6 @@ async function acquireImplementationWorktree(
 	resumeExistingBranch: boolean,
 	resumeDelivery: boolean,
 	recoveryMode?: RecoveryMode,
-	projectId?: string,
 	runId?: string,
 ): Promise<{
 	handle: WorktreeHandle;
@@ -300,7 +299,6 @@ async function acquireImplementationWorktree(
 			taskId,
 			recoveryMode,
 			resumeSessionId,
-			projectId ?? '',
 			'implementation',
 		);
 		if (reuseHandle) {
@@ -408,7 +406,6 @@ export async function runImplementationPhase(
 		resumeExistingBranch,
 		resumeDelivery,
 		recoveryMode,
-		project.id,
 		runId,
 	);
 	await onBranchProvisioned?.();

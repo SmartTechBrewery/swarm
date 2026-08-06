@@ -485,7 +485,6 @@ export async function runRespondToReviewPhase(
 		() => worktrees.provision(taskId, { createBranch: false, branch: prBranch, runId }),
 		resumeDelivery,
 		recoveryMode,
-		project.id,
 	);
 	let preserveForResume = false;
 	try {

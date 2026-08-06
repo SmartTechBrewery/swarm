@@ -45,6 +45,34 @@ function canonicalize(p: string): string {
 	}
 }
 
+/** Compare a `ProjectConfig.repo` and a remote's path on equal terms — case and trailing `.git` are noise. */
+function normalizeRepoSlug(slug: string): string {
+	return slug
+		.trim()
+		.replace(/\.git$/i, '')
+		.replace(/^\/+/, '')
+		.replace(/\/+$/, '')
+		.toLowerCase();
+}
+
+/**
+ * The `owner/name` a clone URL points at, or `null` when it cannot be read.
+ * Deliberately provider-neutral: handles `scp`-style (`git@host:owner/name`),
+ * `ssh://`, and `https://` forms, and keeps the whole path so a nested namespace
+ * (a GitLab subgroup) compares correctly rather than being truncated to two parts.
+ */
+function repoSlugFromRemoteUrl(url: string): string | null {
+	const trimmed = url.trim();
+	if (trimmed === '') return null;
+	const scpStyle = trimmed.match(/^[^/@]+@[^:/]+:(.+)$/);
+	if (scpStyle?.[1]) return normalizeRepoSlug(scpStyle[1]);
+	try {
+		return normalizeRepoSlug(new URL(trimmed).pathname) || null;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Actionable text for a blocked collision — names why the existing checkout is
  * protected and how an operator resolves it, so the reason reaches the run row,
@@ -580,7 +608,7 @@ export class GitWorktreeManager {
 		return paths;
 	}
 
-	/** Verify `repoRoot` exists and is a git working tree (§4.2 step 1). */
+	/** Verify `repoRoot` exists, is a git working tree, and is the *assigned* repo (§4.2 step 1). */
 	private async assertGitRepo(): Promise<void> {
 		if (!existsSync(this.project.repoRoot)) {
 			throw new Error(`Project repo root does not exist: ${this.project.repoRoot}`);
@@ -590,6 +618,42 @@ export class GitWorktreeManager {
 		} catch {
 			throw new Error(`Not a git repository: ${this.project.repoRoot}`);
 		}
+		await this.assertRepoIdentity();
+	}
+
+	/**
+	 * Refuse a checkout that is a git repository but not *this project's*.
+	 *
+	 * A same-host worker takes `repoRoot` from the project config, so the two agree
+	 * by construction. A remote worker resolves it from its own environment
+	 * (`SWARM_WORKER_REPO_ROOT`, defaulting to the daemon's working directory) and
+	 * uses that one path for **every** project it is enrolled in — so a daemon
+	 * launched from the wrong directory, or enrolled in a second project, would
+	 * otherwise cut `<branchPrefix><n>` branches and task worktrees in an unrelated
+	 * repository without ever failing.
+	 *
+	 * Verification is best-effort by design: a checkout with no `origin` cannot be
+	 * identified, and refusing one would break every local-only clone (and every
+	 * test fixture). Only a remote that resolves to a *different* repository is an
+	 * error — that is the case worth failing loudly on.
+	 */
+	private async assertRepoIdentity(): Promise<void> {
+		let remoteUrl: string;
+		try {
+			remoteUrl = (await this.git(['remote', 'get-url', 'origin'])).trim();
+		} catch {
+			return;
+		}
+		const actual = repoSlugFromRemoteUrl(remoteUrl);
+		if (!actual) return;
+		const expected = normalizeRepoSlug(this.project.repo);
+		if (actual === expected) return;
+		throw new Error(
+			`Repo root ${this.project.repoRoot} is a checkout of '${actual}', but project ` +
+				`'${this.project.id}' is '${this.project.repo}'. Point this worker at the assigned ` +
+				"repository (`SWARM_WORKER_REPO_ROOT` on a remote worker, the project's `repoRoot` " +
+				'on the host worker).',
+		);
 	}
 
 	/** Best-effort `git fetch origin` — a failure (no remote, offline) is logged, not thrown. */

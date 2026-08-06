@@ -159,7 +159,6 @@ describe('runRespondToReviewPhase', () => {
 			expect.any(Function),
 			false,
 			'checkpoint',
-			deps.project.id,
 		);
 
 		const runArgs = deps.runAgent.mock.calls[0][0];

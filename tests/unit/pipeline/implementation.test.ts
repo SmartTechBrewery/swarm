@@ -482,7 +482,6 @@ describe('runImplementationPhase', () => {
 			'19',
 			'checkpoint',
 			'prior-19',
-			deps.project.id,
 			'implementation',
 		);
 		// The adopted checkout is used as-is.

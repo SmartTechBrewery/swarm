@@ -667,7 +667,6 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		() => worktrees.provision(taskId, { detach: true, baseBranch: headSha, runId }),
 		resumeDelivery,
 		recoveryMode,
-		project.id,
 	);
 	let preserveForResume = false;
 	try {

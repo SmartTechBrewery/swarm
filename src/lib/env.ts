@@ -1,3 +1,5 @@
+import { resolve } from 'node:path';
+
 /**
  * Read a required environment variable, throwing if it is unset or empty.
  *
@@ -135,5 +137,3 @@ export function resolveDispatchMode(raw = process.env.SWARM_DISPATCH_MODE): Disp
 	if (value === 'transport') return 'transport';
 	throw new Error(`SWARM_DISPATCH_MODE must be 'in-process' or 'transport', got '${raw}'`);
 }
-
-import { resolve } from 'node:path';

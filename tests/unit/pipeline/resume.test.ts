@@ -184,7 +184,6 @@ function gate(
 		'19',
 		mode,
 		sessionId,
-		'project-1',
 		phase,
 	);
 }
@@ -402,7 +401,6 @@ describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', (
 			'19',
 			'fresh',
 			undefined,
-			'project-1',
 			'implementation',
 		);
 		expect(result).toEqual({ reuseHandle: null });
@@ -446,7 +444,6 @@ describe('acquireResumableWorktree — a checkpoint continuation resumes no sess
 			},
 			false,
 			mode,
-			'project-1',
 		);
 	}
 

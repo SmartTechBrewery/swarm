@@ -267,7 +267,6 @@ export async function executeRecoveryGate(
 	taskId: string,
 	recoveryMode: RecoveryMode | undefined,
 	expectedSessionId: string | undefined,
-	_projectId: string,
 	phase: TriggerPhase,
 ): Promise<{ reuseHandle: WorktreeHandle | null; checkpoint?: Checkpoint }> {
 	const path = worktrees.worktreePath(taskId);
@@ -337,7 +336,6 @@ export async function acquireResumableWorktree(
 	provisionFresh: () => Promise<WorktreeHandle>,
 	resumeDelivery = false,
 	recoveryMode?: RecoveryMode,
-	projectId?: string,
 ): Promise<{
 	handle: WorktreeHandle;
 	resumed: boolean;
@@ -350,7 +348,6 @@ export async function acquireResumableWorktree(
 			taskId,
 			recoveryMode,
 			resumeSessionId,
-			projectId ?? (worktrees as unknown as { project: { id: string } }).project.id,
 			phase,
 		);
 		if (reuseHandle) {

@@ -268,7 +268,6 @@ export async function runRespondToCiPhase(
 		() => worktrees.provision(taskId, { createBranch: false, branch: prBranch, runId }),
 		resumeDelivery,
 		recoveryMode,
-		project.id,
 	);
 	let preserveForResume = false;
 	try {
