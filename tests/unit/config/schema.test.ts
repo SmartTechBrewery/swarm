@@ -11,15 +11,17 @@ import {
 	validateConfig,
 	type WorktreeRetentionConfig,
 } from '@/config/schema.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
+import { createMockLinearProjectConfig, createMockProjectConfig } from '../../helpers/factories.js';
 
 describe('ProjectConfigSchema', () => {
 	it('accepts a fully-specified project', () => {
 		const project = createMockProjectConfig();
+		const pm = requireGitHubProjectsConfig(project);
 		expect(project.repo).toBe('SmartTechBrewery/swarm');
 		expect(project.credentials.reviewer).toBe('SCM_TOKEN_REVIEWER');
 		expect(project.pm.type).toBe('github-projects');
-		expect(project.pm.statusFieldId).toBe('PVTSSF_lAHOAC3TF84BcNwDzhW4MKo');
+		expect(pm.statusFieldId).toBe('PVTSSF_lAHOAC3TF84BcNwDzhW4MKo');
 	});
 
 	it('applies worktree/branch defaults when omitted', () => {
@@ -102,6 +104,29 @@ describe('ProjectConfigSchema', () => {
 			statusOptions: { backlog: 'opt-1' },
 			phaseLabels: { 'phase-0': 'phase-0' },
 		});
+	});
+
+	it('parses Linear mappings while rejecting missing or GitHub-only fields', () => {
+		const linear = createMockLinearProjectConfig();
+		expect(linear.pm).toMatchObject({ type: 'linear', teamId: expect.any(String) });
+
+		expect(() =>
+			ProjectConfigSchema.parse({
+				...linear,
+				pm: { type: 'linear', statusOptions: { backlog: 'state-1' } },
+			}),
+		).toThrow();
+		expect(() =>
+			ProjectConfigSchema.parse({
+				...linear,
+				pm: {
+					type: 'linear',
+					teamId: 'team-1',
+					statusOptions: { backlog: 'state-1' },
+					projectId: 'PVT_not-linear',
+				},
+			}),
+		).toThrow();
 	});
 
 	it('requires every credential reference', () => {

@@ -26,6 +26,8 @@ export interface BoardMappingForm {
 	providerContext: Record<string, string>;
 }
 
+type GitHubProjectsPm = Extract<ProjectPm, { type: 'github-projects' }>;
+
 /**
  * The six canonical pipeline status keys (`PM_STATUS_KEYS` — the single source
  * of truth in `src/pm/pipeline.ts`) paired with the display labels the board
@@ -101,11 +103,11 @@ export function blankStatusOptions(): Record<PmStatusKey, string> {
  * Status field id is carried in `providerContext` so a saved mapping survives a
  * round-trip even when discovery can't currently reach the board.
  *
- * Reading the GitHub-Projects fields directly is sound while `ProjectPm` has one
- * member: a second provider maps its own container/state ids to this same neutral
- * form here, alongside its dashboard mapping.
+ * Provider-specific fields are read only after narrowing. Until the Linear form
+ * arrives, its mapping projects safely with a blank container and no context.
  */
 export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm {
+	const githubProjects = pm?.type === 'github-projects' ? pm : undefined;
 	const statusOptions = blankStatusOptions();
 	for (const key of STATUS_KEYS) {
 		const value = pm?.statusOptions?.[key];
@@ -113,9 +115,11 @@ export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm 
 	}
 	return {
 		providerId: pm?.type ?? DEFAULT_PM_PROVIDER_ID,
-		containerId: pm?.projectId ?? '',
+		containerId: githubProjects?.projectId ?? '',
 		statusOptions,
-		providerContext: pm?.statusFieldId ? { statusFieldId: pm.statusFieldId } : {},
+		providerContext: githubProjects?.statusFieldId
+			? { statusFieldId: githubProjects.statusFieldId }
+			: {},
 	};
 }
 
@@ -141,13 +145,17 @@ export function cleanStatusOptions(
  * is GitHub Projects' — the same one-member note on {@link toBoardMappingForm}
  * applies, and a second provider builds its own from the neutral form.
  */
-export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | undefined): ProjectPm {
+export function buildPmUpdate(
+	form: BoardMappingForm,
+	existing: ProjectPm | undefined,
+): GitHubProjectsPm {
+	const githubProjects = existing?.type === 'github-projects' ? existing : undefined;
 	return {
 		type: 'github-projects',
 		projectId: form.containerId.trim(),
 		statusFieldId: (form.providerContext.statusFieldId ?? '').trim(),
 		statusOptions: cleanStatusOptions(form.statusOptions),
-		...(existing?.phaseLabels ? { phaseLabels: existing.phaseLabels } : {}),
+		...(githubProjects?.phaseLabels ? { phaseLabels: githubProjects.phaseLabels } : {}),
 	};
 }
 

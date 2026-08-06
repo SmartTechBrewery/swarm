@@ -96,8 +96,7 @@ export function requireGitHubProjectsConfig(
 	project: ProjectConfig,
 ): GitHubProjectsIntegrationConfig {
 	const pm = project.pm;
-	// Read for the message before the guard narrows `pm` — with one union member the
-	// narrowed-away branch has no `type` left to interpolate.
+	// Keep the configured provider id for the wiring-error message before narrowing.
 	const providerId: string = pm.type;
 	if (pm.type !== 'github-projects') {
 		throw new Error(

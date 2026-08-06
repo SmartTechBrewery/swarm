@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import {
 	buildPreplanContract,
 	embedPreplanMarker,
@@ -17,6 +17,7 @@ import {
 } from '../../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig();
+const PROJECT_PM = requireGitHubProjectsConfig(PROJECT);
 const ITEM_URL = 'https://github.com/SmartTechBrewery/swarm/issues/10';
 
 function preplannedChild(overrides: Partial<WorkItem> = {}): WorkItem {
@@ -34,7 +35,7 @@ function preplannedChild(overrides: Partial<WorkItem> = {}): WorkItem {
 		id: 'PVTI_child',
 		url: ITEM_URL,
 		status: 'Planning',
-		statusId: PROJECT.pm.statusOptions.planning,
+		statusId: PROJECT_PM.statusOptions.planning,
 		description: embedPreplanMarker(humanDescription, contract),
 		labels: [{ id: 'split-label', name: SPLIT_CHILD_LABEL }],
 		...overrides,

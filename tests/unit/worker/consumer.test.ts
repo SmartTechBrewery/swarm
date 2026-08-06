@@ -8,6 +8,7 @@ import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { DEFAULT_ENROLLMENT_ALLOWED_PHASES } from '@/identity/worker-enrollment.js';
 import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-service.js';
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
@@ -67,13 +68,16 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 		return provider;
 	},
 	requireProjectPMAdapter: () => ({
-		synthesizeStateChange: (project: ProjectConfig, itemId: string) => ({
-			itemId,
-			containerId: project.pm.projectId,
-			action: 'updated',
-			changedField: project.pm.statusFieldId,
-			changedFieldType: 'single_select',
-		}),
+		synthesizeStateChange: (project: ProjectConfig, itemId: string) => {
+			const pm = requireGitHubProjectsConfig(project);
+			return {
+				itemId,
+				containerId: pm.projectId,
+				action: 'updated',
+				changedField: pm.statusFieldId,
+				changedFieldType: 'single_select',
+			};
+		},
 	}),
 }));
 
@@ -507,6 +511,7 @@ import {
 } from '@/worker/consumer.js';
 
 const PROJECT = createMockProjectConfig();
+const PROJECT_PM = requireGitHubProjectsConfig(PROJECT);
 
 function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
@@ -573,6 +578,10 @@ const RESOLVE_CONFLICTS_TRIGGER: TriggerResult = {
 
 describe('processJob', () => {
 	beforeEach(() => {
+		// This suite exercises the local worker by default. Keep externally configured
+		// transport credentials from switching it into the remote-delivery path.
+		vi.stubEnv('SWARM_CONTROL_PLANE_URL', '');
+		vi.stubEnv('SWARM_WORKER_CREDENTIAL', '');
 		phaseCalls.length = 0;
 		providerBuiltWith.length = 0;
 		projectLookup = () => PROJECT;
@@ -1267,9 +1276,9 @@ describe('processJob', () => {
 					// The synthetic event is the provider adapter's, not the worker's.
 					event: {
 						itemId: workItem.id,
-						containerId: PROJECT.pm.projectId,
+						containerId: PROJECT_PM.projectId,
 						action: 'updated',
-						changedField: PROJECT.pm.statusFieldId,
+						changedField: PROJECT_PM.statusFieldId,
 						changedFieldType: 'single_select',
 					},
 				},
