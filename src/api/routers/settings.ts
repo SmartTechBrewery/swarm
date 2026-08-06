@@ -24,7 +24,7 @@ export const settingsRouter = router({
 			for (const snapshot of snapshots) {
 				await upsertCliQuota(snapshot.cli, snapshot.status, snapshot);
 			}
-		} catch (err) {
+		} catch (_err) {
 			// Don't fail settings update
 		}
 		return result;

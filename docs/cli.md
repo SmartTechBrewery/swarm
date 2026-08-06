@@ -246,6 +246,7 @@ swarm workers list [<owner-identifier>]
 swarm workers set-cli <worker-id> --cli <c1,c2,...>
 swarm workers remove <worker-id>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
+swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
 swarm workers consent <worker-id> <project-id> <on|off>
 ```
@@ -270,6 +271,13 @@ swarm workers consent <worker-id> <project-id> <on|off>
   grants sharing consent at once (operator seeding). The enrollment's **allowed
   pipeline phases** start as every phase — narrow them per project on the worker
   detail screen (`/workers/<id>`); there is no flag for them yet.
+- **`update-enrollment`** — change an *existing* enrollment's execution constraints.
+  `--cli` replaces the allowed CLIs (still a subset of the worker's declared
+  capabilities — widen those with `set-cli` first) and `--concurrency` replaces
+  this worker's share of the project. At least one flag is required; an omitted
+  flag leaves the stored value alone, and there is no value that clears either.
+  Approval status and sharing consent are untouched (`approve` / `consent`). A
+  change takes effect on the **next** dispatch and never interrupts a running agent.
 - **`approve`** — approve a pending enrollment (worker + project) → active.
 - **`consent`** — turn an enrollment's owner-controlled sharing consent on or off.
   Revoking it blocks future dispatch without stopping a running agent.
@@ -279,11 +287,10 @@ SWARM user; an enrollment offers it to a project, and it is routable **only whil
 active AND sharing consent is on**. A project with no enrolled workers is
 unfederated and runs locally.
 
-> **Known gap:** there is no CLI command to change an *existing* enrollment's
-> execution constraints — `enroll` refuses when the worker is already enrolled.
-> The worker detail screen (`/workers/<id>`) edits them; from the CLI, widen one
-> with a direct `UPDATE` on `worker_project_enrollments.allowed_clis` /
-> `.allowed_phases`.
+> **Known gap:** an enrollment's **allowed pipeline phases** still have no CLI
+> flag (`enroll` starts them at every phase, and `update-enrollment` does not
+> change them). Edit them on the worker detail screen (`/workers/<id>`), or from
+> the CLI with a direct `UPDATE` on `worker_project_enrollments.allowed_phases`.
 
 ### `swarm worktrees`
 
