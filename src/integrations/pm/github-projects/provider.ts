@@ -38,6 +38,7 @@ import type {
 	StateDiscoveryResult,
 	UpdateWorkItemPatch,
 	WorkItem,
+	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
 	WorkItemLabel,
@@ -484,6 +485,19 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		// whole board (`src/pm/transport-delivery.ts`).
 		const items = await this.listWorkItems();
 		return items.find((item) => item.url.endsWith(urlSuffix));
+	}
+
+	async findWorkItemForArtifact({
+		repository,
+		kind,
+		number,
+	}: WorkItemArtifact): Promise<WorkItem | undefined> {
+		// GitHub's URL layout belongs in this adapter. Matching the complete URL keeps
+		// a shared org board from returning another repository's same-numbered card.
+		const path = kind === 'issue' ? 'issues' : 'pull';
+		const url = `https://github.com/${repository}/${path}/${number}`;
+		const items = await this.listWorkItems();
+		return items.find((item) => item.url === url);
 	}
 
 	async moveWorkItem(id: string, status: string): Promise<void> {

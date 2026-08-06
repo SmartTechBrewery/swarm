@@ -5,9 +5,9 @@
  * results carry a pull request rather than a {@link WorkItem}.
  *
  * Provider-agnostic by construction (ai/RULES.md §2): the match runs inside the
- * provider ({@link PMProvider.findWorkItemByUrlSuffix}) against the work item's
- * generic `url`, so no GitHub URL shape, GraphQL node id, or `projects_v2` payload
- * assumption enters worker/pipeline code — and a federated worker can serve it as
+ * provider ({@link PMProvider.findWorkItemForArtifact}), so no GitHub URL shape,
+ * GraphQL node id, or `projects_v2` payload assumption enters worker/pipeline code —
+ * and a federated worker can serve it as
  * one narrow read through the control plane instead of proxying the whole board
  * (`src/pm/transport-delivery.ts`). It is the same seam
  * `src/pipeline/respond-to-review.ts` resolves its board card through.
@@ -24,6 +24,8 @@ import type { PMProvider, WorkItem } from './types.js';
 
 /** How a pull request identifies its board work item. */
 export interface PullRequestWorkItemQuery {
+	/** Repository the pull request belongs to, in the project's configured owner/name form. */
+	repository: string;
 	/**
 	 * The work-item number the PR's head branch decodes to under the project's
 	 * `branchPrefix`, when it is a SWARM task branch — the usual case, since SWARM
@@ -41,7 +43,7 @@ export interface PullRequestWorkItemQuery {
  *
  * The backing **work item** wins over the PR: SWARM's own PRs are opened from a
  * `<branchPrefix><itemNumber>` branch and the card tracks that item, so the issue
- * suffix is tried first and the PR suffix only when it misses. Each attempt is one
+ * artifact is tried first and the PR artifact only when it misses. Each attempt is one
  * board read, so the second is paid only by a PR whose item is not on the board.
  *
  * `logContext` is merged into the log lines (the caller's `projectId`/`phase`/
@@ -52,23 +54,23 @@ export async function findWorkItemForPullRequest(
 	query: PullRequestWorkItemQuery,
 	logContext: Record<string, unknown> = {},
 ): Promise<WorkItem | undefined> {
-	const suffixes = [
-		...(query.issueNumber ? [`/issues/${query.issueNumber}`] : []),
-		// A `/pull/100` suffix can't false-match `/pull/1001` — the character before
-		// `100` must be `/` — so the repo needn't be anchored too.
-		`/pull/${query.prNumber}`,
+	const artifacts = [
+		...(query.issueNumber
+			? [{ repository: query.repository, kind: 'issue' as const, number: query.issueNumber }]
+			: []),
+		{ repository: query.repository, kind: 'pullRequest' as const, number: query.prNumber },
 	];
 	try {
-		for (const suffix of suffixes) {
-			const match = await pm.findWorkItemByUrlSuffix(suffix);
+		for (const artifact of artifacts) {
+			const match = await pm.findWorkItemForArtifact(artifact);
 			if (match) return match;
 		}
-		logger.debug('No board work item backs this pull request', { ...logContext, suffixes });
+		logger.debug('No board work item backs this pull request', { ...logContext, artifacts });
 		return undefined;
 	} catch (error) {
 		logger.warn('Could not resolve the board work item for this pull request', {
 			...logContext,
-			suffixes,
+			artifacts,
 			error: error instanceof Error ? error.message : String(error),
 		});
 		return undefined;

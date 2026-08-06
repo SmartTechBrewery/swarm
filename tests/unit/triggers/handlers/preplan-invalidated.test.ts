@@ -48,6 +48,7 @@ function providerReturning(items: WorkItem[]) {
 		getWorkItem: async () => items[0] ?? createMockWorkItem(),
 		listWorkItems,
 		findWorkItemByUrlSuffix: async () => undefined,
+		findWorkItemForArtifact: async () => undefined,
 		moveWorkItem: async () => undefined,
 		addComment: async () => 'comment-1',
 		findComment: async () => undefined,

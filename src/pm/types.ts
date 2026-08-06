@@ -179,6 +179,16 @@ export interface WorkItem {
 	updatedAt?: string;
 }
 
+/** A provider-neutral reference to the backing artifact a board card wraps. */
+export interface WorkItemArtifact {
+	/** Repository identity in the provider's normal owner/name form. */
+	repository: string;
+	/** The artifact category. Providers translate this to their native URL or identifier shape. */
+	kind: 'issue' | 'pullRequest';
+	/** Provider-visible artifact number. */
+	number: string;
+}
+
 /**
  * Fields for creating a new work item — a fresh backing Issue added to the
  * board. Used by Planning's task-splitting to spawn the sibling tasks a large
@@ -300,6 +310,14 @@ export interface PMProvider {
 	 * would be the heavy alternative.
 	 */
 	findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined>;
+
+	/**
+	 * Find the board card wrapping one repository-scoped backing artifact, or
+	 * `undefined` when that artifact is not on the board. Unlike
+	 * {@link findWorkItemByUrlSuffix}, this lookup cannot confuse cards from two
+	 * repositories that happen to use the same issue or pull-request number.
+	 */
+	findWorkItemForArtifact(artifact: WorkItemArtifact): Promise<WorkItem | undefined>;
 
 	/**
 	 * Move a work item to a new pipeline status. `status` is a canonical SWARM

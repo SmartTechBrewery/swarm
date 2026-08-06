@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { RedisMock, set, on } = vi.hoisted(() => {
+const { RedisMock, set, del, on } = vi.hoisted(() => {
 	const set = vi.fn();
+	const del = vi.fn();
 	const on = vi.fn();
-	const RedisMock = vi.fn(() => ({ set, on }));
-	return { RedisMock, set, on };
+	const RedisMock = vi.fn(() => ({ set, del, on }));
+	return { RedisMock, set, del, on };
 });
 
 vi.mock('ioredis', () => ({ Redis: RedisMock }));
@@ -14,6 +15,8 @@ beforeEach(() => {
 	RedisMock.mockClear();
 	set.mockReset();
 	set.mockResolvedValue('OK');
+	del.mockReset();
+	del.mockResolvedValue(1);
 	on.mockReset();
 	process.env.REDIS_URL = 'redis://localhost:6379';
 });
@@ -67,5 +70,19 @@ describe('resolve-conflicts dedup', () => {
 		await expect(
 			refreshConflictResolutionClaim('acme/widgets:42:head123:base456', 480),
 		).resolves.toBeUndefined();
+	});
+
+	it('releases a skipped claim so the same state can be claimed again', async () => {
+		const { claimConflictResolution, releaseConflictResolution } = await import(
+			'@/triggers/resolve-conflicts-dedup.js'
+		);
+		const key = 'acme/widgets:42:head123:base456';
+
+		await claimConflictResolution(key);
+		await releaseConflictResolution(key);
+		await claimConflictResolution(key);
+
+		expect(del).toHaveBeenCalledWith(`${NS}${key}`);
+		expect(set).toHaveBeenCalledTimes(2);
 	});
 });

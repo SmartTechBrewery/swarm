@@ -21,8 +21,9 @@
  * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
  *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
  *   no in-process provider to fall back on: the two writes ride the transport,
- *   two narrow reads ride it too — `listBlockers` (the dependency gate must keep
- *   gating) and `findWorkItemByUrlSuffix` (Respond-to-review's board card) — and
+ *   three narrow reads ride it too — `listBlockers` (the dependency gate must keep
+ *   gating), `findWorkItemByUrlSuffix` (Respond-to-review's board card), and
+ *   `findWorkItemForArtifact` (the repository-scoped automation gate) — and
  *   every remaining board *read* refuses with an actionable error, because the
  *   control plane already performed the reads the assignment was composed from.
  *
@@ -38,7 +39,7 @@ import {
 	ListBlockersDeliveryResponseSchema,
 	MoveWorkItemDeliveryResponseSchema,
 } from '../transport/protocol.js';
-import type { PMProvider, PMType } from './types.js';
+import type { PMProvider, PMType, WorkItemArtifact } from './types.js';
 
 export type { FetchLike } from '../transport/delivery-client.js';
 
@@ -104,6 +105,7 @@ export function createTransportPmDeliveryProvider(options: TransportPmDeliveryOp
 		getWorkItem: (id) => localDelegate.getWorkItem(id),
 		listWorkItems: (filter) => localDelegate.listWorkItems(filter),
 		findWorkItemByUrlSuffix: (urlSuffix) => localDelegate.findWorkItemByUrlSuffix(urlSuffix),
+		findWorkItemForArtifact: (artifact) => localDelegate.findWorkItemForArtifact(artifact),
 		findComment: (id, marker) => localDelegate.findComment(id, marker),
 		createWorkItem: (input) => localDelegate.createWorkItem(input),
 		updateWorkItem: (id, patch) => localDelegate.updateWorkItem(id, patch),
@@ -137,8 +139,8 @@ async function unavailableRead(operation: string): Promise<never> {
 
 /**
  * Build the delegate-less variant for a DB-free remote worker: the two metadata
- * writes ride the transport exactly as above, two **reads** ride it too —
- * `listBlockers` and `findWorkItemByUrlSuffix` — and everything else refuses via
+ * writes ride the transport exactly as above, three **reads** ride it too —
+ * `listBlockers`, `findWorkItemByUrlSuffix`, and `findWorkItemForArtifact` — and everything else refuses via
  * {@link unavailableRead}. The phases a DB-free worker runs today need exactly
  * that surface — Implementation moves the card, posts its comment and gates on
  * dependencies; Respond-to-review resolves its card and moves it — so a call to
@@ -201,6 +203,22 @@ export function createWriteOnlyTransportPmProvider(
 						labels: [],
 						assignees: [],
 					};
+				},
+			),
+		findWorkItemForArtifact: (artifact: WorkItemArtifact) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/find-artifact',
+				{
+					projectId: options.projectId,
+					repository: artifact.repository,
+					kind: artifact.kind,
+					number: artifact.number,
+				},
+				(value) => {
+					const item = FindWorkItemDeliveryResponseSchema.parse(value).item;
+					if (!item) return undefined;
+					return { ...item, description: '', labels: [], assignees: [] };
 				},
 			),
 		...transportPmWrites(options),

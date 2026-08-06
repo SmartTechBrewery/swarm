@@ -6,59 +6,82 @@ import { createMockWorkItem } from '../../helpers/factories.js';
 
 /**
  * A provider whose only exercised method is the narrow card lookup — the seam the
- * gate resolves a PR's board item through (issue #354). `impl` answers per URL
- * suffix so a test can say which suffix has a card behind it.
+ * gate resolves a PR's board item through (issue #354). `impl` answers per
+ * repository-scoped artifact so a test can say which card it finds.
  */
-function pmReturning(impl: (urlSuffix: string) => Promise<unknown>) {
-	const findWorkItemByUrlSuffix = vi.fn(impl);
+function pmReturning(
+	impl: (artifact: { repository: string; kind: string; number: string }) => Promise<unknown>,
+) {
+	const findWorkItemForArtifact = vi.fn(impl);
 	return {
-		pm: { findWorkItemByUrlSuffix } as unknown as PMProvider,
-		findWorkItemByUrlSuffix,
+		pm: { findWorkItemForArtifact } as unknown as PMProvider,
+		findWorkItemForArtifact,
 	};
 }
 
 describe('findWorkItemForPullRequest', () => {
 	it('resolves the backing work item from the PR task branch', async () => {
 		const item = createMockWorkItem({ id: 'item-354' });
-		const { pm, findWorkItemByUrlSuffix } = pmReturning(async (suffix) =>
-			suffix === '/issues/354' ? item : undefined,
+		const { pm, findWorkItemForArtifact } = pmReturning(async (artifact) =>
+			artifact.kind === 'issue' && artifact.number === '354' ? item : undefined,
 		);
 
 		await expect(
-			findWorkItemForPullRequest(pm, { issueNumber: '354', prNumber: '512' }),
+			findWorkItemForPullRequest(pm, {
+				repository: 'SmartTechBrewery/swarm',
+				issueNumber: '354',
+				prNumber: '512',
+			}),
 		).resolves.toBe(item);
 		// The item's own card wins, so the PR suffix is never even asked for.
-		expect(findWorkItemByUrlSuffix).toHaveBeenCalledTimes(1);
-		expect(findWorkItemByUrlSuffix).toHaveBeenCalledWith('/issues/354');
+		expect(findWorkItemForArtifact).toHaveBeenCalledExactlyOnceWith({
+			repository: 'SmartTechBrewery/swarm',
+			kind: 'issue',
+			number: '354',
+		});
 	});
 
 	it('falls back to the PR itself when no card wraps the work item', async () => {
 		const prCard = createMockWorkItem({ id: 'item-pr-512' });
-		const { pm, findWorkItemByUrlSuffix } = pmReturning(async (suffix) =>
-			suffix === '/pull/512' ? prCard : undefined,
+		const { pm, findWorkItemForArtifact } = pmReturning(async (artifact) =>
+			artifact.kind === 'pullRequest' && artifact.number === '512' ? prCard : undefined,
 		);
 
 		await expect(
-			findWorkItemForPullRequest(pm, { issueNumber: '354', prNumber: '512' }),
+			findWorkItemForPullRequest(pm, {
+				repository: 'SmartTechBrewery/swarm',
+				issueNumber: '354',
+				prNumber: '512',
+			}),
 		).resolves.toBe(prCard);
-		expect(findWorkItemByUrlSuffix.mock.calls.map(([suffix]) => suffix)).toEqual([
-			'/issues/354',
-			'/pull/512',
+		expect(findWorkItemForArtifact.mock.calls.map(([artifact]) => artifact)).toEqual([
+			{ repository: 'SmartTechBrewery/swarm', kind: 'issue', number: '354' },
+			{ repository: 'SmartTechBrewery/swarm', kind: 'pullRequest', number: '512' },
 		]);
 	});
 
 	it('asks only for the PR when the branch decodes to no work item', async () => {
-		const { pm, findWorkItemByUrlSuffix } = pmReturning(async () => undefined);
+		const { pm, findWorkItemForArtifact } = pmReturning(async () => undefined);
 
-		await expect(findWorkItemForPullRequest(pm, { prNumber: '512' })).resolves.toBeUndefined();
-		expect(findWorkItemByUrlSuffix).toHaveBeenCalledExactlyOnceWith('/pull/512');
+		await expect(
+			findWorkItemForPullRequest(pm, { repository: 'SmartTechBrewery/swarm', prNumber: '512' }),
+		).resolves.toBeUndefined();
+		expect(findWorkItemForArtifact).toHaveBeenCalledExactlyOnceWith({
+			repository: 'SmartTechBrewery/swarm',
+			kind: 'pullRequest',
+			number: '512',
+		});
 	});
 
 	it('resolves undefined when nothing on the board backs the PR', async () => {
 		const { pm } = pmReturning(async () => undefined);
 
 		await expect(
-			findWorkItemForPullRequest(pm, { issueNumber: '354', prNumber: '512' }),
+			findWorkItemForPullRequest(pm, {
+				repository: 'SmartTechBrewery/swarm',
+				issueNumber: '354',
+				prNumber: '512',
+			}),
 		).resolves.toBeUndefined();
 	});
 
@@ -68,7 +91,26 @@ describe('findWorkItemForPullRequest', () => {
 		});
 
 		await expect(
-			findWorkItemForPullRequest(pm, { issueNumber: '354', prNumber: '512' }),
+			findWorkItemForPullRequest(pm, {
+				repository: 'SmartTechBrewery/swarm',
+				issueNumber: '354',
+				prNumber: '512',
+			}),
 		).resolves.toBeUndefined();
+	});
+
+	it('does not accept a same-numbered artifact from another repository', async () => {
+		const own = createMockWorkItem({ id: 'own-card' });
+		const { pm } = pmReturning(async (artifact) =>
+			artifact.repository === 'SmartTechBrewery/swarm' ? own : undefined,
+		);
+
+		await expect(
+			findWorkItemForPullRequest(pm, {
+				repository: 'SmartTechBrewery/swarm',
+				issueNumber: '354',
+				prNumber: '512',
+			}),
+		).resolves.toBe(own);
 	});
 });

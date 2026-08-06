@@ -47,3 +47,15 @@ export async function refreshConflictResolutionClaim(key: string, ttlSec: number
 		});
 	}
 }
+
+/** Release a claim when a dispatch is skipped before conflict resolution starts. */
+export async function releaseConflictResolution(key: string): Promise<void> {
+	try {
+		await client().del(`${KEY_NS}${key}`);
+	} catch (error) {
+		logger.warn('resolve-conflicts dedup: claim release failed (TTL will reap)', {
+			key,
+			error: String(error),
+		});
+	}
+}

@@ -591,6 +591,18 @@ export const FindWorkItemDeliveryRequestSchema = z.object({
 });
 export type FindWorkItemDeliveryRequest = z.infer<typeof FindWorkItemDeliveryRequestSchema>;
 
+/** Resolve one board card by a repository-scoped backing artifact. */
+export const FindWorkItemForArtifactDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	repository: z.string().min(1),
+	kind: z.enum(['issue', 'pullRequest']),
+	number: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type FindWorkItemForArtifactDeliveryRequest = z.infer<
+	typeof FindWorkItemForArtifactDeliveryRequestSchema
+>;
+
 /**
  * Dedicated schema for the card resolved by `POST /worker/delivery/pm/find-item`.
  * Narrow wire frame containing only what `findWorkItemByUrlSuffix` needs to identify

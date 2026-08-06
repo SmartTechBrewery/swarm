@@ -7,6 +7,7 @@ import {
 	handleAbandonReviewVerdict,
 	handleAddPmComment,
 	handleFindWorkItem,
+	handleFindWorkItemForArtifact,
 	handleListBlockers,
 	handleMarkReviewVerdict,
 	handleMoveWorkItem,
@@ -62,6 +63,7 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 		getWorkItem: vi.fn(),
 		listWorkItems: vi.fn(),
 		findWorkItemByUrlSuffix: vi.fn().mockResolvedValue(undefined),
+		findWorkItemForArtifact: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('IC_kwComment'),
 		findComment: vi.fn(),
@@ -918,6 +920,31 @@ describe('handleFindWorkItem', () => {
 			).status,
 		).toBe(400);
 		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleFindWorkItemForArtifact', () => {
+	it('resolves the card through the repository-scoped provider lookup', async () => {
+		const item = createMockWorkItem({ id: 'ITEM_21' });
+		const findWorkItemForArtifact = vi.fn().mockResolvedValue(item);
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() => makePmProvider({ findWorkItemForArtifact })),
+		});
+
+		const result = await handleFindWorkItemForArtifact(deps, CREDENTIAL, {
+			projectId: 'swarm',
+			repository: 'SmartTechBrewery/swarm',
+			kind: 'issue',
+			number: '21',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+
+		expect(result.status).toBe(200);
+		expect(findWorkItemForArtifact).toHaveBeenCalledWith({
+			repository: 'SmartTechBrewery/swarm',
+			kind: 'issue',
+			number: '21',
+		});
 	});
 });
 

@@ -32,6 +32,7 @@ import {
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import { abandonReviewVerdict } from '../db/repositories/reviewVerdictsRepository.js';
 import {
 	type CompleteRunInput,
 	completeRun,
@@ -119,7 +120,12 @@ import type { TriggerRegistry } from '../triggers/registry.js';
 import {
 	buildConflictResolutionKey,
 	refreshConflictResolutionClaim,
+	releaseConflictResolution,
 } from '../triggers/resolve-conflicts-dedup.js';
+import {
+	buildRespondToCiAttemptKey,
+	releaseRespondToCiAttempt,
+} from '../triggers/respond-to-ci-attempts.js';
 import {
 	buildReviewDispatchKey,
 	refreshReviewDispatchClaim,
@@ -2485,6 +2491,7 @@ async function resolveGatedWorkItem(
 		return await findWorkItemForPullRequest(
 			requireProjectPMProvider(project),
 			{
+				repository: project.repo,
 				// SWARM opens every PR from `<branchPrefix><itemNumber>`, so the branch
 				// names the backing item (the same decode `src/pipeline/respond-to-review.ts`
 				// performs for its board report).
@@ -2991,15 +2998,44 @@ export async function processJob(
 		if (job.runId) {
 			await finalizeRun(job.runId, { status: 'failed', error: reason });
 		}
-		// Hand back the PR+SHA dispatch dedup claim the trigger took moments ago:
-		// unlike a phase that ran, this dispatch consumed nothing, so a later —
-		// correctly labelled — attempt at the same head must not be dropped as a
-		// duplicate. Review and Respond-to-CI share that slot (see
-		// `handleConcurrencyDeferral`); the other two phases never claim it.
+		// Hand back every handler-side claim this dispatch took before the gate. A
+		// skipped phase consumes nothing, so a later correctly labelled attempt must
+		// not be treated as a duplicate, remain blocked by a ledger reservation, or
+		// spend a CI-fix attempt.
 		if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
 			await releaseReviewDispatch(
 				buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
 			);
+		}
+		if (trigger.phase === 'review') {
+			try {
+				await abandonReviewVerdict({
+					projectId: project.id,
+					repository: project.repo,
+					prNumber: trigger.prNumber,
+					headSha: trigger.headSha,
+				});
+			} catch (error) {
+				logger.warn('Could not abandon skipped Review verdict reservation', {
+					projectId: project.id,
+					prNumber: trigger.prNumber,
+					headSha: trigger.headSha,
+					error: describeError(error),
+				});
+			}
+		}
+		if (trigger.phase === 'resolve-conflicts') {
+			await releaseConflictResolution(
+				buildConflictResolutionKey(
+					project.repo,
+					trigger.prNumber,
+					trigger.headSha,
+					trigger.baseSha,
+				),
+			);
+		}
+		if (trigger.phase === 'respond-to-ci') {
+			await releaseRespondToCiAttempt(buildRespondToCiAttemptKey(project.repo, trigger.prNumber));
 		}
 		await tryCompleteDispatch(dispatch.id, 'skipped-not-eligible');
 		return {
