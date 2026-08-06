@@ -494,6 +494,21 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		return items.find((item) => item.url.endsWith(urlSuffix));
 	}
 
+	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
+		// Same client-side match over the same paginated board read as
+		// `findWorkItemByUrlSuffix`, for the same reason: Projects v2 exposes no
+		// server-side filter on the backing content's body. `body` is already in
+		// `LIST_ITEMS_QUERY`, so this costs no extra field.
+		//
+		// Deliberately the board read and **not** GitHub's code/issue search API,
+		// which is an eventually-consistent index: the caller asking is Planning's
+		// retried split, and a child created seconds ago has to be findable *now* or
+		// the guard silently duplicates it — the exact failure this lookup exists to
+		// prevent.
+		const items = await this.listWorkItems();
+		return items.find((item) => item.description.includes(marker));
+	}
+
 	async findWorkItemForArtifact({
 		repository,
 		kind,

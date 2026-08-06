@@ -66,6 +66,10 @@ class InMemoryPMProvider implements PMProvider {
 		return undefined;
 	}
 
+	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
+		return [...this.items.values()].find((item) => item.description.includes(marker));
+	}
+
 	async moveWorkItem(id: string, status: string): Promise<void> {
 		const item = await this.getWorkItem(id);
 		this.items.set(id, { ...item, statusId: this.statusOptions[status] });

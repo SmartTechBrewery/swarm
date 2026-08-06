@@ -57,6 +57,7 @@ const PM_CONTRACT_METHODS = [
 	'listWorkItems',
 	'findWorkItemByUrlSuffix',
 	'findWorkItemForArtifact',
+	'findWorkItemByDescriptionMarker',
 	'moveWorkItem',
 	'addComment',
 	'findComment',

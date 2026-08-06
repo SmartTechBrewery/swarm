@@ -128,6 +128,9 @@ function makeDeps() {
 		listWorkItems: vi.fn(),
 		findWorkItemByUrlSuffix: vi.fn(async () => undefined),
 		findWorkItemForArtifact: vi.fn(async () => undefined),
+		findWorkItemByDescriptionMarker: vi.fn<(marker: string) => Promise<WorkItem | undefined>>(
+			async () => undefined,
+		),
 		addComment: vi.fn<(id: string, text: string) => Promise<string>>(async () => 'comment-1'),
 		findComment: vi.fn<(id: string, marker: string) => Promise<string | undefined>>(
 			async () => undefined,
@@ -1216,6 +1219,189 @@ describe('runPlanningPhase', () => {
 			const posted = fresh.pm.addComment.mock.calls.find((c) => c[0] === 'PVTI_child')?.[1];
 			expect(posted).toContain('<!-- swarm-planning-delivery:run-B -->');
 			expect(fresh.pm.addLabel).toHaveBeenCalledWith('PVTI_child', 'planned');
+		});
+	});
+
+	/**
+	 * Issue #543. The plan comment's marker only short-circuits a delivery that got
+	 * as far as posting it, and `applySplit` runs first — so an interrupted split used
+	 * to re-create every child the failed attempt had already made. These drive the
+	 * real failure: two attempts of the *same* delivery against one board, with the
+	 * provider throwing partway through the first.
+	 */
+	describe('an interrupted split resumes instead of duplicating', () => {
+		const THREE_PHASES = JSON.stringify({
+			mainTask: { title: 'Phase 1', description: 'The first slice' },
+			subTasks: [
+				{ title: 'Phase 2', description: 'The second slice', plan: '# Plan 2\n\nBuild it.' },
+				{ title: 'Phase 3', description: 'The third slice', plan: '# Plan 3\n\nShip it.' },
+			],
+		});
+
+		/** The board both attempts write to, so the retry sees what the first one left. */
+		interface Board {
+			items: WorkItem[];
+			comments: Array<{ itemId: string; body: string }>;
+		}
+
+		/**
+		 * Point one attempt's provider at the shared board: cards are found by the
+		 * marker in their description and comments by the marker in their body, which
+		 * is exactly the state a real provider carries between two attempts.
+		 */
+		function onBoard(deps: ReturnType<typeof makeDeps>, board: Board) {
+			deps.pm.createWorkItem.mockImplementation(async (input) => {
+				const id = `PVTI_child${board.items.length + 1}`;
+				const item = createMockWorkItem({
+					id,
+					title: input.title,
+					description: input.description,
+					url: `https://example.test/${id}`,
+				});
+				board.items.push(item);
+				return item;
+			});
+			deps.pm.findWorkItemByDescriptionMarker.mockImplementation(async (marker) =>
+				board.items.find((item) => item.description.includes(marker)),
+			);
+			deps.pm.updateWorkItem.mockImplementation(async (id, patch) => {
+				const item = board.items.find((i) => i.id === id);
+				if (item && patch.description !== undefined) item.description = patch.description;
+			});
+			deps.pm.addComment.mockImplementation(async (itemId, body) => {
+				board.comments.push({ itemId, body });
+				return `comment-${board.comments.length}`;
+			});
+			deps.pm.findComment.mockImplementation(async (itemId, marker) =>
+				board.comments.some((c) => c.itemId === itemId && c.body.includes(marker))
+					? 'existing-comment'
+					: undefined,
+			);
+			return deps;
+		}
+
+		/** Make the nth (1-based) card creation of this attempt fail, as a 502 would. */
+		function failCreateOnCall(deps: ReturnType<typeof makeDeps>, nth: number) {
+			const create = deps.pm.createWorkItem.getMockImplementation();
+			let calls = 0;
+			deps.pm.createWorkItem.mockImplementation(async (input) => {
+				calls += 1;
+				if (calls === nth) throw new Error('create-item failed: 502');
+				return create?.(input) as ReturnType<NonNullable<typeof create>>;
+			});
+		}
+
+		const titlesOn = (board: Board) => board.items.map((item) => item.title);
+		const commentsOn = (board: Board, itemId: string, marker: string) =>
+			board.comments.filter((c) => c.itemId === itemId && c.body.includes(marker));
+
+		let board: Board;
+
+		beforeEach(() => {
+			splitExists = true;
+			splitContents = THREE_PHASES;
+			board = { items: [], comments: [] };
+		});
+
+		it('creates each child exactly once when the first attempt died between children', async () => {
+			const first = onBoard(makeDeps(), board);
+			failCreateOnCall(first, 2);
+			await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
+				'create-item failed: 502',
+			);
+			expect(titlesOn(board)).toEqual(['Phase 2']);
+
+			const retry = onBoard(makeDeps(), board);
+			await runPlanningPhase({ ...retry, runId: 'run-A' });
+
+			// One card per planned phase, not two for Phase 2 — and the retry created
+			// only the child the first attempt never reached.
+			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(retry.pm.createWorkItem).toHaveBeenCalledTimes(1);
+			expect(retry.pm.createWorkItem).toHaveBeenCalledWith(
+				expect.objectContaining({ title: 'Phase 3' }),
+			);
+			// The adopted child keeps a single copy of each of its two comments.
+			expect(commentsOn(board, 'PVTI_child1', PREPLAN_COMMENT_MARKER_PREFIX)).toHaveLength(1);
+			expect(commentsOn(board, 'PVTI_child1', '<!-- swarm-split-child-note:run-A:0')).toHaveLength(
+				1,
+			);
+		});
+
+		it('creates each child exactly once when the first attempt died on the very first one', async () => {
+			const first = onBoard(makeDeps(), board);
+			failCreateOnCall(first, 1);
+			await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
+				'create-item failed: 502',
+			);
+			expect(titlesOn(board)).toEqual([]);
+
+			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
+
+			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+		});
+
+		it('creates no child at all when the first attempt died after the last one, before the plan comment', async () => {
+			const first = onBoard(makeDeps(), board);
+			// Every child lands; the parent's own plan comment — the very next write — is
+			// what fails, so the delivery has no marker to be recognised by.
+			first.pm.addComment.mockImplementation(async (itemId, body) => {
+				if (itemId === 'PVTI_item18') throw new Error('plan comment failed: 502');
+				board.comments.push({ itemId, body });
+				return `comment-${board.comments.length}`;
+			});
+			await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
+				'plan comment failed: 502',
+			);
+			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+
+			const retry = onBoard(makeDeps(), board);
+			await runPlanningPhase({ ...retry, runId: 'run-A' });
+
+			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(retry.pm.createWorkItem).not.toHaveBeenCalled();
+			// Both adopted children keep exactly one preplan comment, not a second copy
+			// of a plan a reader would have to reconcile.
+			for (const itemId of ['PVTI_child1', 'PVTI_child2']) {
+				expect(commentsOn(board, itemId, PREPLAN_COMMENT_MARKER_PREFIX)).toHaveLength(1);
+			}
+			// And the parent's plan comment, the write that failed, is posted this time.
+			expect(
+				commentsOn(board, 'PVTI_item18', '<!-- swarm-planning-delivery:run-A -->'),
+			).toHaveLength(1);
+		});
+
+		it('still performs its own split for a genuine replan — a new run, hence a new identity', async () => {
+			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
+			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+
+			const replan = onBoard(makeDeps(), board);
+			await runPlanningPhase({ ...replan, runId: 'run-B' });
+
+			// A replan is a new decomposition, not a resumption of the old one.
+			expect(replan.pm.createWorkItem).toHaveBeenCalledTimes(2);
+			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3', 'Phase 2', 'Phase 3']);
+		});
+
+		it("keeps the delivery's marker in the child's body through the preplan contract write", async () => {
+			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
+
+			// The marker has to survive the description rewrite that embeds the preplan,
+			// or the next retry could not recognise the child — and it is inside the
+			// human part the contract's hash is computed over, so the child still reads
+			// as validly preplanned.
+			const child = board.items[0] as WorkItem;
+			expect(child.description).toContain('<!-- swarm-split-child:run-A:0 -->');
+			expect(child.description).toContain('swarm-preplan:v1');
+			expect(isPreplanSkip(evaluatePreplan({ ...child, url: child.url }))).toBe(true);
+		});
+
+		it('does not look a child up when the run has no delivery identity to key on', async () => {
+			const deps = onBoard(makeDeps(), board);
+			await runPlanningPhase(deps);
+
+			expect(deps.pm.findWorkItemByDescriptionMarker).not.toHaveBeenCalled();
+			expect(board.items[0]?.description).not.toContain('swarm-split-child:');
 		});
 	});
 });

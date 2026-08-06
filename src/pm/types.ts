@@ -154,7 +154,7 @@ export interface WorkItem {
 	 * A field rather than a new {@link PMProvider} method, for the same reason as
 	 * {@link statusKey}: the provider already holds the linkage during its own board
 	 * read, so the reference rides along with the item instead of costing a second
-	 * lookup — and the 13-method surface stays as it is. It exists so no *shared*
+	 * lookup — and the method surface stays as it is. It exists so no *shared*
 	 * module has to recover the number by regexing a GitHub-shaped `url`
 	 * (ai/RULES.md §2); see ai/ARCHITECTURE.md "Task identity" for why `taskId`
 	 * stays SCM-derived rather than becoming the PM provider's own key.
@@ -333,6 +333,31 @@ export interface PMProvider {
 	 * repositories that happen to use the same issue or pull-request number.
 	 */
 	findWorkItemForArtifact(artifact: WorkItemArtifact): Promise<WorkItem | undefined>;
+
+	/**
+	 * Find the one board item whose `description` **contains** `marker`, or
+	 * `undefined` when no card carries it.
+	 *
+	 * The narrow, one-card form of a board search, exactly like
+	 * {@link findWorkItemByUrlSuffix}: one marker in, at most one card out. That
+	 * shape is what lets a federated worker ask the control plane "is the card I
+	 * already created still there?" without the whole-board `listWorkItems` it has
+	 * no business performing (`src/pm/transport-delivery.ts`).
+	 *
+	 * A soft miss rather than a throw, for the same reason as
+	 * {@link findWorkItemByUrlSuffix}: "nothing on the board carries that marker"
+	 * is the ordinary answer, which the caller acts on by creating the item.
+	 *
+	 * Provider-agnostic by construction — it matches on `description`, the generic
+	 * field every provider fills from its own body/description text, so no caller
+	 * pattern-matches a provider-specific shape (ai/RULES.md §2). Callers pass a
+	 * marker specific enough that at most one item can carry it, exactly as
+	 * {@link findComment} requires for comments: Planning's split stamps every child
+	 * it creates with one keyed on the delivery and the child's index, so a retried
+	 * delivery recognises the child it already created instead of spawning a second
+	 * one (`applySplit`, `src/pipeline/planning.ts`).
+	 */
+	findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined>;
 
 	/**
 	 * Move a work item to a new pipeline status. `status` is a canonical SWARM

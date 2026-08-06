@@ -321,9 +321,11 @@ worker/user columns complete that half of the mapping too.
   `POST /worker/delivery/pm/find-artifact`, and issue #536 added the five routes
   the **Planning** phase needs —
   `POST /worker/delivery/pm/{find-comment,create-item,update-item,label,blocked-by}`
-  → `findComment`/`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy` — for
-  **sixteen routes** in total, with the wire mechanics shared by one client
-  (`src/transport/delivery-client.ts`). Resolving a board card from a PR URL has a
+  → `findComment`/`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`; and
+  issue #543 added `POST /worker/delivery/pm/find-item-by-marker`
+  → `findWorkItemByDescriptionMarker`, the lookup that makes an interrupted split
+  resume rather than duplicate its children — for **seventeen routes** in total, with
+  the wire mechanics shared by one client (`src/transport/delivery-client.ts`). Resolving a board card from a PR URL has a
   route (`POST /worker/delivery/pm/find-item`); the only PM **reads** with none left
   are `getWorkItem`/`listWorkItems`/discovery, which stay worker-side — no phase a
   DB-free worker runs calls them, since the control plane already read the assigned
@@ -339,7 +341,10 @@ worker/user columns complete that half of the mapping too.
   write is idempotent or best-effort at the provider, and the split's replay guard
   (`findComment` on the plan-delivery marker) is itself one of the calls that
   travels — so a retried Planning delivery still short-circuits before re-creating a
-  child. What was rejected was the coarser alternative of one "apply this split"
+  child. That guard only ever covered a delivery that got as far as posting its plan
+  comment, which issue #543 then closed on the pipeline side: `createWorkItem` — the
+  one write here no contract makes idempotent — is now preceded by a marker lookup
+  that adopts the child this delivery already created (see ADR-003's #536 entry). What was rejected was the coarser alternative of one "apply this split"
   route: it would move `applySplit`'s agent-authored contracts, per-child ordering
   and per-child failure handling onto the control plane, which is pipeline logic the
   phase owns, and would have changed the same-host path too.

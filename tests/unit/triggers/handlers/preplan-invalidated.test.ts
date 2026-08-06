@@ -50,6 +50,7 @@ function providerReturning(items: WorkItem[]) {
 		listWorkItems,
 		findWorkItemByUrlSuffix: async () => undefined,
 		findWorkItemForArtifact: async () => undefined,
+		findWorkItemByDescriptionMarker: async () => undefined,
 		moveWorkItem: async () => undefined,
 		addComment: async () => 'comment-1',
 		findComment: async () => undefined,

@@ -199,7 +199,8 @@ server-side store) it needs:
    now runs **all six** phases, so phase support no longer depends on which machine
    a worker happens to be. The delivery API grows five more PM routes
    (`POST /worker/delivery/pm/{find-comment,create-item,update-item,label,blocked-by}`,
-   for sixteen in total; see ADR-004 §2), each authenticated and authorized exactly
+   for sixteen in total, seventeen once #543 added the split's resume lookup; see
+   ADR-004 §2), each authenticated and authorized exactly
    as the existing PM routes are, and `createWriteOnlyTransportPmProvider` refuses
    only `getWorkItem` and `listWorkItems` — neither of which any DB-free phase calls.
    The agent run, `proposed_plan.md`, the split contract and the deterministic scope
@@ -228,6 +229,19 @@ server-side store) it needs:
    needs a change to the split's own idempotency — a marker written before the first
    child, or a resumable split — which is pipeline semantics shared with the same-host
    path, so it is tracked separately rather than smuggled into a transport change.
+
+   **Closed by issue #543, as a resumable split.** Of the two candidates above, the
+   marker-before-the-first-child one was rejected on inspection: it makes the retry
+   *skip* a split that only got halfway, so the phase succeeds with phases the plan
+   promises and the board does not have. Instead every child is created carrying
+   `<!-- swarm-split-child:<runId>:<index> -->` in its own body, and each iteration
+   resolves that marker before creating anything — a seventeenth route,
+   `POST /worker/delivery/pm/find-item-by-marker`, backing the new
+   `PMProvider.findWorkItemByDescriptionMarker`, narrow in exactly the sense the
+   card-by-URL lookup is (one marker in, at most one card out), so `getWorkItem` and
+   `listWorkItems` stay refused. The fix is in `applySplit`, shared by both paths, and
+   the board *writes* keep their order; the only addition is the lookup ahead of each
+   creation.
    Deliberately **not** taken: relocating `applySplit` behind one coarse
    "apply this split" route. That would carry agent-authored preplan contracts and
    per-child ordering up to the control plane and re-implement Planning's per-child

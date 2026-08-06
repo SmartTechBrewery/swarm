@@ -627,6 +627,31 @@ export type FindWorkItemForArtifactDeliveryRequest = z.infer<
 >;
 
 /**
+ * `POST /worker/delivery/pm/find-item-by-marker` request body — resolve the single
+ * board card whose `description` contains `marker` (issue #543). The read that makes
+ * Planning's split **resumable**: each child is created carrying a marker keyed on
+ * the delivery and the child's index, so a retried delivery recognises a child it
+ * already created rather than spawning a duplicate.
+ *
+ * Narrow in exactly the sense {@link FindWorkItemDeliveryRequestSchema} is — one
+ * marker in, at most one card out — which is why the enumerating `listWorkItems`
+ * stays refused on the worker even though this lookup is served: a worker asks a
+ * one-card question and gets a one-card answer. `marker` carries no provider
+ * vocabulary; it matches `WorkItem.description`, the generic field every provider
+ * populates (ai/RULES.md §2), and the answer rides the same narrow card frame as
+ * the two lookups above.
+ */
+export const FindWorkItemByMarkerDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	/** Unique substring identifying at most one card (`PMProvider.findWorkItemByDescriptionMarker`). */
+	marker: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type FindWorkItemByMarkerDeliveryRequest = z.infer<
+	typeof FindWorkItemByMarkerDeliveryRequestSchema
+>;
+
+/**
  * Dedicated schema for the card resolved by `POST /worker/delivery/pm/find-item`.
  * Narrow wire frame containing only what `findWorkItemByUrlSuffix` needs to identify
  * and move the card (`id`, `title`, `url`, `status?`, `statusId?`) — omitting labels,
@@ -662,11 +687,14 @@ export type FindWorkItemDeliveryResponse = z.infer<typeof FindWorkItemDeliveryRe
  *
  * They are deliberately **one frame per `PMProvider` method** rather than one
  * coarse "apply this split" frame. The split's idempotency does not live in the
- * grouping of its writes: a replayed Planning delivery is short-circuited *before*
- * `applySplit` runs at all, by finding its own plan comment through
- * {@link FindPmCommentDeliveryRequestSchema} (`planDeliveryMarker`,
- * `../pipeline/planning.ts`), and each individual write is idempotent or
- * best-effort by the provider's own contract. A coarse frame would instead have to
+ * grouping of its writes: a replayed Planning delivery that got as far as posting is
+ * short-circuited *before* `applySplit` runs at all, by finding its own plan comment
+ * through {@link FindPmCommentDeliveryRequestSchema} (`planDeliveryMarker`,
+ * `../pipeline/planning.ts`); one that died mid-split resumes instead, recognising
+ * each child it already created through
+ * {@link FindWorkItemByMarkerDeliveryRequestSchema} (issue #543); and each individual
+ * write is idempotent or best-effort by the provider's own contract. A coarse frame
+ * would instead have to
  * carry the agent-authored split — preplan contracts, marker bodies, per-child
  * ordering — up to the control plane and re-implement Planning's per-child failure
  * handling there, moving pipeline logic off the phase that owns it and changing the

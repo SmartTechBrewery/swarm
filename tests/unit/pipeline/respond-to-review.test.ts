@@ -322,6 +322,7 @@ describe('runRespondToReviewPhase', () => {
 					workItems.find((item) => item.url.endsWith(urlSuffix)),
 				),
 				findWorkItemForArtifact: vi.fn(async () => undefined),
+				findWorkItemByDescriptionMarker: vi.fn(async () => undefined),
 				moveWorkItem: vi.fn(async (_id: string, _status: string) => {}),
 				addComment: vi.fn(async () => 'c1'),
 				findComment: vi.fn(async () => undefined),
