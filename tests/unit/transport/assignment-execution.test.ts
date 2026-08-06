@@ -15,10 +15,15 @@ import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
-import { deferrableOrFailedResult, runAssignmentDbFree } from '@/transport/assignment-execution.js';
+import {
+	deferrableOrFailedResult,
+	runAssignmentDbFree,
+	SUPPORTED_DB_FREE_PHASES,
+} from '@/transport/assignment-execution.js';
 import type { FetchLike } from '@/transport/delivery-client.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
+import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
 import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
 
@@ -235,25 +240,130 @@ describe('runAssignmentDbFree', () => {
 		expect(runPhase.mock.calls[0][0].delivery).toBeDefined();
 	});
 
-	it('fails an unsupported phase cleanly with the gate message and never runs it', async () => {
+	it('supports every pipeline phase, so the gate excludes none of them (issue #536)', () => {
+		// The gate itself stays as the worker-side backstop — a daemon predating #536
+		// declares only five phases — but nothing is carved out of it any more.
+		expect([...SUPPORTED_DB_FREE_PHASES].sort()).toEqual([...ALL_TRIGGER_PHASES].sort());
+	});
+
+	it('still fails a phase outside the gate cleanly, before building any delivery', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn();
 		const buildDelivery = vi.fn(async () => stubDelivery());
-		// Planning's PM surface (create/update/label/find-comment + splitting) has no
-		// DB-free seam, so it stays on the local host worker.
-		await runAssignmentDbFree(
-			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'planning' })),
-			sink,
-			{ ...RUN_OPTIONS, deps: depsWith(runPhase as never, buildDelivery) },
-		);
+		// No real phase is excluded now, so drive the backstop with a synthetic phase
+		// value: it must answer with a frame rather than crashing on a DB/Redis access.
+		const assignment = {
+			...ciAssignment(),
+			phase: 'not-a-phase' as never,
+		};
+		await runAssignmentDbFree(assignment, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase as never, buildDelivery),
+		});
 
 		expect(runPhase).not.toHaveBeenCalled();
 		// The gate fails before any delivery is built (no GitHub client, no DB).
 		expect(buildDelivery).not.toHaveBeenCalled();
 		expect(sink.sent.at(-1)).toMatchObject({ type: 'task-execution-result', status: 'failed' });
 		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
-			/phase planning is not yet runnable on a DB-free worker/i,
+			/phase not-a-phase is not yet runnable on a DB-free worker/i,
 		);
+	});
+
+	it('runs planning with its whole board surface on the delivery API and no PM credential', async () => {
+		const sink = recordingSink();
+		const child = {
+			id: 'ITEM_CHILD',
+			title: 'Phase 2 of 2 — extract the reader',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/61',
+		};
+		const posted: string[] = [];
+		const fetchImpl = vi.fn<FetchLike>().mockImplementation(async (url, init) => {
+			posted.push(url);
+			if (url.endsWith('/pm/find-comment')) return jsonResponse(200, { commentId: null });
+			if (url.endsWith('/pm/create-item')) return jsonResponse(200, { item: child });
+			if (url.endsWith('/pm/comment')) return jsonResponse(200, { commentId: 'IC_1' });
+			// Nothing on this path may carry a project credential — only the worker's own.
+			expect(init.headers.authorization).toBe(`Bearer ${WORKER_CREDENTIAL}`);
+			return jsonResponse(200, {});
+		});
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			// What the real phase does on a split: check its own plan-delivery marker,
+			// post the plan, re-scope the parent, create the child, prepare it (preplan
+			// comment → marker → Planning move), label it, chain its dependency edge.
+			const pm = inputs.pm as NonNullable<AssignedPhaseInputs['pm']>;
+			expect(await pm.findComment('ITEM_60', 'swarm-planning-delivery:run-1')).toBeUndefined();
+			await pm.addComment('ITEM_60', 'the plan');
+			await pm.updateWorkItem('ITEM_60', { title: 'Phase 1 of 2 — the smaller first task' });
+			const sibling = await pm.createWorkItem({
+				title: child.title,
+				description: 'child body',
+				status: 'backlog',
+				labels: ['swarm', 'swarm:split-child'],
+			});
+			await pm.addComment(sibling.id, 'preplan');
+			await pm.updateWorkItem(sibling.id, { description: 'child body + marker' });
+			await pm.moveWorkItem(sibling.id, 'planning');
+			await pm.addLabel(sibling.id, 'planned');
+			await pm.addBlockedBy(sibling.id, 'ITEM_60');
+			await pm.addLabel('ITEM_60', 'planned');
+			return { agent: agentResult() };
+		});
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'planning',
+					workItem: createMockWorkItem({ id: 'ITEM_60' }),
+				}),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => stubDelivery(), fetchImpl) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'planning' });
+		expect(posted.map((url) => url.replace(`${CONTROL_PLANE}/worker/delivery`, ''))).toEqual([
+			'/pm/find-comment',
+			'/pm/comment',
+			'/pm/update-item',
+			'/pm/create-item',
+			'/pm/comment',
+			'/pm/update-item',
+			'/pm/move',
+			'/pm/label',
+			'/pm/blocked-by',
+			'/pm/label',
+		]);
+		// Every board call is scoped to the assignment's project, which the server then
+		// re-derives from the authenticated enrollment rather than trusting this field.
+		for (const [, init] of fetchImpl.mock.calls) {
+			expect(JSON.parse(init.body).projectId).toBe(PROJECT_ID);
+		}
+	});
+
+	it('threads a deferred planning run’s session handle back for resumption', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'planning',
+					workItem: createMockWorkItem({ id: 'ITEM_60' }),
+					session: { agentSessionId: 'session-abc', resumeSession: true },
+				}),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		// `runs.agent_session_id` rides the assignment, and a resumed run must receive
+		// it as the CLI's *resume* id (not as a fresh session assignment) so Planning
+		// reuses its preserved worktree and continues the same agent session.
+		expect(runPhase.mock.calls[0][0]).toMatchObject({
+			phase: 'planning',
+			resumeSessionId: 'session-abc',
+			sessionId: undefined,
+		});
 	});
 
 	it('runs respond-to-review with its card lookup, board move and follow-up on the delivery API', async () => {

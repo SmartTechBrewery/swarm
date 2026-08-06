@@ -286,7 +286,9 @@ export function deferrableOrFailedResult(
 }
 
 /**
- * The pipeline phases a DB-free worker can run today, and how each is delivered:
+ * The pipeline phases a DB-free worker can run — since issue #536, **all six**, so
+ * which phases an instance can run no longer depends on which machine a worker
+ * happens to be. Each, and how it is delivered:
  *
  * - `respond-to-ci` / `resolve-conflicts` — entirely worker-side source ops
  *   (implementer `postComment` + `pushBranch` under the operator's own token,
@@ -308,11 +310,18 @@ export function deferrableOrFailedResult(
  *   under the PM credential, and the follow-up-Review enqueue a pushed fix owes
  *   (issue #241), which needs the dispatch store and queue this worker has
  *   neither of.
- *
- * `planning`'s PM write surface (`createWorkItem`/`updateWorkItem`/`addLabel`/
- * `addBlockedBy`/`findComment` plus the split logic) is wider than a delivery seam
- * should carry, so it stays on the local host worker and is failed cleanly by the
- * gate below.
+ * - `planning` — the agent run, the plan file it writes and the deterministic
+ *   scope gate are all worker-side; every board operation rides the delivery API
+ *   under the project's PM credential. That is a wider PM surface than any other
+ *   phase's (post the plan, re-scope the parent, create each split child, embed its
+ *   preplan marker, move it, label it, chain its dependency edges, and find its own
+ *   plan comment on a replay), which is why ADR-003 originally deferred it — but
+ *   width alone was never a boundary violation: no project credential crosses the
+ *   wire, every write is idempotent or best-effort at the provider, and the split's
+ *   replay guard (`findComment` on the plan-delivery marker) is one of the calls
+ *   that travels, so a retry still short-circuits before re-creating a child. The
+ *   alternative — Planning running only where the database is — pinned the whole
+ *   instance to one machine (issue #536).
  */
 export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
 	'respond-to-ci',
@@ -320,6 +329,7 @@ export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhas
 	'implementation',
 	'review',
 	'respond-to-review',
+	'planning',
 ]);
 
 /**
@@ -355,22 +365,29 @@ function resolveDbFreeDelivery(
 	});
 }
 
+/** The phases that act on a board card, and so need a PM provider injected. */
+const BOARD_DRIVEN_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
+	'planning',
+	'implementation',
+	'respond-to-review',
+]);
+
 /**
  * The PM provider a DB-free phase runs against, or `undefined` for a phase that
  * takes none (review / respond-to-ci / resolve-conflicts — `runAssignedPhase`
- * then constructs nothing). The two board-driven phases get the delegate-less
- * transport writer: their board writes ride the delivery API under the
- * server-held PM credential, as do the two narrow reads it serves —
- * Implementation's `listBlockers` and Respond-to-review's card lookup. Every
- * other board read refuses, because the control plane performed the reads this
- * assignment was composed from.
+ * then constructs nothing). Every board-driven phase gets the same delegate-less
+ * transport writer: its board writes ride the delivery API under the server-held
+ * PM credential, as do the four narrow reads it serves — Implementation's
+ * `listBlockers`, Respond-to-review's card lookups, and Planning's `findComment`
+ * replay guard. The two enumerating reads still refuse, because the control plane
+ * performed the reads this assignment was composed from.
  */
 function resolveDbFreePm(
 	phase: TaskPhase,
 	project: ProjectConfig,
 	transport: DeliveryClientOptions,
 ): PMProvider | undefined {
-	if (phase !== 'implementation' && phase !== 'respond-to-review') return undefined;
+	if (!BOARD_DRIVEN_DB_FREE_PHASES.has(phase)) return undefined;
 	return createWriteOnlyTransportPmProvider({
 		...transport,
 		projectId: project.id,

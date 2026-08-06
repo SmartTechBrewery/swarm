@@ -317,11 +317,32 @@ worker/user columns complete that half of the mapping too.
   Since issue #418 the same API also carries `POST /worker/delivery/pm/find-item`
   and `POST /worker/delivery/follow-up-review` alongside the earlier §2
   amendment routes (`POST /worker/delivery/pm/blockers` and
-  `POST /worker/delivery/review-ledger/{prior,mark,abandon}`) — for ten routes in
-  total, with the wire mechanics shared by one client
-  (`src/transport/delivery-client.ts`). Resolving a board card from a PR URL now
-  has a route (`POST /worker/delivery/pm/find-item`); the remaining PM **reads**
-  (`getWorkItem`/`listWorkItems`/`findComment`/discovery) stay worker-side.
+  `POST /worker/delivery/review-ledger/{prior,mark,abandon}`); issue #498 added
+  `POST /worker/delivery/pm/find-artifact`, and issue #536 added the five routes
+  the **Planning** phase needs —
+  `POST /worker/delivery/pm/{find-comment,create-item,update-item,label,blocked-by}`
+  → `findComment`/`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy` — for
+  **sixteen routes** in total, with the wire mechanics shared by one client
+  (`src/transport/delivery-client.ts`). Resolving a board card from a PR URL has a
+  route (`POST /worker/delivery/pm/find-item`); the only PM **reads** with none left
+  are `getWorkItem`/`listWorkItems`/discovery, which stay worker-side — no phase a
+  DB-free worker runs calls them, since the control plane already read the assigned
+  item and put it on the assignment, and enumerating a whole board is not something
+  a worker has business doing.
+
+  Planning's five routes are the point at which "exactly the metadata operations
+  backed by per-project credentials" got noticeably *wide*, which is why ADR-003
+  deferred the phase in the first place. The deferral was reversed on the same
+  criteria the API was built to satisfy and not on convenience: no project
+  credential crosses the wire, the project a card is created on comes from the
+  worker's authenticated routable enrollment rather than the request body, each
+  write is idempotent or best-effort at the provider, and the split's replay guard
+  (`findComment` on the plan-delivery marker) is itself one of the calls that
+  travels — so a retried Planning delivery still short-circuits before re-creating a
+  child. What was rejected was the coarser alternative of one "apply this split"
+  route: it would move `applySplit`'s agent-authored contracts, per-child ordering
+  and per-child failure handling onto the control plane, which is pipeline logic the
+  phase owns, and would have changed the same-host path too.
 - Implementer credential provisioning changes: it is no longer a project
   `project_credentials` row but the worker operator's own token configured
   locally on their machine. `CredentialsSchema.implementer`
@@ -350,6 +371,14 @@ worker/user columns complete that half of the mapping too.
 2. **Local worker unification.** Keep the in-process DB-direct path for the
    local host worker and make the transport additive (proposed), or route even
    the local worker through a `localhost` transport to have one code path?
+   *Now decidable, still open (issue #536).* This question was unanswerable while
+   the transport path could not run every phase — unifying onto it would have cost
+   Planning. All six phases now run there, so the two paths are functionally
+   equivalent and the choice is a real one. The argument for taking it is that two
+   paths mean the DB-free half only gets exercised where someone deliberately runs
+   it: issue #535 found a real phase body had never once run on it. Left open rather
+   than settled here — it is a separate change, and the same-host path carries all
+   traffic today.
 3. **GitHub repo visibility.** `ProjectVisibilitySchema` (`private` |
    `discoverable`, `src/config/schema.ts:443,483`) is a SWARM *discovery* policy,
    **not** GitHub repo visibility. Do we add a separate repo-visibility field to

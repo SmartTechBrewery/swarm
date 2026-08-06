@@ -20,12 +20,14 @@
  *   expect is preserved unchanged.
  * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
  *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
- *   no in-process provider to fall back on: the two writes ride the transport,
- *   three narrow reads ride it too — `listBlockers` (the dependency gate must keep
- *   gating), `findWorkItemByUrlSuffix` (Respond-to-review's board card), and
- *   `findWorkItemForArtifact` (the repository-scoped automation gate) — and
- *   every remaining board *read* refuses with an actionable error, because the
- *   control plane already performed the reads the assignment was composed from.
+ *   no in-process provider to fall back on: every board write rides the transport,
+ *   as do the four narrow reads a DB-free phase needs — `listBlockers` (the
+ *   dependency gate must keep gating), `findWorkItemByUrlSuffix`
+ *   (Respond-to-review's board card), `findWorkItemForArtifact` (the
+ *   repository-scoped automation gate), and `findComment` (Planning's own replay
+ *   guard) — while the two *enumerating/whole-item* reads refuse with an actionable
+ *   error, because the control plane already performed the reads the assignment was
+ *   composed from.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * best-effort / board-report handling behaves exactly as it does with the
@@ -34,12 +36,18 @@
 
 import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
 import {
+	AddBlockedByDeliveryResponseSchema,
 	AddPmCommentDeliveryResponseSchema,
+	AddPmLabelDeliveryResponseSchema,
+	CreateWorkItemDeliveryResponseSchema,
+	FindPmCommentDeliveryResponseSchema,
 	FindWorkItemDeliveryResponseSchema,
+	type FoundWorkItem,
 	ListBlockersDeliveryResponseSchema,
 	MoveWorkItemDeliveryResponseSchema,
+	UpdateWorkItemDeliveryResponseSchema,
 } from '../transport/protocol.js';
-import type { PMProvider, PMType, WorkItemArtifact } from './types.js';
+import type { PMProvider, PMType, WorkItem, WorkItemArtifact } from './types.js';
 
 export type { FetchLike } from '../transport/delivery-client.js';
 
@@ -138,13 +146,27 @@ async function unavailableRead(operation: string): Promise<never> {
 }
 
 /**
- * Build the delegate-less variant for a DB-free remote worker: the two metadata
- * writes ride the transport exactly as above, three **reads** ride it too —
- * `listBlockers`, `findWorkItemByUrlSuffix`, and `findWorkItemForArtifact` — and everything else refuses via
- * {@link unavailableRead}. The phases a DB-free worker runs today need exactly
- * that surface — Implementation moves the card, posts its comment and gates on
- * dependencies; Respond-to-review resolves its card and moves it — so a call to
- * anything else is a wiring bug, and the thrown message says so.
+ * Hydrate the narrow card frame the three card-returning routes answer with
+ * (`FoundWorkItemSchema`) into the `WorkItem` the interface returns. The three
+ * omitted fields take the interface's own "nothing here" values rather than being
+ * left undefined — `labels`/`assignees` are non-optional arrays, and `description`
+ * is the field the server deliberately does not put on the wire. Callers on this
+ * path address the card and name it; none reads a body or an assignee off one.
+ */
+function hydrateWorkItem(item: FoundWorkItem): WorkItem {
+	return { ...item, description: '', labels: [], assignees: [] };
+}
+
+/**
+ * Build the delegate-less variant for a DB-free remote worker: every board
+ * **write** rides the transport, so do the four narrow **reads** a DB-free phase
+ * needs, and the two remaining reads refuse via {@link unavailableRead}. The
+ * phases a DB-free worker runs need exactly that surface — Implementation moves
+ * the card, posts its comment and gates on dependencies; Respond-to-review
+ * resolves its card and moves it; Planning posts its plan, re-scopes the parent,
+ * creates and prepares each split child, chains the dependency edges and labels
+ * what it finished — so a call to anything else is a wiring bug, and the thrown
+ * message says so.
  *
  * `listBlockers` is transported rather than stubbed because the alternative is
  * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
@@ -161,10 +183,21 @@ async function unavailableRead(operation: string): Promise<never> {
  * which is why `listWorkItems` keeps refusing rather than being widened to serve
  * it: a worker has no business enumerating a board to answer a one-card question.
  *
- * `addBlockedBy` still refuses: recording a dependency is Planning's
- * task-splitting move, and Planning does not run on a DB-free worker. Assignees
- * are unreadable here too — only the server-side eligibility gate reads that
- * flag, and it never runs on a worker.
+ * `findComment` and the four remaining writes joined with Planning (issue #536).
+ * The read is load-bearing rather than convenient: it is what makes a *replayed*
+ * Planning delivery reuse its own plan comment and skip the split entirely, so
+ * refusing it would have a retry create a second set of sibling cards. The writes
+ * are the split itself, and each is idempotent or best-effort at the provider —
+ * `addLabel` and `addBlockedBy` absorb a repeat by contract, and a failed
+ * per-child write is already logged and swallowed by the phase — so the wider
+ * surface adds no new failure mode beyond the ones the same-host path already
+ * handles.
+ *
+ * What still refuses is what a worker has no business doing: `getWorkItem` (the
+ * control plane already read the assigned item and put it on the assignment) and
+ * `listWorkItems` (enumerating a whole board). No phase a DB-free worker runs
+ * calls either. Assignees are unreadable here too — only the server-side
+ * eligibility gate reads that flag, and it never runs on a worker.
  */
 export function createWriteOnlyTransportPmProvider(
 	options: WriteOnlyTransportPmDeliveryOptions,
@@ -175,11 +208,6 @@ export function createWriteOnlyTransportPmProvider(
 		supportsDependencies: true,
 		getWorkItem: () => unavailableRead('getWorkItem'),
 		listWorkItems: () => unavailableRead('listWorkItems'),
-		findComment: () => unavailableRead('findComment'),
-		createWorkItem: () => unavailableRead('createWorkItem'),
-		updateWorkItem: () => unavailableRead('updateWorkItem'),
-		addLabel: () => unavailableRead('addLabel'),
-		addBlockedBy: () => unavailableRead('addBlockedBy'),
 		listBlockers: (id) =>
 			postDelivery(
 				options,
@@ -196,13 +224,7 @@ export function createWriteOnlyTransportPmProvider(
 				// interface returns, so the phase reads one shape on both paths.
 				(value) => {
 					const item = FindWorkItemDeliveryResponseSchema.parse(value).item;
-					if (!item) return undefined;
-					return {
-						...item,
-						description: '',
-						labels: [],
-						assignees: [],
-					};
+					return item ? hydrateWorkItem(item) : undefined;
 				},
 			),
 		findWorkItemForArtifact: (artifact: WorkItemArtifact) =>
@@ -217,8 +239,66 @@ export function createWriteOnlyTransportPmProvider(
 				},
 				(value) => {
 					const item = FindWorkItemDeliveryResponseSchema.parse(value).item;
-					if (!item) return undefined;
-					return { ...item, description: '', labels: [], assignees: [] };
+					return item ? hydrateWorkItem(item) : undefined;
+				},
+			),
+		findComment: (id, marker) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/find-comment',
+				{ projectId: options.projectId, itemId: id, marker },
+				// `null` (no comment carries the marker) maps back to `undefined`, the
+				// "not posted yet" answer the caller acts on by posting.
+				(value) => FindPmCommentDeliveryResponseSchema.parse(value).commentId ?? undefined,
+			),
+		createWorkItem: (input) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/create-item',
+				{
+					projectId: options.projectId,
+					title: input.title,
+					description: input.description,
+					status: input.status,
+					...(input.labels !== undefined && { labels: input.labels }),
+				},
+				(value) => hydrateWorkItem(CreateWorkItemDeliveryResponseSchema.parse(value).item),
+			),
+		updateWorkItem: (id, patch) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/update-item',
+				// Spread conditionally rather than passing `patch.title` straight through:
+				// the wire schema's optional fields mean "leave this field alone", so an
+				// omitted patch field must not appear as a key. (`JSON.stringify` would
+				// drop an explicit `undefined` anyway; stating it here keeps the frame's
+				// shape independent of that.)
+				{
+					projectId: options.projectId,
+					itemId: id,
+					...(patch.title !== undefined && { title: patch.title }),
+					...(patch.description !== undefined && { description: patch.description }),
+				},
+				(value) => {
+					UpdateWorkItemDeliveryResponseSchema.parse(value);
+				},
+			),
+		addLabel: (id, name) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/label',
+				{ projectId: options.projectId, itemId: id, name },
+				(value) => {
+					AddPmLabelDeliveryResponseSchema.parse(value);
+				},
+			),
+		addBlockedBy: (id, blockerId) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/blocked-by',
+				{ projectId: options.projectId, itemId: id, blockerId },
+				(value) => {
+					AddBlockedByDeliveryResponseSchema.parse(value);
 				},
 			),
 		...transportPmWrites(options),

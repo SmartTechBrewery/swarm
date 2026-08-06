@@ -55,10 +55,13 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
  *   both resolve the same way: wait for the worker to come back or free a slot.
  * - `missing-phase-capability` — the worker's daemon did not declare this pipeline
  *   phase as one it can execute (issue #467). Distinct from a missing CLI: the
- *   machine may have every CLI and still refuse the phase, as the DB-free remote
- *   daemon refuses `planning` (`SUPPORTED_DB_FREE_PHASES`,
- *   `../transport/assignment-execution.ts`). It is a property of the whole worker,
- *   not of one target, so it is judged before the per-target CLI check.
+ *   machine may have every CLI and still refuse the phase. Today's DB-free daemon
+ *   declares all six (`SUPPORTED_DB_FREE_PHASES`,
+ *   `../transport/assignment-execution.ts`, issue #536), so the live case is version
+ *   skew — a worker row still carrying what an older daemon declared, which stops
+ *   refusing once that machine reconnects on a current build. It is a property of
+ *   the whole worker, not of one target, so it is judged before the per-target CLI
+ *   check.
  * - `phase-not-permitted` — the machine *can* run this phase, but its owner did not
  *   include the phase in this enrollment's `allowedPhases` (issue #509). Distinct
  *   from `missing-phase-capability` because the fix is different and belongs to a
@@ -167,8 +170,8 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	}
 	// Whether this machine runs this phase at all — judged before the CLI because it
 	// is a property of the worker rather than of the candidate target (issue #467).
-	// Without it the gate could hand `planning` to a DB-free daemon, which refuses it
-	// and reports a terminal failure the dispatcher cannot re-route.
+	// Without it the gate could hand a phase to a daemon that refuses it, which then
+	// reports a terminal failure the dispatcher cannot re-route.
 	if (!worker.supportedPhases.includes(phase)) {
 		return { eligible: false, reason: 'missing-phase-capability' };
 	}

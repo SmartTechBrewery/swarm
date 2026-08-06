@@ -103,8 +103,24 @@ function gateInput(overrides: Partial<DispatchGateInput> = {}): DispatchGateInpu
 	};
 }
 
-/** A DB-free remote daemon: every phase it can run, which excludes `planning`. */
+/** A DB-free remote daemon: every phase it can run — all six, since issue #536. */
 const DB_FREE_PHASES: Worker['supportedPhases'] = [...SUPPORTED_DB_FREE_PHASES];
+
+/**
+ * What a DB-free daemon built **before** issue #536 declares — the five phases that
+ * ran without a database back when `planning` needed one. Nothing in production
+ * narrows this set on purpose any more, but the machine-declaration gate exists
+ * precisely for version skew (a worker row is re-declared only when that daemon
+ * reconnects), so the #467/#469 policy composition is pinned against this fixture
+ * rather than against whatever `SUPPORTED_DB_FREE_PHASES` happens to hold.
+ */
+const LEGACY_DB_FREE_PHASES: Worker['supportedPhases'] = [
+	'respond-to-ci',
+	'resolve-conflicts',
+	'implementation',
+	'review',
+	'respond-to-review',
+];
 
 // Issue #469. Stated as its own contract because the set is a policy decision, not
 // an implementation detail: which phases route to their assignee's own machine.
@@ -113,7 +129,7 @@ describe('isAffinityGatedPhase', () => {
 		expect(isAffinityGatedPhase('implementation')).toBe(true);
 	});
 
-	it('does not gate planning, which runs centrally', () => {
+	it('does not gate planning, which belongs to no particular machine', () => {
 		expect(isAffinityGatedPhase('planning')).toBe(false);
 	});
 
@@ -252,7 +268,7 @@ describe('evaluateDispatchEligibility', () => {
 		// predicate cannot silently re-open it.
 		it('plans an item whose assignee owns only a worker that cannot plan', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: LEGACY_DB_FREE_PHASES }),
 				makeCandidate('w-host', { ownerUserId: BOB }),
 			]);
 			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
@@ -266,7 +282,7 @@ describe('evaluateDispatchEligibility', () => {
 
 		it('still holds the assignee to their own worker for implementation on that fixture', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-db-free', { ownerUserId: ALICE, supportedPhases: LEGACY_DB_FREE_PHASES }),
 				makeCandidate('w-host', { ownerUserId: BOB }),
 			]);
 			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
@@ -569,12 +585,13 @@ describe('evaluateDispatchEligibility', () => {
 			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
 		});
 
-		// Issue #467 — the bug this closes. A DB-free daemon refuses `planning`, and the
-		// dispatcher used to learn that only from the worker's terminal failure frame,
-		// which it cannot re-route. The gate now refuses the candidate up front.
-		it('never selects a DB-free worker for planning, deferring instead of dispatching', async () => {
+		// Issue #467 — the bug this closes. A daemon that refuses `planning` used to be
+		// discovered only from the worker's terminal failure frame, which the dispatcher
+		// cannot re-route. The gate refuses such a candidate up front. Driven by a
+		// pre-#536 daemon's declaration, since today's DB-free daemon declares planning.
+		it('never selects a worker that cannot plan, deferring instead of dispatching', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-db-free', { supportedPhases: LEGACY_DB_FREE_PHASES }),
 			]);
 
 			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'planning' }));
@@ -585,6 +602,19 @@ describe('evaluateDispatchEligibility', () => {
 				status: 'ineligible',
 				reason: 'missing-phase-capability',
 			});
+		});
+
+		// Issue #536's dispatch-side outcome: a DB-free daemon now declares `planning`,
+		// so it is selected for it rather than refused — the machine no longer decides
+		// which phases an instance can run.
+		it('selects a DB-free worker for planning once its daemon declares it', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput({ phase: 'planning' }));
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-db-free' } });
 		});
 
 		// The refusal text is posted on the board item once the recheck budget is spent,
@@ -619,9 +649,9 @@ describe('evaluateDispatchEligibility', () => {
 		// The mixed fleet: selection order (first-free) would have offered the DB-free
 		// worker first, so this is what previously made a Planning dispatch die at
 		// random even though a capable worker was connected and eligible.
-		it('routes planning past a DB-free worker to the DB-capable one behind it', async () => {
+		it('routes planning past a worker that cannot plan to the one behind it', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-db-free', { supportedPhases: DB_FREE_PHASES }),
+				makeCandidate('w-db-free', { supportedPhases: LEGACY_DB_FREE_PHASES }),
 				makeCandidate('w-host'),
 			]);
 

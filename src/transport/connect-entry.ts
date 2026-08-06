@@ -16,11 +16,13 @@
  * delivery uses the operator token through the registered SCM provider
  * (`SCMProvider.operatorDeliveryProvider`), the reviewer/PM metadata writes go up to the
  * control plane's delivery API (`./delivery-client.ts`) so those credentials stay
- * server-side, and results stream back over the transport back-channel. Every
- * phase but `planning` runs this way — `respond-to-review` included, since issue
- * #418 gave it the `pm/find-item` card lookup and `follow-up-review` enqueue
- * seams. `planning` alone is failed cleanly by the supported-phase gate. It
- * never opens a database or queue connection.
+ * server-side, and results stream back over the transport back-channel. **Every
+ * phase runs this way** — `respond-to-review` since issue #418 gave it the
+ * `pm/find-item` card lookup and `follow-up-review` enqueue seams, and `planning`
+ * since issue #536 routed its whole board surface through five more PM delivery
+ * routes. The supported-phase gate in `runAssignmentDbFree` stays as the backstop
+ * even though it now excludes nothing. It never opens a database or queue
+ * connection.
  */
 
 import { readFileSync } from 'node:fs';
@@ -87,10 +89,11 @@ async function main(): Promise<void> {
 	const inFlight = new Set<string>();
 	const shutdownSignal = new AbortController();
 	// Declare *which phases* this daemon can execute, not just which CLIs it has
-	// (issue #467). A DB-free daemon runs a strict subset — `planning` needs the PM
-	// write/split surface only a DB-holding worker has — and the control plane cannot
-	// infer that, so it is stated here and the eligibility gate honours it. The gate
-	// in `runAssignmentDbFree` stays as the backstop.
+	// (issue #467). Since issue #536 that is every phase, but the declaration is not
+	// therefore redundant: the control plane cannot infer a daemon's repertoire, and a
+	// worker row keeps whatever an older daemon last declared until this one
+	// reconnects — so stating it is what widens the row back. The gate in
+	// `runAssignmentDbFree` stays as the backstop.
 	const supportedPhases = [...SUPPORTED_DB_FREE_PHASES];
 	const client = connectWorkerTransport({
 		controlPlaneUrl,

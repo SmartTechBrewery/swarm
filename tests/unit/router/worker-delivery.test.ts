@@ -5,7 +5,11 @@ import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
 import {
 	handleAbandonReviewVerdict,
+	handleAddBlockedBy,
 	handleAddPmComment,
+	handleAddPmLabel,
+	handleCreateWorkItem,
+	handleFindPmComment,
 	handleFindWorkItem,
 	handleFindWorkItemForArtifact,
 	handleListBlockers,
@@ -15,6 +19,7 @@ import {
 	handlePriorReview,
 	handleScheduleFollowUpReview,
 	handleSubmitReview,
+	handleUpdateWorkItem,
 	type WorkerDeliveryDeps,
 } from '@/router/worker-delivery.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
@@ -945,6 +950,307 @@ describe('handleFindWorkItemForArtifact', () => {
 			kind: 'issue',
 			number: '21',
 		});
+	});
+});
+
+/**
+ * The Planning routes (issue #536). Planning is the only phase that *creates* board
+ * structure, so beyond the shared prelude every one of these asserts the two
+ * properties that keep a bug from writing wrong structure onto a live board: the
+ * board written to is the **authenticated** project's, and no provider-native shape
+ * (a board option id, a label object) is what crosses the wire.
+ */
+describe('handleFindPmComment', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function findCommentBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			itemId: 'PVTI_item1',
+			marker: 'swarm-planning-delivery:run-1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('returns the matching comment id under the server-side PM credential', async () => {
+		const findComment = vi.fn().mockResolvedValue('IC_kw77');
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ findComment })) });
+
+		const result = await handleFindPmComment(deps, CREDENTIAL, findCommentBody());
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ commentId: 'IC_kw77' });
+		expect(findComment).toHaveBeenCalledWith('PVTI_item1', 'swarm-planning-delivery:run-1');
+	});
+
+	it('answers commentId: null for an unposted delivery — an ordinary miss, not a 404', async () => {
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() =>
+				makePmProvider({ findComment: vi.fn().mockResolvedValue(undefined) }),
+			),
+		});
+		const result = await handleFindPmComment(deps, CREDENTIAL, findCommentBody());
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ commentId: null });
+	});
+
+	it('enforces auth and enrollment before touching the PM credential', async () => {
+		const unknownWorker = makeDeps({
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+		expect((await handleFindPmComment(unknownWorker, 'bogus', findCommentBody())).status).toBe(401);
+		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
+
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleFindPmComment(unenrolled, CREDENTIAL, findCommentBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleFindPmComment(deps, CREDENTIAL, findCommentBody({ projectId: 'nope' }))).status,
+		).toBe(404);
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect(
+			(await handleFindPmComment(deps, CREDENTIAL, findCommentBody({ marker: '' }))).status,
+		).toBe(400);
+		expect(
+			(
+				await handleFindPmComment(
+					deps,
+					CREDENTIAL,
+					findCommentBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleCreateWorkItem', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function createBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			title: 'Phase 2 of 3 — extract the reader',
+			description: 'child body',
+			status: 'backlog',
+			labels: ['swarm', 'swarm:split-child'],
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('creates the card on the authenticated project and projects it onto the narrow frame', async () => {
+		const created = createMockWorkItem({
+			id: 'ITEM_61',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/61',
+			description: 'child body the worker already has',
+			labels: [{ id: 'l1', name: 'swarm' }],
+			assignees: [{ handle: 'octocat' }],
+		});
+		const createWorkItem = vi.fn().mockResolvedValue(created);
+		const project = createMockProjectConfig();
+		const buildPmProvider = vi.fn(() => makePmProvider({ createWorkItem }));
+		const deps = makeDeps({ buildPmProvider });
+
+		const result = await handleCreateWorkItem(deps, CREDENTIAL, createBody());
+
+		expect(result.status).toBe(200);
+		// Description, labels and assignees deliberately stay off the wire.
+		expect(result.json).toEqual({
+			item: {
+				id: 'ITEM_61',
+				title: created.title,
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/61',
+				status: created.status,
+				statusId: created.statusId,
+			},
+		});
+		// A canonical status key and label names in; the adapter resolves them.
+		expect(createWorkItem).toHaveBeenCalledWith({
+			title: 'Phase 2 of 3 — extract the reader',
+			description: 'child body',
+			status: 'backlog',
+			labels: ['swarm', 'swarm:split-child'],
+		});
+		// The board is the authenticated enrollment's project, never one the body names.
+		expect(buildPmProvider).toHaveBeenCalledWith(project);
+	});
+
+	it('omits labels entirely when the request names none', async () => {
+		const createWorkItem = vi.fn().mockResolvedValue(createMockWorkItem());
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ createWorkItem })) });
+
+		await handleCreateWorkItem(deps, CREDENTIAL, createBody({ labels: undefined }));
+
+		expect(createWorkItem).toHaveBeenCalledWith({
+			title: 'Phase 2 of 3 — extract the reader',
+			description: 'child body',
+			status: 'backlog',
+		});
+	});
+
+	it('creates nothing for an unauthenticated, unenrolled or unknown-project request', async () => {
+		const unknownWorker = makeDeps({
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+		expect((await handleCreateWorkItem(unknownWorker, 'bogus', createBody())).status).toBe(401);
+		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
+
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleCreateWorkItem(unenrolled, CREDENTIAL, createBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleCreateWorkItem(deps, CREDENTIAL, createBody({ projectId: 'nope' }))).status,
+		).toBe(404);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect((await handleCreateWorkItem(deps, CREDENTIAL, createBody({ title: '' }))).status).toBe(
+			400,
+		);
+		expect((await handleCreateWorkItem(deps, CREDENTIAL, createBody({ status: '' }))).status).toBe(
+			400,
+		);
+		expect(
+			(
+				await handleCreateWorkItem(
+					deps,
+					CREDENTIAL,
+					createBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleUpdateWorkItem', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function updateBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			itemId: 'PVTI_item1',
+			title: 'Phase 1 of 3 — the smaller first task',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('forwards only the fields the request carries, so an omitted one stays unchanged', async () => {
+		const updateWorkItem = vi.fn().mockResolvedValue(undefined);
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ updateWorkItem })) });
+
+		expect((await handleUpdateWorkItem(deps, CREDENTIAL, updateBody())).status).toBe(200);
+		expect(updateWorkItem).toHaveBeenCalledWith('PVTI_item1', {
+			title: 'Phase 1 of 3 — the smaller first task',
+		});
+
+		// A marker embed patches only the description — and an empty one is legitimate.
+		await handleUpdateWorkItem(deps, CREDENTIAL, updateBody({ title: undefined, description: '' }));
+		expect(updateWorkItem).toHaveBeenLastCalledWith('PVTI_item1', { description: '' });
+	});
+
+	it('enforces auth and enrollment, and rejects a malformed body', async () => {
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleUpdateWorkItem(unenrolled, CREDENTIAL, updateBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect((await handleUpdateWorkItem(deps, CREDENTIAL, updateBody({ itemId: '' }))).status).toBe(
+			400,
+		);
+		// An untitled item is no provider's shape, so an empty title is a bad request
+		// rather than a write that blanks the card.
+		expect((await handleUpdateWorkItem(deps, CREDENTIAL, updateBody({ title: '' }))).status).toBe(
+			400,
+		);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleAddPmLabel', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function labelBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			itemId: 'PVTI_item1',
+			name: 'planned',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('applies the label by name under the server-side PM credential', async () => {
+		const addLabel = vi.fn().mockResolvedValue(undefined);
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ addLabel })) });
+
+		expect((await handleAddPmLabel(deps, CREDENTIAL, labelBody())).status).toBe(200);
+		expect(addLabel).toHaveBeenCalledWith('PVTI_item1', 'planned');
+	});
+
+	it('enforces auth and enrollment, and rejects a malformed body', async () => {
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleAddPmLabel(unenrolled, CREDENTIAL, labelBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect((await handleAddPmLabel(deps, CREDENTIAL, labelBody({ name: '' }))).status).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleAddBlockedBy', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function blockedByBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			itemId: 'PVTI_child',
+			blockerId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('records the dependency edge under the server-side PM credential', async () => {
+		const addBlockedBy = vi.fn().mockResolvedValue(undefined);
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ addBlockedBy })) });
+
+		expect((await handleAddBlockedBy(deps, CREDENTIAL, blockedByBody())).status).toBe(200);
+		expect(addBlockedBy).toHaveBeenCalledWith('PVTI_child', 'PVTI_item1');
+	});
+
+	it('needs no capability branch — a provider without dependencies no-ops by contract', async () => {
+		const addBlockedBy = vi.fn().mockResolvedValue(undefined);
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() => makePmProvider({ supportsDependencies: false, addBlockedBy })),
+		});
+		expect((await handleAddBlockedBy(deps, CREDENTIAL, blockedByBody())).status).toBe(200);
+		expect(addBlockedBy).toHaveBeenCalledWith('PVTI_child', 'PVTI_item1');
+	});
+
+	it('enforces auth and enrollment, and rejects a malformed body', async () => {
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleAddBlockedBy(unenrolled, CREDENTIAL, blockedByBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleAddBlockedBy(deps, CREDENTIAL, blockedByBody({ blockerId: '' }))).status,
+		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
 	});
 });
 

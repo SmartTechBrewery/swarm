@@ -152,15 +152,22 @@ dependency lookup and Respond-to-review's card lookup + board moves under the
 project's PM credential, Review's submitted verdict under its reviewer PAT, and
 the two things backed by a database the control plane owns: Review's
 verdict-ledger reads/writes and the follow-up Review a pushed fix enqueues.
-Results stream back over the transport (ADR-003 §2). Five of the six phases run
-this way today (`respond-to-ci`, `resolve-conflicts`, `implementation`, `review`,
-`respond-to-review`); only `planning`, whose PM write/split surface is wider than
-a delivery seam should carry, stays on the local host worker. Because the daemon
-declares its phase repertoire at handshake, the control plane never routes
-Planning to a worker that cannot run it and the work waits for one that can
-(issue #467); the worker-side gate still fails such an assignment cleanly as a
-backstop. It is **additive**: the same-machine `npm run dev:worker`
-path above is unchanged. See
+Results stream back over the transport (ADR-003 §2). **All six phases** run this
+way (`respond-to-ci`, `resolve-conflicts`, `implementation`, `review`,
+`respond-to-review`, `planning`): Planning was the last holdout and joined in issue
+#536, so which phases an instance can run no longer depends on which machine a
+worker happens to be. Its board surface — create a split's sibling cards, chain
+their dependency edges, re-scope the parent, label what finished, and find its own
+plan comment on a retry — rides five more PM delivery routes under the project's PM
+credential, while its agent run, plan file and scope gate stay worker-side. Because
+the daemon declares its phase repertoire at handshake, the control plane never
+routes a phase to a worker that cannot run it and the work waits for one that can
+(issue #467) — which still matters for a daemon built before #536, since it declares
+only five; the worker-side gate fails such an assignment cleanly as a backstop.
+Separately, an enrollment may be *permitted* `planning` only on an instance admin's
+own worker: Planning is the only phase that creates board structure, so who may
+author it is a trust decision rather than a capability one. It is **additive**: the
+same-machine `npm run dev:worker` path above is unchanged. See
 [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md#remote-worker-transport-worker).
 
 Open <http://localhost:5173>. For a compiled self-hosted dashboard, run
