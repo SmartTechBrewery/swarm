@@ -36,6 +36,7 @@ vi.mock('@/integrations/scm/github/scm-integration.js', () => ({
 	},
 }));
 
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import {
 	createGitHubProjectsProvider,
 	GitHubProjectsPMProvider,
@@ -43,6 +44,7 @@ import {
 import { createMockProjectConfig } from '../../../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig();
+const PROJECT_PM = requireGitHubProjectsConfig(PROJECT);
 
 const ITEM_NODE = {
 	id: 'PVTI_x',
@@ -263,7 +265,7 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(items.map((i) => i.id)).toEqual(['PVTI_x', 'PVTI_y']);
 			expect(graphql).toHaveBeenCalledTimes(1);
 			expect(graphql).toHaveBeenCalledWith(expect.stringContaining('ProjectV2'), {
-				projectId: PROJECT.pm.projectId,
+				projectId: PROJECT_PM.projectId,
 				cursor: undefined,
 			});
 		});
@@ -274,7 +276,7 @@ describe('GitHubProjectsPMProvider', () => {
 			await provider.listWorkItems();
 
 			expect(graphql).toHaveBeenCalledWith(expect.stringContaining('labels(first: 100)'), {
-				projectId: PROJECT.pm.projectId,
+				projectId: PROJECT_PM.projectId,
 				cursor: undefined,
 			});
 		});
@@ -303,11 +305,11 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(items.map((i) => i.id)).toEqual(['PVTI_x', 'PVTI_y']);
 			expect(graphql).toHaveBeenCalledTimes(2);
 			expect(graphql).toHaveBeenNthCalledWith(1, expect.any(String), {
-				projectId: PROJECT.pm.projectId,
+				projectId: PROJECT_PM.projectId,
 				cursor: undefined,
 			});
 			expect(graphql).toHaveBeenNthCalledWith(2, expect.any(String), {
-				projectId: PROJECT.pm.projectId,
+				projectId: PROJECT_PM.projectId,
 				cursor: 'CURSOR_1',
 			});
 		});
@@ -440,9 +442,9 @@ describe('GitHubProjectsPMProvider', () => {
 			expect(graphql).toHaveBeenCalledWith(
 				expect.stringContaining('updateProjectV2ItemFieldValue'),
 				{
-					projectId: PROJECT.pm.projectId,
+					projectId: PROJECT_PM.projectId,
 					itemId: 'PVTI_x',
-					fieldId: PROJECT.pm.statusFieldId,
+					fieldId: PROJECT_PM.statusFieldId,
 					optionId: '47fc9ee4',
 				},
 			);
@@ -568,7 +570,7 @@ describe('GitHubProjectsPMProvider', () => {
 			});
 			// Added to the board...
 			expect(graphql).toHaveBeenNthCalledWith(1, expect.stringContaining('addProjectV2ItemById'), {
-				projectId: PROJECT.pm.projectId,
+				projectId: PROJECT_PM.projectId,
 				contentId: 'I_new',
 			});
 			// ...then placed in Planning (option 61e4505c per the mock config).
@@ -576,9 +578,9 @@ describe('GitHubProjectsPMProvider', () => {
 				2,
 				expect.stringContaining('updateProjectV2ItemFieldValue'),
 				{
-					projectId: PROJECT.pm.projectId,
+					projectId: PROJECT_PM.projectId,
 					itemId: 'PVTI_new',
-					fieldId: PROJECT.pm.statusFieldId,
+					fieldId: PROJECT_PM.statusFieldId,
 					optionId: '61e4505c',
 				},
 			);

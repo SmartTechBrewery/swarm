@@ -15,6 +15,10 @@ import {
 	githubProjectsConfigSchema,
 } from '@/integrations/pm/github-projects/config-schema.js';
 import { resolveStatusKeyByOptionId } from '@/integrations/pm/github-projects/status-mapping.js';
+import {
+	type LinearIntegrationConfig,
+	linearConfigSchema,
+} from '@/integrations/pm/linear/config-schema.js';
 import { DEFAULT_AUTOMATION_LABEL } from '@/pm/automation-label.js';
 import { type PmEvent, PmEventSchema } from '@/pm/events.js';
 import type { WorkItem } from '@/pm/types.js';
@@ -61,6 +65,23 @@ export function createMockGitHubProjectsConfig(
 			inProgress: '47fc9ee4',
 			inReview: 'df73e18b',
 			done: '98236657',
+		},
+		...overrides,
+	});
+}
+
+export function createMockLinearConfig(
+	overrides: Partial<LinearIntegrationConfig> = {},
+): LinearIntegrationConfig {
+	return linearConfigSchema.parse({
+		teamId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+		statusOptions: {
+			backlog: '9e1a4a5f-8d0c-4ea2-a27c-8142ad0297a0',
+			planning: 'f4dd18f6-7943-4a6d-9a0e-4e6cb6e3acb6',
+			todo: '02f2a0de-a18d-4cef-a5e6-82bcc98d0e3e',
+			inProgress: '24a31a62-af5f-449a-aa73-8e636a81e5a2',
+			inReview: '34f47bf9-0d47-4cc6-af6e-7a40d2fcc430',
+			done: '44a7a8b5-4c34-4668-a63e-47aa8f0fbcc5',
 		},
 		...overrides,
 	});
@@ -662,6 +683,23 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 		repoRoot: '/Users/dev/swarm/swarm',
 		// The board mapping lives under the provider that owns it (issue #495).
 		pm: { type: 'github-projects', ...createMockGitHubProjectsConfig() },
+		credentials: {
+			reviewer: 'SCM_TOKEN_REVIEWER',
+			webhookSecret: 'SCM_WEBHOOK_SECRET',
+		},
+		...overrides,
+	});
+}
+
+export function createMockLinearProjectConfig(
+	overrides: Partial<ProjectConfig> = {},
+): ProjectConfig {
+	return ProjectConfigSchema.parse({
+		id: 'linear-project',
+		name: 'linear-project',
+		repo: 'SmartTechBrewery/swarm',
+		repoRoot: '/Users/dev/swarm/swarm',
+		pm: { type: 'linear', ...createMockLinearConfig() },
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',

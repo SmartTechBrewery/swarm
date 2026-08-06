@@ -6,6 +6,7 @@ import {
 	WORKER_SAFE_KEYS,
 	WorkerProjectConfigSchema,
 } from '@/config/worker-config.js';
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 describe('toWorkerConfig', () => {
@@ -31,13 +32,14 @@ describe('toWorkerConfig', () => {
 
 	it('strips the board mapping along with the pm block it now lives under', () => {
 		const project = createMockProjectConfig();
+		const pm = requireGitHubProjectsConfig(project);
 		const worker = toWorkerConfig(project) as Record<string, unknown>;
 		expect('pm' in worker).toBe(false);
 		// Since issue #495 the board's opaque node ids live *inside* `pm`, so dropping
 		// the block is what keeps them off the wire — there is no sibling key left that
 		// could carry them to a worker.
 		const serialized = JSON.stringify(worker);
-		for (const boardId of [project.pm.projectId, project.pm.statusFieldId]) {
+		for (const boardId of [pm.projectId, pm.statusFieldId]) {
 			expect(serialized).not.toContain(boardId);
 		}
 	});

@@ -18,6 +18,7 @@ import {
 	upsertProjectToDb,
 } from '@/db/repositories/projectsRepository.js';
 import { projects } from '@/db/schema/projects.js';
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
 
 function stubDb(rows: unknown[]): void {
@@ -177,6 +178,7 @@ describe('projectsRepository', () => {
 		it('flattens pm.type into a column and upserts on the id', async () => {
 			const { values, onConflictDoUpdate } = stubInsert();
 			const project = createMockProjectConfig({ id: 'proj-1' });
+			const pm = requireGitHubProjectsConfig(project);
 
 			await upsertProjectToDb(project);
 
@@ -187,9 +189,9 @@ describe('projectsRepository', () => {
 			// with no `type` key left inside the blob (issue #495).
 			expect(inserted).not.toHaveProperty('pm');
 			expect(inserted.pmConfig).toEqual({
-				projectId: project.pm.projectId,
-				statusFieldId: project.pm.statusFieldId,
-				statusOptions: project.pm.statusOptions,
+				projectId: pm.projectId,
+				statusFieldId: pm.statusFieldId,
+				statusOptions: pm.statusOptions,
 			});
 
 			const [conflict] = onConflictDoUpdate.mock.calls[0];

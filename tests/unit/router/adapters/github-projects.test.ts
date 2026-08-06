@@ -14,6 +14,7 @@ vi.mock('@/integrations/scm/github/personas.js', () => ({
 }));
 
 import { findProjectByBoard } from '@/config/provider.js';
+import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import {
 	isSwarmBot,
 	type PersonaIdentities,
@@ -24,6 +25,7 @@ import { GitHubProjectsRouterAdapter } from '@/router/adapters/github-projects.j
 const IDENTITIES: PersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 const STATUS_FIELD_ID = 'PVTSSF_lAHOAC3TF84BcNwDzhW4MKo';
 const project = createMockProjectConfig({ id: 'proj-1' });
+const projectPm = requireGitHubProjectsConfig(project);
 
 describe('GitHubProjectsRouterAdapter', () => {
 	const adapter = new GitHubProjectsRouterAdapter();
@@ -187,7 +189,7 @@ describe('GitHubProjectsRouterAdapter', () => {
 			const event = adapter.synthesizeStateChange(project, 'PVTI_next');
 			expect(event).toEqual({
 				itemId: 'PVTI_next',
-				containerId: project.pm.projectId,
+				containerId: projectPm.projectId,
 				action: 'updated',
 				changedField: STATUS_FIELD_ID,
 				changedFieldType: 'single_select',

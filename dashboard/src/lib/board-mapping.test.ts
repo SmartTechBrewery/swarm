@@ -24,6 +24,12 @@ const fullPm: ProjectPm = {
 	},
 };
 
+const linearPm: ProjectPm = {
+	type: 'linear',
+	teamId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+	statusOptions: { planning: 'f4dd18f6-7943-4a6d-9a0e-4e6cb6e3acb6' },
+};
+
 describe('toBoardMappingForm', () => {
 	it('fills blanks and defaults the provider when config is undefined', () => {
 		const form = toBoardMappingForm(undefined);
@@ -51,6 +57,15 @@ describe('toBoardMappingForm', () => {
 	// not a second argument the caller has to keep in sync with the mapping.
 	it('takes the provider id from the stored pm member', () => {
 		expect(toBoardMappingForm(fullPm).providerId).toBe('github-projects');
+	});
+
+	it('keeps a Linear mapping inert until its board form is available', () => {
+		const form = toBoardMappingForm(linearPm);
+		expect(form.providerId).toBe('linear');
+		expect(form.containerId).toBe('');
+		expect(form.providerContext).toEqual({});
+		expect(form.statusOptions.planning).toBe(linearPm.statusOptions.planning);
+		expect(canSaveBoardMapping(form)).toBe(false);
 	});
 
 	it('leaves an unmapped canonical key blank and omits absent field context', () => {
