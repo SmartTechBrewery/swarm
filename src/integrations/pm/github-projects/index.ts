@@ -45,8 +45,10 @@ export const githubProjectsManifest: PMProviderManifest = {
 		{
 			role: GITHUB_PROJECTS_API_TOKEN_ROLE,
 			label: 'GitHub Projects API Token',
+			// Plain prose, not markdown: the dashboard renders a description as text
+			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
 			description:
-				'GitHub token the board is read and written with. Needs `repo` and `project` (fine-grained: repository Issues + Pull requests read/write and organization Projects read/write), plus `read:org` to discover organization-owned boards.',
+				'GitHub token the board is read and written with. Needs the repo and project scopes (fine-grained: repository Issues + Pull requests read/write and organization Projects read/write), plus read:org to discover organization-owned boards.',
 			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
 		},
 		{

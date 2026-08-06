@@ -318,6 +318,19 @@ describe('credentialsRouter', () => {
 			expect(apiToken).toMatchObject({ isConfigured: false, maskedValue: 'not set' });
 		});
 
+		// An empty stored row is what `resolvePmCredential` treats as absent, so
+		// reporting it as configured would have the panel claim the board is set up
+		// while every board call answers "no credential configured".
+		it('reports an empty stored value as not configured', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({ PM_GITHUB_PROJECTS_TOKEN: '' });
+
+			const result = await caller.listPm({ projectId: 'p1' });
+			const apiToken = result.roles.find((role) => role.role === 'apiToken');
+
+			expect(apiToken).toMatchObject({ isConfigured: false, maskedValue: 'not set' });
+		});
+
 		it('throws NOT_FOUND for an unknown project', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
 

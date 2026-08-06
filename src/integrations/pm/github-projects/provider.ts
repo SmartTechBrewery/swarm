@@ -803,9 +803,16 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	/**
-	 * The organizations the board credential belongs to, or an actionable error
-	 * naming the permission it is missing. Must run inside a scoped-credentials
-	 * context (its caller does).
+	 * The organizations the board credential belongs to.
+	 *
+	 * A **permission** failure here is translated into an error naming the scope the
+	 * token is missing, because GitHub's own wording ("Resource not accessible by
+	 * personal access token") does not say which permission or why. Anything else —
+	 * an outage, a 5xx, a rate limit, a revoked token — is rethrown untouched: this
+	 * whole issue exists because a misleading error sent an operator after the wrong
+	 * cause, and asserting "grant read:org" over a network blip would do it again.
+	 *
+	 * Must run inside a scoped-credentials context (its caller does).
 	 */
 	private async collectViewerOrganizations(
 		client: ReturnType<typeof getScopedClient>,
@@ -816,6 +823,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				return data.viewer?.organizations ?? null;
 			});
 		} catch (err) {
+			if (!isPermissionDenied(err)) throw err;
 			throw new Error(
 				'The GitHub Projects API token cannot list the organizations it belongs to, so ' +
 					"organization-owned boards can't be discovered. Grant it the 'read:org' scope " +
@@ -1069,6 +1077,38 @@ function errorMessage(err: unknown): string {
 /** Whether an Octokit error carries a specific HTTP status. */
 function isHttpStatus(err: unknown, status: number): boolean {
 	return typeof err === 'object' && err !== null && (err as { status?: number }).status === status;
+}
+
+/**
+ * Whether a failure is GitHub refusing the call on **authorization** grounds, as
+ * opposed to failing to answer it. Used to decide whether a diagnosis may be
+ * asserted or the original error must stand.
+ *
+ * Three signals, in decreasing order of how much they can be trusted:
+ *
+ * 1. HTTP 401/403 — a REST-shaped refusal (expired or under-scoped token).
+ * 2. A GraphQL `errors` entry typed `FORBIDDEN`/`INSUFFICIENT_SCOPES`. A
+ *    scope-refused GraphQL query comes back **HTTP 200** with an `errors` array,
+ *    which Octokit raises as a `GraphqlResponseError`; the `type` is the
+ *    machine-readable part.
+ * 3. GitHub's own refusal wording, as a fallback. Matching provider text is
+ *    normally the wrong instinct — this module argues against it elsewhere — but
+ *    the GraphQL surface has more than one shape for this and losing the
+ *    diagnosis would regress the very failure #537 was reported for. It is scoped
+ *    tightly enough that an outage or a 5xx cannot satisfy it.
+ */
+function isPermissionDenied(err: unknown): boolean {
+	if (isHttpStatus(err, 401) || isHttpStatus(err, 403)) return true;
+	const graphqlErrors = (err as { errors?: Array<{ type?: string }> } | null)?.errors;
+	if (
+		Array.isArray(graphqlErrors) &&
+		graphqlErrors.some(
+			(entry) => entry?.type === 'FORBIDDEN' || entry?.type === 'INSUFFICIENT_SCOPES',
+		)
+	) {
+		return true;
+	}
+	return /not accessible by|insufficient.*scope|requires.*scope|read:org/i.test(errorMessage(err));
 }
 
 /**

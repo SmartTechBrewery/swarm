@@ -79,6 +79,9 @@ export interface PmCredentialRoleSpec {
 	 * Management tab (issue #537) so the screen's terminology and permission
 	 * guidance come from the provider rather than being hard-coded per provider in
 	 * the UI. Optional: a role whose label says everything needs no prose.
+	 *
+	 * **Plain prose, not markdown.** The panel renders it as text, so backticks and
+	 * other markup would appear literally.
 	 */
 	readonly description?: string;
 	/**

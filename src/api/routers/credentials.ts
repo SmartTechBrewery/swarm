@@ -45,7 +45,17 @@ import { authedProcedure, router } from '../trpc.js';
  * so the response discloses only configured/not-configured state.
  */
 function maskCredential(value: string | undefined): string {
-	return value === undefined ? 'not set' : '****';
+	return isUsableSecret(value) ? '****' : 'not set';
+}
+
+/**
+ * Whether a stored value is one a provider could actually authenticate with.
+ * An empty row is not: `resolvePmCredential` (`src/config/provider.ts`) treats it
+ * as absent and falls through, so reporting it as configured would have the panel
+ * claim the credential is set while every board call answers "not configured".
+ */
+function isUsableSecret(value: string | undefined): boolean {
+	return value !== undefined && value !== '';
 }
 
 /** Load a project for a credential operation, or NOT_FOUND. */
@@ -151,7 +161,7 @@ export const credentialsRouter = router({
 			return Object.entries(scmReferences).map(([role, envVarKey]) => ({
 				role: role as 'reviewer' | 'webhookSecret',
 				envVarKey,
-				isConfigured: envVarKey in resolved,
+				isConfigured: isUsableSecret(resolved[envVarKey]),
 				maskedValue: maskCredential(resolved[envVarKey]),
 			}));
 		}),
@@ -192,7 +202,7 @@ export const credentialsRouter = router({
 						referenceKey,
 						optional: spec.optional === true,
 						inheritsSharedCredential: spec.inheritsSharedCredential,
-						isConfigured: referenceKey in resolved,
+						isConfigured: isUsableSecret(resolved[referenceKey]),
 						maskedValue: maskCredential(resolved[referenceKey]),
 					};
 				}),

@@ -23,6 +23,7 @@
  * bound to it here is the PM provider's own.
  */
 
+import { createHash } from 'node:crypto';
 import { requirePmCredential } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
@@ -51,14 +52,28 @@ const IDENTITY_CACHE_TTL_MS = 60_000;
 
 interface CacheEntry {
 	login: string;
+	/** Fingerprint of the credential the login was resolved for — see below. */
+	credentialFingerprint: string;
 	expiresAt: number;
 }
 
-// Per-project TTL cache of the board identity. Resolving it costs a credential
-// lookup plus a GitHub round-trip, and the board's loop-prevention gate asks for
-// it on every inbound `projects_v2_item` delivery. Failures are re-thrown rather
-// than cached, so a transient credential error isn't pinned for the whole window.
+// Per-project TTL cache of the board identity. The board's loop-prevention gate
+// asks for it on every inbound `projects_v2_item` delivery, and the expensive half
+// of answering is the GitHub round-trip — that is what this caches. The credential
+// itself is still resolved on each call, so rotating it is observed immediately
+// instead of at the end of a TTL window in which SWARM's own board writes (made
+// with the *new* token) would be compared against the old login and mistaken for a
+// human's. Failures are re-thrown rather than cached, so a transient credential
+// error isn't pinned for the whole window.
 const identityCache = new Map<string, CacheEntry>();
+
+/**
+ * A stable, non-reversible tag for a credential value, so a cache entry can be
+ * invalidated when the credential changes without the cache holding the secret.
+ */
+function credentialFingerprint(token: string): string {
+	return createHash('sha256').update(token).digest('hex');
+}
 
 /**
  * The GitHub login the project's board credential authenticates as — the identity
@@ -71,12 +86,23 @@ const identityCache = new Map<string, CacheEntry>();
  * about an account that no longer touches the board. Throws when the credential is
  * missing or its identity can't be resolved — the caller decides how to treat that
  * (the gate fails open and logs).
+ *
+ * Cached per project for {@link IDENTITY_CACHE_TTL_MS}, keyed additionally on a
+ * fingerprint of the credential, so a rotated token is picked up on the next call
+ * rather than at the end of the window.
  */
 export async function resolveGitHubProjectsIdentity(project: ProjectConfig): Promise<string> {
-	const cached = identityCache.get(project.id);
-	if (cached && Date.now() < cached.expiresAt) return cached.login;
-
+	// Resolved before the cache is consulted, deliberately: a credential that was
+	// rotated (or removed — in which case this throws, as it should) must not keep
+	// answering with the login of the account that no longer writes to the board.
 	const token = await requirePmCredential(project, GITHUB_PROJECTS_API_TOKEN_ROLE);
+	const fingerprint = credentialFingerprint(token);
+
+	const cached = identityCache.get(project.id);
+	if (cached && cached.credentialFingerprint === fingerprint && Date.now() < cached.expiresAt) {
+		return cached.login;
+	}
+
 	const login = await getGitHubUserForToken(token);
 	if (!login) {
 		throw new Error(
@@ -85,7 +111,11 @@ export async function resolveGitHubProjectsIdentity(project: ProjectConfig): Pro
 	}
 
 	logger.debug('pm: resolved GitHub Projects board identity', { projectId: project.id, login });
-	identityCache.set(project.id, { login, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	identityCache.set(project.id, {
+		login,
+		credentialFingerprint: fingerprint,
+		expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS,
+	});
 	return login;
 }
 

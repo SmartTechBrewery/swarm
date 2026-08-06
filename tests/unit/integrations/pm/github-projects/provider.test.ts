@@ -983,6 +983,47 @@ describe('GitHubProjectsPMProvider', () => {
 				// Never the credential itself.
 				expect(String(error?.message)).not.toContain('ghp_board_token');
 			});
+
+			it('names the missing permission from a typed GraphQL FORBIDDEN error', async () => {
+				// What Octokit actually raises for a scope-refused GraphQL query: HTTP 200
+				// with an `errors` array, surfaced as a GraphqlResponseError.
+				graphql.mockImplementation(async (query: string) => {
+					if (query.includes('organizations')) {
+						throw Object.assign(new Error('Request failed'), {
+							errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible' }],
+						});
+					}
+					return { viewer: { projectsV2: { nodes: [], pageInfo: { hasNextPage: false } } } };
+				});
+
+				const error = await provider.discover?.('containers', {}).catch((err) => err);
+
+				expect(String(error?.message)).toContain('read:org');
+			});
+
+			// A diagnosis asserted over an outage is the same failure mode #537 was
+			// reported for, one layer up: the operator goes hunting for a permission
+			// problem that isn't there.
+			it.each([
+				['a 502 from GitHub', Object.assign(new Error('Bad gateway'), { status: 502 })],
+				['a socket failure', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })],
+				[
+					'a rate limit',
+					Object.assign(new Error('API rate limit exceeded'), {
+						errors: [{ type: 'RATE_LIMITED' }],
+					}),
+				],
+			])('surfaces %s unchanged instead of blaming read:org', async (_case, thrown) => {
+				graphql.mockImplementation(async (query: string) => {
+					if (query.includes('organizations')) throw thrown;
+					return { viewer: { projectsV2: { nodes: [], pageInfo: { hasNextPage: false } } } };
+				});
+
+				const error = await provider.discover?.('containers', {}).catch((err) => err);
+
+				expect(error).toBe(thrown);
+				expect(String(error?.message)).not.toContain('read:org');
+			});
 		});
 
 		describe('states', () => {
