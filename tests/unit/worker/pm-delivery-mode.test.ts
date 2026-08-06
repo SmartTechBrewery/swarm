@@ -14,6 +14,7 @@ const localDelegate: PMProvider = {
 	listWorkItems: vi.fn(),
 	findWorkItemByUrlSuffix: vi.fn(),
 	findWorkItemForArtifact: vi.fn(),
+	findWorkItemByDescriptionMarker: vi.fn(),
 	moveWorkItem: vi.fn().mockResolvedValue(undefined),
 	addComment: vi.fn().mockResolvedValue('local-comment'),
 	findComment: vi.fn(),

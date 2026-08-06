@@ -21,13 +21,14 @@
  * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
  *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
  *   no in-process provider to fall back on: every board write rides the transport,
- *   as do the four narrow reads a DB-free phase needs — `listBlockers` (the
+ *   as do the five narrow reads a DB-free phase needs — `listBlockers` (the
  *   dependency gate must keep gating), `findWorkItemByUrlSuffix`
  *   (Respond-to-review's board card), `findWorkItemForArtifact` (the
- *   repository-scoped automation gate), and `findComment` (Planning's own replay
- *   guard) — while the two *enumerating/whole-item* reads refuse with an actionable
- *   error, because the control plane already performed the reads the assignment was
- *   composed from.
+ *   repository-scoped automation gate), `findComment` (Planning's own replay guard)
+ *   and `findWorkItemByDescriptionMarker` (the split child that guard's retry must
+ *   not duplicate) — while the two *enumerating/whole-item* reads refuse with an
+ *   actionable error, because the control plane already performed the reads the
+ *   assignment was composed from.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * best-effort / board-report handling behaves exactly as it does with the
@@ -114,6 +115,8 @@ export function createTransportPmDeliveryProvider(options: TransportPmDeliveryOp
 		listWorkItems: (filter) => localDelegate.listWorkItems(filter),
 		findWorkItemByUrlSuffix: (urlSuffix) => localDelegate.findWorkItemByUrlSuffix(urlSuffix),
 		findWorkItemForArtifact: (artifact) => localDelegate.findWorkItemForArtifact(artifact),
+		findWorkItemByDescriptionMarker: (marker) =>
+			localDelegate.findWorkItemByDescriptionMarker(marker),
 		findComment: (id, marker) => localDelegate.findComment(id, marker),
 		createWorkItem: (input) => localDelegate.createWorkItem(input),
 		updateWorkItem: (id, patch) => localDelegate.updateWorkItem(id, patch),
@@ -193,6 +196,15 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  * surface adds no new failure mode beyond the ones the same-host path already
  * handles.
  *
+ * `findWorkItemByDescriptionMarker` finished that job (issue #543). The plan-comment
+ * guard only covers a delivery that got as far as posting; a split that died between
+ * children left `createWorkItem` — the one write no contract makes idempotent — to be
+ * repeated by the retry. This lookup is how the phase recognises the child it already
+ * created, so the split resumes instead of duplicating. It is transported for the same
+ * reason `findWorkItemByUrlSuffix` is: it is the *narrow* form of the board read, one
+ * marker in and at most one card out, so serving it costs a worker nothing it could
+ * misuse and leaves `listWorkItems` refused.
+ *
  * What still refuses is what a worker has no business doing: `getWorkItem` (the
  * control plane already read the assigned item and put it on the assignment) and
  * `listWorkItems` (enumerating a whole board). No phase a DB-free worker runs
@@ -222,6 +234,18 @@ export function createWriteOnlyTransportPmProvider(
 				{ projectId: options.projectId, urlSuffix },
 				// `null` (no card wraps that URL) maps back to the `undefined` the
 				// interface returns, so the phase reads one shape on both paths.
+				(value) => {
+					const item = FindWorkItemDeliveryResponseSchema.parse(value).item;
+					return item ? hydrateWorkItem(item) : undefined;
+				},
+			),
+		findWorkItemByDescriptionMarker: (marker) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/find-item-by-marker',
+				{ projectId: options.projectId, marker },
+				// Same `null` → `undefined` mapping as the sibling card lookups: "no card
+				// carries that marker" is the answer the caller acts on by creating one.
 				(value) => {
 					const item = FindWorkItemDeliveryResponseSchema.parse(value).item;
 					return item ? hydrateWorkItem(item) : undefined;

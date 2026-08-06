@@ -161,7 +161,9 @@ way (`respond-to-ci`, `resolve-conflicts`, `implementation`, `review`,
 worker happens to be. Its board surface — create a split's sibling cards, chain
 their dependency edges, re-scope the parent, label what finished, and find its own
 plan comment on a retry — rides five more PM delivery routes under the project's PM
-credential, while its agent run, plan file and scope gate stay worker-side. Because
+credential, while its agent run, plan file and scope gate stay worker-side. A sixth
+followed with issue #543: a split interrupted partway now resumes from a per-child
+marker in each child's body instead of creating that child a second time. Because
 the daemon declares its phase repertoire at handshake, the control plane never
 routes a phase to a worker that cannot run it and the work waits for one that can
 (issue #467) — which still matters for a daemon built before #536, since it declares

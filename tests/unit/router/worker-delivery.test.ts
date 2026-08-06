@@ -11,6 +11,7 @@ import {
 	handleCreateWorkItem,
 	handleFindPmComment,
 	handleFindWorkItem,
+	handleFindWorkItemByMarker,
 	handleFindWorkItemForArtifact,
 	handleListBlockers,
 	handleMarkReviewVerdict,
@@ -69,6 +70,7 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 		listWorkItems: vi.fn(),
 		findWorkItemByUrlSuffix: vi.fn().mockResolvedValue(undefined),
 		findWorkItemForArtifact: vi.fn().mockResolvedValue(undefined),
+		findWorkItemByDescriptionMarker: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('IC_kwComment'),
 		findComment: vi.fn(),
@@ -924,6 +926,65 @@ describe('handleFindWorkItem', () => {
 				)
 			).status,
 		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleFindWorkItemByMarker', () => {
+	// Issue #543: the read Planning's retried split resolves its already-created
+	// child through. Narrow in the same sense as the URL-suffix lookup — one marker
+	// in, one card out — so the card comes back on the same projected frame.
+	const MARKER = '<!-- swarm-split-child:run-1:0 -->';
+
+	it('resolves the card through the provider and projects the narrow frame', async () => {
+		const findWorkItemByDescriptionMarker = vi
+			.fn()
+			.mockResolvedValue(createMockWorkItem({ id: 'ITEM_61', description: `body\n\n${MARKER}` }));
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() => makePmProvider({ findWorkItemByDescriptionMarker })),
+		});
+
+		const result = await handleFindWorkItemByMarker(deps, CREDENTIAL, {
+			projectId: 'swarm',
+			marker: MARKER,
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+
+		expect(result.status).toBe(200);
+		expect(findWorkItemByDescriptionMarker).toHaveBeenCalledWith(MARKER);
+		// The description the marker was matched on is deliberately not sent back.
+		expect(result.json).toMatchObject({ item: { id: 'ITEM_61' } });
+		expect((result.json as { item: Record<string, unknown> }).item).not.toHaveProperty(
+			'description',
+		);
+	});
+
+	it('answers a miss with an explicit null card', async () => {
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() =>
+				makePmProvider({ findWorkItemByDescriptionMarker: vi.fn().mockResolvedValue(undefined) }),
+			),
+		});
+
+		const result = await handleFindWorkItemByMarker(deps, CREDENTIAL, {
+			projectId: 'swarm',
+			marker: MARKER,
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+
+		expect(result).toMatchObject({ status: 200, json: { item: null } });
+	});
+
+	it('rejects a mismatched protocol version before touching the board', async () => {
+		const deps = makeDeps();
+
+		const result = await handleFindWorkItemByMarker(deps, CREDENTIAL, {
+			projectId: 'swarm',
+			marker: MARKER,
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1,
+		});
+
+		expect(result.status).toBe(400);
 		expect(deps.buildPmProvider).not.toHaveBeenCalled();
 	});
 });

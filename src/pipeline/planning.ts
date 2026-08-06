@@ -438,9 +438,12 @@ interface ChildPreparation {
  * pointed at when it was really posted, so a failed publication never leaves the
  * operator hunting for a comment that doesn't exist.
  *
- * Carries the {@link SWARM_GENERATED_FOOTER} like every other SWARM comment: this
- * is the one body that has no per-delivery marker to identify it, so without the
- * footer comment loop prevention would read it back as human input.
+ * Carries the {@link SWARM_GENERATED_FOOTER} like every other SWARM comment, so
+ * comment loop prevention never reads it back as human input — it used to be the one
+ * SWARM body with nothing *but* the footer, which is why `marker` was added (issue
+ * #543): a resumed split needs to recognise the note it already posted. The marker is
+ * omitted only when there is no delivery identity to key it on (a direct invocation
+ * with no run row), in which case the footer alone still marks the comment as SWARM's.
  */
 export function splitChildCommentBody(
 	parent: WorkItem,
@@ -448,6 +451,7 @@ export function splitChildCommentBody(
 	phaseNumber: number,
 	totalPhases: number,
 	preparation: ChildPreparation,
+	marker?: string,
 ): string {
 	const lines = [
 		`## 🧩 Phase ${phaseNumber} of ${totalPhases} — split from a larger task`,
@@ -487,6 +491,7 @@ export function splitChildCommentBody(
 		);
 	}
 	lines.push('', '---', SWARM_GENERATED_FOOTER);
+	if (marker) lines.push('', marker);
 	return lines.join('\n');
 }
 
@@ -510,6 +515,68 @@ export const PREPLAN_COMMENT_MARKER_PREFIX = '<!-- swarm-preplan-comment:';
 /** The full idempotency marker for one split child's published preplan comment. */
 export function preplanCommentMarker(splitId: string, childIndex: number): string {
 	return `${PREPLAN_COMMENT_MARKER_PREFIX}${splitId}:${childIndex} -->`;
+}
+
+/**
+ * The marker every split child SWARM creates carries in its **own issue body** —
+ * `<!-- swarm-split-child:<splitId>:<childIndex> -->` — which is what makes the
+ * split resumable rather than duplicating (issue #543).
+ *
+ * `createWorkItem` is the one board write in the split that no provider contract
+ * makes idempotent, and it runs *before* the plan comment whose
+ * {@link planDeliveryMarker} short-circuits a replayed delivery — so a split that
+ * died between children used to have its retry create a second card for every
+ * child the first attempt had already made. This marker closes that: it is stamped
+ * into the child's description at creation, so `findWorkItemByDescriptionMarker`
+ * finds exactly the card this delivery already created for this phase, and the
+ * retry adopts it instead of spawning a sibling of a sibling.
+ *
+ * Two properties make it a *delivery* identity rather than a run-of-the-mill id:
+ *
+ * - `splitId` is the delivery id (the run-row id, reused across a retry of the same
+ *   job — `reuseRunRow`, `src/worker/consumer.ts`), so a retry matches and a genuine
+ *   replan — a new run row, hence a new id — matches nothing and performs its own
+ *   split, exactly as the plan comment's marker behaves.
+ * - `childIndex` is the child's ordinal in `proposed_split.json`, so each planned
+ *   phase is matched on its own and a split interrupted *between* children resumes at
+ *   the child it stopped on.
+ *
+ * It is embedded in the body (not attached as a label, and not recorded as a comment
+ * on the parent) because the body is the one place a card's own identity durably
+ * lives and is searchable in a single narrow board lookup — the same reason the
+ * preplan contract rides there ({@link import('./preplan.js').embedPreplanMarker}).
+ * It therefore has to *survive* that later contract write, which rewrites the whole
+ * description: the marker is part of the `humanDescription` the contract's
+ * `descriptionHash` is computed over, so it is re-emitted with every description the
+ * split writes, and a later human edit that removes it invalidates the preplan by
+ * hash anyway.
+ */
+export function splitChildMarker(splitId: string, childIndex: number): string {
+	return swarmMarker('split-child', `${splitId}:${childIndex}`);
+}
+
+/**
+ * Idempotency marker for the split-explanation comment {@link splitChildCommentBody}
+ * posts on a child — the one comment in the split that carried no marker at all
+ * before issue #543, so a resumed split would have posted a second copy.
+ *
+ * The child's *outcome* is deliberately part of the marker. The note reports what
+ * preparation actually achieved, and a retry can legitimately achieve more than the
+ * attempt it resumes (a child left in Backlog by a failed marker embed can reach
+ * Planning the second time). Keying on the outcome makes a repeat of the *same*
+ * report a no-op while letting a genuinely different one post — the second note then
+ * corrects the first, which is the honest board state rather than a stale claim
+ * nothing may contradict.
+ */
+export function splitChildNoteMarker(
+	splitId: string,
+	childIndex: number,
+	prepared: boolean,
+): string {
+	return swarmMarker(
+		'split-child-note',
+		`${splitId}:${childIndex}:${prepared ? 'ready' : 'backlog'}`,
+	);
 }
 
 /**
@@ -695,20 +762,51 @@ function readPlanOrThrow(
  * ({@link markSplitChildPlanned}), not in the `createWorkItem` labels: a child
  * whose preparation failed has not finished being placed as planned, so the label
  * would say the inverse of the board's truth (issue #436).
+ *
+ * **The split is resumable, so an interrupted one does not duplicate (issue #543).**
+ * `createWorkItem` is the only write here that no provider contract makes idempotent,
+ * and it runs before the plan comment whose {@link planDeliveryMarker} short-circuits
+ * a replayed delivery — so a split that died between children (a `createWorkItem`
+ * throwing on child 2 of 3, which putting the call on the wire made a live failure
+ * mode) used to have its retry create child 1 a second time. Every child is therefore
+ * created carrying a {@link splitChildMarker} keyed on this delivery and the child's
+ * index, and each iteration looks that marker up before creating anything
+ * ({@link acquireSplitChild}): a child this delivery already made is *adopted* and its
+ * preparation resumed, while a genuine replan — a new run row, hence a new delivery id
+ * — matches nothing and performs its own split.
+ *
+ * Resuming re-runs the rest of the child's preparation rather than trying to work out
+ * how far the previous attempt got. Every one of those writes is idempotent by
+ * contract (`updateWorkItem` rewrites the same description, `moveWorkItem` re-asserts
+ * the same status, `addLabel`/`addBlockedBy` absorb a repeat) — except the two
+ * *comments*, which are guarded by their own markers on the resume path only
+ * ({@link publishPreplanComment}, {@link postSplitChildNote}). Deliberately no state is
+ * inferred from the adopted card's own fields: the DB-free path's narrow card frame
+ * carries no description (`src/pm/transport-delivery.ts`), so anything read off one
+ * would behave differently on the two paths, and this is pipeline semantics that must
+ * not.
+ *
+ * The board *writes* keep their order exactly (issues #431, #436, #536); the only new
+ * call is the lookup that precedes each creation.
  */
 async function applySplit(
 	pm: PMProvider,
 	parent: WorkItem,
 	split: ProposedSplit,
 	automationLabel: string | undefined,
+	deliveryId: string | undefined,
 ): Promise<{ subTaskItemIds: string[]; mainTaskUpdated: boolean }> {
 	const mainPatch = split.mainTask ? buildMainTaskPatch(parent, split.mainTask) : undefined;
 	if (mainPatch) {
 		await pm.updateWorkItem(parent.id, mainPatch);
 	}
 	// One id/timestamp for the whole split, so every child's marker is stamped
-	// with the operation it came from (provenance; see PreplanContract).
-	const splitId = randomUUID();
+	// with the operation it came from (provenance; see PreplanContract). The id is
+	// the *delivery's* when there is one, which is what makes every marker this
+	// split writes match again on a retry of the same delivery (issue #543); a
+	// direct invocation with no run row falls back to a random id and simply gets
+	// no replay protection, exactly as it gets none from the plan comment's marker.
+	const splitId = deliveryId ?? randomUUID();
 	const generatedAt = new Date().toISOString();
 	const subTaskItemIds: string[] = [];
 	// Phase 1 is the re-scoped original (with whatever rename patch just applied);
@@ -718,68 +816,244 @@ async function applySplit(
 	const totalPhases = split.subTasks.length + 1;
 	const predecessors: WorkItem[] = [firstTask];
 	for (const [childIndex, sub] of split.subTasks.entries()) {
-		const sibling = await pm.createWorkItem({
-			title: sub.title,
-			description: sub.description,
-			status: SIBLING_CREATION_STATUS,
-			// The configured automation label, not a hard-coded `swarm` (issue #131):
-			// a sibling SWARM created must be opted into SWARM's own pipeline, whatever
-			// label this project gates on. Omitted entirely when the gate is disabled.
-			// PLANNED_LABEL is deliberately *not* here — it is applied below, once the
-			// preparation that makes the child planned actually succeeded (issue #436).
-			labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL],
+		const sibling = await spawnSplitChild(pm, {
+			parent,
+			firstTask,
+			predecessors,
+			sub,
+			childIndex,
+			totalPhases,
+			splitId,
+			generatedAt,
+			automationLabel,
+			deliveryId,
 		});
-		let prepared = false;
-		let preplanPublished = false;
-		try {
-			const contract = buildPreplanContract({
-				splitId,
-				childIndex,
-				parentUrl: parent.url,
-				itemUrl: sibling.url,
-				humanDescription: sub.description,
-				plan: sub.plan,
-				generatedAt,
-			});
-			await publishPreplanComment(pm, sibling, contract, childIndex + 2, totalPhases);
-			preplanPublished = true;
-			await pm.updateWorkItem(sibling.id, {
-				description: embedPreplanMarker(sub.description, contract),
-			});
-			await pm.moveWorkItem(sibling.id, SIBLING_START_STATUS);
-			prepared = true;
-		} catch (error) {
-			logger.warn('Planning — failed to prepare split child; leaving it in Backlog', {
-				parentId: parent.id,
-				siblingId: sibling.id,
-				splitId,
-				childIndex,
-				preplanPublished,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-		// Only a child that really was prepared is planned (issue #436): the label
-		// must not outlive a failed preparation, which leaves the child in Backlog
-		// without having completed its placement as planned (see
-		// `markSplitChildPlanned` for what each failure branch actually costs).
-		if (prepared) await markSplitChildPlanned(pm, sibling, splitId, childIndex);
-		// Guard 2 (issue #330): record the native blocked-by relationship for every
-		// preceding phase, so the worker defers this phase's Implementation until they
-		// all close. Best-effort — a provider that can't model dependencies, or a
-		// transient API failure, must not fail the whole split; the comment below (guard
-		// 1) still names the blockers.
-		await linkBlockedBy(pm, sibling, predecessors, splitId, childIndex);
-		await pm.addComment(
-			sibling.id,
-			splitChildCommentBody(firstTask, predecessors, childIndex + 2, totalPhases, {
-				prepared,
-				preplanPublished,
-			}),
-		);
 		subTaskItemIds.push(sibling.id);
 		predecessors.push(sibling);
 	}
 	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined };
+}
+
+/** One child's slice of {@link applySplit}'s state, for {@link spawnSplitChild}. */
+interface SpawnSplitChildOptions {
+	parent: WorkItem;
+	/** Phase 1 — the re-scoped original, named as the first blocker in the child's note. */
+	firstTask: WorkItem;
+	/** Phases 1..N-1, the cumulative blocked-by this child is chained behind. */
+	predecessors: readonly WorkItem[];
+	sub: ProposedSplit['subTasks'][number];
+	childIndex: number;
+	totalPhases: number;
+	splitId: string;
+	generatedAt: string;
+	automationLabel: string | undefined;
+	/** This delivery's id, or `undefined` when the run has no run row to key markers on. */
+	deliveryId: string | undefined;
+}
+
+/**
+ * Place one planned phase on the board: find-or-create its card, prepare it, and
+ * report the outcome — the whole per-child body of {@link applySplit}, extracted for
+ * the same complexity-budget reason as {@link readPlanOrThrow}. Returns the child,
+ * which the caller chains the *next* phase behind.
+ *
+ * Everything the ordering of these writes buys is documented on {@link applySplit};
+ * what lives here is the failure contract. The preparation block is best-effort
+ * (issue #436): a failure inside it is logged and swallowed, leaving the child created
+ * and in Backlog with an honest note, because failing the parent run mid-loop is what
+ * a retry would have to clean up. The find-or-create ahead of it is not — see
+ * {@link acquireSplitChild}.
+ */
+async function spawnSplitChild(pm: PMProvider, options: SpawnSplitChildOptions): Promise<WorkItem> {
+	const {
+		parent,
+		firstTask,
+		predecessors,
+		sub,
+		childIndex,
+		totalPhases,
+		splitId,
+		generatedAt,
+		automationLabel,
+		deliveryId,
+	} = options;
+	// Only a delivery with an identity can be replayed, so only one stamps its
+	// children — and `description` is the human description *plus* that stamp, the
+	// exact string the preplan contract is then hashed over and re-embedded with.
+	const marker = deliveryId ? splitChildMarker(splitId, childIndex) : undefined;
+	const description = marker ? `${sub.description.trimEnd()}\n\n${marker}` : sub.description;
+	const { sibling, resumed } = await acquireSplitChild(pm, {
+		marker,
+		title: sub.title,
+		description,
+		automationLabel,
+		parentId: parent.id,
+		childIndex,
+	});
+	let prepared = false;
+	let preplanPublished = false;
+	try {
+		const contract = buildPreplanContract({
+			splitId,
+			childIndex,
+			parentUrl: parent.url,
+			itemUrl: sibling.url,
+			humanDescription: description,
+			plan: sub.plan,
+			generatedAt,
+		});
+		await publishPreplanComment(pm, sibling, contract, childIndex + 2, totalPhases, resumed);
+		preplanPublished = true;
+		await pm.updateWorkItem(sibling.id, {
+			description: embedPreplanMarker(description, contract),
+		});
+		await pm.moveWorkItem(sibling.id, SIBLING_START_STATUS);
+		prepared = true;
+	} catch (error) {
+		logger.warn('Planning — failed to prepare split child; leaving it in Backlog', {
+			parentId: parent.id,
+			siblingId: sibling.id,
+			splitId,
+			childIndex,
+			preplanPublished,
+			resumed,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	// Only a child that really was prepared is planned (issue #436): the label
+	// must not outlive a failed preparation, which leaves the child in Backlog
+	// without having completed its placement as planned (see
+	// `markSplitChildPlanned` for what each failure branch actually costs).
+	if (prepared) await markSplitChildPlanned(pm, sibling, splitId, childIndex);
+	// Guard 2 (issue #330): record the native blocked-by relationship for every
+	// preceding phase, so the worker defers this phase's Implementation until they
+	// all close. Best-effort — a provider that can't model dependencies, or a
+	// transient API failure, must not fail the whole split; the note below (guard 1)
+	// still names the blockers.
+	await linkBlockedBy(pm, sibling, predecessors, splitId, childIndex);
+	await postSplitChildNote(pm, sibling, {
+		firstTask,
+		predecessors,
+		phaseNumber: childIndex + 2,
+		totalPhases,
+		preparation: { prepared, preplanPublished },
+		marker: deliveryId ? splitChildNoteMarker(splitId, childIndex, prepared) : undefined,
+		resumed,
+	});
+	return sibling;
+}
+
+/** What {@link acquireSplitChild} needs to find-or-create one child. */
+interface AcquireSplitChildOptions {
+	/**
+	 * This delivery's marker for this child, embedded in `description`. Absent when
+	 * the run has no delivery identity, which skips the lookup entirely.
+	 */
+	marker: string | undefined;
+	title: string;
+	/** The child's issue body — human description plus `marker`, when there is one. */
+	description: string;
+	automationLabel: string | undefined;
+	parentId: string;
+	childIndex: number;
+}
+
+/**
+ * Get this delivery's card for one planned phase: adopt the one it already created
+ * when the delivery is being retried, else create it (issue #543).
+ *
+ * The lookup is a *narrow* board read — one marker in, at most one card out — so it
+ * is served on the DB-free path as well (`findWorkItemByDescriptionMarker`,
+ * `src/pm/transport-delivery.ts`) and the phase behaves identically on both. It runs
+ * unconditionally rather than only when something already suspects a retry, because
+ * nothing here can tell a first attempt from a replay: the plan comment's absence is
+ * exactly what both look like, which is how the duplicate got made in the first place.
+ *
+ * A failed lookup **fails the split**, unlike the best-effort preparation writes
+ * below. It is the guard itself: swallowing it would fall through to `createWorkItem`
+ * and produce precisely the duplicate card it exists to prevent, and a retry of a
+ * failed split costs nothing but a retry.
+ *
+ * The marker is written *by* the creation rather than recorded after it, which is what
+ * makes a lost response safe: an attempt whose `createWorkItem` threw on a 502 the
+ * board had already applied still left a card carrying the marker, so the retry adopts
+ * it. The one case this cannot see is a creation that failed *inside* the provider
+ * after minting the backing artifact but before it reached the board (GitHub Projects
+ * creates the Issue, then adds it — `createWorkItem`, `src/integrations/pm/…`): that
+ * orphan is not on the board to be found, so the retry makes a new card. Narrowing
+ * that further is the provider's own job, not the phase's.
+ */
+async function acquireSplitChild(
+	pm: PMProvider,
+	options: AcquireSplitChildOptions,
+): Promise<{ sibling: WorkItem; resumed: boolean }> {
+	const { marker, title, description, automationLabel, parentId, childIndex } = options;
+	if (marker) {
+		const existing = await pm.findWorkItemByDescriptionMarker(marker);
+		if (existing) {
+			logger.info('Planning — resuming a split child this delivery already created', {
+				parentId,
+				siblingId: existing.id,
+				childIndex,
+			});
+			return { sibling: existing, resumed: true };
+		}
+	}
+	const sibling = await pm.createWorkItem({
+		title,
+		description,
+		status: SIBLING_CREATION_STATUS,
+		// The configured automation label, not a hard-coded `swarm` (issue #131):
+		// a sibling SWARM created must be opted into SWARM's own pipeline, whatever
+		// label this project gates on. Omitted entirely when the gate is disabled.
+		// PLANNED_LABEL is deliberately *not* here — it is applied by the caller, once
+		// the preparation that makes the child planned actually succeeded (issue #436).
+		labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL],
+	});
+	return { sibling, resumed: false };
+}
+
+/** What {@link postSplitChildNote} needs to compose and dedupe one child's note. */
+interface SplitChildNoteOptions {
+	firstTask: WorkItem;
+	predecessors: readonly WorkItem[];
+	phaseNumber: number;
+	totalPhases: number;
+	preparation: ChildPreparation;
+	/** This note's idempotency marker; absent when the run has no delivery identity. */
+	marker: string | undefined;
+	/** Whether the child was adopted from an earlier attempt of this delivery. */
+	resumed: boolean;
+}
+
+/**
+ * Post the split-explanation comment ({@link splitChildCommentBody}) on one child,
+ * skipping it when a resumed delivery already posted the same note (issue #543).
+ *
+ * The lookup runs **only** on the resume path: a child that was just created has no
+ * comments at all, so on the normal path it could only ever miss — at the cost of a
+ * fully paginated comment read per child — and this keeps the happy path's board
+ * traffic exactly what it was. Failing the phase over the lookup is right here for the
+ * same reason it is in {@link acquireSplitChild}: the alternative is the duplicate.
+ */
+async function postSplitChildNote(
+	pm: PMProvider,
+	child: WorkItem,
+	options: SplitChildNoteOptions,
+): Promise<void> {
+	const { firstTask, predecessors, phaseNumber, totalPhases, preparation, marker, resumed } =
+		options;
+	if (resumed && marker && (await pm.findComment(child.id, marker))) {
+		logger.debug('Planning — split note already posted for this delivery; skipping', {
+			siblingId: child.id,
+			phaseNumber,
+		});
+		return;
+	}
+	await pm.addComment(
+		child.id,
+		splitChildCommentBody(firstTask, predecessors, phaseNumber, totalPhases, preparation, marker),
+	);
 }
 
 /**
@@ -843,17 +1117,21 @@ async function markSplitChildPlanned(
  * publishes a rendered copy; the marker remains authoritative for validation and
  * for suppressing the child's redundant Planning-agent run.
  *
- * **No duplicate check of its own, deliberately.** The replay guarantee lives one
- * level up: a retry of the same delivery finds its plan comment by
- * {@link planDeliveryMarker} and skips {@link applySplit} entirely, so this never
- * runs twice for the same child. Every child it does see was just created by
- * `pm.createWorkItem` and therefore has no comments at all — a lookup here could
- * only ever miss, at the cost of a `resolveItem` + a fully paginated
- * `listComments` per child, and a *failed* lookup would strand the child in
- * Backlog over a duplicate that cannot happen.
+ * **The duplicate check runs on the resume path only** (issue #543). A child that
+ * `pm.createWorkItem` just made has no comments at all, so on the normal path a
+ * lookup could only ever miss — at the cost of a `resolveItem` + a fully paginated
+ * `listComments` per child — and a *failed* lookup would strand the child in Backlog
+ * over a duplicate that cannot happen. A child **adopted** from an earlier attempt of
+ * this delivery ({@link acquireSplitChild}) is the case where it can: that attempt may
+ * have got as far as publishing this very comment, and posting the whole plan a second
+ * time is not something a reader can be expected to sort out. The marker keyed on the
+ * delivery and the child's index ({@link preplanCommentMarker}) is what makes the two
+ * recognisable as the same comment.
  *
  * Throws on a provider failure — the caller's catch turns that into the honest
- * Backlog fallback rather than a marker whose plan nobody can read.
+ * Backlog fallback rather than a marker whose plan nobody can read. That covers the
+ * lookup too: a resumed child whose comment read fails is left in Backlog, which is
+ * the same conservative answer a failed publication gets.
  */
 async function publishPreplanComment(
 	pm: PMProvider,
@@ -861,7 +1139,18 @@ async function publishPreplanComment(
 	contract: PreplanContract,
 	phaseNumber: number,
 	totalPhases: number,
+	resumed: boolean,
 ): Promise<void> {
+	if (resumed) {
+		const marker = preplanCommentMarker(contract.splitId, contract.childIndex);
+		if (await pm.findComment(child.id, marker)) {
+			logger.debug('Planning — preplan already published for this delivery; skipping', {
+				siblingId: child.id,
+				phaseNumber,
+			});
+			return;
+		}
+	}
 	await pm.addComment(child.id, preplanCommentBody(contract, phaseNumber, totalPhases));
 }
 
@@ -1156,6 +1445,11 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 	// skips the split it already performed, while a genuine replan — a fresh run row,
 	// hence a new marker — posts its new plan and runs its split. Skipped when no run
 	// row is available (direct/test invocations): then we always post.
+	//
+	// This covers only a delivery that got as far as posting. One that died *inside*
+	// the split has no comment to find, so it re-enters `applySplit` — which resumes
+	// from its own per-child markers rather than creating a second card per phase
+	// (issue #543).
 	let commentId = deliveryId
 		? await pm.findComment(workItem.id, planDeliveryMarker(deliveryId))
 		: undefined;
@@ -1163,7 +1457,15 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 
 	if (!commentId) {
 		splitResult = split
-			? await applySplit(pm, workItem, split, resolveAutomationLabel(project.pipeline))
+			? await applySplit(
+					pm,
+					workItem,
+					split,
+					resolveAutomationLabel(project.pipeline),
+					// The delivery's own identity, threaded in so the split's per-child
+					// markers match again on a retry that got this far (issue #543).
+					deliveryId,
+				)
 			: undefined;
 		commentId = await pm.addComment(
 			workItem.id,

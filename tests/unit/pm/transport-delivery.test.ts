@@ -21,6 +21,7 @@ function makeLocalDelegate(overrides: Partial<PMProvider> = {}): PMProvider {
 		listWorkItems: vi.fn().mockResolvedValue([]),
 		findWorkItemByUrlSuffix: vi.fn().mockResolvedValue(undefined),
 		findWorkItemForArtifact: vi.fn().mockResolvedValue(undefined),
+		findWorkItemByDescriptionMarker: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('local-comment'),
 		findComment: vi.fn().mockResolvedValue(undefined),
@@ -146,6 +147,7 @@ describe('createTransportPmDeliveryProvider', () => {
 		await provider.getWorkItem('i1');
 		await provider.listWorkItems({ status: 'todo' });
 		await provider.findWorkItemByUrlSuffix('/issues/21');
+		await provider.findWorkItemByDescriptionMarker('swarm-split-child:run-1:0');
 		await provider.findComment('i1', 'marker');
 		await provider.createWorkItem({ title: 't', description: 'd', status: 'planning' });
 		await provider.updateWorkItem('i1', { title: 't2' });
@@ -156,6 +158,7 @@ describe('createTransportPmDeliveryProvider', () => {
 		expect(local.getWorkItem).toHaveBeenCalledWith('i1');
 		expect(local.listWorkItems).toHaveBeenCalledWith({ status: 'todo' });
 		expect(local.findWorkItemByUrlSuffix).toHaveBeenCalledWith('/issues/21');
+		expect(local.findWorkItemByDescriptionMarker).toHaveBeenCalledWith('swarm-split-child:run-1:0');
 		expect(local.findComment).toHaveBeenCalledWith('i1', 'marker');
 		expect(local.createWorkItem).toHaveBeenCalledWith({
 			title: 't',
@@ -328,6 +331,36 @@ describe('createWriteOnlyTransportPmProvider', () => {
 			number: '21',
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
+	});
+
+	it("serves the split's resume lookup as one narrow read over the transport", async () => {
+		// Issue #543: the plan-comment guard above only covers a delivery that got as
+		// far as posting; this is how a split that died between children recognises the
+		// card it already created instead of making a second one.
+		const wireItem = {
+			id: 'ITEM_61',
+			title: 'Phase 2 of 3 — extract the reader',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/61',
+		};
+		const hit = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: wireItem }));
+
+		await expect(
+			writeOnly(hit).findWorkItemByDescriptionMarker('<!-- swarm-split-child:run-1:0 -->'),
+		).resolves.toEqual({ ...wireItem, description: '', labels: [], assignees: [] });
+		expect(hit.mock.calls[0][0]).toBe(
+			'https://swarm.example/worker/delivery/pm/find-item-by-marker',
+		);
+		expect(JSON.parse(hit.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			marker: '<!-- swarm-split-child:run-1:0 -->',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+
+		// A miss is the ordinary "this delivery has not created that child yet" answer.
+		const miss = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: null }));
+		await expect(
+			writeOnly(miss).findWorkItemByDescriptionMarker('<!-- swarm-split-child:run-1:0 -->'),
+		).resolves.toBeUndefined();
 	});
 
 	it('maps a null card back to undefined, the shape the interface returns', async () => {

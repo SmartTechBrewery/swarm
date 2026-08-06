@@ -89,6 +89,7 @@ function makeDeps() {
 		listWorkItems: vi.fn(),
 		findWorkItemByUrlSuffix: vi.fn(async () => undefined),
 		findWorkItemForArtifact: vi.fn(async () => undefined),
+		findWorkItemByDescriptionMarker: vi.fn(async () => undefined),
 		addComment: vi.fn<(id: string, text: string) => Promise<string>>(async () => 'comment-1'),
 		findComment: vi.fn(async () => undefined),
 		moveWorkItem: vi.fn(async () => {}),

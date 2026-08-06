@@ -171,6 +171,9 @@ describe('real DB-free phase worktree lifecycle', () => {
 			// Only the worker's own credential authenticates these — never a project's.
 			expect(init.headers.authorization).toBe('Bearer worker-credential');
 			if (route === '/pm/find-comment') return jsonResponse({ commentId: null });
+			// Nothing on the board carries this delivery's per-child marker yet — the
+			// first attempt of a split, so every child is created rather than adopted.
+			if (route === '/pm/find-item-by-marker') return jsonResponse({ item: null });
 			if (route === '/pm/create-item')
 				return jsonResponse({
 					item: {
@@ -246,14 +249,16 @@ describe('real DB-free phase worktree lifecycle', () => {
 		});
 
 		// The whole split, in the order the phase performs it: check this delivery's
-		// own marker, re-scope the parent, create the child, publish its preplan,
-		// embed the marker, move it to Planning, mark it planned, chain its
-		// dependency edge, explain the split, post the parent's plan, mark the parent
-		// planned. Ordering is load-bearing (issues #431, #436), so it is asserted
-		// rather than just the set of calls.
+		// own marker, re-scope the parent, look for a child this delivery already
+		// created (issue #543), create it, publish its preplan, embed the marker, move
+		// it to Planning, mark it planned, chain its dependency edge, explain the
+		// split, post the parent's plan, mark the parent planned. Ordering is
+		// load-bearing (issues #431, #436), so it is asserted rather than just the set
+		// of calls.
 		expect(boardCalls.map((call) => call.route)).toEqual([
 			'/pm/find-comment',
 			'/pm/update-item',
+			'/pm/find-item-by-marker',
 			'/pm/create-item',
 			'/pm/comment',
 			'/pm/update-item',

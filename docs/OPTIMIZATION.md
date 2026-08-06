@@ -97,9 +97,13 @@ travels with a child while it enters Planning.
 Because GitHub does not render that hidden marker, SWARM also posts the same plan as a normal,
 human-readable **Preplan** comment on the child (issue #431), so an operator can review the actual
 plan in the issue before sequencing the child. That comment carries its own provenance marker
-(`<!-- swarm-preplan-comment:… -->`) stamping it with the split run that produced it; no duplicate
-check is needed at that point, because a retried or replayed delivery is short-circuited one level
-up (the plan-delivery marker on the parent's own comment) before any child is re-prepared. It is
+(`<!-- swarm-preplan-comment:… -->`) stamping it with the split run that produced it. On the normal
+path no duplicate check is needed at that point, because a child that was just created has no
+comments at all; the check runs only when a child is *adopted* — a delivery whose split died partway
+resumes from the per-child marker in each child's body rather than creating a second card (issue
+#543), and that earlier attempt may already have published this comment. A delivery that got as far
+as posting its plan is still short-circuited one level up, by the plan-delivery marker on the
+parent's own comment, before any child is re-prepared. It is
 published *before* the hidden marker is written: if publishing fails, no marker exists, the child
 stays in Backlog with a comment that claims no published preplan, and a later move to Planning runs
 a normal Planning agent that posts its own plan. The hidden marker remains the single authoritative

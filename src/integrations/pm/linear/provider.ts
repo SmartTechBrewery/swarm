@@ -442,6 +442,12 @@ export class LinearPMProvider implements PMProvider {
 		);
 	}
 
+	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
+		throw new Error(
+			`findWorkItemByDescriptionMarker is not implemented for the Linear PM provider (marker '${marker}')`,
+		);
+	}
+
 	async createWorkItem(input: CreateWorkItemInput): Promise<WorkItem> {
 		throw new Error(
 			`createWorkItem is not implemented for the Linear PM provider (title '${input.title}')`,

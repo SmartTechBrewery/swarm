@@ -62,7 +62,7 @@
  * each write is idempotent at the provider, so a replayed request cannot fork the
  * board.
  *
- * Sixteen routes, all under `/worker/delivery`:
+ * Seventeen routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
@@ -70,6 +70,7 @@
  *   - `POST /worker/delivery/pm/blockers` — read the item's open prerequisites.
  *   - `POST /worker/delivery/pm/find-item` — resolve one card by its backing URL's tail.
  *   - `POST /worker/delivery/pm/find-artifact` — resolve one card by a repository-scoped artifact.
+ *   - `POST /worker/delivery/pm/find-item-by-marker` — resolve one card by a marker in its description.
  *   - `POST /worker/delivery/pm/find-comment` — find one comment by its idempotency marker.
  *   - `POST /worker/delivery/pm/create-item` — create one card (Planning's split children).
  *   - `POST /worker/delivery/pm/update-item` — patch a card's title/description.
@@ -83,8 +84,8 @@
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
  * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
- * `handleListBlockers`, `handleFindWorkItem`, `handleFindWorkItemForArtifact`,
- * `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
+ * `handleListBlockers`, `handleFindWorkItem`, `handleFindWorkItemByMarker`,
+ * `handleFindWorkItemForArtifact`, `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
  * `handleAddPmLabel`, `handleAddBlockedBy`, `handleScheduleFollowUpReview`,
  * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
  * tests drive them with fake deps and never need a live router; collaborators
@@ -130,6 +131,7 @@ import {
 	AddPmLabelDeliveryRequestSchema,
 	CreateWorkItemDeliveryRequestSchema,
 	FindPmCommentDeliveryRequestSchema,
+	FindWorkItemByMarkerDeliveryRequestSchema,
 	FindWorkItemDeliveryRequestSchema,
 	FindWorkItemForArtifactDeliveryRequestSchema,
 	FollowUpReviewDeliveryRequestSchema,
@@ -529,6 +531,36 @@ function projectFoundWorkItem(item: WorkItem): FoundWorkItem {
 	};
 }
 
+/**
+ * Resolve one board card by a marker in its description — the read that makes
+ * Planning's split **resumable** instead of duplicating a child it already created
+ * (issue #543; `applySplit`, `../pipeline/planning.ts`). Same prelude, contract, and
+ * narrow card projection as {@link handleFindWorkItem}: the match runs inside the
+ * provider, so nothing here knows how a provider stores a description, and
+ * `item: null` is the ordinary "no card carries that marker" answer the caller acts
+ * on by creating one.
+ */
+export async function handleFindWorkItemByMarker(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = FindWorkItemByMarkerDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+	const item = await deps
+		.buildPmProvider(authed.project)
+		.findWorkItemByDescriptionMarker(request.marker);
+	return { status: 200, json: { item: item ? projectFoundWorkItem(item) : null } };
+}
+
 /** Resolve one board card by its repository-scoped backing artifact. */
 export async function handleFindWorkItemForArtifact(
 	deps: WorkerDeliveryDeps,
@@ -920,6 +952,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/pm/find-item', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleFindWorkItem(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/find-item-by-marker', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleFindWorkItemByMarker(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 

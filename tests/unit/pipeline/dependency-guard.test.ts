@@ -13,6 +13,7 @@ function pmWith(
 		listWorkItems: vi.fn(async () => []),
 		findWorkItemByUrlSuffix: vi.fn(async () => undefined),
 		findWorkItemForArtifact: vi.fn(async () => undefined),
+		findWorkItemByDescriptionMarker: vi.fn(async () => undefined),
 		moveWorkItem: vi.fn(async () => {}),
 		addComment: vi.fn(async () => 'c1'),
 		findComment: vi.fn(async () => undefined),

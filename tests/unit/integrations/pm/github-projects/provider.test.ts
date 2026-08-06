@@ -425,6 +425,31 @@ describe('GitHubProjectsPMProvider', () => {
 		});
 	});
 
+	describe('findWorkItemByDescriptionMarker', () => {
+		// The marker Planning's split stamps into a child it creates, so a retried
+		// delivery adopts that child instead of duplicating it (issue #543).
+		const MARKER = '<!-- swarm-split-child:run-42:0 -->';
+
+		it('returns the one card whose body carries the marker', async () => {
+			const stamped = {
+				...ITEM_NODE,
+				id: 'PVTI_child',
+				content: { ...ITEM_NODE.content, body: `The second slice.\n\n${MARKER}` },
+			};
+			graphql.mockResolvedValue({ node: { items: { nodes: [ITEM_NODE, stamped] } } });
+
+			await expect(provider.findWorkItemByDescriptionMarker(MARKER)).resolves.toMatchObject({
+				id: 'PVTI_child',
+			});
+		});
+
+		it('returns undefined when no card carries it — the answer that means "create it"', async () => {
+			graphql.mockResolvedValue({ node: { items: { nodes: [ITEM_NODE] } } });
+
+			await expect(provider.findWorkItemByDescriptionMarker(MARKER)).resolves.toBeUndefined();
+		});
+	});
+
 	describe('findWorkItemForArtifact', () => {
 		it('selects the card from the requested repository when a board contains same-numbered issues', async () => {
 			const foreignNode = {
