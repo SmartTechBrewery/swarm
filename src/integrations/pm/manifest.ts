@@ -71,8 +71,19 @@ import type { PMDiscoveryCapability, PMProvider, PMType } from '../../pm/types.j
 export interface PmCredentialRoleSpec {
 	/** Stable key the project's `credentials.pm` map and every resolver call name. */
 	readonly role: string;
-	/** Human-readable name, for logs and any future credential UI. */
+	/** Human-readable name, for logs and the credential UI. */
 	readonly label: string;
+	/**
+	 * One-line explanation of what this credential is and what it must be able to
+	 * do — the provider's own words, rendered verbatim by the dashboard's Project
+	 * Management tab (issue #537) so the screen's terminology and permission
+	 * guidance come from the provider rather than being hard-coded per provider in
+	 * the UI. Optional: a role whose label says everything needs no prose.
+	 *
+	 * **Plain prose, not markdown.** The panel renders it as text, so backticks and
+	 * other markup would appear literally.
+	 */
+	readonly description?: string;
 	/**
 	 * Host-environment variable read as the last-resort fallback only when the
 	 * project explicitly configures a reference for this role — and, for `swarm

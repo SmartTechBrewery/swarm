@@ -38,7 +38,8 @@ export const CREDENTIAL_ROLE_LABELS: Record<CredentialRole, string> = {
 export const CREDENTIAL_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 	reviewer:
 		'GitHub personal access token the reviewer persona reviews with. Must resolve to a different GitHub account than the worker operator (the implementer identity) for loop prevention to work.',
-	webhookSecret: 'HMAC secret GitHub signs webhook deliveries with. Not tied to a GitHub identity.',
+	webhookSecret:
+		'HMAC secret GitHub signs webhook deliveries with — repository events and Projects board events alike, since they arrive on one webhook. Not tied to a GitHub identity.',
 };
 
 /** A source-control provider the Source Control tab's provider selector can offer. */

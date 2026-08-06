@@ -686,6 +686,10 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',
+			// GitHub Projects declares one required credential role of its own — the
+			// board's API token (issue #537) — so a valid config for it names a
+			// reference here.
+			pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
 		},
 		...overrides,
 	});

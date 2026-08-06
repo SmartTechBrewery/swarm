@@ -15,9 +15,11 @@
  * a login no longer distinguishes SWARM's output from that human's (ADR-004 §3).
  * The Review trigger keys on work-item origin instead (issue #397) and comment
  * loop prevention on the comment's own marker (issue #443,
- * `src/scm/swarm-origin.ts`); what still calls `isSwarmBot` is the board's
- * status-change gate (`GitHubProjectsRouterAdapter`, which has no body to mark)
- * and `resolve-conflicts`' candidate filter.
+ * `src/scm/swarm-origin.ts`), and the board's status-change gate stopped asking
+ * these personas at all once board writes moved onto the PM provider's own
+ * credential (issue #537 — `GitHubProjectsRouterAdapter` now resolves that
+ * credential's identity instead). What still calls `isSwarmBot` is
+ * `resolve-conflicts`' candidate filter.
  *
  * The two personas resolve their tokens from different sources (issue #396): the
  * `implementer` identity is resolved from the worker operator's own token

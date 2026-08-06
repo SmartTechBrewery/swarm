@@ -58,9 +58,17 @@ const CONFIG_TEMPLATE = {
 			// The implementer persona is NOT a project credential: it is the worker
 			// operator's own token, set as SWARM_OPERATOR_GH_TOKEN in `.env` on each host
 			// that runs implementer phases (issue #396).
+			//
+			// `pm` holds one reference per credential role the *PM provider* declares
+			// (issue #497). GitHub Projects declares `apiToken` — the board's own GitHub
+			// token, required and never the operator's (issue #537); its webhook secret
+			// inherits `webhookSecret` above, so it needs no entry here.
 			credentials: {
 				reviewer: 'SCM_TOKEN_REVIEWER',
 				webhookSecret: 'SCM_WEBHOOK_SECRET',
+				pm: {
+					apiToken: 'PM_GITHUB_PROJECTS_TOKEN',
+				},
 			},
 		},
 	],

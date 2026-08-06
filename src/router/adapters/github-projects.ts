@@ -26,7 +26,10 @@
 import { findProjectByBoard } from '../../config/provider.js';
 import type { ProjectConfig } from '../../config/schema.js';
 import { requireGitHubProjectsConfig } from '../../integrations/pm/github-projects/config-schema.js';
-import { isSwarmBot, resolvePersonaIdentities } from '../../integrations/scm/github/personas.js';
+import {
+	matchesGitHubProjectsIdentity,
+	resolveGitHubProjectsIdentity,
+} from '../../integrations/pm/github-projects/credentials.js';
 import { logger } from '../../lib/logger.js';
 import type { PmEvent, PmEventAction } from '../../pm/events.js';
 import type { PMRouterAdapter } from '../../pm/router-adapter.js';
@@ -160,20 +163,23 @@ export class GitHubProjectsRouterAdapter implements PMRouterAdapter {
 	 * this proves too loose in practice, the fix is a bounded retry on resolution
 	 * here, not flipping to fail-closed (which would strand real human changes).
 	 *
-	 * Reaching into the *SCM* provider's persona helpers is legitimate **only for
-	 * this provider**, because a GitHub Projects board and the GitHub repo are the
-	 * same account (ai/RULES.md §2 names it as one of three deliberate reaches). The
-	 * contract on {@link PMRouterAdapter.isSelfAuthored} spells out that a provider
-	 * whose board is a different account than its repo must establish its own
-	 * identity instead.
+	 * The identity it keys on is the **board credential's own** — the `apiToken` role
+	 * this provider declares (`../../integrations/pm/github-projects/credentials.ts`,
+	 * issue #537) — not the SCM personas it used to borrow. That reach was legitimate
+	 * only while board writes ran on the implementer persona's token; now that every
+	 * SWARM board write is made by the PM credential, asking about the SCM personas
+	 * would answer for an account that no longer touches the board, so the gate
+	 * resolves the same credential the writes are made with. This is exactly what
+	 * {@link PMRouterAdapter.isSelfAuthored}'s contract asks of a provider: an
+	 * identity it can establish on its own.
 	 */
 	async isSelfAuthored(event: PmEvent, project: ProjectConfig): Promise<boolean> {
 		if (!event.actorHandle) return false;
 		try {
-			const identities = await resolvePersonaIdentities(project);
-			return isSwarmBot(event.actorHandle, identities);
+			const identity = await resolveGitHubProjectsIdentity(project);
+			return matchesGitHubProjectsIdentity(event.actorHandle, identity);
 		} catch (err) {
-			logger.error('Failed to resolve persona identities; skipping loop-prevention check', {
+			logger.error('Failed to resolve board identity; skipping loop-prevention check', {
 				projectId: project.id,
 				containerId: event.containerId,
 				error: String(err),

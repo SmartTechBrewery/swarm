@@ -9,17 +9,19 @@ import {
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
 } from '@/lib/board-mapping.js';
+import { isMissingPmCredentialError } from '@/lib/pm-credentials.js';
 import { trpc } from '@/lib/trpc.js';
 import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 
 /**
- * Provider-neutral Board Mapping panel (issue #201). Replaces the old GitHub
+ * Provider-neutral board/status mapping panel (issue #201) — the second half of the
+ * Project Management tab, under its credential section. Replaces the old GitHub
  * Projects raw-ID form: the operator picks a PM provider, then a discovered
  * board, then maps each canonical SWARM pipeline status to one of that board's
  * discovered states. Opaque IDs stay option values and persisted data — never
  * something to type. Boards/states are discovered through the `pm` API using the
- * implementer persona's token (the worker operator's own `SWARM_OPERATOR_GH_TOKEN`,
- * resolved server-side — issue #396); the browser never handles a credential.
+ * project's own PM credential, resolved server-side (issue #537); the browser never
+ * handles a credential.
  *
  * The owning route holds the form state and the save/reset handlers (so the save
  * goes through the same serialized `projects.update` write as the other tabs);
@@ -49,11 +51,6 @@ const SELECT_CLASS =
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400 mb-1';
 
 const NEUTRAL_UNAVAILABLE = 'Configured value (unavailable)';
-
-/** Whether a tRPC error is the "no implementer token" precondition (actionable). */
-function isMissingCredentialError(message: string | undefined): boolean {
-	return !!message && /SWARM_OPERATOR_GH_TOKEN/i.test(message);
-}
 
 interface StateOption {
 	value: string;
@@ -141,6 +138,11 @@ export function BoardMappingPanel({
 
 	const containerErr = containersQuery.isError ? containersQuery.error?.message : undefined;
 	const statesErr = statesQuery.isError ? statesQuery.error?.message : undefined;
+	// A discovery failure caused by an unconfigured PM credential is the operator's
+	// own next step (set it in the Credentials section above), so it renders as an
+	// actionable notice rather than as a red "failed to load" line.
+	const containerCredentialGap =
+		containersQuery.isError && isMissingPmCredentialError(containersQuery.error);
 	const canSave = canSaveBoardMapping(form);
 
 	return (
@@ -148,7 +150,7 @@ export function BoardMappingPanel({
 			<form onSubmit={handleSubmit} className="space-y-6">
 				<div>
 					<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
-						Board Mapping
+						Board
 					</h2>
 
 					<div className="max-w-xs">
@@ -184,7 +186,7 @@ export function BoardMappingPanel({
 						{provider.label} {provider.containerNoun}
 					</label>
 
-					{isMissingCredentialError(containerErr) ? (
+					{containerCredentialGap ? (
 						<div className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded">
 							{containerErr}
 						</div>
@@ -224,7 +226,7 @@ export function BoardMappingPanel({
 									preserved until you pick another.
 								</p>
 							)}
-							{containerErr && !isMissingCredentialError(containerErr) && (
+							{containerErr && !containerCredentialGap && (
 								<p className="text-xs text-red-400 mt-1">
 									Failed to load {provider.containerNoun}s: {containerErr}
 								</p>

@@ -61,27 +61,44 @@ describe('github-projects manifest registration', () => {
 		expect(githubProjectsManifest.discovery).toEqual(['containers', 'states']);
 	});
 
-	// Issue #497: the one credential this provider resolves for itself. It inherits
-	// the shared SCM webhook-secret reference rather than asking a project to
-	// configure a second one, because board and repo are literally the same webhook —
-	// which is what keeps this provider's effective credentials unchanged.
-	it('declares only the webhook-secret role, inheriting the shared reference', () => {
-		expect(githubProjectsManifest.credentialRoles).toEqual([
-			{
-				role: 'webhookSecret',
-				label: 'Webhook Secret',
-				envVarKey: 'SCM_WEBHOOK_SECRET',
-				inheritsSharedCredential: 'webhookSecret',
-			},
-		]);
+	// Issue #537: the board's own API token is a required project credential — this is
+	// what replaced borrowing the SCM implementer persona's worker-local operator
+	// token. `description` is provider-authored copy the Project Management tab
+	// renders, and it names the permissions the token needs.
+	it('declares a required board API-token role naming its permissions', () => {
+		const apiToken = githubProjectsManifest.credentialRoles.find(
+			(role) => role.role === 'apiToken',
+		);
+		expect(apiToken).toMatchObject({
+			role: 'apiToken',
+			label: 'GitHub Projects API Token',
+			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
+		});
+		// Required: neither optional nor satisfied by a shared SCM reference.
+		expect(apiToken?.optional).toBeUndefined();
+		expect(apiToken?.inheritsSharedCredential).toBeUndefined();
+		expect(apiToken?.description).toContain('read:org');
 	});
 
-	// Its persona tokens deliberately resolve through the GitHub SCM provider
-	// (`provider.ts`) — one of ai/RULES.md §2's named reaches — so they are not
-	// credential roles of this provider.
-	it('declares no persona-token roles', () => {
-		expect(githubProjectsManifest.credentialRoles.map((role) => role.role)).not.toContain(
-			'reviewer',
+	// Issue #497: the webhook secret inherits the shared SCM reference rather than
+	// asking a project to configure a second one, because board and repo are literally
+	// the same webhook.
+	it('declares a webhook-secret role that inherits the shared reference', () => {
+		expect(githubProjectsManifest.credentialRoles).toContainEqual(
+			expect.objectContaining({
+				role: 'webhookSecret',
+				envVarKey: 'SCM_WEBHOOK_SECRET',
+				inheritsSharedCredential: 'webhookSecret',
+			}),
 		);
+	});
+
+	// The board authenticates as its own credential, not as an SCM persona (#537), so
+	// the persona roles are still not credential roles of this provider.
+	it('declares no persona-token roles', () => {
+		expect(githubProjectsManifest.credentialRoles.map((role) => role.role)).toEqual([
+			'apiToken',
+			'webhookSecret',
+		]);
 	});
 });

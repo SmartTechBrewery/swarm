@@ -2,7 +2,8 @@ import type { ProjectPm } from '../../../src/config/schema.js';
 import { PM_STATUS_KEYS, type PmStatusKey } from '../../../src/pm/pipeline.js';
 
 /**
- * The Board Mapping screen's editable state — provider-neutral now that the
+ * The board/status mapping form's editable state (the Project Management tab's
+ * second half) — provider-neutral now that the
  * screen discovers boards and states through the `pm` API instead of asking the
  * operator to type GitHub node IDs (issue #201). It holds the selected provider
  * and container (board), one discovered-state ID per canonical pipeline status,
@@ -47,7 +48,7 @@ export const STATUS_KEY_LABELS: Readonly<Record<PmStatusKey, string>> = {
 export const STATUS_KEYS = PM_STATUS_KEYS;
 
 /**
- * A PM provider the Board Mapping selector can offer, with the human-readable
+ * A PM provider the mapping form's selector can offer, with the human-readable
  * nouns its pickers use. UI-only catalogue, analogous to `SCM_PROVIDERS` in
  * `credentials.ts`: it makes the selector and its copy data-driven off the
  * selected provider rather than embedding GitHub vocabulary throughout the
@@ -64,7 +65,11 @@ export interface PmMappingProvider {
 	containerNoun: string;
 	/** Noun for a workflow state (e.g. "status", "column"), used in picker copy. */
 	stateNoun: string;
-	/** One-line explanation of what the mapping does and which credential discovery uses. */
+	/**
+	 * One-line explanation of what the mapping does. It names *where* the credential
+	 * discovery uses is configured, never which one — since issue #537 that is the
+	 * provider's own declared role, rendered by the Credentials section above.
+	 */
 	intro: string;
 }
 
@@ -75,7 +80,7 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		containerNoun: 'board',
 		stateNoun: 'status',
 		intro:
-			"Pick this project's GitHub Projects (v2) board, then map each SWARM pipeline status to one of the board's Status options. Boards and options are discovered with the implementer token configured on the Source Control tab — no node IDs to copy by hand.",
+			"Pick this project's GitHub Projects (v2) board, then map each SWARM pipeline status to one of the board's Status options. Boards and options are discovered server-side with this project's own board credential, configured under Credentials above — no node IDs to copy by hand.",
 	},
 ];
 

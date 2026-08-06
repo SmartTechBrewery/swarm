@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
+// A DB-free worker loads the integrations entrypoint at startup
+// (`src/transport/connect-entry.ts`), so the PM manifests are registered while it
+// reconstructs a project config. Importing it here is what makes these tests
+// exercise the same validation path a real remote worker takes (issue #537).
+import '@/integrations/entrypoint.js';
 import { toNonSecretProjectConfig } from '@/config/project-config-slice.js';
 import { CredentialsSchema } from '@/config/schema.js';
 import { reconstructProjectConfig } from '@/transport/db-free-project.js';
@@ -40,6 +45,7 @@ describe('reconstructProjectConfig', () => {
 			credentials: {
 				reviewer: 'REAL_REVIEWER_REF',
 				webhookSecret: 'REAL_WEBHOOK_REF',
+				pm: { apiToken: 'REAL_PM_TOKEN_REF' },
 			},
 		});
 		const reconstructed = reconstructProjectConfig(
@@ -48,6 +54,26 @@ describe('reconstructProjectConfig', () => {
 		);
 
 		expect(reconstructed.credentials.reviewer).not.toBe('REAL_REVIEWER_REF');
+	});
+
+	// Issue #537: PM credentials are control-plane-only. A DB-free worker gets no PM
+	// credential *and no PM reference either* — not even a placeholder one, which would
+	// otherwise let this host's own environment resolve the role's declared env var.
+	it('carries no PM credential reference at all', () => {
+		const project = createMockProjectConfig({
+			credentials: {
+				reviewer: 'SCM_TOKEN_REVIEWER',
+				webhookSecret: 'SCM_WEBHOOK_SECRET',
+				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+			},
+		});
+		const reconstructed = reconstructProjectConfig(
+			toNonSecretProjectConfig(project),
+			'/remote-worker/swarm',
+		);
+
+		expect(reconstructed.credentials.pm).toBeUndefined();
+		expect(JSON.stringify(reconstructed)).not.toContain('PM_GITHUB_PROJECTS_TOKEN');
 	});
 
 	it('replaces the control-plane repoRoot with this worker host checkout', () => {

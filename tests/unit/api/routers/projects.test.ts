@@ -58,6 +58,11 @@ import {
 import type { MembershipRequest } from '@/identity/membership-request.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
+import type { PMProviderManifest } from '@/integrations/pm/manifest.js';
+import {
+	_resetPMProviderRegistryForTesting,
+	registerPMProvider,
+} from '@/integrations/pm/registry.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
 
 const ADMIN_USER: SwarmUser = {
@@ -273,6 +278,40 @@ describe('projectsRouter', () => {
 				userId: ADMIN_USER.id,
 				role: 'projectAdmin',
 			});
+		});
+
+		// Issue #537: a new project starts with one `credentials.pm` slot per credential
+		// role its PM provider requires and owns — read off the manifest, so no provider
+		// is named here. Nothing is stored yet; the slot is what the Project Management
+		// tab (or `swarm config apply`) fills.
+		it('seeds a credentials.pm reference for each required, provider-owned role', async () => {
+			registerPMProvider({
+				id: DEFAULT_PM_CONFIG.type,
+				label: 'Stub',
+				category: 'pm',
+				credentialRoles: [
+					{ role: 'apiToken', label: 'API Token', envVarKey: 'PM_STUB_TOKEN' },
+					{ role: 'optionalThing', label: 'Optional', envVarKey: 'PM_STUB_OPT', optional: true },
+					{
+						role: 'webhookSecret',
+						label: 'Webhook Secret',
+						envVarKey: 'SCM_WEBHOOK_SECRET',
+						inheritsSharedCredential: 'webhookSecret',
+					},
+				],
+			} as unknown as PMProviderManifest);
+			vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
+
+			try {
+				const result = await caller.create(validProjectInput);
+
+				expect(result.credentials).toEqual({
+					...defaultCredentials,
+					pm: { apiToken: 'PM_STUB_TOKEN' },
+				});
+			} finally {
+				_resetPMProviderRegistryForTesting();
+			}
 		});
 
 		it('strips a client-supplied pm block and uses the placeholder default', async () => {

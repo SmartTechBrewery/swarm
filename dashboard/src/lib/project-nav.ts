@@ -18,17 +18,31 @@ export const PROJECT_PHASES = [
 
 export type ProjectPhase = (typeof PROJECT_PHASES)[number];
 
-/** The tabs on the project-detail screen, in display order. */
+/**
+ * The tabs on the project-detail screen, in display order. `projectManagement` was
+ * `boardMapping` until issue #537 widened that tab from a board mapping into the
+ * whole PM setup (provider, credentials, board, status mapping);
+ * {@link LEGACY_TAB_ALIASES} keeps old links working.
+ */
 export const PROJECT_TABS = [
 	'runs',
 	'general',
 	'agents',
 	'pipeline',
-	'boardMapping',
+	'projectManagement',
 	'credentials',
 ] as const;
 
 export type ProjectTab = (typeof PROJECT_TABS)[number];
+
+/**
+ * Renamed tab values a bookmarked or pasted `?tab=` link may still carry, mapped to
+ * the tab that replaced them. Without this a stale link would `.catch(undefined)`
+ * into the Runs tab, silently dropping the operator somewhere they didn't ask for.
+ */
+const LEGACY_TAB_ALIASES: Readonly<Record<string, ProjectTab>> = {
+	boardMapping: 'projectManagement',
+};
 
 /**
  * Search-param schema for `/projects/$projectId`. The active tab and the open
@@ -42,7 +56,10 @@ export type ProjectTab = (typeof PROJECT_TABS)[number];
  * usable with a sensible fallback.
  */
 export const projectDetailSearchSchema = z.object({
-	tab: z.enum(PROJECT_TABS).optional().catch(undefined),
+	tab: z.preprocess(
+		(value) => (typeof value === 'string' ? (LEGACY_TAB_ALIASES[value] ?? value) : value),
+		z.enum(PROJECT_TABS).optional().catch(undefined),
+	),
 	phase: z.enum(PROJECT_PHASES).optional().catch(undefined),
 });
 

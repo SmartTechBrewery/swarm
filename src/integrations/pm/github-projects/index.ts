@@ -16,6 +16,7 @@ import { GitHubProjectsRouterAdapter } from '../../../router/adapters/github-pro
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
 import { githubProjectsConfigSchema } from './config-schema.js';
+import { GITHUB_PROJECTS_API_TOKEN_ROLE } from './credentials.js';
 import { createGitHubProjectsProvider } from './provider.js';
 import { verifyGitHubProjectsWebhookSignature } from './webhook.js';
 
@@ -26,22 +27,35 @@ export const githubProjectsManifest: PMProviderManifest = {
 	createProvider: createGitHubProjectsProvider,
 	configSchema: githubProjectsConfigSchema,
 	routerAdapter: new GitHubProjectsRouterAdapter(),
-	// The one credential this provider resolves for itself (issue #497), and it is
-	// the *shared* GitHub webhook secret: the board and the repo are literally the
-	// same webhook, so the role inherits `credentials.webhookSecret` rather than
-	// asking a project to configure the same reference twice. Declaring that as data
-	// keeps the reach out of shared resolution code (ai/RULES.md §2).
+	// Two roles, and they are credentials of two different kinds.
 	//
-	// Its **persona tokens** are deliberately absent: GitHub Projects scopes board
-	// writes with `GitHubSCMIntegration`'s persona helpers (`./provider.ts`), because
-	// board and repo are the same account — the named cross-category reach in
-	// ai/RULES.md §2, not a credential of its own. Declaring `reviewer`/implementer
-	// roles here would duplicate that resolution and imply a project could point the
-	// board at a different account than the repo, which GitHub does not allow.
+	// `apiToken` is the provider's **own** board credential (issue #537). It used to
+	// be absent, and board reads/writes borrowed `GitHubSCMIntegration`'s implementer
+	// persona instead — i.e. the worker-local `SWARM_OPERATOR_GH_TOKEN`. That made a
+	// worker's SCM identity a hidden requirement of the API host and left a project
+	// admin no way to configure board access; the token is now a project-scoped role
+	// resolved through `credentials.pm` like any other provider's
+	// (`./credentials.ts`), with no fallback to the operator token.
+	//
+	// `webhookSecret` is the *shared* GitHub webhook secret: the board and the repo
+	// are literally the same webhook, so the role inherits `credentials.webhookSecret`
+	// rather than asking a project to configure the same reference twice. Declaring
+	// that as data keeps the reach out of shared resolution code (ai/RULES.md §2).
 	credentialRoles: [
+		{
+			role: GITHUB_PROJECTS_API_TOKEN_ROLE,
+			label: 'GitHub Projects API Token',
+			// Plain prose, not markdown: the dashboard renders a description as text
+			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
+			description:
+				'GitHub token the board is read and written with. Needs the repo and project scopes (fine-grained: repository Issues + Pull requests read/write and organization Projects read/write), plus read:org to discover organization-owned boards.',
+			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
+		},
 		{
 			role: PM_WEBHOOK_SECRET_ROLE,
 			label: 'Webhook Secret',
+			description:
+				"HMAC secret GitHub signs board deliveries with. It is the repository's webhook secret — one webhook carries both — so it is configured on the Source Control tab, not here.",
 			envVarKey: 'SCM_WEBHOOK_SECRET',
 			inheritsSharedCredential: 'webhookSecret',
 		},

@@ -16,7 +16,7 @@
  */
 
 import type { NonSecretProjectConfig } from '../config/project-config-slice.js';
-import { type ProjectConfig, ProjectConfigSchema } from '../config/schema.js';
+import { type ProjectConfig, ProjectConfigBaseSchema } from '../config/schema.js';
 
 /**
  * Inert credential references satisfying `CredentialsSchema` (each a non-empty
@@ -30,12 +30,21 @@ const PLACEHOLDER_CREDENTIALS = {
 /**
  * Rebuild a full `ProjectConfig` from the assignment's transport slice, adding
  * the worker's own checkout path and inert placeholder `credentials`.
+ *
+ * Parses the **base** schema deliberately: `ProjectConfigSchema`'s cross-field check
+ * validates that `credentials.pm` names a reference for every credential role the
+ * project's PM provider declares (issue #537), and this worker has no credentials by
+ * design — the placeholder above is the *absence* of a credential block, not a
+ * configuration of one. Running that check here would force a fake `credentials.pm`
+ * reference into the payload (a reference whose declared host env var this machine
+ * could then resolve), which is the opposite of the boundary this module exists to
+ * hold. Every other field keeps its own validation.
  */
 export function reconstructProjectConfig(
 	slice: NonSecretProjectConfig,
 	workerRepoRoot: string,
 ): ProjectConfig {
-	return ProjectConfigSchema.parse({
+	return ProjectConfigBaseSchema.parse({
 		...slice,
 		// `repoRoot` is host-local execution state and never travels from the control plane.
 		repoRoot: workerRepoRoot,
