@@ -116,7 +116,11 @@ function ConnectionCell({ worker }: { worker: WorkerRow }) {
  * project has allowed anything on it yet.
  */
 function effectiveClis(worker: WorkerRow): string[] {
-	const allowed = new Set(worker.enrollments.flatMap((enrollment) => enrollment.allowedClis));
+	const allowed = new Set(
+		worker.enrollments
+			.filter((enrollment) => enrollment.status === 'active')
+			.flatMap((enrollment) => enrollment.allowedClis),
+	);
 	return worker.capabilities.filter((cli) => allowed.has(cli));
 }
 

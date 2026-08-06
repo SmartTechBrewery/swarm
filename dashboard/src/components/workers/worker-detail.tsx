@@ -1,11 +1,11 @@
 import { useMutation } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
-import { useEffect, useRef, useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { trpcClient } from '@/lib/trpc.js';
+import { useDraftSync } from '@/lib/use-draft-sync.js';
 import type { WorkerDetail } from '@/types/workers.js';
 
 /**
@@ -83,14 +83,7 @@ function WorkerNameField({
 	editable: boolean;
 	onChanged: () => void;
 }) {
-	const [draft, setDraft] = useState(displayName);
-	const lastServerValue = useRef(displayName);
-	useEffect(() => {
-		if (lastServerValue.current !== displayName) {
-			lastServerValue.current = displayName;
-			setDraft(displayName);
-		}
-	}, [displayName]);
+	const [draft, setDraft] = useDraftSync(displayName, (name) => name);
 
 	const renameMutation = useMutation({
 		mutationFn: (nextDisplayName: string) =>

@@ -1,11 +1,12 @@
 import { useMutation } from '@tanstack/react-query';
 import { CheckCircle2, Loader2 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { Badge, type BadgeTone } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { formatPhase } from '@/lib/format.js';
 import { trpcClient } from '@/lib/trpc.js';
+import { useDraftSync } from '@/lib/use-draft-sync.js';
 import { enrollmentPhaseOptions } from '@/lib/worker-enrollment-phases.js';
 import { ENROLLMENT_STATUS_LABELS, routabilityBlockers } from '@/lib/worker-enrollment-view.js';
 import type { WorkerDetailEnrollment } from '@/types/workers.js';
@@ -757,14 +758,7 @@ function ConcurrencyControl({
 	ownerName: string;
 	onApply: (next: number) => void;
 }) {
-	const [draft, setDraft] = useState(() => concurrencyToDraft(value));
-	const lastServerValue = useRef(value);
-	useEffect(() => {
-		if (lastServerValue.current !== value) {
-			lastServerValue.current = value;
-			setDraft(concurrencyToDraft(value));
-		}
-	}, [value]);
+	const [draft, setDraft] = useDraftSync(value, concurrencyToDraft);
 
 	if (!editable) {
 		return (

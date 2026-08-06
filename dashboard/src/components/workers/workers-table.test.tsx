@@ -253,6 +253,30 @@ describe('WorkersTable row content', () => {
 		expect(screen.queryByText('codex')).toBeNull();
 	});
 
+	it('ignores allowed CLIs from a pending or suspended enrollment, not just an active one', () => {
+		// A pending or revoked enrollment's allowedClis are not currently
+		// dispatchable — unioning them in would show a chip for a CLI no
+		// active enrollment actually permits on this machine.
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						capabilities: ['claude', 'antigravity', 'codex'],
+						enrollments: [
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+							{ projectId: 'proj-b', status: 'pending', allowedClis: ['antigravity'] },
+							{ projectId: 'proj-c', status: 'suspended', allowedClis: ['codex'] },
+						],
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.getByText('claude')).toBeDefined();
+		expect(screen.queryByText('antigravity')).toBeNull();
+		expect(screen.queryByText('codex')).toBeNull();
+	});
+
 	it('shows no CLI chip for a registered-but-un-enrolled machine, even though it declares CLIs', () => {
 		// No project has allowed anything on it yet — the planning badge (a
 		// separate axis) may still show, but no CLI chip should.
