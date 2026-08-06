@@ -62,8 +62,6 @@ import { requireStateIdForStatusKey, resolveStatusKeyByStateId } from './status-
  */
 const ISSUE_FIELDS = /* GraphQL */ `
 	id
-	identifier
-	number
 	title
 	description
 	url
@@ -71,6 +69,7 @@ const ISSUE_FIELDS = /* GraphQL */ `
 	updatedAt
 	team { id }
 	state { id name }
+	attachments(first: 100) { nodes { url } }
 	labels(first: 100) { nodes { id name color } }
 	assignee { id name displayName }
 `;
@@ -85,8 +84,8 @@ const GET_ISSUE_QUERY = /* GraphQL */ `
 /**
  * One page of the top-level `issues` connection under a caller-supplied
  * `IssueFilter`. Every list-shaped read shares this one document because they
- * differ only in that filter — the board read narrows by team (plus optionally
- * workflow state), and the artifact lookup adds `number`.
+ * differ only in that filter — the board read narrows by team and optionally
+ * workflow state.
  */
 const LIST_ISSUES_QUERY = /* GraphQL */ `
 	query ListIssues($filter: IssueFilter, $cursor: String) {
@@ -136,8 +135,6 @@ const TEAM_STATES_QUERY = /* GraphQL */ `
 /** The shape {@link ISSUE_FIELDS} selects. Every field is optional defensively. */
 interface IssueNode {
 	id?: string;
-	identifier?: string;
-	number?: number;
 	title?: string;
 	description?: string | null;
 	url?: string;
@@ -145,6 +142,7 @@ interface IssueNode {
 	updatedAt?: string;
 	team?: { id?: string } | null;
 	state?: { id?: string; name?: string } | null;
+	attachments?: { nodes?: Array<{ url?: string } | null> | null } | null;
 	labels?: { nodes?: Array<{ id?: string; name?: string; color?: string | null } | null> | null };
 	assignee?: { id?: string; name?: string | null; displayName?: string | null } | null;
 }
@@ -184,7 +182,6 @@ interface TeamStatesResponse {
 interface IssueFilterVariable {
 	team: { id: { eq: string } };
 	state?: { id: { eq: string } };
-	number?: { eq: number };
 }
 
 function mapLabels(issue: IssueNode): WorkItemLabel[] {
@@ -224,24 +221,23 @@ function mapAssignees(issue: IssueNode): WorkItemAssignee[] {
  * shared code resolves a pipeline phase from, so no caller inverts
  * `statusOptions` itself (ai/RULES.md §2).
  *
- * **`taskRef` is the Linear issue's own `number`** — the third mapping this
- * provider had to settle. A Linear card has no backing GitHub artifact to borrow
- * a number from the way a GitHub Projects card does, and `number` is Linear's
- * only stable *numeric* handle for an issue: `identifier` (`ENG-42`) carries the
- * team key, and the id is a UUID. Numeric is what the task identity actually
- * requires — a task id names the `task-<id>` worktree and the `<branchPrefix><id>`
- * branch, and `isSwarmManagedPullRequest` recognizes such a branch by its
- * digits-only tail (ai/ARCHITECTURE.md "Task identity"). It is also what makes
- * {@link LinearPMProvider.findWorkItemForArtifact} invertible.
+ * `taskRef` comes only from a GitHub issue or pull-request attachment in this
+ * project's repository. A Linear-native number would name an unrelated GitHub
+ * issue in the PR closing keyword, so an unlinked card leaves it unset and cannot
+ * start an SCM-driven phase (ai/ARCHITECTURE.md "Task identity").
  */
-function toWorkItem(issue: IssueNode, config: LinearIntegrationConfig): WorkItem {
+function toWorkItem(
+	issue: IssueNode & { id: string },
+	config: LinearIntegrationConfig,
+	repository: string,
+): WorkItem {
 	const stateId = issue.state?.id;
 	return {
-		id: issue.id ?? '',
+		id: issue.id,
 		title: issue.title ?? '',
 		description: issue.description ?? '',
 		url: issue.url ?? '',
-		taskRef: issue.number == null ? undefined : String(issue.number),
+		taskRef: taskRefFromAttachments(issue, repository),
 		status: issue.state?.name,
 		statusId: stateId,
 		statusKey: stateId === undefined ? undefined : resolveStatusKeyByStateId(config, stateId),
@@ -250,6 +246,21 @@ function toWorkItem(issue: IssueNode, config: LinearIntegrationConfig): WorkItem
 		createdAt: issue.createdAt,
 		updatedAt: issue.updatedAt,
 	};
+}
+
+function taskRefFromAttachments(issue: IssueNode, repository: string): string | undefined {
+	const artifactUrl = new RegExp(
+		`^https://github\\.com/${escapeRegExp(repository)}/(?:issues|pull)/(\\d+)(?:[/?#]|$)`,
+	);
+	for (const attachment of issue.attachments?.nodes ?? []) {
+		const match = attachment?.url?.match(artifactUrl);
+		if (match) return match[1];
+	}
+	return undefined;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -301,20 +312,22 @@ export class LinearPMProvider implements PMProvider {
 	}
 
 	/** An `IssueFilter` scoped to this project's team, optionally narrowed further. */
-	private issueFilter(extra: { stateId?: string; number?: number } = {}): IssueFilterVariable {
+	private issueFilter(extra: { stateId?: string } = {}): IssueFilterVariable {
 		return {
 			team: { id: { eq: this.config.teamId } },
 			...(extra.stateId === undefined ? {} : { state: { id: { eq: extra.stateId } } }),
-			...(extra.number === undefined ? {} : { number: { eq: extra.number } }),
 		};
 	}
 
 	/** Walk every page of the `issues` connection under `filter`. Runs inside a credential scope. */
-	private collectIssues(filter: IssueFilterVariable): Promise<IssueNode[]> {
-		return collectLinearConnection<IssueNode>(async (cursor) => {
+	private async collectIssues(
+		filter: IssueFilterVariable,
+	): Promise<Array<IssueNode & { id: string }>> {
+		const issues = await collectLinearConnection<IssueNode>(async (cursor) => {
 			const data = await linearGraphQL<ListIssuesResponse>(LIST_ISSUES_QUERY, { filter, cursor });
 			return data.issues ?? null;
 		});
+		return issues.filter((issue): issue is IssueNode & { id: string } => Boolean(issue?.id));
 	}
 
 	async getWorkItem(id: string): Promise<WorkItem> {
@@ -329,7 +342,7 @@ export class LinearPMProvider implements PMProvider {
 			if (!issue?.id) {
 				throw new Error(`Linear issue '${id}' did not resolve`);
 			}
-			return toWorkItem(issue, this.config);
+			return toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo);
 		});
 	}
 
@@ -348,7 +361,7 @@ export class LinearPMProvider implements PMProvider {
 			// `IssueFilter` narrows by team *and* workflow state, so a status-filtered
 			// read doesn't page the whole board to discard most of it.
 			const issues = await this.collectIssues(this.issueFilter({ stateId }));
-			return issues.map((issue) => toWorkItem(issue, this.config));
+			return issues.map((issue) => toWorkItem(issue, this.config, this.project.repo));
 		});
 	}
 
@@ -372,31 +385,11 @@ export class LinearPMProvider implements PMProvider {
 		kind,
 		number,
 	}: WorkItemArtifact): Promise<WorkItem | undefined> {
-		if (kind === 'issue') {
-			// The inverse of the `taskRef` decision in `toWorkItem`: the issue artifact
-			// number *is* the Linear issue's own `number`, so the card is one filtered
-			// read. This is the path `findWorkItemForPullRequest` actually hits, since
-			// SWARM opens every PR from a `<branchPrefix><number>` branch.
-			//
-			// `repository` plays no part here, deliberately: the number is Linear's, not
-			// a repo's, so it is the *team* filter that keeps two boards' same-numbered
-			// cards apart — the guarantee this lookup owes over `findWorkItemByUrlSuffix`.
-			const issueNumber = Number(number);
-			if (!Number.isInteger(issueNumber)) return undefined;
-			return this.run(async () => {
-				const issues = await this.collectIssues(this.issueFilter({ number: issueNumber }));
-				const issue = issues[0];
-				return issue ? toWorkItem(issue, this.config) : undefined;
-			});
-		}
-		// A Linear card wraps no pull request of its own, so the only link is the one
-		// Linear's *own* GitHub integration records: the PR's URL as an attachment on
-		// the issue. A board whose workspace has that integration off simply has no
-		// card for the PR, and the caller falls open (`src/pm/pull-request-work-item.ts`).
-		// The github.com URL shape is this provider's to know, exactly as it is the
-		// GitHub Projects provider's — `WorkItemArtifact` carries the repository in
-		// `owner/name` form and nothing else.
-		const url = `https://github.com/${repository}/pull/${number}`;
+		// Linear records its GitHub linkage as an attachment, whether it points to an
+		// issue or a pull request. A workspace without that integration simply has no
+		// card for the artifact, and the caller falls open.
+		const path = kind === 'issue' ? 'issues' : 'pull';
+		const url = `https://github.com/${repository}/${path}/${number}`;
 		return this.run(async () => {
 			const data = await linearGraphQL<AttachmentsForUrlResponse>(ATTACHMENTS_FOR_URL_QUERY, {
 				url,
@@ -408,7 +401,9 @@ export class LinearPMProvider implements PMProvider {
 				(node) => node?.issue?.id && node.issue.team?.id === this.config.teamId,
 			);
 			const issue = attached?.issue;
-			return issue ? toWorkItem(issue, this.config) : undefined;
+			return issue?.id
+				? toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo)
+				: undefined;
 		});
 	}
 

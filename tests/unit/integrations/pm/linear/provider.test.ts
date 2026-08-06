@@ -32,8 +32,6 @@ const API_KEY = 'lin_api_test_key';
 
 const ISSUE_NODE = {
 	id: '0d5c3e5e-2d8e-4a3f-9f9a-0f5b1c0f0e21',
-	identifier: 'ENG-42',
-	number: 42,
 	title: 'Wire triggers',
 	description: 'Do the thing.',
 	url: 'https://linear.app/acme/issue/ENG-42/wire-triggers',
@@ -41,6 +39,7 @@ const ISSUE_NODE = {
 	updatedAt: '2026-07-02T00:00:00.000Z',
 	team: { id: CONFIG.teamId },
 	state: { id: CONFIG.statusOptions.inProgress, name: 'In Progress' },
+	attachments: { nodes: [] },
 	labels: { nodes: [{ id: 'label-swarm', name: 'swarm', color: '#4cb782' }] },
 	assignee: { id: 'user-1', name: 'Ada Lovelace', displayName: 'ada' },
 };
@@ -81,7 +80,7 @@ describe('LinearPMProvider', () => {
 	});
 
 	describe('getWorkItem', () => {
-		it('maps a Linear issue onto a WorkItem, taking taskRef from the issue number', async () => {
+		it('leaves taskRef unset when a Linear issue has no linked SCM artifact', async () => {
 			linearGraphQL.mockResolvedValue({ issue: ISSUE_NODE });
 
 			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toEqual({
@@ -89,9 +88,7 @@ describe('LinearPMProvider', () => {
 				title: 'Wire triggers',
 				description: 'Do the thing.',
 				url: ISSUE_NODE.url,
-				// Linear's own `number`, not the `ENG-42` identifier: the task id has to be
-				// numeric for `task-<id>`/`<branchPrefix><id>` and the digits-only branch check.
-				taskRef: '42',
+				taskRef: undefined,
 				status: 'In Progress',
 				statusId: CONFIG.statusOptions.inProgress,
 				statusKey: 'inProgress',
@@ -109,6 +106,23 @@ describe('LinearPMProvider', () => {
 				expect.stringContaining('labels(first: 100)'),
 				expect.anything(),
 			);
+			expect(linearGraphQL.mock.calls[0]?.[0]).not.toContain('identifier');
+		});
+
+		it('takes taskRef only from a GitHub artifact attachment in this project repository', async () => {
+			linearGraphQL.mockResolvedValue({
+				issue: {
+					...ISSUE_NODE,
+					attachments: {
+						nodes: [
+							{ url: 'https://github.com/another/repo/issues/9' },
+							{ url: 'https://github.com/SmartTechBrewery/swarm/pull/19/files' },
+						],
+					},
+				},
+			});
+
+			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({ taskRef: '19' });
 		});
 
 		it('leaves statusKey unset for an unmapped state and assignees empty when nobody is assigned', async () => {
@@ -140,14 +154,16 @@ describe('LinearPMProvider', () => {
 	});
 
 	describe('listWorkItems', () => {
-		it("filters by the project's team and concatenates every page", async () => {
+		it("filters id-less nodes and concatenates every page from the project's team", async () => {
 			linearGraphQL
-				.mockResolvedValueOnce(issuesPage([ISSUE_NODE], 'cursor-1'))
-				.mockResolvedValueOnce(issuesPage([{ ...ISSUE_NODE, id: 'issue-2', number: 43 }]));
+				.mockResolvedValueOnce(
+					issuesPage([null, { ...ISSUE_NODE, id: undefined }, ISSUE_NODE], 'cursor-1'),
+				)
+				.mockResolvedValueOnce(issuesPage([{ ...ISSUE_NODE, id: 'issue-2' }]));
 
 			const items = await provider.listWorkItems();
 
-			expect(items.map((item) => item.taskRef)).toEqual(['42', '43']);
+			expect(items.map((item) => item.id)).toEqual([ISSUE_NODE.id, 'issue-2']);
 			expect(linearGraphQL).toHaveBeenNthCalledWith(1, expect.stringContaining('issues(filter:'), {
 				filter: TEAM_FILTER,
 				cursor: undefined,
@@ -196,8 +212,22 @@ describe('LinearPMProvider', () => {
 	});
 
 	describe('findWorkItemForArtifact', () => {
-		it("resolves an issue artifact through the Linear issue's own number", async () => {
-			linearGraphQL.mockResolvedValue(issuesPage([ISSUE_NODE]));
+		it('resolves an issue artifact through the attachment Linear recorded for its URL', async () => {
+			linearGraphQL.mockResolvedValue({
+				attachmentsForURL: {
+					nodes: [
+						{
+							id: 'attachment-issue',
+							issue: {
+								...ISSUE_NODE,
+								attachments: {
+									nodes: [{ url: 'https://github.com/SmartTechBrewery/swarm/issues/42' }],
+								},
+							},
+						},
+					],
+				},
+			});
 
 			await expect(
 				provider.findWorkItemForArtifact({
@@ -206,14 +236,14 @@ describe('LinearPMProvider', () => {
 					number: '42',
 				}),
 			).resolves.toMatchObject({ id: ISSUE_NODE.id, taskRef: '42' });
-			expect(linearGraphQL).toHaveBeenCalledWith(expect.stringContaining('issues(filter:'), {
-				filter: { ...TEAM_FILTER, number: { eq: 42 } },
-				cursor: undefined,
-			});
+			expect(linearGraphQL).toHaveBeenCalledWith(
+				expect.stringContaining('attachmentsForURL(url: $url'),
+				{ url: 'https://github.com/SmartTechBrewery/swarm/issues/42' },
+			);
 		});
 
-		it('returns undefined when no issue in the team carries that number', async () => {
-			linearGraphQL.mockResolvedValue(issuesPage([]));
+		it('returns undefined when Linear has no attachment for an issue artifact', async () => {
+			linearGraphQL.mockResolvedValue({ attachmentsForURL: { nodes: [] } });
 
 			await expect(
 				provider.findWorkItemForArtifact({
@@ -234,7 +264,15 @@ describe('LinearPMProvider', () => {
 							id: 'attachment-other',
 							issue: { ...ISSUE_NODE, id: 'other-issue', team: { id: 'another-team' } },
 						},
-						{ id: 'attachment-1', issue: ISSUE_NODE },
+						{
+							id: 'attachment-1',
+							issue: {
+								...ISSUE_NODE,
+								attachments: {
+									nodes: [{ url: 'https://github.com/SmartTechBrewery/swarm/pull/7' }],
+								},
+							},
+						},
 					],
 				},
 			});
