@@ -98,18 +98,36 @@ not a way for a project administrator to bypass the worker owner's consent.
 > Rule 1's "must not fall back to another user's worker" is unconditional as
 > written, which is right for a phase whose *point* is running on the owner's
 > machine — `implementation`, which writes source in a worktree under the
-> operator's own token. It is wrong for `planning`, because the ability to run that
-> phase is deliberately **not** distributed: a DB-free remote worker refuses it
-> (its board write/split surface is wider than the control plane's delivery seam
-> carries, ADR-003). An item assigned to a user whose only machine is such a worker
-> was therefore never plannable at all — the permitted set held one worker that
-> refuses the phase, and the dispatch deferred to a terminal failure while a
-> capable worker sat idle. Two individually correct rules composed into work that
-> could never run. `planning` is now dispatched to any eligible, capable worker
-> regardless of assignment (`AFFINITY_GATED_PHASES`,
-> `src/worker/eligibility-gate.ts`); every other phase is unchanged. If Planning
-> ever becomes runnable without a database, this exemption is worth revisiting —
-> the reason for it is a capability asymmetry, not a property of planning as such.
+> operator's own token. It is wrong for `planning`, which produces no branch, no
+> worktree and no pull request: its whole output is board structure written under
+> the project's own credential, so nothing about it belongs on one machine rather
+> than another, and holding an item for its assignee's worker only leaves it
+> waiting while a capable worker sits idle. `planning` is therefore dispatched to
+> any eligible, capable worker regardless of assignment (`AFFINITY_GATED_PHASES`,
+> `src/worker/eligibility-gate.ts`); every other phase is unchanged.
+>
+> The exemption was originally argued from a capability asymmetry instead — a
+> DB-free remote worker refused Planning, so an item assigned to a user whose only
+> machine was such a worker was never plannable at all. Issue #536 made every
+> daemon run every phase and killed that premise; the exemption stands on the
+> reason above, which does not depend on it.
+
+> **Amended (issue #542): every worker has the same permissions.** `planning` was
+> for a time the one phase an enrollment could be *permitted* only on a worker whose
+> owner is an instance admin. That rule is gone. `instance_admin` is a role about
+> administering the installation — the API, the dashboard, the router — not about
+> workers, and using it as a per-phase switch conflated installation administration
+> with pipeline authorization while granting far more access than intended (it also
+> bypasses membership entirely in `listAccessibleProjectIds`). Board authorship is
+> already authorized at a better scope by the enrollment itself: the worker owner
+> chooses `allowedPhases` (issue #509) and a project administrator approves the
+> enrollment, and since issue #537 the board writes execute control-plane side under
+> the *project's* PM credential, which no worker ever holds. Whether a machine may
+> run Planning for a project is now decided by the same three conditions as every
+> other phase — the daemon declared it, the project has it enabled, and the
+> enrollment permits it. Enrollments stripped of `planning` by migration
+> `0043_backfill_planning_instance_admin.sql` stay stripped: opting back in is the
+> owner's explicit choice, not a silent re-grant.
 
 For community-contributed workers, execution results are untrusted until they
 pass the project's normal delivery controls. Changes are isolated in a

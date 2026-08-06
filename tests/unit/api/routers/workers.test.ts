@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
 	AllowedClisNotCapableError,
-	PlanningRequiresInstanceAdminError,
 	approveEnrollment,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -23,15 +22,8 @@ const {
 			this.name = 'AllowedClisNotCapableError';
 		}
 	}
-	class PlanningRequiresInstanceAdminError extends Error {
-		constructor(public workerId: string) {
-			super(`planning requires an instance admin owner: ${workerId}`);
-			this.name = 'PlanningRequiresInstanceAdminError';
-		}
-	}
 	return {
 		AllowedClisNotCapableError,
-		PlanningRequiresInstanceAdminError,
 		approveEnrollment: vi.fn(),
 		enrollWorker: vi.fn(),
 		getDashboardWorkerDetail: vi.fn(),
@@ -55,7 +47,6 @@ const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 
 vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	AllowedClisNotCapableError,
-	PlanningRequiresInstanceAdminError,
 	approveEnrollment,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -439,19 +430,23 @@ describe('workers.enroll (owner offers a worker to a project)', () => {
 		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
 	});
 
-	it('translates a planning-requires-instance-admin rejection to BAD_REQUEST', async () => {
+	// Issue #542: `planning` is an ordinary phase — the router neither special-cases
+	// it nor consults who owns the machine, whatever the caller's installation role.
+	it('enrolls with planning for an ordinary (non-admin) owner', async () => {
 		getWorker.mockResolvedValue(makeWorker());
 		getMembership.mockResolvedValue(membershipFor('contributor'));
-		enrollWorker.mockRejectedValue(new PlanningRequiresInstanceAdminError(WORKER_ID));
+		enrollWorker.mockResolvedValue(makeEnrollment());
 
-		await expect(
-			owner.enroll({
-				workerId: WORKER_ID,
-				projectId: 'p1',
-				allowedClis: ['claude'],
-				allowedPhases: ['planning'],
-			}),
-		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+		await owner.enroll({
+			workerId: WORKER_ID,
+			projectId: 'p1',
+			allowedClis: ['claude'],
+			allowedPhases: ['planning'],
+		});
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ allowedPhases: ['planning'] }),
+		);
 	});
 
 	it('an instanceAdmin may enroll any worker', async () => {
@@ -582,16 +577,18 @@ describe('workers allowed-phase inputs (issue #509)', () => {
 		expect(updateEnrollmentConstraints).not.toHaveBeenCalled();
 	});
 
-	it('translates a planning-requires-instance-admin rejection to BAD_REQUEST', async () => {
+	// Issue #542: adding `planning` to an ordinary owner's enrollment is an ordinary
+	// constraints update — no gate above the enrollment's own phase selection.
+	it('adds planning for an ordinary (non-admin) owner', async () => {
 		getEnrollment.mockResolvedValue(makeEnrollment());
 		getWorker.mockResolvedValue(makeWorker());
-		updateEnrollmentConstraints.mockRejectedValue(
-			new PlanningRequiresInstanceAdminError(WORKER_ID),
-		);
+		updateEnrollmentConstraints.mockResolvedValue(makeEnrollment());
 
-		await expect(
-			owner.updateConstraints({ enrollmentId: ENROLLMENT_ID, allowedPhases: ['planning'] }),
-		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+		await owner.updateConstraints({ enrollmentId: ENROLLMENT_ID, allowedPhases: ['planning'] });
+
+		expect(updateEnrollmentConstraints).toHaveBeenCalledWith(
+			expect.objectContaining({ allowedPhases: ['planning'] }),
+		);
 	});
 
 	it('omits the selection on enroll so the service applies its default', async () => {

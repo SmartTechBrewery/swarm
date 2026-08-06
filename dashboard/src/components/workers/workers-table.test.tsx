@@ -56,7 +56,6 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 			userId: 'u1',
 			identifier: 'ada@example.com',
 			displayName: 'Ada Lovelace',
-			instanceAdmin: false,
 		},
 		capabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
@@ -94,7 +93,6 @@ function makeRosterEntry(overrides: Partial<WorkerRosterEntry> = {}): WorkerRost
 			userId: 'u1',
 			identifier: 'ada@example.com',
 			displayName: 'Ada Lovelace',
-			instanceAdmin: false,
 		},
 		capabilities: ['claude', 'codex'],
 		status: 'active',
@@ -193,22 +191,21 @@ describe('WorkersTable row content', () => {
 		expect(screen.getByText('codex')).toBeDefined();
 	});
 
-	it('leads Capabilities with a planning badge when the daemon declared that phase', () => {
+	// Issue #542: the column used to lead with an amber `PLANNING` badge. It promotes
+	// no phase now — and lists none, whether or not the daemon declares it; the
+	// declared repertoire is the worker detail screen's, in full.
+	it('lists only the effective CLIs in Capabilities — no phase badge', () => {
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
 		const badges = screen.getByText('claude').parentElement;
-		// Planning first, then the CLIs — it is the capability an operator cannot
-		// infer from the machine's tooling (issue #467).
 		expect([...(badges?.children ?? [])].map((node) => node.textContent)).toEqual([
-			'planning',
 			'claude',
 			'codex',
 		]);
-		expect(screen.getByText('planning').getAttribute('title')).toContain('Planning phase');
+		expect(screen.queryByText('planning')).toBeNull();
 	});
 
-	it('omits the planning badge for a machine whose daemon refuses that phase', () => {
-		// What a DB-free remote daemon declares: every CLI, no planning.
+	it('reads the same for a machine whose daemon declares fewer phases', () => {
 		renderTable(
 			<WorkersTable
 				workers={[
@@ -221,6 +218,7 @@ describe('WorkersTable row content', () => {
 
 		expect(screen.queryByText('planning')).toBeNull();
 		expect(screen.getByText('claude')).toBeDefined();
+		expect(screen.getByText('codex')).toBeDefined();
 	});
 
 	it('shows only the CLIs at least one enrollment actually allows, not every declared capability', () => {
@@ -288,21 +286,11 @@ describe('WorkersTable row content', () => {
 	});
 
 	it('shows no CLI chip for a registered-but-un-enrolled machine, even though it declares CLIs', () => {
-		// No project has allowed anything on it yet — the planning badge (a
-		// separate axis) may still show, but no CLI chip should.
+		// No project has allowed anything on it yet, so the cell has nothing to show.
 		renderTable(<WorkersTable workers={[makeWorker({ enrollments: [] })]} />);
 
 		expect(screen.queryByText('claude')).toBeNull();
 		expect(screen.queryByText('codex')).toBeNull();
-	});
-
-	it('shows an em dash when a machine can neither plan nor run any allowed CLI', () => {
-		renderTable(
-			<WorkersTable
-				workers={[makeWorker({ supportedPhases: ['implementation'], enrollments: [] })]}
-			/>,
-		);
-
 		expect(screen.getAllByText('—').length).toBeGreaterThan(0);
 	});
 
@@ -657,7 +645,6 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 					userId: 'u2',
 					identifier: 'grace@example.com',
 					displayName: 'Grace Hopper',
-					instanceAdmin: false,
 				},
 				sharingConsent: false,
 				isRoutable: false,

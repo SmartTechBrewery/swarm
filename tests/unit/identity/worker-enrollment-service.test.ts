@@ -72,7 +72,6 @@ import {
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
-	PlanningRequiresInstanceAdminError,
 	setSharingConsent,
 	updateEnrollmentConstraints,
 } from '@/identity/worker-enrollment-service.js';
@@ -212,12 +211,7 @@ describe('listProjectRoster', () => {
 				'workerId',
 			].sort(),
 		);
-		expect(Object.keys(entry.owner ?? {}).sort()).toEqual([
-			'displayName',
-			'identifier',
-			'instanceAdmin',
-			'userId',
-		]);
+		expect(Object.keys(entry.owner ?? {}).sort()).toEqual(['displayName', 'identifier', 'userId']);
 		expect(entry).toMatchObject({
 			workerId: WORKER_ID,
 			displayName: 'ada-laptop',
@@ -634,12 +628,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'workerId',
 			].sort(),
 		);
-		expect(Object.keys(view.owner ?? {}).sort()).toEqual([
-			'displayName',
-			'identifier',
-			'instanceAdmin',
-			'userId',
-		]);
+		expect(Object.keys(view.owner ?? {}).sort()).toEqual(['displayName', 'identifier', 'userId']);
 		// Enrollment summaries carry approval state plus the effective allowed CLIs
 		// (for the roster's Capabilities column) — no consent/concurrency knob the
 		// screen could turn into a control.
@@ -663,10 +652,6 @@ describe('enrollWorker', () => {
 	it('de-dupes allowed CLIs, defaults status pending / consent off / allocation 1', async () => {
 		const worker = makeWorker({ capabilities: ['claude', 'codex'] });
 		createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
-		// An instance admin's own worker, so the default phase set (which names every
-		// phase, including `planning`) survives untouched — a separate describe block
-		// below covers the planning/ownership gate itself.
-		getUserById.mockResolvedValue(makeOwner({ instanceAdmin: true }));
 
 		await enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude', 'claude'] });
 
@@ -746,7 +731,6 @@ describe('enrollWorker', () => {
 	it('does not require the phase selection to be within the machine’s declared repertoire', async () => {
 		const worker = makeWorker({ supportedPhases: ['implementation'] });
 		createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
-		getUserById.mockResolvedValue(makeOwner({ instanceAdmin: true }));
 
 		await enrollWorker({
 			worker,
@@ -760,8 +744,11 @@ describe('enrollWorker', () => {
 		);
 	});
 
-	describe('planning is instance-admin-only (independent of supportedPhases)', () => {
-		it('silently drops planning from the default phase set for a non-instance-admin owner', async () => {
+	// Issue #542: `planning` is an ordinary phase. Nothing about who owns the machine
+	// is read when an enrollment's phase selection is decided — the enrollment itself
+	// is the authorization, and the owner's installation role is not part of it.
+	describe('planning is an ordinary phase (issue #542)', () => {
+		it('keeps planning in the default phase set for a non-instance-admin owner', async () => {
 			const worker = makeWorker();
 			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
 			getUserById.mockResolvedValue(makeOwner({ instanceAdmin: false }));
@@ -769,46 +756,14 @@ describe('enrollWorker', () => {
 			await enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude'] });
 
 			const [[created]] = createEnrollment.mock.calls;
-			expect(created.allowedPhases).not.toContain('planning');
-			// Every other phase from the default set survives the narrowing.
-			expect(created.allowedPhases).toEqual(
-				[...DEFAULT_ENROLLMENT_ALLOWED_PHASES].filter((phase) => phase !== 'planning'),
-			);
+			expect(created.allowedPhases).toEqual([...DEFAULT_ENROLLMENT_ALLOWED_PHASES]);
+			expect(created.allowedPhases).toContain('planning');
 		});
 
-		it('rejects an explicit planning selection for a non-instance-admin owner', async () => {
-			const worker = makeWorker();
-			getUserById.mockResolvedValue(makeOwner({ instanceAdmin: false }));
-
-			await expect(
-				enrollWorker({
-					worker,
-					projectId: 'proj-a',
-					allowedClis: ['claude'],
-					allowedPhases: ['planning'],
-				}),
-			).rejects.toBeInstanceOf(PlanningRequiresInstanceAdminError);
-			expect(createEnrollment).not.toHaveBeenCalled();
-		});
-
-		it('rejects planning when the worker’s owner no longer resolves', async () => {
-			const worker = makeWorker();
-			getUserById.mockResolvedValue(undefined);
-
-			await expect(
-				enrollWorker({
-					worker,
-					projectId: 'proj-a',
-					allowedClis: ['claude'],
-					allowedPhases: ['planning'],
-				}),
-			).rejects.toBeInstanceOf(PlanningRequiresInstanceAdminError);
-		});
-
-		it('keeps an explicit planning selection for an instance-admin owner', async () => {
+		it('accepts an explicit planning selection for a non-instance-admin owner', async () => {
 			const worker = makeWorker();
 			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
-			getUserById.mockResolvedValue(makeOwner({ instanceAdmin: true }));
+			getUserById.mockResolvedValue(makeOwner({ instanceAdmin: false }));
 
 			await enrollWorker({
 				worker,
@@ -820,6 +775,20 @@ describe('enrollWorker', () => {
 			expect(createEnrollment).toHaveBeenCalledWith(
 				expect.objectContaining({ allowedPhases: ['planning', 'implementation'] }),
 			);
+		});
+
+		it('does not read the owner at all when planning is selected', async () => {
+			const worker = makeWorker();
+			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+			await enrollWorker({
+				worker,
+				projectId: 'proj-a',
+				allowedClis: ['claude'],
+				allowedPhases: ['planning'],
+			});
+
+			expect(getUserById).not.toHaveBeenCalled();
 		});
 	});
 });
@@ -903,36 +872,23 @@ describe('updateEnrollmentConstraints', () => {
 		expect(updateEnrollmentConstraintsRow).not.toHaveBeenCalled();
 	});
 
-	describe('planning is instance-admin-only (independent of supportedPhases)', () => {
-		it('rejects adding planning for a non-instance-admin owner', async () => {
-			const worker = makeWorker();
-			getUserById.mockResolvedValue(makeOwner({ instanceAdmin: false }));
+	// Issue #542: adding `planning` is the owner's own routing choice, exactly like
+	// adding any other phase — the owner's installation role is never consulted.
+	it('allows adding planning for a non-instance-admin owner (issue #542)', async () => {
+		const worker = makeWorker();
+		updateEnrollmentConstraintsRow.mockResolvedValue(makeEnrollment());
+		getUserById.mockResolvedValue(makeOwner({ instanceAdmin: false }));
 
-			await expect(
-				updateEnrollmentConstraints({
-					worker,
-					enrollmentId: ENROLLMENT_ID,
-					allowedPhases: ['planning', 'implementation'],
-				}),
-			).rejects.toBeInstanceOf(PlanningRequiresInstanceAdminError);
-			expect(updateEnrollmentConstraintsRow).not.toHaveBeenCalled();
+		await updateEnrollmentConstraints({
+			worker,
+			enrollmentId: ENROLLMENT_ID,
+			allowedPhases: ['planning', 'implementation'],
 		});
 
-		it('allows adding planning for an instance-admin owner', async () => {
-			const worker = makeWorker();
-			updateEnrollmentConstraintsRow.mockResolvedValue(makeEnrollment());
-			getUserById.mockResolvedValue(makeOwner({ instanceAdmin: true }));
-
-			await updateEnrollmentConstraints({
-				worker,
-				enrollmentId: ENROLLMENT_ID,
-				allowedPhases: ['planning', 'implementation'],
-			});
-
-			expect(updateEnrollmentConstraintsRow).toHaveBeenCalledWith(ENROLLMENT_ID, {
-				allowedPhases: ['planning', 'implementation'],
-			});
+		expect(updateEnrollmentConstraintsRow).toHaveBeenCalledWith(ENROLLMENT_ID, {
+			allowedPhases: ['planning', 'implementation'],
 		});
+		expect(getUserById).not.toHaveBeenCalled();
 	});
 });
 

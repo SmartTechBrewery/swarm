@@ -73,7 +73,6 @@ function makeRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
 			userId: 'u1',
 			identifier: 'ada@example.com',
 			displayName: 'Ada Lovelace',
-			instanceAdmin: false,
 		},
 		capabilities: ['claude'],
 		supportedPhases: ['planning'],

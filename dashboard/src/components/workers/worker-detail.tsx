@@ -141,7 +141,12 @@ function ConnectionState({ worker }: { worker: WorkerDetail }) {
 	);
 }
 
-/** The declared phase repertoire in full — not just `planning`, as the table shows. */
+/**
+ * The declared phase repertoire in full — the only screen that shows it, and every
+ * phase on the same terms (issue #542). What it answers is version skew: a daemon
+ * built before issue #536 declares five phases rather than six, and the dispatch
+ * gate routes around the missing one instead of failing (issue #467).
+ */
 function SupportedPhases({ phases }: { phases: string[] }) {
 	if (phases.length === 0) {
 		return (
@@ -153,15 +158,7 @@ function SupportedPhases({ phases }: { phases: string[] }) {
 	return (
 		<div className="flex flex-wrap gap-1">
 			{phases.map((phase) => (
-				<Badge
-					key={phase}
-					tone={phase === 'planning' ? 'caution' : 'neutral'}
-					title={
-						phase === 'planning' ? "This machine's daemon can run the Planning phase" : undefined
-					}
-				>
-					{formatPhase(phase)}
-				</Badge>
+				<Badge key={phase}>{formatPhase(phase)}</Badge>
 			))}
 		</div>
 	);
@@ -257,9 +254,10 @@ export function WorkerDetailView({
 					</Field>
 				</div>
 				<p className="text-xs text-zinc-500 mt-4">
-					Declared by the machine's own daemon at handshake, on two independent axes: a remote
-					DB-free daemon has every CLI and still refuses Planning. Reported here, never editable —
-					editing them would make this screen disagree with the machine.
+					Declared by the machine's own daemon at handshake, on two independent axes. Reported here,
+					never editable — editing them would make this screen disagree with the machine. A daemon
+					on an older build can declare fewer phases than this one runs; which of them a project may
+					actually give this machine is the enrollment's Allowed pipeline phases, below.
 				</p>
 			</div>
 
@@ -301,7 +299,6 @@ export function WorkerDetailView({
 								capabilities={worker.capabilities}
 								supportedPhases={worker.supportedPhases}
 								projectDisabledPhases={projectDisabledPhases.get(enrollment.projectId) ?? []}
-								ownerIsInstanceAdmin={worker.owner?.instanceAdmin ?? false}
 								projectName={projectNames.get(enrollment.projectId) ?? enrollment.projectId}
 								viewerIsOwner={worker.viewerIsOwner}
 								ownerName={ownerName}

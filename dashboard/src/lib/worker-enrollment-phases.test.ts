@@ -36,7 +36,6 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['implementation'],
 			supportedPhases: [...ALL_TRIGGER_PHASES],
 			projectDisabledPhases: [],
-			ownerIsInstanceAdmin: true,
 		});
 
 		expect(options.map((option) => option.phase)).toEqual([...ALL_TRIGGER_PHASES]);
@@ -51,7 +50,6 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['implementation'],
 			supportedPhases: ['implementation'],
 			projectDisabledPhases: [],
-			ownerIsInstanceAdmin: true,
 		});
 
 		expect(planning.phase).toBe('planning');
@@ -63,7 +61,6 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['review'],
 			supportedPhases: [...ALL_TRIGGER_PHASES],
 			projectDisabledPhases: ['review'],
-			ownerIsInstanceAdmin: true,
 		});
 		const review = options.find((option) => option.phase === 'review');
 
@@ -78,7 +75,6 @@ describe('enrollmentPhaseOptions', () => {
 			allowedPhases: ['implementation'],
 			supportedPhases: ['implementation'],
 			projectDisabledPhases: ['review'],
-			ownerIsInstanceAdmin: true,
 		});
 		const review = options.find((option) => option.phase === 'review');
 
@@ -86,30 +82,29 @@ describe('enrollmentPhaseOptions', () => {
 		expect(review?.unavailable).toMatch(/turned off for every worker/);
 	});
 
-	it('blocks planning on a non-instance-admin’s worker even though the daemon declares it', () => {
+	// Issue #542: planning is offered exactly like the other five. Nothing about the
+	// machine's owner reaches this helper any more, so a declared, project-enabled
+	// planning is freely selectable whoever owns the machine.
+	it('offers planning freely once the daemon declares it', () => {
 		const [planning] = enrollmentPhaseOptions({
 			allowedPhases: ['implementation'],
 			supportedPhases: [...ALL_TRIGGER_PHASES],
 			projectDisabledPhases: [],
-			ownerIsInstanceAdmin: false,
 		});
 
 		expect(planning.phase).toBe('planning');
-		expect(planning.unavailable).toMatch(/instance admin/);
+		expect(planning.unavailable).toBeNull();
 	});
 
-	it('never blocks any other phase on ownership — only planning is instance-admin-gated', () => {
+	it('never explains an unavailable phase by who owns the machine', () => {
 		const options = enrollmentPhaseOptions({
 			allowedPhases: ['implementation'],
-			supportedPhases: [...ALL_TRIGGER_PHASES],
-			projectDisabledPhases: [],
-			ownerIsInstanceAdmin: false,
+			supportedPhases: ['implementation'],
+			projectDisabledPhases: ['review'],
 		});
 
-		expect(
-			options
-				.filter((option) => option.phase !== 'planning')
-				.every((option) => option.unavailable === null),
-		).toBe(true);
+		for (const option of options) {
+			expect(option.unavailable ?? '').not.toMatch(/admin|owner/i);
+		}
 	});
 });
