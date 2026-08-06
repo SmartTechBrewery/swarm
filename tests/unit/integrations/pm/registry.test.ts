@@ -76,6 +76,7 @@ describe('pmProviderRegistry', () => {
 				category: 'pm',
 				createProvider: () => provider,
 				routerAdapter,
+				credentialRoles: [],
 			} as unknown as PMProviderManifest;
 		}
 

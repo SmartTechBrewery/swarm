@@ -78,6 +78,7 @@ export function RunFilters({
 					<option value="completed">Completed</option>
 					<option value="failed">Failed</option>
 					<option value="deferred">Deferred</option>
+					<option value="checkpointed">Checkpointed</option>
 				</select>
 			</div>
 

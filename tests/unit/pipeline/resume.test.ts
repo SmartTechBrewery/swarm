@@ -23,8 +23,11 @@ import { AgentRunError } from '@/harness/agent-failure.js';
 import { CHECKPOINT_FILENAME } from '@/pipeline/checkpoint.js';
 import {
 	acquireResumableWorktree,
+	checkpointFallbackApplies,
 	executeRecoveryGate,
 	sessionRunArgs,
+	shouldPreserveFailedCheckout,
+	shouldPreserveForCheckpoint,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
@@ -176,6 +179,109 @@ function gate(
 		phase,
 	);
 }
+
+/**
+ * The Tier 2 *selection* predicates (issue #503) — which failures may fall back to a
+ * checkpoint, and whether the checkout must therefore survive. The matrix that
+ * matters is kind × captured-session × was-this-attempt-a-resume × checkpoint
+ * present, and the first row of it is the regression that keeps Tier 1 in front.
+ */
+describe('checkpointFallbackApplies / shouldPreserveForCheckpoint (issue #503)', () => {
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	const stopped = (kind: 'rate-limit' | 'timeout' | 'stalled', sessionId?: string): AgentRunError =>
+		new AgentRunError(`${kind} error`, { kind }, mockAgentResult(sessionId));
+
+	it.each([
+		'rate-limit',
+		'timeout',
+		'stalled',
+	] as const)('applies to a sessionless %s stop', (kind) => {
+		expect(checkpointFallbackApplies(stopped(kind), false)).toBe(true);
+	});
+
+	// Tier 1 keeps absolute priority: a first stop that captured a resumable session is
+	// still resumed, and never diverted to the degraded checkpoint hand-off.
+	it.each([
+		'rate-limit',
+		'timeout',
+		'stalled',
+	] as const)('does not apply to a %s stop that captured a session id on a non-resume attempt', (kind) => {
+		expect(checkpointFallbackApplies(stopped(kind, 'session-123'), false)).toBe(false);
+	});
+
+	// …but once that resume has itself failed, the id it echoes back is no longer
+	// evidence the session can be re-entered, so Tier 2 takes over.
+	it('applies when the failed attempt was itself a session resume', () => {
+		expect(checkpointFallbackApplies(stopped('rate-limit', 'session-123'), true)).toBe(true);
+	});
+
+	it.each([
+		'error',
+		'auth',
+		'capacity',
+		'aborted',
+	] as const)('never applies to a %s failure, resume or not', (kind) => {
+		const error = new AgentRunError(`${kind} error`, { kind }, mockAgentResult(undefined));
+		expect(checkpointFallbackApplies(error, false)).toBe(false);
+		expect(checkpointFallbackApplies(error, true)).toBe(false);
+	});
+
+	it('preserves the checkout when the fallback applies and a checkpoint is there', () => {
+		const path = preservedCheckout(CHECKPOINT);
+		expect(shouldPreserveForCheckpoint(stopped('rate-limit'), path, 'implementation')).toBe(true);
+	});
+
+	it('does not preserve the checkout when no checkpoint was written', () => {
+		const path = preservedCheckout();
+		expect(shouldPreserveForCheckpoint(stopped('rate-limit'), path, 'implementation')).toBe(false);
+	});
+
+	it('does not preserve the checkout for an unparseable checkpoint', () => {
+		const path = preservedCheckout({ nonsense: true });
+		expect(shouldPreserveForCheckpoint(stopped('timeout'), path, 'implementation')).toBe(false);
+	});
+
+	it('does not preserve the checkout for a checkpoint another phase wrote', () => {
+		const path = preservedCheckout({ ...CHECKPOINT, phase: 'respond-to-ci' });
+		expect(shouldPreserveForCheckpoint(stopped('timeout'), path, 'implementation')).toBe(false);
+	});
+
+	it('does not preserve the checkout when Tier 1 can serve the stop', () => {
+		const path = preservedCheckout(CHECKPOINT);
+		expect(
+			shouldPreserveForCheckpoint(
+				stopped('rate-limit', 'session-123'),
+				path,
+				'implementation',
+				false,
+			),
+		).toBe(false);
+	});
+
+	it('keeps either tier able to claim the checkout', () => {
+		const path = preservedCheckout(CHECKPOINT);
+		// Tier 1's own case — no checkpoint needed.
+		expect(
+			shouldPreserveFailedCheckout(
+				stopped('timeout', 'session-123'),
+				'/nonexistent',
+				'implementation',
+				false,
+			),
+		).toBe(true);
+		// Tier 2's — no session, but a checkpoint.
+		expect(shouldPreserveFailedCheckout(stopped('timeout'), path, 'implementation', false)).toBe(
+			true,
+		);
+		// Neither.
+		expect(
+			shouldPreserveFailedCheckout(stopped('timeout'), '/nonexistent', 'implementation', false),
+		).toBe(false);
+	});
+});
 
 describe("executeRecoveryGate — the 'checkpoint' continuation branch (issue #502)", () => {
 	beforeEach(() => {

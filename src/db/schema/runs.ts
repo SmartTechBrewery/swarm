@@ -11,6 +11,7 @@ import {
 	uuid,
 } from 'drizzle-orm/pg-core';
 import type { AgentUsage } from '../../harness/usage.js';
+import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
@@ -169,6 +170,26 @@ export const runs = pgTable(
 		failureDiagnosis: jsonb('failure_diagnosis').$type<FailureDiagnosis>(),
 		/** Claude Code session handle used to continue a deferred PM phase. */
 		agentSessionId: uuid('agent_session_id'),
+		/**
+		 * The Tier 2 checkpoint hand-off this run was settled `checkpointed` with
+		 * (`docs/CHECKPOINTS.md`, issue #503) — the parsed `swarm_checkpoint.json` the
+		 * stopped agent left in its worktree. Stored on the row, not read back off
+		 * disk, so the API and dashboard can show the recorded remainder without
+		 * reaching into a (possibly remote) worker's filesystem. Nullable: only a
+		 * `checkpointed` settle writes one, and it survives an ordinary retry as the
+		 * record of what the current attempt was seeded from — "Reset & restart"
+		 * ({@link clearRunRecovery}) clears it.
+		 */
+		checkpoint: jsonb('checkpoint').$type<Checkpoint>(),
+		/**
+		 * How many times this run has already been continued from a checkpoint. The
+		 * bound on the Tier 2 fallback: once it reaches the project's
+		 * `pipeline.maxContinuations`, the next involuntary stop fails terminally
+		 * ("continuation budget exhausted") instead of handing off again. Deliberately
+		 * **not** cleared by a retry ({@link resetRunToRunning}) — that would unbound
+		 * the loop — only by "Reset & restart" ({@link clearRunRecovery}).
+		 */
+		continuationCount: integer('continuation_count').notNull().default(0),
 		outputBytes: integer('output_bytes').notNull().default(0),
 		outputTruncated: boolean('output_truncated').notNull().default(false),
 		recovery: jsonb('recovery').$type<{

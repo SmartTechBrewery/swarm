@@ -56,10 +56,53 @@ export function buildResolveConflictsPrompt(
 			input.headSha +
 			'; if not, stop and fail without pushing.',
 		`Merge origin/${input.baseBranch} into the checked-out PR branch with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent.`,
+		...MIGRATION_CONFLICT_GUIDANCE,
 		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge in the working tree for SWARM.',
 		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", body (the concise result comment), and verification [{command,outcome:"passed"}].`,
 		...checkpointInstructions('resolve-conflicts'),
 		...(input.checkpoint ? checkpointContinuationSection(input.checkpoint) : []),
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');
+}
+
+/**
+ * Standing guidance for the one conflict shape a generic "preserve both
+ * sides' intent" merge reliably gets wrong: `src/db/migrations/`. Drizzle's
+ * numbered `.sql` files and `meta/_journal.json` are generated artifacts with
+ * invariants a normal 3-way text merge does not know to preserve — every
+ * journal entry must name a file that exists, and `when` must strictly
+ * increase across entries, or a database already migrated past that point
+ * silently skips the entry instead of erroring (confirmed live, issue #503/#508:
+ * three merges into one long-lived branch left the journal naming a `.sql`
+ * file that was never committed, and gave the branch's own migration a `when`
+ * earlier than the one main had already moved ahead to). SWARM still runs
+ * `validateMigrationJournal` (`src/db/migration-journal.ts`) as a
+ * deterministic backstop after this — this paragraph is to get it right on
+ * the first pass instead of spending that one repair chance.
+ */
+const MIGRATION_CONFLICT_GUIDANCE = [
+	"If the merge conflicts inside `src/db/migrations/` (a numbered `.sql` file, or `src/db/migrations/meta/_journal.json`/its snapshot files), do not hand-resolve the conflict markers in those generated files. Instead: finish resolving every *other* conflict first and commit nothing yet; keep `main`'s migrations exactly as `main` has them (do not renumber or edit any migration `main` already has); then run `npx drizzle-kit generate` from the repo root, which reads the merged `src/db/schema/*.ts` and this branch's already-merged schema changes to generate one fresh, correctly-numbered migration (and its matching journal entry and snapshot) for whatever this branch's schema changes still need beyond what `main` already has. If this branch's own migration file(s) are now superseded by the freshly generated one, remove them (and their now-orphaned snapshot/journal entry) rather than keeping both. Verify afterward that `src/db/migrations/meta/_journal.json` has exactly one entry per `.sql` file in that folder and that every entry's `when` is strictly greater than the previous one's.",
+];
+
+/**
+ * Build the one repair pass `runResolveConflictsPhase`
+ * (`src/pipeline/resolve-conflicts.ts`) runs when its post-merge
+ * `validateMigrationJournal` gate finds the merge it just produced leaves the
+ * migration journal inconsistent — the deterministic backstop for the
+ * guidance above, for whichever CLI/model ignored or mishandled it. Mirrors
+ * `buildReviewHandoffRepairPrompt`'s shape (`src/pipeline/prompts/review.ts`):
+ * one paragraph naming the validator's own complaint, one naming the fix, and
+ * the same repository-mutation floor as the original prompt.
+ */
+export function buildMigrationJournalRepairPrompt(issues: readonly string[]): string {
+	return [
+		"The merge you just produced is NOT resolved: `src/db/migrations/` failed SWARM's deterministic post-merge check.",
+		'',
+		'The validator reported:',
+		issues.map((issue) => `- ${issue}`).join('\n'),
+		'',
+		"Fix only `src/db/migrations/` (the numbered `.sql` files and `meta/_journal.json`/its snapshot files) so every reported problem is gone. Do not touch any other file — every other conflict is already correctly resolved. Prefer `npx drizzle-kit generate` over hand-editing the journal or a snapshot: keep `main`'s existing migrations exactly as `main` has them, and let `drizzle-kit generate` produce one fresh, correctly-numbered migration (with its own journal entry and snapshot) for whatever schema change this branch still needs beyond `main`. Remove this branch's now-superseded migration file(s) and their orphaned journal entries if `drizzle-kit generate` replaces them.",
+		'',
+		'Still do not commit, push, comment, or perform any GitHub mutation — leave the corrected tree in the working directory for SWARM, and rewrite the hand-off file only if the fix changes its `body` or `verification`.',
+	].join('\n');
 }

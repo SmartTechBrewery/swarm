@@ -84,6 +84,27 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 			expect(await findProjectByBoardFromDb('PVT_untracked')).toBeUndefined();
 		});
 
+		// The PM provider's credential-role references ride the existing `credentials`
+		// jsonb column (issue #497) — no column, no migration — so a real round-trip is
+		// what proves the nested map survives Postgres.
+		it("round-trips the credentials block's PM role references", async () => {
+			const config = createMockProjectConfig({
+				id: 'proj-pm-credentials',
+				name: 'PM Credentials Project',
+				repo: 'jkwiecien/pm-credentials',
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: { webhookSecret: 'PM_WEBHOOK_SECRET' },
+				},
+			});
+			await createProjectInDb(config);
+
+			expect((await findProjectByIdFromDb('proj-pm-credentials'))?.credentials).toEqual(
+				config.credentials,
+			);
+		});
+
 		it('rejects if the project ID already exists', async () => {
 			await seedProject({ id: 'dup-id', name: 'Original Name', repo: 'jkwiecien/original' });
 

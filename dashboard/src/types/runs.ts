@@ -9,7 +9,13 @@ import { z } from 'zod';
  * Zod is the source of truth per `ai/CODING_STANDARDS.md`; the types are
  * `z.infer`'d rather than hand-written.
  */
-export const runStatusFilterSchema = z.enum(['running', 'completed', 'failed', 'deferred']);
+export const runStatusFilterSchema = z.enum([
+	'running',
+	'completed',
+	'failed',
+	'deferred',
+	'checkpointed',
+]);
 export type RunStatusFilter = z.infer<typeof runStatusFilterSchema>;
 
 export const runPhaseFilterSchema = z.enum([
@@ -52,12 +58,38 @@ export const failureDiagnosisSchema = z.object({
 		'launch-or-authentication',
 		'worker-shutdown',
 		'user-terminated',
+		'continuation-budget-exhausted',
 	]),
 	title: z.string(),
 	message: z.string(),
 	recovery: z.string(),
 });
 export type FailureDiagnosis = z.infer<typeof failureDiagnosisSchema>;
+
+/**
+ * Mirrors `CheckpointSchema` (`src/pipeline/checkpoint.ts`) — the Tier 2 hand-off
+ * a `checkpointed` run was settled with (`docs/CHECKPOINTS.md`, issue #503). The
+ * dashboard package can't import that module (it reads git and the filesystem),
+ * so the shape is re-declared here the same way `failureDiagnosisSchema` mirrors
+ * the worker's. Keep the two in step; the server's schema stays the validator.
+ */
+export const checkpointSchema = z.object({
+	/** The phase that wrote it — a continuation never adopts another phase's checkpoint. */
+	phase: z.string(),
+	/** What the stopped agent finished, and a continuation must not re-derive. */
+	completed: z.array(z.string()),
+	/** What is still left, in order — the remainder a continuation picks up. */
+	remaining: z.array(z.string()),
+	/** Decisions/caveats carried over rather than re-decided. */
+	decisions: z.array(z.string()),
+	/** The paths it claims it left changed, by change kind. */
+	workingTree: z.object({
+		modified: z.array(z.string()),
+		added: z.array(z.string()),
+		deleted: z.array(z.string()),
+	}),
+});
+export type Checkpoint = z.infer<typeof checkpointSchema>;
 
 /**
  * Mirrors the server `runs.queued` contract (`QueuedRunSchema`,
@@ -296,6 +328,31 @@ export interface RunRow {
 	 * `hasResumableDeferredRun` guard). Mirrors the `agent_session_id` column.
 	 */
 	agentSessionId: string | null;
+	/**
+	 * The Tier 2 checkpoint this run was settled `checkpointed` with (issue #503) —
+	 * the hand-off the stopped agent left in its worktree, persisted on the row so
+	 * the detail page can show the recorded remainder without reading a (possibly
+	 * remote) worker's filesystem. Null for every run that never handed off, and it
+	 * survives an ordinary retry as the record of what the current attempt was
+	 * seeded from. Mirrors the `checkpoint` column.
+	 */
+	checkpoint?: Checkpoint | null;
+	/**
+	 * How many times this run has already been continued from its checkpoint — the
+	 * spent half of the bounded Tier 2 fallback. Deliberately *not* cleared by a
+	 * retry (that would unbound the loop), only by "Reset & restart". Optional here
+	 * because pre-#503 payloads carry no such field.
+	 */
+	continuationCount?: number;
+	/**
+	 * The project's checkpoint-continuation ceiling this run's `continuationCount`
+	 * reads against — `pipeline.maxContinuations`, resolved server-side by
+	 * `runs.getById` (issue #504) so the default never has to be re-declared here.
+	 * Returned only for a run that carries a checkpoint; null otherwise, and for a
+	 * project that no longer resolves, in which case the panel shows the spent count
+	 * without a ceiling rather than a fabricated one.
+	 */
+	maxContinuations?: number | null;
 	/**
 	 * Preservation/recovery state for failed or resumed runs.
 	 */

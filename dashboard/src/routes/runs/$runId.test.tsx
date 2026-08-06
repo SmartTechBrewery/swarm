@@ -10,7 +10,14 @@ import type { RunRow } from '@/types/runs.js';
 // stubbed here. Every other test in this file renders a pure callout that never
 // touches it.
 vi.mock('@/lib/trpc.js', () => ({
-	trpcClient: { runs: { reset: { mutate: vi.fn() }, forceReReview: { mutate: vi.fn() } } },
+	trpcClient: {
+		runs: {
+			reset: { mutate: vi.fn() },
+			forceReReview: { mutate: vi.fn() },
+			retryNow: { mutate: vi.fn() },
+			terminate: { mutate: vi.fn() },
+		},
+	},
 	trpc: {
 		runs: {
 			getById: { queryKey: () => ['runs.getById'] },
@@ -33,6 +40,8 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 
 import { trpcClient } from '@/lib/trpc.js';
 import {
+	CheckpointedCallout,
+	CheckpointPanel,
 	FailureDiagnosisCallout,
 	ForceReReviewButton,
 	GitHubReferences,
@@ -253,6 +262,13 @@ describe('RecoveryCallout (issue #368)', () => {
 			/resume, finish, or deliberately terminate/i,
 		],
 		['missing-validation', /saved agent session is gone/i, /provision a fresh checkout/i],
+		// Issue #502's continuation block: unlike the reasons above, no tidying of the
+		// checkout restores the hand-off it no longer matches.
+		[
+			'checkpoint-divergent',
+			/no longer describes the checkout/i,
+			/start this phase over from a fresh checkout/i,
+		],
 	] as const)('explains the %s blocked reason and offers Recheck and retry', (blockedReason, conditionPattern, resolutionPattern) => {
 		render(<RecoveryCallout run={makeRecoveryRun({ state: 'blocked', blockedReason })} />);
 
@@ -276,6 +292,185 @@ describe('RecoveryCallout (issue #368)', () => {
 		expect(screen.getByRole('heading', { name: /recovery blocked/i })).toBeDefined();
 		expect(screen.getByText(/failed a safety check/i)).toBeDefined();
 		expect(screen.getByText(/recheck and retry/i)).toBeDefined();
+	});
+});
+
+// The Tier 2 checkpoint surface (issues #503, #504).
+const CHECKPOINT: NonNullable<RunRow['checkpoint']> = {
+	phase: 'implementation',
+	completed: ['Added the schema field and its focused tests.'],
+	remaining: ['Update the configuration table.', 'Run lint and the focused tests.'],
+	decisions: ['Storage migration is out of scope.'],
+	workingTree: {
+		modified: ['src/config/schema.ts'],
+		added: ['tests/unit/config/new.test.ts'],
+		deleted: ['src/config/legacy.ts'],
+	},
+};
+
+function makeCheckpointedRun(overrides: Partial<RunRow> = {}): RunRow {
+	return makeReviewRun({
+		status: 'checkpointed',
+		phase: 'implementation',
+		reviewVerdict: null,
+		reviewOrdinal: null,
+		reviewAutomationOutcome: null,
+		error: 'Agent stopped: rate limit reached.',
+		// A checkpointed row carries no session id by construction.
+		agentSessionId: null,
+		nextRetryAt: '2026-01-01T01:00:00.000Z',
+		checkpoint: CHECKPOINT,
+		continuationCount: 1,
+		maxContinuations: 2,
+		...overrides,
+	});
+}
+
+describe('CheckpointPanel (issue #504)', () => {
+	it('renders nothing for a run that never handed off', () => {
+		const { container } = render(<CheckpointPanel run={makeReviewRun()} />);
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('shows the remaining work, completed steps, decisions, and recorded working tree', () => {
+		render(<CheckpointPanel run={makeCheckpointedRun()} />);
+
+		expect(screen.getByRole('heading', { name: /checkpoint hand-off/i })).toBeDefined();
+		expect(screen.getByText('Update the configuration table.')).toBeDefined();
+		expect(screen.getByText('Run lint and the focused tests.')).toBeDefined();
+		expect(screen.getByText('Added the schema field and its focused tests.')).toBeDefined();
+		expect(screen.getByText('Storage migration is out of scope.')).toBeDefined();
+		expect(screen.getByText('src/config/schema.ts')).toBeDefined();
+		expect(screen.getByText('tests/unit/config/new.test.ts')).toBeDefined();
+		expect(screen.getByText('src/config/legacy.ts')).toBeDefined();
+	});
+
+	it('numbers the remaining work, because its order is the order a continuation works in', () => {
+		const { container } = render(<CheckpointPanel run={makeCheckpointedRun()} />);
+		const ordered = container.querySelector('ol');
+		expect(ordered?.querySelectorAll('li')).toHaveLength(CHECKPOINT.remaining.length);
+	});
+
+	it("reads the spent continuation count against the project's configured ceiling", () => {
+		render(<CheckpointPanel run={makeCheckpointedRun()} />);
+		expect(screen.getByText('Continuation 1 of 2')).toBeDefined();
+	});
+
+	it('reports the count alone when the server could not resolve a ceiling', () => {
+		render(<CheckpointPanel run={makeCheckpointedRun({ maxContinuations: null })} />);
+		expect(screen.getByText('Continuation 1')).toBeDefined();
+	});
+
+	it('omits empty checkpoint groups rather than rendering an empty label', () => {
+		render(
+			<CheckpointPanel
+				run={makeCheckpointedRun({
+					checkpoint: {
+						...CHECKPOINT,
+						decisions: [],
+						workingTree: { ...CHECKPOINT.workingTree, added: [], deleted: [] },
+					},
+				})}
+			/>,
+		);
+
+		expect(screen.queryByText(/decisions carried over/i)).toBeNull();
+		expect(screen.queryByText('Added')).toBeNull();
+		expect(screen.queryByText('Deleted')).toBeNull();
+		expect(screen.getByText('Modified')).toBeDefined();
+	});
+
+	it('still renders for a retried continuation, whose checkpoint records what it was seeded from', () => {
+		// The column survives an ordinary retry, so a `running` continuation shows the
+		// hand-off it is working through.
+		render(<CheckpointPanel run={makeCheckpointedRun({ status: 'running' })} />);
+		expect(screen.getByRole('heading', { name: /checkpoint hand-off/i })).toBeDefined();
+	});
+});
+
+describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
+	function renderHeader(run: RunRow = makeCheckpointedRun()) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	it('explains it waits on a continuation rather than on quota', () => {
+		renderHeader();
+
+		const heading = screen.getByRole('heading', { name: /checkpointed — continuation scheduled/i });
+		expect(heading.classList.contains('text-sky-200')).toBe(true);
+		expect(screen.getByText(/not waiting on quota/i).classList.contains('text-sky-200/70')).toBe(
+			true,
+		);
+		const callout = heading.parentElement?.parentElement;
+		expect(callout?.classList.contains('bg-sky-950/20')).toBe(true);
+		expect(callout?.classList.contains('border-sky-900/30')).toBe(true);
+		// The badge next to the title states the same status.
+		expect(screen.getByText('Checkpointed')).toBeDefined();
+		// Never the amber deferred callout, which would claim a scheduled *retry*.
+		expect(screen.queryByRole('heading', { name: /deferred/i })).toBeNull();
+	});
+
+	it('offers Continue now, Terminate, and Reset & restart', () => {
+		renderHeader();
+
+		expect(screen.getByRole('button', { name: /continue now/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /^terminate$/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();
+		// A continuation is never labelled as a session resume.
+		expect(screen.queryByRole('button', { name: /^resume$/i })).toBeNull();
+	});
+
+	it('fires runs.retryNow with no overrides when Continue now is clicked', async () => {
+		const retryMutate = vi.mocked(trpcClient.runs.retryNow.mutate);
+		retryMutate.mockReset();
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		renderHeader();
+
+		fireEvent.click(screen.getByRole('button', { name: /continue now/i }));
+
+		// The server picks `recoveryMode: 'checkpoint'` off the row's status, so the
+		// continuation is the *unchanged* retry mutation with no overrides.
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith({
+				runId: 'run-1',
+				cli: undefined,
+				model: undefined,
+				reasoning: undefined,
+			});
+		});
+	});
+
+	it('warns in the terminate confirmation that the recorded remainder is abandoned', () => {
+		renderHeader();
+
+		fireEvent.click(screen.getByRole('button', { name: /^terminate$/i }));
+
+		expect(screen.getByRole('heading', { name: /terminate run\?/i })).toBeDefined();
+		expect(screen.getByText(/scheduled continuation/i)).toBeDefined();
+	});
+
+	it('renders the checkpoint panel alongside the callout', () => {
+		renderHeader();
+		expect(screen.getByRole('heading', { name: /checkpoint hand-off/i })).toBeDefined();
+		expect(screen.getByText('Update the configuration table.')).toBeDefined();
+	});
+
+	it('is directly renderable as its own checkpoint-specific component', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<CheckpointedCallout run={makeCheckpointedRun()} onResetSuccess={vi.fn()} />
+			</QueryClientProvider>,
+		);
+
+		expect(
+			screen.getByRole('heading', { name: /checkpointed — continuation scheduled/i }),
+		).toBeDefined();
 	});
 });
 

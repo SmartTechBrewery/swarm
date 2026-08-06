@@ -24,7 +24,7 @@
 import type { ProjectConfig } from '../../config/schema.js';
 import type { PMRouterAdapter } from '../../pm/router-adapter.js';
 import type { PMProvider } from '../../pm/types.js';
-import type { PMProviderManifest } from './manifest.js';
+import type { PMProviderManifest, PmCredentialRoleSpec } from './manifest.js';
 
 const registry: PMProviderManifest[] = [];
 const byId = new Map<string, PMProviderManifest>();
@@ -90,6 +90,35 @@ export function requireProjectPMProvider(project: ProjectConfig): PMProvider {
  */
 export function requireProjectPMAdapter(project: ProjectConfig): PMRouterAdapter {
 	return requireProjectPMManifest(project).routerAdapter;
+}
+
+/**
+ * Resolve one declared credential role of a project's PM provider (issue #497) —
+ * the manifest lookup behind `resolvePmCredential` (`src/config/provider.ts`), kept
+ * here so every manifest lookup stays in the registry.
+ *
+ * Throws for a role the provider does not declare: the declared list is the
+ * contract, so a caller naming something else is a wiring bug rather than a lookup
+ * miss (ai/CODING_STANDARDS.md "Error handling"). Callers that must *tolerate* a
+ * provider without a given role check `manifest.credentialRoles` themselves — the
+ * webhook receiver does exactly that for `PM_WEBHOOK_SECRET_ROLE`.
+ */
+export function requireProjectPMCredentialRole(
+	project: ProjectConfig,
+	role: string,
+): PmCredentialRoleSpec {
+	const manifest = requireProjectPMManifest(project);
+	const spec = manifest.credentialRoles.find((candidate) => candidate.role === role);
+	if (!spec) {
+		const declared = manifest.credentialRoles.map((candidate) => candidate.role);
+		throw new Error(
+			`PM provider '${manifest.id}' declares no credential role '${role}' — ` +
+				(declared.length
+					? `its roles are: ${declared.join(', ')}`
+					: 'it declares no credential roles'),
+		);
+	}
+	return spec;
 }
 
 export function listPMProviders(): readonly PMProviderManifest[] {

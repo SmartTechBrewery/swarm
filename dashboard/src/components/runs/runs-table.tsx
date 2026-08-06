@@ -87,7 +87,9 @@ export function RunsTable({
 									<WorkItemCell run={run} repo={project?.repo} variant="card" />
 								</div>
 								<RunStatusBadge
-									status={run.status as 'running' | 'completed' | 'failed' | 'deferred'}
+									status={
+										run.status as 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed'
+									}
 									timedOut={run.timedOut}
 									phase={run.phase}
 									reviewVerdict={run.reviewVerdict}
@@ -193,7 +195,9 @@ export function RunsTable({
 								</td>
 								<td className="px-2 py-3 text-sm">
 									<RunStatusBadge
-										status={run.status as 'running' | 'completed' | 'failed' | 'deferred'}
+										status={
+											run.status as 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed'
+										}
 										timedOut={run.timedOut}
 										phase={run.phase}
 										reviewVerdict={run.reviewVerdict}

@@ -26,12 +26,14 @@ import {
 	isNull,
 	ne,
 	notExists,
+	notInArray,
 	or,
 	type SQL,
 	sql,
 } from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import type { AgentUsage } from '../../harness/usage.js';
+import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
 import type { ReviewAutomationOutcome, ReviewVerdict } from '../../pipeline/review.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
@@ -53,8 +55,28 @@ export interface RunOutputEventInput {
 
 export type RunRow = typeof runs.$inferSelect;
 
-/** A run's terminal state — everything but the initial `running`. */
-type RunStatus = 'running' | 'completed' | 'failed' | 'deferred';
+/**
+ * A run's terminal state — everything but the initial `running`.
+ *
+ * `checkpointed` (issue #503) is a *second* retry-pending state alongside
+ * `deferred`, not a terminal one: the run stopped involuntarily, native session
+ * resume could not serve it, and its preserved checkout carries a Tier 2 checkpoint
+ * the enqueued continuation will pick up (`docs/CHECKPOINTS.md`). It differs from
+ * `deferred` in exactly one way that matters to queries — it deliberately holds no
+ * `agentSessionId` — so anything keying retry-pendingness on that column has to name
+ * the status instead (see {@link hasResumableDeferredRun}).
+ */
+type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed';
+
+/** The retry-pending statuses: a run that has settled but is waiting on a scheduled continuation. */
+export const RETRY_PENDING_RUN_STATUSES = ['deferred', 'checkpointed'] as const;
+
+/** Whether a stored status string is one of {@link RETRY_PENDING_RUN_STATUSES}. */
+export function isRetryPendingStatus(
+	status: string,
+): status is (typeof RETRY_PENDING_RUN_STATUSES)[number] {
+	return (RETRY_PENDING_RUN_STATUSES as readonly string[]).includes(status);
+}
 
 export interface CreateRunInput {
 	projectId: string;
@@ -122,6 +144,13 @@ export async function createRun(input: CreateRunInput): Promise<string> {
  * any phase, any engine (cross-CLI resume). A deferred row that still holds an
  * `agentSessionId` is one the worker intends to resume; pruning its worktree
  * would strip the partial work the resume relies on.
+ *
+ * A `checkpointed` row (issue #503) pins the checkout just as hard, but cannot be
+ * recognised the same way: its whole point is that there is no session to resume,
+ * so it deliberately carries a **null** `agentSessionId` and the `isNotNull` clause
+ * would exclude it — and pruning it would delete the very working tree its
+ * checkpoint describes, turning the continuation into a `checkpoint-divergent`
+ * block. Hence the OR: a session id *or* the status itself is evidence of intent.
  */
 export async function hasResumableDeferredRun(projectId: string, taskId: string): Promise<boolean> {
 	const rows = await getDb()
@@ -131,8 +160,8 @@ export async function hasResumableDeferredRun(projectId: string, taskId: string)
 			and(
 				eq(runs.projectId, projectId),
 				eq(runs.taskId, taskId),
-				inArray(runs.status, ['deferred', 'failed']),
-				isNotNull(runs.agentSessionId),
+				inArray(runs.status, ['deferred', 'failed', 'checkpointed']),
+				or(isNotNull(runs.agentSessionId), eq(runs.status, 'checkpointed')),
 			),
 		)
 		.limit(1);
@@ -140,7 +169,7 @@ export async function hasResumableDeferredRun(projectId: string, taskId: string)
 }
 
 export interface CompleteRunInput {
-	status: 'completed' | 'failed' | 'deferred';
+	status: 'completed' | 'failed' | 'deferred' | 'checkpointed';
 	engine?: AgentCli;
 	exitCode?: number | null;
 	timedOut?: boolean;
@@ -188,6 +217,17 @@ export interface CompleteRunInput {
 	planningScope?: ProposedScope;
 	/** Evidence-based explanation for a terminal failure; raw `error` remains untouched. */
 	failureDiagnosis?: FailureDiagnosis;
+	/**
+	 * The Tier 2 checkpoint a `checkpointed` settle hands its continuation
+	 * (issue #503). Set only alongside `status: 'checkpointed'`; omitted for every
+	 * other settle, which leaves the column as-is.
+	 */
+	checkpoint?: Checkpoint;
+	/**
+	 * The run's checkpoint-continuation count *after* this settle — written only by a
+	 * `checkpointed` settle, which is the one thing that spends the budget.
+	 */
+	continuationCount?: number;
 }
 
 /**
@@ -219,6 +259,8 @@ export async function completeRun(runId: string, input: CompleteRunInput): Promi
 			cancellation: input.cancellation,
 			planningScope: input.planningScope,
 			failureDiagnosis: input.failureDiagnosis,
+			checkpoint: input.checkpoint,
+			continuationCount: input.continuationCount,
 			completedAt: new Date(),
 		})
 		.where(eq(runs.id, runId));
@@ -296,6 +338,11 @@ export async function resetRunToRunning(
 			// real external artifact that outlives the attempt, so a resumed
 			// Implementation retry re-reports the same URL and overwrites it, whereas
 			// clearing would erase the record of a PR that exists.
+			// `continuationCount` and `checkpoint` are deliberately *not* cleared either
+			// (issue #503): the count is the bound on the Tier 2 fallback, so resetting
+			// it on the very retry the fallback scheduled would make the loop unbounded,
+			// and the checkpoint is what this attempt is being seeded from. "Reset &
+			// restart" ({@link clearRunRecovery}) is what discards both.
 			// A retried attempt hasn't (yet) been cancelled — clear a prior attempt's
 			// recorded origin so a genuine failure this time never shows a stale
 			// "cancelled via dashboard" origin left over from before the retry.
@@ -381,6 +428,12 @@ export async function failRunFromStatus(
  * (issue #308) is persisted on the row alongside the neutral `reason` — the
  * `terminate` mutation's already-recorded origin, so the row and the durable
  * Redis origin agree without a second read.
+ *
+ * A `checkpointed` run (issue #503) is claimed by the same path: it is the other
+ * retry-pending state, so a user terminating it must settle its waiting dispatch
+ * exactly as for a `deferred` one. It reports no `preservedSession` (it has none),
+ * which is what makes the caller's checkout reconciliation treat its worktree as
+ * ordinary protected work rather than a resumable session's.
  */
 export async function cancelDeferredRunInDb(
 	runId: string,
@@ -409,7 +462,7 @@ export async function cancelDeferredRunInDb(
 			.where(eq(runs.id, runId))
 			.limit(1);
 		const run = runRows[0];
-		if (!run || run.status !== 'deferred') {
+		if (!run || !isRetryPendingStatus(run.status)) {
 			return { success: false, dispatch: null, preservedSession: null };
 		}
 
@@ -494,11 +547,17 @@ export async function recordRunCleanupBlocked(
  * keep misleading retention (`hasResumableDeferredRun`), the reclaim gate, or
  * the UI. The captured session id goes with it — a retained session must never
  * outlive the checkout it would have resumed.
+ *
+ * The Tier 2 record goes too (issue #503): the reset discards the checkout, so the
+ * `checkpoint` describes a working tree that no longer exists, and the whole point
+ * of the action is to start over — which means the spent `continuationCount` is
+ * forgiven. This is the *only* path that resets that count; an ordinary retry keeps
+ * it, or the fallback would never be bounded.
  */
 export async function clearRunRecovery(runId: string): Promise<void> {
 	await getDb()
 		.update(runs)
-		.set({ recovery: null, agentSessionId: null })
+		.set({ recovery: null, agentSessionId: null, checkpoint: null, continuationCount: 0 })
 		.where(eq(runs.id, runId));
 }
 
@@ -908,9 +967,10 @@ export interface ListRunsFilter {
  * (`startedAt desc`) — sortable columns and date-range filters are out of scope.
  *
  * Queue and Runs are complementary read models (issues #279/#316): Queue is
- * the canonical list for waiting dispatches, so Runs hides only a deferred
- * attempt linked to a pending/retry-scheduled dispatch. Deferred attempts with
- * no waiting dispatch remain visible as history and for operator recovery.
+ * the canonical list for waiting dispatches, so Runs hides only a retry-pending
+ * attempt — `deferred`, or `checkpointed` (issue #503) — linked to a
+ * pending/retry-scheduled dispatch. Retry-pending attempts with no waiting dispatch
+ * remain visible as history and for operator recovery.
  */
 export async function listRunsFromDb(
 	filter: ListRunsFilter,
@@ -922,7 +982,12 @@ export async function listRunsFromDb(
 		.where(
 			and(eq(dispatches.runId, runs.id), inArray(dispatches.state, ['pending', 'retry-scheduled'])),
 		);
-	const conditions: SQL[] = [or(ne(runs.status, 'deferred'), notExists(hasWaitingDispatch)) as SQL];
+	const conditions: SQL[] = [
+		or(
+			notInArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]),
+			notExists(hasWaitingDispatch),
+		) as SQL,
+	];
 	if (filter.projectId) conditions.push(eq(runs.projectId, filter.projectId));
 	if (filter.projectIds && filter.projectIds.length > 0) {
 		conditions.push(inArray(runs.projectId, [...filter.projectIds]));

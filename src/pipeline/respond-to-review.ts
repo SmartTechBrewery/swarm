@@ -101,7 +101,7 @@ import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
 	sessionRunArgs,
-	shouldPreserveForResume,
+	shouldPreserveFailedCheckout,
 } from '@/pipeline/resume.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider } from '@/pm/types.js';
@@ -523,7 +523,14 @@ export async function runRespondToReviewPhase(
 				`Respond-to-review agent (${cli}) exited with code ${agent.exitCode}`,
 				` for PR #${prNumber}`,
 			);
-			preserveForResume = shouldPreserveForResume(error);
+			// Either tier may claim this checkout: Tier 1's resumable session, or — when it
+			// cannot apply — the Tier 2 checkpoint the agent left in the worktree.
+			preserveForResume = shouldPreserveFailedCheckout(
+				error,
+				handle.path,
+				'respond-to-review',
+				resumed,
+			);
 			throw error;
 		}
 

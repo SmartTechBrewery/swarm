@@ -7,6 +7,10 @@ describe('canTerminateRun', () => {
 		expect(canTerminateRun('deferred')).toBe(true);
 	});
 
+	it('allows terminate for a checkpointed run (issue #503)', () => {
+		expect(canTerminateRun('checkpointed')).toBe(true);
+	});
+
 	it('disallows terminate for completed and failed runs', () => {
 		expect(canTerminateRun('completed')).toBe(false);
 		expect(canTerminateRun('failed')).toBe(false);
@@ -34,5 +38,13 @@ describe('terminateConfirmMessage', () => {
 
 	it('describes stopping the running agent for a running run', () => {
 		expect(terminateConfirmMessage('running')).toContain('running agent');
+	});
+
+	it('warns that a checkpointed run abandons its recorded remainder (issue #503)', () => {
+		const message = terminateConfirmMessage('checkpointed');
+		expect(message).toContain('scheduled continuation');
+		expect(message).toContain('remaining');
+		// Not the generic deferred copy — that would call it a scheduled *retry*.
+		expect(message).not.toContain('scheduled retry');
 	});
 });

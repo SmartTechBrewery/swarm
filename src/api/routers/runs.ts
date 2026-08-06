@@ -16,6 +16,7 @@ import {
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	isRetryPendingStatus,
 	listRunsFromDb,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
@@ -38,6 +39,7 @@ import { getWorker } from '../../identity/worker-service.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
+import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import {
 	type CancellationOrigin,
@@ -45,7 +47,12 @@ import {
 	RUN_CANCELLED_MESSAGE,
 	requestRunCancellation,
 } from '../../queue/cancellation.js';
-import { normalizeStoredJobPayload, type SwarmJob, SwarmJobSchema } from '../../queue/jobs.js';
+import {
+	normalizeStoredJobPayload,
+	type RecoveryMode,
+	type SwarmJob,
+	SwarmJobSchema,
+} from '../../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../../queue/producer.js';
 import {
 	deriveDispatchPhaseHint,
@@ -195,7 +202,7 @@ async function enrichQueuedWorkItems(items: QueuedRun[]): Promise<QueuedRun[]> {
 // `RunStatus`/`RunRow` are local (non-exported) types in the repository, so the
 // router declares its own filter enums — keeping Zod the source of truth for the
 // API boundary and rejecting garbage filter values before they reach the DB.
-const RunStatusEnum = z.enum(['running', 'completed', 'failed', 'deferred']);
+const RunStatusEnum = z.enum(['running', 'completed', 'failed', 'deferred', 'checkpointed']);
 const RunPhaseEnum = z.enum([
 	'planning',
 	'implementation',
@@ -382,6 +389,36 @@ async function resolveRunAttribution(run: {
 	}
 }
 
+/**
+ * The checkpoint-continuation budget that bounds this run's Tier 2 fallback
+ * (issue #504) — the project's `pipeline.maxContinuations`, or the coded default
+ * ({@link resolveMaxContinuations}). Resolved server-side, so the dashboard can
+ * show the spent `continuationCount` against its ceiling without re-declaring
+ * that default in the web bundle where it would go stale.
+ *
+ * Only a row that actually carries a checkpoint has a budget worth reporting, so
+ * every other run skips the project read entirely — the same shape
+ * {@link resolveRunAttribution} uses for a run with no recorded worker. Returns
+ * `null` when the project no longer resolves or the read throws, so the panel
+ * shows the spent count alone rather than a fabricated ceiling.
+ */
+async function resolveContinuationBudget(run: {
+	projectId: string;
+	checkpoint: Checkpoint | null;
+}): Promise<number | null> {
+	if (!run.checkpoint) return null;
+	try {
+		const project = await getProjectByIdFromDb(run.projectId);
+		return project ? resolveMaxContinuations(project) : null;
+	} catch (error) {
+		logger.warn('runs.getById: continuation-budget lookup failed; reporting the count alone', {
+			projectId: run.projectId,
+			error: describeError(error),
+		});
+		return null;
+	}
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } straight from the repo.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
@@ -431,9 +468,13 @@ export const runsRouter = router({
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member
 	// of the run's project (existence hidden with identical run-not-found message).
-	// The row is returned as-is plus an additive `attribution` object resolving the
-	// recorded worker/user to display labels (issue #446) — looked up only after the
-	// access check, so a non-member never triggers an identity read.
+	// The row is returned as-is — including the persisted Tier 2 `checkpoint` and
+	// `continuationCount` (issue #503) the detail page's checkpoint panel renders —
+	// plus two additive, server-resolved fields: an `attribution` object resolving
+	// the recorded worker/user to display labels (issue #446), and the
+	// `maxContinuations` ceiling that count reads against (issue #504). Both are
+	// looked up only after the access check, so a non-member never triggers an
+	// identity or project read.
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -450,7 +491,11 @@ export const runsRouter = router({
 				'contributor',
 				`Run with ID "${input.id}" not found`,
 			);
-			return { ...run, attribution: await resolveRunAttribution(run) };
+			return {
+				...run,
+				attribution: await resolveRunAttribution(run),
+				maxContinuations: await resolveContinuationBudget(run),
+			};
 		}),
 
 	// Captured stdout/stderr for a run; null when the run stored no logs (a run
@@ -544,10 +589,10 @@ export const runsRouter = router({
 				'member',
 				`Run with ID "${input.runId}" not found`,
 			);
-			if (run.status !== 'deferred' && run.status !== 'failed') {
+			if (run.status !== 'deferred' && run.status !== 'failed' && run.status !== 'checkpointed') {
 				throw new TRPCError({
 					code: 'PRECONDITION_FAILED',
-					message: `Only a deferred or failed run can be retried; run "${input.runId}" is ${run.status}.`,
+					message: `Only a deferred, checkpointed, or failed run can be retried; run "${input.runId}" is ${run.status}.`,
 				});
 			}
 
@@ -561,10 +606,19 @@ export const runsRouter = router({
 			const applyingOverride =
 				input.cli !== undefined || input.model !== undefined || input.reasoning !== undefined;
 			let startFresh = run.status === 'failed' || run.agentSessionId === null || applyingOverride;
-			let recoveryMode: 'resume' | 'fresh' | undefined;
+			let recoveryMode: RecoveryMode | undefined;
 			if (isRecovery) {
 				recoveryMode = applyingOverride ? 'fresh' : 'resume';
 				startFresh = applyingOverride;
+			}
+			// A `checkpointed` run's preserved checkout is adopted on the strength of its
+			// Tier 2 checkpoint, never a session (issue #503) — and a cli/model override is
+			// compatible with that, since a continuation always runs a fresh session and is
+			// CLI-agnostic by construction. Without this the manual retry would try to
+			// provision over a deliberately preserved worktree and settle blocked.
+			if (run.status === 'checkpointed') {
+				recoveryMode = 'checkpoint';
+				startFresh = false;
 			}
 
 			const active = await getActiveDispatchByRunId(run.id);
@@ -709,7 +763,9 @@ export const runsRouter = router({
 			};
 			await requestRunCancellation(run.id, origin);
 
-			if (run.status === 'deferred') {
+			// Both retry-pending statuses settle the same way (issue #503): a `checkpointed`
+			// run has a waiting dispatch and no live agent, exactly like a `deferred` one.
+			if (isRetryPendingStatus(run.status)) {
 				// Cancel the canonical dispatch and fail the row atomically while still deferred (issue #284).
 				// Preserves session info and payload for future recovery retry (issue #306).
 				const res = await cancelDeferredRunInDb(run.id, RUN_CANCELLED_MESSAGE, origin);

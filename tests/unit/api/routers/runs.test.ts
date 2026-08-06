@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/db/repositories/runsRepository.js', () => ({
+vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
+	// `isRetryPendingStatus` is a pure predicate over the status vocabulary, so the
+	// real one is kept: stubbing it would let the router and the repository disagree
+	// about which statuses are retry-pending.
+	...(await importOriginal<typeof import('@/db/repositories/runsRepository.js')>()),
 	listRunsFromDb: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
@@ -152,6 +156,7 @@ import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { getWorker } from '@/identity/worker-service.js';
 import { getPMProvider } from '@/integrations/pm/registry.js';
+import { type Checkpoint, DEFAULT_MAX_CONTINUATIONS } from '@/pipeline/checkpoint.js';
 import {
 	clearRunCancellation,
 	RUN_CANCELLED_MESSAGE,
@@ -213,11 +218,22 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		agentSessionId: null,
 		recovery: null,
 		cancellation: null,
+		checkpoint: null,
+		continuationCount: 0,
 		outputBytes: 0,
 		outputTruncated: false,
 		...overrides,
 	};
 }
+
+/** A valid Tier 2 hand-off (issue #503) for the `checkpointed` rows below. */
+const CHECKPOINT: Checkpoint = {
+	phase: 'implementation',
+	completed: ['Added the schema field and its tests.'],
+	remaining: ['Update the configuration table.', 'Run lint and the focused tests.'],
+	decisions: ['Storage migration is out of scope.'],
+	workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+};
 
 const SCM_PAYLOAD: SwarmJob = {
 	type: 'scm',
@@ -542,7 +558,7 @@ describe('runsRouter', () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(run);
 
 			const result = await caller.getById({ id: 'run-1' });
-			expect(result).toEqual({ ...run, attribution: null });
+			expect(result).toEqual({ ...run, attribution: null, maxContinuations: null });
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
 		});
@@ -650,6 +666,62 @@ describe('runsRouter', () => {
 					workerName: null,
 					userId: 'user-1',
 					userDisplayName: null,
+				});
+			});
+		});
+
+		// The Tier 2 continuation ceiling the dashboard shows the spent count against
+		// (issue #504). Resolved server-side so `pipeline.maxContinuations`'s default
+		// isn't re-declared in the web bundle.
+		describe('maxContinuations', () => {
+			it("resolves the project's configured ceiling for a checkpointed run", async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'checkpointed',
+						checkpoint: CHECKPOINT,
+						continuationCount: 1,
+					}),
+				);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
+					createMockProjectConfig({ id: 'p1', pipeline: { maxContinuations: 5 } }),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.maxContinuations).toBe(5);
+				expect(result.checkpoint).toEqual(CHECKPOINT);
+				expect(result.continuationCount).toBe(1);
+			});
+
+			it('falls back to the coded default when the project configures none', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'checkpointed', checkpoint: CHECKPOINT }),
+				);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					maxContinuations: DEFAULT_MAX_CONTINUATIONS,
+				});
+			});
+
+			it('reports null — and skips the project read — for a run with no checkpoint', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					maxContinuations: null,
+				});
+				expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+			});
+
+			it('degrades to the count alone instead of failing the page when the project read throws', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'checkpointed', checkpoint: CHECKPOINT }),
+				);
+				vi.mocked(getProjectByIdFromDb).mockRejectedValue(new Error('db unreachable'));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					maxContinuations: null,
 				});
 			});
 		});
@@ -861,6 +933,56 @@ describe('runsRouter', () => {
 			expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
 		});
 
+		// "Continue now" on a checkpointed run (issues #503, #504): it must reuse the
+		// Tier 2 continuation mechanism rather than provision over the deliberately
+		// preserved checkout, which would settle blocked.
+		it('sends a checkpointed run through the checkpoint recovery mode with a fresh session', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({
+					id: 'run-1',
+					status: 'checkpointed',
+					// A checkpointed row carries no session id by construction.
+					agentSessionId: null,
+					checkpoint: CHECKPOINT,
+					continuationCount: 1,
+				}),
+			);
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+			const reopened = makeDispatch({ state: 'pending', waitReason: 'manual-retry', attempt: 0 });
+			vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(reopened);
+
+			await expect(caller.retryNow({ runId: 'run-1' })).resolves.toEqual({
+				runId: 'run-1',
+				status: 'retrying',
+			});
+
+			const [, job] = vi.mocked(reopenDispatchForManualRetry).mock.calls[0];
+			expect(job.recoveryMode).toBe('checkpoint');
+			// A continuation never re-enters a session — it runs a brand-new one.
+			expect(job.resumeSession).toBeUndefined();
+			expect(job.agentSessionId).toEqual(expect.any(String));
+			expect(job.rateLimitRetryAttempt).toBe(0);
+		});
+
+		it('keeps the checkpoint mode when the operator also overrides the CLI/model', async () => {
+			// Unlike a session resume, a continuation is CLI-agnostic (it carries no
+			// session), so an override composes with it instead of forcing a fresh start.
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'checkpointed', checkpoint: CHECKPOINT }),
+			);
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+			vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(makeDispatch());
+
+			await caller.retryNow({ runId: 'run-1', cli: 'codex', model: 'gpt-5.1-codex' });
+
+			const [, job] = vi.mocked(reopenDispatchForManualRetry).mock.calls[0];
+			expect(job).toMatchObject({
+				recoveryMode: 'checkpoint',
+				cliOverride: 'codex',
+				modelOverride: 'gpt-5.1-codex',
+			});
+		});
+
 		it('retries even after the automatic budget was exhausted (bypasses the cap)', async () => {
 			// A run can defer at a high attempt and still be manually retryable — the
 			// reopen resets the counter. Guard: a deferred run always retries.
@@ -1029,6 +1151,28 @@ describe('runsRouter', () => {
 			// Keep the marker until an explicit retry clears it: a wake-up that
 			// already claimed the dispatch honours it at run start.
 			expect(clearRunCancellation).not.toHaveBeenCalled();
+		});
+
+		// The other retry-pending status settles down the same branch (issues #503, #504):
+		// a checkpointed run has a waiting dispatch and no live agent, exactly like a
+		// deferred one — so "Terminate" must settle it rather than report `terminating`.
+		it('cancels the canonical dispatch and fails the row for a checkpointed run', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'checkpointed', checkpoint: CHECKPOINT }),
+			);
+			vi.mocked(cancelDeferredRunInDb).mockResolvedValue({
+				success: true,
+				dispatch: { id: 'disp-1', wakeSeq: 2 },
+				preservedSession: null,
+			});
+
+			await expect(caller.terminate({ runId: 'run-1' })).resolves.toEqual({
+				runId: 'run-1',
+				status: 'failed',
+			});
+			const origin = expect.objectContaining({ source: 'dashboard' });
+			expect(requestRunCancellation).toHaveBeenCalledWith('run-1', origin);
+			expect(cancelDeferredRunInDb).toHaveBeenCalledWith('run-1', RUN_CANCELLED_MESSAGE, origin);
 		});
 
 		it('reconciles the checkout after cancelling a no-session deferred run (issue #361)', async () => {
@@ -1816,6 +1960,7 @@ describe('runsRouter', () => {
 				await expect(ordinary.getById({ id: 'run-1' })).resolves.toEqual({
 					...run,
 					attribution: null,
+					maxContinuations: null,
 				});
 			});
 		});
@@ -1849,6 +1994,28 @@ describe('runsRouter', () => {
 					}),
 				);
 				expect(requestRunCancellation).not.toHaveBeenCalled();
+			});
+
+			// The new retry-pending status must not open a hole in the role boundary
+			// (issue #504): the access check runs before the status guard, so a
+			// checkpointed row is refused exactly like any other.
+			it.each([
+				'retryNow',
+				'terminate',
+			] as const)('denies %s on a checkpointed run to a non-member', async (procedure) => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', projectId: 'p1', status: 'checkpointed', checkpoint: CHECKPOINT }),
+				);
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary[procedure]({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'NOT_FOUND',
+						message: 'Run with ID "run-1" not found',
+					}),
+				);
+				expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
+				expect(cancelDeferredRunInDb).not.toHaveBeenCalled();
 			});
 
 			it('forbids a contributor from retrying a run', async () => {

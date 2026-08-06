@@ -5,11 +5,21 @@ let prFileExists: boolean;
 let prFileContents: string;
 let blockedReasonFileExists: boolean;
 let blockedReasonFileContents: string;
+let checkpointFileExists: boolean;
+let checkpointFileContents: string;
 vi.mock('node:fs', () => ({
-	existsSync: (path: unknown) =>
-		String(path).endsWith('blocked_reason.md') ? blockedReasonFileExists : prFileExists,
-	readFileSync: (path: unknown) =>
-		String(path).endsWith('blocked_reason.md') ? blockedReasonFileContents : prFileContents,
+	existsSync: (path: unknown) => {
+		const name = String(path);
+		if (name.endsWith('blocked_reason.md')) return blockedReasonFileExists;
+		if (name.endsWith('swarm_checkpoint.json')) return checkpointFileExists;
+		return prFileExists;
+	},
+	readFileSync: (path: unknown) => {
+		const name = String(path);
+		if (name.endsWith('blocked_reason.md')) return blockedReasonFileContents;
+		if (name.endsWith('swarm_checkpoint.json')) return checkpointFileContents;
+		return prFileContents;
+	},
 }));
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
@@ -109,6 +119,8 @@ describe('runImplementationPhase', () => {
 		prFileContents = 'https://github.com/SmartTechBrewery/swarm/pull/99\n';
 		blockedReasonFileExists = false;
 		blockedReasonFileContents = '';
+		checkpointFileExists = false;
+		checkpointFileContents = '';
 	});
 
 	it('defers (throws DependencyBlockedError) when the item is blocked by an open prerequisite', async () => {
@@ -522,6 +534,34 @@ describe('runImplementationPhase', () => {
 	});
 
 	it('still cleans up a rate-limited failure that had no session to resume', async () => {
+		const deps = makeDeps();
+		deps.runAgent = vi.fn(async () =>
+			agentResult({
+				exitCode: 1,
+				stdout: "You've hit your session limit · resets 1:40pm (Europe/Warsaw)\n",
+			}),
+		);
+		await expect(runImplementationPhase(deps)).rejects.toThrow(/rate limited/);
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
+	});
+
+	it('preserves the worktree for a checkpoint continuation when a sessionless stop left one', async () => {
+		checkpointFileExists = true;
+		checkpointFileContents = JSON.stringify(CONTINUATION);
+		const deps = makeDeps();
+		deps.runAgent = vi.fn(async () =>
+			agentResult({
+				exitCode: 1,
+				stdout: "You've hit your session limit · resets 1:40pm (Europe/Warsaw)\n",
+			}),
+		);
+		await expect(runImplementationPhase(deps)).rejects.toThrow(/rate limited/);
+		expect(deps.worktrees.cleanup).not.toHaveBeenCalled();
+	});
+
+	it('cleans up when a sessionless stop left an invalid checkpoint', async () => {
+		checkpointFileExists = true;
+		checkpointFileContents = JSON.stringify({ nonsense: true });
 		const deps = makeDeps();
 		deps.runAgent = vi.fn(async () =>
 			agentResult({

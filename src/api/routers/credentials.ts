@@ -45,7 +45,13 @@ export const credentialsRouter = router({
 
 			const resolved = await resolveAllProjectCredentials(input.projectId);
 
-			return Object.entries(project.credentials).map(([role, envVarKey]) => ({
+			// The Source Control screen edits the shared SCM references only; the PM
+			// provider's own role map (`credentials.pm`, issue #497) is configured in
+			// `swarm.config.json` and has no UI yet, so it is excluded rather than
+			// listed as a role whose "env var key" is an object.
+			const { pm: _pmReferences, ...scmReferences } = project.credentials;
+
+			return Object.entries(scmReferences).map(([role, envVarKey]) => ({
 				role: role as 'reviewer' | 'webhookSecret',
 				envVarKey,
 				isConfigured: envVarKey in resolved,
