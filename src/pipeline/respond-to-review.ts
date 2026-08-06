@@ -44,12 +44,14 @@
  * re-review is driven only by the *new commit* a `fixed` response pushes (see
  * "Follow-up Review" below), deduped per head SHA —
  * `src/triggers/review-dispatch-dedup.ts`. And they are strictly
- * **best-effort**: the board item is resolved from the PR branch's issue number
- * (`<branchPrefix><n>`), and a failure to resolve it (a human-named branch, an
- * item not on the board) or to move it is logged and swallowed — a cosmetic
- * status report must never fail an otherwise-successful response. On a failed
- * run the card is left at "In progress" (as Implementation leaves it), with the
- * worker's failure comment explaining why; the next reviewer round moves it on.
+ * **best-effort**: the board item arrives already resolved from SWARM's own
+ * durable card↔task link (`boardItemId`, `src/dispatch/board-card.ts` — issue
+ * #498), falling back to the legacy `/issues/<n>` URL-suffix guess for a PR that
+ * predates it; a failure to resolve it (a human-named branch, an item not on the
+ * board) or to move it is logged and swallowed — a cosmetic status report must
+ * never fail an otherwise-successful response. On a failed run the card is left
+ * at "In progress" (as Implementation leaves it), with the worker's failure
+ * comment explaining why; the next reviewer round moves it on.
  * Skipped entirely when no `pm` provider is injected (unit tests that don't
  * exercise the board).
  *
@@ -213,6 +215,15 @@ export interface RunRespondToReviewPhaseOptions {
 	 * unit tests that don't exercise the board (board reports are then skipped).
 	 */
 	pm?: PMProvider;
+	/**
+	 * The board card this PR's task was dispatched from, already resolved
+	 * control-plane side from the durable `runs.work_item_id` link
+	 * (`src/dispatch/board-card.ts`, issue #498) — where the DB is, so a federated
+	 * worker needs none (ADR-003 §2). Omitted when nothing links the task to a card
+	 * (a pruned run row, a PR from before this change), in which case
+	 * {@link resolveBoardItemId} falls back to the legacy URL-suffix lookup.
+	 */
+	boardItemId?: string;
 	/** Worktree manager for the project — provisions and cleans up the checkout. */
 	worktrees?: GitWorktreeManager;
 	/** Which agent CLI to run. Defaults to Claude Code. */
@@ -298,20 +309,31 @@ export function resolvePushedHeadSha(
 }
 
 /**
- * Resolve the board item wrapping issue `#{issueNumber}` to its provider-native
- * ID, or `undefined` if it isn't on the board. Provider-agnostic: the lookup
- * matches on the work item's backing `url` (which every {@link PMProvider}
- * populates) rather than anything GitHub-specific, and runs inside the provider
- * ({@link PMProvider.findWorkItemByUrlSuffix}) so a federated worker can serve it
- * as one narrow read through the control plane instead of proxying the whole
- * board. Swallows and logs provider errors — the caller treats any failure as
+ * Resolve the board card this response should report on to its provider-native
+ * ID, or `undefined` when there is none.
+ *
+ * Prefers `injectedItemId` — the card resolved control-plane side from SWARM's
+ * own durable `runs.work_item_id` link (`src/dispatch/board-card.ts`, issue
+ * #498). That link is provider-neutral by construction, so it works for a
+ * Jira/Linear/Trello board paired with a GitHub repo.
+ *
+ * The fallback is the **GitHub-shaped legacy path**, and the only remaining place
+ * that assumption lives: a PR opened before this change (or one whose run rows
+ * were pruned) has no recorded card, so the card is guessed from a
+ * `/issues/<n>` URL suffix. It resolves nothing for a board whose items carry
+ * some other URL shape, which is exactly the pre-#498 behaviour it preserves.
+ *
+ * Swallows and logs provider errors either way — the caller treats any failure as
  * "no board report", never a phase failure.
  */
 async function resolveBoardItemId(
 	pm: PMProvider,
-	issueNumber: string,
+	issueNumber: string | undefined,
 	taskId: string,
+	injectedItemId: string | undefined,
 ): Promise<string | undefined> {
+	if (injectedItemId) return injectedItemId;
+	if (!issueNumber) return undefined;
 	try {
 		// A `/issues/100` suffix can't false-match `/issues/1001` — the char before
 		// `100` must be `/` — so no need to anchor on the repo too.
@@ -442,8 +464,9 @@ export async function runRespondToReviewPhase(
 	// human watching the board sees the response start — never blocks or fails the
 	// response. See the module header. Skipped when no provider is injected.
 	const issueNumber = issueNumberFromBranch(prBranch, project.branchPrefix);
-	const boardItemId =
-		pm && issueNumber ? await resolveBoardItemId(pm, issueNumber, taskId) : undefined;
+	const boardItemId = pm
+		? await resolveBoardItemId(pm, issueNumber, taskId, options.boardItemId)
+		: undefined;
 	if (pm && boardItemId) {
 		await reportBoardStatus(pm, boardItemId, PICKUP_STATUS, taskId);
 	}

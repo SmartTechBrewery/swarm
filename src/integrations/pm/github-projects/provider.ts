@@ -367,6 +367,10 @@ function toResolvedItem(item: ItemNode, config: GitHubProjectsIntegrationConfig)
 		title: content?.title ?? '',
 		description: content?.body ?? '',
 		url: content?.url ?? '',
+		// The board's own linkage to the SCM artifact — the backing Issue/PR's number,
+		// read in the same round-trip. Absent for a draft card, which has no Issue/PR
+		// and therefore no SCM-driven phase (ai/ARCHITECTURE.md "Task identity").
+		taskRef: content?.number == null ? undefined : String(content.number),
 		status: item.fieldValueByName?.name,
 		statusId: optionId,
 		statusKey: optionId === undefined ? undefined : resolveStatusKeyByOptionId(config, optionId),
@@ -605,6 +609,8 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				title: issue.title,
 				description: issue.body ?? '',
 				url: issue.html_url,
+				// The Issue this card was just created around is its SCM artifact.
+				taskRef: String(issue.number),
 				statusId: optionId,
 				// The caller named the canonical key, and `optionId` is its resolution —
 				// carry it back so the fresh item reads like one off a board read.

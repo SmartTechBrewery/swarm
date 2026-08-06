@@ -176,6 +176,11 @@ export const AssignedWorkItemSchema = z.object({
 	title: z.string(),
 	description: z.string(),
 	url: z.string(),
+	/**
+	 * The card's SCM artifact reference (`WorkItem.taskRef`) the provider resolved —
+	 * what SWARM keys the worktree/branch/PR on (ai/ARCHITECTURE.md "Task identity").
+	 */
+	taskRef: z.string().optional(),
 	status: z.string().optional(),
 	statusId: z.string().optional(),
 	/** The canonical pipeline status key (`WorkItem.statusKey`) the provider resolved. */
@@ -232,6 +237,13 @@ export const TaskAssignmentSchema = z.object({
 	prBranch: z.string().optional(),
 	headSha: z.string().optional(),
 	reviewId: z.string().optional(),
+	/**
+	 * respond-to-review only: the board card the PR's task was dispatched from,
+	 * resolved control-plane side from the durable `runs.work_item_id` link (issue
+	 * #498) so the worker needs no database to report board status (ADR-003 §2).
+	 * Absent when nothing links the task to a card.
+	 */
+	boardItemId: z.string().optional(),
 	baseBranch: z.string().optional(),
 	baseSha: z.string().optional(),
 });

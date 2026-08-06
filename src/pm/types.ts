@@ -145,6 +145,21 @@ export interface WorkItem {
 	description: string;
 	/** Web URL of the backing Issue/PR the card wraps. */
 	url: string;
+	/**
+	 * The SCM artifact reference SWARM keys its worktree, branch, and PR on for this
+	 * card — the issue/PR number for a card backed by one. The provider resolves it
+	 * from its own linkage (GitHub Projects: the backing Issue/PR); `undefined` when
+	 * the card has no SCM artifact, in which case no SCM-driven phase can run for it.
+	 *
+	 * A field rather than a new {@link PMProvider} method, for the same reason as
+	 * {@link statusKey}: the provider already holds the linkage during its own board
+	 * read, so the reference rides along with the item instead of costing a second
+	 * lookup — and the 13-method surface stays as it is. It exists so no *shared*
+	 * module has to recover the number by regexing a GitHub-shaped `url`
+	 * (ai/RULES.md §2); see ai/ARCHITECTURE.md "Task identity" for why `taskId`
+	 * stays SCM-derived rather than becoming the PM provider's own key.
+	 */
+	taskRef?: string;
 	/** Human-readable Status option name (e.g. `In progress`) when available. */
 	status?: string;
 	/**

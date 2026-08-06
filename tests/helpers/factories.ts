@@ -91,6 +91,14 @@ export function createMockWorkItem(overrides: Partial<WorkItem> = {}): WorkItem 
 	// (issue #297), so derive it here from the fixture board too — a test that
 	// overrides only `statusId` still gets the matching canonical key, and one that
 	// names `statusKey` explicitly keeps its value.
+	//
+	// `taskRef` gets the same treatment (issue #498): the GitHub Projects provider
+	// resolves it from the backing Issue/PR it read, so a fixture that overrides
+	// only `url` still comes back with the matching reference — and one that names
+	// `taskRef` explicitly (including `undefined`, for a draft card) keeps it.
+	if (!('taskRef' in overrides)) {
+		item.taskRef = item.url.match(/\/(?:issues|pull)\/(\d+)(?:[/?#]|$)/)?.[1];
+	}
 	if ('statusKey' in overrides) return item;
 	return {
 		...item,

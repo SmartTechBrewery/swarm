@@ -32,7 +32,6 @@ import { type PipelinePhase, resolvePipelinePhaseForStatusKey } from '../../pm/p
 import type { WorkItem } from '../../pm/types.js';
 import { recordStatusAndDetectChange } from '../pm-status-dedup.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
-import { issueNumberFromUrl } from './shared.js';
 
 /**
  * Check whether a split child entering Planning has already been planned outside of
@@ -140,12 +139,15 @@ export function createPmStatusTrigger(): TriggerHandler {
 				return null;
 			}
 
-			const taskId = issueNumberFromUrl(workItem.url);
+			// The provider resolved the card's SCM artifact from its own linkage
+			// (`WorkItem.taskRef`) — shared code never regexes a GitHub-shaped URL for
+			// it (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
+			const taskId = workItem.taskRef;
 			if (!taskId) {
-				// No backing Issue number to key the worktree on — a draft item, or a
-				// URL shape we don't recognize. Can't run a phase without it; drop
+				// No backing SCM artifact to key the worktree on — a draft item, or a
+				// board with no SCM linkage at all. Can't run a phase without it; drop
 				// rather than throw (a draft card isn't a failed job).
-				logger.warn('pm-status: could not resolve issue number from work item URL — skipping', {
+				logger.warn('pm-status: work item has no backing SCM artifact reference — skipping', {
 					itemId: event.itemId,
 					url: workItem.url,
 					phase,

@@ -69,6 +69,41 @@ describe('buildTaskAssignment', () => {
 			expect(assignment.baseBranch).toBeUndefined();
 		});
 
+		// The card the DB-free worker cannot look up for itself (issue #498).
+		it('carries the control-plane-resolved board item id for respond-to-review', () => {
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'respond-to-review',
+					workItem: undefined,
+					pr: { prNumber: '42', prBranch: 'issue-42', headSha: 'abc123', reviewId: '9001' },
+					boardItemId: 'ITEM_42',
+				}),
+			);
+			expect(assignment.boardItemId).toBe('ITEM_42');
+			expect(TaskAssignmentSchema.safeParse(assignment).success).toBe(true);
+		});
+
+		it('omits the board item id when the control plane resolved none', () => {
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'respond-to-review',
+					workItem: undefined,
+					pr: { prNumber: '42', prBranch: 'issue-42', headSha: 'abc123', reviewId: '9001' },
+				}),
+			);
+			expect(assignment.boardItemId).toBeUndefined();
+		});
+
+		// `taskRef` is the provider's own card→artifact answer, so it has to survive
+		// the wire for a federated planning/implementation run (issue #498).
+		it('round-trips the work item taskRef', () => {
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({ phase: 'implementation' }),
+			);
+			expect(assignment.workItem?.taskRef).toBe(createMockTaskAssignmentInput().workItem?.taskRef);
+			expect(assignment.workItem?.taskRef).toBeDefined();
+		});
+
 		it('carries baseBranch/baseSha only for resolve-conflicts', () => {
 			const assignment = buildTaskAssignment(
 				createMockTaskAssignmentInput({

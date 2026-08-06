@@ -125,6 +125,9 @@ function buildAssignedPhaseInputs(
 		prBranch: assignment.prBranch,
 		headSha: assignment.headSha,
 		reviewId: assignment.reviewId,
+		// Resolved control-plane side (issue #498) and carried on the assignment, so
+		// this path behaves identically to the DB-free one.
+		boardItemId: assignment.boardItemId,
 		baseBranch: assignment.baseBranch,
 		baseSha: assignment.baseSha,
 	};

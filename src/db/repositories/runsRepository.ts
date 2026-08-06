@@ -558,6 +558,43 @@ export async function getLatestRunForTask(
 }
 
 /**
+ * The board card SWARM last recorded for this project task — the provider-native
+ * work-item id of the most recent run that carried one.
+ *
+ * The durable card↔task link the PR-driven phases resolve their board card
+ * through (issue #498): every board-driven run persists `runs.work_item_id`
+ * alongside its `(project_id, task_id)`, so a later phase that knows only the
+ * task can recover the card without guessing a provider-shaped URL for it
+ * (ai/ARCHITECTURE.md "Task identity"). Rows carrying no card — the PR-driven
+ * phases' own rows, which sit alongside the board-driven ones for the same task
+ * and are usually *newer* — are skipped rather than read as "no card"; so is the
+ * empty-string id a provider with an unresolvable item would have written.
+ *
+ * `undefined` when nothing links the task to a card: the board never drove it, or
+ * the run rows have since been pruned. The caller falls back or skips its report;
+ * this is a soft miss, not bad input.
+ */
+export async function findBoardItemIdForTask(
+	projectId: string,
+	taskId: string,
+): Promise<string | undefined> {
+	const rows = await getDb()
+		.select({ workItemId: runs.workItemId })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.taskId, taskId),
+				isNotNull(runs.workItemId),
+				ne(runs.workItemId, ''),
+			),
+		)
+		.orderBy(desc(runs.startedAt))
+		.limit(1);
+	return rows[0]?.workItemId ?? undefined;
+}
+
+/**
  * Resolve the newest successful Planning scope for this exact project/task.
  * Failed, deferred, unrelated, and pre-scope historical runs are intentionally
  * ignored: absence is evidence we do not have, never evidence of oversized work.

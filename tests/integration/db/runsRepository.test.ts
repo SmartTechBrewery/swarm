@@ -16,6 +16,7 @@ import {
 	createRun,
 	failOrphanedRunningRuns,
 	failStaleRunningRuns,
+	findBoardItemIdForTask,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getPendingReviewMergeFollowUps,
@@ -851,6 +852,57 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect((await getLatestRunForTask(PROJECT_ID, '42', 'review'))?.id).toBe(newest);
 			expect(await getLatestRunForTask(PROJECT_ID, 'missing', 'review')).toBeUndefined();
+		});
+	});
+
+	// The durable PR→card link a PR-driven phase resolves its board report through
+	// (issue #498) — board-driven runs write it, the respond phase reads it back.
+	describe('findBoardItemIdForTask', () => {
+		it('returns the most recent card recorded for the task, ignoring cardless rows', async () => {
+			await seedProject({ id: 'proj-card-other', repo: 'jkwiecien/card-other' });
+			const older = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '77',
+				phase: 'planning',
+				workItemId: 'ITEM_OLD',
+			});
+			const newest = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '77',
+				phase: 'implementation',
+				workItemId: 'ITEM_NEW',
+			});
+			// A PR-driven row for the same task carries no card — it must not shadow
+			// the board-driven rows just because it is newer.
+			const cardless = await createRun({ projectId: PROJECT_ID, taskId: '77', phase: 'review' });
+			// Same task id, different project — never crosses over.
+			await createRun({
+				projectId: 'proj-card-other',
+				taskId: '77',
+				phase: 'implementation',
+				workItemId: 'ITEM_WRONG_PROJECT',
+			});
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-01-01') })
+				.where(eq(runs.id, older));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-02-01') })
+				.where(eq(runs.id, newest));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-03-01') })
+				.where(eq(runs.id, cardless));
+
+			expect(await findBoardItemIdForTask(PROJECT_ID, '77')).toBe('ITEM_NEW');
+		});
+
+		it('returns undefined when no run for the task ever carried a card', async () => {
+			await createRun({ projectId: PROJECT_ID, taskId: '78', phase: 'review' });
+
+			expect(await findBoardItemIdForTask(PROJECT_ID, '78')).toBeUndefined();
+			expect(await findBoardItemIdForTask(PROJECT_ID, 'never-ran')).toBeUndefined();
 		});
 	});
 

@@ -92,6 +92,9 @@ describe('GitHubProjectsPMProvider', () => {
 				title: 'Wire triggers',
 				description: 'Do the thing.',
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+				// The provider resolves the card's SCM artifact from its own linkage,
+				// so no shared module has to regex the URL for it (issue #498).
+				taskRef: '10',
 				status: 'In progress',
 				statusId: '47fc9ee4',
 				// The provider resolves the board option id to its canonical pipeline key
@@ -143,6 +146,43 @@ describe('GitHubProjectsPMProvider', () => {
 		it('throws when the item does not resolve', async () => {
 			graphql.mockResolvedValue({ node: null });
 			await expect(provider.getWorkItem('PVTI_missing')).rejects.toThrow('did not resolve');
+		});
+	});
+
+	// The card→SCM-artifact seam (issue #498): shared code keys its worktree, branch,
+	// and PR on `taskRef`, so the provider is the only place that knows how its own
+	// board links to an Issue/PR.
+	describe('taskRef', () => {
+		it('carries the backing pull request number for a PR-backed card', async () => {
+			graphql.mockResolvedValue({
+				node: {
+					...ITEM_NODE,
+					content: {
+						...ITEM_NODE.content,
+						__typename: 'PullRequest',
+						number: 42,
+						url: 'https://github.com/SmartTechBrewery/swarm/pull/42',
+					},
+				},
+			});
+
+			const item = await provider.getWorkItem('PVTI_x');
+
+			expect(item.taskRef).toBe('42');
+		});
+
+		it('is undefined for a draft card, which has no backing Issue/PR', async () => {
+			graphql.mockResolvedValue({
+				node: {
+					id: 'PVTI_draft',
+					content: { __typename: 'DraftIssue' },
+					fieldValueByName: { name: 'In progress', optionId: '47fc9ee4' },
+				},
+			});
+
+			const item = await provider.getWorkItem('PVTI_draft');
+
+			expect(item.taskRef).toBeUndefined();
 		});
 	});
 
@@ -525,6 +565,9 @@ describe('GitHubProjectsPMProvider', () => {
 				title: 'Sibling task',
 				statusId: '61e4505c',
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/42',
+				// A freshly created card reads like one off a board read (issue #498) —
+				// otherwise the split child SWARM just made could not be dispatched.
+				taskRef: '42',
 			});
 			expect(created.labels.map((l) => l.name)).toContain('swarm:split-child');
 		});

@@ -402,6 +402,34 @@ describe('runRespondToReviewPhase', () => {
 			expect(result.movedTo).toBeUndefined();
 		});
 
+		// The card↔task link is durable and provider-neutral (issue #498): the control
+		// plane resolves it from `runs.work_item_id` and injects it, so the phase never
+		// has to guess a provider-shaped URL for a board that isn't GitHub Projects.
+		it('uses the injected board item id without consulting the URL-suffix lookup', async () => {
+			const deps = makeDeps();
+			// A board whose cards carry no GitHub URL at all — the URL-suffix fallback
+			// could never resolve this card.
+			const pm = makePm([{ id: 'ITEM_JIRA', url: 'https://swarm.example.test/browse/PROJ-7' }]);
+
+			const result = await runRespondToReviewPhase({ ...deps, pm, boardItemId: 'ITEM_JIRA' });
+
+			expect(pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
+			expect(pm.moveWorkItem).toHaveBeenNthCalledWith(1, 'ITEM_JIRA', 'inProgress');
+			expect(pm.moveWorkItem).toHaveBeenNthCalledWith(2, 'ITEM_JIRA', 'inReview');
+			expect(result.movedTo).toBe('inReview');
+		});
+
+		it('falls back to the legacy URL-suffix lookup when no board item id is injected', async () => {
+			const deps = makeDeps();
+			const pm = makePm();
+
+			const result = await runRespondToReviewPhase({ ...deps, pm, boardItemId: undefined });
+
+			expect(pm.findWorkItemByUrlSuffix).toHaveBeenCalledWith('/issues/21');
+			expect(pm.moveWorkItem).toHaveBeenNthCalledWith(1, 'ITEM_21', 'inProgress');
+			expect(result.movedTo).toBe('inReview');
+		});
+
 		it('leaves the card at In progress (no In review move) when the agent fails', async () => {
 			const deps = makeDeps();
 			const pm = makePm();

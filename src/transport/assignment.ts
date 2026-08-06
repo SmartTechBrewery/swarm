@@ -70,6 +70,14 @@ export interface BuildTaskAssignmentInput {
 	session?: TaskAssignmentSession;
 	workItem?: WorkItem;
 	pr?: TaskAssignmentPr;
+	/**
+	 * respond-to-review only: the board card the PR's task was dispatched from,
+	 * already resolved by the caller from the durable `runs.work_item_id` link
+	 * (`../dispatch/board-card.ts`, issue #498). Resolved control-plane side
+	 * because a federated worker must not need a database (ADR-003 §2 / ADR-004
+	 * §3); omitted when nothing links the task to a card.
+	 */
+	boardItemId?: string;
 }
 
 /** Map a PM `WorkItem` to the transport's serialization subset (`AssignedWorkItem`). */
@@ -79,6 +87,7 @@ function toAssignedWorkItem(workItem: WorkItem): AssignedWorkItem {
 		title: workItem.title,
 		description: workItem.description,
 		url: workItem.url,
+		taskRef: workItem.taskRef,
 		status: workItem.status,
 		statusId: workItem.statusId,
 		statusKey: workItem.statusKey,
@@ -119,6 +128,7 @@ export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssign
 		...input.session,
 		workItem: input.workItem ? toAssignedWorkItem(input.workItem) : undefined,
 		...input.pr,
+		boardItemId: input.boardItemId,
 	};
 	// Validate before returning so a bad assembly fails at the seam, not on the wire.
 	return TaskAssignmentSchema.parse(assignment);

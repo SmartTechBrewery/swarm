@@ -31,6 +31,7 @@
 import { Worker } from 'bullmq';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failStaleRunningRuns, updateRunJobPayload } from '../db/repositories/runsRepository.js';
+import { resolveBoardItemIdForPrBranch } from '../dispatch/board-card.js';
 import { cancelDispatchAndWake } from '../dispatch/dispatcher.js';
 import {
 	reconcileDispatchesAtStartup,
@@ -359,6 +360,13 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		},
 		workItem: 'workItem' in trigger ? trigger.workItem : undefined,
 		pr: prCoordinates(trigger),
+		// Resolved here, where the DB is: the worker this is pushed to may have none
+		// (ADR-003 §2), so its board status report needs the card handed to it
+		// (issue #498). Best-effort — `undefined` falls back inside the phase.
+		boardItemId:
+			trigger.phase === 'respond-to-review'
+				? await resolveBoardItemIdForPrBranch(project, trigger.prBranch)
+				: undefined,
 	});
 
 	// Register the result wait *before* pushing so a fast worker's ack/progress/
