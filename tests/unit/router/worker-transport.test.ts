@@ -464,4 +464,57 @@ describe('GET /worker/stream connected-worker registry lifecycle', () => {
 		expect(isWorkerConnected(WORKER_ID)).toBe(false);
 		expect(sendToWorker(WORKER_ID, { type: 'heartbeat-ack' })).toBe(false);
 	});
+
+	// Regression: a back-channel frame (task-execution-result/-progress/-ack,
+	// stream-log) resolves `handleWorkerStreamFrame` to `{ action: 'ignore' }` —
+	// the socket never closes. An earlier `action.action !== 'ack'` check treated
+	// that the same as a `disconnect`/`close` and deregistered a still-open
+	// connection, so the worker read as offline (`isWorkerConnected` false) the
+	// moment it reported a phase's result — wedging every later dispatch to it
+	// behind `worker-unavailable` until the process reconnected, even though the
+	// DB session stayed live and the socket never closed.
+	it('stays registered after a task-execution-result frame — the socket never closed', async () => {
+		const deps = makeDeps();
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+		handlers.onOpen?.({}, ws);
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+
+		await handlers.onMessage(
+			{
+				data: JSON.stringify({
+					type: 'task-execution-result',
+					dispatchId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					status: 'succeeded',
+					phase: 'implementation',
+					taskId: '407',
+					exitCode: 0,
+				}),
+			},
+			ws,
+		);
+
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(ws.close).not.toHaveBeenCalled();
+		// The next dispatch can still reach this worker.
+		expect(sendToWorker(WORKER_ID, { type: 'heartbeat-ack' })).toBe(true);
+	});
+
+	it('deregisters when a heartbeat can no longer be refreshed (disconnect action)', async () => {
+		const deps = makeDeps({ heartbeat: vi.fn().mockResolvedValue(false) });
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+		handlers.onOpen?.({}, ws);
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+
+		await handlers.onMessage({ data: JSON.stringify({ type: 'heartbeat', fencingToken: 7 }) }, ws);
+
+		expect(isWorkerConnected(WORKER_ID)).toBe(false);
+	});
 });

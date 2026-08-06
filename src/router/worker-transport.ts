@@ -458,7 +458,13 @@ export function registerWorkerTransport(
 						// A `disconnect`/`close` action closes the socket, so drop it from the
 						// registry now rather than waiting for the async `onClose`. Identity-
 						// checked, so it can't evict a socket that has since been replaced.
-						if (action.action !== 'ack') {
+						// `ack` and `ignore` both leave the socket open — a back-channel frame
+						// (task-execution-result, task-progress, task-assignment-ack, stream-log)
+						// resolves to `ignore` and must not deregister a connection that never
+						// closed, or the worker reads as disconnected the moment it reports a
+						// phase's result, wedging every later dispatch to it (`worker-unavailable`)
+						// until the process reconnects.
+						if (action.action === 'disconnect' || action.action === 'close') {
 							deregisterConnection(workerId, ws);
 						}
 					} catch (err) {
