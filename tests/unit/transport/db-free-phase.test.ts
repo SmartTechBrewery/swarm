@@ -39,6 +39,13 @@ function delivery(): ScmDeliveryProvider {
 
 describe('real DB-free phase worktree lifecycle', () => {
 	let repoRoot: string | undefined;
+	const isolatedGitEnv = Object.fromEntries(
+		Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')),
+	);
+
+	function git(args: string[]): void {
+		execFileSync('git', args, { cwd: repoRoot, env: isolatedGitEnv });
+	}
 
 	afterEach(() => {
 		vi.unstubAllEnvs();
@@ -48,13 +55,13 @@ describe('real DB-free phase worktree lifecycle', () => {
 
 	it('runs a real phase with a worker-local repoRoot and no database or Redis', async () => {
 		repoRoot = mkdtempSync(join(tmpdir(), 'swarm-db-free-phase-'));
-		execFileSync('git', ['init', '-b', 'main'], { cwd: repoRoot });
-		execFileSync('git', ['config', 'user.name', 'Test Worker'], { cwd: repoRoot });
-		execFileSync('git', ['config', 'user.email', 'worker@example.com'], { cwd: repoRoot });
+		git(['init', '-b', 'main']);
+		git(['config', 'user.name', 'Test Worker']);
+		git(['config', 'user.email', 'worker@example.com']);
 		writeFileSync(join(repoRoot, 'README.md'), 'remote checkout\n');
-		execFileSync('git', ['add', 'README.md'], { cwd: repoRoot });
-		execFileSync('git', ['commit', '-m', 'chore: seed remote checkout'], { cwd: repoRoot });
-		execFileSync('git', ['branch', 'issue-17'], { cwd: repoRoot });
+		git(['add', 'README.md']);
+		git(['commit', '-m', 'chore: seed remote checkout']);
+		git(['branch', 'issue-17']);
 
 		// Any accidental store-backed call must fail this test immediately.
 		vi.stubEnv('DATABASE_URL', '');
