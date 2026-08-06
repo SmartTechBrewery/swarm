@@ -27,6 +27,7 @@ import {
 	createWorker,
 	findWorkerByCredentialHash,
 	getWorkerById,
+	getWorkersByIds,
 	listWorkersForOwner as listWorkersForOwnerRows,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
@@ -165,6 +166,16 @@ export async function renameWorker(id: string, displayName: string): Promise<Wor
 /** Resolve a worker by id. Returns `undefined` if unknown. */
 export async function getWorker(id: string): Promise<Worker | undefined> {
 	return getWorkerById(id);
+}
+
+/**
+ * Resolve several workers by id in one read (issue #523) — the batched form of
+ * {@link getWorker}, for a caller labelling a whole page of rows with the
+ * machines that produced them. Unknown ids are absent from the result rather
+ * than reported as an error, exactly as `getWorker` returns `undefined`.
+ */
+export async function getWorkers(ids: string[]): Promise<Worker[]> {
+	return getWorkersByIds(ids);
 }
 
 /** Every worker an owner operates (empty if they operate none). */

@@ -10,6 +10,7 @@ import {
 	createWorker,
 	findWorkerByCredentialHash,
 	getWorkerById,
+	getWorkersByIds,
 	listAllWorkers,
 	listWorkersForOwner,
 	removeWorker,
@@ -59,6 +60,48 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 
 		it('returns undefined for an unknown id', async () => {
 			expect(await getWorkerById('00000000-0000-4000-8000-000000000000')).toBeUndefined();
+		});
+	});
+
+	// The batched form the runs list labels a page of rows with (issue #523).
+	describe('getWorkersByIds', () => {
+		it('resolves the requested workers and silently omits the ids it cannot', async () => {
+			const ada = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-laptop',
+				capabilities: ['claude'],
+				credentialHash: 'hash-a',
+			});
+			const grace = await createWorker({
+				ownerUserId: graceId,
+				displayName: 'grace-desktop',
+				capabilities: ['codex'],
+				credentialHash: 'hash-b',
+			});
+
+			const found = await getWorkersByIds([
+				ada.id,
+				'00000000-0000-4000-8000-000000000000',
+				grace.id,
+			]);
+
+			expect(found.map((worker) => worker.displayName).sort()).toEqual([
+				'ada-laptop',
+				'grace-desktop',
+			]);
+			// The credential hash never enters the domain read model here either.
+			expect(found.every((worker) => !('credentialHash' in worker))).toBe(true);
+		});
+
+		it('reads nothing at all for an empty id list', async () => {
+			await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-laptop',
+				capabilities: ['claude'],
+				credentialHash: 'hash-a',
+			});
+
+			expect(await getWorkersByIds([])).toEqual([]);
 		});
 	});
 

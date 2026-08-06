@@ -265,6 +265,15 @@ export interface RunRow {
 	phase: string;
 	/** The worker that executed this run; null for an unfederated/single-user run and pre-existing rows. */
 	workerId: string | null;
+	/**
+	 * Display name of the worker machine that executed this run, resolved
+	 * server-side by `runs.list` (issue #523) so the run list can name the machine
+	 * without a second roster query. Null when the run recorded no worker and when
+	 * the recorded worker's row no longer resolves — the list then shows no machine
+	 * rather than a stale or invented one. Optional because `runs.getById` carries
+	 * the richer {@link RunAttribution} instead.
+	 */
+	workerName?: string | null;
 	/** The SWARM user owning `workerId`, denormalized at dispatch so it survives the worker row's removal. */
 	workerUserId: string | null;
 	/**

@@ -18,7 +18,7 @@
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
  */
 
-import { asc, eq } from 'drizzle-orm';
+import { asc, eq, inArray } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
@@ -85,6 +85,18 @@ export async function getWorkerById(id: string): Promise<Worker | undefined> {
 	const rows = await getDb().select().from(workers).where(eq(workers.id, id)).limit(1);
 	const row = rows[0];
 	return row ? rowToWorker(row) : undefined;
+}
+
+/**
+ * Resolve several workers by id in one read — the batched form of
+ * {@link getWorkerById}, so a page of runs can be labelled with the machines
+ * that executed them without a query per row (issue #523). Unknown ids are
+ * simply absent from the result; an empty input reads nothing at all.
+ */
+export async function getWorkersByIds(ids: string[]): Promise<Worker[]> {
+	if (ids.length === 0) return [];
+	const rows = await getDb().select().from(workers).where(inArray(workers.id, ids));
+	return rows.map(rowToWorker);
 }
 
 /**

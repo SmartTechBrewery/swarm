@@ -309,6 +309,74 @@ describe('RunsTable', () => {
 		});
 	});
 
+	// issue #523 — the machine a run is executing on, alongside its phase.
+	describe('worker machine', () => {
+		const onWorker: RunRow = { ...baseRun, workerId: 'worker-a', workerName: 'studio-mac' };
+
+		it('adds the machine name as a second, subordinate line in the desktop Phase cell', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[onWorker]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const phaseCell = within(table).getAllByRole('row')[1].querySelectorAll('td')[0];
+			// The phase still leads the cell; the machine reads below it.
+			expect(phaseCell.textContent).toBe('implementationstudio-mac');
+
+			const machine = within(phaseCell as HTMLElement).getByTestId('run-worker-name');
+			expect(machine.className).toContain('block');
+			// Visually less prominent than the phase: smaller, muted, not bolded.
+			expect(machine.className).toContain('text-xs');
+			expect(machine.className).toContain('text-zinc-500');
+			expect(machine.className).toContain('font-normal');
+			// A long machine name must not stretch the fixed-width Phase column.
+			expect(machine.className).toContain('truncate');
+			expect(machine.getAttribute('title')).toBe('studio-mac');
+		});
+
+		it('leaves the desktop Phase cell as the phase alone when no worker is recorded', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[baseRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const phaseCell = within(table).getAllByRole('row')[1].querySelectorAll('td')[0];
+			expect(phaseCell.textContent).toBe('implementation');
+			expect(within(phaseCell as HTMLElement).queryByTestId('run-worker-name')).toBeNull();
+		});
+
+		it('names the machine in the card metadata line only for a run that recorded one', () => {
+			renderTable(
+				<RunsTable
+					runs={[onWorker, { ...baseRun, id: 'run-2' }]}
+					totalCount={2}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const [withWorker, withoutWorker] = screen.getAllByTestId('run-card');
+			expect(within(withWorker).getByTestId('run-worker-name').textContent).toBe('studio-mac');
+			expect(within(withoutWorker).queryByTestId('run-worker-name')).toBeNull();
+			// The existing phase metadata is untouched either way.
+			expect(within(withWorker).getByText('implementation')).not.toBeNull();
+			expect(within(withoutWorker).getByText('implementation')).not.toBeNull();
+		});
+	});
+
 	describe('pagination footer', () => {
 		it('stacks on mobile and returns to a row on desktop', () => {
 			renderTable(

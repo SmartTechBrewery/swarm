@@ -30,10 +30,12 @@ vi.mock('@/identity/membership-service.js', () => ({
 	listAccessibleProjectIds: vi.fn(),
 }));
 
-// The attribution lookups `getById` resolves (issue #446), mocked at their own
-// module boundaries like every other repository/service read in this file.
+// The attribution lookups `getById` resolves (issue #446) and the batched
+// machine-name lookup `list` resolves (issue #523), mocked at their own module
+// boundaries like every other repository/service read in this file.
 vi.mock('@/identity/worker-service.js', () => ({
 	getWorker: vi.fn(),
+	getWorkers: vi.fn(),
 }));
 
 vi.mock('@/db/repositories/usersRepository.js', () => ({
@@ -154,7 +156,7 @@ import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
-import { getWorker } from '@/identity/worker-service.js';
+import { getWorker, getWorkers } from '@/identity/worker-service.js';
 import { getPMProvider } from '@/integrations/pm/registry.js';
 import { type Checkpoint, DEFAULT_MAX_CONTINUATIONS } from '@/pipeline/checkpoint.js';
 import {
@@ -342,6 +344,8 @@ describe('runsRouter', () => {
 		vi.mocked(resetRun).mockReset();
 		vi.mocked(forceReReview).mockReset();
 		vi.mocked(getWorker).mockReset();
+		vi.mocked(getWorkers).mockReset();
+		vi.mocked(getWorkers).mockResolvedValue([]);
 		vi.mocked(getUserById).mockReset();
 	});
 
@@ -360,9 +364,76 @@ describe('runsRouter', () => {
 			vi.mocked(listRunsFromDb).mockResolvedValue({ data, total: 2 });
 
 			const result = await caller.list({});
-			expect(result).toEqual({ data, total: 2 });
+			// Every row is widened with the additive `workerName` (issue #523);
+			// neither of these ran on a worker, so both resolve to null.
+			expect(result).toEqual({
+				data: data.map((run) => ({ ...run, workerName: null })),
+				total: 2,
+			});
 			expect(result.data[0].nextRetryAt).toEqual(nextRetryAt);
 			expect(listRunsFromDb).toHaveBeenCalledWith({ limit: 50, offset: 0 });
+		});
+
+		// issue #523 — the Runs table names the machine under the phase, so the
+		// list resolves the recorded worker id into a display name server-side.
+		it('names the worker machine that executed each run, in one batched lookup', async () => {
+			const data = [
+				makeRun({ id: 'run-1', workerId: 'worker-a' }),
+				makeRun({ id: 'run-2', workerId: 'worker-a' }),
+				makeRun({ id: 'run-3', workerId: null }),
+			];
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data, total: 3 });
+			vi.mocked(getWorkers).mockResolvedValue([
+				{
+					id: 'worker-a',
+					ownerUserId: 'user-1',
+					displayName: 'studio-mac',
+					capabilities: ['claude'],
+					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+					createdAt: new Date(0),
+					updatedAt: new Date(0),
+				},
+			]);
+
+			const result = await caller.list({});
+
+			expect(result.data.map((run) => run.workerName)).toEqual(['studio-mac', 'studio-mac', null]);
+			// The two rows sharing a worker cost one read, not one per row.
+			expect(getWorkers).toHaveBeenCalledExactlyOnceWith(['worker-a']);
+		});
+
+		it('skips the lookup entirely when no listed run recorded a worker', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [makeRun({ id: 'run-1' })], total: 1 });
+
+			const result = await caller.list({});
+
+			expect(result.data[0].workerName).toBeNull();
+			expect(getWorkers).not.toHaveBeenCalled();
+		});
+
+		it('reports a run whose recorded worker no longer resolves without a machine name', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({
+				data: [makeRun({ id: 'run-1', workerId: 'worker-gone' })],
+				total: 1,
+			});
+			vi.mocked(getWorkers).mockResolvedValue([]);
+
+			const result = await caller.list({});
+
+			expect(result.data[0].workerName).toBeNull();
+			expect(result.data[0].workerId).toBe('worker-gone');
+		});
+
+		it('degrades to unnamed machines when the lookup itself fails', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({
+				data: [makeRun({ id: 'run-1', workerId: 'worker-a' })],
+				total: 1,
+			});
+			vi.mocked(getWorkers).mockRejectedValue(new Error('workers table unavailable'));
+
+			const result = await caller.list({});
+
+			expect(result.data[0].workerName).toBeNull();
 		});
 
 		it('exposes a completed Review run’s verdict in the list data shape (issue #218)', async () => {
