@@ -21,6 +21,12 @@ COPY package*.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
 COPY --from=builder /app/dist ./dist
+# Raw migration SQL + meta/_journal.json aren't TypeScript, so `tsc` never puts
+# them in dist — but src/db/migrate.ts resolves MIGRATIONS_FOLDER relative to
+# cwd at runtime (src/db/migrations), which SWARM_DISPATCH_MODE=transport reads
+# on startup (src/router/index.ts) to run migrations before the dispatch
+# consumer starts.
+COPY --from=builder /app/src/db/migrations ./src/db/migrations
 
 ENV PORT=3000
 EXPOSE 3000
