@@ -230,7 +230,9 @@ export async function updateWorkerCapabilities(
  * than by handshaking, so it has a CLI set it must not overwrite and a phase
  * repertoire it must state. Without this, a row narrowed by one `connect` run
  * would stay narrowed for every later in-process run, permanently refusing
- * `planning` on a host that can in fact run it (issue #467).
+ * `planning` on a host that can in fact run it (issue #467). Issue #536 made
+ * `connect` declare every phase too, so the narrowing case is now a daemon on an
+ * older build — the same skew, one build behind rather than one program over.
  *
  * No enrollment validation, for the reason given on {@link updateWorkerCapabilities}:
  * an enrollment's own phase selection (`allowedPhases`, issue #509) is the owner's

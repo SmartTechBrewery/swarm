@@ -223,17 +223,15 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		expect(writeOnly().type).toBe('github-projects');
 	});
 
-	it('rejects every board read with an actionable reason instead of inventing a result', async () => {
+	it('rejects only the two reads no DB-free phase calls, instead of inventing a result', async () => {
 		const fetchImpl = vi.fn<FetchLike>();
 		const provider = writeOnly(fetchImpl);
 
+		// The control plane already read the assigned item and put it on the
+		// assignment, and enumerating a whole board is not a worker's business.
 		for (const call of [
 			() => provider.getWorkItem('PVTI_item1'),
 			() => provider.listWorkItems({ status: 'todo' }),
-			() => provider.findComment('PVTI_item1', 'marker'),
-			() => provider.createWorkItem({ title: 't', description: 'd', status: 'planning' }),
-			() => provider.updateWorkItem('PVTI_item1', { title: 't2' }),
-			() => provider.addLabel('PVTI_item1', 'planned'),
 		]) {
 			await expect(call()).rejects.toThrow(/not available on a DB-free worker/i);
 		}
@@ -339,12 +337,116 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		).resolves.toBeUndefined();
 	});
 
-	it("refuses addBlockedBy — recording a dependency is Planning's move, and Planning stays local", async () => {
-		const fetchImpl = vi.fn<FetchLike>();
-		await expect(writeOnly(fetchImpl).addBlockedBy('PVTI_item1', 'PVTI_item2')).rejects.toThrow(
-			/not available on a DB-free worker/i,
-		);
-		expect(fetchImpl).not.toHaveBeenCalled();
+	it("serves Planning's replay guard as a narrow read, mapping a miss back to undefined", async () => {
+		// This is the load-bearing one (issue #536): a replayed Planning delivery finds
+		// its own plan comment by marker and skips the split entirely, so refusing it
+		// would have a retry create a second set of sibling cards.
+		const hit = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { commentId: 'IC_kw77' }));
+		await expect(
+			writeOnly(hit).findComment('PVTI_item1', 'swarm-planning-delivery:run-1'),
+		).resolves.toBe('IC_kw77');
+		expect(hit.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/find-comment');
+		expect(JSON.parse(hit.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			marker: 'swarm-planning-delivery:run-1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+
+		const miss = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { commentId: null }));
+		await expect(writeOnly(miss).findComment('PVTI_item1', 'marker')).resolves.toBeUndefined();
+	});
+
+	it("creates a split's sibling card over the transport and hydrates the narrow frame", async () => {
+		const wireItem = {
+			id: 'ITEM_61',
+			title: 'Phase 2 of 3 — extract the reader',
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/61',
+		};
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { item: wireItem }));
+
+		await expect(
+			writeOnly(fetchImpl).createWorkItem({
+				title: wireItem.title,
+				description: 'child body',
+				status: 'backlog',
+				labels: ['swarm', 'swarm:split-child'],
+			}),
+		).resolves.toEqual({ ...wireItem, description: '', labels: [], assignees: [] });
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/create-item');
+		// A canonical status key and label *names* cross the wire — never a board
+		// option id or a provider label object (RULES.md §2).
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			title: wireItem.title,
+			description: 'child body',
+			status: 'backlog',
+			labels: ['swarm', 'swarm:split-child'],
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it('omits the labels key entirely when a creation names none', async () => {
+		const fetchImpl = vi
+			.fn<FetchLike>()
+			.mockResolvedValue(jsonResponse(200, { item: { id: 'i', title: 't', url: 'u' } }));
+		await writeOnly(fetchImpl).createWorkItem({ title: 't', description: 'd', status: 'planning' });
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).not.toHaveProperty('labels');
+	});
+
+	it('sends only the patch fields a caller actually set, so an omitted field stays unchanged', async () => {
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, {}));
+		const provider = writeOnly(fetchImpl);
+
+		await provider.updateWorkItem('PVTI_item1', { title: 'Phase 1 of 3 — the smaller task' });
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/update-item');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			title: 'Phase 1 of 3 — the smaller task',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+
+		// An empty description is a legitimate re-scope, so it must be *sent*, not
+		// treated as "leave it alone".
+		await provider.updateWorkItem('PVTI_item1', { description: '' });
+		expect(JSON.parse(fetchImpl.mock.calls[1][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			description: '',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it('applies a label and records a blocked-by edge over the transport', async () => {
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, {}));
+		const provider = writeOnly(fetchImpl);
+
+		await provider.addLabel('PVTI_item1', 'planned');
+		await provider.addBlockedBy('PVTI_child', 'PVTI_item1');
+
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/label');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			name: 'planned',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+		expect(fetchImpl.mock.calls[1][0]).toBe('https://swarm.example/worker/delivery/pm/blocked-by');
+		expect(JSON.parse(fetchImpl.mock.calls[1][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_child',
+			blockerId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it('throws on a refused Planning write, so the phase’s own failure handling applies', async () => {
+		// `addLabel` on completion is a hard step (issue #384) and each per-child write
+		// is best-effort — both behave correctly only if a refusal throws rather than
+		// resolving silently.
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(403, { reason: 'nope' }));
+		await expect(writeOnly(fetchImpl).addLabel('PVTI_item1', 'planned')).rejects.toThrow(/403/);
 	});
 
 	it('exposes no discovery capability', () => {

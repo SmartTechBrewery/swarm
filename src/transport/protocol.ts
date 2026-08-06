@@ -653,6 +653,150 @@ export const FindWorkItemDeliveryResponseSchema = z.object({
 export type FindWorkItemDeliveryResponse = z.infer<typeof FindWorkItemDeliveryResponseSchema>;
 
 /**
+ * Control-plane PM frames the **Planning** phase needs (issue #536), the last set
+ * that kept a phase off a DB-free worker. Same contract as the PM frames above —
+ * worker-credential-authenticated `POST /worker/delivery/pm/*`, the project taken
+ * from the authenticated enrollment rather than the body, `protocolVersion`
+ * handshaked, no provider vocabulary on the wire — so the reasoning there applies
+ * unchanged and only the operations are new.
+ *
+ * They are deliberately **one frame per `PMProvider` method** rather than one
+ * coarse "apply this split" frame. The split's idempotency does not live in the
+ * grouping of its writes: a replayed Planning delivery is short-circuited *before*
+ * `applySplit` runs at all, by finding its own plan comment through
+ * {@link FindPmCommentDeliveryRequestSchema} (`planDeliveryMarker`,
+ * `../pipeline/planning.ts`), and each individual write is idempotent or
+ * best-effort by the provider's own contract. A coarse frame would instead have to
+ * carry the agent-authored split — preplan contracts, marker bodies, per-child
+ * ordering — up to the control plane and re-implement Planning's per-child failure
+ * handling there, moving pipeline logic off the phase that owns it and changing the
+ * same-host path this issue must leave untouched.
+ *
+ * `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: every existing frame
+ * keeps its shape, and a bump would reject every frame from an already-deployed
+ * worker rather than just these new ones. An older worker simply never calls these
+ * routes; a newer worker against an older router gets a 404, which surfaces as the
+ * same failed write any other non-2xx does.
+ */
+export const FindPmCommentDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	itemId: z.string().min(1),
+	/** Unique substring identifying at most one comment (`PMProvider.findComment`). */
+	marker: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type FindPmCommentDeliveryRequest = z.infer<typeof FindPmCommentDeliveryRequestSchema>;
+
+/**
+ * `POST /worker/delivery/pm/find-comment` success body — the matching comment's
+ * provider-native id, or `null` when no comment carries the marker. `null` rather
+ * than an absent key, for the same reason as the card lookup above: "no such
+ * comment" must be an explicit answer, never a dropped field, because the caller
+ * treats it as "this delivery has not posted yet" and posts.
+ */
+export const FindPmCommentDeliveryResponseSchema = z.object({
+	commentId: z.string().min(1).nullable(),
+});
+export type FindPmCommentDeliveryResponse = z.infer<typeof FindPmCommentDeliveryResponseSchema>;
+
+/**
+ * `POST /worker/delivery/pm/create-item` request body — spawn one sibling card for
+ * Planning's task split. `status` is a canonical `PmStatusKey` and `labels` are
+ * label *names*, exactly as `CreateWorkItemInput` defines them (`../pm/types.ts`):
+ * resolving either to a board option id or to a provider label object is the
+ * adapter's job, server-side.
+ */
+export const CreateWorkItemDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	title: z.string().min(1),
+	description: z.string(),
+	/** Canonical SWARM pipeline status key (`PmStatusKey`), never a board option ID. */
+	status: z.string().min(1),
+	labels: z.array(z.string().min(1)).optional(),
+	protocolVersion: z.number().int(),
+});
+export type CreateWorkItemDeliveryRequest = z.infer<typeof CreateWorkItemDeliveryRequestSchema>;
+
+/**
+ * `POST /worker/delivery/pm/create-item` success body — the created card on the
+ * same narrow {@link FoundWorkItemSchema} frame the lookups use, which is exactly
+ * what Planning reads off a fresh sibling (its `id` to write to, its `title`/`url`
+ * to name it in the next child's blocked-by comment). Not nullable: unlike a
+ * lookup, a creation that resolved no item is a failure, not an ordinary miss.
+ */
+export const CreateWorkItemDeliveryResponseSchema = z.object({
+	item: FoundWorkItemSchema,
+});
+export type CreateWorkItemDeliveryResponse = z.infer<typeof CreateWorkItemDeliveryResponseSchema>;
+
+/**
+ * `POST /worker/delivery/pm/update-item` request body — patch a card's mutable
+ * fields. Both fields are optional and independently omittable, mirroring
+ * `UpdateWorkItemPatch` (`../pm/types.ts`), so "leave the title alone" stays
+ * distinguishable from "set the title to this". `description` accepts the empty
+ * string, which a re-scope may legitimately write; `title` does not, since no
+ * provider models an untitled item.
+ */
+export const UpdateWorkItemDeliveryRequestSchema = z
+	.object({
+		projectId: z.string().min(1),
+		itemId: z.string().min(1),
+		title: z.string().min(1).optional(),
+		description: z.string().optional(),
+		protocolVersion: z.number().int(),
+	})
+	// Both fields optional means "leave this one alone", so *neither* means the
+	// request asks for nothing — a caller bug that would otherwise reach the provider
+	// as an empty patch and spend a board write saying nothing. Planning never sends
+	// one (`buildMainTaskPatch` returns undefined when nothing changed, and the call
+	// is guarded on that), so rejecting it costs no legitimate traffic.
+	.refine((request) => request.title !== undefined || request.description !== undefined, {
+		message: 'update-item requires at least one of title or description',
+	});
+export type UpdateWorkItemDeliveryRequest = z.infer<typeof UpdateWorkItemDeliveryRequestSchema>;
+
+/** `POST /worker/delivery/pm/update-item` success body — a patch carries no return value. */
+export const UpdateWorkItemDeliveryResponseSchema = z.object({});
+export type UpdateWorkItemDeliveryResponse = z.infer<typeof UpdateWorkItemDeliveryResponseSchema>;
+
+/**
+ * `POST /worker/delivery/pm/label` request body — apply one label by *name* to a
+ * card's backing artifact (`planned`, a project's automation label). Creating the
+ * label if it is missing and making a repeat a no-op are the adapter's job
+ * (`PMProvider.addLabel`), so nothing here needs a read-then-write.
+ */
+export const AddPmLabelDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	itemId: z.string().min(1),
+	name: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type AddPmLabelDeliveryRequest = z.infer<typeof AddPmLabelDeliveryRequestSchema>;
+
+/** `POST /worker/delivery/pm/label` success body — a label write carries no return value. */
+export const AddPmLabelDeliveryResponseSchema = z.object({});
+export type AddPmLabelDeliveryResponse = z.infer<typeof AddPmLabelDeliveryResponseSchema>;
+
+/**
+ * `POST /worker/delivery/pm/blocked-by` request body — record that `itemId` is
+ * blocked by `blockerId`, the dependency edge a split chains its phases with
+ * (issue #330). Both are provider-native work-item ids, and the write is
+ * idempotent — a no-op entirely on a provider that models no dependencies
+ * (`PMProvider.addBlockedBy`).
+ */
+export const AddBlockedByDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	itemId: z.string().min(1),
+	blockerId: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type AddBlockedByDeliveryRequest = z.infer<typeof AddBlockedByDeliveryRequestSchema>;
+
+/** `POST /worker/delivery/pm/blocked-by` success body — a dependency write carries no return value. */
+export const AddBlockedByDeliveryResponseSchema = z.object({});
+export type AddBlockedByDeliveryResponse = z.infer<typeof AddBlockedByDeliveryResponseSchema>;
+
+/**
  * `POST /worker/delivery/follow-up-review` request body — schedule the one
  * follow-up Review a `fixed` Respond-to-review response owes its newly pushed
  * commit (issue #241). Unlike the delivery frames above this fronts no

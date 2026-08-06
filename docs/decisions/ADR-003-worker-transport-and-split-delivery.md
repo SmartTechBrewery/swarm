@@ -195,27 +195,79 @@ server-side store) it needs:
    amendment), and provisioning asserts the checkout is the assigned repository
    before it writes anything into it.
 
-Still out of scope: **`planning`**, whose PM write/split surface
-(`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`/`findComment`)
-is wider than a delivery seam should carry and stays on the local host worker, and
-over-the-wire secret delivery, which remains unnecessary: the split keeps every
-project credential server-side instead.
+9. **#536** — **`planning`** joins them, completing the set: a DB-free remote worker
+   now runs **all six** phases, so phase support no longer depends on which machine
+   a worker happens to be. The delivery API grows five more PM routes
+   (`POST /worker/delivery/pm/{find-comment,create-item,update-item,label,blocked-by}`,
+   for sixteen in total; see ADR-004 §2), each authenticated and authorized exactly
+   as the existing PM routes are, and `createWriteOnlyTransportPmProvider` refuses
+   only `getWorkItem` and `listWorkItems` — neither of which any DB-free phase calls.
+   The agent run, `proposed_plan.md`, the split contract and the deterministic scope
+   gate all stay worker-side; only board metadata crosses.
 
-> **"Stays on the local host worker" is now enforced, not merely asserted (issue #467).**
-> As originally written this sentence was a statement of fact that no code was
+   **This reverses the original deferral below, on the deferral's own terms.** Width
+   was the stated objection, and width alone was never a boundary violation: no
+   project PM credential reaches the worker (every board call still executes under
+   the server-side credential), the board a worker may write to still comes from its
+   authenticated routable enrollment rather than the request body, and each write is
+   idempotent or best-effort at the provider. The split's two idempotency mechanisms
+   travel unchanged: `findComment` on the plan-delivery marker short-circuits a
+   replayed delivery *before* `applySplit` runs, and `PLANNED_LABEL` still marks only
+   children whose preparation actually completed.
+
+   **Unchanged is not the same as sufficient, and this move raises the stakes on one
+   gap.** The marker that makes a replay a no-op is the *plan comment*, and
+   `applySplit` runs **before** that comment is posted — so the guard only covers a
+   delivery that got as far as posting. A split that dies partway (a `createWorkItem`
+   throwing on child 2 of 3) leaves child 1 on the board with no marker anywhere, and
+   the retry re-runs the whole split: child 1 is created a second time. That is
+   pre-existing behaviour, identical on the same-host path and not introduced here —
+   but `createWorkItem` is the one write outside the per-child `try`, and putting it
+   on the wire adds transport failure modes (a 5xx, a socket reset, a control-plane
+   restart) to precisely the call whose failure duplicates board structure. Closing it
+   needs a change to the split's own idempotency — a marker written before the first
+   child, or a resumable split — which is pipeline semantics shared with the same-host
+   path, so it is tracked separately rather than smuggled into a transport change.
+   Deliberately **not** taken: relocating `applySplit` behind one coarse
+   "apply this split" route. That would carry agent-authored preplan contracts and
+   per-child ordering up to the control plane and re-implement Planning's per-child
+   failure handling there — moving pipeline logic off the phase that owns it, and
+   changing the same-host path this issue had to leave untouched.
+
+   What the deferral cost while it stood: with `planning` excluded, **no machine
+   could plan** unless the instance admin's own host was permanently part of the
+   deployment. It was the last thing pinning SWARM to a single-machine topology and
+   the blocker on a hosted instance where the control plane holds the database and no
+   worker does.
+
+Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
+split keeps every project credential server-side instead.
+
+> **Superseded by issue #536 (above).** As originally written, this ADR also placed
+> **`planning`** out of scope, "whose PM write/split surface
+> (`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`/`findComment`) is
+> wider than a delivery seam should carry and stays on the local host worker." Those
+> five methods now have routes and Planning runs anywhere. The paragraph is kept here
+> because the enforcement note below is about it, and because the reasoning it was
+> reversed on is recorded in item 9 rather than lost.
+
+> **"Stays on the local host worker" was enforced, not merely asserted (issue #467).**
+> As originally written that sentence was a statement of fact that no code was
 > responsible for. The handshake declared only CLI capabilities, so the control plane
 > could not tell a DB-free daemon from a same-host one and would select either for
 > `planning`; the DB-free worker then answered with a terminal `status: 'failed'`
 > frame carrying no `failureKind`, which the dispatcher rethrows as a plain error —
 > no deferral budget, no failover, so the dispatch died even with a capable worker
-> connected. The daemon now declares its phase repertoire at handshake
+> connected. The daemon declares its phase repertoire at handshake
 > (`HandshakeRequestSchema.supportedPhases`, persisted as `workers.supported_phases`),
 > the eligibility gate refuses an incapable candidate (`missing-phase-capability`),
 > and the dispatch takes the existing token-free "wait for an eligible worker"
-> deferral instead. The worker-side gate stays as the backstop. Whoever later widens
-> the delivery API to cover Planning's PM surface only has to grow
-> `SUPPORTED_DB_FREE_PHASES`: the declaration and the gate follow it with no
-> control-plane change.
+> deferral instead. The worker-side gate stays as the backstop. That machinery is
+> what made #536 a one-line widening on the dispatch side: growing
+> `SUPPORTED_DB_FREE_PHASES` is all it took, and the declaration and the gate
+> followed with no control-plane change. It is not dead code now that every phase is
+> supported — an enrollment's `allowedPhases` still narrows what a machine is
+> *permitted*, and a daemon predating #536 keeps declaring five.
 
 > **Supersedes issue #300.** #300's gRPC bidirectional control plane is re-scoped:
 > the MVP transport is WebSocket + HTTP on the router, not a gRPC stream. The gRPC

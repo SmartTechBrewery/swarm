@@ -393,11 +393,12 @@ export interface DashboardWorkerView {
 	capabilities: AgentCli[];
 	/**
 	 * The pipeline phases the machine's daemon declared it can execute (issue
-	 * #467) — the second capability axis, independent of the CLIs above: a DB-free
-	 * remote daemon has every CLI and still refuses `planning`
-	 * (`SUPPORTED_DB_FREE_PHASES`, `../transport/assignment-execution.ts`). The
-	 * Workers screen reads it to say so, rather than leaving an operator to infer
-	 * it from work that never starts.
+	 * #467) — the second capability axis, independent of the CLIs above: a machine
+	 * can have every CLI and still refuse a phase. Today's DB-free daemon declares
+	 * all six (`SUPPORTED_DB_FREE_PHASES`, `../transport/assignment-execution.ts`,
+	 * issue #536), so what this now surfaces is mostly version skew — a machine still
+	 * on an older build. The Workers screen reads it to say so, rather than leaving
+	 * an operator to infer it from work that never starts.
 	 */
 	supportedPhases: TriggerPhase[];
 	connection: WorkerConnectionState;
@@ -703,15 +704,27 @@ function assertClisWithinCapabilities(worker: Worker, allowedClis: AgentCli[]): 
 /**
  * `planning` may only ever be allowed on an instance admin's own worker
  * ({@link PlanningRequiresInstanceAdminError}) — independent of what the
- * worker's daemon self-declares in `supportedPhases`, since in production only
- * the instance admin's machine is ever handed the `DATABASE_URL`/`REDIS_URL`
- * planning needs. `explicit` distinguishes the two ways `planning` can end up
- * in `allowedPhases`: a caller who asked for it by name gets a clean rejection
- * (mirrors {@link assertClisWithinCapabilities}); `enrollWorker`'s
+ * worker's daemon self-declares in `supportedPhases`. `explicit` distinguishes
+ * the two ways `planning` can end up in `allowedPhases`: a caller who asked for
+ * it by name gets a clean rejection (mirrors
+ * {@link assertClisWithinCapabilities}); `enrollWorker`'s
  * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES} fallback, which names every phase
  * because a new enrollment is meant to constrain nothing beyond what already
  * constrains the worker, has it filtered out silently instead — ownership is
  * exactly such a pre-existing constraint, not a deliberate ask.
+ *
+ * **One of the two reasons this rule had is gone (issue #536), and the rule is
+ * deliberately unchanged.** It used to rest partly on capability: only the instance
+ * admin's machine was ever handed the `DATABASE_URL`/`REDIS_URL` Planning needed, so
+ * granting the phase elsewhere could only produce work that never ran. A DB-free
+ * worker now runs Planning, so that half no longer applies. What remains is the
+ * *authorization* half, which was always the stronger one: Planning is the only
+ * phase that creates board structure — new work items, dependency edges, a re-scoped
+ * parent — so a mistaken or hostile run writes wrong structure onto a live board
+ * rather than failing one task. Widening who may be granted it is a trust decision
+ * about board authorship, not a consequence of the phase becoming portable, and it
+ * needs its own issue. Until then a hosted instance runs Planning on an admin-owned
+ * DB-free daemon, which #536 makes possible for the first time.
  */
 async function restrictPlanningToInstanceAdminOwner(
 	worker: Worker,

@@ -20,7 +20,8 @@
  *    user — takes the unassigned path (ADR-001 open question 5), so an unlinked
  *    handle never wedges a project. Affinity applies **per phase**
  *    ({@link AFFINITY_GATED_PHASES}): to `implementation` but not to `planning`,
- *    which runs centrally (issue #469).
+ *    which belongs to no particular machine (issue #469; see that constant for why
+ *    the exemption outlived the reason it was introduced for).
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
  *    connection/health → free capacity → declared phase support (issue #467) →
@@ -182,21 +183,29 @@ export interface DispatchGateOptions {
  * (`src/triggers/types.ts`). This narrows that set by one more: **`planning` is a
  * central phase and is not affinity-gated.**
  *
- * The reason is that affinity and phase capability compose badly for `planning`
- * specifically. Affinity is a hard rule with no cross-user fallback, while the
- * ability to run `planning` is deliberately *not* distributed — a DB-free remote
- * worker refuses it, because its PM write/split surface is wider than the control
- * plane's delivery seam carries (`SUPPORTED_DB_FREE_PHASES`,
- * `src/transport/assignment-execution.ts`). An item assigned to a user whose only
- * machine is such a worker was therefore never plannable at all: the permitted set
- * held one worker that refuses the phase, and the dispatch deferred to a terminal
- * failure while a capable worker sat idle. Two individually correct rules produced
- * work that could never run.
+ * The original reason was that affinity and phase capability composed badly for
+ * `planning` specifically. Affinity is a hard rule with no cross-user fallback,
+ * while the ability to run `planning` was deliberately *not* distributed — a DB-free
+ * remote worker refused it. An item assigned to a user whose only machine was such a
+ * worker was therefore never plannable at all: the permitted set held one worker
+ * that refuses the phase, and the dispatch deferred to a terminal failure while a
+ * capable worker sat idle. Two individually correct rules produced work that could
+ * never run.
+ *
+ * **That premise is gone (issue #536): every worker can now run `planning`, and the
+ * exemption is deliberately kept anyway** — on the reason that outlived it, stated
+ * in the paragraph below rather than inherited from the bug. Planning produces no
+ * branch, no worktree-bound artifact and no PR: nothing about it belongs on a
+ * particular person's machine, so gating it on affinity would only make a plan wait
+ * for one worker while any other could produce the same comment and board writes.
+ * Revisiting that is a routing decision of its own. (A pre-#536 daemon still
+ * declares a narrower repertoire, so the composition the bug describes remains
+ * reachable through version skew — which is why the exemption's *effect* is still
+ * load-bearing and not merely historical.)
  *
  * `implementation` keeps affinity, and the rationale still holds there: it writes
  * source in a worktree on the operator's own machine under their own token, so
- * *whose* machine runs it is the point. Planning produces a plan comment and board
- * writes, and every DB-holding worker can do that equally.
+ * *whose* machine runs it is the point.
  */
 const AFFINITY_GATED_PHASES: ReadonlySet<TriggerPhase> = new Set<TriggerPhase>(['implementation']);
 

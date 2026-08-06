@@ -50,7 +50,19 @@
  * PR coordinates and this route performs that same enqueue — for the
  * **authenticated** project, never one named in the request.
  *
- * Ten routes, all under `/worker/delivery`:
+ * The five `pm/{find-comment,create-item,update-item,label,blocked-by}` routes are
+ * the **Planning** phase's board surface (issue #536) — the split that creates
+ * sibling cards, chains them as dependencies, marks an item `planned`, and finds
+ * its own plan comment to stay idempotent on a retry. They front the same
+ * per-project PM credential as the two writes above and are authorized identically;
+ * what they add is width, which is what had kept Planning off a DB-free worker.
+ * Planning is the only phase that *creates* board structure, so two properties
+ * matter more here than for the narrower routes: the project is the authenticated
+ * enrollment's (a worker cannot create a card on a board it isn't enrolled in), and
+ * each write is idempotent at the provider, so a replayed request cannot fork the
+ * board.
+ *
+ * Sixteen routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
@@ -58,6 +70,11 @@
  *   - `POST /worker/delivery/pm/blockers` — read the item's open prerequisites.
  *   - `POST /worker/delivery/pm/find-item` — resolve one card by its backing URL's tail.
  *   - `POST /worker/delivery/pm/find-artifact` — resolve one card by a repository-scoped artifact.
+ *   - `POST /worker/delivery/pm/find-comment` — find one comment by its idempotency marker.
+ *   - `POST /worker/delivery/pm/create-item` — create one card (Planning's split children).
+ *   - `POST /worker/delivery/pm/update-item` — patch a card's title/description.
+ *   - `POST /worker/delivery/pm/label` — apply one label by name.
+ *   - `POST /worker/delivery/pm/blocked-by` — record a blocked-by dependency edge.
  *   - `POST /worker/delivery/follow-up-review` — schedule the follow-up Review a fix owes.
  *   - `POST /worker/delivery/review-ledger/prior` — the PR's prior submitted verdict.
  *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
@@ -66,7 +83,9 @@
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
  * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
- * `handleListBlockers`, `handleFindWorkItem`, `handleScheduleFollowUpReview`,
+ * `handleListBlockers`, `handleFindWorkItem`, `handleFindWorkItemForArtifact`,
+ * `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
+ * `handleAddPmLabel`, `handleAddBlockedBy`, `handleScheduleFollowUpReview`,
  * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
  * tests drive them with fake deps and never need a live router; collaborators
  * default to the real services and are overridden in tests. Credential handling
@@ -101,15 +120,20 @@ import {
 	scheduleFollowUpReviewDefault,
 } from '../pipeline/follow-up-review.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
-import type { PMProvider } from '../pm/types.js';
+import type { PMProvider, WorkItem } from '../pm/types.js';
 import type { ScmDeliveryProvider } from '../scm/delivery.js';
 import type { ScmPersona } from '../scm/types.js';
 import {
 	AbandonReviewLedgerRequestSchema,
+	AddBlockedByDeliveryRequestSchema,
 	AddPmCommentDeliveryRequestSchema,
+	AddPmLabelDeliveryRequestSchema,
+	CreateWorkItemDeliveryRequestSchema,
+	FindPmCommentDeliveryRequestSchema,
 	FindWorkItemDeliveryRequestSchema,
 	FindWorkItemForArtifactDeliveryRequestSchema,
 	FollowUpReviewDeliveryRequestSchema,
+	type FoundWorkItem,
 	ListBlockersDeliveryRequestSchema,
 	MarkReviewLedgerRequestSchema,
 	MoveWorkItemDeliveryRequestSchema,
@@ -117,6 +141,7 @@ import {
 	PriorReviewLedgerRequestSchema,
 	SubmitReviewDeliveryRequestSchema,
 	TRANSPORT_PROTOCOL_VERSION,
+	UpdateWorkItemDeliveryRequestSchema,
 } from '../transport/protocol.js';
 
 /**
@@ -483,16 +508,25 @@ export async function handleFindWorkItem(
 
 	const pm = deps.buildPmProvider(authed.project);
 	const item = await pm.findWorkItemByUrlSuffix(request.urlSuffix);
-	const projected = item
-		? {
-				id: item.id,
-				title: item.title,
-				url: item.url,
-				...(item.status !== undefined && { status: item.status }),
-				...(item.statusId !== undefined && { statusId: item.statusId }),
-			}
-		: null;
-	return { status: 200, json: { item: projected } };
+	return { status: 200, json: { item: item ? projectFoundWorkItem(item) : null } };
+}
+
+/**
+ * Narrow a `WorkItem` onto the wire frame the three card-returning routes share
+ * (`FoundWorkItemSchema`): identity, title, URL, and the status pair when the
+ * provider resolved one. Description, labels, and assignees are dropped rather
+ * than sent — a worker needs none of them to address a card, and assignees must
+ * not cross the wire at all (ai/RULES.md §2). Factored out so a field can't be
+ * added to one route's projection and missed by the others.
+ */
+function projectFoundWorkItem(item: WorkItem): FoundWorkItem {
+	return {
+		id: item.id,
+		title: item.title,
+		url: item.url,
+		...(item.status !== undefined && { status: item.status }),
+		...(item.statusId !== undefined && { statusId: item.statusId }),
+	};
 }
 
 /** Resolve one board card by its repository-scoped backing artifact. */
@@ -516,16 +550,177 @@ export async function handleFindWorkItemForArtifact(
 		kind: request.kind,
 		number: request.number,
 	});
-	const projected = item
-		? {
-				id: item.id,
-				title: item.title,
-				url: item.url,
-				...(item.status !== undefined && { status: item.status }),
-				...(item.statusId !== undefined && { statusId: item.statusId }),
-			}
-		: null;
-	return { status: 200, json: { item: projected } };
+	return { status: 200, json: { item: item ? projectFoundWorkItem(item) : null } };
+}
+
+/**
+ * Find one comment on a work item's backing Issue/PR by its idempotency marker —
+ * the read that makes a **replayed Planning delivery** a no-op instead of a second
+ * plan comment and a duplicated split (`planDeliveryMarker`,
+ * `../pipeline/planning.ts`). Same prelude and contract as
+ * {@link handleMoveWorkItem}; `commentId: null` is the ordinary "this delivery has
+ * not posted yet" answer rather than a 404, because that is exactly how the caller
+ * reads it — it posts.
+ *
+ * Only the comment's *id* comes back, never its body: the caller asks whether its
+ * own marker is present, and returning the text would put a board comment on the
+ * wire for no reader.
+ */
+export async function handleFindPmComment(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = FindPmCommentDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	const commentId = await pm.findComment(request.itemId, request.marker);
+	return { status: 200, json: { commentId: commentId ?? null } };
+}
+
+/**
+ * Create one board card — the sibling task Planning's split spawns (`createWorkItem`).
+ * Same prelude and contract as {@link handleMoveWorkItem}, and the authorization
+ * matters most here of all the PM routes: the board written to is the
+ * **authenticated** enrollment's project, so a worker credential cannot mint cards
+ * on a board it isn't enrolled in even if its request names one.
+ *
+ * The canonical status key and the label *names* cross the wire; resolving them to
+ * a board option id and to provider label objects stays inside the adapter
+ * (ai/RULES.md §2). The created card comes back on the same narrow frame the
+ * lookups use, which is all Planning reads off a fresh sibling.
+ */
+export async function handleCreateWorkItem(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = CreateWorkItemDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	const item = await pm.createWorkItem({
+		title: request.title,
+		description: request.description,
+		status: request.status,
+		...(request.labels !== undefined && { labels: request.labels }),
+	});
+	return { status: 200, json: { item: projectFoundWorkItem(item) } };
+}
+
+/**
+ * Patch a card's mutable title/description — how Planning re-scopes the original
+ * item into the smaller first task, and how it embeds a split child's preplan
+ * marker in the child's body. Same prelude and contract as
+ * {@link handleMoveWorkItem}; the two fields are forwarded only when the request
+ * carries them, so an omitted field stays unchanged rather than being written as
+ * `undefined`.
+ */
+export async function handleUpdateWorkItem(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = UpdateWorkItemDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	await pm.updateWorkItem(request.itemId, {
+		...(request.title !== undefined && { title: request.title }),
+		...(request.description !== undefined && { description: request.description }),
+	});
+	return { status: 200, json: {} };
+}
+
+/**
+ * Apply one label by name to a card's backing artifact — the `planned` completion
+ * marker (issue #384) and the automation label a split child needs to be dispatchable
+ * (issue #131). Same prelude and contract as {@link handleMoveWorkItem}; the
+ * provider both creates a missing label and makes a repeat a no-op, so a retried
+ * request is harmless.
+ */
+export async function handleAddPmLabel(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = AddPmLabelDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	await pm.addLabel(request.itemId, request.name);
+	return { status: 200, json: {} };
+}
+
+/**
+ * Record one blocked-by dependency edge — how a split chains its phases so a later
+ * phase cannot start before its predecessors land (issue #330). Same prelude and
+ * contract as {@link handleMoveWorkItem}. No capability branch is needed: the
+ * interface's own contract makes this a no-op on a provider that models no
+ * dependencies (`../pm/types.ts`), exactly as `listBlockers` returns `[]` there.
+ */
+export async function handleAddBlockedBy(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = AddBlockedByDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	await pm.addBlockedBy(request.itemId, request.blockerId);
+	return { status: 200, json: {} };
 }
 
 /**
@@ -731,6 +926,36 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/pm/find-artifact', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleFindWorkItemForArtifact(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/find-comment', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleFindPmComment(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/create-item', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleCreateWorkItem(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/update-item', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleUpdateWorkItem(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/label', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleAddPmLabel(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/blocked-by', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleAddBlockedBy(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 

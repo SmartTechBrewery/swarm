@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SUPPORTED_DB_FREE_PHASES } from '@/transport/assignment-execution.js';
-import { TRANSPORT_PROTOCOL_VERSION, WS_CLOSE } from '@/transport/protocol.js';
+import { type TaskPhase, TRANSPORT_PROTOCOL_VERSION, WS_CLOSE } from '@/transport/protocol.js';
 import {
 	buildHandshakeRequest,
 	buildHeartbeatFrame,
@@ -67,9 +67,31 @@ describe('buildHandshakeRequest', () => {
 		});
 	});
 
-	// A DB-free daemon declares a strict subset (issue #467): the handshake must carry
-	// exactly what it can run, so the control plane never selects it for `planning`.
+	// A daemon that declares a strict subset must have it carried verbatim (issue
+	// #467), so the control plane never selects it for a phase it refuses. Today's
+	// DB-free daemon declares every phase (`SUPPORTED_DB_FREE_PHASES`, issue #536), so
+	// the narrowed set here is a *pre-#536* daemon's — the version skew this must keep
+	// handling, and the reason the field is not simply assumed to be complete.
 	it('carries a narrowed phase set verbatim without widening it', () => {
+		const legacyDbFreePhases: TaskPhase[] = [
+			'respond-to-ci',
+			'resolve-conflicts',
+			'implementation',
+			'review',
+			'respond-to-review',
+		];
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: legacyDbFreePhases,
+		});
+		expect(request.supportedPhases).toEqual(legacyDbFreePhases);
+		expect(request.supportedPhases).not.toContain('planning');
+	});
+
+	it('carries today’s DB-free repertoire, which is every phase (issue #536)', () => {
 		const request = buildHandshakeRequest({
 			credential: CREDENTIAL,
 			daemonVersion: '0.1.0',
@@ -78,7 +100,7 @@ describe('buildHandshakeRequest', () => {
 			supportedPhases: [...SUPPORTED_DB_FREE_PHASES],
 		});
 		expect(request.supportedPhases).toEqual([...SUPPORTED_DB_FREE_PHASES]);
-		expect(request.supportedPhases).not.toContain('planning');
+		expect(request.supportedPhases).toContain('planning');
 	});
 
 	it('rejects an empty phase set (a daemon that can run nothing is a bug)', () => {

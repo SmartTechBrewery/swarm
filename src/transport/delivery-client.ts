@@ -61,6 +61,21 @@ async function failureMessage(
 	response: { status: number; json: () => Promise<unknown> },
 ): Promise<string> {
 	const base = `Control-plane delivery ${path} failed with status ${response.status}`;
+	// A 404 on a delivery route is the one failure whose cause is a *deployment*
+	// rather than a request: the route does not exist on that control plane, so this
+	// daemon is running a newer build than the server it is enrolled with. Nothing
+	// upstream catches it — `TRANSPORT_PROTOCOL_VERSION` is bumped only when a frame
+	// changes shape (`./protocol.ts`), deliberately, since bumping it would reject
+	// every already-deployed worker at the handshake. So a route added in a later
+	// release reaches an older control plane as a bare 404, and without naming the
+	// cause an operator sees only a status code for what is a one-line fix.
+	if (response.status === 404) {
+		return (
+			`${base}. This control plane does not serve that route, which means it is ` +
+			'running an older build than this worker — update the control plane, or run a ' +
+			'daemon matching it.'
+		);
+	}
 	try {
 		const body = await response.json();
 		const reason =
