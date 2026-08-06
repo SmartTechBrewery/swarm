@@ -112,6 +112,15 @@ function phaseCheckbox(phase: string): HTMLInputElement {
 	return screen.getByRole('checkbox', { name: phase }) as HTMLInputElement;
 }
 
+/**
+ * The declared Pipeline-phases badges in the order they render. Scoped to that one
+ * field, since the same section also stamps the declared agent CLIs.
+ */
+function declaredPhaseBadges(): string[] {
+	const value = screen.getByText('Pipeline phases').nextElementSibling as HTMLElement;
+	return Array.from(value.querySelectorAll('span')).map((badge) => badge.textContent ?? '');
+}
+
 beforeEach(() => {
 	setConsentMutate.mockReset();
 	updateConstraintsMutate.mockReset();
@@ -166,6 +175,36 @@ describe('WorkerDetailView sections (issue #477)', () => {
 		expect(capabilities.getByText('planning')).toBeDefined();
 		expect(capabilities.getByText('implementation')).toBeDefined();
 		expect(capabilities.getByText('review')).toBeDefined();
+	});
+
+	// Issue #548: a remote DB-free daemon declares `[...SUPPORTED_DB_FREE_PHASES]`,
+	// whose `Set` order is written for its own doc comment, while a same-host worker
+	// declares `ALL_TRIGGER_PHASES` — the screen must read the same either way.
+	it('renders the declared phases in the pipeline’s own order, however they arrived', () => {
+		renderWorker({
+			supportedPhases: [
+				'respond-to-ci',
+				'resolve-conflicts',
+				'implementation',
+				'review',
+				'respond-to-review',
+				'planning',
+			],
+		});
+
+		expect(declaredPhaseBadges()).toEqual([
+			'planning',
+			'implementation',
+			'review',
+			'respond to review',
+			'respond to ci',
+			'resolve conflicts',
+		]);
+	});
+
+	it('renders a declared subset in canonical relative order, with no placeholders', () => {
+		renderWorker({ supportedPhases: ['resolve-conflicts', 'implementation'] });
+		expect(declaredPhaseBadges()).toEqual(['implementation', 'resolve conflicts']);
 	});
 
 	it('offers no control for the self-declared capabilities, and says why', () => {
