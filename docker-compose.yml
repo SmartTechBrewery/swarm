@@ -57,6 +57,10 @@ services:
       # worker (which must run `npm run dev:worker` with the same mode). See
       # docs/configuration.md.
       SWARM_DISPATCH_MODE: ${SWARM_DISPATCH_MODE:-in-process}
+      # In transport mode the router owns the BullMQ consumer, so it must receive
+      # the same dispatch-concurrency setting as the host worker. Without this
+      # pass-through it silently uses the resolver's default of one.
+      SWARM_WORKER_CONCURRENCY: ${SWARM_WORKER_CONCURRENCY:-1}
       # Worker-local operator GitHub token (issue #396). The router resolves the
       # implementer identity from it for isSelfAuthored loop-prevention, so it must
       # reach this container too (the host worker + API server read it from .env

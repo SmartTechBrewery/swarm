@@ -116,7 +116,9 @@ npm run dev:worker -- --concurrency 2   # …or run up to N jobs at once
 By default the worker runs one job at a time. Pass `--concurrency <n>` (or set
 `SWARM_WORKER_CONCURRENCY`) to raise it — the flag wins over the env var. This is
 the worker's own cap across every project it serves; a project's **Maximum
-Concurrent Jobs** setting bounds it further per project. See
+Concurrent Jobs** setting bounds it further per project. In `transport` mode the
+router owns the consumer, and Compose passes the same environment setting to it so
+it can dispatch work to multiple eligible workers. See
 [`docs/configuration.md`](docs/configuration.md).
 
 For a worker on a **different machine** from the router, run the remote transport
