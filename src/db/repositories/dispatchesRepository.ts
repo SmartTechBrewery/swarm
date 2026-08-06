@@ -777,6 +777,47 @@ export async function listWaitingDispatches(projectId?: string): Promise<Dispatc
 }
 
 /**
+ * How many runnable dispatches the pool scheduler looks at (issue #533). The read
+ * is ordered by the same dispatch intent as {@link listWaitingDispatches}, so a
+ * backlog deeper than this drops only its lowest-ranked tail — work that would lose
+ * every slot to the rows above it anyway. Bounded because this runs on the dispatch
+ * path: a project sitting on hundreds of pending dispatches must not turn each
+ * selection into a hundred-way match.
+ */
+export const POOL_DEMAND_LIMIT = 50;
+
+/**
+ * The project's runnable dispatches that still need a worker — the demand side of
+ * pool-aware scheduling (issue #533). A dispatch qualifies when it is non-terminal,
+ * has not already claimed a worker (`selectedWorkerId` — one that has consumed that
+ * worker's capacity, which the availability snapshot already reflects), and is due
+ * now rather than scheduled into the future.
+ *
+ * `leased` rows are deliberately included: with the consumer processing several
+ * dispatches at once, the contender that most needs a scarce worker is often one
+ * being gated at this very moment, and both sides matching over the same snapshot is
+ * what lets them agree without a shared lock.
+ */
+export async function listRunnableDispatchesForPool(
+	projectId: string,
+	asOf: Date = new Date(),
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				inArray(dispatches.state, ['pending', 'retry-scheduled', 'leased']),
+				isNull(dispatches.selectedWorkerId),
+				lte(dispatches.availableAt, asOf),
+			),
+		)
+		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt))
+		.limit(POOL_DEMAND_LIMIT);
+}
+
+/**
  * The next capacity-blocked dispatch a freed project slot should wake. With
  * continuation priority on, the oldest SCM continuation wins; otherwise strict
  * FIFO on when the dispatch became pending.

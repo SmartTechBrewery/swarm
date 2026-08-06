@@ -28,13 +28,26 @@
  *    the enrollment's allowed phases (issue #509) → declared/allowed CLI.
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
- * `agents.<phase>.targets` in configured order and, for each, takes the first
+ * `agents.<phase>.targets` in configured order and, for each, takes an
  * eligible worker in the deterministic order. So a higher-priority Codex target
  * wins whenever *some* enrolled worker can run Codex, even if a Claude-only
  * worker is free for a lower-priority Claude target; and a lower-priority target
  * is chosen only when no worker can serve any higher-priority one. It never
  * silently falls back to `targets[0]` — a target no worker can run is skipped,
  * and exhausting the list yields a structured reason, not a blind dispatch.
+ *
+ * **Which of several eligible workers it takes is a pool decision** (issue #533).
+ * "First in the deterministic order" is the right answer only when this dispatch is
+ * the only one in play; with the consumer processing dispatches concurrently it can
+ * spend a scarce capability another runnable phase uniquely needs. So when the
+ * caller supplies the project's other runnable dispatches
+ * ({@link DispatchGateOptions.loadPoolDemands}), the chosen target's eligible
+ * workers are matched against the whole runnable set
+ * (`./pool-scheduling.ts`) and this dispatch takes its share of that matching. The
+ * pool only *reorders the preference* — it never withholds work, never overrides
+ * target priority, and falls back to the first eligible worker whenever the matching
+ * has no slot for this dispatch, so nothing it does can defer a phase that could
+ * otherwise have run.
  *
  * **Every dispatch is gated, including retries and later phases**, because the
  * gate sits on the common dispatch path: consent revoked, an enrollment
@@ -70,6 +83,7 @@ import {
 } from '../identity/worker-enrollment-service.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import type { TriggerPhase } from '../triggers/types.js';
+import { type PoolDemand, selectPooledWorker } from './pool-scheduling.js';
 
 /**
  * Why a *dispatch* was refused — Phase 2's per-worker vocabulary plus the one
@@ -130,9 +144,39 @@ export class WorkerIneligibleError extends Error {
 	}
 }
 
+/**
+ * One runnable dispatch as the pool scheduler sees it (issue #533) — the durable
+ * dispatch plus what it would need to run. The gate turns each into the set of
+ * workers that could serve it, so it can tell a phase only one worker can run from
+ * one that has alternatives.
+ *
+ * A contender's demand is deliberately computed **without** assignee affinity: the
+ * board item an affinity-gated dispatch would narrow by is not on its dispatch row,
+ * and reconstructing it would mean a board read per waiting dispatch. Skipping it
+ * yields a *superset* of the workers that contender can really use, which can only
+ * make it look less constrained than it is — so the gate errs towards keeping its
+ * own first-eligible pick rather than towards diverting for contention that isn't
+ * real.
+ */
+export interface RunnableDispatchDemand {
+	dispatchId: string;
+	phase: TriggerPhase;
+	/** The dispatch's candidate targets in priority order (`resolveTargetPolicy`). */
+	targets: AgentTarget[];
+	/** Its phase's coded default CLI, for a target that names none. */
+	phaseDefaultCli: AgentCli;
+}
+
 /** Everything the gate judges for one dispatch. */
 export interface DispatchGateInput {
 	projectId: string;
+	/**
+	 * The durable dispatch being gated, when there is one. Required for pool
+	 * scheduling — it is how this dispatch recognizes its own share of the matching
+	 * (issue #533) — and absent only for callers with no dispatch row, which keep the
+	 * plain first-eligible pick.
+	 */
+	dispatchId?: string;
 	/** The phase's candidate targets in priority order (never empty — see `resolveTargetPolicy`). */
 	targets: AgentTarget[];
 	/** The phase's coded default CLI, for a target that names none. */
@@ -173,6 +217,16 @@ export interface DispatchGateOptions {
 	 * in-process path, which reads connectivity from the lease alone (unchanged).
 	 */
 	isWorkerConnected?: (workerId: string) => boolean;
+	/**
+	 * The project's runnable dispatches — this one included — in scheduling order
+	 * (issue #533). Supplied as a **lazy loader** rather than a value because it costs
+	 * a query: the gate calls it only once it has found more than one eligible worker
+	 * for the chosen target, which is the only situation in which the answer can
+	 * change anything. Omitted (or resolving to `undefined`, which is how a caller
+	 * reports a failed read) keeps the plain first-eligible pick — a pool read that
+	 * fails must never block a dispatch that is otherwise ready to run.
+	 */
+	loadPoolDemands?: () => Promise<RunnableDispatchDemand[] | undefined>;
 }
 
 /**
@@ -297,6 +351,107 @@ function resolveAvailability(
 }
 
 /**
+ * The workers that could serve one *other* runnable dispatch, under the same
+ * target-priority-first rule this gate applies to its own (issue #533): the first
+ * target any worker can run decides the demand, and the demand is that target's
+ * eligible workers. Judged against every project candidate, since affinity is not
+ * reconstructable here ({@link RunnableDispatchDemand}).
+ */
+function eligibleWorkersForDemand(
+	candidates: WorkerDispatchCandidate[],
+	demand: RunnableDispatchDemand,
+	availabilityOf: (candidate: WorkerDispatchCandidate) => WorkerAvailability,
+): string[] {
+	for (const target of demand.targets) {
+		const eligible = candidates
+			.filter(
+				(candidate) =>
+					evaluateWorkerEligibility({
+						worker: candidate.worker,
+						enrollment: candidate.enrollment,
+						availability: availabilityOf(candidate),
+						target,
+						phaseDefaultCli: demand.phaseDefaultCli,
+						phase: demand.phase,
+					}).eligible,
+			)
+			.map((candidate) => candidate.worker.id);
+		if (eligible.length > 0) return eligible;
+	}
+	return [];
+}
+
+/**
+ * How many runs each connected candidate could still take: its enrollment's
+ * allocation less what it is already executing for this project. The pool matching
+ * needs the *count* rather than the free/busy bit the eligibility predicate returns,
+ * so a worker allocated two slots can serve two runnable dispatches at once.
+ */
+function freeSlotsByWorker(
+	candidates: WorkerDispatchCandidate[],
+	availabilityOf: (candidate: WorkerDispatchCandidate) => WorkerAvailability,
+): Map<string, number> {
+	const slots = new Map<string, number>();
+	for (const candidate of candidates) {
+		const availability = availabilityOf(candidate);
+		if (!availability.connected) continue;
+		const free = candidate.enrollment.concurrencyAllocation - availability.activeRuns;
+		if (free > 0) slots.set(candidate.worker.id, free);
+	}
+	return slots;
+}
+
+/**
+ * Which of this dispatch's eligible workers to take (issue #533). With one
+ * candidate, or without a dispatch id / pool loader, that is the deterministic first
+ * one — today's behaviour. Otherwise the project's runnable dispatches are matched
+ * against the pool's free slots and this dispatch takes its share, falling back to
+ * the first eligible worker whenever the matching left it unplaced: the pool chooses
+ * *between* workers and never withholds one (see `./pool-scheduling.ts`).
+ */
+async function selectEligibleWorker(
+	eligible: readonly [WorkerDispatchCandidate, ...WorkerDispatchCandidate[]],
+	input: DispatchGateInput,
+	options: DispatchGateOptions,
+	candidates: WorkerDispatchCandidate[],
+	availabilityOf: (candidate: WorkerDispatchCandidate) => WorkerAvailability,
+): Promise<WorkerDispatchCandidate> {
+	const [first] = eligible;
+	const dispatchId = input.dispatchId;
+	if (eligible.length === 1 || !dispatchId || !options.loadPoolDemands) return first;
+
+	const runnable = await options.loadPoolDemands();
+	if (!runnable || runnable.length === 0) return first;
+
+	const self: PoolDemand = {
+		dispatchId,
+		// This dispatch's own demand is the gate's own walk — the affinity-narrowed,
+		// override-pinned set it actually selects from — not the reconstruction the
+		// other demands get.
+		eligibleWorkerIds: eligible.map((candidate) => candidate.worker.id),
+	};
+	const demands = runnable.map((demand) =>
+		demand.dispatchId === dispatchId
+			? self
+			: {
+					dispatchId: demand.dispatchId,
+					eligibleWorkerIds: eligibleWorkersForDemand(candidates, demand, availabilityOf),
+				},
+	);
+	// A dispatch missing from its own project's runnable set (its row was claimed, or
+	// the read raced its state transition) ranks last: every demand the caller *did*
+	// report is a known-runnable one, and this dispatch loses nothing by yielding to
+	// them — it still falls back to `first` when the matching has no slot for it.
+	if (!demands.some((demand) => demand.dispatchId === dispatchId)) demands.push(self);
+
+	const pooled = selectPooledWorker(
+		{ demands, freeSlots: freeSlotsByWorker(candidates, availabilityOf) },
+		dispatchId,
+	);
+	return eligible.find((candidate) => candidate.worker.id === pooled) ?? first;
+}
+
+/**
  * Decide whether — and where — this dispatch may run. Reads only; it never
  * mutates an enrollment, session, or run, and it is safe to call again on every
  * retry (which is exactly how revocation between attempts takes effect).
@@ -340,39 +495,52 @@ export async function evaluateDispatchEligibility(
 		};
 	}
 
-	// Target priority first, deterministic worker order second: a configured
-	// preference for a CLI outranks a free worker that can only serve a
-	// lower-priority target.
+	// Target priority first, worker choice second: a configured preference for a CLI
+	// outranks a free worker that can only serve a lower-priority target. Only *which*
+	// of the chosen target's eligible workers wins is a pool decision (issue #533) —
+	// target priority is a hard rule the pool never trades away, so the walk still
+	// stops at the first target any worker can run.
+	const availabilityOf = (candidate: WorkerDispatchCandidate): WorkerAvailability =>
+		resolveAvailability(candidate, options.isWorkerConnected);
 	const reported = new Set<IneligibilityReason>();
 	for (const [targetIndex, target] of input.targets.entries()) {
+		const eligible: WorkerDispatchCandidate[] = [];
 		for (const candidate of permitted) {
 			const verdict = evaluateWorkerEligibility({
 				worker: candidate.worker,
 				enrollment: candidate.enrollment,
-				availability: resolveAvailability(candidate, options.isWorkerConnected),
+				availability: availabilityOf(candidate),
 				target,
 				phaseDefaultCli: input.phaseDefaultCli,
 				phase: input.phase,
 			});
-			if (verdict.eligible) {
-				return {
-					status: 'selected',
-					selection: {
-						workerId: candidate.worker.id,
-						workerName: candidate.worker.displayName,
-						ownerUserId: candidate.worker.ownerUserId,
-						assignedUserId: assigned?.user.id,
-						target,
-						targetIndex,
-						cli: resolveTargetCli(target, input.phaseDefaultCli),
-						skippedClis: input.targets
-							.slice(0, targetIndex)
-							.map((skipped) => resolveTargetCli(skipped, input.phaseDefaultCli)),
-					},
-				};
-			}
-			reported.add(verdict.reason);
+			if (verdict.eligible) eligible.push(candidate);
+			else reported.add(verdict.reason);
 		}
+		const [firstEligible, ...alternatives] = eligible;
+		if (!firstEligible) continue;
+		const chosen = await selectEligibleWorker(
+			[firstEligible, ...alternatives],
+			input,
+			options,
+			candidates,
+			availabilityOf,
+		);
+		return {
+			status: 'selected',
+			selection: {
+				workerId: chosen.worker.id,
+				workerName: chosen.worker.displayName,
+				ownerUserId: chosen.worker.ownerUserId,
+				assignedUserId: assigned?.user.id,
+				target,
+				targetIndex,
+				cli: resolveTargetCli(target, input.phaseDefaultCli),
+				skippedClis: input.targets
+					.slice(0, targetIndex)
+					.map((skipped) => resolveTargetCli(skipped, input.phaseDefaultCli)),
+			},
+		};
 	}
 
 	// An assignee whose own workers are merely busy/offline is the scheduler-level

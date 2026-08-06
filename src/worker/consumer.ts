@@ -170,6 +170,7 @@ import {
 	processMergeAutomationDispatch,
 	requestMergeAutomation,
 } from './merge-automation.js';
+import { loadRunnableDispatchDemands } from './pool-demand.js';
 import {
 	acquireProjectSlot,
 	releaseProjectSlot,
@@ -2958,6 +2959,7 @@ async function gateDispatch(
 	trigger: TriggerResult,
 	job: SwarmJob,
 	implementationUnplanned: boolean,
+	dispatchId: string,
 	gateOptions?: DispatchGateOptions,
 ): Promise<DispatchSelection | undefined> {
 	// Single-user mode routes every phase through the implicit local host worker
@@ -2974,6 +2976,9 @@ async function gateDispatch(
 		decision = await evaluateDispatchEligibility(
 			{
 				projectId: project.id,
+				// Names this dispatch inside the project's runnable set, so pool-aware
+				// selection can hand it its own share of the pool (issue #533).
+				dispatchId,
 				targets: resolveTargetPolicy(phaseConfig, job).targets,
 				phaseDefaultCli: PHASE_DEFAULT_CLI[trigger.phase],
 				// Gates on the worker's declared phase repertoire too, so a phase a
@@ -2985,7 +2990,18 @@ async function gateDispatch(
 				// the unassigned path without one being constructed.
 				pm: workItem?.assignees.length ? requireProjectPMProvider(project) : undefined,
 			},
-			gateOptions,
+			{
+				...gateOptions,
+				// Read only when the gate finds more than one eligible worker, and never
+				// allowed to block the dispatch: a failed read answers `undefined`, which
+				// keeps today's first-eligible pick (issue #533). Resolved after the spread
+				// rather than before it so a caller that carries the key at all — including
+				// one built from a partial where it is present-but-`undefined` — cannot
+				// silently switch pool scheduling off. A caller supplying a real loader
+				// still wins, which is how tests substitute one.
+				loadPoolDemands:
+					gateOptions?.loadPoolDemands ?? (() => loadRunnableDispatchDemands(project)),
+			},
 		);
 	} catch (err) {
 		throw new WorkerIneligibleError(
@@ -3294,6 +3310,7 @@ export async function processJob(
 			trigger,
 			job,
 			implementationUnplanned,
+			dispatch.id,
 			deps.gateOptions,
 		);
 		// Control-plane transport dispatch has no local executor (issue #407): an

@@ -32,6 +32,7 @@ import {
 	type DispatchGateInput,
 	evaluateDispatchEligibility,
 	isAffinityGatedPhase,
+	type RunnableDispatchDemand,
 } from '@/worker/eligibility-gate.js';
 
 const ALICE = '11111111-1111-4111-8111-111111111111';
@@ -548,6 +549,202 @@ describe('evaluateDispatchEligibility', () => {
 			);
 
 			expect(decision).toMatchObject({ status: 'selected', selection: { cli: 'codex' } });
+		});
+	});
+
+	// Issue #533. The gate judges one dispatch, but the project runs several at once,
+	// so "the first eligible worker" can spend a capability another runnable phase
+	// uniquely needs. These pin the pool policy *and* its limits: it reorders the
+	// preference between eligible workers, and nothing more.
+	describe('pool-aware worker selection (issue #533)', () => {
+		/** Every phase but the scarce one, for the machine that cannot plan. */
+		const WITHOUT_PLANNING = ALL_TRIGGER_PHASES.filter((phase) => phase !== 'planning');
+
+		/** The incident's fleet: only `w-a` can plan; either machine can review. */
+		function planningScarceFleet(): WorkerDispatchCandidate[] {
+			return [makeCandidate('w-a'), makeCandidate('w-b', { supportedPhases: WITHOUT_PLANNING })];
+		}
+
+		/** One other runnable dispatch, in the shape the caller reads off the dispatch rows. */
+		function demand(dispatchId: string, phase: DispatchGateInput['phase']): RunnableDispatchDemand {
+			return { dispatchId, phase, targets: [{}], phaseDefaultCli: 'claude' };
+		}
+
+		it('leaves the only planning-capable worker free for a runnable planning dispatch', async () => {
+			listProjectDispatchCandidates.mockResolvedValue(planningScarceFleet());
+			// Review is ranked first — the arrival order that produced the incident, in
+			// which taking `w-a` left Planning with nowhere to run.
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-review', 'review'),
+				demand('d-planning', 'planning'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-review', phase: 'review' }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-b' } });
+		});
+
+		it('reaches the same assignment when the planning dispatch is ranked first', async () => {
+			listProjectDispatchCandidates.mockResolvedValue(planningScarceFleet());
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-planning', 'planning'),
+				demand('d-review', 'review'),
+			]);
+
+			// Planning takes the worker only it can use…
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ dispatchId: 'd-planning', phase: 'planning' }),
+					{
+						loadPoolDemands,
+					},
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+			// …and Review, gating against the same snapshot, still routes around it.
+			expect(
+				await evaluateDispatchEligibility(gateInput({ dispatchId: 'd-review', phase: 'review' }), {
+					loadPoolDemands,
+				}),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-b' } });
+		});
+
+		it('keeps the first eligible worker when nothing else is contending for it', async () => {
+			listProjectDispatchCandidates.mockResolvedValue(planningScarceFleet());
+			const loadPoolDemands = vi.fn(async () => [demand('d-review', 'review')]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-review', phase: 'review' }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+		});
+
+		it('runs anyway on its first eligible worker when the pool has no slot for it', async () => {
+			// Two higher-ranked demands claim both machines. Yielding would idle a worker
+			// this dispatch can use for a dispatch whose wake-up may not have fired, so
+			// the pool's answer is a preference, not a refusal.
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-a'), makeCandidate('w-b')]);
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-first', 'review'),
+				demand('d-second', 'review'),
+				demand('d-self', 'review'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-self', phase: 'review' }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+		});
+
+		it('never trades target priority for pool utilisation', async () => {
+			// The preferred codex target runs only on `w-a`, which the planning dispatch
+			// also needs. Target priority is a hard rule, so Review still takes `w-a` and
+			// Planning waits — the pool chooses between workers, never between targets.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a', { capabilities: ['claude', 'codex'] }),
+				makeCandidate('w-b', { capabilities: ['claude'], supportedPhases: WITHOUT_PLANNING }),
+			]);
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-review', 'review'),
+				demand('d-planning', 'planning'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({
+					dispatchId: 'd-review',
+					phase: 'review',
+					targets: [{ cli: 'codex' }, { cli: 'claude' }],
+				}),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-a', targetIndex: 0, cli: 'codex' },
+			});
+		});
+
+		it('spends nothing on the pool read when only one worker is eligible', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a'),
+				makeCandidate('w-busy', { activeRuns: 1 }),
+			]);
+			const loadPoolDemands = vi.fn(async () => [demand('d-self', 'review')]);
+
+			await evaluateDispatchEligibility(gateInput({ dispatchId: 'd-self', phase: 'review' }), {
+				loadPoolDemands,
+			});
+
+			expect(loadPoolDemands).not.toHaveBeenCalled();
+		});
+
+		it('keeps today’s pick when the pool read is unavailable or the dispatch is unnamed', async () => {
+			listProjectDispatchCandidates.mockResolvedValue(planningScarceFleet());
+			// A failed read reports `undefined` — scheduling preference must never be the
+			// reason a ready dispatch waits.
+			const loadPoolDemands = vi.fn(async () => undefined);
+
+			expect(
+				await evaluateDispatchEligibility(gateInput({ dispatchId: 'd-review', phase: 'review' }), {
+					loadPoolDemands,
+				}),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+			// And a caller with no dispatch row cannot recognise its own share, so it does
+			// not read the pool at all.
+			expect(
+				await evaluateDispatchEligibility(gateInput({ phase: 'review' }), { loadPoolDemands }),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+			expect(loadPoolDemands).toHaveBeenCalledTimes(1);
+		});
+
+		it('fills a worker’s spare allocation before diverting to another machine', async () => {
+			// `w-a` is allocated two slots and running one, so it can still serve both the
+			// review and the planning dispatch — there is no scarcity to preserve.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a', { enrollment: { concurrencyAllocation: 2 }, activeRuns: 0 }),
+				makeCandidate('w-b', { supportedPhases: WITHOUT_PLANNING }),
+			]);
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-review', 'review'),
+				demand('d-planning', 'planning'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-review', phase: 'review' }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+		});
+
+		it('holds an affinity-gated dispatch to its assignee’s worker under contention', async () => {
+			// The pool may only reorder *eligible* workers: Alice's item cannot be routed
+			// to Bob's machine to make room, so it takes hers and the contender waits.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-alice', { ownerUserId: ALICE }),
+				makeCandidate('w-bob', { ownerUserId: BOB }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-other', 'review'),
+				demand('d-self', 'implementation'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-self', workItem: ASSIGNED_ITEM, pm: PM }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-alice', assignedUserId: ALICE },
+			});
 		});
 	});
 
