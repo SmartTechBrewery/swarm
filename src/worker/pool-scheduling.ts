@@ -31,11 +31,19 @@
  * Pure and dependency-light, in the shape of `src/identity/worker-eligibility.ts`
  * and `src/pm/dependencies.ts`: eligibility, capacity, and rank are resolved by the
  * caller and passed in, so the policy holds no I/O and is deterministic — the same
- * snapshot always yields the same assignment, which is what lets two dispatches
- * gating concurrently agree on who takes which worker without a shared lock. The
- * atomic claim (`claimWorkerForDispatch`) remains the only authority on capacity;
- * this is a read-side preference, so a raced snapshot costs at most one deferral
- * exactly as it does today.
+ * input always yields the same assignment.
+ *
+ * **Determinism is not agreement between concurrent gates, and this does not need
+ * it to be.** Each gate substitutes its *own* affinity-narrowed eligible set for
+ * itself while reconstructing every contender as a superset, so two gates running
+ * against the same database snapshot are not solving the same instance and can pick
+ * the same worker: with slots on A and B, a higher-ranked D1 truly confined to B
+ * (its superset says `A,B`) and a D2 eligible on both, the gate judging D1 takes B
+ * and the gate judging D2 also takes B. What makes that harmless is the *next* two
+ * properties rather than agreement — the atomic claim
+ * (`claimWorkerForDispatch`) remains the only authority on capacity, and this is a
+ * read-side preference that never withholds work, so a collision costs at most the
+ * one deferral a raced claim costs today.
  */
 
 /** One runnable dispatch's demand on the pool: what it is, and what could serve it. */

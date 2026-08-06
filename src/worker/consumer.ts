@@ -2991,11 +2991,16 @@ async function gateDispatch(
 				pm: workItem?.assignees.length ? requireProjectPMProvider(project) : undefined,
 			},
 			{
+				...gateOptions,
 				// Read only when the gate finds more than one eligible worker, and never
 				// allowed to block the dispatch: a failed read answers `undefined`, which
-				// keeps today's first-eligible pick (issue #533).
-				loadPoolDemands: () => loadRunnableDispatchDemands(project),
-				...gateOptions,
+				// keeps today's first-eligible pick (issue #533). Resolved after the spread
+				// rather than before it so a caller that carries the key at all — including
+				// one built from a partial where it is present-but-`undefined` — cannot
+				// silently switch pool scheduling off. A caller supplying a real loader
+				// still wins, which is how tests substitute one.
+				loadPoolDemands:
+					gateOptions?.loadPoolDemands ?? (() => loadRunnableDispatchDemands(project)),
 			},
 		);
 	} catch (err) {
