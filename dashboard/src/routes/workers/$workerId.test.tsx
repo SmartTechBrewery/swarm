@@ -62,8 +62,9 @@ vi.mock('../__root.js', () => ({
 	rootRoute: createRootRoute({ component: () => <Outlet /> }),
 }));
 
+import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import { workerDetailRoute } from './$workerId.js';
-import { WORKERS_REFETCH_MS, workersRoute } from './index.js';
+import { workersRoute } from './index.js';
 
 function makeRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
 	return {

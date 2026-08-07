@@ -4,9 +4,9 @@ import { Server } from 'lucide-react';
 import { WorkerDetailView } from '@/components/workers/worker-detail.js';
 import { trpc } from '@/lib/trpc.js';
 import { projectDisabledPhases } from '@/lib/worker-enrollment-phases.js';
+import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { WorkerDetail } from '@/types/workers.js';
 import { rootRoute } from '../__root.js';
-import { WORKERS_REFETCH_MS } from './index.js';
 
 /**
  * The **worker detail** screen (issue #477) — one machine in full, reached by

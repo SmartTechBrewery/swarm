@@ -1,11 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import {
 	agentConfigSearch,
+	PROJECT_TABS,
 	phaseDetailSearch,
 	projectDetailSearchSchema,
 	resolveActiveTab,
 	tabSearch,
 } from './project-nav.js';
+
+describe('PROJECT_TABS', () => {
+	// Issue #574: the Workers tab is the project-scoped worker roster and belongs
+	// directly after Runs, ahead of the configuration tabs.
+	it('lists the tabs in display order with Workers directly after Runs', () => {
+		expect([...PROJECT_TABS]).toEqual([
+			'runs',
+			'workers',
+			'general',
+			'agents',
+			'pipeline',
+			'projectManagement',
+			'credentials',
+		]);
+	});
+});
 
 describe('projectDetailSearchSchema', () => {
 	it('parses a valid tab and phase (a phase-details link)', () => {
@@ -37,6 +54,13 @@ describe('projectDetailSearchSchema', () => {
 		});
 	});
 
+	it('round-trips the Workers tab (issue #574)', () => {
+		expect(projectDetailSearchSchema.parse({ tab: 'workers' })).toEqual({
+			tab: 'workers',
+			phase: undefined,
+		});
+	});
+
 	it('strips unknown params', () => {
 		expect(projectDetailSearchSchema.parse({ tab: 'pipeline', extra: 'x' })).toEqual({
 			tab: 'pipeline',
@@ -52,6 +76,7 @@ describe('resolveActiveTab', () => {
 
 	it('honors an explicit tab', () => {
 		expect(resolveActiveTab({ tab: 'pipeline' })).toBe('pipeline');
+		expect(resolveActiveTab({ tab: 'workers' })).toBe('workers');
 	});
 
 	it('resolves a phase-details deep link without a tab to the Agent Configuration tab', () => {

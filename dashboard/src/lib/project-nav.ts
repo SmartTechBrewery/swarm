@@ -19,13 +19,17 @@ export const PROJECT_PHASES = [
 export type ProjectPhase = (typeof PROJECT_PHASES)[number];
 
 /**
- * The tabs on the project-detail screen, in display order. `projectManagement` was
- * `boardMapping` until issue #537 widened that tab from a board mapping into the
- * whole PM setup (provider, credentials, board, status mapping);
- * {@link LEGACY_TAB_ALIASES} keeps old links working.
+ * The tabs on the project-detail screen, in display order. `workers` (issue #574)
+ * is the project-scoped worker roster and sits directly after `runs`, ahead of the
+ * configuration tabs — the two read-only views of what the project is *doing* come
+ * before how it is set up. `projectManagement` was `boardMapping` until issue #537
+ * widened that tab from a board mapping into the whole PM setup (provider,
+ * credentials, board, status mapping); {@link LEGACY_TAB_ALIASES} keeps old links
+ * working.
  */
 export const PROJECT_TABS = [
 	'runs',
+	'workers',
 	'general',
 	'agents',
 	'pipeline',

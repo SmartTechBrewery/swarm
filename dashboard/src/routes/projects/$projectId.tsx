@@ -9,8 +9,10 @@ import {
 	GitBranch,
 	GitMerge,
 	Loader2,
+	type LucideIcon,
 	Play,
 	Plus,
+	Server,
 	Settings,
 	SquareKanban,
 	Trash2,
@@ -22,6 +24,7 @@ import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
 import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
+import { WorkersRoster } from '@/components/workers/workers-roster.js';
 import {
 	addTarget,
 	areTargetsDirty,
@@ -1753,6 +1756,51 @@ export function diffProjectForSync(
 	};
 }
 
+/**
+ * The project-detail tabs in display order, each with the icon and label it
+ * renders. Ordered to match `PROJECT_TABS` (`lib/project-nav.ts`), which is the
+ * URL vocabulary — a test asserts the two agree, so the rendered order and the
+ * `?tab=` values can't drift apart.
+ */
+const PROJECT_TAB_ITEMS: ReadonlyArray<{ tab: ProjectTab; label: string; icon: LucideIcon }> = [
+	{ tab: 'runs', label: 'Runs', icon: Play },
+	{ tab: 'workers', label: 'Workers', icon: Server },
+	{ tab: 'general', label: 'Settings', icon: Settings },
+	{ tab: 'agents', label: 'Agent Configuration', icon: Cpu },
+	{ tab: 'pipeline', label: 'Pipeline', icon: GitMerge },
+	{ tab: 'projectManagement', label: 'Project Management', icon: SquareKanban },
+	{ tab: 'credentials', label: 'Source Control', icon: GitBranch },
+];
+
+/** The horizontal tab bar, rendered from {@link PROJECT_TAB_ITEMS}. */
+export function ProjectTabBar({
+	activeTab,
+	onSelect,
+}: {
+	activeTab: ProjectTab;
+	onSelect: (tab: ProjectTab) => void;
+}) {
+	return (
+		<div className="flex border-b border-zinc-800">
+			{PROJECT_TAB_ITEMS.map(({ tab, label, icon: Icon }) => (
+				<button
+					key={tab}
+					type="button"
+					onClick={() => onSelect(tab)}
+					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
+						activeTab === tab
+							? 'border-violet-500 text-white bg-zinc-800/20'
+							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
+					}`}
+				>
+					<Icon className="h-4 w-4 text-violet-400" />
+					{label}
+				</button>
+			))}
+		</div>
+	);
+}
+
 function ProjectDetailRouteComponent() {
 	const { projectId } = projectDetailRoute.useParams();
 	// The active tab and the open Agent Configuration phase live in the URL so each
@@ -2177,82 +2225,13 @@ function ProjectDetailRouteComponent() {
 			</div>
 
 			{/* Horizontal Tab Bar */}
-			<div className="flex border-b border-zinc-800">
-				<button
-					type="button"
-					onClick={() => goToTab('runs')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'runs'
-							? 'border-violet-500 text-white bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<Play className="h-4 w-4 text-violet-400" />
-					Runs
-				</button>
-				<button
-					type="button"
-					onClick={() => goToTab('general')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'general'
-							? 'border-violet-500 text-white bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<Settings className="h-4 w-4 text-violet-400" />
-					Settings
-				</button>
-				<button
-					type="button"
-					onClick={() => goToTab('agents')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'agents'
-							? 'border-violet-500 text-white bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<Cpu className="h-4 w-4 text-violet-400" />
-					Agent Configuration
-				</button>
-				<button
-					type="button"
-					onClick={() => goToTab('pipeline')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'pipeline'
-							? 'border-violet-500 text-white bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<GitMerge className="h-4 w-4 text-violet-400" />
-					Pipeline
-				</button>
-				<button
-					type="button"
-					onClick={() => goToTab('projectManagement')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'projectManagement'
-							? 'border-violet-500 text-white bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<SquareKanban className="h-4 w-4 text-violet-400" />
-					Project Management
-				</button>
-				<button
-					type="button"
-					onClick={() => goToTab('credentials')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'credentials'
-							? 'border-violet-500 text-white bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<GitBranch className="h-4 w-4 text-violet-400" />
-					Source Control
-				</button>
-			</div>
+			<ProjectTabBar activeTab={activeTab} onSelect={goToTab} />
 
 			{activeTab === 'runs' && <ProjectRunsPanel projectId={projectId} />}
+
+			{/* This project's worker roster (issue #574) — the same component `/workers`
+			    renders, scoped server-side to the machines enrolled here. */}
+			{activeTab === 'workers' && <WorkersRoster projectId={projectId} />}
 
 			{/* Form Card - General Settings */}
 			{activeTab === 'general' && (
