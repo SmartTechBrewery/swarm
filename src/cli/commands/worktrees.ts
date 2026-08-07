@@ -15,9 +15,10 @@ Usage: swarm worktrees prune [--project <id>] [--dry-run]
   --project <id>   Only sweep this project (default: all configured projects)
   --dry-run        Report what would be pruned without removing anything
 
-Requires DATABASE_URL (project config) and REDIS_URL (in-flight check) in the
-environment — run via \`npm run worktrees:prune\` (loads .env) or export them
-yourself first.`;
+Requires DATABASE_URL (project config) in the environment — run via
+\`npm run worktrees:prune\` (loads .env) or export it yourself first. The
+in-flight check also needs REDIS_URL in SWARM_DISPATCH_MODE=in-process; in
+transport mode it reads host-local \`.swarm-state\` leases instead.`;
 
 /**
  * Print a labelled `<label>: <count>` line followed by each entry, or nothing

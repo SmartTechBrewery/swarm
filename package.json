@@ -23,7 +23,7 @@
 		"build": "tsc && tsc-alias",
 		"start": "node dist/index.js",
 		"start:api": "npm run build:dashboard && npm run dev:api",
-		"reload": "npm install && npm --prefix dashboard install && npm run build:dashboard && npm run db:migrate && echo '[reload] deps synced, dashboard rebuilt (served live by the running API), migrations applied. Restart the worker (npm run dev:worker) and rebuild the router (docker compose up -d --build router) if their code changed.'",
+		"reload": "npm install && npm --prefix dashboard install && npm run build:dashboard && npm run db:migrate && echo '[reload] deps synced, dashboard rebuilt (served live by the running API), migrations applied. Restart the worker (npm run dev:worker, or dev:worker:legacy in in-process mode) and rebuild the router (docker compose up -d --build router) if their code changed.'",
 		"start:worker": "node --env-file-if-exists=.env dist/transport/connect-entry.js",
 		"start:worker:legacy": "npm run db:migrate && node --env-file=.env dist/worker/index.js",
 		"worker": "npm run build && npm run start:worker",

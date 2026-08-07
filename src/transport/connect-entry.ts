@@ -44,7 +44,12 @@ import { fileURLToPath } from 'node:url';
 // connection at load (`getDb()` is lazy, `src/db/client.ts`), so this process still
 // connects to neither.
 import '../integrations/entrypoint.js';
-import { requireEnv, resolveOperatorGitHubToken, resolveWorkerRepoRoot } from '../lib/env.js';
+import {
+	assertTransportDispatchMode,
+	requireEnv,
+	resolveOperatorGitHubToken,
+	resolveWorkerRepoRoot,
+} from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import {
@@ -73,6 +78,13 @@ function resolveDaemonVersion(): string {
 }
 
 async function main(): Promise<void> {
+	// Refuse to start outside `transport` mode (issue #551 F1) — the mirror image
+	// of `../worker/index.ts`'s own guard. Without it, this entry point connects
+	// and heartbeats successfully in the default `in-process` mode while nothing
+	// consumes `swarm-jobs`, so the operator sees a healthy connected worker and
+	// every job just sits `waiting`.
+	assertTransportDispatchMode();
+
 	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
 	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
 	// The operator's own GitHub token, held only on this machine — the identity

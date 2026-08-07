@@ -91,7 +91,7 @@ The one that changes behaviour meaningfully is **#437**. It added:
 
 **The DB-free path is opt-in and, by default, dormant.** `runAssignmentDbFree` has
 exactly one caller — `src/transport/connect-entry.ts`, i.e. `npm run
-dev:worker:connect` — and assignments only get pushed to it when
+dev:worker` — and assignments only get pushed to it when
 `SWARM_DISPATCH_MODE=transport` on both the router and the worker (default
 `in-process`). If you leave dispatch in-process and do not run the remote worker,
 **none of #437's new behaviour executes**; the delivery routes sit unused.

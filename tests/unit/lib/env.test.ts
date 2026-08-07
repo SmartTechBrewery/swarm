@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+	assertTransportDispatchMode,
 	isSingleUserMode,
 	optionalEnv,
 	requireEnv,
@@ -106,5 +107,19 @@ describe('resolveWorkerRepoRoot', () => {
 
 	it('defaults to the daemon working directory', () => {
 		expect(resolveWorkerRepoRoot('', '/worker/swarm')).toBe('/worker/swarm');
+	});
+});
+
+describe('assertTransportDispatchMode', () => {
+	it('returns normally for transport', () => {
+		expect(() => assertTransportDispatchMode('transport')).not.toThrow();
+	});
+
+	it('throws (naming dev:worker:legacy) when unset', () => {
+		expect(() => assertTransportDispatchMode('')).toThrow(/dev:worker:legacy/);
+	});
+
+	it('throws (naming dev:worker:legacy) for an explicit in-process value', () => {
+		expect(() => assertTransportDispatchMode('in-process')).toThrow(/dev:worker:legacy/);
 	});
 });

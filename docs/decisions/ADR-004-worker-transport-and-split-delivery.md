@@ -166,7 +166,7 @@ a preserved-checkout pin, and `repoRoot` describe one machine's filesystem; no
 other host can observe or act on that checkout, so centralizing them in Redis or
 Postgres creates false cross-host coupling. Remote execution therefore coordinates
 worktrees with atomic filesystem locks and preservation pins under its own
-`worktreeRoot`, while the same-host path retains its existing store-backed runtime.
+`worktreeRoot`, while the in-process path retains its existing store-backed runtime.
 The control plane omits `repoRoot` from `TaskAssignment`; the daemon resolves its
 own checkout with `SWARM_WORKER_REPO_ROOT` (default cwd). Shared collision policy
 still fails closed in the same order (live lease, resumable pin, dirty, unpushed).
@@ -185,7 +185,7 @@ filesystem, and both are load-bearing rather than defensive polish:
   the timestamp covers what liveness cannot see. Expiring a *marker* never
   force-removes work — the reclaim gate behind it still refuses a dirty or
   unpushed checkout.
-- **Repository identity.** `repoRoot` came from the project config, so a same-host
+- **Repository identity.** `repoRoot` came from the project config, so an in-process
   worker's checkout matched the assignment by construction. A remote daemon
   resolves one path from its own environment and reuses it for **every** project
   it is enrolled in, so "is a git repository" stopped being a sufficient sanity

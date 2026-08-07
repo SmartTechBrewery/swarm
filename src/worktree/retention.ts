@@ -33,7 +33,11 @@ export function retentionWorktreeRuntime(
 ): WorktreeRuntime {
 	if (dispatchMode !== 'transport') return storeBackedWorktreeRuntime;
 	return createHostLocalWorktreeRuntime({
-		repoRoot: project.repoRoot,
+		// Canonicalized so a symlinked or otherwise aliased `repoRoot` spelling still
+		// derives the same `.swarm-state` path the worker itself writes to
+		// (`../transport/assignment-execution.ts`, issue #551 F5) — `resolve()` alone
+		// normalizes relative segments and trailing separators, not symlinks.
+		repoRoot: canonicalize(project.repoRoot),
 		worktreeRoot: project.worktreeRoot,
 		ownerId: `worktree-retention-sweep:${process.pid}`,
 		isOwnerLive: () => true,

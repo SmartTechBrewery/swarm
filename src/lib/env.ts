@@ -139,3 +139,19 @@ export function resolveDispatchMode(raw = process.env.SWARM_DISPATCH_MODE): Disp
 	if (value === 'transport') return 'transport';
 	throw new Error(`SWARM_DISPATCH_MODE must be 'in-process' or 'transport', got '${raw}'`);
 }
+
+/**
+ * Refuse to continue unless the dispatch mode is `transport` — the mirror image
+ * of `../worker/index.ts`'s own guard against the opposite mode. Called at the
+ * top of `../transport/connect-entry.ts`'s `main()` (issue #551) so that entry
+ * point is loud about the mode it does not serve too: without it, starting the
+ * transport worker in the default `in-process` mode connects and heartbeats
+ * successfully while no process consumes `swarm-jobs`, leaving every job
+ * `waiting` with nothing to diagnose from.
+ */
+export function assertTransportDispatchMode(raw = process.env.SWARM_DISPATCH_MODE): void {
+	if (resolveDispatchMode(raw) === 'transport') return;
+	throw new Error(
+		"SWARM_DISPATCH_MODE is 'in-process' (the default), which this transport entry point does not serve — refusing to start. Run this host's worker with `npm run dev:worker:legacy` (src/worker/index.ts) instead, or set SWARM_DISPATCH_MODE=transport on both the router and this host to use `npm run dev:worker` (src/transport/connect-entry.ts).",
+	);
+}
