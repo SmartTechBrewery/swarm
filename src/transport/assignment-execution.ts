@@ -4,20 +4,23 @@
  * both the same-host and remote executors share.
  *
  * `../worker/transport-client.ts` runs an assignment on a host **with**
- * `DATABASE_URL` (persona tokens from Postgres, live output persisted to
- * `run_output_events`, cancellation via Redis). This module adds the **remote**
- * counterpart, {@link runAssignmentDbFree}, which runs entirely from the
- * assignment itself: the project config is reconstructed from the non-secret
- * slice (`./db-free-project.ts`), source-carrying delivery uses the operator's
- * own credential through the registered SCM provider
+ * `DATABASE_URL` (persona tokens from Postgres, cancellation via Redis). This
+ * module adds the **remote** counterpart, {@link runAssignmentDbFree}, which runs
+ * entirely from the assignment itself: the project config is reconstructed from
+ * the non-secret slice (`./db-free-project.ts`), source-carrying delivery uses the
+ * operator's own credential through the registered SCM provider
  * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`), the two kinds of
  * metadata write the operator token *cannot* perform — a review under the
  * project's reviewer PAT, a board write under its PM credential — ride the
- * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2), live
- * output streams over the transport only (no DB write), and cancellation rides
- * the shutdown signal alone (no Redis). A supported-phase gate cleanly fails any
- * phase not yet runnable this way, so a premature push fails with a clear result
- * rather than crashing on a DB/Redis access.
+ * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2), and
+ * cancellation rides the shutdown signal alone (no Redis). A supported-phase gate
+ * cleanly fails any phase not yet runnable this way, so a premature push fails
+ * with a clear result rather than crashing on a DB/Redis access.
+ *
+ * Live output is the one thing neither executor persists: both stream it as
+ * `stream-log` frames and the control plane writes it to `run_output_events`
+ * (`../router/stream-log-persistence.ts`), so a run's output looks the same
+ * wherever it ran.
  *
  * The pure helpers (`fromAssignedWorkItem`, `createAssignmentRunAgent`,
  * `classifyDeferrable`, `succeededResult`, `deferrableOrFailedResult`) live here
@@ -68,6 +71,21 @@ import type { AssignmentSink, TransportLogger } from './worker-client.js';
 const BATCH_MS = 100;
 const BATCH_SIZE = 100;
 
+/**
+ * How long a Claude run may stay silent before the live log says so (issue #356).
+ * Claude can work for minutes without emitting a readable event (one long tool
+ * call), and on the run page that is indistinguishable from a hung process. It
+ * lives here, on the streaming wrapper both executors share, rather than in the
+ * worker-local batcher that used to append it: since the control plane owns the
+ * `run_output_events` write (`../router/stream-log-persistence.ts`), a line only
+ * reaches the run page by travelling as a `stream-log` — which is also what finally
+ * gives a remote worker the heartbeat. The in-process BullMQ path keeps its own
+ * copy in `../worker/live-output.ts`, which does not go through this wrapper.
+ * Claude-only, and an internal constant rather than a setting: it exists to make
+ * "alive" legible, not to be tuned.
+ */
+const HEARTBEAT_MS = 30_000;
+
 /** Map the transport's serialization subset back to a PM `WorkItem` for the phase runner. */
 export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
 	return {
@@ -91,10 +109,15 @@ export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
 /**
  * Wrap an agent runner so every emitted line is forwarded to the control plane
  * as a batched `StreamLog` frame — the transport analogue of
- * `../worker/live-output.ts`'s DB batcher. `base` is the underlying runner: the
- * same-host client passes its `run_output_events` batcher (DB access), the
- * DB-free executor passes the raw `runAgentCli` so lines stream over the wire
- * *only*. Injectable so a test can drive the forwarding without a real CLI.
+ * `../worker/live-output.ts`'s DB batcher, and, since the control plane took over
+ * the `run_output_events` write (`../router/stream-log-persistence.ts`), the only
+ * way a transport-dispatched run's output reaches the run page. `base` is the
+ * underlying runner: **both** executors pass the raw `runAgentCli`, so neither
+ * persists locally and no line is written twice. Injectable so a test can drive
+ * the forwarding without a real CLI.
+ *
+ * A silent Claude run emits the {@link HEARTBEAT_MS} "still running" line as an
+ * ordinary streamed line, so it lands in the same output stream as everything else.
  */
 export function createAssignmentRunAgent(
 	assignment: TaskAssignment,
@@ -104,6 +127,7 @@ export function createAssignmentRunAgent(
 	return async (options) => {
 		let queue: StreamLogLine[] = [];
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
 		const flush = (): void => {
 			if (timer) {
 				clearTimeout(timer);
@@ -125,14 +149,30 @@ export function createAssignmentRunAgent(
 			if (queue.length >= BATCH_SIZE) flush();
 			else timer ??= setTimeout(flush, BATCH_MS);
 		};
+		const stopHeartbeat = (): void => {
+			if (heartbeatTimer) clearTimeout(heartbeatTimer);
+			heartbeatTimer = undefined;
+		};
+		const armHeartbeat = (): void => {
+			if (options.cli !== 'claude') return;
+			stopHeartbeat();
+			heartbeatTimer = setTimeout(() => {
+				enqueue('stdout', `Still running — no output for ${HEARTBEAT_MS / 1_000}s.`);
+				armHeartbeat();
+			}, HEARTBEAT_MS);
+		};
+
+		armHeartbeat();
 		try {
 			return await base({
 				...options,
 				onStdout: (line) => {
+					armHeartbeat();
 					options.onStdout?.(line);
 					enqueue('stdout', line);
 				},
 				onStderr: (line) => {
+					armHeartbeat();
 					options.onStderr?.(line);
 					enqueue('stderr', line);
 				},
@@ -140,6 +180,8 @@ export function createAssignmentRunAgent(
 		} finally {
 			// Flush whatever the run produced before it settled, even on the throwing
 			// paths — the same "preserve the last output" contract `../worker/live-output.ts` keeps.
+			// Stop the heartbeat first, so a settled run never emits one more line.
+			stopHeartbeat();
 			flush();
 		}
 	};
@@ -567,8 +609,8 @@ function buildDbFreePhaseInputs({
 		runId: assignment.runId,
 		worktrees,
 		signal,
-		// Non-persisting base: lines stream over the transport only — this worker
-		// has no `run_output_events` table to write to.
+		// Non-persisting base: lines stream over the transport and the control plane
+		// writes them — this worker has no `run_output_events` table to write to.
 		runAgent: createAssignmentRunAgent(assignment, sink, baseRunAgent),
 		workItem: assignment.workItem ? fromAssignedWorkItem(assignment.workItem) : undefined,
 		resumeExistingBranch: assignment.implementationBranchProvisioned === true,

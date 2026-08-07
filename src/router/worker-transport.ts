@@ -55,6 +55,7 @@ import { logger } from '../lib/logger.js';
 import {
 	type ControlPlaneMessage,
 	HandshakeRequestSchema,
+	type StreamLog,
 	type TaskAssignmentAck,
 	type TaskExecutionResult,
 	type TaskProgress,
@@ -68,6 +69,7 @@ import {
 	deliverDispatchProgress,
 	deliverDispatchResult,
 } from './dispatch-results.js';
+import { persistStreamLog } from './stream-log-persistence.js';
 import { deregisterConnection, registerConnection } from './worker-connections.js';
 
 // The application-defined WebSocket close codes are part of the wire contract, so
@@ -109,6 +111,13 @@ export interface WorkerTransportDeps {
 	deliverDispatchResult: (result: TaskExecutionResult) => boolean;
 	deliverDispatchProgress: (progress: TaskProgress) => void;
 	deliverDispatchAck: (ack: TaskAssignmentAck) => void;
+	/**
+	 * Write a batch of streamed agent output to the run's output stream
+	 * (`./stream-log-persistence.ts`). The control plane owns this write for every
+	 * worker — a federated one has no database to make it itself. Fire-and-forget
+	 * by contract: it returns `void` so the frame handler never blocks on Postgres.
+	 */
+	persistStreamLog: (frame: StreamLog) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -123,6 +132,7 @@ function defaultDeps(): WorkerTransportDeps {
 		deliverDispatchResult,
 		deliverDispatchProgress,
 		deliverDispatchAck,
+		persistStreamLog,
 	};
 }
 
@@ -269,8 +279,9 @@ export type WorkerStreamAction =
  * (4408). The split-delivery back-channel frames (assignment ack, coarse progress,
  * execution result — ADR-003 §2, issue #407) are routed to the control-plane
  * dispatcher awaiting that dispatch's result (`./dispatch-results.ts`) and keep the
- * socket open; a `stream-log` is ignored here (the same-host worker already
- * persisted its output locally). None of these touch the lease.
+ * socket open; a `stream-log` goes to the run-output sink
+ * (`./stream-log-persistence.ts`), which the control plane owns for every worker.
+ * None of these touch the lease.
  */
 export async function handleWorkerStreamFrame(
 	deps: WorkerTransportDeps,
@@ -308,10 +319,14 @@ export async function handleWorkerStreamFrame(
 		return { action: 'ignore' };
 	}
 	if (frame.type === 'stream-log') {
-		// The same-host worker already persisted its output to `run_output_events`
-		// locally (`../worker/live-output.ts`), so this router-side copy would only
-		// double-persist — ignore it. A future DB-less remote worker's output would
-		// be persisted here instead.
+		// Persist the batch to `run_output_events` here rather than on the worker:
+		// a federated worker holds no `DATABASE_URL`, so this is the only place a
+		// remote run's live output can be written at all, and the same-host executor
+		// no longer writes it locally — so there is no second copy. The call returns
+		// immediately (the write runs on the run's own chain), keeping the socket
+		// non-blocking, and the frame still resolves to `ignore` so the connection
+		// lifecycle is untouched.
+		deps.persistStreamLog(frame);
 		return { action: 'ignore' };
 	}
 	if (frame.fencingToken !== ctx.fencingToken) {

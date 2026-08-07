@@ -1,9 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { AgentCliResult } from '@/harness/agent-cli.js';
+import type { AgentCliResult, runAgentCli } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
@@ -16,6 +16,7 @@ import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import {
+	createAssignmentRunAgent,
 	deferrableOrFailedResult,
 	runAssignmentDbFree,
 	SUPPORTED_DB_FREE_PHASES,
@@ -927,5 +928,122 @@ describe('runAssignmentDbFree', () => {
 		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'deferred', failureKind: 'timeout' });
+	});
+});
+
+/**
+ * The streaming wrapper both executors compose. Since the control plane owns the
+ * `run_output_events` write (`@/router/stream-log-persistence.js`), a `stream-log`
+ * line is the only way anything reaches the run page — which is why the silence
+ * heartbeat (issue #356) lives here rather than in the worker-local batcher, and
+ * why a remote worker gets it at all.
+ */
+describe('createAssignmentRunAgent silence heartbeat', () => {
+	beforeEach(() => vi.useFakeTimers());
+	afterEach(() => vi.useRealTimers());
+
+	/** Every line streamed so far, across batches, in order. */
+	function streamed(sink: ReturnType<typeof recordingSink>): string[] {
+		return sink.sent
+			.filter((f) => f.type === 'stream-log')
+			.flatMap((f) => f.lines as Array<{ content: string }>)
+			.map((l) => l.content);
+	}
+
+	/** A base runner that stays pending until the test finishes it. */
+	function pendingBase(): {
+		base: typeof runAgentCli;
+		emit: (line: string) => void;
+		finish: () => void;
+	} {
+		let onStdout: ((line: string) => void) | undefined;
+		let resolve: ((result: AgentCliResult) => void) | undefined;
+		const base = ((options: { onStdout?: (line: string) => void }) => {
+			onStdout = options.onStdout;
+			return new Promise<AgentCliResult>((r) => {
+				resolve = r;
+			});
+		}) as unknown as typeof runAgentCli;
+		return {
+			base,
+			emit: (line) => onStdout?.(line),
+			finish: () => resolve?.(agentResult()),
+		};
+	}
+
+	it('streams a still-running line for a silent claude run, and stops once it settles', async () => {
+		const sink = recordingSink();
+		const { base, finish } = pendingBase();
+		const run = createAssignmentRunAgent(
+			ciAssignment(),
+			sink,
+			base,
+		)({
+			cli: 'claude',
+			args: [],
+			cwd: '/wt',
+		});
+
+		// A little past each interval, so the heartbeat's own batch window flushes.
+		await vi.advanceTimersByTimeAsync(30_100);
+		await vi.advanceTimersByTimeAsync(30_100);
+		expect(streamed(sink)).toEqual([
+			'Still running — no output for 30s.\n',
+			'Still running — no output for 30s.\n',
+		]);
+
+		finish();
+		await run;
+		const afterRun = streamed(sink).length;
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(streamed(sink)).toHaveLength(afterRun);
+	});
+
+	it('postpones the heartbeat whenever the run actually says something', async () => {
+		const sink = recordingSink();
+		const { base, emit, finish } = pendingBase();
+		const run = createAssignmentRunAgent(
+			ciAssignment(),
+			sink,
+			base,
+		)({
+			cli: 'claude',
+			args: [],
+			cwd: '/wt',
+		});
+
+		await vi.advanceTimersByTimeAsync(25_000);
+		emit('Tool started: Bash');
+		await vi.advanceTimersByTimeAsync(25_000);
+		expect(streamed(sink)).toEqual(['Tool started: Bash\n']);
+
+		await vi.advanceTimersByTimeAsync(5_100);
+		expect(streamed(sink)).toEqual([
+			'Tool started: Bash\n',
+			'Still running — no output for 30s.\n',
+		]);
+
+		finish();
+		await run;
+	});
+
+	it('leaves the other CLIs without a heartbeat', async () => {
+		const sink = recordingSink();
+		const { base, finish } = pendingBase();
+		const run = createAssignmentRunAgent(
+			ciAssignment(),
+			sink,
+			base,
+		)({
+			cli: 'codex',
+			args: [],
+			cwd: '/wt',
+		});
+
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(streamed(sink)).toEqual([]);
+
+		finish();
+		await run;
 	});
 });

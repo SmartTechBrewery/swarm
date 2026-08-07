@@ -65,6 +65,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		deliverDispatchResult: vi.fn().mockReturnValue(true),
 		deliverDispatchProgress: vi.fn(),
 		deliverDispatchAck: vi.fn(),
+		persistStreamLog: vi.fn(),
 		...overrides,
 	};
 }
@@ -228,6 +229,7 @@ describe('handleWorkerStreamFrame', () => {
 	// Split delivery (issue #407): the back-channel frames are routed to the
 	// control-plane dispatcher and keep the socket open (never touch the lease).
 	const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+	const RUN_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 	it('routes a task-execution-result to the dispatcher and keeps the socket open', async () => {
 		const deps = makeDeps();
@@ -278,7 +280,10 @@ describe('handleWorkerStreamFrame', () => {
 		);
 	});
 
-	it('ignores a stream-log without persisting it here (same-host worker owns output)', async () => {
+	// The control plane owns the `run_output_events` write for every worker now: a
+	// federated one has no database to make it itself, so dropping the frame here
+	// left its run detail page blank for the whole run.
+	it('forwards a stream-log to the run-output sink and keeps the socket open', async () => {
 		const deps = makeDeps();
 		const action = await handleWorkerStreamFrame(
 			deps,
@@ -286,11 +291,20 @@ describe('handleWorkerStreamFrame', () => {
 			JSON.stringify({
 				type: 'stream-log',
 				dispatchId: DISPATCH,
+				runId: RUN_ID,
 				lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
 			}),
 		);
 		expect(action).toEqual({ action: 'ignore' });
+		expect(deps.persistStreamLog).toHaveBeenCalledWith({
+			type: 'stream-log',
+			dispatchId: DISPATCH,
+			runId: RUN_ID,
+			lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
+		});
 		expect(deps.deliverDispatchResult).not.toHaveBeenCalled();
+		expect(deps.deliverDispatchProgress).not.toHaveBeenCalled();
+		expect(deps.deliverDispatchAck).not.toHaveBeenCalled();
 	});
 });
 
@@ -501,6 +515,35 @@ describe('GET /worker/stream connected-worker registry lifecycle', () => {
 		expect(ws.close).not.toHaveBeenCalled();
 		// The next dispatch can still reach this worker.
 		expect(sendToWorker(WORKER_ID, { type: 'heartbeat-ack' })).toBe(true);
+	});
+
+	// Same regression for the frame a live run sends most often: a chatty run emits
+	// one every 100ms, so treating it as a close would drop the connection almost
+	// immediately after the phase started.
+	it('stays registered after a stream-log frame, having persisted it', async () => {
+		const deps = makeDeps();
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+		handlers.onOpen?.({}, ws);
+
+		await handlers.onMessage(
+			{
+				data: JSON.stringify({
+					type: 'stream-log',
+					dispatchId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+					runId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+					lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
+				}),
+			},
+			ws,
+		);
+
+		expect(deps.persistStreamLog).toHaveBeenCalledTimes(1);
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(ws.close).not.toHaveBeenCalled();
 	});
 
 	it('deregisters when a heartbeat can no longer be refreshed (disconnect action)', async () => {

@@ -3,6 +3,11 @@
  * runs". It wraps {@link runAgentCli} so every line the CLI emits is batched
  * into `run_output_events` as it arrives, which is what the run page polls.
  *
+ * This is the **in-process BullMQ** path's batcher, and only that path's: a run
+ * dispatched over the worker transport streams its lines instead and the control
+ * plane persists them (`../router/stream-log-persistence.ts`), so neither
+ * transport executor composes this wrapper.
+ *
  * The harness decides *what* a line says (Claude's protocol stream is decoded
  * into readable progress there — `src/harness/claude-stream.ts`); this module
  * only decides when those lines are written, and bounds both the batching and
