@@ -14,7 +14,7 @@
  * (ai/CODING_STANDARDS.md "Module shape for a provider").
  *
  * This imports each provider index directly. A `src/integrations/<kind>/index.ts`
- * barrel (mirroring Cascade's) is still deferred: with four imports the list is
+ * barrel (mirroring Cascade's) is still deferred: with five imports the list is
  * shorter than the barrel that would front it, and each line's comment is where
  * a reader learns which providers actually carry traffic — a distinction an
  * aggregate would hide.
@@ -26,6 +26,10 @@
 
 // PM: GitHub Projects. Registers its manifest into pmProviderRegistry.
 import './pm/github-projects/index.js';
+// PM: Linear (issue #491, contract complete as of its phase 5/6). Registers its
+// manifest into pmProviderRegistry — selectable from `pm.type` at once, since a PM
+// manifest carries no `runtimeReady` flag.
+import './pm/linear/index.js';
 // SCM: GitHub. Registers its manifest into scmProviderRegistry.
 import './scm/github/index.js';
 // SCM: Bitbucket (issue #296, contract complete). Registers with

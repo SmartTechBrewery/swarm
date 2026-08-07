@@ -27,7 +27,8 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
                                       commit / PR / review / board update
 ```
 
-- Planning and Implementation start from GitHub Projects board status changes.
+- Planning and Implementation start from project-board status changes — on GitHub
+  Projects or, since issue #530, a Linear board.
 - Review starts when a SWARM-managed pull request opens or its checks complete.
 - Respond-to-review and Respond-to-CI start from pull-request lifecycle events.
 - The worker runs `claude`, `agy` (Antigravity), or `codex` in an isolated
@@ -241,9 +242,10 @@ Configuration has three layers:
 
 - `.env` — host and process settings such as database, Redis, ports, logging,
   dashboard authentication, and credential encryption.
-- `swarm.config.json` — per-project repository, worktree, GitHub Projects,
-  credential references (the SCM reviewer/webhook pair plus the PM provider's own
-  roles under `credentials.pm`), agent, and pipeline settings. Apply changes with
+- `swarm.config.json` — per-project repository, worktree, board mapping (`pm`, one
+  member per PM provider — GitHub Projects or Linear), credential references (the
+  SCM reviewer/webhook pair plus the PM provider's own roles under
+  `credentials.pm`), agent, and pipeline settings. Apply changes with
   `npm run db:seed` or `swarm config apply`.
 - Dashboard global settings — app-wide settings stored in Postgres and edited
   through the dashboard API.
