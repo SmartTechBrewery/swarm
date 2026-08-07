@@ -78,8 +78,6 @@
  * #253) — Respond-to-review still never requests it directly.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { getPersonaToken } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import {
@@ -153,17 +151,16 @@ const DONE_STATUS: PmStatusKey = 'inReview';
 /**
  * The outcomes the agent may report — PROJECT.md §5.4's two paths, now also
  * covering an approval/comment review with nothing actionable in it. `fixed`
- * means at least one fix commit was pushed (even if some points were pushed
- * back); `pushed-back` means no code changed because at least one concrete
- * point was rejected with a rationale; `no-findings` means the review raised
- * no actionable points and the agent only acknowledged it. The agent hands
- * back which one applied via
- * {@link RESPOND_OUTCOME_FILENAME}; anything else is a failed run, not a third
- * outcome.
+ * means at least one fix commit is waiting in the tree for SWARM to push (even if
+ * some points were pushed back); `pushed-back` means no code changed because at
+ * least one concrete point was rejected with a rationale; `no-findings` means the
+ * review raised no actionable points and the agent only acknowledged it. Derived
+ * from {@link ReviewResponseHandoffSchema} rather than declared beside it, so the
+ * hand-off the agent writes to {@link RESPOND_OUTCOME_FILENAME} is the single
+ * place the vocabulary is stated and enforced; anything else is a failed run, not
+ * a fourth outcome.
  */
-export const RESPOND_OUTCOMES = ['fixed', 'pushed-back', 'no-findings'] as const;
-
-export type RespondOutcome = (typeof RESPOND_OUTCOMES)[number];
+export type RespondOutcome = ReturnType<typeof ReviewResponseHandoffSchema.parse>['outcome'];
 
 /** Claude Code is SWARM's implementer agent (PROJECT.md §5.4) — the persona that responds. */
 export const DEFAULT_RESPOND_CLI: AgentCli = 'claude';
@@ -260,13 +257,20 @@ export interface RunRespondToReviewPhaseOptions {
 	runAgent?: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	/** Injectable env-grafting step — defaults to {@link graftEnvironment}; overridden in tests. */
 	graft?: typeof graftEnvironment;
-	/** Injectable implementer-token resolver — defaults to {@link getPersonaToken}; overridden in tests. */
+	/**
+	 * Provider-neutral deterministic SCM delivery seam. Omit to have the phase
+	 * resolve the project's own registered provider.
+	 */
 	delivery?: ScmDeliveryProvider;
+	/**
+	 * Injectable implementer-token resolver — defaults to {@link getPersonaToken}.
+	 * Supplied by the DB-free worker, which injects the operator's own token rather
+	 * than reaching into a secret store it cannot read (ADR-003 §2).
+	 */
 	getToken?: typeof getPersonaToken;
 	/**
 	 * Injectable follow-up-Review scheduler (issue #241) — defaults to
-	 * {@link scheduleFollowUpReviewDefault}; overridden in tests. Not consulted in
-	 * legacy mode (no delivery progress to key the checkpoint on).
+	 * {@link scheduleFollowUpReviewDefault}; overridden in tests.
 	 */
 	scheduleFollowUpReview?: ScheduleFollowUpReview;
 }
@@ -441,7 +445,6 @@ export async function runRespondToReviewPhase(
 		scheduleFollowUpReview = scheduleFollowUpReviewDefault,
 	} = options;
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
-	const legacyMode = options.getToken !== undefined && options.delivery === undefined;
 	const agentToken = await (options.getToken ?? getPersonaToken)(project, 'implementer');
 
 	logger.info(
@@ -491,8 +494,7 @@ export async function runRespondToReviewPhase(
 	try {
 		graft(project.repoRoot, handle.path);
 
-		const shouldResumeDelivery = !legacyMode && deliveryResumed;
-		const agent = shouldResumeDelivery
+		const agent = deliveryResumed
 			? resumedDeliveryAgent(cli)
 			: await runAgent({
 					cli,
@@ -534,28 +536,6 @@ export async function runRespondToReviewPhase(
 			throw error;
 		}
 
-		// Case-tolerant ("Fixed" happens) but otherwise strict: an unknown outcome
-		// means the hand-off contract broke, and pretending the response happened
-		// would stall the pipeline silently.
-		if (legacyMode) {
-			if (!existsSync(join(handle.path, RESPOND_OUTCOME_FILENAME)))
-				throw new Error(
-					`Respond-to-review agent (${cli}) did not write ${RESPOND_OUTCOME_FILENAME}`,
-				);
-			const outcome = readFileSync(join(handle.path, RESPOND_OUTCOME_FILENAME), 'utf8')
-				.trim()
-				.toLowerCase() as RespondOutcome;
-			if (!outcome)
-				throw new Error(
-					`Respond-to-review agent (${cli}) wrote an empty ${RESPOND_OUTCOME_FILENAME}`,
-				);
-			if (!RESPOND_OUTCOMES.includes(outcome))
-				throw new Error(`Respond-to-review agent (${cli}) wrote unrecognized outcome '${outcome}'`);
-			let movedTo: PmStatusKey | undefined;
-			if (pm && boardItemId && (await reportBoardStatus(pm, boardItemId, DONE_STATUS, taskId)))
-				movedTo = DONE_STATUS;
-			return { outcome, movedTo, agent };
-		}
 		const handoff = readHandoff(handle.path, RESPOND_OUTCOME_FILENAME, ReviewResponseHandoffSchema);
 		if (
 			handoff.outcome === 'fixed' &&
@@ -634,7 +614,7 @@ export async function runRespondToReviewPhase(
 	} catch (error) {
 		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
 		// settles terminally instead of retrying a push that can never succeed (#558).
-		if (!legacyMode && shouldDeferDeliveryFailure(error, handle.path)) {
+		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Review-response delivery deferred for retry', {
 				cause: error,

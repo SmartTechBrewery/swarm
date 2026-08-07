@@ -1,13 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-
-// The verdict file is read via node:fs; presence + contents are controlled per test.
-let verdictFileExists: boolean;
-let verdictFileContents: string;
-vi.mock('node:fs', () => ({
-	existsSync: () => verdictFileExists,
-	readFileSync: () => verdictFileContents,
-}));
-
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	REVIEW_VERDICT_CAP,
 	type ReviewVerdictRecord,
@@ -15,11 +9,53 @@ import {
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { buildReviewHandoffRepairPrompt } from '@/pipeline/prompts/review.js';
 import { buildReviewPrompt, REVIEW_VERDICT_FILENAME, runReviewPhase } from '@/pipeline/review.js';
+import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
-const WORKTREE_PATH = '/Users/dev/swarm/swarm/.swarm-workspaces/task-review-20';
 const HEAD_SHA = 'abc1234def5678abc1234def5678abc1234def56';
+
+const roots: string[] = [];
+afterEach(() => {
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+/** The one blocking finding a `request-changes` hand-off must carry (issue #470). */
+const BLOCKING_FINDING = {
+	id: 'F1',
+	title: 'Unhandled rejection',
+	severity: 'blocker',
+	category: 'correctness',
+	evidence: '`review.ts:210`.',
+	failureScenario: 'A rejected promise crashes the worker mid-phase.',
+	impact: 'The run never settles.',
+	fixPlan: ['Await the promise.'],
+	tests: 'Assert the rejection is handled.',
+};
+
+/** A valid structured hand-off; `overrides` merge over a `request-changes` default. */
+function handoff(overrides: Record<string, unknown> = {}) {
+	return {
+		verdict: 'request-changes',
+		summary: 'Adds the review phase.',
+		verification: [{ command: 'npm run typecheck', outcome: 'passed' }],
+		docsChecked: [{ path: 'README.md', status: 'not-applicable' }],
+		findings: [BLOCKING_FINDING],
+		...overrides,
+	};
+}
+
+/** The `approve` counterpart — no findings, so the verdict rule is satisfied. */
+function approval(overrides: Record<string, unknown> = {}) {
+	return handoff({ verdict: 'approve', findings: [], ...overrides });
+}
+
+function writeHandoff(path: string, contents: unknown): void {
+	writeFileSync(
+		join(path, REVIEW_VERDICT_FILENAME),
+		typeof contents === 'string' ? contents : JSON.stringify(contents),
+	);
+}
 
 function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
@@ -37,10 +73,15 @@ function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 }
 
 function makeDeps() {
+	// A real checkout directory: the phase reads the agent's hand-off and writes its
+	// own delivery-progress sidecar there.
+	const path = mkdtempSync(join(tmpdir(), 'swarm-review-'));
+	roots.push(path);
+	writeHandoff(path, handoff());
 	// Detached checkout at the PR head SHA — no branch, matching the review flow.
 	const handle: WorktreeHandle = {
 		taskId: 'review-20',
-		path: WORKTREE_PATH,
+		path,
 		branch: HEAD_SHA,
 		detached: true,
 	};
@@ -49,6 +90,7 @@ function makeDeps() {
 		cleanup: vi.fn(async () => {}),
 	};
 	return {
+		path,
 		project: createMockProjectConfig(),
 		prNumber: '99',
 		headSha: HEAD_SHA,
@@ -59,6 +101,23 @@ function makeDeps() {
 		),
 		graft: vi.fn(() => []),
 		getToken: vi.fn(async () => 'reviewer-token'),
+		// SWARM submits the review itself; production resolves the project's own
+		// registered provider here.
+		delivery: {
+			commitIdentity: { name: 'reviewer', email: 'reviewer@users.noreply.github.com' },
+			findPullRequest: vi.fn(async () => undefined),
+			createPullRequest: vi.fn(async () => ({ number: 99, url: 'https://x/pull/99' })),
+			pushBranch: vi.fn(async () => {}),
+			submitReview: vi.fn(
+				async (_input: {
+					prNumber: number;
+					verdict: 'approve' | 'request-changes';
+					body: string;
+					deliveryId: string;
+				}) => 77,
+			),
+			postComment: vi.fn(async () => 1),
+		} satisfies ScmDeliveryProvider,
 		// Ledger writers default to a first-verdict reservation so existing tests
 		// exercise the common case without a live database (issue #235).
 		markReviewVerdictSubmitted: vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 })),
@@ -71,12 +130,7 @@ function makeDeps() {
 }
 
 describe('runReviewPhase', () => {
-	beforeEach(() => {
-		verdictFileExists = true;
-		verdictFileContents = 'request-changes\n';
-	});
-
-	it('provisions a detached worktree at the head SHA, runs Claude Code as the reviewer, and returns the verdict', async () => {
+	it('provisions a detached worktree at the head SHA, runs Claude Code as the reviewer, and submits the verdict', async () => {
 		const deps = makeDeps();
 		const result = await runReviewPhase(deps);
 
@@ -94,12 +148,19 @@ describe('runReviewPhase', () => {
 		expect(deps.runAgent).toHaveBeenCalledTimes(1);
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.cli).toBe('claude');
-		expect(runArgs.cwd).toBe(WORKTREE_PATH);
+		expect(runArgs.cwd).toBe(deps.path);
 		expect(runArgs.args?.[0]).toContain('gh pr diff 99');
 		expect(runArgs.env).toEqual({ GH_TOKEN: 'reviewer-token' });
 
 		// Env is grafted into the worktree before the agent runs.
-		expect(deps.graft).toHaveBeenCalledWith(deps.project.repoRoot, WORKTREE_PATH);
+		expect(deps.graft).toHaveBeenCalledWith(deps.project.repoRoot, deps.path);
+
+		// SWARM — not the agent — submits the review, under the hand-off's verdict.
+		expect(deps.delivery.submitReview).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.submitReview.mock.calls[0][0]).toMatchObject({
+			prNumber: 99,
+			verdict: 'request-changes',
+		});
 
 		// Worktree is always cleaned up.
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
@@ -174,26 +235,33 @@ describe('runReviewPhase', () => {
 		await expect(runReviewPhase(deps)).rejects.toThrow(/timed out/);
 	});
 
-	it('throws and cleans up when the agent produced no verdict file', async () => {
-		verdictFileExists = false;
+	it('throws and cleans up when the agent wrote no hand-off', async () => {
 		const deps = makeDeps();
+		rmSync(join(deps.path, REVIEW_VERDICT_FILENAME));
 		await expect(runReviewPhase(deps)).rejects.toThrow(
-			new RegExp(`did not write ${REVIEW_VERDICT_FILENAME}`),
+			new RegExp(`did not write required hand-off ${REVIEW_VERDICT_FILENAME}`),
 		);
+		expect(deps.delivery.submitReview).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
 	});
 
-	it('throws and cleans up when the verdict file is empty', async () => {
-		verdictFileContents = '   \n  ';
+	it('throws and cleans up when the hand-off is not valid JSON', async () => {
 		const deps = makeDeps();
-		await expect(runReviewPhase(deps)).rejects.toThrow(/empty/);
+		writeHandoff(deps.path, '   \n  ');
+		await expect(runReviewPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${REVIEW_VERDICT_FILENAME}`),
+		);
+		expect(deps.delivery.submitReview).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
 	});
 
 	it('throws and cleans up when the verdict is not one of the known two', async () => {
-		verdictFileContents = 'LGTM!\n';
 		const deps = makeDeps();
-		await expect(runReviewPhase(deps)).rejects.toThrow(/unrecognized verdict 'LGTM!'/);
+		writeHandoff(deps.path, handoff({ verdict: 'LGTM!' }));
+		await expect(runReviewPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${REVIEW_VERDICT_FILENAME}`),
+		);
+		expect(deps.delivery.submitReview).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
 	});
 
@@ -201,27 +269,41 @@ describe('runReviewPhase', () => {
 	// dispatched no follow-up, so a PR that received one was silently terminal. It
 	// must now fail the run — which retries — rather than be accepted.
 	it('rejects the removed comment verdict instead of submitting it', async () => {
-		verdictFileContents = 'comment\n';
 		const deps = makeDeps();
-		await expect(runReviewPhase(deps)).rejects.toThrow(/unrecognized verdict 'comment'/);
+		writeHandoff(deps.path, handoff({ verdict: 'comment' }));
+		await expect(runReviewPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${REVIEW_VERDICT_FILENAME}`),
+		);
+		expect(deps.delivery.submitReview).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
 	});
 
-	it.each([
-		['approve\n', 'approve'],
-		['Approve', 'approve'],
-		['REQUEST-CHANGES\n', 'request-changes'],
-	])('normalizes verdict %j to %j', async (contents, expected) => {
-		verdictFileContents = contents;
+	// The verdict is a function of the severity histogram, enforced rather than
+	// instructed (issue #470) — an approval that still reports a blocker is rejected.
+	it('rejects an approval whose findings include a blocker', async () => {
 		const deps = makeDeps();
+		writeHandoff(deps.path, handoff({ verdict: 'approve' }));
+		await expect(runReviewPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${REVIEW_VERDICT_FILENAME}`),
+		);
+		expect(deps.delivery.submitReview).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['approve', approval()],
+		['request-changes', handoff()],
+	])('returns and submits the %j verdict the hand-off carries', async (expected, contents) => {
+		const deps = makeDeps();
+		writeHandoff(deps.path, contents);
 		const result = await runReviewPhase(deps);
 		expect(result.verdict).toBe(expected);
+		expect(deps.delivery.submitReview.mock.calls[0][0].verdict).toBe(expected);
 	});
 
 	describe('review-verdict safety-cap ledger (issue #235)', () => {
 		it('marks the reserved head submitted with the verdict, by natural key', async () => {
-			verdictFileContents = 'approve\n';
 			const deps = makeDeps();
+			writeHandoff(deps.path, approval());
 			await runReviewPhase(deps);
 
 			expect(deps.markReviewVerdictSubmitted).toHaveBeenCalledWith(
@@ -231,13 +313,13 @@ describe('runReviewPhase', () => {
 					prNumber: '99',
 					headSha: HEAD_SHA,
 				},
-				{ verdict: 'approve' },
+				// Marked only after delivery confirmed the review id.
+				{ verdict: 'approve', reviewId: '77' },
 			);
 			expect(deps.abandonReviewVerdict).not.toHaveBeenCalled();
 		});
 
 		it('surfaces the ledger ordinal on the result', async () => {
-			verdictFileContents = 'request-changes\n';
 			const deps = makeDeps();
 			deps.markReviewVerdictSubmitted = vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 }));
 
@@ -248,7 +330,6 @@ describe('runReviewPhase', () => {
 		});
 
 		it('leaves an intermediate request-changes verdict on the automatic cycle', async () => {
-			verdictFileContents = 'request-changes\n';
 			const deps = makeDeps();
 			deps.markReviewVerdictSubmitted = vi.fn(async () => ({ id: 'verdict-2', ordinal: 2 }));
 
@@ -259,7 +340,6 @@ describe('runReviewPhase', () => {
 		});
 
 		it('records manual-intervention-required when the cap-reaching verdict is request-changes', async () => {
-			verdictFileContents = 'request-changes\n';
 			const deps = makeDeps();
 			deps.markReviewVerdictSubmitted = vi.fn(async () => ({
 				id: 'verdict-last',
@@ -273,8 +353,8 @@ describe('runReviewPhase', () => {
 		});
 
 		it('does not record manual-intervention-required for a cap-reaching approval', async () => {
-			verdictFileContents = 'approve\n';
 			const deps = makeDeps();
+			writeHandoff(deps.path, approval());
 			deps.markReviewVerdictSubmitted = vi.fn(async () => ({
 				id: 'verdict-last',
 				ordinal: REVIEW_VERDICT_CAP,

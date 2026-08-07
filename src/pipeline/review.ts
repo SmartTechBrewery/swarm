@@ -100,7 +100,7 @@ import {
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 
-/** The file the review agent is instructed to write its submitted verdict to, at the worktree root. */
+/** The hand-off file the review agent writes its verdict and findings to, at the worktree root. */
 export const REVIEW_VERDICT_FILENAME = HANDOFF_FILENAMES.review;
 
 // The static review prompt now lives in `src/pipeline/prompts/review.ts` (issue
@@ -109,9 +109,11 @@ export const REVIEW_VERDICT_FILENAME = HANDOFF_FILENAMES.review;
 export { buildReviewPrompt };
 
 /**
- * The verdicts the agent may submit. The agent hands back which one it used via
+ * The verdicts SWARM may submit on the agent's behalf. The agent names one in
  * {@link REVIEW_VERDICT_FILENAME}; anything else is a failed run, not a third
- * outcome.
+ * outcome. Kept as a named list rather than derived from
+ * {@link ReviewHandoffSchema} because the wire protocol and the `runs` row check
+ * themselves against it (`src/transport/protocol.ts`, `src/db/schema/runs.ts`).
  *
  * `comment` was removed (issue #470). It existed only to mirror `gh pr review`'s
  * third event flag, and it closed every exit at once: it never clears the review
@@ -209,9 +211,16 @@ export interface RunReviewPhaseOptions {
 	runAgent?: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	/** Injectable env-grafting step — defaults to {@link graftEnvironment}; overridden in tests. */
 	graft?: typeof graftEnvironment;
-	/** Injectable reviewer-token resolver — defaults to {@link getPersonaToken}; overridden in tests. */
+	/**
+	 * Provider-neutral deterministic SCM delivery seam. Omit to have the phase
+	 * resolve the project's own registered provider.
+	 */
 	delivery?: ScmDeliveryProvider;
-	/** @deprecated Compatibility seam for pre-delivery tests; production leaves this unset. */
+	/**
+	 * Injectable reviewer-token resolver — defaults to {@link getPersonaToken}.
+	 * Supplied by the DB-free worker, which injects the operator's own token rather
+	 * than reaching into a secret store it cannot read (ADR-003 §2).
+	 */
 	getToken?: typeof getPersonaToken;
 	/**
 	 * Injectable review-verdict ledger writers (issue #235) — defaults to the
@@ -231,7 +240,7 @@ export interface RunReviewPhaseOptions {
 }
 
 export interface ReviewPhaseResult {
-	/** The verdict the agent submitted, read from {@link REVIEW_VERDICT_FILENAME}. */
+	/** The verdict SWARM submitted, read from {@link REVIEW_VERDICT_FILENAME}. */
 	verdict: ReviewVerdict;
 	/** The agent run's result (exit code, duration, captured output). */
 	agent: AgentCliResult;
@@ -638,7 +647,6 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		getPriorSubmittedReview = getPriorSubmittedReviewDefault,
 	} = options;
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
-	const legacyMode = options.getToken !== undefined && options.delivery === undefined;
 	const agentToken = await (options.getToken ?? getPersonaToken)(project, 'reviewer');
 	const verdictKey = { projectId: project.id, repository: project.repo, prNumber, headSha };
 
@@ -672,9 +680,8 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 	try {
 		graft(project.repoRoot, handle.path);
 
-		const shouldResumeDelivery = !legacyMode && deliveryResumed;
 		const { agent, isReReview, passOrdinal } = await produceReviewAgentResult({
-			shouldResumeDelivery,
+			shouldResumeDelivery: deliveryResumed,
 			cli,
 			model,
 			reasoning,
@@ -705,32 +712,13 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			throw error;
 		}
 
-		if (legacyMode) {
-			if (!existsSync(join(handle.path, REVIEW_VERDICT_FILENAME)))
-				throw new Error(`Review agent (${cli}) did not write ${REVIEW_VERDICT_FILENAME}`);
-			const original = readFileSync(join(handle.path, REVIEW_VERDICT_FILENAME), 'utf8').trim();
-			const raw = original.toLowerCase() as ReviewVerdict;
-			if (!raw) throw new Error(`Review agent (${cli}) wrote an empty ${REVIEW_VERDICT_FILENAME}`);
-			if (!REVIEW_VERDICTS.includes(raw))
-				throw new Error(`Review agent (${cli}) wrote unrecognized verdict '${original}'`);
-			const ledgerRecord = await markReviewVerdictSubmitted(verdictKey, { verdict: raw });
-			const automationOutcome = isCapReachingRequestChanges(ledgerRecord?.ordinal, raw)
-				? 'manual-intervention-required'
-				: undefined;
-			return {
-				verdict: raw,
-				agent,
-				reviewOrdinal: ledgerRecord?.ordinal,
-				automationOutcome,
-			};
-		}
 		const submission = await readReviewSubmission(handle.path, {
 			cli,
 			headSha,
 			ordinal: passOrdinal,
 			isReReview,
 			minorsAnswered: minorsAreAnswered(project),
-			allowLegacy: shouldResumeDelivery,
+			allowLegacy: deliveryResumed,
 			repair: reviewRepairStep({
 				isReReview,
 				cli,
@@ -786,14 +774,14 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 
 		return { verdict, agent, reviewOrdinal, automationOutcome };
 	} catch (error) {
-		if (!legacyMode && hasDeliveryProgress(handle.path)) {
+		if (hasDeliveryProgress(handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Review delivery deferred for retry', { cause: error });
 		}
-		// No delivery progress exists (or this is legacy mode, which has none) —
-		// the review is known to have never been submitted, so free the ledger's
-		// pending slot rather than charging the PR for this failed attempt
-		// (issue #235). Best-effort: a failure here must not mask the original error.
+		// No delivery progress exists — the review is known to have never been
+		// submitted, so free the ledger's pending slot rather than charging the PR for
+		// this failed attempt (issue #235). Best-effort: a failure here must not mask
+		// the original error.
 		try {
 			await abandonReviewVerdict(verdictKey);
 		} catch (abandonError) {
@@ -809,6 +797,3 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		await cleanupUnlessPreserved(worktrees, taskId, preserveForResume, 'review phase', runId);
 	}
 }
-
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';

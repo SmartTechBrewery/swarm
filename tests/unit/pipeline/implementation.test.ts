@@ -1,25 +1,42 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The PR-URL file is read via node:fs; presence + contents are controlled per test.
-let prFileExists: boolean;
-let prFileContents: string;
+// The worktree's files are read via node:fs; presence + contents are controlled per
+// test. `.swarm_delivery.json` is the sidecar deterministic delivery writes itself,
+// so it is backed by whatever the phase wrote rather than by a per-test flag.
+let handoffFileExists: boolean;
+let handoffFileContents: string;
 let blockedReasonFileExists: boolean;
 let blockedReasonFileContents: string;
 let checkpointFileExists: boolean;
 let checkpointFileContents: string;
+let progressFileContents: string | undefined;
 vi.mock('node:fs', () => ({
 	existsSync: (path: unknown) => {
 		const name = String(path);
 		if (name.endsWith('blocked_reason.md')) return blockedReasonFileExists;
 		if (name.endsWith('swarm_checkpoint.json')) return checkpointFileExists;
-		return prFileExists;
+		if (name.endsWith('.swarm_delivery.json')) return progressFileContents !== undefined;
+		return handoffFileExists;
 	},
 	readFileSync: (path: unknown) => {
 		const name = String(path);
 		if (name.endsWith('blocked_reason.md')) return blockedReasonFileContents;
 		if (name.endsWith('swarm_checkpoint.json')) return checkpointFileContents;
-		return prFileContents;
+		if (name.endsWith('.swarm_delivery.json')) return progressFileContents;
+		return handoffFileContents;
 	},
+	writeFileSync: (path: unknown, data: unknown) => {
+		if (String(path).endsWith('.swarm_delivery.json')) progressFileContents = String(data);
+	},
+}));
+
+// The one delivery step that shells out to real `git`. The worktree here is a
+// fixture path, not a checkout, so the commit is stubbed; `implementation-delivery.test.ts`
+// exercises commit/push/PR against real repositories.
+const DELIVERED_SHA = 'c0ffee1234567890c0ffee1234567890c0ffee12';
+vi.mock('@/scm/delivery.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/scm/delivery.js')>()),
+	commitPreparedTree: vi.fn(async () => DELIVERED_SHA),
 }));
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
@@ -37,15 +54,25 @@ import {
 	BLOCKED_REASON_FILENAME,
 	buildImplementationPrompt,
 	implementationCommentBody,
-	OPENED_PR_FILENAME,
 	runImplementationPhase,
 } from '@/pipeline/implementation.js';
 import type { WorkItemBlocker } from '@/pm/types.js';
+import { HANDOFF_FILENAMES, type ScmDeliveryProvider } from '@/scm/delivery.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
 
 const WORKTREE_PATH = '/Users/dev/swarm/swarm/.swarm-workspaces/task-19';
+const PR_URL = 'https://github.com/SmartTechBrewery/swarm/pull/99';
+
+/** The hand-off a successful implementation run leaves for SWARM to deliver. */
+const HANDOFF = JSON.stringify({
+	summary: 'Adds the implementation phase.',
+	commitSubject: 'feat: add the implementation phase',
+	verification: [{ command: 'npm test', outcome: 'passed' }],
+	limitations: [],
+	readyForDelivery: true,
+});
 
 function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
@@ -70,6 +97,24 @@ const CONTINUATION: Checkpoint = {
 	decisions: [],
 	workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
 };
+
+/**
+ * The deterministic delivery seam. Production resolves the project's registered
+ * SCM provider here; every phase run goes through it, so a test that does not
+ * inject one would reach the registry.
+ */
+function makeDelivery() {
+	return {
+		commitIdentity: { name: 'swarm-implementer', email: 'implementer@users.noreply.github.com' },
+		findPullRequest: vi.fn(
+			async (_branch: string) => undefined as { number: number; url: string } | undefined,
+		),
+		createPullRequest: vi.fn(async () => ({ number: 99, url: PR_URL })),
+		pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
+		submitReview: vi.fn(async () => 0),
+		postComment: vi.fn(async () => 0),
+	} satisfies ScmDeliveryProvider;
+}
 
 function makeDeps() {
 	const handle: WorktreeHandle = {
@@ -112,17 +157,19 @@ function makeDeps() {
 		),
 		graft: vi.fn(() => []),
 		getToken: vi.fn(async () => 'implementer-token'),
+		delivery: makeDelivery(),
 	};
 }
 
 describe('runImplementationPhase', () => {
 	beforeEach(() => {
-		prFileExists = true;
-		prFileContents = 'https://github.com/SmartTechBrewery/swarm/pull/99\n';
+		handoffFileExists = true;
+		handoffFileContents = HANDOFF;
 		blockedReasonFileExists = false;
 		blockedReasonFileContents = '';
 		checkpointFileExists = false;
 		checkpointFileContents = '';
+		progressFileContents = undefined;
 	});
 
 	it('defers (throws DependencyBlockedError) when the item is blocked by an open prerequisite', async () => {
@@ -190,12 +237,14 @@ describe('runImplementationPhase', () => {
 		// Env is grafted into the worktree before the agent runs.
 		expect(deps.graft).toHaveBeenCalledWith(deps.project.repoRoot, WORKTREE_PATH);
 
+		// SWARM — not the agent — pushes the delivered commit and opens the PR.
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(WORKTREE_PATH, 'issue-19', DELIVERED_SHA);
+		expect(deps.delivery.createPullRequest).toHaveBeenCalledTimes(1);
+
 		// The PR link is posted on the linked item, then the item advances to inReview.
 		expect(deps.pm.addComment).toHaveBeenCalledTimes(1);
 		expect(deps.pm.addComment.mock.calls[0][0]).toBe('PVTI_item19');
-		expect(deps.pm.addComment.mock.calls[0][1]).toContain(
-			'https://github.com/SmartTechBrewery/swarm/pull/99',
-		);
+		expect(deps.pm.addComment.mock.calls[0][1]).toContain(PR_URL);
 		expect(deps.pm.moveWorkItem).toHaveBeenNthCalledWith(2, 'PVTI_item19', 'inReview');
 		expect(deps.pm.moveWorkItem).toHaveBeenCalledTimes(2);
 
@@ -203,7 +252,7 @@ describe('runImplementationPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 
 		expect(result).toMatchObject({
-			prUrl: 'https://github.com/SmartTechBrewery/swarm/pull/99',
+			prUrl: PR_URL,
 			branch: 'issue-19',
 			commentId: 'comment-1',
 			movedTo: 'inReview',
@@ -385,18 +434,20 @@ describe('runImplementationPhase', () => {
 		await expect(runImplementationPhase(deps)).rejects.toThrow(/timed out/);
 	});
 
-	it('throws and cleans up when the agent produced no PR-URL file', async () => {
-		prFileExists = false;
+	it('throws and cleans up when the agent wrote no hand-off', async () => {
+		handoffFileExists = false;
 		const deps = makeDeps();
 		await expect(runImplementationPhase(deps)).rejects.toThrow(
-			new RegExp(`did not write ${OPENED_PR_FILENAME}`),
+			new RegExp(`did not write required hand-off ${HANDOFF_FILENAMES.implementation}`),
 		);
+		// Nothing was delivered, so nothing is reported and the checkout is released.
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.pm.addComment).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 	});
 
-	it('surfaces an agent-written blocker instead of a generic missing-PR error', async () => {
-		prFileExists = false;
+	it('surfaces an agent-written blocker instead of a generic missing-hand-off error', async () => {
+		handoffFileExists = false;
 		blockedReasonFileExists = true;
 		blockedReasonFileContents = 'Wait for PR #147 to merge, then retry this task.';
 		const deps = makeDeps();
@@ -407,22 +458,46 @@ describe('runImplementationPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 	});
 
-	it('throws and cleans up when the PR-URL file is empty', async () => {
-		prFileContents = '   \n  ';
+	it('throws and cleans up when the hand-off is not valid JSON', async () => {
+		handoffFileContents = '   \n  ';
 		const deps = makeDeps();
-		await expect(runImplementationPhase(deps)).rejects.toThrow(/empty/);
+		await expect(runImplementationPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${HANDOFF_FILENAMES.implementation}`),
+		);
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.pm.addComment).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
 	});
 
-	it('cleans up the worktree even when posting the comment throws', async () => {
+	// The hand-off *is* the delivery contract: a run that reports no verification, or
+	// that never declared itself ready, must not be committed and pushed.
+	it.each([
+		['no verification', { verification: [] }],
+		['no commit subject', { commitSubject: '' }],
+		['readyForDelivery unset', { readyForDelivery: false }],
+	])('throws and cleans up when the hand-off has %s', async (_label, override) => {
+		handoffFileContents = JSON.stringify({ ...JSON.parse(HANDOFF), ...override });
+		const deps = makeDeps();
+		await expect(runImplementationPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${HANDOFF_FILENAMES.implementation}`),
+		);
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
+	});
+
+	// Once the PR is open the delivery is half-done, so the failure is deferred and
+	// the checkout preserved — the retry finishes the reporting instead of
+	// re-implementing (and re-pushing) the task.
+	it('defers and keeps the worktree when posting the comment throws after the PR is open', async () => {
 		const deps = makeDeps();
 		deps.pm.addComment.mockRejectedValue(new Error('GraphQL 502'));
-		await expect(runImplementationPhase(deps)).rejects.toThrow(/GraphQL 502/);
+		await expect(runImplementationPhase(deps)).rejects.toMatchObject({
+			name: 'DeliveryDeferredError',
+		});
 		// The pickup move already happened; only the final (In review) move never fires.
 		expect(deps.pm.moveWorkItem).toHaveBeenCalledTimes(1);
 		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_item19', 'inProgress');
-		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
+		expect(deps.worktrees.cleanup).not.toHaveBeenCalled();
 	});
 
 	it('threads sessionId (not resumeSessionId) and provisions fresh on a first run', async () => {
@@ -589,7 +664,7 @@ describe('buildImplementationPrompt', () => {
 			createMockWorkItem({ title: 'T', description: 'D' }),
 			context,
 		);
-		expect(prompt).toContain(OPENED_PR_FILENAME);
+		expect(prompt).toContain(HANDOFF_FILENAMES.implementation);
 		expect(prompt).toContain(BLOCKED_REASON_FILENAME);
 		expect(prompt).toContain('Closes #19');
 		expect(prompt).toContain('git push -u origin issue-19');
@@ -648,7 +723,7 @@ describe('buildImplementationPrompt', () => {
 		const prompt = buildImplementationPrompt(createMockWorkItem(), { ...context, worktreePath });
 		expect(prompt).toContain(`worktree at the absolute path ${worktreePath}`);
 		expect(prompt).toContain(`inside\n${worktreePath}. SWARM only reads files from there.`);
-		expect(prompt).toContain(OPENED_PR_FILENAME);
+		expect(prompt).toContain(HANDOFF_FILENAMES.implementation);
 		expect(prompt).toContain(BLOCKED_REASON_FILENAME);
 		// The "current working directory" claim would be false there, so it's dropped.
 		expect(prompt).not.toContain('worktree whose root is your current working directory');
