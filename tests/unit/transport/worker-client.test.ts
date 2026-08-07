@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AgentCli } from '@/harness/agent-cli.js';
 import { SUPPORTED_DB_FREE_PHASES } from '@/transport/assignment-execution.js';
 import { type TaskPhase, TRANSPORT_PROTOCOL_VERSION, WS_CLOSE } from '@/transport/protocol.js';
 import {
@@ -452,6 +453,74 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		fetch.mockResolvedValueOnce(jsonResponse(409, { reason: 'worker session already held' }));
 		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
 		await expect(client.done).rejects.toBeInstanceOf(WorkerSessionConflictError);
+	});
+
+	// Issue #559: a PATH probe that misses an installed CLI declares a set the
+	// control plane rejects, and that rejection used to kill the daemon outright.
+	// The loop re-probes first and only gives up when the fresh probe agrees.
+	it('re-probes and re-declares after a capability rejection, then connects', async () => {
+		fetch
+			.mockResolvedValueOnce(jsonResponse(409, { reason: 'needs codex', offending: ['codex'] }))
+			.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const refreshCapabilities = vi
+			.fn<() => Promise<AgentCli[]>>()
+			.mockResolvedValue(['claude', 'codex']);
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], refreshCapabilities },
+			overrides(),
+		);
+		await flush();
+		expect(refreshCapabilities).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(500);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(JSON.parse(String(fetch.mock.calls[1][1].body)).capabilities).toEqual([
+			'claude',
+			'codex',
+		]);
+		expect(sockets).toHaveLength(1);
+
+		await client.stop();
+	});
+
+	it('fails fatally when the re-probe agrees the required CLI is not there', async () => {
+		fetch.mockResolvedValue(jsonResponse(409, { offending: ['codex'] }));
+		const refreshCapabilities = vi.fn<() => Promise<AgentCli[]>>().mockResolvedValue(['claude']);
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], refreshCapabilities },
+			overrides(),
+		);
+		await expect(client.done).rejects.toBeInstanceOf(WorkerCapabilityConflictError);
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it('fails fatally on a capability rejection when the set was declared explicitly', async () => {
+		fetch.mockResolvedValue(jsonResponse(409, { offending: ['codex'] }));
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await expect(client.done).rejects.toBeInstanceOf(WorkerCapabilityConflictError);
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it('stops re-probing a flapping PATH after the bounded number of attempts', async () => {
+		fetch.mockResolvedValue(jsonResponse(409, { offending: ['codex', 'antigravity'] }));
+		const refreshCapabilities = vi
+			.fn<() => Promise<AgentCli[]>>()
+			.mockResolvedValueOnce(['claude', 'codex'])
+			.mockResolvedValueOnce(['claude', 'antigravity'])
+			.mockResolvedValue(['claude', 'codex', 'antigravity']);
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], refreshCapabilities },
+			overrides(),
+		);
+		const settled = client.done.catch((e) => e);
+		await flush();
+		await vi.advanceTimersByTimeAsync(500);
+		await flush();
+		await vi.advanceTimersByTimeAsync(1_000);
+
+		await expect(settled).resolves.toBeInstanceOf(WorkerCapabilityConflictError);
+		expect(refreshCapabilities).toHaveBeenCalledTimes(2);
+		expect(fetch).toHaveBeenCalledTimes(3);
 	});
 
 	it('stop() closes the live socket gracefully so the lease is released promptly', async () => {

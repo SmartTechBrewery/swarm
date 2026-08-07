@@ -144,9 +144,8 @@ if (resolveDispatchMode() === 'transport') {
 	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
 	// Declare the CLIs this host can run — an explicit override, else a PATH probe.
 	// The control plane routes on this set; an empty one can't handshake.
-	const capabilities =
-		parseDeclaredClisOverride(process.env.SWARM_WORKER_TRANSPORT_CLIS) ??
-		(await discoverAvailableClis());
+	const declaredOverride = parseDeclaredClisOverride(process.env.SWARM_WORKER_TRANSPORT_CLIS);
+	const capabilities = declaredOverride ?? (await discoverAvailableClis());
 	if (capabilities.length === 0) {
 		logger.error(
 			'No agent CLIs found on PATH to declare (looked for claude, agy, codex) — refusing to start in transport dispatch mode. Install at least one, or set SWARM_WORKER_TRANSPORT_CLIS.',
@@ -158,6 +157,9 @@ if (resolveDispatchMode() === 'transport') {
 		controlPlaneUrl,
 		credential,
 		capabilities,
+		// A discovered set gets a second look if the control plane rejects it; an
+		// explicit override does not (issue #559).
+		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
 		hostname: hostname(),
 		daemonVersion: process.env.npm_package_version ?? '0.0.0',
 		shutdownSignal: transportShutdown.signal,

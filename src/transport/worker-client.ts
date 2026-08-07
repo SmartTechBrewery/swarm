@@ -88,14 +88,22 @@ export class WorkerSessionConflictError extends Error {
 
 /**
  * The declared capability set drops a CLI an enrollment requires (HTTP 409 with
- * `offending` CLIs). Always fatal: retrying with the same too-narrow set repeats
- * the rejection; the operator must install/declare the missing CLI.
+ * `offending` CLIs). Fatal once re-declaring cannot change the answer: retrying
+ * with the same too-narrow set only repeats the rejection, so the connect loop
+ * re-probes PATH first (`WorkerTransportOptions.refreshCapabilities`) and gives
+ * up only when the fresh probe still doesn't have the CLI.
+ *
+ * The message states what this daemon *declared*, not that the CLI is missing
+ * (issue #559). The daemon does not know that: the set may have come from an
+ * explicit `SWARM_WORKER_TRANSPORT_CLIS`, and telling an operator to install a
+ * CLI that is sitting on their PATH points the investigation at the wrong thing.
  */
 export class WorkerCapabilityConflictError extends Error {
 	readonly offending: string[];
 	constructor(offending: string[], message?: string) {
 		super(
-			message ?? `declared capabilities drop a CLI an enrollment requires: ${offending.join(', ')}`,
+			message ??
+				`declared capabilities drop a CLI an enrollment requires: ${offending.join(', ')} — this daemon did not declare it. Check that it runs on this host's PATH, or declare it explicitly with SWARM_WORKER_TRANSPORT_CLIS.`,
 		);
 		this.name = 'WorkerCapabilityConflictError';
 		this.offending = offending;
@@ -354,6 +362,16 @@ export interface WorkerTransportOptions {
 	 * dispatch client passes every phase.
 	 */
 	supportedPhases: readonly TaskPhase[];
+	/**
+	 * Re-run capability discovery after the control plane rejects the declared set
+	 * (issue #559). A PATH probe can miss a CLI that is installed — a loaded
+	 * machine, a binary mid-upgrade — and that rejection is otherwise terminal, so
+	 * the daemon dies over a hiccup. Supplied only when the set was *discovered*:
+	 * an explicit `SWARM_WORKER_TRANSPORT_CLIS` is the operator's declaration and
+	 * re-probing would talk over it. Left undefined, a capability conflict stays
+	 * immediately fatal.
+	 */
+	refreshCapabilities?: () => Promise<AgentCli[]>;
 	hostname: string;
 	daemonVersion: string;
 	/** Optional advisory host-health provider, attached to each heartbeat. */
@@ -383,6 +401,13 @@ type SessionEnd =
 const WS_NORMAL_CLOSE = 1000;
 
 /**
+ * How many times a capability rejection may be answered with a fresh PATH probe
+ * before it is taken at face value. Two covers the case this exists for — a probe
+ * that missed a CLI once — without letting a flapping PATH reconnect forever.
+ */
+const MAX_CAPABILITY_REPROBES = 2;
+
+/**
  * Connect and keep a live worker session, reconnecting on transport loss until
  * {@link WorkerTransportClient.stop} is called. Returns immediately with a handle;
  * the connect loop runs in the background on `done`.
@@ -395,7 +420,8 @@ export function connectWorkerTransport(
 	const urls = deriveTransportUrls(options.controlPlaneUrl);
 	const backoff: BackoffConfig = { ...DEFAULT_BACKOFF, ...options.backoff };
 	// Validated once up front so a bad capability set fails loudly before any I/O.
-	const request = buildHandshakeRequest(options);
+	// Rebuilt only when a re-probe widens the declared set (see `reprobeRequest`).
+	let request = buildHandshakeRequest(options);
 
 	let stopped = false;
 	let activeSocket: TransportSocket | undefined;
@@ -509,6 +535,43 @@ export function connectWorkerTransport(
 		});
 	}
 
+	let reprobesLeft = MAX_CAPABILITY_REPROBES;
+
+	/**
+	 * Answer a capability rejection by re-probing PATH: a handshake request
+	 * carrying the CLI the control plane asked for, or `undefined` when the
+	 * rejection stands and the caller should treat it as fatal.
+	 *
+	 * The rejection stands unless the fresh probe actually *gains* an offending
+	 * CLI. That is what keeps the retry bounded and honest — a genuinely missing
+	 * CLI fails on the same round trip it always did, and only a probe that
+	 * changed its mind buys another attempt (issue #559).
+	 */
+	async function reprobeRequest(
+		err: WorkerCapabilityConflictError,
+	): Promise<HandshakeRequest | undefined> {
+		if (!options.refreshCapabilities || reprobesLeft <= 0) return undefined;
+		reprobesLeft -= 1;
+		let refreshed: AgentCli[];
+		try {
+			refreshed = await options.refreshCapabilities();
+		} catch (probeErr) {
+			deps.logger.warn('re-probing agent CLIs after a capability rejection failed', {
+				error: probeErr instanceof Error ? probeErr.message : String(probeErr),
+			});
+			return undefined;
+		}
+		const declared = new Set<string>(request.capabilities);
+		const reprobed = new Set<string>(refreshed);
+		const gained = err.offending.filter((cli) => !declared.has(cli) && reprobed.has(cli));
+		if (gained.length === 0) return undefined;
+		deps.logger.warn('re-probe found agent CLIs the handshake was rejected for; re-declaring', {
+			gained,
+			capabilities: refreshed,
+		});
+		return buildHandshakeRequest({ ...options, capabilities: refreshed });
+	}
+
 	const done = (async () => {
 		let attempt = 0;
 		let everConnected = false;
@@ -517,7 +580,11 @@ export function connectWorkerTransport(
 			try {
 				session = await performHandshake(deps, urls.sessionUrl, request);
 			} catch (err) {
-				if (isFatalHandshakeError(err, everConnected)) throw err;
+				if (err instanceof WorkerCapabilityConflictError) {
+					const refreshedRequest = await reprobeRequest(err);
+					if (!refreshedRequest) throw err;
+					request = refreshedRequest;
+				} else if (isFatalHandshakeError(err, everConnected)) throw err;
 				attempt += 1;
 				const delayMs = computeReconnectDelayMs(attempt, backoff, deps.random);
 				deps.logger.warn('worker transport handshake failed; backing off before retry', {
@@ -577,10 +644,13 @@ export function connectWorkerTransport(
 }
 
 /**
- * Whether a handshake error should stop the client rather than be retried. Auth,
- * protocol, and capability rejections are always fatal; a plain session conflict
- * is fatal only before the first successful connect (a competing daemon), and
- * recoverable afterward (a stale self-lease that expires within the TTL).
+ * Whether a handshake error should stop the client rather than be retried. Auth
+ * and protocol rejections are always fatal; a plain session conflict is fatal
+ * only before the first successful connect (a competing daemon), and recoverable
+ * afterward (a stale self-lease that expires within the TTL). A capability
+ * rejection is fatal too, but the connect loop gets first refusal on it — it
+ * re-probes PATH and only falls through to this classification once the fresh
+ * probe agrees the CLI is not there (issue #559).
  */
 function isFatalHandshakeError(err: unknown, everConnected: boolean): boolean {
 	if (err instanceof WorkerTransportAuthError) return true;
