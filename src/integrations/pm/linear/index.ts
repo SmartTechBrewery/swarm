@@ -49,7 +49,7 @@ export const linearManifest: PMProviderManifest = {
 			// Plain prose, not markdown: the dashboard renders a description as text
 			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
 			description:
-				'Linear API key the board is read and written with. A personal API key from Linear Settings, or an OAuth access token — both authenticate the same way. Its own account is the identity board loop prevention recognizes as SWARM, so do not use the account a human moves cards from.',
+				'Linear personal API key from Linear Settings that SWARM uses to read and write the board. Its account is the identity board loop prevention recognizes as SWARM, so do not use the account a human moves cards from.',
 			envVarKey: 'LINEAR_API_KEY',
 		},
 		{

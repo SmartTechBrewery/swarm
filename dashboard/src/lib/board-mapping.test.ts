@@ -186,6 +186,11 @@ describe('canSaveBoardMapping', () => {
 describe('getPmMappingProvider', () => {
 	it('returns the matching provider and falls back to the default for an unknown id', () => {
 		expect(getPmMappingProvider('github-projects').label).toBe('GitHub Projects');
+		expect(getPmMappingProvider('linear')).toMatchObject({
+			label: 'Linear',
+			containerNoun: 'team',
+			stateNoun: 'workflow state',
+		});
 		expect(getPmMappingProvider('nope').id).toBe('github-projects');
 	});
 });

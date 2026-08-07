@@ -13,7 +13,7 @@ import { PM_STATUS_KEYS, type PmStatusKey } from '../../../src/pm/pipeline.js';
  * adapter helpers below rather than the component reaching into config internals.
  */
 export interface BoardMappingForm {
-	/** Selected PM provider id — the project's `pm.type` (only `github-projects` today). */
+	/** Selected PM provider id — the project's `pm.type`. */
 	providerId: string;
 	/** Selected board/container opaque id (a Projects v2 node ID for GitHub). Blank = unselected. */
 	containerId: string;
@@ -81,6 +81,14 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		stateNoun: 'status',
 		intro:
 			"Pick this project's GitHub Projects (v2) board, then map each SWARM pipeline status to one of the board's Status options. Boards and options are discovered server-side with this project's own board credential, configured under Credentials above — no node IDs to copy by hand.",
+	},
+	{
+		id: 'linear',
+		label: 'Linear',
+		containerNoun: 'team',
+		stateNoun: 'workflow state',
+		intro:
+			"Pick this project's Linear team, then map each SWARM pipeline status to one of the team's workflow states. Teams and states are discovered server-side with this project's own board credential, configured under Credentials above.",
 	},
 ];
 

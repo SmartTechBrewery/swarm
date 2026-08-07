@@ -69,15 +69,17 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
 - Docker Compose
 - Git
 - Authenticated agent CLIs (`claude`, `agy`, and/or `codex`)
-- A GitHub repository, Projects v2 board, and webhook
+- A GitHub repository and a project-management board with a webhook: a GitHub Projects v2 board or a Linear team
 - Two distinct GitHub identities for loop prevention: the worker operator's own
   token (`SWARM_OPERATOR_GH_TOKEN`, the implementer persona) set in `.env` on each
   host, and a separate project-scoped reviewer credential
-- A GitHub token for the **board** — a project credential, separate from the two
-  above: `credentials.pm.apiToken` (conventionally `PM_GITHUB_PROJECTS_TOKEN`),
-  needing `repo`, `project`, and `read:org`. Every board read, write, and the
-  dashboard's board discovery authenticate with it, and it is configurable from the
-  dashboard's **Project Management** tab. See
+- A project credential for the **board**, separate from the two above. GitHub
+  Projects uses `credentials.pm.apiToken` (conventionally
+  `PM_GITHUB_PROJECTS_TOKEN`) with `repo`, `project`, and `read:org`; Linear uses
+  the required `credentials.pm.apiKey` and `credentials.pm.webhookSecret` roles
+  (conventionally `LINEAR_API_KEY` and `LINEAR_WEBHOOK_SECRET`). Every board read,
+  write, and dashboard discovery authenticates with the selected provider's
+  credential, configurable from the dashboard's **Project Management** tab. See
   [`docs/configuration.md`](docs/configuration.md)
 
 ## Quick start
