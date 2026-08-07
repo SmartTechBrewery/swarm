@@ -35,7 +35,21 @@ export interface DispatchResultHandlers {
 	onAck?: (ack: TaskAssignmentAck) => void;
 }
 
-interface PendingDispatch extends DispatchResultHandlers {
+/**
+ * Who the control plane actually pushed a dispatch to, and which run row it opened
+ * for it. Recorded at registration so a back-channel write can be authorized
+ * against what *this router* did, rather than against what an inbound frame claims
+ * about itself — the same "identity comes from the server side, never the request
+ * body" rule `./worker-delivery.ts` follows for the HTTP delivery API.
+ */
+export interface DispatchStreamTarget {
+	/** The worker the assignment was pushed to. */
+	workerId: string;
+	/** The run row this dispatch's attempt opened, when it has one. */
+	runId?: string;
+}
+
+interface PendingDispatch extends DispatchResultHandlers, DispatchStreamTarget {
 	resolve: (result: TaskExecutionResult) => void;
 }
 
@@ -59,6 +73,7 @@ export interface AwaitingDispatchResult {
  */
 export function awaitDispatchResult(
 	dispatchId: string,
+	target: DispatchStreamTarget,
 	handlers: DispatchResultHandlers = {},
 ): AwaitingDispatchResult {
 	const existing = pending.get(dispatchId);
@@ -82,7 +97,13 @@ export function awaitDispatchResult(
 	const result = new Promise<TaskExecutionResult>((res) => {
 		resolve = res;
 	});
-	pending.set(dispatchId, { resolve, onProgress: handlers.onProgress, onAck: handlers.onAck });
+	pending.set(dispatchId, {
+		resolve,
+		workerId: target.workerId,
+		runId: target.runId,
+		onProgress: handlers.onProgress,
+		onAck: handlers.onAck,
+	});
 	return {
 		result,
 		dispose: () => {
@@ -125,4 +146,22 @@ export function deliverDispatchProgress(progress: TaskProgress): void {
 /** Route an assignment ack to the awaiting dispatcher, if any (a no-op otherwise). */
 export function deliverDispatchAck(ack: TaskAssignmentAck): void {
 	pending.get(ack.dispatchId)?.onAck?.(ack);
+}
+
+/**
+ * The worker and run the control plane recorded for a dispatch it is awaiting
+ * here, or `undefined` when no dispatcher on this router is awaiting it.
+ *
+ * This is the authorization seam for the one back-channel frame that performs a
+ * **durable write** — `stream-log`, whose rows land in `run_output_events`
+ * (`./stream-log-persistence.ts`). Every other frame on the socket is either
+ * lease-scoped or resolves against a waiter that discards it, so trusting the
+ * frame's own ids costs nothing; a write does not have that property. The caller
+ * compares `workerId` against the socket's authenticated worker and persists under
+ * the `runId` recorded here, so the frame's own `runId` is advisory.
+ */
+export function resolveDispatchStreamTarget(dispatchId: string): DispatchStreamTarget | undefined {
+	const entry = pending.get(dispatchId);
+	if (!entry) return undefined;
+	return { workerId: entry.workerId, runId: entry.runId };
 }

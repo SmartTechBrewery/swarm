@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ProjectConfig } from '@/config/schema.js';
-import type { AgentCliResult } from '@/harness/agent-cli.js';
+import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
@@ -29,6 +29,24 @@ vi.mock('@/queue/cancellation.js', () => ({
 	isRunCancellationRequested,
 	clearRunCancellation: vi.fn(async () => {}),
 	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
+}));
+
+// The harness, so the runner this executor composes can be driven without a
+// subprocess; and the one repository call the local batcher used to make, so the
+// "no longer persists here" assertion is about the write itself rather than the
+// wrapper that used to perform it. Everything else in the repository is left real
+// (it is only imported, never called on this path).
+const { runAgentCli, appendRunOutputEvents } = vi.hoisted(() => ({
+	runAgentCli: vi.fn<(options: RunAgentCliOptions) => Promise<AgentCliResult>>(),
+	appendRunOutputEvents: vi.fn<() => Promise<void>>(),
+}));
+vi.mock('@/harness/agent-cli.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/harness/agent-cli.js')>()),
+	runAgentCli,
+}));
+vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/db/repositories/runsRepository.js')>()),
+	appendRunOutputEvents,
 }));
 
 const RUN_ID = '77777777-7777-4777-8777-777777777777';
@@ -77,6 +95,9 @@ describe('runAssignment', () => {
 	beforeEach(() => {
 		isRunCancellationRequested.mockReset();
 		isRunCancellationRequested.mockResolvedValue(false);
+		runAgentCli.mockReset();
+		appendRunOutputEvents.mockReset();
+		appendRunOutputEvents.mockResolvedValue(undefined);
 	});
 	afterEach(() => {
 		vi.useRealTimers();
@@ -272,6 +293,30 @@ describe('runAssignment', () => {
 
 		releaseFirst?.();
 		await first;
+	});
+
+	// The control plane persists every worker's output now
+	// (`@/router/stream-log-persistence.js`), so this executor — which *could* write
+	// the table, being on a host with `DATABASE_URL` — must not, or every line would
+	// land twice.
+	it('streams the agent output without persisting it locally', async () => {
+		const sink = recordingSink();
+		runAgentCli.mockImplementation(async (options) => {
+			options.onStdout?.('planning…');
+			return agentResult();
+		});
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			const agent = await inputs.runAgent({ cli: 'claude', args: [], cwd: '/wt' });
+			return { agent };
+		});
+		await runAssignment(assignment({ runId: RUN_ID }), sink, { deps: depsWith(runPhase) });
+
+		const streamLog = sink.sent.find((f) => f.type === 'stream-log') as
+			| Record<string, unknown>
+			| undefined;
+		expect(streamLog?.runId).toBe(RUN_ID);
+		expect((streamLog?.lines as Array<{ content: string }>)[0]?.content).toBe('planning…\n');
+		expect(appendRunOutputEvents).not.toHaveBeenCalled();
 	});
 
 	it('reports the implementation branch checkpoint as a task-progress frame', async () => {

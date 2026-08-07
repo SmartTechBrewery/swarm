@@ -4,11 +4,18 @@ import {
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
+	resolveDispatchStreamTarget,
 } from '@/router/dispatch-results.js';
 import type { TaskAssignmentAck, TaskExecutionResult, TaskProgress } from '@/transport/protocol.js';
 
 const DISPATCH_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const DISPATCH_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+/** What the control plane recorded when it pushed each dispatch (issue #544 review, F1). */
+const WORKER_A = 'aaaaaaaa-0000-4000-8000-000000000001';
+const WORKER_B = 'bbbbbbbb-0000-4000-8000-000000000002';
+const TARGET_A = { workerId: WORKER_A, runId: 'run-a' };
+const TARGET_B = { workerId: WORKER_B, runId: 'run-b' };
 
 function result(dispatchId: string): TaskExecutionResult {
 	return {
@@ -37,7 +44,7 @@ function ack(dispatchId: string, duplicate = false): TaskAssignmentAck {
 
 describe('dispatch result correlation registry', () => {
 	it('resolves the awaiting dispatcher with the delivered result', async () => {
-		const awaiting = awaitDispatchResult(DISPATCH_A);
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
 		await expect(awaiting.result).resolves.toMatchObject({
 			status: 'succeeded',
@@ -50,7 +57,7 @@ describe('dispatch result correlation registry', () => {
 	});
 
 	it('consuming the entry makes a duplicate result frame a no-op', async () => {
-		const awaiting = awaitDispatchResult(DISPATCH_A);
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
 		await awaiting.result;
 		// The second frame finds no waiter — the registration was consumed on delivery.
@@ -61,7 +68,7 @@ describe('dispatch result correlation registry', () => {
 	it('routes progress and ack frames to the registered handlers', () => {
 		const onProgress = vi.fn();
 		const onAck = vi.fn();
-		const awaiting = awaitDispatchResult(DISPATCH_B, { onProgress, onAck });
+		const awaiting = awaitDispatchResult(DISPATCH_B, TARGET_B, { onProgress, onAck });
 
 		deliverDispatchProgress(progress(DISPATCH_B));
 		deliverDispatchAck(ack(DISPATCH_B, true));
@@ -79,19 +86,42 @@ describe('dispatch result correlation registry', () => {
 	});
 
 	it('dispose unregisters the wait so a later result is dropped', () => {
-		const awaiting = awaitDispatchResult(DISPATCH_A);
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		awaiting.dispose();
 		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(false);
 	});
 
 	it('a re-registration for the same dispatch unblocks the superseded waiter', async () => {
-		const first = awaitDispatchResult(DISPATCH_A);
-		const second = awaitDispatchResult(DISPATCH_A);
+		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const second = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		// The earlier waiter must not hang forever — it settles as a benign deferral.
 		await expect(first.result).resolves.toMatchObject({ status: 'deferred' });
 		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
 		await expect(second.result).resolves.toMatchObject({ status: 'succeeded' });
 		first.dispose();
 		second.dispose();
+	});
+});
+
+/**
+ * The lookup that authorizes a durable `stream-log` write (issue #544 review, F1):
+ * it must answer with what the control plane recorded when it pushed the dispatch,
+ * and nothing at all for a dispatch this router is not awaiting.
+ */
+describe('resolveDispatchStreamTarget', () => {
+	it('returns the worker and run recorded at registration', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		expect(resolveDispatchStreamTarget(DISPATCH_A)).toEqual(TARGET_A);
+
+		awaiting.dispose();
+	});
+
+	it('returns nothing once the wait is disposed, and for an unknown dispatch', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		awaiting.dispose();
+
+		expect(resolveDispatchStreamTarget(DISPATCH_A)).toBeUndefined();
+		expect(resolveDispatchStreamTarget(DISPATCH_B)).toBeUndefined();
 	});
 });

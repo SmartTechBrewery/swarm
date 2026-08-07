@@ -3,6 +3,11 @@
  * runs". It wraps {@link runAgentCli} so every line the CLI emits is batched
  * into `run_output_events` as it arrives, which is what the run page polls.
  *
+ * This is the **in-process BullMQ** path's batcher, and only that path's: a run
+ * dispatched over the worker transport streams its lines instead and the control
+ * plane persists them (`../router/stream-log-persistence.ts`), so neither
+ * transport executor composes this wrapper.
+ *
  * The harness decides *what* a line says (Claude's protocol stream is decoded
  * into readable progress there — `src/harness/claude-stream.ts`); this module
  * only decides when those lines are written, and bounds both the batching and
@@ -25,8 +30,21 @@ const BATCH_SIZE = 100;
  * mode issue #356 was filed for. Kept an internal constant rather than a
  * setting: it exists to make "alive" legible, not to be tuned. Claude-only
  * because the other CLIs' output behavior is unchanged by that issue.
+ *
+ * Exported because the transport path emits the same heartbeat from its own
+ * wrapper (`../transport/assignment-execution.ts`): two copies of a *user-visible*
+ * line are two things that can drift, and the run page would then read differently
+ * depending on which dispatch mode produced the run. The duplicated arm/stop
+ * closures stay where they are — they are short, and phase 6 of issue #544 deletes
+ * one of the two paths outright; it is the shared string that must not fork in the
+ * meantime (issue #544 review, F3).
  */
-const HEARTBEAT_MS = 30_000;
+export const HEARTBEAT_MS = 30_000;
+
+/** The line a silent Claude run emits, rendered once so both paths say the same thing. */
+export function stillRunningLine(): string {
+	return `Still running — no output for ${HEARTBEAT_MS / 1_000}s.`;
+}
 
 export function createLiveOutputRunner(runId: string | undefined): typeof runAgentCli {
 	if (!runId) {
@@ -77,7 +95,7 @@ export function createLiveOutputRunner(runId: string | undefined): typeof runAge
 			if (options.cli !== 'claude') return;
 			stopHeartbeat();
 			heartbeatTimer = setTimeout(() => {
-				append('stdout', `Still running — no output for ${HEARTBEAT_MS / 1_000}s.`);
+				append('stdout', stillRunningLine());
 				armHeartbeat();
 			}, HEARTBEAT_MS);
 		};

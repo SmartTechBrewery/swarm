@@ -12,7 +12,10 @@
  * (`runAssignedPhase`, `./consumer.ts`) the BullMQ path uses so the two can't
  * diverge, forwards the agent's live output as `StreamLog` frames, and sends a
  * terminal `TaskExecutionResult` mirroring the in-process `JobOutcome` so the
- * control plane can settle the dispatch.
+ * control plane can settle the dispatch. Having a database does *not* make it
+ * persist that output: `run_output_events` is written control-plane side for every
+ * worker (`../router/stream-log-persistence.ts`), so this executor streams and
+ * nothing more — the same composition the DB-free one uses.
  *
  * It is gated behind a default-off dispatch mode (`SWARM_DISPATCH_MODE`,
  * `../lib/env.ts`): when off, `./index.ts` runs the BullMQ consumer exactly as
@@ -22,7 +25,7 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
-import type { AgentCli } from '../harness/agent-cli.js';
+import { type AgentCli, runAgentCli } from '../harness/agent-cli.js';
 import { agentRunError } from '../harness/agent-failure.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
@@ -48,7 +51,6 @@ import {
 } from '../transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '../triggers/types.js';
 import { type AssignedPhaseInputs, type PhaseRunResult, runAssignedPhase } from './consumer.js';
-import { createLiveOutputRunner } from './live-output.js';
 import {
 	beginRunCancellationTracking,
 	linkRunAbortController,
@@ -104,9 +106,11 @@ function buildAssignedPhaseInputs(
 		resumeDelivery: assignment.resumeDelivery === true,
 		runId: assignment.runId,
 		signal,
-		// Same-host base: persists live output to `run_output_events` (DB access)
-		// *and* forwards it over the transport.
-		runAgent: createAssignmentRunAgent(assignment, sink, createLiveOutputRunner(assignment.runId)),
+		// The raw CLI as the base, exactly as the DB-free executor composes it: this
+		// host *could* write `run_output_events` itself, but the control plane persists
+		// every worker's `stream-log` batches now (`../router/stream-log-persistence.ts`),
+		// so a local batcher here would only double-persist.
+		runAgent: createAssignmentRunAgent(assignment, sink, runAgentCli),
 		workItem: assignment.workItem ? fromAssignedWorkItem(assignment.workItem) : undefined,
 		resumeExistingBranch: assignment.implementationBranchProvisioned === true,
 		// Report the branch checkpoint so the control plane can persist
