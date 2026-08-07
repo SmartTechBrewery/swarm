@@ -50,6 +50,78 @@ function issuesPage(nodes: unknown[], endCursor: string | null = null) {
 	return { issues: { nodes, pageInfo: { hasNextPage: Boolean(endCursor), endCursor } } };
 }
 
+/** The operation name of a GraphQL document, which is how the router below keys them. */
+function operationName(query: string): string {
+	return /(?:query|mutation)\s+(\w+)/.exec(query)?.[1] ?? '';
+}
+
+/**
+ * Route the mocked transport by operation name. The write methods each issue two
+ * or three different documents, so ordered `mockResolvedValueOnce` chains would
+ * encode call order rather than behaviour — and an operation a test didn't
+ * declare fails loudly instead of silently reusing another one's payload.
+ */
+type Responder =
+	| Record<string, unknown>
+	| ((variables: Record<string, unknown>) => Record<string, unknown>);
+function mockGraphQL(handlers: Record<string, Responder>): void {
+	linearGraphQL.mockImplementation(async (query: string, variables: Record<string, unknown>) => {
+		const name = operationName(query);
+		if (!(name in handlers)) {
+			throw new Error(`Unexpected Linear operation '${name}'`);
+		}
+		const handler = handlers[name];
+		return typeof handler === 'function' ? handler(variables) : handler;
+	});
+}
+
+/** Every `(document, variables)` pair the provider issued, in order. */
+function graphQLCalls(): Array<[string, Record<string, unknown>]> {
+	return linearGraphQL.mock.calls as Array<[string, Record<string, unknown>]>;
+}
+
+/** The variables every call to one operation sent — where a direction or id mix-up shows up. */
+function variablesSentTo(name: string): unknown[] {
+	return graphQLCalls()
+		.filter(([query]) => operationName(query) === name)
+		.map(([, variables]) => variables);
+}
+
+/** The document one operation was issued with, for asserting on the selection itself. */
+function documentSentTo(name: string): string {
+	return graphQLCalls().find(([query]) => operationName(query) === name)?.[0] ?? '';
+}
+
+function commentsPage(nodes: unknown[], endCursor: string | null = null) {
+	return {
+		issue: { comments: { nodes, pageInfo: { hasNextPage: Boolean(endCursor), endCursor } } },
+	};
+}
+
+function relationsPage(nodes: unknown[], endCursor: string | null = null) {
+	return {
+		issue: {
+			inverseRelations: { nodes, pageInfo: { hasNextPage: Boolean(endCursor), endCursor } },
+		},
+	};
+}
+
+function labelsPage(nodes: unknown[], endCursor: string | null = null) {
+	return { issueLabels: { nodes, pageInfo: { hasNextPage: Boolean(endCursor), endCursor } } };
+}
+
+/** A blocking-issue fixture in the shape `BLOCKER_ISSUE_FIELDS` selects. */
+function blockerIssue(number: number, stateType = 'started') {
+	return {
+		id: `issue-${number}`,
+		identifier: `ENG-${number}`,
+		number,
+		title: `Prerequisite ${number}`,
+		url: `https://linear.app/acme/issue/ENG-${number}/prerequisite-${number}`,
+		state: { type: stateType },
+	};
+}
+
 describe('LinearPMProvider', () => {
 	const provider = new LinearPMProvider(PROJECT);
 
@@ -427,12 +499,452 @@ describe('LinearPMProvider', () => {
 		});
 	});
 
-	// The safety property this phase leans on: the writes are still stubs, and the
-	// PM conformance suite fails any *registered* manifest whose method source
-	// carries this wording — so registering Linear before the next phase lands
-	// breaks the build instead of shipping an unwritable board.
-	it('keeps the not-implemented sentinel on every method a later phase lands', () => {
-		const pending = [
+	describe('findWorkItemByDescriptionMarker', () => {
+		it("narrows the team read server-side by the marker the caller's description carries", async () => {
+			mockGraphQL({ ListIssues: issuesPage([ISSUE_NODE]) });
+
+			await expect(
+				provider.findWorkItemByDescriptionMarker('<!-- swarm-split:abc:1 -->'),
+			).resolves.toMatchObject({ id: ISSUE_NODE.id });
+			expect(variablesSentTo('ListIssues')).toEqual([
+				{
+					filter: { ...TEAM_FILTER, description: { contains: '<!-- swarm-split:abc:1 -->' } },
+					cursor: undefined,
+				},
+			]);
+		});
+
+		it('returns undefined when no card carries the marker', async () => {
+			mockGraphQL({ ListIssues: issuesPage([]) });
+
+			await expect(provider.findWorkItemByDescriptionMarker('nope')).resolves.toBeUndefined();
+		});
+	});
+
+	describe('moveWorkItem', () => {
+		it("writes the canonical status key's mapped workflow state", async () => {
+			mockGraphQL({ UpdateIssue: { issueUpdate: { success: true } } });
+
+			await provider.moveWorkItem(ISSUE_NODE.id, 'inReview');
+
+			expect(variablesSentTo('UpdateIssue')).toEqual([
+				{ id: ISSUE_NODE.id, input: { stateId: CONFIG.statusOptions.inReview } },
+			]);
+		});
+
+		it('refuses an unmapped status instead of writing an unknown state', async () => {
+			await expect(provider.moveWorkItem(ISSUE_NODE.id, 'triage')).rejects.toThrow(
+				/no workflow state ID mapped for canonical status 'triage'/,
+			);
+			expect(linearGraphQL).not.toHaveBeenCalled();
+		});
+
+		it('treats a falsy success in the payload as a failed move', async () => {
+			mockGraphQL({ UpdateIssue: { issueUpdate: { success: false } } });
+
+			await expect(provider.moveWorkItem(ISSUE_NODE.id, 'done')).rejects.toThrow(
+				`Linear rejected the request to move item '${ISSUE_NODE.id}' to 'done'`,
+			);
+		});
+	});
+
+	describe('addComment', () => {
+		it('posts natively on the Linear issue and returns the new comment id', async () => {
+			mockGraphQL({
+				CreateComment: { commentCreate: { success: true, comment: { id: 'comment-1' } } },
+			});
+
+			await expect(provider.addComment(ISSUE_NODE.id, 'Plan published.')).resolves.toBe(
+				'comment-1',
+			);
+			expect(variablesSentTo('CreateComment')).toEqual([
+				{ input: { issueId: ISSUE_NODE.id, body: 'Plan published.' } },
+			]);
+		});
+
+		it('fails when Linear accepts the mutation but returns no comment', async () => {
+			mockGraphQL({ CreateComment: { commentCreate: { success: true, comment: null } } });
+
+			await expect(provider.addComment(ISSUE_NODE.id, 'Plan published.')).rejects.toThrow(
+				`Linear rejected the request to comment on item '${ISSUE_NODE.id}'`,
+			);
+		});
+	});
+
+	describe('findComment', () => {
+		it('finds a marker that sits beyond the first page of comments', async () => {
+			mockGraphQL({
+				IssueComments: ({ cursor }) =>
+					cursor === undefined
+						? commentsPage([{ id: 'comment-1', body: 'first' }], 'cursor-1')
+						: commentsPage([{ id: 'comment-2', body: 'notes\n<!-- marker-7 -->' }]),
+			});
+
+			await expect(provider.findComment(ISSUE_NODE.id, '<!-- marker-7 -->')).resolves.toBe(
+				'comment-2',
+			);
+			expect(variablesSentTo('IssueComments')).toEqual([
+				{ id: ISSUE_NODE.id, cursor: undefined },
+				{ id: ISSUE_NODE.id, cursor: 'cursor-1' },
+			]);
+		});
+
+		it('returns undefined when no comment carries the marker', async () => {
+			mockGraphQL({ IssueComments: commentsPage([{ id: 'comment-1', body: 'first' }]) });
+
+			await expect(
+				provider.findComment(ISSUE_NODE.id, '<!-- marker-7 -->'),
+			).resolves.toBeUndefined();
+		});
+	});
+
+	describe('createWorkItem', () => {
+		const CREATE_INPUT = {
+			title: 'Phase 2',
+			description: 'Second slice.',
+			status: 'planning',
+			labels: ['swarm'],
+		};
+
+		it('creates the label it needs, then the issue in its starting state', async () => {
+			mockGraphQL({
+				FindIssueLabels: labelsPage([]),
+				CreateIssueLabel: { issueLabelCreate: { success: true, issueLabel: { id: 'label-new' } } },
+				CreateIssue: { issueCreate: { success: true, issue: ISSUE_NODE } },
+			});
+
+			await expect(provider.createWorkItem(CREATE_INPUT)).resolves.toMatchObject({
+				id: ISSUE_NODE.id,
+				title: 'Wire triggers',
+				statusKey: 'inProgress',
+				labels: [{ id: 'label-swarm', name: 'swarm', color: '#4cb782' }],
+			});
+			expect(variablesSentTo('CreateIssueLabel')).toEqual([
+				{ input: { teamId: CONFIG.teamId, name: 'swarm' } },
+			]);
+			expect(variablesSentTo('CreateIssue')).toEqual([
+				{
+					input: {
+						teamId: CONFIG.teamId,
+						title: 'Phase 2',
+						description: 'Second slice.',
+						stateId: CONFIG.statusOptions.planning,
+						labelIds: ['label-new'],
+					},
+				},
+			]);
+		});
+
+		it('reuses an existing label rather than creating a second one', async () => {
+			mockGraphQL({
+				FindIssueLabels: labelsPage([
+					{ id: 'label-workspace', name: 'swarm', team: null },
+					{ id: 'label-team', name: 'Swarm', team: { id: CONFIG.teamId } },
+				]),
+				CreateIssue: { issueCreate: { success: true, issue: ISSUE_NODE } },
+			});
+
+			await provider.createWorkItem(CREATE_INPUT);
+
+			// This team's own label wins over a workspace-wide one of the same name.
+			expect(variablesSentTo('CreateIssue')).toMatchObject([
+				{ input: { labelIds: ['label-team'] } },
+			]);
+		});
+
+		it("tolerates Linear's duplicate-name rejection when a label appears mid-flight", async () => {
+			let lookups = 0;
+			mockGraphQL({
+				FindIssueLabels: () => {
+					lookups += 1;
+					return lookups === 1
+						? labelsPage([])
+						: labelsPage([{ id: 'label-raced', name: 'swarm', team: { id: CONFIG.teamId } }]);
+				},
+				CreateIssueLabel: () => {
+					throw new Error('Linear API error: duplicate label name');
+				},
+				CreateIssue: { issueCreate: { success: true, issue: ISSUE_NODE } },
+			});
+
+			await provider.createWorkItem(CREATE_INPUT);
+
+			expect(variablesSentTo('CreateIssue')).toMatchObject([
+				{ input: { labelIds: ['label-raced'] } },
+			]);
+		});
+
+		it('rethrows a label-create failure that is not a duplicate name', async () => {
+			mockGraphQL({
+				FindIssueLabels: labelsPage([]),
+				CreateIssueLabel: () => {
+					throw new Error('Linear API error: insufficient permissions');
+				},
+			});
+
+			await expect(provider.createWorkItem(CREATE_INPUT)).rejects.toThrow(
+				'insufficient permissions',
+			);
+		});
+
+		it('refuses a starting status the board mapping cannot resolve', async () => {
+			await expect(provider.createWorkItem({ ...CREATE_INPUT, status: 'triage' })).rejects.toThrow(
+				/no workflow state ID mapped for canonical status 'triage'/,
+			);
+			expect(linearGraphQL).not.toHaveBeenCalled();
+		});
+
+		it('omits labelIds entirely when the caller named no labels', async () => {
+			mockGraphQL({ CreateIssue: { issueCreate: { success: true, issue: ISSUE_NODE } } });
+
+			await provider.createWorkItem({ ...CREATE_INPUT, labels: undefined });
+
+			expect(variablesSentTo('CreateIssue')).toEqual([
+				{
+					input: {
+						teamId: CONFIG.teamId,
+						title: 'Phase 2',
+						description: 'Second slice.',
+						stateId: CONFIG.statusOptions.planning,
+					},
+				},
+			]);
+		});
+	});
+
+	describe('updateWorkItem', () => {
+		it('sends only the fields the patch carries', async () => {
+			mockGraphQL({ UpdateIssue: { issueUpdate: { success: true } } });
+
+			await provider.updateWorkItem(ISSUE_NODE.id, { title: 'Renamed' });
+
+			expect(variablesSentTo('UpdateIssue')).toEqual([
+				{ id: ISSUE_NODE.id, input: { title: 'Renamed' } },
+			]);
+		});
+
+		it('writes nothing at all for an empty patch', async () => {
+			await provider.updateWorkItem(ISSUE_NODE.id, {});
+
+			expect(linearGraphQL).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('addLabel', () => {
+		it("attaches a resolved label through Linear's dedicated add mutation", async () => {
+			mockGraphQL({
+				IssueLabels: { issue: { labels: { nodes: [{ id: 'label-other', name: 'bug' }] } } },
+				FindIssueLabels: labelsPage([
+					{ id: 'label-planned', name: 'planned', team: { id: CONFIG.teamId } },
+				]),
+				AddIssueLabel: { issueAddLabel: { success: true } },
+			});
+
+			await provider.addLabel(ISSUE_NODE.id, 'planned');
+
+			expect(variablesSentTo('FindIssueLabels')).toEqual([{ name: 'planned', cursor: undefined }]);
+			expect(variablesSentTo('AddIssueLabel')).toEqual([
+				{ id: ISSUE_NODE.id, labelId: 'label-planned' },
+			]);
+		});
+
+		it('is a no-op when the issue already carries the label', async () => {
+			mockGraphQL({
+				IssueLabels: { issue: { labels: { nodes: [{ id: 'label-planned', name: 'Planned' }] } } },
+			});
+
+			await provider.addLabel(ISSUE_NODE.id, 'planned');
+
+			// Neither a lookup nor a write — the router above would have thrown on either.
+			expect(variablesSentTo('AddIssueLabel')).toEqual([]);
+		});
+
+		it('creates a label the workspace does not have yet', async () => {
+			let lookups = 0;
+			mockGraphQL({
+				IssueLabels: { issue: { labels: { nodes: [] } } },
+				FindIssueLabels: () => {
+					lookups += 1;
+					return labelsPage([]);
+				},
+				CreateIssueLabel: {
+					issueLabelCreate: { success: true, issueLabel: { id: 'label-planned' } },
+				},
+				AddIssueLabel: { issueAddLabel: { success: true } },
+			});
+
+			await provider.addLabel(ISSUE_NODE.id, 'planned');
+
+			expect(lookups).toBe(1);
+			expect(variablesSentTo('AddIssueLabel')).toEqual([
+				{ id: ISSUE_NODE.id, labelId: 'label-planned' },
+			]);
+		});
+	});
+
+	describe('listBlockers', () => {
+		it('merges native relations with prose mentions, deduping a doubly declared prerequisite', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([
+					// A `related` relation is not a dependency and must not gate work.
+					{ type: 'related', issue: blockerIssue(3) },
+					{ type: 'blocks', issue: blockerIssue(7) },
+				]),
+				IssueDependencyProse: {
+					issue: {
+						number: 42,
+						description: 'Blocked by #7. Depends on #9. Requires #404. Requires #42.',
+						comments: { nodes: [{ body: 'Also needs to land #11 first.' }] },
+					},
+				},
+				IssueByNumber: ({ filter }) => {
+					const number = (filter as { number: { eq: number } }).number.eq;
+					if (number === 404) return { issues: { nodes: [] } };
+					return {
+						issues: { nodes: [blockerIssue(number, number === 9 ? 'completed' : 'started')] },
+					};
+				},
+			});
+
+			const blockers = await provider.listBlockers(ISSUE_NODE.id);
+
+			expect(blockers).toEqual([
+				{
+					id: 'issue-7',
+					reference: 'ENG-7',
+					url: blockerIssue(7).url,
+					title: 'Prerequisite 7',
+					open: true,
+					// The native relation wins over the same issue's bare mention.
+					source: 'dependency',
+				},
+				{
+					id: 'issue-9',
+					reference: 'ENG-9',
+					url: blockerIssue(9).url,
+					title: 'Prerequisite 9',
+					// A `completed` workflow state means the prerequisite no longer gates.
+					open: false,
+					source: 'mention',
+				},
+				{
+					// Declared in a human comment rather than the description.
+					id: 'issue-11',
+					reference: 'ENG-11',
+					url: blockerIssue(11).url,
+					title: 'Prerequisite 11',
+					open: true,
+					source: 'mention',
+				},
+			]);
+			// #404 resolved to nothing on this team and is not a gate, and the item's
+			// own number is never looked up as its own blocker.
+			expect(variablesSentTo('IssueByNumber')).toEqual(
+				[7, 9, 404, 11].map((number) => ({ filter: { ...TEAM_FILTER, number: { eq: number } } })),
+			);
+		});
+
+		it('reads the relations pointing at the item, mapping their source as the blocker', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([
+					// Both sides are present in Linear's payload; only the source blocks us.
+					{ type: 'blocks', issue: blockerIssue(7), relatedIssue: blockerIssue(42) },
+				]),
+				IssueDependencyProse: { issue: { number: 42, description: '', comments: { nodes: [] } } },
+			});
+
+			await expect(provider.listBlockers(ISSUE_NODE.id)).resolves.toMatchObject([
+				{ id: 'issue-7', source: 'dependency' },
+			]);
+			// "Who blocks me" is the inverse direction — `relations` would answer
+			// "what do I block?" and silently gate nothing.
+			expect(documentSentTo('IssueBlockingRelations')).toContain('inverseRelations(');
+			expect(documentSentTo('IssueBlockingRelations')).not.toMatch(/\brelations\(/);
+		});
+
+		it('reports a canceled blocker as no longer open', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([
+					{ type: 'blocks', issue: blockerIssue(7, 'canceled') },
+				]),
+				IssueDependencyProse: { issue: { number: 42, description: '', comments: { nodes: [] } } },
+			});
+
+			await expect(provider.listBlockers(ISSUE_NODE.id)).resolves.toMatchObject([{ open: false }]);
+		});
+
+		it('returns [] for an item with neither a relation nor a prose prerequisite', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([]),
+				IssueDependencyProse: {
+					issue: { number: 42, description: 'Mentions #9 in passing.', comments: { nodes: [] } },
+				},
+			});
+
+			await expect(provider.listBlockers(ISSUE_NODE.id)).resolves.toEqual([]);
+		});
+	});
+
+	describe('addBlockedBy', () => {
+		it('records the blocker as the relation source', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([]),
+				CreateIssueRelation: { issueRelationCreate: { success: true } },
+			});
+
+			await provider.addBlockedBy(ISSUE_NODE.id, 'issue-7');
+
+			expect(variablesSentTo('CreateIssueRelation')).toEqual([
+				{ input: { issueId: 'issue-7', relatedIssueId: ISSUE_NODE.id, type: 'blocks' } },
+			]);
+		});
+
+		it('does not write again when Linear already holds the relation', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([{ type: 'blocks', issue: blockerIssue(7) }]),
+			});
+
+			await provider.addBlockedBy(ISSUE_NODE.id, 'issue-7');
+
+			expect(variablesSentTo('CreateIssueRelation')).toEqual([]);
+		});
+
+		it('treats a duplicate-relation rejection as success', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([]),
+				CreateIssueRelation: () => {
+					throw new Error('Linear API error: duplicate issue relation');
+				},
+			});
+
+			await expect(provider.addBlockedBy(ISSUE_NODE.id, 'issue-7')).resolves.toBeUndefined();
+		});
+
+		it('rethrows any other failure to record the relation', async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([]),
+				CreateIssueRelation: () => {
+					throw new Error('Linear API error: insufficient permissions');
+				},
+			});
+
+			await expect(provider.addBlockedBy(ISSUE_NODE.id, 'issue-7')).rejects.toThrow(
+				'insufficient permissions',
+			);
+		});
+	});
+
+	// The gate the phase-5 registration depends on, asserted here too so it fails in
+	// this suite rather than only once a manifest exists: the PM conformance suite
+	// rejects any *registered* provider whose method source still carries the
+	// stubbed-method wording (`tests/unit/integrations/pm/pm-conformance.test.ts`).
+	it('carries no stub sentinel on any contract method', () => {
+		const contractMethods = [
+			'getWorkItem',
+			'listWorkItems',
+			'findWorkItemByUrlSuffix',
+			'findWorkItemForArtifact',
+			'findWorkItemByDescriptionMarker',
 			'moveWorkItem',
 			'addComment',
 			'findComment',
@@ -442,8 +954,8 @@ describe('LinearPMProvider', () => {
 			'listBlockers',
 			'addBlockedBy',
 		] as const;
-		for (const method of pending) {
-			expect(String(provider[method]), method).toMatch(/\bnot\s+implemented\b/i);
+		for (const method of contractMethods) {
+			expect(String(provider[method]), method).not.toMatch(/\bnot\s+implemented\b/i);
 		}
 	});
 });
