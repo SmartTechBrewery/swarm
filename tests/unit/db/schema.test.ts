@@ -29,12 +29,22 @@ describe('db schema', () => {
 				'worktree_root',
 				'base_branch',
 				'branch_prefix',
+				'scm_type',
 				'pm_type',
 				'pm_config',
 				'credentials',
 			]) {
 				expect(columns.has(name), `missing column ${name}`).toBe(true);
 			}
+		});
+
+		// NULL is "this project states no SCM provider", which resolves to the sole
+		// runtime-ready one (issue #478). A NOT NULL default of 'github' would turn every
+		// existing row into a project that *states* GitHub and hide the loud "set scm"
+		// error a second runtime-ready provider is supposed to raise.
+		it('leaves scm_type nullable with no default, so an unstated provider stays unstated', () => {
+			expect(columns.get('scm_type')?.notNull).toBe(false);
+			expect(columns.get('scm_type')?.default).toBeUndefined();
 		});
 
 		it('has no org_id — single-user scope, no organizations table', () => {

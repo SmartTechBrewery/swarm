@@ -103,7 +103,8 @@ The file is `{ "projects": [ … ] }` — a non-empty array of project objects. 
 | --- | --- | --- |
 | `id` | **required** | Stable internal project id; one Postgres row per project. |
 | `name` | **required** | Human-facing name; also `{project-name}` in worktree paths. |
-| `repo` | **required** | GitHub repo as `owner/repo`. |
+| `repo` | **required** | The repository this project operates on, as `owner/repo` — interpreted by the provider `scm` names (Bitbucket reads it as `workspace/repo_slug`, GitLab as `namespace/project`; see [`credentials`](#project-config-swarmconfigjson) below). |
+| `scm` | optional | The SCM provider this project's repository lives on — `github`, `bitbucket`, or `gitlab` (`ScmType`, `src/scm/types.ts`). The discriminator `requireProjectSCMProvider` resolves, so several providers can be runtime-ready at once and each project's operations route to its own. **Omit it and the project resolves to the sole runtime-ready registered provider**, which is why an existing installation needs no config change — today only GitHub is runtime-ready, so every project resolves to it either way. Naming a provider that is not registered, or one that is registered but not yet runtime-ready (Bitbucket and GitLab today — their contracts are complete, but each is declared ready by the issue that completes it), fails loudly and names the project and what it asked for; SWARM never falls back to another provider. Omitting it once two or more providers are runtime-ready also fails, telling you to set this field rather than guessing. |
 | `repoRoot` | **required** | Absolute path to the main repo checkout on the dev machine. |
 | `worktreeRoot` | `.swarm-workspaces` | Directory under `repoRoot` for per-task git worktrees. |
 | `baseBranch` | `main` | Branch worktrees are cut from and PRs target. |

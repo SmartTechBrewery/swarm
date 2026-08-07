@@ -52,6 +52,14 @@ describe('toWorkerConfig', () => {
 		}
 	});
 
+	// The DB-free worker resolves its own SCM provider from the assignment's config
+	// (`src/transport/assignment-execution.ts`), so the discriminator has to survive
+	// the projection — and stay absent when the project states none (issue #478).
+	it("carries the project's scm discriminator, and omits it when unstated", () => {
+		expect(toWorkerConfig(createMockProjectConfig({ scm: 'bitbucket' })).scm).toBe('bitbucket');
+		expect(toWorkerConfig(createMockProjectConfig()).scm).toBeUndefined();
+	});
+
 	it('returns a fresh object and does not mutate the source (local path intact)', () => {
 		const project = createMockProjectConfig();
 		const worker = toWorkerConfig(project);

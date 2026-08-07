@@ -17,7 +17,9 @@
  * into the trigger context). The outbound, project-scoped mutations joined with
  * issue #386 via {@link requireProjectSCMProvider} — phase delivery, the
  * worker's PR-title read and failure comments, durable merge execution, and the
- * router's server-side delivery default.
+ * router's server-side delivery default. That project-scoped lookup selects on
+ * the `ProjectConfig.scm` discriminator since issue #478, so several providers
+ * can be runtime-ready at once with each project routing to its own.
  *
  * Duplicate-id registrations throw — that's how a provider module cloned from a
  * sibling but not renamed gets caught at startup rather than silently shadowing
@@ -69,34 +71,69 @@ export function requireSCMProvider(id: string): SCMProvider {
  * failure comments, durable merge execution, the router's server-side delivery)
  * so none of them names a concrete provider (ai/RULES.md §2).
  *
- * Deliberately **no selection logic and no fallback ordering**: `ProjectConfig`
- * carries no provider discriminator (`src/config/schema.ts`) and exactly one SCM
- * provider is runtime-ready, so "this project's provider" is unambiguous today.
- * Inventing a config field or a preference order before a second provider exists
- * would be speculative (ai/CODING_STANDARDS.md); instead this asserts the
- * invariant and throws the moment it stops holding, so project→provider
- * selection gets designed *with* the second provider rather than silently
- * resolving to whichever manifest happened to register first.
+ * Real project→provider selection since issue #478, keyed on the config
+ * discriminator `ProjectConfig.scm` (`src/config/schema.ts`) — the SCM twin of
+ * `pm.type`, validated at the config boundary rather than pattern-matched here.
+ * Two or more providers can therefore be runtime-ready at once, each project
+ * routing to its own:
  *
- * The assertion counts only *runtime-ready* manifests
- * ({@link SCMProviderManifest.runtimeReady}), so providers nothing selects yet —
- * Bitbucket (issue #296) and GitLab (issue #295), whose contracts are complete
- * but which no project resolves to — can register without answering for every
- * project. The forcing function is unchanged: the second manifest to claim
- * runtime readiness lands here as a throw.
+ * - **`project.scm` set** — the named manifest, which must be registered *and*
+ *   runtime-ready ({@link SCMProviderManifest.runtimeReady}). Either miss throws
+ *   naming the project and what it asked for; neither ever falls back to another
+ *   provider, since resolving a project's operations onto a provider it did not
+ *   name is the exact failure this lookup exists to prevent.
+ * - **`project.scm` absent** — the sole runtime-ready provider. That is what keeps
+ *   every installation predating the discriminator working with no config change.
+ *   It is a statement of an unambiguous situation, not a preference order: with
+ *   zero or with two or more runtime-ready providers there is no "the" provider, so
+ *   this throws and tells the operator to set `scm` rather than picking whichever
+ *   manifest registered first.
+ *
+ * The runtime-ready filter still gates a *selected* provider too: a manifest that
+ * declares `runtimeReady: false` is registered so its own tests and follow-up work
+ * can resolve it by id, and is deliberately unable to serve traffic until the work
+ * completing that provider flips the flag. {@link requireSCMProvider} stays exempt
+ * from the filter — its id comes from an enqueued job's envelope, written by this
+ * process's own ingress, and that lookup must stay event-accurate.
  */
 export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
+	const selected = project.scm;
+	if (selected) {
+		const manifest = getSCMProvider(selected);
+		if (!manifest) {
+			throw new Error(
+				`Cannot resolve the SCM provider for project '${project.id}': it selects '${selected}', ` +
+					'which is not registered — is that provider implemented, and did ' +
+					`src/integrations/entrypoint.ts fail to load? Registered: ${describeIds(registry)}.`,
+			);
+		}
+		if (!isRuntimeReadySCMProvider(manifest)) {
+			throw new Error(
+				`Cannot resolve the SCM provider for project '${project.id}': it selects '${selected}', ` +
+					'which is registered but not runtime-ready (SCMProviderManifest.runtimeReady), so it ' +
+					'cannot serve traffic yet — SWARM will not fall back to another provider. ' +
+					`Runtime-ready: ${describeIds(registry.filter(isRuntimeReadySCMProvider))}.`,
+			);
+		}
+		return manifest.provider;
+	}
+
 	const runtimeReady = registry.filter(isRuntimeReadySCMProvider);
 	const only = runtimeReady[0];
 	if (runtimeReady.length !== 1 || !only) {
 		throw new Error(
-			`Cannot resolve the SCM provider for project '${project.id}': ` +
-				`${runtimeReady.length} runtime-ready of ${registry.length} registered, expected exactly ` +
-				'one — did src/integrations/entrypoint.ts fail to load, or did a second provider register ' +
-				'as runtime-ready before project→provider selection existed?',
+			`Cannot resolve the SCM provider for project '${project.id}': it selects no provider and ` +
+				`${runtimeReady.length} of ${registry.length} registered are runtime-ready, expected ` +
+				`exactly one — set "scm" on the project config to one of: ${describeIds(runtimeReady)} ` +
+				'(or did src/integrations/entrypoint.ts fail to load?).',
 		);
 	}
 	return only.provider;
+}
+
+/** Render manifest ids for an error message, so an empty list reads as words rather than as nothing. */
+function describeIds(manifests: readonly SCMProviderManifest[]): string {
+	return manifests.length ? manifests.map((manifest) => manifest.id).join(', ') : 'none';
 }
 
 export function listSCMProviders(): readonly SCMProviderManifest[] {

@@ -26,6 +26,9 @@ import { linearConfigSchema } from '../integrations/pm/linear/config-schema.js';
 // Registry lookup only — `./registry.js` imports nothing at runtime, so this stays a
 // leaf import rather than pulling the provider implementations in behind it.
 import { getPMProvider } from '../integrations/pm/registry.js';
+// The Zod mirror of `ScmType`; `../scm/events.js` imports only zod plus a type-only
+// `ScmType`, so this stays a leaf import too.
+import { ScmProviderIdSchema } from '../scm/events.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
 
 /**
@@ -552,6 +555,39 @@ export const ProjectConfigBaseSchema = z.object({
 
 	/** The GitHub repository this project operates on, as `owner/repo`. */
 	repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
+
+	/**
+	 * The SCM provider this project's repository lives on — the discriminator
+	 * `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`) resolves, and
+	 * the SCM twin of `pm`'s `type` (issue #478). `repo` is the coordinates *this*
+	 * provider interprets (`owner/repo`, a Bitbucket `workspace/repo_slug`, a GitLab
+	 * `namespace/project`), which is why the discriminator is stated rather than
+	 * inferred from the repo string: there is nothing in a bare `owner/repo` to tell
+	 * two providers apart.
+	 *
+	 * **Optional, and absent means "the sole runtime-ready registered provider"**, so
+	 * every project written before this field existed keeps resolving unchanged with
+	 * no config migration. Absence is not a silent pick: with zero — or two or more —
+	 * runtime-ready providers registered, the lookup throws and names this field.
+	 * Naming a provider that is unregistered, or registered but not runtime-ready
+	 * (`SCMProviderManifest.runtimeReady`), also throws rather than falling back to
+	 * another provider.
+	 *
+	 * A bare provider id rather than a `pm`-style discriminated union on purpose: an
+	 * SCM manifest declares no `configSchema` (a project's SCM config is `repo` +
+	 * `credentials`, shared by every provider — issue #290), so there is no
+	 * provider-owned block for a discriminator to sit beside. If one ever appears,
+	 * this field is what becomes that union's `type`.
+	 *
+	 * Deliberately *not* cross-checked against the registry here: a config may be
+	 * parsed by a surface that never loaded `src/integrations/entrypoint.js` (a
+	 * dashboard bundle, a focused unit test, the DB-free worker's
+	 * `reconstructProjectConfig`), and validation must not depend on which modules a
+	 * process happens to import — the same reasoning `validatePmCredentialRoles`
+	 * below applies to `pm.type`. The enum is the boundary validation; the registry
+	 * check is the lookup's loud error.
+	 */
+	scm: ScmProviderIdSchema.optional(),
 
 	/**
 	 * Absolute path to the main repository checkout on the developer's machine

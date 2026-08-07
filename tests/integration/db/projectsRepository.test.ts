@@ -63,6 +63,32 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 			expect(resolved?.pipeline?.planning?.autoAdvance).toBe(true);
 		});
 
+		// The `scm_type` column added by issue #478. What a stubbed-DB unit test cannot
+		// prove is that the migration actually added a *nullable* column: a NOT NULL one
+		// would reject the second insert here, and a defaulted one would hand back
+		// `'github'` for a project that states nothing — turning the loud "set scm" error
+		// into a silent pick the moment a second provider goes runtime-ready.
+		it('round-trips the scm discriminator, and keeps an unstated one unstated', async () => {
+			await createProjectInDb(
+				createMockProjectConfig({
+					id: 'proj-scm-stated',
+					name: 'Stated SCM Project',
+					repo: 'jkwiecien/stated-scm',
+					scm: 'bitbucket',
+				}),
+			);
+			await createProjectInDb(
+				createMockProjectConfig({
+					id: 'proj-scm-unstated',
+					name: 'Unstated SCM Project',
+					repo: 'jkwiecien/unstated-scm',
+				}),
+			);
+
+			expect((await findProjectByIdFromDb('proj-scm-stated'))?.scm).toBe('bitbucket');
+			expect((await findProjectByIdFromDb('proj-scm-unstated'))?.scm).toBeUndefined();
+		});
+
 		// The board mapping now lives under `pm`, persisted as `pm_type` + the renamed
 		// `pm_config` jsonb column (issue #495). Assert the union member survives a real
 		// Postgres round-trip, and that the board lookup still matches inside the blob —

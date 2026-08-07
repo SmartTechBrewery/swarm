@@ -25,12 +25,16 @@ import { type ProjectConfig, ProjectConfigBaseSchema } from './schema.js';
 
 /**
  * Fields safe and meaningful to travel to a worker inside a task assignment:
- * project identity and the worktree/branch/agent settings shared across hosts.
+ * project identity and the worktree/branch/agent settings shared across hosts,
+ * plus `scm` — the project's SCM provider discriminator (issue #478), which is
+ * non-secret and is what lets a DB-free worker resolve its own provider through
+ * `requireProjectSCMProvider` (`src/transport/assignment-execution.ts`).
  */
 export const WORKER_SAFE_KEYS = [
 	'id',
 	'name',
 	'repo',
+	'scm',
 	'worktreeRoot',
 	'baseBranch',
 	'branchPrefix',

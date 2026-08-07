@@ -71,10 +71,14 @@ describe('SCM provider conformance', () => {
 		expect(new Set(ids).size).toBe(ids.length);
 	});
 
-	// Exactly one runtime-ready provider is today's invariant, and the project-scoped
-	// lookup asserts it (`requireProjectSCMProvider`). A second one claiming readiness
-	// must land together with project→provider selection, so this fails loudly first.
-	it('has exactly one runtime-ready provider, since nothing selects between them yet', () => {
+	// Project→provider selection exists since issue #478 (`ProjectConfig.scm`), so
+	// several providers *can* be runtime-ready at once — the two-projects-two-providers
+	// case is asserted in `registry.test.ts`, against fake manifests, because this suite
+	// runs over the real registrations. What is left here is a deliberate tripwire: only
+	// GitHub claims readiness today, and flipping any other provider's flag is a
+	// decision made in the issue completing that provider (#457 for Bitbucket), together
+	// with its served ingress route — never a side effect of unrelated work.
+	it('has exactly one runtime-ready provider, since no other provider has been declared complete', () => {
 		expect(manifests.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual(['github']);
 	});
 
