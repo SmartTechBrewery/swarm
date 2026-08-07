@@ -37,6 +37,7 @@ import type { SwarmUser } from '../identity/schema.js';
 import { buildCorsMiddleware } from '../lib/cors.js';
 import { isSingleUserMode } from '../lib/env.js';
 import { configureLogger, logger } from '../lib/logger.js';
+import { startHostMaintenance } from './maintenance.js';
 import { appRouter } from './router.js';
 import type { TrpcContext } from './trpc.js';
 
@@ -178,15 +179,26 @@ export function createApiApp(
 }
 
 // Entrypoint bootstrap — only when executed directly, so tests can import the
-// factory without binding a port (mirrors src/router/index.ts).
+// factory without binding a port (or starting the maintenance timers below —
+// they belong to the process, not to the app). Mirrors src/router/index.ts.
 if (import.meta.url === `file://${process.argv[1]}`) {
 	configureLogger({ component: 'api' });
 	const port = Number(process.env.API_PORT ?? 3101);
 	const app = createApiApp();
+	// Control-plane host maintenance (issue #550): the orphaned-run reap, CLI quota
+	// discovery, and the worktree retention sweep. This process is the one on the
+	// control-plane host that has all three of `DATABASE_URL`, the operator's PATH,
+	// and the repository checkout. A no-op in `in-process` dispatch mode, where the
+	// host worker still reaches its own copies (`src/api/maintenance.ts`).
+	const maintenance = startHostMaintenance();
 	const server = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
 		logger.debug('swarm-api: listening', { port, hostname: '127.0.0.1' });
 	});
 	for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-		process.on(signal, () => server.close(() => process.exit(0)));
+		process.on(signal, () =>
+			server.close(() => {
+				void Promise.resolve(maintenance?.close()).finally(() => process.exit(0));
+			}),
+		);
 	}
 }

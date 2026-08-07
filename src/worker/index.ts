@@ -271,6 +271,8 @@ if (executionSession) {
 // authenticated worker or worker-less local runs, so another live host's runs
 // are never reaped.
 // Best-effort: a hiccup must not stop the worker from serving jobs.
+// In-process path only — `transport` mode returns above, and the API server owns
+// the worker-less half of this reap there (`src/api/maintenance.ts`, issue #550).
 try {
 	const reconciled = await failOrphanedRunningRuns(
 		'Worker restarted while this run was in progress',
@@ -296,6 +298,10 @@ await reconcileDispatchesAtStartup();
 // via `runAgentCli`'s signal option) instead of outliving the stop grace period.
 const shutdown = new AbortController();
 
+// In-process path only, and it has no counterpart anywhere else: these Redis slot
+// counters serve unfederated in-process execution alone (federated capacity lives
+// in durable dispatch claims), so `transport` mode needs no owner for them and
+// they retire with this path rather than moving (issue #550).
 async function resetProjectSlots(): Promise<void> {
 	try {
 		const projects = await listAllProjectsFromDb();
@@ -320,6 +326,8 @@ async function resetProjectSlots(): Promise<void> {
 
 await resetProjectSlots();
 
+// In-process path only — `transport` mode returns above, where the API server
+// runs this instead (`src/api/maintenance.ts`, issue #550).
 async function runQuotaDiscovery(cheap = false): Promise<void> {
 	try {
 		logger.debug('Starting CLI capability/quota discovery...', { cheap });
@@ -474,6 +482,8 @@ const cancellationSubscription = subscribeToRunCancellations((runId) => {
 
 logger.debug('swarm-worker started', { queue: QUEUE_NAME, concurrency });
 
+// In-process path only — `transport` mode returns above, where the API server
+// runs this instead (`src/api/maintenance.ts`, issue #550).
 async function runWorktreeSweep(): Promise<void> {
 	try {
 		logger.debug('Starting background worktree retention sweep');

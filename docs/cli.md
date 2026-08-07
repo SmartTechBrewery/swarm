@@ -320,7 +320,7 @@ repo root.
 
 | Script | Description |
 | --- | --- |
-| `npm run dev:api` | Migrate the DB, free `API_PORT`, then start the API server (`:3101`) with `--watch`. In dev it serves the API only; it also serves the built dashboard SPA from `dashboard/dist` when that exists. |
+| `npm run dev:api` | Migrate the DB, free `API_PORT`, then start the API server (`:3101`) with `--watch`. In dev it serves the API only; it also serves the built dashboard SPA from `dashboard/dist` when that exists. Under `SWARM_DISPATCH_MODE=transport` it additionally runs the control-plane host maintenance loop — the orphaned-run reap, CLI quota discovery, and the worktree retention sweep (`src/api/maintenance.ts`, issue #550) — which the host worker owns in `in-process` mode. |
 | `npm run start:api` | Build the dashboard, then run `dev:api` — the recommended **same-origin** mode where one process serves the SPA + API on `:3101` (used for public/tunnel access). |
 | `npm run reload` | After `git pull`: sync both dependency trees, rebuild the dashboard (`dist`, picked up live by a running `dev:api`/`start:api` since it serves `dist` from disk), and apply migrations. Does **not** restart the worker or rebuild the router — do those manually if their code changed (it prints the reminder). |
 | `npm run dev:worker` | Migrate the DB, then start the host worker (BullMQ consumer). This is how the worker runs — it is not in Docker Compose. Runs one job at a time by default; append `-- --concurrency <n>` to run up to N at once (overrides `SWARM_WORKER_CONCURRENCY`). |
