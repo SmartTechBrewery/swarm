@@ -34,6 +34,16 @@
  * will not recognise, silently stranding the item in "In review" forever with
  * nothing to trigger Review, let alone Respond-to-review after it.
  *
+ * **An attempt that finds the work already delivered adopts it** (issue #558).
+ * Delivery progress is recorded in the worktree, but an interrupted dispatch is
+ * re-dispatched to whichever worker is eligible — which may be a machine holding
+ * none of that state. So before running the agent this phase asks the SCM whether
+ * its task branch already has an open PR; if it does, an earlier attempt already
+ * implemented and pushed the task, and what this one owes is the *rest* of that
+ * delivery (the PR-link comment and the status move), not a second implementation.
+ * Without it, the second attempt produced a divergent commit that could never be
+ * pushed, and burned its whole retry budget on the identical rejection.
+ *
  * This is the phase's orchestration only. It composes the building blocks that
  * already exist — `GitWorktreeManager` (SWARM-14), `graftEnvironment` (SWARM-15),
  * `runAgentCli` (SWARM-16), the `PMProvider` contract (SWARM-11) — and takes them
@@ -81,12 +91,14 @@ import {
 	hasDeliveryProgress,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
+	pushDeliveredBranch,
 	readHandoff,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
+	shouldDeferDeliveryFailure,
 } from '@/scm/delivery.js';
-import { SWARM_GENERATED_SIGNATURE } from '@/scm/swarm-origin.js';
+import { SWARM_GENERATED_SIGNATURE, swarmMarker } from '@/scm/swarm-origin.js';
 import { GitWorktreeManager, type WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 
@@ -199,11 +211,31 @@ export interface ImplementationPhaseResult {
 }
 
 /**
+ * Per-delivery idempotency marker on the PR-link comment (issue #558). Mirrors
+ * Planning's `planDeliveryMarker` and shares the `<!-- swarm-… -->` frame so
+ * comment loop prevention still recognises the body (`isSwarmGeneratedBody`,
+ * `src/scm/swarm-origin.ts`).
+ *
+ * The id is {@link deliveryIdentity} over (phase, repo, task, branch), so it is
+ * the *same* for every attempt at one task's implementation — including an
+ * attempt that resumes on a different worker with none of the first one's local
+ * state. That is what lets a resumed delivery find the comment it already posted
+ * instead of posting a second "Implementation complete" under the same PR link.
+ */
+export function implementationDeliveryMarker(deliveryId: string): string {
+	return swarmMarker('implementation-delivery', deliveryId);
+}
+
+/**
  * Wrap the opened PR URL in a comment body that marks it as SWARM's
  * implementation output and points the human at the open PR. The trailing note
  * reflects whether automated Review is enabled for the project.
  */
-export function implementationCommentBody(prUrl: string, reviewEnabled = true): string {
+export function implementationCommentBody(
+	prUrl: string,
+	reviewEnabled = true,
+	deliveryId?: string,
+): string {
 	const note = reviewEnabled
 		? `${SWARM_GENERATED_SIGNATURE} (Implementation phase). This item has moved to **In review**._`
 		: `${SWARM_GENERATED_SIGNATURE} (Implementation phase). Automated Review is disabled; this item remains **In progress**._`;
@@ -214,7 +246,30 @@ export function implementationCommentBody(prUrl: string, reviewEnabled = true): 
 		'',
 		'---',
 		note,
+		...(deliveryId ? ['', implementationDeliveryMarker(deliveryId)] : []),
 	].join('\n');
+}
+
+/**
+ * Post the PR-link comment at most once per implementation delivery: an attempt
+ * that resumes after an earlier one already commented reuses that comment rather
+ * than adding a duplicate. Legacy mode passes no `deliveryId` and always posts,
+ * exactly as before.
+ */
+async function postImplementationComment(
+	pm: PMProvider,
+	workItemId: string,
+	prUrl: string,
+	reviewEnabled: boolean,
+	deliveryId?: string,
+): Promise<string> {
+	const existing = deliveryId
+		? await pm.findComment(workItemId, implementationDeliveryMarker(deliveryId))
+		: undefined;
+	return (
+		existing ??
+		(await pm.addComment(workItemId, implementationCommentBody(prUrl, reviewEnabled, deliveryId)))
+	);
 }
 
 /**
@@ -413,6 +468,53 @@ export async function runImplementationPhase(
 	try {
 		graft(project.repoRoot, handle.path);
 
+		// Deterministic delivery is resolved *before* the agent, not after: the
+		// already-delivered probe below has to ask the SCM about this task's branch
+		// while there is still an agent run to skip.
+		const delivery = legacyMode
+			? undefined
+			: (options.delivery ??
+				(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer')));
+		const deliveryId = deliveryIdentity(['implementation', project.repo, taskId, handle.branch]);
+
+		// Already delivered by an earlier attempt (issue #558). An interruption after
+		// the push — a control-plane restart, a worker shutdown, a lost socket — puts
+		// the dispatch back in the pool, and the attempt that picks it up may land on a
+		// machine holding none of the first one's worktree, so the local progress
+		// sidecar cannot answer "did this task already deliver?". The open PR on the
+		// task branch can, and it is the same answer on every host: an attempt that
+		// finds one owes the *rest* of the delivery, not a second implementation of the
+		// task. Running the agent again is what produced a divergent second commit that
+		// could never be pushed. Skipped when the checkout's own progress file already
+		// claimed this delivery (`deliveryResumed`) — that resume is strictly better
+		// informed, and it still short-circuits the agent.
+		if (delivery && !deliveryResumed) {
+			const delivered = await delivery.findPullRequest(handle.branch);
+			if (delivered) {
+				logger.info('Implementation already delivered — adopting the open PR, skipping the agent', {
+					taskId,
+					workItemId: workItem.id,
+					branch: handle.branch,
+					prUrl: delivered.url,
+				});
+				const commentId = await postImplementationComment(
+					pm,
+					workItem.id,
+					delivered.url,
+					reviewEnabled,
+					deliveryId,
+				);
+				if (reviewEnabled) await pm.moveWorkItem(workItem.id, NEXT_STATUS);
+				return {
+					prUrl: delivered.url,
+					branch: handle.branch,
+					commentId,
+					movedTo: reviewEnabled ? NEXT_STATUS : undefined,
+					agent: resumedDeliveryAgent(cli),
+				};
+			}
+		}
+
 		const shouldResumeDelivery = !legacyMode && deliveryResumed;
 		const agent = shouldResumeDelivery
 			? resumedDeliveryAgent(cli)
@@ -496,10 +598,8 @@ export async function runImplementationPhase(
 			};
 		}
 		const handoff = readHandoff(handle.path, OPENED_PR_FILENAME, ImplementationHandoffSchema);
-		const delivery =
-			options.delivery ??
-			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
-		const deliveryId = deliveryIdentity(['implementation', project.repo, taskId, handle.branch]);
+		// Resolved above, before the agent ran; non-legacy mode always has one.
+		if (!delivery) throw new Error('Implementation delivery provider is unavailable');
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);
 		if (!progress.commitSha) {
@@ -511,7 +611,7 @@ export async function runImplementationPhase(
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (!progress.pushed) {
-			await delivery.pushBranch(handle.path, handle.branch, progress.commitSha);
+			await pushDeliveredBranch(delivery, handle.path, handle.branch, progress.commitSha);
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}
@@ -530,9 +630,12 @@ export async function runImplementationPhase(
 		}
 		const prUrl = progress.pullRequestUrl;
 
-		const commentId = await pm.addComment(
+		const commentId = await postImplementationComment(
+			pm,
 			workItem.id,
-			implementationCommentBody(prUrl, reviewEnabled),
+			prUrl,
+			reviewEnabled,
+			deliveryId,
 		);
 		if (reviewEnabled) {
 			await pm.moveWorkItem(workItem.id, NEXT_STATUS);
@@ -555,7 +658,12 @@ export async function runImplementationPhase(
 			agent,
 		};
 	} catch (error) {
-		if (!legacyMode && hasDeliveryProgress(handle.path)) {
+		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
+		// settles terminally instead of retrying a push that can never succeed (#558):
+		// deferring would also preserve the checkout, denying the branch to the phase
+		// that could unblock the PR. The delivered commit survives on the local branch
+		// ref after the cleanup below, so nothing is lost to inspection.
+		if (!legacyMode && shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Implementation delivery deferred for retry', {
 				cause: error,

@@ -201,6 +201,91 @@ describe('GitWorktreeManager', () => {
 			expect(handle.branch).toBe('issue-14-some-feature');
 		});
 
+		// Issue #558. `git worktree remove` leaves the branch behind, and the reap
+		// deliberately keeps one `origin` also has (a PR may depend on it) — so an
+		// operator who cleaned up a preserved checkout by hand must not find the next
+		// attempt failing differently on the leftover ref.
+		it('checks the task branch out when it survived the reap, instead of failing on -b', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'branch' && args[1] === '--list') return { stdout: '  issue-14\n' };
+				// `origin` has it too, so the reap keeps it.
+				if (args[0] === 'ls-remote') return { stdout: 'abc123\trefs/heads/issue-14\n' };
+				return { stdout: '' };
+			};
+
+			const handle = await makeManager().provision('14');
+
+			expect(gitCalls).not.toContainEqual(['branch', '-D', 'issue-14']);
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', WORKTREE_14, 'issue-14']);
+			expect(handle).toEqual({
+				taskId: '14',
+				path: WORKTREE_14,
+				branch: 'issue-14',
+				detached: false,
+			});
+		});
+
+		// Issue #558. A checkout preserved for its own retry holds the branch, and git
+		// allows one checkout per branch — which used to make every *other* phase
+		// needing that branch (Respond-to-review on the open PR) unrunnable on sight.
+		it('provisions a detached checkout when another worktree holds the branch', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'worktree' && args[1] === 'list')
+					return {
+						stdout: [
+							`worktree ${REPO_ROOT}`,
+							'branch refs/heads/main',
+							'',
+							`worktree ${WORKTREE_14}`,
+							'branch refs/heads/issue-14',
+							'',
+						].join('\n'),
+					};
+				return { stdout: '' };
+			};
+
+			const handle = await makeManager().provision('99', {
+				createBranch: false,
+				branch: 'issue-14',
+			});
+
+			// Detached at the remote tip: for a branch a PR is open on, `origin` is the
+			// authority, and starting from a stale local ref is what produces a push
+			// that can never fast-forward.
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'--detach',
+				`${REPO_ROOT}/.swarm-workspaces/task-99`,
+				'origin/issue-14',
+			]);
+			// The handle still names the branch the delivery targets: commits are made
+			// on the detached HEAD and pushed as `<sha>:refs/heads/<branch>`.
+			expect(handle).toMatchObject({ branch: 'issue-14', detached: true });
+		});
+
+		it('detaches at the local branch when origin has no matching ref', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'worktree' && args[1] === 'list')
+					return { stdout: `worktree ${WORKTREE_14}\nbranch refs/heads/issue-14\n` };
+				if (args[0] === 'rev-parse' && args[1] === '--verify') throw new Error('unknown revision');
+				return { stdout: '' };
+			};
+
+			await makeManager().provision('99', { createBranch: false, branch: 'issue-14' });
+
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'--detach',
+				`${REPO_ROOT}/.swarm-workspaces/task-99`,
+				'issue-14',
+			]);
+		});
+
 		it('honours explicit branch and baseBranch overrides', async () => {
 			await makeManager().provision('14', { branch: 'hotfix', baseBranch: 'develop' });
 			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'hotfix', WORKTREE_14, 'develop']);
@@ -620,12 +705,22 @@ describe('GitWorktreeManager', () => {
 			const project = createMockProjectConfig({ id: 'project-1', repoRoot: REPO_ROOT });
 			const manager = new GitWorktreeManager(project);
 
+			// The reclaim deletes the branch ref the removed checkout was on, so
+			// `branch --list` must stop reporting it afterwards — otherwise the
+			// provision that follows would (correctly) check the surviving branch out
+			// instead of cutting it fresh (issue #558).
+			let branchDeleted = false;
 			gitHandler = (args) => {
 				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
 				if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref')
 					return { stdout: 'origin/issue-14\n' };
 				if (args[0] === 'rev-list' && args[1] === '--count') return { stdout: '0\n' };
-				if (args[0] === 'branch' && args[1] === '--list') return { stdout: '  issue-14\n' };
+				if (args[0] === 'branch' && args[1] === '-D') {
+					branchDeleted = true;
+					return { stdout: '' };
+				}
+				if (args[0] === 'branch' && args[1] === '--list')
+					return { stdout: branchDeleted ? '' : '  issue-14\n' };
 				if (args[0] === 'ls-remote') return { stdout: 'abc123\trefs/heads/issue-14\n' };
 				return { stdout: '' };
 			};

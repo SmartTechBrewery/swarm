@@ -69,12 +69,13 @@ import {
 	DeliveryDeferredError,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
-	hasDeliveryProgress,
 	loadDeliveryProgress,
+	pushDeliveredBranch,
 	readHandoff,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
+	shouldDeferDeliveryFailure,
 } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
@@ -356,7 +357,7 @@ export async function runRespondToCiPhase(
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (progress.commitSha && !progress.pushed) {
-			await delivery.pushBranch(handle.path, prBranch, progress.commitSha);
+			await pushDeliveredBranch(delivery, handle.path, prBranch, progress.commitSha);
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}
@@ -374,7 +375,9 @@ export async function runRespondToCiPhase(
 
 		return { outcome, agent };
 	} catch (error) {
-		if (!legacyMode && hasDeliveryProgress(handle.path)) {
+		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
+		// settles terminally instead of retrying a push that can never succeed (#558).
+		if (!legacyMode && shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('CI-response delivery deferred for retry', { cause: error });
 		}
