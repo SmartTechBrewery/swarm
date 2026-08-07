@@ -68,6 +68,8 @@ export interface PmMappingProvider {
 	label: string;
 	/** Noun for a board/container (e.g. "board", "project"), used in picker copy. */
 	containerNoun: string;
+	/** Plural of {@link containerNoun}, used in picker copy. */
+	containerNounPlural: string;
 	/** Noun for a workflow state (e.g. "status", "column"), used in picker copy. */
 	stateNoun: string;
 	/**
@@ -89,6 +91,7 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		id: 'github-projects',
 		label: 'GitHub Projects',
 		containerNoun: 'board',
+		containerNounPlural: 'boards',
 		stateNoun: 'status',
 		stateNounPlural: 'statuses',
 		intro:
@@ -98,6 +101,7 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		id: 'linear',
 		label: 'Linear',
 		containerNoun: 'team',
+		containerNounPlural: 'teams',
 		stateNoun: 'workflow state',
 		stateNounPlural: 'workflow states',
 		intro:
@@ -137,6 +141,18 @@ function usesStatusFieldContext(form: BoardMappingForm): boolean {
 /** An empty option map with every canonical key present, for seeding blank state. */
 export function blankStatusOptions(): Record<PmStatusKey, string> {
 	return Object.fromEntries(STATUS_KEYS.map((key) => [key, ''])) as Record<PmStatusKey, string>;
+}
+
+/** Reset provider-scoped selections before moving the form to another provider. */
+export function withSelectedProvider(form: BoardMappingForm, providerId: string): BoardMappingForm {
+	if (form.providerId === providerId) return form;
+	return {
+		...form,
+		providerId,
+		containerId: '',
+		statusOptions: blankStatusOptions(),
+		providerContext: {},
+	};
 }
 
 /**

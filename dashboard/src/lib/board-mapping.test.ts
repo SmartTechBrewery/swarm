@@ -9,6 +9,7 @@ import {
 	isBoardMappingDirty,
 	STATUS_KEYS,
 	toBoardMappingForm,
+	withSelectedProvider,
 } from './board-mapping.js';
 
 const fullPm: ProjectPm = {
@@ -269,6 +270,18 @@ describe('isBoardMappingDirty', () => {
 		expect(
 			isBoardMappingDirty({ ...toBoardMappingForm(fullPm), providerId: 'linear' }, fullPm),
 		).toBe(true);
+	});
+});
+
+describe('withSelectedProvider', () => {
+	it('clears provider-scoped values so they cannot cross a provider switch', () => {
+		const switched = withSelectedProvider(toBoardMappingForm(fullPm), 'linear');
+		expect(switched).toEqual({
+			providerId: 'linear',
+			containerId: '',
+			statusOptions: blankStatusOptions(),
+			providerContext: {},
+		});
 	});
 });
 

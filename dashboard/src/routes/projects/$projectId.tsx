@@ -44,6 +44,7 @@ import {
 	blankStatusOptions as emptyBoardStatusOptions,
 	isBoardMappingDirty,
 	toBoardMappingForm,
+	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import {
 	anyCustomPromptError,
@@ -2058,19 +2059,7 @@ function ProjectDetailRouteComponent() {
 	};
 
 	const handleBoardMappingProvider = (providerId: string) => {
-		setBoardMapping((prev) => {
-			if (prev.providerId === providerId) return prev;
-			// Switching providers clears the selection wholesale: one provider's
-			// container/state IDs mean nothing to another, so carrying them over would
-			// save, say, a Projects v2 board node id as a Linear team id (issue #531).
-			return {
-				...prev,
-				providerId,
-				containerId: '',
-				statusOptions: emptyBoardStatusOptions(),
-				providerContext: {},
-			};
-		});
+		setBoardMapping((prev) => withSelectedProvider(prev, providerId));
 		updateMutation.reset();
 	};
 

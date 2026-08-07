@@ -9,6 +9,7 @@ import {
 	buildPmUpdate,
 	isBoardMappingDirty,
 	toBoardMappingForm,
+	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import type { ProjectPm } from '../../../../src/config/schema.js';
 import { BoardMappingPanel } from './board-mapping-panel.js';
@@ -57,19 +58,7 @@ function Harness({
 		<BoardMappingPanel
 			projectId="p1"
 			form={form}
-			onProviderChange={(providerId) =>
-				setForm((f) =>
-					f.providerId === providerId
-						? f
-						: {
-								...f,
-								providerId,
-								containerId: '',
-								statusOptions: blankStatusOptions(),
-								providerContext: {},
-							},
-				)
-			}
+			onProviderChange={(providerId) => setForm((f) => withSelectedProvider(f, providerId))}
 			onSelectContainer={(containerId) =>
 				setForm((f) =>
 					f.containerId === containerId
@@ -284,22 +273,15 @@ describe('BoardMappingPanel (issue #201)', () => {
 			});
 		});
 
-		it('clears the selected team when the provider is switched away', async () => {
+		it('keeps the mapping scoped to its persisted provider', async () => {
 			renderHarness({ initial: LINEAR_CONFIG });
 
 			const teamSelect = (await screen.findByLabelText(/Linear team/i)) as HTMLSelectElement;
 			expect(teamSelect.value).toBe('team-uuid');
-
-			fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'github-projects' } });
-
-			// A Linear team id must never survive as a GitHub Projects board selection.
-			const boardSelect = (await screen.findByLabelText(
-				/GitHub Projects board/i,
-			)) as HTMLSelectElement;
-			expect(boardSelect.value).toBe('');
 			expect(
-				(screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement).disabled,
-			).toBe(true);
+				within(screen.getByLabelText('Provider')).getByRole('option', { name: 'GitHub Projects' }),
+			).toHaveProperty('disabled', true);
+			expect(screen.getByText(/Change the PM provider in/)).not.toBeNull();
 		});
 	});
 
