@@ -21,12 +21,13 @@ import {
 	DeliveryDeferredError,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
-	hasDeliveryProgress,
 	loadDeliveryProgress,
+	pushDeliveredBranch,
 	readHandoff,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
+	shouldDeferDeliveryFailure,
 } from '../scm/delivery.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
@@ -316,7 +317,7 @@ export async function runResolveConflictsPhase(
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (!progress.pushed) {
-			await delivery.pushBranch(handle.path, prBranch, progress.commitSha);
+			await pushDeliveredBranch(delivery, handle.path, prBranch, progress.commitSha);
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}
@@ -335,7 +336,9 @@ export async function runResolveConflictsPhase(
 		logger.info('Phase finished - Resolve-conflicts', { taskId, prNumber, ...outcome });
 		return { agent, outcome };
 	} catch (error) {
-		if (hasDeliveryProgress(handle.path)) {
+		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
+		// settles terminally instead of retrying a push that can never succeed (#558).
+		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Conflict-resolution delivery deferred for retry', {
 				cause: error,

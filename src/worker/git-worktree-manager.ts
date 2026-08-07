@@ -101,7 +101,10 @@ export interface WorktreeHandle {
 	path: string;
 	/**
 	 * The branch checked out in the worktree. For a `detach`ed worktree there is no
-	 * branch — this holds the ref the detached HEAD was placed at (the base branch).
+	 * branch — this holds the ref the detached HEAD was placed at: the base branch
+	 * for a deliberately detached checkout ({@link ProvisionOptions.detach}), or the
+	 * branch the delivery still targets when the checkout was detached only because
+	 * another worktree holds that branch (issue #558, see `resolveBranchCheckout`).
 	 */
 	branch: string;
 	/** True when the worktree is in detached HEAD (see {@link ProvisionOptions.detach}). */
@@ -383,26 +386,43 @@ export class GitWorktreeManager {
 			);
 		}
 
-		const detached = options.detach ?? false;
+		const explicitlyDetached = options.detach ?? false;
 		// Detached HEAD has no branch; the handle reports the base ref it points at.
-		const branch = detached
+		const branch = explicitlyDetached
 			? baseBranch
 			: (options.branch ?? `${this.project.branchPrefix}${taskId}`);
 
-		if (createBranch && !detached) {
-			await this.reapOrphanedBranch(branch);
-		}
+		// Whether a local branch of this name survives into the checkout below. On the
+		// create path the reap already asked git, so its answer is reused rather than
+		// repeating `branch --list`; on the existing-branch path the branch is the
+		// caller's premise, so nothing is asked at all.
+		const localBranchExists =
+			createBranch && !explicitlyDetached ? await this.reapOrphanedBranch(branch) : !createBranch;
+
+		// What `git worktree add` can actually be asked for, which is not always what
+		// the caller asked for (issue #558) — see {@link resolveBranchCheckout}.
+		const checkout = explicitlyDetached
+			? { mode: 'detach' as const, ref: baseBranch }
+			: await this.resolveBranchCheckout(branch, createBranch, localBranchExists);
+		const detached = checkout.mode === 'detach';
 
 		const args = ['worktree', 'add'];
-		if (detached) {
-			args.push('--detach', path, baseBranch);
-		} else if (createBranch) {
+		if (checkout.mode === 'detach') {
+			args.push('--detach', path, checkout.ref);
+		} else if (checkout.mode === 'create') {
 			args.push('-b', branch, path, baseBranch);
 		} else {
 			args.push(path, branch);
 		}
 
-		logger.debug('Provisioning worktree', { taskId, path, branch, createBranch, detached });
+		logger.debug('Provisioning worktree', {
+			taskId,
+			path,
+			branch,
+			createBranch,
+			detached,
+			checkoutMode: checkout.mode,
+		});
 		await this.git(args);
 
 		await this.runtime.claim(this.project.id, taskId, leaseToken);
@@ -412,6 +432,91 @@ export class GitWorktreeManager {
 		// `cascade` symlink) are already checked out by `git worktree add`.
 
 		return { taskId, path, branch, detached };
+	}
+
+	/**
+	 * How to check `branch` out, given what this repository already holds (issue
+	 * #558). Git enforces two rules that turn ordinary leftovers into a phase that
+	 * cannot start at all, and both have a correct answer that is not "fail":
+	 *
+	 * - **The branch already exists locally.** `-b` refuses it. That is the state a
+	 *   worktree removed by hand leaves behind — `git worktree remove` never deletes
+	 *   the branch, and {@link reapOrphanedBranch} deliberately keeps one `origin`
+	 *   also has, because a PR may depend on it. So check the existing branch out
+	 *   instead of cutting it again: an Implementation retry wants exactly that
+	 *   branch, and the delivery it resumes is keyed to it.
+	 * - **The branch is checked out in another worktree.** Git allows one checkout per
+	 *   branch, so a *preserved* checkout kept for its own retry (`task-<id>`) made
+	 *   every other phase needing the same branch unrunnable — a Respond-to-review for
+	 *   the open PR failed on sight with `'<branch>' is already used by worktree at …`.
+	 *   Check the same commit out **detached** instead. Nothing in the delivery path
+	 *   needs the branch *ref* to be held: commits are made on the detached HEAD and
+	 *   pushed as `<sha>:refs/heads/<branch>` (`src/scm/delivery.ts`), so the phase
+	 *   runs and pushes exactly as it would have, while the preserved checkout keeps
+	 *   the branch it is pinned to. The ref preferred is `origin/<branch>` — for a
+	 *   branch a PR is open on, the remote is the authority, and starting from the
+	 *   local ref is what would produce a push that can never fast-forward.
+	 */
+	private async resolveBranchCheckout(
+		branch: string,
+		createBranch: boolean,
+		localBranchExists: boolean,
+	): Promise<{ mode: 'create' | 'checkout' } | { mode: 'detach'; ref: string }> {
+		// Only an existing branch can be held by a worktree, so a create-path branch
+		// that survived no reap needs no holder lookup — which is what keeps the
+		// ordinary first Implementation provision at exactly the git calls it made
+		// before.
+		const holder = localBranchExists ? await this.worktreeHoldingBranch(branch) : null;
+		if (holder) {
+			const ref = (await this.refExists(`refs/remotes/origin/${branch}`))
+				? `origin/${branch}`
+				: branch;
+			logger.warn('Branch is checked out in another worktree — provisioning a detached checkout', {
+				branch,
+				holder,
+				ref,
+			});
+			return { mode: 'detach', ref };
+		}
+		if (createBranch && localBranchExists) {
+			logger.info('Task branch already exists locally — checking it out instead of creating it', {
+				branch,
+			});
+			return { mode: 'checkout' };
+		}
+		return { mode: createBranch ? 'create' : 'checkout' };
+	}
+
+	/** Whether a ref resolves in this repository — used for `origin/<branch>`. */
+	private async refExists(ref: string): Promise<boolean> {
+		try {
+			await this.git(['rev-parse', '--verify', '--quiet', ref]);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * The path of the worktree that currently has `branch` checked out, or `null`
+	 * when none does. Read from `git worktree list --porcelain`, whose records pair a
+	 * `worktree <path>` line with the `branch refs/heads/<name>` line for a
+	 * non-detached checkout. Fails **open** (`null`) if git cannot answer: the
+	 * `worktree add` below then reports the real reason rather than this guessing one.
+	 */
+	private async worktreeHoldingBranch(branch: string): Promise<string | null> {
+		let stdout: string;
+		try {
+			stdout = await this.git(['worktree', 'list', '--porcelain']);
+		} catch {
+			return null;
+		}
+		let current: string | null = null;
+		for (const line of stdout.split('\n')) {
+			if (line.startsWith('worktree ')) current = line.slice('worktree '.length).trim();
+			else if (line.trim() === `branch refs/heads/${branch}`) return current;
+		}
+		return null;
 	}
 
 	/**
@@ -572,13 +677,20 @@ export class GitWorktreeManager {
 	 * blocks every retry with `fatal: a branch named '<x>' already exists`
 	 * (confirmed live on #75). Delete that orphan, but only when it's provably
 	 * safe to: if `origin` already has a matching ref, a PR may depend on it, so
-	 * this leaves it alone and lets the `worktree add` failure below surface
-	 * instead of risking real pushed work. Same caution on an `ls-remote` failure
-	 * (network/config issue, can't verify either way) — assume the worst and skip.
+	 * this leaves it alone — but no longer lets the `worktree add` below fail on it:
+	 * a retained branch is *checked out* instead of cut again
+	 * ({@link resolveBranchCheckout}), which is what an operator who removed a
+	 * preserved checkout by hand needs the next attempt to do, rather than failing
+	 * differently on the leftover ref (issue #558). Same caution on an `ls-remote`
+	 * failure (network/config issue, can't verify either way) — assume the worst and
+	 * keep it.
+	 *
+	 * Returns whether a local branch of this name **survives** the reap, so the
+	 * caller decides how to check out without asking git the same question twice.
 	 */
-	private async reapOrphanedBranch(branch: string): Promise<void> {
+	private async reapOrphanedBranch(branch: string): Promise<boolean> {
 		const localExists = (await this.git(['branch', '--list', branch])).trim().length > 0;
-		if (!localExists) return;
+		if (!localExists) return false;
 
 		let remoteHasIt: boolean;
 		try {
@@ -586,10 +698,11 @@ export class GitWorktreeManager {
 		} catch {
 			remoteHasIt = true;
 		}
-		if (remoteHasIt) return;
+		if (remoteHasIt) return true;
 
 		logger.warn('Deleting orphaned local branch left over from a previous failed run', { branch });
 		await this.git(['branch', '-D', branch]);
+		return false;
 	}
 
 	/**

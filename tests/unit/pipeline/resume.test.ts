@@ -161,8 +161,9 @@ function preservedCheckout(checkpoint?: unknown): string {
 function stubWorktrees(path: string) {
 	return {
 		worktreePath: vi.fn(() => path),
-		git: vi.fn(async (args: string[]) =>
-			args[0] === 'symbolic-ref' ? 'issue-19\n' : 'abc1234def\n',
+		git: vi.fn(
+			async (args: string[]): Promise<string> =>
+				args[0] === 'symbolic-ref' ? 'issue-19\n' : 'abc1234def\n',
 		),
 		isClean: vi.fn(async () => true),
 		hasUnpushedWork: vi.fn(async () => false),
@@ -185,6 +186,7 @@ function gate(
 		mode,
 		sessionId,
 		phase,
+		'issue-19',
 	);
 }
 
@@ -311,6 +313,29 @@ describe("executeRecoveryGate — the 'checkpoint' continuation branch (issue #5
 		expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
 	});
 
+	// A checkout provisioned since #558 may be detached at `origin/<branch>` while
+	// still targeting that branch. The handle has to keep the branch it targets:
+	// delivery pushes `<sha>:refs/heads/<handle.branch>`, so a git-derived label
+	// would push a branch named after a commit.
+	it('keeps the targeted branch on a detached checkout, not the head sha', async () => {
+		const path = preservedCheckout(CHECKPOINT);
+		const worktrees = stubWorktrees(path);
+		worktrees.git.mockImplementation(async (args: string[]): Promise<string> => {
+			// `symbolic-ref -q` exits non-zero on a detached HEAD.
+			if (args[0] === 'symbolic-ref') throw new Error('exit 1');
+			return 'abc1234def\n';
+		});
+		const result = await executeRecoveryGate(
+			worktrees as unknown as GitWorktreeManager,
+			'19',
+			'checkpoint',
+			undefined,
+			'implementation',
+			'issue-19',
+		);
+		expect(result.reuseHandle).toEqual({ taskId: '19', path, branch: 'issue-19', detached: true });
+	});
+
 	it('needs no session id — the continuation resumes none', async () => {
 		const path = preservedCheckout(CHECKPOINT);
 		await expect(gate(path, 'checkpoint', undefined)).resolves.toMatchObject({
@@ -402,6 +427,7 @@ describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', (
 			'fresh',
 			undefined,
 			'implementation',
+			'issue-19',
 		);
 		expect(result).toEqual({ reuseHandle: null });
 		expect(worktrees.cleanup).toHaveBeenCalledWith('19');

@@ -398,6 +398,29 @@ export class DeliveryDeferredError extends Error {
 	}
 }
 
+/**
+ * A push that cannot succeed however many times it is retried: the delivered
+ * commit is not a descendant of what `origin` already has on the branch (issue
+ * #558).
+ *
+ * Deliberately **not** a {@link DeliveryDeferredError}. A deferral preserves the
+ * checkout and retries the delivery, which is right for a transient push/API
+ * failure but wrong here — a diverged branch produces the identical
+ * `! [rejected] (fetch first)` on every attempt, so the only thing retrying buys
+ * is the retry budget (four attempts over ~35 minutes in the incident this comes
+ * from). Every failure classifier keys deferral off `DeliveryDeferredError`
+ * alone (`classifyDeferrable`, `src/transport/assignment-execution.ts`;
+ * `handlePhaseFailure`, `src/worker/consumer.ts`), so being a plain `Error` is
+ * what makes this terminal on the same-host and DB-free paths alike, with the
+ * divergence named in the message the run, the board, and the logs all carry.
+ */
+export class DeliveryDivergedError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = 'DeliveryDivergedError';
+	}
+}
+
 export function resumedDeliveryAgent(cli: AgentCli): AgentCliResult {
 	return {
 		cli,
@@ -455,6 +478,22 @@ export function hasDeliveryProgress(cwd: string): boolean {
 	return existsSync(join(cwd, PROGRESS_FILENAME));
 }
 
+/**
+ * Whether a failed delivery should be deferred for a retry that resumes from the
+ * preserved checkout — the rule every pushing phase's failure path applies, in
+ * one place so the four cannot drift.
+ *
+ * Two conditions, and the second is issue #558's: the attempt must have recorded
+ * delivery progress, so there *is* something to resume, and the failure must be
+ * one a retry could plausibly get past. A {@link DeliveryDivergedError} is not: the
+ * remote already holds a commit the delivered one does not descend from, so every
+ * retry repeats the identical rejection while the preserved checkout keeps the
+ * branch away from the phase that could actually unblock the PR.
+ */
+export function shouldDeferDeliveryFailure(error: unknown, cwd: string): boolean {
+	return !(error instanceof DeliveryDivergedError) && hasDeliveryProgress(cwd);
+}
+
 async function git(cwd: string, args: string[]): Promise<string> {
 	const { stdout } = await execFileAsync('git', args, { cwd, env: gitEnvironmentForCwd() });
 	return stdout.trim();
@@ -507,4 +546,88 @@ export async function assertRemoteHead(
 	const remote = await git(cwd, ['rev-parse', `origin/${branch}`]);
 	if (remote !== expectedSha)
 		throw new Error(`Remote head drift for ${branch}: expected ${expectedSha}, found ${remote}`);
+}
+
+/**
+ * What git says when it refuses a non-fast-forward update. Matched against both
+ * the error message and its captured `stderr`, because `execFile` surfaces the
+ * output in one, the other, or both depending on how the provider spawns `git`.
+ */
+const PUSH_REJECTION_MARKERS = [
+	'! [rejected]',
+	'non-fast-forward',
+	'fetch first',
+	'updates were rejected',
+];
+
+function looksLikePushRejection(error: unknown): boolean {
+	if (typeof error !== 'object' || error === null) return false;
+	const message = error instanceof Error ? error.message : '';
+	const stderr = 'stderr' in error ? String((error as { stderr: unknown }).stderr) : '';
+	const text = `${message}\n${stderr}`.toLowerCase();
+	return PUSH_REJECTION_MARKERS.some((marker) => text.includes(marker));
+}
+
+/**
+ * The remote head when the branch has genuinely diverged from `expectedSha`, or
+ * `null` when it has not (or when git cannot answer).
+ *
+ * "Diverged" is the precise question `git push` refused on: is the remote tip an
+ * ancestor of the commit being delivered? A rejection whose remote tip *is* an
+ * ancestor was not a divergence at all (a concurrent hook, a protected-branch
+ * rule, a race that has since resolved), so it stays a retryable failure — and
+ * so does any rejection this cannot verify, which keeps a network/`fetch`
+ * failure from being misreported as unpushable work.
+ */
+async function divergedRemoteHead(
+	cwd: string,
+	branch: string,
+	expectedSha: string,
+): Promise<string | null> {
+	try {
+		await git(cwd, ['fetch', 'origin', branch]);
+		const remote = await git(cwd, ['rev-parse', `origin/${branch}`]);
+		if (!remote || remote === expectedSha) return null;
+		try {
+			await git(cwd, ['merge-base', '--is-ancestor', remote, expectedSha]);
+			return null;
+		} catch {
+			return remote;
+		}
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Push a delivered commit, turning an unwinnable push into a terminal
+ * {@link DeliveryDivergedError} instead of a retry (issue #558).
+ *
+ * Every phase that pushes goes through here rather than calling
+ * `ScmDeliveryProvider.pushBranch` directly, so the classification is one
+ * provider-neutral rule rather than six copies inside the SCM adapters: the
+ * adapters keep spelling the push in their own vocabulary, and this reads only
+ * what git reported about the *refusal*. Anything it cannot prove is a
+ * divergence is rethrown untouched and stays deferrable.
+ */
+export async function pushDeliveredBranch(
+	delivery: Pick<ScmDeliveryProvider, 'pushBranch'>,
+	cwd: string,
+	branch: string,
+	expectedSha: string,
+): Promise<void> {
+	try {
+		await delivery.pushBranch(cwd, branch, expectedSha);
+	} catch (error) {
+		if (!looksLikePushRejection(error)) throw error;
+		const remote = await divergedRemoteHead(cwd, branch, expectedSha);
+		if (!remote) throw error;
+		throw new DeliveryDivergedError(
+			`Branch '${branch}' has diverged: origin/${branch} is at ${remote}, which is not an ` +
+				`ancestor of the delivered commit ${expectedSha}, so this push can never fast-forward. ` +
+				`The delivered commit stays on the local '${branch}' ref for inspection; reconcile it ` +
+				`with origin/${branch} (or discard it) before re-running this phase.`,
+			{ cause: error },
+		);
+	}
 }

@@ -152,28 +152,35 @@ import { BlockedRecoveryError, type BlockedRecoveryReason } from '@/worktree/rec
 export { BlockedRecoveryError };
 
 /**
- * Resolve the checked-out branch (or the detached HEAD's SHA) of a preserved
- * checkout, so an adopted handle reports the same `branch`/`detached` pair a
- * freshly provisioned one would. Falls back to a detached `HEAD` when git cannot
- * answer — the checkout is still adoptable; only its label is unknown.
+ * Resolve the `branch`/`detached` pair for a preserved checkout, so an adopted
+ * handle reports what a freshly provisioned one would.
+ *
+ * **`branch` is the caller's, not git's.** Since issue #558 a checkout can be
+ * detached while still *targeting* a branch — provisioning detaches at
+ * `origin/<branch>` when another worktree holds the ref — and delivery pushes
+ * `<sha>:refs/heads/<handle.branch>`. Reading the label back out of git would
+ * answer with the head SHA for exactly those checkouts, so a resumed Implementation
+ * would push a branch named after a commit and its adoption probe would look for a
+ * PR on that name. The caller always knows the branch it means (`reuseBranch`, or
+ * the task branch for Implementation); only *whether* the checkout ended up
+ * detached has to be asked of git, because provisioning may have decided that on
+ * its own.
  */
 async function resolveReuseHandle(
 	worktrees: GitWorktreeManager,
 	taskId: string,
 	path: string,
+	branch: string,
 ): Promise<WorktreeHandle> {
 	try {
 		const symbolicRef = await (
 			worktrees as unknown as { git: (args: string[], cwd?: string) => Promise<string> }
 		).git(['symbolic-ref', '--short', '-q', 'HEAD'], path);
-		const branch = symbolicRef.trim();
-		if (branch) return { taskId, path, branch, detached: false };
-		const headSha = await (
-			worktrees as unknown as { git: (args: string[], cwd?: string) => Promise<string> }
-		).git(['rev-parse', 'HEAD'], path);
-		return { taskId, path, branch: headSha.trim(), detached: true };
+		return { taskId, path, branch, detached: symbolicRef.trim() === '' };
 	} catch {
-		return { taskId, path, branch: 'HEAD', detached: true };
+		// Git could not answer; the checkout is still adoptable and the branch it
+		// targets is the caller's premise either way.
+		return { taskId, path, branch, detached: true };
 	}
 }
 
@@ -237,6 +244,7 @@ async function adoptCheckpointContinuation(
 	taskId: string,
 	path: string,
 	phase: TriggerPhase,
+	branch: string,
 ): Promise<{ reuseHandle: WorktreeHandle; checkpoint: Checkpoint }> {
 	const validation = await validateCheckpointForContinuation(path, phase);
 	if (!validation.valid)
@@ -247,7 +255,7 @@ async function adoptCheckpointContinuation(
 			`Cannot continue task '${taskId}' (${phase}) from a checkpoint — ${validation.detail}.`,
 		);
 	return {
-		reuseHandle: await resolveReuseHandle(worktrees, taskId, path),
+		reuseHandle: await resolveReuseHandle(worktrees, taskId, path, branch),
 		checkpoint: validation.checkpoint,
 	};
 }
@@ -268,6 +276,8 @@ export async function executeRecoveryGate(
 	recoveryMode: RecoveryMode | undefined,
 	expectedSessionId: string | undefined,
 	phase: TriggerPhase,
+	/** The branch the adopted checkout targets — see {@link resolveReuseHandle}. */
+	branch: string,
 ): Promise<{ reuseHandle: WorktreeHandle | null; checkpoint?: Checkpoint }> {
 	const path = worktrees.worktreePath(taskId);
 	const exists = existsSync(path);
@@ -306,11 +316,11 @@ export async function executeRecoveryGate(
 				'missing-validation',
 				`Cannot resume task '${taskId}' — missing expected session ID.`,
 			);
-		return { reuseHandle: await resolveReuseHandle(worktrees, taskId, path) };
+		return { reuseHandle: await resolveReuseHandle(worktrees, taskId, path, branch) };
 	}
 
 	if (recoveryMode === 'checkpoint')
-		return adoptCheckpointContinuation(worktrees, taskId, path, phase);
+		return adoptCheckpointContinuation(worktrees, taskId, path, phase, branch);
 
 	if (recoveryMode === 'fresh') await reclaimForFreshRetry(worktrees, taskId, path);
 
@@ -349,6 +359,7 @@ export async function acquireResumableWorktree(
 			recoveryMode,
 			resumeSessionId,
 			phase,
+			reuseBranch,
 		);
 		if (reuseHandle) {
 			return {

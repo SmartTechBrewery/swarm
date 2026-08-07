@@ -5,12 +5,16 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
 	commitPreparedTree,
+	DeliveryDeferredError,
+	DeliveryDivergedError,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
+	pushDeliveredBranch,
 	readHandoff,
 	saveDeliveryProgress,
+	shouldDeferDeliveryFailure,
 	validatePreparedTree,
 } from '@/scm/delivery.js';
 
@@ -149,6 +153,121 @@ describe('SCM delivery hand-offs', () => {
 
 		await expect(validatePreparedTree(root)).rejects.toThrow(
 			`scratch artifact is tracked (${HANDOFF_FILENAMES.checkpoint})`,
+		);
+	});
+});
+
+/**
+ * The push guard (issue #558). Run against real repositories rather than a stub
+ * git, because the whole question is what git *actually* reports for a rejected
+ * push and whether the two histories really have diverged.
+ */
+describe('pushDeliveredBranch', () => {
+	/** A bare origin plus a clone of it, both with one shared commit on `main`. */
+	function makeRemoteAndClone(): { origin: string; clone: string } {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-push-'));
+		roots.push(root);
+		const origin = join(root, 'origin.git');
+		const seed = join(root, 'seed');
+		const clone = join(root, 'clone');
+		execFileSync('git', ['init', '--bare', '-b', 'main', origin], { env: fixtureGitEnvironment });
+		execFileSync('git', ['clone', origin, seed], { env: fixtureGitEnvironment });
+		writeFileSync(join(seed, 'README.md'), 'seed\n');
+		fixtureGit(seed, ['add', '.']);
+		fixtureGit(seed, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-m', 'seed']);
+		fixtureGit(seed, ['push', 'origin', 'main']);
+		execFileSync('git', ['clone', origin, clone], { env: fixtureGitEnvironment });
+		return { origin, clone };
+	}
+
+	/** Commit `content` on `branch` in `cwd` and return the new sha. */
+	function commitOn(cwd: string, branch: string, content: string): string {
+		fixtureGit(cwd, ['checkout', '-q', '-B', branch]);
+		writeFileSync(join(cwd, 'work.txt'), content);
+		fixtureGit(cwd, ['add', '.']);
+		fixtureGit(cwd, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-m', content]);
+		return fixtureGit(cwd, ['rev-parse', 'HEAD']).trim();
+	}
+
+	/** A delivery whose `pushBranch` is a real `git push` of `<sha>:refs/heads/<branch>`. */
+	const realPush = {
+		pushBranch: async (cwd: string, branch: string, expectedSha: string) => {
+			execFileSync('git', ['push', 'origin', `${expectedSha}:refs/heads/${branch}`], {
+				cwd,
+				env: fixtureGitEnvironment,
+				stdio: 'pipe',
+			});
+		},
+	};
+
+	it('pushes a fast-forward delivery unchanged', async () => {
+		const { clone } = makeRemoteAndClone();
+		const sha = commitOn(clone, 'issue-1', 'first\n');
+
+		await expect(pushDeliveredBranch(realPush, clone, 'issue-1', sha)).resolves.toBeUndefined();
+	});
+
+	// The incident's inner loop: the branch on origin carries someone else's commit,
+	// so this push is rejected identically however many times it is retried.
+	it('names the divergence and fails terminally when the branch cannot fast-forward', async () => {
+		const { origin, clone } = makeRemoteAndClone();
+		const other = mkdtempSync(join(tmpdir(), 'swarm-push-other-'));
+		roots.push(other);
+		execFileSync('git', ['clone', origin, other], { env: fixtureGitEnvironment });
+		const remoteSha = commitOn(other, 'issue-1', 'delivered by the first attempt\n');
+		fixtureGit(other, ['push', 'origin', 'issue-1']);
+		const localSha = commitOn(clone, 'issue-1', 'a second implementation of the same task\n');
+
+		const error = await pushDeliveredBranch(realPush, clone, 'issue-1', localSha).catch((e) => e);
+
+		expect(error).toBeInstanceOf(DeliveryDivergedError);
+		// The message is the whole point: it names both heads so an operator can act
+		// without reproducing the push.
+		expect(error.message).toContain(remoteSha);
+		expect(error.message).toContain(localSha);
+		// Terminal, not deferrable — a retry would repeat the identical rejection.
+		// Asserted with delivery progress actually recorded in the checkout, since
+		// that is the condition that would otherwise turn any failure into a deferral.
+		expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+		saveDeliveryProgress(clone, {
+			deliveryId: 'd1',
+			commitSha: localSha,
+			pushed: false,
+			followUpEnqueued: false,
+		});
+		expect(shouldDeferDeliveryFailure(new Error('transient API failure'), clone)).toBe(true);
+		expect(shouldDeferDeliveryFailure(error, clone)).toBe(false);
+	});
+
+	// Only a *proven* divergence is terminal. A rejection whose remote head is still
+	// an ancestor (a hook, a protected branch, a race that has resolved) stays the
+	// deferrable failure it was, so a transient condition keeps its retry.
+	it('rethrows a rejection that is not a divergence', async () => {
+		const { clone } = makeRemoteAndClone();
+		const sha = commitOn(clone, 'issue-1', 'first\n');
+		await realPush.pushBranch(clone, 'issue-1', sha);
+		const rejected = {
+			pushBranch: async () => {
+				throw new Error('Command failed: git push\n ! [rejected] issue-1 -> issue-1 (fetch first)');
+			},
+		};
+
+		const error = await pushDeliveredBranch(rejected, clone, 'issue-1', sha).catch((e) => e);
+
+		expect(error).not.toBeInstanceOf(DeliveryDivergedError);
+		expect(error.message).toContain('[rejected]');
+	});
+
+	it('rethrows a push failure that is not a rejection at all', async () => {
+		const { clone } = makeRemoteAndClone();
+		const failing = {
+			pushBranch: async () => {
+				throw new Error('fatal: could not read from remote repository');
+			},
+		};
+
+		await expect(pushDeliveredBranch(failing, clone, 'issue-1', 'deadbeef')).rejects.toThrow(
+			'could not read from remote repository',
 		);
 	});
 });
