@@ -41,8 +41,6 @@
  * reaching for a queue or webhook payload.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { getPersonaToken } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import {
@@ -89,15 +87,15 @@ export const RESPOND_CI_OUTCOME_FILENAME = HANDOFF_FILENAMES.respondToCi;
 export { buildRespondToCiPrompt };
 
 /**
- * The outcomes the agent may report. `fixed` means it pushed at least one fix
- * commit; `no-fix` means it investigated but changed no code — the failure was
- * flaky/infra or otherwise not something a code change should address. The agent
- * hands back which one applied via {@link RESPOND_CI_OUTCOME_FILENAME}; anything
- * else is a failed run, not a third outcome.
+ * The outcomes the agent may report. `fixed` means it left a verified change for
+ * SWARM to commit and push; `no-fix` means it investigated but changed no code —
+ * the failure was flaky/infra or otherwise not something a code change should
+ * address. Derived from {@link CiResponseHandoffSchema} rather than declared
+ * beside it, so the hand-off the agent writes to
+ * {@link RESPOND_CI_OUTCOME_FILENAME} is the single place the vocabulary is
+ * stated and enforced; anything else is a failed run, not a third outcome.
  */
-export const RESPOND_CI_OUTCOMES = ['fixed', 'no-fix'] as const;
-
-export type RespondCiOutcome = (typeof RESPOND_CI_OUTCOMES)[number];
+export type RespondCiOutcome = ReturnType<typeof CiResponseHandoffSchema.parse>['outcome'];
 
 /** Claude Code is SWARM's implementer agent — the persona that fixes the build. */
 export const DEFAULT_RESPOND_CI_CLI: AgentCli = 'claude';
@@ -170,8 +168,16 @@ export interface RunRespondToCiPhaseOptions {
 	runAgent?: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	/** Injectable env-grafting step — defaults to {@link graftEnvironment}; overridden in tests. */
 	graft?: typeof graftEnvironment;
-	/** Injectable implementer-token resolver — defaults to {@link getPersonaToken}; overridden in tests. */
+	/**
+	 * Provider-neutral deterministic SCM delivery seam. Omit to have the phase
+	 * resolve the project's own registered provider.
+	 */
 	delivery?: ScmDeliveryProvider;
+	/**
+	 * Injectable implementer-token resolver — defaults to {@link getPersonaToken}.
+	 * Supplied by the DB-free worker, which injects the operator's own token rather
+	 * than reaching into a secret store it cannot read (ADR-003 §2).
+	 */
 	getToken?: typeof getPersonaToken;
 }
 
@@ -239,7 +245,6 @@ export async function runRespondToCiPhase(
 		graft = graftEnvironment,
 	} = options;
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
-	const legacyMode = options.getToken !== undefined && options.delivery === undefined;
 	const agentToken = await (options.getToken ?? getPersonaToken)(project, 'implementer');
 
 	logger.info(`Phase started - Respond-to-CI — running ${describeAgent(cli, model, reasoning)}`, {
@@ -274,8 +279,7 @@ export async function runRespondToCiPhase(
 	try {
 		graft(project.repoRoot, handle.path);
 
-		const shouldResumeDelivery = !legacyMode && deliveryResumed;
-		const agent = shouldResumeDelivery
+		const agent = deliveryResumed
 			? resumedDeliveryAgent(cli)
 			: await runAgent({
 					cli,
@@ -317,22 +321,6 @@ export async function runRespondToCiPhase(
 			throw error;
 		}
 
-		if (legacyMode) {
-			if (!existsSync(join(handle.path, RESPOND_CI_OUTCOME_FILENAME)))
-				throw new Error(
-					`Respond-to-ci agent (${cli}) did not write ${RESPOND_CI_OUTCOME_FILENAME}`,
-				);
-			const outcome = readFileSync(join(handle.path, RESPOND_CI_OUTCOME_FILENAME), 'utf8')
-				.trim()
-				.toLowerCase() as RespondCiOutcome;
-			if (!outcome)
-				throw new Error(
-					`Respond-to-ci agent (${cli}) wrote an empty ${RESPOND_CI_OUTCOME_FILENAME}`,
-				);
-			if (!RESPOND_CI_OUTCOMES.includes(outcome))
-				throw new Error(`Respond-to-ci agent (${cli}) wrote unrecognized outcome '${outcome}'`);
-			return { outcome, agent };
-		}
 		const handoff = readHandoff(handle.path, RESPOND_CI_OUTCOME_FILENAME, CiResponseHandoffSchema);
 		if (
 			handoff.outcome === 'fixed' &&
@@ -377,7 +365,7 @@ export async function runRespondToCiPhase(
 	} catch (error) {
 		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
 		// settles terminally instead of retrying a push that can never succeed (#558).
-		if (!legacyMode && shouldDeferDeliveryFailure(error, handle.path)) {
+		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('CI-response delivery deferred for retry', { cause: error });
 		}

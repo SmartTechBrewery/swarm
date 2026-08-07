@@ -14,16 +14,18 @@
  * Unlike Cascade — whose implementer opens the PR through a `CreatePR` gadget
  * exposed to the agent — SWARM's harness is deliberately narrow (`runAgentCli`
  * only spawns the CLI, no gadget layer; see ai/ARCHITECTURE.md "Harness"). So the
- * agent opens the PR itself via `gh` (the same way the `/solve-issue` skill does)
- * and hands the URL back through a file, mirroring how the Planning phase reads
- * `proposed_plan.md`. The `Closes #<n>` in the PR body is what links the PR back
- * to the Issue the Projects item wraps; the comment this phase posts is the
- * human-facing pointer.
+ * agent performs no git or GitHub write at all: it leaves a prepared tree plus a
+ * structured hand-off (`HANDOFF_FILENAMES.implementation`, mirroring how the
+ * Planning phase reads `proposed_plan.md`), and *SWARM* commits, pushes and opens
+ * the PR through `ScmDeliveryProvider`. The `Closes #<n>` in the PR body is what
+ * links the PR back to the Issue the Projects item wraps; the comment this phase
+ * posts is the human-facing pointer.
  *
  * The implementer persona's token is resolved and handed to the agent as
- * `GH_TOKEN` (mirroring `runReviewPhase`'s reviewer-token plumbing) so `gh pr
- * create` opens the PR as that persona, not whatever `gh auth` session happens
- * to be ambient on the worker's host. Since issue #396 the implementer token is
+ * `GH_TOKEN` (mirroring `runReviewPhase`'s reviewer-token plumbing) so every `gh`
+ * read the agent makes acts as that persona, not whatever `gh auth` session
+ * happens to be ambient on the worker's host; the delivery that opens the PR runs
+ * under the same persona's credential. Since issue #396 the implementer token is
  * the worker operator's own token (`SWARM_OPERATOR_GH_TOKEN`, resolved through
  * the same `getPersonaToken(project, 'implementer')` seam), so the PR is authored
  * by the operator's account. Review's ownership gate no longer reads that author
@@ -102,9 +104,6 @@ import { SWARM_GENERATED_SIGNATURE, swarmMarker } from '@/scm/swarm-origin.js';
 import { GitWorktreeManager, type WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 
-/** The file the implementation agent is instructed to write the opened PR's URL to, at the worktree root. */
-export const OPENED_PR_FILENAME = HANDOFF_FILENAMES.implementation;
-
 // The static implementation prompt and its blocked-reason filename now live in
 // `src/pipeline/prompts/implementation.ts` (issue #135); re-exported so existing
 // importers of `@/pipeline/implementation.js` keep resolving them unchanged.
@@ -132,8 +131,8 @@ const NEXT_STATUS: PmStatusKey = 'inReview';
 
 /**
  * Cap on captured agent output, so a chatty/runaway Claude Code run can't grow the
- * worker's memory without bound. The PR URL is read from {@link OPENED_PR_FILENAME},
- * not from stdout, so truncating the captured stream costs nothing here.
+ * worker's memory without bound. The delivery reads the agent's hand-off file, not
+ * its stdout, so truncating the captured stream costs nothing here.
  */
 const MAX_AGENT_OUTPUT_BYTES = 1_000_000;
 
@@ -191,14 +190,21 @@ export interface RunImplementationPhaseOptions {
 	runAgent?: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	/** Injectable env-grafting step — defaults to {@link graftEnvironment}; overridden in tests. */
 	graft?: typeof graftEnvironment;
-	/** Provider-neutral deterministic SCM delivery seam. */
+	/**
+	 * Provider-neutral deterministic SCM delivery seam. Omit to have the phase
+	 * resolve the project's own registered provider.
+	 */
 	delivery?: ScmDeliveryProvider;
-	/** @deprecated Compatibility seam; production deterministic delivery leaves this unset. */
+	/**
+	 * Injectable implementer-token resolver — defaults to {@link getPersonaToken}.
+	 * Supplied by the DB-free worker, which injects the operator's own token rather
+	 * than reaching into a secret store it cannot read (ADR-003 §2).
+	 */
 	getToken?: typeof getPersonaToken;
 }
 
 export interface ImplementationPhaseResult {
-	/** The URL of the PR the agent opened, read from {@link OPENED_PR_FILENAME}. */
+	/** The URL of the PR this phase's delivery opened (or adopted). */
 	prUrl: string;
 	/** The branch the implementation was committed to and the PR opened from. */
 	branch: string;
@@ -253,19 +259,16 @@ export function implementationCommentBody(
 /**
  * Post the PR-link comment at most once per implementation delivery: an attempt
  * that resumes after an earlier one already commented reuses that comment rather
- * than adding a duplicate. Legacy mode passes no `deliveryId` and always posts,
- * exactly as before.
+ * than adding a duplicate.
  */
 async function postImplementationComment(
 	pm: PMProvider,
 	workItemId: string,
 	prUrl: string,
 	reviewEnabled: boolean,
-	deliveryId?: string,
+	deliveryId: string,
 ): Promise<string> {
-	const existing = deliveryId
-		? await pm.findComment(workItemId, implementationDeliveryMarker(deliveryId))
-		: undefined;
+	const existing = await pm.findComment(workItemId, implementationDeliveryMarker(deliveryId));
 	return (
 		existing ??
 		(await pm.addComment(workItemId, implementationCommentBody(prUrl, reviewEnabled, deliveryId)))
@@ -387,13 +390,6 @@ async function acquireImplementationWorktree(
 	return { handle, resumed: false, deliveryResumed: false };
 }
 
-/**
- * Read the PR URL the implementation agent handed back through
- * {@link OPENED_PR_FILENAME}. Throws a descriptive error when the file is
- * missing (surfacing a `blocked` reason the agent may have written instead) or
- * empty. `onInvalid` runs before each throw so the caller can log the captured
- * agent output alongside the failure.
- */
 export async function runImplementationPhase(
 	options: RunImplementationPhaseOptions,
 ): Promise<ImplementationPhaseResult> {
@@ -433,7 +429,6 @@ export async function runImplementationPhase(
 
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
 	const reviewEnabled = project.pipeline?.review?.enabled !== false;
-	const legacyMode = options.getToken !== undefined && options.delivery === undefined;
 	const agentToken = await (options.getToken ?? getPersonaToken)(project, 'implementer');
 
 	logger.info(`Phase started - Implementation — running ${describeAgent(cli, model, reasoning)}`, {
@@ -472,10 +467,9 @@ export async function runImplementationPhase(
 		// Deterministic delivery is resolved *before* the agent, not after: the
 		// already-delivered probe below has to ask the SCM about this task's branch
 		// while there is still an agent run to skip.
-		const delivery = legacyMode
-			? undefined
-			: (options.delivery ??
-				(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer')));
+		const delivery =
+			options.delivery ??
+			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
 		const deliveryId = deliveryIdentity(['implementation', project.repo, taskId, handle.branch]);
 
 		// Already delivered by an earlier attempt (issue #558). An interruption after
@@ -489,7 +483,7 @@ export async function runImplementationPhase(
 		// could never be pushed. Skipped when the checkout's own progress file already
 		// claimed this delivery (`deliveryResumed`) — that resume is strictly better
 		// informed, and it still short-circuits the agent.
-		if (delivery && !deliveryResumed) {
+		if (!deliveryResumed) {
 			const delivered = await delivery.findPullRequest(handle.branch);
 			if (delivered) {
 				logger.info('Implementation already delivered — adopting the open PR, skipping the agent', {
@@ -516,8 +510,7 @@ export async function runImplementationPhase(
 			}
 		}
 
-		const shouldResumeDelivery = !legacyMode && deliveryResumed;
-		const agent = shouldResumeDelivery
+		const agent = deliveryResumed
 			? resumedDeliveryAgent(cli)
 			: await runAgent({
 					cli,
@@ -574,33 +567,19 @@ export async function runImplementationPhase(
 			throw error;
 		}
 
-		if (!existsSync(join(handle.path, OPENED_PR_FILENAME))) {
+		// A run that wrote a blocker instead of a hand-off names the prerequisite it is
+		// waiting on, rather than failing with the generic missing-hand-off error
+		// `readHandoff` would raise a line later.
+		if (!existsSync(join(handle.path, HANDOFF_FILENAMES.implementation))) {
 			const blockedReason = readBlockedReason(handle.path);
 			if (blockedReason)
 				throw new Error(`Implementation blocked for task '${taskId}': ${blockedReason}`);
-			if (legacyMode)
-				throw new Error(`Implementation agent (${cli}) did not write ${OPENED_PR_FILENAME}`);
 		}
-		if (legacyMode) {
-			const prUrl = readFileSync(join(handle.path, OPENED_PR_FILENAME), 'utf8').trim();
-			if (!prUrl)
-				throw new Error(`Implementation agent (${cli}) wrote an empty ${OPENED_PR_FILENAME}`);
-			const commentId = await pm.addComment(
-				workItem.id,
-				implementationCommentBody(prUrl, reviewEnabled),
-			);
-			if (reviewEnabled) await pm.moveWorkItem(workItem.id, NEXT_STATUS);
-			return {
-				prUrl,
-				branch: handle.branch,
-				commentId,
-				movedTo: reviewEnabled ? NEXT_STATUS : undefined,
-				agent,
-			};
-		}
-		const handoff = readHandoff(handle.path, OPENED_PR_FILENAME, ImplementationHandoffSchema);
-		// Resolved above, before the agent ran; non-legacy mode always has one.
-		if (!delivery) throw new Error('Implementation delivery provider is unavailable');
+		const handoff = readHandoff(
+			handle.path,
+			HANDOFF_FILENAMES.implementation,
+			ImplementationHandoffSchema,
+		);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);
 		if (!progress.commitSha) {
@@ -664,7 +643,7 @@ export async function runImplementationPhase(
 		// deferring would also preserve the checkout, denying the branch to the phase
 		// that could unblock the PR. The delivered commit survives on the local branch
 		// ref after the cleanup below, so nothing is lost to inspection.
-		if (!legacyMode && shouldDeferDeliveryFailure(error, handle.path)) {
+		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Implementation delivery deferred for retry', {
 				cause: error,
