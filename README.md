@@ -254,8 +254,8 @@ Configuration has three layers:
 - `.env` — host and process settings such as database, Redis, ports, logging,
   dashboard authentication, and credential encryption.
 - `swarm.config.json` — per-project repository, worktree, board mapping (`pm`, one
-  member per PM provider — GitHub Projects or Linear, plus Jira's, which parses
-  ahead of that provider being registered), credential references (the
+  member per PM provider — GitHub Projects or Linear, plus Jira's and Trello's,
+  which parse ahead of those providers being registered), credential references (the
   SCM reviewer/webhook pair plus the PM provider's own roles under
   `credentials.pm`), agent, and pipeline settings. Apply changes with
   `npm run db:seed` or `swarm config apply`.

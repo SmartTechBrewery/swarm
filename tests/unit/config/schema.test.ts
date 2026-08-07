@@ -16,6 +16,7 @@ import {
 	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
+	createMockTrelloProjectConfig,
 } from '../../helpers/factories.js';
 
 describe('ProjectConfigSchema', () => {
@@ -181,6 +182,30 @@ describe('ProjectConfigSchema', () => {
 					statusOptions: { backlog: '10000' },
 					teamId: 'not-a-jira-field',
 				},
+			}),
+		).toThrow();
+	});
+
+	it('parses Trello mappings while rejecting missing or foreign fields', () => {
+		const trello = createMockTrelloProjectConfig();
+		expect(trello.pm).toMatchObject({
+			type: 'trello',
+			boardId: expect.any(String),
+			statusOptions: expect.objectContaining({ inProgress: expect.any(String) }),
+		});
+
+		expect(() =>
+			ProjectConfigSchema.parse({
+				...trello,
+				pm: { type: 'trello', statusOptions: { backlog: 'list-1' } },
+			}),
+		).toThrow();
+		expect(() =>
+			ProjectConfigSchema.parse({
+				...trello,
+				// Cascade names Trello's mapping `lists`; the SWARM member keeps the neutral
+				// `statusOptions` key, so the Cascade shape is rejected rather than ignored.
+				pm: { type: 'trello', boardId: 'board-1', lists: { backlog: 'list-1' } },
 			}),
 		).toThrow();
 	});
