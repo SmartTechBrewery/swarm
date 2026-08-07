@@ -9,10 +9,10 @@
  * page polls. It lives here rather than on the worker because writing that table
  * needs a resource a federated worker must not and cannot hold — a database
  * connection (ADR-004 §2: an operation needing a resource the worker cannot hold
- * runs on the control plane). Doing it for *every* worker rather than only the
- * DB-free one is what stops the same run producing output on one machine and
- * nothing on another; the same-host executor therefore no longer persists locally
- * (`../worker/transport-client.ts`), so no line is written twice.
+ * runs on the control plane). Doing it here for every worker — the control-plane
+ * host's own included, which since issue #551 runs the same DB-free entrypoint
+ * over loopback — is what stops the same run producing output on one machine and
+ * nothing on another, and means no line is ever written twice.
  *
  * Writing is fire-and-forget — the socket frame handler
  * (`./worker-transport.ts`) must never block on Postgres — but **ordered per

@@ -1,13 +1,18 @@
 /**
- * The transport assignment-execution substrate — the DB/Redis-free half of
- * running a pushed `TaskAssignment` (ADR-003 §2), plus the pure framing helpers
- * both the same-host and remote executors share.
+ * The transport assignment-execution substrate — how a pushed `TaskAssignment`
+ * is run (ADR-003 §2), plus the pure framing helpers the back-channel is built
+ * from.
  *
- * `../worker/transport-client.ts` runs an assignment on a host **with**
- * `DATABASE_URL` (persona tokens resolve from Postgres). This module adds the
- * **remote** counterpart, {@link runAssignmentDbFree}, which runs entirely from
- * the assignment itself: the project config is reconstructed from the non-secret
- * slice (`./db-free-project.ts`), source-carrying delivery uses the operator's own
+ * **This is the only executor.** It used to be one of two: a same-host client
+ * (`../worker/transport-client.ts`) resolved persona tokens from Postgres for the
+ * control-plane host, while this one served remote workers. Issue #551 deleted
+ * that second program and pointed the host's worker at the same DB-free
+ * entrypoint every other machine uses (`./connect-entry.ts`), connected over
+ * loopback — so "same host" is now a network distance rather than a code path.
+ *
+ * {@link runAssignmentDbFree} runs entirely from the assignment itself: the
+ * project config is reconstructed from the non-secret slice
+ * (`./db-free-project.ts`), source-carrying delivery uses the operator's own
  * credential through the registered SCM provider
  * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`), and the two kinds of
  * metadata write the operator token *cannot* perform — a review under the
@@ -17,21 +22,15 @@
  * premature push fails with a clear result rather than crashing on a DB/Redis
  * access.
  *
- * Cancellation is shared by both executors and needs no Redis on either (issue
- * #549): the in-flight registry below indexes each running assignment by
- * `dispatchId`, a pushed `task-cancel` frame aborts the matching run's signal, and
- * the run settles terminal-`failed` with `cancelled: true`.
+ * Cancellation needs no Redis (issue #549): the in-flight registry below indexes
+ * each running assignment by `dispatchId`, a pushed `task-cancel` frame aborts the
+ * matching run's signal, and the run settles terminal-`failed` with
+ * `cancelled: true`.
  *
- * Live output is the one thing neither executor persists: both stream it as
- * `stream-log` frames and the control plane writes it to `run_output_events`
+ * Live output is the one thing this executor does not persist: it streams
+ * `stream-log` frames and the control plane writes them to `run_output_events`
  * (`../router/stream-log-persistence.ts`), so a run's output looks the same
  * wherever it ran.
- *
- * The pure helpers (`fromAssignedWorkItem`, `createAssignmentRunAgent`,
- * `classifyDeferrable`, `succeededResult`, `deferrableOrFailedResult`) live here
- * rather than in the DB-importing same-host client so both paths frame the
- * back-channel identically; the same-host client re-exports them, so its public
- * surface and behaviour are unchanged.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -289,9 +288,8 @@ interface CancellableAssignment {
  * transport addresses work and with no Redis behind it: a DB-free worker learns
  * about a cancellation only from the frame.
  *
- * Module-level and shared by both executors ({@link runAssignmentDbFree} and the
- * same-host `../worker/transport-client.ts`), so one daemon's entrypoint resolves
- * a cancel for whichever of them is running the dispatch.
+ * Module-level rather than per-run, so `./connect-entry.ts` can resolve a cancel
+ * against whichever of this daemon's in-flight assignments it names.
  */
 const cancellableAssignments = new Map<string, CancellableAssignment>();
 
@@ -326,10 +324,9 @@ export function isAssignmentCancelled(dispatchId: string): boolean {
 }
 
 /**
- * Apply a pushed `task-cancel` frame — the `onCancel` handler both executing
- * entrypoints register (`./connect-entry.ts` and
- * `../worker/transport-client.ts`). Shared so the two log and behave identically,
- * and so an unknown dispatch stays an ordinary, non-fatal miss.
+ * Apply a pushed `task-cancel` frame — the `onCancel` handler `./connect-entry.ts`
+ * registers. It lives beside the registry it reads, and answers an unknown
+ * dispatch with an ordinary, non-fatal miss rather than an error.
  */
 export function handleTaskCancel(frame: TaskCancel, logger: TransportLogger = defaultLogger): void {
 	const context = { dispatchId: frame.dispatchId, runId: frame.runId, reason: frame.reason };
@@ -656,6 +653,23 @@ export interface RunAssignmentDbFreeOptions {
 	 * The worker operator's own account credential for the project's SCM provider,
 	 * resolved from this machine's environment by `./connect-entry.ts`
 	 * (`SWARM_OPERATOR_GH_TOKEN` on GitHub) — never a project credential.
+	 *
+	 * **This is the agent's identity on every worker, not a fallback for the ones
+	 * without a database** (ADR-004 §2; issue #551 made it universal by retiring the
+	 * control-plane host's own second executor). The implementer identity *is* the
+	 * worker operator's own account: it authors the branch, the commits, the pull
+	 * request and the implementer-side comments, and the loop-prevention split still
+	 * holds because it is a different account from the project's reviewer PAT. Two
+	 * consequences worth stating where they bite:
+	 *
+	 * - `credentials.implementer` is not read anywhere on this path — it is not even
+	 *   in `ScmCredentialReferencesSchema` any more (issue #396), so there is no
+	 *   per-project persona token for the agent to resolve from Postgres, on any
+	 *   host. What changes with a project is the repository, not who commits to it.
+	 * - The identities that must stay per-project — the **reviewer** PAT and the
+	 *   **PM** credential — never reach a worker at all: those writes ride the
+	 *   control-plane delivery API (`./delivery-client.ts`), so a submitted review's
+	 *   author and a board write's actor are unchanged by which machine ran the phase.
 	 */
 	operatorToken: string;
 	/**
@@ -765,21 +779,22 @@ function buildDbFreePhaseInputs({
 }
 
 /**
- * Execute one pushed `TaskAssignment` on a DB/Redis-free remote worker and stream
- * its lifecycle back through the sink: an immediate ack (marking a re-pushed
- * dispatch a duplicate so the control plane drops it), a `running` progress
- * marker, batched live output, and a terminal `TaskExecutionResult`. Idempotent
- * by `dispatchId`: a re-pushed assignment for a dispatch already running here
- * keeps the in-flight run rather than starting a second (ADR-003 §2). Never
- * throws — every settlement is a frame.
+ * Execute one pushed `TaskAssignment` DB/Redis-free and stream its lifecycle back
+ * through the sink: an immediate ack (marking a re-pushed dispatch a duplicate so
+ * the control plane drops it), a `running` progress marker, batched live output,
+ * and a terminal `TaskExecutionResult`. Idempotent by `dispatchId`: a re-pushed
+ * assignment for a dispatch already running here keeps the in-flight run rather
+ * than starting a second (ADR-003 §2). Never throws — every settlement is a frame.
  *
- * Unlike the same-host executor (`../worker/transport-client.ts`), it reads no
- * database and no queue: the project is reconstructed from the assignment's
- * non-secret slice, source delivery uses the operator's own token, and the
- * reviewer / PM metadata writes ride the control-plane delivery API under
- * credentials that stay on the server. A user termination reaches it as a pushed
- * `task-cancel` ({@link cancelAssignment}) rather than a Redis read. A phase not
- * in {@link SUPPORTED_DB_FREE_PHASES} is failed cleanly with a clear reason rather
+ * It reads no database and no queue, on any host: the project is reconstructed
+ * from the assignment's non-secret slice, source delivery uses the operator's own
+ * token, and the reviewer / PM metadata writes ride the control-plane delivery API
+ * under credentials that stay on the server. That holds for the control-plane
+ * host's own worker too — since issue #551 it runs this same path over loopback
+ * rather than a second executor that read Postgres because it happened to be able
+ * to. A user termination reaches it as a pushed `task-cancel`
+ * ({@link cancelAssignment}) rather than a Redis read. A phase not in
+ * {@link SUPPORTED_DB_FREE_PHASES} is failed cleanly with a clear reason rather
  * than crashing on a DB/Redis access.
  */
 export async function runAssignmentDbFree(
@@ -868,7 +883,7 @@ export async function runAssignmentDbFree(
 		const result = await deps.runPhase(inputs);
 		// A run the harness killed for exceeding its wall-clock timeout is a terminal
 		// failure even if the agent trapped SIGTERM and still exited 0 (issue #165) —
-		// route it through the failure path like the same-host executor does.
+		// route it through the failure path like the in-process `processJob` does.
 		if (result.agent.timedOut) {
 			throw agentRunError(
 				result.agent,

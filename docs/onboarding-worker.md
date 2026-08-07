@@ -83,7 +83,12 @@ whichever account should author their commits/PRs.
 
 This machine is **DB-free** — no `DATABASE_URL`/`REDIS_URL`, no Postgres/Redis
 access at all. It needs the repo checked out (it runs the agent CLI locally and
-manages its own Git worktrees) and three environment variables in its `.env`:
+manages its own Git worktrees) and three environment variables in its `.env`.
+
+> This is also how the **control-plane host's own** worker runs since issue #551 —
+> same command, same three variables, with `SWARM_CONTROL_PLANE_URL` pointing at
+> `http://localhost:<ROUTER_PORT>` instead of the tunnel. Everything in Part 2
+> applies there too.
 
 ```bash
 git clone <repo-url> && cd swarm
@@ -91,7 +96,7 @@ npm ci
 ```
 
 ```dotenv
-# .env — the *only* file npm run dev:worker:connect reads
+# .env — the *only* file npm run dev:worker reads
 # (node --env-file-if-exists=.env is hardcoded in package.json; a differently
 # named file like .env.worker.local is never picked up automatically)
 SWARM_WORKER_CREDENTIAL=<the credential from Part 1, step 3>
@@ -103,13 +108,13 @@ Make sure every CLI declared in `--cli` back in Part 1 is actually installed
 and authenticated on this machine (e.g. `claude` logged in), then:
 
 ```bash
-npm run dev:worker:connect
+npm run dev:worker
 ```
 
 A successful connection logs two lines:
 
 ```
-swarm-worker started in transport dispatch mode controlPlaneUrl=... capabilities=[...]
+worker transport client starting controlPlaneUrl=... hostname=... capabilities=[...] supportedPhases=[...] repoRoot=...
 worker transport session established workerId=... sessionId=... heartbeatTtlMs=60000
 ```
 
@@ -138,6 +143,6 @@ to expire after `heartbeatTtlMs`.
 
 | Symptom | Cause |
 | --- | --- |
-| `Cannot find package 'ws'` (or any other module) on `dev:worker:connect` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
-| `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker:connect` only reads `.env` (see the dotenv block above) — put the three variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
+| `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
+| `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the three variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, step 4), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |

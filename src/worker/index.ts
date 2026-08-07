@@ -4,13 +4,20 @@
  * one-container-per-job model: the MVP runs one worker on the host (NOT in
  * Docker Compose — it needs the developer's PATH/auth for git and the agent
  * CLIs), pulling jobs off `swarm-jobs` one at a time (env-overridable pool).
+ *
+ * **`in-process` dispatch mode only** (`npm run dev:worker:legacy`). Since issue
+ * #551 every worker that executes a *transport*-dispatched phase — this host's
+ * included — runs `../transport/connect-entry.ts` (`npm run dev:worker`) instead,
+ * connected over loopback on the control-plane host. There is one executor
+ * program again, so this entry point refuses to start in `transport` mode rather
+ * than offering a second one that only this machine could ever run. It retires
+ * with the in-process path itself (phase 6 of issue #544).
  */
 
 // Single canonical integration registration — same entrypoint as the router,
 // so a provider can never be registered on one runtime surface but not another.
 import '../integrations/entrypoint.js';
 
-import { hostname } from 'node:os';
 import { Worker } from 'bullmq';
 import { runMigrations } from '../db/migrate.js';
 import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
@@ -33,7 +40,6 @@ import { addFileSink, configureLogger, logger } from '../lib/logger.js';
 import { parseRedisUrl } from '../lib/redis.js';
 import { closeRunCancellationRedis, subscribeToRunCancellations } from '../queue/cancellation.js';
 import { QUEUE_NAME, SwarmJobSchema } from '../queue/jobs.js';
-import { discoverAvailableClis, parseDeclaredClisOverride } from '../transport/cli-discovery.js';
 import { createTriggerRegistry, registerBuiltInTriggers } from '../triggers/index.js';
 import { ALL_TRIGGER_PHASES } from '../triggers/types.js';
 import { pruneStaleWorktrees } from '../worktree/retention.js';
@@ -51,7 +57,6 @@ import { isJobStale, resolveMaxJobAgeMs } from './job-freshness.js';
 import { resetProjectSlot } from './project-concurrency.js';
 import { abortRun } from './run-cancellation.js';
 import { resolveWorkerConcurrency, resolveWorkerLockOptions } from './runtime-options.js';
-import { startWorkerTransportDispatch } from './transport-client.js';
 
 // Tag every line this process emits so router and worker logs stay
 // distinguishable in a shared stream (ai/ARCHITECTURE.md "Observability").
@@ -66,6 +71,22 @@ configureLogger({ component: 'worker' });
 // under the repo root; override the path (or point it elsewhere) with
 // SWARM_LOG_FILE. The file always receives the JSON form (see logger.ts).
 addFileSink(optionalEnv('SWARM_LOG_FILE', 'logs/worker.log'));
+
+// Refuse `transport` mode outright, before migrations or any queue/Redis
+// connection (issue #551). This entry point used to fork here into a second,
+// DB-holding executor (`./transport-client.ts`, now deleted) that only the
+// control-plane host could ever run, so the same role shipped as two programs
+// and only one of them was exercised on every run. The transport executor is
+// `../transport/connect-entry.ts` for every worker now — on this host it simply
+// points at the router over loopback. Naming the replacement command matters:
+// silently falling through to the BullMQ consumer would leave the operator with
+// a worker that never receives a pushed assignment and no message saying why.
+if (resolveDispatchMode() === 'transport') {
+	logger.error(
+		'SWARM_DISPATCH_MODE=transport dispatches phases over the worker transport, which this in-process entry point no longer serves — refusing to start. Run this host’s worker with `npm run dev:worker` (src/transport/connect-entry.ts), pointing SWARM_CONTROL_PLANE_URL at the router (http://localhost:<ROUTER_PORT> on the control-plane host) with SWARM_WORKER_CREDENTIAL and SWARM_OPERATOR_GH_TOKEN set. `npm run dev:worker:legacy` starts this entry point, and is only for SWARM_DISPATCH_MODE=in-process.',
+	);
+	process.exit(1);
+}
 
 // How many jobs this worker runs at once. The `--concurrency <n>` launch flag
 // wins over the `SWARM_WORKER_CONCURRENCY` env var, which wins over the default
@@ -119,7 +140,7 @@ const registry = createTriggerRegistry();
 registerBuiltInTriggers(registry);
 
 // Bring the DB schema up to date before serving any job. This is required for
-// direct/source starts and the opt-in `dev:worker:watch` mode alike; a restarted
+// direct/source starts and the opt-in `dev:worker:legacy:watch` mode alike; a restarted
 // process must never run newer schema-referencing code against an older DB.
 // Fatal on failure: crash loudly rather than serve jobs with broken run history.
 try {
@@ -129,75 +150,6 @@ try {
 		error: describeError(err),
 	});
 	process.exit(1);
-}
-
-// Dispatch mode (ADR-003 §2). Default `in-process` falls straight through to the
-// BullMQ consumer below — today's behavior, unchanged. `transport` instead runs
-// the worker-side transport-dispatch client: this same-host worker connects to
-// the control plane, receives pushed TaskAssignment frames, runs each phase
-// locally (persona tokens still resolve from the DB), and reports results back
-// over the transport back-channel. The top-level `await` on the client's `done`
-// suspends the rest of this entry point (the BullMQ setup) for the client's
-// lifetime, so the two paths never run at once.
-if (resolveDispatchMode() === 'transport') {
-	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
-	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
-	// Declare the CLIs this host can run — an explicit override, else a PATH probe.
-	// The control plane routes on this set; an empty one can't handshake.
-	const declaredOverride = parseDeclaredClisOverride(process.env.SWARM_WORKER_TRANSPORT_CLIS);
-	const capabilities = declaredOverride ?? (await discoverAvailableClis());
-	if (capabilities.length === 0) {
-		logger.error(
-			'No agent CLIs found on PATH to declare (looked for claude, agy, codex) — refusing to start in transport dispatch mode. Install at least one, or set SWARM_WORKER_TRANSPORT_CLIS.',
-		);
-		process.exit(1);
-	}
-	const transportShutdown = new AbortController();
-	const client = startWorkerTransportDispatch({
-		controlPlaneUrl,
-		credential,
-		capabilities,
-		// A discovered set gets a second look if the control plane rejects it; an
-		// explicit override does not (issue #559).
-		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
-		hostname: hostname(),
-		daemonVersion: process.env.npm_package_version ?? '0.0.0',
-		shutdownSignal: transportShutdown.signal,
-	});
-	logger.info('swarm-worker started in transport dispatch mode', { controlPlaneUrl, capabilities });
-
-	let stoppingTransport = false;
-	for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-		process.on(signal, () => {
-			if (stoppingTransport) return;
-			stoppingTransport = true;
-			logger.debug(`Received ${signal} — stopping transport dispatch client`);
-			// Abort any in-flight agent CLI, then release the session via a normal
-			// close so the control plane frees the lease promptly.
-			transportShutdown.abort();
-			void client.stop().then(
-				() => process.exit(0),
-				(err) => {
-					logger.error('Transport dispatch client shutdown failed', {
-						error: describeError(err),
-					});
-					process.exit(1);
-				},
-			);
-		});
-	}
-
-	// Resolves on a graceful stop; rejects on a fatal, non-recoverable handshake
-	// error (bad credential, protocol mismatch, capability rejection).
-	try {
-		await client.done;
-		process.exit(0);
-	} catch (err) {
-		logger.error('Transport dispatch client exited with a fatal error', {
-			error: describeError(err),
-		});
-		process.exit(1);
-	}
 }
 
 const rawWorkerCredential = optionalEnv('SWARM_WORKER_CREDENTIAL', '').trim();
@@ -219,7 +171,7 @@ if (rawWorkerCredential) {
 	// owns the row (the same ordering the transport handshake uses). This process runs
 	// every phase through the full `processJob` switch — it holds `DATABASE_URL`, so
 	// `planning`'s board write/split surface is available — and saying so is what keeps
-	// a row from carrying the narrower set a previous `dev:worker:connect` run
+	// a row from carrying the narrower set a previous transport-daemon run
 	// declared, which would otherwise refuse `planning` here forever (issue #467). Only
 	// the phases are written; the CLI set stays the operator-registered one.
 	//
@@ -271,8 +223,9 @@ if (executionSession) {
 // authenticated worker or worker-less local runs, so another live host's runs
 // are never reaped.
 // Best-effort: a hiccup must not stop the worker from serving jobs.
-// In-process path only — `transport` mode returns above, and the API server owns
-// the worker-less half of this reap there (`src/api/maintenance.ts`, issue #550).
+// In-process path only — `transport` mode never reaches this process at all, and
+// the API server owns the worker-less half of this reap there
+// (`src/api/maintenance.ts`, issue #550).
 try {
 	const reconciled = await failOrphanedRunningRuns(
 		'Worker restarted while this run was in progress',
@@ -326,8 +279,8 @@ async function resetProjectSlots(): Promise<void> {
 
 await resetProjectSlots();
 
-// In-process path only — `transport` mode returns above, where the API server
-// runs this instead (`src/api/maintenance.ts`, issue #550).
+// In-process path only — `transport` mode never reaches this process at all,
+// and the API server runs this instead (`src/api/maintenance.ts`, issue #550).
 async function runQuotaDiscovery(cheap = false): Promise<void> {
 	try {
 		logger.debug('Starting CLI capability/quota discovery...', { cheap });
@@ -482,8 +435,8 @@ const cancellationSubscription = subscribeToRunCancellations((runId) => {
 
 logger.debug('swarm-worker started', { queue: QUEUE_NAME, concurrency });
 
-// In-process path only — `transport` mode returns above, where the API server
-// runs this instead (`src/api/maintenance.ts`, issue #550).
+// In-process path only — `transport` mode never reaches this process at all,
+// and the API server runs this instead (`src/api/maintenance.ts`, issue #550).
 async function runWorktreeSweep(): Promise<void> {
 	try {
 		logger.debug('Starting background worktree retention sweep');

@@ -1353,8 +1353,8 @@ export interface PhaseRunResult {
  * The already-resolved inputs a single pipeline phase runs from — the normalized
  * shape both dispatch paths build before invoking a phase: the in-process path
  * ({@link runPhase}, from a `TriggerResult` + routing overrides + the job's
- * session fields) and the transport path (`../worker/transport-client.ts`, from
- * a pushed `TaskAssignment`). Centralizing the per-phase runner switch in
+ * session fields) and the transport path (`../transport/assignment-execution.ts`,
+ * from a pushed `TaskAssignment`). Centralizing the per-phase runner switch in
  * {@link runAssignedPhase} is what keeps the two paths from diverging — the
  * mapping of "which phase → which `runXPhase`, with which arguments" lives in
  * exactly one place.
@@ -1422,16 +1422,15 @@ export interface AssignedPhaseInputs {
 	 * `undefined` to use the phase's own in-process delegate (the local host
 	 * worker, via the project's registered SCM provider).
 	 *
-	 * A remote worker with no `DATABASE_URL` additionally injects an
+	 * A transport worker, which holds no `DATABASE_URL`, additionally injects an
 	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
 	 * phases, a `pm`; for review, a `reviewLedger`) so no phase reaches into the
 	 * secret store or the DB.
 	 * Forwarding both `delivery` and `agentToken` keeps the delivery-owning
 	 * phases' `legacyMode` guard false (it is `getToken !== undefined &&
 	 * delivery === undefined`), i.e. deterministic delivery stays on. The
-	 * in-process ({@link runPhase}) and same-host (`./transport-client.ts`)
-	 * paths leave both unset, so the phase resolves its own default exactly
-	 * as before — the agent token from `getPersonaToken`.
+	 * in-process path ({@link runPhase}) leaves both unset, so the phase resolves
+	 * its own default exactly as before — the agent token from `getPersonaToken`.
 	 */
 	delivery?: ScmDeliveryProvider;
 	agentToken?: string;
@@ -1440,8 +1439,8 @@ export interface AssignedPhaseInputs {
 	 * and writes its submitted slot through (`../pipeline/review-ledger.ts`).
 	 * Injected by a DB-free worker with the transport-backed implementation
 	 * (ADR-003 §2, `../transport/review-ledger-delivery.ts`), since that worker
-	 * cannot reach `review_verdicts` itself. Left unset by the in-process and
-	 * same-host paths, which keep the phase's own repository defaults.
+	 * cannot reach `review_verdicts` itself. Left unset by the in-process path,
+	 * which keeps the phase's own repository defaults.
 	 */
 	reviewLedger?: ReviewVerdictLedger;
 	/**
@@ -1450,8 +1449,8 @@ export interface AssignedPhaseInputs {
 	 * transport-backed implementation (ADR-003 §2,
 	 * `../transport/follow-up-review-delivery.ts`), since the default writes a
 	 * dispatch row and enqueues a job — a `DATABASE_URL`/`REDIS_URL` that worker
-	 * does not have. Left unset by the in-process and same-host paths, which keep
-	 * the phase's own `scheduleFollowUpReviewDefault`.
+	 * does not have. Left unset by the in-process path, which keeps the phase's own
+	 * `scheduleFollowUpReviewDefault`.
 	 */
 	scheduleFollowUpReview?: ScheduleFollowUpReview;
 }

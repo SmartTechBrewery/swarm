@@ -120,31 +120,38 @@ Start these processes in separate terminals:
 ```bash
 npm run dev:api                   # API server on 127.0.0.1:3101
 npm run dev:dashboard             # Vite dashboard on localhost:5173
-npm run dev:worker                # host worker (1 job at a time by default)
-npm run dev:worker -- --concurrency 2   # …or run up to N jobs at once
+npm run dev:worker                # the worker (transport mode — see below)
+npm run dev:worker:legacy -- --concurrency 2   # …or the in-process worker, up to N jobs at once
 ```
 
-By default the worker runs one job at a time. Pass `--concurrency <n>` (or set
-`SWARM_WORKER_CONCURRENCY`) to raise it — the flag wins over the env var. This is
-the worker's own cap across every project it serves; a project's **Maximum
-Concurrent Jobs** setting bounds it further per project. In `transport` mode the
-router owns the consumer, and Compose passes the same environment setting to it so
-it can dispatch work to multiple eligible workers. See
-[`docs/configuration.md`](docs/configuration.md).
-
-For a worker on a **different machine** from the router, run the remote transport
-client instead of (or alongside) the in-process worker:
+**There is one worker command.** `npm run dev:worker` runs
+`src/transport/connect-entry.ts` — the same program on every machine, remote or the
+control-plane host itself (issue #551). Point it at the router and give it the
+operator's own GitHub token; on the control-plane host that URL is simply loopback:
 
 ```bash
-SWARM_CONTROL_PLANE_URL=https://<your-tunnel> \
-SWARM_WORKER_CREDENTIAL=<from `swarm workers register`> \
-SWARM_OPERATOR_GH_TOKEN=<your own GitHub token> \
-SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout \
-npm run dev:worker:connect        # remote worker: connect over the tunnel, run pushed phases
+# .env on the machine running the worker
+SWARM_DISPATCH_MODE=transport
+SWARM_CONTROL_PLANE_URL=http://localhost:3100      # remote worker: https://<your-tunnel>
+SWARM_WORKER_CREDENTIAL=<from `swarm workers register`>
+SWARM_OPERATOR_GH_TOKEN=<your own GitHub token>
+SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
 ```
 
-This client holds **only** the credential, the control-plane URL, and the
-operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`. It performs the
+`npm run dev:worker:legacy` is the older **in-process** worker
+(`src/worker/index.ts`, the BullMQ consumer) for `SWARM_DISPATCH_MODE=in-process`
+deployments; it refuses to start in `transport` mode. It runs one job at a time by
+default — pass `--concurrency <n>` (or set `SWARM_WORKER_CONCURRENCY`) to raise it,
+the flag winning over the env var; a project's **Maximum Concurrent Jobs** setting
+bounds it further per project. In `transport` mode the router owns the consumer, and
+Compose passes the same environment setting to it so it can dispatch work to
+multiple eligible workers. See [`docs/configuration.md`](docs/configuration.md).
+
+The worker holds **only** the credential, the control-plane URL, and the
+operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`, even on a host that has
+them. Its agent therefore authenticates as the *operator's own* GitHub account
+everywhere, which is ADR-004 §2's decision; the project-scoped reviewer PAT and PM
+credential never leave the server, so a submitted review's identity is unchanged. It performs the
 `/worker/session` handshake (declaring the CLIs it can run and the pipeline phases
 it can execute), keeps its session
 live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
@@ -173,8 +180,10 @@ routes a phase to a worker that cannot run it and the work waits for one that ca
 only five; the worker-side gate fails such an assignment cleanly as a backstop.
 Every worker has the same permissions: which phases a project may give a machine is
 the enrollment's own choice, made by the worker's owner and approved by a project
-administrator, with no reference to who owns the machine (issue #542). It is
-**additive**: the same-machine `npm run dev:worker` path above is unchanged. See
+administrator, with no reference to who owns the machine (issue #542). The
+control-plane host's own worker runs this identical program over loopback, so a
+remote worker and a local one are the same code path rather than two that have to be
+kept in step. See
 [`docs/cloudflare-tunnel.md`](docs/cloudflare-tunnel.md#remote-worker-transport-worker).
 
 Open <http://localhost:5173>. For a compiled self-hosted dashboard, run

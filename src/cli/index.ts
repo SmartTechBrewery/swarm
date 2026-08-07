@@ -10,6 +10,7 @@
  * the number is the process exit code.
  */
 
+import { resolveDispatchMode } from '../lib/env.js';
 import * as out from './_shared/output.js';
 import * as config from './commands/config.js';
 import * as identities from './commands/identities.js';
@@ -44,7 +45,9 @@ const COMMANDS: Record<string, Command> = {
 	worktrees,
 };
 
-const USAGE = `swarm — SWARM operator CLI
+function usage(): string {
+	const workerCommand = resolveDispatchMode() === 'transport' ? 'dev:worker' : 'dev:worker:legacy';
+	return `swarm — SWARM operator CLI
 
 Usage: swarm <command> [options]
 
@@ -63,7 +66,8 @@ Commands:
   workers          Register and manage local workers (identity + declared CLIs)
   worktrees prune  Prune stale per-task worktrees
 
-The worker is not managed here — it runs on the host: npm run dev:worker`;
+The worker is not managed here — it runs on the host: npm run ${workerCommand}`;
+}
 
 /**
  * Parse argv (already stripped of `node` + script path) and run the matching
@@ -73,14 +77,14 @@ export async function run(argv: string[]): Promise<number> {
 	const [command, ...rest] = argv;
 
 	if (!command || command === '--help' || command === '-h' || command === 'help') {
-		out.info(USAGE);
+		out.info(usage());
 		return 0;
 	}
 
 	const handler = COMMANDS[command];
 	if (!handler) {
 		out.error(`unknown command '${command}'`);
-		out.info(USAGE);
+		out.info(usage());
 		return 1;
 	}
 

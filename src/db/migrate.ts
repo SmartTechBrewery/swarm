@@ -4,7 +4,7 @@
  *
  * Why this exists (not just the `db:migrate` npm-script prefix): the worker can
  * be launched directly, from compiled output, or through the opt-in
- * `dev:worker:watch` command. A watch restart does not rerun the npm prefix. A
+ * `dev:worker:legacy:watch` command. A watch restart does not rerun the npm prefix. A
  * process that picks up new schema-referencing code before its migration is
  * applied would run *ahead* of the DB: every `runs` insert/select would fail with
  * `column "…" does not exist`, silently (run tracking is best-effort), and the

@@ -85,7 +85,7 @@ eligibility gate already consumes that signal. The in-process host worker
 directly — the transport is a second front door to the same service, so the
 single-user/same-machine path is unaffected.
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -103,7 +103,10 @@ operator opts in). It landed across four phases:
 3. **#406** — the worker-side phase runner (`src/worker/transport-client.ts`):
    receive a pushed `TaskAssignment`, run the phase via the shared `runAssignedPhase`
    switch, stream `StreamLog`/`TaskProgress`, and report a terminal
-   `TaskExecutionResult`.
+   `TaskExecutionResult`. (**Deleted by issue #551**, item 10 below: the DB-free
+   executor from #394/#417/#418 subsumed it, and the control-plane host's worker now
+   runs that one over loopback. Its framing helpers had already moved to
+   `src/transport/assignment-execution.ts`.)
 4. **#407** — the **control-plane dispatcher** (`src/router/dispatcher.ts`): the
    router hosts the BullMQ consumer + ADR-001 eligibility gate and, on selecting a
    connected eligible worker, composes the prompt/branch server-side, pushes the
@@ -222,7 +225,7 @@ server-side store) it needs:
    delivery that got as far as posting. A split that dies partway (a `createWorkItem`
    throwing on child 2 of 3) leaves child 1 on the board with no marker anywhere, and
    the retry re-runs the whole split: child 1 is created a second time. That is
-   pre-existing behaviour, identical on the same-host path and not introduced here —
+   pre-existing behaviour, identical on the in-process path and not introduced here —
    but `createWorkItem` is the one write outside the per-child `try`, and putting it
    on the wire adds transport failure modes (a 5xx, a socket reset, a control-plane
    restart) to precisely the call whose failure duplicates board structure. Closing it
@@ -246,13 +249,42 @@ server-side store) it needs:
    "apply this split" route. That would carry agent-authored preplan contracts and
    per-child ordering up to the control plane and re-implement Planning's per-child
    failure handling there — moving pipeline logic off the phase that owns it, and
-   changing the same-host path this issue had to leave untouched.
+   changing the in-process path this issue had to leave untouched.
 
    What the deferral cost while it stood: with `planning` excluded, **no machine
    could plan** unless the instance admin's own host was permanently part of the
    deployment. It was the last thing pinning SWARM to a single-machine topology and
    the blocker on a hosted instance where the control plane holds the database and no
    worker does.
+
+10. **#551** — **one worker program.** The control-plane host stopped running an
+   executor of its own: `SWARM_DISPATCH_MODE=transport` now points its worker at
+   `src/transport/connect-entry.ts` with `SWARM_CONTROL_PLANE_URL=http://localhost:<ROUTER_PORT>`,
+   the same program and the same code path a remote worker runs, and
+   `src/worker/transport-client.ts` is deleted rather than kept "just in case".
+   `src/worker/index.ts` refuses to start in that mode, naming `npm run dev:worker`,
+   so the queue keeps exactly one consumer and no second executor can drift.
+   Loopback is safe by inspection: only worker-side code reads
+   `SWARM_CONTROL_PLANE_URL` — the router publishes its own address as
+   `WEBHOOK_CALLBACK_BASE_URL`.
+
+   **The deliberate behavioural delta is the agent's `GH_TOKEN`.** The deleted
+   executor resolved a per-project *implementer persona* token from Postgres because
+   it happened to be able to; the surviving one uses the operator's own
+   `SWARM_OPERATOR_GH_TOKEN`. That is ADR-004 §2's already-taken decision — the
+   implementer identity *is* the worker operator's own GitHub account — and issue
+   #396 had already removed `implementer` from `ScmCredentialReferencesSchema`, so
+   there is no per-project implementer token left to resolve on any host. The
+   identities that must stay per-project are untouched: the **reviewer** PAT still
+   backs `POST /worker/delivery/review`, so a submitted review's author is unchanged,
+   and board writes still run under the project's PM credential control-plane side.
+
+   One consequence outside the executor: the worktree retention sweep must read the
+   lease store this host's worker *writes*. In `transport` mode that is the
+   host-local filesystem runtime rather than the Redis lease, so
+   `retentionWorktreeRuntime` (`src/worktree/retention.ts`) selects it by dispatch
+   mode — otherwise the sweep would find every checkout unleased and prune one out
+   from under a live phase.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

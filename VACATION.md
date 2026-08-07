@@ -91,7 +91,7 @@ The one that changes behaviour meaningfully is **#437**. It added:
 
 **The DB-free path is opt-in and, by default, dormant.** `runAssignmentDbFree` has
 exactly one caller — `src/transport/connect-entry.ts`, i.e. `npm run
-dev:worker:connect` — and assignments only get pushed to it when
+dev:worker` — and assignments only get pushed to it when
 `SWARM_DISPATCH_MODE=transport` on both the router and the worker (default
 `in-process`). If you leave dispatch in-process and do not run the remote worker,
 **none of #437's new behaviour executes**; the delivery routes sit unused.
@@ -137,10 +137,10 @@ Ranked by how likely each is to bite while unattended.
    `pipeline.automationLabel` (default `swarm`) is checked before Planning or
    Implementation starts, so an unlabelled item is skipped at every dispatch. This
    is the supported way to stop SWARM touching a specific task.
-2. **Stop the executor:** stop the worker process (`npm run dev:worker`, or
-   `npm run dev:worker:connect` for the remote one). Pending work stays durable in
-   Postgres and resumes when a worker comes back — nothing is lost, nothing
-   proceeds.
+2. **Stop the executor:** stop the worker process (`npm run dev:worker` on every
+   machine running one; `npm run dev:worker:legacy` if the installation is still
+   `in-process`). Pending work stays durable in Postgres and resumes when a worker
+   comes back — nothing is lost, nothing proceeds.
 3. **Turn off the new path specifically:** unset `SWARM_DISPATCH_MODE` (or set
    `in-process`) on the router and worker. Dispatch returns to the host worker and
    the DB-free executor stops receiving assignments.

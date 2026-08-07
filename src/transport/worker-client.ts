@@ -131,10 +131,8 @@ export class WorkerTransportTransientError extends Error {
 /**
  * Build the handshake request body, stamping the current protocol version.
  *
- * `supportedPhases` is the caller's phase repertoire (issue #467): the DB-free
- * daemon passes `SUPPORTED_DB_FREE_PHASES`, the same-host client passes every
- * phase. Since issue #536 those are the same six — a DB-free daemon runs
- * `planning` too — so this is no longer a difference between the callers. It
+ * `supportedPhases` is the caller's phase repertoire (issue #467): every daemon
+ * passes `SUPPORTED_DB_FREE_PHASES`, which since issue #536 is all six. It
  * stays required rather than defaulted because a default would be a claim the
  * transport made on a caller's behalf: a daemon that later narrows its repertoire
  * would silently keep claiming phases it refuses.
@@ -366,8 +364,8 @@ export interface WorkerTransportOptions {
 	/**
 	 * The pipeline phases this daemon can execute (issue #467), declared at
 	 * handshake so the control plane never selects it for a phase it would refuse.
-	 * The DB-free remote daemon passes `SUPPORTED_DB_FREE_PHASES`; the same-host
-	 * dispatch client passes every phase.
+	 * `./connect-entry.ts` — the one worker program (issue #551) — passes
+	 * `SUPPORTED_DB_FREE_PHASES`.
 	 */
 	supportedPhases: readonly TaskPhase[];
 	/**
@@ -389,12 +387,11 @@ export interface WorkerTransportOptions {
 	/**
 	 * Called when the control plane pushes a `task-assignment` frame on the live
 	 * session (ADR-003 §2). The handler runs the phase and streams results back
-	 * through the supplied {@link AssignmentSink}. Left undefined by the
-	 * session-only remote client (`./connect-entry.ts`), which keeps its lease live
-	 * but executes no work; the in-process transport-dispatch client
-	 * (`../worker/transport-client.ts`) supplies it. Fire-and-forget: the handler
-	 * runs independently of the heartbeat loop, so a long phase never blocks lease
-	 * liveness.
+	 * through the supplied {@link AssignmentSink}. `./connect-entry.ts` supplies it
+	 * ({@link runAssignmentDbFree}); it stays optional so a session-only client —
+	 * one that keeps its lease live but executes no work — remains expressible.
+	 * Fire-and-forget: the handler runs independently of the heartbeat loop, so a
+	 * long phase never blocks lease liveness.
 	 */
 	onAssignment?: (assignment: TaskAssignment, sink: AssignmentSink) => void;
 	/**

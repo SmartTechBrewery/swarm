@@ -4,8 +4,9 @@
  * router** and, on selecting a connected, eligible worker, composes the phase's
  * system prompt + target branch server-side, builds a `TaskAssignment`
  * (`../transport/assignment.ts`), and pushes it (`./worker-connections.ts`) to
- * that worker — which runs the phase (`../worker/transport-client.ts`) and reports
- * a `TaskExecutionResult` back over its socket for the dispatcher to settle on.
+ * that worker — which runs the phase (`../transport/assignment-execution.ts`) and
+ * reports a `TaskExecutionResult` back over its socket for the dispatcher to
+ * settle on.
  *
  * The whole dispatch/settle machine is **reused verbatim** from `processJob`
  * (`../worker/consumer.ts`): claim → trigger → automation gate → eligibility gate

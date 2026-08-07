@@ -15,8 +15,8 @@
  * to the control plane's ledger routes (`../router/worker-delivery.ts`) — the
  * same shape as the metadata-delivery split: the operation runs where its backing
  * resource lives, and only its inputs and result cross the wire. The in-process
- * and same-host paths inject nothing and keep the repository defaults, so their
- * behaviour is byte-for-byte unchanged.
+ * path injects nothing and keeps the repository defaults, so its behaviour is
+ * byte-for-byte unchanged.
  *
  * Typed against the repository's own `ReviewVerdictKey`/`ReviewVerdictRecord`
  * (type-only imports, erased at build) so the contract cannot drift from the
