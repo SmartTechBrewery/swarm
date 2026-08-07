@@ -268,6 +268,12 @@ describe('performHandshake', () => {
 		const err = await performHandshake(deps, 'http://cp/worker/session', request).catch((e) => e);
 		expect(err).toBeInstanceOf(WorkerCapabilityConflictError);
 		expect((err as WorkerCapabilityConflictError).offending).toEqual(['codex']);
+		// The control plane's reason is a prefix, not the whole message: it always
+		// sends the same CLI-less sentence, and this string is the daemon's fatal
+		// log line, so the offending CLI and the next step have to survive it.
+		expect((err as Error).message).toContain('declared capabilities drop a CLI');
+		expect((err as Error).message).toContain('codex');
+		expect((err as Error).message).toContain('SWARM_WORKER_TRANSPORT_CLIS');
 	});
 
 	it('treats an unrecognized 200 body as a protocol mismatch', async () => {

@@ -7,18 +7,22 @@ vi.mock('node:child_process', () => ({
 
 import { probeBinary } from '@/harness/binary-probe.js';
 
+/** `execFile`'s node-style callback, always its last argument. */
+type ExecFileCallback = (err: unknown, stdout: unknown, stderr: unknown) => void;
+
+/** Settle the promisified `execFile` call `mockExecFile` was invoked with. */
+function settle(args: unknown[], err: unknown, stdout: unknown = null): void {
+	(args[args.length - 1] as ExecFileCallback)(err, stdout, '');
+}
+
 /** Drive the promisified `execFile` callback with a success. */
 function succeed(): void {
-	mockExecFile.mockImplementation((...args: any[]) => {
-		args[args.length - 1](null, { stdout: '1.0.0' }, '');
-	});
+	mockExecFile.mockImplementation((...args: unknown[]) => settle(args, null, { stdout: '1.0.0' }));
 }
 
 /** Fail the next `execFile` call with `err`. */
 function failWith(err: unknown): void {
-	mockExecFile.mockImplementation((...args: any[]) => {
-		args[args.length - 1](err, null, null);
-	});
+	mockExecFile.mockImplementation((...args: unknown[]) => settle(args, err));
 }
 
 /** The error shape `execFile` reports when its own timeout kills the child. */
@@ -64,24 +68,20 @@ describe('probeBinary', () => {
 
 	it('confirms a binary that exits non-zero with a bare invocation', async () => {
 		mockExecFile
-			.mockImplementationOnce((...args: any[]) => {
-				args[args.length - 1](Object.assign(new Error('unknown flag'), { code: 1 }), null, null);
-			})
-			.mockImplementationOnce((...args: any[]) => {
-				args[args.length - 1](null, { stdout: 'usage' }, '');
-			});
+			.mockImplementationOnce((...args: unknown[]) =>
+				settle(args, Object.assign(new Error('unknown flag'), { code: 1 })),
+			)
+			.mockImplementationOnce((...args: unknown[]) => settle(args, null, { stdout: 'usage' }));
 		await expect(probeBinary('agy')).resolves.toBe('present');
 		expect(mockExecFile).toHaveBeenCalledTimes(2);
 	});
 
 	it('reports indeterminate when the confirming bare invocation times out', async () => {
 		mockExecFile
-			.mockImplementationOnce((...args: any[]) => {
-				args[args.length - 1](Object.assign(new Error('unknown flag'), { code: 1 }), null, null);
-			})
-			.mockImplementationOnce((...args: any[]) => {
-				args[args.length - 1](TIMEOUT_ERROR, null, null);
-			});
+			.mockImplementationOnce((...args: unknown[]) =>
+				settle(args, Object.assign(new Error('unknown flag'), { code: 1 })),
+			)
+			.mockImplementationOnce((...args: unknown[]) => settle(args, TIMEOUT_ERROR));
 		await expect(probeBinary('agy')).resolves.toBe('indeterminate');
 	});
 

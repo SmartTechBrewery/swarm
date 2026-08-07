@@ -97,13 +97,17 @@ export class WorkerSessionConflictError extends Error {
  * (issue #559). The daemon does not know that: the set may have come from an
  * explicit `SWARM_WORKER_TRANSPORT_CLIS`, and telling an operator to install a
  * CLI that is sitting on their PATH points the investigation at the wrong thing.
+ *
+ * The control plane's `reason` is a *prefix*, never the whole message: it always
+ * sends the same fixed sentence (`src/router/worker-transport.ts`), which names
+ * no CLI and offers no next step, and this error is what the daemon dies with —
+ * `describeError` renders exactly this string into the fatal log line.
  */
 export class WorkerCapabilityConflictError extends Error {
 	readonly offending: string[];
-	constructor(offending: string[], message?: string) {
+	constructor(offending: string[], reason?: string) {
 		super(
-			message ??
-				`declared capabilities drop a CLI an enrollment requires: ${offending.join(', ')} — this daemon did not declare it. Check that it runs on this host's PATH, or declare it explicitly with SWARM_WORKER_TRANSPORT_CLIS.`,
+			`${reason ?? 'declared capabilities drop a CLI an enrollment requires'}: ${offending.join(', ')} — this daemon did not declare it. Check that it runs on this host's PATH, or declare it explicitly with SWARM_WORKER_TRANSPORT_CLIS.`,
 		);
 		this.name = 'WorkerCapabilityConflictError';
 		this.offending = offending;
