@@ -10,13 +10,18 @@ import {
 	deleteProjectFromDb,
 	findProjectByBoardFromDb,
 	findProjectByIdFromDb,
+	findProjectByPmContainerFromDb,
 	getProjectByIdFromDb,
 	listAllProjectsFromDb,
 	listDiscoverableProjectsFromDb,
 } from '../../../src/db/repositories/projectsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { projectCredentials } from '../../../src/db/schema/projectCredentials.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import {
+	createMockLinearConfig,
+	createMockLinearProjectConfig,
+	createMockProjectConfig,
+} from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -82,6 +87,57 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 			const byBoard = await findProjectByBoardFromDb('PVT_kwDOpersisted');
 			expect(byBoard?.id).toBe('proj-pm-config');
 			expect(await findProjectByBoardFromDb('PVT_untracked')).toBeUndefined();
+		});
+
+		// The provider-parameterised container lookup (issue #529). Its predicate is
+		// the one piece of new SQL a stubbed-DB unit test can only assert *structurally*
+		// — a bound parameter used as the jsonb key, with an explicit `::text` cast to
+		// pick the `jsonb ->> text` operator over the integer overload. Whether Postgres
+		// actually resolves and executes that is exactly what a real round-trip proves,
+		// and it is how every Linear webhook will find its project.
+		it('resolves a project by the container key its own provider names', async () => {
+			const linearConfig = createMockLinearConfig();
+			const linear = createMockLinearProjectConfig({
+				id: 'proj-linear-container',
+				name: 'Linear Container Project',
+				repo: 'jkwiecien/linear-container',
+				pm: { type: 'linear', ...linearConfig },
+			});
+			await createProjectInDb(linear);
+
+			const byTeam = await findProjectByPmContainerFromDb('linear', 'teamId', linearConfig.teamId);
+			expect(byTeam?.id).toBe('proj-linear-container');
+			expect(byTeam?.pm).toEqual(linear.pm);
+			expect(
+				await findProjectByPmContainerFromDb('linear', 'teamId', 'team-untracked'),
+			).toBeUndefined();
+		});
+
+		// The collision-safety claim, on a real DB: the same key *and* the same value,
+		// asked for under the wrong `pm_type`, must miss. Without the discriminator two
+		// providers whose blobs happen to share a key name would resolve each other's
+		// projects.
+		it('scopes the container match to the asking provider, so two blobs cannot collide', async () => {
+			await createProjectInDb(
+				createMockProjectConfig({
+					id: 'proj-gh-container',
+					name: 'GitHub Container Project',
+					repo: 'jkwiecien/gh-container',
+				}),
+			);
+
+			expect(
+				(
+					await findProjectByPmContainerFromDb(
+						'github-projects',
+						'projectId',
+						'PVT_kwHOAC3TF84BcNwD',
+					)
+				)?.id,
+			).toBe('proj-gh-container');
+			expect(
+				await findProjectByPmContainerFromDb('linear', 'projectId', 'PVT_kwHOAC3TF84BcNwD'),
+			).toBeUndefined();
 		});
 
 		// The PM provider's credential-role references ride the existing `credentials`
