@@ -26,6 +26,8 @@ import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const SESSION_ID = '33333333-3333-4333-8333-333333333333';
 const CREDENTIAL = 'raw-worker-credential-secret';
+const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
+const RUN_ID = '55555555-5555-4555-8555-555555555555';
 
 function handshakeResponseBody(fencingToken: number, heartbeatTtlMs = 60_000) {
 	return {
@@ -527,6 +529,65 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		await expect(settled).resolves.toBeInstanceOf(WorkerCapabilityConflictError);
 		expect(refreshCapabilities).toHaveBeenCalledTimes(2);
 		expect(fetch).toHaveBeenCalledTimes(3);
+	});
+
+	// Issue #549: the control plane delivers a user termination as a pushed frame,
+	// because a DB-free daemon has no Redis to read the durable marker from.
+	it('hands a task-cancel frame to the registered onCancel handler', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const onCancel = vi.fn();
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onCancel },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			reason: 'a cancellation was requested for this run',
+		});
+
+		expect(onCancel).toHaveBeenCalledTimes(1);
+		expect(onCancel).toHaveBeenCalledWith(
+			expect.objectContaining({ type: 'task-cancel', dispatchId: DISPATCH_ID, runId: RUN_ID }),
+		);
+		await client.stop();
+	});
+
+	it('ignores a task-cancel when no handler is registered, keeping the session live', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({ type: 'task-cancel', dispatchId: DISPATCH_ID });
+		await flush();
+
+		expect(sockets[0].closedWith).toBeUndefined();
+		expect(fetch).toHaveBeenCalledTimes(1);
+		await client.stop();
+	});
+
+	// What keeps a new cloud→worker frame additive (no `TRANSPORT_PROTOCOL_VERSION`
+	// bump): a daemon that predates one must ignore it, not drop its session.
+	it('ignores an unrecognized control frame instead of ending the session', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({ type: 'task-pause', dispatchId: DISPATCH_ID });
+		sockets[0].emitMessage('not json at all');
+		await flush();
+
+		expect(sockets[0].closedWith).toBeUndefined();
+		// No reconnect was scheduled — the session is untouched.
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		await client.stop();
 	});
 
 	it('stop() closes the live socket gracefully so the lease is released promptly', async () => {

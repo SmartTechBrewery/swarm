@@ -56,6 +56,22 @@ interface PendingDispatch extends DispatchResultHandlers, DispatchStreamTarget {
 /** dispatchId → the dispatcher awaiting that dispatch's terminal result on this router. */
 const pending = new Map<string, PendingDispatch>();
 
+/**
+ * runId → dispatchId, the reverse index over the same registrations. It answers
+ * the one question the pushing side cannot: a run cancellation names a *run*
+ * (`../queue/cancellation.ts` keys on the immutable run id), while the transport
+ * addresses a *worker* and a *dispatch* — so cancelling a run executing on a
+ * connected worker means resolving one to the other (`./dispatch-cancellation.ts`,
+ * issue #549). Maintained strictly alongside `pending`, so a dispatch this router
+ * is no longer awaiting is not resolvable here either.
+ */
+const byRun = new Map<string, string>();
+
+/** Drop `runId`'s index entry, but only while it still points at `dispatchId`. */
+function unindexRun(dispatchId: string, runId: string | undefined): void {
+	if (runId !== undefined && byRun.get(runId) === dispatchId) byRun.delete(runId);
+}
+
 /** A registered result wait — the promise to await, plus the cleanup that unregisters it. */
 export interface AwaitingDispatchResult {
 	/** Resolves with the worker's terminal `TaskExecutionResult` for this dispatch. */
@@ -81,6 +97,7 @@ export function awaitDispatchResult(
 		logger.warn('dispatch back-channel: superseding an earlier result wait for the same dispatch', {
 			dispatchId,
 		});
+		unindexRun(dispatchId, existing.runId);
 		existing.resolve({
 			type: 'task-execution-result',
 			dispatchId,
@@ -97,17 +114,24 @@ export function awaitDispatchResult(
 	const result = new Promise<TaskExecutionResult>((res) => {
 		resolve = res;
 	});
-	pending.set(dispatchId, {
+	const entry: PendingDispatch = {
 		resolve,
 		workerId: target.workerId,
 		runId: target.runId,
 		onProgress: handlers.onProgress,
 		onAck: handlers.onAck,
-	});
+	};
+	pending.set(dispatchId, entry);
+	if (target.runId !== undefined) byRun.set(target.runId, dispatchId);
 	return {
 		result,
 		dispose: () => {
+			// Identity-checked, like `./worker-connections.ts`'s deregister: a superseded
+			// waiter's own `dispose` must not unregister the newer registration that
+			// replaced it, nor take its run index down with it.
+			if (pending.get(dispatchId) !== entry) return;
 			pending.delete(dispatchId);
+			unindexRun(dispatchId, target.runId);
 		},
 	};
 }
@@ -134,6 +158,7 @@ export function deliverDispatchResult(result: TaskExecutionResult): boolean {
 		return false;
 	}
 	pending.delete(result.dispatchId);
+	unindexRun(result.dispatchId, entry.runId);
 	entry.resolve(result);
 	return true;
 }
@@ -164,4 +189,26 @@ export function resolveDispatchStreamTarget(dispatchId: string): DispatchStreamT
 	const entry = pending.get(dispatchId);
 	if (!entry) return undefined;
 	return { workerId: entry.workerId, runId: entry.runId };
+}
+
+/** Where a dispatch is executing: the worker it was pushed to and the dispatch id itself. */
+export interface RunDispatchTarget {
+	dispatchId: string;
+	workerId: string;
+}
+
+/**
+ * The dispatch this router pushed for `runId` and the worker it went to, or
+ * `undefined` when no dispatch for that run is awaited here — it already settled,
+ * was never dispatched from this router, or is queued/deferred rather than
+ * executing (issue #549). A miss is an ordinary answer, not an error: the durable
+ * cancellation marker still governs a run that is not executing on a connected
+ * worker.
+ */
+export function resolveDispatchTargetForRun(runId: string): RunDispatchTarget | undefined {
+	const dispatchId = byRun.get(runId);
+	if (dispatchId === undefined) return undefined;
+	const entry = pending.get(dispatchId);
+	if (!entry) return undefined;
+	return { dispatchId, workerId: entry.workerId };
 }

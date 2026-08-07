@@ -251,6 +251,38 @@ export const TaskAssignmentSchema = z.object({
 export type TaskAssignment = z.infer<typeof TaskAssignmentSchema>;
 
 /**
+ * Cloud→worker control frame asking the daemon to abort one in-flight
+ * {@link TaskAssignmentSchema} — the transport half of the dashboard's Terminate
+ * action (issue #166). The control plane records the durable cancellation marker
+ * and publishes it (`../queue/cancellation.ts`); the dispatcher turns that
+ * notification into this frame, addressed to the worker it actually pushed the
+ * dispatch to (`../router/dispatch-cancellation.ts`). The worker aborts the
+ * matching run's `AbortSignal` — the same SIGTERM→SIGKILL path shutdown uses —
+ * and settles the dispatch terminal-`failed` with `cancelled: true`, never
+ * `deferred`, which would re-run the very phase the user killed.
+ *
+ * Keyed on `dispatchId`, which is what a worker indexes its in-flight assignments
+ * by (`./assignment-execution.ts`); `runId` rides along for correlation and the
+ * daemon's log. `reason` is human-readable for that log, exactly as
+ * {@link DisconnectSchema}'s is, and never becomes the run's terminal message —
+ * the control plane owns that wording (`RUN_CANCELLED_MESSAGE`).
+ *
+ * Additive, so `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: a
+ * daemon that predates the frame does not recognise it, and an unrecognised
+ * control frame is a logged no-op there rather than a closed socket
+ * (`./worker-client.ts`). A version skew therefore costs only the promptness this
+ * frame buys — the durable marker still settles the run — whereas a bump would
+ * reject every frame from an already-deployed worker.
+ */
+export const TaskCancelSchema = z.object({
+	type: z.literal('task-cancel'),
+	dispatchId: z.string().uuid(),
+	runId: z.string().uuid().optional(),
+	reason: z.string().optional(),
+});
+export type TaskCancel = z.infer<typeof TaskCancelSchema>;
+
+/**
  * One captured agent-output line, the transport mirror of a `run_output_events`
  * row (`../worker/live-output.ts`): the `stream` it came from, its `content`
  * (newline-terminated, as the batcher stores it), and the ISO-8601 instant it
@@ -436,15 +468,16 @@ export type WorkerStreamMessage = z.infer<typeof WorkerStreamMessageSchema>;
 /**
  * Every cloud→worker stream frame, discriminated on `type`: the lease-liveness
  * control frames plus `TaskAssignment` (PROJECT.md §3), which the control-plane
- * dispatcher pushes to a selected connected worker (ADR-003 §2, issue #407). The
- * back-channel frames it pairs with — `TaskExecutionResult`/`StreamLog`/
- * `TaskProgress`/`TaskAssignmentAck` on the worker→cloud union above — settle the
- * dispatch on the control plane.
+ * dispatcher pushes to a selected connected worker (ADR-003 §2, issue #407), and
+ * the `TaskCancel` that stops one it already pushed. The back-channel frames they
+ * pair with — `TaskExecutionResult`/`StreamLog`/`TaskProgress`/`TaskAssignmentAck`
+ * on the worker→cloud union above — settle the dispatch on the control plane.
  */
 export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 	HeartbeatAckSchema,
 	DisconnectSchema,
 	TaskAssignmentSchema,
+	TaskCancelSchema,
 ]);
 export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 

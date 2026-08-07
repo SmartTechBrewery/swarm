@@ -40,6 +40,7 @@ import {
 	HandshakeResponseSchema,
 	type Heartbeat,
 	type TaskAssignment,
+	type TaskCancel,
 	type TaskPhase,
 	TRANSPORT_PROTOCOL_VERSION,
 	type WorkerHealth,
@@ -396,6 +397,16 @@ export interface WorkerTransportOptions {
 	 * liveness.
 	 */
 	onAssignment?: (assignment: TaskAssignment, sink: AssignmentSink) => void;
+	/**
+	 * Called when the control plane pushes a `task-cancel` frame for an assignment
+	 * this daemon is running (issue #549) — the transport delivery of the
+	 * dashboard's Terminate action, which a worker with no `REDIS_URL` cannot learn
+	 * about any other way. The handler aborts the matching in-flight run
+	 * (`cancelAssignment`, `./assignment-execution.ts`); both executing entrypoints
+	 * supply it. Left undefined the frame is logged and ignored, which is exactly
+	 * how a daemon predating the frame behaves.
+	 */
+	onCancel?: (cancel: TaskCancel) => void;
 }
 
 /** How a live session ended, deciding whether the loop reconnects or fails. */
@@ -517,7 +528,7 @@ export function connectWorkerTransport(
 				heartbeatTimer = setInterval(sendHeartbeat, heartbeatCadenceMs(session.heartbeatTtlMs));
 			});
 			socket.on('message', (data) => {
-				const frame = parseControlFrame(data);
+				const frame = parseControlFrame(data, deps.logger);
 				if (!frame) return;
 				// A `disconnect` control frame means the lease can no longer be refreshed
 				// (lost/expired/superseded) — end the session so the loop reconnects with a
@@ -526,14 +537,11 @@ export function connectWorkerTransport(
 					finish({ reason: 'disconnect', message: frame.reason });
 					return;
 				}
-				// A pushed assignment (ADR-003 §2): hand it to the executor, which streams
-				// its results back through `sink`. Runs independently of this session's
-				// heartbeat loop, so a long phase never blocks lease liveness.
-				if (frame.type === 'task-assignment') {
-					options.onAssignment?.(frame, sink);
-					return;
-				}
-				// `heartbeat-ack` needs no action.
+				// Everything else is work rather than session liveness: a pushed assignment
+				// and the cancellation that stops one, both handed to the executor. They run
+				// independently of this session's heartbeat loop, so a long phase never
+				// blocks lease liveness — and `heartbeat-ack` needs no action at all.
+				routeWorkFrame(frame, options, deps.logger, sink);
 			});
 			socket.on('close', (code) =>
 				finish({ reason: 'close', code: typeof code === 'number' ? code : WS_CLOSE.LEASE_LOST }),
@@ -667,18 +675,69 @@ function isFatalHandshakeError(err: unknown, everConnected: boolean): boolean {
 	return false;
 }
 
-/** Parse a WebSocket frame payload into a known control-plane message, if it is one. */
-function parseControlFrame(data: unknown): ControlPlaneMessage | undefined {
+/**
+ * Route the cloud→worker *work* frames — a pushed `TaskAssignment` (ADR-003 §2)
+ * and the `TaskCancel` that stops one (issue #549) — to the executor's handlers.
+ * Both handlers are optional, because a session-only client keeps its lease live
+ * and runs nothing: an unhandled frame is logged and ignored, never an error.
+ * `heartbeat-ack` falls through with no action.
+ *
+ * Module-level rather than inline in the socket's `message` listener so that
+ * listener stays a flat frame switch as frames are added.
+ */
+function routeWorkFrame(
+	frame: ControlPlaneMessage,
+	options: WorkerTransportOptions,
+	logger: TransportLogger,
+	sink: AssignmentSink,
+): void {
+	if (frame.type === 'task-assignment') {
+		options.onAssignment?.(frame, sink);
+		return;
+	}
+	if (frame.type === 'task-cancel') {
+		if (!options.onCancel) {
+			logger.info('ignoring task-cancel — this client runs no assignments', {
+				dispatchId: frame.dispatchId,
+				runId: frame.runId,
+			});
+			return;
+		}
+		options.onCancel(frame);
+	}
+}
+
+/**
+ * Parse a WebSocket frame payload into a known control-plane message, if it is
+ * one. An unrecognised frame is a **logged no-op**, never a close: that is what
+ * lets the control plane add a cloud→worker frame without a
+ * `TRANSPORT_PROTOCOL_VERSION` bump (`task-cancel`, issue #549) — a daemon that
+ * predates it keeps its session and simply does nothing. The line names the
+ * frame's `type` and nothing else, so it stays useful for diagnosing a version
+ * skew without logging frame contents.
+ */
+function parseControlFrame(
+	data: unknown,
+	logger: TransportLogger,
+): ControlPlaneMessage | undefined {
 	const text = frameToText(data);
 	if (text === undefined) return undefined;
 	let payload: unknown;
 	try {
 		payload = JSON.parse(text);
 	} catch {
+		logger.debug('ignoring an unparseable control-plane frame');
 		return undefined;
 	}
 	const parsed = ControlPlaneMessageSchema.safeParse(payload);
-	return parsed.success ? parsed.data : undefined;
+	if (!parsed.success) {
+		const type = (payload as { type?: unknown } | null)?.type;
+		logger.debug('ignoring an unrecognized control-plane frame', {
+			type: typeof type === 'string' ? type : undefined,
+		});
+		return undefined;
+	}
+	return parsed.data;
 }
 
 /** Normalize a WebSocket message payload (string or binary) to a string frame. */

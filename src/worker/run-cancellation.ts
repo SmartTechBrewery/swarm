@@ -21,14 +21,16 @@ import { isRunCancellationRequested } from '../queue/cancellation.js';
 
 /**
  * Thrown to settle a phase as a terminal, user-initiated cancellation (issue
- * #166) when the durable cancellation marker cannot be consulted at settle time.
- * The in-process path detects a cancellation by re-reading the durable set in
- * `handlePhaseFailure`, but the control-plane transport path (issue #407) settles
- * from a worker's `TaskExecutionResult` *after* the worker already cleared that
- * marker in its own cleanup — so the worker reports the cancellation on the frame
- * (`cancelled: true`) and the control plane raises this to route it through the
- * same terminal-cancelled branch (never a deferral, which would re-run the very
- * phase the user killed).
+ * #166) reported by a worker rather than read from the durable marker. The
+ * in-process path detects a cancellation by re-reading the durable set in
+ * `handlePhaseFailure`; the control-plane transport path (issue #407) settles from
+ * a worker's `TaskExecutionResult` instead, and it is the *worker* that observed
+ * the cancellation — since issue #549 it learns of one from a pushed `task-cancel`
+ * frame, which is the only channel a worker with no `REDIS_URL` has. So the worker
+ * reports it on the frame (`cancelled: true`) and the control plane raises this to
+ * route it through the same terminal-cancelled branch (never a deferral, which
+ * would re-run the very phase the user killed), independent of what a marker read
+ * on the settling side would find.
  */
 export class RunTerminatedError extends Error {
 	constructor(message: string) {

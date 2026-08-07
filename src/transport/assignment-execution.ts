@@ -4,18 +4,23 @@
  * both the same-host and remote executors share.
  *
  * `../worker/transport-client.ts` runs an assignment on a host **with**
- * `DATABASE_URL` (persona tokens from Postgres, cancellation via Redis). This
- * module adds the **remote** counterpart, {@link runAssignmentDbFree}, which runs
- * entirely from the assignment itself: the project config is reconstructed from
- * the non-secret slice (`./db-free-project.ts`), source-carrying delivery uses the
- * operator's own credential through the registered SCM provider
- * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`), the two kinds of
+ * `DATABASE_URL` (persona tokens resolve from Postgres). This module adds the
+ * **remote** counterpart, {@link runAssignmentDbFree}, which runs entirely from
+ * the assignment itself: the project config is reconstructed from the non-secret
+ * slice (`./db-free-project.ts`), source-carrying delivery uses the operator's own
+ * credential through the registered SCM provider
+ * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`), and the two kinds of
  * metadata write the operator token *cannot* perform — a review under the
  * project's reviewer PAT, a board write under its PM credential — ride the
- * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2), and
- * cancellation rides the shutdown signal alone (no Redis). A supported-phase gate
- * cleanly fails any phase not yet runnable this way, so a premature push fails
- * with a clear result rather than crashing on a DB/Redis access.
+ * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2). A
+ * supported-phase gate cleanly fails any phase not yet runnable this way, so a
+ * premature push fails with a clear result rather than crashing on a DB/Redis
+ * access.
+ *
+ * Cancellation is shared by both executors and needs no Redis on either (issue
+ * #549): the in-flight registry below indexes each running assignment by
+ * `dispatchId`, a pushed `task-cancel` frame aborts the matching run's signal, and
+ * the run settles terminal-`failed` with `cancelled: true`.
  *
  * Live output is the one thing neither executor persists: both stream it as
  * `stream-log` frames and the control plane writes it to `run_output_events`
@@ -62,6 +67,7 @@ import type {
 	AssignedWorkItem,
 	StreamLogLine,
 	TaskAssignment,
+	TaskCancel,
 	TaskExecutionResult,
 	TaskPhase,
 } from './protocol.js';
@@ -263,14 +269,125 @@ export function succeededResult(
 	};
 }
 
+/** One in-flight assignment this worker can still abort, plus whether it was. */
+interface CancellableAssignment {
+	controller: AbortController;
+	/**
+	 * Set by {@link cancelAssignment} before it aborts, so the executor's `catch`
+	 * can tell a user termination from an ordinary abort. Without it the abort
+	 * arrives as a plain `aborted` `AgentRunError`, which {@link classifyDeferrable}
+	 * would defer — re-running the very phase the user killed.
+	 */
+	cancelled: boolean;
+}
+
+/**
+ * The assignments currently executing in *this* worker process, keyed by
+ * `dispatchId` — the bridge between a pushed `task-cancel` frame and the
+ * per-run `AbortSignal` threaded into the phase runner (issue #549). It mirrors
+ * `../worker/run-cancellation.ts`'s run-id registry, but keyed the way the
+ * transport addresses work and with no Redis behind it: a DB-free worker learns
+ * about a cancellation only from the frame.
+ *
+ * Module-level and shared by both executors ({@link runAssignmentDbFree} and the
+ * same-host `../worker/transport-client.ts`), so one daemon's entrypoint resolves
+ * a cancel for whichever of them is running the dispatch.
+ */
+const cancellableAssignments = new Map<string, CancellableAssignment>();
+
+/** Make an in-flight assignment cancellable; call {@link untrackAssignment} when it settles. */
+export function trackAssignment(dispatchId: string, controller: AbortController): void {
+	cancellableAssignments.set(dispatchId, { controller, cancelled: false });
+}
+
+/** Drop a settled assignment from the registry (called from the executor's `finally`). */
+export function untrackAssignment(dispatchId: string): void {
+	cancellableAssignments.delete(dispatchId);
+}
+
+/**
+ * Abort the in-flight assignment for `dispatchId`, if it is running here, and mark
+ * it cancelled so it settles terminal-`failed` rather than deferring. Returns
+ * whether one was found — `false` means this worker is not running that dispatch
+ * (it already settled, or was never pushed here), in which case the frame is a
+ * no-op and the control plane's durable marker still governs the run.
+ */
+export function cancelAssignment(dispatchId: string): boolean {
+	const entry = cancellableAssignments.get(dispatchId);
+	if (!entry) return false;
+	entry.cancelled = true;
+	entry.controller.abort();
+	return true;
+}
+
+/** Whether the assignment for `dispatchId` was cancelled by a pushed `task-cancel`. */
+export function isAssignmentCancelled(dispatchId: string): boolean {
+	return cancellableAssignments.get(dispatchId)?.cancelled === true;
+}
+
+/**
+ * Apply a pushed `task-cancel` frame — the `onCancel` handler both executing
+ * entrypoints register (`./connect-entry.ts` and
+ * `../worker/transport-client.ts`). Shared so the two log and behave identically,
+ * and so an unknown dispatch stays an ordinary, non-fatal miss.
+ */
+export function handleTaskCancel(frame: TaskCancel, logger: TransportLogger = defaultLogger): void {
+	const context = { dispatchId: frame.dispatchId, runId: frame.runId, reason: frame.reason };
+	if (cancelAssignment(frame.dispatchId)) {
+		logger.info('aborting in-flight assignment after a cancellation request', context);
+		return;
+	}
+	logger.info('ignoring task-cancel — that assignment is not running here', context);
+}
+
+/**
+ * Build the terminal frame for an assignment a `task-cancel` stopped: `failed`
+ * with `cancelled: true`, which `../router/dispatcher.ts` turns back into a
+ * `RunTerminatedError` so the shared settle path treats it as the user
+ * termination it is — never a deferral, which would re-run the killed phase.
+ *
+ * It carries no `error`: the control plane substitutes its own neutral
+ * `RUN_CANCELLED_MESSAGE` (issue #305) for an absent one, which is exactly the
+ * wording this used to send, and sourcing the constant here would put
+ * `../queue/cancellation.ts` — a Redis module — back on a DB-free worker's import
+ * path for a string the control plane already owns.
+ */
+function cancelledResult(assignment: TaskAssignment): TaskExecutionResult {
+	return {
+		type: 'task-execution-result',
+		dispatchId: assignment.dispatchId,
+		runId: assignment.runId,
+		phase: assignment.phase,
+		taskId: assignment.taskId,
+		status: 'failed',
+		cancelled: true,
+	};
+}
+
+/**
+ * The terminal frame for a failed assignment: the cancelled settlement above when
+ * a `task-cancel` stopped this dispatch, otherwise the classified
+ * failure/deferral. One helper so both executors settle a cancellation
+ * identically (issue #549).
+ */
+export function settleAssignmentFailure(
+	err: unknown,
+	assignment: TaskAssignment,
+	worktreePath?: string,
+): TaskExecutionResult {
+	if (isAssignmentCancelled(assignment.dispatchId)) return cancelledResult(assignment);
+	return deferrableOrFailedResult(err, assignment, worktreePath);
+}
+
 /**
  * Build the terminal failure/deferral frame for a non-cancelled failure: a
  * deferrable failure settles `deferred` with the retry hint + resume flags a
  * `phase-deferred` outcome carries; a dependency block settles `deferred` too, but
  * reports the open prerequisites instead of a delay (issue #438); everything else
- * settles terminal-`failed`. The cancelled-settlement (a user termination) is the
- * caller's concern — the same-host client checks Redis for it; the DB-free path has
- * no such channel and so never produces one.
+ * settles terminal-`failed`. A *cancelled* run never reaches here — both executors
+ * route through {@link settleAssignmentFailure}, which answers a `task-cancel`
+ * with the terminal cancelled frame before this classification could defer the
+ * abort it caused.
  *
  * `worktreePath` is this task's checkout on *this* host, present once the assignment
  * got far enough to reconstruct the project. It is what lets a remote worker report
@@ -658,11 +775,12 @@ function buildDbFreePhaseInputs({
  *
  * Unlike the same-host executor (`../worker/transport-client.ts`), it reads no
  * database and no queue: the project is reconstructed from the assignment's
- * non-secret slice, source delivery uses the operator's own token, the reviewer /
- * PM metadata writes ride the control-plane delivery API under credentials that
- * stay on the server, and cancellation rides the shutdown signal alone. A phase
- * not in {@link SUPPORTED_DB_FREE_PHASES} is failed cleanly with a clear reason
- * rather than crashing on a DB/Redis access.
+ * non-secret slice, source delivery uses the operator's own token, and the
+ * reviewer / PM metadata writes ride the control-plane delivery API under
+ * credentials that stay on the server. A user termination reaches it as a pushed
+ * `task-cancel` ({@link cancelAssignment}) rather than a Redis read. A phase not
+ * in {@link SUPPORTED_DB_FREE_PHASES} is failed cleanly with a clear reason rather
+ * than crashing on a DB/Redis access.
  */
 export async function runAssignmentDbFree(
 	assignment: TaskAssignment,
@@ -682,6 +800,9 @@ export async function runAssignmentDbFree(
 	inFlight.add(dispatchId);
 
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
+	// Registered synchronously, before the first await, so a `task-cancel` pushed
+	// straight after the assignment can never arrive ahead of the registration.
+	trackAssignment(dispatchId, controller);
 	// Resolved as soon as the project is, so the failure path below can read the Tier 2
 	// checkpoint out of this host's checkout (issue #503). Still unset for a failure
 	// that happened before there was a project — and so before there was a worktree.
@@ -774,9 +895,10 @@ export async function runAssignmentDbFree(
 			taskId,
 			error: describeError(err),
 		});
-		sink.send(deferrableOrFailedResult(err, assignment, worktreePath));
+		sink.send(settleAssignmentFailure(err, assignment, worktreePath));
 	} finally {
 		detach();
+		untrackAssignment(dispatchId);
 		inFlight.delete(dispatchId);
 	}
 }

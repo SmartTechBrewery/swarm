@@ -16,8 +16,10 @@ import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import {
+	cancelAssignment,
 	createAssignmentRunAgent,
 	deferrableOrFailedResult,
+	handleTaskCancel,
 	runAssignmentDbFree,
 	SUPPORTED_DB_FREE_PHASES,
 } from '@/transport/assignment-execution.js';
@@ -928,6 +930,92 @@ describe('runAssignmentDbFree', () => {
 		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'deferred', failureKind: 'timeout' });
+	});
+});
+
+/**
+ * A pushed `task-cancel` is the only cancellation channel a DB-free worker has
+ * (issue #549) — it holds no `REDIS_URL` to read the durable marker with. What
+ * matters is that the abort reaches the in-flight run's signal and that the
+ * settlement is terminal-`failed` + `cancelled`, never the `deferred` that
+ * `classifyDeferrable` would otherwise make of an `aborted` failure and that
+ * would re-run the very phase the user killed.
+ */
+describe('cancelling an in-flight assignment', () => {
+	beforeEach(_resetSCMProviderRegistryForTesting);
+
+	/** A phase runner that hangs until its own signal aborts, then fails like the harness does. */
+	function abortableRunPhase(onStarted: (signal: AbortSignal) => void) {
+		return vi.fn(
+			(inputs: AssignedPhaseInputs) =>
+				new Promise<PhaseRunResult>((_resolve, reject) => {
+					const signal = inputs.signal as AbortSignal;
+					signal.addEventListener('abort', () =>
+						reject(
+							new AgentRunError('aborted', { kind: 'aborted' }, agentResult({ exitCode: null })),
+						),
+					);
+					onStarted(signal);
+				}),
+		);
+	}
+
+	it('aborts the run and settles failed+cancelled, never deferred', async () => {
+		const sink = recordingSink();
+		let started: (signal: AbortSignal) => void = () => {};
+		const signalSeen = new Promise<AbortSignal>((resolve) => {
+			started = resolve;
+		});
+		const frame = ciAssignment();
+		const run = runAssignmentDbFree(frame, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(abortableRunPhase(started)),
+		});
+
+		const signal = await signalSeen;
+		expect(cancelAssignment(frame.dispatchId)).toBe(true);
+		await run;
+
+		expect(signal.aborted).toBe(true);
+		const result = sink.sent.at(-1) as Record<string, unknown>;
+		expect(result).toMatchObject({
+			type: 'task-execution-result',
+			status: 'failed',
+			cancelled: true,
+			dispatchId: frame.dispatchId,
+		});
+		// The control plane owns the neutral terminal wording (issue #305), so the
+		// frame deliberately carries no `error` of its own.
+		expect(result.error).toBeUndefined();
+		expect(result.retryDelayMs).toBeUndefined();
+	});
+
+	it('is a no-op for a dispatch this worker is not running', () => {
+		expect(cancelAssignment('66666666-6666-4666-8666-666666666666')).toBe(false);
+	});
+
+	it('drops the assignment from the registry once it settles', async () => {
+		const sink = recordingSink();
+		const frame = ciAssignment();
+		await runAssignmentDbFree(frame, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(async () => ({ agent: agentResult() })),
+		});
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded' });
+		// A cancellation arriving after the run settled finds nothing to abort.
+		expect(cancelAssignment(frame.dispatchId)).toBe(false);
+	});
+
+	it('logs and ignores a task-cancel for an unknown dispatch', () => {
+		const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+		handleTaskCancel(
+			{ type: 'task-cancel', dispatchId: '66666666-6666-4666-8666-666666666666' },
+			logger,
+		);
+
+		expect(logger.info).toHaveBeenCalledTimes(1);
+		expect(logger.error).not.toHaveBeenCalled();
 	});
 });
 
