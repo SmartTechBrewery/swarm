@@ -2058,7 +2058,19 @@ function ProjectDetailRouteComponent() {
 	};
 
 	const handleBoardMappingProvider = (providerId: string) => {
-		setBoardMapping((prev) => ({ ...prev, providerId }));
+		setBoardMapping((prev) => {
+			if (prev.providerId === providerId) return prev;
+			// Switching providers clears the selection wholesale: one provider's
+			// container/state IDs mean nothing to another, so carrying them over would
+			// save, say, a Projects v2 board node id as a Linear team id (issue #531).
+			return {
+				...prev,
+				providerId,
+				containerId: '',
+				statusOptions: emptyBoardStatusOptions(),
+				providerContext: {},
+			};
+		});
 		updateMutation.reset();
 	};
 

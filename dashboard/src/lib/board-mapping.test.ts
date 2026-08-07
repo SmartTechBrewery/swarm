@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ProjectPm } from '../../../src/config/schema.js';
 import {
+	blankStatusOptions,
 	buildPmUpdate,
 	canSaveBoardMapping,
 	cleanStatusOptions,
@@ -29,6 +30,15 @@ const linearPm: ProjectPm = {
 	teamId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
 	statusOptions: { planning: 'f4dd18f6-7943-4a6d-9a0e-4e6cb6e3acb6' },
 };
+
+/** Narrow a built payload to one provider's member, failing loudly on a mismatch. */
+function asMember<T extends ProjectPm['type']>(
+	pm: ProjectPm,
+	type: T,
+): Extract<ProjectPm, { type: T }> {
+	if (pm.type !== type) throw new Error(`expected a '${type}' member, got '${pm.type}'`);
+	return pm as Extract<ProjectPm, { type: T }>;
+}
 
 describe('toBoardMappingForm', () => {
 	it('fills blanks and defaults the provider when config is undefined', () => {
@@ -59,13 +69,16 @@ describe('toBoardMappingForm', () => {
 		expect(toBoardMappingForm(fullPm).providerId).toBe('github-projects');
 	});
 
-	it('keeps a Linear mapping inert until its board form is available', () => {
+	// Issue #531: the Linear member's container is its team, and it carries no
+	// provider context — a workflow-state UUID is the whole mapping.
+	it('projects a Linear mapping onto the team container with no provider context', () => {
 		const form = toBoardMappingForm(linearPm);
 		expect(form.providerId).toBe('linear');
-		expect(form.containerId).toBe('');
+		expect(form.containerId).toBe(linearPm.teamId);
 		expect(form.providerContext).toEqual({});
 		expect(form.statusOptions.planning).toBe(linearPm.statusOptions.planning);
-		expect(canSaveBoardMapping(form)).toBe(false);
+		expect(form.statusOptions.done).toBe('');
+		expect(canSaveBoardMapping(form)).toBe(true);
 	});
 
 	it('leaves an unmapped canonical key blank and omits absent field context', () => {
@@ -107,10 +120,10 @@ describe('buildPmUpdate', () => {
 			undefined,
 		);
 		// The payload is a whole `pm` member — discriminator included.
-		expect(payload.type).toBe('github-projects');
-		expect(payload.projectId).toBe('PVT_1');
-		expect(payload.statusFieldId).toBe('PVTSSF_1');
-		expect(payload.statusOptions).toEqual({ planning: '3fe662f4' });
+		const member = asMember(payload, 'github-projects');
+		expect(member.projectId).toBe('PVT_1');
+		expect(member.statusFieldId).toBe('PVTSSF_1');
+		expect(member.statusOptions).toEqual({ planning: '3fe662f4' });
 	});
 
 	it('preserves phaseLabels from the existing config', () => {
@@ -118,13 +131,86 @@ describe('buildPmUpdate', () => {
 			...fullPm,
 			phaseLabels: { 'phase-6': 'phase-6' },
 		};
-		const payload = buildPmUpdate(toBoardMappingForm(existing), existing);
+		const payload = asMember(
+			buildPmUpdate(toBoardMappingForm(existing), existing),
+			'github-projects',
+		);
 		expect(payload.phaseLabels).toEqual({ 'phase-6': 'phase-6' });
 	});
 
 	it('omits phaseLabels when the existing config has none', () => {
 		const payload = buildPmUpdate(toBoardMappingForm(fullPm), fullPm);
 		expect(payload).not.toHaveProperty('phaseLabels');
+	});
+
+	it('round-trips a Linear mapping back to an equal member', () => {
+		expect(buildPmUpdate(toBoardMappingForm(linearPm), linearPm)).toEqual(linearPm);
+	});
+
+	it('serializes the container to teamId for Linear and carries no field context', () => {
+		const payload = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'linear',
+					containerId: `  ${linearPm.teamId}  `,
+					statusOptions: { ...blankStatusOptions(), inReview: ' state_review ' },
+					providerContext: {},
+				},
+				undefined,
+			),
+			'linear',
+		);
+		expect(payload.teamId).toBe(linearPm.teamId);
+		expect(payload.statusOptions).toEqual({ inReview: 'state_review' });
+		expect(payload).not.toHaveProperty('statusFieldId');
+		expect(payload).not.toHaveProperty('projectId');
+	});
+
+	// Acceptance criterion of issue #531: neither provider's own keys may cross a
+	// provider switch — not from the stored member, not from a stale form context.
+	it('never leaks the other provider’s keys across a provider switch', () => {
+		const storedGitHub: ProjectPm = { ...fullPm, phaseLabels: { 'phase-6': 'phase-6' } };
+		const toLinear = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'linear',
+					containerId: linearPm.teamId,
+					statusOptions: { ...blankStatusOptions(), planning: 'state_planning' },
+					providerContext: { statusFieldId: 'PVTSSF_stale' },
+				},
+				storedGitHub,
+			),
+			'linear',
+		);
+		expect(toLinear).toEqual({
+			type: 'linear',
+			teamId: linearPm.teamId,
+			statusOptions: { planning: 'state_planning' },
+		});
+
+		const toGitHub = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'github-projects',
+					containerId: 'PVT_1',
+					statusOptions: { ...blankStatusOptions(), todo: 'opt_ready' },
+					providerContext: { statusFieldId: 'PVTSSF_1' },
+				},
+				linearPm,
+			),
+			'github-projects',
+		);
+		expect(toGitHub).toEqual({
+			type: 'github-projects',
+			projectId: 'PVT_1',
+			statusFieldId: 'PVTSSF_1',
+			statusOptions: { todo: 'opt_ready' },
+		});
+	});
+
+	it('builds the default provider’s member for an unknown provider id', () => {
+		const payload = buildPmUpdate({ ...toBoardMappingForm(fullPm), providerId: 'nope' }, fullPm);
+		expect(payload.type).toBe('github-projects');
 	});
 });
 
@@ -156,6 +242,34 @@ describe('isBoardMappingDirty', () => {
 		form.containerId = 'PVT_1';
 		expect(isBoardMappingDirty(form, undefined)).toBe(true);
 	});
+
+	it('is false when a Linear form matches its stored mapping', () => {
+		expect(isBoardMappingDirty(toBoardMappingForm(linearPm), linearPm)).toBe(false);
+	});
+
+	it('is true when a Linear team or workflow state changes', () => {
+		const team = toBoardMappingForm(linearPm);
+		team.containerId = 'other-team';
+		expect(isBoardMappingDirty(team, linearPm)).toBe(true);
+
+		const state = toBoardMappingForm(linearPm);
+		state.statusOptions.done = 'state_done';
+		expect(isBoardMappingDirty(state, linearPm)).toBe(true);
+	});
+
+	// Linear returns no `providerContext`, so a stale GitHub field id left on the form
+	// must not read as a change against a stored Linear mapping.
+	it('ignores the Status field context for a Linear form', () => {
+		const form = toBoardMappingForm(linearPm);
+		form.providerContext = { statusFieldId: 'PVTSSF_stale' };
+		expect(isBoardMappingDirty(form, linearPm)).toBe(false);
+	});
+
+	it('is true when the selected provider changes', () => {
+		expect(
+			isBoardMappingDirty({ ...toBoardMappingForm(fullPm), providerId: 'linear' }, fullPm),
+		).toBe(true);
+	});
 });
 
 describe('canSaveBoardMapping', () => {
@@ -181,6 +295,25 @@ describe('canSaveBoardMapping', () => {
 		form.providerContext = { statusFieldId: 'PVTSSF_1' };
 		expect(canSaveBoardMapping(form)).toBe(false);
 	});
+
+	// The Status field id is GitHub Projects' own scope; Linear's state UUIDs need none.
+	it('requires only a team and one workflow state for Linear', () => {
+		const form = toBoardMappingForm(linearPm);
+		expect(form.providerContext).toEqual({});
+		expect(canSaveBoardMapping(form)).toBe(true);
+	});
+
+	it('is false for a Linear form without a team', () => {
+		const form = toBoardMappingForm(linearPm);
+		form.containerId = '';
+		expect(canSaveBoardMapping(form)).toBe(false);
+	});
+
+	it('is false for a Linear form with no workflow state mapped', () => {
+		const form = toBoardMappingForm(linearPm);
+		form.statusOptions = blankStatusOptions();
+		expect(canSaveBoardMapping(form)).toBe(false);
+	});
 });
 
 describe('getPmMappingProvider', () => {
@@ -190,6 +323,7 @@ describe('getPmMappingProvider', () => {
 			label: 'Linear',
 			containerNoun: 'team',
 			stateNoun: 'workflow state',
+			stateNounPlural: 'workflow states',
 		});
 		expect(getPmMappingProvider('nope').id).toBe('github-projects');
 	});

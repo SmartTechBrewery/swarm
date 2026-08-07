@@ -242,16 +242,16 @@ export function BoardMappingPanel({
 					</h3>
 					<p className="text-xs text-zinc-400 mb-4">
 						Map each SWARM pipeline status to one of the {provider.containerNoun}'s{' '}
-						{provider.stateNoun}es. Leave a status unmapped if the {provider.containerNoun} has no
-						matching {provider.stateNoun}.
+						{provider.stateNounPlural}. Leave a status unmapped if the {provider.containerNoun} has
+						no matching {provider.stateNoun}.
 					</p>
 
 					{statesQuery.isLoading && form.containerId && (
-						<p className="text-xs text-zinc-500 mb-3">Discovering {provider.stateNoun}es…</p>
+						<p className="text-xs text-zinc-500 mb-3">Discovering {provider.stateNounPlural}…</p>
 					)}
 					{statesErr && (
 						<p className="text-xs text-red-400 mb-3">
-							Failed to load {provider.stateNoun}es: {statesErr}
+							Failed to load {provider.stateNounPlural}: {statesErr}
 						</p>
 					)}
 
