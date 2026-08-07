@@ -94,11 +94,13 @@ export const EnrollmentAllowedPhasesSchema = z
  * behavior before phases were selectable per enrollment at all.
  *
  * Deliberately *not* the worker's own `supportedPhases`, tempting as the tighter
- * set is: that column states whichever **program** currently operates the row (a
- * DB-free `connect` run declares a strict subset of what the host worker does —
- * `updateWorkerSupportedPhases`, `src/db/repositories/workersRepository.ts`), so
+ * set is: that column states whichever **program** currently operates the row
+ * (`updateWorkerSupportedPhases`, `src/db/repositories/workersRepository.ts`), so
  * seeding an owner's durable choice from it would let one narrow session
- * permanently narrow an enrollment nobody chose to narrow.
+ * permanently narrow an enrollment nobody chose to narrow. Since issue #536 the
+ * DB-free `connect` daemon declares every phase, so the narrow session is a
+ * daemon on an older build rather than a different kind of program — the same
+ * skew, and the same reason not to seed from it.
  */
 export const DEFAULT_ENROLLMENT_ALLOWED_PHASES: readonly TriggerPhase[] = ALL_TRIGGER_PHASES;
 

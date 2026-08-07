@@ -291,8 +291,12 @@ export function startWorkerTransportDispatch(
 		capabilities: options.capabilities,
 		refreshCapabilities: options.refreshCapabilities,
 		// This client holds `DATABASE_URL` and runs phases through the full
-		// `runAssignedPhase` switch, so it declares every phase — including
-		// `planning`, the one the DB-free daemon must refuse (issue #467).
+		// `runAssignedPhase` switch, so it declares every phase. Since issue #536
+		// that is the same repertoire the DB-free daemon declares
+		// (`SUPPORTED_DB_FREE_PHASES`, `../transport/assignment-execution.ts`) —
+		// including `planning`, which no longer requires a database. The two are
+		// stated separately because each declares what *it* can run, not because
+		// they differ.
 		supportedPhases: ALL_TRIGGER_PHASES,
 		hostname: options.hostname,
 		daemonVersion: options.daemonVersion,

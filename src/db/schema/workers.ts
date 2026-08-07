@@ -38,10 +38,11 @@ export const workers = pgTable(
 		capabilities: jsonb('capabilities').$type<AgentCli[]>().notNull(),
 		/**
 		 * The pipeline phases this worker's daemon declared it can execute (issue
-		 * #467) — the second capability axis alongside `capabilities`, since the
-		 * DB-free remote daemon runs a strict subset of the phases the same-host
-		 * worker does and the two are otherwise indistinguishable to the dispatcher.
-		 * One `TriggerPhase` per element.
+		 * #467) — the second capability axis alongside `capabilities`, since a
+		 * daemon's repertoire is otherwise indistinguishable to the dispatcher from
+		 * any other's. It is not a distinction between daemon *kinds*: since issue
+		 * #536 the DB-free remote daemon declares every phase, `planning` included,
+		 * so a narrower set means an older build. One `TriggerPhase` per element.
 		 *
 		 * `NOT NULL` with an every-phase default so the eligibility gate never has a
 		 * null case to interpret: a worker registered before it ever connects, a row

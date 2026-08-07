@@ -80,8 +80,10 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * operates the machine); `displayName` is its human-facing label, unique per
  * owner (`src/db/schema/workers.ts`); `capabilities` is the declared set of agent
  * CLIs it can run and `supportedPhases` the set of pipeline phases its daemon
- * declared it can execute (issue #467 — the DB-free remote daemon runs a strict
- * subset of what the same-host worker does). `id` is generated (`uuid`), not
+ * declared it can execute (issue #467). The axis exists because a daemon's
+ * repertoire is its own to state, not because the two daemon kinds differ: since
+ * issue #536 the DB-free remote daemon declares every phase, `planning` included,
+ * so a narrower set today means an older build. `id` is generated (`uuid`), not
  * externally supplied.
  *
  * The worker credential hash is intentionally **not** a field here — it is a

@@ -132,8 +132,11 @@ export class WorkerTransportTransientError extends Error {
  *
  * `supportedPhases` is the caller's phase repertoire (issue #467): the DB-free
  * daemon passes `SUPPORTED_DB_FREE_PHASES`, the same-host client passes every
- * phase. It is required here — the two callers genuinely differ, so defaulting it
- * would let the DB-free daemon silently claim phases it refuses.
+ * phase. Since issue #536 those are the same six — a DB-free daemon runs
+ * `planning` too — so this is no longer a difference between the callers. It
+ * stays required rather than defaulted because a default would be a claim the
+ * transport made on a caller's behalf: a daemon that later narrows its repertoire
+ * would silently keep claiming phases it refuses.
  */
 export function buildHandshakeRequest(input: {
 	credential: string;
