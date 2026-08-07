@@ -11,7 +11,7 @@
  * "Zod is the source of truth").
  */
 
-import { asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 
 import type { ProjectConfig, ProjectPm, ProjectVisibility } from '../../config/schema.js';
 import { getDb } from '../client.js';
@@ -94,9 +94,11 @@ export async function findProjectByRepoFromDb(repo: string): Promise<ProjectConf
  * That key is **provider-specific** — it is only meaningful for a row whose
  * `pm_type` is `github-projects`, since another provider's config names its
  * container differently — so this lookup is deliberately GitHub-Projects-shaped
- * and only its router adapter calls it. A second provider resolving a project
- * from a board event gets its own lookup (or this one grows a `pm_type` filter
- * and a per-provider key), rather than sharing this predicate.
+ * and only its router adapter calls it. That is why a second provider resolving a
+ * project from a board event does *not* share this predicate: it goes through
+ * {@link findProjectByPmContainerFromDb}, which takes the `pm_type` and the
+ * container key as parameters (issue #529). This one stays exactly as it is —
+ * GitHub Projects keeps resolving through it.
  */
 export async function findProjectByBoardFromDb(
 	projectNodeId: string,
@@ -105,6 +107,44 @@ export async function findProjectByBoardFromDb(
 		.select()
 		.from(projects)
 		.where(sql`${projects.pmConfig}->>'projectId' = ${projectNodeId}`)
+		.limit(1);
+	const row = rows[0];
+	return row ? rowToProjectConfig(row) : undefined;
+}
+
+/**
+ * Resolve a project by the container id a PM provider's board event carries,
+ * parameterised by *that provider*: its `pm_type` discriminator plus the key its
+ * own `pm_config` blob names the container with (issue #529). The
+ * provider-agnostic form of {@link findProjectByBoardFromDb}, and the shape that
+ * function's own comment anticipated — a second provider resolving a project from
+ * a board event gets its own lookup rather than sharing a GitHub-shaped predicate.
+ *
+ * The `pm_type` filter is what makes it safe for two providers to name their
+ * container with the same key: a Linear team id looked up as
+ * `(linear, 'teamId', …)` can never match a row persisted for another provider,
+ * even if that provider's blob happens to carry a `teamId` too. Returns
+ * `undefined` for an untracked container — not our board isn't an error
+ * (ai/CODING_STANDARDS.md "Error handling").
+ *
+ * `configKey` is bound as a parameter (never interpolated), and cast to `text` so
+ * Postgres resolves `jsonb ->> text` rather than weighing it against the
+ * `jsonb ->> integer` overload.
+ */
+export async function findProjectByPmContainerFromDb(
+	pmType: string,
+	configKey: string,
+	containerId: string,
+): Promise<ProjectConfig | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(projects)
+		.where(
+			and(
+				eq(projects.pmType, pmType),
+				sql`${projects.pmConfig}->>${configKey}::text = ${containerId}`,
+			),
+		)
 		.limit(1);
 	const row = rows[0];
 	return row ? rowToProjectConfig(row) : undefined;

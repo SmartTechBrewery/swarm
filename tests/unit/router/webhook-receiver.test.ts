@@ -2,6 +2,16 @@ import { createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
+// The receiver no longer holds a board lookup — a PM event's project is resolved
+// through `PMRouterAdapter.resolveProject` (issue #529). The fake manifests below
+// stub that method directly; this mock is for the *real* registered GitHub
+// Projects adapter, whose own `resolveProject` calls this facade.
+vi.mock('@/config/provider.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/config/provider.js')>()),
+	findProjectByBoard: vi.fn(),
+}));
+
+import { findProjectByBoard } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
@@ -93,6 +103,10 @@ function fakePmManifest(
 		routerAdapter: {
 			type: id,
 			parseWebhook: vi.fn().mockReturnValue(pmEvent),
+			// The provider owns the board→project lookup (issue #529): the receiver
+			// resolves a board event's project through this contract method, so the
+			// "untracked board" cases override it rather than a receiver dep.
+			resolveProject: vi.fn().mockResolvedValue(project),
 			isStatusChange: vi.fn().mockReturnValue(true),
 			isSelfAuthored: vi.fn().mockResolvedValue(false),
 			...overrides.adapter,
@@ -315,9 +329,7 @@ describe('createWebhookApp', () => {
 			const app = createWebhookApp({
 				scmProviders: [fakeManifest()],
 				pmProviders: [pmManifest],
-				findProjectByBoard: vi
-					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
-					.mockResolvedValue(project),
+				// The board→project lookup is the adapter's (`fakePmManifest`), not a dep.
 				// The board side resolves the PM provider's own role, not the SCM secret
 				// (issue #497) — the SCM dep is still stubbed so a test can assert it is
 				// left untouched.
@@ -357,6 +369,15 @@ describe('createWebhookApp', () => {
 			expect(enqueuePm).toHaveBeenCalledWith('github-projects', pmEvent, project, 'delivery-pm');
 		});
 
+		// Issue #529: the receiver holds no board lookup of its own. Each provider owns
+		// which of its config keys names the container, so the project comes from the
+		// contract method — handed the *parsed* event, not a bare container id.
+		it("resolves the project through the adapter's resolveProject, with the parsed event", async () => {
+			const { app, pmManifest } = makePmApp();
+			await postPm(app);
+			expect(pmManifest.routerAdapter.resolveProject).toHaveBeenCalledWith(pmEvent);
+		});
+
 		// A `parseWebhook` returning null *is* the "not my event" answer on a shared
 		// route, so the request continues down the SCM path — which acknowledges an
 		// event it doesn't handle either.
@@ -372,16 +393,16 @@ describe('createWebhookApp', () => {
 			expect(enqueue).not.toHaveBeenCalled();
 		});
 
+		// The adapter answering `null` is the "board not tracked" signal (issue #529);
+		// the receiver holds no board lookup to answer it with.
 		it('ignores an event for an untracked board (before touching secrets)', async () => {
 			const getPmCredential = vi
 				.fn<WebhookReceiverDeps['getPmCredential']>()
 				.mockResolvedValue('whsec');
-			const { app, enqueuePm } = makePmApp({
-				findProjectByBoard: vi
-					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
-					.mockResolvedValue(undefined),
-				getPmCredential,
-			});
+			const { app, enqueuePm } = makePmApp(
+				{ getPmCredential },
+				fakePmManifest({ adapter: { resolveProject: vi.fn().mockResolvedValue(null) } }),
+			);
 			const res = await postPm(app);
 			expect(res.status).toBe(202);
 			expect((await res.json()).ignored).toBe(true);
@@ -539,9 +560,6 @@ describe('createWebhookApp', () => {
 			const app = createWebhookApp({
 				scmProviders: [fakeManifest({ parseWebhookEvent: () => null, ...scmOverrides })],
 				pmProviders: [githubProjects, jira],
-				findProjectByBoard: vi
-					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
-					.mockResolvedValue(project),
 				getPmCredential: vi.fn<WebhookReceiverDeps['getPmCredential']>().mockResolvedValue('whsec'),
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
@@ -642,13 +660,14 @@ describe('createWebhookApp', () => {
 			const getPmCredential = vi
 				.fn<WebhookReceiverDeps['getPmCredential']>()
 				.mockResolvedValue(secret);
+			// The board lookup is no longer a receiver dep: the *real* GitHub Projects
+			// adapter resolves it through the mocked `findProjectByBoard` facade, which
+			// is what keeps this end-to-end case honest about where the lookup lives.
+			vi.mocked(findProjectByBoard).mockResolvedValue(project);
 			// Fake only the secret + project lookups; leave both providers to the registry.
 			const app = createWebhookApp({
 				findProject: vi
 					.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
-					.mockResolvedValue(project),
-				findProjectByBoard: vi
-					.fn<(id: string) => Promise<ProjectConfig | undefined>>()
 					.mockResolvedValue(project),
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()

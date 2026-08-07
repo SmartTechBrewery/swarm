@@ -12,6 +12,7 @@ import {
 	deleteProjectFromDb,
 	findProjectByBoardFromDb,
 	findProjectByIdFromDb,
+	findProjectByPmContainerFromDb,
 	findProjectByRepoFromDb,
 	getProjectByIdFromDb,
 	listAllProjectsFromDb,
@@ -150,6 +151,54 @@ describe('projectsRepository', () => {
 			expect(query.sql).toContain('"pm_config"->>\'projectId\'');
 			expect(query.sql).not.toContain('github_projects');
 			expect(query.params).toEqual(['PVT_x']);
+		});
+	});
+
+	// The provider-parameterised container lookup (issue #529): the second PM
+	// provider resolving a project from a board event names its own `pm_type` and
+	// its own `pm_config` key rather than sharing the GitHub-shaped predicate above.
+	describe('findProjectByPmContainerFromDb', () => {
+		const linearRow = {
+			...row,
+			id: 'proj-linear',
+			repo: 'SmartTechBrewery/other',
+			pmType: 'linear',
+			pmConfig: { teamId: 'team-uuid', statusOptions: { inProgress: 'state-uuid' } },
+		};
+
+		it('maps a row back to a ProjectConfig', async () => {
+			stubDb([linearRow]);
+			const project = await findProjectByPmContainerFromDb('linear', 'teamId', 'team-uuid');
+			expect(project).toMatchObject({
+				id: 'proj-linear',
+				pm: { type: 'linear', teamId: 'team-uuid' },
+			});
+		});
+
+		it('returns undefined when no project owns the container', async () => {
+			stubDb([]);
+			expect(
+				await findProjectByPmContainerFromDb('linear', 'teamId', 'team-unknown'),
+			).toBeUndefined();
+		});
+
+		// The `pm_type` filter is what keeps two providers' blobs from colliding on a
+		// shared key name, and the container key is a bound parameter rather than an
+		// interpolated string — assert both in the rendered predicate, since neither is
+		// observable from the row mapping.
+		it('filters on pm_type and matches the provider-named key inside pm_config', async () => {
+			const captured = stubDbCapturingWhere([linearRow]);
+
+			await findProjectByPmContainerFromDb('linear', 'teamId', 'team-uuid');
+
+			const predicate = captured.where();
+			expect(predicate).toBeDefined();
+			const query = new PgDialect().sqlToQuery(predicate as SQL);
+			expect(query.sql).toContain('"pm_type"');
+			expect(query.sql).toContain('"pm_config"->>');
+			// Bound, not interpolated: the key never appears literally in the SQL.
+			expect(query.sql).not.toContain('teamId');
+			expect(query.params).toEqual(['linear', 'teamId', 'team-uuid']);
 		});
 	});
 

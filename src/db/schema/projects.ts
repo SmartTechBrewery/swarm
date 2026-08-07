@@ -57,8 +57,10 @@ export const projects = pgTable('projects', {
 	 * (`githubProjectsConfigSchema`). One *generic* jsonb column keyed by `pm_type`,
 	 * not a column per provider (issue #495): a second PM provider persists its own
 	 * config here without a migration, and nothing in this table reads inside the
-	 * blob. (The one query that does is `findProjectByBoardFromDb`'s board lookup,
-	 * which is provider-specific by construction — see its comment.)
+	 * blob. (The only queries that do are the two container lookups in
+	 * `projectsRepository.ts` — `findProjectByBoardFromDb`, hard-coded to GitHub
+	 * Projects' `projectId` key, and `findProjectByPmContainerFromDb`, which takes
+	 * both the `pm_type` and the container key from the provider that owns them.)
 	 */
 	pmConfig: jsonb('pm_config').$type<ProjectPmConfig>().notNull(),
 	credentials: jsonb('credentials').$type<Credentials>().notNull(),
