@@ -304,6 +304,15 @@ The dashboard deliberately exposes two complementary read models (issue #313):
   dispatch from Postgres — state, wait reason, priority, and scheduled time — never a
   BullMQ snapshot. `swarm queue clear` cancels those canonical records first. A fresh
   dispatch with no `runId` is Queue-only because no persisted attempt exists yet.
+  The *view* is narrower than the table, deliberately: `runs.queued` returns
+  `{ items, noTrigger }`, partitioning out a board dispatch whose card status the
+  enrichment's own board read proved maps to no pipeline phase (issue #570 — SWARM's
+  own `In progress` status report echoing back, a card being filed, a column reorder).
+  Nothing about the dispatch lifecycle changes: those rows are still created, claimed,
+  and settled as no-triggers, and they stay observable as a counted, expandable group
+  under the queue. The decision is the server's — the code that already read the board —
+  so no client has to learn to hide them, and it keys on the proven case only, leaving
+  the enrichment's fail-open behaviour intact.
 - **Runs is run-centric.** The Runs list (`runs.list` / `listRunsFromDb`) reads persisted
   attempts by their normal lifecycle, but hides a retry-pending (`deferred` or `checkpointed`) attempt linked to a pending
   or retry-scheduled dispatch to avoid displaying a duplicate row (issues #279/#316).

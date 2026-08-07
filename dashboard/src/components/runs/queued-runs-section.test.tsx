@@ -424,4 +424,66 @@ describe('QueuedRunsSection', () => {
 			expect(within(cards()[0]).getByText(/PR #42/)).not.toBeNull();
 		});
 	});
+
+	// Issue #570: the server proved these board dispatches cannot become a run and
+	// keeps them out of `items`, so the section's job is only to keep them
+	// observable — a count that expands to the rows — without ever presenting them
+	// as pending work.
+	describe('board events that start no phase (issue #570)', () => {
+		const noTriggerItem: QueuedRun = {
+			...boardItem,
+			jobId: 'job-no-trigger',
+			state: 'prioritized',
+			runsAt: undefined,
+			boardOutcome: 'no-trigger',
+			workItemTitle: "Phase 4/6: Run the control-plane host's worker",
+			workItemUrl: 'https://github.com/SmartTechBrewery/swarm/issues/551',
+		};
+
+		it('reports them as a collapsed count, not as queued rows', () => {
+			renderSection(<QueuedRunsSection items={[githubItem]} noTriggerItems={[noTriggerItem]} />);
+
+			expect(cards()).toHaveLength(1);
+			expect(within(cards()[0]).getByText(/PR #42/)).not.toBeNull();
+			// The queue count covers the queue alone.
+			expect(screen.getByText('(1)')).not.toBeNull();
+			const group = screen.getByTestId('queued-no-trigger-group');
+			expect(within(group).getByText('1 board event that starts no phase')).not.toBeNull();
+			// Collapsed: the borrowed task title is not on screen until asked for.
+			expect(screen.queryByTestId('queued-no-trigger-row')).toBeNull();
+			expect(screen.queryByText(noTriggerItem.workItemTitle as string)).toBeNull();
+		});
+
+		it('expands to the underlying rows on click', () => {
+			renderSection(<QueuedRunsSection items={[githubItem]} noTriggerItems={[noTriggerItem]} />);
+
+			fireEvent.click(screen.getByRole('button', { name: /starts no phase/ }));
+
+			const rows = screen.getAllByTestId('queued-no-trigger-row');
+			expect(rows).toHaveLength(1);
+			expect(within(rows[0]).getByText(noTriggerItem.workItemTitle as string)).not.toBeNull();
+			expect(within(rows[0]).getByText('Issue: #551')).not.toBeNull();
+			// Not pending work: no intervention offered on these rows.
+			expect(within(rows[0]).queryByRole('button', { name: /Put back/i })).toBeNull();
+		});
+
+		it('stays visible when they are all that is left, so an accumulation cannot hide', () => {
+			renderSection(
+				<QueuedRunsSection
+					items={[]}
+					noTriggerItems={[noTriggerItem, { ...noTriggerItem, jobId: 'job-no-trigger-2' }]}
+				/>,
+			);
+
+			expect(screen.queryByTestId('queued-run-card')).toBeNull();
+			// No empty queue table/heading alongside it.
+			expect(screen.queryByText('Task')).toBeNull();
+			expect(screen.getByText('2 board events that start no phase')).not.toBeNull();
+		});
+
+		it('renders nothing at all when there is neither queued work nor such an event', () => {
+			const { container } = renderSection(<QueuedRunsSection items={[]} noTriggerItems={[]} />);
+			expect(container.firstChild).toBeNull();
+		});
+	});
 });

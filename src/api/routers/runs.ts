@@ -61,7 +61,7 @@ import { priorityFor, removePendingJobById } from '../../queue/producer.js';
 import {
 	deriveDispatchPhaseHint,
 	deriveQueuedPhaseHint,
-	type QueuedPhaseHint,
+	type QueuedBoardOutcome,
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
@@ -72,9 +72,32 @@ import { accessibleProjectScope, assertProjectAccess } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
 const QUEUED_WORK_ITEM_CACHE_TTL_MS = 30_000;
+
+/**
+ * What one board read established about a queued dispatch's backing card/PR.
+ * `startsPhase` is a fact about the **card** — its current status maps to a
+ * pipeline phase — which {@link resolveQueuedBoardOutcome} turns into a fact
+ * about a *row* only where the card is still what decides that row's phase.
+ */
+interface QueuedWorkItemDetails {
+	title?: string;
+	url?: string;
+	nodeId?: string;
+	startsPhase?: boolean;
+}
+
+/**
+ * The board read, cached per card/PR for {@link QUEUED_WORK_ITEM_CACHE_TTL_MS}.
+ *
+ * `readAt` is what keeps that window from turning a merely wrong label into a
+ * *missing row* (issue #570): an entry cannot describe a dispatch enqueued after
+ * it was written, so a card dragged to Todo a second after a `no-trigger` read
+ * re-reads instead of inheriting that verdict and being filtered out of the queue
+ * for the rest of the window.
+ */
 const queuedWorkItemCache = new Map<
 	string,
-	{ expiresAt: number; title?: string; url?: string; nodeId?: string; phaseHint?: QueuedPhaseHint }
+	QueuedWorkItemDetails & { expiresAt: number; readAt: number }
 >();
 
 function queuedWorkItemCacheKey(item: QueuedRun): string | null {
@@ -87,23 +110,42 @@ function queuedWorkItemCacheKey(item: QueuedRun): string | null {
 	return null;
 }
 
-function withQueuedWorkItemDetails(
+/**
+ * The board outcome to report for `item`, given what the read established about
+ * its card (issue #570) — `undefined` whenever nothing was proven about *this
+ * row*, which is every case the filter must leave alone.
+ *
+ * Only a fresh, unresolved board dispatch is decided by the card's current
+ * status, so the guards mirror the queue view's own board fold (`boardGroupKey`,
+ * `dashboard/src/lib/queued-runs.ts`): a dispatch a worker already resolved a
+ * phase for, and one that owns a run — a deferred Planning/Implementation retry,
+ * whose card the Implementation phase itself moved to `inProgress` — are real
+ * pending work the board no longer speaks for.
+ */
+function resolveQueuedBoardOutcome(
 	item: QueuedRun,
-	details: { title?: string; url?: string; nodeId?: string; phaseHint?: QueuedPhaseHint },
-): QueuedRun {
+	startsPhase: boolean | undefined,
+): QueuedBoardOutcome | undefined {
+	if (startsPhase === undefined) return undefined;
+	if (item.type !== 'pm' || item.phaseHint !== 'board' || item.runId) return undefined;
+	return startsPhase ? 'starts-phase' : 'no-trigger';
+}
+
+function withQueuedWorkItemDetails(item: QueuedRun, details: QueuedWorkItemDetails): QueuedRun {
+	const boardOutcome = resolveQueuedBoardOutcome(item, details.startsPhase);
 	return {
 		...item,
 		workItemTitle: details.title,
 		workItemUrl: details.url,
 		workItemNodeId: details.nodeId || item.workItemNodeId,
-		phaseHint: details.phaseHint || item.phaseHint,
+		...(boardOutcome ? { boardOutcome } : {}),
 	};
 }
 
 async function resolveQueuedWorkItemDetails(
 	item: QueuedRun,
 	workItemNodeId: string,
-): Promise<{ title?: string; url?: string; isSupported?: boolean } | null> {
+): Promise<{ title?: string; url?: string; startsPhase: boolean } | null> {
 	const project = await getProjectByIdFromDb(item.projectId);
 	if (!project) return null;
 
@@ -113,17 +155,17 @@ async function resolveQueuedWorkItemDetails(
 	const workItem = await manifest.createProvider(project).getWorkItem(workItemNodeId);
 	// The provider already resolved its opaque native status into the canonical
 	// pipeline key on the way out of the board read (ai/RULES.md §2).
-	let isSupported = false;
+	let startsPhase = false;
 	if (workItem.statusKey) {
 		const targetPhase = resolvePipelinePhaseForStatusKey(workItem.statusKey);
 		if (targetPhase === 'planning' || targetPhase === 'implementation') {
-			isSupported = true;
+			startsPhase = true;
 		}
 	}
 	return {
 		title: workItem.title || undefined,
 		url: workItem.url || undefined,
-		isSupported,
+		startsPhase,
 	};
 }
 
@@ -132,17 +174,14 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 	if (!cacheKey) return item;
 
 	const cached = queuedWorkItemCache.get(cacheKey);
-	if (cached && cached.expiresAt > Date.now()) {
+	// A cached read describes only the dispatches that already existed when it was
+	// taken (see `queuedWorkItemCache`).
+	if (cached && cached.expiresAt > Date.now() && cached.readAt >= Date.parse(item.enqueuedAt)) {
 		return withQueuedWorkItemDetails(item, cached);
 	}
 
 	try {
-		let details: {
-			title?: string;
-			url?: string;
-			nodeId?: string;
-			phaseHint?: QueuedPhaseHint;
-		} | null = null;
+		let details: QueuedWorkItemDetails | null = null;
 		if (item.type === 'pm' && item.workItemNodeId) {
 			const resolved = await resolveQueuedWorkItemDetails(item, item.workItemNodeId);
 			if (resolved) {
@@ -150,7 +189,7 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 					title: resolved.title,
 					url: resolved.url,
 					nodeId: item.workItemNodeId,
-					phaseHint: resolved.isSupported ? 'board' : 'unknown',
+					startsPhase: resolved.startsPhase,
 				};
 			}
 		} else if (item.type === 'scm' && item.prNumber) {
@@ -181,8 +220,10 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 
 		if (!details) return item;
 
+		const readAt = Date.now();
 		const cachedDetails = {
-			expiresAt: Date.now() + QUEUED_WORK_ITEM_CACHE_TTL_MS,
+			expiresAt: readAt + QUEUED_WORK_ITEM_CACHE_TTL_MS,
+			readAt,
 			...details,
 		};
 		queuedWorkItemCache.set(cacheKey, cachedDetails);
@@ -201,6 +242,39 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 /** Add the same backing Issue/PR metadata that the persisted runs list uses. */
 async function enrichQueuedWorkItems(items: QueuedRun[]): Promise<QueuedRun[]> {
 	return Promise.all(items.map(enrichQueuedWorkItem));
+}
+
+/**
+ * The `runs.queued` response (issue #570). `items` is the queue — work that is
+ * going to happen — and `noTrigger` carries the board dispatches this server's
+ * own board read has already **proven** cannot start a phase, so no client has to
+ * learn to hide them for itself and none can list them as pending work.
+ *
+ * The split is a *view*, not a lifecycle: every dispatch in either array is the
+ * same row in the dispatch table, still claimed and settled exactly as before (a
+ * `noTrigger` one settles as a no-trigger when a worker reaches it). Reported
+ * rather than dropped because an accumulation of them is a real state — one
+ * survived a router restart and was re-imported by the dispatch reconciler — so
+ * the dashboard renders them as a collapsed, counted group.
+ */
+export interface QueuedRunsPage {
+	items: QueuedRun[];
+	noTrigger: QueuedRun[];
+}
+
+/**
+ * Split enriched queue rows into {@link QueuedRunsPage}. Keys on the proven case
+ * alone: a row whose board read failed, was unavailable, or doesn't decide its
+ * phase carries no `boardOutcome` and stays in the default view — the enrichment
+ * already fails open, and that behaviour has to survive the filter.
+ */
+function partitionQueuedRuns(items: QueuedRun[]): QueuedRunsPage {
+	const page: QueuedRunsPage = { items: [], noTrigger: [] };
+	for (const item of items) {
+		if (item.boardOutcome === 'no-trigger') page.noTrigger.push(item);
+		else page.items.push(item);
+	}
+	return page;
 }
 
 // `RunStatus`/`RunRow` are local (non-exported) types in the repository, so the
@@ -575,16 +649,22 @@ export const runsRouter = router({
 	// the pending set is small and bounded by worker throughput. Scoped like
 	// `list`: a chosen `projectId` needs read access, and the unscoped view is
 	// filtered to the caller's accessible projects in-memory (the set is small).
+	//
+	// Returns the two-part {@link QueuedRunsPage}: the queue itself, and the board
+	// dispatches the enrichment's own board read proved cannot start a phase
+	// (issue #570), reported separately instead of listed as pending work.
 	queued: authedProcedure
 		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
-		.query(async ({ ctx, input }) => {
+		.query(async ({ ctx, input }): Promise<QueuedRunsPage> => {
 			if (input?.projectId) {
 				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 				const project = await getProjectByIdFromDb(input.projectId);
 				const policy = project?.pipeline?.prioritizeContinuations !== false;
 				const policies = { [input.projectId]: policy };
-				return enrichQueuedWorkItems(
-					toQueuedRuns(await listWaitingDispatches(input.projectId), policies),
+				return partitionQueuedRuns(
+					await enrichQueuedWorkItems(
+						toQueuedRuns(await listWaitingDispatches(input.projectId), policies),
+					),
 				);
 			}
 			const scope = await accessibleProjectScope(ctx.user);
@@ -594,9 +674,11 @@ export const runsRouter = router({
 				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
 			);
 			const items = toQueuedRuns(dispatches, policies);
-			if (scope === null) return enrichQueuedWorkItems(items);
+			if (scope === null) return partitionQueuedRuns(await enrichQueuedWorkItems(items));
 			const accessible = new Set(scope);
-			return enrichQueuedWorkItems(items.filter((item) => accessible.has(item.projectId)));
+			return partitionQueuedRuns(
+				await enrichQueuedWorkItems(items.filter((item) => accessible.has(item.projectId))),
+			);
 		}),
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member

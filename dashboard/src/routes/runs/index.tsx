@@ -57,10 +57,12 @@ function RunsRouteComponent() {
 
 	// Enqueued-but-not-yet-running work (issue #238). Independent of the runs
 	// table's status/phase filters — only the project scope applies — and never
-	// gates the table below.
+	// gates the table below. The response is server-partitioned into the queue
+	// itself and the board dispatches proven to start no phase (issue #570); only
+	// the former paces the poll.
 	const queuedQuery = useQuery({
 		...trpc.runs.queued.queryOptions({ projectId: search.projectId || undefined }),
-		refetchInterval: (query) => queuedListRefetchInterval(query.state.data),
+		refetchInterval: (query) => queuedListRefetchInterval(query.state.data?.items),
 	});
 
 	const hasActiveFilters = !!(search.projectId || search.status || search.phase);
@@ -81,7 +83,11 @@ function RunsRouteComponent() {
 				onClear={handleClearFilters}
 			/>
 
-			<QueuedRunsSection items={queuedQuery.data ?? []} projectId={search.projectId || undefined} />
+			<QueuedRunsSection
+				items={queuedQuery.data?.items ?? []}
+				noTriggerItems={queuedQuery.data?.noTrigger ?? []}
+				projectId={search.projectId || undefined}
+			/>
 
 			{runsQuery.isLoading ? (
 				<div className="text-sm text-zinc-400">Loading runs history…</div>

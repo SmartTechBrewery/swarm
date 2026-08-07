@@ -33,7 +33,9 @@ export function runsListRefetchInterval(data?: { data?: RunStatusRow[] } | null)
  * a picked-up job disappears promptly, and keep polling on the idle baseline when
  * the queue is empty so newly-enqueued work still surfaces without a manual
  * refresh. Returns a positive number in all cases (never `false`/0). Kept
- * structural on `length` so the tRPC payload can be passed straight through.
+ * structural on `length` so the queue half of the `runs.queued` payload
+ * (`data.items`) can be passed straight through — the board dispatches it reports
+ * as starting no phase (issue #570) are not pending work and don't set the pace.
  */
 export function queuedListRefetchInterval(items?: { length: number } | null): number {
 	const hasQueued = (items?.length ?? 0) > 0;

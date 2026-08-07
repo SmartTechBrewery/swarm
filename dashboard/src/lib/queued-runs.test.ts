@@ -3,6 +3,7 @@ import type { QueuedRun } from '@/types/runs.js';
 import {
 	groupQueuedRuns,
 	hideBoardRowsWithActiveRun,
+	noTriggerGroupLabel,
 	queuedPhaseLabel,
 	queuedRunKey,
 	queuedWorkItemLabel,
@@ -426,5 +427,17 @@ describe('reviewGateSourceEventLabel', () => {
 		expect(reviewGateSourceEventLabel({ jobId: 'j1', sourceEvent: 'pull-request' })).toBe(
 			'Pull request',
 		);
+	});
+});
+
+// Issue #570 — the collapsed group is the only place these dispatches surface, so
+// its label has to state the count rather than merely hint that something exists.
+describe('noTriggerGroupLabel', () => {
+	it('counts a single board event in the singular', () => {
+		expect(noTriggerGroupLabel(1)).toBe('1 board event that starts no phase');
+	});
+
+	it('counts several in the plural', () => {
+		expect(noTriggerGroupLabel(4)).toBe('4 board events that start no phase');
 	});
 });

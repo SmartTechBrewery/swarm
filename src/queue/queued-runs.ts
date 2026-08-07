@@ -25,6 +25,11 @@ import { normalizeStoredJobPayload, type SwarmJob } from './jobs.js';
  * event — never a GitHub lookup. `board` covers both Planning and
  * Implementation, which are only distinguished at authoritative dispatch (a
  * fresh GraphQL re-read of the card's Status).
+ *
+ * `unknown` means *undetermined* — an event kind this read model can't classify
+ * — and nothing may use it for a case the server has decided (issue #570):
+ * whether a board dispatch can start a phase at all is a *proven* fact once the
+ * card has been read, and is reported as {@link QueuedBoardOutcomeSchema}.
  */
 export const QueuedPhaseHintSchema = z.enum([
 	'board',
@@ -38,6 +43,30 @@ export const QueuedPhaseHintSchema = z.enum([
 	'unknown',
 ]);
 export type QueuedPhaseHint = z.infer<typeof QueuedPhaseHintSchema>;
+
+/**
+ * What a live board read proved about a *fresh* board (`pm`) dispatch's ability
+ * to start a pipeline phase (issue #570):
+ *
+ * - `starts-phase` — the card's current status maps to Planning or
+ *   Implementation, so claiming this dispatch starts that phase.
+ * - `no-trigger` — it maps to none. Every board status change SWARM itself makes
+ *   produces such a dispatch (Implementation moves a card to `inProgress` as a
+ *   status report and GitHub sends the `single_select` change straight back), as
+ *   does every human board operation with no pipeline meaning (filing a card,
+ *   reordering a column). The dispatch is still recorded, claimed, and settled as
+ *   a no-trigger exactly as before — this only states what the server already
+ *   knows about it.
+ *
+ * Resolved by the API's queued-work-item enrichment, the one place that performs
+ * the board read, so a dispatch-derived row never carries it. Its *absence* is
+ * the undetermined case — no read, a failed read, or a dispatch whose phase the
+ * board no longer decides — which is why this is a separate field rather than a
+ * {@link QueuedPhaseHintSchema} value: `unknown` is for what the server doesn't
+ * know, and this is something it does.
+ */
+export const QueuedBoardOutcomeSchema = z.enum(['starts-phase', 'no-trigger']);
+export type QueuedBoardOutcome = z.infer<typeof QueuedBoardOutcomeSchema>;
 
 /**
  * The queue-facing view of a dispatch's state: `waiting`/`prioritized` for an
@@ -118,6 +147,12 @@ export const QueuedRunSchema = z.object({
 	workItemNodeId: z.string().optional(),
 	/** `pm` jobs only — the provider's display-only content descriptor (`Issue`, `PullRequest`, …). */
 	contentType: z.string().optional(),
+	/**
+	 * `pm` jobs only — what a live board read proved about this dispatch's trigger
+	 * (issue #570). Absent unless the API's enrichment resolved it for a dispatch
+	 * the card's current status still decides; see {@link QueuedBoardOutcomeSchema}.
+	 */
+	boardOutcome: QueuedBoardOutcomeSchema.optional(),
 	/** Resolved backing Issue/PR title for a board job, when the PM provider can read it. */
 	workItemTitle: z.string().optional(),
 	/** Resolved backing Issue/PR URL for a board job, when the PM provider can read it. */

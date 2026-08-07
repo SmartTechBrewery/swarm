@@ -1,11 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ExternalLink, RotateCcw } from 'lucide-react';
+import { ChevronDown, ChevronRight, ExternalLink, RotateCcw } from 'lucide-react';
 import { useState } from 'react';
 import { formatRelativeTime, formatTimeUntil } from '@/lib/format.js';
 import type { QueuedDisplayRow } from '@/lib/queued-runs.js';
 import {
 	groupQueuedRuns,
 	hideBoardRowsWithActiveRun,
+	NO_TRIGGER_GROUP_EXPLANATION,
+	noTriggerGroupLabel,
 	queuedPhaseLabel,
 	queuedRunKey,
 	queuedWaitReasonLabel,
@@ -137,8 +139,78 @@ function QueuedEnqueuedContent({ item }: { item: QueuedRun }) {
 	);
 }
 
+/**
+ * The board dispatches the server proved cannot start a phase (issue #570),
+ * rendered as one collapsed, counted line below the queue instead of as pending
+ * rows inside it. The server has already kept them out of `items`, so this
+ * component never has to recognize them — it only makes sure they stay
+ * *observable*: a count on the collapsed line, and each row's card and enqueue
+ * time when expanded, so an accumulation (one survived a router restart and was
+ * re-imported by the dispatch reconciler) can't hide.
+ *
+ * No Put back / View run action: nothing here is pending work to intervene in,
+ * and the board card these rows name is not necessarily the one an operator would
+ * be putting back.
+ */
+function NoTriggerGroup({ items }: { items: QueuedRun[] }) {
+	const [expanded, setExpanded] = useState(false);
+	if (items.length === 0) return null;
+
+	return (
+		<div
+			data-testid="queued-no-trigger-group"
+			className="rounded-md border border-zinc-800 bg-panel/10 px-3 py-2"
+		>
+			<button
+				type="button"
+				aria-expanded={expanded}
+				onClick={() => setExpanded((current) => !current)}
+				className="flex w-full items-center gap-1.5 text-left text-xs font-medium text-zinc-400 hover:text-zinc-300"
+			>
+				{expanded ? (
+					<ChevronDown className="h-3.5 w-3.5 shrink-0" />
+				) : (
+					<ChevronRight className="h-3.5 w-3.5 shrink-0" />
+				)}
+				{noTriggerGroupLabel(items.length)}
+			</button>
+			{expanded && (
+				<div className="mt-2 space-y-2 border-t border-zinc-800/60 pt-2">
+					<p className="text-[11px] text-zinc-500">{NO_TRIGGER_GROUP_EXPLANATION}</p>
+					<ul className="space-y-1.5">
+						{items.map((item) => (
+							<li
+								key={queuedRunKey(item)}
+								data-testid="queued-no-trigger-row"
+								className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-zinc-500"
+							>
+								{queuedWorkItemTitle(item) && (
+									<span className="min-w-0 break-words text-zinc-400">
+										{queuedWorkItemTitle(item)}
+									</span>
+								)}
+								<span className="font-mono">{queuedWorkItemLabel(item)}</span>
+								<span>
+									<QueuedEnqueuedContent item={item} />
+								</span>
+							</li>
+						))}
+					</ul>
+				</div>
+			)}
+		</div>
+	);
+}
+
 interface QueuedRunsSectionProps {
 	items: QueuedRun[];
+	/**
+	 * The board dispatches `runs.queued` reported as proven no-trigger (issue
+	 * #570) — server-partitioned, never mixed into `items`. Rendered as one
+	 * collapsed line by {@link NoTriggerGroup}; omitted by callers that don't read
+	 * that half of the response.
+	 */
+	noTriggerItems?: QueuedRun[];
 	/**
 	 * Whether to render the Project column. `true` for the global `/runs` view;
 	 * `false` for the project-scoped Runs tab, where every row is the same project
@@ -171,6 +243,7 @@ interface QueuedRunsSectionProps {
  */
 export function QueuedRunsSection({
 	items,
+	noTriggerItems = [],
 	showProject = true,
 	projectId,
 }: QueuedRunsSectionProps) {
@@ -223,8 +296,18 @@ export function QueuedRunsSection({
 	// Collapse the section when nothing remains to show — either no queued items at
 	// all, or every queued item was a fresh board row hidden as a duplicate of an
 	// in-progress run (issue #421). Computed from `rows` (post-hide) so the header
-	// count and the section presence stay consistent.
-	if (rows.length === 0) return null;
+	// count and the section presence stay consistent. Proven no-trigger dispatches
+	// keep the section alive on their own (issue #570) — they are not queued work, so
+	// they get no heading, count or table, but an accumulation of them must not become
+	// invisible either.
+	if (rows.length === 0) {
+		if (noTriggerItems.length === 0) return null;
+		return (
+			<section data-testid="queued-runs-section" className="space-y-2">
+				<NoTriggerGroup items={noTriggerItems} />
+			</section>
+		);
+	}
 
 	const handleOpenConfirm = (item: QueuedRun) => {
 		setSelectedItem(item);
@@ -411,6 +494,12 @@ export function QueuedRunsSection({
 					</tbody>
 				</table>
 			</div>
+
+			{/*
+			 * Board dispatches the server proved cannot start a phase (issue #570) —
+			 * below the queue, collapsed, and never counted as queued work.
+			 */}
+			<NoTriggerGroup items={noTriggerItems} />
 
 			<Modal open={confirmOpen} onClose={handleCloseConfirm} title="Put Back Work Item">
 				<div className="space-y-4">
