@@ -31,17 +31,15 @@ import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import {
-	clearRunCancellation,
-	isRunCancellationRequested,
-	RUN_CANCELLED_MESSAGE,
-} from '../queue/cancellation.js';
-import {
 	createAssignmentRunAgent,
-	deferrableOrFailedResult,
 	fromAssignedWorkItem,
+	handleTaskCancel,
+	settleAssignmentFailure,
 	succeededResult,
+	trackAssignment,
+	untrackAssignment,
 } from '../transport/assignment-execution.js';
-import type { TaskAssignment, TaskExecutionResult } from '../transport/protocol.js';
+import type { TaskAssignment } from '../transport/protocol.js';
 import {
 	type AssignmentSink,
 	type BackoffConfig,
@@ -51,11 +49,7 @@ import {
 } from '../transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '../triggers/types.js';
 import { type AssignedPhaseInputs, type PhaseRunResult, runAssignedPhase } from './consumer.js';
-import {
-	beginRunCancellationTracking,
-	linkRunAbortController,
-	unregisterRunController,
-} from './run-cancellation.js';
+import { linkRunAbortController } from './run-cancellation.js';
 
 // The pure back-channel framing helpers now live in the shared execution
 // substrate (`../transport/assignment-execution.ts`) so the same-host and
@@ -137,34 +131,6 @@ function buildAssignedPhaseInputs(
 	};
 }
 
-/**
- * Build the terminal failure/deferral result frame. A user termination (issue
- * #166) settles terminal-`failed` with `cancelled: true` (never deferred, which
- * would re-run the very phase the user killed); every other failure is classified
- * by the shared {@link deferrableOrFailedResult} — a deferrable failure settles
- * `deferred` with the retry hint + resume flags, everything else terminal-`failed`.
- * The cancelled check is same-host-only (it reads Redis); the DB-free executor has
- * no such channel.
- */
-async function settleFailure(
-	err: unknown,
-	assignment: TaskAssignment,
-): Promise<TaskExecutionResult> {
-	if (assignment.runId && (await isRunCancellationRequested(assignment.runId))) {
-		return {
-			type: 'task-execution-result',
-			dispatchId: assignment.dispatchId,
-			runId: assignment.runId,
-			phase: assignment.phase,
-			taskId: assignment.taskId,
-			status: 'failed',
-			error: RUN_CANCELLED_MESSAGE,
-			cancelled: true,
-		};
-	}
-	return deferrableOrFailedResult(err, assignment);
-}
-
 /** Options {@link runAssignment} reads — a shared in-flight set, the shutdown signal, and its deps. */
 export interface RunAssignmentOptions {
 	/** Dedup set keyed by `dispatchId`, shared across every assignment on the session. */
@@ -201,6 +167,9 @@ export async function runAssignment(
 	inFlight.add(dispatchId);
 
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
+	// Registered synchronously, before the first await, so a `task-cancel` pushed
+	// straight after the assignment can never arrive ahead of the registration.
+	trackAssignment(dispatchId, controller);
 	try {
 		const project = await deps.loadProject(assignment.projectConfig.id);
 		if (!project) {
@@ -215,10 +184,6 @@ export async function runAssignment(
 			});
 			return;
 		}
-
-		// Make the run cancellable by id and honour a cancellation already recorded
-		// (a re-push whose run the operator terminated meanwhile).
-		await beginRunCancellationTracking(runId, controller);
 
 		sink.send({ type: 'task-progress', dispatchId, runId, phase, taskId, state: 'running' });
 
@@ -242,13 +207,10 @@ export async function runAssignment(
 			taskId,
 			error: describeError(err),
 		});
-		sink.send(await settleFailure(err, assignment));
+		sink.send(settleAssignmentFailure(err, assignment));
 	} finally {
 		detach();
-		if (runId) {
-			unregisterRunController(runId);
-			await clearRunCancellation(runId).catch(() => {});
-		}
+		untrackAssignment(dispatchId);
 		inFlight.delete(dispatchId);
 	}
 }
@@ -308,5 +270,10 @@ export function startWorkerTransportDispatch(
 				deps: resolved,
 			});
 		},
+		// A user termination arrives as a pushed frame rather than a Redis
+		// notification (issue #549), so this host learns about one the same way a
+		// remote daemon does — and the in-process BullMQ subscription in `./index.ts`,
+		// which transport mode never reaches, is no longer the only channel.
+		onCancel: (cancel) => handleTaskCancel(cancel, resolved.logger),
 	});
 }

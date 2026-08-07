@@ -2740,11 +2740,13 @@ async function handlePhaseFailure(
 	const error = describeError(err);
 
 	// A control-plane transport settle raised by a worker's `cancelled` result
-	// (issue #407): the worker already cleared the durable cancellation marker in
-	// its own cleanup, so the `isRunCancellationRequested` check below cannot see
-	// it — route it through the same terminal, user-initiated failure as the
-	// in-process cancellation (never a deferral, which would re-run the killed
-	// phase). Placed first so it wins before any deferrable-failure classification.
+	// (issue #407): the worker is what observed the cancellation — since issue #549
+	// it learns of one from a pushed `task-cancel` frame — so its report is
+	// authoritative and this branch does not depend on the
+	// `isRunCancellationRequested` check below finding the marker. Route it through
+	// the same terminal, user-initiated failure as the in-process cancellation
+	// (never a deferral, which would re-run the killed phase). Placed first so it
+	// wins before any deferrable-failure classification.
 	if (err instanceof RunTerminatedError) {
 		logger.info(`Phase cancelled after cancellation request - ${phaseLabel(trigger.phase)}`, {
 			projectId: project.id,

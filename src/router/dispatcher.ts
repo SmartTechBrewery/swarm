@@ -26,6 +26,11 @@
  * router). With no eligible/connected worker the durable dispatch stays `pending`
  * in Postgres via the existing `WorkerIneligibleError` token-free deferral —
  * exactly as the in-process federated path already behaves.
+ *
+ * Cancellation crosses the same transport (issue #549): this consumer subscribes
+ * to run cancellations and pushes a `task-cancel` to the worker executing the run
+ * (`./dispatch-cancellation.ts`), which aborts its agent and reports `cancelled`
+ * for {@link adaptResultToPhaseRun} to raise as a `RunTerminatedError`.
  */
 
 import { Worker } from 'bullmq';
@@ -50,7 +55,11 @@ import { parseRedisUrl } from '../lib/redis.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
 import type { ReviewVerdict } from '../pipeline/review.js';
 import type { WorkItem } from '../pm/types.js';
-import { RUN_CANCELLED_MESSAGE } from '../queue/cancellation.js';
+import {
+	closeRunCancellationRedis,
+	isRunCancellationRequested,
+	RUN_CANCELLED_MESSAGE,
+} from '../queue/cancellation.js';
 import { QUEUE_NAME, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
 import { DeliveryDeferredError } from '../scm/delivery.js';
 import { buildTaskAssignment, type TaskAssignmentPr } from '../transport/assignment.js';
@@ -73,6 +82,7 @@ import { RunTerminatedError } from '../worker/run-cancellation.js';
 import { resolveWorkerConcurrency, resolveWorkerLockOptions } from '../worker/runtime-options.js';
 import { phaseAgentConfig } from '../worker/target-policy.js';
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
+import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
 import { awaitDispatchResult } from './dispatch-results.js';
 import { isWorkerConnected, sendToWorker } from './worker-connections.js';
 
@@ -415,6 +425,20 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 			workerId: selection.workerId,
 			worker: selection.workerName,
 		});
+		// A cancellation recorded *before* this push had nothing to cancel when its
+		// notification arrived, so read the durable marker once — after the push, not
+		// before it (issue #549). The ordering is what makes the pair airtight: a
+		// marker set before this read is seen by it, and one set after it is published
+		// to a worker that is already running the assignment. The worker registers a
+		// pushed assignment synchronously, so a cancel sent right behind it aborts the
+		// run before its agent is spawned.
+		if (runId && (await isRunCancellationRequested(runId))) {
+			logger.info('Cancelling a just-pushed assignment — its run was already terminated', {
+				dispatchId: dispatch.id,
+				runId,
+			});
+			cancelRunOnWorker(runId);
+		}
 		const result = await awaitResultWithGuards(
 			awaiting.result,
 			signal,
@@ -558,6 +582,13 @@ export async function startControlPlaneDispatch(options: {
 	const reconcileInterval = setInterval(() => void reconcile(), 5 * 60 * 1000);
 	reconcileInterval.unref();
 
+	// Deliver user terminations to the worker running the run (issue #549). The
+	// in-process worker's own subscription lives in the BullMQ branch this mode
+	// never reaches, so without this a transport-dispatched run is unstoppable
+	// until its wall-clock timeout — and a DB-free worker has no Redis to read the
+	// durable marker with either.
+	const cancellations = subscribeDispatchCancellations();
+
 	logger.info('swarm-router: control-plane dispatch consumer started', {
 		queue: QUEUE_NAME,
 		concurrency: resolveWorkerConcurrency(),
@@ -566,7 +597,12 @@ export async function startControlPlaneDispatch(options: {
 	return {
 		close: async () => {
 			clearInterval(reconcileInterval);
+			// Drain the consumer first: an in-flight dispatch still reads the durable
+			// cancellation marker on this client, so closing it underneath would only
+			// make that read fail safe into "not cancelled".
 			await worker.close();
+			await cancellations.close();
+			await closeRunCancellationRedis();
 		},
 	};
 }

@@ -5,6 +5,7 @@ import {
 	deliverDispatchProgress,
 	deliverDispatchResult,
 	resolveDispatchStreamTarget,
+	resolveDispatchTargetForRun,
 } from '@/router/dispatch-results.js';
 import type { TaskAssignmentAck, TaskExecutionResult, TaskProgress } from '@/transport/protocol.js';
 
@@ -123,5 +124,62 @@ describe('resolveDispatchStreamTarget', () => {
 
 		expect(resolveDispatchStreamTarget(DISPATCH_A)).toBeUndefined();
 		expect(resolveDispatchStreamTarget(DISPATCH_B)).toBeUndefined();
+	});
+});
+
+/**
+ * The reverse index a run cancellation resolves through (issue #549): a
+ * cancellation names a run, the transport addresses a worker + dispatch. It must
+ * answer only for a dispatch this router is still awaiting, so a settled or
+ * never-dispatched run falls back to the durable marker instead of pushing a
+ * cancel at whoever happens to hold the id now.
+ */
+describe('resolveDispatchTargetForRun', () => {
+	it('resolves a run to the dispatch pushed for it and the worker it went to', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		expect(resolveDispatchTargetForRun('run-a')).toEqual({
+			dispatchId: DISPATCH_A,
+			workerId: WORKER_A,
+		});
+
+		awaiting.dispose();
+	});
+
+	it('returns nothing for an unknown run, a disposed wait, or a delivered result', () => {
+		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
+
+		const disposed = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		disposed.dispose();
+		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
+
+		const settled = awaitDispatchResult(DISPATCH_B, TARGET_B);
+		expect(deliverDispatchResult(result(DISPATCH_B))).toBe(true);
+		expect(resolveDispatchTargetForRun('run-b')).toBeUndefined();
+		settled.dispose();
+	});
+
+	it('a re-push keeps the run pointed at the live registration', () => {
+		const first = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_A, runId: 'run-a' });
+		const second = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_B, runId: 'run-a' });
+		// The superseded waiter's own cleanup must not unregister the newer push.
+		first.dispose();
+
+		expect(resolveDispatchTargetForRun('run-a')).toEqual({
+			dispatchId: DISPATCH_A,
+			workerId: WORKER_B,
+		});
+
+		second.dispose();
+		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
+	});
+
+	it('indexes nothing for a dispatch that opened no run row', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_A });
+
+		expect(resolveDispatchStreamTarget(DISPATCH_A)).toEqual({ workerId: WORKER_A });
+		expect(resolveDispatchTargetForRun(DISPATCH_A)).toBeUndefined();
+
+		awaiting.dispose();
 	});
 });

@@ -6,6 +6,7 @@ import { AgentRunError } from '@/harness/agent-failure.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
+import { cancelAssignment } from '@/transport/assignment-execution.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
 import {
@@ -19,18 +20,10 @@ import {
 	createMockWorkItem,
 } from '../../helpers/factories.js';
 
-// Cancellation rides Redis; mock it so the cancelled-settlement path is testable
-// without a live datastore. Everything else is injected through `runAssignment`'s
-// deps, so no DB is touched.
-const { isRunCancellationRequested } = vi.hoisted(() => ({
-	isRunCancellationRequested: vi.fn<(runId: string) => Promise<boolean>>(),
-}));
-vi.mock('@/queue/cancellation.js', () => ({
-	isRunCancellationRequested,
-	clearRunCancellation: vi.fn(async () => {}),
-	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
-}));
-
+// No cancellation mock: since issue #549 a user termination reaches this executor
+// as a pushed `task-cancel` frame (`cancelAssignment`) rather than a Redis read,
+// so the same-host path settles a cancellation with no datastore either.
+//
 // The harness, so the runner this executor composes can be driven without a
 // subprocess; and the one repository call the local batcher used to make, so the
 // "no longer persists here" assertion is about the write itself rather than the
@@ -93,8 +86,6 @@ function depsWith(
 
 describe('runAssignment', () => {
 	beforeEach(() => {
-		isRunCancellationRequested.mockReset();
-		isRunCancellationRequested.mockResolvedValue(false);
 		runAgentCli.mockReset();
 		appendRunOutputEvents.mockReset();
 		appendRunOutputEvents.mockResolvedValue(undefined);
@@ -241,20 +232,48 @@ describe('runAssignment', () => {
 		});
 	});
 
-	it('settles a user termination as failed+cancelled, never deferred', async () => {
-		isRunCancellationRequested.mockResolvedValue(true);
+	// Issue #549: the same-host executor learns about a user termination from the
+	// pushed frame, exactly as the DB-free one does — it no longer reads Redis at
+	// settle time — and the settlement must stay terminal rather than deferring the
+	// `aborted` failure the abort itself produces.
+	it('settles a cancelled assignment as failed+cancelled, never deferred', async () => {
 		const sink = recordingSink();
-		const runPhase = vi.fn(async () => {
-			// A user termination surfaces as an aborted run (would otherwise defer).
-			throw new AgentRunError('aborted', { kind: 'aborted' }, agentResult({ exitCode: null }));
-		});
-		await runAssignment(assignment({ runId: RUN_ID }), sink, { deps: depsWith(runPhase) });
+		let signal: AbortSignal | undefined;
+		const runPhase = vi.fn(
+			(inputs: AssignedPhaseInputs) =>
+				new Promise<PhaseRunResult>((_resolve, reject) => {
+					signal = inputs.signal as AbortSignal;
+					signal.addEventListener('abort', () =>
+						reject(
+							new AgentRunError('aborted', { kind: 'aborted' }, agentResult({ exitCode: null })),
+						),
+					);
+				}),
+		);
+		const frame = assignment({ runId: RUN_ID });
+		const run = runAssignment(frame, sink, { deps: depsWith(runPhase) });
+		// Let the executor reach the phase runner, then cancel it as the router would.
+		await vi.waitFor(() => expect(signal).toBeDefined());
+		expect(cancelAssignment(frame.dispatchId)).toBe(true);
+		await run;
 
+		expect(signal?.aborted).toBe(true);
 		expect(sink.sent.at(-1)).toMatchObject({
 			type: 'task-execution-result',
 			status: 'failed',
 			cancelled: true,
 		});
+	});
+
+	it('drops the assignment from the cancellation registry once it settles', async () => {
+		const sink = recordingSink();
+		const frame = assignment({ runId: RUN_ID });
+		await runAssignment(frame, sink, {
+			deps: depsWith(async () => ({ agent: agentResult() })),
+		});
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded' });
+		expect(cancelAssignment(frame.dispatchId)).toBe(false);
 	});
 
 	it('settles failed when the assignment references an unknown project', async () => {

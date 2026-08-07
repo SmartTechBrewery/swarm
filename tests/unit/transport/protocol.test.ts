@@ -13,6 +13,7 @@ import {
 	StreamLogSchema,
 	TaskAssignmentAckSchema,
 	TaskAssignmentSchema,
+	TaskCancelSchema,
 	TaskExecutionResultSchema,
 	TaskPhaseSchema,
 	TaskProgressSchema,
@@ -330,6 +331,38 @@ describe('transport protocol schemas', () => {
 		it('discriminates a task-assignment frame to TaskAssignmentSchema', () => {
 			const parsed = ControlPlaneMessageSchema.parse(VALID_ASSIGNMENT);
 			expect(parsed.type).toBe('task-assignment');
+		});
+
+		it('round-trips a task-cancel frame through the union (issue #549)', () => {
+			const frame = {
+				type: 'task-cancel' as const,
+				dispatchId: DISPATCH_ID,
+				runId: '55555555-5555-4555-8555-555555555555',
+				reason: 'a cancellation was requested for this run',
+			};
+			expect(ControlPlaneMessageSchema.parse(frame)).toEqual(frame);
+			// `runId`/`reason` are correlation and log context — a bare cancel is valid.
+			expect(
+				ControlPlaneMessageSchema.parse({ type: 'task-cancel', dispatchId: DISPATCH_ID }),
+			).toEqual({ type: 'task-cancel', dispatchId: DISPATCH_ID });
+		});
+
+		it('rejects a task-cancel without the dispatch it names', () => {
+			expect(TaskCancelSchema.safeParse({ type: 'task-cancel' }).success).toBe(false);
+			expect(
+				TaskCancelSchema.safeParse({ type: 'task-cancel', dispatchId: 'not-a-uuid' }).success,
+			).toBe(false);
+		});
+
+		// The additive contract behind adding `task-cancel` without a
+		// `TRANSPORT_PROTOCOL_VERSION` bump: the union refuses a frame it does not
+		// model, and the client treats that refusal as a logged no-op rather than a
+		// reason to close the session (see `worker-client.test.ts`).
+		it('rejects an unknown cloud→worker frame type', () => {
+			expect(
+				ControlPlaneMessageSchema.safeParse({ type: 'task-pause', dispatchId: DISPATCH_ID })
+					.success,
+			).toBe(false);
 		});
 	});
 

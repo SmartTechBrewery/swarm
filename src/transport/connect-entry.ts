@@ -39,7 +39,11 @@ import '../integrations/entrypoint.js';
 import { requireEnv, resolveOperatorGitHubToken, resolveWorkerRepoRoot } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
-import { runAssignmentDbFree, SUPPORTED_DB_FREE_PHASES } from './assignment-execution.js';
+import {
+	handleTaskCancel,
+	runAssignmentDbFree,
+	SUPPORTED_DB_FREE_PHASES,
+} from './assignment-execution.js';
 import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discovery.js';
 import { connectWorkerTransport } from './worker-client.js';
 
@@ -117,6 +121,10 @@ async function main(): Promise<void> {
 				inFlight,
 			});
 		},
+		// The only channel a user termination has to this daemon (issue #549): it
+		// holds no `REDIS_URL`, so it cannot read the durable cancellation marker the
+		// dashboard writes — the control plane pushes the frame instead.
+		onCancel: (cancel) => handleTaskCancel(cancel, logger),
 	});
 
 	logger.info('worker transport client starting', {
