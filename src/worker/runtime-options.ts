@@ -24,7 +24,7 @@ function readConcurrencyFlag(argv: string[]): string | undefined {
 /**
  * Resolve how many jobs this worker runs at once (BullMQ's `concurrency`).
  *
- * Precedence: the `--concurrency <n>` launch flag (so `npm run dev:worker --
+ * Precedence: the `--concurrency <n>` launch flag (so `npm run dev:worker:legacy --
  * --concurrency 2` overrides without editing `.env`), then the
  * `SWARM_WORKER_CONCURRENCY` env var, then {@link DEFAULT_WORKER_CONCURRENCY}.
  * Must resolve to a positive integer — a typo throws rather than silently

@@ -90,14 +90,14 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * handshake; ongoing health rides the heartbeat.
  *
  * `supportedPhases` is the second capability axis (issue #467): *which pipeline
- * phases* this daemon can actually execute, not just which CLIs it has. The two
- * worker programs differ here — the same-host client (`../worker/transport-client.ts`)
- * holds `DATABASE_URL` and runs every phase, while the DB-free remote daemon
- * (`./connect-entry.ts`) runs only `SUPPORTED_DB_FREE_PHASES`
- * (`./assignment-execution.ts`) — and they are otherwise indistinguishable to the
- * control plane, so without this the eligibility gate could select a worker for a
- * phase it refuses, failing the dispatch terminally instead of routing it to a
- * capable worker.
+ * phases* this daemon can actually execute, not just which CLIs it has. Every
+ * daemon runs the same program now (`./connect-entry.ts`, issue #551) and declares
+ * `SUPPORTED_DB_FREE_PHASES` (`./assignment-execution.ts`), which since issue #536
+ * is all six — but a daemon's *version* is what decides that, and daemons are
+ * upgraded independently of the control plane, so an older one still declares
+ * fewer. Without this the eligibility gate could select a worker for a phase it
+ * refuses, failing the dispatch terminally instead of routing it to a capable
+ * worker.
  *
  * **Optional on purpose.** A daemon built before this field simply omits it; the
  * router then treats it as "every phase", which is exactly the behaviour that

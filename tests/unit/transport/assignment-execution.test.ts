@@ -19,6 +19,7 @@ import {
 	cancelAssignment,
 	createAssignmentRunAgent,
 	deferrableOrFailedResult,
+	fromAssignedWorkItem,
 	handleTaskCancel,
 	runAssignmentDbFree,
 	SUPPORTED_DB_FREE_PHASES,
@@ -922,6 +923,49 @@ describe('runAssignmentDbFree', () => {
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'failed', error: 'boom' });
 	});
 
+	it('settles terminally failed for an auth failure, carrying its actionable message', async () => {
+		// Issue #343: `auth` is deliberately not deferrable, so it must settle `failed`
+		// rather than `deferred` — a `deferred` frame carrying an unrecognised kind is
+		// re-read as a rate-limit by the control plane (`@/router/dispatcher.js`),
+		// which would retry a run only a human re-`/login` can unblock. The suffixed
+		// message rides along in `error`, so the dashboard headline is the same
+		// actionable one the in-process path produces.
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => {
+			throw new AgentRunError(
+				'Review agent (claude) exited with code 1 (authentication failed)',
+				{ kind: 'auth' },
+				agentResult({ exitCode: 1 }),
+			);
+		});
+		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'failed',
+			error: 'Review agent (claude) exited with code 1 (authentication failed)',
+		});
+	});
+
+	it('reports the implementation branch checkpoint as a task-progress frame', async () => {
+		// The control plane persists `implementationBranchProvisioned` off this frame,
+		// so a re-pushed Implementation resumes the existing branch instead of pushing
+		// a second one.
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			await inputs.onBranchProvisioned?.();
+			return { agent: agentResult() };
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(
+			sink.sent.some((f) => f.type === 'task-progress' && f.state === 'branch-provisioned'),
+		).toBe(true);
+	});
+
 	it('routes a timed-out run through the failure path even when it exited 0', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({
@@ -1133,5 +1177,26 @@ describe('createAssignmentRunAgent silence heartbeat', () => {
 
 		finish();
 		await run;
+	});
+});
+
+describe('fromAssignedWorkItem', () => {
+	it('round-trips the transport work-item subset back to a PM WorkItem', () => {
+		const workItem = fromAssignedWorkItem({
+			id: 'PVTI_1',
+			title: 'Do it',
+			description: 'body',
+			url: 'https://example.com/1',
+			status: 'Planning',
+			statusId: '3fe662f4',
+			labels: [{ id: 'LA_1', name: 'swarm', color: 'ededed' }],
+			assignees: [{ handle: 'octocat', displayName: 'The Octocat' }],
+		});
+		expect(workItem).toMatchObject({
+			id: 'PVTI_1',
+			title: 'Do it',
+			labels: [{ id: 'LA_1', name: 'swarm', color: 'ededed' }],
+			assignees: [{ handle: 'octocat', displayName: 'The Octocat' }],
+		});
 	});
 });

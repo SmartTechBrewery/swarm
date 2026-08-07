@@ -124,9 +124,11 @@ export type DispatchMode = 'in-process' | 'transport';
  * consumer + `processJob` on the host worker; the router serves only webhooks +
  * the worker-session transport. `transport` relocates the consumer + eligibility
  * gate to the control plane: the router dequeues and pushes a `TaskAssignment` to
- * the selected connected worker (`../router/dispatcher.ts`), while the host worker
- * runs the transport-dispatch client (`../worker/transport-client.ts`) that
- * executes the pushed phase locally and reports results back. Any other value
+ * the selected connected worker (`../router/dispatcher.ts`), while every worker —
+ * this host's included, over loopback — runs the DB-free transport entrypoint
+ * (`../transport/connect-entry.ts`, issue #551) that executes the pushed phase
+ * locally and reports results back. In that mode `../worker/index.ts` refuses to
+ * start, so the queue has exactly one consumer. Any other value
  * fails startup loudly rather than silently falling back, mirroring the other env
  * parsers. Set it the same on both processes; default-off for backward
  * compatibility (an operator opts into the federated transport cutover).

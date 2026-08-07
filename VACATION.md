@@ -137,10 +137,10 @@ Ranked by how likely each is to bite while unattended.
    `pipeline.automationLabel` (default `swarm`) is checked before Planning or
    Implementation starts, so an unlabelled item is skipped at every dispatch. This
    is the supported way to stop SWARM touching a specific task.
-2. **Stop the executor:** stop the worker process (`npm run dev:worker`, or
-   `npm run dev:worker:connect` for the remote one). Pending work stays durable in
-   Postgres and resumes when a worker comes back — nothing is lost, nothing
-   proceeds.
+2. **Stop the executor:** stop the worker process (`npm run dev:worker` on every
+   machine running one; `npm run dev:worker:legacy` if the installation is still
+   `in-process`). Pending work stays durable in Postgres and resumes when a worker
+   comes back — nothing is lost, nothing proceeds.
 3. **Turn off the new path specifically:** unset `SWARM_DISPATCH_MODE` (or set
    `in-process`) on the router and worker. Dispatch returns to the host worker and
    the DB-free executor stops receiving assignments.

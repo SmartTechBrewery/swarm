@@ -54,7 +54,9 @@ services:
       # on the host worker. Set `SWARM_DISPATCH_MODE=transport` (in `.env`) to run
       # the control-plane dispatcher here: this router dequeues, runs the ADR-001
       # eligibility gate, and pushes a TaskAssignment to the selected connected
-      # worker (which must run `npm run dev:worker` with the same mode). See
+      # worker. Every worker runs `npm run dev:worker` (the DB-free transport
+      # entrypoint) in that mode — including this host's own, pointed at
+      # SWARM_CONTROL_PLANE_URL=http://localhost:${ROUTER_PORT} over loopback. See
       # docs/configuration.md.
       SWARM_DISPATCH_MODE: ${SWARM_DISPATCH_MODE:-in-process}
       # In transport mode the router owns the BullMQ consumer, so it must receive
@@ -86,9 +88,9 @@ services:
 
   # The worker is NOT containerized: it provisions Git worktrees and spawns the
   # `claude` / `antigravity` CLIs, which need the developer's own PATH, auth, and
-  # config. It runs on the host instead (`npm run dev:worker`), talking to the
-  # containers below over their published host ports. See README "Running the
-  # stack" and ai/ARCHITECTURE.md.
+  # config. It runs on the host instead (`npm run dev:worker`), reaching this
+  # router over its published host port — the same way a remote worker reaches it
+  # through the tunnel. See README "Running the stack" and ai/ARCHITECTURE.md.
 
   # Opt-in — only starts when the "tunnel" profile is active (set
   # COMPOSE_PROFILES=tunnel in .env). Runs a dashboard-created Cloudflare Tunnel

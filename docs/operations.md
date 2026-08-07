@@ -18,16 +18,17 @@ npm run swarm -- users set-password you@example.com   # set their dashboard logi
 cd dashboard && npm install && cd .. # install dashboard (frontend) dependencies
 npm run dev:api               # start the API server on the host (default port 3101)
 npm run dev:dashboard         # start the Vite dev server (default port 5173)
-npm run dev:worker            # start the worker on the host (or: npm run build && npm run start:worker); SWARM_WORKER_CONCURRENCY in .env sets how many jobs run at once (default 1)
+npm run dev:worker            # start the worker on the host (or: npm run build && npm run start:worker) — the same program a remote worker runs, pointed at the router over loopback
 ```
-`swarm start`, `npm run dev:api`, `npm run dev:worker`, and their production
+`swarm start`, `npm run dev:api`, `npm run dev:worker:legacy`, and their production
 start variants apply pending committed migrations before serving requests or processing
-jobs. `dev:worker` is intentionally stable: source edits do not restart it and abort a
-live agent. Use `npm run dev:worker:watch` only while developing the worker itself and
-when no real pipeline run is active. The worker also applies migrations **in-process on
-every start**, so either mode refuses to serve jobs against a stale schema. The explicit
-`npm run db:migrate` step remains useful for setup and maintenance, and is safe to run
-repeatedly.
+jobs. `npm run dev:worker` does **not** — it holds no `DATABASE_URL` (the router and the
+API server own migrations in `transport` mode; see "Process responsibilities" in
+`ai/ARCHITECTURE.md`). Either worker is intentionally stable: source edits do not restart
+it and abort a live agent. Use `npm run dev:worker:watch` (or `dev:worker:legacy:watch`)
+only while developing the worker itself and when no real pipeline run is active. The
+explicit `npm run db:migrate` step remains useful for setup and maintenance, and is safe
+to run repeatedly.
 
 The dashboard can be run in two modes:
 

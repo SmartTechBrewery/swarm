@@ -1,16 +1,24 @@
 /**
- * `swarm worker connect` entrypoint — runs the worker-side transport client
+ * The worker entrypoint — runs the worker-side transport client
  * (`./worker-client.ts`) as a long-lived process (ADR-003 §1, Phase 2 of issue
- * #391). Run it via `npm run dev:worker:connect`.
+ * #391). Run it via `npm run dev:worker`.
  *
- * This is the **remote** worker mode: unlike the in-process host worker
- * (`../worker/index.ts`), which holds `DATABASE_URL`/`REDIS_URL` and pulls jobs off
- * BullMQ, this process holds **only** `SWARM_WORKER_CREDENTIAL`,
+ * **Every** worker runs this program, including the one on the control-plane host
+ * (issue #551). That host used to run a second, database-holding executor instead
+ * (`../worker/index.ts` in transport mode → the deleted
+ * `../worker/transport-client.ts`) — the same role as two programs, only one of
+ * which was exercised on a given run. It now points `SWARM_CONTROL_PLANE_URL` at
+ * its own router over loopback (`http://localhost:<ROUTER_PORT>`), so "local" is a
+ * network distance rather than a code path, and whatever works here works there.
+ *
+ * The process holds **only** `SWARM_WORKER_CREDENTIAL`,
  * `SWARM_CONTROL_PLANE_URL`, the operator's own `SWARM_OPERATOR_GH_TOKEN`, and
- * its host-local checkout path (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd). It
- * connects to the control plane over the network (through the Cloudflare tunnel),
- * declares the CLIs it can run, and heartbeats to keep its `worker_sessions` lease
- * live so the eligibility gate sees it as connected. On each pushed
+ * its host-local checkout path (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd) —
+ * never `DATABASE_URL`/`REDIS_URL`, even on a host that has them. It connects to
+ * the control plane (over the Cloudflare tunnel from a remote machine, over
+ * loopback on the control-plane host), declares the CLIs it can run, and
+ * heartbeats to keep its `worker_sessions` lease live so the eligibility gate sees
+ * it as connected. On each pushed
  * `TaskAssignment` it runs the phase **DB-free** (`./assignment-execution.ts`):
  * the project config comes from the assignment's non-secret slice, source-carrying
  * delivery uses the operator token through the registered SCM provider
@@ -86,9 +94,8 @@ async function main(): Promise<void> {
 
 	const host = hostname();
 	// One in-flight set shared across every assignment on the session, so a
-	// re-pushed dispatch is deduplicated across pushes (matches the same-host
-	// dispatch client). The shutdown signal kills any in-flight agent CLI on a
-	// graceful stop before the session is released.
+	// re-pushed dispatch is deduplicated across pushes. The shutdown signal kills
+	// any in-flight agent CLI on a graceful stop before the session is released.
 	const inFlight = new Set<string>();
 	const shutdownSignal = new AbortController();
 	// Declare *which phases* this daemon can execute, not just which CLIs it has
