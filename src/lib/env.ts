@@ -73,6 +73,15 @@ export function resolveWebhookCallbackBaseUrl(
  * literal string `true` enables it — an unset, empty, or any other value keeps
  * the coded default (the existing multi-user, session-cookie behavior), so the
  * safe multi-user policy is what you get unless you opt in explicitly.
+ *
+ * **That is the whole of its meaning** (issue #552). It briefly also bypassed the
+ * federated dispatch gate (issue #373), which made one flag govern two unrelated
+ * decisions and made the mode incompatible with `transport` dispatch — the
+ * control plane has no local executor to fall back to, so the bypass left every
+ * dispatch durably pending. Worker selection now has one rule for every
+ * deployment: a single-user install registers and enrolls its one local worker
+ * like anyone else (`docs/onboarding-worker.md`). The only reader is
+ * `../api/server.ts`; nothing on the dispatch path may branch on it.
  */
 export function isSingleUserMode(): boolean {
 	return process.env.SWARM_SINGLE_USER_MODE === 'true';

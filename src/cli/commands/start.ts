@@ -10,6 +10,7 @@ import { resolveDispatchMode } from '../../lib/env.js';
 import { runCommand } from '../_shared/exec.js';
 import * as out from '../_shared/output.js';
 import { REPO_ROOT } from '../_shared/paths.js';
+import { reportWorkerReadiness } from '../_shared/worker-readiness.js';
 
 export async function run(argv: string[]): Promise<number> {
 	const { values } = parseArgs({
@@ -33,5 +34,8 @@ export async function run(argv: string[]): Promise<number> {
 
 	const workerCommand = resolveDispatchMode() === 'transport' ? 'dev:worker' : 'dev:worker:legacy';
 	out.info(`stack is up. The worker runs on the host — start it with: npm run ${workerCommand}`);
+	// Said after the stack is up, where an operator is about to start the worker:
+	// without a registered worker every dispatch waits durably (issue #552).
+	await reportWorkerReadiness();
 	return 0;
 }

@@ -422,8 +422,8 @@ export interface RunAttribution {
 
 /**
  * Resolve a run's recorded worker/user into display labels, or `null` when the
- * row records no attribution at all — an unfederated / single-user run, and
- * every row written before the columns existed.
+ * row records no attribution at all — an unfederated run, and every row written
+ * before the columns existed.
  *
  * Each field is named explicitly rather than spreading a worker/user row, the
  * same way `assembleDashboardWorker` assembles its dashboard view
@@ -477,9 +477,9 @@ async function resolveRunAttribution(run: {
  *
  * One batched read per page over the *distinct* recorded ids, so a full page
  * costs a single query rather than one per row. A run with no recorded worker
- * (unfederated / single-user, and every row predating the columns), a worker
- * whose row no longer resolves, and a failed lookup all yield `null`: the UI
- * then shows no machine at all rather than a stale or invented one.
+ * (unfederated, and every row predating the columns), a worker whose row no
+ * longer resolves, and a failed lookup all yield `null`: the UI then shows no
+ * machine at all rather than a stale or invented one.
  */
 async function withWorkerNames<T extends { workerId: string | null }>(
 	rows: T[],

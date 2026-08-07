@@ -59,8 +59,8 @@ export const runs = pgTable(
 		 * issue #398), taken from `DispatchSelection.ownerUserId`. Stored rather than
 		 * joined through `workers.owner_user_id` so the attribution survives the
 		 * worker row being removed (`worker_id` is `ON DELETE SET NULL`). Nullable:
-		 * an unfederated / single-user run resolves no selection and records no
-		 * worker at all, as does every pre-existing row.
+		 * an unfederated run (no worker enrolled in the project) resolves no
+		 * selection and records no worker at all, as does every pre-existing row.
 		 */
 		workerUserId: uuid('worker_user_id').references(() => users.id, { onDelete: 'set null' }),
 		/** Session fencing token used to bind this attempt to that worker host. */

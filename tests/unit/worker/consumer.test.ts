@@ -2259,42 +2259,41 @@ describe('processJob', () => {
 			]);
 		});
 
-		describe('local single-user mode (issue #373)', () => {
-			it('runs every phase on the host worker, ignoring an enrolled non-consenting worker', async () => {
-				// An install in single-user mode treats the host process as the implicit
-				// local executor for every project: dispatch skips the federated roster
-				// entirely, so an enrolled worker that would fail the gate (here, no
-				// sharing consent) never blocks — the phase just runs locally.
+		describe('single-user mode is not a dispatch policy (issue #552)', () => {
+			// `SWARM_SINGLE_USER_MODE` used to short-circuit the gate before the roster
+			// was read (issue #373). It no longer does: it is the API's authentication
+			// policy and nothing else, so worker selection has one rule for every
+			// deployment — which is what lets a single-user install dispatch over the
+			// transport instead of stalling on a control plane that has no local
+			// executor to bypass to.
+			it('selects the enrolled worker for a single-user install', async () => {
 				vi.stubEnv('SWARM_SINGLE_USER_MODE', 'true');
-				listProjectDispatchCandidates.mockResolvedValue([
-					candidate('w-1', { sharingConsent: false }),
-				]);
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-local')]);
 
 				const outcome = await processJob(
 					createMockPmWebhookJob(),
 					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-local'),
 				);
 
 				expect(outcome.status).toBe('phase-succeeded');
-				expect(phaseCalls).toHaveLength(1);
-				// No federated evaluation at all: neither the roster nor the assignee
-				// link is read, and no worker claim is ever attempted.
-				expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
-				expect(resolveAssignedUser).not.toHaveBeenCalled();
-				expect(claimWorkerForDispatch).not.toHaveBeenCalled();
-				// The normal local project slot is used, exactly as an unfederated project.
-				expect(acquireProjectSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.maxConcurrentJobs);
-				// A local dispatch binds no worker identity onto its run row.
+				// The roster *was* consulted and the run is bound to the selected worker
+				// under the fenced claim — no implicit local executor.
+				expect(listProjectDispatchCandidates).toHaveBeenCalledWith(PROJECT.id);
+				expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+					expect.objectContaining({ selectedWorkerId: 'w-local' }),
+				);
 				expect(createRun).toHaveBeenCalledWith(
-					expect.objectContaining({ workerId: undefined, workerFencingToken: undefined }),
+					expect.objectContaining({ workerId: 'w-local', workerFencingToken: 7 }),
 				);
 			});
 
-			it('restores the full federated gate for the same roster when the mode is disabled', async () => {
-				// The paired control: with the mode off (the safe default), the same
-				// enrolled-but-non-consenting worker still produces today's token-free
-				// worker-eligibility deferral, proving disabling the mode restores the
-				// complete federated policy.
+			it('still refuses an ineligible worker with the mode enabled', async () => {
+				// The paired control the other way round: an enrolled worker that fails
+				// the gate (here, no sharing consent) defers exactly as in multi-user
+				// mode rather than being bypassed into a local run.
+				vi.stubEnv('SWARM_SINGLE_USER_MODE', 'true');
 				listProjectDispatchCandidates.mockResolvedValue([
 					candidate('w-1', { sharingConsent: false }),
 				]);
@@ -2309,8 +2308,46 @@ describe('processJob', () => {
 					workerEligibilityRecheck: true,
 				});
 				expect(phaseCalls).toEqual([]);
-				// The gate ran — the roster *was* consulted, unlike enabled mode.
 				expect(listProjectDispatchCandidates).toHaveBeenCalledWith(PROJECT.id);
+			});
+
+			it('leaves an unfederated project running locally whatever the mode says', async () => {
+				// The one path that still resolves no selection is the *unfederated* one
+				// (nothing enrolled) — a property of the project, not of the auth policy.
+				vi.stubEnv('SWARM_SINGLE_USER_MODE', 'true');
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(planningTrigger()),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(listProjectDispatchCandidates).toHaveBeenCalledWith(PROJECT.id);
+				expect(claimWorkerForDispatch).not.toHaveBeenCalled();
+				expect(acquireProjectSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.maxConcurrentJobs);
+			});
+
+			it('tells a worker-less transport install which commands to run', async () => {
+				// The control-plane path (`federatedOnly`) has no local executor, so the
+				// same no-enrollment project defers there instead — and this is the
+				// message a single-user install that never registered its own worker
+				// finally sees on the board, so it must name the runbook rather than
+				// report a bare `worker-unavailable`.
+				vi.stubEnv('SWARM_SINGLE_USER_MODE', 'true');
+
+				const outcome = await processJob(
+					createMockPmWebhookJob({ workerEligibilityRecheckAttempt: 1_000_000 }),
+					registryReturning(planningTrigger()),
+					undefined,
+					undefined,
+					{ federatedOnly: true },
+				);
+
+				expect(outcome.status).toBe('phase-failed');
+				expect(phaseCalls).toEqual([]);
+				const [, body] = addComment.mock.calls[0];
+				expect(body).toContain('swarm workers register');
+				expect(body).toContain('swarm workers enroll');
 			});
 		});
 	});

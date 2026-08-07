@@ -72,7 +72,7 @@ import { discoverCliQuotas } from '../harness/quota-discovery.js';
 import '../integrations/entrypoint.js';
 import { requireProjectPMAdapter, requireProjectPMProvider } from '../integrations/pm/registry.js';
 import { requireProjectSCMProvider, requireSCMProvider } from '../integrations/scm/registry.js';
-import { getControlPlaneUrl, isSingleUserMode, optionalEnv } from '../lib/env.js';
+import { getControlPlaneUrl, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -1196,10 +1196,10 @@ export interface ProcessJobDeps {
 	 */
 	gateOptions?: DispatchGateOptions;
 	/**
-	 * Require a selected worker. In transport mode there is no local executor, so
-	 * an unfederated/single-user project (the gate returns no selection) has
-	 * nowhere to run: it defers durably as a token-free `worker-eligibility` wait
-	 * rather than running on the host.
+	 * Require a selected worker. In transport mode there is no local executor, so an
+	 * unfederated project (the gate returns no selection) has nowhere to run: it
+	 * defers durably as a token-free `worker-eligibility` wait, naming the
+	 * register/enroll commands that fix it, rather than running on the host.
 	 */
 	federatedOnly?: boolean;
 	/**
@@ -1279,7 +1279,7 @@ function logAgentRouting(
  * local via the in-process delegate, keeping the operator's own token
  * worker-side. Otherwise — the **local host worker**, the default — it returns
  * `undefined`, so the phase builds today's in-process provider itself, lazily,
- * byte-for-byte unchanged; single-user mode and the same-machine worker are
+ * byte-for-byte unchanged; a same-machine worker with no control-plane URL is
  * unaffected.
  */
 export async function resolveScmDelivery(
@@ -1309,8 +1309,8 @@ export async function resolveScmDelivery(
  * credential; every read and non-metadata write stays local via the in-process
  * delegate, so the worker never holds that credential. Otherwise — the **local
  * host worker**, the default — it returns `undefined`, so `runAssignedPhase`
- * builds today's in-process provider itself, byte-for-byte unchanged;
- * single-user mode and the same-machine worker are unaffected.
+ * builds today's in-process provider itself, byte-for-byte unchanged; a
+ * same-machine worker with no control-plane URL is unaffected.
  */
 export function resolvePmDelivery(project: ProjectConfig): PMProvider | undefined {
 	const controlPlaneUrl = getControlPlaneUrl();
@@ -2939,14 +2939,16 @@ async function handlePhaseFailure(
  * the selected target, or `undefined` when the project is not federated (no
  * enrolled workers — the local worker runs it, exactly as before).
  *
- * Local single-user mode (issue #373) short-circuits to that same `undefined`
- * result *before* the roster or assignee link is read: an install running in
- * single-user mode treats the host process as the implicit local executor for
- * every project, so dispatch never consults enrollment, sharing consent,
- * assignee affinity, live sessions, or worker capacity — even when worker and
- * enrollment rows exist — and runs on the host worker exactly as an unfederated
- * project does (local target selection, the project slot, a null worker
- * identity). Disabling the mode restores the complete federated policy below.
+ * **The deployment's authentication policy is not an input here** (issue #552).
+ * Single-user mode used to short-circuit to that same `undefined` result before
+ * the roster was read, which made `SWARM_SINGLE_USER_MODE` mean two unrelated
+ * things and left a single-user install unable to run in `transport` mode at all
+ * (the control plane has no local executor, so the bypass produced a dispatch
+ * that stayed durably pending forever). It is now what its name says — the API's
+ * authentication policy (`../lib/env.ts`, `../api/server.ts`) — and worker
+ * selection has one rule for every deployment: a single-user install registers
+ * and enrolls its one local worker exactly as anyone else does
+ * (`docs/onboarding-worker.md`).
  *
  * Throws {@link WorkerIneligibleError} when no eligible worker may take the
  * phase: `handlePhaseFailure` turns that into a bounded, token-free
@@ -2963,12 +2965,6 @@ async function gateDispatch(
 	dispatchId: string,
 	gateOptions?: DispatchGateOptions,
 ): Promise<DispatchSelection | undefined> {
-	// Single-user mode routes every phase through the implicit local host worker
-	// (issue #373): skip the federated roster/assignee evaluation entirely and
-	// take the same no-selection local path an unfederated project uses. This runs
-	// before `listProjectDispatchCandidates` or the assignee-provider construction
-	// so no enrollment, consent, or affinity is ever read in this mode.
-	if (isSingleUserMode()) return undefined;
 	const phaseConfig = phaseAgentConfig(project, trigger.phase, implementationUnplanned);
 	// PR-driven phases carry no board item, so they take the unassigned path.
 	const workItem = 'workItem' in trigger ? trigger.workItem : undefined;
@@ -3315,15 +3311,18 @@ export async function processJob(
 			deps.gateOptions,
 		);
 		// Control-plane transport dispatch has no local executor (issue #407): an
-		// unfederated/single-user project resolves no selection and has nowhere to
-		// run, so defer durably rather than falling through to the host's local path.
-		// The throw lands in the catch below as a token-free `worker-eligibility`
-		// wait — the durable dispatch stays pending exactly as the no-eligible-worker
-		// path does — and re-checks until a worker enrolls and connects.
+		// unfederated project resolves no selection and has nowhere to run, so defer
+		// durably rather than falling through to the host's local path. The throw
+		// lands in the catch below as a token-free `worker-eligibility` wait — the
+		// durable dispatch stays pending exactly as the no-eligible-worker path does —
+		// and re-checks until a worker enrolls and connects. The message names the two
+		// commands that fix it (issue #552): this is the state a single-user install
+		// that never registered its own local worker lands in, and a bare
+		// `worker-unavailable` would leave it watching dispatches pile up.
 		if (!selection && deps.federatedOnly) {
 			throw new WorkerIneligibleError(
 				'worker-unavailable',
-				`No eligible, connected worker is enrolled for project '${project.id}'. Control-plane dispatch requires one; waiting for a worker to enroll and connect.`,
+				`No worker is enrolled for project '${project.id}', so this dispatch has nowhere to run. Every deployment — a single-user install included — registers and enrolls one worker: \`swarm workers register <owner> --name <name> --cli <clis>\`, then \`swarm workers enroll <worker-id> ${project.id} --cli <clis> --active --consent\`. Waiting for a worker to enroll and connect.`,
 			);
 		}
 		// Bind on the selected worker's identity: the host's own for the in-process
