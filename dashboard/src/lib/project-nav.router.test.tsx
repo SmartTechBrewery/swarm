@@ -58,6 +58,9 @@ function StubProjectDetail() {
 			<button type="button" onClick={() => go(tabSearch('agents'))}>
 				Agent Configuration
 			</button>
+			<button type="button" onClick={() => go(tabSearch('workers'))}>
+				Workers
+			</button>
 		</div>
 	);
 }
@@ -130,5 +133,24 @@ describe('Agent Configuration browser-history navigation', () => {
 	it('falls back to the summary for a deep link with an unknown phase', async () => {
 		renderAt('/projects/p1?tab=agents&phase=bogus');
 		expect(await screen.findByText('agent-config-summary')).toBeDefined();
+	});
+});
+
+describe('Workers tab navigation (issue #574)', () => {
+	it('renders the Workers tab from a direct deep link', async () => {
+		renderAt('/projects/p1?tab=workers');
+		expect(await screen.findByText('tab:workers')).toBeDefined();
+	});
+
+	it('opens as its own history entry, so Back returns to the preceding tab', async () => {
+		const router = renderAt('/projects/p1');
+		expect(await screen.findByText('tab:runs')).toBeDefined();
+
+		fireEvent.click(screen.getByText('Workers'));
+		expect(await screen.findByText('tab:workers')).toBeDefined();
+		expect(router.state.location.search).toEqual({ tab: 'workers' });
+
+		act(() => router.history.back());
+		expect(await screen.findByText('tab:runs')).toBeDefined();
 	});
 });

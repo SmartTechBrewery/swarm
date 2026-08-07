@@ -63,12 +63,14 @@ vi.mock('@/lib/trpc.js', () => ({
 	},
 }));
 
+import { PROJECT_TABS } from '@/lib/project-nav.js';
 import {
 	diffProjectForSync,
 	PhaseConfigRow,
 	PhaseEnabledCell,
 	PhaseSettingsDetail,
 	PipelineSettingsForm,
+	ProjectTabBar,
 	ToggleSaveIndicator,
 	toggleSaveKey,
 	useToggleAutoSave,
@@ -1050,6 +1052,34 @@ describe('diffProjectForSync', () => {
 		const prev = makeProject({ maxConcurrentJobs: 1 });
 		const next = makeProject({ maxConcurrentJobs: 4 });
 		expect(diffProjectForSync(prev, next)).toMatchObject({ general: true, pipeline: false });
+	});
+});
+
+describe('ProjectTabBar', () => {
+	it('renders the tabs in PROJECT_TABS order, with Workers directly after Runs', () => {
+		render(<ProjectTabBar activeTab="runs" onSelect={() => {}} />);
+
+		const labels = screen.getAllByRole('button').map((button) => button.textContent);
+		expect(labels).toEqual([
+			'Runs',
+			'Workers',
+			'Settings',
+			'Agent Configuration',
+			'Pipeline',
+			'Project Management',
+			'Source Control',
+		]);
+		// The rendered order and the `?tab=` vocabulary must not drift apart.
+		expect(labels).toHaveLength(PROJECT_TABS.length);
+	});
+
+	it('selects the tab that was clicked', () => {
+		const onSelect = vi.fn();
+		render(<ProjectTabBar activeTab="runs" onSelect={onSelect} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Workers' }));
+
+		expect(onSelect).toHaveBeenCalledWith('workers');
 	});
 });
 

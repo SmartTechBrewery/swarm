@@ -7,6 +7,7 @@ import { WorkerDisplayNameSchema } from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
+	type DashboardProjectScope,
 	enrollWorker,
 	getDashboardWorkerDetail,
 	getEnrollment,
@@ -30,10 +31,13 @@ import { authedProcedure, router } from '../trpc.js';
  * - **Installation roster** (`list`, #133): the read-only cross-project
  *   connectivity view the dashboard's Workers screen renders, bounded by
  *   `accessibleProjectScope` — an `instanceAdmin` sees every registered worker,
- *   anyone else only workers enrolled in projects they may access. `getById`
- *   (#477) returns that same row for one worker, widened with per-project
- *   enrollment detail and with what the *viewer* may change, so the detail screen
- *   offers only controls that would succeed.
+ *   anyone else only workers enrolled in projects they may access. Given a
+ *   `projectId` (#574) the same query serves **one project's** roster instead —
+ *   the project detail page's Workers tab — under the project roster's own access
+ *   rule rather than the cross-project scope. `getById` (#477) returns that same
+ *   row for one worker, widened with per-project enrollment detail and with what
+ *   the *viewer* may change, so the detail screen offers only controls that would
+ *   succeed.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
  *   (`enroll`), renames a machine (`rename`), and controls the revocable
@@ -122,6 +126,24 @@ async function resolveOwnedEnrollment(user: SwarmUser, enrollmentId: string) {
 	return { enrollment, worker };
 }
 
+/**
+ * The project scope one roster read runs under. With a `projectId` this is the
+ * project's own roster (issue #574) — the Workers tab on the project detail page
+ * — so it applies the access rule `roster` applies, a `contributor` may read it
+ * and a non-member gets `NOT_FOUND`, and scopes the read to that project alone:
+ * an enrollment elsewhere, an in-flight run outside it, and the un-enrolled
+ * machines an `instanceAdmin` otherwise sees all stay out. Without one it is the
+ * installation-wide roster, bounded by `accessibleProjectScope` as before.
+ */
+async function resolveRosterScope(
+	user: SwarmUser,
+	projectId: string | undefined,
+): Promise<DashboardProjectScope> {
+	if (!projectId) return await accessibleProjectScope(user);
+	await assertProjectAccess(user, projectId, 'contributor');
+	return [projectId];
+}
+
 const AllowedClisInput = z.array(AgentCliSchema).min(1);
 /**
  * The phases an enrollment may be given (issue #509). Non-empty for the same
@@ -139,20 +161,23 @@ export const workersRouter = router({
 
 	// Every worker the caller may see, with connectivity, last-seen, capabilities,
 	// in-flight run, and enrollment states — the dashboard's Workers screen (#133).
-	// Scoping is delegated wholesale to `accessibleProjectScope`: an `instanceAdmin`
-	// passes `null` (every worker, including un-enrolled machines), anyone else
-	// passes exactly their membership project ids. Read-only — no mutation, no
-	// path/credential/token, and no routing or approval affordance.
-	list: authedProcedure.query(async ({ ctx }) => {
-		const scope = await accessibleProjectScope(ctx.user);
-		const workers = await listDashboardWorkers(scope);
-		// The service already assembled a secret-free view; the only wire-shape
-		// concern here is giving the browser an explicit ISO timestamp.
-		return workers.map((worker) => ({
-			...worker,
-			lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
-		}));
-	}),
+	// Scoping is delegated wholesale to `resolveRosterScope`: unscoped, an
+	// `instanceAdmin` passes `null` (every worker, including un-enrolled machines)
+	// and anyone else exactly their membership project ids; with a `projectId`
+	// (#574) it is that one project, authorized like `roster`. Read-only — no
+	// mutation, no path/credential/token, and no routing or approval affordance.
+	list: authedProcedure
+		.input(z.object({ projectId: z.string().min(1) }).optional())
+		.query(async ({ ctx, input }) => {
+			const scope = await resolveRosterScope(ctx.user, input?.projectId);
+			const workers = await listDashboardWorkers(scope);
+			// The service already assembled a secret-free view; the only wire-shape
+			// concern here is giving the browser an explicit ISO timestamp.
+			return workers.map((worker) => ({
+				...worker,
+				lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
+			}));
+		}),
 
 	// One worker in detail (#477) — the same row `list` returns, widened with the
 	// full enrollment detail per visible project and with the two capability flags

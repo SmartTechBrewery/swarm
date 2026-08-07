@@ -45,7 +45,8 @@ vi.mock('@/lib/trpc.js', () => ({
 	},
 }));
 
-import { WORKERS_REFETCH_MS, WorkersRouteComponent, workersRoute } from './index.js';
+import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
+import { WorkersRouteComponent, workersRoute } from './index.js';
 
 function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 	return {

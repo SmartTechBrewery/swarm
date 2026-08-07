@@ -184,6 +184,39 @@ describe('workers.list (installation roster, issue #133)', () => {
 	});
 });
 
+describe('workers.list scoped to one project (issue #574)', () => {
+	it('runs the project roster’s own access rule and scopes to that project alone', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listDashboardWorkers.mockResolvedValue([]);
+
+		await owner.list({ projectId: 'p1' });
+
+		expect(listDashboardWorkers).toHaveBeenCalledWith(['p1']);
+		// The cross-project scope is not consulted at all — this read is the
+		// project's roster, not a filtered view of the installation's.
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
+	});
+
+	it('denies a non-member with NOT_FOUND, hiding the roster and the project', async () => {
+		getMembership.mockResolvedValue(undefined);
+
+		await expect(owner.list({ projectId: 'p1' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('scopes an instanceAdmin too, so un-enrolled machines stay off a project tab', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listDashboardWorkers.mockResolvedValue([]);
+
+		await admin.list({ projectId: 'p1' });
+
+		expect(listDashboardWorkers).toHaveBeenCalledWith(['p1']);
+		expect(listDashboardWorkers).not.toHaveBeenCalledWith(null);
+	});
+});
+
 describe('workers.getById (worker detail, issue #477)', () => {
 	/** The service view the router decorates — only the fields this suite asserts on. */
 	function detailView(overrides: Record<string, unknown> = {}) {
