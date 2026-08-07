@@ -65,9 +65,11 @@ import {
 } from '../transport/protocol.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import {
+	type DispatchStreamTarget,
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
+	resolveDispatchStreamTarget,
 } from './dispatch-results.js';
 import { persistStreamLog } from './stream-log-persistence.js';
 import { deregisterConnection, registerConnection } from './worker-connections.js';
@@ -117,7 +119,14 @@ export interface WorkerTransportDeps {
 	 * worker — a federated one has no database to make it itself. Fire-and-forget
 	 * by contract: it returns `void` so the frame handler never blocks on Postgres.
 	 */
-	persistStreamLog: (frame: StreamLog) => void;
+	persistStreamLog: (frame: StreamLog, runId: string | undefined) => void;
+	/**
+	 * The worker and run this router recorded when it pushed a dispatch
+	 * (`./dispatch-results.ts`). `undefined` for a dispatch not awaited here. It is
+	 * what authorizes a `stream-log`: the frame names its own run, and a durable
+	 * write must not take that on trust.
+	 */
+	resolveDispatchStreamTarget: (dispatchId: string) => DispatchStreamTarget | undefined;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -133,6 +142,7 @@ function defaultDeps(): WorkerTransportDeps {
 		deliverDispatchProgress,
 		deliverDispatchAck,
 		persistStreamLog,
+		resolveDispatchStreamTarget,
 	};
 }
 
@@ -252,6 +262,12 @@ export interface WorkerStreamContext {
 	ttlMs: number;
 	/** The fencing token bound to this WebSocket at upgrade time. */
 	fencingToken: number;
+	/**
+	 * The worker this socket authenticated as, resolved once at upgrade. Present so
+	 * a frame that performs a durable write can be checked against the identity the
+	 * connection proved, rather than against ids the frame supplies itself.
+	 */
+	workerId: string;
 }
 
 /**
@@ -326,7 +342,25 @@ export async function handleWorkerStreamFrame(
 		// immediately (the write runs on the run's own chain), keeping the socket
 		// non-blocking, and the frame still resolves to `ignore` so the connection
 		// lifecycle is untouched.
-		deps.persistStreamLog(frame);
+		//
+		// **Authorized against what this router pushed, never against the frame.**
+		// This is the only back-channel frame that writes durably, and it names its
+		// own `runId`; every other frame either carries the lease or resolves against
+		// a waiter that discards it, so trusting their ids costs nothing. Here it
+		// would make any authenticated worker credential a write handle on any run
+		// of any project — so the batch is persisted only when this router is
+		// awaiting that dispatch AND pushed it to *this* socket's worker, and it is
+		// written under the run id the router recorded, not the one the frame claims.
+		const target = deps.resolveDispatchStreamTarget(frame.dispatchId);
+		if (!target || target.workerId !== ctx.workerId) {
+			logger.warn('stream-log for a dispatch this router did not push here — dropping', {
+				dispatchId: frame.dispatchId,
+				workerId: ctx.workerId,
+				awaited: !!target,
+			});
+			return { action: 'ignore' };
+		}
+		deps.persistStreamLog(frame, target.runId);
 		return { action: 'ignore' };
 	}
 	if (frame.fencingToken !== ctx.fencingToken) {
@@ -466,7 +500,7 @@ export function registerWorkerTransport(
 					try {
 						const action = await handleWorkerStreamFrame(
 							deps,
-							{ credential: safeCredential, ttlMs, fencingToken },
+							{ credential: safeCredential, ttlMs, fencingToken, workerId },
 							frameToString(evt.data),
 						);
 						applyStreamAction(ws, action);

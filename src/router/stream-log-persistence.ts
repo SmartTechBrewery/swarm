@@ -26,6 +26,25 @@
  * a run is capped, later frames are dropped by that repository call; the control
  * plane has no way to tell the worker to stop streaming, and bounded socket
  * chatter is cheaper than the protocol change a backpressure signal would need.
+ *
+ * **What moving the write here costs: output does not survive a lost session.**
+ * The worker-local batcher this replaces flushed and *awaited* its DB write in a
+ * `finally`, so a run's lines were durable on the worker's own machine whatever
+ * happened to the socket. Now the only route to durability is the assignment sink,
+ * which is bound to one transport session and drops every frame once that session
+ * settles (`../transport/worker-client.ts`) — while the phase itself keeps running,
+ * because the assignment handler is independent of the heartbeat loop. So a socket
+ * lost mid-phase (a dropped connection, a router restart) loses that run's
+ * remaining output, and a session lost early loses all of it: the run page stays
+ * blank for exactly the attempt an operator most wants to read.
+ *
+ * That is accepted here rather than solved, deliberately. In this scenario the
+ * terminal `TaskExecutionResult` rides the same dead sink and is lost too, so the
+ * dispatch fails and is re-pushed regardless — the marginal loss is diagnostic, not
+ * correctness. The fix, if it is wanted, is a bounded replay buffer on the sink so
+ * undelivered batches survive into the next session; that is worth deciding before
+ * phase 4 of issue #544 removes `DATABASE_URL` from the host worker and makes this
+ * the *only* path to persisted output (issue #544 review, F2).
  */
 
 import {
@@ -59,10 +78,9 @@ function parseEmittedAt(value: string): Date {
  * immediately — the write runs on the run's chain. A frame with no `runId` (a
  * dispatch with no run row) is skipped: there is nothing to attach the rows to.
  */
-export function persistStreamLog(frame: StreamLog): void {
-	const { runId } = frame;
+export function persistStreamLog(frame: StreamLog, runId: string | undefined): void {
 	if (!runId) {
-		logger.debug('stream-log frame carries no run id — dropping its output', {
+		logger.debug('dispatch has no run row — dropping its streamed output', {
 			dispatchId: frame.dispatchId,
 		});
 		return;

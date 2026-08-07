@@ -52,6 +52,7 @@ import {
 	runAssignedPhase,
 } from '../worker/consumer.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
+import { HEARTBEAT_MS, stillRunningLine } from '../worker/live-output.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
 import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
 import { reconstructProjectConfig } from './db-free-project.js';
@@ -84,7 +85,8 @@ const BATCH_SIZE = 100;
  * Claude-only, and an internal constant rather than a setting: it exists to make
  * "alive" legible, not to be tuned.
  */
-const HEARTBEAT_MS = 30_000;
+// Interval and rendered line both come from `../worker/live-output.ts` so the two
+// paths cannot drift on a user-visible string (issue #544 review, F3).
 
 /** Map the transport's serialization subset back to a PM `WorkItem` for the phase runner. */
 export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
@@ -157,7 +159,7 @@ export function createAssignmentRunAgent(
 			if (options.cli !== 'claude') return;
 			stopHeartbeat();
 			heartbeatTimer = setTimeout(() => {
-				enqueue('stdout', `Still running — no output for ${HEARTBEAT_MS / 1_000}s.`);
+				enqueue('stdout', stillRunningLine());
 				armHeartbeat();
 			}, HEARTBEAT_MS);
 		};

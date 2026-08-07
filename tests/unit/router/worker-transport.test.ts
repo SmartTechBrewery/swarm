@@ -53,6 +53,10 @@ function makeAcquired(overrides: Partial<AcquiredSession['session']> = {}): Acqu
 	};
 }
 
+/** The dispatch the back-channel tests speak about, and the run the router opened for it. */
+const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const RUN_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
 function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransportDeps {
 	return {
 		resolveWorkerByCredential: vi.fn().mockResolvedValue(makeWorker()),
@@ -66,6 +70,9 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		deliverDispatchProgress: vi.fn(),
 		deliverDispatchAck: vi.fn(),
 		persistStreamLog: vi.fn(),
+		// By default this router is awaiting the dispatch and pushed it to WORKER_ID,
+		// so a stream-log from that socket is authorized (issue #544 review, F1).
+		resolveDispatchStreamTarget: vi.fn(() => ({ workerId: WORKER_ID, runId: RUN_ID })),
 		...overrides,
 	};
 }
@@ -170,7 +177,7 @@ describe('handleHandshake', () => {
 describe('handleWorkerStreamFrame', () => {
 	beforeEach(() => vi.clearAllMocks());
 
-	const ctx = { credential: CREDENTIAL, ttlMs: 60_000, fencingToken: 7 };
+	const ctx = { credential: CREDENTIAL, ttlMs: 60_000, fencingToken: 7, workerId: WORKER_ID };
 
 	it('refreshes the lease and acks a valid heartbeat', async () => {
 		const deps = makeDeps();
@@ -228,8 +235,6 @@ describe('handleWorkerStreamFrame', () => {
 
 	// Split delivery (issue #407): the back-channel frames are routed to the
 	// control-plane dispatcher and keep the socket open (never touch the lease).
-	const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-	const RUN_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 	it('routes a task-execution-result to the dispatcher and keeps the socket open', async () => {
 		const deps = makeDeps();
@@ -296,15 +301,68 @@ describe('handleWorkerStreamFrame', () => {
 			}),
 		);
 		expect(action).toEqual({ action: 'ignore' });
-		expect(deps.persistStreamLog).toHaveBeenCalledWith({
-			type: 'stream-log',
-			dispatchId: DISPATCH,
-			runId: RUN_ID,
-			lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
-		});
+		expect(deps.persistStreamLog).toHaveBeenCalledWith(
+			{
+				type: 'stream-log',
+				dispatchId: DISPATCH,
+				runId: RUN_ID,
+				lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
+			},
+			RUN_ID,
+		);
 		expect(deps.deliverDispatchResult).not.toHaveBeenCalled();
 		expect(deps.deliverDispatchProgress).not.toHaveBeenCalled();
 		expect(deps.deliverDispatchAck).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * `stream-log` is the only back-channel frame that writes durably, so it is the
+	 * only one whose ids cannot be taken on trust: without these three checks an
+	 * authenticated worker credential is a write handle on any run of any project
+	 * (issue #544 review, F1).
+	 */
+	function streamLogFrame(runId: string): string {
+		return JSON.stringify({
+			type: 'stream-log',
+			dispatchId: DISPATCH,
+			runId,
+			lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
+		});
+	}
+
+	it('drops a stream-log for a dispatch this router is not awaiting', async () => {
+		const deps = makeDeps({ resolveDispatchStreamTarget: vi.fn(() => undefined) });
+
+		const action = await handleWorkerStreamFrame(deps, ctx, streamLogFrame(RUN_ID));
+
+		expect(action).toEqual({ action: 'ignore' });
+		expect(deps.persistStreamLog).not.toHaveBeenCalled();
+	});
+
+	it('drops a stream-log whose dispatch was pushed to a different worker', async () => {
+		const deps = makeDeps({
+			resolveDispatchStreamTarget: vi.fn(() => ({
+				workerId: '99999999-9999-4999-8999-999999999999',
+				runId: RUN_ID,
+			})),
+		});
+
+		const action = await handleWorkerStreamFrame(deps, ctx, streamLogFrame(RUN_ID));
+
+		expect(action).toEqual({ action: 'ignore' });
+		expect(deps.persistStreamLog).not.toHaveBeenCalled();
+	});
+
+	it('persists under the run the router recorded, not the run the frame names', async () => {
+		const deps = makeDeps();
+
+		await handleWorkerStreamFrame(
+			deps,
+			ctx,
+			streamLogFrame('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+		);
+
+		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
 	});
 });
 

@@ -386,13 +386,19 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 
 	// Register the result wait *before* pushing so a fast worker's ack/progress/
 	// result can't race ahead of the registration.
-	const awaiting = awaitDispatchResult(dispatch.id, {
-		onProgress: (progress: TaskProgress) => {
-			if (progress.state === 'branch-provisioned') {
-				void persistBranchProvisioned(runId, job, trigger.taskId);
-			}
+	const awaiting = awaitDispatchResult(
+		dispatch.id,
+		// Recorded here, not read off the worker's frames: this is what authorizes the
+		// one back-channel frame that writes durably (`stream-log`).
+		{ workerId: selection.workerId, runId },
+		{
+			onProgress: (progress: TaskProgress) => {
+				if (progress.state === 'branch-provisioned') {
+					void persistBranchProvisioned(runId, job, trigger.taskId);
+				}
+			},
 		},
-	});
+	);
 	try {
 		if (!sendToWorker(selection.workerId, assignment)) {
 			// The socket dropped between the connectivity check and the push — defer

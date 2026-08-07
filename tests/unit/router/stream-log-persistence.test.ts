@@ -50,7 +50,7 @@ beforeEach(() => {
 describe('persistStreamLog', () => {
 	it('appends every line of a batch, with the wire instant as a Date', async () => {
 		const runId = nextRunId();
-		persistStreamLog(frame(runId, 'Tool started: Bash', 'Tool completed: Bash'));
+		persistStreamLog(frame(runId, 'Tool started: Bash', 'Tool completed: Bash'), runId);
 		await settle();
 
 		expect(appendRunOutputEvents).toHaveBeenCalledWith(runId, [
@@ -77,8 +77,8 @@ describe('persistStreamLog', () => {
 				}),
 		);
 
-		persistStreamLog(frame(runId, 'first'));
-		persistStreamLog(frame(runId, 'second'));
+		persistStreamLog(frame(runId, 'first'), runId);
+		persistStreamLog(frame(runId, 'second'), runId);
 		await settle();
 
 		// The second batch waits on the first — the whole point of the per-run chain.
@@ -97,8 +97,8 @@ describe('persistStreamLog', () => {
 		const other = nextRunId();
 		appendRunOutputEvents.mockImplementationOnce(() => new Promise<void>(() => {}));
 
-		persistStreamLog(frame(blocked, 'stuck'));
-		persistStreamLog(frame(other, 'free'));
+		persistStreamLog(frame(blocked, 'stuck'), blocked);
+		persistStreamLog(frame(other, 'free'), other);
 		await settle();
 
 		expect(appendRunOutputEvents).toHaveBeenCalledTimes(2);
@@ -106,7 +106,7 @@ describe('persistStreamLog', () => {
 	});
 
 	it('skips a frame with no run id — there is no run row to attach output to', async () => {
-		persistStreamLog(frame(undefined, 'orphan'));
+		persistStreamLog(frame(undefined, 'orphan'), undefined);
 		await settle();
 
 		expect(appendRunOutputEvents).not.toHaveBeenCalled();
@@ -116,9 +116,9 @@ describe('persistStreamLog', () => {
 		const runId = nextRunId();
 		appendRunOutputEvents.mockRejectedValueOnce(new Error('db down'));
 
-		persistStreamLog(frame(runId, 'lost'));
+		persistStreamLog(frame(runId, 'lost'), runId);
 		await settle();
-		persistStreamLog(frame(runId, 'kept'));
+		persistStreamLog(frame(runId, 'kept'), runId);
 		await settle();
 
 		expect(appendRunOutputEvents).toHaveBeenCalledTimes(2);
@@ -127,12 +127,15 @@ describe('persistStreamLog', () => {
 
 	it('falls back to a usable instant when the wire timestamp is unparseable', async () => {
 		const runId = nextRunId();
-		persistStreamLog({
-			type: 'stream-log',
-			dispatchId: DISPATCH,
+		persistStreamLog(
+			{
+				type: 'stream-log',
+				dispatchId: DISPATCH,
+				runId,
+				lines: [{ stream: 'stderr', content: 'a warning\n', emittedAt: 'not-a-date' }],
+			},
 			runId,
-			lines: [{ stream: 'stderr', content: 'a warning\n', emittedAt: 'not-a-date' }],
-		});
+		);
 		await settle();
 
 		const [, events] = appendRunOutputEvents.mock.calls[0] ?? [];
