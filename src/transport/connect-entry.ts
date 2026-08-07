@@ -72,9 +72,8 @@ async function main(): Promise<void> {
 	// Declare the CLIs this host can run: an explicit override if set, otherwise
 	// probe PATH. An empty set can't handshake (the protocol requires a non-empty
 	// capability list), so fail loudly with an actionable message.
-	const capabilities =
-		parseDeclaredClisOverride(process.env.SWARM_WORKER_TRANSPORT_CLIS) ??
-		(await discoverAvailableClis());
+	const declaredOverride = parseDeclaredClisOverride(process.env.SWARM_WORKER_TRANSPORT_CLIS);
+	const capabilities = declaredOverride ?? (await discoverAvailableClis());
 	if (capabilities.length === 0) {
 		throw new Error(
 			'No agent CLIs found on PATH to declare (looked for claude, agy, codex). Install at least one, or set SWARM_WORKER_TRANSPORT_CLIS explicitly.',
@@ -99,6 +98,9 @@ async function main(): Promise<void> {
 		controlPlaneUrl,
 		credential,
 		capabilities,
+		// Only a *discovered* set is worth re-probing when the control plane rejects
+		// it (issue #559); an explicit override is the operator's own declaration.
+		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
 		supportedPhases,
 		hostname: host,
 		daemonVersion: resolveDaemonVersion(),

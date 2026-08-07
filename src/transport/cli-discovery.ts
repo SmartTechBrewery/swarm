@@ -13,14 +13,19 @@
  * or the queue, matching the transport client's no-datastore contract (ADR-003
  * §1). Availability here is the cheap "does the binary run" check alone; quota
  * telemetry rides the optional heartbeat health, not the capability set.
+ *
+ * **Discovery never narrows the set on a guess** (issue #559). The declared set
+ * is what the control plane checks the worker's enrollments against, and a set
+ * missing a required CLI is a fatal handshake rejection — so a CLI is dropped
+ * only on proof it is absent (`ENOENT`), never on a probe that merely failed to
+ * settle. An unsettled probe is retried once, serially and with a wider budget,
+ * and if it still has no answer the CLI is declared anyway: over-declaring costs
+ * one failed assignment, under-declaring costs the whole daemon.
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
 import { type AgentCli, AgentCliSchema } from '../harness/agent-cli.js';
-
-const execFileAsync = promisify(execFile);
+import { type BinaryProbeOutcome, probeBinary } from '../harness/binary-probe.js';
+import { logger } from '../lib/logger.js';
 
 /**
  * Binary name per agent CLI. Antigravity's CLI binary is `agy`, not
@@ -33,43 +38,78 @@ const CLI_BINARY: Record<AgentCli, string> = {
 	codex: 'codex',
 };
 
-/** How long a single `--version` probe may run before it is treated as absent. */
-const PROBE_TIMEOUT_MS = 2_000;
+/**
+ * Budget for the re-probe of a CLI the first round could not settle. Wider than
+ * the default, and spent one CLI at a time: the first round runs all three
+ * concurrently, which is precisely the contention a loaded machine starves, so
+ * the retry removes both variables at once.
+ */
+const RETRY_PROBE_TIMEOUT_MS = 15_000;
+
+/** What the PATH probe established about each agent CLI on this host. */
+export interface CliProbeReport {
+	/** The set to declare at handshake: proven present, plus anything unsettled. */
+	declared: AgentCli[];
+	/** Proven absent (`ENOENT`) — the only outcome that drops a CLI. */
+	absent: AgentCli[];
+	/** Declared without a confirmed probe, after the retry also failed to settle. */
+	unconfirmed: AgentCli[];
+}
 
 /**
- * Whether `command` exists and runs on PATH. A missing binary throws `ENOENT`
- * (→ `false`); a binary that exists but exits non-zero or lacks `--version` is
- * still present, so a fallback bare invocation confirms it. Mirrors
- * `isBinaryRunnable` in `../harness/quota-discovery.ts` without that module's DB
- * import.
+ * Probe every agent CLI on PATH and report what was established, including the
+ * ones the probe could not settle. {@link discoverAvailableClis} is the plain
+ * "what do I declare" caller; this is for anything that also needs to say how
+ * confident that answer is.
  */
-async function isBinaryRunnable(command: string): Promise<boolean> {
-	try {
-		await execFileAsync(command, ['--version'], { timeout: PROBE_TIMEOUT_MS });
-		return true;
-	} catch (err) {
-		if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-		try {
-			await execFileAsync(command, [], { timeout: PROBE_TIMEOUT_MS });
-			return true;
-		} catch {
-			return false;
+export async function probeAvailableClis(): Promise<CliProbeReport> {
+	const clis = AgentCliSchema.options;
+	const outcomes = new Map<AgentCli, BinaryProbeOutcome>(
+		await Promise.all(
+			clis.map(
+				async (cli) => [cli, await probeBinary(CLI_BINARY[cli])] as [AgentCli, BinaryProbeOutcome],
+			),
+		),
+	);
+
+	for (const [cli, outcome] of [...outcomes]) {
+		if (outcome !== 'indeterminate') continue;
+		logger.warn('agent CLI probe did not settle; re-probing before declaring capabilities', {
+			cli,
+			binary: CLI_BINARY[cli],
+			timeoutMs: RETRY_PROBE_TIMEOUT_MS,
+		});
+		outcomes.set(cli, await probeBinary(CLI_BINARY[cli], { timeoutMs: RETRY_PROBE_TIMEOUT_MS }));
+	}
+
+	const report: CliProbeReport = { declared: [], absent: [], unconfirmed: [] };
+	for (const cli of clis) {
+		const outcome = outcomes.get(cli);
+		if (outcome === 'absent') {
+			report.absent.push(cli);
+			continue;
+		}
+		report.declared.push(cli);
+		if (outcome === 'indeterminate') {
+			report.unconfirmed.push(cli);
+			logger.warn('declaring an agent CLI its probe never confirmed', {
+				cli,
+				binary: CLI_BINARY[cli],
+				reason: 'the probe timed out twice, which is no evidence the binary is missing',
+			});
 		}
 	}
+	return report;
 }
 
 /**
  * The agent CLIs runnable on this host, probed by binary availability on PATH.
- * The set the daemon declares at handshake; empty when none are installed (the
- * entrypoint treats that as a clear startup error, since the handshake requires a
- * non-empty capability set).
+ * The set the daemon declares at handshake; empty only when every CLI answered
+ * `ENOENT` (the entrypoint treats that as a clear startup error, since the
+ * handshake requires a non-empty capability set).
  */
 export async function discoverAvailableClis(): Promise<AgentCli[]> {
-	const clis = AgentCliSchema.options;
-	const available = await Promise.all(
-		clis.map(async (cli) => ((await isBinaryRunnable(CLI_BINARY[cli])) ? cli : undefined)),
-	);
-	return available.filter((cli): cli is AgentCli => cli !== undefined);
+	return (await probeAvailableClis()).declared;
 }
 
 /**

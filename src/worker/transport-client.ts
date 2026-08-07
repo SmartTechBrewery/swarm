@@ -258,6 +258,12 @@ export interface WorkerTransportDispatchOptions {
 	controlPlaneUrl: string;
 	credential: string;
 	capabilities: AgentCli[];
+	/**
+	 * Re-run PATH discovery when the control plane rejects the declared set
+	 * (issue #559). Supplied only when `capabilities` was discovered rather than
+	 * declared by the operator; see `WorkerTransportOptions.refreshCapabilities`.
+	 */
+	refreshCapabilities?: () => Promise<AgentCli[]>;
 	hostname: string;
 	daemonVersion: string;
 	/** Worker shutdown signal — aborting kills any in-flight agent CLI. */
@@ -283,6 +289,7 @@ export function startWorkerTransportDispatch(
 		controlPlaneUrl: options.controlPlaneUrl,
 		credential: options.credential,
 		capabilities: options.capabilities,
+		refreshCapabilities: options.refreshCapabilities,
 		// This client holds `DATABASE_URL` and runs phases through the full
 		// `runAssignedPhase` switch, so it declares every phase — including
 		// `planning`, the one the DB-free daemon must refuse (issue #467).

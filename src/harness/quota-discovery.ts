@@ -1,40 +1,28 @@
-import { execFile, spawn } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import { getDb } from '../db/client.js';
 import { RETRY_PENDING_RUN_STATUSES } from '../db/repositories/runsRepository.js';
 import { runs } from '../db/schema/runs.js';
 import { logger } from '../lib/logger.js';
 import type { AgentCli } from './agent-cli.js';
+import { probeBinary } from './binary-probe.js';
 import type { CliQuotaSnapshot } from './quota.js';
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Cheap availability check to verify if the binary exists and runs.
+ *
+ * Fails **open**: only a probe that proved absence (`ENOENT`) reports `false`,
+ * while one that never settled reports `true` (issue #559). The two are separate
+ * outcomes in `probeBinary`, and collapsing them the other way is what let a
+ * momentarily loaded machine report an installed CLI as missing. A wrong `true`
+ * costs one failed quota read that reports its own error; a wrong `false` labels
+ * the CLI "not found on PATH" and points the operator at the wrong thing.
  */
 export async function isBinaryRunnable(
 	command: string,
 	args: string[] = ['--version'],
 ): Promise<boolean> {
-	try {
-		await execFileAsync(command, args, { timeout: 2000 });
-		return true;
-	} catch (err: any) {
-		// If command exited with 0/non-zero but exists, it might succeed or fail,
-		// but if it is NOT found on PATH it will throw ENOENT.
-		if (err && err.code === 'ENOENT') {
-			return false;
-		}
-		// Some binaries might not support the version flag or exit non-zero,
-		// let's try running without arguments as a fallback.
-		try {
-			await execFileAsync(command, [], { timeout: 2000 });
-			return true;
-		} catch {
-			return false;
-		}
-	}
+	return (await probeBinary(command, { args })) !== 'absent';
 }
 
 /**
