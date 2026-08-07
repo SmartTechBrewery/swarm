@@ -1,16 +1,18 @@
 /**
  * LinearPMProvider — the concrete `PMProvider` (`src/pm/types.ts`) for Linear.
- * This phase lands the **read half** plus discovery: the board reads the pipeline
- * needs to resolve the card that triggered a phase, and the `containers`/`states`
- * enumeration the board-mapping screen builds a mapping from. The writes and the
- * dependency gate arrive with the next phase, which is why nothing registers a
- * Linear manifest yet (ai/RULES.md §2 "Register when the contract is satisfied,
- * not when the folder appears" — the sequencing GitLab's #295 used).
+ * Every method of the contract is now real: the board reads and discovery the
+ * previous phase landed, plus the writes (status transition, comment, issue
+ * create/update, label) and the dependency gate (`listBlockers`/`addBlockedBy`).
+ * Registration still waits on the ingress adapter and the manifest — a provider
+ * registers only once nothing about it is a stub, and the reverse is not true
+ * (ai/RULES.md §2 "Register when the contract is satisfied, not when the folder
+ * appears" — the sequencing GitLab's #295 used).
  *
  * Every operation is GraphQL: Linear has no REST surface at all, so unlike the
  * GitHub Projects provider there is no second protocol to keep straight. Every
- * field name, argument and `IssueFilter` key in the documents below was verified
- * against the live schema at https://api.linear.app/graphql rather than inferred.
+ * field name, argument, mutation, payload field and `IssueFilter` key in the
+ * documents below was verified against the live schema at
+ * https://api.linear.app/graphql rather than inferred.
  *
  * Credentials are never passed in: each method runs its work inside
  * `withLinearProjectCredentials(this.project, …)`, so `linearGraphQL` picks the
@@ -23,6 +25,12 @@
  */
 
 import type { ProjectConfig } from '../../../config/schema.js';
+import { logger } from '../../../lib/logger.js';
+import {
+	dedupeBlockers,
+	dependencyProse,
+	findDependencyReferences,
+} from '../../../pm/dependencies.js';
 import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
@@ -135,6 +143,154 @@ const TEAM_STATES_QUERY = /* GraphQL */ `
 	}
 `;
 
+/**
+ * The fields a {@link WorkItemBlocker} is built from — a much narrower selection
+ * than {@link ISSUE_FIELDS}, because a blocker only has to be named in a message
+ * and answered "still open?".
+ *
+ * `identifier` (`SWARM-491`) is Linear's own human-readable reference and the one
+ * a person would search for; `number` backs the `#N` form the shared prose
+ * heuristic speaks. `state { type }` is the open/closed signal: Linear has no
+ * boolean, only the state's category.
+ */
+const BLOCKER_ISSUE_FIELDS = /* GraphQL */ `
+	id
+	identifier
+	number
+	title
+	url
+	state { type }
+`;
+
+/** One page of an issue's comments — id and body are all a marker scan needs. */
+const ISSUE_COMMENTS_QUERY = /* GraphQL */ `
+	query IssueComments($id: String!, $cursor: String) {
+		issue(id: $id) {
+			id
+			comments(first: 100, after: $cursor) {
+				pageInfo { hasNextPage endCursor }
+				nodes { id body }
+			}
+		}
+	}
+`;
+
+/**
+ * The free text a prose-declared prerequisite can hide in — the issue's own
+ * description plus its comments — together with the issue's `number` so a
+ * self-reference can be dropped.
+ */
+const ISSUE_DEPENDENCY_PROSE_QUERY = /* GraphQL */ `
+	query IssueDependencyProse($id: String!) {
+		issue(id: $id) {
+			id
+			number
+			description
+			comments(first: 100) { nodes { body } }
+		}
+	}
+`;
+
+/**
+ * One page of the relations *pointing at* this issue. See
+ * {@link LinearPMProvider.fetchNativeBlockers} for why "who blocks me" is
+ * `inverseRelations` rather than `relations`.
+ */
+const ISSUE_BLOCKING_RELATIONS_QUERY = /* GraphQL */ `
+	query IssueBlockingRelations($id: String!, $cursor: String) {
+		issue(id: $id) {
+			id
+			inverseRelations(first: 100, after: $cursor) {
+				pageInfo { hasNextPage endCursor }
+				nodes { type issue { ${BLOCKER_ISSUE_FIELDS} } }
+			}
+		}
+	}
+`;
+
+/** The one issue in this team carrying a given number, for resolving a `#N` mention. */
+const ISSUE_BY_NUMBER_QUERY = /* GraphQL */ `
+	query IssueByNumber($filter: IssueFilter) {
+		issues(filter: $filter, first: 1) {
+			nodes { ${BLOCKER_ISSUE_FIELDS} }
+		}
+	}
+`;
+
+/** One page of the workspace's labels carrying a given name (see {@link LinearPMProvider.findLabelId}). */
+const FIND_LABELS_QUERY = /* GraphQL */ `
+	query FindIssueLabels($name: String!, $cursor: String) {
+		issueLabels(filter: { name: { eqIgnoreCase: $name } }, first: 100, after: $cursor) {
+			pageInfo { hasNextPage endCursor }
+			nodes { id name team { id } }
+		}
+	}
+`;
+
+/** The labels currently attached to one issue — the idempotence check for `addLabel`. */
+const ISSUE_LABELS_QUERY = /* GraphQL */ `
+	query IssueLabels($id: String!) {
+		issue(id: $id) {
+			id
+			labels(first: 100) { nodes { id name } }
+		}
+	}
+`;
+
+/**
+ * The one mutation behind every field write: a status transition is
+ * `input: { stateId }`, a re-scope is `input: { title, description }`.
+ */
+const UPDATE_ISSUE_MUTATION = /* GraphQL */ `
+	mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
+		issueUpdate(id: $id, input: $input) { success }
+	}
+`;
+
+/** Create an issue, reading the whole card back so it maps like any board read. */
+const CREATE_ISSUE_MUTATION = /* GraphQL */ `
+	mutation CreateIssue($input: IssueCreateInput!) {
+		issueCreate(input: $input) {
+			success
+			issue { ${ISSUE_FIELDS} }
+		}
+	}
+`;
+
+/** Post a comment on an issue. */
+const CREATE_COMMENT_MUTATION = /* GraphQL */ `
+	mutation CreateComment($input: CommentCreateInput!) {
+		commentCreate(input: $input) {
+			success
+			comment { id }
+		}
+	}
+`;
+
+/** Create a team label. Linear rejects a name the team (or workspace) already uses. */
+const CREATE_LABEL_MUTATION = /* GraphQL */ `
+	mutation CreateIssueLabel($input: IssueLabelCreateInput!) {
+		issueLabelCreate(input: $input) {
+			success
+			issueLabel { id name }
+		}
+	}
+`;
+
+/** Attach one existing label to an issue — a set insert, not a whole-list write. */
+const ADD_LABEL_MUTATION = /* GraphQL */ `
+	mutation AddIssueLabel($id: String!, $labelId: String!) {
+		issueAddLabel(id: $id, labelId: $labelId) { success }
+	}
+`;
+
+/** Record one issue relation. See {@link LinearPMProvider.addBlockedBy} for the direction. */
+const CREATE_RELATION_MUTATION = /* GraphQL */ `
+	mutation CreateIssueRelation($input: IssueRelationCreateInput!) {
+		issueRelationCreate(input: $input) { success }
+	}
+`;
+
 /** The shape {@link ISSUE_FIELDS} selects. Every field is optional defensively. */
 interface IssueNode {
 	id?: string;
@@ -181,10 +337,154 @@ interface TeamStatesResponse {
 	team?: { id?: string; states?: LinearConnection<StateNode> | null } | null;
 }
 
+/** The blocker-shaped subset of an issue that {@link BLOCKER_ISSUE_FIELDS} selects. */
+interface BlockerIssueNode {
+	id?: string;
+	identifier?: string;
+	number?: number;
+	title?: string;
+	url?: string;
+	state?: { type?: string } | null;
+}
+
+interface CommentNode {
+	id?: string;
+	body?: string;
+}
+
+interface IssueCommentsResponse {
+	issue?: { comments?: LinearConnection<CommentNode> | null } | null;
+}
+
+interface IssueDependencyProseResponse {
+	issue?: {
+		number?: number;
+		description?: string | null;
+		comments?: { nodes?: Array<{ body?: string } | null> | null } | null;
+	} | null;
+}
+
+interface RelationNode {
+	type?: string;
+	issue?: BlockerIssueNode | null;
+}
+
+interface IssueBlockingRelationsResponse {
+	issue?: { inverseRelations?: LinearConnection<RelationNode> | null } | null;
+}
+
+interface BlockerIssuesResponse {
+	issues?: { nodes?: Array<BlockerIssueNode | null> | null } | null;
+}
+
+interface LabelNode {
+	id?: string;
+	name?: string;
+	team?: { id?: string } | null;
+}
+
+interface FindLabelsResponse {
+	issueLabels?: LinearConnection<LabelNode> | null;
+}
+
+interface IssueLabelsResponse {
+	issue?: { labels?: { nodes?: Array<{ id?: string; name?: string } | null> | null } } | null;
+}
+
+interface IssueUpdateResponse {
+	issueUpdate?: { success?: boolean } | null;
+}
+
+interface IssueCreateResponse {
+	issueCreate?: { success?: boolean; issue?: IssueNode | null } | null;
+}
+
+interface CommentCreateResponse {
+	commentCreate?: { success?: boolean; comment?: { id?: string } | null } | null;
+}
+
+interface IssueLabelCreateResponse {
+	issueLabelCreate?: { success?: boolean; issueLabel?: { id?: string } | null } | null;
+}
+
+interface IssueAddLabelResponse {
+	issueAddLabel?: { success?: boolean } | null;
+}
+
+interface IssueRelationCreateResponse {
+	issueRelationCreate?: { success?: boolean } | null;
+}
+
 /** The `IssueFilter` variable shape the read queries take. */
 interface IssueFilterVariable {
 	team: { id: { eq: string } };
 	state?: { id: { eq: string } };
+	number?: { eq: number };
+	description?: { contains: string };
+}
+
+/**
+ * The relation type that models a prerequisite. `IssueRelationType` also carries
+ * `duplicate`/`related`/`similar`, which are not dependencies — and on the *read*
+ * side `IssueRelation.type` is a plain `String`, so those arrive alongside and
+ * have to be filtered out rather than excluded by the schema.
+ */
+const BLOCKS_RELATION_TYPE = 'blocks';
+
+/**
+ * The Linear workflow-state categories that mean an issue is finished, and so no
+ * longer gates dependent work. Every other category (`triage`, `backlog`,
+ * `unstarted`, `started`) leaves the blocker open.
+ */
+const CLOSED_STATE_TYPES = new Set(['completed', 'canceled']);
+
+/** Map a Linear issue — a native relation's or a resolved mention's — to a provider-neutral blocker. */
+function toBlocker(issue: BlockerIssueNode, source: WorkItemBlocker['source']): WorkItemBlocker {
+	return {
+		id: issue.id,
+		// Linear's `identifier` is what a person sees and searches for; the `#N` form
+		// is the fallback for a partial response, matching how the mention was written.
+		reference: issue.identifier || (issue.number == null ? (issue.url ?? '?') : `#${issue.number}`),
+		url: issue.url ?? '',
+		title: issue.title ?? '',
+		open: !CLOSED_STATE_TYPES.has(issue.state?.type ?? ''),
+		source,
+	};
+}
+
+/**
+ * Fail on a mutation Linear answered without an error but without accepting
+ * either. Every write payload carries `success`, and a falsy one means the write
+ * did not happen — silently returning would report a move or a label that a human
+ * would then not find on the board (ai/CODING_STANDARDS.md "Error handling").
+ */
+function requireMutationSuccess(success: boolean | undefined, operation: string): void {
+	if (!success) {
+		throw new Error(`Linear rejected the request to ${operation}`);
+	}
+}
+
+/**
+ * Whether an error is Linear refusing to create a second label with a name the
+ * workspace already uses. The phrase is Linear's own — Cascade's `createLabel`
+ * matches the same one against the live API (`src/linear/client.ts` there) — and
+ * `linearGraphQL` surfaces a GraphQL error as its joined message text, so the
+ * message is what there is to match on.
+ */
+function isDuplicateLabelNameError(error: unknown): boolean {
+	return error instanceof Error && /duplicate label name/i.test(error.message);
+}
+
+/**
+ * Whether an error is Linear refusing a relation it already holds. Narrower than
+ * a blanket catch, and only a backstop: {@link LinearPMProvider.addBlockedBy}
+ * makes itself idempotent by reading the existing relations first, so this
+ * catches only the window between that read and the write. Unlike the label
+ * phrase above, this wording could not be confirmed against a live workspace, so
+ * anything it does not match is rethrown.
+ */
+function isDuplicateRelationError(error: unknown): boolean {
+	return error instanceof Error && /duplicate|already (?:exists|related)/i.test(error.message);
 }
 
 function mapLabels(issue: IssueNode): WorkItemLabel[] {
@@ -317,10 +617,16 @@ export class LinearPMProvider implements PMProvider {
 	}
 
 	/** An `IssueFilter` scoped to this project's team, optionally narrowed further. */
-	private issueFilter(extra: { stateId?: string } = {}): IssueFilterVariable {
+	private issueFilter(
+		extra: { stateId?: string; number?: number; descriptionContains?: string } = {},
+	): IssueFilterVariable {
 		return {
 			team: { id: { eq: this.config.teamId } },
 			...(extra.stateId === undefined ? {} : { state: { id: { eq: extra.stateId } } }),
+			...(extra.number === undefined ? {} : { number: { eq: extra.number } }),
+			...(extra.descriptionContains === undefined
+				? {}
+				: { description: { contains: extra.descriptionContains } }),
 		};
 	}
 
@@ -412,68 +718,318 @@ export class LinearPMProvider implements PMProvider {
 		});
 	}
 
-	// ---------------------------------------------------------------------------
-	// The write half plus the dependency reads land in the next phase. Each one
-	// throws the generic **not-implemented sentinel inline**, on purpose and
-	// verbatim: the PM conformance suite scans each contract method's own source
-	// for that wording (`tests/unit/integrations/pm/pm-conformance.test.ts`), so
-	// registering this provider before the stubs are gone fails that suite instead
-	// of shipping a board that silently can't be written to. Do not factor these
-	// into a shared helper — hiding the phrase behind a call would defeat the gate,
-	// which is the only thing making a half-built provider safe (ai/RULES.md §2,
-	// ai/TESTING.md "A provider under construction registers nothing").
-	// ---------------------------------------------------------------------------
+	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
+		return this.run(async () => {
+			// Server-side, unlike GitHub Projects' client-side scan of a whole board
+			// read: `IssueFilter.description` takes a case-sensitive `contains`, which
+			// is the same narrowing the team/state filters use.
+			//
+			// A *filter over the issues themselves*, deliberately, and not Linear's
+			// `searchIssues` — the caller is Planning's retried split, and a child
+			// created seconds ago has to be findable now or the guard silently
+			// duplicates it, which an eventually-consistent search index cannot
+			// promise. Callers pass a marker at most one item can carry, so the first
+			// match is the match.
+			const issues = await this.collectIssues(this.issueFilter({ descriptionContains: marker }));
+			const issue = issues[0];
+			return issue ? toWorkItem(issue, this.config, this.project.repo) : undefined;
+		});
+	}
 
 	async moveWorkItem(id: string, status: string): Promise<void> {
-		throw new Error(
-			`moveWorkItem is not implemented for the Linear PM provider (item '${id}' → '${status}')`,
-		);
+		// Resolve the canonical key before the write: a status the board mapping
+		// can't resolve is a config/logic error, not a value to send blindly — the
+		// same fail-loud contract `listWorkItems` and GitHub Projects' `moveWorkItem`
+		// keep (ai/CODING_STANDARDS.md "Error handling").
+		const stateId = requireStateIdForStatusKey(this.config, status);
+		await this.run(async () => {
+			const data = await linearGraphQL<IssueUpdateResponse>(UPDATE_ISSUE_MUTATION, {
+				id,
+				input: { stateId },
+			});
+			requireMutationSuccess(data.issueUpdate?.success, `move item '${id}' to '${status}'`);
+		});
+		logger.debug('pm: moved work item', { itemId: id, status });
 	}
 
 	async addComment(id: string, text: string): Promise<string> {
-		throw new Error(
-			`addComment is not implemented for the Linear PM provider (item '${id}', ${text.length} chars)`,
-		);
+		// Unlike GitHub Projects — whose board card has no comment thread, so the
+		// comment is redirected onto the backing Issue — a Linear issue *is* the
+		// card, and the comment lands natively on it. There is no backing artifact
+		// to resolve first, and no draft-item case that leaves nowhere to post.
+		return this.run(async () => {
+			const data = await linearGraphQL<CommentCreateResponse>(CREATE_COMMENT_MUTATION, {
+				input: { issueId: id, body: text },
+			});
+			const commentId = data.commentCreate?.comment?.id;
+			if (!data.commentCreate?.success || !commentId) {
+				throw new Error(`Linear rejected the request to comment on item '${id}'`);
+			}
+			return commentId;
+		});
 	}
 
 	async findComment(id: string, marker: string): Promise<string | undefined> {
-		throw new Error(
-			`findComment is not implemented for the Linear PM provider (item '${id}', marker '${marker}')`,
-		);
-	}
-
-	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
-		throw new Error(
-			`findWorkItemByDescriptionMarker is not implemented for the Linear PM provider (marker '${marker}')`,
-		);
+		return this.run(async () => {
+			// Every page, not just the first: an earlier delivery's marker can sit
+			// beyond page 1, and missing it would post a duplicate on a retry — the
+			// same reason GitHub Projects paginates its own comment scan. Substring
+			// match, because the marker lives at the comment's tail, not its start.
+			const comments = await collectLinearConnection<CommentNode>(async (cursor) => {
+				const data = await linearGraphQL<IssueCommentsResponse>(ISSUE_COMMENTS_QUERY, {
+					id,
+					cursor,
+				});
+				return data.issue?.comments ?? null;
+			});
+			return comments.find((comment) => comment.id && comment.body?.includes(marker))?.id;
+		});
 	}
 
 	async createWorkItem(input: CreateWorkItemInput): Promise<WorkItem> {
-		throw new Error(
-			`createWorkItem is not implemented for the Linear PM provider (title '${input.title}')`,
-		);
+		const stateId = requireStateIdForStatusKey(this.config, input.status);
+		const labels = input.labels ?? [];
+		return this.run(async () => {
+			// `IssueCreateInput` takes label *ids*, so every name has to be resolved
+			// (and created when the workspace has none) before the issue exists.
+			const labelIds: string[] = [];
+			for (const name of labels) {
+				labelIds.push(await this.ensureLabelId(name));
+			}
+			const data = await linearGraphQL<IssueCreateResponse>(CREATE_ISSUE_MUTATION, {
+				input: {
+					teamId: this.config.teamId,
+					title: input.title,
+					description: input.description,
+					stateId,
+					...(labelIds.length > 0 ? { labelIds } : {}),
+				},
+			});
+			const issue = data.issueCreate?.issue;
+			if (!data.issueCreate?.success || !issue?.id) {
+				throw new Error(`Linear rejected the request to create issue '${input.title}'`);
+			}
+			logger.debug('pm: created work item', { itemId: issue.id, status: input.status });
+			// One write, unlike GitHub Projects' create-then-place pair: `stateId` is
+			// part of the create. Mapped through `toWorkItem` so the fresh card reads
+			// exactly like one off a board read — the caller gets the same resolved
+			// `statusKey` and label shape. Its `taskRef` is unset and that is honest:
+			// a Linear issue is not an SCM artifact, and nothing has linked one to it
+			// yet (ai/ARCHITECTURE.md "Task identity").
+			return toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo);
+		});
 	}
 
 	async updateWorkItem(id: string, patch: UpdateWorkItemPatch): Promise<void> {
-		throw new Error(
-			`updateWorkItem is not implemented for the Linear PM provider (item '${id}', fields ${Object.keys(patch).join(', ')})`,
-		);
+		// Nothing to write is not an empty write: `issueUpdate` with an empty input
+		// would touch the issue's `updatedAt` for no reason.
+		if (patch.title === undefined && patch.description === undefined) return;
+		await this.run(async () => {
+			const data = await linearGraphQL<IssueUpdateResponse>(UPDATE_ISSUE_MUTATION, {
+				id,
+				input: {
+					...(patch.title !== undefined ? { title: patch.title } : {}),
+					...(patch.description !== undefined ? { description: patch.description } : {}),
+				},
+			});
+			requireMutationSuccess(data.issueUpdate?.success, `update item '${id}'`);
+		});
+		logger.debug('pm: updated work item', { itemId: id });
 	}
 
 	async addLabel(id: string, name: string): Promise<void> {
-		throw new Error(
-			`addLabel is not implemented for the Linear PM provider (item '${id}', label '${name}')`,
-		);
+		await this.run(async () => {
+			// Re-applying a label the issue already carries is contractually a no-op,
+			// so check before writing rather than leaning on how Linear happens to
+			// answer a repeated add. Compared case-insensitively, the way Linear
+			// itself compares label names.
+			const attached = await linearGraphQL<IssueLabelsResponse>(ISSUE_LABELS_QUERY, { id });
+			const already = (attached.issue?.labels?.nodes ?? []).some(
+				(node) => node?.name?.toLowerCase() === name.toLowerCase(),
+			);
+			if (already) return;
+			const labelId = await this.ensureLabelId(name);
+			// Linear's dedicated add mutation (`issueAddLabel(id:, labelId:)`, verified
+			// against the live schema) is a set insert. The alternative Cascade had to
+			// use — read `labels.nodes`, write the whole list back through
+			// `issueUpdate(labelIds:)` — loses any label a concurrent writer added
+			// between that read and the write; this has no such window.
+			const data = await linearGraphQL<IssueAddLabelResponse>(ADD_LABEL_MUTATION, { id, labelId });
+			requireMutationSuccess(data.issueAddLabel?.success, `label item '${id}' with '${name}'`);
+			logger.debug('pm: applied label', { itemId: id, label: name });
+		});
 	}
 
 	async listBlockers(id: string): Promise<WorkItemBlocker[]> {
-		throw new Error(`listBlockers is not implemented for the Linear PM provider (item '${id}')`);
+		return this.run(async () => {
+			// Two sources, deduplicated by URL so a prerequisite that is both linked
+			// and written down is reported once: Linear's own blocking relations, and
+			// the prerequisites the item names in prose.
+			const [native, mentioned] = await Promise.all([
+				this.fetchNativeBlockers(id),
+				this.fetchMentionedBlockers(id),
+			]);
+			return dedupeBlockers([...native, ...mentioned]);
+		});
 	}
 
 	async addBlockedBy(id: string, blockerId: string): Promise<void> {
-		throw new Error(
-			`addBlockedBy is not implemented for the Linear PM provider (item '${id}' blocked by '${blockerId}')`,
+		await this.run(async () => {
+			// Linear has no upsert for a relation, so idempotence comes from reading
+			// the relations it already holds — re-chaining a split's phases must not
+			// fail on a retry.
+			const existing = await this.fetchNativeBlockers(id);
+			if (existing.some((blocker) => blocker.id === blockerId)) return;
+			try {
+				// The *blocker* is the relation's source: the schema defines `issue` as
+				// "the source issue whose relationship is being described" and
+				// `relatedIssue` as its target, so `blockerId blocks id`.
+				const data = await linearGraphQL<IssueRelationCreateResponse>(CREATE_RELATION_MUTATION, {
+					input: { issueId: blockerId, relatedIssueId: id, type: BLOCKS_RELATION_TYPE },
+				});
+				requireMutationSuccess(
+					data.issueRelationCreate?.success,
+					`block item '${id}' by '${blockerId}'`,
+				);
+			} catch (error) {
+				// A relation recorded between the read above and this write: the pair is
+				// linked, which is exactly what the caller asked for.
+				if (!isDuplicateRelationError(error)) throw error;
+				return;
+			}
+			logger.debug('pm: linked blocked-by dependency', { itemId: id, blockerId });
+		});
+	}
+
+	/**
+	 * The issues Linear itself records as blocking this one.
+	 *
+	 * A `blocks` relation runs from the blocker to the blocked issue — the schema
+	 * calls `issue` "the source issue whose relationship is being described" and
+	 * `relatedIssue` its target — so the relations *pointing at* this issue are its
+	 * `inverseRelations`, and each blocker is that relation's `issue` side. Reading
+	 * `relations`, or taking the relation's `relatedIssue`, would each answer the
+	 * opposite question ("what do I block?") and gate nothing — so the test fixture
+	 * carries both sides of the relation and asserts which one comes back.
+	 *
+	 * Runs inside a credential scope (its callers do).
+	 */
+	private async fetchNativeBlockers(id: string): Promise<WorkItemBlocker[]> {
+		const relations = await collectLinearConnection<RelationNode>(async (cursor) => {
+			const data = await linearGraphQL<IssueBlockingRelationsResponse>(
+				ISSUE_BLOCKING_RELATIONS_QUERY,
+				{ id, cursor },
+			);
+			return data.issue?.inverseRelations ?? null;
+		});
+		return relations
+			.filter(
+				(relation): relation is RelationNode & { issue: BlockerIssueNode } =>
+					relation.type === BLOCKS_RELATION_TYPE && Boolean(relation.issue?.id),
+			)
+			.map((relation) => toBlocker(relation.issue, 'dependency'));
+	}
+
+	/**
+	 * The prerequisites the item *names in prose* — its own description and its
+	 * **human** comments. The heuristic is the shared, provider-neutral one
+	 * (`dependencyProse` + `findDependencyReferences`, `src/pm/dependencies.ts`),
+	 * which also excludes SWARM's own comments so a published plan's "requires
+	 * #266" never becomes a blocker nobody declared (issue #431); this adapter only
+	 * resolves each reference to a live open/closed state.
+	 *
+	 * **Known limitation:** the shared heuristic recognises the numeric `#N` and
+	 * `/issues/N` forms, not Linear's own `SWARM-491` identifier — widening it
+	 * would change GitHub's behaviour too, so it is out of scope here. A
+	 * prerequisite written only in Linear's own notation is therefore guarded by
+	 * the native relation above, not by this scan.
+	 *
+	 * Only the first page of comments is scanned, matching GitHub Projects: a
+	 * prose dependency buried past comment #100 is missed, but the native relation
+	 * and the description remain the durable guards, and this check runs on every
+	 * gated dispatch.
+	 *
+	 * Runs inside a credential scope (its callers do).
+	 */
+	private async fetchMentionedBlockers(id: string): Promise<WorkItemBlocker[]> {
+		const data = await linearGraphQL<IssueDependencyProseResponse>(ISSUE_DEPENDENCY_PROSE_QUERY, {
+			id,
+		});
+		const issue = data.issue;
+		if (!issue) return [];
+		const prose = dependencyProse(
+			issue.description ?? undefined,
+			(issue.comments?.nodes ?? []).map((node) => node?.body),
 		);
+		const refs = findDependencyReferences(prose).filter((ref) => ref !== String(issue.number));
+		const resolved = await Promise.all(refs.map((ref) => this.findBlockerByNumber(ref)));
+		return resolved.filter((blocker): blocker is WorkItemBlocker => blocker !== undefined);
+	}
+
+	/**
+	 * Resolve one referenced issue *number* to a blocker within this project's
+	 * team. A reference that resolves to nothing is skipped rather than raised: a
+	 * typo'd number, or one naming a GitHub issue rather than a Linear one, is not
+	 * a gate. Runs inside a credential scope (its callers do).
+	 */
+	private async findBlockerByNumber(ref: string): Promise<WorkItemBlocker | undefined> {
+		const number = Number(ref);
+		if (!Number.isSafeInteger(number)) return undefined;
+		const data = await linearGraphQL<BlockerIssuesResponse>(ISSUE_BY_NUMBER_QUERY, {
+			filter: this.issueFilter({ number }),
+		});
+		const issue = (data.issues?.nodes ?? []).find((node) => node?.id);
+		return issue ? toBlocker(issue, 'mention') : undefined;
+	}
+
+	/**
+	 * Resolve a label *name* to the id every Linear write takes, creating the label
+	 * when nothing in the workspace carries that name. Runs inside a credential
+	 * scope (its callers do).
+	 *
+	 * Create-if-missing tolerating a lost race, like GitHub Projects' `ensureLabel`:
+	 * a concurrent create that got there first leaves the label existing, which is
+	 * all the caller needs, so the duplicate-name rejection falls through to a
+	 * second lookup instead of failing the write it was preparing.
+	 */
+	private async ensureLabelId(name: string): Promise<string> {
+		const existing = await this.findLabelId(name);
+		if (existing) return existing;
+		try {
+			const data = await linearGraphQL<IssueLabelCreateResponse>(CREATE_LABEL_MUTATION, {
+				input: { teamId: this.config.teamId, name },
+			});
+			const created = data.issueLabelCreate?.issueLabel?.id;
+			if (data.issueLabelCreate?.success && created) return created;
+		} catch (error) {
+			if (!isDuplicateLabelNameError(error)) throw error;
+		}
+		const resolved = await this.findLabelId(name);
+		if (!resolved) {
+			throw new Error(`Linear label '${name}' could neither be resolved nor created`);
+		}
+		return resolved;
+	}
+
+	/**
+	 * The id of the label this project's issues would get for `name`, or
+	 * `undefined` when the workspace has none.
+	 *
+	 * Searched workspace-wide rather than through `team(id:) { labels }` because a
+	 * Linear label is either scoped to one team or shared across the workspace, and
+	 * an issue can carry either — a team-only lookup would miss a shared label and
+	 * then fail to create it, since Linear rejects the duplicate name. This team's
+	 * own label wins when both exist. Runs inside a credential scope (its callers do).
+	 */
+	private async findLabelId(name: string): Promise<string | undefined> {
+		const labels = await collectLinearConnection<LabelNode>(async (cursor) => {
+			const data = await linearGraphQL<FindLabelsResponse>(FIND_LABELS_QUERY, { name, cursor });
+			return data.issueLabels ?? null;
+		});
+		const usable = labels.filter(
+			(label) => label.id && (!label.team?.id || label.team.id === this.config.teamId),
+		);
+		return (usable.find((label) => label.team?.id === this.config.teamId) ?? usable[0])?.id;
 	}
 
 	async discover<C extends PMDiscoveryCapability>(
