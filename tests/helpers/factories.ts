@@ -16,6 +16,10 @@ import {
 } from '@/integrations/pm/github-projects/config-schema.js';
 import { resolveStatusKeyByOptionId } from '@/integrations/pm/github-projects/status-mapping.js';
 import {
+	type JiraIntegrationConfig,
+	jiraConfigSchema,
+} from '@/integrations/pm/jira/config-schema.js';
+import {
 	type LinearIntegrationConfig,
 	linearConfigSchema,
 } from '@/integrations/pm/linear/config-schema.js';
@@ -82,6 +86,27 @@ export function createMockLinearConfig(
 			inProgress: '24a31a62-af5f-449a-aa73-8e636a81e5a2',
 			inReview: '34f47bf9-0d47-4cc6-af6e-7a40d2fcc430',
 			done: '44a7a8b5-4c34-4668-a63e-47aa8f0fbcc5',
+		},
+		...overrides,
+	});
+}
+
+export function createMockJiraConfig(
+	overrides: Partial<JiraIntegrationConfig> = {},
+): JiraIntegrationConfig {
+	return jiraConfigSchema.parse({
+		baseUrl: 'https://example.atlassian.net',
+		projectKey: 'SWARM',
+		// Jira status ids are numeric strings (`fields.status.id`), and `10000`+ is the
+		// range a workflow's own statuses land in — the built-ins (`1` To Do, `3` In
+		// Progress, `10001` Done) share the low numbers across every site.
+		statusOptions: {
+			backlog: '10000',
+			planning: '10001',
+			todo: '10002',
+			inProgress: '3',
+			inReview: '10003',
+			done: '10004',
 		},
 		...overrides,
 	});
@@ -712,6 +737,31 @@ export function createMockLinearProjectConfig(
 			// both references here — without them `ProjectConfigSchema` rejects this
 			// fixture in any test file where the manifest is registered.
 			pm: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
+		},
+		...overrides,
+	});
+}
+
+export function createMockJiraProjectConfig(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
+	return ProjectConfigSchema.parse({
+		id: 'jira-project',
+		name: 'jira-project',
+		repo: 'SmartTechBrewery/swarm',
+		repoRoot: '/Users/dev/swarm/swarm',
+		pm: { type: 'jira', ...createMockJiraConfig() },
+		credentials: {
+			reviewer: 'SCM_TOKEN_REVIEWER',
+			webhookSecret: 'SCM_WEBHOOK_SECRET',
+			// Jira authenticates with basic auth, so its own roles are the email +
+			// API-token pair, plus the webhook secret its manifest will declare. All
+			// three are named here already: `ProjectConfigSchema` validates
+			// `credentials.pm` against the *registered* manifest, so the fixture has to
+			// be complete before that phase or every suite using it starts failing.
+			pm: {
+				email: 'JIRA_EMAIL',
+				apiToken: 'JIRA_API_TOKEN',
+				webhookSecret: 'JIRA_WEBHOOK_SECRET',
+			},
 		},
 		...overrides,
 	});

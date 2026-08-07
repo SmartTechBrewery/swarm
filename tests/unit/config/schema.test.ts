@@ -12,7 +12,11 @@ import {
 	type WorktreeRetentionConfig,
 } from '@/config/schema.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
-import { createMockLinearProjectConfig, createMockProjectConfig } from '../../helpers/factories.js';
+import {
+	createMockJiraProjectConfig,
+	createMockLinearProjectConfig,
+	createMockProjectConfig,
+} from '../../helpers/factories.js';
 
 describe('ProjectConfigSchema', () => {
 	it('accepts a fully-specified project', () => {
@@ -148,6 +152,34 @@ describe('ProjectConfigSchema', () => {
 					teamId: 'team-1',
 					statusOptions: { backlog: 'state-1' },
 					projectId: 'PVT_not-linear',
+				},
+			}),
+		).toThrow();
+	});
+
+	it('parses Jira mappings while rejecting missing or foreign fields', () => {
+		const jira = createMockJiraProjectConfig();
+		expect(jira.pm).toMatchObject({
+			type: 'jira',
+			baseUrl: 'https://example.atlassian.net',
+			projectKey: 'SWARM',
+		});
+
+		expect(() =>
+			ProjectConfigSchema.parse({
+				...jira,
+				pm: { type: 'jira', projectKey: 'SWARM', statusOptions: { backlog: '10000' } },
+			}),
+		).toThrow();
+		expect(() =>
+			ProjectConfigSchema.parse({
+				...jira,
+				pm: {
+					type: 'jira',
+					baseUrl: 'https://example.atlassian.net',
+					projectKey: 'SWARM',
+					statusOptions: { backlog: '10000' },
+					teamId: 'not-a-jira-field',
 				},
 			}),
 		).toThrow();
