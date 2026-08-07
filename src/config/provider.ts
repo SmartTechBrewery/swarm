@@ -12,6 +12,7 @@
 import { resolveProjectCredential } from '../db/repositories/credentialsRepository.js';
 import {
 	findProjectByBoardFromDb,
+	findProjectByPmContainerFromDb,
 	findProjectByRepoFromDb,
 } from '../db/repositories/projectsRepository.js';
 import { requireProjectPMCredentialRole } from '../integrations/pm/registry.js';
@@ -39,6 +40,22 @@ export async function findProjectByBoard(
 	projectNodeId: string,
 ): Promise<ProjectConfig | undefined> {
 	return findProjectByBoardFromDb(projectNodeId);
+}
+
+/**
+ * Resolve the SWARM project that owns a Linear **team**, by the team UUID
+ * (`pm.teamId`) a Linear board webhook carries. The Linear counterpart of
+ * {@link findProjectByBoard}: a team is Linear's board container, since workflow
+ * states belong to teams (`src/integrations/pm/linear/config-schema.ts`).
+ *
+ * Its own lookup rather than a shared one, because each provider names the
+ * container with its own `pm_config` key — the repository call is parameterised by
+ * both the provider id and that key, so two providers' blobs cannot collide
+ * (issue #529). Returns `undefined` for an untracked team — "not ours", not an
+ * error.
+ */
+export async function findProjectByLinearTeam(teamId: string): Promise<ProjectConfig | undefined> {
+	return findProjectByPmContainerFromDb('linear', 'teamId', teamId);
 }
 
 /**

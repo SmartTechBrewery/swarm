@@ -8,10 +8,12 @@ vi.mock('@/db/repositories/credentialsRepository.js', () => ({
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	findProjectByRepoFromDb: vi.fn(),
 	findProjectByBoardFromDb: vi.fn(),
+	findProjectByPmContainerFromDb: vi.fn(),
 }));
 
 import {
 	findProjectByBoard,
+	findProjectByLinearTeam,
 	findProjectByRepo,
 	getPersonaToken,
 	getPersonaTokenOrNull,
@@ -20,6 +22,7 @@ import {
 import { resolveProjectCredential } from '@/db/repositories/credentialsRepository.js';
 import {
 	findProjectByBoardFromDb,
+	findProjectByPmContainerFromDb,
 	findProjectByRepoFromDb,
 } from '@/db/repositories/projectsRepository.js';
 
@@ -36,6 +39,7 @@ describe('config provider', () => {
 		vi.mocked(resolveProjectCredential).mockReset();
 		vi.mocked(findProjectByRepoFromDb).mockReset();
 		vi.mocked(findProjectByBoardFromDb).mockReset();
+		vi.mocked(findProjectByPmContainerFromDb).mockReset();
 		delete process.env.SWARM_OPERATOR_GH_TOKEN;
 	});
 
@@ -56,6 +60,23 @@ describe('config provider', () => {
 			vi.mocked(findProjectByBoardFromDb).mockResolvedValue(project);
 			expect(await findProjectByBoard('PVT_kwHOAC3TF84BcNwD')).toBe(project);
 			expect(findProjectByBoardFromDb).toHaveBeenCalledWith('PVT_kwHOAC3TF84BcNwD');
+		});
+	});
+
+	describe('findProjectByLinearTeam', () => {
+		// Its own lookup rather than the board one (issue #529): the provider names
+		// both the `pm_type` it owns and the `pm_config` key that holds its container,
+		// so two providers' blobs cannot collide on a shared key.
+		it("delegates to the container lookup with Linear's provider id and container key", async () => {
+			vi.mocked(findProjectByPmContainerFromDb).mockResolvedValue(project);
+			expect(await findProjectByLinearTeam('team-uuid')).toBe(project);
+			expect(findProjectByPmContainerFromDb).toHaveBeenCalledWith('linear', 'teamId', 'team-uuid');
+			expect(findProjectByBoardFromDb).not.toHaveBeenCalled();
+		});
+
+		it('returns undefined for an untracked team', async () => {
+			vi.mocked(findProjectByPmContainerFromDb).mockResolvedValue(undefined);
+			expect(await findProjectByLinearTeam('team-unknown')).toBeUndefined();
 		});
 	});
 

@@ -1,6 +1,15 @@
 import { createHmac } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+// The board→project lookup belongs to the provider's adapter since issue #529, so
+// the real GitHub Projects adapter under test here resolves through this facade
+// rather than through a receiver dep.
+vi.mock('@/config/provider.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/config/provider.js')>()),
+	findProjectByBoard: vi.fn(),
+}));
+
+import { findProjectByBoard } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { githubProjectsManifest } from '@/integrations/pm/github-projects/index.js';
 import {
@@ -29,12 +38,10 @@ describe('createWebhookApp — PM routes come from the registry', () => {
 	function registryBackedApp() {
 		const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
 		const enqueuePm = vi.fn<WebhookReceiverDeps['enqueuePm']>().mockResolvedValue(undefined);
+		vi.mocked(findProjectByBoard).mockResolvedValue(project);
 		const app = createWebhookApp({
 			findProject: vi
 				.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
-				.mockResolvedValue(project),
-			findProjectByBoard: vi
-				.fn<(id: string) => Promise<ProjectConfig | undefined>>()
 				.mockResolvedValue(project),
 			getWebhookSecret: vi.fn<WebhookReceiverDeps['getWebhookSecret']>().mockResolvedValue(secret),
 			// The board half resolves the PM provider's own `webhookSecret` role (issue

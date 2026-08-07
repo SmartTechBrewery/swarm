@@ -11,13 +11,24 @@
  * Everything downstream of the seam — trigger routing, the worker — is a later
  * phase (see `enqueue.ts`).
  *
+ * The two sides order those steps differently, and both orderings are deliberate.
+ * A repo event names its project in the payload, so the SCM path parses, matches
+ * the repo, then authenticates. A board event carries no repo, so the PM path
+ * parses, resolves the project **through the provider's own
+ * `PMRouterAdapter.resolveProject`** (each provider knows which of its config keys
+ * names the container — the receiver holds no board lookup of its own, issue #529),
+ * then authenticates against that project's secret, then filters and
+ * loop-prevents. In both cases nothing but the project match happens before
+ * authentication, and no payload is trusted until it is authenticated.
+ *
  * The receiver names no provider and knows no provider's vocabulary: header names,
- * event names, payload shapes, signature framing, and both loop-prevention rules
- * live behind `SCMProvider` (`src/scm/types.ts`, issue #385) on the repo side and
- * behind `PMRouterAdapter` plus the manifest's own `verifyWebhookSignature`
- * (`src/pm/router-adapter.ts`, `src/integrations/pm/manifest.ts`, issues
- * #297/#496) on the board side. Adding Bitbucket, GitLab, Jira, or Trello adds a
- * manifest, not a branch here.
+ * event names, payload shapes, signature framing, container ids, and both
+ * loop-prevention rules live behind `SCMProvider` (`src/scm/types.ts`, issue #385)
+ * on the repo side and behind `PMRouterAdapter` plus the manifest's own
+ * `verifyWebhookSignature` (`src/pm/router-adapter.ts`,
+ * `src/integrations/pm/manifest.ts`, issues #297/#496/#529) on the board side.
+ * Adding Bitbucket, GitLab, Jira, Linear, or Trello adds a manifest, not a branch
+ * here.
  *
  * **A shared path makes a PM manifest a co-tenant, never a second handler.**
  * GitHub delivers `projects_v2_item` to the *same* URL with the same secret as its
@@ -46,7 +57,6 @@
 import { type Context, Hono } from 'hono';
 
 import {
-	findProjectByBoard,
 	findProjectByRepo,
 	getWebhookSecretOrNull,
 	resolvePmCredential,
@@ -108,8 +118,6 @@ export interface WebhookReceiverDeps {
 	 */
 	pmProviders: readonly PMProviderManifest[];
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;
-	/** Resolve the SWARM project owning a PM board, by the provider's container id. */
-	findProjectByBoard: (containerId: string) => Promise<ProjectConfig | undefined>;
 	/** The SCM webhook secret — the repo side's `credentials.webhookSecret` reference. */
 	getWebhookSecret: (project: ProjectConfig) => Promise<string | null>;
 	/**
@@ -140,7 +148,6 @@ function defaultDeps(): WebhookReceiverDeps {
 		scmProviders: listSCMProviders(),
 		pmProviders: listPMProviders(),
 		findProject: findProjectByRepo,
-		findProjectByBoard,
 		getWebhookSecret: getWebhookSecretOrNull,
 		getPmCredential: resolvePmCredential,
 		enqueue: enqueueScmEvent,
@@ -335,8 +342,16 @@ async function handleScmEvent(
  * it resolves the project by the board's container id (a board event carries no
  * repo) and filters to state-field changes before enqueueing. Every
  * provider-specific step is behind the PM manifest: `PMRouterAdapter`
- * (`src/pm/router-adapter.ts`) for the filters, `verifyWebhookSignature` for
- * authentication.
+ * (`src/pm/router-adapter.ts`) for the filters and the project lookup,
+ * `verifyWebhookSignature` for authentication.
+ *
+ * The project lookup goes through `PMRouterAdapter.resolveProject` — the contract
+ * method that exists for exactly this — rather than through a receiver-held board
+ * lookup (issue #529). The dep it replaced keyed on `pm_config->>'projectId'`,
+ * which is GitHub Projects' key for its container and nobody else's: each provider
+ * owns which of its own config keys names the board, so the receiver must not hold
+ * a provider-shaped lookup. GitHub Projects resolves through the very same query as
+ * before — its adapter calls it.
  */
 async function handlePmEvent(
 	c: Context,
@@ -347,7 +362,7 @@ async function handlePmEvent(
 	deliveryId: string | undefined,
 ): Promise<Response> {
 	// Untracked board → not ours. Ack without work (and before touching secrets).
-	const project = await deps.findProjectByBoard(event.containerId);
+	const project = await manifest.routerAdapter.resolveProject(event);
 	if (!project) {
 		return c.json({ ok: true, ignored: true, reason: 'board not tracked by any project' }, 202);
 	}
