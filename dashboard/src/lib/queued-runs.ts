@@ -265,6 +265,21 @@ export function hideBoardRowsWithActiveRun(
 	return rows.filter((row) => !isFreshBoardRowWithActiveRun(row, activeWorkItemUrls));
 }
 
+/**
+ * The wording of the collapsed group holding the board dispatches the server
+ * proved cannot start a phase (issue #570) — kept out of the queue itself, but
+ * counted so a pile-up of them is never invisible.
+ */
+export function noTriggerGroupLabel(count: number): string {
+	return count === 1
+		? '1 board event that starts no phase'
+		: `${count} board events that start no phase`;
+}
+
+/** Why a no-trigger row is listed apart from the queue rather than dropped. */
+export const NO_TRIGGER_GROUP_EXPLANATION =
+	'Recorded and queued as usual — each re-reads its card and settles as a no-trigger once a worker reaches it. Board changes SWARM itself makes (a card moved to In progress as a status report) and pure housekeeping (filing a card, reordering a column) land here.';
+
 const REVIEW_GATE_SOURCE_LABELS: Record<QueuedReviewGateSourceEvent, string> = {
 	'pull-request': 'Pull request',
 	checks: 'Checks',

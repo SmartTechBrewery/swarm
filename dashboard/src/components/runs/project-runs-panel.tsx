@@ -42,9 +42,11 @@ export function ProjectRunsPanel({ projectId }: ProjectRunsPanelProps) {
 
 	// Enqueued-but-not-yet-running work for this project (issue #238). Scoped to
 	// `projectId`; the Project column is dropped since every row is this project.
+	// `data.items` is the queue; `data.noTrigger` the board dispatches the server
+	// proved start no phase (issue #570), which don't pace the poll.
 	const queuedQuery = useQuery({
 		...trpc.runs.queued.queryOptions({ projectId }),
-		refetchInterval: (query) => queuedListRefetchInterval(query.state.data),
+		refetchInterval: (query) => queuedListRefetchInterval(query.state.data?.items),
 	});
 
 	const hasActiveFilters = !!(status || phase);
@@ -76,7 +78,12 @@ export function ProjectRunsPanel({ projectId }: ProjectRunsPanelProps) {
 				onClear={handleClearFilters}
 			/>
 
-			<QueuedRunsSection items={queuedQuery.data ?? []} showProject={false} projectId={projectId} />
+			<QueuedRunsSection
+				items={queuedQuery.data?.items ?? []}
+				noTriggerItems={queuedQuery.data?.noTrigger ?? []}
+				showProject={false}
+				projectId={projectId}
+			/>
 
 			{runsQuery.isLoading ? (
 				<div className="text-sm text-zinc-400">Loading runs history…</div>

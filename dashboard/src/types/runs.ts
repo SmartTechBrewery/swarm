@@ -100,7 +100,10 @@ export type Checkpoint = z.infer<typeof checkpointSchema>;
  *
  * `phaseHint` is best-effort (derived without a GitHub lookup), so it is NOT the
  * same closed set as {@link runPhaseFilterSchema}: `board` covers Planning/Impl
- * before authoritative dispatch, and `unknown` is a real value.
+ * before authoritative dispatch, and `unknown` is a real value — but only for an
+ * event kind the server couldn't classify. Whether a board dispatch can start a
+ * phase at all is a decided fact once its card has been read, and is carried by
+ * {@link queuedBoardOutcomeSchema} instead (issue #570).
  */
 export const queuedPhaseHintSchema = z.enum([
 	'board',
@@ -114,6 +117,17 @@ export const queuedPhaseHintSchema = z.enum([
 	'unknown',
 ]);
 export type QueuedPhaseHint = z.infer<typeof queuedPhaseHintSchema>;
+
+/**
+ * Mirrors `QueuedBoardOutcomeSchema` (`src/queue/queued-runs.ts`, issue #570):
+ * what a live board read proved about a fresh board dispatch — `starts-phase`
+ * when the card's current status maps to Planning/Implementation, `no-trigger`
+ * when it maps to none (SWARM's own `inProgress` status report echoing back, a
+ * card being filed, a backlog reorder). Absent means undetermined: no board read,
+ * a failed one, or a dispatch whose phase the board no longer decides.
+ */
+export const queuedBoardOutcomeSchema = z.enum(['starts-phase', 'no-trigger']);
+export type QueuedBoardOutcome = z.infer<typeof queuedBoardOutcomeSchema>;
 
 /**
  * The queue-facing state of a waiting dispatch (mirrors
@@ -185,6 +199,8 @@ export const queuedRunSchema = z.object({
 	workItemNodeId: z.string().optional(),
 	/** `pm` jobs only — the provider's display-only content descriptor (`Issue`, `PullRequest`, …). */
 	contentType: z.string().optional(),
+	/** `pm` jobs only — what a board read proved about this dispatch's trigger (issue #570). */
+	boardOutcome: queuedBoardOutcomeSchema.optional(),
 	/** Resolved backing Issue/PR title for a board job, when available. */
 	workItemTitle: z.string().optional(),
 	/** Resolved backing Issue/PR URL for a board job, when available. */

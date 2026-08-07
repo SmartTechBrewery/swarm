@@ -176,7 +176,7 @@ import {
 	requestRunCancellation,
 } from '@/queue/cancellation.js';
 import type { SwarmJob } from '@/queue/jobs.js';
-import { toQueuedRuns } from '@/queue/queued-runs.js';
+import { type QueuedRun, toQueuedRuns } from '@/queue/queued-runs.js';
 import { reconcileTerminatedWorktree } from '@/worktree/termination-cleanup.js';
 import {
 	createMockPmEvent,
@@ -529,13 +529,19 @@ describe('runsRouter', () => {
 
 			const result = await caller.queued({});
 
-			expect(result).toEqual([
-				{
-					...queuedItem,
-					workItemTitle: 'Fix the widget',
-					workItemUrl: 'https://github.com/acme/widgets/issues/42',
-				},
-			]);
+			expect(result).toEqual({
+				items: [
+					{
+						...queuedItem,
+						workItemTitle: 'Fix the widget',
+						workItemUrl: 'https://github.com/acme/widgets/issues/42',
+						// The card's status maps to a phase, so the read model's `board` hint
+						// stands and the row is queued work (issue #570).
+						boardOutcome: 'starts-phase',
+					},
+				],
+				noTrigger: [],
+			});
 			expect(listWaitingDispatches).toHaveBeenCalledWith(undefined);
 			expect(getProjectByIdFromDb).toHaveBeenCalledWith('p1');
 			expect(getPMProvider).toHaveBeenCalledWith('github-projects');
@@ -567,7 +573,9 @@ describe('runsRouter', () => {
 			vi.mocked(toQueuedRuns).mockReturnValue([queuedItem]);
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
 
-			expect(await caller.queued({})).toEqual([queuedItem]);
+			// Fails open (issue #570): with no board read there is nothing proven about
+			// the row, so it carries no `boardOutcome` and stays in the queue.
+			expect(await caller.queued({})).toEqual({ items: [queuedItem], noTrigger: [] });
 		});
 
 		it('passes reviewGate metadata through unchanged alongside normal github enrichment (issue #275)', async () => {
@@ -596,7 +604,7 @@ describe('runsRouter', () => {
 			// the item (reviewGate included) is returned exactly as the read model built it.
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
 
-			expect(await caller.queued({})).toEqual([queuedItem]);
+			expect(await caller.queued({})).toEqual({ items: [queuedItem], noTrigger: [] });
 		});
 
 		it('propagates the project-specific prioritizeContinuations policy when scoped', async () => {
@@ -629,6 +637,155 @@ describe('runsRouter', () => {
 			await caller.queued({});
 
 			expect(toQueuedRuns).toHaveBeenCalledWith(expect.any(Array), { p1: false, p2: true });
+		});
+
+		// Issue #570: every board status change SWARM itself makes (Implementation
+		// moving a card to `In progress` as a status report) and every human board
+		// operation with no pipeline meaning (filing a card, reordering a column)
+		// arrives as a durable board dispatch that cannot become a run. The board read
+		// this enrichment already performs proves that, so such a row is reported apart
+		// from the queue instead of listed as pending work under the running task's
+		// title. Each test uses its own board node id: the read cache is module state
+		// that outlives an individual test.
+		describe('board dispatches proven to start no phase (issue #570)', () => {
+			function boardItem(overrides: Partial<QueuedRun> = {}): QueuedRun {
+				return {
+					jobId: 'dispatch-board',
+					projectId: 'p1',
+					type: 'pm',
+					providerId: 'github-projects',
+					state: 'prioritized',
+					phaseHint: 'board',
+					workItemNodeId: 'PVTI_item',
+					contentType: 'Issue',
+					priority: 10,
+					continuation: false,
+					prioritizeContinuations: true,
+					enqueuedAt: '2026-08-07T10:22:22.000Z',
+					availableAt: '2026-08-07T10:22:22.000Z',
+					...overrides,
+				};
+			}
+
+			/** A card whose status maps to no pipeline phase — `In progress` (`47fc9ee4`). */
+			function inProgressCard() {
+				return createMockWorkItem({
+					title: "Phase 4/6: Run the control-plane host's worker through the DB-free entrypoint",
+					url: 'https://github.com/SmartTechBrewery/swarm/issues/551',
+					statusId: '47fc9ee4',
+				});
+			}
+
+			function stubBoardReads(getWorkItem: ReturnType<typeof vi.fn>) {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				vi.mocked(getPMProvider).mockReturnValue({
+					createProvider: () => ({ getWorkItem }),
+				} as never);
+			}
+
+			it('keeps such a dispatch out of the queue and reports it apart, still labelled board', async () => {
+				const item = boardItem({ jobId: 'dispatch-echo', workItemNodeId: 'PVTI_echo' });
+				const getWorkItem = vi.fn().mockResolvedValue(inProgressCard());
+				vi.mocked(toQueuedRuns).mockReturnValue([item]);
+				stubBoardReads(getWorkItem);
+
+				const result = await caller.queued({});
+
+				expect(result.items).toEqual([]);
+				expect(result.noTrigger).toEqual([
+					{
+						...item,
+						workItemTitle:
+							"Phase 4/6: Run the control-plane host's worker through the DB-free entrypoint",
+						workItemUrl: 'https://github.com/SmartTechBrewery/swarm/issues/551',
+						boardOutcome: 'no-trigger',
+					},
+				]);
+				// A decided case is never reported as an absence of knowledge: the phase
+				// hint stays `board` and `unknown` is left for what the server can't decide.
+				expect(result.noTrigger[0].phaseHint).toBe('board');
+				// A view, not a lifecycle: the dispatch is read exactly as before and the
+				// row it reports apart is neither cancelled nor otherwise touched.
+				expect(listWaitingDispatches).toHaveBeenCalledWith(undefined);
+				expect(cancelDispatchAndWake).not.toHaveBeenCalled();
+				expect(cancelDispatchForRun).not.toHaveBeenCalled();
+				expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			});
+
+			it('never filters a dispatch the board no longer decides — a deferred retry or a resolved phase', async () => {
+				const deferred = boardItem({
+					jobId: 'dispatch-deferred',
+					workItemNodeId: 'PVTI_deferred',
+					phaseHint: 'implementation',
+					runId: 'run-9',
+					state: 'delayed',
+				});
+				const resolved = boardItem({
+					jobId: 'dispatch-resolved',
+					workItemNodeId: 'PVTI_resolved',
+					phaseHint: 'planning',
+				});
+				// Both cards sit in `In progress` — for the deferred Implementation retry
+				// because that phase itself moved the card there.
+				const getWorkItem = vi.fn().mockResolvedValue(inProgressCard());
+				vi.mocked(toQueuedRuns).mockReturnValue([deferred, resolved]);
+				stubBoardReads(getWorkItem);
+
+				const result = await caller.queued({});
+
+				expect(result.noTrigger).toEqual([]);
+				expect(result.items.map((row) => row.jobId)).toEqual([
+					'dispatch-deferred',
+					'dispatch-resolved',
+				]);
+				expect(result.items.every((row) => row.boardOutcome === undefined)).toBe(true);
+			});
+
+			it('re-reads the board for a dispatch enqueued after the cached read, so a fresh trigger is never hidden', async () => {
+				vi.useFakeTimers();
+				try {
+					vi.setSystemTime(new Date('2026-08-07T10:22:22.000Z'));
+					const getWorkItem = vi
+						.fn()
+						.mockResolvedValueOnce(inProgressCard())
+						// The same card, now dragged to `Ready` (`61e4505c` — the `todo` key
+						// Implementation is triggered from).
+						.mockResolvedValueOnce(createMockWorkItem({ statusId: '61e4505c' }));
+					stubBoardReads(getWorkItem);
+					vi.mocked(toQueuedRuns).mockReturnValue([
+						boardItem({
+							jobId: 'dispatch-echo',
+							workItemNodeId: 'PVTI_shared',
+							enqueuedAt: '2026-08-07T10:22:22.000Z',
+						}),
+					]);
+
+					const echo = await caller.queued({});
+					expect(echo.items).toEqual([]);
+					expect(echo.noTrigger).toHaveLength(1);
+
+					// Five seconds later — well inside the 30 s read cache — the operator
+					// drags the card to Ready and its webhook lands as a new dispatch. The
+					// cached `no-trigger` says nothing about a dispatch that didn't exist
+					// when it was taken, so this one must not inherit it.
+					vi.setSystemTime(new Date('2026-08-07T10:22:32.000Z'));
+					vi.mocked(toQueuedRuns).mockReturnValue([
+						boardItem({
+							jobId: 'dispatch-todo',
+							workItemNodeId: 'PVTI_shared',
+							enqueuedAt: '2026-08-07T10:22:27.000Z',
+						}),
+					]);
+
+					const trigger = await caller.queued({});
+					expect(trigger.noTrigger).toEqual([]);
+					expect(trigger.items).toHaveLength(1);
+					expect(trigger.items[0].boardOutcome).toBe('starts-phase');
+					expect(getWorkItem).toHaveBeenCalledTimes(2);
+				} finally {
+					vi.useRealTimers();
+				}
+			});
 		});
 	});
 
@@ -2126,7 +2283,7 @@ describe('runsRouter', () => {
 				] as never);
 
 				const result = await ordinary.queued({});
-				expect(result).toEqual([{ projectId: 'p1', type: 'github' }]);
+				expect(result).toEqual({ items: [{ projectId: 'p1', type: 'github' }], noTrigger: [] });
 			});
 		});
 
