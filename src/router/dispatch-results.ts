@@ -101,7 +101,12 @@ export function awaitDispatchResult(
 export function deliverDispatchResult(result: TaskExecutionResult): boolean {
 	const entry = pending.get(result.dispatchId);
 	if (!entry) {
-		logger.debug('dispatch back-channel: result for a dispatch not awaited here — dropping', {
+		// `warn`, not `debug`: a dropped terminal result means the run it belongs to is
+		// no longer being settled by anyone, so it waits out `RESULT_WAIT_MARGIN_MS` and
+		// lands as a timeout however well the phase actually went. The benign readings
+		// (already settled, or awaited on another router) are worth the line too — a
+		// second router settling SWARM's dispatches is itself something to know about.
+		logger.warn('dispatch back-channel: result for a dispatch not awaited here — dropping', {
 			dispatchId: result.dispatchId,
 			status: result.status,
 		});

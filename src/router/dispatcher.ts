@@ -269,6 +269,7 @@ function awaitResultWithGuards(
 	signal: AbortSignal,
 	selection: DispatchSelection,
 	waitMs: number,
+	dispatchId: string,
 ): Promise<TaskExecutionResult> {
 	return new Promise<TaskExecutionResult>((resolve, reject) => {
 		const abort = (reason: string): void => {
@@ -281,11 +282,20 @@ function awaitResultWithGuards(
 				),
 			);
 		};
-		const timer = setTimeout(
-			() =>
-				abort(`Worker '${selection.workerName}' did not report a result within the lease window`),
-			waitMs,
-		);
+		const timer = setTimeout(() => {
+			// Logged where it happens, not inferred later from the settle time: this is
+			// the branch that turns "the worker never reported" into a phase failure, and
+			// it looks identical in the run row to a phase that genuinely failed. The
+			// pair to look for is this line with no matching "assignment phase finished —
+			// sending result" on the worker (`src/transport/assignment-execution.ts`).
+			logger.warn('dispatch back-channel: no result within the lease window — failing', {
+				dispatchId,
+				workerId: selection.workerId,
+				worker: selection.workerName,
+				waitMs,
+			});
+			abort(`Worker '${selection.workerName}' did not report a result within the lease window`);
+		}, waitMs);
 		const onAbort = (): void => abort('Control plane is shutting down');
 		const cleanup = (): void => {
 			clearTimeout(timer);
@@ -404,6 +414,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 			signal,
 			selection,
 			timeoutMs + RESULT_WAIT_MARGIN_MS,
+			dispatch.id,
 		);
 		return adaptResultToPhaseRun(
 			result,

@@ -405,6 +405,13 @@ export async function cleanupUnlessPreserved(
 	phaseName: string,
 	runId?: string,
 ): Promise<void> {
+	// Bracketed by logs because this runs in the phase's `finally`, *after* the last
+	// board write and *before* the worker reports its result — so on a phase that
+	// completed its delivery and then never reported, the pair "entering"/"done" is
+	// what distinguishes a phase still stuck in here from one that returned and
+	// failed to send. Both are `debug`: this is a per-run, per-phase pair, not noise
+	// worth promoting.
+	logger.debug(`${phaseName}: settling the worktree`, { taskId, runId, preserveForResume });
 	try {
 		const isCancelled = runId ? await worktrees.isCancellationRequested(runId) : false;
 		if (preserveForResume || isCancelled) {
@@ -413,6 +420,7 @@ export async function cleanupUnlessPreserved(
 			return;
 		}
 		await worktrees.cleanup(taskId);
+		logger.debug(`${phaseName}: worktree settled`, { taskId, runId });
 	} catch (error) {
 		logger.error(`${phaseName}: worktree cleanup failed`, {
 			taskId,

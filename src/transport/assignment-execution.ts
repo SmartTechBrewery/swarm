@@ -711,6 +711,17 @@ export async function runAssignmentDbFree(
 				` for task '${taskId}'`,
 			);
 		}
+		// Logged because the *absence* of this line is the only evidence that a phase
+		// finished its work and then never reported it — the failure that leaves a
+		// dispatch waiting out `RESULT_WAIT_MARGIN_MS` and settles a successful run as
+		// a timeout. The failure path below already logs; without this one, "did the
+		// worker send its result?" cannot be answered from a worker log at all.
+		deps.logger.info('assignment phase finished — sending result', {
+			dispatchId,
+			runId,
+			phase,
+			taskId,
+		});
 		sink.send(succeededResult(assignment, result));
 	} catch (err) {
 		deps.logger.warn('assignment phase failed', {
