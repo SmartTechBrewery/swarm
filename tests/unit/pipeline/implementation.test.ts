@@ -484,6 +484,7 @@ describe('runImplementationPhase', () => {
 			'checkpoint',
 			'prior-19',
 			'implementation',
+			'issue-19',
 		);
 		// The adopted checkout is used as-is.
 		expect(deps.worktrees.provision).not.toHaveBeenCalled();

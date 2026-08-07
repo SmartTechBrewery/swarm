@@ -355,6 +355,7 @@ async function acquireImplementationWorktree(
 			recoveryMode,
 			resumeSessionId,
 			'implementation',
+			branch,
 		);
 		if (reuseHandle) {
 			return {
