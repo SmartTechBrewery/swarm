@@ -2,12 +2,15 @@
  * `swarm status` — a quick health snapshot: the stack's container states
  * (`docker compose ps`) plus a probe of the router's `/health` endpoint on the
  * published host port (`ROUTER_PORT`, default 3100 — see `.env.docker.example`).
- * The worker isn't shown: it runs on the host outside Compose.
+ * The worker's own process isn't shown: it runs on the host outside Compose. Its
+ * *readiness to be dispatched to* is, since a host with no registered worker is
+ * the one failure a healthy-looking stack hides (issue #552).
  */
 
 import { runCommand } from '../_shared/exec.js';
 import * as out from '../_shared/output.js';
 import { REPO_ROOT } from '../_shared/paths.js';
+import { reportWorkerReadiness } from '../_shared/worker-readiness.js';
 
 const HEALTH_TIMEOUT_MS = 2000;
 
@@ -33,6 +36,7 @@ export async function run(_argv: string[]): Promise<number> {
 
 	const port = process.env.ROUTER_PORT ?? '3100';
 	await probeRouterHealth(port);
+	await reportWorkerReadiness();
 
 	return psCode;
 }

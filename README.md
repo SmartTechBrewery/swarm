@@ -43,11 +43,11 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   whole pool, so a phase several machines can run does not consume the one machine
   another waiting phase needs (issue #533). **Planning is
   central** — it is never routed by assignment, because only a worker with
-  database access can run it (issue #469). (When single-user mode is enabled via
-  `SWARM_SINGLE_USER_MODE=true`, this entire federated dispatch gate is bypassed
-  and every phase executes locally on the host worker without a credential.)
-  When single-user mode is disabled, each federated host must authenticate with
-  the credential printed once by `swarm workers register`
+  database access can run it (issue #469). **The gate has one rule for every
+  deployment** — a single-user install registers and enrolls its one local worker
+  exactly as anyone else does (issue #552); `SWARM_SINGLE_USER_MODE` is the API's
+  authentication policy and no longer bypasses dispatch. Each host authenticates
+  with the credential printed once by `swarm workers register`
   (`SWARM_WORKER_CREDENTIAL`); the selected host atomically reserves capacity
   before the phase can start. A project with no enrolled workers is
   unfederated and runs locally as before.
@@ -98,22 +98,41 @@ npm run db:seed                   # loads swarm.config.json into Postgres
 > **Local single-user mode is on by default.** The `.env.docker.example` template
 > sets `SWARM_SINGLE_USER_MODE=true`, so this local install needs **no dashboard
 > user, no password, no `/login`, and no session cookie**: the API bootstraps a
-> passwordless `localhost-admin` and signs you straight into the dashboard. It
-> also routes **every pipeline phase through this host worker**, so dispatch needs
-> **no worker credential, no worker-project enrollment, no admin approval, no
-> assignee linking, and no sharing consent** — the federated roster is skipped
-> even if worker/enrollment rows exist. Skip the account commands below.
+> passwordless `localhost-admin` and signs you straight into the dashboard. Skip
+> the account commands below.
+>
+> **It is an authentication policy, and nothing more** (issue #552). It does *not*
+> change how work is dispatched: this install registers and enrolls its one local
+> worker exactly as a multi-user one does (the three commands under **Register
+> this machine as a worker** below), because worker selection has a single rule
+> for every deployment. Without that worker, phases queue up with nothing to run
+> them — `swarm start` and `swarm status` say so.
 >
 > **Multi-user alternative.** Set `SWARM_SINGLE_USER_MODE=false` in `.env` (or
-> remove the line) to restore the full federated policy — per-user session auth
-> *and* the complete enrollment/consent/affinity/capacity dispatch gate. Then
-> create your dashboard user and set its login password before signing in at
-> `/login`:
+> remove the line) to require per-user session auth instead. Then create your
+> dashboard user and set its login password before signing in at `/login`:
 >
 > ```bash
 > npm run swarm -- users add you@example.com --admin    # create your dashboard user, then
 > npm run swarm -- users set-password you@example.com   # set its login password (prompts, no echo)
 > ```
+
+**Register this machine as a worker.** Every deployment does this — a
+single-user install runs the same commands as a multi-user one, because a phase
+runs on an enrolled worker or it waits (issue #552). In single-user mode the
+owner is the bootstrapped `localhost-admin` account, which exists once the API
+has served a request (start `npm run dev:api` and open the dashboard first, or
+use a user you created with `swarm users add`):
+
+```bash
+npm run swarm -- workers register localhost-admin --name "this machine" --cli claude
+npm run swarm -- workers enroll <worker-id> <project-id> --cli claude --active --consent
+```
+
+`workers register` prints a credential **once** — put it in `.env` as
+`SWARM_WORKER_CREDENTIAL` before starting the worker. `swarm start` and `swarm
+status` warn when this host has no usable credential. The full runbook, including
+someone else's machine, is [`docs/onboarding-worker.md`](./docs/onboarding-worker.md).
 
 Start these processes in separate terminals:
 
@@ -192,13 +211,12 @@ Open <http://localhost:5173>. For a compiled self-hosted dashboard, run
 The worker is intentionally host-run: it needs local Git worktrees, agent CLI
 authentication, and the developer's PATH. With local single-user mode on (the
 Docker template default) the dashboard opens straight in as `localhost-admin`
-with no `/login` step, and every pipeline phase runs on this host worker without
-consulting the federated roster — no enrollment, consent, or assignee affinity.
-With it disabled the dashboard uses per-user session auth (sign in at `/login`
-with a user created via `swarm users`, above) and dispatch enforces the full
-federated eligibility/fencing/affinity/capacity gate; `/health` is
+with no `/login` step; with it disabled the dashboard uses per-user session auth
+(sign in at `/login` with a user created via `swarm users`, above). `/health` is
 unauthenticated either way, while every API request in multi-user mode carries
-an HTTP-only session cookie. See
+an HTTP-only session cookie. Dispatch is unaffected by that choice: both modes
+enforce the same federated eligibility/fencing/affinity/capacity gate against
+this host's registered worker. See
 [`docs/operations.md`](./docs/operations.md) for health
 checks, ports, webhook setup, and troubleshooting.
 

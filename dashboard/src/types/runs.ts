@@ -299,7 +299,7 @@ export interface RunRow {
 	 */
 	producedPrUrl: string | null;
 	phase: string;
-	/** The worker that executed this run; null for an unfederated/single-user run and pre-existing rows. */
+	/** The worker that executed this run; null for an unfederated run and pre-existing rows. */
 	workerId: string | null;
 	/**
 	 * Display name of the worker machine that executed this run, resolved

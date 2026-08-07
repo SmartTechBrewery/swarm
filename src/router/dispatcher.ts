@@ -22,11 +22,17 @@
  *    a `PhaseRunResult` (or throwing so the shared failure path defers/fails it).
  *
  * Plus the transport-connectivity `gateOptions` (only socket-connected workers
- * are selectable) and `federatedOnly` (no local executor here, so an
- * unfederated/single-user project defers durably rather than running on the
- * router). With no eligible/connected worker the durable dispatch stays `pending`
- * in Postgres via the existing `WorkerIneligibleError` token-free deferral —
- * exactly as the in-process federated path already behaves.
+ * are selectable) and `federatedOnly` (no local executor here, so an unfederated
+ * project defers durably rather than running on the router). With no
+ * eligible/connected worker the durable dispatch stays `pending` in Postgres via
+ * the existing `WorkerIneligibleError` token-free deferral — exactly as the
+ * in-process federated path already behaves.
+ *
+ * **Single-user installs dispatch over this path too** (issue #552). The gate no
+ * longer bypasses itself when `SWARM_SINGLE_USER_MODE` is set, so a single-user
+ * deployment registers and enrolls its one local worker like any other and is
+ * routed to it here, instead of the mode's former bypass resolving no selection
+ * and leaving every dispatch durably pending.
  *
  * Cancellation crosses the same transport (issue #549): this consumer subscribes
  * to run cancellations and pushes a `task-cancel` to the worker executing the run

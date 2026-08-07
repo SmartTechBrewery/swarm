@@ -1493,7 +1493,7 @@ export function GitHubReferences({ run, project }: GitHubReferencesProps) {
  * issue #446): the worker machine and the SWARM user who owns it, resolved
  * server-side into `run.attribution`.
  *
- * A run with no recorded worker — unfederated / single-user, and every row
+ * A run with no recorded worker — unfederated, and every row
  * predating the columns — renders the same neutral `—` the other optional fields
  * use. A recorded worker whose row no longer resolves falls back to its id in the
  * muted mono style used for the project id, so the record is never silently lost,

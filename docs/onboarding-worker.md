@@ -1,8 +1,8 @@
-# Onboarding a new user + remote worker
+# Onboarding a worker
 
-A step-by-step runbook for adding **another person's machine** as a worker once
-the instance is already running in **federated (`transport`) dispatch mode**
-(`SWARM_DISPATCH_MODE=transport`, ADR-003 §2 — see
+A step-by-step runbook for making a machine — **this one or somebody else's** —
+a worker on an instance already running in **federated (`transport`) dispatch
+mode** (`SWARM_DISPATCH_MODE=transport`, ADR-003 §2 — see
 [`docs/configuration.md`](./configuration.md) and
 [`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#remote-worker-transport-worker)).
 Turning the instance into federated mode in the first place — the control-plane
@@ -10,13 +10,25 @@ Turning the instance into federated mode in the first place — the control-plan
 one-time admin-side change and out of scope here; this doc assumes that part is
 already done and the router is healthy with its dispatch consumer running.
 
+**Every deployment does this, including a single-user install** (issue #552).
+`SWARM_SINGLE_USER_MODE` is the API's authentication policy; it does not bypass
+the dispatch gate, so the control-plane host's own worker is registered and
+enrolled by these same commands. A host with no registered worker has nothing to
+run phases on and its dispatches wait durably — which is what `swarm start` /
+`swarm status` warn about.
+
 Everything in **Part 1** runs on the **admin machine** (it has `DATABASE_URL`).
-Everything in **Part 2** runs on the **new person's machine** and needs nothing
-but the credential Part 1 prints.
+Everything in **Part 2** runs on the **worker's own machine** — which may be the
+admin machine itself — and needs nothing but the credential Part 1 prints.
 
 ---
 
 ## Part 1 — admin machine: register the user + worker
+
+For a **single-user install**, skip steps 1 and 2 and run steps 3 and 4 with
+`localhost-admin` as `<email>`: that is the bootstrapped account the API resolves
+every request to (created the first time it serves one), and being an
+installation admin it needs no project membership of its own.
 
 ```bash
 # 1. Create the user and set their dashboard login password

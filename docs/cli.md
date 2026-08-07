@@ -98,6 +98,13 @@ Bring up the local stack (postgres, redis, router) via Docker Compose. `--build`
 rebuilds images first. The worker is intentionally not started (it runs on the
 host).
 
+Finishes with a **worker-readiness** check (issue #552): every deployment
+dispatches to a registered, enrolled worker, so an unset `SWARM_WORKER_CREDENTIAL`
+— or one matching no registered worker — is reported together with the
+`swarm workers register` / `swarm workers enroll` commands that fix it. Advice
+only: it never changes the exit code, and a database this command cannot reach
+leaves the check silent rather than guessing.
+
 ### `swarm stop`
 
 ```bash
@@ -116,7 +123,9 @@ swarm status
 
 A quick health snapshot: the stack's container states (`docker compose ps`) plus
 a probe of the router's `/health` endpoint on the published host port
-(`ROUTER_PORT`, default 3100). The worker isn't shown (it runs on the host).
+(`ROUTER_PORT`, default 3100). The worker's process isn't shown (it runs on the
+host), but the same worker-readiness check `swarm start` performs is — a healthy
+stack with no registered worker is the one failure the container states hide.
 
 ### `swarm logs`
 
