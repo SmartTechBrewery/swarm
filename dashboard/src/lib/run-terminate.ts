@@ -18,9 +18,58 @@ export function canTerminateRun(status: string): boolean {
 	return status === 'running' || status === 'deferred' || status === 'checkpointed';
 }
 
-/** Confirm-button label: reads "Terminating…" while the mutation is pending. */
-export function terminateButtonLabel(isPending: boolean): string {
+/**
+ * Button label. `requestOutstanding` — the run-scoped fact that a termination
+ * request has been accepted and hasn't taken effect (issue #561) — wins over the
+ * mutation's own `isPending`, because it outlives it: the HTTP call answers in
+ * milliseconds while the wait for the worker to notice and unwind can run to the
+ * run's agent timeout. Naming the *wait* rather than the action is what stops the
+ * button reading as one that did nothing.
+ */
+export function terminateButtonLabel(isPending: boolean, requestOutstanding = false): string {
+	if (requestOutstanding) return 'Waiting to stop…';
 	return isPending ? 'Terminating…' : 'Terminate';
+}
+
+/**
+ * What the operator is waiting for once a termination request is accepted
+ * (issue #561) — the explanation the disabled button carries, so a slow
+ * cancellation reads as "waiting" rather than "broken".
+ *
+ * `hasDeadline` swaps the closing sentence for the one that fits: a bound the
+ * operator can see, or — for a legacy run that recorded no agent timeout — the
+ * stale-run reconciliation that still bounds a request a worker never receives.
+ * The timestamp itself is formatted by the component (like the
+ * deferred/checkpointed callouts already do), so this copy stays
+ * locale-independent.
+ */
+export function describeTerminateWait(hasDeadline: boolean): string {
+	const base =
+		'The termination request was recorded. It takes effect once the run’s worker sees it and aborts the agent — this page updates as soon as the run settles.';
+	return hasDeadline
+		? `${base} The run’s agent timeout is the outer bound on that wait.`
+		: `${base} This run did not record its agent timeout. The periodic stale-run sweep still reaps a stuck run after the default agent timeout plus its grace period.`;
+}
+
+/**
+ * The pending-request callout is the one place where a timeout can visibly be
+ * overdue while the run is still marked running. Keep shared future-time copy
+ * unchanged for retry dates, but make this state honest about the missed bound.
+ */
+export function formatPendingRequestWaitUntil(waitUntil: string, now = Date.now()): string {
+	const diffMs = new Date(waitUntil).getTime() - now;
+	if (diffMs >= 0) {
+		const diffMin = Math.ceil(diffMs / 60_000);
+		if (diffMin <= 1) return 'shortly';
+		if (diffMin < 60) return `in ${diffMin} min`;
+		return `in ~${Math.round(diffMin / 60)} h`;
+	}
+
+	const elapsedSeconds = Math.round(-diffMs / 1000);
+	if (elapsedSeconds < 60) return 'overdue by under a minute';
+	const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+	if (elapsedMinutes < 60) return `overdue by ${elapsedMinutes} min`;
+	return `overdue by ~${Math.round(elapsedMinutes / 60)} h`;
 }
 
 /**

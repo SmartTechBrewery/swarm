@@ -246,6 +246,26 @@ export interface RunAttribution {
 	userDisplayName: string | null;
 }
 
+/**
+ * Mirrors the server `PendingRunRequest` (`src/api/routers/runs.ts`, issue #561):
+ * an operator request against the run that has been accepted but has not taken
+ * effect yet, so the matching button must stay disabled and say what it is
+ * waiting for.
+ *
+ * *Derived* server-side on every `runs.getById` read — from the durable Redis
+ * cancellation marker for a `running` run, and from the run's waiting
+ * `manual-retry` dispatch otherwise — not a column, and never the local
+ * mutation's lifetime. That is what makes it survive a reload and read the same
+ * for every viewer of the run rather than only the operator who clicked.
+ */
+export interface PendingRunRequest {
+	action: 'terminate' | 'restart';
+	/** ISO 8601 — when the request was recorded; null when only the bare marker exists. */
+	requestedAt: string | null;
+	/** ISO 8601 upper bound of the wait, when the run records one; null otherwise. */
+	waitUntil: string | null;
+}
+
 export interface RunRow {
 	id: string;
 	projectId: string;
@@ -383,6 +403,13 @@ export interface RunRow {
 	 * pre-existing row. Mirrors the `cancellation` column.
 	 */
 	cancellation?: CancellationOrigin | null;
+	/**
+	 * The accepted Terminate / Reset & restart request still outstanding against
+	 * this run (issue #561), or null when there is none. Returned by
+	 * `runs.getById` only — the runs list renders neither button, so it carries no
+	 * such field; optional for exactly that reason.
+	 */
+	pendingRequest?: PendingRunRequest | null;
 	/** Evidence-based terminal diagnosis; null for ordinary and historical runs. */
 	failureDiagnosis: FailureDiagnosis | null;
 }

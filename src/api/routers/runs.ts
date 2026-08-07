@@ -6,6 +6,7 @@ import {
 	getDispatchById,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
+	WAITING_DISPATCH_STATES,
 } from '../../db/repositories/dispatchesRepository.js';
 import {
 	getProjectByIdFromDb,
@@ -45,6 +46,8 @@ import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import {
 	type CancellationOrigin,
 	clearRunCancellation,
+	getRunCancellationOrigin,
+	isRunCancellationRequested,
 	RUN_CANCELLED_MESSAGE,
 	requestRunCancellation,
 } from '../../queue/cancellation.js';
@@ -460,6 +463,91 @@ async function resolveContinuationBudget(run: {
 	}
 }
 
+/**
+ * An accepted operator request against a run that has not taken effect yet
+ * (issue #561) — the durable, run-scoped answer to "is something outstanding?"
+ * that the dashboard's Terminate / Reset & restart buttons need in order to
+ * disable themselves and say what is being waited for.
+ *
+ * Both actions record their intent and return long before anything observable
+ * happens (a cancellation waits for the worker to notice and unwind; a restart
+ * waits for a worker to claim the replacement dispatch), so the mutation's own
+ * `isPending` covers only the HTTP round-trip. Derived here from facts that
+ * already exist and are already written at request time, so the state survives a
+ * reload and is identical for every viewer of the run.
+ */
+export interface PendingRunRequest {
+	action: 'terminate' | 'restart';
+	/** ISO 8601 — when the request was recorded; null when only the bare marker exists. */
+	requestedAt: string | null;
+	/** ISO 8601 upper bound of the wait, when the run records one; null otherwise. */
+	waitUntil: string | null;
+}
+
+/**
+ * The accepted-but-not-yet-effective request outstanding against `run`, or
+ * `null` when there is none (issue #561). Derived, never stored — the two
+ * durable facts it reads are written by the request paths themselves:
+ *
+ *  - **terminate**, for a `running` run: the run-id-keyed Redis cancellation
+ *    marker `runs.terminate` writes ({@link requestRunCancellation}). Gating on
+ *    `running` is what clears the pending state when the worker settles the row,
+ *    even if a stale marker outlives it, and keeps a phantom wait off the two
+ *    retry-pending statuses that `terminate` settles synchronously.
+ *  - **restart**, for a run that is not running: its active dispatch, when that
+ *    dispatch is still *waiting* and was opened as a `manual-retry` — the wait
+ *    reason `resetRun`/`retryNow` record and nothing automatic does. Narrowing
+ *    to {@link WAITING_DISPATCH_STATES} clears the pending state as soon as a
+ *    worker claims the restart; the wait-reason check is what keeps an ordinary
+ *    `deferred` run's scheduled auto-retry from reading as an operator request
+ *    and permanently disabling the button meant to unwedge it.
+ *
+ * Only the status that can have one issues a read, so a `completed` run's poll
+ * costs nothing extra. Fails soft to `null`: a Redis or dispatch read that
+ * throws must show the run without a fabricated wait, never fail the page.
+ */
+async function resolvePendingRunRequest(run: {
+	id: string;
+	status: string;
+	startedAt: Date;
+	timeoutMs: number | null;
+}): Promise<PendingRunRequest | null> {
+	try {
+		if (run.status === 'running') {
+			if (!(await isRunCancellationRequested(run.id))) return null;
+			const origin = await getRunCancellationOrigin(run.id);
+			// The run's own agent timeout is the bound the operator can see. It is an
+			// outer bound, not the settle instant — the control plane adds its own
+			// result-wait margin on the transport path — and a run without one
+			// reports no bound rather than a guessed one.
+			const waitUntil =
+				run.timeoutMs && run.timeoutMs > 0
+					? new Date(run.startedAt.getTime() + run.timeoutMs).toISOString()
+					: null;
+			return {
+				action: 'terminate',
+				requestedAt: origin?.requestedAt ?? null,
+				waitUntil,
+			};
+		}
+		if (run.status === 'completed') return null;
+		const dispatch = await getActiveDispatchByRunId(run.id);
+		if (!dispatch || dispatch.waitReason !== 'manual-retry') return null;
+		if (!(WAITING_DISPATCH_STATES as readonly string[]).includes(dispatch.state)) return null;
+		return {
+			action: 'restart',
+			requestedAt: dispatch.updatedAt.toISOString(),
+			waitUntil: null,
+		};
+	} catch (error) {
+		logger.warn('runs.getById: pending-request lookup failed; reporting no outstanding request', {
+			runId: run.id,
+			error: describeError(error),
+		});
+		return null;
+	}
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } from the repo, each row
 	// widened with the additive, server-resolved `workerName` naming the machine
@@ -515,11 +603,14 @@ export const runsRouter = router({
 	// of the run's project (existence hidden with identical run-not-found message).
 	// The row is returned as-is — including the persisted Tier 2 `checkpoint` and
 	// `continuationCount` (issue #503) the detail page's checkpoint panel renders —
-	// plus two additive, server-resolved fields: an `attribution` object resolving
-	// the recorded worker/user to display labels (issue #446), and the
-	// `maxContinuations` ceiling that count reads against (issue #504). Both are
-	// looked up only after the access check, so a non-member never triggers an
-	// identity or project read.
+	// plus three additive, server-resolved fields: an `attribution` object resolving
+	// the recorded worker/user to display labels (issue #446), the
+	// `maxContinuations` ceiling that count reads against (issue #504), and the
+	// `pendingRequest` naming an accepted Terminate/Reset request that hasn't taken
+	// effect yet (issue #561 — the Redis cancellation marker for a `running` run, the
+	// run's waiting `manual-retry` dispatch otherwise). All three are looked up only
+	// after the access check, so a non-member never triggers an identity, project, or
+	// queue read.
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -540,6 +631,7 @@ export const runsRouter = router({
 				...run,
 				attribution: await resolveRunAttribution(run),
 				maxContinuations: await resolveContinuationBudget(run),
+				pendingRequest: await resolvePendingRunRequest(run),
 			};
 		}),
 

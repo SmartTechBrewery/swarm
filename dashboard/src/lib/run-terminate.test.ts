@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { canTerminateRun, terminateButtonLabel, terminateConfirmMessage } from './run-terminate.js';
+import {
+	canTerminateRun,
+	describeTerminateWait,
+	formatPendingRequestWaitUntil,
+	terminateButtonLabel,
+	terminateConfirmMessage,
+} from './run-terminate.js';
 
 describe('canTerminateRun', () => {
 	it('allows terminate for a running or deferred run', () => {
@@ -28,6 +34,41 @@ describe('terminateButtonLabel', () => {
 
 	it('reads "Terminate" when idle', () => {
 		expect(terminateButtonLabel(false)).toBe('Terminate');
+	});
+
+	it('names the wait once the request is accepted (issue #561)', () => {
+		expect(terminateButtonLabel(false, true)).toBe('Waiting to stop…');
+	});
+
+	it('prefers the accepted request over the mutation, which it outlives', () => {
+		expect(terminateButtonLabel(true, true)).toBe('Waiting to stop…');
+	});
+});
+
+describe('describeTerminateWait (issue #561)', () => {
+	it('says the request was recorded and what has to happen for it to take effect', () => {
+		const copy = describeTerminateWait(true);
+		expect(copy).toContain('was recorded');
+		expect(copy).toContain('aborts the agent');
+	});
+
+	it('names the agent timeout as the outer bound when the run records one', () => {
+		expect(describeTerminateWait(true)).toContain('outer bound');
+	});
+
+	it('names stale-run reconciliation when the run records no timeout', () => {
+		const copy = describeTerminateWait(false);
+		expect(copy).not.toContain('outer bound');
+		expect(copy).toContain('periodic stale-run sweep');
+		expect(copy).not.toContain('swarm run reset');
+	});
+});
+
+describe('formatPendingRequestWaitUntil', () => {
+	it('makes a missed timeout visibly overdue instead of describing it as shortly', () => {
+		expect(
+			formatPendingRequestWaitUntil('2026-01-01T00:00:00.000Z', Date.UTC(2026, 0, 1, 0, 2)),
+		).toBe('overdue by 2 min');
 	});
 });
 
