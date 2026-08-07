@@ -14,6 +14,7 @@
 import { and, asc, eq, sql } from 'drizzle-orm';
 
 import type { ProjectConfig, ProjectPm, ProjectVisibility } from '../../config/schema.js';
+import type { PMType } from '../../pm/types.js';
 import { getDb } from '../client.js';
 import { projectMembers } from '../schema/projectMembers.js';
 import { projects } from '../schema/projects.js';
@@ -127,12 +128,16 @@ export async function findProjectByBoardFromDb(
  * `undefined` for an untracked container — not our board isn't an error
  * (ai/CODING_STANDARDS.md "Error handling").
  *
- * `configKey` is bound as a parameter (never interpolated), and cast to `text` so
- * Postgres resolves `jsonb ->> text` rather than weighing it against the
+ * `pmType` is the contract's {@link PMType}, not a free string: a typo would
+ * otherwise compile and simply match no row, which reads downstream as "board not
+ * tracked" and silently drops every one of that provider's webhooks. `configKey`
+ * *is* a free string — only the provider knows which of its own keys names the
+ * container — and it is bound as a parameter (never interpolated), cast to `text`
+ * so Postgres resolves `jsonb ->> text` rather than weighing it against the
  * `jsonb ->> integer` overload.
  */
 export async function findProjectByPmContainerFromDb(
-	pmType: string,
+	pmType: PMType,
 	configKey: string,
 	containerId: string,
 ): Promise<ProjectConfig | undefined> {
