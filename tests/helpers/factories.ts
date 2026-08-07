@@ -23,6 +23,10 @@ import {
 	type LinearIntegrationConfig,
 	linearConfigSchema,
 } from '@/integrations/pm/linear/config-schema.js';
+import {
+	type TrelloIntegrationConfig,
+	trelloConfigSchema,
+} from '@/integrations/pm/trello/config-schema.js';
 import { DEFAULT_AUTOMATION_LABEL } from '@/pm/automation-label.js';
 import { type PmEvent, PmEventSchema } from '@/pm/events.js';
 import type { WorkItem } from '@/pm/types.js';
@@ -107,6 +111,25 @@ export function createMockJiraConfig(
 			inProgress: '3',
 			inReview: '10003',
 			done: '10004',
+		},
+		...overrides,
+	});
+}
+
+export function createMockTrelloConfig(
+	overrides: Partial<TrelloIntegrationConfig> = {},
+): TrelloIntegrationConfig {
+	return trelloConfigSchema.parse({
+		// Trello object ids are 24 hex characters — the board's and, below, one per list,
+		// since a Trello card's status is the list it sits in.
+		boardId: '5f2b9c1a4e6d7f0a1b2c3d4e',
+		statusOptions: {
+			backlog: '6a1b2c3d4e5f60718293a4b0',
+			planning: '6a1b2c3d4e5f60718293a4b1',
+			todo: '6a1b2c3d4e5f60718293a4b2',
+			inProgress: '6a1b2c3d4e5f60718293a4b3',
+			inReview: '6a1b2c3d4e5f60718293a4b4',
+			done: '6a1b2c3d4e5f60718293a4b5',
 		},
 		...overrides,
 	});
@@ -761,6 +784,34 @@ export function createMockJiraProjectConfig(overrides: Partial<ProjectConfig> = 
 				email: 'JIRA_EMAIL',
 				apiToken: 'JIRA_API_TOKEN',
 				webhookSecret: 'JIRA_WEBHOOK_SECRET',
+			},
+		},
+		...overrides,
+	});
+}
+
+export function createMockTrelloProjectConfig(
+	overrides: Partial<ProjectConfig> = {},
+): ProjectConfig {
+	return ProjectConfigSchema.parse({
+		id: 'trello-project',
+		name: 'trello-project',
+		repo: 'SmartTechBrewery/swarm',
+		repoRoot: '/Users/dev/swarm/swarm',
+		pm: { type: 'trello', ...createMockTrelloConfig() },
+		credentials: {
+			reviewer: 'SCM_TOKEN_REVIEWER',
+			webhookSecret: 'SCM_WEBHOOK_SECRET',
+			// Trello authenticates with an API key + token pair, so those are its own two
+			// roles, plus the signing secret its manifest will declare under
+			// `webhookSecret` (Trello's *API secret*, hence the env-var name). All three
+			// are named here already: `ProjectConfigSchema` validates `credentials.pm`
+			// against the *registered* manifest, so the fixture has to be complete before
+			// that phase or every suite using it starts failing.
+			pm: {
+				apiKey: 'TRELLO_API_KEY',
+				token: 'TRELLO_TOKEN',
+				webhookSecret: 'TRELLO_API_SECRET',
 			},
 		},
 		...overrides,
