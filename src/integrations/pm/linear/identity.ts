@@ -21,9 +21,7 @@ import { linearGraphQL } from './client.js';
 import { withLinearProjectCredentials } from './credentials.js';
 
 /**
- * The authenticated actor behind the API key. `viewer` answers for a personal API
- * key and for an OAuth access token alike, so one document covers both ways a
- * project can supply the credential.
+ * The authenticated actor behind the configured personal API key.
  */
 const VIEWER_QUERY = /* GraphQL */ `
 	query Viewer {

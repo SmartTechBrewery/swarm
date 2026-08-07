@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockLinearProjectConfig, createMockProjectConfig } from '../../helpers/factories.js';
 
 vi.mock('@/db/repositories/credentialsRepository.js', () => ({
 	resolveProjectCredential: vi.fn(),
@@ -17,10 +17,11 @@ import {
 } from '@/config/provider.js';
 import { type ProjectConfig, ProjectConfigSchema } from '@/config/schema.js';
 import { resolveProjectCredential } from '@/db/repositories/credentialsRepository.js';
-// Registers the real github-projects manifest, whose declared roles both halves of
-// this suite validate and resolve against.
+// Registers the real PM manifests, whose declared roles both halves of this suite
+// validate and resolve against.
 import '@/integrations/entrypoint.js';
 import { githubProjectsManifest } from '@/integrations/pm/github-projects/index.js';
+import { linearManifest } from '@/integrations/pm/linear/index.js';
 import type { PmCredentialRoleSpec } from '@/integrations/pm/manifest.js';
 import {
 	_resetPMProviderRegistryForTesting,
@@ -63,8 +64,12 @@ function parseErrors(input: unknown): string {
 }
 
 afterEach(() => {
+	// Restore what the entrypoint import registered — both providers, not just the
+	// first: a test that swaps a manifest behind an id must not leave Linear
+	// unregistered for the ones after it.
 	_resetPMProviderRegistryForTesting();
 	registerPMProvider(githubProjectsManifest);
+	registerPMProvider(linearManifest);
 	vi.unstubAllEnvs();
 });
 
@@ -154,6 +159,66 @@ describe('credentials.pm validation against the declared roles', () => {
 		expect(ProjectConfigSchema.safeParse(configWithPmReferences({ whatever: 'KEY' })).success).toBe(
 			true,
 		);
+	});
+
+	// Linear is the second registered provider, and the first whose roles a project
+	// must configure in full: neither inherits a shared SCM credential, because its
+	// board is a separate system from the repo (issue #530). The check runs against
+	// the *registered* manifest, which is why this suite imports the entrypoint.
+	describe('a pm.type linear project', () => {
+		/** The Linear fixture with its `credentials.pm` block replaced. */
+		function linearConfigWithPmReferences(pm: Record<string, string> | undefined): unknown {
+			const linearProject = createMockLinearProjectConfig();
+			return {
+				...linearProject,
+				credentials: {
+					reviewer: linearProject.credentials.reviewer,
+					webhookSecret: linearProject.credentials.webhookSecret,
+					...(pm ? { pm } : {}),
+				},
+			};
+		}
+
+		it('validates once both of its own references are named', () => {
+			expect(
+				ProjectConfigSchema.safeParse(
+					linearConfigWithPmReferences({
+						apiKey: 'LINEAR_API_KEY',
+						webhookSecret: 'LINEAR_WEBHOOK_SECRET',
+					}),
+				).success,
+			).toBe(true);
+		});
+
+		it('requires the apiKey role, naming it and its env var', () => {
+			const errors = parseErrors(
+				linearConfigWithPmReferences({ webhookSecret: 'LINEAR_WEBHOOK_SECRET' }),
+			);
+			expect(errors).toContain("requires the 'apiKey' credential (API Key)");
+			expect(errors).toContain('credentials.pm.apiKey');
+			expect(errors).toContain('LINEAR_API_KEY');
+		});
+
+		// Required rather than optional on purpose: the verifier fails closed on a null
+		// secret, so an optional role would validate here and 401 every delivery.
+		it('requires the webhookSecret role too, since it inherits nothing', () => {
+			const errors = parseErrors(linearConfigWithPmReferences({ apiKey: 'LINEAR_API_KEY' }));
+			expect(errors).toContain("requires the 'webhookSecret' credential (Webhook Secret)");
+			expect(errors).toContain('credentials.pm.webhookSecret');
+			expect(errors).toContain('LINEAR_WEBHOOK_SECRET');
+		});
+
+		it("rejects GitHub Projects' apiToken role, which Linear does not declare", () => {
+			const errors = parseErrors(
+				linearConfigWithPmReferences({
+					apiKey: 'LINEAR_API_KEY',
+					webhookSecret: 'LINEAR_WEBHOOK_SECRET',
+					apiToken: 'PM_GITHUB_PROJECTS_TOKEN',
+				}),
+			);
+			expect(errors).toContain("declares no credential role 'apiToken'");
+			expect(errors).toContain('its roles are: apiKey, webhookSecret');
+		});
 	});
 });
 

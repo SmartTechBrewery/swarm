@@ -707,6 +707,11 @@ export function createMockLinearProjectConfig(
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SCM_WEBHOOK_SECRET',
+			// Linear declares two required roles of its own and inherits neither from
+			// the SCM block (its board is a separate system), so a valid config names
+			// both references here — without them `ProjectConfigSchema` rejects this
+			// fixture in any test file where the manifest is registered.
+			pm: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
 		},
 		...overrides,
 	});

@@ -12,8 +12,8 @@ describe('github-projects manifest registration', () => {
 		expect(getPMProvider('github-projects')).toBe(githubProjectsManifest);
 	});
 
-	it('registers exactly once (the entrypoint has one PM provider today)', () => {
-		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects']);
+	it('registers exactly once, alongside the other PM providers the entrypoint loads', () => {
+		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects', 'linear']);
 	});
 
 	it('declares the expected identity', () => {

@@ -1,11 +1,12 @@
 /**
  * GitHub Projects (v2) provider integration config schema.
  *
- * This is SWARM's only PM provider (see ai/ARCHITECTURE.md "PM: GitHub
+ * This was SWARM's first PM provider (see ai/ARCHITECTURE.md "PM: GitHub
  * Projects") and has no Cascade equivalent — Cascade ships Trello/JIRA/Linear,
  * not GitHub Projects. It follows the same `config-schema.ts` shape those
  * providers use (Zod schema + `z.infer` type, the provider owns its own
- * contract) so the central project config can compose it by import rather than
+ * contract) — the shape `../linear/config-schema.ts` follows too — so the
+ * central project config can compose it by import rather than
  * re-declaring the board mapping — the single-source-of-truth rule from
  * ai/CODING_STANDARDS.md "Zod is the source of truth".
  *

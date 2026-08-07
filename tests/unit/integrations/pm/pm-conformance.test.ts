@@ -29,7 +29,10 @@ import type { PMProviderManifest } from '@/integrations/pm/manifest.js';
 import { listPMProviders } from '@/integrations/pm/registry.js';
 import type { PMRouterAdapter } from '@/pm/router-adapter.js';
 import { PM_DISCOVERY_CAPABILITIES, type PMProvider, type PMType } from '@/pm/types.js';
-import { createMockProjectConfig } from '../../../helpers/factories.js';
+import {
+	createMockLinearProjectConfig,
+	createMockProjectConfig,
+} from '../../../helpers/factories.js';
 
 /**
  * The names of `PMProvider`'s method members. `-?` is the one difference from the
@@ -105,6 +108,7 @@ const STUB_SENTINEL = /\bnot\s+implemented\b/i;
  */
 const PROJECT_FIXTURES: Partial<Record<PMType, () => ProjectConfig>> = {
 	'github-projects': () => createMockProjectConfig(),
+	linear: () => createMockLinearProjectConfig(),
 };
 
 function projectFor(manifest: PMProviderManifest): ProjectConfig {
@@ -121,7 +125,7 @@ const manifests = listPMProviders();
 
 describe('PM provider conformance', () => {
 	it('registers every provider the suite runs over', () => {
-		expect(manifests.map((manifest) => manifest.id)).toEqual(['github-projects']);
+		expect(manifests.map((manifest) => manifest.id)).toEqual(['github-projects', 'linear']);
 	});
 
 	it('gives every provider a unique id', () => {
@@ -172,10 +176,16 @@ describe('PM provider conformance', () => {
 			// declarations of one shape (issue #495); a provider that lets them drift
 			// passes config validation and then builds a provider against a mapping its
 			// own schema rejects.
+			//
+			// The discriminator is stripped before parsing because `configSchema` declares
+			// the board *mapping* alone — `ProjectPmSchema` merges `{ type }` on top of it
+			// — so a provider whose schema is `.strict()` (Linear's is) would otherwise
+			// fail on a key it deliberately doesn't declare.
 			it('declares a config schema that accepts its own project fixture', () => {
 				const project = projectFor(manifest);
 				expect(project.pm.type).toBe(manifest.id);
-				expect(() => manifest.configSchema.parse(project.pm)).not.toThrow();
+				const { type: _type, ...mapping } = project.pm;
+				expect(() => manifest.configSchema.parse(mapping)).not.toThrow();
 			});
 
 			// `credentials.pm` is validated against these (`src/config/schema.ts`), so a

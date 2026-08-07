@@ -9,9 +9,10 @@ import { z } from 'zod';
 vi.mock('@/config/provider.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/config/provider.js')>()),
 	findProjectByBoard: vi.fn(),
+	findProjectByLinearTeam: vi.fn(),
 }));
 
-import { findProjectByBoard } from '@/config/provider.js';
+import { findProjectByBoard, findProjectByLinearTeam } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
@@ -22,7 +23,11 @@ import type { PMType } from '@/pm/types.js';
 import { createWebhookApp, type WebhookReceiverDeps } from '@/router/webhook-receiver.js';
 import type { ScmEvent } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
-import { createFakeScmProvider, createMockProjectConfig } from '../../helpers/factories.js';
+import {
+	createFakeScmProvider,
+	createMockLinearProjectConfig,
+	createMockProjectConfig,
+} from '../../helpers/factories.js';
 
 const project = createMockProjectConfig({ id: 'proj-1', repo: 'SmartTechBrewery/swarm' });
 
@@ -769,6 +774,90 @@ describe('createWebhookApp', () => {
 				expect(getPmCredential).toHaveBeenCalledWith(project, PM_WEBHOOK_SECRET_ROLE);
 				expect(enqueuePm).not.toHaveBeenCalled();
 			});
+		});
+	});
+
+	// The registered Linear manifest is the first PM provider whose route no SCM
+	// manifest serves (issue #530), so this exercises the own-route half of the
+	// receiver against the *real* registry: its path, its own `linear-signature`
+	// header, its unprefixed hex HMAC, and its own adapter's parse + team lookup.
+	describe('real registered Linear PM manifest (own route, defaultDeps wiring)', () => {
+		const secret = 'linear-whsec';
+		const linearProject = createMockLinearProjectConfig();
+		const teamId = linearProject.pm.type === 'linear' ? linearProject.pm.teamId : '';
+		// A workflow-state edit with no `actor`, so loop prevention answers "not ours"
+		// without resolving the board identity (which would be a live Linear call).
+		const boardBody = JSON.stringify({
+			type: 'Issue',
+			action: 'update',
+			data: { id: 'a2f0c7e1-8b4e-4a1a-9d61-1c4f0b6e2d33', teamId },
+			updatedFrom: { stateId: '9e1a4a5f-8d0c-4ea2-a27c-8142ad0297a0' },
+		});
+
+		function realLinearApp() {
+			const enqueuePm = vi.fn<WebhookReceiverDeps['enqueuePm']>().mockResolvedValue(undefined);
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
+				.mockResolvedValue(secret);
+			// The Linear adapter resolves its project by *team*, through its own facade
+			// (issue #529) — not through a receiver dep.
+			vi.mocked(findProjectByLinearTeam).mockResolvedValue(linearProject);
+			// Leave both registries alone: the route under test is mounted from the
+			// registered manifest, not injected.
+			const app = createWebhookApp({ getPmCredential, enqueuePm });
+			return { app, enqueuePm, getPmCredential };
+		}
+
+		/** Linear's framing: a bare hex digest of the raw body, with no `sha256=` prefix. */
+		function signLinear(body: string, key = secret) {
+			return createHmac('sha256', key).update(body, 'utf8').digest('hex');
+		}
+
+		function postLinear(app: ReturnType<typeof createWebhookApp>, signature: string) {
+			return app.request('/linear/webhook', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json', 'linear-signature': signature },
+				body: boardBody,
+			});
+		}
+
+		it("serves the registered manifest's own `/linear/webhook` GET ping", async () => {
+			const { app } = realLinearApp();
+			expect((await app.request('/linear/webhook')).status).toBe(200);
+		});
+
+		it('enqueues a genuinely-signed board event under the Linear provider id', async () => {
+			const { app, enqueuePm, getPmCredential } = realLinearApp();
+			const res = await postLinear(app, signLinear(boardBody));
+			expect(res.status).toBe(202);
+			// Authenticated against Linear's own declared role, which is its own secret
+			// rather than the repository's — the manifest inherits nothing.
+			expect(getPmCredential).toHaveBeenCalledWith(linearProject, PM_WEBHOOK_SECRET_ROLE);
+			expect(enqueuePm).toHaveBeenCalledWith(
+				'linear',
+				expect.objectContaining({
+					itemId: 'a2f0c7e1-8b4e-4a1a-9d61-1c4f0b6e2d33',
+					containerId: teamId,
+					action: 'updated',
+				}),
+				linearProject,
+				undefined,
+			);
+		});
+
+		it('rejects a board event whose real signature does not match with 401', async () => {
+			const { app, enqueuePm } = realLinearApp();
+			const res = await postLinear(app, signLinear(boardBody, 'wrong-secret'));
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+
+		it('fails closed when the project has no Linear webhook secret configured', async () => {
+			const { app, enqueuePm, getPmCredential } = realLinearApp();
+			getPmCredential.mockResolvedValue(null);
+			const res = await postLinear(app, signLinear(boardBody));
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
 		});
 	});
 });
