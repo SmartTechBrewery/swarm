@@ -1425,12 +1425,10 @@ export interface AssignedPhaseInputs {
 	 * A transport worker, which holds no `DATABASE_URL`, additionally injects an
 	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
 	 * phases, a `pm`; for review, a `reviewLedger`) so no phase reaches into the
-	 * secret store or the DB.
-	 * Forwarding both `delivery` and `agentToken` keeps the delivery-owning
-	 * phases' `legacyMode` guard false (it is `getToken !== undefined &&
-	 * delivery === undefined`), i.e. deterministic delivery stays on. The
-	 * in-process path ({@link runPhase}) leaves both unset, so the phase resolves
-	 * its own default exactly as before — the agent token from `getPersonaToken`.
+	 * secret store or the DB. The two are independent seams: each phase resolves
+	 * its own default for whichever is unset, so the in-process path
+	 * ({@link runPhase}) leaves both unset and gets the project's registered
+	 * delivery provider plus the agent token from `getPersonaToken`.
 	 */
 	delivery?: ScmDeliveryProvider;
 	agentToken?: string;

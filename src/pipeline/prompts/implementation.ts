@@ -16,8 +16,8 @@ import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js'
 import type { WorkItem } from '@/pm/types.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 
-/** The hand-off file the implementer writes with the opened-PR details (the phase's delivery contract). */
-const OPENED_PR_FILENAME = HANDOFF_FILENAMES.implementation;
+/** The hand-off file the implementer writes for SWARM to deliver from (the phase's delivery contract). */
+const IMPLEMENTATION_HANDOFF_FILENAME = HANDOFF_FILENAMES.implementation;
 
 /**
  * The file the implementer writes instead of a PR when a genuine external
@@ -72,7 +72,7 @@ export function buildImplementationPrompt(
 				`worktree at the absolute path ${worktreePath}. The repository is ${repo} on GitHub.`,
 				`Your process's working directory may be a different, unrelated directory — do not`,
 				`rely on it. Make every repository edit, run every command, and write every hand-off`,
-				`file (including "${OPENED_PR_FILENAME}", "${BLOCKED_REASON_FILENAME}", and`,
+				`file (including "${IMPLEMENTATION_HANDOFF_FILENAME}", "${BLOCKED_REASON_FILENAME}", and`,
 				`"${CHECKPOINT_FILENAME}") inside`,
 				`${worktreePath}. SWARM only reads files from there.`,
 			]
@@ -95,7 +95,7 @@ export function buildImplementationPrompt(
 		'4. Run the project lint, type-check, and the relevant tests; fix whatever they surface before continuing.',
 		'5. Do not commit, push, open a pull request, or run any GitHub mutation. SWARM delivers the prepared tree after you exit.',
 		`Specifically, do not run \`git push -u origin ${branch}\` or \`gh pr create --base ${baseBranch} --head ${branch}\`; SWARM constructs the PR with \`Closes #${context.taskId}\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
-		`6. Write "${OPENED_PR_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), commitSubject (a conventional-commit subject), limitations (an array), and readyForDelivery:true. Do not track this file.`,
+		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), commitSubject (a conventional-commit subject), limitations (an array), and readyForDelivery:true. Do not track this file.`,
 		'Do NOT `git add`/commit the hand-off file.',
 		`If a genuine external prerequisite blocks implementation (for example, a required PR has not merged), do not open a placeholder PR. Instead, write a concise, human-readable explanation and the actionable next step to "${BLOCKED_REASON_FILENAME}" at the worktree root, then stop. Do NOT commit that file.`,
 		'',

@@ -1,12 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-
-// The outcome file is read via node:fs; presence + contents are controlled per test.
-let outcomeFileExists: boolean;
-let outcomeFileContents: string;
-vi.mock('node:fs', () => ({
-	existsSync: () => outcomeFileExists,
-	readFileSync: () => outcomeFileContents,
-}));
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
 // release, blocked reasons) is covered in `resume.test.ts` against real fixtures;
@@ -28,12 +24,56 @@ import {
 	RESPOND_CI_OUTCOME_FILENAME,
 	runRespondToCiPhase,
 } from '@/pipeline/respond-to-ci.js';
+import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
-const WORKTREE_PATH = '/Users/dev/swarm/swarm/.swarm-workspaces/task-respond-ci-64';
 const PR_BRANCH = 'issue-64';
 const HEAD_SHA = 'deadbeef';
+
+const roots: string[] = [];
+afterEach(() => {
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+const testGitEnvironment = Object.fromEntries(
+	Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
+);
+
+/**
+ * A minimal real git repo — deterministic delivery's `commitPreparedTree` shells
+ * out to `git` (`src/scm/delivery.ts`), so a `fixed` outcome needs an actual
+ * checkout with an uncommitted change to deliver.
+ */
+function initGitRepo(path: string): void {
+	const git = (...args: string[]) =>
+		execFileSync('git', args, { cwd: path, env: testGitEnvironment });
+	git('init', '-q');
+	git('config', 'user.email', 'test@example.com');
+	git('config', 'user.name', 'Test');
+	writeFileSync(join(path, 'README.md'), 'initial\n');
+	git('add', '.');
+	git('commit', '-q', '--no-verify', '-m', 'initial commit');
+	writeFileSync(join(path, 'fix.txt'), 'fixed the build\n');
+}
+
+/** The hand-off a CI-fix run leaves behind; `overrides` merge over a `fixed` default. */
+function ciHandoff(overrides: Record<string, unknown> = {}) {
+	return {
+		outcome: 'fixed',
+		body: 'Fixed the failing type-check.',
+		commitSubject: 'fix: satisfy the type-check',
+		verification: [{ command: 'npm run typecheck', outcome: 'passed' }],
+		...overrides,
+	};
+}
+
+function writeHandoff(path: string, contents: unknown): void {
+	writeFileSync(
+		join(path, RESPOND_CI_OUTCOME_FILENAME),
+		typeof contents === 'string' ? contents : JSON.stringify(contents),
+	);
+}
 
 function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
@@ -60,10 +100,14 @@ const CONTINUATION: Checkpoint = {
 };
 
 function makeDeps() {
-	// The PR's existing task branch — not detached, the agent pushes the fix here.
+	const path = mkdtempSync(join(tmpdir(), 'swarm-respond-ci-'));
+	roots.push(path);
+	initGitRepo(path);
+	writeHandoff(path, ciHandoff());
+	// The PR's existing task branch — not detached, SWARM pushes the fix here.
 	const handle: WorktreeHandle = {
 		taskId: 'respond-ci-64',
-		path: WORKTREE_PATH,
+		path,
 		branch: PR_BRANCH,
 		detached: false,
 	};
@@ -72,6 +116,7 @@ function makeDeps() {
 		cleanup: vi.fn(async () => {}),
 	};
 	return {
+		path,
 		project: createMockProjectConfig(),
 		prNumber: '99',
 		prBranch: PR_BRANCH,
@@ -83,41 +128,57 @@ function makeDeps() {
 		),
 		graft: vi.fn(() => []),
 		getToken: vi.fn(async () => 'implementer-token'),
+		// SWARM pushes the fix and posts the explanation; production resolves the
+		// project's own registered provider here.
+		delivery: {
+			commitIdentity: { name: 'implementer', email: 'implementer@users.noreply.github.com' },
+			findPullRequest: vi.fn(async () => undefined),
+			createPullRequest: vi.fn(async () => ({ number: 99, url: 'https://x/pull/99' })),
+			pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
+			submitReview: vi.fn(async () => 0),
+			postComment: vi.fn(
+				async (_input: { prNumber: number; body: string; deliveryId: string }) => 7,
+			),
+		} satisfies ScmDeliveryProvider,
 	};
 }
 
 describe('runRespondToCiPhase', () => {
-	beforeEach(() => {
-		outcomeFileExists = true;
-		outcomeFileContents = 'fixed\n';
-	});
-
-	it('provisions a worktree on the PR branch, runs Claude Code as the implementer, and returns the outcome', async () => {
+	it('provisions a worktree on the PR branch, runs Claude Code as the implementer, and delivers the fix', async () => {
 		const deps = makeDeps();
 		const result = await runRespondToCiPhase(deps);
 
 		// Implementer credentials, same reason as Implementation/Review.
 		expect(deps.getToken).toHaveBeenCalledWith(deps.project, 'implementer');
 
-		// The existing task branch, not a fresh cut and not detached — the agent
-		// commits and pushes the build fix from here.
+		// The existing task branch, not a fresh cut and not detached — SWARM commits
+		// and pushes the build fix from here.
 		expect(deps.worktrees.provision).toHaveBeenCalledWith('respond-ci-64', {
 			createBranch: false,
 			branch: PR_BRANCH,
 		});
 
 		// Claude Code runs with the worktree as CWD, the CI-fix prompt, and the
-		// implementer token in GH_TOKEN so gh (incl. the PR comment) acts as that
-		// persona rather than the worker host's own gh auth login.
+		// implementer token in GH_TOKEN so its gh reads act as that persona rather
+		// than the worker host's own gh auth login.
 		expect(deps.runAgent).toHaveBeenCalledTimes(1);
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.cli).toBe('claude');
-		expect(runArgs.cwd).toBe(WORKTREE_PATH);
+		expect(runArgs.cwd).toBe(deps.path);
 		expect(runArgs.args?.[0]).toContain(HEAD_SHA);
 		expect(runArgs.env).toEqual({ GH_TOKEN: 'implementer-token' });
 
 		// Env is grafted into the worktree before the agent runs.
-		expect(deps.graft).toHaveBeenCalledWith(deps.project.repoRoot, WORKTREE_PATH);
+		expect(deps.graft).toHaveBeenCalledWith(deps.project.repoRoot, deps.path);
+
+		// SWARM — not the agent — pushes the fix commit and posts the explanation.
+		expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.pushBranch.mock.calls[0][1]).toBe(PR_BRANCH);
+		expect(deps.delivery.postComment).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.postComment.mock.calls[0][0]).toMatchObject({
+			prNumber: 99,
+			body: 'Fixed the failing type-check.',
+		});
 
 		// Worktree is always cleaned up.
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
@@ -126,10 +187,29 @@ describe('runRespondToCiPhase', () => {
 		expect(result.agent.exitCode).toBe(0);
 	});
 
+	it('posts the explanation without committing anything for a no-fix outcome', async () => {
+		const deps = makeDeps();
+		writeHandoff(
+			deps.path,
+			ciHandoff({
+				outcome: 'no-fix',
+				body: 'The failure was a flaky runner, not a code defect.',
+				commitSubject: undefined,
+				verification: [],
+			}),
+		);
+
+		const result = await runRespondToCiPhase(deps);
+
+		expect(result.outcome).toBe('no-fix');
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.delivery.postComment).toHaveBeenCalledTimes(1);
+	});
+
 	it('continues from a checkpoint on a fresh session, on a different CLI (issue #502)', async () => {
 		const deps = makeDeps();
 		acquireResumableWorktreeMock.mockResolvedValueOnce({
-			handle: { taskId: 'respond-ci-64', path: WORKTREE_PATH, branch: PR_BRANCH, detached: false },
+			handle: { taskId: 'respond-ci-64', path: deps.path, branch: PR_BRANCH, detached: false },
 			resumed: false,
 			deliveryResumed: false,
 			checkpoint: CONTINUATION,
@@ -244,39 +324,49 @@ describe('runRespondToCiPhase', () => {
 		await expect(runRespondToCiPhase(deps)).rejects.toThrow(/timed out/);
 	});
 
-	it('throws and cleans up when the agent produced no outcome file', async () => {
-		outcomeFileExists = false;
+	it('throws and cleans up when the agent wrote no hand-off', async () => {
 		const deps = makeDeps();
+		rmSync(join(deps.path, RESPOND_CI_OUTCOME_FILENAME));
 		await expect(runRespondToCiPhase(deps)).rejects.toThrow(
-			new RegExp(`did not write ${RESPOND_CI_OUTCOME_FILENAME}`),
+			new RegExp(`did not write required hand-off ${RESPOND_CI_OUTCOME_FILENAME}`),
+		);
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.delivery.postComment).not.toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
+	});
+
+	it('throws and cleans up when the hand-off is not valid JSON', async () => {
+		const deps = makeDeps();
+		writeHandoff(deps.path, '   \n  ');
+		await expect(runRespondToCiPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${RESPOND_CI_OUTCOME_FILENAME}`),
 		);
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 	});
 
-	it('throws and cleans up when the outcome file is empty', async () => {
-		outcomeFileContents = '   \n  ';
-		const deps = makeDeps();
-		await expect(runRespondToCiPhase(deps)).rejects.toThrow(/empty/);
-		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
-	});
-
 	it('throws and cleans up when the outcome is not one of the known two', async () => {
-		outcomeFileContents = 'done!\n';
 		const deps = makeDeps();
-		await expect(runRespondToCiPhase(deps)).rejects.toThrow(/unrecognized outcome 'done!'/);
+		writeHandoff(deps.path, ciHandoff({ outcome: 'done!' }));
+		await expect(runRespondToCiPhase(deps)).rejects.toThrow(
+			new RegExp(`Invalid hand-off ${RESPOND_CI_OUTCOME_FILENAME}`),
+		);
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 	});
 
+	// A `fixed` outcome is a promise that a verified change is waiting in the tree.
+	// Delivering one that names neither a commit subject nor a passing command would
+	// push an unattributed, unverified commit to the PR.
 	it.each([
-		['fixed\n', 'fixed'],
-		['Fixed', 'fixed'],
-		['NO-FIX\n', 'no-fix'],
-		['no-fix', 'no-fix'],
-	])('normalizes outcome %j to %j', async (contents, expected) => {
-		outcomeFileContents = contents;
+		['no commit subject', { commitSubject: undefined }],
+		['no verification', { verification: [] }],
+	])('refuses a fixed hand-off with %s', async (_label, override) => {
 		const deps = makeDeps();
-		const result = await runRespondToCiPhase(deps);
-		expect(result.outcome).toBe(expected);
+		writeHandoff(deps.path, ciHandoff(override));
+		await expect(runRespondToCiPhase(deps)).rejects.toThrow(
+			/fixed requires commitSubject and verification/,
+		);
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 	});
 });
 
