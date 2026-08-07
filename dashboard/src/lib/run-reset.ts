@@ -73,7 +73,7 @@ export function resetButtonLabel(isPending: boolean, requestOutstanding = false)
  * dead-looking control.
  */
 export function describeRestartWait(): string {
-	return 'The restart was accepted and queued as a fresh dispatch. It takes effect when a worker claims it and the run turns Running — this page updates as soon as it does. If no worker ever picks it up, re-issue it from the CLI with "swarm run reset <runId> --force".';
+	return 'The restart was accepted and queued as a fresh dispatch. It takes effect when a worker claims it and the run turns Running — this page updates as soon as it does. If no worker ever picks it up, re-issue it from the CLI with "swarm run reset <runId>". Use "--force" only if you intend to discard dirty or unpushed work in the run’s checkout.';
 }
 
 /**

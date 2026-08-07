@@ -46,6 +46,7 @@ import {
 import {
 	canTerminateRun,
 	describeTerminateWait,
+	formatPendingRequestWaitUntil,
 	terminateButtonLabel,
 	terminateConfirmMessage,
 } from '@/lib/run-terminate.js';
@@ -78,6 +79,8 @@ function isRetryPending(status: string | undefined): boolean {
 
 const RUN_AGENTS = ['claude', 'antigravity', 'codex'] as const;
 type RunAgent = AgentCli;
+
+const RESTART_CLAIM_POLL_WINDOW_MS = 30_000;
 
 /** Capitalize a normalized reasoning level for display ("high" → "High"). */
 function capitalizeLevel(value: string): string {
@@ -472,7 +475,7 @@ function PendingRequestNotice({
 			{request.waitUntil && (
 				<p className="text-xs text-amber-200/60 mt-1 font-mono">
 					Agent timeout {new Date(request.waitUntil).toLocaleString()} (
-					{formatTimeUntil(request.waitUntil)})
+					{formatPendingRequestWaitUntil(request.waitUntil)})
 				</p>
 			)}
 		</div>
@@ -1734,6 +1737,8 @@ function RunDetailRouteComponent() {
 	const [outputCursor, setOutputCursor] = useState(0);
 	const [outputEvents, setOutputEvents] = useState<LiveOutputEvent[]>([]);
 	const [uiOutputTruncated, setUiOutputTruncated] = useState(false);
+	const restartPendingObservedRef = useRef(false);
+	const [restartClaimedAt, setRestartClaimedAt] = useState<number | null>(null);
 
 	// Query project list to map projectId to project repo/name
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
@@ -1745,17 +1750,36 @@ function RunDetailRouteComponent() {
 	// Terminate/Reset request still outstanding (issue #561): a `failed` run awaiting
 	// a queued restart is otherwise static, so without this leg the page would never
 	// observe the restart being claimed and the button would stay disabled until a
-	// manual reload.
+	// manual reload. Keep polling briefly after that claim too: the dispatch becomes
+	// leased before the worker flips the run from failed to running.
 	const runQuery = useQuery({
 		...trpc.runs.getById.queryOptions({ id: runId }),
 		refetchInterval: (query) => {
 			const run = query.state.data;
 			if (!run) return false;
-			return run.status === 'running' || isRetryPending(run.status) || run.pendingRequest
+			if (run.status === 'running' || isRetryPending(run.status) || run.pendingRequest) return 2000;
+			return restartClaimedAt !== null &&
+				Date.now() - restartClaimedAt < RESTART_CLAIM_POLL_WINDOW_MS
 				? 2000
 				: false;
 		},
 	});
+
+	useEffect(() => {
+		const run = runQuery.data;
+		if (!run) return;
+		if (run.pendingRequest?.action === 'restart') {
+			restartPendingObservedRef.current = true;
+			if (restartClaimedAt !== null) setRestartClaimedAt(null);
+			return;
+		}
+		if (restartPendingObservedRef.current && run.status === 'failed') {
+			if (restartClaimedAt === null) setRestartClaimedAt(Date.now());
+			return;
+		}
+		restartPendingObservedRef.current = false;
+		if (restartClaimedAt !== null) setRestartClaimedAt(null);
+	}, [restartClaimedAt, runQuery.data]);
 
 	// Fetch run logs and poll while the run can still change automatically.
 	const logsQuery = useQuery({

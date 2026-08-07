@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	canTerminateRun,
 	describeTerminateWait,
+	formatPendingRequestWaitUntil,
 	terminateButtonLabel,
 	terminateConfirmMessage,
 } from './run-terminate.js';
@@ -55,10 +56,19 @@ describe('describeTerminateWait (issue #561)', () => {
 		expect(describeTerminateWait(true)).toContain('outer bound');
 	});
 
-	it('offers the CLI escape instead of a bound when the run records no timeout', () => {
+	it('names stale-run reconciliation when the run records no timeout', () => {
 		const copy = describeTerminateWait(false);
 		expect(copy).not.toContain('outer bound');
-		expect(copy).toContain('swarm run reset <runId> --force');
+		expect(copy).toContain('periodic stale-run sweep');
+		expect(copy).not.toContain('swarm run reset');
+	});
+});
+
+describe('formatPendingRequestWaitUntil', () => {
+	it('makes a missed timeout visibly overdue instead of describing it as shortly', () => {
+		expect(
+			formatPendingRequestWaitUntil('2026-01-01T00:00:00.000Z', Date.UTC(2026, 0, 1, 0, 2)),
+		).toBe('overdue by 2 min');
 	});
 });
 

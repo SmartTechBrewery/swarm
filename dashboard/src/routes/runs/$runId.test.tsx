@@ -869,16 +869,31 @@ describe('outstanding request state (issue #561)', () => {
 		expect(terminateMutate).not.toHaveBeenCalled();
 	});
 
-	it('leaves Terminate live once the run settles, whatever the terminal status calls for', () => {
-		// The pending state is derived from the row, so a settle clears it: the
-		// failed run below shows Reset & restart and no wait copy at all.
-		renderHeader(
+	it('a settled run shows no wait copy and the terminal status’s own actions', () => {
+		const view = renderHeader(
 			makeReviewRun({
-				status: 'failed',
+				status: 'running',
 				phase: 'implementation',
-				error: 'boom',
-				pendingRequest: null,
+				completedAt: null,
+				pendingRequest: { action: 'terminate', requestedAt: null, waitUntil: null },
 			}),
+		);
+
+		expect(screen.getByRole('button', { name: /waiting to stop/i })).toBeDefined();
+
+		view.rerender(
+			<QueryClientProvider
+				client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+			>
+				<RunDetailHeader
+					run={makeReviewRun({
+						status: 'failed',
+						phase: 'implementation',
+						error: 'boom',
+						pendingRequest: null,
+					})}
+				/>
+			</QueryClientProvider>,
 		);
 
 		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();

@@ -37,18 +37,39 @@ export function terminateButtonLabel(isPending: boolean, requestOutstanding = fa
  * cancellation reads as "waiting" rather than "broken".
  *
  * `hasDeadline` swaps the closing sentence for the one that fits: a bound the
- * operator can see, or — for a run recording no agent timeout — the CLI escape
- * for a request that may never be delivered, since a `running` run offers no
- * Reset button in the dashboard. The timestamp itself is formatted by the
- * component (like the deferred/checkpointed callouts already do), so this copy
- * stays locale-independent.
+ * operator can see, or — for a legacy run that recorded no agent timeout — the
+ * stale-run reconciliation that still bounds a request a worker never receives.
+ * The timestamp itself is formatted by the component (like the
+ * deferred/checkpointed callouts already do), so this copy stays
+ * locale-independent.
  */
 export function describeTerminateWait(hasDeadline: boolean): string {
 	const base =
 		'The termination request was recorded. It takes effect once the run’s worker sees it and aborts the agent — this page updates as soon as the run settles.';
 	return hasDeadline
 		? `${base} The run’s agent timeout is the outer bound on that wait.`
-		: `${base} This run records no agent timeout, so nothing bounds the wait: if it never settles, force it from the CLI with "swarm run reset <runId> --force".`;
+		: `${base} This run did not record its agent timeout. The periodic stale-run sweep still reaps a stuck run after the default agent timeout plus its grace period.`;
+}
+
+/**
+ * The pending-request callout is the one place where a timeout can visibly be
+ * overdue while the run is still marked running. Keep shared future-time copy
+ * unchanged for retry dates, but make this state honest about the missed bound.
+ */
+export function formatPendingRequestWaitUntil(waitUntil: string, now = Date.now()): string {
+	const diffMs = new Date(waitUntil).getTime() - now;
+	if (diffMs >= 0) {
+		const diffMin = Math.ceil(diffMs / 60_000);
+		if (diffMin <= 1) return 'shortly';
+		if (diffMin < 60) return `in ${diffMin} min`;
+		return `in ~${Math.round(diffMin / 60)} h`;
+	}
+
+	const elapsedSeconds = Math.round(-diffMs / 1000);
+	if (elapsedSeconds < 60) return 'overdue by under a minute';
+	const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+	if (elapsedMinutes < 60) return `overdue by ${elapsedMinutes} min`;
+	return `overdue by ~${Math.round(elapsedMinutes / 60)} h`;
 }
 
 /**

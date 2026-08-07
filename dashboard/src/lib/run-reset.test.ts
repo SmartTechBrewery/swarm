@@ -69,7 +69,9 @@ describe('describeRestartWait (issue #561)', () => {
 	});
 
 	it('names the CLI escape for a restart no worker ever picks up', () => {
-		expect(describeRestartWait()).toContain('swarm run reset <runId> --force');
+		expect(describeRestartWait()).toContain('swarm run reset <runId>');
+		expect(describeRestartWait()).not.toContain('"swarm run reset <runId> --force"');
+		expect(describeRestartWait()).toContain('discard dirty or unpushed work');
 	});
 });
 
