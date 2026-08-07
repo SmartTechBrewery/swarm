@@ -42,7 +42,12 @@ vi.mock('@/db/repositories/usersRepository.js', () => ({
 	getUserById: vi.fn(),
 }));
 
-vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
+// Only the reads are stubbed; the module's own state vocabulary
+// (`WAITING_DISPATCH_STATES`, which `getById`'s pending-request resolution
+// narrows on — issue #561) is kept real for the same reason
+// `isRetryPendingStatus` is above: a stubbed copy could drift from it.
+vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()),
 	getActiveDispatchByRunId: vi.fn(),
 	getDispatchById: vi.fn(),
 	listWaitingDispatches: vi.fn(),
@@ -118,6 +123,10 @@ vi.mock('@/queue/queued-runs.js', () => {
 vi.mock('@/queue/cancellation.js', () => ({
 	requestRunCancellation: vi.fn(),
 	clearRunCancellation: vi.fn(),
+	// The two durable reads `getById` resolves an outstanding termination request
+	// from (issue #561).
+	isRunCancellationRequested: vi.fn(),
+	getRunCancellationOrigin: vi.fn(),
 	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
 }));
 
@@ -161,6 +170,8 @@ import { getPMProvider } from '@/integrations/pm/registry.js';
 import { type Checkpoint, DEFAULT_MAX_CONTINUATIONS } from '@/pipeline/checkpoint.js';
 import {
 	clearRunCancellation,
+	getRunCancellationOrigin,
+	isRunCancellationRequested,
 	RUN_CANCELLED_MESSAGE,
 	requestRunCancellation,
 } from '@/queue/cancellation.js';
@@ -327,6 +338,10 @@ describe('runsRouter', () => {
 		vi.mocked(reconcileTerminatedWorktree).mockResolvedValue({ outcome: 'absent' });
 		vi.mocked(requestRunCancellation).mockReset();
 		vi.mocked(clearRunCancellation).mockReset();
+		vi.mocked(isRunCancellationRequested).mockReset();
+		vi.mocked(isRunCancellationRequested).mockResolvedValue(false);
+		vi.mocked(getRunCancellationOrigin).mockReset();
+		vi.mocked(getRunCancellationOrigin).mockResolvedValue(null);
 		vi.mocked(toQueuedRuns).mockReset();
 		vi.mocked(getProjectByIdFromDb).mockReset();
 		vi.mocked(listAllProjectsFromDb).mockReset();
@@ -629,7 +644,12 @@ describe('runsRouter', () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(run);
 
 			const result = await caller.getById({ id: 'run-1' });
-			expect(result).toEqual({ ...run, attribution: null, maxContinuations: null });
+			expect(result).toEqual({
+				...run,
+				attribution: null,
+				maxContinuations: null,
+				pendingRequest: null,
+			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
 		});
@@ -793,6 +813,143 @@ describe('runsRouter', () => {
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					maxContinuations: null,
+				});
+			});
+		});
+
+		// The accepted-but-not-yet-effective operator request the dashboard disables
+		// and relabels its Terminate / Reset & restart button on (issue #561).
+		// Derived from durable facts written at request time, so the state survives a
+		// reload and is identical for every viewer — never the mutation's lifetime.
+		describe('pendingRequest', () => {
+			const RUNNING = {
+				status: 'running',
+				startedAt: new Date('2026-07-10T00:00:00Z'),
+				timeoutMs: 1_800_000,
+			};
+
+			it('reports an outstanding termination for a running run whose cancellation marker is set', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...RUNNING }));
+				vi.mocked(isRunCancellationRequested).mockResolvedValue(true);
+				vi.mocked(getRunCancellationOrigin).mockResolvedValue({
+					source: 'dashboard',
+					requestedAt: '2026-07-10T00:05:00.000Z',
+				});
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.pendingRequest).toEqual({
+					action: 'terminate',
+					requestedAt: '2026-07-10T00:05:00.000Z',
+					// startedAt + timeoutMs — the outer bound the operator can see.
+					waitUntil: '2026-07-10T00:30:00.000Z',
+				});
+				expect(isRunCancellationRequested).toHaveBeenCalledWith('run-1');
+			});
+
+			it('still reports the wait for a marker-only cancellation, without inventing a request time', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...RUNNING }));
+				vi.mocked(isRunCancellationRequested).mockResolvedValue(true);
+				vi.mocked(getRunCancellationOrigin).mockResolvedValue(null);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.pendingRequest).toEqual({
+					action: 'terminate',
+					requestedAt: null,
+					waitUntil: '2026-07-10T00:30:00.000Z',
+				});
+			});
+
+			it('reports no bound for a running run that records no agent timeout', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', ...RUNNING, timeoutMs: null }),
+				);
+				vi.mocked(isRunCancellationRequested).mockResolvedValue(true);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.pendingRequest).toMatchObject({ action: 'terminate', waitUntil: null });
+			});
+
+			it('reports null — and reads neither the origin nor the dispatch — for an uncancelled running run', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...RUNNING }));
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.pendingRequest).toBeNull();
+				expect(getRunCancellationOrigin).not.toHaveBeenCalled();
+				expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
+			});
+
+			it('reports null for a completed run without consulting the cancellation marker', async () => {
+				// The settle is what clears the pending state, so a stale marker left on a
+				// finished run must never keep the UI waiting.
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'completed' }),
+				);
+				vi.mocked(isRunCancellationRequested).mockResolvedValue(true);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.pendingRequest).toBeNull();
+				expect(isRunCancellationRequested).not.toHaveBeenCalled();
+				expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
+			});
+
+			it('reports an outstanding restart for a failed run whose replacement dispatch is still waiting', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({
+						state: 'pending',
+						waitReason: 'manual-retry',
+						updatedAt: new Date('2026-07-10T00:07:00Z'),
+					}),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.pendingRequest).toEqual({
+					action: 'restart',
+					requestedAt: '2026-07-10T00:07:00.000Z',
+					waitUntil: null,
+				});
+			});
+
+			it("leaves Reset available for an ordinary deferred run, whose automatic retry isn't an operator request", async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'retry-scheduled', waitReason: 'rate-limit' }),
+				);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					pendingRequest: null,
+				});
+			});
+
+			it('clears the pending restart once a worker has claimed the dispatch', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'checkpointed' }),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'leased', waitReason: 'manual-retry' }),
+				);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					pendingRequest: null,
+				});
+			});
+
+			it('reports no request rather than failing the page when the durable read throws', async () => {
+				const run = makeRun({ id: 'run-1', status: 'failed' });
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(run);
+				vi.mocked(getActiveDispatchByRunId).mockRejectedValue(new Error('db unreachable'));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toEqual({
+					...run,
+					attribution: null,
+					maxContinuations: null,
+					pendingRequest: null,
 				});
 			});
 		});
@@ -2032,6 +2189,7 @@ describe('runsRouter', () => {
 					...run,
 					attribution: null,
 					maxContinuations: null,
+					pendingRequest: null,
 				});
 			});
 		});

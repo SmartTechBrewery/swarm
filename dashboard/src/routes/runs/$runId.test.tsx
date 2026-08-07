@@ -809,6 +809,128 @@ describe('ResetRunButton (issue #428)', () => {
 	});
 });
 
+// An accepted Terminate / Reset request that hasn't taken effect (issue #561):
+// the button must be disabled, relabelled to the wait, and explained — driven by
+// the run-scoped `pendingRequest` the server resolves, not by the mutation's own
+// lifetime, so it reads the same after a reload and for a second viewer.
+describe('outstanding request state (issue #561)', () => {
+	const terminateMutate = vi.mocked(trpcClient.runs.terminate.mutate);
+	const resetMutate = vi.mocked(trpcClient.runs.reset.mutate);
+
+	beforeEach(() => {
+		terminateMutate.mockReset();
+		resetMutate.mockReset();
+	});
+
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	it('disables Terminate, names the wait, and explains it for a running run', () => {
+		renderHeader(
+			makeReviewRun({
+				status: 'running',
+				phase: 'implementation',
+				completedAt: null,
+				pendingRequest: {
+					action: 'terminate',
+					requestedAt: '2026-01-01T00:02:00.000Z',
+					waitUntil: '2026-01-01T00:30:00.000Z',
+				},
+			}),
+		);
+
+		const button = screen.getByRole('button', { name: /waiting to stop/i });
+		expect((button as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.queryByRole('button', { name: /^terminate$/i })).toBeNull();
+		expect(screen.getByText(/takes effect once the run’s worker sees it/i)).toBeDefined();
+		expect(screen.getByText(/outer bound on that wait/i)).toBeDefined();
+	});
+
+	it('does not issue a second termination while one is outstanding', () => {
+		renderHeader(
+			makeReviewRun({
+				status: 'running',
+				phase: 'implementation',
+				completedAt: null,
+				pendingRequest: { action: 'terminate', requestedAt: null, waitUntil: null },
+			}),
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: /waiting to stop/i }));
+
+		// No confirmation modal, and nothing recorded.
+		expect(screen.queryByRole('heading', { name: /terminate run\?/i })).toBeNull();
+		expect(terminateMutate).not.toHaveBeenCalled();
+	});
+
+	it('leaves Terminate live once the run settles, whatever the terminal status calls for', () => {
+		// The pending state is derived from the row, so a settle clears it: the
+		// failed run below shows Reset & restart and no wait copy at all.
+		renderHeader(
+			makeReviewRun({
+				status: 'failed',
+				phase: 'implementation',
+				error: 'boom',
+				pendingRequest: null,
+			}),
+		);
+
+		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();
+		expect(screen.queryByText(/waiting to stop/i)).toBeNull();
+		expect(screen.queryByText(/takes effect once/i)).toBeNull();
+	});
+
+	it('disables Reset & restart and explains the queued restart for a failed run', () => {
+		renderHeader(
+			makeReviewRun({
+				status: 'failed',
+				phase: 'implementation',
+				error: 'boom',
+				pendingRequest: {
+					action: 'restart',
+					requestedAt: '2026-01-01T00:03:00.000Z',
+					waitUntil: null,
+				},
+			}),
+		);
+
+		const button = screen.getByRole('button', { name: /waiting to restart/i });
+		expect((button as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.queryByRole('button', { name: /reset & restart/i })).toBeNull();
+		expect(screen.getByText(/queued as a fresh dispatch/i)).toBeDefined();
+
+		fireEvent.click(button);
+		expect(screen.queryByRole('heading', { name: /reset & restart run\?/i })).toBeNull();
+		expect(resetMutate).not.toHaveBeenCalled();
+	});
+
+	it('keeps Terminate live for a deferred run with an outstanding restart — the escape hatch', () => {
+		// Terminating cancels the dispatch the restart is waiting on, so this is the
+		// one way out of a restart nothing has claimed. Only Reset is blocked.
+		renderHeader(
+			makeReviewRun({
+				status: 'deferred',
+				phase: 'implementation',
+				nextRetryAt: '2026-01-01T01:00:00.000Z',
+				pendingRequest: { action: 'restart', requestedAt: null, waitUntil: null },
+			}),
+		);
+
+		expect(
+			(screen.getByRole('button', { name: /^terminate$/i }) as HTMLButtonElement).disabled,
+		).toBe(false);
+		expect(
+			(screen.getByRole('button', { name: /waiting to restart/i }) as HTMLButtonElement).disabled,
+		).toBe(true);
+	});
+});
+
 describe('ForceReReviewButton (issue #511)', () => {
 	const forceMutate = vi.mocked(trpcClient.runs.forceReReview.mutate);
 

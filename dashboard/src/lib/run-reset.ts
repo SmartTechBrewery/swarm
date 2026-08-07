@@ -49,9 +49,31 @@ export function canResetRun(status: string): boolean {
 	return status === 'failed' || status === 'deferred' || status === 'checkpointed';
 }
 
-/** Confirm-button label: reads "Resetting…" while the mutation is pending. */
-export function resetButtonLabel(isPending: boolean): string {
+/**
+ * Button label. `requestOutstanding` — the run-scoped fact that a restart has
+ * been accepted and hasn't taken effect (issue #561) — wins over the mutation's
+ * own `isPending`, which only ever covers the HTTP round-trip: `runs.reset`
+ * returns as soon as the replacement dispatch exists, long before a worker
+ * claims it and the row turns Running. Naming the *wait* is what stops the
+ * button reading as one that did nothing.
+ */
+export function resetButtonLabel(isPending: boolean, requestOutstanding = false): string {
+	if (requestOutstanding) return 'Waiting to restart…';
 	return isPending ? 'Resetting…' : 'Reset & restart';
+}
+
+/**
+ * What the operator is waiting for once a restart is accepted (issue #561) — the
+ * explanation the disabled button carries, so a restart nothing has picked up yet
+ * reads as "queued" rather than "broken".
+ *
+ * The CLI escape is named because a restart no worker ever claims leaves this
+ * button disabled and (on a `failed` run) no Terminate button to re-issue from,
+ * so the dashboard alone cannot clear it — better to say so than to leave a
+ * dead-looking control.
+ */
+export function describeRestartWait(): string {
+	return 'The restart was accepted and queued as a fresh dispatch. It takes effect when a worker claims it and the run turns Running — this page updates as soon as it does. If no worker ever picks it up, re-issue it from the CLI with "swarm run reset <runId> --force".';
 }
 
 /**

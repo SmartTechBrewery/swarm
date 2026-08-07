@@ -32,6 +32,7 @@ import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import {
 	canResetRun,
 	describeResetResult,
+	describeRestartWait,
 	type ResetRunReport,
 	resetButtonLabel,
 	resetConfirmMessage,
@@ -44,12 +45,13 @@ import {
 } from '@/lib/run-retry.js';
 import {
 	canTerminateRun,
+	describeTerminateWait,
 	terminateButtonLabel,
 	terminateConfirmMessage,
 } from '@/lib/run-terminate.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { parseWorkItemRef, workItemLabel } from '@/lib/work-item.js';
-import type { AgentUsage, FailureDiagnosis, RunRow } from '@/types/runs.js';
+import type { AgentUsage, FailureDiagnosis, PendingRunRequest, RunRow } from '@/types/runs.js';
 // Shared model catalog — the single source of truth (`src/harness/models.ts`), so
 // the retry override dropdowns stay in lockstep with the config UI (issue #180).
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
@@ -442,34 +444,95 @@ function RetryNowButton({ run }: { run: RunRow }) {
 }
 
 /**
+ * The explanation a disabled Terminate / Reset & restart button carries while its
+ * request is outstanding (issue #561). The button label names the wait; this says
+ * what has to happen before it takes effect — which is the difference between a
+ * slow action reading as "waiting" and reading as "broken".
+ *
+ * The amber caution hue is the same one the deferred callout uses
+ * (`ai/DESIGN_SYSTEM.md`): the run is fine, it just isn't there yet. Timestamps
+ * are formatted here rather than in the pure helpers, exactly as the
+ * deferred/checkpointed callouts already format `nextRetryAt`.
+ */
+function PendingRequestNotice({
+	request,
+	explanation,
+}: {
+	request: PendingRunRequest;
+	explanation: string;
+}) {
+	return (
+		<div className="mt-2 p-2.5 bg-amber-950/20 border border-amber-900/30 rounded">
+			<p className="text-xs text-amber-200/80">{explanation}</p>
+			{request.requestedAt && (
+				<p className="text-xs text-amber-200/60 mt-1 font-mono">
+					Requested {new Date(request.requestedAt).toLocaleString()}
+				</p>
+			)}
+			{request.waitUntil && (
+				<p className="text-xs text-amber-200/60 mt-1 font-mono">
+					Agent timeout {new Date(request.waitUntil).toLocaleString()} (
+					{formatTimeUntil(request.waitUntil)})
+				</p>
+			)}
+		</div>
+	);
+}
+
+/**
  * "Terminate" action (issue #166) for a running or deferred run: a click opens a
  * confirmation modal (an intentional stop that can't be undone), and confirming
  * fires the `runs.terminate` mutation. The button carries its own pending state
  * so a double-click can't fire twice; the mutation is idempotent server-side.
+ *
+ * Once a request is *accepted* the button stays disabled and relabelled until the
+ * run settles (issue #561), driven by the run-scoped `pendingRequest` the server
+ * resolves rather than by this mutation's own lifetime — the two differ by the
+ * whole period the worker takes to notice the cancellation and unwind, which is
+ * where the button used to snap back to `Terminate` having visibly done nothing.
  */
 function TerminateRunButton({ run }: { run: RunRow }) {
 	const queryClient = useQueryClient();
 	const [confirmOpen, setConfirmOpen] = useState(false);
 	const mutation = useMutation({
 		mutationFn: () => trpcClient.runs.terminate.mutate({ runId: run.id }),
-		onSuccess: () => {
+		// The detail refetch is awaited so the mutation stays pending until the run
+		// carries its `pendingRequest` (issue #561): otherwise the label flashes back
+		// to "Terminate" for the width of that round-trip, which is the exact
+		// "it did nothing" reading this change exists to remove.
+		onSuccess: async () => {
 			setConfirmOpen(false);
-			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
 			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
+			await queryClient.invalidateQueries({
+				queryKey: trpc.runs.getById.queryKey({ id: run.id }),
+			});
 		},
 	});
+	const outstanding = run.pendingRequest?.action === 'terminate' ? run.pendingRequest : null;
+	const blocked = mutation.isPending || outstanding !== null;
 
 	return (
 		<div className="mt-3">
 			<button
 				type="button"
 				onClick={() => setConfirmOpen(true)}
-				disabled={mutation.isPending}
+				disabled={blocked}
 				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
 			>
-				<OctagonX className={`h-4 w-4 ${mutation.isPending ? 'animate-pulse' : ''}`} />
-				{terminateButtonLabel(mutation.isPending)}
+				{outstanding ? (
+					<Loader2 className="h-4 w-4 animate-spin" />
+				) : (
+					<OctagonX className={`h-4 w-4 ${mutation.isPending ? 'animate-pulse' : ''}`} />
+				)}
+				{terminateButtonLabel(mutation.isPending, outstanding !== null)}
 			</button>
+
+			{outstanding && (
+				<PendingRequestNotice
+					request={outstanding}
+					explanation={describeTerminateWait(outstanding.waitUntil !== null)}
+				/>
+			)}
 
 			<Modal
 				open={confirmOpen}
@@ -486,14 +549,16 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 				)}
 				<ModalFooter
 					primary={
+						// Guarded on the accepted request too, so a modal left open across a
+						// refetch can't record the same intent a second time.
 						<button
 							type="button"
 							onClick={() => mutation.mutate()}
-							disabled={mutation.isPending}
+							disabled={blocked}
 							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
 						>
-							{mutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-							{terminateButtonLabel(mutation.isPending)}
+							{blocked && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+							{terminateButtonLabel(mutation.isPending, outstanding !== null)}
 						</button>
 					}
 					secondary={
@@ -522,6 +587,12 @@ function TerminateRunButton({ run }: { run: RunRow }) {
  * an operator can tell a reset that freed the checkout from one that restarted
  * the run but kept protected work. Pending state disables both the trigger and
  * the confirm button so a double-click can't fire two resets.
+ *
+ * That guard extends past the mutation itself (issue #561): `runs.reset` returns
+ * as soon as the replacement dispatch exists, while the run row keeps its old
+ * `failed`/`deferred`/`checkpointed` status until a worker claims it — so the
+ * button stays disabled and relabelled for as long as the server reports the
+ * restart outstanding, rather than inviting a second one.
  */
 export function ResetRunButton({
 	run,
@@ -542,13 +613,20 @@ export function ResetRunButton({
 
 	const mutation = useMutation({
 		mutationFn: (force: boolean) => trpcClient.runs.reset.mutate({ runId: run.id, force }),
-		onSuccess: (data) => {
+		// The detail refetch is awaited for the same reason Terminate's is (issue #561):
+		// the row's status doesn't change here at all, so without it the button reads
+		// "Reset & restart" again before the queued restart becomes visible.
+		onSuccess: async (data) => {
 			closeConfirm();
 			onResetSuccess?.(data);
-			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
 			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
+			await queryClient.invalidateQueries({
+				queryKey: trpc.runs.getById.queryKey({ id: run.id }),
+			});
 		},
 	});
+	const outstanding = run.pendingRequest?.action === 'restart' ? run.pendingRequest : null;
+	const blocked = mutation.isPending || outstanding !== null;
 
 	return (
 		<div className="mt-3">
@@ -559,12 +637,16 @@ export function ResetRunButton({
 					mutation.reset();
 					setConfirmOpen(true);
 				}}
-				disabled={mutation.isPending}
+				disabled={blocked}
 				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
 			>
-				<RotateCcw className={`h-4 w-4 ${mutation.isPending ? 'animate-spin' : ''}`} />
-				{resetButtonLabel(mutation.isPending)}
+				<RotateCcw className={`h-4 w-4 ${blocked ? 'animate-spin' : ''}`} />
+				{resetButtonLabel(mutation.isPending, outstanding !== null)}
 			</button>
+
+			{outstanding && (
+				<PendingRequestNotice request={outstanding} explanation={describeRestartWait()} />
+			)}
 
 			{mutation.isSuccess && !onResetSuccess && (
 				<div className="mt-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded">
@@ -619,14 +701,16 @@ export function ResetRunButton({
 				)}
 				<ModalFooter
 					primary={
+						// Guarded on the accepted restart too, so a modal left open across a
+						// refetch can't queue a second one.
 						<button
 							type="button"
 							onClick={() => mutation.mutate(discardWork)}
-							disabled={mutation.isPending}
+							disabled={blocked}
 							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
 						>
-							{mutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-							{resetButtonLabel(mutation.isPending)}
+							{blocked && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+							{resetButtonLabel(mutation.isPending, outstanding !== null)}
 						</button>
 					}
 					secondary={
@@ -1657,12 +1741,19 @@ function RunDetailRouteComponent() {
 
 	// Fetch run details and poll while the run can still change automatically —
 	// which includes a `checkpointed` run (issue #503), whose scheduled continuation
-	// flips it to `running` with no operator action.
+	// flips it to `running` with no operator action, and any run with an accepted
+	// Terminate/Reset request still outstanding (issue #561): a `failed` run awaiting
+	// a queued restart is otherwise static, so without this leg the page would never
+	// observe the restart being claimed and the button would stay disabled until a
+	// manual reload.
 	const runQuery = useQuery({
 		...trpc.runs.getById.queryOptions({ id: runId }),
 		refetchInterval: (query) => {
 			const run = query.state.data;
-			return run && (run.status === 'running' || isRetryPending(run.status)) ? 2000 : false;
+			if (!run) return false;
+			return run.status === 'running' || isRetryPending(run.status) || run.pendingRequest
+				? 2000
+				: false;
 		},
 	});
 

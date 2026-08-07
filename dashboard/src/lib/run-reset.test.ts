@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	canResetRun,
 	describeResetResult,
+	describeRestartWait,
 	type ResetRunReport,
 	resetButtonLabel,
 	resetConfirmMessage,
@@ -49,6 +50,26 @@ describe('resetButtonLabel', () => {
 
 	it('reads "Reset & restart" when idle', () => {
 		expect(resetButtonLabel(false)).toBe('Reset & restart');
+	});
+
+	it('names the wait once the restart is accepted (issue #561)', () => {
+		expect(resetButtonLabel(false, true)).toBe('Waiting to restart…');
+	});
+
+	it('prefers the accepted restart over the mutation, which it outlives', () => {
+		expect(resetButtonLabel(true, true)).toBe('Waiting to restart…');
+	});
+});
+
+describe('describeRestartWait (issue #561)', () => {
+	it('says the restart was accepted and what has to happen for it to take effect', () => {
+		const copy = describeRestartWait();
+		expect(copy).toContain('accepted');
+		expect(copy).toContain('a worker claims it');
+	});
+
+	it('names the CLI escape for a restart no worker ever picks up', () => {
+		expect(describeRestartWait()).toContain('swarm run reset <runId> --force');
 	});
 });
 

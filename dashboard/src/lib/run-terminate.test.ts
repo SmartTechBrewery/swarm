@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { canTerminateRun, terminateButtonLabel, terminateConfirmMessage } from './run-terminate.js';
+import {
+	canTerminateRun,
+	describeTerminateWait,
+	terminateButtonLabel,
+	terminateConfirmMessage,
+} from './run-terminate.js';
 
 describe('canTerminateRun', () => {
 	it('allows terminate for a running or deferred run', () => {
@@ -28,6 +33,32 @@ describe('terminateButtonLabel', () => {
 
 	it('reads "Terminate" when idle', () => {
 		expect(terminateButtonLabel(false)).toBe('Terminate');
+	});
+
+	it('names the wait once the request is accepted (issue #561)', () => {
+		expect(terminateButtonLabel(false, true)).toBe('Waiting to stop…');
+	});
+
+	it('prefers the accepted request over the mutation, which it outlives', () => {
+		expect(terminateButtonLabel(true, true)).toBe('Waiting to stop…');
+	});
+});
+
+describe('describeTerminateWait (issue #561)', () => {
+	it('says the request was recorded and what has to happen for it to take effect', () => {
+		const copy = describeTerminateWait(true);
+		expect(copy).toContain('was recorded');
+		expect(copy).toContain('aborts the agent');
+	});
+
+	it('names the agent timeout as the outer bound when the run records one', () => {
+		expect(describeTerminateWait(true)).toContain('outer bound');
+	});
+
+	it('offers the CLI escape instead of a bound when the run records no timeout', () => {
+		const copy = describeTerminateWait(false);
+		expect(copy).not.toContain('outer bound');
+		expect(copy).toContain('swarm run reset <runId> --force');
 	});
 });
 
