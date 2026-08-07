@@ -44,6 +44,7 @@ import {
 	blankStatusOptions as emptyBoardStatusOptions,
 	isBoardMappingDirty,
 	toBoardMappingForm,
+	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import {
 	anyCustomPromptError,
@@ -2058,7 +2059,7 @@ function ProjectDetailRouteComponent() {
 	};
 
 	const handleBoardMappingProvider = (providerId: string) => {
-		setBoardMapping((prev) => ({ ...prev, providerId }));
+		setBoardMapping((prev) => withSelectedProvider(prev, providerId));
 		updateMutation.reset();
 	};
 

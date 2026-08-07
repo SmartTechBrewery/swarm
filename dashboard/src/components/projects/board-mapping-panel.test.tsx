@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -9,6 +9,7 @@ import {
 	buildPmUpdate,
 	isBoardMappingDirty,
 	toBoardMappingForm,
+	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import type { ProjectPm } from '../../../../src/config/schema.js';
 import { BoardMappingPanel } from './board-mapping-panel.js';
@@ -57,7 +58,7 @@ function Harness({
 		<BoardMappingPanel
 			projectId="p1"
 			form={form}
-			onProviderChange={(providerId) => setForm((f) => ({ ...f, providerId }))}
+			onProviderChange={(providerId) => setForm((f) => withSelectedProvider(f, providerId))}
 			onSelectContainer={(containerId) =>
 				setForm((f) =>
 					f.containerId === containerId
@@ -93,6 +94,7 @@ function renderHarness(props: Parameters<typeof Harness>[0] = {}) {
 
 const PROVIDERS = [
 	{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
+	{ id: 'linear', label: 'Linear', discovery: ['containers', 'states'] },
 ];
 
 const CONFIG: ProjectPm = {
@@ -207,6 +209,80 @@ describe('BoardMappingPanel (issue #201)', () => {
 		renderHarness();
 
 		await waitFor(() => expect(screen.getByText(/Failed to load boards/)).not.toBeNull());
+	});
+
+	// Issue #531: the same panel, for a Linear project — provider vocabulary comes
+	// from the catalogue, and Save needs no Status field context (Linear returns none).
+	describe('with a Linear project', () => {
+		const LINEAR_CONFIG: ProjectPm = {
+			type: 'linear',
+			teamId: 'team-uuid',
+			statusOptions: { todo: 'state-todo' },
+		};
+
+		beforeEach(() => {
+			discoverContainersFn.mockResolvedValue({ containers: [{ id: 'team-uuid', name: 'Core' }] });
+			discoverStatesFn.mockResolvedValue({
+				states: [
+					{ id: 'state-todo', name: 'Todo' },
+					{ id: 'state-done', name: 'Done' },
+				],
+			});
+		});
+
+		it('uses Linear’s nouns and renders its discovered teams and workflow states', async () => {
+			renderHarness({ initial: LINEAR_CONFIG });
+
+			await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
+			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('linear');
+			await screen.findByLabelText(/Linear team/i);
+			await screen.findByRole('option', { name: 'Core' });
+			expect(
+				screen.getByText(/Map each SWARM pipeline status to one of the team's/),
+			).not.toBeNull();
+			// The state selectors are labelled with the provider's own noun, not "status".
+			const readySelect = (await screen.findByLabelText(
+				'Ready workflow state',
+			)) as HTMLSelectElement;
+			await waitFor(() => expect(readySelect.disabled).toBe(false));
+			expect(within(readySelect).getByRole('option', { name: 'Todo' })).not.toBeNull();
+		});
+
+		it('enables Save on an edited mapping and submits the Linear member', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({ initial: LINEAR_CONFIG, onSubmit });
+
+			const save = () => screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			// Unchanged from the stored mapping — saveable, but nothing to save yet.
+			expect(save().disabled).toBe(true);
+
+			const reviewSelect = (await screen.findByLabelText(
+				'In review workflow state',
+			)) as HTMLSelectElement;
+			await waitFor(() => expect(reviewSelect.disabled).toBe(false));
+			fireEvent.change(reviewSelect, { target: { value: 'state-done' } });
+
+			// State discovery returned no `providerContext` for Linear, and Save enables anyway.
+			await waitFor(() => expect(save().disabled).toBe(false));
+			fireEvent.click(save());
+
+			expect(onSubmit).toHaveBeenCalledWith({
+				type: 'linear',
+				teamId: 'team-uuid',
+				statusOptions: { todo: 'state-todo', inReview: 'state-done' },
+			});
+		});
+
+		it('keeps the mapping scoped to its persisted provider', async () => {
+			renderHarness({ initial: LINEAR_CONFIG });
+
+			const teamSelect = (await screen.findByLabelText(/Linear team/i)) as HTMLSelectElement;
+			expect(teamSelect.value).toBe('team-uuid');
+			expect(
+				within(screen.getByLabelText('Provider')).getByRole('option', { name: 'GitHub Projects' }),
+			).toHaveProperty('disabled', true);
+			expect(screen.getByText(/Change the PM provider in/)).not.toBeNull();
+		});
 	});
 
 	it('disables Save until a board and at least one status are chosen', async () => {

@@ -168,8 +168,12 @@ export function BoardMappingPanel({
 								<option
 									key={p.id}
 									value={p.id}
-									// Providers not yet in the registry are shown but not selectable.
-									disabled={providersQuery.isSuccess && !registeredIds.has(p.id)}
+									// Changing providers requires credentials and discovery for that provider,
+									// so this mapping editor remains scoped to the persisted provider.
+									disabled={
+										p.id !== form.providerId ||
+										(providersQuery.isSuccess && !registeredIds.has(p.id))
+									}
 								>
 									{p.label}
 								</option>
@@ -178,6 +182,9 @@ export function BoardMappingPanel({
 					</div>
 
 					<p className="text-xs text-zinc-400 mt-4">{provider.intro}</p>
+					<p className="text-xs text-zinc-500 mt-2">
+						Change the PM provider in <code className="font-mono">swarm.config.json</code>.
+					</p>
 				</div>
 
 				{/* Board / container picker */}
@@ -201,7 +208,7 @@ export function BoardMappingPanel({
 							>
 								<option value="">
 									{containersQuery.isLoading
-										? `Discovering ${provider.containerNoun}s…`
+										? `Discovering ${provider.containerNounPlural}…`
 										: `Select a ${provider.containerNoun}…`}
 								</option>
 								{boardUnavailable && (
@@ -217,7 +224,7 @@ export function BoardMappingPanel({
 							</select>
 							{containersQuery.isSuccess && containers.length === 0 && (
 								<p className="text-xs text-zinc-500 mt-1">
-									No {provider.containerNoun}s were found for the configured token.
+									No {provider.containerNounPlural} were found for the configured token.
 								</p>
 							)}
 							{boardUnavailable && containersQuery.isSuccess && (
@@ -228,7 +235,7 @@ export function BoardMappingPanel({
 							)}
 							{containerErr && !containerCredentialGap && (
 								<p className="text-xs text-red-400 mt-1">
-									Failed to load {provider.containerNoun}s: {containerErr}
+									Failed to load {provider.containerNounPlural}: {containerErr}
 								</p>
 							)}
 						</>
@@ -242,16 +249,16 @@ export function BoardMappingPanel({
 					</h3>
 					<p className="text-xs text-zinc-400 mb-4">
 						Map each SWARM pipeline status to one of the {provider.containerNoun}'s{' '}
-						{provider.stateNoun}es. Leave a status unmapped if the {provider.containerNoun} has no
-						matching {provider.stateNoun}.
+						{provider.stateNounPlural}. Leave a status unmapped if the {provider.containerNoun} has
+						no matching {provider.stateNoun}.
 					</p>
 
 					{statesQuery.isLoading && form.containerId && (
-						<p className="text-xs text-zinc-500 mb-3">Discovering {provider.stateNoun}es…</p>
+						<p className="text-xs text-zinc-500 mb-3">Discovering {provider.stateNounPlural}…</p>
 					)}
 					{statesErr && (
 						<p className="text-xs text-red-400 mb-3">
-							Failed to load {provider.stateNoun}es: {statesErr}
+							Failed to load {provider.stateNounPlural}: {statesErr}
 						</p>
 					)}
 
