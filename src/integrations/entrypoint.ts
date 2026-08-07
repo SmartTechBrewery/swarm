@@ -33,8 +33,9 @@ import './pm/linear/index.js';
 // SCM: GitHub. Registers its manifest into scmProviderRegistry.
 import './scm/github/index.js';
 // SCM: Bitbucket (issue #296, contract complete). Registers with
-// `runtimeReady: false` — discoverable by id, but not selectable and not served a
-// webhook route until project→provider selection exists (a follow-up).
+// `runtimeReady: false` — discoverable by id, but neither routable from
+// `project.scm` nor served a webhook route until the issue completing this provider
+// (#457) flips the flag and mounts its ingress.
 import './scm/bitbucket/index.js';
 // SCM: GitLab (issue #295, contract complete as of its phase 4/4). Registers with
 // `runtimeReady: false` for the same reason Bitbucket does.

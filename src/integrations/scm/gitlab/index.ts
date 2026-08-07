@@ -34,13 +34,13 @@ export const gitlabScmManifest: SCMProviderManifest = {
 	// (`src/router/webhook-receiver.ts`).
 	webhookRoute: '/gitlab/webhook',
 	// The contract is complete as of issue #295 phase 4/4 — no method is stubbed
-	// (`tests/unit/integrations/scm/scm-conformance.test.ts`) — but nothing selects a
-	// project's SCM provider, so this stays `false`: that is what makes registering a
-	// third manifest a no-op for GitHub, since the project-scoped lookup keeps
-	// resolving the one runtime-ready provider instead of refusing to choose
-	// (`../registry.ts`). Flipping it needs project→provider selection plus a served
-	// ingress route — the separate follow-up Bitbucket is already waiting on, not a
-	// phase of #295 (ai/RULES.md §2).
+	// (`tests/unit/integrations/scm/scm-conformance.test.ts`) — but this provider has
+	// not been declared ready to carry traffic, so the flag stays `false` for the same
+	// reason Bitbucket's does: the project-scoped lookup routes only to runtime-ready
+	// manifests, and a project naming `gitlab` gets a loud error rather than a silent
+	// GitHub fallback (`../registry.ts`). Project→provider selection landed with issue
+	// #478 (`project.scm`); what is left is a served ingress route and the readiness
+	// call, which belong to the issue completing this provider (ai/RULES.md §2).
 	runtimeReady: false,
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).

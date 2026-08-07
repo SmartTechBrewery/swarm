@@ -48,12 +48,11 @@ export function getPMProvider(id: string): PMProviderManifest | null {
  * Resolve the manifest a project's board lives on, throwing when nothing is
  * registered for it.
  *
- * Unlike the SCM side's `requireProjectSCMProvider`
- * (`src/integrations/scm/registry.ts`), this needs **no** single-provider
- * assertion and no `runtimeReady` flag: `project.pm.type` already *is* the config
- * discriminator, so project→provider selection is a plain registry lookup. Do not
- * copy SCM's assertion pattern here — it exists precisely because
- * `ProjectConfig` carries no SCM discriminator.
+ * A plain registry lookup on `project.pm.type`, the config discriminator. The SCM
+ * side's `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`) selects the
+ * same way on `project.scm` (issue #478) but adds a `runtimeReady` gate, because an
+ * SCM provider also needs a served ingress route before it can carry traffic. Do not
+ * copy that gate here: a PM provider is selectable the day it registers.
  *
  * A miss therefore means the id names a provider that hasn't been implemented (a
  * `PMType` value widened ahead of its connector — `src/pm/types.ts`) or that the

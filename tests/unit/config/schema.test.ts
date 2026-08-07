@@ -59,6 +59,30 @@ describe('ProjectConfigSchema', () => {
 		expect(() => createMockProjectConfig({ repo: 'not-a-slug' })).toThrow(/owner\/repo/);
 	});
 
+	// `scm` is the discriminator `requireProjectSCMProvider` resolves (issue #478).
+	// Validated here at the config boundary rather than pattern-matched at the lookup
+	// (ai/CODING_STANDARDS.md "Zod is the source of truth").
+	describe('scm discriminator (issue #478)', () => {
+		it('accepts every provider id the contract names', () => {
+			for (const scm of ['github', 'bitbucket', 'gitlab'] as const) {
+				expect(createMockProjectConfig({ scm }).scm).toBe(scm);
+			}
+		});
+
+		it('rejects a provider id that is not an ScmType', () => {
+			expect(() => createMockProjectConfig({ scm: 'gitea' as never })).toThrow();
+		});
+
+		// Absence is the back-compat path: a config predating the field parses with the
+		// key *absent* (not an explicit undefined), and resolves to the sole
+		// runtime-ready provider.
+		it('leaves the key absent when omitted', () => {
+			const project = createMockProjectConfig();
+			expect(project.scm).toBeUndefined();
+			expect(Object.hasOwn(project, 'scm')).toBe(false);
+		});
+	});
+
 	// `pm` carries the board mapping since issue #495, so it has no default: a
 	// project with no PM block, or one naming a provider SWARM has no config member
 	// for, is rejected rather than silently defaulted onto GitHub Projects.

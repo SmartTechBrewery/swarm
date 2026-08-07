@@ -119,6 +119,22 @@ describe('projectsRepository', () => {
 			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
 			expect(project?.agents).toEqual(agents);
 		});
+
+		it('maps a populated scm_type column to the config discriminator', async () => {
+			stubDb([{ ...row, scmType: 'bitbucket' }]);
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
+			expect(project?.scm).toBe('bitbucket');
+		});
+
+		// A NULL column is "this project states no provider", which the lookup resolves
+		// to the sole runtime-ready one — so the key must come back *absent* rather than
+		// present-and-undefined (issue #478).
+		it('leaves scm absent when the column is null', async () => {
+			stubDb([{ ...row, scmType: null }]);
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
+			expect(project?.scm).toBeUndefined();
+			expect(Object.hasOwn(project as object, 'scm')).toBe(false);
+		});
 	});
 
 	describe('findProjectByBoardFromDb', () => {
@@ -305,6 +321,18 @@ describe('projectsRepository', () => {
 			const { values } = stubInsert();
 			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1' }));
 			expect(values.mock.calls[0][0]).toMatchObject({ agents: null });
+		});
+
+		it('writes the scm discriminator, and null when the project states none', async () => {
+			const { values: withScm } = stubInsert();
+			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1', scm: 'gitlab' }));
+			expect(withScm.mock.calls[0][0]).toMatchObject({ scmType: 'gitlab' });
+
+			// Never 'github': a project that states no provider must stay unstated in the
+			// row, or the loud "set scm" error can never fire for it (issue #478).
+			const { values: withoutScm } = stubInsert();
+			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1' }));
+			expect(withoutScm.mock.calls[0][0]).toMatchObject({ scmType: null });
 		});
 
 		it('writes the configured maximum concurrent jobs', async () => {

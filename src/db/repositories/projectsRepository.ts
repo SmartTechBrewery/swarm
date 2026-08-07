@@ -15,6 +15,7 @@ import { and, asc, eq, sql } from 'drizzle-orm';
 
 import type { ProjectConfig, ProjectPm, ProjectVisibility } from '../../config/schema.js';
 import type { PMType } from '../../pm/types.js';
+import type { ScmType } from '../../scm/types.js';
 import { getDb } from '../client.js';
 import { projectMembers } from '../schema/projectMembers.js';
 import { projects } from '../schema/projects.js';
@@ -34,6 +35,11 @@ function rowToProjectConfig(row: ProjectRow): ProjectConfig {
 		branchPrefix: row.branchPrefix,
 		maxConcurrentJobs: row.maxConcurrentJobs,
 		visibility: row.visibility as ProjectVisibility,
+		// A `NULL` scm_type is a project that states no SCM provider, which is a
+		// different thing from one that states `github` — spread it in only when the
+		// column holds a value so the key stays *absent* rather than becoming an
+		// explicit `undefined` (issue #478).
+		...(row.scmType ? { scm: row.scmType as ScmType } : {}),
 		// `pm` is persisted split — the discriminator in `pm_type`, the provider's own
 		// config in the generic `pm_config` blob — so re-assembling the union member is
 		// a re-join, not a re-validation (see this file's header). The cast is what
@@ -63,6 +69,9 @@ function projectConfigToRow(config: ProjectConfig) {
 		branchPrefix: config.branchPrefix,
 		maxConcurrentJobs: config.maxConcurrentJobs,
 		visibility: config.visibility,
+		// `null`, not `'github'`, when the project states no provider — see the
+		// `scm_type` column comment (`src/db/schema/projects.ts`).
+		scmType: config.scm ?? null,
 		pmType,
 		pmConfig,
 		credentials: config.credentials,

@@ -46,6 +46,17 @@ export const projects = pgTable('projects', {
 	 */
 	visibility: text('visibility').notNull().default('private'),
 	/**
+	 * SCM provider id — the persisted form of `ProjectConfig.scm` (`ScmType`,
+	 * `src/scm/types.ts`), stored as free `text` like `pm_type` (issue #478).
+	 *
+	 * **Nullable with no default, deliberately.** `NULL` is "this project states no
+	 * provider", which is exactly the config-absent case `requireProjectSCMProvider`
+	 * resolves to the sole runtime-ready provider. Backfilling `'github'` onto every
+	 * row would turn an unstated project into a stated one and hide the loud
+	 * "set `scm`" error the moment a second provider goes runtime-ready.
+	 */
+	scmType: text('scm_type'),
+	/**
 	 * PM provider id — the `pm` union's discriminator (`PMType`, `src/pm/types.ts`),
 	 * stored as free `text` like `visibility`. Together with `pm_config` below it is
 	 * the persisted form of `ProjectConfig.pm`; the repository re-assembles the two

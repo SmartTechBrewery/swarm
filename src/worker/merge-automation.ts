@@ -194,8 +194,8 @@ export async function processMergeAutomationDispatch(
 	const attempt = dispatch.attempt;
 	let outcome: MergePullRequestOutcome;
 	// Resolving the default *inside* the try, not in a default parameter: an
-	// unresolvable provider (nothing registered, or a second one registered before
-	// project→provider selection exists — `requireProjectSCMProvider`) would
+	// unresolvable provider (nothing registered, or a `project.scm` naming one that is
+	// unregistered or not runtime-ready — `requireProjectSCMProvider`) would
 	// otherwise throw during parameter binding, before this function can settle the
 	// dispatch it was handed. It must fail the same way any other provider failure
 	// does — `provider-error` → outcome persisted on the Review run → `failDispatch`

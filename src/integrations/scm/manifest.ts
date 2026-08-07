@@ -51,13 +51,15 @@ export interface SCMProviderManifest {
 	 * `./registry.ts`) and the receiver's route mounting
 	 * (`src/router/webhook-receiver.ts`) — which is exactly the pair that would
 	 * otherwise start answering for a provider nothing has chosen. Bitbucket (issue
-	 * #296) and GitLab (issue #295) sit here with **complete** contracts: what they
-	 * still lack is project→provider selection, not an implementation.
+	 * #296) and GitLab (issue #295) sit here with **complete** contracts: what each
+	 * still lacks is a served ingress route and the decision, in its own completion
+	 * issue, that it is ready to carry traffic.
 	 *
-	 * It is **not** a selection mechanism and does not soften the single-provider
-	 * assertion: the second provider to claim runtime readiness still makes the
-	 * project-scoped lookup throw, so project→provider selection gets designed
-	 * then rather than resolving to whichever manifest registered first.
+	 * It is **not** a selection mechanism — `ProjectConfig.scm` is, since issue #478
+	 * (`src/config/schema.ts`). The two compose: a project that selects a provider
+	 * declaring `runtimeReady: false` gets a loud, specific throw rather than that
+	 * provider or a fallback to another, and a project that selects nothing resolves
+	 * only when exactly one manifest is runtime-ready.
 	 *
 	 * `requireSCMProvider(id)` deliberately does not consult `runtimeReady`: an
 	 * explicit ID lookup for an enqueued job identity is intentionally exempt since

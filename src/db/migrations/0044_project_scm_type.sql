@@ -1,0 +1,11 @@
+-- Issue #478: a project now states which SCM provider its repository lives on, so
+-- two or more runtime-ready providers can be registered at once and each project's
+-- operations route to its own (`ProjectConfig.scm`, `src/config/schema.ts`; the
+-- discriminator `requireProjectSCMProvider` resolves).
+--
+-- Nullable with no default on purpose: NULL is "this project states no provider",
+-- which resolves to the sole runtime-ready provider — that is what keeps every row
+-- written before this column existed working with no backfill. Defaulting to
+-- 'github' would turn an unstated project into a stated one and hide the loud
+-- "set scm" error the moment a second provider goes runtime-ready.
+ALTER TABLE "projects" ADD COLUMN "scm_type" text;
