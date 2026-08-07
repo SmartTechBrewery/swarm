@@ -22,6 +22,7 @@ import {
 	splitAntigravityModel,
 } from '../harness/models.js';
 import { githubProjectsConfigSchema } from '../integrations/pm/github-projects/config-schema.js';
+import { jiraConfigSchema } from '../integrations/pm/jira/config-schema.js';
 import { linearConfigSchema } from '../integrations/pm/linear/config-schema.js';
 // Registry lookup only — `./registry.js` imports nothing at runtime, so this stays a
 // leaf import rather than pulling the provider implementations in behind it.
@@ -516,10 +517,11 @@ export const PROJECT_VISIBILITIES = ProjectVisibilitySchema.options;
  * dashboard's provider-neutral board-mapping form changes.
  *
  * Narrowing a member back to a concrete provider's config is the *provider's* job
- * — `requireGitHubProjectsConfig` or `requireLinearConfig` — never a `pm.type`
- * branch in shared code (ai/RULES.md §2). The Linear member parses ahead of its
- * manifest: it remains unresolvable, and mounts no route, until that provider is
- * complete and registered.
+ * — `requireGitHubProjectsConfig`, `requireLinearConfig`, `requireJiraConfig` —
+ * never a `pm.type` branch in shared code (ai/RULES.md §2). The Jira member parses
+ * ahead of its manifest: it remains unresolvable, and mounts no route, until that
+ * provider is complete and registered (issue #490 phase 1/6), exactly as the
+ * Linear member did before issue #530.
  *
  * Routing the member list through the PM registry instead of importing each
  * provider's schema here stays deferred, exactly as `PMProviderManifest`'s own
@@ -529,6 +531,7 @@ export const PROJECT_VISIBILITIES = ProjectVisibilitySchema.options;
 export const ProjectPmSchema = z.discriminatedUnion('type', [
 	z.object({ type: z.literal('github-projects') }).merge(githubProjectsConfigSchema),
 	z.object({ type: z.literal('linear') }).merge(linearConfigSchema),
+	z.object({ type: z.literal('jira') }).merge(jiraConfigSchema),
 ]);
 
 /**
