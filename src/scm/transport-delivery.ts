@@ -1,25 +1,29 @@
 /**
- * Worker-side transport-backed {@link ScmDeliveryProvider} (ADR-004 §2). A
- * federated worker (one that does not hold the per-project reviewer PAT) uses
- * this provider so the two metadata-only SCM delivery calls — `submitReview`,
- * `postComment` — travel up the transport to the control-plane delivery API
- * (`../router/worker-delivery.ts`), which performs the GitHub write under the
- * persona this composite names: the per-project reviewer PAT for a Review's
- * verdict and comment, the implementer for a Respond-to-review reply. Only
- * metadata (a verdict + a comment body + the PR number) crosses the wire; the
- * repository tree never does (ai/RULES.md §1). The wire mechanics — URL join,
- * bearer header, protocol stamp, error contract — live in the shared client
+ * Worker-side transport-backed {@link ScmDeliveryProvider} (ADR-004 §2). A worker
+ * does not hold the per-project reviewer PAT, so the two metadata-only SCM
+ * delivery calls — `submitReview`, `postComment` — travel up the transport to the
+ * control-plane delivery API (`../router/worker-delivery.ts`), which performs the
+ * GitHub write under the persona this composite names: the per-project reviewer
+ * PAT for a Review's verdict and comment, the implementer for a Respond-to-review
+ * reply. Only metadata (a verdict + a comment body + the PR number) crosses the
+ * wire; the repository tree never does (ai/RULES.md §1). The wire mechanics — URL
+ * join, bearer header, protocol stamp, error contract — live in the shared client
  * (`../transport/delivery-client.ts`).
  *
- * Everything that carries source or must be attributed to the operator's own
- * GitHub account — `commitIdentity`, `findPullRequest`, `createPullRequest`,
- * `pushBranch` — delegates verbatim to a `localDelegate` (the worker's own
- * in-process provider, built from the operator's token). That keeps
- * respond-to-review working: it still commits and pushes locally with the
- * operator's identity, and only the PR comment rides the transport. A DB-free
- * remote worker composes the same way, passing the operator-token delivery
- * provider it already built as the delegate
- * (`../transport/assignment-execution.ts`).
+ * **This one stayed a composite when its PM counterpart stopped being one**
+ * (issue #553 deleted `createTransportPmDeliveryProvider`), and the reason is the
+ * credential split rather than which worker is running. `localDelegate` here is
+ * the **operator-credential** provider — `SCMProvider.operatorDeliveryProvider`,
+ * built from the worker operator's own token (ADR-003 §2) — not an in-process,
+ * DB-backed one. Everything that carries source or must be attributed to that
+ * account (`commitIdentity`, `findPullRequest`, `createPullRequest`,
+ * `pushBranch`) has to run where the checkout is, under a token the control plane
+ * never sees; everything the *project's* reviewer/implementer persona must sign
+ * for has to run where that credential is. The pair is what expresses that split,
+ * so it survives having exactly one caller
+ * (`../transport/assignment-execution.ts`). The PM side had no such split — a
+ * board write has no local half at all — so its delegate was only ever the
+ * DB-holding worker's in-process provider, and it retired with that worker.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * `DeliveryDeferredError` retry path (`../pipeline/review.ts`,
@@ -49,7 +53,10 @@ export interface TransportScmDeliveryOptions extends DeliveryClientOptions {
 	 * phase runs under instead of leaving the server to infer one.
 	 */
 	persona: DeliveryPersona;
-	/** The worker's in-process provider, handling every source-carrying / attribution op. */
+	/**
+	 * The worker's operator-credential provider, handling every source-carrying /
+	 * attribution op under the operator's own account.
+	 */
 	localDelegate: ScmDeliveryProvider;
 }
 

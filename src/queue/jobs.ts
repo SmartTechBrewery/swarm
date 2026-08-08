@@ -57,7 +57,7 @@ const jobBase = z.object({
 	recheckAttempt: z.number().int().nonnegative().optional(),
 	/**
 	 * How many times this job has already been re-enqueued as a deferred retry
-	 * (`src/worker/index.ts`, on a `phase-deferred` outcome) — either a rate-limit
+	 * (on a `phase-deferred` outcome) — either a rate-limit
 	 * hit or a run the worker itself aborted mid-flight (e.g. a `--watch`
 	 * restart). Absent on a fresh webhook; incremented on each deferral so the
 	 * consumer can cap the retry loop (one shared budget for both reasons —
@@ -121,8 +121,8 @@ const jobBase = z.object({
 	resumeDelivery: z.boolean().optional(),
 	/**
 	 * The `runs` row this job re-runs (issue #136). Absent on a fresh webhook;
-	 * set when a deferred run is re-enqueued (`reenqueueDeferred`
-	 * `src/worker/index.ts`, or a manual "Retry now") so the worker resets that
+	 * set when a deferred run is re-enqueued (a scheduled deferral retry, or a
+	 * manual "Retry now") so the consumer resets that
 	 * existing row to `running` instead of inserting a second one — a retry then
 	 * shows as one run on the dashboard, not two. When absent, the consumer
 	 * creates a fresh row as before.

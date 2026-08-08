@@ -26,6 +26,11 @@ enrollments, memberships, sharing consent, discoverable projects, assignee
 identity links). What it does **not** cover is the two mechanics that actually
 block a worker from running on a machine other than the one hosting the stack:
 
+> **Reading note.** This section describes the code as it stood in 2026-07, and
+> its `src/worker/index.ts` citations are historical: that entry point was deleted
+> when open question 2 was answered (issue #544/#553, below). Nothing in SWARM
+> connects a worker to Postgres or Redis any more.
+
 1. **Transport.** The worker connects to Postgres and Redis **directly**. It
    runs migrations (`src/worker/index.ts` imports `runMigrations`), opens a raw
    `pg.Pool` (`src/db/client.ts`), and pulls jobs as a BullMQ `Worker`
@@ -63,8 +68,8 @@ protocol modelled on PROJECT.md §3, carried over WebSocket for the bidi stream
 plus HTTP for request/response calls:
 
 - **Handshake** — worker presents `SWARM_WORKER_CREDENTIAL`; the control plane
-  validates it against the worker roster (as `acquireWorkerExecutionSession`
-  does today, `src/worker/index.ts:129-148`) and returns a session.
+  validates it against the worker roster and returns a session
+  (`src/identity/worker-session-service.ts`, via `src/router/worker-transport.ts`).
 - **Capability + heartbeat** — the worker reports its declared CLIs and health
   on connect and periodically; a disconnected/unhealthy worker is not selected
   for dispatch (ADR-001 "Worker capabilities and availability").
@@ -77,10 +82,12 @@ plus HTTP for request/response calls:
 - **Result + logs** — the worker streams progress logs and the phase result
   back up the stream (the phases already produce a structured hand-off; see §3).
 
-The current in-process, DB-direct path is retained for the **local host worker**
-(single-user mode and a same-machine trusted worker); the transport is
-**additive** for remote workers. Unifying both behind the transport is deferred
-(see Open questions).
+This was originally **additive**: the in-process, DB-direct path was retained for
+the local host worker while the transport served remote ones. It no longer is —
+open question 2 was answered in favour of one path (issue #544, 2026-08-08), and
+the in-process executor was deleted rather than kept behind a flag. Every worker
+runs this transport; the control-plane host's points `SWARM_CONTROL_PLANE_URL` at
+its own router over loopback.
 
 ### 2. Split GitHub delivery by whether the operation carries source
 
@@ -373,17 +380,39 @@ worker/user columns complete that half of the mapping too.
 1. **Transport framing.** WebSocket for the bidi stream is assumed; is HTTP
    long-poll/SSE acceptable as a fallback, and what is the exact message
    framing/versioning (mirroring PROJECT.md §3's `AgentMessage`/`CloudMessage`)?
-2. **Local worker unification.** Keep the in-process DB-direct path for the
+2. **Local worker unification.** ~~Keep the in-process DB-direct path for the
    local host worker and make the transport additive (proposed), or route even
-   the local worker through a `localhost` transport to have one code path?
-   *Now decidable, still open (issue #536).* This question was unanswerable while
-   the transport path could not run every phase — unifying onto it would have cost
-   Planning. All six phases now run there, so the two paths are functionally
-   equivalent and the choice is a real one. The argument for taking it is that two
-   paths mean the DB-free half only gets exercised where someone deliberately runs
-   it: issue #535 found a real phase body had never once run on it. Left open rather
-   than settled here — it is a separate change, and the same-host path carries all
-   traffic today.
+   the local worker through a `localhost` transport to have one code path?~~
+   **Answered 2026-08-08 (issue #544): one code path — the transport.** The
+   in-process DB-direct executor is *deleted*, not kept behind a flag. Every
+   worker, the control-plane host's included, runs
+   `src/transport/connect-entry.ts` and reaches its own router over loopback, so
+   "local" is a network distance rather than a code path; the router always hosts
+   the dispatch consumer + ADR-001 eligibility gate.
+
+   The argument that decided it is the one the question already named: two paths
+   mean the DB-free half only gets exercised where someone deliberately runs it,
+   and issue #535 found a phase body that had never once run on it. A flag would
+   have preserved exactly that failure mode. It became decidable once all six
+   phases ran on the transport (issue #536), and the six phases of #544 closed the
+   gaps that made the two paths *not* equivalent — persisting a transport-dispatched
+   run's live output control-plane side (#544), delivering cancellation over the
+   transport (#549), giving the host worker's non-execution chores a stated owner
+   (#550, the API server), running the control-plane host's worker through the
+   DB-free entrypoint (#551), and dispatching a single-user deployment over the
+   transport (#552).
+
+   What went with it (issue #553): `src/worker/index.ts`, `runPhase` and the two
+   delivery-mode resolvers (`resolvePmDelivery` / `resolveScmDelivery`) in
+   `src/worker/consumer.ts`, the composite `createTransportPmDeliveryProvider`
+   (§2's delegate-holding PM shape — a worker has no in-process provider to
+   delegate to any more), `SWARM_DISPATCH_MODE` and every branch on it, and the
+   `dev:worker:legacy` / `start:worker:legacy` scripts. What stayed:
+   `processJob`, the eligibility gate and `runAssignedPhase` — the shared machine
+   the control plane runs, now reached only from `src/router/dispatcher.ts`. The
+   SCM composite (`createTransportScmDeliveryProvider`) also stayed, because its
+   delegate is the *operator-credential* provider rather than an in-process one:
+   it expresses §2's credential split, not a dispatch mode.
 3. **GitHub repo visibility.** `ProjectVisibilitySchema` (`private` |
    `discoverable`, `src/config/schema.ts:443,483`) is a SWARM *discovery* policy,
    **not** GitHub repo visibility. Do we add a separate repo-visibility field to

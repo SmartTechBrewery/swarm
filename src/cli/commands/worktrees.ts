@@ -17,8 +17,8 @@ Usage: swarm worktrees prune [--project <id>] [--dry-run]
 
 Requires DATABASE_URL (project config) in the environment — run via
 \`npm run worktrees:prune\` (loads .env) or export it yourself first. The
-in-flight check also needs REDIS_URL in SWARM_DISPATCH_MODE=in-process; in
-transport mode it reads host-local \`.swarm-state\` leases instead.`;
+in-flight check reads the host-local \`.swarm-state\` leases the worker writes,
+so it needs no Redis.`;
 
 /**
  * Print a labelled `<label>: <count>` line followed by each entry, or nothing

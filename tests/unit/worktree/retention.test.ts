@@ -5,7 +5,6 @@ import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { pruneStaleWorktrees, retentionWorktreeRuntime } from '@/worktree/retention.js';
-import { storeBackedWorktreeRuntime } from '@/worktree/worktree-runtime.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const { hasResumableDeferredRunMock } = vi.hoisted(() => ({
@@ -357,11 +356,11 @@ describe('pruneStaleWorktrees', () => {
 });
 
 /**
- * Issue #551: the control-plane host's worker now runs the DB-free entrypoint, so
- * it writes host-local filesystem leases instead of the Redis one — and the sweep
- * (in the API server, `src/api/maintenance.ts`, and in `swarm worktrees prune`)
- * has to read the store the worker actually writes, or it would find every
- * checkout unleased and prune one out from under a live phase.
+ * Issue #551/#553: every worker runs the DB-free entrypoint, so it writes
+ * host-local filesystem leases rather than the Redis one the retired in-process
+ * worker held — and the sweep (in the API server, `src/api/maintenance.ts`, and in
+ * `swarm worktrees prune`) has to read the store the worker actually writes, or it
+ * would find every checkout unleased and prune one out from under a live phase.
  */
 describe('retentionWorktreeRuntime', () => {
 	let repoRoot: string;
@@ -397,11 +396,6 @@ describe('retentionWorktreeRuntime', () => {
 		);
 	}
 
-	it('keeps the store-backed runtime in in-process dispatch mode', () => {
-		const project = createMockProjectConfig({ repoRoot, worktreeRoot: '.swarm-workspaces' });
-		expect(retentionWorktreeRuntime(project, 'in-process')).toBe(storeBackedWorktreeRuntime);
-	});
-
 	it('skips a checkout held by a live host-local lease instead of pruning it', async () => {
 		const project = createMockProjectConfig({
 			repoRoot,
@@ -412,10 +406,7 @@ describe('retentionWorktreeRuntime', () => {
 		for (const taskId of ['1', '2']) mkdirSync(taskPath(taskId), { recursive: true });
 		writeHostLocalLease(project, '1');
 
-		const manager = new FakeGitWorktreeManager(
-			project,
-			retentionWorktreeRuntime(project, 'transport'),
-		);
+		const manager = new FakeGitWorktreeManager(project, retentionWorktreeRuntime(project));
 		manager.setWorktreesList([taskPath('1'), taskPath('2')]);
 		statSyncMock.mockImplementation((path: string) => {
 			if (path.endsWith('task-1')) return { mtimeMs: 1000 } as unknown as Stats;
@@ -443,10 +434,7 @@ describe('retentionWorktreeRuntime', () => {
 		const taskPath = (taskId: string) => resolve(repoRoot, '.swarm-workspaces', `task-${taskId}`);
 		for (const taskId of ['1', '2']) mkdirSync(taskPath(taskId), { recursive: true });
 
-		const manager = new FakeGitWorktreeManager(
-			project,
-			retentionWorktreeRuntime(project, 'transport'),
-		);
+		const manager = new FakeGitWorktreeManager(project, retentionWorktreeRuntime(project));
 		manager.setWorktreesList([taskPath('1'), taskPath('2')]);
 		statSyncMock.mockImplementation((path: string) => {
 			if (path.endsWith('task-1')) return { mtimeMs: 1000 } as unknown as Stats;

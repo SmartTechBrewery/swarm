@@ -4,7 +4,7 @@
  * The implementer persona is no longer a project-scoped secret: it resolves to
  * the worker operator's *own* GitHub token, held only on the machine that runs
  * the implementer phases. This mirrors `SWARM_WORKER_CREDENTIAL`
- * (`src/worker/index.ts`): a plain worker-local env var that is **never
+ * (`src/transport/connect-entry.ts`): a plain worker-local env var that is **never
  * persisted** (never written to `project_credentials`), **never in
  * `ProjectConfig`** (so it is never in the transport `NonSecretProjectConfig`
  * slice, `src/config/project-config-slice.ts`), and **never sent over the

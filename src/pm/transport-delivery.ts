@@ -1,38 +1,30 @@
 /**
  * Worker-side transport-backed PM **write** delegate (ADR-004 §2, the Phase 2/2
- * counterpart of `../scm/transport-delivery.ts`). A federated worker (one that
- * does not hold the per-project PM credential) uses this provider so the two
- * metadata-only PM board writes — `moveWorkItem`, `addComment` — travel up the
- * transport to the control-plane delivery API (`../router/worker-delivery.ts`),
- * which performs the board write under the PM credential. Only metadata (a
- * canonical status key or a comment body) crosses the wire; the repository tree
- * never does (ai/RULES.md §1). The wire mechanics live in the shared client
- * (`../transport/delivery-client.ts`).
+ * counterpart of `../scm/transport-delivery.ts`). A worker does not hold the
+ * per-project PM credential, so this provider sends the two metadata-only PM
+ * board writes — `moveWorkItem`, `addComment` — up the transport to the
+ * control-plane delivery API (`../router/worker-delivery.ts`), which performs the
+ * board write under that credential. Only metadata (a canonical status key or a
+ * comment body) crosses the wire; the repository tree never does (ai/RULES.md §1).
+ * The wire mechanics live in the shared client (`../transport/delivery-client.ts`).
  *
- * Two shapes share those writes, for the two kinds of worker:
- *
- * - {@link createTransportPmDeliveryProvider} — the **composite**, for a worker
- *   that still holds `DATABASE_URL` and can build an in-process provider: every
- *   remaining `PMProvider` method (the reads `getWorkItem`/`listWorkItems`/
- *   `findComment`/`listBlockers`, the other writes `createWorkItem`/
- *   `updateWorkItem`/`addLabel`/`addBlockedBy`, and `discover`) delegates
- *   verbatim to a `localDelegate`, so the full interface the pipeline phases
- *   expect is preserved unchanged.
- * - {@link createWriteOnlyTransportPmProvider} — the **delegate-less** variant,
- *   for a DB-free remote worker (`../transport/assignment-execution.ts`) that has
- *   no in-process provider to fall back on: every board write rides the transport,
- *   as do the five narrow reads a DB-free phase needs — `listBlockers` (the
- *   dependency gate must keep gating), `findWorkItemByUrlSuffix`
- *   (Respond-to-review's board card), `findWorkItemForArtifact` (the
- *   repository-scoped automation gate), `findComment` (Planning's own replay guard)
- *   and `findWorkItemByDescriptionMarker` (the split child that guard's retry must
- *   not duplicate) — while the two *enumerating/whole-item* reads refuse with an
- *   actionable error, because the control plane already performed the reads the
- *   assignment was composed from.
+ * **One shape**, {@link createWriteOnlyTransportPmProvider}, because there is one
+ * kind of worker (issue #553). Every worker runs the DB-free entrypoint
+ * (`../transport/connect-entry.ts`) and has no in-process provider to fall back
+ * on, so this factory takes no local delegate: every board write rides the
+ * transport, as do the five narrow reads a DB-free phase needs — `listBlockers`
+ * (the dependency gate must keep gating), `findWorkItemByUrlSuffix`
+ * (Respond-to-review's board card), `findWorkItemForArtifact` (the
+ * repository-scoped automation gate), `findComment` (Planning's own replay guard)
+ * and `findWorkItemByDescriptionMarker` (the split child that guard's retry must
+ * not duplicate) — while the two *enumerating/whole-item* reads refuse with an
+ * actionable error, because the control plane already performed the reads the
+ * assignment was composed from. The composite that wrapped a `localDelegate`
+ * retired with the DB-holding worker it existed for.
  *
  * A non-2xx or unparseable response **throws**, so the phase's existing
- * best-effort / board-report handling behaves exactly as it does with the
- * in-process provider today.
+ * best-effort / board-report handling behaves exactly as it does with a
+ * control-plane-resolved provider.
  */
 
 import { type DeliveryClientOptions, postDelivery } from '../transport/delivery-client.js';
@@ -52,15 +44,10 @@ import type { PMProvider, PMType, WorkItem, WorkItemArtifact } from './types.js'
 
 export type { FetchLike } from '../transport/delivery-client.js';
 
-/** What both shapes need to reach the control plane's PM delivery routes. */
+/** What the provider needs to reach the control plane's PM delivery routes. */
 interface TransportPmWriteOptions extends DeliveryClientOptions {
 	/** The project id, sent so the server resolves the right PM credential + enrollment. */
 	projectId: string;
-}
-
-export interface TransportPmDeliveryOptions extends TransportPmWriteOptions {
-	/** The worker's in-process provider, handling every read + non-metadata-write op. */
-	localDelegate: PMProvider;
 }
 
 export interface WriteOnlyTransportPmDeliveryOptions extends TransportPmWriteOptions {
@@ -72,10 +59,7 @@ export interface WriteOnlyTransportPmDeliveryOptions extends TransportPmWriteOpt
 	providerType: PMType;
 }
 
-/**
- * The two metadata board writes, as they ride the transport. Shared by both
- * factories below so the request shapes can't drift apart.
- */
+/** The two metadata board writes, as they ride the transport. */
 function transportPmWrites(
 	options: TransportPmWriteOptions,
 ): Pick<PMProvider, 'moveWorkItem' | 'addComment'> {
@@ -96,40 +80,6 @@ function transportPmWrites(
 				{ projectId: options.projectId, itemId: id, body: text },
 				(value) => AddPmCommentDeliveryResponseSchema.parse(value).commentId,
 			),
-	};
-}
-
-/**
- * Build a transport-backed PM write delegate. The two metadata writes POST to
- * the control plane; every other `PMProvider` method delegates to `localDelegate`
- * (each wrapped in an arrow so the concrete provider's `this` binding is kept).
- */
-export function createTransportPmDeliveryProvider(options: TransportPmDeliveryOptions): PMProvider {
-	const { localDelegate } = options;
-	return {
-		type: localDelegate.type,
-		supportsAssignees: localDelegate.supportsAssignees,
-		supportsDependencies: localDelegate.supportsDependencies,
-		// Reads and non-metadata writes stay on the worker's in-process provider.
-		getWorkItem: (id) => localDelegate.getWorkItem(id),
-		listWorkItems: (filter) => localDelegate.listWorkItems(filter),
-		findWorkItemByUrlSuffix: (urlSuffix) => localDelegate.findWorkItemByUrlSuffix(urlSuffix),
-		findWorkItemForArtifact: (artifact) => localDelegate.findWorkItemForArtifact(artifact),
-		findWorkItemByDescriptionMarker: (marker) =>
-			localDelegate.findWorkItemByDescriptionMarker(marker),
-		findComment: (id, marker) => localDelegate.findComment(id, marker),
-		createWorkItem: (input) => localDelegate.createWorkItem(input),
-		updateWorkItem: (id, patch) => localDelegate.updateWorkItem(id, patch),
-		addLabel: (id, name) => localDelegate.addLabel(id, name),
-		listBlockers: (id) => localDelegate.listBlockers(id),
-		addBlockedBy: (id, blockerId) => localDelegate.addBlockedBy(id, blockerId),
-		// `discover` (the optional board-mapping capability) is intentionally not
-		// exposed: it is a server-side administration concern reached through the
-		// PM registry, never called on a pipeline phase's `pm`, so this write-only
-		// transport delegate leaves it absent (a valid `PMProvider` — `discover` is
-		// optional) rather than routing discovery over the metadata-write transport.
-		// The two metadata writes ride the transport under the server-side PM credential.
-		...transportPmWrites(options),
 	};
 }
 

@@ -1,19 +1,18 @@
 /**
- * Control-plane host maintenance (issue #550) — the stated owner of the
- * non-execution chores that today run only as a side effect of the host worker's
- * BullMQ startup path.
+ * Control-plane host maintenance (issue #550) — the stated owner of three chores
+ * that have nothing to do with executing a phase: the startup orphaned-`running`
+ * reap, periodic CLI capability/quota discovery, and the background worktree
+ * retention sweep.
  *
- * Three of the worker entry point's responsibilities have nothing to do with
- * executing a phase: the startup orphaned-`running` reap, periodic CLI
- * capability/quota discovery, and the background worktree retention sweep. In
- * `SWARM_DISPATCH_MODE=transport` (ADR-003 §2) `src/worker/index.ts` hands off to
- * the transport-dispatch client and never reaches any of them, so they silently
- * stop happening. They cannot move to the **router**: it runs in Docker
- * (`docker-compose.yml`) with no agent CLIs on PATH and no repository checkout,
- * which is exactly what quota discovery probes and what the sweep prunes. The
- * **API server** is the process that has all three — `DATABASE_URL`, the
- * operator's PATH, and the checkout — and it already runs host-local CLI
- * discovery on demand (`quota.refreshQuotas`), so it owns the periodic form too.
+ * They used to run only as a side effect of a database-holding host worker's
+ * BullMQ startup path, which no longer exists (issue #553 — every worker is the
+ * DB-free `src/transport/connect-entry.ts`). They cannot move to the **router**
+ * either: it runs in Docker (`docker-compose.yml`) with no agent CLIs on PATH and
+ * no repository checkout, which is exactly what quota discovery probes and what
+ * the sweep prunes. The **API server** is the process that has all three —
+ * `DATABASE_URL`, the operator's PATH, and the checkout — and it already runs
+ * host-local CLI discovery on demand (`quota.refreshQuotas`), so it owns the
+ * periodic form too.
  *
  * What stays elsewhere, deliberately: migrations and the dispatch/stale-run
  * reconcilers are the **router**'s (`src/router/index.ts`, `src/router/dispatcher.ts`),
@@ -22,7 +21,7 @@
  *
  * Everything here is best-effort per iteration and every timer is `unref`'d, so a
  * failing chore never stops the API server and a pending sweep never holds the
- * process open — the same shape the worker's copies have.
+ * process open.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -30,7 +29,7 @@ import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failOrphanedRunningRuns } from '../db/repositories/runsRepository.js';
 import { discoverCliQuotas } from '../harness/quota-discovery.js';
-import { type DispatchMode, optionalEnv, resolveDispatchMode } from '../lib/env.js';
+import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { pruneStaleWorktrees } from '../worktree/retention.js';
@@ -45,12 +44,6 @@ const QUOTA_DISCOVERY_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 
 export interface HostMaintenanceOptions {
-	/**
-	 * Which dispatch mode this installation runs in; defaults to
-	 * `resolveDispatchMode()`. Anything but `transport` leaves these chores on the
-	 * host worker, which still runs them in that mode.
-	 */
-	dispatchMode?: DispatchMode;
 	/** Worktree sweep cadence; defaults to `SWARM_WORKTREE_SWEEP_INTERVAL_MS`. */
 	worktreeSweepIntervalMs?: number;
 	/** Quota discovery cadence; defaults to {@link QUOTA_DISCOVERY_INTERVAL_MS}. */
@@ -69,10 +62,8 @@ export interface HostMaintenanceHandle {
 }
 
 /**
- * Resolve the worktree retention sweep cadence, validated at API startup exactly
- * as the worker validates it at its own startup (a bad value throws rather than
- * silently falling back). Mirrored in `src/worker/index.ts` until the in-process
- * path is retired.
+ * Resolve the worktree retention sweep cadence, validated at API startup (a bad
+ * value throws rather than silently falling back, like every other env parser).
  */
 function resolveWorktreeSweepIntervalMs(): number {
 	const raw = optionalEnv(
@@ -87,20 +78,13 @@ function resolveWorktreeSweepIntervalMs(): number {
 }
 
 /**
- * Start the control-plane host maintenance loop. Returns `undefined` in
- * `in-process` dispatch mode — there the host worker reaches its own copies of
- * these chores, and running them on both processes would have two hosts pruning
- * one checkout and probing one PATH.
+ * Start the control-plane host maintenance loop.
  *
  * The startup reap runs once; the sweep and quota discovery run once immediately
  * and then on their own interval. Nothing is awaited, so the API server binds its
  * port without waiting on a CLI probe.
  */
-export function startHostMaintenance(
-	options: HostMaintenanceOptions = {},
-): HostMaintenanceHandle | undefined {
-	if ((options.dispatchMode ?? resolveDispatchMode()) !== 'transport') return undefined;
-
+export function startHostMaintenance(options: HostMaintenanceOptions = {}): HostMaintenanceHandle {
 	const sweepIntervalMs = options.worktreeSweepIntervalMs ?? resolveWorktreeSweepIntervalMs();
 	const quotaIntervalMs = options.quotaDiscoveryIntervalMs ?? QUOTA_DISCOVERY_INTERVAL_MS;
 	const failOrphanedRuns = options.failOrphanedRuns ?? failOrphanedRunningRuns;

@@ -10,7 +10,6 @@
  * the number is the process exit code.
  */
 
-import { resolveDispatchMode } from '../lib/env.js';
 import * as out from './_shared/output.js';
 import * as config from './commands/config.js';
 import * as identities from './commands/identities.js';
@@ -46,7 +45,6 @@ const COMMANDS: Record<string, Command> = {
 };
 
 function usage(): string {
-	const workerCommand = resolveDispatchMode() === 'transport' ? 'dev:worker' : 'dev:worker:legacy';
 	return `swarm — SWARM operator CLI
 
 Usage: swarm <command> [options]
@@ -66,7 +64,7 @@ Commands:
   workers          Register and manage local workers (identity + declared CLIs)
   worktrees prune  Prune stale per-task worktrees
 
-The worker is not managed here — it runs on the host: npm run ${workerCommand}`;
+The worker is not managed here — it runs on the host: npm run dev:worker`;
 }
 
 /**

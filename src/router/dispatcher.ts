@@ -55,7 +55,7 @@ import {
 	getLiveSessionForWorker,
 	resolveHeartbeatTtlMs,
 } from '../identity/worker-session-service.js';
-import { requireEnv } from '../lib/env.js';
+import { optionalEnv, requireEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { parseRedisUrl } from '../lib/redis.js';
@@ -109,6 +109,26 @@ const DEFAULT_PHASE_TIMEOUT_MS = resolveAgentTimeoutMs();
 
 /** Grace past the largest configured timeout before a `running` run row is judged stale. */
 const STALE_RUN_MARGIN_MS = 10 * 60 * 1000;
+
+/**
+ * How often the reconciliation loop runs — reclaiming expired dispatch leases and
+ * reaping stale `running` run rows left by a worker that died mid-phase. Cheap
+ * (bounded UPDATEs), so it can run far more often than the hourly worktree sweep;
+ * default every 5 min.
+ *
+ * The knob moved here with the executor it used to belong to (issue #553): it was
+ * the in-process worker's own sweep cadence, and the reap is now the control
+ * plane's job. The name is kept so an existing `.env` keeps working.
+ */
+function resolveStaleRunSweepIntervalMs(
+	raw = optionalEnv('SWARM_STALE_RUN_SWEEP_INTERVAL_MS', String(5 * 60 * 1000)),
+): number {
+	const value = Number(raw);
+	if (!Number.isInteger(value) || value < 1) {
+		throw new Error(`SWARM_STALE_RUN_SWEEP_INTERVAL_MS must be a positive integer, got '${raw}'`);
+	}
+	return value;
+}
 
 /**
  * Resolve the *selected* worker's live-session identity so the control plane can
@@ -486,11 +506,13 @@ export interface DispatchConsumerHandle {
 /**
  * Start the control-plane dispatch consumer: reconcile the durable dispatch state
  * machine, then run the BullMQ consumer that dequeues wake-ups and drives each
- * through `processJob` with the transport dispatch deps. Mirrors the host worker's
- * consumer wiring (`../worker/index.ts`) — stale-job discard, dispatch settle on a
- * stale wake-up, periodic lease/run reconciliation — but never runs a phase itself.
- * Only started when `SWARM_DISPATCH_MODE=transport` (see `../router/index.ts`), so
- * the queue is consumed by exactly one side.
+ * through `processJob` with the transport dispatch deps — stale-job discard,
+ * dispatch settle on a stale wake-up, periodic lease/run reconciliation — but
+ * never runs a phase itself; every phase runs on a connected worker.
+ *
+ * The router always starts this (`../router/index.ts`) and is the queue's only
+ * consumer: issue #553 deleted the in-process executor that used to be the other
+ * side, so there is no mode in which this is skipped.
  */
 export async function startControlPlaneDispatch(options: {
 	shutdownSignal: AbortSignal;
@@ -586,14 +608,12 @@ export async function startControlPlaneDispatch(options: {
 			});
 		}
 	}
-	const reconcileInterval = setInterval(() => void reconcile(), 5 * 60 * 1000);
+	const reconcileInterval = setInterval(() => void reconcile(), resolveStaleRunSweepIntervalMs());
 	reconcileInterval.unref();
 
-	// Deliver user terminations to the worker running the run (issue #549). The
-	// in-process worker's own subscription lives in the BullMQ branch this mode
-	// never reaches, so without this a transport-dispatched run is unstoppable
-	// until its wall-clock timeout — and a DB-free worker has no Redis to read the
-	// durable marker with either.
+	// Deliver user terminations to the worker running the run (issue #549). A
+	// dispatched run is otherwise unstoppable until its wall-clock timeout, and a
+	// DB-free worker has no Redis to read the durable marker with either.
 	const cancellations = subscribeDispatchCancellations();
 
 	logger.info('swarm-router: control-plane dispatch consumer started', {
