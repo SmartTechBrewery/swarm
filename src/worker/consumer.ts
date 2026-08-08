@@ -1284,8 +1284,8 @@ export interface AssignedPhaseInputs {
 	 * resume, delivery/branch progress to adopt, and the recovery mode the
 	 * worktree gate enforces. **Required, and one value rather than five optional
 	 * siblings** (issue #591): the members are declared once
-	 * ({@link RecoveryIntentSchema}) and resolved once
-	 * ({@link phaseRecoveryFromAssignment}), so a member added there fails to
+	 * (`RecoveryIntentSchema`, `../queue/jobs.ts`) and resolved once
+	 * (`phaseRecoveryFromAssignment`, same file), so a member added there fails to
 	 * compile at every construction site instead of quietly defaulting to "this
 	 * attempt has no recovery intent" — the shape that let `recoveryMode` reach no
 	 * executor at all while every write path kept setting it.
@@ -1394,13 +1394,14 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 	// `recoveryMode` rides the same object into every phase, which is what makes
 	// the recovery gate (`executeRecoveryGate`, `../pipeline/resume.ts`) reachable
 	// on the host that actually holds the preserved checkout (issue #591).
-	const { recovery } = inputs;
-	const session = {
-		sessionId: recovery.sessionId,
-		resumeSessionId: recovery.resumeSessionId,
-		resumeDelivery: recovery.resumeDelivery,
-		recoveryMode: recovery.recoveryMode,
-	};
+	//
+	// **Destructured, never re-listed.** This is the last hop before a phase, so a
+	// member named here by hand is a member the next author can forget — the same
+	// shape that let `recoveryMode` reach no executor at all. Splitting off the one
+	// member that is *not* uniform (`resumeExistingBranch`, which only Implementation
+	// takes) leaves the rest to spread through as a rest object, so a member added
+	// to `PhaseRecovery` arrives at every phase with no edit here.
+	const { resumeExistingBranch, ...session } = inputs.recovery;
 	// Additive DB-free injection (see `AssignedPhaseInputs`): forward an injected
 	// PM/delivery/token straight through, defaulting the PM to the project's
 	// registry-resolved provider (never a concrete one, per ai/RULES.md §2) and
@@ -1452,7 +1453,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				model,
 				reasoning,
 				customPrompt,
-				resumeExistingBranch: recovery.resumeExistingBranch,
+				resumeExistingBranch,
 				onBranchProvisioned: inputs.onBranchProvisioned,
 				// Identifies this attempt to the provision-time collision gate, so a
 				// lease left behind by a crashed run is recognised as an orphan instead

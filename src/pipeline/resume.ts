@@ -283,16 +283,20 @@ export async function executeRecoveryGate(
 	const exists = existsSync(path);
 
 	if (!exists) {
+		// "on this worker" because that is the operator's actual next question: a
+		// retry can be routed to a different host than the one holding the checkout
+		// (Planning is affinity-exempt — see ai/ARCHITECTURE.md), so "pruned" and
+		// "ran somewhere else" are different problems with the same symptom.
 		if (recoveryMode === 'resume') {
 			throw new BlockedRecoveryError(
 				'missing-validation',
-				`Cannot resume task '${taskId}' — worktree checkout does not exist.`,
+				`Cannot resume task '${taskId}' — worktree checkout does not exist on this worker.`,
 			);
 		}
 		if (recoveryMode === 'checkpoint') {
 			throw new BlockedRecoveryError(
 				'missing-validation',
-				`Cannot continue task '${taskId}' from a checkpoint — worktree checkout does not exist.`,
+				`Cannot continue task '${taskId}' from a checkpoint — worktree checkout does not exist on this worker.`,
 			);
 		}
 		return { reuseHandle: null };
@@ -343,6 +347,15 @@ export async function executeRecoveryGate(
  * for a task whose old checkout is still lying around). An *explicitly* requested
  * recovery that cannot be served still fails terminally in the gate above, and
  * that stays the correct outcome.
+ *
+ * **Two levels, because a directory existing is weaker evidence than a hand-off.**
+ * All this can see synchronously is whether the path is there — which a plain
+ * stale leftover from a completed run also satisfies, and warning on those would
+ * dilute exactly the signal this exists to sharpen. A **checkpoint** is different:
+ * it is an explicit hand-off some continuation was supposed to adopt, so its
+ * presence here means one was definitively lost. That case warns, which is what
+ * makes "a lost continuation is always attributable" (issue #591's stated purpose)
+ * true; a checkout with no hand-off is recorded at `info` instead.
  */
 export function warnStartingOverOnPreservedWork(
 	worktrees: GitWorktreeManager,
@@ -353,18 +366,24 @@ export function warnStartingOverOnPreservedWork(
 	const path = worktrees.worktreePath(taskId);
 	if (!existsSync(path)) return;
 	const checkpoint = tryReadCheckpoint(path);
-	logger.warn(
+	const context = {
+		taskId,
+		phase,
+		runId,
+		worktreePath: path,
+		hasCheckpoint: checkpoint !== undefined,
+		checkpointPhase: checkpoint?.phase,
+	};
+	if (checkpoint) {
+		logger.warn(
+			'recovery: starting over while a checkpointed checkout still exists — the recorded hand-off is not being continued',
+			context,
+		);
+		return;
+	}
+	logger.info(
 		'recovery: starting over while a preserved checkout still exists — any work in it is not being continued',
-		{
-			taskId,
-			phase,
-			runId,
-			worktreePath: path,
-			// The louder half: a checkpoint is an explicit hand-off a continuation was
-			// supposed to adopt, so its presence here means one was lost.
-			hasCheckpoint: checkpoint !== undefined,
-			checkpointPhase: checkpoint?.phase,
-		},
+		context,
 	);
 }
 

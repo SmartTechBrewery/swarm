@@ -24,11 +24,11 @@ vi.mock('@/worktree/worktree-lease.js', () => ({
 	releaseWorktreeLease: releaseWorktreeLeaseMock,
 }));
 
-/** The one log level this module's behaviour is asserted on (issue #591). */
-const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
+/** The two levels this module's start-over signal is asserted on (issue #591). */
+const { warn, info } = vi.hoisted(() => ({ warn: vi.fn(), info: vi.fn() }));
 vi.mock('@/lib/logger.js', async (importOriginal) => {
 	const actual = await importOriginal<typeof import('@/lib/logger.js')>();
-	return { ...actual, logger: { ...actual.logger, warn } };
+	return { ...actual, logger: { ...actual.logger, warn, info } };
 });
 
 import type { AgentCliResult } from '@/harness/agent-cli.js';
@@ -526,6 +526,7 @@ describe('acquireResumableWorktree — starting over is never silent', () => {
 	afterEach(() => {
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 		warn.mockClear();
+		info.mockClear();
 	});
 
 	/** No recovery mode and no resume id — the fall-through the warning guards. */
@@ -557,6 +558,7 @@ describe('acquireResumableWorktree — starting over is never silent', () => {
 		const path = preservedCheckout(CHECKPOINT);
 		await acquireFresh(path);
 
+		// A recorded hand-off was definitively lost, so this is the loud case.
 		expect(warn).toHaveBeenCalledTimes(1);
 		const [message, context] = warn.mock.calls[0];
 		expect(message).toMatch(/starting over/i);
@@ -571,18 +573,23 @@ describe('acquireResumableWorktree — starting over is never silent', () => {
 		});
 	});
 
-	it('warns for a preserved checkout with no checkpoint, saying so', async () => {
+	it('records a checkout with no hand-off at info, not warn', async () => {
+		// A bare directory is also what a plain stale leftover looks like, so warning
+		// on it would dilute the signal the checkpointed case above carries.
 		const path = preservedCheckout();
 		await acquireFresh(path);
 
-		expect(warn).toHaveBeenCalledTimes(1);
-		expect(warn.mock.calls[0][1]).toMatchObject({ hasCheckpoint: false });
+		expect(warn).not.toHaveBeenCalled();
+		expect(info).toHaveBeenCalledTimes(1);
+		expect(info.mock.calls[0][0]).toMatch(/starting over/i);
+		expect(info.mock.calls[0][1]).toMatchObject({ hasCheckpoint: false });
 	});
 
 	it('stays quiet for an ordinary first run, whose task has no checkout at all', async () => {
 		// The common case by far — a warning here would be pure noise.
 		await acquireFresh(join(tmpdir(), 'swarm-no-such-checkout'), '/tmp/provisioned');
 		expect(warn).not.toHaveBeenCalled();
+		expect(info).not.toHaveBeenCalled();
 	});
 });
 

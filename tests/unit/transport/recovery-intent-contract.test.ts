@@ -3,7 +3,7 @@
  *
  * A run's recovery intent — which session to re-enter, which preserved checkout
  * to adopt, and under which contract — travels `SwarmJob` → `buildTaskAssignment`
- * → `TaskAssignmentSchema.parse` (the wire) → `buildDbFreePhaseInputs` →
+ * → `TaskAssignmentSchema.parse` (the wire) → `phaseRecoveryFromAssignment` →
  * `AssignedPhaseInputs` → the phase. Every hop had a test. The *path* had none,
  * and that is exactly why `recoveryMode` could be written by three call sites,
  * dropped at the very first hop, and read by no executor at all while the whole
@@ -17,10 +17,19 @@
  * a deliberately preserved checkout and re-doing work from zero — a 0% recovery
  * rate against 162/168 ordinary runs completing the same week.
  *
- * So this file walks the whole path and asserts the intent survives it, and the
- * last case is driven by `Object.keys(RecoveryIntentSchema.shape)` rather than a
- * hand-written list: a member added to the intent and *not* carried across the
- * wire fails here rather than degrading to "this attempt has no recovery intent".
+ * So this file walks that path and asserts the intent survives it, with two cases
+ * driven by `Object.keys(RecoveryIntentSchema.shape)` rather than a hand-written
+ * list: a member added to the intent and *not* carried through fails here rather
+ * than degrading to "this attempt has no recovery intent".
+ *
+ * **What it does and does not span.** It calls `phaseRecoveryFromAssignment`
+ * directly, which is the whole of what `buildDbFreePhaseInputs` does with the
+ * intent (that function is not exported, and injecting a fake `runPhase` to
+ * observe it is `assignment-execution.test.ts`'s job — see "reaches the phase with
+ * the assignment's recovery mode" there). The hop *after* `AssignedPhaseInputs` —
+ * `runAssignedPhase` forwarding each member to an orchestrator — has its own
+ * exhaustiveness case in `tests/unit/worker/consumer.test.ts`. Between the three,
+ * every hop from the job payload to a phase orchestrator is covered.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -172,6 +181,12 @@ describe('recovery intent: job → assignment → wire → phase inputs', () => 
 	 * asserts against an explicit "where each member lands" map: a new member fails
 	 * here until someone states where it goes, instead of being carried across the
 	 * wire and then quietly dropped by the resolver.
+	 *
+	 * Deliberately a **soft** gate: a member mapped lazily onto an existing key
+	 * (`newThing: ['recoveryMode']`) satisfies it without being wired. Tightening
+	 * that would mean asserting per-member values, which is what the named cases
+	 * above already do. What this buys is that the author is *asked* the question at
+	 * the point of adding the member, by an error message that says what to do.
 	 */
 	it('resolves every member of RecoveryIntentSchema into the phase recovery', () => {
 		const LANDS_ON: Record<keyof RecoveryIntent, (keyof PhaseRecovery)[]> = {

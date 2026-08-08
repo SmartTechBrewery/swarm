@@ -119,8 +119,8 @@ export function recoveryIntentFromJob(job: SwarmJob): RecoveryIntent {
  * optional siblings, so a construction site that forgets it fails to compile.
  *
  * A run either *assigns* a session id or *resumes* one, never both
- * ({@link sessionRunArgs}, `../pipeline/resume.ts`, applies the same rule to the
- * agent invocation itself).
+ * (`sessionRunArgs`, `../pipeline/resume.ts`, applies the same rule to the agent
+ * invocation itself).
  */
 export interface PhaseRecovery {
 	/** Session id to assign to a fresh run (claude's `--session-id`). */

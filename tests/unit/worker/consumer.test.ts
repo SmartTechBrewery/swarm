@@ -4442,6 +4442,38 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		expect(assignedPhaseCalls[0].args.recoveryMode).toBeUndefined();
 	});
 
+	/**
+	 * The last hop's own exhaustiveness gate (issue #591). The contract test
+	 * (`tests/unit/transport/recovery-intent-contract.test.ts`) stops at
+	 * `PhaseRecovery`; this covers the hop after it, which is the one that used to
+	 * re-list every member by hand. Driven by the keys of a fully-populated
+	 * recovery, so a member added to `PhaseRecovery` and *not* forwarded fails here
+	 * instead of arriving nowhere — the exact defect this issue is about, one layer
+	 * down. Every member keeps its own name on the phase options, so this is a
+	 * straight key-for-key comparison.
+	 */
+	it('forwards every member of the phase recovery to the orchestrator', async () => {
+		const recovery = createMockPhaseRecovery({
+			sessionId: 'sess-fresh',
+			resumeDelivery: true,
+			resumeExistingBranch: true,
+			recoveryMode: 'checkpoint',
+		});
+		// Implementation is the phase that takes all of them — including
+		// `resumeExistingBranch`, which the others have no use for.
+		await runAssignedPhase(
+			baseInputs({ phase: 'implementation', workItem: createMockWorkItem(), recovery }),
+		);
+
+		const args = assignedPhaseCalls[0].args;
+		for (const [member, value] of Object.entries(recovery)) {
+			expect(
+				args,
+				`runAssignedPhase drops '${member}' — spread the recovery rather than re-listing its members`,
+			).toHaveProperty(member, value);
+		}
+	});
+
 	it('throws when a required phase input is missing rather than calling the runner', async () => {
 		await expect(
 			runAssignedPhase(baseInputs({ phase: 'planning', workItem: undefined })),

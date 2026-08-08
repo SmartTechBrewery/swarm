@@ -232,11 +232,14 @@ export const TaskAssignmentSchema = z.object({
 	// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped: an older worker
 	// ignores a member it does not know, and an older router simply omits it.
 	...RecoveryIntentSchema.shape,
-	// The one member the wire deliberately types *looser* than the job payload
-	// does. A session id reaches here from a `runs` row the control plane already
-	// accepted (`tryReuseLatestRun`, `../worker/consumer.ts`), so re-validating its
-	// shape at this seam would fail the whole dispatch over a value whose only use
-	// is to be handed to a CLI as a resume id.
+	// Declared *after* the spread, so this looser type deliberately overrides the
+	// intent's `.uuid()` — keep it below `...RecoveryIntentSchema.shape`, since
+	// reordering silently reinstates the stricter one. The looseness protects the
+	// **receiving** end only: the sender already validated this value through
+	// `recoveryIntentFromJob`'s `.parse` (`../queue/jobs.ts`), so a non-UUID never
+	// leaves the control plane. What it buys is that a worker does not reject an
+	// otherwise-valid assignment over the shape of a value whose only use is to be
+	// handed to a CLI as a resume id.
 	agentSessionId: z.string().optional(),
 	// Phase-specific inputs — mirror `TriggerResult` (`src/triggers/types.ts`):
 	// planning/implementation carry `workItem`; the PR phases carry the PR
