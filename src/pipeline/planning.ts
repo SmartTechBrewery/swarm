@@ -62,6 +62,7 @@ import {
 import { resolveAutomationLabel } from '@/pm/automation-label.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
+import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	SWARM_GENERATED_FOOTER,
 	SWARM_GENERATED_SIGNATURE,
@@ -262,11 +263,17 @@ export interface RunPlanningPhaseOptions {
 	/** The database run id. */
 	runId?: string;
 	/**
-	 * Mode for recovering a cancelled preserved worktree. Deliberately narrower than
-	 * {@link RecoveryMode}: this phase writes no checkpoint (`docs/CHECKPOINTS.md`),
-	 * so there is never one to continue it from.
+	 * Mode for recovering a cancelled preserved worktree. The full
+	 * {@link RecoveryMode}, even though this phase writes no checkpoint
+	 * (`docs/CHECKPOINTS.md`) and so can never legitimately be sent
+	 * `'checkpoint'`: the executor forwards one value to every phase (issue #591),
+	 * and narrowing it here only meant this phase could not be handed the union it
+	 * is given. If a `'checkpoint'` ever does arrive, the recovery gate's
+	 * `validateCheckpointForContinuation` fails it with the accurate
+	 * `missing-validation` / `checkpoint-divergent` reason rather than the phase
+	 * failing to compile.
 	 */
-	recoveryMode?: 'resume' | 'fresh';
+	recoveryMode?: RecoveryMode;
 	/**
 	 * Whether to move the item to "ToDo" once the plan is posted. Defaults to
 	 * `false` — a human reviews the plan and moves the item themselves. Always
@@ -1227,7 +1234,7 @@ async function acquirePlanningWorktree(
 	taskId: string,
 	baseBranch: string,
 	resumeSessionId: string | undefined,
-	recoveryMode?: 'resume' | 'fresh',
+	recoveryMode?: RecoveryMode,
 	runId?: string,
 ): Promise<{ handle: WorktreeHandle; resumed: boolean }> {
 	const res = await acquireResumableWorktree(
@@ -1240,6 +1247,7 @@ async function acquirePlanningWorktree(
 		() => worktrees.provision(taskId, { detach: true, runId }),
 		false,
 		recoveryMode,
+		runId,
 	);
 	return { handle: res.handle, resumed: res.resumed };
 }

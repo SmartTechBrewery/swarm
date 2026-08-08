@@ -67,7 +67,7 @@ import {
 	isRunCancellationRequested,
 	RUN_CANCELLED_MESSAGE,
 } from '../queue/cancellation.js';
-import { QUEUE_NAME, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
+import { QUEUE_NAME, recoveryIntentFromJob, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
 import { DeliveryDeferredError } from '../scm/delivery.js';
 import { buildTaskAssignment, type TaskAssignmentPr } from '../transport/assignment.js';
 import type { TaskExecutionResult, TaskProgress } from '../transport/protocol.js';
@@ -404,12 +404,11 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		customPrompt,
 		target: selection.target,
 		timeoutMs,
-		session: {
-			agentSessionId: job.agentSessionId,
-			resumeSession: job.resumeSession,
-			resumeDelivery: job.resumeDelivery,
-			implementationBranchProvisioned: job.implementationBranchProvisioned,
-		},
+		// The run's whole recovery intent, derived from the job by its own schema
+		// rather than hand-listed here — a member this dispatcher forgot is exactly
+		// how `recoveryMode` stopped reaching the worker that holds the checkout
+		// (issue #591).
+		session: recoveryIntentFromJob(job),
 		workItem: 'workItem' in trigger ? trigger.workItem : undefined,
 		pr: prCoordinates(trigger),
 		// Resolved here, where the DB is: the worker this is pushed to may have none

@@ -74,6 +74,7 @@ function makeOptions(path: string, handle: WorktreeHandle) {
 	const cleanup = vi.fn(async () => undefined);
 	const worktrees = {
 		provision: vi.fn(async () => handle),
+		worktreePath: vi.fn(() => handle.path),
 		reuse: vi.fn(async () => handle),
 		cleanup,
 	} as unknown as GitWorktreeManager;

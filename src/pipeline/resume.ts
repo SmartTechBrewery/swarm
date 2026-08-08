@@ -328,6 +328,47 @@ export async function executeRecoveryGate(
 }
 
 /**
+ * Say so, loudly, when a phase is about to start over on a task whose previous
+ * attempt left work behind (issue #591).
+ *
+ * Falling through to `provisionFresh()` while a preserved checkout — or a
+ * checkpoint inside it — still exists is how a continuation gets lost with no
+ * signal at all: the intent that would have adopted it was dropped somewhere
+ * upstream, the checkout is either reclaimed or reported as a generic collision,
+ * and the run silently re-does work it had already done. Nothing here changes what
+ * happens; it makes a lost continuation attributable to the task, phase and run it
+ * happened to, instead of surfacing three layers away as a worktree error.
+ *
+ * Deliberately not a throw: an unrequested start-over is legal (a fresh dispatch
+ * for a task whose old checkout is still lying around). An *explicitly* requested
+ * recovery that cannot be served still fails terminally in the gate above, and
+ * that stays the correct outcome.
+ */
+export function warnStartingOverOnPreservedWork(
+	worktrees: GitWorktreeManager,
+	taskId: string,
+	phase: TriggerPhase,
+	runId: string | undefined,
+): void {
+	const path = worktrees.worktreePath(taskId);
+	if (!existsSync(path)) return;
+	const checkpoint = tryReadCheckpoint(path);
+	logger.warn(
+		'recovery: starting over while a preserved checkout still exists — any work in it is not being continued',
+		{
+			taskId,
+			phase,
+			runId,
+			worktreePath: path,
+			// The louder half: a checkpoint is an explicit hand-off a continuation was
+			// supposed to adopt, so its presence here means one was lost.
+			hasCheckpoint: checkpoint !== undefined,
+			checkpointPhase: checkpoint?.phase,
+		},
+	);
+}
+
+/**
  * Acquire a phase's worktree, reusing a preserved checkout for either an agent
  * session retry or a delivery retry. Delivery reuse additionally requires its
  * progress sidecar, so an unrelated stale checkout is never adopted. `resumed`
@@ -335,6 +376,10 @@ export async function executeRecoveryGate(
  * verified deterministic-delivery continuation; `checkpoint` is set only for a
  * `'checkpoint'` continuation, which resumes no session (`resumed: false`) and
  * carries its hand-off in the returned checkpoint instead.
+ *
+ * `runId` is carried for the start-over warning alone
+ * ({@link warnStartingOverOnPreservedWork}); the provisioning call the caller
+ * passes in threads its own.
  */
 export async function acquireResumableWorktree(
 	worktrees: GitWorktreeManager,
@@ -346,6 +391,7 @@ export async function acquireResumableWorktree(
 	provisionFresh: () => Promise<WorktreeHandle>,
 	resumeDelivery = false,
 	recoveryMode?: RecoveryMode,
+	runId?: string,
 ): Promise<{
 	handle: WorktreeHandle;
 	resumed: boolean;
@@ -382,6 +428,7 @@ export async function acquireResumableWorktree(
 			resumed: resumeSessionId !== undefined,
 			deliveryResumed: resumeDelivery,
 		};
+	warnStartingOverOnPreservedWork(worktrees, taskId, phase, runId);
 	return { handle: await provisionFresh(), resumed: false, deliveryResumed: false };
 }
 

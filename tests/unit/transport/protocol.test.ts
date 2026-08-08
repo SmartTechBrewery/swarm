@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { toNonSecretProjectConfig } from '@/config/project-config-slice.js';
 import { REVIEW_AUTOMATION_OUTCOMES, REVIEW_VERDICTS } from '@/pipeline/review.js';
 import { PM_STATUS_KEYS } from '@/pm/pipeline.js';
+import { RecoveryModeSchema } from '@/queue/jobs.js';
 import {
 	ControlPlaneMessageSchema,
 	DisconnectSchema,
@@ -427,6 +428,30 @@ describe('transport protocol schemas', () => {
 			expect(
 				TaskAssignmentSchema.safeParse({ ...VALID_ASSIGNMENT, dispatchId: 'nope' }).success,
 			).toBe(false);
+		});
+
+		// The recovery intent the frame carries since issue #591. Optional and
+		// additive in both directions, which is why `TRANSPORT_PROTOCOL_VERSION` is
+		// deliberately not bumped: an older router omits it, an older worker ignores
+		// it, and neither end rejects the other's frame.
+		describe('recoveryMode', () => {
+			it('accepts every RecoveryMode value', () => {
+				for (const mode of RecoveryModeSchema.options) {
+					const parsed = TaskAssignmentSchema.parse({ ...VALID_ASSIGNMENT, recoveryMode: mode });
+					expect(parsed.recoveryMode).toBe(mode);
+				}
+			});
+
+			it('rejects an unknown mode rather than passing it to the worktree gate', () => {
+				expect(
+					TaskAssignmentSchema.safeParse({ ...VALID_ASSIGNMENT, recoveryMode: 'discard' }).success,
+				).toBe(false);
+			});
+
+			it('parses a frame from an older router that carries none', () => {
+				const parsed = TaskAssignmentSchema.parse(VALID_ASSIGNMENT);
+				expect(parsed.recoveryMode).toBeUndefined();
+			});
 		});
 	});
 

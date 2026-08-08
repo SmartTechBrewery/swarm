@@ -64,7 +64,11 @@ const { createGitHubProjectsProvider } = vi.hoisted(() => ({
 vi.mock('@/integrations/pm/github-projects/provider.js', () => ({ createGitHubProjectsProvider }));
 
 import { runAssignedPhase } from '@/worker/consumer.js';
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import {
+	createMockPhaseRecovery,
+	createMockProjectConfig,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 const RUN_ID = 'f1e2d3c4-b5a6-4978-8899-aabbccddeeff';
 
@@ -88,7 +92,7 @@ const baseInputs = () => ({
 	project: createMockProjectConfig(),
 	workItem: createMockWorkItem(),
 	runId: RUN_ID,
-	resumeDelivery: false,
+	recovery: createMockPhaseRecovery(),
 	runAgent: vi.fn(async () => agentResult()) as never,
 	prNumber: '99',
 	prBranch: 'issue-17',

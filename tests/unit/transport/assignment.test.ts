@@ -141,6 +141,25 @@ describe('buildTaskAssignment', () => {
 			expect(assignment.resumeDelivery).toBe(true);
 			expect(assignment.implementationBranchProvisioned).toBe(true);
 		});
+
+		it('carries the recovery mode onto the frame (issue #591)', () => {
+			// Without this the worker sees no recovery intent at all and provisions
+			// fresh over the very checkout the continuation was meant to adopt.
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					session: { recoveryMode: 'checkpoint', agentSessionId: 'sess-1' },
+				}),
+			);
+			expect(assignment.recoveryMode).toBe('checkpoint');
+		});
+
+		it('omits recoveryMode entirely when the run has no recovery intent', () => {
+			// An ordinary first attempt must not assert a mode — `undefined` is what
+			// makes the phase's worktree gate stay out of the way.
+			const assignment = buildTaskAssignment(createMockTaskAssignmentInput({ session: {} }));
+			expect(assignment.recoveryMode).toBeUndefined();
+			expect('recoveryMode' in assignment).toBe(false);
+		});
 	});
 
 	describe('validation at the seam', () => {

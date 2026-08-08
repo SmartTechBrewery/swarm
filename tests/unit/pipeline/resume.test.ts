@@ -24,6 +24,13 @@ vi.mock('@/worktree/worktree-lease.js', () => ({
 	releaseWorktreeLease: releaseWorktreeLeaseMock,
 }));
 
+/** The one log level this module's behaviour is asserted on (issue #591). */
+const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('@/lib/logger.js', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/lib/logger.js')>();
+	return { ...actual, logger: { ...actual.logger, warn } };
+});
+
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import { CHECKPOINT_FILENAME } from '@/pipeline/checkpoint.js';
@@ -409,6 +416,20 @@ describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', (
 		expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
 	});
 
+	// Acceptance criterion 3 of issue #591: an operator who explicitly asked to
+	// *resume* must be told the checkout is gone, never quietly handed a run that
+	// started over. Pinned here because restoring the hand-off is what finally makes
+	// this branch reachable — until then no gate ran at all.
+	it("'resume' fails terminally when the checkout is gone rather than starting over", async () => {
+		await expect(
+			gate(join(tmpdir(), 'swarm-no-such-checkout'), 'resume', 'session-19'),
+		).rejects.toMatchObject({
+			name: 'BlockedRecoveryError',
+			reason: 'missing-validation',
+			message: expect.stringContaining('worktree checkout does not exist'),
+		});
+	});
+
 	it("'resume' still blocks with missing-validation when no session id is known", async () => {
 		const path = preservedCheckout();
 		await expect(gate(path, 'resume', undefined)).rejects.toMatchObject({
@@ -487,6 +508,81 @@ describe('acquireResumableWorktree — a checkpoint continuation resumes no sess
 		const result = await acquire('resume', path);
 		expect(result.resumed).toBe(true);
 		expect(result.checkpoint).toBeUndefined();
+	});
+});
+
+/**
+ * Acceptance criterion 5 of issue #591. Losing a continuation used to be
+ * *completely* silent: the phase fell through to `provisionFresh()`, re-did work
+ * it had already done, and nothing in the logs tied that to the checkout still
+ * sitting on disk. Task #553 lost a checkpointed session exactly this way.
+ */
+describe('acquireResumableWorktree — starting over is never silent', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isWorktreeLeasedMock.mockResolvedValue(false);
+	});
+
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+		warn.mockClear();
+	});
+
+	/** No recovery mode and no resume id — the fall-through the warning guards. */
+	async function acquireFresh(path: string, provisionedPath = path) {
+		const worktrees = {
+			...stubWorktrees(path),
+			reuse: vi.fn(async () => undefined),
+		};
+		return acquireResumableWorktree(
+			worktrees as unknown as GitWorktreeManager,
+			'19',
+			'implementation',
+			'issue-19',
+			false,
+			undefined,
+			async (): Promise<WorktreeHandle> => ({
+				taskId: '19',
+				path: provisionedPath,
+				branch: 'issue-19',
+				detached: false,
+			}),
+			false,
+			undefined,
+			'run-19',
+		);
+	}
+
+	it('warns — naming task, phase and run — when a checkpointed checkout is abandoned', async () => {
+		const path = preservedCheckout(CHECKPOINT);
+		await acquireFresh(path);
+
+		expect(warn).toHaveBeenCalledTimes(1);
+		const [message, context] = warn.mock.calls[0];
+		expect(message).toMatch(/starting over/i);
+		expect(context).toMatchObject({
+			taskId: '19',
+			phase: 'implementation',
+			runId: 'run-19',
+			worktreePath: path,
+			// The loud half: a checkpoint present here means a hand-off was lost.
+			hasCheckpoint: true,
+			checkpointPhase: 'implementation',
+		});
+	});
+
+	it('warns for a preserved checkout with no checkpoint, saying so', async () => {
+		const path = preservedCheckout();
+		await acquireFresh(path);
+
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0][1]).toMatchObject({ hasCheckpoint: false });
+	});
+
+	it('stays quiet for an ordinary first run, whose task has no checkout at all', async () => {
+		// The common case by far — a warning here would be pure noise.
+		await acquireFresh(join(tmpdir(), 'swarm-no-such-checkout'), '/tmp/provisioned');
+		expect(warn).not.toHaveBeenCalled();
 	});
 });
 

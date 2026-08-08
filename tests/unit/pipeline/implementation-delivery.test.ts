@@ -151,6 +151,7 @@ function makeOptions(path: string, branch: string, delivery: ScmDeliveryProvider
 	const handle: WorktreeHandle = { taskId: '544', path, branch, detached: false };
 	const worktrees = {
 		provision: vi.fn(async () => handle),
+		worktreePath: vi.fn(() => handle.path),
 		reuse: vi.fn(async () => undefined),
 		cleanup: vi.fn(async () => {}),
 	} as unknown as GitWorktreeManager;

@@ -43,6 +43,117 @@ export const QUEUE_NAME = 'swarm-jobs';
 export const RecoveryModeSchema = z.enum(['resume', 'fresh', 'checkpoint']);
 export type RecoveryMode = z.infer<typeof RecoveryModeSchema>;
 
+/**
+ * **One declaration of how an attempt treats the work a prior attempt left
+ * behind** — the session to re-enter, the delivery/branch progress to adopt, and
+ * the recovery mode the gate enforces (issue #591).
+ *
+ * These five travelled as loose optional siblings on four hand-maintained
+ * projections of each other — this payload, `TaskAssignmentSchema`
+ * (`../transport/protocol.ts`), the dispatcher's assembled `session` object
+ * (`../router/dispatcher.ts`), and the worker's `AssignedPhaseInputs`
+ * (`../worker/consumer.ts`) — so dropping one from any of them compiled, passed
+ * the suite, and degraded to "this attempt has no recovery intent". That is how
+ * `recoveryMode` came to be written by three call sites and read by no executor:
+ * every Tier 2 continuation silently re-did its work from zero.
+ *
+ * So the members are declared here **once** and consumed by reference: the job
+ * payload spreads this shape, the transport frame spreads it into its own
+ * session block, and the two executors resolve it through the mappers below.
+ * A member added here therefore crosses the wire on its own, and the contract
+ * test (`tests/unit/transport/recovery-intent-contract.test.ts`) fails until it
+ * is also resolved into {@link PhaseRecovery}.
+ */
+export const RecoveryIntentSchema = z.object({
+	/**
+	 * Persisted agent session/thread id for a resumable deferred run — the value
+	 * threaded back as the CLI's resume id on retry. UUID-shaped for every CLI:
+	 * claude's assigned `--session-id`, codex's `thread_id`, and agy's conversation
+	 * id are all UUIDs (verified live). Not claude-only anymore.
+	 */
+	agentSessionId: z.string().uuid().optional(),
+	/**
+	 * Set on a deferred retry that should *continue the prior agent session*
+	 * rather than start fresh (a `rate-limit`/`timeout` deferral, any phase, any
+	 * CLI). When set, the worker threads {@link agentSessionId} into the phase
+	 * as a resume id (`claude --resume` / `agy --conversation` /
+	 * `codex exec resume`) and the phase reuses the preserved worktree; when
+	 * absent, the run starts a fresh session and, for claude, assigns
+	 * `agentSessionId` as its new `--session-id`.
+	 */
+	resumeSession: z.boolean().optional(),
+	/**
+	 * Set on a deterministic-delivery retry. Unlike {@link resumeSession}, this
+	 * resumes a preserved worktree and its delivery sidecar without requiring an
+	 * agent CLI session to exist.
+	 */
+	resumeDelivery: z.boolean().optional(),
+	/**
+	 * Durable proof that Implementation successfully provisioned its task branch.
+	 * A manual retry needs `resumePmPhase` to preserve dispatch intent after the
+	 * card moved to In progress, but must not reuse a branch unless provisioning
+	 * actually completed.
+	 */
+	implementationBranchProvisioned: z.boolean().optional(),
+	/** How this run recovers a preserved worktree ({@link RecoveryModeSchema}). */
+	recoveryMode: RecoveryModeSchema.optional(),
+});
+export type RecoveryIntent = z.infer<typeof RecoveryIntentSchema>;
+
+/**
+ * The recovery intent a queue job carries, extracted by the schema itself rather
+ * than by hand — so a member added to {@link RecoveryIntentSchema} is picked up
+ * here with no edit, and cannot be forgotten on the way to the wire.
+ *
+ * Zod strips the job's other keys, and an absent optional member stays absent
+ * (rather than becoming an explicit `undefined`), which is what keeps the
+ * assembled frame free of keys the job never set.
+ */
+export function recoveryIntentFromJob(job: SwarmJob): RecoveryIntent {
+	return RecoveryIntentSchema.parse(job);
+}
+
+/**
+ * The recovery intent **resolved for one phase run** — what the executor hands a
+ * phase orchestrator, as a single required value rather than a handful of
+ * optional siblings, so a construction site that forgets it fails to compile.
+ *
+ * A run either *assigns* a session id or *resumes* one, never both
+ * ({@link sessionRunArgs}, `../pipeline/resume.ts`, applies the same rule to the
+ * agent invocation itself).
+ */
+export interface PhaseRecovery {
+	/** Session id to assign to a fresh run (claude's `--session-id`). */
+	sessionId?: string;
+	/** Session to resume on a retry — undefined on a fresh run. */
+	resumeSessionId?: string;
+	/** Resume deterministic-delivery progress rather than an agent session. */
+	resumeDelivery: boolean;
+	/** implementation: reuse an already-provisioned task branch. */
+	resumeExistingBranch: boolean;
+	/** How the phase's worktree gate treats the preserved checkout. */
+	recoveryMode?: RecoveryMode;
+}
+
+/**
+ * Resolve a carried {@link RecoveryIntent} into the {@link PhaseRecovery} a phase
+ * runs from. Takes the intent slice structurally, so the transport's
+ * `TaskAssignment` is passed straight in without this module importing (and
+ * cycling back through) `../transport/protocol.ts`.
+ *
+ * This is the one place the "assign or resume" split is decided; it used to be
+ * duplicated verbatim in both executors.
+ */
+export function phaseRecoveryFromAssignment(intent: RecoveryIntent): PhaseRecovery {
+	return {
+		sessionId: intent.resumeSession ? undefined : intent.agentSessionId,
+		resumeSessionId: intent.resumeSession ? intent.agentSessionId : undefined,
+		resumeDelivery: intent.resumeDelivery === true,
+		resumeExistingBranch: intent.implementationBranchProvisioned === true,
+		recoveryMode: intent.recoveryMode,
+	};
+}
+
 const jobBase = z.object({
 	/** The SWARM project (`ProjectConfig.id`) the event was matched to. */
 	projectId: z.string().min(1),
@@ -96,29 +207,10 @@ const jobBase = z.object({
 	 * the separate {@link resumeSession} flag, which spans every phase and CLI.
 	 */
 	resumePmPhase: z.enum(['planning', 'implementation']).optional(),
-	/**
-	 * Durable proof that Implementation successfully provisioned its task branch.
-	 * A manual retry needs `resumePmPhase` to preserve dispatch intent after the
-	 * card moved to In progress, but must not reuse a branch unless provisioning
-	 * actually completed.
-	 */
-	implementationBranchProvisioned: z.boolean().optional(),
-	/**
-	 * Set on a deferred retry that should *continue the prior agent session*
-	 * rather than start fresh (a `rate-limit`/`timeout` deferral, any phase, any
-	 * CLI). When set, the consumer threads {@link agentSessionId} into the phase
-	 * as a resume id (`claude --resume` / `agy --conversation` /
-	 * `codex exec resume`) and the phase reuses the preserved worktree; when
-	 * absent, the run starts a fresh session and, for claude, assigns
-	 * `agentSessionId` as its new `--session-id`.
-	 */
-	resumeSession: z.boolean().optional(),
-	/**
-	 * Set on a deterministic-delivery retry. Unlike {@link resumeSession}, this
-	 * resumes a preserved worktree and its delivery sidecar without requiring an
-	 * agent CLI session to exist.
-	 */
-	resumeDelivery: z.boolean().optional(),
+	// How this attempt treats a prior one's preserved work — declared once in
+	// {@link RecoveryIntentSchema} and spread here, so the payload and the
+	// transport frame cannot drift apart member by member (issue #591).
+	...RecoveryIntentSchema.shape,
 	/**
 	 * The `runs` row this job re-runs (issue #136). Absent on a fresh webhook;
 	 * set when a deferred run is re-enqueued (a scheduled deferral retry, or a
@@ -128,13 +220,6 @@ const jobBase = z.object({
 	 * creates a fresh row as before.
 	 */
 	runId: z.string().min(1).optional(),
-	/**
-	 * Persisted agent session/thread id for a resumable deferred run — the value
-	 * threaded back as the CLI's resume id on retry. UUID-shaped for every CLI:
-	 * claude's assigned `--session-id`, codex's `thread_id`, and agy's conversation
-	 * id are all UUIDs (verified live). Not claude-only anymore.
-	 */
-	agentSessionId: z.string().uuid().optional(),
 	/** Optional overrides for retrying/running with a specific agent CLI and model. */
 	cliOverride: AgentCliSchema.optional(),
 	modelOverride: z.string().min(1).optional(),
@@ -145,8 +230,6 @@ const jobBase = z.object({
 	 * launched. Rides `...jobPayload` spreads through deferred/manual retries.
 	 */
 	reasoningOverride: ReasoningLevelSchema.optional(),
-	/** How this run recovers a preserved worktree ({@link RecoveryModeSchema}). */
-	recoveryMode: RecoveryModeSchema.optional(),
 	/**
 	 * Set on a concurrency-deferred continuation's retry (issue #214): its dispatch
 	 * dedup slot was already claimed by the original dispatch attempt, so the
