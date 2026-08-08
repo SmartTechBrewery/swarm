@@ -168,6 +168,42 @@ export async function hasResumableDeferredRun(projectId: string, taskId: string)
 	return rows.length > 0;
 }
 
+/** The `runs.recovery` record, named so the sticky-key helpers below can talk about it. */
+export type RunRecoveryRecord = NonNullable<typeof runs.$inferSelect.recovery>;
+
+/**
+ * The recovery-column write expression, with the two machine-location facts
+ * (issue #567) carried across it rather than clobbered.
+ *
+ * `recovery` is rewritten wholesale on every settle and every re-bind, which is
+ * precisely what used to make the location of a preserved checkout unrecoverable.
+ * Two keys therefore survive the rewrite:
+ *
+ * - `preservedWorkerId` — live pin state, so it survives onto *another* recovery
+ *   record (the `recovered` one a continuation's re-bind writes) but not a `null`
+ *   write, which is the fresh, non-recovery attempt that gives the checkout up.
+ * - `abandonedWorkerId` — a historical fact about the row, so it survives even a
+ *   `null` write; nothing but a later abandonment replaces it.
+ *
+ * Written as one SQL expression so the merge reads the row's current value under
+ * the same statement that replaces it — no read-modify-write race with a
+ * concurrent settle.
+ */
+function recoveryWriteSql(next: RunRecoveryRecord | null): SQL {
+	const sticky =
+		next === null
+			? sql`jsonb_build_object('abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId')`
+			: sql`jsonb_build_object(
+					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
+					'preservedWorkerId', ${runs.recovery} -> 'preservedWorkerId'
+				)`;
+	const base = next === null ? sql`'{}'::jsonb` : sql`${JSON.stringify(next)}::jsonb`;
+	// `jsonb_strip_nulls` drops the absent sticky keys (`jsonb -> key` is SQL NULL
+	// when missing); `nullif` keeps "no record at all" as a real NULL column rather
+	// than an empty object, so every `recovery IS NULL` reader is unaffected.
+	return sql`nullif(jsonb_strip_nulls(${sticky} || ${base}), '{}'::jsonb)`;
+}
+
 export interface CompleteRunInput {
 	status: 'completed' | 'failed' | 'deferred' | 'checkpointed';
 	engine?: AgentCli;
@@ -255,7 +291,10 @@ export async function completeRun(runId: string, input: CompleteRunInput): Promi
 			reviewOrdinal: input.reviewOrdinal,
 			reviewAutomationOutcome: input.reviewAutomationOutcome,
 			producedPrUrl: input.producedPrUrl,
-			recovery: input.recovery,
+			// Spread rather than assigned so an omitted `recovery` still leaves the
+			// column untouched, while a supplied one goes through the sticky-key merge
+			// (issue #567) instead of clobbering the run's recorded machine location.
+			...(input.recovery !== undefined ? { recovery: recoveryWriteSql(input.recovery) } : {}),
 			cancellation: input.cancellation,
 			planningScope: input.planningScope,
 			failureDiagnosis: input.failureDiagnosis,
@@ -356,7 +395,11 @@ export async function resetRunToRunning(
 			...(timeoutMs !== undefined ? { timeoutMs } : {}),
 			...(reasoning !== undefined ? { reasoning } : {}),
 			...(agentSessionId !== undefined ? { agentSessionId } : {}),
-			...(recovery !== undefined ? { recovery } : {}),
+			// The re-bind this issue's defect hid behind (#567): `worker_id` above is
+			// being overwritten with *this* attempt's worker, so the machine holding the
+			// preserved checkout would be lost here if the recovery record were replaced
+			// wholesale. `recoveryWriteSql` carries it onto the new record.
+			...(recovery !== undefined ? { recovery: recoveryWriteSql(recovery) } : {}),
 		})
 		.where(fromStatus ? and(eq(runs.id, runId), eq(runs.status, fromStatus)) : eq(runs.id, runId))
 		.returning({ id: runs.id });
@@ -508,7 +551,13 @@ export async function cancelDeferredRunInDb(
 				error: reason,
 				nextRetryAt: null,
 				agentSessionId: run.agentSessionId,
-				recovery: recoveryVal,
+				// Through the sticky-key merge like every other recovery write (issue
+				// #567): terminating a deferred run keeps its session *and*, when the
+				// checkout is on another host, keeps the checkout — so the operator's next
+				// "Resume" is still a continuation and must still be pinned. Replacing the
+				// record wholesale here would drop the machine and send that resume to
+				// whichever worker was free, which is the defect this pin exists to close.
+				recovery: recoveryWriteSql(recoveryVal),
 				cancellation,
 				failureDiagnosis: diagnoseFailure({ knownCondition: 'user-terminated' }),
 				completedAt: new Date(),
@@ -537,8 +586,36 @@ export async function recordRunCleanupBlocked(
 ): Promise<void> {
 	await getDb()
 		.update(runs)
-		.set({ recovery: { state: 'blocked', blockedReason } })
+		// Merged rather than replaced (issue #567): a checkout that could not be removed
+		// is *still on* the machine that holds it, so this is the last write that should
+		// forget where that is — and an `abandonedWorkerId` is a historical fact no
+		// later write may erase.
+		.set({ recovery: recoveryWriteSql({ state: 'blocked', blockedReason }) })
 		.where(eq(runs.id, runId));
+}
+
+/**
+ * Record the machine that holds this run's **preserved checkout** (issue #567),
+ * taken from the attempt's own `worker_id` — the one moment at which the two are
+ * still the same fact, since `worker_id` is overwritten by every later bind.
+ *
+ * Called at each settle that leaves a checkout behind for a continuation to adopt:
+ * a resumable/`checkpointed`/delivery-resume deferral, and a cancellation that
+ * preserved its session. Merged into whatever recovery record that settle wrote
+ * rather than replacing it, so it composes with `preserved`/`blocked` alike.
+ *
+ * A run with no recorded worker (an unfederated one) matches nothing and records
+ * nothing: there is no other machine it could have been dispatched to, so there is
+ * nothing to pin. Best-effort like the rest of run tracking — the caller swallows
+ * and logs a throw.
+ */
+export async function recordRunPreservedWorker(runId: string): Promise<void> {
+	await getDb()
+		.update(runs)
+		.set({
+			recovery: sql`coalesce(${runs.recovery}, '{}'::jsonb) || jsonb_build_object('preservedWorkerId', ${runs.workerId})`,
+		})
+		.where(and(eq(runs.id, runId), isNotNull(runs.workerId)));
 }
 
 /**
@@ -553,11 +630,32 @@ export async function recordRunCleanupBlocked(
  * of the action is to start over — which means the spent `continuationCount` is
  * forgiven. This is the *only* path that resets that count; an ordinary retry keeps
  * it, or the fallback would never be bounded.
+ *
+ * One thing is not cleared but *converted* (issue #567): a recorded
+ * `preservedWorkerId` becomes an `abandonedWorkerId`. Clearing the pin is what frees
+ * the run to restart on any machine — the point of the action — but a run that
+ * started over instead of continuing used to leave no trace at all, so the machine
+ * whose work was given up is kept as the record of it. An existing
+ * `abandonedWorkerId` is retained when there is no pin to replace it, and a run with
+ * neither ends up with a `NULL` column exactly as before.
  */
 export async function clearRunRecovery(runId: string): Promise<void> {
 	await getDb()
 		.update(runs)
-		.set({ recovery: null, agentSessionId: null, checkpoint: null, continuationCount: 0 })
+		.set({
+			recovery: sql`nullif(
+				jsonb_strip_nulls(
+					jsonb_build_object(
+						'abandonedWorkerId',
+						coalesce(${runs.recovery} -> 'preservedWorkerId', ${runs.recovery} -> 'abandonedWorkerId')
+					)
+				),
+				'{}'::jsonb
+			)`,
+			agentSessionId: null,
+			checkpoint: null,
+			continuationCount: 0,
+		})
 		.where(eq(runs.id, runId));
 }
 

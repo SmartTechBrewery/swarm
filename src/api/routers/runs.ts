@@ -468,6 +468,73 @@ async function resolveRunAttribution(run: {
 }
 
 /**
+ * The machine a run's preserved checkout is on, resolved to a display label
+ * (issue #567) — the read side of `recovery.preservedWorkerId`, and of the
+ * `abandonedWorkerId` an operator's "Reset & restart" leaves in its place.
+ *
+ * Exactly one of the two is reported, `preserved` taking precedence: a run either
+ * still holds machine-local state or has given it up, never both at once.
+ */
+export interface RunPreservedWorker {
+	state: 'preserved' | 'abandoned';
+	workerId: string;
+	/** Null when the worker row no longer resolves — the UI then falls back to the id. */
+	workerName: string | null;
+	/**
+	 * Whether the run is *currently* blocked on that machine, rather than merely
+	 * pinned to it. Read from the active dispatch's `preserved-worker` wait reason,
+	 * because the two are genuinely different states and only one of them is the
+	 * unbounded wait: an ordinary rate-limit deferral also preserves its checkout
+	 * and records a machine, but its retry fires on a timer. Saying "this wait does
+	 * not time out" about that one would be false, so the UI keys its copy on this
+	 * rather than on the run's status.
+	 */
+	waiting: boolean;
+}
+
+/**
+ * Resolve the run's recorded preserved/abandoned machine into a display label, or
+ * `null` when it records neither (every run that never preserved a checkout, and
+ * every row written before issue #567).
+ *
+ * This is what lets a run *say which machine it is waiting for*, to every viewer,
+ * for as long as it waits — the wait is unbounded by design, so it must never read
+ * as a wedged run. Resolved server-side like every other display label here, and a
+ * failed lookup degrades to a null name (and to "not waiting", the weaker claim)
+ * rather than throwing.
+ */
+async function resolveRunPreservedWorker(run: {
+	id: string;
+	recovery: { preservedWorkerId?: string | null; abandonedWorkerId?: string | null } | null;
+}): Promise<RunPreservedWorker | null> {
+	const preserved = run.recovery?.preservedWorkerId ?? null;
+	const abandoned = run.recovery?.abandonedWorkerId ?? null;
+	const workerId = preserved ?? abandoned;
+	if (!workerId) return null;
+	const state = preserved ? 'preserved' : 'abandoned';
+	try {
+		const [worker, dispatch] = await Promise.all([
+			getWorker(workerId),
+			// Only a still-pinned run can be waiting on its pin; an abandoned record is
+			// history and never queries the queue.
+			preserved ? getActiveDispatchByRunId(run.id) : Promise.resolve(undefined),
+		]);
+		return {
+			state,
+			workerId,
+			workerName: worker?.displayName ?? null,
+			waiting: dispatch?.waitReason === 'preserved-worker',
+		};
+	} catch (error) {
+		logger.warn('runs.getById: preserved-worker lookup failed; reporting the id without a name', {
+			workerId,
+			error: describeError(error),
+		});
+		return { state, workerId, workerName: null, waiting: false };
+	}
+}
+
+/**
  * Label a page of runs with the display name of the worker machine that
  * executed each one (issue #523) — the list-shaped counterpart to
  * {@link resolveRunAttribution}, which `getById` resolves for the detail view.
@@ -685,14 +752,15 @@ export const runsRouter = router({
 	// of the run's project (existence hidden with identical run-not-found message).
 	// The row is returned as-is — including the persisted Tier 2 `checkpoint` and
 	// `continuationCount` (issue #503) the detail page's checkpoint panel renders —
-	// plus three additive, server-resolved fields: an `attribution` object resolving
+	// plus four additive, server-resolved fields: an `attribution` object resolving
 	// the recorded worker/user to display labels (issue #446), the
-	// `maxContinuations` ceiling that count reads against (issue #504), and the
+	// `maxContinuations` ceiling that count reads against (issue #504), the
 	// `pendingRequest` naming an accepted Terminate/Reset request that hasn't taken
 	// effect yet (issue #561 — the Redis cancellation marker for a `running` run, the
-	// run's waiting `manual-retry` dispatch otherwise). All three are looked up only
-	// after the access check, so a non-member never triggers an identity, project, or
-	// queue read.
+	// run's waiting `manual-retry` dispatch otherwise), and the `preservedWorker`
+	// naming the machine that holds (or has had discarded) this run's preserved
+	// checkout (issue #567). All four are looked up only after the access check, so a
+	// non-member never triggers an identity, project, or queue read.
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -714,6 +782,7 @@ export const runsRouter = router({
 				attribution: await resolveRunAttribution(run),
 				maxContinuations: await resolveContinuationBudget(run),
 				pendingRequest: await resolvePendingRunRequest(run),
+				preservedWorker: await resolveRunPreservedWorker(run),
 			};
 		}),
 

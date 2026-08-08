@@ -44,6 +44,7 @@ function resetResult(overrides: Partial<ResetRunResult> = {}): ResetRunResult {
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
 		recoveryCleared: true,
+		abandonedPreservedWorkerId: null,
 		dispatchId: 'dispatch-9',
 		...overrides,
 	};

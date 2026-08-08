@@ -89,6 +89,7 @@ export const QueuedWaitReasonSchema = z.enum([
 	'stalled',
 	'recheck',
 	'worker-eligibility',
+	'preserved-worker',
 	'manual-retry',
 	'recovered',
 ]);

@@ -61,6 +61,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	stalled: 'retrying after a stalled response',
 	recheck: 'waiting for checks to settle',
 	'worker-eligibility': 'waiting for an eligible worker',
+	// Deliberately names the *machine* rather than "a worker": every other worker in
+	// the project may be free and it changes nothing, because this dispatch continues
+	// work preserved on one specific machine (issue #567).
+	'preserved-worker': 'waiting for the machine holding its preserved work',
 	'manual-retry': 'manual retry',
 	recovered: 'recovered after a restart',
 };

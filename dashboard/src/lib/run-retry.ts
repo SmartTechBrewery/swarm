@@ -56,7 +56,9 @@ export type RetryActionKind = 'resume' | 'continue' | 'recheck' | 'retry';
 export function retryActionKind(
 	status: string,
 	agentSessionId: string | null,
-	recovery?: { state: 'preserved' | 'recovered' | 'blocked' } | null,
+	// `state` is optional since issue #567: a run can carry a recovery record that
+	// only records where its preserved checkout is, with no recovery state at all.
+	recovery?: { state?: 'preserved' | 'recovered' | 'blocked' } | null,
 ): RetryActionKind {
 	if (status === 'checkpointed') return 'continue';
 	if (status === 'deferred' && agentSessionId !== null) return 'resume';

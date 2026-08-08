@@ -193,7 +193,12 @@ export const runs = pgTable(
 		outputBytes: integer('output_bytes').notNull().default(0),
 		outputTruncated: boolean('output_truncated').notNull().default(false),
 		recovery: jsonb('recovery').$type<{
-			state: 'preserved' | 'recovered' | 'blocked';
+			/**
+			 * Optional since issue #567: the two machine-location facts below are
+			 * recorded on runs that have no recovery *state* at all — a `deferred` or
+			 * `checkpointed` run preserves a checkout without ever writing one.
+			 */
+			state?: 'preserved' | 'recovered' | 'blocked';
 			// Kept in sync with `BlockedRecoveryReason` (`src/worktree/reclaim.ts`).
 			// `resumable-owner` (issue #367) marks a collision blocked because a
 			// resumable deferred/failed run still pins the checkout;
@@ -208,6 +213,36 @@ export const runs = pgTable(
 				| 'resumable-owner'
 				| 'checkpoint-divergent';
 			agentSessionId?: string | null;
+			/**
+			 * The worker whose machine holds this run's **preserved checkout** (issue
+			 * #567) — recorded at the settle that preserved it
+			 * ({@link recordRunPreservedWorker}), from the attempt's own `worker_id`.
+			 *
+			 * It lives here rather than being read back off `worker_id` because that
+			 * column is the *last attempt's* worker and is overwritten at every bind:
+			 * once a continuation re-binds the run to another machine, the location of
+			 * the surviving checkout would be unrecoverable. A checkpoint, a resumable
+			 * session, and a delivery sidecar are all machine-local, so a continuation
+			 * that lands anywhere else silently redoes the work — which is exactly what
+			 * this pins against (`src/worker/eligibility-gate.ts`).
+			 *
+			 * Survives a re-bind ({@link resetRunToRunning} carries it forward onto the
+			 * `recovered` record the next attempt writes) and is dropped only when the
+			 * run stops recovering: a fresh, non-recovery attempt, or the operator's
+			 * "Reset & restart" ({@link clearRunRecovery}).
+			 */
+			preservedWorkerId?: string | null;
+			/**
+			 * The machine whose preserved checkout an operator deliberately **discarded**
+			 * (issue #567) — written by "Reset & restart" ({@link clearRunRecovery}) from
+			 * the `preservedWorkerId` it just cleared.
+			 *
+			 * The durable record that this run started over rather than continued, which
+			 * nothing said before. Unlike every other field here it is a historical fact
+			 * about the row rather than live recovery state, so it is the one key a fresh
+			 * attempt's recovery rewrite does not clear.
+			 */
+			abandonedWorkerId?: string | null;
 		}>(),
 		/**
 		 * This run's recorded cancellation origin (issue #308), mirroring

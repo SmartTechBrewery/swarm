@@ -45,8 +45,9 @@ export const dispatches = pgTable(
 		/**
 		 * Why a non-terminal dispatch is waiting: `project-capacity`, `rate-limit`,
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
-		 * `worktree-exists`, `stalled`, `recheck`, `manual-retry`. Null while
-		 * leased/running and for terminal states.
+		 * `worktree-exists`, `stalled`, `recheck`, `worker-eligibility`,
+		 * `preserved-worker`, `manual-retry`, `recovered`. Null while leased/running
+		 * and for terminal states.
 		 */
 		waitReason: text('wait_reason'),
 		/**
