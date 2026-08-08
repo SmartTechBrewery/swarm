@@ -81,6 +81,7 @@ import {
 	executeRecoveryGate,
 	sessionRunArgs,
 	shouldPreserveFailedCheckout,
+	warnStartingOverOnPreservedWork,
 } from '@/pipeline/resume.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
@@ -384,6 +385,12 @@ async function acquireImplementationWorktree(
 				deliveryResumed: resumeDelivery,
 			};
 	}
+	// Implementation is the phase that writes checkpoints, so this fall-through is
+	// where a lost continuation costs the most: reaching it with a preserved
+	// checkout still on disk means the run is re-doing work it had already done
+	// (issue #591). Warn, then provision as before — an unrequested start-over is
+	// legal, it just must never be silent.
+	warnStartingOverOnPreservedWork(worktrees, taskId, 'implementation', runId);
 	const handle = resumeExistingBranch
 		? await worktrees.provision(taskId, { createBranch: false, branch, runId })
 		: await worktrees.provision(taskId, { runId });

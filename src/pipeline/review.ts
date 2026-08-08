@@ -83,6 +83,7 @@ import {
 } from '@/pipeline/resume.js';
 import { renderReviewBody } from '@/pipeline/review-body.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
+import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	DeliveryDeferredError,
 	deliveryIdentity,
@@ -196,11 +197,17 @@ export interface RunReviewPhaseOptions {
 	/** The database run id. */
 	runId?: string;
 	/**
-	 * Mode for recovering a cancelled preserved worktree. Deliberately narrower than
-	 * {@link RecoveryMode}: this phase writes no checkpoint (`docs/CHECKPOINTS.md`),
-	 * so there is never one to continue it from.
+	 * Mode for recovering a cancelled preserved worktree. The full
+	 * {@link RecoveryMode}, even though this phase writes no checkpoint
+	 * (`docs/CHECKPOINTS.md`) and so can never legitimately be sent
+	 * `'checkpoint'`: the executor forwards one value to every phase (issue #591),
+	 * and narrowing it here only meant this phase could not be handed the union it
+	 * is given. If a `'checkpoint'` ever does arrive, the recovery gate's
+	 * `validateCheckpointForContinuation` fails it with the accurate
+	 * `missing-validation` / `checkpoint-divergent` reason rather than the phase
+	 * failing to compile.
 	 */
-	recoveryMode?: 'resume' | 'fresh';
+	recoveryMode?: RecoveryMode;
 	/** Resume deterministic delivery from a preserved worktree without rerunning the agent. */
 	resumeDelivery?: boolean;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
@@ -675,6 +682,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		() => worktrees.provision(taskId, { detach: true, baseBranch: headSha, runId }),
 		resumeDelivery,
 		recoveryMode,
+		runId,
 	);
 	let preserveForResume = false;
 	try {

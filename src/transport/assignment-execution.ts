@@ -46,6 +46,7 @@ import { phaseLabel } from '../pipeline/phase-label.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
 import { createWriteOnlyTransportPmProvider } from '../pm/transport-delivery.js';
 import type { PMProvider, WorkItem, WorkItemBlocker } from '../pm/types.js';
+import { phaseRecoveryFromAssignment } from '../queue/jobs.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
 import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
 import {
@@ -736,9 +737,10 @@ function buildDbFreePhaseInputs({
 		reasoning: assignment.target.reasoning,
 		customPrompt: assignment.customPrompt,
 		timeoutMs: assignment.timeoutMs,
-		sessionId: assignment.resumeSession ? undefined : assignment.agentSessionId,
-		resumeSessionId: assignment.resumeSession ? assignment.agentSessionId : undefined,
-		resumeDelivery: assignment.resumeDelivery === true,
+		// The whole recovery intent, resolved by the mapper the job payload owns
+		// (`../queue/jobs.ts`) rather than re-derived here — the duplication that
+		// let the wire and this executor disagree about `recoveryMode` (issue #591).
+		recovery: phaseRecoveryFromAssignment(assignment),
 		runId: assignment.runId,
 		worktrees,
 		signal,
@@ -746,7 +748,6 @@ function buildDbFreePhaseInputs({
 		// writes them — this worker has no `run_output_events` table to write to.
 		runAgent: createAssignmentRunAgent(assignment, sink, baseRunAgent),
 		workItem: assignment.workItem ? fromAssignedWorkItem(assignment.workItem) : undefined,
-		resumeExistingBranch: assignment.implementationBranchProvisioned === true,
 		onBranchProvisioned: async () => {
 			sink.send({
 				type: 'task-progress',

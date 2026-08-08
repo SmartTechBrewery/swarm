@@ -19,6 +19,7 @@
 import { toNonSecretProjectConfig } from '../config/project-config-slice.js';
 import type { AgentTarget, ProjectConfig } from '../config/schema.js';
 import type { WorkItem } from '../pm/types.js';
+import type { RecoveryIntent } from '../queue/jobs.js';
 import {
 	type AssignedWorkItem,
 	type TaskAssignment,
@@ -27,13 +28,13 @@ import {
 	TRANSPORT_PROTOCOL_VERSION,
 } from './protocol.js';
 
-/** Session-threading / resume fields, grouped as the worker phase runner consumes them. */
-export interface TaskAssignmentSession {
-	agentSessionId?: string;
-	resumeSession?: boolean;
-	resumeDelivery?: boolean;
-	implementationBranchProvisioned?: boolean;
-}
+/**
+ * Session-threading / resume fields, grouped as the worker phase runner consumes
+ * them — the run's {@link RecoveryIntent}, which is the *one* declaration of
+ * these members (`../queue/jobs.ts`) rather than a fourth hand-maintained copy of
+ * them (issue #591). Callers derive it from the job with `recoveryIntentFromJob`.
+ */
+export type TaskAssignmentSession = RecoveryIntent;
 
 /** PR coordinates for the SCM-driven phases (review / respond-to-* / resolve-conflicts). */
 export interface TaskAssignmentPr {

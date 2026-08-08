@@ -108,6 +108,9 @@ function depsWith(
 }
 
 /** The transport coordinates every run needs: the operator token + this worker's own credential. */
+/** A resumable session id — UUID-shaped for every CLI (`RecoveryIntentSchema`). */
+const SESSION_UUID = '11111111-1111-4111-8111-111111111111';
+
 const RUN_OPTIONS = {
 	repoRoot: '/worker-local/swarm',
 	operatorToken: OPERATOR_TOKEN,
@@ -365,9 +368,50 @@ describe('runAssignmentDbFree', () => {
 		// reuses its preserved worktree and continues the same agent session.
 		expect(runPhase.mock.calls[0][0]).toMatchObject({
 			phase: 'planning',
-			resumeSessionId: 'session-abc',
-			sessionId: undefined,
+			recovery: { resumeSessionId: 'session-abc', sessionId: undefined },
 		});
+	});
+
+	// The regression test for the observed outage (issue #591): the pushed frame
+	// carried `recoveryMode: 'checkpoint'` and this executor dropped it, so the
+	// phase saw no recovery intent, provisioned fresh over the preserved checkout,
+	// and failed with a generic worktree collision — nine dispatches running.
+	it('reaches the phase with the assignment’s recovery mode (issue #591)', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'implementation',
+					workItem: createMockWorkItem({ id: 'ITEM_567' }),
+					// What "Continue now" sends for a `checkpointed` run: the mode plus a
+					// freshly minted session and deliberately no resume.
+					session: { recoveryMode: 'checkpoint', agentSessionId: SESSION_UUID },
+				}),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(runPhase.mock.calls[0][0].recovery).toMatchObject({
+			recoveryMode: 'checkpoint',
+			// A continuation's hand-off is the checkpoint file, so its fresh id is
+			// assigned rather than resumed.
+			sessionId: SESSION_UUID,
+			resumeSessionId: undefined,
+		});
+	});
+
+	it('passes no recovery mode for an ordinary attempt', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'planning' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(runPhase.mock.calls[0][0].recovery.recoveryMode).toBeUndefined();
 	});
 
 	it('runs respond-to-review with its card lookup, board move and follow-up on the delivery API', async () => {

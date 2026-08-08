@@ -297,14 +297,37 @@ identical policy it applies in-process. The wire `status` stays `deferred` — a
 a deferral whose retry happens to run from a checkpoint — so the frame change is additive and
 needs no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits the field.
 
-**And the continuation goes back to that same host** (issue #567). The checkpoint file lives in
-that worker's `.swarm-workspaces/task-<id>` and nowhere else, so the settle also records which
-machine it is on (`runs.recovery.preservedWorkerId`) and the dispatch gate offers the
-continuation only there. If that machine is unavailable the dispatch waits for it without a
-timeout rather than continuing somewhere the checkpoint does not exist — which used to provision
-a fresh checkout and re-run the phase from scratch, silently. "Reset & restart" is the deliberate
-way out: it discards the checkpoint and the continuation budget as it always did, and now also
-releases the pin, recording on the run that the preserved work was abandoned.
+**And the continuation travels back the same way** (issue #591). The deferral is only half the
+split: the checkout the checkpoint describes stays on the worker's host, so the *gate that adopts
+it* has to run there too. The control plane therefore sends the run's whole recovery intent —
+`agentSessionId`, `resumeSession`, `resumeDelivery`, `implementationBranchProvisioned` and
+`recoveryMode` — on the `TaskAssignment` itself, and the worker resolves it into the phase inputs
+that reach `executeRecoveryGate` (`src/pipeline/resume.ts`). Additive in this direction too, so
+again no version bump: an older router omits `recoveryMode` and an older worker ignores it.
+
+Those five members are declared **once**, as `RecoveryIntentSchema` (`src/queue/jobs.ts`), and
+spread into both the job payload and the assignment frame rather than restated on each. That is
+deliberate and worth keeping: while they were four hand-maintained copies of each other,
+`recoveryMode` was written by "Retry now", "Reset & restart" and the automatic deferral, dropped
+at the very first hop, and read by no executor at all — every Tier 2 continuation provisioned
+fresh over the preserved checkout and silently re-did the work, which the whole test suite
+tolerated because each end was covered and the joint between them was not. The contract test
+that now walks the whole hand-off (`tests/unit/transport/recovery-intent-contract.test.ts`)
+fails if a member added to that schema does not reach a phase.
+
+**Carrying the intent is necessary but not sufficient — it also has to be sent to the right
+machine** (issue #567). The checkpoint file lives in one worker's `.swarm-workspaces/task-<id>`
+and nowhere else, so the settle additionally records which machine it is on
+(`runs.recovery.preservedWorkerId`) and the dispatch gate offers the continuation only there. If
+that machine is unavailable the dispatch waits for it without a timeout rather than continuing
+somewhere the checkpoint does not exist — which used to provision a fresh checkout and re-run the
+phase from scratch, silently. "Reset & restart" is the deliberate way out: it discards the
+checkpoint and the continuation budget as it always did, and now also releases the pin, recording
+on the run that the preserved work was abandoned.
+
+A phase that reaches `provisionFresh()` while a preserved checkout — or a checkpoint inside it —
+still exists logs a `warn` naming the task, phase and run. That is the backstop for both halves
+above: starting over is sometimes legitimate; being unable to tell that it happened is not.
 
 ## Rejected: soft quota budgets and the self-checkpoint trigger
 

@@ -119,6 +119,7 @@ import {
 	RUN_CANCELLED_MESSAGE,
 } from '../queue/cancellation.js';
 import {
+	type PhaseRecovery,
 	type PmWebhookJob,
 	type ScmWebhookJob,
 	type SwarmJob,
@@ -1303,13 +1304,10 @@ export interface PhaseRunResult {
 
 /**
  * The already-resolved inputs a single pipeline phase runs from — the normalized
- * shape both dispatch paths build before invoking a phase: the in-process path
- * ({@link runPhase}, from a `TriggerResult` + routing overrides + the job's
- * session fields) and the transport path (`../transport/assignment-execution.ts`,
- * from a pushed `TaskAssignment`). Centralizing the per-phase runner switch in
- * {@link runAssignedPhase} is what keeps the two paths from diverging — the
- * mapping of "which phase → which `runXPhase`, with which arguments" lives in
- * exactly one place.
+ * shape the transport path (`../transport/assignment-execution.ts`) builds from a
+ * pushed `TaskAssignment` before invoking a phase. Centralizing the per-phase
+ * runner switch in {@link runAssignedPhase} is what keeps every phase's argument
+ * mapping in exactly one place.
  */
 export interface AssignedPhaseInputs {
 	phase: TriggerPhase;
@@ -1320,12 +1318,18 @@ export interface AssignedPhaseInputs {
 	reasoning?: ReasoningLevel;
 	customPrompt?: string;
 	timeoutMs?: number;
-	/** Deterministic session handle assigned to a fresh run (claude's `--session-id`). */
-	sessionId?: string;
-	/** Session to resume on a rate-limit/timeout retry — undefined on a fresh run. */
-	resumeSessionId?: string;
-	/** Resume deterministic-delivery progress rather than an agent session. */
-	resumeDelivery: boolean;
+	/**
+	 * How this attempt treats the work a prior one preserved — session to assign or
+	 * resume, delivery/branch progress to adopt, and the recovery mode the
+	 * worktree gate enforces. **Required, and one value rather than five optional
+	 * siblings** (issue #591): the members are declared once
+	 * (`RecoveryIntentSchema`, `../queue/jobs.ts`) and resolved once
+	 * (`phaseRecoveryFromAssignment`, same file), so a member added there fails to
+	 * compile at every construction site instead of quietly defaulting to "this
+	 * attempt has no recovery intent" — the shape that let `recoveryMode` reach no
+	 * executor at all while every write path kept setting it.
+	 */
+	recovery: PhaseRecovery;
 	/** The database run id, when one exists for this attempt. */
 	runId?: string;
 	/** External cancellation — aborting kills the agent CLI. */
@@ -1345,8 +1349,6 @@ export interface AssignedPhaseInputs {
 	 * SCM side.
 	 */
 	pm?: PMProvider;
-	/** implementation: reuse an already-provisioned task branch on a resumed retry. */
-	resumeExistingBranch?: boolean;
 	/** implementation: called once the task branch has been acquired, for resume idempotency. */
 	onBranchProvisioned?: () => Promise<void>;
 	/** PR-driven phases (review / respond-to-* / resolve-conflicts). */
@@ -1378,9 +1380,9 @@ export interface AssignedPhaseInputs {
 	 * operator-token `agentToken` alongside `delivery` (and, for board-driven
 	 * phases, a `pm`; for review, a `reviewLedger`) so no phase reaches into the
 	 * secret store or the DB. The two are independent seams: each phase resolves
-	 * its own default for whichever is unset, so the in-process path
-	 * ({@link runPhase}) leaves both unset and gets the project's registered
-	 * delivery provider plus the agent token from `getPersonaToken`.
+	 * its own default for whichever is unset, so a caller that leaves both unset
+	 * gets the project's registered delivery provider plus the agent token from
+	 * `getPersonaToken`.
 	 */
 	delivery?: ScmDeliveryProvider;
 	agentToken?: string;
@@ -1424,15 +1426,21 @@ export interface AssignedPhaseInputs {
 export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<PhaseRunResult> {
 	const { project, taskId, runId, signal, runAgent, cli, model, reasoning, customPrompt } = inputs;
 	const timeoutMs = inputs.timeoutMs;
-	// Session threading, uniform across every phase (issue: cross-CLI resume). On a
-	// resume retry the persisted id is handed back as the CLI's resume id; on a
-	// fresh run it's assigned as claude's `--session-id` (codex/agy ignore the
-	// assign and have their id captured post-run).
-	const session = {
-		sessionId: inputs.sessionId,
-		resumeSessionId: inputs.resumeSessionId,
-		resumeDelivery: inputs.resumeDelivery,
-	};
+	// Session threading and recovery, uniform across every phase (issue: cross-CLI
+	// resume). On a resume retry the persisted id is handed back as the CLI's
+	// resume id; on a fresh run it's assigned as claude's `--session-id`
+	// (codex/agy ignore the assign and have their id captured post-run).
+	// `recoveryMode` rides the same object into every phase, which is what makes
+	// the recovery gate (`executeRecoveryGate`, `../pipeline/resume.ts`) reachable
+	// on the host that actually holds the preserved checkout (issue #591).
+	//
+	// **Destructured, never re-listed.** This is the last hop before a phase, so a
+	// member named here by hand is a member the next author can forget — the same
+	// shape that let `recoveryMode` reach no executor at all. Splitting off the one
+	// member that is *not* uniform (`resumeExistingBranch`, which only Implementation
+	// takes) leaves the rest to spread through as a rest object, so a member added
+	// to `PhaseRecovery` arrives at every phase with no edit here.
+	const { resumeExistingBranch, ...session } = inputs.recovery;
 	// Additive DB-free injection (see `AssignedPhaseInputs`): forward an injected
 	// PM/delivery/token straight through, defaulting the PM to the project's
 	// registry-resolved provider (never a concrete one, per ai/RULES.md §2) and
@@ -1484,7 +1492,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				model,
 				reasoning,
 				customPrompt,
-				resumeExistingBranch: inputs.resumeExistingBranch === true,
+				resumeExistingBranch,
 				onBranchProvisioned: inputs.onBranchProvisioned,
 				// Identifies this attempt to the provision-time collision gate, so a
 				// lease left behind by a crashed run is recognised as an orphan instead

@@ -31,6 +31,7 @@ import { DEFAULT_AUTOMATION_LABEL } from '@/pm/automation-label.js';
 import { type PmEvent, PmEventSchema } from '@/pm/events.js';
 import type { WorkItem } from '@/pm/types.js';
 import {
+	type PhaseRecovery,
 	type PmWebhookJob,
 	PmWebhookJobSchema,
 	type ScmWebhookJob,
@@ -721,6 +722,17 @@ export function createMockPmWebhookJob(overrides: Partial<PmWebhookJob> = {}): P
 		event: createMockPmEvent(),
 		...overrides,
 	});
+}
+
+/**
+ * The resolved recovery intent a phase runs from (`PhaseRecovery`,
+ * `src/queue/jobs.ts`), defaulted to "a fresh attempt with nothing to continue" —
+ * the required member every `AssignedPhaseInputs` carries since issue #591.
+ * Override exactly the part under test rather than restating the whole value, so
+ * a member added to the intent reaches every test through this one default.
+ */
+export function createMockPhaseRecovery(overrides: Partial<PhaseRecovery> = {}): PhaseRecovery {
+	return { resumeDelivery: false, resumeExistingBranch: false, ...overrides };
 }
 
 export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}): ProjectConfig {

@@ -119,6 +119,7 @@ function makeDeps() {
 	};
 	const worktrees = {
 		provision: vi.fn(async () => handle),
+		worktreePath: vi.fn(() => handle.path),
 		reuse: vi.fn(async () => handle),
 		cleanup: vi.fn(async () => {}),
 	};

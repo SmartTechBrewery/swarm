@@ -13,9 +13,10 @@
  *
  * It lives here, not in the phase, because the DB is here: a federated worker
  * must be able to run the phase with no database at all (ADR-003 §2 / ADR-004
- * §3), so both dispatch paths resolve the id before the phase starts — the local
- * one in `runPhase` (`../worker/consumer.ts`), the federated one in the
- * dispatcher's assignment (`../router/dispatcher.ts`) — and inject it.
+ * §3), so the id is resolved before the phase starts — in the dispatcher's
+ * assignment (`../router/dispatcher.ts`) — and injected. There is one dispatch
+ * path now: issue #551 retired the in-process executor, so every host runs the
+ * phase from a pushed assignment.
  *
  * Best-effort by contract: the board report it feeds is cosmetic, so a lookup
  * failure logs and yields `undefined` rather than failing a dispatch.
