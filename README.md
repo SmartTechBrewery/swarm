@@ -43,7 +43,11 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   whole pool, so a phase several machines can run does not consume the one machine
   another waiting phase needs (issue #533). **Planning is
   central** — it is never routed by assignment, so it takes any capable worker
-  rather than waiting on the assignee's (issue #469). **The gate has one rule for every
+  rather than waiting on the assignee's (issue #469). **A continuation runs where
+  its work is** — a run that preserved a checkout (a checkpoint, a resumable
+  session, a delivery sidecar) is pinned to the machine holding it and waits for
+  that machine rather than starting over elsewhere, until an operator chooses
+  "Reset & restart" (issue #567). **The gate has one rule for every
   deployment** — a single-user install registers and enrolls its one local worker
   exactly as anyone else does (issue #552); `SWARM_SINGLE_USER_MODE` is the API's
   authentication policy and no longer bypasses dispatch. Each host authenticates

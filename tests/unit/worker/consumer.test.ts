@@ -317,8 +317,16 @@ const resetRunBindings: Array<{
 const resetRunSessionColumns: Array<string | null | undefined> = [];
 const getRunByIdFromDb = vi.fn(
 	async (_id: string) =>
-		undefined as { agentSessionId?: string | null; continuationCount?: number } | undefined,
+		undefined as
+			| {
+					agentSessionId?: string | null;
+					continuationCount?: number;
+					recovery?: { preservedWorkerId?: string | null } | null;
+			  }
+			| undefined,
 );
+/** Issue #567 — the settle-time record of which machine holds the preserved checkout. */
+const recordRunPreservedWorker = vi.fn(async (_runId: string) => {});
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
 	completeRun: (id: string, input: unknown) => completeRun(id, input),
@@ -343,6 +351,15 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		return resetRunToRunning(args[0] as string, args[1], args[2] as string | undefined);
 	},
 	getRunByIdFromDb: (id: string) => getRunByIdFromDb(id),
+	recordRunPreservedWorker: (runId: string) => recordRunPreservedWorker(runId),
+}));
+
+// The preserved-checkout pin resolves the machine's display name for its refusal
+// message (issue #567). Mocked at the module boundary like every other DB-backed
+// collaborator here; the id is the fallback when it resolves nothing.
+const getWorker = vi.fn(async (id: string) => ({ id, displayName: `worker-${id}` }));
+vi.mock('@/identity/worker-service.js', () => ({
+	getWorker: (id: string) => getWorker(id),
 }));
 
 // Global (app-wide) settings are loaded once per job for the default-model tier
@@ -692,6 +709,8 @@ describe('processJob', () => {
 		resetRunSessionColumns.length = 0;
 		getRunByIdFromDb.mockClear();
 		getRunByIdFromDb.mockResolvedValue(undefined);
+		recordRunPreservedWorker.mockClear();
+		getWorker.mockClear();
 		reconcileTerminatedWorktree.mockClear();
 		reconcileTerminatedWorktree.mockResolvedValue({ outcome: 'absent' });
 		getLatestRunForTask.mockClear();
@@ -2117,6 +2136,113 @@ describe('processJob', () => {
 			expect(addComment).toHaveBeenCalledOnce();
 			const [, body] = addComment.mock.calls[0];
 			expect(body).toMatch(/sharing consent/i);
+		});
+
+		// Issue #567. The end-to-end shape of the pin: where it is read from, that the
+		// wait it produces never expires, and that it is recorded as its own reason.
+		describe('preserved-checkout pin', () => {
+			/** A continuation of `run-1` whose checkout was preserved on `w-preserved`. */
+			const continuation = () =>
+				createMockPmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' });
+
+			beforeEach(() => {
+				getRunByIdFromDb.mockResolvedValue({ recovery: { preservedWorkerId: 'w-preserved' } });
+			});
+
+			it('waits for the pinned machine instead of running on a free worker', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-free'),
+					candidate('w-preserved', { activeRuns: 1 }),
+				]);
+
+				const outcome = await processJob(continuation(), registryReturning(planningTrigger()));
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					preservedWorkerWait: true,
+				});
+				expect(phaseCalls).toEqual([]);
+			});
+
+			it('records the wait as its own dispatch reason, not a generic eligibility one', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-preserved', { activeRuns: 1 }),
+				]);
+
+				await processJob(continuation(), registryReturning(planningTrigger()));
+
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				expect(input).toMatchObject({ waitReason: 'preserved-worker' });
+			});
+
+			it('never gives up on the pinned machine, however long it has waited', async () => {
+				// The budget that ends every other eligibility wait must not end this one:
+				// failing here would abandon work that is still sitting on disk.
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-preserved', { activeRuns: 1 }),
+				]);
+
+				const outcome = await processJob(
+					createMockPmWebhookJob({
+						runId: 'run-1',
+						recoveryMode: 'checkpoint',
+						workerEligibilityRecheckAttempt: 1_000_000,
+					}),
+					registryReturning(planningTrigger()),
+				);
+
+				expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+				expect(addComment).not.toHaveBeenCalled();
+			});
+
+			it('runs on the pinned machine once it is free again', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-free'),
+					candidate('w-preserved'),
+				]);
+
+				const outcome = await processJob(
+					continuation(),
+					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-preserved'),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+					expect.objectContaining({ selectedWorkerId: 'w-preserved' }),
+				);
+			});
+
+			it('leaves a non-continuation dispatch unpinned, without reading the run row', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+				const outcome = await processJob(
+					createMockPmWebhookJob({ runId: 'run-1' }),
+					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-free'),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+			});
+
+			it('refuses a continuation it cannot resolve a pin for rather than routing it unpinned', async () => {
+				// Dispatching a continuation without its pin is the defect itself, so an
+				// unreadable run row waits — on the ordinary bounded budget, since a DB
+				// that never returns must not hold the run forever.
+				getRunByIdFromDb.mockRejectedValue(new Error('db down'));
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+				const outcome = await processJob(continuation(), registryReturning(planningTrigger()));
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					workerEligibilityRecheck: true,
+					preservedWorkerWait: false,
+				});
+				expect(phaseCalls).toEqual([]);
+			});
 		});
 
 		it('never routes an assigned item to another user’s free worker', async () => {
@@ -4039,6 +4165,20 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({ status: 'checkpointed', agentSessionId: null }),
 			);
+		});
+
+		// Issue #567: the settle is the one moment `runs.worker_id` still names the
+		// machine the checkout is on — every later bind overwrites it — so a settle
+		// that preserves a checkout records where it is.
+		it('records the machine holding the checkout a checkpointed settle preserves', async () => {
+			phaseImpl = stoppedRun({ sessionId: 'sess-ci', checkpoint: CHECKPOINT });
+
+			await processJob(
+				createMockScmWebhookJob({ resumeSession: true, runId: 'run-1' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
 		});
 
 		it('ignores a checkpoint another phase left in the shared checkout', async () => {

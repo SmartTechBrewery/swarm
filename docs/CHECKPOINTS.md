@@ -297,6 +297,15 @@ identical policy it applies in-process. The wire `status` stays `deferred` — a
 a deferral whose retry happens to run from a checkpoint — so the frame change is additive and
 needs no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits the field.
 
+**And the continuation goes back to that same host** (issue #567). The checkpoint file lives in
+that worker's `.swarm-workspaces/task-<id>` and nowhere else, so the settle also records which
+machine it is on (`runs.recovery.preservedWorkerId`) and the dispatch gate offers the
+continuation only there. If that machine is unavailable the dispatch waits for it without a
+timeout rather than continuing somewhere the checkpoint does not exist — which used to provision
+a fresh checkout and re-run the phase from scratch, silently. "Reset & restart" is the deliberate
+way out: it discards the checkpoint and the continuation budget as it always did, and now also
+releases the pin, recording on the run that the preserved work was abandoned.
+
 ## Rejected: soft quota budgets and the self-checkpoint trigger
 
 An earlier draft of this design proposed a second, *voluntary* mechanism: phases would run

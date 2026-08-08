@@ -209,8 +209,37 @@ describe('resetRun', () => {
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-2',
 		});
+	});
+
+	// Issue #567: reset is the *only* thing that ends a pinned wait, and it is the
+	// operator's deliberate "give up that machine's work" — so it reports which
+	// machine's work went, and it never asks that machine to participate.
+	it('reports the machine whose preserved work it abandoned', async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(
+			makeRun({ recovery: { preservedWorkerId: 'w-preserved' } }),
+		);
+
+		const result = await resetRun('run-1');
+
+		expect(result.abandonedPreservedWorkerId).toBe('w-preserved');
+		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
+	});
+
+	it('works while the pinned machine is unreachable, since nothing asks it anything', async () => {
+		// The escape hatch has to work exactly when the machine is offline — otherwise
+		// a run pinned to a dead host would wait forever with no way out.
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(
+			makeRun({ recovery: { preservedWorkerId: 'w-offline' } }),
+		);
+		vi.mocked(reconcileTerminatedWorktree).mockResolvedValue({ outcome: 'absent' });
+
+		const result = await resetRun('run-1');
+
+		expect(result.abandonedPreservedWorkerId).toBe('w-offline');
+		expect(result.dispatchId).toBe('dispatch-2');
 	});
 
 	it('re-dispatches with a fresh agent session and a reset rate-limit budget', async () => {

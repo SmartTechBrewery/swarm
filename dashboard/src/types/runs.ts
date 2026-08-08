@@ -150,6 +150,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'stalled',
 	'recheck',
 	'worker-eligibility',
+	'preserved-worker',
 	'manual-retry',
 	'recovered',
 ]);
@@ -274,6 +275,24 @@ export interface RunAttribution {
  * mutation's lifetime. That is what makes it survive a reload and read the same
  * for every viewer of the run rather than only the operator who clicked.
  */
+/**
+ * Mirrors the server `RunPreservedWorker` (`src/api/routers/runs.ts`, issue #567):
+ * the machine holding this run's preserved checkout, or — once an operator has
+ * restarted the run instead of continuing it — the machine whose preserved work
+ * was discarded.
+ *
+ * A continuation runs *only* on the preserved machine, and waits for it without a
+ * timeout, so the run has to be able to say which machine that is for as long as it
+ * waits. Resolved server-side on every `runs.getById` read, so it reads the same for
+ * every viewer rather than only for whoever triggered the wait.
+ */
+export interface RunPreservedWorker {
+	state: 'preserved' | 'abandoned';
+	workerId: string;
+	/** Null when the worker row no longer resolves — fall back to the id. */
+	workerName: string | null;
+}
+
 export interface PendingRunRequest {
 	action: 'terminate' | 'restart';
 	/** ISO 8601 — when the request was recorded; null when only the bare marker exists. */
@@ -402,7 +421,8 @@ export interface RunRow {
 	 * Preservation/recovery state for failed or resumed runs.
 	 */
 	recovery?: {
-		state: 'preserved' | 'recovered' | 'blocked';
+		/** Optional since issue #567 — a recorded machine can stand alone (see below). */
+		state?: 'preserved' | 'recovered' | 'blocked';
 		/** Mirrors `BlockedRecoveryReason` (`src/worktree/reclaim.ts`); keep the unions in sync. */
 		blockedReason?:
 			| 'dirty'
@@ -412,7 +432,18 @@ export interface RunRow {
 			| 'resumable-owner'
 			| 'checkpoint-divergent';
 		agentSessionId?: string | null;
+		/** The machine holding this run's preserved checkout (issue #567). */
+		preservedWorkerId?: string | null;
+		/** The machine whose preserved checkout a "Reset & restart" discarded (issue #567). */
+		abandonedWorkerId?: string | null;
 	} | null;
+	/**
+	 * Mirrors the server `RunPreservedWorker` (`src/api/routers/runs.ts`, issue
+	 * #567): the machine that holds — or has had discarded — this run's preserved
+	 * checkout, resolved server-side to a display label. Returned by `runs.getById`
+	 * only; null when the run records neither.
+	 */
+	preservedWorker?: RunPreservedWorker | null;
 	/**
 	 * Recorded cancellation origin (issue #308); null for a marker-only
 	 * (external/unknown) cancellation, a run never cancelled, and every

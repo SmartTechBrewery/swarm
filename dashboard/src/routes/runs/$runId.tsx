@@ -13,6 +13,7 @@ import {
 	Play,
 	RefreshCw,
 	RotateCcw,
+	Server,
 	Terminal,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -27,6 +28,7 @@ import {
 	forceReReviewConfirmMessage,
 } from '@/lib/force-re-review.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
+import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import {
@@ -675,7 +677,17 @@ export function ResetRunButton({
 				}}
 				title="Reset & restart run?"
 			>
-				<p className="text-sm text-zinc-300">{resetConfirmMessage(run.status, discardWork)}</p>
+				<p className="text-sm text-zinc-300">
+					{resetConfirmMessage(
+						run.status,
+						discardWork,
+						// Named only while the work is still there to lose: an already
+						// abandoned record must not read as a second warning.
+						run.preservedWorker?.state === 'preserved'
+							? preservedWorkerLabel(run.preservedWorker)
+							: null,
+					)}
+				</p>
 
 				<label className="flex items-start gap-3 mt-4 p-3 border border-red-900/50 rounded-md bg-red-950/20 cursor-pointer hover:bg-red-950/30 transition-colors">
 					<input
@@ -834,6 +846,41 @@ export function ForceReReviewButton({ run }: { run: RunRow }) {
 					}
 				/>
 			</Modal>
+		</div>
+	);
+}
+
+/**
+ * Where this run's preserved checkout is, and what that means (issue #567).
+ *
+ * A run pinned to a machine waits for it **without a timeout**, so this callout is
+ * what stops that wait reading as a wedged run: it names the machine, says the wait
+ * does not expire, and names the action that ends it. It renders for every viewer
+ * off a server-resolved field, not off the local operator's mutation state.
+ */
+export function PreservedWorkerCallout({ run }: { run: RunRow }) {
+	const described = describePreservedWorker(run.preservedWorker, run.status);
+	if (!described) return null;
+	const abandoned = run.preservedWorker?.state === 'abandoned';
+	return (
+		<div
+			className={
+				abandoned
+					? 'p-4 bg-zinc-900/40 border border-zinc-800 rounded flex items-start gap-3'
+					: 'p-4 bg-sky-950/20 border border-sky-900/30 rounded flex items-start gap-3'
+			}
+		>
+			<Server
+				className={`h-5 w-5 shrink-0 mt-0.5 ${abandoned ? 'text-zinc-400' : 'text-sky-400'}`}
+			/>
+			<div>
+				<h3 className={`text-xs font-semibold ${abandoned ? 'text-zinc-200' : 'text-sky-200'}`}>
+					{described.title}
+				</h3>
+				<p className={`text-xs mt-1 ${abandoned ? 'text-zinc-400' : 'text-sky-200/70'}`}>
+					{described.body}
+				</p>
+			</div>
 		</div>
 	);
 }
@@ -1408,6 +1455,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				</div>
 			)}
 
+			<PreservedWorkerCallout run={run} />
 			<CheckpointPanel run={run} />
 			<RecoveryCallout run={run} />
 			<ReviewCapCallout run={run} project={project} />

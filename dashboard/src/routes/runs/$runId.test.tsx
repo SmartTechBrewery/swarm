@@ -691,6 +691,7 @@ describe('ResetRunButton (issue #428)', () => {
 			cancellationCleared: true,
 			worktree: { outcome: 'blocked', blockedReason: 'dirty' },
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -711,6 +712,7 @@ describe('ResetRunButton (issue #428)', () => {
 			cancellationCleared: true,
 			worktree: { outcome: 'removed', discarded: 'dirty' },
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -733,6 +735,7 @@ describe('ResetRunButton (issue #428)', () => {
 			cancellationCleared: true,
 			worktree: { outcome: 'blocked', blockedReason: 'live-leased' },
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -770,6 +773,7 @@ describe('ResetRunButton (issue #428)', () => {
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 

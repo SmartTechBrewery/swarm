@@ -144,6 +144,15 @@ function reportReset(result: ResetRunResult): void {
 		out.step('recovery record: cleared');
 	}
 
+	// The one step that reports work *lost* (issue #567): the run stops waiting for
+	// the machine that held its preserved checkout, and that attempt is not carried
+	// over. Warned rather than stepped, because nothing else here is irreversible.
+	if (result.abandonedPreservedWorkerId) {
+		out.warn(
+			`preserved work: discarded — this run is no longer pinned to worker ${result.abandonedPreservedWorkerId}, and that attempt's progress is not carried over`,
+		);
+	}
+
 	out.step(`restarted: re-dispatched from scratch as dispatch ${result.dispatchId}`);
 }
 

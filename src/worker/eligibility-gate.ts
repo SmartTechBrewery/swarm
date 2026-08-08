@@ -22,6 +22,15 @@
  *    ({@link AFFINITY_GATED_PHASES}): to `implementation` but not to `planning`,
  *    which belongs to no particular machine (issue #469; see that constant for why
  *    the exemption outlived the reason it was introduced for).
+ * 2b. **The preserved-checkout pin** (issue #567) — when the dispatch continues
+ *    work left in a machine-local checkout (a Tier 2 checkpoint, a resumable
+ *    session, a delivery sidecar), the permitted set is *only* the machine that
+ *    holds it, recorded on the run as `recovery.preservedWorkerId`. It replaces
+ *    affinity rather than composing with it, and its refusal
+ *    (`preserved-worker-unavailable`) is the one wait with **no budget**: a
+ *    continuation is never started over on another machine, because doing so
+ *    silently discards the earlier attempt's work. Giving that work up is an
+ *    operator action ("Reset & restart"), never a timer.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
  *    connection/health → free capacity → declared phase support (issue #467) →
@@ -86,17 +95,27 @@ import type { TriggerPhase } from '../triggers/types.js';
 import { type PoolDemand, selectPooledWorker } from './pool-scheduling.js';
 
 /**
- * Why a *dispatch* was refused — Phase 2's per-worker vocabulary plus the one
- * verdict only a scheduler can reach: `assignee-worker-unavailable`, meaning the
- * assignee's workers as a set cannot take the work right now (none enrolled here,
- * or all of them busy/disconnected). Structural reasons stay per-worker so the
- * message names the thing an operator must fix.
+ * Why a *dispatch* was refused — Phase 2's per-worker vocabulary plus the two
+ * verdicts only a scheduler can reach:
+ *
+ * - `assignee-worker-unavailable` — the assignee's workers as a set cannot take
+ *   the work right now (none enrolled here, or all of them busy/disconnected).
+ * - `preserved-worker-unavailable` — this is a continuation and the one machine
+ *   holding its preserved checkout cannot take it (issue #567). Named separately
+ *   from "no capable worker" on purpose: every other worker in the project may be
+ *   idle and eligible and it changes nothing, because the state is not there.
+ *
+ * Structural reasons stay per-worker so the message names the thing an operator
+ * must fix.
  *
  * Only an affinity-gated phase can reach `assignee-worker-unavailable`
  * ({@link AFFINITY_GATED_PHASES}, issue #469): `planning` never narrows to one
  * user's machines, so it can never be refused for their unavailability.
  */
-export type DispatchIneligibilityReason = IneligibilityReason | 'assignee-worker-unavailable';
+export type DispatchIneligibilityReason =
+	| IneligibilityReason
+	| 'assignee-worker-unavailable'
+	| 'preserved-worker-unavailable';
 
 /** The worker + target a gated dispatch resolved to. */
 export interface DispatchSelection {
@@ -115,6 +134,15 @@ export interface DispatchSelection {
 	cli: AgentCli;
 	/** CLIs of the higher-priority targets no eligible worker could serve. */
 	skippedClis: AgentCli[];
+	/**
+	 * True when this worker was the *only* candidate because it holds the run's
+	 * preserved checkout (issue #567). Carried onto the selection so the fenced bind
+	 * that follows reports a lost claim as the same "waiting for that machine"
+	 * verdict the gate would have — otherwise a race between selection and claim
+	 * would downgrade the wait to a generic one and re-open the door to the phase
+	 * being started over somewhere else.
+	 */
+	pinnedToPreservedWorker?: boolean;
 }
 
 /**
@@ -199,6 +227,20 @@ export interface DispatchGateInput {
 	workItem?: Pick<WorkItem, 'assignees'>;
 	/** The project's PM provider — only its `type`/`supportsAssignees` are read. */
 	pm?: Pick<PMProvider, 'type' | 'supportsAssignees'>;
+	/**
+	 * The machine holding this run's preserved checkout, when this dispatch is a
+	 * continuation of it (issue #567) — resolved by the caller from
+	 * `runs.recovery.preservedWorkerId`. Set, it is the **hardest** narrowing the
+	 * gate applies: the candidate set becomes that one worker, and every other
+	 * eligible machine in the project is irrelevant, because a checkpoint, a
+	 * resumable session, and a delivery sidecar are all machine-local and a
+	 * continuation that runs anywhere else silently redoes the work.
+	 *
+	 * `name` is the worker's display label for the refusal message, resolved by the
+	 * caller because a pinned machine may not even be an enrolled candidate here
+	 * (unenrolled since, or never enrolled in this project); the id is the fallback.
+	 */
+	preservedWorker?: { id: string; name?: string };
 }
 
 /** Per-call tuning for {@link evaluateDispatchEligibility}. */
@@ -301,12 +343,23 @@ function aggregateReason(reported: Set<IneligibilityReason>): IneligibilityReaso
 /** Where the refusal message should point a human, per reason. */
 function ineligibilityMessage(
 	reason: DispatchIneligibilityReason,
-	context: { projectId: string; assignee?: string; clis: AgentCli[]; phase: TriggerPhase },
+	context: {
+		projectId: string;
+		assignee?: string;
+		clis: AgentCli[];
+		phase: TriggerPhase;
+		preservedWorker?: string;
+	},
 ): string {
 	const owner = context.assignee
 		? `assignee '${context.assignee}'`
 		: `project '${context.projectId}'`;
 	switch (reason) {
+		// Names the machine, states that the wait does not expire, and names the one
+		// action that ends it — this text is what an operator reads on the run while
+		// it waits, so "waiting for m3_pro_tp" has to be distinguishable from "wedged".
+		case 'preserved-worker-unavailable':
+			return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine is not currently available to take it. Waiting for it — this wait does not time out and nothing is started over on another machine. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
 		case 'assignee-worker-unavailable':
 			return `No eligible worker is free for ${owner} — an assigned item waits for its assignee's own worker and is never routed to another user's. Waiting for one to become available.`;
 		case 'worker-unavailable':
@@ -475,9 +528,19 @@ export async function evaluateDispatchEligibility(
 		input.workItem && input.pm?.supportsAssignees && isAffinityGatedPhase(input.phase)
 			? await resolveAssignedUser(input.workItem, input.pm.type)
 			: undefined;
-	const permitted = assigned
-		? candidates.filter((c) => c.worker.ownerUserId === assigned.user.id)
-		: candidates;
+	// A pin outranks affinity, and replaces it rather than composing with it (issue
+	// #567). The two can only disagree when the item's assignee changed after the
+	// checkout was preserved, and intersecting them would then narrow to nothing and
+	// wait forever for a machine that cannot hold the state anyway. The preserved
+	// machine was itself chosen through affinity on the attempt that stopped, so
+	// honouring it is the closer reading of the assignment; an operator who wants the
+	// work moved gives the preserved state up with "Reset & restart".
+	const pinned = input.preservedWorker;
+	const permitted = pinned
+		? candidates.filter((c) => c.worker.id === pinned.id)
+		: assigned
+			? candidates.filter((c) => c.worker.ownerUserId === assigned.user.id)
+			: candidates;
 	const clis = [
 		...new Set(input.targets.map((target) => resolveTargetCli(target, input.phaseDefaultCli))),
 	];
@@ -486,12 +549,19 @@ export async function evaluateDispatchEligibility(
 		assignee: assigned?.assignee.handle,
 		clis,
 		phase: input.phase,
+		preservedWorker: pinned?.name ?? pinned?.id,
 	};
 	if (permitted.length === 0) {
+		// A pinned machine that is not a candidate at all — unenrolled since, or its
+		// enrollment withdrawn — is still the only machine that can continue this run,
+		// so this is a wait for it, not a roster problem to report.
+		const emptyReason: DispatchIneligibilityReason = pinned
+			? 'preserved-worker-unavailable'
+			: 'assignee-worker-unavailable';
 		return {
 			status: 'ineligible',
-			reason: 'assignee-worker-unavailable',
-			message: ineligibilityMessage('assignee-worker-unavailable', messageContext),
+			reason: emptyReason,
+			message: ineligibilityMessage(emptyReason, messageContext),
 		};
 	}
 
@@ -539,15 +609,29 @@ export async function evaluateDispatchEligibility(
 				skippedClis: input.targets
 					.slice(0, targetIndex)
 					.map((skipped) => resolveTargetCli(skipped, input.phaseDefaultCli)),
+				pinnedToPreservedWorker: pinned !== undefined,
 			},
 		};
 	}
 
 	// An assignee whose own workers are merely busy/offline is the scheduler-level
-	// verdict, not a per-worker one: the work waits for *that user's* worker.
+	// verdict, not a per-worker one: the work waits for *that user's* worker. A pin
+	// narrows the same way and takes precedence, since it narrowed the candidate set.
+	//
+	// Only `worker-unavailable` is re-framed. A structural refusal from the pinned
+	// machine (consent revoked, enrollment suspended, the phase no longer permitted
+	// there) keeps its own actionable text and its own bounded budget: those name
+	// something only an operator can fix and will not resolve on their own, so waiting
+	// on them forever would be the wrong answer.
 	const aggregated = aggregateReason(reported);
 	const reason: DispatchIneligibilityReason =
-		assigned && aggregated === 'worker-unavailable' ? 'assignee-worker-unavailable' : aggregated;
+		aggregated !== 'worker-unavailable'
+			? aggregated
+			: pinned
+				? 'preserved-worker-unavailable'
+				: assigned
+					? 'assignee-worker-unavailable'
+					: aggregated;
 	return {
 		status: 'ineligible',
 		reason,

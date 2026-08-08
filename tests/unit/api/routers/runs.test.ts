@@ -804,6 +804,7 @@ describe('runsRouter', () => {
 			expect(result).toEqual({
 				...run,
 				attribution: null,
+				preservedWorker: null,
 				maxContinuations: null,
 				pendingRequest: null,
 			});
@@ -1105,6 +1106,7 @@ describe('runsRouter', () => {
 				await expect(caller.getById({ id: 'run-1' })).resolves.toEqual({
 					...run,
 					attribution: null,
+					preservedWorker: null,
 					maxContinuations: null,
 					pendingRequest: null,
 				});
@@ -1702,6 +1704,7 @@ describe('runsRouter', () => {
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' as const },
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-2',
 		};
 
@@ -2345,6 +2348,7 @@ describe('runsRouter', () => {
 				await expect(ordinary.getById({ id: 'run-1' })).resolves.toEqual({
 					...run,
 					attribution: null,
+					preservedWorker: null,
 					maxContinuations: null,
 					pendingRequest: null,
 				});

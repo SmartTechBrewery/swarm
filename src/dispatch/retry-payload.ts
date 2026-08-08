@@ -102,7 +102,42 @@ function attemptCounterPatch(
  * <id> is already in use` before doing any work. So a non-resumable retry mints a
  * fresh id rather than carrying the spent one forward.
  */
+/**
+ * The PM dispatch-intent patch, shared by both branches of
+ * {@link deriveRetryJobPayload}: keep the board-dispatch marker when this attempt
+ * already carried it, or when the outcome says the phase was entered.
+ */
+function pmIntentPatch(
+	job: SwarmJob,
+	intent: DeferredRetryIntent,
+	carriedResumePmPhase: SwarmJob['resumePmPhase'],
+): { resumePmPhase?: 'planning' | 'implementation' } {
+	if (!(intent.pmPhaseStarted || carriedResumePmPhase !== undefined)) return {};
+	if (job.type !== 'pm') return {};
+	if (intent.phase !== 'planning' && intent.phase !== 'implementation') return {};
+	return { resumePmPhase: intent.phase };
+}
+
 export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryIntent): SwarmJob {
+	// A **token-free re-check** deferral (issue #330's dependency gate, issue #339's
+	// eligibility gate) is not a retry of an attempt — it is the *same* attempt still
+	// waiting. Both gates run before any worktree is provisioned or any agent is
+	// launched, so nothing was consumed: no session was opened, no checkout adopted,
+	// no checkpoint spent. Re-deriving recovery intent here would therefore rewrite a
+	// still-valid plan into a different one — a `'checkpoint'` continuation would lose
+	// its mode outright, and a `'resume'` would have its session id replaced with a
+	// freshly minted one it could never resume — so the wait would quietly become the
+	// start-over it exists to prevent (issue #567). The payload is carried through
+	// verbatim instead; only the wait's own bookkeeping changes.
+	if (intent.dependencyRecheck || intent.workerEligibilityRecheck) {
+		return {
+			...parsed,
+			...attemptCounterPatch(parsed, intent),
+			...(intent.runId ? { runId: intent.runId } : {}),
+			...pmIntentPatch(parsed, intent, parsed.resumePmPhase),
+			...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),
+		};
+	}
 	const {
 		resumePmPhase,
 		resumeSession: _resumeSession,
@@ -125,11 +160,7 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		// Keep PM dispatch intent when this attempt already carried it, or when
 		// the outcome says the phase started. Branch reuse is governed by the
 		// separate durable provisioning checkpoint on `job`.
-		...((intent.pmPhaseStarted || resumePmPhase !== undefined) &&
-		job.type === 'pm' &&
-		(intent.phase === 'planning' || intent.phase === 'implementation')
-			? { resumePmPhase: intent.phase }
-			: {}),
+		...pmIntentPatch(job, intent, resumePmPhase),
 		// Continue the prior agent session on the retry when the deferral was a
 		// resumable one; separate from `resumePmPhase`, which is only the PM
 		// board-dispatch signal. A non-resumable retry re-assigns instead of

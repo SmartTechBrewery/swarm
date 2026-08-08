@@ -88,6 +88,14 @@ export type DispatchWaitReason =
 	| 'recheck'
 	/** No eligible worker could take the dispatch (issue #339's federated gate). */
 	| 'worker-eligibility'
+	/**
+	 * A continuation is waiting for the one machine that holds its preserved
+	 * checkout (issue #567). Distinct from `worker-eligibility` on purpose: that
+	 * reason means "no capable worker", while this one means the capable workers
+	 * are irrelevant — only the recorded machine can continue this run. The one
+	 * waiting reason with no budget behind it.
+	 */
+	| 'preserved-worker'
 	| 'manual-retry'
 	| 'recovered';
 

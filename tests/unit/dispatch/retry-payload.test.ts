@@ -62,6 +62,59 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.rateLimitRetryAttempt).toBe(1);
 	});
 
+	// Issue #567. Both token-free gates refuse *before* anything is provisioned, so
+	// their "retry" is the same attempt still waiting. Re-deriving recovery intent
+	// there would turn the wait into the start-over it exists to prevent.
+	describe('token-free re-check deferrals carry recovery intent through verbatim', () => {
+		const SESSION = '92340ec7-709e-4ffa-9297-3899caca4830';
+
+		it('keeps a checkpoint continuation a checkpoint continuation', () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({
+					recoveryMode: 'checkpoint',
+					agentSessionId: SESSION,
+					workerEligibilityRecheckAttempt: 1,
+				}),
+				{
+					phase: 'implementation',
+					runId: 'run-1',
+					resumable: false,
+					workerEligibilityRecheck: true,
+				},
+			);
+
+			expect(next.recoveryMode).toBe('checkpoint');
+			expect(next.agentSessionId).toBe(SESSION);
+		});
+
+		it('keeps a session resume resumable, with the id it means to resume', () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({ resumeSession: true, agentSessionId: SESSION }),
+				{
+					phase: 'implementation',
+					runId: 'run-1',
+					resumable: false,
+					workerEligibilityRecheck: true,
+				},
+			);
+
+			expect(next.resumeSession).toBe(true);
+			expect(next.agentSessionId).toBe(SESSION);
+		});
+
+		it('keeps a delivery resume across a dependency re-check too', () => {
+			const next = deriveRetryJobPayload(createMockScmWebhookJob({ resumeDelivery: true }), {
+				phase: 'review',
+				runId: 'run-1',
+				resumable: false,
+				dependencyRecheck: true,
+			});
+
+			expect(next.resumeDelivery).toBe(true);
+			expect(next.dependencyRecheckAttempt).toBe(1);
+		});
+	});
+
 	it('keeps PM resume for an interrupted Implementation', () => {
 		const next = deriveRetryJobPayload(createMockPmWebhookJob(), {
 			phase: 'implementation',
