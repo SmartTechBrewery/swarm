@@ -43,6 +43,7 @@ function resetResult(overrides: Partial<ResetRunResult> = {}): ResetRunResult {
 		dispatch: 'cancelled',
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
+		worktreeIntent: 'reclaim',
 		recoveryCleared: true,
 		dispatchId: 'dispatch-9',
 		...overrides,
@@ -82,6 +83,7 @@ describe('run command', () => {
 		expect(report).toContain('dispatch: the active dispatch was cancelled');
 		expect(report).toContain('cancellation flag: cleared');
 		expect(report).toContain('checkout: removed and its lease released');
+		expect(report).toContain('restart intent: the worker holding the checkout reclaims it only');
 		expect(report).toContain('recovery record: cleared');
 		expect(report).toContain('re-dispatched from scratch as dispatch dispatch-9');
 	});
@@ -92,6 +94,7 @@ describe('run command', () => {
 				forced: true,
 				dispatch: 'force-cancelled-claimed',
 				worktree: { outcome: 'removed', discarded: 'dirty', staleLeaseReleased: true },
+				worktreeIntent: 'discard',
 			}),
 		);
 
@@ -103,6 +106,8 @@ describe('run command', () => {
 		expect(report).toContain('a worker-claimed dispatch was force-cancelled');
 		expect(report).toContain('uncommitted changes discarded as requested');
 		expect(report).toContain('a stale worktree lease no live run owned was released');
+		// The delegated half of the answer: what the worker holding the checkout will do.
+		expect(report).toContain('restart intent: the worker holding the checkout discards it');
 	});
 
 	it('reports a retained checkout with its reason', async () => {
@@ -139,8 +144,11 @@ describe('run command', () => {
 		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
 		const report = logged.join('\n');
 		expect(report).toContain('dispatch: none was active');
-		expect(report).toContain('checkout: none on disk');
-		expect(report).toContain('lease marker was dropped');
+		// Issue #592: not "nothing to remove" — the checkout may be alive on another
+		// worker, which is the case the operator is resetting.
+		expect(report).toContain('checkout: none on this host');
+		expect(report).not.toContain('nothing to remove');
+		expect(report).toContain('leftover lease marker here was dropped');
 		// Steps the service did not perform are not claimed.
 		expect(report).not.toContain('cancellation flag:');
 		expect(report).not.toContain('recovery record:');

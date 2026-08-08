@@ -208,6 +208,7 @@ describe('resetRun', () => {
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
+			worktreeIntent: 'reclaim',
 			recoveryCleared: true,
 			dispatchId: 'dispatch-2',
 		});
@@ -313,6 +314,38 @@ describe('resetRun', () => {
 			null,
 			false,
 			expect.objectContaining({ discardProtectedWork: true }),
+		);
+	});
+
+	// Issue #592: the local teardown above only reaches the control-plane host, so a
+	// forced reset also has to tell the worker that actually holds the checkout to
+	// destroy it — otherwise the replacement dispatch fails on the same collision.
+	it("carries a 'discard' recovery mode to the worker holding the checkout when forced", async () => {
+		const result = await resetRun('run-1', { force: true });
+
+		const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
+		expect(jobPayload.recoveryMode).toBe('discard');
+		expect(jobPayload.resumeSession).toBeUndefined();
+		expect(result.worktreeIntent).toBe('discard');
+	});
+
+	it('sends no recovery mode on a plain reset, leaving the reclaim gate’s protections', async () => {
+		const result = await resetRun('run-1');
+
+		const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
+		expect(jobPayload.recoveryMode).toBeUndefined();
+		expect(result.worktreeIntent).toBe('reclaim');
+	});
+
+	it('delegates the discard even when nothing was on this host to tear down', async () => {
+		vi.mocked(reconcileTerminatedWorktree).mockResolvedValue({ outcome: 'absent' });
+
+		await expect(resetRun('run-1', { force: true })).resolves.toMatchObject({
+			worktree: { outcome: 'absent' },
+			worktreeIntent: 'discard',
+		});
+		expect(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload.recoveryMode).toBe(
+			'discard',
 		);
 	});
 

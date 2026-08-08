@@ -234,6 +234,33 @@ async function reclaimForFreshRetry(
 }
 
 /**
+ * The `'discard'` branch (issue #592): the operator forced a reset, so the
+ * checkout goes regardless of what it holds. This is the *only* path that removes
+ * uncommitted changes or unpushed commits without asking — `'fresh'` above still
+ * refuses both — and it exists because a `force` reset issued on the control plane
+ * has no other way to reach a checkout on a different worker: the intent travels
+ * on the replacement dispatch and is honoured here, by the host that actually
+ * holds the directory.
+ *
+ * Logged at `warn` naming the task and the path, mirroring `termination-cleanup.ts`'s
+ * discard logging, so destroyed work is always attributable to a request.
+ */
+async function discardCheckout(
+	worktrees: GitWorktreeManager,
+	taskId: string,
+	path: string,
+): Promise<void> {
+	logger.warn(
+		'recovery: discarding the preserved checkout on operator request — reset with force',
+		{
+			taskId,
+			path,
+		},
+	);
+	await worktrees.cleanup(taskId);
+}
+
+/**
  * The `'checkpoint'` branch (Tier 2, `docs/CHECKPOINTS.md`): there is no session
  * to re-enter, so the checkpoint file left in the checkout *is* the hand-off.
  * Adopt the checkout only once that file proves it describes this phase and the
@@ -327,6 +354,7 @@ export async function executeRecoveryGate(
 		return adoptCheckpointContinuation(worktrees, taskId, path, phase, branch);
 
 	if (recoveryMode === 'fresh') await reclaimForFreshRetry(worktrees, taskId, path);
+	if (recoveryMode === 'discard') await discardCheckout(worktrees, taskId, path);
 
 	return { reuseHandle: null };
 }

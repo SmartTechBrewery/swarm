@@ -92,6 +92,12 @@ function attemptCounterPatch(
  * adopt a checkpoint. An operator-selected `'resume'`/`'fresh'` is left alone, as
  * before.
  *
+ * `'discard'` is dropped too, and for a different reason (issue #592): it is a
+ * one-shot instruction to destroy a checkout, issued by an operator for *one*
+ * forced reset. Carrying it forward would put it on every later automatic deferral
+ * of the same run, so the retry of a run that had just preserved its checkout for a
+ * resume would delete that checkout instead of continuing from it.
+ *
  * {@link SwarmJob.agentSessionId} is dropped and re-derived with them — it is
  * destructured out below rather than carried by the rest spread, so the id can't
  * survive a branch that didn't decide it — because `resumeSession` is what
@@ -113,7 +119,9 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 	} = parsed;
 	return {
 		...job,
-		...(recoveryMode && recoveryMode !== 'checkpoint' ? { recoveryMode } : {}),
+		...(recoveryMode && recoveryMode !== 'checkpoint' && recoveryMode !== 'discard'
+			? { recoveryMode }
+			: {}),
 		// A re-check waits on an external condition, not a failure, so it spends its
 		// own budget and leaves the rate-limit one untouched; every other deferral
 		// consumes a rate-limit attempt as before.
@@ -196,10 +204,11 @@ export function reconstructRetryJob(
 			job.resumeSession = true;
 			if (expectedSessionId) job.agentSessionId = expectedSessionId;
 		} else {
-			// `'fresh'` (start over) and `'checkpoint'` (continue from the checkpoint,
-			// issue #503) both run a brand-new session: neither re-enters the stopped
-			// run's, and a checkpoint continuation is CLI-agnostic precisely because it
-			// has no session to carry, so a cli/model override composes with it.
+			// `'fresh'` (start over), `'checkpoint'` (continue from the checkpoint, issue
+			// #503) and `'discard'` (a forced reset destroying the checkout, issue #592)
+			// all run a brand-new session: none re-enters the stopped run's, and a
+			// checkpoint continuation is CLI-agnostic precisely because it has no session
+			// to carry, so a cli/model override composes with it.
 			job.agentSessionId = randomUUID();
 			delete job.resumeSession;
 		}

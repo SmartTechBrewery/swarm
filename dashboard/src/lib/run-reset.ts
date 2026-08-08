@@ -24,6 +24,14 @@ export type ResetWorktreeReport =
 	| { outcome: 'removed'; discarded?: string; staleLeaseReleased?: true }
 	| { outcome: 'blocked'; blockedReason: string };
 
+/**
+ * What the replacement dispatch tells the worker holding the checkout to do with
+ * it — mirrors `ResetRunResult['worktreeIntent']`. The server's own teardown only
+ * reaches the control-plane host, so on a federated deployment this is what
+ * actually settles the checkout.
+ */
+export type ResetWorktreeIntent = 'reclaim' | 'discard';
+
 /** The per-step report `runs.reset` returns — mirrors `ResetRunResult`. */
 export interface ResetRunReport {
 	runId: string;
@@ -31,6 +39,7 @@ export interface ResetRunReport {
 	dispatch: ResetDispatchOutcome;
 	cancellationCleared: boolean;
 	worktree: ResetWorktreeReport;
+	worktreeIntent: ResetWorktreeIntent;
 	recoveryCleared: boolean;
 	dispatchId: string;
 }
@@ -100,7 +109,7 @@ export function resetConfirmMessage(status: string, discardWork: boolean): strin
 			: '';
 	const sequence = `${scope}, removes its checkout and releases the worktree lease, clears its recovery record, and restarts this phase from scratch with a fresh agent session.${checkpoint}`;
 	const work = discardWork
-		? 'Uncommitted changes and unpushed commits in the checkout are discarded permanently — they cannot be recovered.'
+		? 'Uncommitted changes and unpushed commits in the checkout are discarded permanently, on whichever worker holds it — they cannot be recovered.'
 		: 'Uncommitted changes and unpushed commits are kept: a checkout holding either is retained instead of removed.';
 	return `${sequence} ${work}`;
 }
@@ -119,11 +128,20 @@ function describeWorktreeReason(reason: string): string {
 	}
 }
 
-/** One line describing what the reset did to the run's checkout and lease. */
+/**
+ * One line describing what the reset did to the run's checkout and lease **on the
+ * control-plane host** — the only filesystem the server-side teardown can see.
+ *
+ * `absent` is the case that had to stop reading as an answer (issue #592): on a
+ * federated deployment the checkout usually lives on another worker, where "none on
+ * disk — nothing to remove" was actively misleading about the very collision the
+ * operator was resetting to clear. It now says who settles it instead, and
+ * {@link describeResetResult} follows it with the intent that restart carries.
+ */
 function describeWorktreeOutcome(worktree: ResetWorktreeReport): string {
 	switch (worktree.outcome) {
 		case 'absent':
-			return 'Checkout: none on disk — nothing to remove.';
+			return 'Checkout: none on this host — one held by another worker is settled by that worker when it provisions the restart.';
 		case 'preserved':
 			return 'Checkout: kept for its saved agent session; the lease was released.';
 		case 'removed': {
@@ -141,6 +159,18 @@ function describeWorktreeOutcome(worktree: ResetWorktreeReport): string {
 		case 'blocked':
 			return `Checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}. The restarted run re-checks it before provisioning.`;
 	}
+}
+
+/**
+ * The line naming what the *restart itself* will do to the checkout (issue #592) —
+ * the half of the answer the server-side settlement cannot give, because the
+ * checkout may be on a worker the control plane cannot reach. It always follows the
+ * settlement line, since the intent rides every replacement dispatch.
+ */
+function describeWorktreeIntent(intent: ResetWorktreeIntent): string {
+	return intent === 'discard'
+		? 'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.'
+		: 'Restart intent: the worker holding the checkout reclaims it only if it is safe to; dirty or unpushed work is retained.';
 }
 
 /**
@@ -170,6 +200,7 @@ export function describeResetResult(result: ResetRunReport): string[] {
 	}
 
 	lines.push(describeWorktreeOutcome(result.worktree));
+	lines.push(describeWorktreeIntent(result.worktreeIntent));
 
 	if (result.recoveryCleared) {
 		lines.push('Recovery record: cleared.');

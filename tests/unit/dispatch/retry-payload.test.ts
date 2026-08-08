@@ -219,6 +219,28 @@ describe('deriveRetryJobPayload', () => {
 
 		expect(next.recoveryMode).toBe('resume');
 	});
+
+	it("carries an operator-selected 'fresh' forward too", () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ recoveryMode: 'fresh', runId: 'run-1' }),
+			{ phase: 'review', runId: 'run-1', resumable: false },
+		);
+
+		expect(next.recoveryMode).toBe('fresh');
+	});
+
+	// Issue #592: `'discard'` is one operator action against one checkout. Carried
+	// forward, it would ride every later automatic deferral of the same run and
+	// destroy the checkout that deferral had just preserved for a resume.
+	it("drops a one-shot 'discard' so a later deferral cannot re-destroy the checkout", () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ recoveryMode: 'discard', runId: 'run-1' }),
+			{ phase: 'implementation', runId: 'run-1', resumable: true },
+		);
+
+		expect(next.recoveryMode).toBeUndefined();
+		expect(next.resumeSession).toBe(true);
+	});
 });
 
 describe('deriveCapacityPendingPayload', () => {

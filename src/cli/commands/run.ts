@@ -43,8 +43,9 @@ Usage: swarm run reset <runId> [--force]
 
   --force  Also reset a run still marked running, cancel a dispatch a worker has
            already claimed, and DISCARD uncommitted changes and unpushed commits
-           in the checkout instead of retaining it. It cannot stop an
-           already-spawned agent process — only Terminate can.
+           in the checkout instead of retaining it — on whichever worker holds
+           that checkout, not only this host. It cannot stop an already-spawned
+           agent process — only Terminate can.
 
 Without --force a checkout holding uncommitted changes or unpushed commits is
 retained (reported with its reason) rather than removed, and a healthy running
@@ -53,8 +54,10 @@ run is refused.
 Requires DATABASE_URL and REDIS_URL in the environment — run via
 \`npm run swarm -- run reset <runId>\` (loads .env) or export them yourself
 first. Works with the worker and the API stopped: it goes straight to Postgres
-and Redis. Run it on the host that owns the run's worktree — it settles that
-checkout on local disk, so from anywhere else the checkout looks absent.`;
+and Redis. It settles a checkout on *this* host's disk directly; one on another
+worker is settled by that worker when it provisions the restart, following the
+intent the restart carries (--force discards it, a plain reset reclaims it only
+if it is safe to), so this can be run from anywhere.`;
 
 /** `runs.id` is a uuid column (`src/db/schema/runs.ts`). */
 const RunIdSchema = z.string().uuid();
@@ -80,13 +83,20 @@ function describeWorktreeReason(reason: TerminationBlockedReason): string {
 	}
 }
 
-/** One line describing what the reset did to the run's checkout and lease. */
+/**
+ * One line describing what the reset did to the run's checkout and lease **on the
+ * control-plane host** — the only filesystem `resetRun` can settle itself. A
+ * checkout on another worker is described by {@link describeWorktreeIntent}
+ * instead (issue #592).
+ */
 function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
 	switch (worktree.outcome) {
 		case 'absent':
 			// The service still releases the lease on this path, so a leftover marker
-			// from the wedged run is gone even though there was nothing to remove.
-			return 'checkout: none on disk — nothing to remove; any leftover lease marker was dropped';
+			// from the wedged run is gone. What it can no longer claim is that there was
+			// nothing to remove: on a federated deployment the checkout is usually alive
+			// on another worker, which is the very case being reset.
+			return 'checkout: none on this host — one held by another worker is settled by that worker when it provisions the restart; any leftover lease marker here was dropped';
 		case 'preserved':
 			return 'checkout: kept for its saved agent session; the lease was released';
 		case 'removed': {
@@ -107,6 +117,21 @@ function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
 				`checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}; the restarted run re-checks it before provisioning ` +
 				'— push or discard that work, or re-run with --force, to actually free it'
 			);
+	}
+}
+
+/**
+ * The line naming what the *restart* will do to the checkout (issue #592) — the
+ * half of the answer the local settlement above cannot give, because the checkout
+ * may be on a worker this process cannot see. Typed against the service's union so
+ * a new intent is a compile error here rather than an unreported one.
+ */
+function describeWorktreeIntent(intent: ResetRunResult['worktreeIntent']): string {
+	switch (intent) {
+		case 'discard':
+			return 'restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning';
+		case 'reclaim':
+			return 'restart intent: the worker holding the checkout reclaims it only if it is safe to; dirty or unpushed work is retained';
 	}
 }
 
@@ -139,6 +164,7 @@ function reportReset(result: ResetRunResult): void {
 	}
 
 	out.step(describeWorktreeOutcome(result.worktree));
+	out.step(describeWorktreeIntent(result.worktreeIntent));
 
 	if (result.recoveryCleared) {
 		out.step('recovery record: cleared');

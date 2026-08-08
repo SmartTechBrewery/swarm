@@ -1701,6 +1701,7 @@ describe('runsRouter', () => {
 			dispatch: 'cancelled' as const,
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' as const },
+			worktreeIntent: 'reclaim' as const,
 			recoveryCleared: true,
 			dispatchId: 'dispatch-2',
 		};

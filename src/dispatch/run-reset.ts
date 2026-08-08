@@ -27,6 +27,30 @@
  * dispatch cancel, the one-active-dispatch-per-run unique index, and
  * `tryClaimWorktreeLease` at the next provision. No new locks.
  *
+ * **Step 3 settles only the checkouts on *this* host — the intent on step 5 settles
+ * the rest** (issue #592). `resetRun` runs in the API server, so its
+ * `reconcileTerminatedWorktree` call can only ever see the control-plane host's
+ * filesystem. That is still exactly right for a checkout the control-plane host's
+ * own worker holds, and a harmless no-op otherwise — but in a federated deployment
+ * the checkout usually lives on another worker, where the local teardown reports
+ * `absent` and the replacement dispatch then fails on the very collision the reset
+ * was meant to clear. So a **forced** reset also puts `recoveryMode: 'discard'` on
+ * the replacement dispatch's payload: the worker that actually holds the checkout
+ * honours it in its own recovery gate (`executeRecoveryGate`,
+ * `src/pipeline/resume.ts`) before provisioning. A plain reset deliberately carries
+ * **no** mode — the worker's ordinary provision-time reclaim gate already *is* the
+ * plain-reset contract (reclaim a clean, unleased, unpinned checkout; retain
+ * anything protected; take over a lease with no live owner).
+ *
+ * A synchronous worktree-teardown frame was considered and not taken. `sendToWorker`
+ * (`src/router/worker-connections.ts`) is a **router-process-local** map and this
+ * service runs in the API server, which has no request channel to the router — only
+ * Redis pub/sub (`src/queue/cancellation.ts`) and BullMQ. Adding one would mean
+ * inventing a cross-process request/reply mechanism plus a new frame pair purely to
+ * reach a worker the replacement dispatch already reaches: worker affinity routes
+ * the restart back to the host holding the checkout, which is what makes carrying
+ * the intent sufficient.
+ *
  * This module deliberately knows nothing about tRPC: the API router (and, later,
  * the CLI) are thin surfaces over it.
  */
@@ -78,9 +102,11 @@ export class RunResetError extends Error {
 export interface ResetRunOptions {
 	/**
 	 * Allow resetting a live `running` run, cancelling a dispatch a worker has
-	 * already claimed, and discarding dirty/unpushed work in the checkout. It
-	 * cannot stop an already-spawned agent process — only Terminate can — so a
-	 * forced reset of a live run is a deliberate operator choice.
+	 * already claimed, and discarding dirty/unpushed work in the checkout —
+	 * wherever that checkout lives, since the discard intent travels on the
+	 * replacement dispatch (issue #592). It cannot stop an already-spawned agent
+	 * process — only Terminate can — so a forced reset of a live run is a
+	 * deliberate operator choice.
 	 */
 	force?: boolean;
 }
@@ -91,8 +117,19 @@ export interface ResetRunResult {
 	/** What happened to the run's active dispatch. */
 	dispatch: 'none' | 'cancelled' | 'force-cancelled-claimed';
 	cancellationCleared: boolean;
-	/** The worktree/lease settlement, verbatim from `reconcileTerminatedWorktree`. */
+	/**
+	 * The worktree/lease settlement **on the control-plane host**, verbatim from
+	 * `reconcileTerminatedWorktree`. A checkout held by another worker is not
+	 * described here — see {@link ResetRunResult.worktreeIntent}.
+	 */
 	worktree: TerminationCleanupResult;
+	/**
+	 * What the replacement dispatch instructs the worker holding the checkout to do
+	 * with it: `'discard'` (a forced reset — remove it even when it holds dirty or
+	 * unpushed work) or `'reclaim'` (a plain reset — the worker's ordinary
+	 * provision-time reclaim gate, which retains anything protected).
+	 */
+	worktreeIntent: 'reclaim' | 'discard';
 	recoveryCleared: boolean;
 	/** The dispatch the phase was re-dispatched on. */
 	dispatchId: string;
@@ -212,6 +249,10 @@ export async function resetRun(
 	// collision survives.
 	await clearRunRecovery(run.id);
 
+	// A forced reset carries its discard intent to whichever worker holds the
+	// checkout (see the module header); a plain one carries none, so the worker's
+	// ordinary reclaim gate applies its unchanged protections.
+	const worktreeIntent: ResetRunResult['worktreeIntent'] = force ? 'discard' : 'reclaim';
 	const job = reconstructRetryJob(
 		run.jobPayload,
 		run.id,
@@ -220,6 +261,7 @@ export async function resetRun(
 		undefined,
 		undefined,
 		true,
+		force ? 'discard' : undefined,
 	);
 	let dispatchId: string;
 	try {
@@ -254,6 +296,7 @@ export async function resetRun(
 		forced: force,
 		dispatch,
 		worktree: worktree.outcome,
+		worktreeIntent,
 		dispatchId,
 	});
 
@@ -263,6 +306,7 @@ export async function resetRun(
 		dispatch,
 		cancellationCleared: true,
 		worktree,
+		worktreeIntent,
 		recoveryCleared: true,
 		dispatchId,
 	};

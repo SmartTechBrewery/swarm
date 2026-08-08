@@ -43,6 +43,7 @@ import {
 	shouldPreserveForCheckpoint,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
+import type { RecoveryMode } from '@/queue/jobs.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 
 function mockAgentResult(sessionId?: string): AgentCliResult {
@@ -183,7 +184,7 @@ function stubWorktrees(path: string) {
 
 function gate(
 	path: string,
-	mode: 'resume' | 'fresh' | 'checkpoint' | undefined,
+	mode: RecoveryMode | undefined,
 	sessionId: string | undefined,
 	phase: 'implementation' | 'respond-to-ci' = 'implementation',
 ) {
@@ -461,6 +462,120 @@ describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', (
 			name: 'BlockedRecoveryError',
 			reason: 'live-leased',
 		});
+	});
+
+	// The regression the `'discard'` branch must not cause: `'fresh'` is still the
+	// mode that refuses to destroy work, so an automatic retry can never acquire
+	// force-reset semantics by accident.
+	it("'fresh' still blocks on a dirty checkout rather than removing it", async () => {
+		const path = preservedCheckout();
+		const worktrees = { ...stubWorktrees(path), isClean: vi.fn(async () => false) };
+		await expect(
+			executeRecoveryGate(
+				worktrees as unknown as GitWorktreeManager,
+				'19',
+				'fresh',
+				undefined,
+				'implementation',
+				'issue-19',
+			),
+		).rejects.toMatchObject({ name: 'BlockedRecoveryError', reason: 'dirty' });
+		expect(worktrees.cleanup).not.toHaveBeenCalled();
+		expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
+	});
+
+	it("'fresh' still blocks on unpushed commits rather than removing them", async () => {
+		const path = preservedCheckout();
+		const worktrees = { ...stubWorktrees(path), hasUnpushedWork: vi.fn(async () => true) };
+		await expect(
+			executeRecoveryGate(
+				worktrees as unknown as GitWorktreeManager,
+				'19',
+				'fresh',
+				undefined,
+				'implementation',
+				'issue-19',
+			),
+		).rejects.toMatchObject({ name: 'BlockedRecoveryError', reason: 'unpushed' });
+		expect(worktrees.cleanup).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * The `'discard'` branch (issue #592) — the operator's forced reset, honoured by
+ * whichever worker holds the checkout. It is the one mode that destroys protected
+ * work, which is exactly why the assertions below are about a *dirty, unpushed*
+ * checkout going anyway.
+ */
+describe("executeRecoveryGate — the 'discard' branch (issue #592)", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isWorktreeLeasedMock.mockResolvedValue(false);
+	});
+
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	it('removes a dirty, unpushed checkout and provisions fresh', async () => {
+		const path = preservedCheckout();
+		const worktrees = {
+			...stubWorktrees(path),
+			isClean: vi.fn(async () => false),
+			hasUnpushedWork: vi.fn(async () => true),
+		};
+
+		const result = await executeRecoveryGate(
+			worktrees as unknown as GitWorktreeManager,
+			'19',
+			'discard',
+			undefined,
+			'implementation',
+			'issue-19',
+		);
+
+		expect(result).toEqual({ reuseHandle: null });
+		expect(worktrees.cleanup).toHaveBeenCalledWith('19');
+		// The protections `'fresh'` applies are deliberately not consulted here.
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining('discarding the preserved checkout'),
+			expect.objectContaining({ taskId: '19', path }),
+		);
+	});
+
+	it('takes over a checkout another run still leases — a wedged lease is what it clears', async () => {
+		isWorktreeLeasedMock.mockResolvedValue(true);
+		const path = preservedCheckout();
+		const worktrees = stubWorktrees(path);
+
+		await expect(
+			executeRecoveryGate(
+				worktrees as unknown as GitWorktreeManager,
+				'19',
+				'discard',
+				undefined,
+				'implementation',
+				'issue-19',
+			),
+		).resolves.toEqual({ reuseHandle: null });
+		expect(worktrees.cleanup).toHaveBeenCalledWith('19');
+	});
+
+	it('provisions fresh without throwing when the checkout is genuinely gone', async () => {
+		const path = join(tmpdir(), 'swarm-no-such-checkout');
+		const worktrees = stubWorktrees(path);
+
+		await expect(
+			executeRecoveryGate(
+				worktrees as unknown as GitWorktreeManager,
+				'19',
+				'discard',
+				undefined,
+				'implementation',
+				'issue-19',
+			),
+		).resolves.toEqual({ reuseHandle: null });
+		expect(worktrees.cleanup).not.toHaveBeenCalled();
 	});
 });
 

@@ -443,8 +443,11 @@ describe('transport protocol schemas', () => {
 			});
 
 			it('rejects an unknown mode rather than passing it to the worktree gate', () => {
+				// `'discard'` used to be the example here and is a real mode since issue
+				// #592, so the unknown value has to be one no schema will ever accept.
 				expect(
-					TaskAssignmentSchema.safeParse({ ...VALID_ASSIGNMENT, recoveryMode: 'discard' }).success,
+					TaskAssignmentSchema.safeParse({ ...VALID_ASSIGNMENT, recoveryMode: 'obliterate' })
+						.success,
 				).toBe(false);
 			});
 
