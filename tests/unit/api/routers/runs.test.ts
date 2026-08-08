@@ -1270,6 +1270,27 @@ describe('runsRouter', () => {
 			expect(input.jobPayload.resumeSession).toBeUndefined();
 		});
 
+		// Issue #592: a forced reset's payload is persisted onto the run row when a
+		// worker claims it, so "Retry now" — which has no force opt-in and no
+		// discard-work copy — must not replay its destructive intent.
+		it("does not replay a stored 'discard' left on the row by a forced reset", async () => {
+			const mockPayload: SwarmJob = { ...SCM_PAYLOAD, recoveryMode: 'discard' };
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'failed', jobPayload: mockPayload }),
+			);
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+			vi.mocked(createAndPublishDispatch).mockResolvedValue({
+				dispatch: makeDispatch(),
+				created: true,
+			});
+
+			await caller.retryNow({ runId: 'run-1' });
+
+			expect(
+				vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload.recoveryMode,
+			).toBeUndefined();
+		});
+
 		it('marks a failed PM retry for dispatch without inventing a branch checkpoint', async () => {
 			const mockPayload = createMockPmWebhookJob();
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(

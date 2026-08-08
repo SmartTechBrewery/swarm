@@ -168,6 +168,48 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 }
 
 /**
+ * Settle a manually rebuilt attempt's recovery mode and session, in place — the
+ * half of {@link reconstructRetryJob} that decides whether the attempt re-enters a
+ * session or starts one, and which stored intent it may keep.
+ *
+ * A stored `'discard'` is **never inherited** (issue #592). The forced reset's payload
+ * is persisted onto the run row by `resetRunToRunning` when a worker claims it, so a
+ * later "Retry now" — which passes no `recoveryMode` for an ordinary `failed` run —
+ * would otherwise replay a *destructive* intent from an action that has no force
+ * opt-in and promises nothing of the sort. `'fresh'` and `'checkpoint'` are carried as
+ * before: both still refuse a dirty or unpushed checkout, so inheriting either is
+ * harmless, and one-shot-ness is a property of the only mode allowed to destroy work.
+ */
+function applyManualRecoveryIntent(
+	job: SwarmJob,
+	freshSession: boolean,
+	recoveryMode?: RecoveryMode,
+	expectedSessionId?: string | null,
+): void {
+	if (!recoveryMode) {
+		if (job.recoveryMode === 'discard') delete job.recoveryMode;
+		if (!freshSession) return;
+		job.agentSessionId = randomUUID();
+		delete job.resumeSession;
+		return;
+	}
+
+	job.recoveryMode = recoveryMode;
+	if (recoveryMode === 'resume') {
+		job.resumeSession = true;
+		if (expectedSessionId) job.agentSessionId = expectedSessionId;
+		return;
+	}
+	// `'fresh'` (start over), `'checkpoint'` (continue from the checkpoint, issue
+	// #503) and `'discard'` (a forced reset destroying the checkout, issue #592)
+	// all run a brand-new session: none re-enters the stopped run's, and a
+	// checkpoint continuation is CLI-agnostic precisely because it has no session
+	// to carry, so a cli/model override composes with it.
+	job.agentSessionId = randomUUID();
+	delete job.resumeSession;
+}
+
+/**
  * Rebuild a retry job payload from a stored one: carry the originating `runId`
  * forward (so the retry reuses that row) and reset the rate-limit attempt
  * counter to 0 (a manual retry bypasses the automatic cap), applying any
@@ -198,24 +240,7 @@ export function reconstructRetryJob(
 	if (cli) job.cliOverride = cli;
 	if (model) job.modelOverride = model;
 	if (reasoning) job.reasoningOverride = reasoning;
-	if (recoveryMode) {
-		job.recoveryMode = recoveryMode;
-		if (recoveryMode === 'resume') {
-			job.resumeSession = true;
-			if (expectedSessionId) job.agentSessionId = expectedSessionId;
-		} else {
-			// `'fresh'` (start over), `'checkpoint'` (continue from the checkpoint, issue
-			// #503) and `'discard'` (a forced reset destroying the checkout, issue #592)
-			// all run a brand-new session: none re-enters the stopped run's, and a
-			// checkpoint continuation is CLI-agnostic precisely because it has no session
-			// to carry, so a cli/model override composes with it.
-			job.agentSessionId = randomUUID();
-			delete job.resumeSession;
-		}
-	} else if (freshSession) {
-		job.agentSessionId = randomUUID();
-		delete job.resumeSession;
-	}
+	applyManualRecoveryIntent(job, freshSession, recoveryMode, expectedSessionId);
 	return job;
 }
 

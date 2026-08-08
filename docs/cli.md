@@ -165,18 +165,25 @@ swarm run reset <runId> [--force]
      one, `force-cancelled` when a worker had already claimed it);
   2. **cancellation flag** — clears the Redis user-termination flag, or the worker
      would kill the fresh attempt at its start-check;
-  3. **checkout** — settles the checkout and worktree lease, releasing a *stale*
-     lease no live run owns (the marker a wedged run leaves behind). Reports
-     `removed`, `retained` with its reason (`uncommitted changes`,
-     `unpushed commits`, a lease held by another live run), or `none on disk`. A
-     reset never keeps a checkout for a saved agent session — restarting from
-     scratch is the point of it;
-  4. **recovery record** — clears it plus any captured session id;
-  5. **restarted** — re-dispatches the phase from scratch and prints the new
+  3. **checkout** — settles the checkout and worktree lease **on this host**,
+     releasing a *stale* lease no live run owns (the marker a wedged run leaves
+     behind). Reports `removed`, `retained` with its reason (`uncommitted changes`,
+     `unpushed commits`, a lease held by another live run), or
+     `none on this host` — which says the checkout is settled by whichever worker
+     holds it, not that there was nothing to remove. A reset never keeps a checkout
+     for a saved agent session — restarting from scratch is the point of it;
+  4. **restart intent** — what the *restart* will do to the checkout wherever it
+     lives (issue #592), which is the half of the answer step 3 cannot give:
+     `discards it — dirty and unpushed work included` with `--force`, or
+     `reclaims it only if it is safe to` without;
+  5. **recovery record** — clears it plus any captured session id;
+  6. **restarted** — re-dispatches the phase from scratch and prints the new
      dispatch id.
 - **`--force`** — also resets a run still marked `running`, cancels a dispatch a
   worker has already claimed, and **discards** uncommitted changes and unpushed
-  commits instead of retaining the checkout. It prints a warning before acting and
+  commits instead of retaining the checkout — on whichever worker holds that
+  checkout, since the discard travels to it as the restart's recovery intent
+  rather than being performed here. It prints a warning before acting and
   **cannot stop an already-spawned agent process** — only Terminate can, so a
   forced reset of a live run is a deliberate operator choice.
 
@@ -191,10 +198,13 @@ stopped — it goes straight to Postgres and Redis, which is the point: the same
 action exists in the dashboard (a run's "Reset & restart" button), and this is how
 you reach it when the services that serve it are down.
 
-Run it **on the host that owns the run's worktree**: step 3 inspects and removes
-that checkout on local disk, so from any other machine the checkout looks absent,
-the report says so, and the lease is released for a checkout that still exists
-elsewhere.
+**It can be run from anywhere** (issue #592). Step 3 inspects and removes a
+checkout on *this* machine's disk; a checkout on another worker is settled by that
+worker when it provisions the restart, following the intent step 4 reports —
+`--force` discards it there, a plain reset leaves the worker's ordinary reclaim
+gate and its dirty/unpushed protections in charge. Running it on the host that
+owns the worktree still settles that checkout one step sooner, but it is no longer
+required to free a wedged one.
 
 ### `swarm users`
 
