@@ -859,7 +859,7 @@ export function ForceReReviewButton({ run }: { run: RunRow }) {
  * off a server-resolved field, not off the local operator's mutation state.
  */
 export function PreservedWorkerCallout({ run }: { run: RunRow }) {
-	const described = describePreservedWorker(run.preservedWorker, run.status);
+	const described = describePreservedWorker(run.preservedWorker);
 	if (!described) return null;
 	const abandoned = run.preservedWorker?.state === 'abandoned';
 	return (

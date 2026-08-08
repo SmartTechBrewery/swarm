@@ -31,6 +31,7 @@ import {
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
+	recordRunPreservedWorker,
 	resetRunToRunning,
 	storeRunLogs,
 	updateReviewMergeOutcome,
@@ -734,6 +735,157 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(row?.status).toBe('failed');
 			expect(row?.recovery).toEqual({ state: 'blocked', blockedReason: 'dirty' });
 			expect(row?.agentSessionId).toBeNull();
+		});
+	});
+
+	// Issue #567. The pin is three hand-written SQL expressions on a free-form jsonb
+	// column, so it is pinned against a real Postgres rather than reasoned about: the
+	// sticky-key merge is what makes the pin survive the wholesale recovery rewrites
+	// that every settle and every re-bind perform, and losing it silently re-opens the
+	// defect (a continuation dispatched to a machine that does not hold its work).
+	describe('preserved-checkout pin (issue #567)', () => {
+		/** A deferred run bound to `worker`, with its preserved machine recorded. */
+		async function pinnedRun(taskId: string, workerId: string, ownerUserId: string) {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId,
+				phase: 'implementation',
+				workerId,
+				workerUserId: ownerUserId,
+			});
+			await completeRun(id, { status: 'deferred', error: 'rate limited', agentSessionId: id });
+			await recordRunPreservedWorker(id);
+			return id;
+		}
+
+		it('records the machine from the attempt’s own worker at settle', async () => {
+			const { worker, owner } = await seedWorker('pin-a');
+			const id = await pinnedRun('567a', worker.id, owner.id);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.recovery?.preservedWorkerId).toBe(worker.id);
+		});
+
+		it('records nothing for a run with no worker — there is no other machine to pin', async () => {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '567b',
+				phase: 'implementation',
+			});
+			await completeRun(id, { status: 'deferred', error: 'rate limited' });
+
+			await recordRunPreservedWorker(id);
+
+			expect((await getRunByIdFromDb(id))?.recovery).toBeNull();
+		});
+
+		it('carries the machine onto the recovery record a re-bind writes', async () => {
+			// The exact overwrite that made the location unrecoverable: `worker_id` is
+			// replaced with the continuation's worker while `recovery` is rewritten whole.
+			const { worker, owner } = await seedWorker('pin-c');
+			const other = await seedWorker('pin-c-other');
+			const id = await pinnedRun('567c', worker.id, owner.id);
+
+			await resetRunToRunning(
+				id,
+				undefined,
+				'deferred',
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ state: 'recovered', agentSessionId: null },
+				other.worker.id,
+				1,
+				other.owner.id,
+			);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.workerId).toBe(other.worker.id);
+			expect(row?.recovery).toEqual({ state: 'recovered', preservedWorkerId: worker.id });
+		});
+
+		it('drops the machine when a fresh, non-recovery attempt gives the checkout up', async () => {
+			const { worker, owner } = await seedWorker('pin-d');
+			const id = await pinnedRun('567d', worker.id, owner.id);
+
+			await resetRunToRunning(
+				id,
+				undefined,
+				'deferred',
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				null,
+				worker.id,
+				1,
+				owner.id,
+			);
+
+			expect((await getRunByIdFromDb(id))?.recovery).toBeNull();
+		});
+
+		it('keeps the machine through a cancellation that preserves the session', async () => {
+			// Terminate-then-Resume: the checkout survives on the pinned machine, the
+			// operator's next action is a resume, and it must still be pinned.
+			const { worker, owner } = await seedWorker('pin-e');
+			const id = await pinnedRun('567e', worker.id, owner.id);
+
+			const result = await cancelDeferredRunInDb(id, 'terminated', {
+				source: 'dashboard',
+				requestedAt: new Date().toISOString(),
+			});
+
+			expect(result.success).toBe(true);
+			const row = await getRunByIdFromDb(id);
+			expect(row?.recovery?.state).toBe('preserved');
+			expect(row?.recovery?.preservedWorkerId).toBe(worker.id);
+		});
+
+		it('keeps the machine through a blocked cleanup — the checkout is still on it', async () => {
+			const { worker, owner } = await seedWorker('pin-f');
+			const id = await pinnedRun('567f', worker.id, owner.id);
+
+			await recordRunCleanupBlocked(id, 'dirty');
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.recovery).toEqual({
+				state: 'blocked',
+				blockedReason: 'dirty',
+				preservedWorkerId: worker.id,
+			});
+		});
+
+		it('turns the pin into an abandonment on "Reset & restart", and keeps it thereafter', async () => {
+			const { worker, owner } = await seedWorker('pin-g');
+			const id = await pinnedRun('567g', worker.id, owner.id);
+
+			await clearRunRecovery(id);
+			expect((await getRunByIdFromDb(id))?.recovery).toEqual({
+				abandonedWorkerId: worker.id,
+			});
+
+			// The restarted attempt writes no recovery at all; the record that this run
+			// started over rather than continuing must survive it.
+			await resetRunToRunning(
+				id,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				null,
+				worker.id,
+				1,
+				owner.id,
+			);
+
+			expect((await getRunByIdFromDb(id))?.recovery).toEqual({ abandonedWorkerId: worker.id });
 		});
 	});
 

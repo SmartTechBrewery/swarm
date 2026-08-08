@@ -608,6 +608,14 @@ export interface ScheduleDispatchRetryInput {
 	waitReason: DispatchWaitReason;
 	attempt: number;
 	runId?: string;
+	/**
+	 * The human-readable reason this attempt deferred (issue #567). `waitReason` is
+	 * a category; this is the sentence an operator can act on — which for the
+	 * unbounded `preserved-worker` wait is the only place outside the run-detail
+	 * page that names the machine being waited for, since a gate refusal settles
+	 * before any run row exists to write an `error` onto.
+	 */
+	lastError?: string;
 }
 
 /**
@@ -631,6 +639,7 @@ export async function scheduleDispatchRetry(
 			availableAt: input.availableAt,
 			waitReason: input.waitReason,
 			attempt: input.attempt,
+			lastError: input.lastError,
 			wakeSeq: sql`${dispatches.wakeSeq} + 1`,
 			leaseOwner: null,
 			leaseExpiresAt: null,

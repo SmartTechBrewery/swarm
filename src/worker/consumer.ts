@@ -826,6 +826,8 @@ function deferWorkerIneligible(
 			retryDelayMs: ELIGIBILITY_RECHECK_INTERVAL_MS,
 			reason: err.reason,
 			unbounded,
+			// The message, not only the category — it is what names the machine.
+			detail: err.message,
 		},
 	);
 	return {
@@ -949,6 +951,10 @@ async function settleDispatchRetry(
 		availableAt: new Date(Date.now() + outcome.retryDelayMs),
 		waitReason: deferralWaitReason(outcome),
 		attempt: deferralAttempt(outcome, next),
+		// The reason in full, not just its category (issue #567): a gate refusal defers
+		// before any run row exists, so the dispatch row is where its message — which
+		// names the machine a pinned continuation is waiting for — has to live.
+		lastError: outcome.reason,
 		runId: outcome.runId,
 	});
 	if (!updated) {

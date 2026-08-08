@@ -291,6 +291,13 @@ export interface RunPreservedWorker {
 	workerId: string;
 	/** Null when the worker row no longer resolves — fall back to the id. */
 	workerName: string | null;
+	/**
+	 * Whether the run is *currently* blocked on that machine, resolved server-side
+	 * from the active dispatch's `preserved-worker` wait reason — not from the run's
+	 * status, which cannot tell the unbounded pin wait from an ordinary rate-limit
+	 * deferral that merely also preserved its checkout.
+	 */
+	waiting: boolean;
 }
 
 export interface PendingRunRequest {

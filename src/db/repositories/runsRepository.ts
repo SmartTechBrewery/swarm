@@ -551,7 +551,13 @@ export async function cancelDeferredRunInDb(
 				error: reason,
 				nextRetryAt: null,
 				agentSessionId: run.agentSessionId,
-				recovery: recoveryVal,
+				// Through the sticky-key merge like every other recovery write (issue
+				// #567): terminating a deferred run keeps its session *and*, when the
+				// checkout is on another host, keeps the checkout — so the operator's next
+				// "Resume" is still a continuation and must still be pinned. Replacing the
+				// record wholesale here would drop the machine and send that resume to
+				// whichever worker was free, which is the defect this pin exists to close.
+				recovery: recoveryWriteSql(recoveryVal),
 				cancellation,
 				failureDiagnosis: diagnoseFailure({ knownCondition: 'user-terminated' }),
 				completedAt: new Date(),
@@ -580,7 +586,11 @@ export async function recordRunCleanupBlocked(
 ): Promise<void> {
 	await getDb()
 		.update(runs)
-		.set({ recovery: { state: 'blocked', blockedReason } })
+		// Merged rather than replaced (issue #567): a checkout that could not be removed
+		// is *still on* the machine that holds it, so this is the last write that should
+		// forget where that is — and an `abandonedWorkerId` is a historical fact no
+		// later write may erase.
+		.set({ recovery: recoveryWriteSql({ state: 'blocked', blockedReason }) })
 		.where(eq(runs.id, runId));
 }
 

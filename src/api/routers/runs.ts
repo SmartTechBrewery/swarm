@@ -480,6 +480,16 @@ export interface RunPreservedWorker {
 	workerId: string;
 	/** Null when the worker row no longer resolves — the UI then falls back to the id. */
 	workerName: string | null;
+	/**
+	 * Whether the run is *currently* blocked on that machine, rather than merely
+	 * pinned to it. Read from the active dispatch's `preserved-worker` wait reason,
+	 * because the two are genuinely different states and only one of them is the
+	 * unbounded wait: an ordinary rate-limit deferral also preserves its checkout
+	 * and records a machine, but its retry fires on a timer. Saying "this wait does
+	 * not time out" about that one would be false, so the UI keys its copy on this
+	 * rather than on the run's status.
+	 */
+	waiting: boolean;
 }
 
 /**
@@ -490,9 +500,11 @@ export interface RunPreservedWorker {
  * This is what lets a run *say which machine it is waiting for*, to every viewer,
  * for as long as it waits — the wait is unbounded by design, so it must never read
  * as a wedged run. Resolved server-side like every other display label here, and a
- * failed lookup degrades to a null name rather than throwing.
+ * failed lookup degrades to a null name (and to "not waiting", the weaker claim)
+ * rather than throwing.
  */
 async function resolveRunPreservedWorker(run: {
+	id: string;
 	recovery: { preservedWorkerId?: string | null; abandonedWorkerId?: string | null } | null;
 }): Promise<RunPreservedWorker | null> {
 	const preserved = run.recovery?.preservedWorkerId ?? null;
@@ -501,13 +513,24 @@ async function resolveRunPreservedWorker(run: {
 	if (!workerId) return null;
 	const state = preserved ? 'preserved' : 'abandoned';
 	try {
-		return { state, workerId, workerName: (await getWorker(workerId))?.displayName ?? null };
+		const [worker, dispatch] = await Promise.all([
+			getWorker(workerId),
+			// Only a still-pinned run can be waiting on its pin; an abandoned record is
+			// history and never queries the queue.
+			preserved ? getActiveDispatchByRunId(run.id) : Promise.resolve(undefined),
+		]);
+		return {
+			state,
+			workerId,
+			workerName: worker?.displayName ?? null,
+			waiting: dispatch?.waitReason === 'preserved-worker',
+		};
 	} catch (error) {
 		logger.warn('runs.getById: preserved-worker lookup failed; reporting the id without a name', {
 			workerId,
 			error: describeError(error),
 		});
-		return { state, workerId, workerName: null };
+		return { state, workerId, workerName: null, waiting: false };
 	}
 }
 

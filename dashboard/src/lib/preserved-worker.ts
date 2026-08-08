@@ -1,7 +1,7 @@
 /**
  * Pure view-logic for the **preserved-checkout pin** (issue #567), split out of
- * the run-detail route so it can be unit-tested without a rendered component (the
- * dashboard package tests helpers only — no jsdom; see `dashboard/vitest.config.ts`).
+ * the run-detail route so the copy can be asserted without rendering (the route's
+ * own tests opt into jsdom per file — see `dashboard/vitest.config.ts`).
  *
  * A run whose checkout was preserved on one machine can only be continued there:
  * a Tier 2 checkpoint, a resumable agent session, and a delivery sidecar all live
@@ -26,16 +26,19 @@ export function preservedWorkerLabel(preserved: RunPreservedWorker): string {
  * nothing to say — no record at all, or a run that is no longer waiting on one.
  *
  * Three shapes:
- * - **waiting** (a retry-pending run) — the unbounded wait, so it names the
- *   machine, says the wait does not expire, and names the action that ends it.
- * - **preserved but not waiting** — the run is running or settled; the pin is
- *   still recorded, so state the machine without implying a wait.
+ * - **waiting** — the unbounded pin wait, so it names the machine, says the wait
+ *   does not expire, and names the action that ends it. Keyed on the server's
+ *   `waiting` flag rather than on the run's status: a `deferred` run can also be
+ *   pinned while waiting on something else entirely (an ordinary rate-limit retry
+ *   preserves its checkout too), and telling that operator "this does not time
+ *   out" would be plainly false.
+ * - **preserved but not waiting** — the pin is recorded but is not what the run is
+ *   blocked on, so state the machine without implying a wait.
  * - **abandoned** — the record an operator's restart left behind, which is what
  *   makes "this run started over instead of continuing" visible after the fact.
  */
 export function describePreservedWorker(
 	preserved: RunPreservedWorker | null | undefined,
-	status: string,
 ): { title: string; body: string } | null {
 	if (!preserved) return null;
 	const machine = preservedWorkerLabel(preserved);
@@ -45,7 +48,7 @@ export function describePreservedWorker(
 			body: `This run was restarted from scratch instead of continuing the work preserved on ${machine}. That earlier attempt's checkpoint, session and checkout were given up deliberately and are not part of this run.`,
 		};
 	}
-	if (status === 'deferred' || status === 'checkpointed') {
+	if (preserved.waiting) {
 		return {
 			title: `Waiting for ${machine}`,
 			body: `This run continues work preserved on ${machine}, so it can only run there — no other worker can pick it up, however free it is. The wait does not time out and nothing is started over elsewhere. Use "Reset & restart" to give the preserved work up and restart this phase on any worker; that works even while ${machine} is offline.`,

@@ -356,8 +356,11 @@ function ineligibilityMessage(
 		: `project '${context.projectId}'`;
 	switch (reason) {
 		// Names the machine, states that the wait does not expire, and names the one
-		// action that ends it — this text is what an operator reads on the run while
-		// it waits, so "waiting for m3_pro_tp" has to be distinguishable from "wedged".
+		// action that ends it. This text is the dispatch row's `lastError` — the run's
+		// own `error` column is *not* written, because the gate refuses before a run row
+		// for this attempt exists; the run-detail callout is what an operator reads
+		// (`runs.getById`'s `preservedWorker`), and it is built from the recorded machine
+		// rather than from this string.
 		case 'preserved-worker-unavailable':
 			return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine is not currently available to take it. Waiting for it — this wait does not time out and nothing is started over on another machine. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
 		case 'assignee-worker-unavailable':
