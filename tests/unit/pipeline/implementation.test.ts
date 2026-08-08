@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The worktree's files are read via node:fs; presence + contents are controlled per
 // test. `.swarm_delivery.json` is the sidecar deterministic delivery writes itself,
@@ -49,6 +49,7 @@ vi.mock('@/pipeline/resume.js', async (importOriginal) => ({
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import { logger } from '@/lib/logger.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import {
 	BLOCKED_REASON_FILENAME,
@@ -125,6 +126,7 @@ function makeDeps() {
 	};
 	const worktrees = {
 		provision: vi.fn(async () => handle),
+		worktreePath: vi.fn(() => handle.path),
 		reuse: vi.fn(async () => handle),
 		cleanup: vi.fn(async () => {}),
 	};
@@ -533,6 +535,63 @@ describe('runImplementationPhase', () => {
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.resumeSessionId).toBeUndefined();
 		expect(runArgs.sessionId).toBe('sess-19');
+	});
+
+	/**
+	 * Acceptance criterion 5 of issue #591, on the call site where a lost
+	 * continuation costs the most: Implementation is the only phase that *writes*
+	 * checkpoints, and it acquires its worktree through its own
+	 * `acquireImplementationWorktree` rather than the shared
+	 * `acquireResumableWorktree` the other five use — so the warning covering them
+	 * covers nothing here. Task #553 lost a checkpointed session exactly this way,
+	 * with no log line tying the restart to the checkout still on disk.
+	 */
+	describe('starting over is never silent (issue #591)', () => {
+		let warn: ReturnType<typeof vi.spyOn>;
+
+		beforeEach(() => {
+			warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		});
+
+		afterEach(() => {
+			warn.mockRestore();
+		});
+
+		it('warns — naming task, phase and run — when a checkpointed checkout is abandoned', async () => {
+			const deps = makeDeps();
+			// The checkout survived and still holds this phase's hand-off, but nothing
+			// asked to recover it: no recovery mode, no resume id, no branch flag — so
+			// acquisition skips reuse entirely and falls through to provisioning.
+			checkpointFileExists = true;
+			checkpointFileContents = JSON.stringify(CONTINUATION);
+
+			await runImplementationPhase({ ...deps, runId: 'run-19' });
+
+			const startingOver = warn.mock.calls.filter(([message]) =>
+				/starting over/i.test(String(message)),
+			);
+			expect(startingOver).toHaveLength(1);
+			expect(startingOver[0][1]).toMatchObject({
+				taskId: '19',
+				phase: 'implementation',
+				runId: 'run-19',
+				worktreePath: WORKTREE_PATH,
+				hasCheckpoint: true,
+				checkpointPhase: 'implementation',
+			});
+		});
+
+		it('stays quiet at warn for an ordinary first run, whose task has no checkout at all', async () => {
+			const deps = makeDeps();
+			// `existsSync` is mocked per-test; the worktree path falls to this flag.
+			handoffFileExists = false;
+
+			await runImplementationPhase({ ...deps, runId: 'run-19' }).catch(() => {});
+
+			expect(
+				warn.mock.calls.filter(([message]) => /starting over/i.test(String(message))),
+			).toHaveLength(0);
+		});
 	});
 
 	it('continues from a checkpoint on a fresh session, on a different CLI (issue #502)', async () => {

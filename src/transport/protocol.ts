@@ -27,6 +27,7 @@ import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js'
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
+import { RecoveryIntentSchema } from '../queue/jobs.js';
 import { TriggerPhaseSchema } from '../triggers/types.js';
 
 /**
@@ -223,12 +224,23 @@ export const TaskAssignmentSchema = z.object({
 	customPrompt: z.string().optional(),
 	target: AgentTargetSchema,
 	timeoutMs: z.number().int().positive().optional(),
-	// Session threading / resume — mirrors the `session` object `runPhase`
-	// assembles and the resume fields on `SwarmJob` (`src/worker/consumer.ts`).
+	// Session threading / resume: the run's whole recovery intent, spread from the
+	// single declaration the job payload also spreads (`RecoveryIntentSchema`,
+	// `../queue/jobs.ts`) rather than restated member by member — which is how
+	// `recoveryMode` went missing here and left every Tier 2 continuation to
+	// silently start over (issue #591). Additive in both directions, so
+	// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped: an older worker
+	// ignores a member it does not know, and an older router simply omits it.
+	...RecoveryIntentSchema.shape,
+	// Declared *after* the spread, so this looser type deliberately overrides the
+	// intent's `.uuid()` — keep it below `...RecoveryIntentSchema.shape`, since
+	// reordering silently reinstates the stricter one. The looseness protects the
+	// **receiving** end only: the sender already validated this value through
+	// `recoveryIntentFromJob`'s `.parse` (`../queue/jobs.ts`), so a non-UUID never
+	// leaves the control plane. What it buys is that a worker does not reject an
+	// otherwise-valid assignment over the shape of a value whose only use is to be
+	// handed to a CLI as a resume id.
 	agentSessionId: z.string().optional(),
-	resumeSession: z.boolean().optional(),
-	resumeDelivery: z.boolean().optional(),
-	implementationBranchProvisioned: z.boolean().optional(),
 	// Phase-specific inputs — mirror `TriggerResult` (`src/triggers/types.ts`):
 	// planning/implementation carry `workItem`; the PR phases carry the PR
 	// coordinates, with `reviewId` only for respond-to-review and

@@ -53,6 +53,7 @@ function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {})
 	const handle: WorktreeHandle = { taskId: 'review-42', path, branch: 'abc', detached: true };
 	const worktrees = {
 		provision: vi.fn(async () => handle),
+		worktreePath: vi.fn(() => handle.path),
 		reuse: vi.fn(async () => handle),
 		cleanup: vi.fn(async () => undefined),
 	} as unknown as GitWorktreeManager;
@@ -253,6 +254,7 @@ describe('review production delivery', () => {
 		const cleanup = vi.fn(async () => undefined);
 		const worktrees = {
 			provision: vi.fn(async () => handle),
+			worktreePath: vi.fn(() => handle.path),
 			reuse: vi.fn(async () => handle),
 			cleanup,
 		} as unknown as GitWorktreeManager;

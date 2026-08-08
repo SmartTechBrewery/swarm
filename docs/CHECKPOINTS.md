@@ -297,6 +297,28 @@ identical policy it applies in-process. The wire `status` stays `deferred` — a
 a deferral whose retry happens to run from a checkpoint — so the frame change is additive and
 needs no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits the field.
 
+**And the continuation travels back the same way** (issue #591). The deferral is only half the
+split: the checkout the checkpoint describes stays on the worker's host, so the *gate that adopts
+it* has to run there too. The control plane therefore sends the run's whole recovery intent —
+`agentSessionId`, `resumeSession`, `resumeDelivery`, `implementationBranchProvisioned` and
+`recoveryMode` — on the `TaskAssignment` itself, and the worker resolves it into the phase inputs
+that reach `executeRecoveryGate` (`src/pipeline/resume.ts`). Additive in this direction too, so
+again no version bump: an older router omits `recoveryMode` and an older worker ignores it.
+
+Those five members are declared **once**, as `RecoveryIntentSchema` (`src/queue/jobs.ts`), and
+spread into both the job payload and the assignment frame rather than restated on each. That is
+deliberate and worth keeping: while they were four hand-maintained copies of each other,
+`recoveryMode` was written by "Retry now", "Reset & restart" and the automatic deferral, dropped
+at the very first hop, and read by no executor at all — every Tier 2 continuation provisioned
+fresh over the preserved checkout and silently re-did the work, which the whole test suite
+tolerated because each end was covered and the joint between them was not. The contract test
+that now walks the whole hand-off (`tests/unit/transport/recovery-intent-contract.test.ts`)
+fails if a member added to that schema does not reach a phase.
+
+A phase that reaches `provisionFresh()` while a preserved checkout — or a checkpoint inside it —
+still exists logs a `warn` naming the task, phase and run. Starting over is sometimes legitimate;
+being unable to tell that it happened is not.
+
 ## Rejected: soft quota budgets and the self-checkpoint trigger
 
 An earlier draft of this design proposed a second, *voluntary* mechanism: phases would run

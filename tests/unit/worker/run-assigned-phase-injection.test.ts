@@ -26,7 +26,7 @@ const { createGitHubProjectsProvider } = vi.hoisted(() => ({
 vi.mock('@/integrations/pm/github-projects/provider.js', () => ({ createGitHubProjectsProvider }));
 
 import { runAssignedPhase } from '@/worker/consumer.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockPhaseRecovery, createMockProjectConfig } from '../../helpers/factories.js';
 
 function agentResult(): AgentCliResult {
 	return {
@@ -56,7 +56,7 @@ function stubDelivery(): ScmDeliveryProvider {
 const baseInputs = () => ({
 	taskId: '17',
 	project: createMockProjectConfig(),
-	resumeDelivery: false,
+	recovery: createMockPhaseRecovery(),
 	runAgent: vi.fn(async () => agentResult()) as never,
 	prNumber: '99',
 	prBranch: 'issue-17',

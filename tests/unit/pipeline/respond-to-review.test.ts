@@ -125,6 +125,7 @@ function makeDeps() {
 	};
 	const worktrees = {
 		provision: vi.fn(async () => handle),
+		worktreePath: vi.fn(() => handle.path),
 		cleanup: vi.fn(async () => {}),
 	};
 	return {
@@ -235,6 +236,9 @@ describe('runRespondToReviewPhase', () => {
 			expect.any(Function),
 			false,
 			'checkpoint',
+			// The run id the start-over warning names when a continuation is lost
+			// (issue #591); this case has none.
+			undefined,
 		);
 
 		const runArgs = deps.runAgent.mock.calls[0][0];

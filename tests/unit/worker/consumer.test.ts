@@ -18,6 +18,7 @@ import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import {
+	createMockPhaseRecovery,
 	createMockPmWebhookJob,
 	createMockProjectConfig,
 	createMockScmEvent,
@@ -4272,7 +4273,7 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 			phase: 'planning',
 			taskId: '17',
 			project: PROJECT,
-			resumeDelivery: false,
+			recovery: createMockPhaseRecovery(),
 			runAgent,
 			...overrides,
 		};
@@ -4331,7 +4332,7 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 			baseInputs({
 				phase: 'implementation',
 				workItem: createMockWorkItem(),
-				resumeExistingBranch: true,
+				recovery: createMockPhaseRecovery({ resumeExistingBranch: true }),
 				onBranchProvisioned,
 			}),
 		);
@@ -4389,7 +4390,11 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 
 	it('threads a fresh session id as sessionId and a resume as resumeSessionId', async () => {
 		await runAssignedPhase(
-			baseInputs({ phase: 'planning', workItem: createMockWorkItem(), sessionId: 'sess-fresh' }),
+			baseInputs({
+				phase: 'planning',
+				workItem: createMockWorkItem(),
+				recovery: createMockPhaseRecovery({ sessionId: 'sess-fresh' }),
+			}),
 		);
 		expect(assignedPhaseCalls[0].args.sessionId).toBe('sess-fresh');
 		expect(assignedPhaseCalls[0].args.resumeSessionId).toBeUndefined();
@@ -4400,11 +4405,73 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 				phase: 'review',
 				prNumber: '42',
 				headSha: 'dead',
-				resumeSessionId: 'sess-resume',
+				recovery: createMockPhaseRecovery({ resumeSessionId: 'sess-resume' }),
 			}),
 		);
 		expect(assignedPhaseCalls[0].args.resumeSessionId).toBe('sess-resume');
 		expect(assignedPhaseCalls[0].args.sessionId).toBeUndefined();
+	});
+
+	// Issue #591: the switch is the last hop before a phase, so a mode dropped here
+	// is a mode the recovery gate never sees — on either kind of phase.
+	it('forwards the recovery mode to a board-driven and a PR-driven phase', async () => {
+		await runAssignedPhase(
+			baseInputs({
+				phase: 'implementation',
+				workItem: createMockWorkItem(),
+				recovery: createMockPhaseRecovery({ recoveryMode: 'checkpoint' }),
+			}),
+		);
+		expect(assignedPhaseCalls[0].args.recoveryMode).toBe('checkpoint');
+
+		assignedPhaseCalls.length = 0;
+		await runAssignedPhase(
+			baseInputs({
+				phase: 'respond-to-ci',
+				prNumber: '42',
+				prBranch: 'issue-17',
+				headSha: 'dead',
+				recovery: createMockPhaseRecovery({ recoveryMode: 'fresh' }),
+			}),
+		);
+		expect(assignedPhaseCalls[0].args.recoveryMode).toBe('fresh');
+	});
+
+	it('forwards no recovery mode when the attempt carries none', async () => {
+		await runAssignedPhase(baseInputs({ phase: 'planning', workItem: createMockWorkItem() }));
+		expect(assignedPhaseCalls[0].args.recoveryMode).toBeUndefined();
+	});
+
+	/**
+	 * The last hop's own exhaustiveness gate (issue #591). The contract test
+	 * (`tests/unit/transport/recovery-intent-contract.test.ts`) stops at
+	 * `PhaseRecovery`; this covers the hop after it, which is the one that used to
+	 * re-list every member by hand. Driven by the keys of a fully-populated
+	 * recovery, so a member added to `PhaseRecovery` and *not* forwarded fails here
+	 * instead of arriving nowhere — the exact defect this issue is about, one layer
+	 * down. Every member keeps its own name on the phase options, so this is a
+	 * straight key-for-key comparison.
+	 */
+	it('forwards every member of the phase recovery to the orchestrator', async () => {
+		const recovery = createMockPhaseRecovery({
+			sessionId: 'sess-fresh',
+			resumeDelivery: true,
+			resumeExistingBranch: true,
+			recoveryMode: 'checkpoint',
+		});
+		// Implementation is the phase that takes all of them — including
+		// `resumeExistingBranch`, which the others have no use for.
+		await runAssignedPhase(
+			baseInputs({ phase: 'implementation', workItem: createMockWorkItem(), recovery }),
+		);
+
+		const args = assignedPhaseCalls[0].args;
+		for (const [member, value] of Object.entries(recovery)) {
+			expect(
+				args,
+				`runAssignedPhase drops '${member}' — spread the recovery rather than re-listing its members`,
+			).toHaveProperty(member, value);
+		}
 	});
 
 	it('throws when a required phase input is missing rather than calling the runner', async () => {
