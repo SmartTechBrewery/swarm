@@ -224,15 +224,13 @@ export async function updateWorkerCapabilities(
  *
  * Separate from {@link updateWorkerCapabilities} because the two declarations have
  * different owners: the CLI set is registered by an operator and re-declared by a
- * *transport* handshake, while the phase set is a property of whichever **program**
- * currently operates the row — and the in-process host worker
- * (`src/worker/index.ts`) authenticates by acquiring an execution session rather
- * than by handshaking, so it has a CLI set it must not overwrite and a phase
- * repertoire it must state. Without this, a row narrowed by one `connect` run
- * would stay narrowed for every later in-process run, permanently refusing
+ * *transport* handshake, while the phase set is declared on its own — an operator
+ * editing the worker (`src/identity/worker-service.ts`) states a repertoire without
+ * touching a CLI set that is not theirs to overwrite. Without this split, a row
+ * narrowed by one `connect` run would stay narrowed, permanently refusing
  * `planning` on a host that can in fact run it (issue #467). Issue #536 made
  * `connect` declare every phase too, so the narrowing case is now a daemon on an
- * older build — the same skew, one build behind rather than one program over.
+ * older build.
  *
  * No enrollment validation, for the reason given on {@link updateWorkerCapabilities}:
  * an enrollment's own phase selection (`allowedPhases`, issue #509) is the owner's

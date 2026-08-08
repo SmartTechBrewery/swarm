@@ -2,9 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const evalScript =
 	vi.fn<(script: string, numKeys: number, ...args: unknown[]) => Promise<number>>();
-const del = vi.fn<(key: string) => Promise<number>>();
 const on = vi.fn();
-const redisClient = { eval: evalScript, del, on };
+const redisClient = { eval: evalScript, on };
 const RedisMock = vi.fn<(options: Record<string, unknown>) => typeof redisClient>(
 	() => redisClient,
 );
@@ -17,7 +16,6 @@ describe('project concurrency', () => {
 		vi.clearAllMocks();
 		process.env.REDIS_URL = 'redis://localhost:6379';
 		evalScript.mockResolvedValue(1);
-		del.mockResolvedValue(1);
 	});
 
 	it('acquires atomically below and at the limit using one fail-fast client', async () => {
@@ -67,14 +65,5 @@ describe('project concurrency', () => {
 		const { releaseProjectSlot } = await import('@/worker/project-concurrency.js');
 
 		await expect(releaseProjectSlot('alpha')).resolves.toBeUndefined();
-	});
-
-	it('resets a project counter and swallows reset failures', async () => {
-		const { resetProjectSlot } = await import('@/worker/project-concurrency.js');
-
-		await resetProjectSlot('alpha');
-		expect(del).toHaveBeenCalledWith('swarm:project-slots:alpha');
-		del.mockRejectedValueOnce(new Error('down'));
-		await expect(resetProjectSlot('alpha')).resolves.toBeUndefined();
 	});
 });

@@ -3,13 +3,13 @@
  * (`./worker-client.ts`) as a long-lived process (ADR-003 §1, Phase 2 of issue
  * #391). Run it via `npm run dev:worker`.
  *
- * **Every** worker runs this program, including the one on the control-plane host
- * (issue #551). That host used to run a second, database-holding executor instead
- * (`../worker/index.ts` in transport mode → the deleted
- * `../worker/transport-client.ts`) — the same role as two programs, only one of
- * which was exercised on a given run. It now points `SWARM_CONTROL_PLANE_URL` at
- * its own router over loopback (`http://localhost:<ROUTER_PORT>`), so "local" is a
- * network distance rather than a code path, and whatever works here works there.
+ * **Every** worker runs this program — there is no second one (issue #553). The
+ * control-plane host used to run a database-holding BullMQ executor of its own
+ * (the deleted `../worker/index.ts`), so the same role shipped as two programs and
+ * only one of them was exercised on a given run. That host now points
+ * `SWARM_CONTROL_PLANE_URL` at its own router over loopback
+ * (`http://localhost:<ROUTER_PORT>`), so "local" is a network distance rather than
+ * a code path, and whatever works here works there.
  *
  * The process holds **only** `SWARM_WORKER_CREDENTIAL`,
  * `SWARM_CONTROL_PLANE_URL`, the operator's own `SWARM_OPERATOR_GH_TOKEN`, and
@@ -45,13 +45,13 @@ import { fileURLToPath } from 'node:url';
 // connects to neither.
 import '../integrations/entrypoint.js';
 import {
-	assertTransportDispatchMode,
+	optionalEnv,
 	requireEnv,
 	resolveOperatorGitHubToken,
 	resolveWorkerRepoRoot,
 } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
-import { configureLogger, logger } from '../lib/logger.js';
+import { addFileSink, configureLogger, logger } from '../lib/logger.js';
 import {
 	handleTaskCancel,
 	runAssignmentDbFree,
@@ -61,9 +61,17 @@ import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discover
 import { connectWorkerTransport } from './worker-client.js';
 
 // Tag every line this process emits so it stays distinguishable from the router
-// and the in-process worker in a shared log stream (ai/ARCHITECTURE.md
-// "Observability").
+// and the API server in a shared log stream (ai/ARCHITECTURE.md "Observability").
 configureLogger({ component: 'worker-transport' });
+
+// Tee the worker's logs to a durable file (in addition to stdout) so an
+// unattended run leaves a greppable record behind — a terminal scrollback is easy
+// to lose, and the worker's runs are long. Defaults to `logs/worker.log` under the
+// repo root; override the path with SWARM_LOG_FILE. The file always receives the
+// JSON form (see logger.ts). This moved here with the deleted in-process entry
+// point (issue #553): the file sink belongs to whichever process actually runs
+// the agents, which is now only this one.
+addFileSink(optionalEnv('SWARM_LOG_FILE', 'logs/worker.log'));
 
 /** The daemon version reported at handshake — diagnostic only. */
 function resolveDaemonVersion(): string {
@@ -78,13 +86,6 @@ function resolveDaemonVersion(): string {
 }
 
 async function main(): Promise<void> {
-	// Refuse to start outside `transport` mode (issue #551 F1) — the mirror image
-	// of `../worker/index.ts`'s own guard. Without it, this entry point connects
-	// and heartbeats successfully in the default `in-process` mode while nothing
-	// consumes `swarm-jobs`, so the operator sees a healthy connected worker and
-	// every job just sits `waiting`.
-	assertTransportDispatchMode();
-
 	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
 	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
 	// The operator's own GitHub token, held only on this machine — the identity

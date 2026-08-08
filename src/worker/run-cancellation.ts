@@ -1,19 +1,17 @@
 /**
- * In-process registry of the {@link AbortController} backing each run currently
- * executing in *this* worker, keyed by run id (issue #166). It's the bridge
- * between the cross-process cancellation notification (`src/queue/cancellation.ts`,
- * delivered on the worker's Redis subscriber) and the per-run abort signal
- * threaded into `runPhase`: when a cancellation for a run id arrives, the worker
- * looks the run up here and aborts its controller, which kills the in-flight
- * agent CLI via its existing `AbortSignal` path (SIGTERM→SIGKILL) and lets the
- * phase run its normal worktree/lease cleanup.
+ * In-process registry of the {@link AbortController} backing each dispatch in
+ * flight in *this* process, keyed by run id (issue #166), plus the
+ * {@link RunTerminatedError} a worker-reported cancellation settles through.
  *
- * Single-worker MVP, so an in-memory map suffices; the durable Redis set remains
- * the source of truth for *whether* a run was cancelled (a cancellation that
- * arrives with no controller registered — the worker isn't running that run yet,
- * or already finished it — is a no-op here and is instead caught by the worker's
- * start-check against that set). A multi-worker deployment would route the
- * notification to the owning worker rather than broadcasting.
+ * The registry serves the control plane's `processJob`: a cancellation the
+ * operator recorded *before* the dispatch reached execution is caught by
+ * {@link beginRunCancellationTracking}'s start-check against the durable Redis
+ * set, which aborts the controller before an assignment is pushed. Delivering a
+ * cancellation to a run already executing is the transport's job, not this map's
+ * — `../router/dispatch-cancellation.ts` pushes a `task-cancel` frame to the
+ * worker running it (issue #549), which is the only channel a worker with no
+ * `REDIS_URL` has. The worker keeps its own copy of this registry for the
+ * assignment it is executing (`../transport/assignment-execution.ts`).
  */
 
 import { logger } from '../lib/logger.js';
@@ -52,21 +50,8 @@ export function unregisterRunController(runId: string): void {
 }
 
 /**
- * Abort the in-flight run with this id, if it's running here. Returns whether a
- * controller was found and aborted — `false` means the run isn't executing in
- * this worker right now (already settled, or not yet picked up), in which case
- * the durable set entry (checked at run start) covers it.
- */
-export function abortRun(runId: string): boolean {
-	const controller = runControllers.get(runId);
-	if (!controller) return false;
-	controller.abort();
-	return true;
-}
-
-/**
- * Link a run's abort controller to the worker's own shutdown signal, so that
- * worker shutdown propagates to the run. Returns the controller and a detach
+ * Link a run's abort controller to the process's own shutdown signal, so that
+ * shutdown propagates to the run. Returns the controller and a detach
  * callback to clean up the listener once the run settles.
  */
 export function linkRunAbortController(signal?: AbortSignal): {

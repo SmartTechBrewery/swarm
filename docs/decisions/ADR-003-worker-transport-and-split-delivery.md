@@ -80,18 +80,19 @@ rejection rather than a silent misparse.
 
 **No scheduler/eligibility/dispatch behavior changes.** The transport only keeps
 the existing `worker_sessions` liveness signal fresh over the wire; the
-eligibility gate already consumes that signal. The in-process host worker
-(`src/worker/index.ts`) is untouched and keeps calling the session service
-directly — the transport is a second front door to the same service, so the
-single-user/same-machine path is unaffected.
+eligibility gate already consumes that signal. When this shipped, the in-process
+host worker was untouched and kept calling the session service directly — the
+transport was a second front door to the same service. It is now the only one:
+issue #553 deleted that worker, and every worker acquires its session through the
+handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
-`TaskExecutionResult`/`StreamLog`) — is now built, gated behind
-`SWARM_DISPATCH_MODE=transport` (default `in-process`, so nothing changes until an
-operator opts in). It landed across four phases:
+`TaskExecutionResult`/`StreamLog`) — is now built, and since issue #544 it is how
+**every** dispatch runs; there is no mode and no alternative executor. It landed
+across the following phases:
 
 1. **#392** — the `TaskAssignment` frame + a non-secret payload builder
    (`src/transport/assignment.ts`): the frame carries the non-secret project-config
@@ -258,12 +259,13 @@ server-side store) it needs:
    worker does.
 
 10. **#551** — **one worker program.** The control-plane host stopped running an
-   executor of its own: `SWARM_DISPATCH_MODE=transport` now points its worker at
-   `src/transport/connect-entry.ts` with `SWARM_CONTROL_PLANE_URL=http://localhost:<ROUTER_PORT>`,
-   the same program and the same code path a remote worker runs, and
-   `src/worker/transport-client.ts` is deleted rather than kept "just in case".
-   `src/worker/index.ts` refuses to start in that mode, naming `npm run dev:worker`,
-   so the queue keeps exactly one consumer and no second executor can drift.
+   executor of its own: its worker is `src/transport/connect-entry.ts` with
+   `SWARM_CONTROL_PLANE_URL=http://localhost:<ROUTER_PORT>`, the same program and the
+   same code path a remote worker runs, and `src/worker/transport-client.ts` is
+   deleted rather than kept "just in case". At the time this landed the in-process
+   entry point survived for the opposite mode and refused to start in `transport`,
+   naming `npm run dev:worker`, so the queue kept exactly one consumer; item 11
+   deleted it and the mode with it.
    Loopback is safe by inspection: only worker-side code reads
    `SWARM_CONTROL_PLANE_URL` — the router publishes its own address as
    `WEBHOOK_CALLBACK_BASE_URL`.
@@ -282,9 +284,48 @@ server-side store) it needs:
    One consequence outside the executor: the worktree retention sweep must read the
    lease store this host's worker *writes*. In `transport` mode that is the
    host-local filesystem runtime rather than the Redis lease, so
-   `retentionWorktreeRuntime` (`src/worktree/retention.ts`) selects it by dispatch
-   mode — otherwise the sweep would find every checkout unleased and prune one out
-   from under a live phase.
+   `retentionWorktreeRuntime` (`src/worktree/retention.ts`) reads it — otherwise the
+   sweep would find every checkout unleased and prune one out from under a live
+   phase. (It selected the store *by dispatch mode* while both existed; since #553
+   the host-local one is the only store any worker writes.)
+
+11. **#544** — **the in-process path is gone**, which is what makes this record's
+   §2 the whole story rather than one of two. Six phases: **#544** persisted a
+   transport-dispatched run's live output control-plane side (the run page reads the
+   same rows either way); **#549** delivered run cancellation to a transport worker
+   over the transport as a pushed `task-cancel`, since a DB-free worker has no Redis
+   to read the durable marker with; **#550** gave the host worker's three
+   non-execution chores a stated owner — the orphaned-`running` reap, CLI
+   capability/quota discovery, and the worktree retention sweep moved to the **API
+   server** (`src/api/maintenance.ts`), the one process on the control-plane host
+   holding `DATABASE_URL`, the operator's PATH, *and* the checkout; **#551** is item
+   10 above; **#552** stopped `SWARM_SINGLE_USER_MODE` bypassing the dispatch gate,
+   so a single-user install registers and enrolls its one local worker like any
+   other; and **#553** deleted the alternative outright.
+
+   #553's deletions: `src/worker/index.ts`; `runPhase`, `resolvePmDelivery` and
+   `resolveScmDelivery` in `src/worker/consumer.ts`; the composite
+   `createTransportPmDeliveryProvider` (`src/pm/transport-delivery.ts`), whose
+   `localDelegate` was the DB-holding worker's in-process provider —
+   `createWriteOnlyTransportPmProvider` is now the only PM shape; `DispatchMode` /
+   `resolveDispatchMode` / `assertTransportDispatchMode` / `getControlPlaneUrl`
+   (`src/lib/env.ts`) and every branch on them, so the router hosts the dispatch
+   consumer and runs migrations unconditionally; the `dev:worker:legacy` /
+   `dev:worker:legacy:watch` / `start:worker:legacy` scripts; and, once nothing
+   imported them, `createLiveOutputRunner` (the in-process live-output DB batcher —
+   the control plane persists a transport run's lines instead), `abortRun`,
+   `resetProjectSlot`, and `acquireWorkerExecutionSession`.
+
+   `processJob`, the ADR-001 eligibility gate and `runAssignedPhase` stayed: they are
+   the shared machine, reached now only from `src/router/dispatcher.ts` (the first
+   two) and `src/transport/assignment-execution.ts` (the third).
+   `ProcessJobDeps.executePhase` became **required** — there is no in-process default
+   to fall back to, and a caller that supplies none is a compile error rather than a
+   silent second path. One behavioural consequence, deliberate: `handlePhaseFailure`
+   no longer fires recovery CLI-quota discovery on a launch/authentication failure.
+   That failure describes the *worker's* PATH and logins; probing the control plane's
+   own host would record a bogus status. The refresh belongs to `startHostMaintenance`
+   and the on-demand `quota.refreshQuotas`, both of which run where the CLIs are.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

@@ -2,10 +2,11 @@
  * Control-plane delivery of a user termination to the worker actually running the
  * run (issue #549). The dashboard's Terminate action records the run id in the
  * durable Redis marker and publishes it (`../queue/cancellation.ts`); the only
- * subscriber used to be the in-process BullMQ worker (`../worker/index.ts`), a
- * branch `SWARM_DISPATCH_MODE=transport` never reaches — so a transport-dispatched
- * run kept working until its own wall-clock timeout, and a DB-free worker could
- * not have read the marker even if it had been told to look.
+ * subscriber used to be the in-process BullMQ executor, which a transport-
+ * dispatched run never reached — so such a run kept working until its own
+ * wall-clock timeout, and a DB-free worker could not have read the marker even if
+ * it had been told to look. (That executor is gone entirely since issue #553; this
+ * bridge is now the only delivery path there is.)
  *
  * This module is the bridge: a cancellation names a *run*, the transport addresses
  * a *worker* and a *dispatch*, so it resolves one to the other through the

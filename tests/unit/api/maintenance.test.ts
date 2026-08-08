@@ -51,22 +51,10 @@ describe('startHostMaintenance', () => {
 		vi.useRealTimers();
 	});
 
-	it('does not start in `in-process` dispatch mode — the host worker owns the chores there', async () => {
-		const collaborators = createCollaborators([createMockProjectConfig()]);
-
-		const handle = startHostMaintenance({ dispatchMode: 'in-process', ...collaborators });
-		await vi.advanceTimersByTimeAsync(QUOTA_INTERVAL_MS * 2);
-
-		expect(handle).toBeUndefined();
-		expect(collaborators.failOrphanedRuns).not.toHaveBeenCalled();
-		expect(collaborators.listProjects).not.toHaveBeenCalled();
-		expect(collaborators.discoverQuotas).not.toHaveBeenCalled();
-	});
-
 	it('reaps worker-less orphaned runs exactly once, at startup', async () => {
 		const collaborators = createCollaborators([]);
 
-		const handle = startHostMaintenance({ dispatchMode: 'transport', ...collaborators });
+		const handle = startHostMaintenance({ ...collaborators });
 		await vi.advanceTimersByTimeAsync(0);
 
 		expect(collaborators.failOrphanedRuns).toHaveBeenCalledTimes(1);
@@ -77,7 +65,7 @@ describe('startHostMaintenance', () => {
 		await vi.advanceTimersByTimeAsync(QUOTA_INTERVAL_MS * 2);
 		expect(collaborators.failOrphanedRuns).toHaveBeenCalledTimes(1);
 
-		await handle?.close();
+		await handle.close();
 	});
 
 	it('sweeps worktrees immediately and then on the configured interval', async () => {
@@ -87,7 +75,7 @@ describe('startHostMaintenance', () => {
 		];
 		const collaborators = createCollaborators(projects);
 
-		const handle = startHostMaintenance({ dispatchMode: 'transport', ...collaborators });
+		const handle = startHostMaintenance({ ...collaborators });
 		await vi.advanceTimersByTimeAsync(0);
 
 		expect(collaborators.pruneWorktrees).toHaveBeenCalledTimes(2);
@@ -96,13 +84,13 @@ describe('startHostMaintenance', () => {
 		await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
 		expect(collaborators.pruneWorktrees).toHaveBeenCalledTimes(4);
 
-		await handle?.close();
+		await handle.close();
 	});
 
 	it('discovers CLI quotas immediately (full) and then cheaply on its interval', async () => {
 		const collaborators = createCollaborators([]);
 
-		const handle = startHostMaintenance({ dispatchMode: 'transport', ...collaborators });
+		const handle = startHostMaintenance({ ...collaborators });
 		await vi.advanceTimersByTimeAsync(0);
 
 		expect(collaborators.discoverQuotas).toHaveBeenCalledTimes(1);
@@ -117,7 +105,7 @@ describe('startHostMaintenance', () => {
 		expect(collaborators.discoverQuotas).toHaveBeenCalledTimes(2);
 		expect(collaborators.discoverQuotas).toHaveBeenLastCalledWith(true);
 
-		await handle?.close();
+		await handle.close();
 	});
 
 	it('steps over a project whose prune throws and keeps sweeping the rest', async () => {
@@ -131,7 +119,7 @@ describe('startHostMaintenance', () => {
 			return {};
 		});
 
-		const handle = startHostMaintenance({ dispatchMode: 'transport', ...collaborators });
+		const handle = startHostMaintenance({ ...collaborators });
 		await vi.advanceTimersByTimeAsync(0);
 
 		expect(collaborators.pruneWorktrees.mock.calls.map(([p]) => p.id)).toEqual([
@@ -143,7 +131,7 @@ describe('startHostMaintenance', () => {
 		await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
 		expect(collaborators.pruneWorktrees).toHaveBeenCalledTimes(4);
 
-		await handle?.close();
+		await handle.close();
 	});
 
 	it('keeps running when a chore rejects outright', async () => {
@@ -152,7 +140,7 @@ describe('startHostMaintenance', () => {
 		collaborators.listProjects.mockRejectedValue(new Error('database unreachable'));
 		collaborators.discoverQuotas.mockRejectedValue(new Error('no CLI on PATH'));
 
-		const handle = startHostMaintenance({ dispatchMode: 'transport', ...collaborators });
+		const handle = startHostMaintenance({ ...collaborators });
 		await vi.advanceTimersByTimeAsync(0);
 
 		expect(handle).toBeDefined();
@@ -160,15 +148,15 @@ describe('startHostMaintenance', () => {
 		await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
 		expect(collaborators.listProjects).toHaveBeenCalledTimes(2);
 
-		await handle?.close();
+		await handle.close();
 	});
 
 	it('clears every timer on close', async () => {
 		const collaborators = createCollaborators([createMockProjectConfig()]);
 
-		const handle = startHostMaintenance({ dispatchMode: 'transport', ...collaborators });
+		const handle = startHostMaintenance({ ...collaborators });
 		await vi.advanceTimersByTimeAsync(0);
-		await handle?.close();
+		await handle.close();
 
 		expect(vi.getTimerCount()).toBe(0);
 
@@ -183,7 +171,6 @@ describe('startHostMaintenance', () => {
 		const collaborators = createCollaborators([createMockProjectConfig()]);
 
 		const handle = startHostMaintenance({
-			dispatchMode: 'transport',
 			worktreeSweepIntervalMs: 1_000,
 			quotaDiscoveryIntervalMs: 2_000,
 			...collaborators,
@@ -193,14 +180,14 @@ describe('startHostMaintenance', () => {
 		expect(collaborators.pruneWorktrees).toHaveBeenCalledTimes(3);
 		expect(collaborators.discoverQuotas).toHaveBeenCalledTimes(2);
 
-		await handle?.close();
+		await handle.close();
 	});
 
 	it('rejects a non-positive SWARM_WORKTREE_SWEEP_INTERVAL_MS at startup', () => {
 		const previous = process.env.SWARM_WORKTREE_SWEEP_INTERVAL_MS;
 		process.env.SWARM_WORKTREE_SWEEP_INTERVAL_MS = '0';
 		try {
-			expect(() => startHostMaintenance({ dispatchMode: 'transport' })).toThrow(
+			expect(() => startHostMaintenance()).toThrow(
 				/SWARM_WORKTREE_SWEEP_INTERVAL_MS must be a positive integer/,
 			);
 		} finally {

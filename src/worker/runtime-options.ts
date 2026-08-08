@@ -3,7 +3,7 @@ import { optionalEnv } from '../lib/env.js';
 export const DEFAULT_WORKER_LOCK_DURATION_MS = 15 * 60 * 1000;
 export const MAX_WORKER_LOCK_RENEW_TIME_MS = 30 * 1000;
 
-/** Jobs a worker runs at once when neither the flag nor the env var is set. */
+/** Dispatches driven at once when neither the flag nor the env var is set. */
 export const DEFAULT_WORKER_CONCURRENCY = 1;
 
 /**
@@ -22,17 +22,20 @@ function readConcurrencyFlag(argv: string[]): string | undefined {
 }
 
 /**
- * Resolve how many jobs this worker runs at once (BullMQ's `concurrency`).
+ * Resolve how many dispatch wake-ups the control plane drives at once (BullMQ's
+ * `concurrency`). Since issue #553 the only consumer of that queue is the
+ * router's dispatch consumer (`../router/dispatcher.ts`), so this bounds how
+ * many dispatches the control plane gates and pushes concurrently — not how many
+ * agents any one machine runs, which is the workers' own business.
  *
- * Precedence: the `--concurrency <n>` launch flag (so `npm run dev:worker:legacy --
+ * Precedence: the `--concurrency <n>` launch flag (so `npm run dev:router --
  * --concurrency 2` overrides without editing `.env`), then the
  * `SWARM_WORKER_CONCURRENCY` env var, then {@link DEFAULT_WORKER_CONCURRENCY}.
  * Must resolve to a positive integer — a typo throws rather than silently
  * falling back, naming whichever source supplied the bad value.
  *
- * This is the worker's *process-wide* cap across every project it serves; a
- * project's own `maxConcurrentJobs` and an enrollment's `concurrencyAllocation`
- * bound it further (see `worker-eligibility.ts`).
+ * A project's own `maxConcurrentJobs` and an enrollment's `concurrencyAllocation`
+ * bound the result further (see `worker-eligibility.ts`).
  */
 export function resolveWorkerConcurrency(
 	argv: string[] = process.argv.slice(2),

@@ -1,24 +1,31 @@
 /**
- * The worker's job processor — the Phase-3 wiring: dequeued job → trigger
- * lookup → pipeline phase (ai/ARCHITECTURE.md "Components").
+ * The dispatch job processor — dequeued job → trigger lookup → pipeline phase
+ * (ai/ARCHITECTURE.md "Components").
  *
- * A matched trigger names one of the pipeline phases plus its inputs
- * (`src/triggers/types.ts`); this dispatches on that phase and hands off to the
- * phase orchestrator (`src/pipeline/*`), which owns the whole run — worktree
- * provisioning + environment graft (SWARM-14/15), the agent CLI (SWARM-16),
- * reading its hand-off file, posting back to the PM board, and cleanup. The
- * worker's job here is just to resolve the project, build the PM provider the
- * PM-driven phases need, and translate the phase's result (or failure) into a
- * `JobOutcome`.
+ * It runs on the **control plane** (`src/router/dispatcher.ts` is its only
+ * caller): `processJob` claims the durable dispatch, resolves the trigger, runs
+ * the automation + ADR-001 eligibility gates, binds the selected worker, keeps
+ * the run row and dispatch record in step, and translates the phase's result (or
+ * failure) into a `JobOutcome`. Running the phase itself is the one pluggable
+ * step ({@link ProcessJobDeps.executePhase}) — it happens on the selected worker,
+ * which is handed an assignment over the transport and reports back.
+ *
+ * The other half this module owns is {@link runAssignedPhase}: the single
+ * per-phase switch that maps already-resolved {@link AssignedPhaseInputs} onto a
+ * `runXPhase` orchestrator (`src/pipeline/*`), which owns the whole run —
+ * worktree provisioning + environment graft (SWARM-14/15), the agent CLI
+ * (SWARM-16), reading its hand-off file, posting back to the PM board, and
+ * cleanup. That switch runs *on the worker*
+ * (`src/transport/assignment-execution.ts`); it lives here so both halves of one
+ * dispatch stay described in one place.
  *
  * Queue-agnostic on purpose: `processJob` takes an already-validated `SwarmJob`
- * and knows nothing about BullMQ, so tests drive it directly and the entry
- * point (`src/worker/index.ts`) stays a thin shell.
+ * and knows nothing about BullMQ, so tests drive it directly and the consumer
+ * that dequeues for it stays a thin shell.
  */
 
 import type { AgentDefaults, ProjectConfig } from '../config/schema.js';
 import { getAppSettings } from '../db/repositories/appSettingsRepository.js';
-import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import {
 	cancelClaimedDispatch,
 	claimWorkerForDispatch,
@@ -46,7 +53,6 @@ import {
 	storeRunLogs,
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
-import { resolveBoardItemIdForPrBranch } from '../dispatch/board-card.js';
 import {
 	claimDispatchForJob,
 	createAndPublishDispatch,
@@ -56,7 +62,7 @@ import {
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
-import type { AgentCli, AgentCliResult } from '../harness/agent-cli.js';
+import type { AgentCli, AgentCliResult, runAgentCli } from '../harness/agent-cli.js';
 import {
 	type AgentFailure,
 	type AgentFailureKind,
@@ -64,15 +70,13 @@ import {
 	agentRunError,
 } from '../harness/agent-failure.js';
 import { capabilityFor, DEFAULT_MODEL_PER_CLI, type ReasoningLevel } from '../harness/models.js';
-import { discoverCliQuotas } from '../harness/quota-discovery.js';
 // Side-effect import: registers every provider manifest into its registry before
-// `buildTriggerContext` resolves a dequeued job's `providerId` below. Declared here,
-// not only in the worker entrypoint, because the control plane's own dispatch
-// consumer (`src/router/dispatcher.ts`) drives `processJob` too.
+// `buildTriggerContext` resolves a dequeued job's `providerId` below. Declared here
+// as well as in the entry points, so no caller can reach this module with an empty
+// registry.
 import '../integrations/entrypoint.js';
 import { requireProjectPMAdapter, requireProjectPMProvider } from '../integrations/pm/registry.js';
 import { requireProjectSCMProvider, requireSCMProvider } from '../integrations/scm/registry.js';
-import { getControlPlaneUrl, optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -103,7 +107,6 @@ import {
 } from '../pm/automation-label.js';
 import { type PmStatusKey, resolvePipelinePhaseForStatusKey } from '../pm/pipeline.js';
 import { findWorkItemForPullRequest } from '../pm/pull-request-work-item.js';
-import { createTransportPmDeliveryProvider } from '../pm/transport-delivery.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import {
 	type CancellationOrigin,
@@ -121,8 +124,6 @@ import {
 import { priorityFor } from '../queue/producer.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
-import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
-import type { ScmPersona } from '../scm/types.js';
 import type { TriggerRegistry } from '../triggers/registry.js';
 import {
 	buildConflictResolutionKey,
@@ -164,7 +165,6 @@ import {
 	type KnownFailureCondition,
 } from './failure-diagnosis.js';
 import { GitWorktreeManager } from './git-worktree-manager.js';
-import { createLiveOutputRunner } from './live-output.js';
 import {
 	type MergeAutomationSettledOutcome,
 	processMergeAutomationDispatch,
@@ -421,8 +421,9 @@ export const DEFAULT_ENGINE: AgentCli = 'claude';
 /**
  * Resolve the effective default agent timeout: `SWARM_AGENT_TIMEOUT_MS` when it
  * is set to a positive integer, else {@link DEFAULT_AGENT_TIMEOUT_MS}. Exported
- * so the worker entrypoint reuses the exact same value for its stale-run
- * reconciliation cutoff (`src/worker/index.ts`). Throws on a non-integer / <1
+ * so the control-plane host's maintenance loop reuses the exact same value for
+ * its stale-run reconciliation cutoff (`src/api/maintenance.ts`). Throws on a
+ * non-integer / <1
  * value so a typo surfaces at startup rather than silently disabling the safety
  * net.
  */
@@ -448,7 +449,7 @@ const DISPATCH_CLAIM_LEASE_MS = 15 * 60 * 1000;
 /**
  * Margin past the effective agent timeout before a `running` dispatch's lease
  * is considered dead — the harness's SIGTERM→SIGKILL grace plus headroom for a
- * slow finalize, mirroring the stale-run sweep's margin (`src/worker/index.ts`).
+ * slow finalize, mirroring the stale-run sweep's margin (`src/api/maintenance.ts`).
  */
 const DISPATCH_LEASE_MARGIN_MS = 10 * 60 * 1000;
 
@@ -1161,15 +1162,15 @@ export interface PhaseResolution {
 }
 
 /**
- * The already-resolved inputs the pluggable phase executor runs from — exactly
- * the arguments {@link runPhase} takes, plus the claimed `dispatch` (so the
- * control-plane transport executor can build and push a `TaskAssignment` keyed by
- * `dispatch.id`). Issue #407 splits `processJob` into a dispatcher half (claim →
+ * The already-resolved inputs the pluggable phase executor runs from — the
+ * trigger, its project and routing resolution, the wake-up job, and the claimed
+ * `dispatch` (so the executor can build and push a `TaskAssignment` keyed by
+ * `dispatch.id`). Issue #407 split `processJob` into a dispatcher half (claim →
  * trigger → gates → bind → run-row → settle, all shared) and this one pluggable
- * step: the in-process executor ignores `dispatch` and calls `runPhase`; the
- * control-plane executor (`src/router/dispatcher.ts`) composes and pushes the
- * assignment and awaits the worker's `TaskExecutionResult`, adapting it back to a
- * {@link PhaseRunResult} (or throwing so the shared failure path settles it).
+ * step; issue #553 left the control-plane executor (`src/router/dispatcher.ts`)
+ * as its only implementation — it composes and pushes the assignment and awaits
+ * the worker's `TaskExecutionResult`, adapting it back to a {@link
+ * PhaseRunResult} (or throwing so the shared failure path settles it).
  */
 export interface DispatchPhaseContext {
 	trigger: TriggerResult;
@@ -1184,9 +1185,9 @@ export interface DispatchPhaseContext {
 
 /**
  * Collaborators that let the control-plane transport path (issue #407) reuse
- * {@link processJob} verbatim while diverging only where it must. Every field is
- * optional and the defaults reproduce today's in-process behavior exactly, so the
- * host worker's call is unchanged.
+ * {@link processJob} verbatim while diverging only where it must. Built in one
+ * place — `createControlPlaneDispatchDeps` (`src/router/dispatcher.ts`) — which
+ * has been the sole caller since issue #553 deleted the in-process executor.
  */
 export interface ProcessJobDeps {
 	/**
@@ -1196,24 +1197,27 @@ export interface ProcessJobDeps {
 	 */
 	gateOptions?: DispatchGateOptions;
 	/**
-	 * Require a selected worker. In transport mode there is no local executor, so an
-	 * unfederated project (the gate returns no selection) has nowhere to run: it
-	 * defers durably as a token-free `worker-eligibility` wait, naming the
-	 * register/enroll commands that fix it, rather than running on the host.
+	 * Require a selected worker. There is no local executor, so an unfederated
+	 * project (the gate returns no selection) has nowhere to run: it defers durably
+	 * as a token-free `worker-eligibility` wait, naming the register/enroll commands
+	 * that fix it.
 	 */
 	federatedOnly?: boolean;
 	/**
-	 * Resolve the execution identity a selected worker is bound with. Default: the
-	 * host's own identity (which must equal the selection — the in-process host is
-	 * the selected worker). The transport path resolves the *selected* worker's
-	 * live session identity instead, so the control plane binds the fenced claim on
-	 * that worker's behalf.
+	 * Resolve the execution identity a selected worker is bound with — the
+	 * *selected* worker's live session, since the control plane binds the fenced
+	 * claim on that worker's behalf rather than on a host credential of its own.
+	 * Falls back to `processJob`'s `executionIdentity` argument when unset.
 	 */
 	resolveBindIdentity?: (
 		selection: DispatchSelection,
 	) => Promise<WorkerExecutionIdentity | undefined>;
-	/** Run the resolved phase. Default: {@link runPhase} (in-process execution). */
-	executePhase?: (context: DispatchPhaseContext) => Promise<PhaseRunResult>;
+	/**
+	 * Run the resolved phase. Required: since issue #553 there is no in-process
+	 * executor to default to — every phase runs on a worker the control plane
+	 * pushed a `TaskAssignment` to.
+	 */
+	executePhase: (context: DispatchPhaseContext) => Promise<PhaseRunResult>;
 }
 
 /** Adapt the federated worker+target selection to the shared target-routing shape. */
@@ -1228,102 +1232,11 @@ function targetSelectionFor(selection: DispatchSelection | undefined): TargetSel
 }
 
 /**
- * Make a phase's routing decision (issue #346) visible in the worker log: quiet
- * (debug) when the preferred target won, louder when this worker had to route
- * around a CLI it cannot run — the case an operator needs to see, since it
- * explains why a run used a model the project didn't ask for first.
- */
-function logAgentRouting(
-	project: ProjectConfig,
-	trigger: TriggerResult,
-	routing?: TargetSelection,
-): void {
-	if (!routing) return;
-	const context = {
-		projectId: project.id,
-		phase: trigger.phase,
-		taskId: trigger.taskId,
-		// An undefined `cli` means the phase's own coded default (`DEFAULT_*_CLI`).
-		cli: routing.target.cli ?? 'phase default',
-		model: routing.target.model,
-		targetIndex: routing.index,
-	};
-	if (routing.fallback) {
-		logger.warn('No configured target CLI is available here - using the preferred target', context);
-	} else if (routing.skipped.length > 0) {
-		logger.info('Routed the phase to a lower-priority target', {
-			...context,
-			unavailable: routing.skipped,
-		});
-	} else {
-		logger.debug('Routed the phase to its preferred target', context);
-	}
-}
-
-/**
  * A phase run's result — the shape every `runXPhase` resolves to as far as the
  * worker cares. The orchestrators differ in their inputs and return richer
  * types, but all carry the agent run (`.agent`); the optional fields below are
  * the ones the worker (and the transport back-channel) read off the result.
  */
-/**
- * Resolve the SCM delivery provider for a PR-driven phase, choosing the delivery
- * mode in one place (ADR-004 §2). In **control-plane delivery mode** — a
- * federated worker with both `SWARM_CONTROL_PLANE_URL` and
- * `SWARM_WORKER_CREDENTIAL` set — the metadata-only calls (`submitReview` /
- * `postComment`) travel up the transport to the router's server-side delivery
- * API, which performs them under the persona this phase asked for — the
- * per-project reviewer PAT for a Review, the implementer for a Respond-to-review
- * reply, which must not be authored by the reviewer it answers (issue #444); the
- * source-carrying / attribution ops (commit identity, find/create PR, push) stay
- * local via the in-process delegate, keeping the operator's own token
- * worker-side. Otherwise — the **local host worker**, the default — it returns
- * `undefined`, so the phase builds today's in-process provider itself, lazily,
- * byte-for-byte unchanged; a same-machine worker with no control-plane URL is
- * unaffected.
- */
-export async function resolveScmDelivery(
-	project: ProjectConfig,
-	persona: ScmPersona,
-): Promise<ScmDeliveryProvider | undefined> {
-	const controlPlaneUrl = getControlPlaneUrl();
-	const workerCredential = optionalEnv('SWARM_WORKER_CREDENTIAL', '').trim();
-	if (!controlPlaneUrl || !workerCredential) return undefined;
-	return createTransportScmDeliveryProvider({
-		controlPlaneUrl,
-		workerCredential,
-		projectId: project.id,
-		persona,
-		localDelegate: await requireProjectSCMProvider(project).deliveryProvider(project, persona),
-	});
-}
-
-/**
- * Resolve the PM provider a board-driven phase (planning / implementation /
- * respond-to-review) writes through, choosing the delivery mode in the same one
- * place as {@link resolveScmDelivery} (ADR-004 §2, Phase 2/2). In **control-plane
- * delivery mode** — a federated worker with both `SWARM_CONTROL_PLANE_URL` and
- * `SWARM_WORKER_CREDENTIAL` set — the two metadata-only PM writes
- * (`moveWorkItem` / `addComment`) travel up the transport to the router's
- * server-side delivery API, which performs them under the per-project PM
- * credential; every read and non-metadata write stays local via the in-process
- * delegate, so the worker never holds that credential. Otherwise — the **local
- * host worker**, the default — it returns `undefined`, so `runAssignedPhase`
- * builds today's in-process provider itself, byte-for-byte unchanged; a
- * same-machine worker with no control-plane URL is unaffected.
- */
-export function resolvePmDelivery(project: ProjectConfig): PMProvider | undefined {
-	const controlPlaneUrl = getControlPlaneUrl();
-	const workerCredential = optionalEnv('SWARM_WORKER_CREDENTIAL', '').trim();
-	if (!controlPlaneUrl || !workerCredential) return undefined;
-	return createTransportPmDeliveryProvider({
-		controlPlaneUrl,
-		workerCredential,
-		projectId: project.id,
-		localDelegate: requireProjectPMProvider(project),
-	});
-}
-
 export interface PhaseRunResult {
 	agent: AgentCliResult;
 	/**
@@ -1378,8 +1291,8 @@ export interface AssignedPhaseInputs {
 	runId?: string;
 	/** External cancellation — aborting kills the agent CLI. */
 	signal?: AbortSignal;
-	/** Agent runner (live-output-wrapped by the caller); defaults are the phase's own. */
-	runAgent: ReturnType<typeof createLiveOutputRunner>;
+	/** Agent runner (output-forwarding-wrapped by the caller); defaults are the phase's own. */
+	runAgent: typeof runAgentCli;
 	/** Worktree runtime selected by the executor; unset keeps the store-backed host path. */
 	worktrees?: GitWorktreeManager;
 	/** planning / implementation: the board item to act on. */
@@ -1672,114 +1585,11 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 }
 
 /**
- * Run the pipeline phase a matched trigger resolved to (the in-process dispatch
- * path). Resolves routing overrides and the job's session-threading fields into
- * {@link AssignedPhaseInputs}, then hands off to the shared
- * {@link runAssignedPhase} switch. `signal` (the worker's shutdown signal) is
- * threaded through so a graceful shutdown kills any in-flight agent CLI.
- */
-async function runPhase(
-	trigger: TriggerResult,
-	project: ProjectConfig,
-	resolution: PhaseResolution,
-	job: SwarmJob,
-	runId: string | undefined,
-	signal?: AbortSignal,
-	implementationUnplanned = false,
-): Promise<PhaseRunResult> {
-	const overrides = agentOverrideFor(
-		project,
-		resolution,
-		trigger.phase,
-		job,
-		implementationUnplanned,
-	);
-	logAgentRouting(project, trigger, overrides.routing);
-	const runAgent = createLiveOutputRunner(runId);
-	const markImplementationBranchProvisioned = async (): Promise<void> => {
-		job.implementationBranchProvisioned = true;
-		if (!runId) return;
-		try {
-			await updateRunJobPayload(runId, job);
-		} catch (err) {
-			logger.error('Failed to persist Implementation branch checkpoint', {
-				runId,
-				taskId: trigger.taskId,
-				error: describeError(err),
-			});
-		}
-	};
-	const base = {
-		phase: trigger.phase,
-		taskId: trigger.taskId,
-		project,
-		cli: overrides.cli,
-		model: overrides.model,
-		reasoning: overrides.reasoning,
-		customPrompt: overrides.customPrompt,
-		timeoutMs: overrides.timeoutMs,
-		sessionId: job.resumeSession ? undefined : job.agentSessionId,
-		resumeSessionId: job.resumeSession ? job.agentSessionId : undefined,
-		resumeDelivery: job.resumeDelivery === true,
-		runId,
-		signal,
-		runAgent,
-	};
-	switch (trigger.phase) {
-		case 'planning':
-		case 'implementation':
-			return runAssignedPhase({
-				...base,
-				workItem: trigger.workItem,
-				pm: resolvePmDelivery(project),
-				resumeExistingBranch: job.implementationBranchProvisioned === true,
-				onBranchProvisioned: markImplementationBranchProvisioned,
-			});
-		case 'review':
-			return runAssignedPhase({
-				...base,
-				prNumber: trigger.prNumber,
-				headSha: trigger.headSha,
-				delivery: await resolveScmDelivery(project, 'reviewer'),
-			});
-		case 'respond-to-review':
-			return runAssignedPhase({
-				...base,
-				prNumber: trigger.prNumber,
-				prBranch: trigger.prBranch,
-				reviewId: trigger.reviewId,
-				headSha: trigger.headSha,
-				pm: resolvePmDelivery(project),
-				// Resolved here, where the DB is — the phase itself must run without one
-				// (ADR-003 §2). Best-effort: `undefined` simply falls back in the phase.
-				boardItemId: await resolveBoardItemIdForPrBranch(project, trigger.prBranch),
-				delivery: await resolveScmDelivery(project, 'implementer'),
-			});
-		case 'respond-to-ci':
-			return runAssignedPhase({
-				...base,
-				prNumber: trigger.prNumber,
-				prBranch: trigger.prBranch,
-				headSha: trigger.headSha,
-			});
-		case 'resolve-conflicts':
-			return runAssignedPhase({
-				...base,
-				prNumber: trigger.prNumber,
-				prBranch: trigger.prBranch,
-				headSha: trigger.headSha,
-				baseBranch: trigger.baseBranch,
-				baseSha: trigger.baseSha,
-			});
-	}
-}
-
-/**
- * The per-phase agent override (`cli`/`model`) a project configured, resolving
- * `runPhase`'s own `project.agents?.<phase>?.{cli,model}` lookup once so a run
- * row can record the *requested* model at creation without threading it through
- * `runPhase`'s signature. `model` may be undefined — "the phase's coded default
- * is in effect", the same convention `describeAgent` uses.
+ * The per-phase agent override (`cli`/`model`) a project configured, resolved
+ * once so a run row can record the *requested* model at creation and so the
+ * dispatch lease can be renewed to cover the phase's own wall-clock timeout.
+ * `model` may be undefined — "the phase's coded default is in effect", the same
+ * convention `describeAgent` uses.
  *
  * `engine` is the resolved effective CLI (`cli` with the coded {@link
  * DEFAULT_ENGINE} applied), persisted on the run row at creation/reset so the
@@ -1788,9 +1598,9 @@ async function runPhase(
  * their own `DEFAULT_*_CLI`). Finalization still records what actually ran
  * (`AgentCliResult.cli`), confirming or correcting the persisted engine.
  *
- * The model is resolved through the same fallback chain `runPhase` uses
- * (per-phase → project default → global default → coded default), so the
- * recorded value matches what actually runs.
+ * The model is resolved through the phase's own fallback chain (per-phase →
+ * project default → global default → coded default), so the recorded value
+ * matches what actually runs.
  *
  * Which of the phase's `targets` is resolved comes from {@link PhaseResolution}:
  * the federated gate's chosen target when a worker was selected for it (issue
@@ -2728,7 +2538,6 @@ async function handlePhaseFailure(
 	trigger: TriggerResult,
 	project: ProjectConfig,
 	runId: string | undefined,
-	deps: ProcessJobDeps = {},
 ): Promise<JobOutcome> {
 	// Delivery errors deliberately wrap a resumable checkpoint around the
 	// underlying push/hook/API failure. Preserve that cause chain in the run row,
@@ -2761,33 +2570,12 @@ async function handlePhaseFailure(
 		};
 	}
 
-	// If the failure looks like a missing binary, permission issue, or authentication/login failure,
-	// run capability discovery immediately to refresh the dashboard status. Skipped
-	// on the control-plane dispatch path (issue #407): the CLIs run on the remote
-	// worker, not here, so probing the control plane's own PATH would record a
-	// bogus "unavailable" for a failure that has nothing to do with its host.
-	const isLaunchOrAuthFailure =
-		!deps.executePhase &&
-		(isLaunchOrAuthenticationFailure(error) ||
-			(err instanceof AgentRunError &&
-				// `auth` is named explicitly (issue #343): it used to reach here through
-				// the catch-all `error` kind, and the dashboard's CLI/quota status must
-				// still refresh after a login failure now that it classifies separately.
-				(err.failure.kind === 'error' || err.failure.kind === 'auth')));
-
-	if (isLaunchOrAuthFailure) {
-		void discoverCliQuotas()
-			.then(async (snapshots) => {
-				for (const snapshot of snapshots) {
-					await upsertCliQuota(snapshot.cli, snapshot.status, snapshot);
-				}
-			})
-			.catch((discoverErr) => {
-				logger.error('Failed to run recovery quota discovery after launch failure', {
-					error: String(discoverErr),
-				});
-			});
-	}
+	// No recovery quota discovery here (issue #553): a launch/authentication failure
+	// describes the *worker's* PATH and logins, and this module now runs only on the
+	// control plane, which probing would record a bogus "unavailable" for. The
+	// dashboard's CLI/quota status is refreshed by the process that actually owns a
+	// host's CLIs — `startHostMaintenance` (`../api/maintenance.ts`, issue #550) on
+	// its schedule, or `quota.refreshQuotas` on demand.
 
 	// A user asked to terminate this run (issue #166): its abort must settle as a
 	// terminal, user-initiated failure — never a deferral, which would re-enqueue
@@ -3090,9 +2878,9 @@ async function bindSelectedWorker(
 export async function processJob(
 	job: SwarmJob,
 	registry: TriggerRegistry,
-	signal?: AbortSignal,
-	executionIdentity?: WorkerExecutionIdentity,
-	deps: ProcessJobDeps = {},
+	signal: AbortSignal | undefined,
+	executionIdentity: WorkerExecutionIdentity | undefined,
+	deps: ProcessJobDeps,
 ): Promise<JobOutcome> {
 	// Claim the durable dispatch behind this wake-up before acting on anything
 	// (issue #284): a cancelled/completed/superseded dispatch refuses the claim,
@@ -3365,31 +3153,20 @@ export async function processJob(
 		// landed (a deferred run terminated as its retry was dequeued).
 		await beginRunCancellationTracking(runId, runAbort);
 
-		// Run the resolved phase: in-process (the default {@link runPhase}) or, when
-		// the caller injects one, the control-plane transport executor that pushes a
+		// Run the resolved phase — the control-plane transport executor pushes a
 		// `TaskAssignment` to the selected worker and awaits its result (issue #407).
 		// Everything around this call — run-row lifecycle, dispatch settle, self-
-		// enqueue, merge automation, cancellation — is shared across both paths.
-		const result = deps.executePhase
-			? await deps.executePhase({
-					trigger,
-					project,
-					resolution,
-					job,
-					runId,
-					signal: runAbort.signal,
-					implementationUnplanned,
-					dispatch,
-				})
-			: await runPhase(
-					trigger,
-					project,
-					resolution,
-					job,
-					runId,
-					runAbort.signal,
-					implementationUnplanned,
-				);
+		// enqueue, merge automation, cancellation — is this module's shared machine.
+		const result = await deps.executePhase({
+			trigger,
+			project,
+			resolution,
+			job,
+			runId,
+			signal: runAbort.signal,
+			implementationUnplanned,
+			dispatch,
+		});
 		// A run the harness killed for exceeding its wall-clock timeout is a terminal
 		// failure, even in the rare case the agent trapped SIGTERM and still exited 0
 		// before SIGKILL (so the phase read a stale/partial hand-off and "succeeded").
@@ -3455,7 +3232,7 @@ export async function processJob(
 			durationMs: result.agent.durationMs,
 		};
 	} catch (err) {
-		const outcome = await handlePhaseFailure(err, job, trigger, project, runId, deps);
+		const outcome = await handlePhaseFailure(err, job, trigger, project, runId);
 		preserveCancellationMarker = outcome.status === 'phase-deferred';
 		// Reconcile the terminated run's checkout before the `finally` clears
 		// cancellation tracking and releases the project slot.

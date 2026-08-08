@@ -81,24 +81,37 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 	}),
 }));
 
-type PhaseCall = { phase: string; args: Record<string, unknown> };
-const phaseCalls: PhaseCall[] = [];
-let phaseImpl: (
-	phase: string,
-	args: Record<string, unknown>,
-) => Promise<{
+/** What a phase run resolves to, as far as the two stand-ins below are concerned. */
+type StubPhaseResult = {
 	agent: AgentCliResult;
 	movedTo?: string;
 	split?: { subTaskItemIds: string[]; mainTaskUpdated: boolean };
 	verdict?: string;
 	reviewOrdinal?: number;
 	automationOutcome?: string;
-}>;
+};
+
+/**
+ * What `runAssignedPhase` handed each mocked orchestrator — the per-phase switch's
+ * own inputs, asserted by its describe block at the bottom of this file.
+ */
+const assignedPhaseCalls: Array<{ phase: string; args: Record<string, unknown> }> = [];
+let assignedPhaseImpl: (phase: string, args: Record<string, unknown>) => Promise<StubPhaseResult> =
+	async () => ({ agent: agentResult() });
+
+/**
+ * What `processJob` dispatched — the context the control plane resolved before
+ * handing the phase to a worker. `processJob` no longer runs a phase itself
+ * (issue #553): `executePhase` is a required dependency, and the local wrapper
+ * below injects the recording stand-in every case here drives through `phaseImpl`.
+ */
+const phaseCalls: Array<{ phase: string; context: DispatchPhaseContext }> = [];
+let phaseImpl: (phase: string, context: DispatchPhaseContext) => Promise<StubPhaseResult>;
 
 function mockPhase(phase: string) {
 	return (args: Record<string, unknown>) => {
-		phaseCalls.push({ phase, args });
-		return phaseImpl(phase, args);
+		assignedPhaseCalls.push({ phase, args });
+		return assignedPhaseImpl(phase, args);
 	};
 }
 // Each mocked phase module keeps its coded `DEFAULT_*_CLI`: the eligibility gate
@@ -282,13 +295,16 @@ const hasCompletedRunForTask = vi.fn(
 );
 const resetRunToRunning = vi.fn(async (_id: string, _job?: unknown, _fromStatus?: string) => true);
 /**
- * The worker-binding tail of each `resetRunToRunning` call, named for
- * readability: the mock above deliberately forwards only the first three
- * positional arguments (so the existing exact-call assertions stay short), so
- * the trailing binding args — worker, fencing token, and the owning user the
- * attribution record needs (issue #398) — are captured here instead.
+ * The tail of each `resetRunToRunning` call, named for readability: the mock
+ * above deliberately forwards only the first three positional arguments (so the
+ * existing exact-call assertions stay short), so the resolved target it records
+ * on the reused row and the trailing binding args — worker, fencing token, and
+ * the owning user the attribution record needs (issue #398) — are captured here
+ * instead.
  */
 const resetRunBindings: Array<{
+	model?: string;
+	engine?: string;
 	workerId?: string;
 	fencingToken?: number;
 	workerUserId?: string;
@@ -318,6 +334,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	resetRunToRunning: (...args: unknown[]) => {
 		resetRunSessionColumns.push(args[7] as string | null | undefined);
 		resetRunBindings.push({
+			model: args[3] as string | undefined,
+			engine: args[6] as string | undefined,
 			workerId: args[9] as string | undefined,
 			fencingToken: args[10] as number | undefined,
 			workerUserId: args[11] as string | undefined,
@@ -502,13 +520,56 @@ import type { TriggerContext, TriggerResult } from '@/triggers/types.js';
 import {
 	type AssignedPhaseInputs,
 	DEFAULT_AGENT_TIMEOUT_MS,
+	type DispatchPhaseContext,
 	interruptedRunCommentBody,
+	type PhaseRunResult,
 	type ProcessJobDeps,
 	phaseFailureCommentBody,
-	processJob,
+	processJob as processJobWithDeps,
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
 } from '@/worker/consumer.js';
+
+type ProcessJobArgs = Parameters<typeof processJobWithDeps>;
+
+/**
+ * The dispatch dependencies every production caller supplies
+ * (`createControlPlaneDispatchDeps`, `@/router/dispatcher.js`), with a recording
+ * `executePhase` in place of the push-to-a-worker one. A case overrides a field
+ * when it is exercising that seam.
+ */
+function dispatchDeps(overrides: Partial<ProcessJobDeps> = {}): ProcessJobDeps {
+	return {
+		executePhase: async (context) => {
+			phaseCalls.push({ phase: context.trigger.phase, context });
+			return (await phaseImpl(context.trigger.phase, context)) as PhaseRunResult;
+		},
+		...overrides,
+	};
+}
+
+/**
+ * The target `agentOverrideFor` resolved for a dispatched phase. The phase runs on
+ * a worker now (issue #553), so the resolution is observable where the dispatcher
+ * records it: on the run row it creates. `engine` is the effective CLI (the phase's
+ * coded default applied), `model`/`reasoning`/`timeoutMs` are what it will run with.
+ */
+function resolvedTarget(): Record<string, unknown> {
+	const input = createRun.mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+	if (!input) throw new Error('expected the dispatcher to have created a run row');
+	return input;
+}
+
+/** `processJob` with those dependencies, so a case states only what it varies. */
+function processJob(
+	job: ProcessJobArgs[0],
+	registry: ProcessJobArgs[1],
+	signal?: ProcessJobArgs[2],
+	executionIdentity?: ProcessJobArgs[3],
+	deps: Partial<ProcessJobDeps> = {},
+): ReturnType<typeof processJobWithDeps> {
+	return processJobWithDeps(job, registry, signal, executionIdentity, dispatchDeps(deps));
+}
 
 const PROJECT = createMockProjectConfig();
 const PROJECT_PM = requireGitHubProjectsConfig(PROJECT);
@@ -1020,7 +1081,7 @@ describe('processJob', () => {
 			registryReturning(trigger),
 		);
 
-		expect(phaseCalls[0].args.resumeExistingBranch).toBe(true);
+		expect(phaseCalls[0].context.job.implementationBranchProvisioned).toBe(true);
 	});
 
 	it('does not treat PM resume dispatch intent as proof that a branch exists', async () => {
@@ -1032,23 +1093,7 @@ describe('processJob', () => {
 			registryReturning(trigger),
 		);
 
-		expect(phaseCalls[0].args.resumeExistingBranch).toBe(false);
-	});
-
-	it('persists the explicit branch checkpoint after Implementation provisions', async () => {
-		phaseImpl = async (_phase, args) => {
-			await (args.onBranchProvisioned as () => Promise<void>)();
-			throw new Error('failed after provisioning');
-		};
-		const workItem = createMockWorkItem({ statusId: '61e4505c' });
-		const trigger: TriggerResult = { phase: 'implementation', taskId: '10', workItem };
-
-		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
-
-		expect(updateRunJobPayload).toHaveBeenCalledWith(
-			'run-1',
-			expect.objectContaining({ implementationBranchProvisioned: true }),
-		);
+		expect(phaseCalls[0].context.job.implementationBranchProvisioned).toBeFalsy();
 	});
 
 	it('threads the fresh run row id as the sessionId on a first PM run (nothing to resume)', async () => {
@@ -1058,8 +1103,8 @@ describe('processJob', () => {
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
 		// createRun's id becomes the deterministic session handle; no resume yet.
-		expect(phaseCalls[0].args.sessionId).toBe('run-1');
-		expect(phaseCalls[0].args.resumeSessionId).toBeUndefined();
+		expect(phaseCalls[0].context.job.agentSessionId).toBe('run-1');
+		expect(phaseCalls[0].context.job.resumeSession).toBeFalsy();
 	});
 
 	it('threads the restored session as resumeSessionId (not sessionId) on a resumed PM run', async () => {
@@ -1078,8 +1123,8 @@ describe('processJob', () => {
 
 		// The carried row's preserved session is restored from the DB and resumed.
 		expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
-		expect(phaseCalls[0].args.resumeSessionId).toBe('sess-restored');
-		expect(phaseCalls[0].args.sessionId).toBeUndefined();
+		expect(phaseCalls[0].context.job.agentSessionId).toBe('sess-restored');
+		expect(phaseCalls[0].context.job.resumeSession).toBe(true);
 	});
 
 	it('threads the restored session as resumeSessionId on a resumed non-PM (review) run', async () => {
@@ -1093,8 +1138,8 @@ describe('processJob', () => {
 		// Review is a github (PR) job with no resumePmPhase — session continuation is
 		// driven purely by the generic resumeSession flag, uniform across phases.
 		expect(phaseCalls[0].phase).toBe('review');
-		expect(phaseCalls[0].args.resumeSessionId).toBe('sess-review');
-		expect(phaseCalls[0].args.sessionId).toBeUndefined();
+		expect(phaseCalls[0].context.job.agentSessionId).toBe('sess-review');
+		expect(phaseCalls[0].context.job.resumeSession).toBe(true);
 	});
 
 	// A non-resuming retry *assigns* its `agentSessionId` (`claude --session-id`),
@@ -1112,8 +1157,8 @@ describe('processJob', () => {
 			registryReturning(REVIEW_TRIGGER),
 		);
 
-		expect(phaseCalls[0].args.sessionId).toBe(fresh);
-		expect(phaseCalls[0].args.resumeSessionId).toBeUndefined();
+		expect(phaseCalls[0].context.job.agentSessionId).toBe(fresh);
+		expect(phaseCalls[0].context.job.resumeSession).toBeFalsy();
 		// And the row records the id this attempt assigns, so a run that dies before
 		// it can finalize still leaves a recoverable session behind.
 		expect(resetRunSessionColumns).toEqual([fresh]);
@@ -1140,8 +1185,8 @@ describe('processJob', () => {
 		);
 
 		expect(phaseCalls[0].phase).toBe('review');
-		expect(phaseCalls[0].args.resumeDelivery).toBe(true);
-		expect(phaseCalls[0].args.resumeSessionId).toBeUndefined();
+		expect(phaseCalls[0].context.job.resumeDelivery).toBe(true);
+		expect(phaseCalls[0].context.job.agentSessionId).toBeFalsy();
 	});
 
 	it('discriminates the context source for a board job and injects its PM provider', async () => {
@@ -1163,8 +1208,8 @@ describe('processJob', () => {
 
 		expect(phaseCalls).toHaveLength(1);
 		expect(phaseCalls[0].phase).toBe('review');
-		expect(phaseCalls[0].args).toMatchObject({
-			project: PROJECT,
+		expect(phaseCalls[0].context.project).toBe(PROJECT);
+		expect(phaseCalls[0].context.trigger).toMatchObject({
 			prNumber: '17',
 			headSha: 'deadbeef',
 			taskId: '17',
@@ -1226,16 +1271,12 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		// Twice, both from the registry and both for this project: once building the
-		// trigger context's `ctx.pm`, once for the phase itself.
-		expect(providerBuiltWith).toEqual([PROJECT, PROJECT]);
+		// Once, from the registry and for this project: the trigger context's `ctx.pm`.
+		// The phase's own PM provider is the worker's, resolved there (ADR-004 §2).
+		expect(providerBuiltWith).toEqual([PROJECT]);
 		expect(phaseCalls[0].phase).toBe('planning');
-		expect(phaseCalls[0].args).toMatchObject({
-			project: PROJECT,
-			taskId: '10',
-			workItem,
-			pm: provider,
-		});
+		expect(phaseCalls[0].context.project).toBe(PROJECT);
+		expect(phaseCalls[0].context.trigger).toMatchObject({ taskId: '10', workItem });
 	});
 
 	describe('self-enqueue after auto-advance', () => {
@@ -1333,7 +1374,7 @@ describe('processJob', () => {
 		});
 	});
 
-	it("threads the project's per-phase agent override (cli/model/reasoning) into the phase call", async () => {
+	it("resolves the project's per-phase agent override (cli/model/reasoning) for the dispatch", async () => {
 		const projectWithAgents = createMockProjectConfig({
 			// Legacy combined string migrates to logical model + reasoning (issue #180).
 			agents: { planning: { cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' } },
@@ -1344,8 +1385,8 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		expect(phaseCalls[0].args).toMatchObject({
-			cli: 'antigravity',
+		expect(resolvedTarget()).toMatchObject({
+			engine: 'antigravity',
 			model: 'gemini-3.5-flash',
 			reasoning: 'high',
 		});
@@ -1379,11 +1420,6 @@ describe('processJob', () => {
 			await processJob(createMockPmWebhookJob(), registryReturning(implementationTrigger()));
 
 			expect(hasCompletedRunForTask).toHaveBeenCalledWith(PROJECT.id, '10', 'planning');
-			expect(phaseCalls[0].args).toMatchObject({
-				cli: 'codex',
-				model: 'gpt-5.6-terra',
-				reasoning: 'max',
-			});
 			expect(createRun).toHaveBeenCalledWith(
 				expect.objectContaining({ engine: 'codex', model: 'gpt-5.6-terra', reasoning: 'max' }),
 			);
@@ -1400,14 +1436,14 @@ describe('processJob', () => {
 			hasCompletedRunForTask.mockResolvedValueOnce(true);
 
 			await processJob(createMockPmWebhookJob(), registryReturning(implementationTrigger()));
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'claude', model: 'opus' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
 
 			phaseCalls.length = 0;
 			projectLookup = () =>
 				createMockProjectConfig({ agents: { implementation: { cli: 'claude', model: 'opus' } } });
 			hasCompletedRunForTask.mockResolvedValueOnce(false);
 			await processJob(createMockPmWebhookJob(), registryReturning(implementationTrigger()));
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'claude', model: 'opus' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
 		});
 
 		it('assumes planned when the planning history lookup fails', async () => {
@@ -1423,7 +1459,7 @@ describe('processJob', () => {
 			await expect(
 				processJob(createMockPmWebhookJob(), registryReturning(implementationTrigger())),
 			).resolves.toMatchObject({ status: 'phase-succeeded' });
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'claude', model: 'opus' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
 		});
 
 		it('does not query planning history for non-implementation phases', async () => {
@@ -1433,7 +1469,7 @@ describe('processJob', () => {
 		});
 	});
 
-	it('passes undefined cli and the default model when the project has no agents override, leaving phase on coded default CLI but resolving default model', async () => {
+	it('leaves the phase on its coded default CLI while still resolving the default model', async () => {
 		const trigger: TriggerResult = {
 			phase: 'planning',
 			taskId: '10',
@@ -1442,8 +1478,9 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		expect(phaseCalls[0].args.cli).toBeUndefined();
-		expect(phaseCalls[0].args.model).toBe('sonnet');
+		// `engine` is the coded default the phase applies for itself; only the model
+		// was resolved through the fallback chain.
+		expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'sonnet' });
 	});
 
 	it('resolves model to the project defaults block when phase override omits model', async () => {
@@ -1462,8 +1499,7 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		expect(phaseCalls[0].args.cli).toBe('claude');
-		expect(phaseCalls[0].args.model).toBe('opus');
+		expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
 	});
 
 	it('resolves model to the global defaults when the project has none', async () => {
@@ -1477,7 +1513,7 @@ describe('processJob', () => {
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
 		// No project override at all → the global default wins over the coded default.
-		expect(phaseCalls[0].args.model).toBe('opus');
+		expect(resolvedTarget().model).toBe('opus');
 	});
 
 	it('prefers the project default over the global default', async () => {
@@ -1494,7 +1530,7 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		expect(phaseCalls[0].args.model).toBe('opus');
+		expect(resolvedTarget().model).toBe('opus');
 	});
 
 	it('prefers the per-phase model over both project and global defaults', async () => {
@@ -1514,7 +1550,7 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		expect(phaseCalls[0].args.model).toBe('sonnet');
+		expect(resolvedTarget().model).toBe('sonnet');
 	});
 
 	it('falls back to the coded default when neither project nor global sets one', async () => {
@@ -1526,7 +1562,7 @@ describe('processJob', () => {
 
 		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
-		expect(phaseCalls[0].args.model).toBe('sonnet');
+		expect(resolvedTarget().model).toBe('sonnet');
 	});
 
 	it('still runs the phase on coded defaults when the settings load fails', async () => {
@@ -1540,7 +1576,7 @@ describe('processJob', () => {
 		const outcome = await processJob(createMockPmWebhookJob(), registryReturning(trigger));
 
 		expect(outcome.status).toBe('phase-succeeded');
-		expect(phaseCalls[0].args.model).toBe('sonnet');
+		expect(resolvedTarget().model).toBe('sonnet');
 	});
 
 	// The ordering/fallback rules themselves are unit-tested in
@@ -1578,7 +1614,7 @@ describe('processJob', () => {
 
 			await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
 
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'codex', model: 'gpt-5.6-terra' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
 		});
 
 		it('routes to the next target when the preferred CLI is unavailable here', async () => {
@@ -1590,12 +1626,7 @@ describe('processJob', () => {
 
 			await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
 
-			expect(phaseCalls[0].args).toMatchObject({
-				cli: 'claude',
-				model: 'opus',
-				reasoning: 'high',
-			});
-			// The run row must record what actually ran, not the preferred target.
+			// The run row must record what will actually run, not the preferred target.
 			expect(createRun).toHaveBeenCalledWith(
 				expect.objectContaining({ engine: 'claude', model: 'opus', reasoning: 'high' }),
 			);
@@ -1611,7 +1642,7 @@ describe('processJob', () => {
 			await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
 
 			// Fail visibly on spawn rather than silently skip the phase.
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'codex', model: 'gpt-5.6-terra' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
 		});
 
 		it('keeps the preferred target when the capability lookup fails', async () => {
@@ -1624,7 +1655,7 @@ describe('processJob', () => {
 			);
 
 			expect(outcome.status).toBe('phase-succeeded');
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'codex', model: 'gpt-5.6-terra' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
 		});
 
 		it('lets a per-run override win over routing', async () => {
@@ -1643,37 +1674,8 @@ describe('processJob', () => {
 				registryReturning(planningTrigger()),
 			);
 
-			expect(phaseCalls[0].args).toMatchObject({ cli: 'codex', model: 'gpt-5.6-sol' });
+			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-sol' });
 		});
-	});
-
-	it("threads the project's Planning autoAdvance setting into the phase call", async () => {
-		const projectWithPipeline = createMockProjectConfig({
-			pipeline: { planning: { autoAdvance: true } },
-		});
-		projectLookup = () => projectWithPipeline;
-
-		await processJob(
-			createMockPmWebhookJob(),
-			registryReturning({
-				phase: 'planning',
-				taskId: '10',
-				workItem: createMockWorkItem({ statusId: '61e4505c' }),
-			}),
-		);
-		expect(phaseCalls[0].args.autoAdvance).toBe(true);
-	});
-
-	it('passes undefined Planning autoAdvance when the project has no override', async () => {
-		const trigger: TriggerResult = {
-			phase: 'planning',
-			taskId: '10',
-			workItem: createMockWorkItem({ statusId: '61e4505c' }),
-		};
-
-		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
-
-		expect(phaseCalls[0].args.autoAdvance).toBeUndefined();
 	});
 
 	it('threads a shutdown-linked per-run signal through to the phase', async () => {
@@ -1682,8 +1684,8 @@ describe('processJob', () => {
 		// rather than being the same object — aborting shutdown still aborts the run.
 		const controller = new AbortController();
 		let phaseSignal: AbortSignal | undefined;
-		phaseImpl = async (_phase, args) => {
-			phaseSignal = args.signal as AbortSignal | undefined;
+		phaseImpl = async (_phase, context) => {
+			phaseSignal = context.signal;
 			return { agent: agentResult() };
 		};
 
@@ -1700,8 +1702,8 @@ describe('processJob', () => {
 	it('aborts the in-flight phase signal when the worker shutdown signal fires', async () => {
 		const controller = new AbortController();
 		let phaseSignal: AbortSignal | undefined;
-		phaseImpl = async (_phase, args) => {
-			phaseSignal = args.signal as AbortSignal | undefined;
+		phaseImpl = async (_phase, context) => {
+			phaseSignal = context.signal;
 			// Fire shutdown mid-run; the linked per-run signal must abort too.
 			controller.abort();
 			return { agent: agentResult() };
@@ -2209,7 +2211,7 @@ describe('processJob', () => {
 				executionIdentity('w-claude'),
 			);
 
-			expect(phaseCalls[0].args).toMatchObject({
+			expect(phaseCalls[0].context.resolution.selection?.target).toMatchObject({
 				cli: 'claude',
 				model: 'opus',
 				reasoning: 'high',
@@ -2239,7 +2241,7 @@ describe('processJob', () => {
 			);
 
 			expect(resetRunBindings).toEqual([
-				{ workerId: 'w-claude', fencingToken: 7, workerUserId: ALICE },
+				expect.objectContaining({ workerId: 'w-claude', fencingToken: 7, workerUserId: ALICE }),
 			]);
 		});
 
@@ -2255,7 +2257,7 @@ describe('processJob', () => {
 			);
 
 			expect(resetRunBindings).toEqual([
-				{ workerId: 'w-claude', fencingToken: 7, workerUserId: ALICE },
+				expect.objectContaining({ workerId: 'w-claude', fencingToken: 7, workerUserId: ALICE }),
 			]);
 		});
 
@@ -2516,11 +2518,10 @@ describe('processJob', () => {
 		expect(outcome.status).toBe('phase-failed');
 	});
 
-	it('fails an auth failure terminally and still refreshes CLI quota discovery', async () => {
+	it('fails an auth failure terminally, without probing the control plane’s own CLIs', async () => {
 		// Issue #343: an unauthenticated CLI must not be re-enqueued (a retry cannot
-		// succeed until a human re-`/login`s), and must keep firing the recovery
-		// discovery it used to reach through the catch-all `error` kind. `attempt` is
-		// 0 on this job, so `phase-failed` proves terminality, not an exhausted budget.
+		// succeed until a human re-`/login`s). `attempt` is 0 on this job, so
+		// `phase-failed` proves terminality, not an exhausted budget.
 		phaseImpl = async () => {
 			throw new AgentRunError('Review agent (claude) exited with code 1 (authentication failed)', {
 				kind: 'auth',
@@ -2536,7 +2537,10 @@ describe('processJob', () => {
 			error: 'Review agent (claude) exited with code 1 (authentication failed)',
 			failureDiagnosis: { kind: 'launch-or-authentication' },
 		});
-		expect(discoverCliQuotas).toHaveBeenCalled();
+		// The CLI that failed to authenticate is the *worker's* (issue #553); probing
+		// this host's PATH would record a bogus status for a login it knows nothing
+		// about. `startHostMaintenance` (`@/api/maintenance.js`) owns that refresh.
+		expect(discoverCliQuotas).not.toHaveBeenCalled();
 	});
 
 	it('defers a stalled phase instead of failing it, using minimum delayed-retry floor', async () => {
@@ -2663,8 +2667,8 @@ describe('processJob', () => {
 
 	it('registers a per-run abort controller and threads its signal into the phase', async () => {
 		let seenSignal: AbortSignal | undefined;
-		phaseImpl = async (_phase, args) => {
-			seenSignal = args.signal as AbortSignal | undefined;
+		phaseImpl = async (_phase, context) => {
+			seenSignal = context.signal;
 			return { agent: agentResult() };
 		};
 
@@ -2823,8 +2827,8 @@ describe('processJob', () => {
 		// an already-aborted signal.
 		isRunCancellationRequested.mockResolvedValue(true);
 		let signalAborted = false;
-		phaseImpl = async (_phase, args) => {
-			signalAborted = (args.signal as AbortSignal | undefined)?.aborted ?? false;
+		phaseImpl = async (_phase, context) => {
+			signalAborted = context.signal.aborted;
 			return { agent: agentResult() };
 		};
 
@@ -3311,8 +3315,8 @@ describe('processJob', () => {
 			const gate = new Promise<void>((resolve) => {
 				release = resolve;
 			});
-			phaseImpl = async (_phase, args) => {
-				if (args.taskId === '17') await gate; // only task 17 parks
+			phaseImpl = async (_phase, context) => {
+				if (context.trigger.taskId === '17') await gate; // only task 17 parks
 				return { agent: agentResult() };
 			};
 
@@ -3824,7 +3828,7 @@ describe('processJob', () => {
 		it('passes the worker default timeout to a phase the project sets no override for', async () => {
 			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
-			expect(phaseCalls[0].args.timeoutMs).toBe(DEFAULT_AGENT_TIMEOUT_MS);
+			expect(resolvedTarget().timeoutMs).toBe(DEFAULT_AGENT_TIMEOUT_MS);
 		});
 
 		it('defers a genuinely-killed timeout (non-zero exit) for a resume retry', async () => {
@@ -3888,12 +3892,7 @@ describe('processJob', () => {
 				exitCode: 1,
 				timedOut: false,
 			};
-			phaseImpl = async (_phase, args) => {
-				// The phase must be dispatched with the retry's overrides, not the
-				// project/coded defaults — the confirmed `codex`/`gpt-5.6-terra`
-				// regression that instead relaunched `antigravity`.
-				expect(args.cli).toBe('codex');
-				expect(args.model).toBe('gpt-5.6-terra');
+			phaseImpl = async () => {
 				throw new AgentRunError(
 					'implementation agent (codex) exited with code 1',
 					{ kind: 'error' },
@@ -3913,6 +3912,13 @@ describe('processJob', () => {
 			);
 
 			expect(outcome.status).toBe('phase-failed');
+			// The dispatch must resolve the retry's overrides, not the project/coded
+			// defaults — the confirmed `codex`/`gpt-5.6-terra` regression that instead
+			// relaunched `antigravity`. The reused row records what will run.
+			expect(resetRunBindings[0]).toMatchObject({
+				engine: 'codex',
+				model: 'gpt-5.6-terra',
+			});
 			// The carried row is reused (reset to running), then finalized `failed`
 			// with the engine that actually ran — never left `running`.
 			expect(resetRunToRunning).toHaveBeenCalledWith(
@@ -4273,17 +4279,36 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 	}
 
 	beforeEach(() => {
-		phaseCalls.length = 0;
+		assignedPhaseCalls.length = 0;
 		providerBuiltWith.length = 0;
-		phaseImpl = async () => ({ agent: agentResult() });
+		assignedPhaseImpl = async () => ({ agent: agentResult() });
+	});
+
+	it("threads the project's Planning autoAdvance setting into the phase call", async () => {
+		const projectWithPipeline = createMockProjectConfig({
+			pipeline: { planning: { autoAdvance: true } },
+		});
+		await runAssignedPhase(
+			baseInputs({
+				phase: 'planning',
+				project: projectWithPipeline,
+				workItem: createMockWorkItem(),
+			}),
+		);
+		expect(assignedPhaseCalls[0].args.autoAdvance).toBe(true);
+	});
+
+	it('passes undefined Planning autoAdvance when the project has no override', async () => {
+		await runAssignedPhase(baseInputs({ phase: 'planning', workItem: createMockWorkItem() }));
+		expect(assignedPhaseCalls[0].args.autoAdvance).toBeUndefined();
 	});
 
 	it('routes planning to runPlanningPhase with the board PM provider and work item', async () => {
 		const workItem = createMockWorkItem({ id: 'PVTI_1' });
 		await runAssignedPhase(baseInputs({ phase: 'planning', workItem }));
-		expect(phaseCalls).toHaveLength(1);
-		expect(phaseCalls[0].phase).toBe('planning');
-		expect(phaseCalls[0].args.workItem).toBe(workItem);
+		expect(assignedPhaseCalls).toHaveLength(1);
+		expect(assignedPhaseCalls[0].phase).toBe('planning');
+		expect(assignedPhaseCalls[0].args.workItem).toBe(workItem);
 		// The board-driven phases build the concrete PM provider inside the switch.
 		expect(providerBuiltWith).toHaveLength(1);
 	});
@@ -4296,7 +4321,7 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		await runAssignedPhase(
 			baseInputs({ phase: 'planning', workItem: createMockWorkItem(), pm: injectedPm }),
 		);
-		expect(phaseCalls[0].args.pm).toBe(injectedPm);
+		expect(assignedPhaseCalls[0].args.pm).toBe(injectedPm);
 		expect(providerBuiltWith).toHaveLength(0);
 	});
 
@@ -4310,16 +4335,16 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 				onBranchProvisioned,
 			}),
 		);
-		expect(phaseCalls[0].phase).toBe('implementation');
-		expect(phaseCalls[0].args.resumeExistingBranch).toBe(true);
-		expect(phaseCalls[0].args.onBranchProvisioned).toBe(onBranchProvisioned);
+		expect(assignedPhaseCalls[0].phase).toBe('implementation');
+		expect(assignedPhaseCalls[0].args.resumeExistingBranch).toBe(true);
+		expect(assignedPhaseCalls[0].args.onBranchProvisioned).toBe(onBranchProvisioned);
 	});
 
 	it('routes review with PR coordinates and no PM provider', async () => {
 		await runAssignedPhase(baseInputs({ phase: 'review', prNumber: '42', headSha: 'deadbeef' }));
-		expect(phaseCalls[0].phase).toBe('review');
-		expect(phaseCalls[0].args.prNumber).toBe('42');
-		expect(phaseCalls[0].args.headSha).toBe('deadbeef');
+		expect(assignedPhaseCalls[0].phase).toBe('review');
+		expect(assignedPhaseCalls[0].args.prNumber).toBe('42');
+		expect(assignedPhaseCalls[0].args.headSha).toBe('deadbeef');
 		expect(providerBuiltWith).toHaveLength(0);
 	});
 
@@ -4333,8 +4358,8 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 				headSha: 'deadbeef',
 			}),
 		);
-		expect(phaseCalls[0].phase).toBe('respond-to-review');
-		expect(phaseCalls[0].args.reviewId).toBe('RV_1');
+		expect(assignedPhaseCalls[0].phase).toBe('respond-to-review');
+		expect(assignedPhaseCalls[0].args.reviewId).toBe('RV_1');
 		expect(providerBuiltWith).toHaveLength(1);
 	});
 
@@ -4342,8 +4367,8 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		await runAssignedPhase(
 			baseInputs({ phase: 'respond-to-ci', prNumber: '42', prBranch: 'issue-17', headSha: 'dead' }),
 		);
-		expect(phaseCalls[0].phase).toBe('respond-to-ci');
-		expect(phaseCalls[0].args.prBranch).toBe('issue-17');
+		expect(assignedPhaseCalls[0].phase).toBe('respond-to-ci');
+		expect(assignedPhaseCalls[0].args.prBranch).toBe('issue-17');
 	});
 
 	it('routes resolve-conflicts with base + head coordinates', async () => {
@@ -4357,19 +4382,19 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 				baseSha: 'cafe',
 			}),
 		);
-		expect(phaseCalls[0].phase).toBe('resolve-conflicts');
-		expect(phaseCalls[0].args.baseBranch).toBe('main');
-		expect(phaseCalls[0].args.baseSha).toBe('cafe');
+		expect(assignedPhaseCalls[0].phase).toBe('resolve-conflicts');
+		expect(assignedPhaseCalls[0].args.baseBranch).toBe('main');
+		expect(assignedPhaseCalls[0].args.baseSha).toBe('cafe');
 	});
 
 	it('threads a fresh session id as sessionId and a resume as resumeSessionId', async () => {
 		await runAssignedPhase(
 			baseInputs({ phase: 'planning', workItem: createMockWorkItem(), sessionId: 'sess-fresh' }),
 		);
-		expect(phaseCalls[0].args.sessionId).toBe('sess-fresh');
-		expect(phaseCalls[0].args.resumeSessionId).toBeUndefined();
+		expect(assignedPhaseCalls[0].args.sessionId).toBe('sess-fresh');
+		expect(assignedPhaseCalls[0].args.resumeSessionId).toBeUndefined();
 
-		phaseCalls.length = 0;
+		assignedPhaseCalls.length = 0;
 		await runAssignedPhase(
 			baseInputs({
 				phase: 'review',
@@ -4378,8 +4403,8 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 				resumeSessionId: 'sess-resume',
 			}),
 		);
-		expect(phaseCalls[0].args.resumeSessionId).toBe('sess-resume');
-		expect(phaseCalls[0].args.sessionId).toBeUndefined();
+		expect(assignedPhaseCalls[0].args.resumeSessionId).toBe('sess-resume');
+		expect(assignedPhaseCalls[0].args.sessionId).toBeUndefined();
 	});
 
 	it('throws when a required phase input is missing rather than calling the runner', async () => {
@@ -4389,7 +4414,7 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		await expect(runAssignedPhase(baseInputs({ phase: 'review' }))).rejects.toThrow(
 			/requires prNumber and headSha/,
 		);
-		expect(phaseCalls).toHaveLength(0);
+		expect(assignedPhaseCalls).toHaveLength(0);
 	});
 });
 

@@ -25,19 +25,6 @@ export function optionalEnv(name: string, fallback: string): string {
 }
 
 /**
- * The control-plane base URL a federated worker POSTs SCM metadata delivery to
- * (`SWARM_CONTROL_PLANE_URL`), or `undefined` when unset/empty. Set together
- * with `SWARM_WORKER_CREDENTIAL` it opts a worker into control-plane delivery
- * mode (ADR-004 §2): the metadata-only `submitReview`/`postComment` calls travel
- * to the router's server-side delivery API instead of running in-process. Unset
- * (the default, and every local host worker) keeps the in-process delivery path.
- */
-export function getControlPlaneUrl(): string | undefined {
-	const value = process.env.SWARM_CONTROL_PLANE_URL;
-	return value === undefined || value.trim() === '' ? undefined : value.trim();
-}
-
-/**
  * SWARM's own public base URL (`WEBHOOK_CALLBACK_BASE_URL`), or `undefined` when
  * unset/empty — the ingress half of the same value GitHub's webhook (and the
  * Cloudflare Tunnel serving it) is configured with, e.g.
@@ -120,47 +107,4 @@ export function resolveWorkerRepoRoot(
 ): string {
 	const value = (raw ?? '').trim();
 	return resolve(value === '' ? cwd : value);
-}
-
-/** How the host worker receives its work (`SWARM_DISPATCH_MODE`). */
-export type DispatchMode = 'in-process' | 'transport';
-
-/**
- * Resolve the dispatch mode (`SWARM_DISPATCH_MODE`, ADR-003 §2) — read by both the
- * router (`../router/index.ts`) and the host worker (`../worker/index.ts`).
- *
- * `in-process` (the default, and what an unset/empty value keeps) runs the BullMQ
- * consumer + `processJob` on the host worker; the router serves only webhooks +
- * the worker-session transport. `transport` relocates the consumer + eligibility
- * gate to the control plane: the router dequeues and pushes a `TaskAssignment` to
- * the selected connected worker (`../router/dispatcher.ts`), while every worker —
- * this host's included, over loopback — runs the DB-free transport entrypoint
- * (`../transport/connect-entry.ts`, issue #551) that executes the pushed phase
- * locally and reports results back. In that mode `../worker/index.ts` refuses to
- * start, so the queue has exactly one consumer. Any other value
- * fails startup loudly rather than silently falling back, mirroring the other env
- * parsers. Set it the same on both processes; default-off for backward
- * compatibility (an operator opts into the federated transport cutover).
- */
-export function resolveDispatchMode(raw = process.env.SWARM_DISPATCH_MODE): DispatchMode {
-	const value = (raw ?? '').trim();
-	if (value === '' || value === 'in-process') return 'in-process';
-	if (value === 'transport') return 'transport';
-	throw new Error(`SWARM_DISPATCH_MODE must be 'in-process' or 'transport', got '${raw}'`);
-}
-
-/**
- * Refuse to continue unless the dispatch mode is `transport` — the mirror image
- * of `../worker/index.ts`'s own guard against the opposite mode. Called at the
- * top of `../transport/connect-entry.ts`'s `main()` (issue #551) so that entry
- * point is loud about the mode it does not serve too: without it, starting the
- * transport worker in the default `in-process` mode connects and heartbeats
- * successfully while no process consumes `swarm-jobs`, leaving every job
- * `waiting` with nothing to diagnose from.
- */
-export function assertTransportDispatchMode(raw = process.env.SWARM_DISPATCH_MODE): void {
-	if (resolveDispatchMode(raw) === 'transport') return;
-	throw new Error(
-		"SWARM_DISPATCH_MODE is 'in-process' (the default), which this transport entry point does not serve — refusing to start. Run this host's worker with `npm run dev:worker:legacy` (src/worker/index.ts) instead, or set SWARM_DISPATCH_MODE=transport on both the router and this host to use `npm run dev:worker` (src/transport/connect-entry.ts).",
-	);
 }

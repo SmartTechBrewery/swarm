@@ -2,24 +2,23 @@ import { realpathSync, statSync } from 'node:fs';
 import { basename, resolve, sep } from 'node:path';
 import type { ProjectConfig } from '../config/schema.js';
 import { PROJECT_DEFAULTS } from '../config/schema.js';
-import { type DispatchMode, resolveDispatchMode } from '../lib/env.js';
 import { logger } from '../lib/logger.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { createHostLocalWorktreeRuntime } from './host-local-runtime.js';
-import { storeBackedWorktreeRuntime, type WorktreeRuntime } from './worktree-runtime.js';
+import type { WorktreeRuntime } from './worktree-runtime.js';
 
 /**
  * The lease/pin store the sweep must read — **the same one this host's worker
  * writes**, or the reclaim gate answers about markers nobody sets (issue #551).
  *
- * In `in-process` mode the worker holds the Redis lease, so the store-backed
- * default is right. In `transport` mode every worker — this host's included, now
- * that it runs `src/transport/connect-entry.ts` over loopback — writes atomic
- * filesystem leases and preservation pins under `<repoRoot>/<worktreeRoot>/.swarm-state`
- * instead (`./host-local-runtime.ts`, ADR-004's 2026-08-06 amendment). A sweep
- * still asking Redis would find every checkout unleased and prune one out from
- * under a live phase — the sweep runs in the API server (`src/api/maintenance.ts`,
- * issue #550) and the CLI (`swarm worktrees prune`), both on this same filesystem.
+ * Every worker runs `src/transport/connect-entry.ts` (issue #553), which writes
+ * atomic filesystem leases and preservation pins under
+ * `<repoRoot>/<worktreeRoot>/.swarm-state` (`./host-local-runtime.ts`, ADR-004's
+ * 2026-08-06 amendment) rather than the Redis lease the retired in-process worker
+ * held. A sweep still asking Redis would find every checkout unleased and prune
+ * one out from under a live phase — the sweep runs in the API server
+ * (`src/api/maintenance.ts`, issue #550) and the CLI (`swarm worktrees prune`),
+ * both on this same filesystem.
  *
  * `isOwnerLive` answers `true` deliberately. It is consulted only for a lease
  * whose recorded pid is *this* process's, and this process holds no leases of its
@@ -27,11 +26,7 @@ import { storeBackedWorktreeRuntime, type WorktreeRuntime } from './worktree-run
  * fail-closed rule (`./reclaim.ts`) says skip the prune rather than risk a live
  * checkout. `ownerId` is likewise never written: nothing here claims or takes over.
  */
-export function retentionWorktreeRuntime(
-	project: ProjectConfig,
-	dispatchMode: DispatchMode = resolveDispatchMode(),
-): WorktreeRuntime {
-	if (dispatchMode !== 'transport') return storeBackedWorktreeRuntime;
+export function retentionWorktreeRuntime(project: ProjectConfig): WorktreeRuntime {
 	return createHostLocalWorktreeRuntime({
 		// Canonicalized so a symlinked or otherwise aliased `repoRoot` spelling still
 		// derives the same `.swarm-state` path the worker itself writes to

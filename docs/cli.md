@@ -329,14 +329,12 @@ repo root.
 
 | Script | Description |
 | --- | --- |
-| `npm run dev:api` | Migrate the DB, free `API_PORT`, then start the API server (`:3101`) with `--watch`. In dev it serves the API only; it also serves the built dashboard SPA from `dashboard/dist` when that exists. Under `SWARM_DISPATCH_MODE=transport` it additionally runs the control-plane host maintenance loop — the orphaned-run reap, CLI quota discovery, and the worktree retention sweep (`src/api/maintenance.ts`, issue #550) — which the host worker owns in `in-process` mode. |
+| `npm run dev:api` | Migrate the DB, free `API_PORT`, then start the API server (`:3101`) with `--watch`. In dev it serves the API only; it also serves the built dashboard SPA from `dashboard/dist` when that exists. It also runs the control-plane host maintenance loop — the orphaned-run reap, CLI quota discovery, and the worktree retention sweep (`src/api/maintenance.ts`, issue #550). |
 | `npm run start:api` | Build the dashboard, then run `dev:api` — the recommended **same-origin** mode where one process serves the SPA + API on `:3101` (used for public/tunnel access). |
 | `npm run reload` | After `git pull`: sync both dependency trees, rebuild the dashboard (`dist`, picked up live by a running `dev:api`/`start:api` since it serves `dist` from disk), and apply migrations. Does **not** restart the worker or rebuild the router — do those manually if their code changed (it prints the reminder). |
-| `npm run dev:worker` | Start the worker (`src/transport/connect-entry.ts`). **This is the worker**, on every machine — remote or the control-plane host itself, where it points `SWARM_CONTROL_PLANE_URL` at the router over loopback (issue #551). It is not in Docker Compose, holds no `DATABASE_URL`/`REDIS_URL`, and needs `SWARM_WORKER_CREDENTIAL`, `SWARM_CONTROL_PLANE_URL` and `SWARM_OPERATOR_GH_TOKEN` in `.env`. Requires `SWARM_DISPATCH_MODE=transport`. |
+| `npm run dev:worker` | Start the worker (`src/transport/connect-entry.ts`). **This is the worker** — the only one, on every machine, remote or the control-plane host itself, where it points `SWARM_CONTROL_PLANE_URL` at the router over loopback (issue #551). It is not in Docker Compose, holds no `DATABASE_URL`/`REDIS_URL`, and needs `SWARM_WORKER_CREDENTIAL`, `SWARM_CONTROL_PLANE_URL` and `SWARM_OPERATOR_GH_TOKEN` in `.env`. |
 | `npm run dev:worker:watch` | Same as `dev:worker`, with `--watch` auto-restart. |
 | `npm run dev:worker:seed` | Apply `swarm.config.json` (`db:seed`) then start the worker. Control-plane host only — `db:seed` needs `DATABASE_URL`. |
-| `npm run dev:worker:legacy` | Migrate the DB, then start the **in-process** host worker (`src/worker/index.ts`, the BullMQ consumer). `SWARM_DISPATCH_MODE=in-process` only; it refuses to start in `transport` mode and names `dev:worker` instead. Runs one job at a time by default; append `-- --concurrency <n>` to run up to N at once (overrides `SWARM_WORKER_CONCURRENCY`). Retires with the in-process path. |
-| `npm run dev:worker:legacy:watch` | Same as `dev:worker:legacy`, with `--watch` auto-restart. |
 | `npm run dev:dashboard` | Start the dashboard Vite dev server (`:5173`) — local development only; not what you expose publicly. |
 | `npm run dev:router` | Free `ROUTER_PORT`, then run the router (webhook receiver) on the host with `--watch` — for router development (in normal operation the router runs in Compose). |
 | `npm run dev` | Run `src/index.ts` (combined entry) with `--watch`. |
@@ -349,7 +347,6 @@ repo root.
 | `npm run build:dashboard` | Build the dashboard SPA into `dashboard/dist`. |
 | `npm run start` | Run the compiled combined entry (`dist/index.js`). |
 | `npm run start:worker` | Run the compiled worker (`dist/transport/connect-entry.js`). |
-| `npm run start:worker:legacy` | Migrate the DB, then run the compiled in-process worker (`dist/worker/index.js`). |
 | `npm run worker` | `build` then `start:worker`. |
 
 ### Database

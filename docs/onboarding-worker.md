@@ -1,14 +1,13 @@
 # Onboarding a worker
 
 A step-by-step runbook for making a machine — **this one or somebody else's** —
-a worker on an instance already running in **federated (`transport`) dispatch
-mode** (`SWARM_DISPATCH_MODE=transport`, ADR-003 §2 — see
+a worker. Every worker connects over the transport (ADR-003 §2 — see
 [`docs/configuration.md`](./configuration.md) and
-[`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#remote-worker-transport-worker)).
-Turning the instance into federated mode in the first place — the control-plane
-`.env` flip, the router recreate, the Cloudflare Tunnel `/worker/*` route — is a
-one-time admin-side change and out of scope here; this doc assumes that part is
-already done and the router is healthy with its dispatch consumer running.
+[`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#remote-worker-transport-worker));
+there is one worker program and one way to run it (issue #553). The admin-side
+prerequisites — the Cloudflare Tunnel `/worker/*` route in particular — are out
+of scope here; this doc assumes the router is healthy with its dispatch consumer
+running, which it always is.
 
 **Every deployment does this, including a single-user install** (issue #552).
 `SWARM_SINGLE_USER_MODE` is the API's authentication policy; it does not bypass
@@ -142,9 +141,7 @@ to expire after `heartbeatTtlMs`.
 - **Dashboard** — the new worker appears under `/workers`, and its detail page
   (`/workers/<id>`) shows it connected.
 - **Database** — a fresh, ticking heartbeat confirms the transport session is
-  live (this table also heartbeats in `in-process` mode, so a fresh row alone
-  doesn't prove transport connected — the two log lines above are the
-  authoritative signal on the worker's own side):
+  live:
   ```sql
   SELECT worker_id, fencing_token, last_heartbeat_at, now() - last_heartbeat_at AS age
   FROM worker_sessions

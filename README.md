@@ -42,26 +42,26 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   else's); an unassigned one takes a free eligible worker — chosen across the
   whole pool, so a phase several machines can run does not consume the one machine
   another waiting phase needs (issue #533). **Planning is
-  central** — it is never routed by assignment, because only a worker with
-  database access can run it (issue #469). **The gate has one rule for every
+  central** — it is never routed by assignment, so it takes any capable worker
+  rather than waiting on the assignee's (issue #469). **The gate has one rule for every
   deployment** — a single-user install registers and enrolls its one local worker
   exactly as anyone else does (issue #552); `SWARM_SINGLE_USER_MODE` is the API's
   authentication policy and no longer bypasses dispatch. Each host authenticates
   with the credential printed once by `swarm workers register`
   (`SWARM_WORKER_CREDENTIAL`); the selected host atomically reserves capacity
-  before the phase can start. A project with no enrolled workers is
-  unfederated and runs locally as before.
+  before the phase can start. A project with no enrolled, connected worker has
+  nowhere to run: its dispatch waits durably until one enrolls.
 - Pending work is durable in Postgres; Redis carries wake-ups, not the source
   of truth. See [`docs/pipeline.md`](./docs/pipeline.md) for lifecycle details.
-- **Where dispatch runs is a mode (`SWARM_DISPATCH_MODE`, ADR-003 §2).** By
-  default (`in-process`) the host worker dequeues and runs each phase, exactly as
-  the diagram shows. Set `transport` (on both the router and the worker) to
-  relocate the consumer + dispatch gate to the **control plane (router)**: the
-  router selects a connected, eligible worker, composes the system prompt + target
-  branch and pushes a `TaskAssignment` to it (never a persona secret), and the
-  worker runs the phase and reports the result back over the same transport for the
-  router to settle. Federated: a project with no enrolled, connected worker leaves
-  its dispatch durably pending. See [`docs/configuration.md`](./docs/configuration.md).
+- **Dispatch always runs on the control plane (ADR-003 §2).** The **router**
+  hosts the queue consumer and the dispatch gate: it selects a connected, eligible
+  worker, composes the system prompt + target branch, and pushes a
+  `TaskAssignment` to it (never a persona secret); the worker runs the phase and
+  reports the result back over the same transport for the router to settle. There
+  is no second arrangement — the in-process executor was deleted in issue #544 so
+  that one path carries every run. A project with no enrolled, connected worker
+  leaves its dispatch durably pending. See
+  [`docs/configuration.md`](./docs/configuration.md).
 
 ## Prerequisites
 
@@ -139,32 +139,26 @@ Start these processes in separate terminals:
 ```bash
 npm run dev:api                   # API server on 127.0.0.1:3101
 npm run dev:dashboard             # Vite dashboard on localhost:5173
-npm run dev:worker                # the worker (transport mode — see below)
-npm run dev:worker:legacy -- --concurrency 2   # …or the in-process worker, up to N jobs at once
+npm run dev:worker                # the worker — see below
 ```
 
-**There is one worker command.** `npm run dev:worker` runs
-`src/transport/connect-entry.ts` — the same program on every machine, remote or the
-control-plane host itself (issue #551). Point it at the router and give it the
-operator's own GitHub token; on the control-plane host that URL is simply loopback:
+**There is one worker program and one command for it.** `npm run dev:worker` runs
+`src/transport/connect-entry.ts` on every machine, remote or the control-plane host
+itself (issues #551/#553). Point it at the router and give it the operator's own
+GitHub token; on the control-plane host that URL is simply loopback:
 
 ```bash
 # .env on the machine running the worker
-SWARM_DISPATCH_MODE=transport
 SWARM_CONTROL_PLANE_URL=http://localhost:3100      # remote worker: https://<your-tunnel>
 SWARM_WORKER_CREDENTIAL=<from `swarm workers register`>
 SWARM_OPERATOR_GH_TOKEN=<your own GitHub token>
 SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
 ```
 
-`npm run dev:worker:legacy` is the older **in-process** worker
-(`src/worker/index.ts`, the BullMQ consumer) for `SWARM_DISPATCH_MODE=in-process`
-deployments; it refuses to start in `transport` mode. It runs one job at a time by
-default — pass `--concurrency <n>` (or set `SWARM_WORKER_CONCURRENCY`) to raise it,
-the flag winning over the env var; a project's **Maximum Concurrent Jobs** setting
-bounds it further per project. In `transport` mode the router owns the consumer, and
-Compose passes the same environment setting to it so it can dispatch work to
-multiple eligible workers. See [`docs/configuration.md`](docs/configuration.md).
+The **router** dequeues and dispatches; `SWARM_WORKER_CONCURRENCY` bounds how many
+dispatches it drives at once (default 1), and a project's **Maximum Concurrent
+Jobs** setting bounds it further per project. See
+[`docs/configuration.md`](docs/configuration.md).
 
 The worker holds **only** the credential, the control-plane URL, and the
 operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`, even on a host that has
@@ -301,7 +295,7 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`docs/cloudflare-tunnel.md`](./docs/cloudflare-tunnel.md) — exposing the
   local router to GitHub
 - [`docs/onboarding-worker.md`](./docs/onboarding-worker.md) — adding a new
-  user + remote worker to a federated (`transport`-mode) instance
+  user + worker, local or remote
 - [`docs/github-projects-v2-api.md`](./docs/github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./docs/decisions/) — architecture decision records

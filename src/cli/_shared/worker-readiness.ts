@@ -6,9 +6,9 @@
  * deployment routes its phases to a registered, enrolled worker — so a host with
  * no `SWARM_WORKER_CREDENTIAL` has nothing to run them on and its dispatches wait
  * durably instead of failing. That is a silent state: the stack is healthy, the
- * board moves, and nothing happens. The worker entry points already refuse to
- * start (`src/transport/connect-entry.ts`) or warn (`src/worker/index.ts`) about
- * it, but an operator upgrading a single-user install reads the stack commands
+ * board moves, and nothing happens. The worker entry point already refuses to
+ * start without it (`src/transport/connect-entry.ts`),
+ * but an operator upgrading a single-user install reads the stack commands
  * first, so the same actionable pointer belongs here — naming the two commands
  * that fix it rather than leaving them to diagnose a pile of pending dispatches.
  *
