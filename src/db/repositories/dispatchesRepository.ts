@@ -88,6 +88,14 @@ export type DispatchWaitReason =
 	| 'recheck'
 	/** No eligible worker could take the dispatch (issue #339's federated gate). */
 	| 'worker-eligibility'
+	/**
+	 * A continuation is waiting for the one machine that holds its preserved
+	 * checkout (issue #567). Distinct from `worker-eligibility` on purpose: that
+	 * reason means "no capable worker", while this one means the capable workers
+	 * are irrelevant — only the recorded machine can continue this run. The one
+	 * waiting reason with no budget behind it.
+	 */
+	| 'preserved-worker'
 	| 'manual-retry'
 	| 'recovered';
 
@@ -600,6 +608,14 @@ export interface ScheduleDispatchRetryInput {
 	waitReason: DispatchWaitReason;
 	attempt: number;
 	runId?: string;
+	/**
+	 * The human-readable reason this attempt deferred (issue #567). `waitReason` is
+	 * a category; this is the sentence an operator can act on — which for the
+	 * unbounded `preserved-worker` wait is the only place outside the run-detail
+	 * page that names the machine being waited for, since a gate refusal settles
+	 * before any run row exists to write an `error` onto.
+	 */
+	lastError?: string;
 }
 
 /**
@@ -623,6 +639,7 @@ export async function scheduleDispatchRetry(
 			availableAt: input.availableAt,
 			waitReason: input.waitReason,
 			attempt: input.attempt,
+			lastError: input.lastError,
 			wakeSeq: sql`${dispatches.wakeSeq} + 1`,
 			leaseOwner: null,
 			leaseExpiresAt: null,

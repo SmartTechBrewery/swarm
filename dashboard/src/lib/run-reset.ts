@@ -41,6 +41,12 @@ export interface ResetRunReport {
 	worktree: ResetWorktreeReport;
 	worktreeIntent: ResetWorktreeIntent;
 	recoveryCleared: boolean;
+	/**
+	 * The machine whose preserved checkout this reset gave up (issue #567), or null
+	 * when the run was pinned to none. Reset is the only action that ends a pinned
+	 * wait, so the report says which machine's work was discarded.
+	 */
+	abandonedPreservedWorkerId?: string | null;
 	dispatchId: string;
 }
 
@@ -95,8 +101,17 @@ export function describeRestartWait(): string {
  * is the only action that discards the recorded checkpoint and returns the spent
  * continuation budget, so restarting one deliberately gives up the remainder
  * "Continue now" would have picked up.
+ *
+ * A run pinned to a machine gets one more (issue #567), and it is the important one:
+ * this is the action that abandons that machine's preserved work, and it is offered
+ * — and works — whether or not the machine is reachable, so the copy has to say what
+ * is being given up rather than let "restarts this phase" imply a free retry.
  */
-export function resetConfirmMessage(status: string, discardWork: boolean): string {
+export function resetConfirmMessage(
+	status: string,
+	discardWork: boolean,
+	preservedMachine?: string | null,
+): string {
 	const scope =
 		status === 'checkpointed'
 			? "This cancels the run's scheduled continuation and its active dispatch"
@@ -108,10 +123,13 @@ export function resetConfirmMessage(status: string, discardWork: boolean): strin
 			? ' Its checkpoint and spent continuation count are cleared too, so the remainder it recorded is not carried over.'
 			: '';
 	const sequence = `${scope}, removes its checkout and releases the worktree lease, clears its recovery record, and restarts this phase from scratch with a fresh agent session.${checkpoint}`;
+	const pinned = preservedMachine
+		? ` The work preserved on ${preservedMachine} is abandoned: this run stops waiting for that machine and restarts on any available worker, and that earlier attempt's progress is lost. This works whether or not ${preservedMachine} is currently reachable.`
+		: '';
 	const work = discardWork
 		? 'Uncommitted changes and unpushed commits in the checkout are discarded permanently, on whichever worker holds it — they cannot be recovered.'
 		: 'Uncommitted changes and unpushed commits are kept: a checkout holding either is retained instead of removed.';
-	return `${sequence} ${work}`;
+	return `${sequence}${pinned} ${work}`;
 }
 
 /** Operator-facing wording for a protected-checkout reason (dirty/unpushed/leased). */
@@ -204,6 +222,14 @@ export function describeResetResult(result: ResetRunReport): string[] {
 
 	if (result.recoveryCleared) {
 		lines.push('Recovery record: cleared.');
+	}
+
+	// The one line that reports work *lost*, so it says so plainly rather than
+	// hiding behind "recovery record cleared" (issue #567).
+	if (result.abandonedPreservedWorkerId) {
+		lines.push(
+			`Preserved work: discarded — this run is no longer pinned to the machine that held its checkout, and that attempt's progress is not carried over.`,
+		);
 	}
 
 	lines.push(`Restarted: re-dispatched from scratch as dispatch ${result.dispatchId}.`);

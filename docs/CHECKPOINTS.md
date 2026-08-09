@@ -317,9 +317,19 @@ tolerated because each end was covered and the joint between them was not. The c
 that now walks the whole hand-off (`tests/unit/transport/recovery-intent-contract.test.ts`)
 fails if a member added to that schema does not reach a phase.
 
+**Carrying the intent is necessary but not sufficient — it also has to be sent to the right
+machine** (issue #567). The checkpoint file lives in one worker's `.swarm-workspaces/task-<id>`
+and nowhere else, so the settle additionally records which machine it is on
+(`runs.recovery.preservedWorkerId`) and the dispatch gate offers the continuation only there. If
+that machine is unavailable the dispatch waits for it without a timeout rather than continuing
+somewhere the checkpoint does not exist — which used to provision a fresh checkout and re-run the
+phase from scratch, silently. "Reset & restart" is the deliberate way out: it discards the
+checkpoint and the continuation budget as it always did, and now also releases the pin, recording
+on the run that the preserved work was abandoned.
+
 A phase that reaches `provisionFresh()` while a preserved checkout — or a checkpoint inside it —
-still exists logs a `warn` naming the task, phase and run. Starting over is sometimes legitimate;
-being unable to tell that it happened is not.
+still exists logs a `warn` naming the task, phase and run. That is the backstop for both halves
+above: starting over is sometimes legitimate; being unable to tell that it happened is not.
 
 ## Rejected: soft quota budgets and the self-checkpoint trigger
 

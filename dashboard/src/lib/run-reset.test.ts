@@ -109,6 +109,21 @@ describe('resetConfirmMessage', () => {
 		expect(message).toContain('discarded permanently');
 		expect(message).toContain('cannot be recovered');
 	});
+
+	// Issue #567: this is the action that abandons a pinned machine's work, and the
+	// only one available while that machine is unreachable — so the copy has to say
+	// both, rather than let "restarts this phase" read as a free retry.
+	it('names the machine whose preserved work a restart abandons', () => {
+		const message = resetConfirmMessage('checkpointed', false, 'm3_pro_tp');
+
+		expect(message).toContain('m3_pro_tp');
+		expect(message).toContain('abandoned');
+		expect(message).toContain('whether or not');
+	});
+
+	it('says nothing about a machine for a run pinned to none', () => {
+		expect(resetConfirmMessage('failed', false, null)).not.toContain('abandoned');
+	});
 });
 
 describe('describeResetResult', () => {
@@ -122,6 +137,12 @@ describe('describeResetResult', () => {
 			'Recovery record: cleared.',
 			'Restarted: re-dispatched from scratch as dispatch dispatch-9.',
 		]);
+	});
+
+	it('reports the preserved work a restart discarded, in its own line', () => {
+		const lines = describeResetResult(makeReport({ abandonedPreservedWorkerId: 'w-preserved' }));
+
+		expect(lines.some((line) => line.startsWith('Preserved work: discarded'))).toBe(true);
 	});
 
 	it('reports that no dispatch was active', () => {

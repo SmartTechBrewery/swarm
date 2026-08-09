@@ -49,6 +49,7 @@ import {
 	getRunByIdFromDb,
 	hasCompletedRunForTask,
 	isRetryPendingStatus,
+	recordRunPreservedWorker,
 	resetRunToRunning,
 	storeRunLogs,
 	updateRunJobPayload,
@@ -61,6 +62,7 @@ import {
 	promoteNextCapacityDispatch,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
+import { jobContinuesPreservedCheckout } from '../dispatch/preserved-worker.js';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
 import type { AgentCli, AgentCliResult, runAgentCli } from '../harness/agent-cli.js';
 import {
@@ -70,6 +72,7 @@ import {
 	agentRunError,
 } from '../harness/agent-failure.js';
 import { capabilityFor, DEFAULT_MODEL_PER_CLI, type ReasoningLevel } from '../harness/models.js';
+import { getWorker } from '../identity/worker-service.js';
 // Side-effect import: registers every provider manifest into its registry before
 // `buildTriggerContext` resolves a dequeued job's `providerId` below. Declared here
 // as well as in the entry points, so no caller can reach this module with an empty
@@ -154,6 +157,7 @@ import {
 } from './dependency-recheck.js';
 import {
 	type DispatchGateOptions,
+	type DispatchIneligibilityReason,
 	type DispatchSelection,
 	evaluateDispatchEligibility,
 	type GateDecision,
@@ -328,6 +332,13 @@ export type JobOutcome =
 			 * the gate runs before any worktree or agent.
 			 */
 			workerEligibilityRecheck?: boolean;
+			/**
+			 * This eligibility wait is the **preserved-checkout pin** (issue #567): the
+			 * dispatch continues machine-local state and the machine holding it is busy
+			 * or offline. Reads as its own dispatch wait reason (`preserved-worker`) and
+			 * is the one deferral with no budget — see {@link deferWorkerIneligible}.
+			 */
+			preservedWorkerWait?: boolean;
 	  };
 
 /**
@@ -776,6 +787,16 @@ function deferDependencyBlock(
  * that budget is exhausted, so the caller falls through to a terminal
  * `phase-failed` that posts the actionable reason (missing consent, missing
  * enrollment, no capable worker, …) on the item rather than dropping the work.
+ *
+ * **One reason has no budget** (issue #567): `preserved-worker-unavailable`, where
+ * the dispatch continues work preserved on one specific machine and that machine is
+ * merely busy or offline. There is nothing to give up on — the state is on disk and
+ * the machine will come back — and every terminal outcome available here is worse
+ * than waiting: failing the run abandons the work, and any timed fallback is this
+ * issue's defect with a delay on it. The wait is unbounded and the operator ends it
+ * deliberately with "Reset & restart", which discards the preserved work and frees
+ * the phase to run anywhere. A *structural* refusal from that machine still expires
+ * normally — the gate only frames "busy/offline" this way.
  */
 function deferWorkerIneligible(
 	err: WorkerIneligibleError,
@@ -786,21 +807,30 @@ function deferWorkerIneligible(
 	runId: string | undefined,
 ): Extract<JobOutcome, { status: 'phase-deferred' }> | undefined {
 	const attempt = job.workerEligibilityRecheckAttempt ?? 0;
-	if (attempt >= MAX_ELIGIBILITY_RECHECKS) {
+	const unbounded = err.reason === 'preserved-worker-unavailable';
+	if (!unbounded && attempt >= MAX_ELIGIBILITY_RECHECKS) {
 		logger.error(
 			`Phase failed - ${phaseLabel(trigger.phase)} — no eligible worker after ${attempt} re-checks`,
 			{ projectId, phase: trigger.phase, taskId: trigger.taskId, reason: err.reason, error },
 		);
 		return undefined;
 	}
-	logger.info(`Phase deferred - ${phaseLabel(trigger.phase)} — waiting for an eligible worker`, {
-		projectId,
-		phase: trigger.phase,
-		taskId: trigger.taskId,
-		attempt,
-		retryDelayMs: ELIGIBILITY_RECHECK_INTERVAL_MS,
-		reason: err.reason,
-	});
+	logger.info(
+		unbounded
+			? `Phase deferred - ${phaseLabel(trigger.phase)} — waiting for the machine holding its preserved checkout`
+			: `Phase deferred - ${phaseLabel(trigger.phase)} — waiting for an eligible worker`,
+		{
+			projectId,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			attempt,
+			retryDelayMs: ELIGIBILITY_RECHECK_INTERVAL_MS,
+			reason: err.reason,
+			unbounded,
+			// The message, not only the category — it is what names the machine.
+			detail: err.message,
+		},
+	);
 	return {
 		status: 'phase-deferred',
 		phase: trigger.phase,
@@ -810,6 +840,7 @@ function deferWorkerIneligible(
 		attempt,
 		resumable: false,
 		workerEligibilityRecheck: true,
+		preservedWorkerWait: unbounded,
 		// The gate refused before anything ran, so preserve board dispatch intent
 		// exactly as the dependency gate does — the re-check must re-enter the same
 		// phase even though the card never moved.
@@ -870,6 +901,10 @@ function deferralWaitReason(
 	outcome: Extract<JobOutcome, { status: 'phase-deferred' }>,
 ): DispatchWaitReason {
 	if (outcome.dependencyRecheck) return 'recheck';
+	// Checked first: a preserved-checkout wait is an eligibility re-check too, but it
+	// is the one with no budget, and the dispatch row is where an operator sees the
+	// difference between "no capable worker" and "waiting for one specific machine".
+	if (outcome.preservedWorkerWait) return 'preserved-worker';
 	if (outcome.workerEligibilityRecheck) return 'worker-eligibility';
 	return waitReasonForDeferral(outcome.failureKind);
 }
@@ -917,6 +952,10 @@ async function settleDispatchRetry(
 		availableAt: new Date(Date.now() + outcome.retryDelayMs),
 		waitReason: deferralWaitReason(outcome),
 		attempt: deferralAttempt(outcome, next),
+		// The reason in full, not just its category (issue #567): a gate refusal defers
+		// before any run row exists, so the dispatch row is where its message — which
+		// names the machine a pinned continuation is waiting for — has to live.
+		lastError: outcome.reason,
 		runId: outcome.runId,
 	});
 	if (!updated) {
@@ -2000,6 +2039,12 @@ async function finalizeFailedRun(
 			},
 			agent,
 		);
+		// Every deferral that hands its retry a checkout to adopt records *where* that
+		// checkout is (issue #567), so the continuation is offered only to that machine
+		// instead of being started over on whichever worker is free.
+		if (outcome.resumable || outcome.checkpoint || outcome.resumeDelivery) {
+			await recordPreservedWorker(runId);
+		}
 	} else if (outcome.status === 'phase-failed') {
 		let recoveryVal: any = null;
 		let sessionToRetain: string | null = null;
@@ -2063,6 +2108,27 @@ async function finalizeFailedRun(
 			},
 			agent,
 		);
+		// A cancellation that kept the checkout for its session leaves the same
+		// machine-local state a deferral does, so it pins the same way (issue #567).
+		if (recoveryVal?.state === 'preserved') await recordPreservedWorker(runId);
+	}
+}
+
+/**
+ * Record the machine holding the checkout this settle preserved (issue #567).
+ * Best-effort, exactly like {@link finalizeRun}: run tracking must never fail a
+ * settled pipeline run, and a missing pin only costs the *next* continuation its
+ * routing guarantee rather than corrupting anything.
+ */
+async function recordPreservedWorker(runId: string | undefined): Promise<void> {
+	if (!runId) return;
+	try {
+		await recordRunPreservedWorker(runId);
+	} catch (err) {
+		logger.error('Failed to record the worker holding the preserved checkout (continuing)', {
+			runId,
+			error: describeError(err),
+		});
 	}
 }
 
@@ -2729,6 +2795,51 @@ async function handlePhaseFailure(
 }
 
 /**
+ * The machine this dispatch must run on because it holds the run's preserved
+ * checkout (issue #567), or `undefined` when this dispatch is not a continuation
+ * or the run recorded no machine.
+ *
+ * Two conditions, both required: the payload means to adopt a preserved checkout
+ * ({@link jobContinuesPreservedCheckout}), and the run row records where that
+ * checkout is (`recovery.preservedWorkerId`). A run with no recorded machine —
+ * every row settled before this existed, and every unfederated run — resolves no
+ * pin and routes exactly as it did before, so the fix never wedges history it
+ * cannot place.
+ *
+ * **Fails closed on an unreadable run row.** Dispatching a continuation without
+ * its pin is the defect itself, so an unreadable row refuses the dispatch rather
+ * than routing it unpinned — as the roster read does, and on the same *bounded*
+ * `worker-unavailable` budget, because a DB that never comes back must not hold a
+ * run in an unbounded wait. The display name is the one part allowed to fail
+ * softly: it only shapes the message, and the id is a usable fallback.
+ */
+async function resolvePreservedWorkerPin(
+	job: SwarmJob,
+): Promise<{ id: string; name?: string } | undefined> {
+	if (!job.runId || !jobContinuesPreservedCheckout(job)) return undefined;
+	let workerId: string | null | undefined;
+	try {
+		workerId = (await getRunByIdFromDb(job.runId))?.recovery?.preservedWorkerId;
+	} catch (err) {
+		throw new WorkerIneligibleError(
+			'worker-unavailable',
+			`Could not read run '${job.runId}' to find the machine holding its preserved checkout, and a continuation must not be dispatched without it: ${describeError(err)}`,
+		);
+	}
+	if (!workerId) return undefined;
+	try {
+		return { id: workerId, name: (await getWorker(workerId))?.displayName };
+	} catch (err) {
+		logger.warn('Preserved-worker pin: name lookup failed; naming the machine by id', {
+			runId: job.runId,
+			workerId,
+			error: describeError(err),
+		});
+		return { id: workerId };
+	}
+}
+
+/**
  * Run the federated eligibility gate for this dispatch (issue #339) and return
  * the selected target, or `undefined` when the project is not federated (no
  * enrolled workers — the local worker runs it, exactly as before).
@@ -2762,6 +2873,7 @@ async function gateDispatch(
 	const phaseConfig = phaseAgentConfig(project, trigger.phase, implementationUnplanned);
 	// PR-driven phases carry no board item, so they take the unassigned path.
 	const workItem = 'workItem' in trigger ? trigger.workItem : undefined;
+	const preservedWorker = await resolvePreservedWorkerPin(job);
 	let decision: GateDecision;
 	try {
 		decision = await evaluateDispatchEligibility(
@@ -2780,6 +2892,9 @@ async function gateDispatch(
 				// its `type`, to resolve the identity link) — an unassigned item takes
 				// the unassigned path without one being constructed.
 				pm: workItem?.assignees.length ? requireProjectPMProvider(project) : undefined,
+				// The machine holding this continuation's preserved checkout, when there
+				// is one (issue #567) — the hardest narrowing the gate applies.
+				preservedWorker,
 			},
 			{
 				...gateOptions,
@@ -2816,6 +2931,7 @@ async function gateDispatch(
 		model: selection.target.model,
 		targetIndex: selection.targetIndex,
 		unavailable: selection.skippedClis,
+		pinnedToPreservedWorker: selection.pinnedToPreservedWorker,
 	});
 	return selection;
 }
@@ -2830,9 +2946,18 @@ async function bindSelectedWorker(
 	selection: DispatchSelection,
 	executionIdentity: WorkerExecutionIdentity | undefined,
 ): Promise<void> {
+	// A dispatch pinned to the machine holding its preserved checkout (issue #567)
+	// reports every "that worker isn't taking it" outcome as the pin's own verdict, so
+	// a claim lost between selection and bind keeps the unbounded wait instead of
+	// falling back onto a budget that would eventually fail the run.
+	const unavailableReason: DispatchIneligibilityReason = selection.pinnedToPreservedWorker
+		? 'preserved-worker-unavailable'
+		: selection.assignedUserId
+			? 'assignee-worker-unavailable'
+			: 'worker-unavailable';
 	if (!executionIdentity) {
 		throw new WorkerIneligibleError(
-			selection.assignedUserId ? 'assignee-worker-unavailable' : 'worker-unavailable',
+			unavailableReason,
 			`Worker '${selection.workerName}' was selected, but this process has no authenticated SWARM_WORKER_CREDENTIAL and may not execute that worker's dispatch. Waiting for the selected worker host.`,
 		);
 	}
@@ -2849,18 +2974,15 @@ async function bindSelectedWorker(
 	});
 	if (claim.claimed) return;
 
-	const assignedUnavailable = selection.assignedUserId
-		? 'assignee-worker-unavailable'
-		: 'worker-unavailable';
 	switch (claim.reason) {
 		case 'wrong-worker-host':
 			throw new WorkerIneligibleError(
-				assignedUnavailable,
+				unavailableReason,
 				`Worker '${selection.workerName}' was selected, but this queue job was claimed by a different authenticated worker host. Waiting for the selected worker host; cross-worker execution is forbidden.`,
 			);
 		case 'worker-unavailable':
 			throw new WorkerIneligibleError(
-				assignedUnavailable,
+				unavailableReason,
 				`Worker '${selection.workerName}' lost its live session or available capacity before execution could be claimed. Waiting and re-checking eligibility.`,
 			);
 		case 'project-capacity':
@@ -2877,7 +2999,7 @@ async function bindSelectedWorker(
 			);
 		case 'not-claimable':
 			throw new WorkerIneligibleError(
-				assignedUnavailable,
+				unavailableReason,
 				'The durable dispatch changed state before its selected-worker claim could be persisted. Re-checking before retry.',
 			);
 	}

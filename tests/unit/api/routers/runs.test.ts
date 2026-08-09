@@ -804,6 +804,7 @@ describe('runsRouter', () => {
 			expect(result).toEqual({
 				...run,
 				attribution: null,
+				preservedWorker: null,
 				maxContinuations: null,
 				pendingRequest: null,
 			});
@@ -1039,6 +1040,60 @@ describe('runsRouter', () => {
 				expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
 			});
 
+			it('reports the machine holding a preserved checkout, flagged as waiting on the pin', async () => {
+				// Issue #567: the run says which machine it is waiting for, to every viewer,
+				// for as long as the unbounded wait lasts.
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'checkpointed', recovery: { preservedWorkerId: 'w-1' } }),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'retry-scheduled', waitReason: 'preserved-worker' }),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toEqual({
+					state: 'preserved',
+					workerId: 'w-1',
+					workerName: 'm3_pro_tp',
+					waiting: true,
+				});
+			});
+
+			it('does not report a pinned run as waiting when the pin is not what blocks it', async () => {
+				// An ordinary rate-limit deferral also preserves its checkout and records a
+				// machine; its retry is on a timer, so the "never expires" copy must not fire.
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'deferred', recovery: { preservedWorkerId: 'w-1' } }),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'retry-scheduled', waitReason: 'rate-limit' }),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toMatchObject({ waiting: false });
+			});
+
+			it('reports an abandoned machine as history, without consulting the queue', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'completed', recovery: { abandonedWorkerId: 'w-1' } }),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toEqual({
+					state: 'abandoned',
+					workerId: 'w-1',
+					workerName: 'm3_pro_tp',
+					waiting: false,
+				});
+				expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
+			});
+
 			it('reports null for a completed run without consulting the cancellation marker', async () => {
 				// The settle is what clears the pending state, so a stale marker left on a
 				// finished run must never keep the UI waiting.
@@ -1105,6 +1160,7 @@ describe('runsRouter', () => {
 				await expect(caller.getById({ id: 'run-1' })).resolves.toEqual({
 					...run,
 					attribution: null,
+					preservedWorker: null,
 					maxContinuations: null,
 					pendingRequest: null,
 				});
@@ -1724,6 +1780,7 @@ describe('runsRouter', () => {
 			worktree: { outcome: 'removed' as const },
 			worktreeIntent: 'reclaim' as const,
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-2',
 		};
 
@@ -2367,6 +2424,7 @@ describe('runsRouter', () => {
 				await expect(ordinary.getById({ id: 'run-1' })).resolves.toEqual({
 					...run,
 					attribution: null,
+					preservedWorker: null,
 					maxContinuations: null,
 					pendingRequest: null,
 				});

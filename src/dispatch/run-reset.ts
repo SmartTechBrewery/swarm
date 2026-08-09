@@ -131,6 +131,14 @@ export interface ResetRunResult {
 	 */
 	worktreeIntent: 'reclaim' | 'discard';
 	recoveryCleared: boolean;
+	/**
+	 * The machine whose preserved checkout this reset gave up (issue #567), or `null`
+	 * when the run was pinned to none. Reset is the operator's deliberate "abandon the
+	 * preserved work and start over anywhere" action, and it is the *only* thing that
+	 * ends the pinned wait — so the report says plainly which machine's work was
+	 * discarded, and the run keeps that as `recovery.abandonedWorkerId`.
+	 */
+	abandonedPreservedWorkerId: string | null;
 	/** The dispatch the phase was re-dispatched on. */
 	dispatchId: string;
 }
@@ -247,6 +255,13 @@ export async function resetRun(
 	// Always cleared, even when the checkout was retained: the run is restarting,
 	// and the fresh attempt's provisioning gate re-records a blocked reason if the
 	// collision survives.
+	//
+	// This is also what releases the preserved-checkout pin (issue #567) — and note
+	// that nothing above needed the pinned machine to participate: the dispatch is
+	// cancelled control-plane side and the local checkout reconciliation is a no-op
+	// for a checkout that lives on another host. That is deliberate, since the whole
+	// point of the escape hatch is to work while that machine is unreachable.
+	const abandonedPreservedWorkerId = run.recovery?.preservedWorkerId ?? null;
 	await clearRunRecovery(run.id);
 
 	// A forced reset carries its discard intent to whichever worker holds the
@@ -297,6 +312,7 @@ export async function resetRun(
 		dispatch,
 		worktree: worktree.outcome,
 		worktreeIntent,
+		abandonedPreservedWorkerId,
 		dispatchId,
 	});
 
@@ -308,6 +324,7 @@ export async function resetRun(
 		worktree,
 		worktreeIntent,
 		recoveryCleared: true,
+		abandonedPreservedWorkerId,
 		dispatchId,
 	};
 }

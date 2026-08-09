@@ -45,6 +45,7 @@ import {
 	FailureDiagnosisCallout,
 	ForceReReviewButton,
 	GitHubReferences,
+	PreservedWorkerCallout,
 	RecoveryCallout,
 	ResetRunButton,
 	ReviewCapCallout,
@@ -235,6 +236,75 @@ function makeRecoveryRun(recovery: RunRow['recovery'], overrides: Partial<RunRow
 		...overrides,
 	});
 }
+
+// The preserved-checkout pin's operator surface (issue #567). A pinned run waits
+// with no timeout, so this callout is the only thing separating "waiting for
+// m3_pro_tp" from "wedged" — its presence on the page is the thing worth pinning.
+describe('PreservedWorkerCallout (issue #567)', () => {
+	const pinned = (
+		overrides: Partial<NonNullable<RunRow['preservedWorker']>> = {},
+	): Partial<RunRow> => ({
+		preservedWorker: {
+			state: 'preserved',
+			workerId: 'w-1',
+			workerName: 'm3_pro_tp',
+			waiting: true,
+			...overrides,
+		},
+	});
+
+	it('renders nothing for a run with no recorded machine', () => {
+		const { container } = render(<PreservedWorkerCallout run={makeReviewRun()} />);
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('names the machine, the unbounded wait, and the way out while it is waiting', () => {
+		render(<PreservedWorkerCallout run={makeReviewRun({ status: 'checkpointed', ...pinned() })} />);
+
+		expect(screen.getByRole('heading', { name: /waiting for m3_pro_tp/i })).toBeDefined();
+		expect(screen.getByText(/does not time out/i)).toBeDefined();
+		expect(screen.getByText(/reset & restart/i)).toBeDefined();
+	});
+
+	it('states the machine without promising an unbounded wait when the pin is not what blocks it', () => {
+		render(
+			<PreservedWorkerCallout
+				run={makeReviewRun({ status: 'deferred', ...pinned({ waiting: false }) })}
+			/>,
+		);
+
+		expect(screen.getByRole('heading', { name: /preserved on m3_pro_tp/i })).toBeDefined();
+		expect(screen.queryByText(/does not time out/i)).toBeNull();
+	});
+
+	it('reports after the fact that a restart discarded the preserved work', () => {
+		render(
+			<PreservedWorkerCallout
+				run={makeReviewRun({
+					status: 'running',
+					...pinned({ state: 'abandoned', waiting: false }),
+				})}
+			/>,
+		);
+
+		expect(screen.getByRole('heading', { name: /preserved work was discarded/i })).toBeDefined();
+		expect(screen.getByText(/m3_pro_tp/)).toBeDefined();
+	});
+
+	it('is wired into the run detail header, not just exported', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader
+					run={makeReviewRun({ status: 'checkpointed', phase: 'implementation', ...pinned() })}
+					project={null}
+				/>
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getByRole('heading', { name: /waiting for m3_pro_tp/i })).toBeDefined();
+	});
+});
 
 describe('RecoveryCallout (issue #368)', () => {
 	it('renders nothing for an unrelated run with no recovery record', () => {
@@ -692,6 +762,7 @@ describe('ResetRunButton (issue #428)', () => {
 			worktree: { outcome: 'blocked', blockedReason: 'dirty' },
 			worktreeIntent: 'reclaim',
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -704,6 +775,43 @@ describe('ResetRunButton (issue #428)', () => {
 		});
 	});
 
+	it('names the machine whose preserved work the restart abandons (issue #567)', () => {
+		openConfirm(
+			makeReviewRun({
+				status: 'checkpointed',
+				phase: 'implementation',
+				preservedWorker: {
+					state: 'preserved',
+					workerId: 'w-1',
+					workerName: 'm3_pro_tp',
+					waiting: true,
+				},
+			}),
+		);
+
+		expect(screen.getByText(/work preserved on m3_pro_tp is abandoned/i)).toBeDefined();
+		// The escape hatch is offered precisely when that machine is unreachable, so the
+		// copy has to say it does not depend on it.
+		expect(screen.getByText(/whether or not m3_pro_tp is currently reachable/i)).toBeDefined();
+	});
+
+	it('warns about no machine for a run whose preserved work was already discarded', () => {
+		openConfirm(
+			makeReviewRun({
+				status: 'failed',
+				phase: 'implementation',
+				preservedWorker: {
+					state: 'abandoned',
+					workerId: 'w-1',
+					workerName: 'm3_pro_tp',
+					waiting: false,
+				},
+			}),
+		);
+
+		expect(screen.queryByText(/is abandoned/i)).toBeNull();
+	});
+
 	it('maps the discard opt-in to the force variant and warns it is unrecoverable', async () => {
 		resetMutate.mockResolvedValue({
 			runId: 'run-1',
@@ -713,6 +821,7 @@ describe('ResetRunButton (issue #428)', () => {
 			worktree: { outcome: 'removed', discarded: 'dirty' },
 			worktreeIntent: 'discard',
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -736,6 +845,7 @@ describe('ResetRunButton (issue #428)', () => {
 			worktree: { outcome: 'blocked', blockedReason: 'live-leased' },
 			worktreeIntent: 'reclaim',
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -774,6 +884,7 @@ describe('ResetRunButton (issue #428)', () => {
 			worktree: { outcome: 'removed' },
 			worktreeIntent: 'reclaim',
 			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 

@@ -470,6 +470,112 @@ describe('evaluateDispatchEligibility', () => {
 		});
 	});
 
+	// Issue #567. A continuation's state — a Tier 2 checkpoint, a resumable session,
+	// a delivery sidecar — is machine-local, so routing it anywhere but the machine
+	// that holds it silently redoes the work. These pin the narrowing itself; the
+	// wait it produces is unbounded by `deferWorkerIneligible`.
+	describe('preserved-checkout pin', () => {
+		it('routes a continuation only to the machine holding its checkout', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-free'),
+				makeCandidate('w-preserved'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ preservedWorker: { id: 'w-preserved', name: 'm3_pro_tp' } }),
+			);
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-preserved', pinnedToPreservedWorker: true },
+			});
+		});
+
+		it('waits for the pinned machine rather than taking a free one, naming it', async () => {
+			// The observed failure: the pinned machine is busy and another worker is
+			// idle and eligible. Every other worker is irrelevant — the state is not
+			// on them — so this must refuse rather than select.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-free'),
+				makeCandidate('w-preserved', { activeRuns: 1 }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ preservedWorker: { id: 'w-preserved', name: 'm3_pro_tp' } }),
+			);
+
+			expect(decision).toMatchObject({
+				status: 'ineligible',
+				reason: 'preserved-worker-unavailable',
+			});
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			expect(decision.message).toContain('m3_pro_tp');
+			expect(decision.message).toContain('Reset & restart');
+		});
+
+		it('waits for a pinned machine that is no longer an enrolled candidate at all', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-free')]);
+
+			expect(
+				await evaluateDispatchEligibility(gateInput({ preservedWorker: { id: 'w-gone' } })),
+			).toMatchObject({ status: 'ineligible', reason: 'preserved-worker-unavailable' });
+		});
+
+		it('names the machine by id when its display name could not be resolved', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-free')]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ preservedWorker: { id: 'w-gone' } }),
+			);
+
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			expect(decision.message).toContain('w-gone');
+		});
+
+		it('keeps a structural refusal from the pinned machine actionable and its own', async () => {
+			// Only "busy or offline" becomes the unbounded wait. Revoked consent names
+			// something an operator must fix and will not resolve on its own, so it
+			// keeps its own reason — and therefore its own bounded budget.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-preserved', { enrollment: { sharingConsent: false } }),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(gateInput({ preservedWorker: { id: 'w-preserved' } })),
+			).toMatchObject({ status: 'ineligible', reason: 'missing-consent' });
+		});
+
+		it('outranks assignee affinity when the two disagree', async () => {
+			// The item was reassigned after the checkout was preserved. Intersecting the
+			// two narrowings would wait forever for a machine that cannot hold the
+			// state; the preserved machine is the only one that can continue this run.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-preserved', { ownerUserId: BOB }),
+				makeCandidate('w-assignee', { ownerUserId: ALICE }),
+			]);
+			resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({
+						workItem: ASSIGNED_ITEM,
+						pm: PM,
+						preservedWorker: { id: 'w-preserved' },
+					}),
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-preserved' } });
+		});
+
+		it('leaves an unpinned dispatch routing exactly as before', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-1')]);
+
+			expect(await evaluateDispatchEligibility(gateInput())).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-1', pinnedToPreservedWorker: false },
+			});
+		});
+	});
+
 	describe('ordered model targets (issues #345/#346)', () => {
 		it('prefers a higher-priority target a worker can run over a free worker on a lower one', async () => {
 			// The addendum's case: a free claude-only worker must not win the
