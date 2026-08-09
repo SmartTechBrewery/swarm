@@ -15,6 +15,7 @@ function makeReport(overrides: Partial<ResetRunReport> = {}): ResetRunReport {
 		dispatch: 'cancelled',
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
+		worktreeIntent: 'reclaim',
 		recoveryCleared: true,
 		dispatchId: 'dispatch-9',
 		...overrides,
@@ -132,6 +133,7 @@ describe('describeResetResult', () => {
 			'Dispatch: the active dispatch was cancelled.',
 			'Cancellation flag: cleared, so the fresh attempt is not killed at startup.',
 			'Checkout: removed and its lease released.',
+			'Restart intent: the worker holding the checkout reclaims it only if it is safe to; dirty or unpushed work is retained.',
 			'Recovery record: cleared.',
 			'Restarted: re-dispatched from scratch as dispatch dispatch-9.',
 		]);
@@ -155,9 +157,23 @@ describe('describeResetResult', () => {
 		);
 	});
 
-	it('reports an absent checkout', () => {
+	// Issue #592: "nothing to remove" was the reset's whole answer even when the
+	// checkout was alive on another worker — the exact case the operator is resetting.
+	it('says who settles a checkout the control-plane host cannot see', () => {
 		const lines = describeResetResult(makeReport({ worktree: { outcome: 'absent' } }));
-		expect(lines).toContain('Checkout: none on disk — nothing to remove.');
+		expect(lines.some((line) => line.includes('nothing to remove'))).toBe(false);
+		expect(lines).toContain(
+			'Checkout: none on this host — one held by another worker is settled by that worker when it provisions the restart.',
+		);
+	});
+
+	it('names the delegated intent of a forced reset (issue #592)', () => {
+		const lines = describeResetResult(
+			makeReport({ forced: true, worktreeIntent: 'discard', worktree: { outcome: 'absent' } }),
+		);
+		expect(lines).toContain(
+			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
+		);
 	});
 
 	it('reports a reclaimed stale lease when the checkout was removed', () => {

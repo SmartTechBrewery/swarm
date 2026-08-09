@@ -272,6 +272,28 @@ describe('deriveRetryJobPayload', () => {
 
 		expect(next.recoveryMode).toBe('resume');
 	});
+
+	it("carries an operator-selected 'fresh' forward too", () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ recoveryMode: 'fresh', runId: 'run-1' }),
+			{ phase: 'review', runId: 'run-1', resumable: false },
+		);
+
+		expect(next.recoveryMode).toBe('fresh');
+	});
+
+	// Issue #592: `'discard'` is one operator action against one checkout. Carried
+	// forward, it would ride every later automatic deferral of the same run and
+	// destroy the checkout that deferral had just preserved for a resume.
+	it("drops a one-shot 'discard' so a later deferral cannot re-destroy the checkout", () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ recoveryMode: 'discard', runId: 'run-1' }),
+			{ phase: 'implementation', runId: 'run-1', resumable: true },
+		);
+
+		expect(next.recoveryMode).toBeUndefined();
+		expect(next.resumeSession).toBe(true);
+	});
 });
 
 describe('deriveCapacityPendingPayload', () => {
@@ -363,5 +385,48 @@ describe('reconstructRetryJob', () => {
 		expect(job.resumeSession).toBeUndefined();
 		expect(job.agentSessionId).toBeDefined();
 		expect(job.agentSessionId).not.toBe('11111111-1111-4111-8111-111111111111');
+	});
+
+	it("builds the forced reset's discard dispatch when the mode is passed explicitly", () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ resumeSession: true }),
+			'run-4',
+			'implementation',
+			undefined,
+			undefined,
+			undefined,
+			true,
+			'discard',
+		);
+
+		expect(job.recoveryMode).toBe('discard');
+		expect(job.resumeSession).toBeUndefined();
+	});
+
+	// Issue #592: the forced reset's payload is persisted onto the run row when a
+	// worker claims it, so "Retry now" — which passes no mode for an ordinary failed
+	// run — would replay a destructive intent from an action with no force opt-in.
+	it("never inherits a stored 'discard' when the caller asks for no recovery mode", () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ recoveryMode: 'discard' }),
+			'run-5',
+			'implementation',
+			undefined,
+			undefined,
+			undefined,
+			true,
+		);
+
+		expect(job.recoveryMode).toBeUndefined();
+	});
+
+	it("still inherits a stored 'fresh', which cannot destroy protected work", () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ recoveryMode: 'fresh' }),
+			'run-6',
+			'implementation',
+		);
+
+		expect(job.recoveryMode).toBe('fresh');
 	});
 });

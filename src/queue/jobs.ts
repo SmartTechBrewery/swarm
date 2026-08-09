@@ -36,11 +36,21 @@ export const QUEUE_NAME = 'swarm-jobs';
  * - `checkpoint` — Tier 2. Adopt the checkout and continue from the checkpoint
  *   file the stopped run left in it, on a **fresh** session with no resume id, so
  *   the continuation may run on a different CLI than the deferred run did.
+ * - `discard` — the operator's explicit `force` reset (issue #592): remove the
+ *   preserved checkout **even when it holds uncommitted changes or unpushed
+ *   commits**, then provision fresh. It is the only mode allowed to destroy
+ *   protected work, and the only way a `force` reset reaches a checkout that
+ *   lives on a *different* worker than the control plane — the reset's own local
+ *   teardown can only ever touch the control-plane host's filesystem, so the
+ *   intent rides the replacement dispatch to whichever worker actually holds it.
+ *   It is **one-shot**: `deriveRetryJobPayload` (`../dispatch/retry-payload.ts`)
+ *   drops it from every derived retry, so a later automatic deferral of the same
+ *   run cannot destroy a checkout that deferral had just preserved.
  *
  * Lives here because the job payload is the contract that carries the value; the
  * pipeline imports the type rather than restating the union.
  */
-export const RecoveryModeSchema = z.enum(['resume', 'fresh', 'checkpoint']);
+export const RecoveryModeSchema = z.enum(['resume', 'fresh', 'checkpoint', 'discard']);
 export type RecoveryMode = z.infer<typeof RecoveryModeSchema>;
 
 /**

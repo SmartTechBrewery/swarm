@@ -158,9 +158,11 @@ from being cleaned up. The prompt tells the agent not to `git add` it either.
 ### Continuing from one — `recoveryMode: 'checkpoint'`
 
 A continuation is the third value of the recovery mode a run carries
-(`RecoveryModeSchema`, `src/queue/jobs.ts`), alongside Tier 1's `'resume'` and the
-start-over `'fresh'`. **Tier 1 still wins whenever a session id is resumable**: `'checkpoint'`
-is only for the cases it cannot serve (§ "When Tier 2 takes over").
+(`RecoveryModeSchema`, `src/queue/jobs.ts`), alongside Tier 1's `'resume'`, the
+start-over `'fresh'`, and — since issue #592 — `'discard'`, the forced-reset intent that
+removes a wedged checkout on whichever worker holds it. **Tier 1 still wins whenever a
+session id is resumable**: `'checkpoint'` is only for the cases it cannot serve
+(§ "When Tier 2 takes over").
 
 The recovery gate (`executeRecoveryGate`, `src/pipeline/resume.ts`) adopts the preserved
 checkout for a continuation only after `validateCheckpointForContinuation`
