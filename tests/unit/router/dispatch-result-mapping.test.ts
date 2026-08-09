@@ -245,3 +245,115 @@ describe('adaptResultToPhaseRun', () => {
 		}
 	});
 });
+
+/**
+ * The seam asserted against itself (issue #596): the frames come from the worker's own
+ * `deferrableOrFailedResult`, not a hand-built fixture, so "the worker sends it" and
+ * "the control plane keeps it" are checked against each other rather than a guess.
+ */
+describe('adaptResultToPhaseRun exit metadata', () => {
+	const ASSIGNMENT = () =>
+		buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' }));
+
+	/** The stand-in `adaptResultToPhaseRun` rebuilt, for a frame it turns into a throw. */
+	function thrownAgent(result: TaskExecutionResult): AgentRunError {
+		try {
+			adaptResultToPhaseRun(result, SELECTION);
+		} catch (err) {
+			expect(err).toBeInstanceOf(AgentRunError);
+			return err as AgentRunError;
+		}
+		throw new Error('expected a throw');
+	}
+
+	it('carries a timeout deferral’s real metadata onto the rebuilt error', () => {
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				'Implementation agent (claude) exited with code 143 (timed out)',
+				{ kind: 'timeout' },
+				{
+					cli: 'claude',
+					exitCode: 143,
+					signal: 'SIGTERM',
+					stdout: '',
+					stderr: '',
+					durationMs: 1_806_000,
+					timedOut: true,
+					aborted: false,
+					outputTruncated: false,
+				},
+			),
+			ASSIGNMENT(),
+		);
+
+		const err = thrownAgent(frame);
+		expect(err.failure.kind).toBe('timeout');
+		expect(err.agent).toMatchObject({
+			exitCode: 143,
+			signal: 'SIGTERM',
+			timedOut: true,
+			durationMs: 1_806_000,
+		});
+	});
+
+	// An older worker omits the four fields entirely. Nothing may be invented in their
+	// place — `exitCode` stays null and the two optional fields stay unset, so the settle
+	// leaves the columns alone — and `exitCode !== 0` still keeps the timeout deferrable.
+	it('leaves a metadata-less deferral frame unknown, and still deferrable', () => {
+		const err = thrownAgent(base({ status: 'deferred', failureKind: 'timeout', reason: 'stop' }));
+
+		expect(err.agent?.exitCode).toBeNull();
+		expect(err.agent?.timedOut).toBeUndefined();
+		expect(err.agent?.durationMs).toBeUndefined();
+		expect(err.agent?.exitCode).not.toBe(0);
+	});
+
+	// A terminal `failed` used to throw a plain `Error`, so `finalizeFailedRun` — which
+	// reads the columns off `AgentRunError.agent` — recorded nothing at all.
+	it('rebuilds a terminal failed frame as an inert AgentRunError carrying its metadata', () => {
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				'Review agent (claude) exited with code 1 (authentication failed)',
+				{ kind: 'auth' },
+				{
+					cli: 'claude',
+					exitCode: 1,
+					signal: null,
+					stdout: '',
+					stderr: '',
+					durationMs: 3_400,
+					timedOut: false,
+					aborted: false,
+					outputTruncated: false,
+				},
+			),
+			ASSIGNMENT(),
+		);
+		expect(frame.status).toBe('failed');
+
+		const err = thrownAgent(frame);
+		// `error`, not the frame's own `auth`: the worker already applied the
+		// terminal/deferrable split, and re-deriving a kind here would re-enter the
+		// shared deferral rule and retry a run the worker settled for good.
+		expect(err.failure.kind).toBe('error');
+		expect(err.message).toBe('Review agent (claude) exited with code 1 (authentication failed)');
+		expect(err.agent).toMatchObject({ exitCode: 1, timedOut: false, durationMs: 3_400 });
+	});
+
+	it('records nothing for a terminal failure that ran no agent', () => {
+		const err = thrownAgent(base({ status: 'failed', error: 'worktree setup failed' }));
+
+		expect(err.agent?.exitCode).toBeNull();
+		expect(err.agent?.timedOut).toBeUndefined();
+		expect(err.agent?.durationMs).toBeUndefined();
+	});
+
+	it('still raises RunTerminatedError for a cancelled frame', () => {
+		expect(() =>
+			adaptResultToPhaseRun(
+				base({ status: 'failed', cancelled: true, error: 'Run cancelled by user' }),
+				SELECTION,
+			),
+		).toThrow(RunTerminatedError);
+	});
+});

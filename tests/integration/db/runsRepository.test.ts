@@ -231,6 +231,44 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			);
 		});
 
+		// The contract issue #596 rests on: unknown exit metadata is expressed by an
+		// *omitted* field, which leaves the column as-is (`exit_code`/`duration_ms` stay
+		// NULL) rather than writing the `1 / false / 0` placeholder that used to
+		// contradict the `error` the same settle wrote.
+		it('leaves the exit columns untouched when a settle reports no exit metadata', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '2f', phase: 'implementation' });
+
+			await completeRun(id, {
+				status: 'deferred',
+				error: 'Implementation agent (claude) exited with code 143 (timed out)',
+			});
+
+			const unreported = await getRunByIdFromDb(id);
+			expect(unreported?.exitCode).toBeNull();
+			expect(unreported?.durationMs).toBeNull();
+			// `timed_out` is NOT NULL DEFAULT false, so its "unknown" is the NULL pair above.
+			expect(unreported?.timedOut).toBe(false);
+
+			await completeRun(id, {
+				status: 'checkpointed',
+				exitCode: 143,
+				timedOut: true,
+				durationMs: 1_806_000,
+			});
+
+			const reported = await getRunByIdFromDb(id);
+			expect(reported?.exitCode).toBe(143);
+			expect(reported?.timedOut).toBe(true);
+			expect(reported?.durationMs).toBe(1_806_000);
+
+			// And a later settle that reports none leaves what was recorded alone.
+			await completeRun(id, { status: 'failed', error: 'boom' });
+			const kept = await getRunByIdFromDb(id);
+			expect(kept?.exitCode).toBe(143);
+			expect(kept?.timedOut).toBe(true);
+			expect(kept?.durationMs).toBe(1_806_000);
+		});
+
 		it('records a failed run with its error message', async () => {
 			const id = await createRun({ projectId: PROJECT_ID, taskId: '2', phase: 'planning' });
 

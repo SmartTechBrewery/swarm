@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AgentCliResult } from '../harness/agent-cli.js';
+import type { ReportedAgentResult } from '../harness/agent-cli.js';
 import type { AgentFailureKind } from '../harness/agent-failure.js';
 import type { ProposedScope } from '../pipeline/planning.js';
 
@@ -37,7 +37,7 @@ export type KnownFailureCondition = Exclude<
 
 export interface DiagnoseFailureInput {
 	failureKind?: AgentFailureKind;
-	agent?: AgentCliResult;
+	agent?: ReportedAgentResult;
 	planningScope?: ProposedScope;
 	knownCondition?: KnownFailureCondition;
 }
@@ -102,7 +102,7 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 	}
 }
 
-function progressOutputBytes(agent: AgentCliResult): number {
+function progressOutputBytes(agent: ReportedAgentResult): number {
 	const cleanStdout = agent.stdout.replace(RESPONSE_STALL_BANNER_RE, '');
 	const cleanStderr = agent.stderr.replace(RESPONSE_STALL_BANNER_RE, '');
 	return Buffer.byteLength(cleanStdout, 'utf8') + Buffer.byteLength(cleanStderr, 'utf8');
@@ -123,7 +123,9 @@ export function diagnoseFailure(input: DiagnoseFailureInput): FailureDiagnosis |
 	const hasScopeEvidence = (input.planningScope?.independentConcerns.length ?? 0) > 1;
 	const hasSubstantialProgress =
 		agent !== undefined &&
-		agent.durationMs >= MIN_SCOPE_STALL_DURATION_MS &&
+		// A stand-in whose frame never reported a duration (issue #596) is no evidence
+		// of substantial progress, so it must not support a scope claim.
+		(agent.durationMs ?? 0) >= MIN_SCOPE_STALL_DURATION_MS &&
 		progressOutputBytes(agent) >= MIN_SCOPE_STALL_OUTPUT_BYTES;
 
 	if (input.failureKind === 'stalled' && hasScopeEvidence && hasSubstantialProgress) {

@@ -64,7 +64,12 @@ import {
 } from '../dispatch/dispatcher.js';
 import { jobContinuesPreservedCheckout } from '../dispatch/preserved-worker.js';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
-import type { AgentCli, AgentCliResult, runAgentCli } from '../harness/agent-cli.js';
+import type {
+	AgentCli,
+	AgentCliResult,
+	ReportedAgentResult,
+	runAgentCli,
+} from '../harness/agent-cli.js';
 import {
 	type AgentFailure,
 	type AgentFailureKind,
@@ -1981,12 +1986,17 @@ async function tryCreateRun(
 async function finalizeRun(
 	runId: string | undefined,
 	input: CompleteRunInput,
-	agent?: AgentCliResult,
+	agent?: ReportedAgentResult,
 ): Promise<void> {
 	if (!runId) return;
 	try {
 		await completeRun(runId, input);
-		if (agent) await storeRunLogs(runId, agent.stdout, agent.stderr);
+		// Only when there is output to store: a control-plane stand-in carries empty
+		// stdout/stderr (the router ran no agent), and since issue #596 a *terminal*
+		// federated failure carries one too — writing it would blank the logs a live
+		// stream had already persisted for the run.
+		if (agent && (agent.stdout || agent.stderr))
+			await storeRunLogs(runId, agent.stdout, agent.stderr);
 	} catch (err) {
 		logger.error('Failed to finalize run row (continuing)', {
 			runId,
@@ -2132,8 +2142,17 @@ async function recordPreservedWorker(runId: string | undefined): Promise<void> {
 	}
 }
 
-/** The run's engine/exit/timing columns, pulled from a captured agent result. */
-function agentColumns(agent: AgentCliResult | undefined): Partial<CompleteRunInput> {
+/**
+ * The run's engine/exit/timing columns, pulled from a captured agent result — or from
+ * the stand-in a control-plane settle rebuilt out of a worker's terminal frame.
+ *
+ * A field that (possibly stand-in) result never learned is `undefined` here and is
+ * dropped by {@link completeRun}, leaving the column exactly as it was: unknown is
+ * expressed by `exit_code`/`duration_ms` staying NULL, so an older worker's
+ * metadata-less frame degrades to "unknown" rather than asserting "exit 1, 0 ms, did
+ * not time out" over the reason the same settle wrote into `error` (issue #596).
+ */
+function agentColumns(agent: ReportedAgentResult | undefined): Partial<CompleteRunInput> {
 	return {
 		engine: agent?.cli,
 		exitCode: agent?.exitCode,
