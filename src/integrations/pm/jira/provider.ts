@@ -1,13 +1,13 @@
 /**
  * JiraPMProvider — the concrete `PMProvider` (`src/pm/types.ts`) for Jira Cloud.
- * This phase lands the **board reads** (`getWorkItem`, `listWorkItems`,
- * `findWorkItemByUrlSuffix`, `findWorkItemForArtifact`,
- * `findWorkItemByDescriptionMarker`) and `discover`; the writes, the transition,
- * and the dependency gate are still explicit not-implemented stubs, and nothing
- * registers this provider yet — a provider registers only once no method of the
- * contract is a stub (ai/RULES.md §2 "Register when the contract is satisfied,
- * not when the folder appears", the sequencing GitLab's #295 and Linear's #491
- * both used).
+ * With this phase no contract method is a stub: the board reads and `discover`
+ * landed first, and the writes (`moveWorkItem`, `addComment`, `createWorkItem`,
+ * `updateWorkItem`, `addLabel`), the comment lookup, and the dependency gate
+ * (`listBlockers`/`addBlockedBy`) complete it. Nothing registers this provider
+ * yet — its ingress (router adapter, webhook, manifest) is a later phase, and a
+ * provider registers only once *all* of that exists (ai/RULES.md §2 "Register
+ * when the contract is satisfied, not when the folder appears", the sequencing
+ * GitLab's #295 and Linear's #491 both used).
  *
  * Every operation is REST v3 over `jiraRequest` (`./client.ts`), which picks the
  * basic-auth pair up off the async scope — credentials are never arguments, so
@@ -19,17 +19,25 @@
  * with and what a board webhook carries; a **state** is one of that project's
  * workflow statuses, mapped by status **id** (`./config-schema.ts`).
  *
- * Two Jira-specific costs are deliberate and visible rather than hidden:
+ * Three Jira-specific costs are deliberate and visible rather than hidden:
  * `taskRef` needs the issue's *remote links*, a second round trip per card, so it
- * is resolved only on the reads that answer with a single card; and Jira indexes
+ * is resolved only on the reads that answer with a single card; Jira indexes
  * nothing on a remote link's URL, so {@link JiraPMProvider.findWorkItemForArtifact}
- * is a capped scan rather than a lookup.
+ * is a capped scan rather than a lookup; and a status change is a **workflow
+ * transition**, not a field write, so {@link JiraPMProvider.moveWorkItem} resolves
+ * the transition that reaches the mapped status instead of assigning it.
  */
 
 import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
+import {
+	dedupeBlockers,
+	dependencyProse,
+	findDependencyReferences,
+} from '../../../pm/dependencies.js';
 import type {
 	ContainerDiscoveryResult,
+	CreateWorkItemInput,
 	DiscoveredContainer,
 	DiscoveredState,
 	ListWorkItemsFilter,
@@ -39,14 +47,15 @@ import type {
 	PMProvider,
 	PMType,
 	StateDiscoveryResult,
+	UpdateWorkItemPatch,
 	WorkItem,
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
 	WorkItemLabel,
 } from '../../../pm/types.js';
-import { adfToPlainText } from './adf.js';
-import { collectJiraPage, type JiraPage, jiraRequest, MAX_PAGES } from './client.js';
+import { adfToPlainText, textToAdf } from './adf.js';
+import { collectJiraPage, JiraApiError, type JiraPage, jiraRequest, MAX_PAGES } from './client.js';
 import { type JiraIntegrationConfig, requireJiraConfig } from './config-schema.js';
 import { withJiraProjectCredentials } from './credentials.js';
 import { requireStatusIdForStatusKey, resolveStatusKeyByStatusId } from './status-mapping.js';
@@ -78,6 +87,123 @@ const ARTIFACT_SCAN_LIMIT = 50;
 /** How many candidates that scan reads remote links for at once. */
 const ARTIFACT_SCAN_CONCURRENCY = 5;
 
+/**
+ * The `inward` description of Jira's built-in **Blocks** link type — the sentence
+ * fragment Jira renders as "<this issue> is blocked by <that issue>", and the
+ * signal {@link isBlockedByLinkType} matches a link type on. Matched on the
+ * description rather than an id because link-type ids are per-instance.
+ */
+const BLOCKED_BY_INWARD = 'is blocked by';
+
+/** The built-in link type's own name, the fallback when its descriptions were reworded. */
+const BLOCKS_LINK_TYPE_NAME = 'blocks';
+
+/**
+ * Jira's status **category** key for a finished status. A Jira status carries no
+ * open/closed boolean — every workflow status belongs to one of three categories
+ * (`new`, `indeterminate`, `done`), and only `done` means finished.
+ */
+const DONE_STATUS_CATEGORY = 'done';
+
+/**
+ * The issue type {@link JiraPMProvider.createWorkItem} prefers when the project
+ * offers it. Not a *mapping*: no config field names an issue type (issue #490's
+ * non-goal), the project's own types are read and a standard one is picked.
+ */
+const PREFERRED_ISSUE_TYPE = 'task';
+
+/** The fields a blocker is mapped from — its title and the status category behind `open`. */
+const BLOCKER_FIELDS = 'summary,status';
+
+/** One transition Jira offers out of an issue's *current* workflow status. */
+interface JiraTransition {
+	/** The transition's own id — what a transition POST names, never the status id. */
+	id?: string;
+	name?: string;
+	/** The status the issue lands in once the transition executes. */
+	to?: { id?: string; name?: string } | null;
+}
+
+/** `GET /rest/api/3/issue/{key}/transitions` — a bare object, not a page. */
+interface JiraTransitionsResponse {
+	transitions?: Array<JiraTransition | null> | null;
+}
+
+/** One Jira comment; `body` is an ADF document in REST v3, read through {@link adfToPlainText}. */
+interface JiraComment {
+	id?: string;
+	body?: unknown;
+}
+
+/**
+ * One page of `GET /rest/api/3/issue/{key}/comment`. Offset-paged like the rest of
+ * REST v3, but its array is `comments` rather than the usual `values`, so it is
+ * re-shaped into a {@link JiraPage} before {@link collectJiraPage} walks it.
+ */
+interface JiraCommentPage {
+	comments?: Array<JiraComment | null> | null;
+	startAt?: number | null;
+	maxResults?: number | null;
+	total?: number | null;
+}
+
+/** One issue type a project offers on create. `subtask` types cannot stand alone. */
+interface JiraIssueType {
+	id?: string;
+	name?: string;
+	subtask?: boolean;
+}
+
+/** The subset of `GET /rest/api/3/project/{key}` the create path reads. */
+interface JiraProjectDetail {
+	issueTypes?: Array<JiraIssueType | null> | null;
+}
+
+/** A link type's identity and its two direction descriptions. */
+interface JiraLinkType {
+	id?: string;
+	name?: string;
+	/** How the issue at the inward end relates ("is blocked by"). */
+	inward?: string;
+	/** How the issue at the outward end relates ("blocks"). */
+	outward?: string;
+}
+
+/** `GET /rest/api/3/issueLinkType` — every link type the site defines. */
+interface JiraIssueLinkTypesResponse {
+	issueLinkTypes?: Array<JiraLinkType | null> | null;
+}
+
+/**
+ * The other issue of one link, as `fields.issuelinks` embeds it: enough to report
+ * a blocker without a second read per link.
+ */
+interface JiraLinkedIssue {
+	key?: string;
+	fields?: {
+		summary?: string | null;
+		status?: { statusCategory?: { key?: string } | null } | null;
+	} | null;
+}
+
+/**
+ * One entry of `fields.issuelinks`. Exactly one of the two issue sides is present,
+ * and *which* one is the direction: an `inwardIssue` is reached by the type's
+ * `inward` description ("this issue is blocked by that one"), an `outwardIssue` by
+ * its `outward` one ("this issue blocks that one").
+ */
+interface JiraIssueLink {
+	type?: JiraLinkType | null;
+	inwardIssue?: JiraLinkedIssue | null;
+	outwardIssue?: JiraLinkedIssue | null;
+}
+
+/** What `POST /rest/api/3/issue` answers with — the new issue's key. */
+interface JiraCreatedIssue {
+	id?: string;
+	key?: string;
+}
+
 /** An Atlassian account as the issue reads select it. */
 interface JiraUser {
 	accountId?: string;
@@ -85,16 +211,22 @@ interface JiraUser {
 	emailAddress?: string | null;
 }
 
-/** The subset of `fields` {@link ISSUE_FIELDS} asks for. Every member is optional defensively. */
+/**
+ * The subset of `fields` a read asks for — {@link ISSUE_FIELDS} plus the two the
+ * narrower reads add (`issuelinks` for the dependency gate, `statusCategory` for a
+ * blocker's open state, which Jira nests inside `status` rather than exposing
+ * separately). Every member is optional defensively.
+ */
 interface JiraIssueFields {
 	summary?: string | null;
 	/** An ADF document in REST v3 — read through {@link adfToPlainText}, never as a string. */
 	description?: unknown;
-	status?: { id?: string; name?: string } | null;
+	status?: { id?: string; name?: string; statusCategory?: { key?: string } | null } | null;
 	labels?: Array<string | null> | null;
 	assignee?: JiraUser | null;
 	created?: string;
 	updated?: string;
+	issuelinks?: Array<JiraIssueLink | null> | null;
 }
 
 interface JiraIssue {
@@ -297,6 +429,90 @@ function normalizeContainers(projects: JiraProjectNode[], site: string): Discove
 	);
 }
 
+/** A link-type description, folded for comparison against Jira's own wording. */
+function normalizeLinkText(value: string | undefined): string {
+	return (value ?? '').trim().toLowerCase();
+}
+
+/**
+ * Whether a link type is the one that expresses "blocked by". Matched on its
+ * `inward` description first — that is the sentence Jira renders and the only
+ * thing that states the direction — and on the built-in name as a fallback for a
+ * site whose descriptions were reworded. Never on an id: link-type ids differ per
+ * instance.
+ */
+function isBlockedByLinkType(type: JiraLinkType | null | undefined): boolean {
+	return (
+		normalizeLinkText(type?.inward) === BLOCKED_BY_INWARD ||
+		normalizeLinkText(type?.name) === BLOCKS_LINK_TYPE_NAME
+	);
+}
+
+/**
+ * Map one linked/referenced issue onto a `WorkItemBlocker`.
+ *
+ * `reference` is the issue **key** (`SWARM-123`) rather than a number, because that
+ * is what a person searches Jira for and what the deferral comment has to name.
+ * `open` comes from the status **category**: Jira has no finished flag, and only
+ * the `done` category means finished, so a workflow status of any name outside it
+ * still gates dependent work.
+ */
+function toBlocker(
+	issue: JiraLinkedIssue & { key: string },
+	source: WorkItemBlocker['source'],
+	config: JiraIntegrationConfig,
+): WorkItemBlocker {
+	return {
+		id: issue.key,
+		reference: issue.key,
+		url: `${siteUrl(config)}/browse/${issue.key}`,
+		title: issue.fields?.summary ?? '',
+		open: issue.fields?.status?.statusCategory?.key !== DONE_STATUS_CATEGORY,
+		source,
+	};
+}
+
+/**
+ * A Jira label is a single token — the API rejects one containing whitespace with
+ * an opaque 400. Failing here instead names the constraint and the offending value.
+ * `pipeline.automationLabel` defaults to `swarm`, so this is a guard on operator
+ * config rather than a common path.
+ */
+function requireJiraLabel(name: string): string {
+	if (/\s/.test(name)) {
+		throw new Error(
+			`Jira label '${name}' contains whitespace — Jira labels are single tokens and cannot contain spaces`,
+		);
+	}
+	return name;
+}
+
+/**
+ * Whether an error is Jira refusing a link it already holds. Only a backstop:
+ * {@link JiraPMProvider.addBlockedBy} reads the existing links first, so this
+ * covers the window between that read and the write. The wording could not be
+ * confirmed against a live site, so — exactly as Linear's equivalent — anything it
+ * does not match is rethrown rather than swallowed.
+ */
+function isDuplicateLinkError(error: unknown): boolean {
+	return error instanceof Error && /duplicate|already (?:exists|linked)/i.test(error.message);
+}
+
+/** A status as an error message should name it: `'In Progress' (id 3)`. */
+function describeStatus(status: JiraIssueFields['status']): string {
+	if (!status?.id && !status?.name) return '<unknown>';
+	return `'${status.name ?? '<unnamed>'}' (id ${status.id ?? '?'})`;
+}
+
+/** Every transition Jira offers, as `"<id>:<name> → <target> (<target id>)"`, for an actionable error. */
+function describeTransitions(transitions: JiraTransition[]): string {
+	const described = transitions.map(
+		(transition) =>
+			`${transition.id}:${transition.name ?? '<unnamed>'} → ${transition.to?.name ?? '<unnamed>'} (id ${transition.to?.id ?? '?'})`,
+	);
+	return described.length > 0 ? described.join(', ') : '<none>';
+}
+
 /** Split `values` into consecutive groups of at most `size`. */
 function chunk<T>(values: T[], size: number): T[][] {
 	const groups: T[][] = [];
@@ -317,7 +533,7 @@ export class JiraPMProvider implements PMProvider {
 	// Jira models cross-issue prerequisites natively, as an issue link of type
 	// "Blocks", so this provider claims the dependency capability and callers keep
 	// the dependency gate rather than falling back to the human-readable comment
-	// guard. The two methods behind it land with the writes in phase 3/6.
+	// guard.
 	readonly supportsDependencies = true;
 
 	/**
@@ -465,40 +681,209 @@ export class JiraPMProvider implements PMProvider {
 		});
 	}
 
-	// The board writes, the transition, and the dependency gate land in phase 3/6.
-	// The wording below is the generic sentinel the PM conformance suite scans a
-	// registered provider's own source for, which is what keeps a stub from being
-	// registered as if it were real (ai/TESTING.md "Provider conformance").
-	async moveWorkItem(): Promise<void> {
-		throw new Error('moveWorkItem is not implemented for the Jira PM provider');
+	/**
+	 * Move a card by executing the **workflow transition** that lands it in the
+	 * mapped status — Jira does not let a status be assigned like a field.
+	 *
+	 * Because the move runs *through* the workflow, a target can be legitimately
+	 * unreachable from where the issue currently sits, and that is reported rather
+	 * than absorbed: Cascade's adapter logs a warning and returns, which leaves the
+	 * pipeline believing it reported progress while the board never moved. It also
+	 * does **not** fall back to matching a transition by name — the board mapping
+	 * stores status ids precisely so a rename cannot silently redirect a move.
+	 */
+	async moveWorkItem(id: string, status: string): Promise<void> {
+		// Resolve the canonical key before the write: a status the board mapping
+		// can't resolve is a config/logic error, not a value to send blindly — the
+		// same fail-loud contract `listWorkItems` and the other two providers'
+		// `moveWorkItem` keep (ai/CODING_STANDARDS.md "Error handling").
+		const targetStatusId = requireStatusIdForStatusKey(this.config, status);
+		await this.run(async () => {
+			// A card already in the target status has no transition *to* it, and
+			// re-requesting the status a card is already in is ordinary (`autoAdvance`
+			// re-asserts it), so the no-op is answered before the workflow is consulted.
+			const current = await this.fetchStatus(id);
+			if (current?.id === targetStatusId) {
+				logger.debug('pm: work item already in the requested status', { itemId: id, status });
+				return;
+			}
+			const transitions = await this.fetchTransitions(id);
+			const transition = transitions.find((candidate) => candidate.to?.id === targetStatusId);
+			if (!transition) {
+				throw new Error(
+					`Jira issue '${id}' cannot reach canonical status '${status}' (Jira status id ${targetStatusId}): ` +
+						`no transition out of its current status ${describeStatus(current)} targets it. ` +
+						`Jira offers: ${describeTransitions(transitions)}. ` +
+						"Fix the project's workflow or its statusOptions mapping.",
+				);
+			}
+			await jiraRequest<void>(`issue/${encodeURIComponent(id)}/transitions`, {
+				method: 'POST',
+				body: { transition: { id: transition.id } },
+			});
+			logger.debug('pm: moved work item', { itemId: id, status, transition: transition.id });
+		});
 	}
 
-	async addComment(): Promise<string> {
-		throw new Error('addComment is not implemented for the Jira PM provider');
+	async addComment(id: string, text: string): Promise<string> {
+		// Unlike GitHub Projects — whose board card has no comment thread, so the
+		// comment is redirected onto the backing Issue — a Jira issue *is* the card,
+		// and the comment lands natively on it. There is no backing artifact to
+		// resolve first, and no draft-item case that leaves nowhere to post.
+		return this.run(async () => {
+			const comment = await jiraRequest<JiraComment | undefined>(
+				`issue/${encodeURIComponent(id)}/comment`,
+				{ method: 'POST', body: { body: textToAdf(text) } },
+			);
+			if (!comment?.id) {
+				throw new Error(`Jira returned no comment id for the comment posted on issue '${id}'`);
+			}
+			return comment.id;
+		});
 	}
 
-	async findComment(): Promise<string | undefined> {
-		throw new Error('findComment is not implemented for the Jira PM provider');
+	async findComment(id: string, marker: string): Promise<string | undefined> {
+		return this.run(async () => {
+			// Every page, not just the first: an earlier delivery's marker can sit
+			// beyond page 1, and missing it would post a duplicate on a retry — the
+			// same reason the other two providers walk their whole thread. The body is
+			// an ADF document, so the match runs on its plain text, which is what keeps
+			// SWARM's `<!-- swarm-… -->` markers findable (`./adf.ts`).
+			const comments = await this.fetchAllComments(id);
+			return comments.find((comment) => comment.id && adfToPlainText(comment.body).includes(marker))
+				?.id;
+		});
 	}
 
-	async createWorkItem(): Promise<WorkItem> {
-		throw new Error('createWorkItem is not implemented for the Jira PM provider');
+	/**
+	 * Create a card in the requested status — three writes, because Jira requires an
+	 * `issuetype` on create and cannot create an issue *into* an arbitrary status:
+	 * create, transition, then read the card back so it maps exactly like one off a
+	 * board read (resolved `statusKey`, label shape).
+	 *
+	 * A failing transition **throws** rather than warning and returning the card
+	 * (Cascade warns): a child left in the workflow's initial status would never
+	 * start, whereas Planning's retry is idempotent through
+	 * {@link JiraPMProvider.findWorkItemByDescriptionMarker} — so a loud failure is
+	 * recoverable and a silent one is not. The already-created issue is not rolled
+	 * back; the retry adopts it.
+	 */
+	async createWorkItem(input: CreateWorkItemInput): Promise<WorkItem> {
+		// Both validations run before the issue exists, so a bad mapping or an
+		// unusable label fails without leaving a half-created card behind.
+		requireStatusIdForStatusKey(this.config, input.status);
+		const labels = (input.labels ?? []).map(requireJiraLabel);
+		const key = await this.run(async () => {
+			const issueTypeId = await this.resolveStandardIssueTypeId();
+			const created = await jiraRequest<JiraCreatedIssue | undefined>('issue', {
+				method: 'POST',
+				body: {
+					fields: {
+						project: { key: this.config.projectKey },
+						summary: input.title,
+						description: textToAdf(input.description),
+						issuetype: { id: issueTypeId },
+						// Jira labels are free-form and auto-create, so the names go straight
+						// on — there is no label object to resolve or create first, unlike
+						// GitHub's and Linear's.
+						...(labels.length > 0 ? { labels } : {}),
+					},
+				},
+			});
+			if (!created?.key) {
+				throw new Error(`Jira returned no issue key for the created issue '${input.title}'`);
+			}
+			logger.debug('pm: created work item', { itemId: created.key, status: input.status });
+			return created.key;
+		});
+		await this.moveWorkItem(key, input.status);
+		return this.getWorkItem(key);
 	}
 
-	async updateWorkItem(): Promise<void> {
-		throw new Error('updateWorkItem is not implemented for the Jira PM provider');
+	async updateWorkItem(id: string, patch: UpdateWorkItemPatch): Promise<void> {
+		// Nothing to write is not an empty write: a `PUT` with no fields would still
+		// touch the issue's `updated` timestamp for no reason.
+		if (patch.title === undefined && patch.description === undefined) return;
+		await this.run(async () => {
+			await jiraRequest<void>(`issue/${encodeURIComponent(id)}`, {
+				method: 'PUT',
+				body: {
+					fields: {
+						...(patch.title !== undefined ? { summary: patch.title } : {}),
+						...(patch.description !== undefined
+							? { description: textToAdf(patch.description) }
+							: {}),
+					},
+				},
+			});
+		});
+		logger.debug('pm: updated work item', { itemId: id });
 	}
 
-	async addLabel(): Promise<void> {
-		throw new Error('addLabel is not implemented for the Jira PM provider');
+	async addLabel(id: string, name: string): Promise<void> {
+		requireJiraLabel(name);
+		await this.run(async () => {
+			// Re-applying a label the issue already carries is contractually a no-op,
+			// so check before writing. Compared exactly, not case-insensitively: Jira
+			// labels are case-sensitive, so `swarm` and `Swarm` are two labels.
+			const issue = await jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(id)}`, {
+				query: { fields: 'labels' },
+			});
+			if ((issue?.fields?.labels ?? []).includes(name)) return;
+			// Jira's `update` verb is a set insert on the labels field. The alternative
+			// — read every label and write the whole list back through `fields.labels`
+			// (what Cascade does) — loses any label a concurrent writer added between
+			// that read and the write; this has no such window.
+			await jiraRequest<void>(`issue/${encodeURIComponent(id)}`, {
+				method: 'PUT',
+				body: { update: { labels: [{ add: name }] } },
+			});
+			logger.debug('pm: applied label', { itemId: id, label: name });
+		});
 	}
 
-	async listBlockers(): Promise<WorkItemBlocker[]> {
-		throw new Error('listBlockers is not implemented for the Jira PM provider');
+	async listBlockers(id: string): Promise<WorkItemBlocker[]> {
+		return this.run(async () => {
+			// Two sources, deduplicated by URL so a prerequisite that is both linked
+			// and written down is reported once: Jira's own "is blocked by" issue
+			// links, and the prerequisites the item names in prose.
+			const [native, mentioned] = await Promise.all([
+				this.fetchNativeBlockers(id),
+				this.fetchMentionedBlockers(id),
+			]);
+			return dedupeBlockers([...native, ...mentioned]);
+		});
 	}
 
-	async addBlockedBy(): Promise<void> {
-		throw new Error('addBlockedBy is not implemented for the Jira PM provider');
+	async addBlockedBy(id: string, blockerId: string): Promise<void> {
+		await this.run(async () => {
+			// Jira has no upsert for a link, so idempotence comes from reading the
+			// links it already holds — re-chaining a split's phases must not fail on a
+			// retry.
+			const existing = await this.fetchNativeBlockers(id);
+			if (existing.some((blocker) => blocker.id === blockerId)) return;
+			const linkType = await this.resolveBlockedByLinkType();
+			try {
+				// `outwardIssue` is the *from* side of the link and `inwardIssue` the to
+				// side, so this records "`blockerId` blocks `id`" — the same relationship
+				// {@link JiraPMProvider.fetchNativeBlockers} reads back off `id` as an
+				// `inwardIssue` entry.
+				await jiraRequest<void>('issueLink', {
+					method: 'POST',
+					body: {
+						type: { name: linkType },
+						inwardIssue: { key: id },
+						outwardIssue: { key: blockerId },
+					},
+				});
+			} catch (error) {
+				// A link recorded between the read above and this write: the pair is
+				// linked, which is exactly what the caller asked for.
+				if (!isDuplicateLinkError(error)) throw error;
+				return;
+			}
+			logger.debug('pm: linked blocked-by dependency', { itemId: id, blockerId });
+		});
 	}
 
 	async discover<C extends PMDiscoveryCapability>(
@@ -627,6 +1012,200 @@ export class JiraPMProvider implements PMProvider {
 			`issue/${encodeURIComponent(key)}/remotelink`,
 		);
 		return Array.isArray(links) ? links : [];
+	}
+
+	/**
+	 * The issue's current workflow status — the narrowest read there is, since the
+	 * transition lookup needs only this. Runs inside a credential scope (its callers do).
+	 */
+	private async fetchStatus(id: string): Promise<JiraIssueFields['status']> {
+		const issue = await jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(id)}`, {
+			query: { fields: 'status' },
+		});
+		return issue?.fields?.status;
+	}
+
+	/**
+	 * The transitions Jira offers out of the issue's current status, narrowed to the
+	 * ones that name both themselves and a target status — a transition missing
+	 * either can be neither matched nor executed. Runs inside a credential scope
+	 * (its callers do).
+	 */
+	private async fetchTransitions(id: string): Promise<JiraTransition[]> {
+		const response = await jiraRequest<JiraTransitionsResponse | undefined>(
+			`issue/${encodeURIComponent(id)}/transitions`,
+		);
+		return (response?.transitions ?? []).filter((transition): transition is JiraTransition =>
+			Boolean(transition?.id && transition.to?.id),
+		);
+	}
+
+	/**
+	 * One page of the issue's comment thread, re-shaped into the offset-paged
+	 * envelope {@link collectJiraPage} walks — the comment operation names its array
+	 * `comments` rather than `values`. Runs inside a credential scope (its callers do).
+	 */
+	private async fetchCommentPage(id: string, startAt: number): Promise<JiraPage<JiraComment>> {
+		const page = await jiraRequest<JiraCommentPage | undefined>(
+			`issue/${encodeURIComponent(id)}/comment`,
+			{ query: { startAt, maxResults: PAGE_SIZE } },
+		);
+		return { ...page, values: page?.comments ?? [] };
+	}
+
+	/** The whole comment thread. Runs inside a credential scope (its callers do). */
+	private async fetchAllComments(id: string): Promise<JiraComment[]> {
+		return collectJiraPage<JiraComment>((startAt) => this.fetchCommentPage(id, startAt));
+	}
+
+	/**
+	 * The issues Jira itself records as blocking this one.
+	 *
+	 * Direction is carried by *which side* of the link the entry names, not by the
+	 * link type: an entry with an `inwardIssue` is reached by the type's `inward`
+	 * description, so under the Blocks type it reads "this issue **is blocked by**
+	 * that one". An `outwardIssue` entry says the opposite ("this issue blocks that
+	 * one") and gates nothing here — so the test fixture carries both directions and
+	 * asserts which one comes back.
+	 *
+	 * Runs inside a credential scope (its callers do).
+	 */
+	private async fetchNativeBlockers(id: string): Promise<WorkItemBlocker[]> {
+		const links = await this.fetchIssueLinks(id);
+		return links
+			.filter(
+				(link): link is JiraIssueLink & { inwardIssue: JiraLinkedIssue & { key: string } } =>
+					isBlockedByLinkType(link.type) && Boolean(link.inwardIssue?.key),
+			)
+			.map((link) => toBlocker(link.inwardIssue, 'dependency', this.config));
+	}
+
+	/** One issue's links. Runs inside a credential scope (its callers do). */
+	private async fetchIssueLinks(id: string): Promise<JiraIssueLink[]> {
+		const issue = await jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(id)}`, {
+			query: { fields: 'issuelinks' },
+		});
+		return (issue?.fields?.issuelinks ?? []).filter((link): link is JiraIssueLink => Boolean(link));
+	}
+
+	/**
+	 * The prerequisites the item *names in prose* — its own description and its
+	 * **human** comments. The heuristic is the shared, provider-neutral one
+	 * (`dependencyProse` + `findDependencyReferences`, `src/pm/dependencies.ts`),
+	 * which also excludes SWARM's own comments so a published plan's "requires
+	 * #266" never becomes a blocker nobody declared (issue #431); this adapter only
+	 * resolves each reference to a live open/closed state.
+	 *
+	 * **Known limitation:** the shared heuristic recognises the numeric `#N` and
+	 * `/issues/N` forms, not Jira's own `SWARM-123` notation — widening it would
+	 * change GitHub's behaviour too, so it is out of scope here. A prerequisite
+	 * written only in Jira's own notation is therefore guarded by the native issue
+	 * link above, not by this scan. A bare `#N` is resolved as this project's own
+	 * issue `<projectKey>-N` and nowhere else, so a number naming some other
+	 * project's issue resolves to nothing rather than to the wrong card.
+	 *
+	 * Only the first page of comments is scanned, matching the other two providers:
+	 * a prose dependency buried past comment #100 is missed, but the native link and
+	 * the description remain the durable guards, and this check runs on every gated
+	 * dispatch.
+	 *
+	 * Runs inside a credential scope (its callers do).
+	 */
+	private async fetchMentionedBlockers(id: string): Promise<WorkItemBlocker[]> {
+		const [issue, comments] = await Promise.all([
+			jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(id)}`, {
+				query: { fields: 'description' },
+			}),
+			this.fetchCommentPage(id, 0),
+		]);
+		const prose = dependencyProse(
+			adfToPlainText(issue?.fields?.description),
+			(comments.values ?? []).map((comment) =>
+				comment ? adfToPlainText(comment.body) : undefined,
+			),
+		);
+		const keys = findDependencyReferences(prose)
+			.map((reference) => `${this.config.projectKey}-${reference}`)
+			.filter((key) => key !== id);
+		const resolved = await Promise.all(keys.map((key) => this.findBlockerByKey(key)));
+		return resolved.filter((blocker): blocker is WorkItemBlocker => blocker !== undefined);
+	}
+
+	/**
+	 * Resolve one referenced issue key to a blocker. A key that resolves to nothing
+	 * is skipped rather than raised: a typo'd number, or one naming a GitHub issue
+	 * rather than a Jira one, is not a gate — the same soft miss Linear's mention
+	 * lookup makes. Runs inside a credential scope (its callers do).
+	 */
+	private async findBlockerByKey(key: string): Promise<WorkItemBlocker | undefined> {
+		try {
+			const issue = await jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(key)}`, {
+				query: { fields: BLOCKER_FIELDS },
+			});
+			return issue?.key
+				? toBlocker({ ...issue, key: issue.key }, 'mention', this.config)
+				: undefined;
+		} catch (error) {
+			// Only "there is no such issue" is a miss; anything else (a permission
+			// failure, an outage) is a real error the gate must not swallow.
+			if (error instanceof JiraApiError && error.status === 404) return undefined;
+			throw error;
+		}
+	}
+
+	/**
+	 * The **name** of this site's "is blocked by" link type — what a link write
+	 * names it by. Resolved from the site rather than assumed to be the English
+	 * built-in `Blocks`, since link types are site data an administrator can rename
+	 * or delete. Runs inside a credential scope (its callers do).
+	 */
+	private async resolveBlockedByLinkType(): Promise<string> {
+		const response = await jiraRequest<JiraIssueLinkTypesResponse | undefined>('issueLinkType');
+		const types = (response?.issueLinkTypes ?? []).filter((type): type is JiraLinkType =>
+			Boolean(type?.name),
+		);
+		// The `inward` description states the direction, so it decides; the built-in
+		// name is only the fallback for a site that reworded its descriptions.
+		const match =
+			types.find((type) => normalizeLinkText(type.inward) === BLOCKED_BY_INWARD) ??
+			types.find((type) => isBlockedByLinkType(type));
+		if (!match?.name) {
+			throw new Error(
+				`Jira site '${siteUrl(this.config)}' defines no '${BLOCKED_BY_INWARD}' issue link type, so a ` +
+					`dependency cannot be recorded. It offers: ${types.map((type) => type.name).join(', ') || '<none>'}.`,
+			);
+		}
+		return match.name;
+	}
+
+	/**
+	 * The issue type a new card is created as. Jira requires one on create, and
+	 * SWARM's contract has no issue-type concept, so the project's *own* types are
+	 * read and a standard one picked — one named `Task` when the project offers it,
+	 * else the first non-subtask type. A sub-task cannot stand alone (it needs a
+	 * parent), so those are never eligible.
+	 *
+	 * Deliberately **not** an issue-type mapping: no config field is added, which is
+	 * what issue #490's non-goal forbids. Runs inside a credential scope (its
+	 * callers do).
+	 */
+	private async resolveStandardIssueTypeId(): Promise<string> {
+		const project = await jiraRequest<JiraProjectDetail | undefined>(
+			`project/${encodeURIComponent(this.config.projectKey)}`,
+		);
+		const usable = (project?.issueTypes ?? []).filter(
+			(issueType): issueType is JiraIssueType & { id: string } =>
+				Boolean(issueType?.id) && !issueType?.subtask,
+		);
+		const preferred =
+			usable.find((issueType) => issueType.name?.toLowerCase() === PREFERRED_ISSUE_TYPE) ??
+			usable[0];
+		if (!preferred) {
+			throw new Error(
+				`Jira project '${this.config.projectKey}' offers no standard (non-subtask) issue type to create an issue as`,
+			);
+		}
+		return preferred.id;
 	}
 }
 
