@@ -1860,6 +1860,68 @@ describe('processJob', () => {
 		expect(addComment).not.toHaveBeenCalled();
 	});
 
+	// Issue #596: the run row's exit metadata must agree with the reason the same settle
+	// writes into `error`, and must stay silent when nothing reported it.
+	it('records the timed-out run’s own exit metadata on the deferred row', async () => {
+		const workItem = createMockWorkItem({ statusId: '61e4505c' });
+		phaseImpl = async () => {
+			throw new AgentRunError(
+				'Implementation agent (claude) exited with code 143 (timed out)',
+				{ kind: 'timeout' },
+				agentResult({ exitCode: 143, timedOut: true, durationMs: 1_806_000 }),
+			);
+		};
+
+		await processJob(
+			createMockPmWebhookJob(),
+			registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+		);
+
+		expect(completeRun).toHaveBeenCalledWith(
+			'run-1',
+			expect.objectContaining({
+				status: 'deferred',
+				exitCode: 143,
+				timedOut: true,
+				durationMs: 1_806_000,
+			}),
+		);
+	});
+
+	it('writes no placeholder exit metadata when the failure reported none', async () => {
+		const workItem = createMockWorkItem({ statusId: '61e4505c' });
+		phaseImpl = async () => {
+			// The stand-in an older worker's metadata-less frame rebuilds on the control
+			// plane: an exit code it does not know, and neither optional field.
+			throw new AgentRunError(
+				'Phase deferred (timeout) on the worker',
+				{ kind: 'timeout' },
+				{
+					cli: 'claude',
+					exitCode: null,
+					signal: null,
+					stdout: '',
+					stderr: '',
+					aborted: false,
+					outputTruncated: false,
+				},
+			);
+		};
+
+		await processJob(
+			createMockPmWebhookJob(),
+			registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+		);
+
+		const [, input] = completeRun.mock.calls.at(-1) as [string, Record<string, unknown>];
+		expect(input.status).toBe('deferred');
+		// Omitted — not `0` / `false` — so `completeRun` leaves the columns as they are and
+		// the row stays distinguishable as "never reported".
+		expect(input.exitCode).toBeNull();
+		expect(input.timedOut).toBeUndefined();
+		expect(input.durationMs).toBeUndefined();
+	});
+
 	it('does not append splitting suggestion for a non-stalled AgentRunError', async () => {
 		const workItem = createMockWorkItem({ statusId: '61e4505c' });
 		phaseImpl = async () => {

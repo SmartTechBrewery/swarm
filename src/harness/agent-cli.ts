@@ -336,6 +336,17 @@ export interface AgentCliResult {
 }
 
 /**
+ * A captured agent run, or a stand-in rebuilt from a *report* of one — a worker's
+ * terminal result frame (`../transport/protocol.ts`), on a control plane that ran
+ * no agent itself. The two fields a report can legitimately not know are optional
+ * here, so a settle can tell "ran 0 ms and did not time out" from "the frame never
+ * said" and leave the run row's column alone instead of asserting a default
+ * (issue #596). Every real {@link AgentCliResult} is assignable to it unchanged.
+ */
+export type ReportedAgentResult = Omit<AgentCliResult, 'durationMs' | 'timedOut'> &
+	Partial<Pick<AgentCliResult, 'durationMs' | 'timedOut'>>;
+
+/**
  * Accumulate stream chunks into a single string, capped at `maxBytes`. Once the
  * cap is crossed the buffer stops growing and `truncated` latches — bounding
  * memory for a runaway, chatty agent without disturbing the line callbacks that

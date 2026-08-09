@@ -237,6 +237,22 @@ export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | 
 	return undefined;
 }
 
+/**
+ * The exit metadata of the agent run this failure carries, for its terminal frame
+ * (issue #596): the worker holds the real `AgentCliResult` on {@link AgentRunError.agent}
+ * at settle time, and sending none of it is what left the control plane inventing
+ * `exit 1 / 0 ms / not timed out` over a 30-minute wall-clock kill. A failure that
+ * ran no agent (a delivery deferral, a dependency block, a worktree/setup error)
+ * reports nothing, so the run records "unknown" rather than a placeholder.
+ */
+function reportedAgentExit(
+	err: unknown,
+): Pick<TaskExecutionResult, 'exitCode' | 'signal' | 'timedOut' | 'durationMs'> {
+	if (!(err instanceof AgentRunError) || err.agent === undefined) return {};
+	const { exitCode, signal, timedOut, durationMs } = err.agent;
+	return { exitCode, signal, timedOut, durationMs };
+}
+
 /** Build the terminal `succeeded` result frame from a completed phase run. */
 export function succeededResult(
 	assignment: TaskAssignment,
@@ -394,6 +410,10 @@ export function settleAssignmentFailure(
  * worker parses the checkpoint the stopped agent left behind and attaches it to the
  * deferral. Read for the same `rate-limit`/`timeout`/`stalled` set that preserves the
  * checkout at all, so a failure that discards the worktree never reports one.
+ *
+ * Every frame this builds also reports the exit metadata of the agent run the failure
+ * carried, when it carried one ({@link reportedAgentExit}, issue #596), so the run row
+ * records the same stop the `error` describes.
  */
 export function deferrableOrFailedResult(
 	err: unknown,
@@ -407,6 +427,10 @@ export function deferrableOrFailedResult(
 		runId: assignment.runId,
 		phase: assignment.phase,
 		taskId: assignment.taskId,
+		// Shared by all three returns below, so a deferral and a terminal failure report
+		// the stop identically, and the two error types that never hold an agent result
+		// (a delivery deferral, a dependency block) contribute nothing.
+		...reportedAgentExit(err),
 	};
 	const failure = classifyDeferrable(err);
 	if (failure?.kind === 'dependency') {

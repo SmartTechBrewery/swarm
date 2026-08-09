@@ -395,8 +395,17 @@ export const TaskExecutionResultSchema = z.object({
 	status: z.enum(['succeeded', 'deferred', 'failed']),
 	phase: TaskPhaseSchema,
 	taskId: z.string().min(1),
-	// `succeeded` — the agent run's exit metadata (mirrors the `phase-succeeded`
-	// outcome fields).
+	// The agent run's exit metadata (mirrors the `phase-succeeded` outcome fields),
+	// reported for **every** terminal status whose run actually produced an agent
+	// result: `succeeded`, and — since issue #596 — `deferred`/`failed`, which held
+	// the same `AgentCliResult` at settle time and used to send none of it, leaving
+	// the control plane to invent `exit 1 / 0 ms / not timed out` over (say) a
+	// 30-minute wall-clock kill. A failure that ran no agent at all still reports
+	// none, and the control plane records "unknown" rather than a placeholder.
+	// Optional and additive in both directions — the same reasoning `checkpoint`
+	// records below — so `TRANSPORT_PROTOCOL_VERSION` is deliberately *not* bumped:
+	// an older worker simply omits them on a non-`succeeded` frame and its run
+	// records "unknown" instead of a placeholder.
 	exitCode: z.number().int().nullable().optional(),
 	signal: z.string().nullable().optional(),
 	timedOut: z.boolean().optional(),

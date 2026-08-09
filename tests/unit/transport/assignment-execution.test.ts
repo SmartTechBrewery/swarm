@@ -1019,6 +1019,102 @@ describe('runAssignmentDbFree', () => {
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'deferred', failureKind: 'timeout' });
 	});
+
+	// Issue #596: the worker holds the real `AgentCliResult` at settle time, and used to
+	// send none of it on a non-`succeeded` frame — which is what left the control plane
+	// inventing `exit 1 / 0 ms / not timed out` over a 30-minute wall-clock kill.
+	describe('reported exit metadata on a non-succeeded frame', () => {
+		const ASSIGNMENT = () =>
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' }));
+
+		it('carries the timed-out run’s own exit metadata on a timeout deferral', () => {
+			const frame = deferrableOrFailedResult(
+				new AgentRunError(
+					'Implementation agent (claude) exited with code 143 (timed out)',
+					{ kind: 'timeout' },
+					agentResult({
+						exitCode: 143,
+						signal: 'SIGTERM',
+						timedOut: true,
+						durationMs: 1_800_000,
+					}),
+				),
+				ASSIGNMENT(),
+			);
+
+			expect(frame).toMatchObject({
+				status: 'deferred',
+				failureKind: 'timeout',
+				exitCode: 143,
+				signal: 'SIGTERM',
+				timedOut: true,
+				durationMs: 1_800_000,
+			});
+		});
+
+		it('carries it on a rate-limit deferral too', () => {
+			const frame = deferrableOrFailedResult(
+				new AgentRunError(
+					'rate limited',
+					{ kind: 'rate-limit' },
+					agentResult({ exitCode: 1, durationMs: 4_200 }),
+				),
+				ASSIGNMENT(),
+			);
+
+			expect(frame).toMatchObject({
+				status: 'deferred',
+				exitCode: 1,
+				timedOut: false,
+				durationMs: 4_200,
+			});
+		});
+
+		it('carries it on a terminal failed frame', () => {
+			const frame = deferrableOrFailedResult(
+				new AgentRunError(
+					'Review agent (claude) exited with code 1 (authentication failed)',
+					{ kind: 'auth' },
+					agentResult({ exitCode: 1, durationMs: 900 }),
+				),
+				ASSIGNMENT(),
+			);
+
+			expect(frame).toMatchObject({
+				status: 'failed',
+				exitCode: 1,
+				timedOut: false,
+				durationMs: 900,
+			});
+		});
+
+		// A failure that ran no agent has nothing to report, so the frame must stay
+		// silent rather than assert a default the control plane would then persist.
+		it.each([
+			['a plain error', new Error('worktree setup failed')],
+			['a delivery deferral', new DeliveryDeferredError('push rejected')],
+			[
+				'a dependency block',
+				new DependencyBlockedError(createMockWorkItem(), [
+					{
+						reference: '#319',
+						url: 'https://github.com/SmartTechBrewery/swarm/issues/319',
+						title: 'Session auth',
+						open: true,
+						source: 'dependency' as const,
+					},
+				]),
+			],
+			['an agent error carrying no result', new AgentRunError('stalled', { kind: 'stalled' })],
+		])('omits all four fields for %s', (_label, err) => {
+			const frame = deferrableOrFailedResult(err, ASSIGNMENT());
+
+			expect(frame.exitCode).toBeUndefined();
+			expect(frame.signal).toBeUndefined();
+			expect(frame.timedOut).toBeUndefined();
+			expect(frame.durationMs).toBeUndefined();
+		});
+	});
 });
 
 /**

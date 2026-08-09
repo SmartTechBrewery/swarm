@@ -70,6 +70,22 @@ describe('diagnoseFailure (issue #269)', () => {
 		});
 	});
 
+	// A control-plane stand-in whose frame reported no duration (issue #596) is no
+	// evidence of substantial progress, so it must not support a scope claim.
+	it('keeps a stall provider-oriented when the reported result carries no duration', () => {
+		const { durationMs: _unreported, ...unreportedAgent } = agent({
+			stdout: `${'x'.repeat(2_000)}\nError: timeout waiting for response`,
+		});
+
+		const diagnosis = diagnoseFailure({
+			failureKind: 'stalled',
+			planningScope: MULTI_CONCERN_SCOPE,
+			agent: unreportedAgent,
+		});
+
+		expect(diagnosis?.kind).toBe('provider-stalled-early');
+	});
+
 	it('never turns a harness timeout alone into a scope conclusion', () => {
 		const diagnosis = diagnoseFailure({
 			failureKind: 'timeout',

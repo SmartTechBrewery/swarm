@@ -49,7 +49,7 @@ import {
 	reconcileDispatchesAtStartup,
 	reconcileDispatchesPeriodically,
 } from '../dispatch/reconciler.js';
-import type { AgentCliResult } from '../harness/agent-cli.js';
+import type { AgentCliResult, ReportedAgentResult } from '../harness/agent-cli.js';
 import { type AgentFailureKind, AgentRunError } from '../harness/agent-failure.js';
 import {
 	getLiveSessionForWorker,
@@ -179,40 +179,48 @@ function prCoordinates(trigger: TriggerResult): TaskAssignmentPr | undefined {
 	}
 }
 
-/** A minimal captured-run stand-in built from a worker's result frame (the router ran no agent). */
-function resultAgent(
+/** The exit metadata a worker's terminal frame reports, in stand-in form. */
+interface ReportedAgentFields {
+	exitCode?: number | null;
+	signal?: string | null;
+	durationMs?: number;
+	timedOut?: boolean;
+	aborted?: boolean;
+}
+
+/**
+ * A minimal captured-run stand-in built from a worker's result frame (the router ran
+ * no agent). A field the frame never reported stays **unset** rather than defaulting
+ * to `0 ms` / `did not time out` (issue #596): the settle drops an undefined column,
+ * so an older worker's metadata-less frame records "unknown" instead of a placeholder
+ * that contradicts the `error` written by the same settle.
+ */
+function reportedAgent(
 	cli: AgentCliResult['cli'],
-	fields: {
-		exitCode?: number | null;
-		signal?: string | null;
-		durationMs?: number;
-		timedOut?: boolean;
-		aborted?: boolean;
-	} = {},
-): AgentCliResult {
+	fields: ReportedAgentFields = {},
+): ReportedAgentResult {
 	return {
 		cli,
 		exitCode: fields.exitCode ?? null,
 		signal: (fields.signal ?? null) as AgentCliResult['signal'],
 		stdout: '',
 		stderr: '',
-		durationMs: fields.durationMs ?? 0,
-		timedOut: fields.timedOut ?? false,
+		durationMs: fields.durationMs,
+		timedOut: fields.timedOut,
 		aborted: fields.aborted ?? false,
 		outputTruncated: false,
 	};
 }
 
 /**
- * Adapt a worker's terminal `TaskExecutionResult` back into the shape
- * `processJob`'s shared settle path consumes: a `PhaseRunResult` for a success, or
- * a throw that the shared `handlePhaseFailure` classifies exactly as an in-process
- * failure would — `RunTerminatedError` for a user cancellation, `DependencyBlockedError`,
- * `DeliveryDeferredError` or an `AgentRunError` (with the reported failure kind) for a
- * deferral, and a plain terminal error otherwise. The synthetic agent result carries the
- * reported exit metadata; its non-zero exit keeps a genuinely-interrupted `timeout`
- * deferrable, matching the in-process rule.
+ * The same stand-in, completed for the succeeded path — whose frame always reports
+ * both fields, and whose `PhaseRunResult.agent` is a full {@link AgentCliResult}.
  */
+function capturedAgent(cli: AgentCliResult['cli'], fields: ReportedAgentFields): AgentCliResult {
+	const agent = reportedAgent(cli, fields);
+	return { ...agent, durationMs: agent.durationMs ?? 0, timedOut: agent.timedOut ?? false };
+}
+
 /**
  * Narrow a worker's reported Review verdict to the two SWARM still produces.
  *
@@ -235,6 +243,18 @@ function reportedVerdict(verdict: TaskExecutionResult['verdict']): ReviewVerdict
 	return verdict;
 }
 
+/**
+ * Adapt a worker's terminal `TaskExecutionResult` back into the shape
+ * `processJob`'s shared settle path consumes: a `PhaseRunResult` for a success, or
+ * a throw that the shared `handlePhaseFailure` classifies exactly as an in-process
+ * failure would — `RunTerminatedError` for a user cancellation, `DependencyBlockedError`,
+ * `DeliveryDeferredError` or an `AgentRunError` (with the reported failure kind) for a
+ * deferral, and an `AgentRunError` carrying the reported exit metadata otherwise. The
+ * synthetic agent result carries what the frame *reported* rather than a stand-in
+ * default (issue #596), so the run row records the same stop its `error` describes and
+ * a frame that reported nothing records "unknown"; its non-zero exit keeps a
+ * genuinely-interrupted `timeout` deferrable, matching the in-process rule.
+ */
 export function adaptResultToPhaseRun(
 	result: TaskExecutionResult,
 	selection: DispatchSelection,
@@ -243,7 +263,7 @@ export function adaptResultToPhaseRun(
 ): PhaseRunResult {
 	if (result.status === 'succeeded') {
 		return {
-			agent: resultAgent(selection.cli, {
+			agent: capturedAgent(selection.cli, {
 				exitCode: result.exitCode ?? 0,
 				signal: result.signal,
 				durationMs: result.durationMs,
@@ -260,7 +280,29 @@ export function adaptResultToPhaseRun(
 	}
 	if (result.status === 'failed') {
 		if (result.cancelled) throw new RunTerminatedError(result.error || RUN_CANCELLED_MESSAGE);
-		throw new Error(result.error || result.reason || 'Phase failed on the worker');
+		// An `AgentRunError` rather than a plain `Error` purely so the reported exit
+		// metadata reaches the run row: `finalizeFailedRun` (`../worker/consumer.ts`)
+		// records the columns only from `AgentRunError.agent`, and a plain throw is why
+		// a terminally-failed federated run recorded nothing at all (issue #596).
+		//
+		// `kind: 'error'` is deliberate, and is *not* the frame's own `failureKind`: the
+		// worker already applied the terminal/deferrable split (`classifyDeferrable`,
+		// `../transport/assignment-execution.ts`), so re-deriving a kind here would
+		// re-enter the shared deferral rule and retry a run the worker settled for good.
+		// `'error'` is inert in every branch that reads a kind — `isDeferrable` excludes
+		// it, `tryLoadPlanningScope` only acts on `stalled`, `diagnoseFailure` returns
+		// `undefined` for it, and `knownFailureCondition('error', msg)` falls through to
+		// the same message check a plain `Error` gets today.
+		throw new AgentRunError(
+			result.error || result.reason || 'Phase failed on the worker',
+			{ kind: 'error' },
+			reportedAgent(selection.cli, {
+				exitCode: result.exitCode,
+				signal: result.signal,
+				timedOut: result.timedOut,
+				durationMs: result.durationMs,
+			}),
+		);
 	}
 	// deferred: rebuild the classified failure so the shared deferral path applies
 	// its budget and retry-delay policy exactly as it does for an in-process failure.
@@ -286,7 +328,19 @@ export function adaptResultToPhaseRun(
 	throw new AgentRunError(
 		result.reason ?? `Phase deferred (${kind}) on the worker`,
 		{ kind },
-		resultAgent(selection.cli, { exitCode: result.exitCode ?? 1, aborted: kind === 'aborted' }),
+		// The frame's own reported metadata, not a `?? 1 / 0 ms / false` stand-in
+		// (issue #596). A frame that reports no exit code leaves `exitCode: null`, which
+		// still satisfies the shared "genuinely interrupted" timeout rule
+		// (`handlePhaseFailure` requires `exitCode !== 0`, `../worker/consumer.ts`), so an
+		// older worker's timeout deferral behaves exactly as before while its run records
+		// "unknown" instead of "exit 1, 0 ms, did not time out".
+		reportedAgent(selection.cli, {
+			exitCode: result.exitCode,
+			signal: result.signal,
+			timedOut: result.timedOut,
+			durationMs: result.durationMs,
+			aborted: kind === 'aborted',
+		}),
 		// The Tier 2 checkpoint the worker read off its own disk (issue #503). Carried on
 		// the rebuilt error so the shared deferral path applies the identical continuation
 		// policy and budget it applies in-process — the control plane cannot read that
@@ -315,7 +369,7 @@ function awaitResultWithGuards(
 				new AgentRunError(
 					reason,
 					{ kind: 'aborted' },
-					resultAgent(selection.cli, { aborted: true }),
+					reportedAgent(selection.cli, { aborted: true }),
 				),
 			);
 		};

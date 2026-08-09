@@ -23,7 +23,7 @@
  */
 
 import type { Checkpoint } from '../pipeline/checkpoint.js';
-import type { AgentCliResult } from './agent-cli.js';
+import type { AgentCliResult, ReportedAgentResult } from './agent-cli.js';
 
 /** Why an agent run failed, from the worker's point of view. */
 export type AgentFailureKind =
@@ -69,8 +69,14 @@ export class AgentRunError extends Error {
 	 * in tests don't have one; in production the error is only ever built via
 	 * {@link agentRunError}, which always forwards the `result` it classified, so
 	 * `.agent` is populated for every real failure.
+	 *
+	 * Typed as a {@link ReportedAgentResult} because the control plane rebuilds this
+	 * error from a worker's terminal frame (`../router/dispatcher.ts`) and so carries
+	 * only what that frame *reported* — a field an older worker's frame omits stays
+	 * unset rather than being defaulted into a placeholder on the run row (issue
+	 * #596). A locally captured run always fills every field.
 	 */
-	readonly agent?: AgentCliResult;
+	readonly agent?: ReportedAgentResult;
 	/**
 	 * The Tier 2 checkpoint (`docs/CHECKPOINTS.md`) the stopped run left in its
 	 * worktree, when that worktree is somewhere the process handling this error
@@ -84,7 +90,7 @@ export class AgentRunError extends Error {
 	constructor(
 		message: string,
 		failure: AgentFailure,
-		agent?: AgentCliResult,
+		agent?: ReportedAgentResult,
 		checkpoint?: Checkpoint,
 	) {
 		super(message);
