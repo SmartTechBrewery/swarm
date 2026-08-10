@@ -88,19 +88,22 @@ export function requireSCMProvider(id: string): SCMProvider {
  *   operator to set `scm` rather than picking whichever manifest registered first.
  *
  *   **That branch stopped resolving with issue #618**, which made Bitbucket the
- *   second runtime-ready provider. It was the back-compat path for installations
- *   predating the discriminator; from #618 on, every project must state its provider.
- *   The throw is the migration notice — it names the project and lists the ids to
- *   choose from — and the fix is one field: set `"scm": "github"` on each existing
- *   project in `swarm.config.json` and run `swarm config apply` (docs/configuration.md).
- *   Deliberately not defaulted to `github` in the schema: a silent default would route
- *   a *new* Bitbucket project's operations onto GitHub, which is the exact failure this
- *   lookup exists to prevent.
+ *   second runtime-ready provider, and issue #619 (GitLab) took the count to three.
+ *   It was the back-compat path for installations predating the discriminator; from
+ *   #618 on, every project must state its provider. The throw is the migration
+ *   notice — it names the project and lists the ids to choose from — and the fix is
+ *   one field: set `"scm": "github"` on each existing project in `swarm.config.json`
+ *   and run `swarm config apply` (docs/configuration.md). Deliberately not defaulted
+ *   to `github` in the schema: a silent default would route a *new* Bitbucket or
+ *   GitLab project's operations onto GitHub, which is the exact failure this lookup
+ *   exists to prevent.
  *
  * The runtime-ready filter still gates a *selected* provider too: a manifest that
  * declares `runtimeReady: false` is registered so its own tests and follow-up work
  * can resolve it by id, and is deliberately unable to serve traffic until the work
- * completing that provider flips the flag (GitLab is the one left, issue #619).
+ * completing that provider flips the flag. Every registered provider has now made
+ * that call (GitHub, then Bitbucket with #618, then GitLab with #619), so the filter
+ * is there for the fourth one while it is under construction.
  * {@link requireSCMProvider} stays exempt from the filter — its id comes from an
  * enqueued job's envelope, written by this process's own ingress, and that lookup
  * must stay event-accurate.

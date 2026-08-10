@@ -9,8 +9,8 @@ on the developer's machine.
 The MVP runs a local router, Redis/Postgres stack, host worker, and an API server
 that serves the dashboard SPA.
 The source-control provider reaches the router through a public HTTPS webhook
-endpoint, usually via a Cloudflare Tunnel — `/github/webhook` or, for a Bitbucket
-Cloud project, `/bitbucket/webhook`. The router also exposes an authenticated worker-transport
+endpoint, usually via a Cloudflare Tunnel — `/github/webhook`, `/bitbucket/webhook`,
+or `/gitlab/webhook`, one per provider a project can be routed to. The router also exposes an authenticated worker-transport
 endpoint (`POST /worker/session` + a `GET /worker/stream` WebSocket) so a remote
 worker can establish and heartbeat its session over that same tunnel (ADR-003).
 The architecture as built is documented in
@@ -21,7 +21,7 @@ working checkout.
 ## How it works
 
 ```text
-GitHub / Bitbucket → HTTPS webhook → Router → durable Postgres dispatch → Redis wake-up
+GitHub / Bitbucket / GitLab → HTTPS webhook → Router → durable Postgres dispatch → Redis wake-up
                                                         ↓
                                       host Worker → isolated worktree → agent CLI
                                                         ↓
@@ -80,13 +80,13 @@ GitHub / Bitbucket → HTTPS webhook → Router → durable Postgres dispatch �
 - Docker Compose
 - Git
 - Authenticated agent CLIs (`claude`, `agy`, and/or `codex`)
-- A source-control repository on GitHub or Bitbucket Cloud — named by the project's
-  `scm` field, which every project must set — and a project-management board with a
+- A source-control repository on GitHub, Bitbucket Cloud, or gitlab.com — named by the
+  project's `scm` field, which every project must set — and a project-management board with a
   webhook: a GitHub Projects v2 board, a Linear team, or a Jira Cloud project
 - Two distinct source-control identities for loop prevention: the worker operator's
-  own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN`, the
-  implementer persona) set in `.env` on each host, and a separate project-scoped
-  reviewer credential
+  own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN` /
+  `SWARM_OPERATOR_GITLAB_TOKEN`, the implementer persona) set in `.env` on each host,
+  and a separate project-scoped reviewer credential
 - A project credential for the **board**, separate from the two above. GitHub
   Projects uses `credentials.pm.apiToken` (conventionally
   `PM_GITHUB_PROJECTS_TOKEN`) with `repo`, `project`, and `read:org`; Linear uses

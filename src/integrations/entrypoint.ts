@@ -39,10 +39,9 @@ import './scm/github/index.js';
 // SCM: Bitbucket (issue #296, contract complete). Runtime-ready since issue #618:
 // routable from `project.scm` and served at `/bitbucket/webhook`, alongside GitHub.
 import './scm/bitbucket/index.js';
-// SCM: GitLab (issue #295, contract complete as of its phase 4/4). Registers with
-// `runtimeReady: false` — discoverable by id, but neither routable from
-// `project.scm` nor served a webhook route until issue #619 flips the flag and
-// mounts its ingress, the way #618 did for Bitbucket.
+// SCM: GitLab (issue #295, contract complete as of its phase 4/4). Runtime-ready
+// since issue #619, the way #618 did it for Bitbucket: routable from `project.scm`
+// and served at `/gitlab/webhook`. All three registered providers now carry traffic.
 import './scm/gitlab/index.js';
 
 /**

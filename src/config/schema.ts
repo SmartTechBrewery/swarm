@@ -581,8 +581,8 @@ export const ProjectConfigBaseSchema = z.object({
 	 * unregistered, or registered but not runtime-ready
 	 * (`SCMProviderManifest.runtimeReady`), also throws rather than falling back to
 	 * another provider. The field stays optional rather than gaining a `github`
-	 * default, because a default would silently route a Bitbucket project's operations
-	 * onto GitHub instead of failing loudly.
+	 * default, because a default would silently route a Bitbucket or GitLab project's
+	 * operations onto GitHub instead of failing loudly.
 	 *
 	 * A bare provider id rather than a `pm`-style discriminated union on purpose: an
 	 * SCM manifest declares no `configSchema` (a project's SCM config is `repo` +

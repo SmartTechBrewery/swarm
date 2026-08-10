@@ -48,7 +48,7 @@ export const CREDENTIAL_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
  * subset of the contract's `ScmType`, so a value picked here is exactly what
  * `project.scm` (`src/config/schema.ts`) stores.
  */
-export type ScmProviderId = Extract<ScmType, 'github' | 'bitbucket'>;
+export type ScmProviderId = Extract<ScmType, 'github' | 'bitbucket' | 'gitlab'>;
 
 export interface ScmProviderOption {
 	id: ScmProviderId;
@@ -62,7 +62,8 @@ export interface ScmProviderOption {
  * are **runtime-ready** server-side (`SCMProviderManifest.runtimeReady`), since
  * selecting anything else would only earn the project a loud resolution error.
  * GitHub was alone here until issue #618 made Bitbucket routable and served its
- * ingress; GitLab joins with issue #619.
+ * ingress; issue #619 did the same for GitLab, so all three registered providers
+ * are offered.
  *
  * Deliberately a hand-kept list rather than a registry read: the dashboard is a
  * browser bundle and does not load `src/integrations/entrypoint.js`, so there is no
@@ -71,6 +72,7 @@ export interface ScmProviderOption {
 export const SCM_PROVIDERS: readonly ScmProviderOption[] = [
 	{ id: 'github', label: 'GitHub', available: true },
 	{ id: 'bitbucket', label: 'Bitbucket Cloud', available: true },
+	{ id: 'gitlab', label: 'GitLab', available: true },
 ];
 
 export const DEFAULT_SCM_PROVIDER_ID: ScmProviderId = SCM_PROVIDERS[0].id;
@@ -78,8 +80,9 @@ export const DEFAULT_SCM_PROVIDER_ID: ScmProviderId = SCM_PROVIDERS[0].id;
 /**
  * Narrow a project's stored `scm` to a provider this screen can render. A project
  * that names nothing predates issue #478's discriminator; one that names a provider
- * the selector doesn't offer (`gitlab`, until issue #619) is left unset so the tab
- * never presents GitHub as a value that has not actually been saved.
+ * the selector doesn't offer — a fourth provider registered but not yet added to
+ * {@link SCM_PROVIDERS} — is left unset so the tab never presents GitHub as a value
+ * that has not actually been saved.
  */
 export function toSelectableScmProvider(scm: string | undefined | null): ScmProviderId | undefined {
 	return SCM_PROVIDERS.some((provider) => provider.id === scm) ? (scm as ScmProviderId) : undefined;
@@ -107,6 +110,20 @@ const BITBUCKET_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 		'HMAC secret Bitbucket signs webhook deliveries with, sent as X-Hub-Signature. A hook configured without one is rejected: SWARM fails closed rather than trusting an unsigned delivery.',
 };
 
+/**
+ * GitLab's wording for the same two shared references. The webhook line differs in
+ * kind rather than in phrasing: GitLab echoes the secret verbatim in
+ * `X-Gitlab-Token` instead of signing the body, so the copy says what the operator
+ * is configuring — a secret token, not an HMAC key (see
+ * `src/integrations/scm/gitlab/webhook.ts`).
+ */
+const GITLAB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
+	reviewer:
+		'GitLab access token (personal, group, or project) the reviewer persona reviews with, needing the api scope. Must resolve to a different GitLab account than the worker operator (the implementer identity) for loop prevention to work, and be an eligible approver on the project. A token whose scope withholds the account email still delivers, but its commits stay unlinked.',
+	webhookSecret:
+		'Secret token GitLab echoes verbatim in the X-Gitlab-Token header — GitLab does not sign the body, so this authenticates the sender rather than the payload. A hook configured without one is rejected: SWARM fails closed rather than trusting an unauthenticated delivery.',
+};
+
 const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	github: {
 		intro:
@@ -121,6 +138,13 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 		verifyFailureMessage:
 			'Credential did not resolve to a Bitbucket account. It must be a "username:app_password" pair — a workspace or repository access token cannot resolve an identity.',
 	},
+	gitlab: {
+		intro:
+			"The reviewer persona authenticates to gitlab.com with this project-scoped access token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GITLAB_TOKEN environment variable — not here — so its merge requests are attributed to the operator's account, distinct from the reviewer. Point the project's webhook at /gitlab/webhook, enable its merge request, comment, and pipeline events, and give it the secret token below. Verify the token to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+		roleDescriptions: GITLAB_ROLE_DESCRIPTIONS,
+		verifyFailureMessage:
+			'Token did not resolve to a GitLab account. It needs the api scope, and only gitlab.com is supported — a self-managed host cannot be verified.',
+	},
 };
 
 /** Project the selected provider onto the Source Control tab's display copy. */
@@ -132,7 +156,7 @@ export function getScmProviderCopy(providerId: ScmProviderId): ScmProviderCopy {
  * Whether a role's secret maps to a provider identity and can be verified through
  * that provider's `scm.verify…` procedure. The webhook secret is an HMAC secret,
  * not a token, so it has no login to resolve and no Verify affordance — true of
- * both providers, which is why this takes no provider id.
+ * all three providers, which is why this takes no provider id.
  */
 export function isVerifiableRole(role: CredentialRole): boolean {
 	return role === 'reviewer';

@@ -8,14 +8,15 @@
  * barrel" half of the registration pattern (ai/CODING_STANDARDS.md "Module shape
  * for a provider").
  *
- * **Why this arrives in the last phase rather than the first.** Bitbucket
- * registered a `runtimeReady: false` manifest from its own phase 1; GitLab
- * deliberately registered nothing until now, because the multi-provider
- * conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
- * asserts that no *registered* manifest stubs a contract method. A stub-bearing
- * manifest would have forced an exemption that disabled that gate for the two
- * providers already passing it, so registration lands together with the last
- * stub's removal — and passing the gate is this phase's job (ai/TESTING.md).
+ * **Why registration arrived in issue #295's last phase rather than its first.**
+ * Bitbucket registered a `runtimeReady: false` manifest from its own phase 1;
+ * GitLab deliberately registered nothing until the contract was complete, because
+ * the multi-provider conformance suite
+ * (`tests/unit/integrations/scm/scm-conformance.test.ts`) asserts that no
+ * *registered* manifest stubs a contract method. A stub-bearing manifest would
+ * have forced an exemption that disabled that gate for the two providers already
+ * passing it, so registration landed together with the last stub's removal
+ * (ai/TESTING.md).
  *
  * The manifest is also exported for tests and for callers that want the
  * provider's pieces without going through the registry.
@@ -29,19 +30,35 @@ export const gitlabScmManifest: SCMProviderManifest = {
 	id: 'gitlab',
 	label: 'GitLab',
 	category: 'scm',
-	// Declared so the route this provider *will* answer on is decided in one place,
-	// but not served: `runtimeReady: false` keeps the receiver from mounting it
-	// (`src/router/webhook-receiver.ts`).
+	// Served verbatim by the receiver (`src/router/webhook-receiver.ts`) since this
+	// manifest declared itself runtime-ready: a GET ping plus the POST deliveries
+	// gitlab.com sends.
 	webhookRoute: '/gitlab/webhook',
-	// The contract is complete as of issue #295 phase 4/4 — no method is stubbed
-	// (`tests/unit/integrations/scm/scm-conformance.test.ts`) — but this provider has
-	// not been declared ready to carry traffic, so the flag stays `false` for the same
-	// reason Bitbucket's does: the project-scoped lookup routes only to runtime-ready
-	// manifests, and a project naming `gitlab` gets a loud error rather than a silent
-	// GitHub fallback (`../registry.ts`). Project→provider selection landed with issue
-	// #478 (`project.scm`); what is left is a served ingress route and the readiness
-	// call, which belong to the issue completing this provider (ai/RULES.md §2).
-	runtimeReady: false,
+	// Declared ready to carry traffic by issue #619, the third provider to claim it.
+	// The contract has been complete since issue #295 phase 4/4 — no method is stubbed
+	// (`tests/unit/integrations/scm/scm-conformance.test.ts`) — and the two pieces of
+	// wiring that were still missing land with the flip: the receiver now mounts
+	// `/gitlab/webhook`, and `requireProjectSCMProvider` routes a project that sets
+	// `"scm": "gitlab"` here (`../registry.ts`). GitHub and Bitbucket projects are
+	// unaffected — each project resolves the manifest it names.
+	//
+	// **The webhook trade-off this makes live, decided here rather than deferred
+	// again.** GitLab authenticates a delivery by echoing the operator-chosen secret
+	// verbatim in `X-Gitlab-Token`, so `verifyGitLabWebhookToken` (`./webhook.ts`)
+	// authenticates the *sender* where GitHub's and Bitbucket's HMAC also covers the
+	// exact body bytes. Serving the route is judged **acceptable as-is**, not a
+	// prerequisite: the token check is GitLab's own long-standing mechanism, it fails
+	// closed on an absent, empty, or mismatched value, and it compares in constant
+	// time, so a delivery cannot be forged without the secret. What it does not add on
+	// top of TLS is body integrity and replay protection — and an attacker positioned
+	// to tamper with or replay a delivery has already broken the TLS the secret itself
+	// travels under, so the token is not the weakest link. GitLab 19.0's
+	// Standard-Webhooks signing tokens would close the gap and stay a recorded
+	// follow-up, because they need `SCMProvider.verifyWebhookSignature` widened for the
+	// `webhook-id`/`webhook-timestamp` headers it never sees **and** a per-provider
+	// secret reference (a GitLab-minted `whsec_…` key cannot be the operator-chosen
+	// secret the same project's PM webhook shares). See `./webhook.ts`'s header.
+	runtimeReady: true,
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).
 	provider: new GitLabSCMIntegration(),
