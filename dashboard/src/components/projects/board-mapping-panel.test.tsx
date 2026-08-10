@@ -5,10 +5,10 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-	blankStatusOptions,
 	buildPmUpdate,
 	isBoardMappingDirty,
 	toBoardMappingForm,
+	withSelectedContainer,
 	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import type { ProjectPm } from '../../../../src/config/schema.js';
@@ -59,13 +59,7 @@ function Harness({
 			projectId="p1"
 			form={form}
 			onProviderChange={(providerId) => setForm((f) => withSelectedProvider(f, providerId))}
-			onSelectContainer={(containerId) =>
-				setForm((f) =>
-					f.containerId === containerId
-						? f
-						: { ...f, containerId, statusOptions: blankStatusOptions(), providerContext: {} },
-				)
-			}
+			onSelectContainer={(containerId) => setForm((f) => withSelectedContainer(f, containerId))}
 			onStatusOptionChange={(key, value) =>
 				setForm((f) => ({ ...f, statusOptions: { ...f.statusOptions, [key]: value } }))
 			}
@@ -95,6 +89,7 @@ function renderHarness(props: Parameters<typeof Harness>[0] = {}) {
 const PROVIDERS = [
 	{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
 	{ id: 'linear', label: 'Linear', discovery: ['containers', 'states'] },
+	{ id: 'jira', label: 'Jira', discovery: ['containers', 'states'] },
 ];
 
 const CONFIG: ProjectPm = {
@@ -282,6 +277,116 @@ describe('BoardMappingPanel (issue #201)', () => {
 				within(screen.getByLabelText('Provider')).getByRole('option', { name: 'GitHub Projects' }),
 			).toHaveProperty('disabled', true);
 			expect(screen.getByText(/Change the PM provider in/)).not.toBeNull();
+		});
+	});
+
+	// Issue #581: the third provider through the same panel — Jira's nouns come from the
+	// catalogue, and its site base URL rides through untouched because this screen does
+	// not edit it.
+	describe('with a Jira project', () => {
+		const JIRA_CONFIG: ProjectPm = {
+			type: 'jira',
+			baseUrl: 'https://acme.atlassian.net',
+			projectKey: 'SWARM',
+			statusOptions: { todo: '10001' },
+		};
+
+		beforeEach(() => {
+			discoverContainersFn.mockResolvedValue({
+				containers: [
+					{ id: 'SWARM', name: 'Swarm' },
+					{ id: 'OPS', name: 'Operations' },
+				],
+			});
+			// Jira's state discovery returns no `providerContext` — a status id is the
+			// whole mapping.
+			discoverStatesFn.mockResolvedValue({
+				states: [
+					{ id: '10001', name: 'To Do' },
+					{ id: '10002', name: 'Done' },
+				],
+			});
+		});
+
+		it('uses Jira’s nouns and renders its discovered projects and statuses', async () => {
+			renderHarness({ initial: JIRA_CONFIG });
+
+			await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
+			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('jira');
+			const projectSelect = (await screen.findByLabelText(/Jira project/i)) as HTMLSelectElement;
+			// jsdom ignores a value with no matching option, so wait for the discovered one.
+			await screen.findByRole('option', { name: 'Swarm' });
+			expect(projectSelect.value).toBe('SWARM');
+			expect(
+				screen.getByText(/Map each SWARM pipeline status to one of the project's statuses/),
+			).not.toBeNull();
+			await waitFor(() =>
+				expect(discoverStatesFn).toHaveBeenCalledWith({ projectId: 'p1', containerId: 'SWARM' }),
+			);
+			const readySelect = (await screen.findByLabelText('Ready status')) as HTMLSelectElement;
+			await waitFor(() => expect(readySelect.disabled).toBe(false));
+			expect(within(readySelect).getByRole('option', { name: 'To Do' })).not.toBeNull();
+		});
+
+		it('submits the Jira member with the stored base URL preserved', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({ initial: JIRA_CONFIG, onSubmit });
+
+			const doneSelect = (await screen.findByLabelText('Done status')) as HTMLSelectElement;
+			await waitFor(() => expect(doneSelect.disabled).toBe(false));
+			fireEvent.change(doneSelect, { target: { value: '10002' } });
+
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await waitFor(() => expect(save.disabled).toBe(false));
+			fireEvent.click(save);
+
+			expect(onSubmit).toHaveBeenCalledWith({
+				type: 'jira',
+				baseUrl: 'https://acme.atlassian.net',
+				projectKey: 'SWARM',
+				statusOptions: { todo: '10001', done: '10002' },
+			});
+		});
+
+		it('keeps the base URL when another Jira project is selected', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({ initial: JIRA_CONFIG, onSubmit });
+
+			await screen.findByRole('option', { name: 'Operations' });
+			fireEvent.change(screen.getByLabelText(/Jira project/i), { target: { value: 'OPS' } });
+
+			// Switching projects clears the previous project's status mapping, so one has
+			// to be picked again before Save.
+			const readySelect = (await screen.findByLabelText('Ready status')) as HTMLSelectElement;
+			await waitFor(() => expect(readySelect.disabled).toBe(false));
+			fireEvent.change(readySelect, { target: { value: '10001' } });
+
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await waitFor(() => expect(save.disabled).toBe(false));
+			fireEvent.click(save);
+
+			expect(onSubmit).toHaveBeenCalledWith({
+				type: 'jira',
+				baseUrl: 'https://acme.atlassian.net',
+				projectKey: 'OPS',
+				statusOptions: { todo: '10001' },
+			});
+		});
+
+		// A member `jiraConfigSchema` would reject, cast on purpose: Save must refuse it
+		// and say where the URL is set, rather than writing it and failing validation.
+		it('blocks Save and says where to set a missing base URL', async () => {
+			renderHarness({
+				initial: { ...JIRA_CONFIG, baseUrl: '' } as ProjectPm,
+			});
+
+			const doneSelect = (await screen.findByLabelText('Done status')) as HTMLSelectElement;
+			await waitFor(() => expect(doneSelect.disabled).toBe(false));
+			fireEvent.change(doneSelect, { target: { value: '10002' } });
+
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await waitFor(() => expect(screen.getByText(/pm\.baseUrl/)).not.toBeNull());
+			expect(save.disabled).toBe(true);
 		});
 	});
 

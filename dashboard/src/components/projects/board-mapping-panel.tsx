@@ -5,6 +5,7 @@ import {
 	type BoardMappingForm,
 	canSaveBoardMapping,
 	getPmMappingProvider,
+	isBaseUrlMissing,
 	PM_MAPPING_PROVIDERS,
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
@@ -144,6 +145,10 @@ export function BoardMappingPanel({
 	const containerCredentialGap =
 		containersQuery.isError && isMissingPmCredentialError(containersQuery.error);
 	const canSave = canSaveBoardMapping(form);
+	// The one Save gate this screen can't clear: the provider's site URL is board
+	// identity kept in `swarm.config.json`, so the disabled button is explained
+	// rather than left inexplicable.
+	const baseUrlMissing = isBaseUrlMissing(form);
 
 	return (
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
@@ -319,6 +324,13 @@ export function BoardMappingPanel({
 					>
 						Reset
 					</button>
+					{baseUrlMissing && (
+						<p className="text-xs text-amber-300/80">
+							Set this {provider.label} {provider.containerNoun}'s{' '}
+							<code className="font-mono">pm.baseUrl</code> in{' '}
+							<code className="font-mono">swarm.config.json</code> before saving a mapping.
+						</p>
+					)}
 				</div>
 			</form>
 		</div>

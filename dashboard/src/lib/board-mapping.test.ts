@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import type { ProjectPm } from '../../../src/config/schema.js';
+// The provider's own schema — the `jira` member of `ProjectPmSchema` — imported
+// directly rather than through that union: it is the half this form has to satisfy,
+// and it is a leaf module (Zod only), unlike the whole config schema.
+import { jiraConfigSchema } from '../../../src/integrations/pm/jira/config-schema.js';
 import {
 	blankStatusOptions,
 	buildPmUpdate,
 	canSaveBoardMapping,
 	cleanStatusOptions,
 	getPmMappingProvider,
+	isBaseUrlMissing,
 	isBoardMappingDirty,
 	STATUS_KEYS,
 	toBoardMappingForm,
+	withSelectedContainer,
 	withSelectedProvider,
 } from './board-mapping.js';
 
@@ -32,6 +38,13 @@ const linearPm: ProjectPm = {
 	statusOptions: { planning: 'f4dd18f6-7943-4a6d-9a0e-4e6cb6e3acb6' },
 };
 
+const jiraPm: ProjectPm = {
+	type: 'jira',
+	baseUrl: 'https://acme.atlassian.net',
+	projectKey: 'SWARM',
+	statusOptions: { todo: '10001', done: '10002' },
+};
+
 /** Narrow a built payload to one provider's member, failing loudly on a mismatch. */
 function asMember<T extends ProjectPm['type']>(
 	pm: ProjectPm,
@@ -39,6 +52,12 @@ function asMember<T extends ProjectPm['type']>(
 ): Extract<ProjectPm, { type: T }> {
 	if (pm.type !== type) throw new Error(`expected a '${type}' member, got '${pm.type}'`);
 	return pm as Extract<ProjectPm, { type: T }>;
+}
+
+/** Strip the union discriminator, leaving the provider's own (strict) config shape. */
+function withoutDiscriminator(pm: ProjectPm): Record<string, unknown> {
+	const { type: _type, ...config } = pm;
+	return config;
 }
 
 describe('toBoardMappingForm', () => {
@@ -79,6 +98,18 @@ describe('toBoardMappingForm', () => {
 		expect(form.providerContext).toEqual({});
 		expect(form.statusOptions.planning).toBe(linearPm.statusOptions.planning);
 		expect(form.statusOptions.done).toBe('');
+		expect(canSaveBoardMapping(form)).toBe(true);
+	});
+
+	// Issue #581: Jira's container is its project *key*, and the site base URL — board
+	// identity this screen never edits — rides along in the opaque provider context.
+	it('projects a Jira mapping onto the project key and carries its base URL', () => {
+		const form = toBoardMappingForm(jiraPm);
+		expect(form.providerId).toBe('jira');
+		expect(form.containerId).toBe('SWARM');
+		expect(form.providerContext).toEqual({ baseUrl: 'https://acme.atlassian.net' });
+		expect(form.statusOptions.todo).toBe('10001');
+		expect(form.statusOptions.planning).toBe('');
 		expect(canSaveBoardMapping(form)).toBe(true);
 	});
 
@@ -167,6 +198,35 @@ describe('buildPmUpdate', () => {
 		expect(payload).not.toHaveProperty('projectId');
 	});
 
+	it('round-trips a Jira mapping into a member the config schema accepts', () => {
+		const payload = buildPmUpdate(toBoardMappingForm(jiraPm), jiraPm);
+		// The stored base URL survives the save unchanged, and the member is one
+		// `jiraConfigSchema` actually parses — never a silent write it then rejects.
+		expect(payload).toEqual(jiraPm);
+		expect(jiraConfigSchema.safeParse(withoutDiscriminator(payload)).success).toBe(true);
+	});
+
+	it('serializes the container to projectKey and the carried base URL for Jira', () => {
+		const payload = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'jira',
+					containerId: '  SWARM  ',
+					statusOptions: { ...blankStatusOptions(), inProgress: ' 10003 ' },
+					providerContext: { baseUrl: '  https://acme.atlassian.net  ' },
+				},
+				undefined,
+			),
+			'jira',
+		);
+		expect(payload).toEqual({
+			type: 'jira',
+			baseUrl: 'https://acme.atlassian.net',
+			projectKey: 'SWARM',
+			statusOptions: { inProgress: '10003' },
+		});
+	});
+
 	// Acceptance criterion of issue #531: neither provider's own keys may cross a
 	// provider switch — not from the stored member, not from a stale form context.
 	it('never leaks the other provider’s keys across a provider switch', () => {
@@ -207,6 +267,51 @@ describe('buildPmUpdate', () => {
 			statusFieldId: 'PVTSSF_1',
 			statusOptions: { todo: 'opt_ready' },
 		});
+	});
+
+	// Same rule for the third provider: a stale Jira base URL must not land on a GitHub
+	// member, and a GitHub field id must not land on a Jira one.
+	it('never leaks Jira’s base URL or another provider’s context across a switch', () => {
+		const toGitHub = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'github-projects',
+					containerId: 'PVT_1',
+					statusOptions: { ...blankStatusOptions(), todo: 'opt_ready' },
+					providerContext: { statusFieldId: 'PVTSSF_1', baseUrl: 'https://acme.atlassian.net' },
+				},
+				jiraPm,
+			),
+			'github-projects',
+		);
+		expect(toGitHub).toEqual({
+			type: 'github-projects',
+			projectId: 'PVT_1',
+			statusFieldId: 'PVTSSF_1',
+			statusOptions: { todo: 'opt_ready' },
+		});
+
+		const toJira = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'jira',
+					containerId: 'SWARM',
+					statusOptions: { ...blankStatusOptions(), todo: '10001' },
+					providerContext: { statusFieldId: 'PVTSSF_stale' },
+				},
+				fullPm,
+			),
+			'jira',
+		);
+		// No base URL survives from a GitHub member, so the payload the gate refuses to
+		// send carries a blank one rather than another provider's value.
+		expect(toJira).toEqual({
+			type: 'jira',
+			baseUrl: '',
+			projectKey: 'SWARM',
+			statusOptions: { todo: '10001' },
+		});
+		expect(jiraConfigSchema.safeParse(withoutDiscriminator(toJira)).success).toBe(false);
 	});
 
 	it('builds the default provider’s member for an unknown provider id', () => {
@@ -271,6 +376,34 @@ describe('isBoardMappingDirty', () => {
 			isBoardMappingDirty({ ...toBoardMappingForm(fullPm), providerId: 'linear' }, fullPm),
 		).toBe(true);
 	});
+
+	it('is false when a Jira form matches its stored mapping', () => {
+		expect(isBoardMappingDirty(toBoardMappingForm(jiraPm), jiraPm)).toBe(false);
+	});
+
+	it('is true when a Jira project key or workflow status changes', () => {
+		const project = toBoardMappingForm(jiraPm);
+		project.containerId = 'OTHER';
+		expect(isBoardMappingDirty(project, jiraPm)).toBe(true);
+
+		const status = toBoardMappingForm(jiraPm);
+		status.statusOptions.inReview = '10004';
+		expect(isBoardMappingDirty(status, jiraPm)).toBe(true);
+	});
+
+	// Jira returns no Status field context, so a stale GitHub field id left on the form
+	// must not read as a change against a stored Jira mapping.
+	it('ignores the Status field context for a Jira form', () => {
+		const form = toBoardMappingForm(jiraPm);
+		form.providerContext = { ...form.providerContext, statusFieldId: 'PVTSSF_stale' };
+		expect(isBoardMappingDirty(form, jiraPm)).toBe(false);
+	});
+
+	it('is true when a Jira form loses the stored base URL', () => {
+		const form = toBoardMappingForm(jiraPm);
+		form.providerContext = {};
+		expect(isBoardMappingDirty(form, jiraPm)).toBe(true);
+	});
 });
 
 describe('withSelectedProvider', () => {
@@ -282,6 +415,46 @@ describe('withSelectedProvider', () => {
 			statusOptions: blankStatusOptions(),
 			providerContext: {},
 		});
+	});
+
+	// The base URL comes from the stored Jira member, so leaving Jira and coming back
+	// leaves nothing to save with — exactly what the save gate must refuse.
+	it('drops Jira’s base URL on a switch away and back, blocking save', () => {
+		const back = withSelectedProvider(
+			withSelectedProvider(toBoardMappingForm(jiraPm), 'linear'),
+			'jira',
+		);
+		expect(back.providerContext).toEqual({});
+		back.containerId = 'SWARM';
+		back.statusOptions.todo = '10001';
+		expect(isBaseUrlMissing(back)).toBe(true);
+		expect(canSaveBoardMapping(back)).toBe(false);
+	});
+});
+
+describe('withSelectedContainer', () => {
+	it('clears the previous board’s states and field context', () => {
+		const switched = withSelectedContainer(toBoardMappingForm(fullPm), 'PVT_other');
+		expect(switched).toEqual({
+			providerId: 'github-projects',
+			containerId: 'PVT_other',
+			statusOptions: blankStatusOptions(),
+			providerContext: {},
+		});
+	});
+
+	// The site URL is not a property of the selected project, and nothing re-seeds it
+	// (Jira's state discovery returns no context), so it has to survive the switch.
+	it('keeps Jira’s base URL when another project is selected', () => {
+		const switched = withSelectedContainer(toBoardMappingForm(jiraPm), 'OTHER');
+		expect(switched.containerId).toBe('OTHER');
+		expect(switched.statusOptions).toEqual(blankStatusOptions());
+		expect(switched.providerContext).toEqual({ baseUrl: 'https://acme.atlassian.net' });
+	});
+
+	it('returns the same form when the container is unchanged', () => {
+		const form = toBoardMappingForm(jiraPm);
+		expect(withSelectedContainer(form, 'SWARM')).toBe(form);
 	});
 });
 
@@ -327,6 +500,34 @@ describe('canSaveBoardMapping', () => {
 		form.statusOptions = blankStatusOptions();
 		expect(canSaveBoardMapping(form)).toBe(false);
 	});
+
+	// Issue #581: Jira's own required context is the site base URL, and it is not a
+	// Status field id — a Jira mapping is gated on one and not the other.
+	it('requires a project, a base URL, and one mapped status for Jira', () => {
+		const form = toBoardMappingForm(jiraPm);
+		expect(isBaseUrlMissing(form)).toBe(false);
+		expect(canSaveBoardMapping(form)).toBe(true);
+
+		const noProject = toBoardMappingForm(jiraPm);
+		noProject.containerId = '';
+		expect(canSaveBoardMapping(noProject)).toBe(false);
+
+		const noStatus = toBoardMappingForm(jiraPm);
+		noStatus.statusOptions = blankStatusOptions();
+		expect(canSaveBoardMapping(noStatus)).toBe(false);
+	});
+
+	it('is false for a Jira form with no stored base URL', () => {
+		const form = toBoardMappingForm(jiraPm);
+		form.providerContext = { baseUrl: '   ' };
+		expect(isBaseUrlMissing(form)).toBe(true);
+		expect(canSaveBoardMapping(form)).toBe(false);
+	});
+
+	it('never reports a missing base URL for a provider that has none', () => {
+		expect(isBaseUrlMissing(toBoardMappingForm(fullPm))).toBe(false);
+		expect(isBaseUrlMissing(toBoardMappingForm(linearPm))).toBe(false);
+	});
 });
 
 describe('getPmMappingProvider', () => {
@@ -337,6 +538,13 @@ describe('getPmMappingProvider', () => {
 			containerNoun: 'team',
 			stateNoun: 'workflow state',
 			stateNounPlural: 'workflow states',
+		});
+		expect(getPmMappingProvider('jira')).toMatchObject({
+			label: 'Jira',
+			containerNoun: 'project',
+			containerNounPlural: 'projects',
+			stateNoun: 'status',
+			stateNounPlural: 'statuses',
 		});
 		expect(getPmMappingProvider('nope').id).toBe('github-projects');
 	});

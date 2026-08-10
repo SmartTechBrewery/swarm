@@ -44,9 +44,9 @@ import {
 import {
 	type BoardMappingForm,
 	buildPmUpdate,
-	blankStatusOptions as emptyBoardStatusOptions,
 	isBoardMappingDirty,
 	toBoardMappingForm,
+	withSelectedContainer,
 	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import {
@@ -2112,17 +2112,11 @@ function ProjectDetailRouteComponent() {
 	};
 
 	const handleBoardMappingSelectContainer = (containerId: string) => {
-		setBoardMapping((prev) => {
-			if (prev.containerId === containerId) return prev;
-			// Switching boards clears the previous board's state mappings and provider
-			// context so option/field IDs from one board can't be saved against another.
-			return {
-				...prev,
-				containerId,
-				statusOptions: emptyBoardStatusOptions(),
-				providerContext: {},
-			};
-		});
+		// Switching boards clears the previous board's state mappings and its
+		// container-scoped provider context, so option/field IDs from one board can't be
+		// saved against another; context that describes the *site* rather than the board
+		// (Jira's base URL) survives.
+		setBoardMapping((prev) => withSelectedContainer(prev, containerId));
 		updateMutation.reset();
 	};
 
