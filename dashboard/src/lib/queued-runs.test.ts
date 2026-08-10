@@ -6,6 +6,7 @@ import {
 	noTriggerGroupLabel,
 	queuedPhaseLabel,
 	queuedRunKey,
+	queuedWaitReasonLabel,
 	queuedWorkItemLabel,
 	queuedWorkItemTitle,
 	queuedWorkItemUrl,
@@ -62,6 +63,17 @@ describe('queuedPhaseLabel', () => {
 		['unknown', 'Unknown'],
 	] as const)('labels %s as "%s"', (hint, label) => {
 		expect(queuedPhaseLabel(hint)).toBe(label);
+	});
+});
+
+// Issue #607. The gate's two waits look identical on the Queue unless the copy says
+// which one clears by itself, which is the whole point of splitting the reason.
+describe('queuedWaitReasonLabel', () => {
+	it('distinguishes waiting for a machine from waiting for a human', () => {
+		expect(queuedWaitReasonLabel('worker-eligibility')).toBe('waiting for an available worker');
+		expect(queuedWaitReasonLabel('worker-authorization')).toBe(
+			'waiting for a worker to be authorized',
+		);
 	});
 });
 

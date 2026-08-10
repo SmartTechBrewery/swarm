@@ -166,6 +166,7 @@ import {
 	type DispatchSelection,
 	evaluateDispatchEligibility,
 	type GateDecision,
+	isAvailabilityRefusal,
 	WorkerIneligibleError,
 } from './eligibility-gate.js';
 import type { WorkerExecutionIdentity } from './execution-identity.js';
@@ -344,6 +345,13 @@ export type JobOutcome =
 			 * is the one deferral with no budget — see {@link deferWorkerIneligible}.
 			 */
 			preservedWorkerWait?: boolean;
+			/**
+			 * The gate's own refusal reason behind a `workerEligibilityRecheck`
+			 * deferral (issue #607). Carried so the settle can record *which kind of
+			 * wait* the dispatch is in — a machine that is merely busy or offline, or a
+			 * refusal only a human can clear — see {@link deferralWaitReason}.
+			 */
+			workerIneligibilityReason?: DispatchIneligibilityReason;
 	  };
 
 /**
@@ -846,6 +854,7 @@ function deferWorkerIneligible(
 		resumable: false,
 		workerEligibilityRecheck: true,
 		preservedWorkerWait: unbounded,
+		workerIneligibilityReason: err.reason,
 		// The gate refused before anything ran, so preserve board dispatch intent
 		// exactly as the dependency gate does — the re-check must re-enter the same
 		// phase even though the card never moved.
@@ -910,7 +919,16 @@ function deferralWaitReason(
 	// is the one with no budget, and the dispatch row is where an operator sees the
 	// difference between "no capable worker" and "waiting for one specific machine".
 	if (outcome.preservedWorkerWait) return 'preserved-worker';
-	if (outcome.workerEligibilityRecheck) return 'worker-eligibility';
+	if (outcome.workerEligibilityRecheck) {
+		// Which *kind* of eligibility wait (issue #607): a machine that is merely busy
+		// or offline reads as `worker-eligibility` — the value such rows already
+		// carried — while a refusal only a human can clear (consent, an enrollment, an
+		// allowed phase or CLI) reads as `worker-authorization`, because no machine
+		// coming online can change that verdict. Timing is identical either way; the
+		// row is where an operator sees which wait clears by itself.
+		const reason = outcome.workerIneligibilityReason;
+		return reason && !isAvailabilityRefusal(reason) ? 'worker-authorization' : 'worker-eligibility';
+	}
 	return waitReasonForDeferral(outcome.failureKind);
 }
 

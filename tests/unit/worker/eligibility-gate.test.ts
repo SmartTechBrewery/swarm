@@ -29,9 +29,12 @@ vi.mock('@/identity/assignee-resolver.js', () => ({
 }));
 
 import {
+	DISPATCH_INELIGIBILITY_REASONS,
 	type DispatchGateInput,
+	type DispatchIneligibilityReason,
 	evaluateDispatchEligibility,
 	isAffinityGatedPhase,
+	isAvailabilityRefusal,
 	type RunnableDispatchDemand,
 } from '@/worker/eligibility-gate.js';
 
@@ -142,6 +145,45 @@ describe('isAffinityGatedPhase', () => {
 			'resolve-conflicts',
 		] as const) {
 			expect(isAffinityGatedPhase(phase)).toBe(false);
+		}
+	});
+});
+
+// Issue #607. The classification the dispatch row records, asserted over the whole
+// refusal vocabulary: which waits clear by themselves and which need a human. Stated
+// as two explicit lists so a reason added to the union fails *here* as well as at the
+// type level, rather than being silently absorbed into whichever bucket it defaults to.
+describe('isAvailabilityRefusal', () => {
+	/** Every structural check passed; the machine is busy, offline, or the pinned one. */
+	const AVAILABILITY: readonly DispatchIneligibilityReason[] = [
+		'worker-unavailable',
+		'assignee-worker-unavailable',
+		'preserved-worker-unavailable',
+	];
+	/** Nothing a connecting machine can change — a human must act. */
+	const AUTHORIZATION: readonly DispatchIneligibilityReason[] = [
+		'missing-enrollment',
+		'missing-consent',
+		'missing-phase-capability',
+		'phase-not-permitted',
+		'missing-cli-capability',
+	];
+
+	it('classifies every reason in the union, and no reason twice', () => {
+		expect([...AVAILABILITY, ...AUTHORIZATION].sort()).toEqual(
+			[...DISPATCH_INELIGIBILITY_REASONS].sort(),
+		);
+	});
+
+	it('treats a machine that is merely busy, offline, or pinned as an availability wait', () => {
+		for (const reason of AVAILABILITY) {
+			expect(isAvailabilityRefusal(reason), reason).toBe(true);
+		}
+	});
+
+	it('treats a refusal only a human can clear as something else entirely', () => {
+		for (const reason of AUTHORIZATION) {
+			expect(isAvailabilityRefusal(reason), reason).toBe(false);
 		}
 	});
 });

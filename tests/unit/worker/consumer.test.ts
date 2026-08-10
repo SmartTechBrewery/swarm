@@ -2185,6 +2185,38 @@ describe('processJob', () => {
 			});
 		});
 
+		// Issue #607. The row says *which kind* of wait it is in, because the two clear
+		// differently: a busy machine frees itself, a revoked consent never does. The
+		// distinction is visible only there — nothing about the timing changes.
+		it('separates a refusal only a human can clear from a busy machine, on identical timing', async () => {
+			async function settle(candidates: WorkerDispatchCandidate[]) {
+				scheduleDispatchRetry.mockClear();
+				listProjectDispatchCandidates.mockResolvedValue(candidates);
+				const outcome = await processJob(
+					createMockPmWebhookJob({ rateLimitRetryAttempt: 3 }),
+					registryReturning(planningTrigger()),
+				);
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				return { outcome, input };
+			}
+
+			const busy = await settle([candidate('w-1', { activeRuns: 1 })]);
+			const revoked = await settle([candidate('w-1', { sharingConsent: false })]);
+
+			expect(busy.input.waitReason).toBe('worker-eligibility');
+			expect(revoked.input.waitReason).toBe('worker-authorization');
+			// Same cadence, same attempt counter, same budget: no dispatch starts earlier
+			// or later because of the distinction.
+			const retryDelayMs = (busy.outcome as { retryDelayMs?: number }).retryDelayMs;
+			expect(retryDelayMs).toBeGreaterThan(0);
+			expect(revoked.outcome).toMatchObject({ status: 'phase-deferred', retryDelayMs });
+			expect(revoked.input.attempt).toBe(busy.input.attempt);
+			expect(revoked.input.jobPayload).toMatchObject({
+				workerEligibilityRecheckAttempt: 1,
+				rateLimitRetryAttempt: 3,
+			});
+		});
+
 		it('fails with the actionable reason once the re-check budget is exhausted', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
 				candidate('w-1', { sharingConsent: false }),

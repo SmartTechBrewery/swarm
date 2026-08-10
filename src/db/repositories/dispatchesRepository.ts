@@ -86,8 +86,24 @@ export type DispatchWaitReason =
 	| 'worktree-exists'
 	| 'stalled'
 	| 'recheck'
-	/** No eligible worker could take the dispatch (issue #339's federated gate). */
+	/**
+	 * No eligible worker could take the dispatch (issue #339's federated gate)
+	 * because none is *available*: some worker cleared every structural check and
+	 * is merely busy or offline, so time alone clears the wait. Narrowed to that
+	 * meaning by issue #607 — it keeps the value the rows already carry, and the
+	 * refusals a human must clear moved to `worker-authorization`.
+	 */
 	| 'worker-eligibility'
+	/**
+	 * The same gate refused for a reason **only a human can clear** (issue #607):
+	 * no approved enrollment, no sharing consent, or no worker declaring/allowed
+	 * the phase or CLI this project configures. Distinct from
+	 * `worker-eligibility` because no machine connecting or freeing capacity can
+	 * change the verdict — which is what the Queue shows an operator, and what a
+	 * wake-up policy keys on. Same cadence, attempt counter, and budget as the
+	 * availability wait.
+	 */
+	| 'worker-authorization'
 	/**
 	 * A continuation is waiting for the one machine that holds its preserved
 	 * checkout (issue #567). Distinct from `worker-eligibility` on purpose: that
