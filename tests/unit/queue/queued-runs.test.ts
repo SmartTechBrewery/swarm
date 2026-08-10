@@ -275,6 +275,16 @@ describe('toQueuedRuns', () => {
 		});
 	});
 
+	// Issue #607. `toQueuedRun` ends in `QueuedRunSchema.parse`, so an unmirrored wait
+	// reason would not degrade the row — it would throw and take the whole Queue read
+	// with it. Both halves of the gate's wait are asserted for that reason.
+	it('accepts either kind of dispatch-gate wait, so the Queue read survives both', () => {
+		for (const waitReason of ['worker-eligibility', 'worker-authorization'] as const) {
+			const [item] = toQueuedRuns([makeDispatch({ state: 'retry-scheduled', waitReason })]);
+			expect(item).toMatchObject({ state: 'delayed', waitReason });
+		}
+	});
+
 	it('maps a capacity-blocked dispatch to the blocked state with its wait reason', () => {
 		const [item] = toQueuedRuns([
 			makeDispatch({ waitReason: 'project-capacity', continuation: true }),

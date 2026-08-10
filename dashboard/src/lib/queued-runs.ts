@@ -60,7 +60,12 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	'worktree-exists': 'retrying after a worktree collision',
 	stalled: 'retrying after a stalled response',
 	recheck: 'waiting for checks to settle',
-	'worker-eligibility': 'waiting for an eligible worker',
+	// The two halves of the dispatch gate's wait, deliberately worded so an operator
+	// can tell them apart at a glance (issue #607): the first clears on its own once a
+	// machine is free, the second only when a human acts (grant sharing consent,
+	// approve an enrollment, permit the phase, enroll a worker that runs the CLI).
+	'worker-eligibility': 'waiting for an available worker',
+	'worker-authorization': 'waiting for a worker to be authorized',
 	// Deliberately names the *machine* rather than "a worker": every other worker in
 	// the project may be free and it changes nothing, because this dispatch continues
 	// work preserved on one specific machine (issue #567).

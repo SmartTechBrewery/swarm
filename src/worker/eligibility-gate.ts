@@ -340,6 +340,51 @@ function aggregateReason(reported: Set<IneligibilityReason>): IneligibilityReaso
 	return 'worker-unavailable';
 }
 
+/**
+ * Which *kind of wait* each refusal puts a dispatch in (issue #607) — the split
+ * {@link REASON_PRIORITY} already draws for message purposes, stated once so the
+ * dispatch row can record it durably.
+ *
+ * `true` means the refusal is an **availability** wait: every structural check
+ * passed and the machine is merely busy, offline, or (for the preserved-checkout
+ * pin) the one machine that may continue this run. Time alone clears it. `false`
+ * means the refusal names something only a human changes — an enrollment
+ * approval, sharing consent, an allowed phase, a declared/allowed CLI — so no
+ * machine coming online can make the verdict true.
+ *
+ * A `Record` over the whole union rather than a set of the availability reasons:
+ * a reason added to {@link DispatchIneligibilityReason} then fails to compile
+ * until it is classified here, instead of defaulting silently into one bucket.
+ */
+const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
+	'worker-unavailable': true,
+	'assignee-worker-unavailable': true,
+	'preserved-worker-unavailable': true,
+	'missing-enrollment': false,
+	'missing-consent': false,
+	'missing-phase-capability': false,
+	'phase-not-permitted': false,
+	'missing-cli-capability': false,
+};
+
+/** Every reason the gate can refuse with — the domain of {@link isAvailabilityRefusal}. */
+export const DISPATCH_INELIGIBILITY_REASONS = Object.keys(
+	AVAILABILITY_REFUSAL,
+) as readonly DispatchIneligibilityReason[];
+
+/**
+ * Whether a refusal is one that a machine becoming available can clear (issue
+ * #607) — see {@link AVAILABILITY_REFUSAL} for the classification itself. The
+ * deferral records the two kinds under different dispatch wait reasons, so an
+ * operator (and, later, a wake-up policy) can tell "waiting for a machine" from
+ * "waiting for a human". The preserved-checkout pin is availability-shaped here
+ * too, but its deferral keeps recording the third reason it has had since issue
+ * #567 (`preserved-worker`) — it is classified, not re-labelled.
+ */
+export function isAvailabilityRefusal(reason: DispatchIneligibilityReason): boolean {
+	return AVAILABILITY_REFUSAL[reason];
+}
+
 /** Where the refusal message should point a human, per reason. */
 function ineligibilityMessage(
 	reason: DispatchIneligibilityReason,
