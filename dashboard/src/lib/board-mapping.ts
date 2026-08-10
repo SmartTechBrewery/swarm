@@ -17,22 +17,27 @@ export interface BoardMappingForm {
 	providerId: string;
 	/**
 	 * Selected board/container opaque id — a Projects v2 node ID for GitHub, a team
-	 * UUID for Linear. Blank = unselected.
+	 * UUID for Linear, a project key for Jira. Blank = unselected.
 	 */
 	containerId: string;
 	/** Discovered state id per canonical status; blank = unmapped. */
 	statusOptions: Record<PmStatusKey, string>;
 	/**
-	 * Opaque provider scope carried from state discovery to save time — for GitHub
-	 * Projects `{ statusFieldId }`; empty for a provider whose state ids are the whole
-	 * mapping, such as Linear. Cleared when the selected container or provider
-	 * changes so one board's field id can't be saved against another.
+	 * Opaque provider scope carried through to save time — for GitHub Projects the
+	 * `{ statusFieldId }` state discovery returns, for Jira the `{ baseUrl }` the
+	 * stored mapping was read with; empty for a provider whose state ids are the
+	 * whole mapping, such as Linear. Cleared on a provider switch so one provider's
+	 * scope can't be saved as another's, and its *container-scoped* half (GitHub's
+	 * field id) is cleared on a container switch too — a site URL is not a property
+	 * of the selected container, so it survives that (see
+	 * {@link withSelectedContainer}).
 	 */
 	providerContext: Record<string, string>;
 }
 
 type GitHubProjectsPm = Extract<ProjectPm, { type: 'github-projects' }>;
 type LinearPm = Extract<ProjectPm, { type: 'linear' }>;
+type JiraPm = Extract<ProjectPm, { type: 'jira' }>;
 
 /**
  * The six canonical pipeline status keys (`PM_STATUS_KEYS` — the single source
@@ -107,6 +112,16 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		intro:
 			"Pick this project's Linear team, then map each SWARM pipeline status to one of the team's workflow states. Teams and states are discovered server-side with this project's own board credential, configured under Credentials above.",
 	},
+	{
+		id: 'jira',
+		label: 'Jira',
+		containerNoun: 'project',
+		containerNounPlural: 'projects',
+		stateNoun: 'status',
+		stateNounPlural: 'statuses',
+		intro:
+			"Pick this project's Jira project, then map each SWARM pipeline status to one of its workflow statuses. Projects and statuses are discovered server-side with this project's own board credential, configured under Credentials above. The Jira site URL is board identity, set in swarm.config.json and preserved by this screen.",
+	},
 ];
 
 export const DEFAULT_PM_PROVIDER_ID = PM_MAPPING_PROVIDERS[0].id;
@@ -138,6 +153,32 @@ function usesStatusFieldContext(form: BoardMappingForm): boolean {
 	return selectedProviderId(form) === 'github-projects';
 }
 
+/**
+ * Whether the selected provider's member carries a site base URL the mapping is
+ * incomplete without. Jira's `baseUrl` names the Cloud site its project key and
+ * status ids belong to; it is board identity set in `swarm.config.json` rather than
+ * edited here (issue #490 phase 1/6), so this screen only has to carry it through a
+ * save — and refuse to write a member without one instead of letting
+ * `jiraConfigSchema` reject it after the fact.
+ */
+function requiresBaseUrl(form: BoardMappingForm): boolean {
+	return selectedProviderId(form) === 'jira';
+}
+
+/** The carried base URL, normalized; blank when the provider has none or none is set. */
+function baseUrlOf(form: BoardMappingForm): string {
+	return requiresBaseUrl(form) ? (form.providerContext.baseUrl ?? '').trim() : '';
+}
+
+/**
+ * Whether the selected provider needs a base URL and the form carries none — the
+ * one save gate the operator can't clear from this screen, so the panel explains
+ * where to set it rather than leaving Save inexplicably disabled.
+ */
+export function isBaseUrlMissing(form: BoardMappingForm): boolean {
+	return requiresBaseUrl(form) && !baseUrlOf(form);
+}
+
 /** An empty option map with every canonical key present, for seeding blank state. */
 export function blankStatusOptions(): Record<PmStatusKey, string> {
 	return Object.fromEntries(STATUS_KEYS.map((key) => [key, ''])) as Record<PmStatusKey, string>;
@@ -156,6 +197,30 @@ export function withSelectedProvider(form: BoardMappingForm, providerId: string)
 }
 
 /**
+ * Reset container-scoped selections before moving the form to another container, so
+ * one board's state ids and field id can't be saved against another.
+ *
+ * What survives is the part of `providerContext` that is *not* a property of the
+ * selected container: Jira's `baseUrl` is the site every one of the discovered
+ * projects came from, and nothing re-seeds it (this screen doesn't edit it and Jira's
+ * state discovery deliberately returns no context), so clearing it on a container
+ * switch would leave a Jira mapping permanently unsaveable.
+ */
+export function withSelectedContainer(
+	form: BoardMappingForm,
+	containerId: string,
+): BoardMappingForm {
+	if (form.containerId === containerId) return form;
+	const baseUrl = baseUrlOf(form);
+	return {
+		...form,
+		containerId,
+		statusOptions: blankStatusOptions(),
+		providerContext: baseUrl ? { baseUrl } : {},
+	};
+}
+
+/**
  * Project the project's stored `pm` member onto the provider-neutral form,
  * filling a blank for any status key the board hasn't mapped so every selector
  * is controlled. The selected provider comes from the member's own `type`
@@ -168,13 +233,15 @@ export function withSelectedProvider(form: BoardMappingForm, providerId: string)
  * round-trip even when discovery can't currently reach the board.
  *
  * Provider-specific fields are read only after narrowing: the neutral
- * `containerId` is GitHub's board node id or Linear's team UUID depending on the
- * member, and `providerContext` stays GitHub-only because only GitHub Projects
- * has a second id to carry (issue #531).
+ * `containerId` is GitHub's board node id, Linear's team UUID, or Jira's project
+ * key depending on the member, and `providerContext` carries whichever second
+ * value that member has — GitHub's Status field id (issue #531) or Jira's site
+ * base URL (issue #581), never both.
  */
 export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm {
 	const githubProjects = pm?.type === 'github-projects' ? pm : undefined;
 	const linear = pm?.type === 'linear' ? pm : undefined;
+	const jira = pm?.type === 'jira' ? pm : undefined;
 	const statusOptions = blankStatusOptions();
 	for (const key of STATUS_KEYS) {
 		const value = pm?.statusOptions?.[key];
@@ -182,11 +249,13 @@ export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm 
 	}
 	return {
 		providerId: pm?.type ?? DEFAULT_PM_PROVIDER_ID,
-		containerId: githubProjects?.projectId ?? linear?.teamId ?? '',
+		containerId: githubProjects?.projectId ?? linear?.teamId ?? jira?.projectKey ?? '',
 		statusOptions,
 		providerContext: githubProjects?.statusFieldId
 			? { statusFieldId: githubProjects.statusFieldId }
-			: {},
+			: jira?.baseUrl
+				? { baseUrl: jira.baseUrl }
+				: {},
 	};
 }
 
@@ -221,6 +290,20 @@ export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | unde
 		const linear: LinearPm = { type: 'linear', teamId: containerId, statusOptions };
 		return linear;
 	}
+	if (selectedProviderId(form) === 'jira') {
+		// The site URL isn't edited here: it comes from the form's carried context,
+		// which `toBoardMappingForm` seeded from the stored Jira member and which is
+		// blank when the stored member is another provider's — the case
+		// `canSaveBoardMapping` refuses rather than writing a member Jira's schema
+		// would then reject.
+		const jira: JiraPm = {
+			type: 'jira',
+			baseUrl: baseUrlOf(form),
+			projectKey: containerId,
+			statusOptions,
+		};
+		return jira;
+	}
 	// `phaseLabels` is GitHub Projects' own field and this screen doesn't edit it, so
 	// it survives a save — but only when the stored member is that same provider's.
 	const githubProjects = existing?.type === 'github-projects' ? existing : undefined;
@@ -237,9 +320,10 @@ export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | unde
 /**
  * Whether the form differs from the stored config, compared semantically after
  * normalization (selected provider, selected container, and each mapped status).
- * The Status field context is compared only for GitHub Projects — it is that
- * provider's own field, so a provider that returns none would otherwise read as
- * permanently clean or permanently dirty against a stored GitHub mapping.
+ * Each provider's own `providerContext` entry is compared only for that provider —
+ * the Status field id for GitHub Projects, the site base URL for Jira — so a
+ * provider that carries neither doesn't read as permanently clean or permanently
+ * dirty against a stored mapping that does.
  */
 export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | undefined): boolean {
 	const stored = toBoardMappingForm(pm);
@@ -251,6 +335,8 @@ export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | unde
 			(stored.providerContext.statusFieldId ?? '')
 	)
 		return true;
+	if (requiresBaseUrl(form) && baseUrlOf(form) !== (stored.providerContext.baseUrl ?? ''))
+		return true;
 	return STATUS_KEYS.some(
 		(key) => (form.statusOptions[key]?.trim() ?? '') !== stored.statusOptions[key],
 	);
@@ -259,14 +345,16 @@ export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | unde
 /**
  * Whether the form can be saved: a container is selected and at least one
  * canonical status is mapped — matching every provider schema's "at least one
- * option" minimum (`githubProjectsConfigSchema`, `linearConfigSchema`) rather than
- * requiring every status be mapped — plus, for GitHub Projects alone, a known
- * Status-field context. The route additionally gates Save on the form being dirty
- * and no other config write being in flight.
+ * option" minimum (`githubProjectsConfigSchema`, `linearConfigSchema`,
+ * `jiraConfigSchema`) rather than requiring every status be mapped — plus each
+ * provider's own required context: a known Status-field context for GitHub Projects,
+ * a carried site base URL for Jira. The route additionally gates Save on the form
+ * being dirty and no other config write being in flight.
  */
 export function canSaveBoardMapping(form: BoardMappingForm): boolean {
 	if (!form.containerId.trim()) return false;
 	if (usesStatusFieldContext(form) && !(form.providerContext.statusFieldId ?? '').trim())
 		return false;
+	if (isBaseUrlMissing(form)) return false;
 	return STATUS_KEYS.some((key) => !!form.statusOptions[key]?.trim());
 }
