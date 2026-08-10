@@ -78,6 +78,24 @@ export async function findProjectByJiraProject(
 }
 
 /**
+ * Resolve the SWARM project that owns a Trello **board**, by the board id
+ * (`pm.boardId`) a card action carries at `action.data.board.id`. The Trello
+ * counterpart of {@link findProjectByLinearTeam}, and the same one-line facade
+ * over the parameterised container lookup — the `pm_type` filter is what stops
+ * another provider's config blob matching on the same key name (issue #529).
+ *
+ * The long 24-character object id, not the board's short link, because that is
+ * what the board mapping stores and what a delivery carries
+ * (`src/integrations/pm/trello/config-schema.ts`). Returns `undefined` for an
+ * untracked board — "not ours", not an error.
+ */
+export async function findProjectByTrelloBoard(
+	boardId: string,
+): Promise<ProjectConfig | undefined> {
+	return findProjectByPmContainerFromDb('trello', 'boardId', boardId);
+}
+
+/**
  * Resolve a persona's GitHub token for a project, or `null` if it resolves to no
  * token.
  *

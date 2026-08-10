@@ -600,6 +600,17 @@ describe('createWebhookApp', () => {
 			expect((await app.request('/jira/webhook')).status).toBe(200);
 		});
 
+		// Trello confirms a webhook registration with a **HEAD** request to the
+		// callback URL and refuses to create the webhook unless it answers 200. Hono
+		// dispatches HEAD onto the matching GET handler (returning it with a null
+		// body), so the ping mounted above already covers it — pinned here so a
+		// future receiver refactor cannot silently break that handshake.
+		it('answers a HEAD confirmation on a PM-owned route with 200', async () => {
+			const { app } = makeTwoProviderApp();
+			const res = await app.request('/jira/webhook', { method: 'HEAD' });
+			expect(res.status).toBe(200);
+		});
+
 		it('enqueues its event under its own provider id, verified by its own verifier', async () => {
 			const verifyWebhookSignature = vi.fn().mockReturnValue(true);
 			const { app, enqueuePm, githubProjects } = makeTwoProviderApp({ verifyWebhookSignature });
