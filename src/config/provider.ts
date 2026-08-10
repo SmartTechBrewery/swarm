@@ -59,6 +59,25 @@ export async function findProjectByLinearTeam(teamId: string): Promise<ProjectCo
 }
 
 /**
+ * Resolve the SWARM project that owns a Jira **project**, by the project key
+ * (`pm.projectKey`, e.g. `SWARM`) a Jira issue webhook carries at
+ * `issue.fields.project.key`. The Jira counterpart of
+ * {@link findProjectByLinearTeam}, and the same one-line facade over the
+ * parameterised container lookup — the `pm_type` filter is what stops another
+ * provider's config blob matching on the same key name (issue #529).
+ *
+ * The key, not the numeric project id, because that is what every issue key is
+ * prefixed with and what the board mapping stores
+ * (`src/integrations/pm/jira/config-schema.ts`). Returns `undefined` for an
+ * untracked project — "not ours", not an error.
+ */
+export async function findProjectByJiraProject(
+	projectKey: string,
+): Promise<ProjectConfig | undefined> {
+	return findProjectByPmContainerFromDb('jira', 'projectKey', projectKey);
+}
+
+/**
  * Resolve a persona's GitHub token for a project, or `null` if it resolves to no
  * token.
  *
