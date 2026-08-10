@@ -20,11 +20,13 @@ import {
 	getDispatchById,
 	getWorkerDispatchClaimState,
 	hasExecutingDispatchForTask,
+	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
 	listRunnableDispatchesForPool,
 	listWaitingDispatches,
 	listWakeablePendingDispatches,
 	markDispatchRunning,
+	promoteDispatchToImmediateWake,
 	reopenDispatchForManualRetry,
 	scheduleDispatchRetry,
 	selectNextCapacityDispatch,
@@ -34,6 +36,7 @@ import {
 	completeRun,
 	createRun,
 	getRunByIdFromDb,
+	recordRunPreservedWorker,
 } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
@@ -927,6 +930,138 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			const orphans = await listDeferredRunsWithoutActiveDispatch();
 			expect(orphans.map((r) => r.id)).toEqual([orphanId]);
 			expect(await getActiveDispatchByRunId(coveredId)).toBeDefined();
+		});
+	});
+
+	// Issue #610. Which deferred dispatches a worker becoming available may start —
+	// the read behind the early wake-up, and the conditional re-date that makes two
+	// concurrent wake-ups resolve to one promotion.
+	describe('availability-wait promotion', () => {
+		const OTHER_PROJECT_ID = 'proj-dispatches-other';
+
+		/** A worker of `suffix`, enrolled in `PROJECT_ID` with the given routability. */
+		async function seedEnrolledWorker(
+			suffix: string,
+			enrollment: { status?: 'pending' | 'active' | 'suspended'; sharingConsent?: boolean } = {},
+		): Promise<string> {
+			const owner = await createUser({
+				identifier: `wake-${suffix}@example.com`,
+				displayName: 'Owner',
+			});
+			const worker = await createWorker({
+				ownerUserId: owner.id,
+				displayName: `worker-${suffix}`,
+				capabilities: ['claude'],
+				credentialHash: `wake-hash-${suffix}`,
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: PROJECT_ID,
+				status: enrollment.status ?? 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: enrollment.sharingConsent ?? true,
+			});
+			return worker.id;
+		}
+
+		/** A dispatch deferred on `waitReason`, due in a minute like the real re-check. */
+		async function deferredDispatch(
+			waitReason: 'worker-eligibility' | 'worker-authorization' | 'preserved-worker',
+			overrides: { projectId?: string; runId?: string; availableAt?: Date } = {},
+		): Promise<DispatchRow> {
+			const { dispatch } = await createDispatch({
+				projectId: overrides.projectId ?? PROJECT_ID,
+				jobPayload: job({ runId: overrides.runId }),
+				source: 'webhook',
+				state: 'retry-scheduled',
+				waitReason,
+				availableAt: overrides.availableAt ?? new Date(Date.now() + 60_000),
+				runId: overrides.runId,
+			});
+			return dispatch;
+		}
+
+		it('offers the availability waits in the worker’s routable projects, and nothing else', async () => {
+			await seedProject({ id: OTHER_PROJECT_ID, repo: 'jkwiecien/other-repo' });
+			const workerId = await seedEnrolledWorker('routable');
+
+			const waiting = await deferredDispatch('worker-eligibility');
+			// A structural wait a machine cannot clear (issue #607), another project, a
+			// dispatch already due, and one that is no longer waiting at all.
+			await deferredDispatch('worker-authorization');
+			await deferredDispatch('worker-eligibility', { projectId: OTHER_PROJECT_ID });
+			await deferredDispatch('worker-eligibility', {
+				availableAt: new Date(Date.now() - 1_000),
+			});
+			const claimed = await deferredDispatch('worker-eligibility');
+			await claimDispatch(claimed.id, OWNER, 60_000);
+
+			const candidates = await listAvailabilityWaitsForWorker(workerId);
+			expect(candidates.map((row) => row.id)).toEqual([waiting.id]);
+		});
+
+		it('offers nothing to a worker whose enrollment is not routable', async () => {
+			const suspended = await seedEnrolledWorker('suspended', { status: 'suspended' });
+			const withoutConsent = await seedEnrolledWorker('no-consent', { sharingConsent: false });
+			await deferredDispatch('worker-eligibility');
+
+			expect(await listAvailabilityWaitsForWorker(suspended)).toEqual([]);
+			expect(await listAvailabilityWaitsForWorker(withoutConsent)).toEqual([]);
+		});
+
+		it('offers a preserved-checkout wait to its own machine, enrolled here or not', async () => {
+			// The pinned machine is deliberately *not* enrolled in this project — the gate
+			// honours the pin regardless (issue #567), so enrollment is the wrong key.
+			const owner = await createUser({ identifier: 'pinned@example.com', displayName: 'Owner' });
+			const pinned = await createWorker({
+				ownerUserId: owner.id,
+				displayName: 'worker-pinned',
+				capabilities: ['claude'],
+				credentialHash: 'wake-hash-pinned',
+			});
+			const enrolledElsewhere = await seedEnrolledWorker('bystander');
+
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '549',
+				phase: 'implementation',
+				workerId: pinned.id,
+			});
+			await recordRunPreservedWorker(runId);
+			const waiting = await deferredDispatch('preserved-worker', { runId });
+
+			expect((await listAvailabilityWaitsForWorker(pinned.id)).map((row) => row.id)).toEqual([
+				waiting.id,
+			]);
+			// Every other worker in the project being free changes nothing.
+			expect(await listAvailabilityWaitsForWorker(enrolledElsewhere)).toEqual([]);
+		});
+
+		it('re-dates the dispatch once, whichever wake-up gets there first', async () => {
+			const workerId = await seedEnrolledWorker('racing');
+			const waiting = await deferredDispatch('worker-eligibility');
+
+			const first = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+			const second = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+
+			expect(second).toBeNull();
+			expect(first?.wakeSeq).toBe(waiting.wakeSeq + 1);
+			expect(first?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
+			// The retry intent is untouched: the woken job spends the budget the previous
+			// settle persisted, and re-enters the gate exactly as the timer would have.
+			expect(first?.attempt).toBe(waiting.attempt);
+			expect(first?.jobPayload).toEqual(waiting.jobPayload);
+			expect(first?.waitReason).toBe('worker-eligibility');
+			// And it is no longer a candidate, so a later wake-up is a no-op.
+			expect(await listAvailabilityWaitsForWorker(workerId)).toEqual([]);
+		});
+
+		it('refuses to re-date a structural wait even when asked directly', async () => {
+			const waiting = await deferredDispatch('worker-authorization');
+
+			expect(await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq)).toBeNull();
 		});
 	});
 });

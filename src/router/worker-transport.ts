@@ -34,6 +34,7 @@ import type { createNodeWebSocket } from '@hono/node-ws';
 import type { Hono } from 'hono';
 import type { WSContext } from 'hono/ws';
 
+import { promoteAvailabilityWaitsForWorker } from '../dispatch/dispatcher.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '../identity/worker.js';
 import {
@@ -127,6 +128,13 @@ export interface WorkerTransportDeps {
 	 * write must not take that on trust.
 	 */
 	resolveDispatchStreamTarget: (dispatchId: string) => DispatchStreamTarget | undefined;
+	/**
+	 * A worker just became reachable here — wake the dispatches that were deferred
+	 * only because none was (issue #610, `../dispatch/dispatcher.ts`). Fire-and-
+	 * forget by contract: it returns `void` so opening a socket never waits on
+	 * Postgres or Redis, and the promotion swallows its own failures.
+	 */
+	onWorkerAvailable: (workerId: string) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -143,6 +151,9 @@ function defaultDeps(): WorkerTransportDeps {
 		deliverDispatchAck,
 		persistStreamLog,
 		resolveDispatchStreamTarget,
+		onWorkerAvailable: (workerId) => {
+			void promoteAvailabilityWaitsForWorker(workerId, 'connected');
+		},
 	};
 }
 
@@ -418,6 +429,39 @@ function applyStreamAction(ws: WSContext, action: WorkerStreamAction): void {
 }
 
 /**
+ * An authenticated `/worker/stream` socket opened: record it as the worker's live
+ * transport, then wake the work that was only waiting for a machine like this one.
+ *
+ * Factored out of the socket glue for the same reason `handleHandshake` and
+ * `handleWorkerStreamFrame` are — a test drives it with a fake `WSContext` and a
+ * fake promotion — and kept here rather than inside `registerConnection` so the
+ * connected-worker registry keeps owning no scheduling decision of its own.
+ *
+ * This is the *first* of the two moments a worker becomes available (issue #610);
+ * the other is a dispatch bound to it settling (`../worker/consumer.ts`). Waking
+ * is fire-and-forget: the socket must open regardless of what Postgres or Redis
+ * are doing.
+ */
+export function handleWorkerStreamOpen(
+	deps: WorkerTransportDeps,
+	workerId: string,
+	ws: WSContext,
+): void {
+	registerConnection(workerId, ws);
+	try {
+		deps.onWorkerAvailable(workerId);
+	} catch (err) {
+		// Registration already happened, and it is the part connectivity depends on.
+		// A scheduling nudge that fails must not take the socket down with it — the
+		// timed re-check still starts the waiting work.
+		logger.warn('worker connected: waking availability-blocked dispatches failed', {
+			workerId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
  * Wire the two transport routes onto the router's Hono `app`. `upgradeWebSocket`
  * is the handle from `createNodeWebSocket({ app })` (constructed in the router
  * entry point so `injectWebSocket` binds the same server). Pass `overrides` to
@@ -488,9 +532,10 @@ export function registerWorkerTransport(
 						return;
 					}
 					// Record this socket as the live transport for the worker so the control
-					// plane can push to it. A prior socket for the same worker is superseded
-					// (a newer daemon wins — see `registerConnection`).
-					registerConnection(workerId, ws);
+					// plane can push to it (a prior socket for the same worker is superseded
+					// — a newer daemon wins, see `registerConnection`), then promote whatever
+					// was waiting for a worker to become available.
+					handleWorkerStreamOpen(deps, workerId, ws);
 				},
 				async onMessage(evt, ws) {
 					if (workerId === undefined) {

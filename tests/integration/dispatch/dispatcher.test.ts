@@ -8,11 +8,15 @@ import {
 	listWakeablePendingDispatches,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import { completeRun, createRun } from '../../../src/db/repositories/runsRepository.js';
+import { createUser } from '../../../src/db/repositories/usersRepository.js';
+import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
+import { createWorker } from '../../../src/db/repositories/workersRepository.js';
 import {
 	cancelAllWaitingWork,
 	cancelDispatchAndWake,
 	claimDispatchForJob,
 	createAndPublishDispatch,
+	promoteAvailabilityWaitsForWorker,
 	promoteNextCapacityDispatch,
 	publishDispatchWakeUp,
 	scheduleCoalescedDispatch,
@@ -182,6 +186,53 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 
 			// Promotion is idempotent under racing slot releases (same job id).
 			await promoteNextCapacityDispatch(PROJECT_ID, true);
+			expect(await pendingJobIds()).toHaveLength(1);
+		});
+
+		// Issue #610. The availability wake-up's real difference from the capacity one:
+		// it promotes a `retry-scheduled` row that already holds a *delayed* wake-up, so
+		// the stale one has to go rather than be overwritten.
+		it('an available worker replaces the delayed wake-up with an immediate one', async () => {
+			const owner = await createUser({ identifier: 'wake@example.com', displayName: 'Owner' });
+			const worker = await createWorker({
+				ownerUserId: owner.id,
+				displayName: 'worker-wake',
+				capabilities: ['claude'],
+				credentialHash: 'wake-hash',
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: PROJECT_ID,
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				state: 'retry-scheduled',
+				waitReason: 'worker-eligibility',
+				// The 5-minute re-check the gate's deferral schedules.
+				availableAt: new Date(Date.now() + 300_000),
+			});
+			await publishDispatchWakeUp(dispatch);
+			const [delayed] = await inspect.getDelayed();
+			expect(delayed?.id).toBe(wakeJobId(dispatch));
+
+			expect(await promoteAvailabilityWaitsForWorker(worker.id, 'connected')).toBe(1);
+
+			// Exactly one wake-up, on the next wake sequence, eligible now rather than in
+			// five minutes — the stale delayed job is gone, not merely shadowed.
+			const promoted = await getDispatchById(dispatch.id);
+			expect(promoted?.wakeSeq).toBe(dispatch.wakeSeq + 1);
+			expect(await pendingJobIds()).toEqual([wakeJobId({ id: dispatch.id, wakeSeq: 1 })]);
+			expect(await inspect.getDelayed()).toEqual([]);
+
+			// A second worker becoming available finds nothing left to promote.
+			expect(await promoteAvailabilityWaitsForWorker(worker.id, 'capacity-freed')).toBe(0);
 			expect(await pendingJobIds()).toHaveLength(1);
 		});
 

@@ -187,6 +187,7 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	created: true,
 }));
 const promoteNextCapacityDispatch = vi.fn(async (_projectId: string, _prioritize?: boolean) => {});
+const promoteAvailabilityWaitsForWorker = vi.fn(async (_workerId: string, _cause: string) => 0);
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	DISPATCH_LEASE_OWNER: 'test-host:1',
@@ -197,6 +198,8 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 		...dispatch.jobPayload,
 		dispatchId: dispatch.id,
 	}),
+	promoteAvailabilityWaitsForWorker: (workerId: string, cause: string) =>
+		promoteAvailabilityWaitsForWorker(workerId, cause),
 	promoteNextCapacityDispatch: (projectId: string, prioritize?: boolean) =>
 		promoteNextCapacityDispatch(projectId, prioritize),
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
@@ -680,6 +683,7 @@ describe('processJob', () => {
 		createAndPublishDispatch.mockClear();
 		createAndPublishDispatch.mockResolvedValue({ dispatch: mockDispatchRow({}), created: true });
 		promoteNextCapacityDispatch.mockClear();
+		promoteAvailabilityWaitsForWorker.mockClear();
 		publishDispatchWakeUp.mockClear();
 		completeDispatch.mockClear();
 		failDispatch.mockClear();
@@ -2337,6 +2341,51 @@ describe('processJob', () => {
 					preservedWorkerWait: false,
 				});
 				expect(phaseCalls).toEqual([]);
+			});
+		});
+
+		// Issue #610. The settle is the capacity-freed signal — including for a
+		// federated transport worker, whose phase runs remotely and reports back here.
+		describe('waking the availability waits a settle unblocks', () => {
+			it('wakes them on the worker whose execution claim this dispatch held', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-1')]);
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-1'),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(promoteAvailabilityWaitsForWorker).toHaveBeenCalledWith('w-1', 'capacity-freed');
+			});
+
+			it('wakes them for a deferral too — the claim is released either way', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-1')]);
+				phaseImpl = async () => {
+					throw new AgentRunError('rate limited', { kind: 'rate-limit' }, agentResult());
+				};
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-1'),
+				);
+
+				expect(outcome.status).toBe('phase-deferred');
+				expect(promoteAvailabilityWaitsForWorker).toHaveBeenCalledWith('w-1', 'capacity-freed');
+			});
+
+			it('wakes nothing when the gate refused before any claim was bound', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-1', { activeRuns: 1 })]);
+
+				await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
+
+				// No capacity was taken, so none was freed — the dispatch is simply queued
+				// behind whatever is already running.
+				expect(promoteAvailabilityWaitsForWorker).not.toHaveBeenCalled();
 			});
 		});
 

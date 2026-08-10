@@ -878,6 +878,122 @@ export async function selectNextCapacityDispatch(
 }
 
 /**
+ * The wait reasons an *availability* wake-up may promote (issue #610) — the two
+ * the dispatch gate records when nothing structural is wrong and a machine
+ * merely has to become available (issue #607 is what made them distinguishable
+ * on the row).
+ *
+ * `worker-authorization` is deliberately absent: a worker connecting or freeing
+ * capacity cannot grant sharing consent, approve an enrollment, permit a phase,
+ * or teach a machine a CLI, so promoting such a row would only spend its budget
+ * faster while changing nothing. It keeps the timed cadence.
+ */
+export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
+	'worker-eligibility',
+	'preserved-worker',
+] as const satisfies readonly DispatchWaitReason[];
+
+/**
+ * Availability-blocked dispatches that this worker becoming available could
+ * start (issue #610) — the candidate set for an early wake-up, keyed on the two
+ * different things the two waits are actually waiting for:
+ *
+ * - `worker-eligibility` — any dispatch in a project this worker is **routable**
+ *   enrolled in (`isRoutable`: an active enrollment with its owner's sharing
+ *   consent). Deliberately no narrower: the row records a category, not the
+ *   roster walk behind it, and re-deriving affinity or target capability here
+ *   would mean a board read per waiting dispatch. A wake-up it did not need
+ *   costs one token-free re-evaluation, which is what the gate does anyway.
+ * - `preserved-worker` — keyed on the **recorded machine**
+ *   (`runs.recovery.preservedWorkerId`), never on project enrollment: the gate
+ *   honours a pin to a machine that is no longer an enrolled candidate at all
+ *   (issue #567), so enrollment is the wrong question for this wait.
+ *
+ * Only rows whose wake-up is still *delayed* (`availableAt` in the future) are
+ * candidates — a dispatch already due needs no promotion, and its wake-up may
+ * be mid-flight, which is what makes {@link promoteDispatchToImmediateWake}'s
+ * remove-then-re-date sequence safe for the caller.
+ */
+export async function listAvailabilityWaitsForWorker(
+	workerId: string,
+	asOf: Date = new Date(),
+): Promise<DispatchRow[]> {
+	const db = getDb();
+	const routableProjects = db
+		.select({ projectId: workerProjectEnrollments.projectId })
+		.from(workerProjectEnrollments)
+		.where(
+			and(
+				eq(workerProjectEnrollments.workerId, workerId),
+				eq(workerProjectEnrollments.status, 'active'),
+				eq(workerProjectEnrollments.sharingConsent, true),
+			),
+		);
+	const pinnedRuns = db
+		.select({ id: runs.id })
+		.from(runs)
+		.where(sql`${runs.recovery} ->> 'preservedWorkerId' = ${workerId}`);
+	return db
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.state, 'retry-scheduled'),
+				gt(dispatches.availableAt, asOf),
+				or(
+					and(
+						eq(dispatches.waitReason, 'worker-eligibility'),
+						inArray(dispatches.projectId, routableProjects),
+					),
+					and(eq(dispatches.waitReason, 'preserved-worker'), inArray(dispatches.runId, pinnedRuns)),
+				),
+			),
+		)
+		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt));
+}
+
+/**
+ * Re-date one availability-blocked dispatch to be eligible **now** and bump its
+ * wake sequence, so the caller can publish a fresh wake-up in place of the
+ * delayed one it just removed (issue #610).
+ *
+ * Conditional on the row still sitting on `wakeSeq` — which is what makes
+ * concurrent wake-ups from two workers resolve to at most one promotion per
+ * dispatch, and what stops a row that was claimed, cancelled, or re-deferred in
+ * the meantime from being dragged back. The `availableAt > asOf` leg makes a
+ * repeat call a no-op rather than a second promotion. Returns the updated row,
+ * or `null` when the dispatch moved on.
+ *
+ * It does **not** touch the attempt counter or the stored payload: the woken job
+ * re-enters `processJob` exactly as the timer would have, spending the budget the
+ * previous settle persisted rather than a fresh one, and may defer again.
+ */
+export async function promoteDispatchToImmediateWake(
+	id: string,
+	wakeSeq: number,
+	asOf: Date = new Date(),
+): Promise<DispatchRow | null> {
+	const rows = await getDb()
+		.update(dispatches)
+		.set({
+			availableAt: asOf,
+			wakeSeq: sql`${dispatches.wakeSeq} + 1`,
+			updatedAt: asOf,
+		})
+		.where(
+			and(
+				eq(dispatches.id, id),
+				eq(dispatches.state, 'retry-scheduled'),
+				eq(dispatches.wakeSeq, wakeSeq),
+				gt(dispatches.availableAt, asOf),
+				inArray(dispatches.waitReason, [...PROMOTABLE_AVAILABILITY_WAIT_REASONS]),
+			),
+		)
+		.returning();
+	return rows[0] ?? null;
+}
+
+/**
  * Supersede prior waiting dispatches carrying this coalesce key — the
  * cancel-and-replace half of a bounded recheck. Returns the superseded rows so
  * the caller can best-effort remove their wake-up jobs.
