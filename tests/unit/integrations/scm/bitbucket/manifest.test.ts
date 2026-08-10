@@ -17,7 +17,7 @@ describe('bitbucket SCM manifest registration', () => {
 		expect(listSCMProviders().map((m) => m.id)).toEqual(['github', 'bitbucket', 'gitlab']);
 	});
 
-	it('declares the expected identity and its future webhook route', () => {
+	it('declares the expected identity and its served webhook route', () => {
 		expect(bitbucketScmManifest).toMatchObject({
 			id: 'bitbucket',
 			label: 'Bitbucket',
@@ -26,12 +26,12 @@ describe('bitbucket SCM manifest registration', () => {
 		});
 	});
 
-	// The contract is complete (issue #296 phase 4/4), and this still holds:
-	// discoverable by id, but not answering for any project and not served a webhook
-	// route, because nothing selects a project's SCM provider yet.
-	it('opts out of runtime traffic', () => {
-		expect(bitbucketScmManifest.runtimeReady).toBe(false);
-		expect(isRuntimeReadySCMProvider(bitbucketScmManifest)).toBe(false);
+	// The flip issue #618 exists for: the contract has been complete since issue #296
+	// phase 4/4, and this is what makes `requireProjectSCMProvider` route a project
+	// naming `bitbucket` here and the receiver mount `/bitbucket/webhook`.
+	it('declares itself ready to carry runtime traffic', () => {
+		expect(bitbucketScmManifest.runtimeReady).toBe(true);
+		expect(isRuntimeReadySCMProvider(bitbucketScmManifest)).toBe(true);
 	});
 
 	it('exposes a provider that satisfies the SCMProvider contract without naming the class', () => {
@@ -54,6 +54,7 @@ describe('bitbucket SCM manifest registration', () => {
 			'getPullRequest',
 			'getPullRequestTitle',
 			'getAggregateCheckStatus',
+			'listPullRequestsForCommit',
 			'listConflictCandidates',
 			'commentOnPullRequest',
 			'deliveryProvider',

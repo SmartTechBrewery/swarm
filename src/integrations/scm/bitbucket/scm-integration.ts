@@ -19,11 +19,13 @@
  * reviewer and push as the implementer without either credential appearing in a
  * signature (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Implemented is still not reachable.** The manifest keeps `runtimeReady: false`
- * (`./index.ts`): nothing selects a project's SCM provider, so no served route or
- * project-scoped lookup resolves to Bitbucket. That wiring — project→provider
- * selection plus a served ingress route — is a separate follow-up, not part of
- * #296 (ai/RULES.md §2).
+ * **Reachable since issue #618.** The manifest declares `runtimeReady: true`
+ * (`./index.ts`), so the receiver serves `/bitbucket/webhook` and a project setting
+ * `"scm": "bitbucket"` resolves here. One ingress detail is this provider's alone:
+ * a `commit_status` payload names no pull request, so the receiver completes a
+ * `checks` event through {@link BitbucketSCMIntegration.listPullRequestsForCommit}
+ * — the contract method that closes that seam neutrally rather than making shared
+ * code call a Bitbucket-specific lookup (ai/RULES.md §2).
  */
 
 import { execFile } from 'node:child_process';
@@ -34,6 +36,7 @@ import type { ScmEvent } from '../../../scm/events.js';
 import type { MergePullRequestOutcome } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
+	CommitPullRequest,
 	PullRequestDetails,
 	SCMProvider,
 	ScmPersona,
@@ -62,6 +65,7 @@ import {
 	getBitbucketPullRequestApprovals,
 	getBitbucketPullRequestMergeState,
 	getBitbucketPullRequestTitle,
+	listBitbucketPullRequestsForCommit,
 	listOpenBitbucketPullRequestsForBase,
 } from './pull-requests.js';
 import {
@@ -341,6 +345,33 @@ export class BitbucketSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getBitbucketCommitBuildStatus(workspace, slug, ref),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.listPullRequestsForCommit} — the read a Bitbucket `checks`
+	 * event depends on, since a `commit_status` payload carries no pull-request
+	 * association at all (issue #618). Reads under the **reviewer** persona by
+	 * default, the same scope {@link BitbucketSCMIntegration.getAggregateCheckStatus}
+	 * uses for the query that follows it on the review path.
+	 *
+	 * Bitbucket's four-state vocabulary collapses to the contract's `open`/`closed`
+	 * pair here — the same mapping `getBitbucketPullRequestMergeState` applies, so a
+	 * `MERGED`, `DECLINED`, or `SUPERSEDED` pull request never reads as open.
+	 */
+	async listPullRequestsForCommit(
+		project: ProjectConfig,
+		sha: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<CommitPullRequest[]> {
+		const [workspace, slug] = repoCoordinates(project);
+		const pulls = await this.withPersonaCredentials(project, persona, () =>
+			listBitbucketPullRequestsForCommit(workspace, slug, sha),
+		);
+		return pulls.map((pull) => ({
+			number: pull.number,
+			headBranch: pull.headBranch,
+			state: pull.state === 'OPEN' ? ('open' as const) : ('closed' as const),
+		}));
 	}
 
 	/**

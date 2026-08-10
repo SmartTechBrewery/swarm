@@ -5,6 +5,7 @@ import {
 	isVerifiableRole,
 	maskedPreview,
 	SCM_PROVIDERS,
+	toSelectableScmProvider,
 } from './credentials.js';
 
 describe('isVerifiableRole', () => {
@@ -30,13 +31,31 @@ describe('maskedPreview', () => {
 });
 
 describe('SCM_PROVIDERS', () => {
-	it('lists GitHub as the sole available provider', () => {
-		expect(SCM_PROVIDERS).toHaveLength(1);
-		expect(SCM_PROVIDERS[0]).toEqual({ id: 'github', label: 'GitHub', available: true });
+	// The list mirrors the server's runtime-ready manifests: offering a provider a
+	// project cannot resolve would only earn the operator a loud lookup error.
+	// Bitbucket joined with issue #618; GitLab joins with #619.
+	it('lists exactly the providers a project can be routed to', () => {
+		expect(SCM_PROVIDERS).toEqual([
+			{ id: 'github', label: 'GitHub', available: true },
+			{ id: 'bitbucket', label: 'Bitbucket Cloud', available: true },
+		]);
 	});
 
 	it('defaults the selected provider to GitHub', () => {
 		expect(DEFAULT_SCM_PROVIDER_ID).toBe('github');
+	});
+});
+
+describe('toSelectableScmProvider', () => {
+	it('keeps a stored provider this screen can render', () => {
+		expect(toSelectableScmProvider('bitbucket')).toBe('bitbucket');
+	});
+
+	// A project predating issue #478's discriminator names nothing; one naming a
+	// provider the selector does not offer must not crash the tab on an unknown key.
+	it('leaves an unset or unoffered provider unselected', () => {
+		expect(toSelectableScmProvider(undefined)).toBeUndefined();
+		expect(toSelectableScmProvider('gitlab')).toBeUndefined();
 	});
 });
 
@@ -54,5 +73,19 @@ describe('getScmProviderCopy', () => {
 
 	it('explains the implementer token is the operator env var, not a project credential', () => {
 		expect(copy.intro).toMatch(/SWARM_OPERATOR_GH_TOKEN/);
+	});
+});
+
+describe('getScmProviderCopy — Bitbucket', () => {
+	const copy = getScmProviderCopy('bitbucket');
+
+	it('names Bitbucket’s own credential form rather than GitHub’s', () => {
+		expect(copy.roleDescriptions.reviewer).toMatch(/username:app_password/);
+		expect(copy.verifyFailureMessage).toMatch(/Bitbucket account/);
+	});
+
+	it('points at Bitbucket’s own operator env var and ingress route', () => {
+		expect(copy.intro).toMatch(/SWARM_OPERATOR_BITBUCKET_TOKEN/);
+		expect(copy.intro).toMatch(/\/bitbucket\/webhook/);
 	});
 });

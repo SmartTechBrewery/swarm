@@ -4,15 +4,15 @@
  * concrete provider or speak a provider's own vocabulary (ai/RULES.md §2
  * "Source-control features must not hard-code GitHub").
  *
- * GitHub is the only implementation that carries runtime traffic today
- * (`GitHubSCMIntegration`, `src/integrations/scm/github/scm-integration.ts`),
- * registered through the SCM manifest + registry
+ * Two implementations carry runtime traffic: `GitHubSCMIntegration`
+ * (`src/integrations/scm/github/scm-integration.ts`) and, since issue #618,
+ * `BitbucketSCMIntegration` (`src/integrations/scm/bitbucket/scm-integration.ts`),
+ * both registered through the SCM manifest + registry
  * (`src/integrations/scm/{manifest,registry}.ts`) exactly as the PM side
- * registers GitHub Projects. Bitbucket (`BitbucketSCMIntegration`, issue #296)
- * satisfies the whole contract as of its phase 4/4 and registers with
- * `runtimeReady: false`, because nothing selects a project's SCM provider yet.
- * GitLab (`GitLabSCMIntegration`, issue #295) also satisfies the whole contract
- * and is registered with `runtimeReady: false` for the same reason.
+ * registers GitHub Projects, and each project routing to the one it names
+ * (`ProjectConfig.scm`, issue #478). GitLab (`GitLabSCMIntegration`, issue #295)
+ * satisfies the whole contract too and stays `runtimeReady: false` until issue
+ * #619 serves its ingress route.
  *
  * This file defines **types only** — every importer uses `import type`, so the
  * module adds no runtime edge. That's what lets `src/config/provider.ts` (which
@@ -31,14 +31,13 @@
  *
  * Deliberately **not** here yet:
  *
- * - **Provider selection, fallback, or per-provider config.** There is one
- *   runtime-ready provider, one served webhook route, and one HMAC secret; a
- *   project's SCM config is `repo` + `credentials` (`src/config/schema.ts`) with
- *   no per-provider block to declare. Issue #386 pinned that as an assertion
- *   rather than a guess: the project-scoped lookup every outbound call site uses
- *   (`requireProjectSCMProvider`, `src/integrations/scm/registry.ts`) throws
- *   unless exactly one *runtime-ready* provider is registered, so selection gets
- *   designed with the second one that claims runtime readiness.
+ * - **Per-provider config.** A project's SCM config is `repo` + `credentials`
+ *   (`src/config/schema.ts`) with no per-provider block to declare, so the
+ *   manifest carries no `configSchema` and the `ProjectConfig.scm` discriminator
+ *   (issue #478) is a bare provider id rather than a discriminated union's `type`.
+ *   Selection itself is no longer missing: `requireProjectSCMProvider`
+ *   (`src/integrations/scm/registry.ts`) resolves the manifest a project names,
+ *   which is what lets GitHub and Bitbucket serve one installation side by side.
  * - **`withCredentials`** — the implementer-persona convenience wrapper on the
  *   GitHub class. It is sugar over {@link SCMProvider.withPersonaCredentials};
  *   putting it in the contract would oblige a second provider to implement two
@@ -99,6 +98,21 @@ export interface CheckRunState {
 export interface AggregateCheckStatus {
 	totalCount: number;
 	checkRuns: CheckRunState[];
+}
+
+/**
+ * A pull request a commit belongs to — just enough to tie a CI event back to the
+ * pull request it ran for (see {@link SCMProvider.listPullRequestsForCommit}).
+ *
+ * `state` is the neutral `open`/`closed` pair, not a provider's own vocabulary:
+ * Bitbucket says `OPEN`/`MERGED`/`DECLINED`/`SUPERSEDED` and GitLab
+ * `opened`/`closed`/`locked`/`merged`, and shared code only ever asks whether the
+ * pull request is still open.
+ */
+export interface CommitPullRequest {
+	number: number;
+	headBranch: string;
+	state: 'open' | 'closed';
 }
 
 /**
@@ -258,6 +272,32 @@ export interface SCMProvider extends ScmMergeProvider {
 		ref: string,
 		persona?: ScmPersona,
 	): Promise<AggregateCheckStatus>;
+
+	/**
+	 * The pull requests commit `sha` belongs to — the ingress path's commit→pull
+	 * request resolution, for providers whose CI payload names no pull request
+	 * (issue #618).
+	 *
+	 * GitHub's `check_suite` carries `pull_requests`, so its `checks` events arrive
+	 * already resolved; Bitbucket's `commit_status` and a GitLab **branch** pipeline
+	 * carry no association at all, leaving `workItemId`/`prBranch` unset. The
+	 * receiver closes that gap through this method rather than reaching for a
+	 * provider-local lookup (ai/RULES.md §2 "widen the interface"), so no shared code
+	 * names `listBitbucketPullRequestsForCommit` or its GitLab twin.
+	 *
+	 * A credential-scoped read, unlike {@link SCMProvider.parseWebhookEvent}, which
+	 * is why it is a contract method and not part of the parse. Ordering is the
+	 * provider's own; the caller picks the first **open** pull request. An empty
+	 * array is an ordinary answer — Bitbucket serves this through its Pull Request
+	 * Commit Links app, which may not have indexed the commit yet — and must not be
+	 * read as proof the commit has no pull request. Omitting `persona` uses the
+	 * provider's documented default for the read.
+	 */
+	listPullRequestsForCommit(
+		project: ProjectConfig,
+		sha: string,
+		persona?: ScmPersona,
+	): Promise<CommitPullRequest[]>;
 
 	/** Open pull requests targeting `baseBranch` — the conflict-detection seam after a base advances. */
 	listConflictCandidates(project: ProjectConfig, baseBranch: string): Promise<PullRequestDetails[]>;

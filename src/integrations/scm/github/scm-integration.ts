@@ -31,6 +31,7 @@ import type { ScmEvent } from '../../../scm/events.js';
 import type { MergePullRequestOutcome } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
+	CommitPullRequest,
 	PullRequestDetails,
 	SCMProvider,
 	ScmPersona,
@@ -49,6 +50,7 @@ import {
 	getPullRequestReviews,
 	getPullRequestTitle,
 	listOpenPullRequestsForBase,
+	listPullRequestsForCommit,
 	mergePullRequestDirect,
 	postIdempotentPullRequestComment,
 	postIssueComment,
@@ -331,6 +333,24 @@ export class GitHubSCMIntegration implements SCMProvider {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
 			getCheckSuiteStatus(owner, repo, ref),
+		);
+	}
+
+	/**
+	 * {@link SCMProvider.listPullRequestsForCommit}. Reads under the **reviewer**
+	 * persona by default — the same scope the aggregate check query that follows it
+	 * on the `checks` path uses. GitHub's `check_suite` payload names associated pull
+	 * requests when present; branch and default-branch checks need this read to resolve
+	 * a pull request. The seam is neutral rather than Bitbucket-only (issue #618).
+	 */
+	async listPullRequestsForCommit(
+		project: ProjectConfig,
+		sha: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<CommitPullRequest[]> {
+		const [owner, repo] = project.repo.split('/');
+		return this.withPersonaCredentials(project, persona, () =>
+			listPullRequestsForCommit(owner, repo, sha),
 		);
 	}
 

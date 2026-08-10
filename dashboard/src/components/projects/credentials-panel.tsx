@@ -1,17 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Pencil, ShieldCheck, Trash2, X } from 'lucide-react';
 import type React from 'react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
 	CREDENTIAL_ROLE_LABELS,
 	type CredentialEntry,
 	type CredentialRole,
-	DEFAULT_SCM_PROVIDER_ID,
 	getScmProviderCopy,
 	isVerifiableRole,
 	maskedPreview,
 	SCM_PROVIDERS,
 	type ScmProviderId,
+	toSelectableScmProvider,
 } from '@/lib/credentials.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
@@ -28,8 +28,19 @@ const PRIMARY_BUTTON_CLASS =
 const SELECT_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
 
-/** Result shape of `scm.verifyGithubToken` (see `src/api/routers/scm.ts`). */
+/** Result shape of the `scm.verify…` procedures (see `src/api/routers/scm.ts`). */
 type VerifyResult = { valid: true; login: string } | { valid: false };
+
+/**
+ * Verify a pasted secret against the selected provider. One procedure per provider
+ * rather than one generalised call: there is no project yet to resolve an
+ * `SCMProvider` from, which is why `src/api/routers/scm.ts` keeps them separate.
+ */
+function verifyScmCredential(providerId: ScmProviderId, secret: string): Promise<VerifyResult> {
+	return providerId === 'bitbucket'
+		? trpcClient.scm.verifyBitbucketCredential.mutate({ credential: secret })
+		: trpcClient.scm.verifyGithubToken.mutate({ token: secret });
+}
 
 interface CredentialFieldEditorProps {
 	entry: CredentialEntry;
@@ -192,6 +203,7 @@ function CredentialFieldPreview({
 
 interface CredentialFieldProps {
 	projectId: string;
+	providerId: ScmProviderId;
 	entry: CredentialEntry;
 	roleDescription: string;
 	verifyFailureMessage: string;
@@ -208,6 +220,7 @@ interface CredentialFieldProps {
  */
 function CredentialField({
 	projectId,
+	providerId,
 	entry,
 	roleDescription,
 	verifyFailureMessage,
@@ -223,7 +236,7 @@ function CredentialField({
 	const [value, setValue] = useState('');
 
 	const verifyMutation = useMutation({
-		mutationFn: (token: string) => trpcClient.scm.verifyGithubToken.mutate({ token }),
+		mutationFn: (secret: string) => verifyScmCredential(providerId, secret),
 		onSuccess: (result) => {
 			onVerified(entry.role, result.valid ? result.login : undefined);
 		},
@@ -317,12 +330,37 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 	const queryClient = useQueryClient();
 	const credentialsQuery = useQuery(trpc.projects.credentials.list.queryOptions({ projectId }));
 
-	// UI-only selected-provider state (issue #200). GitHub is the sole working
-	// provider; the selector exists so the panel's copy is data-driven off a
-	// selected provider rather than embedded GitHub literals throughout.
-	const [selectedProviderId, setSelectedProviderId] =
-		useState<ScmProviderId>(DEFAULT_SCM_PROVIDER_ID);
-	const providerCopy = getScmProviderCopy(selectedProviderId);
+	// The selector was UI-only when it landed (issue #200) because nothing selected a
+	// project's SCM provider. It writes `project.scm` since issue #618, which is what
+	// lets an operator put a project on Bitbucket without hand-editing
+	// `swarm.config.json`. The stored value seeds it; `pendingProviderId` holds an
+	// unsaved pick so the copy switches immediately while the mutation is in flight.
+	const projectQuery = useQuery(trpc.projects.getById.queryOptions({ id: projectId }));
+	const [pendingProviderId, setPendingProviderId] = useState<ScmProviderId | null>(null);
+	const storedProviderId = toSelectableScmProvider(projectQuery.data?.scm ?? undefined);
+	const selectedProviderId = pendingProviderId ?? storedProviderId;
+	const providerCopy = selectedProviderId ? getScmProviderCopy(selectedProviderId) : undefined;
+
+	// The optimistic pick outlives the mutation deliberately: it is dropped only once
+	// the refetched project agrees with it, so the selector and its copy never flick
+	// back to the old provider in the window before the read catches up. A failed save
+	// drops it immediately, reverting to what is actually stored.
+	useEffect(() => {
+		if (pendingProviderId !== null && storedProviderId === pendingProviderId) {
+			setPendingProviderId(null);
+		}
+	}, [pendingProviderId, storedProviderId]);
+
+	const providerMutation = useMutation({
+		mutationFn: (scm: ScmProviderId) => trpcClient.projects.update.mutate({ id: projectId, scm }),
+		onSuccess: () => {
+			queryClient.invalidateQueries({
+				queryKey: trpc.projects.getById.queryOptions({ id: projectId }).queryKey,
+			});
+			queryClient.invalidateQueries({ queryKey: trpc.projects.list.queryOptions().queryKey });
+		},
+		onError: () => setPendingProviderId(null),
+	});
 
 	// Session-only record of the login each PAT last verified to; drives the
 	// per-field "✓ @login" preview. Never persisted — the plaintext token is gone
@@ -382,35 +420,58 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 					</label>
 					<select
 						id="scm-provider"
-						value={selectedProviderId}
-						onChange={(e) => setSelectedProviderId(e.target.value as ScmProviderId)}
+						value={selectedProviderId ?? ''}
+						disabled={providerMutation.isPending}
+						onChange={(e) => {
+							const next = e.target.value as ScmProviderId;
+							setPendingProviderId(next);
+							providerMutation.mutate(next);
+						}}
 						className={SELECT_CLASS}
 					>
+						<option value="" disabled>
+							Select a provider
+						</option>
 						{SCM_PROVIDERS.map((provider) => (
 							<option key={provider.id} value={provider.id} disabled={!provider.available}>
 								{provider.label}
 							</option>
 						))}
 					</select>
+					{providerMutation.isError && (
+						<p className="text-xs text-red-400 mt-1.5">
+							Failed to save the provider: {providerMutation.error.message}
+						</p>
+					)}
+					{!selectedProviderId && (
+						<p className="text-xs text-amber-400 mt-1.5">
+							{projectQuery.data?.scm
+								? `The saved provider “${projectQuery.data.scm}” is not available in this dashboard.`
+								: 'No provider is saved. Select one before this project can run.'}
+						</p>
+					)}
 				</div>
 
-				<p className="text-xs text-zinc-400 mt-4">{providerCopy.intro}</p>
+				{providerCopy && <p className="text-xs text-zinc-400 mt-4">{providerCopy.intro}</p>}
 			</div>
 
-			<div className="space-y-4">
-				{entries.map((entry) => (
-					<CredentialField
-						key={entry.role}
-						projectId={projectId}
-						entry={entry}
-						roleDescription={providerCopy.roleDescriptions[entry.role]}
-						verifyFailureMessage={providerCopy.verifyFailureMessage}
-						verifiedLogin={verifiedLogins[entry.role]}
-						onVerified={handleVerified}
-						onRequestRemove={setRemoveTarget}
-					/>
-				))}
-			</div>
+			{selectedProviderId && providerCopy && (
+				<div className="space-y-4">
+					{entries.map((entry) => (
+						<CredentialField
+							key={entry.role}
+							projectId={projectId}
+							providerId={selectedProviderId}
+							entry={entry}
+							roleDescription={providerCopy.roleDescriptions[entry.role]}
+							verifyFailureMessage={providerCopy.verifyFailureMessage}
+							verifiedLogin={verifiedLogins[entry.role]}
+							onVerified={handleVerified}
+							onRequestRemove={setRemoveTarget}
+						/>
+					))}
+				</div>
+			)}
 
 			<Modal
 				open={!!removeTarget}

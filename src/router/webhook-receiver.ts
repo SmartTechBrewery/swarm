@@ -13,8 +13,10 @@
  *
  * The two sides order those steps differently, and both orderings are deliberate.
  * A repo event names its project in the payload, so the SCM path parses, matches
- * the repo, then authenticates. A board event carries no repo, so the PM path
- * parses, resolves the project **through the provider's own
+ * the repo, then authenticates — and, for a CI event whose provider names no pull
+ * request, completes it afterwards through the contract's commit→PR read
+ * ({@link resolveChecksPullRequest}, issue #618). A board event carries no repo,
+ * so the PM path parses, resolves the project **through the provider's own
  * `PMRouterAdapter.resolveProject`** (each provider knows which of its config keys
  * names the container — the receiver holds no board lookup of its own, issue #529),
  * then authenticates against that project's secret, then filters and
@@ -27,8 +29,10 @@
  * on the repo side and behind `PMRouterAdapter` plus the manifest's own
  * `verifyWebhookSignature` (`src/pm/router-adapter.ts`,
  * `src/integrations/pm/manifest.ts`, issues #297/#496/#529) on the board side.
- * Adding Bitbucket, GitLab, Jira, Linear, or Trello adds a manifest, not a branch
- * here.
+ * Adding GitLab or Trello adds a manifest, not a branch here — which is exactly
+ * what serving Bitbucket took (issue #618): its manifest declared itself
+ * runtime-ready and `/bitbucket/webhook` started being mounted by the same loop
+ * that mounts GitHub's, with no receiver edit.
  *
  * **A shared path makes a PM manifest a co-tenant, never a second handler.**
  * GitHub delivers `projects_v2_item` to the *same* URL with the same secret as its
@@ -79,7 +83,7 @@ import { logger } from '../lib/logger.js';
 import type { PmEvent } from '../pm/events.js';
 import type { PMType } from '../pm/types.js';
 import type { ScmEvent } from '../scm/events.js';
-import type { ScmType, ScmWebhookRequest } from '../scm/types.js';
+import type { CommitPullRequest, ScmType, ScmWebhookRequest } from '../scm/types.js';
 import { enqueuePmEvent, enqueueScmEvent } from './enqueue.js';
 import { resolveWebhookCallbackUrl } from './webhook-callback-url.js';
 
@@ -283,6 +287,60 @@ async function authenticatePmWebhook(
 	return c.json({ ok: false, reason: 'signature verification failed' }, 401);
 }
 
+/**
+ * Complete a `checks` event that names no pull request, by asking the provider
+ * which pull requests its commit belongs to (issue #618).
+ *
+ * GitHub's `check_suite` payload carries `pull_requests` for an associated pull
+ * request, so only those events arrive resolved. Bitbucket's `commit_status`
+ * carries no association at all, and a GitLab **branch** pipeline carries none
+ * either, so `workItemId`/`prBranch` can only come from a credential-scoped
+ * commit→PR read — which is why it happens here, on the ingress path, rather than
+ * inside the provider's pure `parseWebhookEvent`. The read is the contract's own
+ * {@link SCMProvider.listPullRequestsForCommit}, so the receiver still names no
+ * provider (ai/RULES.md §2).
+ *
+ * Only an **open** pull request is adopted: a `checks` event on a commit whose
+ * only pull request has already merged or been declined must not wake a review.
+ *
+ * **Fails open** — a failed lookup logs and enqueues the event unresolved, where
+ * it matches no trigger, rather than rejecting the delivery. A provider fires one
+ * CI event per build definition and re-runs fire more, so the next delivery for
+ * the same commit retries the resolution; turning a transient API blip into a 500
+ * would instead need an operator to hand-replay the delivery, since neither
+ * Bitbucket nor GitHub redelivers a failed webhook on its own.
+ */
+async function resolveChecksPullRequest(
+	manifest: SCMProviderManifest,
+	project: ProjectConfig,
+	event: ScmEvent,
+): Promise<ScmEvent> {
+	if (event.kind !== 'checks' || event.workItemId !== undefined || !event.headSha) return event;
+
+	const logContext = { providerId: manifest.id, projectId: project.id, headSha: event.headSha };
+	let pulls: CommitPullRequest[];
+	try {
+		pulls = await manifest.provider.listPullRequestsForCommit(project, event.headSha);
+	} catch (error) {
+		logger.warn('Could not resolve the pull request a CI event belongs to', {
+			...logContext,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return event;
+	}
+
+	const open = pulls.find((pull) => pull.state === 'open');
+	if (!open) {
+		logger.debug('CI event resolved to no open pull request', {
+			...logContext,
+			candidates: pulls.length,
+		});
+		return event;
+	}
+
+	return { ...event, workItemId: String(open.number), prBranch: open.headBranch };
+}
+
 /** Handle a repo-scoped SCM event (a pull request, a review, a comment, checks, …). */
 async function handleScmEvent(
 	c: Context,
@@ -331,7 +389,11 @@ async function handleScmEvent(
 		);
 	}
 
-	await deps.enqueue(manifest.id, event, project, request.deliveryId);
+	// After loop prevention, so a dropped event never pays for the credential-scoped
+	// commit→PR read.
+	const resolved = await resolveChecksPullRequest(manifest, project, event);
+
+	await deps.enqueue(manifest.id, resolved, project, request.deliveryId);
 	return c.json({ ok: true, accepted: true }, 202);
 }
 
@@ -430,9 +492,10 @@ export function createWebhookApp(overrides: Partial<WebhookReceiverDeps> = {}): 
 	// Liveness probe for the Docker Compose healthcheck.
 	app.get('/health', (c) => c.json({ status: 'ok', service: 'router' }));
 
-	// A provider still being built out phase by phase (issue #296) gets no route:
-	// serving one would expose an unauthenticated endpoint whose first act is to
-	// call a contract method that throws (`manifest.runtimeReady`).
+	// A provider that has not declared itself ready to carry traffic gets no route:
+	// serving one would expose an endpoint for a provider no project can select
+	// (`manifest.runtimeReady`). GitHub and Bitbucket are mounted; GitLab is not,
+	// until issue #619.
 	const scmManifests = deps.scmProviders.filter(isRuntimeReadySCMProvider);
 	const scmRoutes = new Set(scmManifests.map((manifest) => manifest.webhookRoute));
 	const pmByRoute = pmManifestsByRoute(deps.pmProviders);

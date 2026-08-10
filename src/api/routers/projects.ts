@@ -183,6 +183,10 @@ export const projectsRouter = router({
 		const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
 		const config = {
 			...input,
+			// This is a creation-time default, not a config-schema fallback: the dashboard
+			// always submits its explicit picker value, while non-dashboard callers remain
+			// routable instead of creating a project with no SCM provider.
+			scm: input.scm ?? 'github',
 			pm: DEFAULT_PM_CONFIG,
 			credentials: {
 				...DEFAULT_SCM_CREDENTIAL_REFERENCES,

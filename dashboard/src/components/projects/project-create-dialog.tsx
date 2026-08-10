@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Info, RefreshCw } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useState } from 'react';
+import { DEFAULT_SCM_PROVIDER_ID, SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
 import { parseRepoUrl } from '@/lib/parse-repo-url.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
@@ -17,6 +18,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	const [name, setName] = useState('');
 	const [repo, setRepo] = useState('');
 	const [repoRoot, setRepoRoot] = useState('');
+	const [scm, setScm] = useState<ScmProviderId>(DEFAULT_SCM_PROVIDER_ID);
 	const [repoUrl, setRepoUrl] = useState('');
 	const [urlError, setUrlError] = useState('');
 	const [showPathHelp, setShowPathHelp] = useState(false);
@@ -39,8 +41,13 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	}, [showPathHelp]);
 
 	const mutation = useMutation({
-		mutationFn: (newProject: { id: string; name: string; repo: string; repoRoot: string }) =>
-			trpcClient.projects.create.mutate(newProject),
+		mutationFn: (newProject: {
+			id: string;
+			name: string;
+			repo: string;
+			repoRoot: string;
+			scm: ScmProviderId;
+		}) => trpcClient.projects.create.mutate(newProject),
 		onSuccess: () => {
 			queryClient.invalidateQueries({
 				queryKey: trpc.projects.list.queryOptions().queryKey,
@@ -49,6 +56,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			setName('');
 			setRepo('');
 			setRepoRoot('');
+			setScm(DEFAULT_SCM_PROVIDER_ID);
 			setRepoUrl('');
 			setUrlError('');
 			setShowPathHelp(false);
@@ -58,7 +66,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
-		mutation.mutate({ id, name, repo, repoRoot });
+		mutation.mutate({ id, name, repo, repoRoot, scm });
 	};
 
 	const handleClose = () => {
@@ -159,6 +167,23 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							placeholder="owner/repo"
 							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
 						/>
+					</div>
+					<div>
+						<label htmlFor="project-scm" className="block text-xs font-medium text-zinc-400 mb-1">
+							Source Control Provider <span className="text-red-500">*</span>
+						</label>
+						<select
+							id="project-scm"
+							value={scm}
+							onChange={(e) => setScm(e.target.value as ScmProviderId)}
+							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
+						>
+							{SCM_PROVIDERS.map((provider) => (
+								<option key={provider.id} value={provider.id} disabled={!provider.available}>
+									{provider.label}
+								</option>
+							))}
+						</select>
 					</div>
 					<div>
 						<div className="relative flex items-center gap-1.5 mb-1">

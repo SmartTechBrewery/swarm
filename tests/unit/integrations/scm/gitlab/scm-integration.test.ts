@@ -328,6 +328,32 @@ describe('GitLabSCMIntegration', () => {
 			);
 		});
 
+		// The read a **branch** pipeline's `checks` event depends on (issue #618): GitLab
+		// includes `merge_request` only for a merge-request pipeline, so ingress resolves
+		// one through this contract method. Its four-state vocabulary must collapse to
+		// the neutral pair, or a merged merge request would read as open.
+		it("maps a commit's merge requests onto the contract's open/closed pair, as the reviewer", async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse([
+					{ iid: 17, state: 'opened', source_branch: 'swarm/issue-17' },
+					{ iid: 16, state: 'merged', source_branch: 'swarm/issue-16' },
+					{ iid: 15, state: 'closed', source_branch: 'swarm/issue-15' },
+					{ iid: 14, state: 'locked', source_branch: 'swarm/issue-14' },
+				]),
+			);
+
+			await expect(scm.listPullRequestsForCommit(project, 'abc123')).resolves.toEqual([
+				{ number: 17, state: 'open', headBranch: 'swarm/issue-17' },
+				{ number: 16, state: 'closed', headBranch: 'swarm/issue-16' },
+				{ number: 15, state: 'closed', headBranch: 'swarm/issue-15' },
+				{ number: 14, state: 'closed', headBranch: 'swarm/issue-14' },
+			]);
+			expect(tokenOnTheWire()).toBe('token-reviewer');
+			expect(requestedPath()).toBe(
+				'/api/v4/projects/SmartTechBrewery%2Fswarm/repository/commits/abc123/merge_requests',
+			);
+		});
+
 		it('lists conflict candidates as the implementer, the persona that pushes the fix', async () => {
 			fetchMock.mockResolvedValue(jsonResponse([]));
 

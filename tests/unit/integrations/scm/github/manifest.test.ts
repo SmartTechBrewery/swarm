@@ -12,13 +12,16 @@ describe('github SCM manifest registration', () => {
 		expect(getSCMProvider('github')).toBe(githubScmManifest);
 	});
 
-	it('registers exactly once, and is the only runtime-ready SCM provider', () => {
+	it('registers exactly once, and stays runtime-ready alongside Bitbucket', () => {
 		const registered = listSCMProviders();
 		expect(registered.filter((m) => m.id === 'github')).toHaveLength(1);
-		// Bitbucket registers too, with a complete contract as of issue #296 phase 4/4,
-		// but opts out of runtime traffic because nothing selects a project's SCM
-		// provider — so GitHub is still what every project-scoped call site resolves.
-		expect(registered.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual(['github']);
+		// Bitbucket joined it as a runtime-ready provider with issue #618; GitLab's
+		// contract is complete but still opts out (issue #619). GitHub carrying traffic
+		// is what must not regress here — a project on GitHub still resolves to it.
+		expect(registered.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual([
+			'github',
+			'bitbucket',
+		]);
 	});
 
 	it('declares the expected identity, and claims runtime readiness by omission', () => {
@@ -46,6 +49,7 @@ describe('github SCM manifest registration', () => {
 			'getPullRequest',
 			'getPullRequestTitle',
 			'getAggregateCheckStatus',
+			'listPullRequestsForCommit',
 			'listConflictCandidates',
 			'commentOnPullRequest',
 			'deliveryProvider',

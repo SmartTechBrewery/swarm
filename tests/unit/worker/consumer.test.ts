@@ -592,7 +592,11 @@ function processJob(
 	return processJobWithDeps(job, registry, signal, executionIdentity, dispatchDeps(deps));
 }
 
-const PROJECT = createMockProjectConfig();
+// `scm` is stated rather than left to the sole-runtime-ready fallback: with GitHub
+// *and* Bitbucket runtime-ready since issue #618, a project naming no provider makes
+// `requireProjectSCMProvider` throw — which is exactly what a real installation must
+// now fix by setting this one field.
+const PROJECT = createMockProjectConfig({ scm: 'github' });
 const PROJECT_PM = requireGitHubProjectsConfig(PROJECT);
 
 function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {

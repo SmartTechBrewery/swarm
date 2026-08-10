@@ -8,8 +8,9 @@ on the developer's machine.
 
 The MVP runs a local router, Redis/Postgres stack, host worker, and an API server
 that serves the dashboard SPA.
-GitHub reaches the router through a public HTTPS webhook endpoint, usually via a
-Cloudflare Tunnel. The router also exposes an authenticated worker-transport
+The source-control provider reaches the router through a public HTTPS webhook
+endpoint, usually via a Cloudflare Tunnel — `/github/webhook` or, for a Bitbucket
+Cloud project, `/bitbucket/webhook`. The router also exposes an authenticated worker-transport
 endpoint (`POST /worker/session` + a `GET /worker/stream` WebSocket) so a remote
 worker can establish and heartbeat its session over that same tunnel (ADR-003).
 The architecture as built is documented in
@@ -20,7 +21,7 @@ working checkout.
 ## How it works
 
 ```text
-GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake-up
+GitHub / Bitbucket → HTTPS webhook → Router → durable Postgres dispatch → Redis wake-up
                                                         ↓
                                       host Worker → isolated worktree → agent CLI
                                                         ↓
@@ -32,7 +33,8 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
 - Review starts when a SWARM-managed pull request opens or its checks complete.
 - Respond-to-review and Respond-to-CI start from pull-request lifecycle events.
 - The worker runs `claude`, `agy` (Antigravity), or `codex` in an isolated
-  worktree and performs deterministic GitHub delivery after the agent exits.
+  worktree and performs deterministic delivery to the project's source-control
+  provider after the agent exits.
 - Before any worktree or agent, a dispatch gate confirms an *eligible* worker may
   take the phase — active enrollment, the owner's sharing consent, a live
   connection, free capacity, the phase (both the machine's declared repertoire and
@@ -78,10 +80,13 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
 - Docker Compose
 - Git
 - Authenticated agent CLIs (`claude`, `agy`, and/or `codex`)
-- A GitHub repository and a project-management board with a webhook: a GitHub Projects v2 board, a Linear team, or a Jira Cloud project
-- Two distinct GitHub identities for loop prevention: the worker operator's own
-  token (`SWARM_OPERATOR_GH_TOKEN`, the implementer persona) set in `.env` on each
-  host, and a separate project-scoped reviewer credential
+- A source-control repository on GitHub or Bitbucket Cloud — named by the project's
+  `scm` field, which every project must set — and a project-management board with a
+  webhook: a GitHub Projects v2 board, a Linear team, or a Jira Cloud project
+- Two distinct source-control identities for loop prevention: the worker operator's
+  own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN`, the
+  implementer persona) set in `.env` on each host, and a separate project-scoped
+  reviewer credential
 - A project credential for the **board**, separate from the two above. GitHub
   Projects uses `credentials.pm.apiToken` (conventionally
   `PM_GITHUB_PROJECTS_TOKEN`) with `repo`, `project`, and `read:org`; Linear uses
