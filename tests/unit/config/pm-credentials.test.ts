@@ -21,6 +21,7 @@ import { resolveProjectCredential } from '@/db/repositories/credentialsRepositor
 // validate and resolve against.
 import '@/integrations/entrypoint.js';
 import { githubProjectsManifest } from '@/integrations/pm/github-projects/index.js';
+import { jiraManifest } from '@/integrations/pm/jira/index.js';
 import { linearManifest } from '@/integrations/pm/linear/index.js';
 import type { PmCredentialRoleSpec } from '@/integrations/pm/manifest.js';
 import {
@@ -64,12 +65,13 @@ function parseErrors(input: unknown): string {
 }
 
 afterEach(() => {
-	// Restore what the entrypoint import registered — both providers, not just the
-	// first: a test that swaps a manifest behind an id must not leave Linear
+	// Restore what the entrypoint import registered — every provider, not just the
+	// first: a test that swaps a manifest behind an id must not leave Linear or Jira
 	// unregistered for the ones after it.
 	_resetPMProviderRegistryForTesting();
 	registerPMProvider(githubProjectsManifest);
 	registerPMProvider(linearManifest);
+	registerPMProvider(jiraManifest);
 	vi.unstubAllEnvs();
 });
 
