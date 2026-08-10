@@ -46,6 +46,7 @@ import {
 	ForceReReviewButton,
 	GitHubReferences,
 	PreservedWorkerCallout,
+	RecoverRunButton,
 	RecoveryCallout,
 	ResetRunButton,
 	ReviewCapCallout,
@@ -901,6 +902,8 @@ describe('ResetRunButton (issue #428)', () => {
 			</QueryClientProvider>,
 		);
 
+		// A failed run reaches Reset through the unified Recover control (issue #593).
+		fireEvent.click(screen.getByRole('button', { name: 'Recover' }));
 		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
 		const buttons = screen.getAllByRole('button', { name: /reset & restart/i });
 		fireEvent.click(buttons[buttons.length - 1]);
@@ -1011,12 +1014,13 @@ describe('outstanding request state (issue #561)', () => {
 			</QueryClientProvider>,
 		);
 
-		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();
+		// A failed run's terminal action is the unified Recover control (issue #593).
+		expect(screen.getByRole('button', { name: 'Recover' })).toBeDefined();
 		expect(screen.queryByText(/waiting to stop/i)).toBeNull();
 		expect(screen.queryByText(/takes effect once/i)).toBeNull();
 	});
 
-	it('disables Reset & restart and explains the queued restart for a failed run', () => {
+	it('disables Recover and explains the queued restart for a failed run', () => {
 		renderHeader(
 			makeReviewRun({
 				status: 'failed',
@@ -1032,6 +1036,7 @@ describe('outstanding request state (issue #561)', () => {
 
 		const button = screen.getByRole('button', { name: /waiting to restart/i });
 		expect((button as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.queryByRole('button', { name: 'Recover' })).toBeNull();
 		expect(screen.queryByRole('button', { name: /reset & restart/i })).toBeNull();
 		expect(screen.getByText(/queued as a fresh dispatch/i)).toBeDefined();
 
@@ -1058,6 +1063,326 @@ describe('outstanding request state (issue #561)', () => {
 		expect(
 			(screen.getByRole('button', { name: /waiting to restart/i }) as HTMLButtonElement).disabled,
 		).toBe(true);
+	});
+});
+
+// The unified recovery control (issue #593). An errored run used to expose Retry
+// and Reset & restart as two live buttons against the same row, so both could be
+// submitted while the first was unresolved; these pin the one-button layout, the
+// popup's choices, and the mutual exclusion that replaces it.
+describe('RecoverRunButton (issue #593)', () => {
+	const retryMutate = vi.mocked(trpcClient.runs.retryNow.mutate);
+	const resetMutate = vi.mocked(trpcClient.runs.reset.mutate);
+
+	/** A mutation that never settles — pins the in-flight state for an assertion. */
+	const neverSettles = () => new Promise<never>(() => {});
+
+	const RESET_REPORT = {
+		runId: 'run-1',
+		forced: false,
+		dispatch: 'cancelled' as const,
+		cancellationCleared: true,
+		worktree: { outcome: 'removed' as const },
+		worktreeIntent: 'reclaim' as const,
+		recoveryCleared: true,
+		abandonedPreservedWorkerId: null,
+		dispatchId: 'dispatch-9',
+	};
+
+	beforeEach(() => {
+		retryMutate.mockReset();
+		resetMutate.mockReset();
+	});
+
+	function failedRun(overrides: Partial<RunRow> = {}): RunRow {
+		return makeReviewRun({
+			status: 'failed',
+			phase: 'implementation',
+			reviewVerdict: null,
+			reviewOrdinal: null,
+			reviewAutomationOutcome: null,
+			error: 'boom',
+			...overrides,
+		});
+	}
+
+	function renderRecover(run: RunRow = failedRun()) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RecoverRunButton run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	/** Render, then open the recovery popup from the single trigger. */
+	function openRecover(run?: RunRow) {
+		renderRecover(run);
+		fireEvent.click(screen.getByRole('button', { name: 'Recover' }));
+	}
+
+	it('renders one Recover button on a failed run, not the separate recovery actions', () => {
+		renderHeader(failedRun());
+
+		expect(screen.getAllByRole('button', { name: 'Recover' })).toHaveLength(1);
+		expect(screen.queryByRole('button', { name: /retry now/i })).toBeNull();
+		expect(screen.queryByRole('button', { name: /reset & restart/i })).toBeNull();
+		expect(screen.queryByRole('button', { name: /^resume$/i })).toBeNull();
+		expect(screen.queryByRole('button', { name: /recheck and retry/i })).toBeNull();
+	});
+
+	it('opens a popup carrying the eligible recovery actions and the override fields', () => {
+		openRecover();
+
+		expect(screen.getByRole('button', { name: /retry now/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();
+		expect(screen.getByLabelText('Agent CLI')).toBeDefined();
+		expect(screen.getByLabelText('Model')).toBeDefined();
+		expect(screen.getByLabelText('Reasoning')).toBeDefined();
+		// The override submit never collides with the plain retry choice beside it.
+		expect(screen.getByRole('button', { name: /retry with these settings/i })).toBeDefined();
+	});
+
+	it.each([
+		['preserved', /^resume$/i],
+		['blocked', /recheck and retry/i],
+	] as const)('names the %s run’s retry choice by its server semantics', (state, label) => {
+		openRecover(failedRun({ recovery: { state } }));
+
+		expect(screen.getByRole('button', { name: label })).toBeDefined();
+	});
+
+	it('closes the popup and submits only the chosen retry', async () => {
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		openRecover();
+
+		fireEvent.click(screen.getByRole('button', { name: /retry now/i }));
+
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith({
+				runId: 'run-1',
+				cli: undefined,
+				model: undefined,
+				reasoning: undefined,
+			});
+		});
+		expect(resetMutate).not.toHaveBeenCalled();
+		// The popup closed with the choice, so no alternate action is still offered.
+		expect(screen.queryByRole('button', { name: /reset & restart/i })).toBeNull();
+	});
+
+	it('submits the popup’s agent/model overrides with the retry', async () => {
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		openRecover();
+
+		fireEvent.change(screen.getByLabelText('Agent CLI'), { target: { value: 'codex' } });
+		fireEvent.click(screen.getByRole('button', { name: /retry with these settings/i }));
+
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith(
+				expect.objectContaining({ runId: 'run-1', cli: 'codex' }),
+			);
+		});
+		expect(resetMutate).not.toHaveBeenCalled();
+	});
+
+	it('routes the reset choice through its own confirmation before submitting', async () => {
+		resetMutate.mockResolvedValue(RESET_REPORT);
+		openRecover();
+
+		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
+
+		// The popup closed and the destructive action still confirms first.
+		expect(screen.getByRole('heading', { name: /reset & restart run\?/i })).toBeDefined();
+		expect(screen.queryByRole('button', { name: /retry now/i })).toBeNull();
+		expect(resetMutate).not.toHaveBeenCalled();
+
+		fireEvent.click(screen.getByRole('checkbox'));
+		const confirms = screen.getAllByRole('button', { name: /reset & restart/i });
+		fireEvent.click(confirms[confirms.length - 1]);
+
+		await waitFor(() => {
+			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1', force: true });
+		});
+		expect(retryMutate).not.toHaveBeenCalled();
+	});
+
+	it('becomes a disabled pending label naming the retry in flight', async () => {
+		retryMutate.mockReturnValue(neverSettles());
+		openRecover();
+
+		fireEvent.click(screen.getByRole('button', { name: /retry now/i }));
+
+		await waitFor(() => {
+			expect(
+				(screen.getByRole('button', { name: /retrying…/i }) as HTMLButtonElement).disabled,
+			).toBe(true);
+		});
+		expect(screen.queryByRole('button', { name: 'Recover' })).toBeNull();
+		// The chosen action is not left exposed as a second active button either.
+		expect(screen.queryByRole('button', { name: /^retry now$/i })).toBeNull();
+		expect(screen.queryByRole('button', { name: /reset & restart/i })).toBeNull();
+	});
+
+	it('becomes a disabled pending label naming the reset in flight', async () => {
+		resetMutate.mockReturnValue(neverSettles());
+		openRecover();
+
+		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
+		const confirms = screen.getAllByRole('button', { name: /reset & restart/i });
+		fireEvent.click(confirms[confirms.length - 1]);
+
+		await waitFor(() => {
+			// The trigger relabels; the still-open modal's confirm relabels with it.
+			// Both are disabled, so a second reset can't be issued from either.
+			const pendingButtons = screen.getAllByRole('button', { name: /resetting…/i });
+			expect(pendingButtons).toHaveLength(2);
+			expect(pendingButtons.every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+		});
+		expect(screen.queryByRole('button', { name: 'Recover' })).toBeNull();
+	});
+
+	it('blocks both choices while a restart is outstanding for every viewer', () => {
+		// The durable, server-derived fact — not this browser's mutation — so a
+		// second viewer and a reloaded page see the same blocked control.
+		renderRecover(
+			failedRun({
+				pendingRequest: {
+					action: 'restart',
+					requestedAt: '2026-01-01T00:03:00.000Z',
+					waitUntil: null,
+				},
+			}),
+		);
+
+		const button = screen.getByRole('button', { name: /waiting to restart/i });
+		expect((button as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.getByText(/queued as a fresh dispatch/i)).toBeDefined();
+
+		fireEvent.click(button);
+
+		expect(screen.queryByRole('button', { name: /retry now/i })).toBeNull();
+		expect(screen.queryByRole('button', { name: /reset & restart/i })).toBeNull();
+		expect(retryMutate).not.toHaveBeenCalled();
+		expect(resetMutate).not.toHaveBeenCalled();
+	});
+
+	it('disables the choices in a popup left open when a restart becomes outstanding', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const { rerender } = render(
+			<QueryClientProvider client={queryClient}>
+				<RecoverRunButton run={failedRun()} />
+			</QueryClientProvider>,
+		);
+		fireEvent.click(screen.getByRole('button', { name: 'Recover' }));
+
+		// A background refetch surfaces the request another viewer just made.
+		rerender(
+			<QueryClientProvider client={queryClient}>
+				<RecoverRunButton
+					run={failedRun({
+						pendingRequest: { action: 'restart', requestedAt: null, waitUntil: null },
+					})}
+				/>
+			</QueryClientProvider>,
+		);
+
+		const retryChoice = screen.getByRole('button', { name: /retry now/i }) as HTMLButtonElement;
+		const resetChoice = screen.getByRole('button', {
+			name: /reset & restart/i,
+		}) as HTMLButtonElement;
+		expect(retryChoice.disabled).toBe(true);
+		expect(resetChoice.disabled).toBe(true);
+
+		fireEvent.click(retryChoice);
+		fireEvent.click(resetChoice);
+		expect(retryMutate).not.toHaveBeenCalled();
+		expect(resetMutate).not.toHaveBeenCalled();
+	});
+
+	it('returns to an enabled Recover and reports a rejected retry', async () => {
+		retryMutate.mockRejectedValue(new Error('Run "run-1" is already being restarted.'));
+		openRecover();
+
+		fireEvent.click(screen.getByRole('button', { name: /retry now/i }));
+
+		await waitFor(() => {
+			expect(screen.getByText('Run "run-1" is already being restarted.')).toBeDefined();
+		});
+		expect((screen.getByRole('button', { name: 'Recover' }) as HTMLButtonElement).disabled).toBe(
+			false,
+		);
+	});
+
+	it('keeps the reset confirmation open with the server’s refusal', async () => {
+		resetMutate.mockRejectedValue(new Error('Run "run-1" is already being restarted.'));
+		openRecover();
+
+		fireEvent.click(screen.getByRole('button', { name: /reset & restart/i }));
+		const confirms = screen.getAllByRole('button', { name: /reset & restart/i });
+		fireEvent.click(confirms[confirms.length - 1]);
+
+		await waitFor(() => {
+			expect(screen.getByText('Run "run-1" is already being restarted.')).toBeDefined();
+		});
+		// The operator can adjust and retry from the still-open modal.
+		expect(screen.getByRole('checkbox')).toBeDefined();
+	});
+
+	it('re-enables once the outstanding restart resolves', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const { rerender } = render(
+			<QueryClientProvider client={queryClient}>
+				<RecoverRunButton
+					run={failedRun({
+						pendingRequest: { action: 'restart', requestedAt: null, waitUntil: null },
+					})}
+				/>
+			</QueryClientProvider>,
+		);
+		expect(screen.getByRole('button', { name: /waiting to restart/i })).toBeDefined();
+
+		rerender(
+			<QueryClientProvider client={queryClient}>
+				<RecoverRunButton run={failedRun({ pendingRequest: null })} />
+			</QueryClientProvider>,
+		);
+
+		expect((screen.getByRole('button', { name: 'Recover' }) as HTMLButtonElement).disabled).toBe(
+			false,
+		);
+		expect(screen.queryByText(/queued as a fresh dispatch/i)).toBeNull();
+	});
+
+	it('renders nothing for a run with no eligible recovery action', () => {
+		const { container } = renderRecover(makeReviewRun());
+
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('leaves the non-error recovery states with their existing side-by-side controls', () => {
+		renderHeader(
+			makeReviewRun({
+				status: 'deferred',
+				phase: 'implementation',
+				error: 'rate limited',
+				nextRetryAt: '2026-01-01T01:00:00.000Z',
+			}),
+		);
+
+		expect(screen.getByRole('button', { name: /retry now/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /^terminate$/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();
+		expect(screen.queryByRole('button', { name: 'Recover' })).toBeNull();
 	});
 });
 
