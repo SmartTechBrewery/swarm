@@ -5,10 +5,12 @@ type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed
 interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	status: RunStatus;
 	/**
-	 * When the run failed specifically because it hit its wall-clock timeout,
-	 * render an unambiguous "Timed out" badge instead of a generic "Failed" — so
-	 * a run the worker killed for running too long reads distinctly from one that
-	 * exited with an error (issue #165).
+	 * When the run hit its wall-clock timeout, name the timeout in the badge so it
+	 * reads distinctly from a run that stopped for any other reason. A terminal
+	 * kill shows an unambiguous "Timed out" instead of a generic "Failed" (issue
+	 * #165) — but a wall-clock kill is normally *resumable* and settles `deferred`
+	 * or `checkpointed` rather than `failed` (issue #596), so those two statuses
+	 * render it too, keeping their own retry state visible (issue #600).
 	 */
 	timedOut?: boolean;
 	/**
@@ -98,6 +100,35 @@ const TIMED_OUT_CONFIG: BadgeConfig = {
 };
 
 /**
+ * The *resumable* end of a wall-clock kill (issue #600). Killing a run for
+ * running too long normally leaves it retryable, so it settles `deferred` or
+ * `checkpointed` rather than `failed` (issue #596) — and the plain lifecycle
+ * badge would then read as an ordinary rate-limit deferral, leaving the runs
+ * list unable to answer "which runs hit the timeout".
+ *
+ * Each entry keeps its status's own config — hue, dot, and the retry state it
+ * encodes — and only re-words the label, so an operator still tells "waiting on
+ * quota" from "waiting to continue from a checkpoint" (the distinction
+ * `ai/DESIGN_SYSTEM.md` §1 and the `checkpointed` comment above deliberately
+ * carry) while the words say why it is waiting. No new hue: the orange
+ * {@link TIMED_OUT_CONFIG} stays reserved for the terminal, non-resumable kill.
+ */
+const TIMED_OUT_RETRY_CONFIGS: Partial<Record<RunStatus, BadgeConfig>> = {
+	deferred: {
+		...STATUS_CONFIGS.deferred,
+		text: 'Timed out · retrying',
+		title:
+			'Hit its wall-clock timeout — deferred for an automatic retry, not waiting on quota or capacity.',
+	},
+	checkpointed: {
+		...STATUS_CONFIGS.checkpointed,
+		text: 'Timed out · checkpointed',
+		title:
+			'Hit its wall-clock timeout — waiting to be continued from its recorded checkpoint, not waiting on quota.',
+	},
+};
+
+/**
  * Human-readable, semantically-coloured labels for a completed Review run's
  * submitted verdict (issue #218): approval reuses the green "Completed" hue,
  * changes-requested the amber "Deferred" hue, and any other verdict a distinct
@@ -168,6 +199,12 @@ function resolveBadgeConfig(
 	reviewAutomationOutcome: string | null | undefined,
 ): BadgeConfig {
 	if (status === 'failed' && timedOut) return TIMED_OUT_CONFIG;
+	// A resumable wall-clock kill settles deferred/checkpointed, so the timeout
+	// has to be legible on those rows too — as their own hue, re-labelled.
+	if (timedOut) {
+		const retryConfig = TIMED_OUT_RETRY_CONFIGS[status];
+		if (retryConfig) return retryConfig;
+	}
 	// A completed Review run shows its verdict rather than "Completed"; anything
 	// non-completed (or a review row missing its verdict) keeps lifecycle status.
 	if (status === 'completed' && phase === 'review' && reviewVerdict) {
