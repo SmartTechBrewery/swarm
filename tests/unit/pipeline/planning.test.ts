@@ -41,6 +41,7 @@ import {
 	isPreplanSkip,
 	REPLAN_LABEL,
 } from '@/pipeline/preplan.js';
+import { parseSplitTitle } from '@/pipeline/split-naming.js';
 import type { UpdateWorkItemPatch, WorkItem } from '@/pm/types.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
@@ -95,6 +96,15 @@ function planFromMarker(description: string, itemUrl: string): string | undefine
 
 const WORKTREE_PATH = '/Users/dev/swarm/swarm/.swarm-workspaces/task-18';
 
+/**
+ * The shared task name the split fixtures below declare, and the board title SWARM
+ * writes for one of their phases (issue #594) — every card of a split is titled
+ * `<shared name> <phase>/<total>: <phase-specific task>`.
+ */
+const SHARED_NAME = 'Big task';
+const splitTitle = (phase: number, totalPhases: number, task: string) =>
+	`${SHARED_NAME} ${phase}/${totalPhases}: ${task}`;
+
 function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
 		cli: 'claude',
@@ -137,9 +147,13 @@ function makeDeps() {
 			async () => undefined,
 		),
 		moveWorkItem: vi.fn(async () => {}),
-		createWorkItem: vi.fn(async (input) =>
-			createMockWorkItem({ id: `PVTI_${input.title}`, title: input.title, url: input.title }),
-		),
+		createWorkItem: vi.fn(async (input) => {
+			// Key the fake id/url on the phase-specific half of the title, so a card
+			// stays addressable as `PVTI_Second slice` now that SWARM prefixes every
+			// split title with the split's shared name (issue #594).
+			const { task } = parseSplitTitle(input.title);
+			return createMockWorkItem({ id: `PVTI_${task}`, title: input.title, url: task });
+		}),
 		updateWorkItem: vi.fn<(id: string, patch: UpdateWorkItemPatch) => Promise<void>>(
 			async () => {},
 		),
@@ -260,6 +274,7 @@ describe('runPlanningPhase', () => {
 	it('splits a large task: marks each sibling before moving it to Planning, and re-scopes the original', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
 			mainTask: { title: 'First slice', description: 'Just the API' },
 			subTasks: [
 				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Build it.' },
@@ -269,9 +284,10 @@ describe('runPlanningPhase', () => {
 		const deps = makeDeps();
 		const result = await runPlanningPhase({ ...deps, autoAdvance: true });
 
-		// Original re-scoped/renamed into the smaller first task.
+		// Original re-scoped and renamed into the smaller first task — phase 1 of the
+		// split's shared name, the same convention its children get (issue #594).
 		expect(deps.pm.updateWorkItem).toHaveBeenCalledWith('PVTI_item18', {
-			title: 'First slice',
+			title: splitTitle(1, 3, 'First slice'),
 			description: 'Just the API',
 		});
 
@@ -285,8 +301,8 @@ describe('runPlanningPhase', () => {
 			});
 		}
 		expect(deps.pm.createWorkItem.mock.calls.map((c) => c[0].title)).toEqual([
-			'Second slice',
-			'Third slice',
+			splitTitle(2, 3, 'Second slice'),
+			splitTitle(3, 3, 'Third slice'),
 		]);
 
 		// Each sibling's body is updated to embed its parent-written plan as a
@@ -330,15 +346,15 @@ describe('runPlanningPhase', () => {
 		// Phase 2 of 3, blocked by phase 1 (the re-scoped original) and no one else.
 		expect(secondComment).toMatch(/Phase 2 of 3 — split from a larger task/);
 		expect(secondComment).toMatch(/Blocked by/);
-		expect(secondComment).toContain('Phase 1: First slice');
-		expect(secondComment).not.toContain('Phase 2: Second slice');
+		expect(secondComment).toContain(`Phase 1: ${splitTitle(1, 3, 'First slice')}`);
+		expect(secondComment).not.toContain('Phase 2: ');
 		expect(secondComment).toContain('placed it in **Planning**');
 
 		const thirdComment = childComment(deps, 'PVTI_Third slice', false);
 		// Phase 3 of 3, cumulatively blocked by BOTH earlier phases.
 		expect(thirdComment).toMatch(/Phase 3 of 3 — split from a larger task/);
-		expect(thirdComment).toContain('Phase 1: First slice');
-		expect(thirdComment).toContain('Phase 2: Second slice');
+		expect(thirdComment).toContain(`Phase 1: ${splitTitle(1, 3, 'First slice')}`);
+		expect(thirdComment).toContain(`Phase 2: ${splitTitle(2, 3, 'Second slice')}`);
 
 		// Guard 2 (issue #330): cumulative native blocked-by — phase N blocked by
 		// every predecessor. Phase 2 ← [phase 1]; phase 3 ← [phase 1, phase 2].
@@ -363,6 +379,7 @@ describe('runPlanningPhase', () => {
 	it('labels split children with the project-configured automation label (issue #131)', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
 			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
 		});
 		const deps = makeDeps();
@@ -371,15 +388,48 @@ describe('runPlanningPhase', () => {
 		await runPlanningPhase(deps);
 
 		// Without this the sibling SWARM just created would be gated out of SWARM's
-		// own pipeline by the very label the project configured.
+		// own pipeline by the very label the project configured. The parent's own
+		// labels come along too (issue #594), whatever this project gates on.
 		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
-			expect.objectContaining({ labels: ['automate', SPLIT_CHILD_LABEL] }),
+			expect.objectContaining({ labels: ['swarm', 'automate', SPLIT_CHILD_LABEL] }),
+		);
+	});
+
+	it('gives every child the original task’s labels, deduplicated (issue #594)', async () => {
+		splitExists = true;
+		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
+			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
+		});
+		const deps = makeDeps();
+		deps.workItem = createMockWorkItem({
+			id: 'PVTI_item18',
+			title: 'Add planning phase',
+			labels: [
+				{ id: 'LA_bug', name: 'bug' },
+				{ id: 'LA_swarm', name: 'swarm' },
+				// Two lifecycle claims about the *parent* card that would be false the
+				// moment they were copied onto a child.
+				{ id: 'LA_planned', name: PLANNED_LABEL },
+				{ id: 'LA_replan', name: REPLAN_LABEL },
+			],
+		});
+
+		await runPlanningPhase(deps);
+
+		// The type label rides along so the phase still reads as a bug on the board,
+		// the automation label is not duplicated, and neither lifecycle label is
+		// inherited — `planned` is earned by a successful preparation (issue #436) and
+		// `swarm:replan` would discard the preplan this very split is writing.
+		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ labels: ['bug', 'swarm', SPLIT_CHILD_LABEL] }),
 		);
 	});
 
 	it('labels a prepared split child `planned` before its own Planning run (issue #426)', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
 			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
 		});
 		const deps = makeDeps();
@@ -402,6 +452,7 @@ describe('runPlanningPhase', () => {
 	it('keeps splitting when labeling a prepared split child `planned` throws (issue #436)', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
 			subTasks: [
 				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' },
 				{ title: 'Third slice', description: 'The docs', plan: '# Docs plan\n\n1. Write it.' },
@@ -426,13 +477,21 @@ describe('runPlanningPhase', () => {
 		expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
 	});
 
-	it('labels split children with only the split-child label when the gate is disabled', async () => {
+	it('labels split children with only the inherited and split-child labels when the gate is disabled', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
 			subTasks: [{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Do it.' }],
 		});
 		const deps = makeDeps();
 		deps.project = createMockProjectConfig({ pipeline: { automationLabel: '' } });
+		// An unlabeled parent, so nothing but the split-child label can appear: with the
+		// gate disabled no automation label is added on top of what was inherited.
+		deps.workItem = createMockWorkItem({
+			id: 'PVTI_item18',
+			title: 'Add planning phase',
+			labels: [],
+		});
 
 		await runPlanningPhase(deps);
 
@@ -462,22 +521,52 @@ describe('runPlanningPhase', () => {
 		expect(deps.pm.moveWorkItem).not.toHaveBeenCalled();
 	});
 
-	it('leaves the original untouched when the split omits mainTask (but still marks the sibling)', async () => {
+	it('still renames the original when the split omits mainTask, keeping its description (issue #594)', async () => {
 		splitExists = true;
 		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
 			subTasks: [{ title: 'Only sibling', description: 'Z', plan: '# plan\n\nDo Z.' }],
 		});
 		const deps = makeDeps();
 		const result = await runPlanningPhase(deps);
-		// The original item's fields are not patched...
-		expect(deps.pm.updateWorkItem).not.toHaveBeenCalledWith('PVTI_item18', expect.anything());
-		// ...but the sibling's body is still updated to carry its preplanned marker.
+		// A split never leaves the original card generic while its children are named:
+		// it becomes phase 1 of the same shared name. Its description is untouched —
+		// the agent asked for no re-scope.
+		expect(deps.pm.updateWorkItem).toHaveBeenCalledWith('PVTI_item18', {
+			title: splitTitle(1, 2, 'Add planning phase'),
+		});
+		// The sibling's body is still updated to carry its preplanned marker.
 		expect(deps.pm.updateWorkItem).toHaveBeenCalledWith(
 			'PVTI_Only sibling',
 			expect.objectContaining({ description: expect.stringContaining('swarm-preplan:v1') }),
 		);
+		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ title: splitTitle(2, 2, 'Only sibling') }),
+		);
 		expect(deps.pm.createWorkItem).toHaveBeenCalledTimes(1);
-		expect(result.split).toMatchObject({ mainTaskUpdated: false });
+		expect(result.split).toMatchObject({ mainTaskUpdated: true });
+	});
+
+	it('normalizes a phase-first response into the shared-name-first convention (issue #594)', async () => {
+		splitExists = true;
+		// The retired spelling the old prompt asked for, with no `sharedName` at all:
+		// the board must still end up with cards a human can group at a glance.
+		splitContents = JSON.stringify({
+			mainTask: { title: 'Phase 1/2: The API', description: 'Just the API' },
+			subTasks: [{ title: 'Phase 2/2: The UI', description: 'The UI', plan: '# plan\n\nDo it.' }],
+		});
+		const deps = makeDeps();
+		await runPlanningPhase(deps);
+
+		// The shared name is derived from the first task, so it names *this* split
+		// rather than repeating the generic "Phase" every other split would carry.
+		expect(deps.pm.updateWorkItem).toHaveBeenCalledWith('PVTI_item18', {
+			title: 'The API 1/2: The API',
+			description: 'Just the API',
+		});
+		expect(deps.pm.createWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ title: 'The API 2/2: The UI' }),
+		);
 	});
 
 	it('treats an empty subTasks array as no split', async () => {
@@ -487,6 +576,15 @@ describe('runPlanningPhase', () => {
 		const result = await runPlanningPhase(deps);
 		expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
 		expect(result.split).toBeUndefined();
+	});
+
+	it('leaves an unsplit item’s title and labels exactly as they were (issue #594)', async () => {
+		// The naming convention is a property of a *split*, not of Planning: a
+		// right-sized item is renamed by nothing and gains no label but `planned`.
+		const deps = makeDeps();
+		await runPlanningPhase(deps);
+		expect(deps.pm.updateWorkItem).not.toHaveBeenCalled();
+		expect(deps.pm.addLabel.mock.calls).toEqual([['PVTI_item18', PLANNED_LABEL]]);
 	});
 
 	it('throws on a malformed split file rather than silently skipping the split', async () => {
@@ -1232,12 +1330,15 @@ describe('runPlanningPhase', () => {
 	 */
 	describe('an interrupted split resumes instead of duplicating', () => {
 		const THREE_PHASES = JSON.stringify({
-			mainTask: { title: 'Phase 1', description: 'The first slice' },
+			sharedName: SHARED_NAME,
+			mainTask: { title: 'First slice', description: 'The first slice' },
 			subTasks: [
-				{ title: 'Phase 2', description: 'The second slice', plan: '# Plan 2\n\nBuild it.' },
-				{ title: 'Phase 3', description: 'The third slice', plan: '# Plan 3\n\nShip it.' },
+				{ title: 'Second slice', description: 'The second slice', plan: '# Plan 2\n\nBuild it.' },
+				{ title: 'Third slice', description: 'The third slice', plan: '# Plan 3\n\nShip it.' },
 			],
 		});
+		/** The two children's board titles, in phase order (issue #594). */
+		const CHILD_TITLES = [splitTitle(2, 3, 'Second slice'), splitTitle(3, 3, 'Third slice')];
 
 		/** The board both attempts write to, so the retry sees what the first one left. */
 		interface Board {
@@ -1310,17 +1411,17 @@ describe('runPlanningPhase', () => {
 			await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
 				'create-item failed: 502',
 			);
-			expect(titlesOn(board)).toEqual(['Phase 2']);
+			expect(titlesOn(board)).toEqual([CHILD_TITLES[0]]);
 
 			const retry = onBoard(makeDeps(), board);
 			await runPlanningPhase({ ...retry, runId: 'run-A' });
 
 			// One card per planned phase, not two for Phase 2 — and the retry created
 			// only the child the first attempt never reached.
-			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(titlesOn(board)).toEqual(CHILD_TITLES);
 			expect(retry.pm.createWorkItem).toHaveBeenCalledTimes(1);
 			expect(retry.pm.createWorkItem).toHaveBeenCalledWith(
-				expect.objectContaining({ title: 'Phase 3' }),
+				expect.objectContaining({ title: CHILD_TITLES[1] }),
 			);
 			// The adopted child keeps a single copy of each of its two comments.
 			expect(commentsOn(board, 'PVTI_child1', PREPLAN_COMMENT_MARKER_PREFIX)).toHaveLength(1);
@@ -1339,7 +1440,7 @@ describe('runPlanningPhase', () => {
 
 			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
 
-			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(titlesOn(board)).toEqual(CHILD_TITLES);
 		});
 
 		it('creates no child at all when the first attempt died after the last one, before the plan comment', async () => {
@@ -1354,12 +1455,12 @@ describe('runPlanningPhase', () => {
 			await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
 				'plan comment failed: 502',
 			);
-			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(titlesOn(board)).toEqual(CHILD_TITLES);
 
 			const retry = onBoard(makeDeps(), board);
 			await runPlanningPhase({ ...retry, runId: 'run-A' });
 
-			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(titlesOn(board)).toEqual(CHILD_TITLES);
 			expect(retry.pm.createWorkItem).not.toHaveBeenCalled();
 			// Both adopted children keep exactly one preplan comment, not a second copy
 			// of a plan a reader would have to reconcile.
@@ -1374,14 +1475,14 @@ describe('runPlanningPhase', () => {
 
 		it('still performs its own split for a genuine replan — a new run, hence a new identity', async () => {
 			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
-			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3']);
+			expect(titlesOn(board)).toEqual(CHILD_TITLES);
 
 			const replan = onBoard(makeDeps(), board);
 			await runPlanningPhase({ ...replan, runId: 'run-B' });
 
 			// A replan is a new decomposition, not a resumption of the old one.
 			expect(replan.pm.createWorkItem).toHaveBeenCalledTimes(2);
-			expect(titlesOn(board)).toEqual(['Phase 2', 'Phase 3', 'Phase 2', 'Phase 3']);
+			expect(titlesOn(board)).toEqual([...CHILD_TITLES, ...CHILD_TITLES]);
 		});
 
 		it("keeps the delivery's marker in the child's body through the preplan contract write", async () => {
@@ -1458,6 +1559,19 @@ describe('buildPlanningPrompt', () => {
 		expect(prompt).toMatch(/more than 2 INDEPENDENT concerns/i);
 		expect(prompt).toMatch(/more than 2 entries you MUST split/i);
 		expect(prompt).toMatch(/at most 2 entries/i);
+	});
+
+	it('asks for one shared task name and the shared-name-first title format (issue #594)', () => {
+		const prompt = buildPlanningPrompt(createMockWorkItem(), true);
+		expect(prompt).toContain('"sharedName"');
+		expect(prompt).toMatch(/CHOOSE ONE SHARED TASK NAME/);
+		expect(prompt).toContain(
+			'TITLE EVERY\n    TASK "<shared task name> <phase>/<total>: <this phase\'s task>"',
+		);
+		// The retired phase-first spelling is not offered as an example any more — it
+		// is what made every split's cards read alike in the Planning column.
+		expect(prompt).toMatch(/never a\n {4}bare "Phase 2\/3: …"/);
+		expect(prompt).not.toContain('"Phase 1/3: <title>"');
 	});
 
 	it('asks for a reusable per-child plan when splitting', () => {

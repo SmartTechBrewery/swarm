@@ -48,7 +48,10 @@ export const PROPOSED_SPLIT_FILENAME = 'proposed_split.json';
  * work is too large for a single focused PR and, if so, to split it:
  * `proposed_plan.md` then covers only the first (now-smaller) task, and
  * `proposed_split.json` lists the remaining sibling tasks (see
- * {@link PROPOSED_SPLIT_FILENAME}). A right-sized task is left whole. It is also
+ * {@link PROPOSED_SPLIT_FILENAME}), named with one shared task name so every phase
+ * of one issue is recognisable together on the board (issue #594 — SWARM enforces
+ * that convention on the titles it writes, `src/pipeline/split-naming.ts`, so the
+ * prompt asks for it rather than relying on it). A right-sized task is left whole. It is also
  * told to record a scope gate — a "## Scope gate" section in `proposed_plan.md`
  * and a machine-readable {@link PROPOSED_SCOPE_FILENAME} — that SWARM's
  * deterministic post-plan guard validates.
@@ -110,6 +113,7 @@ export function buildPlanningPrompt(
 			'    that context is fresh, so each one does not have to re-explore the repo later.',
 			`  - Write "${PROPOSED_SPLIT_FILENAME}" as JSON of this exact shape:`,
 			'      {',
+			'        "sharedName": "<concise name every phase of this split shares>",',
 			'        "mainTask": { "title": "<first task\'s title>", "description": "<its scope>" },',
 			'        "subTasks": [',
 			'          {',
@@ -119,15 +123,24 @@ export function buildPlanningPrompt(
 			'          }',
 			'        ]',
 			'      }',
-			'    "mainTask" is OPTIONAL — include it only to rename/re-scope the original item;',
-			'    omit it to keep the original title/description.',
+			'    "mainTask" is OPTIONAL — include it only to re-scope the original item;',
+			'    omit it to keep the original description. Either way SWARM renames the',
+			'    original card to phase 1 of the naming convention below.',
+			'    CHOOSE ONE SHARED TASK NAME for this split — two to five words naming the',
+			'    overall effort (e.g. "Trello PM", "Split card naming") — put it in',
+			'    "sharedName", and use that exact name, unchanged, for the original task and',
+			'    for every child. It is what makes all phases of one issue recognisable',
+			"    together in the board's Planning column, so it must distinguish this split",
+			'    from other issues that happen to have the same number of phases.',
 			'    ORDER THE TITLES BY PHASE. The first task (mainTask, or the original item if',
-			'    you omit it) is phase 1, each "subTasks" entry the next phase. Prefix EVERY',
-			'    title with its phase so the sequence is unmistakable on the board, e.g.',
-			'    "Phase 1/3: <title>", "Phase 2/3: <title>", "Phase 3/3: <title>". A later',
-			'    phase must never be startable before its predecessors — SWARM also records',
-			'    this as a blocked-by relationship and defers a phase whose predecessors are',
-			'    still open, so make each "description" state which earlier phases it needs.',
+			'    you omit it) is phase 1, each "subTasks" entry the next phase. TITLE EVERY',
+			'    TASK "<shared task name> <phase>/<total>: <this phase\'s task>", e.g.',
+			'    "Trello PM 1/3: Board reads", "Trello PM 2/3: Board writes",',
+			'    "Trello PM 3/3: The dependency opt-out" — the shared name FIRST, never a',
+			'    bare "Phase 2/3: …". A later phase must never be startable before its',
+			'    predecessors — SWARM also records this as a blocked-by relationship and',
+			'    defers a phase whose predecessors are still open, so make each',
+			'    "description" state which earlier phases it needs.',
 			'    Each "subTasks" entry is a task planned separately later. Write its "description"',
 			'    complete enough to stand on its own, and its "plan" (concise GitHub-flavored',
 			'    Markdown) covering:',

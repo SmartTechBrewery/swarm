@@ -45,6 +45,7 @@ import {
 	evaluatePreplan,
 	isPreplanSkip,
 	type PreplanContract,
+	REPLAN_LABEL,
 	SPLIT_CHILD_LABEL,
 } from '@/pipeline/preplan.js';
 import {
@@ -59,9 +60,10 @@ import {
 	sessionRunArgs,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
+import { resolveSplitNaming } from '@/pipeline/split-naming.js';
 import { resolveAutomationLabel } from '@/pm/automation-label.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
-import type { PMProvider, WorkItem } from '@/pm/types.js';
+import type { PMProvider, UpdateWorkItemPatch, WorkItem } from '@/pm/types.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	SWARM_GENERATED_FOOTER,
@@ -108,8 +110,16 @@ const SplitSubTaskSchema = z.object({
  * the original item into the smaller first task; `subTasks` are the siblings to
  * spawn (each carrying its own reusable plan). Zod is the source of truth for the
  * on-disk contract (ai/CODING_STANDARDS.md "Zod as source of truth").
+ *
+ * `sharedName` is the one human-readable name every phase of this split is titled
+ * with (issue #594). Optional because it is a *preference*, not a prerequisite: the
+ * naming convention is applied to every title SWARM writes either way
+ * (`resolveSplitNaming`, `src/pipeline/split-naming.ts`), so a response that omits
+ * it falls back to a name derived from the split's own titles rather than failing a
+ * Planning run over wording.
  */
 const ProposedSplitSchema = z.object({
+	sharedName: z.string().trim().min(1).optional(),
 	mainTask: MainTaskSchema.optional(),
 	subTasks: z.array(SplitSubTaskSchema).default([]),
 });
@@ -666,19 +676,50 @@ export function planCommentBody(
 
 /**
  * The patch to apply to the original item so it becomes the split's smaller
- * first task, containing only the fields the agent actually changed — or
- * `undefined` when title and description both match, so no needless write is
- * made.
+ * first task — or `undefined` when it already carries both, so no needless write
+ * is made.
+ *
+ * `title` is the phase-1 title the naming convention produced, not the agent's own
+ * (issue #594): the original is renamed on **every** split, even one whose response
+ * omits `mainTask`, because a split that renames its children and leaves the parent
+ * card generic is exactly the unscannable board the convention exists to fix. The
+ * description is still the agent's, and only patched when it actually re-scoped one.
  */
 function buildMainTaskPatch(
 	workItem: WorkItem,
+	title: string,
 	mainTask: ProposedSplit['mainTask'],
-): { title?: string; description?: string } | undefined {
-	if (!mainTask) return undefined;
-	const patch: { title?: string; description?: string } = {};
-	if (mainTask.title !== workItem.title) patch.title = mainTask.title;
-	if (mainTask.description !== workItem.description) patch.description = mainTask.description;
+): UpdateWorkItemPatch | undefined {
+	const patch: UpdateWorkItemPatch = {};
+	if (title !== workItem.title) patch.title = title;
+	if (mainTask && mainTask.description !== workItem.description) {
+		patch.description = mainTask.description;
+	}
 	return patch.title === undefined && patch.description === undefined ? undefined : patch;
+}
+
+/**
+ * Labels every child of a split is created with (issue #594): the original task's
+ * own labels, then the project's automation label, then {@link SPLIT_CHILD_LABEL},
+ * deduplicated with the first occurrence winning.
+ *
+ * Inheriting the parent's labels keeps a phase readable as what it is — a `bug`
+ * split into four phases produces four `bug` cards, not one `bug` and three
+ * untyped ones — and carries the automation gate across even when the parent is
+ * labelled with something this project no longer gates on. Two labels are
+ * deliberately **not** inherited, because both are statements about a card's own
+ * lifecycle that would be false the moment they were copied: {@link PLANNED_LABEL},
+ * which a child earns only once its preparation really succeeded (issue #436), and
+ * {@link REPLAN_LABEL}, which would discard the preplan this split is about to
+ * write into that very child.
+ */
+function splitChildLabels(parent: WorkItem, automationLabel: string | undefined): string[] {
+	const inherited = parent.labels
+		.map((label) => label.name)
+		.filter((name) => name !== PLANNED_LABEL && name !== REPLAN_LABEL);
+	return [
+		...new Set([...inherited, ...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL]),
+	];
 }
 
 /**
@@ -733,9 +774,11 @@ function readPlanOrThrow(
 }
 
 /**
- * Apply a split: re-scope/rename the original item into the smaller first task
- * (when the agent asked), then spawn each sibling task in Planning — tagged as a
- * split child and with the project's `automationLabel` (issue #131) so SWARM's own
+ * Apply a split: re-scope the original item into the smaller first task and rename
+ * it to phase 1 of the split's shared naming convention (issue #594), then spawn
+ * each sibling task in Planning — named as its own phase of that same convention,
+ * tagged as a split child and carrying the parent's labels plus the project's
+ * `automationLabel` (issues #131, #594) so SWARM's own
  * siblings pass the dispatch gate, with a comment explaining the split, and with the parent-written
  * plan embedded as a validated preplanned marker in its issue body
  * ({@link embedPreplanMarker}) before it enters Planning. It is created in Backlog
@@ -803,10 +846,19 @@ async function applySplit(
 	automationLabel: string | undefined,
 	deliveryId: string | undefined,
 ): Promise<{ subTaskItemIds: string[]; mainTaskUpdated: boolean }> {
-	const mainPatch = split.mainTask ? buildMainTaskPatch(parent, split.mainTask) : undefined;
+	// One shared name for the whole split, applied to the original and every child
+	// (issue #594), so the phases of one issue are recognisable as a set on the board.
+	const naming = resolveSplitNaming({
+		declaredSharedName: split.sharedName,
+		parentTitle: parent.title,
+		mainTaskTitle: split.mainTask?.title,
+		subTaskTitles: split.subTasks.map((sub) => sub.title),
+	});
+	const mainPatch = buildMainTaskPatch(parent, naming.mainTaskTitle, split.mainTask);
 	if (mainPatch) {
 		await pm.updateWorkItem(parent.id, mainPatch);
 	}
+	const childLabels = splitChildLabels(parent, automationLabel);
 	// One id/timestamp for the whole split, so every child's marker is stamped
 	// with the operation it came from (provenance; see PreplanContract). The id is
 	// the *delivery's* when there is one, which is what makes every marker this
@@ -828,11 +880,12 @@ async function applySplit(
 			firstTask,
 			predecessors,
 			sub,
+			title: naming.subTaskTitles[childIndex],
 			childIndex,
 			totalPhases,
 			splitId,
 			generatedAt,
-			automationLabel,
+			labels: childLabels,
 			deliveryId,
 		});
 		subTaskItemIds.push(sibling.id);
@@ -849,11 +902,14 @@ interface SpawnSplitChildOptions {
 	/** Phases 1..N-1, the cumulative blocked-by this child is chained behind. */
 	predecessors: readonly WorkItem[];
 	sub: ProposedSplit['subTasks'][number];
+	/** This phase's board title, in the split's shared naming convention (issue #594). */
+	title: string;
 	childIndex: number;
 	totalPhases: number;
 	splitId: string;
 	generatedAt: string;
-	automationLabel: string | undefined;
+	/** The labels every child of this split is created with ({@link splitChildLabels}). */
+	labels: readonly string[];
 	/** This delivery's id, or `undefined` when the run has no run row to key markers on. */
 	deliveryId: string | undefined;
 }
@@ -877,11 +933,12 @@ async function spawnSplitChild(pm: PMProvider, options: SpawnSplitChildOptions):
 		firstTask,
 		predecessors,
 		sub,
+		title,
 		childIndex,
 		totalPhases,
 		splitId,
 		generatedAt,
-		automationLabel,
+		labels,
 		deliveryId,
 	} = options;
 	// Only a delivery with an identity can be replayed, so only one stamps its
@@ -891,9 +948,9 @@ async function spawnSplitChild(pm: PMProvider, options: SpawnSplitChildOptions):
 	const description = marker ? `${sub.description.trimEnd()}\n\n${marker}` : sub.description;
 	const { sibling, resumed } = await acquireSplitChild(pm, {
 		marker,
-		title: sub.title,
+		title,
 		description,
-		automationLabel,
+		labels,
 		parentId: parent.id,
 		childIndex,
 	});
@@ -960,7 +1017,8 @@ interface AcquireSplitChildOptions {
 	title: string;
 	/** The child's issue body — human description plus `marker`, when there is one. */
 	description: string;
-	automationLabel: string | undefined;
+	/** The labels to create it with ({@link splitChildLabels}). */
+	labels: readonly string[];
 	parentId: string;
 	childIndex: number;
 }
@@ -994,7 +1052,7 @@ async function acquireSplitChild(
 	pm: PMProvider,
 	options: AcquireSplitChildOptions,
 ): Promise<{ sibling: WorkItem; resumed: boolean }> {
-	const { marker, title, description, automationLabel, parentId, childIndex } = options;
+	const { marker, title, description, labels, parentId, childIndex } = options;
 	if (marker) {
 		const existing = await pm.findWorkItemByDescriptionMarker(marker);
 		if (existing) {
@@ -1010,12 +1068,14 @@ async function acquireSplitChild(
 		title,
 		description,
 		status: SIBLING_CREATION_STATUS,
-		// The configured automation label, not a hard-coded `swarm` (issue #131):
-		// a sibling SWARM created must be opted into SWARM's own pipeline, whatever
-		// label this project gates on. Omitted entirely when the gate is disabled.
-		// PLANNED_LABEL is deliberately *not* here — it is applied by the caller, once
-		// the preparation that makes the child planned actually succeeded (issue #436).
-		labels: [...(automationLabel ? [automationLabel] : []), SPLIT_CHILD_LABEL],
+		// The original task's own labels plus the configured automation label — not a
+		// hard-coded `swarm` (issue #131): a sibling SWARM created must be opted into
+		// SWARM's own pipeline, whatever label this project gates on, and must keep the
+		// parent's type/automation metadata visible on every phase (issue #594). See
+		// `splitChildLabels` for the two labels that are deliberately not inherited;
+		// PLANNED_LABEL is likewise applied by the caller, once the preparation that
+		// makes the child planned actually succeeded (issue #436).
+		labels: [...labels],
 	});
 	return { sibling, resumed: false };
 }
