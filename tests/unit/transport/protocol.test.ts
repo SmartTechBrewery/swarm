@@ -77,6 +77,33 @@ describe('transport protocol schemas', () => {
 			const { hostname, ...withoutHostname } = valid;
 			expect(HandshakeRequestSchema.safeParse(withoutHostname).success).toBe(false);
 		});
+
+		// Issue #608: a reconnecting daemon presents the lease it already holds. The
+		// field is additive and optional in both directions, which is why
+		// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped for it — the shape
+		// above (with no `reclaim`) is the older daemon's and stays valid.
+		it('accepts a reclaim carrying the session id and fencing token it holds', () => {
+			const reclaim = { sessionId: SESSION_ID, fencingToken: 4 };
+			expect(HandshakeRequestSchema.parse({ ...valid, reclaim })).toEqual({ ...valid, reclaim });
+		});
+
+		it('rejects a malformed reclaim', () => {
+			expect(
+				HandshakeRequestSchema.safeParse({
+					...valid,
+					reclaim: { sessionId: 'not-a-uuid', fencingToken: 4 },
+				}).success,
+			).toBe(false);
+			expect(
+				HandshakeRequestSchema.safeParse({
+					...valid,
+					reclaim: { sessionId: SESSION_ID, fencingToken: 0 },
+				}).success,
+			).toBe(false);
+			expect(
+				HandshakeRequestSchema.safeParse({ ...valid, reclaim: { sessionId: SESSION_ID } }).success,
+			).toBe(false);
+		});
 	});
 
 	describe('HandshakeResponseSchema', () => {

@@ -31,9 +31,13 @@ import {
 } from '../db/repositories/workerSessionsRepository.js';
 import { optionalEnv } from '../lib/env.js';
 import { resolveWorkerByCredential } from './worker-service.js';
-import type { WorkerSession } from './worker-session.js';
+import type { WorkerSession, WorkerSessionReclaim } from './worker-session.js';
 
-export { type WorkerSession, WorkerSessionHeldError } from './worker-session.js';
+export {
+	type WorkerSession,
+	WorkerSessionHeldError,
+	type WorkerSessionReclaim,
+} from './worker-session.js';
 
 /** Default heartbeat TTL when `SWARM_WORKER_HEARTBEAT_TTL_MS` is unset (60s). */
 export const DEFAULT_WORKER_HEARTBEAT_TTL_MS = 60_000;
@@ -84,13 +88,20 @@ export interface AcquiredSession {
  * rejected (`WorkerSessionHeldError`), an expired one is re-acquired with a bumped
  * fencing token. The same user may hold independent leases for *different*
  * registered workers — leases are keyed by worker, not by user.
+ *
+ * `reclaim` is the optional proof that the caller is the lease's *own* holder,
+ * reconnecting after the control plane dropped its socket (issue #608): a live
+ * lease it matches is re-acquired (with the token still bumped) instead of
+ * refused. Credential authentication stays **first** and unchanged — the proof is
+ * possession on top of authentication, never instead of it.
  */
 export async function acquireSession(
 	rawCredential: string,
 	ttlMs = resolveHeartbeatTtlMs(),
+	reclaim?: WorkerSessionReclaim,
 ): Promise<AcquiredSession> {
 	const workerId = await authenticateWorker(rawCredential);
-	const session = await acquireLease(workerId, ttlMs);
+	const session = await acquireLease(workerId, ttlMs, reclaim);
 	return { session, fencingToken: session.fencingToken };
 }
 

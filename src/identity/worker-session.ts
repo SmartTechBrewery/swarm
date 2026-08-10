@@ -15,14 +15,20 @@
  * (`validateFencingToken`, the seam #130 calls). `lastHeartbeatAt` drives
  * expiry: a session is *live* only while its last heartbeat is within the
  * heartbeat TTL, and an expired session may be re-acquired with a bumped token.
- * `currentRunId` is a legacy single-run pointer. Federated capacity is tracked
- * by durable dispatch claims because one worker may have multiple allocations.
+ * A *live* one may be re-acquired too, but only by the daemon that already holds
+ * it, which proves that by presenting the lease's own `sessionId`/`fencingToken`
+ * ({@link WorkerSessionReclaimSchema}, issue #608) — so a control-plane restart
+ * costs a reconnecting daemon a round trip rather than the whole TTL, while a
+ * genuinely competing daemon is still refused. `currentRunId` is a legacy
+ * single-run pointer. Federated capacity is tracked by durable dispatch claims
+ * because one worker may have multiple allocations.
  *
  * This is the persisted-row read model; `src/db/schema/workerSessions.ts` is its
  * table and `src/db/repositories/workerSessionsRepository.ts` owns the atomic
  * acquire/heartbeat/release transitions. The domain-level helpers here
- * (`isSessionLive`, `nextFencingToken`) stay dependency-free so both the
- * repository and the service share one definition of "live" and "next token".
+ * (`isSessionLive`, `nextFencingToken`, `isReclaimOf`) stay dependency-free so
+ * both the repository and the service share one definition of "live", "next
+ * token", and "the caller's own lease".
  */
 
 import { z } from 'zod';
@@ -47,6 +53,50 @@ export const WorkerSessionSchema = z.object({
 });
 
 export type WorkerSession = z.infer<typeof WorkerSessionSchema>;
+
+/**
+ * Proof that the caller already holds the lease it is acquiring — the `sessionId`
+ * and `fencingToken` the control plane minted for it, which live only in that
+ * daemon's memory. Presented on a **reconnect** handshake so a daemon whose socket
+ * the control plane dropped (a router restart, redeploy, or crash — nothing
+ * released the leases it held) takes its own lease back on the next round trip
+ * instead of waiting out the heartbeat TTL (issue #608).
+ *
+ * Possession of the pair is a sound proof because both values are minted by the
+ * control plane in the handshake response and never leave the holder: they are not
+ * persisted on the worker, never logged, and never placed in a URL. A second daemon
+ * reading the same `SWARM_WORKER_CREDENTIAL` has the credential but not the pair,
+ * so it is still refused — and the proof is checked *on top of* credential
+ * authentication, never instead of it.
+ */
+export const WorkerSessionReclaimSchema = z.object({
+	sessionId: z.string().uuid(),
+	fencingToken: z.number().int().positive(),
+});
+
+export type WorkerSessionReclaim = z.infer<typeof WorkerSessionReclaimSchema>;
+
+/**
+ * Whether `reclaim` proves possession of `session` — an exact match on *both* the
+ * session's own id and its current fencing token. Pure, so the acquire transaction
+ * and its tests share one definition, exactly as {@link isSessionLive} is shared.
+ * `undefined` (no proof presented) is always `false`: a competing daemon, and a
+ * restarted daemon that lost the pair, must both stay refused.
+ *
+ * Matching the token as well as the id is what makes a *superseded* holder's stale
+ * proof fail: once anyone re-acquires, the row's token has moved past the one that
+ * daemon remembers.
+ */
+export function isReclaimOf(
+	session: { id: string; fencingToken: number },
+	reclaim: WorkerSessionReclaim | undefined,
+): boolean {
+	return (
+		reclaim !== undefined &&
+		reclaim.sessionId === session.id &&
+		reclaim.fencingToken === session.fencingToken
+	);
+}
 
 /**
  * The next fencing token after `current` — the single named place the monotonic

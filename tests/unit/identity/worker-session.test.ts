@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	INITIAL_FENCING_TOKEN,
+	isReclaimOf,
 	isSessionLive,
 	nextFencingToken,
 	WorkerSessionHeldError,
+	WorkerSessionReclaimSchema,
 	WorkerSessionSchema,
 } from '@/identity/worker-session.js';
 
@@ -65,6 +67,59 @@ describe('WorkerSessionSchema', () => {
 		expect(() => WorkerSessionSchema.parse({ ...valid, fencingToken: 0 })).toThrow();
 		expect(() => WorkerSessionSchema.parse({ ...valid, fencingToken: -1 })).toThrow();
 		expect(() => WorkerSessionSchema.parse({ ...valid, fencingToken: 1.5 })).toThrow();
+	});
+});
+
+describe('isReclaimOf (the reconnecting holder’s proof — issue #608)', () => {
+	const session = { id: '11111111-1111-4111-8111-111111111111', fencingToken: 4 };
+
+	it('accepts an exact match on both the session id and its current token', () => {
+		expect(isReclaimOf(session, { sessionId: session.id, fencingToken: 4 })).toBe(true);
+	});
+
+	it('refuses a caller that presents no proof at all', () => {
+		// A competing daemon holds the same credential but not the pair, so the lease's
+		// liveness refusal must still catch it.
+		expect(isReclaimOf(session, undefined)).toBe(false);
+	});
+
+	it('refuses a mismatched session id', () => {
+		expect(
+			isReclaimOf(session, {
+				sessionId: '22222222-2222-4222-8222-222222222222',
+				fencingToken: 4,
+			}),
+		).toBe(false);
+	});
+
+	it('refuses a superseded holder’s stale token', () => {
+		// Once anyone re-acquires, the row's token moves past the one that daemon
+		// remembers — which is what makes matching on the token load-bearing.
+		expect(isReclaimOf(session, { sessionId: session.id, fencingToken: 3 })).toBe(false);
+		expect(isReclaimOf(session, { sessionId: session.id, fencingToken: 5 })).toBe(false);
+	});
+});
+
+describe('WorkerSessionReclaimSchema', () => {
+	it('accepts a uuid session id with a positive integer token', () => {
+		const valid = { sessionId: '11111111-1111-4111-8111-111111111111', fencingToken: 2 };
+		expect(WorkerSessionReclaimSchema.parse(valid)).toEqual(valid);
+	});
+
+	it('rejects a non-uuid session id or a non-positive/non-integer token', () => {
+		expect(
+			WorkerSessionReclaimSchema.safeParse({ sessionId: 'nope', fencingToken: 2 }).success,
+		).toBe(false);
+		const sessionId = '11111111-1111-4111-8111-111111111111';
+		expect(WorkerSessionReclaimSchema.safeParse({ sessionId, fencingToken: 0 }).success).toBe(
+			false,
+		);
+		expect(WorkerSessionReclaimSchema.safeParse({ sessionId, fencingToken: -1 }).success).toBe(
+			false,
+		);
+		expect(WorkerSessionReclaimSchema.safeParse({ sessionId, fencingToken: 1.5 }).success).toBe(
+			false,
+		);
 	});
 });
 

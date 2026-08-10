@@ -26,6 +26,7 @@ import { z } from 'zod';
 import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js';
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
+import { WorkerSessionReclaimSchema } from '../identity/worker-session.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { RecoveryIntentSchema } from '../queue/jobs.js';
 import { TriggerPhaseSchema } from '../triggers/types.js';
@@ -106,6 +107,19 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * worker's eligibility, so the field needs no protocol-version bump: it is an
  * additive, backward-compatible frame change (see {@link TRANSPORT_PROTOCOL_VERSION},
  * which is reserved for *incompatible* shape changes).
+ *
+ * `reclaim` is what lets a daemon say *"this is me, taking my own lease back"*
+ * (issue #608). It carries the `sessionId`/`fencingToken` the control plane already
+ * minted for this daemon — it *is* the identity module's validator
+ * (`WorkerSessionReclaimSchema`, `../identity/worker-session.ts`) rather than a
+ * re-declaration, the same move {@link TaskPhaseSchema} makes — so a worker whose
+ * socket the control plane dropped re-establishes its session on the next round trip
+ * instead of waiting out the heartbeat TTL. Optional on purpose for the same reason
+ * as `supportedPhases`: a daemon that predates it simply omits it and gets exactly
+ * today's behaviour, and an older router ignores a key it does not know, so this too
+ * needs no protocol-version bump. It carries **no secret** — the credential contract
+ * above is untouched, and like every other handshake field it is never reflected in
+ * an error body.
  */
 export const HandshakeRequestSchema = z.object({
 	credential: z.string().min(1),
@@ -113,6 +127,7 @@ export const HandshakeRequestSchema = z.object({
 	hostname: z.string().min(1),
 	capabilities: z.array(AgentCliSchema).nonempty(),
 	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
+	reclaim: WorkerSessionReclaimSchema.optional(),
 	protocolVersion: z.number().int(),
 });
 export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;

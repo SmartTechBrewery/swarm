@@ -12,7 +12,9 @@
  *      frame every `heartbeatTtlMs / 3` to keep the `worker_sessions` lease live —
  *      the exact liveness signal the eligibility gate consumes;
  *   3. reconnect with exponential backoff (jittered, capped) whenever the
- *      transport is lost, re-acquiring the lease with a fresh handshake.
+ *      transport is lost, re-acquiring the lease with a fresh handshake —
+ *      presenting the session it already holds so a control-plane restart costs a
+ *      round trip rather than the lease TTL (issue #608).
  *
  * It deliberately imports **nothing** from `../db/*` or the queue: the client is
  * the second front door to the same session service the in-process worker calls
@@ -30,6 +32,7 @@
 import { WebSocket } from 'ws';
 
 import type { AgentCli } from '../harness/agent-cli.js';
+import type { WorkerSessionReclaim } from '../identity/worker-session.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import {
 	type ControlPlaneMessage,
@@ -77,8 +80,10 @@ export class WorkerTransportProtocolError extends Error {
 /**
  * A live session for this worker is already held by another daemon (HTTP 409,
  * no `offending` CLIs). Fatal on the *first* connect (a genuinely competing
- * daemon), but recoverable on a reconnect: a stale self-lease from an ungraceful
- * drop expires within the TTL, so the reconnect loop backs off and retries.
+ * daemon), but recoverable on a reconnect: this daemon normally takes its own
+ * lease straight back by presenting it (issue #608), and a 409 that survives that
+ * means the lease really is somebody else's now — so the loop drops the proof,
+ * backs off, and retries as a plain acquire.
  */
 export class WorkerSessionConflictError extends Error {
 	constructor(message = 'a worker session is already held by another daemon') {
@@ -152,6 +157,20 @@ export function buildHandshakeRequest(input: {
 		supportedPhases: [...input.supportedPhases],
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
+}
+
+/**
+ * The handshake request, plus the proof of possession when this daemon already
+ * holds a lease (issue #608). A separate pure helper rather than a field on
+ * `buildHandshakeRequest`'s input, because the base request is built once up front
+ * (and rebuilt only by a capability re-probe) while the proof changes with every
+ * successful handshake.
+ */
+export function withSessionReclaim(
+	request: HandshakeRequest,
+	reclaim: WorkerSessionReclaim | undefined,
+): HandshakeRequest {
+	return reclaim ? { ...request, reclaim } : request;
 }
 
 /** Build a heartbeat frame presenting the session's fencing token (+ optional health). */
@@ -587,11 +606,30 @@ export function connectWorkerTransport(
 	const done = (async () => {
 		let attempt = 0;
 		let everConnected = false;
+		// The lease this daemon currently holds, presented on a reconnect handshake so
+		// the control plane recognises its own holder instead of refusing it for the
+		// remainder of the TTL (issue #608). In memory only, deliberately: a restarted
+		// *daemon* has no claim on the old lease and must acquire afresh.
+		let heldSession: WorkerSessionReclaim | undefined;
 		while (!stopped) {
 			let session: HandshakeResponse;
 			try {
-				session = await performHandshake(deps, urls.sessionUrl, request);
+				session = await performHandshake(
+					deps,
+					urls.sessionUrl,
+					withSessionReclaim(request, heldSession),
+				);
 			} catch (err) {
+				if (err instanceof WorkerSessionConflictError && heldSession) {
+					// The lease we remembered is genuinely someone else's now — it was
+					// re-acquired while we were away, so our token no longer matches. Drop the
+					// proof so the next attempt is a plain acquire, and let the normal backoff
+					// wait the TTL out.
+					deps.logger.warn('reclaim of the previously held worker session was refused', {
+						sessionId: heldSession.sessionId,
+					});
+					heldSession = undefined;
+				}
 				if (err instanceof WorkerCapabilityConflictError) {
 					const refreshedRequest = await reprobeRequest(err);
 					if (!refreshedRequest) throw err;
@@ -615,7 +653,11 @@ export function connectWorkerTransport(
 				workerId: session.workerId,
 				sessionId: session.sessionId,
 				heartbeatTtlMs: session.heartbeatTtlMs,
+				// Which path this handshake took, so the log says on its face whether the
+				// reconnect reclaimed the lease it already held or acquired a fresh one.
+				reclaimed: heldSession !== undefined,
 			});
+			heldSession = { sessionId: session.sessionId, fencingToken: session.fencingToken };
 
 			const end = await runSession(session);
 			if (stopped) break;
@@ -659,7 +701,8 @@ export function connectWorkerTransport(
  * Whether a handshake error should stop the client rather than be retried. Auth
  * and protocol rejections are always fatal; a plain session conflict is fatal
  * only before the first successful connect (a competing daemon), and recoverable
- * afterward (a stale self-lease that expires within the TTL). A capability
+ * afterward — the reconnect normally reclaims the lease outright (issue #608), and
+ * a conflict that survives that means another daemon really took it. A capability
  * rejection is fatal too, but the connect loop gets first refusal on it — it
  * re-probes PATH and only falls through to this classification once the fresh
  * probe agrees the CLI is not there (issue #559).

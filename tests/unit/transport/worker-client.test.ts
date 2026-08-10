@@ -20,6 +20,7 @@ import {
 	WorkerTransportAuthError,
 	type WorkerTransportOverrides,
 	WorkerTransportProtocolError,
+	withSessionReclaim,
 } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
@@ -128,6 +129,28 @@ describe('buildHandshakeRequest', () => {
 				supportedPhases: ALL_TRIGGER_PHASES,
 			}),
 		).toThrow();
+	});
+});
+
+describe('withSessionReclaim', () => {
+	const request = buildHandshakeRequest({
+		credential: CREDENTIAL,
+		daemonVersion: '0.1.0',
+		hostname: 'ada-laptop',
+		capabilities: ['claude'],
+		supportedPhases: ALL_TRIGGER_PHASES,
+	});
+
+	it('passes the request through untouched when this daemon holds no lease', () => {
+		expect(withSessionReclaim(request, undefined)).toEqual(request);
+		expect(withSessionReclaim(request, undefined)).not.toHaveProperty('reclaim');
+	});
+
+	it('attaches the held session as the proof of possession', () => {
+		const reclaim = { sessionId: SESSION_ID, fencingToken: 4 };
+		expect(withSessionReclaim(request, reclaim)).toEqual({ ...request, reclaim });
+		// The base request is left alone, so a capability re-probe's rebuild still wins.
+		expect(request).not.toHaveProperty('reclaim');
 	});
 });
 
@@ -405,7 +428,47 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		expect(sockets).toHaveLength(2);
 		expect(sockets[1].headers['x-fencing-token']).toBe('5');
 
+		// Issue #608: the first handshake had nothing to reclaim; the reconnect presents
+		// the session it holds, so the control plane recognises its own holder instead of
+		// refusing it until the lease TTL lapses.
+		expect(JSON.parse(String(fetch.mock.calls[0][1].body))).not.toHaveProperty('reclaim');
+		expect(JSON.parse(String(fetch.mock.calls[1][1].body)).reclaim).toEqual({
+			sessionId: SESSION_ID,
+			fencingToken: 4,
+		});
+
 		await client.stop();
+	});
+
+	// A 409 that survives the reclaim means the lease really is another daemon's now
+	// (it was re-acquired while we were away, so our token no longer matches). The
+	// proof is dropped and the next attempt is a plain acquire — still not fatal,
+	// because this client had connected.
+	it('drops the held proof when the reclaim is refused, then re-acquires fresh', async () => {
+		fetch
+			.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)))
+			.mockResolvedValueOnce(jsonResponse(409, { reason: 'worker session already held' }))
+			.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(9)));
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitDrop(1006);
+		await flush();
+		await vi.advanceTimersByTimeAsync(500);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(JSON.parse(String(fetch.mock.calls[1][1].body)).reclaim).toEqual({
+			sessionId: SESSION_ID,
+			fencingToken: 4,
+		});
+
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(fetch).toHaveBeenCalledTimes(3);
+		expect(JSON.parse(String(fetch.mock.calls[2][1].body))).not.toHaveProperty('reclaim');
+		expect(sockets).toHaveLength(2);
+
+		await client.stop();
+		await expect(client.done).resolves.toBeUndefined();
 	});
 
 	it('reconnects when the control plane sends a disconnect control frame', async () => {

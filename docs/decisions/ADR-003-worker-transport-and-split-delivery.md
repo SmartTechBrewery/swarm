@@ -59,11 +59,17 @@ service verbatim:
   (`resolveWorkerByCredential`), acquire the fenced `worker_sessions` lease
   (`acquireSession`), persist the daemon's declared CLIs
   (`refreshWorkerCapabilities`), and return the session (`sessionId`,
-  `fencingToken`, `heartbeatTtlMs`).
+  `fencingToken`, `heartbeatTtlMs`). The request may also carry an optional
+  `reclaim` — the `sessionId`/`fencingToken` this daemon already holds (issue
+  #608) — which lets it take its *own* live lease back (token still bumped, run
+  pointer still cleared) instead of being refused; a caller that presents no
+  matching proof still gets `worker session already held`.
 - **`GET /worker/stream`** — a WebSocket (via `@hono/node-ws`) carrying periodic
   worker→cloud `heartbeat` frames that refresh the lease (`heartbeat`), and
   releasing the lease on disconnect (`releaseSession`). An ungraceful drop still
-  expires via the heartbeat TTL — the existing mechanism.
+  expires via the heartbeat TTL — the existing mechanism — except when the *control
+  plane* is what dropped the socket: the returning daemon reclaims its own lease at
+  the handshake, so a router restart no longer costs it the TTL (issue #608).
 
 HTTP carries the request/response handshake; the WebSocket carries the
 long-lived, low-latency heartbeat stream. The raw credential travels only in the

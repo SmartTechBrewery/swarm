@@ -13,7 +13,8 @@
  *
  * Two routes, both under `/worker`:
  *   - `POST /worker/session` — the handshake (request/response): authenticate the
- *     credential, acquire the fenced lease, declare the daemon's CLIs, return the
+ *     credential, acquire the fenced lease — reclaiming the daemon's *own* live lease
+ *     when it presents the proof (issue #608) — declare the daemon's CLIs, return the
  *     session.
  *   - `GET /worker/stream` — a WebSocket carrying periodic heartbeat frames that
  *     keep the lease live, releasing it on disconnect.
@@ -50,6 +51,7 @@ import {
 	UnknownWorkerCredentialError,
 	validateFencingToken,
 	WorkerSessionHeldError,
+	type WorkerSessionReclaim,
 } from '../identity/worker-session-service.js';
 import { logger } from '../lib/logger.js';
 import {
@@ -94,7 +96,11 @@ const LEASE_LOST_REASON =
  */
 export interface WorkerTransportDeps {
 	resolveWorkerByCredential: (rawCredential: string) => Promise<Worker | undefined>;
-	acquireSession: (rawCredential: string, ttlMs: number) => Promise<AcquiredSession>;
+	acquireSession: (
+		rawCredential: string,
+		ttlMs: number,
+		reclaim?: WorkerSessionReclaim,
+	) => Promise<AcquiredSession>;
 	heartbeat: (rawCredential: string, fencingToken: number, ttlMs: number) => Promise<boolean>;
 	releaseSession: (rawCredential: string, fencingToken: number) => Promise<boolean>;
 	refreshWorkerCapabilities: (
@@ -193,9 +199,23 @@ export async function handleHandshake(
 
 	let session: AcquiredSession;
 	try {
-		session = await deps.acquireSession(request.credential, ttlMs);
+		// `request.reclaim` is the daemon's proof that it already holds this lease
+		// (issue #608). A live lease it matches exactly is handed back — with the fencing
+		// token still bumped and the run pointer cleared — so a control-plane restart
+		// costs a reconnecting worker a round trip instead of the whole heartbeat TTL.
+		//
+		// Two invariants this rests on, both already holding here:
+		//   - a reclaim while a live socket for that worker is still registered (a
+		//     half-open connection) bumps the token, so the old socket's next heartbeat
+		//     cannot refresh the lease → `disconnect` + 4408 in
+		//     `handleWorkerStreamFrame`, and `registerConnection` evicts it as soon as
+		//     the new socket registers. One live session per worker survives;
+		//   - the new socket's upgrade check (`validateFencingToken` → `getLiveSession`)
+		//     passes immediately, since the row is unreleased with a just-written heartbeat.
+		session = await deps.acquireSession(request.credential, ttlMs, request.reclaim);
 	} catch (err) {
-		// A live lease already held by another daemon for this worker.
+		// A live lease held by *another* daemon for this worker — the caller either
+		// presented no proof of possession or one that no longer matches the row.
 		if (err instanceof WorkerSessionHeldError) {
 			return {
 				status: 409,

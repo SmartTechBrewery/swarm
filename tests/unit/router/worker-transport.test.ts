@@ -103,7 +103,8 @@ describe('handleHandshake', () => {
 			heartbeatTtlMs: 60_000,
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
-		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000);
+		// `validBody()` presents no proof of possession, so the acquire is the plain one.
+		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, undefined);
 		// `validBody()` declares no `supportedPhases` — the older-daemon shape — so the
 		// handshake records every phase, the behaviour that pre-dated the field (#467).
 		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
@@ -157,6 +158,57 @@ describe('handleHandshake', () => {
 		const result = await handleHandshake(deps, validBody());
 		expect(result.status).toBe(409);
 		expect(deps.refreshWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	// Issue #608: a reconnecting daemon presents the lease it already holds, so the
+	// control plane recognises its own holder instead of refusing it for the rest of
+	// the heartbeat TTL.
+	describe('session reclaim', () => {
+		const reclaim = { sessionId: SESSION_ID, fencingToken: 6 };
+
+		it('passes a presented reclaim through to the acquire and returns the new session', async () => {
+			const deps = makeDeps();
+
+			const result = await handleHandshake(deps, { ...validBody(), reclaim });
+
+			expect(result.status).toBe(200);
+			expect(result.json).toMatchObject({ sessionId: SESSION_ID, fencingToken: 7 });
+			expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, reclaim);
+		});
+
+		// The AC's "a different daemon is still refused" case at this seam: the acquire
+		// rejects the proof, and the 409 body is byte-identical to today's.
+		it('still answers 409 “worker session already held” when the reclaim is refused', async () => {
+			const deps = makeDeps({
+				acquireSession: vi.fn().mockRejectedValue(new WorkerSessionHeldError(WORKER_ID)),
+			});
+
+			const result = await handleHandshake(deps, { ...validBody(), reclaim });
+
+			expect(result.status).toBe(409);
+			expect(result.json).toEqual({
+				authenticated: false,
+				reason: 'worker session already held',
+			});
+			expect(deps.refreshWorkerCapabilities).not.toHaveBeenCalled();
+		});
+
+		it('rejects a malformed reclaim with 400 before touching the lease', async () => {
+			const deps = makeDeps();
+
+			const badSessionId = await handleHandshake(deps, {
+				...validBody(),
+				reclaim: { sessionId: 'not-a-uuid', fencingToken: 6 },
+			});
+			const badToken = await handleHandshake(deps, {
+				...validBody(),
+				reclaim: { sessionId: SESSION_ID, fencingToken: 0 },
+			});
+
+			expect(badSessionId.status).toBe(400);
+			expect(badToken.status).toBe(400);
+			expect(deps.acquireSession).not.toHaveBeenCalled();
+		});
 	});
 
 	it('maps a capability reduction to 409, releases the lease, and reports the offending CLIs', async () => {
