@@ -29,18 +29,19 @@ type FetchMock = ReturnType<typeof vi.fn<typeof fetch>>;
 
 /** A route answers with a body to serialize, a whole `Response`, or nothing at all. */
 type ResponseBody = Response | Record<string, unknown> | unknown[] | undefined;
-type Responder = ResponseBody | ((url: URL) => ResponseBody);
+type Responder = ResponseBody | ((url: URL, method: string) => ResponseBody);
 
 let fetchMock: FetchMock;
 
 /**
  * Route the stubbed transport by the REST path, anchored, so an unexpected
  * endpoint fails loudly instead of silently reusing another route's payload.
- * Each handler sees the request URL, which is where the `fields`, `filter` and
- * paging parameters the provider built show up.
+ * Each handler sees the request URL — where the `fields`, `filter` and paging
+ * parameters the provider built show up — and its method, which is what tells a
+ * board-label *read* from the *create* that follows it on the same path.
  */
 function mockTrello(routes: Record<string, Responder>): void {
-	fetchMock.mockImplementation(async (input) => {
+	fetchMock.mockImplementation(async (input, init) => {
 		const url = new URL(String(input));
 		const path = url.pathname.replace(/^\/1\//, '');
 		const pattern = Object.keys(routes).find((candidate) =>
@@ -50,7 +51,8 @@ function mockTrello(routes: Record<string, Responder>): void {
 			throw new Error(`Unexpected Trello request '${path}'`);
 		}
 		const responder = routes[pattern];
-		const body = typeof responder === 'function' ? responder(url) : responder;
+		const body =
+			typeof responder === 'function' ? responder(url, init?.method ?? 'GET') : responder;
 		if (body instanceof Response) return body;
 		if (body === undefined) return new Response(null, { status: 200 });
 		return new Response(JSON.stringify(body), {
@@ -75,6 +77,17 @@ function requestsTo(path: string): URL[] {
 	return requestedUrls().filter((url) => url.pathname === `/1/${path}`);
 }
 
+/** The writes issued to one REST path, with their method and parsed JSON body. */
+function callsTo(path: string): Array<{ url: URL; method: string; body: unknown }> {
+	return fetchMock.mock.calls
+		.map(([input, init]) => ({
+			url: new URL(String(input)),
+			method: init?.method ?? 'GET',
+			body: init?.body === undefined ? undefined : JSON.parse(String(init.body)),
+		}))
+		.filter((call) => call.url.pathname === `/1/${path}`);
+}
+
 /** The board's lists, as `GET /boards/{id}/lists` reports them. */
 const BOARD_LISTS = [
 	{ id: CONFIG.statusOptions.backlog, name: 'Backlog', pos: 65536 },
@@ -86,6 +99,28 @@ const LISTS_PATH = `boards/${CONFIG.boardId}/lists`;
 const BOARD_CARDS_PATH = `boards/${CONFIG.boardId}/cards`;
 
 const DESCRIPTION_MARKER = '<!-- swarm-split-child:2490f13f:0 -->';
+
+/**
+ * Every method `PMProvider` declares, plus the optional `discover`. Kept here
+ * rather than imported from the conformance suite because that suite only ever
+ * sees a *registered* manifest, and Trello registers none until its final phase.
+ */
+const CONTRACT_METHODS = [
+	'getWorkItem',
+	'listWorkItems',
+	'findWorkItemByUrlSuffix',
+	'findWorkItemForArtifact',
+	'findWorkItemByDescriptionMarker',
+	'moveWorkItem',
+	'addComment',
+	'findComment',
+	'createWorkItem',
+	'updateWorkItem',
+	'addLabel',
+	'listBlockers',
+	'addBlockedBy',
+	'discover',
+] as const;
 
 /** A card as the reads select it, overridable field by field. */
 function trelloCard(overrides: Record<string, unknown> = {}) {
@@ -507,20 +542,311 @@ describe('TrelloPMProvider', () => {
 		});
 	});
 
-	describe('phase 3 stubs', () => {
-		it.each([
-			['moveWorkItem', () => provider.moveWorkItem()],
-			['addComment', () => provider.addComment()],
-			['createWorkItem', () => provider.createWorkItem()],
-			['updateWorkItem', () => provider.updateWorkItem()],
-			['addLabel', () => provider.addLabel()],
-			['listBlockers', () => provider.listBlockers()],
-			['addBlockedBy', () => provider.addBlockedBy()],
-		])('%s carries the not-implemented sentinel until the writes land', async (name, call) => {
-			// The sentinel is what the PM conformance suite scans a *registered*
-			// provider's source for; Trello registers nothing yet, which is why these
-			// may still throw (ai/RULES.md §2).
-			await expect(call()).rejects.toThrow(`${name} is not implemented for the Trello PM provider`);
+	describe('moveWorkItem', () => {
+		it('moves the card into the list the mapping names for the canonical key', async () => {
+			mockTrello({ [`cards/${CARD_ID}`]: undefined });
+
+			await provider.moveWorkItem(CARD_ID, 'todo');
+
+			// A card's status *is* its list, so a move is one ordinary field write —
+			// there is no transition graph to negotiate the way Jira has.
+			const [move] = callsTo(`cards/${CARD_ID}`);
+			expect(move?.method).toBe('PUT');
+			expect(move?.body).toEqual({ idList: TODO_LIST });
+		});
+
+		it('fails loudly on an unmapped status rather than writing blindly', async () => {
+			mockTrello({ [`cards/${CARD_ID}`]: undefined });
+
+			await expect(provider.moveWorkItem(CARD_ID, 'archived')).rejects.toThrow(
+				/no list ID mapped for canonical status 'archived'/,
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('addComment', () => {
+		const COMMENTS_PATH = `cards/${CARD_ID}/actions/comments`;
+
+		it('comments natively on the card and returns the comment action id', async () => {
+			mockTrello({
+				[COMMENTS_PATH]: { id: 'action-new', data: { text: 'Plan published' } },
+			});
+
+			// Trello models a card comment as an action, so the action id *is* the
+			// comment id — the same id space `findComment` scans.
+			await expect(provider.addComment(CARD_ID, 'Plan published')).resolves.toBe('action-new');
+
+			const [posted] = callsTo(COMMENTS_PATH);
+			expect(posted?.method).toBe('POST');
+			// The body, not the query: an agent-written plan would overflow a request line.
+			expect(posted?.body).toEqual({ text: 'Plan published' });
+			expect(posted?.url.searchParams.has('text')).toBe(false);
+		});
+
+		it('reports a response carrying no comment id', async () => {
+			mockTrello({ [COMMENTS_PATH]: {} });
+
+			await expect(provider.addComment(CARD_ID, 'Plan published')).rejects.toThrow(
+				`Trello returned no comment id for the comment posted on card '${CARD_ID}'`,
+			);
+		});
+	});
+
+	describe('updateWorkItem', () => {
+		it('writes the patched fields under their Trello names', async () => {
+			mockTrello({ [`cards/${CARD_ID}`]: undefined });
+
+			await provider.updateWorkItem(CARD_ID, { title: 'Phase 1/2', description: 'First slice.' });
+
+			const [update] = callsTo(`cards/${CARD_ID}`);
+			expect(update?.method).toBe('PUT');
+			expect(update?.body).toEqual({ name: 'Phase 1/2', desc: 'First slice.' });
+		});
+
+		it('leaves a field the patch does not name untouched', async () => {
+			mockTrello({ [`cards/${CARD_ID}`]: undefined });
+
+			await provider.updateWorkItem(CARD_ID, { description: 'Rescoped.' });
+
+			expect(callsTo(`cards/${CARD_ID}`)[0]?.body).toEqual({ desc: 'Rescoped.' });
+		});
+
+		it('issues no request at all for an empty patch', async () => {
+			mockTrello({ [`cards/${CARD_ID}`]: undefined });
+
+			// An empty write is not "nothing to write": it would still bump the card's
+			// `dateLastActivity`.
+			await provider.updateWorkItem(CARD_ID, {});
+
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('createWorkItem', () => {
+		const BOARD_LABELS_PATH = `boards/${CONFIG.boardId}/labels`;
+
+		/** A card as `POST /cards` answers it — no `members`, no `attachments`. */
+		const CREATED_CARD = {
+			id: 'card-new',
+			name: 'Wire triggers',
+			desc: 'Wire the triggers.',
+			url: 'https://trello.com/c/NEWCARD01/9-wire-triggers',
+			shortUrl: 'https://trello.com/c/NEWCARD01',
+			idList: TODO_LIST,
+			idBoard: CONFIG.boardId,
+			dateLastActivity: '2026-08-10T00:00:00.000Z',
+			labels: [{ id: 'label-swarm', name: 'swarm', color: 'green' }],
+		};
+
+		const INPUT = {
+			title: 'Wire triggers',
+			description: 'Wire the triggers.',
+			status: 'todo',
+			labels: ['Swarm'],
+		};
+
+		it('creates in the mapped list with resolved label ids, and maps the response back', async () => {
+			mockTrello({
+				[BOARD_LABELS_PATH]: [{ id: 'label-swarm', name: 'swarm' }],
+				cards: CREATED_CARD,
+				[LISTS_PATH]: BOARD_LISTS,
+			});
+
+			const item = await provider.createWorkItem(INPUT);
+
+			const [created] = callsTo('cards');
+			expect(created?.method).toBe('POST');
+			// A Trello label is a board-scoped object, so the *name* the contract takes
+			// is resolved to the board's own id before the card exists.
+			expect(created?.body).toEqual({
+				idList: TODO_LIST,
+				name: 'Wire triggers',
+				desc: 'Wire the triggers.',
+				idLabels: ['label-swarm'],
+			});
+			// The board already carried the label, in another case — nothing was created.
+			expect(callsTo(BOARD_LABELS_PATH).map((call) => call.method)).toEqual(['GET']);
+			// Mapped through the same `toWorkItem` the reads use, so a fresh card reads
+			// identically to one off a board read.
+			expect(item).toEqual({
+				id: 'card-new',
+				title: 'Wire triggers',
+				description: 'Wire the triggers.',
+				url: 'https://trello.com/c/NEWCARD01/9-wire-triggers',
+				// Nothing has linked an SCM artifact to a card that was created seconds ago.
+				taskRef: undefined,
+				status: 'Ready',
+				statusId: TODO_LIST,
+				statusKey: 'todo',
+				labels: [{ id: 'label-swarm', name: 'swarm', color: 'green' }],
+				assignees: [],
+				createdAt: undefined,
+				updatedAt: '2026-08-10T00:00:00.000Z',
+			});
+		});
+
+		it('creates a board label the board does not carry yet', async () => {
+			mockTrello({
+				[BOARD_LABELS_PATH]: (_url, method) => (method === 'POST' ? { id: 'label-made' } : []),
+				cards: { ...CREATED_CARD, labels: [{ id: 'label-made', name: 'Swarm' }] },
+				[LISTS_PATH]: BOARD_LISTS,
+			});
+
+			await provider.createWorkItem(INPUT);
+
+			const [, made] = callsTo(BOARD_LABELS_PATH);
+			expect(made?.method).toBe('POST');
+			expect(made?.body).toEqual({ name: 'Swarm', color: 'green' });
+			expect(callsTo('cards')[0]?.body).toMatchObject({ idLabels: ['label-made'] });
+		});
+
+		it('omits the label list entirely when the input names none', async () => {
+			mockTrello({ cards: CREATED_CARD, [LISTS_PATH]: BOARD_LISTS });
+
+			await provider.createWorkItem({ ...INPUT, labels: undefined });
+
+			expect(callsTo('cards')[0]?.body).toEqual({
+				idList: TODO_LIST,
+				name: 'Wire triggers',
+				desc: 'Wire the triggers.',
+			});
+		});
+
+		it('fails loudly on an unmapped status rather than creating an unplaced card', async () => {
+			mockTrello({ cards: CREATED_CARD });
+
+			await expect(provider.createWorkItem({ ...INPUT, status: 'archived' })).rejects.toThrow(
+				/no list ID mapped for canonical status 'archived'/,
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+
+		it('reports a response carrying no card id', async () => {
+			mockTrello({ cards: {}, [BOARD_LABELS_PATH]: [], [LISTS_PATH]: BOARD_LISTS });
+
+			await expect(provider.createWorkItem({ ...INPUT, labels: [] })).rejects.toThrow(
+				"Trello returned no card id for the card created as 'Wire triggers'",
+			);
+		});
+	});
+
+	describe('addLabel', () => {
+		const BOARD_LABELS_PATH = `boards/${CONFIG.boardId}/labels`;
+		const CARD_LABELS_PATH = `cards/${CARD_ID}/idLabels`;
+		const UNLABELLED_CARD = { id: CARD_ID, labels: [] };
+
+		it('no-ops when the card already carries the name in another case', async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: { id: CARD_ID, labels: [{ id: 'label-planned', name: 'Planned' }] },
+			});
+
+			await provider.addLabel(CARD_ID, 'planned');
+
+			// Contractual idempotence, checked rather than left to how Trello answers a
+			// repeat: neither the board's labels nor the card were written.
+			expect(requestedPaths()).toEqual([`cards/${CARD_ID}`]);
+		});
+
+		it('creates the missing board label, then applies it to the card', async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: UNLABELLED_CARD,
+				[BOARD_LABELS_PATH]: (_url, method) => (method === 'POST' ? { id: 'label-made' } : []),
+				[CARD_LABELS_PATH]: ['label-made'],
+			});
+
+			await provider.addLabel(CARD_ID, 'planned');
+
+			const [lookup, create] = callsTo(BOARD_LABELS_PATH);
+			// Load-bearing: `GET /boards/{id}/labels` defaults to 50, so without this a
+			// busy board would miss an existing label and create a duplicate.
+			expect(lookup?.url.searchParams.get('limit')).toBe(String(PAGE_LIMIT));
+			expect(create?.method).toBe('POST');
+			expect(create?.body).toEqual({ name: 'planned', color: 'green' });
+			// A single label id is bounded, so it rides the query Trello documents.
+			const [applied] = callsTo(CARD_LABELS_PATH);
+			expect(applied?.method).toBe('POST');
+			expect(applied?.url.searchParams.get('value')).toBe('label-made');
+		});
+
+		it('re-resolves the board label when a concurrent writer wins the create', async () => {
+			let createAttempted = false;
+			mockTrello({
+				[`cards/${CARD_ID}`]: UNLABELLED_CARD,
+				[BOARD_LABELS_PATH]: (_url, method) => {
+					if (method !== 'POST') {
+						return createAttempted ? [{ id: 'label-raced', name: 'Planned' }] : [];
+					}
+					createAttempted = true;
+					return new Response('label already exists', { status: 400 });
+				},
+				[CARD_LABELS_PATH]: ['label-raced'],
+			});
+
+			await provider.addLabel(CARD_ID, 'planned');
+
+			// The label the race left behind is the one applied — the caller's need is met.
+			expect(callsTo(CARD_LABELS_PATH)[0]?.url.searchParams.get('value')).toBe('label-raced');
+		});
+
+		it('rethrows a failed label create the re-read cannot explain away', async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: UNLABELLED_CARD,
+				[BOARD_LABELS_PATH]: (_url, method) =>
+					method === 'POST' ? new Response('invalid token', { status: 401 }) : [],
+			});
+
+			// Nothing carries the name afterwards, so this was not a lost race.
+			await expect(provider.addLabel(CARD_ID, 'planned')).rejects.toThrow(
+				`Trello API request failed (401) for /boards/${CONFIG.boardId}/labels: invalid token`,
+			);
+		});
+
+		it('treats Trello refusing an already-applied label as success', async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: UNLABELLED_CARD,
+				[BOARD_LABELS_PATH]: [{ id: 'label-planned', name: 'planned' }],
+				[CARD_LABELS_PATH]: new Response('that label is already on the card', { status: 400 }),
+			});
+
+			// Applied between the card read and this write — the card carries it either way.
+			await expect(provider.addLabel(CARD_ID, 'planned')).resolves.toBeUndefined();
+		});
+
+		it('propagates any other rejection of the label write', async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: UNLABELLED_CARD,
+				[BOARD_LABELS_PATH]: [{ id: 'label-planned', name: 'planned' }],
+				[CARD_LABELS_PATH]: new Response('invalid value for idLabels', { status: 400 }),
+			});
+
+			await expect(provider.addLabel(CARD_ID, 'planned')).rejects.toThrow(
+				/invalid value for idLabels/,
+			);
+		});
+	});
+
+	describe('the declared dependency opt-out', () => {
+		it('reports no blockers and records none, without touching the API', async () => {
+			mockTrello({});
+
+			// `supportsDependencies: false` is the contract's opt-out (`src/pm/types.ts`),
+			// not an unfinished method: Trello models no cross-card blocking
+			// relationship, and the prose references a description can carry are GitHub
+			// issue numbers only an SCM provider could resolve — the cross-category reach
+			// ai/RULES.md §2 forbids. Callers fall back to the comment guard instead.
+			await expect(provider.listBlockers()).resolves.toEqual([]);
+			await expect(provider.addBlockedBy()).resolves.toBeUndefined();
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+
+		it('stubs no contract method, which is what the manifest phase is gated on', () => {
+			// The same scan the PM conformance suite runs against every *registered*
+			// manifest (ai/TESTING.md "Provider conformance"). Asserted here because
+			// Trello registers nothing yet, so that suite cannot see it.
+			for (const method of CONTRACT_METHODS) {
+				expect(String(provider[method]), method).not.toMatch(/\bnot\s+implemented\b/i);
+			}
 		});
 	});
 });
