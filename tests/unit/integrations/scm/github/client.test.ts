@@ -154,9 +154,9 @@ describe('github client', () => {
 		});
 	});
 
-	// GitHub's own `check_suite` payload already names its pull requests, so ingress
-	// never calls this — it exists so the contract's commit→PR seam is one neutral
-	// method for every provider (issue #618).
+	// GitHub `check_suite` payloads name associated pull requests when available;
+	// unresolved branch and default-branch checks use this neutral contract seam
+	// (issue #618).
 	describe('listPullRequestsForCommit', () => {
 		it("maps associated pull requests onto the contract's neutral shape", async () => {
 			paginate.mockResolvedValue([

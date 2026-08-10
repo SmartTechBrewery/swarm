@@ -258,9 +258,9 @@ export async function listOpenPullRequestsForBase(
  * The pull requests a commit belongs to — GitHub's half of the contract's
  * commit→PR resolution (issue #618).
  *
- * GitHub's own `check_suite` payload already names its pull requests, so this is
- * never on the `checks` ingress path here; it exists so the seam is the same
- * neutral method for every provider rather than a Bitbucket-only call.
+ * GitHub's `check_suite` payload names associated pull requests when it has them;
+ * checks for a branch or default-branch commit may need this ingress read. The
+ * seam remains neutral rather than being a Bitbucket-only call.
  */
 export async function listPullRequestsForCommit(
 	owner: string,

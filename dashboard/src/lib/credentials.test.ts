@@ -53,9 +53,9 @@ describe('toSelectableScmProvider', () => {
 
 	// A project predating issue #478's discriminator names nothing; one naming a
 	// provider the selector does not offer must not crash the tab on an unknown key.
-	it('falls back to the default for an unset or unoffered provider', () => {
-		expect(toSelectableScmProvider(undefined)).toBe('github');
-		expect(toSelectableScmProvider('gitlab')).toBe('github');
+	it('leaves an unset or unoffered provider unselected', () => {
+		expect(toSelectableScmProvider(undefined)).toBeUndefined();
+		expect(toSelectableScmProvider('gitlab')).toBeUndefined();
 	});
 });
 

@@ -75,18 +75,25 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		projectScm.current = undefined;
 	});
 
-	it('renders the Source Control heading with a provider selector', async () => {
+	it('shows an unset provider as unsaved and persists a GitHub selection', async () => {
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 
 		await waitFor(() => expect(screen.getByText('Source Control')).not.toBeNull());
 
 		const select = screen.getByLabelText('Provider') as HTMLSelectElement;
-		expect(select.value).toBe('github');
+		expect(select.value).toBe('');
+		expect(screen.getByText(/No provider is saved/)).not.toBeNull();
 		expect(screen.getByRole('option', { name: 'GitHub' })).not.toBeNull();
 		expect(screen.getByRole('option', { name: 'Bitbucket Cloud' })).not.toBeNull();
+
+		fireEvent.change(select, { target: { value: 'github' } });
+		await waitFor(() =>
+			expect(updateProject).toHaveBeenCalledWith({ id: 'proj-a', scm: 'github' }),
+		);
 	});
 
 	it('derives the intro and role copy from the selected GitHub provider, not a hard-coded path', async () => {
+		projectScm.current = 'github';
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 
 		await waitFor(() => expect(screen.getByText(/SWARM_OPERATOR_GH_TOKEN/)).not.toBeNull());
@@ -106,6 +113,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 	});
 
 	it('persists a picked provider to project.scm and switches the copy', async () => {
+		projectScm.current = 'github';
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 		await waitFor(() => expect(screen.getByLabelText('Provider')).not.toBeNull());
 

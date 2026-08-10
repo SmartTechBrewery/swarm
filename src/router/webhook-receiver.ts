@@ -291,8 +291,8 @@ async function authenticatePmWebhook(
  * Complete a `checks` event that names no pull request, by asking the provider
  * which pull requests its commit belongs to (issue #618).
  *
- * GitHub's `check_suite` payload carries `pull_requests`, so its events arrive
- * already resolved and this is a no-op for them. Bitbucket's `commit_status`
+ * GitHub's `check_suite` payload carries `pull_requests` for an associated pull
+ * request, so only those events arrive resolved. Bitbucket's `commit_status`
  * carries no association at all, and a GitLab **branch** pipeline carries none
  * either, so `workItemId`/`prBranch` can only come from a credential-scoped
  * commit→PR read — which is why it happens here, on the ingress path, rather than

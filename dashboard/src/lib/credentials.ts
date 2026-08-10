@@ -78,13 +78,11 @@ export const DEFAULT_SCM_PROVIDER_ID: ScmProviderId = SCM_PROVIDERS[0].id;
 /**
  * Narrow a project's stored `scm` to a provider this screen can render. A project
  * that names nothing predates issue #478's discriminator; one that names a provider
- * the selector doesn't offer (`gitlab`, until issue #619) falls back rather than
- * crashing the tab on an unknown key.
+ * the selector doesn't offer (`gitlab`, until issue #619) is left unset so the tab
+ * never presents GitHub as a value that has not actually been saved.
  */
-export function toSelectableScmProvider(scm: string | undefined | null): ScmProviderId {
-	return SCM_PROVIDERS.some((provider) => provider.id === scm)
-		? (scm as ScmProviderId)
-		: DEFAULT_SCM_PROVIDER_ID;
+export function toSelectableScmProvider(scm: string | undefined | null): ScmProviderId | undefined {
+	return SCM_PROVIDERS.some((provider) => provider.id === scm) ? (scm as ScmProviderId) : undefined;
 }
 
 /** Provider-facing copy for the Source Control tab, projected off the selected provider. */

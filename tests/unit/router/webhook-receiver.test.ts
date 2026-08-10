@@ -1113,8 +1113,8 @@ describe('createWebhookApp', () => {
 			);
 		});
 
-		// GitHub's `check_suite` names its pull requests in the payload, so the read is
-		// skipped entirely — the change costs a GitHub project no extra API call.
+		// A GitHub `check_suite` that names a pull request is already resolved, so this
+		// path avoids a second API call. Branch and default-branch checks remain unresolved.
 		it('never reads when the provider already resolved the event', async () => {
 			const listPullRequestsForCommit = vi.fn<SCMProvider['listPullRequestsForCommit']>();
 			const resolved = { ...checksEvent, workItemId: '5', prBranch: 'issue-5' };

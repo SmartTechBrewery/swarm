@@ -339,9 +339,9 @@ export class GitHubSCMIntegration implements SCMProvider {
 	/**
 	 * {@link SCMProvider.listPullRequestsForCommit}. Reads under the **reviewer**
 	 * persona by default — the same scope the aggregate check query that follows it
-	 * on the `checks` path uses. GitHub's own `check_suite` payload already names its
-	 * pull requests, so ingress never needs this read here; it exists so the seam is
-	 * one neutral method rather than a Bitbucket-only call (issue #618).
+	 * on the `checks` path uses. GitHub's `check_suite` payload names associated pull
+	 * requests when present; branch and default-branch checks need this read to resolve
+	 * a pull request. The seam is neutral rather than Bitbucket-only (issue #618).
 	 */
 	async listPullRequestsForCommit(
 		project: ProjectConfig,

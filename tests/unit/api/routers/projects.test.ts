@@ -206,6 +206,7 @@ describe('projectsRouter', () => {
 				...validProjectInput,
 				maxConcurrentJobs: 1,
 				visibility: 'private',
+				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
@@ -237,6 +238,7 @@ describe('projectsRouter', () => {
 				branchPrefix: 'issue-',
 				maxConcurrentJobs: 1,
 				visibility: 'private',
+				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
@@ -268,6 +270,7 @@ describe('projectsRouter', () => {
 				...validProjectInput,
 				maxConcurrentJobs: 1,
 				visibility: 'private',
+				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};
@@ -335,6 +338,7 @@ describe('projectsRouter', () => {
 				...validProjectInput,
 				maxConcurrentJobs: 1,
 				visibility: 'private',
+				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
 				credentials: defaultCredentials,
 			};

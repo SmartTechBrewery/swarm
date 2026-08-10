@@ -339,7 +339,7 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 	const [pendingProviderId, setPendingProviderId] = useState<ScmProviderId | null>(null);
 	const storedProviderId = toSelectableScmProvider(projectQuery.data?.scm ?? undefined);
 	const selectedProviderId = pendingProviderId ?? storedProviderId;
-	const providerCopy = getScmProviderCopy(selectedProviderId);
+	const providerCopy = selectedProviderId ? getScmProviderCopy(selectedProviderId) : undefined;
 
 	// The optimistic pick outlives the mutation deliberately: it is dropped only once
 	// the refetched project agrees with it, so the selector and its copy never flick
@@ -420,7 +420,7 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 					</label>
 					<select
 						id="scm-provider"
-						value={selectedProviderId}
+						value={selectedProviderId ?? ''}
 						disabled={providerMutation.isPending}
 						onChange={(e) => {
 							const next = e.target.value as ScmProviderId;
@@ -429,6 +429,9 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 						}}
 						className={SELECT_CLASS}
 					>
+						<option value="" disabled>
+							Select a provider
+						</option>
 						{SCM_PROVIDERS.map((provider) => (
 							<option key={provider.id} value={provider.id} disabled={!provider.available}>
 								{provider.label}
@@ -440,26 +443,35 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 							Failed to save the provider: {providerMutation.error.message}
 						</p>
 					)}
+					{!selectedProviderId && (
+						<p className="text-xs text-amber-400 mt-1.5">
+							{projectQuery.data?.scm
+								? `The saved provider “${projectQuery.data.scm}” is not available in this dashboard.`
+								: 'No provider is saved. Select one before this project can run.'}
+						</p>
+					)}
 				</div>
 
-				<p className="text-xs text-zinc-400 mt-4">{providerCopy.intro}</p>
+				{providerCopy && <p className="text-xs text-zinc-400 mt-4">{providerCopy.intro}</p>}
 			</div>
 
-			<div className="space-y-4">
-				{entries.map((entry) => (
-					<CredentialField
-						key={entry.role}
-						projectId={projectId}
-						providerId={selectedProviderId}
-						entry={entry}
-						roleDescription={providerCopy.roleDescriptions[entry.role]}
-						verifyFailureMessage={providerCopy.verifyFailureMessage}
-						verifiedLogin={verifiedLogins[entry.role]}
-						onVerified={handleVerified}
-						onRequestRemove={setRemoveTarget}
-					/>
-				))}
-			</div>
+			{selectedProviderId && providerCopy && (
+				<div className="space-y-4">
+					{entries.map((entry) => (
+						<CredentialField
+							key={entry.role}
+							projectId={projectId}
+							providerId={selectedProviderId}
+							entry={entry}
+							roleDescription={providerCopy.roleDescriptions[entry.role]}
+							verifyFailureMessage={providerCopy.verifyFailureMessage}
+							verifiedLogin={verifiedLogins[entry.role]}
+							onVerified={handleVerified}
+							onRequestRemove={setRemoveTarget}
+						/>
+					))}
+				</div>
+			)}
 
 			<Modal
 				open={!!removeTarget}
