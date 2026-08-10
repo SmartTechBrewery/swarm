@@ -10,9 +10,14 @@ vi.mock('@/config/provider.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/config/provider.js')>()),
 	findProjectByBoard: vi.fn(),
 	findProjectByLinearTeam: vi.fn(),
+	findProjectByJiraProject: vi.fn(),
 }));
 
-import { findProjectByBoard, findProjectByLinearTeam } from '@/config/provider.js';
+import {
+	findProjectByBoard,
+	findProjectByJiraProject,
+	findProjectByLinearTeam,
+} from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
@@ -25,6 +30,7 @@ import type { ScmEvent } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
 import {
 	createFakeScmProvider,
+	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
 } from '../../helpers/factories.js';
@@ -856,6 +862,99 @@ describe('createWebhookApp', () => {
 			const { app, enqueuePm, getPmCredential } = realLinearApp();
 			getPmCredential.mockResolvedValue(null);
 			const res = await postLinear(app, signLinear(boardBody));
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+	});
+
+	// The third registered PM manifest, and the second on a route no SCM manifest
+	// serves (issue #580). Jira frames its digest exactly as GitHub does —
+	// `sha256=<hex>` — but in `x-hub-signature` and against the *board's* secret, so
+	// this is where "a correctly signed body is accepted and a tampered one is
+	// rejected" is exercised at the seam that actually serves it.
+	describe('real registered Jira PM manifest (own route, defaultDeps wiring)', () => {
+		const secret = 'jira-whsec';
+		const jiraProject = createMockJiraProjectConfig();
+		const projectKey = jiraProject.pm.type === 'jira' ? jiraProject.pm.projectKey : '';
+		// A workflow transition, reported as a `status` entry in the changelog. No
+		// `user` block, so loop prevention answers "not ours" without resolving the
+		// board identity (which would be a live Jira call).
+		const boardBody = JSON.stringify({
+			webhookEvent: 'jira:issue_updated',
+			issue: {
+				key: 'SWARM-12',
+				fields: { project: { key: projectKey }, issuetype: { name: 'Task' } },
+			},
+			changelog: {
+				items: [
+					{ fieldId: 'status', field: 'status', fromString: 'To Do', toString: 'In Progress' },
+				],
+			},
+		});
+
+		function realJiraApp() {
+			const enqueuePm = vi.fn<WebhookReceiverDeps['enqueuePm']>().mockResolvedValue(undefined);
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
+				.mockResolvedValue(secret);
+			// The Jira adapter resolves its project by *project key*, through its own
+			// facade (issue #529) — not through a receiver dep.
+			vi.mocked(findProjectByJiraProject).mockResolvedValue(jiraProject);
+			// Leave both registries alone: the route under test is mounted from the
+			// registered manifest, not injected.
+			const app = createWebhookApp({ getPmCredential, enqueuePm });
+			return { app, enqueuePm, getPmCredential };
+		}
+
+		/** Jira's framing: GitHub's `sha256=<hex>`, in a header one name older. */
+		function signJira(body: string, key = secret) {
+			return `sha256=${createHmac('sha256', key).update(body, 'utf8').digest('hex')}`;
+		}
+
+		function postJira(app: ReturnType<typeof createWebhookApp>, signature: string) {
+			return app.request('/jira/webhook', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json', 'x-hub-signature': signature },
+				body: boardBody,
+			});
+		}
+
+		it("serves the registered manifest's own `/jira/webhook` GET ping", async () => {
+			const { app } = realJiraApp();
+			expect((await app.request('/jira/webhook')).status).toBe(200);
+		});
+
+		it('enqueues a genuinely-signed status transition under the Jira provider id', async () => {
+			const { app, enqueuePm, getPmCredential } = realJiraApp();
+			const res = await postJira(app, signJira(boardBody));
+			expect(res.status).toBe(202);
+			// Authenticated against Jira's own declared role, which is its own secret
+			// rather than the repository's — the manifest inherits nothing.
+			expect(getPmCredential).toHaveBeenCalledWith(jiraProject, PM_WEBHOOK_SECRET_ROLE);
+			expect(enqueuePm).toHaveBeenCalledWith(
+				'jira',
+				expect.objectContaining({
+					itemId: 'SWARM-12',
+					containerId: projectKey,
+					action: 'updated',
+					changedField: 'status',
+				}),
+				jiraProject,
+				undefined,
+			);
+		});
+
+		it('rejects a board event whose real signature does not match with 401', async () => {
+			const { app, enqueuePm } = realJiraApp();
+			const res = await postJira(app, signJira(boardBody, 'wrong-secret'));
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+
+		it('fails closed when the project has no Jira webhook secret configured', async () => {
+			const { app, enqueuePm, getPmCredential } = realJiraApp();
+			getPmCredential.mockResolvedValue(null);
+			const res = await postJira(app, signJira(boardBody));
 			expect(res.status).toBe(401);
 			expect(enqueuePm).not.toHaveBeenCalled();
 		});

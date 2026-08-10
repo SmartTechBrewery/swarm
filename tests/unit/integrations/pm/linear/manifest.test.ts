@@ -22,7 +22,7 @@ describe('linear manifest registration', () => {
 	});
 
 	it('registers alongside GitHub Projects rather than replacing it', () => {
-		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects', 'linear']);
+		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects', 'linear', 'jira']);
 	});
 
 	it('declares the expected identity', () => {

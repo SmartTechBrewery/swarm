@@ -30,6 +30,7 @@ import { listPMProviders } from '@/integrations/pm/registry.js';
 import type { PMRouterAdapter } from '@/pm/router-adapter.js';
 import { PM_DISCOVERY_CAPABILITIES, type PMProvider, type PMType } from '@/pm/types.js';
 import {
+	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
 } from '../../../helpers/factories.js';
@@ -109,6 +110,7 @@ const STUB_SENTINEL = /\bnot\s+implemented\b/i;
 const PROJECT_FIXTURES: Partial<Record<PMType, () => ProjectConfig>> = {
 	'github-projects': () => createMockProjectConfig(),
 	linear: () => createMockLinearProjectConfig(),
+	jira: () => createMockJiraProjectConfig(),
 };
 
 function projectFor(manifest: PMProviderManifest): ProjectConfig {
@@ -125,7 +127,7 @@ const manifests = listPMProviders();
 
 describe('PM provider conformance', () => {
 	it('registers every provider the suite runs over', () => {
-		expect(manifests.map((manifest) => manifest.id)).toEqual(['github-projects', 'linear']);
+		expect(manifests.map((manifest) => manifest.id)).toEqual(['github-projects', 'linear', 'jira']);
 	});
 
 	it('gives every provider a unique id', () => {

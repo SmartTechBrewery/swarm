@@ -13,7 +13,7 @@ describe('github-projects manifest registration', () => {
 	});
 
 	it('registers exactly once, alongside the other PM providers the entrypoint loads', () => {
-		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects', 'linear']);
+		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects', 'linear', 'jira']);
 	});
 
 	it('declares the expected identity', () => {
