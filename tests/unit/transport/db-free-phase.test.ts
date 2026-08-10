@@ -178,7 +178,7 @@ describe('real DB-free phase worktree lifecycle', () => {
 				return jsonResponse({
 					item: {
 						id: 'ITEM_61',
-						title: 'Phase 2 of 2 — the second half',
+						title: 'Large thing 2/2: The second half',
 						url: 'https://github.com/SmartTechBrewery/swarm/issues/61',
 					},
 				});
@@ -212,13 +212,14 @@ describe('real DB-free phase worktree lifecycle', () => {
 				writeFileSync(
 					join(options.cwd, 'proposed_split.json'),
 					JSON.stringify({
+						sharedName: 'Large thing',
 						mainTask: {
-							title: 'Phase 1 of 2 — the first half',
+							title: 'The first half',
 							description: 'Narrowed to the first half.',
 						},
 						subTasks: [
 							{
-								title: 'Phase 2 of 2 — the second half',
+								title: 'The second half',
 								description: 'The remaining work.',
 								plan: '## Plan\nDo the second half.',
 							},
@@ -276,13 +277,20 @@ describe('real DB-free phase worktree lifecycle', () => {
 			itemId: 'ITEM_60',
 			marker: expect.stringContaining(RUN_ID),
 		});
-		// The child is created in Backlog with the automation + split-child labels, and
-		// `planned` deliberately not among them (issue #436).
+		// The child is created in Backlog carrying the parent's labels plus the
+		// split-child one (issue #594), and `planned` deliberately not among them
+		// (issue #436) — titled as its own phase of the split's shared name.
 		expect(byRoute('/pm/create-item')[0]?.body).toMatchObject({
 			projectId: 'swarm',
-			title: 'Phase 2 of 2 — the second half',
+			title: 'Large thing 2/2: The second half',
 			status: 'backlog',
 			labels: ['swarm', 'swarm:split-child'],
+		});
+		// The original card is renamed to phase 1 of that same shared name, so the
+		// board never shows a generic parent beside named children.
+		expect(byRoute('/pm/update-item')[0]?.body).toMatchObject({
+			itemId: 'ITEM_60',
+			title: 'Large thing 1/2: The first half',
 		});
 		expect(byRoute('/pm/move')[0]?.body).toMatchObject({ itemId: 'ITEM_61', status: 'planning' });
 		expect(byRoute('/pm/label').map((call) => call.body)).toMatchObject([
