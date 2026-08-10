@@ -11,12 +11,14 @@ vi.mock('@/config/provider.js', async (importOriginal) => ({
 	findProjectByBoard: vi.fn(),
 	findProjectByLinearTeam: vi.fn(),
 	findProjectByJiraProject: vi.fn(),
+	findProjectByTrelloBoard: vi.fn(),
 }));
 
 import {
 	findProjectByBoard,
 	findProjectByJiraProject,
 	findProjectByLinearTeam,
+	findProjectByTrelloBoard,
 } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
@@ -34,6 +36,7 @@ import {
 	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
+	createMockTrelloProjectConfig,
 } from '../../helpers/factories.js';
 
 const project = createMockProjectConfig({ id: 'proj-1', repo: 'SmartTechBrewery/swarm' });
@@ -968,6 +971,134 @@ describe('createWebhookApp', () => {
 			const { app, enqueuePm, getPmCredential } = realJiraApp();
 			getPmCredential.mockResolvedValue(null);
 			const res = await postJira(app, signJira(boardBody));
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+	});
+
+	// The fourth registered PM manifest, and the third on a route no SCM manifest
+	// serves (issue #588). Trello is the only one whose HMAC covers SWARM's **own**
+	// callback URL — base64 HMAC-SHA1 over `rawBody + callbackUrl` in
+	// `x-trello-webhook` — so this is where that whole chain is exercised at the seam
+	// that actually serves it: the receiver's resolved callback URL has to be the one
+	// the signature was computed over, or every genuine delivery 401s.
+	describe('real registered Trello PM manifest (own route, defaultDeps wiring)', () => {
+		const secret = 'trello-api-secret';
+		const baseUrl = 'https://swarm.example.com';
+		const callbackUrl = `${baseUrl}/trello/webhook`;
+		const trelloProject = createMockTrelloProjectConfig();
+		const boardId = trelloProject.pm.type === 'trello' ? trelloProject.pm.boardId : '';
+		// A card moved between lists: `data.listAfter` is Trello's own "this card
+		// changed column" marker. No `idMemberCreator`, so loop prevention answers "not
+		// ours" without resolving the board identity (which would be a live Trello call).
+		const boardBody = JSON.stringify({
+			action: {
+				type: 'updateCard',
+				data: {
+					card: { id: '5f2b1c8e9d4a3b2c1e0f9a8b' },
+					board: { id: boardId },
+					listBefore: { id: '6a1b2c3d4e5f60718293a4b5' },
+					listAfter: { id: '7b2c3d4e5f60718293a4b5c6' },
+				},
+			},
+		});
+
+		function realTrelloApp() {
+			// The verifier signs over SWARM's own public callback URL, so pin the base URL
+			// the receiver resolves it from rather than letting it fall back to the
+			// request's `Host`.
+			vi.stubEnv('WEBHOOK_CALLBACK_BASE_URL', baseUrl);
+			const enqueuePm = vi.fn<WebhookReceiverDeps['enqueuePm']>().mockResolvedValue(undefined);
+			const getPmCredential = vi
+				.fn<WebhookReceiverDeps['getPmCredential']>()
+				.mockResolvedValue(secret);
+			// The Trello adapter resolves its project by *board*, through its own facade
+			// (issue #529) — not through a receiver dep.
+			vi.mocked(findProjectByTrelloBoard).mockResolvedValue(trelloProject);
+			// Leave both registries alone: the route under test is mounted from the
+			// registered manifest, not injected.
+			const app = createWebhookApp({ getPmCredential, enqueuePm });
+			return { app, enqueuePm, getPmCredential };
+		}
+
+		/** Trello's framing: a base64 HMAC-**SHA1** over the body plus the callback URL. */
+		function signTrello(body: string, key = secret, url = callbackUrl) {
+			return createHmac('sha1', key)
+				.update(body + url, 'utf8')
+				.digest('base64');
+		}
+
+		function postTrello(app: ReturnType<typeof createWebhookApp>, signature: string) {
+			return app.request('/trello/webhook', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json', 'x-trello-webhook': signature },
+				body: boardBody,
+			});
+		}
+
+		it("serves the registered manifest's own `/trello/webhook` GET ping", async () => {
+			const { app } = realTrelloApp();
+			expect((await app.request('/trello/webhook')).status).toBe(200);
+		});
+
+		// Trello refuses to create a webhook whose callback URL doesn't answer its HEAD
+		// probe with 200 — the mounted GET covers it (Hono dispatches HEAD onto GET),
+		// pinned here against the *real* route as well as the fake one above.
+		it('answers Trello’s HEAD confirmation of the callback URL with 200', async () => {
+			const { app } = realTrelloApp();
+			expect((await app.request('/trello/webhook', { method: 'HEAD' })).status).toBe(200);
+		});
+
+		it('enqueues a genuinely-signed card move under the Trello provider id', async () => {
+			const { app, enqueuePm, getPmCredential } = realTrelloApp();
+			const res = await postTrello(app, signTrello(boardBody));
+			expect(res.status).toBe(202);
+			// Authenticated against Trello's own declared role — its API secret, not the
+			// repository's webhook secret: the manifest inherits nothing.
+			expect(getPmCredential).toHaveBeenCalledWith(trelloProject, PM_WEBHOOK_SECRET_ROLE);
+			expect(enqueuePm).toHaveBeenCalledWith(
+				'trello',
+				expect.objectContaining({
+					itemId: '5f2b1c8e9d4a3b2c1e0f9a8b',
+					containerId: boardId,
+					action: 'updated',
+					changedField: 'idList',
+				}),
+				trelloProject,
+				undefined,
+			);
+		});
+
+		it('rejects an unsigned delivery with 401', async () => {
+			const { app, enqueuePm } = realTrelloApp();
+			const res = await postTrello(app, '');
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+
+		it('rejects a board event whose real signature does not match with 401', async () => {
+			const { app, enqueuePm } = realTrelloApp();
+			const res = await postTrello(app, signTrello(boardBody, 'wrong-secret'));
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+
+		// The reason `PmWebhookVerification` carries a callback URL at all: a body
+		// signed for another URL is not a valid delivery to this one.
+		it('rejects a body signed over a different callback URL with 401', async () => {
+			const { app, enqueuePm } = realTrelloApp();
+			const res = await postTrello(
+				app,
+				signTrello(boardBody, secret, 'https://attacker.example/trello/webhook'),
+			);
+			expect(res.status).toBe(401);
+			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+
+		it('fails closed when the project has no Trello API secret configured', async () => {
+			const { app, enqueuePm, getPmCredential } = realTrelloApp();
+			getPmCredential.mockResolvedValue(null);
+			const res = await postTrello(app, signTrello(boardBody));
 			expect(res.status).toBe(401);
 			expect(enqueuePm).not.toHaveBeenCalled();
 		});

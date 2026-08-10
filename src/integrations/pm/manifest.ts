@@ -7,8 +7,8 @@
  * Mirrors Cascade's `src/integrations/pm/manifest.ts`, but **scoped down to
  * SWARM's MVP** — the same trimming `src/pm/types.ts` did to Cascade's
  * `PMProvider`. Cascade's manifest carries ~15 fields because it ships three
- * providers plus a wizard/discovery/tRPC layer; SWARM has three (GitHub Projects,
- * Linear, and Jira) and only the pieces below exist today. The rest are left out
+ * providers plus a wizard/discovery/tRPC layer; SWARM has four (GitHub Projects,
+ * Linear, Jira, and Trello) and only the pieces below exist today. The rest are left out
  * until the phase that needs them, so the manifest doesn't advertise a contract
  * nothing implements:
  *

@@ -4,6 +4,7 @@ import type { ProjectPm } from '../../../src/config/schema.js';
 // directly rather than through that union: it is the half this form has to satisfy,
 // and it is a leaf module (Zod only), unlike the whole config schema.
 import { jiraConfigSchema } from '../../../src/integrations/pm/jira/config-schema.js';
+import { trelloConfigSchema } from '../../../src/integrations/pm/trello/config-schema.js';
 import {
 	blankStatusOptions,
 	buildPmUpdate,
@@ -43,6 +44,14 @@ const jiraPm: ProjectPm = {
 	baseUrl: 'https://acme.atlassian.net',
 	projectKey: 'SWARM',
 	statusOptions: { todo: '10001', done: '10002' },
+};
+
+// Trello object ids are 24 hex characters — the board's, and one list id per mapped
+// status, since a card's status is the list it sits in.
+const trelloPm: ProjectPm = {
+	type: 'trello',
+	boardId: '5f2b1c8e9d4a3b2c1e0f9a8b',
+	statusOptions: { todo: '6a1b2c3d4e5f60718293a4b5' },
 };
 
 /** Narrow a built payload to one provider's member, failing loudly on a mismatch. */
@@ -110,6 +119,18 @@ describe('toBoardMappingForm', () => {
 		expect(form.providerContext).toEqual({ baseUrl: 'https://acme.atlassian.net' });
 		expect(form.statusOptions.todo).toBe('10001');
 		expect(form.statusOptions.planning).toBe('');
+		expect(canSaveBoardMapping(form)).toBe(true);
+	});
+
+	// Issue #588: Trello's container is its board, and like Linear it carries no
+	// provider context — a list id is the whole mapping.
+	it('projects a Trello mapping onto the board container with no provider context', () => {
+		const form = toBoardMappingForm(trelloPm);
+		expect(form.providerId).toBe('trello');
+		expect(form.containerId).toBe(trelloPm.boardId);
+		expect(form.providerContext).toEqual({});
+		expect(form.statusOptions.todo).toBe(trelloPm.statusOptions.todo);
+		expect(form.statusOptions.done).toBe('');
 		expect(canSaveBoardMapping(form)).toBe(true);
 	});
 
@@ -196,6 +217,34 @@ describe('buildPmUpdate', () => {
 		expect(payload.statusOptions).toEqual({ inReview: 'state_review' });
 		expect(payload).not.toHaveProperty('statusFieldId');
 		expect(payload).not.toHaveProperty('projectId');
+	});
+
+	it('round-trips a Trello mapping into a member the config schema accepts', () => {
+		const payload = buildPmUpdate(toBoardMappingForm(trelloPm), trelloPm);
+		expect(payload).toEqual(trelloPm);
+		expect(trelloConfigSchema.safeParse(withoutDiscriminator(payload)).success).toBe(true);
+	});
+
+	it('serializes the container to boardId for Trello and carries no field context', () => {
+		const payload = asMember(
+			buildPmUpdate(
+				{
+					providerId: 'trello',
+					containerId: `  ${trelloPm.boardId}  `,
+					statusOptions: { ...blankStatusOptions(), inReview: ' 7b2c3d4e5f60718293a4b5c6 ' },
+					// A stale GitHub field id on the form must not reach a Trello member.
+					providerContext: { statusFieldId: 'PVTSSF_stale' },
+				},
+				fullPm,
+			),
+			'trello',
+		);
+		expect(payload).toEqual({
+			type: 'trello',
+			boardId: trelloPm.boardId,
+			statusOptions: { inReview: '7b2c3d4e5f60718293a4b5c6' },
+		});
+		expect(trelloConfigSchema.safeParse(withoutDiscriminator(payload)).success).toBe(true);
 	});
 
 	it('round-trips a Jira mapping into a member the config schema accepts', () => {
@@ -404,6 +453,28 @@ describe('isBoardMappingDirty', () => {
 		form.providerContext = {};
 		expect(isBoardMappingDirty(form, jiraPm)).toBe(true);
 	});
+
+	it('is false when a Trello form matches its stored mapping', () => {
+		expect(isBoardMappingDirty(toBoardMappingForm(trelloPm), trelloPm)).toBe(false);
+	});
+
+	it('is true when a Trello board or list changes', () => {
+		const board = toBoardMappingForm(trelloPm);
+		board.containerId = 'other-board';
+		expect(isBoardMappingDirty(board, trelloPm)).toBe(true);
+
+		const list = toBoardMappingForm(trelloPm);
+		list.statusOptions.done = '7b2c3d4e5f60718293a4b5c6';
+		expect(isBoardMappingDirty(list, trelloPm)).toBe(true);
+	});
+
+	// Trello returns no `providerContext` either, so a stale GitHub field id left on
+	// the form must not read as a change against a stored Trello mapping.
+	it('ignores the Status field context for a Trello form', () => {
+		const form = toBoardMappingForm(trelloPm);
+		form.providerContext = { statusFieldId: 'PVTSSF_stale' };
+		expect(isBoardMappingDirty(form, trelloPm)).toBe(false);
+	});
 });
 
 describe('withSelectedProvider', () => {
@@ -524,9 +595,25 @@ describe('canSaveBoardMapping', () => {
 		expect(canSaveBoardMapping(form)).toBe(false);
 	});
 
+	// Trello's list ids need no field scope and no site URL — a board plus one list.
+	it('requires only a board and one list for Trello', () => {
+		const form = toBoardMappingForm(trelloPm);
+		expect(form.providerContext).toEqual({});
+		expect(canSaveBoardMapping(form)).toBe(true);
+
+		const noBoard = toBoardMappingForm(trelloPm);
+		noBoard.containerId = '';
+		expect(canSaveBoardMapping(noBoard)).toBe(false);
+
+		const noList = toBoardMappingForm(trelloPm);
+		noList.statusOptions = blankStatusOptions();
+		expect(canSaveBoardMapping(noList)).toBe(false);
+	});
+
 	it('never reports a missing base URL for a provider that has none', () => {
 		expect(isBaseUrlMissing(toBoardMappingForm(fullPm))).toBe(false);
 		expect(isBaseUrlMissing(toBoardMappingForm(linearPm))).toBe(false);
+		expect(isBaseUrlMissing(toBoardMappingForm(trelloPm))).toBe(false);
 	});
 });
 
@@ -545,6 +632,13 @@ describe('getPmMappingProvider', () => {
 			containerNounPlural: 'projects',
 			stateNoun: 'status',
 			stateNounPlural: 'statuses',
+		});
+		expect(getPmMappingProvider('trello')).toMatchObject({
+			label: 'Trello',
+			containerNoun: 'board',
+			containerNounPlural: 'boards',
+			stateNoun: 'list',
+			stateNounPlural: 'lists',
 		});
 		expect(getPmMappingProvider('nope').id).toBe('github-projects');
 	});
