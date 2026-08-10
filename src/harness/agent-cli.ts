@@ -21,6 +21,11 @@ import { supportsOutputFormat } from './antigravity-capabilities.js';
 import { detectNewConversationId, snapshotConversationIds } from './antigravity-session.js';
 import { createAntigravityStreamNormalizer } from './antigravity-stream.js';
 import { createClaudeStreamNormalizer, findClaudeRateLimitReset } from './claude-stream.js';
+import {
+	type AgentContainment,
+	resolveAgentContainment,
+	resolveContainmentPlan,
+} from './containment.js';
 import { type ReasoningLevel, resolveModelLaunch } from './models.js';
 import { type AgentUsage, parseAgentOutput } from './usage.js';
 
@@ -54,19 +59,24 @@ const DEFAULT_COMMAND: Record<AgentCli, string> = {
 };
 
 /**
- * Flags prepended ahead of every caller's own `args` (the prompt), so no phase
- * has to remember them. Every run through this harness happens inside a
- * disposable git worktree with stdin closed (`stdio: ['ignore', ...]` below)
- * — there is no terminal to approve a tool call, so without
- * a permissions-bypass flag a run that needs to write a file or run a
- * command sits blocked on a permission prompt it can never receive. Confirmed
- * live: a Planning run produced a complete plan, then reported the write to
- * `proposed_plan.md` as "blocked pending your permission approval" in its
- * final response and exited 0 having written nothing.
+ * The subcommand args that put each CLI into non-interactive mode, prepended
+ * ahead of everything else so no phase has to remember them. Only codex needs
+ * one: it has no `-p` print flag at all (its `-p` is `--profile`, entirely
+ * unrelated), and non-interactive mode is the `exec` subcommand —
+ * `codex exec <prompt>`, with the prompt a trailing positional. claude and agy
+ * take a flag instead (see PRINT_FLAG below), so their entries are empty.
  *
- * claude and agy both call their bypass `--dangerously-skip-permissions`.
- * Codex calls it `--dangerously-bypass-approvals-and-sandbox` (confirmed via
- * `codex exec --help`; it has no `--dangerously-skip-permissions` at all).
+ * The permission/sandbox flags that used to live here are **not** constants any
+ * more: they are resolved per run by `./containment.ts` and inserted directly
+ * after these args, in the position the old bypass flag occupied (issue #614).
+ * Every run through this harness still happens inside a disposable git worktree
+ * with stdin closed (`stdio: ['ignore', ...]` below), so there is no terminal to
+ * approve a tool call and *something* must make tool calls run unattended —
+ * confirmed live: a Planning run produced a complete plan, then reported the
+ * write to `proposed_plan.md` as "blocked pending your permission approval" in
+ * its final response and exited 0 having written nothing. What changed is only
+ * *which* answer a deployment gives: the blanket bypass (still the default) or
+ * the CLI's own worktree-scoped sandbox.
  *
  * claude and agy also expose a `-p`/`--print` flag for one-shot,
  * non-interactive output (`claude --help`: "starts an interactive session by
@@ -83,27 +93,22 @@ const DEFAULT_COMMAND: Record<AgentCli, string> = {
  * prompt, for claude and agy — safe for claude (position-independent) and
  * required for agy.
  *
- * Codex is different again: it has no `-p` print flag at all. Its `-p` is
- * `--profile` (layer a config profile), entirely unrelated. Non-interactive
- * mode is the `exec` subcommand — `codex exec <prompt>`, where the prompt is
- * a trailing positional argument. So `DEFAULT_ARGS['codex']` starts with
- * `'exec'` to invoke the subcommand, and `PRINT_FLAG['codex']` is an empty
- * string (nothing to insert before the prompt). See PRINT_FLAG below;
- * don't add a fourth CLI's flags to this map without checking its own
- * `--help`, not assuming it matches another CLI's (ai/RULES.md).
+ * See PRINT_FLAG below; don't add a fourth CLI's flags to this map without
+ * checking its own `--help`, not assuming it matches another CLI's
+ * (ai/RULES.md).
  */
-const DEFAULT_ARGS: Record<AgentCli, string[]> = {
-	claude: ['--dangerously-skip-permissions'],
-	antigravity: ['--dangerously-skip-permissions'],
-	codex: ['exec', '--dangerously-bypass-approvals-and-sandbox'],
+const SUBCOMMAND_ARGS: Record<AgentCli, string[]> = {
+	claude: [],
+	antigravity: [],
+	codex: ['exec'],
 };
 
 /**
  * The non-interactive-mode flag, inserted immediately before the prompt (see
- * DEFAULT_ARGS above for why the position is load-bearing for agy).
+ * SUBCOMMAND_ARGS above for why the position is load-bearing for agy).
  *
  * Codex has no print flag — non-interactive mode is via the `exec` subcommand
- * (already in DEFAULT_ARGS), so PRINT_FLAG is empty for it. The assembly
+ * (already in SUBCOMMAND_ARGS), so PRINT_FLAG is empty for it. The assembly
  * logic in `runAgentCli` filters out empty strings, so no stray '' arg leaks
  * into the spawn call.
  */
@@ -196,6 +201,16 @@ export interface RunAgentCliOptions {
 	 * {@link runAgentCli}). Ignored when {@link sessionId} is also set.
 	 */
 	resumeSessionId?: string;
+	/**
+	 * How far outside {@link cwd} this run may reach (`./containment.ts`).
+	 * Omit to take the deployment's own setting (`SWARM_AGENT_CONTAINMENT`,
+	 * default `bypass` — today's behavior). Pass it explicitly when the caller
+	 * has a stricter policy of its own than the host default: dashboard chat
+	 * (ADR-005 open question 2), which has no worktree at all, is the case this
+	 * exists for. A CLI that cannot be contained falls back to `bypass` and logs
+	 * why, rather than failing the run.
+	 */
+	containment?: AgentContainment;
 	/** Extra env vars, merged over (and overriding) the parent process env. */
 	env?: Record<string, string>;
 	/** Override the binary to launch — mainly for tests/deployment. Defaults per `cli`. */
@@ -466,12 +481,16 @@ function lineForwarder(onLine: (line: string) => void) {
  * The base subcommand args plus the resume/assign session flags for one run,
  * per CLI (ai/RULES.md §6: the three CLIs don't share resume shapes):
  *  - codex resumes via a *subcommand* — `codex exec resume <id> …` — so a resume
- *    rewrites the base `exec` args entirely (keeping the bypass flag), and adds
- *    no separate session flag;
+ *    rewrites the base `exec` args entirely, and adds no separate session flag;
  *  - claude/agy resume via a *flag* (`--resume` / `--conversation`) inserted
  *    after the output-format flags, leaving their base args unchanged;
  *  - a resume id always wins over an assign id — a run either continues an
  *    existing session or starts a fresh one, never both.
+ *
+ * The permission/sandbox args are **not** repeated here any more: `runAgentCli`
+ * appends one resolved containment plan after whatever this returns, so a resume
+ * is contained exactly like a fresh run instead of carrying its own duplicated
+ * copy of the bypass flag (issue #614).
  */
 function buildSessionArgs(
 	cli: AgentCli,
@@ -480,9 +499,7 @@ function buildSessionArgs(
 ): { baseArgs: string[]; sessionArgs: string[] } {
 	if (cli === 'codex') {
 		return {
-			baseArgs: resumeId
-				? ['exec', 'resume', resumeId, '--dangerously-bypass-approvals-and-sandbox']
-				: DEFAULT_ARGS.codex,
+			baseArgs: resumeId ? ['exec', 'resume', resumeId] : SUBCOMMAND_ARGS.codex,
 			sessionArgs: [],
 		};
 	}
@@ -492,11 +509,11 @@ function buildSessionArgs(
 			: assignId
 				? ['--session-id', assignId]
 				: [];
-		return { baseArgs: DEFAULT_ARGS.claude, sessionArgs };
+		return { baseArgs: SUBCOMMAND_ARGS.claude, sessionArgs };
 	}
 	// antigravity: resume by conversation id; no assign-upfront flag exists.
 	return {
-		baseArgs: DEFAULT_ARGS.antigravity,
+		baseArgs: SUBCOMMAND_ARGS.antigravity,
 		sessionArgs: resumeId ? ['--conversation', resumeId] : [],
 	};
 }
@@ -512,6 +529,22 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	const modelArgs = launch.model ? ['--model', launch.model] : [];
 	const resumeId = options.resumeSessionId;
 	const { baseArgs, sessionArgs } = buildSessionArgs(cli, resumeId, options.sessionId);
+	// The permission/sandbox answer for this run (issue #614) — the caller's own
+	// policy if it has one, otherwise the deployment's `SWARM_AGENT_CONTAINMENT`.
+	// Resolved once and used for a resume exactly as for a fresh run.
+	const containment = resolveContainmentPlan({
+		cli,
+		mode: options.containment ?? resolveAgentContainment(),
+	});
+	if (containment.unavailableReason) {
+		logger.warn('agent run is not contained', {
+			...options.logContext,
+			cli,
+			requested: containment.requested,
+			applied: containment.applied,
+			reason: containment.unavailableReason,
+		});
+	}
 	const printFlag = PRINT_FLAG[cli];
 	// Antigravity's `agy --print` runs the agent from its own scratch dir
 	// (`~/.gemini/antigravity-cli/scratch`), NOT the `cwd` we spawn it with —
@@ -522,7 +555,7 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	// all edits and the hand-off file be written there, so SWARM's delivery
 	// validation finds the hand-off in the worktree it provisioned. Grouped with the
 	// leading flags — never between `-p` and the prompt, the one position that is
-	// load-bearing for agy (see DEFAULT_ARGS/PRINT_FLAG above).
+	// load-bearing for agy (see SUBCOMMAND_ARGS/PRINT_FLAG above).
 	const addDirArgs = cli === 'antigravity' ? ['--add-dir', options.cwd] : [];
 	// agy is the one CLI whose structured-output flag has to be asked for: 1.1.3
 	// has no `--output-format`, and passing it there would hand an unknown flag to
@@ -535,6 +568,7 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	const agyStreams = cli === 'antigravity' && outputFormatArgs.length > 0;
 	const args = [
 		...baseArgs,
+		...containment.args,
 		...addDirArgs,
 		...modelArgs,
 		...launch.providerArgs,

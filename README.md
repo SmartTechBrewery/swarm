@@ -300,6 +300,8 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
   project, and global-settings reference
 - [`docs/pipeline.md`](./docs/pipeline.md) — phases, triggers, security, and
   provider boundaries
+- [`docs/agent-containment.md`](./docs/agent-containment.md) — how far outside
+  its worktree an agent CLI run can reach, per CLI, and how to tighten it
 - [`docs/status.md`](./docs/status.md) — implemented MVP areas and current
   roadmap snapshot
 - [`ai/ARCHITECTURE.md`](./ai/ARCHITECTURE.md) — engineering architecture and

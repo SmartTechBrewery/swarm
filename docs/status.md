@@ -65,7 +65,7 @@ Early implementation. Summary by area:
 
 ### Cross-cutting
 - One shared structured logger (`src/lib/logger.ts`, SWARM-23) emits JSON log lines (level, ISO timestamp, message, context) for machine parsing, with a `pretty` mode for local dev and a `SWARM_LOG_LEVEL` filter; the router and worker each tag their lines with a `component`.
-- Antigravity's actual binary is `agy`, and its `-p`/`--print` flag — unlike Claude's, which is a bare boolean — takes the prompt as its own value: it must be the last flag before the prompt, or it silently swallows whatever comes next as the "prompt" instead (confirmed live: a real Implementation run answered a question about `--dangerously-skip-permissions` instead of doing the task). See the `DEFAULT_ARGS`/`PRINT_FLAG` comment in `src/harness/agent-cli.ts` and `ai/RULES.md` §6.
+- Antigravity's actual binary is `agy`, and its `-p`/`--print` flag — unlike Claude's, which is a bare boolean — takes the prompt as its own value: it must be the last flag before the prompt, or it silently swallows whatever comes next as the "prompt" instead (confirmed live: a real Implementation run answered a question about `--dangerously-skip-permissions` instead of doing the task). See the `SUBCOMMAND_ARGS`/`PRINT_FLAG` comment in `src/harness/agent-cli.ts` and `ai/RULES.md` §6.
 
 ### Dashboard (phase-6 backlog)
 - Host-run, same model as the worker. API scaffold in place: Hono + tRPC entrypoint (`src/api/server.ts`, SWARM-75) and its localhost-bound bearer-token auth guard (SWARM-76).

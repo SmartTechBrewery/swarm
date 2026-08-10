@@ -44,6 +44,7 @@ import { fileURLToPath } from 'node:url';
 // connection at load (`getDb()` is lazy, `src/db/client.ts`), so this process still
 // connects to neither.
 import '../integrations/entrypoint.js';
+import { resolveAgentContainment } from '../harness/containment.js';
 import {
 	optionalEnv,
 	requireEnv,
@@ -93,6 +94,11 @@ async function main(): Promise<void> {
 	// a missing token fails startup rather than mid-assignment.
 	const operatorToken = resolveOperatorGitHubToken();
 	const repoRoot = resolveWorkerRepoRoot();
+	// Same reason: a typo in SWARM_AGENT_CONTAINMENT should fail this daemon at
+	// startup, not once per dispatched phase (issue #614). The resolved value is
+	// not held — `runAgentCli` reads it per run — this is validation only, and
+	// it also logs which mode this host will actually launch agents under.
+	logger.info('agent containment', { mode: resolveAgentContainment() });
 
 	// Declare the CLIs this host can run: an explicit override if set, otherwise
 	// probe PATH. An empty set can't handshake (the protocol requires a non-empty

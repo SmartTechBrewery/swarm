@@ -251,6 +251,100 @@ describe('runAgentCli', () => {
 		]);
 	});
 
+	describe('containment (issue #614)', () => {
+		// The per-CLI arguments themselves are covered in containment.test.ts; these
+		// assert the harness *wiring* — that a resolved plan lands in the position
+		// the hard-coded bypass flag used to occupy, on the resume path too.
+		it('takes the deployment mode from SWARM_AGENT_CONTAINMENT when the caller names none', async () => {
+			vi.stubEnv('SWARM_AGENT_CONTAINMENT', 'worktree');
+			vi.stubEnv('SWARM_AGENT_CONTAINMENT_DOMAINS', 'api.github.com');
+
+			const promise = runAgentCli(createMockRunAgentCliOptions({ args: ['do the thing'] }));
+			lastChild().emit('close', 0, null);
+			await promise;
+
+			const args = spawnMock.mock.calls[0][1] as string[];
+			expect(args).not.toContain('--dangerously-skip-permissions');
+			expect(args.slice(0, 4)).toEqual([
+				'--settings',
+				JSON.stringify({
+					sandbox: {
+						enabled: true,
+						failIfUnavailable: true,
+						allowUnsandboxedCommands: false,
+						autoAllowBashIfSandboxed: true,
+						network: { allowedDomains: ['api.github.com'] },
+					},
+				}),
+				'--permission-mode',
+				'acceptEdits',
+			]);
+			// The one position that is load-bearing for agy is untouched: whatever
+			// containment inserts, the prompt still follows -p directly.
+			expect(args.slice(-2)).toEqual(['-p', 'do the thing']);
+		});
+
+		it("lets a caller's own mode override the deployment default", async () => {
+			vi.stubEnv('SWARM_AGENT_CONTAINMENT', 'worktree');
+
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ containment: 'bypass', args: ['do the thing'] }),
+			);
+			lastChild().emit('close', 0, null);
+			await promise;
+
+			expect(spawnMock.mock.calls[0][1]).toContain('--dangerously-skip-permissions');
+		});
+
+		it('contains the codex resume path, not just a fresh run', async () => {
+			// The resume path used to carry its own copy of the bypass flag, so it
+			// could not be tightened at all.
+			const resumed = runAgentCli(
+				createMockRunAgentCliOptions({
+					cli: 'codex',
+					containment: 'worktree',
+					resumeSessionId: '019f57a7-cf1b-72d3-b887-63758a10f3a8',
+					args: ['continue'],
+				}),
+			);
+			lastChild().emit('close', 0, null);
+			await resumed;
+
+			expect(spawnMock.mock.calls[0][1]).toEqual([
+				'exec',
+				'resume',
+				'019f57a7-cf1b-72d3-b887-63758a10f3a8',
+				'-c',
+				'permissions.swarm-worktree.extends=":workspace"',
+				'-c',
+				'permissions.swarm-worktree.network.enabled=true',
+				'-c',
+				'default_permissions="swarm-worktree"',
+				'--json',
+				'continue',
+			]);
+		});
+
+		it('warns and stays on the bypass for antigravity, which cannot be contained', async () => {
+			const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({
+					cli: 'antigravity',
+					containment: 'worktree',
+					args: ['do the thing'],
+				}),
+			);
+			(await spawnedChild(0)).emit('close', 0, null);
+			await promise;
+
+			expect(spawnMock.mock.calls[0][1]).toContain('--dangerously-skip-permissions');
+			expect(warn).toHaveBeenCalledWith(
+				'agent run is not contained',
+				expect.objectContaining({ cli: 'antigravity', requested: 'worktree', applied: 'bypass' }),
+			);
+		});
+	});
+
 	it('resumes antigravity via --conversation, keeping -p immediately before the prompt', async () => {
 		const resumed = runAgentCli(
 			createMockRunAgentCliOptions({
@@ -331,7 +425,7 @@ describe('runAgentCli', () => {
 	it('spawns the agy binary for antigravity, with -p immediately before the prompt too', async () => {
 		// Load-bearing order: agy's -p/--print is a *value* flag whose value is the
 		// prompt itself (unlike claude's boolean -p), confirmed live — see the
-		// DEFAULT_ARGS/PRINT_FLAG comment in agent-cli.ts. Any flag landing between
+		// SUBCOMMAND_ARGS/PRINT_FLAG comment in agent-cli.ts. Any flag landing between
 		// -p and the prompt gets swallowed as the prompt instead of the real task.
 		const promise = runAgentCli(
 			createMockRunAgentCliOptions({ cli: 'antigravity', args: ['do the thing'] }),
