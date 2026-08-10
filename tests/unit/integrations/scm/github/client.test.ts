@@ -13,6 +13,7 @@ const listWorkflowRunsForRepo = vi.fn();
 const listJobsForWorkflowRun = vi.fn();
 const pullsGet = vi.fn();
 const pullsMerge = vi.fn();
+const listPullRequestsAssociatedWithCommit = vi.fn();
 const paginate = vi.fn();
 const graphql = vi.fn();
 
@@ -22,6 +23,7 @@ vi.mock('@octokit/rest', () => ({
 		users = { getAuthenticated };
 		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun };
 		pulls = { get: pullsGet, merge: pullsMerge };
+		repos = { listPullRequestsAssociatedWithCommit };
 		paginate = paginate;
 		graphql = graphql;
 		constructor(opts: { auth: unknown }) {
@@ -37,6 +39,7 @@ import {
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getScopedClient,
+	listPullRequestsForCommit,
 	mergePullRequestDirect,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
@@ -148,6 +151,36 @@ describe('github client', () => {
 				getCheckSuiteStatus('jkwiecien', 'swarm', 'deadbeef'),
 			);
 			expect(result).toEqual({ totalCount: 0, checkRuns: [] });
+		});
+	});
+
+	// GitHub's own `check_suite` payload already names its pull requests, so ingress
+	// never calls this — it exists so the contract's commit→PR seam is one neutral
+	// method for every provider (issue #618).
+	describe('listPullRequestsForCommit', () => {
+		it("maps associated pull requests onto the contract's neutral shape", async () => {
+			paginate.mockResolvedValue([
+				{ number: 42, state: 'open', head: { ref: 'issue-42' } },
+				{ number: 41, state: 'closed', head: { ref: 'issue-41' } },
+			]);
+
+			await expect(
+				withGitHubToken('tok', () => listPullRequestsForCommit('jkwiecien', 'swarm', 'deadbeef')),
+			).resolves.toEqual([
+				{ number: 42, state: 'open', headBranch: 'issue-42' },
+				{ number: 41, state: 'closed', headBranch: 'issue-41' },
+			]);
+			expect(paginate).toHaveBeenCalledWith(
+				listPullRequestsAssociatedWithCommit,
+				expect.objectContaining({ owner: 'jkwiecien', repo: 'swarm', commit_sha: 'deadbeef' }),
+			);
+		});
+
+		it('reports no pull request for a commit that belongs to none', async () => {
+			paginate.mockResolvedValue([]);
+			await expect(
+				withGitHubToken('tok', () => listPullRequestsForCommit('jkwiecien', 'swarm', 'deadbeef')),
+			).resolves.toEqual([]);
 		});
 	});
 

@@ -192,10 +192,10 @@ describe('createWebhookApp', () => {
 			expect(res.status).toBe(200);
 		});
 
-		// A provider still being built out phase by phase (Bitbucket, issue #296)
-		// registers with `runtimeReady: false`. Mounting its route would expose an
-		// unauthenticated endpoint whose first act is a contract method that throws,
-		// so the receiver serves nothing for it — not even the GET ping.
+		// A provider that has not declared itself ready to carry traffic (GitLab, until
+		// issue #619) registers with `runtimeReady: false`. Mounting its route would
+		// expose an endpoint for a provider no project can select, so the receiver
+		// serves nothing for it — not even the GET ping.
 		it('serves no route for a provider that is not runtime-ready', async () => {
 			const { app } = makeApp({
 				scmProviders: [
@@ -957,6 +957,221 @@ describe('createWebhookApp', () => {
 			const res = await postJira(app, signJira(boardBody));
 			expect(res.status).toBe(401);
 			expect(enqueuePm).not.toHaveBeenCalled();
+		});
+	});
+
+	// The second runtime-ready SCM provider (issue #618). Nothing in the receiver
+	// names it: the same loop that mounts GitHub's route mounts this one, because the
+	// registered manifest now declares `runtimeReady: true`. Driven through the real
+	// registry with only the project + secret lookups faked, so the assertions cover
+	// Bitbucket's genuine header names, `sha256=<hex>` framing over `X-Hub-Signature`,
+	// and `X-Event-Key` normalization.
+	describe('real registered Bitbucket provider (defaultDeps wiring)', () => {
+		const secret = 'topsecret';
+		const bitbucketProject = createMockProjectConfig({
+			id: 'bb-project',
+			repo: 'SmartTechBrewery/swarm',
+			scm: 'bitbucket',
+		});
+		const signedBody = JSON.stringify({
+			repository: { full_name: 'SmartTechBrewery/swarm' },
+			pullrequest: {
+				id: 7,
+				source: { branch: { name: 'issue-7' }, commit: { hash: 'abcdef123456' } },
+				destination: { branch: { name: 'main' } },
+				author: { nickname: 'human-dev' },
+			},
+			actor: { nickname: 'human-dev' },
+		});
+
+		function realBitbucketApp() {
+			const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
+			// Fake only the secret + project lookups; the manifest comes from the registry.
+			const app = createWebhookApp({
+				findProject: vi
+					.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
+					.mockResolvedValue(bitbucketProject),
+				getWebhookSecret: vi
+					.fn<WebhookReceiverDeps['getWebhookSecret']>()
+					.mockResolvedValue(secret),
+				enqueue,
+			});
+			return { app, enqueue };
+		}
+
+		function signBitbucket(body: string, key = secret) {
+			return `sha256=${createHmac('sha256', key).update(body, 'utf8').digest('hex')}`;
+		}
+
+		function postBitbucket(
+			app: ReturnType<typeof createWebhookApp>,
+			body: string,
+			headers: Record<string, string> = {},
+		) {
+			return app.request('/bitbucket/webhook', {
+				method: 'POST',
+				headers: {
+					'x-event-key': 'pullrequest:created',
+					'x-hub-signature': signBitbucket(body),
+					'x-request-uuid': 'delivery-bb-1',
+					'content-type': 'application/json',
+					...headers,
+				},
+				body,
+			});
+		}
+
+		it("serves the registered manifest's `/bitbucket/webhook` GET ping", async () => {
+			const { app } = realBitbucketApp();
+			expect((await app.request('/bitbucket/webhook')).status).toBe(200);
+		});
+
+		it("enqueues a signed delivery as a neutral event under providerId 'bitbucket'", async () => {
+			const { app, enqueue } = realBitbucketApp();
+			const res = await postBitbucket(app, signedBody);
+			expect(res.status).toBe(202);
+			expect(enqueue).toHaveBeenCalledWith(
+				'bitbucket',
+				expect.objectContaining({
+					kind: 'pull-request',
+					action: 'opened',
+					workItemId: '7',
+					prBranch: 'issue-7',
+				}),
+				bitbucketProject,
+				'delivery-bb-1',
+			);
+		});
+
+		it('rejects a body whose real signature does not match with 401', async () => {
+			const { app, enqueue } = realBitbucketApp();
+			const res = await postBitbucket(app, signedBody, {
+				'x-hub-signature': signBitbucket(signedBody, 'wrong-secret'),
+			});
+			expect(res.status).toBe(401);
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		// Bitbucket omits the header entirely for a hook configured without a secret;
+		// the provider's verifier fails closed on it rather than trusting the payload.
+		it('rejects an unsigned delivery with 401', async () => {
+			const { app, enqueue } = realBitbucketApp();
+			const res = await app.request('/bitbucket/webhook', {
+				method: 'POST',
+				headers: { 'x-event-key': 'pullrequest:created', 'content-type': 'application/json' },
+				body: signedBody,
+			});
+			expect(res.status).toBe(401);
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		it("acknowledges an event key SWARM doesn't act on without enqueueing", async () => {
+			const { app, enqueue } = realBitbucketApp();
+			const res = await postBitbucket(app, signedBody, { 'x-event-key': 'repo:push' });
+			expect(res.status).toBe(202);
+			expect(await res.json()).toMatchObject({ ok: true, ignored: true });
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+	});
+
+	// A CI event whose provider names no pull request is completed on the ingress
+	// path through the contract's own commit→PR read (issue #618). Bitbucket's
+	// `commit_status` carries no association at all, so this is what supplies
+	// `workItemId`/`prBranch` — without which the Review trigger drops the event.
+	describe("commit→PR resolution for a 'checks' event", () => {
+		const checksEvent: ScmEvent = {
+			kind: 'checks',
+			action: 'completed',
+			repoFullName: 'SmartTechBrewery/swarm',
+			isCommentEvent: false,
+			headSha: 'abcdef123456',
+			checkConclusion: 'success',
+		};
+
+		function makeChecksApp(overrides: Partial<SCMProvider> = {}) {
+			return makeApp({}, { parseWebhookEvent: () => checksEvent, ...overrides });
+		}
+
+		it('fills workItemId and prBranch from the open pull request the commit belongs to', async () => {
+			const listPullRequestsForCommit = vi
+				.fn<SCMProvider['listPullRequestsForCommit']>()
+				.mockResolvedValue([
+					{ number: 12, headBranch: 'issue-12', state: 'closed' },
+					{ number: 42, headBranch: 'issue-42', state: 'open' },
+				]);
+			const { app, enqueue } = makeChecksApp({ listPullRequestsForCommit });
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(listPullRequestsForCommit).toHaveBeenCalledWith(project, 'abcdef123456');
+			expect(enqueue).toHaveBeenCalledWith(
+				'github',
+				{ ...checksEvent, workItemId: '42', prBranch: 'issue-42' },
+				project,
+				'delivery-1',
+			);
+		});
+
+		// GitHub's `check_suite` names its pull requests in the payload, so the read is
+		// skipped entirely — the change costs a GitHub project no extra API call.
+		it('never reads when the provider already resolved the event', async () => {
+			const listPullRequestsForCommit = vi.fn<SCMProvider['listPullRequestsForCommit']>();
+			const resolved = { ...checksEvent, workItemId: '5', prBranch: 'issue-5' };
+			const { app, enqueue } = makeApp(
+				{},
+				{ parseWebhookEvent: () => resolved, listPullRequestsForCommit },
+			);
+
+			await post(app, VALID_BODY);
+
+			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
+			expect(enqueue).toHaveBeenCalledWith('github', resolved, project, 'delivery-1');
+		});
+
+		// A merged or declined pull request must not wake a review of its commit.
+		it('leaves the event unresolved when no candidate is open', async () => {
+			const { app, enqueue } = makeChecksApp({
+				listPullRequestsForCommit: vi
+					.fn<SCMProvider['listPullRequestsForCommit']>()
+					.mockResolvedValue([{ number: 12, headBranch: 'issue-12', state: 'closed' }]),
+			});
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(enqueue).toHaveBeenCalledWith('github', checksEvent, project, 'delivery-1');
+		});
+
+		// Fails open: the delivery is still accepted and enqueued (matching no trigger)
+		// rather than 500'd, because neither provider redelivers a failed webhook on its
+		// own — the next CI event for the same commit retries the resolution.
+		it('enqueues the unresolved event when the lookup fails', async () => {
+			const { app, enqueue } = makeChecksApp({
+				listPullRequestsForCommit: vi
+					.fn<SCMProvider['listPullRequestsForCommit']>()
+					.mockRejectedValue(new Error('bitbucket 503')),
+			});
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(enqueue).toHaveBeenCalledWith('github', checksEvent, project, 'delivery-1');
+		});
+
+		// Loop prevention runs first, so a dropped event never pays for the read.
+		it('does not read for an event loop prevention drops', async () => {
+			const listPullRequestsForCommit = vi.fn<SCMProvider['listPullRequestsForCommit']>();
+			const { app, enqueue } = makeChecksApp({
+				isSwarmGeneratedEvent: async () => true,
+				listPullRequestsForCommit,
+			});
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
+			expect(enqueue).not.toHaveBeenCalled();
 		});
 	});
 });

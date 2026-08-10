@@ -48,6 +48,7 @@ vi.mock('@/integrations/scm/bitbucket/pull-requests.js', () => ({
 	getBitbucketPullRequestMergeState: vi.fn(),
 	getBitbucketPullRequestTitle: vi.fn(),
 	getBitbucketCommitBuildStatus: vi.fn(),
+	listBitbucketPullRequestsForCommit: vi.fn(),
 	listOpenBitbucketPullRequestsForBase: vi.fn(),
 }));
 vi.mock('@/integrations/scm/bitbucket/writes.js', () => ({
@@ -80,6 +81,7 @@ import {
 	getBitbucketPullRequestApprovals,
 	getBitbucketPullRequestMergeState,
 	getBitbucketPullRequestTitle,
+	listBitbucketPullRequestsForCommit,
 	listOpenBitbucketPullRequestsForBase,
 } from '@/integrations/scm/bitbucket/pull-requests.js';
 import { BitbucketSCMIntegration } from '@/integrations/scm/bitbucket/scm-integration.js';
@@ -308,6 +310,32 @@ describe('BitbucketSCMIntegration', () => {
 
 			await expect(scm.getAggregateCheckStatus(project, 'd3022fc0ca3d')).resolves.toBe(aggregate);
 			expect(vi.mocked(getBitbucketCommitBuildStatus)).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				'd3022fc0ca3d',
+			);
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
+		});
+
+		// The read a Bitbucket `checks` event depends on (issue #618): its `commit_status`
+		// payload names no pull request, so ingress resolves one through this contract
+		// method. Bitbucket's four-state vocabulary must collapse to the neutral pair,
+		// or a merged pull request would read as open and wake a review.
+		it("maps a commit's pull requests onto the contract's open/closed pair, as the reviewer", async () => {
+			vi.mocked(listBitbucketPullRequestsForCommit).mockResolvedValue([
+				{ number: 17, state: 'OPEN', headBranch: 'swarm/issue-17' },
+				{ number: 16, state: 'MERGED', headBranch: 'swarm/issue-16' },
+				{ number: 15, state: 'DECLINED', headBranch: 'swarm/issue-15' },
+				{ number: 14, state: 'SUPERSEDED', headBranch: 'swarm/issue-14' },
+			]);
+
+			await expect(scm.listPullRequestsForCommit(project, 'd3022fc0ca3d')).resolves.toEqual([
+				{ number: 17, state: 'open', headBranch: 'swarm/issue-17' },
+				{ number: 16, state: 'closed', headBranch: 'swarm/issue-16' },
+				{ number: 15, state: 'closed', headBranch: 'swarm/issue-15' },
+				{ number: 14, state: 'closed', headBranch: 'swarm/issue-14' },
+			]);
+			expect(vi.mocked(listBitbucketPullRequestsForCommit)).toHaveBeenCalledWith(
 				'SmartTechBrewery',
 				'swarm',
 				'd3022fc0ca3d',

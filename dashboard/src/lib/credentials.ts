@@ -7,6 +7,7 @@
  */
 
 import type { ScmCredentialReferences } from '../../../src/config/schema.js';
+import type { ScmType } from '../../../src/scm/types.js';
 
 /**
  * The credential references this screen edits — derived from the Zod-owned
@@ -42,8 +43,12 @@ export const CREDENTIAL_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 		'HMAC secret GitHub signs webhook deliveries with — repository events and Projects board events alike, since they arrive on one webhook. Not tied to a GitHub identity.',
 };
 
-/** A source-control provider the Source Control tab's provider selector can offer. */
-export type ScmProviderId = 'github';
+/**
+ * A source-control provider the Source Control tab's selector can offer — a
+ * subset of the contract's `ScmType`, so a value picked here is exactly what
+ * `project.scm` (`src/config/schema.ts`) stores.
+ */
+export type ScmProviderId = Extract<ScmType, 'github' | 'bitbucket'>;
 
 export interface ScmProviderOption {
 	id: ScmProviderId;
@@ -53,26 +58,56 @@ export interface ScmProviderOption {
 }
 
 /**
- * UI-only catalogue backing the Source Control tab's provider selector.
- * GitHub is the only provider with a working integration
- * (`GitHubSCMIntegration`, `scm.verifyGithubToken`) — this list exists so the
- * selector and its copy are data-driven rather than a step toward a shared
- * `SCMProvider` interface (`ai/RULES.md` §2 explicitly defers that).
+ * Catalogue backing the Source Control tab's provider selector — the values that
+ * are **runtime-ready** server-side (`SCMProviderManifest.runtimeReady`), since
+ * selecting anything else would only earn the project a loud resolution error.
+ * GitHub was alone here until issue #618 made Bitbucket routable and served its
+ * ingress; GitLab joins with issue #619.
+ *
+ * Deliberately a hand-kept list rather than a registry read: the dashboard is a
+ * browser bundle and does not load `src/integrations/entrypoint.js`, so there is no
+ * registry in scope to enumerate.
  */
 export const SCM_PROVIDERS: readonly ScmProviderOption[] = [
 	{ id: 'github', label: 'GitHub', available: true },
+	{ id: 'bitbucket', label: 'Bitbucket Cloud', available: true },
 ];
 
 export const DEFAULT_SCM_PROVIDER_ID: ScmProviderId = SCM_PROVIDERS[0].id;
+
+/**
+ * Narrow a project's stored `scm` to a provider this screen can render. A project
+ * that names nothing predates issue #478's discriminator; one that names a provider
+ * the selector doesn't offer (`gitlab`, until issue #619) falls back rather than
+ * crashing the tab on an unknown key.
+ */
+export function toSelectableScmProvider(scm: string | undefined | null): ScmProviderId {
+	return SCM_PROVIDERS.some((provider) => provider.id === scm)
+		? (scm as ScmProviderId)
+		: DEFAULT_SCM_PROVIDER_ID;
+}
 
 /** Provider-facing copy for the Source Control tab, projected off the selected provider. */
 export interface ScmProviderCopy {
 	/** Introductory paragraph explaining what the credentials are for. */
 	intro: string;
 	roleDescriptions: Record<CredentialRole, string>;
-	/** Shown under a verifiable field when `scm.verifyGithubToken` resolves invalid. */
+	/** Shown under a verifiable field when the provider's verify procedure resolves invalid. */
 	verifyFailureMessage: string;
 }
+
+/**
+ * Bitbucket Cloud's wording for the two shared credential references. The roles
+ * themselves are provider-neutral (issue #290 — a Bitbucket project reuses
+ * `reviewer` / `webhookSecret` rather than getting its own), so only the copy
+ * differs.
+ */
+const BITBUCKET_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
+	reviewer:
+		'Bitbucket app password as "username:app_password", which the reviewer persona reviews with. Must resolve to a different Bitbucket account than the worker operator (the implementer identity) for loop prevention to work. Grant it the email scope so its commits are attributed rather than landing on a noreply address.',
+	webhookSecret:
+		'HMAC secret Bitbucket signs webhook deliveries with, sent as X-Hub-Signature. A hook configured without one is rejected: SWARM fails closed rather than trusting an unsigned delivery.',
+};
 
 const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	github: {
@@ -80,6 +115,13 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 			"The reviewer persona authenticates to GitHub with this project-scoped token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GH_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Verify the PAT to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
 		roleDescriptions: CREDENTIAL_ROLE_DESCRIPTIONS,
 		verifyFailureMessage: 'Token did not resolve to a GitHub account. Check it and try again.',
+	},
+	bitbucket: {
+		intro:
+			"The reviewer persona authenticates to Bitbucket Cloud with this project-scoped app password. The implementer persona uses the worker operator's own credential, configured on each host as the SWARM_OPERATOR_BITBUCKET_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Point the repository's webhook at /bitbucket/webhook and give it the secret below. Verify the app password to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+		roleDescriptions: BITBUCKET_ROLE_DESCRIPTIONS,
+		verifyFailureMessage:
+			'Credential did not resolve to a Bitbucket account. It must be a "username:app_password" pair — a workspace or repository access token cannot resolve an identity.',
 	},
 };
 
@@ -89,9 +131,10 @@ export function getScmProviderCopy(providerId: ScmProviderId): ScmProviderCopy {
 }
 
 /**
- * Whether a role's token maps to a GitHub identity and can be verified via
- * `scm.verifyGithubToken`. The webhook secret is an HMAC secret, not a token, so
- * it has no login to resolve and no Verify affordance.
+ * Whether a role's secret maps to a provider identity and can be verified through
+ * that provider's `scm.verify…` procedure. The webhook secret is an HMAC secret,
+ * not a token, so it has no login to resolve and no Verify affordance — true of
+ * both providers, which is why this takes no provider id.
  */
 export function isVerifiableRole(role: CredentialRole): boolean {
 	return role === 'reviewer';

@@ -31,6 +31,7 @@ import type { ScmEvent } from '../../../scm/events.js';
 import type { MergePullRequestOutcome } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
+	CommitPullRequest,
 	PullRequestDetails,
 	SCMProvider,
 	ScmPersona,
@@ -49,6 +50,7 @@ import {
 	getPullRequestReviews,
 	getPullRequestTitle,
 	listOpenPullRequestsForBase,
+	listPullRequestsForCommit,
 	mergePullRequestDirect,
 	postIdempotentPullRequestComment,
 	postIssueComment,
@@ -331,6 +333,24 @@ export class GitHubSCMIntegration implements SCMProvider {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
 			getCheckSuiteStatus(owner, repo, ref),
+		);
+	}
+
+	/**
+	 * {@link SCMProvider.listPullRequestsForCommit}. Reads under the **reviewer**
+	 * persona by default — the same scope the aggregate check query that follows it
+	 * on the `checks` path uses. GitHub's own `check_suite` payload already names its
+	 * pull requests, so ingress never needs this read here; it exists so the seam is
+	 * one neutral method rather than a Bitbucket-only call (issue #618).
+	 */
+	async listPullRequestsForCommit(
+		project: ProjectConfig,
+		sha: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<CommitPullRequest[]> {
+		const [owner, repo] = project.repo.split('/');
+		return this.withPersonaCredentials(project, persona, () =>
+			listPullRequestsForCommit(owner, repo, sha),
 		);
 	}
 

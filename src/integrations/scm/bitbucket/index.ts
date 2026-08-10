@@ -20,20 +20,20 @@ export const bitbucketScmManifest: SCMProviderManifest = {
 	id: 'bitbucket',
 	label: 'Bitbucket',
 	category: 'scm',
-	// Declared so the route this provider *will* answer on is decided in one place,
-	// but not served: `runtimeReady: false` keeps the receiver from mounting it
-	// (`src/router/webhook-receiver.ts`).
+	// Served verbatim by the receiver (`src/router/webhook-receiver.ts`) since this
+	// manifest declared itself runtime-ready: a GET ping plus the POST deliveries
+	// Bitbucket Cloud sends.
 	webhookRoute: '/bitbucket/webhook',
-	// The contract is complete as of issue #296 phase 4/4 — no method is stubbed
-	// (`tests/unit/integrations/scm/scm-conformance.test.ts`) — but this provider has
-	// not been declared ready to carry traffic, so the flag stays `false`: registering
-	// the manifest is a no-op for GitHub, since the project-scoped lookup routes only
-	// to runtime-ready manifests and a project naming `bitbucket` gets a loud error
-	// rather than a silent GitHub fallback (`../registry.ts`). Project→provider
-	// selection is no longer what's missing — `project.scm` is that, since issue #478.
-	// Flipping this needs a served ingress route and belongs to #457, the issue that
-	// completes this provider (ai/RULES.md §2).
-	runtimeReady: false,
+	// Declared ready to carry traffic by issue #618, the second provider to claim it.
+	// The contract has been complete since issue #296 phase 4/4 — no method is stubbed
+	// (`tests/unit/integrations/scm/scm-conformance.test.ts`) — and the two pieces of
+	// wiring that were still missing land with the flip: the receiver now mounts
+	// `/bitbucket/webhook`, and `requireProjectSCMProvider` routes a project that sets
+	// `"scm": "bitbucket"` here (`../registry.ts`). GitHub is unaffected — each project
+	// resolves the manifest it names — but a project that names *no* provider no longer
+	// resolves a sole runtime-ready one and must now set `scm` (see `../registry.ts`
+	// and the `scm` field doc in `src/config/schema.ts`).
+	runtimeReady: true,
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).
 	provider: new BitbucketSCMIntegration(),

@@ -82,19 +82,28 @@ export function requireSCMProvider(id: string): SCMProvider {
  *   naming the project and what it asked for; neither ever falls back to another
  *   provider, since resolving a project's operations onto a provider it did not
  *   name is the exact failure this lookup exists to prevent.
- * - **`project.scm` absent** — the sole runtime-ready provider. That is what keeps
- *   every installation predating the discriminator working with no config change.
- *   It is a statement of an unambiguous situation, not a preference order: with
- *   zero or with two or more runtime-ready providers there is no "the" provider, so
- *   this throws and tells the operator to set `scm` rather than picking whichever
- *   manifest registered first.
+ * - **`project.scm` absent** — the sole runtime-ready provider. It is a statement of
+ *   an unambiguous situation, not a preference order: with zero or with two or more
+ *   runtime-ready providers there is no "the" provider, so this throws and tells the
+ *   operator to set `scm` rather than picking whichever manifest registered first.
+ *
+ *   **That branch stopped resolving with issue #618**, which made Bitbucket the
+ *   second runtime-ready provider. It was the back-compat path for installations
+ *   predating the discriminator; from #618 on, every project must state its provider.
+ *   The throw is the migration notice — it names the project and lists the ids to
+ *   choose from — and the fix is one field: set `"scm": "github"` on each existing
+ *   project in `swarm.config.json` and run `swarm config apply` (docs/configuration.md).
+ *   Deliberately not defaulted to `github` in the schema: a silent default would route
+ *   a *new* Bitbucket project's operations onto GitHub, which is the exact failure this
+ *   lookup exists to prevent.
  *
  * The runtime-ready filter still gates a *selected* provider too: a manifest that
  * declares `runtimeReady: false` is registered so its own tests and follow-up work
  * can resolve it by id, and is deliberately unable to serve traffic until the work
- * completing that provider flips the flag. {@link requireSCMProvider} stays exempt
- * from the filter — its id comes from an enqueued job's envelope, written by this
- * process's own ingress, and that lookup must stay event-accurate.
+ * completing that provider flips the flag (GitLab is the one left, issue #619).
+ * {@link requireSCMProvider} stays exempt from the filter — its id comes from an
+ * enqueued job's envelope, written by this process's own ingress, and that lookup
+ * must stay event-accurate.
  */
 export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
 	const selected = project.scm;

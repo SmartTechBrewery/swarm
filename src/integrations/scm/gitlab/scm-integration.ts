@@ -36,6 +36,7 @@ import type { ScmEvent } from '../../../scm/events.js';
 import type { MergePullRequestOutcome } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
+	CommitPullRequest,
 	PullRequestDetails,
 	SCMProvider,
 	ScmPersona,
@@ -52,6 +53,7 @@ import {
 	getGitLabMergeRequestApprovals,
 	getGitLabMergeRequestMergeState,
 	getGitLabMergeRequestTitle,
+	listGitLabMergeRequestsForCommit,
 	listOpenGitLabMergeRequestsForBase,
 } from './merge-requests.js';
 import { createGitLabOperatorDeliveryProvider } from './operator-delivery.js';
@@ -353,6 +355,32 @@ export class GitLabSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getGitLabCommitStatuses(project.repo, ref),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.listPullRequestsForCommit} — the read a **branch** pipeline's
+	 * `checks` event depends on, since GitLab includes `merge_request` only when the
+	 * pipeline ran *for* one (issue #618). Reads under the **reviewer** persona by
+	 * default, the same scope {@link GitLabSCMIntegration.getAggregateCheckStatus}
+	 * uses for the query that follows it on the review path.
+	 *
+	 * GitLab's four-state vocabulary collapses to the contract's `open`/`closed`
+	 * pair here, so a `merged`, `closed`, or `locked` merge request never reads as
+	 * open.
+	 */
+	async listPullRequestsForCommit(
+		project: ProjectConfig,
+		sha: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<CommitPullRequest[]> {
+		const mergeRequests = await this.withPersonaCredentials(project, persona, () =>
+			listGitLabMergeRequestsForCommit(project.repo, sha),
+		);
+		return mergeRequests.map((mergeRequest) => ({
+			number: mergeRequest.number,
+			headBranch: mergeRequest.headBranch,
+			state: mergeRequest.state === 'opened' ? ('open' as const) : ('closed' as const),
+		}));
 	}
 
 	/**

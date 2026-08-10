@@ -49,11 +49,11 @@ export interface SCMProviderManifest {
 	 * unreachable at runtime, so registering it changes no existing behavior. Two
 	 * things read it — the project-scoped lookup (`requireProjectSCMProvider`,
 	 * `./registry.ts`) and the receiver's route mounting
-	 * (`src/router/webhook-receiver.ts`) — which is exactly the pair that would
-	 * otherwise start answering for a provider nothing has chosen. Bitbucket (issue
-	 * #296) and GitLab (issue #295) sit here with **complete** contracts: what each
-	 * still lacks is a served ingress route and the decision, in its own completion
-	 * issue, that it is ready to carry traffic.
+	 * (`src/router/webhook-receiver.ts`) — which is exactly the pair that starts
+	 * answering for a provider the moment it flips. GitHub and, since issue #618,
+	 * Bitbucket are both ready; GitLab (issue #295) still sits at `false` with a
+	 * **complete** contract, waiting on issue #619 to serve its ingress route and make
+	 * the same call.
 	 *
 	 * It is **not** a selection mechanism — `ProjectConfig.scm` is, since issue #478
 	 * (`src/config/schema.ts`). The two compose: a project that selects a provider

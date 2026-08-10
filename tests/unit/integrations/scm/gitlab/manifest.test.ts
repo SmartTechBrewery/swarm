@@ -26,9 +26,9 @@ describe('gitlab SCM manifest registration', () => {
 		});
 	});
 
-	// The contract is complete (issue #295 phase 4/4), and this still holds:
-	// discoverable by id, but not answering for any project and not served a webhook
-	// route, because nothing selects a project's SCM provider yet.
+	// The contract is complete (issue #295 phase 4/4), and this still holds: discoverable
+	// by id, but not answering for any project and not served a webhook route. Bitbucket
+	// made that flip with issue #618; GitLab's is issue #619's to make.
 	it('opts out of runtime traffic', () => {
 		expect(gitlabScmManifest.runtimeReady).toBe(false);
 		expect(isRuntimeReadySCMProvider(gitlabScmManifest)).toBe(false);
@@ -54,6 +54,7 @@ describe('gitlab SCM manifest registration', () => {
 			'getPullRequest',
 			'getPullRequestTitle',
 			'getAggregateCheckStatus',
+			'listPullRequestsForCommit',
 			'listConflictCandidates',
 			'commentOnPullRequest',
 			'deliveryProvider',

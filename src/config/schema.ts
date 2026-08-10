@@ -571,13 +571,18 @@ export const ProjectConfigBaseSchema = z.object({
 	 * inferred from the repo string: there is nothing in a bare `owner/repo` to tell
 	 * two providers apart.
 	 *
-	 * **Optional, and absent means "the sole runtime-ready registered provider"**, so
-	 * every project written before this field existed keeps resolving unchanged with
-	 * no config migration. Absence is not a silent pick: with zero — or two or more —
-	 * runtime-ready providers registered, the lookup throws and names this field.
-	 * Naming a provider that is unregistered, or registered but not runtime-ready
+	 * **Optional in shape, required in practice since issue #618.** Absence means "the
+	 * sole runtime-ready registered provider", which was the back-compat path for
+	 * projects written before this field existed — and it stopped resolving the moment
+	 * Bitbucket became the second runtime-ready provider. Absence is not a silent pick:
+	 * with zero — or two or more — runtime-ready providers registered, the lookup
+	 * throws and names this field, so an existing project must now state `"scm":
+	 * "github"` (one field, then `swarm config apply`). Naming a provider that is
+	 * unregistered, or registered but not runtime-ready
 	 * (`SCMProviderManifest.runtimeReady`), also throws rather than falling back to
-	 * another provider.
+	 * another provider. The field stays optional rather than gaining a `github`
+	 * default, because a default would silently route a Bitbucket project's operations
+	 * onto GitHub instead of failing loudly.
 	 *
 	 * A bare provider id rather than a `pm`-style discriminated union on purpose: an
 	 * SCM manifest declares no `configSchema` (a project's SCM config is `repo` +

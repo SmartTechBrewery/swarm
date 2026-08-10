@@ -19,6 +19,7 @@ import { deliveryMarker } from '../../../scm/swarm-origin.js';
 import type {
 	AggregateCheckStatus,
 	CheckRunState,
+	CommitPullRequest,
 	PullRequestDetails,
 } from '../../../scm/types.js';
 
@@ -251,6 +252,35 @@ export async function listOpenPullRequestsForBase(
 			mergeable: data.mergeable,
 			authorLogin: data.user?.login ?? null,
 		}));
+}
+
+/**
+ * The pull requests a commit belongs to — GitHub's half of the contract's
+ * commit→PR resolution (issue #618).
+ *
+ * GitHub's own `check_suite` payload already names its pull requests, so this is
+ * never on the `checks` ingress path here; it exists so the seam is the same
+ * neutral method for every provider rather than a Bitbucket-only call.
+ */
+export async function listPullRequestsForCommit(
+	owner: string,
+	repo: string,
+	sha: string,
+): Promise<CommitPullRequest[]> {
+	const client = getScopedClient();
+	const pulls = await client.paginate(client.repos.listPullRequestsAssociatedWithCommit, {
+		owner,
+		repo,
+		commit_sha: sha,
+		per_page: 100,
+	});
+	return pulls.map((pull) => ({
+		number: pull.number,
+		headBranch: pull.head.ref,
+		// GitHub already spells it `open`/`closed`; normalized rather than cast so a
+		// merged PR (which GitHub also reports as `closed`) can't read as open.
+		state: pull.state === 'open' ? ('open' as const) : ('closed' as const),
+	}));
 }
 
 /** Retrieve pull request details by number, including mergeability status. */
