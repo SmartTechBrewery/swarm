@@ -4,15 +4,14 @@
  * concrete provider or speak a provider's own vocabulary (ai/RULES.md §2
  * "Source-control features must not hard-code GitHub").
  *
- * Two implementations carry runtime traffic: `GitHubSCMIntegration`
- * (`src/integrations/scm/github/scm-integration.ts`) and, since issue #618,
- * `BitbucketSCMIntegration` (`src/integrations/scm/bitbucket/scm-integration.ts`),
- * both registered through the SCM manifest + registry
+ * All three implementations carry runtime traffic: `GitHubSCMIntegration`
+ * (`src/integrations/scm/github/scm-integration.ts`), `BitbucketSCMIntegration`
+ * (`src/integrations/scm/bitbucket/scm-integration.ts`, since issue #618), and
+ * `GitLabSCMIntegration` (`src/integrations/scm/gitlab/scm-integration.ts`, since
+ * issue #619) — each registered through the SCM manifest + registry
  * (`src/integrations/scm/{manifest,registry}.ts`) exactly as the PM side
  * registers GitHub Projects, and each project routing to the one it names
- * (`ProjectConfig.scm`, issue #478). GitLab (`GitLabSCMIntegration`, issue #295)
- * satisfies the whole contract too and stays `runtimeReady: false` until issue
- * #619 serves its ingress route.
+ * (`ProjectConfig.scm`, issue #478).
  *
  * This file defines **types only** — every importer uses `import type`, so the
  * module adds no runtime edge. That's what lets `src/config/provider.ts` (which
@@ -37,7 +36,8 @@
  *   (issue #478) is a bare provider id rather than a discriminated union's `type`.
  *   Selection itself is no longer missing: `requireProjectSCMProvider`
  *   (`src/integrations/scm/registry.ts`) resolves the manifest a project names,
- *   which is what lets GitHub and Bitbucket serve one installation side by side.
+ *   which is what lets GitHub, Bitbucket, and GitLab serve one installation side
+ *   by side.
  * - **`withCredentials`** — the implementer-persona convenience wrapper on the
  *   GitHub class. It is sugar over {@link SCMProvider.withPersonaCredentials};
  *   putting it in the contract would oblige a second provider to implement two

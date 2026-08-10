@@ -17,7 +17,7 @@ describe('gitlab SCM manifest registration', () => {
 		expect(listSCMProviders().map((m) => m.id)).toEqual(['github', 'bitbucket', 'gitlab']);
 	});
 
-	it('declares the expected identity and its future webhook route', () => {
+	it('declares the expected identity and its served webhook route', () => {
 		expect(gitlabScmManifest).toMatchObject({
 			id: 'gitlab',
 			label: 'GitLab',
@@ -26,12 +26,12 @@ describe('gitlab SCM manifest registration', () => {
 		});
 	});
 
-	// The contract is complete (issue #295 phase 4/4), and this still holds: discoverable
-	// by id, but not answering for any project and not served a webhook route. Bitbucket
-	// made that flip with issue #618; GitLab's is issue #619's to make.
-	it('opts out of runtime traffic', () => {
-		expect(gitlabScmManifest.runtimeReady).toBe(false);
-		expect(isRuntimeReadySCMProvider(gitlabScmManifest)).toBe(false);
+	// The flip issue #619 owns: the contract has been complete since issue #295 phase
+	// 4/4, and this is what makes it reachable — `requireProjectSCMProvider` routes a
+	// project stating `"scm": "gitlab"` here, and the receiver mounts the route above.
+	it('carries runtime traffic', () => {
+		expect(gitlabScmManifest.runtimeReady).toBe(true);
+		expect(isRuntimeReadySCMProvider(gitlabScmManifest)).toBe(true);
 	});
 
 	it('exposes a provider that satisfies the SCMProvider contract without naming the class', () => {

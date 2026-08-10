@@ -33,11 +33,13 @@ describe('maskedPreview', () => {
 describe('SCM_PROVIDERS', () => {
 	// The list mirrors the server's runtime-ready manifests: offering a provider a
 	// project cannot resolve would only earn the operator a loud lookup error.
-	// Bitbucket joined with issue #618; GitLab joins with #619.
+	// Bitbucket joined with issue #618 and GitLab with #619, so all three registered
+	// providers are offered.
 	it('lists exactly the providers a project can be routed to', () => {
 		expect(SCM_PROVIDERS).toEqual([
 			{ id: 'github', label: 'GitHub', available: true },
 			{ id: 'bitbucket', label: 'Bitbucket Cloud', available: true },
+			{ id: 'gitlab', label: 'GitLab', available: true },
 		]);
 	});
 
@@ -51,11 +53,15 @@ describe('toSelectableScmProvider', () => {
 		expect(toSelectableScmProvider('bitbucket')).toBe('bitbucket');
 	});
 
+	it('keeps GitLab now that the selector offers it', () => {
+		expect(toSelectableScmProvider('gitlab')).toBe('gitlab');
+	});
+
 	// A project predating issue #478's discriminator names nothing; one naming a
 	// provider the selector does not offer must not crash the tab on an unknown key.
 	it('leaves an unset or unoffered provider unselected', () => {
 		expect(toSelectableScmProvider(undefined)).toBeUndefined();
-		expect(toSelectableScmProvider('gitlab')).toBeUndefined();
+		expect(toSelectableScmProvider('gerrit')).toBeUndefined();
 	});
 });
 
@@ -87,5 +93,26 @@ describe('getScmProviderCopy — Bitbucket', () => {
 	it('points at Bitbucket’s own operator env var and ingress route', () => {
 		expect(copy.intro).toMatch(/SWARM_OPERATOR_BITBUCKET_TOKEN/);
 		expect(copy.intro).toMatch(/\/bitbucket\/webhook/);
+	});
+});
+
+describe('getScmProviderCopy — GitLab', () => {
+	const copy = getScmProviderCopy('gitlab');
+
+	// The webhook secret differs in kind here, not just in wording: GitLab echoes the
+	// token rather than signing the body, so the copy must not promise an HMAC.
+	it('describes a secret token rather than an HMAC signature', () => {
+		expect(copy.roleDescriptions.webhookSecret).toMatch(/X-Gitlab-Token/);
+		expect(copy.roleDescriptions.webhookSecret).not.toMatch(/HMAC/);
+	});
+
+	it('names the api scope the reviewer token needs', () => {
+		expect(copy.roleDescriptions.reviewer).toMatch(/api scope/);
+		expect(copy.verifyFailureMessage).toMatch(/GitLab account/);
+	});
+
+	it('points at GitLab’s own operator env var and ingress route', () => {
+		expect(copy.intro).toMatch(/SWARM_OPERATOR_GITLAB_TOKEN/);
+		expect(copy.intro).toMatch(/\/gitlab\/webhook/);
 	});
 });

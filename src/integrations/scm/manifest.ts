@@ -50,10 +50,11 @@ export interface SCMProviderManifest {
 	 * things read it — the project-scoped lookup (`requireProjectSCMProvider`,
 	 * `./registry.ts`) and the receiver's route mounting
 	 * (`src/router/webhook-receiver.ts`) — which is exactly the pair that starts
-	 * answering for a provider the moment it flips. GitHub and, since issue #618,
-	 * Bitbucket are both ready; GitLab (issue #295) still sits at `false` with a
-	 * **complete** contract, waiting on issue #619 to serve its ingress route and make
-	 * the same call.
+	 * answering for a provider the moment it flips. Every registered provider has now
+	 * made that call — GitHub, then Bitbucket with issue #618, then GitLab with issue
+	 * #619 — so no manifest sits at `false` today: the flag is what keeps a *fourth*
+	 * provider's intermediate phases from carrying traffic before its contract is
+	 * complete and its ingress route is served.
 	 *
 	 * It is **not** a selection mechanism — `ProjectConfig.scm` is, since issue #478
 	 * (`src/config/schema.ts`). The two compose: a project that selects a provider

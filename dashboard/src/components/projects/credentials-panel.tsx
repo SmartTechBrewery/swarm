@@ -37,9 +37,14 @@ type VerifyResult = { valid: true; login: string } | { valid: false };
  * `SCMProvider` from, which is why `src/api/routers/scm.ts` keeps them separate.
  */
 function verifyScmCredential(providerId: ScmProviderId, secret: string): Promise<VerifyResult> {
-	return providerId === 'bitbucket'
-		? trpcClient.scm.verifyBitbucketCredential.mutate({ credential: secret })
-		: trpcClient.scm.verifyGithubToken.mutate({ token: secret });
+	switch (providerId) {
+		case 'bitbucket':
+			return trpcClient.scm.verifyBitbucketCredential.mutate({ credential: secret });
+		case 'gitlab':
+			return trpcClient.scm.verifyGitLabToken.mutate({ token: secret });
+		default:
+			return trpcClient.scm.verifyGithubToken.mutate({ token: secret });
+	}
 }
 
 interface CredentialFieldEditorProps {

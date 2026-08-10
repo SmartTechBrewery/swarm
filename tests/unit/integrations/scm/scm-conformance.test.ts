@@ -13,8 +13,9 @@
  * **The third provider has now passed that gate.** GitLab (issue #295) built its
  * contract over four phases while registering nothing, precisely so it could not
  * claim an exemption from the no-stub assertion, and registered in its phase 4/4
- * together with the last stub's removal. A fourth provider adds a manifest to the
- * list below and inherits every assertion unchanged.
+ * together with the last stub's removal; issue #619 then declared it runtime-ready.
+ * A fourth provider adds a manifest to the list below and inherits every assertion
+ * unchanged.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -73,18 +74,19 @@ describe('SCM provider conformance', () => {
 		expect(new Set(ids).size).toBe(ids.length);
 	});
 
-	// Two runtime-ready providers is the deliberate state since issue #618, which made
-	// Bitbucket routable from `project.scm` and served `/bitbucket/webhook`; the
-	// two-projects-two-providers routing itself is asserted in `registry.test.ts`,
-	// against fake manifests, because this suite runs over the real registrations.
-	// The tripwire is unchanged in spirit: this list is the exhaustive set of providers
-	// declared ready to carry traffic, so flipping GitLab's flag has to update it
-	// deliberately — in issue #619, together with its served ingress route — rather
+	// All three registered providers are runtime-ready as of issue #619, which served
+	// `/gitlab/webhook` the way #618 served Bitbucket's; the several-projects-several-
+	// providers routing itself is asserted in `registry.test.ts`, against fake
+	// manifests, because this suite runs over the real registrations. The tripwire is
+	// unchanged in spirit: this list is the exhaustive set of providers declared ready
+	// to carry traffic, so a fourth provider flipping its flag has to update it
+	// deliberately — in the issue that serves that provider's ingress route — rather
 	// than as a side effect of unrelated work.
 	it('declares exactly the providers that have been made runtime-reachable', () => {
 		expect(manifests.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual([
 			'github',
 			'bitbucket',
+			'gitlab',
 		]);
 	});
 
@@ -139,7 +141,7 @@ describe('SCM provider conformance', () => {
 	// `registry.test.ts`'s fakes — because since issue #618 its multi-provider
 	// branches are what production actually takes.
 	describe('requireProjectSCMProvider against the real registry', () => {
-		for (const id of ['github', 'bitbucket'] as const) {
+		for (const id of ['github', 'bitbucket', 'gitlab'] as const) {
 			it(`routes a project that selects '${id}' to that provider`, () => {
 				const manifest = manifests.find((candidate) => candidate.id === id);
 				expect(requireProjectSCMProvider(createMockProjectConfig({ scm: id }))).toBe(
@@ -148,26 +150,26 @@ describe('SCM provider conformance', () => {
 			});
 		}
 
-		// GitLab's contract is complete, so this is the `runtimeReady` gate alone —
-		// and it must stay a loud, specific error rather than a fallback onto GitHub.
-		it('refuses a project that selects a provider which is not runtime-ready', () => {
-			expect(() => requireProjectSCMProvider(createMockProjectConfig({ scm: 'gitlab' }))).toThrow(
-				/registered but not runtime-ready/,
-			);
-		});
+		// The two "selected but unusable" throws have no real manifest to run against any
+		// more: `ScmType` is a closed enum, so an unregistered id cannot even be put on a
+		// `ProjectConfig`, and every registered provider carries traffic since issue #619.
+		// Both stay asserted against fake manifests in `registry.test.ts` ('throws naming
+		// the project and the selected id when that provider is not registered' and
+		// 'throws when the selected provider is registered but not runtime-ready').
 
-		// The migration this issue creates: the sole-runtime-ready fallback stopped
+		// The migration issue #618 created: the sole-runtime-ready fallback stopped
 		// resolving the moment Bitbucket became the second ready provider, so an
-		// installation predating `ProjectConfig.scm` must now set the field. The error
-		// is the notice, so it has to name the field and list the choices.
+		// installation predating `ProjectConfig.scm` must set the field. The error is
+		// the notice, so it has to name the field and list the choices — all three of
+		// them now that GitLab is ready too.
 		it('tells an unmigrated project to set scm rather than picking a provider for it', () => {
 			const unmigrated = createMockProjectConfig();
 			expect(unmigrated.scm).toBeUndefined();
 			expect(() => requireProjectSCMProvider(unmigrated)).toThrow(
-				/it selects no provider and 2 of 3 registered are runtime-ready/,
+				/it selects no provider and 3 of 3 registered are runtime-ready/,
 			);
 			expect(() => requireProjectSCMProvider(unmigrated)).toThrow(
-				/set "scm" on the project config to one of: github, bitbucket/,
+				/set "scm" on the project config to one of: github, bitbucket, gitlab/,
 			);
 		});
 	});

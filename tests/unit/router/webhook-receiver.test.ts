@@ -20,6 +20,7 @@ import {
 } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
+import { gitlabScmManifest } from '@/integrations/scm/gitlab/index.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import { logger } from '@/lib/logger.js';
 import type { PmEvent } from '@/pm/events.js';
@@ -192,10 +193,11 @@ describe('createWebhookApp', () => {
 			expect(res.status).toBe(200);
 		});
 
-		// A provider that has not declared itself ready to carry traffic (GitLab, until
-		// issue #619) registers with `runtimeReady: false`. Mounting its route would
-		// expose an endpoint for a provider no project can select, so the receiver
-		// serves nothing for it — not even the GET ping.
+		// A provider that has not declared itself ready to carry traffic registers with
+		// `runtimeReady: false`. Mounting its route would expose an endpoint for a
+		// provider no project can select, so the receiver serves nothing for it — not
+		// even the GET ping. Every *registered* provider is ready since issue #619, so
+		// this runs against a fake manifest and guards the fourth one's construction.
 		it('serves no route for a provider that is not runtime-ready', async () => {
 			const { app } = makeApp({
 				scmProviders: [
@@ -1172,6 +1174,197 @@ describe('createWebhookApp', () => {
 			expect(res.status).toBe(202);
 			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
 			expect(enqueue).not.toHaveBeenCalled();
+		});
+	});
+
+	// The third runtime-ready SCM provider (issue #619). Nothing in the receiver names
+	// it either: declaring `runtimeReady: true` is the whole change, and the same loop
+	// that mounts GitHub's and Bitbucket's routes mounts `/gitlab/webhook`. Driven
+	// through the real registry with only the project + secret lookups faked, so the
+	// assertions cover GitLab's genuine header names, its `X-Gitlab-Token` *sender*
+	// authentication (not an HMAC over the body), and `X-Gitlab-Event` normalization.
+	describe('real registered GitLab provider (defaultDeps wiring)', () => {
+		const secret = 'gl-secret-token';
+		const headSha = 'a'.repeat(40);
+		const gitlabProject = createMockProjectConfig({
+			id: 'gl-project',
+			repo: 'SmartTechBrewery/swarm',
+			scm: 'gitlab',
+		});
+		const mergeRequestBody = JSON.stringify({
+			object_kind: 'merge_request',
+			project: { path_with_namespace: 'SmartTechBrewery/swarm' },
+			user: { id: 501, username: 'human-dev' },
+			object_attributes: {
+				iid: 7,
+				action: 'open',
+				source_branch: 'issue-7',
+				target_branch: 'main',
+				source_project_id: 1,
+				target_project_id: 1,
+				last_commit: { id: headSha },
+				url: 'https://gitlab.com/SmartTechBrewery/swarm/-/merge_requests/7',
+			},
+		});
+		/** A **branch** pipeline: GitLab names no merge request at all (see the parse). */
+		const branchPipelineBody = JSON.stringify({
+			object_kind: 'pipeline',
+			project: { path_with_namespace: 'SmartTechBrewery/swarm' },
+			user: { id: 501, username: 'human-dev' },
+			object_attributes: { id: 99, sha: headSha, status: 'success' },
+		});
+
+		function realGitLabApp() {
+			const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
+			// Fake only the secret + project lookups; the manifest comes from the registry.
+			const app = createWebhookApp({
+				findProject: vi
+					.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
+					.mockResolvedValue(gitlabProject),
+				getWebhookSecret: vi
+					.fn<WebhookReceiverDeps['getWebhookSecret']>()
+					.mockResolvedValue(secret),
+				enqueue,
+			});
+			return { app, enqueue };
+		}
+
+		function postGitLab(
+			app: ReturnType<typeof createWebhookApp>,
+			body: string,
+			headers: Record<string, string> = {},
+		) {
+			return app.request('/gitlab/webhook', {
+				method: 'POST',
+				headers: {
+					'x-gitlab-event': 'Merge Request Hook',
+					'x-gitlab-token': secret,
+					'x-gitlab-event-uuid': 'delivery-gl-1',
+					'content-type': 'application/json',
+					...headers,
+				},
+				body,
+			});
+		}
+
+		it("serves the registered manifest's `/gitlab/webhook` GET ping", async () => {
+			const { app } = realGitLabApp();
+			expect((await app.request('/gitlab/webhook')).status).toBe(200);
+		});
+
+		it("enqueues an authenticated delivery as a neutral event under providerId 'gitlab'", async () => {
+			const { app, enqueue } = realGitLabApp();
+			const res = await postGitLab(app, mergeRequestBody);
+			expect(res.status).toBe(202);
+			expect(enqueue).toHaveBeenCalledWith(
+				'gitlab',
+				expect.objectContaining({
+					kind: 'pull-request',
+					action: 'opened',
+					workItemId: '7',
+					prBranch: 'issue-7',
+					headSha,
+				}),
+				gitlabProject,
+				'delivery-gl-1',
+			);
+		});
+
+		it('rejects a delivery whose token does not match with 401', async () => {
+			const { app, enqueue } = realGitLabApp();
+			const res = await postGitLab(app, mergeRequestBody, { 'x-gitlab-token': 'wrong-token' });
+			expect(res.status).toBe(401);
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		// GitLab omits the header entirely for a hook configured without a secret token;
+		// the provider's verifier fails closed on it rather than trusting the payload.
+		it('rejects a delivery carrying no token with 401', async () => {
+			const { app, enqueue } = realGitLabApp();
+			const res = await app.request('/gitlab/webhook', {
+				method: 'POST',
+				headers: { 'x-gitlab-event': 'Merge Request Hook', 'content-type': 'application/json' },
+				body: mergeRequestBody,
+			});
+			expect(res.status).toBe(401);
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		it("acknowledges an event SWARM doesn't act on without enqueueing", async () => {
+			const { app, enqueue } = realGitLabApp();
+			const res = await postGitLab(app, mergeRequestBody, { 'x-gitlab-event': 'Push Hook' });
+			expect(res.status).toBe(202);
+			expect(await res.json()).toMatchObject({ ok: true, ignored: true });
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		// The acceptance criterion a GitLab branch pipeline turns on: the parse leaves
+		// `workItemId`/`prBranch` unset because the payload names no merge request, so
+		// they can only come from the ingress path's commit→merge-request read. Spied on
+		// the real provider rather than faked at the manifest, so the wiring under test
+		// is the registered one.
+		it('resolves a branch pipeline to its merge request through the contract read', async () => {
+			const listPullRequestsForCommit = vi
+				.spyOn(gitlabScmManifest.provider, 'listPullRequestsForCommit')
+				.mockResolvedValue([
+					{ number: 12, headBranch: 'issue-12', state: 'closed' },
+					{ number: 42, headBranch: 'issue-42', state: 'open' },
+				]);
+			const { app, enqueue } = realGitLabApp();
+
+			const res = await postGitLab(app, branchPipelineBody, { 'x-gitlab-event': 'Pipeline Hook' });
+
+			expect(res.status).toBe(202);
+			expect(listPullRequestsForCommit).toHaveBeenCalledWith(gitlabProject, headSha);
+			expect(enqueue).toHaveBeenCalledWith(
+				'gitlab',
+				expect.objectContaining({
+					kind: 'checks',
+					action: 'completed',
+					checkConclusion: 'success',
+					workItemId: '42',
+					prBranch: 'issue-42',
+				}),
+				gitlabProject,
+				'delivery-gl-1',
+			);
+			listPullRequestsForCommit.mockRestore();
+		});
+
+		// A merge-request pipeline names its merge request in the payload, so the read is
+		// skipped — the same saving GitHub's `check_suite` gets.
+		it('never reads when the pipeline payload already names its merge request', async () => {
+			const listPullRequestsForCommit = vi.spyOn(
+				gitlabScmManifest.provider,
+				'listPullRequestsForCommit',
+			);
+			const { app, enqueue } = realGitLabApp();
+
+			const res = await postGitLab(
+				app,
+				JSON.stringify({
+					object_kind: 'pipeline',
+					project: { path_with_namespace: 'SmartTechBrewery/swarm' },
+					user: { id: 501, username: 'human-dev' },
+					object_attributes: { id: 99, sha: headSha, status: 'success' },
+					merge_request: {
+						iid: 8,
+						source_branch: 'issue-8',
+						url: 'https://gitlab.com/SmartTechBrewery/swarm/-/merge_requests/8',
+					},
+				}),
+				{ 'x-gitlab-event': 'Pipeline Hook' },
+			);
+
+			expect(res.status).toBe(202);
+			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
+			expect(enqueue).toHaveBeenCalledWith(
+				'gitlab',
+				expect.objectContaining({ kind: 'checks', workItemId: '8', prBranch: 'issue-8' }),
+				gitlabProject,
+				'delivery-gl-1',
+			);
+			listPullRequestsForCommit.mockRestore();
 		});
 	});
 });

@@ -7,16 +7,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The panel writes `project.scm` since issue #618, so the project read/update pair
 // is part of its trpc surface now. Hoisted so a test can assert what was persisted.
-const { updateProject, projectScm } = vi.hoisted(() => ({
+const { updateProject, projectScm, verifyGithubToken, verifyGitLabToken } = vi.hoisted(() => ({
 	updateProject: vi.fn(),
 	projectScm: { current: undefined as string | undefined },
+	verifyGithubToken: vi.fn(),
+	verifyGitLabToken: vi.fn(),
 }));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpcClient: {
 		scm: {
-			verifyGithubToken: { mutate: vi.fn() },
+			verifyGithubToken: { mutate: verifyGithubToken },
 			verifyBitbucketCredential: { mutate: vi.fn() },
+			verifyGitLabToken: { mutate: verifyGitLabToken },
 		},
 		projects: {
 			update: { mutate: updateProject },
@@ -72,6 +75,10 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 	beforeEach(() => {
 		updateProject.mockReset();
 		updateProject.mockResolvedValue({});
+		verifyGithubToken.mockReset();
+		verifyGithubToken.mockResolvedValue({ valid: false });
+		verifyGitLabToken.mockReset();
+		verifyGitLabToken.mockResolvedValue({ valid: true, login: 'reviewer-bot' });
 		projectScm.current = undefined;
 	});
 
@@ -85,6 +92,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		expect(screen.getByText(/No provider is saved/)).not.toBeNull();
 		expect(screen.getByRole('option', { name: 'GitHub' })).not.toBeNull();
 		expect(screen.getByRole('option', { name: 'Bitbucket Cloud' })).not.toBeNull();
+		expect(screen.getByRole('option', { name: 'GitLab' })).not.toBeNull();
 
 		fireEvent.change(select, { target: { value: 'github' } });
 		await waitFor(() =>
@@ -123,5 +131,24 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 			expect(updateProject).toHaveBeenCalledWith({ id: 'proj-a', scm: 'bitbucket' }),
 		);
 		expect(screen.getByText(/SWARM_OPERATOR_BITBUCKET_TOKEN/)).not.toBeNull();
+	});
+
+	// Issue #619 made GitLab selectable too, which means Verify has to reach *its*
+	// procedure: there is no project yet to resolve a provider from, so the panel
+	// dispatches on the selected id (`src/api/routers/scm.ts`).
+	it('verifies a reviewer secret against the selected provider’s own procedure', async () => {
+		projectScm.current = 'gitlab';
+		renderPanel(<CredentialsPanel projectId="proj-a" />);
+
+		await waitFor(() => expect(screen.getByText(/SWARM_OPERATOR_GITLAB_TOKEN/)).not.toBeNull());
+
+		fireEvent.change(screen.getByLabelText('Reviewer PAT value'), {
+			target: { value: 'glpat-secret' },
+		});
+		fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0]);
+
+		await waitFor(() => expect(verifyGitLabToken).toHaveBeenCalledWith({ token: 'glpat-secret' }));
+		expect(verifyGithubToken).not.toHaveBeenCalled();
+		expect(await screen.findByText(/Verified as @reviewer-bot/)).not.toBeNull();
 	});
 });
