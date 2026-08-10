@@ -16,6 +16,28 @@
  *      presenting the session it already holds so a control-plane restart costs a
  *      round trip rather than the lease TTL (issue #608).
  *
+ * **Backoff policy: unreachability and refusal are separate ladders (issue #611).**
+ * A single counter advanced by every failure made the wait after a control-plane
+ * outage grow with *how long it had been down* rather than with how long it stays
+ * down, so a returning router met a daemon parked inside an already-scheduled delay
+ * of up to the 30s cap. The retry schedule therefore keys off *who answered*:
+ *
+ *   - **The control plane answered and refused** — a 409 session conflict, a
+ *     capability rejection, a 500 it generated itself — advances the ordinary
+ *     ladder (`maxMs`, 30s). A server that is up and saying no is exactly what that
+ *     ladder is for, and its shape is deliberately unchanged.
+ *   - **Nothing answered** — the request never completed, or the edge answered for
+ *     an origin that is not there (`UNREACHABLE_STATUSES`) — advances a *separate*
+ *     ladder held to the much lower `unreachableMaxMs` ceiling, and an answer of
+ *     any kind clears it. Its length is what bounds the idle gap after the control
+ *     plane comes back, so it is capped where a daemon can afford to wait.
+ *
+ * The lower ceiling is a bound, not a removal: the equal-jitter floor still applies
+ * to it, so a fleet reconnecting at once spreads across `[unreachableMaxMs/2,
+ * unreachableMaxMs]` and no daemon retries a recovering control plane at a near-zero
+ * delay. Resetting the counter outright was the alternative and was rejected for
+ * exactly that reason — a 502 *is* a recovering server, and it must not be hammered.
+ *
  * It deliberately imports **nothing** from `../db/*` or the queue: the client is
  * the second front door to the same session service the in-process worker calls
  * directly (`../identity/worker-session-service.ts`), but reached over the network
@@ -131,6 +153,32 @@ export class WorkerTransportTransientError extends Error {
 	}
 }
 
+/**
+ * The transient failure of a handshake the control plane never answered: the
+ * request did not complete at all, or an edge answered on behalf of an origin that
+ * is not there. Retried like any other transient failure, but on the separate,
+ * lower-capped ladder (issue #611 — see the module doc), because its length decides
+ * how long a daemon idles *after* the control plane is serving again.
+ */
+export class WorkerTransportUnreachableError extends WorkerTransportTransientError {
+	constructor(message: string) {
+		super(message);
+		this.name = 'WorkerTransportUnreachableError';
+	}
+}
+
+/**
+ * Statuses that mean *nothing behind the edge answered* rather than "the control
+ * plane answered and refused": the proxy/gateway family (502/503/504) plus
+ * Cloudflare's origin-unreachable codes (520–524, 530), which is what SWARM's own
+ * tunnel deployment returns while the router is restarting (`docs/cloudflare-tunnel.md`).
+ * Everything else — a 500 the router generated, a 429 it chose to send — is an
+ * answer, and keeps the ordinary ladder.
+ */
+const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
+	502, 503, 504, 520, 521, 522, 523, 524, 530,
+]);
+
 // --- Wire helpers (pure) ----------------------------------------------------
 
 /**
@@ -212,13 +260,39 @@ export function heartbeatCadenceMs(heartbeatTtlMs: number): number {
 	return Math.max(1_000, Math.floor(heartbeatTtlMs / 3));
 }
 
-/** Reconnect backoff schedule: exponential (base·2^(n-1)), capped, with equal jitter. */
+/**
+ * Reconnect backoff schedule: exponential (base·2^(n-1)), capped, with equal jitter.
+ * Two ceilings rather than one (issue #611 — see the module doc): `maxMs` bounds the
+ * ladder for a control plane that answered and refused, `unreachableMaxMs` the one
+ * for a control plane that answered nothing at all.
+ */
 export interface BackoffConfig {
 	baseMs: number;
 	maxMs: number;
+	unreachableMaxMs: number;
 }
 
-export const DEFAULT_BACKOFF: BackoffConfig = { baseMs: 1_000, maxMs: 30_000 };
+/**
+ * `unreachableMaxMs` is a sixth of `maxMs`: the unreachable ladder tops out at a
+ * jittered `[2.5s, 5s]`, which is the whole of the delay a worker can still be
+ * sitting in when the control plane starts serving again — small enough that a
+ * router restart costs a round trip rather than a ladder, wide enough that a fleet's
+ * retries stay spread across a 2.5s window instead of arriving together.
+ */
+export const DEFAULT_BACKOFF: BackoffConfig = {
+	baseMs: 1_000,
+	maxMs: 30_000,
+	unreachableMaxMs: 5_000,
+};
+
+/**
+ * The schedule for attempts the control plane never answered: the same exponential
+ * growth and the same equal-jitter floor, held to the lower `unreachableMaxMs`
+ * ceiling so the post-outage wait cannot grow with the length of the outage.
+ */
+function unreachableBackoff(config: BackoffConfig): BackoffConfig {
+	return { ...config, maxMs: config.unreachableMaxMs };
+}
 
 /**
  * The delay before reconnect attempt `attempt` (1-based). Exponential growth
@@ -235,6 +309,72 @@ export function computeReconnectDelayMs(
 	const capped = Math.min(config.maxMs, exponential);
 	const half = capped / 2;
 	return Math.round(half + random() * half);
+}
+
+/** A reconnect wait: which ladder produced it, where that ladder stands, how long to sleep. */
+export interface ReconnectStep {
+	/** The producing ladder's position, 1-based — what the retry log line reports. */
+	attempt: number;
+	delayMs: number;
+	/** Whether this came from the unreachable ladder rather than the ordinary one. */
+	unreachable: boolean;
+}
+
+/**
+ * The connect loop's pair of reconnect ladders (issue #611 — the policy itself is
+ * stated in the module doc). Two counters rather than one, so the length of a
+ * control-plane *outage* can never drive the schedule used against a control plane
+ * that is up and refusing; and the single place that decides which failure belongs
+ * on which ladder, so the loop reads as "step, log, sleep".
+ */
+export interface ReconnectLadders {
+	/** The wait a handshake failure earns, on whichever ladder its class belongs to. */
+	forHandshakeFailure(err: unknown): ReconnectStep;
+	/** The wait a lost live session earns — always the ordinary ladder's next rung. */
+	forSessionLoss(): ReconnectStep;
+	/** Clear both: a handshake succeeded, so neither ladder's history applies. */
+	reset(): void;
+}
+
+/** Build the two ladders over one backoff config and jitter source. */
+export function createReconnectLadders(
+	config: BackoffConfig,
+	random: () => number,
+): ReconnectLadders {
+	let answeredAttempt = 0;
+	let unreachableAttempt = 0;
+	const unreachableConfig = unreachableBackoff(config);
+
+	const answered = (): ReconnectStep => {
+		// An answer of any kind proves the control plane is reachable, so whatever the
+		// unreachable ladder had climbed to is stale.
+		unreachableAttempt = 0;
+		answeredAttempt += 1;
+		return {
+			attempt: answeredAttempt,
+			delayMs: computeReconnectDelayMs(answeredAttempt, config, random),
+			unreachable: false,
+		};
+	};
+
+	return {
+		forHandshakeFailure(err: unknown): ReconnectStep {
+			if (!(err instanceof WorkerTransportUnreachableError)) return answered();
+			// Deliberately leaves the ordinary ladder where it was: an outage is not a
+			// refusal, and must not spend the refusal ladder's rungs on its behalf.
+			unreachableAttempt += 1;
+			return {
+				attempt: unreachableAttempt,
+				delayMs: computeReconnectDelayMs(unreachableAttempt, unreachableConfig, random),
+				unreachable: true,
+			};
+		},
+		forSessionLoss: answered,
+		reset(): void {
+			answeredAttempt = 0;
+			unreachableAttempt = 0;
+		},
+	};
 }
 
 // --- Injectable collaborators ----------------------------------------------
@@ -301,8 +441,10 @@ function resolveOverrides(overrides: Partial<WorkerTransportOverrides>): WorkerT
  * Perform the HTTP handshake and return the acquired session. Maps each failure
  * status to a typed error the reconnect loop classifies (auth/protocol/capability
  * are fatal, session-conflict is fatal only on first connect, everything else is
- * transient). Never logs or echoes the credential — the control plane's error
- * bodies are constant-shape and credential-free by contract.
+ * transient — and the transient half splits again on whether the control plane
+ * answered at all, which picks the retry ladder). Never logs or echoes the
+ * credential — the control plane's error bodies are constant-shape and
+ * credential-free by contract.
  */
 export async function performHandshake(
 	deps: WorkerTransportOverrides,
@@ -317,7 +459,9 @@ export async function performHandshake(
 			body: JSON.stringify(request),
 		});
 	} catch (err) {
-		throw new WorkerTransportTransientError(
+		// No round trip completed at all — the control plane is unreachable rather than
+		// refusing (issue #611), so this retries on the lower-capped ladder.
+		throw new WorkerTransportUnreachableError(
 			`control plane handshake request failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
 	}
@@ -346,7 +490,19 @@ export async function performHandshake(
 		}
 		throw new WorkerSessionConflictError(reason);
 	}
-	throw new WorkerTransportTransientError(`control plane returned HTTP ${response.status}`);
+	throw transientErrorForStatus(response.status);
+}
+
+/**
+ * The transient error a retryable status maps to — the narrower unreachable variant
+ * when nothing behind the edge answered, so the connect loop can pick the matching
+ * backoff ladder (issue #611).
+ */
+function transientErrorForStatus(status: number): WorkerTransportTransientError {
+	const message = `control plane returned HTTP ${status}`;
+	return UNREACHABLE_STATUSES.has(status)
+		? new WorkerTransportUnreachableError(message)
+		: new WorkerTransportTransientError(message);
 }
 
 // --- Client -----------------------------------------------------------------
@@ -603,8 +759,9 @@ export function connectWorkerTransport(
 		return buildHandshakeRequest({ ...options, capabilities: refreshed });
 	}
 
+	const ladders = createReconnectLadders(backoff, deps.random);
+
 	const done = (async () => {
-		let attempt = 0;
 		let everConnected = false;
 		// The lease this daemon currently holds, presented on a reconnect handshake so
 		// the control plane recognises its own holder instead of refusing it for the
@@ -635,20 +792,24 @@ export function connectWorkerTransport(
 					if (!refreshedRequest) throw err;
 					request = refreshedRequest;
 				} else if (isFatalHandshakeError(err, everConnected)) throw err;
-				attempt += 1;
-				const delayMs = computeReconnectDelayMs(attempt, backoff, deps.random);
+				// An outage climbs only the lower-capped ladder (issue #611), so the daemon is
+				// never parked in a long delay it earned while nobody was home. `unreachable`
+				// names the ladder, so the line says on its face whether the control plane
+				// refused this attempt or never answered it.
+				const step = ladders.forHandshakeFailure(err);
 				deps.logger.warn('worker transport handshake failed; backing off before retry', {
-					attempt,
-					delayMs,
+					attempt: step.attempt,
+					unreachable: step.unreachable,
+					delayMs: step.delayMs,
 					error: err instanceof Error ? err.message : String(err),
 				});
-				if (!(await backoffSleep(delayMs))) break;
+				if (!(await backoffSleep(step.delayMs))) break;
 				continue;
 			}
 
 			if (stopped) break;
 			everConnected = true;
-			attempt = 0;
+			ladders.reset();
 			deps.logger.info('worker transport session established', {
 				workerId: session.workerId,
 				sessionId: session.sessionId,
@@ -670,8 +831,11 @@ export function connectWorkerTransport(
 				);
 			}
 
-			attempt += 1;
-			const delayMs = computeReconnectDelayMs(attempt, backoff, deps.random);
+			// A lost session steps the ordinary ladder, and both were just cleared by the
+			// handshake that opened it, so this is always its first rung. Whether the control
+			// plane is *gone* rather than merely done with us is the next handshake's answer
+			// to give, and that is what picks the ladder from there on.
+			const { delayMs } = ladders.forSessionLoss();
 			deps.logger.warn('worker transport session ended; reconnecting', {
 				end: describeSessionEnd(end),
 				delayMs,

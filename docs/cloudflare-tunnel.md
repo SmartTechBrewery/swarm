@@ -245,7 +245,10 @@ The client derives two endpoints from `SWARM_CONTROL_PLANE_URL`:
 - **`wss://swarm.example.com/worker/stream`** — a WebSocket carrying periodic
   heartbeat frames that keep the worker's session lease live (so the eligibility
   gate sees it as connected), reconnecting with exponential backoff on transport
-  loss.
+  loss. While the tunnel is answering `502`/`530` for a router that is restarting,
+  that backoff runs on its own low ceiling (5s, jittered) rather than the 30s one a
+  refusal earns — so a daemon re-establishes its session within a few seconds of the
+  origin coming back, however long the restart took (issue #611).
 
 > **`cloudflared` forwards WebSocket upgrades transparently.** No extra tunnel
 > configuration is needed for `/worker/stream`: the `Upgrade: websocket` request
