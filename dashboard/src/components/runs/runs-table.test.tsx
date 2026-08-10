@@ -309,6 +309,53 @@ describe('RunsTable', () => {
 		});
 	});
 
+	// issue #600 — a wall-clock kill is resumable, so it settles `deferred`; the
+	// list still has to answer "which runs hit the timeout".
+	describe('timed-out deferred runs', () => {
+		const timedOutRun: RunRow = {
+			...baseRun,
+			status: 'deferred',
+			timedOut: true,
+			exitCode: 124,
+			completedAt: null,
+		};
+
+		it('surfaces the timeout in both the desktop row and the mobile card', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[timedOutRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			expect(within(table).getByText('Timed out · retrying')).not.toBeNull();
+
+			const card = screen.getByTestId('run-card');
+			expect(within(card).getByText('Timed out · retrying')).not.toBeNull();
+			expect(within(card).queryByText('Deferred')).toBeNull();
+		});
+
+		it('leaves a run deferred for any other reason reading as plain "Deferred"', () => {
+			renderTable(
+				<RunsTable
+					runs={[{ ...timedOutRun, timedOut: false }]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const card = screen.getByTestId('run-card');
+			expect(within(card).getByText('Deferred')).not.toBeNull();
+			expect(within(card).queryByText(/Timed out/)).toBeNull();
+		});
+	});
+
 	// issue #523 — the machine a run is executing on, alongside its phase.
 	describe('worker machine', () => {
 		const onWorker: RunRow = { ...baseRun, workerId: 'worker-a', workerName: 'studio-mac' };

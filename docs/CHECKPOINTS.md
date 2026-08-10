@@ -267,7 +267,11 @@ recorded work left, and spends a bounded budget. So the dashboard renders it as 
 - **Its own badge.** A `Checkpointed` badge in the documented `sky` hue — the label, not the
   colour, carries the meaning (`ai/DESIGN_SYSTEM.md` §1) — with a tooltip saying it is waiting on
   a continuation rather than on quota. Both the Runs table and the run detail page use it, and
-  the Status filter offers it.
+  the Status filter offers it. When the stop was a wall-clock kill (`timed_out`, issue #596) the
+  same badge reads `Timed out · checkpointed`, keeping the hue and the "not waiting on quota"
+  tooltip, so the runs list can answer *which runs hit the timeout* for the resumable statuses a
+  timeout actually settles into (issue #600); `deferred` gets the equivalent `Timed out ·
+  retrying`.
 - **The hand-off itself.** The run detail page shows a **Checkpoint hand-off** panel: the
   remaining work numbered in the order a continuation works through it, what is already
   completed, the decisions carried over, and the working tree the checkpoint recorded — read off
