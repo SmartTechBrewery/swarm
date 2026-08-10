@@ -20,6 +20,8 @@ import {
 	createDispatch,
 	type DispatchRow,
 	getActiveDispatchByRunId,
+	listAvailabilityWaitsForWorker,
+	promoteDispatchToImmediateWake,
 	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
 } from '../db/repositories/dispatchesRepository.js';
@@ -219,6 +221,85 @@ export async function promoteNextCapacityDispatch(
 			projectId,
 			error: describeError(err),
 		});
+	}
+}
+
+/** What made a worker available, for the promotion's log line (issue #610). */
+export type WorkerAvailabilityCause =
+	/** Its authenticated `/worker/stream` socket opened on this router. */
+	| 'connected'
+	/** A dispatch bound to it settled, releasing its execution claim. */
+	| 'capacity-freed';
+
+/**
+ * After a worker becomes available — it connected, or a dispatch bound to it
+ * settled and released its claim — start the dispatches that were only waiting
+ * for exactly that (issue #610).
+ *
+ * A refusal from the eligibility gate is deferred on the dependency gate's
+ * 5-minute cadence, so before this a dispatch sat still next to an idle worker
+ * for up to a full interval. This is the availability wait's equivalent of the
+ * slot-release scheduling {@link promoteNextCapacityDispatch} does for the
+ * concurrency wait — with one real difference: a capacity wait is a `pending`
+ * row whose wake-up is simply (re)published, while these are `retry-scheduled`
+ * rows that already hold a live *delayed* wake-up, so the stale one has to be
+ * dealt with rather than merely overwritten.
+ *
+ * Hence the per-row order: **remove the delayed wake-up, then re-date the row,
+ * then publish the replacement**, so the dispatch never holds two live wake-ups
+ * at once. Removing first is safe in every race — a candidate's wake-up is still
+ * delayed by construction (`listAvailabilityWaitsForWorker`), and the re-date is
+ * refused unless the row is still on that exact wake sequence, so a row that
+ * moved on had this wake-up superseded anyway. Whatever a partial failure
+ * leaves behind, the reconciler's idempotent republish and the timed re-check
+ * are both still underneath it.
+ *
+ * Best-effort and fully swallowed, exactly like the capacity promotion: this
+ * runs off a settled run and off a socket open, and neither may be failed by a
+ * queue hiccup. Returns how many dispatches were promoted.
+ */
+export async function promoteAvailabilityWaitsForWorker(
+	workerId: string,
+	cause: WorkerAvailabilityCause,
+): Promise<number> {
+	try {
+		const waiting = await listAvailabilityWaitsForWorker(workerId);
+		if (waiting.length === 0) return 0;
+		const promoted: DispatchRow[] = [];
+		for (const dispatch of waiting) {
+			try {
+				await removePendingJobById(wakeJobId(dispatch));
+				const updated = await promoteDispatchToImmediateWake(dispatch.id, dispatch.wakeSeq);
+				// Claimed, cancelled, or already promoted by another worker's wake-up
+				// between the read and here — leave it to whoever won.
+				if (!updated) continue;
+				await publishDispatchWakeUp(updated);
+				promoted.push(updated);
+			} catch (err) {
+				logger.warn('dispatch: could not wake an availability-blocked dispatch', {
+					workerId,
+					cause,
+					dispatchId: dispatch.id,
+					error: describeError(err),
+				});
+			}
+		}
+		if (promoted.length > 0) {
+			logger.info('dispatch: worker became available — woke availability-blocked dispatches', {
+				workerId,
+				cause,
+				promoted: promoted.length,
+				taskIds: promoted.map((row) => row.taskId ?? row.id),
+			});
+		}
+		return promoted.length;
+	} catch (err) {
+		logger.warn('dispatch: availability promotion failed', {
+			workerId,
+			cause,
+			error: describeError(err),
+		});
+		return 0;
 	}
 }
 

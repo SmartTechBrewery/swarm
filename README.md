@@ -54,7 +54,12 @@ GitHub → HTTPS webhook → Router → durable Postgres dispatch → Redis wake
   with the credential printed once by `swarm workers register`
   (`SWARM_WORKER_CREDENTIAL`); the selected host atomically reserves capacity
   before the phase can start. A project with no enrolled, connected worker has
-  nowhere to run: its dispatch waits durably until one enrolls.
+  nowhere to run: its dispatch waits durably until one enrolls. **A wait for a
+  machine ends as soon as one turns up** — a worker connecting, or finishing a run
+  and freeing its slot, starts the dispatches that were only waiting for that
+  rather than leaving them to the next re-check (issue #610); a wait for a *human*
+  (consent, an enrollment, a permitted phase) keeps the timed cadence, since
+  nothing a machine does can clear it.
 - Pending work is durable in Postgres; Redis carries wake-ups, not the source
   of truth. See [`docs/pipeline.md`](./docs/pipeline.md) for lifecycle details.
 - **Dispatch always runs on the control plane (ADR-003 §2).** The **router**

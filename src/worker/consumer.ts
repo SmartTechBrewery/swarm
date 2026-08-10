@@ -59,6 +59,7 @@ import {
 	createAndPublishDispatch,
 	DISPATCH_LEASE_OWNER,
 	parseDispatchPayload,
+	promoteAvailabilityWaitsForWorker,
 	promoteNextCapacityDispatch,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
@@ -3229,6 +3230,10 @@ export async function processJob(
 	let slot: SlotAcquisition = { acquired: true, tracked: false };
 
 	let runId: string | undefined;
+	// The worker whose execution claim this dispatch holds, once the fenced bind
+	// persisted one. Declared out here so the `finally` can wake whatever was
+	// waiting on that machine the moment the claim is released (issue #610).
+	let claimedWorkerId: string | undefined;
 	// A deferred outcome hands the run to `reenqueueDeferred`, which relies on
 	// this durable marker to prevent a termination racing that queue hand-off
 	// from resurrecting the run. Terminal outcomes consume the marker here.
@@ -3291,8 +3296,13 @@ export async function processJob(
 			selection,
 			executionIdentity: selection ? bindIdentity : undefined,
 		};
-		if (selection) await bindSelectedWorker(dispatch, selection, bindIdentity);
-		if (!selection) {
+		if (selection) {
+			await bindSelectedWorker(dispatch, selection, bindIdentity);
+			// The claim that bind persisted *is* the worker's capacity (an active,
+			// unexpired dispatch claim), so from here on this dispatch settling frees a
+			// slot on that machine — which is what the `finally` promotes on (#610).
+			claimedWorkerId = selection.workerId;
+		} else {
 			slot = await acquireProjectSlot(project.id, project.maxConcurrentJobs);
 			if (!slot.acquired) return handleConcurrencyDeferral(dispatch, job, trigger, project);
 		}
@@ -3453,6 +3463,16 @@ export async function processJob(
 				project.id,
 				project.pipeline?.prioritizeContinuations !== false,
 			);
+		}
+		// The same move for the *worker* whose claim this dispatch held (issue #610):
+		// it has just settled — success, failure, cancellation, or deferral alike — so
+		// that machine has capacity again and whatever was deferred waiting for it can
+		// start now instead of at the end of its 5-minute re-check interval. This is
+		// the capacity-freed signal for a federated transport worker too: the settle
+		// happens here, after the remote phase reported its result. Fully swallowed
+		// inside the promotion — a queue hiccup must never fail a settled run.
+		if (claimedWorkerId) {
+			await promoteAvailabilityWaitsForWorker(claimedWorkerId, 'capacity-freed');
 		}
 		inFlightTaskIds.delete(trigger.taskId);
 	}

@@ -73,6 +73,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		// By default this router is awaiting the dispatch and pushed it to WORKER_ID,
 		// so a stream-log from that socket is authorized (issue #544 review, F1).
 		resolveDispatchStreamTarget: vi.fn(() => ({ workerId: WORKER_ID, runId: RUN_ID })),
+		onWorkerAvailable: vi.fn(),
 		...overrides,
 	};
 }
@@ -535,6 +536,42 @@ describe('GET /worker/stream connected-worker registry lifecycle', () => {
 		expect(ws.close).toHaveBeenCalledWith(WS_CLOSE.UNAUTHORIZED, 'unauthorized');
 		expect(isWorkerConnected(WORKER_ID)).toBe(false);
 		expect(sendToWorker(WORKER_ID, { type: 'heartbeat-ack' })).toBe(false);
+		// Nothing became available, so nothing is woken (issue #610).
+		expect(deps.onWorkerAvailable).not.toHaveBeenCalled();
+	});
+
+	// Issue #610. A worker connecting is one of the two moments that clears an
+	// availability wait, and the socket open is where the control plane learns it.
+	it('wakes the availability-blocked dispatches once an authenticated socket opens', async () => {
+		const deps = makeDeps();
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+
+		handlers.onOpen?.({}, fakeWs());
+
+		expect(deps.onWorkerAvailable).toHaveBeenCalledWith(WORKER_ID);
+	});
+
+	it('keeps the socket registered when waking throws — connectivity does not depend on it', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			onWorkerAvailable: vi.fn(() => {
+				throw new Error('postgres is down');
+			}),
+		});
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+
+		expect(() => handlers.onOpen?.({}, ws)).not.toThrow();
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(warnSpy).toHaveBeenCalled();
+
+		warnSpy.mockRestore();
 	});
 
 	// Regression: a back-channel frame (task-execution-result/-progress/-ack,
