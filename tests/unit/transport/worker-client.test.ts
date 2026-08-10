@@ -9,6 +9,7 @@ import {
 	buildHeartbeatFrame,
 	computeReconnectDelayMs,
 	connectWorkerTransport,
+	createReconnectLadders,
 	DEFAULT_BACKOFF,
 	deriveTransportUrls,
 	type FetchResponse,
@@ -20,6 +21,8 @@ import {
 	WorkerTransportAuthError,
 	type WorkerTransportOverrides,
 	WorkerTransportProtocolError,
+	WorkerTransportTransientError,
+	WorkerTransportUnreachableError,
 	withSessionReclaim,
 } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
@@ -226,6 +229,66 @@ describe('computeReconnectDelayMs', () => {
 	});
 });
 
+// Issue #611: the two ladders, and which failure belongs on which. A control plane
+// that answers and refuses keeps the ordinary 30s schedule; one that answers nothing
+// climbs a separate, lower-capped one, so the wait after an outage is bounded by that
+// ceiling rather than by how long the outage lasted.
+describe('createReconnectLadders', () => {
+	const unanswered = new WorkerTransportUnreachableError('control plane returned HTTP 502');
+	const refusal = new WorkerTransportTransientError('control plane returned HTTP 500');
+
+	it('holds the unreachable ladder to its own lower ceiling, jitter floor intact', () => {
+		const ladders = createReconnectLadders(DEFAULT_BACKOFF, () => 0);
+		const delays = Array.from(
+			{ length: 20 },
+			() => ladders.forHandshakeFailure(unanswered).delayMs,
+		);
+		expect(delays.slice(0, 4)).toEqual([500, 1_000, 2_000, 2_500]);
+		for (const delayMs of delays) {
+			expect(delayMs).toBeLessThanOrEqual(DEFAULT_BACKOFF.unreachableMaxMs);
+			// Stampede protection survives the lower cap: no daemon ever retries a
+			// recovering control plane at a near-zero delay.
+			expect(delayMs).toBeGreaterThanOrEqual(DEFAULT_BACKOFF.baseMs / 2);
+		}
+		const spread = Array.from({ length: 20 }, (_, i) =>
+			createReconnectLadders(DEFAULT_BACKOFF, () => i / 20).forHandshakeFailure(unanswered),
+		);
+		expect(new Set(spread.map((step) => step.delayMs)).size).toBeGreaterThan(1);
+	});
+
+	it('does not let an outage advance the refusal ladder', () => {
+		const ladders = createReconnectLadders(DEFAULT_BACKOFF, () => 0);
+		for (let i = 0; i < 40; i += 1) ladders.forHandshakeFailure(unanswered);
+		// The control plane comes back and refuses: the ordinary ladder is still at its
+		// first rung, not at the ceiling a single shared counter would have reached.
+		expect(ladders.forHandshakeFailure(refusal)).toEqual({
+			attempt: 1,
+			delayMs: 500,
+			unreachable: false,
+		});
+	});
+
+	it('keeps the refusal ladder’s existing shape, and clears the unreachable one on any answer', () => {
+		const ladders = createReconnectLadders(DEFAULT_BACKOFF, () => 0);
+		const refusals = [1, 2, 3].map(() => ladders.forHandshakeFailure(refusal).delayMs);
+		expect(refusals).toEqual([500, 1_000, 2_000]);
+		// Those answers proved the control plane reachable, so a fresh outage starts at
+		// the bottom of the unreachable ladder...
+		expect(ladders.forHandshakeFailure(unanswered).delayMs).toBe(500);
+		// ...while the refusal ladder carries on from exactly where it was.
+		expect(ladders.forHandshakeFailure(refusal).attempt).toBe(4);
+	});
+
+	it('steps the ordinary ladder for a lost session, and clears both on a success', () => {
+		const ladders = createReconnectLadders(DEFAULT_BACKOFF, () => 0);
+		expect(ladders.forSessionLoss()).toEqual({ attempt: 1, delayMs: 500, unreachable: false });
+		ladders.forHandshakeFailure(unanswered);
+		ladders.reset();
+		expect(ladders.forSessionLoss().attempt).toBe(1);
+		expect(ladders.forHandshakeFailure(unanswered).attempt).toBe(1);
+	});
+});
+
 describe('performHandshake', () => {
 	function depsWith(fetch: WorkerTransportOverrides['fetch']): WorkerTransportOverrides {
 		return {
@@ -299,6 +362,31 @@ describe('performHandshake', () => {
 		expect((err as Error).message).toContain('declared capabilities drop a CLI');
 		expect((err as Error).message).toContain('codex');
 		expect((err as Error).message).toContain('SWARM_WORKER_TRANSPORT_CLIS');
+	});
+
+	// Issue #611: the transient half splits on whether anything actually answered,
+	// because that is what picks the retry ladder.
+	it.each([
+		502, 503, 504, 522, 530,
+	])('maps HTTP %i — an edge answering for an origin that is not there — to unreachable', async (status) => {
+		const deps = depsWith(vi.fn().mockResolvedValue(jsonResponse(status, {})));
+		const err = await performHandshake(deps, 'http://cp/worker/session', request).catch((e) => e);
+		expect(err).toBeInstanceOf(WorkerTransportUnreachableError);
+		expect((err as Error).message).toContain(`HTTP ${status}`);
+	});
+
+	it('maps a request that never completed to an unreachable failure', async () => {
+		const deps = depsWith(vi.fn().mockRejectedValue(new Error('fetch failed')));
+		const err = await performHandshake(deps, 'http://cp/worker/session', request).catch((e) => e);
+		expect(err).toBeInstanceOf(WorkerTransportUnreachableError);
+		expect((err as Error).message).toContain('fetch failed');
+	});
+
+	it('leaves a status the control plane generated itself on the ordinary transient class', async () => {
+		const deps = depsWith(vi.fn().mockResolvedValue(jsonResponse(500, {})));
+		const err = await performHandshake(deps, 'http://cp/worker/session', request).catch((e) => e);
+		expect(err).toBeInstanceOf(WorkerTransportTransientError);
+		expect(err).not.toBeInstanceOf(WorkerTransportUnreachableError);
 	});
 
 	it('treats an unrecognized 200 body as a protocol mismatch', async () => {
@@ -508,6 +596,124 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 
 		await vi.advanceTimersByTimeAsync(500);
 		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(sockets).toHaveLength(1);
+
+		await client.stop();
+	});
+
+	// Issue #611's acceptance criterion, pinned end to end: what a worker waits once
+	// the control plane is reachable again must not scale with how long it was
+	// unreachable. A single shared counter put a two-minute outage at the 30s ceiling,
+	// so the daemon idled there after the router was already serving.
+	it('pins the post-outage reconnect to the unreachable cap, however long the outage lasted', async () => {
+		const TICK_MS = 100;
+		const GIVE_UP_MS = 120_000;
+
+		/** Advance the fake clock in small ticks until one more handshake is attempted. */
+		async function tickUntilAttempt(mock: ReturnType<typeof vi.fn>): Promise<number> {
+			const before = mock.mock.calls.length;
+			let elapsedMs = 0;
+			while (mock.mock.calls.length === before && elapsedMs < GIVE_UP_MS) {
+				await vi.advanceTimersByTimeAsync(TICK_MS);
+				elapsedMs += TICK_MS;
+			}
+			return elapsedMs;
+		}
+
+		/**
+		 * Run a daemon through an outage of `outageMs` — an edge answering 502 for an
+		 * origin that is not there — and report the gap the ladder has reached by then
+		 * (the delay a returning control plane finds it sitting in) plus how long it
+		 * actually idles once the control plane starts serving.
+		 */
+		async function outageProbe(
+			outageMs: number,
+		): Promise<{ retryGapMs: number; idleAfterRecoveryMs: number }> {
+			const seen: FakeSocket[] = [];
+			const outageFetch = vi.fn().mockResolvedValue(jsonResponse(502, {}));
+			const client = connectWorkerTransport(
+				{ ...options, capabilities: ['claude'] },
+				{
+					fetch: outageFetch,
+					createWebSocket: (url, headers) => {
+						const socket = new FakeSocket(url, headers);
+						seen.push(socket);
+						return socket;
+					},
+					random: () => 0,
+					logger: silentLogger,
+				},
+			);
+			await flush();
+			await vi.advanceTimersByTimeAsync(outageMs);
+
+			// Land on an attempt, then time the whole cycle that follows it.
+			await tickUntilAttempt(outageFetch);
+			const retryGapMs = await tickUntilAttempt(outageFetch);
+
+			// The router comes back while the daemon sits in the delay it just scheduled.
+			// That delay is the whole of the idle gap this issue is about.
+			outageFetch.mockResolvedValue(jsonResponse(200, handshakeResponseBody(4)));
+			let idleAfterRecoveryMs = 0;
+			while (seen.length === 0 && idleAfterRecoveryMs < GIVE_UP_MS) {
+				await vi.advanceTimersByTimeAsync(TICK_MS);
+				idleAfterRecoveryMs += TICK_MS;
+			}
+			await client.stop();
+			return { retryGapMs, idleAfterRecoveryMs };
+		}
+
+		const brief = await outageProbe(3_000);
+		const long = await outageProbe(600_000);
+
+		// The ladder stopped growing: a two-hundred-times-longer outage leaves exactly the
+		// same delay scheduled. Under one shared counter these differed by ~4x.
+		expect(long.retryGapMs).toBe(brief.retryGapMs);
+		// ...and that delay — the whole of the post-outage idle — is held to the low cap.
+		expect(long.retryGapMs).toBeLessThanOrEqual(DEFAULT_BACKOFF.unreachableMaxMs);
+		// ...while the equal-jitter floor keeps it above half the cap, so a fleet still
+		// spreads its retries instead of stampeding a control plane that has just come up.
+		expect(long.retryGapMs).toBeGreaterThanOrEqual(DEFAULT_BACKOFF.unreachableMaxMs / 2);
+		for (const probe of [brief, long]) {
+			expect(probe.idleAfterRecoveryMs).toBeLessThanOrEqual(DEFAULT_BACKOFF.unreachableMaxMs);
+		}
+	});
+
+	// The other half of the criterion: a refusal the control plane *answers* is
+	// untouched by the outage that preceded it.
+	it('starts the ordinary ladder at its first rung when a long outage ends in a refusal', async () => {
+		// Down, then answering exactly one refusal it generated itself, then healthy.
+		let stage: 'outage' | 'refusing' | 'healthy' = 'outage';
+		fetch.mockImplementation(async () => {
+			if (stage === 'outage') return jsonResponse(502, {});
+			if (stage === 'refusing') {
+				stage = 'healthy';
+				return jsonResponse(500, {});
+			}
+			return jsonResponse(200, handshakeResponseBody(4));
+		});
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await flush();
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(sockets).toHaveLength(0);
+
+		// The control plane starts answering. The daemon reaches it within the unreachable
+		// ceiling rather than after a wait the two-minute outage earned.
+		stage = 'refusing';
+		const beforeRefusal = fetch.mock.calls.length;
+		let waitedMs = 0;
+		while (fetch.mock.calls.length === beforeRefusal && waitedMs < 120_000) {
+			await vi.advanceTimersByTimeAsync(100);
+			waitedMs += 100;
+		}
+		expect(waitedMs).toBeLessThanOrEqual(DEFAULT_BACKOFF.unreachableMaxMs);
+
+		// That answer was a refusal, so it steps the *ordinary* ladder — from its first
+		// rung (500ms with random 0), because the outage never touched it. A single shared
+		// counter would have been sitting at the 30s ceiling here.
+		await vi.advanceTimersByTimeAsync(499);
+		expect(sockets).toHaveLength(0);
+		await vi.advanceTimersByTimeAsync(1);
 		expect(sockets).toHaveLength(1);
 
 		await client.stop();
