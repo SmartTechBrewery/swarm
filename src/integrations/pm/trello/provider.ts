@@ -784,7 +784,7 @@ export class TrelloPMProvider implements PMProvider {
 /**
  * Build the Trello PM provider for a project. The one construction seam callers
  * use, so they depend on the `PMProvider` interface rather than the concrete
- * class — and, once a manifest exists, what `createProvider` points at.
+ * class — and what the manifest's `createProvider` points at (`./index.ts`).
  */
 export function createTrelloProvider(project: ProjectConfig): PMProvider {
 	return new TrelloPMProvider(project);

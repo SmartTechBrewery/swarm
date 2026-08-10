@@ -29,7 +29,8 @@ GitHub / Bitbucket / GitLab → HTTPS webhook → Router → durable Postgres di
 ```
 
 - Planning and Implementation start from project-board status changes — on GitHub
-  Projects, a Linear board (issue #530), or a Jira project (issue #580).
+  Projects, a Linear board (issue #530), a Jira project (issue #580), or a Trello
+  board (issue #588).
 - Review starts when a SWARM-managed pull request opens or its checks complete.
 - Respond-to-review and Respond-to-CI start from pull-request lifecycle events.
 - The worker runs `claude`, `agy` (Antigravity), or `codex` in an isolated
@@ -82,7 +83,8 @@ GitHub / Bitbucket / GitLab → HTTPS webhook → Router → durable Postgres di
 - Authenticated agent CLIs (`claude`, `agy`, and/or `codex`)
 - A source-control repository on GitHub, Bitbucket Cloud, or gitlab.com — named by the
   project's `scm` field, which every project must set — and a project-management board with a
-  webhook: a GitHub Projects v2 board, a Linear team, or a Jira Cloud project
+  webhook: a GitHub Projects v2 board, a Linear team, a Jira Cloud project, or a
+  Trello board
 - Two distinct source-control identities for loop prevention: the worker operator's
   own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN` /
   `SWARM_OPERATOR_GITLAB_TOKEN`, the implementer persona) set in `.env` on each host,
@@ -95,7 +97,11 @@ GitHub / Bitbucket / GitLab → HTTPS webhook → Router → durable Postgres di
   required `credentials.pm.email`, `credentials.pm.apiToken`, and
   `credentials.pm.webhookSecret` roles (conventionally `JIRA_EMAIL`,
   `JIRA_API_TOKEN`, and `JIRA_WEBHOOK_SECRET`), since Jira Cloud authenticates
-  with basic auth. Every board read,
+  with basic auth; Trello uses the required `credentials.pm.apiKey`,
+  `credentials.pm.token`, and `credentials.pm.webhookSecret` roles (conventionally
+  `TRELLO_API_KEY`, `TRELLO_TOKEN`, and `TRELLO_API_SECRET` — the last being
+  Trello's API secret, which signs its deliveries), since Trello authenticates with
+  a key/token pair. Every board read,
   write, and dashboard discovery authenticates with the selected provider's
   credential, configurable from the dashboard's **Project Management** tab. See
   [`docs/configuration.md`](docs/configuration.md)
@@ -284,11 +290,10 @@ Configuration has three layers:
 - `.env` — host and process settings such as database, Redis, ports, logging,
   dashboard authentication, and credential encryption.
 - `swarm.config.json` — per-project repository, worktree, board mapping (`pm`, one
-  member per PM provider — GitHub Projects, Linear, or Jira, plus Trello's, which
-  parses ahead of that provider being registered), credential references (the
-  SCM reviewer/webhook pair plus the PM provider's own roles under
-  `credentials.pm`), agent, and pipeline settings. Apply changes with
-  `npm run db:seed` or `swarm config apply`.
+  member per PM provider — GitHub Projects, Linear, Jira, or Trello, all four
+  selectable), credential references (the SCM reviewer/webhook pair plus the PM
+  provider's own roles under `credentials.pm`), agent, and pipeline settings.
+  Apply changes with `npm run db:seed` or `swarm config apply`.
 - Dashboard global settings — app-wide settings stored in Postgres and edited
   through the dashboard API.
 

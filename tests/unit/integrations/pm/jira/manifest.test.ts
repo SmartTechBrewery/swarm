@@ -23,7 +23,12 @@ describe('jira manifest registration', () => {
 	});
 
 	it('registers alongside the providers already there rather than replacing them', () => {
-		expect(listPMProviders().map((m) => m.id)).toEqual(['github-projects', 'linear', 'jira']);
+		expect(listPMProviders().map((m) => m.id)).toEqual([
+			'github-projects',
+			'linear',
+			'jira',
+			'trello',
+		]);
 	});
 
 	it('declares the expected identity', () => {

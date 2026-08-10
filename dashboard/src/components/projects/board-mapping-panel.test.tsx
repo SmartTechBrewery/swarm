@@ -90,6 +90,7 @@ const PROVIDERS = [
 	{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
 	{ id: 'linear', label: 'Linear', discovery: ['containers', 'states'] },
 	{ id: 'jira', label: 'Jira', discovery: ['containers', 'states'] },
+	{ id: 'trello', label: 'Trello', discovery: ['containers', 'states'] },
 ];
 
 const CONFIG: ProjectPm = {
@@ -387,6 +388,81 @@ describe('BoardMappingPanel (issue #201)', () => {
 			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
 			await waitFor(() => expect(screen.getByText(/pm\.baseUrl/)).not.toBeNull());
 			expect(save.disabled).toBe(true);
+		});
+	});
+
+	// Issue #588: the fourth provider through the same panel. Trello's nouns come from
+	// the catalogue too — a card's status is the *list* it sits in — and, like Linear,
+	// it carries no provider context, so Save needs nothing beyond a board and a list.
+	describe('with a Trello project', () => {
+		const TRELLO_CONFIG: ProjectPm = {
+			type: 'trello',
+			boardId: '5f2b1c8e9d4a3b2c1e0f9a8b',
+			statusOptions: { todo: '6a1b2c3d4e5f60718293a4b5' },
+		};
+
+		beforeEach(() => {
+			discoverContainersFn.mockResolvedValue({
+				containers: [{ id: '5f2b1c8e9d4a3b2c1e0f9a8b', name: 'SWARM Board' }],
+			});
+			// Trello's state discovery returns no `providerContext` — a list id is the
+			// whole mapping.
+			discoverStatesFn.mockResolvedValue({
+				states: [
+					{ id: '6a1b2c3d4e5f60718293a4b5', name: 'Ready' },
+					{ id: '7b2c3d4e5f60718293a4b5c6', name: 'Done' },
+				],
+			});
+		});
+
+		it('uses Trello’s nouns and renders its discovered boards and lists', async () => {
+			renderHarness({ initial: TRELLO_CONFIG });
+
+			await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
+			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('trello');
+			const boardSelect = (await screen.findByLabelText(/Trello board/i)) as HTMLSelectElement;
+			// jsdom ignores a value with no matching option, so wait for the discovered one.
+			await screen.findByRole('option', { name: 'SWARM Board' });
+			expect(boardSelect.value).toBe('5f2b1c8e9d4a3b2c1e0f9a8b');
+			expect(
+				screen.getByText(/Map each SWARM pipeline status to one of the board's lists/),
+			).not.toBeNull();
+			await waitFor(() =>
+				expect(discoverStatesFn).toHaveBeenCalledWith({
+					projectId: 'p1',
+					containerId: '5f2b1c8e9d4a3b2c1e0f9a8b',
+				}),
+			);
+			// The state selectors are labelled with the provider's own noun, not "status".
+			const readySelect = (await screen.findByLabelText('Ready list')) as HTMLSelectElement;
+			await waitFor(() => expect(readySelect.disabled).toBe(false));
+			expect(within(readySelect).getByRole('option', { name: 'Ready' })).not.toBeNull();
+		});
+
+		it('enables Save on an edited mapping and submits the Trello member', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({ initial: TRELLO_CONFIG, onSubmit });
+
+			const save = () => screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			// Unchanged from the stored mapping — saveable, but nothing to save yet.
+			expect(save().disabled).toBe(true);
+
+			const doneSelect = (await screen.findByLabelText('Done list')) as HTMLSelectElement;
+			await waitFor(() => expect(doneSelect.disabled).toBe(false));
+			fireEvent.change(doneSelect, { target: { value: '7b2c3d4e5f60718293a4b5c6' } });
+
+			// List discovery returned no `providerContext`, and Save enables anyway.
+			await waitFor(() => expect(save().disabled).toBe(false));
+			fireEvent.click(save());
+
+			expect(onSubmit).toHaveBeenCalledWith({
+				type: 'trello',
+				boardId: '5f2b1c8e9d4a3b2c1e0f9a8b',
+				statusOptions: {
+					todo: '6a1b2c3d4e5f60718293a4b5',
+					done: '7b2c3d4e5f60718293a4b5c6',
+				},
+			});
 		});
 	});
 

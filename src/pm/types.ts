@@ -27,14 +27,16 @@
  */
 
 /**
- * Every PM provider id SWARM's shared surface recognizes. Vocabulary only —
- * widened past the one implemented provider exactly as `ScmType`
+ * Every PM provider id SWARM's shared surface recognizes. It was widened past the
+ * one implemented provider as *vocabulary* first, exactly as `ScmType`
  * (`src/scm/types.ts`) named `bitbucket`/`gitlab` before either registered, so a
  * new connector's own issue adds a folder and a manifest rather than editing the
- * shared type. Nothing resolves `jira`/`linear`/`trello` until their manifests
- * register: `getPMProvider` returns `null` and
+ * shared type. All four now have one — `linear` (issue #530), `jira` (#580), and
+ * `trello` (#588) — so every value resolves; an id whose manifest is *not*
+ * registered still makes `getPMProvider` return `null` and
  * {@link import('../integrations/pm/registry.js').requireProjectPMProvider}
- * throws a wiring-bug error.
+ * throw a wiring-bug error, which is how the next provider's phases stay
+ * unreachable until it is complete.
  */
 export type PMType = 'github-projects' | 'jira' | 'linear' | 'trello';
 

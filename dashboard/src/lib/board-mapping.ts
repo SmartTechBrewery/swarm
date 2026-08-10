@@ -17,7 +17,8 @@ export interface BoardMappingForm {
 	providerId: string;
 	/**
 	 * Selected board/container opaque id — a Projects v2 node ID for GitHub, a team
-	 * UUID for Linear, a project key for Jira. Blank = unselected.
+	 * UUID for Linear, a project key for Jira, a board id for Trello. Blank =
+	 * unselected.
 	 */
 	containerId: string;
 	/** Discovered state id per canonical status; blank = unmapped. */
@@ -38,6 +39,7 @@ export interface BoardMappingForm {
 type GitHubProjectsPm = Extract<ProjectPm, { type: 'github-projects' }>;
 type LinearPm = Extract<ProjectPm, { type: 'linear' }>;
 type JiraPm = Extract<ProjectPm, { type: 'jira' }>;
+type TrelloPm = Extract<ProjectPm, { type: 'trello' }>;
 
 /**
  * The six canonical pipeline status keys (`PM_STATUS_KEYS` — the single source
@@ -122,6 +124,18 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		intro:
 			"Pick this project's Jira project, then map each SWARM pipeline status to one of its workflow statuses. Projects and statuses are discovered server-side with this project's own board credential, configured under Credentials above. The Jira site URL is board identity, set in swarm.config.json and preserved by this screen.",
 	},
+	{
+		id: 'trello',
+		label: 'Trello',
+		containerNoun: 'board',
+		containerNounPlural: 'boards',
+		// A Trello card has no status field: its status *is* the list it sits in, so
+		// the state noun is the provider's own "list" (issue #588).
+		stateNoun: 'list',
+		stateNounPlural: 'lists',
+		intro:
+			"Pick this project's Trello board, then map each SWARM pipeline status to one of the board's lists — a card's status is the list it sits in. Boards and lists are discovered server-side with this project's own board credential, configured under Credentials above.",
+	},
 ];
 
 export const DEFAULT_PM_PROVIDER_ID = PM_MAPPING_PROVIDERS[0].id;
@@ -145,9 +159,9 @@ function selectedProviderId(form: BoardMappingForm): string {
 /**
  * Whether the selected provider threads an opaque Status *field* id through
  * `providerContext`. GitHub Projects' option ids are scoped to one single-select
- * field, so its mapping is incomplete without that id; Linear's workflow-state
- * UUID is the whole mapping and its state discovery deliberately returns no
- * context, so a Linear mapping must not be gated on one.
+ * field, so its mapping is incomplete without that id; a Linear workflow-state UUID
+ * and a Trello list id are each the whole mapping and neither provider's state
+ * discovery returns any context, so their mappings must not be gated on one.
  */
 function usesStatusFieldContext(form: BoardMappingForm): boolean {
 	return selectedProviderId(form) === 'github-projects';
@@ -233,15 +247,17 @@ export function withSelectedContainer(
  * round-trip even when discovery can't currently reach the board.
  *
  * Provider-specific fields are read only after narrowing: the neutral
- * `containerId` is GitHub's board node id, Linear's team UUID, or Jira's project
- * key depending on the member, and `providerContext` carries whichever second
- * value that member has — GitHub's Status field id (issue #531) or Jira's site
- * base URL (issue #581), never both.
+ * `containerId` is GitHub's board node id, Linear's team UUID, Jira's project key,
+ * or Trello's board id depending on the member, and `providerContext` carries
+ * whichever second value that member has — GitHub's Status field id (issue #531)
+ * or Jira's site base URL (issue #581), never both, and neither for Linear or
+ * Trello, whose state ids are the whole mapping.
  */
 export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm {
 	const githubProjects = pm?.type === 'github-projects' ? pm : undefined;
 	const linear = pm?.type === 'linear' ? pm : undefined;
 	const jira = pm?.type === 'jira' ? pm : undefined;
+	const trello = pm?.type === 'trello' ? pm : undefined;
 	const statusOptions = blankStatusOptions();
 	for (const key of STATUS_KEYS) {
 		const value = pm?.statusOptions?.[key];
@@ -249,7 +265,8 @@ export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm 
 	}
 	return {
 		providerId: pm?.type ?? DEFAULT_PM_PROVIDER_ID,
-		containerId: githubProjects?.projectId ?? linear?.teamId ?? jira?.projectKey ?? '',
+		containerId:
+			githubProjects?.projectId ?? linear?.teamId ?? jira?.projectKey ?? trello?.boardId ?? '',
 		statusOptions,
 		providerContext: githubProjects?.statusFieldId
 			? { statusFieldId: githubProjects.statusFieldId }
@@ -289,6 +306,13 @@ export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | unde
 	if (selectedProviderId(form) === 'linear') {
 		const linear: LinearPm = { type: 'linear', teamId: containerId, statusOptions };
 		return linear;
+	}
+	if (selectedProviderId(form) === 'trello') {
+		// The board id and the list ids are the whole mapping — a Trello card has no
+		// status field, so there is no field scope to carry and nothing from
+		// `providerContext` belongs on this member.
+		const trello: TrelloPm = { type: 'trello', boardId: containerId, statusOptions };
+		return trello;
 	}
 	if (selectedProviderId(form) === 'jira') {
 		// The site URL isn't edited here: it comes from the form's carried context,
@@ -346,7 +370,8 @@ export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | unde
  * Whether the form can be saved: a container is selected and at least one
  * canonical status is mapped — matching every provider schema's "at least one
  * option" minimum (`githubProjectsConfigSchema`, `linearConfigSchema`,
- * `jiraConfigSchema`) rather than requiring every status be mapped — plus each
+ * `jiraConfigSchema`, `trelloConfigSchema`) rather than requiring every status be
+ * mapped — plus each
  * provider's own required context: a known Status-field context for GitHub Projects,
  * a carried site base URL for Jira. The route additionally gates Save on the form
  * being dirty and no other config write being in flight.

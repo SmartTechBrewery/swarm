@@ -24,10 +24,10 @@
  *   signature input.
  * - **The secret is Trello's API secret**, not a per-webhook secret SWARM
  *   generates: Trello signs every delivery for an integration with the secret
- *   paired to its API key. It is declared under `PM_WEBHOOK_SECRET_ROLE`
- *   (`../manifest.ts`) in phase 5 because the receiver resolves exactly that one
- *   role for a verifier — the role name is the receiver's vocabulary, and the
- *   credential behind it is Trello's.
+ *   paired to its API key. The manifest (`./index.ts`) declares it under
+ *   `PM_WEBHOOK_SECRET_ROLE` (`../manifest.ts`) because the receiver resolves
+ *   exactly that one role for a verifier — the role name is the receiver's
+ *   vocabulary, and the credential behind it is Trello's `TRELLO_API_SECRET`.
  *
  * **No replay-window check**, for the same reason Linear's verifier carries none:
  * a board event is only a doorbell, and the pipeline re-reads the card's state

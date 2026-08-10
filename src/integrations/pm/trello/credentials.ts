@@ -12,10 +12,10 @@
  *
  * Roles are resolved through the *registered manifest*: `requirePmCredential`
  * validates the role against `PMProviderManifest.credentialRoles` for
- * `project.pm.type` (`src/config/provider.ts`, issue #497). Trello registers no
- * manifest until the provider is complete (ai/RULES.md §2 "Register when the
- * contract is satisfied"), so this resolves for real only from that phase on; until
- * then the provider's own unit suite mocks `@/config/provider.js`.
+ * `project.pm.type` (`src/config/provider.ts`, issue #497) — which `./index.ts`
+ * registers as of issue #588, so both roles below resolve for real. The provider's
+ * own unit suite still mocks `@/config/provider.js`, so it exercises this module
+ * without a secret store.
  *
  * The **webhook-secret role is not declared here**: Trello signs each delivery with
  * the integration's *API secret*, but SWARM's receiver resolves exactly one role for
