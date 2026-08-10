@@ -169,7 +169,7 @@ should wait on.
 - Chat needs its own persistence. Reusing the `runs` table is rejected: `taskId`
   and `phase` are `NOT NULL` and the whole pipeline read model is built on those
   rows, so chat turns would pollute run history and dispatch semantics.
-- `--dangerously-skip-permissions` is currently unconditional in `DEFAULT_ARGS`
+- `--dangerously-skip-permissions` is currently unconditional in the harness's default arguments
   for every CLI. Chat inherits it unless the harness is parameterized, which is
   the security question below.
   **Resolved since (issue #614):** it no longer is. The per-CLI permission /

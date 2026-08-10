@@ -38,7 +38,7 @@ it. Under `worktree`, bash is auto-allowed **because** it is sandboxed.
 
 | CLI | Contained? | How | What it costs |
 | --- | --- | --- | --- |
-| `codex` | **Yes** | A SWARM-owned permission profile supplied through `-c` overrides: `permissions.swarm-worktree.extends=":workspace"` + `.network.enabled=true`, selected with `-c default_permissions="swarm-worktree"` | `git add` is denied (`.git` is read-only). Network is all-or-nothing — no per-domain scoping. Reads outside the worktree stay allowed. |
+| `codex` | **Yes** | A SWARM-owned permission profile supplied through `-c` overrides: `permissions.swarm-worktree.extends=":workspace"` + `.network.enabled=true`, selected with `-c default_permissions="swarm-worktree"`. Its resolved common `.git` directory is an additional workspace root so `git pull` works in a linked worktree. | The task's shared Git metadata is writable, so the agent could alter refs or objects even though every phase prompt forbids committing or pushing. Network is all-or-nothing — no per-domain scoping. Reads outside the worktree stay allowed. |
 | `claude` | **Yes** | `--settings '<sandbox json>'` (`enabled`, `failIfUnavailable`, `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed`, `network.allowedDomains`) plus `--permission-mode acceptEdits` | Network is an allowlist, so anything not in `SWARM_AGENT_CONTAINMENT_DOMAINS` fails — an `npm install` on a cold cache included. `/tmp` is not writable (only the session temp dir). Reads outside the worktree stay allowed. |
 | `agy` (antigravity) | **No** | — keeps the bypass, and logs a `agent run is not contained` warning when a contained run was requested | See below. |
 
@@ -115,21 +115,22 @@ Note also that codex's legacy `sandbox_workspace_write.network_access` is
 
 ## Enabling it
 
-1. **Run the check** on the host, from a task worktree (or any checkout):
+1. **Run the check** on the host against a linked task worktree:
 
    ```bash
-   npm run check:containment            # defaults to the current directory
    npm run check:containment -- /path/to/.swarm-workspaces/task-123
    ```
 
    It applies the exact permission profile `src/harness/containment.ts` builds
    for a real run and asserts that a write inside the worktree succeeds, that a
-   write to the parent directory and to `$HOME` both fail, and that
-   `api.github.com` is still reachable. It drives `codex sandbox -P <profile>`,
-   which runs an ordinary command under the sandbox with **no model in the
-   loop** — deterministic, instant, and free — so it is re-runnable as often as
-   you like and is the thing to re-run after a CLI upgrade. Anything other than
-   a clean pass (including `codex` not being installed) exits non-zero.
+   write to the main checkout and to `$HOME` both fail, and that `git fetch` and
+   `api.github.com` still work. It rejects the main checkout rather than giving
+   a misleading pass: a linked worktree is where a phase actually runs. It
+   drives `codex sandbox -P <profile>`, which runs an ordinary command under the
+   sandbox with **no model in the loop** — deterministic, instant, and free — so
+   it is re-runnable as often as you like and is the thing to re-run after a CLI
+   upgrade. Anything other than a clean pass (including `codex` not being
+   installed) exits non-zero.
 
 2. **Set the mode** on the worker host and restart the worker:
 

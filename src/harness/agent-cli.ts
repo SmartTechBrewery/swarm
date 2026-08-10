@@ -535,6 +535,7 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	const containment = resolveContainmentPlan({
 		cli,
 		mode: options.containment ?? resolveAgentContainment(),
+		cwd: options.cwd,
 	});
 	if (containment.unavailableReason) {
 		logger.warn('agent run is not contained', {

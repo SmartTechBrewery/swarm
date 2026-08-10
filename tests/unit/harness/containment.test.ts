@@ -118,7 +118,7 @@ describe('resolveContainmentPlan — worktree', () => {
 	});
 
 	it('defines and selects a SWARM-owned codex permission profile without touching config.toml', () => {
-		const plan = resolveContainmentPlan({ cli: 'codex', mode: 'worktree' });
+		const plan = resolveContainmentPlan({ cli: 'codex', mode: 'worktree', cwd: process.cwd() });
 
 		expect(plan.applied).toBe('worktree');
 		expect(plan.args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
@@ -127,6 +127,10 @@ describe('resolveContainmentPlan — worktree', () => {
 			`permissions.${CODEX_PERMISSION_PROFILE}.extends=":workspace"`,
 			'-c',
 			`permissions.${CODEX_PERMISSION_PROFILE}.network.enabled=true`,
+			'-c',
+			expect.stringMatching(
+				new RegExp(`^permissions\\.${CODEX_PERMISSION_PROFILE}\\.workspace_roots=\\{.+=true\\}$`),
+			),
 			'-c',
 			`default_permissions="${CODEX_PERMISSION_PROFILE}"`,
 		]);

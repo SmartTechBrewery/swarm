@@ -29,6 +29,9 @@
  * version each builder below needs is inlined with it.
  */
 
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
+
 import { z } from 'zod';
 
 import type { AgentCli } from './agent-cli.js';
@@ -176,10 +179,11 @@ export function resolveContainmentDomains(
  *
  * `extends = ":workspace"` inherits codex's built-in workspace profile: the
  * Seatbelt/Landlock sandbox that makes `cwd` (plus `/tmp` and `TMPDIR`)
- * writable and everything else read-only. It resolves a linked worktree's
- * `gitdir:` pointer, so `git status`/`diff`/`log` keep working while `git add`
- * does not — which does not matter for SWARM, since every phase prompt already
- * forbids the agent from committing and SWARM delivers the prepared tree itself.
+ * writable and everything else read-only. A linked worktree's `.git` pointer
+ * targets metadata outside `cwd`, so the run's resolved common git directory
+ * is an additional workspace root. That lets the phase's required `git pull`
+ * create its FETCH_HEAD, refs, and objects while leaving every non-git path
+ * outside the task worktree read-only.
  *
  * `network.enabled = true` re-opens egress, which `:workspace` denies. It has to
  * be a profile key: the legacy `sandbox_workspace_write.network_access` is
@@ -189,13 +193,42 @@ export function resolveContainmentDomains(
  * parse did not restrict anything when measured. The `allowedDomains` argument
  * therefore governs claude only; see `docs/agent-containment.md`.
  */
-export function codexPermissionProfileArgs(): string[] {
-	return [
+export function codexPermissionProfileArgs(cwd?: string): string[] {
+	const args = [
 		'-c',
 		`permissions.${CODEX_PERMISSION_PROFILE}.extends=":workspace"`,
 		'-c',
 		`permissions.${CODEX_PERMISSION_PROFILE}.network.enabled=true`,
 	];
+	const gitCommonDir = resolveGitCommonDir(cwd);
+	if (gitCommonDir) {
+		args.push(
+			'-c',
+			`permissions.${CODEX_PERMISSION_PROFILE}.workspace_roots={${JSON.stringify(gitCommonDir)}=true}`,
+		);
+	}
+	return args;
+}
+
+/** Resolve a worktree's shared git directory without spawning a second process. */
+function resolveGitCommonDir(cwd: string | undefined): string | undefined {
+	if (!cwd) return undefined;
+
+	const dotGit = join(cwd, '.git');
+	try {
+		if (statSync(dotGit).isDirectory()) return dotGit;
+
+		const gitDirMatch = /^gitdir:\s*(.+)\s*$/m.exec(readFileSync(dotGit, 'utf8'));
+		if (!gitDirMatch) return undefined;
+		const gitDir = isAbsolute(gitDirMatch[1]) ? gitDirMatch[1] : resolve(cwd, gitDirMatch[1]);
+		const commonDirFile = join(gitDir, 'commondir');
+		if (!existsSync(commonDirFile)) return gitDir;
+
+		const commonDir = readFileSync(commonDirFile, 'utf8').trim();
+		return isAbsolute(commonDir) ? commonDir : resolve(gitDir, commonDir);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -251,6 +284,8 @@ export function resolveContainmentPlan(options: {
 	cli: AgentCli;
 	mode?: AgentContainment;
 	allowedDomains?: readonly string[];
+	/** The run's worktree, used to allow its linked git metadata under codex. */
+	cwd?: string;
 }): AgentContainmentPlan {
 	const requested = options.mode ?? DEFAULT_AGENT_CONTAINMENT;
 	const bypass = (unavailableReason?: string): AgentContainmentPlan => ({
@@ -277,7 +312,7 @@ export function resolveContainmentPlan(options: {
 			};
 		case 'codex':
 			return {
-				args: [...codexPermissionProfileArgs(), ...codexProfileSelectionArgs()],
+				args: [...codexPermissionProfileArgs(options.cwd), ...codexProfileSelectionArgs()],
 				requested,
 				applied: 'worktree',
 			};
