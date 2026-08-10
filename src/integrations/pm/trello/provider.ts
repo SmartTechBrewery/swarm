@@ -1,13 +1,12 @@
 /**
  * TrelloPMProvider — the concrete `PMProvider` (`src/pm/types.ts`) for Trello.
- * This phase lands the **board reads** (`getWorkItem`, `listWorkItems`,
- * `findWorkItemByUrlSuffix`, `findWorkItemForArtifact`,
- * `findWorkItemByDescriptionMarker`, `findComment`) and `discover`; the writes
- * and the dependency pair are still explicit not-implemented stubs, and nothing
- * registers this provider yet — a provider registers only once no method of the
- * contract is a stub (ai/RULES.md §2 "Register when the contract is satisfied,
- * not when the folder appears", the sequencing GitLab's #295, Linear's #491 and
- * Jira's #490 all used).
+ * With this phase **no method of the contract is a stub**: the board reads and
+ * `discover` landed previously, and the writes (`moveWorkItem`, `addComment`,
+ * `createWorkItem`, `updateWorkItem`, `addLabel`) plus the declared dependency
+ * opt-out land here. Nothing registers this provider yet — the manifest is its
+ * own phase — but the gate that phase is held behind is now clear (ai/RULES.md §2
+ * "Register when the contract is satisfied, not when the folder appears", the
+ * sequencing GitLab's #295, Linear's #491 and Jira's #490 all used).
  *
  * Every operation is REST over `trelloRequest` (`./client.ts`), which picks the
  * API key/token pair up off the async scope — credentials are never arguments,
@@ -18,7 +17,15 @@
  * field, its status *is* the list it sits in (`./config-schema.ts`). So
  * `statusId` is the card's `idList`, `status` is that list's name (resolved from
  * the board's own lists, which is the one extra request every board read pays),
- * and `statusKey` is the canonical key the mapping translates that list id to.
+ * `statusKey` is the canonical key the mapping translates that list id to, and
+ * moving a card is `PUT /cards/{id}` with a new `idList`.
+ *
+ * Trello takes a write's parameters either in the query string or in the request
+ * body, and this provider **sends a body**: a comment carries a whole
+ * agent-written plan and a description a whole issue body, either of which would
+ * overflow a request line if it rode the query. The one exception is applying an
+ * existing label, whose payload is a single id and which Trello documents only as
+ * `?value=`.
  *
  * Two Trello-specific costs are deliberate and visible rather than hidden.
  * Trello indexes nothing SWARM looks a card up by — not the card's URL, not its
@@ -34,6 +41,7 @@ import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
 import type {
 	ContainerDiscoveryResult,
+	CreateWorkItemInput,
 	DiscoveredContainer,
 	DiscoveredState,
 	ListWorkItemsFilter,
@@ -43,13 +51,14 @@ import type {
 	PMProvider,
 	PMType,
 	StateDiscoveryResult,
+	UpdateWorkItemPatch,
 	WorkItem,
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
 	WorkItemLabel,
 } from '../../../pm/types.js';
-import { collectTrelloPage, PAGE_LIMIT, trelloRequest } from './client.js';
+import { collectTrelloPage, PAGE_LIMIT, TrelloApiError, trelloRequest } from './client.js';
 import { requireTrelloConfig, type TrelloIntegrationConfig } from './config-schema.js';
 import { withTrelloProjectCredentials } from './credentials.js';
 import { requireListIdForStatusKey, resolveStatusKeyByListId } from './status-mapping.js';
@@ -75,7 +84,19 @@ const CARD_QUERY = {
 	attachment_fields: 'url',
 } as const;
 
-/** A Trello label as the card reads select it. */
+/**
+ * The colour a board label SWARM creates is given. Trello requires one on
+ * `POST /boards/{id}/labels` — a label is a board-scoped *object*, not a free
+ * string — and nothing here ever reads it back: every lookup matches on the name.
+ * So this is only what the operator sees on the board for a label SWARM had to
+ * invent, and `green` is Trello's own default swatch.
+ */
+const CREATED_LABEL_COLOR = 'green';
+
+/** The substring Trello answers `POST /cards/{id}/idLabels` with when the card already carries the label. */
+const LABEL_ALREADY_APPLIED = 'already on the card';
+
+/** A Trello label as the card reads select it, and as the board's own label list reports it. */
 interface TrelloLabel {
 	id?: string;
 	name?: string | null;
@@ -135,6 +156,19 @@ interface TrelloCommentAction {
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Whether this is Trello refusing to apply a label the card already carries.
+ * `addLabel` checks the card first, so this only covers a label applied between
+ * that read and the write — the outcome the caller asked for either way.
+ */
+function isLabelAlreadyApplied(error: unknown): boolean {
+	return (
+		error instanceof TrelloApiError &&
+		error.status === 400 &&
+		error.message.toLowerCase().includes(LABEL_ALREADY_APPLIED)
+	);
 }
 
 /**
@@ -364,36 +398,158 @@ export class TrelloPMProvider implements PMProvider {
 		});
 	}
 
-	// The board writes and the dependency pair land in phase 3/6. The wording below
-	// is the generic sentinel the PM conformance suite scans a registered provider's
-	// own source for, which is what keeps a stub from being registered as if it were
-	// real (ai/TESTING.md "Provider conformance").
-	async moveWorkItem(): Promise<void> {
-		throw new Error('moveWorkItem is not implemented for the Trello PM provider');
+	async moveWorkItem(id: string, status: string): Promise<void> {
+		// Resolve the canonical key before the write: a status the board mapping
+		// can't resolve is a config/logic error, not a value to send blindly — the
+		// same fail-loud contract `listWorkItems` and the other three providers'
+		// `moveWorkItem` keep (ai/CODING_STANDARDS.md "Error handling").
+		const idList = requireListIdForStatusKey(this.config, status);
+		await this.run(async () => {
+			// One write, and no transition graph to negotiate: a Trello card's status is
+			// which list holds it, so a move is an ordinary field update and every list
+			// is reachable from every other. Re-asserting the list a card already sits in
+			// is accepted by Trello, so `autoAdvance` needs no already-there check.
+			await trelloRequest<void>(`cards/${encodeURIComponent(id)}`, {
+				method: 'PUT',
+				body: { idList },
+			});
+		});
+		logger.debug('pm: moved work item', { itemId: id, status });
 	}
 
-	async addComment(): Promise<string> {
-		throw new Error('addComment is not implemented for the Trello PM provider');
+	async addComment(id: string, text: string): Promise<string> {
+		// Unlike GitHub Projects — whose board card has no comment thread, so the
+		// comment is redirected onto the backing Issue — a Trello card *is* the work
+		// item, and the comment lands natively on it. There is no backing artifact to
+		// resolve first.
+		return this.run(async () => {
+			// Trello models a card comment as an **action**, so what comes back is a
+			// `commentCard` action and its id is the comment id — the same id space
+			// `findComment` scans, which is what lets an idempotency marker match.
+			const action = await trelloRequest<TrelloCommentAction | undefined>(
+				`cards/${encodeURIComponent(id)}/actions/comments`,
+				{ method: 'POST', body: { text } },
+			);
+			if (!action?.id) {
+				throw new Error(`Trello returned no comment id for the comment posted on card '${id}'`);
+			}
+			return action.id;
+		});
 	}
 
-	async createWorkItem(): Promise<WorkItem> {
-		throw new Error('createWorkItem is not implemented for the Trello PM provider');
+	async createWorkItem(input: CreateWorkItemInput): Promise<WorkItem> {
+		const idList = requireListIdForStatusKey(this.config, input.status);
+		const labels = input.labels ?? [];
+		return this.run(async () => {
+			// `POST /cards` takes label *ids*, and a Trello label is an object owned by
+			// the board, so every name has to be resolved (and created when the board
+			// has none) before the card exists.
+			const idLabels: string[] = [];
+			for (const name of labels) {
+				idLabels.push(await this.ensureBoardLabelId(name));
+			}
+			const [card, listNames] = await Promise.all([
+				trelloRequest<TrelloCard | undefined>('cards', {
+					method: 'POST',
+					body: {
+						idList,
+						name: input.title,
+						desc: input.description,
+						...(idLabels.length > 0 ? { idLabels } : {}),
+					},
+				}),
+				// The card's list name is not on the create response, and this read does
+				// not depend on the write, so the two go out together.
+				this.fetchListNames(),
+			]);
+			if (!card?.id) {
+				throw new Error(`Trello returned no card id for the card created as '${input.title}'`);
+			}
+			logger.debug('pm: created work item', { itemId: card.id, status: input.status });
+			// One write, unlike GitHub Projects' create-then-place pair: `idList` is part
+			// of the create. Mapped through the same `toWorkItem` the reads use so the
+			// fresh card reads exactly like one off a board read. Its `taskRef` is unset
+			// and that is honest — a Trello card is not an SCM artifact, and nothing has
+			// linked one to it yet (ai/ARCHITECTURE.md "Task identity").
+			return this.toWorkItem({ ...card, id: card.id }, listNames);
+		});
 	}
 
-	async updateWorkItem(): Promise<void> {
-		throw new Error('updateWorkItem is not implemented for the Trello PM provider');
+	async updateWorkItem(id: string, patch: UpdateWorkItemPatch): Promise<void> {
+		// Nothing to write is not an empty write: an empty `PUT /cards/{id}` still
+		// bumps the card's `dateLastActivity` for no reason.
+		if (patch.title === undefined && patch.description === undefined) return;
+		await this.run(async () => {
+			await trelloRequest<void>(`cards/${encodeURIComponent(id)}`, {
+				method: 'PUT',
+				body: {
+					...(patch.title !== undefined ? { name: patch.title } : {}),
+					...(patch.description !== undefined ? { desc: patch.description } : {}),
+				},
+			});
+		});
+		logger.debug('pm: updated work item', { itemId: id });
 	}
 
-	async addLabel(): Promise<void> {
-		throw new Error('addLabel is not implemented for the Trello PM provider');
+	async addLabel(id: string, name: string): Promise<void> {
+		await this.run(async () => {
+			// Re-applying a label the card already carries is contractually a no-op, so
+			// check before writing rather than leaning on how Trello happens to answer a
+			// repeat. Compared case-insensitively, since a board label's name is display
+			// text an operator may have capitalised differently.
+			const card = await trelloRequest<TrelloCard | undefined>(`cards/${encodeURIComponent(id)}`, {
+				query: { fields: 'labels' },
+			});
+			const already = (card?.labels ?? []).some(
+				(label) => label?.name?.toLowerCase() === name.toLowerCase(),
+			);
+			if (already) return;
+			const labelId = await this.ensureBoardLabelId(name);
+			try {
+				await trelloRequest<void>(`cards/${encodeURIComponent(id)}/idLabels`, {
+					method: 'POST',
+					query: { value: labelId },
+				});
+			} catch (error) {
+				// The label was applied between the read above and this write — the card
+				// carries it, which is all the caller asked for.
+				if (!isLabelAlreadyApplied(error)) throw error;
+				return;
+			}
+			logger.debug('pm: applied label', { itemId: id, label: name });
+		});
 	}
 
+	/**
+	 * The **declared capability opt-out**, not an unfinished method: this provider
+	 * sets `supportsDependencies: false`, and the contract (`src/pm/types.ts`)
+	 * defines that as `listBlockers` answering `[]` and {@link addBlockedBy} doing
+	 * nothing, so callers skip the dependency gate and fall back to the
+	 * human-readable comment guard (`src/pipeline/dependency-guard.ts`).
+	 *
+	 * Trello models no cross-card blocking relationship at all — a board has lists,
+	 * labels and checklists, and nothing that says one card must finish before
+	 * another. The only prerequisites a card can express are prose in its
+	 * description, and in SWARM those are GitHub issue numbers whose open/closed
+	 * state only an **SCM** provider could resolve; reaching for one here would be
+	 * exactly the cross-category reach ai/RULES.md §2 forbids (the PM provider
+	 * borrowing another category's model). Synthesising a blocker SWARM cannot
+	 * answer `open` for would be worse than reporting none: the gate would defer
+	 * work on a prerequisite it could never see finish.
+	 */
 	async listBlockers(): Promise<WorkItemBlocker[]> {
-		throw new Error('listBlockers is not implemented for the Trello PM provider');
+		return [];
 	}
 
+	/**
+	 * The write half of the same opt-out — see {@link listBlockers} for why. There
+	 * is no Trello relationship to record, so Planning's split chains its phases in
+	 * the prose it already writes into each child's description; the contract makes
+	 * this a no-op rather than a failure precisely so a split still succeeds against
+	 * a board with no dependency concept.
+	 */
 	async addBlockedBy(): Promise<void> {
-		throw new Error('addBlockedBy is not implemented for the Trello PM provider');
+		// Intentionally empty — see the doc comment above.
 	}
 
 	async discover<C extends PMDiscoveryCapability>(
@@ -542,6 +698,60 @@ export class TrelloPMProvider implements PMProvider {
 			if (list?.id && list.name) names.set(list.id, list.name);
 		}
 		return names;
+	}
+
+	/**
+	 * Resolve a label *name* to the board label id every Trello label write takes,
+	 * creating the label on this board when it carries none by that name. Runs
+	 * inside a credential scope (its callers do).
+	 *
+	 * Create-if-missing tolerating a lost race, like Linear's `ensureLabelId` and
+	 * GitHub Projects' `ensureLabel`: a concurrent writer that got there first
+	 * leaves the label existing, which is all the caller needs. The race is caught
+	 * by *re-reading* rather than by recognising a rejection message, because
+	 * Trello documents no duplicate-name rejection to recognise — a board may
+	 * legitimately hold two labels sharing a name — so a failed create only becomes
+	 * a success if the name actually resolves afterwards; otherwise the original
+	 * error is rethrown rather than swallowed.
+	 */
+	private async ensureBoardLabelId(name: string): Promise<string> {
+		const existing = await this.findBoardLabelId(name);
+		if (existing) return existing;
+		try {
+			const created = await trelloRequest<TrelloLabel | undefined>(
+				`boards/${encodeURIComponent(this.config.boardId)}/labels`,
+				{ method: 'POST', body: { name, color: CREATED_LABEL_COLOR } },
+			);
+			if (created?.id) return created.id;
+		} catch (error) {
+			const raced = await this.findBoardLabelId(name);
+			if (raced) return raced;
+			throw error;
+		}
+		const resolved = await this.findBoardLabelId(name);
+		if (!resolved) {
+			throw new Error(`Trello board label '${name}' could neither be resolved nor created`);
+		}
+		return resolved;
+	}
+
+	/**
+	 * The id of this board's label named `name`, or `undefined` when it has none.
+	 * Board-scoped because that is the only scope a Trello label has — there is no
+	 * workspace-wide label to also consider, unlike Linear's shared labels.
+	 *
+	 * The explicit `limit` is load-bearing: `GET /boards/{id}/labels` defaults to
+	 * **50**, so a board with more labels than that would silently miss an existing
+	 * one and create a duplicate. Runs inside a credential scope (its callers do).
+	 */
+	private async findBoardLabelId(name: string): Promise<string | undefined> {
+		const labels = await trelloRequest<Array<TrelloLabel | null> | undefined>(
+			`boards/${encodeURIComponent(this.config.boardId)}/labels`,
+			{ query: { fields: 'name', limit: PAGE_LIMIT } },
+		);
+		return (labels ?? []).find(
+			(label) => label?.id && label.name?.toLowerCase() === name.toLowerCase(),
+		)?.id;
 	}
 
 	/**
