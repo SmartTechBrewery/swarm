@@ -102,6 +102,60 @@ describe('RunStatusBadge', () => {
 		});
 	});
 
+	describe('a resumable wall-clock kill reads as a timeout (issue #600)', () => {
+		it('names the timeout on a deferred run while keeping the amber deferred hue', () => {
+			render(<RunStatusBadge status="deferred" phase="implementation" timedOut />);
+			const badge = screen.getByText('Timed out · retrying');
+			expect(badge.className).toContain('text-amber-400');
+			expect(screen.queryByText('Deferred')).toBeNull();
+			// The terminal-failure orange stays reserved for the non-resumable kill.
+			expect(badge.className).not.toContain('orange');
+		});
+
+		it('names the timeout on a checkpointed run while keeping the sky checkpointed hue', () => {
+			render(<RunStatusBadge status="checkpointed" phase="implementation" timedOut />);
+			const badge = screen.getByText('Timed out · checkpointed');
+			expect(badge.className).toContain('text-sky-400');
+			expect(screen.queryByText('Checkpointed')).toBeNull();
+			expect(badge.className).not.toContain('orange');
+		});
+
+		it('keeps the retry state readable in the title of each', () => {
+			const { rerender } = render(<RunStatusBadge status="deferred" timedOut />);
+			const deferredTitle = screen.getByText('Timed out · retrying').getAttribute('title') ?? '';
+			expect(deferredTitle).toMatch(/wall-clock timeout/i);
+			expect(deferredTitle).toMatch(/retry/i);
+
+			rerender(<RunStatusBadge status="checkpointed" timedOut />);
+			const checkpointedTitle =
+				screen.getByText('Timed out · checkpointed').getAttribute('title') ?? '';
+			expect(checkpointedTitle).toMatch(/wall-clock timeout/i);
+			expect(checkpointedTitle).toMatch(/checkpoint/i);
+		});
+
+		it('leaves a deferred or checkpointed run that did not time out unchanged', () => {
+			const { rerender } = render(<RunStatusBadge status="deferred" phase="implementation" />);
+			expect(screen.getByText('Deferred').className).toContain('text-amber-400');
+			expect(screen.queryByText(/Timed out/)).toBeNull();
+
+			rerender(<RunStatusBadge status="checkpointed" phase="implementation" />);
+			expect(screen.getByText('Checkpointed').className).toContain('text-sky-400');
+			expect(screen.queryByText(/Timed out/)).toBeNull();
+		});
+
+		it('leaves the terminal timed-out failure badge unchanged', () => {
+			render(<RunStatusBadge status="failed" phase="implementation" timedOut />);
+			const badge = screen.getByText('Timed out');
+			expect(badge.className).toContain('text-orange-400');
+		});
+
+		it('does not divert a completed Review run away from its verdict badge', () => {
+			render(<RunStatusBadge status="completed" phase="review" timedOut reviewVerdict="approve" />);
+			expect(screen.getByText('Approved')).not.toBeNull();
+			expect(screen.queryByText(/Timed out/)).toBeNull();
+		});
+	});
+
 	describe('lifecycle status is kept where a verdict must not show', () => {
 		it('shows "Completed" for a completed non-Review run even if a verdict slipped through', () => {
 			render(<RunStatusBadge status="completed" phase="implementation" reviewVerdict="approve" />);
