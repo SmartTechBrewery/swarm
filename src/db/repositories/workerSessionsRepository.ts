@@ -7,12 +7,14 @@
  *
  * `acquireLease` is the crux: an atomic conditional transition in one
  * transaction (the same style as `approveMembershipRequestInDb`). It reads the
- * worker's row `FOR UPDATE`, then either rejects (a *live* lease is held),
- * replaces the row with a bumped fencing token (an *expired* lease is re-taken),
- * or inserts the first session — and the row lock plus the table's unique index
- * on `worker_id` together guarantee exactly one concurrent caller wins. A racing
- * insert that trips the unique index (`23505`) is surfaced as the same
- * `WorkerSessionHeldError` as an already-live lease, so contention has one type.
+ * worker's row `FOR UPDATE`, then either rejects (a *live* lease is held by
+ * someone else), replaces the row with a bumped fencing token (an *expired* or
+ * *released* lease is re-taken, as is a live one whose own holder proves
+ * possession — `isReclaimOf`, issue #608), or inserts the first session — and the
+ * row lock plus the table's unique index on `worker_id` together guarantee
+ * exactly one concurrent caller wins. A racing insert that trips the unique index
+ * (`23505`) is surfaced as the same `WorkerSessionHeldError` as an already-live
+ * lease, so contention has one type.
  *
  * `heartbeat`, `setCurrentRun`, and `getLiveSession` all gate on the same SQL
  * liveness predicate as `isSessionLive` (`last_heartbeat_at` strictly newer than
@@ -26,10 +28,12 @@ import { and, eq, gt } from 'drizzle-orm';
 
 import {
 	INITIAL_FENCING_TOKEN,
+	isReclaimOf,
 	isSessionLive,
 	nextFencingToken,
 	type WorkerSession,
 	WorkerSessionHeldError,
+	type WorkerSessionReclaim,
 } from '../../identity/worker-session.js';
 import { getDb } from '../client.js';
 import { workerSessions } from '../schema/workerSessions.js';
@@ -67,17 +71,32 @@ function livenessCutoff(ttlMs: number): Date {
  * Acquire the single lease for a worker, atomically. In one transaction, lock
  * the worker's existing session row `FOR UPDATE` (if any) and:
  *
- * - **live** (unreleased and last heartbeat within `ttlMs`) → throw {@link WorkerSessionHeldError};
- * - **expired / released** → replace it in place with a bumped fencing token, a fresh
- *   heartbeat, `released: false`, and no current run (a new lease on the same row);
+ * - **live and not the caller's own** (unreleased, last heartbeat within `ttlMs`, and
+ *   `reclaim` does not prove possession) → throw {@link WorkerSessionHeldError};
+ * - **live and reclaimed by its own holder / expired / released** → replace it in place
+ *   with a bumped fencing token, a fresh heartbeat, `released: false`, and no current
+ *   run (a new lease on the same row);
  * - **none** → insert the first session at {@link INITIAL_FENCING_TOKEN}.
+ *
+ * `reclaim` is the reconnecting daemon's proof of possession — the `sessionId` and
+ * `fencingToken` this control plane minted for it (`isReclaimOf`, issue #608) — so a
+ * router restart that never released the leases it held costs the returning daemon a
+ * round trip rather than the remainder of the TTL. Omitted, or not an exact match, the
+ * liveness refusal above is exactly what it always was: a second daemon holding only
+ * the shared credential is still refused.
  *
  * The row lock serializes concurrent acquires against an existing row, and the
  * table's unique index on `worker_id` serializes a racing first insert — the
  * loser's `23505` is translated to the same `WorkerSessionHeldError`, so exactly
- * one concurrent caller ever wins.
+ * one concurrent caller ever wins. That covers two racing reclaims of the same
+ * lease too: the loser's remembered token no longer matches once the winner's bump
+ * has committed.
  */
-export async function acquireLease(workerId: string, ttlMs: number): Promise<WorkerSession> {
+export async function acquireLease(
+	workerId: string,
+	ttlMs: number,
+	reclaim?: WorkerSessionReclaim,
+): Promise<WorkerSession> {
 	try {
 		return await getDb().transaction(async (tx) => {
 			const now = new Date();
@@ -89,9 +108,18 @@ export async function acquireLease(workerId: string, ttlMs: number): Promise<Wor
 				.limit(1);
 
 			if (existing) {
-				if (!existing.released && isSessionLive(existing.lastHeartbeatAt, ttlMs, now)) {
+				const live = !existing.released && isSessionLive(existing.lastHeartbeatAt, ttlMs, now);
+				if (live && !isReclaimOf(existing, reclaim)) {
 					throw new WorkerSessionHeldError(workerId);
 				}
+				// The reclaimed lease flows through the same replace as an expired one, which
+				// is already exactly right for it: the fencing token still **bumps**, so the
+				// superseded holder's heartbeats / run attachments / dispatch results keep
+				// being rejected, and `currentRunId` is **cleared** rather than inherited — a
+				// reconnecting session must not silently adopt an in-flight run it did not
+				// produce. (Nothing in `src/` calls `setCurrentRun` today; the pointer is the
+				// legacy single-run field the dashboard reads, so clearing it resolves the
+				// reclaimed lease's run state the same way a re-acquire always has.)
 				const [replaced] = await tx
 					.update(workerSessions)
 					.set({

@@ -102,9 +102,36 @@ describe('credential authentication', () => {
 		const { session, fencingToken } = await acquireSession('raw-cred', 5000);
 
 		expect(resolveWorkerByCredential).toHaveBeenCalledWith('raw-cred');
-		expect(acquireLease).toHaveBeenCalledWith(WORKER_ID, 5000);
+		// No proof of possession presented — the plain acquire, forwarded as `undefined`.
+		expect(acquireLease).toHaveBeenCalledWith(WORKER_ID, 5000, undefined);
 		expect(session.fencingToken).toBe(3);
 		expect(fencingToken).toBe(3);
+	});
+
+	// Issue #608: a reconnecting daemon's proof rides down to the lease, but only
+	// after the credential authenticated — possession is checked on top of auth.
+	it('acquireSession forwards a reclaim proof to the lease, still authenticating first', async () => {
+		resolveWorkerByCredential.mockResolvedValue(makeWorker());
+		acquireLease.mockResolvedValue(makeSession({ fencingToken: 5 }));
+		const reclaim = { sessionId: '44444444-4444-4444-8444-444444444444', fencingToken: 4 };
+
+		const { fencingToken } = await acquireSession('raw-cred', 5000, reclaim);
+
+		expect(resolveWorkerByCredential).toHaveBeenCalledWith('raw-cred');
+		expect(acquireLease).toHaveBeenCalledWith(WORKER_ID, 5000, reclaim);
+		expect(fencingToken).toBe(5);
+	});
+
+	it('never reaches the lease with a reclaim when the credential is unknown', async () => {
+		resolveWorkerByCredential.mockResolvedValue(undefined);
+
+		await expect(
+			acquireSession('nope', 5000, {
+				sessionId: '44444444-4444-4444-8444-444444444444',
+				fencingToken: 4,
+			}),
+		).rejects.toBeInstanceOf(UnknownWorkerCredentialError);
+		expect(acquireLease).not.toHaveBeenCalled();
 	});
 
 	it('throws UnknownWorkerCredentialError and never touches the lease for an unknown credential', async () => {

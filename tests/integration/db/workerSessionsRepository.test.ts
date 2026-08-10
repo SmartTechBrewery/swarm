@@ -70,6 +70,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(session.id).toMatch(/^[0-9a-f-]{36}$/);
 			});
 
+			// The "a genuinely competing second daemon is still refused" case: it holds the
+			// same credential but not the lease's `sessionId`/`fencingToken`, so it presents
+			// no proof of possession and hits the liveness refusal unchanged (issue #608).
 			it('rejects a second acquire while a live session is held', async () => {
 				await acquireLease(workerA, TTL);
 				await expect(acquireLease(workerA, TTL)).rejects.toBeInstanceOf(WorkerSessionHeldError);
@@ -150,6 +153,125 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(await validateFencingToken(workerA, second.fencingToken, TTL)).toBe(true);
 				expect(await heartbeat(workerA, second.fencingToken, TTL)).toBe(true);
 				expect(await setCurrentRun(workerA, second.fencingToken, runId, TTL)).toBe(true);
+			});
+
+			// Issue #608: a router restart never releases the leases of the sockets it held,
+			// so a reconnecting daemon meets its own live row. Presenting the lease it
+			// already holds is what stops the TTL from bounding that outage.
+			describe('reclaiming a live lease (issue #608)', () => {
+				it('hands a live lease back to its own holder with a bumped token, reusing one row', async () => {
+					const first = await acquireLease(workerA, TTL);
+					expect(first.fencingToken).toBe(1);
+
+					const reclaimed = await acquireLease(workerA, TTL, {
+						sessionId: first.id,
+						fencingToken: first.fencingToken,
+					});
+
+					// The lease is live again from this instant, on the same row, with the
+					// fencing counter moved forward.
+					expect(reclaimed.id).toBe(first.id);
+					expect(reclaimed.fencingToken).toBe(2);
+					expect(reclaimed.lastHeartbeatAt.getTime()).toBeGreaterThanOrEqual(
+						first.lastHeartbeatAt.getTime(),
+					);
+					expect(await getLiveSession(workerA, TTL)).toMatchObject({ fencingToken: 2 });
+					const rows = await getDb()
+						.select()
+						.from(workerSessions)
+						.where(eq(workerSessions.workerId, workerA));
+					expect(rows).toHaveLength(1);
+				});
+
+				it('refuses a reclaim carrying a stale fencing token', async () => {
+					const first = await acquireLease(workerA, TTL);
+					const reclaimed = await acquireLease(workerA, TTL, {
+						sessionId: first.id,
+						fencingToken: first.fencingToken,
+					});
+					expect(reclaimed.fencingToken).toBe(2);
+
+					// The superseded holder still remembers token 1 — the row has moved past it.
+					await expect(
+						acquireLease(workerA, TTL, { sessionId: first.id, fencingToken: 1 }),
+					).rejects.toBeInstanceOf(WorkerSessionHeldError);
+					expect(await getLiveSession(workerA, TTL)).toMatchObject({ fencingToken: 2 });
+				});
+
+				it('refuses a reclaim naming a different session id', async () => {
+					const first = await acquireLease(workerA, TTL);
+
+					await expect(
+						acquireLease(workerA, TTL, {
+							sessionId: '99999999-9999-4999-8999-999999999999',
+							fencingToken: first.fencingToken,
+						}),
+					).rejects.toBeInstanceOf(WorkerSessionHeldError);
+					expect(await getLiveSession(workerA, TTL)).toMatchObject({
+						id: first.id,
+						fencingToken: 1,
+					});
+				});
+
+				it('leaves the superseded holder unable to heartbeat, attach a run, or validate', async () => {
+					const first = await acquireLease(workerA, TTL);
+					const runId = await createRun({
+						projectId: PROJECT_ID,
+						taskId: 'w-reclaim-fencing',
+						phase: 'implementation',
+					});
+
+					const reclaimed = await acquireLease(workerA, TTL, {
+						sessionId: first.id,
+						fencingToken: first.fencingToken,
+					});
+
+					expect(await heartbeat(workerA, first.fencingToken, TTL)).toBe(false);
+					expect(await setCurrentRun(workerA, first.fencingToken, runId, TTL)).toBe(false);
+					expect(await validateFencingToken(workerA, first.fencingToken, TTL)).toBe(false);
+					// ...while the reclaiming holder's token works.
+					expect(await heartbeat(workerA, reclaimed.fencingToken, TTL)).toBe(true);
+					expect(await validateFencingToken(workerA, reclaimed.fencingToken, TTL)).toBe(true);
+				});
+
+				it('clears the run the reclaimed lease was carrying rather than inheriting it', async () => {
+					const first = await acquireLease(workerA, TTL);
+					const runId = await createRun({
+						projectId: PROJECT_ID,
+						taskId: 'w-reclaim-run',
+						phase: 'implementation',
+					});
+					expect(await setCurrentRun(workerA, first.fencingToken, runId, TTL)).toBe(true);
+
+					const reclaimed = await acquireLease(workerA, TTL, {
+						sessionId: first.id,
+						fencingToken: first.fencingToken,
+					});
+
+					expect(reclaimed.currentRunId).toBeNull();
+					expect((await getLiveSession(workerA, TTL))?.currentRunId).toBeNull();
+				});
+
+				it('lets exactly one of two concurrent reclaims of the same lease win', async () => {
+					const first = await acquireLease(workerA, TTL);
+					const proof = { sessionId: first.id, fencingToken: first.fencingToken };
+
+					const results = await Promise.allSettled([
+						acquireLease(workerA, TTL, proof),
+						acquireLease(workerA, TTL, proof),
+					]);
+
+					const fulfilled = results.filter((r) => r.status === 'fulfilled');
+					const rejected = results.filter((r) => r.status === 'rejected');
+					expect(fulfilled).toHaveLength(1);
+					expect(rejected).toHaveLength(1);
+					expect(
+						(fulfilled[0] as PromiseFulfilledResult<{ fencingToken: number }>).value.fencingToken,
+					).toBe(2);
+					expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+						WorkerSessionHeldError,
+					);
+				});
 			});
 
 			it('gives two different workers of one user independent live sessions', async () => {
