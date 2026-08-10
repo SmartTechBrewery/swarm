@@ -29,6 +29,7 @@
 		"db:seed": "node --env-file=.env --import tsx/esm src/cli/index.ts config apply",
 		"worktrees:prune": "node --env-file=.env --import tsx/esm src/cli/index.ts worktrees prune",
 		"queue:clear": "node --env-file=.env --import tsx/esm src/cli/index.ts queue clear",
+		"check:containment": "node --import tsx/esm src/harness/containment-check.ts",
 		"db:push": "node --env-file=.env ./node_modules/.bin/drizzle-kit push",
 		"db:studio": "node --env-file=.env ./node_modules/.bin/drizzle-kit studio",
 		"test": "vitest run --project unit && npm run test:dashboard",

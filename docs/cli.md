@@ -376,6 +376,12 @@ repo root.
 | `npm run queue:clear` | `swarm queue clear` with `.env` loaded — cancel all pending queue work. |
 | `npm run worktrees:prune` | `swarm worktrees prune` with `.env` loaded — prune stale worktrees. |
 
+### Agent containment
+
+| Script | Description |
+| --- | --- |
+| `npm run check:containment` | Prove that `SWARM_AGENT_CONTAINMENT=worktree` actually contains a run, before enabling it (issue #614). Applies the same permission profile `src/harness/containment.ts` builds for a real run and asserts a write inside the worktree succeeds while writes to the parent directory and `$HOME` fail, with `api.github.com` still reachable. Takes an optional directory (`npm run check:containment -- /path/to/task-123`), defaulting to the current one. Drives `codex sandbox`, so it needs no model, no quota, and no network round-trip to an LLM — re-run it after any CLI upgrade. Exits non-zero on any failure, `codex` not being installed included. See [`docs/agent-containment.md`](./agent-containment.md). |
+
 ### Verification
 
 | Script | Description |

@@ -169,9 +169,15 @@ should wait on.
 - Chat needs its own persistence. Reusing the `runs` table is rejected: `taskId`
   and `phase` are `NOT NULL` and the whole pipeline read model is built on those
   rows, so chat turns would pollute run history and dispatch semantics.
-- `--dangerously-skip-permissions` is currently unconditional in `DEFAULT_ARGS`
+- `--dangerously-skip-permissions` is currently unconditional in the harness's default arguments
   for every CLI. Chat inherits it unless the harness is parameterized, which is
   the security question below.
+  **Resolved since (issue #614):** it no longer is. The per-CLI permission /
+  sandbox arguments are resolved per run by `src/harness/containment.ts` —
+  `RunAgentCliOptions.containment`, defaulting to the host's
+  `SWARM_AGENT_CONTAINMENT`. Chat therefore has something to opt into rather
+  than inheriting a constant; see [`docs/agent-containment.md`](../agent-containment.md)
+  for what each CLI's contained mode can and cannot enforce.
 
 ## Non-goals
 
@@ -190,7 +196,12 @@ should wait on.
    identified but not evaluated: a scratch directory, the project checkout
    read-only, or a specific run's worktree (useful — "ask the agent what it
    actually did in this run"). This requires parameterizing the currently
-   hard-coded per-CLI permission flags.
+   hard-coded per-CLI permission flags. **That prerequisite is done** (issue
+   #614): the flags are now a resolvable `containment` option on the harness,
+   and `worktree` mode confines a run to its `cwd` under the CLI's own OS
+   sandbox — so "which directory, under what confinement" is a value chat
+   passes, not a code change it needs. Which value chat should pass is still
+   open, as is everything else in this question.
 3. **Quota and concurrency accounting** — does a chat turn compete with pipeline
    dispatch, or draw on a separate allowance?
 4. **History bounds** — given §Findings 3, does a conversation get a turn/token
