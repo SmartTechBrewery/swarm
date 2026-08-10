@@ -6,6 +6,7 @@ import {
 	ChevronDown,
 	ExternalLink,
 	Info,
+	LifeBuoy,
 	ListChecks,
 	Loader2,
 	OctagonX,
@@ -31,6 +32,14 @@ import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
+import {
+	canRecoverRun,
+	type RecoveryChoices,
+	type RecoveryPending,
+	recoverButtonLabel,
+	recoveryChoices,
+	recoveryOverrideSubmitLabel,
+} from '@/lib/run-recovery.js';
 import {
 	canResetRun,
 	describeResetResult,
@@ -222,37 +231,36 @@ function retryOverrideActionLabel(kind: RetryActionKind): string {
 	return kind === 'continue' ? 'Continue Now' : 'Retry Now';
 }
 
-/**
- * Split retry button (issue #153): clicking the main left button retries the run
- * with its existing/preselected settings; clicking the chevron right button opens
- * a popup allowing overrides for the agent CLI and model.
- *
- * The main button's identity tracks the server's retry semantics (issue #227): a
- * `deferred` run that still holds a captured agent session resumes it — a green
- * "Resume" firing the retry path with no overrides (which promotes the pending
- * session-resume job) — while a non-resumable deferred run and a terminally
- * failed run relaunch from scratch as the original violet "Retry now". The
- * override popup is always a fresh retry, so choosing a different CLI/model never
- * masquerades as a resume — except for a `checkpointed` run (issue #503), where the
- * server keeps `recoveryMode: 'checkpoint'` regardless, so an override composes
- * with the continuation instead of replacing it.
- */
-function RetryNowButton({ run }: { run: RunRow }) {
-	const queryClient = useQueryClient();
-	const mutation = useMutation({
-		mutationFn: (overrides: { cli?: RunAgent; model?: string; reasoning?: ReasoningLevel }) =>
-			trpcClient.runs.retryNow.mutate({
-				runId: run.id,
-				cli: overrides.cli,
-				model: overrides.model,
-				reasoning: overrides.reasoning,
-			}),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
-			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
-		},
-	});
+/** The overrides a retry can carry — the `runs.retryNow` input minus the run id. */
+interface RetryOverrides {
+	cli?: RunAgent;
+	model?: string;
+	reasoning?: ReasoningLevel;
+}
 
+/**
+ * The agent-CLI / model / reasoning selects a manual retry can override, plus the
+ * footer that submits them. Extracted from `RetryNowButton` (issue #593) so the
+ * unified Recover popup offers the same overrides rather than a second copy of
+ * them; the caller owns the mutation, the popup's open state, and the heading.
+ *
+ * The selects seed from the run's own engine/model (decomposing a legacy combined
+ * antigravity string, issue #180) and resync when the run row changes underneath
+ * them, so a background refetch never leaves a stale selection armed.
+ */
+function RetryOverridePanel({
+	run,
+	submitLabel,
+	onSubmit,
+	onCancel,
+	disabled = false,
+}: {
+	run: RunRow;
+	submitLabel: string;
+	onSubmit: (overrides: RetryOverrides) => void;
+	onCancel?: () => void;
+	disabled?: boolean;
+}) {
 	const currentCli = (
 		run.engine && (RUN_AGENTS as readonly string[]).includes(run.engine)
 			? (run.engine as RunAgent)
@@ -271,7 +279,6 @@ function RetryNowButton({ run }: { run: RunRow }) {
 		| ReasoningLevel
 		| undefined;
 
-	const [isOpen, setIsOpen] = useState(false);
 	const [selectedCli, setSelectedCli] = useState<RunAgent>(currentCli);
 	const [selectedModel, setSelectedModel] = useState<string>(currentModel);
 	const [selectedReasoning, setSelectedReasoning] = useState<ReasoningLevel | ''>(
@@ -285,6 +292,160 @@ function RetryNowButton({ run }: { run: RunRow }) {
 	}, [currentCli, currentModel, currentReasoning]);
 
 	const reasoningOptions = reasoningChoicesFor(selectedCli, selectedModel);
+
+	return (
+		<div className="space-y-3 text-left">
+			<div>
+				<label
+					htmlFor="agent-cli-select"
+					className="block text-xs font-medium text-zinc-400 mb-1 select-none"
+				>
+					Agent CLI
+				</label>
+				<select
+					id="agent-cli-select"
+					value={selectedCli}
+					onChange={(e) => {
+						const newCli = e.target.value as RunAgent;
+						setSelectedCli(newCli);
+						setSelectedModel(MODEL_CAPABILITIES[newCli][0].id);
+						// Reasoning is model-specific — clear it on any CLI change.
+						setSelectedReasoning('');
+					}}
+					className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+				>
+					{RUN_AGENTS.map((cli) => (
+						<option key={cli} value={cli}>
+							{cli}
+						</option>
+					))}
+				</select>
+			</div>
+
+			<div>
+				<label
+					htmlFor="model-select"
+					className="block text-xs font-medium text-zinc-400 mb-1 select-none"
+				>
+					Model
+				</label>
+				<select
+					id="model-select"
+					value={selectedModel}
+					onChange={(e) => {
+						const newModel = e.target.value;
+						setSelectedModel(newModel);
+						// Drop the reasoning if the new model doesn't support it.
+						const stillValid =
+							selectedReasoning &&
+							(reasoningChoicesFor(selectedCli, newModel) as readonly string[]).includes(
+								selectedReasoning,
+							);
+						if (!stillValid) setSelectedReasoning('');
+					}}
+					className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+				>
+					{MODEL_CAPABILITIES[selectedCli].map((m) => (
+						<option key={m.id} value={m.id}>
+							{m.label}
+						</option>
+					))}
+				</select>
+			</div>
+
+			<div>
+				<label
+					htmlFor="reasoning-select"
+					className="block text-xs font-medium text-zinc-400 mb-1 select-none"
+				>
+					Reasoning
+				</label>
+				<select
+					id="reasoning-select"
+					value={selectedReasoning}
+					onChange={(e) => setSelectedReasoning(e.target.value as ReasoningLevel | '')}
+					disabled={reasoningOptions.length === 0}
+					className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:text-zinc-500"
+				>
+					<option value="">
+						{reasoningOptions.length === 0
+							? capabilityFor(selectedCli, selectedModel)?.fixedVariant
+								? 'Fixed'
+								: 'N/A'
+							: (() => {
+									const def = capabilityFor(selectedCli, selectedModel)?.defaultReasoning;
+									return def ? `Default (${capitalizeLevel(def)})` : 'Default';
+								})()}
+					</option>
+					{reasoningOptions.map((level) => (
+						<option key={level} value={level}>
+							{capitalizeLevel(level)}
+						</option>
+					))}
+				</select>
+			</div>
+
+			<div className="pt-2 flex justify-end gap-2">
+				{onCancel && (
+					<button
+						type="button"
+						onClick={onCancel}
+						className="px-2.5 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+					>
+						Cancel
+					</button>
+				)}
+				<button
+					type="button"
+					onClick={() =>
+						onSubmit({
+							cli: selectedCli,
+							model: selectedModel,
+							reasoning: selectedReasoning || undefined,
+						})
+					}
+					disabled={disabled}
+					className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+				>
+					{submitLabel}
+				</button>
+			</div>
+		</div>
+	);
+}
+
+/**
+ * Split retry button (issue #153): clicking the main left button retries the run
+ * with its existing/preselected settings; clicking the chevron right button opens
+ * a popup allowing overrides for the agent CLI and model.
+ *
+ * The main button's identity tracks the server's retry semantics (issue #227): a
+ * `deferred` run that still holds a captured agent session resumes it — a green
+ * "Resume" firing the retry path with no overrides (which promotes the pending
+ * session-resume job) — while a non-resumable deferred run and a terminally
+ * failed run relaunch from scratch as the original violet "Retry now". The
+ * override popup is always a fresh retry, so choosing a different CLI/model never
+ * masquerades as a resume — except for a `checkpointed` run (issue #503), where the
+ * server keeps `recoveryMode: 'checkpoint'` regardless, so an override composes
+ * with the continuation instead of replacing it.
+ */
+function RetryNowButton({ run }: { run: RunRow }) {
+	const queryClient = useQueryClient();
+	const mutation = useMutation({
+		mutationFn: (overrides: RetryOverrides) =>
+			trpcClient.runs.retryNow.mutate({
+				runId: run.id,
+				cli: overrides.cli,
+				model: overrides.model,
+				reasoning: overrides.reasoning,
+			}),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: trpc.runs.getById.queryKey({ id: run.id }) });
+			queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
+		},
+	});
+
+	const [isOpen, setIsOpen] = useState(false);
 
 	// A resumable run continues its captured CLI session (green "Resume"); a
 	// checkpointed one continues from its written hand-off (green "Continue now"); a
@@ -320,121 +481,15 @@ function RetryNowButton({ run }: { run: RunRow }) {
 						<div className="absolute left-0 top-full mt-2 z-50 w-72 bg-zinc-900 border border-zinc-850 rounded-lg shadow-2xl p-4 animate-in fade-in slide-in-from-top-2 duration-150">
 							<RetryOverrideHeading kind={kind} />
 
-							<div className="space-y-3 text-left">
-								<div>
-									<label
-										htmlFor="agent-cli-select"
-										className="block text-xs font-medium text-zinc-400 mb-1 select-none"
-									>
-										Agent CLI
-									</label>
-									<select
-										id="agent-cli-select"
-										value={selectedCli}
-										onChange={(e) => {
-											const newCli = e.target.value as RunAgent;
-											setSelectedCli(newCli);
-											setSelectedModel(MODEL_CAPABILITIES[newCli][0].id);
-											// Reasoning is model-specific — clear it on any CLI change.
-											setSelectedReasoning('');
-										}}
-										className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
-									>
-										{RUN_AGENTS.map((cli) => (
-											<option key={cli} value={cli}>
-												{cli}
-											</option>
-										))}
-									</select>
-								</div>
-
-								<div>
-									<label
-										htmlFor="model-select"
-										className="block text-xs font-medium text-zinc-400 mb-1 select-none"
-									>
-										Model
-									</label>
-									<select
-										id="model-select"
-										value={selectedModel}
-										onChange={(e) => {
-											const newModel = e.target.value;
-											setSelectedModel(newModel);
-											// Drop the reasoning if the new model doesn't support it.
-											const stillValid =
-												selectedReasoning &&
-												(reasoningChoicesFor(selectedCli, newModel) as readonly string[]).includes(
-													selectedReasoning,
-												);
-											if (!stillValid) setSelectedReasoning('');
-										}}
-										className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
-									>
-										{MODEL_CAPABILITIES[selectedCli].map((m) => (
-											<option key={m.id} value={m.id}>
-												{m.label}
-											</option>
-										))}
-									</select>
-								</div>
-
-								<div>
-									<label
-										htmlFor="reasoning-select"
-										className="block text-xs font-medium text-zinc-400 mb-1 select-none"
-									>
-										Reasoning
-									</label>
-									<select
-										id="reasoning-select"
-										value={selectedReasoning}
-										onChange={(e) => setSelectedReasoning(e.target.value as ReasoningLevel | '')}
-										disabled={reasoningOptions.length === 0}
-										className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:text-zinc-500"
-									>
-										<option value="">
-											{reasoningOptions.length === 0
-												? capabilityFor(selectedCli, selectedModel)?.fixedVariant
-													? 'Fixed'
-													: 'N/A'
-												: (() => {
-														const def = capabilityFor(selectedCli, selectedModel)?.defaultReasoning;
-														return def ? `Default (${capitalizeLevel(def)})` : 'Default';
-													})()}
-										</option>
-										{reasoningOptions.map((level) => (
-											<option key={level} value={level}>
-												{capitalizeLevel(level)}
-											</option>
-										))}
-									</select>
-								</div>
-
-								<div className="pt-2 flex justify-end gap-2">
-									<button
-										type="button"
-										onClick={() => setIsOpen(false)}
-										className="px-2.5 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
-									>
-										Cancel
-									</button>
-									<button
-										type="button"
-										onClick={() => {
-											mutation.mutate({
-												cli: selectedCli,
-												model: selectedModel,
-												reasoning: selectedReasoning || undefined,
-											});
-											setIsOpen(false);
-										}}
-										className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors cursor-pointer"
-									>
-										{retryOverrideActionLabel(kind)}
-									</button>
-								</div>
-							</div>
+							<RetryOverridePanel
+								run={run}
+								submitLabel={retryOverrideActionLabel(kind)}
+								onCancel={() => setIsOpen(false)}
+								onSubmit={(overrides) => {
+									mutation.mutate(overrides);
+									setIsOpen(false);
+								}}
+							/>
 						</div>
 					</>
 				)}
@@ -583,6 +638,114 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 }
 
 /**
+ * The "Reset & restart" confirmation, extracted from `ResetRunButton` (issue
+ * #593) so the unified Recover control confirms exactly the same way rather than
+ * re-stating the copy: the step-by-step message the run's own state shapes, the
+ * explicit default-off opt-in that maps to the destructive `force` variant, and
+ * the refusal message the server returns.
+ *
+ * `blocked` guards the confirm separately from `isPending`, so a modal left open
+ * across a background refetch that surfaces an accepted restart can't queue a
+ * second one.
+ */
+function ResetConfirmModal({
+	run,
+	open,
+	discardWork,
+	onDiscardWorkChange,
+	onClose,
+	onConfirm,
+	isPending,
+	blocked,
+	errorMessage,
+	confirmLabel,
+}: {
+	run: RunRow;
+	open: boolean;
+	discardWork: boolean;
+	onDiscardWorkChange: (value: boolean) => void;
+	onClose: () => void;
+	onConfirm: () => void;
+	isPending: boolean;
+	blocked: boolean;
+	errorMessage?: string;
+	confirmLabel: string;
+}) {
+	return (
+		<Modal
+			open={open}
+			onClose={() => {
+				if (!isPending) onClose();
+			}}
+			title="Reset & restart run?"
+		>
+			<p className="text-sm text-zinc-300">
+				{resetConfirmMessage(
+					run.status,
+					discardWork,
+					// Named only while the work is still there to lose: an already
+					// abandoned record must not read as a second warning.
+					run.preservedWorker?.state === 'preserved'
+						? preservedWorkerLabel(run.preservedWorker)
+						: null,
+				)}
+			</p>
+
+			<label className="flex items-start gap-3 mt-4 p-3 border border-red-900/50 rounded-md bg-red-950/20 cursor-pointer hover:bg-red-950/30 transition-colors">
+				<input
+					type="checkbox"
+					checked={discardWork}
+					onChange={(event) => onDiscardWorkChange(event.target.checked)}
+					disabled={isPending}
+					className="mt-0.5 h-4 w-4 accent-red-600 disabled:opacity-50"
+				/>
+				<span>
+					<span className="block text-sm font-medium text-red-200">
+						Also discard uncommitted / unpushed work in the checkout
+					</span>
+					<span className="block text-xs text-red-400/80 mt-1">
+						Without this, a checkout holding uncommitted changes or unpushed commits is kept and the
+						restarted run may block on it again. With it, that work is deleted and cannot be
+						recovered.
+					</span>
+				</span>
+			</label>
+
+			{errorMessage && (
+				<div className="mt-3 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+					{errorMessage}
+				</div>
+			)}
+			<ModalFooter
+				primary={
+					// Guarded on the accepted restart too, so a modal left open across a
+					// refetch can't queue a second one.
+					<button
+						type="button"
+						onClick={onConfirm}
+						disabled={blocked}
+						className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+					>
+						{blocked && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+						{confirmLabel}
+					</button>
+				}
+				secondary={
+					<button
+						type="button"
+						onClick={onClose}
+						disabled={isPending}
+						className="px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-zinc-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+					>
+						Cancel
+					</button>
+				}
+			/>
+		</Modal>
+	);
+}
+
+/**
  * "Reset & restart" action (issue #428) for a wedged `failed`/`deferred` run —
  * the last resort when neither "Retry now" nor "Terminate" can move it because
  * its dispatch, cancellation flag, worktree lease, and recovery record disagree.
@@ -670,76 +833,290 @@ export function ResetRunButton({
 				</div>
 			)}
 
-			<Modal
+			<ResetConfirmModal
+				run={run}
 				open={confirmOpen}
-				onClose={() => {
-					if (!mutation.isPending) closeConfirm();
-				}}
-				title="Reset & restart run?"
-			>
-				<p className="text-sm text-zinc-300">
-					{resetConfirmMessage(
-						run.status,
-						discardWork,
-						// Named only while the work is still there to lose: an already
-						// abandoned record must not read as a second warning.
-						run.preservedWorker?.state === 'preserved'
-							? preservedWorkerLabel(run.preservedWorker)
-							: null,
+				discardWork={discardWork}
+				onDiscardWorkChange={setDiscardWork}
+				onClose={closeConfirm}
+				onConfirm={() => mutation.mutate(discardWork)}
+				isPending={mutation.isPending}
+				blocked={blocked}
+				errorMessage={mutation.isError ? mutation.error.message : undefined}
+				confirmLabel={resetButtonLabel(mutation.isPending, outstanding !== null)}
+			/>
+		</div>
+	);
+}
+
+/**
+ * The Recover popup's contents (issue #593): one full-width entry per eligible
+ * recovery choice — the retry-family action under its own server-derived label
+ * and hue, and "Reset & restart", which picks up its existing confirmation
+ * instead of submitting here — followed by the override fields a retry can carry.
+ *
+ * Every submit is guarded by `blocked`, so a popup left open across a background
+ * refetch that surfaces an accepted request cannot fire the alternate action.
+ */
+function RecoveryOptionsPopup({
+	run,
+	choices,
+	blocked,
+	onRetry,
+	onReset,
+	onClose,
+}: {
+	run: RunRow;
+	choices: RecoveryChoices;
+	blocked: boolean;
+	onRetry: (overrides: RetryOverrides) => void;
+	onReset: () => void;
+	onClose: () => void;
+}) {
+	const kind = choices.retry;
+
+	return (
+		<>
+			{/* Click-outside backdrop */}
+			<button
+				type="button"
+				className="fixed inset-0 z-40 cursor-default focus:outline-none"
+				onClick={onClose}
+				aria-label="Close recovery options"
+			/>
+
+			{/* The actual popover */}
+			<div className="absolute left-0 top-full mt-2 z-50 w-80 bg-zinc-900 border border-zinc-850 rounded-lg shadow-2xl p-4 animate-in fade-in slide-in-from-top-2 duration-150">
+				<h4 className="text-xs font-semibold text-zinc-300 tracking-wide uppercase mb-3">
+					Recovery actions
+				</h4>
+
+				<div className="space-y-2">
+					{kind && (
+						<button
+							type="button"
+							onClick={() => onRetry({})}
+							disabled={blocked}
+							className={`w-full inline-flex items-center gap-2 px-3 py-2 text-sm font-semibold text-white rounded-md focus:outline-none focus:ring-1 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer ${retrySplitPalette(kind).main}`}
+						>
+							{continuesPriorWork(kind) ? (
+								<Play className="h-4 w-4" />
+							) : (
+								<RefreshCw className="h-4 w-4" />
+							)}
+							{retryButtonLabel(kind, false)}
+						</button>
 					)}
-				</p>
 
-				<label className="flex items-start gap-3 mt-4 p-3 border border-red-900/50 rounded-md bg-red-950/20 cursor-pointer hover:bg-red-950/30 transition-colors">
-					<input
-						type="checkbox"
-						checked={discardWork}
-						onChange={(event) => setDiscardWork(event.target.checked)}
-						disabled={mutation.isPending}
-						className="mt-0.5 h-4 w-4 accent-red-600 disabled:opacity-50"
-					/>
-					<span>
-						<span className="block text-sm font-medium text-red-200">
-							Also discard uncommitted / unpushed work in the checkout
-						</span>
-						<span className="block text-xs text-red-400/80 mt-1">
-							Without this, a checkout holding uncommitted changes or unpushed commits is kept and
-							the restarted run may block on it again. With it, that work is deleted and cannot be
-							recovered.
-						</span>
-					</span>
-				</label>
+					{choices.reset && (
+						// Reset keeps its own confirmation: picking it here closes the popup
+						// and opens that modal, so the confirm click is what actually submits.
+						<button
+							type="button"
+							onClick={onReset}
+							disabled={blocked}
+							className="w-full inline-flex items-center gap-2 px-3 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+						>
+							<RotateCcw className="h-4 w-4" />
+							{resetButtonLabel(false)}
+						</button>
+					)}
+				</div>
 
-				{mutation.isError && (
-					<div className="mt-3 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
-						{mutation.error.message}
+				{kind && (
+					<div className="mt-4 pt-4 border-t border-zinc-850">
+						<RetryOverrideHeading kind={kind} />
+						<RetryOverridePanel
+							run={run}
+							submitLabel={recoveryOverrideSubmitLabel(kind)}
+							disabled={blocked}
+							onSubmit={onRetry}
+						/>
 					</div>
 				)}
-				<ModalFooter
-					primary={
-						// Guarded on the accepted restart too, so a modal left open across a
-						// refetch can't queue a second one.
-						<button
-							type="button"
-							onClick={() => mutation.mutate(discardWork)}
-							disabled={blocked}
-							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-						>
-							{blocked && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-							{resetButtonLabel(mutation.isPending, outstanding !== null)}
-						</button>
-					}
-					secondary={
-						<button
-							type="button"
-							onClick={closeConfirm}
-							disabled={mutation.isPending}
-							className="px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-zinc-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-						>
-							Cancel
-						</button>
-					}
-				/>
-			</Modal>
+
+				<div className="pt-3 flex justify-end">
+					<button
+						type="button"
+						onClick={onClose}
+						className="px-2.5 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+					>
+						Cancel
+					</button>
+				</div>
+			</div>
+		</>
+	);
+}
+
+/**
+ * The single "Recover" control an errored run exposes (issue #593).
+ *
+ * Retry and "Reset & restart" are two ways to recover the *same* errored run, and
+ * as two live buttons both could be submitted while the first was still
+ * unresolved — two competing recovery requests against one row, with nothing on
+ * the page saying which was in progress. This consolidates them: one trigger
+ * opens a popup carrying whichever choices are currently eligible (each with its
+ * own label, hue, and confirmation), choosing one closes the popup and submits
+ * only that action, and the trigger then becomes a disabled status label naming
+ * the choice in flight until it resolves.
+ *
+ * Mutual exclusion is not this component's local state alone. Both choices record
+ * the same durable `manual-retry` dispatch, so `runs.getById` reports either as
+ * one outstanding `restart` request (issue #561) — which is what makes the
+ * disabled state identical for a second viewer and across a reload, rather than
+ * protecting only the browser that clicked. The local mutation state adds only
+ * what the durable fact cannot say: *which* of the two choices this operator
+ * picked, so the label can name it during the HTTP round-trip.
+ *
+ * Deliberately scoped to the error-recovery states: `deferred` and `checkpointed`
+ * runs have not ended in an error — one waits on a scheduled retry, the other on
+ * a scheduled continuation — and keep their side-by-side controls.
+ */
+export function RecoverRunButton({
+	run,
+	onResetSuccess,
+}: {
+	run: RunRow;
+	onResetSuccess?: (report: ResetRunReport) => void;
+}) {
+	const queryClient = useQueryClient();
+	const [isOpen, setIsOpen] = useState(false);
+	const [confirmOpen, setConfirmOpen] = useState(false);
+	const [discardWork, setDiscardWork] = useState(false);
+
+	/** Close the modal and drop the force opt-in, so reopening never starts armed. */
+	const closeConfirm = () => {
+		setConfirmOpen(false);
+		setDiscardWork(false);
+	};
+
+	// The detail refetch is awaited for the reason issue #561 documents on
+	// Terminate/Reset: each mutation returns as soon as the replacement dispatch
+	// exists, so without it the trigger reads "Recover" again before the queued
+	// restart becomes visible — the "it did nothing" reading that invited the
+	// second, competing request in the first place.
+	const refreshRun = async () => {
+		queryClient.invalidateQueries({ queryKey: trpc.runs.list.queryKey() });
+		await queryClient.invalidateQueries({
+			queryKey: trpc.runs.getById.queryKey({ id: run.id }),
+		});
+	};
+
+	const retryMutation = useMutation({
+		mutationFn: (overrides: RetryOverrides) =>
+			trpcClient.runs.retryNow.mutate({
+				runId: run.id,
+				cli: overrides.cli,
+				model: overrides.model,
+				reasoning: overrides.reasoning,
+			}),
+		onSuccess: refreshRun,
+	});
+
+	const resetMutation = useMutation({
+		mutationFn: (force: boolean) => trpcClient.runs.reset.mutate({ runId: run.id, force }),
+		onSuccess: async (data) => {
+			closeConfirm();
+			onResetSuccess?.(data);
+			await refreshRun();
+		},
+	});
+
+	const choices = recoveryChoices(run);
+	if (!canRecoverRun(choices)) return null;
+
+	const outstanding = run.pendingRequest?.action === 'restart' ? run.pendingRequest : null;
+	const pending: RecoveryPending = resetMutation.isPending
+		? 'reset'
+		: retryMutation.isPending
+			? 'retry'
+			: null;
+	// One flag for both choices: whichever one is in flight (or already accepted)
+	// blocks the trigger *and* every submit inside a popup left open across a
+	// background refetch, so no alternate recovery action can be submitted.
+	const blocked = pending !== null || outstanding !== null;
+
+	return (
+		<div className="mt-3">
+			<div className="relative inline-flex">
+				<button
+					type="button"
+					onClick={() => {
+						// Drop any previous report/error so the popup opens on a clean slate.
+						retryMutation.reset();
+						resetMutation.reset();
+						setIsOpen(!isOpen);
+					}}
+					disabled={blocked}
+					className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md shadow-lg shadow-violet-950/10 hover:bg-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+				>
+					{blocked ? (
+						<Loader2 className="h-4 w-4 animate-spin" />
+					) : (
+						<LifeBuoy className="h-4 w-4" />
+					)}
+					{recoverButtonLabel(choices, pending, outstanding !== null)}
+					{!blocked && <ChevronDown className="h-4 w-4" />}
+				</button>
+
+				{isOpen && (
+					<RecoveryOptionsPopup
+						run={run}
+						choices={choices}
+						blocked={blocked}
+						onRetry={(overrides) => {
+							setIsOpen(false);
+							retryMutation.mutate(overrides);
+						}}
+						onReset={() => {
+							setIsOpen(false);
+							setConfirmOpen(true);
+						}}
+						onClose={() => setIsOpen(false)}
+					/>
+				)}
+			</div>
+
+			{outstanding && (
+				<PendingRequestNotice request={outstanding} explanation={describeRestartWait()} />
+			)}
+
+			{resetMutation.isSuccess && !onResetSuccess && (
+				<div className="mt-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+					<h4 className="text-xs font-semibold text-zinc-200">Reset complete</h4>
+					<ul className="mt-1.5 space-y-1 text-xs text-zinc-400">
+						{describeResetResult(resetMutation.data).map((line) => (
+							<li key={line}>{line}</li>
+						))}
+					</ul>
+				</div>
+			)}
+
+			{retryMutation.isError && (
+				<div className="mt-2 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+					{retryMutation.error.message}
+				</div>
+			)}
+
+			{resetMutation.isError && !confirmOpen && (
+				<div className="mt-2 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+					{resetMutation.error.message}
+				</div>
+			)}
+
+			<ResetConfirmModal
+				run={run}
+				open={confirmOpen}
+				discardWork={discardWork}
+				onDiscardWorkChange={setDiscardWork}
+				onClose={closeConfirm}
+				onConfirm={() => resetMutation.mutate(discardWork)}
+				isPending={resetMutation.isPending}
+				blocked={blocked}
+				errorMessage={resetMutation.isError ? resetMutation.error.message : undefined}
+				confirmLabel={resetButtonLabel(resetMutation.isPending, outstanding !== null)}
+			/>
 		</div>
 	);
 }
@@ -1445,11 +1822,13 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 								{describeCancellationOrigin(run.cancellation)}
 							</p>
 						)}
+						{/*
+						 * One control for every eligible recovery choice (issue #593): the
+						 * component computes them itself and renders nothing when none
+						 * applies, so the choice rules can't drift from a call-site guard.
+						 */}
 						<div className="flex flex-wrap items-start gap-3">
-							{canRetryRun(run.status) && <RetryNowButton run={run} />}
-							{canResetRun(run.status) && (
-								<ResetRunButton run={run} onResetSuccess={setResetReport} />
-							)}
+							<RecoverRunButton run={run} onResetSuccess={setResetReport} />
 						</div>
 					</div>
 				</div>
