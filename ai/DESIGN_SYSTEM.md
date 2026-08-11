@@ -126,7 +126,9 @@ Each entry is the Tailwind "recipe" to reuse — treat these as the contract, no
 
 ## 5. Layout shell
 
-- Left sidebar (`w-64` on desktop, full-width stacked on mobile), `bg-panel`, bordered `border-r border-zinc-800`. Top: wordmark + version pill. Middle: nav grouped under a small uppercase section label (`text-[10px] font-semibold uppercase tracking-widest text-zinc-500`). Bottom: connection status dot pinned via `justify-between` on the sidebar's flex column.
+- Left sidebar (`w-64` on desktop, full-width stacked on mobile), `bg-panel`, bordered `border-r border-zinc-800`. Top: wordmark + version pill. Middle: nav grouped under a small uppercase section label (`text-[10px] font-semibold uppercase tracking-widest text-zinc-500`). Bottom: a **compact account row** — connection status dot, the signed-in user's name linking to `/profile`, and Sign out — on one line, `border-t border-zinc-850 px-4 py-3`.
+- **The account row is pinned, the nav scrolls (issue #665).** On desktop the sidebar is its own bounded column (`md:sticky md:top-0 md:h-screen`) whose wordmark+nav wrapper is the only scrolling part (`md:min-h-0 md:flex-1 md:overflow-y-auto`), so the account row stays reachable however long the project list grows. Below `md` the sidebar stacks full-width above the content and flows with the page — a pinned 100vh column would fill a phone screen. Add new nav to the scrolling wrapper, not beside the account row; anything put outside the wrapper permanently costs the nav that much height.
+- **The connection state is a dot, not a sentence.** The footer is an account area, so the dot carries the state on its own (`title` for its accessible name); don't reintroduce a "Connected"/"Disconnected" label beside it.
 - Main content: centered column, `max-w-5xl mx-auto`, `p-4 md:p-8`.
 - Detail screens get a breadcrumb (`text-xs font-mono text-zinc-500`, current segment `text-zinc-300 font-semibold`) above the page title, then a horizontal tab bar, then the active tab's content in its own card.
 
