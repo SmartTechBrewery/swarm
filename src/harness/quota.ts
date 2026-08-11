@@ -3,6 +3,7 @@ import { AgentCliSchema } from './agent-cli.js';
 
 export const QuotaWindowSchema = z.object({
 	name: z.string(),
+	sourceSlot: z.string().optional(),
 	durationMins: z.number().optional(),
 	usedPercent: z.number().optional(),
 	resetsAt: z.string().optional(), // ISO timestamp

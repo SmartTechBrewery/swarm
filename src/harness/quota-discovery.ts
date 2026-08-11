@@ -158,16 +158,23 @@ export function queryCodexQuota(command = 'codex'): Promise<Partial<CliQuotaSnap
 							// Both slots go through the same rule: a window is named after the
 							// duration Codex reported, and a slot Codex left null contributes
 							// nothing at all (issue #669).
-							const windows = [rateLimits?.primary, rateLimits?.secondary]
-								.filter((slot) => slot != null)
-								.map((slot) => ({
-									name: nameQuotaWindow(slot.windowDurationMins),
-									durationMins: slot.windowDurationMins,
-									usedPercent: slot.usedPercent,
-									resetsAt: slot.resetsAt
-										? new Date(slot.resetsAt * 1000).toISOString()
-										: undefined,
-								}));
+							const windows = [
+								['primary', rateLimits?.primary],
+								['secondary', rateLimits?.secondary],
+							].flatMap(([sourceSlot, slot]) => {
+								if (slot == null) return [];
+								return [
+									{
+										name: nameQuotaWindow(slot.windowDurationMins),
+										sourceSlot,
+										durationMins: slot.windowDurationMins,
+										usedPercent: slot.usedPercent,
+										resetsAt: slot.resetsAt
+											? new Date(slot.resetsAt * 1000).toISOString()
+											: undefined,
+									},
+								];
+							});
 
 							// The headline figures track the window closest to exhausting rather
 							// than whichever slot happened to arrive first, so they stay meaningful

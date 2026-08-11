@@ -118,6 +118,7 @@ describe('quota-discovery', () => {
 			expect(result.windows).toHaveLength(1);
 			expect(result.windows?.[0]).toEqual({
 				name: '5-hour',
+				sourceSlot: 'primary',
 				durationMins: 300,
 				usedPercent: 45,
 				resetsAt: new Date(1700000000 * 1000).toISOString(),
@@ -144,6 +145,7 @@ describe('quota-discovery', () => {
 			expect(result.windows).toEqual([
 				{
 					name: 'Weekly',
+					sourceSlot: 'primary',
 					durationMins: 10080,
 					usedPercent: 28,
 					resetsAt: new Date(1787046281 * 1000).toISOString(),
@@ -164,7 +166,10 @@ describe('quota-discovery', () => {
 			});
 
 			const result = await promise;
-			expect(result.windows?.map((w) => w.name)).toEqual(['5-hour', 'Weekly']);
+			expect(result.windows).toMatchObject([
+				{ name: '5-hour', sourceSlot: 'primary' },
+				{ name: 'Weekly', sourceSlot: 'secondary' },
+			]);
 			expect(result.remainingPercentage).toBe(20);
 			expect(result.resetTime).toBe(new Date(1700600000 * 1000).toISOString());
 		});
@@ -180,7 +185,13 @@ describe('quota-discovery', () => {
 
 			const result = await promise;
 			expect(result.windows).toEqual([
-				{ name: 'Usage limit', durationMins: undefined, usedPercent: 5, resetsAt: undefined },
+				{
+					name: 'Usage limit',
+					sourceSlot: 'primary',
+					durationMins: undefined,
+					usedPercent: 5,
+					resetsAt: undefined,
+				},
 			]);
 		});
 
