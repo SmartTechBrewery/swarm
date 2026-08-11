@@ -1,6 +1,17 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router';
-import { FolderGit2, Gauge, LogOut, Play, Plus, Server, Settings } from 'lucide-react';
+import {
+	CircleCheck,
+	CircleDashed,
+	CircleX,
+	FolderGit2,
+	Gauge,
+	LogOut,
+	Play,
+	Plus,
+	Server,
+	Settings,
+} from 'lucide-react';
 import { useState } from 'react';
 import { ProjectCreateDialog } from '@/components/projects/project-create-dialog.js';
 import { logout } from '@/lib/auth.js';
@@ -8,6 +19,22 @@ import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
 import { version } from '../../../../package.json';
+
+// Each connection state gets its own icon shape (not just a color), so the
+// state reads without relying on color perception (issue #665).
+const CONNECTION_STATE_META = {
+	connected: {
+		Icon: CircleCheck,
+		label: 'Connected',
+		iconClassName: 'h-3.5 w-3.5 text-emerald-500',
+	},
+	disconnected: { Icon: CircleX, label: 'Disconnected', iconClassName: 'h-3.5 w-3.5 text-red-500' },
+	connecting: {
+		Icon: CircleDashed,
+		label: 'Connecting…',
+		iconClassName: 'h-3.5 w-3.5 text-zinc-500',
+	},
+} as const;
 
 export function Sidebar() {
 	const currentPath = useRouterState({ select: (s) => s.location.pathname });
@@ -18,6 +45,17 @@ export function Sidebar() {
 	const currentUser = useCurrentUser();
 	const [createOpen, setCreateOpen] = useState(false);
 
+	const connectionState: keyof typeof CONNECTION_STATE_META = pingQuery.isSuccess
+		? 'connected'
+		: pingQuery.isError
+			? 'disconnected'
+			: 'connecting';
+	const {
+		Icon: ConnectionIcon,
+		label: connectionLabel,
+		iconClassName: connectionIconClassName,
+	} = CONNECTION_STATE_META[connectionState];
+
 	const handleLogout = async () => {
 		await logout();
 		// Drop all cached (now-unauthenticated) query state and return to login.
@@ -26,8 +64,13 @@ export function Sidebar() {
 	};
 
 	return (
-		<div className="flex w-full md:w-64 flex-col justify-between border-r border-zinc-800 bg-panel">
-			<div>
+		<div className="flex w-full md:sticky md:top-0 md:h-screen md:w-64 flex-col border-r border-zinc-800 bg-panel">
+			{/* Only the wordmark + nav column scrolls, so the account row below stays
+			    pinned to the bottom of the sidebar however long the project list grows
+			    (issue #665). Desktop only: below `md` the sidebar stacks full-width
+			    above the content, where a pinned full-height column would eat the
+			    whole phone screen, so there it flows with the page as before. */}
+			<div className="md:min-h-0 md:flex-1 md:overflow-y-auto">
 				<div className="flex h-14 items-center justify-between border-b border-zinc-850 px-4">
 					<span className="text-sm font-semibold text-zinc-100">SWARM</span>
 					<span className="px-2 py-0.5 text-[10px] uppercase font-mono font-bold tracking-wider bg-zinc-850 text-zinc-400 rounded border border-zinc-800">
@@ -144,41 +187,49 @@ export function Sidebar() {
 					</Link>
 				</nav>
 			</div>
-			<div>
-				{currentUser.data && (
-					<div className="flex items-center justify-between gap-2 border-t border-zinc-850 px-4 py-3">
-						<span
-							className="min-w-0 truncate text-xs text-zinc-400"
-							title={currentUser.data.identifier}
-						>
-							{currentUser.data.displayName}
-						</span>
-						<button
-							type="button"
-							onClick={handleLogout}
-							className="flex items-center gap-1 rounded px-1.5 py-1 text-xs text-zinc-500 hover:bg-zinc-800/40 hover:text-zinc-200 transition-colors shrink-0"
-							title="Sign out"
-						>
-							<LogOut className="h-3.5 w-3.5" />
-							Sign out
-						</button>
-					</div>
-				)}
-				<div className="flex items-center gap-2 border-t border-zinc-850 p-4">
+			{/* The account area: one compact row that never scrolls away, so the
+			    profile and Sign out stay reachable from anywhere in the nav (#665). */}
+			{currentUser.data && (
+				<div className="flex shrink-0 items-center gap-2 border-t border-zinc-850 px-4 py-3">
+					{/* The connection state survived the removal of its "Connected" text
+					    (#665) — the footer is an account area now, and the status reads
+					    fine as an icon. Each state gets its own shape (not just a color),
+					    and `role="status"` + `aria-label` give it an accessible, live-
+					    announced name without needing a focusable control or a visible
+					    label put back: nothing renders `connectionLabel` in the sidebar. */}
 					<span
-						className={
-							pingQuery.isSuccess
-								? 'h-2 w-2 rounded-full bg-emerald-500 ring-4 ring-emerald-500/10'
-								: pingQuery.isError
-									? 'h-2 w-2 rounded-full bg-red-500 ring-4 ring-red-500/10'
-									: 'h-2 w-2 rounded-full bg-zinc-600 ring-4 ring-zinc-600/10'
-						}
-					/>
-					<span className="text-xs text-zinc-500">
-						{pingQuery.isSuccess ? 'Connected' : pingQuery.isError ? 'Disconnected' : 'Connecting…'}
+						role="status"
+						aria-label={connectionLabel}
+						title={connectionLabel}
+						className="shrink-0"
+					>
+						<ConnectionIcon aria-hidden="true" className={connectionIconClassName} />
 					</span>
+					{/* The signed-in user's name is the way into their own profile
+					    (issue #659) — it was a label until then. `min-w-0 truncate` stays
+					    so a long name can't push the Sign out button off the row. */}
+					<Link
+						to="/profile"
+						className={
+							currentPath.startsWith('/profile')
+								? 'min-w-0 flex-1 truncate text-xs text-zinc-100'
+								: 'min-w-0 flex-1 truncate text-xs text-zinc-400 hover:text-zinc-200 transition-colors'
+						}
+						title={currentUser.data.identifier}
+					>
+						{currentUser.data.displayName}
+					</Link>
+					<button
+						type="button"
+						onClick={handleLogout}
+						className="flex items-center gap-1 rounded px-1.5 py-1 text-xs text-zinc-500 hover:bg-zinc-800/40 hover:text-zinc-200 transition-colors shrink-0"
+						title="Sign out"
+					>
+						<LogOut className="h-3.5 w-3.5" />
+						Sign out
+					</button>
 				</div>
-			</div>
+			)}
 			<ProjectCreateDialog open={createOpen} onOpenChange={setCreateOpen} />
 		</div>
 	);
