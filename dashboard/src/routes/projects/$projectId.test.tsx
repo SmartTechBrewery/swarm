@@ -1086,7 +1086,7 @@ describe('diffProjectForSync', () => {
 
 describe('ProjectTabBar', () => {
 	it('renders the tabs in PROJECT_TABS order, with Workers directly after Runs', () => {
-		render(<ProjectTabBar activeTab="runs" onSelect={() => {}} />);
+		render(<ProjectTabBar activeTab="runs" canAdminister={true} onSelect={() => {}} />);
 
 		const labels = screen.getAllByRole('button').map((button) => button.textContent);
 		expect(labels).toEqual([
@@ -1102,9 +1102,18 @@ describe('ProjectTabBar', () => {
 		expect(labels).toHaveLength(PROJECT_TABS.length);
 	});
 
+	// Issue #655: the configuration tabs are the project administrator's. They are
+	// omitted rather than disabled — there is nothing on them for anyone else to read.
+	it('offers a non-administrator only the operational tabs', () => {
+		render(<ProjectTabBar activeTab="runs" canAdminister={false} onSelect={() => {}} />);
+
+		const labels = screen.getAllByRole('button').map((button) => button.textContent);
+		expect(labels).toEqual(['Runs', 'Workers']);
+	});
+
 	it('selects the tab that was clicked', () => {
 		const onSelect = vi.fn();
-		render(<ProjectTabBar activeTab="runs" onSelect={onSelect} />);
+		render(<ProjectTabBar activeTab="runs" canAdminister={true} onSelect={onSelect} />);
 
 		fireEvent.click(screen.getByRole('button', { name: 'Workers' }));
 

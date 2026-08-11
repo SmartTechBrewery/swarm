@@ -32,7 +32,12 @@ import { githubProjectsBlankPm } from '../../integrations/pm/github-projects/con
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { getSCMProvider } from '../../integrations/scm/registry.js';
 import type { ScmType } from '../../scm/types.js';
-import { accessibleProjectScope, assertProjectAccess, filterAccessibleProjects } from '../authz.js';
+import {
+	accessibleProjectScope,
+	assertProjectAccess,
+	filterAccessibleProjects,
+	mayAccessProject,
+} from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { credentialsRouter } from './credentials.js';
 
@@ -245,6 +250,32 @@ export const projectsRouter = router({
 				});
 			}
 			return project;
+		}),
+
+	// What the caller may *do* on one project, rather than what it is configured as
+	// (issue #655) — the read model the project-detail screen decides which tabs to
+	// offer from, so the configuration and credential tabs a `projectAdmin`-gated
+	// mutation would refuse are never drawn or mounted for anyone else. It reports
+	// the authorization each of those procedures re-checks for itself
+	// (`mayAccessProject`, the non-throwing twin of `assertProjectAccess`); it is not
+	// an enforcement point, and it grants nothing.
+	//
+	// Kept separate from `getById` rather than folded into its return: the project
+	// config is written back into that query's cache by `projects.update`'s own
+	// result, which carries no viewer capability, so a flag riding along there would
+	// be dropped by the next config save.
+	//
+	// Gated at `contributor` like `getById`, so asking what you may do on a project
+	// you cannot see returns the same existence-hiding `NOT_FOUND`. An
+	// `instanceAdmin` administers every project, which `mayAccessProject` already
+	// answers — the dashboard needs no separate installation-role branch.
+	viewerAccess: authedProcedure
+		.input(z.object({ projectId: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			return {
+				canAdminister: await mayAccessProject(ctx.user, input.projectId, 'projectAdmin'),
+			};
 		}),
 
 	// Any authenticated user may create a project and becomes its `projectAdmin`
