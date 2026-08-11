@@ -1,6 +1,7 @@
 import { createRoute, useNavigate } from '@tanstack/react-router';
 import { FolderGit2, type LucideIcon, Server, ShieldCheck, UserRound } from 'lucide-react';
 import { AccountPanel } from '@/components/profile/account-panel.js';
+import { MyProjectsPanel } from '@/components/profile/my-projects-panel.js';
 import { MyWorkersPanel } from '@/components/profile/my-workers-panel.js';
 import {
 	isProfileTabAvailable,
@@ -27,8 +28,9 @@ import { rootRoute } from './__root.js';
  * Only tabs with a panel behind them are rendered ({@link ProfileTabBar} filters
  * on `isProfileTabAvailable`), and a deep link to a declared-but-undelivered one
  * degrades to Account — so the navigation structure is stated once in
- * `lib/profile-nav.ts` while each follow-up ships its own tab. **Account** and
- * **My Workers** (issue #660) are delivered; My Projects and Security are not yet.
+ * `lib/profile-nav.ts` while each follow-up ships its own tab. **Account**, **My
+ * Workers** (issue #660), and **My Projects** (issue #661) are delivered; Security
+ * is not yet.
  *
  * Each panel fetches its own data — nothing about the signed-in user is threaded
  * into one as a prop, so no panel can be handed an identity the session doesn't
@@ -122,6 +124,7 @@ function ProfileRouteComponent() {
 
 			{activeTab === 'account' && <AccountPanel user={currentUser.data} />}
 			{activeTab === 'workers' && <MyWorkersPanel />}
+			{activeTab === 'projects' && <MyProjectsPanel />}
 		</div>
 	);
 }

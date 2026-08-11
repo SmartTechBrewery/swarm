@@ -3,10 +3,10 @@ import { z } from 'zod';
 /**
  * The tabs on the user-profile screen, in display order — the profile's whole
  * user-facing navigation structure (issue #659), not only the part built today.
- * `projects` and `security` are delivered by their own follow-ups; each lands by
- * adding its tab to {@link AVAILABLE_PROFILE_TABS} and rendering its panel, so
- * the structure is decided once here rather than re-decided by whichever issue
- * happens to arrive first. `workers` arrived that way (issue #660).
+ * `security` is delivered by its own follow-up; it lands by adding its tab to
+ * {@link AVAILABLE_PROFILE_TABS} and rendering its panel, so the structure is
+ * decided once here rather than re-decided by whichever issue happens to arrive
+ * first. `workers` (issue #660) and `projects` (issue #661) arrived that way.
  */
 export const PROFILE_TABS = ['account', 'workers', 'projects', 'security'] as const;
 
@@ -21,6 +21,7 @@ export type ProfileTab = (typeof PROFILE_TABS)[number];
 export const AVAILABLE_PROFILE_TABS: ReadonlySet<ProfileTab> = new Set<ProfileTab>([
 	'account',
 	'workers',
+	'projects',
 ]);
 
 /** Whether a declared tab has a panel to render yet. */
