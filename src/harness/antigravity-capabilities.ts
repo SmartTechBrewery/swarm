@@ -44,6 +44,13 @@ const OUTPUT_FORMAT_LINE_RE = /^\s*--output-format\b/m;
  */
 const probes = new Map<string, Promise<boolean>>();
 
+/**
+ * The outcome of one print-mode slash-command attempt. `undefined` means this
+ * process has not observed the capability yet; `false` avoids spending another
+ * agent turn on a build that treated the command as an ordinary prompt.
+ */
+const printModeCommandAnswers = new Map<string, boolean>();
+
 /** The combined output of a finished-or-failed `execFile`, however it ended. */
 function probeOutput(value: unknown): string {
 	const record = value as { stdout?: unknown; stderr?: unknown } | null | undefined;
@@ -79,9 +86,20 @@ export function supportsOutputFormat(command: string): Promise<boolean> {
 	return probe;
 }
 
+/** Whether this process has observed `command` answer a print-mode slash command. */
+export function answersPrintModeCommands(command: string): boolean | undefined {
+	return printModeCommandAnswers.get(command);
+}
+
+/** Record a print-mode slash-command capability observation for this process. */
+export function recordPrintModeCommandAnswer(command: string, answers: boolean): void {
+	printModeCommandAnswers.set(command, answers);
+}
+
 /** Drop the memoized probe results. Test-only seam. */
 export function resetOutputFormatProbeCache(): void {
 	probes.clear();
+	printModeCommandAnswers.clear();
 }
 
 /** Exported for tests that need the real timeout value. */

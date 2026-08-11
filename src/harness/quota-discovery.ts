@@ -6,9 +6,14 @@ import { RETRY_PENDING_RUN_STATUSES } from '../db/repositories/runsRepository.js
 import { runs } from '../db/schema/runs.js';
 import { logger } from '../lib/logger.js';
 import type { AgentCli } from './agent-cli.js';
-import { supportsOutputFormat } from './antigravity-capabilities.js';
+import {
+	answersPrintModeCommands,
+	recordPrintModeCommandAnswer,
+	supportsOutputFormat,
+} from './antigravity-capabilities.js';
 import {
 	findAntigravityCommandData,
+	findAntigravityPrintError,
 	readAntigravityCredits,
 	readAntigravityQuota,
 } from './antigravity-quota.js';
@@ -308,7 +313,14 @@ async function probeAntigravityCommand(
 	}
 
 	const data = findAntigravityCommandData(stdout, commandName);
-	return data === undefined ? { outcome: 'unanswered' } : { outcome: 'answered', data };
+	if (data !== undefined) return { outcome: 'answered', data };
+	const error = findAntigravityPrintError(stdout);
+	return error === undefined
+		? { outcome: 'unanswered' }
+		: {
+				outcome: 'failed',
+				error: `agy ${slashCommand} probe failed: ${error.slice(0, MAX_PROBE_ERROR_CHARS)}`,
+			};
 }
 
 /**
@@ -317,10 +329,10 @@ async function probeAntigravityCommand(
  * Returns `undefined` when the installed binary does not answer the command —
  * the run-derived fallback stays in charge and no error reaches the operator.
  * That decision is made from **observed capability**, never a version compare
- * (ai/RULES.md §6), in two layers: a binary without `--output-format` predates
- * print-mode command answers entirely and is never spawned at all (it would take
- * `/quota` for an ordinary prompt and burn an agent turn on it), and a binary
- * that answers without a structured `command` block has told us the same thing.
+ * (ai/RULES.md §6). `--output-format` is a necessary, but not sufficient, gate:
+ * a binary that lacks it is never spawned at all, while a newer build that treats
+ * `/quota` as an ordinary prompt costs one observed probe before this process
+ * remembers it cannot answer print-mode commands.
  *
  * `/credits` is a second probe rather than part of the first, because agy
  * reports the balance under its own command — and it is only asked once `/quota`
@@ -329,16 +341,19 @@ async function probeAntigravityCommand(
 export async function queryAntigravityQuota(
 	command = 'agy',
 ): Promise<Partial<CliQuotaSnapshot> | undefined> {
+	if (answersPrintModeCommands(command) === false) return undefined;
 	if (!(await supportsOutputFormat(command))) return undefined;
 
 	const usage = await probeAntigravityCommand(command, '/quota', 'usage');
 	if (usage.outcome === 'failed') return { status: 'error', error: usage.error };
 	if (usage.outcome === 'unanswered') {
+		recordPrintModeCommandAnswer(command, false);
 		logger.debug('agy answered /quota without a command block; keeping the quota fallback', {
 			command,
 		});
 		return undefined;
 	}
+	recordPrintModeCommandAnswer(command, true);
 
 	const reading = readAntigravityQuota(usage.data);
 	if (!reading) return undefined;

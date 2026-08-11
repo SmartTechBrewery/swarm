@@ -19,6 +19,7 @@ import { applyConfig } from '@/config/apply.js';
 import { SwarmConfigSchema } from '@/config/schema.js';
 import { writeProjectCredential } from '@/db/repositories/credentialsRepository.js';
 import { upsertProjectToDb } from '@/db/repositories/projectsRepository.js';
+import { discoverCliQuotas } from '@/harness/quota-discovery.js';
 
 const project = createMockProjectConfig({
 	id: 'proj-1',
@@ -33,6 +34,7 @@ describe('applyConfig', () => {
 	beforeEach(() => {
 		vi.mocked(upsertProjectToDb).mockClear();
 		vi.mocked(writeProjectCredential).mockClear();
+		vi.mocked(discoverCliQuotas).mockClear();
 		process.env.REV_KEY = 'test-token-reviewer';
 		process.env.HOOK_KEY = 'whsec';
 	});
@@ -53,6 +55,7 @@ describe('applyConfig', () => {
 		expect(result.credentialsSkipped).toEqual([]);
 		expect(writeProjectCredential).toHaveBeenCalledWith('proj-1', 'REV_KEY', 'test-token-reviewer');
 		expect(writeProjectCredential).toHaveBeenCalledWith('proj-1', 'HOOK_KEY', 'whsec');
+		expect(discoverCliQuotas).not.toHaveBeenCalled();
 	});
 
 	it('writes the project row before its credentials (FK-safety ordering)', async () => {

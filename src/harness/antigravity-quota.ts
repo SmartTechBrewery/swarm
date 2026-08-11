@@ -41,6 +41,7 @@
  */
 
 import { z } from 'zod';
+import { antigravityErrorDetail, isAntigravityErrorResult } from './antigravity-stream.js';
 import type { QuotaWindow } from './quota.js';
 
 /**
@@ -82,6 +83,19 @@ const AntigravityCommandEnvelopeSchema = z.object({
 		name: z.string(),
 		data: z.unknown(),
 	}),
+});
+
+/** The ordinary print-mode envelope when a slash command itself fails. */
+const AntigravityPrintEnvelopeSchema = z.object({
+	status: z.string().optional(),
+	error: z.string().optional(),
+	response: z.string().optional(),
+	result: z
+		.object({
+			error: z.string().optional(),
+			response: z.string().optional(),
+		})
+		.optional(),
 });
 
 /** Window kinds agy names rather than measures. */
@@ -130,12 +144,31 @@ export function findAntigravityCommandData(stdout: string, name: string): unknow
 	return undefined;
 }
 
+/**
+ * The detail of a failed print-mode command envelope, if one was present.
+ * Successful envelopes without a command block are capability answers, not
+ * probe failures, so they deliberately return `undefined` here.
+ */
+export function findAntigravityPrintError(stdout: string): string | undefined {
+	for (const candidate of jsonDocuments(stdout)) {
+		const parsed = AntigravityPrintEnvelopeSchema.safeParse(candidate);
+		if (!parsed.success) continue;
+		const result = {
+			status: parsed.data.status,
+			error: parsed.data.result?.error ?? parsed.data.error,
+			response: parsed.data.result?.response ?? parsed.data.response,
+		};
+		if (!isAntigravityErrorResult(result)) continue;
+		return antigravityErrorDetail(result) || `agy reported ${result.status?.trim() || 'an error'}`;
+	}
+	return undefined;
+}
+
 /** How long the window covers, from what the bucket reported about itself. */
 function windowDurationMins(window: string | undefined): number | undefined {
 	const token = window?.trim().toLowerCase();
 	if (!token) return undefined;
-	const named = NAMED_WINDOW_MINUTES[token];
-	if (named) return named;
+	if (Object.hasOwn(NAMED_WINDOW_MINUTES, token)) return NAMED_WINDOW_MINUTES[token];
 	const measured = MEASURED_WINDOW_RE.exec(token);
 	if (!measured) return undefined;
 	const count = Number(measured[1]);

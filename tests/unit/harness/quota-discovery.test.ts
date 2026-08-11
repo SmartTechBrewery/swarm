@@ -117,6 +117,14 @@ const AGY_PROMPT_ANSWER = JSON.stringify({
 	response: 'I do not have access to your quota.',
 });
 
+/** A print-mode command failure carries its detail in the result envelope. */
+const AGY_ERROR_ANSWER = JSON.stringify({
+	conversation_id: '',
+	status: 'ERROR',
+	response: '',
+	result: { error: 'Authentication expired' },
+});
+
 interface AgyResponses {
 	help?: string;
 	quota?: string | Error;
@@ -368,7 +376,24 @@ describe('quota-discovery', () => {
 			// The observed capability, not a version compare: no block, no live read —
 			// and no second probe spent on a binary that just showed it cannot answer.
 			await expect(queryAntigravityQuota()).resolves.toBeUndefined();
+			await expect(queryAntigravityQuota()).resolves.toBeUndefined();
+			expect(
+				mockExecFile.mock.calls.filter(
+					(args: unknown[]) => Array.isArray(args[1]) && args[1].includes('/quota'),
+				),
+			).toHaveLength(1);
 			expect(probeArgsFor('/credits')).toBeUndefined();
+		});
+
+		it('reports an error envelope instead of treating it as an unsupported command', async () => {
+			mockAgy({
+				quota: Object.assign(new Error('agy exited 1'), { code: 1, stdout: AGY_ERROR_ANSWER }),
+			});
+
+			await expect(queryAntigravityQuota()).resolves.toMatchObject({
+				status: 'error',
+				error: expect.stringContaining('Authentication expired'),
+			});
 		});
 
 		it('reports why a probe that timed out failed', async () => {
@@ -434,6 +459,19 @@ describe('quota-discovery', () => {
 			expect(snapshot?.windows).toBeUndefined();
 		});
 
+		it('does not retry a command that already answered as an ordinary prompt', async () => {
+			mockAgy({ quota: AGY_PROMPT_ANSWER });
+
+			await antigravitySnapshot();
+			await antigravitySnapshot();
+
+			expect(
+				mockExecFile.mock.calls.filter(
+					(args: unknown[]) => Array.isArray(args[1]) && args[1].includes('/quota'),
+				),
+			).toHaveLength(1);
+		});
+
 		it('degrades to the fallback and records why when the probe fails', async () => {
 			mockAgy({ quota: Object.assign(new Error('timed out'), { killed: true }) });
 
@@ -441,6 +479,17 @@ describe('quota-discovery', () => {
 
 			expect(snapshot).toMatchObject({ status: 'error', source: 'fallback' });
 			expect(snapshot?.error).toContain('/quota probe failed');
+		});
+
+		it('records the command error when agy exits with an error envelope', async () => {
+			mockAgy({
+				quota: Object.assign(new Error('agy exited 1'), { code: 1, stdout: AGY_ERROR_ANSWER }),
+			});
+
+			const snapshot = await antigravitySnapshot();
+
+			expect(snapshot).toMatchObject({ status: 'error', source: 'fallback' });
+			expect(snapshot?.error).toContain('Authentication expired');
 		});
 
 		it('skips the live probe entirely when a cheap discovery is asked for', async () => {
