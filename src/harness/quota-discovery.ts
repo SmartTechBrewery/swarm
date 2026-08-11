@@ -6,7 +6,7 @@ import { runs } from '../db/schema/runs.js';
 import { logger } from '../lib/logger.js';
 import type { AgentCli } from './agent-cli.js';
 import { probeBinary } from './binary-probe.js';
-import type { CliQuotaSnapshot } from './quota.js';
+import { type CliQuotaSnapshot, nameQuotaWindow } from './quota.js';
 
 /**
  * Cheap availability check to verify if the binary exists and runs.
@@ -152,41 +152,43 @@ export function queryCodexQuota(command = 'codex'): Promise<Partial<CliQuotaSnap
 
 							const result = response.result;
 							const rateLimits = result?.rateLimits;
-							const primary = rateLimits?.primary;
-							const secondary = rateLimits?.secondary;
 							const creditsObj = rateLimits?.credits;
 							const planType = rateLimits?.planType;
 
-							const windows = [];
-							let mainRemaining: number | undefined;
-							let mainReset: string | undefined;
+							// Both slots go through the same rule: a window is named after the
+							// duration Codex reported, and a slot Codex left null contributes
+							// nothing at all (issue #669).
+							const windows = [
+								['primary', rateLimits?.primary],
+								['secondary', rateLimits?.secondary],
+							].flatMap(([sourceSlot, slot]) => {
+								if (slot == null) return [];
+								return [
+									{
+										name: nameQuotaWindow(slot.windowDurationMins),
+										sourceSlot,
+										durationMins: slot.windowDurationMins,
+										usedPercent: slot.usedPercent,
+										resetsAt: slot.resetsAt
+											? new Date(slot.resetsAt * 1000).toISOString()
+											: undefined,
+									},
+								];
+							});
 
-							if (primary) {
-								const remaining = Math.max(0, 100 - (primary.usedPercent ?? 0));
-								mainRemaining = remaining;
-								if (primary.resetsAt) {
-									mainReset = new Date(primary.resetsAt * 1000).toISOString();
-								}
-								windows.push({
-									name: 'Primary (5-hour)',
-									durationMins: primary.windowDurationMins,
-									usedPercent: primary.usedPercent,
-									resetsAt: mainReset,
-								});
-							}
-
-							if (secondary) {
-								let secReset: string | undefined;
-								if (secondary.resetsAt) {
-									secReset = new Date(secondary.resetsAt * 1000).toISOString();
-								}
-								windows.push({
-									name: 'Secondary (Weekly)',
-									durationMins: secondary.windowDurationMins,
-									usedPercent: secondary.usedPercent,
-									resetsAt: secReset,
-								});
-							}
+							// The headline figures track the window closest to exhausting rather
+							// than whichever slot happened to arrive first, so they stay meaningful
+							// whether Codex reports one window or two.
+							const limiting = windows.reduce<(typeof windows)[number] | undefined>(
+								(worst, w) =>
+									worst && (worst.usedPercent ?? -1) >= (w.usedPercent ?? -1) ? worst : w,
+								undefined,
+							);
+							const mainRemaining =
+								limiting?.usedPercent === undefined
+									? undefined
+									: Math.max(0, 100 - limiting.usedPercent);
+							const mainReset = limiting?.resetsAt;
 
 							let credits: string | undefined;
 							if (creditsObj) {
