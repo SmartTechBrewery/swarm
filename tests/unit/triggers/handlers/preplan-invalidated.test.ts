@@ -60,6 +60,7 @@ function providerReturning(items: WorkItem[]) {
 		supportsDependencies: false,
 		supportsAssignees: false,
 		listBlockers: async () => [],
+		listDependents: async () => [],
 		addBlockedBy: async () => undefined,
 	};
 	return { provider, listWorkItems };

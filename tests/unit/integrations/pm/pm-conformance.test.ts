@@ -71,6 +71,7 @@ const PM_CONTRACT_METHODS = [
 	'updateWorkItem',
 	'addLabel',
 	'listBlockers',
+	'listDependents',
 	'addBlockedBy',
 ] as const satisfies ReadonlyArray<PMContractMethod>;
 

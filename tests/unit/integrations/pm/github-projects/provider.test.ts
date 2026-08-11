@@ -840,6 +840,61 @@ describe('GitHubProjectsPMProvider', () => {
 		});
 	});
 
+	// Issue #639 — the reverse edge the shared cycle backstop reads.
+	describe('listDependents', () => {
+		it('reads the issues this one blocks from the blocking endpoint', async () => {
+			graphql.mockResolvedValue({ node: ITEM_NODE });
+			request.mockResolvedValue({
+				data: [
+					{
+						id: 631,
+						number: 631,
+						title: 'Per-provider PM credentials',
+						html_url: 'https://github.com/SmartTechBrewery/swarm/issues/631',
+						state: 'open',
+					},
+				],
+			});
+
+			const dependents = await provider.listDependents('PVTI_x');
+
+			// `blocking`, not `blocked_by`: the opposite endpoint would answer the
+			// question the gate already has an answer to, and suppress a real blocker.
+			expect(request).toHaveBeenCalledWith(
+				'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking',
+				expect.objectContaining({ owner: 'SmartTechBrewery', repo: 'swarm', issue_number: 10 }),
+			);
+			expect(dependents).toEqual([
+				{
+					reference: '#631',
+					url: 'https://github.com/SmartTechBrewery/swarm/issues/631',
+					title: 'Per-provider PM credentials',
+					open: true,
+				},
+			]);
+		});
+
+		it('returns [] when the item blocks nothing', async () => {
+			graphql.mockResolvedValue({ node: ITEM_NODE });
+			request.mockResolvedValue({ data: [] });
+			await expect(provider.listDependents('PVTI_x')).resolves.toEqual([]);
+		});
+
+		it('treats a missing issue-dependencies API (410) as no dependents', async () => {
+			graphql.mockResolvedValue({ node: ITEM_NODE });
+			request.mockRejectedValue(Object.assign(new Error('Gone'), { status: 410 }));
+			await expect(provider.listDependents('PVTI_x')).resolves.toEqual([]);
+		});
+
+		it('returns [] for a draft item with no backing Issue', async () => {
+			graphql.mockResolvedValue({
+				node: { id: 'PVTI_draft', content: { __typename: 'DraftIssue' }, fieldValueByName: null },
+			});
+			await expect(provider.listDependents('PVTI_draft')).resolves.toEqual([]);
+			expect(request).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('addBlockedBy', () => {
 		it('POSTs the blocker by its numeric database id to the dependencies API', async () => {
 			graphql.mockImplementation(async (_q: string, vars: { itemId: string }) => ({

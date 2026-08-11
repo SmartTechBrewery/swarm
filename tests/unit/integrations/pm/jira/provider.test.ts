@@ -931,6 +931,33 @@ describe('JiraPMProvider', () => {
 			});
 		});
 
+		// Issue #639 — the reverse edge the shared cycle backstop reads.
+		describe('listDependents', () => {
+			it('takes the outward side of the same links the blocker read reads inward', async () => {
+				mockJira({
+					'issue/SWARM-42': { key: 'SWARM-42', fields: { issuelinks: ISSUE_LINKS } },
+				});
+
+				// Only SWARM-8, the one `Blocks` link naming an `outwardIssue`: the two
+				// inward ones are what blocks *this* issue, and the `Relates` link is no
+				// dependency in either direction.
+				await expect(provider.listDependents('SWARM-42')).resolves.toEqual([
+					{
+						id: 'SWARM-8',
+						reference: 'SWARM-8',
+						url: 'https://example.atlassian.net/browse/SWARM-8',
+						title: 'Register the manifest',
+						open: true,
+					},
+				]);
+			});
+
+			it('reports nothing for an issue that blocks nothing', async () => {
+				mockJira({ 'issue/SWARM-42': { key: 'SWARM-42', fields: { issuelinks: [] } } });
+				await expect(provider.listDependents('SWARM-42')).resolves.toEqual([]);
+			});
+		});
+
 		describe('addBlockedBy', () => {
 			it('records the link in the direction that means “id is blocked by blockerId”', async () => {
 				mockJira({

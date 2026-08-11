@@ -341,13 +341,15 @@ SCM side uses and keeps SWARM correct even as the preview payload shifts.
 
 Cross-issue **dependencies** are a GitHub **Issues** feature (not Projects v2), exposed over
 plain REST — so, unlike the item/field reads above, they don't go through GraphQL. SWARM's
-`PMProvider` dependency capability (`supportsDependencies` / `listBlockers` / `addBlockedBy`,
-issue #330) is implemented against these endpoints in the GitHub Projects adapter, resolving a
-board item to its backing issue first (the adapter already does this for comments/updates):
+`PMProvider` dependency capability (`supportsDependencies` / `listBlockers` / `listDependents` /
+`addBlockedBy`, issues #330 and #639) is implemented against these endpoints in the GitHub Projects
+adapter, resolving a board item to its backing issue first (the adapter already does this for
+comments/updates):
 
 | Operation | Endpoint | Notes |
 | --- | --- | --- |
 | List "blocked by" | `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by` | Returns an array of Issue objects (with `id`, `number`, `state`, `title`, `html_url`). A repo/plan without the feature answers 404/410 — SWARM treats that as "no native blockers". |
+| List "blocking" | `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking` | The reverse edge — the issues this one blocks — in the same Issue-object shape, backing `PMProvider.listDependents` (issue #639). It answers with **issues, not board items**, so the mapped dependents carry no work-item `id` and the shared cycle check matches on `url`/`reference`; that is also why only the *direct* edge is checked. Same 404/410 handling: no reverse read leaves the blockers gating rather than ungating them. Verified live — `/issues/633/dependencies/blocking` lists #631. |
 | Add "blocked by" | `POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by` | Body `{ "issue_id": <numeric database id> }` — the blocking issue's **`id`**, *not* its number (resolve it with `issues.get` first). Idempotent: an already-recorded dependency comes back `422`, which SWARM swallows. |
 | Remove "blocked by" | `DELETE /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by/{issue_id}` | Not used by SWARM yet. |
 
@@ -356,7 +358,8 @@ resolved provider-neutrally: `src/pm/dependencies.ts` extracts the referenced is
 the adapter resolves each to its live `state` via `issues.get`, so both native relationships and
 mentioned prerequisites feed one `listBlockers` result — tagged `source: 'dependency'` and
 `source: 'mention'` respectively. Only the native half **gates** a run (issue #643); a prose mention
-is surfaced on the item for a human to record natively and never defers work.
+is surfaced on the item for a human to record natively and never defers work. `listDependents` takes
+no prose at all: it is what *excuses* a blocker, so a heuristic answer there could drop a real gate.
 
 ---
 

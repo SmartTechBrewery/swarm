@@ -16,6 +16,13 @@
  * comment holds the false-positive history that decided that; the split itself is
  * `partitionBlockersBySource` there, so both halves of the rule live next to each
  * other rather than as a `source` comparison here.
+ *
+ * **And a cycle never gates** (issue #639). Whatever survives that split is then
+ * checked against the item's own outgoing edges (`listDependents`): a blocker the
+ * item *natively blocks* cannot close until the gated item lands, so gating on it
+ * could only exhaust the wait budget and settle the run failed. That is the
+ * structural backstop, which is why it lives here — on the shared gate, applying to
+ * every provider — rather than in whichever adapter or parser produced the blocker.
  */
 
 import { logger } from '@/lib/logger.js';
@@ -23,10 +30,11 @@ import {
 	blockedRunMessage,
 	openBlockers,
 	partitionBlockersBySource,
+	partitionCyclicBlockers,
 	proseAdvisoryCommentBody,
 	proseAdvisoryMarker,
 } from '@/pm/dependencies.js';
-import type { PMProvider, WorkItem, WorkItemBlocker } from '@/pm/types.js';
+import type { PMProvider, WorkItem, WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 
 /**
  * Thrown by a phase that must not run yet because its work item is blocked by an
@@ -87,10 +95,56 @@ async function surfaceProseAdvisory(
 }
 
 /**
+ * Drop any blocker the item itself natively blocks (issue #639) — a cycle that
+ * could never resolve. Each suppression is logged with the blocker's reference and
+ * its {@link WorkItemBlocker.source} (issue #638's vocabulary), because a
+ * suppressed gate must be visible: it is the difference between "nothing was
+ * blocking this" and "something was, and it was impossible".
+ *
+ * The reverse read is best-effort in the *conservative* direction, unlike the
+ * blocker read above: a failure means the cycle check could not run, not that
+ * there is no cycle, so the blockers are returned unchanged and the existing
+ * five-minute re-check tries again. Ungating on a failed read would turn a
+ * transient board error into an out-of-order build — the failure issue #330 exists
+ * to prevent — which is strictly worse than the deadlock this guards against,
+ * since that one at least terminates.
+ */
+async function withoutCyclicBlockers(
+	pm: PMProvider,
+	workItem: WorkItem,
+	gating: WorkItemBlocker[],
+): Promise<WorkItemBlocker[]> {
+	let dependents: WorkItemDependent[];
+	try {
+		dependents = await pm.listDependents(workItem.id);
+	} catch (err) {
+		logger.warn('Dependency gate: could not read dependents; keeping the blockers as they are', {
+			workItemId: workItem.id,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return gating;
+	}
+	const partitioned = partitionCyclicBlockers(gating, dependents);
+	for (const blocker of partitioned.suppressed) {
+		logger.warn(
+			'Dependency gate: blocker is itself natively blocked by this item; gating on it could never resolve',
+			{
+				workItemId: workItem.id,
+				reference: blocker.reference,
+				source: blocker.source,
+			},
+		);
+	}
+	return partitioned.gating;
+}
+
+/**
  * The still-open prerequisites that **gate** `workItem`, or `[]` when nothing
  * does. Prose-only prerequisites are surfaced (logged and posted on the item) as a
  * side effect and deliberately left out of the returned list, so a caller cannot
- * gate on one by forgetting to filter — see the module comment.
+ * gate on one by forgetting to filter — see the module comment. A blocker this item
+ * natively blocks is dropped too, for the reason {@link withoutCyclicBlockers}
+ * gives.
  *
  * Best-effort by design: if the provider can't model dependencies, or the blocker
  * lookup fails transiently, this returns `[]` (proceed) rather than gating — a
@@ -124,5 +178,8 @@ export async function findGatingBlockers(
 	}
 	const { gating, advisory } = partitionBlockersBySource(open);
 	if (advisory.length > 0) await surfaceProseAdvisory(pm, workItem, advisory);
-	return gating;
+	// Only worth a reverse read when something would otherwise gate: with nothing to
+	// suppress, the check could only cost a board call per dispatch.
+	if (gating.length === 0) return gating;
+	return withoutCyclicBlockers(pm, workItem, gating);
 }

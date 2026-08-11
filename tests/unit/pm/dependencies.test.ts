@@ -7,10 +7,11 @@ import {
 	findDependencyReferences,
 	openBlockers,
 	partitionBlockersBySource,
+	partitionCyclicBlockers,
 	proseAdvisoryCommentBody,
 	proseAdvisoryMarker,
 } from '@/pm/dependencies.js';
-import type { WorkItemBlocker } from '@/pm/types.js';
+import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 
 function blocker(overrides: Partial<WorkItemBlocker> = {}): WorkItemBlocker {
@@ -20,6 +21,16 @@ function blocker(overrides: Partial<WorkItemBlocker> = {}): WorkItemBlocker {
 		title: 'Session auth',
 		open: true,
 		source: 'dependency',
+		...overrides,
+	};
+}
+
+function dependent(overrides: Partial<WorkItemDependent> = {}): WorkItemDependent {
+	return {
+		reference: '#319',
+		url: 'https://github.com/o/r/issues/319',
+		title: 'Session auth',
+		open: true,
 		...overrides,
 	};
 }
@@ -191,6 +202,76 @@ describe('partitionBlockersBySource', () => {
 
 	it('returns two empty lists for no blockers', () => {
 		expect(partitionBlockersBySource([])).toEqual({ gating: [], advisory: [] });
+	});
+});
+
+// Issue #639: a blocker the item itself blocks can never close, so it can never be
+// a wait — the reported deadlock (633 deferred on 631, whose own `blocked_by` named
+// 633) ran ~2000 rechecks and then settled failed.
+describe('partitionCyclicBlockers', () => {
+	it('suppresses a blocker the item natively blocks, matched by URL', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+			[dependent({ reference: 'ENG-631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(gating).toEqual([]);
+		expect(suppressed.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('falls back to the reference when the two reads carry no URL', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#631', url: '' })],
+			[dependent({ reference: '#631', url: '' })],
+		);
+		expect(gating).toEqual([]);
+		expect(suppressed.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('never matches two entries that are merely both blank', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '', url: '' })],
+			[dependent({ reference: '', url: '' })],
+		);
+		expect(gating).toHaveLength(1);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('gates everything when the item blocks nothing', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker(), blocker({ reference: '#5' })],
+			[],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#319', '#5']);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('gates everything when the dependents are unrelated to the blockers', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker()],
+			[dependent({ reference: '#900', url: 'https://github.com/o/r/issues/900' })],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('suppresses only the cyclic blocker, leaving a genuine one gating', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' }), blocker()],
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		expect(suppressed.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('checks only the direct edge — a dependent-of-a-dependent still gates', () => {
+		// Transitive cycles are deliberately out of scope: walking further needs each
+		// dependent's own provider-native id, which a reverse read need not yield.
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#700', url: 'https://github.com/o/r/issues/700' })],
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#700']);
+		expect(suppressed).toEqual([]);
 	});
 });
 

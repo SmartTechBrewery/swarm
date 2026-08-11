@@ -436,6 +436,7 @@ describe('runRespondToReviewPhase', () => {
 				supportsDependencies: false,
 				supportsAssignees: false,
 				listBlockers: vi.fn(async () => []),
+				listDependents: vi.fn(async () => []),
 				addBlockedBy: vi.fn(async () => {}),
 			};
 		}

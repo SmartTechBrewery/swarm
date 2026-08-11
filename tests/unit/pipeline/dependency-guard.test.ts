@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError, findGatingBlockers } from '@/pipeline/dependency-guard.js';
-import type { PMProvider, WorkItem, WorkItemBlocker } from '@/pm/types.js';
+import type { PMProvider, WorkItem, WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import { createMockWorkItem } from '../../helpers/factories.js';
 
 type PmOverrides = Partial<
-	Pick<PMProvider, 'supportsDependencies' | 'listBlockers' | 'findComment' | 'addComment'>
+	Pick<
+		PMProvider,
+		'supportsDependencies' | 'listBlockers' | 'listDependents' | 'findComment' | 'addComment'
+	>
 >;
 
 function pmWith(overrides: PmOverrides): PMProvider {
@@ -25,6 +29,7 @@ function pmWith(overrides: PmOverrides): PMProvider {
 		supportsDependencies: overrides.supportsDependencies ?? true,
 		supportsAssignees: true,
 		listBlockers: overrides.listBlockers ?? vi.fn(async () => []),
+		listDependents: overrides.listDependents ?? vi.fn(async () => []),
 		addBlockedBy: vi.fn(async () => {}),
 	};
 }
@@ -49,6 +54,17 @@ function mention(overrides: Partial<WorkItemBlocker> = {}): WorkItemBlocker {
 		source: 'mention',
 		...overrides,
 	});
+}
+
+/** An item this one natively blocks — the reverse edge `listDependents` answers with. */
+function dependent(overrides: Partial<WorkItemDependent> = {}): WorkItemDependent {
+	return {
+		reference: '#319',
+		url: 'https://github.com/o/r/issues/319',
+		title: 'Session auth',
+		open: true,
+		...overrides,
+	};
 }
 
 const workItem: WorkItem = createMockWorkItem({ id: 'PVTI_1' });
@@ -139,6 +155,91 @@ describe('findGatingBlockers', () => {
 		const pm = pmWith({ listBlockers: vi.fn(async () => [mention({ open: false })]), addComment });
 		expect(await findGatingBlockers(pm, workItem)).toEqual([]);
 		expect(addComment).not.toHaveBeenCalled();
+	});
+
+	// Issue #639 — the backstop. This is the reported deadlock's exact shape: item
+	// 633 was deferred on 631 while 631's own `blocked_by` list named 633, so the
+	// blocker could not close until the gated item landed.
+	describe('cycle backstop', () => {
+		it('does not gate on a blocker this item itself natively blocks', async () => {
+			const pm = pmWith({
+				listBlockers: vi.fn(async () => [
+					blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' }),
+				]),
+				listDependents: vi.fn(async () => [
+					dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' }),
+				]),
+			});
+			expect(await findGatingBlockers(pm, workItem)).toEqual([]);
+		});
+
+		it('logs each suppressed blocker with its reference and source', async () => {
+			const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+			const pm = pmWith({
+				listBlockers: vi.fn(async () => [
+					blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' }),
+				]),
+				listDependents: vi.fn(async () => [
+					dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' }),
+				]),
+			});
+
+			await findGatingBlockers(pm, workItem);
+
+			// A suppression must be visible: "nothing blocked this" and "something did,
+			// and it was impossible" are different facts.
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('natively blocked by this item'), {
+				workItemId: 'PVTI_1',
+				reference: '#631',
+				source: 'dependency',
+			});
+			warn.mockRestore();
+		});
+
+		it('still gates on a genuine blocker beside a cyclic one', async () => {
+			const pm = pmWith({
+				listBlockers: vi.fn(async () => [
+					blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' }),
+					blocker(),
+				]),
+				listDependents: vi.fn(async () => [
+					dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' }),
+				]),
+			});
+			const gating = await findGatingBlockers(pm, workItem);
+			expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		});
+
+		it('keeps the blockers gating when the dependents read throws', async () => {
+			// The cycle check could not run — that is not evidence there is no cycle, and
+			// ungating on a transient board error would build a task out of order.
+			const pm = pmWith({
+				listBlockers: vi.fn(async () => [blocker()]),
+				listDependents: vi.fn(async () => {
+					throw new Error('GitHub 500');
+				}),
+			});
+			const gating = await findGatingBlockers(pm, workItem);
+			expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		});
+
+		it('leaves unrelated dependents alone', async () => {
+			const pm = pmWith({
+				listBlockers: vi.fn(async () => [blocker()]),
+				listDependents: vi.fn(async () => [
+					dependent({ reference: '#900', url: 'https://github.com/o/r/issues/900' }),
+				]),
+			});
+			const gating = await findGatingBlockers(pm, workItem);
+			expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		});
+
+		it('does not read the dependents when nothing would gate anyway', async () => {
+			const listDependents = vi.fn(async () => []);
+			const pm = pmWith({ listBlockers: vi.fn(async () => [mention()]), listDependents });
+			expect(await findGatingBlockers(pm, workItem)).toEqual([]);
+			expect(listDependents).not.toHaveBeenCalled();
+		});
 	});
 });
 

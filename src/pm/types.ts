@@ -281,6 +281,36 @@ export interface WorkItemBlocker {
 	source: 'dependency' | 'mention';
 }
 
+/**
+ * An item that this work item blocks — the **reverse** edge of
+ * {@link WorkItemBlocker}, returned by {@link PMProvider.listDependents}. Enough
+ * to recognise it in the blocker list and to name it in a log line.
+ *
+ * It carries no `source`, unlike a blocker: this read is **native by
+ * definition**. Its whole purpose is to answer "does the provider's own
+ * dependency graph already say the proposed blocker is waiting on *me*?", and a
+ * prose-derived answer could not settle that — it would let the same heuristic
+ * that invented a blocker also excuse it (issue #639, `ai/ARCHITECTURE.md`
+ * "Pipeline phases" → Implementation).
+ */
+export interface WorkItemDependent {
+	/**
+	 * The dependent's provider-native work-item id when the provider's reverse read
+	 * yields one, else undefined. GitHub's does not — it answers with *issues*, not
+	 * board items — so callers match on {@link url} / {@link reference} rather than
+	 * on this.
+	 */
+	id?: string;
+	/** Human-readable reference for logs/messages — e.g. an issue number `#633`. */
+	reference: string;
+	/** Web URL of the dependent issue/item — the identity a blocker is matched on. */
+	url: string;
+	/** Title of the dependent issue/item, for human-readable messages. */
+	title: string;
+	/** Whether the dependent is still unfinished. Informational: a cycle is a cycle either way. */
+	open: boolean;
+}
+
 /** Optional server-side filters for {@link PMProvider.listWorkItems}. */
 export interface ListWorkItemsFilter {
 	/**
@@ -480,6 +510,28 @@ export interface PMProvider {
 	 * the mentions here would lose the notice rather than tighten the gate.
 	 */
 	listBlockers(id: string): Promise<WorkItemBlocker[]>;
+
+	/**
+	 * List the items this one *blocks* — the reverse edge of {@link listBlockers},
+	 * read from the provider's **native** dependency graph only, never from prose.
+	 * Returns `[]` when the item blocks nothing, or when the provider has no
+	 * dependency concept ({@link supportsDependencies} is `false`).
+	 *
+	 * It exists so that no run can ever be gated by a cycle (issue #639): the shared
+	 * dependency gate drops an open blocker the item itself natively blocks, because
+	 * such a blocker cannot close until the gated item lands, so waiting on it could
+	 * only ever run the wait budget out and settle the run failed. That happened —
+	 * item 633 deferred ~2000 times on an issue whose own `blocked_by` list named
+	 * 633 — which is why this is a structural backstop on the gate rather than an
+	 * improvement to whatever produced the blocker.
+	 *
+	 * A method rather than a field on {@link WorkItemBlocker} because the question is
+	 * about *this* item's outgoing edges, which the provider reads once per gate
+	 * check instead of once per candidate blocker. Native-only for the same reason
+	 * `source` decides a blocker's authority (issue #643): a prose-derived reverse
+	 * edge would let the heuristic that invented a blocker also excuse it.
+	 */
+	listDependents(id: string): Promise<WorkItemDependent[]>;
 
 	/**
 	 * Record that work item `id` is *blocked by* `blockerId` (a prerequisite that

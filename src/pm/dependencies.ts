@@ -50,7 +50,7 @@
  */
 
 import { isSwarmGeneratedBody, SWARM_GENERATED_FOOTER, swarmMarker } from '../scm/swarm-origin.js';
-import type { WorkItemBlocker } from './types.js';
+import type { WorkItemBlocker, WorkItemDependent } from './types.js';
 
 /**
  * Assemble the free-text prose to scan for dependency references — joining the
@@ -312,6 +312,50 @@ export function partitionBlockersBySource(blockers: readonly WorkItemBlocker[]):
 		(BLOCKER_SOURCE_GATES[blocker.source] ? gating : advisory).push(blocker);
 	}
 	return { gating, advisory };
+}
+
+/**
+ * Split gating blockers into the ones that can actually resolve and the ones that
+ * *cannot*, because the item being gated natively blocks them (issue #639).
+ *
+ * A blocker the item itself blocks is a **cycle**: it cannot close until the gated
+ * item lands, and the gated item cannot start until it closes. Deferring on one is
+ * not a wait, it is a deadlock — item 633's Implementation re-checked ~2000 times
+ * over a seven-day budget and then settled failed, naming a dependency the native
+ * graph never asserted in that direction. So the direct edge is dropped here rather
+ * than gated on, whatever produced it.
+ *
+ * The backstop is deliberately **structural**: it makes any future miss in the
+ * prose scan (or a genuinely mis-recorded relationship) non-fatal, instead of
+ * relying on the scan being right. Only the *direct* edge is checked — walking
+ * further would need each dependent's provider-native item id, which a provider's
+ * reverse read need not yield (GitHub's answers with issues, not board items).
+ *
+ * Identity is the same one {@link dedupeBlockers} uses — the `url`, with the
+ * `reference` as the fallback — matched on **either** side independently, so a
+ * provider whose two reads populate the fields differently still matches. Empty
+ * values never match: a blocker with neither is not "the same item" as anything.
+ */
+export function partitionCyclicBlockers(
+	blockers: readonly WorkItemBlocker[],
+	dependents: readonly WorkItemDependent[],
+): {
+	/** Blockers that can still close on their own — these keep gating the run. */
+	gating: WorkItemBlocker[];
+	/** Blockers the item itself blocks — dropped, and logged by the caller. */
+	suppressed: WorkItemBlocker[];
+} {
+	const urls = new Set(dependents.map((d) => d.url).filter(Boolean));
+	const references = new Set(dependents.map((d) => d.reference).filter(Boolean));
+	const gating: WorkItemBlocker[] = [];
+	const suppressed: WorkItemBlocker[] = [];
+	for (const blocker of blockers) {
+		const cyclic =
+			(Boolean(blocker.url) && urls.has(blocker.url)) ||
+			(Boolean(blocker.reference) && references.has(blocker.reference));
+		(cyclic ? suppressed : gating).push(blocker);
+	}
+	return { gating, suppressed };
 }
 
 /**

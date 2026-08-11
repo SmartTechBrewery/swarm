@@ -52,6 +52,7 @@ import type {
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
+	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { adfToPlainText, textToAdf } from './adf.js';
@@ -473,6 +474,25 @@ function toBlocker(
 }
 
 /**
+ * Map one linked issue this one blocks onto a dependent — the same fields
+ * {@link toBlocker} builds minus `source`, since the reverse read has only one
+ * (`src/pm/types.ts`). `reference`/`url` are derived identically on purpose: they
+ * are the identity the shared cycle check matches a blocker against.
+ */
+function toDependent(
+	issue: JiraLinkedIssue & { key: string },
+	config: JiraIntegrationConfig,
+): WorkItemDependent {
+	return {
+		id: issue.key,
+		reference: issue.key,
+		url: `${siteUrl(config)}/browse/${issue.key}`,
+		title: issue.fields?.summary ?? '',
+		open: issue.fields?.status?.statusCategory?.key !== DONE_STATUS_CATEGORY,
+	};
+}
+
+/**
  * A Jira label is a single token — the API rejects one containing whitespace with
  * an opaque 400. Failing here instead names the constraint and the offending value.
  * `pipeline.automationLabel` defaults to `swarm`, so this is a guard on operator
@@ -853,6 +873,28 @@ export class JiraPMProvider implements PMProvider {
 				this.fetchMentionedBlockers(id),
 			]);
 			return dedupeBlockers([...native, ...mentioned]);
+		});
+	}
+
+	/**
+	 * The issues Jira itself records this one as blocking — the mirror of
+	 * {@link fetchNativeBlockers}, over the same `issuelinks` read. Direction is
+	 * carried by *which side* the entry names, so this takes the `outwardIssue` of
+	 * every "is blocked by" link ("this issue blocks that one") where the blocker
+	 * read takes the `inwardIssue`.
+	 *
+	 * Native only, never prose (`src/pm/types.ts`); a `Relates`-style link is not a
+	 * dependency and is filtered out here exactly as on the blocker side.
+	 */
+	async listDependents(id: string): Promise<WorkItemDependent[]> {
+		return this.run(async () => {
+			const links = await this.fetchIssueLinks(id);
+			return links
+				.filter(
+					(link): link is JiraIssueLink & { outwardIssue: JiraLinkedIssue & { key: string } } =>
+						isBlockedByLinkType(link.type) && Boolean(link.outwardIssue?.key),
+				)
+				.map((link) => toDependent(link.outwardIssue, this.config));
 		});
 	}
 
