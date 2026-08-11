@@ -8,8 +8,9 @@ import {
 	isBaseUrlMissing,
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
+	selectedPmProviderId,
 } from '@/lib/board-mapping.js';
-import { isMissingPmCredentialError } from '@/lib/pm-credentials.js';
+import { isMissingPmCredentialError, missingRequiredPmRoles } from '@/lib/pm-credentials.js';
 import { trpc } from '@/lib/trpc.js';
 import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 
@@ -25,8 +26,16 @@ import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
  *
  * The provider selector itself moved out of this form and into `PmProviderPanel`
  * at the top of the tab (issue #630), so the provider is stated before the settings
- * it scopes. That is behaviour-preserving: the provider is not editable yet, and it
- * still reaches this form's save through `form.providerId` and `buildPmUpdate`.
+ * it scopes; it reaches this form's save through `form.providerId` and `buildPmUpdate`.
+ * Since issue #642 that selection is live, so this panel discovers against **the
+ * form's** provider — the incoming one while a switch is open — rather than against
+ * whichever provider the project is persisted on.
+ *
+ * The form's own stages are what make the switch order explicit: discovery is not
+ * attempted until the provider's required credential roles are configured (they are
+ * entered in the card above, whose write invalidates these queries), and the status
+ * selectors stay inert until a board is selected. Neither is a new save gate —
+ * `canSaveBoardMapping` and `isBaseUrlMissing` still decide that, unchanged.
  *
  * The owning route holds the form state and the save/reset handlers (so the save
  * goes through the same serialized `projects.update` write as the other tabs);
@@ -96,24 +105,48 @@ export function BoardMappingPanel({
 	errorMessage,
 }: BoardMappingPanelProps) {
 	const provider = getPmMappingProvider(form.providerId);
+	// The provider every call below is addressed to: the form's selection, which is the
+	// *draft* provider while a switch is open (issue #642). Named explicitly rather than
+	// left to default to the persisted `pm.type`, because the whole point of the switch
+	// flow is discovering the incoming provider's boards before anything is written.
+	const providerId = selectedPmProviderId(form);
 
-	// The registered providers confirm the persisted one is actually selectable —
+	// The registered providers confirm the selected one is actually serveable —
 	// a catalogue entry alone never offers a provider the backend can't discover,
 	// so an unregistered provider gates the discovery queries below rather than
 	// firing them against nothing.
 	const providersQuery = useQuery(trpc.pm.listProviders.queryOptions({ projectId }));
 	const registeredIds = new Set<string>((providersQuery.data ?? []).map((p) => p.id));
-	const providerSelectable = registeredIds.has(form.providerId);
+	const providerSelectable = registeredIds.has(providerId);
+
+	// The credential roles this provider declares, so the board picker states the step
+	// that has to come first instead of firing a discovery call that can only fail. Read
+	// through the same query the Credentials card above owns (react-query dedupes the
+	// identical key), so a credential saved there re-drives this the moment it lands.
+	const credentialsQuery = useQuery(
+		trpc.projects.credentials.listPm.queryOptions({ projectId, providerId }),
+	);
+	// Only a *known* gap gates discovery: a caller whose credential list fails (a
+	// contributor's `listPm` is authorized, but the query can still error) keeps today's
+	// behaviour of attempting discovery and surfacing whatever the provider says.
+	const missingCredentials = credentialsQuery.isSuccess
+		? missingRequiredPmRoles(credentialsQuery.data)
+		: [];
+	const credentialsIncomplete = missingCredentials.length > 0;
 
 	const containersQuery = useQuery({
-		...trpc.pm.discoverContainers.queryOptions({ projectId }),
-		enabled: providerSelectable,
+		...trpc.pm.discoverContainers.queryOptions({ projectId, providerId }),
+		enabled: providerSelectable && !credentialsIncomplete,
 		retry: false,
 	});
 
 	const statesQuery = useQuery({
-		...trpc.pm.discoverStates.queryOptions({ projectId, containerId: form.containerId }),
-		enabled: providerSelectable && !!form.containerId,
+		...trpc.pm.discoverStates.queryOptions({
+			projectId,
+			providerId,
+			containerId: form.containerId,
+		}),
+		enabled: providerSelectable && !credentialsIncomplete && !!form.containerId,
 		retry: false,
 	});
 
@@ -147,6 +180,19 @@ export function BoardMappingPanel({
 	// actionable notice rather than as a red "failed to load" line.
 	const containerCredentialGap =
 		containersQuery.isError && isMissingPmCredentialError(containersQuery.error);
+	// The step that has to come first, stated where the picker is: either this screen
+	// already knows a required role is unset, or discovery was attempted and the provider
+	// said so. Both replace the picker rather than sitting beside a control that cannot
+	// yet list anything.
+	let credentialNotice: string | undefined;
+	if (credentialsIncomplete) {
+		credentialNotice =
+			`Set ${missingCredentials.map((entry) => entry.label).join(', ')} under Credentials above ` +
+			`before picking a ${provider.containerNoun} — that is what discovers ${provider.label}'s ` +
+			`${provider.containerNounPlural}.`;
+	} else if (containerCredentialGap) {
+		credentialNotice = containerErr;
+	}
 	const canSave = canSaveBoardMapping(form);
 	// The one Save gate this screen can't clear: the provider's site URL is board
 	// identity kept in `swarm.config.json`, so the disabled button is explained
@@ -170,9 +216,9 @@ export function BoardMappingPanel({
 						{provider.label} {provider.containerNoun}
 					</label>
 
-					{containerCredentialGap ? (
+					{credentialNotice ? (
 						<div className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded">
-							{containerErr}
+							{credentialNotice}
 						</div>
 					) : (
 						<>
@@ -210,7 +256,9 @@ export function BoardMappingPanel({
 									preserved until you pick another.
 								</p>
 							)}
-							{containerErr && !containerCredentialGap && (
+							{/* Reached only when the notice above did not claim the error: a credential
+							    gap replaces the picker, everything else annotates it. */}
+							{containerErr && (
 								<p className="text-xs text-red-400 mt-1">
 									Failed to load {provider.containerNounPlural}: {containerErr}
 								</p>

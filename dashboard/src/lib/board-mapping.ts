@@ -36,6 +36,13 @@ export interface BoardMappingForm {
 	providerContext: Record<string, string>;
 }
 
+/**
+ * A PM provider id — the `pm` union's own discriminator, so every provider-scoped
+ * call the tab makes (discovery, credentials) is typed against the same closed
+ * vocabulary the API validates against (`PmProviderIdSchema`, `src/pm/events.ts`).
+ */
+export type PmProviderId = ProjectPm['type'];
+
 type GitHubProjectsPm = Extract<ProjectPm, { type: 'github-projects' }>;
 type LinearPm = Extract<ProjectPm, { type: 'linear' }>;
 type JiraPm = Extract<ProjectPm, { type: 'jira' }>;
@@ -70,7 +77,13 @@ export const STATUS_KEYS = PM_STATUS_KEYS;
  * backend can't discover.
  */
 export interface PmMappingProvider {
-	id: string;
+	/**
+	 * The provider id, typed to the `pm` union's own discriminator rather than a bare
+	 * string, so a catalogue id can be handed straight to a provider-scoped API call
+	 * (`pm.discoverContainers`, `projects.credentials.listPm`) without a cast — the
+	 * catalogue is hand-kept, and this is what keeps a typo in it a compile error.
+	 */
+	id: PmProviderId;
 	/** Provider display name for the selector and headings. */
 	label: string;
 	/** Noun for a board/container (e.g. "board", "project"), used in picker copy. */
@@ -152,8 +165,36 @@ export function getPmMappingProvider(providerId: string): PmMappingProvider {
  * that gets built and the rules that gate saving it can never disagree about which
  * provider is being edited.
  */
-function selectedProviderId(form: BoardMappingForm): string {
+function selectedProviderId(form: BoardMappingForm): PmProviderId {
 	return getPmMappingProvider(form.providerId).id;
+}
+
+/**
+ * The provider every provider-scoped call on the tab addresses — the form's selection,
+ * normalized through the catalogue. It is the *draft* provider while a switch is open
+ * and the persisted one otherwise, which is exactly the ordering the switch flow needs:
+ * credentials are entered, and boards discovered, for the provider the operator is
+ * moving to before anything is written (issue #642).
+ */
+export function selectedPmProviderId(form: BoardMappingForm): PmProviderId {
+	return selectedProviderId(form);
+}
+
+/**
+ * The provider a pending switch selects, or `undefined` when the form is on the one the
+ * project is persisted on.
+ *
+ * Derived rather than held as a second piece of state: an open draft *is* "the form
+ * selects a provider the project isn't on", so there is nothing to keep in sync — a
+ * successful save closes the draft by making the two agree, and Reset closes it by
+ * reprojecting the form from `pm`.
+ */
+export function switchedPmProviderId(
+	form: BoardMappingForm,
+	pm: ProjectPm | undefined,
+): PmProviderId | undefined {
+	const selected = selectedProviderId(form);
+	return selected === (pm?.type ?? DEFAULT_PM_PROVIDER_ID) ? undefined : selected;
 }
 
 /**

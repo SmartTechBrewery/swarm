@@ -1,5 +1,5 @@
 import { DrizzleQueryError } from 'drizzle-orm';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	listAllProjectsFromDb: vi.fn(),
@@ -663,6 +663,127 @@ describe('projectsRouter', () => {
 			await expect(caller.update({ id: 'p1', name: 'Error Name' })).rejects.toThrowError(
 				'Some DB connection error',
 			);
+		});
+
+		/**
+		 * Issue #642: the server-side half of the provider-switch guarantee. `update`
+		 * merges and calls `upsertProjectToDb`, which does not parse, so the config
+		 * schema's `validatePmCredentialRoles` presence rule never fires on this path —
+		 * this is what makes a half-switched project (a `pm.type` naming a provider with
+		 * no credentials) impossible even from a hand-rolled client.
+		 */
+		describe('PM provider switch guard', () => {
+			const linearPm = {
+				type: 'linear' as const,
+				teamId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+				statusOptions: { todo: 'state-todo' },
+			};
+
+			function registerLinearStub() {
+				registerPMProvider({
+					id: 'linear',
+					label: 'Stub Linear',
+					category: 'pm',
+					credentialRoles: [
+						{ role: 'apiKey', label: 'API Key', envVarKey: 'LINEAR_API_KEY' },
+						{ role: 'webhookSecret', label: 'Webhook Secret', envVarKey: 'LINEAR_WEBHOOK_SECRET' },
+						{ role: 'optionalThing', label: 'Optional', envVarKey: 'LINEAR_OPT', optional: true },
+					],
+				} as unknown as PMProviderManifest);
+			}
+
+			afterEach(() => {
+				_resetPMProviderRegistryForTesting();
+			});
+
+			it('rejects a switch to a provider nothing is registered for', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+
+				await expect(caller.update({ id: 'p1', pm: linearPm })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'BAD_REQUEST',
+						message: expect.stringContaining("No PM provider is registered for 'linear'"),
+					}),
+				);
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+
+			it('rejects a switch whose required credential references are absent, naming them', async () => {
+				registerLinearStub();
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+
+				await expect(caller.update({ id: 'p1', pm: linearPm })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'BAD_REQUEST',
+						message: expect.stringContaining(
+							"'apiKey' (API Key), 'webhookSecret' (Webhook Secret)",
+						),
+					}),
+				);
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+
+			it('accepts the switch once the incoming provider’s own block names every required role', async () => {
+				registerLinearStub();
+				const withLinearCredentials = createMockProjectConfig({
+					id: 'p1',
+					credentials: {
+						// The outgoing provider's block is retained beside the incoming one — that
+						// is what makes switching back need no secrets re-entered (issue #631).
+						pm: {
+							'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+							linear: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
+						},
+					},
+				});
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(withLinearCredentials);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', pm: linearPm });
+
+				// One write, carrying the whole new union member and nothing of the old one.
+				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+				expect(result.pm).toEqual(linearPm);
+				expect(result.credentials.pm).toEqual(withLinearCredentials.credentials.pm);
+			});
+
+			// The optional role is not required, and an inherited one already resolves
+			// without an entry — the same two exemptions the config schema's rule 3 makes.
+			it('does not require an optional role, nor one that inherits a shared credential', async () => {
+				registerPMProvider({
+					id: 'linear',
+					label: 'Stub Linear',
+					category: 'pm',
+					credentialRoles: [
+						{ role: 'optionalThing', label: 'Optional', envVarKey: 'LINEAR_OPT', optional: true },
+						{
+							role: 'webhookSecret',
+							label: 'Webhook Secret',
+							envVarKey: 'SCM_WEBHOOK_SECRET',
+							inheritsSharedCredential: 'webhookSecret',
+						},
+					],
+				} as unknown as PMProviderManifest);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', pm: linearPm });
+
+				expect(result.pm).toEqual(linearPm);
+			});
+
+			// An ordinary board/status edit keeps the provider it is already on, so nothing
+			// about the guard can block a project from fixing its own mapping.
+			it('leaves a mapping edit that keeps the same provider unaffected', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const samePm = { ...existing.pm, statusOptions: { todo: 'opt_other' } };
+				const result = await caller.update({ id: 'p1', pm: samePm });
+
+				expect(result.pm).toEqual(samePm);
+				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+			});
 		});
 	});
 

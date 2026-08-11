@@ -6,6 +6,7 @@ import {
 	type PipelineConfig,
 	PipelineConfigSchema,
 	type PmCredentialReferencesByProvider,
+	type ProjectConfig,
 	ProjectConfigBaseSchema,
 	type ProjectPm,
 	type ScmCredentialReferencesByProvider,
@@ -147,6 +148,61 @@ function mergePipelineConfig(
 	};
 }
 
+/**
+ * Refuse a `pm` update that would move the project onto a provider it cannot actually
+ * run on — the server-side half of the switch guarantee (issue #642).
+ *
+ * The dashboard walks the switch in an order that makes this unreachable (the incoming
+ * provider's credentials are entered *before* the new `pm` member is written), but
+ * nothing about `update` enforced that order: it merges `{...existing, ...updates}` and
+ * hands the result to `upsertProjectToDb`, which deliberately does not parse — so
+ * `validatePmCredentialRoles`' presence rule (`src/config/schema.ts`, rule 3) fires on
+ * `validateConfig` / `swarm config apply` but never here. A hand-rolled client could
+ * therefore name a provider with no credentials at all and leave the project
+ * half-switched: `pm.type` pointing at a board every read and write would fail against.
+ *
+ * The check mirrors that rule exactly — the provider must be **registered**, and every
+ * role it declares that is neither optional nor inherited must have a reference in
+ * *its own* `credentials.pm[<providerId>]` block (issue #631) — so the two surfaces
+ * agree on what a complete PM configuration is. It fires only on a `pm.type` **change**:
+ * an ordinary board/status edit is unaffected, and a project already running on a
+ * provider whose credentials predate a manifest change is not retroactively blocked from
+ * fixing its mapping.
+ *
+ * Presence of the *reference* is what is required, not of the stored secret — the same
+ * thing the config schema checks, and the same thing `resolvePmCredential` needs before
+ * it can look a secret up at all.
+ */
+function assertPmProviderSwitchable(existing: ProjectConfig, pm: ProjectPm): void {
+	if (pm.type === existing.pm.type) return;
+
+	const manifest = getPMProvider(pm.type);
+	if (!manifest) {
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message:
+				`No PM provider is registered for '${pm.type}', so this project cannot be ` +
+				'switched to it.',
+		});
+	}
+
+	const configured = existing.credentials.pm?.[manifest.id] ?? {};
+	const missing = manifest.credentialRoles.filter(
+		(spec) => !spec.optional && !spec.inheritsSharedCredential && !configured[spec.role],
+	);
+	if (missing.length === 0) return;
+
+	throw new TRPCError({
+		code: 'BAD_REQUEST',
+		message:
+			`Cannot switch this project to ${manifest.label}: it requires the ` +
+			`${missing.map((spec) => `'${spec.role}' (${spec.label})`).join(', ')} credential` +
+			`${missing.length === 1 ? '' : 's'}, which this project has not configured. Set ` +
+			`${missing.length === 1 ? 'it' : 'them'} under Project Management → Credentials ` +
+			'before saving the new board mapping.',
+	});
+}
+
 function hasUniqueViolationCode(error: unknown): boolean {
 	return (
 		typeof error === 'object' &&
@@ -251,6 +307,8 @@ export const projectsRouter = router({
 				});
 			}
 			const { id, ...updates } = input;
+			// Before the merge, so a refused switch leaves nothing written at all.
+			if (updates.pm) assertPmProviderSwitchable(existing, updates.pm);
 			const config = {
 				...existing,
 				...updates,

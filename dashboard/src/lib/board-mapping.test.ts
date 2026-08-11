@@ -14,6 +14,8 @@ import {
 	isBaseUrlMissing,
 	isBoardMappingDirty,
 	STATUS_KEYS,
+	selectedPmProviderId,
+	switchedPmProviderId,
 	toBoardMappingForm,
 	withSelectedContainer,
 	withSelectedProvider,
@@ -641,5 +643,53 @@ describe('getPmMappingProvider', () => {
 			stateNounPlural: 'lists',
 		});
 		expect(getPmMappingProvider('nope').id).toBe('github-projects');
+	});
+});
+
+describe('selectedPmProviderId', () => {
+	it('normalizes an unknown id to the default provider the rest of the form uses', () => {
+		expect(selectedPmProviderId(toBoardMappingForm(linearPm))).toBe('linear');
+		expect(selectedPmProviderId({ ...toBoardMappingForm(fullPm), providerId: 'nope' })).toBe(
+			'github-projects',
+		);
+	});
+});
+
+describe('switchedPmProviderId (issue #642)', () => {
+	it('is undefined while the form is on the provider the project is persisted on', () => {
+		expect(switchedPmProviderId(toBoardMappingForm(fullPm), fullPm)).toBeUndefined();
+		expect(switchedPmProviderId(toBoardMappingForm(jiraPm), jiraPm)).toBeUndefined();
+	});
+
+	it('names the draft provider once the form moves off the persisted one', () => {
+		const draft = withSelectedProvider(toBoardMappingForm(fullPm), 'linear');
+		expect(switchedPmProviderId(draft, fullPm)).toBe('linear');
+	});
+
+	// A provider switch is closed by the two ways it can end, and both are already
+	// modelled: a save makes the persisted member the draft provider's, and Reset
+	// reprojects the form from the stored member.
+	it('closes once the persisted member catches up, and on a reset', () => {
+		const draft = withSelectedProvider(toBoardMappingForm(fullPm), 'linear');
+		expect(switchedPmProviderId(draft, linearPm)).toBeUndefined();
+		expect(switchedPmProviderId(toBoardMappingForm(fullPm), fullPm)).toBeUndefined();
+	});
+
+	// The route holds no project before the first load, and the blank form seeds from the
+	// same default — so nothing reads as a pending switch on the way in.
+	it('reports no switch for a blank form and no stored member', () => {
+		expect(switchedPmProviderId(toBoardMappingForm(undefined), undefined)).toBeUndefined();
+	});
+
+	// One write, carrying a complete member of the incoming provider's own shape and
+	// nothing from the outgoing one — the atomicity the switch flow relies on.
+	it('pairs with buildPmUpdate to produce one complete member of the new provider', () => {
+		let draft = withSelectedProvider(toBoardMappingForm(fullPm), 'linear');
+		draft = withSelectedContainer(draft, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+		draft.statusOptions.planning = 'f4dd18f6-7943-4a6d-9a0e-4e6cb6e3acb6';
+
+		expect(switchedPmProviderId(draft, fullPm)).toBe('linear');
+		expect(canSaveBoardMapping(draft)).toBe(true);
+		expect(buildPmUpdate(draft, fullPm)).toEqual(linearPm);
 	});
 });
