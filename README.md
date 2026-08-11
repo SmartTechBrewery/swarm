@@ -84,21 +84,29 @@ GitHub / Bitbucket / GitLab → HTTPS webhook → Router → durable Postgres di
 - A source-control repository on GitHub, Bitbucket Cloud, or gitlab.com — named by the
   project's `scm` field, which every project must set — and a project-management board with a
   webhook: a GitHub Projects v2 board, a Linear team, a Jira Cloud project, or a
-  Trello board
+  Trello board. The first three are configured in the provider's own UI; a Trello
+  webhook is a resource SWARM creates for you, with
+  `npm run swarm -- pm webhook create --project <id>` (see
+  [`docs/cli.md`](docs/cli.md))
 - Two distinct source-control identities for loop prevention: the worker operator's
   own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN` /
   `SWARM_OPERATOR_GITLAB_TOKEN`, the implementer persona) set in `.env` on each host,
   and a separate project-scoped reviewer credential
-- A project credential for the **board**, separate from the two above. GitHub
-  Projects uses `credentials.pm.apiToken` (conventionally
+- A project credential for the **board**, separate from the two above, and held
+  **per PM provider** under `credentials.pm.<provider>.<role>` since issue #631, so
+  a project can carry two providers' credentials at once (the role names collide)
+  while only the one `pm.type` names is ever resolved. GitHub
+  Projects uses `credentials.pm.github-projects.apiToken` (conventionally
   `PM_GITHUB_PROJECTS_TOKEN`) with `repo`, `project`, and `read:org`; Linear uses
-  the required `credentials.pm.apiKey` and `credentials.pm.webhookSecret` roles
+  the required `credentials.pm.linear.apiKey` and
+  `credentials.pm.linear.webhookSecret` roles
   (conventionally `LINEAR_API_KEY` and `LINEAR_WEBHOOK_SECRET`); Jira uses the
-  required `credentials.pm.email`, `credentials.pm.apiToken`, and
-  `credentials.pm.webhookSecret` roles (conventionally `JIRA_EMAIL`,
+  required `credentials.pm.jira.email`, `credentials.pm.jira.apiToken`, and
+  `credentials.pm.jira.webhookSecret` roles (conventionally `JIRA_EMAIL`,
   `JIRA_API_TOKEN`, and `JIRA_WEBHOOK_SECRET`), since Jira Cloud authenticates
-  with basic auth; Trello uses the required `credentials.pm.apiKey`,
-  `credentials.pm.token`, and `credentials.pm.webhookSecret` roles (conventionally
+  with basic auth; Trello uses the required `credentials.pm.trello.apiKey`,
+  `credentials.pm.trello.token`, and `credentials.pm.trello.webhookSecret` roles
+  (conventionally
   `TRELLO_API_KEY`, `TRELLO_TOKEN`, and `TRELLO_API_SECRET` — the last being
   Trello's API secret, which signs its deliveries), since Trello authenticates with
   a key/token pair. Every board read,
@@ -291,8 +299,11 @@ Configuration has three layers:
   dashboard authentication, and credential encryption.
 - `swarm.config.json` — per-project repository, worktree, board mapping (`pm`, one
   member per PM provider — GitHub Projects, Linear, Jira, or Trello, all four
-  selectable), credential references (the SCM reviewer/webhook pair plus the PM
-  provider's own roles under `credentials.pm`), agent, and pipeline settings.
+  selectable, and switchable from the dashboard's **Project Management** tab since
+  issue #642), credential references (the SCM reviewer/webhook pair **per SCM
+  provider** under `credentials.scm[<providerId>]` since issue #628, plus each PM
+  provider's own roles under `credentials.pm[<providerId>]` since issue #631),
+  agent, and pipeline settings.
   Apply changes with `npm run db:seed` or `swarm config apply`.
 - Dashboard global settings — app-wide settings stored in Postgres and edited
   through the dashboard API.

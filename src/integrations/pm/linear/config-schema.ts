@@ -7,7 +7,7 @@
 
 import { z } from 'zod';
 
-import type { ProjectConfig } from '../../../config/schema.js';
+import type { ProjectConfig, ProjectPm } from '../../../config/schema.js';
 
 export const linearConfigSchema = z
 	.object({
@@ -33,6 +33,19 @@ export const linearConfigSchema = z
 	.describe('Linear board integration config');
 
 export type LinearIntegrationConfig = z.infer<typeof linearConfigSchema>;
+
+/**
+ * This provider's `pm` member with no team selected — the manifest's `blankPm`
+ * (`../manifest.ts`), which the credential/discovery API projects onto a project that
+ * is not (yet) on Linear so an operator can pick a team before saving a switch.
+ *
+ * Deliberately not a persistable member: `statusOptions` must map at least one status.
+ */
+export const linearBlankPm: ProjectPm = {
+	type: 'linear',
+	teamId: '',
+	statusOptions: {},
+};
 
 /**
  * Narrow a project's `pm` union member to Linear's board mapping. A mismatch is

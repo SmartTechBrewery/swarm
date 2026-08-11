@@ -73,6 +73,10 @@ describe('getScmProviderCopy', () => {
 		expect(copy.roleDescriptions.webhookSecret).toMatch(/HMAC secret/);
 	});
 
+	it('labels the roles in GitHub’s own vocabulary', () => {
+		expect(copy.roleLabels).toEqual({ reviewer: 'Reviewer PAT', webhookSecret: 'Webhook Secret' });
+	});
+
 	it('projects the verify-failure copy', () => {
 		expect(copy.verifyFailureMessage).toMatch(/GitHub account/);
 	});
@@ -88,6 +92,15 @@ describe('getScmProviderCopy — Bitbucket', () => {
 	it('names Bitbucket’s own credential form rather than GitHub’s', () => {
 		expect(copy.roleDescriptions.reviewer).toMatch(/username:app_password/);
 		expect(copy.verifyFailureMessage).toMatch(/Bitbucket account/);
+	});
+
+	// "Reviewer PAT" is GitHub's word for what Bitbucket calls an app password (issue
+	// #632): the role is neutral, the credential is not.
+	it('labels the reviewer role an app password, not a PAT', () => {
+		expect(copy.roleLabels).toEqual({
+			reviewer: 'Reviewer App Password',
+			webhookSecret: 'Webhook Secret',
+		});
 	});
 
 	it('points at Bitbucket’s own operator env var and ingress route', () => {
@@ -114,5 +127,58 @@ describe('getScmProviderCopy — GitLab', () => {
 	it('points at GitLab’s own operator env var and ingress route', () => {
 		expect(copy.intro).toMatch(/SWARM_OPERATOR_GITLAB_TOKEN/);
 		expect(copy.intro).toMatch(/\/gitlab\/webhook/);
+	});
+
+	// GitLab has neither a PAT nor a signing secret: an access token, and a secret token
+	// it echoes back in a header.
+	it('labels the roles an access token and a secret token', () => {
+		expect(copy.roleLabels).toEqual({
+			reviewer: 'Reviewer Access Token',
+			webhookSecret: 'Secret Token',
+		});
+	});
+});
+
+// The cheap guard that keeps one provider's vocabulary from creeping into another's
+// copy — "Reviewer PAT" for a Bitbucket app password is the symptom issue #632 reports.
+describe('per-provider credential copy', () => {
+	const ROLES = ['reviewer', 'webhookSecret'] as const;
+
+	it('gives every provider a non-empty label for every role', () => {
+		for (const provider of SCM_PROVIDERS) {
+			const { roleLabels } = getScmProviderCopy(provider.id);
+			for (const role of ROLES) {
+				expect(roleLabels[role]?.length, `${provider.id}.${role}`).toBeGreaterThan(0);
+			}
+		}
+	});
+
+	it('names no other provider in any label or role description', () => {
+		const BRANDS = ['github', 'bitbucket', 'gitlab'] as const;
+		for (const provider of SCM_PROVIDERS) {
+			const copy = getScmProviderCopy(provider.id);
+			const text = ROLES.flatMap((role) => [copy.roleLabels[role], copy.roleDescriptions[role]])
+				.join(' ')
+				.toLowerCase();
+			for (const brand of BRANDS.filter((brand) => brand !== provider.id)) {
+				expect(text, `${provider.id} copy mentions ${brand}`).not.toContain(brand);
+			}
+		}
+	});
+
+	it('keeps each provider’s own credential noun out of the others’ labels', () => {
+		const FOREIGN_NOUNS: Record<string, readonly string[]> = {
+			github: ['app password', 'secret token'],
+			bitbucket: ['pat', 'access token'],
+			gitlab: ['pat', 'app password'],
+		};
+		for (const provider of SCM_PROVIDERS) {
+			const labels = ROLES.map((role) => getScmProviderCopy(provider.id).roleLabels[role])
+				.join(' ')
+				.toLowerCase();
+			for (const noun of FOREIGN_NOUNS[provider.id] ?? []) {
+				expect(labels, `${provider.id} labels use ${noun}`).not.toContain(noun);
+			}
+		}
 	});
 });

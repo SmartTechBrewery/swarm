@@ -5,24 +5,38 @@ import {
 	type BoardMappingForm,
 	canSaveBoardMapping,
 	getPmMappingProvider,
+	isBaseUrlInvalid,
 	isBaseUrlMissing,
-	PM_MAPPING_PROVIDERS,
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
+	selectedPmProviderId,
 } from '@/lib/board-mapping.js';
-import { isMissingPmCredentialError } from '@/lib/pm-credentials.js';
+import { isMissingPmCredentialError, missingRequiredPmRoles } from '@/lib/pm-credentials.js';
 import { trpc } from '@/lib/trpc.js';
 import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 
 /**
- * Provider-neutral board/status mapping panel (issue #201) — the second half of the
- * Project Management tab, under its credential section. Replaces the old GitHub
- * Projects raw-ID form: the operator picks a PM provider, then a discovered
- * board, then maps each canonical SWARM pipeline status to one of that board's
- * discovered states. Opaque IDs stay option values and persisted data — never
- * something to type. Boards/states are discovered through the `pm` API using the
- * project's own PM credential, resolved server-side (issue #537); the browser never
- * handles a credential.
+ * Provider-neutral board/status mapping panel (issue #201) — the last section of
+ * the Project Management tab, under the provider and credential cards. Replaces
+ * the old GitHub Projects raw-ID form: the operator picks a discovered board, then
+ * maps each canonical SWARM pipeline status to one of that board's discovered
+ * states. Opaque IDs stay option values and persisted data — never something to
+ * type. Boards/states are discovered through the `pm` API using the project's own
+ * PM credential, resolved server-side (issue #537); the browser never handles a
+ * credential.
+ *
+ * The provider selector itself moved out of this form and into `PmProviderPanel`
+ * at the top of the tab (issue #630), so the provider is stated before the settings
+ * it scopes; it reaches this form's save through `form.providerId` and `buildPmUpdate`.
+ * Since issue #642 that selection is live, so this panel discovers against **the
+ * form's** provider — the incoming one while a switch is open — rather than against
+ * whichever provider the project is persisted on.
+ *
+ * The form's own stages are what make the switch order explicit: discovery is not
+ * attempted until the provider's required credential roles are configured (they are
+ * entered in the card above, whose write invalidates these queries), and the status
+ * selectors stay inert until a board is selected. Neither is a new save gate —
+ * `canSaveBoardMapping` and `isBaseUrlMissing` still decide that, unchanged.
  *
  * The owning route holds the form state and the save/reset handlers (so the save
  * goes through the same serialized `projects.update` write as the other tabs);
@@ -32,9 +46,10 @@ import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 interface BoardMappingPanelProps {
 	projectId: string;
 	form: BoardMappingForm;
-	onProviderChange: (providerId: string) => void;
 	onSelectContainer: (containerId: string) => void;
 	onStatusOptionChange: (key: PmStatusKey, value: string) => void;
+	/** Update one provider-declared incoming-provider setup value. */
+	onProviderContextChange: (key: string, value: string) => void;
 	/** Record the opaque provider context (GitHub's Status field id) from state discovery. */
 	onStatesContext: (context: Record<string, string>) => void;
 	handleSubmit: (e: React.FormEvent) => void;
@@ -81,9 +96,9 @@ function stateOptionsFor(
 export function BoardMappingPanel({
 	projectId,
 	form,
-	onProviderChange,
 	onSelectContainer,
 	onStatusOptionChange,
+	onProviderContextChange,
 	onStatesContext,
 	handleSubmit,
 	handleReset,
@@ -94,23 +109,60 @@ export function BoardMappingPanel({
 	errorMessage,
 }: BoardMappingPanelProps) {
 	const provider = getPmMappingProvider(form.providerId);
+	// The provider every call below is addressed to: the form's selection, which is the
+	// *draft* provider while a switch is open (issue #642). Named explicitly rather than
+	// left to default to the persisted `pm.type`, because the whole point of the switch
+	// flow is discovering the incoming provider's boards before anything is written.
+	const providerId = selectedPmProviderId(form);
 
-	// The registered providers confirm which catalogue entries are actually
-	// selectable — a catalogue entry alone never offers a provider the backend
-	// can't discover.
+	// The registered providers confirm the selected one is actually serveable —
+	// a catalogue entry alone never offers a provider the backend can't discover,
+	// so an unregistered provider gates the discovery queries below rather than
+	// firing them against nothing.
 	const providersQuery = useQuery(trpc.pm.listProviders.queryOptions({ projectId }));
 	const registeredIds = new Set<string>((providersQuery.data ?? []).map((p) => p.id));
-	const providerSelectable = registeredIds.has(form.providerId);
+	const providerSelectable = registeredIds.has(providerId);
+	const discoveryDraftFields =
+		(providersQuery.data ?? []).find((entry) => entry.id === providerId)?.discoveryDraft ?? [];
+	const discoveryDraftIncomplete = discoveryDraftFields.some(
+		(field) => !(form.providerContext[field.key] ?? '').trim(),
+	);
+	const baseUrlInvalid = isBaseUrlInvalid(form);
+	const discoveryDraftReady = !discoveryDraftIncomplete && !baseUrlInvalid;
+	const discoveryInput = {
+		projectId,
+		providerId,
+		...(discoveryDraftFields.length ? { discoveryDraft: form.providerContext } : {}),
+	};
+
+	// The credential roles this provider declares, so the board picker states the step
+	// that has to come first instead of firing a discovery call that can only fail. Read
+	// through the same query the Credentials card above owns (react-query dedupes the
+	// identical key), so a credential saved there re-drives this the moment it lands.
+	const credentialsQuery = useQuery(
+		trpc.projects.credentials.listPm.queryOptions({ projectId, providerId }),
+	);
+	// Only a *known* gap gates discovery: a caller whose credential list fails (a
+	// contributor's `listPm` is authorized, but the query can still error) keeps today's
+	// behaviour of attempting discovery and surfacing whatever the provider says.
+	const missingCredentials = credentialsQuery.isSuccess
+		? missingRequiredPmRoles(credentialsQuery.data)
+		: [];
+	const credentialsIncomplete = missingCredentials.length > 0;
 
 	const containersQuery = useQuery({
-		...trpc.pm.discoverContainers.queryOptions({ projectId }),
-		enabled: providerSelectable,
+		...trpc.pm.discoverContainers.queryOptions(discoveryInput),
+		enabled: providerSelectable && !credentialsIncomplete && discoveryDraftReady,
 		retry: false,
 	});
 
 	const statesQuery = useQuery({
-		...trpc.pm.discoverStates.queryOptions({ projectId, containerId: form.containerId }),
-		enabled: providerSelectable && !!form.containerId,
+		...trpc.pm.discoverStates.queryOptions({
+			...discoveryInput,
+			containerId: form.containerId,
+		}),
+		enabled:
+			providerSelectable && !credentialsIncomplete && discoveryDraftReady && !!form.containerId,
 		retry: false,
 	});
 
@@ -144,10 +196,20 @@ export function BoardMappingPanel({
 	// actionable notice rather than as a red "failed to load" line.
 	const containerCredentialGap =
 		containersQuery.isError && isMissingPmCredentialError(containersQuery.error);
+	// The step that has to come first, stated where the picker is: either this screen
+	// already knows a required role is unset, or discovery was attempted and the provider
+	// said so. Both replace the picker rather than sitting beside a control that cannot
+	// yet list anything.
+	let credentialNotice: string | undefined;
+	if (credentialsIncomplete) {
+		credentialNotice =
+			`Set ${missingCredentials.map((entry) => entry.label).join(', ')} under Credentials above ` +
+			`before picking a ${provider.containerNoun} — that is what discovers ${provider.label}'s ` +
+			`${provider.containerNounPlural}.`;
+	} else if (containerCredentialGap) {
+		credentialNotice = containerErr;
+	}
 	const canSave = canSaveBoardMapping(form);
-	// The one Save gate this screen can't clear: the provider's site URL is board
-	// identity kept in `swarm.config.json`, so the disabled button is explained
-	// rather than left inexplicable.
 	const baseUrlMissing = isBaseUrlMissing(form);
 
 	return (
@@ -158,39 +220,28 @@ export function BoardMappingPanel({
 						Board
 					</h2>
 
-					<div className="max-w-xs">
-						<label htmlFor="pm-provider" className={LABEL_CLASS}>
-							Provider
-						</label>
-						<select
-							id="pm-provider"
-							value={form.providerId}
-							onChange={(e) => onProviderChange(e.target.value)}
-							disabled={isPending}
-							className={SELECT_CLASS}
-						>
-							{PM_MAPPING_PROVIDERS.map((p) => (
-								<option
-									key={p.id}
-									value={p.id}
-									// Changing providers requires credentials and discovery for that provider,
-									// so this mapping editor remains scoped to the persisted provider.
-									disabled={
-										p.id !== form.providerId ||
-										(providersQuery.isSuccess && !registeredIds.has(p.id))
-									}
-								>
-									{p.label}
-								</option>
-							))}
-						</select>
-					</div>
-
-					<p className="text-xs text-zinc-400 mt-4">{provider.intro}</p>
-					<p className="text-xs text-zinc-500 mt-2">
-						Change the PM provider in <code className="font-mono">swarm.config.json</code>.
-					</p>
+					<p className="text-xs text-zinc-400">{provider.intro}</p>
 				</div>
+
+				{discoveryDraftFields.map((field) => (
+					<div key={field.key}>
+						<label htmlFor={`pm-draft-${field.key}`} className={LABEL_CLASS}>
+							{field.label}
+						</label>
+						<input
+							id={`pm-draft-${field.key}`}
+							type={field.inputType}
+							value={form.providerContext[field.key] ?? ''}
+							onChange={(event) => onProviderContextChange(field.key, event.target.value)}
+							disabled={isPending}
+							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500"
+						/>
+						{field.description && <p className="text-xs text-zinc-400 mt-1">{field.description}</p>}
+					</div>
+				))}
+				{baseUrlInvalid && (
+					<p className="text-xs text-red-400">Enter a valid Jira site URL before discovery.</p>
+				)}
 
 				{/* Board / container picker */}
 				<div>
@@ -198,9 +249,9 @@ export function BoardMappingPanel({
 						{provider.label} {provider.containerNoun}
 					</label>
 
-					{containerCredentialGap ? (
+					{credentialNotice ? (
 						<div className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded">
-							{containerErr}
+							{credentialNotice}
 						</div>
 					) : (
 						<>
@@ -238,7 +289,9 @@ export function BoardMappingPanel({
 									preserved until you pick another.
 								</p>
 							)}
-							{containerErr && !containerCredentialGap && (
+							{/* Reached only when the notice above did not claim the error: a credential
+							    gap replaces the picker, everything else annotates it. */}
+							{containerErr && (
 								<p className="text-xs text-red-400 mt-1">
 									Failed to load {provider.containerNounPlural}: {containerErr}
 								</p>
@@ -326,9 +379,7 @@ export function BoardMappingPanel({
 					</button>
 					{baseUrlMissing && (
 						<p className="text-xs text-amber-300/80">
-							Set this {provider.label} {provider.containerNoun}'s{' '}
-							<code className="font-mono">pm.baseUrl</code> in{' '}
-							<code className="font-mono">swarm.config.json</code> before saving a mapping.
+							Enter this {provider.label} {provider.containerNoun}'s site URL before discovery.
 						</p>
 					)}
 				</div>

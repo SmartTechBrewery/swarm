@@ -139,7 +139,9 @@ to expire after `heartbeatTtlMs`.
 ## Verify from the admin side
 
 - **Dashboard** — the new worker appears under `/workers`, and its detail page
-  (`/workers/<id>`) shows it connected.
+  (`/workers/<id>`) shows it connected. The global `/workers` screen is an
+  instance administrator's view (issue #647); the machine's own owner sees it on
+  the project's **Workers** tab and at `/workers/<id>`.
 - **Database** — a fresh, ticking heartbeat confirms the transport session is
   live:
   ```sql

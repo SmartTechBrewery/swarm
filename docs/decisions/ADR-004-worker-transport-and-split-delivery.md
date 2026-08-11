@@ -331,7 +331,10 @@ worker/user columns complete that half of the mapping too.
   → `findComment`/`createWorkItem`/`updateWorkItem`/`addLabel`/`addBlockedBy`; and
   issue #543 added `POST /worker/delivery/pm/find-item-by-marker`
   → `findWorkItemByDescriptionMarker`, the lookup that makes an interrupted split
-  resume rather than duplicate its children — for **seventeen routes** in total, with
+  resume rather than duplicate its children; and issue #639 added
+  `POST /worker/delivery/pm/dependents` → `listDependents`, the reverse-edge read
+  Implementation's dependency gate uses so a federated run can never defer on a
+  blocker the item itself natively blocks — for **eighteen routes** in total, with
   the wire mechanics shared by one client (`src/transport/delivery-client.ts`). Resolving a board card from a PR URL has a
   route (`POST /worker/delivery/pm/find-item`); the only PM **reads** with none left
   are `getWorkItem`/`listWorkItems`/discovery, which stay worker-side — no phase a

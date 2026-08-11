@@ -13,10 +13,11 @@
  * registers GitHub Projects, and each project routing to the one it names
  * (`ProjectConfig.scm`, issue #478).
  *
- * This file defines **types only** — every importer uses `import type`, so the
- * module adds no runtime edge. That's what lets `src/config/provider.ts` (which
- * the GitHub integration itself depends on) name {@link ScmPersona} without
- * creating an import cycle.
+ * This file defines **types plus one closed value vocabulary**
+ * ({@link SCM_CREDENTIAL_ROLES}) and imports nothing at runtime, so importing it
+ * still adds no dependency edge of its own. That's what lets
+ * `src/config/provider.ts` (which the GitHub integration itself depends on) name
+ * {@link ScmPersona} without creating an import cycle.
  *
  * The contract *composes* the two provider-neutral seams that already exist
  * rather than restating them: it extends {@link ScmMergeProvider}
@@ -49,7 +50,14 @@ import type { ScmDeliveryProvider } from './delivery.js';
 import type { ScmEvent } from './events.js';
 import type { ScmMergeProvider } from './merge.js';
 
-export type ScmType = 'github' | 'bitbucket' | 'gitlab';
+/**
+ * Every SCM provider id, as values — the closed vocabulary {@link ScmType} is derived
+ * from, so the type and the list cannot drift. Needed as a runtime list by the config
+ * schema's `credentials.scm` key check (`src/config/schema.ts`), which validates a
+ * provider *id* without depending on which provider modules a process imported.
+ */
+export const SCM_TYPES = ['github', 'bitbucket', 'gitlab'] as const;
+export type ScmType = (typeof SCM_TYPES)[number];
 
 /**
  * SWARM's dual-persona role model — the provider-neutral name for what the
@@ -65,6 +73,25 @@ export type ScmPersona = 'implementer' | 'reviewer';
  * resolve for it to hold.
  */
 export type ScmPersonaIdentities = Record<ScmPersona, string>;
+
+/**
+ * The project-scoped credentials every SCM provider needs, as a **closed** pair
+ * (issue #628) — a project supplies one reference per role, per provider, under
+ * `credentials.scm[<providerId>]` (`src/config/schema.ts`).
+ *
+ * Closed, unlike the PM side's open `credentialRoles` vocabulary, because these two
+ * are named by the *contract* rather than by a provider: `reviewer` is
+ * {@link ScmPersona}'s project-scoped half (the implementer is the worker
+ * operator's own env-var credential and is deliberately not a project credential —
+ * issue #396), and `webhookSecret` is what
+ * {@link SCMProvider.verifyWebhookSignature} authenticates a delivery with. A PM
+ * provider's roles genuinely differ per provider (Jira an email + token, Trello a
+ * key + token + secret); an SCM provider's do not. What *is* per provider is the
+ * reference name each role conventionally uses, which the manifest declares
+ * (`SCMProviderManifest.credentialRoles`).
+ */
+export const SCM_CREDENTIAL_ROLES = ['reviewer', 'webhookSecret'] as const;
+export type ScmCredentialRole = (typeof SCM_CREDENTIAL_ROLES)[number];
 
 /**
  * A pull/merge request's read state — everything shared code needs to route a

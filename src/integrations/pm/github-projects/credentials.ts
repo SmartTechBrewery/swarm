@@ -13,7 +13,7 @@
  * hidden requirement of the API host, gave a project admin no way to configure
  * board access, and broke discovery whenever that operator token happened to lack
  * `read:org`. The operator token is now strictly an SCM implementer credential
- * (`src/config/operator-token.ts`); the board resolves `credentials.pm.apiToken`
+ * (`src/config/operator-token.ts`); the board resolves `credentials.pm['github-projects'].apiToken`
  * through the provider-agnostic role mechanism (`resolvePmCredential`,
  * `src/config/provider.ts`, issue #497) and nothing here ever falls back to it.
  *

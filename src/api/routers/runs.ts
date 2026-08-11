@@ -68,7 +68,7 @@ import {
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
-import { accessibleProjectScope, assertProjectAccess } from '../authz.js';
+import { assertInstanceAdmin, assertProjectAccess } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
 const QUEUED_WORK_ITEM_CACHE_TTL_MS = 30_000;
@@ -696,26 +696,25 @@ export const runsRouter = router({
 	// only after the access check below, so a non-member never triggers an
 	// identity read.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
-	// access to that project; without one the result is bounded to the caller's
-	// accessible projects (every project for an `instanceAdmin`), so a non-member
-	// never sees another project's runs through the cross-project view.
+	// access to that project, so a non-member never sees another project's runs.
+	// Without one this is the **installation-wide** list behind the global /runs
+	// screen, which is an instance administrator's view (issue #647) — a worker
+	// owner reads their runs per project instead, through the branch above.
 	list: authedProcedure.input(ListRunsInputSchema).query(async ({ ctx, input }) => {
 		if (input.projectId) {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			return await listRunsWithWorkerNames(input);
 		}
-		const scope = await accessibleProjectScope(ctx.user);
-		if (scope === null) return await listRunsWithWorkerNames(input);
-		if (scope.length === 0) return { data: [], total: 0 };
-		return await listRunsWithWorkerNames({ ...input, projectIds: scope });
+		assertInstanceAdmin(ctx.user, 'runs');
+		return await listRunsWithWorkerNames(input);
 	}),
 
 	// Every canonical waiting dispatch (pending / capacity-blocked /
 	// retry-scheduled) — the durable queue read model (issues #234, #284), never
 	// a BullMQ snapshot, so nothing pending can be invisible here. No pagination:
 	// the pending set is small and bounded by worker throughput. Scoped like
-	// `list`: a chosen `projectId` needs read access, and the unscoped view is
-	// filtered to the caller's accessible projects in-memory (the set is small).
+	// `list`: a chosen `projectId` needs read access, and the unscoped,
+	// installation-wide queue is an instance administrator's view (issue #647).
 	//
 	// Returns the two-part {@link QueuedRunsPage}: the queue itself, and the board
 	// dispatches the enrichment's own board read proved cannot start a phase
@@ -734,18 +733,13 @@ export const runsRouter = router({
 					),
 				);
 			}
-			const scope = await accessibleProjectScope(ctx.user);
+			assertInstanceAdmin(ctx.user, 'queue');
 			const dispatches = await listWaitingDispatches(input?.projectId);
 			const projects = await listAllProjectsFromDb();
 			const policies = Object.fromEntries(
 				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
 			);
-			const items = toQueuedRuns(dispatches, policies);
-			if (scope === null) return partitionQueuedRuns(await enrichQueuedWorkItems(items));
-			const accessible = new Set(scope);
-			return partitionQueuedRuns(
-				await enrichQueuedWorkItems(items.filter((item) => accessible.has(item.projectId))),
-			);
+			return partitionQueuedRuns(await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)));
 		}),
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member

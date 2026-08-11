@@ -16,7 +16,7 @@
  * that fails transiently, both resolve to `undefined` — the caller treats that as
  * "nothing to gate on" and lets the phase run. An unlinked PR or a network blip
  * must never wedge review/CI work, so a swallowed error here is deliberate
- * (the same posture as `findOpenBlockers`, `src/pipeline/dependency-guard.ts`).
+ * (the same posture as `findGatingBlockers`, `src/pipeline/dependency-guard.ts`).
  */
 
 import { logger } from '../lib/logger.js';

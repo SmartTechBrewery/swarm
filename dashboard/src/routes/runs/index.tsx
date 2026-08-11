@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { createRoute, useNavigate } from '@tanstack/react-router';
 import { z } from 'zod';
+import { InstanceAdminOnly } from '@/components/layout/instance-admin-only.js';
 import { EmptyRunsState } from '@/components/runs/empty-runs-state.js';
 import { QueuedRunsSection } from '@/components/runs/queued-runs-section.js';
 import { RunFilters } from '@/components/runs/run-filters.js';
@@ -21,7 +22,13 @@ const runsSearchSchema = z.object({
 
 type RunsSearch = z.infer<typeof runsSearchSchema>;
 
-function RunsRouteComponent() {
+/**
+ * The installation-wide Runs History screen: every project's runs and the whole
+ * queue. It is an operator's view, so the route renders it behind
+ * {@link InstanceAdminOnly} (see {@link RunsScreen}); a worker owner reads their
+ * runs on the project detail page's Runs tab instead (issue #647).
+ */
+export function RunsRouteComponent() {
 	const search = runsIndexRoute.useSearch() as RunsSearch;
 	const navigate = useNavigate({ from: '/runs' });
 	const currentPage = search.page ?? 1;
@@ -110,9 +117,22 @@ function RunsRouteComponent() {
 	);
 }
 
+/**
+ * What the route actually mounts (issue #647): the screen behind the
+ * instance-admin gate. Denied, the screen never mounts, so neither `runs.list`
+ * nor `runs.queued` is issued.
+ */
+export function RunsScreen() {
+	return (
+		<InstanceAdminOnly view="runs">
+			<RunsRouteComponent />
+		</InstanceAdminOnly>
+	);
+}
+
 export const runsIndexRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: '/runs',
 	validateSearch: (search) => runsSearchSchema.parse(search),
-	component: RunsRouteComponent,
+	component: RunsScreen,
 });

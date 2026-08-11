@@ -40,7 +40,8 @@ export function LoginScreen() {
 			return;
 		}
 		// The session cookie is set; drop any cached (unauthenticated) session
-		// state and enter the app. The index route forwards to /runs.
+		// state and enter the app. The index route forwards on by role (issue #647):
+		// an instance admin to /runs, anyone else to /projects.
 		await queryClient.invalidateQueries({ queryKey: trpc.auth.me.queryOptions().queryKey });
 		navigate({ to: '/' });
 	};

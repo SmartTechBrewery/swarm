@@ -26,7 +26,7 @@
 
 import { z } from 'zod';
 
-import type { ProjectConfig } from '../../../config/schema.js';
+import type { ProjectConfig, ProjectPm } from '../../../config/schema.js';
 
 export const trelloConfigSchema = z
 	.object({
@@ -63,6 +63,19 @@ export const trelloConfigSchema = z
 	.describe('Trello board integration config');
 
 export type TrelloIntegrationConfig = z.infer<typeof trelloConfigSchema>;
+
+/**
+ * This provider's `pm` member with no board selected — the manifest's `blankPm`
+ * (`../manifest.ts`), which the credential/discovery API projects onto a project that
+ * is not (yet) on Trello so an operator can pick a board before saving a switch.
+ *
+ * Deliberately not a persistable member: `statusOptions` must map at least one status.
+ */
+export const trelloBlankPm: ProjectPm = {
+	type: 'trello',
+	boardId: '',
+	statusOptions: {},
+};
 
 /**
  * Narrow a project's `pm` union member to Trello's board mapping. The single place

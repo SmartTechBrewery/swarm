@@ -29,19 +29,16 @@
  */
 
 import { z } from 'zod';
-import type { PMType } from './types.js';
+import { PM_TYPES, type PMType } from './types.js';
 
 /**
- * The Zod mirror of the contract's {@link PMType}. Annotated with the contract
- * type so the two can't drift: adding a provider to one without the other stops
- * type-checking.
+ * The Zod mirror of the contract's {@link PMType}, built from the contract's own
+ * {@link PM_TYPES} list (issue #631) rather than restating it — one vocabulary, so a
+ * provider added to the contract is recognized here with no second edit. The
+ * `z.ZodType<PMType>` annotation stays as the belt-and-braces check that the two
+ * still describe the same union.
  */
-export const PmProviderIdSchema: z.ZodType<PMType> = z.enum([
-	'github-projects',
-	'jira',
-	'linear',
-	'trello',
-]);
+export const PmProviderIdSchema: z.ZodType<PMType> = z.enum(PM_TYPES);
 
 /**
  * The neutral action vocabulary an adapter maps its provider's action names

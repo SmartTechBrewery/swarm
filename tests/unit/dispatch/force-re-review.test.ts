@@ -24,6 +24,9 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 
 vi.mock('@/integrations/scm/registry.js', () => ({
 	requireProjectSCMProvider: () => ({ type: 'github' }),
+	// Also read by `ProjectConfigSchema`'s per-provider credential check (issue #628);
+	// an empty registry skips it, which is what this suite's fixtures expect.
+	listSCMProviders: () => [],
 }));
 
 import { getProjectByIdFromDb } from '@/db/repositories/projectsRepository.js';
