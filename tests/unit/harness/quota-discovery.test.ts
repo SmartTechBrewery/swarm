@@ -49,10 +49,9 @@ describe('quota-discovery', () => {
 	});
 
 	describe('queryCodexQuota', () => {
-		it('negotiates JSON-RPC initialize and rateLimits read successfully', async () => {
-			const mockStdin = {
-				write: vi.fn(),
-			};
+		/** Drive one app-server exchange: initialize, then the given `rateLimits/read` result. */
+		function runExchange(rateLimitsResult: unknown) {
+			const mockStdin = { write: vi.fn() };
 			const mockStdout = new EventEmitter();
 			const mockChild = Object.assign(new EventEmitter(), {
 				stdin: mockStdin,
@@ -64,7 +63,6 @@ describe('quota-discovery', () => {
 
 			const promise = queryCodexQuota();
 
-			// Simulate initialize response from app-server
 			mockStdout.emit(
 				'data',
 				Buffer.from(
@@ -81,37 +79,35 @@ describe('quota-discovery', () => {
 				),
 			);
 
-			// Expect initialize sent
-			expect(mockStdin.write).toHaveBeenCalledWith(
-				expect.stringContaining('"method":"initialize"'),
-			);
-
-			// Simulate rateLimits/read response
 			mockStdout.emit(
 				'data',
-				Buffer.from(
-					`${JSON.stringify({
-						jsonrpc: '2.0',
-						id: 2,
-						result: {
-							rateLimits: {
-								limitId: 'codex',
-								planType: 'plus',
-								primary: {
-									usedPercent: 45,
-									windowDurationMins: 300,
-									resetsAt: 1700000000,
-								},
-								credits: {
-									balance: '12',
-								},
-							},
-							rateLimitResetCredits: {
-								availableCount: 2,
-							},
-						},
-					})}\n`,
-				),
+				Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: 2, result: rateLimitsResult })}\n`),
+			);
+
+			return { promise, mockStdin };
+		}
+
+		it('negotiates JSON-RPC initialize and rateLimits read successfully', async () => {
+			const { promise, mockStdin } = runExchange({
+				rateLimits: {
+					limitId: 'codex',
+					planType: 'plus',
+					primary: {
+						usedPercent: 45,
+						windowDurationMins: 300,
+						resetsAt: 1700000000,
+					},
+					credits: {
+						balance: '12',
+					},
+				},
+				rateLimitResetCredits: {
+					availableCount: 2,
+				},
+			});
+
+			expect(mockStdin.write).toHaveBeenCalledWith(
+				expect.stringContaining('"method":"initialize"'),
 			);
 
 			const result = await promise;
@@ -121,11 +117,71 @@ describe('quota-discovery', () => {
 			expect(result.credits).toBe('balance: 12, resets: 2');
 			expect(result.windows).toHaveLength(1);
 			expect(result.windows?.[0]).toEqual({
-				name: 'Primary (5-hour)',
+				name: '5-hour',
 				durationMins: 300,
 				usedPercent: 45,
 				resetsAt: new Date(1700000000 * 1000).toISOString(),
 			});
+		});
+
+		// The live `codex-cli 0.147.0` shape (issue #669): hourly sessions are gone, so the
+		// only window Codex reports is a weekly one, and it arrives in the `primary` slot.
+		it('labels a weekly window in the primary slot from its reported duration', async () => {
+			const { promise } = runExchange({
+				rateLimits: {
+					limitId: 'codex',
+					limitName: null,
+					primary: { usedPercent: 28, windowDurationMins: 10080, resetsAt: 1787046281 },
+					secondary: null,
+					credits: { hasCredits: false, unlimited: false, balance: '0' },
+					planType: 'plus',
+					rateLimitReachedType: null,
+				},
+			});
+
+			const result = await promise;
+			expect(result.status).toBe('available');
+			expect(result.windows).toEqual([
+				{
+					name: 'Weekly',
+					durationMins: 10080,
+					usedPercent: 28,
+					resetsAt: new Date(1787046281 * 1000).toISOString(),
+				},
+			]);
+			expect(result.remainingPercentage).toBe(72);
+			expect(result.resetTime).toBe(new Date(1787046281 * 1000).toISOString());
+		});
+
+		it('names each slot from its own duration and reports the most-used window', async () => {
+			const { promise } = runExchange({
+				rateLimits: {
+					limitId: 'codex',
+					planType: 'pro',
+					primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 1700000000 },
+					secondary: { usedPercent: 80, windowDurationMins: 10080, resetsAt: 1700600000 },
+				},
+			});
+
+			const result = await promise;
+			expect(result.windows?.map((w) => w.name)).toEqual(['5-hour', 'Weekly']);
+			expect(result.remainingPercentage).toBe(20);
+			expect(result.resetTime).toBe(new Date(1700600000 * 1000).toISOString());
+		});
+
+		it('falls back to a neutral name when no duration is reported', async () => {
+			const { promise } = runExchange({
+				rateLimits: {
+					limitId: 'codex',
+					primary: { usedPercent: 5 },
+					secondary: null,
+				},
+			});
+
+			const result = await promise;
+			expect(result.windows).toEqual([
+				{ name: 'Usage limit', durationMins: undefined, usedPercent: 5, resetsAt: undefined },
+			]);
 		});
 
 		it('returns error if app-server fails during initialize', async () => {

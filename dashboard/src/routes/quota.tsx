@@ -221,7 +221,9 @@ function QuotaRouteComponent() {
 												<div className="space-y-3">
 													{q.windows.map((w) => (
 														<QuotaWindowCard
-															key={w.name}
+															// Names are derived from the reported duration (issue #669), so the
+															// reset time is what keeps two same-length windows apart.
+															key={`${w.name}-${w.resetsAt ?? ''}`}
 															name={w.name}
 															usedPercent={w.usedPercent}
 															durationMins={w.durationMins}
