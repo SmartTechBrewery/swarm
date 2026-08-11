@@ -51,11 +51,15 @@ const API_TOKEN_ROLE = {
 	maskedValue: 'not set',
 };
 
+// The shape issue #630 reports: the role inherits the shared SCM reference, so it
+// resolves through the project's `GITHUB_WEBHOOK_SECRET` rather than the neutral
+// `SCM_WEBHOOK_SECRET` the manifest declares. The description is the provider's own.
 const WEBHOOK_ROLE = {
 	role: 'webhookSecret',
 	label: 'Webhook Secret',
+	description: 'HMAC secret GitHub signs board deliveries with.',
 	envVarKey: 'SCM_WEBHOOK_SECRET',
-	referenceKey: 'SCM_WEBHOOK_SECRET',
+	referenceKey: 'GITHUB_WEBHOOK_SECRET',
 	optional: false,
 	inheritsSharedCredential: 'webhookSecret',
 	isConfigured: true,
@@ -91,8 +95,45 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		await waitFor(() => expect(screen.getByText('GitHub Projects API Token')).not.toBeNull());
 		expect(screen.getByText('Needs repo, project and read:org.')).not.toBeNull();
 		expect(screen.getByText('PM_GITHUB_PROJECTS_TOKEN')).not.toBeNull();
+		// This role resolves through the provider's own default, so the card gains no
+		// key-divergence note — the common case stays noise-free (issue #630).
+		expect(screen.queryByText(/not the provider's default/)).toBeNull();
 		// Provider terminology comes from the server, not from a table in the dashboard.
 		expect(screen.getByText(/GitHub Projects authenticates/)).not.toBeNull();
+	});
+
+	// Issue #630: the panel used to print the manifest's declared `envVarKey`, telling
+	// the operator to set a variable nothing in the installation reads.
+	it('names the key an inherited role actually resolves through', async () => {
+		listPmFn.mockResolvedValue(view());
+
+		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+
+		await waitFor(() => expect(screen.getByText('GITHUB_WEBHOOK_SECRET')).not.toBeNull());
+		expect(screen.queryByText('SCM_WEBHOOK_SECRET')).toBeNull();
+		// The resolved key and where it lives, plus the provider's own rationale for the
+		// sharing — which stays manifest copy rather than entering this component.
+		expect(
+			screen.getByText(
+				/resolves it through GITHUB_WEBHOOK_SECRET, configured on the Source Control/,
+			),
+		).not.toBeNull();
+		expect(screen.getByText(/HMAC secret GitHub signs board deliveries with/)).not.toBeNull();
+	});
+
+	it('explains a non-inherited role whose resolved key diverges from the default', async () => {
+		listPmFn.mockResolvedValue(
+			view([{ ...API_TOKEN_ROLE, referenceKey: 'GH_PROJECTS_PAT' }, WEBHOOK_ROLE]),
+		);
+
+		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+
+		await waitFor(() => expect(screen.getByText('GH_PROJECTS_PAT')).not.toBeNull());
+		expect(
+			screen.getByText(
+				/resolves it through GH_PROJECTS_PAT, not the provider's default PM_GITHUB_PROJECTS_TOKEN/,
+			),
+		).not.toBeNull();
 	});
 
 	it('warns that discovery needs the unconfigured required role', async () => {
@@ -136,7 +177,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
 
 		await waitFor(() => expect(screen.getByText('Webhook Secret')).not.toBeNull());
-		expect(screen.getByText(/configure it on the Source Control tab/)).not.toBeNull();
+		expect(screen.getByText(/configured on the Source Control tab/)).not.toBeNull();
 		expect(screen.queryByLabelText('Webhook Secret value')).toBeNull();
 		expect(screen.queryByLabelText('Remove Webhook Secret')).toBeNull();
 	});
