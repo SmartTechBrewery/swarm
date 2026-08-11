@@ -85,14 +85,15 @@ describe('github-projects manifest registration', () => {
 		expect(apiToken?.description).toContain('read:org');
 	});
 
-	// Issue #497: the webhook secret inherits the shared SCM reference rather than
+	// Issue #497: the webhook secret inherits the repo side's reference rather than
 	// asking a project to configure a second one, because board and repo are literally
-	// the same webhook.
-	it('declares a webhook-secret role that inherits the shared reference', () => {
+	// the same webhook. Since issue #628 that reference is per SCM provider, so the
+	// conventional key is GitHub's own rather than the retired neutral one.
+	it('declares a webhook-secret role that inherits the repo side’s reference', () => {
 		expect(githubProjectsManifest.credentialRoles).toContainEqual(
 			expect.objectContaining({
 				role: 'webhookSecret',
-				envVarKey: 'SCM_WEBHOOK_SECRET',
+				envVarKey: 'GITHUB_WEBHOOK_SECRET',
 				inheritsSharedCredential: 'webhookSecret',
 			}),
 		);

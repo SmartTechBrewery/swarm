@@ -189,6 +189,10 @@ describe('runAssignmentDbFree', () => {
 			label: 'GitHub',
 			category: 'scm',
 			webhookRoute: '/github/webhook',
+			credentialRoles: [
+				{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER' },
+				{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
+			],
 			provider: { type: 'github', category: 'scm', operatorDeliveryProvider },
 		} as unknown as SCMProviderManifest);
 		const sink = recordingSink();

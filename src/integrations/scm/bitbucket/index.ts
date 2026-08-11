@@ -34,6 +34,14 @@ export const bitbucketScmManifest: SCMProviderManifest = {
 	// resolves a sole runtime-ready one and must now set `scm` (see `../registry.ts`
 	// and the `scm` field doc in `src/config/schema.ts`).
 	runtimeReady: true,
+	// Bitbucket's own reference names for the contract's two credentials (issue #628),
+	// so a project can hold these alongside GitHub's or GitLab's instead of the three
+	// sharing (and overwriting) one pair. Spelled like the sibling operator variable
+	// `SWARM_OPERATOR_BITBUCKET_TOKEN`.
+	credentialRoles: [
+		{ role: 'reviewer', envVarKey: 'BITBUCKET_TOKEN_REVIEWER' },
+		{ role: 'webhookSecret', envVarKey: 'BITBUCKET_WEBHOOK_SECRET' },
+	],
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).
 	provider: new BitbucketSCMIntegration(),
