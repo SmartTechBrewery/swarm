@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import type { AnchorHTMLAttributes, ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -101,16 +101,38 @@ describe('Sidebar user block', () => {
 		expect(scroller?.contains(screen.getByRole('button', { name: 'Sign out' }))).toBe(false);
 	});
 
-	it('states the connection as a dot with no textual label (issue #665)', async () => {
-		const container = renderSidebar();
+	it('states the connection as an accessible status with no textual label (issue #665)', async () => {
+		renderSidebar();
 
-		// Wait for the ping to resolve — a "Connected" label would have rendered by now.
-		await waitFor(() => {
-			expect(container.querySelector('[title="Connected"]')).not.toBeNull();
-		});
+		// The status is exposed to assistive tech via role + accessible name, not
+		// by requiring a hover/focus to read a bare `title`.
+		const status = await screen.findByRole('status', { name: 'Connected' });
+		expect(status.querySelector('svg')?.getAttribute('class')).toContain('lucide-circle-check');
 
 		expect(screen.queryByText('Connected')).toBeNull();
 		expect(screen.queryByText('Disconnected')).toBeNull();
 		expect(screen.queryByText('Connecting…')).toBeNull();
+	});
+
+	it('gives the disconnected state its own icon shape, not just a color change', async () => {
+		pingQueryFn.mockRejectedValue(new Error('unreachable'));
+
+		renderSidebar();
+
+		const status = await screen.findByRole('status', { name: 'Disconnected' });
+		const icon = status.querySelector('svg');
+		expect(icon?.getAttribute('class')).toContain('lucide-circle-x');
+		expect(icon?.getAttribute('class')).not.toContain('lucide-circle-check');
+	});
+
+	it('gives the pending/connecting state its own icon shape while the ping is in flight', () => {
+		// Never resolves, so the query stays in its initial (pending) state.
+		pingQueryFn.mockReturnValue(new Promise(() => {}));
+
+		renderSidebar();
+
+		const status = screen.getByRole('status', { name: 'Connecting…' });
+		const icon = status.querySelector('svg');
+		expect(icon?.getAttribute('class')).toContain('lucide-circle-dashed');
 	});
 });

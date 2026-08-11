@@ -1,6 +1,17 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router';
-import { FolderGit2, Gauge, LogOut, Play, Plus, Server, Settings } from 'lucide-react';
+import {
+	CircleCheck,
+	CircleDashed,
+	CircleX,
+	FolderGit2,
+	Gauge,
+	LogOut,
+	Play,
+	Plus,
+	Server,
+	Settings,
+} from 'lucide-react';
 import { useState } from 'react';
 import { ProjectCreateDialog } from '@/components/projects/project-create-dialog.js';
 import { logout } from '@/lib/auth.js';
@@ -8,6 +19,22 @@ import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
 import { version } from '../../../../package.json';
+
+// Each connection state gets its own icon shape (not just a color), so the
+// state reads without relying on color perception (issue #665).
+const CONNECTION_STATE_META = {
+	connected: {
+		Icon: CircleCheck,
+		label: 'Connected',
+		iconClassName: 'h-3.5 w-3.5 text-emerald-500',
+	},
+	disconnected: { Icon: CircleX, label: 'Disconnected', iconClassName: 'h-3.5 w-3.5 text-red-500' },
+	connecting: {
+		Icon: CircleDashed,
+		label: 'Connecting…',
+		iconClassName: 'h-3.5 w-3.5 text-zinc-500',
+	},
+} as const;
 
 export function Sidebar() {
 	const currentPath = useRouterState({ select: (s) => s.location.pathname });
@@ -17,6 +44,17 @@ export function Sidebar() {
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const currentUser = useCurrentUser();
 	const [createOpen, setCreateOpen] = useState(false);
+
+	const connectionState: keyof typeof CONNECTION_STATE_META = pingQuery.isSuccess
+		? 'connected'
+		: pingQuery.isError
+			? 'disconnected'
+			: 'connecting';
+	const {
+		Icon: ConnectionIcon,
+		label: connectionLabel,
+		iconClassName: connectionIconClassName,
+	} = CONNECTION_STATE_META[connectionState];
 
 	const handleLogout = async () => {
 		await logout();
@@ -153,22 +191,20 @@ export function Sidebar() {
 			    profile and Sign out stay reachable from anywhere in the nav (#665). */}
 			{currentUser.data && (
 				<div className="flex shrink-0 items-center gap-2 border-t border-zinc-850 px-4 py-3">
-					{/* The connection dot survived the removal of its "Connected" text
+					{/* The connection state survived the removal of its "Connected" text
 					    (#665) — the footer is an account area now, and the status reads
-					    fine as a dot. Its `title` is the dot's accessible name, not the
-					    label put back: nothing renders it in the sidebar. */}
+					    fine as an icon. Each state gets its own shape (not just a color),
+					    and `role="status"` + `aria-label` give it an accessible, live-
+					    announced name without needing a focusable control or a visible
+					    label put back: nothing renders `connectionLabel` in the sidebar. */}
 					<span
-						className={
-							pingQuery.isSuccess
-								? 'h-2 w-2 shrink-0 rounded-full bg-emerald-500 ring-4 ring-emerald-500/10'
-								: pingQuery.isError
-									? 'h-2 w-2 shrink-0 rounded-full bg-red-500 ring-4 ring-red-500/10'
-									: 'h-2 w-2 shrink-0 rounded-full bg-zinc-600 ring-4 ring-zinc-600/10'
-						}
-						title={
-							pingQuery.isSuccess ? 'Connected' : pingQuery.isError ? 'Disconnected' : 'Connecting…'
-						}
-					/>
+						role="status"
+						aria-label={connectionLabel}
+						title={connectionLabel}
+						className="shrink-0"
+					>
+						<ConnectionIcon aria-hidden="true" className={connectionIconClassName} />
+					</span>
 					{/* The signed-in user's name is the way into their own profile
 					    (issue #659) — it was a label until then. `min-w-0 truncate` stays
 					    so a long name can't push the Sign out button off the row. */}
