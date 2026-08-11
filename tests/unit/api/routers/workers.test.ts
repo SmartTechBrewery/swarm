@@ -184,6 +184,64 @@ describe('workers.list (installation roster, issue #133)', () => {
 	});
 });
 
+describe('workers.list ordering — the viewer’s own machines first (issue #657)', () => {
+	/** A roster row as `listDashboardWorkers` returns it, reduced to the fields ordering reads. */
+	function rosterRow(workerId: string, ownerUserId: string | null) {
+		return {
+			workerId,
+			lastSeenAt: null,
+			owner: ownerUserId
+				? {
+						userId: ownerUserId,
+						identifier: `${ownerUserId}@example.com`,
+						displayName: ownerUserId,
+					}
+				: null,
+		};
+	}
+
+	it('lists the caller’s workers first, keeping each group’s existing order', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['proj-a']);
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('other-1', OTHER_ID),
+			rosterRow('mine-1', OWNER_ID),
+			rosterRow('other-2', OTHER_ID),
+			rosterRow('mine-2', OWNER_ID),
+		]);
+
+		const rows = await owner.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'mine-2', 'other-1', 'other-2']);
+	});
+
+	it('applies the same ordering to a project-scoped roster', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('other-1', OTHER_ID),
+			rosterRow('mine-1', OWNER_ID),
+		]);
+
+		const rows = await owner.list({ projectId: 'p1' });
+
+		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'other-1']);
+	});
+
+	it('leaves the order untouched for a viewer who owns no visible worker', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['proj-a']);
+		// The third row's owner user row no longer resolves; it is still not the
+		// viewer's, whose own row resolved to authenticate the request.
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('other-1', OTHER_ID),
+			rosterRow('other-2', OTHER_ID),
+			rosterRow('orphaned', null),
+		]);
+
+		const rows = await owner.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['other-1', 'other-2', 'orphaned']);
+	});
+});
+
 describe('workers.list scoped to one project (issue #574)', () => {
 	it('runs the project roster’s own access rule and scopes to that project alone', async () => {
 		getMembership.mockResolvedValue(membershipFor('contributor'));
