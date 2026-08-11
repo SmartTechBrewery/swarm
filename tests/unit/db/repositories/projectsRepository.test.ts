@@ -304,7 +304,7 @@ describe('projectsRepository', () => {
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
 					webhookSecret: 'SCM_WEBHOOK_SECRET',
-					pm: { webhookSecret: 'PM_WEBHOOK_SECRET' },
+					pm: { 'github-projects': { webhookSecret: 'PM_WEBHOOK_SECRET' } },
 				},
 			});
 

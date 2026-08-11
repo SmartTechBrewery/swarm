@@ -18,6 +18,8 @@ import {
 	getPersonaToken,
 	getPersonaTokenOrNull,
 	getWebhookSecretOrNull,
+	requireScmCredential,
+	resolveScmCredentialOrNull,
 } from '@/config/provider.js';
 import { resolveProjectCredential } from '@/db/repositories/credentialsRepository.js';
 import {
@@ -25,12 +27,20 @@ import {
 	findProjectByPmContainerFromDb,
 	findProjectByRepoFromDb,
 } from '@/db/repositories/projectsRepository.js';
+// Registers the real SCM manifests, whose declared `envVarKey`s the "missing
+// credential" errors below name — the criterion that a project asked for GitLab is
+// told about GitLab, never handed GitHub's secret (issue #628).
+import '@/integrations/entrypoint.js';
 
+// A pre-#628 config: the legacy shared pair, which the schema's adoption normalizer
+// files under the provider the project runs on (here an unstated `scm`, so GitHub).
 const project = createMockProjectConfig({
 	id: 'proj-1',
 	credentials: {
 		reviewer: 'REV_TOKEN_KEY',
 		webhookSecret: 'WEBHOOK_KEY',
+		// Required by the registered GitHub Projects manifest (issue #537).
+		pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 	},
 });
 
@@ -120,20 +130,89 @@ describe('config provider', () => {
 
 		it('throws when the reviewer token is not configured', async () => {
 			vi.mocked(resolveProjectCredential).mockResolvedValue(null);
-			await expect(getPersonaToken(project, 'reviewer')).rejects.toThrow(/reviewer token/);
+			await expect(getPersonaToken(project, 'reviewer')).rejects.toThrow(
+				/No GitHub reviewer credential configured for project 'proj-1'/,
+			);
 		});
 	});
 
 	describe('getWebhookSecretOrNull', () => {
-		it("resolves the project's webhook-secret reference to its secret", async () => {
+		it("resolves the named provider's webhook-secret reference to its secret", async () => {
 			vi.mocked(resolveProjectCredential).mockResolvedValue('whsec_123');
-			expect(await getWebhookSecretOrNull(project)).toBe('whsec_123');
+			expect(await getWebhookSecretOrNull(project, 'github')).toBe('whsec_123');
 			expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'WEBHOOK_KEY');
 		});
 
 		it('returns null when the reference resolves to nothing', async () => {
 			vi.mocked(resolveProjectCredential).mockResolvedValue(null);
-			expect(await getWebhookSecretOrNull(project)).toBeNull();
+			expect(await getWebhookSecretOrNull(project, 'github')).toBeNull();
+		});
+
+		// The receiver passes the *delivering* provider's id, so a project that stores no
+		// secret for it must not be verified against another provider's (issue #628).
+		it('reads only the named provider, never a sibling provider’s secret', async () => {
+			vi.mocked(resolveProjectCredential).mockResolvedValue('whsec_123');
+			expect(await getWebhookSecretOrNull(project, 'bitbucket')).toBeNull();
+			expect(resolveProjectCredential).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #628's acceptance criteria, directly: a project may hold several providers'
+	// credentials at once, each resolves independently, and a missing one fails with its
+	// own error rather than resolving a sibling's.
+	describe('per-provider SCM credentials', () => {
+		const multiProvider = createMockProjectConfig({
+			id: 'multi',
+			scm: 'gitlab',
+			credentials: {
+				scm: {
+					github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
+					gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
+				},
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+			},
+		});
+
+		it('resolves each provider through its own reference', async () => {
+			vi.mocked(resolveProjectCredential).mockImplementation(async (_id, key) => `secret:${key}`);
+
+			expect(await resolveScmCredentialOrNull(multiProvider, 'github', 'reviewer')).toBe(
+				'secret:GH_REVIEWER',
+			);
+			expect(await resolveScmCredentialOrNull(multiProvider, 'gitlab', 'reviewer')).toBe(
+				'secret:GL_REVIEWER',
+			);
+			expect(await resolveScmCredentialOrNull(multiProvider, 'gitlab', 'webhookSecret')).toBe(
+				'secret:GL_HOOK',
+			);
+		});
+
+		// Retained credentials for a provider the project is not running on are stored but
+		// never resolved: `resolveScmCredentialOrNull` is not a fallback chain.
+		it('returns null for a provider the project stores nothing for', async () => {
+			vi.mocked(resolveProjectCredential).mockResolvedValue('anything');
+			expect(await resolveScmCredentialOrNull(multiProvider, 'bitbucket', 'reviewer')).toBeNull();
+			expect(resolveProjectCredential).not.toHaveBeenCalled();
+		});
+
+		it('throws naming the asked-for provider, role and its conventional env var key', async () => {
+			vi.mocked(resolveProjectCredential).mockResolvedValue('github-secret');
+
+			// `project` holds GitHub's references only — asking for GitLab must fail rather
+			// than hand back the GitHub secret the mock would happily return.
+			await expect(requireScmCredential(project, 'gitlab', 'reviewer')).rejects.toThrow(
+				"No GitLab reviewer credential configured for project 'proj-1' " +
+					'(set credentials.scm.gitlab.reviewer to a stored reference; ' +
+					'GITLAB_TOKEN_REVIEWER is its conventional config-apply key)',
+			);
+		});
+
+		it('throws when the provider is named but its stored secret is absent', async () => {
+			vi.mocked(resolveProjectCredential).mockResolvedValue(null);
+			await expect(requireScmCredential(multiProvider, 'gitlab', 'webhookSecret')).rejects.toThrow(
+				/GITLAB_WEBHOOK_SECRET is its conventional config-apply key/,
+			);
+			expect(resolveProjectCredential).toHaveBeenCalledWith('multi', 'GL_HOOK');
 		});
 	});
 });

@@ -125,6 +125,29 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		await expect(writeOnly(fetchImpl).listBlockers('PVTI_item1')).resolves.toEqual(blockers);
 	});
 
+	it('serves listDependents over the transport so the cycle backstop keeps working', async () => {
+		// Issue #639: the gate runs on the worker, so refusing this read would leave
+		// every federated Implementation deferring on a blocker it natively blocks
+		// until the wait budget ran out — the deadlock the backstop exists to prevent.
+		const dependents = [
+			{
+				reference: '#631',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/631',
+				title: 'Per-provider PM credentials',
+				open: true,
+			},
+		];
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { dependents }));
+
+		await expect(writeOnly(fetchImpl).listDependents('PVTI_item1')).resolves.toEqual(dependents);
+		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pm/dependents');
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: PROJECT_ID,
+			itemId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
 	it("serves respond-to-review's card lookup as one narrow read over the transport", async () => {
 		const wireItem = {
 			id: 'ITEM_21',

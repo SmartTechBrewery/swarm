@@ -20,6 +20,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 // Importing the entrypoint is what a real runtime surface does; it triggers every
 // provider's side-effect registration. Vitest isolates module state per test file,
 // so this registration is independent of registry.test.ts's resets.
@@ -70,6 +71,7 @@ const PM_CONTRACT_METHODS = [
 	'updateWorkItem',
 	'addLabel',
 	'listBlockers',
+	'listDependents',
 	'addBlockedBy',
 ] as const satisfies ReadonlyArray<PMContractMethod>;
 
@@ -195,6 +197,65 @@ describe('PM provider conformance', () => {
 				expect(project.pm.type).toBe(manifest.id);
 				const { type: _type, ...mapping } = project.pm;
 				expect(() => manifest.configSchema.parse(mapping)).not.toThrow();
+			});
+
+			/**
+			 * `blankPm` is the member shared code projects onto a project that is **not** on
+			 * this provider, so the discovery API can serve an incoming provider before a
+			 * switch is saved (issue #641). Two things make that projection sound, and both
+			 * are asserted here rather than left to the one call site: it declares *this*
+			 * provider (a wrong discriminator would send the request to another provider's
+			 * `require…Config` narrowing), and it is a **complete** member of this provider's
+			 * own mapping shape with **nothing selected** (a missing required key would build
+			 * a provider against a partial member, and a filled one would discover against
+			 * someone else's board).
+			 *
+			 * The key set is read off `configSchema` — the provider's own declaration —
+			 * rather than compared against the fixture, which may legitimately set an
+			 * optional field the blank member omits (GitHub Projects' `phaseLabels`).
+			 */
+			it('declares a blank pm member complete for its own shape, with nothing selected', () => {
+				const { type, ...mapping } = manifest.blankPm;
+				expect(type, `${manifest.id}.blankPm.type`).toBe(manifest.id);
+
+				const schema = manifest.configSchema;
+				expect(schema instanceof z.ZodObject, `${manifest.id}.configSchema is a z.object`).toBe(
+					true,
+				);
+				const shape = (schema as z.AnyZodObject).shape as Record<string, z.ZodTypeAny>;
+				for (const key of Object.keys(mapping)) {
+					expect(
+						Object.keys(shape),
+						`${manifest.id}.blankPm.${key} is not in its own schema`,
+					).toContain(key);
+				}
+				for (const [key, field] of Object.entries(shape)) {
+					if (field.isOptional()) continue;
+					expect(mapping, `${manifest.id}.blankPm is missing the required '${key}'`).toHaveProperty(
+						key,
+					);
+				}
+
+				// "Mapping-free": an identity field is blank and a mapping record is empty, so
+				// nothing here can name a board the operator has not picked yet.
+				for (const [key, value] of Object.entries(mapping)) {
+					if (typeof value === 'string') {
+						expect(value, `${manifest.id}.blankPm.${key} selects something`).toBe('');
+					} else {
+						expect(
+							Object.keys(value ?? {}),
+							`${manifest.id}.blankPm.${key} maps something`,
+						).toHaveLength(0);
+					}
+				}
+			});
+
+			// The refusal copy is returned verbatim as a `PRECONDITION_FAILED` message
+			// (`src/api/routers/pm.ts`), so an empty one would leave the operator with a bare
+			// error code. Absent is the normal case — only Jira declares one.
+			it('pairs any declared discovery blocker with copy an operator can act on', () => {
+				if (manifest.blankPmDiscoveryBlocker === undefined) return;
+				expect(manifest.blankPmDiscoveryBlocker.trim()).not.toBe('');
 			});
 
 			// `credentials.pm` is validated against these (`src/config/schema.ts`), so a

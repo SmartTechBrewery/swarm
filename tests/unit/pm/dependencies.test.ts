@@ -6,8 +6,13 @@ import {
 	dependencyProse,
 	findDependencyReferences,
 	openBlockers,
+	partitionBlockersBySource,
+	partitionCyclicBlockers,
+	proseAdvisoryCommentBody,
+	proseAdvisoryMarker,
 } from '@/pm/dependencies.js';
-import type { WorkItemBlocker } from '@/pm/types.js';
+import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
+import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 
 function blocker(overrides: Partial<WorkItemBlocker> = {}): WorkItemBlocker {
 	return {
@@ -16,6 +21,16 @@ function blocker(overrides: Partial<WorkItemBlocker> = {}): WorkItemBlocker {
 		title: 'Session auth',
 		open: true,
 		source: 'dependency',
+		...overrides,
+	};
+}
+
+function dependent(overrides: Partial<WorkItemDependent> = {}): WorkItemDependent {
+	return {
+		reference: '#319',
+		url: 'https://github.com/o/r/issues/319',
+		title: 'Session auth',
+		open: true,
 		...overrides,
 	};
 }
@@ -68,6 +83,84 @@ describe('findDependencyReferences', () => {
 	it('returns [] for empty text', () => {
 		expect(findDependencyReferences('')).toEqual([]);
 	});
+
+	it('does not read work that depends ON this item as a prerequisite (issue #636)', () => {
+		// The clause that deadlocked run bdd362d7-c059-4e40-b7d7-fcd60ac502ba: one
+		// sentence on item 633 carried "Depends on" (whose object is the prose
+		// "phase 1", no issue number) and, ~190 characters later, a reference to
+		// work that depends *on* 633 — so the referenced issue could never close
+		// first and the gate re-checked until the wait budget ran out. Keep the
+		// fixture here rather than in the issue prose: written out, it declares the
+		// very dependency it describes.
+		const clause =
+			'Depends on phase 1 ("PM tab presentation 1/2") having landed: the two phases touch disjoint files, but the tab’s credential copy must already be correct before a provider section is placed above it — and #631, the dashboard-side provider switch, builds on the section this phase creates.';
+		expect(findDependencyReferences(clause)).toEqual([]);
+	});
+
+	it('does not bind a later dependent through an earlier prerequisite phrase', () => {
+		expect(findDependencyReferences('Depends on #12, but #631 is blocked by this task.')).toEqual([
+			'12',
+		]);
+		expect(
+			findDependencyReferences('#12 must be done first, but #631 is blocked by this task.'),
+		).toEqual(['12']);
+	});
+
+	it('drops a dependency phrase whose object is this item', () => {
+		// The keyword leads, yet the relation runs the other way — the reference is
+		// the dependent side, not a prerequisite.
+		expect(findDependencyReferences('Blocked by this phase, #631 will follow.')).toEqual([]);
+		expect(findDependencyReferences('Issue #631 is blocked by this phase.')).toEqual([]);
+		expect(
+			findDependencyReferences('This phase must be merged first, then #631 can start.'),
+		).toEqual([]);
+	});
+
+	it('binds an object-side phrase forwards and a subject-side phrase backwards', () => {
+		// "#631 depends on X" states what #631 needs, not what this item needs.
+		expect(
+			findDependencyReferences('#631 depends on the provider section this phase adds.'),
+		).toEqual([]);
+		expect(findDependencyReferences('This work is a prerequisite for #631.')).toEqual([]);
+		// …while the mirror phrasings still resolve their prerequisite.
+		expect(findDependencyReferences('#42 needs to land first.')).toEqual(['42']);
+		expect(findDependencyReferences('#12 is a prerequisite for this work.')).toEqual(['12']);
+		expect(findDependencyReferences('Waiting for #12 to close before this can start.')).toEqual([
+			'12',
+		]);
+		expect(findDependencyReferences('Prerequisite: #630, #633.')).toEqual(['630', '633']);
+	});
+
+	it('reads "needs to land" from either side, but only with the reference as its object', () => {
+		expect(findDependencyReferences('Also needs to land #11 first.')).toEqual(['11']);
+		expect(findDependencyReferences('#11 needs to land first.')).toEqual(['11']);
+		// The elided subject is this item, so the reference after "before" is what
+		// waits on *us* — the direction that deadlocked run bdd362d7.
+		expect(findDependencyReferences('This needs to land before #631 can start.')).toEqual([]);
+	});
+
+	it('requires the reference to sit near the phrase that binds it', () => {
+		// Inside the window: a short noun phrase between the two.
+		expect(findDependencyReferences('Blocked by the session-auth groundwork in #319.')).toEqual([
+			'319',
+		]);
+		// Far outside it: the sentence has moved on to other subject matter.
+		expect(
+			findDependencyReferences(
+				'Depends on phase 1, which is the bulk of the credentials work and touches a dozen files across the dashboard and the API router, so #631 stays open until then.',
+			),
+		).toEqual([]);
+	});
+
+	it('measures the window to the reference token, so a long issue URL still binds', () => {
+		// The gap is charged from the token start, not the `/issues/N` match index,
+		// so the org/repo path's own length never pushes a URL out of the window.
+		expect(
+			findDependencyReferences(
+				'Blocked by https://github.com/SmartTechBrewery/swarm/issues/636 for now.',
+			),
+		).toEqual(['636']);
+	});
 });
 
 describe('dependencyProse', () => {
@@ -93,6 +186,135 @@ describe('openBlockers', () => {
 	it('keeps only the still-open blockers', () => {
 		const list = [blocker({ open: true }), blocker({ open: false, reference: '#5' })];
 		expect(openBlockers(list).map((b) => b.reference)).toEqual(['#319']);
+	});
+});
+
+// Issue #643: `source` decides a blocker's authority, not just its wording.
+describe('partitionBlockersBySource', () => {
+	it('gates on a native relationship and only advises on a prose mention', () => {
+		const { gating, advisory } = partitionBlockersBySource([
+			blocker({ reference: '#319', source: 'dependency' }),
+			blocker({ reference: '#631', source: 'mention' }),
+		]);
+		expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		expect(advisory.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('returns two empty lists for no blockers', () => {
+		expect(partitionBlockersBySource([])).toEqual({ gating: [], advisory: [] });
+	});
+});
+
+// Issue #639: a blocker the item itself blocks can never close, so it can never be
+// a wait — the reported deadlock (633 deferred on 631, whose own `blocked_by` named
+// 633) ran ~2000 rechecks and then settled failed.
+describe('partitionCyclicBlockers', () => {
+	it('suppresses a blocker the item natively blocks, matched by URL', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+			[dependent({ reference: 'ENG-631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(gating).toEqual([]);
+		expect(suppressed.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('falls back to the reference when the two reads carry no URL', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#631', url: '' })],
+			[dependent({ reference: '#631', url: '' })],
+		);
+		expect(gating).toEqual([]);
+		expect(suppressed.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('never matches two entries that are merely both blank', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '', url: '' })],
+			[dependent({ reference: '', url: '' })],
+		);
+		expect(gating).toHaveLength(1);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('gates everything when the item blocks nothing', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker(), blocker({ reference: '#5' })],
+			[],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#319', '#5']);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('gates everything when the dependents are unrelated to the blockers', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker()],
+			[dependent({ reference: '#900', url: 'https://github.com/o/r/issues/900' })],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('suppresses only the cyclic blocker, leaving a genuine one gating', () => {
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' }), blocker()],
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		expect(suppressed.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('checks only the direct edge — a dependent-of-a-dependent still gates', () => {
+		// Transitive cycles are deliberately out of scope: walking further needs each
+		// dependent's own provider-native id, which a reverse read need not yield.
+		const { gating, suppressed } = partitionCyclicBlockers(
+			[blocker({ reference: '#700', url: 'https://github.com/o/r/issues/700' })],
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(gating.map((b) => b.reference)).toEqual(['#700']);
+		expect(suppressed).toEqual([]);
+	});
+});
+
+describe('proseAdvisoryMarker', () => {
+	it('is stable for the same reference set whatever the order', () => {
+		const a = proseAdvisoryMarker([blocker({ reference: '#12' }), blocker({ reference: '#7' })]);
+		const b = proseAdvisoryMarker([blocker({ reference: '#7' }), blocker({ reference: '#12' })]);
+		expect(a).toBe(b);
+	});
+
+	it('differs for a different reference set, so a later prerequisite gets its own notice', () => {
+		expect(proseAdvisoryMarker([blocker({ reference: '#7' })])).not.toBe(
+			proseAdvisoryMarker([blocker({ reference: '#8' })]),
+		);
+	});
+});
+
+describe('proseAdvisoryCommentBody', () => {
+	const body = proseAdvisoryCommentBody([
+		blocker({ reference: '#631', title: 'Hold PM credentials', url: 'https://x/631' }),
+	]);
+
+	it('names the reference, its title and its URL', () => {
+		expect(body).toContain('#631');
+		expect(body).toContain('Hold PM credentials');
+		expect(body).toContain('https://x/631');
+	});
+
+	it('says the run was not held back and asks for a recorded relationship', () => {
+		expect(body).toMatch(/did not hold the run back/i);
+		expect(body).toMatch(/record it on the board/i);
+	});
+
+	it('carries its own marker so the notice is idempotent', () => {
+		expect(body).toContain(proseAdvisoryMarker([blocker({ reference: '#631' })]));
+	});
+
+	// The notice names issue references beside the words "prerequisite" and "blocked
+	// by". It is recognisable as SWARM's own writing, so the scan skips it — a notice
+	// that gated the next run on the issue it asks about would be this bug wearing a hat.
+	it('is recognised as SWARM-generated, so the prose scan never reads it back', () => {
+		expect(isSwarmGeneratedBody(body)).toBe(true);
+		expect(findDependencyReferences(dependencyProse(undefined, [body]))).toEqual([]);
 	});
 });
 
@@ -126,5 +348,36 @@ describe('blockedRunMessage', () => {
 		const msg = blockedRunMessage([blocker(), blocker({ reference: '#5', title: 'DB' })]);
 		expect(msg).toContain('#319');
 		expect(msg).toContain('#5');
+	});
+
+	// Issue #636: the message is where a human learns whether the gate rests on a
+	// recorded relationship or on the prose scan's reading of a sentence. The gate only
+	// passes native blockers since #643, but the formatter still labels either source —
+	// the `mention` case below is what keeps that vocabulary honest.
+	it('names a native relationship as the source of a single blocker', () => {
+		const msg = blockedRunMessage([blocker({ source: 'dependency' })]);
+		expect(msg).toContain('native blocked-by relationship');
+		expect(msg).not.toContain('prose mention');
+		expect(msg).toMatch(/must be done first/i);
+	});
+
+	it('names a prose mention as the source of a single blocker', () => {
+		const msg = blockedRunMessage([blocker({ source: 'mention' })]);
+		expect(msg).toContain('prose mention in the item description or comments');
+		expect(msg).not.toContain('native blocked-by relationship');
+		expect(msg).toMatch(/must be done first/i);
+	});
+
+	it('annotates each blocker with its own source when the sources differ', () => {
+		const msg = blockedRunMessage([
+			blocker({ source: 'dependency' }),
+			blocker({ reference: '#5', title: 'DB', source: 'mention' }),
+		]);
+		expect(msg).toContain(
+			'#319 (“Session auth”, https://github.com/o/r/issues/319) — native blocked-by relationship',
+		);
+		expect(msg).toContain(
+			'#5 (“DB”, https://github.com/o/r/issues/319) — prose mention in the item description or comments',
+		);
 	});
 });

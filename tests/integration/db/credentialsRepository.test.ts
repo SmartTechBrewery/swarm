@@ -111,12 +111,15 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('credentialsRepository (in
 		it('resolves the reviewer token and the webhook secret via their references', async () => {
 			vi.stubEnv('CREDENTIAL_MASTER_KEY', MASTER_KEY_HEX);
 			const project = await seedProject({ id: 'swarm-2', repo: 'SmartTechBrewery/swarm-2' });
+			// Per-provider references since issue #628; the fixture's legacy pair is adopted
+			// under `github` on parse, so this is the block both readers below resolve.
+			const references = project.credentials.scm?.github ?? {};
 
-			await writeProjectCredential('swarm-2', project.credentials.reviewer, 'test-token-reviewer');
-			await writeProjectCredential('swarm-2', project.credentials.webhookSecret, 'hmac-secret');
+			await writeProjectCredential('swarm-2', String(references.reviewer), 'test-token-reviewer');
+			await writeProjectCredential('swarm-2', String(references.webhookSecret), 'hmac-secret');
 
 			expect(await getPersonaTokenOrNull(project, 'reviewer')).toBe('test-token-reviewer');
-			expect(await getWebhookSecretOrNull(project)).toBe('hmac-secret');
+			expect(await getWebhookSecretOrNull(project, 'github')).toBe('hmac-secret');
 		});
 
 		it('resolves the implementer token from the operator env var, not project credentials', async () => {

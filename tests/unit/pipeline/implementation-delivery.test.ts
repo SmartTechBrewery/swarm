@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { runImplementationPhase } from '@/pipeline/implementation.js';
-import type { WorkItemBlocker } from '@/pm/types.js';
+import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import {
 	DeliveryDivergedError,
 	deliveryIdentity,
@@ -109,6 +109,7 @@ function makePm() {
 		supportsDependencies: true,
 		supportsAssignees: true,
 		listBlockers: vi.fn<() => Promise<WorkItemBlocker[]>>(async () => []),
+		listDependents: vi.fn<() => Promise<WorkItemDependent[]>>(async () => []),
 		addBlockedBy: vi.fn(async () => {}),
 	};
 }

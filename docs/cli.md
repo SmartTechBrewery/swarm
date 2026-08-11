@@ -1,8 +1,8 @@
 # SWARM command reference
 
 Every command SWARM ships, in one place: the **`swarm` operator CLI** (stack
-lifecycle, config, users, workers, project membership) and the **`npm run`
-scripts** that run the host processes (API, worker, dashboard) and the
+lifecycle, config, users, workers, project membership, board webhooks) and the
+**`npm run` scripts** that run the host processes (API, worker, dashboard) and the
 database/queue/test tooling.
 
 This document is the human-readable mirror of the CLI's own `--help` output and
@@ -28,14 +28,15 @@ when present. The `--` separates npm's own args from the ones passed to the CLI 
 it is required.
 
 **Environment.** Commands that touch the database (`config`, `users`, `members`,
-`identities`, `workers`, `queue`, `run`, `worktrees`) need `DATABASE_URL` (and some
-also `REDIS_URL`) in the environment. `npm run swarm -- …` and the dedicated npm
+`identities`, `workers`, `queue`, `run`, `worktrees`, `pm`) need `DATABASE_URL` (and
+some also `REDIS_URL`) in the environment; `pm webhook` additionally needs
+`WEBHOOK_CALLBACK_BASE_URL`. `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
 
 Run `swarm --help`, or `swarm <command> --help` on the multi-subcommand commands
-(`config`, `queue`, `run`, `users`, `members`, `identities`, `workers`), to print
-the authoritative usage.
+(`config`, `queue`, `run`, `users`, `members`, `identities`, `workers`, `pm`), to
+print the authoritative usage.
 
 ---
 
@@ -56,6 +57,7 @@ the authoritative usage.
 | [`identities`](#swarm-identities) | Link a user to the handles they own on a provider |
 | [`workers`](#swarm-workers) | Register and manage local workers |
 | [`worktrees prune`](#swarm-worktrees) | Prune stale per-task worktrees |
+| [`pm webhook`](#swarm-pm) | Register/list/delete a project's Trello board webhook |
 
 > The worker is **not** managed by this CLI — it runs on the host, outside Docker
 > Compose (it needs the developer's PATH/auth for git and the agent CLIs). Start
@@ -327,6 +329,49 @@ swarm worktrees prune [--project <id>] [--dry-run]
 
 Requires `DATABASE_URL` (project config) and `REDIS_URL` (in-flight check).
 Wrapper: `npm run worktrees:prune`.
+
+### `swarm pm`
+
+```bash
+swarm pm webhook list --project <id>
+swarm pm webhook create --project <id>
+swarm pm webhook delete --project <id> --id <webhook-id>
+```
+
+- **`webhook create`** — register the **Trello board webhook** for a project: the
+  subscription is created against the project's `pm.boardId` with
+  `<WEBHOOK_CALLBACK_BASE_URL>/trello/webhook` as its callback URL and a
+  SWARM-identifying description. **Idempotent** — an existing webhook with the same
+  board and callback URL is reported and left alone rather than duplicated (Trello
+  would happily create a second one, doubling every delivery).
+- **`webhook list`** — the webhooks this project's Trello token owns, one per line
+  (`<id>  board <board-id>  <callback-url>`), marking the project's own and any
+  Trello has deactivated.
+- **`webhook delete`** — delete one webhook by the id `list` prints.
+
+**Trello only** (issue #589). Every other provider's webhook is configured by a
+human in the provider's own UI — a GitHub repo/org hook, Linear's Settings → API
+screen, Jira's WebHooks screen — so there is nothing for SWARM to create; a Trello
+webhook is a REST resource bound to one board and one callback URL, owned by the
+token that created it. A project on another PM provider exits `1` naming its
+provider.
+
+Requires `DATABASE_URL` (the project's config and PM credentials) and
+`WEBHOOK_CALLBACK_BASE_URL`. The second is **not optional here** and every action
+refuses without it: Trello confirms a subscription with a `HEAD` request to the
+callback URL before creating it, and signs every later delivery over that exact
+URL, so one registered against a request-derived URL would `401` on every delivery.
+A creation Trello refuses is reported verbatim together with that reachability hint
+(tunnel up, router running, the URL answering `200`). Changing the base URL later
+means `webhook delete` then `webhook create` — SWARM never rewrites a subscription
+in place.
+
+This is deliberately not folded into [`swarm config apply`](#swarm-config): that
+command is a local-file → Postgres loader with no outbound provider calls, and
+giving every seed run a network dependency and a partial-failure mode is a bigger
+decision than webhook creation needs. See
+[`configuration.md`](./configuration.md) for the Trello board mapping and its
+credential roles.
 
 ---
 

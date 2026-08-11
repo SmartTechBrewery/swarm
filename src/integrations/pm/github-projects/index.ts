@@ -15,7 +15,7 @@
 import { GitHubProjectsRouterAdapter } from '../../../router/adapters/github-projects.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
-import { githubProjectsConfigSchema } from './config-schema.js';
+import { githubProjectsBlankPm, githubProjectsConfigSchema } from './config-schema.js';
 import { GITHUB_PROJECTS_API_TOKEN_ROLE } from './credentials.js';
 import { createGitHubProjectsProvider } from './provider.js';
 import { verifyGitHubProjectsWebhookSignature } from './webhook.js';
@@ -26,6 +26,11 @@ export const githubProjectsManifest: PMProviderManifest = {
 	category: 'pm',
 	createProvider: createGitHubProjectsProvider,
 	configSchema: githubProjectsConfigSchema,
+	// No `blankPmDiscoveryBlocker`: both capabilities read the *credential's* own
+	// account — its boards, then one selected board's Status field — so neither needs
+	// anything out of the `pm` member, and an incoming GitHub Projects board is
+	// discoverable with nothing configured but the token.
+	blankPm: githubProjectsBlankPm,
 	routerAdapter: new GitHubProjectsRouterAdapter(),
 	// Two roles, and they are credentials of two different kinds.
 	//
@@ -37,10 +42,12 @@ export const githubProjectsManifest: PMProviderManifest = {
 	// resolved through `credentials.pm` like any other provider's
 	// (`./credentials.ts`), with no fallback to the operator token.
 	//
-	// `webhookSecret` is the *shared* GitHub webhook secret: the board and the repo
-	// are literally the same webhook, so the role inherits `credentials.webhookSecret`
-	// rather than asking a project to configure the same reference twice. Declaring
-	// that as data keeps the reach out of shared resolution code (ai/RULES.md §2).
+	// `webhookSecret` is the *repo side's* GitHub webhook secret: the board and the repo
+	// are literally the same webhook, so the role inherits it rather than asking a project
+	// to configure the same reference twice. Declaring that as data keeps the reach out of
+	// shared resolution code (ai/RULES.md §2). Since issue #628 it resolves the
+	// per-provider reference for the SCM provider the project runs on, so the conventional
+	// key below is GitHub's own rather than the retired neutral `SCM_WEBHOOK_SECRET`.
 	credentialRoles: [
 		{
 			role: GITHUB_PROJECTS_API_TOKEN_ROLE,
@@ -56,7 +63,7 @@ export const githubProjectsManifest: PMProviderManifest = {
 			label: 'Webhook Secret',
 			description:
 				"HMAC secret GitHub signs board deliveries with. It is the repository's webhook secret — one webhook carries both — so it is configured on the Source Control tab, not here.",
-			envVarKey: 'SCM_WEBHOOK_SECRET',
+			envVarKey: 'GITHUB_WEBHOOK_SECRET',
 			inheritsSharedCredential: 'webhookSecret',
 		},
 	],

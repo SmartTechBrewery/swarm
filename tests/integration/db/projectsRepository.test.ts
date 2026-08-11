@@ -177,7 +177,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
 					webhookSecret: 'SCM_WEBHOOK_SECRET',
-					pm: { webhookSecret: 'PM_WEBHOOK_SECRET' },
+					pm: { 'github-projects': { webhookSecret: 'PM_WEBHOOK_SECRET' } },
 				},
 			});
 			await createProjectInDb(config);

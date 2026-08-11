@@ -106,6 +106,13 @@ function relationsPage(nodes: unknown[], endCursor: string | null = null) {
 	};
 }
 
+/** The mirror of {@link relationsPage}: the relations this issue is the *source* of. */
+function dependentRelationsPage(nodes: unknown[], endCursor: string | null = null) {
+	return {
+		issue: { relations: { nodes, pageInfo: { hasNextPage: Boolean(endCursor), endCursor } } },
+	};
+}
+
 function labelsPage(nodes: unknown[], endCursor: string | null = null) {
 	return { issueLabels: { nodes, pageInfo: { hasNextPage: Boolean(endCursor), endCursor } } };
 }
@@ -885,6 +892,41 @@ describe('LinearPMProvider', () => {
 		});
 	});
 
+	// Issue #639 — the reverse edge the shared cycle backstop reads.
+	describe('listDependents', () => {
+		it('reads the relations this issue is the source of, mapping their target', async () => {
+			mockGraphQL({
+				IssueDependentRelations: dependentRelationsPage([
+					// A `related` relation is not a dependency and must not excuse a blocker.
+					{ type: 'related', relatedIssue: blockerIssue(3) },
+					{ type: 'blocks', issue: blockerIssue(42), relatedIssue: blockerIssue(7) },
+				]),
+			});
+
+			await expect(provider.listDependents(ISSUE_NODE.id)).resolves.toEqual([
+				{
+					id: 'issue-7',
+					reference: 'ENG-7',
+					url: blockerIssue(7).url,
+					title: 'Prerequisite 7',
+					open: true,
+				},
+			]);
+			// The exact mirror of the blocker read: `relations` + `relatedIssue`, where
+			// that one takes `inverseRelations` + `issue`. Reading either the wrong
+			// connection or the wrong side would answer "who blocks me?" again and
+			// suppress a genuine blocker.
+			expect(documentSentTo('IssueDependentRelations')).toMatch(/\brelations\(/);
+			expect(documentSentTo('IssueDependentRelations')).not.toContain('inverseRelations(');
+			expect(documentSentTo('IssueDependentRelations')).toContain('relatedIssue {');
+		});
+
+		it('returns [] for an issue that blocks nothing', async () => {
+			mockGraphQL({ IssueDependentRelations: dependentRelationsPage([]) });
+			await expect(provider.listDependents(ISSUE_NODE.id)).resolves.toEqual([]);
+		});
+	});
+
 	describe('addBlockedBy', () => {
 		it('records the blocker as the relation source', async () => {
 			mockGraphQL({
@@ -952,6 +994,7 @@ describe('LinearPMProvider', () => {
 			'updateWorkItem',
 			'addLabel',
 			'listBlockers',
+			'listDependents',
 			'addBlockedBy',
 		] as const;
 		for (const method of contractMethods) {
