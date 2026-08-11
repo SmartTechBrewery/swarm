@@ -24,7 +24,7 @@
 import { JiraRouterAdapter } from '../../../router/adapters/jira.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
-import { jiraConfigSchema } from './config-schema.js';
+import { jiraBlankPm, jiraConfigSchema } from './config-schema.js';
 import { JIRA_API_TOKEN_ROLE, JIRA_EMAIL_ROLE } from './credentials.js';
 import { createJiraProvider } from './provider.js';
 import { verifyJiraWebhookSignature } from './webhook.js';
@@ -35,6 +35,16 @@ export const jiraManifest: PMProviderManifest = {
 	category: 'pm',
 	createProvider: createJiraProvider,
 	configSchema: jiraConfigSchema,
+	blankPm: jiraBlankPm,
+	// The one provider that declares a blocker (issue #641). Every Jira REST call is
+	// addressed to `baseUrl`, so discovery against the blank member above could only
+	// fail on an unresolvable URL — and the value is board *identity* set in
+	// `swarm.config.json` rather than something this provider could discover
+	// (`./config-schema.ts`). The copy therefore names the file, matching the Save gate
+	// the dashboard's board-mapping panel already shows for the same missing value.
+	// Plain prose, not markdown: it is returned verbatim as an error message.
+	blankPmDiscoveryBlocker:
+		'Jira discovery needs the site its projects live on, and that site URL is board identity SWARM cannot discover. Set pm.baseUrl in swarm.config.json for this project (then run swarm config apply) before mapping a Jira board.',
 	routerAdapter: new JiraRouterAdapter(),
 	// Three roles — Jira Cloud authenticates with basic auth, so the email and the
 	// API token are two halves of one credential — and **none** inherits a shared

@@ -24,7 +24,7 @@
 import { LinearRouterAdapter } from '../../../router/adapters/linear.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
-import { linearConfigSchema } from './config-schema.js';
+import { linearBlankPm, linearConfigSchema } from './config-schema.js';
 import { LINEAR_API_KEY_ROLE } from './credentials.js';
 import { createLinearProvider } from './provider.js';
 import { verifyLinearWebhookSignature } from './webhook.js';
@@ -35,6 +35,11 @@ export const linearManifest: PMProviderManifest = {
 	category: 'pm',
 	createProvider: createLinearProvider,
 	configSchema: linearConfigSchema,
+	// No `blankPmDiscoveryBlocker`: both capabilities read the API key's own workspace
+	// — its teams, then one selected team's workflow states — so neither needs anything
+	// out of the `pm` member, and an incoming Linear board is discoverable with nothing
+	// configured but the key.
+	blankPm: linearBlankPm,
 	routerAdapter: new LinearRouterAdapter(),
 	// Two roles, and **neither** inherits a shared SCM credential — the rule
 	// `PmCredentialRoleSpec.inheritsSharedCredential` states for exactly this

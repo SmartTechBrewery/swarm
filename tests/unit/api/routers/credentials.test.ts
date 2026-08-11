@@ -535,6 +535,54 @@ describe('credentialsRouter', () => {
 				expect.objectContaining({ code: 'NOT_FOUND' }),
 			);
 		});
+
+		// Issue #641: the switch flow shows the *incoming* provider's roles, and shows them
+		// as unconfigured, which is what tells an operator what still has to be entered.
+		it('answers for a provider the project is not persisted on', async () => {
+			const project = createMockProjectConfig({ id: 'p1' });
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
+				PM_GITHUB_PROJECTS_TOKEN: 'ghp_board_token',
+			});
+
+			const result = await caller.listPm({ projectId: 'p1', providerId: 'jira' });
+
+			expect(result.providerId).toBe('jira');
+			expect(result.providerLabel).toBe('Jira');
+			expect(result.providerRegistered).toBe(true);
+			expect(result.roles.map((role) => role.role)).toEqual(['email', 'apiToken', 'webhookSecret']);
+			// Jira's `apiToken` and GitHub Projects' collide by name; reading Jira's must not
+			// report the GitHub Projects secret as its own.
+			expect(result.roles.find((role) => role.role === 'apiToken')).toMatchObject({
+				referenceKey: 'JIRA_API_TOKEN',
+				isConfigured: false,
+				maskedValue: 'not set',
+			});
+		});
+
+		it("reads the named provider's own retained references", async () => {
+			const twoBoards = createMockProjectConfig({
+				id: 'p1',
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: {
+						'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						jira: { apiToken: 'CUSTOM_JIRA_TOKEN' },
+					},
+				},
+			});
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({ CUSTOM_JIRA_TOKEN: 'jira_pat' });
+
+			const result = await caller.listPm({ projectId: 'p1', providerId: 'jira' });
+
+			expect(result.roles.find((role) => role.role === 'apiToken')).toMatchObject({
+				referenceKey: 'CUSTOM_JIRA_TOKEN',
+				isConfigured: true,
+			});
+			expect(JSON.stringify(result)).not.toContain('jira_pat');
+		});
 	});
 
 	describe('setPm', () => {
@@ -683,6 +731,80 @@ describe('credentialsRouter', () => {
 			).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
 			expect(writeProjectCredential).not.toHaveBeenCalled();
 		});
+
+		// Issue #641: entering the incoming provider's credentials is the *first* step of a
+		// provider switch, so it happens while the project still runs on the outgoing one.
+		describe('for a provider the project is not persisted on', () => {
+			it("writes into the named provider's block and leaves the persisted one's intact", async () => {
+				const project = createMockProjectConfig({ id: 'p1' });
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+
+				await caller.setPm({
+					projectId: 'p1',
+					providerId: 'jira',
+					role: 'apiToken',
+					value: 'jira_pat',
+				});
+
+				// Jira's own conventional key, not GitHub Projects' — the role names collide,
+				// and writing the persisted provider's reference would destroy its secret.
+				expect(writeProjectCredential).toHaveBeenCalledWith(
+					'p1',
+					'JIRA_API_TOKEN',
+					'jira_pat',
+					'API Token',
+				);
+				expect(writeProjectCredential).toHaveBeenCalledOnce();
+				expect(upsertProjectToDb).toHaveBeenCalledWith(
+					expect.objectContaining({
+						credentials: expect.objectContaining({
+							pm: {
+								'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+								jira: { apiToken: 'JIRA_API_TOKEN' },
+							},
+						}),
+					}),
+				);
+				// The `pm` member itself is untouched: this phase persists no switch.
+				expect(upsertProjectToDb).toHaveBeenCalledWith(expect.objectContaining({ pm: project.pm }));
+			});
+
+			it('refuses a role the named provider does not declare', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+				// `apiKey` is Linear's and Trello's, never Jira's — validating against the
+				// persisted provider instead would have accepted, or rejected, the wrong list.
+				await expect(
+					caller.setPm({ projectId: 'p1', providerId: 'jira', role: 'apiKey', value: 'x' }),
+				).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'BAD_REQUEST',
+						message: expect.stringContaining("'jira' declares no credential role 'apiKey'"),
+					}),
+				);
+				expect(writeProjectCredential).not.toHaveBeenCalled();
+			});
+
+			// Only GitHub Projects declares an inherited role, so the refusal is a property of
+			// the provider being configured rather than of the one the project runs on.
+			it("accepts the named provider's own webhook secret, which inherits nothing", async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+				await caller.setPm({
+					projectId: 'p1',
+					providerId: 'jira',
+					role: 'webhookSecret',
+					value: 'whsec_jira',
+				});
+
+				expect(writeProjectCredential).toHaveBeenCalledWith(
+					'p1',
+					'JIRA_WEBHOOK_SECRET',
+					'whsec_jira',
+					'Webhook Secret',
+				);
+			});
+		});
 	});
 
 	describe('deletePm', () => {
@@ -732,6 +854,35 @@ describe('credentialsRouter', () => {
 				caller.deletePm({ projectId: 'p1', role: 'webhookSecret' }),
 			).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
 			expect(deleteProjectCredential).not.toHaveBeenCalled();
+		});
+
+		// Issue #641: abandoning a switch has to be able to clear what was entered for the
+		// incoming provider without touching what the project is actually running on.
+		it('prunes only the named provider’s block when it is not the persisted one', async () => {
+			const twoBoards = createMockProjectConfig({
+				id: 'p1',
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: {
+						'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						jira: { apiToken: 'JIRA_API_TOKEN' },
+					},
+				},
+			});
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+
+			await caller.deletePm({ projectId: 'p1', providerId: 'jira', role: 'apiToken' });
+
+			expect(deleteProjectCredential).toHaveBeenCalledWith('p1', 'JIRA_API_TOKEN');
+			expect(deleteProjectCredential).toHaveBeenCalledOnce();
+			expect(upsertProjectToDb).toHaveBeenCalledWith(
+				expect.objectContaining({
+					credentials: expect.objectContaining({
+						pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+					}),
+				}),
+			);
 		});
 	});
 
