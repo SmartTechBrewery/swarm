@@ -48,6 +48,7 @@ import type {
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
+	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { collectLinearConnection, type LinearConnection, linearGraphQL } from './client.js';
@@ -203,6 +204,28 @@ const ISSUE_BLOCKING_RELATIONS_QUERY = /* GraphQL */ `
 			inverseRelations(first: 100, after: $cursor) {
 				pageInfo { hasNextPage endCursor }
 				nodes { type issue { ${BLOCKER_ISSUE_FIELDS} } }
+			}
+		}
+	}
+`;
+
+/**
+ * One page of the relations this issue *is the source of* — the exact mirror of
+ * {@link ISSUE_BLOCKING_RELATIONS_QUERY}, selecting `relations` where that selects
+ * `inverseRelations`, and reading the relation's `relatedIssue` target where that
+ * reads its `issue` source. See {@link LinearPMProvider.listDependents}.
+ *
+ * Both names were verified against the live schema, per this file's header rule:
+ * `Issue.relations` is an `IssueRelationConnection!` alongside `inverseRelations`,
+ * and `IssueRelation` carries `issue: Issue!` and `relatedIssue: Issue!`.
+ */
+const ISSUE_DEPENDENT_RELATIONS_QUERY = /* GraphQL */ `
+	query IssueDependentRelations($id: String!, $cursor: String) {
+		issue(id: $id) {
+			id
+			relations(first: 100, after: $cursor) {
+				pageInfo { hasNextPage endCursor }
+				nodes { type relatedIssue { ${BLOCKER_ISSUE_FIELDS} } }
 			}
 		}
 	}
@@ -367,10 +390,15 @@ interface IssueDependencyProseResponse {
 interface RelationNode {
 	type?: string;
 	issue?: BlockerIssueNode | null;
+	relatedIssue?: BlockerIssueNode | null;
 }
 
 interface IssueBlockingRelationsResponse {
 	issue?: { inverseRelations?: LinearConnection<RelationNode> | null } | null;
+}
+
+interface IssueDependentRelationsResponse {
+	issue?: { relations?: LinearConnection<RelationNode> | null } | null;
 }
 
 interface BlockerIssuesResponse {
@@ -449,6 +477,22 @@ function toBlocker(issue: BlockerIssueNode, source: WorkItemBlocker['source']): 
 		title: issue.title ?? '',
 		open: !CLOSED_STATE_TYPES.has(issue.state?.type ?? ''),
 		source,
+	};
+}
+
+/**
+ * Map a Linear issue this one blocks onto a dependent — the same fields
+ * {@link toBlocker} builds minus `source`, since the reverse read has only one
+ * (`src/pm/types.ts`). `reference`/`url` are derived identically on purpose: they
+ * are the identity the shared cycle check matches a blocker against.
+ */
+function toDependent(issue: BlockerIssueNode): WorkItemDependent {
+	return {
+		id: issue.id,
+		reference: issue.identifier || (issue.number == null ? (issue.url ?? '?') : `#${issue.number}`),
+		url: issue.url ?? '',
+		title: issue.title ?? '',
+		open: !CLOSED_STATE_TYPES.has(issue.state?.type ?? ''),
 	};
 }
 
@@ -871,6 +915,37 @@ export class LinearPMProvider implements PMProvider {
 				this.fetchMentionedBlockers(id),
 			]);
 			return dedupeBlockers([...native, ...mentioned]);
+		});
+	}
+
+	/**
+	 * The issues Linear itself records this one as blocking — the mirror of
+	 * {@link fetchNativeBlockers}, and the direction that method deliberately does
+	 * *not* read. A `blocks` relation runs from the blocker to the blocked issue, so
+	 * "what do I block?" is this issue's own `relations`, each dependent being the
+	 * relation's `relatedIssue` target — the same pairing
+	 * {@link LinearPMProvider.addBlockedBy} writes (`issueId` the blocker,
+	 * `relatedIssueId` the blocked issue).
+	 *
+	 * Native only, never prose (`src/pm/types.ts`), and the non-dependency relation
+	 * types (`related`/`duplicate`/`similar`) are filtered out here exactly as they
+	 * are on the blocker side, since `IssueRelation.type` reads as a plain `String`.
+	 */
+	async listDependents(id: string): Promise<WorkItemDependent[]> {
+		return this.run(async () => {
+			const relations = await collectLinearConnection<RelationNode>(async (cursor) => {
+				const data = await linearGraphQL<IssueDependentRelationsResponse>(
+					ISSUE_DEPENDENT_RELATIONS_QUERY,
+					{ id, cursor },
+				);
+				return data.issue?.relations ?? null;
+			});
+			return relations
+				.filter(
+					(relation): relation is RelationNode & { relatedIssue: BlockerIssueNode } =>
+						relation.type === BLOCKS_RELATION_TYPE && Boolean(relation.relatedIssue?.id),
+				)
+				.map((relation) => toDependent(relation.relatedIssue));
 		});
 	}
 

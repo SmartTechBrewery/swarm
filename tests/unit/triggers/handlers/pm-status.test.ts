@@ -50,6 +50,7 @@ function providerReturning(workItem: WorkItem, seen: string[] = []): PMProvider 
 		supportsDependencies: false,
 		supportsAssignees: false,
 		listBlockers: async () => [],
+		listDependents: async () => [],
 		addBlockedBy: async () => undefined,
 	};
 }

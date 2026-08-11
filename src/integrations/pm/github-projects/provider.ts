@@ -46,6 +46,7 @@ import type {
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
+	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { getScopedClient } from '../../scm/github/client.js';
@@ -720,6 +721,14 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		});
 	}
 
+	async listDependents(id: string): Promise<WorkItemDependent[]> {
+		const { owner, repo, contentNumber } = await this.resolveItem(id);
+		// A draft item (no backing Issue) can block nothing — the same reason
+		// `listBlockers` returns early for one.
+		if (!owner || !repo || contentNumber == null) return [];
+		return this.run(() => this.fetchNativeDependents(owner, repo, contentNumber));
+	}
+
 	async addBlockedBy(id: string, blockerId: string): Promise<void> {
 		const [target, blocker] = await Promise.all([
 			this.resolveItem(id),
@@ -936,6 +945,45 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	/**
+	 * The issues this one natively blocks — the reverse edge of
+	 * {@link fetchNativeBlockers}, from the sibling `dependencies/blocking`
+	 * endpoint (docs/github-projects-v2-api.md §5b). Native only: prose is never
+	 * consulted here, because this answer is what excuses a blocker (issue #639).
+	 *
+	 * Answers *issues*, not board items, so the mapped dependents carry no `id` —
+	 * which is exactly why the gate matches on `url`/`reference` and checks only the
+	 * direct edge. A repo/plan without the feature answers 404/410, treated as "no
+	 * dependents" like its blocked-by twin: a missing reverse read leaves the
+	 * blockers gating, it does not ungate them.
+	 */
+	private async fetchNativeDependents(
+		owner: string,
+		repo: string,
+		issueNumber: number,
+	): Promise<WorkItemDependent[]> {
+		try {
+			const { data } = await getScopedClient().request(
+				'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking',
+				{ owner, repo, issue_number: issueNumber, per_page: 100 },
+			);
+			const issues = (data ?? []) as DependencyIssue[];
+			return issues
+				.filter((i): i is DependencyIssue & { number: number } => typeof i.number === 'number')
+				.map(toDependent);
+		} catch (err) {
+			if (isHttpStatus(err, 404) || isHttpStatus(err, 410)) {
+				logger.debug('pm: issue-dependencies API unavailable; treating as no dependents', {
+					owner,
+					repo,
+					issueNumber,
+				});
+				return [];
+			}
+			throw err;
+		}
+	}
+
+	/**
 	 * Prerequisites the item *names in prose* — its own description and its
 	 * **human** comments — that aren't native relationships. Provider-neutral
 	 * reference extraction (`findDependencyReferences`); this adapter resolves each
@@ -1016,6 +1064,21 @@ function toBlocker(issue: DependencyIssue, source: WorkItemBlocker['source']): W
 		title: issue.title ?? '',
 		open: issue.state !== 'closed',
 		source,
+	};
+}
+
+/**
+ * Map a natively blocked issue onto a dependent — the same fields as
+ * {@link toBlocker} minus `source`, since the reverse read has only one
+ * (`src/pm/types.ts`). `reference`/`url` are built identically on purpose: they are
+ * the identity the shared cycle check matches a blocker against.
+ */
+function toDependent(issue: DependencyIssue): WorkItemDependent {
+	return {
+		reference: issue.number != null ? `#${issue.number}` : (issue.html_url ?? '?'),
+		url: issue.html_url ?? '',
+		title: issue.title ?? '',
+		open: issue.state !== 'closed',
 	};
 }
 

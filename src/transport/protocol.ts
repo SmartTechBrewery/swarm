@@ -663,6 +663,53 @@ export const ListBlockersDeliveryResponseSchema = z.object({
 export type ListBlockersDeliveryResponse = z.infer<typeof ListBlockersDeliveryResponseSchema>;
 
 /**
+ * An item the gated work item blocks, as it crosses the transport — the
+ * provider-neutral `WorkItemDependent` shape (`../pm/types.ts`). No `source`,
+ * because the reverse read is native by definition. Same permissive `url` as
+ * {@link WorkItemBlockerFrameSchema}, and for a sharper version of the same reason:
+ * a rejected frame makes the gate's cycle check fail, which keeps the blockers
+ * gating rather than ungating them.
+ */
+export const WorkItemDependentFrameSchema = z.object({
+	id: z.string().min(1).optional(),
+	reference: z.string().min(1),
+	url: z.string(),
+	title: z.string(),
+	open: z.boolean(),
+});
+export type WorkItemDependentFrame = z.infer<typeof WorkItemDependentFrameSchema>;
+
+/**
+ * `POST /worker/delivery/pm/dependents` request body — the items this work item
+ * blocks. The transported half of the cycle backstop (issue #639): a federated
+ * worker runs Implementation's dependency gate but holds no PM credential, so
+ * without this route the backstop would be inert exactly where the deadlock it
+ * prevents was observed. Read server-side under the per-project PM credential,
+ * like the blockers read above.
+ *
+ * Additive — no existing frame changes shape — so `TRANSPORT_PROTOCOL_VERSION`
+ * stays put: a newer worker talking to an older control plane gets a 404 here,
+ * which the gate treats as "the cycle check could not run" and keeps gating.
+ */
+export const ListDependentsDeliveryRequestSchema = z.object({
+	projectId: z.string().min(1),
+	itemId: z.string().min(1),
+	protocolVersion: z.number().int(),
+});
+export type ListDependentsDeliveryRequest = z.infer<typeof ListDependentsDeliveryRequestSchema>;
+
+/**
+ * `POST /worker/delivery/pm/dependents` success body — the items in the
+ * provider-neutral shape `PMProvider.listDependents` returns (`../pm/types.ts`);
+ * `[]` both when the item blocks nothing and when the provider models no
+ * dependencies. No provider-specific fields cross the wire (ai/RULES.md §2).
+ */
+export const ListDependentsDeliveryResponseSchema = z.object({
+	dependents: z.array(WorkItemDependentFrameSchema),
+});
+export type ListDependentsDeliveryResponse = z.infer<typeof ListDependentsDeliveryResponseSchema>;
+
+/**
  * `POST /worker/delivery/pm/find-item` request body — resolve the single board
  * card whose backing Issue/PR URL ends with `urlSuffix`. The second PM **read**
  * the split serves (ADR-003 §2): Respond-to-review resolves the card for the
