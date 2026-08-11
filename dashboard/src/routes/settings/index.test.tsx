@@ -9,7 +9,53 @@ vi.mock('@/components/theme/theme-provider.js', () => ({
 	useTheme: mockUseTheme,
 }));
 
-import { AppearancePanel } from './index.js';
+import { SETTINGS_TABS, visibleSettingsTabs } from '@/lib/settings-nav.js';
+import { AppearancePanel, SettingsTabBar } from './index.js';
+
+describe('SettingsTabBar', () => {
+	it('renders the tabs in SETTINGS_TABS order for an instance administrator', () => {
+		render(
+			<SettingsTabBar
+				tabs={visibleSettingsTabs({ instanceAdmin: true })}
+				activeTab="agents"
+				onSelect={() => {}}
+			/>,
+		);
+
+		const labels = screen.getAllByRole('button').map((button) => button.textContent);
+		expect(labels).toEqual(['Agent Defaults', 'Appearance']);
+		// The rendered order and the `?tab=` vocabulary must not drift apart.
+		expect(labels).toHaveLength(SETTINGS_TABS.length);
+	});
+
+	it('does not offer Agent Defaults to a non-administrator (issue #666)', () => {
+		render(
+			<SettingsTabBar
+				tabs={visibleSettingsTabs({ instanceAdmin: false })}
+				activeTab="appearance"
+				onSelect={() => {}}
+			/>,
+		);
+
+		const labels = screen.getAllByRole('button').map((button) => button.textContent);
+		expect(labels).toEqual(['Appearance']);
+	});
+
+	it('selects the tab that was clicked', () => {
+		const onSelect = vi.fn();
+		render(
+			<SettingsTabBar
+				tabs={visibleSettingsTabs({ instanceAdmin: true })}
+				activeTab="agents"
+				onSelect={onSelect}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+
+		expect(onSelect).toHaveBeenCalledWith('appearance');
+	});
+});
 
 describe('AppearancePanel', () => {
 	it('renders all three theme options as accessible radios', () => {
