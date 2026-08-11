@@ -9,7 +9,6 @@ import {
 	isBoardMappingDirty,
 	toBoardMappingForm,
 	withSelectedContainer,
-	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import type { ProjectPm } from '../../../../src/config/schema.js';
 import { BoardMappingPanel } from './board-mapping-panel.js';
@@ -58,7 +57,6 @@ function Harness({
 		<BoardMappingPanel
 			projectId="p1"
 			form={form}
-			onProviderChange={(providerId) => setForm((f) => withSelectedProvider(f, providerId))}
 			onSelectContainer={(containerId) => setForm((f) => withSelectedContainer(f, containerId))}
 			onStatusOptionChange={(key, value) =>
 				setForm((f) => ({ ...f, statusOptions: { ...f.statusOptions, [key]: value } }))
@@ -116,8 +114,10 @@ describe('BoardMappingPanel (issue #201)', () => {
 		renderHarness();
 
 		await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
-		expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('github-projects');
 		await screen.findByRole('option', { name: 'My Board' });
+		// The provider selector moved to the tab's own Provider card (issue #630); this
+		// panel keeps only the settings that provider scopes.
+		expect(screen.queryByLabelText('Provider')).toBeNull();
 		// The whole point of #201: opaque IDs are never typed.
 		expect(screen.queryByRole('textbox')).toBeNull();
 	});
@@ -230,7 +230,6 @@ describe('BoardMappingPanel (issue #201)', () => {
 			renderHarness({ initial: LINEAR_CONFIG });
 
 			await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
-			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('linear');
 			await screen.findByLabelText(/Linear team/i);
 			await screen.findByRole('option', { name: 'Core' });
 			expect(
@@ -274,10 +273,9 @@ describe('BoardMappingPanel (issue #201)', () => {
 
 			const teamSelect = (await screen.findByLabelText(/Linear team/i)) as HTMLSelectElement;
 			expect(teamSelect.value).toBe('team-uuid');
-			expect(
-				within(screen.getByLabelText('Provider')).getByRole('option', { name: 'GitHub Projects' }),
-			).toHaveProperty('disabled', true);
-			expect(screen.getByText(/Change the PM provider in/)).not.toBeNull();
+			// The provider's own copy — the selector and its "change it in
+			// swarm.config.json" note — belongs to the Provider card above this one.
+			expect(screen.queryByText(/swarm\.config\.json/)).toBeNull();
 		});
 	});
 
@@ -313,7 +311,6 @@ describe('BoardMappingPanel (issue #201)', () => {
 			renderHarness({ initial: JIRA_CONFIG });
 
 			await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
-			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('jira');
 			const projectSelect = (await screen.findByLabelText(/Jira project/i)) as HTMLSelectElement;
 			// jsdom ignores a value with no matching option, so wait for the discovered one.
 			await screen.findByRole('option', { name: 'Swarm' });
@@ -419,7 +416,6 @@ describe('BoardMappingPanel (issue #201)', () => {
 			renderHarness({ initial: TRELLO_CONFIG });
 
 			await waitFor(() => expect(listProvidersFn).toHaveBeenCalledWith({ projectId: 'p1' }));
-			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('trello');
 			const boardSelect = (await screen.findByLabelText(/Trello board/i)) as HTMLSelectElement;
 			// jsdom ignores a value with no matching option, so wait for the discovered one.
 			await screen.findByRole('option', { name: 'SWARM Board' });

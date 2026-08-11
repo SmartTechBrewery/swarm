@@ -22,6 +22,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { BoardMappingPanel } from '@/components/projects/board-mapping-panel.js';
 import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
 import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.js';
+import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
@@ -2314,18 +2315,24 @@ function ProjectDetailRouteComponent() {
 			)}
 
 			{/*
-			 * Project Management (issue #537): one tab, three coherent sections — the
-			 * provider and its declared credentials, then the board picker, then the
-			 * status mapping. The credential panel owns its own queries, so it renders
-			 * above the mapping form rather than inside it.
+			 * Project Management (issue #537): one tab, four coherent cards in the order
+			 * the settings depend on each other — the provider (issue #630), then its
+			 * declared credentials, then the board picker, then the status mapping. The
+			 * provider and credential panels own their own queries, so they render above
+			 * the mapping form rather than inside it.
 			 */}
 			{activeTab === 'projectManagement' && (
 				<div className="space-y-6">
+					<PmProviderPanel
+						projectId={projectId}
+						providerId={boardMapping.providerId}
+						onProviderChange={handleBoardMappingProvider}
+						isPending={configWriteInFlight}
+					/>
 					<PmCredentialsPanel projectId={projectId} />
 					<BoardMappingPanel
 						projectId={projectId}
 						form={boardMapping}
-						onProviderChange={handleBoardMappingProvider}
 						onSelectContainer={handleBoardMappingSelectContainer}
 						onStatusOptionChange={handleBoardMappingStatusOption}
 						onStatesContext={handleBoardMappingStatesContext}
