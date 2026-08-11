@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import { getDb } from '../db/client.js';
 import { RETRY_PENDING_RUN_STATUSES } from '../db/repositories/runsRepository.js';
@@ -6,7 +7,11 @@ import { runs } from '../db/schema/runs.js';
 import { logger } from '../lib/logger.js';
 import type { AgentCli } from './agent-cli.js';
 import { probeBinary } from './binary-probe.js';
+import { findClaudeResultEvent, isClaudeErrorResult } from './claude-stream.js';
+import { bindingUsageWindow, parseClaudeUsageReport } from './claude-usage.js';
 import type { CliQuotaSnapshot } from './quota.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Cheap availability check to verify if the binary exists and runs.
@@ -230,6 +235,140 @@ export function queryCodexQuota(command = 'codex'): Promise<Partial<CliQuotaSnap
 }
 
 /**
+ * How the probe asks Claude Code for its own usage summary (issue #671).
+ *
+ * `/usage` is answered by the CLI itself: the envelope of a live run reports
+ * `num_turns: 0` and `total_cost_usd: 0`, so the probe starts no agent turn and
+ * consumes no allowance. The two flags around it are what keep it side-effect
+ * free and cheap:
+ *
+ * - `--no-session-persistence` writes no transcript, so a probe leaves no
+ *   conversation behind for the operator to find in `/resume` (verified: no
+ *   `~/.claude/projects/**` entry is created).
+ * - `--safe-mode` runs without hooks, MCP servers, plugins, or CLAUDE.md
+ *   discovery — the host worker's own cwd is a real project, and a quota read
+ *   must not fire its hooks or spawn its MCP servers. It also cuts the probe
+ *   from ~3.6 s to ~1.5 s, while leaving auth alone. `--bare` would be cheaper
+ *   still and is deliberately **not** used: it restricts Anthropic auth to
+ *   `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads OAuth or the keychain, so
+ *   it cannot answer for the subscription user this probe exists to serve.
+ *
+ * `-p` stays last, immediately before the prompt — safe for claude, whose `-p`
+ * is a bare boolean, and the house convention the harness follows for every CLI
+ * (see `./agent-cli.ts`).
+ */
+const CLAUDE_USAGE_ARGS = [
+	'--safe-mode',
+	'--no-session-persistence',
+	'--output-format',
+	'json',
+	'-p',
+	'/usage',
+];
+
+/**
+ * Budget for one `/usage` probe. Observed 1.5 s steady-state and 8.3 s on a cold
+ * start (plugin sync, first-run caches), so this is roughly double the worst
+ * measurement — missing it costs one run-derived fallback, which is the same
+ * outcome as an older build that cannot answer at all.
+ */
+const CLAUDE_USAGE_TIMEOUT_MS = 15_000;
+
+/** Cap on the probe's captured output; the real envelope is ~1.5 KB. */
+const CLAUDE_USAGE_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/** Why a probe didn't answer, in one line — a timeout named as such. */
+function describeProbeFailure(err: unknown): string {
+	const error = err as (NodeJS.ErrnoException & { killed?: boolean }) | undefined;
+	if (error?.killed === true || error?.code === 'ETIMEDOUT') {
+		return `timed out after ${CLAUDE_USAGE_TIMEOUT_MS}ms`;
+	}
+	return error?.message ?? String(err);
+}
+
+/**
+ * Read Claude Code's live usage windows from its own print-mode `/usage` answer.
+ *
+ * Mirrors {@link queryCodexQuota}'s contract — resolves, never rejects, and
+ * reports `status: 'available'` only with real data — but the failure states are
+ * deliberately split in two, because for Claude they mean different things.
+ * A probe that couldn't run (`'error'`) is a broken or absent capability, while
+ * a probe that ran and returned prose this build doesn't recognize
+ * (`'unavailable'`) is simply "no live data": the answer is unstructured, so a
+ * reworded release must degrade the card rather than fail it (issue #671).
+ */
+export async function queryClaudeQuota(command = 'claude'): Promise<Partial<CliQuotaSnapshot>> {
+	let stdout: string;
+	try {
+		const probe = await execFileAsync(command, CLAUDE_USAGE_ARGS, {
+			timeout: CLAUDE_USAGE_TIMEOUT_MS,
+			maxBuffer: CLAUDE_USAGE_MAX_OUTPUT_BYTES,
+		});
+		stdout = probe.stdout;
+	} catch (err) {
+		return { status: 'error', error: `claude /usage probe failed: ${describeProbeFailure(err)}` };
+	}
+
+	// `--output-format json` prints exactly the terminal `result` record a stream
+	// ends with, so the stream decoder already models this envelope.
+	const event = findClaudeResultEvent(stdout);
+	if (!event || isClaudeErrorResult(event) || !event.result) {
+		return { status: 'unavailable', error: 'claude /usage returned no usage report' };
+	}
+
+	const windows = parseClaudeUsageReport(event.result, new Date());
+	if (!windows) {
+		return {
+			status: 'unavailable',
+			error: 'claude /usage reported no recognized usage window',
+		};
+	}
+
+	const binding = bindingUsageWindow(windows);
+	return {
+		status: 'available',
+		remainingPercentage: Math.max(0, 100 - (binding?.usedPercent ?? 0)),
+		resetTime: binding?.resetsAt,
+		windows,
+	};
+}
+
+/** What {@link getFallbackRateLimitInfo} recovered for a CLI, if anything. */
+type FallbackRateLimitInfo = Awaited<ReturnType<typeof getFallbackRateLimitInfo>>;
+
+/**
+ * Today's snapshot for an installed CLI with no live quota read: the only signal
+ * is a *past* exhaustion recovered from `runs.next_retry_at`, so it reports no
+ * windows and no remaining allowance.
+ *
+ * `liveReason` records why a live probe didn't answer. It is appended to the
+ * run-derived error rather than replacing it, and the status stays `available`
+ * on purpose — an operator on a build or auth mode that cannot answer must see
+ * today's card, not a red diagnostic row (issue #671).
+ */
+function runDerivedSnapshot(
+	cli: AgentCli,
+	fallbackInfo: FallbackRateLimitInfo,
+	lastUpdated: string,
+	liveReason?: string,
+): CliQuotaSnapshot {
+	const error = [
+		fallbackInfo?.error ? `Last failure: ${fallbackInfo.error}` : undefined,
+		liveReason,
+	]
+		.filter(Boolean)
+		.join(' · ');
+	return {
+		cli,
+		status: 'available',
+		source: 'fallback',
+		resetTime: fallbackInfo?.resetTime,
+		error: error || undefined,
+		lastUpdated,
+	};
+}
+
+/**
  * Discover CLI capabilities and build quota snapshots for all known agent CLIs.
  */
 export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot[]> {
@@ -292,18 +431,37 @@ export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot
 					lastUpdated: now,
 				});
 			}
-		} else {
-			// For claude and antigravity, when configured and runnable, we use run-derived fallback only.
-			// Also for codex when cheap = true is requested.
-			snapshots.push({
-				cli,
-				status: 'available',
-				source: 'fallback',
-				resetTime: fallbackInfo?.resetTime,
-				error: fallbackInfo?.error ? `Last failure: ${fallbackInfo.error}` : undefined,
-				lastUpdated: now,
-			});
+			continue;
 		}
+
+		if (cli === 'claude' && !cheap) {
+			let liveQuota: Partial<CliQuotaSnapshot>;
+			try {
+				liveQuota = await queryClaudeQuota(binaryName);
+			} catch (err: unknown) {
+				liveQuota = { error: err instanceof Error ? err.message : String(err) };
+			}
+			if (liveQuota.status === 'available') {
+				snapshots.push({
+					cli,
+					status: 'available',
+					remainingPercentage: liveQuota.remainingPercentage,
+					resetTime: liveQuota.resetTime,
+					source: 'live',
+					lastUpdated: now,
+					windows: liveQuota.windows,
+				});
+			} else {
+				const reason = liveQuota.error || 'Live quota query failed';
+				logger.debug('claude live quota unavailable, using run-derived fallback', { reason });
+				snapshots.push(runDerivedSnapshot(cli, fallbackInfo, now, reason));
+			}
+			continue;
+		}
+
+		// Antigravity has no live read yet, and codex/claude skip theirs when the
+		// caller asked for a cheap pass.
+		snapshots.push(runDerivedSnapshot(cli, fallbackInfo, now));
 	}
 
 	return snapshots;
