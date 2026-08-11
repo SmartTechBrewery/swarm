@@ -50,6 +50,7 @@ import {
 	selectedPmProviderId,
 	switchedPmProviderId,
 	toBoardMappingForm,
+	withProviderContext,
 	withSelectedContainer,
 	withSelectedProvider,
 } from '@/lib/board-mapping.js';
@@ -2171,6 +2172,11 @@ function ProjectDetailRouteComponent() {
 		updateMutation.reset();
 	};
 
+	const handleBoardMappingProviderContext = (key: string, value: string) => {
+		setBoardMapping((prev) => withProviderContext(prev, key, value));
+		updateMutation.reset();
+	};
+
 	const handleBoardMappingStatesContext = (context: Record<string, string>) => {
 		setBoardMapping((prev) => ({ ...prev, providerContext: context }));
 	};
@@ -2407,6 +2413,7 @@ function ProjectDetailRouteComponent() {
 						form={boardMapping}
 						onSelectContainer={handleBoardMappingSelectContainer}
 						onStatusOptionChange={handleBoardMappingStatusOption}
+						onProviderContextChange={handleBoardMappingProviderContext}
 						onStatesContext={handleBoardMappingStatesContext}
 						handleSubmit={handleBoardMappingSubmit}
 						handleReset={handleBoardMappingReset}

@@ -24,7 +24,7 @@
 import { JiraRouterAdapter } from '../../../router/adapters/jira.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
-import { jiraBlankPm, jiraConfigSchema } from './config-schema.js';
+import { jiraBlankPm, jiraConfigSchema, jiraDiscoveryDraftSchema } from './config-schema.js';
 import { JIRA_API_TOKEN_ROLE, JIRA_EMAIL_ROLE } from './credentials.js';
 import { createJiraProvider } from './provider.js';
 import { verifyJiraWebhookSignature } from './webhook.js';
@@ -40,11 +40,22 @@ export const jiraManifest: PMProviderManifest = {
 	// addressed to `baseUrl`, so discovery against the blank member above could only
 	// fail on an unresolvable URL — and the value is board *identity* set in
 	// `swarm.config.json` rather than something this provider could discover
-	// (`./config-schema.ts`). The copy therefore names the file, matching the Save gate
-	// the dashboard's board-mapping panel already shows for the same missing value.
-	// Plain prose, not markdown: it is returned verbatim as an error message.
-	blankPmDiscoveryBlocker:
-		'Jira discovery needs the site its projects live on, and that site URL is board identity SWARM cannot discover. Set pm.baseUrl in swarm.config.json for this project (then run swarm config apply) before mapping a Jira board.',
+	// (`./config-schema.ts`). The provider-owned draft below supplies it before discovery;
+	// plain prose remains the API error when that draft is absent or invalid.
+	blankPmDiscoveryBlocker: 'Jira discovery needs a valid site URL before it can list projects.',
+	discoveryDraft: {
+		fields: [
+			{
+				key: 'baseUrl',
+				label: 'Jira site URL',
+				inputType: 'url',
+				description:
+					'The Jira Cloud site URL, for example https://acme.atlassian.net. It is saved only when this provider switch is confirmed.',
+			},
+		],
+		schema: jiraDiscoveryDraftSchema,
+		buildPm: (draft) => ({ ...jiraBlankPm, ...(draft as { baseUrl: string }) }),
+	},
 	routerAdapter: new JiraRouterAdapter(),
 	// Three roles — Jira Cloud authenticates with basic auth, so the email and the
 	// API token are two halves of one credential — and **none** inherits a shared

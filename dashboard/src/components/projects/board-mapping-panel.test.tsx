@@ -81,6 +81,9 @@ function Harness({
 			onStatusOptionChange={(key, value) =>
 				setForm((f) => ({ ...f, statusOptions: { ...f.statusOptions, [key]: value } }))
 			}
+			onProviderContextChange={(key, value) =>
+				setForm((f) => ({ ...f, providerContext: { ...f.providerContext, [key]: value } }))
+			}
 			onStatesContext={(context) => setForm((f) => ({ ...f, providerContext: context }))}
 			handleSubmit={(e) => {
 				e.preventDefault();
@@ -107,7 +110,19 @@ function renderHarness(props: Parameters<typeof Harness>[0] = {}) {
 const PROVIDERS = [
 	{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
 	{ id: 'linear', label: 'Linear', discovery: ['containers', 'states'] },
-	{ id: 'jira', label: 'Jira', discovery: ['containers', 'states'] },
+	{
+		id: 'jira',
+		label: 'Jira',
+		discovery: ['containers', 'states'],
+		discoveryDraft: [
+			{
+				key: 'baseUrl',
+				label: 'Jira site URL',
+				inputType: 'url',
+				description: 'The Jira Cloud site URL.',
+			},
+		],
+	},
 	{ id: 'trello', label: 'Trello', discovery: ['containers', 'states'] },
 ];
 
@@ -434,6 +449,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 					projectId: 'p1',
 					providerId: 'jira',
 					containerId: 'SWARM',
+					discoveryDraft: { baseUrl: 'https://acme.atlassian.net' },
 				}),
 			);
 			const readySelect = (await screen.findByLabelText('Ready status')) as HTMLSelectElement;
@@ -486,26 +502,22 @@ describe('BoardMappingPanel (issue #201)', () => {
 			});
 		});
 
-		// A member `jiraConfigSchema` would reject, cast on purpose: Save must refuse it
-		// and say where the URL is set, rather than writing it and failing validation.
-		it('blocks Save and says where to set a missing base URL', async () => {
+		it('waits for a missing Jira site URL before discovery or Save', async () => {
 			renderHarness({
 				initial: { ...JIRA_CONFIG, baseUrl: '' } as ProjectPm,
 			});
 
-			const doneSelect = (await screen.findByLabelText('Done status')) as HTMLSelectElement;
-			await waitFor(() => expect(doneSelect.disabled).toBe(false));
-			fireEvent.change(doneSelect, { target: { value: '10002' } });
-
 			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
-			await waitFor(() => expect(screen.getByText(/pm\.baseUrl/)).not.toBeNull());
+			await screen.findByLabelText('Jira site URL');
+			expect(discoverContainersFn).not.toHaveBeenCalledWith(
+				expect.objectContaining({ providerId: 'jira' }),
+			);
+			expect(screen.getByText(/site URL before discovery/)).not.toBeNull();
 			expect(save.disabled).toBe(true);
 		});
 
-		// Issue #642: a switch *to* Jira hits the same gate with the same copy — the draft
-		// form carries no base URL at all, since `withSelectedProvider` clears the outgoing
-		// provider's context. That is the stated criterion, not a gap to close here.
-		it('blocks a switch to this provider on the same missing base URL', async () => {
+		it('switches to Jira with a draft site URL, discovers its mapping, and saves one member', async () => {
+			const onSubmit = vi.fn();
 			renderHarness({
 				initial: {
 					type: 'linear',
@@ -513,19 +525,38 @@ describe('BoardMappingPanel (issue #201)', () => {
 					statusOptions: { todo: 'state-todo' },
 				} as ProjectPm,
 				draftProviderId: 'jira',
+				onSubmit,
 			});
 
+			expect(discoverContainersFn).not.toHaveBeenCalledWith(
+				expect.objectContaining({ providerId: 'jira' }),
+			);
+			fireEvent.change(await screen.findByLabelText('Jira site URL'), {
+				target: { value: 'https://acme.atlassian.net' },
+			});
 			await screen.findByRole('option', { name: 'Swarm' });
+			await waitFor(() =>
+				expect(discoverContainersFn).toHaveBeenCalledWith({
+					projectId: 'p1',
+					providerId: 'jira',
+					discoveryDraft: { baseUrl: 'https://acme.atlassian.net' },
+				}),
+			);
 			fireEvent.change(screen.getByLabelText(/Jira project/i), { target: { value: 'SWARM' } });
 
 			const doneSelect = (await screen.findByLabelText('Done status')) as HTMLSelectElement;
 			await waitFor(() => expect(doneSelect.disabled).toBe(false));
 			fireEvent.change(doneSelect, { target: { value: '10002' } });
 
-			await waitFor(() => expect(screen.getByText(/pm\.baseUrl/)).not.toBeNull());
-			expect(
-				(screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement).disabled,
-			).toBe(true);
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await waitFor(() => expect(save.disabled).toBe(false));
+			fireEvent.click(save);
+			expect(onSubmit).toHaveBeenCalledWith({
+				type: 'jira',
+				baseUrl: 'https://acme.atlassian.net',
+				projectKey: 'SWARM',
+				statusOptions: { done: '10002' },
+			});
 		});
 	});
 

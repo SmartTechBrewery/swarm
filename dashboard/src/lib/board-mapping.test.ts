@@ -11,6 +11,7 @@ import {
 	canSaveBoardMapping,
 	cleanStatusOptions,
 	getPmMappingProvider,
+	isBaseUrlInvalid,
 	isBaseUrlMissing,
 	isBoardMappingDirty,
 	STATUS_KEYS,
@@ -594,6 +595,13 @@ describe('canSaveBoardMapping', () => {
 		const form = toBoardMappingForm(jiraPm);
 		form.providerContext = { baseUrl: '   ' };
 		expect(isBaseUrlMissing(form)).toBe(true);
+		expect(canSaveBoardMapping(form)).toBe(false);
+	});
+
+	it('refuses a Jira mapping with an invalid site URL', () => {
+		const form = toBoardMappingForm(jiraPm);
+		form.providerContext = { baseUrl: 'not a URL' };
+		expect(isBaseUrlInvalid(form)).toBe(true);
 		expect(canSaveBoardMapping(form)).toBe(false);
 	});
 

@@ -5,6 +5,7 @@ import {
 	type BoardMappingForm,
 	canSaveBoardMapping,
 	getPmMappingProvider,
+	isBaseUrlInvalid,
 	isBaseUrlMissing,
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
@@ -47,6 +48,8 @@ interface BoardMappingPanelProps {
 	form: BoardMappingForm;
 	onSelectContainer: (containerId: string) => void;
 	onStatusOptionChange: (key: PmStatusKey, value: string) => void;
+	/** Update one provider-declared incoming-provider setup value. */
+	onProviderContextChange: (key: string, value: string) => void;
 	/** Record the opaque provider context (GitHub's Status field id) from state discovery. */
 	onStatesContext: (context: Record<string, string>) => void;
 	handleSubmit: (e: React.FormEvent) => void;
@@ -95,6 +98,7 @@ export function BoardMappingPanel({
 	form,
 	onSelectContainer,
 	onStatusOptionChange,
+	onProviderContextChange,
 	onStatesContext,
 	handleSubmit,
 	handleReset,
@@ -118,6 +122,18 @@ export function BoardMappingPanel({
 	const providersQuery = useQuery(trpc.pm.listProviders.queryOptions({ projectId }));
 	const registeredIds = new Set<string>((providersQuery.data ?? []).map((p) => p.id));
 	const providerSelectable = registeredIds.has(providerId);
+	const discoveryDraftFields =
+		(providersQuery.data ?? []).find((entry) => entry.id === providerId)?.discoveryDraft ?? [];
+	const discoveryDraftIncomplete = discoveryDraftFields.some(
+		(field) => !(form.providerContext[field.key] ?? '').trim(),
+	);
+	const baseUrlInvalid = isBaseUrlInvalid(form);
+	const discoveryDraftReady = !discoveryDraftIncomplete && !baseUrlInvalid;
+	const discoveryInput = {
+		projectId,
+		providerId,
+		...(discoveryDraftFields.length ? { discoveryDraft: form.providerContext } : {}),
+	};
 
 	// The credential roles this provider declares, so the board picker states the step
 	// that has to come first instead of firing a discovery call that can only fail. Read
@@ -135,18 +151,18 @@ export function BoardMappingPanel({
 	const credentialsIncomplete = missingCredentials.length > 0;
 
 	const containersQuery = useQuery({
-		...trpc.pm.discoverContainers.queryOptions({ projectId, providerId }),
-		enabled: providerSelectable && !credentialsIncomplete,
+		...trpc.pm.discoverContainers.queryOptions(discoveryInput),
+		enabled: providerSelectable && !credentialsIncomplete && discoveryDraftReady,
 		retry: false,
 	});
 
 	const statesQuery = useQuery({
 		...trpc.pm.discoverStates.queryOptions({
-			projectId,
-			providerId,
+			...discoveryInput,
 			containerId: form.containerId,
 		}),
-		enabled: providerSelectable && !credentialsIncomplete && !!form.containerId,
+		enabled:
+			providerSelectable && !credentialsIncomplete && discoveryDraftReady && !!form.containerId,
 		retry: false,
 	});
 
@@ -194,9 +210,6 @@ export function BoardMappingPanel({
 		credentialNotice = containerErr;
 	}
 	const canSave = canSaveBoardMapping(form);
-	// The one Save gate this screen can't clear: the provider's site URL is board
-	// identity kept in `swarm.config.json`, so the disabled button is explained
-	// rather than left inexplicable.
 	const baseUrlMissing = isBaseUrlMissing(form);
 
 	return (
@@ -209,6 +222,26 @@ export function BoardMappingPanel({
 
 					<p className="text-xs text-zinc-400">{provider.intro}</p>
 				</div>
+
+				{discoveryDraftFields.map((field) => (
+					<div key={field.key}>
+						<label htmlFor={`pm-draft-${field.key}`} className={LABEL_CLASS}>
+							{field.label}
+						</label>
+						<input
+							id={`pm-draft-${field.key}`}
+							type={field.inputType}
+							value={form.providerContext[field.key] ?? ''}
+							onChange={(event) => onProviderContextChange(field.key, event.target.value)}
+							disabled={isPending}
+							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500"
+						/>
+						{field.description && <p className="text-xs text-zinc-400 mt-1">{field.description}</p>}
+					</div>
+				))}
+				{baseUrlInvalid && (
+					<p className="text-xs text-red-400">Enter a valid Jira site URL before discovery.</p>
+				)}
 
 				{/* Board / container picker */}
 				<div>
@@ -346,9 +379,7 @@ export function BoardMappingPanel({
 					</button>
 					{baseUrlMissing && (
 						<p className="text-xs text-amber-300/80">
-							Set this {provider.label} {provider.containerNoun}'s{' '}
-							<code className="font-mono">pm.baseUrl</code> in{' '}
-							<code className="font-mono">swarm.config.json</code> before saving a mapping.
+							Enter this {provider.label} {provider.containerNoun}'s site URL before discovery.
 						</p>
 					)}
 				</div>

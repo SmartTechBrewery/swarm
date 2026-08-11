@@ -54,6 +54,7 @@ async function resolveProviderForDiscovery(
 	projectId: string,
 	capability: PMDiscoveryCapability,
 	providerId: PMType | undefined,
+	discoveryDraft: Record<string, string> | undefined,
 ): Promise<DiscoveringProvider> {
 	await assertProjectAccess(user, projectId, 'projectAdmin');
 	const project = await getProjectByIdFromDb(projectId);
@@ -78,7 +79,7 @@ async function resolveProviderForDiscovery(
 	// provider offering no discovery at all answers NOT_IMPLEMENTED whatever else its
 	// blank member is missing.
 	if (!manifest.discovery.includes(capability)) throw unsupportedDiscovery(manifest, capability);
-	const provider = manifest.createProvider(projectForDiscovery(project, manifest));
+	const provider = manifest.createProvider(projectForDiscovery(project, manifest, discoveryDraft));
 	if (!provider.discover) throw unsupportedDiscovery(manifest, capability);
 	return provider as DiscoveringProvider;
 }
@@ -111,7 +112,15 @@ function unsupportedDiscovery(
  * provider's own copy, so an operator reads what to set and where instead of an opaque
  * transport failure (Jira's site URL is the case — `src/integrations/pm/jira/index.ts`).
  */
-function projectForDiscovery(project: ProjectConfig, manifest: PMProviderManifest): ProjectConfig {
+function projectForDiscovery(
+	project: ProjectConfig,
+	manifest: PMProviderManifest,
+	discoveryDraft: Record<string, string> | undefined,
+): ProjectConfig {
+	if (manifest.discoveryDraft) {
+		const parsed = manifest.discoveryDraft.schema.safeParse(discoveryDraft ?? {});
+		if (parsed.success) return { ...project, pm: manifest.discoveryDraft.buildPm(parsed.data) };
+	}
 	if (manifest.id === project.pm.type) return project;
 	if (manifest.blankPmDiscoveryBlocker) {
 		throw new TRPCError({
@@ -170,6 +179,7 @@ export const pmRouter = router({
 				id: m.id,
 				label: m.label,
 				discovery: [...m.discovery],
+				discoveryDraft: m.discoveryDraft?.fields ?? [],
 			}));
 		}),
 
@@ -182,6 +192,7 @@ export const pmRouter = router({
 			z.object({
 				projectId: z.string().min(1),
 				providerId: PmProviderIdSchema.optional(),
+				discoveryDraft: z.record(z.string(), z.string()).optional(),
 			}),
 		)
 		.query(async ({ ctx, input }) => {
@@ -190,6 +201,7 @@ export const pmRouter = router({
 				input.projectId,
 				'containers',
 				input.providerId,
+				input.discoveryDraft,
 			);
 			return runDiscovery(() => provider.discover('containers', {}));
 		}),
@@ -201,6 +213,7 @@ export const pmRouter = router({
 				projectId: z.string().min(1),
 				containerId: z.string().min(1),
 				providerId: PmProviderIdSchema.optional(),
+				discoveryDraft: z.record(z.string(), z.string()).optional(),
 			}),
 		)
 		.query(async ({ ctx, input }) => {
@@ -209,6 +222,7 @@ export const pmRouter = router({
 				input.projectId,
 				'states',
 				input.providerId,
+				input.discoveryDraft,
 			);
 			return runDiscovery(() => provider.discover('states', { containerId: input.containerId }));
 		}),
