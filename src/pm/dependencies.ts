@@ -248,17 +248,39 @@ export function openBlockers(blockers: readonly WorkItemBlocker[]): WorkItemBloc
 }
 
 /**
+ * Human copy for a blocker's {@link WorkItemBlocker.source}. The two sources gate
+ * a run *identically*, which is exactly why the message has to name them (issue
+ * #636): a native relationship is a fact someone recorded on the board, while a
+ * prose mention is this module's heuristic reading of a sentence — and therefore
+ * the only one of the two a false positive can come from. Without the label, a
+ * deferral that shouldn't have happened can only be diagnosed by reproducing the
+ * scan by hand, which is what run `bdd362d7-c059-4e40-b7d7-fcd60ac502ba` took.
+ */
+function blockerSourceLabel(source: WorkItemBlocker['source']): string {
+	return source === 'dependency'
+		? 'native blocked-by relationship'
+		: 'prose mention in the item description or comments';
+}
+
+/**
  * The message posted/logged when a run is gated on unfinished prerequisites —
  * the "issue X must be done first" the pipeline surfaces. Lists every open
- * blocker so a human sees exactly what to finish (and in a Markdown-friendly form
- * for the board comment).
+ * blocker, each annotated with where it came from, so a human sees exactly what
+ * to finish and on whose authority (and in a Markdown-friendly form for the board
+ * comment).
  */
 export function blockedRunMessage(openBlockers: readonly WorkItemBlocker[]): string {
 	if (openBlockers.length === 1) {
 		const b = openBlockers[0];
-		return `Blocked: ${b.reference} (“${b.title}”, ${b.url}) must be done first.`;
+		return `Blocked: ${b.reference} (“${b.title}”, ${b.url}) — ${blockerSourceLabel(b.source)} — must be done first.`;
 	}
-	const list = openBlockers.map((b) => `${b.reference} (“${b.title}”, ${b.url})`).join(', ');
+	// Semicolons rather than commas now every entry carries its own em-dashed source:
+	// a comma-joined list would read as one run-on clause with no visible boundary
+	// between "…, url) — prose mention in the item description or comments" and the
+	// next blocker's reference.
+	const list = openBlockers
+		.map((b) => `${b.reference} (“${b.title}”, ${b.url}) — ${blockerSourceLabel(b.source)}`)
+		.join('; ');
 	return `Blocked: these must be done first — ${list}.`;
 }
 
