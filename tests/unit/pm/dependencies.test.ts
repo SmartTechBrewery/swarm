@@ -6,8 +6,12 @@ import {
 	dependencyProse,
 	findDependencyReferences,
 	openBlockers,
+	partitionBlockersBySource,
+	proseAdvisoryCommentBody,
+	proseAdvisoryMarker,
 } from '@/pm/dependencies.js';
 import type { WorkItemBlocker } from '@/pm/types.js';
+import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 
 function blocker(overrides: Partial<WorkItemBlocker> = {}): WorkItemBlocker {
 	return {
@@ -174,6 +178,65 @@ describe('openBlockers', () => {
 	});
 });
 
+// Issue #643: `source` decides a blocker's authority, not just its wording.
+describe('partitionBlockersBySource', () => {
+	it('gates on a native relationship and only advises on a prose mention', () => {
+		const { gating, advisory } = partitionBlockersBySource([
+			blocker({ reference: '#319', source: 'dependency' }),
+			blocker({ reference: '#631', source: 'mention' }),
+		]);
+		expect(gating.map((b) => b.reference)).toEqual(['#319']);
+		expect(advisory.map((b) => b.reference)).toEqual(['#631']);
+	});
+
+	it('returns two empty lists for no blockers', () => {
+		expect(partitionBlockersBySource([])).toEqual({ gating: [], advisory: [] });
+	});
+});
+
+describe('proseAdvisoryMarker', () => {
+	it('is stable for the same reference set whatever the order', () => {
+		const a = proseAdvisoryMarker([blocker({ reference: '#12' }), blocker({ reference: '#7' })]);
+		const b = proseAdvisoryMarker([blocker({ reference: '#7' }), blocker({ reference: '#12' })]);
+		expect(a).toBe(b);
+	});
+
+	it('differs for a different reference set, so a later prerequisite gets its own notice', () => {
+		expect(proseAdvisoryMarker([blocker({ reference: '#7' })])).not.toBe(
+			proseAdvisoryMarker([blocker({ reference: '#8' })]),
+		);
+	});
+});
+
+describe('proseAdvisoryCommentBody', () => {
+	const body = proseAdvisoryCommentBody([
+		blocker({ reference: '#631', title: 'Hold PM credentials', url: 'https://x/631' }),
+	]);
+
+	it('names the reference, its title and its URL', () => {
+		expect(body).toContain('#631');
+		expect(body).toContain('Hold PM credentials');
+		expect(body).toContain('https://x/631');
+	});
+
+	it('says the run was not held back and asks for a recorded relationship', () => {
+		expect(body).toMatch(/did not hold the run back/i);
+		expect(body).toMatch(/record it on the board/i);
+	});
+
+	it('carries its own marker so the notice is idempotent', () => {
+		expect(body).toContain(proseAdvisoryMarker([blocker({ reference: '#631' })]));
+	});
+
+	// The notice names issue references beside the words "prerequisite" and "blocked
+	// by". It is recognisable as SWARM's own writing, so the scan skips it — a notice
+	// that gated the next run on the issue it asks about would be this bug wearing a hat.
+	it('is recognised as SWARM-generated, so the prose scan never reads it back', () => {
+		expect(isSwarmGeneratedBody(body)).toBe(true);
+		expect(findDependencyReferences(dependencyProse(undefined, [body]))).toEqual([]);
+	});
+});
+
 describe('dedupeBlockers', () => {
 	it('collapses the same URL and prefers the native dependency over a bare mention', () => {
 		const url = 'https://github.com/o/r/issues/9';
@@ -206,9 +269,10 @@ describe('blockedRunMessage', () => {
 		expect(msg).toContain('#5');
 	});
 
-	// Issue #636: both sources gate identically, so the message is the only place a
-	// human learns whether the gate rests on a recorded relationship or on the prose
-	// scan's reading of a sentence.
+	// Issue #636: the message is where a human learns whether the gate rests on a
+	// recorded relationship or on the prose scan's reading of a sentence. The gate only
+	// passes native blockers since #643, but the formatter still labels either source —
+	// the `mention` case below is what keeps that vocabulary honest.
 	it('names a native relationship as the source of a single blocker', () => {
 		const msg = blockedRunMessage([blocker({ source: 'dependency' })]);
 		expect(msg).toContain('native blocked-by relationship');

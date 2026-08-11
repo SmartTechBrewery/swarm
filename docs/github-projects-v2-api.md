@@ -354,7 +354,9 @@ board item to its backing issue first (the adapter already does this for comment
 Prose-declared dependencies (an item that says "blocked by #319" in its body or a comment) are
 resolved provider-neutrally: `src/pm/dependencies.ts` extracts the referenced issue numbers, and
 the adapter resolves each to its live `state` via `issues.get`, so both native relationships and
-mentioned prerequisites feed one `listBlockers` result.
+mentioned prerequisites feed one `listBlockers` result — tagged `source: 'dependency'` and
+`source: 'mention'` respectively. Only the native half **gates** a run (issue #643); a prose mention
+is surfaced on the item for a human to record natively and never defers work.
 
 ---
 

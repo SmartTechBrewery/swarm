@@ -350,7 +350,7 @@ export const WorkItemBlockerFrameSchema = z.object({
 	reference: z.string().min(1),
 	// Exactly as permissive as `WorkItemBlocker`, which allows an empty URL (the
 	// GitHub adapter's `issue.html_url ?? ''`). A stricter wire schema would throw
-	// here, and `findOpenBlockers` swallows a throw as "no blockers" — so tightening
+	// here, and `findGatingBlockers` swallows a throw as "no blockers" — so tightening
 	// this field could silently un-gate the very check this serves.
 	url: z.string(),
 	title: z.string(),
