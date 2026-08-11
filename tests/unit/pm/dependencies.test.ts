@@ -205,4 +205,34 @@ describe('blockedRunMessage', () => {
 		expect(msg).toContain('#319');
 		expect(msg).toContain('#5');
 	});
+
+	// Issue #636: both sources gate identically, so the message is the only place a
+	// human learns whether the gate rests on a recorded relationship or on the prose
+	// scan's reading of a sentence.
+	it('names a native relationship as the source of a single blocker', () => {
+		const msg = blockedRunMessage([blocker({ source: 'dependency' })]);
+		expect(msg).toContain('native blocked-by relationship');
+		expect(msg).not.toContain('prose mention');
+		expect(msg).toMatch(/must be done first/i);
+	});
+
+	it('names a prose mention as the source of a single blocker', () => {
+		const msg = blockedRunMessage([blocker({ source: 'mention' })]);
+		expect(msg).toContain('prose mention in the item description or comments');
+		expect(msg).not.toContain('native blocked-by relationship');
+		expect(msg).toMatch(/must be done first/i);
+	});
+
+	it('annotates each blocker with its own source when the sources differ', () => {
+		const msg = blockedRunMessage([
+			blocker({ source: 'dependency' }),
+			blocker({ reference: '#5', title: 'DB', source: 'mention' }),
+		]);
+		expect(msg).toContain(
+			'#319 (“Session auth”, https://github.com/o/r/issues/319) — native blocked-by relationship',
+		);
+		expect(msg).toContain(
+			'#5 (“DB”, https://github.com/o/r/issues/319) — prose mention in the item description or comments',
+		);
+	});
 });
