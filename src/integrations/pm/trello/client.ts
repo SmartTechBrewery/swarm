@@ -13,8 +13,10 @@
  * caller's own query, so nothing can displace it. It is never a function argument
  * (ai/CODING_STANDARDS.md "Error handling"): the scope carries it so it stays out
  * of signatures and stack traces. Credentials living in the URL is also why
- * {@link TrelloApiError} carries a **query-stripped** path — the whole URL would
- * put the token in every log line.
+ * {@link TrelloApiError} carries a **redacted** path — its query string stripped
+ * *and* a leading `tokens/{token}` segment masked, since webhook administration
+ * puts the token in the path itself (`./webhooks.ts`) — because the whole URL
+ * would put the token in every log line.
  *
  * Verified against Trello's current REST documentation
  * (developer.atlassian.com/cloud/trello/rest) rather than inferred from Cascade's
@@ -102,9 +104,10 @@ export function withTrelloCredentials<T>(
 /**
  * A non-2xx Trello API response.
  *
- * `path` is the request path with **any query string removed** — Trello carries the
- * API key and token as query parameters, so the full URL can never reach an error
- * message or a log line.
+ * `path` is the request path with **any query string removed** and a `tokens/{token}`
+ * segment masked — Trello carries the API key and token as query parameters, and
+ * webhook administration carries the token in the path, so neither can reach an
+ * error message or a log line.
  */
 export class TrelloApiError extends Error {
 	constructor(
@@ -117,9 +120,18 @@ export class TrelloApiError extends Error {
 	}
 }
 
-/** The request path without its query string — safe to log or surface in an error. */
-function redactQuery(path: string): string {
-	return `/${path.replace(/^\/+/, '').split('?')[0]}`;
+/**
+ * The request path with its query string dropped and the token masked out of a
+ * `tokens/{token}/…` prefix — safe to log or surface in an error.
+ *
+ * The query goes because the key/token pair rides there on every request; the path
+ * segment is masked because webhook administration addresses the collection *by
+ * token* (`./webhooks.ts`), so stripping the query alone would still put a live
+ * credential in every failure message.
+ */
+function redactPath(path: string): string {
+	const withoutQuery = `/${path.replace(/^\/+/, '').split('?')[0]}`;
+	return withoutQuery.replace(/^\/tokens\/[^/]+/, '/tokens/{token}');
 }
 
 function buildUrl(
@@ -161,7 +173,7 @@ export async function trelloRequest<T>(path: string, init: TrelloRequestInit = {
 		const body = await response.text();
 		throw new TrelloApiError(
 			response.status,
-			redactQuery(path),
+			redactPath(path),
 			body.slice(0, MAX_ERROR_BODY_CHARS) || '<empty response body>',
 		);
 	}
