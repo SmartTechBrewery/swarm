@@ -46,6 +46,7 @@ import type {
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
+	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { getScopedClient } from '../../scm/github/client.js';
@@ -709,13 +710,23 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		return this.run(async () => {
 			// Two sources: the native "blocked by" relationships, plus prerequisites the
 			// item names in prose (its own description + comments). Deduped by URL so a
-			// dependency that is both linked and mentioned appears once.
+			// dependency that is both linked and mentioned appears once — as the native
+			// one, which is what makes it a gate rather than a notice (issue #643: the
+			// caller defers only on `source: 'dependency'` and surfaces the rest).
 			const [native, mentioned] = await Promise.all([
 				this.fetchNativeBlockers(owner, repo, contentNumber),
 				this.fetchMentionedBlockers(owner, repo, contentNumber, workItem.description),
 			]);
 			return dedupeBlockers([...native, ...mentioned]);
 		});
+	}
+
+	async listDependents(id: string): Promise<WorkItemDependent[]> {
+		const { owner, repo, contentNumber } = await this.resolveItem(id);
+		// A draft item (no backing Issue) can block nothing — the same reason
+		// `listBlockers` returns early for one.
+		if (!owner || !repo || contentNumber == null) return [];
+		return this.run(() => this.fetchNativeDependents(owner, repo, contentNumber));
 	}
 
 	async addBlockedBy(id: string, blockerId: string): Promise<void> {
@@ -934,21 +945,65 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	/**
+	 * The issues this one natively blocks — the reverse edge of
+	 * {@link fetchNativeBlockers}, from the sibling `dependencies/blocking`
+	 * endpoint (docs/github-projects-v2-api.md §5b). Native only: prose is never
+	 * consulted here, because this answer is what excuses a blocker (issue #639).
+	 *
+	 * Answers *issues*, not board items, so the mapped dependents carry no `id` —
+	 * which is exactly why the gate matches on `url`/`reference` and checks only the
+	 * direct edge. A repo/plan without the feature answers 404/410, treated as "no
+	 * dependents" like its blocked-by twin: a missing reverse read leaves the
+	 * blockers gating, it does not ungate them.
+	 */
+	private async fetchNativeDependents(
+		owner: string,
+		repo: string,
+		issueNumber: number,
+	): Promise<WorkItemDependent[]> {
+		try {
+			const { data } = await getScopedClient().request(
+				'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking',
+				{ owner, repo, issue_number: issueNumber, per_page: 100 },
+			);
+			const issues = (data ?? []) as DependencyIssue[];
+			return issues
+				.filter((i): i is DependencyIssue & { number: number } => typeof i.number === 'number')
+				.map(toDependent);
+		} catch (err) {
+			if (isHttpStatus(err, 404) || isHttpStatus(err, 410)) {
+				logger.debug('pm: issue-dependencies API unavailable; treating as no dependents', {
+					owner,
+					repo,
+					issueNumber,
+				});
+				return [];
+			}
+			throw err;
+		}
+	}
+
+	/**
 	 * Prerequisites the item *names in prose* — its own description and its
 	 * **human** comments — that aren't native relationships. Provider-neutral
 	 * reference extraction (`findDependencyReferences`); this adapter resolves each
 	 * referenced issue's live open/closed state. A reference that doesn't resolve is
 	 * skipped (a typo'd or cross-repo number is not a gate).
 	 *
+	 * These are reported as `source: 'mention'` and are **advisory** since issue
+	 * #643: the gate surfaces them for a human and proceeds, so accuracy here decides
+	 * the quality of a notice rather than whether a run stalls. Still worth resolving
+	 * the live state — a notice about an already-closed issue is noise.
+	 *
 	 * SWARM's own comments are excluded (`isSwarmGeneratedBody`, issue #431): a
 	 * published plan — a split child's Preplan comment, or any phase's plan comment —
 	 * is agent prose that routinely says things like "this phase requires #266 to
-	 * land first". Read as a dependency declaration, that would gate the item on an
-	 * issue nobody declared a blocker: the dependency guard defers Implementation
-	 * while it stays open and finally fails the run. A prerequisite has to be
-	 * declared by a person (in the description or a comment of their own) or as a
-	 * native `blocked by` relationship — SWARM must not conjure one out of its own
-	 * writing.
+	 * land first". Read as a dependency declaration, that used to gate the item on an
+	 * issue nobody declared a blocker (deferring Implementation while it stayed open
+	 * and finally failing the run); since #643 it would instead ask a human to record
+	 * a relationship SWARM invented out of its own writing. A prerequisite has to be
+	 * declared by a person, in the description or a comment of their own — or, to gate
+	 * anything, as a native `blocked by` relationship.
 	 */
 	private async fetchMentionedBlockers(
 		owner: string,
@@ -1009,6 +1064,21 @@ function toBlocker(issue: DependencyIssue, source: WorkItemBlocker['source']): W
 		title: issue.title ?? '',
 		open: issue.state !== 'closed',
 		source,
+	};
+}
+
+/**
+ * Map a natively blocked issue onto a dependent — the same fields as
+ * {@link toBlocker} minus `source`, since the reverse read has only one
+ * (`src/pm/types.ts`). `reference`/`url` are built identically on purpose: they are
+ * the identity the shared cycle check matches a blocker against.
+ */
+function toDependent(issue: DependencyIssue): WorkItemDependent {
+	return {
+		reference: issue.number != null ? `#${issue.number}` : (issue.html_url ?? '?'),
+		url: issue.html_url ?? '',
+		title: issue.title ?? '',
+		open: issue.state !== 'closed',
 	};
 }
 

@@ -16,6 +16,11 @@
  * | Read a project / its runs / its credentials  | `contributor` | `canReadProject`     |
  * | Drive a project's runs (retry/terminate/…)   | `member`      | `canWriteProject`    |
  * | Administer config / credentials / delete     | `projectAdmin`| `canAdministerProject`|
+ * | Read an installation-wide view (runs/workers)| —             | `assertInstanceAdmin`|
+ *
+ * That last row is deliberately roleless: it is a **layer-1** check, decided by
+ * the installation role alone (see {@link assertInstanceAdmin}), and no project
+ * membership grants it.
  *
  * An `instanceAdmin` (installation role, layer 1) bypasses every check and
  * accesses every project. A user with *no* membership cannot even learn a
@@ -42,6 +47,32 @@ function projectNotFound(projectId: string, notFoundMessage?: string): TRPCError
 	return new TRPCError({
 		code: 'NOT_FOUND',
 		message: notFoundMessage ?? `Project with ID "${projectId}" not found`,
+	});
+}
+
+/**
+ * Throw unless `user` is an installation administrator — the layer-1 gate the
+ * **installation-wide** dashboard views run behind (issue #647). The global
+ * `/runs` and `/workers` screens read across every project on the instance,
+ * which is an operator's view of the installation rather than a member's view of
+ * their own work, so the installation role decides it and project membership
+ * does not enter into it.
+ *
+ * `FORBIDDEN`, not the `NOT_FOUND` the project-scoped helpers use: there is no
+ * existence to hide — the caller named no project id, only a fixed
+ * installation-wide view — so the honest answer is that the view is not theirs.
+ * `view` names it in the copy ("runs", "queue", "workers").
+ *
+ * Synchronous on purpose: it reads a flag already on `ctx.user` and must not
+ * imply a database read. Project-scoped reads are untouched — an enrolled worker
+ * owner still reads their projects' runs and workers through
+ * {@link assertProjectAccess}.
+ */
+export function assertInstanceAdmin(user: SwarmUser, view: string): void {
+	if (isInstanceAdmin(user)) return;
+	throw new TRPCError({
+		code: 'FORBIDDEN',
+		message: `The installation-wide ${view} view is available to instance administrators only. Open a project you are enrolled in to see its ${view}.`,
 	});
 }
 

@@ -12,8 +12,9 @@
  * kind of worker (issue #553). Every worker runs the DB-free entrypoint
  * (`../transport/connect-entry.ts`) and has no in-process provider to fall back
  * on, so this factory takes no local delegate: every board write rides the
- * transport, as do the five narrow reads a DB-free phase needs — `listBlockers`
- * (the dependency gate must keep gating), `findWorkItemByUrlSuffix`
+ * transport, as do the six narrow reads a DB-free phase needs — `listBlockers`
+ * (the dependency gate must keep gating), `listDependents` (and it must never gate
+ * on a cycle — issue #639), `findWorkItemByUrlSuffix`
  * (Respond-to-review's board card), `findWorkItemForArtifact` (the
  * repository-scoped automation gate), `findComment` (Planning's own replay guard)
  * and `findWorkItemByDescriptionMarker` (the split child that guard's retry must
@@ -37,6 +38,7 @@ import {
 	FindWorkItemDeliveryResponseSchema,
 	type FoundWorkItem,
 	ListBlockersDeliveryResponseSchema,
+	ListDependentsDeliveryResponseSchema,
 	MoveWorkItemDeliveryResponseSchema,
 	UpdateWorkItemDeliveryResponseSchema,
 } from '../transport/protocol.js';
@@ -125,10 +127,20 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
  * (`../pipeline/dependency-guard.ts`) short-circuits, and a work item whose
  * prerequisites are still open would be built out of order — the failure issue
- * #330 exists to prevent. Nothing else gates it: `findOpenBlockers` is called
+ * #330 exists to prevent. Nothing else gates it: `findGatingBlockers` is called
  * only inside the phase, never by the dispatcher or the eligibility gate. So the
  * capability is declared **on** and the read runs server-side under the PM
- * credential.
+ * credential. That read still carries both blocker sources, because the gate needs
+ * the prose-only ones to *surface* them even though it no longer defers on them
+ * (issue #643) — and the notice it posts rides the same transported `addComment`.
+ *
+ * `listDependents` is transported for the mirror reason (issue #639). The gate's
+ * cycle backstop runs inside the phase, so it runs *here*: refusing the read would
+ * leave every federated Implementation deferring on a blocker it natively blocks
+ * until the wait budget ran out — the deadlock the backstop exists to prevent, and
+ * the one that was actually observed. Failing the read is safe-by-construction
+ * (the gate keeps its blockers), but it is safe in the direction that keeps the
+ * bug, which is why the route exists rather than an `unavailableRead`.
  *
  * `findWorkItemByUrlSuffix` is transported for a milder reason: Respond-to-review's
  * board report is best-effort, so refusing would merely stop the card moving. It
@@ -176,6 +188,13 @@ export function createWriteOnlyTransportPmProvider(
 				'/worker/delivery/pm/blockers',
 				{ projectId: options.projectId, itemId: id },
 				(value) => ListBlockersDeliveryResponseSchema.parse(value).blockers,
+			),
+		listDependents: (id) =>
+			postDelivery(
+				options,
+				'/worker/delivery/pm/dependents',
+				{ projectId: options.projectId, itemId: id },
+				(value) => ListDependentsDeliveryResponseSchema.parse(value).dependents,
 			),
 		findWorkItemByUrlSuffix: (urlSuffix) =>
 			postDelivery(

@@ -24,7 +24,11 @@ export interface PmCredentialEntry {
 	description?: string;
 	/** The provider's conventional env-var / `swarm config apply` key for this role. */
 	envVarKey: string;
-	/** The secret-store key this role currently resolves through. Never a secret. */
+	/**
+	 * The secret-store key this role currently resolves through — the key the screen
+	 * names, since it is the only one an operator setting a value can act on (issue
+	 * #630). Never a secret, and never empty: the server falls back to `envVarKey`.
+	 */
 	referenceKey: string;
 	optional: boolean;
 	/** Set when the role *is* a shared SCM credential, configured on the Source Control tab. */
@@ -51,10 +55,29 @@ export function isPmRoleEditable(entry: PmCredentialEntry): boolean {
 	return !entry.inheritsSharedCredential;
 }
 
-/** Where a non-editable role is actually configured, as a sentence for the UI. */
+/**
+ * Where a non-editable role is actually configured, as a sentence for the UI —
+ * naming the store key it resolves through (issue #630) rather than the shared
+ * role's name: `webhookSecret` is SWARM's internal vocabulary and told the operator
+ * nothing about what to set, and for a project predating the neutral `SCM_*`
+ * defaults the resolved key is not the provider's declared `envVarKey` either. *Why*
+ * the secret is shared at all stays the provider's own copy (`description`).
+ */
 export function pmRoleInheritanceNote(entry: PmCredentialEntry): string | undefined {
 	if (!entry.inheritsSharedCredential) return undefined;
-	return `Shared with source control (${entry.inheritsSharedCredential}) — configure it on the Source Control tab.`;
+	return `Shared with source control — this project resolves it through ${entry.referenceKey}, configured on the Source Control tab.`;
+}
+
+/**
+ * Note for a role whose resolved store key is not the provider's declared
+ * `envVarKey` — a reference this project configured for itself. Undefined when the
+ * two coincide (the common case, left noise-free), and for an inherited role, whose
+ * own note above already names the key it resolves through.
+ */
+export function pmRoleKeyOriginNote(entry: PmCredentialEntry): string | undefined {
+	if (entry.inheritsSharedCredential) return undefined;
+	if (entry.referenceKey === entry.envVarKey) return undefined;
+	return `This project resolves it through ${entry.referenceKey}, not the provider's default ${entry.envVarKey}.`;
 }
 
 /** Short configured/not-configured status chip text for one role. */

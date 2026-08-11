@@ -2,12 +2,14 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Lock, Pencil, Trash2, X } from 'lucide-react';
 import type React from 'react';
 import { useState } from 'react';
+import type { PmProviderId } from '@/lib/board-mapping.js';
 import { maskedPreview } from '@/lib/credentials.js';
 import {
 	isPmRoleEditable,
 	missingRequiredPmRoles,
 	type PmCredentialEntry,
 	pmRoleInheritanceNote,
+	pmRoleKeyOriginNote,
 	pmRoleStatusLabel,
 } from '@/lib/pm-credentials.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
@@ -24,8 +26,16 @@ import { Modal, ModalFooter } from '../ui/modal.js';
  * receives one back.
  *
  * Nothing here names GitHub Projects: the provider label, each role's label, and
- * its permission guidance all come from the manifest, so a second provider's
- * different credential shape renders without a change to this component.
+ * its permission guidance all come from the manifest, and the key each role is shown
+ * under is the one the *project* resolves it through (issue #630 — `referenceKey`,
+ * not the manifest's conventional default), so a second provider's different
+ * credential shape renders without a change to this component.
+ *
+ * Every query and write is addressed to a **named** provider (issue #641's parameter),
+ * which the tab supplies as the *draft* provider while a switch is open (issue #642):
+ * that is how the incoming provider's roles are entered — and shown as unconfigured
+ * rather than as the outgoing provider's — before the switch is saved, and why the
+ * outgoing provider's block is left untouched throughout.
  *
  * Saving invalidates the board-discovery queries as well as the credential list, so
  * the board picker below immediately retries with the new credential — that retry
@@ -146,6 +156,8 @@ function PmCredentialPreview({ entry, onEdit, onRequestRemove }: PmCredentialPre
 
 interface PmCredentialFieldProps {
 	projectId: string;
+	/** The provider whose block this write lands in — never another provider's. */
+	providerId: PmProviderId;
 	entry: PmCredentialEntry;
 	onSaved: () => void;
 	onRequestRemove: (entry: PmCredentialEntry) => void;
@@ -157,9 +169,18 @@ interface PmCredentialFieldProps {
  * input revealed on Edit (or straight away when unset), and Remove behind the
  * parent's confirmation modal.
  */
-function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCredentialFieldProps) {
+function PmCredentialField({
+	projectId,
+	providerId,
+	entry,
+	onSaved,
+	onRequestRemove,
+}: PmCredentialFieldProps) {
 	const editable = isPmRoleEditable(entry);
 	const inheritanceNote = pmRoleInheritanceNote(entry);
+	// Only set when the resolved key diverges from the provider's declared default —
+	// the two notes are mutually exclusive, so a card never carries two key lines.
+	const keyOriginNote = pmRoleKeyOriginNote(entry);
 	// An unconfigured credential opens straight into the input — there is no masked
 	// value to collapse to. A read-only (inherited) role never opens one.
 	const [editing, setEditing] = useState(editable && !entry.isConfigured);
@@ -167,7 +188,12 @@ function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCre
 
 	const saveMutation = useMutation({
 		mutationFn: (secret: string) =>
-			trpcClient.projects.credentials.setPm.mutate({ projectId, role: entry.role, value: secret }),
+			trpcClient.projects.credentials.setPm.mutate({
+				projectId,
+				providerId,
+				role: entry.role,
+				value: secret,
+			}),
 		onSuccess: () => {
 			setValue('');
 			setEditing(false);
@@ -185,7 +211,10 @@ function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCre
 			<div>
 				<div className="flex items-center gap-2">
 					<span className="text-sm font-medium text-zinc-200">{entry.label}</span>
-					<span className="text-xs text-zinc-500 font-mono select-all">{entry.envVarKey}</span>
+					{/* The key this project resolves the role through, not the provider's
+					    conventional default: it is the only key setting a value acts on, and
+					    it is what `isConfigured`/`maskedValue` beside it already describe. */}
+					<span className="text-xs text-zinc-500 font-mono select-all">{entry.referenceKey}</span>
 					<span
 						className={
 							entry.isConfigured
@@ -205,6 +234,8 @@ function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCre
 						{inheritanceNote}
 					</p>
 				)}
+				{/* No Lock icon: this role *is* editable here — the icon stays the read-only marker. */}
+				{keyOriginNote && <p className="text-xs text-zinc-500 mt-1">{keyOriginNote}</p>}
 			</div>
 
 			{!editable ? null : editing ? (
@@ -241,9 +272,18 @@ function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCre
 	);
 }
 
-export function PmCredentialsPanel({ projectId }: { projectId: string }) {
+export function PmCredentialsPanel({
+	projectId,
+	providerId,
+}: {
+	projectId: string;
+	/** The provider to render and write credentials for — the draft one mid-switch. */
+	providerId: PmProviderId;
+}) {
 	const queryClient = useQueryClient();
-	const credentialsQuery = useQuery(trpc.projects.credentials.listPm.queryOptions({ projectId }));
+	const credentialsQuery = useQuery(
+		trpc.projects.credentials.listPm.queryOptions({ projectId, providerId }),
+	);
 	const [removeTarget, setRemoveTarget] = useState<PmCredentialEntry | null>(null);
 
 	/**
@@ -253,7 +293,7 @@ export function PmCredentialsPanel({ projectId }: { projectId: string }) {
 	 */
 	const invalidateAfterWrite = () => {
 		queryClient.invalidateQueries({
-			queryKey: trpc.projects.credentials.listPm.queryOptions({ projectId }).queryKey,
+			queryKey: trpc.projects.credentials.listPm.queryOptions({ projectId, providerId }).queryKey,
 		});
 		// Every `pm` discovery query at once (boards *and* the selected board's states),
 		// by path filter rather than by key: the states query is keyed by a container id
@@ -263,7 +303,11 @@ export function PmCredentialsPanel({ projectId }: { projectId: string }) {
 
 	const removeMutation = useMutation({
 		mutationFn: (entry: PmCredentialEntry) =>
-			trpcClient.projects.credentials.deletePm.mutate({ projectId, role: entry.role }),
+			trpcClient.projects.credentials.deletePm.mutate({
+				projectId,
+				providerId,
+				role: entry.role,
+			}),
 		onSuccess: () => {
 			invalidateAfterWrite();
 			setRemoveTarget(null);
@@ -324,6 +368,7 @@ export function PmCredentialsPanel({ projectId }: { projectId: string }) {
 					<PmCredentialField
 						key={entry.role}
 						projectId={projectId}
+						providerId={providerId}
 						entry={entry}
 						onSaved={invalidateAfterWrite}
 						onRequestRemove={setRemoveTarget}

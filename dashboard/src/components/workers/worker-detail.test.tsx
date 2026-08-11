@@ -699,15 +699,41 @@ describe('WorkerDetailView project-administrator actions', () => {
 		);
 	});
 
-	it('shows the state but no approval control to a viewer who does not administer the project', () => {
+	it('omits the Approval section entirely for a viewer who does not administer the project', () => {
 		renderWorker({
 			enrollments: [makeEnrollment({ status: 'pending', isRoutable: false })],
 		});
 
+		// The state still reads off the enrollment header's badge — only the section
+		// whose whole content is an administrator's controls goes away (issue #652).
 		expect(screen.getByText('Pending approval')).toBeDefined();
+		expect(screen.queryByText('Approval')).toBeNull();
 		expect(screen.queryByRole('button', { name: 'Approve enrollment' })).toBeNull();
 		expect(screen.queryByRole('button', { name: 'Suspend enrollment' })).toBeNull();
-		expect(screen.getByText(/Only an administrator of Widgets/)).toBeDefined();
+		expect(screen.queryByText(/Only an administrator of Widgets/)).toBeNull();
+	});
+
+	it('keeps the rest of the enrollment readable for a non-administrator', () => {
+		renderWorker({
+			enrollments: [makeEnrollment({ status: 'pending', isRoutable: false })],
+		});
+
+		expect(screen.getByText('Sharing consent')).toBeDefined();
+		expect(screen.getByText('Allowed agent CLIs')).toBeDefined();
+		expect(screen.getByText('Allowed pipeline phases')).toBeDefined();
+		expect(screen.getByText('Concurrency allocation')).toBeDefined();
+	});
+
+	it('renders the Approval section for an administrator', () => {
+		renderWorker({
+			enrollments: [
+				makeEnrollment({ status: 'pending', isRoutable: false, viewerCanAdminister: true }),
+			],
+		});
+
+		expect(screen.getByText('Approval')).toBeDefined();
+		expect(screen.getByRole('button', { name: 'Approve enrollment' })).toBeDefined();
+		expect(screen.getByRole('button', { name: 'Suspend enrollment' })).toBeDefined();
 	});
 
 	it('surfaces a rejected suspension inside the confirmation it was started from', async () => {

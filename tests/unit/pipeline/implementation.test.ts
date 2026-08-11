@@ -57,7 +57,7 @@ import {
 	implementationCommentBody,
 	runImplementationPhase,
 } from '@/pipeline/implementation.js';
-import type { WorkItemBlocker } from '@/pm/types.js';
+import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import { HANDOFF_FILENAMES, type ScmDeliveryProvider } from '@/scm/delivery.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
@@ -146,6 +146,7 @@ function makeDeps() {
 		supportsDependencies: true,
 		supportsAssignees: true,
 		listBlockers: vi.fn<() => Promise<WorkItemBlocker[]>>(async () => []),
+		listDependents: vi.fn<() => Promise<WorkItemDependent[]>>(async () => []),
 		addBlockedBy: vi.fn<(id: string, blockerId: string) => Promise<void>>(async () => {}),
 	};
 	return {

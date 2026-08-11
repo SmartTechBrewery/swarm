@@ -12,6 +12,7 @@ vi.mock('@/identity/membership-service.js', () => ({
 
 import {
 	accessibleProjectScope,
+	assertInstanceAdmin,
 	assertProjectAccess,
 	filterAccessibleProjects,
 	mayAccessProject,
@@ -92,6 +93,37 @@ describe('assertProjectAccess', () => {
 	it('lets a projectAdmin through the projectAdmin floor', async () => {
 		getMembership.mockResolvedValue(membership('projectAdmin'));
 		await expect(assertProjectAccess(user(), 'proj-a', 'projectAdmin')).resolves.toBeUndefined();
+	});
+});
+
+describe('assertInstanceAdmin (issue #647)', () => {
+	beforeEach(() => {
+		getMembership.mockReset();
+		listAccessibleProjectIds.mockReset();
+	});
+
+	it('lets an instanceAdmin read an installation-wide view', () => {
+		expect(() => assertInstanceAdmin(user({ instanceAdmin: true }), 'runs')).not.toThrow();
+	});
+
+	it('throws FORBIDDEN (not NOT_FOUND) for an ordinary user — no project id, so nothing to hide', () => {
+		expect(() => assertInstanceAdmin(user(), 'workers')).toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+	});
+
+	it('names the view and points the caller at their projects', () => {
+		expect(() => assertInstanceAdmin(user(), 'runs')).toThrowError(/installation-wide runs view/);
+		expect(() => assertInstanceAdmin(user(), 'runs')).toThrowError(
+			/Open a project you are enrolled in/,
+		);
+	});
+
+	it('decides on the installation role alone — no membership read at all', () => {
+		expect(() => assertInstanceAdmin(user(), 'runs')).toThrow();
+		expect(() => assertInstanceAdmin(user({ instanceAdmin: true }), 'runs')).not.toThrow();
+		expect(getMembership).not.toHaveBeenCalled();
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 	});
 });
 

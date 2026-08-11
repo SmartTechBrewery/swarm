@@ -56,6 +56,7 @@ import type {
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
+	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { collectTrelloPage, PAGE_LIMIT, TrelloApiError, trelloRequest } from './client.js';
@@ -536,8 +537,31 @@ export class TrelloPMProvider implements PMProvider {
 	 * borrowing another category's model). Synthesising a blocker SWARM cannot
 	 * answer `open` for would be worse than reporting none: the gate would defer
 	 * work on a prerequisite it could never see finish.
+	 *
+	 * **Issue #643 changes nothing here, and takes nothing away.** Prose stopped
+	 * gating a run anywhere, but this provider never gated on prose in the first
+	 * place: the guard short-circuits on `supportsDependencies` before it asks for
+	 * blockers at all, so a Trello project's automated gating was, and remains,
+	 * empty. What it has instead is what it always had — the prose Planning writes
+	 * into each split child's description, for a human to read.
 	 */
 	async listBlockers(): Promise<WorkItemBlocker[]> {
+		return [];
+	}
+
+	/**
+	 * The reverse-edge half of the same opt-out (issue #639) — see
+	 * {@link listBlockers} for why. Trello records no cross-card blocking
+	 * relationship in either direction, so there is nothing for this to read: the
+	 * contract (`src/pm/types.ts`) defines `supportsDependencies: false` as this
+	 * answering `[]`, and a provider that gates on nothing has no cycle to suppress
+	 * either.
+	 *
+	 * Deliberately *not* answered from prose, exactly as `listBlockers` refuses to:
+	 * this read is what excuses a blocker, so a heuristic answer here would be worse
+	 * than none — it could drop a real gate on a sentence.
+	 */
+	async listDependents(): Promise<WorkItemDependent[]> {
 		return [];
 	}
 

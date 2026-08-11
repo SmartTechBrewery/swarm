@@ -71,7 +71,7 @@ import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
-import { DependencyBlockedError, findOpenBlockers } from '@/pipeline/dependency-guard.js';
+import { DependencyBlockedError, findGatingBlockers } from '@/pipeline/dependency-guard.js';
 import {
 	BLOCKED_REASON_FILENAME,
 	buildImplementationPrompt,
@@ -428,10 +428,12 @@ export async function runImplementationPhase(
 	// worktree, credentials, and the agent, so a blocked run defers having spent
 	// zero model tokens; the worker re-checks it cheaply until the blocker closes.
 	// Provider-agnostic — it speaks only the PMProvider gate (no-op for a provider
-	// that can't model dependencies).
-	const openBlockers = await findOpenBlockers(pm, workItem);
-	if (openBlockers.length > 0) {
-		throw new DependencyBlockedError(workItem, openBlockers);
+	// that can't model dependencies). Only *recorded* relationships reach this list
+	// (issue #643): a prerequisite found only in the item's prose is surfaced by the
+	// gate for a human and never defers the run.
+	const gatingBlockers = await findGatingBlockers(pm, workItem);
+	if (gatingBlockers.length > 0) {
+		throw new DependencyBlockedError(workItem, gatingBlockers);
 	}
 
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);

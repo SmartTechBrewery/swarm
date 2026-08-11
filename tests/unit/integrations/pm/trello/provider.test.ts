@@ -118,6 +118,7 @@ const CONTRACT_METHODS = [
 	'updateWorkItem',
 	'addLabel',
 	'listBlockers',
+	'listDependents',
 	'addBlockedBy',
 	'discover',
 ] as const;
@@ -837,6 +838,16 @@ describe('TrelloPMProvider', () => {
 			// ai/RULES.md §2 forbids. Callers fall back to the comment guard instead.
 			await expect(provider.listBlockers()).resolves.toEqual([]);
 			await expect(provider.addBlockedBy()).resolves.toBeUndefined();
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+
+		it('reports no dependents either — the reverse edge opts out the same way', async () => {
+			mockTrello({});
+
+			// Issue #639's cycle backstop reads this, and a provider that gates on
+			// nothing has no cycle to suppress. Answering it from prose would be worse
+			// than answering `[]`: this read is what *excuses* a blocker.
+			await expect(provider.listDependents()).resolves.toEqual([]);
 			expect(fetchMock).not.toHaveBeenCalled();
 		});
 

@@ -1,5 +1,6 @@
 import { createRoute } from '@tanstack/react-router';
 import { Server } from 'lucide-react';
+import { InstanceAdminOnly } from '@/components/layout/instance-admin-only.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
 import { rootRoute } from '../__root.js';
 
@@ -14,6 +15,11 @@ import { rootRoute } from '../__root.js';
  * The roster itself lives in {@link WorkersRoster}, which this screen renders
  * unscoped and the project detail page's Workers tab renders scoped to one
  * project (issue #574) — one component, so the two views cannot drift.
+ *
+ * Unscoped it spans the whole installation — including machines enrolled nowhere
+ * — so the route renders it behind {@link InstanceAdminOnly} (see
+ * {@link WorkersScreen}); a worker owner reads the same roster, scoped, on their
+ * project's Workers tab (issue #647).
  */
 
 export function WorkersRouteComponent() {
@@ -39,8 +45,21 @@ export function WorkersRouteComponent() {
 	);
 }
 
+/**
+ * What the route actually mounts (issue #647): the screen behind the
+ * instance-admin gate. Denied, the screen never mounts, so the installation-wide
+ * `workers.list` read is never issued.
+ */
+export function WorkersScreen() {
+	return (
+		<InstanceAdminOnly view="workers">
+			<WorkersRouteComponent />
+		</InstanceAdminOnly>
+	);
+}
+
 export const workersRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: '/workers',
-	component: WorkersRouteComponent,
+	component: WorkersScreen,
 });

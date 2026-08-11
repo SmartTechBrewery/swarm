@@ -45,8 +45,11 @@ vi.mock('@/lib/trpc.js', () => ({
 	},
 }));
 
+vi.mock('@/lib/use-current-user.js', () => ({ useCurrentUser: vi.fn() }));
+
+import { useCurrentUser } from '@/lib/use-current-user.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
-import { WorkersRouteComponent, workersRoute } from './index.js';
+import { WorkersRouteComponent, WorkersScreen, workersRoute } from './index.js';
 
 function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 	return {
@@ -87,6 +90,12 @@ beforeEach(() => {
 	// no consent control renders unless a test opts in.
 	listMineQueryFn.mockResolvedValue([]);
 	rosterQueryFn.mockResolvedValue([]);
+	// The gate on the route (issue #647) reads the session; default to an admin so
+	// the roster tests below exercise the screen itself.
+	vi.mocked(useCurrentUser).mockReturnValue({
+		data: { id: '1', identifier: 'admin', displayName: 'Admin', instanceAdmin: true },
+		// biome-ignore lint/suspicious/noExplicitAny: a partial query result is all the gate reads.
+	} as any);
 });
 
 describe('/workers route registration', () => {
@@ -99,6 +108,32 @@ describe('/workers route registration', () => {
 	it('polls well inside the 60s default heartbeat TTL, so offline surfaces promptly', () => {
 		expect(WORKERS_REFETCH_MS).toBeGreaterThan(0);
 		expect(WORKERS_REFETCH_MS).toBeLessThan(60_000);
+	});
+});
+
+describe('/workers is restricted to instance admins (issue #647)', () => {
+	it('denies a non-admin without ever issuing the installation-wide roster read', async () => {
+		vi.mocked(useCurrentUser).mockReturnValue({
+			data: { id: '2', identifier: 'ada', displayName: 'Ada', instanceAdmin: false },
+			// biome-ignore lint/suspicious/noExplicitAny: a partial query result is all the gate reads.
+		} as any);
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+
+		renderScreen(<WorkersScreen />);
+
+		expect(
+			await screen.findByText('This page is available to instance administrators only.'),
+		).toBeDefined();
+		expect(screen.queryByText('ada-laptop')).toBeNull();
+		expect(workersListQueryFn).not.toHaveBeenCalled();
+	});
+
+	it('renders the roster for an instance admin', async () => {
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+
+		renderScreen(<WorkersScreen />);
+
+		expect(await screen.findByText('ada-laptop')).toBeDefined();
 	});
 });
 
