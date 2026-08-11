@@ -147,12 +147,20 @@ export function Sidebar() {
 			<div>
 				{currentUser.data && (
 					<div className="flex items-center justify-between gap-2 border-t border-zinc-850 px-4 py-3">
-						<span
-							className="min-w-0 truncate text-xs text-zinc-400"
+						{/* The signed-in user's name is the way into their own profile
+						    (issue #659) — it was a label until then. `min-w-0 truncate` stays
+						    so a long name can't push the Sign out button off the row. */}
+						<Link
+							to="/profile"
+							className={
+								currentPath.startsWith('/profile')
+									? 'min-w-0 truncate text-xs text-zinc-100'
+									: 'min-w-0 truncate text-xs text-zinc-400 hover:text-zinc-200 transition-colors'
+							}
 							title={currentUser.data.identifier}
 						>
 							{currentUser.data.displayName}
-						</span>
+						</Link>
 						<button
 							type="button"
 							onClick={handleLogout}
