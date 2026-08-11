@@ -43,7 +43,7 @@ describe('reconstructProjectConfig', () => {
 		const project = createMockProjectConfig({
 			credentials: {
 				scm: { github: { reviewer: 'REAL_REVIEWER_REF', webhookSecret: 'REAL_WEBHOOK_REF' } },
-				pm: { apiToken: 'REAL_PM_TOKEN_REF' },
+				pm: { 'github-projects': { apiToken: 'REAL_PM_TOKEN_REF' } },
 			},
 		});
 		const reconstructed = reconstructProjectConfig(
@@ -64,7 +64,7 @@ describe('reconstructProjectConfig', () => {
 			credentials: {
 				reviewer: 'SCM_TOKEN_REVIEWER',
 				webhookSecret: 'SCM_WEBHOOK_SECRET',
-				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 			},
 		});
 		const reconstructed = reconstructProjectConfig(

@@ -24,7 +24,7 @@ const project = createMockProjectConfig({
 	scm: 'bitbucket',
 	credentials: {
 		scm: { bitbucket: { reviewer: REVIEWER_REFERENCE, webhookSecret: 'BITBUCKET_HOOK_REF' } },
-		pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+		pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 	},
 });
 
@@ -79,7 +79,7 @@ describe('bitbucket persona credentials', () => {
 				scm: 'bitbucket',
 				credentials: {
 					scm: { github: { reviewer: 'GITHUB_REVIEWER_REF' } },
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 

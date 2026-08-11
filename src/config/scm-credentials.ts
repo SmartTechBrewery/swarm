@@ -6,7 +6,8 @@
  * `credentials.webhookSecret` pair, so storing GitLab's reviewer token overwrote
  * GitHub's in place. It now holds one `{ reviewer?, webhookSecret? }` block **per
  * provider id**, validated against the registered SCM manifests exactly as
- * `credentials.pm` is validated against the PM manifest. Retained credentials for a
+ * `credentials.pm` is validated against the PM ones (per provider itself since issue
+ * #631 — `./pm-credentials.ts`). Retained credentials for a
  * provider the project is not currently running on are *stored but never resolved*:
  * resolution reads only the provider it was asked for, so a missing credential fails
  * with its own error rather than quietly returning another provider's secret.
@@ -44,10 +45,10 @@ export const ScmProviderCredentialReferencesSchema = z
  * `providerId -> { reviewer?, webhookSecret? }`.
  *
  * A plain `z.record` with a `z.string()` key rather than `z.record(ScmProviderIdSchema, …)`,
- * for the same reason `PmCredentialReferencesSchema` is one: the keys are validated
- * against the *registered* manifests by `./schema.ts`, so the shape does not depend on
- * which provider modules a given process happened to import (a dashboard bundle and a
- * focused unit test load none).
+ * for the same reason `PmCredentialReferencesByProviderSchema` (`./pm-credentials.ts`) is
+ * one: the keys are validated against the provider-id value list by `./schema.ts`, so the
+ * shape does not depend on which provider modules a given process happened to import (a
+ * dashboard bundle and a focused unit test load none).
  */
 export const ScmCredentialReferencesByProviderSchema = z
 	.record(z.string().min(1), ScmProviderCredentialReferencesSchema)

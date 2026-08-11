@@ -31,12 +31,19 @@ import { trelloConfigSchema } from '../integrations/pm/trello/config-schema.js';
 // Registry lookup only, like the PM one above — `../integrations/scm/registry.js`
 // imports nothing at runtime.
 import { listSCMProviders } from '../integrations/scm/registry.js';
+// The value list behind `PMType` — `../pm/types.js` imports nothing at runtime either.
+import { PM_TYPES, type PMType } from '../pm/types.js';
 // The Zod mirror of `ScmType`; `../scm/events.js` imports only zod plus a type-only
 // `ScmType`, so this stays a leaf import too.
 import { ScmProviderIdSchema } from '../scm/events.js';
 // The value list behind `ScmType` — `../scm/types.js` imports nothing at runtime.
 import { SCM_TYPES } from '../scm/types.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
+import {
+	adoptLegacyPmCredentials,
+	PmCredentialReferencesByProviderSchema,
+	PmProviderCredentialReferencesSchema,
+} from './pm-credentials.js';
 import {
 	adoptLegacyScmCredentials,
 	ScmCredentialReferencesByProviderSchema,
@@ -116,23 +123,6 @@ export const ScmCredentialReferencesSchema = z.object({
 });
 
 /**
- * The PM provider's credential references, keyed by the roles *that provider*
- * declares on its manifest (`PMProviderManifest.credentialRoles`, issue #497) —
- * references into the same secret store, never the secrets.
- *
- * A record keyed by role rather than a per-provider object schema: the roles are
- * the provider's to declare (Jira needs an email + API token, Linear an API key,
- * Trello a key + token + secret), so this central schema would otherwise have to be
- * rebuilt every time a provider registers. What the record *may* contain is still
- * validated — `ProjectConfigSchema` checks it against the registered manifest for
- * `pm.type`, so an undeclared role or an unconfigured non-optional one fails
- * validation with the declared roles named.
- */
-export const PmCredentialReferencesSchema = z
-	.record(z.string().min(1))
-	.describe("References to the PM provider's credentials, keyed by its declared roles");
-
-/**
  * A project's credential *references*, in three parts:
  *
  * - `scm` — one `{ reviewer?, webhookSecret? }` block **per SCM provider id** (issue
@@ -145,10 +135,18 @@ export const PmCredentialReferencesSchema = z
  *   `scm` on parse. Kept (rather than deleted) so an old `swarm.config.json` still
  *   parses at all: a non-strict object would strip the keys and lose the reference
  *   names before the normalizer could adopt them.
- * - `pm` — the PM provider's own declared roles. Optional and staying so
- *   deliberately: a provider whose roles all resolve from elsewhere needs no entry
- *   (GitHub Projects' webhook secret inherits the repo side's), and every config
- *   written before it existed keeps parsing and resolving exactly as it did.
+ * - `pm` — one `role -> reference` block **per PM provider id** (issue #631),
+ *   validated against the registered PM manifests by
+ *   {@link validatePmCredentialRoles}. Resolution reads only the provider it was
+ *   asked for, so a project may retain a provider it is not currently running on
+ *   without either provider's secret shadowing the other's — the role names
+ *   genuinely collide (`apiToken` is GitHub Projects' *and* Jira's). Optional and
+ *   staying so deliberately: a provider whose roles all resolve from elsewhere needs
+ *   no entry (GitHub Projects' webhook secret inherits the repo side's). A **legacy
+ *   flat** `role -> reference` map is still accepted and nested under `pm.type` by
+ *   `adoptLegacyPmCredentials` (`./pm-credentials.ts`) — a `z.preprocess` rather than
+ *   the SCM side's output transform, because here the legacy and live shapes share
+ *   this one key.
  *
  * Every field being optional means the whole block can legitimately be `{}` — a
  * project mid-provider-switch, or the DB-free worker's inert placeholder
@@ -161,7 +159,7 @@ export const CredentialsSchema = z
 		/** @deprecated Pre-#628 shared webhook-secret reference; adopted into `scm` on parse. */
 		webhookSecret: z.string().min(1).optional(),
 		scm: ScmCredentialReferencesByProviderSchema.optional(),
-		pm: PmCredentialReferencesSchema.optional(),
+		pm: PmCredentialReferencesByProviderSchema.optional(),
 	})
 	.describe('References to a project credentials (never the secrets themselves)');
 
@@ -689,29 +687,41 @@ export const ProjectConfigBaseSchema = z.object({
 });
 
 /**
- * Validate `credentials.pm` against the roles the project's PM provider actually
- * declares (`PMProviderManifest.credentialRoles`, issue #497) — the cross-field
- * check neither schema can make alone, since the roles live on the manifest for
- * `pm.type` and the references live under `credentials`.
+ * Validate `credentials.pm` against the registered PM manifests (issues #497, #631) —
+ * the cross-field check neither schema can make alone, since the roles live on each
+ * provider's manifest and the references live under `credentials`.
  *
- * Two rules, both aimed at the operator who mistyped a role or forgot one:
+ * Three rules, all aimed at the operator who mistyped a key or forgot a role:
  *
- * 1. A reference for a role the provider does not declare is an error naming the
- *    roles it does — silently ignoring it would leave the operator believing they
- *    configured a credential that will never be read.
- * 2. Every non-optional role must be configured. A role that declares
- *    `inheritsSharedCredential` is exempt: it already resolves without an entry.
+ * 1. **Every key must be a known PM provider id** (`PM_TYPES`), so a typo'd key is
+ *    caught rather than silently holding credentials nothing will ever read. Checked
+ *    against the *value list*, not the registry, for the reason
+ *    {@link validateScmCredentialReferences} gives: a config may be parsed by a
+ *    surface that never loaded `src/integrations/entrypoint.js`, and validity must not
+ *    depend on which modules a process imported.
+ * 2. **Every role under a registered provider's block must be one that provider
+ *    declares** — a reference for an undeclared role is an error naming the roles it
+ *    does declare, since silently ignoring it would leave the operator believing they
+ *    configured a credential that will never be read. This half needs the manifest, so
+ *    it is skipped for a provider that is not registered here; `requireProjectPMProvider`
+ *    (`src/integrations/pm/registry.ts`) is the loud check for that.
+ * 3. **Every non-optional role of `project.pm.type` must be configured** — in that
+ *    provider's own block. A role that declares `inheritsSharedCredential` is exempt:
+ *    it already resolves without an entry. `credentials.pm` therefore remains optional
+ *    for a provider whose roles are all optional or inherited, and a provider with a
+ *    non-optional, non-inherited role still requires it even when the whole map is
+ *    absent.
  *
- * `credentials.pm` remains optional for providers whose roles are all optional or
- * inherit a shared credential. A provider with a non-optional, non-inherited role
- * still requires it even when the entire map is absent.
- *
- * Skipped entirely when no manifest is registered for `pm.type` — a config can be
- * parsed by a surface that never loaded `src/integrations/entrypoint.js` (a
- * dashboard bundle, a focused unit test), and validation must not depend on which
- * modules a process happens to import. `requireProjectPMProvider`
- * (`src/integrations/pm/registry.ts`) is the loud check for an unregistered
- * provider.
+ * Rule 3 is where this **deliberately diverges** from the SCM twin, which has no
+ * presence check because `project.scm` is switchable from the dashboard's Source
+ * Control tab and "provider selected, credentials not yet entered" is a state one
+ * click legitimately creates. The PM switch flow works the other way round — the
+ * incoming provider's credentials are entered *before* the `pm` member is written — so
+ * a half-switched config is never something a save produces, and rule 3 is precisely
+ * what makes one unparseable. Only rule 3 is scoped to `pm.type`; the other two apply
+ * to every block, including one retained for a provider the project is not running on.
+ * (`upsertProjectToDb` does not parse, so this is a `validateConfig` / `swarm config
+ * apply` gate rather than an API one.)
  */
 function validatePmCredentialRoles(
 	// Not `ProjectConfig`: that type is inferred *from* this schema, so naming it
@@ -720,18 +730,38 @@ function validatePmCredentialRoles(
 	ctx: z.RefinementCtx,
 ): void {
 	const references = project.credentials.pm ?? {};
+	for (const [providerId, roles] of Object.entries(references)) {
+		validatePmCredentialBlock(providerId, roles, ctx);
+	}
+	validateCurrentPmProviderRoles(project.pm.type, references[project.pm.type] ?? {}, ctx);
+}
 
-	const manifest = getPMProvider(project.pm.type);
+/** Rules 1 and 2 of {@link validatePmCredentialRoles}, for one provider's block. */
+function validatePmCredentialBlock(
+	providerId: string,
+	roles: Record<string, string>,
+	ctx: z.RefinementCtx,
+): void {
+	if (!(PM_TYPES as readonly string[]).includes(providerId)) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['credentials', 'pm', providerId],
+			message:
+				`'${providerId}' is not a PM provider id, so credentials stored under it would ` +
+				`never be read — the provider ids are: ${PM_TYPES.join(', ')}`,
+		});
+		return;
+	}
+
+	const manifest = getPMProvider(providerId);
 	if (!manifest) return;
 
-	const declared = manifest.credentialRoles ?? [];
-	const declaredNames = declared.map((spec) => spec.role);
-
-	for (const role of Object.keys(references)) {
+	const declaredNames: readonly string[] = manifest.credentialRoles.map((spec) => spec.role);
+	for (const role of Object.keys(roles)) {
 		if (declaredNames.includes(role)) continue;
 		ctx.addIssue({
 			code: z.ZodIssueCode.custom,
-			path: ['credentials', 'pm', role],
+			path: ['credentials', 'pm', providerId, role],
 			message:
 				`PM provider '${manifest.id}' declares no credential role '${role}' — ` +
 				(declaredNames.length
@@ -739,17 +769,28 @@ function validatePmCredentialRoles(
 					: 'it declares no credential roles'),
 		});
 	}
+}
 
-	for (const spec of declared) {
+/** Rule 3 of {@link validatePmCredentialRoles} — presence, for `pm.type`'s block alone. */
+function validateCurrentPmProviderRoles(
+	providerId: PMType,
+	configured: Record<string, string>,
+	ctx: z.RefinementCtx,
+): void {
+	const manifest = getPMProvider(providerId);
+	if (!manifest) return;
+
+	for (const spec of manifest.credentialRoles) {
 		if (spec.optional || spec.inheritsSharedCredential) continue;
-		if (references[spec.role]) continue;
+		if (configured[spec.role]) continue;
 		ctx.addIssue({
 			code: z.ZodIssueCode.custom,
-			path: ['credentials', 'pm', spec.role],
+			path: ['credentials', 'pm', providerId, spec.role],
 			message:
 				`PM provider '${manifest.id}' requires the '${spec.role}' credential (${spec.label}): ` +
-				`set credentials.pm.${spec.role} to the secret-store reference holding it ` +
-				`(conventionally '${spec.envVarKey}', which is also the host env var it falls back to)`,
+				`set credentials.pm.${providerId}.${spec.role} to the secret-store reference ` +
+				`holding it (conventionally '${spec.envVarKey}', which is also the host env var it ` +
+				'falls back to)',
 		});
 	}
 }
@@ -827,15 +868,23 @@ function validateScmCredentialReferences(
 }
 
 /**
- * A whole project config: {@link ProjectConfigBaseSchema}'s fields, the legacy
- * SCM-credential adoption, and the two cross-field credential checks. This is what
+ * A whole project config: {@link ProjectConfigBaseSchema}'s fields, the two legacy
+ * credential adoptions, and the two cross-field credential checks. This is what
  * `validateConfig` and every config-parsing call site uses.
  *
- * The `.transform` runs **before** the refinements on purpose: a pre-#628 config's bare
- * `{ reviewer, webhookSecret }` pair is adopted into `credentials.scm` first, so both
- * checks see the shape every later reader sees.
+ * The adoptions run **before** the refinements on purpose, so both checks — and every
+ * later reader — see one shape: a pre-#628 config's bare `{ reviewer, webhookSecret }`
+ * pair is adopted into `credentials.scm`, and a pre-#631 config's flat
+ * `credentials.pm` role map into `credentials.pm[<pm.type>]`.
+ *
+ * The PM one is a `z.preprocess` — before *field* validation, not just before the
+ * refinements — because the legacy and live shapes share the one `credentials.pm` key
+ * (issue #631), unlike the SCM side's sibling keys: a flat map would otherwise be
+ * rejected by `PmCredentialReferencesByProviderSchema` before anything could adopt it.
  */
-export const ProjectConfigSchema = ProjectConfigBaseSchema.transform(adoptLegacyScmCredentials)
+export const ProjectConfigSchema = z
+	.preprocess(adoptLegacyPmCredentials, ProjectConfigBaseSchema)
+	.transform(adoptLegacyScmCredentials)
 	.superRefine(validatePmCredentialRoles)
 	.superRefine(validateScmCredentialReferences);
 
@@ -847,13 +896,21 @@ export type Credentials = z.infer<typeof CredentialsSchema>;
 /** @deprecated Pre-#628 shared pair — see {@link ScmCredentialReferencesSchema}. */
 export type ScmCredentialReferences = z.infer<typeof ScmCredentialReferencesSchema>;
 export type {
+	PmCredentialReferencesByProvider,
+	PmProviderCredentialReferences,
+} from './pm-credentials.js';
+export type {
 	ScmCredentialReferencesByProvider,
 	ScmProviderCredentialReferences,
 } from './scm-credentials.js';
-// Re-exported so `credentials.scm`'s shape is reachable from the one module every
-// config consumer already imports, while the schemas themselves stay in the leaf.
-export { ScmCredentialReferencesByProviderSchema, ScmProviderCredentialReferencesSchema };
-export type PmCredentialReferences = z.infer<typeof PmCredentialReferencesSchema>;
+// Re-exported so both credential maps' shapes are reachable from the one module every
+// config consumer already imports, while the schemas themselves stay in their leaves.
+export {
+	PmCredentialReferencesByProviderSchema,
+	PmProviderCredentialReferencesSchema,
+	ScmCredentialReferencesByProviderSchema,
+	ScmProviderCredentialReferencesSchema,
+};
 export type AgentTarget = z.infer<typeof AgentTargetSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;

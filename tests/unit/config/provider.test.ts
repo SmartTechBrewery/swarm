@@ -40,7 +40,7 @@ const project = createMockProjectConfig({
 		reviewer: 'REV_TOKEN_KEY',
 		webhookSecret: 'WEBHOOK_KEY',
 		// Required by the registered GitHub Projects manifest (issue #537).
-		pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+		pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 	},
 });
 
@@ -169,7 +169,7 @@ describe('config provider', () => {
 					github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
 					gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
 				},
-				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 			},
 		});
 

@@ -323,6 +323,13 @@
       "when": 1786194000000,
       "tag": "0045_scm_credentials_per_provider",
       "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1786453200000,
+      "tag": "0046_pm_credentials_per_provider",
+      "breakpoints": true
     }
   ]
 }

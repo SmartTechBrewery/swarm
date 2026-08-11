@@ -5,6 +5,7 @@ import {
 	PipelineBaseSchema,
 	type PipelineConfig,
 	PipelineConfigSchema,
+	type PmCredentialReferencesByProvider,
 	ProjectConfigBaseSchema,
 	type ProjectPm,
 	type ScmCredentialReferencesByProvider,
@@ -72,24 +73,26 @@ function defaultScmCredentialReferences(scm: ScmType): ScmCredentialReferencesBy
 /**
  * The `credentials.pm` map a new project starts with: one reference per credential
  * role its PM provider *requires and owns*, named by that role's own declared
- * conventional key (issue #537). Nothing is stored yet — the reference is a slot the
- * Project Management tab (or `swarm config apply`) fills — so board operations fail
- * with the actionable "credential not configured" error until it is, which is the
- * point.
+ * conventional key (issue #537), filed under that provider's id (issue #631). Nothing
+ * is stored yet — the reference is a slot the Project Management tab (or `swarm config
+ * apply`) fills — so board operations fail with the actionable "credential not
+ * configured" error until it is, which is the point.
  *
  * Read off the manifest rather than hardcoded, so a project created for a different
  * PM provider seeds *its* roles with no edit here (ai/RULES.md §2). Optional and
  * shared-credential-inheriting roles are skipped: neither needs an entry to resolve.
  * An unregistered provider seeds nothing.
  */
-function defaultPmCredentialReferences(pm: ProjectPm): Record<string, string> | undefined {
+function defaultPmCredentialReferences(
+	pm: ProjectPm,
+): PmCredentialReferencesByProvider | undefined {
 	const roles = getPMProvider(pm.type)?.credentialRoles ?? [];
 	const references = Object.fromEntries(
 		roles
 			.filter((role) => !role.optional && !role.inheritsSharedCredential)
 			.map((role) => [role.role, role.envVarKey]),
 	);
-	return Object.keys(references).length > 0 ? references : undefined;
+	return Object.keys(references).length > 0 ? { [pm.type]: references } : undefined;
 }
 
 // Derived from the base object (`.omit()` needs a bare `z.object`); credentials are

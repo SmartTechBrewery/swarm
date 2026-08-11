@@ -19,6 +19,7 @@ import { requireProjectPMCredentialRole } from '../integrations/pm/registry.js';
 import { getSCMProvider } from '../integrations/scm/registry.js';
 import type { ScmCredentialRole, ScmPersona, ScmType } from '../scm/types.js';
 import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from './operator-token.js';
+import { pmCredentialReferenceFor } from './pm-credentials.js';
 import type { ProjectConfig } from './schema.js';
 import { scmCredentialReferenceFor, sharedScmCredentialProviderFor } from './scm-credentials.js';
 
@@ -108,7 +109,7 @@ export async function findProjectByTrelloBoard(
  * Source Control tab's selector leaves the previous provider's secrets stored — and
  * quietly resolving those would hand a newly selected GitLab the GitHub secret. There
  * is no host-env escape hatch either: SCM references have never had one (only an
- * explicitly configured `credentials.pm` role does).
+ * explicitly configured `credentials.pm` role does — see {@link resolvePmCredential}).
  *
  * The legacy shared `{ reviewer, webhookSecret }` pair is not consulted at runtime.
  * A config that still carries it is migrated on the way in instead —
@@ -206,8 +207,13 @@ export async function getWebhookSecretOrNull(
  *
  * Resolution order, most specific first:
  *
- * 1. the reference the project configured for the role (`credentials.pm[role]`),
- *    through the secret store;
+ * 1. the reference the project configured for the role **under its own provider's
+ *    block** (`credentials.pm[<pm.type>][role]`, issue #631), through the secret store.
+ *    It reads only that block and never another provider's, deliberately not a fallback
+ *    chain: a project may retain credentials for a provider it is not currently running
+ *    on, and since role names collide across providers (`apiToken` is GitHub Projects'
+ *    *and* Jira's) resolving those would hand a newly selected Jira the GitHub Projects
+ *    token;
  * 2. the SCM-side credential the role declares it inherits
  *    (`inheritsSharedCredential`) — also a store reference, so it belongs above the
  *    host env; this is what keeps GitHub Projects' webhook secret *exactly* the
@@ -215,7 +221,7 @@ export async function getWebhookSecretOrNull(
  *    side's **per-provider** secret for the SCM provider the project runs on
  *    (`sharedScmCredentialProviderFor`), rather than a single shared reference;
  * 3. the role's `envVarKey` in this host's environment — only when the project
- *    explicitly configured `credentials.pm[role]`, as the escape hatch for a host
+ *    explicitly configured `credentials.pm[<pm.type>][role]`, as the escape hatch for a host
  *    that exports that opted-in secret directly rather than storing it;
  * 4. `null`.
  *
@@ -236,7 +242,7 @@ export async function resolvePmCredential(
 ): Promise<string | null> {
 	const spec = requireProjectPMCredentialRole(project, role);
 
-	const configured = project.credentials.pm?.[role];
+	const configured = pmCredentialReferenceFor(project, project.pm.type, role);
 	if (configured) {
 		const stored = await resolveProjectCredential(project.id, configured);
 		if (stored) return stored;
@@ -267,13 +273,16 @@ export async function resolvePmCredential(
  * moment the wording changed (issue #537).
  *
  * It carries the role's declared metadata — never the credential — so a caller can
- * name what is missing without re-resolving the manifest.
+ * name what is missing without re-resolving the manifest. `providerId` is part of that
+ * since issue #631: the config path an operator is told to set is per provider
+ * (`credentials.pm.<providerId>.<role>`), so a caller composing its own copy needs it.
  */
 export class MissingPmCredentialError extends Error {
 	readonly name = 'MissingPmCredentialError';
 
 	constructor(
 		readonly projectId: string,
+		readonly providerId: string,
 		readonly role: string,
 		readonly label: string,
 		readonly envVarKey: string,
@@ -300,11 +309,13 @@ export async function requirePmCredential(project: ProjectConfig, role: string):
 		const spec = requireProjectPMCredentialRole(project, role);
 		throw new MissingPmCredentialError(
 			project.id,
+			project.pm.type,
 			role,
 			spec.label,
 			spec.envVarKey,
 			`No PM ${spec.label} (role '${role}') configured for project '${project.id}' ` +
-				`(set credentials.pm.${role} to a stored reference; ${spec.envVarKey} is its conventional config-apply key)`,
+				`(set credentials.pm.${project.pm.type}.${role} to a stored reference; ` +
+				`${spec.envVarKey} is its conventional config-apply key)`,
 		);
 	}
 	return secret;

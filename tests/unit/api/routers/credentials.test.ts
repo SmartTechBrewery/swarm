@@ -92,7 +92,7 @@ describe('credentialsRouter', () => {
 						github: { reviewer: 'SCM_TOKEN_REVIEWER', webhookSecret: 'SCM_WEBHOOK_SECRET' },
 						gitlab: { reviewer: 'GITLAB_TOKEN_REVIEWER' },
 					},
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 		}
@@ -138,7 +138,7 @@ describe('credentialsRouter', () => {
 				credentials: {
 					reviewer: 'GITHUB_TOKEN_REVIEWER',
 					webhookSecret: 'GITHUB_WEBHOOK_SECRET',
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(legacyProject);
@@ -193,7 +193,7 @@ describe('credentialsRouter', () => {
 							github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
 							gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
 						},
-						pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 					},
 				}),
 			);
@@ -408,7 +408,7 @@ describe('credentialsRouter', () => {
 						github: { reviewer: 'SCM_TOKEN_REVIEWER', webhookSecret: 'SCM_WEBHOOK_SECRET' },
 						gitlab: { reviewer: 'GITLAB_TOKEN_REVIEWER' },
 					},
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
@@ -560,7 +560,64 @@ describe('credentialsRouter', () => {
 			expect(upsertProjectToDb).toHaveBeenCalledWith(
 				expect.objectContaining({
 					credentials: expect.objectContaining({
-						pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+					}),
+				}),
+			);
+		});
+
+		// The reason `credentials.pm` is per provider (issue #631): the role names collide
+		// across providers, so a write scoped to the current one is what stops a retained
+		// provider's configuration being destroyed by an identically-named role.
+		it("writes into its own provider's block and leaves another provider's intact", async () => {
+			const twoBoards = createMockProjectConfig({
+				id: 'p1',
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: {
+						'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+					},
+				},
+			});
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+
+			await caller.setPm({ projectId: 'p1', role: 'apiToken', value: 'ghp_rotated' });
+
+			expect(writeProjectCredential).toHaveBeenCalledWith(
+				'p1',
+				'PM_GITHUB_PROJECTS_TOKEN',
+				'ghp_rotated',
+				'GitHub Projects API Token',
+			);
+			// The reference itself was unchanged, so the row is not rewritten — and Jira's
+			// block is therefore untouched by construction.
+			expect(upsertProjectToDb).not.toHaveBeenCalled();
+		});
+
+		it("adds a role to its own provider's block without disturbing another's", async () => {
+			// Assembled rather than parsed: GitHub Projects' `apiToken` is deliberately
+			// absent so the write has something to add, which `ProjectConfigSchema` rejects.
+			const project = {
+				...createMockProjectConfig({ id: 'p1' }),
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: { jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' } },
+				},
+			};
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+
+			await caller.setPm({ projectId: 'p1', role: 'apiToken', value: 'ghp_board_token' });
+
+			expect(upsertProjectToDb).toHaveBeenCalledWith(
+				expect.objectContaining({
+					credentials: expect.objectContaining({
+						pm: {
+							'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+							jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+						},
 					}),
 				}),
 			);
@@ -572,7 +629,7 @@ describe('credentialsRouter', () => {
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
 					webhookSecret: 'SCM_WEBHOOK_SECRET',
-					pm: { apiToken: 'CUSTOM_BOARD_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'CUSTOM_BOARD_TOKEN' } },
 				},
 			});
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
@@ -636,8 +693,35 @@ describe('credentialsRouter', () => {
 			await caller.deletePm({ projectId: 'p1', role: 'apiToken' });
 
 			expect(deleteProjectCredential).toHaveBeenCalledWith('p1', 'PM_GITHUB_PROJECTS_TOKEN');
+			// The emptied provider block is pruned rather than persisted as `{}` (issue #631).
 			expect(upsertProjectToDb).toHaveBeenCalledWith(
 				expect.objectContaining({ credentials: expect.objectContaining({ pm: {} }) }),
+			);
+		});
+
+		it("removes only that role and keeps another provider's block", async () => {
+			const twoBoards = createMockProjectConfig({
+				id: 'p1',
+				credentials: {
+					reviewer: 'SCM_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_WEBHOOK_SECRET',
+					pm: {
+						'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+					},
+				},
+			});
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+
+			await caller.deletePm({ projectId: 'p1', role: 'apiToken' });
+
+			expect(deleteProjectCredential).toHaveBeenCalledWith('p1', 'PM_GITHUB_PROJECTS_TOKEN');
+			expect(upsertProjectToDb).toHaveBeenCalledWith(
+				expect.objectContaining({
+					credentials: expect.objectContaining({
+						pm: { jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' } },
+					}),
+				}),
 			);
 		});
 

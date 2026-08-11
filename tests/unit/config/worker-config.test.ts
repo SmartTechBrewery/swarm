@@ -27,7 +27,7 @@ describe('toWorkerConfig', () => {
 					github: { reviewer: 'GH_REVIEWER_REF', webhookSecret: 'GH_WEBHOOK_REF' },
 					gitlab: { reviewer: 'GL_REVIEWER_REF', webhookSecret: 'GL_WEBHOOK_REF' },
 				},
-				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 			},
 		});
 		const serialized = JSON.stringify(toWorkerConfig(project));
