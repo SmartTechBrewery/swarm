@@ -3,7 +3,11 @@ import {
 	resolveActiveSettingsTab,
 	settingsSearchSchema,
 	settingsTabSearch,
+	visibleSettingsTabs,
 } from './settings-nav.js';
+
+const ADMIN = { instanceAdmin: true };
+const NON_ADMIN = { instanceAdmin: false };
 
 describe('settingsSearchSchema', () => {
 	it('yields no tab for a bare settings link', () => {
@@ -23,13 +27,41 @@ describe('settingsSearchSchema', () => {
 	});
 });
 
+describe('visibleSettingsTabs', () => {
+	it('gives an instance administrator every tab', () => {
+		expect(visibleSettingsTabs(ADMIN)).toEqual(['agents', 'appearance']);
+	});
+
+	it('hides Agent Defaults from a non-administrator', () => {
+		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['appearance']);
+	});
+
+	it('treats an unresolved viewer as a non-administrator', () => {
+		expect(visibleSettingsTabs(undefined)).toEqual(['appearance']);
+	});
+});
+
 describe('resolveActiveSettingsTab', () => {
-	it('defaults to the Agent Defaults tab for an empty search', () => {
-		expect(resolveActiveSettingsTab({})).toBe('agents');
+	it('defaults to the Agent Defaults tab for an administrator on an empty search', () => {
+		expect(resolveActiveSettingsTab({}, ADMIN)).toBe('agents');
 	});
 
 	it('honors an explicit tab', () => {
-		expect(resolveActiveSettingsTab({ tab: 'appearance' })).toBe('appearance');
+		expect(resolveActiveSettingsTab({ tab: 'appearance' }, ADMIN)).toBe('appearance');
+		expect(resolveActiveSettingsTab({ tab: 'agents' }, ADMIN)).toBe('agents');
+	});
+
+	it('lands a non-administrator on Appearance rather than Agent Defaults', () => {
+		expect(resolveActiveSettingsTab({}, NON_ADMIN)).toBe('appearance');
+	});
+
+	it('degrades a direct ?tab=agents link for a non-administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'agents' }, NON_ADMIN)).toBe('appearance');
+	});
+
+	it('treats an unresolved viewer as a non-administrator, so the section never flashes', () => {
+		expect(resolveActiveSettingsTab({ tab: 'agents' })).toBe('appearance');
+		expect(resolveActiveSettingsTab({})).toBe('appearance');
 	});
 });
 
