@@ -8,6 +8,7 @@ import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	type DashboardProjectScope,
+	type DashboardWorkerView,
 	enrollWorker,
 	getDashboardWorkerDetail,
 	getEnrollment,
@@ -20,7 +21,12 @@ import {
 } from '../../identity/worker-enrollment-service.js';
 import { getWorker, renameWorker, type Worker } from '../../identity/worker-service.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
-import { accessibleProjectScope, assertProjectAccess, mayAccessProject } from '../authz.js';
+import {
+	accessibleProjectScope,
+	assertInstanceAdmin,
+	assertProjectAccess,
+	mayAccessProject,
+} from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
 /**
@@ -29,15 +35,18 @@ import { authedProcedure, router } from '../trpc.js';
  * by the identity/authorization layers ADR-001 establishes:
  *
  * - **Installation roster** (`list`, #133): the read-only cross-project
- *   connectivity view the dashboard's Workers screen renders, bounded by
- *   `accessibleProjectScope` — an `instanceAdmin` sees every registered worker,
- *   anyone else only workers enrolled in projects they may access. Given a
- *   `projectId` (#574) the same query serves **one project's** roster instead —
- *   the project detail page's Workers tab — under the project roster's own access
- *   rule rather than the cross-project scope. `getById` (#477) returns that same
- *   row for one worker, widened with per-project enrollment detail and with what
- *   the *viewer* may change, so the detail screen offers only controls that would
- *   succeed.
+ *   connectivity view the dashboard's global Workers screen renders — every
+ *   registered worker, including un-enrolled machines — which is an operator's
+ *   view of the installation and so is reserved to an `instanceAdmin`
+ *   (`assertInstanceAdmin`, issue #647). Given a `projectId` (#574) the same query
+ *   serves **one project's** roster instead — the project detail page's Workers
+ *   tab, the view an enrolled worker owner keeps — under the project roster's own
+ *   access rule. Either way the caller's own machines are listed first (#657),
+ *   which is ordering alone and no change to what is visible. `getById` (#477)
+ *   returns that same row for one worker, widened with per-project enrollment
+ *   detail and with what the *viewer* may change, so the detail screen offers only
+ *   controls that would succeed; it stays bounded by `accessibleProjectScope`,
+ *   because a worker owner reaches it from their project's roster.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
  *   (`enroll`), renames a machine (`rename`), and controls the revocable
@@ -133,15 +142,41 @@ async function resolveOwnedEnrollment(user: SwarmUser, enrollmentId: string) {
  * and a non-member gets `NOT_FOUND`, and scopes the read to that project alone:
  * an enrollment elsewhere, an in-flight run outside it, and the un-enrolled
  * machines an `instanceAdmin` otherwise sees all stay out. Without one it is the
- * installation-wide roster, bounded by `accessibleProjectScope` as before.
+ * installation-wide roster, which only an `instanceAdmin` may read (issue #647) —
+ * so the unrestricted `null` scope below is never handed to a worker owner.
  */
 async function resolveRosterScope(
 	user: SwarmUser,
 	projectId: string | undefined,
 ): Promise<DashboardProjectScope> {
-	if (!projectId) return await accessibleProjectScope(user);
-	await assertProjectAccess(user, projectId, 'contributor');
-	return [projectId];
+	if (projectId) {
+		await assertProjectAccess(user, projectId, 'contributor');
+		return [projectId];
+	}
+	assertInstanceAdmin(user, 'workers');
+	return null;
+}
+
+/**
+ * The viewer's own machines first (issue #657) — presentation order only. It
+ * reorders the rows `listDashboardWorkers` already decided are visible and
+ * changes nothing about visibility, project scoping, ownership, or
+ * authorization; both worker lists the dashboard renders (the global `/workers`
+ * screen and a project's Workers tab) read this one procedure, so ordering here
+ * covers both.
+ *
+ * The sort is **stable** (per spec), so the read model's own oldest-first order
+ * is preserved within each group and a viewer who owns no visible worker sees it
+ * unchanged. A row whose owner user row no longer resolves (`owner === null`)
+ * groups with the others, which is correct: the signed-in viewer's own user row
+ * resolved to produce `ctx.user`, so a missing one is never theirs.
+ */
+function viewerWorkersFirst(
+	workers: DashboardWorkerView[],
+	viewerUserId: string,
+): DashboardWorkerView[] {
+	const isViewers = (worker: DashboardWorkerView) => worker.owner?.userId === viewerUserId;
+	return [...workers].sort((a, b) => Number(isViewers(b)) - Number(isViewers(a)));
 }
 
 const AllowedClisInput = z.array(AgentCliSchema).min(1);
@@ -161,16 +196,19 @@ export const workersRouter = router({
 
 	// Every worker the caller may see, with connectivity, last-seen, capabilities,
 	// in-flight run, and enrollment states — the dashboard's Workers screen (#133).
-	// Scoping is delegated wholesale to `resolveRosterScope`: unscoped, an
-	// `instanceAdmin` passes `null` (every worker, including un-enrolled machines)
-	// and anyone else exactly their membership project ids; with a `projectId`
-	// (#574) it is that one project, authorized like `roster`. Read-only — no
-	// mutation, no path/credential/token, and no routing or approval affordance.
+	// Scoping is delegated wholesale to `resolveRosterScope`: unscoped it is the
+	// installation-wide roster (`null` — every worker, including un-enrolled
+	// machines), which an `instanceAdmin` alone may read (issue #647); with a
+	// `projectId` (#574) it is that one project, authorized like `roster`.
+	// Read-only — no mutation, no path/credential/token, and no routing or
+	// approval affordance. The caller's own machines are ordered first (#657,
+	// `viewerWorkersFirst`) — a presentation-order concern, applied after scoping
+	// decided what is visible.
 	list: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }).optional())
 		.query(async ({ ctx, input }) => {
 			const scope = await resolveRosterScope(ctx.user, input?.projectId);
-			const workers = await listDashboardWorkers(scope);
+			const workers = viewerWorkersFirst(await listDashboardWorkers(scope), ctx.user.id);
 			// The service already assembled a secret-free view; the only wire-shape
 			// concern here is giving the browser an explicit ISO timestamp.
 			return workers.map((worker) => ({
@@ -182,9 +220,12 @@ export const workersRouter = router({
 	// One worker in detail (#477) — the same row `list` returns, widened with the
 	// full enrollment detail per visible project and with the two capability flags
 	// the detail screen needs to decide which controls to offer. Visibility is the
-	// same `accessibleProjectScope` rule as `list`, and an invisible worker is
-	// `NOT_FOUND` exactly like a missing one, so existence never leaks. Read-only:
-	// the flags *report* the authorization each mutation re-checks for itself.
+	// caller's `accessibleProjectScope` — deliberately *not* the installation-admin
+	// rule the unscoped `list` now applies (issue #647), because a worker owner
+	// reaches this row by clicking through their own project's roster — and an
+	// invisible worker is `NOT_FOUND` exactly like a missing one, so existence never
+	// leaks. Read-only: the flags *report* the authorization each mutation
+	// re-checks for itself.
 	getById: authedProcedure
 		.input(z.object({ workerId: z.string().uuid() }))
 		.query(async ({ ctx, input }) => {

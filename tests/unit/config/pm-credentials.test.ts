@@ -11,6 +11,11 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 }));
 
 import {
+	adoptLegacyPmCredentials,
+	listPmCredentialReferences,
+	pmCredentialReferenceFor,
+} from '@/config/pm-credentials.js';
+import {
 	MissingPmCredentialError,
 	requirePmCredential,
 	resolvePmCredential,
@@ -45,8 +50,17 @@ function registerRoles(credentialRoles: readonly PmCredentialRoleSpec[]): void {
 // roles, then pass raw inputs to the schema under test.
 const baselineProject = createMockProjectConfig();
 
-/** A project config input with the given PM credential references. */
+/**
+ * A project config input with the given `github-projects` PM credential references —
+ * the block for the provider `baselineProject` runs on, since issue #631 keyed the map
+ * by provider id.
+ */
 function configWithPmReferences(pm: Record<string, string> | undefined): unknown {
+	return configWithPmBlocks(pm ? { 'github-projects': pm } : undefined);
+}
+
+/** A project config input with whole `credentials.pm` map — one block per provider. */
+function configWithPmBlocks(pm: unknown): unknown {
 	return {
 		...baselineProject,
 		credentials: {
@@ -76,9 +90,10 @@ afterEach(() => {
 });
 
 beforeEach(() => {
-	// This project conventionally exports the shared webhook variable. Negative
-	// cases must be independent of whether the runner inherited that environment.
-	vi.stubEnv('SCM_WEBHOOK_SECRET', '');
+	// This project conventionally exports the webhook variable the github-projects role
+	// declares (`GITHUB_WEBHOOK_SECRET` since issue #628 made the SCM references per
+	// provider). Negative cases must be independent of whether the runner inherited it.
+	vi.stubEnv('GITHUB_WEBHOOK_SECRET', '');
 });
 
 describe('credentials.pm validation against the declared roles', () => {
@@ -102,7 +117,7 @@ describe('credentials.pm validation against the declared roles', () => {
 	it("requires GitHub Projects' own apiToken role", () => {
 		const errors = parseErrors(configWithPmReferences({}));
 		expect(errors).toContain("requires the 'apiToken' credential (GitHub Projects API Token)");
-		expect(errors).toContain('credentials.pm.apiToken');
+		expect(errors).toContain('credentials.pm.github-projects.apiToken');
 		expect(errors).toContain('PM_GITHUB_PROJECTS_TOKEN');
 	});
 
@@ -120,7 +135,7 @@ describe('credentials.pm validation against the declared roles', () => {
 		]);
 		const errors = parseErrors(configWithPmReferences({ email: 'JIRA_EMAIL' }));
 		expect(errors).toContain("requires the 'apiToken' credential (API Token)");
-		expect(errors).toContain('credentials.pm.apiToken');
+		expect(errors).toContain('credentials.pm.github-projects.apiToken');
 		expect(errors).toContain('JIRA_API_TOKEN');
 	});
 
@@ -128,7 +143,7 @@ describe('credentials.pm validation against the declared roles', () => {
 		registerRoles([{ role: 'apiToken', label: 'API Token', envVarKey: 'JIRA_API_TOKEN' }]);
 		const errors = parseErrors(configWithPmReferences(undefined));
 		expect(errors).toContain("requires the 'apiToken' credential (API Token)");
-		expect(errors).toContain('credentials.pm.apiToken');
+		expect(errors).toContain('credentials.pm.github-projects.apiToken');
 	});
 
 	it('does not require an optional role', () => {
@@ -168,7 +183,7 @@ describe('credentials.pm validation against the declared roles', () => {
 	// board is a separate system from the repo (issue #530). The check runs against
 	// the *registered* manifest, which is why this suite imports the entrypoint.
 	describe('a pm.type linear project', () => {
-		/** The Linear fixture with its `credentials.pm` block replaced. */
+		/** The Linear fixture with its own provider's `credentials.pm` block replaced. */
 		function linearConfigWithPmReferences(pm: Record<string, string> | undefined): unknown {
 			const linearProject = createMockLinearProjectConfig();
 			return {
@@ -176,7 +191,7 @@ describe('credentials.pm validation against the declared roles', () => {
 				credentials: {
 					reviewer: linearProject.credentials.reviewer,
 					webhookSecret: linearProject.credentials.webhookSecret,
-					...(pm ? { pm } : {}),
+					...(pm ? { pm: { linear: pm } } : {}),
 				},
 			};
 		}
@@ -197,7 +212,7 @@ describe('credentials.pm validation against the declared roles', () => {
 				linearConfigWithPmReferences({ webhookSecret: 'LINEAR_WEBHOOK_SECRET' }),
 			);
 			expect(errors).toContain("requires the 'apiKey' credential (API Key)");
-			expect(errors).toContain('credentials.pm.apiKey');
+			expect(errors).toContain('credentials.pm.linear.apiKey');
 			expect(errors).toContain('LINEAR_API_KEY');
 		});
 
@@ -206,7 +221,7 @@ describe('credentials.pm validation against the declared roles', () => {
 		it('requires the webhookSecret role too, since it inherits nothing', () => {
 			const errors = parseErrors(linearConfigWithPmReferences({ apiKey: 'LINEAR_API_KEY' }));
 			expect(errors).toContain("requires the 'webhookSecret' credential (Webhook Secret)");
-			expect(errors).toContain('credentials.pm.webhookSecret');
+			expect(errors).toContain('credentials.pm.linear.webhookSecret');
 			expect(errors).toContain('LINEAR_WEBHOOK_SECRET');
 		});
 
@@ -222,6 +237,171 @@ describe('credentials.pm validation against the declared roles', () => {
 			expect(errors).toContain('its roles are: apiKey, webhookSecret');
 		});
 	});
+
+	// Issue #631: the map is keyed by provider id, so the keys themselves are validated —
+	// against the `PM_TYPES` value list rather than the registry, so a config parsed by a
+	// surface that loaded no provider module is judged the same way.
+	describe('the provider-id keys', () => {
+		it('rejects a key that is not a PM provider id, naming the ids', () => {
+			const errors = parseErrors(
+				configWithPmBlocks({
+					'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					jiar: { apiToken: 'TYPO_KEY' },
+				}),
+			);
+			expect(errors).toContain("'jiar' is not a PM provider id");
+			expect(errors).toContain('github-projects, jira, linear, trello');
+		});
+
+		// The state the switch flow depends on: a project keeps the block of a provider it
+		// is not running on, and only the *current* provider's roles have to be complete.
+		it('accepts a retained block for a provider the project is not running on', () => {
+			expect(
+				ProjectConfigSchema.safeParse(
+					configWithPmBlocks({
+						'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						// Deliberately incomplete for Jira (no `webhookSecret`): rule 3 is scoped to
+						// `pm.type`, so a retained block need not satisfy its provider's presence rule.
+						jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+					}),
+				).success,
+			).toBe(true);
+		});
+
+		// Structure is still checked for every block, current or retained, so a typo in a
+		// retained provider's role is caught rather than surfacing on the switch.
+		it('rejects a role a retained provider does not declare', () => {
+			const errors = parseErrors(
+				configWithPmBlocks({
+					'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					linear: { apiKey: 'LINEAR_API_KEY', apiToken: 'WRONG_ROLE' },
+				}),
+			);
+			expect(errors).toContain("declares no credential role 'apiToken'");
+			expect(errors).toContain('its roles are: apiKey, webhookSecret');
+		});
+	});
+});
+
+// Issue #631: a config written before the map was keyed by provider is nested under
+// `pm.type` on parse, so nothing has to be re-entered by hand. This is a `z.preprocess`
+// rather than the SCM side's output transform, because the legacy and live shapes share
+// the one `credentials.pm` key.
+describe('the legacy flat credentials.pm adoption', () => {
+	/** The parsed project for a raw config input, which must parse. */
+	function parsed(input: unknown): ProjectConfig {
+		const result = ProjectConfigSchema.safeParse(input);
+		expect(result.success).toBe(true);
+		if (!result.success) throw result.error;
+		return result.data;
+	}
+
+	it("nests a flat role map under the project's own provider", () => {
+		const project = parsed(configWithPmBlocks({ apiToken: 'PM_GITHUB_PROJECTS_TOKEN' }));
+
+		expect(project.credentials.pm).toEqual({
+			'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+		});
+	});
+
+	it('nests it under a non-default provider just the same', () => {
+		const linearProject = createMockLinearProjectConfig();
+		const project = parsed({
+			...linearProject,
+			credentials: {
+				pm: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
+			},
+		});
+
+		expect(project.credentials.pm).toEqual({
+			linear: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
+		});
+	});
+
+	// Detected by value type rather than a version marker, which is also what makes the
+	// adoption idempotent: a per-provider map has no string values, so it is left alone.
+	it('leaves an already-nested map untouched', () => {
+		const nested = {
+			'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+			jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+		};
+		const project = parsed(configWithPmBlocks(nested));
+
+		expect(project.credentials.pm).toEqual(nested);
+	});
+
+	// Not a state SWARM produces, but pinned because the SQL backfill reads a mixed map
+	// the same way and the two adoption paths must not disagree.
+	it('moves only the flat entries of a map holding both shapes', () => {
+		const project = parsed(
+			configWithPmBlocks({
+				apiToken: 'PM_GITHUB_PROJECTS_TOKEN',
+				jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+			}),
+		);
+
+		expect(project.credentials.pm).toEqual({
+			'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+		});
+	});
+
+	// The pass-through rules, asserted on the normalizer directly: each of these inputs
+	// is one the schema behind the preprocess must be left to report on (or accept) itself,
+	// so none can be exercised through a successful parse.
+	describe('leaves alone what it cannot or must not adopt', () => {
+		it.each([
+			['a non-object', 'not a project'],
+			['a project with no credentials', { pm: { type: 'github-projects' } }],
+			['a project with no credentials.pm', { pm: { type: 'jira' }, credentials: {} }],
+			['an empty map', { pm: { type: 'jira' }, credentials: { pm: {} } }],
+			// Never defaulted to a provider: `pm` is required, so the base schema reports it.
+			['a flat map with no pm.type to attribute it to', { credentials: { pm: { apiKey: 'K' } } }],
+		])('%s', (_name, input) => {
+			expect(adoptLegacyPmCredentials(input)).toBe(input);
+		});
+	});
+
+	// The reference *name* is the store key the secret is already filed under, so
+	// rewriting it to the manifest's conventional `envVarKey` would break resolution.
+	it('copies the reference name verbatim rather than rewriting it to the conventional key', () => {
+		const project = parsed(configWithPmBlocks({ apiToken: 'MY_BOARD_TOKEN' }));
+
+		expect(project.credentials.pm?.['github-projects']?.apiToken).toBe('MY_BOARD_TOKEN');
+	});
+});
+
+// The pure lookups the resolver and the API layer share — no registry, no DB.
+describe('the pure reference lookups', () => {
+	const twoBoards = {
+		credentials: {
+			pm: {
+				'github-projects': { apiToken: 'PM_TOKEN_KEY' },
+				jira: { email: 'JIRA_EMAIL_KEY', apiToken: 'PM_TOKEN_KEY' },
+			},
+		},
+	};
+
+	it('reads the reference for the provider it was asked for', () => {
+		expect(pmCredentialReferenceFor(twoBoards, 'github-projects', 'apiToken')).toBe('PM_TOKEN_KEY');
+		expect(pmCredentialReferenceFor(twoBoards, 'jira', 'email')).toBe('JIRA_EMAIL_KEY');
+	});
+
+	it('returns undefined for an unconfigured provider or role rather than another block’s', () => {
+		expect(pmCredentialReferenceFor(twoBoards, 'linear', 'apiKey')).toBeUndefined();
+		expect(pmCredentialReferenceFor(twoBoards, 'github-projects', 'email')).toBeUndefined();
+		expect(pmCredentialReferenceFor({ credentials: {} }, 'jira', 'apiToken')).toBeUndefined();
+	});
+
+	// `swarm config apply` reads every block, so a retained provider's secrets are applied
+	// too. Deduping is the caller's, which is why the repeated key is listed twice.
+	it('lists every reference across all providers, undeduped', () => {
+		expect(listPmCredentialReferences(twoBoards).sort()).toEqual([
+			'JIRA_EMAIL_KEY',
+			'PM_TOKEN_KEY',
+			'PM_TOKEN_KEY',
+		]);
+		expect(listPmCredentialReferences({ credentials: {} })).toEqual([]);
+	});
 });
 
 describe('resolvePmCredential', () => {
@@ -233,7 +413,7 @@ describe('resolvePmCredential', () => {
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SHARED_WEBHOOK_KEY',
-			pm: { apiToken: 'PM_TOKEN_KEY', webhookSecret: 'PM_WEBHOOK_KEY' },
+			pm: { 'github-projects': { apiToken: 'PM_TOKEN_KEY', webhookSecret: 'PM_WEBHOOK_KEY' } },
 		},
 	});
 
@@ -246,7 +426,7 @@ describe('resolvePmCredential', () => {
 		credentials: {
 			reviewer: 'SCM_TOKEN_REVIEWER',
 			webhookSecret: 'SHARED_WEBHOOK_KEY',
-			pm: { apiToken: 'PM_TOKEN_KEY' },
+			pm: { 'github-projects': { apiToken: 'PM_TOKEN_KEY' } },
 		},
 	});
 
@@ -255,18 +435,60 @@ describe('resolvePmCredential', () => {
 	});
 
 	it("prefers the project's own reference for the role over the host env", async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue('from-store');
 
 		expect(await resolvePmCredential(project, 'webhookSecret')).toBe('from-store');
 		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'PM_WEBHOOK_KEY');
 	});
 
+	// The regression this phase exists to prevent (issue #631): `apiToken` is *both*
+	// GitHub Projects' and Jira's role name, so a project retaining Jira's block must
+	// resolve only the block for the provider it is running on. Deliberately not a
+	// fallback chain — a retained block is stored and never read.
+	it("reads only its own provider's block, never another provider's identical role", async () => {
+		const twoBoards = createMockProjectConfig({
+			id: 'proj-1',
+			credentials: {
+				reviewer: 'SCM_TOKEN_REVIEWER',
+				webhookSecret: 'SHARED_WEBHOOK_KEY',
+				pm: {
+					'github-projects': { apiToken: 'PM_TOKEN_KEY' },
+					jira: { email: 'JIRA_EMAIL_KEY', apiToken: 'JIRA_TOKEN_KEY' },
+				},
+			},
+		});
+		vi.mocked(resolveProjectCredential).mockImplementation(async (_id, key) => `secret:${key}`);
+
+		expect(await resolvePmCredential(twoBoards, 'apiToken')).toBe('secret:PM_TOKEN_KEY');
+		expect(resolveProjectCredential).not.toHaveBeenCalledWith('proj-1', 'JIRA_TOKEN_KEY');
+	});
+
+	// The other direction: a project on a provider whose block is absent fails closed
+	// rather than reaching into the retained one that happens to declare the same role.
+	it('resolves null for a role its own provider has no block for', async () => {
+		const jiraBoardOnly = {
+			...createMockProjectConfig({ id: 'proj-1' }),
+			// Assembled, not parsed: `ProjectConfigSchema` rejects a config whose current
+			// provider is missing a required role, which is exactly the state under test.
+			credentials: {
+				webhookSecret: 'SHARED_WEBHOOK_KEY',
+				pm: { jira: { apiToken: 'JIRA_TOKEN_KEY' } },
+			},
+		};
+		vi.mocked(resolveProjectCredential).mockImplementation(async (_id, key) => `secret:${key}`);
+
+		expect(await resolvePmCredential(jiraBoardOnly, 'apiToken')).toBeNull();
+		expect(resolveProjectCredential).not.toHaveBeenCalledWith('proj-1', 'JIRA_TOKEN_KEY');
+	});
+
 	// The reach that keeps GitHub Projects' effective credentials unchanged: with no
-	// `credentials.pm`, the role resolves the project's existing shared reference —
-	// exactly what `getWebhookSecretOrNull` resolves for the repo side.
-	it('falls back to the shared reference the role declares it inherits', async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
+	// `credentials.pm`, the role resolves the repo side's own webhook-secret reference —
+	// exactly what `getWebhookSecretOrNull` resolves. Since issue #628 that is the
+	// *per-provider* reference for the SCM provider the project runs on; this fixture
+	// states none, so it is GitHub's, which is where the legacy pair was adopted.
+	it('falls back to the SCM reference the role declares it inherits', async () => {
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue('shared-secret');
 
 		expect(await resolvePmCredential(projectWithoutPmReferences, 'webhookSecret')).toBe(
@@ -275,8 +497,46 @@ describe('resolvePmCredential', () => {
 		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'SHARED_WEBHOOK_KEY');
 	});
 
+	// Issue #628: the inherited secret is the repo side's for the provider the project
+	// *runs on*, so a board paired with a GitLab repo resolves GitLab's webhook secret and
+	// never GitHub's — which for GitLab is the token it echoes in `X-Gitlab-Token`.
+	it("inherits the per-provider secret for the project's own SCM provider", async () => {
+		const gitlabRepoProject = createMockProjectConfig({
+			id: 'proj-1',
+			scm: 'gitlab',
+			credentials: {
+				scm: {
+					github: { webhookSecret: 'GH_HOOK_KEY' },
+					gitlab: { webhookSecret: 'GL_HOOK_KEY' },
+				},
+				pm: { 'github-projects': { apiToken: 'PM_TOKEN_KEY' } },
+			},
+		});
+		vi.mocked(resolveProjectCredential).mockResolvedValue('gitlab-secret');
+
+		expect(await resolvePmCredential(gitlabRepoProject, 'webhookSecret')).toBe('gitlab-secret');
+		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'GL_HOOK_KEY');
+		expect(resolveProjectCredential).not.toHaveBeenCalledWith('proj-1', 'GH_HOOK_KEY');
+	});
+
+	// Fails closed rather than reaching for another provider's secret.
+	it('resolves null when the project stores no secret for its own SCM provider', async () => {
+		const unconfigured = createMockProjectConfig({
+			id: 'proj-1',
+			scm: 'bitbucket',
+			credentials: {
+				scm: { github: { webhookSecret: 'GH_HOOK_KEY' } },
+				pm: { 'github-projects': { apiToken: 'PM_TOKEN_KEY' } },
+			},
+		});
+		vi.mocked(resolveProjectCredential).mockResolvedValue('github-secret');
+
+		expect(await resolvePmCredential(unconfigured, 'webhookSecret')).toBeNull();
+		expect(resolveProjectCredential).not.toHaveBeenCalledWith('proj-1', 'GH_HOOK_KEY');
+	});
+
 	it("falls back to the role's env var when an explicitly configured role resolves nowhere", async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 
 		expect(await resolvePmCredential(project, 'webhookSecret')).toBe('from-env');
@@ -286,7 +546,7 @@ describe('resolvePmCredential', () => {
 	});
 
 	it('fails closed for an inherited role with no PM reference even when its env var is set', async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'ambient-secret');
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'ambient-secret');
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 
 		expect(await resolvePmCredential(projectWithoutPmReferences, 'webhookSecret')).toBeNull();
@@ -331,7 +591,7 @@ describe('requirePmCredential', () => {
 	it('throws naming the role and both ways to supply it', async () => {
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 		await expect(requirePmCredential(project, 'webhookSecret')).rejects.toThrow(
-			/credentials\.pm\.webhookSecret.*SCM_WEBHOOK_SECRET/s,
+			/credentials\.pm\.github-projects\.webhookSecret.*GITHUB_WEBHOOK_SECRET/s,
 		);
 	});
 
@@ -345,6 +605,9 @@ describe('requirePmCredential', () => {
 		expect(error).toBeInstanceOf(MissingPmCredentialError);
 		expect(error).toMatchObject({
 			projectId: 'proj-1',
+			// Carried since issue #631, because the path an operator is told to set is per
+			// provider and `src/api/routers/pm.ts` composes its own copy from these fields.
+			providerId: 'github-projects',
 			role: 'apiToken',
 			label: 'GitHub Projects API Token',
 			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
 	agentConfigSearch,
+	isProjectAdminTab,
+	PROJECT_ADMIN_TABS,
 	PROJECT_TABS,
 	phaseDetailSearch,
 	projectDetailSearchSchema,
 	resolveActiveTab,
 	tabSearch,
+	viewerAdministersProject,
 } from './project-nav.js';
 
 describe('PROJECT_TABS', () => {
@@ -21,6 +24,50 @@ describe('PROJECT_TABS', () => {
 			'projectManagement',
 			'credentials',
 		]);
+	});
+});
+
+describe('PROJECT_ADMIN_TABS (issue #655)', () => {
+	it('covers every configuration and credential tab', () => {
+		expect([...PROJECT_ADMIN_TABS]).toEqual([
+			'general',
+			'agents',
+			'pipeline',
+			'projectManagement',
+			'credentials',
+		]);
+		for (const tab of PROJECT_ADMIN_TABS) {
+			expect(isProjectAdminTab(tab)).toBe(true);
+		}
+	});
+
+	it('leaves the operational tabs to every enrolled member', () => {
+		// Runs and Workers are what a non-administrator opens the project for; only the
+		// configuration half is the administrator's.
+		expect(isProjectAdminTab('runs')).toBe(false);
+		expect(isProjectAdminTab('workers')).toBe(false);
+	});
+
+	it('classifies every tab as one or the other, so a new tab cannot be missed', () => {
+		const operational = PROJECT_TABS.filter((tab) => !isProjectAdminTab(tab));
+		expect(operational).toEqual(['runs', 'workers']);
+		expect(operational.length + PROJECT_ADMIN_TABS.length).toBe(PROJECT_TABS.length);
+	});
+});
+
+describe('viewerAdministersProject (issue #655)', () => {
+	it('admits a viewer the server reports as a project administrator', () => {
+		expect(viewerAdministersProject({ canAdminister: true })).toBe(true);
+	});
+
+	it('denies an enrolled non-administrator', () => {
+		expect(viewerAdministersProject({ canAdminister: false })).toBe(false);
+	});
+
+	it('fails closed while the access read is absent', () => {
+		// Loading or failed: an unknown role must not open a configuration tab.
+		expect(viewerAdministersProject(undefined)).toBe(false);
+		expect(viewerAdministersProject(null)).toBe(false);
 	});
 });
 

@@ -1,16 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute, useNavigate } from '@tanstack/react-router';
-import { Cpu, Monitor, Moon, Palette, Sun } from 'lucide-react';
+import { Cpu, type LucideIcon, Monitor, Moon, Palette, Sun } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { useTheme } from '@/components/theme/theme-provider.js';
 import {
 	resolveActiveSettingsTab,
+	type SettingsTab,
 	settingsSearchSchema,
 	settingsTabSearch,
+	visibleSettingsTabs,
 } from '@/lib/settings-nav.js';
 import type { AppearanceTheme } from '@/lib/theme.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
+import { useCurrentUser } from '@/lib/use-current-user.js';
 import type { AppSettings } from '../../../../src/config/app-settings.js';
 import type { AgentDefaults } from '../../../../src/config/schema.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
@@ -272,12 +275,66 @@ export function AppearancePanel() {
 	);
 }
 
+/**
+ * The General Settings tabs in display order, each with the icon and label it
+ * renders. Ordered to match `SETTINGS_TABS` (`lib/settings-nav.ts`), which is the
+ * URL vocabulary — a test asserts the two agree, so the rendered order and the
+ * `?tab=` values can't drift apart. Mirrors `PROJECT_TAB_ITEMS` in
+ * `routes/projects/$projectId.tsx`.
+ */
+const SETTINGS_TAB_ITEMS: ReadonlyArray<{ tab: SettingsTab; label: string; icon: LucideIcon }> = [
+	{ tab: 'agents', label: 'Agent Defaults', icon: Cpu },
+	{ tab: 'appearance', label: 'Appearance', icon: Palette },
+];
+
+/**
+ * The horizontal tab bar, rendered from {@link SETTINGS_TAB_ITEMS} narrowed to the
+ * tabs this viewer may see (`visibleSettingsTabs`) — a non-administrator is never
+ * offered Agent Defaults (issue #666).
+ */
+export function SettingsTabBar({
+	tabs,
+	activeTab,
+	onSelect,
+}: {
+	tabs: readonly SettingsTab[];
+	activeTab: SettingsTab;
+	onSelect: (tab: SettingsTab) => void;
+}) {
+	return (
+		<div className="flex border-b border-zinc-800">
+			{SETTINGS_TAB_ITEMS.filter(({ tab }) => tabs.includes(tab)).map(
+				({ tab, label, icon: Icon }) => (
+					<button
+						key={tab}
+						type="button"
+						onClick={() => onSelect(tab)}
+						className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
+							activeTab === tab
+								? 'border-violet-500 text-zinc-100 bg-zinc-800/20'
+								: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
+						}`}
+					>
+						<Icon className="h-4 w-4 text-violet-400" />
+						{label}
+					</button>
+				),
+			)}
+		</div>
+	);
+}
+
 function SettingsRouteComponent() {
 	const queryClient = useQueryClient();
 	const navigate = useNavigate();
 	const search = settingsRoute.useSearch();
-	const activeTab = resolveActiveSettingsTab(search);
-	const goToTab = (tab: 'agents' | 'appearance') => {
+	// Agent defaults are installation-wide, so the section is shown only to an
+	// instance administrator (issue #666) — including on a direct `?tab=agents`
+	// link, which `resolveActiveSettingsTab` degrades to a tab the viewer may see.
+	const viewer = useCurrentUser().data;
+	const tabs = visibleSettingsTabs(viewer);
+	const activeTab = resolveActiveSettingsTab(search, viewer);
+	const goToTab = (tab: SettingsTab) => {
 		navigate({ to: '/settings', search: settingsTabSearch(tab) });
 	};
 
@@ -359,32 +416,7 @@ function SettingsRouteComponent() {
 			</div>
 
 			{/* Horizontal Tab Bar */}
-			<div className="flex border-b border-zinc-800">
-				<button
-					type="button"
-					onClick={() => goToTab('agents')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'agents'
-							? 'border-violet-500 text-zinc-100 bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<Cpu className="h-4 w-4 text-violet-400" />
-					Agent Defaults
-				</button>
-				<button
-					type="button"
-					onClick={() => goToTab('appearance')}
-					className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold transition-all border-b-2 ${
-						activeTab === 'appearance'
-							? 'border-violet-500 text-zinc-100 bg-zinc-800/20'
-							: 'border-transparent text-zinc-500 hover:text-zinc-300 hover:border-zinc-800'
-					}`}
-				>
-					<Palette className="h-4 w-4 text-violet-400" />
-					Appearance
-				</button>
-			</div>
+			<SettingsTabBar tabs={tabs} activeTab={activeTab} onSelect={goToTab} />
 
 			{activeTab === 'agents' && (
 				<DefaultModelsForm

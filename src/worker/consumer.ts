@@ -774,7 +774,12 @@ function deferDependencyBlock(
 		taskId: trigger.taskId,
 		attempt,
 		retryDelayMs: DEPENDENCY_RECHECK_INTERVAL_MS,
-		blockers: err.blockers.map((b) => b.reference),
+		// Reference *and* source (issue #636): a native relationship and a prose mention
+		// gate identically, so the reference alone leaves the operator unable to tell a
+		// recorded dependency from this module's reading of someone's sentence — the one
+		// of the two that can be wrong. The budget-exhausted `logger.error` above logs
+		// `error`, which is `blockedRunMessage`, so it already names both.
+		blockers: err.blockers.map((b) => ({ reference: b.reference, source: b.source })),
 	});
 	return {
 		status: 'phase-deferred',

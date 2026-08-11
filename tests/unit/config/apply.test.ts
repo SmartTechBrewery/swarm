@@ -111,7 +111,7 @@ describe('applyConfig', () => {
 			credentials: {
 				reviewer: 'REV_KEY',
 				webhookSecret: 'HOOK_KEY',
-				pm: { webhookSecret: 'PM_HOOK_KEY' },
+				pm: { 'github-projects': { webhookSecret: 'PM_HOOK_KEY' } },
 			},
 		});
 		process.env.PM_HOOK_KEY = 'pm-whsec';
@@ -121,6 +121,96 @@ describe('applyConfig', () => {
 		expect(result.credentialsWritten).toBe(3);
 		expect(writeProjectCredential).toHaveBeenCalledWith('proj-4', 'PM_HOOK_KEY', 'pm-whsec');
 		delete process.env.PM_HOOK_KEY;
+	});
+
+	// Issue #628: `credentials.scm` is a nested record too, one block per provider, so
+	// every provider's references are applied — including a provider the project retains
+	// but is not currently running on, which is what makes switching back reversible.
+	it("stores every SCM provider's credential references from the environment", async () => {
+		const multiProvider = createMockProjectConfig({
+			id: 'proj-5',
+			repo: 'owner/multi',
+			scm: 'gitlab',
+			credentials: {
+				scm: {
+					github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
+					gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
+				},
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+			},
+		});
+		for (const key of ['GH_REVIEWER', 'GH_HOOK', 'GL_REVIEWER', 'GL_HOOK']) {
+			process.env[key] = `value-of-${key}`;
+		}
+		process.env.PM_GITHUB_PROJECTS_TOKEN = 'pm-token';
+
+		try {
+			const result = await applyConfig(SwarmConfigSchema.parse({ projects: [multiProvider] }));
+
+			expect(result.credentialsWritten).toBe(5);
+			expect(writeProjectCredential).toHaveBeenCalledWith('proj-5', 'GH_HOOK', 'value-of-GH_HOOK');
+			expect(writeProjectCredential).toHaveBeenCalledWith('proj-5', 'GL_HOOK', 'value-of-GL_HOOK');
+		} finally {
+			for (const key of ['GH_REVIEWER', 'GH_HOOK', 'GL_REVIEWER', 'GL_HOOK']) {
+				delete process.env[key];
+			}
+			delete process.env.PM_GITHUB_PROJECTS_TOKEN;
+		}
+	});
+
+	// Issue #631: `credentials.pm` is one block per provider now, and the same reasoning
+	// applies — a retained provider's references are applied too, so switching back to it
+	// is a config change rather than a re-entry of every credential. Two blocks naming the
+	// same key (the collision the shape exists to survive) still write one row.
+	it("stores every PM provider's credential references, deduped across blocks", async () => {
+		const twoBoards = createMockProjectConfig({
+			id: 'proj-6',
+			repo: 'owner/two-boards',
+			credentials: {
+				reviewer: 'REV_KEY',
+				webhookSecret: 'HOOK_KEY',
+				pm: {
+					'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					// Retained from a provider the project is not running on, and pointing at
+					// the *same* key for its own `apiToken` role.
+					jira: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN', email: 'JIRA_EMAIL' },
+				},
+			},
+		});
+		process.env.PM_GITHUB_PROJECTS_TOKEN = 'pm-token';
+		process.env.JIRA_EMAIL = 'board@example.com';
+
+		try {
+			const result = await applyConfig(SwarmConfigSchema.parse({ projects: [twoBoards] }));
+
+			// Two legacy SCM references + two distinct PM keys, not three PM writes.
+			expect(result.credentialsWritten).toBe(4);
+			expect(
+				vi
+					.mocked(writeProjectCredential)
+					.mock.calls.filter(([, key]) => key === 'PM_GITHUB_PROJECTS_TOKEN'),
+			).toHaveLength(1);
+			expect(writeProjectCredential).toHaveBeenCalledWith(
+				'proj-6',
+				'JIRA_EMAIL',
+				'board@example.com',
+			);
+		} finally {
+			delete process.env.PM_GITHUB_PROJECTS_TOKEN;
+			delete process.env.JIRA_EMAIL;
+		}
+	});
+
+	// A migrated project names the same two keys twice — once under the legacy pair, once
+	// under `credentials.scm` — and must still write each row exactly once.
+	it('dedupes a migrated project’s legacy pair against its per-provider references', async () => {
+		const result = await applyConfig(config);
+
+		expect(project.credentials.scm?.github).toEqual({
+			reviewer: 'REV_KEY',
+			webhookSecret: 'HOOK_KEY',
+		});
+		expect(result.credentialsWritten).toBe(2);
 	});
 
 	it('applies every project in the config', async () => {

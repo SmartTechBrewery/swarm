@@ -25,7 +25,7 @@ import { describe, expect, it } from 'vitest';
 import '@/integrations/entrypoint.js';
 import { isRuntimeReadySCMProvider } from '@/integrations/scm/manifest.js';
 import { listSCMProviders, requireProjectSCMProvider } from '@/integrations/scm/registry.js';
-import type { SCMProvider } from '@/scm/types.js';
+import { SCM_CREDENTIAL_ROLES, type SCMProvider } from '@/scm/types.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
 
 type SCMContractMethod = {
@@ -179,5 +179,36 @@ describe('SCM provider conformance', () => {
 	it('gives every provider its own webhook route', () => {
 		const routes = manifests.map((manifest) => manifest.webhookRoute);
 		expect(new Set(routes).size).toBe(routes.length);
+	});
+
+	// Issue #628: the two credentials the contract names are declared per provider, with
+	// each provider's own conventional reference name.
+	describe('credential roles', () => {
+		it('declares exactly the contract’s two roles for every provider', () => {
+			for (const manifest of manifests) {
+				expect(
+					manifest.credentialRoles.map((spec) => spec.role).sort(),
+					`${manifest.id}.credentialRoles`,
+				).toEqual([...SCM_CREDENTIAL_ROLES].sort());
+			}
+		});
+
+		it('gives every role a non-empty, UPPER_SNAKE_CASE env var key', () => {
+			for (const manifest of manifests) {
+				for (const spec of manifest.credentialRoles) {
+					expect(spec.envVarKey, `${manifest.id}.${spec.role}`).toMatch(/^[A-Z][A-Z0-9_]*$/);
+				}
+			}
+		});
+
+		// The structural guard against the in-place overwrite this issue is about: two
+		// providers sharing a reference name would store one secret over the other, which is
+		// exactly what per-provider references exist to stop.
+		it('shares no env var key between two providers', () => {
+			const keys = manifests.flatMap((manifest) =>
+				manifest.credentialRoles.map((spec) => spec.envVarKey),
+			);
+			expect(new Set(keys).size).toBe(keys.length);
+		});
 	});
 });

@@ -152,35 +152,86 @@ describe('workers.list (installation roster, issue #133)', () => {
 		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 	});
 
-	it('passes only the caller’s membership project ids for an ordinary user', async () => {
-		listAccessibleProjectIds.mockResolvedValue(['proj-a', 'proj-b']);
-		listDashboardWorkers.mockResolvedValue([]);
-
-		await owner.list();
-
-		expect(listAccessibleProjectIds).toHaveBeenCalledWith(OWNER_ID);
-		expect(listDashboardWorkers).toHaveBeenCalledWith(['proj-a', 'proj-b']);
-	});
-
-	it('returns an empty roster for a user with no accessible project', async () => {
-		listAccessibleProjectIds.mockResolvedValue([]);
-		listDashboardWorkers.mockResolvedValue([]);
-
-		await expect(owner.list()).resolves.toEqual([]);
-		expect(listDashboardWorkers).toHaveBeenCalledWith([]);
+	// issue #647 — the installation-wide roster is an operator's view of the whole
+	// instance (it includes un-enrolled machines), so an ordinary worker owner is
+	// denied it outright rather than served a membership-filtered subset. Their
+	// project-scoped roster is the suite below.
+	it('denies the installation-wide roster to an ordinary user, without querying', async () => {
+		await expect(owner.list()).rejects.toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }));
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+		// The gate is the installation role alone — no membership read at all.
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 	});
 
 	it('serializes last-seen to an ISO string (and keeps null for a never-connected worker)', async () => {
-		listAccessibleProjectIds.mockResolvedValue(['proj-a']);
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		listDashboardWorkers.mockResolvedValue([
 			{ workerId: WORKER_ID, lastSeenAt: new Date('2026-07-01T12:00:00.000Z') },
 			{ workerId: 'w2', lastSeenAt: null },
 		]);
 
-		const rows = await owner.list();
+		const rows = await admin.list();
 
 		expect(rows[0].lastSeenAt).toBe('2026-07-01T12:00:00.000Z');
 		expect(rows[1].lastSeenAt).toBeNull();
+	});
+});
+
+describe('workers.list ordering — the viewer’s own machines first (issue #657)', () => {
+	/** A roster row as `listDashboardWorkers` returns it, reduced to the fields ordering reads. */
+	function rosterRow(workerId: string, ownerUserId: string | null) {
+		return {
+			workerId,
+			lastSeenAt: null,
+			owner: ownerUserId
+				? {
+						userId: ownerUserId,
+						identifier: `${ownerUserId}@example.com`,
+						displayName: ownerUserId,
+					}
+				: null,
+		};
+	}
+
+	it('lists the caller’s workers first, keeping each group’s existing order', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('other-1', OWNER_ID),
+			rosterRow('mine-1', OTHER_ID),
+			rosterRow('other-2', OWNER_ID),
+			rosterRow('mine-2', OTHER_ID),
+		]);
+
+		const rows = await admin.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'mine-2', 'other-1', 'other-2']);
+	});
+
+	it('applies the same ordering to a project-scoped roster', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('other-1', OTHER_ID),
+			rosterRow('mine-1', OWNER_ID),
+		]);
+
+		const rows = await owner.list({ projectId: 'p1' });
+
+		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'other-1']);
+	});
+
+	it('leaves the order untouched for a viewer who owns no visible worker', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		// The third row's owner user row no longer resolves; it is still not the
+		// viewer's, whose own row resolved to authenticate the request.
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('other-1', OWNER_ID),
+			rosterRow('other-2', OWNER_ID),
+			rosterRow('orphaned', null),
+		]);
+
+		const rows = await admin.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['other-1', 'other-2', 'orphaned']);
 	});
 });
 
@@ -204,6 +255,19 @@ describe('workers.list scoped to one project (issue #574)', () => {
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
 		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	// The visibility issue #647 preserves: narrowing the *installation-wide* roster
+	// to instance admins leaves a worker owner's per-project roster untouched.
+	it('still serves a non-admin contributor the roster of a project they are enrolled in', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listDashboardWorkers.mockResolvedValue([
+			{ workerId: WORKER_ID, lastSeenAt: new Date('2026-07-01T12:00:00.000Z') },
+		]);
+
+		const rows = await owner.list({ projectId: 'p1' });
+
+		expect(rows).toEqual([{ workerId: WORKER_ID, lastSeenAt: '2026-07-01T12:00:00.000Z' }]);
 	});
 
 	it('scopes an instanceAdmin too, so un-enrolled machines stay off a project tab', async () => {

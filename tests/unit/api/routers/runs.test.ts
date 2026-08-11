@@ -2323,24 +2323,23 @@ describe('runsRouter', () => {
 		const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
 
 		describe('list', () => {
-			it('bounds the unscoped list to the caller accessible projects', async () => {
-				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1', 'p2']);
-				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
-
-				await ordinary.list({});
-
-				expect(listRunsFromDb).toHaveBeenCalledWith({
-					limit: 50,
-					offset: 0,
-					projectIds: ['p1', 'p2'],
-				});
+			// issue #647 — the unscoped list is the global /runs screen's read: an
+			// operator's view of the whole installation, not a member's of their work.
+			it('denies the installation-wide list to a non-admin, without querying', async () => {
+				await expect(ordinary.list({})).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(listRunsFromDb).not.toHaveBeenCalled();
+				// The gate is the installation role alone — no membership read at all.
+				expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 			});
 
-			it('returns an empty page without querying when the caller has no projects', async () => {
-				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
+			it('lets an instanceAdmin read the installation-wide list unfiltered', async () => {
+				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
 
-				await expect(ordinary.list({})).resolves.toEqual({ data: [], total: 0 });
-				expect(listRunsFromDb).not.toHaveBeenCalled();
+				await caller.list({});
+
+				expect(listRunsFromDb).toHaveBeenCalledWith({ limit: 50, offset: 0 });
 			});
 
 			it('denies an explicit projectId filter the caller is not a member of', async () => {
@@ -2351,18 +2350,51 @@ describe('runsRouter', () => {
 				);
 				expect(listRunsFromDb).not.toHaveBeenCalled();
 			});
+
+			// The project-scoped visibility issue #647 preserves for a worker owner.
+			it('still lets a contributor list the runs of a project they are enrolled in', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+
+				await expect(ordinary.list({ projectId: 'p1' })).resolves.toEqual({ data: [], total: 0 });
+				expect(listRunsFromDb).toHaveBeenCalledWith({ projectId: 'p1', limit: 50, offset: 0 });
+			});
 		});
 
 		describe('queued', () => {
-			it('filters the unscoped queued set to the caller accessible projects', async () => {
-				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+			it('denies the installation-wide queue to a non-admin, without reading the queue', async () => {
+				await expect(ordinary.queued({})).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(listWaitingDispatches).not.toHaveBeenCalled();
+				expect(listAccessibleProjectIds).not.toHaveBeenCalled();
+			});
+
+			it('lets an instanceAdmin read the installation-wide queue unfiltered', async () => {
 				vi.mocked(toQueuedRuns).mockReturnValue([
 					{ projectId: 'p1', type: 'github' },
 					{ projectId: 'p2', type: 'github' },
 				] as never);
 
-				const result = await ordinary.queued({});
-				expect(result).toEqual({ items: [{ projectId: 'p1', type: 'github' }], noTrigger: [] });
+				await expect(caller.queued({})).resolves.toEqual({
+					items: [
+						{ projectId: 'p1', type: 'github' },
+						{ projectId: 'p2', type: 'github' },
+					],
+					noTrigger: [],
+				});
+			});
+
+			it('still lets a contributor read the queue of a project they are enrolled in', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+				vi.mocked(toQueuedRuns).mockReturnValue([{ projectId: 'p1', type: 'github' }] as never);
+
+				await expect(ordinary.queued({ projectId: 'p1' })).resolves.toEqual({
+					items: [{ projectId: 'p1', type: 'github' }],
+					noTrigger: [],
+				});
+				expect(listWaitingDispatches).toHaveBeenCalledWith('p1');
 			});
 		});
 

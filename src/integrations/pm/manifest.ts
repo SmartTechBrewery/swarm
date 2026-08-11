@@ -54,7 +54,7 @@
  */
 
 import type { z } from 'zod';
-import type { ProjectConfig, ScmCredentialReferences } from '../../config/schema.js';
+import type { ProjectConfig, ProjectPm, ScmCredentialReferences } from '../../config/schema.js';
 import type { PMRouterAdapter } from '../../pm/router-adapter.js';
 import type { PMDiscoveryCapability, PMProvider, PMType } from '../../pm/types.js';
 
@@ -158,6 +158,28 @@ export interface PmWebhookVerification {
 /** Authenticate one inbound PM webhook delivery — see {@link PmWebhookVerification}. */
 export type PmWebhookVerifier = (input: PmWebhookVerification) => boolean;
 
+/** A non-persisted field a provider needs before it can discover an incoming board. */
+export interface PmDiscoveryDraftField {
+	/** Stable key carried only in the dashboard's provider-switch draft. */
+	readonly key: string;
+	/** Operator-facing label rendered before discovery begins. */
+	readonly label: string;
+	/** HTML input type appropriate for the value. */
+	readonly inputType: 'url' | 'text';
+	/** Optional setup guidance rendered below the control. */
+	readonly description?: string;
+}
+
+/** Provider-owned validation and projection for incoming-provider discovery. */
+export interface PmDiscoveryDraft {
+	/** Controls the dashboard renders before discovery. */
+	readonly fields: readonly PmDiscoveryDraftField[];
+	/** Validates the untrusted API input before it reaches a provider. */
+	readonly schema: z.ZodTypeAny;
+	/** Builds this provider's discovery-ready pm member from validated draft values. */
+	readonly buildPm: (draft: unknown) => ProjectPm;
+}
+
 export interface PMProviderManifest {
 	/** Stable registry key / provider discriminator, e.g. `github-projects`. */
 	readonly id: PMType;
@@ -176,6 +198,50 @@ export interface PMProviderManifest {
 	 * through the registry is a later cleanup, not part of this contract.
 	 */
 	readonly configSchema: z.ZodTypeAny;
+
+	/**
+	 * This provider's own `project.pm` member with **no board selected** — a complete
+	 * member of {@link configSchema}'s shape whose identity and mapping fields are
+	 * empty (issue #641).
+	 *
+	 * Declared as *data* because shared code needs a `pm` member for a provider a
+	 * project is not persisted on: the credential/discovery API serves an **incoming**
+	 * provider so an operator can enter its credentials and pick its board before any
+	 * switch is saved, and it discovers against `{ ...project, pm: manifest.blankPm }`
+	 * (`src/api/routers/pm.ts`). Every alternative branches on `pm.type` in shared code,
+	 * which is exactly what ai/RULES.md §2 forbids.
+	 *
+	 * It deliberately does **not** satisfy `ProjectPmSchema`: a persisted mapping needs
+	 * at least one status option, and this has none. It is a projection for reads that
+	 * only need the provider's *identity*, never something to persist — `DEFAULT_PM_CONFIG`
+	 * (`src/api/routers/projects.ts`) is GitHub Projects' own blank member and carries
+	 * the same caveat, because a dashboard-created project starts unmapped.
+	 */
+	readonly blankPm: ProjectPm;
+
+	/**
+	 * Why this provider cannot answer discovery against {@link blankPm} — absent when it
+	 * can, which is the common case.
+	 *
+	 * Prose the API returns verbatim as a `PRECONDITION_FAILED` message, so it must be
+	 * actionable, secret-free, and name where the missing value is set. Jira is the one
+	 * provider that declares it: its `baseUrl` is the site every REST call is made
+	 * against *and* board identity kept in `swarm.config.json`, so discovering with a
+	 * blank one could only produce an opaque fetch failure. Refusing up front, with the
+	 * provider's own copy, is what turns that into something an operator can act on
+	 * (it is the API-side twin of the dashboard's existing base-URL Save gate).
+	 *
+	 * A provider that answers *no* discovery at all needs nothing here — an undeclared
+	 * {@link discovery} capability already fails `NOT_IMPLEMENTED`.
+	 */
+	readonly blankPmDiscoveryBlocker?: string;
+
+	/**
+	 * Optional provider-owned setup needed to discover an incoming provider before its
+	 * complete mapping is persisted. The dashboard receives only {@link fields}; the
+	 * API validates the draft with {@link schema} and projects it through {@link buildPm}.
+	 */
+	readonly discoveryDraft?: PmDiscoveryDraft;
 
 	/**
 	 * The credentials this provider needs, each as a {@link PmCredentialRoleSpec}

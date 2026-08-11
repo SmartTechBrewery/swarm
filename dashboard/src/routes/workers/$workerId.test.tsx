@@ -62,6 +62,16 @@ vi.mock('../__root.js', () => ({
 	rootRoute: createRootRoute({ component: () => <Outlet /> }),
 }));
 
+// The index is behind the instance-admin gate (issue #647), which reads the
+// session; sign this suite in as an administrator so the navigation it tests is
+// what the assertions see. The gate itself is covered by
+// `components/layout/instance-admin-only.test.tsx` and `./index.test.tsx`.
+vi.mock('@/lib/use-current-user.js', () => ({
+	useCurrentUser: () => ({
+		data: { id: '1', identifier: 'admin', displayName: 'Admin', instanceAdmin: true },
+	}),
+}));
+
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import { workerDetailRoute } from './$workerId.js';
 import { workersRoute } from './index.js';

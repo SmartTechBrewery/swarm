@@ -18,7 +18,9 @@ import {
 	readAntigravityQuota,
 } from './antigravity-quota.js';
 import { probeBinary } from './binary-probe.js';
-import type { CliQuotaSnapshot } from './quota.js';
+import { findClaudeResultEvent, isClaudeErrorResult } from './claude-stream.js';
+import { bindingUsageWindow, parseClaudeUsageReport } from './claude-usage.js';
+import { type CliQuotaSnapshot, nameQuotaWindow } from './quota.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -166,41 +168,43 @@ export function queryCodexQuota(command = 'codex'): Promise<Partial<CliQuotaSnap
 
 							const result = response.result;
 							const rateLimits = result?.rateLimits;
-							const primary = rateLimits?.primary;
-							const secondary = rateLimits?.secondary;
 							const creditsObj = rateLimits?.credits;
 							const planType = rateLimits?.planType;
 
-							const windows = [];
-							let mainRemaining: number | undefined;
-							let mainReset: string | undefined;
+							// Both slots go through the same rule: a window is named after the
+							// duration Codex reported, and a slot Codex left null contributes
+							// nothing at all (issue #669).
+							const windows = [
+								['primary', rateLimits?.primary],
+								['secondary', rateLimits?.secondary],
+							].flatMap(([sourceSlot, slot]) => {
+								if (slot == null) return [];
+								return [
+									{
+										name: nameQuotaWindow(slot.windowDurationMins),
+										sourceSlot,
+										durationMins: slot.windowDurationMins,
+										usedPercent: slot.usedPercent,
+										resetsAt: slot.resetsAt
+											? new Date(slot.resetsAt * 1000).toISOString()
+											: undefined,
+									},
+								];
+							});
 
-							if (primary) {
-								const remaining = Math.max(0, 100 - (primary.usedPercent ?? 0));
-								mainRemaining = remaining;
-								if (primary.resetsAt) {
-									mainReset = new Date(primary.resetsAt * 1000).toISOString();
-								}
-								windows.push({
-									name: 'Primary (5-hour)',
-									durationMins: primary.windowDurationMins,
-									usedPercent: primary.usedPercent,
-									resetsAt: mainReset,
-								});
-							}
-
-							if (secondary) {
-								let secReset: string | undefined;
-								if (secondary.resetsAt) {
-									secReset = new Date(secondary.resetsAt * 1000).toISOString();
-								}
-								windows.push({
-									name: 'Secondary (Weekly)',
-									durationMins: secondary.windowDurationMins,
-									usedPercent: secondary.usedPercent,
-									resetsAt: secReset,
-								});
-							}
+							// The headline figures track the window closest to exhausting rather
+							// than whichever slot happened to arrive first, so they stay meaningful
+							// whether Codex reports one window or two.
+							const limiting = windows.reduce<(typeof windows)[number] | undefined>(
+								(worst, w) =>
+									worst && (worst.usedPercent ?? -1) >= (w.usedPercent ?? -1) ? worst : w,
+								undefined,
+							);
+							const mainRemaining =
+								limiting?.usedPercent === undefined
+									? undefined
+									: Math.max(0, 100 - limiting.usedPercent);
+							const mainReset = limiting?.resetsAt;
 
 							let credits: string | undefined;
 							if (creditsObj) {
@@ -372,9 +376,142 @@ export async function queryAntigravityQuota(
 }
 
 /**
+ * How the probe asks Claude Code for its own usage summary (issue #671).
+ *
+ * `/usage` is answered by the CLI itself: the envelope of a live run reports
+ * `num_turns: 0` and `total_cost_usd: 0`, so the probe starts no agent turn and
+ * consumes no allowance. The two flags around it are what keep it side-effect
+ * free and cheap:
+ *
+ * - `--no-session-persistence` writes no transcript, so a probe leaves no
+ *   conversation behind for the operator to find in `/resume` (verified: no
+ *   `~/.claude/projects/**` entry is created).
+ * - `--safe-mode` runs without hooks, MCP servers, plugins, or CLAUDE.md
+ *   discovery — the host worker's own cwd is a real project, and a quota read
+ *   must not fire its hooks or spawn its MCP servers. It also cuts the probe
+ *   from ~3.6 s to ~1.5 s, while leaving auth alone. `--bare` would be cheaper
+ *   still and is deliberately **not** used: it restricts Anthropic auth to
+ *   `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads OAuth or the keychain, so
+ *   it cannot answer for the subscription user this probe exists to serve.
+ *
+ * `-p` stays last, immediately before the prompt — safe for claude, whose `-p`
+ * is a bare boolean, and the house convention the harness follows for every CLI
+ * (see `./agent-cli.ts`).
+ */
+const CLAUDE_USAGE_ARGS = [
+	'--safe-mode',
+	'--no-session-persistence',
+	'--output-format',
+	'json',
+	'-p',
+	'/usage',
+];
+
+/**
+ * Budget for one `/usage` probe. Observed 1.5 s steady-state and 8.3 s on a cold
+ * start (plugin sync, first-run caches), so this is roughly double the worst
+ * measurement — missing it costs one run-derived fallback, which is the same
+ * outcome as an older build that cannot answer at all.
+ */
+const CLAUDE_USAGE_TIMEOUT_MS = 15_000;
+
+/** Cap on the probe's captured output; the real envelope is ~1.5 KB. */
+const CLAUDE_USAGE_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/** Why a probe didn't answer, in one line — a timeout named as such. */
+function describeProbeFailure(err: unknown): string {
+	const error = err as (NodeJS.ErrnoException & { killed?: boolean }) | undefined;
+	if (error?.killed === true || error?.code === 'ETIMEDOUT') {
+		return `timed out after ${CLAUDE_USAGE_TIMEOUT_MS}ms`;
+	}
+	return error?.message ?? String(err);
+}
+
+/**
+ * Read Claude Code's live usage windows from its own print-mode `/usage` answer.
+ *
+ * Mirrors {@link queryCodexQuota}'s contract — resolves, never rejects, and
+ * reports `status: 'available'` only with real data — but the failure states are
+ * deliberately split in two, because for Claude they mean different things.
+ * A probe that couldn't run (`'error'`) is a broken or absent capability, while
+ * a probe that ran and returned prose this build doesn't recognize
+ * (`'unavailable'`) is simply "no live data": the answer is unstructured, so a
+ * reworded release must degrade the card rather than fail it (issue #671).
+ */
+export async function queryClaudeQuota(command = 'claude'): Promise<Partial<CliQuotaSnapshot>> {
+	let stdout: string;
+	try {
+		const probe = await execFileAsync(command, CLAUDE_USAGE_ARGS, {
+			timeout: CLAUDE_USAGE_TIMEOUT_MS,
+			maxBuffer: CLAUDE_USAGE_MAX_OUTPUT_BYTES,
+		});
+		stdout = probe.stdout;
+	} catch (err) {
+		return { status: 'error', error: `claude /usage probe failed: ${describeProbeFailure(err)}` };
+	}
+
+	// `--output-format json` prints exactly the terminal `result` record a stream
+	// ends with, so the stream decoder already models this envelope.
+	const event = findClaudeResultEvent(stdout);
+	if (!event || isClaudeErrorResult(event) || !event.result) {
+		return { status: 'unavailable', error: 'claude /usage returned no usage report' };
+	}
+
+	const windows = parseClaudeUsageReport(event.result, new Date());
+	if (!windows) {
+		return {
+			status: 'unavailable',
+			error: 'claude /usage reported no recognized usage window',
+		};
+	}
+
+	const binding = bindingUsageWindow(windows);
+	return {
+		status: 'available',
+		remainingPercentage: Math.max(0, 100 - (binding?.usedPercent ?? 0)),
+		resetTime: binding?.resetsAt,
+		windows,
+	};
+}
+
+/** What {@link getFallbackRateLimitInfo} recovered for a CLI, if anything. */
+type FallbackRateLimitInfo = Awaited<ReturnType<typeof getFallbackRateLimitInfo>>;
+
+/**
+ * Today's snapshot for an installed CLI with no live quota read: the only signal
+ * is a *past* exhaustion recovered from `runs.next_retry_at`, so it reports no
+ * windows and no remaining allowance.
+ *
+ * `liveReason` records why a live probe didn't answer. It is appended to the
+ * run-derived error rather than replacing it, and the status stays `available`
+ * on purpose — an operator on a build or auth mode that cannot answer must see
+ * today's card, not a red diagnostic row (issue #671).
+ */
+function runDerivedSnapshot(
+	cli: AgentCli,
+	fallbackInfo: FallbackRateLimitInfo,
+	lastUpdated: string,
+	liveReason?: string,
+): CliQuotaSnapshot {
+	const error = [
+		fallbackInfo?.error ? `Last failure: ${fallbackInfo.error}` : undefined,
+		liveReason,
+	]
+		.filter(Boolean)
+		.join(' · ');
+	return {
+		cli,
+		status: 'available',
+		source: 'fallback',
+		resetTime: fallbackInfo?.resetTime,
+		error: error || undefined,
+		lastUpdated,
+	};
+}
+
+/**
  * The live quota read for one CLI, or `undefined` when there is none to make —
- * either the CLI has no live path (claude, until its own issue lands) or the
- * installed binary doesn't support the one it has.
+ * the installed binary doesn't support the live path it has.
  */
 function queryLiveQuota(
 	cli: AgentCli,
@@ -382,6 +519,7 @@ function queryLiveQuota(
 ): Promise<Partial<CliQuotaSnapshot> | undefined> {
 	if (cli === 'codex') return queryCodexQuota(command);
 	if (cli === 'antigravity') return queryAntigravityQuota(command);
+	if (cli === 'claude') return queryClaudeQuota(command);
 	return Promise.resolve(undefined);
 }
 
@@ -411,9 +549,9 @@ export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot
 		// Fallback signal from runs table
 		const fallbackInfo = await getFallbackRateLimitInfo(cli);
 
-		// `cheap` keeps every live probe out of a hot path; a CLI with no live path
-		// — and a binary that doesn't support the one it has — yields `undefined`
-		// and drops through to the run-derived branch below.
+		// `cheap` keeps every live probe out of a hot path; a binary that doesn't
+		// support the live path it has yields `undefined` and drops through to the
+		// run-derived branch below.
 		let liveQuota: Partial<CliQuotaSnapshot> | undefined;
 		if (!cheap) {
 			try {
@@ -439,7 +577,20 @@ export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot
 				lastUpdated: now,
 				windows: liveQuota.windows,
 			});
-		} else if (liveQuota) {
+			continue;
+		}
+
+		if (liveQuota && cli === 'claude') {
+			// Claude's own exception (issue #671): an operator on a build or auth mode
+			// that cannot answer must see today's card, not a red diagnostic row, so
+			// the status stays `available` rather than propagating 'error'/'unavailable'.
+			const reason = liveQuota.error || 'Live quota query failed';
+			logger.debug('claude live quota unavailable, using run-derived fallback', { reason });
+			snapshots.push(runDerivedSnapshot(cli, fallbackInfo, now, reason));
+			continue;
+		}
+
+		if (liveQuota) {
 			// The live query ran and didn't answer: fall back, recording why.
 			snapshots.push({
 				cli,
@@ -449,17 +600,12 @@ export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot
 				resetTime: fallbackInfo?.resetTime,
 				lastUpdated: now,
 			});
-		} else {
-			// No live read was possible, so the run-derived signal is all there is.
-			snapshots.push({
-				cli,
-				status: 'available',
-				source: 'fallback',
-				resetTime: fallbackInfo?.resetTime,
-				error: fallbackInfo?.error ? `Last failure: ${fallbackInfo.error}` : undefined,
-				lastUpdated: now,
-			});
+			continue;
 		}
+
+		// No live read was possible (a cheap pass, or no live path/capability for
+		// this CLI/binary), so the run-derived signal is all there is.
+		snapshots.push(runDerivedSnapshot(cli, fallbackInfo, now));
 	}
 
 	return snapshots;
