@@ -20,6 +20,7 @@ describe('ProfileTabBar', () => {
 		expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual([
 			'Account',
 			'My Workers',
+			'My Projects',
 			'Security',
 		]);
 	});
@@ -40,6 +41,15 @@ describe('ProfileTabBar', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'My Workers' }));
 
 		expect(onSelect).toHaveBeenCalledWith('workers');
+	});
+
+	it('reports the My Projects tab that was clicked', () => {
+		const onSelect = vi.fn();
+		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'My Projects' }));
+
+		expect(onSelect).toHaveBeenCalledWith('projects');
 	});
 
 	it('reports the Security tab that was clicked', () => {

@@ -14,6 +14,7 @@ vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
 import { settingsRouter } from '@/api/routers/settings.js';
 import type { AppSettings } from '@/config/app-settings.js';
 import { getAppSettings, updateAppSettings } from '@/db/repositories/appSettingsRepository.js';
+import { discoverCliQuotas } from '@/harness/quota-discovery.js';
 
 describe('settingsRouter', () => {
 	const AUTHED_USER = {
@@ -29,6 +30,7 @@ describe('settingsRouter', () => {
 	beforeEach(() => {
 		vi.mocked(getAppSettings).mockReset();
 		vi.mocked(updateAppSettings).mockReset();
+		vi.mocked(discoverCliQuotas).mockClear();
 	});
 
 	describe('get', () => {
@@ -64,6 +66,7 @@ describe('settingsRouter', () => {
 			const result = await caller.update(settings);
 			expect(result).toEqual(settings);
 			expect(updateAppSettings).toHaveBeenCalledWith(settings);
+			expect(discoverCliQuotas).not.toHaveBeenCalled();
 		});
 
 		it('rejects a model not valid for its cli before touching the repository', async () => {

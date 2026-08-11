@@ -27,6 +27,7 @@ vi.mock('@/db/repositories/projectMembershipRequestsRepository.js', () => ({
 vi.mock('@/identity/membership-service.js', () => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
+	listProjectsForUser: vi.fn(),
 }));
 
 import { DEFAULT_PM_CONFIG, projectsRouter } from '@/api/routers/projects.js';
@@ -56,7 +57,11 @@ import {
 	type ProjectRole,
 } from '@/identity/membership.js';
 import type { MembershipRequest } from '@/identity/membership-request.js';
-import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
+import {
+	getMembership,
+	listAccessibleProjectIds,
+	listProjectsForUser,
+} from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import type { PMProviderManifest } from '@/integrations/pm/manifest.js';
 import {
@@ -132,6 +137,8 @@ describe('projectsRouter', () => {
 		vi.mocked(addMember).mockResolvedValue(membershipFor('projectAdmin'));
 		vi.mocked(getMembership).mockReset();
 		vi.mocked(listAccessibleProjectIds).mockReset();
+		vi.mocked(listProjectsForUser).mockReset();
+		vi.mocked(listProjectsForUser).mockResolvedValue([]);
 		vi.mocked(listDiscoverableProjectsFromDb).mockReset();
 		vi.mocked(createMembershipRequest).mockReset();
 		vi.mocked(getPendingRequest).mockReset();
@@ -160,6 +167,51 @@ describe('projectsRouter', () => {
 			const result = await caller.list();
 			expect(result).toEqual([]);
 			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	// Issue #661: the profile's My Projects tab. An instanceAdmin reaches every
+	// project, which is the case where "role" and "access" come apart.
+	describe('listMine', () => {
+		it('reports an instanceAdmin with no membership as having no role, rather than inventing one', async () => {
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+			]);
+			vi.mocked(listProjectsForUser).mockResolvedValue([]);
+
+			// `toEqual` on the whole result, so the projection is pinned: a config,
+			// credential, or board field cannot start riding along unnoticed.
+			await expect(caller.listMine()).resolves.toEqual([
+				{ id: 'p1', name: 'Alpha', role: null },
+				{ id: 'p2', name: 'Beta', role: null },
+			]);
+		});
+
+		it('reports the real role for a project an instanceAdmin is a member of', async () => {
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+			]);
+			vi.mocked(listProjectsForUser).mockResolvedValue([
+				{ ...membershipFor('member', 'p2'), userId: ADMIN_USER.id },
+			]);
+
+			await expect(caller.listMine()).resolves.toEqual([
+				{ id: 'p1', name: 'Alpha', role: null },
+				{ id: 'p2', name: 'Beta', role: 'member' },
+			]);
+			expect(listProjectsForUser).toHaveBeenCalledWith(ADMIN_USER.id);
+		});
+
+		it('keeps the repository ordering rather than sorting its own', async () => {
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p2', name: 'Alpha' }),
+				createMockProjectConfig({ id: 'p1', name: 'Beta' }),
+			]);
+
+			const result = await caller.listMine();
+			expect(result.map((project) => project.id)).toEqual(['p2', 'p1']);
 		});
 	});
 
@@ -846,6 +898,70 @@ describe('projectsRouter', () => {
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
 
 				await expect(ordinary.list()).resolves.toEqual([]);
+			});
+		});
+
+		describe('listMine', () => {
+			it('lists only the accessible projects, each with the role held on it', async () => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+					createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+					createMockProjectConfig({ id: 'p3', name: 'Gamma' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1', 'p3']);
+				vi.mocked(listProjectsForUser).mockResolvedValue([
+					membershipFor('member', 'p1'),
+					membershipFor('projectAdmin', 'p3'),
+				]);
+
+				// `p2` is absent entirely — the scoping rule is `list`'s, so a project the
+				// caller may not discover is not named here either.
+				await expect(ordinary.listMine()).resolves.toEqual([
+					{ id: 'p1', name: 'Alpha', role: 'member' },
+					{ id: 'p3', name: 'Gamma', role: 'projectAdmin' },
+				]);
+				expect(listAccessibleProjectIds).toHaveBeenCalledWith(ORDINARY_USER.id);
+			});
+
+			it.each([
+				'contributor',
+				'member',
+				'projectAdmin',
+			] as const)('reports the %s role the caller holds', async (role) => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listProjectsForUser).mockResolvedValue([membershipFor(role, 'p1')]);
+
+				await expect(ordinary.listMine()).resolves.toEqual([{ id: 'p1', name: 'Alpha', role }]);
+			});
+
+			it('gives a user with no memberships an empty list, naming no project', async () => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
+				vi.mocked(listProjectsForUser).mockResolvedValue([]);
+
+				await expect(ordinary.listMine()).resolves.toEqual([]);
+			});
+
+			it('ignores a membership for a project the caller cannot access', async () => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listProjectsForUser).mockResolvedValue([
+					membershipFor('member', 'p1'),
+					// A stale membership row for a project that is gone: the accessible list
+					// decides what is listed, so it contributes no entry of its own.
+					membershipFor('projectAdmin', 'p9'),
+				]);
+
+				await expect(ordinary.listMine()).resolves.toEqual([
+					{ id: 'p1', name: 'Alpha', role: 'member' },
+				]);
 			});
 		});
 

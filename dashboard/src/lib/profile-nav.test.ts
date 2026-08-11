@@ -16,11 +16,11 @@ describe('PROFILE_TABS', () => {
 	it('offers only the tabs whose content is delivered', () => {
 		// A tripwire: turning a follow-up tab on is a deliberate edit here, made by
 		// the issue that ships its panel, not a side effect of unrelated work.
-		expect([...AVAILABLE_PROFILE_TABS]).toEqual(['account', 'workers', 'security']);
+		expect([...AVAILABLE_PROFILE_TABS]).toEqual(['account', 'workers', 'projects', 'security']);
 		expect(isProfileTabAvailable('account')).toBe(true);
 		expect(isProfileTabAvailable('workers')).toBe(true);
+		expect(isProfileTabAvailable('projects')).toBe(true);
 		expect(isProfileTabAvailable('security')).toBe(true);
-		expect(isProfileTabAvailable('projects')).toBe(false);
 	});
 });
 
@@ -52,11 +52,12 @@ describe('resolveActiveProfileTab', () => {
 	it('honors an explicit, available tab', () => {
 		expect(resolveActiveProfileTab({ tab: 'account' })).toBe('account');
 		expect(resolveActiveProfileTab({ tab: 'workers' })).toBe('workers');
+		expect(resolveActiveProfileTab({ tab: 'projects' })).toBe('projects');
 		expect(resolveActiveProfileTab({ tab: 'security' })).toBe('security');
 	});
 
-	it('degrades a deep link to a declared-but-undelivered tab to Account', () => {
-		expect(resolveActiveProfileTab({ tab: 'projects' })).toBe('account');
+	it('degrades a deep link to an unavailable tab to Account', () => {
+		expect(resolveActiveProfileTab({ tab: undefined })).toBe('account');
 	});
 });
 
