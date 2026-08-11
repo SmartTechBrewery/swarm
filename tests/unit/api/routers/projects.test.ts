@@ -215,8 +215,8 @@ describe('projectsRouter', () => {
 			} as unknown as SCMProviderManifest);
 		});
 
-		// The per-provider map, plus the *interim* legacy mirror of the same two names that
-		// keeps phase 1's Source Control tab editing the rows the resolver reads.
+		// The per-provider map alone: issue #632 removed phase 1's interim legacy mirror,
+		// since the Source Control tab now reads and writes `credentials.scm` itself.
 		const defaultCredentials = {
 			scm: {
 				github: {
@@ -224,8 +224,6 @@ describe('projectsRouter', () => {
 					webhookSecret: 'SCM_STUB_WEBHOOK_SECRET',
 				},
 			},
-			reviewer: 'SCM_STUB_TOKEN_REVIEWER',
-			webhookSecret: 'SCM_STUB_WEBHOOK_SECRET',
 		};
 
 		it('happy path: calls createProjectWithMemberInDb with the input plus credentials and creator membership, and returns the merged object', async () => {
@@ -373,8 +371,6 @@ describe('projectsRouter', () => {
 						webhookSecret: 'BB_STUB_WEBHOOK_SECRET',
 					},
 				},
-				reviewer: 'BB_STUB_TOKEN_REVIEWER',
-				webhookSecret: 'BB_STUB_WEBHOOK_SECRET',
 			});
 		});
 

@@ -294,7 +294,8 @@ Configuration has three layers:
   dashboard authentication, and credential encryption.
 - `swarm.config.json` — per-project repository, worktree, board mapping (`pm`, one
   member per PM provider — GitHub Projects, Linear, Jira, or Trello, all four
-  selectable), credential references (the SCM reviewer/webhook pair plus the PM
+  selectable), credential references (the SCM reviewer/webhook pair **per SCM
+  provider** under `credentials.scm[<providerId>]` since issue #628, plus the PM
   provider's own roles under `credentials.pm`), agent, and pipeline settings.
   Apply changes with `npm run db:seed` or `swarm config apply`.
 - Dashboard global settings — app-wide settings stored in Postgres and edited

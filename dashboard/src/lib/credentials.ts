@@ -6,37 +6,52 @@
  * `dashboard/vitest.config.ts`), mirroring the `board-mapping.ts`/`.test.ts` split.
  */
 
-import type { ScmCredentialReferences } from '../../../src/config/schema.js';
-import type { ScmType } from '../../../src/scm/types.js';
+import type { ScmCredentialRole, ScmType } from '../../../src/scm/types.js';
 
 /**
- * The credential references this screen edits — derived from the Zod-owned
- * `ScmCredentialReferencesSchema` (`src/config/schema.ts`) per "Zod is the source of
- * truth" (`ai/CODING_STANDARDS.md`), so adding/removing a role in the schema
- * surfaces here as a type error. The actual env-var keys are project-configured and
- * come from `projects.credentials.list`; the role is the stable discriminator.
+ * The credential roles this screen edits — the contract's own closed pair
+ * (`SCM_CREDENTIAL_ROLES`, `src/scm/types.ts`) per "Zod is the source of truth"
+ * (`ai/CODING_STANDARDS.md`), so adding or removing a role there surfaces here as a
+ * type error. A type-only import, so the bundle gains nothing at runtime.
  *
- * The shared SCM references, not the whole `credentials` block: the PM provider's
- * own roles (`credentials.pm`, issue #497) are declared per provider on its manifest
- * and configured in `swarm.config.json` — this tab has no UI for them, and
- * `credentials.list` excludes them for the same reason.
+ * The roles are provider-neutral; what is per provider is each role's *reference
+ * name* (declared on `SCMProviderManifest.credentialRoles`, resolved server-side and
+ * served by `projects.credentials.list`) and the copy naming it — see
+ * {@link ScmProviderCopy}.
  */
-export type CredentialRole = keyof ScmCredentialReferences;
+export type CredentialRole = ScmCredentialRole;
 
-/** One entry from `projects.credentials.list` (see `src/api/routers/credentials.ts`). */
+/** One role from `projects.credentials.list` (see `src/api/routers/credentials.ts`). */
 export interface CredentialEntry {
 	role: CredentialRole;
+	/** The provider's conventional `swarm config apply` key for this role. */
 	envVarKey: string;
+	/**
+	 * The secret-store key this project resolves the role through — the key the screen
+	 * names, since it is the only one an operator setting a value can act on. Never a
+	 * secret, and never empty: the server falls back to `envVarKey`.
+	 */
+	referenceKey: string;
 	isConfigured: boolean;
 	maskedValue: string;
 }
 
-export const CREDENTIAL_ROLE_LABELS: Record<CredentialRole, string> = {
+/** The `projects.credentials.list` response — one provider's state (issue #632). */
+export interface ScmCredentialsView {
+	providerId: string;
+	providerLabel: string;
+	/** `false` when this installation registers no runtime-ready provider for `providerId`. */
+	providerRegistered: boolean;
+	roles: CredentialEntry[];
+}
+
+/** GitHub's own name for each role — see {@link ScmProviderCopy.roleLabels}. */
+const GITHUB_ROLE_LABELS: Record<CredentialRole, string> = {
 	reviewer: 'Reviewer PAT',
 	webhookSecret: 'Webhook Secret',
 };
 
-export const CREDENTIAL_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
+const GITHUB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 	reviewer:
 		'GitHub personal access token the reviewer persona reviews with. Must resolve to a different GitHub account than the worker operator (the implementer identity) for loop prevention to work.',
 	webhookSecret:
@@ -92,16 +107,30 @@ export function toSelectableScmProvider(scm: string | undefined | null): ScmProv
 export interface ScmProviderCopy {
 	/** Introductory paragraph explaining what the credentials are for. */
 	intro: string;
+	/**
+	 * What this provider calls each role, used for every label the field renders
+	 * (heading, input, remove control, remove confirmation). Per provider because the
+	 * roles are neutral but the credentials are not: GitHub's "PAT" is Bitbucket's app
+	 * password and GitLab's access token, and GitLab's webhook value is a secret token it
+	 * echoes back rather than a key it signs with (issue #632).
+	 */
+	roleLabels: Record<CredentialRole, string>;
 	roleDescriptions: Record<CredentialRole, string>;
 	/** Shown under a verifiable field when the provider's verify procedure resolves invalid. */
 	verifyFailureMessage: string;
 }
 
+/** Bitbucket Cloud's name for each role — an app password, not a PAT. */
+const BITBUCKET_ROLE_LABELS: Record<CredentialRole, string> = {
+	reviewer: 'Reviewer App Password',
+	webhookSecret: 'Webhook Secret',
+};
+
 /**
- * Bitbucket Cloud's wording for the two shared credential references. The roles
- * themselves are provider-neutral (issue #290 — a Bitbucket project reuses
- * `reviewer` / `webhookSecret` rather than getting its own), so only the copy
- * differs.
+ * Bitbucket Cloud's wording for the two credential references. The roles themselves
+ * are provider-neutral (issue #290 — a Bitbucket project reuses `reviewer` /
+ * `webhookSecret` rather than getting its own), and since issue #628 each provider
+ * holds its own reference per role, so only the copy differs.
  */
 const BITBUCKET_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 	reviewer:
@@ -111,11 +140,20 @@ const BITBUCKET_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 };
 
 /**
- * GitLab's wording for the same two shared references. The webhook line differs in
- * kind rather than in phrasing: GitLab echoes the secret verbatim in
- * `X-Gitlab-Token` instead of signing the body, so the copy says what the operator
- * is configuring — a secret token, not an HMAC key (see
- * `src/integrations/scm/gitlab/webhook.ts`).
+ * GitLab's name for each role. The webhook one is not a "webhook secret" in GitLab's
+ * own vocabulary: it is the secret token GitLab echoes verbatim in `X-Gitlab-Token`
+ * rather than an HMAC key it signs the body with.
+ */
+const GITLAB_ROLE_LABELS: Record<CredentialRole, string> = {
+	reviewer: 'Reviewer Access Token',
+	webhookSecret: 'Secret Token',
+};
+
+/**
+ * GitLab's wording for the same two references. The webhook line differs in kind
+ * rather than in phrasing: GitLab echoes the secret verbatim in `X-Gitlab-Token`
+ * instead of signing the body, so the copy says what the operator is configuring — a
+ * secret token, not an HMAC key (see `src/integrations/scm/gitlab/webhook.ts`).
  */
 const GITLAB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 	reviewer:
@@ -128,12 +166,14 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	github: {
 		intro:
 			"The reviewer persona authenticates to GitHub with this project-scoped token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GH_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Verify the PAT to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
-		roleDescriptions: CREDENTIAL_ROLE_DESCRIPTIONS,
+		roleLabels: GITHUB_ROLE_LABELS,
+		roleDescriptions: GITHUB_ROLE_DESCRIPTIONS,
 		verifyFailureMessage: 'Token did not resolve to a GitHub account. Check it and try again.',
 	},
 	bitbucket: {
 		intro:
 			"The reviewer persona authenticates to Bitbucket Cloud with this project-scoped app password. The implementer persona uses the worker operator's own credential, configured on each host as the SWARM_OPERATOR_BITBUCKET_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Point the repository's webhook at /bitbucket/webhook and give it the secret below. Verify the app password to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+		roleLabels: BITBUCKET_ROLE_LABELS,
 		roleDescriptions: BITBUCKET_ROLE_DESCRIPTIONS,
 		verifyFailureMessage:
 			'Credential did not resolve to a Bitbucket account. It must be a "username:app_password" pair — a workspace or repository access token cannot resolve an identity.',
@@ -141,6 +181,7 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	gitlab: {
 		intro:
 			"The reviewer persona authenticates to gitlab.com with this project-scoped access token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GITLAB_TOKEN environment variable — not here — so its merge requests are attributed to the operator's account, distinct from the reviewer. Point the project's webhook at /gitlab/webhook, enable its merge request, comment, and pipeline events, and give it the secret token below. Verify the token to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+		roleLabels: GITLAB_ROLE_LABELS,
 		roleDescriptions: GITLAB_ROLE_DESCRIPTIONS,
 		verifyFailureMessage:
 			'Token did not resolve to a GitLab account. It needs the api scope, and only gitlab.com is supported — a self-managed host cannot be verified.',
@@ -154,9 +195,10 @@ export function getScmProviderCopy(providerId: ScmProviderId): ScmProviderCopy {
 
 /**
  * Whether a role's secret maps to a provider identity and can be verified through
- * that provider's `scm.verify…` procedure. The webhook secret is an HMAC secret,
- * not a token, so it has no login to resolve and no Verify affordance — true of
- * all three providers, which is why this takes no provider id.
+ * that provider's `scm.verify…` procedure. The webhook role's secret authenticates a
+ * delivery rather than an account — an HMAC key for GitHub and Bitbucket, an echoed
+ * token for GitLab — so it has no login to resolve and no Verify affordance, which is
+ * true of all three providers and why this takes no provider id.
  */
 export function isVerifiableRole(role: CredentialRole): boolean {
 	return role === 'reviewer';

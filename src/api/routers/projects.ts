@@ -70,25 +70,6 @@ function defaultScmCredentialReferences(scm: ScmType): ScmCredentialReferencesBy
 }
 
 /**
- * **Interim** (issue #628 phase 1 only): the legacy shared pair, mirroring the same
- * two reference names the per-provider map above just seeded.
- *
- * The credentials tRPC router's `list`/`set`/`delete` and the dashboard's Source
- * Control tab still edit the legacy pair in phase 1, so without this mirror a
- * newly created project's tab would write to store keys nothing resolves. An
- * *existing* project needs no mirror — it already has the pair, and the migration
- * copied those same names into `credentials.scm`. Phase 2 rewires the router and the
- * tab onto `credentials.scm` and deletes this function.
- */
-function interimLegacyScmCredentialMirror(
-	references: ScmCredentialReferencesByProvider,
-	scm: ScmType,
-): { reviewer?: string; webhookSecret?: string } {
-	const seeded = references[scm];
-	return seeded ? { ...seeded } : {};
-}
-
-/**
  * The `credentials.pm` map a new project starts with: one reference per credential
  * role its PM provider *requires and owns*, named by that role's own declared
  * conventional key (issue #537). Nothing is stored yet — the reference is a slot the
@@ -223,7 +204,6 @@ export const projectsRouter = router({
 			pm: DEFAULT_PM_CONFIG,
 			credentials: {
 				scm: scmReferences,
-				...interimLegacyScmCredentialMirror(scmReferences, scm),
 				...(pmReferences ? { pm: pmReferences } : {}),
 			},
 		};
