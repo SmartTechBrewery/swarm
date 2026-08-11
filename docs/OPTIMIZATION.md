@@ -112,9 +112,10 @@ source for preplan validation and for suppressing the redundant Planning run.
 The Preplan comment carries the plan as ordinary prose, which the Implementation dependency gate
 also reads when it scans an item for prerequisites named in text. That scan therefore skips every
 comment SWARM itself wrote (`isSwarmGeneratedBody`): a plan phrased as "this phase requires #266 to
-land first" is the agent describing its own work, not an operator declaring a blocker, and treating
-it as one would defer — and eventually fail — the child's Implementation on an issue nobody gated it
-on. Prose dependencies still count in the item's description and in comments written by people.
+land first" is the agent describing its own work, not an operator declaring a blocker. Prose the
+gate does read — the item's description and comments written by people — no longer *defers* anything
+either (issue #643): a prerequisite found only in prose is surfaced on the item for a human to
+record natively, and only a recorded relationship gates the run.
 
 SWARM creates the card in Backlog only long enough to write that marker, then moves it to Planning.
 That ordering means both the Planning-move webhook and a delayed creation webhook find the marker

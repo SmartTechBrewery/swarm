@@ -268,8 +268,15 @@ export interface WorkItemBlocker {
 	open: boolean;
 	/**
 	 * How the dependency was found: a `dependency` relationship the provider models
-	 * natively, or a `mention` parsed from the item's own description/comments. Both
-	 * gate work identically; this is informational, for clearer messages and logs.
+	 * natively, or a `mention` parsed from the item's own description/comments.
+	 *
+	 * **This decides the blocker's authority, not just its wording** (issue #643).
+	 * Only `dependency` defers a run; a `mention` is surfaced for a human and never
+	 * becomes a scheduling constraint, because prose that *discusses* a dependency
+	 * reads the same as prose that *declares* one — see `src/pm/dependencies.ts`'s
+	 * module comment for the two runs that proved it. A provider must therefore set
+	 * this accurately: reporting a prose reference as `dependency` re-creates the
+	 * defect, and reporting a real relationship as `mention` silently drops a gate.
 	 */
 	source: 'dependency' | 'mention';
 }
@@ -451,6 +458,11 @@ export interface PMProvider {
 	 * calling {@link listBlockers} / {@link addBlockedBy} (which return `[]` / no-op).
 	 * A capability flag rather than an optional method so a second provider
 	 * (Bitbucket, GitLab, Jira) opts out explicitly (ai/RULES.md §2).
+	 *
+	 * Such a provider has **no automated gate at all**, and that is unchanged by
+	 * issue #643: the gate short-circuits on this flag before `listBlockers` is
+	 * called, so it never gated on prose there either. Its guard stays the prose
+	 * Planning writes into each split child, for a human to read.
 	 */
 	readonly supportsDependencies: boolean;
 
@@ -461,6 +473,11 @@ export interface PMProvider {
 	 * relationships with dependencies referenced in the item's own description and
 	 * comments (deduplicated). Returns `[]` when the item has none, or when the
 	 * provider has no dependency concept ({@link supportsDependencies} is `false`).
+	 *
+	 * Both kinds are still reported, and each carries its {@link
+	 * WorkItemBlocker.source}: the caller *gates* on the native relationships and
+	 * *surfaces* the prose ones to a human (issue #643), so a provider that dropped
+	 * the mentions here would lose the notice rather than tighten the gate.
 	 */
 	listBlockers(id: string): Promise<WorkItemBlocker[]>;
 

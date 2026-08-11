@@ -9,9 +9,47 @@
  * each adapter resolves the same mentions and phrases the same messages without
  * reinventing them (ai/RULES.md §2). The provider-specific half — turning a
  * reference into a live open/closed state — stays inside each adapter.
+ *
+ * ## Prose never gates a run (issue #643) — do not "improve" this back
+ *
+ * A blocker's {@link WorkItemBlocker.source} decides its *authority*, and the two
+ * sources are not equals: a `dependency` is a relationship somebody recorded on
+ * the board, a `mention` is this module reading a sentence. Only the recorded
+ * relationship gates work ({@link BLOCKER_SOURCE_GATES}). A prose-only
+ * prerequisite is **advisory**: it is logged and posted on the item as a notice
+ * asking a human to record it natively ({@link proseAdvisoryCommentBody}), and it
+ * never becomes a scheduling constraint. Re-unioning the two sources at the gate
+ * looks like an obvious improvement and is the defect below.
+ *
+ * **Why, concretely.** Prose gating stalled two runs in one morning, both from
+ * correct, well-written prose:
+ *
+ * - Implementation of item 633 deferred on an issue parsed out of a sentence that
+ *   stated the *reverse* relationship — and that issue was itself natively blocked
+ *   by 633, so it could not close until the gated item landed. A deadlock, not a
+ *   near miss (run `bdd362d7-c059-4e40-b7d7-fcd60ac502ba`).
+ * - Implementation of item 636 deferred on the same issue parsed out of *quoted
+ *   evidence* — an issue about this very bug reproduces error messages and lists
+ *   example dependency phrasings, because that is what such an issue must contain.
+ *   No cycle at all: the run simply waited behind unrelated work (run
+ *   `9fedd2ca-10b2-4e57-aa63-352f0bd764fc`).
+ *
+ * Sharper parsing (issue #636) reduces that class but cannot remove it, because
+ * issues legitimately discuss dependencies, quote errors, and give examples of
+ * dependency wording; naming the source in the deferral message (issue #638)
+ * makes a false positive diagnosable, not preventable. The tell was the
+ * workaround: three issue bodies (633, 636, 638) had to be reworded until the
+ * regex stopped matching, so contributors and the Planning phase were writing
+ * defensively around a parser. Against that, the hypothetical prose gating was
+ * built to catch — a real prerequisite nobody recorded — is now redundant: since
+ * `ai/RULES.md` §5 every dependency must carry a native relationship, and the
+ * notice above is what chases the one that does not.
+ *
+ * The parser is *not* dead code: accuracy still decides what gets surfaced to a
+ * human, it just stopped being load-bearing.
  */
 
-import { isSwarmGeneratedBody } from '../scm/swarm-origin.js';
+import { isSwarmGeneratedBody, SWARM_GENERATED_FOOTER, swarmMarker } from '../scm/swarm-origin.js';
 import type { WorkItemBlocker } from './types.js';
 
 /**
@@ -242,19 +280,52 @@ export function findDependencyReferences(text: string): string[] {
 	return [...found];
 }
 
-/** Only the blockers that still gate work — the still-open prerequisites. */
+/** Only the still-open blockers — a closed prerequisite is finished, whatever its source. */
 export function openBlockers(blockers: readonly WorkItemBlocker[]): WorkItemBlocker[] {
 	return blockers.filter((b) => b.open);
 }
 
 /**
- * Human copy for a blocker's {@link WorkItemBlocker.source}. The two sources gate
- * a run *identically*, which is exactly why the message has to name them (issue
- * #636): a native relationship is a fact someone recorded on the board, while a
- * prose mention is this module's heuristic reading of a sentence — and therefore
- * the only one of the two a false positive can come from. Without the label, a
- * deferral that shouldn't have happened can only be diagnosed by reproducing the
- * scan by hand, which is what run `bdd362d7-c059-4e40-b7d7-fcd60ac502ba` took.
+ * Which blocker sources carry the authority to defer a run (issue #643 — see the
+ * module comment for why prose does not).
+ *
+ * A `Record` over the union rather than a `=== 'dependency'` test, deliberately:
+ * a third source has to be classified *here*, with its decision argued, instead
+ * of silently falling into whichever bucket a comparison happened to leave it in.
+ * Adding a member to {@link WorkItemBlocker.source} fails to compile until it is.
+ */
+const BLOCKER_SOURCE_GATES: Record<WorkItemBlocker['source'], boolean> = {
+	dependency: true,
+	mention: false,
+};
+
+/** Split blockers into the ones that gate the run and the ones only surfaced to a human. */
+export function partitionBlockersBySource(blockers: readonly WorkItemBlocker[]): {
+	/** Recorded relationships — these defer the run. */
+	gating: WorkItemBlocker[];
+	/** Prose-only prerequisites — surfaced for a human, never a scheduling constraint. */
+	advisory: WorkItemBlocker[];
+} {
+	const gating: WorkItemBlocker[] = [];
+	const advisory: WorkItemBlocker[] = [];
+	for (const blocker of blockers) {
+		(BLOCKER_SOURCE_GATES[blocker.source] ? gating : advisory).push(blocker);
+	}
+	return { gating, advisory };
+}
+
+/**
+ * Human copy for a blocker's {@link WorkItemBlocker.source} (issue #638). It was
+ * added when the two sources gated a run identically, to make a deferral that
+ * shouldn't have happened diagnosable without reproducing the scan by hand — which
+ * is what run `bdd362d7-c059-4e40-b7d7-fcd60ac502ba` took.
+ *
+ * Since issue #643 the gate only ever hands {@link blockedRunMessage} recorded
+ * relationships, so the label reads as a positive statement of the gate's
+ * authority rather than as a warning about it — and the same vocabulary names the
+ * other half in {@link proseAdvisoryCommentBody}. Kept, not dropped: a message
+ * that states which authority deferred the run is what makes "prose does not
+ * gate" checkable from the board instead of from this file.
  */
 function blockerSourceLabel(source: WorkItemBlocker['source']): string {
 	return source === 'dependency'
@@ -285,10 +356,58 @@ export function blockedRunMessage(openBlockers: readonly WorkItemBlocker[]): str
 }
 
 /**
+ * Idempotency marker for the prose-advisory notice, keyed on the **set of
+ * references** it names rather than on the item: a later, different unrecorded
+ * prerequisite gets its own notice, while every re-check of the same one finds
+ * the notice already posted and stays quiet. Shares the `<!-- swarm-… -->` frame
+ * so comment loop prevention and the prose scan itself both recognise the notice
+ * as SWARM's own writing ({@link isSwarmGeneratedBody}).
+ */
+export function proseAdvisoryMarker(advisoryBlockers: readonly WorkItemBlocker[]): string {
+	const refs = [...new Set(advisoryBlockers.map((b) => b.reference))].sort();
+	return swarmMarker('prose-dependency', refs.join(','));
+}
+
+/**
+ * The notice posted on an item whose prose named a prerequisite that is *not* a
+ * recorded relationship — the operator-facing half of "prose does not gate"
+ * (issue #643). It has to say three things: what was read, that it did not hold
+ * the run back, and what to do if it is real. Without it a genuinely unrecorded
+ * dependency would simply disappear, which is the one cost of not gating on prose.
+ *
+ * The references sit on their own bullet lines, with no dependency keyword on any
+ * of them, so this body could not be read back as a declaration even if the
+ * SWARM-origin filter were ever bypassed — a notice that gated the next run on
+ * the issue it is asking about would be this bug wearing a hat.
+ */
+export function proseAdvisoryCommentBody(advisoryBlockers: readonly WorkItemBlocker[]): string {
+	const many = advisoryBlockers.length > 1;
+	return [
+		`### Possible unrecorded ${many ? 'prerequisites' : 'prerequisite'}`,
+		'',
+		`Reading this item's description and comments, SWARM found what looks like ${many ? 'prerequisites that are' : 'a prerequisite that is'} not recorded on the board as a relationship:`,
+		'',
+		...advisoryBlockers.map((b) => `- ${b.reference} — “${b.title}” (${b.url})`),
+		'',
+		'**This did not hold the run back.** Only a recorded relationship defers work; a sentence is advisory, because nothing can reliably tell a real prerequisite from an item that merely discusses one.',
+		'',
+		`If ${many ? 'one of these' : 'this'} really has to finish first, record it on the board as a *blocked by* relationship and the gate will enforce it. If it is only discussion, there is nothing to do.`,
+		'',
+		SWARM_GENERATED_FOOTER,
+		proseAdvisoryMarker(advisoryBlockers),
+	].join('\n');
+}
+
+/**
  * Merge native + mentioned blockers, deduplicated by URL (the stable identity
  * across both sources — a `mention` and a native `dependency` can point at the
  * same issue). A native relationship wins over a bare mention when both exist,
  * since it carries the provider-confirmed id.
+ *
+ * That precedence is load-bearing since issue #643, not just cosmetic: `source`
+ * now decides whether the blocker gates at all, so collapsing a recorded
+ * relationship into the mention that also describes it would demote a real gate to
+ * advice. Keep `dependency` winning.
  */
 export function dedupeBlockers(blockers: readonly WorkItemBlocker[]): WorkItemBlocker[] {
 	const byUrl = new Map<string, WorkItemBlocker>();

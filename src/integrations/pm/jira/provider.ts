@@ -845,8 +845,9 @@ export class JiraPMProvider implements PMProvider {
 	async listBlockers(id: string): Promise<WorkItemBlocker[]> {
 		return this.run(async () => {
 			// Two sources, deduplicated by URL so a prerequisite that is both linked
-			// and written down is reported once: Jira's own "is blocked by" issue
-			// links, and the prerequisites the item names in prose.
+			// and written down is reported once — as the native link, which is what
+			// makes it a gate rather than a notice (issue #643): Jira's own "is blocked
+			// by" issue links, and the prerequisites the item names in prose.
 			const [native, mentioned] = await Promise.all([
 				this.fetchNativeBlockers(id),
 				this.fetchMentionedBlockers(id),
@@ -1095,6 +1096,10 @@ export class JiraPMProvider implements PMProvider {
 	 * which also excludes SWARM's own comments so a published plan's "requires
 	 * #266" never becomes a blocker nobody declared (issue #431); this adapter only
 	 * resolves each reference to a live open/closed state.
+	 *
+	 * Reported as `source: 'mention'`, which since issue #643 makes them
+	 * **advisory**: the gate surfaces them for a human and lets the run proceed, so
+	 * only the native issue link below actually defers work.
 	 *
 	 * **Known limitation:** the shared heuristic recognises the numeric `#N` and
 	 * `/issues/N` forms, not Jira's own `SWARM-123` notation — widening it would

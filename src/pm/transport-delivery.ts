@@ -125,10 +125,12 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
  * (`../pipeline/dependency-guard.ts`) short-circuits, and a work item whose
  * prerequisites are still open would be built out of order — the failure issue
- * #330 exists to prevent. Nothing else gates it: `findOpenBlockers` is called
+ * #330 exists to prevent. Nothing else gates it: `findGatingBlockers` is called
  * only inside the phase, never by the dispatcher or the eligibility gate. So the
  * capability is declared **on** and the read runs server-side under the PM
- * credential.
+ * credential. That read still carries both blocker sources, because the gate needs
+ * the prose-only ones to *surface* them even though it no longer defers on them
+ * (issue #643) — and the notice it posts rides the same transported `addComment`.
  *
  * `findWorkItemByUrlSuffix` is transported for a milder reason: Respond-to-review's
  * board report is best-effort, so refusing would merely stop the card moving. It
