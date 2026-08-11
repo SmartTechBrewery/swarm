@@ -24,6 +24,7 @@ import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
 import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.js';
 import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
 import { PmProviderSwitchDialog } from '@/components/projects/pm-provider-switch-dialog.js';
+import { ProjectAdminOnly } from '@/components/projects/project-admin-only.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
@@ -78,12 +79,14 @@ import {
 } from '@/lib/pipeline-enabled.js';
 import {
 	agentConfigSearch,
+	isProjectAdminTab,
 	PROJECT_PHASES as PHASES,
 	type ProjectTab,
 	phaseDetailSearch,
 	projectDetailSearchSchema,
 	resolveActiveTab,
 	tabSearch,
+	viewerAdministersProject,
 } from '@/lib/project-nav.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
@@ -1786,17 +1789,28 @@ const PROJECT_TAB_ITEMS: ReadonlyArray<{ tab: ProjectTab; label: string; icon: L
 	{ tab: 'credentials', label: 'Source Control', icon: GitBranch },
 ];
 
-/** The horizontal tab bar, rendered from {@link PROJECT_TAB_ITEMS}. */
+/**
+ * The horizontal tab bar, rendered from {@link PROJECT_TAB_ITEMS}. A viewer who does
+ * not administer the project is offered only the operational tabs (issue #655): the
+ * configuration ones are omitted rather than shown disabled, since there is nothing
+ * on them for a non-administrator to read. `ProjectAdminOnly` is the boundary either
+ * way — this only avoids drawing a link to a screen it would deny.
+ */
 export function ProjectTabBar({
 	activeTab,
+	canAdminister,
 	onSelect,
 }: {
 	activeTab: ProjectTab;
+	canAdminister: boolean;
 	onSelect: (tab: ProjectTab) => void;
 }) {
+	const items = canAdminister
+		? PROJECT_TAB_ITEMS
+		: PROJECT_TAB_ITEMS.filter(({ tab }) => !isProjectAdminTab(tab));
 	return (
 		<div className="flex border-b border-zinc-800">
-			{PROJECT_TAB_ITEMS.map(({ tab, label, icon: Icon }) => (
+			{items.map(({ tab, label, icon: Icon }) => (
 				<button
 					key={tab}
 					type="button"
@@ -1849,6 +1863,22 @@ function ProjectDetailRouteComponent() {
 	const projectQuery = useQuery({
 		...trpc.projects.getById.queryOptions({ id: projectId }),
 	});
+
+	/**
+	 * Whether this viewer administers the project — the one thing that decides which
+	 * tabs the screen offers and renders (issue #655). Read from the server rather
+	 * than inferred from the installation role, so a `projectAdmin` who is not an
+	 * `instanceAdmin` keeps the configuration tabs and an `instanceAdmin` who is not a
+	 * member still gets them.
+	 *
+	 * `viewerAdministersProject` fails closed on an absent read (still loading, or the
+	 * query failed); the load is awaited below alongside the project's, so the
+	 * configuration tabs never flash in and back out.
+	 */
+	const accessQuery = useQuery({
+		...trpc.projects.viewerAccess.queryOptions({ projectId }),
+	});
+	const canAdminister = viewerAdministersProject(accessQuery.data);
 
 	const lastSyncedProjectRef = useRef<typeof project>(undefined);
 
@@ -2251,7 +2281,10 @@ function ProjectDetailRouteComponent() {
 		});
 	};
 
-	if (projectQuery.isLoading) {
+	// Both loads gate the screen: rendering before the viewer's access resolves would
+	// show the tab bar and the resolved tab as a non-administrator's for a frame, then
+	// swap them (issue #655). The two queries run in parallel, so this costs no round trip.
+	if ([projectQuery, accessQuery].some((query) => query.isLoading)) {
 		return <div className="text-sm text-zinc-400">Loading project settings…</div>;
 	}
 
@@ -2289,152 +2322,157 @@ function ProjectDetailRouteComponent() {
 			</div>
 
 			{/* Horizontal Tab Bar */}
-			<ProjectTabBar activeTab={activeTab} onSelect={goToTab} />
+			<ProjectTabBar activeTab={activeTab} canAdminister={canAdminister} onSelect={goToTab} />
 
+			{/* Runs and Workers are the project-scoped operational views every enrolled
+			    member keeps (issue #655); everything below `ProjectAdminOnly` configures
+			    the project or manages its credentials, and is the administrator's alone. */}
 			{activeTab === 'runs' && <ProjectRunsPanel projectId={projectId} />}
 
 			{/* This project's worker roster (issue #574) — the same component `/workers`
 			    renders, scoped server-side to the machines enrolled here. */}
 			{activeTab === 'workers' && <WorkersRoster projectId={projectId} />}
 
-			{/* Form Card - General Settings */}
-			{activeTab === 'general' && (
-				<GeneralSettingsForm
-					name={name}
-					repo={repo}
-					repoRoot={repoRoot}
-					worktreeRoot={worktreeRoot}
-					baseBranch={baseBranch}
-					branchPrefix={branchPrefix}
-					maxConcurrentJobs={maxConcurrentJobs}
-					maxConcurrentJobsError={maxConcurrentJobsError}
-					setName={setName}
-					setRepo={setRepo}
-					setRepoRoot={setRepoRoot}
-					setWorktreeRoot={setWorktreeRoot}
-					setBaseBranch={setBaseBranch}
-					setBranchPrefix={setBranchPrefix}
-					setMaxConcurrentJobs={setMaxConcurrentJobs}
-					handleInputChange={handleInputChange}
-					handleSubmit={handleSubmit}
-					handleReset={handleReset}
-					isDirty={isDirty}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-				/>
-			)}
-
-			{/* Form Card - Agent Configuration */}
-			{activeTab === 'agents' && (
-				<AgentConfigurationForm
-					agents={agents}
-					pipelineEnabled={pipelineEnabled}
-					pipelineAutoAdvance={pipelineAutoAdvance}
-					selectedPhase={selectedPhase}
-					onSelectPhase={openPhase}
-					onBack={backToAgentConfig}
-					handleEnabledChange={handleEnabledChange}
-					handleAutoAdvanceChange={handleAutoAdvanceChange}
-					handleTargetChange={handleTargetChange}
-					handleAddTarget={handleAddTarget}
-					handleRemoveTarget={handleRemoveTarget}
-					handleMoveTarget={handleMoveTarget}
-					handleTimeoutChange={handleTimeoutChange}
-					handlePromptChange={handlePromptChange}
-					handleSubmit={handleAgentsSubmit}
-					handleReset={handleAgentsReset}
-					isDirty={isAgentsDirty}
-					hasValidationError={hasAgentValidationError}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-					savingToggleKey={savingToggleKey}
-					toggleErrorMessage={toggleErrorMessage}
-				/>
-			)}
-
-			{activeTab === 'pipeline' && (
-				<PipelineSettingsForm
-					autoMerge={autoMerge}
-					setAutoMerge={(value) => {
-						setAutoMerge(value);
-						updateMutation.reset();
-					}}
-					skipRespondToReviewOnMinors={skipRespondToReviewOnMinors}
-					setSkipRespondToReviewOnMinors={(value) => {
-						setSkipRespondToReviewOnMinors(value);
-						updateMutation.reset();
-					}}
-					reviewChecksPolicy={reviewChecksPolicy}
-					setReviewChecksPolicy={(value) => {
-						setReviewChecksPolicy(value);
-						updateMutation.reset();
-					}}
-					handleSubmit={handlePipelineSubmit}
-					handleReset={handlePipelineReset}
-					isDirty={isPipelineDirty}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-				/>
-			)}
-
-			{/*
-			 * Project Management (issue #537): one tab, four coherent cards in the order
-			 * the settings depend on each other — the provider (issue #630), then its
-			 * declared credentials, then the board picker, then the status mapping. The
-			 * provider and credential panels own their own queries, so they render above
-			 * the mapping form rather than inside it.
-			 *
-			 * That order *is* the provider switch (issue #642): the same four cards, scoped
-			 * to the draft provider and each staged behind its predecessor, are what resolve
-			 * the circular dependency between "which provider" and "which board" — no wizard,
-			 * and no invalid intermediate write, since the whole new member goes in one save.
-			 */}
-			{activeTab === 'projectManagement' && (
-				<div className="space-y-6">
-					<PmProviderPanel
-						projectId={projectId}
-						providerId={boardMapping.providerId}
-						persistedProviderId={project?.pm.type ?? boardMapping.providerId}
-						onProviderChange={handleBoardMappingProvider}
-						isPending={configWriteInFlight}
-					/>
-					{/* Scoped to the draft provider while a switch is open, so the incoming
-					    provider's own roles are entered — and its boards discovered — before the
-					    switch is written (issue #641's provider parameter). */}
-					<PmCredentialsPanel projectId={projectId} providerId={pmProviderId} />
-					<BoardMappingPanel
-						projectId={projectId}
-						form={boardMapping}
-						onSelectContainer={handleBoardMappingSelectContainer}
-						onStatusOptionChange={handleBoardMappingStatusOption}
-						onProviderContextChange={handleBoardMappingProviderContext}
-						onStatesContext={handleBoardMappingStatesContext}
-						handleSubmit={handleBoardMappingSubmit}
-						handleReset={handleBoardMappingReset}
-						isDirty={isBoardMappingFormDirty}
+			<ProjectAdminOnly tab={activeTab} canAdminister={canAdminister}>
+				{/* Form Card - General Settings */}
+				{activeTab === 'general' && (
+					<GeneralSettingsForm
+						name={name}
+						repo={repo}
+						repoRoot={repoRoot}
+						worktreeRoot={worktreeRoot}
+						baseBranch={baseBranch}
+						branchPrefix={branchPrefix}
+						maxConcurrentJobs={maxConcurrentJobs}
+						maxConcurrentJobsError={maxConcurrentJobsError}
+						setName={setName}
+						setRepo={setRepo}
+						setRepoRoot={setRepoRoot}
+						setWorktreeRoot={setWorktreeRoot}
+						setBaseBranch={setBaseBranch}
+						setBranchPrefix={setBranchPrefix}
+						setMaxConcurrentJobs={setMaxConcurrentJobs}
+						handleInputChange={handleInputChange}
+						handleSubmit={handleSubmit}
+						handleReset={handleReset}
+						isDirty={isDirty}
 						isPending={configWriteInFlight}
 						isSuccess={updateMutation.isSuccess}
 						isError={updateMutation.isError}
 						errorMessage={updateMutation.error?.message}
 					/>
-					<PmProviderSwitchDialog
-						open={switchConfirmOpen && !!pmDraftProviderId}
-						fromProviderId={project?.pm.type ?? ''}
-						toProviderId={pmDraftProviderId ?? ''}
-						isPending={configWriteInFlight}
-						onConfirm={saveBoardMapping}
-						onCancel={() => setSwitchConfirmOpen(false)}
-					/>
-				</div>
-			)}
+				)}
 
-			{activeTab === 'credentials' && <CredentialsPanel projectId={projectId} />}
+				{/* Form Card - Agent Configuration */}
+				{activeTab === 'agents' && (
+					<AgentConfigurationForm
+						agents={agents}
+						pipelineEnabled={pipelineEnabled}
+						pipelineAutoAdvance={pipelineAutoAdvance}
+						selectedPhase={selectedPhase}
+						onSelectPhase={openPhase}
+						onBack={backToAgentConfig}
+						handleEnabledChange={handleEnabledChange}
+						handleAutoAdvanceChange={handleAutoAdvanceChange}
+						handleTargetChange={handleTargetChange}
+						handleAddTarget={handleAddTarget}
+						handleRemoveTarget={handleRemoveTarget}
+						handleMoveTarget={handleMoveTarget}
+						handleTimeoutChange={handleTimeoutChange}
+						handlePromptChange={handlePromptChange}
+						handleSubmit={handleAgentsSubmit}
+						handleReset={handleAgentsReset}
+						isDirty={isAgentsDirty}
+						hasValidationError={hasAgentValidationError}
+						isPending={configWriteInFlight}
+						isSuccess={updateMutation.isSuccess}
+						isError={updateMutation.isError}
+						errorMessage={updateMutation.error?.message}
+						savingToggleKey={savingToggleKey}
+						toggleErrorMessage={toggleErrorMessage}
+					/>
+				)}
+
+				{activeTab === 'pipeline' && (
+					<PipelineSettingsForm
+						autoMerge={autoMerge}
+						setAutoMerge={(value) => {
+							setAutoMerge(value);
+							updateMutation.reset();
+						}}
+						skipRespondToReviewOnMinors={skipRespondToReviewOnMinors}
+						setSkipRespondToReviewOnMinors={(value) => {
+							setSkipRespondToReviewOnMinors(value);
+							updateMutation.reset();
+						}}
+						reviewChecksPolicy={reviewChecksPolicy}
+						setReviewChecksPolicy={(value) => {
+							setReviewChecksPolicy(value);
+							updateMutation.reset();
+						}}
+						handleSubmit={handlePipelineSubmit}
+						handleReset={handlePipelineReset}
+						isDirty={isPipelineDirty}
+						isPending={configWriteInFlight}
+						isSuccess={updateMutation.isSuccess}
+						isError={updateMutation.isError}
+						errorMessage={updateMutation.error?.message}
+					/>
+				)}
+
+				{/*
+				 * Project Management (issue #537): one tab, four coherent cards in the order
+				 * the settings depend on each other — the provider (issue #630), then its
+				 * declared credentials, then the board picker, then the status mapping. The
+				 * provider and credential panels own their own queries, so they render above
+				 * the mapping form rather than inside it.
+				 *
+				 * That order *is* the provider switch (issue #642): the same four cards, scoped
+				 * to the draft provider and each staged behind its predecessor, are what resolve
+				 * the circular dependency between "which provider" and "which board" — no wizard,
+				 * and no invalid intermediate write, since the whole new member goes in one save.
+				 */}
+				{activeTab === 'projectManagement' && (
+					<div className="space-y-6">
+						<PmProviderPanel
+							projectId={projectId}
+							providerId={boardMapping.providerId}
+							persistedProviderId={project?.pm.type ?? boardMapping.providerId}
+							onProviderChange={handleBoardMappingProvider}
+							isPending={configWriteInFlight}
+						/>
+						{/* Scoped to the draft provider while a switch is open, so the incoming
+					    provider's own roles are entered — and its boards discovered — before the
+					    switch is written (issue #641's provider parameter). */}
+						<PmCredentialsPanel projectId={projectId} providerId={pmProviderId} />
+						<BoardMappingPanel
+							projectId={projectId}
+							form={boardMapping}
+							onSelectContainer={handleBoardMappingSelectContainer}
+							onStatusOptionChange={handleBoardMappingStatusOption}
+							onProviderContextChange={handleBoardMappingProviderContext}
+							onStatesContext={handleBoardMappingStatesContext}
+							handleSubmit={handleBoardMappingSubmit}
+							handleReset={handleBoardMappingReset}
+							isDirty={isBoardMappingFormDirty}
+							isPending={configWriteInFlight}
+							isSuccess={updateMutation.isSuccess}
+							isError={updateMutation.isError}
+							errorMessage={updateMutation.error?.message}
+						/>
+						<PmProviderSwitchDialog
+							open={switchConfirmOpen && !!pmDraftProviderId}
+							fromProviderId={project?.pm.type ?? ''}
+							toProviderId={pmDraftProviderId ?? ''}
+							isPending={configWriteInFlight}
+							onConfirm={saveBoardMapping}
+							onCancel={() => setSwitchConfirmOpen(false)}
+						/>
+					</div>
+				)}
+
+				{activeTab === 'credentials' && <CredentialsPanel projectId={projectId} />}
+			</ProjectAdminOnly>
 		</div>
 	);
 }

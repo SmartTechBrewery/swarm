@@ -40,6 +40,48 @@ export const PROJECT_TABS = [
 export type ProjectTab = (typeof PROJECT_TABS)[number];
 
 /**
+ * The tabs only a **project administrator** may open (issue #655): every screen that
+ * configures the project or manages its credentials. `runs` and `workers` are
+ * deliberately absent — they are the project-scoped operational views an enrolled
+ * non-administrator keeps, the same split issue #647 drew between an installation-wide
+ * screen and a member's view of their own work.
+ *
+ * This mirrors a boundary the server already enforces rather than inventing one:
+ * `projects.update`, the `projects.credentials` procedures, and the whole `pm` router
+ * all require `projectAdmin` (`src/api/authz.ts`), so every tab listed here is one
+ * whose reads and writes a non-administrator is already refused. Hiding it is what
+ * stops the dashboard from offering a dead-end screen; it grants nothing and relaxes
+ * nothing. An `instanceAdmin` administers every project, so they see every tab —
+ * `projects.viewerAccess` resolves that for the client.
+ */
+export const PROJECT_ADMIN_TABS: readonly ProjectTab[] = [
+	'general',
+	'agents',
+	'pipeline',
+	'projectManagement',
+	'credentials',
+];
+
+const PROJECT_ADMIN_TAB_SET: ReadonlySet<ProjectTab> = new Set(PROJECT_ADMIN_TABS);
+
+/** Whether `tab` is one of the administrator-only tabs (see {@link PROJECT_ADMIN_TABS}). */
+export function isProjectAdminTab(tab: ProjectTab): boolean {
+	return PROJECT_ADMIN_TAB_SET.has(tab);
+}
+
+/**
+ * Whether a `projects.viewerAccess` read makes this viewer a project administrator.
+ * An absent read — still loading, or the query failed — is deliberately *not* one:
+ * the same fail-closed default `canViewInstanceWide` applies to the installation-wide
+ * screens, so an unknown role never opens a configuration tab.
+ */
+export function viewerAdministersProject(
+	access: { canAdminister: boolean } | null | undefined,
+): boolean {
+	return access?.canAdminister === true;
+}
+
+/**
  * Renamed tab values a bookmarked or pasted `?tab=` link may still carry, mapped to
  * the tab that replaced them. Without this a stale link would `.catch(undefined)`
  * into the Runs tab, silently dropping the operator somewhere they didn't ask for.

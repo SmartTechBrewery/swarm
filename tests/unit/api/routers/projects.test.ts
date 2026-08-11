@@ -868,6 +868,50 @@ describe('projectsRouter', () => {
 			});
 		});
 
+		// Issue #655: the read model the project-detail screen decides which tabs to
+		// offer from. It reports the `projectAdmin` boundary every configuration
+		// procedure enforces for itself, and grants nothing.
+		describe('viewerAccess', () => {
+			it('reports a projectAdmin as able to administer the project', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('projectAdmin'));
+
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: true,
+				});
+			});
+
+			it('reports a member and a contributor as unable to administer it', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: false,
+				});
+
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: false,
+				});
+			});
+
+			it('denies a non-member with NOT_FOUND rather than reporting false', async () => {
+				// Answering at all would confirm the project exists, so this hides it the
+				// same way `getById` does.
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'NOT_FOUND' }),
+				);
+			});
+
+			it('reports an instanceAdmin as an administrator of a project they are not a member of', async () => {
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(caller.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: true,
+				});
+				expect(getMembership).not.toHaveBeenCalled();
+			});
+		});
+
 		describe('update / delete role boundary', () => {
 			it('forbids a member from updating project config', async () => {
 				vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
