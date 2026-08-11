@@ -22,10 +22,8 @@
  * skipped reference stays as documentation to be filled in on a later re-run.
  */
 
-import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import { writeProjectCredential } from '../db/repositories/credentialsRepository.js';
 import { upsertProjectToDb } from '../db/repositories/projectsRepository.js';
-import { discoverCliQuotas } from '../harness/quota-discovery.js';
 import { listPmCredentialReferences } from './pm-credentials.js';
 import type { SwarmConfig } from './schema.js';
 import { listScmCredentialReferences } from './scm-credentials.js';
@@ -79,15 +77,6 @@ export async function applyConfig(config: SwarmConfig): Promise<ApplyResult> {
 			await writeProjectCredential(project.id, envVarKey, value);
 			result.credentialsWritten++;
 		}
-	}
-
-	try {
-		const snapshots = await discoverCliQuotas();
-		for (const snapshot of snapshots) {
-			await upsertCliQuota(snapshot.cli, snapshot.status, snapshot);
-		}
-	} catch (_err) {
-		// Log but don't fail config apply
 	}
 
 	return result;
