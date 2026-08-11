@@ -12,11 +12,14 @@
  * standards violation (ai/CODING_STANDARDS.md "Comments" / "don't build it
  * speculatively").
  *
- * This file defines *types only* — no runtime import edge. The two companion
- * halves of the PM contract are `src/pm/events.ts` (the Zod normalized inbound
- * event, which crosses the queue boundary) and `src/pm/router-adapter.ts` (the
- * ingress interface). The adapter that implements all three against the GitHub
- * Projects GraphQL API lives under `src/integrations/pm/github-projects/`.
+ * This file defines types plus two closed value vocabularies ({@link PM_TYPES},
+ * {@link PM_DISCOVERY_CAPABILITIES}) and imports nothing at runtime, so importing
+ * it still adds no dependency edge of its own — the same shape `src/scm/types.ts`
+ * has. The two companion halves of the PM contract are `src/pm/events.ts` (the Zod
+ * normalized inbound event, which crosses the queue boundary) and
+ * `src/pm/router-adapter.ts` (the ingress interface). The adapter that implements
+ * all three against the GitHub Projects GraphQL API lives under
+ * `src/integrations/pm/github-projects/`.
  *
  * IDs are plain `string` at this interface, on purpose: the contract is
  * provider-agnostic, so it can't name GitHub-specific branded types
@@ -37,8 +40,16 @@
  * {@link import('../integrations/pm/registry.js').requireProjectPMProvider}
  * throw a wiring-bug error, which is how the next provider's phases stay
  * unreachable until it is complete.
+ *
+ * Stated as values rather than a bare union, exactly as {@link SCM_TYPES}
+ * (`src/scm/types.ts`) is: the config schema's `credentials.pm` key check
+ * (`src/config/schema.ts`, issue #631) has to answer "is this string a PM provider
+ * id?" at runtime, without depending on which provider modules a process imported.
+ * {@link PMType} is derived from the list so the two cannot drift, and
+ * `PmProviderIdSchema` (`src/pm/events.ts`) is built from it for the same reason.
  */
-export type PMType = 'github-projects' | 'jira' | 'linear' | 'trello';
+export const PM_TYPES = ['github-projects', 'jira', 'linear', 'trello'] as const;
+export type PMType = (typeof PM_TYPES)[number];
 
 /**
  * The discovery capabilities the board-mapping screen needs a provider to answer:

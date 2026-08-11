@@ -182,6 +182,7 @@ describe('pmRouter', () => {
 				.mockRejectedValue(
 					new MissingPmCredentialError(
 						'swarm',
+						'github-projects',
 						'apiToken',
 						'GitHub Projects API Token',
 						'PM_GITHUB_PROJECTS_TOKEN',
@@ -197,7 +198,7 @@ describe('pmRouter', () => {
 				message: expect.stringContaining('GitHub Projects API Token'),
 			});
 			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.toThrow(
-				/credentials\.pm\.apiToken.*PM_GITHUB_PROJECTS_TOKEN/s,
+				/credentials\.pm\.github-projects\.apiToken.*PM_GITHUB_PROJECTS_TOKEN/s,
 			);
 			await expect(caller.discoverContainers({ projectId: 'swarm' })).rejects.not.toThrow(
 				/SWARM_OPERATOR_GH_TOKEN/,

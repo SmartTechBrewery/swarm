@@ -24,7 +24,7 @@ const project = createMockProjectConfig({
 	scm: 'gitlab',
 	credentials: {
 		scm: { gitlab: { reviewer: REVIEWER_REFERENCE, webhookSecret: 'GITLAB_HOOK_REF' } },
-		pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+		pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 	},
 });
 
@@ -79,7 +79,7 @@ describe('gitlab persona credentials', () => {
 				scm: 'gitlab',
 				credentials: {
 					scm: { github: { reviewer: 'GITHUB_REVIEWER_REF' } },
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 

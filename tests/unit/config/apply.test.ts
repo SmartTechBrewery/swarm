@@ -108,7 +108,7 @@ describe('applyConfig', () => {
 			credentials: {
 				reviewer: 'REV_KEY',
 				webhookSecret: 'HOOK_KEY',
-				pm: { webhookSecret: 'PM_HOOK_KEY' },
+				pm: { 'github-projects': { webhookSecret: 'PM_HOOK_KEY' } },
 			},
 		});
 		process.env.PM_HOOK_KEY = 'pm-whsec';
@@ -133,7 +133,7 @@ describe('applyConfig', () => {
 					github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
 					gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
 				},
-				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 			},
 		});
 		for (const key of ['GH_REVIEWER', 'GH_HOOK', 'GL_REVIEWER', 'GL_HOOK']) {
@@ -152,6 +152,49 @@ describe('applyConfig', () => {
 				delete process.env[key];
 			}
 			delete process.env.PM_GITHUB_PROJECTS_TOKEN;
+		}
+	});
+
+	// Issue #631: `credentials.pm` is one block per provider now, and the same reasoning
+	// applies — a retained provider's references are applied too, so switching back to it
+	// is a config change rather than a re-entry of every credential. Two blocks naming the
+	// same key (the collision the shape exists to survive) still write one row.
+	it("stores every PM provider's credential references, deduped across blocks", async () => {
+		const twoBoards = createMockProjectConfig({
+			id: 'proj-6',
+			repo: 'owner/two-boards',
+			credentials: {
+				reviewer: 'REV_KEY',
+				webhookSecret: 'HOOK_KEY',
+				pm: {
+					'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					// Retained from a provider the project is not running on, and pointing at
+					// the *same* key for its own `apiToken` role.
+					jira: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN', email: 'JIRA_EMAIL' },
+				},
+			},
+		});
+		process.env.PM_GITHUB_PROJECTS_TOKEN = 'pm-token';
+		process.env.JIRA_EMAIL = 'board@example.com';
+
+		try {
+			const result = await applyConfig(SwarmConfigSchema.parse({ projects: [twoBoards] }));
+
+			// Two legacy SCM references + two distinct PM keys, not three PM writes.
+			expect(result.credentialsWritten).toBe(4);
+			expect(
+				vi
+					.mocked(writeProjectCredential)
+					.mock.calls.filter(([, key]) => key === 'PM_GITHUB_PROJECTS_TOKEN'),
+			).toHaveLength(1);
+			expect(writeProjectCredential).toHaveBeenCalledWith(
+				'proj-6',
+				'JIRA_EMAIL',
+				'board@example.com',
+			);
+		} finally {
+			delete process.env.PM_GITHUB_PROJECTS_TOKEN;
+			delete process.env.JIRA_EMAIL;
 		}
 	});
 

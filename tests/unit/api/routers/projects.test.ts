@@ -339,7 +339,8 @@ describe('projectsRouter', () => {
 
 				expect(result.credentials).toEqual({
 					...defaultCredentials,
-					pm: { apiToken: 'PM_STUB_TOKEN' },
+					// Filed under the provider it was seeded from (issue #631).
+					pm: { 'github-projects': { apiToken: 'PM_STUB_TOKEN' } },
 				});
 			} finally {
 				_resetPMProviderRegistryForTesting();

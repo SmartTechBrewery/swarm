@@ -1,5 +1,9 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
+import {
+	type PmProviderCredentialReferences,
+	pmCredentialReferenceFor,
+} from '../../config/pm-credentials.js';
 import type { ProjectConfig } from '../../config/schema.js';
 import {
 	type ScmProviderCredentialReferences,
@@ -125,13 +129,14 @@ function requirePmRoleSpec(project: ProjectConfig, role: string): PmCredentialRo
 
 /**
  * The secret-store key one PM role resolves through, mirroring
- * `resolvePmCredential`'s order (`src/config/provider.ts`): the reference the
- * project already configured, else the SCM-side reference the role inherits — since
- * issue #628 the *per-provider* one for the SCM provider this project runs on — else
- * the role's declared conventional key.
+ * `resolvePmCredential`'s order (`src/config/provider.ts`): the reference the project
+ * already configured for its **own** PM provider (issue #631 — never another
+ * provider's block, which is the overwrite this shape exists to remove), else the
+ * SCM-side reference the role inherits — since issue #628 the *per-provider* one for
+ * the SCM provider this project runs on — else the role's declared conventional key.
  */
 function pmReferenceKeyFor(project: ProjectConfig, spec: PmCredentialRoleSpec): string {
-	const configured = project.credentials.pm?.[spec.role];
+	const configured = pmCredentialReferenceFor(project, project.pm.type, spec.role);
 	if (configured) return configured;
 	if (spec.inheritsSharedCredential) {
 		const inherited = scmCredentialReferenceFor(
@@ -241,25 +246,32 @@ async function updateScmReferences(
 }
 
 /**
- * Persist a project's `credentials.pm` role → reference map. Written through the
- * project row (the map is config, not a secret), and only when it actually changes,
- * so setting a credential twice doesn't churn the row.
+ * Persist one PM provider's `role -> reference` block under
+ * `credentials.pm[<pm.type>]`, leaving every other provider's block untouched — the PM
+ * twin of {@link updateScmReferences} (issue #631). That preservation is the point: a
+ * project retaining the credentials of a provider it is not currently running on must
+ * not lose them because a role name collides with one of the current provider's.
+ *
+ * Written through the project row (a reference is config, not a secret) and only when
+ * it actually changes, so setting a credential twice doesn't churn the row. A block
+ * that empties drops out entirely rather than persisting as `{}`.
  */
 async function updatePmReferences(
 	project: ProjectConfig,
-	references: Record<string, string>,
+	references: PmProviderCredentialReferences,
 ): Promise<void> {
-	const current = project.credentials.pm ?? {};
+	const current = project.credentials.pm?.[project.pm.type] ?? {};
 	const unchanged =
 		Object.keys(current).length === Object.keys(references).length &&
 		Object.entries(references).every(([role, key]) => current[role] === key);
 	if (unchanged) return;
+
+	const pm = { ...(project.credentials.pm ?? {}) };
+	if (Object.keys(references).length > 0) pm[project.pm.type] = references;
+	else delete pm[project.pm.type];
 	await upsertProjectToDb({
 		...project,
-		credentials: {
-			...project.credentials,
-			pm: references,
-		},
+		credentials: { ...project.credentials, pm },
 	});
 }
 
@@ -349,8 +361,8 @@ export const credentialsRouter = router({
 		}),
 
 	/**
-	 * Store the secret for one PM role and make sure `credentials.pm` names it, so a
-	 * project configured entirely through the dashboard resolves the same way a
+	 * Store the secret for one PM role and make sure `credentials.pm[<pm.type>]` names
+	 * it, so a project configured entirely through the dashboard resolves the same way a
 	 * file-configured one does (`resolvePmCredential`). The plaintext is written
 	 * straight to the encrypted store and never read back.
 	 */
@@ -370,14 +382,14 @@ export const credentialsRouter = router({
 
 			await writeProjectCredential(input.projectId, referenceKey, input.value, spec.label);
 			await updatePmReferences(project, {
-				...(project.credentials.pm ?? {}),
+				...(project.credentials.pm?.[project.pm.type] ?? {}),
 				[spec.role]: referenceKey,
 			});
 		}),
 
 	/**
-	 * Clear one PM role: delete the stored secret *and* drop its `credentials.pm`
-	 * reference. Dropping the reference is the point — a role with no reference reads
+	 * Clear one PM role: delete the stored secret *and* drop its
+	 * `credentials.pm[<pm.type>]` reference. Dropping the reference is the point — a role with no reference reads
 	 * no host environment variable either (`resolvePmCredential`), so "removed" means
 	 * the provider fails explicitly instead of silently resolving an ambient value. A
 	 * later `swarm config apply` re-adds the reference from `swarm.config.json`, which
@@ -392,7 +404,8 @@ export const credentialsRouter = router({
 			const referenceKey = pmReferenceKeyFor(project, spec);
 
 			await deleteProjectCredential(input.projectId, referenceKey);
-			const { [spec.role]: _removed, ...remaining } = project.credentials.pm ?? {};
+			const { [spec.role]: _removed, ...remaining } =
+				project.credentials.pm?.[project.pm.type] ?? {};
 			await updatePmReferences(project, remaining);
 		}),
 

@@ -91,7 +91,7 @@ async function runDiscovery<T>(fn: () => Promise<T>): Promise<T> {
 				code: 'PRECONDITION_FAILED',
 				message:
 					`No ${err.label} is configured for this project. Add it under Project Management → ` +
-					`Credentials (file-based config: set credentials.pm.${err.role}, whose conventional ` +
+					`Credentials (file-based config: set credentials.pm.${err.providerId}.${err.role}, whose conventional ` +
 					`environment key is ${err.envVarKey}), then try again.`,
 			});
 		}

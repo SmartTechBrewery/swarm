@@ -68,13 +68,15 @@ export const CONFIG_TEMPLATE = {
 			// operator's own token, set as SWARM_OPERATOR_GH_TOKEN in `.env` on each host
 			// that runs implementer phases (issue #396).
 			//
-			// `scm` holds one reference per role, *per SCM provider* (issue #628), so a
-			// project can carry a second provider's credentials without either
-			// overwriting the other. Only the provider named by `scm` above is ever
-			// resolved. `pm` holds one reference per credential role the *PM provider*
-			// declares (issue #497). GitHub Projects declares `apiToken` — the board's own
-			// GitHub token, required and never the operator's (issue #537); its webhook
-			// secret inherits the repo side's, so it needs no entry here.
+			// Both maps hold one reference per role, *per provider* — `scm` since issue
+			// #628 and `pm` since #631 — so a project can carry a second provider's
+			// credentials without either overwriting the other (PM role names collide
+			// outright: `apiToken` is GitHub Projects' and Jira's). Only the provider
+			// named by `scm` / `pm.type` above is ever resolved. A `pm` block holds one
+			// reference per credential role that *PM provider* declares (issue #497);
+			// GitHub Projects declares `apiToken` — the board's own GitHub token, required
+			// and never the operator's (issue #537) — while its webhook secret inherits
+			// the repo side's, so it needs no entry here.
 			credentials: {
 				scm: {
 					github: {
@@ -83,7 +85,9 @@ export const CONFIG_TEMPLATE = {
 					},
 				},
 				pm: {
-					apiToken: 'PM_GITHUB_PROJECTS_TOKEN',
+					'github-projects': {
+						apiToken: 'PM_GITHUB_PROJECTS_TOKEN',
+					},
 				},
 			},
 		},

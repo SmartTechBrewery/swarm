@@ -99,7 +99,7 @@ rename-prone; the option ID (`47fc9ee4`) is stable. This is why `config-schema.t
 The dashboard's **Project Management** tab no longer asks an operator to type the `projectId`,
 `statusFieldId`, and option IDs above. It discovers them read-only through the provider's
 `discover()` method (surfaced by the `pm` tRPC router, run under the project's own board
-credential — `credentials.pm.apiToken`, issue #537) and the operator picks from real names;
+credential — `credentials.pm['github-projects'].apiToken`, issues #537/#631) and the operator picks from real names;
 the persisted representation is still the opaque IDs documented above.
 
 **Token permissions.** That credential needs `repo` + `project` (read *and* write — SWARM

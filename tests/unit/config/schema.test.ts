@@ -250,7 +250,7 @@ describe('ProjectConfigSchema', () => {
 						github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
 						gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
 					},
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 
@@ -292,11 +292,52 @@ describe('ProjectConfigSchema', () => {
 				scm: 'gitlab',
 				credentials: {
 					scm: { github: { reviewer: 'GH_REVIEWER' } },
-					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
 
 			expect(project.credentials.scm?.gitlab).toBeUndefined();
+		});
+	});
+
+	// Issue #631: the PM references are per provider too, and a pre-#631 flat role map is
+	// nested under `pm.type` on parse. Same split as `credentials.scm` above — this file
+	// registers no manifest, so only the registry-free rules are asserted here, and the
+	// role-name/presence halves live in `pm-credentials.test.ts`.
+	describe('credentials.pm', () => {
+		it('accepts a per-provider reference map, keeping each provider separate', () => {
+			const project = createMockProjectConfig({
+				credentials: {
+					pm: {
+						'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+						jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' },
+					},
+				},
+			});
+
+			// The collision this shape exists to remove: one `apiToken` per provider.
+			expect(project.credentials.pm?.['github-projects']?.apiToken).toBe(
+				'PM_GITHUB_PROJECTS_TOKEN',
+			);
+			expect(project.credentials.pm?.jira?.apiToken).toBe('JIRA_API_TOKEN');
+		});
+
+		it('nests a legacy flat role map under the provider the project runs on', () => {
+			const project = createMockProjectConfig({
+				credentials: { pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } } as never,
+			});
+
+			expect(project.credentials.pm).toEqual({
+				'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+			});
+		});
+
+		it('rejects a key that is not a PM provider id, naming the ids', () => {
+			expect(() =>
+				createMockProjectConfig({
+					credentials: { pm: { jiar: { apiToken: 'TYPO_KEY' } } },
+				}),
+			).toThrow(/'jiar' is not a PM provider id/);
 		});
 	});
 
