@@ -16,6 +16,7 @@ import * as identities from './commands/identities.js';
 import * as init from './commands/init.js';
 import * as logs from './commands/logs.js';
 import * as members from './commands/members.js';
+import * as pm from './commands/pm.js';
 import * as queue from './commands/queue.js';
 // Namespaced as `runCommand` because this module's own dispatcher is `run`.
 import * as runCommand from './commands/run.js';
@@ -42,6 +43,7 @@ const COMMANDS: Record<string, Command> = {
 	identities,
 	workers,
 	worktrees,
+	pm,
 };
 
 function usage(): string {
@@ -63,6 +65,7 @@ Commands:
   identities       Link a SWARM user to the handles they own on a provider
   workers          Register and manage local workers (identity + declared CLIs)
   worktrees prune  Prune stale per-task worktrees
+  pm webhook       Register/list/delete a project's Trello board webhook
 
 The worker is not managed here — it runs on the host: npm run dev:worker`;
 }

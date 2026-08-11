@@ -28,13 +28,22 @@ const ENV_FILE = '.env';
 const ENV_EXAMPLE_FILE = '.env.docker.example';
 const CONFIG_FILE = 'swarm.config.json';
 
-/** Placeholder project config in `SwarmConfigSchema` shape for the user to fill in. */
-const CONFIG_TEMPLATE = {
+/**
+ * Placeholder project config in `SwarmConfigSchema` shape for the user to fill in.
+ *
+ * Exported for its own test: `ensureConfigFile` below validates an *existing* file but
+ * not the template it writes, so nothing else would catch a template that
+ * `swarm config apply` then rejects.
+ */
+export const CONFIG_TEMPLATE = {
 	projects: [
 		{
 			id: 'my-project',
 			name: 'My Project',
 			repo: 'owner/repo',
+			// Required in practice since issue #618 (`github` / `bitbucket` / `gitlab`),
+			// and since issue #628 also the key `credentials.scm` below is keyed by.
+			scm: 'github',
 			repoRoot: '/absolute/path/to/your/repo/checkout',
 			worktreeRoot: PROJECT_DEFAULTS.worktreeRoot,
 			baseBranch: PROJECT_DEFAULTS.baseBranch,
@@ -59,13 +68,20 @@ const CONFIG_TEMPLATE = {
 			// operator's own token, set as SWARM_OPERATOR_GH_TOKEN in `.env` on each host
 			// that runs implementer phases (issue #396).
 			//
-			// `pm` holds one reference per credential role the *PM provider* declares
-			// (issue #497). GitHub Projects declares `apiToken` — the board's own GitHub
-			// token, required and never the operator's (issue #537); its webhook secret
-			// inherits `webhookSecret` above, so it needs no entry here.
+			// `scm` holds one reference per role, *per SCM provider* (issue #628), so a
+			// project can carry a second provider's credentials without either
+			// overwriting the other. Only the provider named by `scm` above is ever
+			// resolved. `pm` holds one reference per credential role the *PM provider*
+			// declares (issue #497). GitHub Projects declares `apiToken` — the board's own
+			// GitHub token, required and never the operator's (issue #537); its webhook
+			// secret inherits the repo side's, so it needs no entry here.
 			credentials: {
-				reviewer: 'SCM_TOKEN_REVIEWER',
-				webhookSecret: 'SCM_WEBHOOK_SECRET',
+				scm: {
+					github: {
+						reviewer: 'GITHUB_TOKEN_REVIEWER',
+						webhookSecret: 'GITHUB_WEBHOOK_SECRET',
+					},
+				},
 				pm: {
 					apiToken: 'PM_GITHUB_PROJECTS_TOKEN',
 				},

@@ -28,10 +28,20 @@ import { linearConfigSchema } from '../integrations/pm/linear/config-schema.js';
 // leaf import rather than pulling the provider implementations in behind it.
 import { getPMProvider } from '../integrations/pm/registry.js';
 import { trelloConfigSchema } from '../integrations/pm/trello/config-schema.js';
+// Registry lookup only, like the PM one above — `../integrations/scm/registry.js`
+// imports nothing at runtime.
+import { listSCMProviders } from '../integrations/scm/registry.js';
 // The Zod mirror of `ScmType`; `../scm/events.js` imports only zod plus a type-only
 // `ScmType`, so this stays a leaf import too.
 import { ScmProviderIdSchema } from '../scm/events.js';
+// The value list behind `ScmType` — `../scm/types.js` imports nothing at runtime.
+import { SCM_TYPES } from '../scm/types.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
+import {
+	adoptLegacyScmCredentials,
+	ScmCredentialReferencesByProviderSchema,
+	ScmProviderCredentialReferencesSchema,
+} from './scm-credentials.js';
 
 /**
  * A model value is known when it's a logical id for its CLI (or the union, when
@@ -69,10 +79,16 @@ export const PROJECT_DEFAULTS = {
 
 /**
  * References to a project's *project-scoped* source-control credentials — the
- * reviewer persona token plus the webhook-verification secret. These two are
- * provider-neutral and shared by every SCM provider (issue #290); the PM side's
- * per-provider roles are the sibling {@link PmCredentialReferencesSchema}, which
- * does not reshape these.
+ * reviewer persona token plus the webhook-verification secret — as the single
+ * shared pair they were before issue #628.
+ *
+ * **Legacy shape, kept only so an old config still parses.** Both keys are now
+ * optional on {@link CredentialsSchema} and are read by exactly one thing: the
+ * adoption normalizer (`./scm-credentials.ts`), which copies them into
+ * `credentials.scm[<the provider the project runs on>]`. Nothing resolves them at
+ * runtime. The live shape is {@link ScmCredentialReferencesByProviderSchema}, one
+ * block per provider, so a project can hold GitHub's and GitLab's credentials at
+ * once instead of the two overwriting one pair.
  *
  * These are *references*, never the secret values: each is a key into the
  * secret store (the Postgres `project_credentials` table / an env var name),
@@ -89,11 +105,13 @@ export const PROJECT_DEFAULTS = {
  * (author = operator ≠ reviewer). This schema stays non-strict, so a legacy
  * `swarm.config.json` still carrying an `implementer` reference parses with the
  * key stripped, keeping `swarm config apply` idempotent.
+ *
+ * @deprecated Pre-#628 shared pair — use `credentials.scm[<providerId>]`.
  */
 export const ScmCredentialReferencesSchema = z.object({
-	/** Reference to the reviewer-persona GitHub token in the secret store. */
+	/** Reference to the reviewer-persona token in the secret store. */
 	reviewer: z.string().min(1),
-	/** Reference to the GitHub webhook HMAC secret used to verify inbound events. */
+	/** Reference to the secret inbound deliveries are authenticated with. */
 	webhookSecret: z.string().min(1),
 });
 
@@ -115,14 +133,37 @@ export const PmCredentialReferencesSchema = z
 	.describe("References to the PM provider's credentials, keyed by its declared roles");
 
 /**
- * `credentials.pm` is optional and stays so deliberately: a provider whose roles
- * all resolve from elsewhere needs no entry (GitHub Projects' webhook secret
- * inherits `credentials.webhookSecret`), and every config written before this
- * existed keeps parsing and resolving exactly as it did.
+ * A project's credential *references*, in three parts:
+ *
+ * - `scm` — one `{ reviewer?, webhookSecret? }` block **per SCM provider id** (issue
+ *   #628), validated against the registered SCM manifests by
+ *   {@link validateScmCredentialReferences}. Resolution reads only the provider it
+ *   was asked for, so a project may retain a provider it is not currently running on
+ *   without either provider's secret shadowing the other's.
+ * - `reviewer` / `webhookSecret` — the **legacy** shared pair, now optional and read
+ *   only by `adoptLegacyScmCredentials` (`./scm-credentials.ts`), which copies it into
+ *   `scm` on parse. Kept (rather than deleted) so an old `swarm.config.json` still
+ *   parses at all: a non-strict object would strip the keys and lose the reference
+ *   names before the normalizer could adopt them.
+ * - `pm` — the PM provider's own declared roles. Optional and staying so
+ *   deliberately: a provider whose roles all resolve from elsewhere needs no entry
+ *   (GitHub Projects' webhook secret inherits the repo side's), and every config
+ *   written before it existed keeps parsing and resolving exactly as it did.
+ *
+ * Every field being optional means the whole block can legitimately be `{}` — a
+ * project mid-provider-switch, or the DB-free worker's inert placeholder
+ * (`src/transport/db-free-project.ts`).
  */
-export const CredentialsSchema = ScmCredentialReferencesSchema.extend({
-	pm: PmCredentialReferencesSchema.optional(),
-}).describe('References to a project credentials (never the secrets themselves)');
+export const CredentialsSchema = z
+	.object({
+		/** @deprecated Pre-#628 shared reviewer reference; adopted into `scm` on parse. */
+		reviewer: z.string().min(1).optional(),
+		/** @deprecated Pre-#628 shared webhook-secret reference; adopted into `scm` on parse. */
+		webhookSecret: z.string().min(1).optional(),
+		scm: ScmCredentialReferencesByProviderSchema.optional(),
+		pm: PmCredentialReferencesSchema.optional(),
+	})
+	.describe('References to a project credentials (never the secrets themselves)');
 
 /**
  * One agent model target — a CLI, the logical model to run on it, and the
@@ -714,18 +755,104 @@ function validatePmCredentialRoles(
 }
 
 /**
- * A whole project config: {@link ProjectConfigBaseSchema}'s fields plus the
- * cross-field PM-credential-role check. This is what `validateConfig` and every
- * config-parsing call site uses.
+ * Validate `credentials.scm` against the registered SCM manifests (issue #628) — the
+ * SCM twin of {@link validatePmCredentialRoles}, and, like it, the cross-field check
+ * neither schema can make alone.
+ *
+ * It checks **structure only**, in two halves that are deliberately validated against
+ * different things:
+ *
+ * 1. **Every key must be a known provider id** (`ScmProviderIdSchema` — the same closed
+ *    enum `scm` itself uses), so a typo'd key is caught rather than silently holding
+ *    credentials nothing will ever read. Checked against the *enum*, not the registry,
+ *    for the reason the `scm` field's own doc gives: a config may be parsed by a surface
+ *    that never loaded `src/integrations/entrypoint.js` (a dashboard bundle, a focused
+ *    unit test), and validity must not depend on which modules a process imported.
+ *    `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`) stays the loud
+ *    check for a provider that is unregistered or not runtime-ready.
+ * 2. **Every role must be one the named provider declares**, which does need the
+ *    manifest — so it is skipped for a provider that is not registered here, exactly as
+ *    {@link validatePmCredentialRoles} is skipped for an unregistered `pm.type`.
+ *
+ * It deliberately does *not* require the provider named by `project.scm` to have its two
+ * references, and that divergence from the PM check is the point: `project.scm` is
+ * switchable from the dashboard's Source Control tab while `pm.type` is not, so
+ * "provider selected, credentials not yet entered" is a state one click legitimately
+ * creates. A parse-time presence error would leave that project readable at runtime (the
+ * DB read path does not validate) yet rejected by `validateConfig` / `swarm config
+ * apply`, with no way for the operator to avoid it. Presence is enforced instead by
+ * `requireScmCredential` (`./provider.ts`), which fires when the credential is actually
+ * needed and names the project, provider, role, and conventional env var key.
  */
-export const ProjectConfigSchema = ProjectConfigBaseSchema.superRefine(validatePmCredentialRoles);
+function validateScmCredentialReferences(
+	project: z.infer<typeof ProjectConfigBaseSchema>,
+	ctx: z.RefinementCtx,
+): void {
+	const references = project.credentials.scm;
+	if (!references) return;
+
+	const manifests = listSCMProviders();
+
+	for (const [providerId, roles] of Object.entries(references)) {
+		if (!(SCM_TYPES as readonly string[]).includes(providerId)) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['credentials', 'scm', providerId],
+				message:
+					`'${providerId}' is not an SCM provider id, so credentials stored under it would ` +
+					`never be read — the provider ids are: ${SCM_TYPES.join(', ')}`,
+			});
+			continue;
+		}
+
+		const manifest = manifests.find((candidate) => candidate.id === providerId);
+		if (!manifest) continue;
+
+		const declaredNames: readonly string[] = (manifest.credentialRoles ?? []).map(
+			(spec) => spec.role,
+		);
+		for (const role of Object.keys(roles)) {
+			if (declaredNames.includes(role)) continue;
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['credentials', 'scm', providerId, role],
+				message:
+					`SCM provider '${manifest.id}' declares no credential role '${role}' — ` +
+					(declaredNames.length
+						? `its roles are: ${declaredNames.join(', ')}`
+						: 'it declares no credential roles'),
+			});
+		}
+	}
+}
+
+/**
+ * A whole project config: {@link ProjectConfigBaseSchema}'s fields, the legacy
+ * SCM-credential adoption, and the two cross-field credential checks. This is what
+ * `validateConfig` and every config-parsing call site uses.
+ *
+ * The `.transform` runs **before** the refinements on purpose: a pre-#628 config's bare
+ * `{ reviewer, webhookSecret }` pair is adopted into `credentials.scm` first, so both
+ * checks see the shape every later reader sees.
+ */
+export const ProjectConfigSchema = ProjectConfigBaseSchema.transform(adoptLegacyScmCredentials)
+	.superRefine(validatePmCredentialRoles)
+	.superRefine(validateScmCredentialReferences);
 
 export const SwarmConfigSchema = z.object({
 	projects: z.array(ProjectConfigSchema).min(1),
 });
 
 export type Credentials = z.infer<typeof CredentialsSchema>;
+/** @deprecated Pre-#628 shared pair — see {@link ScmCredentialReferencesSchema}. */
 export type ScmCredentialReferences = z.infer<typeof ScmCredentialReferencesSchema>;
+export type {
+	ScmCredentialReferencesByProvider,
+	ScmProviderCredentialReferences,
+} from './scm-credentials.js';
+// Re-exported so `credentials.scm`'s shape is reachable from the one module every
+// config consumer already imports, while the schemas themselves stay in the leaf.
+export { ScmCredentialReferencesByProviderSchema, ScmProviderCredentialReferencesSchema };
 export type PmCredentialReferences = z.infer<typeof PmCredentialReferencesSchema>;
 export type AgentTarget = z.infer<typeof AgentTargetSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;

@@ -35,10 +35,10 @@
  * GitLab-minted `whsec_…` value), which would close that gap. Adopting it is a
  * deliberate **follow-up**, not this phase: `SCMProvider.verifyWebhookSignature`
  * never sees the `webhook-id` / `webhook-timestamp` headers the signed message
- * needs, and a GitLab-minted key cannot be the operator-chosen
- * `credentials.webhookSecret` the same project's GitHub Projects PM webhook
- * already shares — so it needs the contract widened *and* a per-provider secret
- * reference added.
+ * needs, so it still needs the contract widened. Its *other* prerequisite is done —
+ * a GitLab-minted key could not be the operator-chosen secret the same project's
+ * GitHub Projects PM webhook shared, and issue #628 made that secret per provider
+ * (`credentials.scm.gitlab.webhookSecret` is GitLab's alone).
  *
  * ## GitLab has no "request changes" merge-request action
  *

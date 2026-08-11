@@ -18,14 +18,50 @@
  *   which the receiver needs before it has a request to hand the provider.
  * - **A `runtimeReady` opt-out** (issue #296), so a provider can be registered
  *   and discoverable while its contract is still being filled in phase by phase.
+ * - **`credentialRoles`, but for a closed role set** (issue #628). The PM
+ *   manifest's field exists because each PM provider needs *different* credentials;
+ *   an SCM provider always needs exactly the two the contract itself names
+ *   ({@link SCM_CREDENTIAL_ROLES}). What differs per provider is only the
+ *   conventional *reference name* for each role, which is what a spec declares — so
+ *   a project can hold GitHub's and GitLab's credentials at once instead of the two
+ *   overwriting one shared pair. See {@link ScmCredentialRoleSpec}.
  * - **Nothing else yet, on purpose** (ai/CODING_STANDARDS.md "don't build it
- *   speculatively"): no `configSchema` (a project's SCM config is `repo` +
- *   `credentials`, with no per-provider block — `src/config/schema.ts`), no
- *   `discovery`, no `credentialRoles`, and no signature/secret fields (one HMAC
- *   secret is shared with PM, and verification is an {@link SCMProvider} method).
+ *   speculatively"): no `configSchema` (a project's SCM config is `repo` + `scm` +
+ *   `credentials.scm[<providerId>]`, with no provider-owned config block —
+ *   `src/config/schema.ts`), no `discovery`, and no signature/secret fields
+ *   (verification is an {@link SCMProvider} method).
  */
 
-import type { SCMProvider, ScmType } from '../../scm/types.js';
+import type { SCMProvider, ScmCredentialRole, ScmType } from '../../scm/types.js';
+
+/**
+ * One of the two credentials an SCM provider needs, as *that provider's* reference
+ * name for it (issue #628) — the SCM twin of `PmCredentialRoleSpec`
+ * (`../pm/manifest.ts`), minus the fields a closed role set does not need: the
+ * role is one of {@link SCM_CREDENTIAL_ROLES}, never a free string, and neither
+ * role is optional or inherited.
+ *
+ * A project supplies a *reference* per (provider, role) under
+ * `credentials.scm[<providerId>][<role>]` (`src/config/schema.ts`) — never the
+ * secret — and `resolveScmCredentialOrNull` / `requireScmCredential`
+ * (`src/config/provider.ts`) turn `(project, providerId, role)` into the secret.
+ */
+export interface ScmCredentialRoleSpec {
+	/** Which of the contract's two credentials this spec names. */
+	readonly role: ScmCredentialRole;
+	/**
+	 * Conventional secret-store key for this role — the `swarm config apply` env var
+	 * a new project is seeded with, and the key `requireScmCredential`'s error names.
+	 *
+	 * **Not** the reference an existing project necessarily uses: a project created
+	 * since issue #290 holds the provider-neutral `SCM_TOKEN_REVIEWER` /
+	 * `SCM_WEBHOOK_SECRET` names, and issue #628's adoption preserves them verbatim
+	 * (renaming a reference without moving the `project_credentials` row would break
+	 * resolution outright). So anything that *displays* a credential key must show
+	 * the reference the role resolves through, not this.
+	 */
+	readonly envVarKey: string;
+}
 
 export interface SCMProviderManifest {
 	/** Stable registry key / provider discriminator, e.g. `github`. */
@@ -67,6 +103,15 @@ export interface SCMProviderManifest {
 	 * the envelope provider ID is explicitly specified.
 	 */
 	readonly runtimeReady?: boolean;
+	/**
+	 * This provider's reference name for each of the contract's two credentials
+	 * (issue #628) — the declaration a project's `credentials.scm[<this id>]` map is
+	 * validated against (`src/config/schema.ts`), and the source of the keys a new
+	 * project is seeded with. Every provider declares both roles; no two providers
+	 * may share an `envVarKey`, or storing one provider's secret would overwrite
+	 * another's (asserted by `tests/unit/integrations/scm/scm-conformance.test.ts`).
+	 */
+	readonly credentialRoles: readonly ScmCredentialRoleSpec[];
 	/** The provider implementation — one shared, stateless instance (see above). */
 	readonly provider: SCMProvider;
 }

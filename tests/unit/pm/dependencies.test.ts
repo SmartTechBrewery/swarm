@@ -82,6 +82,15 @@ describe('findDependencyReferences', () => {
 		expect(findDependencyReferences(clause)).toEqual([]);
 	});
 
+	it('does not bind a later dependent through an earlier prerequisite phrase', () => {
+		expect(findDependencyReferences('Depends on #12, but #631 is blocked by this task.')).toEqual([
+			'12',
+		]);
+		expect(
+			findDependencyReferences('#12 must be done first, but #631 is blocked by this task.'),
+		).toEqual(['12']);
+	});
+
 	it('drops a dependency phrase whose object is this item', () => {
 		// The keyword leads, yet the relation runs the other way — the reference is
 		// the dependent side, not a prerequisite.

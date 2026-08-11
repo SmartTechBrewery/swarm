@@ -1,7 +1,11 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-
 import type { ProjectConfig } from '../../config/schema.js';
+import {
+	type ScmProviderCredentialReferences,
+	scmCredentialReferenceFor,
+	sharedScmCredentialProviderFor,
+} from '../../config/scm-credentials.js';
 import {
 	deleteProjectCredential,
 	resolveAllProjectCredentials,
@@ -13,6 +17,13 @@ import {
 } from '../../db/repositories/projectsRepository.js';
 import type { PmCredentialRoleSpec } from '../../integrations/pm/manifest.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
+import {
+	isRuntimeReadySCMProvider,
+	type SCMProviderManifest,
+	type ScmCredentialRoleSpec,
+} from '../../integrations/scm/manifest.js';
+import { getSCMProvider } from '../../integrations/scm/registry.js';
+import { SCM_CREDENTIAL_ROLES, type ScmType } from '../../scm/types.js';
 import { assertProjectAccess } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
@@ -26,17 +37,22 @@ import { authedProcedure, router } from '../trpc.js';
  * gets NOT_FOUND (existence hidden), so the assertion also subsumes the old
  * existence check.
  *
- * Two families live here, and they differ in *who declares the roles*:
+ * Two families live here — `list`/`set`/`delete` for the **SCM** side and
+ * `listPm`/`setPm`/`deletePm` for the **PM** side — and since issue #632 they have
+ * the same shape: both are addressed by `(providerId, role)` and both resolve the
+ * secret-store key server-side. What still differs is *who declares the roles*: an
+ * SCM provider's two are named by the contract itself (`SCM_CREDENTIAL_ROLES`,
+ * `src/scm/types.ts`) and only their conventional reference name is per provider,
+ * while a PM provider declares its own vocabulary (an email + token, a key + token +
+ * secret). Either way the manifest's `credentialRoles` is what a `list` renders from.
  *
- * - `list`/`set`/`delete` edit the shared **SCM** references (`reviewer`,
- *   `webhookSecret`), a fixed pair on the central config schema.
- * - `listPm`/`setPm`/`deletePm` edit the **PM provider's own** roles — whatever the
- *   registered manifest for `project.pm.type` declares (`credentialRoles`, issue
- *   #497), so the surface is provider-driven and the dashboard's Project Management
- *   tab renders it without naming a provider (issue #537). The client names a
- *   *role*, never an env-var key: the reference key is the project's existing one or
- *   the role's declared `envVarKey`, resolved server-side, so a browser can neither
- *   invent a store key nor point a role at another project's secret.
+ * **The client never names a secret-store key.** It names a provider and a role, both
+ * picked off the matching `list`, and the reference key is resolved here: the
+ * reference the project already configured, else the role's declared `envVarKey`. That
+ * is what makes the SCM side per provider rather than one shared pair — a browser can
+ * neither invent a store key nor overwrite another provider's secret by pointing a
+ * role at its reference (issue #632; the pre-#632 `set` took the key itself, which is
+ * exactly what let saving GitLab's reviewer token land on GitHub's row).
  */
 
 /**
@@ -110,14 +126,118 @@ function requirePmRoleSpec(project: ProjectConfig, role: string): PmCredentialRo
 /**
  * The secret-store key one PM role resolves through, mirroring
  * `resolvePmCredential`'s order (`src/config/provider.ts`): the reference the
- * project already configured, else the shared reference the role inherits, else the
- * role's declared conventional key.
+ * project already configured, else the SCM-side reference the role inherits — since
+ * issue #628 the *per-provider* one for the SCM provider this project runs on — else
+ * the role's declared conventional key.
  */
 function pmReferenceKeyFor(project: ProjectConfig, spec: PmCredentialRoleSpec): string {
 	const configured = project.credentials.pm?.[spec.role];
 	if (configured) return configured;
-	if (spec.inheritsSharedCredential) return project.credentials[spec.inheritsSharedCredential];
+	if (spec.inheritsSharedCredential) {
+		const inherited = scmCredentialReferenceFor(
+			project,
+			sharedScmCredentialProviderFor(project),
+			spec.inheritsSharedCredential,
+		);
+		if (inherited) return inherited;
+	}
 	return spec.envVarKey;
+}
+
+/**
+ * The registered SCM manifest for `providerId`, or `null` when nothing can serve it.
+ *
+ * Runtime-readiness is part of "can serve it": a manifest declaring
+ * `runtimeReady: false` is registered so a provider under construction can be resolved
+ * by id, and no project may route to it (`requireProjectSCMProvider`), so offering its
+ * credential fields would invite an operator to configure a provider that cannot run.
+ * A miss is an ordinary condition rather than a bug — the dashboard's provider
+ * catalogue is a hand-kept browser list (`dashboard/src/lib/credentials.ts`) and may
+ * name a provider this installation has not registered — so {@link list} reports it
+ * instead of throwing.
+ */
+function runtimeReadyScmProvider(providerId: string): SCMProviderManifest | null {
+	const manifest = getSCMProvider(providerId);
+	return manifest && isRuntimeReadySCMProvider(manifest) ? manifest : null;
+}
+
+/**
+ * The provider a request addresses: the one it named, else the one the project runs
+ * on. `sharedScmCredentialProviderFor` is the same attribution issue #628's adoption
+ * used for a project that names no provider, so the tab shows the very block such a
+ * project's references were adopted into rather than an empty one.
+ */
+function requestedScmProviderId(project: ProjectConfig, providerId: string | undefined): string {
+	return providerId ?? sharedScmCredentialProviderFor(project);
+}
+
+/**
+ * The role spec an SCM write names, validated against the *registered* manifest for the
+ * provider it names — the SCM twin of {@link requirePmRoleSpec}. An unserveable
+ * provider is NOT_FOUND and an undeclared role a BAD_REQUEST: the client picked both
+ * off {@link list}, so a mismatch means the provider changed under it.
+ *
+ * Returns the manifest's own `id` alongside the spec, so callers address
+ * `credentials.scm` with a validated provider id rather than the raw input string.
+ */
+function requireScmRoleSpec(
+	providerId: string,
+	role: string,
+): { providerId: ScmType; spec: ScmCredentialRoleSpec } {
+	const manifest = runtimeReadyScmProvider(providerId);
+	if (!manifest) {
+		throw new TRPCError({
+			code: 'NOT_FOUND',
+			message: `No runtime-ready SCM provider is registered for '${providerId}'`,
+		});
+	}
+	const spec = manifest.credentialRoles.find((candidate) => candidate.role === role);
+	if (!spec) {
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message: `SCM provider '${manifest.id}' declares no credential role '${role}'`,
+		});
+	}
+	return { providerId: manifest.id, spec };
+}
+
+/**
+ * The secret-store key one `(provider, role)` resolves through, mirroring
+ * `resolveScmCredentialOrNull`'s order (`src/config/provider.ts`): the reference the
+ * project already configured for *that provider*, else the role's declared conventional
+ * key. Never another provider's reference — that fallback is the overwrite issue #632
+ * exists to remove.
+ */
+function scmReferenceKeyFor(
+	project: ProjectConfig,
+	providerId: ScmType,
+	spec: ScmCredentialRoleSpec,
+): string {
+	return scmCredentialReferenceFor(project, providerId, spec.role) ?? spec.envVarKey;
+}
+
+/**
+ * Persist one provider's `role -> reference` block under `credentials.scm[providerId]`,
+ * leaving every other provider's block untouched. Written through the project row (a
+ * reference is config, not a secret) and only when it actually changes, so setting a
+ * credential twice doesn't churn the row. A block that empties drops out entirely
+ * rather than persisting as `{}`.
+ */
+async function updateScmReferences(
+	project: ProjectConfig,
+	providerId: ScmType,
+	references: ScmProviderCredentialReferences,
+): Promise<void> {
+	const current = project.credentials.scm?.[providerId] ?? {};
+	if (SCM_CREDENTIAL_ROLES.every((role) => current[role] === references[role])) return;
+
+	const scm = { ...(project.credentials.scm ?? {}) };
+	if (SCM_CREDENTIAL_ROLES.some((role) => references[role])) scm[providerId] = references;
+	else delete scm[providerId];
+	await upsertProjectToDb({
+		...project,
+		credentials: { ...project.credentials, scm },
+	});
 }
 
 /**
@@ -144,26 +264,45 @@ async function updatePmReferences(
 }
 
 export const credentialsRouter = router({
+	/**
+	 * One SCM provider's credential state for this project — the data the Source
+	 * Control tab renders its fields from, addressed per provider since issue #632 so
+	 * switching the tab's selector shows *that* provider's own state (unconfigured
+	 * where nothing was saved) instead of one shared pair.
+	 *
+	 * `providerId` defaults to the provider the project runs on. An id nothing can
+	 * serve reports `providerRegistered: false` with no roles rather than throwing, so
+	 * the tab renders a "not available in this dashboard" state.
+	 */
 	list: authedProcedure
-		.input(z.object({ projectId: z.string().min(1) }))
+		.input(z.object({ projectId: z.string().min(1), providerId: z.string().min(1).optional() }))
 		.query(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			const project = await requireProject(input.projectId);
-
+			const providerId = requestedScmProviderId(project, input.providerId);
+			const manifest = runtimeReadyScmProvider(providerId);
 			const resolved = await resolveAllProjectCredentials(input.projectId);
 
-			// The Source Control screen edits the shared SCM references only; the PM
-			// provider's own role map (`credentials.pm`, issue #497) is provider-declared
-			// and served by `listPm` below, so it is excluded here rather than listed as a
-			// role whose "env var key" is an object.
-			const { pm: _pmReferences, ...scmReferences } = project.credentials;
-
-			return Object.entries(scmReferences).map(([role, envVarKey]) => ({
-				role: role as 'reviewer' | 'webhookSecret',
-				envVarKey,
-				isConfigured: isUsableSecret(resolved[envVarKey]),
-				maskedValue: maskCredential(resolved[envVarKey]),
-			}));
+			return {
+				providerId,
+				providerLabel: manifest?.label ?? providerId,
+				/** `false` when nothing runtime-ready is registered — nothing is editable then. */
+				providerRegistered: !!manifest,
+				roles: manifest
+					? manifest.credentialRoles.map((spec) => {
+							const referenceKey = scmReferenceKeyFor(project, manifest.id, spec);
+							return {
+								role: spec.role,
+								/** The provider's conventional `swarm config apply` key for this role. */
+								envVarKey: spec.envVarKey,
+								/** The store key this role currently resolves through. Never a secret. */
+								referenceKey,
+								isConfigured: isUsableSecret(resolved[referenceKey]),
+								maskedValue: maskCredential(resolved[referenceKey]),
+							};
+						})
+					: [],
+			};
 		}),
 
 	/**
@@ -257,35 +396,65 @@ export const credentialsRouter = router({
 			await updatePmReferences(project, remaining);
 		}),
 
+	/**
+	 * Store the secret for one `(provider, role)` and make sure
+	 * `credentials.scm[providerId]` names it, so a project configured entirely through
+	 * the dashboard resolves the same way a file-configured one does
+	 * (`resolveScmCredentialOrNull`). The plaintext is written straight to the encrypted
+	 * store and never read back.
+	 *
+	 * Only the named provider's block is touched: another provider's stored secret and
+	 * reference are left exactly as they were, which is what lets an operator evaluate a
+	 * second provider without re-entering the first one's credentials.
+	 */
 	set: authedProcedure
 		.input(
 			z.object({
 				projectId: z.string().min(1),
-				envVarKey: z
-					.string()
-					.regex(/^[A-Z_][A-Z0-9_]*$/, 'must be an UPPER_SNAKE_CASE env var key'),
+				providerId: z.string().min(1),
+				role: z.string().min(1),
 				value: z.string().min(1),
-				name: z.string().optional(),
 			}),
 		)
 		.mutation(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
-			await requireProject(input.projectId);
+			const project = await requireProject(input.projectId);
+			const { providerId, spec } = requireScmRoleSpec(input.providerId, input.role);
+			const referenceKey = scmReferenceKeyFor(project, providerId, spec);
 
-			await writeProjectCredential(
-				input.projectId,
-				input.envVarKey,
-				input.value,
-				input.name ?? null,
-			);
+			// No display name: the store row's label was the one thing the pre-#632 input let
+			// a client choose alongside the key, and nothing reads it for an SCM reference.
+			await writeProjectCredential(input.projectId, referenceKey, input.value, null);
+			await updateScmReferences(project, providerId, {
+				...(project.credentials.scm?.[providerId] ?? {}),
+				[spec.role]: referenceKey,
+			});
 		}),
 
+	/**
+	 * Clear one `(provider, role)`: delete the stored secret *and* drop that provider's
+	 * reference for that role, leaving every other provider's block in place. Dropping
+	 * the reference is the point — an SCM reference has no host-environment fallback, so
+	 * "removed" means resolution fails explicitly with the provider and role named. A
+	 * later `swarm config apply` re-adds the reference from `swarm.config.json`, which is
+	 * the file-based configuration path staying authoritative for itself.
+	 */
 	delete: authedProcedure
-		.input(z.object({ projectId: z.string().min(1), envVarKey: z.string().min(1) }))
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				providerId: z.string().min(1),
+				role: z.string().min(1),
+			}),
+		)
 		.mutation(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
-			await requireProject(input.projectId);
+			const project = await requireProject(input.projectId);
+			const { providerId, spec } = requireScmRoleSpec(input.providerId, input.role);
+			const referenceKey = scmReferenceKeyFor(project, providerId, spec);
 
-			await deleteProjectCredential(input.projectId, input.envVarKey);
+			await deleteProjectCredential(input.projectId, referenceKey);
+			const { [spec.role]: _removed, ...remaining } = project.credentials.scm?.[providerId] ?? {};
+			await updateScmReferences(project, providerId, remaining);
 		}),
 });

@@ -6,7 +6,6 @@ import {
 	canSaveBoardMapping,
 	getPmMappingProvider,
 	isBaseUrlMissing,
-	PM_MAPPING_PROVIDERS,
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
 } from '@/lib/board-mapping.js';
@@ -15,14 +14,19 @@ import { trpc } from '@/lib/trpc.js';
 import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 
 /**
- * Provider-neutral board/status mapping panel (issue #201) — the second half of the
- * Project Management tab, under its credential section. Replaces the old GitHub
- * Projects raw-ID form: the operator picks a PM provider, then a discovered
- * board, then maps each canonical SWARM pipeline status to one of that board's
- * discovered states. Opaque IDs stay option values and persisted data — never
- * something to type. Boards/states are discovered through the `pm` API using the
- * project's own PM credential, resolved server-side (issue #537); the browser never
- * handles a credential.
+ * Provider-neutral board/status mapping panel (issue #201) — the last section of
+ * the Project Management tab, under the provider and credential cards. Replaces
+ * the old GitHub Projects raw-ID form: the operator picks a discovered board, then
+ * maps each canonical SWARM pipeline status to one of that board's discovered
+ * states. Opaque IDs stay option values and persisted data — never something to
+ * type. Boards/states are discovered through the `pm` API using the project's own
+ * PM credential, resolved server-side (issue #537); the browser never handles a
+ * credential.
+ *
+ * The provider selector itself moved out of this form and into `PmProviderPanel`
+ * at the top of the tab (issue #630), so the provider is stated before the settings
+ * it scopes. That is behaviour-preserving: the provider is not editable yet, and it
+ * still reaches this form's save through `form.providerId` and `buildPmUpdate`.
  *
  * The owning route holds the form state and the save/reset handlers (so the save
  * goes through the same serialized `projects.update` write as the other tabs);
@@ -32,7 +36,6 @@ import type { PmStatusKey } from '../../../../src/pm/pipeline.js';
 interface BoardMappingPanelProps {
 	projectId: string;
 	form: BoardMappingForm;
-	onProviderChange: (providerId: string) => void;
 	onSelectContainer: (containerId: string) => void;
 	onStatusOptionChange: (key: PmStatusKey, value: string) => void;
 	/** Record the opaque provider context (GitHub's Status field id) from state discovery. */
@@ -81,7 +84,6 @@ function stateOptionsFor(
 export function BoardMappingPanel({
 	projectId,
 	form,
-	onProviderChange,
 	onSelectContainer,
 	onStatusOptionChange,
 	onStatesContext,
@@ -95,9 +97,10 @@ export function BoardMappingPanel({
 }: BoardMappingPanelProps) {
 	const provider = getPmMappingProvider(form.providerId);
 
-	// The registered providers confirm which catalogue entries are actually
-	// selectable — a catalogue entry alone never offers a provider the backend
-	// can't discover.
+	// The registered providers confirm the persisted one is actually selectable —
+	// a catalogue entry alone never offers a provider the backend can't discover,
+	// so an unregistered provider gates the discovery queries below rather than
+	// firing them against nothing.
 	const providersQuery = useQuery(trpc.pm.listProviders.queryOptions({ projectId }));
 	const registeredIds = new Set<string>((providersQuery.data ?? []).map((p) => p.id));
 	const providerSelectable = registeredIds.has(form.providerId);
@@ -158,38 +161,7 @@ export function BoardMappingPanel({
 						Board
 					</h2>
 
-					<div className="max-w-xs">
-						<label htmlFor="pm-provider" className={LABEL_CLASS}>
-							Provider
-						</label>
-						<select
-							id="pm-provider"
-							value={form.providerId}
-							onChange={(e) => onProviderChange(e.target.value)}
-							disabled={isPending}
-							className={SELECT_CLASS}
-						>
-							{PM_MAPPING_PROVIDERS.map((p) => (
-								<option
-									key={p.id}
-									value={p.id}
-									// Changing providers requires credentials and discovery for that provider,
-									// so this mapping editor remains scoped to the persisted provider.
-									disabled={
-										p.id !== form.providerId ||
-										(providersQuery.isSuccess && !registeredIds.has(p.id))
-									}
-								>
-									{p.label}
-								</option>
-							))}
-						</select>
-					</div>
-
-					<p className="text-xs text-zinc-400 mt-4">{provider.intro}</p>
-					<p className="text-xs text-zinc-500 mt-2">
-						Change the PM provider in <code className="font-mono">swarm.config.json</code>.
-					</p>
+					<p className="text-xs text-zinc-400">{provider.intro}</p>
 				</div>
 
 				{/* Board / container picker */}

@@ -59,6 +59,17 @@ export const gitlabScmManifest: SCMProviderManifest = {
 	// secret reference (a GitLab-minted `whsec_…` key cannot be the operator-chosen
 	// secret the same project's PM webhook shares). See `./webhook.ts`'s header.
 	runtimeReady: true,
+	// GitLab's own reference names for the contract's two credentials (issue #628),
+	// so a project can hold these alongside GitHub's or Bitbucket's instead of the
+	// three sharing (and overwriting) one pair. Spelled like the sibling operator
+	// variable `SWARM_OPERATOR_GITLAB_TOKEN`. `webhookSecret` is the operator-chosen
+	// token GitLab echoes in `X-Gitlab-Token` (see `./webhook.ts`), not an HMAC key —
+	// and now that it is per provider, the per-provider secret reference GitLab 19.0's
+	// Standard-Webhooks signing tokens would need is no longer a blocker on its own.
+	credentialRoles: [
+		{ role: 'reviewer', envVarKey: 'GITLAB_TOKEN_REVIEWER' },
+		{ role: 'webhookSecret', envVarKey: 'GITLAB_WEBHOOK_SECRET' },
+	],
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).
 	provider: new GitLabSCMIntegration(),

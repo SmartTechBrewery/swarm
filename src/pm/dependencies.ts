@@ -146,18 +146,55 @@ function clauseReferences(clause: string): ClauseReference[] {
 	return refs;
 }
 
+/**
+ * The first token of a relation: its phrase unless a nearby reference is its
+ * subject ("#631 is blocked by this task"). Treating the subject as the start
+ * keeps an earlier relation from absorbing it as a later object.
+ */
+function relationStart(
+	clause: string,
+	phraseStart: number,
+	refs: readonly ClauseReference[],
+): number {
+	for (let index = refs.length - 1; index >= 0; index--) {
+		const ref = refs[index];
+		const gap = phraseStart - ref.tokenEnd;
+		if (gap < 0) continue;
+		const between = clause.slice(ref.tokenEnd, phraseStart);
+		if (
+			gap <= BINDING_WINDOW_CHARS &&
+			/^\s*(?:(?:is|was|will\s+be|remains?|becomes?)\s+)?(?:an?\s+)?$/.test(between)
+		) {
+			return ref.tokenStart;
+		}
+		break;
+	}
+	return phraseStart;
+}
+
+/** Starts of every relation in a clause, including the reference subject where present. */
+function relationStarts(clause: string, refs: readonly ClauseReference[]): number[] {
+	return [...clause.matchAll(TRAILING_OBJECT_KEYWORDS), ...clause.matchAll(LEADING_OBJECT_KEYWORDS)]
+		.map((keyword) => relationStart(clause, keyword.index, refs))
+		.sort((left, right) => left - right);
+}
+
 /** References an object-side phrase binds: the ones just *after* it. */
 function addTrailingObjectRefs(
 	clause: string,
 	refs: readonly ClauseReference[],
 	found: Set<string>,
 ): void {
+	const starts = relationStarts(clause, refs);
 	for (const keyword of clause.matchAll(TRAILING_OBJECT_KEYWORDS)) {
 		const phraseEnd = keyword.index + keyword[0].length;
 		if (SELF_OBJECT_AFTER.test(clause.slice(phraseEnd))) continue;
+		const nextRelationStart = starts.find((start) => start > phraseEnd) ?? clause.length;
 		for (const ref of refs) {
 			const gap = ref.tokenStart - phraseEnd;
-			if (gap >= 0 && gap <= BINDING_WINDOW_CHARS) found.add(ref.number);
+			if (gap >= 0 && gap <= BINDING_WINDOW_CHARS && ref.tokenEnd <= nextRelationStart) {
+				found.add(ref.number);
+			}
 		}
 	}
 }
@@ -171,9 +208,12 @@ function addLeadingObjectRefs(
 	for (const keyword of clause.matchAll(LEADING_OBJECT_KEYWORDS)) {
 		const phraseStart = keyword.index;
 		if (SELF_OBJECT_BEFORE.test(clause.slice(0, phraseStart))) continue;
+		const start = relationStart(clause, phraseStart, refs);
 		for (const ref of refs) {
 			const gap = phraseStart - ref.tokenEnd;
-			if (gap >= 0 && gap <= BINDING_WINDOW_CHARS) found.add(ref.number);
+			if (gap >= 0 && gap <= BINDING_WINDOW_CHARS && ref.tokenStart >= start) {
+				found.add(ref.number);
+			}
 		}
 	}
 }
