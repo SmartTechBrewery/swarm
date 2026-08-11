@@ -8,6 +8,7 @@ import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	type DashboardProjectScope,
+	type DashboardWorkerView,
 	enrollWorker,
 	getDashboardWorkerDetail,
 	getEnrollment,
@@ -40,11 +41,12 @@ import { authedProcedure, router } from '../trpc.js';
  *   (`assertInstanceAdmin`, issue #647). Given a `projectId` (#574) the same query
  *   serves **one project's** roster instead — the project detail page's Workers
  *   tab, the view an enrolled worker owner keeps — under the project roster's own
- *   access rule. `getById` (#477) returns that same row for one worker, widened
- *   with per-project enrollment detail and with what the *viewer* may change, so
- *   the detail screen offers only controls that would succeed; it stays bounded by
- *   `accessibleProjectScope`, because a worker owner reaches it from their
- *   project's roster.
+ *   access rule. Either way the caller's own machines are listed first (#657),
+ *   which is ordering alone and no change to what is visible. `getById` (#477)
+ *   returns that same row for one worker, widened with per-project enrollment
+ *   detail and with what the *viewer* may change, so the detail screen offers only
+ *   controls that would succeed; it stays bounded by `accessibleProjectScope`,
+ *   because a worker owner reaches it from their project's roster.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
  *   (`enroll`), renames a machine (`rename`), and controls the revocable
@@ -155,6 +157,28 @@ async function resolveRosterScope(
 	return null;
 }
 
+/**
+ * The viewer's own machines first (issue #657) — presentation order only. It
+ * reorders the rows `listDashboardWorkers` already decided are visible and
+ * changes nothing about visibility, project scoping, ownership, or
+ * authorization; both worker lists the dashboard renders (the global `/workers`
+ * screen and a project's Workers tab) read this one procedure, so ordering here
+ * covers both.
+ *
+ * The sort is **stable** (per spec), so the read model's own oldest-first order
+ * is preserved within each group and a viewer who owns no visible worker sees it
+ * unchanged. A row whose owner user row no longer resolves (`owner === null`)
+ * groups with the others, which is correct: the signed-in viewer's own user row
+ * resolved to produce `ctx.user`, so a missing one is never theirs.
+ */
+function viewerWorkersFirst(
+	workers: DashboardWorkerView[],
+	viewerUserId: string,
+): DashboardWorkerView[] {
+	const isViewers = (worker: DashboardWorkerView) => worker.owner?.userId === viewerUserId;
+	return [...workers].sort((a, b) => Number(isViewers(b)) - Number(isViewers(a)));
+}
+
 const AllowedClisInput = z.array(AgentCliSchema).min(1);
 /**
  * The phases an enrollment may be given (issue #509). Non-empty for the same
@@ -177,12 +201,14 @@ export const workersRouter = router({
 	// machines), which an `instanceAdmin` alone may read (issue #647); with a
 	// `projectId` (#574) it is that one project, authorized like `roster`.
 	// Read-only — no mutation, no path/credential/token, and no routing or
-	// approval affordance.
+	// approval affordance. The caller's own machines are ordered first (#657,
+	// `viewerWorkersFirst`) — a presentation-order concern, applied after scoping
+	// decided what is visible.
 	list: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }).optional())
 		.query(async ({ ctx, input }) => {
 			const scope = await resolveRosterScope(ctx.user, input?.projectId);
-			const workers = await listDashboardWorkers(scope);
+			const workers = viewerWorkersFirst(await listDashboardWorkers(scope), ctx.user.id);
 			// The service already assembled a secret-free view; the only wire-shape
 			// concern here is giving the browser an explicit ISO timestamp.
 			return workers.map((worker) => ({
