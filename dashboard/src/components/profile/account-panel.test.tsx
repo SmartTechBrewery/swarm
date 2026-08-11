@@ -47,6 +47,17 @@ describe('AccountPanel', () => {
 		expect(screen.queryByText('User')).toBeNull();
 	});
 
+	it('names who owns each value — the operator, except the self-editable name', () => {
+		render(<AccountPanel user={makeUser()} />);
+
+		expect(
+			screen.getByText(/login identifier and installation\s+role are read-only/),
+		).toBeDefined();
+		expect(
+			screen.getByText(/display name is yours to change, on\s+the Security tab/),
+		).toBeDefined();
+	});
+
 	it('is read-only — it offers no control', () => {
 		const { container } = render(<AccountPanel user={makeUser({ instanceAdmin: true })} />);
 

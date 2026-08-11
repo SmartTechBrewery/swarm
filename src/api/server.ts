@@ -33,7 +33,7 @@ import {
 	revokeSession,
 	verifyCredentials,
 } from '../identity/auth.js';
-import type { SwarmUser } from '../identity/schema.js';
+import { getUser } from '../identity/service.js';
 import { buildCorsMiddleware } from '../lib/cors.js';
 import { isSingleUserMode } from '../lib/env.js';
 import { configureLogger, logger } from '../lib/logger.js';
@@ -90,9 +90,11 @@ export function createApiApp(
 	// the `corsOrigin` pattern). When enabled, tRPC requests resolve the
 	// bootstrapped local admin instead of a session cookie (issue #298).
 	const singleUserMode = options.singleUserMode ?? isSingleUserMode();
-	// The bootstrapped admin, ensured lazily on the first tRPC request and cached
-	// for the app's lifetime so single-user requests don't hit the DB every call.
-	let singleUser: SwarmUser | undefined;
+	// The bootstrapped admin's id, ensured lazily on the first tRPC request and
+	// cached for the app's lifetime — the *bootstrap* happens once, but the user
+	// itself is re-read per request (issue #662) so a self-service change is
+	// visible immediately rather than at the next restart.
+	let singleUserId: string | undefined;
 
 	// Credentialed CORS for the documented separate-origin dev setup; inert for a
 	// same-origin deploy (which never pre-flights). Must run before every route so
@@ -158,9 +160,13 @@ export function createApiApp(
 				// Single-user mode: supply the bootstrapped local admin as the caller
 				// even with no session cookie. The cookie flow below is never consulted,
 				// so a local install needs no /login, password, or swarm_session cookie.
+				// The row is re-read per request — the same per-request user read the
+				// cookie path already does — so a rename made on the profile screen
+				// (issue #662) is reflected immediately.
 				if (singleUserMode) {
-					singleUser ??= await resolveSingleUser();
-					return { user: singleUser };
+					singleUserId ??= (await resolveSingleUser()).id;
+					const admin = (await getUser(singleUserId)) ?? (await resolveSingleUser());
+					return { user: admin };
 				}
 				const token = getCookie(c, SESSION_COOKIE_NAME);
 				const user = token ? await resolveSession(token) : undefined;

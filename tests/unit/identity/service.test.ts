@@ -1,14 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getUserById, findUserByIdentifier } = vi.hoisted(() => ({
+const { getUserById, findUserByIdentifier, setDisplayName } = vi.hoisted(() => ({
 	getUserById: vi.fn(),
 	findUserByIdentifier: vi.fn(),
+	setDisplayName: vi.fn(),
 }));
 
-vi.mock('@/db/repositories/usersRepository.js', () => ({ getUserById, findUserByIdentifier }));
+vi.mock('@/db/repositories/usersRepository.js', () => ({
+	getUserById,
+	findUserByIdentifier,
+	setDisplayName,
+}));
 
 import type { SwarmUser } from '@/identity/schema.js';
-import { getUser, isInstanceAdmin, resolveUserByIdentifier } from '@/identity/service.js';
+import {
+	getUser,
+	isInstanceAdmin,
+	renameUser,
+	resolveUserByIdentifier,
+} from '@/identity/service.js';
 
 function makeUser(overrides: Partial<SwarmUser> = {}): SwarmUser {
 	return {
@@ -26,6 +36,28 @@ describe('identity service', () => {
 	beforeEach(() => {
 		getUserById.mockReset();
 		findUserByIdentifier.mockReset();
+		setDisplayName.mockReset();
+	});
+
+	describe('renameUser', () => {
+		it('trims the name and delegates to the repository', async () => {
+			const renamed = makeUser({ displayName: 'Ada' });
+			setDisplayName.mockResolvedValue(renamed);
+
+			expect(await renameUser(renamed.id, '  Ada  ')).toBe(renamed);
+			expect(setDisplayName).toHaveBeenCalledWith(renamed.id, 'Ada');
+		});
+
+		it('passes through undefined for an unknown user', async () => {
+			setDisplayName.mockResolvedValue(undefined);
+			expect(await renameUser('missing', 'Ada')).toBeUndefined();
+		});
+
+		it('rejects an empty or over-long name before touching the repository', async () => {
+			await expect(renameUser('id', '   ')).rejects.toThrow();
+			await expect(renameUser('id', 'a'.repeat(81))).rejects.toThrow();
+			expect(setDisplayName).not.toHaveBeenCalled();
+		});
 	});
 
 	describe('getUser / resolveUserByIdentifier', () => {
