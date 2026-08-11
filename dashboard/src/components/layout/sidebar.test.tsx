@@ -48,13 +48,14 @@ import { useCurrentUser } from '@/lib/use-current-user.js';
 import { Sidebar } from './sidebar.js';
 
 function renderSidebar() {
-	render(
+	const { container } = render(
 		<QueryClientProvider
 			client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
 		>
 			<Sidebar />
 		</QueryClientProvider>,
 	);
+	return container;
 }
 
 beforeEach(() => {
@@ -81,5 +82,57 @@ describe('Sidebar user block', () => {
 		renderSidebar();
 
 		expect(screen.getByRole('button', { name: 'Sign out' })).toBeDefined();
+	});
+
+	it('keeps the account row out of the scrolling nav column (issue #665)', () => {
+		const container = renderSidebar();
+
+		// The sidebar is its own bounded, pinned column on desktop; without that the
+		// column below has nothing to scroll within.
+		expect(container.firstElementChild?.className).toContain('md:sticky');
+		expect(container.firstElementChild?.className).toContain('md:h-screen');
+
+		// The nav is what scrolls when the project list outgrows the viewport…
+		const scroller = container.querySelector('.md\\:overflow-y-auto');
+		expect(scroller?.querySelector('nav')).not.toBeNull();
+
+		// …and the account controls sit outside it, so they cannot scroll away.
+		expect(scroller?.contains(screen.getByRole('link', { name: 'Ada Lovelace' }))).toBe(false);
+		expect(scroller?.contains(screen.getByRole('button', { name: 'Sign out' }))).toBe(false);
+	});
+
+	it('states the connection as an accessible status with no textual label (issue #665)', async () => {
+		renderSidebar();
+
+		// The status is exposed to assistive tech via role + accessible name, not
+		// by requiring a hover/focus to read a bare `title`.
+		const status = await screen.findByRole('status', { name: 'Connected' });
+		expect(status.querySelector('svg')?.getAttribute('class')).toContain('lucide-circle-check');
+
+		expect(screen.queryByText('Connected')).toBeNull();
+		expect(screen.queryByText('Disconnected')).toBeNull();
+		expect(screen.queryByText('Connecting…')).toBeNull();
+	});
+
+	it('gives the disconnected state its own icon shape, not just a color change', async () => {
+		pingQueryFn.mockRejectedValue(new Error('unreachable'));
+
+		renderSidebar();
+
+		const status = await screen.findByRole('status', { name: 'Disconnected' });
+		const icon = status.querySelector('svg');
+		expect(icon?.getAttribute('class')).toContain('lucide-circle-x');
+		expect(icon?.getAttribute('class')).not.toContain('lucide-circle-check');
+	});
+
+	it('gives the pending/connecting state its own icon shape while the ping is in flight', () => {
+		// Never resolves, so the query stays in its initial (pending) state.
+		pingQueryFn.mockReturnValue(new Promise(() => {}));
+
+		renderSidebar();
+
+		const status = screen.getByRole('status', { name: 'Connecting…' });
+		const icon = status.querySelector('svg');
+		expect(icon?.getAttribute('class')).toContain('lucide-circle-dashed');
 	});
 });
