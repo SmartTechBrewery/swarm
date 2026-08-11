@@ -8,6 +8,7 @@ import {
 	missingRequiredPmRoles,
 	type PmCredentialEntry,
 	pmRoleInheritanceNote,
+	pmRoleKeyOriginNote,
 	pmRoleStatusLabel,
 } from '@/lib/pm-credentials.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
@@ -24,8 +25,10 @@ import { Modal, ModalFooter } from '../ui/modal.js';
  * receives one back.
  *
  * Nothing here names GitHub Projects: the provider label, each role's label, and
- * its permission guidance all come from the manifest, so a second provider's
- * different credential shape renders without a change to this component.
+ * its permission guidance all come from the manifest, and the key each role is shown
+ * under is the one the *project* resolves it through (issue #630 — `referenceKey`,
+ * not the manifest's conventional default), so a second provider's different
+ * credential shape renders without a change to this component.
  *
  * Saving invalidates the board-discovery queries as well as the credential list, so
  * the board picker below immediately retries with the new credential — that retry
@@ -160,6 +163,9 @@ interface PmCredentialFieldProps {
 function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCredentialFieldProps) {
 	const editable = isPmRoleEditable(entry);
 	const inheritanceNote = pmRoleInheritanceNote(entry);
+	// Only set when the resolved key diverges from the provider's declared default —
+	// the two notes are mutually exclusive, so a card never carries two key lines.
+	const keyOriginNote = pmRoleKeyOriginNote(entry);
 	// An unconfigured credential opens straight into the input — there is no masked
 	// value to collapse to. A read-only (inherited) role never opens one.
 	const [editing, setEditing] = useState(editable && !entry.isConfigured);
@@ -185,7 +191,10 @@ function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCre
 			<div>
 				<div className="flex items-center gap-2">
 					<span className="text-sm font-medium text-zinc-200">{entry.label}</span>
-					<span className="text-xs text-zinc-500 font-mono select-all">{entry.envVarKey}</span>
+					{/* The key this project resolves the role through, not the provider's
+					    conventional default: it is the only key setting a value acts on, and
+					    it is what `isConfigured`/`maskedValue` beside it already describe. */}
+					<span className="text-xs text-zinc-500 font-mono select-all">{entry.referenceKey}</span>
 					<span
 						className={
 							entry.isConfigured
@@ -205,6 +214,8 @@ function PmCredentialField({ projectId, entry, onSaved, onRequestRemove }: PmCre
 						{inheritanceNote}
 					</p>
 				)}
+				{/* No Lock icon: this role *is* editable here — the icon stays the read-only marker. */}
+				{keyOriginNote && <p className="text-xs text-zinc-500 mt-1">{keyOriginNote}</p>}
 			</div>
 
 			{!editable ? null : editing ? (
