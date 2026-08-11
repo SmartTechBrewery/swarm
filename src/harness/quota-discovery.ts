@@ -1,12 +1,21 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import { getDb } from '../db/client.js';
 import { RETRY_PENDING_RUN_STATUSES } from '../db/repositories/runsRepository.js';
 import { runs } from '../db/schema/runs.js';
 import { logger } from '../lib/logger.js';
 import type { AgentCli } from './agent-cli.js';
+import { supportsOutputFormat } from './antigravity-capabilities.js';
+import {
+	findAntigravityCommandData,
+	readAntigravityCredits,
+	readAntigravityQuota,
+} from './antigravity-quota.js';
 import { probeBinary } from './binary-probe.js';
 import type { CliQuotaSnapshot } from './quota.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Cheap availability check to verify if the binary exists and runs.
@@ -230,6 +239,138 @@ export function queryCodexQuota(command = 'codex'): Promise<Partial<CliQuotaSnap
 }
 
 /**
+ * Budget for one `agy` print-mode command probe. Measured live at ~3.6 s against
+ * agy 1.1.12, so the budget is deliberately wide enough for a cold start rather
+ * than trimmed to the measurement.
+ */
+const ANTIGRAVITY_COMMAND_TIMEOUT_MS = 20_000;
+
+/**
+ * Cap on the reported detail of a failed probe. A spawn error's message carries
+ * the child's stderr, and this string is persisted on the snapshot and rendered
+ * on the dashboard.
+ */
+const MAX_PROBE_ERROR_CHARS = 500;
+
+/**
+ * What one `agy` slash-command probe established. The three outcomes are kept
+ * apart on purpose: `unanswered` is a *capability* answer (this build predates
+ * print-mode slash commands) and must reach the operator as today's silent
+ * run-derived fallback, while `failed` is a probe that never got to answer and
+ * is surfaced the way a failed Codex probe is.
+ */
+type AntigravityCommandProbe =
+	| { outcome: 'answered'; data: unknown }
+	| { outcome: 'unanswered' }
+	| { outcome: 'failed'; error: string };
+
+/**
+ * Ask `agy` one read-only slash command in print mode and return the structured
+ * `command` block it printed.
+ *
+ * Flag order is load-bearing (ai/RULES.md §6): agy's `-p` is a *value* flag
+ * whose value is the prompt, so `--output-format` goes **before** it and the
+ * slash command immediately after — a flag landing in between is swallowed as
+ * the prompt and the CLI exits 0 having done nothing.
+ *
+ * `json` rather than `stream-json` here (the harness's own choice for a run):
+ * a probe has no live log to keep fed, and the buffered single document is the
+ * shape the payload was verified in.
+ */
+async function probeAntigravityCommand(
+	command: string,
+	slashCommand: string,
+	commandName: string,
+): Promise<AntigravityCommandProbe> {
+	let stdout = '';
+	try {
+		stdout = (
+			await execFileAsync(command, ['--output-format', 'json', '-p', slashCommand], {
+				timeout: ANTIGRAVITY_COMMAND_TIMEOUT_MS,
+			})
+		).stdout;
+	} catch (err) {
+		const failure = err as (NodeJS.ErrnoException & { killed?: boolean; stdout?: string }) | null;
+		// A CLI that answered and *then* exited non-zero still answered, so its
+		// captured output is read below. Only a probe that never ran or ran out of
+		// budget is a failure with nothing to inspect.
+		if (failure?.code === 'ENOENT' || failure?.code === 'ETIMEDOUT' || failure?.killed === true) {
+			// The budget is named rather than asserted as the cause: `killed` also
+			// covers an output overflow, and the operator reads this string.
+			const detail = failure.message?.trim() || String(failure.code ?? 'killed');
+			const budget = failure.killed === true ? ` (budget ${ANTIGRAVITY_COMMAND_TIMEOUT_MS}ms)` : '';
+			return {
+				outcome: 'failed',
+				error: `agy ${slashCommand} probe failed: ${detail.slice(0, MAX_PROBE_ERROR_CHARS)}${budget}`,
+			};
+		}
+		stdout = typeof failure?.stdout === 'string' ? failure.stdout : '';
+	}
+
+	const data = findAntigravityCommandData(stdout, commandName);
+	return data === undefined ? { outcome: 'unanswered' } : { outcome: 'answered', data };
+}
+
+/**
+ * Read Antigravity's live allowance from `agy`'s print-mode `/quota` command.
+ *
+ * Returns `undefined` when the installed binary does not answer the command —
+ * the run-derived fallback stays in charge and no error reaches the operator.
+ * That decision is made from **observed capability**, never a version compare
+ * (ai/RULES.md §6), in two layers: a binary without `--output-format` predates
+ * print-mode command answers entirely and is never spawned at all (it would take
+ * `/quota` for an ordinary prompt and burn an agent turn on it), and a binary
+ * that answers without a structured `command` block has told us the same thing.
+ *
+ * `/credits` is a second probe rather than part of the first, because agy
+ * reports the balance under its own command — and it is only asked once `/quota`
+ * has confirmed the capability, so an older binary is probed exactly once.
+ */
+export async function queryAntigravityQuota(
+	command = 'agy',
+): Promise<Partial<CliQuotaSnapshot> | undefined> {
+	if (!(await supportsOutputFormat(command))) return undefined;
+
+	const usage = await probeAntigravityCommand(command, '/quota', 'usage');
+	if (usage.outcome === 'failed') return { status: 'error', error: usage.error };
+	if (usage.outcome === 'unanswered') {
+		logger.debug('agy answered /quota without a command block; keeping the quota fallback', {
+			command,
+		});
+		return undefined;
+	}
+
+	const reading = readAntigravityQuota(usage.data);
+	if (!reading) return undefined;
+
+	const credits = await probeAntigravityCommand(command, '/credits', 'credits');
+
+	return {
+		status: 'available',
+		remainingPercentage: reading.remainingPercentage,
+		resetTime: reading.resetTime,
+		// Best-effort: a balance SWARM couldn't read must not cost the operator the
+		// window data that did arrive.
+		credits: credits.outcome === 'answered' ? readAntigravityCredits(credits.data) : undefined,
+		windows: reading.windows,
+	};
+}
+
+/**
+ * The live quota read for one CLI, or `undefined` when there is none to make —
+ * either the CLI has no live path (claude, until its own issue lands) or the
+ * installed binary doesn't support the one it has.
+ */
+function queryLiveQuota(
+	cli: AgentCli,
+	command: string,
+): Promise<Partial<CliQuotaSnapshot> | undefined> {
+	if (cli === 'codex') return queryCodexQuota(command);
+	if (cli === 'antigravity') return queryAntigravityQuota(command);
+	return Promise.resolve(undefined);
+}
+
+/**
  * Discover CLI capabilities and build quota snapshots for all known agent CLIs.
  */
 export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot[]> {
@@ -255,46 +396,46 @@ export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot
 		// Fallback signal from runs table
 		const fallbackInfo = await getFallbackRateLimitInfo(cli);
 
-		if (cli === 'codex' && !cheap) {
+		// `cheap` keeps every live probe out of a hot path; a CLI with no live path
+		// — and a binary that doesn't support the one it has — yields `undefined`
+		// and drops through to the run-derived branch below.
+		let liveQuota: Partial<CliQuotaSnapshot> | undefined;
+		if (!cheap) {
 			try {
-				const liveQuota = await queryCodexQuota(binaryName);
-				if (liveQuota.status === 'available') {
-					snapshots.push({
-						cli,
-						status: 'available',
-						remainingPercentage: liveQuota.remainingPercentage,
-						resetTime: liveQuota.resetTime,
-						plan: liveQuota.plan,
-						credits: liveQuota.credits,
-						source: 'live',
-						lastUpdated: now,
-						windows: liveQuota.windows,
-					});
-				} else {
-					// If live query failed but binary exists, fall back
-					snapshots.push({
-						cli,
-						status: liveQuota.status || 'error',
-						source: 'fallback',
-						error: liveQuota.error || 'Live quota query failed',
-						resetTime: fallbackInfo?.resetTime,
-						lastUpdated: now,
-					});
-				}
+				liveQuota = await queryLiveQuota(cli, binaryName);
 			} catch (err: unknown) {
 				const errMsg = err instanceof Error ? err.message : String(err);
-				snapshots.push({
-					cli,
+				liveQuota = {
 					status: 'error',
-					source: 'fallback',
-					error: errMsg || 'Error querying live Codex quota',
-					resetTime: fallbackInfo?.resetTime,
-					lastUpdated: now,
-				});
+					error: errMsg || `Error querying live ${cli} quota`,
+				};
 			}
+		}
+
+		if (liveQuota?.status === 'available') {
+			snapshots.push({
+				cli,
+				status: 'available',
+				remainingPercentage: liveQuota.remainingPercentage,
+				resetTime: liveQuota.resetTime,
+				plan: liveQuota.plan,
+				credits: liveQuota.credits,
+				source: 'live',
+				lastUpdated: now,
+				windows: liveQuota.windows,
+			});
+		} else if (liveQuota) {
+			// The live query ran and didn't answer: fall back, recording why.
+			snapshots.push({
+				cli,
+				status: liveQuota.status || 'error',
+				source: 'fallback',
+				error: liveQuota.error || 'Live quota query failed',
+				resetTime: fallbackInfo?.resetTime,
+				lastUpdated: now,
+			});
 		} else {
-			// For claude and antigravity, when configured and runnable, we use run-derived fallback only.
-			// Also for codex when cheap = true is requested.
+			// No live read was possible, so the run-derived signal is all there is.
 			snapshots.push({
 				cli,
 				status: 'available',
