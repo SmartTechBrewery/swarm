@@ -63,6 +63,11 @@ import {
 	_resetPMProviderRegistryForTesting,
 	registerPMProvider,
 } from '@/integrations/pm/registry.js';
+import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
+import {
+	_resetSCMProviderRegistryForTesting,
+	registerSCMProvider,
+} from '@/integrations/scm/registry.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
 
 const ADMIN_USER: SwarmUser = {
@@ -192,9 +197,35 @@ describe('projectsRouter', () => {
 			branchPrefix: 'issue-',
 		};
 
+		// Issue #628: the SCM references a new project starts with are read off the
+		// manifest for the provider it names, exactly as the `credentials.pm` ones are read
+		// off the PM manifest. A stub with recognizable keys is what proves that — a
+		// hardcoded seeding would keep producing the old `SCM_*` names.
+		beforeEach(() => {
+			_resetSCMProviderRegistryForTesting();
+			registerSCMProvider({
+				id: 'github',
+				label: 'Stub',
+				category: 'scm',
+				webhookRoute: '/stub/webhook',
+				credentialRoles: [
+					{ role: 'reviewer', envVarKey: 'SCM_STUB_TOKEN_REVIEWER' },
+					{ role: 'webhookSecret', envVarKey: 'SCM_STUB_WEBHOOK_SECRET' },
+				],
+			} as unknown as SCMProviderManifest);
+		});
+
+		// The per-provider map, plus the *interim* legacy mirror of the same two names that
+		// keeps phase 1's Source Control tab editing the rows the resolver reads.
 		const defaultCredentials = {
-			reviewer: 'SCM_TOKEN_REVIEWER',
-			webhookSecret: 'SCM_WEBHOOK_SECRET',
+			scm: {
+				github: {
+					reviewer: 'SCM_STUB_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_STUB_WEBHOOK_SECRET',
+				},
+			},
+			reviewer: 'SCM_STUB_TOKEN_REVIEWER',
+			webhookSecret: 'SCM_STUB_WEBHOOK_SECRET',
 		};
 
 		it('happy path: calls createProjectWithMemberInDb with the input plus credentials and creator membership, and returns the merged object', async () => {
@@ -315,6 +346,36 @@ describe('projectsRouter', () => {
 			} finally {
 				_resetPMProviderRegistryForTesting();
 			}
+		});
+
+		// Issue #628: the map is keyed by the provider the project names, and seeded from
+		// *that* manifest — so creating a Bitbucket project stores Bitbucket's keys, and no
+		// GitHub reference is invented for it.
+		it('seeds the credentials.scm block for the provider the project names', async () => {
+			registerSCMProvider({
+				id: 'bitbucket',
+				label: 'Stub Bitbucket',
+				category: 'scm',
+				webhookRoute: '/stub-bitbucket/webhook',
+				credentialRoles: [
+					{ role: 'reviewer', envVarKey: 'BB_STUB_TOKEN_REVIEWER' },
+					{ role: 'webhookSecret', envVarKey: 'BB_STUB_WEBHOOK_SECRET' },
+				],
+			} as unknown as SCMProviderManifest);
+			vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
+
+			const result = await caller.create({ ...validProjectInput, scm: 'bitbucket' });
+
+			expect(result.credentials).toEqual({
+				scm: {
+					bitbucket: {
+						reviewer: 'BB_STUB_TOKEN_REVIEWER',
+						webhookSecret: 'BB_STUB_WEBHOOK_SECRET',
+					},
+				},
+				reviewer: 'BB_STUB_TOKEN_REVIEWER',
+				webhookSecret: 'BB_STUB_WEBHOOK_SECRET',
+			});
 		});
 
 		it('strips a client-supplied pm block and uses the placeholder default', async () => {

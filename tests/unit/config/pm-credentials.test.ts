@@ -76,9 +76,10 @@ afterEach(() => {
 });
 
 beforeEach(() => {
-	// This project conventionally exports the shared webhook variable. Negative
-	// cases must be independent of whether the runner inherited that environment.
-	vi.stubEnv('SCM_WEBHOOK_SECRET', '');
+	// This project conventionally exports the webhook variable the github-projects role
+	// declares (`GITHUB_WEBHOOK_SECRET` since issue #628 made the SCM references per
+	// provider). Negative cases must be independent of whether the runner inherited it.
+	vi.stubEnv('GITHUB_WEBHOOK_SECRET', '');
 });
 
 describe('credentials.pm validation against the declared roles', () => {
@@ -255,7 +256,7 @@ describe('resolvePmCredential', () => {
 	});
 
 	it("prefers the project's own reference for the role over the host env", async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue('from-store');
 
 		expect(await resolvePmCredential(project, 'webhookSecret')).toBe('from-store');
@@ -263,10 +264,12 @@ describe('resolvePmCredential', () => {
 	});
 
 	// The reach that keeps GitHub Projects' effective credentials unchanged: with no
-	// `credentials.pm`, the role resolves the project's existing shared reference —
-	// exactly what `getWebhookSecretOrNull` resolves for the repo side.
-	it('falls back to the shared reference the role declares it inherits', async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
+	// `credentials.pm`, the role resolves the repo side's own webhook-secret reference —
+	// exactly what `getWebhookSecretOrNull` resolves. Since issue #628 that is the
+	// *per-provider* reference for the SCM provider the project runs on; this fixture
+	// states none, so it is GitHub's, which is where the legacy pair was adopted.
+	it('falls back to the SCM reference the role declares it inherits', async () => {
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue('shared-secret');
 
 		expect(await resolvePmCredential(projectWithoutPmReferences, 'webhookSecret')).toBe(
@@ -275,8 +278,46 @@ describe('resolvePmCredential', () => {
 		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'SHARED_WEBHOOK_KEY');
 	});
 
+	// Issue #628: the inherited secret is the repo side's for the provider the project
+	// *runs on*, so a board paired with a GitLab repo resolves GitLab's webhook secret and
+	// never GitHub's — which for GitLab is the token it echoes in `X-Gitlab-Token`.
+	it("inherits the per-provider secret for the project's own SCM provider", async () => {
+		const gitlabRepoProject = createMockProjectConfig({
+			id: 'proj-1',
+			scm: 'gitlab',
+			credentials: {
+				scm: {
+					github: { webhookSecret: 'GH_HOOK_KEY' },
+					gitlab: { webhookSecret: 'GL_HOOK_KEY' },
+				},
+				pm: { apiToken: 'PM_TOKEN_KEY' },
+			},
+		});
+		vi.mocked(resolveProjectCredential).mockResolvedValue('gitlab-secret');
+
+		expect(await resolvePmCredential(gitlabRepoProject, 'webhookSecret')).toBe('gitlab-secret');
+		expect(resolveProjectCredential).toHaveBeenCalledWith('proj-1', 'GL_HOOK_KEY');
+		expect(resolveProjectCredential).not.toHaveBeenCalledWith('proj-1', 'GH_HOOK_KEY');
+	});
+
+	// Fails closed rather than reaching for another provider's secret.
+	it('resolves null when the project stores no secret for its own SCM provider', async () => {
+		const unconfigured = createMockProjectConfig({
+			id: 'proj-1',
+			scm: 'bitbucket',
+			credentials: {
+				scm: { github: { webhookSecret: 'GH_HOOK_KEY' } },
+				pm: { apiToken: 'PM_TOKEN_KEY' },
+			},
+		});
+		vi.mocked(resolveProjectCredential).mockResolvedValue('github-secret');
+
+		expect(await resolvePmCredential(unconfigured, 'webhookSecret')).toBeNull();
+		expect(resolveProjectCredential).not.toHaveBeenCalledWith('proj-1', 'GH_HOOK_KEY');
+	});
+
 	it("falls back to the role's env var when an explicitly configured role resolves nowhere", async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'from-env');
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'from-env');
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 
 		expect(await resolvePmCredential(project, 'webhookSecret')).toBe('from-env');
@@ -286,7 +327,7 @@ describe('resolvePmCredential', () => {
 	});
 
 	it('fails closed for an inherited role with no PM reference even when its env var is set', async () => {
-		vi.stubEnv('SCM_WEBHOOK_SECRET', 'ambient-secret');
+		vi.stubEnv('GITHUB_WEBHOOK_SECRET', 'ambient-secret');
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 
 		expect(await resolvePmCredential(projectWithoutPmReferences, 'webhookSecret')).toBeNull();
@@ -331,7 +372,7 @@ describe('requirePmCredential', () => {
 	it('throws naming the role and both ways to supply it', async () => {
 		vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 		await expect(requirePmCredential(project, 'webhookSecret')).rejects.toThrow(
-			/credentials\.pm\.webhookSecret.*SCM_WEBHOOK_SECRET/s,
+			/credentials\.pm\.webhookSecret.*GITHUB_WEBHOOK_SECRET/s,
 		);
 	});
 

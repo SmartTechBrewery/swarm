@@ -84,7 +84,10 @@ GitHub / Bitbucket / GitLab → HTTPS webhook → Router → durable Postgres di
 - A source-control repository on GitHub, Bitbucket Cloud, or gitlab.com — named by the
   project's `scm` field, which every project must set — and a project-management board with a
   webhook: a GitHub Projects v2 board, a Linear team, a Jira Cloud project, or a
-  Trello board
+  Trello board. The first three are configured in the provider's own UI; a Trello
+  webhook is a resource SWARM creates for you, with
+  `npm run swarm -- pm webhook create --project <id>` (see
+  [`docs/cli.md`](docs/cli.md))
 - Two distinct source-control identities for loop prevention: the worker operator's
   own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN` /
   `SWARM_OPERATOR_GITLAB_TOKEN`, the implementer persona) set in `.env` on each host,

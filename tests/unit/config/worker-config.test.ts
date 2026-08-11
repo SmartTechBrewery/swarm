@@ -16,10 +16,31 @@ describe('toWorkerConfig', () => {
 	});
 
 	it('leaks no credential reference or webhook secret into the projection', () => {
-		const project = createMockProjectConfig();
+		// Both credential shapes: the per-provider references the runtime resolves
+		// (`credentials.scm`, issue #628) and the legacy pair a migrated project still carries.
+		const project = createMockProjectConfig({
+			scm: 'gitlab',
+			credentials: {
+				reviewer: 'LEGACY_REVIEWER_REF',
+				webhookSecret: 'LEGACY_WEBHOOK_REF',
+				scm: {
+					github: { reviewer: 'GH_REVIEWER_REF', webhookSecret: 'GH_WEBHOOK_REF' },
+					gitlab: { reviewer: 'GL_REVIEWER_REF', webhookSecret: 'GL_WEBHOOK_REF' },
+				},
+				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+			},
+		});
 		const serialized = JSON.stringify(toWorkerConfig(project));
-		for (const secret of [project.credentials.reviewer, project.credentials.webhookSecret]) {
-			expect(serialized).not.toContain(secret);
+		for (const reference of [
+			'LEGACY_REVIEWER_REF',
+			'LEGACY_WEBHOOK_REF',
+			'GH_REVIEWER_REF',
+			'GH_WEBHOOK_REF',
+			'GL_REVIEWER_REF',
+			'GL_WEBHOOK_REF',
+			'PM_GITHUB_PROJECTS_TOKEN',
+		]) {
+			expect(serialized).not.toContain(reference);
 		}
 	});
 

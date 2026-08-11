@@ -154,6 +154,44 @@ describe('credentialsRouter', () => {
 			expect(result.map((r) => r.role)).toEqual(['reviewer', 'webhookSecret']);
 		});
 
+		// Issue #628 phase 1 keeps this surface on the pre-#628 single pair. A project that
+		// carries only the per-provider map — one written from `swarm init`'s post-#628
+		// template — must still be editable here, against the block for the provider it runs
+		// on, rather than rendering an empty tab. And `credentials.scm` must never be
+		// projected as a "role" whose env var key is an object.
+		it('projects the active provider’s references for a project with no legacy pair', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(
+				createMockProjectConfig({
+					id: 'p1',
+					scm: 'gitlab',
+					credentials: {
+						scm: {
+							github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
+							gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
+						},
+						pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+					},
+				}),
+			);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({ GL_REVIEWER: 'gitlab-token' });
+
+			const result = await caller.list({ projectId: 'p1' });
+			expect(result).toEqual([
+				{
+					role: 'reviewer',
+					envVarKey: 'GL_REVIEWER',
+					isConfigured: true,
+					maskedValue: '****',
+				},
+				{
+					role: 'webhookSecret',
+					envVarKey: 'GL_HOOK',
+					isConfigured: false,
+					maskedValue: 'not set',
+				},
+			]);
+		});
+
 		it('throws NOT_FOUND for an unknown project without resolving credentials', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
 

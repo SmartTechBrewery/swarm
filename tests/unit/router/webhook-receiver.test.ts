@@ -61,6 +61,10 @@ function fakeManifest(overrides: Partial<SCMProvider> = {}): SCMProviderManifest
 		label: 'GitHub',
 		category: 'scm',
 		webhookRoute: '/github/webhook',
+		credentialRoles: [
+			{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER' },
+			{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
+		],
 		provider: createFakeScmProvider({
 			readWebhookRequest: (header) => ({
 				eventName: header('x-github-event') ?? 'unknown',
@@ -265,6 +269,15 @@ describe('createWebhookApp', () => {
 			const res = await post(app, VALID_BODY);
 			expect(res.status).toBe(401);
 			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		// Issue #628: the secret is resolved for the *delivering* provider, so a project
+		// storing none for it is rejected rather than verified against a sibling's.
+		it('resolves the webhook secret for the delivering manifest’s provider id', async () => {
+			const { app, deps } = makeApp();
+			const res = await post(app, VALID_BODY);
+			expect(res.status).toBe(202);
+			expect(deps.getWebhookSecret).toHaveBeenCalledWith(project, 'github');
 		});
 
 		it("rejects with 401 when the provider's signature check fails", async () => {

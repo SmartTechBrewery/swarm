@@ -27,6 +27,7 @@ import { writeProjectCredential } from '../db/repositories/credentialsRepository
 import { upsertProjectToDb } from '../db/repositories/projectsRepository.js';
 import { discoverCliQuotas } from '../harness/quota-discovery.js';
 import type { SwarmConfig } from './schema.js';
+import { listScmCredentialReferences } from './scm-credentials.js';
 
 export interface ApplyResult {
 	/** Ids of the projects upserted, in config order. */
@@ -53,12 +54,16 @@ export async function applyConfig(config: SwarmConfig): Promise<ApplyResult> {
 		await upsertProjectToDb(project);
 		result.projects.push(project.id);
 
-		// The credentials block maps persona → env-var key, plus the PM provider's own
-		// role → env-var key map (`credentials.pm`, issue #497); distinct roles may
-		// point at the same key, so dedupe before writing to avoid redundant upserts.
-		const { pm: pmReferences, ...scmReferences } = project.credentials;
+		// Three reference sources: the per-provider SCM map (`credentials.scm`, issue
+		// #628), the legacy shared pair still carried beside it, and the PM provider's own
+		// role → env-var key map (`credentials.pm`, issue #497). Distinct roles and
+		// distinct providers may point at the same key — a project migrated from the
+		// legacy pair does exactly that — so dedupe before writing to avoid redundant
+		// upserts and double-counting.
+		const { pm: pmReferences, scm: _scmReferences, ...legacyReferences } = project.credentials;
 		const references = new Set([
-			...Object.values(scmReferences),
+			...listScmCredentialReferences(project),
+			...Object.values(legacyReferences).filter((key): key is string => key !== undefined),
 			...Object.values(pmReferences ?? {}),
 		]);
 		for (const envVarKey of references) {

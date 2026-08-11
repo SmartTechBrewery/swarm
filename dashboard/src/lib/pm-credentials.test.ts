@@ -6,6 +6,7 @@ import {
 	type PmCredentialEntry,
 	type PmCredentialsView,
 	pmRoleInheritanceNote,
+	pmRoleKeyOriginNote,
 	pmRoleStatusLabel,
 } from './pm-credentials.js';
 
@@ -44,14 +45,54 @@ describe('isPmRoleEditable', () => {
 });
 
 describe('pmRoleInheritanceNote', () => {
-	it('says where an inherited role is configured', () => {
-		const note = pmRoleInheritanceNote(entry({ inheritsSharedCredential: 'webhookSecret' }));
-		expect(note).toContain('webhookSecret');
+	// The reported defect (issue #630): the role inherits the shared SCM reference, so
+	// it resolves through `GITHUB_WEBHOOK_SECRET` while the provider's declared key is
+	// the neutral `SCM_WEBHOOK_SECRET`. The note must name the key that is actually
+	// read — never the unread default, and never SWARM's internal role name.
+	it('names the key an inherited role resolves through, and where it is configured', () => {
+		const note = pmRoleInheritanceNote(
+			entry({
+				role: 'webhookSecret',
+				envVarKey: 'SCM_WEBHOOK_SECRET',
+				referenceKey: 'GITHUB_WEBHOOK_SECRET',
+				inheritsSharedCredential: 'webhookSecret',
+			}),
+		);
+		expect(note).toContain('GITHUB_WEBHOOK_SECRET');
 		expect(note).toContain('Source Control');
+		expect(note).not.toContain('SCM_WEBHOOK_SECRET');
 	});
 
 	it('is absent for a role of the provider’s own', () => {
 		expect(pmRoleInheritanceNote(entry())).toBeUndefined();
+	});
+});
+
+describe('pmRoleKeyOriginNote', () => {
+	// The common case: the project resolves the role through the provider's own default,
+	// so there is nothing to explain and the card stays noise-free.
+	it('is absent when the resolved key is the provider’s declared default', () => {
+		expect(pmRoleKeyOriginNote(entry())).toBeUndefined();
+	});
+
+	it('names both keys when a project configured a reference of its own', () => {
+		const note = pmRoleKeyOriginNote(entry({ referenceKey: 'GH_PROJECTS_PAT' }));
+		expect(note).toContain('GH_PROJECTS_PAT');
+		expect(note).toContain('PM_GITHUB_PROJECTS_TOKEN');
+	});
+
+	// An inherited role's own note already names the resolved key, so this one stays
+	// silent rather than putting two key lines on the same card.
+	it('is absent for an inherited role even when the keys diverge', () => {
+		expect(
+			pmRoleKeyOriginNote(
+				entry({
+					envVarKey: 'SCM_WEBHOOK_SECRET',
+					referenceKey: 'GITHUB_WEBHOOK_SECRET',
+					inheritsSharedCredential: 'webhookSecret',
+				}),
+			),
+		).toBeUndefined();
 	});
 });
 
