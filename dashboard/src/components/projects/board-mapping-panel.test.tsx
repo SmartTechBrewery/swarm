@@ -9,18 +9,32 @@ import {
 	isBoardMappingDirty,
 	toBoardMappingForm,
 	withSelectedContainer,
+	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import type { ProjectPm } from '../../../../src/config/schema.js';
 import { BoardMappingPanel } from './board-mapping-panel.js';
 
-const { listProvidersFn, discoverContainersFn, discoverStatesFn } = vi.hoisted(() => ({
+const { listProvidersFn, discoverContainersFn, discoverStatesFn, listPmFn } = vi.hoisted(() => ({
 	listProvidersFn: vi.fn(),
 	discoverContainersFn: vi.fn(),
 	discoverStatesFn: vi.fn(),
+	listPmFn: vi.fn(),
 }));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
+		projects: {
+			credentials: {
+				// The panel reads the selected provider's declared roles so it can state the
+				// credential step before attempting discovery (issue #642).
+				listPm: {
+					queryOptions: (args: unknown) => ({
+						queryKey: ['projects.credentials.listPm', args],
+						queryFn: () => listPmFn(args),
+					}),
+				},
+			},
+		},
 		pm: {
 			listProviders: {
 				queryOptions: (args: unknown) => ({
@@ -47,12 +61,18 @@ vi.mock('@/lib/trpc.js', () => ({
 /** Route-equivalent state harness so board selection and discovery flow through real state. */
 function Harness({
 	initial,
+	draftProviderId,
 	onSubmit,
 }: {
 	initial?: ProjectPm;
+	/** Start the form on a provider the project is not persisted on (issue #642). */
+	draftProviderId?: string;
 	onSubmit?: (patch: ProjectPm) => void;
 }) {
-	const [form, setForm] = useState(() => toBoardMappingForm(initial));
+	const [form, setForm] = useState(() => {
+		const projected = toBoardMappingForm(initial);
+		return draftProviderId ? withSelectedProvider(projected, draftProviderId) : projected;
+	});
 	return (
 		<BoardMappingPanel
 			projectId="p1"
@@ -60,6 +80,9 @@ function Harness({
 			onSelectContainer={(containerId) => setForm((f) => withSelectedContainer(f, containerId))}
 			onStatusOptionChange={(key, value) =>
 				setForm((f) => ({ ...f, statusOptions: { ...f.statusOptions, [key]: value } }))
+			}
+			onProviderContextChange={(key, value) =>
+				setForm((f) => ({ ...f, providerContext: { ...f.providerContext, [key]: value } }))
 			}
 			onStatesContext={(context) => setForm((f) => ({ ...f, providerContext: context }))}
 			handleSubmit={(e) => {
@@ -87,7 +110,19 @@ function renderHarness(props: Parameters<typeof Harness>[0] = {}) {
 const PROVIDERS = [
 	{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
 	{ id: 'linear', label: 'Linear', discovery: ['containers', 'states'] },
-	{ id: 'jira', label: 'Jira', discovery: ['containers', 'states'] },
+	{
+		id: 'jira',
+		label: 'Jira',
+		discovery: ['containers', 'states'],
+		discoveryDraft: [
+			{
+				key: 'baseUrl',
+				label: 'Jira site URL',
+				inputType: 'url',
+				description: 'The Jira Cloud site URL.',
+			},
+		],
+	},
 	{ id: 'trello', label: 'Trello', discovery: ['containers', 'states'] },
 ];
 
@@ -98,12 +133,38 @@ const CONFIG: ProjectPm = {
 	statusOptions: { todo: 'opt_ready' },
 };
 
+/**
+ * A `projects.credentials.listPm` view for the selected provider. Configured by default
+ * — every test here is about the mapping, and only the credential-gate test below cares
+ * that discovery waits.
+ */
+function credentialsView({ isConfigured = true }: { isConfigured?: boolean } = {}) {
+	return {
+		providerId: 'github-projects',
+		providerLabel: 'GitHub Projects',
+		providerRegistered: true,
+		roles: [
+			{
+				role: 'apiToken',
+				label: 'GitHub Projects API Token',
+				envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
+				referenceKey: 'PM_GITHUB_PROJECTS_TOKEN',
+				optional: false,
+				isConfigured,
+				maskedValue: isConfigured ? '****' : 'not set',
+			},
+		],
+	};
+}
+
 describe('BoardMappingPanel (issue #201)', () => {
 	beforeEach(() => {
 		listProvidersFn.mockReset();
 		discoverContainersFn.mockReset();
 		discoverStatesFn.mockReset();
+		listPmFn.mockReset();
 		listProvidersFn.mockResolvedValue(PROVIDERS);
+		listPmFn.mockResolvedValue(credentialsView());
 	});
 
 	it('renders human-readable provider/board choices and no raw-ID text inputs', async () => {
@@ -144,7 +205,11 @@ describe('BoardMappingPanel (issue #201)', () => {
 
 		// State discovery fires for the selected board and enables the status selectors.
 		await waitFor(() =>
-			expect(discoverStatesFn).toHaveBeenCalledWith({ projectId: 'p1', containerId: 'PVT_1' }),
+			expect(discoverStatesFn).toHaveBeenCalledWith({
+				projectId: 'p1',
+				providerId: 'github-projects',
+				containerId: 'PVT_1',
+			}),
 		);
 		const readySelect = (await screen.findByLabelText('Ready status')) as HTMLSelectElement;
 		await waitFor(() => expect(readySelect.disabled).toBe(false));
@@ -195,6 +260,67 @@ describe('BoardMappingPanel (issue #201)', () => {
 			expect(screen.getByText(/No GitHub Projects API Token is configured/)).not.toBeNull(),
 		);
 		expect(screen.queryByText(/Failed to load boards/)).toBeNull();
+	});
+
+	// Issue #642: the switch flow's explicit order, stated where the picker is rather than
+	// left to a discovery call that could only fail. Discovery is not even attempted.
+	it('waits for the provider’s required credential before discovering anything', async () => {
+		listPmFn.mockResolvedValue(credentialsView({ isConfigured: false }));
+
+		renderHarness();
+
+		await waitFor(() =>
+			expect(
+				screen.getByText(/Set GitHub Projects API Token under Credentials above/),
+			).not.toBeNull(),
+		);
+		expect(screen.getByText(/before picking a board/)).not.toBeNull();
+		expect(discoverContainersFn).not.toHaveBeenCalled();
+		expect(discoverStatesFn).not.toHaveBeenCalled();
+	});
+
+	// A caller whose credential list errors keeps the pre-#642 behaviour: attempt
+	// discovery and report whatever the provider says, rather than blocking on a gap this
+	// screen cannot confirm.
+	it('still attempts discovery when the credential list itself fails', async () => {
+		listPmFn.mockRejectedValue(new Error('FORBIDDEN'));
+		discoverContainersFn.mockResolvedValue({ containers: [{ id: 'PVT_1', name: 'My Board' }] });
+
+		renderHarness();
+
+		await screen.findByRole('option', { name: 'My Board' });
+		expect(discoverContainersFn).toHaveBeenCalledWith({
+			projectId: 'p1',
+			providerId: 'github-projects',
+		});
+	});
+
+	// Discovery is addressed to the *form's* provider, which mid-switch is the incoming
+	// one — that is what lets the new board be picked before the switch is written.
+	it('discovers against the draft provider, not the persisted one', async () => {
+		discoverContainersFn.mockResolvedValue({ containers: [{ id: 'team-uuid', name: 'Core' }] });
+		listPmFn.mockResolvedValue({
+			providerId: 'linear',
+			providerLabel: 'Linear',
+			providerRegistered: true,
+			roles: [],
+		});
+
+		// The persisted mapping is GitHub Projects'; the form has already moved to Linear.
+		renderHarness({ initial: CONFIG, draftProviderId: 'linear' });
+
+		await waitFor(() =>
+			expect(discoverContainersFn).toHaveBeenCalledWith({
+				projectId: 'p1',
+				providerId: 'linear',
+			}),
+		);
+		expect(listPmFn).toHaveBeenCalledWith({ projectId: 'p1', providerId: 'linear' });
+		expect(discoverContainersFn).not.toHaveBeenCalledWith({
+			projectId: 'p1',
+			providerId: 'github-projects',
+		});
+		await screen.findByLabelText(/Linear team/i);
 	});
 
 	it('still reports an ordinary discovery failure as a load error', async () => {
@@ -319,7 +445,12 @@ describe('BoardMappingPanel (issue #201)', () => {
 				screen.getByText(/Map each SWARM pipeline status to one of the project's statuses/),
 			).not.toBeNull();
 			await waitFor(() =>
-				expect(discoverStatesFn).toHaveBeenCalledWith({ projectId: 'p1', containerId: 'SWARM' }),
+				expect(discoverStatesFn).toHaveBeenCalledWith({
+					projectId: 'p1',
+					providerId: 'jira',
+					containerId: 'SWARM',
+					discoveryDraft: { baseUrl: 'https://acme.atlassian.net' },
+				}),
 			);
 			const readySelect = (await screen.findByLabelText('Ready status')) as HTMLSelectElement;
 			await waitFor(() => expect(readySelect.disabled).toBe(false));
@@ -371,20 +502,61 @@ describe('BoardMappingPanel (issue #201)', () => {
 			});
 		});
 
-		// A member `jiraConfigSchema` would reject, cast on purpose: Save must refuse it
-		// and say where the URL is set, rather than writing it and failing validation.
-		it('blocks Save and says where to set a missing base URL', async () => {
+		it('waits for a missing Jira site URL before discovery or Save', async () => {
 			renderHarness({
 				initial: { ...JIRA_CONFIG, baseUrl: '' } as ProjectPm,
 			});
+
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await screen.findByLabelText('Jira site URL');
+			expect(discoverContainersFn).not.toHaveBeenCalledWith(
+				expect.objectContaining({ providerId: 'jira' }),
+			);
+			expect(screen.getByText(/site URL before discovery/)).not.toBeNull();
+			expect(save.disabled).toBe(true);
+		});
+
+		it('switches to Jira with a draft site URL, discovers its mapping, and saves one member', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({
+				initial: {
+					type: 'linear',
+					teamId: 'team-uuid',
+					statusOptions: { todo: 'state-todo' },
+				} as ProjectPm,
+				draftProviderId: 'jira',
+				onSubmit,
+			});
+
+			expect(discoverContainersFn).not.toHaveBeenCalledWith(
+				expect.objectContaining({ providerId: 'jira' }),
+			);
+			fireEvent.change(await screen.findByLabelText('Jira site URL'), {
+				target: { value: 'https://acme.atlassian.net' },
+			});
+			await screen.findByRole('option', { name: 'Swarm' });
+			await waitFor(() =>
+				expect(discoverContainersFn).toHaveBeenCalledWith({
+					projectId: 'p1',
+					providerId: 'jira',
+					discoveryDraft: { baseUrl: 'https://acme.atlassian.net' },
+				}),
+			);
+			fireEvent.change(screen.getByLabelText(/Jira project/i), { target: { value: 'SWARM' } });
 
 			const doneSelect = (await screen.findByLabelText('Done status')) as HTMLSelectElement;
 			await waitFor(() => expect(doneSelect.disabled).toBe(false));
 			fireEvent.change(doneSelect, { target: { value: '10002' } });
 
 			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
-			await waitFor(() => expect(screen.getByText(/pm\.baseUrl/)).not.toBeNull());
-			expect(save.disabled).toBe(true);
+			await waitFor(() => expect(save.disabled).toBe(false));
+			fireEvent.click(save);
+			expect(onSubmit).toHaveBeenCalledWith({
+				type: 'jira',
+				baseUrl: 'https://acme.atlassian.net',
+				projectKey: 'SWARM',
+				statusOptions: { done: '10002' },
+			});
 		});
 	});
 
@@ -426,6 +598,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			await waitFor(() =>
 				expect(discoverStatesFn).toHaveBeenCalledWith({
 					projectId: 'p1',
+					providerId: 'trello',
 					containerId: '5f2b1c8e9d4a3b2c1e0f9a8b',
 				}),
 			);

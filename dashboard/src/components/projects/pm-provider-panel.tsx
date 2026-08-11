@@ -9,14 +9,17 @@ import { trpc } from '@/lib/trpc.js';
  * The provider scopes every other setting on the tab (which credential roles are
  * declared, which boards are discovered, which states a status can map to), so it
  * is stated *before* those settings rather than half-way down the mapping form
- * where it used to live. The control is deliberately display-only: switching
- * provider replaces the project's whole `pm` union member with a mapping the
- * dashboard cannot assemble until that provider's credentials and discovery exist,
- * so the copy below sends the operator to `swarm.config.json` (issue #631 makes
- * the switch live here).
+ * where it used to live.
  *
- * Nothing here names a provider: the options and the prose both come from the
- * mapping catalogue, confirmed against the registry (`pm.listProviders`) so a
+ * Since issue #642 the control is **live**: picking another provider does not write
+ * anything, it moves the tab into a client-held draft that walks the order the circular
+ * dependency needs — supply the new provider's credentials, discover its boards and
+ * states, map the canonical statuses, then save the whole `pm` member in one write.
+ * Until that save the project keeps running on the provider it is persisted on, so
+ * selecting the persisted provider again simply cancels.
+ *
+ * Nothing here names a provider of its own: the options and the prose both come from
+ * the mapping catalogue, confirmed against the registry (`pm.listProviders`) so a
  * catalogue entry alone never offers a provider the backend can't serve.
  */
 
@@ -25,8 +28,10 @@ const SELECT_CLASS =
 
 interface PmProviderPanelProps {
 	projectId: string;
-	/** The persisted provider — the project's `pm.type`, via the mapping form. */
+	/** The provider the tab is currently scoped to — the draft one while switching. */
 	providerId: string;
+	/** The project's persisted `pm.type`; differs from {@link providerId} mid-switch. */
+	persistedProviderId: string;
 	onProviderChange: (providerId: string) => void;
 	/** A config write is in flight, so the control is inert until it settles. */
 	isPending: boolean;
@@ -35,10 +40,13 @@ interface PmProviderPanelProps {
 export function PmProviderPanel({
 	projectId,
 	providerId,
+	persistedProviderId,
 	onProviderChange,
 	isPending,
 }: PmProviderPanelProps) {
 	const provider = getPmMappingProvider(providerId);
+	const persisted = getPmMappingProvider(persistedProviderId);
+	const isSwitching = provider.id !== persisted.id;
 
 	// The registered providers confirm which catalogue entries are actually
 	// selectable — a catalogue entry alone never offers a provider the backend
@@ -70,12 +78,13 @@ export function PmProviderPanel({
 						<option
 							key={p.id}
 							value={p.id}
-							// Changing providers requires credentials and discovery for that
-							// provider, so the tab stays scoped to the persisted one and this
-							// control is display-only until issue #631 makes the switch live.
-							disabled={
-								p.id !== providerId || (providersQuery.isSuccess && !registeredIds.has(p.id))
-							}
+							// Selectable when the registry serves it — a catalogue entry the backend
+							// registers nothing for would offer a switch that could never discover a
+							// board. The current selection stays selectable regardless, so the
+							// control never holds a disabled value and a failed (or still loading)
+							// `listProviders` degrades to "only the provider you are on", never to a
+							// switch nothing can serve.
+							disabled={p.id !== provider.id && !registeredIds.has(p.id)}
 						>
 							{p.label}
 						</option>
@@ -83,19 +92,33 @@ export function PmProviderPanel({
 				</select>
 			</div>
 
-			<p className="text-xs text-zinc-400 mt-4">
-				This project's work items live on {provider.label}. Everything else on this tab — the
-				credentials below, the {provider.containerNoun} they discover, and the status mapping — is
-				scoped to that provider.
-			</p>
-			<p className="text-xs text-zinc-500 mt-2">
-				The other options are disabled because switching provider replaces this project's whole
-				board mapping, and the dashboard cannot assemble the new one before that provider's
-				credentials and discovery exist. To move this project, set{' '}
-				<code className="font-mono">pm.type</code> in{' '}
-				<code className="font-mono">swarm.config.json</code> and run{' '}
-				<code className="font-mono">swarm config apply</code>.
-			</p>
+			{isSwitching ? (
+				<>
+					<p className="text-xs text-zinc-400 mt-4">
+						Switching this project from {persisted.label} to {provider.label}. Everything below is
+						now scoped to {provider.label}: supply its credentials, pick a {provider.containerNoun},
+						then map each SWARM status to one of its {provider.stateNounPlural}.
+					</p>
+					<p className="text-xs text-amber-300/80 mt-2">
+						Nothing about this project changes until you save that mapping — {persisted.label} keeps
+						running it until then, and its credentials are retained either way. Select{' '}
+						{persisted.label} again to cancel.
+					</p>
+				</>
+			) : (
+				<>
+					<p className="text-xs text-zinc-400 mt-4">
+						This project's work items live on {provider.label}. Everything else on this tab — the
+						credentials below, the {provider.containerNoun} they discover, and the status mapping —
+						is scoped to that provider.
+					</p>
+					<p className="text-xs text-zinc-500 mt-2">
+						Selecting another provider starts a switch here rather than changing anything at once:
+						supply that provider's credentials, pick one of its boards, map the SWARM statuses, then
+						save the new mapping in one go.
+					</p>
+				</>
+			)}
 		</div>
 	);
 }

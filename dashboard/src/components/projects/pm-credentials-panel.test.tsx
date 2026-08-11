@@ -24,7 +24,7 @@ vi.mock('@/lib/trpc.js', () => ({
 		projects: {
 			credentials: {
 				listPm: {
-					queryOptions: (args: { projectId: string }) => ({
+					queryOptions: (args: { projectId: string; providerId?: string }) => ({
 						queryKey: ['projects.credentials.listPm', args],
 						queryFn: () => listPmFn(args),
 					}),
@@ -90,7 +90,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 	it("renders the provider's declared roles with their own labels and guidance", async () => {
 		listPmFn.mockResolvedValue(view());
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() => expect(screen.getByText('GitHub Projects API Token')).not.toBeNull());
 		expect(screen.getByText('Needs repo, project and read:org.')).not.toBeNull();
@@ -107,7 +107,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 	it('names the key an inherited role actually resolves through', async () => {
 		listPmFn.mockResolvedValue(view());
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() => expect(screen.getByText('GITHUB_WEBHOOK_SECRET')).not.toBeNull());
 		expect(screen.queryByText('SCM_WEBHOOK_SECRET')).toBeNull();
@@ -126,7 +126,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 			view([{ ...API_TOKEN_ROLE, referenceKey: 'GH_PROJECTS_PAT' }, WEBHOOK_ROLE]),
 		);
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() => expect(screen.getByText('GH_PROJECTS_PAT')).not.toBeNull());
 		expect(
@@ -139,7 +139,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 	it('warns that discovery needs the unconfigured required role', async () => {
 		listPmFn.mockResolvedValue(view());
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() =>
 			expect(screen.getByText(/Board discovery and every board read\/write need/)).not.toBeNull(),
@@ -150,7 +150,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		listPmFn.mockResolvedValue(view());
 		setPmMutate.mockResolvedValue(undefined);
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		const input = (await waitFor(() =>
 			screen.getByLabelText('GitHub Projects API Token value'),
@@ -164,6 +164,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		await waitFor(() =>
 			expect(setPmMutate).toHaveBeenCalledWith({
 				projectId: 'proj-a',
+				providerId: 'github-projects',
 				role: 'apiToken',
 				// Trimmed — a pasted token routinely carries surrounding whitespace.
 				value: 'ghp_board_token',
@@ -174,7 +175,7 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 	it('renders an inherited role read-only, pointing at where it is configured', async () => {
 		listPmFn.mockResolvedValue(view());
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() => expect(screen.getByText('Webhook Secret')).not.toBeNull());
 		expect(screen.getByText(/configured on the Source Control tab/)).not.toBeNull();
@@ -188,20 +189,65 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		);
 		deletePmMutate.mockResolvedValue(undefined);
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		fireEvent.click(await waitFor(() => screen.getByLabelText('Remove GitHub Projects API Token')));
 		fireEvent.click(await waitFor(() => screen.getByText('Remove')));
 
 		await waitFor(() =>
-			expect(deletePmMutate).toHaveBeenCalledWith({ projectId: 'proj-a', role: 'apiToken' }),
+			expect(deletePmMutate).toHaveBeenCalledWith({
+				projectId: 'proj-a',
+				providerId: 'github-projects',
+				role: 'apiToken',
+			}),
+		);
+	});
+
+	// Issue #642: mid-switch the tab hands down the *draft* provider, so the panel reads
+	// and writes that provider's own block — the outgoing provider's is never addressed.
+	it('reads and writes the provider it is handed, not the persisted one', async () => {
+		listPmFn.mockResolvedValue({
+			providerId: 'linear',
+			providerLabel: 'Linear',
+			providerRegistered: true,
+			roles: [
+				{
+					role: 'apiKey',
+					label: 'Linear API Key',
+					envVarKey: 'LINEAR_API_KEY',
+					referenceKey: 'LINEAR_API_KEY',
+					optional: false,
+					isConfigured: false,
+					maskedValue: 'not set',
+				},
+			],
+		});
+		setPmMutate.mockResolvedValue(undefined);
+
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="linear" />);
+
+		await waitFor(() =>
+			expect(listPmFn).toHaveBeenCalledWith({ projectId: 'proj-a', providerId: 'linear' }),
+		);
+		fireEvent.change(await waitFor(() => screen.getByLabelText('Linear API Key value')), {
+			target: { value: 'lin_api_key' },
+		});
+		fireEvent.click(screen.getByText('Save'));
+
+		await waitFor(() =>
+			expect(setPmMutate).toHaveBeenCalledWith({
+				projectId: 'proj-a',
+				providerId: 'linear',
+				role: 'apiKey',
+				value: 'lin_api_key',
+			}),
 		);
 	});
 
 	it('surfaces a failed load without claiming there are no credentials', async () => {
 		listPmFn.mockRejectedValue(new Error('boom'));
 
-		renderPanel(<PmCredentialsPanel projectId="proj-a" />);
+		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() =>
 			expect(screen.getByText(/Failed to load project-management credentials/)).not.toBeNull(),

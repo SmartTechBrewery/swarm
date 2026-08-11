@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	getProjectByIdFromDb: vi.fn(),
@@ -68,6 +69,7 @@ function stubManifest(
 		id?: string;
 		blankPm?: ProjectPm;
 		blankPmDiscoveryBlocker?: string;
+		discoveryDraft?: unknown;
 		createProvider?: (project: ProjectConfig) => PMProvider;
 	} = {},
 ) {
@@ -84,6 +86,7 @@ function stubManifest(
 			statusOptions: {},
 		},
 		blankPmDiscoveryBlocker: overrides.blankPmDiscoveryBlocker,
+		discoveryDraft: overrides.discoveryDraft,
 		createProvider: overrides.createProvider ?? (() => ({ discover }) as unknown as PMProvider),
 	};
 }
@@ -115,7 +118,12 @@ describe('pmRouter', () => {
 			]);
 
 			await expect(memberCaller.listProviders({ projectId: 'swarm' })).resolves.toEqual([
-				{ id: 'github-projects', label: 'GitHub Projects', discovery: ['containers', 'states'] },
+				{
+					id: 'github-projects',
+					label: 'GitHub Projects',
+					discovery: ['containers', 'states'],
+					discoveryDraft: [],
+				},
 			]);
 			expect(listPMProviders).toHaveBeenCalledOnce();
 		});
@@ -341,6 +349,50 @@ describe('pmRouter', () => {
 				message: blocker,
 			});
 			expect(createProvider).not.toHaveBeenCalled();
+		});
+
+		it('uses a validated incoming-provider draft to discover Jira without persisting it', async () => {
+			const project = createMockProjectConfig();
+			const discover = vi.fn().mockResolvedValue({ containers: [{ id: 'SWARM', name: 'SWARM' }] });
+			const built: ProjectConfig[] = [];
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(getPMProvider).mockReturnValue(
+				// biome-ignore lint/suspicious/noExplicitAny: manifest stub is intentionally partial
+				stubManifest(['containers'], discover, {
+					id: 'jira',
+					blankPm: { type: 'jira', baseUrl: '', projectKey: '', statusOptions: {} },
+					blankPmDiscoveryBlocker:
+						'Jira discovery needs a valid site URL before it can list projects.',
+					discoveryDraft: {
+						schema: z.object({ baseUrl: z.string().url() }).strict(),
+						buildPm: (draft: { baseUrl: string }) => ({
+							type: 'jira',
+							baseUrl: draft.baseUrl,
+							projectKey: '',
+							statusOptions: {},
+						}),
+					},
+					createProvider: (candidate) => {
+						built.push(candidate);
+						return { discover } as unknown as PMProvider;
+					},
+				}) as any,
+			);
+
+			await expect(
+				caller.discoverContainers({
+					projectId: 'swarm',
+					providerId: 'jira',
+					discoveryDraft: { baseUrl: 'https://acme.atlassian.net' },
+				}),
+			).resolves.toEqual({ containers: [{ id: 'SWARM', name: 'SWARM' }] });
+			expect(built[0].pm).toEqual({
+				type: 'jira',
+				baseUrl: 'https://acme.atlassian.net',
+				projectKey: '',
+				statusOptions: {},
+			});
+			expect(project.pm.type).toBe('github-projects');
 		});
 
 		// The blocker is about the *blank* member, not about the provider: a project already

@@ -1053,6 +1053,35 @@ describe('diffProjectForSync', () => {
 		const next = makeProject({ maxConcurrentJobs: 4 });
 		expect(diffProjectForSync(prev, next)).toMatchObject({ general: true, pipeline: false });
 	});
+
+	// Issue #642: a PM provider switch is a multi-step draft (credentials, board, status
+	// mapping) held client-side until one Save. A background refetch that changes `pm` —
+	// or another tab's write landing on it — must not discard that half-built mapping.
+	it('freezes the boardMapping slice while a provider switch draft is open', () => {
+		const prev = makeProject({ pm: { type: 'github-projects' } as ProjectConfig['pm'] });
+		const next = makeProject({
+			pm: { type: 'github-projects', projectId: 'PVT_new' } as ProjectConfig['pm'],
+		});
+
+		expect(diffProjectForSync(prev, next)).toMatchObject({ boardMapping: true });
+		expect(diffProjectForSync(prev, next, 'linear')).toMatchObject({ boardMapping: false });
+	});
+
+	// The draft only ever shields `boardMapping` — the other tabs' slices keep re-syncing,
+	// so an open switch can't stall an unrelated change out of the form.
+	it('leaves the other slices alone while a draft is open', () => {
+		const prev = makeProject({ maxConcurrentJobs: 1, agents: { planning: {} } });
+		const next = makeProject({
+			maxConcurrentJobs: 4,
+			agents: { planning: { timeoutMs: 1000 } },
+		});
+
+		expect(diffProjectForSync(prev, next, 'linear')).toMatchObject({
+			general: true,
+			agents: true,
+			boardMapping: false,
+		});
+	});
 });
 
 describe('ProjectTabBar', () => {

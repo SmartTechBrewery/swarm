@@ -17,11 +17,9 @@
  * a provider a project is **not** persisted on, against the manifest's blank `pm`
  * member, so an operator can pick an incoming provider's board before saving a
  * switch. That is exactly the case a blank `baseUrl` cannot serve, so this provider
- * declares `blankPmDiscoveryBlocker` (`./index.ts`) and the API refuses with copy
- * naming `swarm.config.json` instead of failing on an opaque fetch. Making the value
- * editable from the dashboard is a separate decision, deliberately not taken there.
- * And it is board *identity*, the same category as `projectKey`, which lives under
- * the provider that maps it.
+ * declares a provider-switch discovery draft (`./index.ts`): the dashboard collects
+ * and the API validates the site URL before discovery, then carries it into the one
+ * final persisted member. It remains board identity, not a credential.
  *
  * Jira credentials (the email + API-token pair) are referenced from the project
  * config's `credentials.pm` block instead (`./credentials.ts`).
@@ -72,6 +70,12 @@ export const jiraConfigSchema = z
 	.describe('Jira board integration config');
 
 export type JiraIntegrationConfig = z.infer<typeof jiraConfigSchema>;
+
+/** The only value an incoming Jira provider needs before it can discover projects. */
+export const jiraDiscoveryDraftSchema = z
+	.object({ baseUrl: z.string().url() })
+	.strict()
+	.describe('Jira incoming-provider discovery draft');
 
 /**
  * This provider's `pm` member with no site and no project selected — the manifest's

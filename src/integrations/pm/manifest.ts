@@ -158,6 +158,28 @@ export interface PmWebhookVerification {
 /** Authenticate one inbound PM webhook delivery — see {@link PmWebhookVerification}. */
 export type PmWebhookVerifier = (input: PmWebhookVerification) => boolean;
 
+/** A non-persisted field a provider needs before it can discover an incoming board. */
+export interface PmDiscoveryDraftField {
+	/** Stable key carried only in the dashboard's provider-switch draft. */
+	readonly key: string;
+	/** Operator-facing label rendered before discovery begins. */
+	readonly label: string;
+	/** HTML input type appropriate for the value. */
+	readonly inputType: 'url' | 'text';
+	/** Optional setup guidance rendered below the control. */
+	readonly description?: string;
+}
+
+/** Provider-owned validation and projection for incoming-provider discovery. */
+export interface PmDiscoveryDraft {
+	/** Controls the dashboard renders before discovery. */
+	readonly fields: readonly PmDiscoveryDraftField[];
+	/** Validates the untrusted API input before it reaches a provider. */
+	readonly schema: z.ZodTypeAny;
+	/** Builds this provider's discovery-ready pm member from validated draft values. */
+	readonly buildPm: (draft: unknown) => ProjectPm;
+}
+
 export interface PMProviderManifest {
 	/** Stable registry key / provider discriminator, e.g. `github-projects`. */
 	readonly id: PMType;
@@ -213,6 +235,13 @@ export interface PMProviderManifest {
 	 * {@link discovery} capability already fails `NOT_IMPLEMENTED`.
 	 */
 	readonly blankPmDiscoveryBlocker?: string;
+
+	/**
+	 * Optional provider-owned setup needed to discover an incoming provider before its
+	 * complete mapping is persisted. The dashboard receives only {@link fields}; the
+	 * API validates the draft with {@link schema} and projects it through {@link buildPm}.
+	 */
+	readonly discoveryDraft?: PmDiscoveryDraft;
 
 	/**
 	 * The credentials this provider needs, each as a {@link PmCredentialRoleSpec}
