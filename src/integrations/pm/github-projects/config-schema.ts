@@ -24,7 +24,7 @@
 
 import { z } from 'zod';
 
-import type { ProjectConfig } from '../../../config/schema.js';
+import type { ProjectConfig, ProjectPm } from '../../../config/schema.js';
 
 export const githubProjectsConfigSchema = z
 	.object({
@@ -74,6 +74,25 @@ export const githubProjectsConfigSchema = z
 	.describe('GitHub Projects (v2) board integration config');
 
 export type GitHubProjectsIntegrationConfig = z.infer<typeof githubProjectsConfigSchema>;
+
+/**
+ * This provider's `pm` member with no board selected — the manifest's `blankPm`
+ * (`../manifest.ts`), and the `pm` block a dashboard-created project starts on
+ * (`DEFAULT_PM_CONFIG`, `src/api/routers/projects.ts`).
+ *
+ * Lives here rather than in `./index.ts` so both readers share one definition without
+ * importing a module whose load registers the provider. It deliberately does **not**
+ * satisfy the schema above: `statusOptions` must map at least one status to be
+ * persisted, and this maps none — the operator fills it in on the Project Management
+ * tab, and a board read against it fails loudly on the unmappable status rather than
+ * writing to a wrong board.
+ */
+export const githubProjectsBlankPm: ProjectPm = {
+	type: 'github-projects',
+	projectId: '',
+	statusFieldId: '',
+	statusOptions: {},
+};
 
 /**
  * Narrow a project's `pm` union member (`ProjectPmSchema`, `src/config/schema.ts`)

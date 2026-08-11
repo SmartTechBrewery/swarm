@@ -134,6 +134,9 @@ function fakePmManifest(
 			throw new Error('the receiver never constructs a PMProvider');
 		},
 		configSchema: z.unknown(),
+		// Declared only because the manifest requires it; the receiver reads no `pm`
+		// member — it resolves the project the delivery names.
+		blankPm: { type: 'github-projects', projectId: '', statusFieldId: '', statusOptions: {} },
 		discovery: [],
 	};
 }

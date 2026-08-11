@@ -15,7 +15,7 @@
 import { GitHubProjectsRouterAdapter } from '../../../router/adapters/github-projects.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
-import { githubProjectsConfigSchema } from './config-schema.js';
+import { githubProjectsBlankPm, githubProjectsConfigSchema } from './config-schema.js';
 import { GITHUB_PROJECTS_API_TOKEN_ROLE } from './credentials.js';
 import { createGitHubProjectsProvider } from './provider.js';
 import { verifyGitHubProjectsWebhookSignature } from './webhook.js';
@@ -26,6 +26,11 @@ export const githubProjectsManifest: PMProviderManifest = {
 	category: 'pm',
 	createProvider: createGitHubProjectsProvider,
 	configSchema: githubProjectsConfigSchema,
+	// No `blankPmDiscoveryBlocker`: both capabilities read the *credential's* own
+	// account — its boards, then one selected board's Status field — so neither needs
+	// anything out of the `pm` member, and an incoming GitHub Projects board is
+	// discoverable with nothing configured but the token.
+	blankPm: githubProjectsBlankPm,
 	routerAdapter: new GitHubProjectsRouterAdapter(),
 	// Two roles, and they are credentials of two different kinds.
 	//

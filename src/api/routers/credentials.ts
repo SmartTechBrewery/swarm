@@ -27,6 +27,8 @@ import {
 	type ScmCredentialRoleSpec,
 } from '../../integrations/scm/manifest.js';
 import { getSCMProvider } from '../../integrations/scm/registry.js';
+import { PmProviderIdSchema } from '../../pm/events.js';
+import type { PMType } from '../../pm/types.js';
 import { SCM_CREDENTIAL_ROLES, type ScmType } from '../../scm/types.js';
 import { assertProjectAccess } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
@@ -57,6 +59,16 @@ import { authedProcedure, router } from '../trpc.js';
  * neither invent a store key nor overwrite another provider's secret by pointing a
  * role at its reference (issue #632; the pre-#632 `set` took the key itself, which is
  * exactly what let saving GitLab's reviewer token land on GitHub's row).
+ *
+ * **Either side's `providerId` may name a provider the project is not persisted on.** All
+ * three PM procedures take it *optionally*, defaulting to `project.pm.type` (issue #641),
+ * which is what lets the Project Management tab enter an *incoming* provider's
+ * credentials — and then discover its boards (`src/api/routers/pm.ts`) — before a switch
+ * is saved, while an omitted id keeps each procedure behaving exactly as it did before.
+ * The SCM writes require the id instead (#632's reason: the browser must state which
+ * provider's secret it is saving), and only `list` defaults. Supplied, the id is never
+ * resolved back to the persisted provider: writing one provider's secret under another's
+ * reference is the whole failure per-provider blocks exist to prevent.
  */
 
 /**
@@ -91,17 +103,37 @@ async function requireProject(projectId: string): Promise<ProjectConfig> {
 }
 
 /**
- * The role spec a PM write names, validated against the *registered* manifest for
- * the project's provider. An unregistered provider or an undeclared role is a
- * BAD_REQUEST rather than a raw throw: the client picked it off `listPm`, so a
- * mismatch means the provider changed under it.
+ * The provider a PM request addresses: the one it named, else the one the project is
+ * persisted on. Naming one is what lets an operator enter the **incoming** provider's
+ * credentials before a switch is saved (issue #641); omitting it keeps every procedure
+ * behaving exactly as it did before.
  */
-function requirePmRoleSpec(project: ProjectConfig, role: string): PmCredentialRoleSpec {
-	const manifest = getPMProvider(project.pm.type);
+function requestedPmProviderId(project: ProjectConfig, providerId: PMType | undefined): PMType {
+	return providerId ?? project.pm.type;
+}
+
+/**
+ * The role spec a PM write names, validated against the *registered* manifest for the
+ * provider it addresses — which since issue #641 need not be the one the project runs
+ * on. An unregistered provider is NOT_FOUND and an undeclared role a BAD_REQUEST: the
+ * client picked both off `listPm`, so a mismatch means the provider changed under it.
+ *
+ * Returns the manifest's own `id` alongside the spec (the SCM twin's shape), so callers
+ * address `credentials.pm` with a validated provider id rather than the raw input — and
+ * never with the persisted provider's id as a fallback, which would write the incoming
+ * provider's secret over the outgoing one's reference.
+ */
+function requirePmRoleSpec(
+	project: ProjectConfig,
+	role: string,
+	providerId: PMType | undefined,
+): { providerId: PMType; spec: PmCredentialRoleSpec } {
+	const requestedId = requestedPmProviderId(project, providerId);
+	const manifest = getPMProvider(requestedId);
 	if (!manifest) {
 		throw new TRPCError({
 			code: 'NOT_FOUND',
-			message: `No PM provider registered for '${project.pm.type}'`,
+			message: `No PM provider registered for '${requestedId}'`,
 		});
 	}
 	const spec = manifest.credentialRoles.find((candidate) => candidate.role === role);
@@ -116,6 +148,9 @@ function requirePmRoleSpec(project: ProjectConfig, role: string): PmCredentialRo
 	// declared env-var key is the shared reference itself. Writing it here would
 	// silently overwrite (or clearing it would silently destroy) the Source Control
 	// tab's secret under a PM-shaped label, so this refuses and says where it lives.
+	// Evaluated per *named* provider since issue #641: only GitHub Projects declares
+	// one, so whether a role is editable here is a property of the provider being
+	// configured rather than of the one the project happens to run on.
 	if (spec.inheritsSharedCredential) {
 		throw new TRPCError({
 			code: 'BAD_REQUEST',
@@ -124,19 +159,23 @@ function requirePmRoleSpec(project: ProjectConfig, role: string): PmCredentialRo
 				'credential — configure it on the Source Control tab.',
 		});
 	}
-	return spec;
+	return { providerId: manifest.id, spec };
 }
 
 /**
- * The secret-store key one PM role resolves through, mirroring
+ * The secret-store key one `(PM provider, role)` resolves through, mirroring
  * `resolvePmCredential`'s order (`src/config/provider.ts`): the reference the project
- * already configured for its **own** PM provider (issue #631 — never another
- * provider's block, which is the overwrite this shape exists to remove), else the
- * SCM-side reference the role inherits — since issue #628 the *per-provider* one for
- * the SCM provider this project runs on — else the role's declared conventional key.
+ * already configured for *that provider* (issue #631 — never another provider's block,
+ * which is the overwrite this shape exists to remove), else the SCM-side reference the
+ * role inherits — since issue #628 the *per-provider* one for the SCM provider this
+ * project runs on — else the role's declared conventional key.
  */
-function pmReferenceKeyFor(project: ProjectConfig, spec: PmCredentialRoleSpec): string {
-	const configured = pmCredentialReferenceFor(project, project.pm.type, spec.role);
+function pmReferenceKeyFor(
+	project: ProjectConfig,
+	providerId: PMType,
+	spec: PmCredentialRoleSpec,
+): string {
+	const configured = pmCredentialReferenceFor(project, providerId, spec.role);
 	if (configured) return configured;
 	if (spec.inheritsSharedCredential) {
 		const inherited = scmCredentialReferenceFor(
@@ -247,10 +286,12 @@ async function updateScmReferences(
 
 /**
  * Persist one PM provider's `role -> reference` block under
- * `credentials.pm[<pm.type>]`, leaving every other provider's block untouched — the PM
+ * `credentials.pm[providerId]`, leaving every other provider's block untouched — the PM
  * twin of {@link updateScmReferences} (issue #631). That preservation is the point: a
  * project retaining the credentials of a provider it is not currently running on must
- * not lose them because a role name collides with one of the current provider's.
+ * not lose them because a role name collides with one of the current provider's, and
+ * since issue #641 the block being written is just as often the *incoming* provider's
+ * as the persisted one's.
  *
  * Written through the project row (a reference is config, not a secret) and only when
  * it actually changes, so setting a credential twice doesn't churn the row. A block
@@ -258,17 +299,18 @@ async function updateScmReferences(
  */
 async function updatePmReferences(
 	project: ProjectConfig,
+	providerId: PMType,
 	references: PmProviderCredentialReferences,
 ): Promise<void> {
-	const current = project.credentials.pm?.[project.pm.type] ?? {};
+	const current = project.credentials.pm?.[providerId] ?? {};
 	const unchanged =
 		Object.keys(current).length === Object.keys(references).length &&
 		Object.entries(references).every(([role, key]) => current[role] === key);
 	if (unchanged) return;
 
 	const pm = { ...(project.credentials.pm ?? {}) };
-	if (Object.keys(references).length > 0) pm[project.pm.type] = references;
-	else delete pm[project.pm.type];
+	if (Object.keys(references).length > 0) pm[providerId] = references;
+	else delete pm[providerId];
 	await upsertProjectToDb({
 		...project,
 		credentials: { ...project.credentials, pm },
@@ -318,11 +360,19 @@ export const credentialsRouter = router({
 		}),
 
 	/**
-	 * The PM provider's declared credential roles for this project, each with its
+	 * One PM provider's declared credential roles for this project, each with its
 	 * configured/not-configured state and a masked preview — the data the Project
 	 * Management tab renders its credential section from (issue #537). Provider
 	 * terminology (`label`, `description`) comes off the manifest, so the screen
 	 * hard-codes no provider.
+	 *
+	 * `providerId` defaults to the provider the project is persisted on; naming another
+	 * answers for *that* provider's own block (issue #641), which is how the switch flow
+	 * shows an incoming provider's credentials as unconfigured rather than showing the
+	 * outgoing provider's. An id nothing is registered for reports
+	 * `providerRegistered: false` with no roles rather than throwing — the same shape the
+	 * SCM `list` uses, and the same answer this procedure has always given for an
+	 * unregistered persisted `pm.type`.
 	 *
 	 * A role that inherits a shared SCM credential is reported with
 	 * `inheritsSharedCredential` set and is not editable here (see
@@ -330,20 +380,26 @@ export const credentialsRouter = router({
 	 * board's webhook secret set?" is a question this screen should answer.
 	 */
 	listPm: authedProcedure
-		.input(z.object({ projectId: z.string().min(1) }))
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				providerId: PmProviderIdSchema.optional(),
+			}),
+		)
 		.query(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			const project = await requireProject(input.projectId);
-			const manifest = getPMProvider(project.pm.type);
+			const providerId = requestedPmProviderId(project, input.providerId);
+			const manifest = getPMProvider(providerId);
 			const resolved = await resolveAllProjectCredentials(input.projectId);
 
 			return {
-				providerId: project.pm.type,
-				providerLabel: manifest?.label ?? project.pm.type,
-				/** `false` when nothing is registered for `pm.type` — nothing is editable then. */
+				providerId,
+				providerLabel: manifest?.label ?? providerId,
+				/** `false` when nothing is registered for it — nothing is editable then. */
 				providerRegistered: !!manifest,
 				roles: (manifest?.credentialRoles ?? []).map((spec) => {
-					const referenceKey = pmReferenceKeyFor(project, spec);
+					const referenceKey = pmReferenceKeyFor(project, providerId, spec);
 					return {
 						role: spec.role,
 						label: spec.label,
@@ -361,15 +417,22 @@ export const credentialsRouter = router({
 		}),
 
 	/**
-	 * Store the secret for one PM role and make sure `credentials.pm[<pm.type>]` names
+	 * Store the secret for one PM role and make sure `credentials.pm[providerId]` names
 	 * it, so a project configured entirely through the dashboard resolves the same way a
 	 * file-configured one does (`resolvePmCredential`). The plaintext is written
 	 * straight to the encrypted store and never read back.
+	 *
+	 * `providerId` defaults to the persisted provider. Only the named provider's block is
+	 * touched (issue #641): the persisted provider's references and stored secrets are
+	 * left exactly as they were, which is what lets an operator enter an incoming
+	 * provider's credentials — and then discover its boards — with the project still
+	 * running on the outgoing one.
 	 */
 	setPm: authedProcedure
 		.input(
 			z.object({
 				projectId: z.string().min(1),
+				providerId: PmProviderIdSchema.optional(),
 				role: z.string().min(1),
 				value: z.string().min(1),
 			}),
@@ -377,36 +440,42 @@ export const credentialsRouter = router({
 		.mutation(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
 			const project = await requireProject(input.projectId);
-			const spec = requirePmRoleSpec(project, input.role);
-			const referenceKey = pmReferenceKeyFor(project, spec);
+			const { providerId, spec } = requirePmRoleSpec(project, input.role, input.providerId);
+			const referenceKey = pmReferenceKeyFor(project, providerId, spec);
 
 			await writeProjectCredential(input.projectId, referenceKey, input.value, spec.label);
-			await updatePmReferences(project, {
-				...(project.credentials.pm?.[project.pm.type] ?? {}),
+			await updatePmReferences(project, providerId, {
+				...(project.credentials.pm?.[providerId] ?? {}),
 				[spec.role]: referenceKey,
 			});
 		}),
 
 	/**
 	 * Clear one PM role: delete the stored secret *and* drop its
-	 * `credentials.pm[<pm.type>]` reference. Dropping the reference is the point — a role with no reference reads
+	 * `credentials.pm[providerId]` reference, leaving every other provider's block in
+	 * place. Dropping the reference is the point — a role with no reference reads
 	 * no host environment variable either (`resolvePmCredential`), so "removed" means
 	 * the provider fails explicitly instead of silently resolving an ambient value. A
 	 * later `swarm config apply` re-adds the reference from `swarm.config.json`, which
 	 * is the file-based configuration path staying authoritative for itself.
 	 */
 	deletePm: authedProcedure
-		.input(z.object({ projectId: z.string().min(1), role: z.string().min(1) }))
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				providerId: PmProviderIdSchema.optional(),
+				role: z.string().min(1),
+			}),
+		)
 		.mutation(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
 			const project = await requireProject(input.projectId);
-			const spec = requirePmRoleSpec(project, input.role);
-			const referenceKey = pmReferenceKeyFor(project, spec);
+			const { providerId, spec } = requirePmRoleSpec(project, input.role, input.providerId);
+			const referenceKey = pmReferenceKeyFor(project, providerId, spec);
 
 			await deleteProjectCredential(input.projectId, referenceKey);
-			const { [spec.role]: _removed, ...remaining } =
-				project.credentials.pm?.[project.pm.type] ?? {};
-			await updatePmReferences(project, remaining);
+			const { [spec.role]: _removed, ...remaining } = project.credentials.pm?.[providerId] ?? {};
+			await updatePmReferences(project, providerId, remaining);
 		}),
 
 	/**

@@ -27,6 +27,7 @@ import {
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
 import { getMembership } from '../../identity/membership-service.js';
+import { githubProjectsBlankPm } from '../../integrations/pm/github-projects/config-schema.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { getSCMProvider } from '../../integrations/scm/registry.js';
 import type { ScmType } from '../../scm/types.js';
@@ -45,13 +46,16 @@ import { credentialsRouter } from './credentials.js';
  * mapping needs at least one status option): it is a placeholder for a project
  * that has not been mapped yet, and the board reads that would use it fail loudly
  * on the unmappable status rather than writing to a wrong board.
+ *
+ * The member itself is the provider's, not this module's (issue #641): every PM
+ * manifest now declares its own blank `pm` member (`PMProviderManifest.blankPm`) so the
+ * discovery API can serve a provider a project is not persisted on, and this default is
+ * GitHub Projects' copy of that one definition rather than a second hand-written
+ * spelling of its field names. Imported from the provider's side-effect-free
+ * `config-schema.ts` — the module `src/config/schema.ts` already composes centrally —
+ * so naming SWARM's default provider here doesn't drag its registration in with it.
  */
-export const DEFAULT_PM_CONFIG: ProjectPm = {
-	type: 'github-projects',
-	projectId: '',
-	statusFieldId: '',
-	statusOptions: {},
-};
+export const DEFAULT_PM_CONFIG: ProjectPm = githubProjectsBlankPm;
 
 /**
  * The `credentials.scm` map a new project starts with: one reference per role its

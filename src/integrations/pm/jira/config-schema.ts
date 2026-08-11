@@ -11,10 +11,17 @@
  * write-only field, which is the wrong treatment for a tenant URL an operator has
  * to be able to read back. Cascade makes it a synthetic credential
  * (`configToCredentials` → `base_url`) only to feed its setup wizard, which
- * discovers *before* any config row exists; SWARM has no wizard — `PMProvider.discover`
- * runs on a persisted `ProjectConfig` (`src/api/routers/pm.ts`) — so the hook has
- * nothing to buy here. And it is board *identity*, the same category as
- * `projectKey`, which lives under the provider that maps it.
+ * discovers *before* any config row exists. SWARM still has no wizard, and this stays
+ * config — but the "discovery only ever runs on a persisted `ProjectConfig`" half of
+ * that argument stopped being true with issue #641: the discovery API now also serves
+ * a provider a project is **not** persisted on, against the manifest's blank `pm`
+ * member, so an operator can pick an incoming provider's board before saving a
+ * switch. That is exactly the case a blank `baseUrl` cannot serve, so this provider
+ * declares `blankPmDiscoveryBlocker` (`./index.ts`) and the API refuses with copy
+ * naming `swarm.config.json` instead of failing on an opaque fetch. Making the value
+ * editable from the dashboard is a separate decision, deliberately not taken there.
+ * And it is board *identity*, the same category as `projectKey`, which lives under
+ * the provider that maps it.
  *
  * Jira credentials (the email + API-token pair) are referenced from the project
  * config's `credentials.pm` block instead (`./credentials.ts`).
@@ -22,7 +29,7 @@
 
 import { z } from 'zod';
 
-import type { ProjectConfig } from '../../../config/schema.js';
+import type { ProjectConfig, ProjectPm } from '../../../config/schema.js';
 
 export const jiraConfigSchema = z
 	.object({
@@ -65,6 +72,27 @@ export const jiraConfigSchema = z
 	.describe('Jira board integration config');
 
 export type JiraIntegrationConfig = z.infer<typeof jiraConfigSchema>;
+
+/**
+ * This provider's `pm` member with no site and no project selected — the manifest's
+ * `blankPm` (`../manifest.ts`).
+ *
+ * Unlike the other providers' blank members this one cannot be discovered against at
+ * all: `baseUrl` is the site every REST call is addressed to, so the manifest pairs it
+ * with a `blankPmDiscoveryBlocker` (`./index.ts`). It is still declared, because the
+ * *credential* half of the incoming-provider flow needs no board at all — entering a
+ * Jira email and API token for a project that is not on Jira yet is exactly what the
+ * switch flow does first.
+ *
+ * Deliberately not a persistable member: `baseUrl` must be a URL and `statusOptions`
+ * must map at least one status.
+ */
+export const jiraBlankPm: ProjectPm = {
+	type: 'jira',
+	baseUrl: '',
+	projectKey: '',
+	statusOptions: {},
+};
 
 /**
  * Narrow a project's `pm` union member to Jira's board mapping. The single place a
