@@ -39,7 +39,7 @@ export const linearManifest: PMProviderManifest = {
 	// Two roles, and **neither** inherits a shared SCM credential — the rule
 	// `PmCredentialRoleSpec.inheritsSharedCredential` states for exactly this
 	// case: a Linear board is a separate system from the GitHub repo it is paired
-	// with, so borrowing `credentials.webhookSecret` (as GitHub Projects legitimately
+	// with, so borrowing the repo side's webhook secret (as GitHub Projects legitimately
 	// does, board and repo being one webhook) would point Linear's verifier at a
 	// secret GitHub chose and Linear never signs with.
 	credentialRoles: [

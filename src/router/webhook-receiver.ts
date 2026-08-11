@@ -122,15 +122,22 @@ export interface WebhookReceiverDeps {
 	 */
 	pmProviders: readonly PMProviderManifest[];
 	findProject: (repo: string) => Promise<ProjectConfig | undefined>;
-	/** The SCM webhook secret — the repo side's `credentials.webhookSecret` reference. */
-	getWebhookSecret: (project: ProjectConfig) => Promise<string | null>;
+	/**
+	 * The SCM webhook secret for one provider — the repo side's
+	 * `credentials.scm[<providerId>].webhookSecret` reference. Provider-scoped since
+	 * issue #628: the caller passes the manifest the delivery actually arrived from, so
+	 * a GitLab delivery is never checked against the secret stored for the same
+	 * project's GitHub webhook (and a project missing GitLab's secret is rejected
+	 * rather than verified against GitHub's).
+	 */
+	getWebhookSecret: (project: ProjectConfig, providerId: ScmType) => Promise<string | null>;
 	/**
 	 * Resolve one credential role a PM provider declares
 	 * (`PMProviderManifest.credentialRoles`, issue #497). The board side resolves its
 	 * webhook secret through this rather than borrowing `getWebhookSecret`: what
 	 * authenticates a board delivery is the *PM provider's* credential, even when — as
-	 * for GitHub Projects, whose role inherits `credentials.webhookSecret` — it
-	 * resolves to the very same secret the repo side uses.
+	 * for GitHub Projects, whose role inherits the repo side's secret for the SCM
+	 * provider the project runs on — it resolves to the very same secret.
 	 */
 	getPmCredential: (project: ProjectConfig, role: string) => Promise<string | null>;
 	enqueue: (
@@ -190,11 +197,13 @@ async function readJsonBody(c: Context): Promise<{ rawBody: string; payload: unk
 }
 
 /**
- * Authenticate a repo-scoped webhook against its project's HMAC secret. Returns a
- * short-circuit `Response` (401) the caller must return, or `null` when the body
- * is authentic. A project with no secret configured can't be verified, so we
- * refuse rather than trust an unauthenticated payload. The scheme itself is the
- * provider's (`SCMProvider.verifyWebhookSignature`).
+ * Authenticate a repo-scoped webhook against the secret this project stores for the
+ * **delivering** provider (`manifest.id`, issue #628). Returns a short-circuit
+ * `Response` (401) the caller must return, or `null` when the body is authentic. A
+ * project with no secret configured for that provider can't be verified, so we refuse
+ * rather than trust an unauthenticated payload — and never reach for another
+ * provider's secret. The scheme itself is the provider's
+ * (`SCMProvider.verifyWebhookSignature`).
  */
 async function authenticateScmWebhook(
 	c: Context,
@@ -205,9 +214,10 @@ async function authenticateScmWebhook(
 	signature: string,
 	logContext: Record<string, unknown>,
 ): Promise<Response | null> {
-	const secret = await deps.getWebhookSecret(project);
+	const secret = await deps.getWebhookSecret(project, manifest.id);
 	if (!secret) {
 		logger.error('No webhook secret configured for project; rejecting webhook', {
+			providerId: manifest.id,
 			projectId: project.id,
 			...logContext,
 		});

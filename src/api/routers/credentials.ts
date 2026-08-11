@@ -1,7 +1,10 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-
 import type { ProjectConfig } from '../../config/schema.js';
+import {
+	scmCredentialReferenceFor,
+	sharedScmCredentialProviderFor,
+} from '../../config/scm-credentials.js';
 import {
 	deleteProjectCredential,
 	resolveAllProjectCredentials,
@@ -13,6 +16,7 @@ import {
 } from '../../db/repositories/projectsRepository.js';
 import type { PmCredentialRoleSpec } from '../../integrations/pm/manifest.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
+import { SCM_CREDENTIAL_ROLES } from '../../scm/types.js';
 import { assertProjectAccess } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
@@ -28,8 +32,10 @@ import { authedProcedure, router } from '../trpc.js';
  *
  * Two families live here, and they differ in *who declares the roles*:
  *
- * - `list`/`set`/`delete` edit the shared **SCM** references (`reviewer`,
- *   `webhookSecret`), a fixed pair on the central config schema.
+ * - `list`/`set`/`delete` edit the **SCM** references (`reviewer`, `webhookSecret`) as
+ *   the single pair they were before issue #628 — see {@link legacyScmReferences} for
+ *   why that is deliberately unchanged in #628's phase 1, and how it stays pointed at
+ *   the store rows the per-provider resolver now reads.
  * - `listPm`/`setPm`/`deletePm` edit the **PM provider's own** roles — whatever the
  *   registered manifest for `project.pm.type` declares (`credentialRoles`, issue
  *   #497), so the surface is provider-driven and the dashboard's Project Management
@@ -110,14 +116,48 @@ function requirePmRoleSpec(project: ProjectConfig, role: string): PmCredentialRo
 /**
  * The secret-store key one PM role resolves through, mirroring
  * `resolvePmCredential`'s order (`src/config/provider.ts`): the reference the
- * project already configured, else the shared reference the role inherits, else the
- * role's declared conventional key.
+ * project already configured, else the SCM-side reference the role inherits — since
+ * issue #628 the *per-provider* one for the SCM provider this project runs on — else
+ * the role's declared conventional key.
  */
 function pmReferenceKeyFor(project: ProjectConfig, spec: PmCredentialRoleSpec): string {
 	const configured = project.credentials.pm?.[spec.role];
 	if (configured) return configured;
-	if (spec.inheritsSharedCredential) return project.credentials[spec.inheritsSharedCredential];
+	if (spec.inheritsSharedCredential) {
+		const inherited = scmCredentialReferenceFor(
+			project,
+			sharedScmCredentialProviderFor(project),
+			spec.inheritsSharedCredential,
+		);
+		if (inherited) return inherited;
+	}
 	return spec.envVarKey;
+}
+
+/**
+ * The `role -> reference` pair the Source Control tab edits — **interim, issue #628
+ * phase 1 only**.
+ *
+ * Phase 1 moves storage and resolution onto `credentials.scm[<providerId>]` and leaves
+ * this router (and the tab) on the pre-#628 single pair, so both must stay pointed at
+ * the very store rows the per-provider resolver now reads:
+ *
+ * - a project that still carries the legacy pair — every migrated project, and every
+ *   project the dashboard creates (`projects.create` seeds the same two names into both
+ *   shapes as an explicit mirror) — is projected from it, unchanged;
+ * - a project that carries only `credentials.scm` (a config written from `swarm init`'s
+ *   post-#628 template) is projected from the block for the provider it runs on, so the
+ *   tab still shows and edits the right two rows rather than nothing at all.
+ *
+ * Phase 2 replaces the whole family with a provider-aware surface and deletes this.
+ */
+function legacyScmReferences(project: ProjectConfig): {
+	reviewer?: string;
+	webhookSecret?: string;
+} {
+	const { reviewer, webhookSecret } = project.credentials;
+	if (reviewer || webhookSecret) return { reviewer, webhookSecret };
+	return project.credentials.scm?.[sharedScmCredentialProviderFor(project)] ?? {};
 }
 
 /**
@@ -152,18 +192,25 @@ export const credentialsRouter = router({
 
 			const resolved = await resolveAllProjectCredentials(input.projectId);
 
-			// The Source Control screen edits the shared SCM references only; the PM
-			// provider's own role map (`credentials.pm`, issue #497) is provider-declared
-			// and served by `listPm` below, so it is excluded here rather than listed as a
-			// role whose "env var key" is an object.
-			const { pm: _pmReferences, ...scmReferences } = project.credentials;
-
-			return Object.entries(scmReferences).map(([role, envVarKey]) => ({
-				role: role as 'reviewer' | 'webhookSecret',
-				envVarKey,
-				isConfigured: isUsableSecret(resolved[envVarKey]),
-				maskedValue: maskCredential(resolved[envVarKey]),
-			}));
+			// The Source Control screen edits the two SCM roles only, as the single pair
+			// they were before issue #628 (see `legacyScmReferences`). Neither nested map is
+			// projected here: the PM provider's own role map (`credentials.pm`, issue #497)
+			// is provider-declared and served by `listPm` below, and `credentials.scm`
+			// (issue #628) is keyed by provider — listing either would render an object as a
+			// role's "env var key".
+			const references = legacyScmReferences(project);
+			return SCM_CREDENTIAL_ROLES.flatMap((role) => {
+				const envVarKey = references[role];
+				if (!envVarKey) return [];
+				return [
+					{
+						role,
+						envVarKey,
+						isConfigured: isUsableSecret(resolved[envVarKey]),
+						maskedValue: maskCredential(resolved[envVarKey]),
+					},
+				];
+			});
 		}),
 
 	/**

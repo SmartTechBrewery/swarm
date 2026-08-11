@@ -40,7 +40,7 @@ export const jiraManifest: PMProviderManifest = {
 	// API token are two halves of one credential — and **none** inherits a shared
 	// SCM credential, the rule `PmCredentialRoleSpec.inheritsSharedCredential`
 	// states for exactly this case: a Jira site is a separate system from the
-	// GitHub repo it is paired with, so borrowing `credentials.webhookSecret` (as
+	// GitHub repo it is paired with, so borrowing the repo side's webhook secret (as
 	// GitHub Projects legitimately does, board and repo being one webhook) would
 	// point Jira's verifier at a secret GitHub chose and Jira never signs with.
 	credentialRoles: [

@@ -210,11 +210,16 @@ describe('ProjectConfigSchema', () => {
 		).toThrow();
 	});
 
-	it('requires every credential reference', () => {
+	it('requires a credentials block, and rejects an empty reference string', () => {
 		expect(() => createMockProjectConfig({ credentials: undefined as never })).toThrow();
 		expect(() =>
 			createMockProjectConfig({
 				credentials: { reviewer: 'B', webhookSecret: '' },
+			}),
+		).toThrow();
+		expect(() =>
+			createMockProjectConfig({
+				credentials: { scm: { github: { reviewer: '' } } },
 			}),
 		).toThrow();
 	});
@@ -229,6 +234,70 @@ describe('ProjectConfigSchema', () => {
 		});
 		expect('implementer' in project.credentials).toBe(false);
 		expect(project.credentials.reviewer).toBe('B');
+	});
+
+	// Issue #628: the SCM references are per provider, and a pre-#628 config is adopted
+	// onto that shape on parse so nothing has to be re-entered by hand. The manifest-facing
+	// half of the validation (role names) lives in `pm-credentials.test.ts`-style suites
+	// that register real manifests; this file registers none, so only the registry-free
+	// rules are asserted here.
+	describe('credentials.scm', () => {
+		it('accepts a per-provider reference map, keeping each provider separate', () => {
+			const project = createMockProjectConfig({
+				scm: 'gitlab',
+				credentials: {
+					scm: {
+						github: { reviewer: 'GH_REVIEWER', webhookSecret: 'GH_HOOK' },
+						gitlab: { reviewer: 'GL_REVIEWER', webhookSecret: 'GL_HOOK' },
+					},
+					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				},
+			});
+
+			expect(project.credentials.scm?.github?.reviewer).toBe('GH_REVIEWER');
+			expect(project.credentials.scm?.gitlab?.reviewer).toBe('GL_REVIEWER');
+		});
+
+		it('adopts a legacy shared pair under the provider the project runs on', () => {
+			const project = createMockProjectConfig({
+				scm: 'bitbucket',
+				credentials: { reviewer: 'REV_KEY', webhookSecret: 'HOOK_KEY' },
+			});
+
+			expect(project.credentials.scm).toEqual({
+				bitbucket: { reviewer: 'REV_KEY', webhookSecret: 'HOOK_KEY' },
+			});
+			// The legacy keys stay in place beside it — phase 1's Source Control tab reads them.
+			expect(project.credentials.reviewer).toBe('REV_KEY');
+		});
+
+		it('rejects a key that is not an SCM provider id, naming the ids', () => {
+			expect(() =>
+				createMockProjectConfig({
+					credentials: { scm: { githbu: { reviewer: 'TYPO_KEY' } } },
+				}),
+			).toThrow(/'githbu' is not an SCM provider id/);
+		});
+
+		/**
+		 * Presence is a *resolution-time* rule, not a schema rule (see
+		 * `validateScmCredentialReferences`): the dashboard's Source Control tab persists a
+		 * provider switch on its own, so "selected but not yet configured" is a state one
+		 * click legitimately creates. Rejecting it here would leave an operator with a config
+		 * file `swarm config apply` refuses for a state the dashboard just made. This test is
+		 * what keeps a parse-time presence check from being reintroduced.
+		 */
+		it('parses a project whose active provider has no references at all', () => {
+			const project = createMockProjectConfig({
+				scm: 'gitlab',
+				credentials: {
+					scm: { github: { reviewer: 'GH_REVIEWER' } },
+					pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				},
+			});
+
+			expect(project.credentials.scm?.gitlab).toBeUndefined();
+		});
 	});
 
 	it('omits agents entirely by default (every phase keeps its coded default)', () => {

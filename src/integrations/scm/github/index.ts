@@ -24,6 +24,17 @@ export const githubScmManifest: SCMProviderManifest = {
 	// board webhook is delivered to this same path and shares its HMAC secret
 	// (docs/github-projects-v2-api.md §5), so the path must stay exactly this.
 	webhookRoute: '/github/webhook',
+	// GitHub's own reference names for the contract's two credentials (issue #628).
+	// Provider-named rather than the neutral `SCM_*` pair, so storing GitHub's
+	// reviewer token cannot overwrite GitLab's — and these two strings are exactly
+	// the pre-#290 legacy names, so an installation that never moved off them
+	// migrates to the keys it already stores. A project created since #290 keeps its
+	// `SCM_TOKEN_REVIEWER` / `SCM_WEBHOOK_SECRET` references instead; these are only
+	// the conventional defaults for a project with no reference yet (see the spec).
+	credentialRoles: [
+		{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER' },
+		{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
+	],
 	// One shared instance: the integration is stateless and takes `project` per
 	// call, so there is nothing to construct per project (see the manifest doc).
 	provider: new GitHubSCMIntegration(),

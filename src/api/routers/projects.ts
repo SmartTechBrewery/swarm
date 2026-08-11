@@ -7,6 +7,7 @@ import {
 	PipelineConfigSchema,
 	ProjectConfigBaseSchema,
 	type ProjectPm,
+	type ScmCredentialReferencesByProvider,
 } from '../../config/schema.js';
 import {
 	approveMembershipRequestInDb,
@@ -26,6 +27,8 @@ import {
 } from '../../db/repositories/projectsRepository.js';
 import { getMembership } from '../../identity/membership-service.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
+import { getSCMProvider } from '../../integrations/scm/registry.js';
+import type { ScmType } from '../../scm/types.js';
 import { accessibleProjectScope, assertProjectAccess, filterAccessibleProjects } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { credentialsRouter } from './credentials.js';
@@ -49,13 +52,41 @@ export const DEFAULT_PM_CONFIG: ProjectPm = {
 	statusOptions: {},
 };
 
-// Project-scoped credential references a new project is created with. The
-// implementer persona is intentionally absent — it resolves from the worker-local
-// SWARM_OPERATOR_GH_TOKEN, not from project_credentials (issue #396).
-const DEFAULT_SCM_CREDENTIAL_REFERENCES = {
-	reviewer: 'SCM_TOKEN_REVIEWER',
-	webhookSecret: 'SCM_WEBHOOK_SECRET',
-};
+/**
+ * The `credentials.scm` map a new project starts with: one reference per role its
+ * **SCM provider** declares, named by that role's own conventional key
+ * (`SCMProviderManifest.credentialRoles`, issue #628) — the exact shape of
+ * {@link defaultPmCredentialReferences}, read off the manifest rather than hardcoded,
+ * so a project created for another provider seeds *its* keys with no edit here.
+ *
+ * The implementer persona is intentionally absent — it resolves from the worker-local
+ * `SWARM_OPERATOR_GH_TOKEN` (and its Bitbucket/GitLab siblings), not from
+ * `project_credentials` (issue #396). An unregistered provider seeds nothing.
+ */
+function defaultScmCredentialReferences(scm: ScmType): ScmCredentialReferencesByProvider {
+	const roles = getSCMProvider(scm)?.credentialRoles ?? [];
+	if (roles.length === 0) return {};
+	return { [scm]: Object.fromEntries(roles.map((role) => [role.role, role.envVarKey])) };
+}
+
+/**
+ * **Interim** (issue #628 phase 1 only): the legacy shared pair, mirroring the same
+ * two reference names the per-provider map above just seeded.
+ *
+ * The credentials tRPC router's `list`/`set`/`delete` and the dashboard's Source
+ * Control tab still edit the legacy pair in phase 1, so without this mirror a
+ * newly created project's tab would write to store keys nothing resolves. An
+ * *existing* project needs no mirror — it already has the pair, and the migration
+ * copied those same names into `credentials.scm`. Phase 2 rewires the router and the
+ * tab onto `credentials.scm` and deletes this function.
+ */
+function interimLegacyScmCredentialMirror(
+	references: ScmCredentialReferencesByProvider,
+	scm: ScmType,
+): { reviewer?: string; webhookSecret?: string } {
+	const seeded = references[scm];
+	return seeded ? { ...seeded } : {};
+}
 
 /**
  * The `credentials.pm` map a new project starts with: one reference per credential
@@ -181,15 +212,18 @@ export const projectsRouter = router({
 	// atomically in one transaction so a partial failure never leaves an unowned project.
 	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input }) => {
 		const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
+		// This is a creation-time default, not a config-schema fallback: the dashboard
+		// always submits its explicit picker value, while non-dashboard callers remain
+		// routable instead of creating a project with no SCM provider.
+		const scm: ScmType = input.scm ?? 'github';
+		const scmReferences = defaultScmCredentialReferences(scm);
 		const config = {
 			...input,
-			// This is a creation-time default, not a config-schema fallback: the dashboard
-			// always submits its explicit picker value, while non-dashboard callers remain
-			// routable instead of creating a project with no SCM provider.
-			scm: input.scm ?? 'github',
+			scm,
 			pm: DEFAULT_PM_CONFIG,
 			credentials: {
-				...DEFAULT_SCM_CREDENTIAL_REFERENCES,
+				scm: scmReferences,
+				...interimLegacyScmCredentialMirror(scmReferences, scm),
 				...(pmReferences ? { pm: pmReferences } : {}),
 			},
 		};

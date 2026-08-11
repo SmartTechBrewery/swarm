@@ -16,9 +16,11 @@ import {
 	findProjectByRepoFromDb,
 } from '../db/repositories/projectsRepository.js';
 import { requireProjectPMCredentialRole } from '../integrations/pm/registry.js';
-import type { ScmPersona } from '../scm/types.js';
+import { getSCMProvider } from '../integrations/scm/registry.js';
+import type { ScmCredentialRole, ScmPersona, ScmType } from '../scm/types.js';
 import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from './operator-token.js';
 import type { ProjectConfig } from './schema.js';
+import { scmCredentialReferenceFor, sharedScmCredentialProviderFor } from './scm-credentials.js';
 
 /**
  * Resolve the SWARM project that owns a GitHub repository (`owner/repo`).
@@ -96,36 +98,103 @@ export async function findProjectByTrelloBoard(
 }
 
 /**
+ * Resolve one of a project's SCM credentials — `(project, providerId, role)` →
+ * secret, or `null` when the project names no reference for that pair or the
+ * reference resolves to no stored credential (issue #628).
+ *
+ * It reads **only** the provider it was asked for
+ * (`credentials.scm[providerId][role]`). Deliberately not a fallback chain: a project
+ * may retain credentials for a provider it is not currently running on — switching the
+ * Source Control tab's selector leaves the previous provider's secrets stored — and
+ * quietly resolving those would hand a newly selected GitLab the GitHub secret. There
+ * is no host-env escape hatch either: SCM references have never had one (only an
+ * explicitly configured `credentials.pm` role does).
+ *
+ * The legacy shared `{ reviewer, webhookSecret }` pair is not consulted at runtime.
+ * A config that still carries it is migrated on the way in instead —
+ * `adoptLegacyScmCredentials` on parse, plus a one-time SQL backfill for persisted
+ * rows (`./scm-credentials.ts`).
+ */
+export async function resolveScmCredentialOrNull(
+	project: ProjectConfig,
+	providerId: ScmType,
+	role: ScmCredentialRole,
+): Promise<string | null> {
+	const reference = scmCredentialReferenceFor(project, providerId, role);
+	if (!reference) return null;
+	return resolveProjectCredential(project.id, reference);
+}
+
+/**
+ * Resolve an SCM credential, throwing when it resolves to nothing — the
+ * `require`-shaped twin of {@link resolveScmCredentialOrNull}, and the **single
+ * enforcement point** for "this provider's credential must be configured" (issue
+ * #628). The config schema validates only the *structure* of `credentials.scm`, so
+ * this is what fires when a credential is actually needed.
+ *
+ * The message names the project, the provider, the role, and that provider's
+ * conventional config-apply key, in `requirePmCredential`'s wording — never another
+ * provider's secret, and never a suggestion to reuse one.
+ */
+export async function requireScmCredential(
+	project: ProjectConfig,
+	providerId: ScmType,
+	role: ScmCredentialRole,
+): Promise<string> {
+	const secret = await resolveScmCredentialOrNull(project, providerId, role);
+	if (secret) return secret;
+
+	const manifest = getSCMProvider(providerId);
+	const label = manifest?.label ?? providerId;
+	const envVarKey = manifest?.credentialRoles.find((spec) => spec.role === role)?.envVarKey;
+	throw new Error(
+		`No ${label} ${role} credential configured for project '${project.id}' ` +
+			`(set credentials.scm.${providerId}.${role} to a stored reference` +
+			(envVarKey ? `; ${envVarKey} is its conventional config-apply key)` : ')'),
+	);
+}
+
+/**
  * Resolve a persona's GitHub token for a project, or `null` if it resolves to no
  * token.
+ *
+ * **This pair is GitHub's**, not a provider-neutral seam: the `implementer` branch
+ * returns the *GitHub* operator token, and the `reviewer` branch resolves GitHub's own
+ * per-provider reference since issue #628. Bitbucket and GitLab have their own twins
+ * in their provider folders (`src/integrations/scm/{bitbucket,gitlab}/credentials.ts`)
+ * for exactly that reason.
  *
  * The two personas resolve from *different* sources (issue #396): the
  * `implementer` is the worker operator's own token, a worker-local env var
  * (`SWARM_OPERATOR_GH_TOKEN`, `./operator-token.ts`) that is never persisted and
  * never in the project config; the `reviewer` stays a project-scoped credential
- * *reference* (an env-var key in `project.credentials`) resolved from the secret
- * store. The implementer/reviewer split is the whole point (ai/CODING_STANDARDS.md
- * "Loop prevention"): the two personas must resolve to two distinct identities so
- * neither reacts to its own output — here the author (operator) ≠ reviewer.
+ * *reference* resolved from the secret store. The implementer/reviewer split is the
+ * whole point (ai/CODING_STANDARDS.md "Loop prevention"): the two personas must
+ * resolve to two distinct identities so neither reacts to its own output — here the
+ * author (operator) ≠ reviewer.
  */
 export async function getPersonaTokenOrNull(
 	project: ProjectConfig,
 	persona: ScmPersona,
 ): Promise<string | null> {
 	if (persona === 'implementer') return getOperatorGitHubTokenOrNull();
-	const envVarKey = project.credentials[persona];
-	return resolveProjectCredential(project.id, envVarKey);
+	return resolveScmCredentialOrNull(project, 'github', persona);
 }
 
 /**
- * Resolve a project's GitHub webhook HMAC secret, or `null` if the reference
- * resolves to no stored credential. Like the persona tokens, the config holds
- * only the *reference* (an env-var key) in its `credentials` block; this maps it
- * to the stored secret. Returning `null` (rather than throwing) lets the router
- * decide how to treat a project with no secret configured.
+ * Resolve the secret one SCM provider authenticates a project's inbound deliveries
+ * with, or `null` when the reference is unset or resolves to no stored credential.
+ *
+ * Takes the provider id since issue #628: the receiver passes the manifest the
+ * delivery actually arrived from, so a GitLab delivery is never checked against the
+ * secret stored for the same project's GitHub webhook. Returning `null` (rather than
+ * throwing) lets the router decide how to treat a project with no secret configured.
  */
-export async function getWebhookSecretOrNull(project: ProjectConfig): Promise<string | null> {
-	return resolveProjectCredential(project.id, project.credentials.webhookSecret);
+export async function getWebhookSecretOrNull(
+	project: ProjectConfig,
+	providerId: ScmType,
+): Promise<string | null> {
+	return resolveScmCredentialOrNull(project, providerId, 'webhookSecret');
 }
 
 /**
@@ -139,10 +208,12 @@ export async function getWebhookSecretOrNull(project: ProjectConfig): Promise<st
  *
  * 1. the reference the project configured for the role (`credentials.pm[role]`),
  *    through the secret store;
- * 2. the shared `credentials` reference the role declares it inherits
+ * 2. the SCM-side credential the role declares it inherits
  *    (`inheritsSharedCredential`) — also a store reference, so it belongs above the
  *    host env; this is what keeps GitHub Projects' webhook secret *exactly* the
- *    project's existing SCM webhook secret;
+ *    project's existing SCM webhook secret. Since issue #628 that resolves the repo
+ *    side's **per-provider** secret for the SCM provider the project runs on
+ *    (`sharedScmCredentialProviderFor`), rather than a single shared reference;
  * 3. the role's `envVarKey` in this host's environment — only when the project
  *    explicitly configured `credentials.pm[role]`, as the escape hatch for a host
  *    that exports that opted-in secret directly rather than storing it;
@@ -172,9 +243,13 @@ export async function resolvePmCredential(
 	}
 
 	if (spec.inheritsSharedCredential) {
-		const inherited = await resolveProjectCredential(
-			project.id,
-			project.credentials[spec.inheritsSharedCredential],
+		// The repo side's secret for the SCM provider this project runs on. An unstated
+		// `scm` attributes to GitHub — the same rule the legacy adoption uses, so an
+		// unmigrated GitHub Projects board keeps authenticating its deliveries.
+		const inherited = await resolveScmCredentialOrNull(
+			project,
+			sharedScmCredentialProviderFor(project),
+			spec.inheritsSharedCredential,
 		);
 		if (inherited) return inherited;
 	}
@@ -240,24 +315,20 @@ export async function requirePmCredential(project: ProjectConfig, role: string):
  * token — an operation that needs a persona token but has none configured is a
  * deployment error, not a soft "not found" (ai/CODING_STANDARDS.md "Error
  * handling"). The message points at the persona's actual source: the operator
- * env var for the implementer, the project credential reference for the reviewer.
+ * env var for the implementer, and — via {@link requireScmCredential} — GitHub's own
+ * per-provider credential reference for the reviewer.
  */
 export async function getPersonaToken(
 	project: ProjectConfig,
 	persona: ScmPersona,
 ): Promise<string> {
-	const token = await getPersonaTokenOrNull(project, persona);
-	if (!token) {
-		if (persona === 'implementer') {
-			throw new Error(
-				`No GitHub implementer token configured: set ${OPERATOR_GH_TOKEN_ENV} on this host ` +
-					"(the worker operator's own token; never stored in project_credentials)",
-			);
-		}
+	if (persona === 'implementer') {
+		const token = await getOperatorGitHubTokenOrNull();
+		if (token) return token;
 		throw new Error(
-			`No GitHub ${persona} token configured for project '${project.id}' ` +
-				`(credential reference '${project.credentials[persona]}' not found in project_credentials)`,
+			`No GitHub implementer token configured: set ${OPERATOR_GH_TOKEN_ENV} on this host ` +
+				"(the worker operator's own token; never stored in project_credentials)",
 		);
 	}
-	return token;
+	return requireScmCredential(project, 'github', persona);
 }
