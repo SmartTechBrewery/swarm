@@ -17,7 +17,10 @@ describe('ProfileTabBar', () => {
 	it('renders only the tabs whose content is delivered', () => {
 		render(<ProfileTabBar activeTab="account" onSelect={vi.fn()} />);
 
-		expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual(['Account']);
+		expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual([
+			'Account',
+			'My Workers',
+		]);
 	});
 
 	it('reports the tab that was clicked', () => {
@@ -27,6 +30,15 @@ describe('ProfileTabBar', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Account' }));
 
 		expect(onSelect).toHaveBeenCalledWith('account');
+	});
+
+	it('reports the My Workers tab that was clicked', () => {
+		const onSelect = vi.fn();
+		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'My Workers' }));
+
+		expect(onSelect).toHaveBeenCalledWith('workers');
 	});
 
 	it('marks the active tab with the underline recipe', () => {
