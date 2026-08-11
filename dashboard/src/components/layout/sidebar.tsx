@@ -4,6 +4,7 @@ import { FolderGit2, Gauge, LogOut, Play, Plus, Server, Settings } from 'lucide-
 import { useState } from 'react';
 import { ProjectCreateDialog } from '@/components/projects/project-create-dialog.js';
 import { logout } from '@/lib/auth.js';
+import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
 import { version } from '../../../../package.json';
@@ -34,29 +35,36 @@ export function Sidebar() {
 					</span>
 				</div>
 				<nav className="space-y-1 p-2">
-					<Link
-						to="/runs"
-						className={
-							currentPath.startsWith('/runs')
-								? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-								: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-						}
-					>
-						<Play className="h-4 w-4" />
-						Runs
-					</Link>
+					{/* The two installation-wide screens, offered only to an instance
+					    administrator (issue #647) — a worker owner reaches the same runs
+					    and workers, scoped, through their project links below. */}
+					{canViewInstanceWide(currentUser.data) && (
+						<>
+							<Link
+								to="/runs"
+								className={
+									currentPath.startsWith('/runs')
+										? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
+										: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
+								}
+							>
+								<Play className="h-4 w-4" />
+								Runs
+							</Link>
 
-					<Link
-						to="/workers"
-						className={
-							currentPath.startsWith('/workers')
-								? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-								: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-						}
-					>
-						<Server className="h-4 w-4" />
-						Workers
-					</Link>
+							<Link
+								to="/workers"
+								className={
+									currentPath.startsWith('/workers')
+										? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
+										: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
+								}
+							>
+								<Server className="h-4 w-4" />
+								Workers
+							</Link>
+						</>
+					)}
 
 					<div className="flex items-center justify-between px-3 pt-4 pb-1">
 						<span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">

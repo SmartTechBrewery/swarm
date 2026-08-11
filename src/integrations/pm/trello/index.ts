@@ -28,7 +28,7 @@
 import { TrelloRouterAdapter } from '../../../router/adapters/trello.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '../manifest.js';
 import { registerPMProvider } from '../registry.js';
-import { trelloConfigSchema } from './config-schema.js';
+import { trelloBlankPm, trelloConfigSchema } from './config-schema.js';
 import { TRELLO_API_KEY_ROLE, TRELLO_TOKEN_ROLE } from './credentials.js';
 import { createTrelloProvider } from './provider.js';
 import { verifyTrelloWebhookSignature } from './webhook.js';
@@ -39,13 +39,18 @@ export const trelloManifest: PMProviderManifest = {
 	category: 'pm',
 	createProvider: createTrelloProvider,
 	configSchema: trelloConfigSchema,
+	// No `blankPmDiscoveryBlocker`: both capabilities read the key/token pair's own
+	// account — its boards, then one selected board's lists — so neither needs anything
+	// out of the `pm` member, and an incoming Trello board is discoverable with nothing
+	// configured but the pair.
+	blankPm: trelloBlankPm,
 	routerAdapter: new TrelloRouterAdapter(),
 	// Three roles — Trello authenticates with a **key/token pair** passed as query
 	// parameters, and signs its deliveries with a third secret — and **none**
 	// inherits a shared SCM credential, the rule
 	// `PmCredentialRoleSpec.inheritsSharedCredential` states for exactly this case:
 	// a Trello board is a separate system from the GitHub repo it is paired with, so
-	// borrowing `credentials.webhookSecret` (as GitHub Projects legitimately does,
+	// borrowing the repo side's webhook secret (as GitHub Projects legitimately does,
 	// board and repo being one webhook) would point Trello's verifier at a secret
 	// GitHub chose and Trello never signs with.
 	credentialRoles: [

@@ -12,11 +12,14 @@
  * standards violation (ai/CODING_STANDARDS.md "Comments" / "don't build it
  * speculatively").
  *
- * This file defines *types only* — no runtime import edge. The two companion
- * halves of the PM contract are `src/pm/events.ts` (the Zod normalized inbound
- * event, which crosses the queue boundary) and `src/pm/router-adapter.ts` (the
- * ingress interface). The adapter that implements all three against the GitHub
- * Projects GraphQL API lives under `src/integrations/pm/github-projects/`.
+ * This file defines types plus two closed value vocabularies ({@link PM_TYPES},
+ * {@link PM_DISCOVERY_CAPABILITIES}) and imports nothing at runtime, so importing
+ * it still adds no dependency edge of its own — the same shape `src/scm/types.ts`
+ * has. The two companion halves of the PM contract are `src/pm/events.ts` (the Zod
+ * normalized inbound event, which crosses the queue boundary) and
+ * `src/pm/router-adapter.ts` (the ingress interface). The adapter that implements
+ * all three against the GitHub Projects GraphQL API lives under
+ * `src/integrations/pm/github-projects/`.
  *
  * IDs are plain `string` at this interface, on purpose: the contract is
  * provider-agnostic, so it can't name GitHub-specific branded types
@@ -37,8 +40,16 @@
  * {@link import('../integrations/pm/registry.js').requireProjectPMProvider}
  * throw a wiring-bug error, which is how the next provider's phases stay
  * unreachable until it is complete.
+ *
+ * Stated as values rather than a bare union, exactly as {@link SCM_TYPES}
+ * (`src/scm/types.ts`) is: the config schema's `credentials.pm` key check
+ * (`src/config/schema.ts`, issue #631) has to answer "is this string a PM provider
+ * id?" at runtime, without depending on which provider modules a process imported.
+ * {@link PMType} is derived from the list so the two cannot drift, and
+ * `PmProviderIdSchema` (`src/pm/events.ts`) is built from it for the same reason.
  */
-export type PMType = 'github-projects' | 'jira' | 'linear' | 'trello';
+export const PM_TYPES = ['github-projects', 'jira', 'linear', 'trello'] as const;
+export type PMType = (typeof PM_TYPES)[number];
 
 /**
  * The discovery capabilities the board-mapping screen needs a provider to answer:
@@ -257,10 +268,47 @@ export interface WorkItemBlocker {
 	open: boolean;
 	/**
 	 * How the dependency was found: a `dependency` relationship the provider models
-	 * natively, or a `mention` parsed from the item's own description/comments. Both
-	 * gate work identically; this is informational, for clearer messages and logs.
+	 * natively, or a `mention` parsed from the item's own description/comments.
+	 *
+	 * **This decides the blocker's authority, not just its wording** (issue #643).
+	 * Only `dependency` defers a run; a `mention` is surfaced for a human and never
+	 * becomes a scheduling constraint, because prose that *discusses* a dependency
+	 * reads the same as prose that *declares* one — see `src/pm/dependencies.ts`'s
+	 * module comment for the two runs that proved it. A provider must therefore set
+	 * this accurately: reporting a prose reference as `dependency` re-creates the
+	 * defect, and reporting a real relationship as `mention` silently drops a gate.
 	 */
 	source: 'dependency' | 'mention';
+}
+
+/**
+ * An item that this work item blocks — the **reverse** edge of
+ * {@link WorkItemBlocker}, returned by {@link PMProvider.listDependents}. Enough
+ * to recognise it in the blocker list and to name it in a log line.
+ *
+ * It carries no `source`, unlike a blocker: this read is **native by
+ * definition**. Its whole purpose is to answer "does the provider's own
+ * dependency graph already say the proposed blocker is waiting on *me*?", and a
+ * prose-derived answer could not settle that — it would let the same heuristic
+ * that invented a blocker also excuse it (issue #639, `ai/ARCHITECTURE.md`
+ * "Pipeline phases" → Implementation).
+ */
+export interface WorkItemDependent {
+	/**
+	 * The dependent's provider-native work-item id when the provider's reverse read
+	 * yields one, else undefined. GitHub's does not — it answers with *issues*, not
+	 * board items — so callers match on {@link url} / {@link reference} rather than
+	 * on this.
+	 */
+	id?: string;
+	/** Human-readable reference for logs/messages — e.g. an issue number `#633`. */
+	reference: string;
+	/** Web URL of the dependent issue/item — the identity a blocker is matched on. */
+	url: string;
+	/** Title of the dependent issue/item, for human-readable messages. */
+	title: string;
+	/** Whether the dependent is still unfinished. Informational: a cycle is a cycle either way. */
+	open: boolean;
 }
 
 /** Optional server-side filters for {@link PMProvider.listWorkItems}. */
@@ -440,6 +488,11 @@ export interface PMProvider {
 	 * calling {@link listBlockers} / {@link addBlockedBy} (which return `[]` / no-op).
 	 * A capability flag rather than an optional method so a second provider
 	 * (Bitbucket, GitLab, Jira) opts out explicitly (ai/RULES.md §2).
+	 *
+	 * Such a provider has **no automated gate at all**, and that is unchanged by
+	 * issue #643: the gate short-circuits on this flag before `listBlockers` is
+	 * called, so it never gated on prose there either. Its guard stays the prose
+	 * Planning writes into each split child, for a human to read.
 	 */
 	readonly supportsDependencies: boolean;
 
@@ -450,8 +503,35 @@ export interface PMProvider {
 	 * relationships with dependencies referenced in the item's own description and
 	 * comments (deduplicated). Returns `[]` when the item has none, or when the
 	 * provider has no dependency concept ({@link supportsDependencies} is `false`).
+	 *
+	 * Both kinds are still reported, and each carries its {@link
+	 * WorkItemBlocker.source}: the caller *gates* on the native relationships and
+	 * *surfaces* the prose ones to a human (issue #643), so a provider that dropped
+	 * the mentions here would lose the notice rather than tighten the gate.
 	 */
 	listBlockers(id: string): Promise<WorkItemBlocker[]>;
+
+	/**
+	 * List the items this one *blocks* — the reverse edge of {@link listBlockers},
+	 * read from the provider's **native** dependency graph only, never from prose.
+	 * Returns `[]` when the item blocks nothing, or when the provider has no
+	 * dependency concept ({@link supportsDependencies} is `false`).
+	 *
+	 * It exists so that no run can ever be gated by a cycle (issue #639): the shared
+	 * dependency gate drops an open blocker the item itself natively blocks, because
+	 * such a blocker cannot close until the gated item lands, so waiting on it could
+	 * only ever run the wait budget out and settle the run failed. That happened —
+	 * item 633 deferred ~2000 times on an issue whose own `blocked_by` list named
+	 * 633 — which is why this is a structural backstop on the gate rather than an
+	 * improvement to whatever produced the blocker.
+	 *
+	 * A method rather than a field on {@link WorkItemBlocker} because the question is
+	 * about *this* item's outgoing edges, which the provider reads once per gate
+	 * check instead of once per candidate blocker. Native-only for the same reason
+	 * `source` decides a blocker's authority (issue #643): a prose-derived reverse
+	 * edge would let the heuristic that invented a blocker also excuse it.
+	 */
+	listDependents(id: string): Promise<WorkItemDependent[]>;
 
 	/**
 	 * Record that work item `id` is *blocked by* `blockerId` (a prerequisite that

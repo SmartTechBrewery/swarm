@@ -62,12 +62,13 @@
  * each write is idempotent at the provider, so a replayed request cannot fork the
  * board.
  *
- * Seventeen routes, all under `/worker/delivery`:
+ * Eighteen routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
  *   - `POST /worker/delivery/pm/comment` — comment on the item's backing Issue/PR.
  *   - `POST /worker/delivery/pm/blockers` — read the item's open prerequisites.
+ *   - `POST /worker/delivery/pm/dependents` — read the items it blocks (the cycle backstop).
  *   - `POST /worker/delivery/pm/find-item` — resolve one card by its backing URL's tail.
  *   - `POST /worker/delivery/pm/find-artifact` — resolve one card by a repository-scoped artifact.
  *   - `POST /worker/delivery/pm/find-item-by-marker` — resolve one card by a marker in its description.
@@ -84,7 +85,7 @@
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
  * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
- * `handleListBlockers`, `handleFindWorkItem`, `handleFindWorkItemByMarker`,
+ * `handleListBlockers`, `handleListDependents`, `handleFindWorkItem`, `handleFindWorkItemByMarker`,
  * `handleFindWorkItemForArtifact`, `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
  * `handleAddPmLabel`, `handleAddBlockedBy`, `handleScheduleFollowUpReview`,
  * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
@@ -137,6 +138,7 @@ import {
 	FollowUpReviewDeliveryRequestSchema,
 	type FoundWorkItem,
 	ListBlockersDeliveryRequestSchema,
+	ListDependentsDeliveryRequestSchema,
 	MarkReviewLedgerRequestSchema,
 	MoveWorkItemDeliveryRequestSchema,
 	PostCommentDeliveryRequestSchema,
@@ -446,6 +448,40 @@ export async function handleAddPmComment(
 	const pm = deps.buildPmProvider(authed.project);
 	const commentId = await pm.addComment(request.itemId, request.body);
 	return { status: 200, json: { commentId } };
+}
+
+/**
+ * Read the items a work item *blocks* — the reverse edge of
+ * {@link handleListBlockers}, served for the same reason: the dependency gate runs
+ * on the worker, and without this the cycle backstop (issue #639) would be inert on
+ * the federated path, which is exactly where the deadlock it prevents was observed.
+ * Same prelude and contract as {@link handleMoveWorkItem}; the PM credential is
+ * resolved server-side and the answer is `PMProvider.listDependents`'s
+ * provider-neutral shape.
+ */
+export async function handleListDependents(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = ListDependentsDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	if ('status' in authed) return authed;
+
+	const pm = deps.buildPmProvider(authed.project);
+	// `[]` for a provider that models no dependencies is the interface's own
+	// contract (`../pm/types.ts`), so no capability branch is needed here.
+	const dependents = await pm.listDependents(request.itemId);
+	return { status: 200, json: { dependents } };
 }
 
 /**
@@ -946,6 +982,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/pm/blockers', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleListBlockers(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/pm/dependents', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleListDependents(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 

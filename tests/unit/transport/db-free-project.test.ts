@@ -33,19 +33,17 @@ describe('reconstructProjectConfig', () => {
 		);
 
 		expect(() => CredentialsSchema.parse(reconstructed.credentials)).not.toThrow();
-		// The placeholder is a fixed sentinel, never a real secret reference.
-		expect(reconstructed.credentials).toEqual({
-			reviewer: 'db-free-unused',
-			webhookSecret: 'db-free-unused',
-		});
+		// Empty since issue #628 made every credential key optional: the honest
+		// representation of "this worker holds no references", and it names no key a host
+		// environment could accidentally satisfy.
+		expect(reconstructed.credentials).toEqual({});
 	});
 
 	it('does not carry the original credential references onto the reconstructed config', () => {
 		const project = createMockProjectConfig({
 			credentials: {
-				reviewer: 'REAL_REVIEWER_REF',
-				webhookSecret: 'REAL_WEBHOOK_REF',
-				pm: { apiToken: 'REAL_PM_TOKEN_REF' },
+				scm: { github: { reviewer: 'REAL_REVIEWER_REF', webhookSecret: 'REAL_WEBHOOK_REF' } },
+				pm: { 'github-projects': { apiToken: 'REAL_PM_TOKEN_REF' } },
 			},
 		});
 		const reconstructed = reconstructProjectConfig(
@@ -53,7 +51,9 @@ describe('reconstructProjectConfig', () => {
 			'/remote-worker/swarm',
 		);
 
-		expect(reconstructed.credentials.reviewer).not.toBe('REAL_REVIEWER_REF');
+		expect(reconstructed.credentials.scm).toBeUndefined();
+		expect(JSON.stringify(reconstructed)).not.toContain('REAL_REVIEWER_REF');
+		expect(JSON.stringify(reconstructed)).not.toContain('REAL_WEBHOOK_REF');
 	});
 
 	// Issue #537: PM credentials are control-plane-only. A DB-free worker gets no PM
@@ -64,7 +64,7 @@ describe('reconstructProjectConfig', () => {
 			credentials: {
 				reviewer: 'SCM_TOKEN_REVIEWER',
 				webhookSecret: 'SCM_WEBHOOK_SECRET',
-				pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 			},
 		});
 		const reconstructed = reconstructProjectConfig(

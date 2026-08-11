@@ -7,6 +7,7 @@ import type {
 	UpdateWorkItemPatch,
 	WorkItem,
 	WorkItemBlocker,
+	WorkItemDependent,
 } from '@/pm/types.js';
 import { createMockWorkItem } from '../../helpers/factories.js';
 
@@ -140,17 +141,30 @@ class InMemoryPMProvider implements PMProvider {
 
 	async listBlockers(id: string): Promise<WorkItemBlocker[]> {
 		const blockerIds = this.blockedBy.get(id) ?? new Set<string>();
-		return [...blockerIds].map((blockerId) => {
-			const item = this.items.get(blockerId);
-			return {
-				id: blockerId,
-				reference: item?.url ?? blockerId,
-				url: item?.url ?? '',
-				title: item?.title ?? '',
-				open: item?.statusId !== this.statusOptions.done,
-				source: 'dependency' as const,
-			};
-		});
+		return [...blockerIds].map((blockerId) => ({
+			...this.edgeTarget(blockerId),
+			source: 'dependency' as const,
+		}));
+	}
+
+	/** The reverse edge of {@link listBlockers}: every item recorded as blocked by `id`. */
+	async listDependents(id: string): Promise<WorkItemDependent[]> {
+		const dependentIds = [...this.blockedBy.entries()]
+			.filter(([, blockerIds]) => blockerIds.has(id))
+			.map(([dependentId]) => dependentId);
+		return dependentIds.map((dependentId) => this.edgeTarget(dependentId));
+	}
+
+	/** One end of a dependency edge, in the fields both directions share. */
+	private edgeTarget(id: string): WorkItemDependent {
+		const item = this.items.get(id);
+		return {
+			id,
+			reference: item?.url ?? id,
+			url: item?.url ?? '',
+			title: item?.title ?? '',
+			open: item?.statusId !== this.statusOptions.done,
+		};
 	}
 }
 

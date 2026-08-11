@@ -52,6 +52,7 @@ import type {
 	WorkItemArtifact,
 	WorkItemAssignee,
 	WorkItemBlocker,
+	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
 import { adfToPlainText, textToAdf } from './adf.js';
@@ -473,6 +474,25 @@ function toBlocker(
 }
 
 /**
+ * Map one linked issue this one blocks onto a dependent — the same fields
+ * {@link toBlocker} builds minus `source`, since the reverse read has only one
+ * (`src/pm/types.ts`). `reference`/`url` are derived identically on purpose: they
+ * are the identity the shared cycle check matches a blocker against.
+ */
+function toDependent(
+	issue: JiraLinkedIssue & { key: string },
+	config: JiraIntegrationConfig,
+): WorkItemDependent {
+	return {
+		id: issue.key,
+		reference: issue.key,
+		url: `${siteUrl(config)}/browse/${issue.key}`,
+		title: issue.fields?.summary ?? '',
+		open: issue.fields?.status?.statusCategory?.key !== DONE_STATUS_CATEGORY,
+	};
+}
+
+/**
  * A Jira label is a single token — the API rejects one containing whitespace with
  * an opaque 400. Failing here instead names the constraint and the offending value.
  * `pipeline.automationLabel` defaults to `swarm`, so this is a guard on operator
@@ -845,13 +865,36 @@ export class JiraPMProvider implements PMProvider {
 	async listBlockers(id: string): Promise<WorkItemBlocker[]> {
 		return this.run(async () => {
 			// Two sources, deduplicated by URL so a prerequisite that is both linked
-			// and written down is reported once: Jira's own "is blocked by" issue
-			// links, and the prerequisites the item names in prose.
+			// and written down is reported once — as the native link, which is what
+			// makes it a gate rather than a notice (issue #643): Jira's own "is blocked
+			// by" issue links, and the prerequisites the item names in prose.
 			const [native, mentioned] = await Promise.all([
 				this.fetchNativeBlockers(id),
 				this.fetchMentionedBlockers(id),
 			]);
 			return dedupeBlockers([...native, ...mentioned]);
+		});
+	}
+
+	/**
+	 * The issues Jira itself records this one as blocking — the mirror of
+	 * {@link fetchNativeBlockers}, over the same `issuelinks` read. Direction is
+	 * carried by *which side* the entry names, so this takes the `outwardIssue` of
+	 * every "is blocked by" link ("this issue blocks that one") where the blocker
+	 * read takes the `inwardIssue`.
+	 *
+	 * Native only, never prose (`src/pm/types.ts`); a `Relates`-style link is not a
+	 * dependency and is filtered out here exactly as on the blocker side.
+	 */
+	async listDependents(id: string): Promise<WorkItemDependent[]> {
+		return this.run(async () => {
+			const links = await this.fetchIssueLinks(id);
+			return links
+				.filter(
+					(link): link is JiraIssueLink & { outwardIssue: JiraLinkedIssue & { key: string } } =>
+						isBlockedByLinkType(link.type) && Boolean(link.outwardIssue?.key),
+				)
+				.map((link) => toDependent(link.outwardIssue, this.config));
 		});
 	}
 
@@ -1095,6 +1138,10 @@ export class JiraPMProvider implements PMProvider {
 	 * which also excludes SWARM's own comments so a published plan's "requires
 	 * #266" never becomes a blocker nobody declared (issue #431); this adapter only
 	 * resolves each reference to a live open/closed state.
+	 *
+	 * Reported as `source: 'mention'`, which since issue #643 makes them
+	 * **advisory**: the gate surfaces them for a human and lets the run proceed, so
+	 * only the native issue link below actually defers work.
 	 *
 	 * **Known limitation:** the shared heuristic recognises the numeric `#N` and
 	 * `/issues/N` forms, not Jira's own `SWARM-123` notation — widening it would

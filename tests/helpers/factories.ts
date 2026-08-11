@@ -748,8 +748,8 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 			webhookSecret: 'SCM_WEBHOOK_SECRET',
 			// GitHub Projects declares one required credential role of its own — the
 			// board's API token (issue #537) — so a valid config for it names a
-			// reference here.
-			pm: { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+			// reference here, under its own provider id (issue #631).
+			pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 		},
 		...overrides,
 	});
@@ -771,7 +771,7 @@ export function createMockLinearProjectConfig(
 			// the SCM block (its board is a separate system), so a valid config names
 			// both references here — without them `ProjectConfigSchema` rejects this
 			// fixture in any test file where the manifest is registered.
-			pm: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
+			pm: { linear: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' } },
 		},
 		...overrides,
 	});
@@ -793,9 +793,11 @@ export function createMockJiraProjectConfig(overrides: Partial<ProjectConfig> = 
 			// `credentials.pm` against the *registered* manifest, so the fixture has to
 			// be complete before that phase or every suite using it starts failing.
 			pm: {
-				email: 'JIRA_EMAIL',
-				apiToken: 'JIRA_API_TOKEN',
-				webhookSecret: 'JIRA_WEBHOOK_SECRET',
+				jira: {
+					email: 'JIRA_EMAIL',
+					apiToken: 'JIRA_API_TOKEN',
+					webhookSecret: 'JIRA_WEBHOOK_SECRET',
+				},
 			},
 		},
 		...overrides,
@@ -821,9 +823,11 @@ export function createMockTrelloProjectConfig(
 			// against the *registered* manifest, so the fixture has to be complete before
 			// that phase or every suite using it starts failing.
 			pm: {
-				apiKey: 'TRELLO_API_KEY',
-				token: 'TRELLO_TOKEN',
-				webhookSecret: 'TRELLO_API_SECRET',
+				trello: {
+					apiKey: 'TRELLO_API_KEY',
+					token: 'TRELLO_TOKEN',
+					webhookSecret: 'TRELLO_API_SECRET',
+				},
 			},
 		},
 		...overrides,
