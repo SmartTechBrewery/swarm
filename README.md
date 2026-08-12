@@ -205,7 +205,10 @@ live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
 and executes a pushed `TaskAssignment` **DB-free**: project config comes from the
 assignment while `repoRoot` is resolved from this host (`SWARM_WORKER_REPO_ROOT`,
 defaulting to the launch directory) — an assignment for a repository this checkout
-is *not* is refused up front, naming both, rather than run (issue #688) —
+is *not* is refused up front, naming both, rather than run (issue #688), and the
+daemon **locks** that checkout for its whole life, so a second worker pointed at the
+same path refuses to start instead of driving git in the same repository (issue
+#689; give a second worker on the machine its own checkout) —
 source-carrying delivery (commit / push /
 create-PR) runs under the operator token, and everything needing something this
 worker must not hold goes up to the control plane's delivery API — Implementation's board moves/comments and

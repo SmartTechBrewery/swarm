@@ -16,17 +16,12 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
+// Shared with the daemon's own checkout lock (`./checkout-lock.ts`, issue #689) so
+// "is that owner still alive" has one definition on this host, TTLs apart.
+import { isExpired, pathOlderThan, pidIsLive, readJson } from './local-lock.js';
 import { BlockedRecoveryError } from './reclaim.js';
 import type { WorktreeRuntime } from './worktree-runtime.js';
 
@@ -103,46 +98,6 @@ export interface HostLocalWorktreeRuntimeOptions {
 
 function stateKey(projectId: string, taskId: string): string {
 	return createHash('sha256').update(`${projectId}\0${taskId}`).digest('hex');
-}
-
-/**
- * `null` — absent. `undefined` — present but unparseable, which is *not* the same
- * answer: an absent artifact is free, an unreadable one is occupied by something
- * this process cannot identify.
- */
-function readJson<T>(path: string, schema: z.ZodType<T>): T | null | undefined {
-	if (!existsSync(path)) return null;
-	try {
-		return schema.parse(JSON.parse(readFileSync(path, 'utf8')));
-	} catch {
-		return undefined;
-	}
-}
-
-/** An unparseable or missing timestamp counts as expired — it cannot be trusted to bound anything. */
-function isExpired(createdAt: string, ttlMs: number, now = Date.now()): boolean {
-	const at = Date.parse(createdAt);
-	if (Number.isNaN(at)) return true;
-	return now - at > ttlMs;
-}
-
-/** Fallback age for an artifact whose own timestamp is unreadable or was never written. */
-function pathOlderThan(path: string, ttlMs: number, now = Date.now()): boolean {
-	try {
-		return now - statSync(path).mtimeMs > ttlMs;
-	} catch {
-		// Vanished underneath us — treat as gone rather than as protected.
-		return true;
-	}
-}
-
-function pidIsLive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === 'EPERM';
-	}
 }
 
 /**

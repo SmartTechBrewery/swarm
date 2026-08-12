@@ -135,6 +135,17 @@ repository the machine holds no other way, since `repoRoot` is host-local. It pr
 `null` when the checkout has no identifiable `origin` (a local-only clone); that is
 not an error, the daemon simply declares nothing.
 
+**One worker per checkout** (issue #689). Before it handshakes, the daemon takes a
+lock on the checkout it was pointed at, recorded under
+`~/.swarm/checkout-locks/<hash>/owner.json` on this machine — not on the control
+plane, which cannot see a checkout. A second daemon started against the same
+`SWARM_WORKER_REPO_ROOT` refuses to start and names the worker holding it, because
+both would drive git in the same repository and collide on its `index.lock`. Two
+*separate* checkouts on one machine are fine, and are the supported way to run two
+workers on it. The lock needs no cleanup after a crash: the next daemon reclaims it
+once the holder's process is gone (or its refresh has lapsed), and a `Ctrl-C`
+shutdown releases it immediately.
+
 Leave it running in its own foreground terminal — same as the host worker, this
 process is meant to be watched, not daemonized. `Ctrl-C` sends a graceful
 `SIGINT`, which releases the session lease immediately rather than leaving it
@@ -163,4 +174,5 @@ to expire after `heartbeatTtlMs`.
 | `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
 | `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the three variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, step 4), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
+| `refusing to start — another worker already holds this checkout` | Another daemon on this machine is already running against the same `SWARM_WORKER_REPO_ROOT` (issue #689) — the line names its worker id, or its pid when it has not handshaked yet. Stop that process, or give this worker its own checkout and point `SWARM_WORKER_REPO_ROOT` at it. A lock left by a crashed daemon is reclaimed automatically, so this message always means a live holder — unless its `owner.json` is unreadable, which resolves itself once the lock ages out (15 minutes). |
 | Handshake repeatedly logs `worker session already held` | Another daemon really is connected as this worker — two machines were given the same `SWARM_WORKER_CREDENTIAL`, or a stale process is still running on this one. A daemon *reconnecting* after a control-plane restart takes its own lease straight back (it presents the session it holds, and logs `reclaimed=true` on the next `worker transport session established`), so a repeating refusal means a second holder rather than a slow expiry. |
