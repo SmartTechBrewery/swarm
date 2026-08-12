@@ -45,6 +45,19 @@ export function normalizeRepoSlug(slug: string): string {
 }
 
 /**
+ * Whether two slugs name the same repository, each normalised first — the named
+ * form of the comparison the module header describes, so no caller has to
+ * remember that the *config* side needs {@link normalizeRepoSlug} too (issue #688).
+ *
+ * It is an equality test on a host-less slug, with everything that implies (see
+ * the header): it guards against operator error, not against an attacker, and it
+ * cannot tell two providers hosting the same path apart.
+ */
+export function repoSlugsMatch(a: string, b: string): boolean {
+	return normalizeRepoSlug(a) === normalizeRepoSlug(b);
+}
+
+/**
  * The `owner/name` a clone URL points at, or `null` when it cannot be read.
  * Deliberately provider-neutral: handles `scp`-style (`git@host:owner/name`),
  * `ssh://`, and `https://` forms, and keeps the whole path so a nested namespace

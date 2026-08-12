@@ -281,6 +281,65 @@ describe('runAssignmentDbFree', () => {
 		);
 	});
 
+	it('refuses an assignment for a repository this checkout is not, naming both (issue #688)', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn();
+		const buildDelivery = vi.fn(async () => stubDelivery());
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			// This daemon's checkout is a different repository from the assigned project's
+			// `SmartTechBrewery/swarm` — the second-enrollment case (ADR-003 §2).
+			checkoutRepository: 'acme/backend',
+			deps: depsWith(runPhase as never, buildDelivery),
+		});
+
+		// Refused before the project is reconstructed: no delivery built, no phase run,
+		// and so no worktree cut in the wrong repository.
+		expect(runPhase).not.toHaveBeenCalled();
+		expect(buildDelivery).not.toHaveBeenCalled();
+		const result = sink.sent.at(-1) as Record<string, unknown>;
+		// Terminal `failed`, never `deferred` — no retry here could make the two match.
+		expect(result).toMatchObject({ type: 'task-execution-result', status: 'failed' });
+		expect(sink.sent.filter((f) => f.type === 'task-execution-result')).toHaveLength(1);
+		expect(String(result.error)).toContain('SmartTechBrewery/swarm');
+		expect(String(result.error)).toContain('acme/backend');
+		// The checkout path too, as `assertRepoIdentity`'s own refusal already reports it.
+		expect(String(result.error)).toContain(RUN_OPTIONS.repoRoot);
+	});
+
+	it('runs an assignment whose repository differs only in case or a .git suffix', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			checkoutRepository: 'SmartTechBrewery/Swarm.git',
+			deps: depsWith(runPhase),
+		});
+
+		// Both sides go through the shared normaliser, so a host's own casing and a
+		// trailing `.git` are noise rather than a different repository.
+		expect(runPhase).toHaveBeenCalledTimes(1);
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'respond-to-ci' });
+	});
+
+	it('runs the normal path when the daemon declared no repository', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+
+		// A checkout with no identifiable `origin` declares nothing (issue #687), and
+		// keeps exactly today's behaviour — `assertRepoIdentity` is still the backstop.
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			checkoutRepository: undefined,
+			deps: depsWith(runPhase),
+		});
+
+		expect(runPhase).toHaveBeenCalledTimes(1);
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'respond-to-ci' });
+	});
+
 	it('runs planning with its whole board surface on the delivery API and no PM credential', async () => {
 		const sink = recordingSink();
 		const child = {

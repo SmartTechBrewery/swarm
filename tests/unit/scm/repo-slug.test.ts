@@ -25,6 +25,7 @@ import {
 	normalizeRepoSlug,
 	RepoSlugSchema,
 	repoSlugFromRemoteUrl,
+	repoSlugsMatch,
 	resolveDeclarableOriginRepoSlug,
 	resolveOriginRepoSlug,
 } from '@/scm/repo-slug.js';
@@ -48,6 +49,21 @@ describe('normalizeRepoSlug', () => {
 
 	it('leaves an already-normalised slug alone', () => {
 		expect(normalizeRepoSlug('smarttechbrewery/swarm')).toBe('smarttechbrewery/swarm');
+	});
+});
+
+// The named comparison the worker's pre-flight repository check runs (issue #688):
+// it must normalise *both* sides, since one of them is a raw `ProjectConfig.repo`.
+describe('repoSlugsMatch', () => {
+	it('matches slugs that differ only in case, a .git suffix, or surrounding slashes', () => {
+		expect(repoSlugsMatch('SmartTechBrewery/swarm', 'smarttechbrewery/Swarm.git')).toBe(true);
+		expect(repoSlugsMatch('SmartTechBrewery/swarm', '/smarttechbrewery/swarm/')).toBe(true);
+	});
+
+	it('does not match two different repositories', () => {
+		expect(repoSlugsMatch('SmartTechBrewery/swarm', 'acme/backend')).toBe(false);
+		// Same name, different owner — the second-enrollment case worth failing on.
+		expect(repoSlugsMatch('acme/swarm', 'SmartTechBrewery/swarm')).toBe(false);
 	});
 });
 
