@@ -9,7 +9,8 @@
  *
  * It owns both the enrollment write operations (`enrollWorker` /
  * `approveEnrollment` / `setSharingConsent` / `updateEnrollmentConstraints` /
- * `setEnrollmentStatus`) and the two provider-neutral read models:
+ * `setEnrollmentStatus` / `suspendEnrollmentsForMismatchedRepository`) and the two
+ * provider-neutral read models:
  *
  * - `listProjectRoster(projectId)` — every worker enrolled in a project, with
  *   display name, owner, capabilities, status, allowed CLIs, allowed phases,
@@ -28,11 +29,22 @@
  *   worker + enrollment + resolved availability, in the deterministic
  *   enrollment-creation order the scheduler selects by.
  *
+ * **A worker is only ever enrolled in a project for the repository its own
+ * checkout is** (issue #690). Both moments the pairing becomes knowable are
+ * policed here: `enrollWorker` refuses a mismatched write
+ * (`EnrollmentRepositoryMismatchError`), and
+ * `suspendEnrollmentsForMismatchedRepository` suspends an existing enrollment when
+ * a reconnecting daemon declares a repository that contradicts it. Neither ever
+ * *creates* or *activates* an enrollment from a declaration — approval and sharing
+ * consent stay the human decisions ADR-001 makes them — and a worker that declared
+ * no repository is left alone by both.
+ *
  * **No secrets** leave this surface. The assembled views are built by explicitly
  * naming the safe fields (never spreading a row), so a repo path, PAT, local
  * CLI token, or credential hash can never ride along — the `Worker` read model
- * already omits the credential hash, and this layer never reaches for project
- * config, credentials, or worktree paths.
+ * already omits the credential hash, and this layer reaches for project config
+ * only to read a project's own `repo` slug (a non-secret `owner/repo`), never its
+ * credentials or worktree paths.
  *
  * **Busy/current-run is derived from run lifecycle, never client-supplied**:
  * `deriveWorkerRunState` reads the worker's *live* Phase-2 session
@@ -45,6 +57,7 @@ import {
 	getActiveWorkerClaims,
 	getWorkerDispatchClaimState,
 } from '../db/repositories/dispatchesRepository.js';
+import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import { getRunByIdFromDb } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
 import {
@@ -62,6 +75,8 @@ import {
 	listWorkersForOwner,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import { logger } from '../lib/logger.js';
+import { normalizeRepoSlug, repoSlugsMatch } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
 import type { WorkerAvailability } from './worker-eligibility.js';
@@ -72,6 +87,7 @@ import {
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	EnrollmentAllowedClisSchema,
 	EnrollmentAllowedPhasesSchema,
+	EnrollmentRepositoryMismatchError,
 	type EnrollmentStatus,
 	isRoutable,
 	type WorkerEnrollment,
@@ -86,6 +102,7 @@ export {
 	ENROLLMENT_STATUSES,
 	EnrollmentAllowedClisSchema,
 	EnrollmentAllowedPhasesSchema,
+	EnrollmentRepositoryMismatchError,
 	type EnrollmentStatus,
 	EnrollmentStatusSchema,
 	isRoutable,
@@ -398,6 +415,18 @@ export interface DashboardWorkerView {
 	 * an operator to infer it from work that never starts.
 	 */
 	supportedPhases: TriggerPhase[];
+	/**
+	 * Which repository the machine's one local checkout is (issue #687), in the
+	 * shared normalised `owner/repo` form, or `null` when it declared none. Read by
+	 * the Workers screen as one half of the reason a mismatched enrollment was
+	 * refused or suspended (issue #690) — the other half being each enrollment's own
+	 * `projectRepo` below.
+	 *
+	 * Non-secret and named explicitly, like every other field here: a repository slug
+	 * is not the machine's path (`SWARM_WORKER_REPO_ROOT` stays host-local and never
+	 * travels) and not a credential.
+	 */
+	repository: string | null;
 	connection: WorkerConnectionState;
 	/** When the worker was last heard from, or `null` if it never connected. */
 	lastSeenAt: Date | null;
@@ -431,6 +460,18 @@ export interface DashboardWorkerEnrollmentDetail {
 	concurrencyAllocation: number;
 	sharingConsent: boolean;
 	isRoutable: boolean;
+	/**
+	 * This enrollment's project repository (issue #690), in the **same normalised
+	 * form** as the surrounding view's `repository`, so comparing the two on the
+	 * screen is the same comparison the write path makes (`repoSlugsMatch`) — the
+	 * dashboard deliberately does not import `../scm/repo-slug.ts`, whose slug reader
+	 * spawns `git`. `null` only when the project no longer resolves.
+	 *
+	 * The reason for a mismatched enrollment is these two live facts rather than a
+	 * sentence stored when it was refused or suspended: repositories change, and a
+	 * stored sentence would go stale where the pair cannot.
+	 */
+	projectRepo: string | null;
 }
 
 /**
@@ -526,12 +567,19 @@ export async function getDashboardWorkerDetail(
 	return {
 		...row,
 		ownerUserId: worker.ownerUserId,
-		enrollments: visible.map(assembleEnrollmentDetail),
+		enrollments: await Promise.all(visible.map(assembleEnrollmentDetail)),
 	};
 }
 
-/** Assemble one detail-view enrollment by naming each safe field explicitly. */
-function assembleEnrollmentDetail(enrollment: WorkerEnrollment): DashboardWorkerEnrollmentDetail {
+/**
+ * Assemble one detail-view enrollment by naming each safe field explicitly. The
+ * project is read for its repository alone (issue #690) — the enrollment's own
+ * fields are never taken from it.
+ */
+async function assembleEnrollmentDetail(
+	enrollment: WorkerEnrollment,
+): Promise<DashboardWorkerEnrollmentDetail> {
+	const project = await findProjectByIdFromDb(enrollment.projectId);
 	return {
 		enrollmentId: enrollment.id,
 		projectId: enrollment.projectId,
@@ -541,6 +589,7 @@ function assembleEnrollmentDetail(enrollment: WorkerEnrollment): DashboardWorker
 		concurrencyAllocation: enrollment.concurrencyAllocation,
 		sharingConsent: enrollment.sharingConsent,
 		isRoutable: isRoutable(enrollment),
+		projectRepo: project ? normalizeRepoSlug(project.repo) : null,
 	};
 }
 
@@ -567,6 +616,7 @@ async function assembleDashboardWorker(
 			: null,
 		capabilities: worker.capabilities,
 		supportedPhases: worker.supportedPhases,
+		repository: worker.repository,
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
 		currentRun: await resolveVisibleRun(worker.id, liveSession?.currentRunId ?? null, accessible),
@@ -658,11 +708,13 @@ export interface EnrollWorkerInput {
  * de-duplicated) and enforces that it is a **subset of the worker's declared
  * capabilities** — throwing {@link AllowedClisNotCapableError} otherwise —
  * validates `allowedPhases` (non-empty, de-duplicated, defaulting to
- * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES}), then persists a `pending` enrollment
- * (unless a status is given) with sharing consent off by default and, unless the
- * caller names one, a concurrency allocation of
- * {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate `(worker, project)` surfaces
- * the repository's pg `23505` for the caller to translate.
+ * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES}), refuses a project whose repository
+ * is not the worker's declared one ({@link EnrollmentRepositoryMismatchError},
+ * issue #690), then persists a `pending` enrollment (unless a status is given)
+ * with sharing consent off by default and, unless the caller names one, a
+ * concurrency allocation of {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate
+ * `(worker, project)` surfaces the repository's pg `23505` for the caller to
+ * translate.
  */
 export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnrollment> {
 	const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
@@ -673,6 +725,7 @@ export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnro
 	const concurrencyAllocation = ConcurrencyAllocationSchema.parse(
 		input.concurrencyAllocation ?? DEFAULT_CONCURRENCY_ALLOCATION,
 	);
+	await assertProjectIsWorkersRepository(input.worker, input.projectId);
 	return createEnrollment({
 		workerId: input.worker.id,
 		projectId: input.projectId,
@@ -691,6 +744,104 @@ function assertClisWithinCapabilities(worker: Worker, allowedClis: AgentCli[]): 
 	if (offending.length > 0) {
 		throw new AllowedClisNotCapableError(worker.id, offending);
 	}
+}
+
+/**
+ * Throw {@link EnrollmentRepositoryMismatchError} unless the project is for the
+ * repository the worker's own checkout is (issue #690) — the first of the two
+ * moments the pairing becomes knowable, the other being a reconnecting daemon's
+ * declaration ({@link suspendEnrollmentsForMismatchedRepository}).
+ *
+ * Two cases are deliberately *not* refused:
+ *
+ * - a worker that declared **no** repository (`repository === null`): an
+ *   unidentifiable checkout — a machine that never connected, a daemon on a build
+ *   that predates the field, a clone with no readable `origin` — must not lock an
+ *   operator out of enrolling their machine at all;
+ * - a `projectId` that resolves to no project: this is not a second not-found
+ *   path, and inventing one here would answer "does this project exist?" ahead of
+ *   the caller's own authorization check. The existing FK on `createEnrollment`
+ *   remains what refuses it.
+ *
+ * The comparison runs through the shared `repoSlugsMatch` (`../scm/repo-slug.ts`),
+ * which normalises the *config* side too — a stored declaration is already
+ * normalised, a `ProjectConfig.repo` is whatever the operator wrote.
+ */
+async function assertProjectIsWorkersRepository(worker: Worker, projectId: string): Promise<void> {
+	const declared = worker.repository;
+	if (!declared) return;
+	const project = await findProjectByIdFromDb(projectId);
+	if (!project) return;
+	if (repoSlugsMatch(project.repo, declared)) return;
+	throw new EnrollmentRepositoryMismatchError(worker.id, declared, project.repo);
+}
+
+/** One enrollment {@link suspendEnrollmentsForMismatchedRepository} suspended. */
+export interface SuspendedMismatchedEnrollment {
+	enrollmentId: string;
+	projectId: string;
+	/** The project's repository, normalised — the half of the reason that is not the declaration. */
+	projectRepository: string;
+}
+
+/**
+ * Suspend every enrollment of `workerId` whose project is **not** for
+ * `declaredRepository` (issue #690) — the second moment the pairing becomes
+ * knowable, when a reconnecting daemon declares a repository that contradicts an
+ * enrollment written before it (or written while the machine declared nothing).
+ * Returns what it suspended, so a caller can report it; each suspension is also
+ * logged with both repositories, since the daemon's handshake has no operator
+ * watching it.
+ *
+ * It only ever **suspends**. Nothing here creates an enrollment, approves one, or
+ * reactivates one — a declaration is the machine's own statement, and enrollment
+ * remains the human decision ADR-001 makes it (a project administrator approves,
+ * the owner consents). That holds in both directions: an enrollment suspended
+ * here stays suspended when a later declaration matches again, because
+ * re-activation is the project administrator's act and a machine must not be able
+ * to restore its own routability by re-pointing a checkout.
+ *
+ * Suspension rather than deletion is equally deliberate: the enrollment keeps its
+ * constraints (allowed CLIs, allowed phases, allocation, consent) for the operator
+ * who fixes the pairing, and suspension blocks only *future* dispatch
+ * ({@link isRoutable}) — never a phase already running.
+ *
+ * An already-`suspended` enrollment is left alone (no redundant write), a project
+ * that no longer resolves is skipped rather than guessed at, and a blank
+ * declaration suspends nothing — defensive, because "matches nothing" would
+ * otherwise suspend every enrollment the worker has.
+ */
+export async function suspendEnrollmentsForMismatchedRepository(
+	workerId: string,
+	declaredRepository: string,
+): Promise<SuspendedMismatchedEnrollment[]> {
+	const declared = normalizeRepoSlug(declaredRepository);
+	if (declared === '') return [];
+	const suspended: SuspendedMismatchedEnrollment[] = [];
+	for (const enrollment of await listEnrollmentsForWorker(workerId)) {
+		if (enrollment.status === 'suspended') continue;
+		const project = await findProjectByIdFromDb(enrollment.projectId);
+		if (!project) continue;
+		if (repoSlugsMatch(project.repo, declared)) continue;
+		await setEnrollmentStatus(enrollment.id, 'suspended');
+		const projectRepository = normalizeRepoSlug(project.repo);
+		suspended.push({
+			enrollmentId: enrollment.id,
+			projectId: enrollment.projectId,
+			projectRepository,
+		});
+		logger.warn(
+			'suspended worker enrollment: the declared checkout is not this project’s repository',
+			{
+				workerId,
+				enrollmentId: enrollment.id,
+				projectId: enrollment.projectId,
+				declaredRepository: declared,
+				projectRepository,
+			},
+		);
+	}
+	return suspended;
 }
 
 /** Resolve an enrollment by id — the read the router uses before an ownership/authz check. */

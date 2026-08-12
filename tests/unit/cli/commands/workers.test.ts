@@ -38,6 +38,7 @@ const {
 	setSharingConsent,
 	updateEnrollmentConstraints,
 	AllowedClisNotCapableError,
+	EnrollmentRepositoryMismatchError,
 } = vi.hoisted(() => {
 	class AllowedClisNotCapableError extends Error {
 		constructor(
@@ -48,12 +49,23 @@ const {
 			this.name = 'AllowedClisNotCapableError';
 		}
 	}
+	class EnrollmentRepositoryMismatchError extends Error {
+		constructor(
+			public workerId: string,
+			public declaredRepository: string,
+			public projectRepository: string,
+		) {
+			super(`checkout is ${declaredRepository}, project is ${projectRepository}`);
+			this.name = 'EnrollmentRepositoryMismatchError';
+		}
+	}
 	return {
 		enrollWorker: vi.fn(),
 		approveEnrollment: vi.fn(),
 		setSharingConsent: vi.fn(),
 		updateEnrollmentConstraints: vi.fn(),
 		AllowedClisNotCapableError,
+		EnrollmentRepositoryMismatchError,
 	};
 });
 
@@ -70,6 +82,7 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	setSharingConsent,
 	updateEnrollmentConstraints,
 	AllowedClisNotCapableError,
+	EnrollmentRepositoryMismatchError,
 }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier, listUsers }));
@@ -332,6 +345,18 @@ describe('swarm workers', () => {
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'antigravity'])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('not capable'));
+		});
+
+		// Issue #690 — the machine's checkout is not this project's repository. One
+		// actionable line, the typed error's own message, and exit 1.
+		it('translates a repository mismatch to a single actionable line', async () => {
+			enrollWorker.mockRejectedValue(
+				new EnrollmentRepositoryMismatchError(WORKER_ID, 'acme/frontend', 'acme/backend'),
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('acme/frontend'));
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('acme/backend'));
 		});
 
 		it('translates a duplicate enrollment (23505) to a friendly error', async () => {

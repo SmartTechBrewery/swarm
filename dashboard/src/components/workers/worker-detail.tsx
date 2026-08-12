@@ -13,14 +13,17 @@ import type { WorkerDetail } from '@/types/workers.js';
  * One machine in full (issue #477) — where the Workers table is the scannable
  * index, this is where an operator understands and administers a single worker.
  * It is grouped into sections rather than a field dump: identity and owner,
- * connectivity, the two declared-capability axes, the active job, and one block
- * per project the machine is enrolled in ({@link WorkerEnrollmentCard}, which owns
- * the editable values and their authorization).
+ * connectivity, what the daemon declares, the active job, and one block per
+ * project the machine is enrolled in ({@link WorkerEnrollmentCard}, which owns the
+ * editable values and their authorization).
  *
- * **Self-declared facts are read-only.** A daemon declares its `capabilities` and
- * `supportedPhases` at handshake and re-declares them on every reconnect, so the
- * view reports them and never offers to edit them — an edit here would only make
- * the dashboard disagree with the machine until its next heartbeat.
+ * **Self-declared facts are read-only.** A daemon declares its `capabilities`,
+ * `supportedPhases` and its checkout's `repository` (issue #687) at handshake and
+ * re-declares them on every reconnect, so the view reports them and never offers to
+ * edit them — an edit here would only make the dashboard disagree with the machine
+ * until its next heartbeat. The checkout repository is here because it is the fact
+ * an enrollment for a *different* repository is refused or suspended against (issue
+ * #690), which the enrollment blocks below then name in full.
  *
  * **The machine's own name is the one Identity-card fact that *is* editable** —
  * unlike the self-declared facts above, `displayName` is the owner's own label,
@@ -240,7 +243,7 @@ export function WorkerDetailView({
 			</div>
 
 			<div className={CARD_CLASS}>
-				<h2 className={SECTION_HEADING_CLASS}>Declared capabilities</h2>
+				<h2 className={SECTION_HEADING_CLASS}>Declared by the daemon</h2>
 				<div className="grid gap-4 grid-cols-1 md:grid-cols-2">
 					<Field label="Agent CLIs">
 						{worker.capabilities.length === 0 ? (
@@ -256,12 +259,17 @@ export function WorkerDetailView({
 					<Field label="Pipeline phases">
 						<SupportedPhases phases={worker.supportedPhases} />
 					</Field>
+					<Field label="Checkout repository" mono>
+						{worker.repository ?? EM_DASH}
+					</Field>
 				</div>
 				<p className="text-xs text-zinc-500 mt-4">
-					Declared by the machine's own daemon at handshake, on two independent axes. Reported here,
-					never editable — editing them would make this screen disagree with the machine. A daemon
-					on an older build can declare fewer phases than this one runs; which of them a project may
-					actually give this machine is the enrollment's Allowed pipeline phases, below.
+					Declared by the machine's own daemon at handshake. Reported here, never editable — editing
+					any of it would make this screen disagree with the machine. A daemon on an older build can
+					declare fewer phases than this one runs; which of them a project may actually give this
+					machine is the enrollment's Allowed pipeline phases, below. The checkout repository is the
+					single repository this machine works in: a project for any other one cannot run here, and
+					an unidentifiable checkout declares nothing.
 				</p>
 			</div>
 
@@ -301,6 +309,7 @@ export function WorkerDetailView({
 								workerName={worker.displayName}
 								capabilities={worker.capabilities}
 								supportedPhases={worker.supportedPhases}
+								declaredRepository={worker.repository}
 								projectDisabledPhases={projectDisabledPhases.get(enrollment.projectId) ?? []}
 								projectName={projectNames.get(enrollment.projectId) ?? enrollment.projectId}
 								viewerIsOwner={worker.viewerIsOwner}

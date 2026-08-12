@@ -62,6 +62,16 @@ Notes:
   connected** (`isWorkerConnected`) — an enrolled-but-disconnected worker just
   can't be picked, so there's no window where work gets routed to a machine
   that isn't there yet.
+- **Enroll the machine in a project for the repository its checkout actually is.**
+  Step 4 is refused (naming both repositories) when the worker has already declared
+  a checkout of a different one — a worker holds a single checkout, so work for any
+  other repository would only be refused when it got there (issue #690). A worker
+  that has not connected yet has declared nothing and is enrolled as before; if its
+  first handshake then contradicts this enrollment, the control plane **suspends**
+  it, and `/workers/<id>` says which two repositories disagree. Fixing the pairing
+  is an operator action — point the machine at the right checkout, or enroll it in
+  the right project — and re-activating a suspended enrollment stays the project
+  administrator's call (`swarm workers approve`).
 - Skip `swarm identities link` unless you already know which GitHub account
   should be the *assignee* that routes work to this specific machine — without
   it the worker still receives review / respond-to-review / respond-to-ci /
@@ -133,7 +143,11 @@ worker transport session established workerId=... sessionId=... heartbeatTtlMs=6
 remote and declared at handshake (issue #687) — the control plane learns which
 repository the machine holds no other way, since `repoRoot` is host-local. It prints
 `null` when the checkout has no identifiable `origin` (a local-only clone); that is
-not an error, the daemon simply declares nothing.
+not an error, the daemon simply declares nothing. Once it *is* declared, the
+handshake also **suspends any enrollment of this worker in a project for another
+repository** (issue #690) — the pairing was impossible, and the Workers screen now
+says so instead of leaving it to be inferred from refused assignments. A daemon that
+declares nothing suspends nothing.
 
 **One worker per checkout** (issue #689). Before it handshakes, the daemon takes a
 lock on the checkout it was pointed at, recorded under
@@ -174,5 +188,7 @@ to expire after `heartbeatTtlMs`.
 | `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
 | `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the three variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, step 4), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
+| An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a different repository than the project's, so the control plane suspended the pairing (issue #690). `/workers/<id>` names both repositories on that enrollment block. Point `SWARM_WORKER_REPO_ROOT` at a checkout of the project's repository (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
+| `swarm workers enroll` exits 1 saying the worker's checkout is a different repository | Same mismatch, caught on the write path instead (issue #690) — the message names the machine's checkout and the project's repository. Enroll a worker whose checkout is that repository, or re-point this one. |
 | `refusing to start — another worker already holds this checkout` | Another daemon on this machine is already running against the same `SWARM_WORKER_REPO_ROOT` (issue #689) — the line names its worker id, or its pid when it has not handshaked yet. Stop that process, or give this worker its own checkout and point `SWARM_WORKER_REPO_ROOT` at it. A lock left by a crashed daemon is reclaimed automatically, so this message always means a live holder — unless its `owner.json` is unreadable, which resolves itself once the lock ages out (15 minutes). |
 | Handshake repeatedly logs `worker session already held` | Another daemon really is connected as this worker — two machines were given the same `SWARM_WORKER_CREDENTIAL`, or a stale process is still running on this one. A daemon *reconnecting* after a control-plane restart takes its own lease straight back (it presents the session it holds, and logs `reclaimed=true` on the next `worker transport session established`), so a repeating refusal means a second holder rather than a slow expiry. |

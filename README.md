@@ -208,7 +208,12 @@ defaulting to the launch directory) — an assignment for a repository this chec
 is *not* is refused up front, naming both, rather than run (issue #688), and the
 daemon **locks** that checkout for its whole life, so a second worker pointed at the
 same path refuses to start instead of driving git in the same repository (issue
-#689; give a second worker on the machine its own checkout) —
+#689; give a second worker on the machine its own checkout). The control plane
+polices the same pairing (issue #690): enrolling a worker in a project for another
+repository is **refused** naming both, and an existing enrollment a reconnecting
+daemon's declaration contradicts is **suspended**, with both repositories shown on
+the Workers screen — approval and sharing consent stay human decisions, so nothing
+is ever enrolled or re-activated from a declaration —
 source-carrying delivery (commit / push /
 create-PR) runs under the operator token, and everything needing something this
 worker must not hold goes up to the control plane's delivery API — Implementation's board moves/comments and
