@@ -222,6 +222,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const session = await acquireLease(workerA, TTL);
 				const runId = await createRun({
 					projectId: PROJECT_A,
+					repository: 'jkwiecien/enroll-a',
 					taskId: 't-busy',
 					phase: 'implementation',
 				});

@@ -1969,6 +1969,11 @@ async function tryCreateRun(
 		);
 		const runId = await createRun({
 			projectId: project.id,
+			// The one place the repository a run acts on is resolved today: a project
+			// holds exactly one, so this is that repository (issue #683). When a project
+			// can hold several, this is where the event's own repository is resolved
+			// instead — the row then keeps being the record of what the run ran against.
+			repository: project.repo,
 			taskId: trigger.taskId,
 			phase: trigger.phase,
 			workerId: resolution.selection?.workerId,

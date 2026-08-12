@@ -51,6 +51,7 @@ import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
 const PROJECT_ID = 'proj-dispatches';
+const REPO = 'jkwiecien/dispatch-repo';
 const OWNER = 'test-worker:1';
 
 function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
@@ -89,7 +90,7 @@ async function seedDispatchInState(
 describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (integration)', () => {
 	beforeEach(async () => {
 		await truncateAll();
-		await seedProject({ id: PROJECT_ID, repo: 'jkwiecien/dispatch-repo' });
+		await seedProject({ id: PROJECT_ID, repo: REPO });
 	});
 
 	describe('create + dedup identity', () => {
@@ -113,7 +114,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		});
 
 		it('enforces at most one active dispatch per run row (the duplicate-retry guard)', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: '17', phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '17',
+				phase: 'review',
+			});
 			await completeRun(runId, { status: 'failed', error: 'boom' });
 
 			await createDispatch({
@@ -138,7 +144,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		});
 
 		it('allows a new active dispatch for a run whose prior dispatch is terminal', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: '17', phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '17',
+				phase: 'review',
+			});
 			const { dispatch } = await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: job({ runId }),
@@ -162,7 +173,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		const TASK = '77';
 
 		it.each(['leased', 'running'] as const)('is true for a %s dispatch', async (state) => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK,
+				phase: 'review',
+			});
 			await seedDispatchInState(TASK, state, runId);
 			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK)).toBe(true);
 		});
@@ -174,13 +190,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			'failed',
 			'cancelled',
 		] as const)('is false for a %s dispatch — it owns no checkout', async (state) => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK,
+				phase: 'review',
+			});
 			await seedDispatchInState(TASK, state, runId);
 			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK)).toBe(false);
 		});
 
 		it('is false when the only executing dispatch belongs to the excluded run', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK,
+				phase: 'review',
+			});
 			await seedDispatchInState(TASK, 'running', runId);
 			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK, runId)).toBe(false);
 		});
@@ -188,12 +214,22 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		it('is true for a run-row-less executing dispatch even when a run is excluded', async () => {
 			await seedDispatchInState(TASK, 'running', undefined);
 			// SQL `NULL <> $1` is unknown, so only the explicit isNull leg keeps this true.
-			const otherRunId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			const otherRunId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK,
+				phase: 'review',
+			});
 			expect(await hasExecutingDispatchForTask(PROJECT_ID, TASK, otherRunId)).toBe(true);
 		});
 
 		it('scopes to the given project and task', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: TASK, phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK,
+				phase: 'review',
+			});
 			await seedDispatchInState(TASK, 'running', runId);
 			expect(await hasExecutingDispatchForTask(PROJECT_ID, '78')).toBe(false);
 			expect(await hasExecutingDispatchForTask('proj-other', TASK)).toBe(false);
@@ -693,7 +729,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		});
 
 		it('covers running dispatches too — a dead run row cannot hide behind `running`', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: '17', phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '17',
+				phase: 'review',
+			});
 			const { dispatch } = await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: job({ runId }),
@@ -729,6 +770,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		it('reopens a concurrently visible deferred run with overrides without duplicating its dispatch', async () => {
 			const runId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: 'manual-retry',
 				phase: 'resolve-conflicts',
 			});
@@ -907,6 +949,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		it('finds deferred runs with no active dispatch and ignores covered ones', async () => {
 			const orphanId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: 'orphan',
 				phase: 'review',
 			});
@@ -914,6 +957,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const coveredId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: 'covered',
 				phase: 'review',
 			});
@@ -1025,6 +1069,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const runId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: '549',
 				phase: 'implementation',
 				workerId: pinned.id,

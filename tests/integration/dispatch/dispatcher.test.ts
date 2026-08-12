@@ -137,7 +137,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		});
 
 		it('adopts a legacy runId-carrying job by claiming the run’s backfilled dispatch', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: '17', phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: 'jkwiecien/dispatcher-repo',
+				taskId: '17',
+				phase: 'review',
+			});
 			await completeRun(runId, { status: 'deferred', error: 'rate limited' });
 			const { dispatch } = await createDispatch({
 				projectId: PROJECT_ID,
