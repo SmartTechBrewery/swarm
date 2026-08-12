@@ -193,6 +193,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		repository: 'SmartTechBrewery/swarm',
 		taskId: '103',
 		workItemId: null,
 		workItemTitle: null,
