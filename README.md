@@ -335,6 +335,10 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`docs/github-projects-v2-api.md`](./docs/github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./docs/decisions/) — architecture decision records
+- [`docs/public-hosting-exploration.md`](./docs/public-hosting-exploration.md) —
+  what a public, multi-tenant deployment would take (hosting, missing pieces,
+  credential model, OAuth across the three SCM providers). **Deferred** — SWARM
+  stays on privately hosted instances; kept so the analysis is not re-derived
 - [`PROJECT.md`](./PROJECT.md) — the original design document, **frozen as a historical baseline**; read it for original intent, not current behavior
 
 The live task backlog is the [SWARM GitHub Projects board](https://github.com/orgs/SmartTechBrewery/projects/6/views/1).
