@@ -594,6 +594,16 @@ export interface WorkerTransportOptions {
 	 * how a daemon predating the frame behaves.
 	 */
 	onCancel?: (cancel: TaskCancel) => void;
+	/**
+	 * Called with each established session, before the stream opens — the only place
+	 * a daemon learns the `workerId` it authenticates as, since the credential does
+	 * not carry it (issue #689: the checkout lock records it so a second daemon's
+	 * refusal can *name* the holder). Worker-side bookkeeping only, so it changes no
+	 * wire shape; it fires again on every reconnect, and a handler must therefore be
+	 * idempotent. A throwing handler is logged and swallowed rather than killing the
+	 * transport — this is not the connection.
+	 */
+	onSession?: (session: HandshakeResponse) => void;
 }
 
 /** How a live session ended, deciding whether the loop reconnects or fails. */
@@ -834,6 +844,7 @@ export function connectWorkerTransport(
 				reclaimed: heldSession !== undefined,
 			});
 			heldSession = { sessionId: session.sessionId, fencingToken: session.fencingToken };
+			notifySession(session, options, deps.logger);
 
 			const end = await runSession(session);
 			if (stopped) break;
@@ -892,6 +903,27 @@ function isFatalHandshakeError(err: unknown, everConnected: boolean): boolean {
 	if (err instanceof WorkerCapabilityConflictError) return true;
 	if (err instanceof WorkerSessionConflictError) return !everConnected;
 	return false;
+}
+
+/**
+ * Hand the established session to the daemon's own bookkeeping
+ * ({@link WorkerTransportOptions.onSession}). Guarded, because that handler is not
+ * part of the connection: a throw here would otherwise reject the connect loop and
+ * take a healthy session down with it.
+ */
+function notifySession(
+	session: HandshakeResponse,
+	options: WorkerTransportOptions,
+	logger: TransportLogger,
+): void {
+	if (!options.onSession) return;
+	try {
+		options.onSession(session);
+	} catch (err) {
+		logger.warn('worker session handler failed', {
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
 }
 
 /**

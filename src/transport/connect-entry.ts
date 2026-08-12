@@ -31,8 +31,11 @@
  * routes. The supported-phase gate in `runAssignmentDbFree` stays as the backstop
  * even though it now excludes nothing, and the repository this daemon declares at
  * handshake is handed to the same executor so an assignment for a *different*
- * repository is refused before the checkout is touched (issue #688). It never
- * opens a database or queue connection.
+ * repository is refused before the checkout is touched (issue #688). Before any of
+ * that it takes a host-local lock on that checkout (`../worktree/checkout-lock.ts`,
+ * issue #689), so a second daemon pointed at the same `SWARM_WORKER_REPO_ROOT`
+ * refuses to start rather than driving git in the same repository as this one. It
+ * never opens a database or queue connection.
  */
 
 import { readFileSync } from 'node:fs';
@@ -57,6 +60,12 @@ import { describeError } from '../lib/errors.js';
 import { addFileSink, configureLogger, logger } from '../lib/logger.js';
 import { resolveDeclarableOriginRepoSlug } from '../scm/repo-slug.js';
 import {
+	acquireCheckoutLock,
+	CHECKOUT_LOCK_REFRESH_MS,
+	CheckoutHeldError,
+	type CheckoutLock,
+} from '../worktree/checkout-lock.js';
+import {
 	handleTaskCancel,
 	runAssignmentDbFree,
 	SUPPORTED_DB_FREE_PHASES,
@@ -76,6 +85,56 @@ configureLogger({ component: 'worker-transport' });
 // point (issue #553): the file sink belongs to whichever process actually runs
 // the agents, which is now only this one.
 addFileSink(optionalEnv('SWARM_LOG_FILE', 'logs/worker.log'));
+
+/**
+ * The checkout lock this process holds (issue #689), with the timer that keeps it
+ * fresh. Module-scoped so every exit path can drop it — a released lock is
+ * immediately re-acquirable, where a lock left behind waits for the next daemon to
+ * find its pid dead.
+ */
+let heldCheckoutLock: CheckoutLock | undefined;
+let checkoutRefreshTimer: ReturnType<typeof setInterval> | undefined;
+
+function releaseCheckoutLock(): void {
+	if (checkoutRefreshTimer) clearInterval(checkoutRefreshTimer);
+	checkoutRefreshTimer = undefined;
+	try {
+		heldCheckoutLock?.release();
+	} catch (err) {
+		// Never let a filesystem hiccup turn a graceful shutdown into a crash: the lock
+		// is reclaimable on liveness grounds once this process is gone.
+		logger.warn('releasing the checkout lock failed', { error: describeError(err) });
+	}
+	heldCheckoutLock = undefined;
+}
+
+/**
+ * Take the host-local lock on this checkout, or refuse to start (issue #689).
+ *
+ * Two daemons holding two *different* credentials can still be pointed at one
+ * `SWARM_WORKER_REPO_ROOT`, and both would then run `git worktree add` against the
+ * same main repository and contend on its `index.lock`. The control plane cannot
+ * see that — `repoRoot` is host-local and never travels, and two checkouts of one
+ * repository are legitimate capacity — so the guard is a filesystem lock and the
+ * refusal happens here, before the handshake.
+ */
+function acquireCheckoutLockOrExit(repoRoot: string): CheckoutLock {
+	try {
+		return acquireCheckoutLock({ repoRoot });
+	} catch (err) {
+		if (!(err instanceof CheckoutHeldError)) throw err;
+		// Names the holding worker (a pid, until that daemon's own handshake told it
+		// which worker it is) so an operator knows which process to stop.
+		logger.error('refusing to start — another worker already holds this checkout', {
+			repoRoot,
+			lockDir: err.lockDir,
+			holderWorkerId: err.holder?.workerId ?? null,
+			holderPid: err.holder?.pid ?? null,
+			reason: err.message,
+		});
+		process.exit(1);
+	}
+}
 
 /** The daemon version reported at handshake — diagnostic only. */
 function resolveDaemonVersion(): string {
@@ -97,6 +156,22 @@ async function main(): Promise<void> {
 	// a missing token fails startup rather than mid-assignment.
 	const operatorToken = resolveOperatorGitHubToken();
 	const repoRoot = resolveWorkerRepoRoot();
+	// Claimed before anything else this daemon does with the checkout, so a second
+	// worker on it exits without ever handshaking. Refreshed below, and released on
+	// every exit path.
+	const checkoutLock = acquireCheckoutLockOrExit(repoRoot);
+	heldCheckoutLock = checkoutLock;
+	// An unref'd interval: it keeps the lock alive but must never be the reason this
+	// process stays alive. The cadence is what lets the TTL stay short — a lapsed
+	// `refreshedAt` then means a departed daemon rather than a long-running one.
+	checkoutRefreshTimer = setInterval(() => {
+		if (checkoutLock.refresh()) return;
+		logger.warn('this checkout lock is no longer held by this process', {
+			repoRoot,
+			lockDir: checkoutLock.lockDir,
+		});
+	}, CHECKOUT_LOCK_REFRESH_MS);
+	checkoutRefreshTimer.unref();
 	// Which repository that one checkout actually is, read from its `origin` remote
 	// (issue #687) — the fact the control plane cannot otherwise learn, since
 	// `repoRoot` is host-local and never travels. Resolved once, because the process
@@ -167,6 +242,12 @@ async function main(): Promise<void> {
 		// holds no `REDIS_URL`, so it cannot read the durable cancellation marker the
 		// dashboard writes — the control plane pushes the frame instead.
 		onCancel: (cancel) => handleTaskCancel(cancel, logger),
+		// The handshake is the only place this daemon learns which worker it
+		// authenticates as, so it is where the checkout lock stops naming a bare pid:
+		// a second daemon's refusal can then name the *worker* holding it (issue #689).
+		onSession: (session) => {
+			checkoutLock.annotate(session.workerId);
+		},
 	});
 
 	logger.info('worker transport client starting', {
@@ -184,7 +265,7 @@ async function main(): Promise<void> {
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session
 	// via a normal WS close so the control plane frees the lease promptly instead
-	// of waiting out the TTL, then exit.
+	// of waiting out the TTL, then drop the checkout lock and exit.
 	let shuttingDown = false;
 	for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 		process.on(signal, () => {
@@ -192,22 +273,34 @@ async function main(): Promise<void> {
 			shuttingDown = true;
 			logger.info(`received ${signal} — releasing worker session and exiting`);
 			shutdownSignal.abort();
-			void client.stop().then(
-				() => process.exit(0),
-				(err) => {
-					logger.error('worker transport shutdown failed', { error: describeError(err) });
-					process.exit(1);
-				},
-			);
+			void client
+				.stop()
+				.then(
+					() => 0,
+					(err) => {
+						logger.error('worker transport shutdown failed', { error: describeError(err) });
+						return 1;
+					},
+				)
+				.then((code) => {
+					// The checkout goes last: a departing daemon must not hand it to another
+					// worker while its own aborted agent may still be writing there. Releasing
+					// it at all is what lets an operator restart immediately rather than wait
+					// for the next daemon's liveness check.
+					releaseCheckoutLock();
+					process.exit(code);
+				});
 		});
 	}
 
 	// Resolves on a graceful stop; rejects on a fatal, non-recoverable error.
 	await client.done;
+	releaseCheckoutLock();
 	logger.info('worker transport client stopped');
 }
 
 main().catch((err) => {
+	releaseCheckoutLock();
 	logger.error('worker transport client exited with a fatal error', { error: describeError(err) });
 	process.exit(1);
 });
