@@ -108,6 +108,7 @@ export interface WorkerTransportDeps {
 		id: string,
 		capabilities: AgentCli[],
 		supportedPhases: TriggerPhase[],
+		repository: string | null,
 	) => Promise<Worker | undefined>;
 	resolveHeartbeatTtlMs: () => number;
 	validateFencingToken: (workerId: string, token: number, ttlMs?: number) => Promise<boolean>;
@@ -251,11 +252,20 @@ export async function handleHandshake(
 	// recorded as supporting every phase — the dispatcher's behaviour before phases
 	// were declarable. Normalizing here, at the boundary, is what keeps the
 	// eligibility gate free of a "declaration unknown" case.
+	//
+	// `repository` (issue #687) is normalized at the same boundary but in the opposite
+	// direction: an omitted field records NULL, which *clears* whatever an earlier
+	// daemon declared. The row states the checkout of the program currently operating
+	// it, so a daemon re-pointed at a checkout it cannot identify — or an older build
+	// that cannot state one — must not leave the previous statement standing for the
+	// later guards to act on. For a row that never carried one that write is a no-op
+	// NULL, i.e. exactly today's behaviour.
 	try {
 		await deps.refreshWorkerCapabilities(
 			worker.id,
 			request.capabilities,
 			request.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
+			request.repository ?? null,
 		);
 	} catch (err) {
 		if (err instanceof WorkerCapabilityReductionError) {

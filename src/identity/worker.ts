@@ -29,6 +29,7 @@
 
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../harness/agent-cli.js';
+import { RepoSlugSchema } from '../scm/repo-slug.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase, TriggerPhaseSchema } from '../triggers/types.js';
 
 /**
@@ -86,6 +87,17 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * so a narrower set today means an older build. `id` is generated (`uuid`), not
  * externally supplied.
  *
+ * `repository` is the third self-declared fact (issue #687), and the one that is
+ * not a *capability*: it states which repository the machine's single local
+ * checkout is (`SWARM_WORKER_REPO_ROOT`), resolved from that checkout's `origin`
+ * remote and re-declared on every reconnect, in the shared normalised
+ * `owner/repo` form (`RepoSlugSchema`, `../scm/repo-slug.ts`) — so comparing it
+ * against a `ProjectConfig.repo` must normalise that side too. `null` means no
+ * declaration: a worker registered but never connected, a daemon too old to send
+ * the field, or a checkout with no identifiable `origin`. Trusted exactly as the
+ * two capability axes are — it guards against operator error (a daemon launched in
+ * the wrong directory), not against an attacker.
+ *
  * The worker credential hash is intentionally **not** a field here — it is a
  * secret that never leaves the DB layer (`rowToWorker` drops it), the same
  * treatment `users.password_hash` gets in `SwarmUser`.
@@ -96,6 +108,7 @@ export const WorkerSchema = z.object({
 	displayName: WorkerDisplayNameSchema,
 	capabilities: z.array(AgentCliSchema),
 	supportedPhases: z.array(TriggerPhaseSchema),
+	repository: RepoSlugSchema.nullable(),
 	createdAt: z.date(),
 	updatedAt: z.date(),
 });

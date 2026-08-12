@@ -53,6 +53,7 @@ import {
 } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { addFileSink, configureLogger, logger } from '../lib/logger.js';
+import { resolveDeclarableOriginRepoSlug } from '../scm/repo-slug.js';
 import {
 	handleTaskCancel,
 	runAssignmentDbFree,
@@ -94,6 +95,13 @@ async function main(): Promise<void> {
 	// a missing token fails startup rather than mid-assignment.
 	const operatorToken = resolveOperatorGitHubToken();
 	const repoRoot = resolveWorkerRepoRoot();
+	// Which repository that one checkout actually is, read from its `origin` remote
+	// (issue #687) — the fact the control plane cannot otherwise learn, since
+	// `repoRoot` is host-local and never travels. Resolved once, because the process
+	// holds exactly one checkout for its whole life and re-reading per assignment
+	// would only invite the two answers to differ. A checkout with no identifiable
+	// `origin` resolves to `undefined` and declares nothing rather than failing startup.
+	const repository = await resolveDeclarableOriginRepoSlug(repoRoot);
 	// Same reason: a typo in SWARM_AGENT_CONTAINMENT should fail this daemon at
 	// startup, not once per dispatched phase (issue #614). The resolved value is
 	// not held — `runAgentCli` reads it per run — this is validation only, and
@@ -132,6 +140,7 @@ async function main(): Promise<void> {
 		// it (issue #559); an explicit override is the operator's own declaration.
 		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
 		supportedPhases,
+		repository,
 		hostname: host,
 		daemonVersion: resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {
@@ -159,6 +168,11 @@ async function main(): Promise<void> {
 		capabilities,
 		supportedPhases,
 		repoRoot,
+		// Printed beside `repoRoot` so an operator can see what this daemon declared its
+		// checkout to be. Explicitly `null` rather than left undefined when there is no
+		// declaration, since the logger drops an undefined field and "nothing declared" is
+		// precisely what an operator debugging a later phase's refusal needs to see.
+		repository: repository ?? null,
 	});
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session

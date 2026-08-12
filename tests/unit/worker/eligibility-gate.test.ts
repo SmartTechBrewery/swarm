@@ -65,6 +65,7 @@ function makeCandidate(
 			displayName: `worker-${id}`,
 			capabilities: overrides.capabilities ?? ['claude'],
 			supportedPhases: overrides.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
+			repository: null,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
 		},

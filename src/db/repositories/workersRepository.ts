@@ -50,6 +50,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		displayName: row.displayName,
 		capabilities: row.capabilities as AgentCli[],
 		supportedPhases: row.supportedPhases as TriggerPhase[],
+		repository: row.repository ?? null,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -74,6 +75,10 @@ export async function createWorker(input: CreateWorkerInput): Promise<Worker> {
 			// machines that can run it. The runtime constant is the authority for new
 			// rows; the SQL default remains only as the backfill for rows predating it.
 			supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+			// `repository` is deliberately left to the column's NULL (issue #687):
+			// registering a worker is not declaring a checkout. An operator registers a
+			// machine from wherever they happen to be, and only the daemon that connects
+			// can state which repository the machine actually holds.
 			credentialHash: input.credentialHash,
 		})
 		.returning();
@@ -151,6 +156,16 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * stored phases untouched — the CLI-only path (`swarm workers set-cli`) knows
  * nothing about phases and must not silently reset them.
  *
+ * `repository` (issue #687) is the daemon's declaration of which repository its one
+ * local checkout is, written in that same transaction for the same reason. It is
+ * **three-valued** on purpose: `undefined` leaves the stored value alone (the
+ * `swarm workers set-cli` path knows nothing about checkouts and must not clear a
+ * declaration it cannot make), `null` records that the connecting daemon declared
+ * none, and a slug records it. `null` therefore *clears* an earlier daemon's
+ * statement rather than leaving it standing — the row describes the program
+ * currently operating it, and a stale-but-wrong checkout is worse than an absent
+ * one.
+ *
  * Note the asymmetry with the CLI check above: phases are deliberately *not*
  * validated against enrollments, even though an enrollment does now constrain them
  * (`allowedPhases`, issue #509). The two constraints are maintained differently on
@@ -187,6 +202,7 @@ export async function updateWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
 	supportedPhases?: TriggerPhase[],
+	repository?: string | null,
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -208,9 +224,15 @@ export async function updateWorkerCapabilities(
 			throw new WorkerCapabilityReductionError(id, offending);
 		}
 
+		// Assembled rather than nested ternaries, so each declaration states its own
+		// "omitted means leave it alone" rule once and a fourth axis costs one line.
+		const declaration: Partial<typeof workers.$inferInsert> = { capabilities };
+		if (supportedPhases) declaration.supportedPhases = supportedPhases;
+		if (repository !== undefined) declaration.repository = repository;
+
 		const [updatedRow] = await tx
 			.update(workers)
-			.set(supportedPhases ? { capabilities, supportedPhases } : { capabilities })
+			.set(declaration)
 			.where(eq(workers.id, id))
 			.returning();
 

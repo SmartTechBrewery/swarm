@@ -91,6 +91,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		repository: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,

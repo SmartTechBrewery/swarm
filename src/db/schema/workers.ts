@@ -53,6 +53,20 @@ export const workers = pgTable(
 			.$type<TriggerPhase[]>()
 			.notNull()
 			.default(ALL_TRIGGER_PHASES as TriggerPhase[]),
+		/**
+		 * The `owner/repo` the daemon **currently operating this row** declared its one
+		 * local checkout to be (issue #687), resolved from that checkout's `origin`
+		 * remote at handshake. The control plane learns it no other way:
+		 * `SWARM_WORKER_REPO_ROOT` is host-local and never travels.
+		 *
+		 * Nullable with no default, and that is the point: NULL means "no repository
+		 * declared", which is what every row written before this column existed says and
+		 * what a daemon too old to send the field keeps saying — nothing to backfill, and
+		 * no default that would be honest. The stored form is the normalised, host-less,
+		 * `.git`-less one (`RepoSlugSchema`, `src/scm/repo-slug.ts`), so a comparison
+		 * against `projects.repo` must normalise that side too.
+		 */
+		repository: text('repository'),
 		/** SHA-256 of the worker credential — never the raw token; dropped by `rowToWorker`. */
 		credentialHash: text('credential_hash').notNull().unique(),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

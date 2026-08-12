@@ -125,9 +125,15 @@ npm run dev:worker
 A successful connection logs two lines:
 
 ```
-worker transport client starting controlPlaneUrl=... hostname=... capabilities=[...] supportedPhases=[...] repoRoot=...
+worker transport client starting controlPlaneUrl=... hostname=... capabilities=[...] supportedPhases=[...] repoRoot=... repository=...
 worker transport session established workerId=... sessionId=... heartbeatTtlMs=60000
 ```
+
+`repository` is the `owner/repo` this daemon read from its checkout's `origin`
+remote and declared at handshake (issue #687) — the control plane learns which
+repository the machine holds no other way, since `repoRoot` is host-local. It prints
+`null` when the checkout has no identifiable `origin` (a local-only clone); that is
+not an error, the daemon simply declares nothing.
 
 Leave it running in its own foreground terminal — same as the host worker, this
 process is meant to be watched, not daemonized. `Ctrl-C` sends a graceful

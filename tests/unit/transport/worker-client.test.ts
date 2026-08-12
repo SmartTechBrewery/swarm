@@ -122,6 +122,33 @@ describe('buildHandshakeRequest', () => {
 		).toThrow();
 	});
 
+	// Issue #687 — the checkout this daemon holds. Carried when known, and the key is
+	// left off the body entirely when not, so a daemon whose checkout has no
+	// identifiable `origin` sends exactly the request a daemon predating the field does.
+	it('carries the declared repository, normalised', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			repository: 'SmartTechBrewery/Swarm.git',
+		});
+		expect(request.repository).toBe('smarttechbrewery/swarm');
+	});
+
+	it('omits the repository key entirely when the checkout could not be identified', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			repository: undefined,
+		});
+		expect(request).not.toHaveProperty('repository');
+	});
+
 	it('rejects an empty capability set (the protocol requires at least one CLI)', () => {
 		expect(() =>
 			buildHandshakeRequest({
@@ -743,7 +770,12 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 			.fn<() => Promise<AgentCli[]>>()
 			.mockResolvedValue(['claude', 'codex']);
 		const client = connectWorkerTransport(
-			{ ...options, capabilities: ['claude'], refreshCapabilities },
+			{
+				...options,
+				capabilities: ['claude'],
+				repository: 'smarttechbrewery/swarm',
+				refreshCapabilities,
+			},
 			overrides(),
 		);
 		await flush();
@@ -751,10 +783,11 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 
 		await vi.advanceTimersByTimeAsync(500);
 		expect(fetch).toHaveBeenCalledTimes(2);
-		expect(JSON.parse(String(fetch.mock.calls[1][1].body)).capabilities).toEqual([
-			'claude',
-			'codex',
-		]);
+		const rebuilt = JSON.parse(String(fetch.mock.calls[1][1].body));
+		expect(rebuilt.capabilities).toEqual(['claude', 'codex']);
+		// The re-probe rebuilds the request from `options`, so the checkout declaration
+		// survives it rather than being dropped on the reconnect (issue #687).
+		expect(rebuilt.repository).toBe('smarttechbrewery/swarm');
 		expect(sockets).toHaveLength(1);
 
 		await client.stop();

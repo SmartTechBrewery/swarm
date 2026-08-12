@@ -189,6 +189,11 @@ const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
  * stays required rather than defaulted because a default would be a claim the
  * transport made on a caller's behalf: a daemon that later narrows its repertoire
  * would silently keep claiming phases it refuses.
+ *
+ * `repository` is the checkout this daemon holds (issue #687), omitted entirely
+ * when the caller could not identify it — the key is left off the body rather than
+ * sent as null, so the request a daemon with an unidentifiable checkout sends is
+ * byte-identical to the one a daemon predating the field sends.
  */
 export function buildHandshakeRequest(input: {
 	credential: string;
@@ -196,6 +201,7 @@ export function buildHandshakeRequest(input: {
 	hostname: string;
 	capabilities: AgentCli[];
 	supportedPhases: readonly TaskPhase[];
+	repository?: string;
 }): HandshakeRequest {
 	return HandshakeRequestSchema.parse({
 		credential: input.credential,
@@ -203,6 +209,7 @@ export function buildHandshakeRequest(input: {
 		hostname: input.hostname,
 		capabilities: input.capabilities,
 		supportedPhases: [...input.supportedPhases],
+		...(input.repository ? { repository: input.repository } : {}),
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
 }
@@ -543,6 +550,14 @@ export interface WorkerTransportOptions {
 	 * `SUPPORTED_DB_FREE_PHASES`.
 	 */
 	supportedPhases: readonly TaskPhase[];
+	/**
+	 * The `owner/repo` this daemon's one local checkout is (issue #687), declared at
+	 * handshake so the control plane knows which repository the machine can actually
+	 * work in — `repoRoot` itself is host-local and never travels. `./connect-entry.ts`
+	 * resolves it once from the checkout's `origin` remote; omitted when the checkout
+	 * cannot be identified, which declares nothing rather than failing.
+	 */
+	repository?: string;
 	/**
 	 * Re-run capability discovery after the control plane rejects the declared set
 	 * (issue #559). A PATH probe can miss a CLI that is installed — a loaded

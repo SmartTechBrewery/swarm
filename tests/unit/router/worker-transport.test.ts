@@ -32,6 +32,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -108,10 +109,13 @@ describe('handleHandshake', () => {
 		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, undefined);
 		// `validBody()` declares no `supportedPhases` — the older-daemon shape — so the
 		// handshake records every phase, the behaviour that pre-dated the field (#467).
+		// It declares no `repository` either, which records NULL (issue #687): the
+		// column's pre-existing value, and the one that clears a stale declaration.
 		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
 		);
 	});
 
@@ -122,7 +126,44 @@ describe('handleHandshake', () => {
 		const result = await handleHandshake(deps, { ...validBody(), supportedPhases: declared });
 
 		expect(result.status).toBe(200);
-		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['claude'], declared);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			declared,
+			null,
+		);
+	});
+
+	// Issue #687 — the third declaration. Persisted (unlike `hostname`) and normalised at
+	// this boundary, so the roster records one canonical `owner/repo` whatever form a
+	// daemon sent.
+	it('records the declared repository, normalised', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repository: 'SmartTechBrewery/Swarm.git',
+		});
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			'smarttechbrewery/swarm',
+		);
+		// Nothing is gated on the declaration in this phase — the session body is unchanged.
+		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
+	});
+
+	it('rejects a malformed repository with 400, before touching the lease', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, { ...validBody(), repository: 'not-a-slug' });
+
+		expect(result.status).toBe(400);
+		expect(deps.acquireSession).not.toHaveBeenCalled();
+		expect(deps.refreshWorkerCapabilities).not.toHaveBeenCalled();
 	});
 
 	it('rejects a malformed body with 400', async () => {
