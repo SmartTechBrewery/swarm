@@ -41,6 +41,7 @@ import type { Worker } from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
+	EnrollmentRepositoryMismatchError,
 	enrollWorker,
 	setSharingConsent,
 	updateEnrollmentConstraints,
@@ -363,7 +364,13 @@ function parseConcurrencyFlag(
 	return { ok: true, value };
 }
 
-/** Perform the enrollment write and report it, translating the two known errors to exit 1. */
+/**
+ * Perform the enrollment write and report it, translating the three known
+ * rejections to exit 1: allowed CLIs the machine does not declare, a project whose
+ * repository is not the machine's checkout (issue #690), and a duplicate
+ * enrollment. Each prints one actionable line — the two typed errors already name
+ * what disagrees, so their message is printed as written rather than re-worded.
+ */
 async function performEnroll(
 	worker: Worker,
 	projectId: string,
@@ -386,7 +393,10 @@ async function performEnroll(
 		);
 		return 0;
 	} catch (err) {
-		if (err instanceof AllowedClisNotCapableError) {
+		if (
+			err instanceof AllowedClisNotCapableError ||
+			err instanceof EnrollmentRepositoryMismatchError
+		) {
 			out.error(err.message);
 			return 1;
 		}

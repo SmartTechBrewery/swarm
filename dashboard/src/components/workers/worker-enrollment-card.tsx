@@ -8,7 +8,11 @@ import { formatPhase } from '@/lib/format.js';
 import { trpcClient } from '@/lib/trpc.js';
 import { useDraftSync } from '@/lib/use-draft-sync.js';
 import { enrollmentPhaseOptions } from '@/lib/worker-enrollment-phases.js';
-import { ENROLLMENT_STATUS_LABELS, routabilityBlockers } from '@/lib/worker-enrollment-view.js';
+import {
+	ENROLLMENT_STATUS_LABELS,
+	repositoryMismatch,
+	routabilityBlockers,
+} from '@/lib/worker-enrollment-view.js';
 import type { WorkerDetailEnrollment } from '@/types/workers.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 import type { TriggerPhase } from '../../../../src/triggers/types.js';
@@ -135,6 +139,12 @@ interface WorkerEnrollmentCardProps {
 	capabilities: string[];
 	/** The machine's declared phase repertoire — a phase it doesn't declare can't be added. */
 	supportedPhases: string[];
+	/**
+	 * The repository the machine's checkout is (issue #687), or `null` when it
+	 * declared none — read against this enrollment's `projectRepo` to state the
+	 * mismatch that refused or suspended it (issue #690).
+	 */
+	declaredRepository: string | null;
 	/** Phases this project has turned off for every worker (`pipeline.<phase>.enabled: false`). */
 	projectDisabledPhases: string[];
 	projectName: string;
@@ -169,6 +179,33 @@ function consentSwitchText(
 		label: `Sharing of ${workerName} with ${projectName}`,
 		title: `Only ${ownerName} can change sharing for ${projectName}`,
 	};
+}
+
+/**
+ * Why this enrollment was refused or suspended: the machine's checkout is not this
+ * project's repository (issue #690). Stated as the two repositories themselves —
+ * derived from the live facts on every render rather than from a sentence stored
+ * when the mismatch was detected, so it cannot go stale if either side changes.
+ *
+ * Rendered whatever the enrollment's status is. A mismatch normally *is* a
+ * suspension (the handshake's policing pass suspends one it finds), but an active
+ * mismatched enrollment is exactly the case an operator most needs explained: the
+ * dispatch gate routes work there and the daemon then refuses it (issue #688).
+ */
+function RepositoryMismatch({
+	declaredRepository,
+	projectRepository,
+}: {
+	declaredRepository: string;
+	projectRepository: string;
+}) {
+	return (
+		<p className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded leading-relaxed">
+			This machine's checkout is <span className="font-mono">{declaredRepository}</span>, but this
+			project is <span className="font-mono">{projectRepository}</span>. Work for this project
+			cannot run here — enroll a machine checked out from that repository, or point this one at it.
+		</p>
+	);
 }
 
 /** The project, its approval state, and the routing verdict the two combine into. */
@@ -280,6 +317,7 @@ export function WorkerEnrollmentCard({
 	workerName,
 	capabilities,
 	supportedPhases,
+	declaredRepository,
 	projectDisabledPhases,
 	projectName,
 	viewerIsOwner,
@@ -340,6 +378,7 @@ export function WorkerEnrollmentCard({
 	});
 
 	const blockers = routabilityBlockers(enrollment);
+	const mismatch = repositoryMismatch(declaredRepository, enrollment.projectRepo);
 	// A confirmation dialog shows its own action's error; the inline feedback for
 	// that control stays quiet meanwhile so the message isn't stated twice.
 	const confirmOpen = confirm !== null;
@@ -351,6 +390,8 @@ export function WorkerEnrollmentCard({
 			<EnrollmentHeader enrollment={enrollment} projectName={projectName} />
 
 			<p className="text-xs text-zinc-500 font-mono break-all select-all">{enrollment.projectId}</p>
+
+			{mismatch ? <RepositoryMismatch {...mismatch} /> : null}
 
 			{blockers.length > 0 ? (
 				<ul className="space-y-1 text-xs text-zinc-400">

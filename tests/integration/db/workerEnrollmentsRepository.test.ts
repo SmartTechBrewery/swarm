@@ -19,7 +19,10 @@ import {
 	acquireLease,
 	setCurrentRun,
 } from '../../../src/db/repositories/workerSessionsRepository.js';
-import { createWorker } from '../../../src/db/repositories/workersRepository.js';
+import {
+	createWorker,
+	updateWorkerCapabilities,
+} from '../../../src/db/repositories/workersRepository.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import { workerSessions } from '../../../src/db/schema/workerSessions.js';
 import { workers } from '../../../src/db/schema/workers.js';
@@ -27,6 +30,7 @@ import {
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	isRoutable,
 } from '../../../src/identity/worker-enrollment.js';
+import { suspendEnrollmentsForMismatchedRepository } from '../../../src/identity/worker-enrollment-service.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -156,6 +160,68 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(isRoutable(created)).toBe(false);
 				const regranted = await setEnrollmentSharingConsent(created.id, true);
 				expect(regranted && isRoutable(regranted)).toBe(true);
+			});
+		});
+
+		// Issue #690 — the declaration path, against a real database: what a reconnecting
+		// daemon's handshake runs once its repository is persisted.
+		describe('suspendEnrollmentsForMismatchedRepository', () => {
+			it('persists the suspension and leaves the enrollment’s constraints intact', async () => {
+				const mismatched = await enroll(workerA, PROJECT_B, {
+					allowedClis: ['claude', 'codex'],
+					allowedPhases: ['implementation', 'review'],
+					concurrencyAllocation: 3,
+				});
+				const matching = await enroll(workerA, PROJECT_A);
+				// PROJECT_A is `jkwiecien/enroll-a`; the machine's checkout is that one, so
+				// only its PROJECT_B (`jkwiecien/enroll-b`) enrollment contradicts it.
+				await updateWorkerCapabilities(
+					workerA,
+					['claude', 'codex'],
+					undefined,
+					'jkwiecien/enroll-a',
+				);
+
+				const suspended = await suspendEnrollmentsForMismatchedRepository(
+					workerA,
+					'jkwiecien/enroll-a',
+				);
+
+				expect(suspended).toEqual([
+					{
+						enrollmentId: mismatched.id,
+						projectId: PROJECT_B,
+						projectRepository: 'jkwiecien/enroll-b',
+					},
+				]);
+				// Suspension, not deletion: the row keeps every constraint for the operator
+				// who fixes the pairing, and is simply no longer routable.
+				const stored = await getEnrollmentById(mismatched.id);
+				expect(stored).toMatchObject({
+					status: 'suspended',
+					allowedClis: ['claude', 'codex'],
+					allowedPhases: ['implementation', 'review'],
+					concurrencyAllocation: 3,
+					sharingConsent: true,
+				});
+				expect(stored && isRoutable(stored)).toBe(false);
+				// The enrollment for the repository this checkout *is* stays untouched.
+				expect(await getEnrollmentById(matching.id)).toMatchObject({ status: 'active' });
+			});
+
+			it('creates nothing and reactivates nothing when the declaration matches again', async () => {
+				const created = await enroll(workerA, PROJECT_A, { status: 'suspended' });
+
+				const suspended = await suspendEnrollmentsForMismatchedRepository(
+					workerA,
+					'jkwiecien/enroll-a',
+				);
+
+				expect(suspended).toEqual([]);
+				// Re-activation is the project administrator's act — a machine cannot restore
+				// its own routability by re-pointing a checkout (ADR-001).
+				expect(await getEnrollmentById(created.id)).toMatchObject({ status: 'suspended' });
+				expect(await listEnrollmentsForWorker(workerA)).toHaveLength(1);
 			});
 		});
 

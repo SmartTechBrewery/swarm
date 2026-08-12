@@ -69,6 +69,16 @@ export interface WorkerRow {
 	 * with a `PLANNING` badge when this includes it.
 	 */
 	supportedPhases: string[];
+	/**
+	 * Which repository the machine's one local checkout is (issue #687), normalised
+	 * `owner/repo`, or `null` when it declared none — a machine that never connected,
+	 * a daemon on a build that predates the field, or a checkout with no readable
+	 * `origin`. Not a path: `SWARM_WORKER_REPO_ROOT` stays on the machine.
+	 *
+	 * Read against an enrollment's own `projectRepo` to explain a refused or
+	 * suspended enrollment (issue #690).
+	 */
+	repository: string | null;
 	connection: WorkerConnectionState;
 	/** ISO 8601 — when the worker was last heard from; null if it never connected. */
 	lastSeenAt: string | null;
@@ -104,6 +114,14 @@ export interface WorkerDetailEnrollment {
 	sharingConsent: boolean;
 	/** Server-derived: `active` **and** consented. The only field the dispatch gate reads. */
 	isRoutable: boolean;
+	/**
+	 * This enrollment's project repository (issue #690), in the **same normalised
+	 * form** as the worker's own `repository`, so plain equality between the two is
+	 * the comparison the server makes (`repoSlugsMatch`, `src/scm/repo-slug.ts` —
+	 * not imported here, since its slug reader spawns `git`). `null` only when the
+	 * project no longer resolves.
+	 */
+	projectRepo: string | null;
 	/**
 	 * Whether the viewer administers this enrollment's project, so approval and
 	 * suspend/reactivate may be offered. Declared by the server — the same check

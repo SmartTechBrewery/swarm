@@ -14,8 +14,9 @@
  * Two routes, both under `/worker`:
  *   - `POST /worker/session` — the handshake (request/response): authenticate the
  *     credential, acquire the fenced lease — reclaiming the daemon's *own* live lease
- *     when it presents the proof (issue #608) — declare the daemon's CLIs, return the
- *     session.
+ *     when it presents the proof (issue #608) — declare the daemon's CLIs and its
+ *     checkout's repository, suspend any enrollment that declaration contradicts
+ *     (issue #690), return the session.
  *   - `GET /worker/stream` — a WebSocket carrying periodic heartbeat frames that
  *     keep the lease live, releasing it on disconnect.
  *
@@ -38,6 +39,10 @@ import type { WSContext } from 'hono/ws';
 import { promoteAvailabilityWaitsForWorker } from '../dispatch/dispatcher.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '../identity/worker.js';
+import {
+	type SuspendedMismatchedEnrollment,
+	suspendEnrollmentsForMismatchedRepository,
+} from '../identity/worker-enrollment-service.js';
 import {
 	refreshWorkerCapabilities,
 	resolveWorkerByCredential,
@@ -110,6 +115,18 @@ export interface WorkerTransportDeps {
 		supportedPhases: TriggerPhase[],
 		repository: string | null,
 	) => Promise<Worker | undefined>;
+	/**
+	 * Police the worker's existing enrollments against the repository it just
+	 * declared (issue #690) — suspending any whose project is a different repository.
+	 * Called only when a repository *was* declared, and only after the declaration is
+	 * persisted, so it acts on what the row now says. It never creates or activates
+	 * an enrollment: a declaration is the machine's statement, and enrollment stays a
+	 * human decision (ADR-001).
+	 */
+	suspendEnrollmentsForMismatchedRepository: (
+		workerId: string,
+		declaredRepository: string,
+	) => Promise<SuspendedMismatchedEnrollment[]>;
 	resolveHeartbeatTtlMs: () => number;
 	validateFencingToken: (workerId: string, token: number, ttlMs?: number) => Promise<boolean>;
 	/**
@@ -151,6 +168,7 @@ function defaultDeps(): WorkerTransportDeps {
 		heartbeat,
 		releaseSession,
 		refreshWorkerCapabilities,
+		suspendEnrollmentsForMismatchedRepository,
 		resolveHeartbeatTtlMs,
 		validateFencingToken,
 		deliverDispatchResult,
@@ -172,10 +190,13 @@ export interface HandshakeResult {
 
 /**
  * The handshake, as a pure function of its deps and the raw request body:
- * validate → authenticate → acquire lease → declare CLIs → return the session.
+ * validate → authenticate → acquire lease → declare CLIs and repository → police
+ * enrollments against that repository → return the session.
  * Returns the status/body for the route to send; never throws for an expected
  * failure (bad request, bad credential, lease held, capability reduction), and
- * never reflects the credential in the body.
+ * never reflects the credential in the body. The enrollment-policing pass is the
+ * one step whose failure is swallowed rather than reported: it is housekeeping on
+ * the control plane's side of the connection, not a condition of connecting.
  */
 export async function handleHandshake(
 	deps: WorkerTransportDeps,
@@ -282,6 +303,9 @@ export async function handleHandshake(
 		throw err;
 	}
 
+	// Only now that the declaration is persisted — the pass acts on what the row says.
+	await policeEnrollmentsAgainstDeclaration(deps, worker.id, request.repository);
+
 	return {
 		status: 200,
 		json: {
@@ -293,6 +317,40 @@ export async function handleHandshake(
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		},
 	};
+}
+
+/**
+ * Suspend the enrollments the repository this daemon just declared contradicts
+ * (issue #690): one written against a different repository — created before the
+ * machine declared anything, or before it was re-pointed at another checkout — is
+ * suspended, so the roster states why no work is routed there instead of leaving an
+ * operator to read the reason off refused assignments.
+ *
+ * **Never throws, and never blocks the handshake.** Policing enrollments is
+ * housekeeping on the control plane's side of the connection, not a condition of
+ * connecting, so a failure is logged and the session still comes back — the daemon's
+ * own pre-flight check (issue #688) refuses a mismatched assignment regardless. The
+ * suspension itself blocks only *future* dispatch (`isRoutable`), never a phase
+ * already running.
+ *
+ * A daemon that declared nothing is skipped entirely: an unidentifiable checkout
+ * must not suspend enrollments an operator deliberately created.
+ */
+async function policeEnrollmentsAgainstDeclaration(
+	deps: WorkerTransportDeps,
+	workerId: string,
+	declaredRepository: string | undefined,
+): Promise<void> {
+	if (!declaredRepository) return;
+	try {
+		await deps.suspendEnrollmentsForMismatchedRepository(workerId, declaredRepository);
+	} catch (err) {
+		logger.warn('worker handshake: policing enrollments against the declaration failed', {
+			workerId,
+			repository: declaredRepository,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
 }
 
 /** Per-connection context threaded into every stream-frame decision. */

@@ -59,6 +59,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		},
 		capabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
+		repository: 'acme/frontend',
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		currentRun: null,

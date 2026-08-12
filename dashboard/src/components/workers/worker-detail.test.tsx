@@ -42,6 +42,7 @@ function makeEnrollment(overrides: Partial<WorkerDetailEnrollment> = {}): Worker
 		concurrencyAllocation: 2,
 		sharingConsent: true,
 		isRoutable: true,
+		projectRepo: 'acme/frontend',
 		viewerCanAdminister: false,
 		...overrides,
 	};
@@ -59,6 +60,7 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		ownerUserId: 'u1',
 		capabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
+		repository: 'acme/frontend',
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		currentRun: null,
@@ -166,7 +168,7 @@ describe('WorkerDetailView sections (issue #477)', () => {
 	it('reports both capability axes in full — the whole declared repertoire', () => {
 		renderWorker();
 
-		const capabilities = within(section('Declared capabilities'));
+		const capabilities = within(section('Declared by the daemon'));
 		expect(capabilities.getByText('claude')).toBeDefined();
 		expect(capabilities.getByText('codex')).toBeDefined();
 		// The whole repertoire; the table itself lists no phase at all (issue #542).
@@ -279,6 +281,54 @@ describe('WorkerDetailView enrollment blocks', () => {
 		expect(screen.getByText('Not routable')).toBeDefined();
 		expect(screen.getByText(/awaiting a project administrator/)).toBeDefined();
 		expect(screen.getByText(/has not shared this machine/)).toBeDefined();
+	});
+
+	// Issue #690 — the reason an enrollment was refused or suspended, read off the two
+	// live repositories rather than a sentence stored when it was detected.
+	describe('a checkout that is not the project’s repository', () => {
+		it('names both repositories on a suspended mismatched enrollment', () => {
+			renderWorker({
+				repository: 'acme/frontend',
+				enrollments: [
+					makeEnrollment({
+						status: 'suspended',
+						isRoutable: false,
+						projectRepo: 'acme/backend',
+					}),
+				],
+			});
+
+			const reason = screen.getByText(/This machine's checkout is/);
+			expect(reason.textContent).toContain('acme/frontend');
+			expect(reason.textContent).toContain('acme/backend');
+		});
+
+		it('says nothing when the machine’s checkout is the project’s repository', () => {
+			renderWorker({
+				repository: 'acme/frontend',
+				enrollments: [makeEnrollment({ projectRepo: 'acme/frontend' })],
+			});
+
+			expect(screen.queryByText(/This machine's checkout is/)).toBeNull();
+		});
+
+		// An unidentifiable checkout is not a wrong one — the same rule the server applies.
+		it('says nothing when the machine declared no repository', () => {
+			renderWorker({
+				repository: null,
+				enrollments: [makeEnrollment({ projectRepo: 'acme/backend' })],
+			});
+
+			expect(screen.queryByText(/This machine's checkout is/)).toBeNull();
+		});
+
+		it('reports the declared checkout repository beside the two capability axes', () => {
+			renderWorker({ repository: 'acme/frontend', enrollments: [] });
+
+			const declared = within(section('Declared by the daemon'));
+			expect(declared.getByText('Checkout repository')).toBeDefined();
+			expect(declared.getByText('acme/frontend')).toBeDefined();
+		});
 	});
 
 	it('renders one block per enrollment', () => {

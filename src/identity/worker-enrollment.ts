@@ -180,6 +180,34 @@ export class AllowedClisNotCapableError extends Error {
 }
 
 /**
+ * Raised when an enrollment would pair a worker with a project whose repository
+ * is not the repository the worker's own checkout is (issue #690) — the
+ * enrollment-time twin of the daemon's pre-flight assignment refusal (issue
+ * #688). A worker holds a single local checkout, so an enrollment into a project
+ * for a different repository can only ever produce refused work.
+ *
+ * Both slugs are named so the operator can see *which* two disagree; the
+ * declaration is the worker's own normalised `Worker.repository`, the project
+ * side is `ProjectConfig.repo` as configured. A distinct type so the router
+ * surfaces it as a `BAD_REQUEST` and the CLI as one actionable line, exactly as
+ * {@link AllowedClisNotCapableError} is surfaced.
+ */
+export class EnrollmentRepositoryMismatchError extends Error {
+	constructor(
+		public readonly workerId: string,
+		public readonly declaredRepository: string,
+		public readonly projectRepository: string,
+	) {
+		super(
+			`Worker ${workerId} cannot be enrolled in a project for repository '${projectRepository}': ` +
+				`its checkout is '${declaredRepository}'. Enroll a worker whose checkout is that ` +
+				'repository, or point this one at it.',
+		);
+		this.name = 'EnrollmentRepositoryMismatchError';
+	}
+}
+
+/**
  * The routability predicate — the named seam the #130 dispatch gate checks
  * before it lets a worker receive *future* automatic dispatch (the enrollment
  * analogue of `canReadProject` etc. in `./membership.ts`). A worker is routable
