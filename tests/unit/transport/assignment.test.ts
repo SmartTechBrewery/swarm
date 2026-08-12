@@ -94,6 +94,33 @@ describe('buildTaskAssignment', () => {
 			expect(assignment.boardItemId).toBeUndefined();
 		});
 
+		// The repository the run acts on, which the DB-free worker cannot read off the
+		// run row for itself (issue #692) — Review keys its verdict ledger on it.
+		it('carries the control-plane-resolved repository', () => {
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'review',
+					workItem: undefined,
+					pr: { prNumber: '42', headSha: 'abc123' },
+					repository: 'SmartTechBrewery/run-repo',
+				}),
+			);
+			expect(assignment.repository).toBe('SmartTechBrewery/run-repo');
+			expect(TaskAssignmentSchema.safeParse(assignment).success).toBe(true);
+		});
+
+		it('omits the repository when the caller resolved none (older-router skew)', () => {
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'review',
+					workItem: undefined,
+					pr: { prNumber: '42', headSha: 'abc123' },
+				}),
+			);
+			expect(assignment.repository).toBeUndefined();
+			expect(TaskAssignmentSchema.safeParse(assignment).success).toBe(true);
+		});
+
 		// `taskRef` is the provider's own card→artifact answer, so it has to survive
 		// the wire for a federated planning/implementation run (issue #498).
 		it('round-trips the work item taskRef', () => {

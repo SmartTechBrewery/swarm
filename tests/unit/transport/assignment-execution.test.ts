@@ -477,6 +477,32 @@ describe('runAssignmentDbFree', () => {
 		expect(runPhase.mock.calls[0][0].recovery.recoveryMode).toBeUndefined();
 	});
 
+	// The run's own repository, resolved control-plane side because this worker has
+	// no run row to read it from (issue #692).
+	it('reaches the phase with the assignment’s repository', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+		await runAssignmentDbFree(ciAssignment({ repository: 'SmartTechBrewery/run-repo' }), sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase),
+		});
+
+		expect(runPhase.mock.calls[0][0].repository).toBe('SmartTechBrewery/run-repo');
+	});
+
+	// Router/worker version skew only: a router predating the field omits it, and the
+	// reconstructed project's repo is the same string while a project holds one.
+	it('falls back to the reconstructed project’s repo when the assignment carries none', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase),
+		});
+
+		expect(runPhase.mock.calls[0][0].repository).toBe('SmartTechBrewery/swarm');
+	});
+
 	it('runs respond-to-review with its card lookup, board move and follow-up on the delivery API', async () => {
 		const sink = recordingSink();
 		const card = {

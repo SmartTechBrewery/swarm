@@ -4560,11 +4560,18 @@ describe('reportInterruptedJobToBoard', () => {
 describe('runAssignedPhase (shared per-phase runner switch)', () => {
 	const runAgent = (async () => agentResult()) as AssignedPhaseInputs['runAgent'];
 
+	/**
+	 * The repository the run recorded (issue #692) — deliberately not `PROJECT.repo`,
+	 * so the review arm's assertion fails if it forwards the project's own instead.
+	 */
+	const RUN_REPOSITORY = 'SmartTechBrewery/run-repo';
+
 	function baseInputs(overrides: Partial<AssignedPhaseInputs>): AssignedPhaseInputs {
 		return {
 			phase: 'planning',
 			taskId: '17',
 			project: PROJECT,
+			repository: RUN_REPOSITORY,
 			recovery: createMockPhaseRecovery(),
 			runAgent,
 			...overrides,
@@ -4638,6 +4645,9 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		expect(assignedPhaseCalls[0].phase).toBe('review');
 		expect(assignedPhaseCalls[0].args.prNumber).toBe('42');
 		expect(assignedPhaseCalls[0].args.headSha).toBe('deadbeef');
+		// The run's own repository, which the phase keys its verdict ledger on — not
+		// `project.repo` (issue #692).
+		expect(assignedPhaseCalls[0].args.repository).toBe(RUN_REPOSITORY);
 		expect(providerBuiltWith).toHaveLength(0);
 	});
 

@@ -1342,6 +1342,15 @@ export interface AssignedPhaseInputs {
 	phase: TriggerPhase;
 	taskId: string;
 	project: ProjectConfig;
+	/**
+	 * The repository this run acts on — the same value its run row records
+	 * (`runs.repository`, issue #683). Resolved control-plane side, where the run
+	 * row is written, and carried on the assignment because a DB-free worker
+	 * cannot read that row (ADR-003 §2) — exactly like {@link boardItemId}. Review
+	 * keys its verdict ledger on it (issue #692); identical to `project.repo`
+	 * while a project holds exactly one repository.
+	 */
+	repository: string;
 	cli?: AgentCli;
 	model?: string;
 	reasoning?: ReasoningLevel;
@@ -1539,6 +1548,9 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 			}
 			return runReviewPhase({
 				project,
+				// The run's own repository rather than `project.repo` — what its verdict
+				// ledger rows key on (issue #692).
+				repository: inputs.repository,
 				worktrees: inputs.worktrees,
 				prNumber: inputs.prNumber,
 				headSha: inputs.headSha,

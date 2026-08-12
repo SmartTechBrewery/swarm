@@ -295,6 +295,17 @@ export const TaskAssignmentSchema = z.object({
 	 * Absent when nothing links the task to a card.
 	 */
 	boardItemId: z.string().optional(),
+	/**
+	 * The repository this run acts on, resolved control-plane side from the same
+	 * source the run row's `repository` column was written from (issue #683) — the
+	 * worker cannot read that row itself (ADR-003 §2), so the value travels here,
+	 * exactly like `boardItemId`. Review keys its verdict ledger on it (issue
+	 * #692). Additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` is
+	 * deliberately not bumped: an older worker ignores it, and an older router
+	 * omits it, in which case the executor falls back to the reconstructed
+	 * project's repo — the same string, while a project holds one repository.
+	 */
+	repository: z.string().optional(),
 	baseBranch: z.string().optional(),
 	baseSha: z.string().optional(),
 });

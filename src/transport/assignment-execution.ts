@@ -771,6 +771,12 @@ function buildDbFreePhaseInputs({
 		phase: assignment.phase,
 		taskId: assignment.taskId,
 		project,
+		// Resolved control-plane side, where the run row that records it is written
+		// (issue #683) — this worker has no DB to read that row from. The fallback
+		// exists solely for router/worker version skew (a router predating the field
+		// omits it) and resolves to the same string today, since a project holds
+		// exactly one repository.
+		repository: assignment.repository ?? project.repo,
 		cli: assignment.target.cli,
 		model: assignment.target.model,
 		reasoning: assignment.target.reasoning,
