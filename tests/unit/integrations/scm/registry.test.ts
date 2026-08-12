@@ -22,6 +22,13 @@ function fakeManifest(id: string, runtimeReady?: boolean): SCMProviderManifest {
 		id,
 		label: id,
 		category: 'scm',
+		// Declared so a project config parsed while this fake is registered still
+		// validates its `credentials.scm[id]` roles against something (issue #628); the
+		// registry itself never reads them.
+		credentialRoles: [
+			{ role: 'reviewer', envVarKey: `${id.toUpperCase()}_TOKEN_REVIEWER` },
+			{ role: 'webhookSecret', envVarKey: `${id.toUpperCase()}_WEBHOOK_SECRET` },
+		],
 		provider: { id },
 		...(runtimeReady === undefined ? {} : { runtimeReady }),
 	} as unknown as SCMProviderManifest;

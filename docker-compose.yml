@@ -63,10 +63,21 @@ services:
       # the same dispatch-concurrency setting as the host worker. Without this
       # pass-through it silently uses the resolver's default of one.
       SWARM_WORKER_CONCURRENCY: ${SWARM_WORKER_CONCURRENCY:-1}
-      # Worker-local operator GitHub token (issue #396). The router resolves the
-      # implementer identity from it for isSelfAuthored loop-prevention, so it must
-      # reach this container too (the host worker + API server read it from .env
-      # directly). Never persisted; passed through from the host env.
+      # Worker-local operator GitHub token (issue #396) — OPTIONAL here, unlike on a
+      # worker (which throws at startup without it). The router's ONE use of it is
+      # POST /worker/delivery/pr-comment with `persona: 'implementer'`: a federated
+      # worker's Respond-to-review reply, which must not be authored by the reviewer
+      # it answers (issue #444). Unset, the router still starts — it logs a warning —
+      # and answers that single route 503; every other route, that route's reviewer
+      # persona included, works. It is NOT needed for loop prevention: the board gate
+      # resolves the PM provider's own credential (issue #537), comment gates key on
+      # SWARM's own marker (issue #443), and persona-identity routing (personaForActor)
+      # runs worker-side in the trigger handlers. The API server needs none either
+      # since #537 moved board discovery onto the project's PM credential. Note this
+      # is the *operator's own* account and the router holds one value for every
+      # worker it serves, so a multi-operator deployment authors every implementer
+      # reply under whichever account it names. Never persisted; passed through from
+      # the host env.
       SWARM_OPERATOR_GH_TOKEN: ${SWARM_OPERATOR_GH_TOKEN:-}
       # SWARM's own public base URL (issue #496). The receiver hands each route's
       # callback URL to the PM provider's signature verifier, because some providers

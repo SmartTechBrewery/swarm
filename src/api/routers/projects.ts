@@ -5,8 +5,11 @@ import {
 	PipelineBaseSchema,
 	type PipelineConfig,
 	PipelineConfigSchema,
+	type PmCredentialReferencesByProvider,
+	type ProjectConfig,
 	ProjectConfigBaseSchema,
 	type ProjectPm,
+	type ScmCredentialReferencesByProvider,
 } from '../../config/schema.js';
 import {
 	approveMembershipRequestInDb,
@@ -24,9 +27,17 @@ import {
 	listDiscoverableProjectsFromDb,
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
-import { getMembership } from '../../identity/membership-service.js';
+import { getMembership, listProjectsForUser } from '../../identity/membership-service.js';
+import { githubProjectsBlankPm } from '../../integrations/pm/github-projects/config-schema.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
-import { accessibleProjectScope, assertProjectAccess, filterAccessibleProjects } from '../authz.js';
+import { getSCMProvider } from '../../integrations/scm/registry.js';
+import type { ScmType } from '../../scm/types.js';
+import {
+	accessibleProjectScope,
+	assertProjectAccess,
+	filterAccessibleProjects,
+	mayAccessProject,
+} from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { credentialsRouter } from './credentials.js';
 
@@ -41,43 +52,57 @@ import { credentialsRouter } from './credentials.js';
  * mapping needs at least one status option): it is a placeholder for a project
  * that has not been mapped yet, and the board reads that would use it fail loudly
  * on the unmappable status rather than writing to a wrong board.
+ *
+ * The member itself is the provider's, not this module's (issue #641): every PM
+ * manifest now declares its own blank `pm` member (`PMProviderManifest.blankPm`) so the
+ * discovery API can serve a provider a project is not persisted on, and this default is
+ * GitHub Projects' copy of that one definition rather than a second hand-written
+ * spelling of its field names. Imported from the provider's side-effect-free
+ * `config-schema.ts` — the module `src/config/schema.ts` already composes centrally —
+ * so naming SWARM's default provider here doesn't drag its registration in with it.
  */
-export const DEFAULT_PM_CONFIG: ProjectPm = {
-	type: 'github-projects',
-	projectId: '',
-	statusFieldId: '',
-	statusOptions: {},
-};
+export const DEFAULT_PM_CONFIG: ProjectPm = githubProjectsBlankPm;
 
-// Project-scoped credential references a new project is created with. The
-// implementer persona is intentionally absent — it resolves from the worker-local
-// SWARM_OPERATOR_GH_TOKEN, not from project_credentials (issue #396).
-const DEFAULT_SCM_CREDENTIAL_REFERENCES = {
-	reviewer: 'SCM_TOKEN_REVIEWER',
-	webhookSecret: 'SCM_WEBHOOK_SECRET',
-};
+/**
+ * The `credentials.scm` map a new project starts with: one reference per role its
+ * **SCM provider** declares, named by that role's own conventional key
+ * (`SCMProviderManifest.credentialRoles`, issue #628) — the exact shape of
+ * {@link defaultPmCredentialReferences}, read off the manifest rather than hardcoded,
+ * so a project created for another provider seeds *its* keys with no edit here.
+ *
+ * The implementer persona is intentionally absent — it resolves from the worker-local
+ * `SWARM_OPERATOR_GH_TOKEN` (and its Bitbucket/GitLab siblings), not from
+ * `project_credentials` (issue #396). An unregistered provider seeds nothing.
+ */
+function defaultScmCredentialReferences(scm: ScmType): ScmCredentialReferencesByProvider {
+	const roles = getSCMProvider(scm)?.credentialRoles ?? [];
+	if (roles.length === 0) return {};
+	return { [scm]: Object.fromEntries(roles.map((role) => [role.role, role.envVarKey])) };
+}
 
 /**
  * The `credentials.pm` map a new project starts with: one reference per credential
  * role its PM provider *requires and owns*, named by that role's own declared
- * conventional key (issue #537). Nothing is stored yet — the reference is a slot the
- * Project Management tab (or `swarm config apply`) fills — so board operations fail
- * with the actionable "credential not configured" error until it is, which is the
- * point.
+ * conventional key (issue #537), filed under that provider's id (issue #631). Nothing
+ * is stored yet — the reference is a slot the Project Management tab (or `swarm config
+ * apply`) fills — so board operations fail with the actionable "credential not
+ * configured" error until it is, which is the point.
  *
  * Read off the manifest rather than hardcoded, so a project created for a different
  * PM provider seeds *its* roles with no edit here (ai/RULES.md §2). Optional and
  * shared-credential-inheriting roles are skipped: neither needs an entry to resolve.
  * An unregistered provider seeds nothing.
  */
-function defaultPmCredentialReferences(pm: ProjectPm): Record<string, string> | undefined {
+function defaultPmCredentialReferences(
+	pm: ProjectPm,
+): PmCredentialReferencesByProvider | undefined {
 	const roles = getPMProvider(pm.type)?.credentialRoles ?? [];
 	const references = Object.fromEntries(
 		roles
 			.filter((role) => !role.optional && !role.inheritsSharedCredential)
 			.map((role) => [role.role, role.envVarKey]),
 	);
-	return Object.keys(references).length > 0 ? references : undefined;
+	return Object.keys(references).length > 0 ? { [pm.type]: references } : undefined;
 }
 
 // Derived from the base object (`.omit()` needs a bare `z.object`); credentials are
@@ -128,6 +153,61 @@ function mergePipelineConfig(
 	};
 }
 
+/**
+ * Refuse a `pm` update that would move the project onto a provider it cannot actually
+ * run on — the server-side half of the switch guarantee (issue #642).
+ *
+ * The dashboard walks the switch in an order that makes this unreachable (the incoming
+ * provider's credentials are entered *before* the new `pm` member is written), but
+ * nothing about `update` enforced that order: it merges `{...existing, ...updates}` and
+ * hands the result to `upsertProjectToDb`, which deliberately does not parse — so
+ * `validatePmCredentialRoles`' presence rule (`src/config/schema.ts`, rule 3) fires on
+ * `validateConfig` / `swarm config apply` but never here. A hand-rolled client could
+ * therefore name a provider with no credentials at all and leave the project
+ * half-switched: `pm.type` pointing at a board every read and write would fail against.
+ *
+ * The check mirrors that rule exactly — the provider must be **registered**, and every
+ * role it declares that is neither optional nor inherited must have a reference in
+ * *its own* `credentials.pm[<providerId>]` block (issue #631) — so the two surfaces
+ * agree on what a complete PM configuration is. It fires only on a `pm.type` **change**:
+ * an ordinary board/status edit is unaffected, and a project already running on a
+ * provider whose credentials predate a manifest change is not retroactively blocked from
+ * fixing its mapping.
+ *
+ * Presence of the *reference* is what is required, not of the stored secret — the same
+ * thing the config schema checks, and the same thing `resolvePmCredential` needs before
+ * it can look a secret up at all.
+ */
+function assertPmProviderSwitchable(existing: ProjectConfig, pm: ProjectPm): void {
+	if (pm.type === existing.pm.type) return;
+
+	const manifest = getPMProvider(pm.type);
+	if (!manifest) {
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message:
+				`No PM provider is registered for '${pm.type}', so this project cannot be ` +
+				'switched to it.',
+		});
+	}
+
+	const configured = existing.credentials.pm?.[manifest.id] ?? {};
+	const missing = manifest.credentialRoles.filter(
+		(spec) => !spec.optional && !spec.inheritsSharedCredential && !configured[spec.role],
+	);
+	if (missing.length === 0) return;
+
+	throw new TRPCError({
+		code: 'BAD_REQUEST',
+		message:
+			`Cannot switch this project to ${manifest.label}: it requires the ` +
+			`${missing.map((spec) => `'${spec.role}' (${spec.label})`).join(', ')} credential` +
+			`${missing.length === 1 ? '' : 's'}, which this project has not configured. Set ` +
+			`${missing.length === 1 ? 'it' : 'them'} under Project Management → Credentials ` +
+			'before saving the new board mapping.',
+	});
+}
+
 function hasUniqueViolationCode(error: unknown): boolean {
 	return (
 		typeof error === 'object' &&
@@ -156,6 +236,46 @@ export const projectsRouter = router({
 		return await filterAccessibleProjects(ctx.user, await listAllProjectsFromDb());
 	}),
 
+	// The caller's own projects and what they hold on each (issue #661) — the read
+	// model behind the profile's My Projects tab, and the first place the dashboard
+	// exposes a per-project membership role as personal data.
+	//
+	// Visibility is not decided here: it is the same `filterAccessibleProjects` rule
+	// `list` runs on, so a project the caller may not discover is absent for exactly
+	// the reason it is absent there and the two cannot drift apart. A `discoverable`
+	// project they have not joined is therefore not listed — asking to join one stays
+	// `listDiscoverable`/`requestMembership`.
+	//
+	// `role` is the membership row's role, or `null` when there is none. Only an
+	// `instanceAdmin` reaches a project without one, so `null` means precisely
+	// "access comes from the installation role" and is reported as the absence of a
+	// membership rather than as a synthesized `projectAdmin` — inventing one would
+	// misdescribe access that removing an installation role would take away. An
+	// `instanceAdmin` who *is* a member reports that real role.
+	//
+	// Kept out of `list` rather than folded into it, for `viewerAccess`'s reason:
+	// that query's cache is rewritten by `projects.update`'s result, which carries no
+	// viewer-scoped field, so a `role` riding along there would be dropped by the next
+	// config save. The projection is id + name + role only — the narrowness
+	// `listDiscoverableProjectsFromDb` already applies to a project read that is not
+	// about configuration, so no repo path, board mapping, or credential reference
+	// travels to a personal overview that needs none of them.
+	listMine: authedProcedure.query(async ({ ctx }) => {
+		const accessible = await filterAccessibleProjects(ctx.user, await listAllProjectsFromDb());
+		const roleByProjectId = new Map(
+			(await listProjectsForUser(ctx.user.id)).map(
+				(membership) => [membership.projectId, membership.role] as const,
+			),
+		);
+		// `listAllProjectsFromDb` already orders by name, so the order is the server's
+		// and the panel adds no sort of its own.
+		return accessible.map((project) => ({
+			id: project.id,
+			name: project.name,
+			role: roleByProjectId.get(project.id) ?? null,
+		}));
+	}),
+
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -172,6 +292,32 @@ export const projectsRouter = router({
 			return project;
 		}),
 
+	// What the caller may *do* on one project, rather than what it is configured as
+	// (issue #655) — the read model the project-detail screen decides which tabs to
+	// offer from, so the configuration and credential tabs a `projectAdmin`-gated
+	// mutation would refuse are never drawn or mounted for anyone else. It reports
+	// the authorization each of those procedures re-checks for itself
+	// (`mayAccessProject`, the non-throwing twin of `assertProjectAccess`); it is not
+	// an enforcement point, and it grants nothing.
+	//
+	// Kept separate from `getById` rather than folded into its return: the project
+	// config is written back into that query's cache by `projects.update`'s own
+	// result, which carries no viewer capability, so a flag riding along there would
+	// be dropped by the next config save.
+	//
+	// Gated at `contributor` like `getById`, so asking what you may do on a project
+	// you cannot see returns the same existence-hiding `NOT_FOUND`. An
+	// `instanceAdmin` administers every project, which `mayAccessProject` already
+	// answers — the dashboard needs no separate installation-role branch.
+	viewerAccess: authedProcedure
+		.input(z.object({ projectId: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			return {
+				canAdminister: await mayAccessProject(ctx.user, input.projectId, 'projectAdmin'),
+			};
+		}),
+
 	// Any authenticated user may create a project and becomes its `projectAdmin`
 	// (#281 task 4): the creator gets a membership row in the same call, so they
 	// can immediately administer what they just created without an operator
@@ -181,15 +327,17 @@ export const projectsRouter = router({
 	// atomically in one transaction so a partial failure never leaves an unowned project.
 	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input }) => {
 		const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
+		// This is a creation-time default, not a config-schema fallback: the dashboard
+		// always submits its explicit picker value, while non-dashboard callers remain
+		// routable instead of creating a project with no SCM provider.
+		const scm: ScmType = input.scm ?? 'github';
+		const scmReferences = defaultScmCredentialReferences(scm);
 		const config = {
 			...input,
-			// This is a creation-time default, not a config-schema fallback: the dashboard
-			// always submits its explicit picker value, while non-dashboard callers remain
-			// routable instead of creating a project with no SCM provider.
-			scm: input.scm ?? 'github',
+			scm,
 			pm: DEFAULT_PM_CONFIG,
 			credentials: {
-				...DEFAULT_SCM_CREDENTIAL_REFERENCES,
+				scm: scmReferences,
 				...(pmReferences ? { pm: pmReferences } : {}),
 			},
 		};
@@ -230,6 +378,8 @@ export const projectsRouter = router({
 				});
 			}
 			const { id, ...updates } = input;
+			// Before the merge, so a refused switch leaves nothing written at all.
+			if (updates.pm) assertPmProviderSwitchable(existing, updates.pm);
 			const config = {
 				...existing,
 				...updates,

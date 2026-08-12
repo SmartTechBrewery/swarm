@@ -29,6 +29,16 @@ export const InstallationRoleSchema = z.enum(['instanceAdmin', 'user']);
 export type InstallationRole = z.infer<typeof InstallationRoleSchema>;
 
 /**
+ * A user's own human-facing label — trimmed and bounded (1–80 chars), the same
+ * rule a worker's own label follows ({@link WorkerDisplayNameSchema},
+ * `./worker.ts`). Declared separately from {@link SwarmUserSchema} because it is
+ * also the API input of the self-service rename (issue #662), so the boundary
+ * and the domain shape cannot drift. It carries no login/identity semantics —
+ * that is `identifier`, which stays operator-managed.
+ */
+export const UserDisplayNameSchema = z.string().trim().min(1).max(80);
+
+/**
  * An authenticated SWARM user. `identifier` is the stable login handle
  * (username/email) and is unique across the installation; `displayName` is the
  * human-friendly label shown in the dashboard. `instanceAdmin` is the single
@@ -38,7 +48,7 @@ export type InstallationRole = z.infer<typeof InstallationRoleSchema>;
 export const SwarmUserSchema = z.object({
 	id: z.string().uuid(),
 	identifier: z.string().min(1),
-	displayName: z.string().min(1),
+	displayName: UserDisplayNameSchema,
 	instanceAdmin: z.boolean(),
 	createdAt: z.date(),
 	updatedAt: z.date(),

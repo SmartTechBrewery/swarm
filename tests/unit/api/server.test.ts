@@ -24,6 +24,15 @@ vi.mock('@/identity/membership-service.js', () => ({
 	listAccessibleProjectIds: vi.fn(),
 }));
 
+// The single-user context re-reads its user per request (issue #662), so the
+// read seam is mocked here; `isInstanceAdmin` is supplied so the module's other
+// consumers aren't left undefined.
+vi.mock('@/identity/service.js', () => ({
+	getUser: vi.fn(),
+	isInstanceAdmin: vi.fn(),
+	renameUser: vi.fn(),
+}));
+
 import { createApiApp, SESSION_COOKIE_NAME } from '@/api/server.js';
 import { listAllProjectsFromDb } from '@/db/repositories/projectsRepository.js';
 import {
@@ -35,6 +44,7 @@ import {
 } from '@/identity/auth.js';
 import { listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
+import { getUser } from '@/identity/service.js';
 
 const user: SwarmUser = {
 	id: '11111111-1111-4111-8111-111111111111',
@@ -61,6 +71,7 @@ describe('swarm-api', () => {
 		vi.mocked(resolveSingleUser).mockReset();
 		vi.mocked(revokeSession).mockReset().mockResolvedValue(undefined);
 		vi.mocked(listAccessibleProjectIds).mockReset();
+		vi.mocked(getUser).mockReset();
 	});
 
 	describe('public routes', () => {
@@ -135,6 +146,7 @@ describe('swarm-api', () => {
 
 		it('serves auth.me from the bootstrapped admin with no session cookie', async () => {
 			vi.mocked(resolveSingleUser).mockResolvedValue(admin);
+			vi.mocked(getUser).mockResolvedValue(admin);
 
 			const app = createApiApp({ singleUserMode: true });
 			const res = await app.request('/trpc/auth.me');
@@ -151,6 +163,7 @@ describe('swarm-api', () => {
 
 		it('serves a protected procedure with no cookie and without resolveSession', async () => {
 			vi.mocked(resolveSingleUser).mockResolvedValue(admin);
+			vi.mocked(getUser).mockResolvedValue(admin);
 			vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
 
 			const app = createApiApp({ singleUserMode: true });
@@ -162,14 +175,43 @@ describe('swarm-api', () => {
 			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
 		});
 
-		it('bootstraps the admin once and caches it across requests', async () => {
+		it('bootstraps the admin once across requests', async () => {
 			vi.mocked(resolveSingleUser).mockResolvedValue(admin);
+			vi.mocked(getUser).mockResolvedValue(admin);
 
 			const app = createApiApp({ singleUserMode: true });
 			await app.request('/trpc/auth.me');
 			await app.request('/trpc/auth.me');
 
 			expect(resolveSingleUser).toHaveBeenCalledTimes(1);
+		});
+
+		it('re-reads the admin per request, so a self-service change is visible at once', async () => {
+			// Issue #662: caching the whole user for the app's lifetime would keep
+			// reporting the old name until the process restarted.
+			vi.mocked(resolveSingleUser).mockResolvedValue(admin);
+			vi.mocked(getUser)
+				.mockResolvedValueOnce(admin)
+				.mockResolvedValueOnce({ ...admin, displayName: 'Ada Lovelace' });
+
+			const app = createApiApp({ singleUserMode: true });
+			const first = await app.request('/trpc/auth.me');
+			const second = await app.request('/trpc/auth.me');
+
+			expect((await first.json()).result.data.displayName).toBe('Local Admin');
+			expect((await second.json()).result.data.displayName).toBe('Ada Lovelace');
+			expect(getUser).toHaveBeenCalledWith(admin.id);
+		});
+
+		it('falls back to the bootstrap when the row is momentarily unreadable', async () => {
+			vi.mocked(resolveSingleUser).mockResolvedValue(admin);
+			vi.mocked(getUser).mockResolvedValue(undefined);
+
+			const app = createApiApp({ singleUserMode: true });
+			const res = await app.request('/trpc/auth.me');
+
+			expect(res.status).toBe(200);
+			expect((await res.json()).result.data).toMatchObject({ identifier: 'localhost-admin' });
 		});
 
 		it('explicitly disabled: still 401s without a cookie and never bootstraps an admin', async () => {

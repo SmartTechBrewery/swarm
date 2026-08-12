@@ -3,8 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/usersRepository.js', () => ({
 	findUserCredentialByIdentifier: vi.fn(),
+	findUserCredentialById: vi.fn(),
 	getUserById: vi.fn(),
 	ensureLocalAdminUser: vi.fn(),
+	setPasswordHash: vi.fn(),
 }));
 
 vi.mock('@/db/repositories/userSessionsRepository.js', () => ({
@@ -22,10 +24,13 @@ import {
 } from '@/db/repositories/userSessionsRepository.js';
 import {
 	ensureLocalAdminUser,
+	findUserCredentialById,
 	findUserCredentialByIdentifier,
 	getUserById,
+	setPasswordHash,
 } from '@/db/repositories/usersRepository.js';
 import {
+	changeOwnPassword,
 	createSession,
 	hashPassword,
 	resolveSession,
@@ -55,6 +60,8 @@ beforeEach(() => {
 	vi.mocked(deleteSessionByToken).mockReset().mockResolvedValue(undefined);
 	vi.mocked(deleteExpiredSessions).mockReset().mockResolvedValue(0);
 	vi.mocked(ensureLocalAdminUser).mockReset();
+	vi.mocked(findUserCredentialById).mockReset();
+	vi.mocked(setPasswordHash).mockReset().mockResolvedValue(true);
 });
 
 describe('password hashing', () => {
@@ -109,6 +116,76 @@ describe('verifyCredentials', () => {
 	it('returns undefined for a user with no password set', async () => {
 		vi.mocked(findUserCredentialByIdentifier).mockResolvedValue({ user, passwordHash: null });
 		expect(await verifyCredentials('ada@example.com', 'whatever')).toBeUndefined();
+	});
+});
+
+describe('changeOwnPassword', () => {
+	it('re-credentials the user against a verified current password', async () => {
+		const oldHash = await hashPassword('hunter2');
+		vi.mocked(findUserCredentialById).mockResolvedValue({ user, passwordHash: oldHash });
+
+		expect(
+			await changeOwnPassword({
+				userId: user.id,
+				currentPassword: 'hunter2',
+				newPassword: 'correct horse battery staple',
+			}),
+		).toBe('changed');
+
+		expect(findUserCredentialById).toHaveBeenCalledWith(user.id);
+		expect(setPasswordHash).toHaveBeenCalledTimes(1);
+		const [storedId, storedHash] = vi.mocked(setPasswordHash).mock.calls[0];
+		expect(storedId).toBe(user.id);
+		expect(storedHash).not.toBe(oldHash);
+		// The stored value is a hash of the *new* password, and the old one no
+		// longer verifies against it.
+		expect(await verifyPassword('correct horse battery staple', storedHash)).toBe(true);
+		expect(await verifyPassword('hunter2', storedHash)).toBe(false);
+		expect(storedHash).not.toContain('correct horse battery staple');
+	});
+
+	it('rejects a wrong current password without writing anything', async () => {
+		vi.mocked(findUserCredentialById).mockResolvedValue({
+			user,
+			passwordHash: await hashPassword('hunter2'),
+		});
+
+		expect(
+			await changeOwnPassword({
+				userId: user.id,
+				currentPassword: 'nope',
+				newPassword: 'whatever-else',
+			}),
+		).toBe('invalid-current-password');
+		expect(setPasswordHash).not.toHaveBeenCalled();
+	});
+
+	it('fails closed for an account with no password set', async () => {
+		// The bootstrapped single-user admin is passwordless: a null hash must
+		// never be treated as "any current password matches".
+		vi.mocked(findUserCredentialById).mockResolvedValue({ user, passwordHash: null });
+
+		expect(
+			await changeOwnPassword({
+				userId: user.id,
+				currentPassword: 'anything',
+				newPassword: 'whatever-else',
+			}),
+		).toBe('no-password-set');
+		expect(setPasswordHash).not.toHaveBeenCalled();
+	});
+
+	it('reports an unknown user without writing anything', async () => {
+		vi.mocked(findUserCredentialById).mockResolvedValue(undefined);
+
+		expect(
+			await changeOwnPassword({
+				userId: user.id,
+				currentPassword: 'hunter2',
+				newPassword: 'whatever-else',
+			}),
+		).toBe('unknown-user');
+		expect(setPasswordHash).not.toHaveBeenCalled();
 	});
 });
 

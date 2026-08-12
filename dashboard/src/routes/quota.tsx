@@ -11,12 +11,19 @@ interface QuotaWindowProps {
 	resetsAt?: string;
 }
 
-function QuotaWindowCard({ name, usedPercent = 0, durationMins, resetsAt }: QuotaWindowProps) {
+export function QuotaWindowCard({
+	name,
+	usedPercent = 0,
+	durationMins,
+	resetsAt,
+}: QuotaWindowProps) {
 	const remainingPercent = Math.max(0, 100 - usedPercent);
 	const durationText = durationMins
-		? durationMins >= 1440
-			? `${Math.round(durationMins / 1440)}d`
-			: `${Math.round(durationMins / 60)}h`
+		? durationMins % 1440 === 0
+			? `${durationMins / 1440}d`
+			: durationMins % 60 === 0
+				? `${durationMins / 60}h`
+				: `${durationMins}m`
 		: '';
 
 	// Curated HSL colors matching styling rules
@@ -65,7 +72,7 @@ function QuotaWindowCard({ name, usedPercent = 0, durationMins, resetsAt }: Quot
 	);
 }
 
-function QuotaRouteComponent() {
+export function QuotaRouteComponent() {
 	const queryClient = useQueryClient();
 	const quotasQuery = useQuery(trpc.quota.getQuotas.queryOptions());
 
@@ -196,21 +203,16 @@ function QuotaRouteComponent() {
 											</div>
 										</div>
 
-										{/* Description / Plan / Credits Info */}
-										<div className="grid grid-cols-2 gap-4 border-t border-zinc-850 pt-4 text-xs">
-											<div>
-												<span className="text-zinc-500 block">Plan Tier</span>
-												<span className="text-zinc-300 font-medium capitalize">
-													{q.plan || 'Standard'}
-												</span>
-											</div>
-											{q.credits && (
+										{/* Credits Info — the plan tier this row used to share is deliberately
+										    not shown (issue #679): it is account/product detail, not a quota. */}
+										{q.credits && (
+											<div className="grid grid-cols-2 gap-4 border-t border-zinc-850 pt-4 text-xs">
 												<div>
 													<span className="text-zinc-500 block">Credits / Resets</span>
 													<span className="text-zinc-300 font-medium font-mono">{q.credits}</span>
 												</div>
-											)}
-										</div>
+											</div>
+										)}
 
 										{/* Windows & Usage */}
 										{q.windows && q.windows.length > 0 ? (
@@ -219,9 +221,9 @@ function QuotaRouteComponent() {
 													Usage Windows
 												</span>
 												<div className="space-y-3">
-													{q.windows.map((w) => (
+													{q.windows.map((w, index) => (
 														<QuotaWindowCard
-															key={w.name}
+															key={w.sourceSlot ?? index}
 															name={w.name}
 															usedPercent={w.usedPercent}
 															durationMins={w.durationMins}

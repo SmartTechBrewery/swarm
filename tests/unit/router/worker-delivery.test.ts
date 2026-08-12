@@ -14,6 +14,7 @@ import {
 	handleFindWorkItemByMarker,
 	handleFindWorkItemForArtifact,
 	handleListBlockers,
+	handleListDependents,
 	handleMarkReviewVerdict,
 	handleMoveWorkItem,
 	handlePostComment,
@@ -79,6 +80,7 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 		updateWorkItem: vi.fn(),
 		addLabel: vi.fn(),
 		listBlockers: vi.fn(),
+		listDependents: vi.fn(),
 		addBlockedBy: vi.fn(),
 		...overrides,
 	};
@@ -842,6 +844,85 @@ describe('handleListBlockers', () => {
 					deps,
 					CREDENTIAL,
 					blockersBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+});
+
+// Issue #639 — the reverse edge, served for the same reason as the blockers read:
+// the cycle backstop runs inside the phase, so it runs on the worker.
+describe('handleListDependents', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function dependentsBody(overrides: Record<string, unknown> = {}) {
+		return {
+			projectId: 'swarm',
+			itemId: 'PVTI_item1',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('reads the items it blocks under the server-side PM credential', async () => {
+		const dependents = [
+			{
+				reference: '#631',
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/631',
+				title: 'Per-provider PM credentials',
+				open: true,
+			},
+		];
+		const listDependents = vi.fn().mockResolvedValue(dependents);
+		const deps = makeDeps({ buildPmProvider: vi.fn(() => makePmProvider({ listDependents })) });
+
+		const result = await handleListDependents(deps, CREDENTIAL, dependentsBody());
+
+		expect(result.status).toBe(200);
+		expect(result.json).toEqual({ dependents });
+		expect(listDependents).toHaveBeenCalledWith('PVTI_item1');
+	});
+
+	it('passes through an empty list for an item that blocks nothing', async () => {
+		const deps = makeDeps({
+			buildPmProvider: vi.fn(() =>
+				makePmProvider({ listDependents: vi.fn().mockResolvedValue([]) }),
+			),
+		});
+		expect((await handleListDependents(deps, CREDENTIAL, dependentsBody())).json).toEqual({
+			dependents: [],
+		});
+	});
+
+	it('enforces auth and enrollment before touching the PM credential', async () => {
+		const unknownWorker = makeDeps({
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+		expect((await handleListDependents(unknownWorker, 'bogus', dependentsBody())).status).toBe(401);
+		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
+
+		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		expect((await handleListDependents(unenrolled, CREDENTIAL, dependentsBody())).status).toBe(403);
+		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
+
+		const deps = makeDeps();
+		expect(
+			(await handleListDependents(deps, CREDENTIAL, dependentsBody({ projectId: 'nope' }))).status,
+		).toBe(404);
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+		expect(
+			(await handleListDependents(deps, CREDENTIAL, dependentsBody({ itemId: '' }))).status,
+		).toBe(400);
+		expect(
+			(
+				await handleListDependents(
+					deps,
+					CREDENTIAL,
+					dependentsBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
 				)
 			).status,
 		).toBe(400);

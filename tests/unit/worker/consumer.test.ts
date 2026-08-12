@@ -3630,6 +3630,9 @@ describe('processJob', () => {
 			expect(createRun).toHaveBeenCalledExactlyOnceWith(
 				expect.objectContaining({
 					projectId: PROJECT.id,
+					// The repository the run acted on, recorded on the row rather than left
+					// to be joined back through the project later (issue #683).
+					repository: PROJECT.repo,
 					taskId: '17',
 					phase: 'review',
 					workItemId: undefined,
@@ -3896,6 +3899,7 @@ describe('processJob', () => {
 			expect(createRun).toHaveBeenCalledExactlyOnceWith(
 				expect.objectContaining({
 					projectId: projectWithAgents.id,
+					repository: projectWithAgents.repo,
 					taskId: '10',
 					phase: 'planning',
 					workItemId: workItem.id,

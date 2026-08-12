@@ -25,8 +25,8 @@ export interface BoardMappingForm {
 	statusOptions: Record<PmStatusKey, string>;
 	/**
 	 * Opaque provider scope carried through to save time — for GitHub Projects the
-	 * `{ statusFieldId }` state discovery returns, for Jira the `{ baseUrl }` the
-	 * stored mapping was read with; empty for a provider whose state ids are the
+	 * `{ statusFieldId }` state discovery returns, for Jira the `{ baseUrl }` held in
+	 * the persisted mapping or incoming-provider draft; empty for a provider whose state ids are the
 	 * whole mapping, such as Linear. Cleared on a provider switch so one provider's
 	 * scope can't be saved as another's, and its *container-scoped* half (GitHub's
 	 * field id) is cleared on a container switch too — a site URL is not a property
@@ -35,6 +35,13 @@ export interface BoardMappingForm {
 	 */
 	providerContext: Record<string, string>;
 }
+
+/**
+ * A PM provider id — the `pm` union's own discriminator, so every provider-scoped
+ * call the tab makes (discovery, credentials) is typed against the same closed
+ * vocabulary the API validates against (`PmProviderIdSchema`, `src/pm/events.ts`).
+ */
+export type PmProviderId = ProjectPm['type'];
 
 type GitHubProjectsPm = Extract<ProjectPm, { type: 'github-projects' }>;
 type LinearPm = Extract<ProjectPm, { type: 'linear' }>;
@@ -70,7 +77,13 @@ export const STATUS_KEYS = PM_STATUS_KEYS;
  * backend can't discover.
  */
 export interface PmMappingProvider {
-	id: string;
+	/**
+	 * The provider id, typed to the `pm` union's own discriminator rather than a bare
+	 * string, so a catalogue id can be handed straight to a provider-scoped API call
+	 * (`pm.discoverContainers`, `projects.credentials.listPm`) without a cast — the
+	 * catalogue is hand-kept, and this is what keeps a typo in it a compile error.
+	 */
+	id: PmProviderId;
 	/** Provider display name for the selector and headings. */
 	label: string;
 	/** Noun for a board/container (e.g. "board", "project"), used in picker copy. */
@@ -122,7 +135,7 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		stateNoun: 'status',
 		stateNounPlural: 'statuses',
 		intro:
-			"Pick this project's Jira project, then map each SWARM pipeline status to one of its workflow statuses. Projects and statuses are discovered server-side with this project's own board credential, configured under Credentials above. The Jira site URL is board identity, set in swarm.config.json and preserved by this screen.",
+			"Enter this project's Jira site URL, pick its Jira project, then map each SWARM pipeline status to one of its workflow statuses. Projects and statuses are discovered server-side with this project's own board credential, configured under Credentials above.",
 	},
 	{
 		id: 'trello',
@@ -152,8 +165,36 @@ export function getPmMappingProvider(providerId: string): PmMappingProvider {
  * that gets built and the rules that gate saving it can never disagree about which
  * provider is being edited.
  */
-function selectedProviderId(form: BoardMappingForm): string {
+function selectedProviderId(form: BoardMappingForm): PmProviderId {
 	return getPmMappingProvider(form.providerId).id;
+}
+
+/**
+ * The provider every provider-scoped call on the tab addresses — the form's selection,
+ * normalized through the catalogue. It is the *draft* provider while a switch is open
+ * and the persisted one otherwise, which is exactly the ordering the switch flow needs:
+ * credentials are entered, and boards discovered, for the provider the operator is
+ * moving to before anything is written (issue #642).
+ */
+export function selectedPmProviderId(form: BoardMappingForm): PmProviderId {
+	return selectedProviderId(form);
+}
+
+/**
+ * The provider a pending switch selects, or `undefined` when the form is on the one the
+ * project is persisted on.
+ *
+ * Derived rather than held as a second piece of state: an open draft *is* "the form
+ * selects a provider the project isn't on", so there is nothing to keep in sync — a
+ * successful save closes the draft by making the two agree, and Reset closes it by
+ * reprojecting the form from `pm`.
+ */
+export function switchedPmProviderId(
+	form: BoardMappingForm,
+	pm: ProjectPm | undefined,
+): PmProviderId | undefined {
+	const selected = selectedProviderId(form);
+	return selected === (pm?.type ?? DEFAULT_PM_PROVIDER_ID) ? undefined : selected;
 }
 
 /**
@@ -170,10 +211,8 @@ function usesStatusFieldContext(form: BoardMappingForm): boolean {
 /**
  * Whether the selected provider's member carries a site base URL the mapping is
  * incomplete without. Jira's `baseUrl` names the Cloud site its project key and
- * status ids belong to; it is board identity set in `swarm.config.json` rather than
- * edited here (issue #490 phase 1/6), so this screen only has to carry it through a
- * save — and refuse to write a member without one instead of letting
- * `jiraConfigSchema` reject it after the fact.
+ * status ids belong to; it is collected in the incoming-provider draft and carried
+ * through the final save rather than being persisted independently.
  */
 function requiresBaseUrl(form: BoardMappingForm): boolean {
 	return selectedProviderId(form) === 'jira';
@@ -193,6 +232,17 @@ export function isBaseUrlMissing(form: BoardMappingForm): boolean {
 	return requiresBaseUrl(form) && !baseUrlOf(form);
 }
 
+/** Whether the Jira site URL is non-empty but not a URL the persisted schema accepts. */
+export function isBaseUrlInvalid(form: BoardMappingForm): boolean {
+	if (!requiresBaseUrl(form) || isBaseUrlMissing(form)) return false;
+	try {
+		new URL(baseUrlOf(form));
+		return false;
+	} catch {
+		return true;
+	}
+}
+
 /** An empty option map with every canonical key present, for seeding blank state. */
 export function blankStatusOptions(): Record<PmStatusKey, string> {
 	return Object.fromEntries(STATUS_KEYS.map((key) => [key, ''])) as Record<PmStatusKey, string>;
@@ -207,6 +257,18 @@ export function withSelectedProvider(form: BoardMappingForm, providerId: string)
 		containerId: '',
 		statusOptions: blankStatusOptions(),
 		providerContext: {},
+	};
+}
+
+/** Update one provider-owned draft value without carrying another provider's context. */
+export function withProviderContext(
+	form: BoardMappingForm,
+	key: string,
+	value: string,
+): BoardMappingForm {
+	return {
+		...form,
+		providerContext: { ...form.providerContext, [key]: value },
 	};
 }
 
@@ -315,11 +377,8 @@ export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | unde
 		return trello;
 	}
 	if (selectedProviderId(form) === 'jira') {
-		// The site URL isn't edited here: it comes from the form's carried context,
-		// which `toBoardMappingForm` seeded from the stored Jira member and which is
-		// blank when the stored member is another provider's — the case
-		// `canSaveBoardMapping` refuses rather than writing a member Jira's schema
-		// would then reject.
+		// The site URL comes from Jira's persisted mapping or incoming-provider draft;
+		// the final write is the only place that draft becomes project configuration.
 		const jira: JiraPm = {
 			type: 'jira',
 			baseUrl: baseUrlOf(form),
@@ -373,13 +432,13 @@ export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | unde
  * `jiraConfigSchema`, `trelloConfigSchema`) rather than requiring every status be
  * mapped — plus each
  * provider's own required context: a known Status-field context for GitHub Projects,
- * a carried site base URL for Jira. The route additionally gates Save on the form
+ * a valid site base URL for Jira. The route additionally gates Save on the form
  * being dirty and no other config write being in flight.
  */
 export function canSaveBoardMapping(form: BoardMappingForm): boolean {
 	if (!form.containerId.trim()) return false;
 	if (usesStatusFieldContext(form) && !(form.providerContext.statusFieldId ?? '').trim())
 		return false;
-	if (isBaseUrlMissing(form)) return false;
+	if (isBaseUrlMissing(form) || isBaseUrlInvalid(form)) return false;
 	return STATUS_KEYS.some((key) => !!form.statusOptions[key]?.trim());
 }

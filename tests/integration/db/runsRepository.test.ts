@@ -10,10 +10,11 @@ import {
 import { deleteProjectFromDb } from '../../../src/db/repositories/projectsRepository.js';
 import {
 	appendRunOutputEvents,
+	type CreateRunInput,
 	cancelDeferredRunInDb,
 	clearRunRecovery,
 	completeRun,
-	createRun,
+	createRun as createRunRow,
 	failOrphanedRunningRuns,
 	failStaleRunningRuns,
 	findBoardItemIdForTask,
@@ -49,6 +50,16 @@ import { seedProject } from '../helpers/seed.js';
 
 // `runs.project_id` FKs `projects`, so every run needs a seeded project first.
 const PROJECT_ID = 'proj-runs';
+/** The repository `seedProject` below gives `PROJECT_ID`, i.e. what its runs act on. */
+const REPO = 'jkwiecien/runs-repo';
+
+/**
+ * `createRun` with the run's repository defaulted (issue #683), so the cases below
+ * state only what they exercise. The tests that are *about* the column call
+ * `createRunRow` directly.
+ */
+const createRun = (input: Omit<CreateRunInput, 'repository'> & { repository?: string }) =>
+	createRunRow({ repository: REPO, ...input });
 
 /** A registered worker plus the user who owns it — the attribution record's two ids. */
 async function seedWorker(label: string): Promise<{ worker: Worker; owner: SwarmUser }> {
@@ -167,6 +178,20 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			const row = await getRunByIdFromDb(id);
 			expect(row?.workerId).toBeNull();
 			expect(row?.workerUserId).toBeNull();
+		});
+
+		it('records the repository the run acts on (issue #683)', async () => {
+			const id = await createRunRow({
+				projectId: PROJECT_ID,
+				repository: 'jkwiecien/other-repo',
+				taskId: '683',
+				phase: 'implementation',
+			});
+
+			const row = await getRunByIdFromDb(id);
+			// Whatever the caller stated, not whatever the owning project happens to
+			// hold — the point of the column once a project spans several repos.
+			expect(row?.repository).toBe('jkwiecien/other-repo');
 		});
 
 		it('keeps the attribution user when the worker row is removed (issue #398)', async () => {
@@ -483,6 +508,20 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(row?.durationMs).toBeNull();
 			expect(row?.usage).toBeNull();
 			expect(row?.failureDiagnosis).toBeNull();
+		});
+
+		it('leaves the recorded repository alone so a retry keeps the repo it ran against (issue #683)', async () => {
+			const id = await createRunRow({
+				projectId: PROJECT_ID,
+				repository: 'jkwiecien/other-repo',
+				taskId: '683-retry',
+				phase: 'implementation',
+			});
+			await completeRun(id, { status: 'failed', engine: 'claude', error: 'boom' });
+
+			await resetRunToRunning(id);
+
+			expect((await getRunByIdFromDb(id))?.repository).toBe('jkwiecien/other-repo');
 		});
 
 		it('clears a prior Review verdict so a re-running row shows no stale verdict (issue #218)', async () => {
@@ -1308,6 +1347,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				.insert(runs)
 				.values({
 					projectId: overrides.projectId ?? PROJECT_ID,
+					repository: REPO,
 					taskId: 't',
 					phase: overrides.phase ?? 'review',
 					status: overrides.status ?? 'running',

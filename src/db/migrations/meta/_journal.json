@@ -320,8 +320,29 @@
     {
       "idx": 45,
       "version": "7",
-      "when": 1786548517352,
-      "tag": "0045_worker_repository",
+      "when": 1786194000000,
+      "tag": "0045_scm_credentials_per_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1786453200000,
+      "tag": "0046_pm_credentials_per_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1786547620091,
+      "tag": "0047_run_repository",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1786549456378,
+      "tag": "0048_clumsy_sphinx",
       "breakpoints": true
     }
   ]

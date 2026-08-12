@@ -22,6 +22,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { BoardMappingPanel } from '@/components/projects/board-mapping-panel.js';
 import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
 import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.js';
+import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
+import { PmProviderSwitchDialog } from '@/components/projects/pm-provider-switch-dialog.js';
+import { ProjectAdminOnly } from '@/components/projects/project-admin-only.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
@@ -45,7 +48,10 @@ import {
 	type BoardMappingForm,
 	buildPmUpdate,
 	isBoardMappingDirty,
+	selectedPmProviderId,
+	switchedPmProviderId,
 	toBoardMappingForm,
+	withProviderContext,
 	withSelectedContainer,
 	withSelectedProvider,
 } from '@/lib/board-mapping.js';
@@ -73,12 +79,14 @@ import {
 } from '@/lib/pipeline-enabled.js';
 import {
 	agentConfigSearch,
+	isProjectAdminTab,
 	PROJECT_PHASES as PHASES,
 	type ProjectTab,
 	phaseDetailSearch,
 	projectDetailSearchSchema,
 	resolveActiveTab,
 	tabSearch,
+	viewerAdministersProject,
 } from '@/lib/project-nav.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
@@ -1733,10 +1741,18 @@ export interface ProjectSyncFlags {
  * leaves `agents` unchanged here and the user's open target/timeout/prompt edits
  * survive — the two save paths stay independent (#369). A first sync (`prev`
  * undefined) reports every slice changed so the form seeds from the initial load.
+ *
+ * `boardMappingDraftProviderId` extends that protection one step further for the one
+ * slice whose edits span several steps: while a PM provider switch is open (issue #642),
+ * the `boardMapping` slice never reports changed, so a background refetch — or another
+ * tab's write landing on `pm` — cannot discard a half-built mapping for the incoming
+ * provider. It deliberately does not gate the first sync: a draft presupposes a loaded
+ * project, so there is none to protect before the form has seeded at all.
  */
 export function diffProjectForSync(
 	prev: ProjectConfig | undefined,
 	next: ProjectConfig,
+	boardMappingDraftProviderId?: string,
 ): ProjectSyncFlags {
 	if (!prev) {
 		return { general: true, agents: true, pipeline: true, boardMapping: true };
@@ -1752,7 +1768,8 @@ export function diffProjectForSync(
 			next.maxConcurrentJobs !== prev.maxConcurrentJobs,
 		agents: JSON.stringify(next.agents) !== JSON.stringify(prev.agents),
 		pipeline: JSON.stringify(next.pipeline) !== JSON.stringify(prev.pipeline),
-		boardMapping: JSON.stringify(next.pm) !== JSON.stringify(prev.pm),
+		boardMapping:
+			!boardMappingDraftProviderId && JSON.stringify(next.pm) !== JSON.stringify(prev.pm),
 	};
 }
 
@@ -1772,17 +1789,28 @@ const PROJECT_TAB_ITEMS: ReadonlyArray<{ tab: ProjectTab; label: string; icon: L
 	{ tab: 'credentials', label: 'Source Control', icon: GitBranch },
 ];
 
-/** The horizontal tab bar, rendered from {@link PROJECT_TAB_ITEMS}. */
+/**
+ * The horizontal tab bar, rendered from {@link PROJECT_TAB_ITEMS}. A viewer who does
+ * not administer the project is offered only the operational tabs (issue #655): the
+ * configuration ones are omitted rather than shown disabled, since there is nothing
+ * on them for a non-administrator to read. `ProjectAdminOnly` is the boundary either
+ * way — this only avoids drawing a link to a screen it would deny.
+ */
 export function ProjectTabBar({
 	activeTab,
+	canAdminister,
 	onSelect,
 }: {
 	activeTab: ProjectTab;
+	canAdminister: boolean;
 	onSelect: (tab: ProjectTab) => void;
 }) {
+	const items = canAdminister
+		? PROJECT_TAB_ITEMS
+		: PROJECT_TAB_ITEMS.filter(({ tab }) => !isProjectAdminTab(tab));
 	return (
 		<div className="flex border-b border-zinc-800">
-			{PROJECT_TAB_ITEMS.map(({ tab, label, icon: Icon }) => (
+			{items.map(({ tab, label, icon: Icon }) => (
 				<button
 					key={tab}
 					type="button"
@@ -1836,6 +1864,22 @@ function ProjectDetailRouteComponent() {
 		...trpc.projects.getById.queryOptions({ id: projectId }),
 	});
 
+	/**
+	 * Whether this viewer administers the project — the one thing that decides which
+	 * tabs the screen offers and renders (issue #655). Read from the server rather
+	 * than inferred from the installation role, so a `projectAdmin` who is not an
+	 * `instanceAdmin` keeps the configuration tabs and an `instanceAdmin` who is not a
+	 * member still gets them.
+	 *
+	 * `viewerAdministersProject` fails closed on an absent read (still loading, or the
+	 * query failed); the load is awaited below alongside the project's, so the
+	 * configuration tabs never flash in and back out.
+	 */
+	const accessQuery = useQuery({
+		...trpc.projects.viewerAccess.queryOptions({ projectId }),
+	});
+	const canAdminister = viewerAdministersProject(accessQuery.data);
+
 	const lastSyncedProjectRef = useRef<typeof project>(undefined);
 
 	const [name, setName] = useState('');
@@ -1862,8 +1906,29 @@ function ProjectDetailRouteComponent() {
 	const [boardMapping, setBoardMapping] = useState<BoardMappingForm>(() =>
 		toBoardMappingForm(undefined),
 	);
+	// The review step in front of a provider switch's single write (issue #642); an
+	// ordinary mapping edit never opens it.
+	const [switchConfirmOpen, setSwitchConfirmOpen] = useState(false);
 
 	const project = projectQuery.data;
+
+	/**
+	 * The Project Management tab's provider switch, held entirely client-side (issue
+	 * #642): nothing is written until Save, so the project never names a provider whose
+	 * mapping is absent or still the previous provider's, and abandoning the flow leaves
+	 * the stored configuration exactly as it was.
+	 *
+	 * Both values are *derived* from the mapping form rather than kept as separate state:
+	 * an open draft is precisely "the form selects a provider the project isn't on", so a
+	 * successful save closes it by making the two agree and Reset closes it by
+	 * reprojecting the form from `project.pm` — with no second copy that could disagree
+	 * about which provider is being configured.
+	 */
+	const pmProviderId = selectedPmProviderId(boardMapping);
+	const pmDraftProviderId = useMemo(
+		() => switchedPmProviderId(boardMapping, project?.pm),
+		[boardMapping, project],
+	);
 
 	const handleInputChange =
 		(setter: (val: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1879,7 +1944,9 @@ function ProjectDetailRouteComponent() {
 			// `pipeline`) from resetting unsaved Agents/General/Board edits when its
 			// success `setQueryData` — or any concurrent refetch — updates the cache
 			// (#369). See {@link diffProjectForSync}.
-			const changed = diffProjectForSync(lastSyncedProjectRef.current, project);
+			// An open provider switch additionally freezes the `boardMapping` slice, so a
+			// refetch can't discard a mapping being built for the incoming provider.
+			const changed = diffProjectForSync(lastSyncedProjectRef.current, project, pmDraftProviderId);
 
 			if (changed.general) {
 				setName(project.name);
@@ -1910,7 +1977,7 @@ function ProjectDetailRouteComponent() {
 
 			lastSyncedProjectRef.current = project;
 		}
-	}, [project]);
+	}, [project, pmDraftProviderId]);
 
 	const updateMutation = useMutation({
 		mutationFn: (variables: {
@@ -2107,7 +2174,14 @@ function ProjectDetailRouteComponent() {
 	};
 
 	const handleBoardMappingProvider = (providerId: string) => {
-		setBoardMapping((prev) => withSelectedProvider(prev, providerId));
+		// Selecting the provider the project is already on cancels an open switch, so it
+		// restores the stored mapping rather than blanking the form the way a *move* to
+		// another provider does.
+		setBoardMapping((prev) =>
+			providerId === project?.pm.type
+				? toBoardMappingForm(project.pm)
+				: withSelectedProvider(prev, providerId),
+		);
 		updateMutation.reset();
 	};
 
@@ -2128,22 +2202,48 @@ function ProjectDetailRouteComponent() {
 		updateMutation.reset();
 	};
 
+	const handleBoardMappingProviderContext = (key: string, value: string) => {
+		setBoardMapping((prev) => withProviderContext(prev, key, value));
+		updateMutation.reset();
+	};
+
 	const handleBoardMappingStatesContext = (context: Record<string, string>) => {
 		setBoardMapping((prev) => ({ ...prev, providerContext: context }));
 	};
 
+	// Reset already reprojects from the stored member, which is also what drops an open
+	// provider switch: the form goes back to the persisted provider and its mapping.
 	const handleBoardMappingReset = () => {
 		setBoardMapping(toBoardMappingForm(project?.pm));
+		setSwitchConfirmOpen(false);
 		updateMutation.reset();
+	};
+
+	/**
+	 * The single `projects.update` write that persists the mapping — the whole new `pm`
+	 * union member, discriminator included, so a provider switch is one atomic change
+	 * rather than a sequence with an invalid state in the middle. `buildPmUpdate` reads
+	 * nothing from the outgoing member across a switch, and `credentials.pm` is untouched
+	 * here, so the outgoing provider's credentials are retained.
+	 */
+	const saveBoardMapping = () => {
+		setSwitchConfirmOpen(false);
+		updateMutation.mutate({
+			id: projectId,
+			pm: buildPmUpdate(boardMapping, project?.pm),
+		});
 	};
 
 	const handleBoardMappingSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		if (configWriteInFlight) return;
-		updateMutation.mutate({
-			id: projectId,
-			pm: buildPmUpdate(boardMapping, project?.pm),
-		});
+		// A provider switch has consequences the form can't show (retained credentials,
+		// in-flight runs left pointing at the outgoing board), so it is reviewed first.
+		if (pmDraftProviderId) {
+			setSwitchConfirmOpen(true);
+			return;
+		}
+		saveBoardMapping();
 	};
 
 	const handleReset = () => {
@@ -2181,7 +2281,10 @@ function ProjectDetailRouteComponent() {
 		});
 	};
 
-	if (projectQuery.isLoading) {
+	// Both loads gate the screen: rendering before the viewer's access resolves would
+	// show the tab bar and the resolved tab as a non-administrator's for a frame, then
+	// swap them (issue #655). The two queries run in parallel, so this costs no round trip.
+	if ([projectQuery, accessQuery].some((query) => query.isLoading)) {
 		return <div className="text-sm text-zinc-400">Loading project settings…</div>;
 	}
 
@@ -2219,128 +2322,157 @@ function ProjectDetailRouteComponent() {
 			</div>
 
 			{/* Horizontal Tab Bar */}
-			<ProjectTabBar activeTab={activeTab} onSelect={goToTab} />
+			<ProjectTabBar activeTab={activeTab} canAdminister={canAdminister} onSelect={goToTab} />
 
+			{/* Runs and Workers are the project-scoped operational views every enrolled
+			    member keeps (issue #655); everything below `ProjectAdminOnly` configures
+			    the project or manages its credentials, and is the administrator's alone. */}
 			{activeTab === 'runs' && <ProjectRunsPanel projectId={projectId} />}
 
 			{/* This project's worker roster (issue #574) — the same component `/workers`
 			    renders, scoped server-side to the machines enrolled here. */}
 			{activeTab === 'workers' && <WorkersRoster projectId={projectId} />}
 
-			{/* Form Card - General Settings */}
-			{activeTab === 'general' && (
-				<GeneralSettingsForm
-					name={name}
-					repo={repo}
-					repoRoot={repoRoot}
-					worktreeRoot={worktreeRoot}
-					baseBranch={baseBranch}
-					branchPrefix={branchPrefix}
-					maxConcurrentJobs={maxConcurrentJobs}
-					maxConcurrentJobsError={maxConcurrentJobsError}
-					setName={setName}
-					setRepo={setRepo}
-					setRepoRoot={setRepoRoot}
-					setWorktreeRoot={setWorktreeRoot}
-					setBaseBranch={setBaseBranch}
-					setBranchPrefix={setBranchPrefix}
-					setMaxConcurrentJobs={setMaxConcurrentJobs}
-					handleInputChange={handleInputChange}
-					handleSubmit={handleSubmit}
-					handleReset={handleReset}
-					isDirty={isDirty}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-				/>
-			)}
-
-			{/* Form Card - Agent Configuration */}
-			{activeTab === 'agents' && (
-				<AgentConfigurationForm
-					agents={agents}
-					pipelineEnabled={pipelineEnabled}
-					pipelineAutoAdvance={pipelineAutoAdvance}
-					selectedPhase={selectedPhase}
-					onSelectPhase={openPhase}
-					onBack={backToAgentConfig}
-					handleEnabledChange={handleEnabledChange}
-					handleAutoAdvanceChange={handleAutoAdvanceChange}
-					handleTargetChange={handleTargetChange}
-					handleAddTarget={handleAddTarget}
-					handleRemoveTarget={handleRemoveTarget}
-					handleMoveTarget={handleMoveTarget}
-					handleTimeoutChange={handleTimeoutChange}
-					handlePromptChange={handlePromptChange}
-					handleSubmit={handleAgentsSubmit}
-					handleReset={handleAgentsReset}
-					isDirty={isAgentsDirty}
-					hasValidationError={hasAgentValidationError}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-					savingToggleKey={savingToggleKey}
-					toggleErrorMessage={toggleErrorMessage}
-				/>
-			)}
-
-			{activeTab === 'pipeline' && (
-				<PipelineSettingsForm
-					autoMerge={autoMerge}
-					setAutoMerge={(value) => {
-						setAutoMerge(value);
-						updateMutation.reset();
-					}}
-					skipRespondToReviewOnMinors={skipRespondToReviewOnMinors}
-					setSkipRespondToReviewOnMinors={(value) => {
-						setSkipRespondToReviewOnMinors(value);
-						updateMutation.reset();
-					}}
-					reviewChecksPolicy={reviewChecksPolicy}
-					setReviewChecksPolicy={(value) => {
-						setReviewChecksPolicy(value);
-						updateMutation.reset();
-					}}
-					handleSubmit={handlePipelineSubmit}
-					handleReset={handlePipelineReset}
-					isDirty={isPipelineDirty}
-					isPending={configWriteInFlight}
-					isSuccess={updateMutation.isSuccess}
-					isError={updateMutation.isError}
-					errorMessage={updateMutation.error?.message}
-				/>
-			)}
-
-			{/*
-			 * Project Management (issue #537): one tab, three coherent sections — the
-			 * provider and its declared credentials, then the board picker, then the
-			 * status mapping. The credential panel owns its own queries, so it renders
-			 * above the mapping form rather than inside it.
-			 */}
-			{activeTab === 'projectManagement' && (
-				<div className="space-y-6">
-					<PmCredentialsPanel projectId={projectId} />
-					<BoardMappingPanel
-						projectId={projectId}
-						form={boardMapping}
-						onProviderChange={handleBoardMappingProvider}
-						onSelectContainer={handleBoardMappingSelectContainer}
-						onStatusOptionChange={handleBoardMappingStatusOption}
-						onStatesContext={handleBoardMappingStatesContext}
-						handleSubmit={handleBoardMappingSubmit}
-						handleReset={handleBoardMappingReset}
-						isDirty={isBoardMappingFormDirty}
+			<ProjectAdminOnly tab={activeTab} canAdminister={canAdminister}>
+				{/* Form Card - General Settings */}
+				{activeTab === 'general' && (
+					<GeneralSettingsForm
+						name={name}
+						repo={repo}
+						repoRoot={repoRoot}
+						worktreeRoot={worktreeRoot}
+						baseBranch={baseBranch}
+						branchPrefix={branchPrefix}
+						maxConcurrentJobs={maxConcurrentJobs}
+						maxConcurrentJobsError={maxConcurrentJobsError}
+						setName={setName}
+						setRepo={setRepo}
+						setRepoRoot={setRepoRoot}
+						setWorktreeRoot={setWorktreeRoot}
+						setBaseBranch={setBaseBranch}
+						setBranchPrefix={setBranchPrefix}
+						setMaxConcurrentJobs={setMaxConcurrentJobs}
+						handleInputChange={handleInputChange}
+						handleSubmit={handleSubmit}
+						handleReset={handleReset}
+						isDirty={isDirty}
 						isPending={configWriteInFlight}
 						isSuccess={updateMutation.isSuccess}
 						isError={updateMutation.isError}
 						errorMessage={updateMutation.error?.message}
 					/>
-				</div>
-			)}
+				)}
 
-			{activeTab === 'credentials' && <CredentialsPanel projectId={projectId} />}
+				{/* Form Card - Agent Configuration */}
+				{activeTab === 'agents' && (
+					<AgentConfigurationForm
+						agents={agents}
+						pipelineEnabled={pipelineEnabled}
+						pipelineAutoAdvance={pipelineAutoAdvance}
+						selectedPhase={selectedPhase}
+						onSelectPhase={openPhase}
+						onBack={backToAgentConfig}
+						handleEnabledChange={handleEnabledChange}
+						handleAutoAdvanceChange={handleAutoAdvanceChange}
+						handleTargetChange={handleTargetChange}
+						handleAddTarget={handleAddTarget}
+						handleRemoveTarget={handleRemoveTarget}
+						handleMoveTarget={handleMoveTarget}
+						handleTimeoutChange={handleTimeoutChange}
+						handlePromptChange={handlePromptChange}
+						handleSubmit={handleAgentsSubmit}
+						handleReset={handleAgentsReset}
+						isDirty={isAgentsDirty}
+						hasValidationError={hasAgentValidationError}
+						isPending={configWriteInFlight}
+						isSuccess={updateMutation.isSuccess}
+						isError={updateMutation.isError}
+						errorMessage={updateMutation.error?.message}
+						savingToggleKey={savingToggleKey}
+						toggleErrorMessage={toggleErrorMessage}
+					/>
+				)}
+
+				{activeTab === 'pipeline' && (
+					<PipelineSettingsForm
+						autoMerge={autoMerge}
+						setAutoMerge={(value) => {
+							setAutoMerge(value);
+							updateMutation.reset();
+						}}
+						skipRespondToReviewOnMinors={skipRespondToReviewOnMinors}
+						setSkipRespondToReviewOnMinors={(value) => {
+							setSkipRespondToReviewOnMinors(value);
+							updateMutation.reset();
+						}}
+						reviewChecksPolicy={reviewChecksPolicy}
+						setReviewChecksPolicy={(value) => {
+							setReviewChecksPolicy(value);
+							updateMutation.reset();
+						}}
+						handleSubmit={handlePipelineSubmit}
+						handleReset={handlePipelineReset}
+						isDirty={isPipelineDirty}
+						isPending={configWriteInFlight}
+						isSuccess={updateMutation.isSuccess}
+						isError={updateMutation.isError}
+						errorMessage={updateMutation.error?.message}
+					/>
+				)}
+
+				{/*
+				 * Project Management (issue #537): one tab, four coherent cards in the order
+				 * the settings depend on each other — the provider (issue #630), then its
+				 * declared credentials, then the board picker, then the status mapping. The
+				 * provider and credential panels own their own queries, so they render above
+				 * the mapping form rather than inside it.
+				 *
+				 * That order *is* the provider switch (issue #642): the same four cards, scoped
+				 * to the draft provider and each staged behind its predecessor, are what resolve
+				 * the circular dependency between "which provider" and "which board" — no wizard,
+				 * and no invalid intermediate write, since the whole new member goes in one save.
+				 */}
+				{activeTab === 'projectManagement' && (
+					<div className="space-y-6">
+						<PmProviderPanel
+							projectId={projectId}
+							providerId={boardMapping.providerId}
+							persistedProviderId={project?.pm.type ?? boardMapping.providerId}
+							onProviderChange={handleBoardMappingProvider}
+							isPending={configWriteInFlight}
+						/>
+						{/* Scoped to the draft provider while a switch is open, so the incoming
+					    provider's own roles are entered — and its boards discovered — before the
+					    switch is written (issue #641's provider parameter). */}
+						<PmCredentialsPanel projectId={projectId} providerId={pmProviderId} />
+						<BoardMappingPanel
+							projectId={projectId}
+							form={boardMapping}
+							onSelectContainer={handleBoardMappingSelectContainer}
+							onStatusOptionChange={handleBoardMappingStatusOption}
+							onProviderContextChange={handleBoardMappingProviderContext}
+							onStatesContext={handleBoardMappingStatesContext}
+							handleSubmit={handleBoardMappingSubmit}
+							handleReset={handleBoardMappingReset}
+							isDirty={isBoardMappingFormDirty}
+							isPending={configWriteInFlight}
+							isSuccess={updateMutation.isSuccess}
+							isError={updateMutation.isError}
+							errorMessage={updateMutation.error?.message}
+						/>
+						<PmProviderSwitchDialog
+							open={switchConfirmOpen && !!pmDraftProviderId}
+							fromProviderId={project?.pm.type ?? ''}
+							toProviderId={pmDraftProviderId ?? ''}
+							isPending={configWriteInFlight}
+							onConfirm={saveBoardMapping}
+							onCancel={() => setSwitchConfirmOpen(false)}
+						/>
+					</div>
+				)}
+
+				{activeTab === 'credentials' && <CredentialsPanel projectId={projectId} />}
+			</ProjectAdminOnly>
 		</div>
 	);
 }

@@ -1,5 +1,5 @@
 import { DrizzleQueryError } from 'drizzle-orm';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	listAllProjectsFromDb: vi.fn(),
@@ -27,6 +27,7 @@ vi.mock('@/db/repositories/projectMembershipRequestsRepository.js', () => ({
 vi.mock('@/identity/membership-service.js', () => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
+	listProjectsForUser: vi.fn(),
 }));
 
 import { DEFAULT_PM_CONFIG, projectsRouter } from '@/api/routers/projects.js';
@@ -56,13 +57,22 @@ import {
 	type ProjectRole,
 } from '@/identity/membership.js';
 import type { MembershipRequest } from '@/identity/membership-request.js';
-import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
+import {
+	getMembership,
+	listAccessibleProjectIds,
+	listProjectsForUser,
+} from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import type { PMProviderManifest } from '@/integrations/pm/manifest.js';
 import {
 	_resetPMProviderRegistryForTesting,
 	registerPMProvider,
 } from '@/integrations/pm/registry.js';
+import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
+import {
+	_resetSCMProviderRegistryForTesting,
+	registerSCMProvider,
+} from '@/integrations/scm/registry.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
 
 const ADMIN_USER: SwarmUser = {
@@ -127,6 +137,8 @@ describe('projectsRouter', () => {
 		vi.mocked(addMember).mockResolvedValue(membershipFor('projectAdmin'));
 		vi.mocked(getMembership).mockReset();
 		vi.mocked(listAccessibleProjectIds).mockReset();
+		vi.mocked(listProjectsForUser).mockReset();
+		vi.mocked(listProjectsForUser).mockResolvedValue([]);
 		vi.mocked(listDiscoverableProjectsFromDb).mockReset();
 		vi.mocked(createMembershipRequest).mockReset();
 		vi.mocked(getPendingRequest).mockReset();
@@ -155,6 +167,51 @@ describe('projectsRouter', () => {
 			const result = await caller.list();
 			expect(result).toEqual([]);
 			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	// Issue #661: the profile's My Projects tab. An instanceAdmin reaches every
+	// project, which is the case where "role" and "access" come apart.
+	describe('listMine', () => {
+		it('reports an instanceAdmin with no membership as having no role, rather than inventing one', async () => {
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+			]);
+			vi.mocked(listProjectsForUser).mockResolvedValue([]);
+
+			// `toEqual` on the whole result, so the projection is pinned: a config,
+			// credential, or board field cannot start riding along unnoticed.
+			await expect(caller.listMine()).resolves.toEqual([
+				{ id: 'p1', name: 'Alpha', role: null },
+				{ id: 'p2', name: 'Beta', role: null },
+			]);
+		});
+
+		it('reports the real role for a project an instanceAdmin is a member of', async () => {
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+			]);
+			vi.mocked(listProjectsForUser).mockResolvedValue([
+				{ ...membershipFor('member', 'p2'), userId: ADMIN_USER.id },
+			]);
+
+			await expect(caller.listMine()).resolves.toEqual([
+				{ id: 'p1', name: 'Alpha', role: null },
+				{ id: 'p2', name: 'Beta', role: 'member' },
+			]);
+			expect(listProjectsForUser).toHaveBeenCalledWith(ADMIN_USER.id);
+		});
+
+		it('keeps the repository ordering rather than sorting its own', async () => {
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p2', name: 'Alpha' }),
+				createMockProjectConfig({ id: 'p1', name: 'Beta' }),
+			]);
+
+			const result = await caller.listMine();
+			expect(result.map((project) => project.id)).toEqual(['p2', 'p1']);
 		});
 	});
 
@@ -192,9 +249,33 @@ describe('projectsRouter', () => {
 			branchPrefix: 'issue-',
 		};
 
+		// Issue #628: the SCM references a new project starts with are read off the
+		// manifest for the provider it names, exactly as the `credentials.pm` ones are read
+		// off the PM manifest. A stub with recognizable keys is what proves that — a
+		// hardcoded seeding would keep producing the old `SCM_*` names.
+		beforeEach(() => {
+			_resetSCMProviderRegistryForTesting();
+			registerSCMProvider({
+				id: 'github',
+				label: 'Stub',
+				category: 'scm',
+				webhookRoute: '/stub/webhook',
+				credentialRoles: [
+					{ role: 'reviewer', envVarKey: 'SCM_STUB_TOKEN_REVIEWER' },
+					{ role: 'webhookSecret', envVarKey: 'SCM_STUB_WEBHOOK_SECRET' },
+				],
+			} as unknown as SCMProviderManifest);
+		});
+
+		// The per-provider map alone: issue #632 removed phase 1's interim legacy mirror,
+		// since the Source Control tab now reads and writes `credentials.scm` itself.
 		const defaultCredentials = {
-			reviewer: 'SCM_TOKEN_REVIEWER',
-			webhookSecret: 'SCM_WEBHOOK_SECRET',
+			scm: {
+				github: {
+					reviewer: 'SCM_STUB_TOKEN_REVIEWER',
+					webhookSecret: 'SCM_STUB_WEBHOOK_SECRET',
+				},
+			},
 		};
 
 		it('happy path: calls createProjectWithMemberInDb with the input plus credentials and creator membership, and returns the merged object', async () => {
@@ -310,11 +391,40 @@ describe('projectsRouter', () => {
 
 				expect(result.credentials).toEqual({
 					...defaultCredentials,
-					pm: { apiToken: 'PM_STUB_TOKEN' },
+					// Filed under the provider it was seeded from (issue #631).
+					pm: { 'github-projects': { apiToken: 'PM_STUB_TOKEN' } },
 				});
 			} finally {
 				_resetPMProviderRegistryForTesting();
 			}
+		});
+
+		// Issue #628: the map is keyed by the provider the project names, and seeded from
+		// *that* manifest — so creating a Bitbucket project stores Bitbucket's keys, and no
+		// GitHub reference is invented for it.
+		it('seeds the credentials.scm block for the provider the project names', async () => {
+			registerSCMProvider({
+				id: 'bitbucket',
+				label: 'Stub Bitbucket',
+				category: 'scm',
+				webhookRoute: '/stub-bitbucket/webhook',
+				credentialRoles: [
+					{ role: 'reviewer', envVarKey: 'BB_STUB_TOKEN_REVIEWER' },
+					{ role: 'webhookSecret', envVarKey: 'BB_STUB_WEBHOOK_SECRET' },
+				],
+			} as unknown as SCMProviderManifest);
+			vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
+
+			const result = await caller.create({ ...validProjectInput, scm: 'bitbucket' });
+
+			expect(result.credentials).toEqual({
+				scm: {
+					bitbucket: {
+						reviewer: 'BB_STUB_TOKEN_REVIEWER',
+						webhookSecret: 'BB_STUB_WEBHOOK_SECRET',
+					},
+				},
+			});
 		});
 
 		it('strips a client-supplied pm block and uses the placeholder default', async () => {
@@ -606,6 +716,127 @@ describe('projectsRouter', () => {
 				'Some DB connection error',
 			);
 		});
+
+		/**
+		 * Issue #642: the server-side half of the provider-switch guarantee. `update`
+		 * merges and calls `upsertProjectToDb`, which does not parse, so the config
+		 * schema's `validatePmCredentialRoles` presence rule never fires on this path —
+		 * this is what makes a half-switched project (a `pm.type` naming a provider with
+		 * no credentials) impossible even from a hand-rolled client.
+		 */
+		describe('PM provider switch guard', () => {
+			const linearPm = {
+				type: 'linear' as const,
+				teamId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+				statusOptions: { todo: 'state-todo' },
+			};
+
+			function registerLinearStub() {
+				registerPMProvider({
+					id: 'linear',
+					label: 'Stub Linear',
+					category: 'pm',
+					credentialRoles: [
+						{ role: 'apiKey', label: 'API Key', envVarKey: 'LINEAR_API_KEY' },
+						{ role: 'webhookSecret', label: 'Webhook Secret', envVarKey: 'LINEAR_WEBHOOK_SECRET' },
+						{ role: 'optionalThing', label: 'Optional', envVarKey: 'LINEAR_OPT', optional: true },
+					],
+				} as unknown as PMProviderManifest);
+			}
+
+			afterEach(() => {
+				_resetPMProviderRegistryForTesting();
+			});
+
+			it('rejects a switch to a provider nothing is registered for', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+
+				await expect(caller.update({ id: 'p1', pm: linearPm })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'BAD_REQUEST',
+						message: expect.stringContaining("No PM provider is registered for 'linear'"),
+					}),
+				);
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+
+			it('rejects a switch whose required credential references are absent, naming them', async () => {
+				registerLinearStub();
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+
+				await expect(caller.update({ id: 'p1', pm: linearPm })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'BAD_REQUEST',
+						message: expect.stringContaining(
+							"'apiKey' (API Key), 'webhookSecret' (Webhook Secret)",
+						),
+					}),
+				);
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+
+			it('accepts the switch once the incoming provider’s own block names every required role', async () => {
+				registerLinearStub();
+				const withLinearCredentials = createMockProjectConfig({
+					id: 'p1',
+					credentials: {
+						// The outgoing provider's block is retained beside the incoming one — that
+						// is what makes switching back need no secrets re-entered (issue #631).
+						pm: {
+							'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' },
+							linear: { apiKey: 'LINEAR_API_KEY', webhookSecret: 'LINEAR_WEBHOOK_SECRET' },
+						},
+					},
+				});
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(withLinearCredentials);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', pm: linearPm });
+
+				// One write, carrying the whole new union member and nothing of the old one.
+				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+				expect(result.pm).toEqual(linearPm);
+				expect(result.credentials.pm).toEqual(withLinearCredentials.credentials.pm);
+			});
+
+			// The optional role is not required, and an inherited one already resolves
+			// without an entry — the same two exemptions the config schema's rule 3 makes.
+			it('does not require an optional role, nor one that inherits a shared credential', async () => {
+				registerPMProvider({
+					id: 'linear',
+					label: 'Stub Linear',
+					category: 'pm',
+					credentialRoles: [
+						{ role: 'optionalThing', label: 'Optional', envVarKey: 'LINEAR_OPT', optional: true },
+						{
+							role: 'webhookSecret',
+							label: 'Webhook Secret',
+							envVarKey: 'SCM_WEBHOOK_SECRET',
+							inheritsSharedCredential: 'webhookSecret',
+						},
+					],
+				} as unknown as PMProviderManifest);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', pm: linearPm });
+
+				expect(result.pm).toEqual(linearPm);
+			});
+
+			// An ordinary board/status edit keeps the provider it is already on, so nothing
+			// about the guard can block a project from fixing its own mapping.
+			it('leaves a mapping edit that keeps the same provider unaffected', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const samePm = { ...existing.pm, statusOptions: { todo: 'opt_other' } };
+				const result = await caller.update({ id: 'p1', pm: samePm });
+
+				expect(result.pm).toEqual(samePm);
+				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+			});
+		});
 	});
 
 	describe('delete', () => {
@@ -670,6 +901,70 @@ describe('projectsRouter', () => {
 			});
 		});
 
+		describe('listMine', () => {
+			it('lists only the accessible projects, each with the role held on it', async () => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+					createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+					createMockProjectConfig({ id: 'p3', name: 'Gamma' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1', 'p3']);
+				vi.mocked(listProjectsForUser).mockResolvedValue([
+					membershipFor('member', 'p1'),
+					membershipFor('projectAdmin', 'p3'),
+				]);
+
+				// `p2` is absent entirely — the scoping rule is `list`'s, so a project the
+				// caller may not discover is not named here either.
+				await expect(ordinary.listMine()).resolves.toEqual([
+					{ id: 'p1', name: 'Alpha', role: 'member' },
+					{ id: 'p3', name: 'Gamma', role: 'projectAdmin' },
+				]);
+				expect(listAccessibleProjectIds).toHaveBeenCalledWith(ORDINARY_USER.id);
+			});
+
+			it.each([
+				'contributor',
+				'member',
+				'projectAdmin',
+			] as const)('reports the %s role the caller holds', async (role) => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listProjectsForUser).mockResolvedValue([membershipFor(role, 'p1')]);
+
+				await expect(ordinary.listMine()).resolves.toEqual([{ id: 'p1', name: 'Alpha', role }]);
+			});
+
+			it('gives a user with no memberships an empty list, naming no project', async () => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
+				vi.mocked(listProjectsForUser).mockResolvedValue([]);
+
+				await expect(ordinary.listMine()).resolves.toEqual([]);
+			});
+
+			it('ignores a membership for a project the caller cannot access', async () => {
+				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				]);
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listProjectsForUser).mockResolvedValue([
+					membershipFor('member', 'p1'),
+					// A stale membership row for a project that is gone: the accessible list
+					// decides what is listed, so it contributes no entry of its own.
+					membershipFor('projectAdmin', 'p9'),
+				]);
+
+				await expect(ordinary.listMine()).resolves.toEqual([
+					{ id: 'p1', name: 'Alpha', role: 'member' },
+				]);
+			});
+		});
+
 		describe('getById', () => {
 			it('denies a non-member with NOT_FOUND without reading the project', async () => {
 				vi.mocked(getMembership).mockResolvedValue(undefined);
@@ -686,6 +981,50 @@ describe('projectsRouter', () => {
 				vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
 
 				await expect(ordinary.getById({ id: 'p1' })).resolves.toEqual(project);
+			});
+		});
+
+		// Issue #655: the read model the project-detail screen decides which tabs to
+		// offer from. It reports the `projectAdmin` boundary every configuration
+		// procedure enforces for itself, and grants nothing.
+		describe('viewerAccess', () => {
+			it('reports a projectAdmin as able to administer the project', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('projectAdmin'));
+
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: true,
+				});
+			});
+
+			it('reports a member and a contributor as unable to administer it', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: false,
+				});
+
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: false,
+				});
+			});
+
+			it('denies a non-member with NOT_FOUND rather than reporting false', async () => {
+				// Answering at all would confirm the project exists, so this hides it the
+				// same way `getById` does.
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.viewerAccess({ projectId: 'p1' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'NOT_FOUND' }),
+				);
+			});
+
+			it('reports an instanceAdmin as an administrator of a project they are not a member of', async () => {
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(caller.viewerAccess({ projectId: 'p1' })).resolves.toEqual({
+					canAdminister: true,
+				});
+				expect(getMembership).not.toHaveBeenCalled();
 			});
 		});
 

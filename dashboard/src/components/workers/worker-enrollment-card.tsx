@@ -33,7 +33,12 @@ import type { TriggerPhase } from '../../../../src/triggers/types.js';
  * A viewer who may not change a value still sees its state, as a disabled control
  * whose `title` says whose it is — the pattern issue #473 established for the
  * table's Available switch — rather than a control that would come back
- * `FORBIDDEN`. Every mutation reports its own outcome beside the control it
+ * `FORBIDDEN`. **Approval is the one field with no such read-only rendering**
+ * (issue #652): its state is already the header's status badge, so for a viewer
+ * who doesn't administer the project the whole section — heading, controls and
+ * all — is omitted rather than reduced to a line explaining whose it is. That is
+ * a visibility change only; `approveEnrollment`/`setStatus` re-check the project
+ * role exactly as before. Every mutation reports its own outcome beside the control it
  * belongs to: pending, saved, or the server's message verbatim (allowed CLIs
  * exceeding the machine's capabilities is a `BAD_REQUEST` worth reading as
  * written). Nothing here terminates a running agent — revoking consent or
@@ -380,27 +385,28 @@ export function WorkerEnrollmentCard({
 					/>
 				</div>
 
-				<div className="space-y-2">
-					<ControlHeading title="Approval">
-						A project administrator's decision, independent of sharing consent — both are required
-						before work is routed here.
-					</ControlHeading>
-					<ApprovalControls
-						enrollment={enrollment}
-						projectName={projectName}
-						pending={approvalPending}
-						onApprove={() => approveMutation.mutate()}
-						onSuspend={() => setConfirm('suspend')}
-						onReactivate={() => statusMutation.mutate('active')}
-					/>
-					<ControlFeedback
-						pending={approvalPending}
-						saved={approveMutation.isSuccess || statusMutation.isSuccess}
-						error={
-							confirmOpen ? null : firstErrorMessage(approveMutation.error, statusMutation.error)
-						}
-					/>
-				</div>
+				{enrollment.viewerCanAdminister ? (
+					<div className="space-y-2">
+						<ControlHeading title="Approval">
+							A project administrator's decision, independent of sharing consent — both are required
+							before work is routed here.
+						</ControlHeading>
+						<ApprovalControls
+							enrollment={enrollment}
+							pending={approvalPending}
+							onApprove={() => approveMutation.mutate()}
+							onSuspend={() => setConfirm('suspend')}
+							onReactivate={() => statusMutation.mutate('active')}
+						/>
+						<ControlFeedback
+							pending={approvalPending}
+							saved={approveMutation.isSuccess || statusMutation.isSuccess}
+							error={
+								confirmOpen ? null : firstErrorMessage(approveMutation.error, statusMutation.error)
+							}
+						/>
+					</div>
+				) : null}
 
 				<div className="space-y-2">
 					<ControlHeading title="Allowed agent CLIs">
@@ -491,34 +497,26 @@ export function WorkerEnrollmentCard({
 
 /**
  * The project administrator's two acts: approving a `pending` enrollment, and
- * suspending/reactivating an existing one. A viewer who doesn't administer the
- * project sees the state (the approval badge in the header) and no button at all —
- * there is nothing here whose *value* would be hidden by omitting the control.
+ * suspending/reactivating an existing one. Rendered only for a viewer who
+ * administers the project — the whole Approval section is omitted for anyone else
+ * (issue #652), since the approval *state* is already the header's status badge
+ * and nothing here is readable without being actionable.
  * Suspending stays offered for a still-pending enrollment too: that is how the
  * server models denying one, and `setStatus` accepts it from any status.
  */
 function ApprovalControls({
 	enrollment,
-	projectName,
 	pending,
 	onApprove,
 	onSuspend,
 	onReactivate,
 }: {
 	enrollment: WorkerDetailEnrollment;
-	projectName: string;
 	pending: boolean;
 	onApprove: () => void;
 	onSuspend: () => void;
 	onReactivate: () => void;
 }) {
-	if (!enrollment.viewerCanAdminister) {
-		return (
-			<p className="text-xs text-zinc-500">
-				Only an administrator of {projectName} can approve or suspend this enrollment.
-			</p>
-		);
-	}
 	return (
 		<div className="flex flex-wrap gap-2">
 			{enrollment.status === 'pending' ? (

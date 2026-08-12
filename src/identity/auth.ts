@@ -24,8 +24,10 @@ import {
 } from '../db/repositories/userSessionsRepository.js';
 import {
 	ensureLocalAdminUser,
+	findUserCredentialById,
 	findUserCredentialByIdentifier,
 	getUserById,
+	setPasswordHash,
 } from '../db/repositories/usersRepository.js';
 import type { SwarmUser } from './schema.js';
 
@@ -99,6 +101,48 @@ export async function verifyCredentials(
 	}
 	const ok = await verifyPassword(password, credential.passwordHash);
 	return ok ? credential.user : undefined;
+}
+
+/**
+ * The outcome of a self-service password change (issue #662). A string union
+ * rather than a thrown error for the *expected* outcomes, so the API layer maps
+ * each to its own status without pattern-matching a message; anything
+ * unexpected still throws (ai/CODING_STANDARDS.md "Error handling").
+ */
+export type PasswordChangeOutcome =
+	| 'changed'
+	| 'invalid-current-password'
+	| 'no-password-set'
+	| 'unknown-user';
+
+/**
+ * Change a user's **own** password, re-authenticating them with their current
+ * one first (issue #662). The subject is a user id the caller resolved from the
+ * session, never an identifier taken from a request body, so this can only ever
+ * re-credential the signed-in account.
+ *
+ * Fails closed on a user with no password set: a null hash means "cannot log
+ * in", never "any current password matches" — and it is reachable, since the
+ * single-user `localhost-admin` is bootstrapped passwordless. A wrong current
+ * password writes nothing.
+ *
+ * **Neither plaintext leaves this function** — not in the return value, not in
+ * an error, and nothing here logs.
+ */
+export async function changeOwnPassword(input: {
+	userId: string;
+	currentPassword: string;
+	newPassword: string;
+}): Promise<PasswordChangeOutcome> {
+	const credential = await findUserCredentialById(input.userId);
+	if (!credential) return 'unknown-user';
+	if (credential.passwordHash === null) return 'no-password-set';
+
+	const ok = await verifyPassword(input.currentPassword, credential.passwordHash);
+	if (!ok) return 'invalid-current-password';
+
+	await setPasswordHash(input.userId, await hashPassword(input.newPassword));
+	return 'changed';
 }
 
 /** SHA-256 of a raw session token — the only form that touches the DB. */

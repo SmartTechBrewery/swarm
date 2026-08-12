@@ -1,5 +1,5 @@
 {
-  "id": "cfb95018-c243-4c40-acfd-2b10885ff23c",
+  "id": "7c1f0a2e-3d5b-4c8a-9e61-2b4f8d0a5c93",
   "prevId": "23e1c575-0f16-4beb-a13b-73c468dc7310",
   "version": "7",
   "dialect": "postgresql",
@@ -1874,12 +1874,6 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\"]'::jsonb"
-        },
-        "repository": {
-          "name": "repository",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
         },
         "credential_hash": {
           "name": "credential_hash",
