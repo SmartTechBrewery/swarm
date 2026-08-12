@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig } from '../../../helpers/factories.js';
+import { createMockProjectRecord } from '../../../helpers/factories.js';
 
 vi.mock('node:fs/promises', () => ({ readFile: vi.fn() }));
 vi.mock('@/config/apply.js', () => ({ applyConfig: vi.fn() }));
@@ -11,7 +11,7 @@ import { run as configRun } from '@/cli/commands/config.js';
 import { applyConfig } from '@/config/apply.js';
 import { closeDb } from '@/db/client.js';
 
-const CONFIG_JSON = JSON.stringify({ projects: [createMockProjectConfig({ id: 'proj-1' })] });
+const CONFIG_JSON = JSON.stringify({ projects: [createMockProjectRecord({ id: 'proj-1' })] });
 
 describe('swarm config', () => {
 	beforeEach(() => {

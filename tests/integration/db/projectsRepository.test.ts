@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
@@ -11,9 +11,13 @@ import {
 	findProjectByBoardFromDb,
 	findProjectByIdFromDb,
 	findProjectByPmContainerFromDb,
+	findProjectByRepoFromDb,
+	findProjectRecordByIdFromDb,
 	getProjectByIdFromDb,
 	listAllProjectsFromDb,
 	listDiscoverableProjectsFromDb,
+	ProjectRepositoryConflictError,
+	upsertProjectToDb,
 } from '../../../src/db/repositories/projectsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { projectCredentials } from '../../../src/db/schema/projectCredentials.js';
@@ -21,6 +25,8 @@ import {
 	createMockLinearConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
+	createMockProjectRecord,
+	toProjectRecord,
 } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
@@ -38,7 +44,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 				repo: 'jkwiecien/new-repo',
 				maxConcurrentJobs: 4,
 			});
-			await createProjectInDb(config);
+			await createProjectInDb(toProjectRecord(config));
 
 			const resolved = await findProjectByIdFromDb('proj-new');
 			expect(resolved).toBeDefined();
@@ -56,7 +62,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 					review: { checks: 'if-present' },
 				},
 			});
-			await createProjectInDb(config);
+			await createProjectInDb(toProjectRecord(config));
 
 			const resolved = await findProjectByIdFromDb('proj-review-checks');
 			expect(resolved?.pipeline?.review?.checks).toBe('if-present');
@@ -70,19 +76,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 		// into a silent pick the moment a second provider goes runtime-ready.
 		it('round-trips the scm discriminator, and keeps an unstated one unstated', async () => {
 			await createProjectInDb(
-				createMockProjectConfig({
-					id: 'proj-scm-stated',
-					name: 'Stated SCM Project',
-					repo: 'jkwiecien/stated-scm',
-					scm: 'bitbucket',
-				}),
+				toProjectRecord(
+					createMockProjectConfig({
+						id: 'proj-scm-stated',
+						name: 'Stated SCM Project',
+						repo: 'jkwiecien/stated-scm',
+						scm: 'bitbucket',
+					}),
+				),
 			);
 			await createProjectInDb(
-				createMockProjectConfig({
-					id: 'proj-scm-unstated',
-					name: 'Unstated SCM Project',
-					repo: 'jkwiecien/unstated-scm',
-				}),
+				toProjectRecord(
+					createMockProjectConfig({
+						id: 'proj-scm-unstated',
+						name: 'Unstated SCM Project',
+						repo: 'jkwiecien/unstated-scm',
+					}),
+				),
 			);
 
 			expect((await findProjectByIdFromDb('proj-scm-stated'))?.scm).toBe('bitbucket');
@@ -106,7 +116,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 					phaseLabels: { 'phase-6': 'phase-6' },
 				},
 			});
-			await createProjectInDb(config);
+			await createProjectInDb(toProjectRecord(config));
 
 			expect((await findProjectByIdFromDb('proj-pm-config'))?.pm).toEqual(config.pm);
 
@@ -129,7 +139,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 				repo: 'jkwiecien/linear-container',
 				pm: { type: 'linear', ...linearConfig },
 			});
-			await createProjectInDb(linear);
+			await createProjectInDb(toProjectRecord(linear));
 
 			const byTeam = await findProjectByPmContainerFromDb('linear', 'teamId', linearConfig.teamId);
 			expect(byTeam?.id).toBe('proj-linear-container');
@@ -145,11 +155,13 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 		// projects.
 		it('scopes the container match to the asking provider, so two blobs cannot collide', async () => {
 			await createProjectInDb(
-				createMockProjectConfig({
-					id: 'proj-gh-container',
-					name: 'GitHub Container Project',
-					repo: 'jkwiecien/gh-container',
-				}),
+				toProjectRecord(
+					createMockProjectConfig({
+						id: 'proj-gh-container',
+						name: 'GitHub Container Project',
+						repo: 'jkwiecien/gh-container',
+					}),
+				),
 			);
 
 			expect(
@@ -180,7 +192,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 					pm: { 'github-projects': { webhookSecret: 'PM_WEBHOOK_SECRET' } },
 				},
 			});
-			await createProjectInDb(config);
+			await createProjectInDb(toProjectRecord(config));
 
 			expect((await findProjectByIdFromDb('proj-pm-credentials'))?.credentials).toEqual(
 				config.credentials,
@@ -195,7 +207,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 				name: 'Duplicate Name',
 				repo: 'jkwiecien/duplicate',
 			});
-			await expect(createProjectInDb(duplicateConfig)).rejects.toThrow();
+			await expect(createProjectInDb(toProjectRecord(duplicateConfig))).rejects.toThrow();
 
 			// Assert original row remains untouched
 			const resolved = await findProjectByIdFromDb('dup-id');
@@ -212,7 +224,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 				repo: 'jkwiecien/atomic-repo',
 			});
 
-			await createProjectWithMemberInDb(config, {
+			await createProjectWithMemberInDb(toProjectRecord(config), {
 				projectId: 'proj-atomic',
 				userId: user.id,
 				role: 'projectAdmin',
@@ -236,7 +248,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 
 			// '00000000-0000-4000-8000-000000000000' does not exist in users table -> foreign key violation
 			await expect(
-				createProjectWithMemberInDb(config, {
+				createProjectWithMemberInDb(toProjectRecord(config), {
 					projectId: 'proj-rollback',
 					userId: '00000000-0000-4000-8000-000000000000',
 					role: 'projectAdmin',
@@ -318,11 +330,13 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 		it('defaults to private and round-trips a discoverable value', async () => {
 			await seedProject({ id: 'proj-private', repo: 'jkwiecien/private-repo' });
 			await createProjectInDb(
-				createMockProjectConfig({
-					id: 'proj-open',
-					repo: 'jkwiecien/open-repo',
-					visibility: 'discoverable',
-				}),
+				toProjectRecord(
+					createMockProjectConfig({
+						id: 'proj-open',
+						repo: 'jkwiecien/open-repo',
+						visibility: 'discoverable',
+					}),
+				),
 			);
 
 			expect((await findProjectByIdFromDb('proj-private'))?.visibility).toBe('private');
@@ -330,24 +344,116 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 		});
 	});
 
+	// The repository list and its jsonb containment lookup (issue #684). A stubbed-DB
+	// unit test can only assert the predicate's *shape*; whether Postgres actually
+	// matches an entry inside the array — and whether the migration produced the column
+	// it matches against — is what a real round-trip proves. This is the path every
+	// SCM webhook takes to find its project.
+	describe('repositories (issue #684)', () => {
+		it('round-trips the repository list and resolves the project by an entry it names', async () => {
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: 'proj-repos',
+					name: 'Repos Project',
+					repositories: [{ repo: 'jkwiecien/list-repo', baseBranch: 'develop' }],
+				}),
+			);
+
+			expect((await findProjectRecordByIdFromDb('proj-repos'))?.repositories).toEqual([
+				{ repo: 'jkwiecien/list-repo', baseBranch: 'develop', branchPrefix: 'issue-' },
+			]);
+
+			const byRepo = await findProjectByRepoFromDb('jkwiecien/list-repo');
+			expect(byRepo).toMatchObject({
+				id: 'proj-repos',
+				repo: 'jkwiecien/list-repo',
+				baseBranch: 'develop',
+			});
+			expect(await findProjectByRepoFromDb('jkwiecien/untracked')).toBeUndefined();
+		});
+
+		// The write-seam guard that replaced the `repo` UNIQUE constraint the column drop
+		// dissolved: without it two projects could claim one repository and the lookup
+		// would resolve arbitrarily.
+		it('refuses a second project claiming a repository another already owns', async () => {
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: 'proj-owner',
+					repositories: [{ repo: 'jkwiecien/claimed' }],
+				}),
+			);
+
+			await expect(
+				createProjectInDb(
+					createMockProjectRecord({
+						id: 'proj-claimant',
+						repositories: [{ repo: 'jkwiecien/claimed' }],
+					}),
+				),
+			).rejects.toThrow(ProjectRepositoryConflictError);
+
+			expect(await findProjectByIdFromDb('proj-claimant')).toBeUndefined();
+			// …while the owner re-writing its own repository is still fine.
+			await expect(
+				upsertProjectToDb(
+					createMockProjectRecord({
+						id: 'proj-owner',
+						name: 'Renamed Owner',
+						repositories: [{ repo: 'jkwiecien/claimed' }],
+					}),
+				),
+			).resolves.toBeUndefined();
+			expect((await findProjectByIdFromDb('proj-owner'))?.name).toBe('Renamed Owner');
+		});
+
+		// Migration 0047 in effect: the three per-repository columns and the UNIQUE
+		// constraint on `repo` are gone, and `repositories` is the NOT NULL jsonb column
+		// that replaced them.
+		it('persists the migrated column shape', async () => {
+			const columns = await getDb().execute(
+				sql`SELECT column_name, is_nullable, data_type FROM information_schema.columns
+					WHERE table_name = 'projects'`,
+			);
+			const byName = new Map(
+				columns.rows.map((column) => [String(column.column_name), column] as const),
+			);
+			expect(byName.get('repositories')).toMatchObject({
+				is_nullable: 'NO',
+				data_type: 'jsonb',
+			});
+			for (const gone of ['repo', 'base_branch', 'branch_prefix']) {
+				expect(byName.has(gone), `column ${gone} should be dropped`).toBe(false);
+			}
+
+			const constraints = await getDb().execute(
+				sql`SELECT conname FROM pg_constraint WHERE conname = 'projects_repo_unique'`,
+			);
+			expect(constraints.rows).toHaveLength(0);
+		});
+	});
+
 	describe('listDiscoverableProjectsFromDb', () => {
 		it('returns only discoverable projects, limited to id + name, ordered by name', async () => {
 			await seedProject({ id: 'proj-priv', name: 'Private One', repo: 'jkwiecien/priv' });
 			await createProjectInDb(
-				createMockProjectConfig({
-					id: 'proj-b',
-					name: 'Bravo Open',
-					repo: 'jkwiecien/bravo',
-					visibility: 'discoverable',
-				}),
+				toProjectRecord(
+					createMockProjectConfig({
+						id: 'proj-b',
+						name: 'Bravo Open',
+						repo: 'jkwiecien/bravo',
+						visibility: 'discoverable',
+					}),
+				),
 			);
 			await createProjectInDb(
-				createMockProjectConfig({
-					id: 'proj-a',
-					name: 'Alpha Open',
-					repo: 'jkwiecien/alpha',
-					visibility: 'discoverable',
-				}),
+				toProjectRecord(
+					createMockProjectConfig({
+						id: 'proj-a',
+						name: 'Alpha Open',
+						repo: 'jkwiecien/alpha',
+						visibility: 'discoverable',
+					}),
+				),
 			);
 
 			const discoverable = await listDiscoverableProjectsFromDb();

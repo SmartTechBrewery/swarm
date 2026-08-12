@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockProjectRecord } from '../../helpers/factories.js';
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	upsertProjectToDb: vi.fn(async () => undefined),
@@ -21,7 +21,7 @@ import { writeProjectCredential } from '@/db/repositories/credentialsRepository.
 import { upsertProjectToDb } from '@/db/repositories/projectsRepository.js';
 import { discoverCliQuotas } from '@/harness/quota-discovery.js';
 
-const project = createMockProjectConfig({
+const project = createMockProjectRecord({
 	id: 'proj-1',
 	credentials: {
 		reviewer: 'REV_KEY',
@@ -87,7 +87,7 @@ describe('applyConfig', () => {
 	});
 
 	it('dedupes references so a key shared by two credentials is written once', async () => {
-		const shared = createMockProjectConfig({
+		const shared = createMockProjectRecord({
 			id: 'proj-2',
 			credentials: { reviewer: 'SHARED', webhookSecret: 'SHARED' },
 		});
@@ -105,9 +105,9 @@ describe('applyConfig', () => {
 	// The PM provider's role map is a nested record beside the SCM references
 	// (issue #497), so its values are references too and must be applied the same way.
 	it("stores the PM provider's credential references from the environment", async () => {
-		const withPmReferences = createMockProjectConfig({
+		const withPmReferences = createMockProjectRecord({
 			id: 'proj-4',
-			repo: 'owner/pm',
+			repositories: [{ repo: 'owner/pm' }],
 			credentials: {
 				reviewer: 'REV_KEY',
 				webhookSecret: 'HOOK_KEY',
@@ -127,9 +127,9 @@ describe('applyConfig', () => {
 	// every provider's references are applied — including a provider the project retains
 	// but is not currently running on, which is what makes switching back reversible.
 	it("stores every SCM provider's credential references from the environment", async () => {
-		const multiProvider = createMockProjectConfig({
+		const multiProvider = createMockProjectRecord({
 			id: 'proj-5',
-			repo: 'owner/multi',
+			repositories: [{ repo: 'owner/multi' }],
 			scm: 'gitlab',
 			credentials: {
 				scm: {
@@ -163,9 +163,9 @@ describe('applyConfig', () => {
 	// is a config change rather than a re-entry of every credential. Two blocks naming the
 	// same key (the collision the shape exists to survive) still write one row.
 	it("stores every PM provider's credential references, deduped across blocks", async () => {
-		const twoBoards = createMockProjectConfig({
+		const twoBoards = createMockProjectRecord({
 			id: 'proj-6',
-			repo: 'owner/two-boards',
+			repositories: [{ repo: 'owner/two-boards' }],
 			credentials: {
 				reviewer: 'REV_KEY',
 				webhookSecret: 'HOOK_KEY',
@@ -214,7 +214,10 @@ describe('applyConfig', () => {
 	});
 
 	it('applies every project in the config', async () => {
-		const other = createMockProjectConfig({ id: 'proj-3', repo: 'owner/other' });
+		const other = createMockProjectRecord({
+			id: 'proj-3',
+			repositories: [{ repo: 'owner/other' }],
+		});
 		const result = await applyConfig(SwarmConfigSchema.parse({ projects: [project, other] }));
 
 		expect(upsertProjectToDb).toHaveBeenCalledTimes(2);

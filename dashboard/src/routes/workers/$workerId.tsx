@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute, Link } from '@tanstack/react-router';
 import { Server } from 'lucide-react';
 import { WorkerDetailView } from '@/components/workers/worker-detail.js';
+import { projectRepo } from '@/lib/project-repository.js';
 import { trpc } from '@/lib/trpc.js';
 import { projectDisabledPhases } from '@/lib/worker-enrollment-phases.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
@@ -38,7 +39,7 @@ export function WorkerDetailRouteComponent() {
 	// resolved the same way the table does; both fall back to the raw project id.
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectNames = new Map(projectsQuery.data?.map((p) => [p.id, p.name]) ?? []);
-	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, p.repo]) ?? []);
+	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, projectRepo(p)]) ?? []);
 	// Which phases each project has switched off for every worker (issue #509) — read
 	// from the same project config the Agents tab edits, so the phase control names a
 	// project-wide "off" instead of offering a phase that can never run. A project

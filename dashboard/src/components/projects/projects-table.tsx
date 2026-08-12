@@ -1,9 +1,10 @@
 import { useNavigate } from '@tanstack/react-router';
+import { projectRepo } from '@/lib/project-repository.js';
 
 interface Project {
 	id: string;
 	name: string;
-	repo: string;
+	repositories: Array<{ repo: string }>;
 	repoRoot: string;
 }
 
@@ -41,7 +42,7 @@ export function ProjectsTable({ projects }: ProjectsTableProps) {
 						>
 							<td className="px-4 py-3 text-sm font-mono text-zinc-300">{project.id}</td>
 							<td className="px-4 py-3 text-sm text-zinc-200">{project.name}</td>
-							<td className="px-4 py-3 text-sm font-mono text-zinc-300">{project.repo}</td>
+							<td className="px-4 py-3 text-sm font-mono text-zinc-300">{projectRepo(project)}</td>
 						</tr>
 					))}
 				</tbody>

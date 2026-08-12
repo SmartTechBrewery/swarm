@@ -4,7 +4,7 @@ import {
 	type PmProviderCredentialReferences,
 	pmCredentialReferenceFor,
 } from '../../config/pm-credentials.js';
-import type { ProjectConfig } from '../../config/schema.js';
+import type { ProjectRecord } from '../../config/schema.js';
 import {
 	type ScmProviderCredentialReferences,
 	scmCredentialReferenceFor,
@@ -16,7 +16,7 @@ import {
 	writeProjectCredential,
 } from '../../db/repositories/credentialsRepository.js';
 import {
-	getProjectByIdFromDb,
+	findProjectRecordByIdFromDb,
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
 import type { PmCredentialRoleSpec } from '../../integrations/pm/manifest.js';
@@ -90,9 +90,13 @@ function isUsableSecret(value: string | undefined): boolean {
 	return value !== undefined && value !== '';
 }
 
-/** Load a project for a credential operation, or NOT_FOUND. */
-async function requireProject(projectId: string): Promise<ProjectConfig> {
-	const project = await getProjectByIdFromDb(projectId);
+/**
+ * Load a project for a credential operation, or NOT_FOUND. The whole **record**, not
+ * a repository-scoped view: every write here is a read-modify-upsert of the project
+ * row, so it must carry the `repositories` list back unchanged (issue #684).
+ */
+async function requireProject(projectId: string): Promise<ProjectRecord> {
+	const project = await findProjectRecordByIdFromDb(projectId);
 	if (!project) {
 		throw new TRPCError({
 			code: 'NOT_FOUND',
@@ -108,7 +112,7 @@ async function requireProject(projectId: string): Promise<ProjectConfig> {
  * credentials before a switch is saved (issue #641); omitting it keeps every procedure
  * behaving exactly as it did before.
  */
-function requestedPmProviderId(project: ProjectConfig, providerId: PMType | undefined): PMType {
+function requestedPmProviderId(project: ProjectRecord, providerId: PMType | undefined): PMType {
 	return providerId ?? project.pm.type;
 }
 
@@ -124,7 +128,7 @@ function requestedPmProviderId(project: ProjectConfig, providerId: PMType | unde
  * provider's secret over the outgoing one's reference.
  */
 function requirePmRoleSpec(
-	project: ProjectConfig,
+	project: ProjectRecord,
 	role: string,
 	providerId: PMType | undefined,
 ): { providerId: PMType; spec: PmCredentialRoleSpec } {
@@ -171,7 +175,7 @@ function requirePmRoleSpec(
  * project runs on — else the role's declared conventional key.
  */
 function pmReferenceKeyFor(
-	project: ProjectConfig,
+	project: ProjectRecord,
 	providerId: PMType,
 	spec: PmCredentialRoleSpec,
 ): string {
@@ -211,7 +215,7 @@ function runtimeReadyScmProvider(providerId: string): SCMProviderManifest | null
  * used for a project that names no provider, so the tab shows the very block such a
  * project's references were adopted into rather than an empty one.
  */
-function requestedScmProviderId(project: ProjectConfig, providerId: string | undefined): string {
+function requestedScmProviderId(project: ProjectRecord, providerId: string | undefined): string {
 	return providerId ?? sharedScmCredentialProviderFor(project);
 }
 
@@ -253,7 +257,7 @@ function requireScmRoleSpec(
  * exists to remove.
  */
 function scmReferenceKeyFor(
-	project: ProjectConfig,
+	project: ProjectRecord,
 	providerId: ScmType,
 	spec: ScmCredentialRoleSpec,
 ): string {
@@ -268,7 +272,7 @@ function scmReferenceKeyFor(
  * rather than persisting as `{}`.
  */
 async function updateScmReferences(
-	project: ProjectConfig,
+	project: ProjectRecord,
 	providerId: ScmType,
 	references: ScmProviderCredentialReferences,
 ): Promise<void> {
@@ -298,7 +302,7 @@ async function updateScmReferences(
  * that empties drops out entirely rather than persisting as `{}`.
  */
 async function updatePmReferences(
-	project: ProjectConfig,
+	project: ProjectRecord,
 	providerId: PMType,
 	references: PmProviderCredentialReferences,
 ): Promise<void> {

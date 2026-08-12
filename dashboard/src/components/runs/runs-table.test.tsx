@@ -62,7 +62,7 @@ const baseRun: RunRow = {
 	failureDiagnosis: null,
 };
 
-const project = { id: 'proj-a', name: 'Acme', repo: 'acme/widgets' };
+const project = { id: 'proj-a', name: 'Acme', repositories: [{ repo: 'acme/widgets' }] };
 
 // Seed the `projects.list` cache so run cards/rows can resolve the repo (needed
 // for the Task work-item link) synchronously. `staleTime: Infinity` keeps

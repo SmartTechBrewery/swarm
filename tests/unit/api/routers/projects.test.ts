@@ -1,10 +1,17 @@
 import { DrizzleQueryError } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/db/repositories/projectsRepository.js', () => ({
-	listAllProjectsFromDb: vi.fn(),
+vi.mock('@/db/repositories/projectsRepository.js', async () => ({
+	// The conflict error is a real class the router narrows on `instanceof`, so it is
+	// imported rather than stubbed.
+	ProjectRepositoryConflictError: (
+		await vi.importActual<typeof import('@/db/repositories/projectsRepository.js')>(
+			'@/db/repositories/projectsRepository.js',
+		)
+	).ProjectRepositoryConflictError,
+	listAllProjectRecordsFromDb: vi.fn(),
 	listDiscoverableProjectsFromDb: vi.fn(),
-	getProjectByIdFromDb: vi.fn(),
+	findProjectRecordByIdFromDb: vi.fn(),
 	createProjectInDb: vi.fn(),
 	createProjectWithMemberInDb: vi.fn(),
 	upsertProjectToDb: vi.fn(),
@@ -44,9 +51,10 @@ import {
 	createProjectInDb,
 	createProjectWithMemberInDb,
 	deleteProjectFromDb,
-	getProjectByIdFromDb,
-	listAllProjectsFromDb,
+	findProjectRecordByIdFromDb,
+	listAllProjectRecordsFromDb,
 	listDiscoverableProjectsFromDb,
+	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '@/db/repositories/projectsRepository.js';
 import {
@@ -73,7 +81,7 @@ import {
 	_resetSCMProviderRegistryForTesting,
 	registerSCMProvider,
 } from '@/integrations/scm/registry.js';
-import { createMockProjectConfig } from '../../../helpers/factories.js';
+import { createMockProjectRecord } from '../../../helpers/factories.js';
 
 const ADMIN_USER: SwarmUser = {
 	id: '00000000-0000-4000-8000-000000000000',
@@ -127,8 +135,8 @@ describe('projectsRouter', () => {
 	const caller = projectsRouter.createCaller({ user: AUTHED_USER });
 
 	beforeEach(() => {
-		vi.mocked(listAllProjectsFromDb).mockReset();
-		vi.mocked(getProjectByIdFromDb).mockReset();
+		vi.mocked(listAllProjectRecordsFromDb).mockReset();
+		vi.mocked(findProjectRecordByIdFromDb).mockReset();
 		vi.mocked(createProjectInDb).mockReset();
 		vi.mocked(createProjectWithMemberInDb).mockReset();
 		vi.mocked(upsertProjectToDb).mockReset();
@@ -149,24 +157,24 @@ describe('projectsRouter', () => {
 	});
 
 	describe('list', () => {
-		it('returns whatever listAllProjectsFromDb resolves', async () => {
+		it('returns whatever listAllProjectRecordsFromDb resolves', async () => {
 			const mockProjects = [
-				createMockProjectConfig({ id: 'p1' }),
-				createMockProjectConfig({ id: 'p2' }),
+				createMockProjectRecord({ id: 'p1' }),
+				createMockProjectRecord({ id: 'p2' }),
 			];
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue(mockProjects);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue(mockProjects);
 
 			const result = await caller.list();
 			expect(result).toEqual(mockProjects);
-			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
+			expect(listAllProjectRecordsFromDb).toHaveBeenCalledTimes(1);
 		});
 
-		it('returns an empty array when listAllProjectsFromDb resolves empty', async () => {
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
+		it('returns an empty array when listAllProjectRecordsFromDb resolves empty', async () => {
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([]);
 
 			const result = await caller.list();
 			expect(result).toEqual([]);
-			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
+			expect(listAllProjectRecordsFromDb).toHaveBeenCalledTimes(1);
 		});
 	});
 
@@ -174,9 +182,9 @@ describe('projectsRouter', () => {
 	// project, which is the case where "role" and "access" come apart.
 	describe('listMine', () => {
 		it('reports an instanceAdmin with no membership as having no role, rather than inventing one', async () => {
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-				createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
-				createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1', name: 'Alpha' }),
+				createMockProjectRecord({ id: 'p2', name: 'Beta' }),
 			]);
 			vi.mocked(listProjectsForUser).mockResolvedValue([]);
 
@@ -189,9 +197,9 @@ describe('projectsRouter', () => {
 		});
 
 		it('reports the real role for a project an instanceAdmin is a member of', async () => {
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-				createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
-				createMockProjectConfig({ id: 'p2', name: 'Beta' }),
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1', name: 'Alpha' }),
+				createMockProjectRecord({ id: 'p2', name: 'Beta' }),
 			]);
 			vi.mocked(listProjectsForUser).mockResolvedValue([
 				{ ...membershipFor('member', 'p2'), userId: ADMIN_USER.id },
@@ -205,9 +213,9 @@ describe('projectsRouter', () => {
 		});
 
 		it('keeps the repository ordering rather than sorting its own', async () => {
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-				createMockProjectConfig({ id: 'p2', name: 'Alpha' }),
-				createMockProjectConfig({ id: 'p1', name: 'Beta' }),
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p2', name: 'Alpha' }),
+				createMockProjectRecord({ id: 'p1', name: 'Beta' }),
 			]);
 
 			const result = await caller.listMine();
@@ -216,18 +224,18 @@ describe('projectsRouter', () => {
 	});
 
 	describe('getById', () => {
-		it('returns the project when getProjectByIdFromDb resolves one', async () => {
-			const project = createMockProjectConfig({ id: 'p1', maxConcurrentJobs: 4 });
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+		it('returns the project when findProjectRecordByIdFromDb resolves one', async () => {
+			const project = createMockProjectRecord({ id: 'p1', maxConcurrentJobs: 4 });
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			const result = await caller.getById({ id: 'p1' });
 			expect(result).toEqual(project);
 			expect(result.maxConcurrentJobs).toBe(4);
-			expect(getProjectByIdFromDb).toHaveBeenCalledWith('p1');
+			expect(findProjectRecordByIdFromDb).toHaveBeenCalledWith('p1');
 		});
 
-		it('throws NOT_FOUND when getProjectByIdFromDb resolves undefined', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+		it('throws NOT_FOUND when findProjectRecordByIdFromDb resolves undefined', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(caller.getById({ id: 'missing' })).rejects.toThrowError(
 				expect.objectContaining({
@@ -242,11 +250,9 @@ describe('projectsRouter', () => {
 		const validProjectInput = {
 			id: 'new-proj',
 			name: 'New Project',
-			repo: 'jkwiecien/new-proj',
+			repositories: [{ repo: 'jkwiecien/new-proj', baseBranch: 'main', branchPrefix: 'issue-' }],
 			repoRoot: '/Users/dev/new-proj',
 			worktreeRoot: '.swarm-workspaces',
-			baseBranch: 'main',
-			branchPrefix: 'issue-',
 		};
 
 		// Issue #628: the SCM references a new project starts with are read off the
@@ -306,7 +312,7 @@ describe('projectsRouter', () => {
 			const minimalInput = {
 				id: 'minimal-proj',
 				name: 'Minimal Project',
-				repo: 'jkwiecien/minimal-proj',
+				repositories: [{ repo: 'jkwiecien/minimal-proj' }],
 				repoRoot: '/Users/dev/minimal-proj',
 			};
 
@@ -314,9 +320,11 @@ describe('projectsRouter', () => {
 
 			const expectedConfig = {
 				...minimalInput,
+				// Each entry's own branch settings default per entry.
+				repositories: [
+					{ repo: 'jkwiecien/minimal-proj', baseBranch: 'main', branchPrefix: 'issue-' },
+				],
 				worktreeRoot: '.swarm-workspaces',
-				baseBranch: 'main',
-				branchPrefix: 'issue-',
 				maxConcurrentJobs: 1,
 				visibility: 'private',
 				scm: 'github',
@@ -503,14 +511,14 @@ describe('projectsRouter', () => {
 	});
 
 	describe('update', () => {
-		const existing = createMockProjectConfig({
+		const existing = createMockProjectRecord({
 			id: 'p1',
 			name: 'Original Name',
-			repo: 'jkwiecien/original',
+			repositories: [{ repo: 'jkwiecien/original', baseBranch: 'main', branchPrefix: 'issue-' }],
 		});
 
 		it('throws NOT_FOUND when the project does not exist and does not update', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(caller.update({ id: 'missing', name: 'New Name' })).rejects.toThrowError(
 				expect.objectContaining({
@@ -523,16 +531,20 @@ describe('projectsRouter', () => {
 		});
 
 		it('happy path: updates project fields while leaving other fields untouched (including credentials)', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
-			const updates = { id: 'p1', name: 'Updated Name', repo: 'jkwiecien/new-repo' };
+			const updates = {
+				id: 'p1',
+				name: 'Updated Name',
+				repositories: [{ repo: 'jkwiecien/new-repo' }],
+			};
 			const result = await caller.update(updates);
 
 			const expectedConfig = {
 				...existing,
 				name: 'Updated Name',
-				repo: 'jkwiecien/new-repo',
+				repositories: [{ repo: 'jkwiecien/new-repo', baseBranch: 'main', branchPrefix: 'issue-' }],
 			};
 
 			expect(result).toEqual(expectedConfig);
@@ -540,7 +552,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('saves the maximum concurrent jobs setting', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			const result = await caller.update({ id: 'p1', maxConcurrentJobs: 4 });
@@ -553,7 +565,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('saves the opt-in auto merge setting', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			const result = await caller.update({
@@ -569,7 +581,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('saves the default-on skip-minors review-response setting', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			const result = await caller.update({
@@ -581,17 +593,17 @@ describe('projectsRouter', () => {
 		});
 
 		it('saves the Review check policy while leaving unrelated pipeline fields intact', async () => {
-			const withPipeline = createMockProjectConfig({
+			const withPipeline = createMockProjectRecord({
 				id: 'p1',
 				name: 'Original Name',
-				repo: 'jkwiecien/original',
+				repositories: [{ repo: 'jkwiecien/original', baseBranch: 'main', branchPrefix: 'issue-' }],
 				pipeline: {
 					planning: { autoAdvance: true },
 					review: { enabled: true },
 					respondToReview: { autoMerge: true, skipOnMinors: false },
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(withPipeline);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			const result = await caller.update({
@@ -610,7 +622,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('merges a nested pipeline patch with the existing pipeline configuration', async () => {
-			const withPipeline = createMockProjectConfig({
+			const withPipeline = createMockProjectRecord({
 				id: 'p1',
 				pipeline: {
 					planning: { autoAdvance: true },
@@ -618,7 +630,7 @@ describe('projectsRouter', () => {
 					respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(withPipeline);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			// Client sends ONLY the pipeline tab fields patch
@@ -643,7 +655,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('does not invent a Review check policy for an unrelated update on a project with none stored', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			const result = await caller.update({ id: 'p1', name: 'Renamed' });
@@ -655,12 +667,12 @@ describe('projectsRouter', () => {
 			await expect(
 				caller.update({ id: 'p1', maxConcurrentJobs: value as number }),
 			).rejects.toThrow();
-			expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 			expect(upsertProjectToDb).not.toHaveBeenCalled();
 		});
 
 		it('absent keys are not updated/merged to undefined', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			// Pass only id and a change to name, omit other fields
@@ -673,13 +685,13 @@ describe('projectsRouter', () => {
 
 			expect(result).toEqual(expectedConfig);
 			expect(upsertProjectToDb).toHaveBeenCalledWith(expectedConfig);
-			// Verifies other attributes like repoRoot, baseBranch etc are still existing values
-			expect(result.repo).toBe(existing.repo);
+			// Verifies other attributes like repoRoot, repositories etc are still existing values
+			expect(result.repositories).toEqual(existing.repositories);
 			expect(result.repoRoot).toBe(existing.repoRoot);
 		});
 
 		it('translates uniqueness conflicts (e.g. repo collision) to CONFLICT', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			const error = Object.assign(new Error('Unique violation'), { code: '23505' });
 			vi.mocked(upsertProjectToDb).mockRejectedValue(error);
 
@@ -691,8 +703,27 @@ describe('projectsRouter', () => {
 			);
 		});
 
+		// The `repo` UNIQUE constraint became a write-seam guard in issue #684, so its
+		// error has to reach the client as the same CONFLICT rather than falling through
+		// as an untranslated 500.
+		it('translates a repository already claimed by another project to CONFLICT', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(upsertProjectToDb).mockRejectedValue(
+				new ProjectRepositoryConflictError('jkwiecien/original', 'other-project'),
+			);
+
+			await expect(
+				caller.update({ id: 'p1', repositories: [{ repo: 'jkwiecien/original' }] }),
+			).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'CONFLICT',
+					message: 'Project ID or repository already exists',
+				}),
+			);
+		});
+
 		it('translates a drizzle-wrapped uniqueness conflict (code on .cause, not top-level) to CONFLICT', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			const pgError = Object.assign(new Error('duplicate key value violates unique constraint'), {
 				code: '23505',
 			});
@@ -708,7 +739,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('propagates unrelated rejections without translating them', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			const error = new Error('Some DB connection error');
 			vi.mocked(upsertProjectToDb).mockRejectedValue(error);
 
@@ -749,7 +780,7 @@ describe('projectsRouter', () => {
 			});
 
 			it('rejects a switch to a provider nothing is registered for', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 
 				await expect(caller.update({ id: 'p1', pm: linearPm })).rejects.toThrowError(
 					expect.objectContaining({
@@ -762,7 +793,7 @@ describe('projectsRouter', () => {
 
 			it('rejects a switch whose required credential references are absent, naming them', async () => {
 				registerLinearStub();
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 
 				await expect(caller.update({ id: 'p1', pm: linearPm })).rejects.toThrowError(
 					expect.objectContaining({
@@ -777,7 +808,7 @@ describe('projectsRouter', () => {
 
 			it('accepts the switch once the incoming provider’s own block names every required role', async () => {
 				registerLinearStub();
-				const withLinearCredentials = createMockProjectConfig({
+				const withLinearCredentials = createMockProjectRecord({
 					id: 'p1',
 					credentials: {
 						// The outgoing provider's block is retained beside the incoming one — that
@@ -788,7 +819,7 @@ describe('projectsRouter', () => {
 						},
 					},
 				});
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(withLinearCredentials);
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withLinearCredentials);
 				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 				const result = await caller.update({ id: 'p1', pm: linearPm });
@@ -816,7 +847,7 @@ describe('projectsRouter', () => {
 						},
 					],
 				} as unknown as PMProviderManifest);
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 				const result = await caller.update({ id: 'p1', pm: linearPm });
@@ -827,7 +858,7 @@ describe('projectsRouter', () => {
 			// An ordinary board/status edit keeps the provider it is already on, so nothing
 			// about the guard can block a project from fixing its own mapping.
 			it('leaves a mapping edit that keeps the same provider unaffected', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 				const samePm = { ...existing.pm, statusOptions: { todo: 'opt_other' } };
@@ -840,10 +871,10 @@ describe('projectsRouter', () => {
 	});
 
 	describe('delete', () => {
-		const existing = createMockProjectConfig({ id: 'p1' });
+		const existing = createMockProjectRecord({ id: 'p1' });
 
 		it('throws NOT_FOUND when the project does not exist and does not delete', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(caller.delete({ id: 'missing' })).rejects.toThrowError(
 				expect.objectContaining({
@@ -856,7 +887,7 @@ describe('projectsRouter', () => {
 		});
 
 		it('happy path: calls deleteProjectFromDb(id) when project existence check passes', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(deleteProjectFromDb).mockResolvedValue(undefined);
 
 			await expect(caller.delete({ id: 'p1' })).resolves.toBeUndefined();
@@ -872,8 +903,8 @@ describe('projectsRouter', () => {
 
 		describe('list', () => {
 			it('instanceAdmin sees every project (no membership filtering)', async () => {
-				const all = [createMockProjectConfig({ id: 'p1' }), createMockProjectConfig({ id: 'p2' })];
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue(all);
+				const all = [createMockProjectRecord({ id: 'p1' }), createMockProjectRecord({ id: 'p2' })];
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue(all);
 
 				await expect(caller.list()).resolves.toEqual(all);
 				expect(listAccessibleProjectIds).not.toHaveBeenCalled();
@@ -881,11 +912,11 @@ describe('projectsRouter', () => {
 
 			it('a member sees only the projects in their accessible set', async () => {
 				const all = [
-					createMockProjectConfig({ id: 'p1' }),
-					createMockProjectConfig({ id: 'p2' }),
-					createMockProjectConfig({ id: 'p3' }),
+					createMockProjectRecord({ id: 'p1' }),
+					createMockProjectRecord({ id: 'p2' }),
+					createMockProjectRecord({ id: 'p3' }),
 				];
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue(all);
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue(all);
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1', 'p3']);
 
 				const result = await ordinary.list();
@@ -894,7 +925,9 @@ describe('projectsRouter', () => {
 			});
 
 			it('a member with no memberships sees nothing', async () => {
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue([createMockProjectConfig({ id: 'p1' })]);
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+					createMockProjectRecord({ id: 'p1' }),
+				]);
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
 
 				await expect(ordinary.list()).resolves.toEqual([]);
@@ -903,10 +936,10 @@ describe('projectsRouter', () => {
 
 		describe('listMine', () => {
 			it('lists only the accessible projects, each with the role held on it', async () => {
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
-					createMockProjectConfig({ id: 'p2', name: 'Beta' }),
-					createMockProjectConfig({ id: 'p3', name: 'Gamma' }),
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+					createMockProjectRecord({ id: 'p1', name: 'Alpha' }),
+					createMockProjectRecord({ id: 'p2', name: 'Beta' }),
+					createMockProjectRecord({ id: 'p3', name: 'Gamma' }),
 				]);
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1', 'p3']);
 				vi.mocked(listProjectsForUser).mockResolvedValue([
@@ -928,8 +961,8 @@ describe('projectsRouter', () => {
 				'member',
 				'projectAdmin',
 			] as const)('reports the %s role the caller holds', async (role) => {
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+					createMockProjectRecord({ id: 'p1', name: 'Alpha' }),
 				]);
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
 				vi.mocked(listProjectsForUser).mockResolvedValue([membershipFor(role, 'p1')]);
@@ -938,8 +971,8 @@ describe('projectsRouter', () => {
 			});
 
 			it('gives a user with no memberships an empty list, naming no project', async () => {
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+					createMockProjectRecord({ id: 'p1', name: 'Alpha' }),
 				]);
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
 				vi.mocked(listProjectsForUser).mockResolvedValue([]);
@@ -948,8 +981,8 @@ describe('projectsRouter', () => {
 			});
 
 			it('ignores a membership for a project the caller cannot access', async () => {
-				vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-					createMockProjectConfig({ id: 'p1', name: 'Alpha' }),
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+					createMockProjectRecord({ id: 'p1', name: 'Alpha' }),
 				]);
 				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
 				vi.mocked(listProjectsForUser).mockResolvedValue([
@@ -972,13 +1005,13 @@ describe('projectsRouter', () => {
 				await expect(ordinary.getById({ id: 'p1' })).rejects.toThrowError(
 					expect.objectContaining({ code: 'NOT_FOUND' }),
 				);
-				expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+				expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 			});
 
 			it('lets a contributor read the project', async () => {
 				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
-				const project = createMockProjectConfig({ id: 'p1' });
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+				const project = createMockProjectRecord({ id: 'p1' });
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 				await expect(ordinary.getById({ id: 'p1' })).resolves.toEqual(project);
 			});
@@ -1035,14 +1068,14 @@ describe('projectsRouter', () => {
 				await expect(ordinary.update({ id: 'p1', name: 'Nope' })).rejects.toThrowError(
 					expect.objectContaining({ code: 'FORBIDDEN' }),
 				);
-				expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+				expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 				expect(upsertProjectToDb).not.toHaveBeenCalled();
 			});
 
 			it('lets a projectAdmin update project config', async () => {
 				vi.mocked(getMembership).mockResolvedValue(membershipFor('projectAdmin'));
-				const existing = createMockProjectConfig({ id: 'p1', name: 'Old' });
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(existing);
+				const existing = createMockProjectRecord({ id: 'p1', name: 'Old' });
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 				const result = await ordinary.update({ id: 'p1', name: 'New' });
@@ -1076,7 +1109,7 @@ describe('projectsRouter', () => {
 				await ordinary.create({
 					id: 'new-proj',
 					name: 'New Project',
-					repo: 'jkwiecien/new-proj',
+					repositories: [{ repo: 'jkwiecien/new-proj' }],
 					repoRoot: '/Users/dev/new-proj',
 				});
 
@@ -1099,7 +1132,7 @@ describe('projectsRouter', () => {
 					ordinary.create({
 						id: 'failed-member',
 						name: 'Failed Member',
-						repo: 'jkwiecien/failed-member',
+						repositories: [{ repo: 'jkwiecien/failed-member' }],
 						repoRoot: '/Users/dev/failed-member',
 					}),
 				).rejects.toThrowError('Membership insert failed');
@@ -1148,8 +1181,8 @@ describe('projectsRouter', () => {
 
 		describe('requestMembership', () => {
 			it('files a pending request for a discoverable project the caller may not access', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-					createMockProjectConfig({ id: 'p1', visibility: 'discoverable' }),
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+					createMockProjectRecord({ id: 'p1', visibility: 'discoverable' }),
 				);
 				vi.mocked(getMembership).mockResolvedValue(undefined);
 				vi.mocked(getPendingRequest).mockResolvedValue(undefined);
@@ -1164,8 +1197,8 @@ describe('projectsRouter', () => {
 			});
 
 			it('hides a private project: NOT_FOUND, and files no request', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-					createMockProjectConfig({ id: 'p1', visibility: 'private' }),
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+					createMockProjectRecord({ id: 'p1', visibility: 'private' }),
 				);
 
 				await expect(ordinary.requestMembership({ projectId: 'p1' })).rejects.toThrowError(
@@ -1175,7 +1208,7 @@ describe('projectsRouter', () => {
 			});
 
 			it('is NOT_FOUND for an unknown project', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 				await expect(ordinary.requestMembership({ projectId: 'missing' })).rejects.toThrowError(
 					expect.objectContaining({ code: 'NOT_FOUND' }),
@@ -1183,8 +1216,8 @@ describe('projectsRouter', () => {
 			});
 
 			it('rejects an already-member with CONFLICT', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-					createMockProjectConfig({ id: 'p1', visibility: 'discoverable' }),
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+					createMockProjectRecord({ id: 'p1', visibility: 'discoverable' }),
 				);
 				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
 
@@ -1195,8 +1228,8 @@ describe('projectsRouter', () => {
 			});
 
 			it('rejects a duplicate pending request with CONFLICT', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-					createMockProjectConfig({ id: 'p1', visibility: 'discoverable' }),
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+					createMockProjectRecord({ id: 'p1', visibility: 'discoverable' }),
 				);
 				vi.mocked(getMembership).mockResolvedValue(undefined);
 				vi.mocked(getPendingRequest).mockResolvedValue(requestFor('pending'));

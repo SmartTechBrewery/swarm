@@ -4,16 +4,28 @@
  * scope (one row per project, no org hierarchy — ai/ARCHITECTURE.md
  * "Single-user scope").
  *
- * A `projects` row is the persisted form of `ProjectConfig`; the jsonb columns
+ * A `projects` row is the persisted form of `ProjectRecord`; the jsonb columns
  * are already typed with the config's inferred types (`src/db/schema/projects.ts`),
- * so mapping a row back to `ProjectConfig` is a re-assembly, not a re-validation.
+ * so mapping a row back to `ProjectRecord` is a re-assembly, not a re-validation.
  * The Zod schema stays the source of truth for the shape (ai/CODING_STANDARDS.md
  * "Zod is the source of truth").
+ *
+ * Two read shapes come out of here since issue #684. The **record** functions
+ * (`…RecordFromDb`) return the whole project including its `repositories` list, and
+ * only the config-management surfaces take them. Everything else gets a
+ * `ProjectConfig` already scoped to one repository, so no runtime call site can act
+ * on a repository other than the one its work names.
  */
 
 import { and, asc, eq, sql } from 'drizzle-orm';
 
-import type { ProjectConfig, ProjectPm, ProjectVisibility } from '../../config/schema.js';
+import { scopeProjectToRepository } from '../../config/project-repository.js';
+import type {
+	ProjectConfig,
+	ProjectPm,
+	ProjectRecord,
+	ProjectVisibility,
+} from '../../config/schema.js';
 import type { PMType } from '../../pm/types.js';
 import type { ScmType } from '../../scm/types.js';
 import { getDb } from '../client.js';
@@ -23,16 +35,14 @@ import type { AddMemberInput } from './projectMembersRepository.js';
 
 type ProjectRow = typeof projects.$inferSelect;
 
-/** Re-assemble a `ProjectConfig` from a persisted `projects` row. */
-function rowToProjectConfig(row: ProjectRow): ProjectConfig {
+/** Re-assemble a `ProjectRecord` from a persisted `projects` row. */
+function rowToProjectRecord(row: ProjectRow): ProjectRecord {
 	return {
 		id: row.id,
 		name: row.name,
-		repo: row.repo,
+		repositories: row.repositories,
 		repoRoot: row.repoRoot,
 		worktreeRoot: row.worktreeRoot,
-		baseBranch: row.baseBranch,
-		branchPrefix: row.branchPrefix,
 		maxConcurrentJobs: row.maxConcurrentJobs,
 		visibility: row.visibility as ProjectVisibility,
 		// A `NULL` scm_type is a project that states no SCM provider, which is a
@@ -53,43 +63,123 @@ function rowToProjectConfig(row: ProjectRow): ProjectConfig {
 	};
 }
 
-/** Flatten a `ProjectConfig` into the columns needed for insertion/upsertion. */
-function projectConfigToRow(config: ProjectConfig) {
+/**
+ * Re-assemble a row and scope it to one of its repositories — `repo` omitted scopes
+ * to the project's default (first) entry.
+ *
+ * Board-driven and project-scoped work has no repository of its own to name, so it
+ * runs against the default entry, which is exactly today's behaviour while a project
+ * owns exactly one. Issue #684 phase 2 is where a caller that *does* know its
+ * repository (a job carrying one) passes it.
+ */
+function rowToProjectConfig(row: ProjectRow, repo?: string): ProjectConfig {
+	return scopeProjectToRepository(rowToProjectRecord(row), repo);
+}
+
+/** Flatten a `ProjectRecord` into the columns needed for insertion/upsertion. */
+function projectRecordToRow(record: ProjectRecord) {
 	// Split the `pm` union member back into its two columns — the discriminator and
 	// the provider's opaque config. The counterpart of the re-join in
-	// `rowToProjectConfig`.
-	const { type: pmType, ...pmConfig } = config.pm;
+	// `rowToProjectRecord`.
+	const { type: pmType, ...pmConfig } = record.pm;
 	return {
-		id: config.id,
-		name: config.name,
-		repo: config.repo,
-		repoRoot: config.repoRoot,
-		worktreeRoot: config.worktreeRoot,
-		baseBranch: config.baseBranch,
-		branchPrefix: config.branchPrefix,
-		maxConcurrentJobs: config.maxConcurrentJobs,
-		visibility: config.visibility,
+		id: record.id,
+		name: record.name,
+		repositories: record.repositories,
+		repoRoot: record.repoRoot,
+		worktreeRoot: record.worktreeRoot,
+		maxConcurrentJobs: record.maxConcurrentJobs,
+		visibility: record.visibility,
 		// `null`, not `'github'`, when the project states no provider — see the
 		// `scm_type` column comment (`src/db/schema/projects.ts`).
-		scmType: config.scm ?? null,
+		scmType: record.scm ?? null,
 		pmType,
 		pmConfig,
-		credentials: config.credentials,
-		agents: config.agents ?? null,
-		pipeline: config.pipeline ?? null,
-		worktreeRetention: config.worktreeRetention ?? null,
+		credentials: record.credentials,
+		agents: record.agents ?? null,
+		pipeline: record.pipeline ?? null,
+		worktreeRetention: record.worktreeRetention ?? null,
 	};
 }
 
 /**
- * Resolve a project by its GitHub repository (`owner/repo`). Returns `undefined`
- * when no project owns that repo — a webhook for an unknown repo isn't an error,
- * it just isn't ours (ai/CODING_STANDARDS.md "Error handling").
+ * A write refused because one of its repositories is already owned by a different
+ * project — the replacement for the `projects.repo` UNIQUE constraint the repository
+ * list dissolved (issue #684).
+ *
+ * Its own class rather than a raw `Error` so the API layer can map it to the same
+ * `CONFLICT` a unique violation produces without string-matching a message.
+ */
+export class ProjectRepositoryConflictError extends Error {
+	constructor(
+		readonly repo: string,
+		readonly ownerProjectId: string,
+	) {
+		super(`Repository '${repo}' already belongs to project '${ownerProjectId}'.`);
+		this.name = 'ProjectRepositoryConflictError';
+	}
+}
+
+/**
+ * Refuse a write that would give a repository to two projects.
+ *
+ * Unlike the index it replaces this is a check-then-write, so two *concurrent*
+ * creates naming the same repository can both pass. That is an accepted trade-off:
+ * creating a project is an operator action rather than a hot path, and the read side
+ * stays deterministic regardless — `findProjectByRepoFromDb` orders by `id`, so it
+ * never resolves arbitrarily even if a duplicate did land.
+ *
+ * Runs on `tx` when given, so the create-with-member transaction checks and inserts
+ * under the same snapshot.
+ */
+async function assertRepositoriesUnclaimed(
+	record: ProjectRecord,
+	tx: Pick<ReturnType<typeof getDb>, 'select'> = getDb(),
+): Promise<void> {
+	for (const entry of record.repositories) {
+		const rows = await tx
+			.select({ id: projects.id })
+			.from(projects)
+			.where(repositoryContains(entry.repo))
+			.orderBy(asc(projects.id));
+		const owner = rows.find((row) => row.id !== record.id);
+		if (owner) throw new ProjectRepositoryConflictError(entry.repo, owner.id);
+	}
+}
+
+/**
+ * `repositories` holds an entry naming `repo` — jsonb containment against the whole
+ * list, so it matches *any* entry rather than only the first. Written generally now
+ * even though the phase-1 cap makes it equivalent to "the only entry", so phase 2
+ * changes nothing here.
+ *
+ * The repo is bound as a parameter and cast to `jsonb`, never interpolated into the
+ * predicate.
+ */
+function repositoryContains(repo: string) {
+	return sql`${projects.repositories} @> ${JSON.stringify([{ repo }])}::jsonb`;
+}
+
+/**
+ * Resolve a project by one of its repositories (`owner/repo`), scoped to the
+ * **matched** entry — so a webhook from repository B runs against repository B's
+ * settings. Returns `undefined` when no project owns that repo — a webhook for an
+ * unknown repo isn't an error, it just isn't ours (ai/CODING_STANDARDS.md "Error
+ * handling").
+ *
+ * `ORDER BY id` is load-bearing: with the `repo UNIQUE` index gone
+ * (`assertRepositoriesUnclaimed` is its replacement) the result must not depend on
+ * heap order.
  */
 export async function findProjectByRepoFromDb(repo: string): Promise<ProjectConfig | undefined> {
-	const rows = await getDb().select().from(projects).where(eq(projects.repo, repo)).limit(1);
+	const rows = await getDb()
+		.select()
+		.from(projects)
+		.where(repositoryContains(repo))
+		.orderBy(asc(projects.id))
+		.limit(1);
 	const row = rows[0];
-	return row ? rowToProjectConfig(row) : undefined;
+	return row ? rowToProjectConfig(row, repo) : undefined;
 }
 
 /**
@@ -164,7 +254,11 @@ export async function findProjectByPmContainerFromDb(
 	return row ? rowToProjectConfig(row) : undefined;
 }
 
-/** Resolve a project by its stable internal id. Returns `undefined` if unknown. */
+/**
+ * Resolve a project by its stable internal id, scoped to its **default** repository.
+ * Returns `undefined` if unknown. Issue #684 phase 2 is where a caller that knows
+ * which repository its work belongs to passes it.
+ */
 export async function findProjectByIdFromDb(id: string): Promise<ProjectConfig | undefined> {
 	const rows = await getDb().select().from(projects).where(eq(projects.id, id)).limit(1);
 	const row = rows[0];
@@ -172,17 +266,34 @@ export async function findProjectByIdFromDb(id: string): Promise<ProjectConfig |
 }
 
 /**
- * Upsert a project row from its `ProjectConfig` — the write side of the
+ * Resolve a whole project **record** — its repository list included — by id. The
+ * config-management read: the projects API serves it so an operator edits the list
+ * itself, where every runtime caller takes {@link findProjectByIdFromDb}'s scoped
+ * view instead.
+ */
+export async function findProjectRecordByIdFromDb(id: string): Promise<ProjectRecord | undefined> {
+	const rows = await getDb().select().from(projects).where(eq(projects.id, id)).limit(1);
+	const row = rows[0];
+	return row ? rowToProjectRecord(row) : undefined;
+}
+
+/**
+ * Upsert a project row from its `ProjectRecord` — the write side of the
  * config-file → DB loader (`swarm config apply`). Keyed on `id`, so re-applying
  * an edited `swarm.config.json` updates the existing row in place rather than
  * inserting a duplicate; the loader is idempotent by design.
+ *
+ * Refuses a record claiming a repository another project already owns
+ * ({@link assertRepositoriesUnclaimed}) — the guard standing in for the `repo`
+ * UNIQUE constraint the repository list dissolved.
  *
  * The `credentials` block is persisted as-is — it holds only *references*
  * (env-var keys), never the secrets themselves. The secret values are written
  * separately into `project_credentials` (see `credentialsRepository`).
  */
-export async function upsertProjectToDb(config: ProjectConfig): Promise<void> {
-	const values = projectConfigToRow(config);
+export async function upsertProjectToDb(record: ProjectRecord): Promise<void> {
+	await assertRepositoriesUnclaimed(record);
+	const values = projectRecordToRow(record);
 	const { id: _id, ...updateValues } = values;
 	await getDb()
 		.insert(projects)
@@ -197,8 +308,9 @@ export async function upsertProjectToDb(config: ProjectConfig): Promise<void> {
  * Create a new project row in the DB.
  * Unlike `upsertProjectToDb`, this rejects with a unique constraint violation if the ID already exists.
  */
-export async function createProjectInDb(config: ProjectConfig): Promise<void> {
-	const values = projectConfigToRow(config);
+export async function createProjectInDb(record: ProjectRecord): Promise<void> {
+	await assertRepositoriesUnclaimed(record);
+	const values = projectRecordToRow(record);
 	await getDb().insert(projects).values(values);
 }
 
@@ -207,11 +319,13 @@ export async function createProjectInDb(config: ProjectConfig): Promise<void> {
  * If either insert fails, the whole transaction rolls back so a failed membership insert never leaves an unowned project row.
  */
 export async function createProjectWithMemberInDb(
-	config: ProjectConfig,
+	record: ProjectRecord,
 	member: AddMemberInput,
 ): Promise<void> {
-	const values = projectConfigToRow(config);
+	const values = projectRecordToRow(record);
 	await getDb().transaction(async (tx) => {
+		// Inside the transaction, so the check and the insert see one snapshot.
+		await assertRepositoriesUnclaimed(record, tx);
 		await tx.insert(projects).values(values);
 		await tx.insert(projectMembers).values({
 			projectId: member.projectId,
@@ -231,11 +345,23 @@ export async function deleteProjectFromDb(id: string): Promise<void> {
 }
 
 /**
- * List all projects in the DB, ordered by name.
+ * List all projects in the DB, ordered by name, each scoped to its **default**
+ * repository. Issue #684 phase 2 is where a caller that knows its repository passes
+ * one.
  */
 export async function listAllProjectsFromDb(): Promise<ProjectConfig[]> {
 	const rows = await getDb().select().from(projects).orderBy(asc(projects.name));
-	return rows.map(rowToProjectConfig);
+	return rows.map((row) => rowToProjectConfig(row));
+}
+
+/**
+ * List every project as a whole **record**, repository list included, ordered by
+ * name — the config-management twin of {@link listAllProjectsFromDb}, served by the
+ * projects API.
+ */
+export async function listAllProjectRecordsFromDb(): Promise<ProjectRecord[]> {
+	const rows = await getDb().select().from(projects).orderBy(asc(projects.name));
+	return rows.map(rowToProjectRecord);
 }
 
 /**

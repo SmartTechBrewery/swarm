@@ -7,7 +7,7 @@ vi.mock('@/db/repositories/credentialsRepository.js', () => ({
 }));
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
-	getProjectByIdFromDb: vi.fn(),
+	findProjectRecordByIdFromDb: vi.fn(),
 	// The PM procedures persist the `credentials.pm` role → reference map through the
 	// project row (issue #537).
 	upsertProjectToDb: vi.fn(),
@@ -27,11 +27,14 @@ import {
 	resolveAllProjectCredentials,
 	writeProjectCredential,
 } from '@/db/repositories/credentialsRepository.js';
-import { getProjectByIdFromDb, upsertProjectToDb } from '@/db/repositories/projectsRepository.js';
+import {
+	findProjectRecordByIdFromDb,
+	upsertProjectToDb,
+} from '@/db/repositories/projectsRepository.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
-import { createMockProjectConfig } from '../../../helpers/factories.js';
+import { createMockProjectRecord } from '../../../helpers/factories.js';
 
 const ADMIN_USER: SwarmUser = {
 	id: '00000000-0000-4000-8000-000000000000',
@@ -66,7 +69,7 @@ describe('credentialsRouter', () => {
 	const caller = credentialsRouter.createCaller({ user: AUTHED_USER });
 
 	beforeEach(() => {
-		vi.mocked(getProjectByIdFromDb).mockReset();
+		vi.mocked(findProjectRecordByIdFromDb).mockReset();
 		vi.mocked(resolveAllProjectCredentials).mockReset();
 		vi.mocked(writeProjectCredential).mockReset();
 		vi.mocked(deleteProjectCredential).mockReset();
@@ -80,11 +83,11 @@ describe('credentialsRouter', () => {
 		// No `scm`, and a legacy pair adopted into `credentials.scm.github` — so its
 		// references are the neutral post-#290 names, which is the *common* case of a
 		// reference diverging from the manifest's conventional `envVarKey`.
-		const project = createMockProjectConfig({ id: 'p1' });
+		const project = createMockProjectRecord({ id: 'p1' });
 
 		/** A project carrying both providers' references, running on GitHub. */
 		function twoProviderProject() {
-			return createMockProjectConfig({
+			return createMockProjectRecord({
 				id: 'p1',
 				scm: 'github',
 				credentials: {
@@ -98,7 +101,7 @@ describe('credentialsRouter', () => {
 		}
 
 		it('masks a long configured value to the same fixed marker, with no secret characters in the response', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
 				SCM_TOKEN_REVIEWER: 'test-token-reviewer',
 			});
@@ -122,7 +125,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('masks a short configured value to the identical fixed marker as a long one', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
 				SCM_TOKEN_REVIEWER: 'short',
 			});
@@ -133,7 +136,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('resolves a project still storing a legacy GitHub-named reference, unmigrated', async () => {
-			const legacyProject = createMockProjectConfig({
+			const legacyProject = createMockProjectRecord({
 				id: 'p1',
 				credentials: {
 					reviewer: 'GITHUB_TOKEN_REVIEWER',
@@ -141,7 +144,7 @@ describe('credentialsRouter', () => {
 					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(legacyProject);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(legacyProject);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
 				GITHUB_TOKEN_REVIEWER: 'test-token-reviewer',
 			});
@@ -157,7 +160,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('reports an unconfigured slot as isConfigured: false, maskedValue: "not set"', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			const result = await caller.list({ projectId: 'p1' });
@@ -171,7 +174,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('returns one entry per role the provider declares, in the manifest’s order (implementer is not project-scoped)', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			const result = await caller.list({ projectId: 'p1' });
@@ -184,8 +187,8 @@ describe('credentialsRouter', () => {
 		});
 
 		it('defaults to the provider the project runs on', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-				createMockProjectConfig({
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({
 					id: 'p1',
 					scm: 'gitlab',
 					credentials: {
@@ -223,7 +226,7 @@ describe('credentialsRouter', () => {
 		// must show *its* empty state under *its* own reference names, while the provider
 		// that is configured keeps reporting configured.
 		it('reports a provider with nothing saved as unconfigured without disturbing the other’s state', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoProviderProject());
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(twoProviderProject());
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
 				SCM_TOKEN_REVIEWER: 'github-reviewer',
 				SCM_WEBHOOK_SECRET: 'github-hook',
@@ -256,7 +259,7 @@ describe('credentialsRouter', () => {
 		// provider this installation has not registered. The tab renders its own
 		// "not available" state from this rather than an error boundary.
 		it('reports an unregistered provider as unregistered with no roles', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			const result = await caller.list({ projectId: 'p1', providerId: 'gerrit' });
@@ -269,7 +272,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('throws NOT_FOUND for an unknown project without resolving credentials', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(caller.list({ projectId: 'missing' })).rejects.toThrowError(
 				expect.objectContaining({
@@ -282,10 +285,10 @@ describe('credentialsRouter', () => {
 	});
 
 	describe('set', () => {
-		const project = createMockProjectConfig({ id: 'p1' });
+		const project = createMockProjectRecord({ id: 'p1' });
 
 		it("stores the secret under the project's own reference for that provider and role", async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(writeProjectCredential).mockResolvedValue(undefined);
 
 			await caller.set({
@@ -311,7 +314,7 @@ describe('credentialsRouter', () => {
 		// The criterion test for issue #632: the reported failure was a silent in-place
 		// overwrite, because the browser chose the store key.
 		it('leaves another provider’s stored secret untouched, writing this provider’s own key', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(writeProjectCredential).mockResolvedValue(undefined);
 
 			await caller.set({
@@ -348,7 +351,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('refuses a role the provider does not declare, without writing', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			await expect(
 				caller.set({ projectId: 'p1', providerId: 'github', role: 'apiToken', value: 'ghp' }),
@@ -362,7 +365,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('refuses a provider nothing runtime-ready is registered for, without writing', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			await expect(
 				caller.set({ projectId: 'p1', providerId: 'gerrit', role: 'reviewer', value: 'secret' }),
@@ -375,11 +378,11 @@ describe('credentialsRouter', () => {
 				caller.set({ projectId: 'p1', providerId: 'github', role: 'reviewer', value: '' }),
 			).rejects.toThrow();
 			expect(writeProjectCredential).not.toHaveBeenCalled();
-			expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 		});
 
 		it('throws NOT_FOUND for an unknown project without writing', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(
 				caller.set({
@@ -400,7 +403,7 @@ describe('credentialsRouter', () => {
 
 	describe('delete', () => {
 		it('clears only the named provider’s row and reference', async () => {
-			const project = createMockProjectConfig({
+			const project = createMockProjectRecord({
 				id: 'p1',
 				scm: 'github',
 				credentials: {
@@ -411,7 +414,7 @@ describe('credentialsRouter', () => {
 					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(deleteProjectCredential).mockResolvedValue(undefined);
 
 			await caller.delete({ projectId: 'p1', providerId: 'gitlab', role: 'reviewer' });
@@ -431,7 +434,9 @@ describe('credentialsRouter', () => {
 		});
 
 		it('keeps the provider’s remaining role when only one is cleared', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 			vi.mocked(deleteProjectCredential).mockResolvedValue(undefined);
 
 			await caller.delete({ projectId: 'p1', providerId: 'github', role: 'reviewer' });
@@ -447,7 +452,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('throws NOT_FOUND for an unknown project without deleting', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(
 				caller.delete({ projectId: 'missing', providerId: 'github', role: 'reviewer' }),
@@ -464,10 +469,10 @@ describe('credentialsRouter', () => {
 	// The PM half (issue #537): the roles come from the project's PM provider manifest,
 	// the client names a role rather than a store key, and no secret is ever returned.
 	describe('listPm', () => {
-		const project = createMockProjectConfig({ id: 'p1' });
+		const project = createMockProjectRecord({ id: 'p1' });
 
 		it("returns the provider's declared roles with their configured state", async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
 				PM_GITHUB_PROJECTS_TOKEN: 'ghp_board_token',
 			});
@@ -492,7 +497,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('reports an inherited role against the shared reference it resolves through', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({ SCM_WEBHOOK_SECRET: 'whsec' });
 
 			const result = await caller.listPm({ projectId: 'p1' });
@@ -506,7 +511,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('reports an unconfigured role as not set', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			const result = await caller.listPm({ projectId: 'p1' });
@@ -519,7 +524,7 @@ describe('credentialsRouter', () => {
 		// reporting it as configured would have the panel claim the board is set up
 		// while every board call answers "no credential configured".
 		it('reports an empty stored value as not configured', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({ PM_GITHUB_PROJECTS_TOKEN: '' });
 
 			const result = await caller.listPm({ projectId: 'p1' });
@@ -529,7 +534,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('throws NOT_FOUND for an unknown project', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(caller.listPm({ projectId: 'missing' })).rejects.toThrowError(
 				expect.objectContaining({ code: 'NOT_FOUND' }),
@@ -539,8 +544,8 @@ describe('credentialsRouter', () => {
 		// Issue #641: the switch flow shows the *incoming* provider's roles, and shows them
 		// as unconfigured, which is what tells an operator what still has to be entered.
 		it('answers for a provider the project is not persisted on', async () => {
-			const project = createMockProjectConfig({ id: 'p1' });
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			const project = createMockProjectRecord({ id: 'p1' });
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
 				PM_GITHUB_PROJECTS_TOKEN: 'ghp_board_token',
 			});
@@ -561,7 +566,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it("reads the named provider's own retained references", async () => {
-			const twoBoards = createMockProjectConfig({
+			const twoBoards = createMockProjectRecord({
 				id: 'p1',
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
@@ -572,7 +577,7 @@ describe('credentialsRouter', () => {
 					},
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(twoBoards);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({ CUSTOM_JIRA_TOKEN: 'jira_pat' });
 
 			const result = await caller.listPm({ projectId: 'p1', providerId: 'jira' });
@@ -592,10 +597,10 @@ describe('credentialsRouter', () => {
 			// state is reachable and must be fixable from the UI). Assembled rather than
 			// parsed, because `ProjectConfigSchema` now rejects it.
 			const project = {
-				...createMockProjectConfig({ id: 'p1' }),
+				...createMockProjectRecord({ id: 'p1' }),
 				credentials: { reviewer: 'SCM_TOKEN_REVIEWER', webhookSecret: 'SCM_WEBHOOK_SECRET' },
 			};
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			await caller.setPm({ projectId: 'p1', role: 'apiToken', value: 'ghp_board_token' });
 
@@ -618,7 +623,7 @@ describe('credentialsRouter', () => {
 		// across providers, so a write scoped to the current one is what stops a retained
 		// provider's configuration being destroyed by an identically-named role.
 		it("writes into its own provider's block and leaves another provider's intact", async () => {
-			const twoBoards = createMockProjectConfig({
+			const twoBoards = createMockProjectRecord({
 				id: 'p1',
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
@@ -629,7 +634,7 @@ describe('credentialsRouter', () => {
 					},
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(twoBoards);
 
 			await caller.setPm({ projectId: 'p1', role: 'apiToken', value: 'ghp_rotated' });
 
@@ -648,14 +653,14 @@ describe('credentialsRouter', () => {
 			// Assembled rather than parsed: GitHub Projects' `apiToken` is deliberately
 			// absent so the write has something to add, which `ProjectConfigSchema` rejects.
 			const project = {
-				...createMockProjectConfig({ id: 'p1' }),
+				...createMockProjectRecord({ id: 'p1' }),
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
 					webhookSecret: 'SCM_WEBHOOK_SECRET',
 					pm: { jira: { email: 'JIRA_EMAIL', apiToken: 'JIRA_API_TOKEN' } },
 				},
 			};
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			await caller.setPm({ projectId: 'p1', role: 'apiToken', value: 'ghp_board_token' });
 
@@ -672,7 +677,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it("replaces the value at the project's existing reference without rewriting the row", async () => {
-			const project = createMockProjectConfig({
+			const project = createMockProjectRecord({
 				id: 'p1',
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
@@ -680,7 +685,7 @@ describe('credentialsRouter', () => {
 					pm: { 'github-projects': { apiToken: 'CUSTOM_BOARD_TOKEN' } },
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			await caller.setPm({ projectId: 'p1', role: 'apiToken', value: 'ghp_new' });
 
@@ -696,7 +701,9 @@ describe('credentialsRouter', () => {
 		// The role *is* the shared SCM webhook secret (declared as data on the manifest),
 		// so writing it here would fork one secret into two places.
 		it('refuses a role that inherits a shared SCM credential, saying where it lives', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 
 			await expect(
 				caller.setPm({ projectId: 'p1', role: 'webhookSecret', value: 'whsec' }),
@@ -710,7 +717,9 @@ describe('credentialsRouter', () => {
 		});
 
 		it('refuses a role the provider does not declare', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 
 			await expect(
 				caller.setPm({ projectId: 'p1', role: 'apiKey', value: 'lin_api' }),
@@ -724,7 +733,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it('throws NOT_FOUND for an unknown project without writing', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
 
 			await expect(
 				caller.setPm({ projectId: 'missing', role: 'apiToken', value: 'ghp' }),
@@ -736,8 +745,8 @@ describe('credentialsRouter', () => {
 		// provider switch, so it happens while the project still runs on the outgoing one.
 		describe('for a provider the project is not persisted on', () => {
 			it("writes into the named provider's block and leaves the persisted one's intact", async () => {
-				const project = createMockProjectConfig({ id: 'p1' });
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+				const project = createMockProjectRecord({ id: 'p1' });
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 				await caller.setPm({
 					projectId: 'p1',
@@ -770,7 +779,9 @@ describe('credentialsRouter', () => {
 			});
 
 			it('refuses a role the named provider does not declare', async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+					createMockProjectRecord({ id: 'p1' }),
+				);
 
 				// `apiKey` is Linear's and Trello's, never Jira's — validating against the
 				// persisted provider instead would have accepted, or rejected, the wrong list.
@@ -788,7 +799,9 @@ describe('credentialsRouter', () => {
 			// Only GitHub Projects declares an inherited role, so the refusal is a property of
 			// the provider being configured rather than of the one the project runs on.
 			it("accepts the named provider's own webhook secret, which inherits nothing", async () => {
-				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+					createMockProjectRecord({ id: 'p1' }),
+				);
 
 				await caller.setPm({
 					projectId: 'p1',
@@ -809,8 +822,8 @@ describe('credentialsRouter', () => {
 
 	describe('deletePm', () => {
 		it('clears the stored secret and drops the reference so nothing ambient resolves', async () => {
-			const project = createMockProjectConfig({ id: 'p1' });
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+			const project = createMockProjectRecord({ id: 'p1' });
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			await caller.deletePm({ projectId: 'p1', role: 'apiToken' });
 
@@ -822,7 +835,7 @@ describe('credentialsRouter', () => {
 		});
 
 		it("removes only that role and keeps another provider's block", async () => {
-			const twoBoards = createMockProjectConfig({
+			const twoBoards = createMockProjectRecord({
 				id: 'p1',
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
@@ -833,7 +846,7 @@ describe('credentialsRouter', () => {
 					},
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(twoBoards);
 
 			await caller.deletePm({ projectId: 'p1', role: 'apiToken' });
 
@@ -848,7 +861,9 @@ describe('credentialsRouter', () => {
 		});
 
 		it('refuses to clear an inherited role', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 
 			await expect(
 				caller.deletePm({ projectId: 'p1', role: 'webhookSecret' }),
@@ -859,7 +874,7 @@ describe('credentialsRouter', () => {
 		// Issue #641: abandoning a switch has to be able to clear what was entered for the
 		// incoming provider without touching what the project is actually running on.
 		it('prunes only the named provider’s block when it is not the persisted one', async () => {
-			const twoBoards = createMockProjectConfig({
+			const twoBoards = createMockProjectRecord({
 				id: 'p1',
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
@@ -870,7 +885,7 @@ describe('credentialsRouter', () => {
 					},
 				},
 			});
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(twoBoards);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(twoBoards);
 
 			await caller.deletePm({ projectId: 'p1', providerId: 'jira', role: 'apiToken' });
 
@@ -897,13 +912,15 @@ describe('credentialsRouter', () => {
 			await expect(ordinary.list({ projectId: 'p1' })).rejects.toThrowError(
 				expect.objectContaining({ code: 'NOT_FOUND' }),
 			);
-			expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 			expect(resolveAllProjectCredentials).not.toHaveBeenCalled();
 		});
 
 		it('lets a contributor read the masked list', async () => {
 			vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			await expect(ordinary.list({ projectId: 'p1' })).resolves.toMatchObject({
@@ -927,7 +944,9 @@ describe('credentialsRouter', () => {
 
 		it('lets a projectAdmin set a credential', async () => {
 			vi.mocked(getMembership).mockResolvedValue(membershipFor('projectAdmin'));
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 			vi.mocked(writeProjectCredential).mockResolvedValue(undefined);
 
 			await ordinary.set({
@@ -957,7 +976,9 @@ describe('credentialsRouter', () => {
 		// role list, only a projectAdmin may write or clear one.
 		it('lets a contributor read the PM role list', async () => {
 			vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
 
 			await expect(ordinary.listPm({ projectId: 'p1' })).resolves.toMatchObject({

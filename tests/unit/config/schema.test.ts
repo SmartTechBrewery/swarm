@@ -7,6 +7,7 @@ import {
 	PipelineConfigSchema,
 	PROJECT_DEFAULTS,
 	ProjectConfigSchema,
+	ProjectRecordSchema,
 	SwarmConfigSchema,
 	validateConfig,
 	type WorktreeRetentionConfig,
@@ -16,6 +17,7 @@ import {
 	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
+	createMockProjectRecord,
 	createMockTrelloProjectConfig,
 } from '../../helpers/factories.js';
 
@@ -62,6 +64,87 @@ describe('ProjectConfigSchema', () => {
 
 	it('rejects a repo that is not owner/repo', () => {
 		expect(() => createMockProjectConfig({ repo: 'not-a-slug' })).toThrow(/owner\/repo/);
+	});
+});
+
+// Issue #684: the four per-repository fields leave the project's top level and become
+// entries of `repositories` on the *record*. `ProjectConfigSchema` above is that record
+// scoped to one entry, which is why none of its cases changed.
+describe('ProjectRecordSchema', () => {
+	/** The shared half of a record, so each case states only the list under test. */
+	const shared = {
+		id: 'swarm',
+		name: 'swarm',
+		repoRoot: '/Users/dev/swarm/swarm',
+		pm: {
+			type: 'github-projects',
+			projectId: 'PVT_x',
+			statusFieldId: 'PVTSSF_y',
+			statusOptions: { backlog: 'opt-1' },
+		},
+		credentials: {
+			reviewer: 'B',
+			webhookSecret: 'C',
+			pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+		},
+	};
+
+	it('applies the branch defaults per entry, not per project', () => {
+		const record = ProjectRecordSchema.parse({
+			...shared,
+			repositories: [{ repo: 'SmartTechBrewery/swarm' }],
+		});
+		expect(record.repositories).toEqual([
+			{
+				repo: 'SmartTechBrewery/swarm',
+				baseBranch: PROJECT_DEFAULTS.baseBranch,
+				branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+			},
+		]);
+	});
+
+	it('accepts a per-repository scm override beside the project-level default', () => {
+		const record = ProjectRecordSchema.parse({
+			...shared,
+			scm: 'github',
+			repositories: [{ repo: 'SmartTechBrewery/swarm', scm: 'gitlab' }],
+		});
+		expect(record.scm).toBe('github');
+		expect(record.repositories[0].scm).toBe('gitlab');
+	});
+
+	it('rejects a project that owns no repository', () => {
+		expect(() => ProjectRecordSchema.parse({ ...shared, repositories: [] })).toThrow();
+	});
+
+	it('rejects an entry whose repo is not owner/repo', () => {
+		expect(() =>
+			ProjectRecordSchema.parse({ ...shared, repositories: [{ repo: 'not-a-slug' }] }),
+		).toThrow(/owner\/repo/);
+	});
+
+	// The cap is scaffolding for this phase: a second repository is not routable until
+	// issue #684 phase 2 threads the chosen one from the queue job to the worker, and
+	// accepting one now would let a webhook from repository B run against repository A.
+	it('rejects a second repository, naming the phase that lifts the cap', () => {
+		expect(() =>
+			ProjectRecordSchema.parse({
+				...shared,
+				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two' }],
+			}),
+		).toThrow(/phase 2/);
+	});
+
+	// The record carries the same cross-field credential checks the scoped config does —
+	// neither reads a repository, so both refine through the same two functions.
+	it('applies the same credential cross-field checks the scoped config does', () => {
+		expect(() =>
+			ProjectRecordSchema.parse({
+				...shared,
+				credentials: { ...shared.credentials, pm: { 'githb-projects': { apiToken: 'X' } } },
+				repositories: [{ repo: 'SmartTechBrewery/swarm' }],
+			}),
+		).toThrow(/is not a PM provider id/);
 	});
 
 	// `scm` is the discriminator `requireProjectSCMProvider` resolves (issue #478).
@@ -847,7 +930,7 @@ describe('PipelineConfigSchema', () => {
 
 describe('validateConfig', () => {
 	it('parses a config with at least one project', () => {
-		const config = validateConfig({ projects: [createMockProjectConfig()] });
+		const config = validateConfig({ projects: [createMockProjectRecord()] });
 		expect(config.projects).toHaveLength(1);
 	});
 
@@ -860,7 +943,7 @@ describe('validateConfig', () => {
 	});
 
 	it('is the SwarmConfigSchema parser', () => {
-		expect(SwarmConfigSchema.safeParse({ projects: [createMockProjectConfig()] }).success).toBe(
+		expect(SwarmConfigSchema.safeParse({ projects: [createMockProjectRecord()] }).success).toBe(
 			true,
 		);
 	});

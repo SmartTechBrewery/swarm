@@ -5,12 +5,13 @@ import type {
 	Credentials,
 	PipelineConfig,
 	ProjectPmConfig,
+	ProjectRepository,
 	WorktreeRetentionConfig,
 } from '../../config/schema.js';
 import { PROJECT_DEFAULTS } from '../../config/schema.js';
 
 /**
- * One row per SWARM project — the persisted form of `ProjectConfig`
+ * One row per SWARM project — the persisted form of `ProjectRecord`
  * (`src/config/schema.ts`), which stays the source of truth for the shape
  * (ai/CODING_STANDARDS.md "Zod is the source of truth"). The jsonb columns are
  * typed with the config's own inferred types via `$type<>()` so the table and
@@ -29,11 +30,25 @@ import { PROJECT_DEFAULTS } from '../../config/schema.js';
 export const projects = pgTable('projects', {
 	id: text('id').primaryKey(),
 	name: text('name').notNull(),
-	repo: text('repo').notNull().unique(),
+	/**
+	 * The project's repositories, each with its own `repo` / `baseBranch` /
+	 * `branchPrefix` and optional `scm` override (`ProjectRepository`, issue #684) —
+	 * the three per-repository `text` columns this replaced, as one list.
+	 *
+	 * jsonb rather than a `project_repositories` child table for the reason every
+	 * other sub-object here is jsonb: a project read is a plain `SELECT` re-assembled
+	 * by `rowToProjectRecord`, and a child table would turn each into a join plus a
+	 * transactional delete-and-reinsert on every upsert.
+	 *
+	 * The one thing the column costs is the `repo UNIQUE` constraint it dissolved,
+	 * which is what kept `findProjectByRepoFromDb` from resolving arbitrarily. Its
+	 * replacement is a write-seam guard — `assertRepositoriesUnclaimed`
+	 * (`src/db/repositories/projectsRepository.ts`) — plus a deterministic `ORDER BY`
+	 * on the read.
+	 */
+	repositories: jsonb('repositories').$type<ProjectRepository[]>().notNull(),
 	repoRoot: text('repo_root').notNull(),
 	worktreeRoot: text('worktree_root').notNull().default(PROJECT_DEFAULTS.worktreeRoot),
-	baseBranch: text('base_branch').notNull().default(PROJECT_DEFAULTS.baseBranch),
-	branchPrefix: text('branch_prefix').notNull().default(PROJECT_DEFAULTS.branchPrefix),
 	maxConcurrentJobs: integer('max_concurrent_jobs')
 		.notNull()
 		.default(PROJECT_DEFAULTS.maxConcurrentJobs),
@@ -46,8 +61,10 @@ export const projects = pgTable('projects', {
 	 */
 	visibility: text('visibility').notNull().default('private'),
 	/**
-	 * SCM provider id — the persisted form of `ProjectConfig.scm` (`ScmType`,
-	 * `src/scm/types.ts`), stored as free `text` like `pm_type` (issue #478).
+	 * SCM provider id — the persisted form of `ProjectRecord.scm` (`ScmType`,
+	 * `src/scm/types.ts`), stored as free `text` like `pm_type` (issue #478). Stays at
+	 * the *project* level: it is the default every repository resolves through unless
+	 * its own entry in `repositories` overrides it (issue #684).
 	 *
 	 * **Nullable with no default, deliberately.** `NULL` is "this project states no
 	 * provider", which is exactly the config-absent case `requireProjectSCMProvider`

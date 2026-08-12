@@ -330,6 +330,13 @@
       "when": 1786453200000,
       "tag": "0046_pm_credentials_per_provider",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1786712400000,
+      "tag": "0047_project_repositories",
+      "breakpoints": true
     }
   ]
 }

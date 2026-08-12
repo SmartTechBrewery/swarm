@@ -94,8 +94,8 @@ import type {
 	AgentsConfig,
 	AgentTarget,
 	PipelineConfig,
-	ProjectConfig,
 	ProjectPm,
+	ProjectRecord,
 	ReviewChecksPolicy,
 } from '../../../../src/config/schema.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
@@ -1750,8 +1750,8 @@ export interface ProjectSyncFlags {
  * project, so there is none to protect before the form has seeded at all.
  */
 export function diffProjectForSync(
-	prev: ProjectConfig | undefined,
-	next: ProjectConfig,
+	prev: ProjectRecord | undefined,
+	next: ProjectRecord,
 	boardMappingDraftProviderId?: string,
 ): ProjectSyncFlags {
 	if (!prev) {
@@ -1760,11 +1760,9 @@ export function diffProjectForSync(
 	return {
 		general:
 			next.name !== prev.name ||
-			next.repo !== prev.repo ||
+			JSON.stringify(next.repositories) !== JSON.stringify(prev.repositories) ||
 			next.repoRoot !== prev.repoRoot ||
 			next.worktreeRoot !== prev.worktreeRoot ||
-			next.baseBranch !== prev.baseBranch ||
-			next.branchPrefix !== prev.branchPrefix ||
 			next.maxConcurrentJobs !== prev.maxConcurrentJobs,
 		agents: JSON.stringify(next.agents) !== JSON.stringify(prev.agents),
 		pipeline: JSON.stringify(next.pipeline) !== JSON.stringify(prev.pipeline),
@@ -1911,6 +1909,10 @@ function ProjectDetailRouteComponent() {
 	const [switchConfirmOpen, setSwitchConfirmOpen] = useState(false);
 
 	const project = projectQuery.data;
+	// The General tab edits one repository. Phase 1 of issue #684 caps a project's list
+	// at exactly one entry, so this is it; phase 3 replaces the three single inputs it
+	// seeds with a list editor.
+	const repository = project?.repositories[0];
 
 	/**
 	 * The Project Management tab's provider switch, held entirely client-side (issue
@@ -1949,12 +1951,16 @@ function ProjectDetailRouteComponent() {
 			const changed = diffProjectForSync(lastSyncedProjectRef.current, project, pmDraftProviderId);
 
 			if (changed.general) {
+				// Read the entry off `project` rather than the memo above, so this effect's
+				// dependency list stays honest: the repository *is* the project's, so
+				// `project` changing is the only thing that can change it.
+				const entry = project.repositories[0];
 				setName(project.name);
-				setRepo(project.repo);
+				setRepo(entry?.repo ?? '');
 				setRepoRoot(project.repoRoot);
 				setWorktreeRoot(project.worktreeRoot ?? '');
-				setBaseBranch(project.baseBranch ?? '');
-				setBranchPrefix(project.branchPrefix ?? '');
+				setBaseBranch(entry?.baseBranch ?? '');
+				setBranchPrefix(entry?.branchPrefix ?? '');
 				setMaxConcurrentJobs(String(project.maxConcurrentJobs));
 				setMaxConcurrentJobsError(undefined);
 			}
@@ -1983,11 +1989,9 @@ function ProjectDetailRouteComponent() {
 		mutationFn: (variables: {
 			id: string;
 			name?: string;
-			repo?: string;
+			repositories?: Array<{ repo: string; baseBranch?: string; branchPrefix?: string }>;
 			repoRoot?: string;
 			worktreeRoot?: string;
-			baseBranch?: string;
-			branchPrefix?: string;
 			maxConcurrentJobs?: number;
 			agents?: AgentsConfig;
 			pipeline?: PipelineConfig;
@@ -2029,14 +2033,24 @@ function ProjectDetailRouteComponent() {
 		if (!project) return false;
 		return (
 			name !== project.name ||
-			repo !== project.repo ||
+			repo !== (repository?.repo ?? '') ||
 			repoRoot !== project.repoRoot ||
 			worktreeRoot !== (project.worktreeRoot ?? '') ||
-			baseBranch !== (project.baseBranch ?? '') ||
-			branchPrefix !== (project.branchPrefix ?? '') ||
+			baseBranch !== (repository?.baseBranch ?? '') ||
+			branchPrefix !== (repository?.branchPrefix ?? '') ||
 			maxConcurrentJobs !== String(project.maxConcurrentJobs)
 		);
-	}, [project, name, repo, repoRoot, worktreeRoot, baseBranch, branchPrefix, maxConcurrentJobs]);
+	}, [
+		project,
+		repository,
+		name,
+		repo,
+		repoRoot,
+		worktreeRoot,
+		baseBranch,
+		branchPrefix,
+		maxConcurrentJobs,
+	]);
 
 	const isAgentsDirty = useMemo(() => {
 		if (!project) return false;
@@ -2249,11 +2263,11 @@ function ProjectDetailRouteComponent() {
 	const handleReset = () => {
 		if (project) {
 			setName(project.name);
-			setRepo(project.repo);
+			setRepo(repository?.repo ?? '');
 			setRepoRoot(project.repoRoot);
 			setWorktreeRoot(project.worktreeRoot ?? '');
-			setBaseBranch(project.baseBranch ?? '');
-			setBranchPrefix(project.branchPrefix ?? '');
+			setBaseBranch(repository?.baseBranch ?? '');
+			setBranchPrefix(repository?.branchPrefix ?? '');
 			setMaxConcurrentJobs(String(project.maxConcurrentJobs));
 			setMaxConcurrentJobsError(undefined);
 			updateMutation.reset();
@@ -2272,11 +2286,11 @@ function ProjectDetailRouteComponent() {
 		updateMutation.mutate({
 			id: projectId,
 			name,
-			repo,
+			// The General tab still edits one repository (issue #684 phase 1 caps the list at
+			// one); phase 3 turns these three inputs into a real list editor.
+			repositories: [{ repo, baseBranch, branchPrefix }],
 			repoRoot,
 			worktreeRoot,
-			baseBranch,
-			branchPrefix,
 			maxConcurrentJobs: parsedMaxConcurrentJobs,
 		});
 	};

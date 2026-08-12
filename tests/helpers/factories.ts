@@ -8,7 +8,13 @@
  * directly instead.
  */
 
-import { type ProjectConfig, ProjectConfigSchema } from '@/config/schema.js';
+import {
+	type ProjectConfig,
+	ProjectConfigSchema,
+	type ProjectRecord,
+	ProjectRecordSchema,
+	type ProjectRepository,
+} from '@/config/schema.js';
 import type { RunAgentCliOptions } from '@/harness/agent-cli.js';
 import {
 	type GitHubProjectsIntegrationConfig,
@@ -752,6 +758,41 @@ export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}):
 			pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
 		},
 		...overrides,
+	});
+}
+
+/**
+ * The **record** twin of {@link createMockProjectConfig} (issue #684): the same
+ * project, authored the way `swarm.config.json` and the `projects` table hold it —
+ * shared settings once, plus the repository list. For the suites that exercise the
+ * record shape (the config schema, the projects repository and API); everything else
+ * keeps taking the scoped `createMockProjectConfig`.
+ */
+export function createMockProjectRecord(overrides: ProjectRecordOverrides = {}): ProjectRecord {
+	// Built by *un-scoping* the config fixture rather than restating it, so the two can
+	// never describe different projects.
+	return ProjectRecordSchema.parse({ ...toProjectRecord(createMockProjectConfig()), ...overrides });
+}
+
+/**
+ * Overrides for {@link createMockProjectRecord}. `repositories` takes the schema's
+ * *input* shape, so an entry may name just its `repo` and let `baseBranch` /
+ * `branchPrefix` default per entry.
+ */
+type ProjectRecordOverrides = Partial<Omit<ProjectRecord, 'repositories'>> & {
+	repositories?: Array<Partial<ProjectRepository> & { repo: string }>;
+};
+
+/**
+ * Un-scope a `ProjectConfig` fixture into the `ProjectRecord` the config surfaces and
+ * the `projects` table take (issue #684) — the inverse of `scopeProjectToRepository`.
+ * Lets the PM-provider fixtures above serve the record-shaped call sites unchanged.
+ */
+export function toProjectRecord(config: ProjectConfig): ProjectRecord {
+	const { repo, baseBranch, branchPrefix, ...shared } = config;
+	return ProjectRecordSchema.parse({
+		...shared,
+		repositories: [{ repo, baseBranch, branchPrefix }],
 	});
 }
 

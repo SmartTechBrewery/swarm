@@ -44,7 +44,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		mutationFn: (newProject: {
 			id: string;
 			name: string;
-			repo: string;
+			repositories: Array<{ repo: string }>;
 			repoRoot: string;
 			scm: ScmProviderId;
 		}) => trpcClient.projects.create.mutate(newProject),
@@ -66,7 +66,9 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
-		mutation.mutate({ id, name, repo, repoRoot, scm });
+		// One repository per project for now (issue #684 phase 1 caps the list at one);
+		// its branch settings default per entry, so the dialog still asks for none.
+		mutation.mutate({ id, name, repositories: [{ repo }], repoRoot, scm });
 	};
 
 	const handleClose = () => {

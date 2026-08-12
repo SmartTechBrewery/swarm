@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
+import { projectRepo } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	OwnerWorker,
@@ -297,7 +298,7 @@ export function WorkersTable({ workers, refetchInterval, onSelectWorker }: Worke
 	// falls back to the raw project id when this auxiliary lookup is unavailable.
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectNames = new Map(projectsQuery.data?.map((p) => [p.id, p.name]) ?? []);
-	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, p.repo]) ?? []);
+	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, projectRepo(p)]) ?? []);
 
 	// The signed-in operator's own workers — presence here is what authorizes an
 	// actionable consent switch for an enrollment.

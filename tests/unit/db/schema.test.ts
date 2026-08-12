@@ -20,21 +20,30 @@ describe('db schema', () => {
 			expect(table.name).toBe('projects');
 		});
 
-		it('persists every ProjectConfig field', () => {
+		it('persists every ProjectRecord field', () => {
 			for (const name of [
 				'id',
 				'name',
-				'repo',
+				'repositories',
 				'repo_root',
 				'worktree_root',
-				'base_branch',
-				'branch_prefix',
 				'scm_type',
 				'pm_type',
 				'pm_config',
 				'credentials',
 			]) {
 				expect(columns.has(name), `missing column ${name}`).toBe(true);
+			}
+		});
+
+		// Issue #684: the three per-repository columns became entries of one jsonb list,
+		// so a project can eventually own more than one repository without a column per
+		// repository. NOT NULL because every project owns at least one.
+		it('holds the repository list in a NOT NULL jsonb column, not three text columns', () => {
+			expect(columns.get('repositories')?.getSQLType()).toBe('jsonb');
+			expect(columns.get('repositories')?.notNull).toBe(true);
+			for (const gone of ['repo', 'base_branch', 'branch_prefix']) {
+				expect(columns.has(gone), `column ${gone} should be gone`).toBe(false);
 			}
 		});
 
@@ -58,15 +67,12 @@ describe('db schema', () => {
 			expect(columns.get('credentials')?.notNull).toBe(true);
 		});
 
-		it('keys on id and enforces one project per repo', () => {
+		it('keys on id', () => {
 			expect(columns.get('id')?.primary).toBe(true);
-			expect(columns.get('repo')?.isUnique).toBe(true);
 		});
 
 		it('applies the PROJECT_DEFAULTS as column defaults', () => {
 			expect(columns.get('worktree_root')?.default).toBe('.swarm-workspaces');
-			expect(columns.get('base_branch')?.default).toBe('main');
-			expect(columns.get('branch_prefix')?.default).toBe('issue-');
 			expect(columns.get('max_concurrent_jobs')?.default).toBe(1);
 		});
 	});

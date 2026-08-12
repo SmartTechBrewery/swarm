@@ -106,4 +106,15 @@ describe('worker/server key classification', () => {
 			new Set(WORKER_SAFE_KEYS),
 		);
 	});
+
+	// The projection is built from the *scoped* config (issue #684), which carries one
+	// repository's settings and no list — so a worker structurally cannot be handed the
+	// other repositories a project owns, whatever the allowlist says.
+	it('carries one repository, never the project’s repository list', () => {
+		const worker = toWorkerConfig(createMockProjectConfig()) as Record<string, unknown>;
+		expect(worker.repo).toBe('SmartTechBrewery/swarm');
+		expect('repositories' in worker).toBe(false);
+		expect(WORKER_SAFE_KEYS as readonly string[]).not.toContain('repositories');
+		expect(Object.keys(ProjectConfigBaseSchema.shape)).not.toContain('repositories');
+	});
 });

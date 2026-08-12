@@ -127,9 +127,9 @@ describe('ReviewCapCallout (issue #242)', () => {
 		run: RunRow = makeReviewRun(),
 		project: {
 			name: string;
-			repo: string;
+			repositories?: Array<{ repo: string }>;
 			pipeline?: { respondToReview?: { enabled?: boolean } };
-		} | null = { name: 'Demo', repo: 'acme/demo' },
+		} | null = { name: 'Demo', repositories: [{ repo: 'acme/demo' }] },
 	) {
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 		return render(
@@ -157,7 +157,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 	it('withholds Force re-review when Respond-to-review is disabled', () => {
 		renderCapCallout(makeReviewRun(), {
 			name: 'Demo',
-			repo: 'acme/demo',
+			repositories: [{ repo: 'acme/demo' }],
 			pipeline: { respondToReview: { enabled: false } },
 		});
 
@@ -183,7 +183,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 		const { container } = render(
 			<ReviewCapCallout
 				run={makeReviewRun({ reviewOrdinal: 1, reviewAutomationOutcome: null })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -194,7 +194,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 		const { container } = render(
 			<ReviewCapCallout
 				run={makeReviewRun({ reviewVerdict: 'approve' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -205,7 +205,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 		const { container } = render(
 			<ReviewCapCallout
 				run={makeReviewRun({ phase: 'respond-to-review' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -216,7 +216,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 		const { container } = render(
 			<ReviewCapCallout
 				run={makeReviewRun({ status: 'running' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -550,7 +550,7 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		const { container } = render(
 			<ReviewMergeCallout
 				run={makeReviewRun({ reviewMergeOutcome: null })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -561,7 +561,7 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		const { container } = render(
 			<ReviewMergeCallout
 				run={makeReviewRun({ phase: 'respond-to-review', reviewMergeOutcome: 'merged' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -575,7 +575,7 @@ describe('ReviewMergeCallout (issue #278)', () => {
 					reviewMergeOutcome: 'merged',
 					reviewMergeMessage: 'Pull Request successfully merged',
 				})}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -592,7 +592,7 @@ describe('ReviewMergeCallout (issue #278)', () => {
 					reviewMergeOutcome: 'not-ready',
 					reviewMergeMessage: 'required checks are still pending',
 				})}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -612,7 +612,7 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		render(
 			<ReviewMergeCallout
 				run={makeReviewRun({ reviewMergeOutcome: outcome, reviewMergeMessage: 'details here' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -691,7 +691,7 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 					prTitle: null,
 					producedPrUrl: 'https://github.com/acme/demo/pull/77',
 				})}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -705,7 +705,7 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 		render(
 			<GitHubReferences
 				run={makeReviewRun({ producedPrUrl: 'https://github.com/acme/demo/pull/77' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 
@@ -718,7 +718,7 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 		const { container } = render(
 			<GitHubReferences
 				run={makeReviewRun({ prNumber: null, prTitle: null })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
+				project={{ name: 'Demo', repositories: [{ repo: 'acme/demo' }] }}
 			/>,
 		);
 

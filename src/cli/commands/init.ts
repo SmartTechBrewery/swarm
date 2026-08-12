@@ -40,14 +40,22 @@ export const CONFIG_TEMPLATE = {
 		{
 			id: 'my-project',
 			name: 'My Project',
-			repo: 'owner/repo',
+			// One entry per repository the project owns, each with its own base branch
+			// and task-branch prefix (issue #684). Exactly one entry for now — several
+			// per project land with issue #684 phase 2.
+			repositories: [
+				{
+					repo: 'owner/repo',
+					baseBranch: PROJECT_DEFAULTS.baseBranch,
+					branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+				},
+			],
 			// Required in practice since issue #618 (`github` / `bitbucket` / `gitlab`),
-			// and since issue #628 also the key `credentials.scm` below is keyed by.
+			// and since issue #628 also the key `credentials.scm` below is keyed by. The
+			// project-level default; a repository living elsewhere states its own `scm`.
 			scm: 'github',
 			repoRoot: '/absolute/path/to/your/repo/checkout',
 			worktreeRoot: PROJECT_DEFAULTS.worktreeRoot,
-			baseBranch: PROJECT_DEFAULTS.baseBranch,
-			branchPrefix: PROJECT_DEFAULTS.branchPrefix,
 			// `pm` carries the provider id *and* that provider's own config — for
 			// GitHub Projects the board mapping below (`ProjectPmSchema`).
 			pm: {

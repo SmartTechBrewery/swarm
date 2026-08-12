@@ -30,6 +30,7 @@ import {
 } from '@/lib/force-re-review.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
+import { projectRepo } from '@/lib/project-repository.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import {
@@ -1539,7 +1540,7 @@ interface ReviewCapCalloutProps {
 	run: RunRow;
 	project?: {
 		name: string;
-		repo: string;
+		repositories?: Array<{ repo: string }>;
 		pipeline?: { respondToReview?: { enabled?: boolean } };
 	} | null;
 }
@@ -1591,9 +1592,9 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 					decision. If that decision is to keep going, "Force re-review" continues the normal
 					corrective cycle once.
 				</p>
-				{project?.repo && run.prNumber && (
+				{projectRepo(project) && run.prNumber && (
 					<a
-						href={`https://github.com/${project.repo}/pull/${run.prNumber}`}
+						href={`https://github.com/${projectRepo(project)}/pull/${run.prNumber}`}
 						target="_blank"
 						rel="noopener noreferrer"
 						className="inline-flex items-center gap-1 mt-2 text-red-300 hover:text-red-200 font-mono hover:underline"
@@ -1619,7 +1620,7 @@ const MERGE_TERMINAL_LABELS: Record<string, string> = {
 
 interface ReviewMergeCalloutProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	project?: { name: string; repositories?: Array<{ repo: string }> } | null;
 }
 
 /**
@@ -1631,9 +1632,9 @@ interface ReviewMergeCalloutProps {
 export function ReviewMergeCallout({ run, project }: ReviewMergeCalloutProps) {
 	if (run.phase !== 'review' || !run.reviewMergeOutcome) return null;
 
-	const prLink = project?.repo && run.prNumber && (
+	const prLink = projectRepo(project) && run.prNumber && (
 		<a
-			href={`https://github.com/${project.repo}/pull/${run.prNumber}`}
+			href={`https://github.com/${projectRepo(project)}/pull/${run.prNumber}`}
 			target="_blank"
 			rel="noopener noreferrer"
 			className="inline-flex items-center gap-1 mt-2 font-mono hover:underline"
@@ -1699,7 +1700,7 @@ export function ReviewMergeCallout({ run, project }: ReviewMergeCalloutProps) {
 
 interface RunDetailHeaderProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	project?: { name: string; repositories?: Array<{ repo: string }> } | null;
 }
 
 export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
@@ -1845,7 +1846,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 
 interface GitHubReferencesProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	project?: { name: string; repositories?: Array<{ repo: string }> } | null;
 }
 
 export function GitHubReferences({ run, project }: GitHubReferencesProps) {
@@ -1880,9 +1881,9 @@ export function GitHubReferences({ run, project }: GitHubReferencesProps) {
 				</span>
 			)}
 			{hasPR &&
-				(project?.repo ? (
+				(projectRepo(project) ? (
 					<a
-						href={`https://github.com/${project.repo}/pull/${run.prNumber}`}
+						href={`https://github.com/${projectRepo(project)}/pull/${run.prNumber}`}
 						target="_blank"
 						rel="noopener noreferrer"
 						className="inline-flex items-center gap-1 text-violet-400 hover:text-violet-300 font-mono hover:underline w-fit"
@@ -2013,7 +2014,7 @@ function TokenUsageSection({ usage }: TokenUsageSectionProps) {
 
 interface RunOverviewProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	project?: { name: string; repositories?: Array<{ repo: string }> } | null;
 }
 
 function RunOverview({ run, project }: RunOverviewProps) {

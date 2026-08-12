@@ -12,7 +12,12 @@ vi.mock('@tanstack/react-router', () => ({
 import { ProjectsTable } from './projects-table.js';
 
 const projects = [
-	{ id: 'proj-a', name: 'Project A', repo: 'acme/widgets', repoRoot: '/work/widgets' },
+	{
+		id: 'proj-a',
+		name: 'Project A',
+		repositories: [{ repo: 'acme/widgets' }],
+		repoRoot: '/work/widgets',
+	},
 ];
 
 describe('ProjectsTable', () => {
