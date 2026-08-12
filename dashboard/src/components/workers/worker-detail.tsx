@@ -175,8 +175,6 @@ interface WorkerDetailViewProps {
 	worker: WorkerDetail;
 	/** Project id → display name, so an enrollment block names its project. */
 	projectNames: Map<string, string>;
-	/** Project id → repo, for the active job's provider reference. */
-	projectRepos: Map<string, string>;
 	/**
 	 * Project id → the phases that project has turned off for every worker
 	 * (`pipeline.<phase>.enabled: false`), so the Allowed-pipeline-phases control can
@@ -191,7 +189,6 @@ interface WorkerDetailViewProps {
 export function WorkerDetailView({
 	worker,
 	projectNames,
-	projectRepos,
 	projectDisabledPhases,
 	onChanged,
 }: WorkerDetailViewProps) {
@@ -274,7 +271,6 @@ export function WorkerDetailView({
 					<div className="space-y-2">
 						<WorkItemCell
 							run={worker.currentRun}
-							repo={projectRepos.get(worker.currentRun.projectId)}
 							titleHref={`/runs/${worker.currentRun.runId}`}
 							phaseLabel={formatPhase(worker.currentRun.phase)}
 							variant="card"

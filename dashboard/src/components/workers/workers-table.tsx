@@ -292,12 +292,12 @@ interface ConfirmTarget {
 export function WorkersTable({ workers, refetchInterval, onSelectWorker }: WorkersTableProps) {
 	const queryClient = useQueryClient();
 
-	// Resolve projects the same way RunsTable does — names for the consent
-	// switches' accessible labels, repo for an active job's PR link. The roster
-	// falls back to the raw project id when this auxiliary lookup is unavailable.
+	// Resolve projects the same way RunsTable does — names for the consent switches'
+	// accessible labels. The roster falls back to the raw project id when this
+	// auxiliary lookup is unavailable; an active job's PR link needs nothing from it,
+	// coming from the run's own repository (issue #691).
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectNames = new Map(projectsQuery.data?.map((p) => [p.id, p.name]) ?? []);
-	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, p.repo]) ?? []);
 
 	// The signed-in operator's own workers — presence here is what authorizes an
 	// actionable consent switch for an enrollment.
@@ -515,7 +515,6 @@ export function WorkersTable({ workers, refetchInterval, onSelectWorker }: Worke
 									// line here because this table has no Phase column of its own.
 									<WorkItemCell
 										run={worker.currentRun}
-										repo={projectRepos.get(worker.currentRun.projectId)}
 										titleHref={`/runs/${worker.currentRun.runId}`}
 										phaseLabel={formatPhase(worker.currentRun.phase)}
 									/>

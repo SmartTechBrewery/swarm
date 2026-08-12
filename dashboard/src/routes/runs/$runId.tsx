@@ -1535,13 +1535,16 @@ export function CheckpointedCallout({ run, onResetSuccess }: CheckpointedCallout
 	);
 }
 
+/**
+ * The project fields the run header and its callouts still need: the pipeline
+ * settings that gate "Force re-review", and nothing else. The repo used to be here
+ * too, for the PR links, which now come from `run.repository` (issue #691).
+ */
+type ReviewCapCalloutProject = { pipeline?: { respondToReview?: { enabled?: boolean } } } | null;
+
 interface ReviewCapCalloutProps {
 	run: RunRow;
-	project?: {
-		name: string;
-		repo: string;
-		pipeline?: { respondToReview?: { enabled?: boolean } };
-	} | null;
+	project?: ReviewCapCalloutProject;
 }
 
 /**
@@ -1591,9 +1594,9 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 					decision. If that decision is to keep going, "Force re-review" continues the normal
 					corrective cycle once.
 				</p>
-				{project?.repo && run.prNumber && (
+				{run.repository && run.prNumber && (
 					<a
-						href={`https://github.com/${project.repo}/pull/${run.prNumber}`}
+						href={`https://github.com/${run.repository}/pull/${run.prNumber}`}
 						target="_blank"
 						rel="noopener noreferrer"
 						className="inline-flex items-center gap-1 mt-2 text-red-300 hover:text-red-200 font-mono hover:underline"
@@ -1619,7 +1622,6 @@ const MERGE_TERMINAL_LABELS: Record<string, string> = {
 
 interface ReviewMergeCalloutProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
 }
 
 /**
@@ -1628,12 +1630,12 @@ interface ReviewMergeCalloutProps {
  * retry, a terminal refusal, or retry exhaustion. A no-op when the run never
  * attempted a merge (automation disabled, or the verdict wasn't an approval).
  */
-export function ReviewMergeCallout({ run, project }: ReviewMergeCalloutProps) {
+export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 	if (run.phase !== 'review' || !run.reviewMergeOutcome) return null;
 
-	const prLink = project?.repo && run.prNumber && (
+	const prLink = run.repository && run.prNumber && (
 		<a
-			href={`https://github.com/${project.repo}/pull/${run.prNumber}`}
+			href={`https://github.com/${run.repository}/pull/${run.prNumber}`}
 			target="_blank"
 			rel="noopener noreferrer"
 			className="inline-flex items-center gap-1 mt-2 font-mono hover:underline"
@@ -1699,7 +1701,8 @@ export function ReviewMergeCallout({ run, project }: ReviewMergeCalloutProps) {
 
 interface RunDetailHeaderProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	/** Forwarded to {@link ReviewCapCallout}, which is the header's only use for it. */
+	project?: ReviewCapCalloutProject;
 }
 
 export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
@@ -1838,17 +1841,16 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 			<CheckpointPanel run={run} />
 			<RecoveryCallout run={run} />
 			<ReviewCapCallout run={run} project={project} />
-			<ReviewMergeCallout run={run} project={project} />
+			<ReviewMergeCallout run={run} />
 		</div>
 	);
 }
 
 interface GitHubReferencesProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
 }
 
-export function GitHubReferences({ run, project }: GitHubReferencesProps) {
+export function GitHubReferences({ run }: GitHubReferencesProps) {
 	const hasWorkItem = !!run.workItemId;
 	const hasPR = !!run.prNumber;
 	const workItemRef = parseWorkItemRef(run.workItemUrl);
@@ -1880,9 +1882,9 @@ export function GitHubReferences({ run, project }: GitHubReferencesProps) {
 				</span>
 			)}
 			{hasPR &&
-				(project?.repo ? (
+				(run.repository ? (
 					<a
-						href={`https://github.com/${project.repo}/pull/${run.prNumber}`}
+						href={`https://github.com/${run.repository}/pull/${run.prNumber}`}
 						target="_blank"
 						rel="noopener noreferrer"
 						className="inline-flex items-center gap-1 text-violet-400 hover:text-violet-300 font-mono hover:underline w-fit"
@@ -2013,7 +2015,8 @@ function TokenUsageSection({ usage }: TokenUsageSectionProps) {
 
 interface RunOverviewProps {
 	run: RunRow;
-	project?: { name: string; repo: string } | null;
+	/** Only the display name — the Project field is all this reads it for. */
+	project?: { name: string } | null;
 }
 
 function RunOverview({ run, project }: RunOverviewProps) {
@@ -2064,7 +2067,7 @@ function RunOverview({ run, project }: RunOverviewProps) {
 							GitHub References
 						</span>
 						<div className="text-sm text-zinc-200 mt-1 block">
-							<GitHubReferences run={run} project={project} />
+							<GitHubReferences run={run} />
 						</div>
 					</div>
 

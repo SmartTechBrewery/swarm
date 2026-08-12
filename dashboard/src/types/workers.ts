@@ -43,8 +43,10 @@ export interface WorkerOwner {
  */
 export interface WorkerActiveRun {
 	runId: string;
-	/** The run's project — the row resolves its repo from this for the PR link. */
+	/** The run's project, so the Active job line can name it. */
 	projectId: string;
+	/** The repository the run acted on (`owner/repo`) — where its PR link comes from (issue #691). */
+	repository: string;
 	taskId: string;
 	phase: string;
 	workItemId: string | null;

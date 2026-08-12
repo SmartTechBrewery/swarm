@@ -292,6 +292,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 			id: RUN_ID,
 			status: 'running',
 			projectId: 'proj-a',
+			repository: 'acme/api',
 			taskId: '42',
 			phase: 'implementation',
 			workItemId: 'I_kwitem',
@@ -360,10 +361,13 @@ describe('listDashboardWorkers (issue #133)', () => {
 
 			const [view] = await listDashboardWorkers(null);
 			// The Workers screen renders the same work-item description `/runs` does
-			// (issue #473), so the read model carries the run's task fields.
+			// (issue #473), so the read model carries the run's task fields — including
+			// the repository the run acted on, which is where its PR link comes from
+			// rather than the owning project's repo (issue #691).
 			expect(view.currentRun).toEqual({
 				runId: RUN_ID,
 				projectId: 'proj-a',
+				repository: 'acme/api',
 				taskId: '42',
 				phase: 'implementation',
 				workItemId: 'I_kwitem',
@@ -394,6 +398,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 					'prNumber',
 					'prTitle',
 					'projectId',
+					'repository',
 					'runId',
 					'taskId',
 					'workItemId',
