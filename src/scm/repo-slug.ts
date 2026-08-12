@@ -38,9 +38,9 @@ const execFileAsync = promisify(execFile);
 export function normalizeRepoSlug(slug: string): string {
 	return slug
 		.trim()
-		.replace(/\.git$/i, '')
 		.replace(/^\/+/, '')
 		.replace(/\/+$/, '')
+		.replace(/\.git$/i, '')
 		.toLowerCase();
 }
 

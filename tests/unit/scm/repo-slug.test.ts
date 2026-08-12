@@ -38,6 +38,10 @@ describe('normalizeRepoSlug', () => {
 		expect(normalizeRepoSlug('  SmartTechBrewery/Swarm.git  ')).toBe('smarttechbrewery/swarm');
 	});
 
+	it('strips a trailing slash before removing a .git suffix', () => {
+		expect(normalizeRepoSlug('SmartTechBrewery/Swarm.git/')).toBe('smarttechbrewery/swarm');
+	});
+
 	it('strips leading and trailing slashes (a URL pathname arrives with one)', () => {
 		expect(normalizeRepoSlug('/SmartTechBrewery/swarm/')).toBe('smarttechbrewery/swarm');
 	});
@@ -54,6 +58,8 @@ describe('repoSlugFromRemoteUrl', () => {
 		['ssh url with a port', 'ssh://git@github.com:443/SmartTechBrewery/swarm.git'],
 		['https url', 'https://github.com/SmartTechBrewery/swarm'],
 		['https url with a port', 'https://github.com:8080/SmartTechBrewery/Swarm.git'],
+		['scp-style ssh with a trailing slash', 'git@github.com:SmartTechBrewery/swarm.git/'],
+		['https url with a trailing slash', 'https://github.com/SmartTechBrewery/swarm.git/'],
 	])('reads the slug from a %s', (_form, url) => {
 		expect(repoSlugFromRemoteUrl(url)).toBe('smarttechbrewery/swarm');
 	});
