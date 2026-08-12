@@ -203,21 +203,16 @@ export function QuotaRouteComponent() {
 											</div>
 										</div>
 
-										{/* Description / Plan / Credits Info */}
-										<div className="grid grid-cols-2 gap-4 border-t border-zinc-850 pt-4 text-xs">
-											<div>
-												<span className="text-zinc-500 block">Plan Tier</span>
-												<span className="text-zinc-300 font-medium capitalize">
-													{q.plan || 'Standard'}
-												</span>
-											</div>
-											{q.credits && (
+										{/* Credits Info — the plan tier this row used to share is deliberately
+										    not shown (issue #679): it is account/product detail, not a quota. */}
+										{q.credits && (
+											<div className="grid grid-cols-2 gap-4 border-t border-zinc-850 pt-4 text-xs">
 												<div>
 													<span className="text-zinc-500 block">Credits / Resets</span>
 													<span className="text-zinc-300 font-medium font-mono">{q.credits}</span>
 												</div>
-											)}
-										</div>
+											</div>
+										)}
 
 										{/* Windows & Usage */}
 										{q.windows && q.windows.length > 0 ? (

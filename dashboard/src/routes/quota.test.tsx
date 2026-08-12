@@ -45,6 +45,37 @@ describe('quota route', () => {
 		expect(screen.getByText('1500-minute (25h)')).toBeTruthy();
 	});
 
+	// Issue #679: the plan tier is account/product detail, not a quota, so no card
+	// may carry it — not even the "Standard" placeholder shown when a CLI reports none.
+	it('omits plan tier copy while keeping credits and usage', async () => {
+		renderQuotaScreen([
+			{
+				cli: 'claude',
+				status: 'available',
+				source: 'live',
+				plan: 'max',
+				credits: 'available: 1',
+				lastUpdated: new Date().toISOString(),
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 40 }],
+			},
+			{
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: new Date().toISOString(),
+				windows: [{ name: 'Hourly', sourceSlot: 'primary', durationMins: 60, usedPercent: 10 }],
+			},
+		]);
+
+		expect(await screen.findByText('Weekly (7d)')).toBeTruthy();
+		expect(screen.getByText('Credits / Resets')).toBeTruthy();
+		expect(screen.getByText('available: 1')).toBeTruthy();
+		expect(screen.getByText('Hourly (1h)')).toBeTruthy();
+		expect(screen.queryByText(/plan tier/i)).toBeNull();
+		expect(screen.queryByText('max')).toBeNull();
+		expect(screen.queryByText('Standard')).toBeNull();
+	});
+
 	it('uses source slots as distinct keys when window metadata is absent', async () => {
 		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 		renderQuotaScreen([
