@@ -34,11 +34,11 @@ export function WorkerDetailRouteComponent() {
 	const workerQueryOptions = trpc.workers.getById.queryOptions({ workerId });
 	const workerQuery = useQuery({ ...workerQueryOptions, refetchInterval: WORKERS_REFETCH_MS });
 
-	// Names and repos for the enrollment blocks and the active job's PR link,
-	// resolved the same way the table does; both fall back to the raw project id.
+	// Names for the enrollment blocks, resolved the same way the table does and
+	// falling back to the raw project id. The active job's PR link needs nothing from
+	// here — it comes from the run's own repository (issue #691).
 	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const projectNames = new Map(projectsQuery.data?.map((p) => [p.id, p.name]) ?? []);
-	const projectRepos = new Map(projectsQuery.data?.map((p) => [p.id, p.repo]) ?? []);
 	// Which phases each project has switched off for every worker (issue #509) — read
 	// from the same project config the Agents tab edits, so the phase control names a
 	// project-wide "off" instead of offering a phase that can never run. A project
@@ -89,7 +89,6 @@ export function WorkerDetailRouteComponent() {
 				<WorkerDetailView
 					worker={worker}
 					projectNames={projectNames}
-					projectRepos={projectRepos}
 					projectDisabledPhases={disabledPhasesByProject}
 					onChanged={() => queryClient.invalidateQueries({ queryKey: workerQueryOptions.queryKey })}
 				/>

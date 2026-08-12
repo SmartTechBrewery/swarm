@@ -93,6 +93,18 @@ describe('queuedWorkItemLabel', () => {
 		expect(queuedWorkItemUrl(boardRun())).toBe('https://github.com/acme/widgets/issues/42');
 	});
 
+	// issue #691 — the run-facing surfaces moved onto `runs.repository`, but the
+	// queued read model deliberately did not: `QueuedRun.repo` is recorded per
+	// dispatch from the job payload (`toQueuedRun`, `src/queue/queued-runs.ts`), and a
+	// fresh dispatch has no run row to read a repository off. So the PR URL here must
+	// keep following the dispatch's own repo.
+	it("builds a queued PR URL from the dispatch's own repo, not a project or run lookup", () => {
+		expect(queuedWorkItemUrl(githubRun({ repo: 'acme/api' }))).toBe(
+			'https://github.com/acme/api/pull/42',
+		);
+		expect(queuedWorkItemUrl(githubRun({ repo: undefined }))).toBeUndefined();
+	});
+
 	it('does not expose an opaque board node id when metadata is unavailable', () => {
 		expect(
 			queuedWorkItemLabel(

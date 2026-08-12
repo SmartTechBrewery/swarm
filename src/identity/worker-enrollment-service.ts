@@ -360,8 +360,15 @@ export interface DashboardEnrollmentView {
  */
 export interface DashboardWorkerRun {
 	runId: string;
-	/** The run's project — the Workers screen resolves its repo for the PR link from this. */
+	/** The run's project, so the Active job line can name it. */
 	projectId: string;
+	/**
+	 * The repository the run acted on (`owner/repo`) — carried on the summary so the
+	 * Active job cell builds its PR link from the run itself (issue #691) rather than
+	 * from the owning project's repo, which identifies one only while the project
+	 * owns exactly one.
+	 */
+	repository: string;
 	taskId: string;
 	phase: string;
 	workItemId: string | null;
@@ -581,6 +588,7 @@ async function getIfRunningAndAccessible(
 	return {
 		runId: run.id,
 		projectId: run.projectId,
+		repository: run.repository,
 		taskId: run.taskId,
 		phase: run.phase,
 		workItemId: run.workItemId,

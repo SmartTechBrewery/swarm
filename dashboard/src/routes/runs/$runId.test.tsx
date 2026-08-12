@@ -59,6 +59,7 @@ function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'project-1',
+		repository: 'acme/demo',
 		taskId: 'task-1',
 		workItemId: null,
 		workItemTitle: null,
@@ -126,10 +127,8 @@ describe('ReviewCapCallout (issue #242)', () => {
 	function renderCapCallout(
 		run: RunRow = makeReviewRun(),
 		project: {
-			name: string;
-			repo: string;
 			pipeline?: { respondToReview?: { enabled?: boolean } };
-		} | null = { name: 'Demo', repo: 'acme/demo' },
+		} | null = {},
 	) {
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 		return render(
@@ -156,8 +155,6 @@ describe('ReviewCapCallout (issue #242)', () => {
 
 	it('withholds Force re-review when Respond-to-review is disabled', () => {
 		renderCapCallout(makeReviewRun(), {
-			name: 'Demo',
-			repo: 'acme/demo',
 			pipeline: { respondToReview: { enabled: false } },
 		});
 
@@ -165,15 +162,17 @@ describe('ReviewCapCallout (issue #242)', () => {
 		expect(screen.queryByRole('button', { name: /force re-review/i })).toBeNull();
 	});
 
-	it('links to the PR when the project repo is known', () => {
-		renderCapCallout();
+	it("links to the PR in the run's own repository (issue #691)", () => {
+		// No project at all: the link is built from the run, so the project lookup the
+		// pre-#691 code needed for it is beside the point.
+		renderCapCallout(makeReviewRun({ repository: 'acme/api' }), null);
 
 		const link = screen.getByRole('link', { name: /view pr #42/i }) as HTMLAnchorElement;
-		expect(link.href).toBe('https://github.com/acme/demo/pull/42');
+		expect(link.href).toBe('https://github.com/acme/api/pull/42');
 	});
 
-	it('omits the PR link when no project is known', () => {
-		renderCapCallout(makeReviewRun(), null);
+	it('omits the PR link when the run recorded no repository', () => {
+		renderCapCallout(makeReviewRun({ repository: '' }));
 
 		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
 		expect(screen.queryByRole('link', { name: /view pr/i })).toBeNull();
@@ -181,10 +180,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 
 	it('renders nothing for an ordinary first changes-requested verdict', () => {
 		const { container } = render(
-			<ReviewCapCallout
-				run={makeReviewRun({ reviewOrdinal: 1, reviewAutomationOutcome: null })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
-			/>,
+			<ReviewCapCallout run={makeReviewRun({ reviewOrdinal: 1, reviewAutomationOutcome: null })} />,
 		);
 
 		expect(container.firstChild).toBeNull();
@@ -192,10 +188,7 @@ describe('ReviewCapCallout (issue #242)', () => {
 
 	it('renders nothing for an approval verdict even with the outcome field set', () => {
 		const { container } = render(
-			<ReviewCapCallout
-				run={makeReviewRun({ reviewVerdict: 'approve' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
-			/>,
+			<ReviewCapCallout run={makeReviewRun({ reviewVerdict: 'approve' })} />,
 		);
 
 		expect(container.firstChild).toBeNull();
@@ -203,22 +196,14 @@ describe('ReviewCapCallout (issue #242)', () => {
 
 	it('renders nothing for a non-Review phase', () => {
 		const { container } = render(
-			<ReviewCapCallout
-				run={makeReviewRun({ phase: 'respond-to-review' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
-			/>,
+			<ReviewCapCallout run={makeReviewRun({ phase: 'respond-to-review' })} />,
 		);
 
 		expect(container.firstChild).toBeNull();
 	});
 
 	it('renders nothing for a run still in progress', () => {
-		const { container } = render(
-			<ReviewCapCallout
-				run={makeReviewRun({ status: 'running' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
-			/>,
-		);
+		const { container } = render(<ReviewCapCallout run={makeReviewRun({ status: 'running' })} />);
 
 		expect(container.firstChild).toBeNull();
 	});
@@ -548,10 +533,7 @@ describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 describe('ReviewMergeCallout (issue #278)', () => {
 	it('renders nothing when no merge automation ran', () => {
 		const { container } = render(
-			<ReviewMergeCallout
-				run={makeReviewRun({ reviewMergeOutcome: null })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
-			/>,
+			<ReviewMergeCallout run={makeReviewRun({ reviewMergeOutcome: null })} />,
 		);
 
 		expect(container.firstChild).toBeNull();
@@ -561,7 +543,6 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		const { container } = render(
 			<ReviewMergeCallout
 				run={makeReviewRun({ phase: 'respond-to-review', reviewMergeOutcome: 'merged' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
 			/>,
 		);
 
@@ -575,7 +556,6 @@ describe('ReviewMergeCallout (issue #278)', () => {
 					reviewMergeOutcome: 'merged',
 					reviewMergeMessage: 'Pull Request successfully merged',
 				})}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
 			/>,
 		);
 
@@ -592,7 +572,6 @@ describe('ReviewMergeCallout (issue #278)', () => {
 					reviewMergeOutcome: 'not-ready',
 					reviewMergeMessage: 'required checks are still pending',
 				})}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
 			/>,
 		);
 
@@ -612,7 +591,6 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		render(
 			<ReviewMergeCallout
 				run={makeReviewRun({ reviewMergeOutcome: outcome, reviewMergeMessage: 'details here' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
 			/>,
 		);
 
@@ -691,7 +669,6 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 					prTitle: null,
 					producedPrUrl: 'https://github.com/acme/demo/pull/77',
 				})}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
 			/>,
 		);
 
@@ -705,7 +682,6 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 		render(
 			<GitHubReferences
 				run={makeReviewRun({ producedPrUrl: 'https://github.com/acme/demo/pull/77' })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
 			/>,
 		);
 
@@ -716,13 +692,41 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 
 	it('still renders the neutral dash for a run with no references at all', () => {
 		const { container } = render(
-			<GitHubReferences
-				run={makeReviewRun({ prNumber: null, prTitle: null })}
-				project={{ name: 'Demo', repo: 'acme/demo' }}
-			/>,
+			<GitHubReferences run={makeReviewRun({ prNumber: null, prTitle: null })} />,
 		);
 
 		expect(container.textContent).toBe('—');
+	});
+});
+
+// issue #691 — every PR link on the run detail page resolves its repository from
+// the run row. The components take no project at all anymore, so a run whose
+// repository differs from the one its project would have supplied still links right.
+describe("run-detail PR links follow the run's repository (issue #691)", () => {
+	const onOtherRepo = makeReviewRun({
+		repository: 'acme/api',
+		reviewMergeOutcome: 'merged',
+	});
+
+	it('builds the GitHub References PR link from the run repository', () => {
+		render(<GitHubReferences run={onOtherRepo} />);
+
+		const link = screen.getByRole('link', { name: /^PR #42$/ }) as HTMLAnchorElement;
+		expect(link.href).toBe('https://github.com/acme/api/pull/42');
+	});
+
+	it('builds the merge callout PR link from the run repository', () => {
+		render(<ReviewMergeCallout run={onOtherRepo} />);
+
+		const link = screen.getByRole('link', { name: /view pr #42/i }) as HTMLAnchorElement;
+		expect(link.href).toBe('https://github.com/acme/api/pull/42');
+	});
+
+	it('leaves the PR number unlinked when the run recorded no repository', () => {
+		render(<GitHubReferences run={makeReviewRun({ repository: '' })} />);
+
+		expect(screen.queryByRole('link', { name: /^PR #42$/ })).toBeNull();
+		expect(screen.getByText('PR #42')).toBeDefined();
 	});
 });
 

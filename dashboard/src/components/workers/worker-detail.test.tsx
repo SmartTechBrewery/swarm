@@ -83,7 +83,6 @@ function confirmButton(name: string): HTMLElement {
 }
 
 const PROJECT_NAMES = new Map([['proj-a', 'Widgets']]);
-const PROJECT_REPOS = new Map([['proj-a', 'acme/widgets']]);
 
 const onChanged = vi.fn();
 
@@ -100,7 +99,6 @@ function renderWorker(
 		<WorkerDetailView
 			worker={makeWorker(overrides)}
 			projectNames={PROJECT_NAMES}
-			projectRepos={PROJECT_REPOS}
 			projectDisabledPhases={disabledPhases}
 			onChanged={onChanged}
 		/>,
@@ -222,6 +220,7 @@ describe('WorkerDetailView sections (issue #477)', () => {
 			currentRun: {
 				runId: 'run-7',
 				projectId: 'proj-a',
+				repository: 'acme/widgets',
 				taskId: '42',
 				phase: 'implementation',
 				workItemId: 'I_kwitem',

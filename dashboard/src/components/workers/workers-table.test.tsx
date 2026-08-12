@@ -72,6 +72,7 @@ function makeActiveRun(overrides: Partial<WorkerActiveRun> = {}): WorkerActiveRu
 	return {
 		runId: 'run-7',
 		projectId: 'proj-a',
+		repository: 'acme/widgets',
 		taskId: '42',
 		phase: 'implementation',
 		workItemId: 'I_kwitem',
@@ -357,7 +358,9 @@ describe('WorkersTable active job (issue #473)', () => {
 		).toBe('/runs/run-7');
 	});
 
-	it('leads a PR-driven job with the PR title and PR reference', async () => {
+	it("leads a PR-driven job with the PR title and a PR reference in the run's repository", async () => {
+		// The project still names `acme/widgets` — the pre-#691 source of this link — so
+		// an href naming it would mean the cell is still resolving the repo by project.
 		projectsListQueryFn.mockResolvedValue([
 			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
 		]);
@@ -369,6 +372,7 @@ describe('WorkersTable active job (issue #473)', () => {
 							phase: 'review',
 							prNumber: '19',
 							prTitle: 'Count dispatches correctly',
+							repository: 'acme/api',
 						}),
 					}),
 				]}
@@ -377,7 +381,7 @@ describe('WorkersTable active job (issue #473)', () => {
 
 		expect(await screen.findByRole('link', { name: 'Count dispatches correctly' })).toBeDefined();
 		const pr = await screen.findByRole('link', { name: /PR #19/ });
-		expect(pr.getAttribute('href')).toBe('https://github.com/acme/widgets/pull/19');
+		expect(pr.getAttribute('href')).toBe('https://github.com/acme/api/pull/19');
 	});
 
 	it('still links a job whose title has not resolved, so a busy worker never reads as idle', async () => {
