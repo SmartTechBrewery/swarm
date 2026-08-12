@@ -90,6 +90,7 @@ function agentResult(): AgentCliResult {
 const baseInputs = () => ({
 	taskId: '17',
 	project: createMockProjectConfig(),
+	repository: 'SmartTechBrewery/run-repo',
 	workItem: createMockWorkItem(),
 	runId: RUN_ID,
 	recovery: createMockPhaseRecovery(),

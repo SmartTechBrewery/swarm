@@ -66,6 +66,9 @@ function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {})
 		submitReview,
 		options: {
 			project: createMockProjectConfig(),
+			// The repository the run recorded, fed explicitly rather than read off the
+			// project config (issue #692).
+			repository: 'SmartTechBrewery/run-repo',
 			prNumber: '42',
 			headSha: 'abc1234',
 			taskId: 'review-42',
@@ -287,6 +290,7 @@ describe('review production delivery', () => {
 		const getPriorSubmittedReview = vi.fn(async () => undefined);
 		const options = {
 			project: createMockProjectConfig(),
+			repository: 'SmartTechBrewery/run-repo',
 			prNumber: '42',
 			headSha: 'abc',
 			taskId: 'review-42',
@@ -323,7 +327,8 @@ describe('review production delivery', () => {
 		expect(markReviewVerdictSubmitted).toHaveBeenCalledWith(
 			{
 				projectId: options.project.id,
-				repository: options.project.repo,
+				// The repository the run recorded, not the project's (issue #692).
+				repository: options.repository,
 				prNumber: '42',
 				headSha: 'abc',
 			},
