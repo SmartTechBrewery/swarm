@@ -349,6 +349,16 @@ Read [`ai/RULES.md`](./ai/RULES.md) before making changes. Run
 `npm run verify` before submitting a change. GitHub Actions runs the same
 verification command for every pull request.
 
+### Temporary: pre-multi-repo restore point
+
+`single_repo_backup` marks the last commit before the multi-repo migration
+(issues [#683](https://github.com/SmartTechBrewery/swarm/issues/683)–[#687](https://github.com/SmartTechBrewery/swarm/issues/687)) — one project owning several
+repositories instead of exactly one. That migration reaches the config schema,
+the run read model, every phase's dedup key, and worker routing, so the branch
+exists to return to a known-good single-repository state if it goes wrong.
+
+**Delete this branch and this section once the migration has stabilized.**
+
 ## License
 
 SWARM is licensed under the [Apache License 2.0](./LICENSE).
