@@ -78,6 +78,23 @@ describe('Sidebar user block', () => {
 		expect(link.getAttribute('title')).toBe('ada@example.com');
 	});
 
+	it('leads the profile link with a profile icon, not the connection checkmark (issue #680)', async () => {
+		renderSidebar();
+
+		const link = screen.getByRole('link', { name: 'Ada Lovelace' });
+		const icon = link.querySelector('svg');
+
+		expect(icon?.getAttribute('class')).toContain('lucide-user');
+		// Decorative: the visible name, not the icon, names the link.
+		expect(icon?.getAttribute('aria-hidden')).toBe('true');
+
+		// The connection status keeps its own icon, but no longer in front of the
+		// name where it read as the account entry's leading checkmark.
+		const status = await screen.findByRole('status', { name: 'Connected' });
+		expect(link.contains(status)).toBe(false);
+		expect(link.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+	});
+
 	it('keeps Sign out beside the profile link', () => {
 		renderSidebar();
 

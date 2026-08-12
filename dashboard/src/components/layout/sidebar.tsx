@@ -11,6 +11,7 @@ import {
 	Plus,
 	Server,
 	Settings,
+	User,
 } from 'lucide-react';
 import { useState } from 'react';
 import { ProjectCreateDialog } from '@/components/projects/project-create-dialog.js';
@@ -191,33 +192,24 @@ export function Sidebar() {
 			    profile and Sign out stay reachable from anywhere in the nav (#665). */}
 			{currentUser.data && (
 				<div className="flex shrink-0 items-center gap-2 border-t border-zinc-850 px-4 py-3">
-					{/* The connection state survived the removal of its "Connected" text
-					    (#665) — the footer is an account area now, and the status reads
-					    fine as an icon. Each state gets its own shape (not just a color),
-					    and `role="status"` + `aria-label` give it an accessible, live-
-					    announced name without needing a focusable control or a visible
-					    label put back: nothing renders `connectionLabel` in the sidebar. */}
-					<span
-						role="status"
-						aria-label={connectionLabel}
-						title={connectionLabel}
-						className="shrink-0"
-					>
-						<ConnectionIcon aria-hidden="true" className={connectionIconClassName} />
-					</span>
 					{/* The signed-in user's name is the way into their own profile
-					    (issue #659) — it was a label until then. `min-w-0 truncate` stays
-					    so a long name can't push the Sign out button off the row. */}
+					    (issue #659) — it was a label until then. Its leading icon says so:
+					    a plain outlined profile bust, decorative (`aria-hidden`) because the
+					    visible name is still the link's accessible name. It used to be the
+					    connection status that sat here, which read as a checkmark labelling
+					    the account (issue #680). `min-w-0 truncate` stays on the name so a
+					    long one can't push the Sign out button off the row. */}
 					<Link
 						to="/profile"
 						className={
 							currentPath.startsWith('/profile')
-								? 'min-w-0 flex-1 truncate text-xs text-zinc-100'
-								: 'min-w-0 flex-1 truncate text-xs text-zinc-400 hover:text-zinc-200 transition-colors'
+								? 'flex min-w-0 flex-1 items-center gap-2 text-xs text-zinc-100'
+								: 'flex min-w-0 flex-1 items-center gap-2 text-xs text-zinc-400 hover:text-zinc-200 transition-colors'
 						}
 						title={currentUser.data.identifier}
 					>
-						{currentUser.data.displayName}
+						<User aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+						<span className="truncate">{currentUser.data.displayName}</span>
 					</Link>
 					<button
 						type="button"
@@ -228,6 +220,22 @@ export function Sidebar() {
 						<LogOut className="h-3.5 w-3.5" />
 						Sign out
 					</button>
+					{/* The connection state survived the removal of its "Connected" text
+					    (#665) — the footer is an account area now, and the status reads
+					    fine as an icon. Each state gets its own shape (not just a color),
+					    and `role="status"` + `aria-label` give it an accessible, live-
+					    announced name without needing a focusable control or a visible
+					    label put back: nothing renders `connectionLabel` in the sidebar.
+					    It trails the row rather than leading it (#680): a state icon in
+					    front of the name was read as the account entry's own icon. */}
+					<span
+						role="status"
+						aria-label={connectionLabel}
+						title={connectionLabel}
+						className="shrink-0"
+					>
+						<ConnectionIcon aria-hidden="true" className={connectionIconClassName} />
+					</span>
 				</div>
 			)}
 			<ProjectCreateDialog open={createOpen} onOpenChange={setCreateOpen} />
