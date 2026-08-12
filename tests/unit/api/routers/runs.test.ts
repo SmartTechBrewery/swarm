@@ -405,6 +405,7 @@ describe('runsRouter', () => {
 					displayName: 'studio-mac',
 					capabilities: ['claude'],
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+					repository: null,
 					createdAt: new Date(0),
 					updatedAt: new Date(0),
 				},
@@ -831,6 +832,7 @@ describe('runsRouter', () => {
 				displayName: 'alice-macbook',
 				capabilities: ['claude' as const],
 				supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+				repository: null,
 				createdAt: new Date(0),
 				updatedAt: new Date(0),
 			};

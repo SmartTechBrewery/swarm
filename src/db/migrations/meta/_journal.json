@@ -316,6 +316,13 @@
       "when": 1786106998397,
       "tag": "0044_project_scm_type",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1786548517352,
+      "tag": "0045_worker_repository",
+      "breakpoints": true
     }
   ]
 }

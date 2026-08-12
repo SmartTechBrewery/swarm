@@ -34,6 +34,7 @@ import {
 	updateWorkerSupportedPhases,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import { RepoSlugSchema } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
 import {
@@ -118,16 +119,26 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * in the same transaction when supplied. Omit it — as `swarm workers set-cli` does —
  * to leave the stored phases as they are; a caller that knows nothing about phases
  * must not reset them to the every-phase default.
+ *
+ * `repository` (issue #687) is which repository the daemon's one local checkout is,
+ * written in that same transaction and validated here — so the service seam, not
+ * only the wire, is a boundary that cannot store an unnormalised slug. Three-valued
+ * exactly as the repository layer documents: omit it to leave the stored value alone
+ * (again the `set-cli` path), pass `null` when the connecting daemon declared none,
+ * which clears a previous daemon's statement.
  */
 export async function refreshWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
 	supportedPhases?: TriggerPhase[],
+	repository?: string | null,
 ): Promise<Worker | undefined> {
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
 	const validatedPhases =
 		supportedPhases === undefined ? undefined : WorkerSupportedPhasesSchema.parse(supportedPhases);
-	return updateWorkerCapabilities(id, validated, validatedPhases);
+	const validatedRepository =
+		repository === undefined || repository === null ? repository : RepoSlugSchema.parse(repository);
+	return updateWorkerCapabilities(id, validated, validatedPhases, validatedRepository);
 }
 
 /**

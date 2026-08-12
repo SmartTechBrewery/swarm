@@ -189,8 +189,10 @@ operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`, even on a host th
 them. Its agent therefore authenticates as the *operator's own* GitHub account
 everywhere, which is ADR-004 §2's decision; the project-scoped reviewer PAT and PM
 credential never leave the server, so a submitted review's identity is unchanged. It performs the
-`/worker/session` handshake (declaring the CLIs it can run and the pipeline phases
-it can execute), keeps its session
+`/worker/session` handshake (declaring the CLIs it can run, the pipeline phases
+it can execute, and — since issue #687 — which repository its one local checkout
+actually is, read from that checkout's `origin` remote and persisted on the worker
+row; a checkout with no identifiable `origin` simply declares nothing), keeps its session
 live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
 and executes a pushed `TaskAssignment` **DB-free**: project config comes from the
 assignment while `repoRoot` is resolved from this host (`SWARM_WORKER_REPO_ROOT`,

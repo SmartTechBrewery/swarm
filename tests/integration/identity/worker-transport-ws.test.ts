@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
-import { registerWorker } from '../../../src/identity/worker-service.js';
+import { getWorker, registerWorker } from '../../../src/identity/worker-service.js';
 import { getLiveSessionForWorker } from '../../../src/identity/worker-session-service.js';
 import { registerWorkerTransport } from '../../../src/router/worker-transport.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '../../../src/transport/protocol.js';
@@ -84,7 +84,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			else process.env.SWARM_WORKER_HEARTBEAT_TTL_MS = originalTtl;
 		});
 
-		async function handshake() {
+		/** The handshake body a current daemon sends; `extra` adds the optional declarations. */
+		async function handshake(extra: Record<string, unknown> = {}) {
 			const res = await fetch(`${transport.httpBase}/worker/session`, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
@@ -94,10 +95,32 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					hostname: 'ada-laptop',
 					capabilities: ['claude'],
 					protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+					...extra,
 				}),
 			});
 			return { status: res.status, body: (await res.json()) as Record<string, unknown> };
 		}
+
+		// Issue #687 — the declaration end to end: the real route, the real service, the
+		// real column. A registered-but-never-connected worker states nothing.
+		it('persists the declared repository on the worker row, and clears it when a daemon declares none', async () => {
+			expect((await getWorker(workerId))?.repository).toBeNull();
+
+			const declared = await handshake({ repository: 'SmartTechBrewery/Swarm.git' });
+			expect(declared.status).toBe(200);
+			// Normalised at the router boundary, so the row holds one canonical form.
+			expect((await getWorker(workerId))?.repository).toBe('smarttechbrewery/swarm');
+
+			// Let the lease lapse so the next handshake is a plain acquire rather than a 409.
+			await sleep(TTL_MS + 200);
+
+			// The older-daemon shape (and equally a checkout with no identifiable `origin`):
+			// the row records NULL rather than keeping the previous daemon's statement, since
+			// it describes the program currently operating it.
+			const silent = await handshake();
+			expect(silent.status).toBe(200);
+			expect((await getWorker(workerId))?.repository).toBeNull();
+		});
 
 		it('handshakes, keeps the lease live via heartbeats, and expires it once they stop', async () => {
 			const { status, body } = await handshake();

@@ -14,6 +14,7 @@ const validWorker = {
 	displayName: 'ada-laptop',
 	capabilities: ['claude', 'codex'],
 	supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+	repository: null,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };
@@ -87,6 +88,26 @@ describe('WorkerSchema', () => {
 
 	it('rejects a non-uuid ownerUserId', () => {
 		expect(() => WorkerSchema.parse({ ...validWorker, ownerUserId: 'nope' })).toThrow();
+	});
+
+	// Issue #687 — the daemon-declared checkout identity. Nullable, not optional: a
+	// worker that has declared nothing says so explicitly rather than by omission, so
+	// no reader has an "absent" case to interpret.
+	it('accepts a declared repository and normalises it to the stored form', () => {
+		expect(
+			WorkerSchema.parse({ ...validWorker, repository: 'SmartTechBrewery/Swarm.git' }),
+		).toEqual({ ...validWorker, repository: 'smarttechbrewery/swarm' });
+	});
+
+	it('rejects an omitted repository, and a host-prefixed one', () => {
+		const { repository, ...withoutRepository } = validWorker;
+		expect(WorkerSchema.safeParse(withoutRepository).success).toBe(false);
+		expect(
+			WorkerSchema.safeParse({
+				...validWorker,
+				repository: 'https://github.com/SmartTechBrewery/swarm',
+			}).success,
+		).toBe(false);
 	});
 
 	it('has no credential/hash field in the read model', () => {

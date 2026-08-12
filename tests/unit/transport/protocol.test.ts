@@ -78,6 +78,29 @@ describe('transport protocol schemas', () => {
 			expect(HandshakeRequestSchema.safeParse(withoutHostname).success).toBe(false);
 		});
 
+		// Issue #687: the daemon declares which repository its one local checkout is.
+		// Additive and optional in both directions like `reclaim` below, which is why
+		// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped: the shape above (with
+		// no `repository`) is the older daemon's and stays valid, and its omission is what
+		// records NULL on the worker row.
+		it('accepts a declared repository, normalised to the host-less owner/repo form', () => {
+			expect(
+				HandshakeRequestSchema.parse({ ...valid, repository: 'SmartTechBrewery/Swarm.git' }),
+			).toEqual({ ...valid, repository: 'smarttechbrewery/swarm' });
+		});
+
+		it('accepts a nested namespace a GitLab subgroup checkout would declare', () => {
+			expect(
+				HandshakeRequestSchema.parse({ ...valid, repository: 'group/sub/project' }).repository,
+			).toBe('group/sub/project');
+		});
+
+		it('rejects a host-prefixed, single-segment, or empty repository', () => {
+			for (const repository of ['https://github.com/SmartTechBrewery/swarm', 'swarm', '']) {
+				expect(HandshakeRequestSchema.safeParse({ ...valid, repository }).success).toBe(false);
+			}
+		});
+
 		// Issue #608: a reconnecting daemon presents the lease it already holds. The
 		// field is additive and optional in both directions, which is why
 		// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped for it — the shape
