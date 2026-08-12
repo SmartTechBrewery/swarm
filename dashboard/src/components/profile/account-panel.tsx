@@ -14,9 +14,9 @@ import {
  * `auth.me` read model, which is already the public `SwarmUser` shape (no password
  * hash, no session token), and it renders only the three facts that answer "who am
  * I and what may I do here": the display name, the login identifier, and the
- * installation role. Editing an account and the security controls that go with it
- * are their own follow-up, so nothing here offers a control that would need
- * authorization.
+ * installation role. Editing is a separate surface — the Security tab (issue #662)
+ * is where a user changes their own display name and password — so nothing here
+ * offers a control, and the two facts an operator owns are not editable anywhere.
  *
  * **It shows the signed-in user and nobody else.** The component takes the user it
  * renders rather than fetching one, and its only caller passes the session's own —
@@ -73,8 +73,10 @@ export function AccountPanel({ user }: { user: AccountUser }) {
 		<div className={CARD_CLASS}>
 			<h2 className={SECTION_HEADING_CLASS}>Account</h2>
 			<p className="text-xs text-zinc-400 mb-4">
-				Who you are signed in as on this SWARM installation. These values are read-only here — an
-				operator manages them with the <span className="font-mono">swarm users</span> CLI.
+				Who you are signed in as on this SWARM installation. Your login identifier and installation
+				role are read-only — an operator manages them with the{' '}
+				<span className="font-mono">swarm users</span> CLI. Your display name is yours to change, on
+				the Security tab.
 			</p>
 
 			<div className="grid grid-cols-1 md:grid-cols-2 gap-4">

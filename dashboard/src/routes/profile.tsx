@@ -3,6 +3,7 @@ import { FolderGit2, type LucideIcon, Server, ShieldCheck, UserRound } from 'luc
 import { AccountPanel } from '@/components/profile/account-panel.js';
 import { MyProjectsPanel } from '@/components/profile/my-projects-panel.js';
 import { MyWorkersPanel } from '@/components/profile/my-workers-panel.js';
+import { SecurityPanel } from '@/components/profile/security-panel.js';
 import {
 	isProfileTabAvailable,
 	type ProfileTab,
@@ -29,12 +30,14 @@ import { rootRoute } from './__root.js';
  * on `isProfileTabAvailable`), and a deep link to a declared-but-undelivered one
  * degrades to Account — so the navigation structure is stated once in
  * `lib/profile-nav.ts` while each follow-up ships its own tab. **Account**, **My
- * Workers** (issue #660), and **My Projects** (issue #661) are delivered; Security
- * is not yet.
+ * Workers** (issue #660), **My Projects** (issue #661), and **Security** (issue #662)
+ * are all delivered.
  *
- * Each panel fetches its own data — nothing about the signed-in user is threaded
- * into one as a prop, so no panel can be handed an identity the session doesn't
- * already establish server-side.
+ * Each panel resolves its own subject from the session — either by fetching
+ * (`My Workers`) or by taking the already-fetched `auth.me` user, which is the
+ * only user this route has. No panel is handed an identity the session doesn't
+ * already establish server-side, and the Security tab's mutations likewise take
+ * no user id.
  */
 
 /**
@@ -125,6 +128,7 @@ function ProfileRouteComponent() {
 			{activeTab === 'account' && <AccountPanel user={currentUser.data} />}
 			{activeTab === 'workers' && <MyWorkersPanel />}
 			{activeTab === 'projects' && <MyProjectsPanel />}
+			{activeTab === 'security' && <SecurityPanel user={currentUser.data} />}
 		</div>
 	);
 }

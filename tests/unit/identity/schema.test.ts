@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { installationRoleFor, isInstanceAdmin, SwarmUserSchema } from '@/identity/schema.js';
+import {
+	installationRoleFor,
+	isInstanceAdmin,
+	SwarmUserSchema,
+	UserDisplayNameSchema,
+} from '@/identity/schema.js';
 
 const validUser = {
 	id: '11111111-1111-4111-8111-111111111111',
@@ -26,6 +31,25 @@ describe('SwarmUserSchema', () => {
 
 	it('rejects a non-uuid id', () => {
 		expect(() => SwarmUserSchema.parse({ ...validUser, id: 'not-a-uuid' })).toThrow();
+	});
+
+	it('trims a padded displayName and rejects an over-long one', () => {
+		expect(SwarmUserSchema.parse({ ...validUser, displayName: '  Ada Lovelace  ' })).toEqual(
+			validUser,
+		);
+		expect(() => SwarmUserSchema.parse({ ...validUser, displayName: 'a'.repeat(81) })).toThrow();
+		expect(SwarmUserSchema.parse({ ...validUser, displayName: 'a'.repeat(80) }).displayName).toBe(
+			'a'.repeat(80),
+		);
+	});
+});
+
+describe('UserDisplayNameSchema', () => {
+	it('trims and bounds a self-editable label', () => {
+		expect(UserDisplayNameSchema.parse('  Ada  ')).toBe('Ada');
+		expect(() => UserDisplayNameSchema.parse('   ')).toThrow();
+		expect(() => UserDisplayNameSchema.parse('')).toThrow();
+		expect(() => UserDisplayNameSchema.parse('a'.repeat(81))).toThrow();
 	});
 });
 

@@ -21,6 +21,7 @@ describe('ProfileTabBar', () => {
 			'Account',
 			'My Workers',
 			'My Projects',
+			'Security',
 		]);
 	});
 
@@ -49,6 +50,15 @@ describe('ProfileTabBar', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'My Projects' }));
 
 		expect(onSelect).toHaveBeenCalledWith('projects');
+	});
+
+	it('reports the Security tab that was clicked', () => {
+		const onSelect = vi.fn();
+		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Security' }));
+
+		expect(onSelect).toHaveBeenCalledWith('security');
 	});
 
 	it('marks the active tab with the underline recipe', () => {

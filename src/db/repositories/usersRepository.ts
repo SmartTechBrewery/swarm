@@ -136,6 +136,24 @@ export async function setInstanceAdmin(id: string, value: boolean): Promise<Swar
 }
 
 /**
+ * Set a user's own display name (issue #662). Returns the updated user, or
+ * `undefined` if no user has that id. `updated_at` maintains itself (`$onUpdate`
+ * on the column), so nothing else is written; the caller validates the name
+ * (`renameUser`, `src/identity/service.ts`).
+ */
+export async function setDisplayName(
+	id: string,
+	displayName: string,
+): Promise<SwarmUser | undefined> {
+	const [row] = await getDb()
+		.update(users)
+		.set({ displayName })
+		.where(eq(users.id, id))
+		.returning();
+	return row ? rowToSwarmUser(row) : undefined;
+}
+
+/**
  * The credential material for a login attempt — the user plus their stored
  * password hash. Kept separate from `SwarmUser` on purpose: the hash is a secret
  * that must never leak into the domain read model or any response, so only the
@@ -155,6 +173,21 @@ export async function findUserCredentialByIdentifier(
 	identifier: string,
 ): Promise<UserCredential | undefined> {
 	const rows = await getDb().select().from(users).where(eq(users.identifier, identifier)).limit(1);
+	const row = rows[0];
+	return row ? { user: rowToSwarmUser(row), passwordHash: row.passwordHash } : undefined;
+}
+
+/**
+ * Resolve a user and their password hash by generated id, for the self-service
+ * password change (issue #662) — the id is what a session authoritatively
+ * carries, and the same key {@link setPasswordHash} takes. Returns `undefined`
+ * when no user has that id; the hash is `null` when the user exists but has no
+ * password set. Carries the same secret as
+ * {@link findUserCredentialByIdentifier}, so it too is read only by the auth
+ * path (`src/identity/auth.ts`).
+ */
+export async function findUserCredentialById(id: string): Promise<UserCredential | undefined> {
+	const rows = await getDb().select().from(users).where(eq(users.id, id)).limit(1);
 	const row = rows[0];
 	return row ? { user: rowToSwarmUser(row), passwordHash: row.passwordHash } : undefined;
 }

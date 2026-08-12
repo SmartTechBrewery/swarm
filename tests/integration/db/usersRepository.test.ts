@@ -4,10 +4,12 @@ import {
 	createUser,
 	ensureLocalAdminUser,
 	findUserByIdentifier,
+	findUserCredentialById,
 	findUserCredentialByIdentifier,
 	getUserById,
 	LOCAL_ADMIN_IDENTIFIER,
 	listUsers,
+	setDisplayName,
 	setInstanceAdmin,
 	setPasswordHash,
 } from '../../../src/db/repositories/usersRepository.js';
@@ -86,6 +88,45 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('usersRepository (integrat
 
 		it('returns undefined for an unknown id', async () => {
 			expect(await setInstanceAdmin('11111111-1111-4111-8111-111111111111', true)).toBeUndefined();
+		});
+	});
+
+	describe('setDisplayName', () => {
+		it('persists the new name and returns the updated user', async () => {
+			const user = await createUser({ identifier: 'rename@example.com', displayName: 'Before' });
+
+			const updated = await setDisplayName(user.id, 'After');
+
+			expect(updated?.displayName).toBe('After');
+			expect(updated?.identifier).toBe('rename@example.com');
+			expect((await getUserById(user.id))?.displayName).toBe('After');
+		});
+
+		it('returns undefined for an unknown id and leaves other users alone', async () => {
+			const other = await createUser({ identifier: 'other@example.com', displayName: 'Other' });
+
+			expect(await setDisplayName('11111111-1111-4111-8111-111111111111', 'Nope')).toBeUndefined();
+			expect((await getUserById(other.id))?.displayName).toBe('Other');
+		});
+	});
+
+	describe('findUserCredentialById', () => {
+		it('returns the user with their stored hash', async () => {
+			const user = await createUser({ identifier: 'cred@example.com', displayName: 'Cred' });
+			await setPasswordHash(user.id, 'deadbeef:cafef00d');
+
+			const credential = await findUserCredentialById(user.id);
+
+			expect(credential?.user).toEqual({ ...user, updatedAt: credential?.user.updatedAt });
+			expect(credential?.user.id).toBe(user.id);
+			expect(credential?.passwordHash).toBe('deadbeef:cafef00d');
+		});
+
+		it('reports a null hash for a user with no password, and undefined for an unknown id', async () => {
+			const user = await createUser({ identifier: 'nopass@example.com', displayName: 'No Pass' });
+
+			expect((await findUserCredentialById(user.id))?.passwordHash).toBeNull();
+			expect(await findUserCredentialById('11111111-1111-4111-8111-111111111111')).toBeUndefined();
 		});
 	});
 
