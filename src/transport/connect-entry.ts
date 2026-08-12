@@ -29,8 +29,10 @@
  * `pm/find-item` card lookup and `follow-up-review` enqueue seams, and `planning`
  * since issue #536 routed its whole board surface through five more PM delivery
  * routes. The supported-phase gate in `runAssignmentDbFree` stays as the backstop
- * even though it now excludes nothing. It never opens a database or queue
- * connection.
+ * even though it now excludes nothing, and the repository this daemon declares at
+ * handshake is handed to the same executor so an assignment for a *different*
+ * repository is refused before the checkout is touched (issue #688). It never
+ * opens a database or queue connection.
  */
 
 import { readFileSync } from 'node:fs';
@@ -146,6 +148,11 @@ async function main(): Promise<void> {
 		onAssignment: (assignment, sink) => {
 			void runAssignmentDbFree(assignment, sink, {
 				repoRoot,
+				// The same declaration the handshake carries, so the executor can refuse an
+				// assignment for a repository this checkout is not before it touches the
+				// checkout (issue #688) — passed from the one startup resolution above
+				// rather than re-read per assignment.
+				checkoutRepository: repository,
 				operatorToken,
 				// The delivery seam for the metadata writes this worker holds no
 				// credential for (a review, a board move/comment): POSTed to the control
