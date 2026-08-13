@@ -95,7 +95,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 	() => {
 		beforeEach(async () => {
 			await truncateAll();
-			await seedProject({ id: PROJECT_ID, repo: REPO });
+			// States its SCM provider, which `publishForcedDispatch` resolves through
+			// `requireProjectSCMProvider` to stamp the synthetic job's `providerId`. Required
+			// rather than optional since issue #618 made a third provider runtime-ready: a
+			// project naming none no longer resolves the sole ready one, it throws.
+			await seedProject({ id: PROJECT_ID, repo: REPO, scm: 'github' });
 		});
 
 		it('schedules a fresh dispatch on the first call', async () => {

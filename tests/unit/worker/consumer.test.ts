@@ -32,9 +32,19 @@ import {
 // asserts the wiring: which phase runs, with which inputs, and how its result
 // (or failure) becomes a JobOutcome.
 
-let projectLookup: (id: string) => ProjectConfig | undefined;
+let projectLookup: (id: string, repo?: string) => ProjectConfig | undefined;
+/**
+ * Every `(projectId, repository)` pair the consumer asked the project read for. The
+ * repository is the whole point since issue #684 phase 2 — the real read scopes the
+ * record to it, and a project that does not own it throws — so the scoping describe
+ * block below asserts on the *argument*, and the throwing case fakes the throw here.
+ */
+const projectLookupCalls: Array<{ id: string; repo?: string }> = [];
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
-	findProjectByIdFromDb: async (id: string) => projectLookup(id),
+	findProjectByIdFromDb: async (id: string, repo?: string) => {
+		projectLookupCalls.push({ id, repo });
+		return projectLookup(id, repo);
+	},
 }));
 
 const addComment = vi.fn(async (_id: string, _text: string) => 'comment-1');
@@ -670,6 +680,7 @@ describe('processJob', () => {
 		vi.stubEnv('SWARM_WORKER_CREDENTIAL', '');
 		phaseCalls.length = 0;
 		providerBuiltWith.length = 0;
+		projectLookupCalls.length = 0;
 		projectLookup = () => PROJECT;
 		phaseImpl = async () => ({ agent: agentResult() });
 		addComment.mockClear();
@@ -1043,6 +1054,84 @@ describe('processJob', () => {
 			processJob(createMockScmWebhookJob({ projectId: 'ghost' }), registryReturning(null)),
 		).rejects.toThrow("unknown project 'ghost'");
 		expect(phaseCalls).toEqual([]);
+	});
+
+	// issue #684 phase 2 — the seam that makes a project's second repository routable.
+	// `processJob` reads the project scoped to the repository *the job* names, so every
+	// phase downstream of it (worktree, branch, prompts, delivery ids, review ledger,
+	// run row, pushed assignment) runs against that repository rather than the
+	// project's default entry.
+	describe('repository scoping (issue #684 phase 2)', () => {
+		it('scopes the project to the repository an SCM event names', async () => {
+			const job = createMockScmWebhookJob({
+				event: createMockScmEvent({ repoFullName: 'SmartTechBrewery/second' }),
+			});
+
+			await processJob(job, registryReturning(REVIEW_TRIGGER));
+
+			expect(projectLookupCalls).toContainEqual({
+				id: PROJECT.id,
+				repo: 'SmartTechBrewery/second',
+			});
+		});
+
+		// A board card names no repository, so Planning/Implementation keep running
+		// against the default entry — the behaviour a single-repository project had.
+		it('scopes a board job to the default entry by naming no repository', async () => {
+			await processJob(
+				createMockPmWebhookJob(),
+				registryReturning({ phase: 'planning', taskId: '10', workItem: createMockWorkItem() }),
+			);
+
+			expect(projectLookupCalls).toContainEqual({ id: PROJECT.id, repo: undefined });
+		});
+
+		it('scopes a merge-automation dispatch to the repository its intent recorded', async () => {
+			await processJob(
+				{
+					type: 'merge-automation' as const,
+					projectId: PROJECT.id,
+					reviewRunId: 'run-1',
+					repo: 'SmartTechBrewery/second',
+					prNumber: '17',
+					approvedHeadSha: 'deadbeef',
+				},
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(projectLookupCalls).toContainEqual({
+				id: PROJECT.id,
+				repo: 'SmartTechBrewery/second',
+			});
+		});
+
+		// The loud failure the phase promises: a job naming a repository the project no
+		// longer owns must not fall back to the default and run the phase in the wrong
+		// repository — it fails the dispatch, so the operator sees it in the queue.
+		it('fails the dispatch and rethrows when the project no longer owns the repository', async () => {
+			const unowned = new Error(
+				"Project 'swarm' does not own repository 'SmartTechBrewery/gone' — it owns: SmartTechBrewery/swarm.",
+			);
+			projectLookup = () => {
+				throw unowned;
+			};
+
+			await expect(
+				processJob(
+					createMockScmWebhookJob({
+						event: createMockScmEvent({ repoFullName: 'SmartTechBrewery/gone' }),
+					}),
+					registryReturning(REVIEW_TRIGGER),
+				),
+			).rejects.toThrow(/does not own repository 'SmartTechBrewery\/gone'/);
+
+			expect(failDispatch).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.stringContaining("does not own repository 'SmartTechBrewery/gone'"),
+			);
+			expect(phaseCalls).toEqual([]);
+			expect(acquireProjectSlot).not.toHaveBeenCalled();
+		});
 	});
 
 	it('completes as no-trigger without running a phase', async () => {
@@ -4526,6 +4615,43 @@ describe('reportInterruptedJobToBoard', () => {
 
 		await expect(
 			reportInterruptedJobToBoard(createMockScmWebhookJob(), 'stalled'),
+		).resolves.toBeUndefined();
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+		expect(addComment).not.toHaveBeenCalled();
+	});
+
+	// issue #684 phase 2 — the courtesy comment goes on the repository the interrupted
+	// work was for, so it reads the project scoped to the job's own repository.
+	it('scopes the project to the repository the interrupted job names', async () => {
+		projectLookupCalls.length = 0;
+
+		await reportInterruptedJobToBoard(
+			createMockScmWebhookJob({
+				event: createMockScmEvent({ repoFullName: 'SmartTechBrewery/second' }),
+			}),
+			'stalled',
+		);
+
+		expect(projectLookupCalls).toContainEqual({
+			id: 'swarm',
+			repo: 'SmartTechBrewery/second',
+		});
+	});
+
+	// Best-effort: a project that no longer owns the job's repository throws out of the
+	// read, and the report swallows it rather than escaping an event handler.
+	it('swallows an unowned-repository throw instead of failing the handler', async () => {
+		projectLookup = () => {
+			throw new Error("Project 'swarm' does not own repository 'SmartTechBrewery/gone'");
+		};
+
+		await expect(
+			reportInterruptedJobToBoard(
+				createMockScmWebhookJob({
+					event: createMockScmEvent({ repoFullName: 'SmartTechBrewery/gone' }),
+				}),
+				'stalled',
+			),
 		).resolves.toBeUndefined();
 		expect(commentOnPullRequest).not.toHaveBeenCalled();
 		expect(addComment).not.toHaveBeenCalled();

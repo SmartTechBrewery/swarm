@@ -1667,6 +1667,31 @@ describe('runsRouter', () => {
 			expect(recordRunCleanupBlocked).not.toHaveBeenCalled();
 		});
 
+		// issue #684 phase 2 — the checkout being settled belongs to the repository the run
+		// acted on, whose branch settings are that entry's own, so the worktree manager is
+		// built from the run's `repository` rather than the project's default entry.
+		it("builds the worktree manager from the run's own repository", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({
+					id: 'run-1',
+					status: 'deferred',
+					projectId: 'p1',
+					taskId: '103',
+					repository: 'SmartTechBrewery/second',
+				}),
+			);
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(cancelDeferredRunInDb).mockResolvedValue({
+				success: true,
+				dispatch: { id: 'disp-1', wakeSeq: 2 },
+				preservedSession: null,
+			});
+
+			await caller.terminate({ runId: 'run-1' });
+
+			expect(getProjectByIdFromDb).toHaveBeenCalledWith('p1', 'SmartTechBrewery/second');
+		});
+
 		it('reconciles with the preserved session for a resumable deferred run (issue #361)', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
 				makeRun({ id: 'run-1', status: 'deferred', projectId: 'p1', taskId: '103' }),

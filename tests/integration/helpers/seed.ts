@@ -20,8 +20,9 @@ export async function seedProject(overrides: Partial<ProjectConfig> = {}): Promi
 			id: config.id,
 			name: config.name,
 			// The fixture is a project *scoped to one repository* (`ProjectConfig`), so the
-			// persisted list is that one entry — which is exactly what a single-repository
-			// project holds while issue #684 phase 1 caps the list at one.
+			// persisted list is that one entry. A test needing several seeds the record through
+			// `createProjectInDb` instead — issue #684 phase 2 lifted the one-entry cap, so a
+			// multi-repository project is writable.
 			repositories: [
 				{
 					repo: config.repo,
@@ -29,6 +30,12 @@ export async function seedProject(overrides: Partial<ProjectConfig> = {}): Promi
 					branchPrefix: config.branchPrefix,
 				},
 			],
+			// The SCM discriminator (issue #478), which this helper used to drop — so a test
+			// passing `scm` still seeded a project stating none, and anything resolving through
+			// `requireProjectSCMProvider` threw once #618 made a second provider runtime-ready.
+			// Left absent when the fixture states none, which is a distinct case the lookup
+			// reports on, so it is deliberately not defaulted here.
+			scmType: config.scm,
 			repoRoot: config.repoRoot,
 			worktreeRoot: config.worktreeRoot,
 			visibility: config.visibility,

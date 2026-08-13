@@ -17,7 +17,7 @@ import { z } from 'zod';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
 import { PmProviderIdSchema } from '../pm/events.js';
 import { ScmProviderIdSchema } from '../scm/events.js';
-import { normalizeStoredJobPayload, type SwarmJob } from './jobs.js';
+import { normalizeStoredJobPayload, repositoryForJob, type SwarmJob } from './jobs.js';
 
 /**
  * Best-effort phase the dispatch will likely run, derived from the resolved
@@ -141,7 +141,11 @@ export const QueuedRunSchema = z.object({
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
 	attempt: z.number().int().nonnegative().optional(),
-	/** SCM and `merge-automation` jobs only — `owner/repo`. */
+	/**
+	 * The repository this dispatch will run against (`owner/repo`) — `repositoryForJob`
+	 * (`./jobs.js`), so it is the same value the worker scopes the project with. Absent
+	 * for a board job, which names none and runs against the project's default entry.
+	 */
 	repo: z.string().optional(),
 	/** SCM and `merge-automation` jobs only — the PR/issue number. */
 	prNumber: z.string().optional(),
@@ -265,10 +269,18 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 	const data = normalizeStoredJobPayload(dispatch.jobPayload);
 	const state = deriveQueuedState(dispatch);
 	const reviewGate = deriveReviewGate(data);
+	// The repository this dispatch will run against, resolved through the *same*
+	// helper the worker scopes its project with (issue #684 phase 2) rather than by
+	// re-reading each variant's own field here — so the PR link this row renders and
+	// the repository the phase actually runs in cannot drift apart. A board job
+	// carries none and keeps the field absent: it runs against the project's default
+	// entry and its link comes from the resolved `workItemUrl` instead.
+	const repo = repositoryForJob(data);
 	const shared = {
 		jobId: dispatch.id,
 		projectId: dispatch.projectId,
 		type: data.type,
+		...(repo ? { repo } : {}),
 		...(data.type === 'scm' || data.type === 'pm' ? { providerId: data.providerId } : {}),
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
@@ -286,9 +298,9 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 
 	return QueuedRunSchema.parse(
 		data.type === 'scm'
-			? { ...shared, repo: data.event.repoFullName, prNumber: data.event.workItemId }
+			? { ...shared, prNumber: data.event.workItemId }
 			: data.type === 'merge-automation'
-				? { ...shared, repo: data.repo, prNumber: data.prNumber }
+				? { ...shared, prNumber: data.prNumber }
 				: { ...shared, workItemNodeId: data.event.itemId, contentType: data.event.contentType },
 	);
 }

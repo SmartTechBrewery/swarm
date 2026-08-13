@@ -379,15 +379,22 @@ async function cancelDuplicateBoardDispatches(
  * worktree is left for the retention sweep. When settlement retains protected
  * work, its blocked reason is recorded on the run without touching the cancelled
  * dispatch (`recordRunCleanupBlocked`).
+ *
+ * `repository` is the run's own (`runs.repository`), so the worktree manager is built
+ * from the repository entry the run actually held rather than the project's default
+ * one (issue #684 phase 2) — a project spanning several repositories has a distinct
+ * `baseBranch`/`branchPrefix` per entry. A repository the project no longer owns
+ * throws out of the read into the same best-effort catch as everything else here.
  */
 async function reconcileDeferredTermination(
 	runId: string,
 	projectId: string,
+	repository: string,
 	taskId: string,
 	preservedSession: string | null,
 ): Promise<void> {
 	try {
-		const project = await getProjectByIdFromDb(projectId);
+		const project = await getProjectByIdFromDb(projectId, repository);
 		if (!project) return;
 		const result = await reconcileTerminatedWorktree(
 			new GitWorktreeManager(project),
@@ -1065,6 +1072,7 @@ export const runsRouter = router({
 					await reconcileDeferredTermination(
 						run.id,
 						run.projectId,
+						run.repository,
 						run.taskId,
 						res.preservedSession,
 					);

@@ -17,6 +17,7 @@
 
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
+import type { ProjectConfig } from '../config/schema.js';
 import {
 	createDispatch,
 	type DispatchRow,
@@ -286,11 +287,23 @@ async function backfillLegacyMergeFollowUps(): Promise<number> {
 	let imported = 0;
 	for (const run of pending) {
 		if (!run.prNumber || !run.reviewMergeApprovedHeadSha) continue;
-		const project = await findProjectByIdFromDb(run.projectId);
-		if (!project) {
-			logger.warn('dispatch-reconciler: pending merge follow-up references unknown project', {
+		// Scoped to the repository the *run* recorded, not the project's default entry
+		// (issue #684 phase 2), so the imported intent merges the pull request the Review
+		// actually approved. A run whose project no longer exists — or no longer owns
+		// that repository — is skipped with a warning rather than throwing: this is a
+		// best-effort one-time import running at startup, and an unimportable legacy row
+		// must not stop the reconciler from doing the rest of its work.
+		let project: ProjectConfig;
+		try {
+			const scoped = await findProjectByIdFromDb(run.projectId, run.repository);
+			if (!scoped) throw new Error(`project '${run.projectId}' no longer exists`);
+			project = scoped;
+		} catch (err) {
+			logger.warn('dispatch-reconciler: pending merge follow-up cannot be scoped — skipping', {
 				runId: run.id,
 				projectId: run.projectId,
+				repository: run.repository,
+				error: describeError(err),
 			});
 			continue;
 		}

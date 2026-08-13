@@ -66,8 +66,9 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
-		// One repository per project for now (issue #684 phase 1 caps the list at one);
-		// its branch settings default per entry, so the dialog still asks for none.
+		// A new project starts on one repository; further ones are added afterwards (in
+		// `swarm.config.json` until issue #684 phase 3 gives the list an editor). Its
+		// branch settings default per entry, so the dialog still asks for none.
 		mutation.mutate({ id, name, repositories: [{ repo }], repoRoot, scm });
 	};
 

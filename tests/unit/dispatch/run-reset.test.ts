@@ -283,6 +283,30 @@ describe('resetRun', () => {
 		expect(reconcileTerminatedWorktree).not.toHaveBeenCalled();
 	});
 
+	// issue #684 phase 2 — the checkout a reset tears down belongs to the repository the
+	// *run* acted on, whose `baseBranch`/`branchPrefix` are its own, so the worktree
+	// manager is built from that entry rather than the project's default one.
+	it("reads the project scoped to the run's own repository", async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(
+			makeRun({ repository: 'SmartTechBrewery/second' }),
+		);
+
+		await resetRun('run-1');
+
+		expect(getProjectByIdFromDb).toHaveBeenCalledWith('p1', 'SmartTechBrewery/second');
+	});
+
+	it('propagates an unowned-repository throw instead of resetting against the default entry', async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ repository: 'SmartTechBrewery/gone' }));
+		vi.mocked(getProjectByIdFromDb).mockRejectedValue(
+			new Error("Project 'p1' does not own repository 'SmartTechBrewery/gone'"),
+		);
+
+		await expect(resetRun('run-1')).rejects.toThrow(/does not own repository/);
+		expect(cancelDispatchAndWake).not.toHaveBeenCalled();
+		expect(reconcileTerminatedWorktree).not.toHaveBeenCalled();
+	});
+
 	it('refuses a running run without force and mutates nothing', async () => {
 		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ status: 'running' }));
 

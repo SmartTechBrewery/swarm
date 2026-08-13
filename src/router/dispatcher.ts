@@ -472,12 +472,12 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 			trigger.phase === 'respond-to-review'
 				? await resolveBoardItemIdForPrBranch(project, trigger.prBranch)
 				: undefined,
-		// The repository this run acts on, resolved here as `tryCreateRun`'s sibling
-		// write resolves it for the `runs.repository` column (`../worker/consumer.ts`,
-		// issue #683): the two are the only places it is resolved, and when a project
-		// can hold several they both resolve the *event's* repository, so the frame and
-		// the row keep agreeing. Not read back off the run row — creation is
-		// best-effort, so `runId` can be undefined here.
+		// The repository this run acts on, read off the project `processJob` already
+		// scoped to the job's own repository (issue #684 phase 2) — the same value
+		// `tryCreateRun`'s sibling write puts in the `runs.repository` column
+		// (`../worker/consumer.ts`, issue #683), so the pushed frame and the row cannot
+		// disagree about which repository the phase ran against. Not read back off the
+		// run row — creation is best-effort, so `runId` can be undefined here.
 		repository: project.repo,
 	});
 

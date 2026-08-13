@@ -123,16 +123,34 @@ describe('ProjectRecordSchema', () => {
 		).toThrow(/owner\/repo/);
 	});
 
-	// The cap is scaffolding for this phase: a second repository is not routable until
-	// issue #684 phase 2 threads the chosen one from the queue job to the worker, and
-	// accepting one now would let a webhook from repository B run against repository A.
-	it('rejects a second repository, naming the phase that lifts the cap', () => {
-		expect(() =>
-			ProjectRecordSchema.parse({
-				...shared,
-				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two' }],
-			}),
-		).toThrow(/phase 2/);
+	// Issue #684 phase 2 lifted phase 1's one-entry cap: the chosen repository now
+	// travels from webhook ingress through the durable dispatch and the run row to the
+	// worker (`repositoryForJob`), so a webhook from repository B can no longer run
+	// against repository A. Each entry keeps its own defaults; the first is the
+	// project's default repository.
+	it('accepts several repositories, each defaulted independently', () => {
+		const record = ProjectRecordSchema.parse({
+			...shared,
+			repositories: [
+				{ repo: 'acme/one' },
+				{ repo: 'acme/two', baseBranch: 'develop', branchPrefix: 'task-' },
+				{ repo: 'acme/three', scm: 'gitlab' },
+			],
+		});
+		expect(record.repositories).toEqual([
+			{
+				repo: 'acme/one',
+				baseBranch: PROJECT_DEFAULTS.baseBranch,
+				branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+			},
+			{ repo: 'acme/two', baseBranch: 'develop', branchPrefix: 'task-' },
+			{
+				repo: 'acme/three',
+				scm: 'gitlab',
+				baseBranch: PROJECT_DEFAULTS.baseBranch,
+				branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+			},
+		]);
 	});
 
 	// The record carries the same cross-field credential checks the scoped config does —

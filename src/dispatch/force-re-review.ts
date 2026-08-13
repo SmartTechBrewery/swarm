@@ -277,7 +277,13 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 			`Run "${runId}" is not a completed Review run stopped by the review cap, so there is no cycle to continue.`,
 		);
 	}
-	const project = await getProjectByIdFromDb(run.projectId);
+	// Scoped to the repository the *run* recorded, not the project's default entry
+	// (issue #684 phase 2): every value derived from `project` below — the dedup
+	// delivery id, the ledger key, the synthetic event's `repoFullName` — has to name
+	// the repository whose PR was actually reviewed, or the forced continuation would
+	// answer a review in a different repository. A project that no longer owns it
+	// throws out of the read rather than falling back.
+	const project = await getProjectByIdFromDb(run.projectId, run.repository);
 	if (!project) {
 		throw new ForceReReviewError(
 			'project-not-found',
