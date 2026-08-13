@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
 import type { AgentCli, AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError, agentRunError } from '@/harness/agent-failure.js';
-import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import type { ResolvedAssignee } from '@/identity/assignee-resolver.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
@@ -384,16 +383,6 @@ vi.mock('@/db/repositories/appSettingsRepository.js', () => ({
 	getAppSettings: () => getAppSettings(),
 }));
 
-// The CLIs this worker can run, for capability-aware target routing (issue
-// #346). Mocked at the same boundary; defaults to "discovery never ran", which
-// keeps every phase on its preferred target.
-const getAllCliQuotas = vi.fn<() => Promise<CliQuotaSnapshot[]>>(async () => []);
-const upsertCliQuota = vi.fn(async () => {});
-vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
-	getAllCliQuotas: () => getAllCliQuotas(),
-	upsertCliQuota: () => upsertCliQuota(),
-}));
-
 // The recovery capability/quota discovery a launch or authentication failure
 // fires (`handlePhaseFailure`) — mocked so the terminal-auth test can assert it
 // ran without shelling out to the real CLIs.
@@ -741,8 +730,6 @@ describe('processJob', () => {
 		hasCompletedRunForTask.mockResolvedValue(false);
 		getAppSettings.mockClear();
 		getAppSettings.mockResolvedValue({});
-		getAllCliQuotas.mockClear();
-		getAllCliQuotas.mockResolvedValue([]);
 		discoverCliQuotas.mockClear();
 		listProjectDispatchCandidates.mockClear();
 		listProjectDispatchCandidates.mockResolvedValue([]);
@@ -1700,9 +1687,6 @@ describe('processJob', () => {
 	// `tests/unit/worker/target-selection.test.ts`; these assert the wiring — that
 	// the routed target is what the phase actually runs and what the run row records.
 	describe('capability-aware target routing (issue #346)', () => {
-		function quota(cli: AgentCli, status: CliQuotaSnapshot['status']): CliQuotaSnapshot {
-			return { cli, status, source: 'live', lastUpdated: '2026-07-21T00:00:00.000Z' };
-		}
 		const planningTrigger = (): TriggerResult => ({
 			phase: 'planning',
 			taskId: '10',
@@ -1722,49 +1706,12 @@ describe('processJob', () => {
 				},
 			});
 
-		it('runs the preferred target when this worker can run its CLI', async () => {
+		// No gate selection here, so no executing host is known — and the control
+		// plane's own CLI set is not consulted as a stand-in, because that host
+		// executes nothing (issue #703). Routing therefore declines and the phase's
+		// preferred target is what runs and what the run row records.
+		it('runs the preferred target when the gate selected no worker to route against', async () => {
 			projectLookup = twoTargetProject;
-			getAllCliQuotas.mockResolvedValue([
-				quota('codex', 'available'),
-				quota('claude', 'available'),
-			]);
-
-			await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
-
-			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
-		});
-
-		it('routes to the next target when the preferred CLI is unavailable here', async () => {
-			projectLookup = twoTargetProject;
-			getAllCliQuotas.mockResolvedValue([
-				quota('codex', 'unavailable'),
-				quota('claude', 'available'),
-			]);
-
-			await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
-
-			// The run row must record what will actually run, not the preferred target.
-			expect(createRun).toHaveBeenCalledWith(
-				expect.objectContaining({ engine: 'claude', model: 'opus', reasoning: 'high' }),
-			);
-		});
-
-		it('keeps the preferred target when no configured CLI is available', async () => {
-			projectLookup = twoTargetProject;
-			getAllCliQuotas.mockResolvedValue([
-				quota('codex', 'unavailable'),
-				quota('claude', 'unavailable'),
-			]);
-
-			await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
-
-			// Fail visibly on spawn rather than silently skip the phase.
-			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
-		});
-
-		it('keeps the preferred target when the capability lookup fails', async () => {
-			projectLookup = twoTargetProject;
-			getAllCliQuotas.mockRejectedValue(new Error('postgres down'));
 
 			const outcome = await processJob(
 				createMockPmWebhookJob(),
@@ -1775,14 +1722,27 @@ describe('processJob', () => {
 			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
 		});
 
+		it('records the preferred target on a capacity-deferred run row', async () => {
+			projectLookup = twoTargetProject;
+			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(planningTrigger()),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			// The deferral runs *before* the gate, so the row states the phase's own
+			// preference rather than a target derived from any host's CLI set (#703);
+			// the wake-up re-enters `processJob` and resolves the real one.
+			expect(createRun).toHaveBeenCalledWith(
+				expect.objectContaining({ engine: 'codex', model: 'gpt-5.6-terra' }),
+			);
+		});
+
 		it('lets a per-run override win over routing', async () => {
 			projectLookup = twoTargetProject;
-			// codex is unavailable, but the run explicitly pins it (a manual retry).
-			getAllCliQuotas.mockResolvedValue([
-				quota('codex', 'unavailable'),
-				quota('claude', 'available'),
-			]);
-
+			// The run explicitly pins one exact target (a manual retry).
 			await processJob(
 				createMockPmWebhookJob({
 					cliOverride: 'codex',

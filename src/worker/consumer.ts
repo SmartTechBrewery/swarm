@@ -196,12 +196,7 @@ import {
 	unregisterRunController,
 } from './run-cancellation.js';
 import { PHASE_DEFAULT_CLI, phaseAgentConfig, resolveTargetPolicy } from './target-policy.js';
-import {
-	loadAvailableClis,
-	selectTarget,
-	type TargetSelection,
-	type WorkerCliAvailability,
-} from './target-selection.js';
+import { selectTarget, type TargetSelection } from './target-selection.js';
 
 /** What became of a dequeued job — returned to BullMQ as the job's result. */
 export type JobOutcome =
@@ -1058,11 +1053,13 @@ async function handleConcurrencyDeferral(
 	// Implementation work visible while it waits, rather than creating a row only
 	// after a timer happens to fire.
 	// No gate selection here: this defers *before* the eligibility gate runs, so
-	// the row records the target local routing would pick. The eventual wake-up
-	// re-enters `processJob` and resolves its target through the gate.
+	// the machine that will execute isn't known yet and the row records the phase's
+	// *preferred* target rather than one derived from some host's CLI set (issue
+	// #703). The eventual wake-up re-enters `processJob` and resolves the real
+	// target through the gate.
 	const runId = await tryCreateRun(
 		project,
-		{ globalDefaults: await loadGlobalDefaults(), availableClis: await loadAvailableClis() },
+		{ globalDefaults: await loadGlobalDefaults() },
 		trigger,
 		job,
 	);
@@ -1219,12 +1216,11 @@ function resolveReasoning(
 export interface PhaseResolution {
 	/** Global per-CLI default models — the tier between project and coded defaults. */
 	globalDefaults: AgentDefaults | undefined;
-	/** The CLIs this worker can run, for local capability routing (issue #346). */
-	availableClis: WorkerCliAvailability;
 	/**
 	 * The target the federated eligibility gate selected together with its worker
-	 * (issue #339). Absent for an unfederated project, where local routing picks
-	 * the target instead.
+	 * (issue #339) — the only availability-aware answer there is. Absent when the
+	 * gate selected no worker, in which case the phase's preferred target applies
+	 * (issue #703).
 	 */
 	selection?: DispatchSelection;
 	/** Authenticated session that claimed `selection`; present exactly when selection is bound. */
@@ -1693,9 +1689,9 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
  *
  * Which of the phase's `targets` is resolved comes from {@link PhaseResolution}:
  * the federated gate's chosen target when a worker was selected for it (issue
- * #339), else the highest-priority target *this* worker can run (issue #346, see
- * {@link selectTarget}). A per-run override still pins one exact target and is
- * never routed around.
+ * #339), else the phase's preferred target, since with no worker there is no
+ * executing host to route against (issue #703, see {@link selectTarget}). A
+ * per-run override still pins one exact target and is never routed around.
  */
 function agentOverrideFor(
 	project: ProjectConfig,
@@ -1718,10 +1714,13 @@ function agentOverrideFor(
 	// CLI/model" — `src/api/routers/runs.ts`), so it wins over routing: the run
 	// resolves against the phase's own configured selection, as it did before.
 	const policy = resolveTargetPolicy(phaseConfig, job);
+	// The gate's selection is the only availability-aware answer: it picked the
+	// target together with the host that will run it. Without one, no executing
+	// host is known, so the walk is handed no availability set and declines —
+	// keeping the phase's preferred target (issue #703).
 	const routing = policy.pinned
 		? undefined
-		: (targetSelectionFor(resolution.selection) ??
-			selectTarget(phaseConfig.targets, resolution.availableClis));
+		: (targetSelectionFor(resolution.selection) ?? selectTarget(phaseConfig.targets, undefined));
 	// With no routing decision the policy's own first entry applies: the pinned
 	// target, or the phase's coded defaults when it configured no list at all.
 	const target = routing?.target ?? policy.targets[0];
@@ -3295,10 +3294,6 @@ export async function processJob(
 		// per job, best-effort: a DB hiccup falls through to the coded defaults rather
 		// than failing the run.
 		const globalDefaults = await loadGlobalDefaults();
-		// The CLIs this worker can actually run, for capability-aware target routing
-		// (issue #346). Loaded once per job for the same reason, and equally
-		// best-effort: an unknown answer routes to the phase's preferred target.
-		const availableClis = await loadAvailableClis();
 		const implementationUnplanned =
 			trigger.phase === 'implementation' &&
 			!(await wasPrecededByPlanning(project.id, trigger.taskId));
@@ -3339,7 +3334,6 @@ export async function processJob(
 				: executionIdentity;
 		const resolution: PhaseResolution = {
 			globalDefaults,
-			availableClis,
 			selection,
 			executionIdentity: selection ? bindIdentity : undefined,
 		};
