@@ -8,7 +8,11 @@ import type { FollowUpReviewInput } from '@/pipeline/follow-up-review.js';
 import { runRespondToReviewPhase } from '@/pipeline/respond-to-review.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../helpers/factories.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -70,7 +74,12 @@ function writeHandoff(path: string, overrides: Record<string, unknown> = {}): vo
 	);
 }
 
-function makeOptions(path: string, handle: WorktreeHandle) {
+/**
+ * The phase options for one run. `project` defaults to the single-repository
+ * fixture; the cross-repository case below passes a project scoped to one of two
+ * repositories instead.
+ */
+function makeOptions(path: string, handle: WorktreeHandle, project = createMockProjectConfig()) {
 	const cleanup = vi.fn(async () => undefined);
 	const worktrees = {
 		provision: vi.fn(async () => handle),
@@ -97,7 +106,7 @@ function makeOptions(path: string, handle: WorktreeHandle) {
 		async () => undefined,
 	);
 	return {
-		project: createMockProjectConfig(),
+		project,
 		prNumber: '42',
 		prBranch: 'issue-42',
 		reviewId: '9001',
@@ -225,5 +234,29 @@ describe('respond-to-review production delivery', () => {
 		expect(second.outcome).toBe('fixed');
 		expect(second.pushedHeadSha).toBe(first.pushedHeadSha);
 		expect(options.scheduleFollowUpReview).toHaveBeenCalledTimes(1);
+	});
+
+	// Two repositories of one project (issue #685), same PR number and the same
+	// review id — the review-id namespace is per repository too, so the identity has
+	// to name the repository or a resumed response in one would adopt the other's
+	// delivery.
+	it('keys its delivery sidecar on the repository it ran in', async () => {
+		const paths = createMockProjectRepositoryPair().map((project) => {
+			const path = mkdtempSync(join(tmpdir(), 'swarm-respond-delivery-'));
+			roots.push(path);
+			initGitRepo(path);
+			return { path, project };
+		});
+		for (const { path, project } of paths) {
+			const handle: WorktreeHandle = {
+				taskId: 'respond-42',
+				path,
+				branch: 'issue-42',
+				detached: false,
+			};
+			await runRespondToReviewPhase(makeOptions(path, handle, project));
+		}
+
+		expect(readDeliveryId(paths[1].path)).not.toBe(readDeliveryId(paths[0].path));
 	});
 });

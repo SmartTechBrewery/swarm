@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ProjectConfig } from '@/config/schema.js';
 import type { AggregateCheckStatus } from '@/scm/types.js';
 import { createReviewTrigger } from '@/triggers/handlers/review.js';
 import type { TriggerContext } from '@/triggers/types.js';
 import {
 	createFakeScmProvider,
 	createMockProjectConfig,
+	createMockProjectRepositoryPair,
 	createMockScmEvent,
 	createMockScmTriggerContext,
 } from '../../../helpers/factories.js';
@@ -895,5 +897,70 @@ describe('review trigger', () => {
 				expect.stringContaining('SWARM conflict check needs attention'),
 			);
 		});
+	});
+});
+
+/**
+ * Two repositories of one project, same PR number (issue #685).
+ *
+ * A project may hold several repositories since issue #699, and two of them can
+ * carry the same PR number for entirely unrelated work. Both keys this handler
+ * takes out therefore have to name the repository of the task at hand: a
+ * project-wide dedup key would drop the second repository's review as a duplicate
+ * of the first's, and a project-wide ledger key would charge it against the first
+ * repository's three verdict slots. Both are silent failures, which is why they
+ * are asserted rather than left as a property of the wiring.
+ *
+ * Driven through the handler with the two configs `processJob` itself would hand
+ * it — `scopeProjectToRepository` applied to one two-entry record — so what is
+ * pinned is the wiring, not the key builders (`buildReviewDispatchKey`'s own
+ * repo-keying is pinned in `tests/unit/triggers/review-dispatch-dedup.test.ts`).
+ */
+describe('review trigger — two repositories of one project (issue #685)', () => {
+	const [ANDROID, BACKEND] = createMockProjectRepositoryPair();
+
+	/** The same freshly-opened PR #42, as it arrives for one of the two repositories. */
+	function repoCtx(project: ProjectConfig): TriggerContext {
+		return createMockScmTriggerContext({
+			project,
+			scm: SCM,
+			event: createMockScmEvent({
+				kind: 'pull-request',
+				action: 'opened',
+				workItemId: '42',
+				headSha: 'abc123',
+				isDraft: false,
+				isCrossRepo: false,
+				prAuthorLogin: 'operator-human',
+			}),
+		});
+	}
+
+	it('dispatches both, claiming a dedup slot per repository', async () => {
+		await expect(handler.handle(repoCtx(ANDROID))).resolves.toMatchObject({
+			phase: 'review',
+			prNumber: '42',
+		});
+		// Not swallowed as a duplicate of the first: the second repository's PR #42 is
+		// different work at the same number.
+		await expect(handler.handle(repoCtx(BACKEND))).resolves.toMatchObject({
+			phase: 'review',
+			prNumber: '42',
+		});
+
+		const [android, backend] = claimReviewDispatch.mock.calls.map((call) => call[0] as string);
+		expect(android).toContain('acme/android');
+		expect(backend).toContain('acme/backend');
+		expect(backend).not.toBe(android);
+	});
+
+	it('reserves a verdict slot per repository under the one project id', async () => {
+		await handler.handle(repoCtx(ANDROID));
+		await handler.handle(repoCtx(BACKEND));
+
+		expect(reserveReviewVerdict.mock.calls.map(([input]) => input)).toEqual([
+			{ projectId: 'acme', repository: 'acme/android', prNumber: '42', headSha: 'abc123' },
+			{ projectId: 'acme', repository: 'acme/backend', prNumber: '42', headSha: 'abc123' },
+		]);
 	});
 });

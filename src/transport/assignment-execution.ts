@@ -774,8 +774,10 @@ function buildDbFreePhaseInputs({
 		// Resolved control-plane side, where the run row that records it is written
 		// (issue #683) — this worker has no DB to read that row from. The fallback
 		// exists solely for router/worker version skew (a router predating the field
-		// omits it) and resolves to the same string today, since a project holds
-		// exactly one repository.
+		// omits it) and is still correct for a multi-repository project: the
+		// dispatcher scoped the project it sent to the job's own repository (issue
+		// #699), so `project.repo` here is that repository, not the project's default
+		// entry (issue #685).
 		repository: assignment.repository ?? project.repo,
 		cli: assignment.target.cli,
 		model: assignment.target.model,

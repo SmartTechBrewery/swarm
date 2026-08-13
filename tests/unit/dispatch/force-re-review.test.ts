@@ -40,7 +40,10 @@ import type { runs } from '@/db/schema/runs.js';
 import { createAndPublishDispatch } from '@/dispatch/dispatcher.js';
 import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js';
 import type { SwarmJob } from '@/queue/jobs.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../helpers/factories.js';
 
 type RunRow = typeof runs.$inferSelect;
 
@@ -416,6 +419,39 @@ describe('forceReReview (issue #511)', () => {
 			await expect(forceReReview('run-1')).rejects.toThrow(/does not own repository/);
 			expect(grantReviewCapOverride).not.toHaveBeenCalled();
 			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		});
+	});
+
+	// issue #685 — the property the scoping above buys, asserted rather than assumed:
+	// two capped reviews for the same PR number and head in two repositories of one
+	// project must not collide. The forced dispatch's dedup key is deterministic *and
+	// permanent*, so a project-wide one would have the second repository's forced
+	// continuation absorbed as an already-recorded repeat of the first's — reported to
+	// the operator as "already scheduled", with no corrective run ever queued for it.
+	describe('two repositories of one project (issue #685)', () => {
+		const [ANDROID, BACKEND] = createMockProjectRepositoryPair();
+
+		beforeEach(() => {
+			vi.mocked(getProjectByIdFromDb).mockImplementation(async (_id, repo) =>
+				repo === BACKEND.repo ? BACKEND : ANDROID,
+			);
+		});
+
+		/** One forced continuation for the same PR and head, in `repository`. */
+		async function forceIn(repository: string): Promise<void> {
+			vi.mocked(getRunByIdFromDb).mockResolvedValueOnce(makeCappedReviewRun({ repository }));
+			await forceReReview('run-1');
+		}
+
+		it('keys the dispatch and the ledger read per repository for one PR and head', async () => {
+			await forceIn(ANDROID.repo);
+			await forceIn(BACKEND.repo);
+
+			const [android, backend] = vi.mocked(createAndPublishDispatch).mock.calls;
+			expect(backend[0].dedupKey).not.toBe(android[0].dedupKey);
+			expect(
+				vi.mocked(getSubmittedReviewSlot).mock.calls.map(([input]) => input.repository),
+			).toEqual([ANDROID.repo, BACKEND.repo]);
 		});
 	});
 

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { ProjectConfig } from '@/config/schema.js';
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
 import { getPersonaForLogin } from '@/integrations/scm/github/personas.js';
 import { parseGitHubWebhook } from '@/integrations/scm/github/webhook.js';
@@ -10,6 +11,7 @@ import type { TriggerContext } from '@/triggers/types.js';
 import {
 	createFakeScmProvider,
 	createMockProjectConfig,
+	createMockProjectRepositoryPair,
 	createMockScmEvent,
 	createMockScmTriggerContext,
 } from '../../../helpers/factories.js';
@@ -415,6 +417,69 @@ describe('respond-to-review trigger', () => {
 				pipeline: { respondToReview: { enabled: false } },
 			});
 			expect(await cappedHandler().handle({ ...forcedCtx(), project })).toBeNull();
+		});
+	});
+
+	/**
+	 * Two repositories of one project (issue #685). The cap gate reads the verdict
+	 * ledger with `(project.id, project.repo)`, so a lookup that named only the
+	 * project would read the *other* repository's slot for the same PR number — and
+	 * a cap reached there would silently stop a corrective cycle that never started
+	 * here. Driven with the two configs `processJob` hands the trigger.
+	 */
+	describe('two repositories of one project (issue #685)', () => {
+		const [ANDROID, BACKEND] = createMockProjectRepositoryPair();
+
+		function repoCtx(project: ProjectConfig): TriggerContext {
+			return createMockScmTriggerContext({ project, scm: SCM, event: reviewEvent() });
+		}
+
+		it('reads the cap slot per repository, not per project', async () => {
+			const byReviewId = vi.fn(async () => ({
+				ordinal: 1,
+				state: 'submitted' as const,
+				verdict: 'request-changes',
+				headSha: HEAD_SHA,
+			}));
+			const scopedHandler = createRespondToReviewTrigger({
+				getReviewVerdictByReviewId: byReviewId,
+				getReviewVerdictByHead: vi.fn(async () => undefined),
+			});
+
+			await expect(scopedHandler.handle(repoCtx(ANDROID))).resolves.toMatchObject({
+				phase: 'respond-to-review',
+			});
+			await expect(scopedHandler.handle(repoCtx(BACKEND))).resolves.toMatchObject({
+				phase: 'respond-to-review',
+			});
+
+			expect(byReviewId.mock.calls).toEqual([
+				['acme', 'acme/android', '555'],
+				['acme', 'acme/backend', '555'],
+			]);
+		});
+
+		it('keys the head-SHA fallback lookup on the same repository', async () => {
+			const byHead = vi.fn(async () => ({
+				ordinal: 1,
+				state: 'submitted' as const,
+				verdict: 'request-changes',
+				headSha: HEAD_SHA,
+			}));
+			const scopedHandler = createRespondToReviewTrigger({
+				// No record under the review id, so the head-SHA fallback runs — the
+				// second of the two ledger reads this handler performs.
+				getReviewVerdictByReviewId: vi.fn(async () => undefined),
+				getReviewVerdictByHead: byHead,
+			});
+
+			await scopedHandler.handle(repoCtx(ANDROID));
+			await scopedHandler.handle(repoCtx(BACKEND));
+
+			expect(byHead.mock.calls).toEqual([
+				['acme', 'acme/android', '17', HEAD_SHA],
+				['acme', 'acme/backend', '17', HEAD_SHA],
+			]);
 		});
 	});
 });

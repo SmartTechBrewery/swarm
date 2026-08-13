@@ -6,7 +6,11 @@ import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { runReviewPhase } from '@/pipeline/review.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../helpers/factories.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -245,6 +249,54 @@ describe('review body rendering', () => {
 
 		await expect(runReviewPhase({ ...options, resumeDelivery: true })).rejects.toThrow(
 			/removed 'comment' verdict/,
+		);
+	});
+});
+
+/**
+ * Two repositories of one project, one PR number (issue #685).
+ *
+ * The Review phase keys two things that must name the repository it ran in: the
+ * delivery identity its progress sidecar is written under — a resume key, so a
+ * project-wide one would let a preserved worktree in repository B adopt repository
+ * A's half-finished submission — and its `review_verdicts` rows, whose cap would
+ * otherwise be shared by two unrelated PRs that happen to carry the same number.
+ */
+describe('review delivery across two repositories of one project (issue #685)', () => {
+	const [ANDROID, BACKEND] = createMockProjectRepositoryPair();
+
+	it('keys the delivery sidecar and the verdict ledger on the repository it ran in', async () => {
+		// Both runs keep `deliveryDeps`' own PR number and head SHA, so the repository
+		// is the only thing that differs between them.
+		const markAndroid = vi.fn(async () => ({ id: 'verdict-a', ordinal: 1 }));
+		const markBackend = vi.fn(async () => ({ id: 'verdict-b', ordinal: 1 }));
+		const android = deliveryDeps(structuredHandoff(), {
+			project: ANDROID,
+			repository: ANDROID.repo,
+			markReviewVerdictSubmitted: markAndroid,
+		});
+		const backend = deliveryDeps(structuredHandoff(), {
+			project: BACKEND,
+			repository: BACKEND.repo,
+			markReviewVerdictSubmitted: markBackend,
+		});
+
+		await runReviewPhase(android.options);
+		await runReviewPhase(backend.options);
+
+		expect(readDeliveryId(backend.path)).not.toBe(readDeliveryId(android.path));
+
+		// The ledger key comes from `RunReviewPhaseOptions.repository` (issue #692),
+		// the delivery identity from `project.repo`. Asserting both here is what pins
+		// the invariant issue #699 relies on: the two are resolved from the job's own
+		// repository, so they agree by construction rather than by coincidence.
+		expect(markAndroid).toHaveBeenCalledWith(
+			{ projectId: 'acme', repository: 'acme/android', prNumber: '42', headSha: 'abc1234' },
+			expect.anything(),
+		);
+		expect(markBackend).toHaveBeenCalledWith(
+			{ projectId: 'acme', repository: 'acme/backend', prNumber: '42', headSha: 'abc1234' },
+			expect.anything(),
 		);
 	});
 });
