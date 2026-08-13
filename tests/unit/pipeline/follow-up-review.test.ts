@@ -25,7 +25,10 @@ import {
 	followUpReviewDeliveryId,
 	scheduleFollowUpReviewDefault,
 } from '@/pipeline/follow-up-review.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig();
 
@@ -50,6 +53,17 @@ describe('followUpReviewDeliveryId', () => {
 
 	it('never contains a colon (BullMQ reserves it for key namespacing)', () => {
 		expect(followUpReviewDeliveryId(PROJECT, '42', 'abc123')).not.toContain(':');
+	});
+
+	// Two repositories of one project (issue #685). Unlike the sidecar identities,
+	// this one keys a *durable dispatch* row: a shared key would have the dispatch
+	// layer absorb the second repository's follow-up Review as an already-recorded
+	// repeat of the first's, so the fix pushed there would never be re-reviewed.
+	it('differs across two repositories of one project', () => {
+		const [android, backend] = createMockProjectRepositoryPair();
+		expect(followUpReviewDeliveryId(android, '42', 'abc123')).not.toBe(
+			followUpReviewDeliveryId(backend, '42', 'abc123'),
+		);
 	});
 });
 

@@ -22,7 +22,11 @@ import {
 	type ScmDeliveryProvider,
 } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../helpers/factories.js';
 
 const PR_NUMBER = '508';
 const HEAD_SHA = 'f'.repeat(40);
@@ -105,7 +109,12 @@ function repairPhantomEntry(worktreePath: string): void {
 	writeFileSync(journalPath, JSON.stringify(journal));
 }
 
-function makeDeps(worktreePath: string) {
+/**
+ * The phase's dependencies over `worktreePath`. `project` defaults to the
+ * single-repository fixture; the cross-repository case below passes a project scoped
+ * to one of two repositories instead.
+ */
+function makeDeps(worktreePath: string, project = createMockProjectConfig()) {
 	const handle: WorktreeHandle = {
 		taskId: 'task-508',
 		path: worktreePath,
@@ -118,7 +127,7 @@ function makeDeps(worktreePath: string) {
 		cleanup: vi.fn(async () => {}),
 	};
 	return {
-		project: createMockProjectConfig(),
+		project,
 		prNumber: PR_NUMBER,
 		prBranch: 'issue-503',
 		headSha: HEAD_SHA,
@@ -208,5 +217,19 @@ describe('runResolveConflictsPhase — migration-journal gate (issue #503/#508)'
 		);
 		expect(deps.runAgent).toHaveBeenCalledTimes(2);
 		expect(commitPreparedTree).not.toHaveBeenCalled();
+	});
+
+	// Two repositories of one project (issue #685), same PR number and the same
+	// head/base SHAs. The merge this phase delivers is a resume key like every other
+	// phase's, so it has to name the repository whose PR actually conflicted.
+	it('keys its delivery sidecar on the repository it ran in', async () => {
+		const runs = createMockProjectRepositoryPair().map((project) => {
+			const worktreePath = makeWorktree();
+			writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+			return { worktreePath, deps: makeDeps(worktreePath, project) };
+		});
+		for (const { deps } of runs) await runResolveConflictsPhase(deps);
+
+		expect(readDeliveryId(runs[1].worktreePath)).not.toBe(readDeliveryId(runs[0].worktreePath));
 	});
 });

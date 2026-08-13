@@ -22,7 +22,12 @@ import {
 	type ScmDeliveryProvider,
 } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -147,8 +152,17 @@ function makeDelivery() {
 	return { delivery, pulls, createPullRequest, pushBranch };
 }
 
-/** The phase options one worker runs with, over its own checkout. */
-function makeOptions(path: string, branch: string, delivery: ScmDeliveryProvider) {
+/**
+ * The phase options one worker runs with, over its own checkout. `project` defaults
+ * to the single-repository fixture; the cross-repository case below passes a project
+ * scoped to one of two repositories instead.
+ */
+function makeOptions(
+	path: string,
+	branch: string,
+	delivery: ScmDeliveryProvider,
+	project = createMockProjectConfig(),
+) {
 	const handle: WorktreeHandle = { taskId: '544', path, branch, detached: false };
 	const worktrees = {
 		provision: vi.fn(async () => handle),
@@ -161,7 +175,7 @@ function makeOptions(path: string, branch: string, delivery: ScmDeliveryProvider
 		return agentResult();
 	});
 	return {
-		project: createMockProjectConfig(),
+		project,
 		workItem: createMockWorkItem({ id: 'PVTI_item544', title: 'Add the feature' }),
 		taskId: '544',
 		pm: makePm(),
@@ -304,5 +318,36 @@ describe('implementation delivery resumption (issue #558)', () => {
 		expect(error.name).not.toBe('DeliveryDeferredError');
 		expect(options.worktrees.cleanup).toHaveBeenCalledWith('544');
 		expect(options.runAgent).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * The same task id and branch in two repositories of one project (issue #685).
+ *
+ * Implementation's delivery identity is its resume key: an interrupted attempt is
+ * re-dispatched and adopts the sidecar it finds. A project-wide identity would let
+ * an attempt in repository B adopt repository A's recorded commit and push it to
+ * the wrong remote — the failure mode the whole suite above is about, one repository
+ * over.
+ *
+ * *Which* repository a board-driven Implementation runs in is issue #686's decision
+ * (a board card names none, so it resolves to the project's default entry today);
+ * what is asserted here is only that the key names whichever one the run acted on.
+ */
+describe('implementation delivery across two repositories of one project (issue #685)', () => {
+	it('keys its delivery sidecar on the repository it ran in', async () => {
+		const [ANDROID, BACKEND] = createMockProjectRepositoryPair();
+		const branch = 'issue-544';
+
+		// A real origin per repository, and a delivery fixture per origin: two
+		// repositories share neither a git remote nor a PR namespace.
+		const paths: string[] = [];
+		for (const project of [ANDROID, BACKEND]) {
+			const worker = makeWorkerCheckout(makeOrigin(), branch);
+			await runImplementationPhase(makeOptions(worker, branch, makeDelivery().delivery, project));
+			paths.push(worker);
+		}
+
+		expect(readDeliveryId(paths[1])).not.toBe(readDeliveryId(paths[0]));
 	});
 });

@@ -162,10 +162,11 @@ export interface RunReviewPhaseOptions {
 	 * (`runs.repository`, issue #683). Required, and fed from the control plane
 	 * rather than read off `project.repo`: it is what the review-verdict ledger
 	 * keys on (both the prior-submitted-review lookup and the submitted slot) and
-	 * what the review prompt names, so once a project can hold several
-	 * repositories those rows key on the repository the run actually reviewed
-	 * rather than on whichever one the config happens to list first. Identical to
-	 * `project.repo` while a project holds exactly one.
+	 * what the review prompt names, so for a project holding several repositories
+	 * those rows key on the repository the run actually reviewed rather than on
+	 * whichever one the config happens to list first. Identical to `project.repo`
+	 * because both are resolved from the job's own repository (issue #699), which
+	 * is the invariant issue #685 asserts rather than assumes.
 	 */
 	repository: string;
 	/** The number of the PR under review. */
@@ -765,7 +766,12 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		// Deliberately still `project.repo`, not the run's `repository`: this is a
 		// resume-idempotency key a preserved worktree's sidecar was written under, so
 		// re-deriving it from a different input would orphan the progress of a run in
-		// flight across the deploy. The two values are identical today (issue #692).
+		// flight across the deploy. The two agree because both are resolved from the
+		// job's own repository — `project` reaches this phase already scoped to it
+		// (issue #699), and `repository` is filled from the same source (issue #692) —
+		// not because a project holds only one. Both being repository-keyed is what
+		// keeps two same-numbered PRs in two repositories from sharing this key
+		// (issue #685; asserted in `tests/unit/pipeline/review-delivery.test.ts`).
 		const deliveryId = deliveryIdentity(['review', project.repo, prNumber, headSha]);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);

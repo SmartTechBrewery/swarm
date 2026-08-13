@@ -26,7 +26,11 @@ import {
 } from '@/pipeline/respond-to-ci.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../helpers/factories.js';
 
 const PR_BRANCH = 'issue-64';
 const HEAD_SHA = 'deadbeef';
@@ -99,7 +103,12 @@ const CONTINUATION: Checkpoint = {
 	workingTree: { modified: ['src/pipeline/review.ts'], added: [], deleted: [] },
 };
 
-function makeDeps() {
+/**
+ * The phase's dependencies over a fresh temp checkout. `project` defaults to the
+ * single-repository fixture; the cross-repository case below passes a project scoped
+ * to one of two repositories instead.
+ */
+function makeDeps(project = createMockProjectConfig()) {
 	const path = mkdtempSync(join(tmpdir(), 'swarm-respond-ci-'));
 	roots.push(path);
 	initGitRepo(path);
@@ -118,7 +127,7 @@ function makeDeps() {
 	};
 	return {
 		path,
-		project: createMockProjectConfig(),
+		project,
 		prNumber: '99',
 		prBranch: PR_BRANCH,
 		headSha: HEAD_SHA,
@@ -371,6 +380,20 @@ describe('runRespondToCiPhase', () => {
 		);
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
+	});
+
+	// Two repositories of one project (issue #685), same PR number and same failing
+	// head SHA. The delivery identity is a resume key, so a project-wide one would
+	// let a CI fix in repository B adopt repository A's recorded commit.
+	it('keys its delivery sidecar on the repository it ran in', async () => {
+		const [android, backend] = createMockProjectRepositoryPair().map((project) =>
+			makeDeps(project),
+		);
+
+		await runRespondToCiPhase(android);
+		await runRespondToCiPhase(backend);
+
+		expect(readDeliveryId(backend.path)).not.toBe(readDeliveryId(android.path));
 	});
 });
 

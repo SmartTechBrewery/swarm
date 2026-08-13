@@ -303,7 +303,9 @@ export const TaskAssignmentSchema = z.object({
 	 * #692). Additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` is
 	 * deliberately not bumped: an older worker ignores it, and an older router
 	 * omits it, in which case the executor falls back to the reconstructed
-	 * project's repo — the same string, while a project holds one repository.
+	 * project's repo — the same string, because the dispatcher scoped the project it
+	 * sent to this very repository (issue #699), not because a project holds only
+	 * one (issue #685).
 	 */
 	repository: z.string().optional(),
 	baseBranch: z.string().optional(),

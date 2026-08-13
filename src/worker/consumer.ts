@@ -1345,7 +1345,9 @@ export interface AssignedPhaseInputs {
 	 * row is written, and carried on the assignment because a DB-free worker
 	 * cannot read that row (ADR-003 §2) — exactly like {@link boardItemId}. Review
 	 * keys its verdict ledger on it (issue #692); identical to `project.repo`
-	 * while a project holds exactly one repository.
+	 * because both are resolved from the job's own repository — `processJob` scopes
+	 * the project to it (issue #699) and the dispatcher fills this from the same
+	 * source — not because a project holds only one (issue #685).
 	 */
 	repository: string;
 	cli?: AgentCli;

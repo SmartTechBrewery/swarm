@@ -8,6 +8,7 @@
  * directly instead.
  */
 
+import { scopeProjectToRepository } from '@/config/project-repository.js';
 import {
 	type ProjectConfig,
 	ProjectConfigSchema,
@@ -772,6 +773,33 @@ export function createMockProjectRecord(overrides: ProjectRecordOverrides = {}):
 	// Built by *un-scoping* the config fixture rather than restating it, so the two can
 	// never describe different projects.
 	return ProjectRecordSchema.parse({ ...toProjectRecord(createMockProjectConfig()), ...overrides });
+}
+
+/**
+ * One project scoped to **two** of its repositories (issue #685) — the pair every
+ * cross-repository key assertion drives both sides of.
+ *
+ * Produced by running the real `scopeProjectToRepository`
+ * (`src/config/project-repository.ts`) over a two-entry record, so the two configs
+ * are literally what `processJob` / `pushAndAwaitResult` hand a trigger or a phase
+ * for two repositories of one project — same `id` and shared settings, differing
+ * only in `repo`. Building them as two independent `createMockProjectConfig` calls
+ * would assert the same thing about a shape production never produced.
+ *
+ * `repos` defaults to two repositories of one owner; pass your own when a suite's
+ * other fixtures already name a repository.
+ */
+export function createMockProjectRepositoryPair(
+	repos: [string, string] = ['acme/android', 'acme/backend'],
+	overrides: ProjectRecordOverrides = {},
+): [ProjectConfig, ProjectConfig] {
+	const record = createMockProjectRecord({
+		id: 'acme',
+		name: 'acme',
+		repositories: repos.map((repo) => ({ repo })),
+		...overrides,
+	});
+	return [scopeProjectToRepository(record, repos[0]), scopeProjectToRepository(record, repos[1])];
 }
 
 /**
