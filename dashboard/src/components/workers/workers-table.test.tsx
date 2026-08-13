@@ -311,7 +311,7 @@ describe('WorkersTable row content', () => {
 describe('WorkersTable active job (issue #473)', () => {
 	it('describes a board-driven job by its work-item title and reference, never by the run id', async () => {
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		renderTable(<WorkersTable workers={[makeWorker({ currentRun: makeActiveRun() })]} />);
 
@@ -328,7 +328,7 @@ describe('WorkersTable active job (issue #473)', () => {
 
 	it('names the executing phase on a leading line of its own, above title and reference', async () => {
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		renderTable(
 			<WorkersTable
@@ -363,7 +363,7 @@ describe('WorkersTable active job (issue #473)', () => {
 		// The project still names `acme/widgets` — the pre-#691 source of this link — so
 		// an href naming it would mean the cell is still resolving the repo by project.
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		renderTable(
 			<WorkersTable
@@ -387,7 +387,7 @@ describe('WorkersTable active job (issue #473)', () => {
 
 	it('still links a job whose title has not resolved, so a busy worker never reads as idle', async () => {
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		renderTable(
 			<WorkersTable
@@ -603,7 +603,7 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 
 	it('keeps the active job visible after sharing is disabled (routing state effective immediately, run untouched)', async () => {
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		listMineQueryFn.mockResolvedValue([
 			makeOwnerWorker({ runState: { busy: true, currentRunId: 'run-9' } }),
@@ -710,7 +710,7 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 describe('WorkersTable read-only surface for non-owners', () => {
 	it('offers no operable control when the viewer owns no worker', async () => {
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		listMineQueryFn.mockResolvedValue([]);
 		rosterQueryFn.mockResolvedValue([makeRosterEntry()]);
@@ -769,7 +769,7 @@ describe('WorkersTable row navigation (issue #477)', () => {
 	it('keeps the Active job links working without navigating', async () => {
 		const onSelectWorker = vi.fn();
 		projectsListQueryFn.mockResolvedValue([
-			{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' },
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
 		]);
 		renderTable(
 			<WorkersTable

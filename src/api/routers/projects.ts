@@ -6,9 +6,9 @@ import {
 	type PipelineConfig,
 	PipelineConfigSchema,
 	type PmCredentialReferencesByProvider,
-	type ProjectConfig,
-	ProjectConfigBaseSchema,
 	type ProjectPm,
+	type ProjectRecord,
+	ProjectRecordBaseSchema,
 	type ScmCredentialReferencesByProvider,
 } from '../../config/schema.js';
 import {
@@ -22,9 +22,10 @@ import {
 import {
 	createProjectWithMemberInDb,
 	deleteProjectFromDb,
-	getProjectByIdFromDb,
-	listAllProjectsFromDb,
+	findProjectRecordByIdFromDb,
+	listAllProjectRecordsFromDb,
 	listDiscoverableProjectsFromDb,
+	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
 import { getMembership, listProjectsForUser } from '../../identity/membership-service.js';
@@ -105,10 +106,11 @@ function defaultPmCredentialReferences(
 	return Object.keys(references).length > 0 ? { [pm.type]: references } : undefined;
 }
 
-// Derived from the base object (`.omit()` needs a bare `z.object`); credentials are
-// not client-writable here, so the config schema's `credentials.pm` cross-field
-// check has nothing to validate on this input.
-const ProjectWriteInputSchema = ProjectConfigBaseSchema.omit({ credentials: true });
+// Derived from the record base object (`.omit()` needs a bare `z.object`); credentials
+// are not client-writable here, so the config schema's `credentials.pm` cross-field
+// check has nothing to validate on this input. The *record*, not the scoped view: this
+// is the config-management surface, so `repositories` is what a client writes.
+const ProjectWriteInputSchema = ProjectRecordBaseSchema.omit({ credentials: true });
 // `pm` is omitted from the create input, not accepted from the client: a new
 // project always starts on `DEFAULT_PM_CONFIG`'s placeholder mapping.
 const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true });
@@ -178,7 +180,7 @@ function mergePipelineConfig(
  * thing the config schema checks, and the same thing `resolvePmCredential` needs before
  * it can look a secret up at all.
  */
-function assertPmProviderSwitchable(existing: ProjectConfig, pm: ProjectPm): void {
+function assertPmProviderSwitchable(existing: ProjectRecord, pm: ProjectPm): void {
 	if (pm.type === existing.pm.type) return;
 
 	const manifest = getPMProvider(pm.type);
@@ -229,11 +231,22 @@ function isUniqueViolation(error: unknown): boolean {
 	);
 }
 
+/**
+ * Either way a project write can collide: the `projects.id` primary key (a unique
+ * violation from Postgres) or a repository another project already owns
+ * (`ProjectRepositoryConflictError`, the guard that replaced the `repo` UNIQUE
+ * constraint in issue #684). Both are the same CONFLICT to a client, so they are
+ * recognised together rather than the repository half falling through as a 500.
+ */
+function isProjectConflict(error: unknown): boolean {
+	return error instanceof ProjectRepositoryConflictError || isUniqueViolation(error);
+}
+
 export const projectsRouter = router({
 	// Only the caller's accessible projects: their membership set, or every
 	// project for an `instanceAdmin` (`filterAccessibleProjects`, #281 task 4).
 	list: authedProcedure.query(async ({ ctx }) => {
-		return await filterAccessibleProjects(ctx.user, await listAllProjectsFromDb());
+		return await filterAccessibleProjects(ctx.user, await listAllProjectRecordsFromDb());
 	}),
 
 	// The caller's own projects and what they hold on each (issue #661) — the read
@@ -261,13 +274,16 @@ export const projectsRouter = router({
 	// about configuration, so no repo path, board mapping, or credential reference
 	// travels to a personal overview that needs none of them.
 	listMine: authedProcedure.query(async ({ ctx }) => {
-		const accessible = await filterAccessibleProjects(ctx.user, await listAllProjectsFromDb());
+		const accessible = await filterAccessibleProjects(
+			ctx.user,
+			await listAllProjectRecordsFromDb(),
+		);
 		const roleByProjectId = new Map(
 			(await listProjectsForUser(ctx.user.id)).map(
 				(membership) => [membership.projectId, membership.role] as const,
 			),
 		);
-		// `listAllProjectsFromDb` already orders by name, so the order is the server's
+		// `listAllProjectRecordsFromDb` already orders by name, so the order is the server's
 		// and the panel adds no sort of its own.
 		return accessible.map((project) => ({
 			id: project.id,
@@ -282,7 +298,7 @@ export const projectsRouter = router({
 			// A non-member gets NOT_FOUND here, so the read below never reveals that a
 			// project they can't see exists.
 			await assertProjectAccess(ctx.user, input.id, 'contributor');
-			const project = await getProjectByIdFromDb(input.id);
+			const project = await findProjectRecordByIdFromDb(input.id);
 			if (!project) {
 				throw new TRPCError({
 					code: 'NOT_FOUND',
@@ -348,7 +364,7 @@ export const projectsRouter = router({
 				role: 'projectAdmin',
 			});
 		} catch (error) {
-			if (isUniqueViolation(error)) {
+			if (isProjectConflict(error)) {
 				throw new TRPCError({
 					code: 'CONFLICT',
 					message: 'Project ID or repository already exists',
@@ -370,7 +386,7 @@ export const projectsRouter = router({
 			// Config changes are a `projectAdmin`-only action; a `member`/`contributor`
 			// gets FORBIDDEN, a non-member NOT_FOUND.
 			await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
-			const existing = await getProjectByIdFromDb(input.id);
+			const existing = await findProjectRecordByIdFromDb(input.id);
 			if (!existing) {
 				throw new TRPCError({
 					code: 'NOT_FOUND',
@@ -393,7 +409,7 @@ export const projectsRouter = router({
 				await upsertProjectToDb(config);
 				return config;
 			} catch (error) {
-				if (isUniqueViolation(error)) {
+				if (isProjectConflict(error)) {
 					throw new TRPCError({
 						code: 'CONFLICT',
 						message: 'Project ID or repository already exists',
@@ -408,7 +424,7 @@ export const projectsRouter = router({
 		.mutation(async ({ ctx, input }) => {
 			// Deleting a project is `projectAdmin`-only (same boundary as `update`).
 			await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
-			const existing = await getProjectByIdFromDb(input.id);
+			const existing = await findProjectRecordByIdFromDb(input.id);
 			if (!existing) {
 				throw new TRPCError({
 					code: 'NOT_FOUND',
@@ -447,7 +463,7 @@ export const projectsRouter = router({
 	requestMembership: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }))
 		.mutation(async ({ ctx, input }) => {
-			const project = await getProjectByIdFromDb(input.projectId);
+			const project = await findProjectRecordByIdFromDb(input.projectId);
 			if (!project || project.visibility !== 'discoverable') {
 				throw new TRPCError({
 					code: 'NOT_FOUND',

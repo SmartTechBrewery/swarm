@@ -3,7 +3,6 @@ import { z } from 'zod';
 /**
  * The tabs on the user-profile screen, in display order — the profile's whole
  * user-facing navigation structure (issue #659), not only the part built today.
-<<<<<<< HEAD
  * `workers` (issue #660), `projects` (issue #661), and `security` (issue #662) have all arrived.
  */
 export const PROFILE_TABS = ['account', 'workers', 'projects', 'security'] as const;

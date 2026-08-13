@@ -15,7 +15,7 @@ const VALID_CONFIG = {
 		{
 			id: 'p',
 			name: 'P',
-			repo: 'owner/repo',
+			repositories: [{ repo: 'owner/repo' }],
 			repoRoot: '/tmp/p',
 			pm: {
 				type: 'github-projects',

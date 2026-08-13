@@ -14,18 +14,27 @@ export async function seedProject(overrides: Partial<ProjectConfig> = {}): Promi
 	// `pm` persists split into its discriminator and the provider's own config blob
 	// (`src/db/schema/projects.ts`), the same way the repository writes it.
 	const { type: pmType, ...pmConfig } = config.pm;
-	await getDb().insert(projects).values({
-		id: config.id,
-		name: config.name,
-		repo: config.repo,
-		repoRoot: config.repoRoot,
-		worktreeRoot: config.worktreeRoot,
-		baseBranch: config.baseBranch,
-		branchPrefix: config.branchPrefix,
-		visibility: config.visibility,
-		pmType,
-		pmConfig,
-		credentials: config.credentials,
-	});
+	await getDb()
+		.insert(projects)
+		.values({
+			id: config.id,
+			name: config.name,
+			// The fixture is a project *scoped to one repository* (`ProjectConfig`), so the
+			// persisted list is that one entry — which is exactly what a single-repository
+			// project holds while issue #684 phase 1 caps the list at one.
+			repositories: [
+				{
+					repo: config.repo,
+					baseBranch: config.baseBranch,
+					branchPrefix: config.branchPrefix,
+				},
+			],
+			repoRoot: config.repoRoot,
+			worktreeRoot: config.worktreeRoot,
+			visibility: config.visibility,
+			pmType,
+			pmConfig,
+			credentials: config.credentials,
+		});
 	return config;
 }

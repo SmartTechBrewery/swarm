@@ -49,7 +49,7 @@ describe('ProjectCreateDialog', () => {
 			expect(createProject).toHaveBeenCalledWith({
 				id: 'new-project',
 				name: 'New Project',
-				repo: 'team/new-project',
+				repositories: [{ repo: 'team/new-project' }],
 				repoRoot: '/work/new-project',
 				scm: 'bitbucket',
 			}),

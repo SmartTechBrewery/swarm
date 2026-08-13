@@ -580,35 +580,84 @@ export const ProjectPmSchema = z.discriminatedUnion('type', [
 ]);
 
 /**
- * The project config's field shape, without the cross-field checks
- * {@link ProjectConfigSchema} adds — the same base/refined split
+ * One repository a project owns, with the settings that are genuinely
+ * per-repository (issue #684 phase 1): the coordinates themselves, the branch
+ * worktrees are cut from, the task-branch prefix, and an optional SCM-provider
+ * override for a project whose repositories don't all live on the same provider.
+ *
+ * These four fields used to sit at the top level of a project, where they were
+ * indistinguishable from the genuinely shared settings beside them. They are the
+ * entry of {@link ProjectRecordBaseSchema}'s `repositories` list now, and remain
+ * flattened back onto {@link ProjectConfigBaseSchema} — the project *scoped to one
+ * of its repositories*, which is what every runtime call site takes.
+ */
+export const ProjectRepositorySchema = z.object({
+	/** The repository this entry names, as `owner/repo`. */
+	repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
+
+	/**
+	 * The SCM provider *this repository* lives on, overriding the project-level
+	 * `scm` default so a project can span two providers. Omit it — as a
+	 * single-provider project does — and the project's own `scm` is what
+	 * `requireProjectSCMProvider` resolves.
+	 */
+	scm: ScmProviderIdSchema.optional(),
+
+	/** Branch task worktrees are cut from and PRs target. */
+	baseBranch: z.string().min(1).default(PROJECT_DEFAULTS.baseBranch),
+
+	/** Prefix for task branch names — SWARM's convention is `issue-<n>-<slug>`. */
+	branchPrefix: z.string().default(PROJECT_DEFAULTS.branchPrefix),
+});
+
+/**
+ * The **authored and persisted** project's field shape, without the cross-field
+ * checks {@link ProjectRecordSchema} adds — the same base/refined split
  * `PipelineBaseSchema`/`PipelineConfigSchema` uses above.
  *
- * Exists because `.pick()`/`.omit()` are `z.object` methods: the worker-safe
- * projection (`./worker-config.ts`), the non-secret transport slice
- * (`./project-config-slice.ts`), and the projects API's write input all derive a
- * narrower schema from these fields, and every one of them drops either
- * `credentials` or nothing the refinement reads. Parse **`ProjectConfigSchema`**,
- * not this, when validating a whole project config.
+ * Everything genuinely shared across a project's repositories is stated once here;
+ * everything genuinely per-repository is an entry of `repositories`. This is the
+ * shape `swarm.config.json` authors, the `projects` table persists, and the projects
+ * API reads and writes. Runtime code takes {@link ProjectConfigBaseSchema} instead —
+ * this record narrowed to one of its repositories by `scopeProjectToRepository`
+ * (`./project-repository.ts`).
  */
-export const ProjectConfigBaseSchema = z.object({
+export const ProjectRecordBaseSchema = z.object({
 	/** Stable internal identifier for this SWARM project (one Postgres row per project). */
 	id: z.string().min(1),
 
 	/** Human-facing name — also the `{project-name}` in the worktree paths (PROJECT.md §4.1). */
 	name: z.string().min(1),
 
-	/** The GitHub repository this project operates on, as `owner/repo`. */
-	repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
+	/**
+	 * The repositories this project operates on ({@link ProjectRepositorySchema}).
+	 *
+	 * **Capped at exactly one entry in issue #684 phase 1.** The list is the durable
+	 * shape — the schema, the `projects.repositories` column, and the repository
+	 * lookups all speak it — but a *second* repository is not routable until phase 2
+	 * threads the chosen repository from the queue job through to the worker.
+	 * Accepting one before then would let a webhook from repository B resolve the
+	 * project and then run the phase against repository A. Phase 2 lifts the cap in
+	 * the same change that closes that gap.
+	 */
+	repositories: z
+		.array(ProjectRepositorySchema)
+		.min(1)
+		.max(1, {
+			message:
+				'A project owns exactly one repository for now — several repositories per ' +
+				'project land with issue #684 phase 2',
+		}),
 
 	/**
-	 * The SCM provider this project's repository lives on — the discriminator
-	 * `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`) resolves, and
-	 * the SCM twin of `pm`'s `type` (issue #478). `repo` is the coordinates *this*
-	 * provider interprets (`owner/repo`, a Bitbucket `workspace/repo_slug`, a GitLab
-	 * `namespace/project`), which is why the discriminator is stated rather than
-	 * inferred from the repo string: there is nothing in a bare `owner/repo` to tell
-	 * two providers apart.
+	 * The SCM provider this project's repositories live on by default — the
+	 * discriminator `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`)
+	 * resolves, and the SCM twin of `pm`'s `type` (issue #478). An entry's `repo` is
+	 * the coordinates *this* provider interprets (`owner/repo`, a Bitbucket
+	 * `workspace/repo_slug`, a GitLab `namespace/project`), which is why the
+	 * discriminator is stated rather than inferred from the repo string: there is
+	 * nothing in a bare `owner/repo` to tell two providers apart. A repository that
+	 * lives elsewhere states its own `scm` and overrides this.
 	 *
 	 * **Optional in shape, required in practice since issue #618.** Absence means "the
 	 * sole runtime-ready registered provider", which was the back-compat path for
@@ -653,12 +702,6 @@ export const ProjectConfigBaseSchema = z.object({
 	 */
 	worktreeRoot: z.string().min(1).default(PROJECT_DEFAULTS.worktreeRoot),
 
-	/** Branch task worktrees are cut from and PRs target. */
-	baseBranch: z.string().min(1).default(PROJECT_DEFAULTS.baseBranch),
-
-	/** Prefix for task branch names — SWARM's convention is `issue-<n>-<slug>`. */
-	branchPrefix: z.string().default(PROJECT_DEFAULTS.branchPrefix),
-
 	/** Maximum number of jobs this project may run concurrently. */
 	maxConcurrentJobs: z.number().int().positive().default(PROJECT_DEFAULTS.maxConcurrentJobs),
 
@@ -685,6 +728,44 @@ export const ProjectConfigBaseSchema = z.object({
 	/** Per-project worktree retention policy (`WorktreeRetentionConfig`) — nullable: most projects omit it and use the coded default. */
 	worktreeRetention: WorktreeRetentionConfigSchema.optional(),
 });
+
+/**
+ * A project **scoped to one of its repositories** — the project's shared settings
+ * with one `repositories` entry flattened over them — without the cross-field checks
+ * {@link ProjectConfigSchema} adds.
+ *
+ * This is the shape every runtime call site takes, and it is deliberately unchanged
+ * by issue #684: the four per-repository fields are still `project.repo`,
+ * `project.baseBranch`, `project.branchPrefix` and `project.scm`, so the pipeline
+ * phases, the triggers, the SCM provider contract and the worker keep reading a
+ * project exactly as they did. What changed is where it comes from —
+ * `scopeProjectToRepository` (`./project-repository.ts`) narrows a
+ * {@link ProjectRecordSchema} down to it — and what it *cannot* carry: a scoped
+ * config has no `repositories` list in it, so no call site can accidentally act on a
+ * repository other than the one its task names.
+ *
+ * Derived by merge rather than restated so the two shapes can't drift: the entry's
+ * `scm` member wins over the project-level default, which is what
+ * `scopeProjectToRepository` resolves before it builds one.
+ *
+ * `.pick()`/`.omit()` are `z.object` methods, and `.merge()` of two `z.object`s is
+ * another — so the worker-safe projection (`./worker-config.ts`), the non-secret
+ * transport slice (`./project-config-slice.ts`), and the projects API's write input
+ * all keep deriving narrower schemas from these fields. Parse
+ * **`ProjectConfigSchema`**, not this, when validating a whole scoped config.
+ */
+export const ProjectConfigBaseSchema = ProjectRecordBaseSchema.omit({
+	repositories: true,
+}).merge(ProjectRepositorySchema);
+
+/**
+ * The slice of a project the two credential refinements below read — the record and
+ * the scoped config alike, since neither check looks at a repository.
+ */
+interface CredentialRefinementInput {
+	pm: z.infer<typeof ProjectPmSchema>;
+	credentials: z.infer<typeof CredentialsSchema>;
+}
 
 /**
  * Validate `credentials.pm` against the registered PM manifests (issues #497, #631) —
@@ -724,9 +805,10 @@ export const ProjectConfigBaseSchema = z.object({
  * apply` gate rather than an API one.)
  */
 function validatePmCredentialRoles(
-	// Not `ProjectConfig`: that type is inferred *from* this schema, so naming it
-	// here would make the inference circular.
-	project: z.infer<typeof ProjectConfigBaseSchema>,
+	// Only the two fields it reads, rather than a whole project: it refines both
+	// `ProjectRecordSchema` and `ProjectConfigSchema`, and naming either inferred type
+	// here would make the inference circular anyway.
+	project: CredentialRefinementInput,
 	ctx: z.RefinementCtx,
 ): void {
 	const references = project.credentials.pm ?? {};
@@ -826,7 +908,7 @@ function validateCurrentPmProviderRoles(
  * needed and names the project, provider, role, and conventional env var key.
  */
 function validateScmCredentialReferences(
-	project: z.infer<typeof ProjectConfigBaseSchema>,
+	project: CredentialRefinementInput,
 	ctx: z.RefinementCtx,
 ): void {
 	const references = project.credentials.scm;
@@ -888,8 +970,20 @@ export const ProjectConfigSchema = z
 	.superRefine(validatePmCredentialRoles)
 	.superRefine(validateScmCredentialReferences);
 
+/**
+ * A whole project **record** — {@link ProjectRecordBaseSchema}'s fields plus exactly
+ * the same adoptions and cross-field checks {@link ProjectConfigSchema} applies,
+ * since neither reads a repository. This is what `validateConfig` /
+ * `swarm config apply` parse and what the `projects` table persists.
+ */
+export const ProjectRecordSchema = z
+	.preprocess(adoptLegacyPmCredentials, ProjectRecordBaseSchema)
+	.transform(adoptLegacyScmCredentials)
+	.superRefine(validatePmCredentialRoles)
+	.superRefine(validateScmCredentialReferences);
+
 export const SwarmConfigSchema = z.object({
-	projects: z.array(ProjectConfigSchema).min(1),
+	projects: z.array(ProjectRecordSchema).min(1),
 });
 
 export type Credentials = z.infer<typeof CredentialsSchema>;
@@ -933,6 +1027,13 @@ export type ProjectPmConfig = ProjectPm extends infer Member
 		: never
 	: never;
 
+/** One entry of a project's repository list (issue #684). */
+export type ProjectRepository = z.infer<typeof ProjectRepositorySchema>;
+
+/** The authored and persisted project — shared settings plus its repository list. */
+export type ProjectRecord = z.infer<typeof ProjectRecordSchema>;
+
+/** A project scoped to one of its repositories — what every runtime call site takes. */
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
 export type SwarmConfig = z.infer<typeof SwarmConfigSchema>;
 

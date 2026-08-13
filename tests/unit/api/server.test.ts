@@ -7,7 +7,7 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	upsertProjectToDb: vi.fn(),
 	createProjectInDb: vi.fn(),
 	deleteProjectFromDb: vi.fn(),
-	listAllProjectsFromDb: vi.fn(),
+	listAllProjectRecordsFromDb: vi.fn(),
 	getProjectByIdFromDb: vi.fn(),
 }));
 
@@ -34,7 +34,7 @@ vi.mock('@/identity/service.js', () => ({
 }));
 
 import { createApiApp, SESSION_COOKIE_NAME } from '@/api/server.js';
-import { listAllProjectsFromDb } from '@/db/repositories/projectsRepository.js';
+import { listAllProjectRecordsFromDb } from '@/db/repositories/projectsRepository.js';
 import {
 	createSession,
 	resolveSession,
@@ -64,7 +64,7 @@ describe('swarm-api', () => {
 		// Keep the single-user policy off unless a test opts in via the app option,
 		// so the default-mode assertions don't depend on the ambient env.
 		delete process.env.SWARM_SINGLE_USER_MODE;
-		vi.mocked(listAllProjectsFromDb).mockReset();
+		vi.mocked(listAllProjectRecordsFromDb).mockReset();
 		vi.mocked(verifyCredentials).mockReset();
 		vi.mocked(createSession).mockReset();
 		vi.mocked(resolveSession).mockReset();
@@ -104,12 +104,12 @@ describe('swarm-api', () => {
 			const res = await app.request('/trpc/projects.list');
 
 			expect(res.status).toBe(401);
-			expect(listAllProjectsFromDb).not.toHaveBeenCalled();
+			expect(listAllProjectRecordsFromDb).not.toHaveBeenCalled();
 		});
 
 		it('serves an authed procedure when the session cookie resolves to a user', async () => {
 			vi.mocked(resolveSession).mockResolvedValue(user);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([]);
 			vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
 
 			const app = createApiApp();
@@ -120,7 +120,7 @@ describe('swarm-api', () => {
 			expect(res.status).toBe(200);
 			expect(await res.json()).toEqual({ result: { data: [] } });
 			expect(resolveSession).toHaveBeenCalledWith(RAW_TOKEN);
-			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
+			expect(listAllProjectRecordsFromDb).toHaveBeenCalledTimes(1);
 		});
 
 		it('returns 401 when the session cookie no longer resolves to a user', async () => {
@@ -132,7 +132,7 @@ describe('swarm-api', () => {
 			});
 
 			expect(res.status).toBe(401);
-			expect(listAllProjectsFromDb).not.toHaveBeenCalled();
+			expect(listAllProjectRecordsFromDb).not.toHaveBeenCalled();
 		});
 	});
 
@@ -164,7 +164,7 @@ describe('swarm-api', () => {
 		it('serves a protected procedure with no cookie and without resolveSession', async () => {
 			vi.mocked(resolveSingleUser).mockResolvedValue(admin);
 			vi.mocked(getUser).mockResolvedValue(admin);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([]);
 
 			const app = createApiApp({ singleUserMode: true });
 			const res = await app.request('/trpc/projects.list');
@@ -172,7 +172,7 @@ describe('swarm-api', () => {
 			expect(res.status).toBe(200);
 			expect(await res.json()).toEqual({ result: { data: [] } });
 			expect(resolveSession).not.toHaveBeenCalled();
-			expect(listAllProjectsFromDb).toHaveBeenCalledTimes(1);
+			expect(listAllProjectRecordsFromDb).toHaveBeenCalledTimes(1);
 		});
 
 		it('bootstraps the admin once across requests', async () => {
@@ -220,12 +220,12 @@ describe('swarm-api', () => {
 
 			expect(res.status).toBe(401);
 			expect(resolveSingleUser).not.toHaveBeenCalled();
-			expect(listAllProjectsFromDb).not.toHaveBeenCalled();
+			expect(listAllProjectRecordsFromDb).not.toHaveBeenCalled();
 		});
 
 		it('explicitly disabled: still resolves a valid cookie exactly as today', async () => {
 			vi.mocked(resolveSession).mockResolvedValue(user);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([]);
 			vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
 
 			const app = createApiApp({ singleUserMode: false });

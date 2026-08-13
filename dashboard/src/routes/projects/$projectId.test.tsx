@@ -2,7 +2,7 @@
 
 import { act, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
-import type { AgentConfig, ProjectConfig } from '../../../../src/config/schema.js';
+import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
 
 const mockMutate = vi.fn();
 const mockSetQueryData = vi.fn();
@@ -76,22 +76,20 @@ import {
 	useToggleAutoSave,
 } from './$projectId.js';
 
-/** Minimal valid ProjectConfig for the slices `diffProjectForSync` compares. */
-function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
+/** Minimal valid ProjectRecord for the slices `diffProjectForSync` compares. */
+function makeProject(overrides: Partial<ProjectRecord> = {}): ProjectRecord {
 	return {
 		id: 'p1',
 		name: 'Proj',
-		repo: 'owner/repo',
+		repositories: [{ repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-' }],
 		repoRoot: '/repo',
 		worktreeRoot: '.worktrees',
-		baseBranch: 'main',
-		branchPrefix: 'issue-',
 		maxConcurrentJobs: 1,
 		visibility: 'private',
-		pm: { type: 'github-projects' } as ProjectConfig['pm'],
-		credentials: {} as ProjectConfig['credentials'],
+		pm: { type: 'github-projects' } as ProjectRecord['pm'],
+		credentials: {} as ProjectRecord['credentials'],
 		...overrides,
-	} as ProjectConfig;
+	} as ProjectRecord;
 }
 
 describe('toggleSaveKey', () => {
@@ -1058,9 +1056,9 @@ describe('diffProjectForSync', () => {
 	// mapping) held client-side until one Save. A background refetch that changes `pm` —
 	// or another tab's write landing on it — must not discard that half-built mapping.
 	it('freezes the boardMapping slice while a provider switch draft is open', () => {
-		const prev = makeProject({ pm: { type: 'github-projects' } as ProjectConfig['pm'] });
+		const prev = makeProject({ pm: { type: 'github-projects' } as ProjectRecord['pm'] });
 		const next = makeProject({
-			pm: { type: 'github-projects', projectId: 'PVT_new' } as ProjectConfig['pm'],
+			pm: { type: 'github-projects', projectId: 'PVT_new' } as ProjectRecord['pm'],
 		});
 
 		expect(diffProjectForSync(prev, next)).toMatchObject({ boardMapping: true });

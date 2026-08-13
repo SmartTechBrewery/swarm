@@ -5,6 +5,7 @@ vi.mock('@/db/client.js', () => ({ getDb: vi.fn() }));
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
+import { scopeProjectToRepository } from '@/config/project-repository.js';
 import { getDb } from '@/db/client.js';
 import {
 	createProjectInDb,
@@ -14,60 +15,83 @@ import {
 	findProjectByIdFromDb,
 	findProjectByPmContainerFromDb,
 	findProjectByRepoFromDb,
+	findProjectRecordByIdFromDb,
 	getProjectByIdFromDb,
 	listAllProjectsFromDb,
+	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '@/db/repositories/projectsRepository.js';
 import { projects } from '@/db/schema/projects.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
-import { createMockProjectConfig } from '../../../helpers/factories.js';
+import { createMockProjectRecord } from '../../../helpers/factories.js';
 
-function stubDb(rows: unknown[]): void {
+/**
+ * A select-chain stub. Thenable as well as `.limit()`-able because the two read
+ * shapes end differently: a lookup finishes on `.limit()`, while the repository-claim
+ * guard (`assertRepositoriesUnclaimed`) awaits the query straight off `.orderBy()`.
+ */
+function selectBuilder(
+	rows: unknown[],
+	onWhere?: (predicate: SQL) => void,
+	onOrderBy?: (column: unknown) => void,
+) {
 	const builder = {
 		select: () => builder,
 		from: () => builder,
-		where: () => builder,
+		where: (predicate: SQL) => {
+			onWhere?.(predicate);
+			return builder;
+		},
+		orderBy: (column: unknown) => {
+			onOrderBy?.(column);
+			return builder;
+		},
 		limit: () => Promise.resolve(rows),
+		// biome-ignore lint/suspicious/noThenProperty: the guard awaits the builder itself
+		then: (resolve: (value: unknown) => unknown) => Promise.resolve(rows).then(resolve),
 	};
-	vi.mocked(getDb).mockReturnValue(builder as unknown as ReturnType<typeof getDb>);
+	return builder;
+}
+
+function stubDb(rows: unknown[]): void {
+	vi.mocked(getDb).mockReturnValue(selectBuilder(rows) as unknown as ReturnType<typeof getDb>);
 }
 
 /** Like {@link stubDb}, but also captures the `.where()` predicate for inspection. */
 function stubDbCapturingWhere(rows: unknown[]): { where: () => SQL | undefined } {
 	let captured: SQL | undefined;
-	const builder = {
-		select: () => builder,
-		from: () => builder,
-		where: (predicate: SQL) => {
+	vi.mocked(getDb).mockReturnValue(
+		selectBuilder(rows, (predicate) => {
 			captured = predicate;
-			return builder;
-		},
-		limit: () => Promise.resolve(rows),
-	};
-	vi.mocked(getDb).mockReturnValue(builder as unknown as ReturnType<typeof getDb>);
+		}) as unknown as ReturnType<typeof getDb>,
+	);
 	return { where: () => captured };
 }
 
-/** Capture the `.values()` / `.onConflictDoUpdate()` args of an insert-upsert chain. */
-function stubInsert(): {
+/**
+ * Capture the `.values()` / `.onConflictDoUpdate()` args of an insert-upsert chain.
+ * `claimedBy` is what the repository-claim guard's select sees — empty (nobody owns
+ * the repository) unless a test is exercising the conflict.
+ */
+function stubInsert(claimedBy: unknown[] = []): {
 	values: ReturnType<typeof vi.fn>;
 	onConflictDoUpdate: ReturnType<typeof vi.fn>;
 } {
 	const onConflictDoUpdate = vi.fn(() => Promise.resolve());
 	const values = vi.fn(() => ({ onConflictDoUpdate }));
 	const insert = vi.fn(() => ({ values }));
-	vi.mocked(getDb).mockReturnValue({ insert } as unknown as ReturnType<typeof getDb>);
+	const builder = selectBuilder(claimedBy) as unknown as Record<string, unknown>;
+	vi.mocked(getDb).mockReturnValue({ ...builder, insert } as unknown as ReturnType<typeof getDb>);
 	return { values, onConflictDoUpdate };
 }
 
 const row = {
 	id: 'proj-1',
 	name: 'swarm',
-	repo: 'SmartTechBrewery/swarm',
+	// The three per-repository columns are one jsonb list since issue #684.
+	repositories: [{ repo: 'SmartTechBrewery/swarm', baseBranch: 'main', branchPrefix: 'issue-' }],
 	repoRoot: '/Users/dev/swarm',
 	worktreeRoot: '.swarm-workspaces',
-	baseBranch: 'main',
-	branchPrefix: 'issue-',
 	maxConcurrentJobs: 4,
 	pmType: 'github-projects',
 	// `pm` persists split: the discriminator in `pm_type`, the provider's own config
@@ -105,6 +129,67 @@ describe('projectsRepository', () => {
 		it('returns undefined when no project owns the repo', async () => {
 			stubDb([]);
 			expect(await findProjectByRepoFromDb('someone/else')).toBeUndefined();
+		});
+
+		// The `repo` column (and its UNIQUE index) is gone: the lookup matches *any*
+		// entry of the jsonb list by containment, and orders by id so the result can
+		// never depend on heap order (issue #684).
+		it('matches any repositories entry by jsonb containment, ordered by id', async () => {
+			const captured = stubDbCapturingWhere([row]);
+
+			await findProjectByRepoFromDb('SmartTechBrewery/swarm');
+
+			const predicate = captured.where();
+			expect(predicate).toBeDefined();
+			const query = new PgDialect().sqlToQuery(predicate as SQL);
+			expect(query.sql).toContain('"repositories" @>');
+			// Bound, not interpolated: the repo never appears literally in the SQL.
+			expect(query.sql).not.toContain('SmartTechBrewery');
+			expect(query.params).toEqual(['[{"repo":"SmartTechBrewery/swarm"}]']);
+		});
+
+		// Scoping to the *matched* entry is what keeps a delivery from repository B
+		// running against repository A's branch settings once phase 2 lifts the cap.
+		it('scopes the result to the matched entry, not the first one', async () => {
+			stubDb([
+				{
+					...row,
+					repositories: [
+						{ repo: 'SmartTechBrewery/first', baseBranch: 'main', branchPrefix: 'issue-' },
+						{ repo: 'SmartTechBrewery/second', baseBranch: 'develop', branchPrefix: 'task-' },
+					],
+				},
+			]);
+
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/second');
+
+			expect(project).toMatchObject({
+				repo: 'SmartTechBrewery/second',
+				baseBranch: 'develop',
+				branchPrefix: 'task-',
+			});
+			// A scoped config carries no list, so nothing downstream can reach another entry.
+			expect(project).not.toHaveProperty('repositories');
+		});
+
+		// A repository stating its own provider overrides the project-level default.
+		it("prefers the matched entry's scm over the project-level default", async () => {
+			stubDb([
+				{
+					...row,
+					scmType: 'github',
+					repositories: [
+						{
+							repo: 'SmartTechBrewery/swarm',
+							baseBranch: 'main',
+							branchPrefix: 'issue-',
+							scm: 'gitlab',
+						},
+					],
+				},
+			]);
+			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
+			expect(project?.scm).toBe('gitlab');
 		});
 
 		it('maps a null agents column to undefined (the common case: no override configured)', async () => {
@@ -177,7 +262,9 @@ describe('projectsRepository', () => {
 		const linearRow = {
 			...row,
 			id: 'proj-linear',
-			repo: 'SmartTechBrewery/other',
+			repositories: [
+				{ repo: 'SmartTechBrewery/other', baseBranch: 'main', branchPrefix: 'issue-' },
+			],
 			pmType: 'linear',
 			pmConfig: { teamId: 'team-uuid', statusOptions: { inProgress: 'state-uuid' } },
 		};
@@ -218,6 +305,23 @@ describe('projectsRepository', () => {
 		});
 	});
 
+	// The config-management read: the whole record, repository list included (issue #684).
+	describe('findProjectRecordByIdFromDb', () => {
+		it('returns the repository list rather than a scoped view', async () => {
+			stubDb([row]);
+			const record = await findProjectRecordByIdFromDb('proj-1');
+			expect(record?.repositories).toEqual([
+				{ repo: 'SmartTechBrewery/swarm', baseBranch: 'main', branchPrefix: 'issue-' },
+			]);
+			expect(record).not.toHaveProperty('repo');
+		});
+
+		it('returns undefined for an unknown id', async () => {
+			stubDb([]);
+			expect(await findProjectRecordByIdFromDb('nope')).toBeUndefined();
+		});
+	});
+
 	describe('findProjectByIdFromDb', () => {
 		it('maps a row back to a ProjectConfig', async () => {
 			stubDb([row]);
@@ -242,8 +346,8 @@ describe('projectsRepository', () => {
 	describe('upsertProjectToDb', () => {
 		it('flattens pm.type into a column and upserts on the id', async () => {
 			const { values, onConflictDoUpdate } = stubInsert();
-			const project = createMockProjectConfig({ id: 'proj-1' });
-			const pm = requireGitHubProjectsConfig(project);
+			const project = createMockProjectRecord({ id: 'proj-1' });
+			const pm = requireGitHubProjectsConfig(scopeProjectToRepository(project));
 
 			await upsertProjectToDb(project);
 
@@ -267,7 +371,7 @@ describe('projectsRepository', () => {
 
 		it('round-trips the pm union member through the two columns it persists as', async () => {
 			const { values } = stubInsert();
-			const project = createMockProjectConfig({
+			const project = createMockProjectRecord({
 				id: 'proj-1',
 				pm: {
 					type: 'github-projects',
@@ -299,7 +403,7 @@ describe('projectsRepository', () => {
 		// map (issue #497) must survive a write/read cycle without a column change.
 		it("round-trips the credentials block's PM role references", async () => {
 			const { values } = stubInsert();
-			const project = createMockProjectConfig({
+			const project = createMockProjectRecord({
 				id: 'proj-1',
 				credentials: {
 					reviewer: 'SCM_TOKEN_REVIEWER',
@@ -319,25 +423,53 @@ describe('projectsRepository', () => {
 
 		it('writes agents as null when the config omits it', async () => {
 			const { values } = stubInsert();
-			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1' }));
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1' }));
 			expect(values.mock.calls[0][0]).toMatchObject({ agents: null });
 		});
 
 		it('writes the scm discriminator, and null when the project states none', async () => {
 			const { values: withScm } = stubInsert();
-			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1', scm: 'gitlab' }));
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1', scm: 'gitlab' }));
 			expect(withScm.mock.calls[0][0]).toMatchObject({ scmType: 'gitlab' });
 
 			// Never 'github': a project that states no provider must stay unstated in the
 			// row, or the loud "set scm" error can never fire for it (issue #478).
 			const { values: withoutScm } = stubInsert();
-			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1' }));
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1' }));
 			expect(withoutScm.mock.calls[0][0]).toMatchObject({ scmType: null });
+		});
+
+		it('writes the repository list to its own jsonb column', async () => {
+			const { values } = stubInsert();
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1' }));
+			const inserted = values.mock.calls[0][0];
+			expect(inserted.repositories).toEqual([
+				{ repo: 'SmartTechBrewery/swarm', baseBranch: 'main', branchPrefix: 'issue-' },
+			]);
+			// The three per-repository columns are gone, not merely unused.
+			for (const key of ['repo', 'baseBranch', 'branchPrefix']) {
+				expect(inserted).not.toHaveProperty(key);
+			}
+		});
+
+		// The write-seam guard standing in for the `repo` UNIQUE constraint the column
+		// drop dissolved (issue #684).
+		it('refuses a write claiming a repository another project already owns', async () => {
+			stubInsert([{ id: 'other-project' }]);
+			await expect(upsertProjectToDb(createMockProjectRecord({ id: 'proj-1' }))).rejects.toThrow(
+				ProjectRepositoryConflictError,
+			);
+		});
+
+		it('allows a project to keep its own repository on re-write', async () => {
+			const { values } = stubInsert([{ id: 'proj-1' }]);
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1' }));
+			expect(values).toHaveBeenCalledTimes(1);
 		});
 
 		it('writes the configured maximum concurrent jobs', async () => {
 			const { values } = stubInsert();
-			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1', maxConcurrentJobs: 3 }));
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1', maxConcurrentJobs: 3 }));
 			expect(values.mock.calls[0][0]).toMatchObject({ maxConcurrentJobs: 3 });
 		});
 
@@ -349,7 +481,7 @@ describe('projectsRepository', () => {
 			const agents = {
 				planning: { cli: 'antigravity' as const, model: 'Gemini 3.5 Flash (High)' },
 			};
-			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1', agents }));
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1', agents }));
 			expect(values.mock.calls[0][0]).toMatchObject({
 				agents: {
 					planning: { cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' },
@@ -367,7 +499,7 @@ describe('projectsRepository', () => {
 					],
 				},
 			};
-			await upsertProjectToDb(createMockProjectConfig({ id: 'proj-1', agents }));
+			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1', agents }));
 
 			// `agents` is a jsonb blob typed by the Zod schema — a target list needs no
 			// migration, but it must survive serialization in priority order.
@@ -421,6 +553,11 @@ describe('projectsRepository', () => {
 			let insertedValues: unknown;
 			let isThenCalled = false;
 			const builder = {
+				// The repository-claim guard runs first and finds nobody owning the repo.
+				select: () => builder,
+				from: () => builder,
+				where: () => builder,
+				orderBy: () => Promise.resolve([]),
 				insert: () => builder,
 				values: (v: unknown) => {
 					insertedValues = v;
@@ -434,7 +571,7 @@ describe('projectsRepository', () => {
 			};
 			vi.mocked(getDb).mockReturnValue(builder as unknown as ReturnType<typeof getDb>);
 
-			const project = createMockProjectConfig({ id: 'proj-new' });
+			const project = createMockProjectRecord({ id: 'proj-new' });
 			await createProjectInDb(project);
 
 			expect(insertedValues).toMatchObject({ id: 'proj-new', pmType: 'github-projects' });
@@ -446,6 +583,11 @@ describe('projectsRepository', () => {
 	describe('createProjectWithMemberInDb', () => {
 		it('inserts project and member inside a transaction block', async () => {
 			const mockTx = {
+				// The repository-claim guard runs on the transaction, so the check and the
+				// inserts share one snapshot.
+				select: vi.fn(() => ({
+					from: () => ({ where: () => ({ orderBy: () => Promise.resolve([]) }) }),
+				})),
 				insert: vi.fn(() => ({
 					values: vi.fn(() => Promise.resolve()),
 				})),
@@ -458,7 +600,7 @@ describe('projectsRepository', () => {
 				},
 			} as unknown as ReturnType<typeof getDb>);
 
-			const project = createMockProjectConfig({ id: 'proj-atomic' });
+			const project = createMockProjectRecord({ id: 'proj-atomic' });
 			await createProjectWithMemberInDb(project, {
 				projectId: 'proj-atomic',
 				userId: 'user-owner',
