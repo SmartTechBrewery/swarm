@@ -25,7 +25,7 @@ import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.j
 import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
 import { PmProviderSwitchDialog } from '@/components/projects/pm-provider-switch-dialog.js';
 import { ProjectAdminOnly } from '@/components/projects/project-admin-only.js';
-import { RepositoryList } from '@/components/projects/repository-list.js';
+import { RepositoriesPanel } from '@/components/projects/repositories-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
@@ -303,10 +303,18 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 	};
 }
 
+/**
+ * The Settings tab's form: project identity and host layout, and nothing else.
+ *
+ * The repository list rendered here between issues #700 and #729 and now lives on the
+ * Source Control tab, under the provider those repositories are hosted on
+ * ({@link RepositoriesPanel}). What is left is coherent on its own — a display `name`,
+ * plus the two local paths and the concurrency cap that describe the *host* running the
+ * work rather than any repository. It keeps its own `projects.update` write, sending
+ * exactly these four fields; the repository list sends its own.
+ */
 interface GeneralSettingsFormProps {
 	name: string;
-	repositories: RepositoryForm[];
-	duplicateRepos: string[];
 	repoRoot: string;
 	worktreeRoot: string;
 	maxConcurrentJobs: string;
@@ -315,10 +323,6 @@ interface GeneralSettingsFormProps {
 	setRepoRoot: (val: string) => void;
 	setWorktreeRoot: (val: string) => void;
 	setMaxConcurrentJobs: (val: string) => void;
-	handleRepositoryChange: (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) => void;
-	handleAddRepository: () => void;
-	handleRemoveRepository: (index: number) => void;
-	handleMoveRepository: (index: number, direction: 'up' | 'down') => void;
 	handleInputChange: (
 		setter: (val: string) => void,
 	) => (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -333,8 +337,6 @@ interface GeneralSettingsFormProps {
 
 export function GeneralSettingsForm({
 	name,
-	repositories,
-	duplicateRepos,
 	repoRoot,
 	worktreeRoot,
 	maxConcurrentJobs,
@@ -343,10 +345,6 @@ export function GeneralSettingsForm({
 	setRepoRoot,
 	setWorktreeRoot,
 	setMaxConcurrentJobs,
-	handleRepositoryChange,
-	handleAddRepository,
-	handleRemoveRepository,
-	handleMoveRepository,
 	handleInputChange,
 	handleSubmit,
 	handleReset,
@@ -456,16 +454,6 @@ export function GeneralSettingsForm({
 					</div>
 				</div>
 
-				<RepositoryList
-					repositories={repositories}
-					duplicates={duplicateRepos}
-					isPending={isPending}
-					onChange={handleRepositoryChange}
-					onAdd={handleAddRepository}
-					onRemove={handleRemoveRepository}
-					onMove={handleMoveRepository}
-				/>
-
 				{/* Feedback Banners */}
 				{isSuccess && (
 					<div className="p-3 bg-emerald-950/20 border border-emerald-900/30 text-sm text-emerald-400 rounded">
@@ -481,12 +469,9 @@ export function GeneralSettingsForm({
 
 				{/* Action Buttons */}
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
-					{/* A repository listed twice would be accepted server-side — the conflict guard
-					    only refuses one *another* project owns — so this is the one rule Save has
-					    to hold on its own. */}
 					<button
 						type="submit"
-						disabled={isPending || !isDirty || duplicateRepos.length > 0}
+						disabled={isPending || !isDirty}
 						className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
 					>
 						{isPending ? 'Saving…' : 'Save Changes'}
@@ -1691,6 +1676,7 @@ export function useToggleAutoSave({
 
 export interface ProjectSyncFlags {
 	general: boolean;
+	repositories: boolean;
 	agents: boolean;
 	pipeline: boolean;
 	boardMapping: boolean;
@@ -1705,6 +1691,11 @@ export interface ProjectSyncFlags {
  * survive — the two save paths stay independent (#369). A first sync (`prev`
  * undefined) reports every slice changed so the form seeds from the initial load.
  *
+ * `repositories` is its own slice since issue #729, when the list moved to the Source
+ * Control tab and got its own Save: it and the Settings form are now two independent
+ * writes, so folding the list back into `general` would let each one's success refetch
+ * reset the other's unsaved edits — the same protection, one tab boundary further out.
+ *
  * `boardMappingDraftProviderId` extends that protection one step further for the one
  * slice whose edits span several steps: while a PM provider switch is open (issue #642),
  * the `boardMapping` slice never reports changed, so a background refetch — or another
@@ -1718,15 +1709,15 @@ export function diffProjectForSync(
 	boardMappingDraftProviderId?: string,
 ): ProjectSyncFlags {
 	if (!prev) {
-		return { general: true, agents: true, pipeline: true, boardMapping: true };
+		return { general: true, repositories: true, agents: true, pipeline: true, boardMapping: true };
 	}
 	return {
 		general:
 			next.name !== prev.name ||
-			JSON.stringify(next.repositories) !== JSON.stringify(prev.repositories) ||
 			next.repoRoot !== prev.repoRoot ||
 			next.worktreeRoot !== prev.worktreeRoot ||
 			next.maxConcurrentJobs !== prev.maxConcurrentJobs,
+		repositories: JSON.stringify(next.repositories) !== JSON.stringify(prev.repositories),
 		agents: JSON.stringify(next.agents) !== JSON.stringify(prev.agents),
 		pipeline: JSON.stringify(next.pipeline) !== JSON.stringify(prev.pipeline),
 		boardMapping:
@@ -1897,43 +1888,45 @@ function ProjectDetailRouteComponent() {
 		};
 
 	useEffect(() => {
-		if (project) {
-			// Re-sync only the slices that actually changed on the server since the
-			// last load. This is what keeps a toggle auto-save (which changes only
-			// `pipeline`) from resetting unsaved Agents/General/Board edits when its
-			// success `setQueryData` — or any concurrent refetch — updates the cache
-			// (#369). See {@link diffProjectForSync}.
-			// An open provider switch additionally freezes the `boardMapping` slice, so a
-			// refetch can't discard a mapping being built for the incoming provider.
-			const changed = diffProjectForSync(lastSyncedProjectRef.current, project, pmDraftProviderId);
+		if (!project) return;
+		// Re-sync only the slices that actually changed on the server since the
+		// last load. This is what keeps a toggle auto-save (which changes only
+		// `pipeline`) from resetting unsaved Agents/Settings/Repository/Board edits when
+		// its success `setQueryData` — or any concurrent refetch — updates the cache
+		// (#369). See {@link diffProjectForSync}.
+		// An open provider switch additionally freezes the `boardMapping` slice, so a
+		// refetch can't discard a mapping being built for the incoming provider.
+		const changed = diffProjectForSync(lastSyncedProjectRef.current, project, pmDraftProviderId);
 
-			if (changed.general) {
-				setName(project.name);
-				setRepositories(toRepositoryForms(project.repositories));
-				setRepoRoot(project.repoRoot);
-				setWorktreeRoot(project.worktreeRoot ?? '');
-				setMaxConcurrentJobs(String(project.maxConcurrentJobs));
-				setMaxConcurrentJobsError(undefined);
-			}
-
-			if (changed.agents) {
-				setAgents(normalizeAgentsForDisplay(project.agents ?? {}));
-			}
-
-			if (changed.pipeline) {
-				setPipelineEnabled(toPipelineEnabledForm(project.pipeline));
-				setPipelineAutoAdvance(toPipelineAutoAdvanceForm(project.pipeline));
-				setAutoMerge(project.pipeline?.respondToReview?.autoMerge ?? false);
-				setSkipRespondToReviewOnMinors(project.pipeline?.respondToReview?.skipOnMinors ?? true);
-				setReviewChecksPolicy(toReviewChecksPolicyForm(project.pipeline));
-			}
-
-			if (changed.boardMapping) {
-				setBoardMapping(toBoardMappingForm(project.pm));
-			}
-
-			lastSyncedProjectRef.current = project;
+		if (changed.general) {
+			setName(project.name);
+			setRepoRoot(project.repoRoot);
+			setWorktreeRoot(project.worktreeRoot ?? '');
+			setMaxConcurrentJobs(String(project.maxConcurrentJobs));
+			setMaxConcurrentJobsError(undefined);
 		}
+
+		if (changed.repositories) {
+			setRepositories(toRepositoryForms(project.repositories));
+		}
+
+		if (changed.agents) {
+			setAgents(normalizeAgentsForDisplay(project.agents ?? {}));
+		}
+
+		if (changed.pipeline) {
+			setPipelineEnabled(toPipelineEnabledForm(project.pipeline));
+			setPipelineAutoAdvance(toPipelineAutoAdvanceForm(project.pipeline));
+			setAutoMerge(project.pipeline?.respondToReview?.autoMerge ?? false);
+			setSkipRespondToReviewOnMinors(project.pipeline?.respondToReview?.skipOnMinors ?? true);
+			setReviewChecksPolicy(toReviewChecksPolicyForm(project.pipeline));
+		}
+
+		if (changed.boardMapping) {
+			setBoardMapping(toBoardMappingForm(project.pm));
+		}
+
+		lastSyncedProjectRef.current = project;
 	}, [project, pmDraftProviderId]);
 
 	const updateMutation = useMutation({
@@ -1980,22 +1973,28 @@ function ProjectDetailRouteComponent() {
 	// one config write outstanding at a time, which removes the race at the source.
 	const configWriteInFlight = updateMutation.isPending || savingToggleKey !== undefined;
 
+	// The Settings tab's own dirty check: project identity and host layout alone. The
+	// repository list has its own, since issue #729 gave it its own tab and its own Save.
 	const isDirty = useMemo(() => {
 		if (!project) return false;
 		return (
 			name !== project.name ||
-			areRepositoriesDirty(repositories, project.repositories) ||
 			repoRoot !== project.repoRoot ||
 			worktreeRoot !== (project.worktreeRoot ?? '') ||
 			maxConcurrentJobs !== String(project.maxConcurrentJobs)
 		);
-	}, [project, name, repositories, repoRoot, worktreeRoot, maxConcurrentJobs]);
+	}, [project, name, repoRoot, worktreeRoot, maxConcurrentJobs]);
+
+	const isRepositoriesDirty = useMemo(
+		() => (project ? areRepositoriesDirty(repositories, project.repositories) : false),
+		[project, repositories],
+	);
 
 	// The one list rule with no server-side twin: `assertRepositoriesUnclaimed` refuses a
 	// repository *another* project owns, so a list repeating one of its own would be
 	// accepted. Surfaced inline and used to block Save, exactly like the Agents tab's
 	// duplicate-CLI check. A repository another project owns stays a server CONFLICT,
-	// rendered by the tab's existing error banner.
+	// rendered by the repository card's own error banner.
 	const duplicateRepos = useMemo(() => duplicateRepositories(repositories), [repositories]);
 
 	const isAgentsDirty = useMemo(() => {
@@ -2040,7 +2039,6 @@ function ProjectDetailRouteComponent() {
 	/** Every repository-list edit goes through here, so each one also clears the banner. */
 	const updateRepositories = (update: (rows: RepositoryForm[]) => RepositoryForm[]) => {
 		setRepositories(update);
-		setMaxConcurrentJobsError(undefined);
 		updateMutation.reset();
 	};
 
@@ -2227,7 +2225,6 @@ function ProjectDetailRouteComponent() {
 	const handleReset = () => {
 		if (project) {
 			setName(project.name);
-			setRepositories(toRepositoryForms(project.repositories));
 			setRepoRoot(project.repoRoot);
 			setWorktreeRoot(project.worktreeRoot ?? '');
 			setMaxConcurrentJobs(String(project.maxConcurrentJobs));
@@ -2239,25 +2236,42 @@ function ProjectDetailRouteComponent() {
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		if (configWriteInFlight) return;
-		// Save is disabled on a duplicate repository; guard here too so an Enter-to-submit
-		// from a field can't bypass the check (the same belt-and-braces the Agents tab uses).
-		if (duplicateRepos.length > 0) return;
 		const parsedMaxConcurrentJobs = Number(maxConcurrentJobs);
 		if (!Number.isInteger(parsedMaxConcurrentJobs) || parsedMaxConcurrentJobs < 1) {
 			setMaxConcurrentJobsError('Maximum concurrent jobs must be a positive whole number.');
 			return;
 		}
 		setMaxConcurrentJobsError(undefined);
+		// Only this tab's four fields: the repository list saves itself from the Source
+		// Control tab (issue #729), so sending it here would carry its unsaved edits.
 		updateMutation.mutate({
 			id: projectId,
 			name,
-			// The whole list every time: `projects.update` replaces `repositories` wholesale,
-			// and this editor shows every field an entry has, so nothing is carried through
-			// unseen.
-			repositories: toRepositoryEntries(repositories),
 			repoRoot,
 			worktreeRoot,
 			maxConcurrentJobs: parsedMaxConcurrentJobs,
+		});
+	};
+
+	const handleRepositoriesReset = () => {
+		if (project) {
+			setRepositories(toRepositoryForms(project.repositories));
+			updateMutation.reset();
+		}
+	};
+
+	const handleRepositoriesSubmit = (e: React.FormEvent) => {
+		e.preventDefault();
+		if (configWriteInFlight) return;
+		// Save is disabled on a duplicate repository; guard here too so an Enter-to-submit
+		// from a field can't bypass the check (the same belt-and-braces the Agents tab uses).
+		if (duplicateRepos.length > 0) return;
+		// `repositories` alone, and the whole list every time: `projects.update` is a
+		// partial patch that replaces this field wholesale, and the editor shows every
+		// field an entry has, so nothing is carried through unseen.
+		updateMutation.mutate({
+			id: projectId,
+			repositories: toRepositoryEntries(repositories),
 		});
 	};
 
@@ -2314,12 +2328,11 @@ function ProjectDetailRouteComponent() {
 			{activeTab === 'workers' && <WorkersRoster projectId={projectId} />}
 
 			<ProjectAdminOnly tab={activeTab} canAdminister={canAdminister}>
-				{/* Form Card - General Settings */}
+				{/* Form Card - General Settings. Project identity and host layout; the
+				    repository list is on the Source Control tab (issue #729). */}
 				{activeTab === 'general' && (
 					<GeneralSettingsForm
 						name={name}
-						repositories={repositories}
-						duplicateRepos={duplicateRepos}
 						repoRoot={repoRoot}
 						worktreeRoot={worktreeRoot}
 						maxConcurrentJobs={maxConcurrentJobs}
@@ -2328,10 +2341,6 @@ function ProjectDetailRouteComponent() {
 						setRepoRoot={setRepoRoot}
 						setWorktreeRoot={setWorktreeRoot}
 						setMaxConcurrentJobs={setMaxConcurrentJobs}
-						handleRepositoryChange={handleRepositoryChange}
-						handleAddRepository={handleAddRepository}
-						handleRemoveRepository={handleRemoveRepository}
-						handleMoveRepository={handleMoveRepository}
 						handleInputChange={handleInputChange}
 						handleSubmit={handleSubmit}
 						handleReset={handleReset}
@@ -2451,7 +2460,39 @@ function ProjectDetailRouteComponent() {
 					</div>
 				)}
 
-				{activeTab === 'credentials' && <CredentialsPanel projectId={projectId} />}
+				{/*
+				 * Source Control (issues #200, #632, #729): the provider, the credentials it
+				 * authenticates with, then the repositories it operates on — one screen for
+				 * "which provider, authenticated how, operating on what", the top-to-bottom
+				 * order issue #630 gave Project Management.
+				 *
+				 * The two cards save independently, as they already did before the list arrived:
+				 * the provider selector and each credential field persist on their own scoped
+				 * write, and the repository list has its own Save sending `repositories` alone.
+				 * `CredentialsPanel` owns its queries and its own loading gate, so it stays a
+				 * sibling rather than wrapping the list — a slow credential read must not blank
+				 * the editor below it.
+				 */}
+				{activeTab === 'credentials' && (
+					<div className="space-y-6">
+						<CredentialsPanel projectId={projectId} />
+						<RepositoriesPanel
+							repositories={repositories}
+							duplicates={duplicateRepos}
+							onChange={handleRepositoryChange}
+							onAdd={handleAddRepository}
+							onRemove={handleRemoveRepository}
+							onMove={handleMoveRepository}
+							handleSubmit={handleRepositoriesSubmit}
+							handleReset={handleRepositoriesReset}
+							isDirty={isRepositoriesDirty}
+							isPending={configWriteInFlight}
+							isSuccess={updateMutation.isSuccess}
+							isError={updateMutation.isError}
+							errorMessage={updateMutation.error?.message}
+						/>
+					</div>
+				)}
 			</ProjectAdminOnly>
 		</div>
 	);

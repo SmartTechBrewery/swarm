@@ -56,16 +56,16 @@ describe('RepositoryList', () => {
 		);
 	});
 
-	// Issue #727: a project has one SCM provider, set on the Source Control tab together
-	// with the credentials it needs. A per-row selector offered a provider whose
-	// credentials had nowhere to be entered, so the row no longer has one — and the
-	// section says where the provider does live instead.
+	// Issue #727: a project has one SCM provider, stated together with the credentials it
+	// needs. A per-row selector offered a provider whose credentials had nowhere to be
+	// entered, so the row no longer has one — and since issue #729 the section points at
+	// the provider card directly above it rather than at another tab.
 	it('offers no per-repository provider, and says where the project\u2019s one is set', () => {
 		renderList({ repositories: TWO });
 
 		expect(screen.queryByLabelText(/Source control provider/)).toBeNull();
 		expect(screen.queryByRole('combobox')).toBeNull();
-		expect(screen.getByText(/set on the Source Control tab/)).toBeDefined();
+		expect(screen.getByText(/live on the provider selected above/)).toBeDefined();
 	});
 
 	// Order is meaningful — the first entry is what board-driven work runs against — so the

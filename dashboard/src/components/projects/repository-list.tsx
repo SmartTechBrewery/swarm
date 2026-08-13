@@ -1,7 +1,7 @@
 import { AlertTriangle, ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
 import type { RepositoryForm } from '@/lib/project-repository.js';
 
-/** Input/select recipe shared with the rest of the General tab (ai/DESIGN_SYSTEM.md §4). */
+/** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
 const FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed';
 
@@ -28,10 +28,11 @@ interface RepositoryRowProps {
  * the rank, since a project can hold several identical-looking rows.
  *
  * The source-control provider is **not** among them (issue #727): it is the project's,
- * stated once on the Source Control tab, and every repository the project owns lives on
- * it. A per-row selector existed here between issues #700 and #727 and could not be
+ * stated once for the whole project, and every repository the project owns lives on it.
+ * A per-row selector existed here between issues #700 and #727 and could not be
  * completed — the credentials an overridden provider needs are project-wide, so there
- * was nowhere to enter them.
+ * was nowhere to enter them. Since issue #729 that one provider is stated directly
+ * above this list, at the top of the same tab.
  */
 function RepositoryRow({
 	entry,
@@ -159,14 +160,17 @@ export interface RepositoryListProps {
 }
 
 /**
- * The project's repositories, in order, with add/remove/reorder (issue #684 phase 3).
+ * The project's repositories, in order, with add/remove/reorder (issue #684 phase 3),
+ * rendered as the last section of the Source Control tab since issue #729 — under the
+ * provider these repositories live on and the credentials it authenticates with, so one
+ * screen answers "which provider, authenticated how, operating on what".
  *
  * Order is what the list means: the **first** entry is the project's default, the one
  * work that names no repository of its own runs against — board-driven Planning and
  * Implementation — so the helper text and the "Default" badge say so rather than leaving
- * the ranking to look decorative. Everything shared by the whole project stays on its own
- * tabs: the board mapping and the PM credentials on Project Management, the SCM provider
- * and its credentials on Source Control. Only the three settings that are genuinely
+ * the ranking to look decorative. What is *not* here is anything shared by the whole
+ * project: the board mapping and the PM credentials on Project Management, the provider
+ * and its credentials in the cards above. Only the three settings that are genuinely
  * per-repository are here.
  */
 export function RepositoryList({
@@ -181,14 +185,15 @@ export function RepositoryList({
 	return (
 		<div className="space-y-3">
 			<div>
-				<h3 className="text-sm font-semibold text-zinc-200">Repositories</h3>
-				<p className="text-xs text-zinc-400 mt-1">
+				<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
+					Repositories
+				</h2>
+				<p className="text-xs text-zinc-400">
 					Every repository this project operates on, with the branch settings SWARM uses for each.
 					The first is the project's <strong className="font-semibold">default</strong>: work that
 					names no repository of its own — board-driven Planning and Implementation — runs against
-					it, so reorder the list to change which that is. All of them live on the project's
-					source-control provider, which is set on the Source Control tab along with its
-					credentials.
+					it, so reorder the list to change which that is. All of them live on the provider selected
+					above, using the credentials configured with it.
 				</p>
 			</div>
 
