@@ -267,6 +267,69 @@ describe('LinearPMProvider', () => {
 		});
 	});
 
+	// Issue #686 phase 1: Linear's routing axis is labels — the `teamId` is already
+	// the board container, so a label is what is left to claim a card.
+	describe('resolveItemRepository', () => {
+		const CANDIDATES = [
+			{ repo: 'acme/default', routingToken: 'label-default' },
+			{ repo: 'acme/second', routingToken: 'label-second' },
+		];
+
+		/** The issue-labels read answering with the given label ids. */
+		function mockLabels(...ids: string[]): void {
+			mockGraphQL({
+				IssueLabels: { issue: { labels: { nodes: ids.map((id) => ({ id, name: 'whatever' })) } } },
+			});
+		}
+
+		it('routes a card to the non-default repository whose label it carries', async () => {
+			mockLabels('label-second');
+
+			await expect(provider.resolveItemRepository(ISSUE_NODE.id, CANDIDATES)).resolves.toEqual({
+				status: 'routed',
+				repo: 'acme/second',
+			});
+		});
+
+		it('reports a card with no labels as unrouted', async () => {
+			mockGraphQL({ IssueLabels: { issue: { labels: { nodes: [] } } } });
+
+			await expect(provider.resolveItemRepository(ISSUE_NODE.id, CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		it('reports a card claimed by two repositories as ambiguous rather than picking one', async () => {
+			mockLabels('label-second', 'label-default');
+
+			await expect(provider.resolveItemRepository(ISSUE_NODE.id, CANDIDATES)).resolves.toEqual({
+				status: 'ambiguous',
+				repos: ['acme/default', 'acme/second'],
+			});
+		});
+
+		// The token is a label *id*, so it can never be confused with the automation
+		// opt-in gate, which matches labels by name.
+		it('matches the label id, never its name', async () => {
+			mockGraphQL({
+				IssueLabels: { issue: { labels: { nodes: [{ id: 'label-xyz', name: 'label-second' }] } } },
+			});
+
+			await expect(provider.resolveItemRepository(ISSUE_NODE.id, CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		it("reuses addLabel's own issue-labels read rather than adding a query", async () => {
+			mockLabels('label-second');
+
+			await provider.resolveItemRepository(ISSUE_NODE.id, CANDIDATES);
+
+			expect(variablesSentTo('IssueLabels')).toEqual([{ id: ISSUE_NODE.id }]);
+			expect(graphQLCalls()).toHaveLength(1);
+		});
+	});
+
 	describe('listWorkItems', () => {
 		it("filters id-less nodes and concatenates every page from the project's team", async () => {
 			linearGraphQL

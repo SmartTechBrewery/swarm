@@ -311,6 +311,47 @@ export interface WorkItemDependent {
 	open: boolean;
 }
 
+/**
+ * One repository a board card may be routed to, as {@link
+ * PMProvider.resolveItemRepository} is handed it (issue #686 phase 1) — the
+ * repository's own slug plus the provider-native id a card carries to claim it.
+ *
+ * The candidates are **passed in as data** rather than read from the provider's
+ * config, and that is the point: a PM provider is built from a `ProjectConfig`
+ * *scoped to one repository*, which deliberately carries no repository list at all
+ * (`scopeProjectToRepository`, `src/config/project-repository.ts`; ai/ARCHITECTURE.md
+ * "Project record vs. scoped project config"). The caller holds the `ProjectRecord`
+ * and therefore the list; the provider keeps its list-free scope.
+ *
+ * `routingToken` is an **id, never a name** — a Jira component id, a Linear label
+ * id, a Trello label id — matched exactly. An entry that declares none claims
+ * nothing. GitHub Projects ignores the field entirely: a card there wraps one
+ * backing Issue/PR, whose own repository is authoritative.
+ */
+export interface RepositoryRoutingCandidate {
+	/** The repository this candidate names, as `owner/repo` (a `ProjectRepository.repo`). */
+	repo: string;
+	/** The provider-native id a card carries to claim it for this repository, when it declares one. */
+	routingToken?: string;
+}
+
+/**
+ * Which of a project's repositories a board card belongs to — the answer
+ * {@link PMProvider.resolveItemRepository} returns.
+ *
+ * Three states rather than `string | undefined`, so "claimed by more than one" is a
+ * first-class answer a caller cannot accidentally coerce into a pick: routing a card
+ * to the wrong repository would push a branch and open a pull request where nobody
+ * asked for one, so a provider reports the ambiguity and lets the caller refuse.
+ * `unrouted` is the same refusal for a card that claims nothing — never a guess at
+ * the default entry, which is the caller's policy to apply, not the provider's.
+ */
+export type ItemRepositoryRoute =
+	| { status: 'routed'; repo: string }
+	| { status: 'unrouted' }
+	/** Every claimed repository, sorted, so a message naming them is stable. */
+	| { status: 'ambiguous'; repos: string[] };
+
 /** Optional server-side filters for {@link PMProvider.listWorkItems}. */
 export interface ListWorkItemsFilter {
 	/**
@@ -470,6 +511,32 @@ export interface PMProvider {
 	 * label-write capability.
 	 */
 	addLabel(id: string, name: string): Promise<void>;
+
+	/**
+	 * Which of the project's repositories the board card `id` belongs to, chosen
+	 * from `candidates` (issue #686 phase 1). Each provider answers from its own
+	 * narrowest read: GitHub Projects compares the backing Issue/PR's repository,
+	 * Jira its component ids, Linear and Trello their label ids.
+	 *
+	 * Widening the interface rather than reading a board field at the call site is
+	 * what keeps the decision provider-agnostic (ai/RULES.md §2) — *which* ids a card
+	 * carries is each provider's own answer, while the 0/1/many verdict is shared
+	 * once in `./repository-routing.ts`.
+	 *
+	 * Keyed on the item id rather than a {@link WorkItem} because two of the four
+	 * axes are not on a work item at all: GitHub's backing repository is internal to
+	 * the adapter, and Jira's components are read by nothing else. Passing the
+	 * candidates in — see {@link RepositoryRoutingCandidate} — is what lets a
+	 * provider built from a repository-scoped config answer at all.
+	 *
+	 * Never guesses: a card that claims nothing is `unrouted` and a card claimed by
+	 * two entries is `ambiguous` ({@link ItemRepositoryRoute}). Throws only when the
+	 * item itself does not resolve, exactly as {@link getWorkItem} does.
+	 */
+	resolveItemRepository(
+		id: string,
+		candidates: readonly RepositoryRoutingCandidate[],
+	): Promise<ItemRepositoryRoute>;
 
 	/**
 	 * Whether this provider models work-item assignees at all. `false` for a

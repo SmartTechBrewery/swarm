@@ -73,6 +73,7 @@ const PM_CONTRACT_METHODS = [
 	'listBlockers',
 	'listDependents',
 	'addBlockedBy',
+	'resolveItemRepository',
 ] as const satisfies ReadonlyArray<PMContractMethod>;
 
 /** The capability flags a provider answers with a boolean rather than a method. */

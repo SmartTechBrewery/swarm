@@ -93,6 +93,31 @@ describe('toRepositoryEntries', () => {
 		]);
 		expect(entry && 'id' in entry).toBe(false);
 	});
+
+	// Issue #686: the routing token is authored in `swarm.config.json` and has no input
+	// on this screen, so a save that rebuilt entries from the rendered fields alone
+	// would delete it. It rides on the row instead, reorder included.
+	it('carries a routing token this screen does not edit through a save', () => {
+		const rows = toRepositoryForms([
+			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+			{
+				repo: 'acme/second',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				pmRoutingToken: 'component-2',
+			},
+		]);
+		expect(rows[1]?.pmRoutingToken).toBe('component-2');
+		expect(toRepositoryEntries(moveRepository(rows, 1, 'up'))).toEqual([
+			{
+				repo: 'acme/second',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				pmRoutingToken: 'component-2',
+			},
+			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+		]);
+	});
 });
 
 describe('repository list mutations', () => {

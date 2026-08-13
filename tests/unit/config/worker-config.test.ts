@@ -107,6 +107,18 @@ describe('worker/server key classification', () => {
 		);
 	});
 
+	// Issue #686: the routing token is board-side config, and which repository a card
+	// claims is a control-plane decision keyed on the whole repository list — so it
+	// belongs with `pm` on the server side rather than travelling to a worker.
+	it('keeps the repository routing token off the worker payload', () => {
+		expect(SERVER_ONLY_KEYS as readonly string[]).toContain('pmRoutingToken');
+		const worker = toWorkerConfig({
+			...createMockProjectConfig(),
+			pmRoutingToken: 'component-1',
+		}) as Record<string, unknown>;
+		expect('pmRoutingToken' in worker).toBe(false);
+	});
+
 	// The projection is built from the *scoped* config (issue #684), which carries one
 	// repository's settings and no list — so a worker structurally cannot be handed the
 	// other repositories a project owns, whatever the allowlist says.

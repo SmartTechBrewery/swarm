@@ -31,6 +31,7 @@ function pmWith(overrides: PmOverrides): PMProvider {
 		listBlockers: overrides.listBlockers ?? vi.fn(async () => []),
 		listDependents: overrides.listDependents ?? vi.fn(async () => []),
 		addBlockedBy: vi.fn(async () => {}),
+		resolveItemRepository: vi.fn(async () => ({ status: 'unrouted' }) as const),
 	};
 }
 

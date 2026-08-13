@@ -72,15 +72,18 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		expect(writeOnly().type).toBe('github-projects');
 	});
 
-	it('rejects only the two reads no DB-free phase calls, instead of inventing a result', async () => {
+	it('rejects only the three reads no DB-free phase calls, instead of inventing a result', async () => {
 		const fetchImpl = vi.fn<FetchLike>();
 		const provider = writeOnly(fetchImpl);
 
 		// The control plane already read the assigned item and put it on the
 		// assignment, and enumerating a whole board is not a worker's business.
+		// Routing a card is a control-plane decision too: it is keyed on the whole
+		// repository list, which a worker's repository-scoped config does not carry.
 		for (const call of [
 			() => provider.getWorkItem('PVTI_item1'),
 			() => provider.listWorkItems({ status: 'todo' }),
+			() => provider.resolveItemRepository('PVTI_item1', [{ repo: 'acme/second' }]),
 		]) {
 			await expect(call()).rejects.toThrow(/not available on a DB-free worker/i);
 		}

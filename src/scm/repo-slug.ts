@@ -12,7 +12,7 @@
  * against operator error — a daemon launched in the wrong directory — not against
  * an attacker, and the declaration is self-reported anyway.
  *
- * Three consumers share these definitions, which is why they live here rather
+ * Four consumers share these definitions, which is why they live here rather
  * than privately in the worktree manager:
  *
  * - the provision-time identity check (`GitWorktreeManager.assertRepoIdentity`),
@@ -20,7 +20,10 @@
  * - the transport handshake (`HandshakeRequestSchema.repository`,
  *   `../transport/protocol.ts`), where a daemon declares which repository its one
  *   local checkout is ({@link resolveDeclarableOriginRepoSlug});
- * - the persisted worker read model (`Worker.repository`, `../identity/worker.ts`).
+ * - the persisted worker read model (`Worker.repository`, `../identity/worker.ts`);
+ * - the GitHub Projects PM provider's card routing (issue #686), which compares a
+ *   card's backing `repository { nameWithOwner }` against the project's repository
+ *   entries ({@link repoSlugsMatch}).
  *
  * Sharing one normaliser is the point: a comparison between a declaration and a
  * `ProjectConfig.repo` is only meaningful if both sides agree on what

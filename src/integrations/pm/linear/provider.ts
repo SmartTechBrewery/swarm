@@ -31,17 +31,20 @@ import {
 	dependencyProse,
 	findDependencyReferences,
 } from '../../../pm/dependencies.js';
+import { routeByClaimTokens } from '../../../pm/repository-routing.js';
 import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
 	DiscoveredContainer,
 	DiscoveredState,
+	ItemRepositoryRoute,
 	ListWorkItemsFilter,
 	PMDiscoveryArgs,
 	PMDiscoveryCapability,
 	PMDiscoveryResult,
 	PMProvider,
 	PMType,
+	RepositoryRoutingCandidate,
 	StateDiscoveryResult,
 	UpdateWorkItemPatch,
 	WorkItem,
@@ -698,6 +701,29 @@ export class LinearPMProvider implements PMProvider {
 				throw new Error(`Linear issue '${id}' did not resolve`);
 			}
 			return toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo);
+		});
+	}
+
+	/**
+	 * Linear's routing axis is **labels** (issue #686 phase 1): the `teamId` is
+	 * already the board container, so a label is what is left to claim a card for one
+	 * of the project's repositories. Matched on the label **id**, never its name —
+	 * which is also what keeps it clear of the automation opt-in gate, that being the
+	 * one thing here that matches a label by name (`src/pm/automation-label.ts`).
+	 *
+	 * Reuses {@link ISSUE_LABELS_QUERY}, the read `addLabel`'s idempotence check
+	 * already makes, rather than adding a second one.
+	 */
+	async resolveItemRepository(
+		id: string,
+		candidates: readonly RepositoryRoutingCandidate[],
+	): Promise<ItemRepositoryRoute> {
+		return this.run(async () => {
+			const data = await linearGraphQL<IssueLabelsResponse>(ISSUE_LABELS_QUERY, { id });
+			const labelIds = (data.issue?.labels?.nodes ?? []).flatMap((node) =>
+				node?.id ? [node.id] : [],
+			);
+			return routeByClaimTokens(labelIds, candidates);
 		});
 	}
 

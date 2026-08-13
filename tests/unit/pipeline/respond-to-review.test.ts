@@ -438,6 +438,7 @@ describe('runRespondToReviewPhase', () => {
 				listBlockers: vi.fn(async () => []),
 				listDependents: vi.fn(async () => []),
 				addBlockedBy: vi.fn(async () => {}),
+				resolveItemRepository: vi.fn(async () => ({ status: 'unrouted' }) as const),
 			};
 		}
 

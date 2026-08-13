@@ -39,17 +39,20 @@
 
 import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
+import { routeByClaimTokens } from '../../../pm/repository-routing.js';
 import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
 	DiscoveredContainer,
 	DiscoveredState,
+	ItemRepositoryRoute,
 	ListWorkItemsFilter,
 	PMDiscoveryArgs,
 	PMDiscoveryCapability,
 	PMDiscoveryResult,
 	PMProvider,
 	PMType,
+	RepositoryRoutingCandidate,
 	StateDiscoveryResult,
 	UpdateWorkItemPatch,
 	WorkItem,
@@ -127,6 +130,13 @@ interface TrelloCard {
 	idBoard?: string | null;
 	dateLastActivity?: string | null;
 	labels?: Array<TrelloLabel | null> | null;
+	/**
+	 * The plain label-id array, asked for by
+	 * {@link TrelloPMProvider.resolveItemRepository}'s narrow read alone (issue #686)
+	 * — never by {@link CARD_QUERY}, which takes whole label objects because the
+	 * automation gate needs their names.
+	 */
+	idLabels?: Array<string | null> | null;
 	members?: Array<TrelloMember | null> | null;
 	attachments?: Array<TrelloAttachment | null> | null;
 }
@@ -331,6 +341,32 @@ export class TrelloPMProvider implements PMProvider {
 				);
 			}
 			return this.toWorkItem({ ...card, id: card.id }, listNames);
+		});
+	}
+
+	/**
+	 * Trello's routing axis is **labels** (issue #686 phase 1): a card's list is
+	 * already its status, so a label is what is left to claim a card for one of the
+	 * project's repositories.
+	 *
+	 * Reads `idLabels` — the plain id array — rather than the whole `labels` objects
+	 * {@link CARD_QUERY} selects, which is the narrowest read *and* the one that
+	 * cannot go wrong here: matching is on the label id, so a colour-only label with
+	 * an empty name routes exactly like any other, and the automation gate's
+	 * name-matching (`src/pm/automation-label.ts`) can never be confused with it.
+	 */
+	async resolveItemRepository(
+		id: string,
+		candidates: readonly RepositoryRoutingCandidate[],
+	): Promise<ItemRepositoryRoute> {
+		return this.run(async () => {
+			const card = await trelloRequest<TrelloCard | undefined>(`cards/${encodeURIComponent(id)}`, {
+				query: { fields: 'idLabels' },
+			});
+			const labelIds = (card?.idLabels ?? []).filter(
+				(labelId): labelId is string => typeof labelId === 'string' && labelId !== '',
+			);
+			return routeByClaimTokens(labelIds, candidates);
 		});
 	}
 
