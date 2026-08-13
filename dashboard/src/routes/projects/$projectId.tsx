@@ -1726,6 +1726,57 @@ export function diffProjectForSync(
 }
 
 /**
+ * The route's single serialization gate (`configWriteInFlight`), pulled out to a pure
+ * function so its inputs can be pinned in isolation rather than only through a full
+ * render. `providerWriteInFlight` is the Source Control tab's SCM provider select
+ * (`CredentialsPanel`'s own `providerMutation`, reported up via `onProviderWriteChange`)
+ * — it shares `projects.update` with the other two inputs, so it has to hold the gate
+ * exactly like they do (issue #369's lost-update shape, re-found across two cards on
+ * one tab by #734).
+ */
+export function isConfigWriteInFlight(flags: {
+	updateMutationPending: boolean;
+	savingToggleKey: string | undefined;
+	providerWriteInFlight: boolean;
+}): boolean {
+	return (
+		flags.updateMutationPending ||
+		flags.savingToggleKey !== undefined ||
+		flags.providerWriteInFlight
+	);
+}
+
+/**
+ * The Settings tab's own save payload: project identity and host layout alone, never
+ * `repositories` — that field is the Source Control tab's own slice, sent by
+ * {@link toRepositoriesUpdate} instead (issue #729). Pulled out so this is the one
+ * place either payload can be asserted against, rather than only inside the inline
+ * `handleSubmit` closure (issue #734's F3).
+ */
+export function toGeneralSettingsUpdate(
+	projectId: string,
+	fields: { name: string; repoRoot: string; worktreeRoot: string; maxConcurrentJobs: number },
+): { id: string; name: string; repoRoot: string; worktreeRoot: string; maxConcurrentJobs: number } {
+	return { id: projectId, ...fields };
+}
+
+/**
+ * The Source Control tab's repository-list save payload: `repositories` alone, replaced
+ * wholesale every time (`projects.update` is a partial patch). `null` when `duplicates`
+ * is non-empty — the one list rule with no server-side twin — so the caller's early
+ * return is this function's own decision rather than a duplicate check re-stated at
+ * the call site.
+ */
+export function toRepositoriesUpdate(
+	projectId: string,
+	rows: RepositoryForm[],
+	duplicates: string[],
+): { id: string; repositories: RepositoryEntry[] } | null {
+	if (duplicates.length > 0) return null;
+	return { id: projectId, repositories: toRepositoryEntries(rows) };
+}
+
+/**
  * The project-detail tabs in display order, each with the icon and label it
  * renders. Ordered to match `PROJECT_TABS` (`lib/project-nav.ts`), which is the
  * URL vocabulary — a test asserts the two agree, so the rendered order and the
@@ -1964,14 +2015,26 @@ function ProjectDetailRouteComponent() {
 			blocked: updateMutation.isPending,
 		});
 
-	// Single serialization gate for every config write on this route. Both the
-	// Save-Changes flow (`updateMutation`) and the Agents-tab toggle auto-save
-	// (`useToggleAutoSave`) read-merge-upsert the project config server-side, so
-	// two overlapping writes would let the later upsert clobber the earlier one's
-	// change (the re-review's lost-update race, #369). Disabling every Save while
-	// any write is in flight — and refusing a toggle while a Save runs — keeps only
-	// one config write outstanding at a time, which removes the race at the source.
-	const configWriteInFlight = updateMutation.isPending || savingToggleKey !== undefined;
+	// CredentialsPanel's own `providerMutation` (the Source Control tab's SCM
+	// provider select) also writes `projects.update` directly, outside the Save-Changes
+	// flow above — reported here so it shares the gate below rather than racing the
+	// Repositories card's Save the way it could before issue #734.
+	const [providerWriteInFlight, setProviderWriteInFlight] = useState(false);
+
+	// Single serialization gate for every config write on this route. The
+	// Save-Changes flow (`updateMutation`), the Agents-tab toggle auto-save
+	// (`useToggleAutoSave`), and the Source Control tab's SCM provider select all
+	// read-merge-upsert the project config server-side, so two overlapping writes
+	// would let the later upsert clobber the earlier one's change (the re-review's
+	// lost-update race, #369, re-found across two cards on one tab by #734).
+	// Disabling every Save while any write is in flight — and refusing a toggle or a
+	// provider switch while another runs — keeps only one config write outstanding
+	// at a time, which removes the race at the source.
+	const configWriteInFlight = isConfigWriteInFlight({
+		updateMutationPending: updateMutation.isPending,
+		savingToggleKey,
+		providerWriteInFlight,
+	});
 
 	// The Settings tab's own dirty check: project identity and host layout alone. The
 	// repository list has its own, since issue #729 gave it its own tab and its own Save.
@@ -2244,13 +2307,14 @@ function ProjectDetailRouteComponent() {
 		setMaxConcurrentJobsError(undefined);
 		// Only this tab's four fields: the repository list saves itself from the Source
 		// Control tab (issue #729), so sending it here would carry its unsaved edits.
-		updateMutation.mutate({
-			id: projectId,
-			name,
-			repoRoot,
-			worktreeRoot,
-			maxConcurrentJobs: parsedMaxConcurrentJobs,
-		});
+		updateMutation.mutate(
+			toGeneralSettingsUpdate(projectId, {
+				name,
+				repoRoot,
+				worktreeRoot,
+				maxConcurrentJobs: parsedMaxConcurrentJobs,
+			}),
+		);
 	};
 
 	const handleRepositoriesReset = () => {
@@ -2263,16 +2327,13 @@ function ProjectDetailRouteComponent() {
 	const handleRepositoriesSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		if (configWriteInFlight) return;
-		// Save is disabled on a duplicate repository; guard here too so an Enter-to-submit
-		// from a field can't bypass the check (the same belt-and-braces the Agents tab uses).
-		if (duplicateRepos.length > 0) return;
-		// `repositories` alone, and the whole list every time: `projects.update` is a
-		// partial patch that replaces this field wholesale, and the editor shows every
-		// field an entry has, so nothing is carried through unseen.
-		updateMutation.mutate({
-			id: projectId,
-			repositories: toRepositoryEntries(repositories),
-		});
+		// `toRepositoriesUpdate` holds the duplicate-repository guard itself (`null` when
+		// `duplicateRepos` is non-empty) — belt-and-braces alongside Save's own `disabled`,
+		// so an Enter-to-submit from a field can't bypass it (the same pattern the Agents
+		// tab's duplicate-CLI check uses).
+		const update = toRepositoriesUpdate(projectId, repositories, duplicateRepos);
+		if (!update) return;
+		updateMutation.mutate(update);
 	};
 
 	// Both loads gate the screen: rendering before the viewer's access resolves would
@@ -2471,11 +2532,21 @@ function ProjectDetailRouteComponent() {
 				 * write, and the repository list has its own Save sending `repositories` alone.
 				 * `CredentialsPanel` owns its queries and its own loading gate, so it stays a
 				 * sibling rather than wrapping the list — a slow credential read must not blank
-				 * the editor below it.
+				 * the editor below it. The provider selector's own write shares `projects.update`
+				 * with the list's Save though, so it is not independent of the route's single
+				 * serialization gate the way the per-role credential fields are (those write a
+				 * separate credentials store): `onProviderWriteChange` reports it into
+				 * `configWriteInFlight`, and `externalWriteInFlight` disables the selector back
+				 * while the list's own Save (or any other write on this route) is in flight
+				 * (issue #734).
 				 */}
 				{activeTab === 'credentials' && (
 					<div className="space-y-6">
-						<CredentialsPanel projectId={projectId} />
+						<CredentialsPanel
+							projectId={projectId}
+							externalWriteInFlight={updateMutation.isPending || savingToggleKey !== undefined}
+							onProviderWriteChange={setProviderWriteInFlight}
+						/>
 						<RepositoriesPanel
 							repositories={repositories}
 							duplicates={duplicateRepos}

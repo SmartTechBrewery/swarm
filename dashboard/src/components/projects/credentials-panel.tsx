@@ -410,7 +410,52 @@ function ScmProviderSelect({
 	);
 }
 
-export function CredentialsPanel({ projectId }: { projectId: string }) {
+/**
+ * Fires the provider write, unless a config write elsewhere on the route already has
+ * the gate (issue #734) — belt-and-braces alongside the select's own `disabled`, kept
+ * as a standalone function so the guard doesn't add to {@link CredentialsPanel}'s own
+ * cognitive complexity budget.
+ */
+function selectScmProvider(
+	next: ScmProviderId,
+	externalWriteInFlight: boolean,
+	setPendingProviderId: (id: ScmProviderId) => void,
+	mutate: (scm: ScmProviderId) => void,
+): void {
+	if (externalWriteInFlight) return;
+	setPendingProviderId(next);
+	mutate(next);
+}
+
+/** Either this write or one elsewhere on the route (issue #734) has the select. */
+function isProviderSelectSaving(
+	providerMutationPending: boolean,
+	externalWriteInFlight: boolean,
+): boolean {
+	return providerMutationPending || externalWriteInFlight;
+}
+
+interface CredentialsPanelProps {
+	projectId: string;
+	/**
+	 * A config write elsewhere on the route (a Settings/Repositories Save, an
+	 * Agents-tab toggle auto-save) is in flight, so the provider select must stay
+	 * inert too — `providerMutation` below shares the read-merge-upsert `projects.update`
+	 * those writes use, and an overlap would let whichever one lands last silently
+	 * revert the other (issue #369's lost-update shape, re-found on this tab by #734).
+	 */
+	externalWriteInFlight?: boolean;
+	/** Reports `providerMutation`'s own pending state up, so the route can fold it
+	 *  into its single serialization gate the same way it already folds in the
+	 *  Agents-tab toggle auto-save. */
+	onProviderWriteChange?: (isPending: boolean) => void;
+}
+
+export function CredentialsPanel({
+	projectId,
+	externalWriteInFlight = false,
+	onProviderWriteChange,
+}: CredentialsPanelProps) {
 	const queryClient = useQueryClient();
 
 	// The selector was UI-only when it landed (issue #200) because nothing selected a
@@ -453,6 +498,13 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 		},
 		onError: () => setPendingProviderId(null),
 	});
+
+	// Reports this write's own pending state to the route on every change, so
+	// `configWriteInFlight` there sees it the moment it starts rather than only
+	// after this component's next render for an unrelated reason (issue #734).
+	useEffect(() => {
+		onProviderWriteChange?.(providerMutation.isPending);
+	}, [providerMutation.isPending, onProviderWriteChange]);
 
 	// Session-only record of the login each reviewer credential last verified to; drives
 	// the per-field "✓ @login" preview. Never persisted — the plaintext token is gone
@@ -529,12 +581,16 @@ export function CredentialsPanel({ projectId }: { projectId: string }) {
 				<ScmProviderSelect
 					selectedProviderId={selectedProviderId}
 					storedScm={projectQuery.data?.scm ?? undefined}
-					isSaving={providerMutation.isPending}
+					isSaving={isProviderSelectSaving(providerMutation.isPending, externalWriteInFlight)}
 					saveErrorMsg={providerMutation.isError ? providerMutation.error.message : undefined}
-					onSelect={(next) => {
-						setPendingProviderId(next);
-						providerMutation.mutate(next);
-					}}
+					onSelect={(next) =>
+						selectScmProvider(
+							next,
+							externalWriteInFlight,
+							setPendingProviderId,
+							providerMutation.mutate,
+						)
+					}
 				/>
 
 				{providerCopy && <p className="text-xs text-zinc-400 mt-4">{providerCopy.intro}</p>}

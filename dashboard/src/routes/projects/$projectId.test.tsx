@@ -2,6 +2,7 @@
 
 import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
+import type { RepositoryForm } from '@/lib/project-repository.js';
 import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
 
 const mockMutate = vi.fn();
@@ -67,13 +68,16 @@ import { PROJECT_TABS } from '@/lib/project-nav.js';
 import {
 	diffProjectForSync,
 	GeneralSettingsForm,
+	isConfigWriteInFlight,
 	PhaseConfigRow,
 	PhaseEnabledCell,
 	PhaseSettingsDetail,
 	PipelineSettingsForm,
 	ProjectTabBar,
 	ToggleSaveIndicator,
+	toGeneralSettingsUpdate,
 	toggleSaveKey,
+	toRepositoriesUpdate,
 	useToggleAutoSave,
 } from './$projectId.js';
 
@@ -1122,6 +1126,82 @@ describe('diffProjectForSync', () => {
 	});
 });
 
+describe('isConfigWriteInFlight', () => {
+	const idle = {
+		updateMutationPending: false,
+		savingToggleKey: undefined,
+		providerWriteInFlight: false,
+	};
+
+	it('reads false when nothing is writing', () => {
+		expect(isConfigWriteInFlight(idle)).toBe(false);
+	});
+
+	it('reads true while the Save-Changes flow is pending', () => {
+		expect(isConfigWriteInFlight({ ...idle, updateMutationPending: true })).toBe(true);
+	});
+
+	it('reads true while an Agents-tab toggle auto-save is pending', () => {
+		expect(isConfigWriteInFlight({ ...idle, savingToggleKey: 'review:enabled' })).toBe(true);
+	});
+
+	// Issue #734: the Source Control tab's SCM provider select writes `projects.update`
+	// directly, outside `updateMutation` — this is the gate's new input pinning that it is
+	// not missed, the way it was before the fix (F1).
+	it('reads true while the Source Control tab’s provider mutation is pending', () => {
+		expect(isConfigWriteInFlight({ ...idle, providerWriteInFlight: true })).toBe(true);
+	});
+});
+
+// Issue #734 (F3): the split lived entirely in two inline, unexported route closures —
+// re-adding `repositories` to the Settings payload (the exact lost-update regression
+// this PR removes) would have kept every test green. Exporting the two payload builders
+// pins the shape of each save so that regression fails here instead.
+describe('toGeneralSettingsUpdate', () => {
+	it('sends only project identity and host layout — never repositories', () => {
+		const update = toGeneralSettingsUpdate('p1', {
+			name: 'Proj',
+			repoRoot: '/repo',
+			worktreeRoot: '.worktrees',
+			maxConcurrentJobs: 2,
+		});
+
+		expect(update).toEqual({
+			id: 'p1',
+			name: 'Proj',
+			repoRoot: '/repo',
+			worktreeRoot: '.worktrees',
+			maxConcurrentJobs: 2,
+		});
+		expect(update).not.toHaveProperty('repositories');
+	});
+});
+
+describe('toRepositoriesUpdate', () => {
+	const rows: RepositoryForm[] = [
+		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+	];
+
+	it('sends only id and repositories — never the Settings fields', () => {
+		const update = toRepositoriesUpdate('p1', rows, []);
+
+		expect(update && Object.keys(update).sort()).toEqual(['id', 'repositories']);
+		expect(update).toEqual({
+			id: 'p1',
+			repositories: [{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' }],
+		});
+	});
+
+	// The one list rule with no server-side twin: Save is disabled on a duplicate
+	// repository, and this is the guard behind that — belt-and-braces against an
+	// Enter-to-submit bypassing the disabled button (the Agents tab's duplicate-CLI
+	// check uses the same pattern). Previously only reachable through the already-disabled
+	// Save button in `repositories-panel.test.tsx`, so the guard itself went unexercised.
+	it('refuses to build an update while a repository is listed twice', () => {
+		expect(toRepositoriesUpdate('p1', rows, ['acme/first'])).toBeNull();
+	});
+});
+
 describe('ProjectTabBar', () => {
 	it('renders the tabs in PROJECT_TABS order, with Workers directly after Runs', () => {
 		render(<ProjectTabBar activeTab="runs" canAdminister={true} onSelect={() => {}} />);
@@ -1192,10 +1272,13 @@ describe('GeneralSettingsForm', () => {
 	it('keeps project identity and host layout, and renders no repository editor', () => {
 		renderForm();
 
-		expect(document.getElementById('name')).toBeDefined();
-		expect(document.getElementById('repoRoot')).toBeDefined();
-		expect(document.getElementById('worktreeRoot')).toBeDefined();
-		expect(document.getElementById('maxConcurrentJobs')).toBeDefined();
+		// `getByLabelText` throws if the field is missing, unlike
+		// `getElementById(...).toBeDefined()` — which is `true` even for `null` and so
+		// would stay green if the move ever took a Settings field along with it.
+		expect(screen.getByLabelText(/^Name/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Local Repository Root/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Worktree Directory/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Maximum Concurrent Jobs/)).toBeTruthy();
 
 		// Neither the list editor nor the pre-#684 single-field trio it replaced.
 		expect(screen.queryByLabelText('Repository, entry 1')).toBeNull();

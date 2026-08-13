@@ -233,6 +233,38 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		expect(screen.getByText(/SWARM_OPERATOR_BITBUCKET_TOKEN/)).not.toBeNull();
 	});
 
+	// Issue #734: this write shares `projects.update` with the Source Control tab's
+	// Repositories Save (and every other route-level write), so it must be disabled —
+	// not just by its own `providerMutation.isPending` — while any of those is in flight,
+	// or the two can land on the same read-merge-upsert and clobber each other.
+	it('stays disabled and does not fire its write while an external config write is in flight', async () => {
+		projectScm.current = 'github';
+		renderPanel(<CredentialsPanel projectId="proj-a" externalWriteInFlight={true} />);
+
+		const select = (await screen.findByLabelText('Provider')) as HTMLSelectElement;
+		expect(select.disabled).toBe(true);
+
+		fireEvent.change(select, { target: { value: 'bitbucket' } });
+		expect(updateProject).not.toHaveBeenCalled();
+	});
+
+	// The route folds this write's own pending state into its single serialization gate
+	// (`isConfigWriteInFlight` in `$projectId.tsx`) via this callback.
+	it('reports its own write pending state up on every change', async () => {
+		projectScm.current = 'github';
+		const onProviderWriteChange = vi.fn();
+		renderPanel(
+			<CredentialsPanel projectId="proj-a" onProviderWriteChange={onProviderWriteChange} />,
+		);
+		await waitFor(() => expect(screen.getByLabelText('Provider')).not.toBeNull());
+		onProviderWriteChange.mockClear();
+
+		fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'bitbucket' } });
+
+		expect(onProviderWriteChange).toHaveBeenCalledWith(true);
+		await waitFor(() => expect(onProviderWriteChange).toHaveBeenCalledWith(false));
+	});
+
 	// Issue #619 made GitLab selectable too, which means Verify has to reach *its*
 	// procedure: there is no project yet to resolve a provider from, so the panel
 	// dispatches on the selected id (`src/api/routers/scm.ts`).

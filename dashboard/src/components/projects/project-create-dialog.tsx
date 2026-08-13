@@ -67,9 +67,9 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		// A new project starts on one repository; further ones are added afterwards on the
-		// General tab's repository list (issue #684 phase 3), so this stays single-entry
-		// rather than growing a second form. Its branch settings default per entry, so the
-		// dialog still asks for none.
+		// Source Control tab's repository list (issues #684 phase 3, #729), so this stays
+		// single-entry rather than growing a second form. Its branch settings default per
+		// entry, so the dialog still asks for none.
 		mutation.mutate({ id, name, repositories: [{ repo }], repoRoot, scm });
 	};
 

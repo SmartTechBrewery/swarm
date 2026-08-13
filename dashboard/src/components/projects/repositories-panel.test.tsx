@@ -95,8 +95,11 @@ describe('RepositoriesPanel', () => {
 		expect(screen.getByText('Repositories saved successfully.')).toBeDefined();
 	});
 
-	// The route feeds `configWriteInFlight` in, so a Settings save or an Agents-tab toggle
-	// auto-save disables this Save too — writes stay serialized (#369).
+	// The route feeds `configWriteInFlight` in, so a Settings save, an Agents-tab toggle
+	// auto-save, or the Source Control tab's own SCM provider select (issue #734) all
+	// disable this Save too — writes stay serialized (#369). The panel only ever sees the
+	// one merged boolean; which upstream write raised it is `isConfigWriteInFlight`'s
+	// concern (`$projectId.test.tsx`), not this component's.
 	it('disables its controls while any config write is in flight', () => {
 		renderPanel({ isPending: true });
 
