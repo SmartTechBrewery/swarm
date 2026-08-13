@@ -282,6 +282,73 @@ describe('JiraPMProvider', () => {
 		});
 	});
 
+	// Issue #686 phase 1: Jira's routing axis is components — the `projectKey` is
+	// already the board container, so it cannot also name a repository.
+	describe('resolveItemRepository', () => {
+		const CANDIDATES = [
+			{ repo: 'acme/default', routingToken: 'component-default' },
+			{ repo: 'acme/second', routingToken: 'component-second' },
+		];
+
+		/** The issue read answering with the given component ids and nothing else. */
+		function mockComponents(...ids: string[]): void {
+			mockJira({
+				'issue/SWARM-42': { key: 'SWARM-42', fields: { components: ids.map((id) => ({ id })) } },
+			});
+		}
+
+		it('routes a card to the non-default repository whose component it carries', async () => {
+			mockComponents('component-second');
+
+			await expect(provider.resolveItemRepository('SWARM-42', CANDIDATES)).resolves.toEqual({
+				status: 'routed',
+				repo: 'acme/second',
+			});
+		});
+
+		it('reports a card with no components as unrouted', async () => {
+			mockJira({ 'issue/SWARM-42': { key: 'SWARM-42', fields: {} } });
+
+			await expect(provider.resolveItemRepository('SWARM-42', CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		it('reports a card claimed by two repositories as ambiguous rather than picking one', async () => {
+			mockComponents('component-second', 'component-default');
+
+			await expect(provider.resolveItemRepository('SWARM-42', CANDIDATES)).resolves.toEqual({
+				status: 'ambiguous',
+				repos: ['acme/default', 'acme/second'],
+			});
+		});
+
+		it('matches the component id, never its name', async () => {
+			mockJira({
+				'issue/SWARM-42': {
+					key: 'SWARM-42',
+					fields: { components: [{ id: '10101', name: 'component-second' }] },
+				},
+			});
+
+			await expect(provider.resolveItemRepository('SWARM-42', CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		// Its own narrow read: adding `components` to the shared field list would make
+		// every other board read pay for a field none of them look at.
+		it('asks for the components field alone, in one request', async () => {
+			mockComponents('component-second');
+
+			await provider.resolveItemRepository('SWARM-42', CANDIDATES);
+
+			const reads = requestsTo('issue/SWARM-42', 'GET');
+			expect(reads).toHaveLength(1);
+			expect(reads[0]?.url.searchParams.get('fields')).toBe('components');
+		});
+	});
+
 	describe('listWorkItems', () => {
 		it('pages the whole board through the search token', async () => {
 			mockJira({

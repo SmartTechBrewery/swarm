@@ -50,12 +50,16 @@ export const WORKER_SAFE_KEYS = [
  * concurrency knob, and `pm` — which since issue #495 is the provider
  * discriminator *and* its board/field IDs in one union, so excluding the block
  * excludes the mapping with it) that a remote worker cannot act on and does not
- * need.
+ * need. `pmRoutingToken` (issue #686) belongs with `pm` for the same reason twice
+ * over: it is a board-side id, and which repository a card claims is a
+ * control-plane decision keyed on the whole repository list — which a worker,
+ * holding one scoped config, does not have.
  */
 export const SERVER_ONLY_KEYS = [
 	'credentials',
 	'repoRoot',
 	'pm',
+	'pmRoutingToken',
 	'pipeline',
 	'visibility',
 	'maxConcurrentJobs',

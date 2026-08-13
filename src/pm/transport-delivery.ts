@@ -168,10 +168,13 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  * misuse and leaves `listWorkItems` refused.
  *
  * What still refuses is what a worker has no business doing: `getWorkItem` (the
- * control plane already read the assigned item and put it on the assignment) and
- * `listWorkItems` (enumerating a whole board). No phase a DB-free worker runs
- * calls either. Assignees are unreadable here too — only the server-side
- * eligibility gate reads that flag, and it never runs on a worker.
+ * control plane already read the assigned item and put it on the assignment),
+ * `listWorkItems` (enumerating a whole board), and `resolveItemRepository` (issue
+ * #686 — routing a card is a control-plane decision keyed on the project's whole
+ * repository list, which a worker holding one repository-scoped config does not
+ * have). No phase a DB-free worker runs calls any of them. Assignees are unreadable
+ * here too — only the server-side eligibility gate reads that flag, and it never
+ * runs on a worker.
  */
 export function createWriteOnlyTransportPmProvider(
 	options: WriteOnlyTransportPmDeliveryOptions,
@@ -182,6 +185,7 @@ export function createWriteOnlyTransportPmProvider(
 		supportsDependencies: true,
 		getWorkItem: () => unavailableRead('getWorkItem'),
 		listWorkItems: () => unavailableRead('listWorkItems'),
+		resolveItemRepository: () => unavailableRead('resolveItemRepository'),
 		listBlockers: (id) =>
 			postDelivery(
 				options,

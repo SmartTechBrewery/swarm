@@ -35,6 +35,12 @@ export interface RepositoryEntry {
 	baseBranch?: string;
 	branchPrefix?: string;
 	scm?: ScmProviderId;
+	/**
+	 * The board card's routing token (issue #686). Authored in `swarm.config.json`
+	 * and **not editable here** — this screen only carries it through, so saving the
+	 * tab cannot silently drop a token nothing on it renders.
+	 */
+	pmRoutingToken?: string;
 }
 
 /**
@@ -53,6 +59,13 @@ export interface RepositoryForm {
 	baseBranch: string;
 	branchPrefix: string;
 	scm: ScmProviderId | '';
+	/**
+	 * Carried opaquely, never rendered (issue #686). It rides on the row rather than
+	 * being looked up at save time because a save sends the whole list positionally,
+	 * and a row can be reordered or removed in between — so the token has to travel
+	 * with the row it belongs to, not with its old index.
+	 */
+	pmRoutingToken?: string;
 }
 
 /**
@@ -86,16 +99,20 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		baseBranch: entry.baseBranch ?? '',
 		branchPrefix: entry.branchPrefix ?? '',
 		scm: toSelectableScmProvider(entry.scm) ?? ('' as const),
+		...(entry.pmRoutingToken ? { pmRoutingToken: entry.pmRoutingToken } : {}),
 	}));
 	return rows.length > 0 ? rows : [{ id: '1', ...NEW_REPOSITORY }];
 }
 
 /**
  * The `repositories` list to send on save. The whole list goes every time, because
- * `projects.update` replaces it wholesale — and every field an entry has is edited here,
- * so nothing has to be carried through unseen. A row left on "project default" sends no
- * `scm` at all rather than a copy of `project.scm`, so the entry keeps following the
- * project if its provider later changes.
+ * `projects.update` replaces it wholesale — so a field this screen does not edit still
+ * has to be written back, or saving the tab would delete it. `pmRoutingToken` (issue
+ * #686) is the one such field: it is authored in `swarm.config.json`, has no input
+ * here, and is carried straight through from the row it was read onto.
+ *
+ * A row left on "project default" sends no `scm` at all rather than a copy of
+ * `project.scm`, so the entry keeps following the project if its provider later changes.
  */
 export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 	return rows.map((row) => ({
@@ -103,6 +120,7 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 		baseBranch: row.baseBranch,
 		branchPrefix: row.branchPrefix,
 		...(row.scm ? { scm: row.scm } : {}),
+		...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
 	}));
 }
 

@@ -153,6 +153,60 @@ describe('ProjectRecordSchema', () => {
 		]);
 	});
 
+	// Issue #686 phase 1: a repository entry declares the provider-native id a board
+	// card carries to claim it. Uniqueness within the project is a parse error, so
+	// `swarm config apply` catches it rather than a dispatch discovering it later.
+	it('accepts distinct routing tokens, and an entry that declares none', () => {
+		const record = ProjectRecordSchema.parse({
+			...shared,
+			repositories: [
+				{ repo: 'acme/one', pmRoutingToken: 'component-1' },
+				{ repo: 'acme/two', pmRoutingToken: 'component-2' },
+				{ repo: 'acme/three' },
+			],
+		});
+		expect(record.repositories.map((entry) => entry.pmRoutingToken)).toEqual([
+			'component-1',
+			'component-2',
+			undefined,
+		]);
+	});
+
+	it('rejects two repositories claiming the same routing token, naming the token', () => {
+		expect(() =>
+			ProjectRecordSchema.parse({
+				...shared,
+				repositories: [
+					{ repo: 'acme/one', pmRoutingToken: 'component-1' },
+					{ repo: 'acme/two', pmRoutingToken: 'component-1' },
+				],
+			}),
+		).toThrow(/pmRoutingToken 'component-1' is claimed by both 'acme\/one' and 'acme\/two'/);
+	});
+
+	it('reports the duplicate at the second claimant’s own path', () => {
+		const result = ProjectRecordSchema.safeParse({
+			...shared,
+			repositories: [
+				{ repo: 'acme/one', pmRoutingToken: 'dupe' },
+				{ repo: 'acme/two', pmRoutingToken: 'dupe' },
+			],
+		});
+		expect(result.success).toBe(false);
+		expect(result.error?.issues.map((issue) => issue.path)).toEqual([
+			['repositories', 1, 'pmRoutingToken'],
+		]);
+	});
+
+	it('rejects an empty routing token rather than treating it as absent', () => {
+		expect(() =>
+			ProjectRecordSchema.parse({
+				...shared,
+				repositories: [{ repo: 'acme/one', pmRoutingToken: '' }],
+			}),
+		).toThrow();
+	});
+
 	// The record carries the same cross-field credential checks the scoped config does —
 	// neither reads a repository, so both refine through the same two functions.
 	it('applies the same credential cross-field checks the scoped config does', () => {

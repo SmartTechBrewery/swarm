@@ -603,6 +603,29 @@ export const ProjectRepositorySchema = z.object({
 	 */
 	scm: ScmProviderIdSchema.optional(),
 
+	/**
+	 * The provider-native id a board card carries to claim it for **this**
+	 * repository (issue #686 phase 1) — a Jira component id, a Linear label id, a
+	 * Trello label id. One opaque token per entry, resolved by
+	 * `PMProvider.resolveItemRepository` (`src/pm/types.ts`), and unique within a
+	 * project: two entries claiming the same token is a parse error
+	 * ({@link validateRepositoryRoutingTokens}), since a card carrying it would
+	 * belong to both.
+	 *
+	 * **An id, never a name**, exactly as `statusOptions` holds ids, and for two
+	 * reasons rather than one: a Trello label may legitimately be colour-only with
+	 * an empty name (`mapLabels`, `src/integrations/pm/trello/provider.ts`), and the
+	 * automation opt-in gate matches labels by *name* (`src/pm/automation-label.ts`),
+	 * so an id-keyed token can never be confused with it.
+	 *
+	 * **GitHub Projects needs none and ignores it**: a card there wraps one backing
+	 * Issue/PR, whose own repository is authoritative. The schema still accepts the
+	 * field on such a project rather than rejecting it — cross-checking it against
+	 * `pm.type` would put a provider branch into shared config validation
+	 * (ai/RULES.md §2).
+	 */
+	pmRoutingToken: z.string().min(1).optional(),
+
 	/** Branch task worktrees are cut from and PRs target. */
 	baseBranch: z.string().min(1).default(PROJECT_DEFAULTS.baseBranch),
 
@@ -944,6 +967,47 @@ function validateScmCredentialReferences(
 }
 
 /**
+ * Refuse a project whose repository entries claim the same `pmRoutingToken`
+ * (issue #686 phase 1) — the cross-*entry* check no single entry can make.
+ *
+ * A routing token is how a board card names one of the project's repositories, so
+ * two entries claiming the same one describes a card that belongs to both. That is
+ * a misconfiguration with no defensible resolution: `resolveItemRepository` would
+ * answer `ambiguous` for every card carrying it, and picking either entry would
+ * push branches into a repository nobody chose.
+ *
+ * It is caught here — at `validateConfig` / `swarm config apply` — rather than at
+ * dispatch, and only on {@link ProjectRecordSchema}: a scoped `ProjectConfig` holds
+ * one entry and no list, so it has nothing to compare. (`upsertProjectToDb` does not
+ * parse, so this is a config-apply gate rather than an API one, for the same reason
+ * {@link validatePmCredentialRoles} records.)
+ */
+function validateRepositoryRoutingTokens(
+	// Only the field it reads, as the credential refinements do above: naming the
+	// inferred record type here would make the inference circular.
+	project: { repositories: Array<{ repo: string; pmRoutingToken?: string }> },
+	ctx: z.RefinementCtx,
+): void {
+	const claimedBy = new Map<string, string>();
+	project.repositories.forEach((entry, index) => {
+		const token = entry.pmRoutingToken;
+		if (token === undefined) return;
+		const firstClaimant = claimedBy.get(token);
+		if (firstClaimant === undefined) {
+			claimedBy.set(token, entry.repo);
+			return;
+		}
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['repositories', index, 'pmRoutingToken'],
+			message:
+				`pmRoutingToken '${token}' is claimed by both '${firstClaimant}' and '${entry.repo}' — ` +
+				'a board card carrying it would belong to two repositories. Give each repository its own token.',
+		});
+	});
+}
+
+/**
  * A whole project config: {@link ProjectConfigBaseSchema}'s fields, the two legacy
  * credential adoptions, and the two cross-field credential checks. This is what
  * `validateConfig` and every config-parsing call site uses.
@@ -965,16 +1029,18 @@ export const ProjectConfigSchema = z
 	.superRefine(validateScmCredentialReferences);
 
 /**
- * A whole project **record** — {@link ProjectRecordBaseSchema}'s fields plus exactly
- * the same adoptions and cross-field checks {@link ProjectConfigSchema} applies,
- * since neither reads a repository. This is what `validateConfig` /
+ * A whole project **record** — {@link ProjectRecordBaseSchema}'s fields plus the same
+ * adoptions and credential checks {@link ProjectConfigSchema} applies, since neither
+ * reads a repository, plus the one check only a record can make: repository routing
+ * tokens are unique within the project. This is what `validateConfig` /
  * `swarm config apply` parse and what the `projects` table persists.
  */
 export const ProjectRecordSchema = z
 	.preprocess(adoptLegacyPmCredentials, ProjectRecordBaseSchema)
 	.transform(adoptLegacyScmCredentials)
 	.superRefine(validatePmCredentialRoles)
-	.superRefine(validateScmCredentialReferences);
+	.superRefine(validateScmCredentialReferences)
+	.superRefine(validateRepositoryRoutingTokens);
 
 export const SwarmConfigSchema = z.object({
 	projects: z.array(ProjectRecordSchema).min(1),

@@ -163,6 +163,7 @@ function makeDeps() {
 		listBlockers: vi.fn(async () => []),
 		listDependents: vi.fn(async () => []),
 		addBlockedBy: vi.fn<(id: string, blockerId: string) => Promise<void>>(async () => {}),
+		resolveItemRepository: vi.fn(async () => ({ status: 'unrouted' }) as const),
 	};
 	return {
 		project: createMockProjectConfig(),

@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { parseWorkItemId, unwrap } from '@/pm/ids.js';
+import { routeByClaimTokens } from '@/pm/repository-routing.js';
 import type {
 	CreateWorkItemInput,
+	ItemRepositoryRoute,
 	ListWorkItemsFilter,
 	PMProvider,
+	RepositoryRoutingCandidate,
 	UpdateWorkItemPatch,
 	WorkItem,
 	WorkItemBlocker,
@@ -123,6 +126,21 @@ class InMemoryPMProvider implements PMProvider {
 		// re-applying an existing label neither duplicates it nor errors.
 		if (item.labels.some((l) => l.name === name)) return;
 		this.items.set(id, { ...item, labels: [...item.labels, { id: name, name }] });
+	}
+
+	/**
+	 * Routed on the item's own label ids, the axis the three token-routed providers
+	 * use, so the fake exercises the shared verdict helper rather than restating it.
+	 */
+	async resolveItemRepository(
+		id: string,
+		candidates: readonly RepositoryRoutingCandidate[],
+	): Promise<ItemRepositoryRoute> {
+		const item = await this.getWorkItem(id);
+		return routeByClaimTokens(
+			item.labels.map((label) => label.id),
+			candidates,
+		);
 	}
 
 	readonly supportsDependencies = true;

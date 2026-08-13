@@ -35,17 +35,20 @@ import {
 	dependencyProse,
 	findDependencyReferences,
 } from '../../../pm/dependencies.js';
+import { routeByClaimTokens } from '../../../pm/repository-routing.js';
 import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
 	DiscoveredContainer,
 	DiscoveredState,
+	ItemRepositoryRoute,
 	ListWorkItemsFilter,
 	PMDiscoveryArgs,
 	PMDiscoveryCapability,
 	PMDiscoveryResult,
 	PMProvider,
 	PMType,
+	RepositoryRoutingCandidate,
 	StateDiscoveryResult,
 	UpdateWorkItemPatch,
 	WorkItem,
@@ -213,10 +216,11 @@ interface JiraUser {
 }
 
 /**
- * The subset of `fields` a read asks for — {@link ISSUE_FIELDS} plus the two the
+ * The subset of `fields` a read asks for — {@link ISSUE_FIELDS} plus the three the
  * narrower reads add (`issuelinks` for the dependency gate, `statusCategory` for a
  * blocker's open state, which Jira nests inside `status` rather than exposing
- * separately). Every member is optional defensively.
+ * separately, and `components` for repository routing). Every member is optional
+ * defensively.
  */
 interface JiraIssueFields {
 	summary?: string | null;
@@ -228,6 +232,8 @@ interface JiraIssueFields {
 	created?: string;
 	updated?: string;
 	issuelinks?: Array<JiraIssueLink | null> | null;
+	/** The issue's components — this provider's repository-routing axis (issue #686). */
+	components?: Array<{ id?: string | null } | null> | null;
 }
 
 interface JiraIssue {
@@ -587,6 +593,24 @@ export class JiraPMProvider implements PMProvider {
 			}
 			return this.resolveTaskRef(toWorkItem({ ...issue, key: issue.key }, this.config));
 		});
+	}
+
+	/**
+	 * Jira's routing axis is **components** (issue #686 phase 1): the `projectKey`
+	 * is already the board container, so it cannot also say which repository a card
+	 * belongs to, while a component is a per-project subdivision an issue carries
+	 * zero or more of. Matched on the component **id**, never its name, which is
+	 * what a repository entry's `pmRoutingToken` holds.
+	 *
+	 * Its own narrow read rather than widening {@link ISSUE_FIELDS}: routing is one
+	 * call, and adding `components` there would make every other board read pay for
+	 * a field none of them look at.
+	 */
+	async resolveItemRepository(
+		id: string,
+		candidates: readonly RepositoryRoutingCandidate[],
+	): Promise<ItemRepositoryRoute> {
+		return this.run(async () => routeByClaimTokens(await this.fetchComponentIds(id), candidates));
 	}
 
 	async listWorkItems(filter?: ListWorkItemsFilter): Promise<WorkItem[]> {
@@ -1066,6 +1090,20 @@ export class JiraPMProvider implements PMProvider {
 			query: { fields: 'status' },
 		});
 		return issue?.fields?.status;
+	}
+
+	/**
+	 * The component ids the issue carries — the repository-routing claim (issue #686),
+	 * read as narrowly as {@link fetchStatus} is. An issue with no components answers
+	 * `[]`, which routes to nothing. Runs inside a credential scope (its caller does).
+	 */
+	private async fetchComponentIds(id: string): Promise<string[]> {
+		const issue = await jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(id)}`, {
+			query: { fields: 'components' },
+		});
+		return (issue?.fields?.components ?? []).flatMap((component) =>
+			component?.id ? [component.id] : [],
+		);
 	}
 
 	/**

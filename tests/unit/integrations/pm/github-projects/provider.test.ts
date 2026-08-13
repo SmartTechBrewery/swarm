@@ -167,6 +167,87 @@ describe('GitHubProjectsPMProvider', () => {
 		});
 	});
 
+	// Issue #686 phase 1. This provider is the one that needs no routing token: the
+	// card's own backing Issue/PR names the repository, so the declared tokens below
+	// are deliberately present and deliberately ignored.
+	describe('resolveItemRepository', () => {
+		const CANDIDATES = [
+			{ repo: 'SmartTechBrewery/other', routingToken: 'L1' },
+			{ repo: 'SmartTechBrewery/swarm', routingToken: 'L2' },
+		];
+
+		function itemInRepository(nameWithOwner: string | undefined) {
+			return {
+				node: {
+					...ITEM_NODE,
+					content:
+						nameWithOwner === undefined
+							? null
+							: { ...ITEM_NODE.content, repository: { nameWithOwner } },
+				},
+			};
+		}
+
+		it('routes a card to the non-default repository its backing issue lives in', async () => {
+			graphql.mockResolvedValue(itemInRepository('SmartTechBrewery/swarm'));
+
+			// `swarm` is the second candidate, so a default-entry fallback would answer
+			// `other` here.
+			await expect(provider.resolveItemRepository('PVTI_x', CANDIDATES)).resolves.toEqual({
+				status: 'routed',
+				repo: 'SmartTechBrewery/swarm',
+			});
+		});
+
+		// The shared slug comparison (issue #688), not `===`: a config entry's casing or
+		// a `.git` suffix is noise, not a different repository.
+		it('compares repositories through the shared slug match', async () => {
+			graphql.mockResolvedValue(itemInRepository('SmartTechBrewery/Swarm'));
+
+			await expect(
+				provider.resolveItemRepository('PVTI_x', [{ repo: 'smarttechbrewery/swarm.git' }]),
+			).resolves.toEqual({ status: 'routed', repo: 'smarttechbrewery/swarm.git' });
+		});
+
+		it('reports a card in a repository the project does not own as unrouted', async () => {
+			graphql.mockResolvedValue(itemInRepository('someone-else/elsewhere'));
+
+			await expect(provider.resolveItemRepository('PVTI_x', CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		it('reports a draft card, which backs no Issue/PR, as unrouted', async () => {
+			graphql.mockResolvedValue(itemInRepository(undefined));
+
+			await expect(provider.resolveItemRepository('PVTI_x', CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		it('ignores the declared routing tokens entirely', async () => {
+			graphql.mockResolvedValue(itemInRepository('SmartTechBrewery/swarm'));
+
+			// The card carries label `L1`, which claims `other` for a token-routed
+			// provider. Here the backing repository still wins.
+			await expect(provider.resolveItemRepository('PVTI_x', CANDIDATES)).resolves.toEqual({
+				status: 'routed',
+				repo: 'SmartTechBrewery/swarm',
+			});
+		});
+
+		it('reads the item once, with no query beyond the one getWorkItem already makes', async () => {
+			graphql.mockResolvedValue(itemInRepository('SmartTechBrewery/swarm'));
+
+			await provider.resolveItemRepository('PVTI_x', CANDIDATES);
+
+			expect(graphql).toHaveBeenCalledTimes(1);
+			expect(graphql).toHaveBeenCalledWith(expect.stringContaining('nameWithOwner'), {
+				itemId: 'PVTI_x',
+			});
+		});
+	});
+
 	// The card→SCM-artifact seam (issue #498): shared code keys its worktree, branch,
 	// and PR on `taskRef`, so the provider is the only place that knows how its own
 	// board links to an Issue/PR.

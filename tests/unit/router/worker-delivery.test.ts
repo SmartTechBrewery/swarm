@@ -82,6 +82,7 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 		listBlockers: vi.fn(),
 		listDependents: vi.fn(),
 		addBlockedBy: vi.fn(),
+		resolveItemRepository: vi.fn(),
 		...overrides,
 	};
 }

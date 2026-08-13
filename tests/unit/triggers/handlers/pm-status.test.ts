@@ -52,6 +52,7 @@ function providerReturning(workItem: WorkItem, seen: string[] = []): PMProvider 
 		listBlockers: async () => [],
 		listDependents: async () => [],
 		addBlockedBy: async () => undefined,
+		resolveItemRepository: async () => ({ status: 'unrouted' }),
 	};
 }
 

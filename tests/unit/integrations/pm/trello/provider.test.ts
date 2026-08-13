@@ -120,6 +120,7 @@ const CONTRACT_METHODS = [
 	'listBlockers',
 	'listDependents',
 	'addBlockedBy',
+	'resolveItemRepository',
 	'discover',
 ] as const;
 
@@ -295,6 +296,70 @@ describe('TrelloPMProvider', () => {
 			await expect(provider.getWorkItem(CARD_ID)).rejects.toThrow(
 				`belongs to board '5f2b9c1a4e6d7f0a1b2c3dff', not this project's board '${CONFIG.boardId}'`,
 			);
+		});
+	});
+
+	// Issue #686 phase 1: Trello's routing axis is labels — a card's list is already
+	// its status, so a label is what is left to claim a card.
+	describe('resolveItemRepository', () => {
+		const CANDIDATES = [
+			{ repo: 'acme/default', routingToken: 'label-default' },
+			{ repo: 'acme/second', routingToken: 'label-second' },
+		];
+
+		/** The card read answering with the given label ids and nothing else. */
+		function mockIdLabels(...ids: string[]): void {
+			mockTrello({ [`cards/${CARD_ID}`]: { id: CARD_ID, idLabels: ids } });
+		}
+
+		it('routes a card to the non-default repository whose label it carries', async () => {
+			mockIdLabels('label-second');
+
+			await expect(provider.resolveItemRepository(CARD_ID, CANDIDATES)).resolves.toEqual({
+				status: 'routed',
+				repo: 'acme/second',
+			});
+		});
+
+		it('reports a card with no labels as unrouted', async () => {
+			mockIdLabels();
+
+			await expect(provider.resolveItemRepository(CARD_ID, CANDIDATES)).resolves.toEqual({
+				status: 'unrouted',
+			});
+		});
+
+		it('reports a card claimed by two repositories as ambiguous rather than picking one', async () => {
+			mockIdLabels('label-second', 'label-default');
+
+			await expect(provider.resolveItemRepository(CARD_ID, CANDIDATES)).resolves.toEqual({
+				status: 'ambiguous',
+				repos: ['acme/default', 'acme/second'],
+			});
+		});
+
+		// The one case that makes ids rather than names load-bearing here: a Trello
+		// label may legitimately be colour-only, with an empty name.
+		it('routes a colour-only label by its id, exactly like any other', async () => {
+			mockIdLabels('label-colour-only');
+
+			await expect(
+				provider.resolveItemRepository(CARD_ID, [
+					{ repo: 'acme/second', routingToken: 'label-colour-only' },
+				]),
+			).resolves.toEqual({ status: 'routed', repo: 'acme/second' });
+		});
+
+		// The narrow read: `idLabels` is the plain id array, unlike the whole label
+		// objects the shared card query selects for the automation gate.
+		it('asks for the idLabels field alone, in one request', async () => {
+			mockIdLabels('label-second');
+
+			await provider.resolveItemRepository(CARD_ID, CANDIDATES);
+
+			const reads = requestsTo(`cards/${CARD_ID}`);
+			expect(reads).toHaveLength(1);
+			expect(reads[0]?.searchParams.get('fields')).toBe('idLabels');
 		});
 	});
 

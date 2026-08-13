@@ -35,11 +35,13 @@ import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
 	DiscoveredContainer,
+	ItemRepositoryRoute,
 	PMDiscoveryArgs,
 	PMDiscoveryCapability,
 	PMDiscoveryResult,
 	PMProvider,
 	PMType,
+	RepositoryRoutingCandidate,
 	StateDiscoveryResult,
 	UpdateWorkItemPatch,
 	WorkItem,
@@ -49,6 +51,7 @@ import type {
 	WorkItemDependent,
 	WorkItemLabel,
 } from '../../../pm/types.js';
+import { repoSlugsMatch } from '../../../scm/repo-slug.js';
 import { getScopedClient } from '../../scm/github/client.js';
 import {
 	type GitHubProjectsIntegrationConfig,
@@ -437,6 +440,31 @@ export class GitHubProjectsPMProvider implements PMProvider {
 
 	async getWorkItem(id: string): Promise<WorkItem> {
 		return (await this.resolveItem(id)).workItem;
+	}
+
+	/**
+	 * The card's own backing repository decides, so this provider reads no routing
+	 * token at all — `candidates[].routingToken` is deliberately unused (issue #686
+	 * phase 1). A Projects card wraps at most one Issue/PR, which lives in exactly
+	 * one repository, so it also can never answer `ambiguous`.
+	 *
+	 * No new query: `resolveItem` already reads `repository { nameWithOwner }` in the
+	 * same round-trip it reads the item with. The comparison goes through the shared
+	 * `repoSlugsMatch` rather than `===`, so a config entry's casing or a `.git`
+	 * suffix cannot make a card look like it belongs to no repository (issue #688).
+	 *
+	 * A **draft** card has no Issue/PR and therefore no repository — `unrouted`, the
+	 * same answer as a card whose repository this project does not own.
+	 */
+	async resolveItemRepository(
+		id: string,
+		candidates: readonly RepositoryRoutingCandidate[],
+	): Promise<ItemRepositoryRoute> {
+		const { owner, repo } = await this.resolveItem(id);
+		if (!owner || !repo) return { status: 'unrouted' };
+		const slug = `${owner}/${repo}`;
+		const claimed = candidates.find((candidate) => repoSlugsMatch(candidate.repo, slug));
+		return claimed ? { status: 'routed', repo: claimed.repo } : { status: 'unrouted' };
 	}
 
 	async listWorkItems(filter?: { status?: string }): Promise<WorkItem[]> {
