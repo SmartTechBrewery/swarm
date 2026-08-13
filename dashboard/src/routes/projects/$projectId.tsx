@@ -25,6 +25,7 @@ import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.j
 import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
 import { PmProviderSwitchDialog } from '@/components/projects/pm-provider-switch-dialog.js';
 import { ProjectAdminOnly } from '@/components/projects/project-admin-only.js';
+import { RepositoryList } from '@/components/projects/repository-list.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
@@ -88,7 +89,18 @@ import {
 	tabSearch,
 	viewerAdministersProject,
 } from '@/lib/project-nav.js';
-import { withDefaultRepositoryEdited } from '@/lib/project-repository.js';
+import {
+	addRepository,
+	areRepositoriesDirty,
+	duplicateRepositories,
+	moveRepository,
+	patchRepository,
+	type RepositoryEntry,
+	type RepositoryForm,
+	removeRepository,
+	toRepositoryEntries,
+	toRepositoryForms,
+} from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	AgentConfig,
@@ -293,20 +305,21 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 
 interface GeneralSettingsFormProps {
 	name: string;
-	repo: string;
+	repositories: RepositoryForm[];
+	projectScm?: string;
+	duplicateRepos: string[];
 	repoRoot: string;
 	worktreeRoot: string;
-	baseBranch: string;
-	branchPrefix: string;
 	maxConcurrentJobs: string;
 	maxConcurrentJobsError?: string;
 	setName: (val: string) => void;
-	setRepo: (val: string) => void;
 	setRepoRoot: (val: string) => void;
 	setWorktreeRoot: (val: string) => void;
-	setBaseBranch: (val: string) => void;
-	setBranchPrefix: (val: string) => void;
 	setMaxConcurrentJobs: (val: string) => void;
+	handleRepositoryChange: (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) => void;
+	handleAddRepository: () => void;
+	handleRemoveRepository: (index: number) => void;
+	handleMoveRepository: (index: number, direction: 'up' | 'down') => void;
 	handleInputChange: (
 		setter: (val: string) => void,
 	) => (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -319,22 +332,23 @@ interface GeneralSettingsFormProps {
 	errorMessage?: string;
 }
 
-function GeneralSettingsForm({
+export function GeneralSettingsForm({
 	name,
-	repo,
+	repositories,
+	projectScm,
+	duplicateRepos,
 	repoRoot,
 	worktreeRoot,
-	baseBranch,
-	branchPrefix,
 	maxConcurrentJobs,
 	maxConcurrentJobsError,
 	setName,
-	setRepo,
 	setRepoRoot,
 	setWorktreeRoot,
-	setBaseBranch,
-	setBranchPrefix,
 	setMaxConcurrentJobs,
+	handleRepositoryChange,
+	handleAddRepository,
+	handleRemoveRepository,
+	handleMoveRepository,
 	handleInputChange,
 	handleSubmit,
 	handleReset,
@@ -369,27 +383,6 @@ function GeneralSettingsForm({
 							/>
 							<p className="text-xs text-zinc-500 mt-1">
 								Display name for this project shown in the dashboard.
-							</p>
-						</div>
-
-						{/* Repo */}
-						<div>
-							<label htmlFor="repo" className="block text-xs font-medium text-zinc-400 mb-1">
-								Repository <span className="text-red-500">*</span>
-							</label>
-							<input
-								type="text"
-								id="repo"
-								value={repo}
-								onChange={handleInputChange(setRepo)}
-								disabled={isPending}
-								required
-								pattern="[^/]+/[^/]+"
-								placeholder="owner/repo"
-								className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
-							/>
-							<p className="text-xs text-zinc-500 mt-1">
-								The GitHub repository this project operates on, in "owner/repo" format.
 							</p>
 						</div>
 
@@ -436,48 +429,6 @@ function GeneralSettingsForm({
 							</p>
 						</div>
 
-						{/* Base Branch */}
-						<div>
-							<label htmlFor="baseBranch" className="block text-xs font-medium text-zinc-400 mb-1">
-								Base Branch <span className="text-red-500">*</span>
-							</label>
-							<input
-								type="text"
-								id="baseBranch"
-								value={baseBranch}
-								onChange={handleInputChange(setBaseBranch)}
-								disabled={isPending}
-								required
-								placeholder="main"
-								className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
-							/>
-							<p className="text-xs text-zinc-500 mt-1">
-								Branch task worktrees are cut from and PRs target.
-							</p>
-						</div>
-
-						{/* Branch Prefix */}
-						<div>
-							<label
-								htmlFor="branchPrefix"
-								className="block text-xs font-medium text-zinc-400 mb-1"
-							>
-								Branch Prefix
-							</label>
-							<input
-								type="text"
-								id="branchPrefix"
-								value={branchPrefix}
-								onChange={handleInputChange(setBranchPrefix)}
-								disabled={isPending}
-								placeholder="issue-"
-								className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
-							/>
-							<p className="text-xs text-zinc-500 mt-1">
-								Prefix for task branch names (convention is 'issue-').
-							</p>
-						</div>
-
 						<div>
 							<label
 								htmlFor="maxConcurrentJobs"
@@ -507,6 +458,17 @@ function GeneralSettingsForm({
 					</div>
 				</div>
 
+				<RepositoryList
+					repositories={repositories}
+					projectScm={projectScm}
+					duplicates={duplicateRepos}
+					isPending={isPending}
+					onChange={handleRepositoryChange}
+					onAdd={handleAddRepository}
+					onRemove={handleRemoveRepository}
+					onMove={handleMoveRepository}
+				/>
+
 				{/* Feedback Banners */}
 				{isSuccess && (
 					<div className="p-3 bg-emerald-950/20 border border-emerald-900/30 text-sm text-emerald-400 rounded">
@@ -522,9 +484,12 @@ function GeneralSettingsForm({
 
 				{/* Action Buttons */}
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
+					{/* A repository listed twice would be accepted server-side — the conflict guard
+					    only refuses one *another* project owns — so this is the one rule Save has
+					    to hold on its own. */}
 					<button
 						type="submit"
-						disabled={isPending || !isDirty}
+						disabled={isPending || !isDirty || duplicateRepos.length > 0}
 						className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
 					>
 						{isPending ? 'Saving…' : 'Save Changes'}
@@ -1882,11 +1847,9 @@ function ProjectDetailRouteComponent() {
 	const lastSyncedProjectRef = useRef<typeof project>(undefined);
 
 	const [name, setName] = useState('');
-	const [repo, setRepo] = useState('');
+	const [repositories, setRepositories] = useState<RepositoryForm[]>(() => toRepositoryForms([]));
 	const [repoRoot, setRepoRoot] = useState('');
 	const [worktreeRoot, setWorktreeRoot] = useState('');
-	const [baseBranch, setBaseBranch] = useState('');
-	const [branchPrefix, setBranchPrefix] = useState('');
 	const [maxConcurrentJobs, setMaxConcurrentJobs] = useState('');
 	const [maxConcurrentJobsError, setMaxConcurrentJobsError] = useState<string>();
 
@@ -1910,11 +1873,6 @@ function ProjectDetailRouteComponent() {
 	const [switchConfirmOpen, setSwitchConfirmOpen] = useState(false);
 
 	const project = projectQuery.data;
-	// The General tab edits the project's **default** repository — its first entry. Phase
-	// 2 of issue #684 lifted phase 1's one-entry cap, so a project may own more; phase 3
-	// replaces the three single inputs this seeds with a list editor. Until then the save
-	// carries the remaining entries through untouched (see `handleSubmit`).
-	const repository = project?.repositories[0];
 
 	/**
 	 * The Project Management tab's provider switch, held entirely client-side (issue
@@ -1953,16 +1911,10 @@ function ProjectDetailRouteComponent() {
 			const changed = diffProjectForSync(lastSyncedProjectRef.current, project, pmDraftProviderId);
 
 			if (changed.general) {
-				// Read the entry off `project` rather than the memo above, so this effect's
-				// dependency list stays honest: the repository *is* the project's, so
-				// `project` changing is the only thing that can change it.
-				const entry = project.repositories[0];
 				setName(project.name);
-				setRepo(entry?.repo ?? '');
+				setRepositories(toRepositoryForms(project.repositories));
 				setRepoRoot(project.repoRoot);
 				setWorktreeRoot(project.worktreeRoot ?? '');
-				setBaseBranch(entry?.baseBranch ?? '');
-				setBranchPrefix(entry?.branchPrefix ?? '');
 				setMaxConcurrentJobs(String(project.maxConcurrentJobs));
 				setMaxConcurrentJobsError(undefined);
 			}
@@ -1991,7 +1943,7 @@ function ProjectDetailRouteComponent() {
 		mutationFn: (variables: {
 			id: string;
 			name?: string;
-			repositories?: Array<{ repo: string; baseBranch?: string; branchPrefix?: string }>;
+			repositories?: RepositoryEntry[];
 			repoRoot?: string;
 			worktreeRoot?: string;
 			maxConcurrentJobs?: number;
@@ -2035,24 +1987,19 @@ function ProjectDetailRouteComponent() {
 		if (!project) return false;
 		return (
 			name !== project.name ||
-			repo !== (repository?.repo ?? '') ||
+			areRepositoriesDirty(repositories, project.repositories) ||
 			repoRoot !== project.repoRoot ||
 			worktreeRoot !== (project.worktreeRoot ?? '') ||
-			baseBranch !== (repository?.baseBranch ?? '') ||
-			branchPrefix !== (repository?.branchPrefix ?? '') ||
 			maxConcurrentJobs !== String(project.maxConcurrentJobs)
 		);
-	}, [
-		project,
-		repository,
-		name,
-		repo,
-		repoRoot,
-		worktreeRoot,
-		baseBranch,
-		branchPrefix,
-		maxConcurrentJobs,
-	]);
+	}, [project, name, repositories, repoRoot, worktreeRoot, maxConcurrentJobs]);
+
+	// The one list rule with no server-side twin: `assertRepositoriesUnclaimed` refuses a
+	// repository *another* project owns, so a list repeating one of its own would be
+	// accepted. Surfaced inline and used to block Save, exactly like the Agents tab's
+	// duplicate-CLI check. A repository another project owns stays a server CONFLICT,
+	// rendered by the tab's existing error banner.
+	const duplicateRepos = useMemo(() => duplicateRepositories(repositories), [repositories]);
 
 	const isAgentsDirty = useMemo(() => {
 		if (!project) return false;
@@ -2092,6 +2039,24 @@ function ProjectDetailRouteComponent() {
 		() => isBoardMappingDirty(boardMapping, project?.pm),
 		[boardMapping, project],
 	);
+
+	/** Every repository-list edit goes through here, so each one also clears the banner. */
+	const updateRepositories = (update: (rows: RepositoryForm[]) => RepositoryForm[]) => {
+		setRepositories(update);
+		setMaxConcurrentJobsError(undefined);
+		updateMutation.reset();
+	};
+
+	const handleRepositoryChange = (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) =>
+		updateRepositories((rows) => patchRepository(rows, index, patch));
+
+	const handleAddRepository = () => updateRepositories(addRepository);
+
+	const handleRemoveRepository = (index: number) =>
+		updateRepositories((rows) => removeRepository(rows, index));
+
+	const handleMoveRepository = (index: number, direction: 'up' | 'down') =>
+		updateRepositories((rows) => moveRepository(rows, index, direction));
 
 	/** Replace one phase's ordered target list, leaving its other fields untouched. */
 	const updateTargets = (
@@ -2265,11 +2230,9 @@ function ProjectDetailRouteComponent() {
 	const handleReset = () => {
 		if (project) {
 			setName(project.name);
-			setRepo(repository?.repo ?? '');
+			setRepositories(toRepositoryForms(project.repositories));
 			setRepoRoot(project.repoRoot);
 			setWorktreeRoot(project.worktreeRoot ?? '');
-			setBaseBranch(repository?.baseBranch ?? '');
-			setBranchPrefix(repository?.branchPrefix ?? '');
 			setMaxConcurrentJobs(String(project.maxConcurrentJobs));
 			setMaxConcurrentJobsError(undefined);
 			updateMutation.reset();
@@ -2279,6 +2242,9 @@ function ProjectDetailRouteComponent() {
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		if (configWriteInFlight) return;
+		// Save is disabled on a duplicate repository; guard here too so an Enter-to-submit
+		// from a field can't bypass the check (the same belt-and-braces the Agents tab uses).
+		if (duplicateRepos.length > 0) return;
 		const parsedMaxConcurrentJobs = Number(maxConcurrentJobs);
 		if (!Number.isInteger(parsedMaxConcurrentJobs) || parsedMaxConcurrentJobs < 1) {
 			setMaxConcurrentJobsError('Maximum concurrent jobs must be a positive whole number.');
@@ -2288,11 +2254,10 @@ function ProjectDetailRouteComponent() {
 		updateMutation.mutate({
 			id: projectId,
 			name,
-			// The General tab still edits only the **default** (first) repository; phase 3
-			// turns these three inputs into a real list editor. The helper is what keeps a
-			// multi-repository project's other entries — `projects.update` replaces the list
-			// wholesale, so sending only the edited entry would delete them.
-			repositories: withDefaultRepositoryEdited(project, { repo, baseBranch, branchPrefix }),
+			// The whole list every time: `projects.update` replaces `repositories` wholesale,
+			// and this editor shows every field an entry has, so nothing is carried through
+			// unseen.
+			repositories: toRepositoryEntries(repositories),
 			repoRoot,
 			worktreeRoot,
 			maxConcurrentJobs: parsedMaxConcurrentJobs,
@@ -2356,20 +2321,21 @@ function ProjectDetailRouteComponent() {
 				{activeTab === 'general' && (
 					<GeneralSettingsForm
 						name={name}
-						repo={repo}
+						repositories={repositories}
+						projectScm={project?.scm}
+						duplicateRepos={duplicateRepos}
 						repoRoot={repoRoot}
 						worktreeRoot={worktreeRoot}
-						baseBranch={baseBranch}
-						branchPrefix={branchPrefix}
 						maxConcurrentJobs={maxConcurrentJobs}
 						maxConcurrentJobsError={maxConcurrentJobsError}
 						setName={setName}
-						setRepo={setRepo}
 						setRepoRoot={setRepoRoot}
 						setWorktreeRoot={setWorktreeRoot}
-						setBaseBranch={setBaseBranch}
-						setBranchPrefix={setBranchPrefix}
 						setMaxConcurrentJobs={setMaxConcurrentJobs}
+						handleRepositoryChange={handleRepositoryChange}
+						handleAddRepository={handleAddRepository}
+						handleRemoveRepository={handleRemoveRepository}
+						handleMoveRepository={handleMoveRepository}
 						handleInputChange={handleInputChange}
 						handleSubmit={handleSubmit}
 						handleReset={handleReset}

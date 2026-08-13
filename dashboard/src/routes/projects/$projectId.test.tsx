@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, renderHook, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
 import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
 
@@ -66,6 +66,7 @@ vi.mock('@/lib/trpc.js', () => ({
 import { PROJECT_TABS } from '@/lib/project-nav.js';
 import {
 	diffProjectForSync,
+	GeneralSettingsForm,
 	PhaseConfigRow,
 	PhaseEnabledCell,
 	PhaseSettingsDetail,
@@ -1052,6 +1053,20 @@ describe('diffProjectForSync', () => {
 		expect(diffProjectForSync(prev, next)).toMatchObject({ general: true, pipeline: false });
 	});
 
+	// The General tab's repository list re-seeds off this flag, so a repository added or
+	// reordered elsewhere has to reach the form (issue #684 phase 3).
+	it('flags general when the repository list changed', () => {
+		const prev = makeProject();
+		const added = makeProject({
+			repositories: [
+				{ repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-' },
+				{ repo: 'owner/second', baseBranch: 'main', branchPrefix: 'issue-' },
+			],
+		});
+		expect(diffProjectForSync(prev, added)).toMatchObject({ general: true, agents: false });
+		expect(diffProjectForSync(added, prev)).toMatchObject({ general: true, agents: false });
+	});
+
 	// Issue #642: a PM provider switch is a multi-step draft (credentials, board, status
 	// mapping) held client-side until one Save. A background refetch that changes `pm` —
 	// or another tab's write landing on it — must not discard that half-built mapping.
@@ -1116,6 +1131,96 @@ describe('ProjectTabBar', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Workers' }));
 
 		expect(onSelect).toHaveBeenCalledWith('workers');
+	});
+});
+
+describe('GeneralSettingsForm — repository list', () => {
+	const REPOSITORIES = [
+		{ id: '1', repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-', scm: '' as const },
+		{ id: '2', repo: 'owner/second', baseBranch: 'main', branchPrefix: 'issue-', scm: '' as const },
+	];
+
+	function renderForm(overrides: Partial<Parameters<typeof GeneralSettingsForm>[0]> = {}) {
+		const handleSubmit = vi.fn((e: React.FormEvent) => e.preventDefault());
+		const handleReset = vi.fn();
+		render(
+			<GeneralSettingsForm
+				name="Proj"
+				repositories={REPOSITORIES}
+				projectScm="github"
+				duplicateRepos={[]}
+				repoRoot="/repo"
+				worktreeRoot=".worktrees"
+				maxConcurrentJobs="1"
+				setName={() => {}}
+				setRepoRoot={() => {}}
+				setWorktreeRoot={() => {}}
+				setMaxConcurrentJobs={() => {}}
+				handleRepositoryChange={() => {}}
+				handleAddRepository={() => {}}
+				handleRemoveRepository={() => {}}
+				handleMoveRepository={() => {}}
+				handleInputChange={() => () => {}}
+				handleSubmit={handleSubmit}
+				handleReset={handleReset}
+				isDirty={true}
+				isPending={false}
+				isSuccess={false}
+				isError={false}
+				{...overrides}
+			/>,
+		);
+		return { handleSubmit, handleReset };
+	}
+
+	// The three single inputs the tab used to bind to `repositories[0]` are gone; the list
+	// editor is what the tab renders now.
+	it('renders the list instead of a single Repository/Base branch/Branch prefix trio', () => {
+		renderForm();
+
+		expect(screen.getByLabelText('Repository, entry 1')).toBeDefined();
+		expect(screen.getByLabelText('Repository, entry 2')).toBeDefined();
+		// The old single-field ids, which a stale binding would still produce.
+		expect(document.getElementById('repo')).toBeNull();
+		expect(document.getElementById('baseBranch')).toBeNull();
+		expect(document.getElementById('branchPrefix')).toBeNull();
+		// The project-wide fields stay exactly where they were.
+		expect(document.getElementById('repoRoot')).toBeDefined();
+		expect(document.getElementById('worktreeRoot')).toBeDefined();
+	});
+
+	// A repository listed twice is the one rule with no server-side twin, so it blocks Save
+	// even though the form is otherwise dirty and valid.
+	it('blocks Save on a duplicate repository, and Enter-to-submit with it', () => {
+		const { handleSubmit } = renderForm({ duplicateRepos: ['owner/repo'] });
+
+		const save = screen.getByRole('button', { name: 'Save Changes' });
+		expect(save).toHaveProperty('disabled', true);
+		fireEvent.click(save);
+		expect(handleSubmit).not.toHaveBeenCalled();
+	});
+
+	it('offers Save and Reset once the form is dirty, and neither while it is not', () => {
+		const { handleReset } = renderForm();
+		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', false);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+		expect(handleReset).toHaveBeenCalled();
+
+		cleanup();
+		renderForm({ isDirty: false });
+		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', true);
+	});
+
+	// The tab's existing banner is where a repository another project owns surfaces —
+	// `projects.update` answers that with a CONFLICT rather than the client pre-checking it.
+	it("renders the server's repository conflict in its error banner", () => {
+		renderForm({ isError: true, errorMessage: 'Project ID or repository already exists' });
+
+		expect(
+			screen.getByText(/Failed to save settings: Project ID or repository already exists/),
+		).toBeDefined();
 	});
 });
 
