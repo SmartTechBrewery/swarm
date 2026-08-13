@@ -22,19 +22,26 @@
  * they can be unit-tested, mirroring `dashboard/src/lib/agent-targets.ts`.
  */
 
-import { type ScmProviderId, toSelectableScmProvider } from './credentials.js';
-
 /** The narrow shape these helpers need — anything carrying the repository list. */
 interface ProjectWithRepositories {
 	repositories?: Array<{ repo: string }>;
 }
 
-/** One repository entry as the projects API reads and writes it (`ProjectRepositorySchema`). */
+/**
+ * One repository entry as the projects API reads and writes it
+ * (`ProjectRepositorySchema`).
+ *
+ * No `scm`: a project has **one** SCM provider and every repository it owns lives on
+ * it (issue #727). The field existed here between issues #700 and #727, and the
+ * credential model is what made it incoherent rather than merely unnecessary — the
+ * Source Control tab edits `credentials.scm[<project.scm>]` alone, so an overridden
+ * provider's credentials had nowhere to be entered. A stored one is ignored
+ * server-side, and a save from this screen drops it.
+ */
 export interface RepositoryEntry {
 	repo: string;
 	baseBranch?: string;
 	branchPrefix?: string;
-	scm?: ScmProviderId;
 	/**
 	 * The board card's routing token (issue #686). Authored in `swarm.config.json`
 	 * and **not editable here** — this screen only carries it through, so saving the
@@ -45,8 +52,7 @@ export interface RepositoryEntry {
 
 /**
  * One row of the General tab's repository editor. Every field is a string, so the form
- * state is exactly what its inputs render, and `scm: ''` is the row saying "whichever
- * provider the project itself names" rather than an override of its own.
+ * state is exactly what its inputs render.
  *
  * `id` is form-only and never persisted: it is the row's React key, so a reorder moves
  * the row instead of rewriting two sets of inputs. A value-derived key — the trick
@@ -58,7 +64,6 @@ export interface RepositoryForm {
 	repo: string;
 	baseBranch: string;
 	branchPrefix: string;
-	scm: ScmProviderId | '';
 	/**
 	 * Carried opaquely, never rendered (issue #686). It rides on the row rather than
 	 * being looked up at save time because a save sends the whole list positionally,
@@ -75,7 +80,7 @@ export interface RepositoryForm {
  * rather than imported, because that module's own imports reach the node-only agent-CLI
  * harness — the same reason `agent-targets.ts` restates `AGENT_CLIS`.
  */
-const NEW_REPOSITORY = { repo: '', baseBranch: 'main', branchPrefix: 'issue-', scm: '' } as const;
+const NEW_REPOSITORY = { repo: '', baseBranch: 'main', branchPrefix: 'issue-' } as const;
 
 /** A row id no row in `rows` already uses, so keys stay unique across adds and removes. */
 function nextRowId(rows: RepositoryForm[]): string {
@@ -84,10 +89,7 @@ function nextRowId(rows: RepositoryForm[]): string {
 }
 
 /**
- * The stored list projected onto editable rows. A provider override the selector cannot
- * offer — a fourth provider registered server-side but not yet in `SCM_PROVIDERS` — reads
- * as "project default" rather than being presented as a value that was never saved, the
- * same narrowing the Source Control tab applies to `project.scm`.
+ * The stored list projected onto editable rows.
  *
  * An absent or empty list yields one blank row: the schema requires at least one entry,
  * so an editor showing none would offer nothing to fix.
@@ -98,7 +100,6 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		repo: entry.repo,
 		baseBranch: entry.baseBranch ?? '',
 		branchPrefix: entry.branchPrefix ?? '',
-		scm: toSelectableScmProvider(entry.scm) ?? ('' as const),
 		...(entry.pmRoutingToken ? { pmRoutingToken: entry.pmRoutingToken } : {}),
 	}));
 	return rows.length > 0 ? rows : [{ id: '1', ...NEW_REPOSITORY }];
@@ -111,15 +112,15 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
  * #686) is the one such field: it is authored in `swarm.config.json`, has no input
  * here, and is carried straight through from the row it was read onto.
  *
- * A row left on "project default" sends no `scm` at all rather than a copy of
- * `project.scm`, so the entry keeps following the project if its provider later changes.
+ * A pre-#727 per-repository `scm` is deliberately *not* one of those: it is dropped
+ * here exactly as the server drops it on parse, so the two surfaces agree that a
+ * repository states no provider of its own.
  */
 export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 	return rows.map((row) => ({
 		repo: row.repo,
 		baseBranch: row.baseBranch,
 		branchPrefix: row.branchPrefix,
-		...(row.scm ? { scm: row.scm } : {}),
 		...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
 	}));
 }
@@ -204,8 +205,7 @@ export function areRepositoriesDirty(
 		return (
 			row.repo !== other?.repo ||
 			row.baseBranch !== other?.baseBranch ||
-			row.branchPrefix !== other?.branchPrefix ||
-			row.scm !== other?.scm
+			row.branchPrefix !== other?.branchPrefix
 		);
 	});
 }

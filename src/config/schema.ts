@@ -582,26 +582,38 @@ export const ProjectPmSchema = z.discriminatedUnion('type', [
 /**
  * One repository a project owns, with the settings that are genuinely
  * per-repository (issue #684 phase 1): the coordinates themselves, the branch
- * worktrees are cut from, the task-branch prefix, and an optional SCM-provider
- * override for a project whose repositories don't all live on the same provider.
+ * worktrees are cut from, and the task-branch prefix.
  *
- * These four fields used to sit at the top level of a project, where they were
+ * These fields used to sit at the top level of a project, where they were
  * indistinguishable from the genuinely shared settings beside them. They are the
  * entry of {@link ProjectRecordBaseSchema}'s `repositories` list now, and remain
  * flattened back onto {@link ProjectConfigBaseSchema} — the project *scoped to one
  * of its repositories*, which is what every runtime call site takes.
+ *
+ * **There is deliberately no per-repository `scm`** (issue #727). One existed
+ * between issues #684 and #727 as the obvious symmetry with `baseBranch`, and it was
+ * *incoherent*, not merely unnecessary: a project's SCM credentials are project-wide
+ * and single-provider — `credentials.scm` is resolved under `project.scm` alone
+ * (`./scm-credentials.ts`), and the dashboard's Source Control tab edits exactly that
+ * one provider's block — so a repository overriding the provider named credentials no
+ * surface could enter, and every operation scoped to it threw out of
+ * `requireScmCredential` (`./provider.ts`). A project whose repositories genuinely
+ * live on two providers is **two projects**, each with its own `repoRoot`,
+ * credentials and board mapping, which is what those models already assume. Moving
+ * credentials per repository is the prerequisite for reintroducing the field, not an
+ * afterthought to it.
+ *
+ * A stored one is **accepted and ignored**, never a parse error: this object is
+ * non-strict, so an unmigrated `swarm.config.json` — or a `repositories` row written
+ * before #727 — still parses with the key stripped, the same treatment the pre-#628
+ * `implementer` credential reference gets. A value that *differed* from `project.scm`
+ * is dropped along with the rest: the repository resolves through the project's
+ * provider, which is the only one its credentials were ever entered for. Refusing it
+ * instead would fail `swarm config apply` over a setting that could never have run.
  */
 export const ProjectRepositorySchema = z.object({
 	/** The repository this entry names, as `owner/repo`. */
 	repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
-
-	/**
-	 * The SCM provider *this repository* lives on, overriding the project-level
-	 * `scm` default so a project can span two providers. Omit it — as a
-	 * single-provider project does — and the project's own `scm` is what
-	 * `requireProjectSCMProvider` resolves.
-	 */
-	scm: ScmProviderIdSchema.optional(),
 
 	/**
 	 * The provider-native id a board card carries to claim it for **this**
@@ -667,14 +679,18 @@ export const ProjectRecordBaseSchema = z.object({
 	repositories: z.array(ProjectRepositorySchema).min(1),
 
 	/**
-	 * The SCM provider this project's repositories live on by default — the
-	 * discriminator `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`)
-	 * resolves, and the SCM twin of `pm`'s `type` (issue #478). An entry's `repo` is
-	 * the coordinates *this* provider interprets (`owner/repo`, a Bitbucket
-	 * `workspace/repo_slug`, a GitLab `namespace/project`), which is why the
-	 * discriminator is stated rather than inferred from the repo string: there is
-	 * nothing in a bare `owner/repo` to tell two providers apart. A repository that
-	 * lives elsewhere states its own `scm` and overrides this.
+	 * The SCM provider this project's repositories live on — the discriminator
+	 * `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`) resolves, and
+	 * the SCM twin of `pm`'s `type` (issue #478). An entry's `repo` is the coordinates
+	 * *this* provider interprets (`owner/repo`, a Bitbucket `workspace/repo_slug`, a
+	 * GitLab `namespace/project`), which is why the discriminator is stated rather than
+	 * inferred from the repo string: there is nothing in a bare `owner/repo` to tell two
+	 * providers apart.
+	 *
+	 * **One provider for the whole project**, every repository it owns included: a
+	 * repository states no provider of its own, and a project spanning two is expressed
+	 * as two projects (issue #727 — {@link ProjectRepositorySchema} has the reasoning,
+	 * which is the credential model rather than a missing feature).
 	 *
 	 * **Optional in shape, required in practice since issue #618.** Absence means "the
 	 * sole runtime-ready registered provider", which was the back-compat path for
@@ -752,18 +768,19 @@ export const ProjectRecordBaseSchema = z.object({
  * {@link ProjectConfigSchema} adds.
  *
  * This is the shape every runtime call site takes, and it is deliberately unchanged
- * by issue #684: the four per-repository fields are still `project.repo`,
+ * by issues #684 and #727: a call site still reads `project.repo`,
  * `project.baseBranch`, `project.branchPrefix` and `project.scm`, so the pipeline
  * phases, the triggers, the SCM provider contract and the worker keep reading a
- * project exactly as they did. What changed is where it comes from —
+ * project exactly as they did. What changed is where each comes from —
  * `scopeProjectToRepository` (`./project-repository.ts`) narrows a
- * {@link ProjectRecordSchema} down to it — and what it *cannot* carry: a scoped
- * config has no `repositories` list in it, so no call site can accidentally act on a
- * repository other than the one its task names.
+ * {@link ProjectRecordSchema} down to it, the first three off the chosen entry and
+ * `scm` off the project itself — and what it *cannot* carry: a scoped config has no
+ * `repositories` list in it, so no call site can accidentally act on a repository
+ * other than the one its task names.
  *
- * Derived by merge rather than restated so the two shapes can't drift: the entry's
- * `scm` member wins over the project-level default, which is what
- * `scopeProjectToRepository` resolves before it builds one.
+ * Derived by merge rather than restated so the two shapes can't drift. `scm` reaches
+ * it from the record half alone (issue #727): an entry declares none, so there is
+ * nothing here for one to override.
  *
  * `.pick()`/`.omit()` are `z.object` methods, and `.merge()` of two `z.object`s is
  * another — so the worker-safe projection (`./worker-config.ts`), the non-secret

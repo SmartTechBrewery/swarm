@@ -172,8 +172,10 @@ describe('projectsRepository', () => {
 			expect(project).not.toHaveProperty('repositories');
 		});
 
-		// A repository stating its own provider overrides the project-level default.
-		it("prefers the matched entry's scm over the project-level default", async () => {
+		// The read is a dumb re-join, so a row written before issue #727 still carries a
+		// per-repository `scm` in its jsonb. Nothing reads it: a project has one provider
+		// and every repository it owns resolves through `scm_type`.
+		it('ignores a pre-#727 per-repository scm left in the jsonb', async () => {
 			stubDb([
 				{
 					...row,
@@ -189,7 +191,7 @@ describe('projectsRepository', () => {
 				},
 			]);
 			const project = await findProjectByRepoFromDb('SmartTechBrewery/swarm');
-			expect(project?.scm).toBe('gitlab');
+			expect(project?.scm).toBe('github');
 		});
 
 		it('maps a null agents column to undefined (the common case: no override configured)', async () => {

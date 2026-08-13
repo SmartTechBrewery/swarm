@@ -7,11 +7,20 @@ import {
 	moveRepository,
 	patchRepository,
 	projectRepo,
+	type RepositoryEntry,
 	type RepositoryForm,
 	removeRepository,
 	toRepositoryEntries,
 	toRepositoryForms,
 } from './project-repository.js';
+
+/**
+ * A list as it may still be **stored** on a project written before issue #727 dropped
+ * the per-repository SCM provider. `RepositoryEntry` no longer models the key, so the
+ * fixture states it past the type — which is exactly the situation: the server strips
+ * it on parse, and this screen must not resurrect it.
+ */
+const PRE_727_ENTRIES = [{ repo: 'acme/first', scm: 'gitlab' }] as unknown as RepositoryEntry[];
 
 describe('projectRepo', () => {
 	it('reads the project’s repository off its list', () => {
@@ -41,24 +50,27 @@ describe('toRepositoryForms', () => {
 		expect(
 			toRepositoryForms([
 				{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-				{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' },
+				{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 			]),
 		).toEqual([
-			{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', scm: '' },
-			{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' },
+			{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+			{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 		]);
 	});
 
-	// A provider the selector doesn't offer must not be presented as a saved value; it
-	// reads as "project default", the same narrowing the Source Control tab applies.
-	it('drops a provider override the selector cannot offer', () => {
-		expect(toRepositoryForms([{ repo: 'acme/first', scm: 'gerrit' as never }])[0]?.scm).toBe('');
+	// Issue #727: a project has one SCM provider, so a row carries none. A pre-#727
+	// entry still stored on the project is ignored rather than surfacing as a value the
+	// screen cannot show — the same thing the server does with it on parse.
+	it('ignores a stored per-repository scm', () => {
+		expect(toRepositoryForms(PRE_727_ENTRIES)).toEqual([
+			{ id: '1', repo: 'acme/first', baseBranch: '', branchPrefix: '' },
+		]);
 	});
 
 	// The schema requires at least one entry, so an editor showing none would offer
 	// nothing to fix.
 	it('yields one blank row for an absent or empty list', () => {
-		const blank = { id: '1', repo: '', baseBranch: 'main', branchPrefix: 'issue-', scm: '' };
+		const blank = { id: '1', repo: '', baseBranch: 'main', branchPrefix: 'issue-' };
 		expect(toRepositoryForms(undefined)).toEqual([blank]);
 		expect(toRepositoryForms([])).toEqual([blank]);
 	});
@@ -68,28 +80,26 @@ describe('toRepositoryEntries', () => {
 	it('sends every row, in order', () => {
 		expect(
 			toRepositoryEntries([
-				{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', scm: '' },
-				{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' },
+				{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+				{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 			]),
 		).toEqual([
 			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-			{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' },
+			{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 		]);
 	});
 
-	// "Project default" must not be persisted as a copy of `project.scm`, or the entry
-	// would stop following the project when its provider changes.
-	it('omits `scm` entirely for a row left on the project default', () => {
-		const [entry] = toRepositoryEntries([
-			{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', scm: '' },
-		]);
+	// A save states no provider per repository (issue #727), so a stored one is dropped
+	// here exactly as the server drops it — the two surfaces agree on the shape.
+	it('sends no `scm`, even for a row projected from a stored one', () => {
+		const [entry] = toRepositoryEntries(toRepositoryForms(PRE_727_ENTRIES));
 		expect(entry && 'scm' in entry).toBe(false);
 	});
 
 	// The form-only React key is not part of the config.
 	it('does not send the row id', () => {
 		const [entry] = toRepositoryEntries([
-			{ id: '7', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', scm: '' },
+			{ id: '7', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
 		]);
 		expect(entry && 'id' in entry).toBe(false);
 	});
@@ -122,14 +132,14 @@ describe('toRepositoryEntries', () => {
 
 describe('repository list mutations', () => {
 	const rows: RepositoryForm[] = [
-		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', scm: '' },
-		{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' },
+		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+		{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 	];
 
 	it('appends a blank row on the project defaults, with an unused id', () => {
 		expect(addRepository(rows)).toEqual([
 			...rows,
-			{ id: '3', repo: '', baseBranch: 'main', branchPrefix: 'issue-', scm: '' },
+			{ id: '3', repo: '', baseBranch: 'main', branchPrefix: 'issue-' },
 		]);
 	});
 
@@ -170,7 +180,7 @@ describe('repository list mutations', () => {
 // check has no server-side twin — it is why Save is blocked client-side.
 describe('duplicateRepositories', () => {
 	function row(repo: string): RepositoryForm {
-		return { id: repo, repo, baseBranch: 'main', branchPrefix: 'issue-', scm: '' };
+		return { id: repo, repo, baseBranch: 'main', branchPrefix: 'issue-' };
 	}
 
 	it('names each repository more than one row claims', () => {
@@ -187,7 +197,7 @@ describe('duplicateRepositories', () => {
 describe('areRepositoriesDirty', () => {
 	const stored = [
 		{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-		{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' as const },
+		{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 	];
 
 	it('is clean for the stored list projected back onto rows', () => {

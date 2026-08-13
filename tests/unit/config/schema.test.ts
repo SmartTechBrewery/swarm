@@ -103,14 +103,24 @@ describe('ProjectRecordSchema', () => {
 		]);
 	});
 
-	it('accepts a per-repository scm override beside the project-level default', () => {
+	// Issue #727 dropped the per-repository override: a project has one SCM provider and
+	// every repository it owns lives on it. An unmigrated config must still load, so a
+	// stored `scm` is accepted and stripped rather than rejected — including one that
+	// differs from the project's, which could never have run (its credentials are
+	// resolved under `project.scm` alone and there is nowhere to enter another
+	// provider's).
+	it('accepts a stored per-repository scm and drops it, project-level one intact', () => {
 		const record = ProjectRecordSchema.parse({
 			...shared,
 			scm: 'github',
 			repositories: [{ repo: 'SmartTechBrewery/swarm', scm: 'gitlab' }],
 		});
 		expect(record.scm).toBe('github');
-		expect(record.repositories[0].scm).toBe('gitlab');
+		expect(record.repositories[0]).toEqual({
+			repo: 'SmartTechBrewery/swarm',
+			baseBranch: PROJECT_DEFAULTS.baseBranch,
+			branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+		});
 	});
 
 	it('rejects a project that owns no repository', () => {
@@ -134,7 +144,7 @@ describe('ProjectRecordSchema', () => {
 			repositories: [
 				{ repo: 'acme/one' },
 				{ repo: 'acme/two', baseBranch: 'develop', branchPrefix: 'task-' },
-				{ repo: 'acme/three', scm: 'gitlab' },
+				{ repo: 'acme/three', branchPrefix: 'work-' },
 			],
 		});
 		expect(record.repositories).toEqual([
@@ -146,9 +156,8 @@ describe('ProjectRecordSchema', () => {
 			{ repo: 'acme/two', baseBranch: 'develop', branchPrefix: 'task-' },
 			{
 				repo: 'acme/three',
-				scm: 'gitlab',
 				baseBranch: PROJECT_DEFAULTS.baseBranch,
-				branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+				branchPrefix: 'work-',
 			},
 		]);
 	});

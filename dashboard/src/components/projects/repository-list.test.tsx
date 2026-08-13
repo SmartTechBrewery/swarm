@@ -11,14 +11,12 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 		repo: 'acme/first',
 		baseBranch: 'main',
 		branchPrefix: 'issue-',
-		scm: '',
 		...overrides,
 	};
 }
 
 function renderList({
 	repositories = [row()],
-	projectScm = 'github',
 	duplicates = [] as string[],
 	isPending = false,
 	onChange = vi.fn(),
@@ -26,10 +24,9 @@ function renderList({
 	onRemove = vi.fn(),
 	onMove = vi.fn(),
 }: Partial<Parameters<typeof RepositoryList>[0]> = {}) {
-	render(
+	const { unmount } = render(
 		<RepositoryList
 			repositories={repositories}
-			projectScm={projectScm}
 			duplicates={duplicates}
 			isPending={isPending}
 			onChange={onChange}
@@ -38,12 +35,12 @@ function renderList({
 			onMove={onMove}
 		/>,
 	);
-	return { onChange, onAdd, onRemove, onMove };
+	return { onChange, onAdd, onRemove, onMove, unmount };
 }
 
 const TWO: RepositoryForm[] = [
 	row(),
-	row({ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', scm: 'gitlab' }),
+	row({ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' }),
 ];
 
 describe('RepositoryList', () => {
@@ -57,9 +54,18 @@ describe('RepositoryList', () => {
 		expect((screen.getByLabelText('Branch prefix, entry 2') as HTMLInputElement).value).toBe(
 			'work-',
 		);
-		expect(
-			(screen.getByLabelText('Source control provider, entry 2') as HTMLSelectElement).value,
-		).toBe('gitlab');
+	});
+
+	// Issue #727: a project has one SCM provider, set on the Source Control tab together
+	// with the credentials it needs. A per-row selector offered a provider whose
+	// credentials had nowhere to be entered, so the row no longer has one — and the
+	// section says where the provider does live instead.
+	it('offers no per-repository provider, and says where the project\u2019s one is set', () => {
+		renderList({ repositories: TWO });
+
+		expect(screen.queryByLabelText(/Source control provider/)).toBeNull();
+		expect(screen.queryByRole('combobox')).toBeNull();
+		expect(screen.getByText(/set on the Source Control tab/)).toBeDefined();
 	});
 
 	// Order is meaningful — the first entry is what board-driven work runs against — so the
@@ -116,32 +122,6 @@ describe('RepositoryList', () => {
 		expect(onRemove).not.toHaveBeenCalled();
 	});
 
-	// The per-entry override defaults to the project's own provider, named so the operator
-	// can see what leaving it alone means.
-	it("names the project's provider on the default option", () => {
-		renderList({ projectScm: 'bitbucket' });
-
-		expect(screen.getByRole('option', { name: 'Project default (Bitbucket Cloud)' })).toBeDefined();
-	});
-
-	// Rendered directly: `renderList`'s own default would substitute a provider for the
-	// absent one this case is about.
-	it('leaves the default option unnamed for a project that names no provider', () => {
-		render(
-			<RepositoryList
-				repositories={[row()]}
-				duplicates={[]}
-				isPending={false}
-				onChange={vi.fn()}
-				onAdd={vi.fn()}
-				onRemove={vi.fn()}
-				onMove={vi.fn()}
-			/>,
-		);
-
-		expect(screen.getByRole('option', { name: 'Project default' })).toBeDefined();
-	});
-
 	it('surfaces a duplicate repository inline', () => {
 		renderList({ repositories: TWO, duplicates: ['acme/first'] });
 
@@ -152,17 +132,7 @@ describe('RepositoryList', () => {
 	// `repoRoot` is still one checkout per project, so a second entry has a consequence the
 	// operator has to be told about — but only once it exists.
 	it('warns about the single checkout only once a second repository is listed', () => {
-		const { unmount } = render(
-			<RepositoryList
-				repositories={[row()]}
-				duplicates={[]}
-				isPending={false}
-				onChange={vi.fn()}
-				onAdd={vi.fn()}
-				onRemove={vi.fn()}
-				onMove={vi.fn()}
-			/>,
-		);
+		const { unmount } = renderList();
 		expect(screen.queryByText(/not yet fully usable/)).toBeNull();
 		unmount();
 

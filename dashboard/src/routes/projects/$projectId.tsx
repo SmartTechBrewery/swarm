@@ -306,7 +306,6 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 interface GeneralSettingsFormProps {
 	name: string;
 	repositories: RepositoryForm[];
-	projectScm?: string;
 	duplicateRepos: string[];
 	repoRoot: string;
 	worktreeRoot: string;
@@ -335,7 +334,6 @@ interface GeneralSettingsFormProps {
 export function GeneralSettingsForm({
 	name,
 	repositories,
-	projectScm,
 	duplicateRepos,
 	repoRoot,
 	worktreeRoot,
@@ -460,7 +458,6 @@ export function GeneralSettingsForm({
 
 				<RepositoryList
 					repositories={repositories}
-					projectScm={projectScm}
 					duplicates={duplicateRepos}
 					isPending={isPending}
 					onChange={handleRepositoryChange}
@@ -2322,7 +2319,6 @@ function ProjectDetailRouteComponent() {
 					<GeneralSettingsForm
 						name={name}
 						repositories={repositories}
-						projectScm={project?.scm}
 						duplicateRepos={duplicateRepos}
 						repoRoot={repoRoot}
 						worktreeRoot={worktreeRoot}

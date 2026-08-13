@@ -5,7 +5,8 @@
  * shared across its repositories stated once, plus a `repositories` list carrying
  * what is genuinely per-repository. `ProjectConfig` is that record **scoped to one
  * entry** — the shape every runtime call site already takes, with `repo`,
- * `baseBranch`, `branchPrefix` and `scm` flattened back to the top level.
+ * `baseBranch` and `branchPrefix` flattened back to the top level beside the
+ * project's own `scm`.
  *
  * Keeping the scoped shape identical to the pre-#684 project config is what makes
  * this a modelling change rather than a rewrite: no pipeline phase, trigger, SCM
@@ -71,18 +72,19 @@ export function requireProjectRepository(record: ProjectRecord, repo: string): P
  * (first) entry; naming one the project does not own throws
  * ({@link requireProjectRepository}).
  *
- * The entry's own `scm` overrides the project-level default, resolved here so
- * `requireProjectSCMProvider(project)` keeps reading a single `scm` field verbatim.
- * When neither states one, `scm` stays **absent** rather than becoming an explicit
- * `undefined` — the same care `rowToProjectConfig` takes for a `NULL` `scm_type`
- * (`src/db/repositories/projectsRepository.ts`), since "states no provider" is a
- * distinct case the registry lookup reports on.
+ * `scm` comes from the **project**, and only from there (issue #727): a repository
+ * declares no provider of its own, because the credentials one would need are
+ * project-wide and single-provider (`ProjectRepositorySchema`, `./schema.ts`). So the
+ * scoped `scm` is the record's verbatim, which is what `requireProjectSCMProvider`
+ * reads. When the project states none it stays **absent** rather than becoming an
+ * explicit `undefined` — the same care `rowToProjectConfig` takes for a `NULL`
+ * `scm_type` (`src/db/repositories/projectsRepository.ts`), since "states no provider"
+ * is a distinct case the registry lookup reports on.
  */
 export function scopeProjectToRepository(record: ProjectRecord, repo?: string): ProjectConfig {
-	const { repositories: _repositories, scm: projectScm, ...shared } = record;
+	const { repositories: _repositories, scm, ...shared } = record;
 	const entry =
 		repo === undefined ? defaultProjectRepository(record) : requireProjectRepository(record, repo);
-	const scm = entry.scm ?? projectScm;
 	return {
 		...shared,
 		repo: entry.repo,

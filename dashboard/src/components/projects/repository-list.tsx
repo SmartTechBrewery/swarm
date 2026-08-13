@@ -1,5 +1,4 @@
 import { AlertTriangle, ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
-import { SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
 import type { RepositoryForm } from '@/lib/project-repository.js';
 
 /** Input/select recipe shared with the rest of the General tab (ai/DESIGN_SYSTEM.md §4). */
@@ -12,20 +11,11 @@ const LABEL_CLASS = 'block text-xs font-medium text-zinc-400 mb-1';
 const ROW_ACTION_CLASS =
 	'p-1.5 rounded text-zinc-500 hover:bg-zinc-800/60 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
 
-/** What a row's first option calls the project's own provider, e.g. "Project default (GitHub)". */
-function projectDefaultLabel(projectScm: string | undefined): string {
-	const provider = SCM_PROVIDERS.find(({ id }) => id === projectScm);
-	// A project naming no provider predates issue #478's discriminator; one naming a
-	// provider this build doesn't offer is left unnamed rather than mislabelled.
-	return provider ? `Project default (${provider.label})` : 'Project default';
-}
-
 interface RepositoryRowProps {
 	entry: RepositoryForm;
 	index: number;
 	/** Total number of rows — the last one can't move down, or be removed at all. */
 	total: number;
-	projectScm?: string;
 	isPending: boolean;
 	onChange: (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) => void;
 	onRemove: (index: number) => void;
@@ -34,14 +24,19 @@ interface RepositoryRowProps {
 
 /**
  * One repository in the project's list: its rank, the reorder/remove actions, and the
- * four settings that are genuinely per-repository. Each field's accessible name carries
+ * three settings that are genuinely per-repository. Each field's accessible name carries
  * the rank, since a project can hold several identical-looking rows.
+ *
+ * The source-control provider is **not** among them (issue #727): it is the project's,
+ * stated once on the Source Control tab, and every repository the project owns lives on
+ * it. A per-row selector existed here between issues #700 and #727 and could not be
+ * completed — the credentials an overridden provider needs are project-wide, so there
+ * was nowhere to enter them.
  */
 function RepositoryRow({
 	entry,
 	index,
 	total,
-	projectScm,
 	isPending,
 	onChange,
 	onRemove,
@@ -99,7 +94,7 @@ function RepositoryRow({
 			</div>
 
 			<div className="grid gap-4 sm:grid-cols-2">
-				<div>
+				<div className="sm:col-span-2">
 					<label htmlFor={`${idBase}-repo`} className={LABEL_CLASS}>
 						Repository <span className="text-red-500">*</span>
 					</label>
@@ -115,26 +110,6 @@ function RepositoryRow({
 						placeholder="owner/repo"
 						className={`${FIELD_CLASS} font-mono`}
 					/>
-				</div>
-				<div>
-					<label htmlFor={`${idBase}-scm`} className={LABEL_CLASS}>
-						Source Control Provider
-					</label>
-					<select
-						id={`${idBase}-scm`}
-						aria-label={`Source control provider, entry ${rank}`}
-						value={entry.scm}
-						onChange={(e) => onChange(index, { scm: e.target.value as ScmProviderId | '' })}
-						disabled={isPending}
-						className={FIELD_CLASS}
-					>
-						<option value="">{projectDefaultLabel(projectScm)}</option>
-						{SCM_PROVIDERS.map((provider) => (
-							<option key={provider.id} value={provider.id} disabled={!provider.available}>
-								{provider.label}
-							</option>
-						))}
-					</select>
 				</div>
 				<div>
 					<label htmlFor={`${idBase}-base-branch`} className={LABEL_CLASS}>
@@ -174,8 +149,6 @@ function RepositoryRow({
 
 export interface RepositoryListProps {
 	repositories: RepositoryForm[];
-	/** The project's own `scm` — what a row left on "project default" resolves to. */
-	projectScm?: string;
 	/** Repositories more than one row claims; Save is blocked while this is non-empty. */
 	duplicates: string[];
 	isPending: boolean;
@@ -192,13 +165,12 @@ export interface RepositoryListProps {
  * work that names no repository of its own runs against — board-driven Planning and
  * Implementation — so the helper text and the "Default" badge say so rather than leaving
  * the ranking to look decorative. Everything shared by the whole project stays on its own
- * tabs: the board mapping and the PM credentials on Project Management, the SCM
- * credentials on Source Control. Only the four settings that are genuinely per-repository
- * are here.
+ * tabs: the board mapping and the PM credentials on Project Management, the SCM provider
+ * and its credentials on Source Control. Only the three settings that are genuinely
+ * per-repository are here.
  */
 export function RepositoryList({
 	repositories,
-	projectScm,
 	duplicates,
 	isPending,
 	onChange,
@@ -214,8 +186,9 @@ export function RepositoryList({
 					Every repository this project operates on, with the branch settings SWARM uses for each.
 					The first is the project's <strong className="font-semibold">default</strong>: work that
 					names no repository of its own — board-driven Planning and Implementation — runs against
-					it, so reorder the list to change which that is. A repository follows the project's own
-					source-control provider unless it names one itself.
+					it, so reorder the list to change which that is. All of them live on the project's
+					source-control provider, which is set on the Source Control tab along with its
+					credentials.
 				</p>
 			</div>
 
@@ -226,7 +199,6 @@ export function RepositoryList({
 						entry={entry}
 						index={index}
 						total={repositories.length}
-						projectScm={projectScm}
 						isPending={isPending}
 						onChange={onChange}
 						onRemove={onRemove}

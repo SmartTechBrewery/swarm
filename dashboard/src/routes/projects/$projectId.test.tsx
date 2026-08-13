@@ -1136,8 +1136,8 @@ describe('ProjectTabBar', () => {
 
 describe('GeneralSettingsForm — repository list', () => {
 	const REPOSITORIES = [
-		{ id: '1', repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-', scm: '' as const },
-		{ id: '2', repo: 'owner/second', baseBranch: 'main', branchPrefix: 'issue-', scm: '' as const },
+		{ id: '1', repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-' },
+		{ id: '2', repo: 'owner/second', baseBranch: 'main', branchPrefix: 'issue-' },
 	];
 
 	function renderForm(overrides: Partial<Parameters<typeof GeneralSettingsForm>[0]> = {}) {
@@ -1147,7 +1147,6 @@ describe('GeneralSettingsForm — repository list', () => {
 			<GeneralSettingsForm
 				name="Proj"
 				repositories={REPOSITORIES}
-				projectScm="github"
 				duplicateRepos={[]}
 				repoRoot="/repo"
 				worktreeRoot=".worktrees"
