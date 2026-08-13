@@ -58,6 +58,17 @@ interface PendingDispatch extends DispatchResultHandlers, DispatchStreamTarget {
 	interruptions: number;
 	/** When the most recent of those drops was observed. */
 	lastInterruptedAt?: Date;
+	/**
+	 * The `interruptions` count as of the last drop this dispatch was reported
+	 * restored for. A worker connects once per socket, and a live socket can be
+	 * superseded by another (a reconnect racing its predecessor's close, or a
+	 * daemon opening a second socket) without the transport ever having dropped in
+	 * between — `handleWorkerStreamOpen` runs for that new socket too, so
+	 * `noteWorkerTransportRestored` would otherwise report the same drop restored a
+	 * second time. Comparing against `interruptions` instead of a boolean survives
+	 * a drop landing while the "already restored" state is still current.
+	 */
+	restoredThroughInterruptions: number;
 }
 
 /** dispatchId → the dispatcher awaiting that dispatch's terminal result on this router. */
@@ -155,6 +166,7 @@ export function awaitDispatchResult(
 		onProgress: handlers.onProgress,
 		onAck: handlers.onAck,
 		interruptions: 0,
+		restoredThroughInterruptions: 0,
 	};
 	pending.set(dispatchId, entry);
 	if (target.runId !== undefined) byRun.set(target.runId, dispatchId);
@@ -226,15 +238,22 @@ export function noteWorkerTransportLost(workerId: string): InterruptedDispatch[]
 
 /**
  * The dispatches `workerId`'s reconnect restores output for: the ones still awaited
- * here whose transport this router already saw drop. Nothing is decremented — the
- * count is history, and it is what a later result-wait timeout is attributed to.
- * A worker whose transport never dropped while a dispatch was awaited yields
+ * here whose transport this router already saw drop and has not yet reported
+ * restored. `interruptions` itself is never decremented — the count is history, and
+ * it is what a later result-wait timeout is attributed to — but
+ * `restoredThroughInterruptions` is advanced to it here, so a socket open that
+ * follows no new drop (a live session superseded by another socket, e.g. a
+ * reconnect racing its predecessor's close) reports nothing the second time. A
+ * worker whose transport never dropped while a dispatch was awaited also yields
  * nothing, so an ordinary first connection annotates no run.
  */
 export function noteWorkerTransportRestored(workerId: string): InterruptedDispatch[] {
 	const restored: InterruptedDispatch[] = [];
 	for (const [dispatchId, entry] of pending) {
-		if (entry.workerId !== workerId || entry.interruptions === 0) continue;
+		if (entry.workerId !== workerId || entry.interruptions === entry.restoredThroughInterruptions) {
+			continue;
+		}
+		entry.restoredThroughInterruptions = entry.interruptions;
 		restored.push({ dispatchId, runId: entry.runId });
 	}
 	return restored;

@@ -9,6 +9,11 @@ import {
 import type { AcquiredSession } from '@/identity/worker-session-service.js';
 import { WorkerSessionHeldError } from '@/identity/worker-session-service.js';
 import { logger } from '@/lib/logger.js';
+import {
+	awaitDispatchResult,
+	noteWorkerTransportLost,
+	noteWorkerTransportRestored,
+} from '@/router/dispatch-results.js';
 import { isWorkerConnected, sendToWorker } from '@/router/worker-connections.js';
 import {
 	handleHandshake,
@@ -936,6 +941,41 @@ describe('GET /worker/stream transport-interruption hooks', () => {
 		expect(deps.onWorkerTransportLost).toHaveBeenCalledTimes(1);
 		expect(deps.onWorkerTransportLost).toHaveBeenCalledWith(WORKER_ID);
 		warnSpy.mockRestore();
+	});
+
+	// Review #4929792793 F1: `onOpen` fires `onWorkerTransportRestored` on *every*
+	// socket open, including one that supersedes an already-live socket with no
+	// transport loss in between (a reconnect racing its predecessor's close, or a
+	// second daemon connection). Wiring the hooks to the real
+	// `dispatch-results.ts` bookkeeping (rather than the bare mocks the other
+	// cases in this block use) is what lets this test observe whether a second,
+	// spurious restoration is reported.
+	it('does not report a second restoration when a live socket is superseded with no new drop', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH, { workerId: WORKER_ID, runId: RUN_ID });
+		const restoredCalls: unknown[][] = [];
+		const deps = makeDeps({
+			onWorkerTransportLost: vi.fn((id: string) => {
+				noteWorkerTransportLost(id);
+			}),
+			onWorkerTransportRestored: vi.fn((id: string) => {
+				restoredCalls.push(noteWorkerTransportRestored(id));
+			}),
+		});
+
+		const first = await connect(deps);
+		await first.handlers.onClose?.({}, first.ws);
+		await connect(deps);
+		// Supersedes the second socket with no intervening drop.
+		const third = await connect(deps);
+
+		expect(restoredCalls).toEqual([
+			[], // first open: transport never dropped yet
+			[{ dispatchId: DISPATCH, runId: RUN_ID }], // second open: restores the drop recorded on close
+			[], // third open: superseded `second`, but nothing dropped since it restored
+		]);
+
+		await third.handlers.onClose?.({}, third.ws);
+		awaiting.dispose();
 	});
 
 	it('still frees the lease when the lost note throws', async () => {

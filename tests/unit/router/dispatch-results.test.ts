@@ -233,6 +233,29 @@ describe('transport interruption bookkeeping', () => {
 		awaiting.dispose();
 	});
 
+	it('reports a restoration only once per drop — a superseding socket with no new drop restores nothing', () => {
+		// Review #4929792793 F1: a live socket superseded by another (a reconnect
+		// racing its predecessor's close, or a second daemon connection) calls
+		// `handleWorkerStreamOpen` again with no transport loss in between. That must
+		// not re-emit the restoration note for a dispatch already reported restored.
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		noteWorkerTransportLost(WORKER_A);
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+		// A second socket open for the same worker, with no intervening drop.
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([]);
+
+		// A fresh drop makes the dispatch reportable again.
+		noteWorkerTransportLost(WORKER_A);
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+
+		awaiting.dispose();
+	});
+
 	it('reports nothing for a worker this router is awaiting no dispatch on', () => {
 		expect(noteWorkerTransportLost(WORKER_A)).toEqual([]);
 		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([]);
