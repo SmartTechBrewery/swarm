@@ -76,6 +76,8 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		// so a stream-log from that socket is authorized (issue #544 review, F1).
 		resolveDispatchStreamTarget: vi.fn(() => ({ workerId: WORKER_ID, runId: RUN_ID })),
 		onWorkerAvailable: vi.fn(),
+		onWorkerTransportLost: vi.fn(),
+		onWorkerTransportRestored: vi.fn(),
 		...overrides,
 	};
 }
@@ -818,5 +820,137 @@ describe('GET /worker/stream connected-worker registry lifecycle', () => {
 		await handlers.onMessage({ data: JSON.stringify({ type: 'heartbeat', fencingToken: 7 }) }, ws);
 
 		expect(isWorkerConnected(WORKER_ID)).toBe(false);
+	});
+});
+
+/**
+ * Issue #723. The router is the only place that knows the moment a socket drops and
+ * the moment one opens, so it is where a transport interruption becomes legible —
+ * recorded against the dispatches awaited on that worker and noted in their runs'
+ * output streams. What the hooks *do* is the registry's and the sink's business
+ * (their own suites); what matters here is that the socket lifecycle invokes them
+ * exactly when the transport really changed state, and never at the cost of the
+ * connection.
+ */
+describe('GET /worker/stream transport-interruption hooks', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	async function connect(deps: WorkerTransportDeps) {
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+		handlers.onOpen?.({}, ws);
+		return { handlers, ws };
+	}
+
+	it('notes the restored session when an authenticated socket opens', async () => {
+		const deps = makeDeps();
+
+		const { handlers, ws } = await connect(deps);
+
+		expect(deps.onWorkerTransportRestored).toHaveBeenCalledWith(WORKER_ID);
+		expect(deps.onWorkerTransportLost).not.toHaveBeenCalled();
+		await handlers.onClose?.({}, ws);
+	});
+
+	it('notes nothing on an unauthenticated open', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+
+		handlers.onOpen?.({}, fakeWs());
+
+		expect(deps.onWorkerTransportRestored).not.toHaveBeenCalled();
+	});
+
+	// Same property the `onWorkerAvailable` test asserts: registration is what
+	// connectivity depends on and it already happened, so a note that fails must not
+	// take the socket down — nor stop the *other* open hook from running.
+	it('keeps the socket registered when the restored note throws', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			onWorkerTransportRestored: vi.fn(() => {
+				throw new Error('postgres is down');
+			}),
+		});
+
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+
+		expect(() => handlers.onOpen?.({}, ws)).not.toThrow();
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(deps.onWorkerAvailable).toHaveBeenCalledWith(WORKER_ID);
+		expect(warnSpy).toHaveBeenCalled();
+
+		await handlers.onClose?.({}, ws);
+		warnSpy.mockRestore();
+	});
+
+	it('records the interruption when the live socket closes', async () => {
+		const deps = makeDeps();
+		const { handlers, ws } = await connect(deps);
+
+		await handlers.onClose?.({}, ws);
+
+		expect(deps.onWorkerTransportLost).toHaveBeenCalledWith(WORKER_ID);
+		// The lease is still freed — the note rides alongside, it does not replace it.
+		expect(deps.releaseSession).toHaveBeenCalledWith(CREDENTIAL, 7);
+		expect(isWorkerConnected(WORKER_ID)).toBe(false);
+	});
+
+	// A reconnect that registered before the old socket's close arrived: nothing is
+	// interrupted, the worker is right here, so the run must not be told otherwise.
+	it('writes nothing for a superseded socket’s stale close', async () => {
+		const stale = makeDeps();
+		const live = makeDeps();
+
+		const first = await connect(stale);
+		const second = await connect(live);
+
+		await first.handlers.onClose?.({}, first.ws);
+
+		expect(stale.onWorkerTransportLost).not.toHaveBeenCalled();
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+
+		await second.handlers.onClose?.({}, second.ws);
+		expect(live.onWorkerTransportLost).toHaveBeenCalledWith(WORKER_ID);
+	});
+
+	// An errored socket may never deliver a clean close, so `onError` records it too —
+	// but the pair `onError` → `onClose` is one drop, and must count as one.
+	it('records one interruption for a socket that errors and then closes', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps();
+		const { handlers, ws } = await connect(deps);
+
+		handlers.onError?.(new Error('socket reset'), ws);
+		await handlers.onClose?.({}, ws);
+
+		expect(deps.onWorkerTransportLost).toHaveBeenCalledTimes(1);
+		expect(deps.onWorkerTransportLost).toHaveBeenCalledWith(WORKER_ID);
+		warnSpy.mockRestore();
+	});
+
+	it('still frees the lease when the lost note throws', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			onWorkerTransportLost: vi.fn(() => {
+				throw new Error('postgres is down');
+			}),
+		});
+		const { handlers, ws } = await connect(deps);
+
+		await expect(handlers.onClose?.({}, ws)).resolves.toBeUndefined();
+
+		expect(deps.releaseSession).toHaveBeenCalledWith(CREDENTIAL, 7);
+		expect(warnSpy).toHaveBeenCalled();
+		warnSpy.mockRestore();
 	});
 });

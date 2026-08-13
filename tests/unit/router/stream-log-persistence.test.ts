@@ -15,7 +15,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	MAX_RUN_OUTPUT_BYTES: 5_000_000,
 }));
 
-const { persistStreamLog } = await import('@/router/stream-log-persistence.js');
+const { persistControlPlaneNote, persistStreamLog, TRANSPORT_LOST_NOTE, TRANSPORT_RESTORED_NOTE } =
+	await import('@/router/stream-log-persistence.js');
 
 const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 
@@ -141,5 +142,76 @@ describe('persistStreamLog', () => {
 		const [, events] = appendRunOutputEvents.mock.calls[0] ?? [];
 		expect(events?.[0]?.emittedAt).toBeInstanceOf(Date);
 		expect(Number.isNaN(events?.[0]?.emittedAt.getTime())).toBe(false);
+	});
+});
+
+/**
+ * The control plane's own line in a run's output (issue #723). It annotates the gap
+ * it cannot fill — output is still not replayed — so what has to hold is that the
+ * note reaches the reader, in the right place relative to the real output, without
+ * the socket handler that observed the disconnect ever waiting on Postgres.
+ */
+describe('persistControlPlaneNote', () => {
+	it('appends exactly one stderr line for the run', async () => {
+		const runId = nextRunId();
+
+		persistControlPlaneNote(runId, TRANSPORT_LOST_NOTE);
+		await settle();
+
+		expect(appendRunOutputEvents).toHaveBeenCalledTimes(1);
+		const [id, events] = appendRunOutputEvents.mock.calls[0] ?? [];
+		expect(id).toBe(runId);
+		expect(events).toHaveLength(1);
+		expect(events?.[0]?.stream).toBe('stderr');
+		// Newline-terminated like every streamed line, so it renders as its own line.
+		expect(events?.[0]?.content).toBe(`${TRANSPORT_LOST_NOTE}\n`);
+		expect(events?.[0]?.emittedAt).toBeInstanceOf(Date);
+	});
+
+	// The ordering half of the AC: a note goes on the *same* per-run chain the
+	// streamed batches use, so it cannot land in the middle of a batch it did not
+	// interrupt.
+	it('queues behind an in-flight batch rather than racing it', async () => {
+		const runId = nextRunId();
+		let releaseBatch: (() => void) | undefined;
+		appendRunOutputEvents.mockImplementationOnce(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseBatch = () => resolve();
+				}),
+		);
+
+		persistStreamLog(frame(runId, 'still working'), runId);
+		persistControlPlaneNote(runId, TRANSPORT_LOST_NOTE);
+		await settle();
+
+		expect(appendRunOutputEvents).toHaveBeenCalledTimes(1);
+		releaseBatch?.();
+		await settle();
+		expect(appendRunOutputEvents).toHaveBeenCalledTimes(2);
+		expect(appendRunOutputEvents.mock.calls.map(([, events]) => events[0]?.content)).toEqual([
+			'still working\n',
+			`${TRANSPORT_LOST_NOTE}\n`,
+		]);
+	});
+
+	it('is a no-op for a dispatch with no run row', async () => {
+		persistControlPlaneNote(undefined, TRANSPORT_RESTORED_NOTE);
+		await settle();
+
+		expect(appendRunOutputEvents).not.toHaveBeenCalled();
+	});
+
+	it('swallows a failed write — a missing note must not take the socket down', async () => {
+		const runId = nextRunId();
+		appendRunOutputEvents.mockRejectedValueOnce(new Error('db down'));
+
+		expect(() => persistControlPlaneNote(runId, TRANSPORT_LOST_NOTE)).not.toThrow();
+		await settle();
+		persistStreamLog(frame(runId, 'kept'), runId);
+		await settle();
+
+		expect(appendRunOutputEvents).toHaveBeenCalledTimes(2);
+		expect(appendRunOutputEvents.mock.calls[1]?.[1][0]?.content).toBe('kept\n');
 	});
 });

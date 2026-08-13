@@ -48,6 +48,15 @@
  * timeout however well it had gone. The sink now spans sessions for that one frame
  * (a bounded, one-per-dispatch queue), so a lost session costs a window of output
  * and not the run's outcome.
+ *
+ * **What issue #723 adds is legibility, not replay.** The lost window stays lost —
+ * nothing here buffers or re-requests it — but the control plane knows the moment
+ * the socket closes and the moment one opens, so it annotates the gap it cannot
+ * fill: {@link persistControlPlaneNote} writes one line into the run's own output
+ * stream on loss and one on restore. That is what stops "working normally, output
+ * discarded" from reading exactly like "dead" — a run whose output merely stopped
+ * arriving now says so, on the same chain and in the same column as the output it
+ * interrupts.
  */
 
 import {
@@ -77,22 +86,11 @@ function parseEmittedAt(value: string): Date {
 }
 
 /**
- * Append one `stream-log` frame's lines to its run's output stream. Returns
- * immediately — the write runs on the run's chain. A frame with no `runId` (a
- * dispatch with no run row) is skipped: there is nothing to attach the rows to.
+ * Queue one append behind whatever is already writing for `runId`. The single
+ * definition of "on the run's chain", so a control-plane note and a streamed batch
+ * cannot interleave — they are the same kind of write to the same reader.
  */
-export function persistStreamLog(frame: StreamLog, runId: string | undefined): void {
-	if (!runId) {
-		logger.debug('dispatch has no run row — dropping its streamed output', {
-			dispatchId: frame.dispatchId,
-		});
-		return;
-	}
-	const events: RunOutputEventInput[] = frame.lines.map((line) => ({
-		stream: line.stream,
-		content: line.content,
-		emittedAt: parseEmittedAt(line.emittedAt),
-	}));
+function appendOnRunChain(runId: string, events: RunOutputEventInput[]): void {
 	const next: Promise<void> = (chains.get(runId) ?? Promise.resolve())
 		.then(() => appendRunOutputEvents(runId, events))
 		.catch((err) => {
@@ -106,4 +104,56 @@ export function persistStreamLog(frame: StreamLog, runId: string | undefined): v
 			if (chains.get(runId) === next) chains.delete(runId);
 		});
 	chains.set(runId, next);
+}
+
+/**
+ * Append one `stream-log` frame's lines to its run's output stream. Returns
+ * immediately — the write runs on the run's chain. A frame with no `runId` (a
+ * dispatch with no run row) is skipped: there is nothing to attach the rows to.
+ */
+export function persistStreamLog(frame: StreamLog, runId: string | undefined): void {
+	if (!runId) {
+		logger.debug('dispatch has no run row — dropping its streamed output', {
+			dispatchId: frame.dispatchId,
+		});
+		return;
+	}
+	appendOnRunChain(
+		runId,
+		frame.lines.map((line) => ({
+			stream: line.stream,
+			content: line.content,
+			emittedAt: parseEmittedAt(line.emittedAt),
+		})),
+	);
+}
+
+/**
+ * The two things the control plane has to say about a run whose output it stopped
+ * receiving (issue #723). Kept here, next to the sink that writes them, so the
+ * *user-visible* strings have one definition — the same reason `stillRunningLine`
+ * lives in `../worker/live-output.ts` rather than at its emit site, and phrased in
+ * the same plain register, since on the run page they sit in the same column.
+ */
+export const TRANSPORT_LOST_NOTE =
+	'Transport session to the worker running this phase dropped — output is paused until it reconnects.';
+export const TRANSPORT_RESTORED_NOTE = 'Transport session restored — output resumes.';
+
+/**
+ * Write one control-plane-authored line into a run's output stream. Unlike every
+ * other row in `run_output_events` this one is not the agent's — it is what the
+ * router observed *about* the run — so it goes on `stderr`, which the run page
+ * already renders as its own thing (`dashboard/.../live-output-viewer.tsx`) rather
+ * than as another line the agent printed.
+ *
+ * Ordered and non-blocking on the same terms as {@link persistStreamLog}: it queues
+ * on the run's own append chain, so it lands between the batches it actually
+ * separates rather than racing them, and it returns immediately so the socket
+ * handler that observed the disconnect never waits on Postgres. A dispatch with no
+ * run row has nothing to annotate, and a failed write is swallowed — a missing note
+ * must not take the socket down.
+ */
+export function persistControlPlaneNote(runId: string | undefined, content: string): void {
+	if (!runId) return;
+	appendOnRunChain(runId, [{ stream: 'stderr', content: `${content}\n`, emittedAt: new Date() }]);
 }

@@ -14,7 +14,10 @@
  * is awaiting what *here*. A worker that never reports (a crash or drop) is not
  * this registry's concern — the dispatcher imposes its own await timeout and the
  * durable dispatch lease reconciler (`../dispatch/reconciler.ts`) reclaims the
- * abandoned dispatch.
+ * abandoned dispatch. What *is* its concern since issue #723 is the transport
+ * interruption itself: being the one place that knows who is awaiting a given
+ * worker, it records a dropped `/worker/stream` against those dispatches, so an
+ * undelivered result can be attributed to the drop rather than to a silent worker.
  *
  * The `Map` is module-private; callers touch it only through the exported
  * functions.
@@ -51,6 +54,10 @@ export interface DispatchStreamTarget {
 
 interface PendingDispatch extends DispatchResultHandlers, DispatchStreamTarget {
 	resolve: (result: TaskExecutionResult) => void;
+	/** How many times this worker's transport dropped while this dispatch was awaited here. */
+	interruptions: number;
+	/** When the most recent of those drops was observed. */
+	lastInterruptedAt?: Date;
 }
 
 /** dispatchId → the dispatcher awaiting that dispatch's terminal result on this router. */
@@ -72,12 +79,39 @@ function unindexRun(dispatchId: string, runId: string | undefined): void {
 	if (runId !== undefined && byRun.get(runId) === dispatchId) byRun.delete(runId);
 }
 
+/**
+ * What this router observed happening to the worker's transport while it was
+ * awaiting one dispatch (issue #723). A count rather than a flag because the
+ * interesting reading is "how flaky was this session", and because a *drop* is
+ * what an undelivered result has to be attributed to — the reconnect does not
+ * undo it, so nothing here is ever decremented.
+ */
+export interface TransportInterruptions {
+	/** How many `/worker/stream` closes this router saw while awaiting the dispatch. */
+	count: number;
+	/** When the most recent one was observed; unset when there was none. */
+	lastAt?: Date;
+}
+
 /** A registered result wait — the promise to await, plus the cleanup that unregisters it. */
 export interface AwaitingDispatchResult {
 	/** Resolves with the worker's terminal `TaskExecutionResult` for this dispatch. */
 	result: Promise<TaskExecutionResult>;
+	/**
+	 * What happened to the worker's transport while this dispatch was awaited — read
+	 * through a closure over the registration rather than by exposing the map, so a
+	 * result-wait timeout can name the interruption instead of blaming the worker
+	 * for never reporting (`./dispatcher.ts`).
+	 */
+	interruptions: () => TransportInterruptions;
 	/** Remove the registration — always call it (in a `finally`) so a timed-out wait leaks nothing. */
 	dispose: () => void;
+}
+
+/** One dispatch a transport interruption applies to, and the run whose output stream annotates it. */
+export interface InterruptedDispatch {
+	dispatchId: string;
+	runId?: string;
 }
 
 /**
@@ -120,11 +154,15 @@ export function awaitDispatchResult(
 		runId: target.runId,
 		onProgress: handlers.onProgress,
 		onAck: handlers.onAck,
+		interruptions: 0,
 	};
 	pending.set(dispatchId, entry);
 	if (target.runId !== undefined) byRun.set(target.runId, dispatchId);
 	return {
 		result,
+		// Closed over *this* registration, so a superseded waiter keeps reporting the
+		// interruptions its own dispatch saw rather than the newer push's.
+		interruptions: () => ({ count: entry.interruptions, lastAt: entry.lastInterruptedAt }),
 		dispose: () => {
 			// Identity-checked, like `./worker-connections.ts`'s deregister: a superseded
 			// waiter's own `dispose` must not unregister the newer registration that
@@ -161,6 +199,45 @@ export function deliverDispatchResult(result: TaskExecutionResult): boolean {
 	unindexRun(result.dispatchId, entry.runId);
 	entry.resolve(result);
 	return true;
+}
+
+/**
+ * Record that `workerId`'s transport dropped against every dispatch this router is
+ * awaiting on it, and return those dispatches so the caller can annotate their runs
+ * (issue #723). The router knows the moment a socket closes; without this the
+ * knowledge died with the socket and a delivered-but-discarded outcome later read as
+ * a worker that never reported.
+ *
+ * Returning the entries rather than writing anything is deliberate: this module has
+ * no database dependency and must keep none — the socket handler is what owns the
+ * fire-and-forget note (`./stream-log-persistence.ts`).
+ */
+export function noteWorkerTransportLost(workerId: string): InterruptedDispatch[] {
+	const at = new Date();
+	const interrupted: InterruptedDispatch[] = [];
+	for (const [dispatchId, entry] of pending) {
+		if (entry.workerId !== workerId) continue;
+		entry.interruptions += 1;
+		entry.lastInterruptedAt = at;
+		interrupted.push({ dispatchId, runId: entry.runId });
+	}
+	return interrupted;
+}
+
+/**
+ * The dispatches `workerId`'s reconnect restores output for: the ones still awaited
+ * here whose transport this router already saw drop. Nothing is decremented — the
+ * count is history, and it is what a later result-wait timeout is attributed to.
+ * A worker whose transport never dropped while a dispatch was awaited yields
+ * nothing, so an ordinary first connection annotates no run.
+ */
+export function noteWorkerTransportRestored(workerId: string): InterruptedDispatch[] {
+	const restored: InterruptedDispatch[] = [];
+	for (const [dispatchId, entry] of pending) {
+		if (entry.workerId !== workerId || entry.interruptions === 0) continue;
+		restored.push({ dispatchId, runId: entry.runId });
+	}
+	return restored;
 }
 
 /** Route a progress frame to the awaiting dispatcher, if any (a no-op otherwise). */
