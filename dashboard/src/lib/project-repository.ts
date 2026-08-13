@@ -15,11 +15,14 @@
  * recorded instead: a run's own `repository` column (issue #691), a queued dispatch's
  * `repo`.
  *
- * The rest of this module is the General tab's list editor (phase 3): the projection
- * onto editable rows, the add/remove/reorder/patch mutations it drives, the two rules
- * the screen enforces client-side (at least one entry, no repository twice), and the
- * dirty check and payload its shared Save uses. Kept out of the route component so
- * they can be unit-tested, mirroring `dashboard/src/lib/agent-targets.ts`.
+ * The rest of this module is the list editor (phase 3): the projection onto editable
+ * rows, the add/remove/reorder/patch mutations it drives, the two rules the screen
+ * enforces client-side (at least one entry, no repository twice), and the dirty check
+ * and payload its Save uses. Kept out of the route component so they can be
+ * unit-tested, mirroring `dashboard/src/lib/agent-targets.ts`. *Where* that editor
+ * renders is not this module's concern and has moved once — the General tab in issue
+ * #700, the Source Control tab in issue #729, under the provider the repositories live
+ * on — with nothing here changing either time.
  */
 
 /** The narrow shape these helpers need — anything carrying the repository list. */
@@ -51,8 +54,8 @@ export interface RepositoryEntry {
 }
 
 /**
- * One row of the General tab's repository editor. Every field is a string, so the form
- * state is exactly what its inputs render.
+ * One row of the repository editor. Every field is a string, so the form state is
+ * exactly what its inputs render.
  *
  * `id` is form-only and never persisted: it is the row's React key, so a reorder moves
  * the row instead of rewriting two sets of inputs. A value-derived key — the trick

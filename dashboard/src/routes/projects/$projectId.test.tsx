@@ -2,6 +2,7 @@
 
 import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
+import type { RepositoryForm } from '@/lib/project-repository.js';
 import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
 
 const mockMutate = vi.fn();
@@ -67,13 +68,16 @@ import { PROJECT_TABS } from '@/lib/project-nav.js';
 import {
 	diffProjectForSync,
 	GeneralSettingsForm,
+	isConfigWriteInFlight,
 	PhaseConfigRow,
 	PhaseEnabledCell,
 	PhaseSettingsDetail,
 	PipelineSettingsForm,
 	ProjectTabBar,
 	ToggleSaveIndicator,
+	toGeneralSettingsUpdate,
 	toggleSaveKey,
+	toRepositoriesUpdate,
 	useToggleAutoSave,
 } from './$projectId.js';
 
@@ -1004,6 +1008,7 @@ describe('diffProjectForSync', () => {
 	it('reports every slice changed on the first sync (no previous project)', () => {
 		expect(diffProjectForSync(undefined, makeProject())).toEqual({
 			general: true,
+			repositories: true,
 			agents: true,
 			pipeline: true,
 			boardMapping: true,
@@ -1015,6 +1020,7 @@ describe('diffProjectForSync', () => {
 		const next = makeProject({ agents: { defaults: {} }, pipeline: { review: { enabled: true } } });
 		expect(diffProjectForSync(prev, next)).toEqual({
 			general: false,
+			repositories: false,
 			agents: false,
 			pipeline: false,
 			boardMapping: false,
@@ -1035,6 +1041,7 @@ describe('diffProjectForSync', () => {
 		});
 		expect(diffProjectForSync(prev, next)).toEqual({
 			general: false,
+			repositories: false,
 			agents: false,
 			pipeline: true,
 			boardMapping: false,
@@ -1053,9 +1060,11 @@ describe('diffProjectForSync', () => {
 		expect(diffProjectForSync(prev, next)).toMatchObject({ general: true, pipeline: false });
 	});
 
-	// The General tab's repository list re-seeds off this flag, so a repository added or
-	// reordered elsewhere has to reach the form (issue #684 phase 3).
-	it('flags general when the repository list changed', () => {
+	// The Source Control tab's repository list re-seeds off this flag, so a repository added
+	// or reordered elsewhere has to reach the form (issue #684 phase 3). It is its **own**
+	// slice since issue #729: the list and the Settings form are two independent saves, so
+	// each one's success refetch must not reset the other's unsaved edits.
+	it('flags repositories alone when the repository list changed', () => {
 		const prev = makeProject();
 		const added = makeProject({
 			repositories: [
@@ -1063,8 +1072,28 @@ describe('diffProjectForSync', () => {
 				{ repo: 'owner/second', baseBranch: 'main', branchPrefix: 'issue-' },
 			],
 		});
-		expect(diffProjectForSync(prev, added)).toMatchObject({ general: true, agents: false });
-		expect(diffProjectForSync(added, prev)).toMatchObject({ general: true, agents: false });
+		expect(diffProjectForSync(prev, added)).toMatchObject({
+			repositories: true,
+			general: false,
+			agents: false,
+		});
+		expect(diffProjectForSync(added, prev)).toMatchObject({
+			repositories: true,
+			general: false,
+			agents: false,
+		});
+	});
+
+	// The reverse half: a Settings save changes `name`/`repoRoot`/`worktreeRoot`/
+	// `maxConcurrentJobs` only, so an unsaved repository edit survives its refetch.
+	it('leaves the repositories slice alone when only a Settings field changed', () => {
+		const prev = makeProject({ repoRoot: '/repo' });
+		const next = makeProject({ repoRoot: '/elsewhere' });
+
+		expect(diffProjectForSync(prev, next)).toMatchObject({
+			general: true,
+			repositories: false,
+		});
 	});
 
 	// Issue #642: a PM provider switch is a multi-step draft (credentials, board, status
@@ -1094,6 +1123,82 @@ describe('diffProjectForSync', () => {
 			agents: true,
 			boardMapping: false,
 		});
+	});
+});
+
+describe('isConfigWriteInFlight', () => {
+	const idle = {
+		updateMutationPending: false,
+		savingToggleKey: undefined,
+		providerWriteInFlight: false,
+	};
+
+	it('reads false when nothing is writing', () => {
+		expect(isConfigWriteInFlight(idle)).toBe(false);
+	});
+
+	it('reads true while the Save-Changes flow is pending', () => {
+		expect(isConfigWriteInFlight({ ...idle, updateMutationPending: true })).toBe(true);
+	});
+
+	it('reads true while an Agents-tab toggle auto-save is pending', () => {
+		expect(isConfigWriteInFlight({ ...idle, savingToggleKey: 'review:enabled' })).toBe(true);
+	});
+
+	// Issue #734: the Source Control tab's SCM provider select writes `projects.update`
+	// directly, outside `updateMutation` — this is the gate's new input pinning that it is
+	// not missed, the way it was before the fix (F1).
+	it('reads true while the Source Control tab’s provider mutation is pending', () => {
+		expect(isConfigWriteInFlight({ ...idle, providerWriteInFlight: true })).toBe(true);
+	});
+});
+
+// Issue #734 (F3): the split lived entirely in two inline, unexported route closures —
+// re-adding `repositories` to the Settings payload (the exact lost-update regression
+// this PR removes) would have kept every test green. Exporting the two payload builders
+// pins the shape of each save so that regression fails here instead.
+describe('toGeneralSettingsUpdate', () => {
+	it('sends only project identity and host layout — never repositories', () => {
+		const update = toGeneralSettingsUpdate('p1', {
+			name: 'Proj',
+			repoRoot: '/repo',
+			worktreeRoot: '.worktrees',
+			maxConcurrentJobs: 2,
+		});
+
+		expect(update).toEqual({
+			id: 'p1',
+			name: 'Proj',
+			repoRoot: '/repo',
+			worktreeRoot: '.worktrees',
+			maxConcurrentJobs: 2,
+		});
+		expect(update).not.toHaveProperty('repositories');
+	});
+});
+
+describe('toRepositoriesUpdate', () => {
+	const rows: RepositoryForm[] = [
+		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+	];
+
+	it('sends only id and repositories — never the Settings fields', () => {
+		const update = toRepositoriesUpdate('p1', rows, []);
+
+		expect(update && Object.keys(update).sort()).toEqual(['id', 'repositories']);
+		expect(update).toEqual({
+			id: 'p1',
+			repositories: [{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' }],
+		});
+	});
+
+	// The one list rule with no server-side twin: Save is disabled on a duplicate
+	// repository, and this is the guard behind that — belt-and-braces against an
+	// Enter-to-submit bypassing the disabled button (the Agents tab's duplicate-CLI
+	// check uses the same pattern). Previously only reachable through the already-disabled
+	// Save button in `repositories-panel.test.tsx`, so the guard itself went unexercised.
+	it('refuses to build an update while a repository is listed twice', () => {
+		expect(toRepositoriesUpdate('p1', rows, ['acme/first'])).toBeNull();
 	});
 });
 
@@ -1134,20 +1239,13 @@ describe('ProjectTabBar', () => {
 	});
 });
 
-describe('GeneralSettingsForm — repository list', () => {
-	const REPOSITORIES = [
-		{ id: '1', repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-' },
-		{ id: '2', repo: 'owner/second', baseBranch: 'main', branchPrefix: 'issue-' },
-	];
-
+describe('GeneralSettingsForm', () => {
 	function renderForm(overrides: Partial<Parameters<typeof GeneralSettingsForm>[0]> = {}) {
 		const handleSubmit = vi.fn((e: React.FormEvent) => e.preventDefault());
 		const handleReset = vi.fn();
 		render(
 			<GeneralSettingsForm
 				name="Proj"
-				repositories={REPOSITORIES}
-				duplicateRepos={[]}
 				repoRoot="/repo"
 				worktreeRoot=".worktrees"
 				maxConcurrentJobs="1"
@@ -1155,10 +1253,6 @@ describe('GeneralSettingsForm — repository list', () => {
 				setRepoRoot={() => {}}
 				setWorktreeRoot={() => {}}
 				setMaxConcurrentJobs={() => {}}
-				handleRepositoryChange={() => {}}
-				handleAddRepository={() => {}}
-				handleRemoveRepository={() => {}}
-				handleMoveRepository={() => {}}
 				handleInputChange={() => () => {}}
 				handleSubmit={handleSubmit}
 				handleReset={handleReset}
@@ -1172,31 +1266,27 @@ describe('GeneralSettingsForm — repository list', () => {
 		return { handleSubmit, handleReset };
 	}
 
-	// The three single inputs the tab used to bind to `repositories[0]` are gone; the list
-	// editor is what the tab renders now.
-	it('renders the list instead of a single Repository/Base branch/Branch prefix trio', () => {
+	// Issue #729: the repository list is configured on the Source Control tab, beneath the
+	// provider those repositories live on. What is left here is project identity and host
+	// layout — and it is still all here, so the tab is not left half-empty.
+	it('keeps project identity and host layout, and renders no repository editor', () => {
 		renderForm();
 
-		expect(screen.getByLabelText('Repository, entry 1')).toBeDefined();
-		expect(screen.getByLabelText('Repository, entry 2')).toBeDefined();
-		// The old single-field ids, which a stale binding would still produce.
+		// `getByLabelText` throws if the field is missing, unlike
+		// `getElementById(...).toBeDefined()` — which is `true` even for `null` and so
+		// would stay green if the move ever took a Settings field along with it.
+		expect(screen.getByLabelText(/^Name/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Local Repository Root/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Worktree Directory/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Maximum Concurrent Jobs/)).toBeTruthy();
+
+		// Neither the list editor nor the pre-#684 single-field trio it replaced.
+		expect(screen.queryByLabelText('Repository, entry 1')).toBeNull();
+		expect(screen.queryByLabelText('Add repository')).toBeNull();
+		expect(screen.queryByText('Repositories')).toBeNull();
 		expect(document.getElementById('repo')).toBeNull();
 		expect(document.getElementById('baseBranch')).toBeNull();
 		expect(document.getElementById('branchPrefix')).toBeNull();
-		// The project-wide fields stay exactly where they were.
-		expect(document.getElementById('repoRoot')).toBeDefined();
-		expect(document.getElementById('worktreeRoot')).toBeDefined();
-	});
-
-	// A repository listed twice is the one rule with no server-side twin, so it blocks Save
-	// even though the form is otherwise dirty and valid.
-	it('blocks Save on a duplicate repository, and Enter-to-submit with it', () => {
-		const { handleSubmit } = renderForm({ duplicateRepos: ['owner/repo'] });
-
-		const save = screen.getByRole('button', { name: 'Save Changes' });
-		expect(save).toHaveProperty('disabled', true);
-		fireEvent.click(save);
-		expect(handleSubmit).not.toHaveBeenCalled();
 	});
 
 	it('offers Save and Reset once the form is dirty, and neither while it is not', () => {
@@ -1212,14 +1302,10 @@ describe('GeneralSettingsForm — repository list', () => {
 		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', true);
 	});
 
-	// The tab's existing banner is where a repository another project owns surfaces —
-	// `projects.update` answers that with a CONFLICT rather than the client pre-checking it.
-	it("renders the server's repository conflict in its error banner", () => {
-		renderForm({ isError: true, errorMessage: 'Project ID or repository already exists' });
+	it('renders a failed save in its error banner', () => {
+		renderForm({ isError: true, errorMessage: 'Boom' });
 
-		expect(
-			screen.getByText(/Failed to save settings: Project ID or repository already exists/),
-		).toBeDefined();
+		expect(screen.getByText(/Failed to save settings: Boom/)).toBeDefined();
 	});
 });
 
