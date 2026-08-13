@@ -788,15 +788,20 @@ export interface WorkerTransportOptions {
 	 */
 	onAssignment?: (assignment: TaskAssignment, sink: AssignmentSink) => void;
 	/**
-	 * Called when the control plane pushes a `task-cancel` frame for an assignment
-	 * this daemon is running (issue #549) — the transport delivery of the
-	 * dashboard's Terminate action, which a worker with no `REDIS_URL` cannot learn
-	 * about any other way. The handler aborts the matching in-flight run
-	 * (`cancelAssignment`, `./assignment-execution.ts`); both executing entrypoints
-	 * supply it. Left undefined the frame is logged and ignored, which is exactly
-	 * how a daemon predating the frame behaves.
+	 * Called when the control plane pushes a `task-cancel` frame (issue #549) — the
+	 * transport delivery of the dashboard's Terminate action, which a worker with no
+	 * `REDIS_URL` cannot learn about any other way. The handler aborts the matching
+	 * in-flight run (`cancelAssignment`, `./assignment-execution.ts`).
+	 *
+	 * **The frame is a question, not only an abort** (issue #724): only this daemon
+	 * knows whether the phase is still executing here, so the handler answers a cancel
+	 * it cannot apply through the supplied {@link AssignmentSink} — with the terminal
+	 * cancelled result, which settles the run as the user termination it is instead of
+	 * leaving it on the control plane's back-channel timer. That is why it is handed
+	 * the same sink an assignment gets. Left undefined the frame is logged and ignored,
+	 * which is exactly how a daemon predating the frame behaves.
 	 */
-	onCancel?: (cancel: TaskCancel) => void;
+	onCancel?: (cancel: TaskCancel, sink: AssignmentSink) => void;
 	/**
 	 * Called with each established session, before the stream opens — the only place
 	 * a daemon learns the `workerId` it authenticates as, since the credential does
@@ -1134,6 +1139,11 @@ function notifySession(
  * and runs nothing: an unhandled frame is logged and ignored, never an error.
  * `heartbeat-ack` falls through with no action.
  *
+ * Either frame is answered from the undelivered queue first when this daemon still
+ * holds that dispatch's terminal result: an assignment because re-reporting beats
+ * re-running the phase (issue #718), a cancellation because the real outcome beats
+ * the synthetic cancellation (issue #724).
+ *
  * Module-level rather than inline in the socket's `message` listener so that
  * listener stays a flat frame switch as frames are added.
  */
@@ -1166,6 +1176,24 @@ function routeWorkFrame(
 		return;
 	}
 	if (frame.type === 'task-cancel') {
+		// This daemon already ran the phase and still holds its real outcome, so the
+		// cancellation is answered with *that* rather than with the synthetic one the
+		// handler would build (issue #724): a Terminate arriving after the phase actually
+		// finished settles the run on its true outcome. Consuming the held frame here
+		// cannot lose it — `send` re-holds it if the write fails.
+		const held = sink.takeUndelivered(frame.dispatchId);
+		if (held) {
+			logger.warn(
+				'answering a task-cancel with the phase result the control plane never received',
+				{
+					dispatchId: frame.dispatchId,
+					runId: frame.runId,
+					status: held.status,
+				},
+			);
+			sink.send(held);
+			return;
+		}
 		if (!options.onCancel) {
 			logger.info('ignoring task-cancel — this client runs no assignments', {
 				dispatchId: frame.dispatchId,
@@ -1173,7 +1201,7 @@ function routeWorkFrame(
 			});
 			return;
 		}
-		options.onCancel(frame);
+		options.onCancel(frame, sink);
 	}
 }
 

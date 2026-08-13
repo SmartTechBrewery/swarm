@@ -330,18 +330,31 @@ export type TaskAssignment = z.infer<typeof TaskAssignmentSchema>;
  * {@link DisconnectSchema}'s is, and never becomes the run's terminal message —
  * the control plane owns that wording (`RUN_CANCELLED_MESSAGE`).
  *
+ * **Since issue #724 the frame is a question the worker answers, not only an
+ * abort**, which is why it names the phase and task it is cancelling. A cancel for
+ * a dispatch that is *not* executing on the receiving worker is answered with a
+ * terminal {@link TaskExecutionResultSchema} (`failed` + `cancelled: true`), and
+ * that frame requires `phase`/`taskId` — which a cancel had no way to supply. They
+ * are filled by the pushing side, which recorded both when it registered the result
+ * wait (`../router/dispatch-results.ts`).
+ *
  * Additive, so `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: a
  * daemon that predates the frame does not recognise it, and an unrecognised
  * control frame is a logged no-op there rather than a closed socket
  * (`./worker-client.ts`). A version skew therefore costs only the promptness this
  * frame buys — the durable marker still settles the run — whereas a bump would
- * reject every frame from an already-deployed worker.
+ * reject every frame from an already-deployed worker. The two fields are additive
+ * on the same terms and so are **optional**, in both directions: an older control
+ * plane omits them and the worker keeps its log-only behaviour rather than sending
+ * a malformed result, and an older worker ignores fields it does not read.
  */
 export const TaskCancelSchema = z.object({
 	type: z.literal('task-cancel'),
 	dispatchId: z.string().uuid(),
 	runId: z.string().uuid().optional(),
 	reason: z.string().optional(),
+	phase: TaskPhaseSchema.optional(),
+	taskId: z.string().min(1).optional(),
 });
 export type TaskCancel = z.infer<typeof TaskCancelSchema>;
 

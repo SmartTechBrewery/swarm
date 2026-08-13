@@ -1028,12 +1028,23 @@ export const runsRouter = router({
 	// (`requestRunCancellation`) and notifies the worker, then handles the two
 	// live states:
 	//
-	//  - `running`: the worker is executing the agent. The published notification
-	//    (and, failing that, the worker's own start-check against the durable set)
-	//    aborts the run via its `AbortSignal`, and the phase settles the row as
-	//    `failed` with the user-termination reason. We don't write the row here —
-	//    the worker owns an in-flight run's terminal state — so we report
-	//    `terminating` and let the UI poll for the settle.
+	//  - `running`: the published notification reaches the worker as a pushed
+	//    `task-cancel` (`src/router/dispatch-cancellation.ts`, issue #549) and the
+	//    worker answers it. If the phase is still executing there it aborts via its
+	//    `AbortSignal` and settles the row `failed` with the user-termination reason;
+	//    if it is *not* — it already finished, or this daemon restarted — the worker
+	//    answers the frame with the same terminal cancelled result rather than
+	//    ignoring it (issue #724), and re-reports the real outcome instead when it
+	//    still holds one undelivered. Either way we don't write the row here: the
+	//    worker owns an in-flight run's terminal state, and it is the only party that
+	//    knows which of those two it is. So we report `terminating` and let the UI
+	//    poll for a settle that now arrives within a round trip rather than at the
+	//    `timeoutMs + RESULT_WAIT_MARGIN_MS` lease-window boundary.
+	//
+	//    The one case that still waits it out is a worker whose transport is down:
+	//    nothing can be pushed to it, and the phase may genuinely still be executing
+	//    there, so writing the row from here would take the terminal state away from
+	//    its owner. Issue #719 is what shortens that.
 	//
 	//  - `deferred`: no agent is running; a delayed BullMQ retry job is waiting.
 	//    Remove that job so nothing resurrects the run, then atomically flip the

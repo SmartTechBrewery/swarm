@@ -1154,7 +1154,7 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 
 	// Issue #549: the control plane delivers a user termination as a pushed frame,
 	// because a DB-free daemon has no Redis to read the durable marker from.
-	it('hands a task-cancel frame to the registered onCancel handler', async () => {
+	it('hands a task-cancel frame and the sink to the registered onCancel handler', async () => {
 		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
 		const onCancel = vi.fn();
 		const client = connectWorkerTransport(
@@ -1169,12 +1169,69 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 			dispatchId: DISPATCH_ID,
 			runId: RUN_ID,
 			reason: 'a cancellation was requested for this run',
+			phase: 'implementation',
+			taskId: '718',
 		});
 
 		expect(onCancel).toHaveBeenCalledTimes(1);
 		expect(onCancel).toHaveBeenCalledWith(
-			expect.objectContaining({ type: 'task-cancel', dispatchId: DISPATCH_ID, runId: RUN_ID }),
+			expect.objectContaining({
+				type: 'task-cancel',
+				dispatchId: DISPATCH_ID,
+				runId: RUN_ID,
+				phase: 'implementation',
+				taskId: '718',
+			}),
+			// The sink is what lets the handler *answer* a cancel it cannot apply
+			// (issue #724).
+			expect.objectContaining({ send: expect.any(Function) }),
 		);
+		await client.stop();
+	});
+
+	// Issue #724: a Terminate arriving after the phase actually finished must settle
+	// the run on its true outcome, not on a synthetic cancellation.
+	it('answers a task-cancel with the real result it still holds, without calling onCancel', async () => {
+		fetch.mockResolvedValue(jsonResponse(200, handshakeResponseBody(4)));
+		const onCancel = vi.fn();
+		let sink: AssignmentSink | undefined;
+		const client = connectWorkerTransport(
+			{
+				...options,
+				capabilities: ['claude'],
+				onCancel,
+				onAssignment: (_assignment, assignmentSink) => {
+					sink = assignmentSink;
+				},
+			},
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+
+		// The peer is gone but the socket has not closed yet, so the write throws and the
+		// succeeded result is held rather than counted as delivered.
+		sockets[0].send = () => {
+			throw new Error('write after end');
+		};
+		sink?.send(resultFrame());
+
+		const written: unknown[] = [];
+		sockets[0].send = (data: string) => {
+			written.push(JSON.parse(data));
+		};
+		sockets[0].emitMessage({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			phase: 'implementation',
+			taskId: '718',
+		});
+
+		expect(written).toEqual([resultFrame()]);
+		expect(onCancel).not.toHaveBeenCalled();
+
 		await client.stop();
 	});
 

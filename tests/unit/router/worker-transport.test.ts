@@ -951,7 +951,12 @@ describe('GET /worker/stream transport-interruption hooks', () => {
 	// cases in this block use) is what lets this test observe whether a second,
 	// spurious restoration is reported.
 	it('does not report a second restoration when a live socket is superseded with no new drop', async () => {
-		const awaiting = awaitDispatchResult(DISPATCH, { workerId: WORKER_ID, runId: RUN_ID });
+		const awaiting = awaitDispatchResult(DISPATCH, {
+			workerId: WORKER_ID,
+			runId: RUN_ID,
+			phase: 'implementation',
+			taskId: '407',
+		});
 		const restoredCalls: unknown[][] = [];
 		const deps = makeDeps({
 			onWorkerTransportLost: vi.fn((id: string) => {

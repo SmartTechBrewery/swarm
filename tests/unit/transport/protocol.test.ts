@@ -390,12 +390,36 @@ describe('transport protocol schemas', () => {
 				dispatchId: DISPATCH_ID,
 				runId: '55555555-5555-4555-8555-555555555555',
 				reason: 'a cancellation was requested for this run',
+				// What the worker answers an unappliable cancel with (issue #724) — a
+				// terminal result frame names both.
+				phase: 'review' as const,
+				taskId: '724',
 			};
 			expect(ControlPlaneMessageSchema.parse(frame)).toEqual(frame);
 			// `runId`/`reason` are correlation and log context — a bare cancel is valid.
 			expect(
 				ControlPlaneMessageSchema.parse({ type: 'task-cancel', dispatchId: DISPATCH_ID }),
 			).toEqual({ type: 'task-cancel', dispatchId: DISPATCH_ID });
+		});
+
+		// The #724 fields are additive in both directions, which is why
+		// `TRANSPORT_PROTOCOL_VERSION` stays put: an older control plane omits them (and
+		// the worker keeps its log-only behaviour), an older worker ignores them.
+		it('parses a task-cancel that predates the phase/task it now names', () => {
+			const old = {
+				type: 'task-cancel' as const,
+				dispatchId: DISPATCH_ID,
+				runId: '55555555-5555-4555-8555-555555555555',
+				reason: 'a cancellation was requested for this run',
+			};
+			const parsed = TaskCancelSchema.parse(old);
+			expect(parsed).toEqual(old);
+			expect(parsed.phase).toBeUndefined();
+			expect(parsed.taskId).toBeUndefined();
+			// An empty task id is not "absent" — it could never build a valid result frame.
+			expect(TaskCancelSchema.safeParse({ ...old, phase: 'review', taskId: '' }).success).toBe(
+				false,
+			);
 		});
 
 		it('rejects a task-cancel without the dispatch it names', () => {

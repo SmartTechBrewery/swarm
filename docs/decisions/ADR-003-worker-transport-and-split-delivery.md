@@ -92,7 +92,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -367,6 +367,25 @@ server-side store) it needs:
    Honest attribution of that second case, and operator-visible liveness, are issue
    #718's phase 2; Terminate settling a run whose phase is no longer executing is its
    phase 3.
+
+   That phase 3 (**#724**) makes the `task-cancel` frame a **question the worker
+   answers** rather than only an abort it applies. The worker is the only party that
+   knows whether the phase is still executing there, so a cancel for a dispatch that
+   is not — it already finished, or the daemon restarted — is settled with the same
+   terminal `failed` + `cancelled: true` result an in-flight cancellation produces
+   (`handleTaskCancel`, `src/transport/assignment-execution.ts`), and one whose real
+   terminal result is still held undelivered re-reports *that* instead, so a Terminate
+   arriving after the phase finished settles the run on its true outcome. The frame
+   therefore gained optional `phase`/`taskId` — a terminal result requires both, and
+   the pushing side records them at registration (`src/router/dispatch-results.ts`) —
+   which is additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` stays put: an
+   older control plane omits them and the worker keeps its log-only behaviour rather
+   than sending a malformed frame. No new settle path and no new router policy: the
+   answer rides `deliverDispatchResult` → `adaptResultToPhaseRun` → `RunTerminatedError`
+   → the shared settle, and a dispatch the router is no longer awaiting drops the frame,
+   so the answer can never settle an unrelated attempt. What still waits out the lease
+   window is a worker whose transport is down — nothing can be pushed to it and its
+   phase may genuinely still be running, which is issue #719's problem, not this one's.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

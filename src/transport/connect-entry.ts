@@ -240,8 +240,9 @@ async function main(): Promise<void> {
 		},
 		// The only channel a user termination has to this daemon (issue #549): it
 		// holds no `REDIS_URL`, so it cannot read the durable cancellation marker the
-		// dashboard writes — the control plane pushes the frame instead.
-		onCancel: (cancel) => handleTaskCancel(cancel, logger),
+		// dashboard writes — the control plane pushes the frame instead. The sink is
+		// what lets the handler *answer* a cancel it cannot apply (issue #724).
+		onCancel: (cancel, sink) => handleTaskCancel(cancel, sink, logger),
 		// The handshake is the only place this daemon learns which worker it
 		// authenticates as, so it is where the checkout lock stops naming a bare pid:
 		// a second daemon's refusal can then name the *worker* holding it (issue #689).

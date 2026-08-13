@@ -17,8 +17,15 @@ const DISPATCH_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 /** What the control plane recorded when it pushed each dispatch (issue #544 review, F1). */
 const WORKER_A = 'aaaaaaaa-0000-4000-8000-000000000001';
 const WORKER_B = 'bbbbbbbb-0000-4000-8000-000000000002';
-const TARGET_A = { workerId: WORKER_A, runId: 'run-a' };
-const TARGET_B = { workerId: WORKER_B, runId: 'run-b' };
+// Phase/task ride along since issue #724: a pushed `task-cancel` states them, so
+// the registration is where they are recorded.
+const TARGET_A = {
+	workerId: WORKER_A,
+	runId: 'run-a',
+	phase: 'implementation' as const,
+	taskId: '407',
+};
+const TARGET_B = { workerId: WORKER_B, runId: 'run-b', phase: 'review' as const, taskId: '408' };
 
 function result(dispatchId: string): TaskExecutionResult {
 	return {
@@ -95,10 +102,16 @@ describe('dispatch result correlation registry', () => {
 	});
 
 	it('a re-registration for the same dispatch unblocks the superseded waiter', async () => {
-		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const first = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, phase: 'review', taskId: '724' });
 		const second = awaitDispatchResult(DISPATCH_A, TARGET_A);
-		// The earlier waiter must not hang forever — it settles as a benign deferral.
-		await expect(first.result).resolves.toMatchObject({ status: 'deferred' });
+		// The earlier waiter must not hang forever — it settles as a benign deferral,
+		// naming the phase and task its *own* registration recorded (issue #724) rather
+		// than the placeholder that stood in before the entry carried them.
+		await expect(first.result).resolves.toMatchObject({
+			status: 'deferred',
+			phase: 'review',
+			taskId: '724',
+		});
 		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
 		await expect(second.result).resolves.toMatchObject({ status: 'succeeded' });
 		first.dispose();
@@ -115,7 +128,7 @@ describe('resolveDispatchStreamTarget', () => {
 	it('returns the worker and run recorded at registration', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 
-		expect(resolveDispatchStreamTarget(DISPATCH_A)).toEqual(TARGET_A);
+		expect(resolveDispatchStreamTarget(DISPATCH_A)).toEqual({ workerId: WORKER_A, runId: 'run-a' });
 
 		awaiting.dispose();
 	});
@@ -137,12 +150,16 @@ describe('resolveDispatchStreamTarget', () => {
  * cancel at whoever happens to hold the id now.
  */
 describe('resolveDispatchTargetForRun', () => {
-	it('resolves a run to the dispatch pushed for it and the worker it went to', () => {
+	it('resolves a run to the dispatch pushed for it, the worker, and the phase it named', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 
+		// Phase/task come from the registration (issue #724) — a `task-cancel` states
+		// them so the worker can answer one it cannot apply with a terminal result.
 		expect(resolveDispatchTargetForRun('run-a')).toEqual({
 			dispatchId: DISPATCH_A,
 			workerId: WORKER_A,
+			phase: 'implementation',
+			taskId: '407',
 		});
 
 		awaiting.dispose();
@@ -162,14 +179,16 @@ describe('resolveDispatchTargetForRun', () => {
 	});
 
 	it('a re-push keeps the run pointed at the live registration', () => {
-		const first = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_A, runId: 'run-a' });
-		const second = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_B, runId: 'run-a' });
+		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const second = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
 		// The superseded waiter's own cleanup must not unregister the newer push.
 		first.dispose();
 
 		expect(resolveDispatchTargetForRun('run-a')).toEqual({
 			dispatchId: DISPATCH_A,
 			workerId: WORKER_B,
+			phase: 'implementation',
+			taskId: '407',
 		});
 
 		second.dispose();
@@ -177,7 +196,7 @@ describe('resolveDispatchTargetForRun', () => {
 	});
 
 	it('indexes nothing for a dispatch that opened no run row', () => {
-		const awaiting = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_A });
+		const awaiting = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, runId: undefined });
 
 		expect(resolveDispatchStreamTarget(DISPATCH_A)).toEqual({ workerId: WORKER_A });
 		expect(resolveDispatchTargetForRun(DISPATCH_A)).toBeUndefined();
@@ -285,7 +304,7 @@ describe('transport interruption bookkeeping', () => {
 	});
 
 	it('reports a dispatch with no run row, so the count still reaches the failure', () => {
-		const awaiting = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_A });
+		const awaiting = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, runId: undefined });
 
 		expect(noteWorkerTransportLost(WORKER_A)).toEqual([
 			{ dispatchId: DISPATCH_A, runId: undefined },

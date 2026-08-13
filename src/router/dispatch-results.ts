@@ -27,6 +27,7 @@ import { logger } from '../lib/logger.js';
 import type {
 	TaskAssignmentAck,
 	TaskExecutionResult,
+	TaskPhase,
 	TaskProgress,
 } from '../transport/protocol.js';
 
@@ -52,7 +53,26 @@ export interface DispatchStreamTarget {
 	runId?: string;
 }
 
-interface PendingDispatch extends DispatchResultHandlers, DispatchStreamTarget {
+/**
+ * Everything this router recorded about a dispatch when it registered the result
+ * wait: the {@link DispatchStreamTarget} a durable write is authorized against,
+ * plus the phase and task the pushed assignment named.
+ *
+ * Those last two are here because a `task-cancel` has to carry them (issue #724):
+ * a worker that answers a cancel it cannot apply answers with a terminal result
+ * frame, and `TaskExecutionResultSchema` requires both. Recorded rather than
+ * re-derived — the dispatcher holds them on the trigger it composed the assignment
+ * from, and nothing else on this router still has them by the time a cancellation
+ * arrives.
+ */
+export interface DispatchRegistration extends DispatchStreamTarget {
+	/** The pipeline phase the pushed assignment names. */
+	phase: TaskPhase;
+	/** The SCM-derived task id the pushed assignment names. */
+	taskId: string;
+}
+
+interface PendingDispatch extends DispatchResultHandlers, DispatchRegistration {
 	resolve: (result: TaskExecutionResult) => void;
 	/** How many times this worker's transport dropped while this dispatch was awaited here. */
 	interruptions: number;
@@ -134,7 +154,7 @@ export interface InterruptedDispatch {
  */
 export function awaitDispatchResult(
 	dispatchId: string,
-	target: DispatchStreamTarget,
+	target: DispatchRegistration,
 	handlers: DispatchResultHandlers = {},
 ): AwaitingDispatchResult {
 	const existing = pending.get(dispatchId);
@@ -147,9 +167,10 @@ export function awaitDispatchResult(
 			type: 'task-execution-result',
 			dispatchId,
 			status: 'deferred',
-			// Phase/task are unknown here; the superseded waiter only needs to unblock.
-			phase: 'implementation',
-			taskId: dispatchId,
+			// The superseded waiter only needs to unblock, but it reports the phase/task
+			// its *own* registration named rather than a placeholder (issue #724).
+			phase: existing.phase,
+			taskId: existing.taskId,
 			reason: 'superseded by a newer dispatch of the same record',
 			failureKind: 'aborted',
 			retryDelayMs: 0,
@@ -163,6 +184,8 @@ export function awaitDispatchResult(
 		resolve,
 		workerId: target.workerId,
 		runId: target.runId,
+		phase: target.phase,
+		taskId: target.taskId,
 		onProgress: handlers.onProgress,
 		onAck: handlers.onAck,
 		interruptions: 0,
@@ -287,10 +310,18 @@ export function resolveDispatchStreamTarget(dispatchId: string): DispatchStreamT
 	return { workerId: entry.workerId, runId: entry.runId };
 }
 
-/** Where a dispatch is executing: the worker it was pushed to and the dispatch id itself. */
+/**
+ * Where a dispatch is executing: the worker it was pushed to and the dispatch id
+ * itself, plus the phase and task that assignment named — everything a pushed
+ * `task-cancel` frame has to state (issue #724).
+ */
 export interface RunDispatchTarget {
 	dispatchId: string;
 	workerId: string;
+	/** The pipeline phase that dispatch is executing. */
+	phase: TaskPhase;
+	/** The SCM-derived task id that dispatch is executing. */
+	taskId: string;
 }
 
 /**
@@ -306,5 +337,5 @@ export function resolveDispatchTargetForRun(runId: string): RunDispatchTarget | 
 	if (dispatchId === undefined) return undefined;
 	const entry = pending.get(dispatchId);
 	if (!entry) return undefined;
-	return { dispatchId, workerId: entry.workerId };
+	return { dispatchId, workerId: entry.workerId, phase: entry.phase, taskId: entry.taskId };
 }

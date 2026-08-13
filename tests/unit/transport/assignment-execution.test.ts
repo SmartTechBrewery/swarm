@@ -1217,6 +1217,10 @@ describe('runAssignmentDbFree', () => {
 describe('cancelling an in-flight assignment', () => {
 	beforeEach(_resetSCMProviderRegistryForTesting);
 
+	/** A dispatch/run this worker is not executing — nothing here ever registers them. */
+	const UNKNOWN_DISPATCH_ID = '66666666-6666-4666-8666-666666666666';
+	const UNKNOWN_RUN_ID = '77777777-7777-4777-8777-777777777777';
+
 	/** A phase runner that hangs until its own signal aborts, then fails like the harness does. */
 	function abortableRunPhase(onStarted: (signal: AbortSignal) => void) {
 		return vi.fn(
@@ -1264,7 +1268,7 @@ describe('cancelling an in-flight assignment', () => {
 	});
 
 	it('is a no-op for a dispatch this worker is not running', () => {
-		expect(cancelAssignment('66666666-6666-4666-8666-666666666666')).toBe(false);
+		expect(cancelAssignment(UNKNOWN_DISPATCH_ID)).toBe(false);
 	});
 
 	it('drops the assignment from the registry once it settles', async () => {
@@ -1280,13 +1284,83 @@ describe('cancelling an in-flight assignment', () => {
 		expect(cancelAssignment(frame.dispatchId)).toBe(false);
 	});
 
-	it('logs and ignores a task-cancel for an unknown dispatch', () => {
-		const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+	it('aborts a running assignment without sending a frame of its own', async () => {
+		const sink = recordingSink();
+		let started: (signal: AbortSignal) => void = () => {};
+		const signalSeen = new Promise<AbortSignal>((resolve) => {
+			started = resolve;
+		});
+		const frame = ciAssignment();
+		const run = runAssignmentDbFree(frame, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(abortableRunPhase(started)),
+		});
+
+		const signal = await signalSeen;
+		const cancelSink = recordingSink();
 		handleTaskCancel(
-			{ type: 'task-cancel', dispatchId: '66666666-6666-4666-8666-666666666666' },
+			{
+				type: 'task-cancel',
+				dispatchId: frame.dispatchId,
+				runId: frame.runId,
+				phase: frame.phase,
+				taskId: frame.taskId,
+			},
+			cancelSink,
+			silentLogger,
+		);
+		await run;
+
+		expect(signal.aborted).toBe(true);
+		// The run's own failure path settles it; a second terminal frame from the cancel
+		// handler would race that one.
+		expect(cancelSink.sent).toEqual([]);
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'failed', cancelled: true });
+	});
+
+	// Issue #724: the worker is the only party that knows the phase is no longer
+	// executing here, so it answers rather than leaving the run on the control
+	// plane's `timeoutMs + RESULT_WAIT_MARGIN_MS` timer.
+	it('answers a cancel for a dispatch not running here with the terminal cancelled result', () => {
+		const sink = recordingSink();
+		const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+		handleTaskCancel(
+			{
+				type: 'task-cancel',
+				dispatchId: UNKNOWN_DISPATCH_ID,
+				runId: UNKNOWN_RUN_ID,
+				phase: 'review',
+				taskId: '724',
+			},
+			sink,
 			logger,
 		);
 
+		expect(sink.sent).toEqual([
+			{
+				type: 'task-execution-result',
+				dispatchId: UNKNOWN_DISPATCH_ID,
+				runId: UNKNOWN_RUN_ID,
+				phase: 'review',
+				taskId: '724',
+				status: 'failed',
+				cancelled: true,
+			},
+		]);
+		// No `error`: the control plane substitutes its own neutral wording (issue #305).
+		expect(sink.sent[0].error).toBeUndefined();
+		expect(logger.error).not.toHaveBeenCalled();
+	});
+
+	it('logs and ignores a cancel that names no phase/task, rather than sending a malformed frame', () => {
+		const sink = recordingSink();
+		const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+		// What a control plane predating issue #724 pushes.
+		handleTaskCancel({ type: 'task-cancel', dispatchId: UNKNOWN_DISPATCH_ID }, sink, logger);
+
+		expect(sink.sent).toEqual([]);
 		expect(logger.info).toHaveBeenCalledTimes(1);
 		expect(logger.error).not.toHaveBeenCalled();
 	});

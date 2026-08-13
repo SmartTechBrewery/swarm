@@ -518,8 +518,10 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 	const awaiting = awaitDispatchResult(
 		dispatch.id,
 		// Recorded here, not read off the worker's frames: this is what authorizes the
-		// one back-channel frame that writes durably (`stream-log`).
-		{ workerId: selection.workerId, runId },
+		// one back-channel frame that writes durably (`stream-log`), and — since issue
+		// #724 — what a pushed `task-cancel` states so the worker can answer one it
+		// cannot apply with a terminal result naming this phase and task.
+		{ workerId: selection.workerId, runId, phase: trigger.phase, taskId: trigger.taskId },
 		{
 			onProgress: (progress: TaskProgress) => {
 				if (progress.state === 'branch-provisioned') {
