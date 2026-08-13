@@ -59,10 +59,26 @@ function collisionMessage(taskId: string, path: string, detail: string): string 
 	);
 }
 
+/**
+ * Actionable text for a provision blocked at the *lease* gate with no checkout on
+ * disk yet. It deliberately does not tell the operator to wait for a provisioner to
+ * finish (issue #717): the lease may have no process behind it at all, and that
+ * advice sent operators hunting a live owner that did not exist — then restarting
+ * the daemon, since no control-plane action reaches a `.swarm-state` file on a
+ * worker host. Every liveness answer behind this gate is bounded now
+ * (`LEASE_TTL_MS`, `../worktree/host-local-runtime.ts`; `LEASE_TTL_SEC`,
+ * `../worktree/worktree-lease.ts`), so re-running is the instruction that is
+ * actually true on both runtimes. The expiry is described rather than quoted: this
+ * module is runtime-agnostic, and a third copy of the TTL is one that can drift
+ * from both of them.
+ */
 function provisionContentionMessage(taskId: string, path: string, detail: string): string {
 	return (
-		`Worktree provisioning for task '${taskId}' at ${path} is already in progress: ${detail}. ` +
-		'Wait for the host-local provisioner to finish, then re-run the task.'
+		`Worktree provisioning for task '${taskId}' did not acquire the task lease for ${path}: ` +
+		`${detail}. Re-run the task: a lease a running phase holds is released when that phase ` +
+		'finishes, and one left behind by a dead owner stops being honoured once it outlives its ' +
+		'expiry, so the next attempt takes it over — no worker restart, and no deleting files under ' +
+		'.swarm-state by hand.'
 	);
 }
 
@@ -248,9 +264,12 @@ export class GitWorktreeManager {
 					: provisionContentionMessage(
 							taskId,
 							path,
+							// Runtime-agnostic on purpose: on the store-backed lease a live owner
+							// is a live *run*, not a local process, so neither branch may name a
+							// host-local provisioner (issue #717).
 							acquired === 'live-owner'
-								? 'a live phase on this host holds the task lease'
-								: 'another provisioner claimed the host-local task lease first or its ownership could not be verified',
+								? 'it has a live owner'
+								: 'another provisioner claimed it first, or its ownership could not be verified',
 						),
 			);
 		}
