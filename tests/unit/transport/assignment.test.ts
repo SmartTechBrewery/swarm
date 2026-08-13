@@ -122,13 +122,19 @@ describe('buildTaskAssignment', () => {
 		});
 
 		// `taskRef` is the provider's own card→artifact answer, so it has to survive
-		// the wire for a federated planning/implementation run (issue #498).
-		it('round-trips the work item taskRef', () => {
+		// the wire for a federated planning/implementation run (issue #498) — and it
+		// must not cross without the repository that makes a bare number placeable
+		// (issue #710).
+		it('round-trips the work item taskRef and the repository it numbers', () => {
 			const assignment = buildTaskAssignment(
 				createMockTaskAssignmentInput({ phase: 'implementation' }),
 			);
-			expect(assignment.workItem?.taskRef).toBe(createMockTaskAssignmentInput().workItem?.taskRef);
+			const source = createMockTaskAssignmentInput().workItem;
+			expect(assignment.workItem?.taskRef).toBe(source?.taskRef);
 			expect(assignment.workItem?.taskRef).toBeDefined();
+			expect(assignment.workItem?.taskRepository).toBe(source?.taskRepository);
+			expect(assignment.workItem?.taskRepository).toBeDefined();
+			expect(TaskAssignmentSchema.safeParse(assignment).success).toBe(true);
 		});
 
 		it('carries baseBranch/baseSha only for resolve-conflicts', () => {

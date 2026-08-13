@@ -164,6 +164,10 @@ export interface WorkItem {
 	 * from its own linkage (GitHub Projects: the backing Issue/PR); `undefined` when
 	 * the card has no SCM artifact, in which case no SCM-driven phase can run for it.
 	 *
+	 * A number alone names nothing, so it never travels alone: read it together with
+	 * {@link taskRepository}, and treat a reference whose repository is not the one
+	 * your run acts on as *not this run's artifact* — the same skip as `undefined`.
+	 *
 	 * A field rather than a new {@link PMProvider} method, for the same reason as
 	 * {@link statusKey}: the provider already holds the linkage during its own board
 	 * read, so the reference rides along with the item instead of costing a second
@@ -173,6 +177,33 @@ export interface WorkItem {
 	 * stays SCM-derived rather than becoming the PM provider's own key.
 	 */
 	taskRef?: string;
+	/**
+	 * The repository {@link taskRef}'s artifact number belongs to, as `owner/repo`,
+	 * read from the same linkage `taskRef` came from — so the pair is meaningful
+	 * together and neither half is a guess (issue #710). The two are set and unset
+	 * together; a reference arriving without one (an older transport frame, a
+	 * provider that could not read the repository) is unplaceable and is treated as
+	 * the same miss as no reference at all.
+	 *
+	 * Three things make it load-bearing:
+	 *
+	 * - **A bare number names nothing.** `#42` is an artifact only once you know the
+	 *   repository numbering it, so a caller that keys a worktree, a branch, or a
+	 *   pull request on {@link taskRef} has to check this first.
+	 * - **The provider fills it from the *card's own* linkage**, never from the
+	 *   repository its `ProjectConfig` happens to be scoped to. That is what lets a
+	 *   board-wide read answer per card: a board is project-wide, so one page can
+	 *   hold cards linked in several of the project's repositories.
+	 * - **Whether that repository is one the project owns is the caller's decision**,
+	 *   not the provider's: a provider is built from a config *scoped to one
+	 *   repository*, which deliberately carries no repository list at all
+	 *   (`scopeProjectToRepository`, `src/config/project-repository.ts`;
+	 *   ai/ARCHITECTURE.md "Project record vs. scoped project config"). So the
+	 *   provider reports honestly and the caller — which holds the run's scoped
+	 *   `project.repo` — refuses what is not for it (`repoSlugsMatch`,
+	 *   `src/scm/repo-slug.ts`, so casing and a `.git` suffix are noise).
+	 */
+	taskRepository?: string;
 	/** Human-readable Status option name (e.g. `In progress`) when available. */
 	status?: string;
 	/**

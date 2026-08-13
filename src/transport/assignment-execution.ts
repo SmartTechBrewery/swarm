@@ -105,6 +105,7 @@ export function fromAssignedWorkItem(item: AssignedWorkItem): WorkItem {
 		description: item.description,
 		url: item.url,
 		taskRef: item.taskRef,
+		taskRepository: item.taskRepository,
 		status: item.status,
 		statusId: item.statusId,
 		statusKey: item.statusKey,

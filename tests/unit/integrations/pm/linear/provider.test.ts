@@ -24,7 +24,10 @@ import { getScopedApiKey } from '@/integrations/pm/linear/client.js';
 import { requireLinearConfig } from '@/integrations/pm/linear/config-schema.js';
 import { LINEAR_API_KEY_ROLE } from '@/integrations/pm/linear/credentials.js';
 import { createLinearProvider, LinearPMProvider } from '@/integrations/pm/linear/provider.js';
-import { createMockLinearProjectConfig } from '../../../../helpers/factories.js';
+import {
+	createMockLinearProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../../../helpers/factories.js';
 
 const PROJECT = createMockLinearProjectConfig();
 const CONFIG = requireLinearConfig(PROJECT);
@@ -168,6 +171,7 @@ describe('LinearPMProvider', () => {
 				description: 'Do the thing.',
 				url: ISSUE_NODE.url,
 				taskRef: undefined,
+				taskRepository: undefined,
 				status: 'In Progress',
 				statusId: CONFIG.statusOptions.inProgress,
 				statusKey: 'inProgress',
@@ -188,20 +192,25 @@ describe('LinearPMProvider', () => {
 			expect(linearGraphQL.mock.calls[0]?.[0]).not.toContain('identifier');
 		});
 
-		it('takes taskRef only from a GitHub issue attachment in this project repository', async () => {
+		// Issue #710 moved the repository half of this rule: the pair is read off the
+		// card's *own* attachment, whichever repository that names, and whether the
+		// project owns it is the caller's decision. Previously a foreign-repository
+		// attachment was skipped over — which is why the first attachment here answers
+		// now and did not before.
+		it('takes taskRef and taskRepository from the first GitHub issue attachment', async () => {
 			linearGraphQL.mockResolvedValue({
 				issue: {
 					...ISSUE_NODE,
 					attachments: {
-						nodes: [
-							{ url: 'https://github.com/another/repo/issues/9' },
-							{ url: 'https://github.com/SmartTechBrewery/swarm/issues/19/comments' },
-						],
+						nodes: [{ url: 'https://github.com/SmartTechBrewery/swarm/issues/19/comments' }],
 					},
 				},
 			});
 
-			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({ taskRef: '19' });
+			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({
+				taskRef: '19',
+				taskRepository: 'SmartTechBrewery/swarm',
+			});
 		});
 
 		it.each([
@@ -236,6 +245,7 @@ describe('LinearPMProvider', () => {
 
 			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({
 				taskRef: undefined,
+				taskRepository: undefined,
 			});
 		});
 
@@ -264,6 +274,63 @@ describe('LinearPMProvider', () => {
 			await expect(provider.getWorkItem('missing-id')).rejects.toThrow(
 				"Linear issue 'missing-id' did not resolve",
 			);
+		});
+	});
+
+	// Issue #710: the GitHub issue attachment names its own repository, so a card
+	// linked in *any* of the project's repositories resolves — the provider is built
+	// from a config scoped to one of them and no longer matches against that scope.
+	describe('taskRepository', () => {
+		// The real `scopeProjectToRepository` over one two-entry record, so this is the
+		// config `processJob` genuinely hands a provider for the *default* repository.
+		const [scopedToDefault] = createMockProjectRepositoryPair(['acme/android', 'acme/backend'], {
+			pm: PROJECT.pm,
+			credentials: PROJECT.credentials,
+		});
+		const scopedProvider = new LinearPMProvider(scopedToDefault);
+
+		const linkedTo = (repository: string, number: number, id: string) => ({
+			...ISSUE_NODE,
+			id,
+			attachments: { nodes: [{ url: `https://github.com/${repository}/issues/${number}` }] },
+		});
+
+		it("resolves a card linked in the project's non-default repository", async () => {
+			linearGraphQL.mockResolvedValue({ issue: linkedTo('acme/backend', 7, ISSUE_NODE.id) });
+
+			await expect(scopedProvider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({
+				taskRef: '7',
+				taskRepository: 'acme/backend',
+			});
+		});
+
+		// The honest miss the old regex produced as `taskRef: undefined`, now reported as
+		// a repository the caller can refuse — never re-labelled as the scoped one.
+		it('reports a repository the project owns neither of, rather than the scoped one', async () => {
+			linearGraphQL.mockResolvedValue({ issue: linkedTo('other/repo', 3, ISSUE_NODE.id) });
+
+			await expect(scopedProvider.getWorkItem(ISSUE_NODE.id)).resolves.toMatchObject({
+				taskRef: '3',
+				taskRepository: 'other/repo',
+			});
+		});
+
+		// The assertion a fix applied one call site at a time cannot pass: one page, two
+		// repositories, each card answering for itself.
+		it('resolves each card of a board-wide read against its own repository', async () => {
+			linearGraphQL.mockResolvedValue(
+				issuesPage([
+					linkedTo('acme/android', 10, 'issue-a'),
+					linkedTo('acme/backend', 11, 'issue-b'),
+				]),
+			);
+
+			const items = await scopedProvider.listWorkItems();
+
+			expect(items.map((item) => [item.taskRepository, item.taskRef])).toEqual([
+				['acme/android', '10'],
+				['acme/backend', '11'],
+			]);
 		});
 	});
 

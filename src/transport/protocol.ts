@@ -221,6 +221,16 @@ export const AssignedWorkItemSchema = z.object({
 	 * what SWARM keys the worktree/branch/PR on (ai/ARCHITECTURE.md "Task identity").
 	 */
 	taskRef: z.string().optional(),
+	/**
+	 * The repository `taskRef` numbers an artifact in (`WorkItem.taskRepository`), as
+	 * `owner/repo`. It travels with `taskRef` because a bare number names nothing on
+	 * its own (issue #710) — a frame carrying one without the other would let the
+	 * worker read a reference it cannot check. Additive and optional in both
+	 * directions, so `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped: a router
+	 * predating the field simply omits it, exactly as `TaskAssignmentSchema.repository`
+	 * does (issue #683).
+	 */
+	taskRepository: z.string().optional(),
 	status: z.string().optional(),
 	statusId: z.string().optional(),
 	/** The canonical pipeline status key (`WorkItem.statusKey`) the provider resolved. */

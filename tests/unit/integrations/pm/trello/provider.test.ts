@@ -14,7 +14,10 @@ vi.mock('@/config/provider.js', () => ({ requirePmCredential }));
 import { PAGE_LIMIT } from '@/integrations/pm/trello/client.js';
 import { requireTrelloConfig } from '@/integrations/pm/trello/config-schema.js';
 import { createTrelloProvider, TrelloPMProvider } from '@/integrations/pm/trello/provider.js';
-import { createMockTrelloProjectConfig } from '../../../../helpers/factories.js';
+import {
+	createMockProjectRepositoryPair,
+	createMockTrelloProjectConfig,
+} from '../../../../helpers/factories.js';
 
 const PROJECT = createMockTrelloProjectConfig();
 const CONFIG = requireTrelloConfig(PROJECT);
@@ -181,6 +184,9 @@ describe('TrelloPMProvider', () => {
 				description: `Wire the triggers.\n\n${DESCRIPTION_MARKER}`,
 				url: 'https://trello.com/c/H0TZyzbK/4-wire-triggers',
 				taskRef: '585',
+				// A bare number names nothing, so the repository it numbers an artifact in
+				// travels with it, read off the same linked URL (issue #710).
+				taskRepository: REPO,
 				// The card's status *is* its list: the display name, the list id, and the
 				// canonical key the mapping translates that id to.
 				status: 'In progress',
@@ -220,10 +226,6 @@ describe('TrelloPMProvider', () => {
 				label: 'only a pull-request attachment',
 				attachments: [{ url: `https://github.com/${REPO}/pull/601` }],
 			},
-			{
-				label: 'an issue link in another repository',
-				attachments: [{ url: 'https://github.com/acme/other/issues/585' }],
-			},
 			{ label: 'no attachments at all', attachments: [] },
 		])('leaves taskRef unset for a card with $label', async ({ attachments }) => {
 			mockTrello({
@@ -236,6 +238,27 @@ describe('TrelloPMProvider', () => {
 			// (ai/ARCHITECTURE.md "Task identity"). The phase dispatcher logs and skips.
 			await expect(provider.getWorkItem(CARD_ID)).resolves.toMatchObject({
 				taskRef: undefined,
+				taskRepository: undefined,
+			});
+		});
+
+		// Issue #710 moved the repository half of this rule out of the provider: a link
+		// naming a repository this project does not own used to be skipped over, leaving
+		// `taskRef` unset. It now resolves honestly — with the repository that makes it
+		// refusable — because a provider built from a config scoped to one repository
+		// cannot know which repositories the project owns.
+		it('reports an issue link in another repository rather than skipping it', async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: trelloCard({
+					attachments: [{ url: 'https://github.com/acme/other/issues/585' }],
+					desc: 'No links here.',
+				}),
+				[LISTS_PATH]: BOARD_LISTS,
+			});
+
+			await expect(provider.getWorkItem(CARD_ID)).resolves.toMatchObject({
+				taskRef: '585',
+				taskRepository: 'acme/other',
 			});
 		});
 
@@ -360,6 +383,52 @@ describe('TrelloPMProvider', () => {
 			const reads = requestsTo(`cards/${CARD_ID}`);
 			expect(reads).toHaveLength(1);
 			expect(reads[0]?.searchParams.get('fields')).toBe('idLabels');
+		});
+	});
+
+	// Issue #710: the linked URL names its own repository, so a card linked in *any*
+	// of the project's repositories resolves — the provider is built from a config
+	// scoped to one of them and no longer matches against that scope.
+	describe('taskRepository', () => {
+		// The real `scopeProjectToRepository` over one two-entry record, so this is the
+		// config `processJob` genuinely hands a provider for the *default* repository.
+		const [scopedToDefault] = createMockProjectRepositoryPair(['acme/android', 'acme/backend'], {
+			pm: PROJECT.pm,
+			credentials: PROJECT.credentials,
+		});
+
+		const linkedTo = (repository: string, number: number, id?: string) =>
+			trelloCard({
+				...(id ? { id } : {}),
+				attachments: [{ url: `https://github.com/${repository}/issues/${number}` }],
+				desc: 'No links here.',
+			});
+
+		it("resolves a card linked in the project's non-default repository", async () => {
+			mockTrello({
+				[`cards/${CARD_ID}`]: linkedTo('acme/backend', 7),
+				[LISTS_PATH]: BOARD_LISTS,
+			});
+
+			await expect(
+				new TrelloPMProvider(scopedToDefault).getWorkItem(CARD_ID),
+			).resolves.toMatchObject({ taskRef: '7', taskRepository: 'acme/backend' });
+		});
+
+		// The assertion a fix applied one call site at a time cannot pass: one board
+		// read, two repositories, each card answering for itself.
+		it('resolves each card of a board-wide read against its own repository', async () => {
+			mockTrello({
+				[BOARD_CARDS_PATH]: [linkedTo('acme/android', 10), linkedTo('acme/backend', 11, 'card-2')],
+				[LISTS_PATH]: BOARD_LISTS,
+			});
+
+			const items = await new TrelloPMProvider(scopedToDefault).listWorkItems();
+
+			expect(items.map((item) => [item.taskRepository, item.taskRef])).toEqual([
+				['acme/android', '10'],
+				['acme/backend', '11'],
+			]);
 		});
 	});
 
@@ -771,8 +840,10 @@ describe('TrelloPMProvider', () => {
 				title: 'Wire triggers',
 				description: 'Wire the triggers.',
 				url: 'https://trello.com/c/NEWCARD01/9-wire-triggers',
-				// Nothing has linked an SCM artifact to a card that was created seconds ago.
+				// Nothing has linked an SCM artifact to a card that was created seconds ago,
+				// so neither half of the pair is set (issue #710).
 				taskRef: undefined,
+				taskRepository: undefined,
 				status: 'Ready',
 				statusId: TODO_LIST,
 				statusKey: 'todo',

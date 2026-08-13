@@ -1418,14 +1418,35 @@ describe('fromAssignedWorkItem', () => {
 			url: 'https://example.com/1',
 			status: 'Planning',
 			statusId: '3fe662f4',
+			taskRef: '42',
+			taskRepository: 'acme/backend',
 			labels: [{ id: 'LA_1', name: 'swarm', color: 'ededed' }],
 			assignees: [{ handle: 'octocat', displayName: 'The Octocat' }],
 		});
 		expect(workItem).toMatchObject({
 			id: 'PVTI_1',
 			title: 'Do it',
+			// A bare artifact number names nothing, so the repository numbering it comes
+			// back off the frame with it (issue #710).
+			taskRef: '42',
+			taskRepository: 'acme/backend',
 			labels: [{ id: 'LA_1', name: 'swarm', color: 'ededed' }],
 			assignees: [{ handle: 'octocat', displayName: 'The Octocat' }],
 		});
+	});
+
+	// Router/worker version skew: the field is additive and optional in both
+	// directions, so a frame from a router predating it still reconstructs.
+	it('reconstructs a frame carrying neither linkage field', () => {
+		const workItem = fromAssignedWorkItem({
+			id: 'PVTI_1',
+			title: 'Do it',
+			description: 'body',
+			url: 'https://example.com/1',
+			labels: [],
+			assignees: [],
+		});
+		expect(workItem.taskRef).toBeUndefined();
+		expect(workItem.taskRepository).toBeUndefined();
 	});
 });

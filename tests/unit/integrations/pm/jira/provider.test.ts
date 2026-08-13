@@ -14,7 +14,10 @@ vi.mock('@/config/provider.js', () => ({ requirePmCredential }));
 import { JIRA_API_PATH } from '@/integrations/pm/jira/client.js';
 import { requireJiraConfig } from '@/integrations/pm/jira/config-schema.js';
 import { createJiraProvider, JiraPMProvider } from '@/integrations/pm/jira/provider.js';
-import { createMockJiraProjectConfig } from '../../../../helpers/factories.js';
+import {
+	createMockJiraProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../../../helpers/factories.js';
 
 const PROJECT = createMockJiraProjectConfig();
 const CONFIG = requireJiraConfig(PROJECT);
@@ -191,6 +194,9 @@ describe('JiraPMProvider', () => {
 				description: DESCRIPTION_TEXT,
 				url: 'https://example.atlassian.net/browse/SWARM-42',
 				taskRef: '577',
+				// A bare number names nothing, so the repository it numbers an artifact in
+				// travels with it, read off the same remote link (issue #710).
+				taskRepository: REPO,
 				status: 'In Progress',
 				statusId: CONFIG.statusOptions.inProgress,
 				statusKey: 'inProgress',
@@ -251,10 +257,6 @@ describe('JiraPMProvider', () => {
 
 		it.each([
 			{ label: 'only a pull-request remote link', links: [GITHUB_PR_LINK] },
-			{
-				label: 'a GitHub issue link in another repository',
-				links: [{ object: { url: 'https://github.com/acme/other/issues/12' } }],
-			},
 			{ label: 'no remote links at all', links: [] },
 		])('leaves taskRef unset for a card with $label', async ({ links }) => {
 			mockJira({ 'issue/SWARM-42': jiraIssue(), 'issue/SWARM-42/remotelink': links });
@@ -264,6 +266,26 @@ describe('JiraPMProvider', () => {
 			// identity"). The phase dispatcher logs and skips.
 			await expect(provider.getWorkItem('SWARM-42')).resolves.toMatchObject({
 				taskRef: undefined,
+				taskRepository: undefined,
+			});
+		});
+
+		// Issue #710 moved the repository half of this rule out of the provider: a link
+		// naming a repository this project does not own used to be skipped over, leaving
+		// `taskRef` unset. It now resolves honestly — with the repository that makes it
+		// refusable — because a provider built from a config scoped to one repository
+		// cannot know which repositories the project owns.
+		it('reports a GitHub issue link in another repository rather than skipping it', async () => {
+			mockJira({
+				'issue/SWARM-42': jiraIssue(),
+				'issue/SWARM-42/remotelink': [
+					{ object: { url: 'https://github.com/acme/other/issues/12' } },
+				],
+			});
+
+			await expect(provider.getWorkItem('SWARM-42')).resolves.toMatchObject({
+				taskRef: '12',
+				taskRepository: 'acme/other',
 			});
 		});
 
@@ -279,6 +301,30 @@ describe('JiraPMProvider', () => {
 			mockJira({ 'issue/SWARM-9999': new Response('Issue does not exist', { status: 404 }) });
 
 			await expect(provider.getWorkItem('SWARM-9999')).rejects.toThrow(/\(404\)/);
+		});
+	});
+
+	// Issue #710: the remote link names its own repository, so a card linked in *any*
+	// of the project's repositories resolves — the provider is built from a config
+	// scoped to one of them and no longer matches against that scope.
+	describe('taskRepository', () => {
+		it("resolves a card linked in the project's non-default repository", async () => {
+			// The real `scopeProjectToRepository` over one two-entry record, so this is the
+			// config `processJob` genuinely hands a provider for the *default* repository.
+			const [scopedToDefault] = createMockProjectRepositoryPair(['acme/android', 'acme/backend'], {
+				pm: PROJECT.pm,
+				credentials: PROJECT.credentials,
+			});
+			mockJira({
+				'issue/SWARM-42': jiraIssue(),
+				'issue/SWARM-42/remotelink': [
+					{ object: { url: 'https://github.com/acme/backend/issues/7' } },
+				],
+			});
+
+			await expect(
+				new JiraPMProvider(scopedToDefault).getWorkItem('SWARM-42'),
+			).resolves.toMatchObject({ taskRef: '7', taskRepository: 'acme/backend' });
 		});
 	});
 
@@ -363,9 +409,12 @@ describe('JiraPMProvider', () => {
 			expect(items.map((item) => item.id)).toEqual(['SWARM-42', 'SWARM-43']);
 			expect(jqlSent()).toBe('project = "SWARM" ORDER BY created DESC');
 			// A whole-board read deliberately spends no remote-link request per card, so
-			// the only calls are the two search pages.
+			// the only calls are the two search pages — which is why this is the one
+			// provider whose board-wide read resolves *neither* half of the card→artifact
+			// pair rather than resolving it per card (issue #710).
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 			expect(items.every((item) => item.taskRef === undefined)).toBe(true);
+			expect(items.every((item) => item.taskRepository === undefined)).toBe(true);
 		});
 
 		it('narrows the read to the mapped Jira status id, unquoted so JQL reads it as an id', async () => {

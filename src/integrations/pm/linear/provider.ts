@@ -571,25 +571,24 @@ function mapAssignees(issue: IssueNode): WorkItemAssignee[] {
  * shared code resolves a pipeline phase from, so no caller inverts
  * `statusOptions` itself (ai/RULES.md §2).
  *
- * `taskRef` comes only from a GitHub issue attachment in this project's
- * repository. A pull-request attachment is an artifact link, not a task id, so
- * it cannot replace the issue link when a card has both. A Linear-native number
- * would name an unrelated GitHub issue in the PR closing keyword, so an unlinked
- * card leaves it unset and cannot start an SCM-driven phase (ai/ARCHITECTURE.md
- * "Task identity").
+ * `taskRef` comes only from a GitHub issue attachment, and `taskRepository` from
+ * that same attachment's own `owner/repo` — never from the repository this
+ * provider's config happens to be scoped to (issue #710). A pull-request
+ * attachment is an artifact link, not a task id, so it cannot replace the issue
+ * link when a card has both. A Linear-native number would name an unrelated GitHub
+ * issue in the PR closing keyword, so an unlinked card leaves both unset and cannot
+ * start an SCM-driven phase (ai/ARCHITECTURE.md "Task identity").
  */
-function toWorkItem(
-	issue: IssueNode & { id: string },
-	config: LinearIntegrationConfig,
-	repository: string,
-): WorkItem {
+function toWorkItem(issue: IssueNode & { id: string }, config: LinearIntegrationConfig): WorkItem {
 	const stateId = issue.state?.id;
+	const artifact = taskRefFromAttachments(issue);
 	return {
 		id: issue.id,
 		title: issue.title ?? '',
 		description: issue.description ?? '',
 		url: issue.url ?? '',
-		taskRef: taskRefFromAttachments(issue, repository),
+		taskRef: artifact?.number,
+		taskRepository: artifact?.repository,
 		status: issue.state?.name,
 		statusId: stateId,
 		statusKey: stateId === undefined ? undefined : resolveStatusKeyByStateId(config, stateId),
@@ -600,19 +599,29 @@ function toWorkItem(
 	};
 }
 
-function taskRefFromAttachments(issue: IssueNode, repository: string): string | undefined {
-	const artifactUrl = new RegExp(
-		`^https://github\\.com/${escapeRegExp(repository)}/issues/(\\d+)(?:[/?#]|$)`,
-	);
+/**
+ * The GitHub **issue** a card's attachments link, as the repository/number pair
+ * that names it — the card's own linkage, matched against *any* repository rather
+ * than against this provider's scoped one (issue #710), because a board is
+ * project-wide and one page's cards may be linked in several of the project's
+ * repositories. Whether the repository is one the project owns is the caller's
+ * decision (`src/pm/types.ts`, `WorkItem.taskRepository`).
+ *
+ * Two rules survive the widening: a *pull-request* attachment never qualifies — the
+ * path is matched as `issues` only — and the Linear issue's own `number` is never a
+ * task id.
+ */
+function taskRefFromAttachments(
+	issue: IssueNode,
+): { repository: string; number: string } | undefined {
+	const artifactUrl = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)(?:[/?#]|$)/;
 	for (const attachment of issue.attachments?.nodes ?? []) {
 		const match = attachment?.url?.match(artifactUrl);
-		if (match) return match[1];
+		if (match?.[1] && match[2] && match[3]) {
+			return { repository: `${match[1]}/${match[2]}`, number: match[3] };
+		}
 	}
 	return undefined;
-}
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -719,7 +728,7 @@ export class LinearPMProvider implements PMProvider {
 			if (!issue?.id) {
 				throw new Error(`Linear issue '${id}' did not resolve`);
 			}
-			return toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo);
+			return toWorkItem({ ...issue, id: issue.id }, this.config);
 		});
 	}
 
@@ -761,7 +770,7 @@ export class LinearPMProvider implements PMProvider {
 			// `IssueFilter` narrows by team *and* workflow state, so a status-filtered
 			// read doesn't page the whole board to discard most of it.
 			const issues = await this.collectIssues(this.issueFilter({ stateId }));
-			return issues.map((issue) => toWorkItem(issue, this.config, this.project.repo));
+			return issues.map((issue) => toWorkItem(issue, this.config));
 		});
 	}
 
@@ -789,7 +798,7 @@ export class LinearPMProvider implements PMProvider {
 			// contract describes — another team's `OPS-12` cannot answer for `ENG-12`.
 			const issues = await this.collectIssues(this.issueFilter({ number }));
 			const match = issues.find((issue) => (issue.url ?? '').endsWith(urlSuffix));
-			return match ? toWorkItem(match, this.config, this.project.repo) : undefined;
+			return match ? toWorkItem(match, this.config) : undefined;
 		});
 	}
 
@@ -814,9 +823,7 @@ export class LinearPMProvider implements PMProvider {
 				(node) => node?.issue?.id && node.issue.team?.id === this.config.teamId,
 			);
 			const issue = attached?.issue;
-			return issue?.id
-				? toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo)
-				: undefined;
+			return issue?.id ? toWorkItem({ ...issue, id: issue.id }, this.config) : undefined;
 		});
 	}
 
@@ -834,7 +841,7 @@ export class LinearPMProvider implements PMProvider {
 			// match is the match.
 			const issues = await this.collectIssues(this.issueFilter({ descriptionContains: marker }));
 			const issue = issues[0];
-			return issue ? toWorkItem(issue, this.config, this.project.repo) : undefined;
+			return issue ? toWorkItem(issue, this.config) : undefined;
 		});
 	}
 
@@ -918,7 +925,7 @@ export class LinearPMProvider implements PMProvider {
 			// `statusKey` and label shape. Its `taskRef` is unset and that is honest:
 			// a Linear issue is not an SCM artifact, and nothing has linked one to it
 			// yet (ai/ARCHITECTURE.md "Task identity").
-			return toWorkItem({ ...issue, id: issue.id }, this.config, this.project.repo);
+			return toWorkItem({ ...issue, id: issue.id }, this.config);
 		});
 	}
 
