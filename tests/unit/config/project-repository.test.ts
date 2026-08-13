@@ -20,7 +20,7 @@ function twoRepositoryRecord(): ProjectRecord {
 		...createMockProjectRecord({ id: 'multi', scm: 'github' }),
 		repositories: [
 			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-			{ repo: 'acme/second', baseBranch: 'develop', branchPrefix: 'task-', scm: 'gitlab' },
+			{ repo: 'acme/second', baseBranch: 'develop', branchPrefix: 'task-' },
 		],
 	};
 }
@@ -72,15 +72,25 @@ describe('project repository scoping (issue #684)', () => {
 			expect(scopeProjectToRepository(twoRepositoryRecord()).repo).toBe('acme/first');
 		});
 
-		it("prefers the entry's own scm over the project-level default", () => {
-			expect(scopeProjectToRepository(twoRepositoryRecord(), 'acme/second').scm).toBe('gitlab');
-			expect(scopeProjectToRepository(twoRepositoryRecord(), 'acme/first').scm).toBe('github');
+		// Issue #727: a project has one SCM provider and every repository it owns lives on
+		// it, so every entry scopes to the project's own `scm` — including one whose
+		// persisted jsonb still carries a pre-#727 override, which nothing reads.
+		it('resolves scm from the project alone, for every entry', () => {
+			const record = twoRepositoryRecord();
+			expect(scopeProjectToRepository(record, 'acme/first').scm).toBe('github');
+			expect(scopeProjectToRepository(record, 'acme/second').scm).toBe('github');
+
+			const withStaleOverride = {
+				...record,
+				repositories: record.repositories.map((entry) => ({ ...entry, scm: 'gitlab' })),
+			};
+			expect(scopeProjectToRepository(withStaleOverride, 'acme/second').scm).toBe('github');
 		});
 
 		// "States no provider" is a distinct case `requireProjectSCMProvider` reports on,
 		// so an unstated provider must stay an *absent* key rather than an explicit
 		// `undefined` (the same care the DB read takes for a NULL `scm_type`).
-		it('leaves scm absent when neither the entry nor the project states one', () => {
+		it('leaves scm absent when the project states none', () => {
 			const record = createMockProjectRecord({ id: 'unstated' });
 			const scoped = scopeProjectToRepository(record);
 			expect(scoped.scm).toBeUndefined();

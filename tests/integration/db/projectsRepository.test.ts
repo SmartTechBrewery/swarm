@@ -384,7 +384,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 					repositories: [
 						{ repo: 'jkwiecien/first' },
 						{ repo: 'jkwiecien/second', baseBranch: 'develop', branchPrefix: 'task-' },
-						{ repo: 'jkwiecien/third', scm: 'gitlab' },
+						{ repo: 'jkwiecien/third', branchPrefix: 'work-' },
 					],
 				}),
 			);
@@ -401,11 +401,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 				baseBranch: 'develop',
 				branchPrefix: 'task-',
 			});
-			// The entry's own provider overrides the project-level default.
+			// Every entry resolves the project's own provider — there is no per-repository
+			// override (issue #727).
 			expect(await findProjectByRepoFromDb('jkwiecien/third')).toMatchObject({
 				id: 'proj-multi',
 				repo: 'jkwiecien/third',
-				scm: 'gitlab',
+				branchPrefix: 'work-',
 			});
 		});
 

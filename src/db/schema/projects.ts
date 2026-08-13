@@ -32,8 +32,10 @@ export const projects = pgTable('projects', {
 	name: text('name').notNull(),
 	/**
 	 * The project's repositories, each with its own `repo` / `baseBranch` /
-	 * `branchPrefix` and optional `scm` override (`ProjectRepository`, issue #684) —
-	 * the three per-repository `text` columns this replaced, as one list.
+	 * `branchPrefix` (`ProjectRepository`, issue #684) — the three per-repository
+	 * `text` columns this replaced, as one list. An entry written before issue #727
+	 * may still carry an `scm` key; nothing reads it, and the next write of the list
+	 * drops it (`ProjectRepositorySchema`, `src/config/schema.ts`).
 	 *
 	 * jsonb rather than a `project_repositories` child table for the reason every
 	 * other sub-object here is jsonb: a project read is a plain `SELECT` re-assembled
@@ -63,8 +65,8 @@ export const projects = pgTable('projects', {
 	/**
 	 * SCM provider id — the persisted form of `ProjectRecord.scm` (`ScmType`,
 	 * `src/scm/types.ts`), stored as free `text` like `pm_type` (issue #478). Stays at
-	 * the *project* level: it is the default every repository resolves through unless
-	 * its own entry in `repositories` overrides it (issue #684).
+	 * the *project* level, and is the only place a provider is stated: every repository
+	 * in `repositories` resolves through it, with no per-entry override (issue #727).
 	 *
 	 * **Nullable with no default, deliberately.** `NULL` is "this project states no
 	 * provider", which is exactly the config-absent case `requireProjectSCMProvider`
