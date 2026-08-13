@@ -9,6 +9,7 @@ import {
 	approveEnrollment,
 	type DashboardProjectScope,
 	type DashboardWorkerView,
+	EnrollmentRepositoryMismatchError,
 	enrollWorker,
 	getDashboardWorkerDetail,
 	getEnrollment,
@@ -291,6 +292,9 @@ export const workersRouter = router({
 	// awaiting a projectAdmin's approval). The caller must own the worker
 	// (NOT_FOUND otherwise) and be able to see the project (`contributor`, so an
 	// unknown/inaccessible project is NOT_FOUND). Sharing consent starts off.
+	// A project whose repository is not the worker's declared checkout is refused
+	// as `BAD_REQUEST` naming both repositories (issue #690), exactly as allowed
+	// CLIs exceeding the machine's capabilities are.
 	enroll: authedProcedure
 		.input(
 			z.object({
@@ -317,7 +321,10 @@ export const workersRouter = router({
 					concurrencyAllocation: input.concurrencyAllocation,
 				});
 			} catch (error) {
-				if (error instanceof AllowedClisNotCapableError) {
+				if (
+					error instanceof AllowedClisNotCapableError ||
+					error instanceof EnrollmentRepositoryMismatchError
+				) {
 					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
 				}
 				if (isUniqueViolation(error)) {

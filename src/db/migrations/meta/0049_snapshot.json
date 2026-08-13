@@ -1,6 +1,6 @@
 {
-  "id": "84d2698d-27ea-4918-ae0a-6948d5531324",
-  "prevId": "b3d7f1c4-8a02-4e6d-9c5b-1f7a3e0d84b2",
+  "id": "d6221893-ba30-4d39-8108-32e4c24bd91b",
+  "prevId": "e27c8f85-cf0f-4602-8128-b060d3593385",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -20,9 +20,9 @@
           "primaryKey": false,
           "notNull": true
         },
-        "repo": {
-          "name": "repo",
-          "type": "text",
+        "repositories": {
+          "name": "repositories",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": true
         },
@@ -38,20 +38,6 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'.swarm-workspaces'"
-        },
-        "base_branch": {
-          "name": "base_branch",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'main'"
-        },
-        "branch_prefix": {
-          "name": "branch_prefix",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'issue-'"
         },
         "max_concurrent_jobs": {
           "name": "max_concurrent_jobs",
@@ -128,15 +114,7 @@
       "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {
-        "projects_repo_unique": {
-          "name": "projects_repo_unique",
-          "nullsNotDistinct": false,
-          "columns": [
-            "repo"
-          ]
-        }
-      },
+      "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false
@@ -1880,6 +1858,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\"]'::jsonb"
+        },
+        "repository": {
+          "name": "repository",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "credential_hash": {
           "name": "credential_hash",

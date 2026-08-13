@@ -4,6 +4,7 @@ const {
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	enrollWorker,
+	EnrollmentRepositoryMismatchError,
 	getDashboardWorkerDetail,
 	getEnrollment,
 	listDashboardWorkers,
@@ -22,8 +23,19 @@ const {
 			this.name = 'AllowedClisNotCapableError';
 		}
 	}
+	class EnrollmentRepositoryMismatchError extends Error {
+		constructor(
+			public workerId: string,
+			public declaredRepository: string,
+			public projectRepository: string,
+		) {
+			super(`checkout is ${declaredRepository}, project is ${projectRepository}`);
+			this.name = 'EnrollmentRepositoryMismatchError';
+		}
+	}
 	return {
 		AllowedClisNotCapableError,
+		EnrollmentRepositoryMismatchError,
 		approveEnrollment: vi.fn(),
 		enrollWorker: vi.fn(),
 		getDashboardWorkerDetail: vi.fn(),
@@ -49,6 +61,7 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	enrollWorker,
+	EnrollmentRepositoryMismatchError,
 	getDashboardWorkerDetail,
 	getEnrollment,
 	listDashboardWorkers,
@@ -91,6 +104,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		repository: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,
@@ -525,6 +539,26 @@ describe('workers.enroll (owner offers a worker to a project)', () => {
 		await expect(
 			owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['antigravity'] }),
 		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+	});
+
+	// Issue #690: the machine's checkout is not this project's repository. A rejection
+	// the caller can act on, so `BAD_REQUEST` with the service's own message — which
+	// already names both repositories — rather than an unexpected failure.
+	it('translates a repository mismatch to BAD_REQUEST naming both repositories', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		enrollWorker.mockRejectedValue(
+			new EnrollmentRepositoryMismatchError(WORKER_ID, 'acme/frontend', 'acme/backend'),
+		);
+
+		await expect(
+			owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] }),
+		).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'BAD_REQUEST',
+				message: expect.stringContaining('acme/frontend'),
+			}),
+		);
 	});
 
 	// Issue #542: `planning` is an ordinary phase — the router neither special-cases

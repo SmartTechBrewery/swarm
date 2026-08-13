@@ -193,6 +193,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		repository: 'SmartTechBrewery/swarm',
 		taskId: '103',
 		workItemId: null,
 		workItemTitle: null,
@@ -405,6 +406,7 @@ describe('runsRouter', () => {
 					displayName: 'studio-mac',
 					capabilities: ['claude'],
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+					repository: null,
 					createdAt: new Date(0),
 					updatedAt: new Date(0),
 				},
@@ -831,6 +833,7 @@ describe('runsRouter', () => {
 				displayName: 'alice-macbook',
 				capabilities: ['claude' as const],
 				supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+				repository: null,
 				createdAt: new Date(0),
 				updatedAt: new Date(0),
 			};

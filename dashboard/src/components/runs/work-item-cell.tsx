@@ -15,6 +15,12 @@ import { parseWorkItemRef, workItemLabel } from '@/lib/work-item.js';
  */
 export interface WorkItemCellRun {
 	taskId: string;
+	/**
+	 * The repository the run acted on (`owner/repo`) — read straight off the run
+	 * (issue #691) rather than passed in from the caller's project lookup, so the PR
+	 * reference stays right for a project spanning several repositories.
+	 */
+	repository: string;
 	phase: string;
 	workItemId: string | null;
 	workItemTitle: string | null;
@@ -75,15 +81,7 @@ function WorkItemTitle({
  * work item. Both open on the provider, so they stop propagation: the runs list
  * navigates on row click and must not swallow the outbound link.
  */
-function WorkItemReference({
-	run,
-	repo,
-	isPrDriven,
-}: {
-	run: WorkItemCellRun;
-	repo: string;
-	isPrDriven: boolean;
-}) {
+function WorkItemReference({ run, isPrDriven }: { run: WorkItemCellRun; isPrDriven: boolean }) {
 	const stopPropagation = (event: React.MouseEvent) => event.stopPropagation();
 	const handleLinkKeyDown = (event: React.KeyboardEvent) => {
 		event.stopPropagation();
@@ -93,7 +91,7 @@ function WorkItemReference({
 	if (isPrDriven && run.prNumber) {
 		return (
 			<a
-				href={`https://github.com/${repo}/pull/${run.prNumber}`}
+				href={`https://github.com/${run.repository}/pull/${run.prNumber}`}
 				target="_blank"
 				rel="noopener noreferrer"
 				onClick={stopPropagation}
@@ -126,13 +124,11 @@ function WorkItemReference({
 
 export function WorkItemCell({
 	run,
-	repo,
 	variant = 'cell',
 	titleHref,
 	phaseLabel,
 }: {
 	run: WorkItemCellRun;
-	repo?: string;
 	/**
 	 * `'cell'` truncates the title to one line for the fixed-width desktop table;
 	 * `'card'` lets it grow to the dominant, wrapping primary line of a mobile
@@ -156,13 +152,13 @@ export function WorkItemCell({
 }) {
 	const isPrDriven = PR_DRIVEN_PHASES.has(run.phase);
 	const title = isPrDriven ? run.prTitle : run.workItemTitle;
-	// The reference line needs the repo to build a PR URL, and something to point
-	// at; without both there is nothing to reference.
-	const referenceRepo = repo && (run.workItemId || run.prNumber) ? repo : null;
+	// The reference line needs the run's repository to build a PR URL, and something
+	// to point at; without both there is nothing to reference.
+	const hasReference = !!run.repository && !!(run.workItemId || run.prNumber);
 
 	// Nothing to say at all — the runs list's long-standing behaviour, which drops
 	// even a resolved title when the reference is unavailable.
-	if (!referenceRepo && !titleHref && !phaseLabel) {
+	if (!hasReference && !titleHref && !phaseLabel) {
 		return <span className="text-zinc-500 font-mono">—</span>;
 	}
 
@@ -174,9 +170,7 @@ export function WorkItemCell({
 				</span>
 			) : null}
 			<WorkItemTitle title={title} isCard={variant === 'card'} titleHref={titleHref} />
-			{referenceRepo ? (
-				<WorkItemReference run={run} repo={referenceRepo} isPrDriven={isPrDriven} />
-			) : null}
+			{hasReference ? <WorkItemReference run={run} isPrDriven={isPrDriven} /> : null}
 		</div>
 	);
 }

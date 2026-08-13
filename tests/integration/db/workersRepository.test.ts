@@ -296,6 +296,76 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 		});
 	});
 
+	// Issue #687 — the daemon-declared checkout identity, against real Postgres. The
+	// unit tests mock the repository, so only these can catch a wrong `.set()` payload,
+	// a column that is not nullable, or the three-valued argument collapsing.
+	describe('repository', () => {
+		it('leaves a newly registered worker with no declaration', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-fresh-repo',
+				capabilities: ['claude'],
+				credentialHash: 'hash-fresh-repo',
+			});
+
+			// Registering a machine is not declaring a checkout — only a connecting daemon
+			// can state which repository it holds.
+			expect(created.repository).toBeNull();
+			expect((await getWorkerById(created.id))?.repository).toBeNull();
+		});
+
+		it('persists a declaration, leaves it alone when omitted, and clears it on null', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-declares',
+				capabilities: ['claude'],
+				credentialHash: 'hash-declares',
+			});
+
+			await updateWorkerCapabilities(created.id, ['claude'], undefined, 'smarttechbrewery/swarm');
+			expect((await getWorkerById(created.id))?.repository).toBe('smarttechbrewery/swarm');
+
+			// The `swarm workers set-cli` shape: no repository passed, so the declaration must
+			// survive rather than be cleared by a caller that knows nothing about checkouts.
+			await updateWorkerCapabilities(created.id, ['claude', 'codex']);
+			const after = await getWorkerById(created.id);
+			expect(after?.capabilities).toEqual(['claude', 'codex']);
+			expect(after?.repository).toBe('smarttechbrewery/swarm');
+
+			// An explicit null is a handshake from a daemon that declared none: the stale
+			// statement is cleared rather than left standing.
+			await updateWorkerCapabilities(created.id, ['claude', 'codex'], undefined, null);
+			expect((await getWorkerById(created.id))?.repository).toBeNull();
+		});
+
+		it('rolls the repository write back with the capability write when a reduction is refused', async () => {
+			await seedProject({ id: 'proj-repo-tx', repo: 'SmartTechBrewery/repo-repo-tx' });
+			const worker = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-repo-tx',
+				capabilities: ['claude', 'codex'],
+				credentialHash: 'hash-repo-tx',
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: 'proj-repo-tx',
+				status: 'active',
+				allowedClis: ['codex'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+
+			// The enrollment still requires codex, so the whole call must fail — and the
+			// declaration it also carried must not have landed (the same-transaction claim).
+			await expect(
+				updateWorkerCapabilities(worker.id, ['claude'], undefined, 'smarttechbrewery/swarm'),
+			).rejects.toThrow(WorkerCapabilityReductionError);
+
+			expect((await getWorkerById(worker.id))?.repository).toBeNull();
+		});
+	});
+
 	describe('updateWorkerCapabilities', () => {
 		it('changes the capability set', async () => {
 			const created = await createWorker({

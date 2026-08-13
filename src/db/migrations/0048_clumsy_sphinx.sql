@@ -1,0 +1,12 @@
+-- Issue #687: a worker's daemon now declares which repository its one local
+-- checkout is, resolved from that checkout's `origin` remote and carried on the
+-- handshake (`HandshakeRequestSchema.repository`, `src/transport/protocol.ts`). The
+-- control plane learns it no other way — `SWARM_WORKER_REPO_ROOT` is host-local and
+-- never travels, and `hostname` is diagnostic and unpersisted.
+--
+-- Nullable with no default on purpose: NULL is "this daemon declared no
+-- repository", which is exactly what every row written before this column says, and
+-- what a daemon too old to send the field keeps saying. There is nothing to backfill
+-- and no default that would be honest — a machine's checkout is not guessable from
+-- its enrollments. No index either: nothing queries by it yet.
+ALTER TABLE "workers" ADD COLUMN "repository" text;

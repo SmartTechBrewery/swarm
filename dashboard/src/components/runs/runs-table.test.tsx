@@ -30,6 +30,7 @@ import { RunsTable } from './runs-table.js';
 const baseRun: RunRow = {
 	id: 'run-1',
 	projectId: 'proj-a',
+	repository: 'acme/widgets',
 	taskId: '42',
 	workItemId: 'issue-42',
 	workItemTitle: 'Fix the widget',
@@ -64,9 +65,10 @@ const baseRun: RunRow = {
 
 const project = { id: 'proj-a', name: 'Acme', repositories: [{ repo: 'acme/widgets' }] };
 
-// Seed the `projects.list` cache so run cards/rows can resolve the repo (needed
-// for the Task work-item link) synchronously. `staleTime: Infinity` keeps
-// the mocked queryFn from refetching and clobbering the seeded value mid-test.
+// Seed the `projects.list` cache so run cards/rows can resolve the project *name*
+// synchronously. `staleTime: Infinity` keeps the mocked queryFn from refetching and
+// clobbering the seeded value mid-test. The Task cell's PR link needs nothing from
+// here — it comes from the run's own `repository` (issue #691).
 function renderTable(ui: ReactElement, projects: unknown[] = [project]) {
 	const queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
@@ -306,6 +308,67 @@ describe('RunsTable', () => {
 
 			expect(navigate).not.toHaveBeenCalled();
 			expect(event.defaultPrevented).toBe(false);
+		});
+	});
+
+	// issue #691 — the Task cell's PR link resolves the repository from the run, not
+	// by joining its project, so it stays right for a project spanning several repos.
+	describe('PR link repository (issue #691)', () => {
+		const prRun: RunRow = {
+			...baseRun,
+			phase: 'review',
+			prNumber: '42',
+			prTitle: 'PR Title',
+			repository: 'acme/api',
+		};
+
+		it('builds the PR link from the run repository even when the project names another', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[prRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+				// The cached project still says `acme/widgets` — the pre-#691 source of
+				// this link — so an href naming it would mean the join is still in play.
+				[project],
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			expect(
+				within(table)
+					.getByRole('link', { name: /PR #42/ })
+					.getAttribute('href'),
+			).toBe('https://github.com/acme/api/pull/42');
+
+			const card = screen.getByTestId('run-card');
+			expect(
+				within(card)
+					.getByRole('link', { name: /PR #42/ })
+					.getAttribute('href'),
+			).toBe('https://github.com/acme/api/pull/42');
+		});
+
+		it('still links the PR when the project lookup has not loaded at all', () => {
+			renderTable(
+				<RunsTable
+					runs={[prRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+				[],
+			);
+
+			const card = screen.getByTestId('run-card');
+			expect(
+				within(card)
+					.getByRole('link', { name: /PR #42/ })
+					.getAttribute('href'),
+			).toBe('https://github.com/acme/api/pull/42');
 		});
 	});
 

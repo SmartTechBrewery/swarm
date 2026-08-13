@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	ENROLLMENT_STATUS_LABELS,
 	type RoutabilityInput,
+	repositoryMismatch,
 	routabilityBlockers,
 } from './worker-enrollment-view.js';
 
@@ -42,6 +43,27 @@ describe('routabilityBlockers (issue #477)', () => {
 		expect(routabilityBlockers(enrollment({ sharingConsent: false, isRoutable: true }))).toEqual(
 			[],
 		);
+	});
+});
+
+describe('repositoryMismatch (issue #690)', () => {
+	it('returns the two repositories that disagree', () => {
+		expect(repositoryMismatch('acme/frontend', 'acme/backend')).toEqual({
+			declaredRepository: 'acme/frontend',
+			projectRepository: 'acme/backend',
+		});
+	});
+
+	it('is null when the machine’s checkout is the project’s repository', () => {
+		expect(repositoryMismatch('acme/frontend', 'acme/frontend')).toBeNull();
+	});
+
+	// Unknown is not wrong: a machine that declared nothing must not read as one that
+	// declared the wrong thing — the rule the server's own checks apply.
+	it('is null when either side is unknown', () => {
+		expect(repositoryMismatch(null, 'acme/backend')).toBeNull();
+		expect(repositoryMismatch('acme/frontend', null)).toBeNull();
+		expect(repositoryMismatch(null, null)).toBeNull();
 	});
 });
 

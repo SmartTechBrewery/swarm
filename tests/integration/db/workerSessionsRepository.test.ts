@@ -23,6 +23,7 @@ import { seedProject } from '../helpers/seed.js';
 
 const TTL = 60_000;
 const PROJECT_ID = 'proj-worker-sessions';
+const REPO = 'jkwiecien/worker-sessions-repo';
 
 /** Push a worker's session heartbeat far enough into the past that it is expired under `TTL`. */
 async function expireSession(workerId: string): Promise<void> {
@@ -41,7 +42,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 		beforeEach(async () => {
 			await truncateAll();
-			await seedProject({ id: PROJECT_ID, repo: 'jkwiecien/worker-sessions-repo' });
+			await seedProject({ id: PROJECT_ID, repo: REPO });
 			adaId = (await createUser({ identifier: 'ada@example.com', displayName: 'Ada' })).id;
 			workerA = (
 				await createWorker({
@@ -135,6 +136,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 				const runId = await createRun({
 					projectId: PROJECT_ID,
+					repository: REPO,
 					taskId: 'w-released',
 					phase: 'implementation',
 				});
@@ -217,6 +219,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					const first = await acquireLease(workerA, TTL);
 					const runId = await createRun({
 						projectId: PROJECT_ID,
+						repository: REPO,
 						taskId: 'w-reclaim-fencing',
 						phase: 'implementation',
 					});
@@ -238,6 +241,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					const first = await acquireLease(workerA, TTL);
 					const runId = await createRun({
 						projectId: PROJECT_ID,
+						repository: REPO,
 						taskId: 'w-reclaim-run',
 						phase: 'implementation',
 					});
@@ -322,6 +326,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const session = await acquireLease(workerA, TTL);
 				const runId = await createRun({
 					projectId: PROJECT_ID,
+					repository: REPO,
 					taskId: 'w-1',
 					phase: 'implementation',
 				});
@@ -337,6 +342,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const session = await acquireLease(workerA, TTL);
 				const runId = await createRun({
 					projectId: PROJECT_ID,
+					repository: REPO,
 					taskId: 'w-2',
 					phase: 'implementation',
 				});
@@ -347,6 +353,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const session = await acquireLease(workerA, TTL);
 				const runId = await createRun({
 					projectId: PROJECT_ID,
+					repository: REPO,
 					taskId: 'w-3',
 					phase: 'implementation',
 				});

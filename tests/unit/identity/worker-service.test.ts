@@ -52,6 +52,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -135,7 +136,14 @@ describe('refreshWorkerCapabilities', () => {
 		// No phases passed through: the caller declared none, so the stored repertoire is
 		// left untouched rather than reset to the every-phase default (issue #467) — the
 		// `swarm workers set-cli` path, which knows nothing about phases.
-		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['codex'], undefined);
+		// The fourth argument is `undefined` for the same reason (issue #687): a caller
+		// that knows nothing about checkouts must not clear the stored declaration.
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['codex'],
+			undefined,
+			undefined,
+		);
 	});
 
 	it('validates and forwards a declared phase set when one is given', async () => {
@@ -154,7 +162,47 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			['implementation', 'review'],
+			undefined,
 		);
+	});
+
+	// Issue #687 — the daemon's checkout declaration, three-valued at this seam so the
+	// CLI-only path can leave a fact it knows nothing about alone.
+	it('validates and forwards a declared repository, normalised', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities(
+			'worker-1',
+			['claude'],
+			undefined,
+			'SmartTechBrewery/Swarm.git',
+		);
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			'smarttechbrewery/swarm',
+		);
+	});
+
+	it('forwards null unchanged, which clears an earlier daemon’s declaration', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null);
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['claude'], undefined, null);
+	});
+
+	it('rejects a malformed repository without hitting the repository layer', async () => {
+		await expect(
+			refreshWorkerCapabilities('worker-1', ['claude'], undefined, 'not-a-slug'),
+		).rejects.toThrow();
+		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
 	});
 
 	it('rejects an empty phase set without hitting the repository', async () => {

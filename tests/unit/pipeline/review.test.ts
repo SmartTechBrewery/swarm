@@ -15,6 +15,13 @@ import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const HEAD_SHA = 'abc1234def5678abc1234def5678abc1234def56';
 
+/**
+ * The repository the run recorded (issue #692) — distinct from
+ * `createMockProjectConfig()`'s own `repo`, so an assertion on it fails if the
+ * phase falls back to reading the project config.
+ */
+const RUN_REPOSITORY = 'SmartTechBrewery/run-repo';
+
 const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -93,6 +100,10 @@ function makeDeps() {
 	return {
 		path,
 		project: createMockProjectConfig(),
+		// Deliberately *not* `project.repo`: the phase is fed the repository its run
+		// recorded, so every assertion below expecting this value is what proves the
+		// ledger key and the prompt are no longer project-derived (issue #692).
+		repository: RUN_REPOSITORY,
 		prNumber: '99',
 		headSha: HEAD_SHA,
 		taskId: 'review-20',
@@ -150,7 +161,8 @@ describe('runReviewPhase', () => {
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.cli).toBe('claude');
 		expect(runArgs.cwd).toBe(deps.path);
-		expect(runArgs.args?.[0]).toContain('gh pr diff 99');
+		// The prompt names the repository the run recorded, not the project's own.
+		expect(runArgs.args?.[0]).toContain(`gh pr diff 99 --repo ${RUN_REPOSITORY}`);
 		expect(runArgs.env).toEqual({ GH_TOKEN: 'reviewer-token' });
 
 		// Env is grafted into the worktree before the agent runs.
@@ -310,7 +322,8 @@ describe('runReviewPhase', () => {
 			expect(deps.markReviewVerdictSubmitted).toHaveBeenCalledWith(
 				{
 					projectId: deps.project.id,
-					repository: deps.project.repo,
+					// The run's own repository, not the project's (issue #692).
+					repository: RUN_REPOSITORY,
 					prNumber: '99',
 					headSha: HEAD_SHA,
 				},
@@ -374,7 +387,7 @@ describe('runReviewPhase', () => {
 
 			expect(deps.abandonReviewVerdict).toHaveBeenCalledWith({
 				projectId: deps.project.id,
-				repository: deps.project.repo,
+				repository: RUN_REPOSITORY,
 				prNumber: '99',
 				headSha: HEAD_SHA,
 			});
@@ -400,12 +413,12 @@ describe('runReviewPhase', () => {
 			headSha: 'oldsha0000000000000000000000000000000000',
 		};
 
-		it('looks up the prior submitted review by PR at the current head', async () => {
+		it('looks up the prior submitted review by PR at the current head, in the run’s repository', async () => {
 			const deps = makeDeps();
 			await runReviewPhase(deps);
 			expect(deps.getPriorSubmittedReview).toHaveBeenCalledWith(
 				deps.project.id,
-				deps.project.repo,
+				RUN_REPOSITORY,
 				'99',
 				HEAD_SHA,
 			);

@@ -70,6 +70,7 @@ async function seedCappedReviewRun(headSha: string, reviewId: string): Promise<s
 	};
 	const runId = await createRun({
 		projectId: PROJECT_ID,
+		repository: REPO,
 		taskId: PR,
 		phase: 'review',
 		prNumber: PR,

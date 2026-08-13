@@ -67,6 +67,7 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		repository: 'SmartTechBrewery/swarm',
 		taskId: '508',
 		workItemId: null,
 		workItemTitle: null,

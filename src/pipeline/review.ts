@@ -157,6 +157,17 @@ const MAX_AGENT_OUTPUT_BYTES = 1_000_000;
 export interface RunReviewPhaseOptions {
 	/** The SWARM project whose repo the PR belongs to. */
 	project: ProjectConfig;
+	/**
+	 * The repository this run acts on — the same value recorded on its run row
+	 * (`runs.repository`, issue #683). Required, and fed from the control plane
+	 * rather than read off `project.repo`: it is what the review-verdict ledger
+	 * keys on (both the prior-submitted-review lookup and the submitted slot) and
+	 * what the review prompt names, so once a project can hold several
+	 * repositories those rows key on the repository the run actually reviewed
+	 * rather than on whichever one the config happens to list first. Identical to
+	 * `project.repo` while a project holds exactly one.
+	 */
+	repository: string;
 	/** The number of the PR under review. */
 	prNumber: string;
 	/**
@@ -296,6 +307,8 @@ interface ReviewAgentRunParams {
 	resumed: boolean;
 	worktreePath: string;
 	project: ProjectConfig;
+	/** The repository the run recorded ({@link RunReviewPhaseOptions.repository}). */
+	repository: string;
 	prNumber: string;
 	headSha: string;
 	taskId: string;
@@ -331,6 +344,7 @@ async function produceReviewAgentResult(
 		resumed,
 		worktreePath,
 		project,
+		repository,
 		prNumber,
 		headSha,
 		taskId,
@@ -345,7 +359,7 @@ async function produceReviewAgentResult(
 	// Read-only, and the current head is excluded, so this can't mistake the run's
 	// own slot for a prior review. Resolved before the resume check so the phase's
 	// completion log reports `isReReview` accurately on a resumed delivery too.
-	const priorReview = await getPriorSubmittedReview(project.id, project.repo, prNumber, headSha);
+	const priorReview = await getPriorSubmittedReview(project.id, repository, prNumber, headSha);
 	const isReReview = priorReview?.verdict === 'request-changes';
 	// This run's own slot number, for the rendered body's pass label (issue #470).
 	// Derived from the prior *submitted* verdict rather than read back from the
@@ -376,7 +390,7 @@ async function produceReviewAgentResult(
 		reasoning,
 		...sessionRunArgs({ sessionId, resumeSessionId }, resumed),
 		cwd: worktreePath,
-		args: [buildReviewPrompt({ repo: project.repo, prNumber, headSha }, customPrompt, isReReview)],
+		args: [buildReviewPrompt({ repo: repository, prNumber, headSha }, customPrompt, isReReview)],
 		// `gh` reads GH_TOKEN ahead of any ambient `gh auth` login, so every gh
 		// call the agent makes acts as the reviewer persona.
 		maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
@@ -633,6 +647,7 @@ async function readReviewSubmission(
 export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<ReviewPhaseResult> {
 	const {
 		project,
+		repository,
 		prNumber,
 		headSha,
 		taskId,
@@ -655,7 +670,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 	} = options;
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
 	const agentToken = await (options.getToken ?? getPersonaToken)(project, 'reviewer');
-	const verdictKey = { projectId: project.id, repository: project.repo, prNumber, headSha };
+	const verdictKey = { projectId: project.id, repository, prNumber, headSha };
 
 	logger.info(`Phase started - Review — running ${describeAgent(cli, model, reasoning)}`, {
 		taskId,
@@ -698,6 +713,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			resumed,
 			worktreePath: handle.path,
 			project,
+			repository,
 			prNumber,
 			headSha,
 			taskId,
@@ -746,6 +762,10 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 		const delivery =
 			options.delivery ??
 			(await requireProjectSCMProvider(project).deliveryProvider(project, 'reviewer'));
+		// Deliberately still `project.repo`, not the run's `repository`: this is a
+		// resume-idempotency key a preserved worktree's sidecar was written under, so
+		// re-deriving it from a different input would orphan the progress of a run in
+		// flight across the deploy. The two values are identical today (issue #692).
 		const deliveryId = deliveryIdentity(['review', project.repo, prNumber, headSha]);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);

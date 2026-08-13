@@ -6,7 +6,6 @@ import {
 	formatRelativeTime,
 	formatTokensCompact,
 } from '@/lib/format.js';
-import { projectRepo } from '@/lib/project-repository.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import { runTableColumnWidths } from '@/lib/run-table-layout.js';
 import { trpc } from '@/lib/trpc.js';
@@ -85,7 +84,7 @@ export function RunsTable({
 								className="flex items-start justify-between gap-3"
 							>
 								<div className="min-w-0 flex-1">
-									<WorkItemCell run={run} repo={projectRepo(project)} variant="card" />
+									<WorkItemCell run={run} variant="card" />
 								</div>
 								<RunStatusBadge
 									status={
@@ -212,7 +211,7 @@ export function RunsTable({
 									</td>
 								)}
 								<td className={`${columnWidths.task} px-2 py-3 text-sm`}>
-									<WorkItemCell run={run} repo={projectRepo(projectsMap.get(run.projectId))} />
+									<WorkItemCell run={run} />
 								</td>
 								<td className="px-2 py-3 text-sm">
 									<RunStatusBadge

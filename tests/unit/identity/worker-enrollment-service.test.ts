@@ -23,6 +23,7 @@ const { getWorkerById, listAllWorkers, listWorkersForOwner } = vi.hoisted(() => 
 	listWorkersForOwner: vi.fn(),
 }));
 const { getUserById } = vi.hoisted(() => ({ getUserById: vi.fn() }));
+const { findProjectByIdFromDb } = vi.hoisted(() => ({ findProjectByIdFromDb: vi.fn() }));
 const { getRunByIdFromDb } = vi.hoisted(() => ({ getRunByIdFromDb: vi.fn() }));
 const { getLiveSessionForWorker, getRetainedSessionForWorker } = vi.hoisted(() => ({
 	getLiveSessionForWorker: vi.fn(),
@@ -48,6 +49,7 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 	listWorkersForOwner,
 }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ getUserById }));
+vi.mock('@/db/repositories/projectsRepository.js', () => ({ findProjectByIdFromDb }));
 vi.mock('@/db/repositories/runsRepository.js', () => ({ getRunByIdFromDb }));
 vi.mock('@/identity/worker-session-service.js', () => ({
 	getLiveSessionForWorker,
@@ -67,12 +69,14 @@ import {
 	DEFAULT_CONCURRENCY_ALLOCATION,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	deriveWorkerRunState,
+	EnrollmentRepositoryMismatchError,
 	enrollWorker,
 	getDashboardWorkerDetail,
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
 	setSharingConsent,
+	suspendEnrollmentsForMismatchedRepository,
 	updateEnrollmentConstraints,
 } from '@/identity/worker-enrollment-service.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
@@ -89,6 +93,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -123,6 +128,15 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 	};
 }
 
+/**
+ * A project as `findProjectByIdFromDb` answers it. Only `repo` is set, because that
+ * is the only field this surface reads from a project (issue #690) — a whole
+ * `ProjectConfig` fixture would hide how narrow the coupling is.
+ */
+function makeProject(repo = 'SmartTechBrewery/swarm') {
+	return { id: 'proj-a', repo };
+}
+
 beforeEach(() => {
 	for (const m of [
 		createEnrollment,
@@ -141,11 +155,15 @@ beforeEach(() => {
 		getActiveWorkerClaims,
 		getLiveSessionForWorker,
 		getRetainedSessionForWorker,
+		findProjectByIdFromDb,
 	]) {
 		m.mockReset();
 	}
 	getWorkerDispatchClaimState.mockResolvedValue({ activeRuns: 0, currentRunId: null });
 	getActiveWorkerClaims.mockResolvedValue([]);
+	// Every project resolves to the repository the default worker declares nothing
+	// about, so the repository check (issue #690) is inert unless a test opts in.
+	findProjectByIdFromDb.mockResolvedValue(makeProject());
 });
 
 describe('deriveWorkerRunState (busy/current-run from run lifecycle)', () => {
@@ -291,6 +309,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 			id: RUN_ID,
 			status: 'running',
 			projectId: 'proj-a',
+			repository: 'acme/api',
 			taskId: '42',
 			phase: 'implementation',
 			workItemId: 'I_kwitem',
@@ -359,10 +378,13 @@ describe('listDashboardWorkers (issue #133)', () => {
 
 			const [view] = await listDashboardWorkers(null);
 			// The Workers screen renders the same work-item description `/runs` does
-			// (issue #473), so the read model carries the run's task fields.
+			// (issue #473), so the read model carries the run's task fields — including
+			// the repository the run acted on, which is where its PR link comes from
+			// rather than the owning project's repo (issue #691).
 			expect(view.currentRun).toEqual({
 				runId: RUN_ID,
 				projectId: 'proj-a',
+				repository: 'acme/api',
 				taskId: '42',
 				phase: 'implementation',
 				workItemId: 'I_kwitem',
@@ -393,6 +415,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 					'prNumber',
 					'prTitle',
 					'projectId',
+					'repository',
 					'runId',
 					'taskId',
 					'workItemId',
@@ -624,6 +647,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'enrollments',
 				'lastSeenAt',
 				'owner',
+				'repository',
 				'supportedPhases',
 				'workerId',
 			].sort(),
@@ -742,6 +766,78 @@ describe('enrollWorker', () => {
 		expect(createEnrollment).toHaveBeenCalledWith(
 			expect.objectContaining({ allowedPhases: ['planning'] }),
 		);
+	});
+
+	// Issue #690 — an enrollment must name the repository the machine's own checkout
+	// is, because a worker holds exactly one and work for any other repository can
+	// only be refused.
+	describe('the project must be the worker’s declared repository (issue #690)', () => {
+		it('refuses a project for a different repository, writing nothing', async () => {
+			const worker = makeWorker({ repository: 'acme/frontend' });
+			findProjectByIdFromDb.mockResolvedValue(makeProject('acme/backend'));
+
+			await expect(
+				enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude'] }),
+			).rejects.toBeInstanceOf(EnrollmentRepositoryMismatchError);
+			expect(createEnrollment).not.toHaveBeenCalled();
+		});
+
+		it('names both repositories on the error itself', async () => {
+			const worker = makeWorker({ repository: 'acme/frontend' });
+			findProjectByIdFromDb.mockResolvedValue(makeProject('acme/backend'));
+
+			const error = await enrollWorker({
+				worker,
+				projectId: 'proj-a',
+				allowedClis: ['claude'],
+			}).then(
+				() => undefined,
+				(err: unknown) => err as EnrollmentRepositoryMismatchError,
+			);
+			if (!error) throw new Error('expected the enrollment to be refused');
+
+			expect(error.workerId).toBe(WORKER_ID);
+			expect(error.declaredRepository).toBe('acme/frontend');
+			expect(error.projectRepository).toBe('acme/backend');
+			expect(error.message).toContain('acme/frontend');
+			expect(error.message).toContain('acme/backend');
+		});
+
+		it('allows a project for that repository, comparing case and .git as noise', async () => {
+			const worker = makeWorker({ repository: 'acme/frontend' });
+			findProjectByIdFromDb.mockResolvedValue(makeProject('Acme/Frontend.git'));
+			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+			await enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude'] });
+
+			expect(createEnrollment).toHaveBeenCalledTimes(1);
+		});
+
+		// An unidentifiable checkout must not lock an operator out of enrolling their
+		// own machine — the same rule the daemon's assignment check applies.
+		it('allows a worker that declared no repository', async () => {
+			const worker = makeWorker({ repository: null });
+			findProjectByIdFromDb.mockResolvedValue(makeProject('acme/backend'));
+			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+			await enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude'] });
+
+			expect(createEnrollment).toHaveBeenCalledTimes(1);
+			// Not even read: no declaration, nothing to compare.
+			expect(findProjectByIdFromDb).not.toHaveBeenCalled();
+		});
+
+		// Not a second not-found path: the enrollment's own FK is what refuses an
+		// unknown project, and answering it here would pre-empt the caller's authz.
+		it('leaves an unresolvable project to the existing write path', async () => {
+			const worker = makeWorker({ repository: 'acme/frontend' });
+			findProjectByIdFromDb.mockResolvedValue(undefined);
+			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+			await enrollWorker({ worker, projectId: 'ghost', allowedClis: ['claude'] });
+
+			expect(createEnrollment).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	// Issue #542: `planning` is an ordinary phase. Nothing about who owns the machine
@@ -906,6 +1002,95 @@ describe('status / consent write delegation', () => {
 	});
 });
 
+// Issue #690 — the declaration path. A daemon reconnecting from a different checkout
+// contradicts the enrollments already written for it, and this is what acts on that.
+describe('suspendEnrollmentsForMismatchedRepository (issue #690)', () => {
+	/** Resolve each project id to its own repository, so one pass can mix matches and mismatches. */
+	function projectsByRepo(repos: Record<string, string>) {
+		findProjectByIdFromDb.mockImplementation(async (id: string) =>
+			repos[id] ? { id, repo: repos[id] } : undefined,
+		);
+	}
+
+	it('suspends only the enrollments whose project is another repository', async () => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ id: 'e-match', projectId: 'proj-front', status: 'active' }),
+			makeEnrollment({ id: 'e-miss', projectId: 'proj-back', status: 'active' }),
+		]);
+		projectsByRepo({ 'proj-front': 'Acme/Frontend.git', 'proj-back': 'acme/backend' });
+		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
+
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+
+		expect(updateEnrollmentStatus).toHaveBeenCalledTimes(1);
+		expect(updateEnrollmentStatus).toHaveBeenCalledWith('e-miss', 'suspended');
+		expect(suspended).toEqual([
+			{ enrollmentId: 'e-miss', projectId: 'proj-back', projectRepository: 'acme/backend' },
+		]);
+	});
+
+	it('creates nothing and activates nothing — enrollment stays a human decision', async () => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ id: 'e-miss', projectId: 'proj-back', status: 'pending' }),
+		]);
+		projectsByRepo({ 'proj-back': 'acme/backend' });
+		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
+
+		await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+
+		expect(createEnrollment).not.toHaveBeenCalled();
+		expect(setEnrollmentSharingConsent).not.toHaveBeenCalled();
+		expect(updateEnrollmentStatus).toHaveBeenCalledWith('e-miss', 'suspended');
+		expect(updateEnrollmentStatus).not.toHaveBeenCalledWith('e-miss', 'active');
+	});
+
+	// A matching declaration is not a re-approval: re-activation is the project
+	// administrator's act, so a machine cannot restore its own routability by
+	// re-pointing a checkout.
+	it('never re-activates an enrollment whose repository now matches', async () => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ id: 'e-suspended', projectId: 'proj-front', status: 'suspended' }),
+		]);
+		projectsByRepo({ 'proj-front': 'acme/frontend' });
+
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+
+		expect(suspended).toEqual([]);
+		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
+	});
+
+	it('leaves an already-suspended mismatched enrollment alone (no redundant write)', async () => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ id: 'e-miss', projectId: 'proj-back', status: 'suspended' }),
+		]);
+		projectsByRepo({ 'proj-back': 'acme/backend' });
+
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+
+		expect(suspended).toEqual([]);
+		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
+		// It is already suspended, so the project need not even be read.
+		expect(findProjectByIdFromDb).not.toHaveBeenCalled();
+	});
+
+	it('skips an enrollment whose project no longer resolves', async () => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ id: 'e-ghost', projectId: 'ghost', status: 'active' }),
+		]);
+		projectsByRepo({});
+
+		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend')).toEqual([]);
+		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
+	});
+
+	// Defensive: "matches nothing" would otherwise suspend every enrollment at once.
+	it('suspends nothing for a blank declaration', async () => {
+		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, '   ')).toEqual([]);
+		expect(listEnrollmentsForWorker).not.toHaveBeenCalled();
+		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
+	});
+});
+
 describe('getDashboardWorkerDetail (issue #477)', () => {
 	beforeEach(() => {
 		getLiveSessionForWorker.mockResolvedValue(undefined);
@@ -931,6 +1116,9 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 				concurrencyAllocation: 2,
 				sharingConsent: true,
 				isRoutable: true,
+				// Normalised, so the screen can compare it with the worker's own declaration
+				// by plain equality — the same comparison the write path makes (issue #690).
+				projectRepo: 'smarttechbrewery/swarm',
 			},
 		]);
 		// The roster row's own fields come along unchanged, so the detail view needs

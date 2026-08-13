@@ -80,6 +80,13 @@ export function isRetryPendingStatus(
 
 export interface CreateRunInput {
 	projectId: string;
+	/**
+	 * The repository this run acts on (`owner/repo`) — recorded on the row rather
+	 * than derived from the project later (issue #683). Required: the dispatcher is
+	 * the party that knows which repository the work is for, so a run is never
+	 * created without stating it.
+	 */
+	repository: string;
 	taskId: string;
 	phase: TriggerPhase;
 	workerId?: string;
@@ -118,6 +125,7 @@ export async function createRun(input: CreateRunInput): Promise<string> {
 		.values({
 			id,
 			projectId: input.projectId,
+			repository: input.repository,
 			taskId: input.taskId,
 			phase: input.phase,
 			workerId: input.workerId,
@@ -377,6 +385,9 @@ export async function resetRunToRunning(
 			// real external artifact that outlives the attempt, so a resumed
 			// Implementation retry re-reports the same URL and overwrites it, whereas
 			// clearing would erase the record of a PR that exists.
+			// `repository` is deliberately left alone too (issue #683): a retry re-runs
+			// the same work against the same repository, so the row keeps the one it
+			// was created for.
 			// `continuationCount` and `checkpoint` are deliberately *not* cleared either
 			// (issue #503): the count is the bound on the Tier 2 fallback, so resetting
 			// it on the very retry the fallback scheduled would make the loop unbounded,

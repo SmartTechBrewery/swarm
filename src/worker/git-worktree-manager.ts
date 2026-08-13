@@ -21,6 +21,7 @@ import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
 import { SCRATCH_PATHSPECS } from '../scm/delivery.js';
+import { normalizeRepoSlug, resolveOriginRepoSlug } from '../scm/repo-slug.js';
 import {
 	BlockedRecoveryError,
 	evaluateWorktreeReclaim,
@@ -42,34 +43,6 @@ function canonicalize(p: string): string {
 		return realpathSync(p);
 	} catch {
 		return resolve(p);
-	}
-}
-
-/** Compare a `ProjectConfig.repo` and a remote's path on equal terms — case and trailing `.git` are noise. */
-function normalizeRepoSlug(slug: string): string {
-	return slug
-		.trim()
-		.replace(/\.git$/i, '')
-		.replace(/^\/+/, '')
-		.replace(/\/+$/, '')
-		.toLowerCase();
-}
-
-/**
- * The `owner/name` a clone URL points at, or `null` when it cannot be read.
- * Deliberately provider-neutral: handles `scp`-style (`git@host:owner/name`),
- * `ssh://`, and `https://` forms, and keeps the whole path so a nested namespace
- * (a GitLab subgroup) compares correctly rather than being truncated to two parts.
- */
-function repoSlugFromRemoteUrl(url: string): string | null {
-	const trimmed = url.trim();
-	if (trimmed === '') return null;
-	const scpStyle = trimmed.match(/^[^/@]+@[^:/]+:(.+)$/);
-	if (scpStyle?.[1]) return normalizeRepoSlug(scpStyle[1]);
-	try {
-		return normalizeRepoSlug(new URL(trimmed).pathname) || null;
-	} catch {
-		return null;
 	}
 }
 
@@ -748,16 +721,13 @@ export class GitWorktreeManager {
 	 * Verification is best-effort by design: a checkout with no `origin` cannot be
 	 * identified, and refusing one would break every local-only clone (and every
 	 * test fixture). Only a remote that resolves to a *different* repository is an
-	 * error — that is the case worth failing loudly on.
+	 * error — that is the case worth failing loudly on. `resolveOriginRepoSlug`
+	 * (`../scm/repo-slug.ts`) owns both the read and the "unidentifiable is not an
+	 * error" contract, and is the same read the daemon's handshake declaration uses
+	 * (issue #687), so the two can never disagree about what this checkout is.
 	 */
 	private async assertRepoIdentity(): Promise<void> {
-		let remoteUrl: string;
-		try {
-			remoteUrl = (await this.git(['remote', 'get-url', 'origin'])).trim();
-		} catch {
-			return;
-		}
-		const actual = repoSlugFromRemoteUrl(remoteUrl);
+		const actual = await resolveOriginRepoSlug(this.project.repoRoot);
 		if (!actual) return;
 		const expected = normalizeRepoSlug(this.project.repo);
 		if (actual === expected) return;

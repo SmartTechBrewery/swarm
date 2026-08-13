@@ -189,6 +189,11 @@ const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
  * stays required rather than defaulted because a default would be a claim the
  * transport made on a caller's behalf: a daemon that later narrows its repertoire
  * would silently keep claiming phases it refuses.
+ *
+ * `repository` is the checkout this daemon holds (issue #687), omitted entirely
+ * when the caller could not identify it — the key is left off the body rather than
+ * sent as null, so the request a daemon with an unidentifiable checkout sends is
+ * byte-identical to the one a daemon predating the field sends.
  */
 export function buildHandshakeRequest(input: {
 	credential: string;
@@ -196,6 +201,7 @@ export function buildHandshakeRequest(input: {
 	hostname: string;
 	capabilities: AgentCli[];
 	supportedPhases: readonly TaskPhase[];
+	repository?: string;
 }): HandshakeRequest {
 	return HandshakeRequestSchema.parse({
 		credential: input.credential,
@@ -203,6 +209,7 @@ export function buildHandshakeRequest(input: {
 		hostname: input.hostname,
 		capabilities: input.capabilities,
 		supportedPhases: [...input.supportedPhases],
+		...(input.repository ? { repository: input.repository } : {}),
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
 }
@@ -544,6 +551,14 @@ export interface WorkerTransportOptions {
 	 */
 	supportedPhases: readonly TaskPhase[];
 	/**
+	 * The `owner/repo` this daemon's one local checkout is (issue #687), declared at
+	 * handshake so the control plane knows which repository the machine can actually
+	 * work in — `repoRoot` itself is host-local and never travels. `./connect-entry.ts`
+	 * resolves it once from the checkout's `origin` remote; omitted when the checkout
+	 * cannot be identified, which declares nothing rather than failing.
+	 */
+	repository?: string;
+	/**
 	 * Re-run capability discovery after the control plane rejects the declared set
 	 * (issue #559). A PATH probe can miss a CLI that is installed — a loaded
 	 * machine, a binary mid-upgrade — and that rejection is otherwise terminal, so
@@ -579,6 +594,16 @@ export interface WorkerTransportOptions {
 	 * how a daemon predating the frame behaves.
 	 */
 	onCancel?: (cancel: TaskCancel) => void;
+	/**
+	 * Called with each established session, before the stream opens — the only place
+	 * a daemon learns the `workerId` it authenticates as, since the credential does
+	 * not carry it (issue #689: the checkout lock records it so a second daemon's
+	 * refusal can *name* the holder). Worker-side bookkeeping only, so it changes no
+	 * wire shape; it fires again on every reconnect, and a handler must therefore be
+	 * idempotent. A throwing handler is logged and swallowed rather than killing the
+	 * transport — this is not the connection.
+	 */
+	onSession?: (session: HandshakeResponse) => void;
 }
 
 /** How a live session ended, deciding whether the loop reconnects or fails. */
@@ -819,6 +844,7 @@ export function connectWorkerTransport(
 				reclaimed: heldSession !== undefined,
 			});
 			heldSession = { sessionId: session.sessionId, fencingToken: session.fencingToken };
+			notifySession(session, options, deps.logger);
 
 			const end = await runSession(session);
 			if (stopped) break;
@@ -877,6 +903,27 @@ function isFatalHandshakeError(err: unknown, everConnected: boolean): boolean {
 	if (err instanceof WorkerCapabilityConflictError) return true;
 	if (err instanceof WorkerSessionConflictError) return !everConnected;
 	return false;
+}
+
+/**
+ * Hand the established session to the daemon's own bookkeeping
+ * ({@link WorkerTransportOptions.onSession}). Guarded, because that handler is not
+ * part of the connection: a throw here would otherwise reject the connect loop and
+ * take a healthy session down with it.
+ */
+function notifySession(
+	session: HandshakeResponse,
+	options: WorkerTransportOptions,
+	logger: TransportLogger,
+): void {
+	if (!options.onSession) return;
+	try {
+		options.onSession(session);
+	} catch (err) {
+		logger.warn('worker session handler failed', {
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
 }
 
 /**

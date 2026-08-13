@@ -79,6 +79,13 @@ export interface BuildTaskAssignmentInput {
 	 * §3); omitted when nothing links the task to a card.
 	 */
 	boardItemId?: string;
+	/**
+	 * The repository this run acts on, resolved by the caller from the same source
+	 * the run row's `repository` column is written from (issue #683). Carried on the
+	 * frame because a federated worker has no database to read that row from
+	 * (ADR-003 §2 / ADR-004 §3); omitted only by a router predating the field.
+	 */
+	repository?: string;
 }
 
 /** Map a PM `WorkItem` to the transport's serialization subset (`AssignedWorkItem`). */
@@ -130,6 +137,7 @@ export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssign
 		workItem: input.workItem ? toAssignedWorkItem(input.workItem) : undefined,
 		...input.pr,
 		boardItemId: input.boardItemId,
+		repository: input.repository,
 	};
 	// Validate before returning so a bad assembly fails at the seam, not on the wire.
 	return TaskAssignmentSchema.parse(assignment);

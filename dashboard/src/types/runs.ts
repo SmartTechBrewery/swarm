@@ -312,6 +312,13 @@ export interface PendingRunRequest {
 export interface RunRow {
 	id: string;
 	projectId: string;
+	/**
+	 * The repository this run acted on, in `owner/repo` form — mirrors the
+	 * `repository` column (issue #683). Every run-facing surface builds its PR link
+	 * from this rather than from the owning project's `repo` (issue #691): a project
+	 * id identifies a repository only while the project owns exactly one.
+	 */
+	repository: string;
 	taskId: string;
 	workItemId: string | null;
 	workItemTitle: string | null;

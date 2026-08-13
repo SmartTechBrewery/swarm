@@ -62,6 +62,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		},
 		capabilities: ['claude'],
 		supportedPhases: ['planning', 'implementation'],
+		repository: 'acme/frontend',
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
 		currentRun: null,

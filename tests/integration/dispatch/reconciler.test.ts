@@ -22,6 +22,7 @@ import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
 const PROJECT_ID = 'proj-reconciler';
+const REPO = 'jkwiecien/reconciler-repo';
 
 function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
 	return { ...createMockScmWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
@@ -39,7 +40,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 
 		beforeEach(async () => {
 			await truncateAll();
-			await seedProject({ id: PROJECT_ID, repo: 'jkwiecien/reconciler-repo' });
+			await seedProject({ id: PROJECT_ID, repo: REPO });
 			const url = new URL(process.env.REDIS_URL ?? '');
 			const connection = { host: url.hostname, port: Number(url.port || 6379) };
 			inspect ??= new Queue<SwarmJob>(QUEUE_NAME, { connection });
@@ -67,6 +68,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		it('imports a deferred run whose retry job vanished as a scheduled dispatch (the #269 orphan)', async () => {
 			const runId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: '269',
 				phase: 'implementation',
 				jobPayload: job(),
@@ -91,7 +93,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		});
 
 		it('fails a leased dispatch (and its running run) left by a dead worker (the #279 orphan)', async () => {
-			const runId = await createRun({ projectId: PROJECT_ID, taskId: '279', phase: 'review' });
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '279',
+				phase: 'review',
+			});
 			const { dispatch } = await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: job({ runId }),
@@ -141,6 +148,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		it('imports legacy not-ready merge-follow-up intent as a durable merge dispatch, exactly once (issue #292)', async () => {
 			const runId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: '17',
 				phase: 'review',
 				prNumber: '17',
@@ -183,6 +191,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		it('is idempotent — a second startup pass changes nothing', async () => {
 			const runId = await createRun({
 				projectId: PROJECT_ID,
+				repository: REPO,
 				taskId: '269',
 				phase: 'implementation',
 				jobPayload: job(),

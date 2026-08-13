@@ -29,6 +29,7 @@ import { AgentCliSchema } from '../harness/agent-cli.js';
 import { WorkerSessionReclaimSchema } from '../identity/worker-session.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { RecoveryIntentSchema } from '../queue/jobs.js';
+import { RepoSlugSchema } from '../scm/repo-slug.js';
 import { TriggerPhaseSchema } from '../triggers/types.js';
 
 /**
@@ -108,6 +109,27 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * additive, backward-compatible frame change (see {@link TRANSPORT_PROTOCOL_VERSION},
  * which is reserved for *incompatible* shape changes).
  *
+ * `repository` is the `owner/repo` the daemon's **one local checkout** actually is
+ * (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd), resolved from that checkout's
+ * `origin` remote at startup (issue #687). The control plane otherwise never learns
+ * it: `repoRoot` is host-local and never travels, and `hostname` above is
+ * diagnostic. It *is* the shared SCM definition (`RepoSlugSchema`,
+ * `../scm/repo-slug.js`) rather than a re-declaration — the same move
+ * {@link TaskPhaseSchema} and `reclaim` make below — so the wire, the persisted
+ * worker row (`workers.repository`), and the provision-time identity check cannot
+ * drift apart about what `owner/repo` means; the schema normalises, so the control
+ * plane records one canonical, host-less, `.git`-less form.
+ *
+ * **Optional on purpose, and unlike `hostname` it is persisted.** A daemon built
+ * before this field simply omits it and the column records NULL — exactly today's
+ * behaviour — and an older router ignores a key it does not know, so this too is
+ * additive in both directions and needs no protocol-version bump. A checkout with
+ * no identifiable `origin` declares nothing for the same reason, rather than failing
+ * to start. It carries **no secret**: a repository slug is public coordinates, not a
+ * credential, and like every handshake field it is never reflected in an error body.
+ * Nothing is gated on it here — refusing a mismatched assignment, a second daemon on
+ * one checkout, and a dishonest enrollment are the follow-on phases of issue #687.
+ *
  * `reclaim` is what lets a daemon say *"this is me, taking my own lease back"*
  * (issue #608). It carries the `sessionId`/`fencingToken` the control plane already
  * minted for this daemon — it *is* the identity module's validator
@@ -127,6 +149,7 @@ export const HandshakeRequestSchema = z.object({
 	hostname: z.string().min(1),
 	capabilities: z.array(AgentCliSchema).nonempty(),
 	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
+	repository: RepoSlugSchema.optional(),
 	reclaim: WorkerSessionReclaimSchema.optional(),
 	protocolVersion: z.number().int(),
 });
@@ -272,6 +295,17 @@ export const TaskAssignmentSchema = z.object({
 	 * Absent when nothing links the task to a card.
 	 */
 	boardItemId: z.string().optional(),
+	/**
+	 * The repository this run acts on, resolved control-plane side from the same
+	 * source the run row's `repository` column was written from (issue #683) — the
+	 * worker cannot read that row itself (ADR-003 §2), so the value travels here,
+	 * exactly like `boardItemId`. Review keys its verdict ledger on it (issue
+	 * #692). Additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` is
+	 * deliberately not bumped: an older worker ignores it, and an older router
+	 * omits it, in which case the executor falls back to the reconstructed
+	 * project's repo — the same string, while a project holds one repository.
+	 */
+	repository: z.string().optional(),
 	baseBranch: z.string().optional(),
 	baseSha: z.string().optional(),
 });

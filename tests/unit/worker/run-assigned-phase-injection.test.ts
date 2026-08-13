@@ -56,6 +56,7 @@ function stubDelivery(): ScmDeliveryProvider {
 const baseInputs = () => ({
 	taskId: '17',
 	project: createMockProjectConfig(),
+	repository: 'SmartTechBrewery/run-repo',
 	recovery: createMockPhaseRecovery(),
 	runAgent: vi.fn(async () => agentResult()) as never,
 	prNumber: '99',

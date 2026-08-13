@@ -32,6 +32,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -64,6 +65,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		heartbeat: vi.fn().mockResolvedValue(true),
 		releaseSession: vi.fn().mockResolvedValue(true),
 		refreshWorkerCapabilities: vi.fn().mockResolvedValue(makeWorker()),
+		suspendEnrollmentsForMismatchedRepository: vi.fn().mockResolvedValue([]),
 		resolveHeartbeatTtlMs: vi.fn().mockReturnValue(60_000),
 		validateFencingToken: vi.fn().mockResolvedValue(true),
 		deliverDispatchResult: vi.fn().mockReturnValue(true),
@@ -108,10 +110,13 @@ describe('handleHandshake', () => {
 		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, undefined);
 		// `validBody()` declares no `supportedPhases` — the older-daemon shape — so the
 		// handshake records every phase, the behaviour that pre-dated the field (#467).
+		// It declares no `repository` either, which records NULL (issue #687): the
+		// column's pre-existing value, and the one that clears a stale declaration.
 		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
 		);
 	});
 
@@ -122,7 +127,114 @@ describe('handleHandshake', () => {
 		const result = await handleHandshake(deps, { ...validBody(), supportedPhases: declared });
 
 		expect(result.status).toBe(200);
-		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['claude'], declared);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			declared,
+			null,
+		);
+	});
+
+	// Issue #687 — the third declaration. Persisted (unlike `hostname`) and normalised at
+	// this boundary, so the roster records one canonical `owner/repo` whatever form a
+	// daemon sent.
+	it('records the declared repository, normalised', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repository: 'SmartTechBrewery/Swarm.git',
+		});
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			'smarttechbrewery/swarm',
+		);
+		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
+	});
+
+	// Issue #690 — the declaration's second consumer: enrollments written against
+	// another repository are suspended once the machine says which one it is.
+	it('polices existing enrollments against the declared repository', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repository: 'SmartTechBrewery/Swarm.git',
+		});
+
+		expect(result.status).toBe(200);
+		// The normalised form, and only after the declaration was persisted — the pass
+		// acts on what the row now says.
+		expect(deps.suspendEnrollmentsForMismatchedRepository).toHaveBeenCalledWith(
+			WORKER_ID,
+			'smarttechbrewery/swarm',
+		);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledBefore(
+			deps.suspendEnrollmentsForMismatchedRepository as ReturnType<typeof vi.fn>,
+		);
+	});
+
+	it('polices nothing when the daemon declared no repository', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, validBody());
+
+		expect(result.status).toBe(200);
+		// An unidentifiable checkout must not suspend enrollments an operator created.
+		expect(deps.suspendEnrollmentsForMismatchedRepository).not.toHaveBeenCalled();
+	});
+
+	it('still completes the handshake when policing enrollments throws', async () => {
+		const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			suspendEnrollmentsForMismatchedRepository: vi
+				.fn()
+				.mockRejectedValue(new Error('postgres is unreachable')),
+		});
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repository: 'smarttechbrewery/swarm',
+		});
+
+		// Policing enrollments is housekeeping on the control plane's side — it must
+		// never stop a worker from connecting. The daemon's own pre-flight check
+		// (issue #688) refuses a mismatched assignment regardless.
+		expect(result.status).toBe(200);
+		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
+		expect(deps.releaseSession).not.toHaveBeenCalled();
+		expect(warn).toHaveBeenCalled();
+		warn.mockRestore();
+	});
+
+	it('does not police enrollments when the declaration could not be persisted', async () => {
+		const deps = makeDeps({
+			refreshWorkerCapabilities: vi
+				.fn()
+				.mockRejectedValue(new WorkerCapabilityReductionError(WORKER_ID, ['claude'])),
+		});
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repository: 'smarttechbrewery/swarm',
+		});
+
+		expect(result.status).toBe(409);
+		expect(deps.suspendEnrollmentsForMismatchedRepository).not.toHaveBeenCalled();
+	});
+
+	it('rejects a malformed repository with 400, before touching the lease', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, { ...validBody(), repository: 'not-a-slug' });
+
+		expect(result.status).toBe(400);
+		expect(deps.acquireSession).not.toHaveBeenCalled();
+		expect(deps.refreshWorkerCapabilities).not.toHaveBeenCalled();
 	});
 
 	it('rejects a malformed body with 400', async () => {

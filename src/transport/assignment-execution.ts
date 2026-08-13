@@ -20,7 +20,9 @@
  * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2). A
  * supported-phase gate cleanly fails any phase not yet runnable this way, so a
  * premature push fails with a clear result rather than crashing on a DB/Redis
- * access.
+ * access. A second pre-flight gate beside it refuses an assignment for a
+ * repository this worker's checkout is not (issue #688), which enrollment being
+ * per `(worker, project)` otherwise makes reachable.
  *
  * Cancellation needs no Redis (issue #549): the in-flight registry below indexes
  * each running assignment by `dispatchId`, a pushed `task-cancel` frame aborts the
@@ -48,6 +50,7 @@ import { createWriteOnlyTransportPmProvider } from '../pm/transport-delivery.js'
 import type { PMProvider, WorkItem, WorkItemBlocker } from '../pm/types.js';
 import { phaseRecoveryFromAssignment } from '../queue/jobs.js';
 import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
+import { repoSlugsMatch } from '../scm/repo-slug.js';
 import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js';
 import {
 	type AssignedPhaseInputs,
@@ -675,6 +678,18 @@ export interface RunAssignmentDbFreeOptions {
 	/** Absolute path to this worker host's checkout of the assigned repository. */
 	repoRoot: string;
 	/**
+	 * Which repository {@link RunAssignmentDbFreeOptions.repoRoot} actually is, as
+	 * this daemon declared it at handshake (issue #687) — the fact the pre-flight
+	 * check below refuses a mismatched assignment on. Absent when the checkout could
+	 * not be identified (no `origin`, a remote no slug reads from), in which case
+	 * nothing is refused here.
+	 *
+	 * Passed in rather than re-read per assignment: `./connect-entry.ts` resolves it
+	 * once at startup for the handshake, and re-reading would only invite this
+	 * worker's two answers to differ.
+	 */
+	checkoutRepository?: string;
+	/**
 	 * The worker operator's own account credential for the project's SCM provider,
 	 * resolved from this machine's environment by `./connect-entry.ts`
 	 * (`SWARM_OPERATOR_GH_TOKEN` on GitHub) — never a project credential.
@@ -756,6 +771,12 @@ function buildDbFreePhaseInputs({
 		phase: assignment.phase,
 		taskId: assignment.taskId,
 		project,
+		// Resolved control-plane side, where the run row that records it is written
+		// (issue #683) — this worker has no DB to read that row from. The fallback
+		// exists solely for router/worker version skew (a router predating the field
+		// omits it) and resolves to the same string today, since a project holds
+		// exactly one repository.
+		repository: assignment.repository ?? project.repo,
 		cli: assignment.target.cli,
 		model: assignment.target.model,
 		reasoning: assignment.target.reasoning,
@@ -859,6 +880,39 @@ export async function runAssignmentDbFree(
 				phase,
 				taskId,
 				error: `phase ${phase} is not yet runnable on a DB-free worker`,
+			});
+			return;
+		}
+
+		// Refuse an assignment for a repository this worker's one checkout is not
+		// (issue #688). Enrollment is per (worker, project), so a worker enrolled in
+		// two projects with different repositories is pushed both — and this daemon
+		// holds a single `repoRoot` to run them in. Checked before the project is
+		// reconstructed, so the refusal names the two repositories that disagree
+		// instead of surfacing as `assertRepoIdentity` failing deep inside worktree
+		// provisioning, after a checkout has already been touched.
+		//
+		// Terminal `failed`, never `deferred`: no retry on *this* worker can make the
+		// repositories match, so a deferral would re-push impossible work until the
+		// budget ran out — the same reasoning the phase gate above applies.
+		//
+		// An absent declaration skips the check entirely, preserving today's behaviour
+		// for a checkout that could not be identified; `assertRepoIdentity` still
+		// refuses at provision time whenever it *can* identify one.
+		const declaredRepository = options.checkoutRepository;
+		const assignedRepository = assignment.projectConfig.repo;
+		if (declaredRepository && !repoSlugsMatch(assignedRepository, declaredRepository)) {
+			sink.send({
+				type: 'task-execution-result',
+				dispatchId,
+				runId,
+				status: 'failed',
+				phase,
+				taskId,
+				error:
+					`assignment for repository '${assignedRepository}' cannot run on this worker's ` +
+					`checkout of '${declaredRepository}' (SWARM_WORKER_REPO_ROOT=${options.repoRoot}). ` +
+					'Enroll a worker whose checkout is that repository, or point this one at it.',
 			});
 			return;
 		}

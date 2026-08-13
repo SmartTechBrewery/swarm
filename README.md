@@ -197,12 +197,24 @@ operator's own GitHub token — no `DATABASE_URL`/`REDIS_URL`, even on a host th
 them. Its agent therefore authenticates as the *operator's own* GitHub account
 everywhere, which is ADR-004 §2's decision; the project-scoped reviewer PAT and PM
 credential never leave the server, so a submitted review's identity is unchanged. It performs the
-`/worker/session` handshake (declaring the CLIs it can run and the pipeline phases
-it can execute), keeps its session
+`/worker/session` handshake (declaring the CLIs it can run, the pipeline phases
+it can execute, and — since issue #687 — which repository its one local checkout
+actually is, read from that checkout's `origin` remote and persisted on the worker
+row; a checkout with no identifiable `origin` simply declares nothing), keeps its session
 live over the `/worker/stream` WebSocket, reconnects with backoff (ADR-003 §1),
 and executes a pushed `TaskAssignment` **DB-free**: project config comes from the
 assignment while `repoRoot` is resolved from this host (`SWARM_WORKER_REPO_ROOT`,
-defaulting to the launch directory), source-carrying delivery (commit / push /
+defaulting to the launch directory) — an assignment for a repository this checkout
+is *not* is refused up front, naming both, rather than run (issue #688), and the
+daemon **locks** that checkout for its whole life, so a second worker pointed at the
+same path refuses to start instead of driving git in the same repository (issue
+#689; give a second worker on the machine its own checkout). The control plane
+polices the same pairing (issue #690): enrolling a worker in a project for another
+repository is **refused** naming both, and an existing enrollment a reconnecting
+daemon's declaration contradicts is **suspended**, with both repositories shown on
+the Workers screen — approval and sharing consent stay human decisions, so nothing
+is ever enrolled or re-activated from a declaration —
+source-carrying delivery (commit / push /
 create-PR) runs under the operator token, and everything needing something this
 worker must not hold goes up to the control plane's delivery API — Implementation's board moves/comments and
 dependency lookup and Respond-to-review's card lookup + board moves under the

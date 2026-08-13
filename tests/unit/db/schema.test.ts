@@ -120,6 +120,7 @@ describe('db schema', () => {
 			for (const name of [
 				'id',
 				'project_id',
+				'repository',
 				'task_id',
 				'work_item_id',
 				'pr_number',
@@ -170,6 +171,15 @@ describe('db schema', () => {
 			expect(names).toContain('idx_runs_project_id');
 			expect(names).toContain('idx_runs_status');
 			expect(names).toContain('idx_runs_started_at');
+		});
+
+		it('requires the repository the run acted on (issue #683)', () => {
+			// NOT NULL rather than nullable-for-back-compat: migration 0047 backfills
+			// every existing row from its project before adding the constraint, which is
+			// total because `project_id` is NOT NULL with an FK and `projects.repo` is
+			// NOT NULL. Unlike `projects.scm_type`, "no repository" is not a state.
+			expect(columns.get('repository')?.getSQLType()).toBe('text');
+			expect(columns.get('repository')?.notNull).toBe(true);
 		});
 
 		it('carries a nullable review safety-cap slot and automation outcome (issue #235)', () => {

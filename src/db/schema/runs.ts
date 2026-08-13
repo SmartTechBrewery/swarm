@@ -27,6 +27,24 @@ export const runs = pgTable(
 		projectId: text('project_id')
 			.notNull()
 			.references(() => projects.id, { onDelete: 'cascade' }),
+		/**
+		 * The repository this run acted on, in `ProjectConfig.repo`'s `owner/repo`
+		 * form (issue #683) — denormalized alongside `project_id` rather than joined
+		 * through it, exactly as `review_verdicts.repository` is
+		 * (`src/db/schema/reviewVerdicts.ts`).
+		 *
+		 * A project id alone does not identify a repository: it does so only while a
+		 * project owns exactly one repo, which is what makes every value derived from
+		 * `project.repo` (PR links, prior-review lookups) ambiguous the moment a
+		 * project spans several. Recording it here makes the run itself the answer to
+		 * "which repo was this for?".
+		 *
+		 * Written once, at creation (`createRun`), from the repository the dispatch
+		 * resolved; deliberately *not* rewritten by a retry
+		 * ({@link resetRunToRunning}) — a retry re-runs the same work against the
+		 * same repository.
+		 */
+		repository: text('repository').notNull(),
 		taskId: text('task_id').notNull(),
 		workItemId: text('work_item_id'),
 		workItemTitle: text('work_item_title'),

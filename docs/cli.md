@@ -291,7 +291,12 @@ swarm workers consent <worker-id> <project-id> <on|off>
   Starts pending with sharing consent off; `--active` approves it and `--consent`
   grants sharing consent at once (operator seeding). The enrollment's **allowed
   pipeline phases** start as every phase — narrow them per project on the worker
-  detail screen (`/workers/<id>`); there is no flag for them yet.
+  detail screen (`/workers/<id>`); there is no flag for them yet. **A project whose
+  repository is not the worker's own checkout is refused** (exit 1, naming both
+  repositories): a worker holds one checkout, so work for another repository could
+  only be refused when it got there. A worker that has not declared a repository —
+  one that never connected, or whose checkout has no identifiable `origin` — is
+  enrolled as before.
 - **`update-enrollment`** — change an *existing* enrollment's execution constraints.
   `--cli` replaces the allowed CLIs (still a subset of the worker's declared
   capabilities — widen those with `set-cli` first) and `--concurrency` replaces
