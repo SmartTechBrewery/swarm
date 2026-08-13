@@ -7,10 +7,15 @@ vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
 
 vi.mock('@/harness/quota-discovery.js', () => ({
 	discoverCliQuotas: vi.fn(),
+	discoveryHost: vi.fn(() => 'control-plane.local'),
 }));
 
 import { quotaRouter } from '@/api/routers/quota.js';
-import { getAllCliQuotas, upsertCliQuota } from '@/db/repositories/cliQuotasRepository.js';
+import {
+	getAllCliQuotas,
+	type HostCliQuotaSnapshot,
+	upsertCliQuota,
+} from '@/db/repositories/cliQuotasRepository.js';
 import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import { discoverCliQuotas } from '@/harness/quota-discovery.js';
 
@@ -32,12 +37,22 @@ describe('quotaRouter', () => {
 	});
 
 	describe('getQuotas', () => {
-		it('returns all persisted cli quotas', async () => {
-			const mockSnapshots: CliQuotaSnapshot[] = [
+		// Issue #703: two hosts can report the same CLI, and each row's host must
+		// survive the read — the page attributes an allowance with it.
+		it('passes host-attributed snapshots through unchanged', async () => {
+			const mockSnapshots: HostCliQuotaSnapshot[] = [
 				{
+					host: 'builder-01',
 					cli: 'codex',
 					status: 'available',
 					source: 'live',
+					lastUpdated: new Date().toISOString(),
+				},
+				{
+					host: 'builder-02',
+					cli: 'codex',
+					status: 'unavailable',
+					source: 'fallback',
 					lastUpdated: new Date().toISOString(),
 				},
 			];
@@ -50,7 +65,7 @@ describe('quotaRouter', () => {
 	});
 
 	describe('refreshQuotas', () => {
-		it('triggers a full CLI discovery, upserts each snapshot, and returns the result', async () => {
+		it('triggers a full CLI discovery, upserts each snapshot against this host, and returns the result', async () => {
 			const mockSnapshots: CliQuotaSnapshot[] = [
 				{
 					cli: 'claude',
@@ -71,7 +86,17 @@ describe('quotaRouter', () => {
 
 			expect(discoverCliQuotas).toHaveBeenCalledWith(false); // cheap = false for manual refresh
 			expect(upsertCliQuota).toHaveBeenCalledTimes(2);
+			// The probing host is stamped on every row this refresh writes (issue #703),
+			// so it replaces only its own machine's snapshots.
+			expect(upsertCliQuota).toHaveBeenNthCalledWith(
+				1,
+				'control-plane.local',
+				mockSnapshots[0].cli,
+				mockSnapshots[0].status,
+				mockSnapshots[0],
+			);
 			expect(upsertCliQuota).toHaveBeenLastCalledWith(
+				'control-plane.local',
 				mockSnapshots[1].cli,
 				mockSnapshots[1].status,
 				mockSnapshots[1],

@@ -30,6 +30,7 @@ describe('quota route', () => {
 	it('preserves non-integral durations in the window suffix', async () => {
 		renderQuotaScreen([
 			{
+				host: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -50,6 +51,7 @@ describe('quota route', () => {
 	it('omits plan tier copy while keeping credits and usage', async () => {
 		renderQuotaScreen([
 			{
+				host: 'builder-01',
 				cli: 'claude',
 				status: 'available',
 				source: 'live',
@@ -59,6 +61,7 @@ describe('quota route', () => {
 				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 40 }],
 			},
 			{
+				host: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -80,6 +83,7 @@ describe('quota route', () => {
 		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 		renderQuotaScreen([
 			{
+				host: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -96,5 +100,76 @@ describe('quota route', () => {
 			false,
 		);
 		consoleError.mockRestore();
+	});
+
+	// Issue #703: two hosts reporting the same CLI used to overwrite one another in
+	// storage; now both rows arrive, and each allowance must be shown under the
+	// machine it describes rather than collapsing into one unlabelled card.
+	it('names each host and renders both hosts’ cards for the same CLI', async () => {
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+		renderQuotaScreen([
+			{
+				host: 'builder-02',
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T09:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 80 }],
+			},
+			{
+				host: 'builder-01',
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T08:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 10 }],
+			},
+		]);
+
+		expect(await screen.findByText('builder-01')).toBeTruthy();
+		expect(screen.getByText('builder-02')).toBeTruthy();
+		// Both allowances survive: one card per host, not one card for the installation.
+		expect(screen.getAllByText('Codex')).toHaveLength(2);
+		expect(screen.getAllByText('Weekly (7d)')).toHaveLength(2);
+		expect(screen.getByText('90% remaining')).toBeTruthy();
+		expect(screen.getByText('20% remaining')).toBeTruthy();
+		// `cli` alone is no longer a unique React key across hosts.
+		expect(consoleError.mock.calls.some(([message]) => String(message).includes('same key'))).toBe(
+			false,
+		);
+		consoleError.mockRestore();
+	});
+
+	it('reports a host’s own diagnostics under that host', async () => {
+		renderQuotaScreen([
+			{
+				host: 'builder-01',
+				cli: 'claude',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T08:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 10 }],
+			},
+			{
+				host: 'builder-02',
+				cli: 'claude',
+				status: 'unavailable',
+				source: 'fallback',
+				error: 'claude binary not found on PATH',
+				lastUpdated: '2026-08-13T09:00:00.000Z',
+			},
+		]);
+
+		expect(await screen.findByText('builder-02')).toBeTruthy();
+		expect(screen.getByText('claude binary not found on PATH')).toBeTruthy();
+		// The reporting host with nothing usable says so for itself, rather than the
+		// page reporting "no CLIs discovered" for the whole installation.
+		expect(screen.getByText('No active, usable agent CLIs on this host.')).toBeTruthy();
+	});
+
+	it('states that no host has reported when nothing is persisted', async () => {
+		renderQuotaScreen([]);
+
+		expect(await screen.findByText('No host has reported its agent CLIs yet.')).toBeTruthy();
 	});
 });

@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { hostname } from 'node:os';
 import { promisify } from 'node:util';
 import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import { getDb } from '../db/client.js';
@@ -521,6 +522,19 @@ function queryLiveQuota(
 	if (cli === 'antigravity') return queryAntigravityQuota(command);
 	if (cli === 'claude') return queryClaudeQuota(command);
 	return Promise.resolve(undefined);
+}
+
+/**
+ * The machine {@link discoverCliQuotas} is probing — the name a snapshot is
+ * stored under (issue #703).
+ *
+ * Both writers call this rather than resolving the host themselves, so they
+ * agree on one string; `os.hostname()` is also how a worker daemon already
+ * names its host in the connect handshake (`src/transport/connect-entry.ts`),
+ * so a future worker-reported snapshot keys on the same name.
+ */
+export function discoveryHost(): string {
+	return hostname();
 }
 
 /**

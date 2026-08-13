@@ -10,7 +10,7 @@
  * Scope: the walk itself, and never the availability set it walks against. This
  * module resolves no CLI set of its own: since issue #553 its caller
  * (`processJob`, `src/worker/consumer.ts`) runs in the control plane, which
- * executes nothing, and the `cli_quotas` rows describe whichever host ran
+ * executes nothing, and the `cli_quotas` rows describe the hosts that ran
  * discovery rather than the host that will execute (issue #703) — so there is
  * nothing correct to look up here. Resolving a target against a real host's
  * declared capabilities is the federated eligibility gate's job
