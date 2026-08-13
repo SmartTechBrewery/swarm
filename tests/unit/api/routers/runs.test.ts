@@ -616,7 +616,13 @@ describe('runsRouter', () => {
 		 * cached as hard as the hit.
 		 */
 		describe('scm row enrichment', () => {
-			/** One waiting SCM dispatch, enqueued far enough back that a fresh read outlives it. */
+			/**
+			 * One waiting SCM dispatch, enqueued far enough back that a fresh read outlives it.
+			 *
+			 * Every case below overrides `prNumber`: the enrichment cache is module state
+			 * with no reset between tests, and its key is `<project>:<provider>:<pr>`, so
+			 * two cases sharing a number would depend on declaration order to pass.
+			 */
 			function scmRow(overrides: Record<string, unknown> = {}) {
 				return {
 					jobId: 'dispatch-scm-enrich',
@@ -637,7 +643,7 @@ describe('runsRouter', () => {
 			}
 
 			it('asks for the card by repository and number, issue artifact first', async () => {
-				const row = scmRow();
+				const row = scmRow({ prNumber: '4040' });
 				vi.mocked(toQueuedRuns).mockReturnValue([row]);
 				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 				const findWorkItemForArtifact = vi
@@ -657,12 +663,12 @@ describe('runsRouter', () => {
 				expect(findWorkItemForArtifact).toHaveBeenNthCalledWith(1, {
 					repository: 'acme/widgets',
 					kind: 'issue',
-					number: '42',
+					number: '4040',
 				});
 				expect(findWorkItemForArtifact).toHaveBeenNthCalledWith(2, {
 					repository: 'acme/widgets',
 					kind: 'pullRequest',
-					number: '42',
+					number: '4040',
 				});
 				expect(result.items[0]).toMatchObject({
 					workItemTitle: 'Wire triggers',

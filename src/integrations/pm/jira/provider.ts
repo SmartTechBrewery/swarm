@@ -730,9 +730,10 @@ export class JiraPMProvider implements PMProvider {
 			// issue #735) simply report no linked card — the put-back one deliberately
 			// *not* fail-open on a provider error, which is a different thing from a miss.
 			//
-			// That third caller is also why the *cost* of a miss is stated: this is the
-			// scan of the four registered providers, and the enrichment endpoint is
-			// polled, so its miss is cached rather than re-asked every two seconds.
+			// That third caller is also why the *cost* of a miss is stated: Trello
+			// declares a scan here too, but its is a fixed two requests, where this one
+			// reads a remote link per candidate — and the enrichment endpoint is polled,
+			// so its miss is cached rather than re-asked every two seconds.
 			const candidates = await this.searchIssues(
 				this.boardJql(undefined, 'updated DESC'),
 				ARTIFACT_SCAN_LIMIT + 1,
