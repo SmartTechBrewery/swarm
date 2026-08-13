@@ -328,9 +328,14 @@ swarm worktrees prune [--project <id>] [--dry-run]
   `.swarm-workspaces/`. A worktree is only removed when it is safe to discard: not
   leased (in-flight), not pinned by a resumable deferred/failed run, with no
   uncommitted changes **and** no unpushed local commits — anything else is
-  reported as skipped and left in place. `--project <id>` limits the sweep to one
-  project (default: all configured projects); `--dry-run` reports what would be
-  pruned without removing anything.
+  reported as skipped and left in place. It also reaps **expired host-local
+  coordination markers** under `.swarm-workspaces/.swarm-state` — a lapsed lock
+  directory, preservation pin or takeover guard, and a preservation staging file
+  (`*.tmp`) stranded by a crash — each on its own TTL, printing every path it
+  swept (issue #721). A marker still inside its TTL and any unrecognised entry
+  there are left alone. `--project <id>` limits the sweep to one project
+  (default: all configured projects); `--dry-run` reports what would be pruned
+  and swept without removing anything.
 
 Requires `DATABASE_URL` (project config) and `REDIS_URL` (in-flight check).
 Wrapper: `npm run worktrees:prune`.

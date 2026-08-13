@@ -27,6 +27,13 @@
  * that replaced the Redis one. So: a branch may answer *sooner* than the expiry,
  * never be *exempt* from it.
  *
+ * **An expiry only anyone *asking* would notice is not enough on its own** (issue
+ * #721). Every TTL here is evaluated by the next provisioner for that same task, so
+ * a task never dispatched again keeps its debris indefinitely — and `preserve()`'s
+ * `<pin>.<uuid>.tmp` staging file has no next reader at all. {@link
+ * sweepStaleHostLocalState} therefore applies the same TTLs proactively, from the
+ * hourly worktree retention sweep.
+ *
  * Expiring an artifact never force-removes work: the reclaim gate behind this one
  * (`./reclaim.ts`) still refuses a checkout that is dirty or carries unpushed
  * commits, so the worst an expiry can do is stop a *marker* from blocking. Nor does
@@ -37,7 +44,15 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+	type Dirent,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 // Shared with the daemon's own checkout lock (`./checkout-lock.ts`, issue #689) so
@@ -381,4 +396,104 @@ export function createHostLocalWorktreeRuntime(
 	};
 
 	return runtime;
+}
+
+export interface SweepHostLocalStateOptions {
+	repoRoot: string;
+	worktreeRoot: string;
+	/** Report what would be removed without removing it. */
+	dryRun?: boolean;
+}
+
+/**
+ * Whether one `.swarm-state` entry is expired debris.
+ *
+ * Each artifact is judged by **its own** TTL against its own recorded timestamp,
+ * falling back to the entry's mtime when that timestamp is absent or unparseable —
+ * the same pairing the per-task reapers above use. An entry matching no artifact
+ * shape is not ours to judge, so it is reported as not expired and left alone.
+ */
+function artifactIsExpired(entry: Dirent, path: string): boolean {
+	if (entry.isDirectory()) {
+		if (entry.name.endsWith('.lock')) {
+			// No readable owner leaves no timestamp to trust, so the lock directory's own
+			// age decides, on the lease TTL — the rule `unreadableLockIsFresh` applies.
+			// `reapAbandonedLock`'s much shorter window stays the *provisioner's* affair:
+			// it can tell a lock mid-`mkdir` from debris, and a sweeper cannot.
+			const owner = readJson(resolve(path, 'owner.json'), LocalLeaseSchema);
+			return owner ? isExpired(owner.createdAt, LEASE_TTL_MS) : pathOlderThan(path, LEASE_TTL_MS);
+		}
+		if (entry.name.endsWith('.takeover')) {
+			const holder = readJson(resolve(path, 'holder.json'), GuardHolderSchema);
+			return holder
+				? isExpired(holder.createdAt, TAKEOVER_GUARD_TTL_MS)
+				: pathOlderThan(path, TAKEOVER_GUARD_TTL_MS);
+		}
+		return false;
+	}
+	if (entry.name.endsWith('.tmp')) {
+		// `preserve()`'s staging file. The `renameSync` that consumes it is a single
+		// syscall, so one this old was stranded by a crash between the two — the same
+		// "a few syscalls" bound the takeover guard carries, reused rather than doubled.
+		return pathOlderThan(path, TAKEOVER_GUARD_TTL_MS);
+	}
+	if (entry.name.endsWith('.pin.json')) {
+		const pin = readJson(path, LocalPinSchema);
+		return pin ? isExpired(pin.createdAt, PIN_TTL_MS) : pathOlderThan(path, PIN_TTL_MS);
+	}
+	return false;
+}
+
+/**
+ * Remove expired coordination artifacts under `<repoRoot>/<worktreeRoot>/.swarm-state`
+ * — a lapsed lock directory, preservation pin, or takeover guard, plus a `preserve()`
+ * staging file no rename ever consumed (issue #721).
+ *
+ * Every TTL above is otherwise evaluated only by *the next provisioner for that same
+ * task* (`ownerIsLive`, `reapStaleTakeoverGuard`, `reapAbandonedLock`), so a task that
+ * is never dispatched again keeps its debris forever: a dead owner's lock directory sat
+ * in one installation's `.swarm-state` for six days. The `<pin>.<uuid>.tmp` staging file
+ * is worse — a crash between `writeFileSync` and `renameSync` strands one that no reader
+ * ever looks at again. This is the sweep for both, and it runs from the existing hourly
+ * worktree retention sweep (`./retention.ts`) rather than on a schedule of its own.
+ *
+ * **TTL-only, on purpose.** It runs in the API server and the CLI, never the daemon, so
+ * it can neither see a daemon's in-flight set nor trust a `pid` it did not write
+ * (`pidIsLive` is the heuristic this module already distrusts — see the header). Since
+ * issue #717 the recorded timestamp is the authority on every liveness path anyway, so
+ * consulting nothing else costs this sweep no precision.
+ *
+ * What it deliberately cannot remove: an artifact still inside its own TTL, an
+ * unrecognised entry under `.swarm-state`, and anything outside `.swarm-state` — a task
+ * checkout is `pruneStaleWorktrees`'s business, behind the reclaim gate. A removal that
+ * fails is left for the next sweep rather than reported as done.
+ *
+ * @returns the absolute paths removed — or, under `dryRun`, that would be.
+ */
+export function sweepStaleHostLocalState(options: SweepHostLocalStateOptions): string[] {
+	const stateRoot = resolve(options.repoRoot, options.worktreeRoot, '.swarm-state');
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(stateRoot, { withFileTypes: true });
+	} catch {
+		// No state root on this host yet (or it is unreadable) — nothing to sweep.
+		return [];
+	}
+
+	const swept: string[] = [];
+	for (const entry of entries) {
+		const path = resolve(stateRoot, entry.name);
+		if (!artifactIsExpired(entry, path)) continue;
+		if (!options.dryRun) {
+			try {
+				rmSync(path, { recursive: true, force: true });
+			} catch {
+				// One unremovable entry must not abort the sweep — and it is still there,
+				// so keep it out of the report and let the next pass retry it.
+				continue;
+			}
+		}
+		swept.push(path);
+	}
+	return swept;
 }

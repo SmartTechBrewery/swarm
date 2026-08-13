@@ -54,6 +54,12 @@ async function sweepProject(project: ProjectConfig, dryRun: boolean): Promise<vo
 		out.warn(`${line} (has unpushed commits — push or discard them if it's no longer needed)`),
 	);
 	reportList('skipped (deferred session)', result.skippedDeferred);
+	if (result.sweptState.length > 0) {
+		out.info(
+			`  ${dryRun ? 'would sweep' : 'swept'} expired host-local state: ${result.sweptState.length} artifact(s)`,
+		);
+		for (const p of result.sweptState) out.info(`    - ${p}`);
+	}
 	if (result.ignored.length > 0) {
 		out.info(`  ignored: ${result.ignored.length}`);
 	}
