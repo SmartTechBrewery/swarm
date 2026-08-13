@@ -27,7 +27,7 @@ import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import { logger } from '@/lib/logger.js';
 import type { PmEvent } from '@/pm/events.js';
 import type { PMRouterAdapter } from '@/pm/router-adapter.js';
-import type { PMType } from '@/pm/types.js';
+import type { ItemRepositoryRoute, PMProvider, PMType } from '@/pm/types.js';
 import { createWebhookApp, type WebhookReceiverDeps } from '@/router/webhook-receiver.js';
 import type { ScmEvent } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
@@ -36,7 +36,9 @@ import {
 	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
+	createMockProjectRecord,
 	createMockTrelloProjectConfig,
+	toProjectRecord,
 } from '../../helpers/factories.js';
 
 const project = createMockProjectConfig({ id: 'proj-1', repo: 'SmartTechBrewery/swarm' });
@@ -139,6 +141,18 @@ function fakePmManifest(
 		blankPm: { type: 'github-projects', projectId: '', statusFieldId: '', statusOptions: {} },
 		discovery: [],
 	};
+}
+
+/**
+ * The record lookup the board path routes a card against (issue #686 phase 2), for
+ * the projects a test's fixtures describe. Every fixture owns exactly **one**
+ * repository, which is the short-circuit: the card routes to it with no provider
+ * built and no board read made, so the whole PM suite below keeps describing today's
+ * projects. The multi-repository cases build their own record explicitly.
+ */
+function recordDep(...configs: ProjectConfig[]) {
+	const records = new Map(configs.map((config) => [config.id, toProjectRecord(config)]));
+	return vi.fn<WebhookReceiverDeps['findProjectRecord']>(async (id) => records.get(id));
 }
 
 /**
@@ -369,6 +383,7 @@ describe('createWebhookApp', () => {
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
 					.mockResolvedValue('scm-whsec'),
+				findProjectRecord: recordDep(project),
 				enqueue,
 				enqueuePm,
 				...overrides,
@@ -398,7 +413,13 @@ describe('createWebhookApp', () => {
 			const res = await postPm(app);
 			expect(res.status).toBe(202);
 			expect(await res.json()).toEqual({ ok: true, accepted: true });
-			expect(enqueuePm).toHaveBeenCalledWith('github-projects', pmEvent, project, 'delivery-pm');
+			expect(enqueuePm).toHaveBeenCalledWith(
+				'github-projects',
+				pmEvent,
+				project,
+				'delivery-pm',
+				project.repo,
+			);
 		});
 
 		// Issue #529: the receiver holds no board lookup of its own. Each provider owns
@@ -556,6 +577,155 @@ describe('createWebhookApp', () => {
 			expect((await res.json()).ignored).toBe(true);
 			expect(enqueuePm).not.toHaveBeenCalled();
 		});
+
+		// Issue #686 phase 2: which of the project's repositories the card runs against
+		// is decided here, at ingress, and recorded on the job — so a redelivery or a
+		// "Retry now" re-parses the same payload and routes identically.
+		describe("routing the card to one of the project's repositories", () => {
+			const SECOND_REPO = 'SmartTechBrewery/second';
+			const twoRepositories = createMockProjectRecord({
+				id: project.id,
+				repositories: [
+					{ repo: project.repo, pmRoutingToken: 'token-default' },
+					{ repo: SECOND_REPO, pmRoutingToken: 'token-second' },
+				],
+			});
+
+			/** A manifest whose provider answers the routing call with `route`. */
+			function routingManifest(route: ItemRepositoryRoute | Error) {
+				const createProvider = vi.fn<PMProviderManifest['createProvider']>(
+					() =>
+						({
+							resolveItemRepository: async () => {
+								if (route instanceof Error) throw route;
+								return route;
+							},
+						}) as unknown as PMProvider,
+				);
+				return { ...fakePmManifest(), createProvider };
+			}
+
+			it('enqueues a card claimed by the non-default entry against that repository', async () => {
+				const manifest = routingManifest({ status: 'routed', repo: SECOND_REPO });
+				const { app, enqueuePm } = makePmApp(
+					{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+					manifest,
+				);
+
+				const res = await postPm(app);
+
+				expect(res.status).toBe(202);
+				expect(enqueuePm).toHaveBeenCalledWith(
+					'github-projects',
+					pmEvent,
+					project,
+					'delivery-pm',
+					SECOND_REPO,
+				);
+				// Built from the manifest's own factory, handed the project the delivery was
+				// authenticated against: a board read is board-scoped, not repository-scoped.
+				expect(manifest.createProvider).toHaveBeenCalledWith(project);
+			});
+
+			it('refuses a card no repository claims, saying so instead of picking the default', async () => {
+				const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+				const { app, enqueuePm } = makePmApp(
+					{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+					routingManifest({ status: 'unrouted' }),
+				);
+
+				const res = await postPm(app);
+
+				expect(res.status).toBe(202);
+				expect(await res.json()).toEqual({
+					ok: true,
+					ignored: true,
+					reason: "board card claims none of the project's repositories",
+				});
+				expect(enqueuePm).not.toHaveBeenCalled();
+				// The warning names the project, the card, and where it could have gone.
+				expect(warnSpy).toHaveBeenCalledWith(
+					expect.stringContaining('not routed to exactly one repository'),
+					expect.objectContaining({
+						projectId: project.id,
+						itemId: pmEvent.itemId,
+						repositories: [project.repo, SECOND_REPO],
+					}),
+				);
+				warnSpy.mockRestore();
+			});
+
+			it('refuses a card two repositories claim, naming both rather than resolving it', async () => {
+				const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+				const { app, enqueuePm } = makePmApp(
+					{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+					routingManifest({ status: 'ambiguous', repos: [project.repo, SECOND_REPO] }),
+				);
+
+				const res = await postPm(app);
+
+				expect(res.status).toBe(202);
+				expect((await res.json()).reason).toBe(
+					`board card claimed by more than one repository: ${project.repo}, ${SECOND_REPO}`,
+				);
+				expect(enqueuePm).not.toHaveBeenCalled();
+				expect(warnSpy).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.objectContaining({ claimedRepositories: [project.repo, SECOND_REPO] }),
+				);
+				warnSpy.mockRestore();
+			});
+
+			// The property that keeps today's projects unchanged: one repository, nothing
+			// to choose, so the provider is never even built — no extra board round trip.
+			it('routes a one-repository project to its only entry without building a provider', async () => {
+				const manifest = routingManifest(new Error('a one-repository project reads no board'));
+				const { app, enqueuePm } = makePmApp({}, manifest);
+
+				const res = await postPm(app);
+
+				expect(res.status).toBe(202);
+				expect(enqueuePm).toHaveBeenCalledWith(
+					'github-projects',
+					pmEvent,
+					project,
+					'delivery-pm',
+					project.repo,
+				);
+				expect(manifest.createProvider).not.toHaveBeenCalled();
+			});
+
+			// An unknown answer is a 5xx the provider redelivers, never a silent default.
+			it('refuses the delivery with a 5xx when the routing read fails', async () => {
+				const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+				const { app, enqueuePm } = makePmApp(
+					{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+					routingManifest(new Error('board unreachable')),
+				);
+
+				const res = await postPm(app);
+
+				expect(res.status).toBe(500);
+				expect((await res.json()).reason).toBe('repository routing failed');
+				expect(enqueuePm).not.toHaveBeenCalled();
+				expect(errorSpy).toHaveBeenCalled();
+				errorSpy.mockRestore();
+			});
+
+			it('ignores a delivery whose project was deleted mid-flight', async () => {
+				const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+				const { app, enqueuePm } = makePmApp({
+					findProjectRecord: vi.fn().mockResolvedValue(undefined),
+				});
+
+				const res = await postPm(app);
+
+				expect(res.status).toBe(202);
+				expect((await res.json()).reason).toBe('project no longer exists');
+				expect(enqueuePm).not.toHaveBeenCalled();
+				warnSpy.mockRestore();
+			});
+		});
 	});
 
 	// The second PM provider is the point of issue #496: a manifest whose route no
@@ -596,6 +766,7 @@ describe('createWebhookApp', () => {
 				getWebhookSecret: vi
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
 					.mockResolvedValue('whsec'),
+				findProjectRecord: recordDep(project),
 				enqueue,
 				enqueuePm,
 			});
@@ -643,7 +814,7 @@ describe('createWebhookApp', () => {
 			);
 			// No delivery id: reading one needs a per-provider header reader the PM
 			// manifest doesn't declare yet.
-			expect(enqueuePm).toHaveBeenCalledWith('jira', jiraEvent, project, undefined);
+			expect(enqueuePm).toHaveBeenCalledWith('jira', jiraEvent, project, undefined, project.repo);
 			expect(githubProjects.verifyWebhookSignature).not.toBe(verifyWebhookSignature);
 		});
 
@@ -716,6 +887,7 @@ describe('createWebhookApp', () => {
 					.fn<WebhookReceiverDeps['getWebhookSecret']>()
 					.mockResolvedValue(secret),
 				getPmCredential,
+				findProjectRecord: recordDep(project),
 				enqueue,
 				enqueuePm,
 			});
@@ -791,6 +963,7 @@ describe('createWebhookApp', () => {
 					expect.objectContaining({ itemId: 'PVTI_1', containerId: 'PVT_1', action: 'created' }),
 					project,
 					'delivery-board',
+					project.repo,
 				);
 				// A board event never travels the repo path.
 				expect(enqueue).not.toHaveBeenCalled();
@@ -842,7 +1015,11 @@ describe('createWebhookApp', () => {
 			vi.mocked(findProjectByLinearTeam).mockResolvedValue(linearProject);
 			// Leave both registries alone: the route under test is mounted from the
 			// registered manifest, not injected.
-			const app = createWebhookApp({ getPmCredential, enqueuePm });
+			const app = createWebhookApp({
+				getPmCredential,
+				findProjectRecord: recordDep(linearProject),
+				enqueuePm,
+			});
 			return { app, enqueuePm, getPmCredential };
 		}
 
@@ -880,6 +1057,7 @@ describe('createWebhookApp', () => {
 				}),
 				linearProject,
 				undefined,
+				linearProject.repo,
 			);
 		});
 
@@ -934,7 +1112,11 @@ describe('createWebhookApp', () => {
 			vi.mocked(findProjectByJiraProject).mockResolvedValue(jiraProject);
 			// Leave both registries alone: the route under test is mounted from the
 			// registered manifest, not injected.
-			const app = createWebhookApp({ getPmCredential, enqueuePm });
+			const app = createWebhookApp({
+				getPmCredential,
+				findProjectRecord: recordDep(jiraProject),
+				enqueuePm,
+			});
 			return { app, enqueuePm, getPmCredential };
 		}
 
@@ -973,6 +1155,7 @@ describe('createWebhookApp', () => {
 				}),
 				jiraProject,
 				undefined,
+				jiraProject.repo,
 			);
 		});
 
@@ -1033,7 +1216,11 @@ describe('createWebhookApp', () => {
 			vi.mocked(findProjectByTrelloBoard).mockResolvedValue(trelloProject);
 			// Leave both registries alone: the route under test is mounted from the
 			// registered manifest, not injected.
-			const app = createWebhookApp({ getPmCredential, enqueuePm });
+			const app = createWebhookApp({
+				getPmCredential,
+				findProjectRecord: recordDep(trelloProject),
+				enqueuePm,
+			});
 			return { app, enqueuePm, getPmCredential };
 		}
 
@@ -1082,6 +1269,7 @@ describe('createWebhookApp', () => {
 				}),
 				trelloProject,
 				undefined,
+				trelloProject.repo,
 			);
 		});
 

@@ -93,12 +93,19 @@ export async function enqueueScmEvent(
  * resolve the same one back. The worker re-reads the authoritative item state
  * itself (`src/worker/consumer.ts` re-reads config from Postgres and dispatches
  * against the normalized event), so this stays symmetric with the SCM path.
+ *
+ * `repository` is the one the card routed to (issue #686 phase 2), already decided
+ * by the caller — an explicit argument rather than something re-derived from
+ * `project`, which is the *default-scoped* config the delivery was authenticated
+ * against and therefore cannot name it. `undefined` leaves the job scoping to the
+ * project's default entry, as every pre-#686 row does.
  */
 export async function enqueuePmEvent(
 	providerId: PMType,
 	event: PmEvent,
 	project: ProjectConfig,
 	deliveryId: string | undefined,
+	repository: string | undefined,
 ): Promise<void> {
 	await dispatchWebhookJob({
 		type: 'pm',
@@ -106,6 +113,7 @@ export async function enqueuePmEvent(
 		projectId: project.id,
 		deliveryId,
 		event,
+		...(repository ? { repository } : {}),
 	});
 	logger.debug('PM board event dispatched', {
 		providerId,
@@ -114,6 +122,7 @@ export async function enqueuePmEvent(
 		action: event.action,
 		itemId: event.itemId,
 		changedField: event.changedField,
+		repository,
 		deliveryId,
 	});
 }

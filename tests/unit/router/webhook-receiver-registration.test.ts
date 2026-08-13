@@ -17,7 +17,7 @@ import {
 	registerPMProvider,
 } from '@/integrations/pm/registry.js';
 import { createWebhookApp, type WebhookReceiverDeps } from '@/router/webhook-receiver.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockProjectConfig, toProjectRecord } from '../../helpers/factories.js';
 
 // The receiver mounts a route per *registered* PM manifest (issue #496), so these
 // cases drive the real registry rather than injected fakes: one asserts the two
@@ -48,6 +48,11 @@ describe('createWebhookApp — PM routes come from the registry', () => {
 			// #497); for GitHub Projects that role inherits `credentials.webhookSecret`,
 			// so it resolves to the same secret the repo half uses.
 			getPmCredential: vi.fn<WebhookReceiverDeps['getPmCredential']>().mockResolvedValue(secret),
+			// One repository, so the card routes to it with no board read (issue #686
+			// phase 2) — the real provider is never built here either.
+			findProjectRecord: vi
+				.fn<WebhookReceiverDeps['findProjectRecord']>()
+				.mockResolvedValue(toProjectRecord(project)),
 			enqueue,
 			enqueuePm,
 		});
@@ -97,6 +102,7 @@ describe('createWebhookApp — PM routes come from the registry', () => {
 			expect.objectContaining({ itemId: 'PVTI_1', containerId: 'PVT_1' }),
 			project,
 			'delivery-projects_v2_item',
+			project.repo,
 		);
 	});
 

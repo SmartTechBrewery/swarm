@@ -98,7 +98,7 @@ describe('enqueuePmEvent', () => {
 		const event = createMockPmEvent();
 		const project = createMockProjectConfig({ id: 'acme' });
 
-		await enqueuePmEvent('github-projects', event, project, 'delivery-2');
+		await enqueuePmEvent('github-projects', event, project, 'delivery-2', undefined);
 
 		expect(createAndPublishDispatch).toHaveBeenCalledWith({
 			projectId: 'acme',
@@ -113,5 +113,20 @@ describe('enqueuePmEvent', () => {
 			priority: 10,
 			source: 'webhook',
 		});
+	});
+
+	// Issue #686 phase 2: the repository the card routed to reaches the dispatch
+	// payload, which is what `repositoryForJob` reads back to scope the project.
+	it('records the repository the card routed to on the dispatch payload', async () => {
+		const event = createMockPmEvent();
+		const project = createMockProjectConfig({ id: 'acme' });
+
+		await enqueuePmEvent('github-projects', event, project, 'delivery-3', 'acme/second');
+
+		expect(createAndPublishDispatch).toHaveBeenCalledWith(
+			expect.objectContaining({
+				jobPayload: expect.objectContaining({ type: 'pm', repository: 'acme/second' }),
+			}),
+		);
 	});
 });

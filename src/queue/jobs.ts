@@ -295,6 +295,16 @@ export const PmWebhookJobSchema = jobBase.extend({
 	 */
 	providerId: PmProviderIdSchema,
 	event: PmEventSchema,
+	/**
+	 * The repository the card routed to (issue #686 phase 2) — decided at ingress
+	 * through `resolveCardRepository` (`../pm/repository-routing.ts`) and recorded
+	 * here so a redelivery, a dependency recheck, and a "Retry now" all re-run
+	 * against the repository the card was routed to rather than re-deriving it.
+	 *
+	 * Absent on a pre-#686 row, which means the project's default entry — the
+	 * behaviour every one of those rows was written under. Nothing to backfill.
+	 */
+	repository: z.string().min(1).optional(),
 });
 
 /**
@@ -384,10 +394,12 @@ export type SwarmJob = z.infer<typeof swarmJobVariants>;
  *   phase: a webhook for repository B runs against repository B.
  * - `merge-automation` — the dispatch's own `repo`, resolved when the Review run
  *   that approved the PR persisted the intent.
- * - `pm` — `undefined`. A board card names no repository, so board-driven Planning
- *   and Implementation run against the default entry, which is exactly the
- *   behaviour a single-repository project already had. Letting a card choose a
- *   repository is a separate product decision.
+ * - `pm` — the repository the card routed to, decided at ingress (issue #686 phase
+ *   2) and recorded on the envelope. A board card *can* name one now: an entry
+ *   declares the provider-native id a card carries to claim it
+ *   (`ProjectRepository.pmRoutingToken`), and a card claiming none or two is
+ *   refused at ingress rather than enqueued. `undefined` only for a row written
+ *   before that — the default entry, exactly as it ran then.
  *
  * One `switch` exhaustive over the discriminator rather than a lookup with a
  * fallback: a fourth job type fails to compile until it states which repository it
@@ -400,7 +412,7 @@ export function repositoryForJob(job: SwarmJob): string | undefined {
 		case 'merge-automation':
 			return job.repo;
 		case 'pm':
-			return undefined;
+			return job.repository;
 	}
 }
 

@@ -65,7 +65,8 @@ import {
 	getWebhookSecretOrNull,
 	resolvePmCredential,
 } from '../config/provider.js';
-import type { ProjectConfig } from '../config/schema.js';
+import type { ProjectConfig, ProjectRecord } from '../config/schema.js';
+import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
 // Side-effect import: registers every PM and SCM provider manifest into its
 // registry before defaultDeps() reads them below.
 import '../integrations/entrypoint.js';
@@ -81,7 +82,8 @@ import {
 import { listSCMProviders } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import type { PmEvent } from '../pm/events.js';
-import type { PMType } from '../pm/types.js';
+import { resolveCardRepository } from '../pm/repository-routing.js';
+import type { ItemRepositoryRoute, PMType } from '../pm/types.js';
 import type { ScmEvent } from '../scm/events.js';
 import type { CommitPullRequest, ScmType, ScmWebhookRequest } from '../scm/types.js';
 import { enqueuePmEvent, enqueueScmEvent } from './enqueue.js';
@@ -140,6 +142,13 @@ export interface WebhookReceiverDeps {
 	 * provider the project runs on — it resolves to the very same secret.
 	 */
 	getPmCredential: (project: ProjectConfig, role: string) => Promise<string | null>;
+	/**
+	 * The project **record** — the unscoped shape carrying the whole `repositories`
+	 * list, which is what a card is routed against (issue #686 phase 2). A dep rather
+	 * than a direct import for the same reason every other collaborator here is one:
+	 * it is the substitution seam a test drives the board path through.
+	 */
+	findProjectRecord: (id: string) => Promise<ProjectRecord | undefined>;
 	enqueue: (
 		providerId: ScmType,
 		event: ScmEvent,
@@ -151,6 +160,7 @@ export interface WebhookReceiverDeps {
 		event: PmEvent,
 		project: ProjectConfig,
 		deliveryId: string | undefined,
+		repository: string | undefined,
 	) => Promise<void>;
 }
 
@@ -161,6 +171,7 @@ function defaultDeps(): WebhookReceiverDeps {
 		findProject: findProjectByRepo,
 		getWebhookSecret: getWebhookSecretOrNull,
 		getPmCredential: resolvePmCredential,
+		findProjectRecord: findProjectRecordByIdFromDb,
 		enqueue: enqueueScmEvent,
 		enqueuePm: enqueuePmEvent,
 	};
@@ -412,10 +423,12 @@ async function handleScmEvent(
  * whose adapter already parsed it (the caller parses, because on a shared route
  * that parse is also the "is this a board event at all?" test). Unlike the SCM path
  * it resolves the project by the board's container id (a board event carries no
- * repo) and filters to state-field changes before enqueueing. Every
- * provider-specific step is behind the PM manifest: `PMRouterAdapter`
+ * repo) and filters to state-field changes before enqueueing — then routes the card
+ * to **one of that project's repositories** ({@link routeBoardCard}, issue #686
+ * phase 2), refusing the delivery outright when it resolves to none or to more than
+ * one. Every provider-specific step is behind the PM manifest: `PMRouterAdapter`
  * (`src/pm/router-adapter.ts`) for the filters and the project lookup,
- * `verifyWebhookSignature` for authentication.
+ * `verifyWebhookSignature` for authentication, `createProvider` for the routing read.
  *
  * The project lookup goes through `PMRouterAdapter.resolveProject` — the contract
  * method that exists for exactly this — rather than through a receiver-held board
@@ -460,8 +473,93 @@ async function handlePmEvent(
 		);
 	}
 
-	await deps.enqueuePm(manifest.id, event, project, deliveryId);
+	// After loop prevention, so a dropped delivery never pays for the board read the
+	// routing call may make — the same ordering `resolveChecksPullRequest` has above.
+	const route = await routeBoardCard(c, deps, manifest, project, event);
+	if (route instanceof Response) return route;
+
+	await deps.enqueuePm(manifest.id, event, project, deliveryId, route.repo);
 	return c.json({ ok: true, accepted: true }, 202);
+}
+
+/**
+ * Which of the project's repositories this card runs against (issue #686 phase 2),
+ * or the short-circuit `Response` the caller must return when it runs against none.
+ *
+ * The routing decision is made **here, at ingress**, and recorded on the job, so a
+ * redelivery, a dependency recheck, and an operator's "Retry now" all re-parse the
+ * stored payload and route identically — the seam #684 phase 2 established, where
+ * the job answers for itself (`repositoryForJob`, `src/queue/jobs.ts`).
+ *
+ * Three refusals, and none of them enqueues:
+ *
+ * - **`unrouted`** — no repository claims the card. Never the default entry: with two
+ *   repositories declared, "the first one" is a coin toss that pushes a branch and
+ *   opens a pull request where nobody asked for one.
+ * - **`ambiguous`** — two claim it. Same refusal, its own reason, never resolved
+ *   arbitrarily.
+ * - **a throw** — the board read failed, so the answer is unknown. That is a 5xx and
+ *   the provider retries the delivery, rather than a silent fall back to the default.
+ *
+ * Both refusals ack `202` so the provider stops redelivering a card whose routing
+ * only an operator can fix, and say so explicitly in the response and a `logger.warn`
+ * naming the project, the card, and the repositories it could have gone to.
+ *
+ * The provider is built from the manifest's own factory (no registry branch, no
+ * `pm.type` here), and the default-scoped `ProjectConfig` it is handed is the right
+ * input: a board read is board-scoped, not repository-scoped, and the repository list
+ * it needs travels separately as candidates (`RepositoryRoutingCandidate`).
+ */
+async function routeBoardCard(
+	c: Context,
+	deps: WebhookReceiverDeps,
+	manifest: PMProviderManifest,
+	project: ProjectConfig,
+	event: PmEvent,
+): Promise<{ repo: string } | Response> {
+	const logContext = {
+		providerId: manifest.id,
+		projectId: project.id,
+		itemId: event.itemId,
+		containerId: event.containerId,
+	};
+
+	// The project was resolved from the delivery moments ago, so a missing record means
+	// it was deleted mid-flight — nothing to route to, and nothing a retry would fix.
+	const record = await deps.findProjectRecord(project.id);
+	if (!record) {
+		logger.warn('Board event references a project that no longer exists', logContext);
+		return c.json({ ok: true, ignored: true, reason: 'project no longer exists' }, 202);
+	}
+
+	let route: ItemRepositoryRoute;
+	try {
+		route = await resolveCardRepository(
+			record,
+			() => manifest.createProvider(project),
+			event.itemId,
+		);
+	} catch (error) {
+		logger.error('Could not resolve which repository a board card belongs to', {
+			...logContext,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return c.json({ ok: false, reason: 'repository routing failed' }, 500);
+	}
+
+	if (route.status === 'routed') return { repo: route.repo };
+
+	logger.warn('Board card is not routed to exactly one repository — not dispatching', {
+		...logContext,
+		status: route.status,
+		repositories: record.repositories.map((entry) => entry.repo),
+		...(route.status === 'ambiguous' ? { claimedRepositories: route.repos } : {}),
+	});
+	const reason =
+		route.status === 'ambiguous'
+			? `board card claimed by more than one repository: ${route.repos.join(', ')}`
+			: "board card claims none of the project's repositories";
+	return c.json({ ok: true, ignored: true, reason }, 202);
 }
 
 /** Group PM manifests by the route they declare, so one path mounts one handler. */

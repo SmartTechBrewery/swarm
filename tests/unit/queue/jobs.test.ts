@@ -290,9 +290,20 @@ describe('repositoryForJob', () => {
 		expect(repositoryForJob(job)).toBe('acme/second');
 	});
 
-	// A board card names no repository, so board-driven Planning and Implementation
-	// run against the project's default entry — unchanged behaviour.
-	it('answers a pm job with undefined, so it scopes to the default entry', () => {
+	// Issue #686 phase 2: a board card *can* name a repository now — ingress routes it
+	// and records the answer here, so a redelivery or a "Retry now" re-parses the same
+	// payload and scopes to the same repository.
+	it('answers a pm job with the repository its card routed to at ingress', () => {
+		const job = SwarmJobSchema.parse({
+			...createMockPmWebhookJob(),
+			repository: 'acme/second',
+		});
+		expect(repositoryForJob(job)).toBe('acme/second');
+	});
+
+	// A row written before #686 phase 2 carries no repository and keeps running against
+	// the project's default entry — no migration, nothing to backfill.
+	it('answers a pm job written before card routing with undefined, so it scopes to the default entry', () => {
 		expect(repositoryForJob(createMockPmWebhookJob())).toBeUndefined();
 	});
 
