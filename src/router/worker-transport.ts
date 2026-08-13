@@ -754,7 +754,12 @@ export function registerWorkerTransport(
 						noteTransportLoss(workerId);
 					}
 					logger.warn('worker transport stream error', {
-						error: evt instanceof ErrorEvent ? evt.message : String(evt),
+						error:
+							evt instanceof Error
+								? evt.message
+								: evt && typeof evt === 'object' && 'message' in evt
+									? String((evt as Record<string, unknown>).message)
+									: String(evt),
 					});
 				},
 			};
