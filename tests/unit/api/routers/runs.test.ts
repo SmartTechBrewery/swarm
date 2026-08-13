@@ -609,6 +609,148 @@ describe('runsRouter', () => {
 			expect(await caller.queued({})).toEqual({ items: [queuedItem], noTrigger: [] });
 		});
 
+		/**
+		 * The SCM row's enrichment after issue #735: "which card backs this pull
+		 * request?" is the contract's one-card lookup, not a whole-board read filtered
+		 * down — and because this endpoint is polled every two seconds, the *miss* is
+		 * cached as hard as the hit.
+		 */
+		describe('scm row enrichment', () => {
+			/** One waiting SCM dispatch, enqueued far enough back that a fresh read outlives it. */
+			function scmRow(overrides: Record<string, unknown> = {}) {
+				return {
+					jobId: 'dispatch-scm-enrich',
+					projectId: 'p1',
+					type: 'scm' as const,
+					providerId: 'github' as const,
+					state: 'waiting' as const,
+					phaseHint: 'review' as const,
+					repo: 'acme/widgets',
+					prNumber: '42',
+					priority: 0,
+					continuation: false,
+					prioritizeContinuations: true,
+					enqueuedAt: '2026-07-17T10:00:00.000Z',
+					availableAt: '2026-07-17T10:00:00.000Z',
+					...overrides,
+				};
+			}
+
+			it('asks for the card by repository and number, issue artifact first', async () => {
+				const row = scmRow();
+				vi.mocked(toQueuedRuns).mockReturnValue([row]);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				const findWorkItemForArtifact = vi
+					.fn()
+					.mockResolvedValueOnce(undefined)
+					.mockResolvedValueOnce({
+						id: 'card-1',
+						title: 'Wire triggers',
+						url: 'https://github.com/acme/widgets/pull/42',
+					});
+				vi.mocked(getPMProvider).mockReturnValue({
+					createProvider: () => ({ findWorkItemForArtifact }),
+				} as never);
+
+				const result = await caller.queued({});
+
+				expect(findWorkItemForArtifact).toHaveBeenNthCalledWith(1, {
+					repository: 'acme/widgets',
+					kind: 'issue',
+					number: '42',
+				});
+				expect(findWorkItemForArtifact).toHaveBeenNthCalledWith(2, {
+					repository: 'acme/widgets',
+					kind: 'pullRequest',
+					number: '42',
+				});
+				expect(result.items[0]).toMatchObject({
+					workItemTitle: 'Wire triggers',
+					workItemUrl: 'https://github.com/acme/widgets/pull/42',
+					workItemNodeId: 'card-1',
+				});
+			});
+
+			// A row recorded before its repository was: the URL suffix is all there is.
+			it('falls back to the URL-suffix lookup for a row carrying no repository', async () => {
+				vi.mocked(toQueuedRuns).mockReturnValue([
+					scmRow({ jobId: 'dispatch-no-repo', repo: null, prNumber: '4141' }),
+				]);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				const findWorkItemByUrlSuffix = vi.fn().mockResolvedValue(undefined);
+				vi.mocked(getPMProvider).mockReturnValue({
+					createProvider: () => ({ findWorkItemByUrlSuffix }),
+				} as never);
+
+				await caller.queued({});
+
+				expect(findWorkItemByUrlSuffix.mock.calls).toEqual([['/issues/4141'], ['/pull/4141']]);
+			});
+
+			// Issue #735: the common answer for an SCM row is "no card backs it", and it
+			// used to be the one answer the cache never covered — so a polled endpoint
+			// re-asked the provider forever. On a Jira board that lookup is a bounded
+			// scan, which is the board-budget failure reached from the other direction.
+			it('caches a miss, so a polled row does not re-ask the provider', async () => {
+				const row = scmRow({ jobId: 'dispatch-cached-miss', prNumber: '4242' });
+				vi.mocked(toQueuedRuns).mockReturnValue([row]);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				const findWorkItemForArtifact = vi.fn().mockResolvedValue(undefined);
+				vi.mocked(getPMProvider).mockReturnValue({
+					createProvider: () => ({ findWorkItemForArtifact }),
+				} as never);
+
+				const first = await caller.queued({});
+				const second = await caller.queued({});
+
+				// Both kinds on the first poll, nothing at all on the second.
+				expect(findWorkItemForArtifact).toHaveBeenCalledTimes(2);
+				// And a cached miss leaves the row exactly as an uncached miss does.
+				expect(first.items).toEqual([row]);
+				expect(second.items).toEqual([row]);
+			});
+
+			// A row whose project is not on file was never *asked* about, so there is no
+			// answer to cache — the distinction that keeps an unenrichable row from
+			// poisoning the entry a later, enrichable read of the same PR would write.
+			it('does not cache a row it could not read for', async () => {
+				// Built before `getPMProvider` is stubbed: the project schema validates its
+				// PM credential block against the real registry.
+				const project = createMockProjectConfig({ id: 'p1' });
+				const row = scmRow({ jobId: 'dispatch-no-project', prNumber: '4444' });
+				vi.mocked(toQueuedRuns).mockReturnValue([row]);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValueOnce(undefined);
+				const findWorkItemForArtifact = vi
+					.fn()
+					.mockResolvedValue({ id: 'card-9', title: 'Found later' });
+				vi.mocked(getPMProvider).mockReturnValue({
+					createProvider: () => ({ findWorkItemForArtifact }),
+				} as never);
+
+				expect((await caller.queued({})).items).toEqual([row]);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(project);
+
+				expect((await caller.queued({})).items[0]).toMatchObject({ workItemNodeId: 'card-9' });
+			});
+
+			// A failed read is "unknown", not "nothing" — caching it would hide a
+			// transient provider outage for the whole window.
+			it('does not cache a failed read', async () => {
+				const row = scmRow({ jobId: 'dispatch-failed-read', prNumber: '4343' });
+				vi.mocked(toQueuedRuns).mockReturnValue([row]);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+				const findWorkItemForArtifact = vi.fn().mockRejectedValue(new Error('rate limit'));
+				vi.mocked(getPMProvider).mockReturnValue({
+					createProvider: () => ({ findWorkItemForArtifact }),
+				} as never);
+
+				expect((await caller.queued({})).items).toEqual([row]);
+				await caller.queued({});
+
+				expect(findWorkItemForArtifact).toHaveBeenCalledTimes(2);
+			});
+		});
+
 		it('propagates the project-specific prioritizeContinuations policy when scoped', async () => {
 			vi.mocked(toQueuedRuns).mockReturnValue([]);
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(

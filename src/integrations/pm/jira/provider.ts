@@ -722,10 +722,17 @@ export class JiraPMProvider implements PMProvider {
 			//
 			// Two consequences worth stating plainly: a card outside the cap is missed,
 			// and Jira's search index is eventually consistent, so a card created
-			// seconds ago may not be found yet. Both are tolerable *here* because this
-			// is a soft miss by contract and its only caller — the automation-label gate
-			// in `src/pm/pull-request-work-item.ts` — fails open, so a miss dispatches
-			// normally rather than wedging review/CI work.
+			// seconds ago may not be found yet. Both are tolerable because a miss here is
+			// soft by contract and no caller treats it as an error: the automation-label
+			// gate (`src/pm/pull-request-work-item.ts`) fails open, so a miss dispatches
+			// normally rather than wedging review/CI work; the dashboard's queue
+			// enrichment and its put-back lookup (`src/api/routers/runs.ts`, both since
+			// issue #735) simply report no linked card — the put-back one deliberately
+			// *not* fail-open on a provider error, which is a different thing from a miss.
+			//
+			// That third caller is also why the *cost* of a miss is stated: this is the
+			// scan of the four registered providers, and the enrichment endpoint is
+			// polled, so its miss is cached rather than re-asked every two seconds.
 			const candidates = await this.searchIssues(
 				this.boardJql(undefined, 'updated DESC'),
 				ARTIFACT_SCAN_LIMIT + 1,

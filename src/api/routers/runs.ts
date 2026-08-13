@@ -43,7 +43,6 @@ import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
-import { findWorkItemForPullRequest } from '../../pm/pull-request-work-item.js';
 import {
 	type CancellationOrigin,
 	clearRunCancellation,
@@ -95,10 +94,20 @@ interface QueuedWorkItemDetails {
  * it was written, so a card dragged to Todo a second after a `no-trigger` read
  * re-reads instead of inheriting that verdict and being filtered out of the queue
  * for the rest of the window.
+ *
+ * **A miss is cached too** — `details: null`, "the read ran and nothing backs this
+ * row" (issue #735). It used to fall through uncached, which made the *common*
+ * answer for an SCM row the one the window never covered: this endpoint is polled
+ * every two seconds while anything is queued (`dashboard/src/lib/runs-refresh.ts`)
+ * and enriches every row, so a pull request with no card on the board re-asked its
+ * provider on every poll, forever. That is cheap on a GitHub board and expensive on
+ * a Jira one, whose `findWorkItemForArtifact` is a documented bounded *scan* — the
+ * board-budget failure issue #735 is about, reached from the other direction. A
+ * *failed* read is still not cached: that is "unknown", not "nothing".
  */
 const queuedWorkItemCache = new Map<
 	string,
-	QueuedWorkItemDetails & { expiresAt: number; readAt: number }
+	{ expiresAt: number; readAt: number; details: QueuedWorkItemDetails | null }
 >();
 
 function queuedWorkItemCacheKey(item: QueuedRun): string | null {
@@ -176,13 +185,18 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 
 	const cached = queuedWorkItemCache.get(cacheKey);
 	// A cached read describes only the dispatches that already existed when it was
-	// taken (see `queuedWorkItemCache`).
+	// taken (see `queuedWorkItemCache`). A cached miss leaves the row exactly as an
+	// uncached miss does — untouched.
 	if (cached && cached.expiresAt > Date.now() && cached.readAt >= Date.parse(item.enqueuedAt)) {
-		return withQueuedWorkItemDetails(item, cached);
+		return cached.details ? withQueuedWorkItemDetails(item, cached.details) : item;
 	}
 
 	try {
-		let details: QueuedWorkItemDetails | null = null;
+		// `undefined` is "no read happened" — no project on file, no manifest, an
+		// unenrichable row — which is *unknown* rather than "nothing backs this row"
+		// and so must not be cached, exactly like the failure the catch below handles.
+		// `null` is the real, cacheable miss: the provider was asked and had no card.
+		let details: QueuedWorkItemDetails | null | undefined;
 		if (item.type === 'pm' && item.workItemNodeId) {
 			const resolved = await resolveQueuedWorkItemDetails(item, item.workItemNodeId);
 			if (resolved) {
@@ -202,37 +216,49 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 					// The contract's one-card lookups, not a whole-board read filtered down to
 					// one card (issue #735): this is a *lookup* — "which card backs this pull
 					// request?" — and reading the board to answer it is what exhausted the
-					// board credential's budget. `repo` is absent only on a dispatch enqueued
-					// before it was recorded, where the URL suffix is all there is to go on.
+					// board credential's budget. Both artifact kinds are asked for, as the URL
+					// match this replaced did; what keeps that from costing twice per poll on a
+					// provider whose artifact lookup is a scan is that the miss is now cached
+					// (see `queuedWorkItemCache`). `repo` is absent only on a dispatch enqueued
+					// before it was recorded, where the URL suffix is all there is to go on —
+					// and on a multi-repository project that suffix resolves against the
+					// project's default repository entry, which is what `getProjectByIdFromDb`
+					// scopes to. Cosmetic either way: a miss just leaves the row without its
+					// card title.
+					//
+					// Called directly rather than through `findWorkItemForPullRequest`, whose
+					// fail-open swallow is right for the automation gate and wrong here: it
+					// would turn a transient provider failure into a `null` this then *caches*
+					// as "nothing backs this row" for the whole window.
 					const match = item.repo
-						? await findWorkItemForPullRequest(
-								pm,
-								{ repository: item.repo, issueNumber: item.prNumber, prNumber: item.prNumber },
-								{ projectId: item.projectId },
-							)
+						? ((await pm.findWorkItemForArtifact({
+								repository: item.repo,
+								kind: 'issue',
+								number: item.prNumber,
+							})) ??
+							(await pm.findWorkItemForArtifact({
+								repository: item.repo,
+								kind: 'pullRequest',
+								number: item.prNumber,
+							})))
 						: ((await pm.findWorkItemByUrlSuffix(`/issues/${item.prNumber}`)) ??
 							(await pm.findWorkItemByUrlSuffix(`/pull/${item.prNumber}`)));
-					if (match) {
-						details = {
-							title: match.title || undefined,
-							url: match.url || undefined,
-							nodeId: match.id,
-						};
-					}
+					details = match
+						? { title: match.title || undefined, url: match.url || undefined, nodeId: match.id }
+						: null;
 				}
 			}
 		}
 
-		if (!details) return item;
+		if (details === undefined) return item;
 
 		const readAt = Date.now();
-		const cachedDetails = {
+		queuedWorkItemCache.set(cacheKey, {
 			expiresAt: readAt + QUEUED_WORK_ITEM_CACHE_TTL_MS,
 			readAt,
-			...details,
-		};
-		queuedWorkItemCache.set(cacheKey, cachedDetails);
-		return withQueuedWorkItemDetails(item, cachedDetails);
+			details,
+		});
+		return details ? withQueuedWorkItemDetails(item, details) : item;
 	} catch (error) {
 		logger.debug('runs.queued: backing work item lookup failed; using fallback', {
 			projectId: item.projectId,

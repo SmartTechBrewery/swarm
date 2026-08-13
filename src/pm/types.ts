@@ -478,8 +478,17 @@ export interface PMProvider {
 	 * so a child created seconds ago must be findable **now**. An
 	 * eventually-consistent search index that answers "no" to a card that exists
 	 * makes the guard create a second child — the exact failure this lookup
-	 * prevents — so a provider whose only text index is eventually consistent
-	 * states that and uses a consistent read instead.
+	 * prevents.
+	 *
+	 * So a provider prefers a **consistent** read over its text index, and where it
+	 * has no consistent read that can answer the marker, it says which one it chose
+	 * and what that costs. The registered three divide on exactly that: GitHub
+	 * Projects reads the project repository's newest issue bodies rather than
+	 * GitHub's search, and Trello scans its board rather than `/search`, both
+	 * consistent; **Jira uses its `description ~` text index and states the risk**,
+	 * because nothing else it exposes narrows on description text at all, and the
+	 * alternative — the whole-board scan this rule exists to remove — trades the
+	 * duplicate-child window for the board-budget failure of issue #735.
 	 *
 	 * A soft miss rather than a throw, for the same reason as
 	 * {@link findWorkItemByUrlSuffix}: "nothing on the board carries that marker"

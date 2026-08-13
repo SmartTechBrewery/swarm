@@ -660,11 +660,16 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		// the suffix names the backing artifact, and *that* is addressable, so the card
 		// is reached through the Issue/PR rather than by paging the board past it
 		// (issue #735). A suffix carrying no owner/repo resolves against this project's
-		// own repository, which is also the only repository its callers can mean: the
-		// legacy fallback in `src/pipeline/respond-to-review.ts` decodes the number from
-		// a task branch in it. That is narrower than the previous whole-board `endsWith`
-		// scan, which would have matched an unrelated repository's same-numbered card
-		// sitting on a shared org board.
+		// own repository. That is narrower than the previous whole-board `endsWith` scan,
+		// which would have matched an unrelated repository's same-numbered card sitting on
+		// a shared org board — and it is what both callers mean. The legacy fallback in
+		// `src/pipeline/respond-to-review.ts` decodes the number from a task branch in
+		// this very repository. The dashboard's queue enrichment (`src/api/routers/runs.ts`,
+		// on its path for a dispatch row recorded before the repository was) has no
+		// repository to offer at all, so on a multi-repository project this resolves
+		// against the project's default entry rather than matching any repository's card;
+		// that read is cosmetic and fail-open, so such a row simply renders without its
+		// card title.
 		const artifact = parseArtifactSuffix(urlSuffix, this.project.repo);
 		// A suffix no GitHub artifact URL ends with is a miss this can answer without
 		// asking GitHub anything (`src/pm/types.ts`, "One-card lookups are lookups").
