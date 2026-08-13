@@ -27,7 +27,10 @@
  * Cancellation needs no Redis (issue #549): the in-flight registry below indexes
  * each running assignment by `dispatchId`, a pushed `task-cancel` frame aborts the
  * matching run's signal, and the run settles terminal-`failed` with
- * `cancelled: true`.
+ * `cancelled: true`. A cancel this worker cannot apply is *answered* with that same
+ * terminal frame rather than logged and dropped (issue #724), so terminating a run
+ * whose phase already finished here settles it promptly instead of leaving it on
+ * the control plane's back-channel timer.
  *
  * Live output is the one thing this executor does not persist: it streams
  * `stream-log` frames and the control plane writes them to `run_output_events`
@@ -328,8 +331,9 @@ export function untrackAssignment(dispatchId: string): void {
  * Abort the in-flight assignment for `dispatchId`, if it is running here, and mark
  * it cancelled so it settles terminal-`failed` rather than deferring. Returns
  * whether one was found — `false` means this worker is not running that dispatch
- * (it already settled, or was never pushed here), in which case the frame is a
- * no-op and the control plane's durable marker still governs the run.
+ * (it already settled, or was never pushed here), which is the case
+ * {@link handleTaskCancel} answers the frame for itself (issue #724) instead of
+ * leaving the run to the control plane's durable marker alone.
  */
 export function cancelAssignment(dispatchId: string): boolean {
 	const entry = cancellableAssignments.get(dispatchId);
@@ -346,23 +350,56 @@ export function isAssignmentCancelled(dispatchId: string): boolean {
 
 /**
  * Apply a pushed `task-cancel` frame — the `onCancel` handler `./connect-entry.ts`
- * registers. It lives beside the registry it reads, and answers an unknown
- * dispatch with an ordinary, non-fatal miss rather than an error.
+ * registers. It lives beside the registry it reads, and **answers** the frame
+ * rather than only acting on it (issue #724): this worker is the only party that
+ * knows whether the phase is still executing here, so a cancel it cannot apply is
+ * settled as the terminal cancelled result instead of being logged and dropped.
+ *
+ * The two cases:
+ *
+ * - **Executing here** — abort it. The run's own failure path then settles it
+ *   ({@link settleAssignmentFailure}), so nothing extra is sent from here; sending
+ *   a second terminal frame would race that one.
+ * - **Not executing here** — it already finished and reported, this daemon
+ *   restarted, or the dispatch was never run here at all. Answer with the terminal
+ *   cancelled result so the control plane settles the run as the user termination
+ *   it is, instead of waiting out `timeoutMs + RESULT_WAIT_MARGIN_MS` on the
+ *   back-channel timer. The answer is only ever consumed by a dispatch the control
+ *   plane is *still awaiting* — `deliverDispatchResult` drops a frame for anything
+ *   else — so it can never settle an unrelated attempt.
+ *
+ * A frame carrying no `phase`/`taskId` (a control plane predating issue #724) keeps
+ * the log-only behaviour: a terminal result frame requires both, and sending a
+ * malformed one would lose the settle rather than speed it up.
  */
-export function handleTaskCancel(frame: TaskCancel, logger: TransportLogger = defaultLogger): void {
+export function handleTaskCancel(
+	frame: TaskCancel,
+	sink: AssignmentSink,
+	logger: TransportLogger = defaultLogger,
+): void {
 	const context = { dispatchId: frame.dispatchId, runId: frame.runId, reason: frame.reason };
 	if (cancelAssignment(frame.dispatchId)) {
 		logger.info('aborting in-flight assignment after a cancellation request', context);
 		return;
 	}
-	logger.info('ignoring task-cancel — that assignment is not running here', context);
+	const answer = cancelledResultForFrame(frame);
+	if (!answer) {
+		logger.info('ignoring task-cancel — that assignment is not running here', context);
+		return;
+	}
+	logger.info('answering a task-cancel — that assignment is not running here', {
+		...context,
+		phase: frame.phase,
+		taskId: frame.taskId,
+	});
+	sink.send(answer);
 }
 
 /**
- * Build the terminal frame for an assignment a `task-cancel` stopped: `failed`
- * with `cancelled: true`, which `../router/dispatcher.ts` turns back into a
- * `RunTerminatedError` so the shared settle path treats it as the user
- * termination it is — never a deferral, which would re-run the killed phase.
+ * The terminal frame for an assignment a `task-cancel` stopped: `failed` with
+ * `cancelled: true`, which `../router/dispatcher.ts` turns back into a
+ * `RunTerminatedError` so the shared settle path treats it as the user termination
+ * it is — never a deferral, which would re-run the killed phase.
  *
  * It carries no `error`: the control plane substitutes its own neutral
  * `RUN_CANCELLED_MESSAGE` (issue #305) for an absent one, which is exactly the
@@ -370,16 +407,33 @@ export function handleTaskCancel(frame: TaskCancel, logger: TransportLogger = de
  * `../queue/cancellation.ts` — a Redis module — back on a DB-free worker's import
  * path for a string the control plane already owns.
  */
-function cancelledResult(assignment: TaskAssignment): TaskExecutionResult {
+function cancelledResult(
+	dispatch: Pick<TaskAssignment, 'dispatchId' | 'runId' | 'phase' | 'taskId'>,
+): TaskExecutionResult {
 	return {
 		type: 'task-execution-result',
-		dispatchId: assignment.dispatchId,
-		runId: assignment.runId,
-		phase: assignment.phase,
-		taskId: assignment.taskId,
+		dispatchId: dispatch.dispatchId,
+		runId: dispatch.runId,
+		phase: dispatch.phase,
+		taskId: dispatch.taskId,
 		status: 'failed',
 		cancelled: true,
 	};
+}
+
+/**
+ * The same terminal frame built from a cancel frame rather than the assignment,
+ * for a dispatch this worker is not running — or `undefined` when the frame names
+ * no `phase`/`taskId` to build it from (see {@link handleTaskCancel}).
+ */
+function cancelledResultForFrame(frame: TaskCancel): TaskExecutionResult | undefined {
+	if (frame.phase === undefined || frame.taskId === undefined) return undefined;
+	return cancelledResult({
+		dispatchId: frame.dispatchId,
+		runId: frame.runId,
+		phase: frame.phase,
+		taskId: frame.taskId,
+	});
 }
 
 /**

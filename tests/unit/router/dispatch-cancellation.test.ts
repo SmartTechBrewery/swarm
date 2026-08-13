@@ -24,6 +24,18 @@ const RUN_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const WORKER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const OTHER_WORKER_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
+/**
+ * What the dispatcher recorded when it pushed this dispatch. Phase and task are
+ * part of it since issue #724: the pushed frame states them so the worker can
+ * answer a cancel it cannot apply with a terminal result naming both.
+ */
+const REGISTRATION = {
+	workerId: WORKER_ID,
+	runId: RUN_ID,
+	phase: 'review' as const,
+	taskId: '724',
+};
+
 type FakeWs = WSContext & { send: ReturnType<typeof vi.fn>; readyState: number };
 
 function fakeWs(): FakeWs {
@@ -41,7 +53,7 @@ describe('cancelRunOnWorker', () => {
 	it('pushes exactly one task-cancel to the worker executing the run', () => {
 		const ws = fakeWs();
 		registerConnection(WORKER_ID, ws);
-		const awaiting = awaitDispatchResult(DISPATCH_ID, { workerId: WORKER_ID, runId: RUN_ID });
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(true);
 
@@ -51,6 +63,10 @@ describe('cancelRunOnWorker', () => {
 			type: 'task-cancel',
 			dispatchId: DISPATCH_ID,
 			runId: RUN_ID,
+			// From the registration, never from anything the worker claims — they are what
+			// lets the worker answer a cancel it cannot apply (issue #724).
+			phase: 'review',
+			taskId: '724',
 		});
 		// Log context only — the run's terminal wording stays the control plane's
 		// neutral `RUN_CANCELLED_MESSAGE` (issue #305).
@@ -73,7 +89,7 @@ describe('cancelRunOnWorker', () => {
 	it('pushes nothing once the dispatch has settled', () => {
 		const ws = fakeWs();
 		registerConnection(WORKER_ID, ws);
-		const awaiting = awaitDispatchResult(DISPATCH_ID, { workerId: WORKER_ID, runId: RUN_ID });
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 		awaiting.dispose();
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
@@ -87,7 +103,7 @@ describe('cancelRunOnWorker', () => {
 		const bystander = fakeWs();
 		registerConnection(WORKER_ID, target);
 		registerConnection(OTHER_WORKER_ID, bystander);
-		const awaiting = awaitDispatchResult(DISPATCH_ID, { workerId: WORKER_ID, runId: RUN_ID });
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(true);
 		expect(framesOn(target)).toHaveLength(1);
@@ -99,7 +115,7 @@ describe('cancelRunOnWorker', () => {
 	});
 
 	it('reports false rather than throwing when the worker is no longer connected', () => {
-		const awaiting = awaitDispatchResult(DISPATCH_ID, { workerId: WORKER_ID, runId: RUN_ID });
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
 
@@ -115,7 +131,7 @@ describe('subscribeDispatchCancellations', () => {
 		subscribeToRunCancellations.mockImplementation(() => ({ close }));
 		const ws = fakeWs();
 		registerConnection(WORKER_ID, ws);
-		const awaiting = awaitDispatchResult(DISPATCH_ID, { workerId: WORKER_ID, runId: RUN_ID });
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
 		const subscription = subscribeDispatchCancellations();
 		const notify = subscribeToRunCancellations.mock.calls[0][0];

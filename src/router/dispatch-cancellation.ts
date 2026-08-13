@@ -14,7 +14,10 @@
  * `task-cancel` frame down that worker's socket (`./worker-connections.ts`). The
  * worker aborts the in-flight agent and settles the dispatch terminal-`failed`
  * with `cancelled: true`, which `./dispatcher.ts` turns back into a
- * `RunTerminatedError` for the shared settle path.
+ * `RunTerminatedError` for the shared settle path — and since issue #724 it
+ * answers the same way when the phase is *no longer* executing there, which is why
+ * the frame carries the phase and task the registration recorded: a terminal
+ * result frame requires both.
  *
  * Best-effort by design, exactly as the notification it rides is: a run this
  * router is not executing (queued, deferred, already settled, or dispatched from
@@ -56,6 +59,11 @@ export function cancelRunOnWorker(runId: string): boolean {
 		dispatchId: target.dispatchId,
 		runId,
 		reason: CANCEL_FRAME_REASON,
+		// What the worker needs to *answer* a cancel it cannot apply (issue #724) — a
+		// terminal result frame names its phase and task. Taken from what this router
+		// recorded when it pushed the assignment, never from anything the worker says.
+		phase: target.phase,
+		taskId: target.taskId,
 	});
 	if (!sent) {
 		logger.warn('run cancellation: could not push task-cancel — the worker is not connected', {
