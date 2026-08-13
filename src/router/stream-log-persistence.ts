@@ -31,20 +31,23 @@
  * The worker-local batcher this replaces flushed and *awaited* its DB write in a
  * `finally`, so a run's lines were durable on the worker's own machine whatever
  * happened to the socket. Now the only route to durability is the assignment sink,
- * which is bound to one transport session and drops every frame once that session
- * settles (`../transport/worker-client.ts`) — while the phase itself keeps running,
- * because the assignment handler is independent of the heartbeat loop. So a socket
- * lost mid-phase (a dropped connection, a router restart) loses that run's
- * remaining output, and a session lost early loses all of it: the run page stays
- * blank for exactly the attempt an operator most wants to read.
+ * which drops a `stream-log` frame whenever no session is live
+ * (`../transport/worker-client.ts`) — while the phase itself keeps running, because
+ * the assignment handler is independent of the heartbeat loop. So a socket lost
+ * mid-phase (a dropped connection, a router restart) loses that run's remaining
+ * output, and a session lost early loses all of it: the run page stays blank for
+ * exactly the attempt an operator most wants to read.
  *
- * That is accepted here rather than solved, deliberately. In this scenario the
- * terminal `TaskExecutionResult` rides the same dead sink and is lost too, so the
- * dispatch fails and is re-pushed regardless — the marginal loss is diagnostic, not
- * correctness. The fix, if it is wanted, is a bounded replay buffer on the sink so
- * undelivered batches survive into the next session; that is worth deciding before
- * phase 4 of issue #544 removes `DATABASE_URL` from the host worker and makes this
- * the *only* path to persisted output (issue #544 review, F2).
+ * That is accepted here rather than solved, deliberately: output is unbounded, so a
+ * replay buffer for it would be a memory liability with no correctness payoff, and
+ * what is lost is diagnostic. **Since issue #718 that is genuinely all that is
+ * lost.** The sentence this paragraph used to rest on — the terminal
+ * `TaskExecutionResult` rides the same dead sink, so the dispatch fails and is
+ * re-pushed regardless — was false: nothing re-pushes a dispatch already
+ * `state='running'`, so the run settled on the back-channel timer as a worker
+ * timeout however well it had gone. The sink now spans sessions for that one frame
+ * (a bounded, one-per-dispatch queue), so a lost session costs a window of output
+ * and not the run's outcome.
  */
 
 import {

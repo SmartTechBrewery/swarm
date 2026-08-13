@@ -92,7 +92,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -332,6 +332,41 @@ server-side store) it needs:
    That failure describes the *worker's* PATH and logins; probing the control plane's
    own host would record a bogus status. The refresh belongs to `startHostMaintenance`
    and the on-demand `quota.refreshQuotas`, both of which run where the CLIs are.
+
+12. **#718** — **the back-channel sink spans sessions.** It was a closure over one
+   WebSocket session and dropped every frame written after that session ended,
+   including a phase's terminal `TaskExecutionResult` — and a phase runs
+   independently of the heartbeat loop, so it routinely outlives the session it was
+   pushed on. The contract justified the drop with "a reconnect re-pushes the
+   assignment and the handler resumes rather than duplicating", **which does not
+   cover a dispatch already `state='running'`** — i.e. every dispatch whose phase is
+   executing: `handleWorkerStreamOpen` wakes only availability-blocked dispatches and
+   `listWakeablePendingDispatches` selects only `retry-scheduled`/`pending` rows, so
+   nothing re-pushes a running dispatch and nothing re-attaches a sink to the run
+   still executing under it. Confirmed twice on 2026-08-12/13: a one-second socket
+   blip discarded a *succeeded* Implementation phase (PR already opened), the row
+   stayed `running` for 34 minutes and settled on the back-channel timer as "Worker
+   'm5_pro' did not report a result within the lease window", then deferred and
+   scheduled a duplicate retry.
+
+   `createAssignmentSink` (`src/transport/worker-client.ts`) now lives for the
+   *process*: each session attaches and detaches its own socket, a terminal frame that
+   could not be written is held in a bounded, one-per-dispatch queue and flushed on
+   the next `attach`, and a re-pushed assignment for a dispatch whose result is still
+   held is answered with that result rather than re-running the phase (keyed on the
+   *undelivered* set, because `dispatchId` is stable across a manual re-open). No
+   control-plane change was needed: its waiter survives the disconnect untouched, and
+   `deliverDispatchResult` already consumes the entry, so **exactly-once stays the
+   consumer's property** and the worker only has to be at-least-once. Non-terminal
+   frames (`stream-log`/`task-progress`/`task-assignment-ack`) are still dropped and
+   never queued — output is unbounded, so buffering it would be a memory liability
+   with no correctness payoff. What the queue does not close is stated in that
+   module's contract comment: a write into a socket whose `close` has not yet fired is
+   still lost (sub-second), and a result flushed after the control plane disposed its
+   waiter is dropped router-side (bounded by `timeoutMs + RESULT_WAIT_MARGIN_MS`).
+   Honest attribution of that second case, and operator-visible liveness, are issue
+   #718's phase 2; Terminate settling a run whose phase is no longer executing is its
+   phase 3.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.
