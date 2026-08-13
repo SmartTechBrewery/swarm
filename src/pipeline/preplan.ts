@@ -1,5 +1,6 @@
 /**
- * Preplanned split-child contract (docs/OPTIMIZATION.md §3).
+ * Preplanned split-child contract (docs/OPTIMIZATION.md §3), plus the two board
+ * labels Planning writes.
  *
  * When Planning splits a large item, the parent run has already explored the
  * repository and decided how the work decomposes — so it writes a concise plan
@@ -11,6 +12,19 @@
  * `createWorkItem`/`getWorkItem`/`updateWorkItem` → issue `body`). The child's
  * own Planning run reads and validates it and skips the agent CLI when it holds
  * up (see {@link evaluatePreplan}, consumed by `runPlanningPhase`).
+ *
+ * **The contract is content, not a gate** (issue #737). It answers "can this
+ * Planning run reuse a plan instead of spending an agent?" — and nothing else.
+ * Whether a card entering Planning is dispatched at all is decided one level up,
+ * by {@link PLANNED_LABEL} alone (`src/triggers/handlers/pm-status.ts`). The two
+ * questions were previously entangled: the trigger evaluated this contract, an
+ * operator invalidated it with a `swarm:replan` label, and a third handler
+ * existed to observe that label edit — on a webhook event the repository never
+ * subscribed to, so it could not fire. One label replaces all three.
+ *
+ * The labels live here rather than in `src/pipeline/planning.ts` (which
+ * re-exports both) so trigger code can read them without pulling the Planning
+ * phase's worktree/agent-CLI module graph into the router process.
  *
  * The contract is deliberately *structured and validated* rather than inferred
  * from the `swarm:split-child` label or a free-form comment (issue #178): Zod is
@@ -32,12 +46,26 @@ import type { WorkItem } from '@/pm/types.js';
 export const SPLIT_CHILD_LABEL = 'swarm:split-child';
 
 /**
- * Label an operator adds to a preplanned child to force a fresh Planning run,
- * bypassing an otherwise-valid marker (issue #178 "an operator explicitly
- * requests replanning"). Checked in {@link evaluatePreplan} against the work
- * item's labels — no board config needed, it's just an issue label.
+ * Label a card carries once it holds a plan — **the single gate on the Planning
+ * phase** (issue #737).
+ *
+ * Written by every successful Planning run (`applyPlannedLabel`) and by the
+ * split that hands a child its parent's plan (`markSplitChildPlanned`), both in
+ * `src/pipeline/planning.ts`. Read by exactly one place: the PM status trigger
+ * (`src/triggers/handlers/pm-status.ts`), which dispatches Planning for a card
+ * entering that status **unless** the card already carries this label.
+ *
+ * So the operator-facing rule is one sentence: *to re-plan a card, remove
+ * `planned` and move it Backlog → Planning.* That replaces the three concepts it
+ * took before — this contract as a dispatch gate, a `swarm:replan` label to
+ * invalidate it, and a `preplan-invalidated` trigger to notice the label edit —
+ * one of which could never fire, because a label or body edit arrives on the
+ * `issues` webhook event the repository does not subscribe to.
+ *
+ * A fixed constant, not a config option: the smallest durable change, with no
+ * speculative setting.
  */
-export const REPLAN_LABEL = 'swarm:replan';
+export const PLANNED_LABEL = 'planned';
 
 /**
  * Delimiters of the hidden HTML-comment block the contract is embedded in. An
@@ -66,10 +94,15 @@ const PREPLAN_MARKER_CLOSE = '-->';
  *   item's `url`) so a marker copied onto a different issue is rejected — this
  *   is the checkable "does this belong to the current child" test.
  * - `descriptionHash` pins the human-authored description the plan was written
- *   against, so a later material edit to the child's scope invalidates the plan
- *   and forces a re-plan. Deterministic on purpose — no classifier model is
- *   spent to decide whether to spend a model (docs/OPTIMIZATION.md governing
- *   principle).
+ *   against, so a later material edit to the child's scope stops the plan from
+ *   being *reused* and the dispatched run plans from scratch instead.
+ *   Deterministic on purpose — no classifier model is spent to decide whether to
+ *   spend a model (docs/OPTIMIZATION.md governing principle). Kept when the
+ *   label became the gate (issue #737), because it answers a different question:
+ *   the label says whether to dispatch, the hash says whether the plan this
+ *   dispatch found is still about the same work. A card an operator wants
+ *   re-planned outright is re-planned the one documented way — remove `planned`,
+ *   move it Backlog → Planning.
  * - `splitId`/`childIndex`/`parentUrl`/`generatedAt` are provenance for logging
  *   and debugging the split operation a child came from.
  */
@@ -175,21 +208,22 @@ export function isPreplanSkip(decision: PreplanDecision): decision is PreplanSki
 }
 
 /**
- * Decide whether a work item entering Planning already carries a valid
- * preplanned plan (skip the agent) or must be planned from scratch (fall back).
- * Every rejection path falls back to a normal run — a bad marker is never a hard
- * failure (issue #178: "Missing, malformed, stale, mismatched, or explicitly
- * invalidated plans fall back to a normal Planning run").
+ * Decide whether a work item **whose Planning run has already been dispatched**
+ * carries a plan that run can reuse (skip the agent) or must be planned from
+ * scratch (fall back). Every rejection path falls back to a normal run — a bad
+ * marker is never a hard failure (issue #178: "Missing, malformed, stale, or
+ * mismatched plans fall back to a normal Planning run").
+ *
+ * Not a dispatch gate: since issue #737 the trigger decides that on
+ * {@link PLANNED_LABEL} alone and never calls this. Consequently there is no
+ * label-based invalidation here any more — an operator who wants a fresh plan
+ * removes `planned` and moves the card Backlog → Planning, which dispatches a
+ * run that this function then lets fall through to the agent.
  */
 export function evaluatePreplan(workItem: WorkItem): PreplanDecision {
 	const block = extractPreplanBlock(workItem.description);
-	// No marker → nothing to reject; a plain item carrying REPLAN_LABEL alone
-	// falls back with a null reason rather than a misleading "rejected" log.
+	// No marker → nothing to reject, so no "rejected" log line either.
 	if (!block) return { fallbackReason: null };
-
-	if (workItem.labels.some((l) => l.name === REPLAN_LABEL)) {
-		return { fallbackReason: `operator requested replanning (${REPLAN_LABEL})` };
-	}
 
 	let contract: PreplanContract;
 	try {

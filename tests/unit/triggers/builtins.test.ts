@@ -12,9 +12,19 @@ describe('registerBuiltInTriggers', () => {
 			'pr-review',
 			'resolve-conflicts',
 			'pr-review-submitted',
-			'preplan-invalidated',
 			'pm-status-changed',
 		]);
+	});
+
+	it('registers no handler that no served webhook event can reach (issue #737)', () => {
+		const registry = createTriggerRegistry();
+		registerBuiltInTriggers(registry);
+
+		// `preplan-invalidated` required a `work-item` event, which only GitHub's
+		// `issues` event maps to — an event the repository webhook does not subscribe
+		// to — so it read as live while being dead. Its replacement is one rule on the
+		// `planned` label, handled by `pm-status-changed`.
+		expect(registry.getHandlers().map((h) => h.name)).not.toContain('preplan-invalidated');
 	});
 
 	it('registers every handler with a description', () => {

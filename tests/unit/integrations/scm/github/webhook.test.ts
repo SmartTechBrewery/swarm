@@ -73,7 +73,11 @@ describe('GitHub webhook ingress', () => {
 			expect(parsed?.commentBody).toBeUndefined();
 		});
 
-		it('parses an issue body edit used to invalidate a preplan', () => {
+		// The normalizer maps `issues` to a `work-item` event and carries these fields
+		// because the durable envelope is provider-neutral, not because a handler reads
+		// them: no trigger consumes `work-item` since issue #737, and the repository
+		// webhook does not subscribe to `issues` in the first place.
+		it('parses an issue body edit', () => {
 			const parsed = parseGitHubWebhook('issues', {
 				action: 'edited',
 				repository: repo(),
@@ -99,11 +103,11 @@ describe('GitHub webhook ingress', () => {
 				action: 'labeled',
 				repository: repo(),
 				issue: { number: 7 },
-				label: { name: 'swarm:replan' },
+				label: { name: 'needs-triage' },
 			});
 			expect(parsed).toMatchObject({
 				kind: 'work-item',
-				labelName: 'swarm:replan',
+				labelName: 'needs-triage',
 				workItemBodyChanged: false,
 			});
 		});

@@ -6,8 +6,8 @@ import {
 	evaluatePreplan,
 	hashDescription,
 	isPreplanSkip,
+	PLANNED_LABEL,
 	type PreplanContract,
-	REPLAN_LABEL,
 } from '@/pipeline/preplan.js';
 import type { WorkItem } from '@/pm/types.js';
 import { createMockWorkItem } from '../../helpers/factories.js';
@@ -143,16 +143,21 @@ describe('evaluatePreplan fallbacks', () => {
 		});
 	});
 
-	it('falls back when the operator applied the replan label', () => {
-		const item = childWith(contract(), HUMAN, {
+	it('reads no label at all — the contract is content, not the dispatch gate (issue #737)', () => {
+		// Labels decide whether a Planning run is dispatched (`planned`, read in
+		// `src/triggers/handlers/pm-status.ts`). This decides only whether the run that
+		// *was* dispatched can reuse a plan, so no label can flip it either way — the
+		// `swarm:replan` override that used to live here is gone with the trigger that
+		// was supposed to observe it.
+		const labelled = childWith(contract(), HUMAN, {
 			labels: [
 				{ id: SPLIT_CHILD_LABEL, name: SPLIT_CHILD_LABEL },
-				{ id: REPLAN_LABEL, name: REPLAN_LABEL },
+				{ id: PLANNED_LABEL, name: PLANNED_LABEL },
+				{ id: 'LA_replan', name: 'swarm:replan' },
 			],
 		});
-		const decision = evaluatePreplan(item);
-		expect(isPreplanSkip(decision)).toBe(false);
-		expect((decision as { fallbackReason: string }).fallbackReason).toContain(REPLAN_LABEL);
+		expect(isPreplanSkip(evaluatePreplan(labelled))).toBe(true);
+		expect(isPreplanSkip(evaluatePreplan(childWith(contract(), HUMAN, { labels: [] })))).toBe(true);
 	});
 });
 
