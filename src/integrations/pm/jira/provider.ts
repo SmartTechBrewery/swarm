@@ -341,33 +341,38 @@ function requireJqlStatusId(statusId: string, statusKey: string): string {
 	return statusId;
 }
 
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /** Drop a query string, fragment, or trailing slash a remote link may have been recorded with. */
 function normalizeArtifactUrl(url: string): string {
 	return url.replace(/[?#].*$/, '').replace(/\/+$/, '');
 }
 
 /**
- * `taskRef` for a card, read off its remote links: the first link pointing at a
- * GitHub **issue** in this project's own repository.
+ * The `taskRef`/`taskRepository` pair for a card, read off its remote links: the
+ * first link pointing at a GitHub **issue**, together with that link's own
+ * `owner/repo`.
+ *
+ * The repository comes from the card's own linkage rather than from the repository
+ * this provider's config is scoped to (issue #710) — a board is project-wide, so a
+ * card may be linked in any of the project's repositories, and deciding whether it
+ * is one the project owns is the caller's (`src/pm/types.ts`,
+ * `WorkItem.taskRepository`).
  *
  * The Jira analogue of Linear's GitHub-issue *attachment* rule (ai/ARCHITECTURE.md
  * "Task identity"). A *pull-request* remote link deliberately does not qualify — a
  * PR is an artifact of the task, not its id — and the Jira issue key is never used
  * as a task id, since a task id names a worktree and a branch. A card with no
- * GitHub issue link leaves this unset, which is the honest answer: the phase
+ * GitHub issue link leaves both unset, which is the honest answer: the phase
  * dispatcher logs and skips.
  */
-function taskRefFromRemoteLinks(links: JiraRemoteLink[], repository: string): string | undefined {
-	const issueUrl = new RegExp(
-		`^https://github\\.com/${escapeRegExp(repository)}/issues/(\\d+)(?:[/?#]|$)`,
-	);
+function taskRefFromRemoteLinks(
+	links: JiraRemoteLink[],
+): { repository: string; number: string } | undefined {
+	const issueUrl = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)(?:[/?#]|$)/;
 	for (const link of links) {
 		const match = link?.object?.url?.match(issueUrl);
-		if (match) return match[1];
+		if (match?.[1] && match[2] && match[3]) {
+			return { repository: `${match[1]}/${match[2]}`, number: match[3] };
+		}
 	}
 	return undefined;
 }
@@ -648,11 +653,13 @@ export class JiraPMProvider implements PMProvider {
 				: `status = ${requireJqlStatusId(requireStatusIdForStatusKey(this.config, filter.status), filter.status)}`;
 		return this.run(async () => {
 			const issues = await this.searchIssues(this.boardJql(statusClause));
-			// No `taskRef` on a whole-board read, deliberately: it lives on each issue's
-			// remote links, so filling it here would cost one extra request *per card*.
-			// Every caller of this method matches on `url`, `status`, or `id`
-			// (`src/api/routers/runs.ts`, `src/triggers/handlers/preplan-invalidated.ts`);
-			// the reads that answer with a single card do resolve it.
+			// No `taskRef`/`taskRepository` on a whole-board read, deliberately: both live
+			// on each issue's remote links, so filling them here would cost one extra
+			// request *per card*. Every caller of this method matches on `url`, `status`, or
+			// `id` (`src/triggers/handlers/preplan-invalidated.ts`); the reads that answer
+			// with a single card do resolve them. This is also why a board-wide read here
+			// resolves nothing per card where the other three providers resolve per card
+			// (issue #710): the linkage is a separate request, not a field already read.
 			return issues.map((issue) => toWorkItem(issue, this.config));
 		});
 	}
@@ -758,8 +765,12 @@ export class JiraPMProvider implements PMProvider {
 				if (confirmed) {
 					// The links this card was confirmed by are the same ones `taskRef` is
 					// read from, so it costs no extra request here.
-					const taskRef = taskRefFromRemoteLinks(confirmed.links, this.project.repo);
-					return { ...toWorkItem(confirmed.issue, this.config), taskRef };
+					const artifact = taskRefFromRemoteLinks(confirmed.links);
+					return {
+						...toWorkItem(confirmed.issue, this.config),
+						taskRef: artifact?.number,
+						taskRepository: artifact?.repository,
+					};
 				}
 			}
 			return undefined;
@@ -1126,14 +1137,15 @@ export class JiraPMProvider implements PMProvider {
 	}
 
 	/**
-	 * Fill in the card's `taskRef` from its remote links — the one extra round trip
-	 * per card this provider pays for the card↔artifact link, kept in a single helper
-	 * so every call site paying it is visible. Runs inside a credential scope (its
-	 * callers do).
+	 * Fill in the card's `taskRef` and the repository it numbers an artifact in from
+	 * its remote links — the one extra round trip per card this provider pays for the
+	 * card↔artifact link, kept in a single helper so every call site paying it is
+	 * visible. Runs inside a credential scope (its callers do).
 	 */
 	private async resolveTaskRef(item: WorkItem): Promise<WorkItem> {
 		const links = await this.fetchRemoteLinks(item.id);
-		return { ...item, taskRef: taskRefFromRemoteLinks(links, this.project.repo) };
+		const artifact = taskRefFromRemoteLinks(links);
+		return { ...item, taskRef: artifact?.number, taskRepository: artifact?.repository };
 	}
 
 	/** One issue's remote links. Runs inside a credential scope (its callers do). */

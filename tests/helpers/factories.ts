@@ -173,8 +173,19 @@ export function createMockWorkItem(overrides: Partial<WorkItem> = {}): WorkItem 
 	// resolves it from the backing Issue/PR it read, so a fixture that overrides
 	// only `url` still comes back with the matching reference — and one that names
 	// `taskRef` explicitly (including `undefined`, for a draft card) keeps it.
+	//
+	// `taskRepository` is derived from the same URL for the same reason (issue #710):
+	// a real provider reads the number and the repository numbering it out of one
+	// linkage, so a fixture that supplies one without the other would describe a card
+	// no provider produces — and the consumer refuses a reference it cannot place.
+	const artifact = item.url.match(
+		/github\.com\/([^/\s]+)\/([^/\s]+)\/(?:issues|pull)\/(\d+)(?:[/?#]|$)/,
+	);
 	if (!('taskRef' in overrides)) {
-		item.taskRef = item.url.match(/\/(?:issues|pull)\/(\d+)(?:[/?#]|$)/)?.[1];
+		item.taskRef = artifact?.[3];
+	}
+	if (!('taskRepository' in overrides)) {
+		item.taskRepository = artifact ? `${artifact[1]}/${artifact[2]}` : undefined;
 	}
 	if ('statusKey' in overrides) return item;
 	return {

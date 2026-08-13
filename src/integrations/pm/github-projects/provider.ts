@@ -523,6 +523,14 @@ function toResolvedItem(item: ItemNode, config: GitHubProjectsIntegrationConfig)
 		// read in the same round-trip. Absent for a draft card, which has no Issue/PR
 		// and therefore no SCM-driven phase (ai/ARCHITECTURE.md "Task identity").
 		taskRef: content?.number == null ? undefined : String(content.number),
+		// The repository that number belongs to, from the *card's own* backing Issue/PR
+		// rather than from whichever repository this provider's config is scoped to
+		// (issue #710) — the same `repository { nameWithOwner }` `resolveItemRepository`
+		// routes on, and authoritative for the same reason. It costs no extra query, so
+		// a board-wide read answers per card, and a card whose Issue/PR lives in another
+		// repository reports that repository instead of being keyed as if it were this
+		// one; the caller holding the run's repository decides (`src/pm/types.ts`).
+		taskRepository: owner && repo ? `${owner}/${repo}` : undefined,
 		status: item.fieldValueByName?.name,
 		statusId: optionId,
 		statusKey: optionId === undefined ? undefined : resolveStatusKeyByOptionId(config, optionId),
@@ -909,8 +917,14 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				title: issue.title,
 				description: issue.body ?? '',
 				url: issue.html_url,
-				// The Issue this card was just created around is its SCM artifact.
+				// The Issue this card was just created around is its SCM artifact, in the
+				// repository it was just created in — which is this provider's scoped one
+				// because that is where `issues.create` above addressed it, not because a
+				// scoped repo is assumed to be a card's repo (issue #710). Planning's split
+				// children belong beside their parent, and the parent card's repository is
+				// what the job was scoped to.
 				taskRef: String(issue.number),
+				taskRepository: this.project.repo,
 				statusId: optionId,
 				// The caller named the canonical key, and `optionId` is its resolution —
 				// carry it back so the fresh item reads like one off a board read.

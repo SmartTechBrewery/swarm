@@ -30,6 +30,7 @@ import { logger } from '../../lib/logger.js';
 import { evaluatePreplan, isPreplanSkip, SPLIT_CHILD_LABEL } from '../../pipeline/preplan.js';
 import { type PipelinePhase, resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import type { WorkItem } from '../../pm/types.js';
+import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { recordStatusAndDetectChange } from '../pm-status-dedup.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
@@ -139,18 +140,38 @@ export function createPmStatusTrigger(): TriggerHandler {
 				return null;
 			}
 
-			// The provider resolved the card's SCM artifact from its own linkage
-			// (`WorkItem.taskRef`) — shared code never regexes a GitHub-shaped URL for
-			// it (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
-			const taskId = workItem.taskRef;
+			// The provider resolved the card's SCM artifact from its own linkage — both
+			// halves of it: the number (`WorkItem.taskRef`) and the repository that
+			// numbers it (`WorkItem.taskRepository`). Shared code never regexes a
+			// GitHub-shaped URL for either (ai/RULES.md §2, ai/ARCHITECTURE.md "Task
+			// identity").
+			//
+			// Deciding whether that repository is the one *this run* is for is this
+			// handler's job, not the provider's: a provider is built from a config scoped
+			// to one repository and so carries no list of the project's repositories
+			// (issue #710), while `ctx.project` is already scoped to the repository the
+			// job routed to (issue #686 phase 2). Compared through `repoSlugsMatch` rather
+			// than `===`, so a config entry's casing or a `.git` suffix cannot refuse a
+			// card that ingress routed on the same terms (issue #688).
+			const artifactRepository = workItem.taskRepository;
+			const taskId =
+				artifactRepository && repoSlugsMatch(artifactRepository, ctx.project.repo)
+					? workItem.taskRef
+					: undefined;
 			if (!taskId) {
-				// No backing SCM artifact to key the worktree on — a draft item, or a
-				// board with no SCM linkage at all. Can't run a phase without it; drop
-				// rather than throw (a draft card isn't a failed job).
+				// No backing SCM artifact *for this repository* to key the worktree on — a
+				// draft item, a board with no SCM linkage at all, or a card whose linkage
+				// points somewhere this run is not for. Can't run a phase without it; drop
+				// rather than throw (a draft card isn't a failed job), and name both
+				// repositories so a mis-linked card is diagnosable rather than
+				// indistinguishable from a draft.
 				logger.warn('pm-status: work item has no backing SCM artifact reference — skipping', {
 					itemId: event.itemId,
 					url: workItem.url,
 					phase,
+					taskRef: workItem.taskRef,
+					artifactRepository,
+					repository: ctx.project.repo,
 				});
 				return null;
 			}

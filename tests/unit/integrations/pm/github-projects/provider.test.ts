@@ -46,7 +46,10 @@ import {
 	createGitHubProjectsProvider,
 	GitHubProjectsPMProvider,
 } from '@/integrations/pm/github-projects/provider.js';
-import { createMockProjectConfig } from '../../../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+} from '../../../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig();
 const PROJECT_PM = requireGitHubProjectsConfig(PROJECT);
@@ -111,8 +114,10 @@ describe('GitHubProjectsPMProvider', () => {
 				description: 'Do the thing.',
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
 				// The provider resolves the card's SCM artifact from its own linkage,
-				// so no shared module has to regex the URL for it (issue #498).
+				// so no shared module has to regex the URL for it (issue #498) — both
+				// halves of it, since a bare number names nothing (issue #710).
 				taskRef: '10',
+				taskRepository: 'SmartTechBrewery/swarm',
 				status: 'In progress',
 				statusId: '47fc9ee4',
 				// The provider resolves the board option id to its canonical pipeline key
@@ -282,6 +287,73 @@ describe('GitHubProjectsPMProvider', () => {
 			const item = await provider.getWorkItem('PVTI_draft');
 
 			expect(item.taskRef).toBeUndefined();
+			expect(item.taskRepository).toBeUndefined();
+		});
+	});
+
+	// Issue #710: a board is project-wide, so one page's cards may be backed by
+	// Issues/PRs in several of the project's repositories — and the provider is built
+	// from a config scoped to exactly one of them. `taskRepository` is what makes the
+	// number placeable, and it comes from the card's own `repository { nameWithOwner }`
+	// (the authority `resolveItemRepository` already routes on), never from the scope.
+	describe('taskRepository', () => {
+		// The real `scopeProjectToRepository` over one two-entry record, so this is what
+		// `processJob` genuinely hands a provider for the *default* repository.
+		const [scopedToDefault] = createMockProjectRepositoryPair(['acme/android', 'acme/backend']);
+		const scopedProvider = new GitHubProjectsPMProvider(scopedToDefault);
+
+		const nodeBackedBy = (repository: string, number: number, id: string) => ({
+			...ITEM_NODE,
+			id,
+			content: {
+				...ITEM_NODE.content,
+				number,
+				url: `https://github.com/${repository}/issues/${number}`,
+				repository: { nameWithOwner: repository },
+			},
+		});
+
+		it("reports the card's own repository, not the one the provider is scoped to", async () => {
+			graphql.mockResolvedValue({ node: nodeBackedBy('acme/backend', 7, 'PVTI_backend') });
+
+			await expect(scopedProvider.getWorkItem('PVTI_backend')).resolves.toMatchObject({
+				taskRef: '7',
+				taskRepository: 'acme/backend',
+			});
+		});
+
+		// The honest miss the old regex produced as `taskRef: undefined`, now reported as
+		// a repository the caller can refuse — never re-labelled as the scoped one, which
+		// would key a worktree in a repository nobody asked for.
+		it('reports a repository the project owns neither of, rather than the scoped one', async () => {
+			graphql.mockResolvedValue({ node: nodeBackedBy('other/repo', 3, 'PVTI_other') });
+
+			await expect(scopedProvider.getWorkItem('PVTI_other')).resolves.toMatchObject({
+				taskRef: '3',
+				taskRepository: 'other/repo',
+			});
+		});
+
+		// The assertion a fix applied one call site at a time cannot pass: one page, two
+		// repositories, each card answering for itself.
+		it('resolves each card of a board-wide read against its own repository', async () => {
+			graphql.mockResolvedValue({
+				node: {
+					items: {
+						nodes: [
+							nodeBackedBy('acme/android', 10, 'PVTI_android'),
+							nodeBackedBy('acme/backend', 11, 'PVTI_backend'),
+						],
+					},
+				},
+			});
+
+			const items = await scopedProvider.listWorkItems();
+
+			expect(items.map((item) => [item.taskRepository, item.taskRef])).toEqual([
+				['acme/android', '10'],
+				['acme/backend', '11'],
+			]);
 		});
 	});
 
@@ -864,8 +936,11 @@ describe('GitHubProjectsPMProvider', () => {
 				statusId: '61e4505c',
 				url: 'https://github.com/SmartTechBrewery/swarm/issues/42',
 				// A freshly created card reads like one off a board read (issue #498) —
-				// otherwise the split child SWARM just made could not be dispatched.
+				// otherwise the split child SWARM just made could not be dispatched. That
+				// includes the repository the number belongs to (issue #710), which is the
+				// one `issues.create` above addressed.
 				taskRef: '42',
+				taskRepository: PROJECT.repo,
 			});
 			expect(created.labels.map((l) => l.name)).toContain('swarm:split-child');
 		});

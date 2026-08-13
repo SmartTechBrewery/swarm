@@ -196,22 +196,29 @@ function cardLinkUrls(card: TrelloCard): string[] {
 }
 
 /**
- * The issue number this card is the board's card *for*, from a GitHub issue URL
- * on the card. Read-only linkage, exactly as Linear derives `taskRef` from a
- * GitHub issue attachment — not attachment modelling, which is an issue #492
- * non-goal.
+ * The GitHub issue this card is the board's card *for*, as the repository/number
+ * pair that names it, from a GitHub issue URL on the card. Read-only linkage,
+ * exactly as Linear derives `taskRef` from a GitHub issue attachment — not
+ * attachment modelling, which is an issue #492 non-goal.
+ *
+ * The repository is the linked URL's own, not the one this provider's config is
+ * scoped to (issue #710): a board is project-wide, so a card may link an artifact in
+ * any of the project's repositories, and whether it is one the project owns is the
+ * caller's decision (`src/pm/types.ts`, `WorkItem.taskRepository`).
  *
  * A **pull-request** URL is an artifact link, not a task id, so it deliberately
  * cannot fill this: a card with only a PR link leaves `taskRef` unset and cannot
  * start an SCM-driven phase, which is honest (ai/ARCHITECTURE.md "Task identity").
+ * The trailing non-digit guard is kept, so a card linking `/issues/1001` does not
+ * answer for `/issues/100`.
  */
-function taskRefFromCard(card: TrelloCard, repository: string): string | undefined {
-	const issueUrl = new RegExp(
-		`https://github\\.com/${escapeRegExp(repository)}/issues/(\\d+)(?![0-9])`,
-	);
+function taskRefFromCard(card: TrelloCard): { repository: string; number: string } | undefined {
+	const issueUrl = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)(?![0-9])/;
 	for (const url of cardLinkUrls(card)) {
 		const match = url.match(issueUrl);
-		if (match) return match[1];
+		if (match?.[1] && match[2] && match[3]) {
+			return { repository: `${match[1]}/${match[2]}`, number: match[3] };
+		}
 	}
 	return undefined;
 }
@@ -893,12 +900,14 @@ export class TrelloPMProvider implements PMProvider {
 	 */
 	private toWorkItem(card: IdentifiedCard, listNames: Map<string, string>): WorkItem {
 		const listId = card.idList ?? undefined;
+		const artifact = taskRefFromCard(card);
 		return {
 			id: card.id,
 			title: card.name ?? '',
 			description: card.desc ?? '',
 			url: cardUrl(card),
-			taskRef: taskRefFromCard(card, this.project.repo),
+			taskRef: artifact?.number,
+			taskRepository: artifact?.repository,
 			status: listId === undefined ? undefined : listNames.get(listId),
 			statusId: listId,
 			statusKey: listId === undefined ? undefined : resolveStatusKeyByListId(this.config, listId),

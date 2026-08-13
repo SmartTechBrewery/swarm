@@ -96,6 +96,7 @@ function toAssignedWorkItem(workItem: WorkItem): AssignedWorkItem {
 		description: workItem.description,
 		url: workItem.url,
 		taskRef: workItem.taskRef,
+		taskRepository: workItem.taskRepository,
 		status: workItem.status,
 		statusId: workItem.statusId,
 		statusKey: workItem.statusKey,

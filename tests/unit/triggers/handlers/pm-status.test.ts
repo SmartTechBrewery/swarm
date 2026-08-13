@@ -281,8 +281,11 @@ describe('pm-status trigger', () => {
 		it('keys the dispatch on the provider-supplied taskRef, not on the item URL', async () => {
 			const workItem = createMockWorkItem({
 				statusId: '61e4505c',
+				// A Jira browse URL: nothing about the item's own URL names the artifact, so
+				// the provider's two linkage fields are the whole of the answer (issue #710).
 				url: 'https://swarm.example.test/browse/PROJ-7',
 				taskRef: '77',
+				taskRepository: PROJECT.repo,
 			});
 			const result = await trigger.handle(ctx(workItem));
 			expect(result).toEqual({ phase: 'planning', taskId: '77', workItem });
@@ -293,6 +296,49 @@ describe('pm-status trigger', () => {
 				statusId: '61e4505c',
 				url: 'https://github.com/SmartTechBrewery/swarm',
 				taskRef: undefined,
+			});
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+		});
+
+		// Issue #710: the provider reports the repository its linkage named, and *this*
+		// handler decides whether that is the repository the run is for — a card linked
+		// in another of the project's repositories is refused rather than keyed here,
+		// which would push a branch and open a pull request where nobody asked.
+		it('returns null when the card links an artifact in another repository', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c',
+				url: 'https://github.com/acme/other/issues/12',
+			});
+
+			expect(workItem.taskRepository).toBe('acme/other');
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+		});
+
+		// `repoSlugsMatch`, not `===` (issue #688): ingress routed the card on those same
+		// terms, so a config entry's casing or a `.git` suffix must not make the handler
+		// refuse a card the dispatch already accepted.
+		it('accepts a taskRepository differing from the run repository only by casing or .git', async () => {
+			for (const taskRepository of ['SmartTechBrewery/Swarm.git', 'smarttechbrewery/swarm']) {
+				const workItem = createMockWorkItem({
+					statusId: '61e4505c',
+					taskRef: '10',
+					taskRepository,
+				});
+				await expect(trigger.handle(ctx(workItem))).resolves.toEqual({
+					phase: 'planning',
+					taskId: '10',
+					workItem,
+				});
+			}
+		});
+
+		// A reference with no repository is unplaceable, so it is the same skip as no
+		// reference at all — including on a frame from a router predating the field.
+		it('returns null for a taskRef arriving with no taskRepository', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c',
+				taskRef: '10',
+				taskRepository: undefined,
 			});
 			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
