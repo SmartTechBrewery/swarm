@@ -372,6 +372,71 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 			expect(await findProjectByRepoFromDb('jkwiecien/untracked')).toBeUndefined();
 		});
 
+		// issue #684 phase 2 lifted phase 1's one-entry cap, so a project genuinely
+		// holding three repositories is now writable — and this is the real-Postgres proof
+		// that the jsonb containment predicate matches *any* entry, not just the first,
+		// and that each webhook resolves the project scoped to the entry it named.
+		it('resolves the same project from each of three entries, scoped to the matched one', async () => {
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: 'proj-multi',
+					name: 'Multi Repo Project',
+					repositories: [
+						{ repo: 'jkwiecien/first' },
+						{ repo: 'jkwiecien/second', baseBranch: 'develop', branchPrefix: 'task-' },
+						{ repo: 'jkwiecien/third', scm: 'gitlab' },
+					],
+				}),
+			);
+
+			expect(await findProjectByRepoFromDb('jkwiecien/first')).toMatchObject({
+				id: 'proj-multi',
+				repo: 'jkwiecien/first',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+			});
+			expect(await findProjectByRepoFromDb('jkwiecien/second')).toMatchObject({
+				id: 'proj-multi',
+				repo: 'jkwiecien/second',
+				baseBranch: 'develop',
+				branchPrefix: 'task-',
+			});
+			// The entry's own provider overrides the project-level default.
+			expect(await findProjectByRepoFromDb('jkwiecien/third')).toMatchObject({
+				id: 'proj-multi',
+				repo: 'jkwiecien/third',
+				scm: 'gitlab',
+			});
+		});
+
+		// What a job or a run row does: it knows its repository by name, so it reads the
+		// project scoped straight to that entry (issue #684 phase 2).
+		it('scopes a by-id read to a named entry, and throws for one the project does not own', async () => {
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: 'proj-by-id',
+					name: 'By Id Project',
+					repositories: [
+						{ repo: 'jkwiecien/default-entry' },
+						{ repo: 'jkwiecien/other-entry', baseBranch: 'develop' },
+					],
+				}),
+			);
+
+			// No repository named → the default (first) entry, which is what board-driven
+			// Planning and Implementation keep resolving to.
+			expect(await findProjectByIdFromDb('proj-by-id')).toMatchObject({
+				repo: 'jkwiecien/default-entry',
+			});
+			expect(await findProjectByIdFromDb('proj-by-id', 'jkwiecien/other-entry')).toMatchObject({
+				repo: 'jkwiecien/other-entry',
+				baseBranch: 'develop',
+			});
+			await expect(findProjectByIdFromDb('proj-by-id', 'jkwiecien/never-owned')).rejects.toThrow(
+				/does not own repository 'jkwiecien\/never-owned'/,
+			);
+		});
+
 		// The write-seam guard that replaced the `repo` UNIQUE constraint the column drop
 		// dissolved: without it two projects could claim one repository and the lookup
 		// would resolve arbitrarily.

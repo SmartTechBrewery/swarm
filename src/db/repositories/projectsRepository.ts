@@ -68,9 +68,11 @@ function rowToProjectRecord(row: ProjectRow): ProjectRecord {
  * to the project's default (first) entry.
  *
  * Board-driven and project-scoped work has no repository of its own to name, so it
- * runs against the default entry, which is exactly today's behaviour while a project
- * owns exactly one. Issue #684 phase 2 is where a caller that *does* know its
- * repository (a job carrying one) passes it.
+ * runs against the default entry, which is exactly the behaviour a single-repository
+ * project already had. A caller that *does* know its repository — a job carrying one
+ * (`repositoryForJob`, `../../queue/jobs.ts`), a run row's `repository` — passes it,
+ * and naming a repository the project does not own throws rather than falling back
+ * (issue #684 phase 2).
  */
 function rowToProjectConfig(row: ProjectRow, repo?: string): ProjectConfig {
 	return scopeProjectToRepository(rowToProjectRecord(row), repo);
@@ -255,14 +257,24 @@ export async function findProjectByPmContainerFromDb(
 }
 
 /**
- * Resolve a project by its stable internal id, scoped to its **default** repository.
- * Returns `undefined` if unknown. Issue #684 phase 2 is where a caller that knows
- * which repository its work belongs to passes it.
+ * Resolve a project by its stable internal id, scoped to one of its repositories —
+ * `repo` omitted scopes to the **default** (first) entry. Returns `undefined` if the
+ * project is unknown.
+ *
+ * The two answers are deliberately different kinds of "no": an unknown *project* is
+ * `undefined`, because a caller reading a project id off a durable row has to cope
+ * with the project having been deleted; a project that exists but does not own
+ * `repo` **throws** (`requireProjectRepository`, `../../config/project-repository.ts`),
+ * because running work against a repository it was not recorded for is a
+ * misconfiguration, never something to fall back from (issue #684 phase 2).
  */
-export async function findProjectByIdFromDb(id: string): Promise<ProjectConfig | undefined> {
+export async function findProjectByIdFromDb(
+	id: string,
+	repo?: string,
+): Promise<ProjectConfig | undefined> {
 	const rows = await getDb().select().from(projects).where(eq(projects.id, id)).limit(1);
 	const row = rows[0];
-	return row ? rowToProjectConfig(row) : undefined;
+	return row ? rowToProjectConfig(row, repo) : undefined;
 }
 
 /**

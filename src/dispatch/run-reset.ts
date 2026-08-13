@@ -186,7 +186,12 @@ export async function resetRun(
 	if (!run) {
 		throw new RunResetError('run-not-found', `Run with ID "${runId}" not found`);
 	}
-	const project = await getProjectByIdFromDb(run.projectId);
+	// Scoped to the repository the *run* recorded, not the project's default entry
+	// (issue #684 phase 2): the `GitWorktreeManager` built from this below tears down
+	// the checkout the run actually held, whose branch names come from that
+	// repository's own `baseBranch`/`branchPrefix`. A project that no longer owns it
+	// throws out of the read rather than falling back.
+	const project = await getProjectByIdFromDb(run.projectId, run.repository);
 	if (!project) {
 		throw new RunResetError(
 			'project-not-found',

@@ -323,6 +323,14 @@ describe('projectsRepository', () => {
 	});
 
 	describe('findProjectByIdFromDb', () => {
+		// Three entries, so "the matched one" is distinguishable from both the default
+		// and the last (issue #684 phase 2).
+		const threeRepositories = [
+			{ repo: 'SmartTechBrewery/first', baseBranch: 'main', branchPrefix: 'issue-' },
+			{ repo: 'SmartTechBrewery/second', baseBranch: 'develop', branchPrefix: 'task-' },
+			{ repo: 'SmartTechBrewery/third', baseBranch: 'trunk', branchPrefix: 'work-' },
+		];
+
 		it('maps a row back to a ProjectConfig', async () => {
 			stubDb([row]);
 			const project = await findProjectByIdFromDb('proj-1');
@@ -332,6 +340,46 @@ describe('projectsRepository', () => {
 		it('returns undefined for an unknown id', async () => {
 			stubDb([]);
 			expect(await findProjectByIdFromDb('nope')).toBeUndefined();
+		});
+
+		// The default entry is the first, which is what board-driven work resolves to.
+		it('scopes to the default (first) entry when no repository is named', async () => {
+			stubDb([{ ...row, repositories: threeRepositories }]);
+			expect(await findProjectByIdFromDb('proj-1')).toMatchObject({
+				repo: 'SmartTechBrewery/first',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+			});
+		});
+
+		// A job or a run row that names its repository gets *that* entry's settings, not
+		// the default one's — the whole point of the parameter.
+		it('scopes to the named entry, carrying its own branch settings', async () => {
+			stubDb([{ ...row, repositories: threeRepositories }]);
+			const project = await findProjectByIdFromDb('proj-1', 'SmartTechBrewery/second');
+			expect(project).toMatchObject({
+				repo: 'SmartTechBrewery/second',
+				baseBranch: 'develop',
+				branchPrefix: 'task-',
+			});
+			// A scoped config carries no list, so nothing downstream can reach another entry.
+			expect(project).not.toHaveProperty('repositories');
+		});
+
+		// The loud failure: naming a repository the project does not own is a
+		// misconfiguration, never something to silently fall back from.
+		it('throws naming the project and the repositories it owns for an unowned repository', async () => {
+			stubDb([{ ...row, repositories: threeRepositories }]);
+			await expect(findProjectByIdFromDb('proj-1', 'SmartTechBrewery/gone')).rejects.toThrow(
+				/'proj-1' does not own repository 'SmartTechBrewery\/gone'.*first.*second.*third/,
+			);
+		});
+
+		// An unknown *project* stays `undefined` rather than throwing: a caller reading a
+		// project id off a durable row has to cope with the project having been deleted.
+		it('still returns undefined for an unknown id even when a repository is named', async () => {
+			stubDb([]);
+			expect(await findProjectByIdFromDb('nope', 'SmartTechBrewery/second')).toBeUndefined();
 		});
 	});
 

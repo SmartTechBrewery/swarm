@@ -8,6 +8,7 @@ import {
 	getActiveDispatchByRunId,
 	getDispatchById,
 } from '../../../src/db/repositories/dispatchesRepository.js';
+import { createProjectInDb } from '../../../src/db/repositories/projectsRepository.js';
 import {
 	completeRun,
 	createRun,
@@ -17,7 +18,7 @@ import {
 import { reconcileDispatchesAtStartup } from '../../../src/dispatch/reconciler.js';
 import { QUEUE_NAME, type SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
-import { createMockScmWebhookJob } from '../../helpers/factories.js';
+import { createMockProjectRecord, createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -186,6 +187,40 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			await reconcileDispatchesAtStartup();
 			expect(await getActiveDispatchByRunId(runId)).toMatchObject({ id: dispatch?.id });
 			expect(await pendingJobIds()).toHaveLength(1);
+		});
+
+		// issue #684 phase 2 — the import scopes the project from the *run's* repository,
+		// so a merge intent recorded for a project's second repository is executed against
+		// that repository rather than against whichever entry the config lists first.
+		it("names the run's own repository on an imported merge dispatch, not the project default", async () => {
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: 'proj-reconciler-multi',
+					name: 'Reconciler Multi',
+					repositories: [{ repo: 'jkwiecien/recon-first' }, { repo: 'jkwiecien/recon-second' }],
+				}),
+			);
+			const runId = await createRun({
+				projectId: 'proj-reconciler-multi',
+				repository: 'jkwiecien/recon-second',
+				taskId: '18',
+				phase: 'review',
+				prNumber: '18',
+			});
+			await completeRun(runId, { status: 'completed', reviewVerdict: 'approve' });
+			await updateReviewMergeOutcome(runId, {
+				status: 'not-ready',
+				message: 'pending required checks',
+				attempt: 1,
+				approvedHeadSha: 'cafebabe',
+			});
+
+			await reconcileDispatchesAtStartup();
+
+			expect((await getActiveDispatchByRunId(runId))?.jobPayload).toMatchObject({
+				type: 'merge-automation',
+				repo: 'jkwiecien/recon-second',
+			});
 		});
 
 		it('is idempotent — a second startup pass changes nothing', async () => {

@@ -127,6 +127,7 @@ import {
 import {
 	type PhaseRecovery,
 	type PmWebhookJob,
+	repositoryForJob,
 	type ScmWebhookJob,
 	type SwarmJob,
 	SwarmJobSchema,
@@ -1981,10 +1982,11 @@ async function tryCreateRun(
 		);
 		const runId = await createRun({
 			projectId: project.id,
-			// The one place the repository a run acts on is resolved today: a project
-			// holds exactly one, so this is that repository (issue #683). When a project
-			// can hold several, this is where the event's own repository is resolved
-			// instead — the row then keeps being the record of what the run ran against.
+			// The repository this run acts on (issue #683). `project` is already scoped to
+			// the job's own repository by `processJob` (issue #684 phase 2), so this reads
+			// the event's repository for an SCM job and the default entry for a board one —
+			// the row is the durable record of what the run actually ran against, which is
+			// what every control-plane path that starts from a run rescopes from.
 			repository: project.repo,
 			taskId: trigger.taskId,
 			phase: trigger.phase,
@@ -2454,7 +2456,11 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 	}
 
 	try {
-		const project = await findProjectByIdFromDb(job.projectId);
+		// Scoped to the job's own repository (issue #684 phase 2), so the PR comment
+		// below is posted on the repository the interrupted work was for. A project
+		// that no longer owns it throws, which the surrounding catch logs — this is a
+		// best-effort courtesy comment, never a place to fail a job from.
+		const project = await findProjectByIdFromDb(job.projectId, repositoryForJob(job));
 		if (!project) {
 			// Unknown project (deleted mid-flight, or the non-stall `processJob` throw
 			// that also lands here) — nothing to comment on.
@@ -3101,12 +3107,31 @@ export async function processJob(
 		return { status: 'dispatch-refused', reason: 'invalid-payload' };
 	}
 
-	const project = await findProjectByIdFromDb(job.projectId);
-	if (!project) {
-		// The producer only enqueues for projects it resolved from Postgres, so a
-		// miss here means the project was deleted mid-flight — fail loudly.
-		await tryFailDispatch(dispatch.id, `Job references unknown project '${job.projectId}'`);
-		throw new Error(`Job references unknown project '${job.projectId}'`);
+	// **The seam this whole phase turns on** (issue #684 phase 2): the project is read
+	// scoped to the repository *this job* belongs to, not to the project's default
+	// entry. Everything downstream of here — the trigger context, every phase, the SCM
+	// provider calls, the worktree and branch, the review ledger, the delivery ids, the
+	// run row, and the assignment the router pushes to a federated worker — reads
+	// `project.repo`/`baseBranch`/`branchPrefix`/`scm` off this one value, so scoping it
+	// once here is what makes a second repository routable without touching any of them.
+	//
+	// A job naming a repository the project no longer owns throws out of the read
+	// (`requireProjectRepository`, which names the project and the repositories it does
+	// own) rather than falling back to the default: running a phase against the wrong
+	// repository would push a branch, open a pull request, and post reviews in a
+	// repository nobody asked for. It settles exactly like the unknown-project miss —
+	// the dispatch is failed with the reason, so the operator sees it in the queue.
+	let project: ProjectConfig;
+	try {
+		// The producer only enqueues for projects it resolved from Postgres, so a miss
+		// here means the project was deleted mid-flight.
+		const scoped = await findProjectByIdFromDb(job.projectId, repositoryForJob(job));
+		if (!scoped) throw new Error(`Job references unknown project '${job.projectId}'`);
+		project = scoped;
+	} catch (err) {
+		const error = describeError(err);
+		await tryFailDispatch(dispatch.id, error);
+		throw err;
 	}
 
 	// The agent-less dispatch kind (issue #292): a merge-automation dispatch

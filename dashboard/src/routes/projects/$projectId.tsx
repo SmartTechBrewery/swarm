@@ -88,6 +88,7 @@ import {
 	tabSearch,
 	viewerAdministersProject,
 } from '@/lib/project-nav.js';
+import { withDefaultRepositoryEdited } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	AgentConfig,
@@ -1909,9 +1910,10 @@ function ProjectDetailRouteComponent() {
 	const [switchConfirmOpen, setSwitchConfirmOpen] = useState(false);
 
 	const project = projectQuery.data;
-	// The General tab edits one repository. Phase 1 of issue #684 caps a project's list
-	// at exactly one entry, so this is it; phase 3 replaces the three single inputs it
-	// seeds with a list editor.
+	// The General tab edits the project's **default** repository — its first entry. Phase
+	// 2 of issue #684 lifted phase 1's one-entry cap, so a project may own more; phase 3
+	// replaces the three single inputs this seeds with a list editor. Until then the save
+	// carries the remaining entries through untouched (see `handleSubmit`).
 	const repository = project?.repositories[0];
 
 	/**
@@ -2286,9 +2288,11 @@ function ProjectDetailRouteComponent() {
 		updateMutation.mutate({
 			id: projectId,
 			name,
-			// The General tab still edits one repository (issue #684 phase 1 caps the list at
-			// one); phase 3 turns these three inputs into a real list editor.
-			repositories: [{ repo, baseBranch, branchPrefix }],
+			// The General tab still edits only the **default** (first) repository; phase 3
+			// turns these three inputs into a real list editor. The helper is what keeps a
+			// multi-repository project's other entries — `projects.update` replaces the list
+			// wholesale, so sending only the edited entry would delete them.
+			repositories: withDefaultRepositoryEdited(project, { repo, baseBranch, branchPrefix }),
 			repoRoot,
 			worktreeRoot,
 			maxConcurrentJobs: parsedMaxConcurrentJobs,

@@ -630,24 +630,18 @@ export const ProjectRecordBaseSchema = z.object({
 	name: z.string().min(1),
 
 	/**
-	 * The repositories this project operates on ({@link ProjectRepositorySchema}).
+	 * The repositories this project operates on ({@link ProjectRepositorySchema}) —
+	 * one or more, uncapped since issue #684 phase 2 threaded the chosen repository
+	 * from webhook ingress through the durable dispatch and the run row to the
+	 * worker (`repositoryForJob`, `src/queue/jobs.ts`). Until then the list was
+	 * capped at one entry, because a webhook from repository B would have resolved
+	 * the project and then run the phase against repository A.
 	 *
-	 * **Capped at exactly one entry in issue #684 phase 1.** The list is the durable
-	 * shape — the schema, the `projects.repositories` column, and the repository
-	 * lookups all speak it — but a *second* repository is not routable until phase 2
-	 * threads the chosen repository from the queue job through to the worker.
-	 * Accepting one before then would let a webhook from repository B resolve the
-	 * project and then run the phase against repository A. Phase 2 lifts the cap in
-	 * the same change that closes that gap.
+	 * The **first** entry is the project's default: work that names no repository of
+	 * its own — a board card, and therefore board-driven Planning and Implementation
+	 * — runs against it (`defaultProjectRepository`, `./project-repository.ts`).
 	 */
-	repositories: z
-		.array(ProjectRepositorySchema)
-		.min(1)
-		.max(1, {
-			message:
-				'A project owns exactly one repository for now — several repositories per ' +
-				'project land with issue #684 phase 2',
-		}),
+	repositories: z.array(ProjectRepositorySchema).min(1),
 
 	/**
 	 * The SCM provider this project's repositories live on by default — the

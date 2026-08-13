@@ -366,6 +366,59 @@ describe('forceReReview (issue #511)', () => {
 		});
 	});
 
+	// issue #684 phase 2 — a control-plane action that starts from a run uses *that
+	// run's* repository, never the project's default entry. Otherwise a forced
+	// continuation for the second repository's PR would answer a review, and key a
+	// ledger row, in the first repository.
+	describe('repository scoping (issue #684 phase 2)', () => {
+		beforeEach(() => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeCappedReviewRun({ repository: 'SmartTechBrewery/second' }),
+			);
+			// Repository-aware, exactly as the real read is: it answers with the project
+			// scoped to whichever entry it is asked for.
+			vi.mocked(getProjectByIdFromDb).mockImplementation(async (_id, repo) =>
+				createMockProjectConfig({ id: 'p1', repo: repo ?? 'SmartTechBrewery/swarm' }),
+			);
+		});
+
+		it("reads the project scoped to the run's repository", async () => {
+			await forceReReview('run-1');
+			expect(getProjectByIdFromDb).toHaveBeenCalledWith('p1', 'SmartTechBrewery/second');
+		});
+
+		it('keys the cap override and the ledger read on that repository', async () => {
+			await forceReReview('run-1');
+			expect(getSubmittedReviewSlot).toHaveBeenCalledWith(
+				expect.objectContaining({ repository: 'SmartTechBrewery/second' }),
+			);
+			expect(grantReviewCapOverride).toHaveBeenCalledWith(
+				expect.objectContaining({ repository: 'SmartTechBrewery/second' }),
+			);
+		});
+
+		it('names that repository on the synthetic review event it replays', async () => {
+			await forceReReview('run-1');
+			const input = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
+			expect(input.jobPayload).toMatchObject({
+				type: 'scm',
+				event: { repoFullName: 'SmartTechBrewery/second' },
+			});
+		});
+
+		// The loud failure surfaces as an internal error rather than a refusal reason:
+		// a project that stopped owning a repository its run acted on is a
+		// misconfiguration, not one of the states the operator is asked to resolve.
+		it('propagates the unowned-repository throw instead of falling back', async () => {
+			vi.mocked(getProjectByIdFromDb).mockRejectedValue(
+				new Error("Project 'p1' does not own repository 'SmartTechBrewery/second'"),
+			);
+			await expect(forceReReview('run-1')).rejects.toThrow(/does not own repository/);
+			expect(grantReviewCapOverride).not.toHaveBeenCalled();
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		});
+	});
+
 	it('refuses before mutating when Respond-to-review is disabled', async () => {
 		vi.mocked(getProjectByIdFromDb).mockResolvedValue(
 			createMockProjectConfig({ pipeline: { respondToReview: { enabled: false } } }),

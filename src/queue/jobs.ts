@@ -312,7 +312,13 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	type: z.literal('merge-automation'),
 	/** The completed Review run whose approval this merge executes — outcomes persist onto its row. */
 	reviewRunId: z.string().min(1),
-	/** `owner/repo` — observability only; execution resolves the repo from project config. */
+	/**
+	 * `owner/repo` — the repository whose pull request this merges. Load-bearing
+	 * since issue #684 phase 2: {@link repositoryForJob} reads it to scope the
+	 * project the executor merges under, so a merge intent recorded for one of a
+	 * project's repositories can never be executed against another. It was
+	 * observability-only while execution re-derived the repo from project config.
+	 */
 	repo: z.string().min(1),
 	prNumber: z.string().min(1),
 	/** The reviewed head SHA the approval covers; re-checked fresh on every attempt. */
@@ -362,6 +368,41 @@ export type ScmWebhookJob = z.infer<typeof ScmWebhookJobSchema>;
 export type PmWebhookJob = z.infer<typeof PmWebhookJobSchema>;
 export type MergeAutomationJob = z.infer<typeof MergeAutomationJobSchema>;
 export type SwarmJob = z.infer<typeof swarmJobVariants>;
+
+/**
+ * Which of its project's repositories this job belongs to (issue #684 phase 2) —
+ * the input `scopeProjectToRepository` (`../config/project-repository.ts`) narrows
+ * the project record with, so every phase downstream of the scoping runs against
+ * the repository the *work* names rather than whichever entry the config lists
+ * first. `undefined` means "the project's default entry".
+ *
+ * Each variant answers from what it already carries, so nothing new travels on the
+ * wire and a dispatch row written before this existed answers identically:
+ *
+ * - `scm` — the normalized event's own `repoFullName` (`../scm/events.ts`), written
+ *   by the ingress that received the delivery. This is the whole point of the
+ *   phase: a webhook for repository B runs against repository B.
+ * - `merge-automation` — the dispatch's own `repo`, resolved when the Review run
+ *   that approved the PR persisted the intent.
+ * - `pm` — `undefined`. A board card names no repository, so board-driven Planning
+ *   and Implementation run against the default entry, which is exactly the
+ *   behaviour a single-repository project already had. Letting a card choose a
+ *   repository is a separate product decision.
+ *
+ * One `switch` exhaustive over the discriminator rather than a lookup with a
+ * fallback: a fourth job type fails to compile until it states which repository it
+ * belongs to, instead of silently inheriting the default.
+ */
+export function repositoryForJob(job: SwarmJob): string | undefined {
+	switch (job.type) {
+		case 'scm':
+			return job.event.repoFullName;
+		case 'merge-automation':
+			return job.repo;
+		case 'pm':
+			return undefined;
+	}
+}
 
 /**
  * Normalize a payload read straight out of Postgres, where `jobPayload` is a

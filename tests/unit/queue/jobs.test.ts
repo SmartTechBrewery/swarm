@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { QUEUE_NAME, SwarmJobSchema } from '@/queue/jobs.js';
-import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
+import { QUEUE_NAME, repositoryForJob, SwarmJobSchema } from '@/queue/jobs.js';
+import {
+	createMockPmWebhookJob,
+	createMockScmEvent,
+	createMockScmWebhookJob,
+} from '../../helpers/factories.js';
 
 // Jobs cross the router→Redis→worker boundary as JSON, so every case parses a
 // JSON round-trip of the fixture — what the consumer actually receives.
@@ -260,5 +264,52 @@ describe('SwarmJobSchema', () => {
 
 	it('names the queue both sides speak on', () => {
 		expect(QUEUE_NAME).toBe('swarm-jobs');
+	});
+});
+
+// issue #684 phase 2 — the one place a job says which of its project's repositories
+// it belongs to. Every variant answers from what it already carries, so a dispatch
+// row written before this existed answers identically.
+describe('repositoryForJob', () => {
+	it('answers an scm job with the event repository its ingress recorded', () => {
+		const job = createMockScmWebhookJob({
+			event: createMockScmEvent({ repoFullName: 'acme/second' }),
+		});
+		expect(repositoryForJob(job)).toBe('acme/second');
+	});
+
+	it('answers a merge-automation job with the repository the intent was recorded for', () => {
+		const job = SwarmJobSchema.parse({
+			type: 'merge-automation',
+			projectId: 'swarm',
+			reviewRunId: 'run-1',
+			repo: 'acme/second',
+			prNumber: '17',
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(repositoryForJob(job)).toBe('acme/second');
+	});
+
+	// A board card names no repository, so board-driven Planning and Implementation
+	// run against the project's default entry — unchanged behaviour.
+	it('answers a pm job with undefined, so it scopes to the default entry', () => {
+		expect(repositoryForJob(createMockPmWebhookJob())).toBeUndefined();
+	});
+
+	// The legacy envelope upgrades before the discriminator is read, so a dispatch row
+	// written pre-#385 still resolves its repository rather than falling to the default.
+	it('answers a legacy `github` envelope from its upgraded event', () => {
+		const job = SwarmJobSchema.parse({
+			type: 'github',
+			projectId: 'swarm',
+			deliveryId: 'legacy-1',
+			event: {
+				kind: 'pull-request',
+				action: 'opened',
+				repoFullName: 'acme/legacy',
+				isCommentEvent: false,
+			},
+		});
+		expect(repositoryForJob(job)).toBe('acme/legacy');
 	});
 });

@@ -327,6 +327,19 @@ describe('toQueuedRuns', () => {
 		expect(item.contentType).toBeUndefined();
 	});
 
+	// issue #684 phase 2 — `repo` is resolved through `repositoryForJob`, the same helper
+	// the worker scopes the project with, so the row's PR link names the repository the
+	// phase will actually run in rather than the project's default entry.
+	it("carries a non-default repository straight off the job's own event", () => {
+		const job = createMockScmWebhookJob({
+			event: { ...createMockScmWebhookJob().event, repoFullName: 'SmartTechBrewery/second' },
+		});
+
+		const [item] = toQueuedRuns([makeDispatch({ jobPayload: job })]);
+
+		expect(item.repo).toBe('SmartTechBrewery/second');
+	});
+
 	it('maps a merge-automation dispatch to repo + prNumber with its run link (issue #292)', () => {
 		const [item] = toQueuedRuns([
 			makeDispatch({
