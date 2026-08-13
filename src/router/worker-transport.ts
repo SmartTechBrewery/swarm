@@ -18,7 +18,10 @@
  *     checkout's repository, suspend any enrollment that declaration contradicts
  *     (issue #690), return the session.
  *   - `GET /worker/stream` — a WebSocket carrying periodic heartbeat frames that
- *     keep the lease live, releasing it on disconnect.
+ *     keep the lease live, releasing it on disconnect — and, since issue #723,
+ *     recording that disconnect against the dispatches this router is awaiting on
+ *     that worker, so the interruption is legible while it happens rather than
+ *     inferred from silence.
  *
  * The request logic is factored out of the socket/HTTP glue into pure,
  * injectable functions (`handleHandshake`, `handleWorkerStreamFrame`) so tests
@@ -77,10 +80,21 @@ import {
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
+	noteWorkerTransportLost,
+	noteWorkerTransportRestored,
 	resolveDispatchStreamTarget,
 } from './dispatch-results.js';
-import { persistStreamLog } from './stream-log-persistence.js';
-import { deregisterConnection, registerConnection } from './worker-connections.js';
+import {
+	persistControlPlaneNote,
+	persistStreamLog,
+	TRANSPORT_LOST_NOTE,
+	TRANSPORT_RESTORED_NOTE,
+} from './stream-log-persistence.js';
+import {
+	deregisterConnection,
+	isWorkerConnected,
+	registerConnection,
+} from './worker-connections.js';
 
 // The application-defined WebSocket close codes are part of the wire contract, so
 // they live in the protocol module (the single source of truth for every frame)
@@ -159,6 +173,17 @@ export interface WorkerTransportDeps {
 	 * Postgres or Redis, and the promotion swallows its own failures.
 	 */
 	onWorkerAvailable: (workerId: string) => void;
+	/**
+	 * This worker's transport just dropped / just came back (issue #723). The router
+	 * is the only place that knows either moment, so it records the interruption
+	 * against every dispatch it is awaiting on that worker and writes one note into
+	 * each of their runs' output streams — otherwise a run whose output is simply not
+	 * reaching the control plane reads exactly like one that stopped progressing.
+	 * Fire-and-forget by contract, like `onWorkerAvailable`: both return `void` so a
+	 * socket's lifecycle never waits on Postgres.
+	 */
+	onWorkerTransportLost: (workerId: string) => void;
+	onWorkerTransportRestored: (workerId: string) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -178,6 +203,16 @@ function defaultDeps(): WorkerTransportDeps {
 		resolveDispatchStreamTarget,
 		onWorkerAvailable: (workerId) => {
 			void promoteAvailabilityWaitsForWorker(workerId, 'connected');
+		},
+		onWorkerTransportLost: (workerId) => {
+			for (const dispatch of noteWorkerTransportLost(workerId)) {
+				persistControlPlaneNote(dispatch.runId, TRANSPORT_LOST_NOTE);
+			}
+		},
+		onWorkerTransportRestored: (workerId) => {
+			for (const dispatch of noteWorkerTransportRestored(workerId)) {
+				persistControlPlaneNote(dispatch.runId, TRANSPORT_RESTORED_NOTE);
+			}
 		},
 	};
 }
@@ -517,18 +552,39 @@ function applyStreamAction(ws: WSContext, action: WorkerStreamAction): void {
 }
 
 /**
+ * Run one fire-and-forget connection-lifecycle hook. Registration has already
+ * happened by the time any of these run, and it is the part connectivity depends
+ * on, so a hook that fails must not take the socket down with it: it is logged and
+ * swallowed, and each hook is guarded separately so one failing does not skip the
+ * next.
+ */
+function runConnectionHook(what: string, workerId: string, hook: () => void): void {
+	try {
+		hook();
+	} catch (err) {
+		logger.warn(`worker transport: ${what} failed`, {
+			workerId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
  * An authenticated `/worker/stream` socket opened: record it as the worker's live
- * transport, then wake the work that was only waiting for a machine like this one.
+ * transport, wake the work that was only waiting for a machine like this one, and
+ * annotate the runs whose output this session restores.
  *
  * Factored out of the socket glue for the same reason `handleHandshake` and
- * `handleWorkerStreamFrame` are — a test drives it with a fake `WSContext` and a
- * fake promotion — and kept here rather than inside `registerConnection` so the
+ * `handleWorkerStreamFrame` are — a test drives it with a fake `WSContext` and
+ * fake hooks — and kept here rather than inside `registerConnection` so the
  * connected-worker registry keeps owning no scheduling decision of its own.
  *
  * This is the *first* of the two moments a worker becomes available (issue #610);
- * the other is a dispatch bound to it settling (`../worker/consumer.ts`). Waking
- * is fire-and-forget: the socket must open regardless of what Postgres or Redis
- * are doing.
+ * the other is a dispatch bound to it settling (`../worker/consumer.ts`). It is
+ * also the moment a dropped transport comes back (issue #723) — which annotates
+ * only the runs whose dispatch this router already saw interrupted, so an ordinary
+ * first connection writes nothing. Both are fire-and-forget: the socket must open
+ * regardless of what Postgres or Redis are doing.
  */
 export function handleWorkerStreamOpen(
 	deps: WorkerTransportDeps,
@@ -536,17 +592,13 @@ export function handleWorkerStreamOpen(
 	ws: WSContext,
 ): void {
 	registerConnection(workerId, ws);
-	try {
-		deps.onWorkerAvailable(workerId);
-	} catch (err) {
-		// Registration already happened, and it is the part connectivity depends on.
-		// A scheduling nudge that fails must not take the socket down with it — the
-		// timed re-check still starts the waiting work.
-		logger.warn('worker connected: waking availability-blocked dispatches failed', {
-			workerId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	}
+	// The timed re-check still starts the waiting work if this nudge fails.
+	runConnectionHook('waking availability-blocked dispatches', workerId, () =>
+		deps.onWorkerAvailable(workerId),
+	);
+	runConnectionHook('noting the restored transport session', workerId, () =>
+		deps.onWorkerTransportRestored(workerId),
+	);
 }
 
 /**
@@ -613,6 +665,22 @@ export function registerWorkerTransport(
 			const workerId = await authenticateUpgrade(deps, credential, fencingToken, ttlMs);
 			const safeCredential = credential ?? '';
 
+			// One loss note per socket, recorded by whichever handler observes the drop
+			// first: `onError` is routinely followed by `onClose` for the same socket, and
+			// a single drop must record a single interruption. Per-connection state, since
+			// this closure runs once per upgrade.
+			let lossNoted = false;
+			function noteTransportLoss(id: string): void {
+				// Only when this socket was still the live one. A superseded socket's stale
+				// close — its replacement registered first, so `deregisterConnection` was a
+				// no-op — must write no note: nothing was interrupted, the worker is here.
+				if (lossNoted || isWorkerConnected(id)) return;
+				lossNoted = true;
+				runConnectionHook('noting the lost transport session', id, () =>
+					deps.onWorkerTransportLost(id),
+				);
+			}
+
 			return {
 				onOpen(_evt, ws) {
 					if (workerId === undefined) {
@@ -665,6 +733,9 @@ export function registerWorkerTransport(
 					// prior heartbeat still expires via the TTL — the existing mechanism.
 					// Best-effort: log, don't throw.
 					deregisterConnection(workerId, ws);
+					// After the deregister, so "is this worker still reachable here?" answers
+					// about the *replacement* socket rather than about the one closing.
+					noteTransportLoss(workerId);
 					try {
 						await deps.releaseSession(credential, fencingToken);
 					} catch (err) {
@@ -675,10 +746,20 @@ export function registerWorkerTransport(
 				},
 				onError(evt, ws) {
 					// Deregister on a socket error too, so a connection that errors out
-					// without a clean close doesn't linger in the registry.
-					if (workerId !== undefined) deregisterConnection(workerId, ws);
+					// without a clean close doesn't linger in the registry — and record the
+					// interruption here as well, since an errored socket may never deliver a
+					// clean `onClose`.
+					if (workerId !== undefined) {
+						deregisterConnection(workerId, ws);
+						noteTransportLoss(workerId);
+					}
 					logger.warn('worker transport stream error', {
-						error: evt instanceof ErrorEvent ? evt.message : String(evt),
+						error:
+							evt instanceof Error
+								? evt.message
+								: evt && typeof evt === 'object' && 'message' in evt
+									? String((evt as Record<string, unknown>).message)
+									: String(evt),
 					});
 				},
 			};

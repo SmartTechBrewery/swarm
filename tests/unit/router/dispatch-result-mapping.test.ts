@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentRunError } from '@/harness/agent-failure.js';
+import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
-import { adaptResultToPhaseRun } from '@/router/dispatcher.js';
+import type { TransportInterruptions } from '@/router/dispatch-results.js';
+import { adaptResultToPhaseRun, awaitResultWithGuards } from '@/router/dispatcher.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import { deferrableOrFailedResult } from '@/transport/assignment-execution.js';
@@ -355,5 +357,112 @@ describe('adaptResultToPhaseRun exit metadata', () => {
 				SELECTION,
 			),
 		).toThrow(RunTerminatedError);
+	});
+});
+
+/**
+ * How a result-wait timeout is attributed (issue #723). The message is the whole
+ * point of this branch — it is what an operator reads on a run that failed without
+ * the worker ever saying why — so it is asserted directly rather than through a live
+ * BullMQ consumer. Since phase 1/3 (issue #718) makes a *recovered* interruption
+ * deliver its result, an undelivered one now genuinely means the drop was not
+ * recovered, which is what makes naming it honest rather than speculative.
+ */
+describe('awaitResultWithGuards timeout attribution', () => {
+	const WAIT_MS = 60_000;
+	const never = (): Promise<TaskExecutionResult> => new Promise<TaskExecutionResult>(() => {});
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.spyOn(logger, 'warn').mockImplementation(() => {});
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	/** Drive the wait to its timeout and hand back the error it rejected with. */
+	async function timeOut(interruptions: TransportInterruptions): Promise<AgentRunError> {
+		const pending = awaitResultWithGuards(
+			never(),
+			new AbortController().signal,
+			SELECTION,
+			WAIT_MS,
+			DISPATCH,
+			() => interruptions,
+		);
+		const caught = pending.catch((err: unknown) => err);
+		await vi.advanceTimersByTimeAsync(WAIT_MS);
+		const err = await caught;
+		expect(err).toBeInstanceOf(AgentRunError);
+		return err as AgentRunError;
+	}
+
+	it('keeps today’s wording when the transport was never interrupted', async () => {
+		const err = await timeOut({ count: 0 });
+
+		expect(err.message).toBe("Worker 'ada-laptop' did not report a result within the lease window");
+		// The thrown shape is unchanged, so the shared deferral path behaves identically.
+		expect(err.failure.kind).toBe('aborted');
+	});
+
+	it('names the interruption, its count, and where to confirm it', async () => {
+		const err = await timeOut({ count: 2, lastAt: new Date('2026-08-13T12:00:00Z') });
+
+		expect(err.message).toContain("Worker 'ada-laptop' lost its transport session 2×");
+		expect(err.message).toContain('never delivered a result');
+		// The pointer that settles "delivered and discarded" versus "never got there".
+		expect(err.message).toContain('assignment phase finished — sending result');
+		expect(err.message).not.toContain('did not report a result within the lease window');
+		expect(err.failure.kind).toBe('aborted');
+	});
+
+	it('records the interruption on the warning that precedes the failure', async () => {
+		await timeOut({ count: 1, lastAt: new Date('2026-08-13T12:00:00Z') });
+
+		expect(logger.warn).toHaveBeenCalledWith(
+			'dispatch back-channel: no result within the lease window — failing',
+			expect.objectContaining({
+				dispatchId: DISPATCH,
+				interruptions: 1,
+				lastInterruptedAt: '2026-08-13T12:00:00.000Z',
+			}),
+		);
+	});
+
+	it('still reports the shutdown, not the interruption, when the control plane aborts', async () => {
+		const controller = new AbortController();
+		const pending = awaitResultWithGuards(
+			never(),
+			controller.signal,
+			SELECTION,
+			WAIT_MS,
+			DISPATCH,
+			() => ({ count: 3 }),
+		);
+		const caught = pending.catch((err: unknown) => err);
+		controller.abort();
+
+		const err = (await caught) as AgentRunError;
+		expect(err.message).toBe('Control plane is shutting down');
+	});
+
+	it('resolves with the result and never times out when the worker reports', async () => {
+		const reported = base({ status: 'succeeded', exitCode: 0 });
+
+		const settled = awaitResultWithGuards(
+			Promise.resolve(reported),
+			new AbortController().signal,
+			SELECTION,
+			WAIT_MS,
+			DISPATCH,
+			() => ({ count: 1, lastAt: new Date('2026-08-13T12:00:00Z') }),
+		);
+
+		await expect(settled).resolves.toEqual(reported);
+		// The recovered interruption is bookkeeping only: it changes nothing for a
+		// dispatch that reports normally.
+		await vi.advanceTimersByTimeAsync(WAIT_MS);
+		expect(logger.warn).not.toHaveBeenCalled();
 	});
 });

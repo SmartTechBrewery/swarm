@@ -4,6 +4,8 @@ import {
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
+	noteWorkerTransportLost,
+	noteWorkerTransportRestored,
 	resolveDispatchStreamTarget,
 	resolveDispatchTargetForRun,
 } from '@/router/dispatch-results.js';
@@ -179,6 +181,116 @@ describe('resolveDispatchTargetForRun', () => {
 
 		expect(resolveDispatchStreamTarget(DISPATCH_A)).toEqual({ workerId: WORKER_A });
 		expect(resolveDispatchTargetForRun(DISPATCH_A)).toBeUndefined();
+
+		awaiting.dispose();
+	});
+});
+
+/**
+ * Transport interruption bookkeeping (issue #723). This registry is the only place
+ * that knows which dispatches are awaited on a given worker, so it is where a
+ * dropped `/worker/stream` gets recorded — and, because it holds no database
+ * dependency and must keep none, it *returns* the affected dispatches rather than
+ * annotating their runs itself.
+ */
+describe('transport interruption bookkeeping', () => {
+	it('marks only the dropped worker’s dispatches, and returns them with their runs', () => {
+		const onA = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const onB = awaitDispatchResult(DISPATCH_B, TARGET_B);
+
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([{ dispatchId: DISPATCH_A, runId: 'run-a' }]);
+
+		expect(onA.interruptions()).toMatchObject({ count: 1 });
+		expect(onA.interruptions().lastAt).toBeInstanceOf(Date);
+		// The other worker's dispatch is untouched — one machine dropping says nothing
+		// about another.
+		expect(onB.interruptions()).toEqual({ count: 0, lastAt: undefined });
+
+		onA.dispose();
+		onB.dispose();
+	});
+
+	it('accumulates over repeated drops — a reconnect does not undo one', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		noteWorkerTransportLost(WORKER_A);
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+		noteWorkerTransportLost(WORKER_A);
+
+		expect(awaiting.interruptions().count).toBe(2);
+
+		awaiting.dispose();
+	});
+
+	it('restores nothing for a worker whose transport never dropped', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		// An ordinary first connection must annotate no run.
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([]);
+
+		awaiting.dispose();
+	});
+
+	it('reports a restoration only once per drop — a superseding socket with no new drop restores nothing', () => {
+		// Review #4929792793 F1: a live socket superseded by another (a reconnect
+		// racing its predecessor's close, or a second daemon connection) calls
+		// `handleWorkerStreamOpen` again with no transport loss in between. That must
+		// not re-emit the restoration note for a dispatch already reported restored.
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		noteWorkerTransportLost(WORKER_A);
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+		// A second socket open for the same worker, with no intervening drop.
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([]);
+
+		// A fresh drop makes the dispatch reportable again.
+		noteWorkerTransportLost(WORKER_A);
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+
+		awaiting.dispose();
+	});
+
+	it('reports nothing for a worker this router is awaiting no dispatch on', () => {
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([]);
+		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([]);
+	});
+
+	// The bookkeeping lives on the entry, so it dies with the entry — there is no
+	// separate cleanup to forget on a dispatch that reports normally.
+	it('drops the bookkeeping with the entry on delivery, supersede and dispose', async () => {
+		const delivered = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		noteWorkerTransportLost(WORKER_A);
+		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
+		await delivered.result;
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([]);
+		delivered.dispose();
+
+		const superseded = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		noteWorkerTransportLost(WORKER_A);
+		const replacement = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		await superseded.result;
+		// The re-push starts clean: the newer registration never saw that drop, while
+		// the superseded waiter keeps reporting what its own dispatch saw.
+		expect(replacement.interruptions().count).toBe(0);
+		expect(superseded.interruptions().count).toBe(1);
+
+		replacement.dispose();
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([]);
+	});
+
+	it('reports a dispatch with no run row, so the count still reaches the failure', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, { workerId: WORKER_A });
+
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: undefined },
+		]);
+		expect(awaiting.interruptions().count).toBe(1);
 
 		awaiting.dispose();
 	});

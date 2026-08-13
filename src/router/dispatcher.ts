@@ -90,7 +90,7 @@ import { resolveWorkerConcurrency, resolveWorkerLockOptions } from '../worker/ru
 import { phaseAgentConfig } from '../worker/target-policy.js';
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
-import { awaitDispatchResult } from './dispatch-results.js';
+import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
 import { isWorkerConnected, sendToWorker } from './worker-connections.js';
 
 /**
@@ -350,17 +350,44 @@ export function adaptResultToPhaseRun(
 }
 
 /**
+ * How a result-wait timeout is attributed (issue #723). With no interruption
+ * recorded, "the worker never reported" is the honest reading and keeps today's
+ * wording. With one, it is not: the phase may well have finished and its result
+ * been dropped with the dead socket, so the failure names the drop and points at
+ * the one line on the worker that settles which it was.
+ */
+function resultWaitTimeoutReason(
+	selection: DispatchSelection,
+	interruptions: TransportInterruptions,
+): string {
+	if (interruptions.count === 0) {
+		return `Worker '${selection.workerName}' did not report a result within the lease window`;
+	}
+	return (
+		`Worker '${selection.workerName}' lost its transport session ${interruptions.count}× during ` +
+		'this phase and never delivered a result — the phase may have completed there ' +
+		"(check the worker log for 'assignment phase finished — sending result')"
+	);
+}
+
+/**
  * Await the worker's terminal result, but give up if the control plane is
  * shutting down (`signal`) or the worker never reports within the lease window —
  * both surface as an `aborted` `AgentRunError` so the shared path defers the
  * dispatch for a bounded retry rather than hanging the BullMQ job forever.
+ *
+ * Exported for its message alone (issue #723): what a timeout *says* is the whole
+ * point of the branch, and asserting it through a live BullMQ consumer would cost
+ * far more than it proves.
  */
-function awaitResultWithGuards(
+export function awaitResultWithGuards(
 	result: Promise<TaskExecutionResult>,
 	signal: AbortSignal,
 	selection: DispatchSelection,
 	waitMs: number,
 	dispatchId: string,
+	/** What this router saw happen to the worker's transport while it was awaiting this dispatch. */
+	interruptions: () => TransportInterruptions,
 ): Promise<TaskExecutionResult> {
 	return new Promise<TaskExecutionResult>((resolve, reject) => {
 		const abort = (reason: string): void => {
@@ -378,14 +405,19 @@ function awaitResultWithGuards(
 			// the branch that turns "the worker never reported" into a phase failure, and
 			// it looks identical in the run row to a phase that genuinely failed. The
 			// pair to look for is this line with no matching "assignment phase finished —
-			// sending result" on the worker (`src/transport/assignment-execution.ts`).
+			// sending result" on the worker (`src/transport/assignment-execution.ts`), and
+			// the interruption count is what says whether that pair is even worth checking
+			// — a dropped session is the reading under which the worker did report.
+			const interrupted = interruptions();
 			logger.warn('dispatch back-channel: no result within the lease window — failing', {
 				dispatchId,
 				workerId: selection.workerId,
 				worker: selection.workerName,
 				waitMs,
+				interruptions: interrupted.count,
+				lastInterruptedAt: interrupted.lastAt?.toISOString(),
 			});
-			abort(`Worker '${selection.workerName}' did not report a result within the lease window`);
+			abort(resultWaitTimeoutReason(selection, interrupted));
 		}, waitMs);
 		const onAbort = (): void => abort('Control plane is shutting down');
 		const cleanup = (): void => {
@@ -532,6 +564,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 			selection,
 			timeoutMs + RESULT_WAIT_MARGIN_MS,
 			dispatch.id,
+			awaiting.interruptions,
 		);
 		return adaptResultToPhaseRun(
 			result,
