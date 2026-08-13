@@ -76,6 +76,18 @@ const PM_CONTRACT_METHODS = [
 	'resolveItemRepository',
 ] as const satisfies ReadonlyArray<PMContractMethod>;
 
+/**
+ * The three lookups that take one key and answer with at most one card. They are
+ * the contract's whole reason for being wider than `listWorkItems` (`src/pm/types.ts`),
+ * so they carry a cost expectation the assertion below holds every registered
+ * provider to.
+ */
+const PM_ONE_CARD_LOOKUPS = [
+	'findWorkItemByUrlSuffix',
+	'findWorkItemForArtifact',
+	'findWorkItemByDescriptionMarker',
+] as const satisfies ReadonlyArray<(typeof PM_CONTRACT_METHODS)[number]>;
+
 /** The capability flags a provider answers with a boolean rather than a method. */
 const PM_CAPABILITY_FLAGS = ['supportsAssignees', 'supportsDependencies'] as const;
 
@@ -310,6 +322,34 @@ describe('PM provider conformance', () => {
 						String(manifest.routerAdapter[method]),
 						`${manifest.id} adapter.${method} still throws the not-implemented sentinel`,
 					).not.toMatch(STUB_SENTINEL);
+				}
+			});
+
+			/**
+			 * The mechanical floor under the one-card lookup rule (`src/pm/types.ts`,
+			 * "One-card lookups are lookups, not scans"; issue #735). All four providers
+			 * once answered these by calling `listWorkItems()` and filtering, which is
+			 * four GitHub GraphQL pages per lookup on a 325-card board and is what
+			 * exhausted the board credential.
+			 *
+			 * Read rather than exercised, like the stub and discovery scans above: calling
+			 * a lookup would authenticate and hit the provider's API, which a unit suite
+			 * must not do (ai/TESTING.md "Test runner").
+			 *
+			 * **A floor, not a proof.** It sees only the method's own body and only the
+			 * contract's own name, so a provider that reads its whole board through a
+			 * private helper passes — Trello's two declared scans do, and say so in their
+			 * own comments. What it does catch is the exact regression this suite exists
+			 * for: the next provider copying `listWorkItems()` into a lookup because that
+			 * was the obvious implementation.
+			 */
+			it('answers one-card lookups without a whole-board read', () => {
+				const provider = manifest.createProvider(projectFor(manifest));
+				for (const method of PM_ONE_CARD_LOOKUPS) {
+					expect(
+						String(provider[method]),
+						`${manifest.id}.${method} answers a one-card lookup with a whole-board listWorkItems()`,
+					).not.toMatch(/\blistWorkItems\s*\(/);
 				}
 			});
 

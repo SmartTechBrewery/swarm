@@ -616,6 +616,25 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * The issue number a Linear-shaped URL suffix names, or nothing when the suffix
+ * could not have come from a Linear issue URL.
+ *
+ * Linear's own URL grammar, kept in this adapter and nowhere else (ai/RULES.md
+ * §2): `linear.app/<workspace>/issue/<TEAM>-<number>` optionally followed by the
+ * title slug, so the identifier is matched wherever it sits in the tail rather
+ * than only at its end. The number is what {@link IssueFilterVariable} can narrow
+ * on; the team-key half is confirmed by the caller against the issue's real URL.
+ *
+ * Returning nothing is how a GitHub-shaped `/issues/<n>` suffix — SWARM's only
+ * caller — becomes a miss that costs no request at all (issue #735).
+ */
+function linearIssueNumberFromUrlSuffix(urlSuffix: string): number | undefined {
+	const match = /(?:^|\/)issue\/[A-Za-z0-9]+-(\d+)(?:\/|$)/.exec(urlSuffix);
+	const number = match?.[1] === undefined ? Number.NaN : Number(match[1]);
+	return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+}
+
+/**
  * Reduce discovered teams to stable picker options: keep only nodes carrying both
  * an id and a name, deduplicate by id, and sort by name (case-insensitive) so the
  * picker order doesn't jump between refreshes. No `url` — a Linear team has no web
@@ -747,18 +766,31 @@ export class LinearPMProvider implements PMProvider {
 	}
 
 	async findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined> {
-		// Linear exposes no filter on an issue's own `url`, so the match runs
-		// client-side over the same paged team read `listWorkItems` walks.
+		// Linear exposes no filter on an issue's own `url` — but a Linear URL carries
+		// the issue's own identifier, and *that* is filterable, so the suffix is parsed
+		// into a key rather than used as a predicate over a whole team read (issue
+		// #735). One request when the suffix is Linear-shaped, none when it is not.
 		//
 		// SWARM's only caller passes a GitHub-shaped `/issues/<n>` suffix — the
 		// documented legacy fallback in `src/pipeline/respond-to-review.ts`, used only
 		// for a pull request with no recorded card (ai/ARCHITECTURE.md "Task
 		// identity"). A Linear issue's URL is a `linear.app/<workspace>/issue/<KEY>`
-		// path, which never ends with that, so for those pre-existing PRs this
-		// honestly resolves nothing; a Linear board reports through SWARM's own
-		// durable `runs.work_item_id` link instead, which is provider-neutral.
-		const items = await this.listWorkItems();
-		return items.find((item) => item.url.endsWith(urlSuffix));
+		// path, which never ends with that, so for those pre-existing PRs this still
+		// honestly resolves nothing — it just no longer reads the board to find that
+		// out. A Linear board reports through SWARM's own durable `runs.work_item_id`
+		// link instead, which is provider-neutral.
+		const number = linearIssueNumberFromUrlSuffix(urlSuffix);
+		if (number === undefined) return undefined;
+		return this.run(async () => {
+			// Team-scoped and number-exact, so this resolves at most one issue: the
+			// team is the board (ai/ARCHITECTURE.md "PM: Linear") and a number is unique
+			// within it. The identifier's team-key half is confirmed by the `endsWith`
+			// below rather than by the filter, which keeps the match exactly the one the
+			// contract describes — another team's `OPS-12` cannot answer for `ENG-12`.
+			const issues = await this.collectIssues(this.issueFilter({ number }));
+			const match = issues.find((issue) => (issue.url ?? '').endsWith(urlSuffix));
+			return match ? toWorkItem(match, this.config, this.project.repo) : undefined;
+		});
 	}
 
 	async findWorkItemForArtifact({

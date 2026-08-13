@@ -84,6 +84,28 @@ interface GetItemResponse {
 	node?: ItemNode | null;
 }
 
+/** A project item read through its backing artifact, which also names the board it sits on. */
+interface ArtifactItemNode extends ItemNode {
+	project?: { id?: string } | null;
+}
+
+/** One artifact's board memberships, for {@link ARTIFACT_ITEMS_QUERY}. */
+interface ArtifactItemsResponse {
+	repository?: {
+		issueOrPullRequest?: {
+			__typename?: string;
+			projectItems?: { nodes?: Array<ArtifactItemNode | null> | null } | null;
+		} | null;
+	} | null;
+}
+
+/** One page of a repository's newest issue bodies, for {@link RECENT_ISSUE_BODIES_QUERY}. */
+interface RecentIssueBodiesResponse {
+	repository?: {
+		issues?: { nodes?: Array<{ number?: number; body?: string | null } | null> | null } | null;
+	} | null;
+}
+
 /** One page of the board's items, for {@link GitHubProjectsPMProvider.listWorkItems}. */
 interface ListItemsResponse {
 	node?: {
@@ -107,37 +129,45 @@ interface ResolvedItem {
 }
 
 /**
- * Read one item, its Status option, and its backing Issue/PR in one round-trip.
+ * The selection every read maps a {@link WorkItem} from — one Projects item, its
+ * Status option, and its backing Issue/PR. Interpolated into each item-shaped
+ * query below rather than repeated, so the three reads can never drift into
+ * mapping different fields.
  *
  * The label page size is deliberately generous: `WorkItem.labels` now drives the
  * automation gate (issue #131), so a label truncated off the end of the page
  * would read as "not opted in" and silently halt the pipeline on a busy issue.
  */
+const ITEM_FIELDS = /* GraphQL */ `
+	id
+	createdAt
+	updatedAt
+	content {
+		__typename
+		... on Issue {
+			number title body url
+			repository { nameWithOwner }
+			labels(first: 100) { nodes { id name color } }
+			assignees(first: 10) { nodes { id login name } }
+		}
+		... on PullRequest {
+			number title body url
+			repository { nameWithOwner }
+			labels(first: 100) { nodes { id name color } }
+			assignees(first: 10) { nodes { id login name } }
+		}
+	}
+	fieldValueByName(name: "Status") {
+		... on ProjectV2ItemFieldSingleSelectValue { name optionId }
+	}
+`;
+
+/** Read one item, its Status option, and its backing Issue/PR in one round-trip. */
 const GET_ITEM_QUERY = /* GraphQL */ `
 	query($itemId: ID!) {
 		node(id: $itemId) {
 			... on ProjectV2Item {
-				id
-				createdAt
-				updatedAt
-				content {
-					__typename
-					... on Issue {
-						number title body url
-						repository { nameWithOwner }
-						labels(first: 100) { nodes { id name color } }
-						assignees(first: 10) { nodes { id login name } }
-					}
-					... on PullRequest {
-						number title body url
-						repository { nameWithOwner }
-						labels(first: 100) { nodes { id name color } }
-						assignees(first: 10) { nodes { id login name } }
-					}
-				}
-				fieldValueByName(name: "Status") {
-					... on ProjectV2ItemFieldSingleSelectValue { name optionId }
-				}
+				${ITEM_FIELDS}
 			}
 		}
 	}
@@ -150,29 +180,84 @@ const LIST_ITEMS_QUERY = /* GraphQL */ `
 				items(first: 100, after: $cursor) {
 					pageInfo { hasNextPage endCursor }
 					nodes {
-						id
-						createdAt
-						updatedAt
-						content {
-							__typename
-							... on Issue {
-								number title body url
-								repository { nameWithOwner }
-								labels(first: 100) { nodes { id name color } }
-								assignees(first: 10) { nodes { id login name } }
-							}
-							... on PullRequest {
-								number title body url
-								repository { nameWithOwner }
-								labels(first: 100) { nodes { id name color } }
-								assignees(first: 10) { nodes { id login name } }
-							}
-						}
-						fieldValueByName(name: "Status") {
-							... on ProjectV2ItemFieldSingleSelectValue { name optionId }
-						}
+						${ITEM_FIELDS}
 					}
 				}
+			}
+		}
+	}
+`;
+
+/**
+ * How many boards one Issue/PR's `projectItems` are read for. An artifact belongs
+ * to as many boards as somebody added it to — a handful in practice, and
+ * unrelated to how many cards any of those boards holds — so this is a defensive
+ * ceiling rather than a page to walk. {@link ARTIFACT_ITEMS_QUERY}'s consumer
+ * logs if it ever fills.
+ */
+const ARTIFACT_PROJECT_ITEMS = 50;
+
+/**
+ * **The board-free artifact lookup.** Addresses one Issue/PR by its repository
+ * and number and walks to *its* project items, instead of paging the board to
+ * find the item that wraps it (issue #735). Constant cost: one request and one
+ * GraphQL point, measured against the 325-card live board where the whole-board
+ * read it replaces cost four requests and eight points.
+ *
+ * `issueOrPullRequest` rather than `issue`/`pullRequest`: GitHub numbers issues
+ * and pull requests in one per-repository sequence, so a number resolves to
+ * exactly one of them, and `__typename` is what the caller confirms the requested
+ * `kind` against. Owner and name are explicit, which is what keeps two
+ * repositories using the same number apart — the property
+ * `findWorkItemForArtifact` is defined by.
+ */
+const ARTIFACT_ITEMS_QUERY = /* GraphQL */ `
+	query($owner: String!, $name: String!, $number: Int!) {
+		repository(owner: $owner, name: $name) {
+			issueOrPullRequest(number: $number) {
+				__typename
+				... on Issue {
+					projectItems(first: ${ARTIFACT_PROJECT_ITEMS}) {
+						nodes { project { id } ${ITEM_FIELDS} }
+					}
+				}
+				... on PullRequest {
+					projectItems(first: ${ARTIFACT_PROJECT_ITEMS}) {
+						nodes { project { id } ${ITEM_FIELDS} }
+					}
+				}
+			}
+		}
+	}
+`;
+
+/**
+ * How many of a repository's most recent issues {@link RECENT_ISSUE_BODIES_QUERY}
+ * reads. One page is the whole read: the only caller is Planning's split guard
+ * asking about a child *it created moments ago*, which sits at the very top of a
+ * `CREATED_AT DESC` ordering. A marker on an issue older than this window is
+ * missed — stated here rather than discovered, and the alternative (GitHub's
+ * eventually-consistent issue search) is the one thing that guard cannot use.
+ */
+const RECENT_ISSUE_WINDOW = 100;
+
+/**
+ * **The board-free marker lookup**: the newest issues of the project's own
+ * repository, bodies only, newest first (issue #735).
+ *
+ * A repository read rather than a board read, and a *listing* rather than
+ * `search`: `repository.issues` is strongly consistent, while GitHub's search
+ * index is not — and the caller is Planning's retried split, where a child
+ * created seconds ago has to be findable now or the guard silently creates a
+ * second one (`src/pm/types.ts`, "One-card lookups are lookups, not scans").
+ * Bodies only, because the matched issue's card is then resolved through
+ * {@link ARTIFACT_ITEMS_QUERY}.
+ */
+const RECENT_ISSUE_BODIES_QUERY = /* GraphQL */ `
+	query($owner: String!, $name: String!) {
+		repository(owner: $owner, name: $name) {
+			issues(first: ${RECENT_ISSUE_WINDOW}, orderBy: { field: CREATED_AT, direction: DESC }) {
+				nodes { number body }
 			}
 		}
 	}
@@ -362,6 +447,63 @@ function ownerRepoFrom(content: ContentNode | null | undefined): {
 	return { owner, repo };
 }
 
+/** Split an `owner/repo` slug for the repository-addressed queries, or nothing if it isn't one. */
+function splitRepositorySlug(repository: string): { owner: string; name: string } | undefined {
+	const [owner, name, ...rest] = repository.split('/');
+	return owner && name && rest.length === 0 ? { owner, name } : undefined;
+}
+
+/**
+ * Whether a GraphQL failure is GitHub answering "that doesn't resolve".
+ *
+ * The board-free lookups (issue #735) address an Issue/PR that may simply not
+ * exist — an issue number decoded from a branch name, a repository slug from
+ * config — and the contract's answer for that is a soft `undefined`, not a throw.
+ * GitHub reports it as a partial response carrying a `NOT_FOUND` error, which
+ * Octokit raises, so it has to be recognised here rather than read off the data.
+ *
+ * **It also covers "the board credential cannot see that repository."** GitHub
+ * answers an unauthorized read with `NOT_FOUND` too, and nothing in the response
+ * tells the two apart; a whole-board scan used to answer from the board instead
+ * and so could still find such a card. That is the one behaviour this trades
+ * away, and it resolves to the contract's ordinary miss with the caller failing
+ * open (`src/pm/pull-request-work-item.ts`), never to a wrong card. Every other
+ * GraphQL error still propagates.
+ */
+function isNotFoundGraphQLError(err: unknown): boolean {
+	const errors = (err as { errors?: Array<{ type?: string } | null> } | null)?.errors;
+	return Array.isArray(errors) && errors.some((entry) => entry?.type === 'NOT_FOUND');
+}
+
+/**
+ * The Issue/PR a `/issues/<n>`-shaped URL suffix names, resolved against
+ * `defaultRepository` when the suffix carries no `owner/repo` of its own.
+ *
+ * This is GitHub's URL layout, and parsing it belongs in this adapter and nowhere
+ * else (ai/RULES.md §2) — the caller passes a tail it knows (`/issues/100`) and
+ * has no host or owner to go with it, which is exactly why the contract takes a
+ * *suffix*. A suffix GitHub's layout could not produce resolves to nothing, which
+ * the caller answers as a free miss.
+ *
+ * The number is anchored to the end and preceded by a path separator, so
+ * `/issues/100` cannot name `/issues/1001` — the same guard the previous
+ * `endsWith` match relied on, now applied to the key instead of to every card.
+ */
+function parseArtifactSuffix(
+	urlSuffix: string,
+	defaultRepository: string,
+): WorkItemArtifact | undefined {
+	const match = /(?:^|\/)(?:([^/\s]+)\/([^/\s]+)\/)?(issues|pull)\/(\d+)$/.exec(urlSuffix);
+	if (!match) return undefined;
+	const [, owner, repo, path, number] = match;
+	if (!path || !number) return undefined;
+	return {
+		repository: owner && repo ? `${owner}/${repo}` : defaultRepository,
+		kind: path === 'issues' ? 'issue' : 'pullRequest',
+		number,
+	};
+}
+
 /**
  * Map a board item onto a `WorkItem`. `config` is the project's board mapping, and
  * it is needed for exactly one thing: translating the opaque Status option ID into
@@ -514,41 +656,138 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	async findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined> {
-		// Projects v2 exposes no server-side filter on the backing content's URL, so
-		// the match runs client-side over the same paginated board read
-		// `listWorkItems` walks. Keeping it here rather than at the call site is what
-		// lets a federated worker ask the control plane for one card instead of the
-		// whole board (`src/pm/transport-delivery.ts`).
-		const items = await this.listWorkItems();
-		return items.find((item) => item.url.endsWith(urlSuffix));
+		// Projects v2 exposes no server-side filter on the backing content's URL — but
+		// the suffix names the backing artifact, and *that* is addressable, so the card
+		// is reached through the Issue/PR rather than by paging the board past it
+		// (issue #735). A suffix carrying no owner/repo resolves against this project's
+		// own repository. That is narrower than the previous whole-board `endsWith` scan,
+		// which would have matched an unrelated repository's same-numbered card sitting on
+		// a shared org board — and it is what both callers mean. The legacy fallback in
+		// `src/pipeline/respond-to-review.ts` decodes the number from a task branch in
+		// this very repository. The dashboard's queue enrichment (`src/api/routers/runs.ts`,
+		// on its path for a dispatch row recorded before the repository was) has no
+		// repository to offer at all, so on a multi-repository project this resolves
+		// against the project's default entry rather than matching any repository's card;
+		// that read is cosmetic and fail-open, so such a row simply renders without its
+		// card title.
+		const artifact = parseArtifactSuffix(urlSuffix, this.project.repo);
+		// A suffix no GitHub artifact URL ends with is a miss this can answer without
+		// asking GitHub anything (`src/pm/types.ts`, "One-card lookups are lookups").
+		if (!artifact) return undefined;
+		return this.resolveArtifactItem(artifact);
 	}
 
 	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
-		// Same client-side match over the same paginated board read as
-		// `findWorkItemByUrlSuffix`, for the same reason: Projects v2 exposes no
-		// server-side filter on the backing content's body. `body` is already in
-		// `LIST_ITEMS_QUERY`, so this costs no extra field.
+		// Two narrow reads instead of a whole board (issue #735): the newest issues of
+		// this project's repository, then the matched issue's own card.
 		//
-		// Deliberately the board read and **not** GitHub's code/issue search API,
-		// which is an eventually-consistent index: the caller asking is Planning's
-		// retried split, and a child created seconds ago has to be findable *now* or
-		// the guard silently duplicates it — the exact failure this lookup exists to
-		// prevent.
-		const items = await this.listWorkItems();
-		return items.find((item) => item.description.includes(marker));
+		// Deliberately **not** GitHub's issue search API, which is an
+		// eventually-consistent index: the caller asking is Planning's retried split,
+		// and a child created seconds ago has to be findable *now* or the guard
+		// silently duplicates it — the exact failure this lookup exists to prevent.
+		// `repository.issues` is a listing, not the index, so it answers immediately;
+		// what it costs instead is the {@link RECENT_ISSUE_WINDOW} bound, which the
+		// split's own children are never near.
+		//
+		// It reaches the project's repository rather than the board, so a marker on a
+		// draft card, on a pull request, or on an issue from another repository is not
+		// found. Every one of those is outside what `createWorkItem` can produce, and
+		// this lookup exists to recognise what `createWorkItem` produced.
+		const slug = splitRepositorySlug(this.project.repo);
+		if (!slug) return undefined;
+		const number = await this.run(async () => {
+			const data = await this.readOrMiss<RecentIssueBodiesResponse>(RECENT_ISSUE_BODIES_QUERY, {
+				owner: slug.owner,
+				name: slug.name,
+			});
+			const nodes = data?.repository?.issues?.nodes ?? [];
+			if (nodes.length >= RECENT_ISSUE_WINDOW) {
+				logger.debug('pm: marker lookup read a full window of recent issues', {
+					repository: this.project.repo,
+					window: RECENT_ISSUE_WINDOW,
+				});
+			}
+			return nodes.find((node) => node?.number != null && (node.body ?? '').includes(marker))
+				?.number;
+		});
+		if (number === undefined) return undefined;
+		return this.resolveArtifactItem({
+			repository: this.project.repo,
+			kind: 'issue',
+			number: String(number),
+		});
 	}
 
-	async findWorkItemForArtifact({
+	async findWorkItemForArtifact(artifact: WorkItemArtifact): Promise<WorkItem | undefined> {
+		return this.resolveArtifactItem(artifact);
+	}
+
+	/**
+	 * This board's card for one Issue/PR, resolved through the artifact itself
+	 * ({@link ARTIFACT_ITEMS_QUERY}) — the shared body of all three one-card
+	 * lookups, and the whole of issue #735's fix on this provider.
+	 *
+	 * The board is never read: an artifact knows which boards it is on, so the
+	 * match is `project.id`, and every property the previous whole-board scan gave
+	 * survives it. It cannot confuse two repositories (owner and name are query
+	 * arguments), it cannot confuse an issue with a pull request of the same number
+	 * (`__typename` is checked against the requested `kind`), and a miss stays a
+	 * soft `undefined` rather than becoming a throw.
+	 */
+	private async resolveArtifactItem({
 		repository,
 		kind,
 		number,
 	}: WorkItemArtifact): Promise<WorkItem | undefined> {
-		// GitHub's URL layout belongs in this adapter. Matching the complete URL keeps
-		// a shared org board from returning another repository's same-numbered card.
-		const path = kind === 'issue' ? 'issues' : 'pull';
-		const url = `https://github.com/${repository}/${path}/${number}`;
-		const items = await this.listWorkItems();
-		return items.find((item) => item.url === url);
+		const slug = splitRepositorySlug(repository);
+		const parsed = Number(number);
+		// A malformed artifact reference is the contract's soft miss, not bad input:
+		// the number reaching here was decoded from a branch name or a URL suffix.
+		if (!slug || !Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
+		return this.run(async () => {
+			const data = await this.readOrMiss<ArtifactItemsResponse>(ARTIFACT_ITEMS_QUERY, {
+				owner: slug.owner,
+				name: slug.name,
+				number: parsed,
+			});
+			const artifact = data?.repository?.issueOrPullRequest;
+			// GitHub numbers issues and pull requests in one sequence, so a number is
+			// one or the other; answering with the wrong kind would hand the caller a
+			// card it did not ask for.
+			if (!artifact || artifact.__typename !== (kind === 'issue' ? 'Issue' : 'PullRequest')) {
+				return undefined;
+			}
+			const nodes = (artifact.projectItems?.nodes ?? []).filter((node): node is ArtifactItemNode =>
+				Boolean(node?.id),
+			);
+			if (nodes.length >= ARTIFACT_PROJECT_ITEMS) {
+				logger.debug('pm: artifact sits on a full page of boards — later ones were not read', {
+					repository,
+					number,
+					limit: ARTIFACT_PROJECT_ITEMS,
+				});
+			}
+			const node = nodes.find((candidate) => candidate.project?.id === this.config.projectId);
+			return node ? toResolvedItem(node, this.config).workItem : undefined;
+		});
+	}
+
+	/**
+	 * Run one of the artifact-addressed queries, turning GitHub's "that doesn't
+	 * resolve" into the contract's soft miss ({@link isNotFoundGraphQLError}) and
+	 * letting every other failure propagate. Runs inside a credential scope (its
+	 * callers do).
+	 */
+	private async readOrMiss<T>(
+		query: string,
+		variables: Record<string, unknown>,
+	): Promise<T | undefined> {
+		try {
+			return await getScopedClient().graphql<T>(query, variables);
+		} catch (error) {
+			if (isNotFoundGraphQLError(error)) return undefined;
+			throw error;
+		}
 	}
 
 	async moveWorkItem(id: string, status: string): Promise<void> {

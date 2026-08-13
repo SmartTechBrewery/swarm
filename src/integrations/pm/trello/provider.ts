@@ -268,6 +268,22 @@ function cardUrl(card: TrelloCard): string {
 }
 
 /**
+ * The short link a Trello-shaped URL suffix names, or nothing when the suffix
+ * could not have come from a Trello card URL.
+ *
+ * Trello's own URL grammar, kept in this adapter and nowhere else (ai/RULES.md
+ * §2): a card is `https://trello.com/c/<shortLink>`, optionally followed by the
+ * `<number>-<slug>` tail its long form carries, and the short link addresses the
+ * card in the REST API exactly as its id does.
+ *
+ * Returning nothing is how a GitHub-shaped `/issues/<n>` suffix — SWARM's only
+ * caller — becomes a miss that costs no request at all (issue #735).
+ */
+function trelloShortLinkFromUrlSuffix(urlSuffix: string): string | undefined {
+	return /(?:^|\/)c\/([A-Za-z0-9]+)(?:\/|$)/.exec(urlSuffix)?.[1];
+}
+
+/**
  * Reduce discovered boards to stable picker options: keep only boards carrying
  * both an id and a name, deduplicate by id, and sort by name (case-insensitive)
  * so the picker order doesn't jump between refreshes — the same normalisation
@@ -387,35 +403,69 @@ export class TrelloPMProvider implements PMProvider {
 	}
 
 	async findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined> {
-		// Trello offers no filter on a card's own URL, so the match runs client-side
-		// over the board read.
+		// Trello offers no filter on a card's own URL — but a Trello card URL carries
+		// the card's own short link, and that *addresses* a card, so the suffix is
+		// parsed into a key rather than used as a predicate over a board read (issue
+		// #735). One request when the suffix is Trello-shaped, none when it is not.
 		//
 		// SWARM's only caller passes a GitHub-shaped `/issues/<n>` suffix — the
 		// documented legacy fallback in `src/pipeline/respond-to-review.ts`, used only
 		// for a pull request with no recorded card (ai/ARCHITECTURE.md "Task
 		// identity"). A Trello card's URL is `https://trello.com/c/<shortLink>`, which
-		// never ends with that, so for those pre-existing PRs this honestly resolves
-		// nothing; a Trello board reports through SWARM's own durable
-		// `runs.work_item_id` link instead, which is provider-neutral.
-		return this.findCard((card) => cardUrl(card).endsWith(urlSuffix));
+		// never ends with that, so for those pre-existing PRs this still honestly
+		// resolves nothing — it just no longer reads the board to find that out, and
+		// the honest miss stays a miss rather than becoming a false positive. A Trello
+		// board reports through SWARM's own durable `runs.work_item_id` link instead,
+		// which is provider-neutral.
+		const shortLink = trelloShortLinkFromUrlSuffix(urlSuffix);
+		if (!shortLink) return undefined;
+		return this.run(async () => {
+			const [card, listNames] = await Promise.all([
+				this.fetchCardOrMiss(shortLink),
+				this.fetchListNames(),
+			]);
+			// A short link addresses any card the token can see, so the board check the
+			// single-card read makes is what keeps this as board-scoped as the scan it
+			// replaced. The URL is confirmed too: the contract matches on the card's own
+			// `url`, and a suffix naming a longer tail than the short link is a miss.
+			const id = card?.id;
+			if (!card || !id || (card.idBoard && card.idBoard !== this.config.boardId)) return undefined;
+			return cardUrl(card).endsWith(urlSuffix)
+				? this.toWorkItem({ ...card, id }, listNames)
+				: undefined;
+		});
 	}
 
+	/**
+	 * Trello indexes **neither** of the places a GitHub artifact reaches a card — an
+	 * attachment (what its GitHub Power-Up records) or a link pasted into the
+	 * description — and its `/search` covers neither reliably, so this one is a
+	 * bounded **scan**, stated here rather than hidden (`src/pm/types.ts`, "One-card
+	 * lookups are lookups, not scans"; the same declaration Jira's remote-link scan
+	 * makes). What bounds it is that {@link fetchCards} is a single page of at most
+	 * {@link PAGE_LIMIT}: two requests whether the board holds 30 cards or 1000, and
+	 * a board past that logs rather than truncating silently.
+	 *
+	 * A miss is the ordinary answer: the artifact simply has no card.
+	 */
 	async findWorkItemForArtifact(artifact: WorkItemArtifact): Promise<WorkItem | undefined> {
-		// Trello has no linkage of its own to query — a GitHub artifact reaches a card
-		// as an attachment (what its GitHub Power-Up records) or as a link pasted into
-		// the description — and neither is indexed, so this scans the board. A miss is
-		// the ordinary answer: the artifact simply has no card.
 		const artifactUrl = artifactUrlPattern(artifact);
-		return this.findCard((card) => cardLinkUrls(card).some((url) => artifactUrl.test(url)));
+		return this.scanBoard((card) => cardLinkUrls(card).some((url) => artifactUrl.test(url)));
 	}
 
+	/**
+	 * A bounded scan for the same reason as {@link findWorkItemForArtifact}, plus
+	 * one that rules out the index Trello *does* have: `/search` covers card
+	 * descriptions, but it is eventually consistent, and the caller is Planning's
+	 * retried split, where a child created seconds ago has to be findable *now* or
+	 * the guard silently creates a second one. A card read is consistent; the search
+	 * index is the one thing this caller cannot use.
+	 *
+	 * Callers pass a marker at most one card can carry, so the first match is the
+	 * match.
+	 */
 	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
-		// Client-side over the board read rather than through Trello's `/search`:
-		// search is index-backed and eventually consistent, and the caller is
-		// Planning's retried split, where a child created seconds ago has to be
-		// findable *now* or the guard silently creates a second one. Callers pass a
-		// marker at most one card can carry, so the first match is the match.
-		return this.findCard((card) => (card.desc ?? '').includes(marker));
+		return this.scanBoard((card) => (card.desc ?? '').includes(marker));
 	}
 
 	async findComment(id: string, marker: string): Promise<string | undefined> {
@@ -686,10 +736,13 @@ export class TrelloPMProvider implements PMProvider {
 
 	/**
 	 * The first card on this board matching `predicate`, mapped — the shared body
-	 * of the three client-side board lookups. A miss answers `undefined`, which is
-	 * the contract's soft "no card for that" for all three.
+	 * of the two lookups Trello has no index for. Named a **scan** on purpose: it
+	 * is the shape a one-card lookup is meant to avoid, kept only where Trello
+	 * offers nothing to address a card by, and bounded by {@link fetchCards}'
+	 * single page. A miss answers `undefined`, the contract's soft "no card for
+	 * that".
 	 */
-	private async findCard(
+	private async scanBoard(
 		predicate: (card: IdentifiedCard) => boolean,
 	): Promise<WorkItem | undefined> {
 		return this.run(async () => {
@@ -697,6 +750,23 @@ export class TrelloPMProvider implements PMProvider {
 			const match = cards.find(predicate);
 			return match ? this.toWorkItem(match, listNames) : undefined;
 		});
+	}
+
+	/**
+	 * One card by id or short link, with a 404 answered as the contract's soft miss
+	 * rather than raised — unlike {@link getWorkItem}, whose id came from a webhook
+	 * or a prior board read and so cannot legitimately be absent. Runs inside a
+	 * credential scope (its callers do).
+	 */
+	private async fetchCardOrMiss(id: string): Promise<TrelloCard | undefined> {
+		try {
+			return await trelloRequest<TrelloCard | undefined>(`cards/${encodeURIComponent(id)}`, {
+				query: CARD_QUERY,
+			});
+		} catch (error) {
+			if (error instanceof TrelloApiError && error.status === 404) return undefined;
+			throw error;
+		}
 	}
 
 	/**
