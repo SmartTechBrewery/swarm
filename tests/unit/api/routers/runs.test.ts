@@ -2006,18 +2006,32 @@ describe('runsRouter', () => {
 			vi.mocked(getDispatchById).mockResolvedValue(dispatch);
 			vi.mocked(cancelDispatchAndWake).mockResolvedValue(dispatch);
 
-			const listWorkItems = vi
+			// The contract's one-card lookup, not a whole-board read (issue #735): the
+			// card backing the PR is asked for by repository and number. The issue
+			// artifact is tried first — SWARM's card tracks the item, not the PR — so a
+			// board that carries the PR itself answers on the second call.
+			const findWorkItemForArtifact = vi
 				.fn()
-				.mockResolvedValue([{ id: 'card-1', url: 'https://github.com/acme/widgets/pull/42' }]);
+				.mockResolvedValueOnce(undefined)
+				.mockResolvedValueOnce({ id: 'card-1', url: 'https://github.com/acme/widgets/pull/42' });
 			const moveWorkItem = vi.fn().mockResolvedValue(undefined);
 			vi.mocked(getPMProvider).mockReturnValue({
-				createProvider: () => ({ listWorkItems, moveWorkItem }),
+				createProvider: () => ({ findWorkItemForArtifact, moveWorkItem }),
 			} as never);
 
 			const result = await caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' });
 
 			expect(result).toEqual({ success: true });
-			expect(listWorkItems).toHaveBeenCalled();
+			expect(findWorkItemForArtifact).toHaveBeenNthCalledWith(1, {
+				repository: 'acme/widgets',
+				kind: 'issue',
+				number: '42',
+			});
+			expect(findWorkItemForArtifact).toHaveBeenNthCalledWith(2, {
+				repository: 'acme/widgets',
+				kind: 'pullRequest',
+				number: '42',
+			});
 			expect(moveWorkItem).toHaveBeenCalledWith('card-1', 'backlog');
 		});
 
@@ -2090,11 +2104,9 @@ describe('runsRouter', () => {
 				makeDispatch({ state: 'pending', phase: null, jobPayload: jobData as never }),
 			);
 
-			const listWorkItems = vi
-				.fn()
-				.mockResolvedValue([{ id: 'card-1', url: 'https://github.com/acme/widgets/pull/999' }]);
+			const findWorkItemForArtifact = vi.fn().mockResolvedValue(undefined);
 			vi.mocked(getPMProvider).mockReturnValue({
-				createProvider: () => ({ listWorkItems }),
+				createProvider: () => ({ findWorkItemForArtifact }),
 			} as never);
 
 			await expect(caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' })).rejects.toThrow(

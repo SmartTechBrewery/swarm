@@ -413,21 +413,52 @@ describe('TrelloPMProvider', () => {
 
 			// The only caller is the legacy fallback in `respond-to-review.ts`; a Trello
 			// board reports through SWARM's own durable `runs.work_item_id` link instead.
+			// Since issue #735 that honest miss costs no request at all — and it is still
+			// a miss, never a false positive.
 			await expect(provider.findWorkItemByUrlSuffix('/issues/585')).resolves.toBeUndefined();
+			expect(fetchMock).not.toHaveBeenCalled();
 		});
 
-		it('matches a Trello-shaped suffix over the board read', async () => {
+		// Issue #735: the short link in a Trello URL *addresses* the card, so the
+		// suffix is parsed into it rather than matched against every card on the board.
+		it('reads the card the suffix’s short link names, without reading the board', async () => {
+			mockTrello({ 'cards/H0TZyzbK': trelloCard(), [LISTS_PATH]: BOARD_LISTS });
+
+			await expect(
+				provider.findWorkItemByUrlSuffix('/c/H0TZyzbK/4-wire-triggers'),
+			).resolves.toMatchObject({ id: CARD_ID });
+		});
+
+		it('rejects a card whose URL does not actually end with the suffix', async () => {
+			mockTrello({ 'cards/H0TZyzbK': trelloCard(), [LISTS_PATH]: BOARD_LISTS });
+
+			await expect(
+				provider.findWorkItemByUrlSuffix('/c/H0TZyzbK/5-something-else'),
+			).resolves.toBeUndefined();
+		});
+
+		// A short link addresses any card the token can see, so the board check is what
+		// keeps this as board-scoped as the scan it replaced.
+		it('rejects a card belonging to another board', async () => {
 			mockTrello({
-				[BOARD_CARDS_PATH]: [
-					trelloCard({ id: 'card-2', url: 'https://trello.com/c/AAAAAAAA/5-other' }),
-					trelloCard(),
-				],
+				'cards/H0TZyzbK': trelloCard({ idBoard: 'someone-elses-board' }),
 				[LISTS_PATH]: BOARD_LISTS,
 			});
 
 			await expect(
 				provider.findWorkItemByUrlSuffix('/c/H0TZyzbK/4-wire-triggers'),
-			).resolves.toMatchObject({ id: CARD_ID });
+			).resolves.toBeUndefined();
+		});
+
+		it('keeps a short link Trello cannot resolve a soft miss rather than a throw', async () => {
+			mockTrello({
+				'cards/H0TZyzbK': () => new Response(null, { status: 404 }),
+				[LISTS_PATH]: BOARD_LISTS,
+			});
+
+			await expect(
+				provider.findWorkItemByUrlSuffix('/c/H0TZyzbK/4-wire-triggers'),
+			).resolves.toBeUndefined();
 		});
 	});
 

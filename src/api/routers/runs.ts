@@ -43,6 +43,7 @@ import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
+import { findWorkItemForPullRequest } from '../../pm/pull-request-work-item.js';
 import {
 	type CancellationOrigin,
 	clearRunCancellation,
@@ -198,15 +199,19 @@ async function enrichQueuedWorkItem(item: QueuedRun): Promise<QueuedRun> {
 				const manifest = getPMProvider(project.pm.type);
 				if (manifest) {
 					const pm = manifest.createProvider(project);
-					const items = await pm.listWorkItems();
-					const repoFullName = item.repo;
-					const match = items.find((i) =>
-						repoFullName
-							? i.url.endsWith(`/${repoFullName}/issues/${item.prNumber}`) ||
-								i.url.endsWith(`/${repoFullName}/pull/${item.prNumber}`)
-							: i.url.endsWith(`/issues/${item.prNumber}`) ||
-								i.url.endsWith(`/pull/${item.prNumber}`),
-					);
+					// The contract's one-card lookups, not a whole-board read filtered down to
+					// one card (issue #735): this is a *lookup* — "which card backs this pull
+					// request?" — and reading the board to answer it is what exhausted the
+					// board credential's budget. `repo` is absent only on a dispatch enqueued
+					// before it was recorded, where the URL suffix is all there is to go on.
+					const match = item.repo
+						? await findWorkItemForPullRequest(
+								pm,
+								{ repository: item.repo, issueNumber: item.prNumber, prNumber: item.prNumber },
+								{ projectId: item.projectId },
+							)
+						: ((await pm.findWorkItemByUrlSuffix(`/issues/${item.prNumber}`)) ??
+							(await pm.findWorkItemByUrlSuffix(`/pull/${item.prNumber}`)));
 					if (match) {
 						details = {
 							title: match.title || undefined,
@@ -1280,12 +1285,21 @@ export const runsRouter = router({
 				const prNumber = jobData.event.workItemId;
 				const repoFullName = jobData.event.repoFullName;
 				if (prNumber && repoFullName) {
-					const items = await pm.listWorkItems();
-					const match = items.find(
-						(item) =>
-							item.url.endsWith(`/${repoFullName}/issues/${prNumber}`) ||
-							item.url.endsWith(`/${repoFullName}/pull/${prNumber}`),
-					);
+					// The contract's one-card lookup rather than a whole-board read (issue
+					// #735). Called directly rather than through `findWorkItemForPullRequest`,
+					// whose fail-open swallow is right for the automation gate and wrong here:
+					// a provider error must surface, not read as "no linked board card".
+					const match =
+						(await pm.findWorkItemForArtifact({
+							repository: repoFullName,
+							kind: 'issue',
+							number: prNumber,
+						})) ??
+						(await pm.findWorkItemForArtifact({
+							repository: repoFullName,
+							kind: 'pullRequest',
+							number: prNumber,
+						}));
 					workItemNodeId = match?.id;
 				}
 			}

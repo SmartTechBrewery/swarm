@@ -477,79 +477,231 @@ describe('GitHubProjectsPMProvider', () => {
 		});
 	});
 
-	describe('findWorkItemByUrlSuffix', () => {
-		// `/issues/10` and `/issues/100`: the suffix match must not confuse them.
-		const LONGER_NUMBER_NODE = {
+	/**
+	 * The three one-card lookups after issue #735: each addresses the backing
+	 * Issue/PR and walks to *its* card, so none of them may page the board. That is
+	 * asserted directly — a `LIST_ITEMS_QUERY` call would be the regression.
+	 */
+	describe('one-card lookups', () => {
+		/** A `projectItems` node as `ARTIFACT_ITEMS_QUERY` reads it: an item, plus the board it sits on. */
+		function artifactItems(
+			typename: 'Issue' | 'PullRequest',
+			nodes: Array<Record<string, unknown>>,
+		) {
+			return {
+				repository: { issueOrPullRequest: { __typename: typename, projectItems: { nodes } } },
+			};
+		}
+
+		const ON_THIS_BOARD = { ...ITEM_NODE, project: { id: PROJECT_PM.projectId } };
+		const ON_ANOTHER_BOARD = {
 			...ITEM_NODE,
-			id: 'PVTI_z',
-			content: {
-				...ITEM_NODE.content,
-				number: 100,
-				url: 'https://github.com/SmartTechBrewery/swarm/issues/100',
-			},
+			id: 'PVTI_elsewhere',
+			project: { id: 'PVT_someone_elses_board' },
 		};
 
-		it('returns the one card whose backing URL ends with the suffix', async () => {
-			graphql.mockResolvedValue({
-				node: { items: { nodes: [LONGER_NUMBER_NODE, ITEM_NODE] } },
+		/** GitHub's own "that doesn't resolve" — a partial response Octokit raises. */
+		const NOT_FOUND = Object.assign(new Error('Could not resolve to an Issue'), {
+			errors: [{ type: 'NOT_FOUND' }],
+		});
+
+		describe('findWorkItemForArtifact', () => {
+			it('addresses the artifact and returns its card on this board, without reading the board', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_ANOTHER_BOARD, ON_THIS_BOARD]));
+
+				const item = await provider.findWorkItemForArtifact({
+					repository: 'SmartTechBrewery/swarm',
+					kind: 'issue',
+					number: '10',
+				});
+
+				expect(item?.id).toBe('PVTI_x');
+				expect(graphql).toHaveBeenCalledTimes(1);
+				expect(graphql).toHaveBeenCalledWith(expect.stringContaining('issueOrPullRequest'), {
+					owner: 'SmartTechBrewery',
+					name: 'swarm',
+					number: 10,
+				});
+				expect(graphql).not.toHaveBeenCalledWith(expect.stringContaining('on ProjectV2'), {
+					projectId: PROJECT_PM.projectId,
+					cursor: undefined,
+				});
 			});
 
-			const item = await provider.findWorkItemByUrlSuffix('/issues/10');
+			it('cannot confuse two repositories using the same number — owner and name are query arguments', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_THIS_BOARD]));
 
-			expect(item?.id).toBe('PVTI_x');
-		});
+				await provider.findWorkItemForArtifact({
+					repository: 'SmartTechBrewery/other',
+					kind: 'issue',
+					number: '10',
+				});
 
-		it('returns undefined when nothing on the board wraps that URL', async () => {
-			graphql.mockResolvedValue({ node: { items: { nodes: [ITEM_NODE] } } });
+				expect(graphql).toHaveBeenCalledWith(expect.anything(), {
+					owner: 'SmartTechBrewery',
+					name: 'other',
+					number: 10,
+				});
+			});
 
-			await expect(provider.findWorkItemByUrlSuffix('/issues/999')).resolves.toBeUndefined();
-		});
-	});
+			it('does not answer a pull-request lookup with the issue of the same number', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_THIS_BOARD]));
 
-	describe('findWorkItemByDescriptionMarker', () => {
-		// The marker Planning's split stamps into a child it creates, so a retried
-		// delivery adopts that child instead of duplicating it (issue #543).
-		const MARKER = '<!-- swarm-split-child:run-42:0 -->';
+				await expect(
+					provider.findWorkItemForArtifact({
+						repository: 'SmartTechBrewery/swarm',
+						kind: 'pullRequest',
+						number: '10',
+					}),
+				).resolves.toBeUndefined();
+			});
 
-		it('returns the one card whose body carries the marker', async () => {
-			const stamped = {
-				...ITEM_NODE,
-				id: 'PVTI_child',
-				content: { ...ITEM_NODE.content, body: `The second slice.\n\n${MARKER}` },
-			};
-			graphql.mockResolvedValue({ node: { items: { nodes: [ITEM_NODE, stamped] } } });
+			it('returns undefined when the artifact is on no board of this project', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_ANOTHER_BOARD]));
 
-			await expect(provider.findWorkItemByDescriptionMarker(MARKER)).resolves.toMatchObject({
-				id: 'PVTI_child',
+				await expect(
+					provider.findWorkItemForArtifact({
+						repository: 'SmartTechBrewery/swarm',
+						kind: 'issue',
+						number: '10',
+					}),
+				).resolves.toBeUndefined();
+			});
+
+			it('keeps a non-resolving artifact a soft miss rather than a throw', async () => {
+				graphql.mockRejectedValue(NOT_FOUND);
+
+				await expect(
+					provider.findWorkItemForArtifact({
+						repository: 'SmartTechBrewery/swarm',
+						kind: 'issue',
+						number: '999999',
+					}),
+				).resolves.toBeUndefined();
+			});
+
+			it('still raises a failure that is not a miss', async () => {
+				graphql.mockRejectedValue(new Error('API rate limit already exceeded'));
+
+				await expect(
+					provider.findWorkItemForArtifact({
+						repository: 'SmartTechBrewery/swarm',
+						kind: 'issue',
+						number: '10',
+					}),
+				).rejects.toThrow(/rate limit/);
 			});
 		});
 
-		it('returns undefined when no card carries it — the answer that means "create it"', async () => {
-			graphql.mockResolvedValue({ node: { items: { nodes: [ITEM_NODE] } } });
+		describe('findWorkItemByUrlSuffix', () => {
+			it('resolves the suffix against this project’s repository', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_THIS_BOARD]));
 
-			await expect(provider.findWorkItemByDescriptionMarker(MARKER)).resolves.toBeUndefined();
-		});
-	});
+				const item = await provider.findWorkItemByUrlSuffix('/issues/10');
 
-	describe('findWorkItemForArtifact', () => {
-		it('selects the card from the requested repository when a board contains same-numbered issues', async () => {
-			const foreignNode = {
-				...ITEM_NODE,
-				id: 'PVTI_foreign',
-				content: {
-					...ITEM_NODE.content,
-					url: 'https://github.com/SmartTechBrewery/other/issues/10',
-				},
-			};
-			graphql.mockResolvedValue({ node: { items: { nodes: [foreignNode, ITEM_NODE] } } });
-
-			const item = await provider.findWorkItemForArtifact({
-				repository: 'SmartTechBrewery/swarm',
-				kind: 'issue',
-				number: '10',
+				expect(item?.id).toBe('PVTI_x');
+				expect(graphql).toHaveBeenCalledWith(expect.stringContaining('issueOrPullRequest'), {
+					owner: 'SmartTechBrewery',
+					name: 'swarm',
+					number: 10,
+				});
 			});
 
-			expect(item?.id).toBe('PVTI_x');
+			// `/issues/10` and `/issues/100`: the number is anchored to the end of the
+			// suffix, so the shorter one can never name the longer one's artifact.
+			it('cannot false-match a longer number', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_THIS_BOARD]));
+
+				await provider.findWorkItemByUrlSuffix('/issues/100');
+
+				expect(graphql).toHaveBeenCalledWith(
+					expect.anything(),
+					expect.objectContaining({ number: 100 }),
+				);
+			});
+
+			it('reads a pull-request suffix as a pull request', async () => {
+				graphql.mockResolvedValue(artifactItems('PullRequest', [ON_THIS_BOARD]));
+
+				await expect(provider.findWorkItemByUrlSuffix('/pull/10')).resolves.toMatchObject({
+					id: 'PVTI_x',
+				});
+			});
+
+			it('honours an owner/repo the suffix carries itself', async () => {
+				graphql.mockResolvedValue(artifactItems('Issue', [ON_THIS_BOARD]));
+
+				await provider.findWorkItemByUrlSuffix('/SmartTechBrewery/other/issues/7');
+
+				expect(graphql).toHaveBeenCalledWith(expect.anything(), {
+					owner: 'SmartTechBrewery',
+					name: 'other',
+					number: 7,
+				});
+			});
+
+			it('answers a suffix no GitHub artifact URL ends with without asking GitHub anything', async () => {
+				await expect(provider.findWorkItemByUrlSuffix('/c/abc123')).resolves.toBeUndefined();
+
+				expect(graphql).not.toHaveBeenCalled();
+			});
+		});
+
+		describe('findWorkItemByDescriptionMarker', () => {
+			// The marker Planning's split stamps into a child it creates, so a retried
+			// delivery adopts that child instead of duplicating it (issue #543).
+			const MARKER = '<!-- swarm-split-child:run-42:0 -->';
+
+			it('finds the marker in the repository’s newest issues, then resolves that issue’s card', async () => {
+				graphql
+					.mockResolvedValueOnce({
+						repository: {
+							issues: {
+								nodes: [
+									{ number: 11, body: 'Unrelated.' },
+									{ number: 10, body: `The second slice.\n\n${MARKER}` },
+								],
+							},
+						},
+					})
+					.mockResolvedValueOnce(artifactItems('Issue', [ON_THIS_BOARD]));
+
+				await expect(provider.findWorkItemByDescriptionMarker(MARKER)).resolves.toMatchObject({
+					id: 'PVTI_x',
+				});
+				expect(graphql).toHaveBeenNthCalledWith(1, expect.stringContaining('CREATED_AT'), {
+					owner: 'SmartTechBrewery',
+					name: 'swarm',
+				});
+				expect(graphql).toHaveBeenNthCalledWith(2, expect.anything(), {
+					owner: 'SmartTechBrewery',
+					name: 'swarm',
+					number: 10,
+				});
+			});
+
+			it('returns undefined when no recent issue carries it — the answer that means "create it"', async () => {
+				graphql.mockResolvedValue({
+					repository: { issues: { nodes: [{ number: 11, body: 'Unrelated.' }] } },
+				});
+
+				await expect(provider.findWorkItemByDescriptionMarker(MARKER)).resolves.toBeUndefined();
+				// The second read is never made: there is no issue to resolve a card for.
+				expect(graphql).toHaveBeenCalledTimes(1);
+			});
+
+			// Deliberately the strongly consistent listing, not `search`: Planning's
+			// retried split has to find a child created seconds ago.
+			it('reads a listing rather than the search index', async () => {
+				graphql.mockResolvedValue({ repository: { issues: { nodes: [] } } });
+
+				await provider.findWorkItemByDescriptionMarker(MARKER);
+
+				expect(graphql).toHaveBeenCalledWith(
+					expect.not.stringContaining('search('),
+					expect.anything(),
+				);
+			});
 		});
 	});
 

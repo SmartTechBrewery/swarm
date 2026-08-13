@@ -381,10 +381,34 @@ describe('LinearPMProvider', () => {
 			).resolves.toMatchObject({ id: ISSUE_NODE.id });
 		});
 
-		it("misses the caller's GitHub-shaped legacy suffix, honestly", async () => {
+		// Issue #735: the suffix names an issue, so it is parsed into the number the
+		// team-scoped filter narrows on rather than used as a predicate over a whole
+		// team read.
+		it('filters the read by the number the suffix names, not by scanning the team', async () => {
+			await provider.findWorkItemByUrlSuffix('/issue/ENG-42/wire-triggers');
+
+			expect(linearGraphQL).toHaveBeenCalledTimes(1);
+			expect(linearGraphQL).toHaveBeenCalledWith(expect.anything(), {
+				filter: { ...TEAM_FILTER, number: { eq: 42 } },
+				cursor: undefined,
+			});
+		});
+
+		// The filter narrows on the number alone, so the identifier's team-key half is
+		// confirmed against the issue's real URL — another team's `OPS-42` must not
+		// answer for `ENG-42`.
+		it('rejects an issue whose URL does not actually end with the suffix', async () => {
+			await expect(
+				provider.findWorkItemByUrlSuffix('/issue/OPS-42/wire-triggers'),
+			).resolves.toBeUndefined();
+		});
+
+		it("misses the caller's GitHub-shaped legacy suffix, honestly and for free", async () => {
 			// respond-to-review's documented fallback for a PR with no recorded card
-			// passes `/issues/<n>`, which no linear.app URL ends with.
+			// passes `/issues/<n>`, which no linear.app URL ends with — so since issue
+			// #735 it is answered without asking Linear anything.
 			await expect(provider.findWorkItemByUrlSuffix('/issues/42')).resolves.toBeUndefined();
+			expect(linearGraphQL).not.toHaveBeenCalled();
 		});
 	});
 

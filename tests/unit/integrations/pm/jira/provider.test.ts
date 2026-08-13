@@ -408,12 +408,14 @@ describe('JiraPMProvider', () => {
 
 			// The only caller is the legacy fallback in `respond-to-review.ts`; a Jira
 			// board reports through SWARM's own durable `runs.work_item_id` link instead.
+			// Since issue #735 that miss costs no request at all.
 			await expect(provider.findWorkItemByUrlSuffix('/issues/577')).resolves.toBeUndefined();
+			expect(fetchMock).not.toHaveBeenCalled();
 		});
 
-		it('matches a Jira-shaped suffix and pays the one remote-link read for its taskRef', async () => {
+		it('reads the issue the suffix names directly, and pays the one remote-link read for its taskRef', async () => {
 			mockJira({
-				'search/jql': searchPage([jiraIssue({ key: 'SWARM-43' }), jiraIssue()]),
+				'issue/SWARM-42': jiraIssue(),
 				'issue/SWARM-42/remotelink': [GITHUB_ISSUE_LINK],
 			});
 
@@ -421,6 +423,23 @@ describe('JiraPMProvider', () => {
 				id: 'SWARM-42',
 				taskRef: '577',
 			});
+			// Issue #735: a key lookup, never a board search.
+			expect(requestedUrls().some((url) => url.pathname.includes('search'))).toBe(false);
+		});
+
+		// The board is one Jira project (`boardJql`), so a key from another one could
+		// never have matched the board-scoped scan this replaced.
+		it('refuses a key belonging to another Jira project, without reading it', async () => {
+			mockJira({});
+
+			await expect(provider.findWorkItemByUrlSuffix('/browse/OPS-42')).resolves.toBeUndefined();
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+
+		it('keeps a key Jira cannot resolve a soft miss rather than a throw', async () => {
+			mockJira({ 'issue/SWARM-42': () => new Response(null, { status: 404 }) });
+
+			await expect(provider.findWorkItemByUrlSuffix('/browse/SWARM-42')).resolves.toBeUndefined();
 		});
 	});
 

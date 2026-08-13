@@ -282,6 +282,29 @@ function siteUrl(config: JiraIntegrationConfig): string {
 }
 
 /**
+ * The issue key a Jira-shaped URL suffix names, or nothing when the suffix could
+ * not have come from a Jira browse URL.
+ *
+ * Jira's own URL grammar, kept in this adapter and nowhere else (ai/RULES.md §2):
+ * a card's URL is `<site>/browse/<KEY>`, so the key is the whole tail after
+ * `/browse/`. Returning nothing is how a GitHub-shaped `/issues/<n>` suffix —
+ * SWARM's only caller — becomes a miss that costs no request at all (issue #735).
+ */
+function jiraKeyFromUrlSuffix(urlSuffix: string): string | undefined {
+	return /(?:^|\/)browse\/([A-Za-z][A-Za-z0-9_]*-\d+)$/.exec(urlSuffix)?.[1];
+}
+
+/**
+ * Whether an issue key belongs to `projectKey`. A Jira key is
+ * `<projectKey>-<number>`, and the board is exactly one project, so this is what
+ * keeps a directly addressed read as board-scoped as the JQL it replaced.
+ * Case-insensitive because Jira resolves a key that way.
+ */
+function keyBelongsToProject(key: string, projectKey: string): boolean {
+	return key.slice(0, key.lastIndexOf('-')).toLowerCase() === projectKey.toLowerCase();
+}
+
+/**
  * Quote a value as a JQL string literal. JQL's own escapes are `\"` and `\\`, so
  * escaping those two is what makes an operator-supplied project key safe to
  * interpolate rather than trusted to be `[A-Z][A-Z0-9]+`.
@@ -635,19 +658,51 @@ export class JiraPMProvider implements PMProvider {
 	}
 
 	async findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined> {
-		// Jira exposes no JQL comparison against an issue's own browse URL, so the
-		// match runs client-side over the same paged board read `listWorkItems` walks.
+		// Jira exposes no JQL comparison against an issue's own browse URL — but a
+		// browse URL *is* the issue key, and a key is what `GET issue/{key}` takes, so
+		// the suffix is parsed into a key rather than used as a predicate over a whole
+		// board read (issue #735). One request when the suffix is Jira-shaped and names
+		// this board's project, none when it is not.
 		//
 		// SWARM's only caller passes a GitHub-shaped `/issues/<n>` suffix — the
 		// documented legacy fallback in `src/pipeline/respond-to-review.ts`, used only
 		// for a pull request with no recorded card (ai/ARCHITECTURE.md "Task
 		// identity"). A Jira card's URL is `<site>/browse/PROJ-123`, which never ends
-		// with that, so for those pre-existing PRs this honestly resolves nothing; a
-		// Jira board reports through SWARM's own durable `runs.work_item_id` link
-		// instead, which is provider-neutral.
-		const items = await this.listWorkItems();
-		const match = items.find((item) => item.url.endsWith(urlSuffix));
-		return match ? this.run(() => this.resolveTaskRef(match)) : undefined;
+		// with that, so for those pre-existing PRs this still honestly resolves nothing
+		// — it just no longer reads the board to find that out. A Jira board reports
+		// through SWARM's own durable `runs.work_item_id` link instead, which is
+		// provider-neutral.
+		const key = jiraKeyFromUrlSuffix(urlSuffix);
+		// The board is one Jira project (`boardJql`), so a key belonging to another one
+		// could never have matched the previous board-scoped scan and must not start
+		// answering now that the read addresses an issue directly.
+		if (!key || !keyBelongsToProject(key, this.config.projectKey)) return undefined;
+		return this.run(async () => {
+			const issue = await this.fetchIssueOrMiss(key);
+			// The browse URL `toWorkItem` builds is the one the contract matches on, so
+			// confirm the suffix against it rather than assuming the key was the whole of
+			// it — a suffix carrying a site path this board does not serve is a miss.
+			if (!issue?.key) return undefined;
+			const item = toWorkItem({ ...issue, key: issue.key }, this.config);
+			return item.url.endsWith(urlSuffix) ? this.resolveTaskRef(item) : undefined;
+		});
+	}
+
+	/**
+	 * One issue by key, with a 404 answered as the contract's soft miss rather than
+	 * raised — unlike {@link getWorkItem}, whose id came from a webhook or a prior
+	 * board read and so cannot legitimately be absent. Runs inside a credential
+	 * scope (its callers do).
+	 */
+	private async fetchIssueOrMiss(key: string): Promise<JiraIssue | undefined> {
+		try {
+			return await jiraRequest<JiraIssue | undefined>(`issue/${encodeURIComponent(key)}`, {
+				query: { fields: ISSUE_FIELDS },
+			});
+		} catch (error) {
+			if (error instanceof JiraApiError && error.status === 404) return undefined;
+			throw error;
+		}
 	}
 
 	async findWorkItemForArtifact({

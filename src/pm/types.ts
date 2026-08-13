@@ -372,6 +372,42 @@ export interface ListWorkItemsFilter {
  * plus the optional `discover` the board-mapping screen dispatches through the
  * manifest. The *inbound* half of a provider is the separate
  * {@link import('./router-adapter.js').PMRouterAdapter}.
+ *
+ * ## One-card lookups are lookups, not scans
+ *
+ * {@link PMProvider.findWorkItemByUrlSuffix},
+ * {@link PMProvider.findWorkItemForArtifact} and
+ * {@link PMProvider.findWorkItemByDescriptionMarker} each take one key and answer
+ * with at most one card. They exist **so that nothing has to read the whole
+ * board** — a federated worker resolves its card through the control plane
+ * (`src/pm/transport-delivery.ts`), and proxying a board to find one card is the
+ * heavy alternative they were widened out of the interface to avoid
+ * (ai/RULES.md §2).
+ *
+ * That is a cost contract, not only a signature, and issue #735 is what happens
+ * when it is honoured at the surface and given back inside: every implementation
+ * answered by calling `listWorkItems()` and filtering, four GitHub GraphQL pages
+ * per lookup against a 325-card board, until the board credential's hourly budget
+ * ran out and took a day's dispatches with it. So, implementing one of the three:
+ *
+ * - **Address the backend with the key you were given.** The artifact
+ *   coordinates, the marker, and the URL suffix are all specific enough to query
+ *   with; resolve the card through the provider's own index, linkage or
+ *   identifier grammar.
+ * - **Cost must not grow with the board.** The requests a lookup issues are the
+ *   same for a 30-card board and a 3000-card one — or the growth is explicitly
+ *   bounded, logged when the bound bites, and stated in the method's own comment
+ *   (the shape Jira's remote-link scan already documents).
+ * - **A key your URL grammar cannot produce is a free miss.** A provider whose
+ *   cards are `linear.app/…/issue/ENG-1` can answer a `/issues/100` suffix
+ *   `undefined` without a request at all — the same honest miss as today, minus
+ *   the board read that discovered it.
+ * - **Say so where you cannot.** A provider with no index for a key states that
+ *   in its own module, in its own words, rather than silently scanning — so the
+ *   next provider copies the declaration and not the scan.
+ *
+ * `tests/unit/integrations/pm/pm-conformance.test.ts` holds the mechanical floor:
+ * no registered provider's one-card lookup may call `listWorkItems`.
  */
 export interface PMProvider {
 	readonly type: PMType;
@@ -409,11 +445,10 @@ export interface PMProvider {
 	 * provider's URLs carry. A suffix beginning at a path separator can't
 	 * false-match a longer number (`/issues/100` vs `/issues/1001`).
 	 *
-	 * Widening the interface rather than leaving every caller to `listWorkItems()`
-	 * and filter (ai/RULES.md §2) keeps the read narrow where that matters: a
-	 * federated worker resolves the card through the control plane
-	 * (`src/pm/transport-delivery.ts`), and proxying a whole board to find one card
-	 * would be the heavy alternative.
+	 * Subject to the one-card lookup rule on {@link PMProvider}: a suffix is a key
+	 * to resolve the card by — usually through the provider's own identifier
+	 * grammar — never a predicate to filter a board read with. A suffix that
+	 * provider's URLs could never end with is a miss it can answer for free.
 	 */
 	findWorkItemByUrlSuffix(urlSuffix: string): Promise<WorkItem | undefined>;
 
@@ -422,6 +457,11 @@ export interface PMProvider {
 	 * `undefined` when that artifact is not on the board. Unlike
 	 * {@link findWorkItemByUrlSuffix}, this lookup cannot confuse cards from two
 	 * repositories that happen to use the same issue or pull-request number.
+	 *
+	 * Subject to the one-card lookup rule on {@link PMProvider}: the artifact's
+	 * `repository`/`kind`/`number` are enough to address the provider's own
+	 * linkage — an attachment, a remote link, or the artifact's own board
+	 * membership — so the board is not the thing to read.
 	 */
 	findWorkItemForArtifact(artifact: WorkItemArtifact): Promise<WorkItem | undefined>;
 
@@ -430,10 +470,16 @@ export interface PMProvider {
 	 * `undefined` when no card carries it.
 	 *
 	 * The narrow, one-card form of a board search, exactly like
-	 * {@link findWorkItemByUrlSuffix}: one marker in, at most one card out. That
-	 * shape is what lets a federated worker ask the control plane "is the card I
-	 * already created still there?" without the whole-board `listWorkItems` it has
-	 * no business performing (`src/pm/transport-delivery.ts`).
+	 * {@link findWorkItemByUrlSuffix}: one marker in, at most one card out — which
+	 * is what lets a federated worker ask the control plane "is the card I already
+	 * created still there?" (`src/pm/transport-delivery.ts`). Subject to the
+	 * one-card lookup rule on {@link PMProvider}, with one constraint of its own
+	 * that overrides the cheapest option: the caller is Planning's *retried* split,
+	 * so a child created seconds ago must be findable **now**. An
+	 * eventually-consistent search index that answers "no" to a card that exists
+	 * makes the guard create a second child — the exact failure this lookup
+	 * prevents — so a provider whose only text index is eventually consistent
+	 * states that and uses a consistent read instead.
 	 *
 	 * A soft miss rather than a throw, for the same reason as
 	 * {@link findWorkItemByUrlSuffix}: "nothing on the board carries that marker"
