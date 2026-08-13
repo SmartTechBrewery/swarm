@@ -1,19 +1,29 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { toNonSecretProjectConfig } from '@/config/project-config-slice.js';
 import type { AgentCli } from '@/harness/agent-cli.js';
 import { SUPPORTED_DB_FREE_PHASES } from '@/transport/assignment-execution.js';
-import { type TaskPhase, TRANSPORT_PROTOCOL_VERSION, WS_CLOSE } from '@/transport/protocol.js';
 import {
+	type StreamLog,
+	type TaskExecutionResult,
+	type TaskPhase,
+	TRANSPORT_PROTOCOL_VERSION,
+	WS_CLOSE,
+} from '@/transport/protocol.js';
+import {
+	type AssignmentSink,
 	buildHandshakeRequest,
 	buildHeartbeatFrame,
 	computeReconnectDelayMs,
 	connectWorkerTransport,
+	createAssignmentSink,
 	createReconnectLadders,
 	DEFAULT_BACKOFF,
 	deriveTransportUrls,
 	type FetchResponse,
 	heartbeatCadenceMs,
+	MAX_UNDELIVERED_RESULTS,
 	performHandshake,
 	type TransportSocket,
 	WorkerCapabilityConflictError,
@@ -26,12 +36,67 @@ import {
 	withSessionReclaim,
 } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
+import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const SESSION_ID = '33333333-3333-4333-8333-333333333333';
 const CREDENTIAL = 'raw-worker-credential-secret';
 const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
 const RUN_ID = '55555555-5555-4555-8555-555555555555';
+const OTHER_DISPATCH_ID = '66666666-6666-4666-8666-666666666666';
+
+/** A recorded log line, so the abandonment/eviction levels can be asserted. */
+interface LoggedLine {
+	level: 'debug' | 'info' | 'warn' | 'error';
+	message: string;
+	context?: Record<string, unknown>;
+}
+
+function recordingLogger(): WorkerTransportOverrides['logger'] & { lines: LoggedLine[] } {
+	const lines: LoggedLine[] = [];
+	const at =
+		(level: LoggedLine['level']) =>
+		(message: string, context?: Record<string, unknown>): void => {
+			lines.push({ level, message, context });
+		};
+	return {
+		lines,
+		debug: at('debug'),
+		info: at('info'),
+		warn: at('warn'),
+		error: at('error'),
+	};
+}
+
+/** A well-formed pushed assignment, so the reconnect loop's frame route is exercised. */
+const ASSIGNMENT_FRAME = {
+	type: 'task-assignment' as const,
+	protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+	dispatchId: DISPATCH_ID,
+	runId: RUN_ID,
+	phase: 'implementation' as const,
+	taskId: '718',
+	projectConfig: toNonSecretProjectConfig(createMockProjectConfig()),
+	targetBranch: 'issue-718',
+	systemPrompt: 'Implement it.',
+	target: { cli: 'claude' as const },
+};
+
+/** The terminal frame whose loss issue #718 is about. */
+function resultFrame(overrides: Partial<TaskExecutionResult> = {}): TaskExecutionResult {
+	return {
+		type: 'task-execution-result',
+		dispatchId: DISPATCH_ID,
+		runId: RUN_ID,
+		status: 'succeeded',
+		phase: 'implementation',
+		taskId: '718',
+		exitCode: 0,
+		timedOut: false,
+		durationMs: 1_103_701,
+		...overrides,
+	};
+}
 
 function handshakeResponseBody(fencingToken: number, heartbeatTtlMs = 60_000) {
 	return {
@@ -466,6 +531,211 @@ class FakeSocket implements TransportSocket {
 		this.dispatch('close', code, Buffer.from(''));
 	}
 }
+
+// Issue #718: the sink lives for the process, so a terminal result produced while the
+// socket is down is held and delivered on the next session. Nothing else is queued —
+// output is unbounded and best-effort by design.
+describe('createAssignmentSink', () => {
+	const streamLog: StreamLog = {
+		type: 'stream-log',
+		dispatchId: DISPATCH_ID,
+		runId: RUN_ID,
+		lines: [
+			{ stream: 'stdout' as const, content: 'building', emittedAt: '2026-08-13T12:13:13.433Z' },
+		],
+	};
+	const progress = {
+		type: 'task-progress' as const,
+		dispatchId: DISPATCH_ID,
+		runId: RUN_ID,
+		phase: 'implementation' as const,
+		taskId: '718',
+		state: 'running' as const,
+	};
+	const ack = {
+		type: 'task-assignment-ack' as const,
+		dispatchId: DISPATCH_ID,
+		runId: RUN_ID,
+		duplicate: false,
+	};
+
+	function sent(socket: FakeSocket): unknown[] {
+		return socket.sent.map((frame) => JSON.parse(frame));
+	}
+
+	it('holds a terminal result with no live session and drops every other frame', () => {
+		const logger = recordingLogger();
+		const sink = createAssignmentSink(logger);
+
+		sink.send(streamLog);
+		sink.send(progress);
+		sink.send(ack);
+		sink.send(resultFrame());
+
+		const socket = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(socket);
+		// Only the result survived the gap — the three best-effort frames were never queued.
+		expect(sent(socket)).toEqual([resultFrame()]);
+		expect(
+			logger.lines
+				.filter((line) => line.message.startsWith('dropping worker frame'))
+				.map((line) => line.context?.type),
+		).toEqual(['stream-log', 'task-progress', 'task-assignment-ack']);
+	});
+
+	it('flushes held results oldest-first and exactly once', () => {
+		const sink = createAssignmentSink(silentLogger);
+		sink.send(resultFrame({ dispatchId: OTHER_DISPATCH_ID, status: 'failed', error: 'boom' }));
+		sink.send(resultFrame());
+
+		const first = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(first);
+		expect(sent(first).map((frame) => (frame as TaskExecutionResult).dispatchId)).toEqual([
+			OTHER_DISPATCH_ID,
+			DISPATCH_ID,
+		]);
+
+		// The worker is at-least-once, not fire-and-forget: what it delivered it does not
+		// keep re-sending on every later session.
+		sink.detach(first);
+		const second = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(second);
+		expect(second.sent).toEqual([]);
+	});
+
+	it('preserves a failure’s exit metadata verbatim across the gap', () => {
+		const sink = createAssignmentSink(silentLogger);
+		const failure = resultFrame({
+			status: 'failed',
+			error: "Implementation agent (claude) exited with code 1 for task '718'",
+			exitCode: 1,
+			signal: null,
+			timedOut: false,
+			failureKind: 'agent',
+		});
+		sink.send(failure);
+
+		const socket = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(socket);
+		expect(sent(socket)).toEqual([failure]);
+	});
+
+	it('treats a throwing write as a non-write: the result is held, the log line is not', () => {
+		const sink = createAssignmentSink(silentLogger);
+		const broken = new FakeSocket('ws://cp/worker/stream', {});
+		broken.send = () => {
+			throw new Error('write after end');
+		};
+		sink.attach(broken);
+
+		sink.send(streamLog);
+		sink.send(resultFrame());
+
+		const healthy = new FakeSocket('ws://cp/worker/stream', {});
+		sink.detach(broken);
+		sink.attach(healthy);
+		expect(sent(healthy)).toEqual([resultFrame()]);
+	});
+
+	it('stops flushing at the first failed write, keeping the rest held', () => {
+		const sink = createAssignmentSink(silentLogger);
+		sink.send(resultFrame({ dispatchId: OTHER_DISPATCH_ID }));
+		sink.send(resultFrame());
+
+		const failing = new FakeSocket('ws://cp/worker/stream', {});
+		let writes = 0;
+		failing.send = () => {
+			writes += 1;
+			if (writes > 1) throw new Error('socket closed mid-flush');
+		};
+		sink.attach(failing);
+		expect(writes).toBe(2);
+
+		sink.detach(failing);
+		const healthy = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(healthy);
+		expect(sent(healthy).map((frame) => (frame as TaskExecutionResult).dispatchId)).toEqual([
+			DISPATCH_ID,
+		]);
+	});
+
+	it('does not let a superseded session’s detach unhook the socket that replaced it', () => {
+		const sink = createAssignmentSink(silentLogger);
+		const stale = new FakeSocket('ws://cp/worker/stream', {});
+		const live = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(stale);
+		sink.attach(live);
+
+		sink.detach(stale);
+		sink.send(resultFrame());
+		expect(sent(live)).toEqual([resultFrame()]);
+	});
+
+	it('re-reports a held result through takeUndelivered, then has nothing left to give', () => {
+		const sink = createAssignmentSink(silentLogger);
+		sink.send(resultFrame());
+
+		const held = sink.takeUndelivered(DISPATCH_ID);
+		expect(held).toEqual(resultFrame());
+		expect(sink.takeUndelivered(DISPATCH_ID)).toBeUndefined();
+		expect(sink.takeUndelivered(OTHER_DISPATCH_ID)).toBeUndefined();
+	});
+
+	it('replaces rather than grows the queue when one dispatch reports twice', () => {
+		const sink = createAssignmentSink(silentLogger);
+		sink.send(resultFrame({ status: 'deferred', retryDelayMs: 1_000 }));
+		sink.send(resultFrame());
+
+		const socket = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(socket);
+		expect(sent(socket)).toEqual([resultFrame()]);
+	});
+
+	it('bounds the queue, logging the evicted result as an error', () => {
+		const logger = recordingLogger();
+		const sink = createAssignmentSink(logger);
+		for (let i = 0; i <= MAX_UNDELIVERED_RESULTS; i += 1) {
+			sink.send(resultFrame({ dispatchId: `dispatch-${i}`, taskId: String(i) }));
+		}
+
+		const evictions = logger.lines.filter((line) => line.message.includes('result queue is full'));
+		expect(evictions).toHaveLength(1);
+		expect(evictions[0].level).toBe('error');
+		expect(evictions[0].context).toMatchObject({
+			dispatchId: 'dispatch-0',
+			runId: RUN_ID,
+			phase: 'implementation',
+			status: 'succeeded',
+		});
+
+		const socket = new FakeSocket('ws://cp/worker/stream', {});
+		sink.attach(socket);
+		expect(socket.sent).toHaveLength(MAX_UNDELIVERED_RESULTS);
+		expect(sink.takeUndelivered('dispatch-0')).toBeUndefined();
+	});
+
+	it('seals loudly: what is still held is named, and a later result is not silently kept', () => {
+		const logger = recordingLogger();
+		const sink = createAssignmentSink(logger);
+		sink.send(resultFrame());
+		sink.seal();
+
+		const abandoned = logger.lines.filter((line) => line.message.includes('abandoning'));
+		expect(abandoned).toHaveLength(1);
+		expect(abandoned[0].level).toBe('error');
+		expect(abandoned[0].context).toMatchObject({
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			phase: 'implementation',
+			status: 'succeeded',
+		});
+
+		logger.lines.length = 0;
+		sink.send(resultFrame({ dispatchId: OTHER_DISPATCH_ID, status: 'failed' }));
+		expect(logger.lines.filter((line) => line.level === 'error')).toHaveLength(1);
+		expect(sink.takeUndelivered(OTHER_DISPATCH_ID)).toBeUndefined();
+	});
+});
 
 describe('connectWorkerTransport (reconnect loop)', () => {
 	let sockets: FakeSocket[];
@@ -939,6 +1209,144 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		await vi.advanceTimersByTimeAsync(5_000);
 		expect(fetch).toHaveBeenCalledTimes(1);
 		await client.stop();
+	});
+
+	// Issue #718, the incident in miniature: a phase finished while the socket was down
+	// and its terminal result was dropped, so a succeeded run settled ~30 minutes later
+	// as "did not report a result within the lease window". It now rides the next session.
+	it('delivers a result produced while the session was down on the next session', async () => {
+		fetch
+			.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)))
+			.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(5)));
+		let sink: AssignmentSink | undefined;
+		const onAssignment = vi.fn((_assignment: unknown, assignmentSink: AssignmentSink) => {
+			sink = assignmentSink;
+		});
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onAssignment },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+		expect(onAssignment).toHaveBeenCalledTimes(1);
+
+		// The 1.1-second blip. The phase runs on, independent of the heartbeat loop.
+		sockets[0].emitDrop(1006);
+		await flush();
+		const failure = resultFrame({
+			status: 'failed',
+			error: "Implementation agent (claude) exited with code 1 for task '718'",
+			exitCode: 1,
+			signal: null,
+			failureKind: 'agent',
+		});
+		sink?.send(failure);
+		// Nothing was written into the dead socket — only its own first heartbeat is there.
+		expect(sockets[0].sent).toHaveLength(1);
+
+		await vi.advanceTimersByTimeAsync(500);
+		expect(sockets).toHaveLength(2);
+		sockets[1].emitOpen();
+		// Lease first, backlog second — and the exit metadata survives verbatim, so the
+		// control plane settles on the real outcome rather than inventing one.
+		expect(sockets[1].sent.map((frame) => JSON.parse(frame))).toEqual([
+			{ type: 'heartbeat', fencingToken: 5 },
+			failure,
+		]);
+
+		await client.stop();
+	});
+
+	it('answers a re-pushed assignment with a held result instead of re-running the phase', async () => {
+		fetch.mockResolvedValue(jsonResponse(200, handshakeResponseBody(4)));
+		let sink: AssignmentSink | undefined;
+		const onAssignment = vi.fn((_assignment: unknown, assignmentSink: AssignmentSink) => {
+			sink = assignmentSink;
+		});
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onAssignment },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+		expect(onAssignment).toHaveBeenCalledTimes(1);
+
+		// The peer is gone but the socket has not closed yet, so the write throws and the
+		// result is held rather than counted as delivered.
+		sockets[0].send = () => {
+			throw new Error('write after end');
+		};
+		sink?.send(resultFrame());
+
+		const written: unknown[] = [];
+		sockets[0].send = (data: string) => {
+			written.push(JSON.parse(data));
+		};
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+		// The outcome this daemon already has is re-reported; the phase is not re-run.
+		expect(onAssignment).toHaveBeenCalledTimes(1);
+		expect(written).toEqual([resultFrame()]);
+
+		await client.stop();
+	});
+
+	// The other half: once the result has been written, a re-push is the control plane's
+	// own re-dispatch decision and must run rather than answer with the stale outcome.
+	it('runs a re-pushed assignment normally once the result has been delivered', async () => {
+		fetch.mockResolvedValue(jsonResponse(200, handshakeResponseBody(4)));
+		let sink: AssignmentSink | undefined;
+		const onAssignment = vi.fn((_assignment: unknown, assignmentSink: AssignmentSink) => {
+			sink = assignmentSink;
+		});
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onAssignment },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+		sink?.send(resultFrame());
+
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+		expect(onAssignment).toHaveBeenCalledTimes(2);
+
+		await client.stop();
+	});
+
+	it('reports at error level a result still held when the client stops', async () => {
+		const logger = recordingLogger();
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		let sink: AssignmentSink | undefined;
+		const client = connectWorkerTransport(
+			{
+				...options,
+				capabilities: ['claude'],
+				onAssignment: (_assignment, assignmentSink) => {
+					sink = assignmentSink;
+				},
+			},
+			{ ...overrides(), logger },
+		);
+		await flush();
+		sockets[0].emitOpen();
+		sockets[0].emitMessage(ASSIGNMENT_FRAME);
+		sockets[0].emitDrop(1006);
+		await flush();
+		sink?.send(resultFrame());
+
+		await client.stop();
+		await expect(client.done).resolves.toBeUndefined();
+		const abandoned = logger.lines.filter((line) => line.message.includes('abandoning'));
+		expect(abandoned).toHaveLength(1);
+		expect(abandoned[0].level).toBe('error');
+		expect(abandoned[0].context).toMatchObject({
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			phase: 'implementation',
+			status: 'succeeded',
+		});
 	});
 
 	it('stop() closes the live socket gracefully so the lease is released promptly', async () => {

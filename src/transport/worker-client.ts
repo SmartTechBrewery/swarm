@@ -66,6 +66,7 @@ import {
 	type Heartbeat,
 	type TaskAssignment,
 	type TaskCancel,
+	type TaskExecutionResult,
 	type TaskPhase,
 	TRANSPORT_PROTOCOL_VERSION,
 	type WorkerHealth,
@@ -528,15 +529,217 @@ export interface WorkerTransportClient {
 
 /**
  * The channel an {@link WorkerTransportOptions.onAssignment} handler uses to send
- * worker→cloud frames (the assignment ack, batched live output, progress, and
- * the terminal execution result) back on the live session socket. `send` is a
- * best-effort write: once the session ends it drops the frame (logged), because a
- * reconnect re-pushes the assignment and the handler resumes rather than
- * duplicating (ADR-003 §2). Serialization is handled here so the handler only
- * ever deals in typed frames.
+ * worker→cloud frames (the assignment ack, batched live output, progress, and the
+ * terminal execution result) back to the control plane (ADR-003 §2). Serialization
+ * is handled here so the handler only ever deals in typed frames.
+ *
+ * **`send` is best-effort for output and at-least-once for the result** (issue #718).
+ * The sink lives for the *process*, not for one WebSocket session: a phase runs
+ * independently of the heartbeat loop, so it routinely outlives the session it was
+ * pushed on, and the terminal `TaskExecutionResult` is the one frame whose loss is
+ * a correctness bug rather than a diagnostic one. A terminal frame that could not be
+ * written is therefore **held** and re-sent on the next session; every other frame
+ * is dropped (logged) exactly as before.
+ *
+ * This used to be a closure over one session, justified by "a reconnect re-pushes
+ * the assignment and the handler resumes rather than duplicating". **That premise
+ * does not cover a dispatch that is already `state='running'`** — which is every
+ * dispatch whose phase is executing, i.e. the only case the sink is used in.
+ * `handleWorkerStreamOpen` (`../router/worker-transport.ts`) wakes only
+ * availability-blocked dispatches, and `listWakeablePendingDispatches`
+ * (`../db/repositories/dispatchesRepository.ts`) selects only `retry-scheduled`/
+ * `pending` rows, so nothing re-pushes a running dispatch and nothing re-attaches a
+ * sink to the run still executing under it. A one-second socket blip therefore
+ * discarded the outcome — a *successful* one included — and the dispatch settled
+ * ~30 minutes later on the back-channel timer as a worker-liveness timeout.
+ *
+ * Two properties of the surrounding machinery are what make holding the frame
+ * sufficient. The control plane's waiter survives the disconnect untouched (the
+ * `pending` entry in `../router/dispatch-results.ts` is cleared only on delivery or
+ * supersede — the socket's `onClose` does not touch it), so a result re-sent on the
+ * next session lands on the *same* waiter and settles the dispatch normally. And
+ * delivery is already consume-once: `deliverDispatchResult` deletes the entry before
+ * resolving, so a duplicate terminal frame is a logged no-op. **Exactly-once stays
+ * the consumer's property**; the worker deliberately only has to be at-least-once,
+ * which is why it re-sends rather than trying to be exactly-once on the wire.
+ *
+ * Non-terminal frames (`stream-log`, `task-progress`, `task-assignment-ack`) are
+ * never queued. Output is unbounded and best-effort by design — a replay buffer for
+ * it would be a memory liability with no correctness payoff — while the result queue
+ * is one frame per dispatch and bounded at {@link MAX_UNDELIVERED_RESULTS}. What is
+ * lost is the run page's output for the affected window, not the run's outcome.
+ *
+ * **Two residual losses this does not close**, so the fix is not read as total:
+ *
+ *   1. A frame written into a socket whose peer is already gone but whose `close`
+ *      event has not yet fired is still lost — the write succeeds locally and nothing
+ *      holds it. That window is sub-second; the observed incident was 12 minutes
+ *      past it.
+ *   2. A result flushed after the control plane has disposed its waiter is dropped
+ *      router-side (bounded by `timeoutMs + RESULT_WAIT_MARGIN_MS`,
+ *      `../router/dispatcher.ts`). Phase 2 of issue #718 makes that case say so;
+ *      issue #719 shortens it.
+ *
+ * "Re-send until acked" was rejected: there is no result ack, and `dispatchId` is
+ * stable across a re-dispatch (`reopenDispatchForManualRetry`, `../api/routers/runs.ts`),
+ * so an unbounded re-send could settle a *later* attempt with an earlier attempt's
+ * outcome. Persisting the queue to disk was rejected for the same reason `heldSession`
+ * is in memory only: a restarted daemon has no claim on the old lease, so a queue
+ * that outlived the process would re-report into a dispatch the control plane has
+ * since re-decided.
  */
 export interface AssignmentSink {
 	send(frame: WorkerStreamMessage): void;
+}
+
+/**
+ * How many undelivered terminal results the sink holds — one per dispatch, so this
+ * bounds distinct *dispatches* rather than frames. Generous relative to how many
+ * phases one daemon runs at once, because the queue only grows while the control
+ * plane is unreachable; an eviction is a lost outcome and is logged as an error.
+ */
+export const MAX_UNDELIVERED_RESULTS = 32;
+
+/**
+ * The {@link AssignmentSink} plus the session lifecycle only this module drives.
+ * One instance lives for the whole client, and each session attaches the socket it
+ * owns and detaches it again when it ends (issue #718 — see {@link AssignmentSink}
+ * for why the sink cannot be per-session).
+ */
+export interface SessionSpanningSink extends AssignmentSink {
+	/** A session opened: write through this socket, then flush what is held. */
+	attach(socket: TransportSocket): void;
+	/** That session ended: hold terminal frames until the next `attach`. */
+	detach(socket: TransportSocket): void;
+	/**
+	 * Consume the undelivered terminal result held for `dispatchId`, if any — how a
+	 * re-pushed assignment is answered with the outcome it already has instead of
+	 * re-running the phase.
+	 */
+	takeUndelivered(dispatchId: string): TaskExecutionResult | undefined;
+	/** No further session will open — report anything still held, loudly. */
+	seal(): void;
+}
+
+/**
+ * Build the client's one sink. Exported so the queue rules are unit-testable
+ * without a socket or a reconnect loop.
+ */
+export function createAssignmentSink(logger: TransportLogger): SessionSpanningSink {
+	/** dispatchId → the terminal result this worker produced and could not deliver. */
+	const undelivered = new Map<string, TaskExecutionResult>();
+	let current: TransportSocket | undefined;
+	let sealed = false;
+
+	/** A log-safe identification of a held result — never its error text or output. */
+	const describeResult = (result: TaskExecutionResult): Record<string, unknown> => ({
+		dispatchId: result.dispatchId,
+		runId: result.runId,
+		phase: result.phase,
+		status: result.status,
+	});
+
+	/** Write on the live socket; `false` when there is none or the write threw. */
+	function write(frame: WorkerStreamMessage): boolean {
+		if (!current) return false;
+		try {
+			current.send(JSON.stringify(frame));
+			return true;
+		} catch (err) {
+			// A throwing write is treated as a non-write, so a terminal frame is held
+			// rather than counted as delivered.
+			logger.warn('failed to send worker frame on transport session', {
+				type: frame.type,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
+	function hold(result: TaskExecutionResult): void {
+		if (sealed) {
+			logger.error('losing a phase result — the worker transport has stopped for good', {
+				...describeResult(result),
+			});
+			return;
+		}
+		// Last write wins per dispatch, and re-inserting moves the entry to the back of
+		// the flush order: a phase reports one terminal result, so a second one for the
+		// same dispatch is a later attempt superseding an earlier attempt's outcome.
+		undelivered.delete(result.dispatchId);
+		undelivered.set(result.dispatchId, result);
+		logger.warn('holding a phase result until the next transport session', {
+			...describeResult(result),
+			held: undelivered.size,
+		});
+		while (undelivered.size > MAX_UNDELIVERED_RESULTS) {
+			const oldest = undelivered.keys().next();
+			if (oldest.done) return;
+			const evicted = undelivered.get(oldest.value);
+			undelivered.delete(oldest.value);
+			// `error`, not `warn`: this is a phase outcome that will never reach the
+			// control plane, so the dispatch settles on the back-channel timer instead.
+			if (evicted) {
+				logger.error('dropping an undelivered phase result — the worker result queue is full', {
+					...describeResult(evicted),
+					limit: MAX_UNDELIVERED_RESULTS,
+				});
+			}
+		}
+	}
+
+	/** Deliver held results oldest-first, stopping at the first write that fails. */
+	function flush(): void {
+		for (const [dispatchId, result] of [...undelivered]) {
+			if (!write(result)) return;
+			undelivered.delete(dispatchId);
+			logger.info('delivered a phase result held across a transport session', {
+				...describeResult(result),
+			});
+		}
+	}
+
+	return {
+		send(frame: WorkerStreamMessage): void {
+			if (frame.type !== 'task-execution-result') {
+				// Output and progress are best-effort: dropped, never queued.
+				if (!current) {
+					logger.warn('dropping worker frame — no live transport session', { type: frame.type });
+					return;
+				}
+				write(frame);
+				return;
+			}
+			if (write(frame)) {
+				undelivered.delete(frame.dispatchId);
+				return;
+			}
+			hold(frame);
+		},
+		attach(socket: TransportSocket): void {
+			current = socket;
+			flush();
+		},
+		detach(socket: TransportSocket): void {
+			// Identity-checked, like `../router/worker-connections.ts`'s deregister: a
+			// stale session's end must not detach the socket that replaced it.
+			if (current === socket) current = undefined;
+		},
+		takeUndelivered(dispatchId: string): TaskExecutionResult | undefined {
+			const held = undelivered.get(dispatchId);
+			if (held) undelivered.delete(dispatchId);
+			return held;
+		},
+		seal(): void {
+			sealed = true;
+			for (const result of undelivered.values()) {
+				logger.error('abandoning an undelivered phase result — the worker transport stopped', {
+					...describeResult(result),
+				});
+			}
+			undelivered.clear();
+		},
+	};
 }
 
 export interface WorkerTransportOptions {
@@ -640,6 +843,10 @@ export function connectWorkerTransport(
 
 	let stopped = false;
 	let activeSocket: TransportSocket | undefined;
+	// One sink for the whole client, not one per session: a phase outlives the session
+	// it was pushed on, and its terminal result has to survive that (issue #718 — see
+	// `AssignmentSink`). Each session attaches its own socket and detaches it again.
+	const sink = createAssignmentSink(deps.logger);
 	let resolveStopped: (() => void) | undefined;
 	const stoppedSignal = new Promise<void>((resolve) => {
 		resolveStopped = resolve;
@@ -679,29 +886,10 @@ export function connectWorkerTransport(
 				settled = true;
 				if (heartbeatTimer) clearInterval(heartbeatTimer);
 				if (activeSocket === socket) activeSocket = undefined;
+				// From here on a still-running phase's terminal result is held rather than
+				// written into a dead socket (issue #718).
+				sink.detach(socket);
 				resolve(end);
-			};
-
-			// The back-channel a task-assignment handler writes its ack/output/result
-			// frames through. Best-effort: once the session has ended the frame is
-			// dropped (a reconnect re-pushes the assignment — ADR-003 §2).
-			const sink: AssignmentSink = {
-				send(frame: WorkerStreamMessage): void {
-					if (settled) {
-						deps.logger.warn('dropping worker frame — transport session already ended', {
-							type: frame.type,
-						});
-						return;
-					}
-					try {
-						socket.send(JSON.stringify(frame));
-					} catch (err) {
-						deps.logger.warn('failed to send worker frame on transport session', {
-							type: frame.type,
-							error: err instanceof Error ? err.message : String(err),
-						});
-					}
-				},
 			};
 
 			socket.on('open', () => {
@@ -722,6 +910,12 @@ export function connectWorkerTransport(
 				// Refresh the lease immediately so a short TTL can't lapse in the gap
 				// between the handshake and the first cadence tick.
 				sendHeartbeat();
+				// A first heartbeat that threw already ended this session, so there is nothing
+				// to attach the sink to and no cadence worth starting.
+				if (settled) return;
+				// Lease first, backlog second: whatever a phase could not report while the
+				// socket was down goes out now (issue #718).
+				sink.attach(socket);
 				heartbeatTimer = setInterval(sendHeartbeat, heartbeatCadenceMs(session.heartbeatTtlMs));
 			});
 			socket.on('message', (data) => {
@@ -793,80 +987,87 @@ export function connectWorkerTransport(
 		// remainder of the TTL (issue #608). In memory only, deliberately: a restarted
 		// *daemon* has no claim on the old lease and must acquire afresh.
 		let heldSession: WorkerSessionReclaim | undefined;
-		while (!stopped) {
-			let session: HandshakeResponse;
-			try {
-				session = await performHandshake(
-					deps,
-					urls.sessionUrl,
-					withSessionReclaim(request, heldSession),
-				);
-			} catch (err) {
-				if (err instanceof WorkerSessionConflictError && heldSession) {
-					// The lease we remembered is genuinely someone else's now — it was
-					// re-acquired while we were away, so our token no longer matches. Drop the
-					// proof so the next attempt is a plain acquire, and let the normal backoff
-					// wait the TTL out.
-					deps.logger.warn('reclaim of the previously held worker session was refused', {
-						sessionId: heldSession.sessionId,
+		try {
+			while (!stopped) {
+				let session: HandshakeResponse;
+				try {
+					session = await performHandshake(
+						deps,
+						urls.sessionUrl,
+						withSessionReclaim(request, heldSession),
+					);
+				} catch (err) {
+					if (err instanceof WorkerSessionConflictError && heldSession) {
+						// The lease we remembered is genuinely someone else's now — it was
+						// re-acquired while we were away, so our token no longer matches. Drop the
+						// proof so the next attempt is a plain acquire, and let the normal backoff
+						// wait the TTL out.
+						deps.logger.warn('reclaim of the previously held worker session was refused', {
+							sessionId: heldSession.sessionId,
+						});
+						heldSession = undefined;
+					}
+					if (err instanceof WorkerCapabilityConflictError) {
+						const refreshedRequest = await reprobeRequest(err);
+						if (!refreshedRequest) throw err;
+						request = refreshedRequest;
+					} else if (isFatalHandshakeError(err, everConnected)) throw err;
+					// An outage climbs only the lower-capped ladder (issue #611), so the daemon is
+					// never parked in a long delay it earned while nobody was home. `unreachable`
+					// names the ladder, so the line says on its face whether the control plane
+					// refused this attempt or never answered it.
+					const step = ladders.forHandshakeFailure(err);
+					deps.logger.warn('worker transport handshake failed; backing off before retry', {
+						attempt: step.attempt,
+						unreachable: step.unreachable,
+						delayMs: step.delayMs,
+						error: err instanceof Error ? err.message : String(err),
 					});
-					heldSession = undefined;
+					if (!(await backoffSleep(step.delayMs))) break;
+					continue;
 				}
-				if (err instanceof WorkerCapabilityConflictError) {
-					const refreshedRequest = await reprobeRequest(err);
-					if (!refreshedRequest) throw err;
-					request = refreshedRequest;
-				} else if (isFatalHandshakeError(err, everConnected)) throw err;
-				// An outage climbs only the lower-capped ladder (issue #611), so the daemon is
-				// never parked in a long delay it earned while nobody was home. `unreachable`
-				// names the ladder, so the line says on its face whether the control plane
-				// refused this attempt or never answered it.
-				const step = ladders.forHandshakeFailure(err);
-				deps.logger.warn('worker transport handshake failed; backing off before retry', {
-					attempt: step.attempt,
-					unreachable: step.unreachable,
-					delayMs: step.delayMs,
-					error: err instanceof Error ? err.message : String(err),
+
+				if (stopped) break;
+				everConnected = true;
+				ladders.reset();
+				deps.logger.info('worker transport session established', {
+					workerId: session.workerId,
+					sessionId: session.sessionId,
+					heartbeatTtlMs: session.heartbeatTtlMs,
+					// Which path this handshake took, so the log says on its face whether the
+					// reconnect reclaimed the lease it already held or acquired a fresh one.
+					reclaimed: heldSession !== undefined,
 				});
-				if (!(await backoffSleep(step.delayMs))) break;
-				continue;
+				heldSession = { sessionId: session.sessionId, fencingToken: session.fencingToken };
+				notifySession(session, options, deps.logger);
+
+				const end = await runSession(session);
+				if (stopped) break;
+
+				// A `4401` close means the credential/token was rejected at the upgrade —
+				// as fatal as a 401 handshake.
+				if (end.reason === 'close' && end.code === WS_CLOSE.UNAUTHORIZED) {
+					throw new WorkerTransportAuthError(
+						'worker transport stream upgrade was rejected (unauthorized)',
+					);
+				}
+
+				// A lost session steps the ordinary ladder, and both were just cleared by the
+				// handshake that opened it, so this is always its first rung. Whether the control
+				// plane is *gone* rather than merely done with us is the next handshake's answer
+				// to give, and that is what picks the ladder from there on.
+				const { delayMs } = ladders.forSessionLoss();
+				deps.logger.warn('worker transport session ended; reconnecting', {
+					end: describeSessionEnd(end),
+					delayMs,
+				});
+				if (!(await backoffSleep(delayMs))) break;
 			}
-
-			if (stopped) break;
-			everConnected = true;
-			ladders.reset();
-			deps.logger.info('worker transport session established', {
-				workerId: session.workerId,
-				sessionId: session.sessionId,
-				heartbeatTtlMs: session.heartbeatTtlMs,
-				// Which path this handshake took, so the log says on its face whether the
-				// reconnect reclaimed the lease it already held or acquired a fresh one.
-				reclaimed: heldSession !== undefined,
-			});
-			heldSession = { sessionId: session.sessionId, fencingToken: session.fencingToken };
-			notifySession(session, options, deps.logger);
-
-			const end = await runSession(session);
-			if (stopped) break;
-
-			// A `4401` close means the credential/token was rejected at the upgrade —
-			// as fatal as a 401 handshake.
-			if (end.reason === 'close' && end.code === WS_CLOSE.UNAUTHORIZED) {
-				throw new WorkerTransportAuthError(
-					'worker transport stream upgrade was rejected (unauthorized)',
-				);
-			}
-
-			// A lost session steps the ordinary ladder, and both were just cleared by the
-			// handshake that opened it, so this is always its first rung. Whether the control
-			// plane is *gone* rather than merely done with us is the next handshake's answer
-			// to give, and that is what picks the ladder from there on.
-			const { delayMs } = ladders.forSessionLoss();
-			deps.logger.warn('worker transport session ended; reconnecting', {
-				end: describeSessionEnd(end),
-				delayMs,
-			});
-			if (!(await backoffSleep(delayMs))) break;
+		} finally {
+			// No further session will open, so a result still held here is lost — say so
+			// rather than parking it in a map nothing will ever flush (issue #718). In a
+			// `finally` so it covers a graceful `stop()` and a fatal handshake error alike.
+			sink.seal();
 		}
 	})();
 
@@ -940,9 +1141,27 @@ function routeWorkFrame(
 	frame: ControlPlaneMessage,
 	options: WorkerTransportOptions,
 	logger: TransportLogger,
-	sink: AssignmentSink,
+	sink: SessionSpanningSink,
 ): void {
 	if (frame.type === 'task-assignment') {
+		// This daemon already ran the phase and still holds its outcome, so the push is
+		// answered with that outcome rather than by running it again (issue #718). Keyed
+		// on the *undelivered* set rather than on "this dispatch ever settled here":
+		// `dispatchId` is stable across a re-open (`reopenDispatchForManualRetry`,
+		// `../api/routers/runs.ts`), so a memory of delivered results would answer a
+		// genuine manual retry with the stale outcome it was retrying. `send` re-holds the
+		// frame if the write fails, so consuming it here cannot lose it.
+		const held = sink.takeUndelivered(frame.dispatchId);
+		if (held) {
+			logger.warn('re-reporting a phase result the control plane never received', {
+				dispatchId: frame.dispatchId,
+				runId: frame.runId,
+				phase: frame.phase,
+				status: held.status,
+			});
+			sink.send(held);
+			return;
+		}
 		options.onAssignment?.(frame, sink);
 		return;
 	}
