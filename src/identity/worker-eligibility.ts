@@ -8,8 +8,9 @@
  * It combines ADR-001's routing prerequisites — "an eligible, connected worker
  * with active owner sharing consent, project enrollment, required CLI
  * capability, and available capacity" — in that order: active enrollment →
- * active sharing consent → connection/health → free capacity → declared phase
- * support (issue #467) → the enrollment's own allowed phases (issue #509) →
+ * active sharing consent → connection/health → free capacity → the repository
+ * the machine's checkout is (issue #714) → declared phase support (issue #467) →
+ * the enrollment's own allowed phases (issue #509) →
  * declared CLI capability. The first missing signal wins, so a caller always gets *the* reason
  * to show rather than a set to prioritize itself. The first two checks together
  * are exactly `isRoutable` (`./worker-enrollment.ts`, #337's named seam); they are
@@ -37,6 +38,7 @@
 import { z } from 'zod';
 import type { AgentTarget } from '../config/schema.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import { repoSlugsMatch } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
 import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
@@ -53,6 +55,18 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
  * - `worker-unavailable` — the worker is disconnected/unhealthy (no live
  *   session) or already at its enrolled concurrency allocation. One value, since
  *   both resolve the same way: wait for the worker to come back or free a slot.
+ * - `repository-mismatch` — the machine's one local checkout is a *different*
+ *   repository than this task's (issue #714): it declared one at handshake
+ *   (`Worker.repository`, issue #687) and that declaration is not the task's. Its own
+ *   value rather than a reuse of `worker-unavailable` or `missing-enrollment`,
+ *   because the fix is one no other reason names — point a worker at this
+ *   repository, or enroll one that already holds it — and no machine coming online
+ *   or freeing a slot can clear it. A worker that declared **no** repository is
+ *   deliberately **not** refused: an unidentifiable checkout (no readable `origin`,
+ *   a daemon on a build that predates the field, a machine that never connected)
+ *   must not become unroutable, exactly as issue #688's assignment refusal and
+ *   #690's enrollment check decided — the provision-time `origin` verification
+ *   (`GitWorktreeManager.assertRepoIdentity`) remains its guard.
  * - `missing-phase-capability` — the worker's daemon did not declare this pipeline
  *   phase as one it can execute (issue #467). Distinct from a missing CLI: the
  *   machine may have every CLI and still refuse the phase. Today's DB-free daemon
@@ -80,6 +94,7 @@ export const IneligibilityReasonSchema = z.enum([
 	'missing-enrollment',
 	'missing-consent',
 	'worker-unavailable',
+	'repository-mismatch',
 	'missing-phase-capability',
 	'phase-not-permitted',
 	'missing-cli-capability',
@@ -118,8 +133,11 @@ export interface WorkerAvailability {
 
 /** Everything {@link evaluateWorkerEligibility} judges — one worker, one target. */
 export interface WorkerEligibilityInput {
-	/** The worker's declared CLI and phase capabilities (`./worker.ts`). */
-	worker: Pick<Worker, 'capabilities' | 'supportedPhases'>;
+	/**
+	 * The worker's declared CLI and phase capabilities, plus the repository its one
+	 * local checkout is (`./worker.ts`) — `null` when it has declared none.
+	 */
+	worker: Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository'>;
 	/** Its enrollment for the project, or `undefined` when it has none. */
 	enrollment: WorkerEnrollment | undefined;
 	availability: WorkerAvailability;
@@ -127,6 +145,18 @@ export interface WorkerEligibilityInput {
 	target: AgentTarget;
 	/** The phase's coded default CLI, used when `target` names none. */
 	phaseDefaultCli: AgentCli;
+	/**
+	 * **The task's** repository, as a `ProjectConfig.repo`-shaped `owner/repo` slug —
+	 * the scoped project's own entry, not the project's default one (issue #684).
+	 * Compared against the worker's declaration through the shared `repoSlugsMatch`
+	 * (`../scm/repo-slug.ts`), which normalises this side too: a stored declaration is
+	 * already normalised, whereas a `ProjectConfig.repo` is whatever the operator wrote.
+	 *
+	 * Required rather than optional, for the same reason `phase` is: a caller that
+	 * forgot it would silently route a task to a machine holding another repository,
+	 * so the type-checker makes every call site name it.
+	 */
+	repository: string;
 	/**
 	 * The phase being dispatched, checked against the worker's declared
 	 * `supportedPhases` (issue #467) **and** the enrollment's own `allowedPhases`
@@ -148,12 +178,12 @@ export function resolveTargetCli(target: AgentTarget, phaseDefaultCli: AgentCli)
 
 /**
  * Judge one worker against one candidate target, returning the first missing
- * signal in ADR-001's order (enrollment → consent → connection → capacity → phase
- * capability → phase permission → CLI capability). Pure: it reads only what it is
- * given.
+ * signal in ADR-001's order (enrollment → consent → connection → capacity →
+ * repository → phase capability → phase permission → CLI capability). Pure: it
+ * reads only what it is given.
  */
 export function evaluateWorkerEligibility(input: WorkerEligibilityInput): EligibilityResult {
-	const { worker, enrollment, availability, target, phaseDefaultCli, phase } = input;
+	const { worker, enrollment, availability, target, phaseDefaultCli, phase, repository } = input;
 	if (!enrollment || enrollment.status !== 'active') {
 		return { eligible: false, reason: 'missing-enrollment' };
 	}
@@ -167,6 +197,18 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	const atCapacity = availability.activeRuns >= enrollment.concurrencyAllocation;
 	if (!availability.connected || atCapacity) {
 		return { eligible: false, reason: 'worker-unavailable' };
+	}
+	// Which repository the machine's one checkout actually is (issue #714) — the most
+	// fundamental property of the pairing, so it is judged before *any* capability: a
+	// worker holding the wrong tree can run no phase of this task at all, whichever
+	// phases and CLIs it declares. Connection and capacity stay ahead of it because
+	// "some worker is merely busy" remains the best news available — a machine that
+	// does hold this repository but is offline must still report `worker-unavailable`.
+	//
+	// A worker that declared nothing is not refused: see `repository-mismatch` in
+	// {@link IneligibilityReasonSchema} for why, and where its guards are instead.
+	if (worker.repository && !repoSlugsMatch(repository, worker.repository)) {
+		return { eligible: false, reason: 'repository-mismatch' };
 	}
 	// Whether this machine runs this phase at all — judged before the CLI because it
 	// is a property of the worker rather than of the candidate target (issue #467).

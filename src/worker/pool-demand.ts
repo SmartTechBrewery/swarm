@@ -11,7 +11,7 @@
  * dispatch will resolve them, including a per-run "Retry now" pin carried on its
  * stored payload.
  *
- * Two deliberate approximations, both of which only ever make a contender look
+ * Three deliberate approximations, all of which only ever make a contender look
  * *less* constrained than it is — the safe direction, since an overstated demand is
  * what would divert this dispatch for contention that isn't real:
  *
@@ -23,6 +23,10 @@
  *   different `agents.*` block for an item that never went through Planning, which a
  *   project may point at different targets; establishing it costs another query per
  *   contender (`wasPrecededByPlanning`), so the planned block is used.
+ * - **A payload that names no repository is not narrowed by one** (issue #714). Its
+ *   `undefined` means the project's *default* entry, and the project a gate scoped is
+ *   not necessarily that entry — so the gate skips its repository check for that
+ *   contender rather than guessing at one.
  *
  * Best-effort by contract: every failure resolves to `undefined`, which the gate
  * reads as "no pool information" and answers with its plain first-eligible pick. A
@@ -37,6 +41,7 @@ import {
 } from '../db/repositories/dispatchesRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { normalizeStoredJobPayload, repositoryForJob } from '../queue/jobs.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../triggers/types.js';
 import type { RunnableDispatchDemand } from './eligibility-gate.js';
 import { PHASE_DEFAULT_CLI, phaseAgentConfig, resolveTargetPolicy } from './target-policy.js';
@@ -58,6 +63,13 @@ function toDemand(project: ProjectConfig, row: DispatchRow): RunnableDispatchDem
 		phase,
 		targets: resolveTargetPolicy(phaseAgentConfig(project, phase), row.jobPayload).targets,
 		phaseDefaultCli: PHASE_DEFAULT_CLI[phase],
+		// Which repository the contender belongs to (issue #714), read off its own stored
+		// payload exactly as its dispatch will scope the project by it. Normalised first,
+		// because a row written before #684/#686 carries the legacy envelope. `undefined`
+		// means the payload names none — the project's *default* entry, which the `project`
+		// scoped here may not be — so the gate skips the repository check for that
+		// contender rather than narrowing it by the wrong repository.
+		repository: repositoryForJob(normalizeStoredJobPayload(row.jobPayload)),
 	};
 }
 

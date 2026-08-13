@@ -33,8 +33,9 @@
  *    operator action ("Reset & restart"), never a timer.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent →
- *    connection/health → free capacity → declared phase support (issue #467) →
- *    the enrollment's allowed phases (issue #509) → declared/allowed CLI.
+ *    connection/health → free capacity → the repository its checkout is (issue
+ *    #714) → declared phase support (issue #467) → the enrollment's allowed phases
+ *    (issue #509) → declared/allowed CLI.
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes an
@@ -193,11 +194,29 @@ export interface RunnableDispatchDemand {
 	targets: AgentTarget[];
 	/** Its phase's coded default CLI, for a target that names none. */
 	phaseDefaultCli: AgentCli;
+	/**
+	 * The repository the contender belongs to (issue #714), or `undefined` when its
+	 * stored payload names none — which means *the project's default entry*, and the
+	 * project this gate scoped may not be that entry. So an unnamed repository skips
+	 * the repository check rather than being guessed at
+	 * ({@link repositoryForDemand}) — a third approximation in the same widening
+	 * direction as the affinity one above and the `implementationUnplanned` one
+	 * recorded in `./pool-demand.ts`.
+	 */
+	repository: string | undefined;
 }
 
 /** Everything the gate judges for one dispatch. */
 export interface DispatchGateInput {
 	projectId: string;
+	/**
+	 * **The task's** repository — the scoped project's own `repo` (issue #684 pins it
+	 * to the job's repository), never the project's default entry. Judged against each
+	 * candidate's declared checkout (issue #714), so a machine holding a different
+	 * repository is *skipped here* instead of being selected, claimed, and then
+	 * refusing the assignment terminally on arrival (issue #688).
+	 */
+	repository: string;
 	/**
 	 * The durable dispatch being gated, when there is one. Required for pool
 	 * scheduling — it is how this dispatch recognizes its own share of the matching
@@ -327,6 +346,10 @@ const REASON_PRIORITY: readonly IneligibilityReason[] = [
 	// nearer miss — the machine can run the phase, its owner just hasn't offered it here.
 	'phase-not-permitted',
 	'missing-phase-capability',
+	// Below both phase reasons by the same rule (issue #714): the predicate judges the
+	// repository *before* either, so a candidate that reported a phase reason had
+	// already cleared the repository check and came nearer to eligible.
+	'repository-mismatch',
 	'missing-consent',
 	'missing-enrollment',
 ];
@@ -365,6 +388,12 @@ const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
 	'missing-phase-capability': false,
 	'phase-not-permitted': false,
 	'missing-cli-capability': false,
+	// A machine coming online cannot clear this (issue #714): a checkout is re-declared
+	// only at handshake, and what ends the wait is a human pointing a worker at this
+	// repository or enrolling one that already holds it. A machine that *does* hold it
+	// but is offline never reaches here — the connection check runs earlier and reports
+	// `worker-unavailable`, which is the availability wait it really is.
+	'repository-mismatch': false,
 };
 
 /** Every reason the gate can refuse with — the domain of {@link isAvailabilityRefusal}. */
@@ -393,6 +422,7 @@ function ineligibilityMessage(
 		assignee?: string;
 		clis: AgentCli[];
 		phase: TriggerPhase;
+		repository: string;
 		preservedWorker?: string;
 	},
 ): string {
@@ -429,6 +459,12 @@ function ineligibilityMessage(
 		// (issue #509), and only its owner can widen that.
 		case 'phase-not-permitted':
 			return `No enrolled worker for ${owner} is allowed the '${context.phase}' phase in this project. A worker owner chooses which pipeline phases their worker may be given per project enrollment; widen that selection on the worker's detail screen — this work waits until one permits the phase.`;
+		// Names the task's repository, because that is what an operator has to act on:
+		// a machine holds exactly one checkout (`SWARM_WORKER_REPO_ROOT`), so the fix is
+		// a machine pointed at *this* repository rather than anything about the phase, the
+		// CLI, or the enrollment (issue #714).
+		case 'repository-mismatch':
+			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine's checkout is a different repository. Point a worker at that repository (SWARM_WORKER_REPO_ROOT) or enroll one that already holds it — this work waits until one does.`;
 	}
 }
 
@@ -449,6 +485,24 @@ function resolveAvailability(
 		...candidate.availability,
 		connected: candidate.availability.connected && isWorkerConnected(candidate.worker.id),
 	};
+}
+
+/**
+ * The repository one *contender's* candidate is judged against (issue #714). A
+ * demand that names its repository is judged against it — the same narrowing this
+ * gate applies to its own dispatch. A demand that names **none** must not be
+ * narrowed by a guess ({@link RunnableDispatchDemand.repository}), so the check is
+ * made vacuous by judging the candidate against its *own* declaration rather than by
+ * giving the predicate an optional field that every real dispatch could then forget
+ * to fill.
+ */
+function repositoryForDemand(
+	demand: RunnableDispatchDemand,
+	candidate: WorkerDispatchCandidate,
+): string {
+	// The `?? ''` tail is unreachable as a comparison: a candidate that declared
+	// nothing clears the predicate's repository check whatever it is given.
+	return demand.repository ?? candidate.worker.repository ?? '';
 }
 
 /**
@@ -474,6 +528,7 @@ function eligibleWorkersForDemand(
 						target,
 						phaseDefaultCli: demand.phaseDefaultCli,
 						phase: demand.phase,
+						repository: repositoryForDemand(demand, candidate),
 					}).eligible,
 			)
 			.map((candidate) => candidate.worker.id);
@@ -597,6 +652,7 @@ export async function evaluateDispatchEligibility(
 		assignee: assigned?.assignee.handle,
 		clis,
 		phase: input.phase,
+		repository: input.repository,
 		preservedWorker: pinned?.name ?? pinned?.id,
 	};
 	if (permitted.length === 0) {
@@ -631,6 +687,7 @@ export async function evaluateDispatchEligibility(
 				target,
 				phaseDefaultCli: input.phaseDefaultCli,
 				phase: input.phase,
+				repository: input.repository,
 			});
 			if (verdict.eligible) eligible.push(candidate);
 			else reported.add(verdict.reason);

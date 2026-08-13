@@ -73,6 +73,23 @@ describe('loadRunnableDispatchDemands', () => {
 		]);
 	});
 
+	// Issue #714: the gate narrows a contender by its own repository, so the demand has
+	// to carry it — read off the stored payload exactly as the contender's own dispatch
+	// will scope its project by it.
+	it('carries each contender’s own repository', async () => {
+		listRunnable.mockResolvedValue([
+			dispatchRow({ jobPayload: { ...JOB, repository: 'smarttechbrewery/dashboard' } as SwarmJob }),
+			// A payload naming none means the project's default entry, which the scoped
+			// project may not be — so the gate skips the check rather than guessing.
+			dispatchRow({ id: 'd-legacy' }),
+		]);
+
+		expect(await loadRunnableDispatchDemands(createMockProjectConfig())).toMatchObject([
+			{ dispatchId: 'd-1', repository: 'smarttechbrewery/dashboard' },
+			{ dispatchId: 'd-legacy', repository: undefined },
+		]);
+	});
+
 	it('drops dispatches that demand no worker', async () => {
 		// A dispatch whose trigger has not resolved yet names no phase, and merge
 		// automation runs no agent at all — neither competes for the pool.
