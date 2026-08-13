@@ -49,18 +49,51 @@ function writeFile(root: string, path: string, body: string): void {
 	writeFileSync(join(root, path), body);
 }
 
+/** The branch every fixture is created on, so branch attribution means something. */
+const BRANCH = 'issue-699';
+
+/** What {@link gitFixture} stashes away, and from where. */
+interface FixtureStash {
+	message: string;
+	/** Restrict the stash to these paths, leaving the rest of the edits in the tree. */
+	paths?: readonly string[];
+	/** Take it somewhere other than the task's branch — another branch by name, or detached. */
+	on?: 'detached' | string;
+}
+
+/** Stash the fixture's dirty edits, optionally from a branch other than the task's. */
+function stashFixture(root: string, { message, paths, on }: FixtureStash): void {
+	if (on === 'detached') fixtureGit(root, ['checkout', '-q', '--detach', 'HEAD']);
+	else if (on) fixtureGit(root, ['checkout', '-q', '-b', on]);
+	fixtureGit(root, [
+		'stash',
+		'push',
+		'--include-untracked',
+		'-m',
+		message,
+		...(paths ? ['--', ...paths] : []),
+	]);
+	if (on) fixtureGit(root, ['checkout', '-q', BRANCH]);
+}
+
 /**
  * A committed repository with `tracked` files, then `dirty` applied on top as
- * uncommitted edits (`null` deletes) and `checkpoint` written to its root.
+ * uncommitted edits (`null` deletes), optionally `stash`ed away, and `checkpoint`
+ * written to its root.
+ *
+ * The stash step runs *before* the checkpoint write on purpose: that is the order
+ * the incident happened in (`swarm_checkpoint.json` is gitignored, so `git stash
+ * push -u` leaves it behind while every recorded path goes into the stash).
  */
 function gitFixture(options: {
 	tracked?: Record<string, string>;
 	dirty?: Record<string, string | null>;
+	stash?: FixtureStash;
 	checkpoint?: unknown;
 }): string {
 	const root = mkdtempSync(join(tmpdir(), 'swarm-checkpoint-git-'));
 	roots.push(root);
-	fixtureGit(root, ['init']);
+	fixtureGit(root, ['init', '--initial-branch', BRANCH]);
 	fixtureGit(root, ['config', 'user.name', 'Fixture']);
 	fixtureGit(root, ['config', 'user.email', 'fixture@example.com']);
 	// A base commit must exist for `git status` to compare against.
@@ -72,6 +105,7 @@ function gitFixture(options: {
 		if (body === null) rmSync(join(root, path));
 		else writeFile(root, path, body);
 	}
+	if (options.stash) stashFixture(root, options.stash);
 	if (options.checkpoint !== undefined)
 		writeFileSync(join(root, CHECKPOINT_FILENAME), JSON.stringify(options.checkpoint));
 	return root;
@@ -196,7 +230,7 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 				workingTree: { modified: ['src/a.ts'], added: ['src/new.ts'], deleted: ['src/gone.ts'] },
 			},
 		});
-		const result = await validateCheckpointForContinuation(root, 'implementation');
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
 		expect(result.valid).toBe(true);
 		if (result.valid) expect(result.checkpoint.remaining).toEqual(VALID.remaining);
 	});
@@ -208,7 +242,9 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 			dirty: { 'src/a.ts': 'edited\n', 'src/unrecorded.ts': 'extra\n' },
 			checkpoint: { ...VALID, workingTree: { modified: ['src/a.ts'] } },
 		});
-		await expect(validateCheckpointForContinuation(root, 'implementation')).resolves.toMatchObject({
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({
 			valid: true,
 		});
 	});
@@ -219,7 +255,9 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 			dirty: { 'src/a.ts': 'edited\n' },
 			checkpoint: { ...VALID, workingTree: { modified: ['./src/a.ts'] } },
 		});
-		await expect(validateCheckpointForContinuation(root, 'implementation')).resolves.toMatchObject({
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({
 			valid: true,
 		});
 	});
@@ -230,7 +268,9 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 			dirty: { 'src/fresh/deep.ts': 'new\n' },
 			checkpoint: { ...VALID, workingTree: { added: ['src/fresh/deep.ts'] } },
 		});
-		await expect(validateCheckpointForContinuation(root, 'implementation')).resolves.toMatchObject({
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({
 			valid: true,
 		});
 	});
@@ -245,14 +285,18 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 				workingTree: { added: ['src/new.ts'], deleted: ['src/old.ts'] },
 			}),
 		);
-		await expect(validateCheckpointForContinuation(root, 'implementation')).resolves.toMatchObject({
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({
 			valid: true,
 		});
 	});
 
 	it('reports missing-validation when no checkpoint was written at all', async () => {
 		const root = gitFixture({ dirty: { 'src/a.ts': 'new\n' } });
-		await expect(validateCheckpointForContinuation(root, 'implementation')).resolves.toMatchObject({
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({
 			valid: false,
 			reason: 'missing-validation',
 		});
@@ -262,7 +306,7 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 		const malformed = gitFixture({ dirty: { 'src/a.ts': 'new\n' } });
 		writeFileSync(join(malformed, CHECKPOINT_FILENAME), '{ not json');
 		await expect(
-			validateCheckpointForContinuation(malformed, 'implementation'),
+			validateCheckpointForContinuation(malformed, 'implementation', BRANCH),
 		).resolves.toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
 
 		const violating = gitFixture({
@@ -270,7 +314,7 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 			checkpoint: { ...VALID, remaining: [] },
 		});
 		await expect(
-			validateCheckpointForContinuation(violating, 'implementation'),
+			validateCheckpointForContinuation(violating, 'implementation', BRANCH),
 		).resolves.toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
 	});
 
@@ -280,7 +324,7 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 			dirty: { 'src/a.ts': 'edited\n' },
 			checkpoint: { ...VALID, workingTree: { modified: ['src/a.ts'] } },
 		});
-		const result = await validateCheckpointForContinuation(root, 'respond-to-ci');
+		const result = await validateCheckpointForContinuation(root, 'respond-to-ci', BRANCH);
 		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
 		if (!result.valid)
 			expect(result.detail).toContain("written by the 'implementation' phase, not 'respond-to-ci'");
@@ -295,7 +339,7 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 				workingTree: { modified: ['src/a.ts'], added: ['src/reverted.ts', 'src/lost.ts'] },
 			},
 		});
-		const result = await validateCheckpointForContinuation(root, 'implementation');
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
 		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
 		if (!result.valid) {
 			expect(result.detail).toContain('src/reverted.ts, src/lost.ts');
@@ -309,17 +353,169 @@ describe('validateCheckpointForContinuation (issue #502)', () => {
 		fixtureGit(root, ['add', '--all']);
 		fixtureGit(root, ['commit', '-m', 'ignore the checkpoint']);
 		writeFileSync(join(root, CHECKPOINT_FILENAME), JSON.stringify(VALID));
-		const result = await validateCheckpointForContinuation(root, 'implementation');
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
 		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
 		if (!result.valid) expect(result.detail).toContain('is clean');
 	});
 
 	it('fails closed when the working tree cannot be read at all', async () => {
+		// Also the fail-soft case for the stash probe: this branch returns before it.
 		const root = checkpointRoot(JSON.stringify(VALID)); // not a git repository
-		await expect(validateCheckpointForContinuation(root, 'implementation')).resolves.toMatchObject({
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({
 			valid: false,
 			reason: 'checkpoint-divergent',
 		});
+	});
+});
+
+/**
+ * The self-diagnosing half of a divergence (issue #705). An agent that stashes
+ * inside its own task worktree and is stopped before restoring it leaves a
+ * checkpoint recording paths over a tree that no longer changes them — the guard
+ * refuses (correctly) and used to say only that the work was missing, so every
+ * retry failed identically and recovery meant reading the stash reflog by hand.
+ *
+ * `swarm_checkpoint.json` is gitignored, which is why the incident is possible at
+ * all: `git stash push -u` takes the untracked work but leaves the checkpoint
+ * behind. The fixtures commit that `.gitignore` so they reproduce it faithfully.
+ */
+describe('the stash diagnosis on a divergence (issue #705)', () => {
+	const IGNORE_CHECKPOINT = { '.gitignore': `${CHECKPOINT_FILENAME}\n` };
+
+	it('names the stash holding the work when the tree was stashed clean', async () => {
+		const root = gitFixture({
+			tracked: { ...IGNORE_CHECKPOINT, 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n', 'src/new.ts': 'new\n' },
+			stash: { message: 'wip-699c' },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/a.ts'], added: ['src/new.ts'], deleted: [] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('is clean');
+		expect(result.detail).toContain('stash@{0}');
+		expect(result.detail).toContain(`On ${BRANCH}: wip-699c`);
+		expect(result.detail).toContain(`on this task's branch '${BRANCH}'`);
+		expect(result.detail).toContain('holds 2 path(s), 2 of which this checkpoint records');
+		expect(result.detail).toContain(`git -C ${root} stash apply 'stash@{0}'`);
+	});
+
+	it('names the stash holding the subset of paths the tree stopped changing', async () => {
+		const root = gitFixture({
+			tracked: { ...IGNORE_CHECKPOINT, 'src/kept.ts': 'a\n', 'src/lost.ts': 'b\n' },
+			dirty: { 'src/kept.ts': 'edited\n', 'src/lost.ts': 'edited\n' },
+			stash: { message: 'wip', paths: ['src/lost.ts'] },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/kept.ts', 'src/lost.ts'], added: [], deleted: [] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('no longer changes: src/lost.ts');
+		expect(result.detail).toContain('holds 1 path(s), 1 of which this checkpoint records');
+		expect(result.detail).toContain("stash apply 'stash@{0}'");
+	});
+
+	it('reports a stash taken while detached, which names no branch, by its paths', async () => {
+		const root = gitFixture({
+			tracked: { ...IGNORE_CHECKPOINT, 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n' },
+			stash: { message: 'wip', on: 'detached' },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/a.ts'], added: [], deleted: [] } },
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('on no branch (a detached checkout)');
+		expect(result.detail).toContain('1 of which this checkpoint records');
+	});
+
+	it('says plainly that no stash matches, rather than pointing at an unrelated one', async () => {
+		const root = gitFixture({
+			tracked: { ...IGNORE_CHECKPOINT, 'src/unrelated.ts': 'a\n' },
+			dirty: { 'src/unrelated.ts': 'edited\n' },
+			stash: { message: 'another task', on: 'other-work' },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/recorded.ts'], added: [], deleted: [] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('1 git stash entry exists');
+		expect(result.detail).toContain(`none is on branch '${BRANCH}'`);
+		expect(result.detail).toContain('the missing work is not stashed');
+		expect(result.detail).not.toContain('stash apply');
+	});
+
+	it('says the work is not stashed when the repository has no stash at all', async () => {
+		const root = gitFixture({
+			tracked: IGNORE_CHECKPOINT,
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/recorded.ts'], added: [], deleted: [] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('is clean');
+		expect(result.detail).toContain('No git stash exists in this repository');
+	});
+
+	it('discloses how many entries it compared paths for when the cap bites', async () => {
+		const root = gitFixture({
+			tracked: IGNORE_CHECKPOINT,
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/recorded.ts'], added: [], deleted: [] },
+			},
+		});
+		fixtureGit(root, ['checkout', '-q', '-b', 'other-work']);
+		for (let index = 0; index < 12; index++) {
+			writeFile(root, `src/other-${index}.ts`, `${index}\n`);
+			fixtureGit(root, ['stash', 'push', '--include-untracked', '-q', '-m', `unrelated-${index}`]);
+		}
+		fixtureGit(root, ['checkout', '-q', BRANCH]);
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('12 git stash entries exist');
+		expect(result.detail).toMatch(/paths compared for the newest \d+ of 12 entries/);
+	});
+
+	it('never applies, pops, or drops the stash it reports', async () => {
+		const root = gitFixture({
+			tracked: { ...IGNORE_CHECKPOINT, 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n' },
+			stash: { message: 'wip-699c' },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/a.ts'], added: [], deleted: [] } },
+		});
+		const before = fixtureGit(root, ['stash', 'list']);
+		await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(fixtureGit(root, ['stash', 'list'])).toBe(before);
+		expect(fixtureGit(root, ['status', '--porcelain'])).toBe('');
+	});
+
+	it('leaves a matching tree valid, and says nothing about an unrelated stash', async () => {
+		const root = gitFixture({
+			tracked: { ...IGNORE_CHECKPOINT, 'src/a.ts': 'a\n', 'src/stashed.ts': 'b\n' },
+			dirty: { 'src/stashed.ts': 'edited\n' },
+			stash: { message: 'older work' },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/a.ts'], added: [], deleted: [] } },
+		});
+		writeFile(root, 'src/a.ts', 'edited\n');
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
 	});
 });
 
@@ -437,6 +633,17 @@ describe.each(IMPLEMENTER_BUILDERS)('$name prompt asks for a checkpoint', ({ nam
 		expect(prompt).toContain('Do not create one before a completed step.');
 		expect(prompt).toContain('completed (a non-empty array');
 		expect(prompt).toContain('remaining (a non-empty array');
+	});
+
+	it('forbids leaving the worktree stashed, and says why (issue #705)', () => {
+		const prompt = build();
+		expect(prompt).toContain("never leave this worktree's changes stashed");
+		expect(prompt).toContain('Do not `git stash` your work aside');
+		// The reason an agent cannot infer from inside one turn.
+		expect(prompt).toContain('the continuation is a fresh session in this same worktree');
+		expect(prompt).toContain('A continuation that finds a clean tree');
+		// …and the safe form of the technique that motivated the stash.
+		expect(prompt).toContain('compare against a separate checkout');
 	});
 
 	it('seeds the recorded remainder when the run adopted a checkpoint (issue #502)', () => {

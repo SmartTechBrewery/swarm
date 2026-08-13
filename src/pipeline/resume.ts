@@ -265,6 +265,11 @@ async function discardCheckout(
  * to re-enter, so the checkpoint file left in the checkout *is* the hand-off.
  * Adopt the checkout only once that file proves it describes this phase and the
  * tree actually on disk.
+ *
+ * `branch` reaches the guard as well as the adopted handle: a divergence reports
+ * whether a git stash on the task's branch holds the work the tree is missing
+ * (issue #705), and the branch it means is the caller's premise for the same
+ * reason {@link resolveReuseHandle} takes it rather than asking git.
  */
 async function adoptCheckpointContinuation(
 	worktrees: GitWorktreeManager,
@@ -273,7 +278,7 @@ async function adoptCheckpointContinuation(
 	phase: TriggerPhase,
 	branch: string,
 ): Promise<{ reuseHandle: WorktreeHandle; checkpoint: Checkpoint }> {
-	const validation = await validateCheckpointForContinuation(path, phase);
+	const validation = await validateCheckpointForContinuation(path, phase, branch);
 	if (!validation.valid)
 		throw await releaseAndBlock(
 			worktrees,

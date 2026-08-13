@@ -187,6 +187,52 @@ and a brand-new untracked directory isn't collapsed to `dir/`, and it scrubs inh
 `GIT_DIR`/`GIT_WORK_TREE`-style variables (`gitEnvironmentForCwd`, `src/scm/delivery.ts`) so
 `cwd` alone decides which repository is read.
 
+**A divergence says where the missing work went** (issue #705). The refusal above is correct
+but used to be self-defeating: it named the mismatch and not its cause, so the one thing that
+routinely causes it — an agent running `git stash` inside its own task worktree, to check
+whether a failure predates its change, and being stopped before restoring it — read as
+"28 recorded paths, clean tree" with nothing pointing at the stash. Every retry then failed
+identically, and recovery meant reading the stash reflog by hand (run
+`5a4b2090-46cc-4f5c-ac05-df60a97a2142`, task 699). Two halves close it, and neither touches the
+refusal itself:
+
+- **The prompt says not to.** `checkpointInstructions` (`src/pipeline/prompts/checkpoint.ts`)
+  now tells the agent never to leave the worktree's changes stashed, gives the reason it cannot
+  infer from inside one turn — the run can be stopped without warning and continued by a *fresh
+  session in this same worktree* — and names the safe form of the technique: compare against a
+  separate checkout rather than mutating this one. It rides with the checkpoint block, so it
+  reaches exactly the four phases that write a checkpoint (including `resolve-conflicts`, which
+  carries no `GH_IDENTITY_GUARD`) and no phase that does not.
+- **The guard diagnoses it.** The two divergences that mean *the recorded work is not in the
+  tree* — a clean tree, and recorded paths the tree no longer changes — append a stash report:
+  which `refs/stash` entries could hold that work, how many of the checkpoint's paths each
+  holds, and the exact `git -C <worktree> stash apply '<ref>'` that restores it. When nothing
+  matches it says so plainly, so a stale unrelated stash is never presented as "your work is
+  over here". The same finding is logged at `warn`. It runs only on those two branches: a parse
+  failure and a wrong-phase checkpoint say nothing about missing work, and an unreadable
+  `git status` means git is already broken, so that branch returns before the probe.
+
+Three details of the probe are worth not re-deriving. **An entry matches on its branch *or* its
+paths**, because each covers the other's blind spot — a checkout detached at `origin/<branch>`
+(issue #558) stashes as `On (no branch)`, so only the paths identify it, while a stash taken
+without `-u` holds none of the untracked `added` paths, so only the branch does. The branch it
+compares against is the **caller's**, passed down from `adoptCheckpointContinuation`, for the
+same reason `resolveReuseHandle` takes it rather than asking git. **It reports; it never acts** —
+nothing here can know the stash is this checkpoint's work rather than something older, so
+auto-applying could bury the tree under an unrelated diff; SWARM has no `git stash` anywhere in
+`src/` other than these read-only probes. And it is **fail-soft**: every git call is wrapped, a
+failure yields a clause saying the check could not run, path lists are read for the newest ten
+entries only (with the truncation disclosed when it bites), and no path through it can change
+the verdict or throw. The refusal is byte-for-byte what it always was — continuing onto a tree
+the checkpoint does not describe is what would corrupt or duplicate the work.
+
+The interaction that makes the failure possible is worth stating: `swarm_checkpoint.json` is
+gitignored, and `git stash push -u` takes untracked files but not ignored ones — so the stash
+swallows every recorded path and leaves the checkpoint behind, which is precisely the state the
+guard refuses. `refs/stash` is a *shared* ref living in the main repository rather than in the
+linked worktree, which is why the entry survives a pruned worktree and why one `git stash list`
+run in the task worktree can find it.
+
 **A continuation always runs on a fresh session, and never resumes one.** `sessionRunArgs`
 forces `{ sessionId, resumeSessionId: undefined }` for the mode unconditionally, and the gate
 reports `resumed: false` because no session was re-entered. That is what makes Tier 2
