@@ -199,6 +199,176 @@ function normalizePath(path: string): string {
 }
 
 /**
+ * How many `refs/stash` entries the divergence diagnosis reads a path list for.
+ * Bounded because each one costs its own `git stash show`; branch attribution
+ * comes from the single `git stash list` and is never capped.
+ */
+const STASH_INSPECTION_LIMIT = 10;
+
+/** How many matching entries the message names before summarising the rest. */
+const STASH_NAMED_LIMIT = 3;
+
+/** One `refs/stash` entry, as the divergence diagnosis reads it. */
+interface StashEntry {
+	/** The selector `git stash apply` takes — `stash@{0}`. */
+	ref: string;
+	/** The reflog subject: `On <branch>: <message>` or `WIP on <branch>: <sha> <subject>`. */
+	subject: string;
+	/** The branch the subject names; undefined for `(no branch)` (a detached checkout) or an unparseable subject. */
+	branch?: string;
+	/** Repository paths the entry holds; undefined when git would not list them. */
+	paths?: readonly string[];
+}
+
+/** `On <branch>: …` / `WIP on <branch>: …` — git's own two reflog subject shapes. */
+const STASH_SUBJECT_BRANCH = /^(?:WIP on|On) (.+?): /;
+
+/**
+ * Every `refs/stash` entry, newest first, with a path list read for the newest
+ * {@link STASH_INSPECTION_LIMIT}.
+ *
+ * `refs/stash` is a *shared* ref — it lives in the main repository's `.git`, not
+ * in a linked worktree — so an agent that stashed inside the task worktree is
+ * still listed from that worktree, and its entry's reflog subject names the branch
+ * the worktree was on. A repository with no stash prints nothing and exits 0.
+ */
+async function readStashEntries(cwd: string): Promise<StashEntry[]> {
+	const raw = await git(cwd, ['stash', 'list', '--format=%gd%x1f%gs']);
+	const entries: StashEntry[] = [];
+	for (const line of raw.split('\n')) {
+		// Neither field can contain a newline or a unit separator, so this splits cleanly.
+		const [ref, subject] = line.split('\x1f');
+		if (!ref || subject === undefined) continue;
+		const named = STASH_SUBJECT_BRANCH.exec(subject)?.[1];
+		entries.push({
+			ref,
+			subject,
+			branch: named === undefined || named === '(no branch)' ? undefined : named,
+		});
+	}
+	for (const entry of entries.slice(0, STASH_INSPECTION_LIMIT)) {
+		try {
+			// `--include-untracked` needs git >= 2.32; an older git leaves `paths`
+			// undefined and the entry is still attributable by its branch.
+			const paths = await git(cwd, [
+				'stash',
+				'show',
+				'--include-untracked',
+				'--name-only',
+				'-z',
+				'--format=',
+				entry.ref,
+			]);
+			entry.paths = paths.split('\0').filter((path) => path.length > 0);
+		} catch {
+			// One unreadable entry must not cost the diagnosis the others.
+		}
+	}
+	return entries;
+}
+
+/** How an entry is attributed to (or away from) the task's branch, for the message. */
+function describeStashBranch(entry: StashEntry, branch: string): string {
+	if (entry.branch === branch) return `on this task's branch '${branch}'`;
+	if (entry.branch) return `on branch '${entry.branch}', not '${branch}'`;
+	return 'on no branch (a detached checkout)';
+}
+
+/** `stash@{0} ("On issue-699: wip", on this task's branch 'issue-699') holds 28 path(s), 28 of which this checkpoint records`. */
+function describeStashEntry(
+	entry: StashEntry,
+	branch: string,
+	unaccounted: ReadonlySet<string>,
+): string {
+	const head = `${entry.ref} ("${entry.subject}", ${describeStashBranch(entry, branch)})`;
+	if (!entry.paths) return `${head} — its path list could not be read`;
+	const overlap = entry.paths.filter((path) => unaccounted.has(normalizePath(path))).length;
+	return `${head} holds ${entry.paths.length} path(s), ${overlap} of which this checkpoint records`;
+}
+
+/**
+ * The self-diagnosing half of a divergence (issue #705): say whether the recorded
+ * work that is no longer in the tree is sitting in a git stash, and if so how to
+ * get it back.
+ *
+ * An agent that runs `git stash` inside its task worktree — to check whether a
+ * failure predates its change, say — and is stopped before restoring it leaves
+ * exactly the state the guard refuses: a checkpoint recording paths, over a tree
+ * that no longer changes them. The stash survives (`refs/stash` is shared, not
+ * per-worktree) but nothing pointed at it, so every retry failed identically and
+ * recovery meant reading the reflog by hand.
+ *
+ * An entry **matches** when its subject names `branch` *or* its paths overlap
+ * `unaccounted`. Both, because each covers the other's blind spot: a checkout
+ * detached at `origin/<branch>` (issue #558) stashes as `(no branch)`, so only the
+ * paths identify it, while a stash taken without `-u` holds none of the untracked
+ * `added` paths, so only the branch does.
+ *
+ * Deliberately **reports** rather than acts: nothing here can know the stash is
+ * this checkpoint's work rather than something older, so applying it could bury a
+ * tree under an unrelated diff. And it is **fail-soft** — every git call is
+ * wrapped, a failure yields a clause saying the check could not run, and no path
+ * through it changes the verdict or throws.
+ */
+async function describeUnaccountedWork(
+	cwd: string,
+	branch: string,
+	unaccounted: readonly string[],
+): Promise<string> {
+	let entries: StashEntry[];
+	try {
+		entries = await readStashEntries(cwd);
+	} catch (error) {
+		return `Could not check whether that work is in a git stash: ${error instanceof Error ? error.message : String(error)}`;
+	}
+
+	if (entries.length === 0)
+		return 'No git stash exists in this repository, so the missing work is not stashed';
+
+	const recorded = new Set(unaccounted.map(normalizePath));
+	const matches = entries.filter(
+		(entry) =>
+			entry.branch === branch ||
+			(entry.paths ?? []).some((path) => recorded.has(normalizePath(path))),
+	);
+
+	if (matches.length === 0) {
+		const inspected = Math.min(entries.length, STASH_INSPECTION_LIMIT);
+		// No silent truncation: say so whenever the cap actually bit.
+		const capped =
+			entries.length > inspected
+				? ` (paths compared for the newest ${inspected} of ${entries.length} entries)`
+				: '';
+		const count =
+			entries.length === 1
+				? '1 git stash entry exists'
+				: `${entries.length} git stash entries exist`;
+		return `${count} in this repository, but none is on branch '${branch}' or holds a path this checkpoint records, so the missing work is not stashed${capped}`;
+	}
+
+	const named = matches
+		.slice(0, STASH_NAMED_LIMIT)
+		.map((entry) => describeStashEntry(entry, branch, recorded))
+		.join('; ');
+	const beyond = matches.length - STASH_NAMED_LIMIT;
+	const rest =
+		beyond > 0
+			? `, and ${beyond} further entr${beyond === 1 ? 'y also matches' : 'ies also match'}`
+			: '';
+	const recovery = `git -C ${cwd} stash apply '${(matches[0] as StashEntry).ref}'`;
+	logger.warn('The work a checkpoint records is missing from the tree but appears to be stashed', {
+		cwd,
+		branch,
+		stashRef: (matches[0] as StashEntry).ref,
+		stashSubject: (matches[0] as StashEntry).subject,
+		matchedEntries: matches.length,
+		unaccountedPaths: unaccounted.length,
+		recovery,
+	});
+	return `The missing work appears to be in a git stash: ${named}${rest}. Restore it in the worktree with \`${recovery}\` and retry this phase; SWARM never applies a stash for you. If it is not this phase's work, start the phase over instead`;
+}
+
+/**
  * Decide whether the preserved checkout at `cwd` may be continued from its
  * checkpoint by `phase`. Three things must hold, in this order:
  *
@@ -218,10 +388,28 @@ function normalizePath(path: string): string {
  * never runs against a tree the checkpoint does not describe — without blocking on
  * an honest under-report. Failures (2) and (3) both report
  * `checkpoint-divergent`, whose message names the specific mismatch.
+ *
+ * **A divergence also says where the missing work went** (issue #705). The two
+ * failures that mean "the recorded work is not in the tree" — a clean tree, and
+ * recorded paths the tree no longer changes — append
+ * {@link describeUnaccountedWork}'s diagnosis, which reports whether a git stash
+ * holds that work and names the command that restores it. The other failures do
+ * not: a parse failure and a wrong-phase checkpoint say nothing about missing
+ * work, and an unreadable `git status` means git is already broken, so that branch
+ * returns before the probe. The probe never applies, pops, or drops a stash, and
+ * is fail-soft — it cannot change the verdict, which stays byte-for-byte the
+ * refusal it has always been.
+ *
+ * `branch` is the branch the checkout *targets*, supplied by the caller for the
+ * same reason `resolveReuseHandle` (`src/pipeline/resume.ts`) takes it rather than
+ * asking git: since issue #558 a checkout can be detached while still targeting a
+ * branch, so a git-derived label would be a head SHA for exactly those checkouts
+ * and the diagnosis would report "no stash for branch `abc1234`".
  */
 export async function validateCheckpointForContinuation(
 	cwd: string,
 	phase: TriggerPhase,
+	branch: string,
 ): Promise<CheckpointValidation> {
 	if (!hasCheckpoint(cwd))
 		return {
@@ -266,7 +454,7 @@ export async function validateCheckpointForContinuation(
 		return {
 			valid: false,
 			reason: 'checkpoint-divergent',
-			detail: `the working tree in ${cwd} is clean, but ${CHECKPOINT_FILENAME} records ${recorded.length} changed path(s)`,
+			detail: `the working tree in ${cwd} is clean, but ${CHECKPOINT_FILENAME} records ${recorded.length} changed path(s). ${await describeUnaccountedWork(cwd, branch, recorded)}`,
 		};
 
 	const missing = recorded.filter((path) => !present.has(path));
@@ -274,7 +462,7 @@ export async function validateCheckpointForContinuation(
 		return {
 			valid: false,
 			reason: 'checkpoint-divergent',
-			detail: `${CHECKPOINT_FILENAME} records path(s) the working tree no longer changes: ${missing.join(', ')}`,
+			detail: `${CHECKPOINT_FILENAME} records path(s) the working tree no longer changes: ${missing.join(', ')}. ${await describeUnaccountedWork(cwd, branch, missing)}`,
 		};
 
 	return { valid: true, checkpoint };

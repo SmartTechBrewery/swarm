@@ -18,6 +18,14 @@
  * arrives without warning, so the file has to be current *before* it does; don't
  * "improve" this into a wind-down decision the agent has to make.
  *
+ * {@link checkpointInstructions} also carries the *worktree-state* directive
+ * (issue #705): don't leave the worktree's changes stashed. It lives here rather
+ * than beside `GH_IDENTITY_GUARD` (`src/pipeline/agent-auth.ts`) because its
+ * reason *is* the checkpoint — a stash that outlives the run turns the next
+ * continuation into a `checkpoint-divergent` block — and because this block is
+ * spliced by exactly the four phases that write a checkpoint, including
+ * `resolve-conflicts`, which deliberately carries no identity guard.
+ *
  * Every returned element is a self-contained paragraph with no internal
  * newlines, so a call site can spread it into a `'\n'`-joined line array
  * (implementation, respond-to-review, respond-to-ci) or a `'\n\n'`-joined
@@ -37,6 +45,8 @@ export function checkpointInstructions(phase: TriggerPhase): readonly string[] {
 		`Throughout the work above, keep a rolling progress checkpoint in "${CHECKPOINT_FILENAME}" at the worktree root. After each completed step — and, once at least one repository path has changed, before starting any long operation — rewrite the whole file (never append) so it always describes where you actually are. Do not create one before a completed step.`,
 		`Write it as JSON with: phase (exactly "${phase}"), completed (a non-empty array of the steps already done), remaining (a non-empty array of what is still left, in order), decisions (an array of choices or caveats worth not re-deriving; may be empty), and workingTree ({"modified":[…],"added":[…],"deleted":[…]} — the repository paths you have changed so far, naming at least one path).`,
 		'It exists so that if this run is stopped involuntarily — a usage limit, a wall-clock timeout, an interruption — SWARM can continue from the recorded remainder instead of re-doing your work. Update it only at a safe boundary: never mid-edit and never mid-command.',
+		"Because that stop arrives without warning and the continuation is a fresh session in this same worktree, never leave this worktree's changes stashed. Do not `git stash` your work aside — not even briefly, and not to check whether a failure predates your change — unless you restore it before the same step ends. A continuation that finds a clean tree while the checkpoint records changed paths is refused outright, and your work then sits in a stash nobody is looking for.",
+		'To check whether something also fails without your changes, compare against a separate checkout (or the base branch in a scratch clone) rather than mutating this worktree.',
 		`Keep it short and factual. It is not a design document, and it is not this phase's hand-off — the hand-off file named above is still what reports the outcome. Do NOT \`git add\` or commit "${CHECKPOINT_FILENAME}".`,
 	];
 }

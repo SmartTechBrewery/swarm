@@ -385,6 +385,23 @@ describe("executeRecoveryGate — the 'checkpoint' continuation branch (issue #5
 		expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
 	});
 
+	// The whole point of threading `branch` into the guard: the refusal an operator
+	// reads off `runs.error` has to name where the missing work went (issue #705).
+	it('names the stash and the recovery command when the work was stashed away', async () => {
+		const path = preservedCheckout();
+		fixtureGit(path, ['checkout', '-q', '-b', 'issue-19']);
+		fixtureGit(path, ['stash', 'push', '--include-untracked', '-q', '-m', 'wip-19']);
+		writeFileSync(join(path, CHECKPOINT_FILENAME), JSON.stringify(CHECKPOINT));
+		const thrown = await gate(path, 'checkpoint', undefined).then(
+			() => undefined,
+			(error: Error) => error,
+		);
+		expect(thrown).toMatchObject({ name: 'BlockedRecoveryError', reason: 'checkpoint-divergent' });
+		expect(thrown?.message).toContain('On issue-19: wip-19');
+		expect(thrown?.message).toContain(`git -C ${path} stash apply 'stash@{0}'`);
+		expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '19');
+	});
+
 	it("refuses another phase's checkpoint left in the reused checkout", async () => {
 		const path = preservedCheckout(CHECKPOINT);
 		await expect(gate(path, 'checkpoint', undefined, 'respond-to-ci')).rejects.toMatchObject({
