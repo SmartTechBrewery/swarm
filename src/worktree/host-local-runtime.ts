@@ -6,13 +6,34 @@
  * issue #427 exists because a held lease with no owner and no expiry wedged every
  * later run for a task until it lapsed. A file on disk has no TTL of its own, so
  * each artifact records `createdAt` and every reader treats an expired one as
- * reclaimable. Liveness (a pid check, or this process's own in-flight set) is the
- * *fast* path; the timestamp is the backstop for what liveness cannot see — a
- * reused pid, a crash between two syscalls, a truncated write.
+ * reclaimable. Liveness (a pid check, or this process's own in-flight set) still
+ * answers sooner and more precisely than the clock — it can call an owner gone the
+ * moment it is, with no TTL to wait out — but the timestamp is consulted **first**
+ * on every path, so no liveness answer is unbounded. It is the backstop for what
+ * liveness cannot see: a reused pid, a crash between two syscalls, a truncated
+ * write, an in-flight entry this process never cleaned up.
+ *
+ * **That ordering is a rule for future edits, not an implementation detail**
+ * (issue #717). The same-process branch used to return before the TTL, on the
+ * premise that this process knows the truth about its own dispatches. The premise
+ * fails the moment that in-flight set leaks an entry — and the leak is not exotic:
+ * the recorded `pid` is the worker *daemon*'s (`../transport/connect-entry.ts`),
+ * which outlives every phase it dispatches, so on a worker host that branch is the
+ * one virtually every lease takes. One leaked entry therefore reported "live" with
+ * no bound at all: task `702-conflicts` stayed wedged 8h42m — past twice this TTL —
+ * and cleared only when its daemon restarted, because no control-plane action
+ * (dashboard "Reset & restart", `swarm run reset`, `swarm worktrees prune`) reaches
+ * a file on a worker host. That is #427's failure class a second time, on the lease
+ * that replaced the Redis one. So: a branch may answer *sooner* than the expiry,
+ * never be *exempt* from it.
  *
  * Expiring an artifact never force-removes work: the reclaim gate behind this one
  * (`./reclaim.ts`) still refuses a checkout that is dirty or carries unpushed
- * commits, so the worst an expiry can do is stop a *marker* from blocking.
+ * commits, so the worst an expiry can do is stop a *marker* from blocking. Nor does
+ * bounding liveness cut a real phase short — a configured per-phase timeout caps at
+ * 45 minutes (`AgentConfigSchema`, `../config/schema.ts`), far inside the lease TTL,
+ * and the Redis lease this mirrors was never heartbeated either: it lapsed under a
+ * live phase too.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
@@ -28,7 +49,8 @@ import type { WorktreeRuntime } from './worktree-runtime.js';
 /**
  * Mirrors `LEASE_TTL_SEC` in `./worktree-lease.ts` — long enough to outlive the
  * longest realistic single-phase agent run, so it only ever fires on an artifact
- * whose owner is genuinely gone.
+ * whose owner is genuinely gone. It bounds **every** liveness answer this module
+ * gives, this daemon's own in-flight set included (issue #717); see the header.
  */
 const LEASE_TTL_MS = 4 * 60 * 60 * 1000;
 
@@ -123,12 +145,18 @@ export function createHostLocalWorktreeRuntime(
 	}
 
 	function ownerIsLive(owner: LocalLease): boolean {
-		// This process knows the truth about its own dispatches, so the in-flight set
-		// outranks the TTL: a phase that legitimately outruns it is still live.
-		if (owner.pid === process.pid) return options.isOwnerLive(owner.ownerId);
-		// Cross-process, `pid` is only a heuristic (it can be recycled), so the
-		// timestamp bounds how long a stale lease can impersonate a live one.
+		// The expiry comes first, ahead of **both** liveness answers (issue #717) —
+		// neither can be trusted to notice on its own that the owner is gone. See the
+		// module header for why the same-process branch in particular cannot: `pid` is
+		// the daemon's rather than the phase's, so a single leaked in-flight entry used
+		// to answer "live" without bound. Past the TTL no answer is worth asking for.
 		if (isExpired(owner.createdAt, LEASE_TTL_MS)) return false;
+		// Within the bound, this process knows the truth about its own dispatches, so
+		// the in-flight set answers ahead of a pid check: it can also report a dispatch
+		// *gone* immediately, with no TTL to wait out.
+		if (owner.pid === process.pid) return options.isOwnerLive(owner.ownerId);
+		// Cross-process, `pid` is only a heuristic (it can be recycled), which is the
+		// other thing the timestamp above is bounding.
 		return pidIsLive(owner.pid);
 	}
 

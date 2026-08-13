@@ -415,8 +415,12 @@ describe('GitWorktreeManager', () => {
 				.catch((error) => error);
 			expect(err).toBeInstanceOf(BlockedRecoveryError);
 			expect(err.message).toContain('provisioning');
-			expect(err.message).toContain('already in progress');
+			expect(err.message).toContain('did not acquire the task lease');
 			expect(err.message).not.toContain('existing checkout');
+			// Never send the operator to wait for a provisioner that may not exist, or
+			// to go clearing lease files by hand: the lease is bounded (issue #717).
+			expect(err.message).not.toMatch(/wait for/i);
+			expect(err.message).toMatch(/outlives its expiry/);
 		});
 
 		describe('stale-lease take-over (issue #427)', () => {

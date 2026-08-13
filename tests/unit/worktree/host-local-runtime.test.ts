@@ -165,6 +165,28 @@ describe('host-local worktree runtime', () => {
 			expect(await other.isResumablePinned('swarm', '539')).toBe(false);
 		});
 
+		it("bounds this daemon's own in-flight liveness answer by the lease TTL (issue #717)", async () => {
+			// The leak itself (#718): the entry outlives the phase, and a lease written
+			// here records *this* process's pid — the daemon's, which outlives every
+			// dispatch — so the same-process branch is the one this lease takes.
+			const live = new Set(['dispatch-leaked']);
+			await runtime('dispatch-leaked', live, 'run-leaked').claim('swarm', '702', 'token-leaked');
+
+			const next = runtime('dispatch-next', live, 'run-next');
+			// A young lease still blocks: a genuinely live phase is protected as before.
+			expect(await next.hasLiveOwner('swarm', '702')).toBe(true);
+			expect(await next.isLeased('swarm', '702')).toBe(true);
+			expect(await next.takeOver('swarm', '702', 'token-leaked', 'token-next')).toBe(false);
+
+			// Past the TTL the leaked entry stops answering, so the task recovers by
+			// itself instead of waiting on a daemon restart.
+			advance(5 * HOUR_MS);
+			expect(await next.hasLiveOwner('swarm', '702')).toBe(false);
+			expect(await next.isLeased('swarm', '702')).toBe(false);
+			await expect(next.claim('swarm', '702', 'token-next')).resolves.toBeUndefined();
+			expect(await next.read('swarm', '702')).toBe('token-next');
+		});
+
 		it('adopts a lease whose owning pid is gone but only after the lease TTL', async () => {
 			const owner = runtime('i', new Set(['i']));
 			await owner.claim('swarm', '540', 'token-i');

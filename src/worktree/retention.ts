@@ -24,7 +24,10 @@ import type { WorktreeRuntime } from './worktree-runtime.js';
  * whose recorded pid is *this* process's, and this process holds no leases of its
  * own — so such a lease is a recycled-pid coincidence, and the reclaim gate's
  * fail-closed rule (`./reclaim.ts`) says skip the prune rather than risk a live
- * checkout. `ownerId` is likewise never written: nothing here claims or takes over.
+ * checkout. That `true` is bounded like every other liveness answer since issue
+ * #717: the runtime checks the lease expiry before asking at all, so a coincidence
+ * can make the sweep skip a checkout for at most the lease TTL rather than forever.
+ * `ownerId` is likewise never written: nothing here claims or takes over.
  */
 export function retentionWorktreeRuntime(project: ProjectConfig): WorktreeRuntime {
 	return createHostLocalWorktreeRuntime({
