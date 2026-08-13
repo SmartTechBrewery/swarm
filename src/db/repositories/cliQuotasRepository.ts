@@ -1,29 +1,33 @@
-import { eq } from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import type { CliQuotaSnapshot } from '../../harness/quota.js';
 import { getDb } from '../client.js';
 import { cliQuotas } from '../schema/cliQuotas.js';
 
 /**
- * Get all CLI quota snapshots currently persisted in the database.
+ * A stored snapshot together with the machine it describes (issue #703).
+ *
+ * The host is attached here, at the persistence boundary, rather than inside
+ * {@link CliQuotaSnapshot}: that type is discovery's output, and discovery does
+ * not own the storage key. The snapshot's own fields stay top-level so every
+ * reader keeps reading `cli`/`status`/`windows` exactly as before.
  */
-export async function getAllCliQuotas(): Promise<CliQuotaSnapshot[]> {
-	const rows = await getDb().select().from(cliQuotas).orderBy(cliQuotas.cli);
-	return rows.map((r) => r.snapshot);
+export type HostCliQuotaSnapshot = CliQuotaSnapshot & { host: string };
+
+/**
+ * Get every persisted CLI quota snapshot, each attributed to the host that
+ * discovered it, ordered by `(host, cli)`.
+ */
+export async function getAllCliQuotas(): Promise<HostCliQuotaSnapshot[]> {
+	const rows = await getDb().select().from(cliQuotas).orderBy(cliQuotas.host, cliQuotas.cli);
+	return rows.map((r) => ({ ...r.snapshot, host: r.host }));
 }
 
 /**
- * Get a specific CLI's quota snapshot.
- */
-export async function getCliQuota(cli: AgentCli): Promise<CliQuotaSnapshot | null> {
-	const rows = await getDb().select().from(cliQuotas).where(eq(cliQuotas.cli, cli)).limit(1);
-	return rows[0]?.snapshot ?? null;
-}
-
-/**
- * Upsert a CLI's quota snapshot.
+ * Upsert one host's snapshot for one CLI. Two hosts reporting the same `cli`
+ * are two rows; a re-run on one host replaces only that host's row.
  */
 export async function upsertCliQuota(
+	host: string,
 	cli: AgentCli,
 	status: 'available' | 'unavailable' | 'error',
 	snapshot: CliQuotaSnapshot,
@@ -31,13 +35,14 @@ export async function upsertCliQuota(
 	await getDb()
 		.insert(cliQuotas)
 		.values({
+			host,
 			cli,
 			status,
 			snapshot,
 			updatedAt: new Date(),
 		})
 		.onConflictDoUpdate({
-			target: cliQuotas.cli,
+			target: [cliQuotas.host, cliQuotas.cli],
 			set: {
 				status,
 				snapshot,

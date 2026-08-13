@@ -351,6 +351,13 @@
       "when": 1786601747067,
       "tag": "0049_low_nightcrawler",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1786611272879,
+      "tag": "0050_cli_quota_host",
+      "breakpoints": true
     }
   ]
 }

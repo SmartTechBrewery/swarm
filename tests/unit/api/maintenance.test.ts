@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { startHostMaintenance } from '@/api/maintenance.js';
@@ -34,6 +35,7 @@ function createCollaborators(projects: ProjectConfig[]) {
 		]),
 		persistQuota: vi.fn<
 			(
+				host: string,
 				cli: CliQuotaSnapshot['cli'],
 				status: CliQuotaSnapshot['status'],
 				snapshot: CliQuotaSnapshot,
@@ -95,7 +97,10 @@ describe('startHostMaintenance', () => {
 
 		expect(collaborators.discoverQuotas).toHaveBeenCalledTimes(1);
 		expect(collaborators.discoverQuotas).toHaveBeenLastCalledWith(false);
+		// Issue #703: the snapshot is a host-local fact, so the probing machine is
+		// stamped on it rather than the row standing for the whole installation.
 		expect(collaborators.persistQuota).toHaveBeenCalledWith(
+			hostname(),
 			'claude',
 			'available',
 			expect.objectContaining({ cli: 'claude' }),

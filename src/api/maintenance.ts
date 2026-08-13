@@ -28,7 +28,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failOrphanedRunningRuns } from '../db/repositories/runsRepository.js';
-import { discoverCliQuotas } from '../harness/quota-discovery.js';
+import { discoverCliQuotas, discoveryHost } from '../harness/quota-discovery.js';
 import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -124,15 +124,20 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 		}
 	}
 
-	/** Probe the host's agent CLIs and persist their capability/quota snapshots. */
+	/**
+	 * Probe this host's agent CLIs and persist their capability/quota snapshots
+	 * against it — the snapshot describes one machine's installation, so it is
+	 * stored under that machine's name rather than the installation's (issue #703).
+	 */
 	async function runQuotaDiscovery(cheap: boolean): Promise<void> {
 		try {
-			logger.debug('Starting CLI capability/quota discovery...', { cheap });
+			const host = discoveryHost();
+			logger.debug('Starting CLI capability/quota discovery...', { cheap, host });
 			const snapshots = await discoverQuotas(cheap);
 			for (const snapshot of snapshots) {
-				await persistQuota(snapshot.cli, snapshot.status, snapshot);
+				await persistQuota(host, snapshot.cli, snapshot.status, snapshot);
 			}
-			logger.debug('CLI capability/quota discovery completed and persisted.');
+			logger.debug('CLI capability/quota discovery completed and persisted.', { host });
 		} catch (err) {
 			logger.error('Failed to run CLI capability/quota discovery', {
 				error: describeError(err),
