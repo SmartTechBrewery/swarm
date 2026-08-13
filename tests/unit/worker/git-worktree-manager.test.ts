@@ -150,7 +150,7 @@ describe('GitWorktreeManager', () => {
 	});
 
 	describe('provision', () => {
-		it('sanity-checks, fetches, then creates a fresh branch off baseBranch by default', async () => {
+		it('sanity-checks, fetches, then creates a fresh branch off the fetched base by default', async () => {
 			const handle = await makeManager().provision('14');
 
 			expect(gitCalls).toEqual([
@@ -158,8 +158,11 @@ describe('GitWorktreeManager', () => {
 				// The sanity check also confirms this is the *assigned* repo (issue #535).
 				['remote', 'get-url', 'origin'],
 				['fetch', 'origin'],
+				// The base is read through the remote-tracking ref the fetch just moved,
+				// not the local branch of that name, which the fetch never advances.
+				['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
 				['branch', '--list', 'issue-14'],
-				['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main'],
+				['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'origin/main'],
 			]);
 			expect(handle).toEqual({
 				taskId: '14',
@@ -172,7 +175,7 @@ describe('GitWorktreeManager', () => {
 		it('checks out baseBranch in detached HEAD when detach is set (planning phase)', async () => {
 			const handle = await makeManager().provision('14', { detach: true });
 
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, 'main']);
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, 'origin/main']);
 			expect(handle).toEqual({
 				taskId: '14',
 				path: WORKTREE_14,
@@ -188,7 +191,13 @@ describe('GitWorktreeManager', () => {
 				branch: 'ignored',
 				baseBranch: 'develop',
 			});
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, 'develop']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'--detach',
+				WORKTREE_14,
+				'origin/develop',
+			]);
 		});
 
 		it('checks out an existing branch when createBranch is false (review phase)', async () => {
@@ -288,7 +297,53 @@ describe('GitWorktreeManager', () => {
 
 		it('honours explicit branch and baseBranch overrides', async () => {
 			await makeManager().provision('14', { branch: 'hotfix', baseBranch: 'develop' });
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'hotfix', WORKTREE_14, 'develop']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'-b',
+				'hotfix',
+				WORKTREE_14,
+				'origin/develop',
+			]);
+		});
+
+		// A fetch only advances `refs/remotes/origin/*`, so cutting from the bare branch
+		// name started every task off whatever this host last pulled — many commits
+		// behind the real base on a host that had not pulled, which surfaced as merge
+		// conflicts the pipeline then spent a Resolve-conflicts phase on.
+		it('cuts the branch from the remote-tracking base, not the local branch of that name', async () => {
+			await makeManager().provision('14');
+
+			expect(gitCalls).toContainEqual([
+				'rev-parse',
+				'--verify',
+				'--quiet',
+				'refs/remotes/origin/main',
+			]);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'-b',
+				'issue-14',
+				WORKTREE_14,
+				'origin/main',
+			]);
+		});
+
+		it('falls back to the literal base when origin has no ref of that name', async () => {
+			// What the Review phase passes: a head SHA, which names no remote branch.
+			// Prefixing it with `origin/` would make every review provision fail.
+			gitHandler = (args) => {
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'rev-parse' && args[1] === '--verify') {
+					throw new Error('fatal: unknown revision');
+				}
+				return { stdout: '' };
+			};
+
+			await makeManager().provision('14', { detach: true, baseBranch: 'deadbee' });
+
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, 'deadbee']);
 		});
 
 		it('skips the fetch when fetch is false', async () => {
@@ -318,7 +373,14 @@ describe('GitWorktreeManager', () => {
 			// Atomically acquired the lease, removed the stale checkout, then re-added.
 			expect(tryClaimWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '14', expect.any(String));
 			expect(gitCalls).toContainEqual(['worktree', 'remove', '--force', WORKTREE_14]);
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'-b',
+				'issue-14',
+				WORKTREE_14,
+				'origin/main',
+			]);
 			expect(handle.path).toBe(WORKTREE_14);
 			expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
 		});
@@ -382,7 +444,14 @@ describe('GitWorktreeManager', () => {
 					expect.any(String),
 				);
 				expect(gitCalls).toContainEqual(['worktree', 'remove', '--force', WORKTREE_14]);
-				expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+				expect(gitCalls.at(-1)).toEqual([
+					'worktree',
+					'add',
+					'-b',
+					'issue-14',
+					WORKTREE_14,
+					'origin/main',
+				]);
 				expect(handle.path).toBe(WORKTREE_14);
 				expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
 			});
@@ -394,7 +463,14 @@ describe('GitWorktreeManager', () => {
 
 				expect(takeOverWorktreeLeaseMock).toHaveBeenCalled();
 				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
-				expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+				expect(gitCalls.at(-1)).toEqual([
+					'worktree',
+					'add',
+					'-b',
+					'issue-14',
+					WORKTREE_14,
+					'origin/main',
+				]);
 				expect(handle.path).toBe(WORKTREE_14);
 			});
 
@@ -592,7 +668,14 @@ describe('GitWorktreeManager', () => {
 			expect(gitCalls).toContainEqual(['branch', '--list', 'issue-14']);
 			expect(gitCalls).toContainEqual(['ls-remote', '--heads', 'origin', 'issue-14']);
 			expect(gitCalls).toContainEqual(['branch', '-D', 'issue-14']);
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'-b',
+				'issue-14',
+				WORKTREE_14,
+				'origin/main',
+			]);
 			expect(handle.branch).toBe('issue-14');
 		});
 
@@ -728,7 +811,14 @@ describe('GitWorktreeManager', () => {
 			const handle = await manager.provision('14');
 			expect(handle.path).toBe(WORKTREE_14);
 			expect(gitCalls).toContainEqual(['branch', '-D', 'issue-14']);
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '-b', 'issue-14', WORKTREE_14, 'main']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'-b',
+				'issue-14',
+				WORKTREE_14,
+				'origin/main',
+			]);
 		});
 
 		it('detached HEAD: blocks reclaim/retention if HEAD has unpushed commits, succeeds if reachable', async () => {

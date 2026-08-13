@@ -99,7 +99,15 @@ export interface ProvisionOptions {
 	 * a PR branch for the review / respond-to-review phases).
 	 */
 	createBranch?: boolean;
-	/** Ref the new branch is cut from when `createBranch` is true. Defaults to the project's `baseBranch`. */
+	/**
+	 * Ref the new branch is cut from when `createBranch` is true. Defaults to the
+	 * project's `baseBranch`.
+	 *
+	 * Read through `origin/<baseBranch>` when that remote-tracking ref exists, so the
+	 * branch starts from the fetched base rather than from whatever this host last
+	 * pulled into its local branch. A value that names no remote branch — the Review
+	 * phase passes a head SHA — is used verbatim.
+	 */
 	baseBranch?: string;
 	/**
 	 * Check out `baseBranch` in **detached HEAD** instead of on a branch — for a
@@ -117,6 +125,11 @@ export interface ProvisionOptions {
 	 * Run `git fetch origin` before creating the worktree so the branch is cut
 	 * from up-to-date refs (§4.2 step 1). Defaults to true; the fetch is
 	 * best-effort — a failure (e.g. no remote yet) is logged, not fatal.
+	 *
+	 * What the fetch updates is `refs/remotes/origin/*` only, which is why the base
+	 * is resolved through `origin/<baseBranch>` rather than the local branch of that
+	 * name: fetching and then cutting from the local ref leaves the fetch with no
+	 * effect on where the branch starts.
 	 */
 	fetch?: boolean;
 	/**
@@ -359,6 +372,21 @@ export class GitWorktreeManager {
 			);
 		}
 
+		// The ref the base is actually read from. `provision` fetched `origin` above so
+		// the branch would be cut "from up-to-date refs", but a fetch only advances
+		// `refs/remotes/origin/*` — it never moves the local `main`, so starting from
+		// the bare branch name cut every task off whatever this host last pulled. On a
+		// host that had not pulled in a while that is silently many commits behind the
+		// real base, which lands as merge conflicts the pipeline then spends a
+		// Resolve-conflicts phase on. Prefer the remote-tracking ref and fall back to
+		// the literal — the same idiom `hasUnpushedWork` already uses below. The
+		// fallback is load-bearing rather than defensive: `baseBranch` is not always a
+		// branch (the Review phase detaches at a head SHA, `src/pipeline/review.ts`),
+		// and `refs/remotes/origin/<sha>` never resolves.
+		const baseRef = (await this.refExists(`refs/remotes/origin/${baseBranch}`))
+			? `origin/${baseBranch}`
+			: baseBranch;
+
 		const explicitlyDetached = options.detach ?? false;
 		// Detached HEAD has no branch; the handle reports the base ref it points at.
 		const branch = explicitlyDetached
@@ -375,7 +403,7 @@ export class GitWorktreeManager {
 		// What `git worktree add` can actually be asked for, which is not always what
 		// the caller asked for (issue #558) — see {@link resolveBranchCheckout}.
 		const checkout = explicitlyDetached
-			? { mode: 'detach' as const, ref: baseBranch }
+			? { mode: 'detach' as const, ref: baseRef }
 			: await this.resolveBranchCheckout(branch, createBranch, localBranchExists);
 		const detached = checkout.mode === 'detach';
 
@@ -383,7 +411,7 @@ export class GitWorktreeManager {
 		if (checkout.mode === 'detach') {
 			args.push('--detach', path, checkout.ref);
 		} else if (checkout.mode === 'create') {
-			args.push('-b', branch, path, baseBranch);
+			args.push('-b', branch, path, baseRef);
 		} else {
 			args.push(path, branch);
 		}
