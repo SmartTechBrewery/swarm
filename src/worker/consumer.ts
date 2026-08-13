@@ -2951,6 +2951,13 @@ async function gateDispatch(
 		decision = await evaluateDispatchEligibility(
 			{
 				projectId: project.id,
+				// The task's own repository (issue #714), so a machine whose one checkout is
+				// a different one is skipped here instead of being selected, claimed, and
+				// then refusing the assignment terminally (issue #688). `project` was scoped
+				// to the job's repository at the top of `processDispatch` (issue #684 phase
+				// 2), so this is already that repository rather than the default entry — no
+				// new read.
+				repository: project.repo,
 				// Names this dispatch inside the project's runnable set, so pool-aware
 				// selection can hand it its own share of the pool (issue #533).
 				dispatchId,

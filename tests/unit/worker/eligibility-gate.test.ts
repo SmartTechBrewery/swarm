@@ -41,6 +41,11 @@ import {
 const ALICE = '11111111-1111-4111-8111-111111111111';
 const BOB = '22222222-2222-4222-8222-222222222222';
 
+/** The task's repository — the scoped project's own entry (issues #684, #714). */
+const REPOSITORY = 'smarttechbrewery/swarm';
+/** A second repository of the same project, held by a different machine. */
+const OTHER_REPOSITORY = 'smarttechbrewery/dashboard';
+
 /** The PM provider seam the gate reads — only these two fields. */
 const PM = { type: 'github-projects', supportsAssignees: true } as Pick<
 	PMProvider,
@@ -53,6 +58,7 @@ function makeCandidate(
 		ownerUserId?: string;
 		capabilities?: Worker['capabilities'];
 		supportedPhases?: Worker['supportedPhases'];
+		repository?: Worker['repository'];
 		enrollment?: Partial<WorkerEnrollment>;
 		connected?: boolean;
 		activeRuns?: number;
@@ -65,7 +71,10 @@ function makeCandidate(
 			displayName: `worker-${id}`,
 			capabilities: overrides.capabilities ?? ['claude'],
 			supportedPhases: overrides.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
-			repository: null,
+			// A single-repository project, which is the regression bar for every case in this
+			// file that says nothing about repositories: the declared checkout always is the
+			// task's, so the #714 check is satisfied rather than merely skipped.
+			repository: overrides.repository === undefined ? REPOSITORY : overrides.repository,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
 		},
@@ -101,6 +110,7 @@ const ASSIGNED_ITEM: Pick<WorkItem, 'assignees'> = { assignees: [{ handle: 'octo
 function gateInput(overrides: Partial<DispatchGateInput> = {}): DispatchGateInput {
 	return {
 		projectId: 'swarm',
+		repository: REPOSITORY,
 		targets: [{}] satisfies AgentTarget[],
 		phaseDefaultCli: 'claude',
 		phase: 'implementation',
@@ -168,6 +178,9 @@ describe('isAvailabilityRefusal', () => {
 		'missing-phase-capability',
 		'phase-not-permitted',
 		'missing-cli-capability',
+		// Issue #714: a checkout is re-declared only at handshake, so no machine coming
+		// online clears this — somebody has to point a worker at the repository.
+		'repository-mismatch',
 	];
 
 	it('classifies every reason in the union, and no reason twice', () => {
@@ -701,6 +714,69 @@ describe('evaluateDispatchEligibility', () => {
 		});
 	});
 
+	// Issue #714. A machine holds one checkout, so a task for another repository can run
+	// no phase on it. The gate skips such a machine up front rather than selecting it,
+	// claiming it, and having the worker refuse the assignment terminally (issue #688).
+	describe('the task’s repository (issue #714)', () => {
+		it('selects the machine whose checkout is the task’s repository', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
+				makeCandidate('w-mine', { repository: REPOSITORY }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-mine' } });
+		});
+
+		it('refuses with repository-mismatch when no machine holds it', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
+				makeCandidate('w-third', { repository: 'smarttechbrewery/cascade' }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'repository-mismatch' });
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			// The wait needs a human — a machine connecting cannot re-point a checkout — so
+			// the deferral records `worker-authorization` rather than `worker-eligibility`.
+			expect(isAvailabilityRefusal(decision.reason)).toBe(false);
+			// And the message names the repository plus the action that ends the wait.
+			expect(decision.message).toContain(REPOSITORY);
+			expect(decision.message).toContain('SWARM_WORKER_REPO_ROOT');
+		});
+
+		it('still reports worker-unavailable while a matching machine is merely busy', async () => {
+			// The best news available wins: one machine does hold this repository and is only
+			// occupied, so the wait clears by itself and must not read as an authorization one.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
+				makeCandidate('w-mine-busy', { repository: REPOSITORY, activeRuns: 1 }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
+		});
+
+		it('keeps a machine that declared no repository selectable', async () => {
+			// An unidentifiable checkout must not become unroutable (issues #688, #690): the
+			// provision-time `origin` check is still its guard.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
+				makeCandidate('w-undeclared', { repository: null }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-undeclared' },
+			});
+		});
+	});
+
 	// Issue #533. The gate judges one dispatch, but the project runs several at once,
 	// so "the first eligible worker" can spend a capability another runnable phase
 	// uniquely needs. These pin the pool policy *and* its limits: it reorders the
@@ -715,8 +791,12 @@ describe('evaluateDispatchEligibility', () => {
 		}
 
 		/** One other runnable dispatch, in the shape the caller reads off the dispatch rows. */
-		function demand(dispatchId: string, phase: DispatchGateInput['phase']): RunnableDispatchDemand {
-			return { dispatchId, phase, targets: [{}], phaseDefaultCli: 'claude' };
+		function demand(
+			dispatchId: string,
+			phase: DispatchGateInput['phase'],
+			repository: string | undefined = REPOSITORY,
+		): RunnableDispatchDemand {
+			return { dispatchId, phase, targets: [{}], phaseDefaultCli: 'claude', repository };
 		}
 
 		it('leaves the only planning-capable worker free for a runnable planning dispatch', async () => {
@@ -870,6 +950,51 @@ describe('evaluateDispatchEligibility', () => {
 			);
 
 			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+		});
+
+		// Issue #714. A contender is narrowed by its *own* repository, read off its stored
+		// payload, so contention is only ever counted between dispatches that can actually
+		// share a machine.
+		it('does not let a contender for another repository reserve this repository’s machine', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a'),
+				makeCandidate('w-b', { supportedPhases: WITHOUT_PLANNING }),
+			]);
+			// The planning contender belongs to a repository neither machine holds, so it can
+			// run nowhere — there is no scarcity to preserve and Review keeps its first pick.
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-review', 'review'),
+				demand('d-planning', 'planning', OTHER_REPOSITORY),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-review', phase: 'review' }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+		});
+
+		it('judges a contender that names no repository against every machine', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a'),
+				makeCandidate('w-b', { supportedPhases: WITHOUT_PLANNING }),
+			]);
+			// A payload written before repositories were routable names none, which means the
+			// project's *default* entry — not necessarily the one this gate scoped. So the
+			// check is skipped rather than guessed at, leaving the contender's eligible set a
+			// superset: Review routes around the only planning-capable machine, and still runs.
+			const loadPoolDemands = vi.fn(async () => [
+				demand('d-review', 'review'),
+				demand('d-planning', 'planning', undefined),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ dispatchId: 'd-review', phase: 'review' }),
+				{ loadPoolDemands },
+			);
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-b' } });
 		});
 
 		it('holds an affinity-gated dispatch to its assignee’s worker under contention', async () => {

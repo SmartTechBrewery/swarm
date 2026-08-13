@@ -2191,6 +2191,7 @@ describe('processJob', () => {
 				capabilities?: AgentCli[];
 				sharingConsent?: boolean;
 				activeRuns?: number;
+				repository?: string | null;
 			} = {},
 		): WorkerDispatchCandidate {
 			const capabilities = overrides.capabilities ?? ['claude'];
@@ -2201,7 +2202,7 @@ describe('processJob', () => {
 					displayName: `worker-${id}`,
 					capabilities,
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-					repository: null,
+					repository: overrides.repository ?? null,
 					createdAt: new Date('2026-01-01T00:00:00Z'),
 					updatedAt: new Date('2026-01-01T00:00:00Z'),
 				},
@@ -2314,6 +2315,30 @@ describe('processJob', () => {
 				workerEligibilityRecheckAttempt: 1,
 				rateLimitRetryAttempt: 3,
 			});
+		});
+
+		// Issue #714. A machine holding another repository is skipped by the gate rather
+		// than selected and then refusing the assignment terminally — and the row says so
+		// with the wait only a human can clear, naming the repository to point one at.
+		it('records a machine holding another repository as a worker-authorization wait', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				candidate('w-1', { repository: 'smarttechbrewery/dashboard' }),
+			]);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(planningTrigger()),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', workerEligibilityRecheck: true });
+			// Nothing was provisioned: the point of skipping up front rather than letting the
+			// worker refuse the assignment after a full selection and claim.
+			expect(phaseCalls).toEqual([]);
+			expect(createRun).not.toHaveBeenCalled();
+			const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+			expect(input.waitReason).toBe('worker-authorization');
+			// `project.repo` is the job's own repository since #684 phase 2 scoped it.
+			expect(input.lastError).toContain('SmartTechBrewery/swarm');
 		});
 
 		it('fails with the actionable reason once the re-check budget is exhausted', async () => {
