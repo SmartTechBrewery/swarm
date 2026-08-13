@@ -2250,6 +2250,11 @@ async function selfEnqueueNextPhase(
 			providerId: project.pm.type,
 			projectId: project.id,
 			event: requireProjectPMAdapter(project).synthesizeStateChange(project, workItem.id),
+			// The repository the *completed* phase ran in, carried rather than re-derived
+			// (issue #686 phase 2). Load-bearing: without it an auto-advanced next phase
+			// would silently jump back to the project's default entry. This path needs no
+			// board read to answer — the run's own scoped project already names it.
+			repository: project.repo,
 		};
 		await createAndPublishDispatch({
 			projectId: project.id,

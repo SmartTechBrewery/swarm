@@ -1062,9 +1062,23 @@ describe('processJob', () => {
 			});
 		});
 
-		// A board card names no repository, so Planning/Implementation keep running
-		// against the default entry — the behaviour a single-repository project had.
-		it('scopes a board job to the default entry by naming no repository', async () => {
+		// Since issue #686 phase 2 a board card *does* name a repository: ingress routed
+		// it and recorded the answer on the envelope, and the same seam scopes to it.
+		it('scopes a board job to the repository its card routed to', async () => {
+			await processJob(
+				{ ...createMockPmWebhookJob(), repository: 'SmartTechBrewery/second' },
+				registryReturning({ phase: 'planning', taskId: '10', workItem: createMockWorkItem() }),
+			);
+
+			expect(projectLookupCalls).toContainEqual({
+				id: PROJECT.id,
+				repo: 'SmartTechBrewery/second',
+			});
+		});
+
+		// A board job written before that routing carries none and keeps running against
+		// the default entry — the behaviour a single-repository project always had.
+		it('scopes a pre-routing board job to the default entry by naming no repository', async () => {
 			await processJob(
 				createMockPmWebhookJob(),
 				registryReturning({ phase: 'planning', taskId: '10', workItem: createMockWorkItem() }),
@@ -1118,6 +1132,29 @@ describe('processJob', () => {
 			);
 			expect(phaseCalls).toEqual([]);
 			expect(acquireProjectSlot).not.toHaveBeenCalled();
+		});
+
+		// Same refusal for a routed board card whose repository has since been removed
+		// from the project (issue #686 phase 2 makes a `pm` job reach that path too).
+		it('fails the dispatch for a board job naming a repository the project no longer owns', async () => {
+			projectLookup = () => {
+				throw new Error(
+					"Project 'swarm' does not own repository 'SmartTechBrewery/gone' — it owns: SmartTechBrewery/swarm.",
+				);
+			};
+
+			await expect(
+				processJob(
+					{ ...createMockPmWebhookJob(), repository: 'SmartTechBrewery/gone' },
+					registryReturning({ phase: 'planning', taskId: '10', workItem: createMockWorkItem() }),
+				),
+			).rejects.toThrow(/does not own repository 'SmartTechBrewery\/gone'/);
+
+			expect(failDispatch).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.stringContaining("does not own repository 'SmartTechBrewery/gone'"),
+			);
+			expect(phaseCalls).toEqual([]);
 		});
 	});
 
@@ -1426,6 +1463,10 @@ describe('processJob', () => {
 						changedField: PROJECT_PM.statusFieldId,
 						changedFieldType: 'single_select',
 					},
+					// The repository the *completed* phase ran in, carried rather than
+					// re-derived (issue #686 phase 2) — without it an auto-advanced next
+					// phase would jump back to the project's default entry.
+					repository: PROJECT.repo,
 				},
 			});
 		});

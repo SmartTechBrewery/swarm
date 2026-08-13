@@ -144,7 +144,8 @@ export const QueuedRunSchema = z.object({
 	/**
 	 * The repository this dispatch will run against (`owner/repo`) — `repositoryForJob`
 	 * (`./jobs.js`), so it is the same value the worker scopes the project with. Absent
-	 * for a board job, which names none and runs against the project's default entry.
+	 * only on a board job written before issue #686 phase 2 routed the card, which runs
+	 * against the project's default entry.
 	 */
 	repo: z.string().optional(),
 	/** SCM and `merge-automation` jobs only — the PR/issue number. */
@@ -272,9 +273,9 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 	// The repository this dispatch will run against, resolved through the *same*
 	// helper the worker scopes its project with (issue #684 phase 2) rather than by
 	// re-reading each variant's own field here — so the PR link this row renders and
-	// the repository the phase actually runs in cannot drift apart. A board job
-	// carries none and keeps the field absent: it runs against the project's default
-	// entry and its link comes from the resolved `workItemUrl` instead.
+	// the repository the phase actually runs in cannot drift apart. A board job written
+	// before issue #686 phase 2 carries none and keeps the field absent: it runs against
+	// the project's default entry and its link comes from `workItemUrl` instead.
 	const repo = repositoryForJob(data);
 	const shared = {
 		jobId: dispatch.id,
