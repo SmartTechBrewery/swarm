@@ -43,6 +43,7 @@ describe('swarm worktrees', () => {
 				skippedUnpushed: [],
 				skippedDeferred: [],
 				ignored: [],
+				sweptState: [],
 			});
 
 		vi.mocked(closeDb).mockClear();
@@ -87,6 +88,7 @@ describe('swarm worktrees', () => {
 			skippedUnpushed: [],
 			skippedDeferred: [],
 			ignored: [],
+			sweptState: [],
 		});
 		const warnSpy = vi.spyOn(console, 'warn');
 		expect(await worktreesRun(['prune'])).toBe(0);
@@ -102,10 +104,40 @@ describe('swarm worktrees', () => {
 			skippedUnpushed: ['/path/to/task-1'],
 			skippedDeferred: [],
 			ignored: [],
+			sweptState: [],
 		});
 		const warnSpy = vi.spyOn(console, 'warn');
 		expect(await worktreesRun(['prune'])).toBe(0);
 		expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('has unpushed commits'));
+	});
+
+	// The artifact basenames are opaque `<sha256>` hashes, so printing them is the only
+	// way an operator can tell which task's debris the sweep removed (issue #721).
+	it('names every expired host-local artifact swept, honouring the dry-run phrasing', async () => {
+		const pin = '/path/to/.swarm-workspaces/.swarm-state/9f2b.pin.json';
+		vi.mocked(pruneStaleWorktrees).mockResolvedValue({
+			kept: ['/path/to/task-2'],
+			pruned: [],
+			skippedInFlight: [],
+			skippedDirty: [],
+			skippedUnpushed: [],
+			skippedDeferred: [],
+			ignored: [],
+			sweptState: [pin],
+		});
+		const logSpy = vi.spyOn(console, 'log');
+
+		expect(await worktreesRun(['prune'])).toBe(0);
+		expect(logSpy).toHaveBeenCalledWith(
+			expect.stringContaining('swept expired host-local state: 1 artifact(s)'),
+		);
+		expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(pin));
+
+		logSpy.mockClear();
+		expect(await worktreesRun(['prune', '--dry-run'])).toBe(0);
+		expect(logSpy).toHaveBeenCalledWith(
+			expect.stringContaining('would sweep expired host-local state: 1 artifact(s)'),
+		);
 	});
 
 	it('closes the db even when pruneStaleWorktrees throws', async () => {

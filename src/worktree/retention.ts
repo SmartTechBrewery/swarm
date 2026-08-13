@@ -4,7 +4,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import { PROJECT_DEFAULTS } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
-import { createHostLocalWorktreeRuntime } from './host-local-runtime.js';
+import { createHostLocalWorktreeRuntime, sweepStaleHostLocalState } from './host-local-runtime.js';
 import type { WorktreeRuntime } from './worktree-runtime.js';
 
 /**
@@ -61,6 +61,8 @@ export interface PruneStaleWorktreesResult {
 	skippedDeferred: string[];
 	/** Worktrees under worktreeRoot that don't match `task-<id>` — left alone entirely (see plan's scope note on legacy worktrees). */
 	ignored: string[];
+	/** Expired host-local coordination artifacts removed from `.swarm-state` (issue #721). */
+	sweptState: string[];
 }
 
 const TASK_DIR_PATTERN = /^task-(.+)$/;
@@ -161,6 +163,16 @@ export async function pruneStaleWorktrees(
 ): Promise<PruneStaleWorktreesResult> {
 	const worktrees =
 		options.worktrees ?? new GitWorktreeManager(project, retentionWorktreeRuntime(project));
+
+	// Ahead of `list()` so a lapsed marker is gone before `evaluateReclaim` reads it —
+	// and so the artifacts of a task nothing dispatches again get swept at all, which
+	// no per-task reaper can do (issue #721).
+	const sweptState = sweepStaleHostLocalState({
+		repoRoot: canonicalize(project.repoRoot),
+		worktreeRoot: project.worktreeRoot,
+		dryRun: options.dryRun,
+	});
+
 	const paths = await worktrees.list();
 
 	const kept: string[] = [];
@@ -210,7 +222,19 @@ export async function pruneStaleWorktrees(
 		skippedUnpushed: skippedUnpushed.length,
 		skippedDeferred: skippedDeferred.length,
 		ignored: ignored.length,
+		sweptState: sweptState.length,
 	});
+
+	if (sweptState.length > 0) {
+		// Named, not just counted: the artifacts are opaque `<sha256>` basenames, so this
+		// log is the only place an operator can connect one back to a task — `projectId`
+		// and `taskId` are recorded *inside* the lease/pin files the sweep just removed.
+		logger.info('expired host-local coordination artifacts swept', {
+			projectId: project.id,
+			dryRun: options.dryRun === true,
+			paths: sweptState,
+		});
+	}
 
 	for (const dirtyPath of skippedDirty) {
 		logger.warn('worktree skipped during retention sweep — has uncommitted changes', {
@@ -234,5 +258,6 @@ export async function pruneStaleWorktrees(
 		skippedUnpushed,
 		skippedDeferred,
 		ignored,
+		sweptState,
 	};
 }

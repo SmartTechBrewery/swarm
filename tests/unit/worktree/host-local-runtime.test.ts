@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	createHostLocalWorktreeRuntime,
+	sweepStaleHostLocalState,
 	UNREADABLE_LEASE_TOKEN,
 } from '@/worktree/host-local-runtime.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
@@ -20,11 +21,15 @@ describe('host-local worktree runtime', () => {
 		root = undefined;
 	});
 
+	function repoRoot(): string {
+		root ??= mkdtempSync(join(tmpdir(), 'swarm-local-worktree-'));
+		return root;
+	}
+
 	/** The opaque `<sha256>` basename the runtime derives its artifact paths from. */
 	function statePath(projectId: string, taskId: string, suffix: string): string {
-		root ??= mkdtempSync(join(tmpdir(), 'swarm-local-worktree-'));
 		const key = createHash('sha256').update(`${projectId}\u0000${taskId}`).digest('hex');
-		return resolve(root, '.swarm-workspaces', '.swarm-state', `${key}${suffix}`);
+		return resolve(repoRoot(), '.swarm-workspaces', '.swarm-state', `${key}${suffix}`);
 	}
 
 	/** Move the wall clock forward so an artifact's recorded `createdAt` falls outside its TTL. */
@@ -211,6 +216,112 @@ describe('host-local worktree runtime', () => {
 			} finally {
 				spy.mockRestore();
 			}
+		});
+	});
+
+	// Every TTL above is evaluated only by the next provisioner for the *same* task, so
+	// a task never dispatched again keeps its debris forever — and a `preserve()` staging
+	// file stranded between its write and its rename has no next reader at all (#721).
+	describe('sweeps stale .swarm-state artifacts', () => {
+		/** One of every artifact a crash can strand, plus an entry the sweep must not touch. */
+		function fabricate() {
+			const paths = {
+				lock: statePath('swarm', '555', '.lock'),
+				unreadableLock: statePath('swarm', '556', '.lock'),
+				pin: statePath('swarm', '557', '.pin.json'),
+				takeover: statePath('swarm', '558', '.takeover'),
+				staging: `${statePath('swarm', '559', '.pin.json')}.4f1a2b3c.tmp`,
+				unrecognised: statePath('swarm', '560', '.notes'),
+			};
+			mkdirSync(paths.lock, { recursive: true });
+			writeFileSync(
+				join(paths.lock, 'owner.json'),
+				JSON.stringify({
+					token: 'token-555',
+					ownerId: 'dispatch-555',
+					ownerKey: 'run-555',
+					pid: 1958,
+					createdAt: new Date().toISOString(),
+					projectId: 'swarm',
+					taskId: '555',
+				}),
+			);
+			mkdirSync(paths.unreadableLock, { recursive: true });
+			writeFileSync(join(paths.unreadableLock, 'owner.json'), 'not json');
+			writeFileSync(
+				paths.pin,
+				JSON.stringify({ ownerKey: 'run-557', createdAt: new Date().toISOString() }),
+			);
+			mkdirSync(paths.takeover, { recursive: true });
+			writeFileSync(
+				join(paths.takeover, 'holder.json'),
+				JSON.stringify({ pid: 1958, createdAt: new Date().toISOString() }),
+			);
+			// The `<pin>.<uuid>.tmp` `preserve()` wrote and never got to rename.
+			writeFileSync(paths.staging, '{"ownerKey":"run-559"');
+			writeFileSync(paths.unrecognised, 'not an artifact this module writes');
+			return paths;
+		}
+
+		/** Sorted, because `readdirSync` order is not part of the contract. */
+		function sweep(dryRun?: boolean): string[] {
+			return sweepStaleHostLocalState({
+				repoRoot: repoRoot(),
+				worktreeRoot: '.swarm-workspaces',
+				dryRun,
+			}).sort();
+		}
+
+		it('leaves every artifact alone while it is inside its own TTL', () => {
+			const paths = fabricate();
+
+			expect(sweep()).toEqual([]);
+			for (const path of Object.values(paths)) expect(existsSync(path)).toBe(true);
+		});
+
+		it('removes every expired artifact, reports its path, and skips unrecognised entries', () => {
+			const paths = fabricate();
+			advance(25 * HOUR_MS);
+
+			const expired = [paths.lock, paths.unreadableLock, paths.pin, paths.takeover, paths.staging];
+			expect(sweep()).toEqual([...expired].sort());
+			for (const path of expired) expect(existsSync(path)).toBe(false);
+			// Not ours to judge: an entry matching no artifact shape is left entirely alone.
+			expect(existsSync(paths.unrecognised)).toBe(true);
+		});
+
+		it('applies each TTL to its own artifact rather than one blanket age', () => {
+			const paths = fabricate();
+			// Past the 5-minute takeover-guard window, well inside the 4h lease and 24h pin.
+			advance(10 * 60 * 1000);
+
+			expect(sweep()).toEqual([paths.takeover, paths.staging].sort());
+			expect(existsSync(paths.lock)).toBe(true);
+			expect(existsSync(paths.unreadableLock)).toBe(true);
+			expect(existsSync(paths.pin)).toBe(true);
+		});
+
+		it('reports what it would remove without removing it under dryRun', () => {
+			const paths = fabricate();
+			advance(25 * HOUR_MS);
+			const expired = [
+				paths.lock,
+				paths.unreadableLock,
+				paths.pin,
+				paths.takeover,
+				paths.staging,
+			].sort();
+
+			expect(sweep(true)).toEqual(expired);
+			for (const path of Object.values(paths)) expect(existsSync(path)).toBe(true);
+
+			// The real sweep then reports exactly the same paths, and removes them.
+			expect(sweep()).toEqual(expired);
+			expect(existsSync(paths.pin)).toBe(false);
+		});
+
+		it('returns nothing rather than throwing when the state root does not exist', () => {
+			expect(sweep()).toEqual([]);
 		});
 	});
 

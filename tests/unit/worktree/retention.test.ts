@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, type Stats, writeFileSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	realpathSync,
+	rmSync,
+	type Stats,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -446,5 +454,43 @@ describe('retentionWorktreeRuntime', () => {
 
 		expect(result.pruned).toEqual([taskPath('1')]);
 		expect(manager.cleanedUpTasks).toEqual(['1']);
+	});
+
+	// Nothing else sweeps these: every TTL in `host-local-runtime.ts` is evaluated by the
+	// next provisioner for that same task, so a task never dispatched again keeps its
+	// coordination debris forever (issue #721). This sweep already runs hourly.
+	it('sweeps an expired host-local coordination artifact, and removes none under dryRun', async () => {
+		const project = createMockProjectConfig({
+			repoRoot,
+			worktreeRoot: '.swarm-workspaces',
+			worktreeRetention: { maxWorktrees: 1 },
+		});
+		// A preservation pin for a task nothing will dispatch again, well past its 24h TTL.
+		const taskId = '555';
+		const key = createHash('sha256').update(`${project.id}\0${taskId}`).digest('hex');
+		const stateRoot = resolve(repoRoot, '.swarm-workspaces', '.swarm-state');
+		const pin = join(stateRoot, `${key}.pin.json`);
+		mkdirSync(stateRoot, { recursive: true });
+		writeFileSync(
+			pin,
+			`${JSON.stringify({
+				ownerKey: 'run-555',
+				createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+				projectId: project.id,
+				taskId: '555',
+			})}\n`,
+			'utf8',
+		);
+
+		const manager = new FakeGitWorktreeManager(project, retentionWorktreeRuntime(project));
+		manager.setWorktreesList([]);
+
+		const dry = await pruneStaleWorktrees(project, { worktrees: manager, dryRun: true });
+		expect(dry.sweptState).toEqual([pin]);
+		expect(existsSync(pin)).toBe(true);
+
+		const result = await pruneStaleWorktrees(project, { worktrees: manager });
+		expect(result.sweptState).toEqual([pin]);
+		expect(existsSync(pin)).toBe(false);
 	});
 });
