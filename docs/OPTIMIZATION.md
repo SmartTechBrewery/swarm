@@ -70,15 +70,10 @@ its repository context is still available. Each child should receive:
 - focused verification guidance.
 
 SWARM should post or persist the child-specific plan with the newly created item and mark it
-as preplanned before moving the child to Planning. Its Planning trigger should recognize a valid
-marker **and** `swarm:split-child` label and avoid launching another agent run. A human edit that
-materially changes the child's scope, a missing or invalid plan, an explicit replan action, or
-removal of the split-child label should run Planning normally.
-
-Because those issue-body and label changes do not emit a Projects Status event, the repo webhook
-also subscribes to **Issues**. The `preplan-invalidated` trigger handles only body edits, adding
-`swarm:replan`, and removing `swarm:split-child`; it re-reads the authoritative Planning card and
-dispatches fallback Planning only when the current marker/label state is invalid.
+as planned before moving the child to Planning, so its Planning trigger skips it and no second
+agent run is launched. An operator who wants a child planned from scratch should have one way to
+say so, and a run that is dispatched anyway should still refuse to reuse a plan written against
+scope that has since materially changed.
 
 This converts one repository analysis into plans for the entire split rather than paying for
 one parent analysis plus one full analysis per child.
@@ -107,7 +102,9 @@ parent's own comment, before any child is re-prepared. It is
 published *before* the hidden marker is written: if publishing fails, no marker exists, the child
 stays in Backlog with a comment that claims no published preplan, and a later move to Planning runs
 a normal Planning agent that posts its own plan. The hidden marker remains the single authoritative
-source for preplan validation and for suppressing the redundant Planning run.
+source for preplan validation — for whether a run that *was* dispatched may reuse the plan instead
+of spending an agent. Since issue #737 it is no longer what suppresses the dispatch; the `planned`
+label is (below).
 
 The Preplan comment carries the plan as ordinary prose, which the Implementation dependency gate
 also reads when it scans an item for prerequisites named in text. That scan therefore skips every
@@ -117,19 +114,36 @@ gate does read — the item's description and comments written by people — no 
 either (issue #643): a prerequisite found only in prose is surfaced on the item for a human to
 record natively, and only a recorded relationship gates the run.
 
-SWARM creates the card in Backlog only long enough to write that marker, then moves it to Planning.
-That ordering means both the Planning-move webhook and a delayed creation webhook find the marker
-before the trigger evaluates the card: a valid marker on a labelled split child suppresses the
-redundant phase, so no worktree or agent CLI is launched. Validity is deterministic — no
-classifier model. It falls back to a normal agent run
-when the marker is missing, malformed, fails schema validation, binds a different item
-(`itemUrl` ≠ the child's URL), was written against a since-edited scope (`descriptionHash`
-mismatch), an operator applied `swarm:replan`, or the split-child label was removed. The marker is
-intentionally *not* inferred from a label or free-form comment alone.
+SWARM creates the card in Backlog only long enough to write that marker **and apply the `planned`
+label**, then moves it to Planning. That ordering means both the Planning-move webhook and a delayed
+creation webhook find a card that is already labelled: the trigger skips it, so no worktree or agent
+CLI is launched. Labelling before the move is what makes that true — the move is the event that
+dispatches, so a label applied afterwards would race every child into the very dispatch it exists to
+stop.
 
-If either the marker write or the move to Planning fails, the child stays in Backlog and its split
-comment says so. A human can move it to Planning later; a saved valid marker is reused, while a
-missing or invalid one falls back to the normal Planning agent.
+**The dispatch gate is the label alone (issue #737).** A card entering Planning starts a Planning
+run unless it already carries `planned`; to re-plan, remove `planned` and move the card
+Backlog → Planning. That replaced three concepts, one of which could never fire: the marker as a
+gate, a `swarm:replan` label an operator added to invalidate it (**removed — nothing reads or
+creates it**), and a `preplan-invalidated` trigger whose job was to notice such a label or body
+edit. That trigger needed GitHub's `issues` event, which the repository webhook does not subscribe
+to, so none of its cases could happen; it is deleted, and no `issues` subscription replaces it —
+`issues` is a chatty event class and two thirds of a typical day's dispatches already complete as
+`no-trigger` no-ops.
+
+The marker survives as **content**, not as a gate: a run that *is* dispatched reuses the plan
+instead of spending an agent. Validity is deterministic — no classifier model — and it falls back to
+a normal agent run when the marker is missing, malformed, fails schema validation, binds a different
+item (`itemUrl` ≠ the child's URL), or was written against a since-edited scope (`descriptionHash`
+mismatch). That hash is deliberately kept: the label answers "should this dispatch happen", the hash
+answers "is the plan this dispatch found still about the same work". The marker is intentionally
+*not* inferred from a label or free-form comment alone.
+
+If the marker write fails, the child stays in Backlog unlabeled with no saved plan, and its split
+comment says so — moving it to Planning runs a normal Planning agent. If the marker landed and only
+the *move* failed, the child sits in Backlog already carrying its plan and the `planned` label:
+moving it to Planning then dispatches nothing at all, which is correct — it is planned. Its split
+comment says that too, and says how to discard the plan (remove `planned`).
 
 ## 4. Move deterministic delivery mechanics out of Implementation
 

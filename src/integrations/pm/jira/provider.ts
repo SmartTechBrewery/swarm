@@ -656,10 +656,10 @@ export class JiraPMProvider implements PMProvider {
 			// No `taskRef`/`taskRepository` on a whole-board read, deliberately: both live
 			// on each issue's remote links, so filling them here would cost one extra
 			// request *per card*. Every caller of this method matches on `url`, `status`, or
-			// `id` (`src/triggers/handlers/preplan-invalidated.ts`); the reads that answer
-			// with a single card do resolve them. This is also why a board-wide read here
-			// resolves nothing per card where the other three providers resolve per card
-			// (issue #710): the linkage is a separate request, not a field already read.
+			// `id`; the reads that answer with a single card do resolve them. This is also
+			// why a board-wide read here resolves nothing per card where the other three
+			// providers resolve per card (issue #710): the linkage is a separate request,
+			// not a field already read.
 			return issues.map((issue) => toWorkItem(issue, this.config));
 		});
 	}

@@ -8,7 +8,7 @@ vi.mock('@/triggers/pm-status-dedup.js', () => ({ recordStatusAndDetectChange: v
 // is populated by the integrations entrypoint at module load — import it so the
 // `github-projects` manifest (and its real `isStatusChange`) is registered.
 import '@/integrations/entrypoint.js';
-import { buildPreplanContract, embedPreplanMarker } from '@/pipeline/preplan.js';
+import { buildPreplanContract, embedPreplanMarker, PLANNED_LABEL } from '@/pipeline/preplan.js';
 import { createPmStatusTrigger } from '@/triggers/handlers/pm-status.js';
 import { recordStatusAndDetectChange } from '@/triggers/pm-status-dedup.js';
 import type { PmTriggerContext, TriggerContext } from '@/triggers/types.js';
@@ -127,7 +127,29 @@ describe('pm-status trigger', () => {
 			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
 		});
 
-		it('returns null (skips planning dispatch) when a split child entering Planning is already preplanned', async () => {
+		// Issue #737 — the whole Planning gate is the `planned` label. A move to
+		// Planning dispatches unless the card already carries it; to re-plan, remove
+		// the label and move the card Backlog → Planning.
+		it('returns null (skips planning dispatch) when the card already carries `planned`', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c', // Planning
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+				labels: [{ id: 'l1', name: PLANNED_LABEL }],
+			});
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+		});
+
+		it('re-plans once `planned` is removed and the card moves back into Planning', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c', // Planning
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+				labels: [{ id: 'l1', name: 'swarm:split-child' }],
+			});
+			const result = await trigger.handle(ctx(workItem));
+			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
+		});
+
+		it('ignores a preplan marker: only the label gates the dispatch', async () => {
 			const itemUrl = 'https://github.com/SmartTechBrewery/swarm/issues/10';
 			const contract = buildPreplanContract({
 				splitId: 'split-1',
@@ -138,57 +160,36 @@ describe('pm-status trigger', () => {
 				plan: '# Subtask Plan',
 				generatedAt: '2026-07-21T00:00:00Z',
 			});
+			// A valid marker on a labelled split child — the exact shape that used to be
+			// the gate. Unlabeled, it now dispatches; the run it dispatches is the layer
+			// that reads the marker and reuses the plan without spending an agent.
 			const workItem = createMockWorkItem({
 				statusId: '61e4505c', // Planning
 				url: itemUrl,
 				description: embedPreplanMarker('Subtask 1 description', contract),
 				labels: [{ id: 'l1', name: 'swarm:split-child' }],
 			});
-			expect(await trigger.handle(ctx(workItem))).toBeNull();
-		});
-
-		it('dispatches Planning when a valid preplan marker has no split-child label', async () => {
-			const itemUrl = 'https://github.com/SmartTechBrewery/swarm/issues/10';
-			const contract = buildPreplanContract({
-				splitId: 'split-1',
-				childIndex: 0,
-				parentUrl: 'https://github.com/SmartTechBrewery/swarm/issues/9',
-				itemUrl,
-				humanDescription: 'Subtask 1 description',
-				plan: '# Subtask Plan',
-				generatedAt: '2026-07-21T00:00:00Z',
-			});
-			const workItem = createMockWorkItem({
-				statusId: '61e4505c', // Planning
-				url: itemUrl,
-				description: embedPreplanMarker('Subtask 1 description', contract),
-				labels: [],
-			});
 			const result = await trigger.handle(ctx(workItem));
 			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
 		});
 
-		it('dispatches Planning when preplanned item carries replan label (swarm:replan)', async () => {
-			const itemUrl = 'https://github.com/SmartTechBrewery/swarm/issues/10';
-			const contract = buildPreplanContract({
-				splitId: 'split-1',
-				childIndex: 0,
-				parentUrl: 'https://github.com/SmartTechBrewery/swarm/issues/9',
-				itemUrl,
-				humanDescription: 'Subtask 1 description',
-				plan: '# Subtask Plan',
-				generatedAt: '2026-07-21T00:00:00Z',
-			});
+		it('gates Implementation on nothing: `planned` only stops Planning', async () => {
 			const workItem = createMockWorkItem({
-				statusId: '61e4505c', // Planning
-				url: itemUrl,
-				description: embedPreplanMarker('Subtask 1 description', contract),
-				labels: [
-					{ id: 'l1', name: 'swarm:split-child' },
-					{ id: 'l2', name: 'swarm:replan' },
-				],
+				statusId: '3121a97d', // ToDo
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/12',
+				labels: [{ id: 'l1', name: PLANNED_LABEL }],
 			});
 			const result = await trigger.handle(ctx(workItem));
+			expect(result).toEqual({ phase: 'implementation', taskId: '12', workItem });
+		});
+
+		it('does not drop a deferred Planning phase resuming on a labelled card', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '47fc9ee4', // In progress — the status its own report moved it to
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+				labels: [{ id: 'l1', name: PLANNED_LABEL }],
+			});
+			const result = await trigger.handle({ ...ctx(workItem), resumePmPhase: 'planning' });
 			expect(result).toEqual({ phase: 'planning', taskId: '10', workItem });
 		});
 

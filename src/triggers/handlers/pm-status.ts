@@ -27,7 +27,7 @@
 
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
-import { evaluatePreplan, isPreplanSkip, SPLIT_CHILD_LABEL } from '../../pipeline/preplan.js';
+import { PLANNED_LABEL } from '../../pipeline/preplan.js';
 import { type PipelinePhase, resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import type { WorkItem } from '../../pm/types.js';
 import { repoSlugsMatch } from '../../scm/repo-slug.js';
@@ -35,26 +35,40 @@ import { recordStatusAndDetectChange } from '../pm-status-dedup.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 /**
- * Check whether a split child entering Planning has already been planned outside of
- * dispatch. A marker alone is insufficient: removing the split-child label is an
- * operator signal to fall back to a normal Planning run.
+ * The whole Planning gate (issue #737): a card entering Planning starts a Planning
+ * run **unless it already carries `planned`**. To re-plan, an operator removes the
+ * label and moves the card Backlog → Planning.
+ *
+ * One rule, on a label that was already being written and never read. It replaces a
+ * gate keyed on the preplan contract embedded in a split child's description
+ * (`src/pipeline/preplan.ts`) plus a `swarm:split-child` label, an operator override
+ * label (`swarm:replan`) that invalidated the contract, and a `preplan-invalidated`
+ * trigger that existed to observe those label/body edits in place — the last of
+ * which never fired at all, since such edits arrive on the `issues` webhook event
+ * the repository does not subscribe to.
+ *
+ * The contract did not go away, it stopped being a gate: a dispatched run still
+ * reuses a split child's embedded plan instead of spending an agent
+ * (`evaluatePreplan`, consumed by `runPlanningPhase`). What that costs here is
+ * nothing, because a prepared child is labelled `planned` *before* the split moves
+ * it to Planning, so this gate stops the dispatch first.
+ *
+ * A deferred phase resuming from its original event (`resumePmPhase`) is exempt: it
+ * has already been dispatched once and is retrying, and by then its own run may well
+ * have applied the label.
  */
-function shouldSkipPreplanned(
+function isAlreadyPlanned(
 	phase: string | null,
 	workItem: WorkItem,
 	resumePmPhase?: string,
 ): boolean {
 	if (phase !== 'planning' || resumePmPhase) return false;
-	const preplan = evaluatePreplan(workItem);
-	const isSplitChild = workItem.labels.some((label) => label.name === SPLIT_CHILD_LABEL);
-	if (isSplitChild && isPreplanSkip(preplan)) {
-		logger.info(
-			'pm-status: item already preplanned outside of dispatch — skipping planning dispatch',
-			{ itemId: workItem.id, splitId: preplan.contract.splitId },
-		);
-		return true;
-	}
-	return false;
+	if (!workItem.labels.some((label) => label.name === PLANNED_LABEL)) return false;
+	logger.info('pm-status: item already carries the planned label — skipping planning dispatch', {
+		itemId: workItem.id,
+		label: PLANNED_LABEL,
+	});
+	return true;
 }
 
 /**
@@ -128,7 +142,7 @@ export function createPmStatusTrigger(): TriggerHandler {
 				return null;
 			}
 
-			if (shouldSkipPreplanned(phase, workItem, ctx.resumePmPhase)) {
+			if (isAlreadyPlanned(phase, workItem, ctx.resumePmPhase)) {
 				return null;
 			}
 

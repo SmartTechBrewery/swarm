@@ -251,11 +251,12 @@ describe('real DB-free phase worktree lifecycle', () => {
 
 		// The whole split, in the order the phase performs it: check this delivery's
 		// own marker, re-scope the parent, look for a child this delivery already
-		// created (issue #543), create it, publish its preplan, embed the marker, move
-		// it to Planning, mark it planned, chain its dependency edge, explain the
+		// created (issue #543), create it, publish its preplan, embed the marker, mark
+		// it planned, move it to Planning, chain its dependency edge, explain the
 		// split, post the parent's plan, mark the parent planned. Ordering is
-		// load-bearing (issues #431, #436), so it is asserted rather than just the set
-		// of calls.
+		// load-bearing (issues #431, #436, #737 — the label goes on *before* the move,
+		// because that move is the event the Planning dispatch keys on), so it is
+		// asserted rather than just the set of calls.
 		expect(boardCalls.map((call) => call.route)).toEqual([
 			'/pm/find-comment',
 			'/pm/update-item',
@@ -263,8 +264,8 @@ describe('real DB-free phase worktree lifecycle', () => {
 			'/pm/create-item',
 			'/pm/comment',
 			'/pm/update-item',
-			'/pm/move',
 			'/pm/label',
+			'/pm/move',
 			'/pm/blocked-by',
 			'/pm/comment',
 			'/pm/comment',
