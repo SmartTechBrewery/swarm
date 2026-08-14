@@ -327,26 +327,6 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			});
 			expect(implementation).not.toBe(planning);
 		});
-
-		it('keeps an unresolved earlier PM delivery ahead of Implementation for the same item', async () => {
-			const itemId = 'item-754';
-			const { dispatch: planning } = await createDispatch({
-				projectId: PROJECT_ID,
-				jobPayload: job({
-					type: 'pm',
-					providerId: 'github-projects',
-					event: { itemId, containerId: 'board-1' },
-				} as SwarmJob),
-				source: 'webhook',
-				state: 'leased',
-			});
-			await seedDispatchInState(TASK, 'leased', undefined, 'implementation');
-
-			expect(await selectTaskPhaseForExecution(PROJECT_ID, TASK, itemId)).toEqual({
-				id: planning.id,
-				phase: null,
-			});
-		});
 	});
 
 	describe('listTaskInFlightWaits (issue #759)', () => {

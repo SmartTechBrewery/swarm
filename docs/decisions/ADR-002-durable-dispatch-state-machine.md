@@ -82,16 +82,15 @@ retry, a cancel and a slot release) resolve to exactly one winner.
 - **Phase sequencing within one task** is the second such pending wait (`wait_reason =
   'task-in-flight'`, issue #759). Two phases must never hold the same `task-<id>`
   checkout, and the board-driven pair deliberately share a task id (issue #498), so a
-  dispatch whose task is still executing another phase is re-deferred to `pending`
+  dispatch whose task is still executing an *earlier* phase is re-deferred to `pending`
   and woken when that phase settles — instead of being discarded as a duplicate, which
   is what the `taskId`-only guard used to do to the ordinary Planning → Implementation
   progression. Same shape as the capacity wait (no attempt spent, event-woken, the
   reconciler's republish underneath); the *same* phase arriving twice remains the
   `skipped-duplicate` outcome, so the row never spells the two with one value. The
   collision is read from this table (`leased`/`running` for that task, excluding the
-  worktree-less `merge-automation` kind) rather than only from a worker's memory. An
-  earlier unresolved PM delivery for the same item also holds the guard until its phase
-  is known, so an Implementation delivery cannot pass a still-resolving Planning delivery.
+  asking dispatch and the worktree-less `merge-automation` kind) rather than only from
+  a worker's memory, so the verdict is not a property of where the dispatch landed.
 - **Retries.** Rate-limit/capacity/timeout/abort/delivery deferrals derive the next
   attempt's payload (session resume, PM dispatch intent, attempt counter) **inside the
   worker's settle path** and persist it on the dispatch as `retry-scheduled` before any

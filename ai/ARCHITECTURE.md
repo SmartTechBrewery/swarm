@@ -398,15 +398,15 @@ the wake-up already exists. Project-capacity waits are `pending` dispatches with
 wait reason `project-capacity`, woken by slot releases under the
 continuation-priority policy — there is no separate Redis registry. **A second
 event-woken `pending` wait sequences the phases of one task** (issue #759): a
-dispatch whose task is still executing another phase waits as
+dispatch whose task is still executing an *earlier* phase waits as
 `task-in-flight` and is woken by that phase settling
 (`promoteTaskInFlightWaits`, from `processJob`'s `finally` — every settle path,
 success or not), rather than being discarded. The *same* phase arriving twice is
 still completed `skipped-duplicate`, so the two halves of that collision stay
 distinguishable on the row; and the collision is read from the dispatch table
-(`selectTaskPhaseForExecution`, `leased`/`running`, excluding `merge-automation`)
-as well as from the worker's in-process map; an earlier unresolved PM delivery for
-the same item also holds the guard until its phase is known. Both
+(`findExecutingDispatchForTask`, `leased`/`running`, excluding the asking
+dispatch and `merge-automation`) as well as from the worker's in-process map, so
+the verdict does not depend on which worker the dispatch was routed to. Both
 pre-run waits share one deferral (`deferBeforeRun`): no attempt spent, the run
 row visible while it waits, continuation dedup claims retained, and the
 reconciler's republish underneath (a `pending` row is wakeable unless it waits on
