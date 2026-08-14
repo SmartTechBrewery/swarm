@@ -71,6 +71,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		releaseSession: vi.fn().mockResolvedValue(true),
 		refreshWorkerCapabilities: vi.fn().mockResolvedValue(makeWorker()),
 		suspendEnrollmentsForMismatchedRepository: vi.fn().mockResolvedValue([]),
+		reapSupersededWorkerClaims: vi.fn().mockResolvedValue(undefined),
 		resolveHeartbeatTtlMs: vi.fn().mockReturnValue(60_000),
 		validateFencingToken: vi.fn().mockResolvedValue(true),
 		deliverDispatchResult: vi.fn().mockReturnValue(true),
@@ -328,6 +329,107 @@ describe('handleHandshake', () => {
 			expect(badSessionId.status).toBe(400);
 			expect(badToken.status).toBe(400);
 			expect(deps.acquireSession).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #719: the supersede is knowable the moment the new generation takes the
+	// lease, so the claims the old one left executing are settled from that signal
+	// instead of waiting out `timeoutMs + RESULT_WAIT_MARGIN_MS`. The handshake is
+	// where it happens because it is the only point that can tell a takeover from the
+	// same daemon reclaiming its own lease.
+	describe('reaping a superseded generation’s dispatch claims', () => {
+		it('reaps when the acquire took no reclaim branch, naming the new generation', async () => {
+			const deps = makeDeps();
+
+			const result = await handleHandshake(deps, validBody());
+
+			expect(result.status).toBe(200);
+			expect(deps.reapSupersededWorkerClaims).toHaveBeenCalledWith(WORKER_ID, 7);
+		});
+
+		it('reaps nothing when the daemon reclaimed its own lease (its phase may still be running)', async () => {
+			const deps = makeDeps();
+
+			// `makeAcquired()` returns session 3333… at token 7 — exactly the replace
+			// branch's answer to this proof, so the same daemon is back and #718's held
+			// result is still coming.
+			const result = await handleHandshake(deps, {
+				...validBody(),
+				reclaim: { sessionId: SESSION_ID, fencingToken: 6 },
+			});
+
+			expect(result.status).toBe(200);
+			expect(deps.reapSupersededWorkerClaims).not.toHaveBeenCalled();
+		});
+
+		it('reaps for a stale proof or one naming another session', async () => {
+			const stale = makeDeps();
+			await handleHandshake(stale, {
+				...validBody(),
+				// The row moved past this token while that daemon was away, so the acquire
+				// refused the proof and took the lease over instead.
+				reclaim: { sessionId: SESSION_ID, fencingToken: 3 },
+			});
+			expect(stale.reapSupersededWorkerClaims).toHaveBeenCalledWith(WORKER_ID, 7);
+
+			const foreign = makeDeps();
+			await handleHandshake(foreign, {
+				...validBody(),
+				reclaim: { sessionId: '44444444-4444-4444-8444-444444444444', fencingToken: 6 },
+			});
+			expect(foreign.reapSupersededWorkerClaims).toHaveBeenCalledWith(WORKER_ID, 7);
+		});
+
+		it('still completes the handshake when the reap throws, and still polices enrollments', async () => {
+			const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+			const deps = makeDeps({
+				reapSupersededWorkerClaims: vi.fn().mockRejectedValue(new Error('postgres is down')),
+			});
+
+			const result = await handleHandshake(deps, {
+				...validBody(),
+				repository: 'smarttechbrewery/swarm',
+			});
+
+			// Housekeeping on the control plane's side, exactly like the enrollment pass:
+			// connecting must not depend on it, and the timer remains the slow backstop.
+			expect(result.status).toBe(200);
+			expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
+			expect(deps.releaseSession).not.toHaveBeenCalled();
+			expect(deps.suspendEnrollmentsForMismatchedRepository).toHaveBeenCalled();
+			expect(warn).toHaveBeenCalled();
+			warn.mockRestore();
+		});
+
+		it('reaps nothing for a handshake that never took the lease', async () => {
+			const unauthenticated = makeDeps({
+				resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+			});
+			await handleHandshake(unauthenticated, validBody());
+			expect(unauthenticated.reapSupersededWorkerClaims).not.toHaveBeenCalled();
+
+			const held = makeDeps({
+				acquireSession: vi.fn().mockRejectedValue(new WorkerSessionHeldError(WORKER_ID)),
+			});
+			await handleHandshake(held, validBody());
+			expect(held.reapSupersededWorkerClaims).not.toHaveBeenCalled();
+
+			const versionMismatch = makeDeps();
+			await handleHandshake(versionMismatch, {
+				...validBody(),
+				protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1,
+			});
+			expect(versionMismatch.reapSupersededWorkerClaims).not.toHaveBeenCalled();
+
+			// A capability reduction releases the lease it just took and answers 409, so
+			// there is no new generation to reap the old one on behalf of.
+			const reduced = makeDeps({
+				refreshWorkerCapabilities: vi
+					.fn()
+					.mockRejectedValue(new WorkerCapabilityReductionError(WORKER_ID, ['claude'])),
+			});
+			await handleHandshake(reduced, validBody());
+			expect(reduced.reapSupersededWorkerClaims).not.toHaveBeenCalled();
 		});
 	});
 

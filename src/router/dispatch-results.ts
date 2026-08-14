@@ -14,7 +14,12 @@
  * is awaiting what *here*. A worker that never reports (a crash or drop) is not
  * this registry's concern — the dispatcher imposes its own await timeout and the
  * durable dispatch lease reconciler (`../dispatch/reconciler.ts`) reclaims the
- * abandoned dispatch. What *is* its concern since issue #723 is the transport
+ * abandoned dispatch. The one loss that *is* answered here rather than by that
+ * timeout is a worker session **superseded** by a newer generation (issue #719):
+ * the handshake settles the old generation's durable claims, and the wait behind
+ * each one has to end with them (`failDispatchResultWait`) — otherwise the rows are
+ * settled while the capacity they occupy stays held for the rest of the window.
+ * What *is* its concern since issue #723 is the transport
  * interruption itself: being the one place that knows who is awaiting a given
  * worker, it records a dropped `/worker/stream` against those dispatches, so an
  * undelivered result can be attributed to the drop rather than to a silent worker.
@@ -234,6 +239,46 @@ export function deliverDispatchResult(result: TaskExecutionResult): boolean {
 	unindexRun(result.dispatchId, entry.runId);
 	entry.resolve(result);
 	return true;
+}
+
+/**
+ * End the wait for a dispatch whose durable claim was just settled out from under
+ * it — a worker session superseded by a newer generation (issue #719). Returns
+ * whether a waiter was found; `false` means no dispatcher here is awaiting it
+ * (already settled, or pushed by a router process that has since restarted), and
+ * the durable dispatch row is then the whole story.
+ *
+ * Without this the awaiting job stays parked until `timeoutMs +
+ * RESULT_WAIT_MARGIN_MS` (`./dispatcher.ts`) holding the project slot and a BullMQ
+ * concurrency slot — the settle would reach the rows and none of the capacity — and
+ * it would then settle the same run *again*, as a deferral, over the terminal state
+ * the reap wrote.
+ *
+ * `status: 'failed'` rather than `'deferred'` on purpose: `adaptResultToPhaseRun`
+ * maps it to a non-deferrable `AgentRunError`, so the shared settle path writes the
+ * same terminal run row the reap just wrote, with the same reason. A `deferred`
+ * frame would instead flip that row back to `deferred` with a retry date — via
+ * `completeRun`'s unconditional update — while `scheduleDispatchRetry` no-ops on the
+ * already-terminal dispatch: the exact #269 orphan shape.
+ *
+ * The frame reports the phase and task the *registration* named (issue #724), so a
+ * synthetic terminal result is indistinguishable in shape from a real one.
+ */
+export function failDispatchResultWait(dispatchId: string, reason: string): boolean {
+	const entry = pending.get(dispatchId);
+	// Answered here rather than by `deliverDispatchResult`'s miss branch: a dispatch
+	// nobody is awaiting is the ordinary reading on this path, not the anomaly that
+	// warn line reports.
+	if (!entry) return false;
+	return deliverDispatchResult({
+		type: 'task-execution-result',
+		dispatchId,
+		status: 'failed',
+		phase: entry.phase,
+		taskId: entry.taskId,
+		error: reason,
+		reason,
+	});
 }
 
 /**

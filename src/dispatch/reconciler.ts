@@ -13,6 +13,12 @@
  * Runs inside the worker: once at startup (after migrations, before serving
  * jobs) and periodically while serving. Every step is best-effort and logged —
  * reconciliation must never stop the worker from serving real work.
+ *
+ * One repair here is **signal-driven rather than periodic**:
+ * {@link reconcileSupersededWorkerClaims} is called by the worker handshake the
+ * moment a new session generation takes a worker's lease (issue #719), because a
+ * timer has no way to tell that takeover apart from the same daemon reconnecting
+ * into a phase that is still executing.
  */
 
 import { Queue } from 'bullmq';
@@ -51,8 +57,13 @@ const LEGACY_MERGE_FOLLOW_UP_QUEUE = 'swarm-merge-follow-ups';
 
 const DEAD_LEASE_REASON =
 	'Worker lease expired without the dispatch settling — reconciled as failed (dead worker or crashed phase)';
+/**
+ * What a superseded claim records — deliberately *not* the back-channel timer's
+ * "did not report a result within the lease window", so run history says which of
+ * the two actually happened (issue #719).
+ */
 const SUPERSEDED_WORKER_SESSION_REASON =
-	'Worker session was superseded before the dispatch settled — reconciled as failed';
+	"The worker's session was superseded by a newer one while this phase was executing — settled from that signal, not from the lease window";
 
 async function settleFailedDispatchRuns(failed: DispatchRow[]): Promise<void> {
 	for (const dispatch of failed) {
@@ -83,18 +94,30 @@ async function reclaimDeadLeases(asOf: Date): Promise<number> {
 	return failed.length;
 }
 
-/** Reap claims left by this worker's older fenced session after re-acquisition. */
+/**
+ * Reap the execution claims this worker's older fenced session left behind, and
+ * settle their still-`running` run rows the same way. Called from the handshake
+ * that minted the new generation (`../router/worker-transport.ts`) — the one moment
+ * a *takeover* is distinguishable from the same daemon reconnecting into its own
+ * lease, so a phase still genuinely executing is never reaped underneath itself
+ * (issue #719).
+ *
+ * Returns the rows it failed rather than a count: each one's control-plane result
+ * wait has to end with it, and the registry that holds those waits is keyed by
+ * dispatch id, not by fencing token. The reason written here is what the dispatch,
+ * the run, and that synthetic terminal result all carry.
+ */
 export async function reconcileSupersededWorkerClaims(
 	workerId: string,
 	activeFencingToken: number,
-): Promise<number> {
+): Promise<DispatchRow[]> {
 	const failed = await failSupersededWorkerDispatchClaims(
 		workerId,
 		activeFencingToken,
 		SUPERSEDED_WORKER_SESSION_REASON,
 	);
 	await settleFailedDispatchRuns(failed);
-	return failed.length;
+	return failed;
 }
 
 /** Re-publish wake-ups for every wakeable dispatch (idempotent by design). */

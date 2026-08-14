@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	INITIAL_FENCING_TOKEN,
+	isReclaimedSession,
 	isReclaimOf,
 	isSessionLive,
 	nextFencingToken,
@@ -97,6 +98,40 @@ describe('isReclaimOf (the reconnecting holder’s proof — issue #608)', () =>
 		// remembers — which is what makes matching on the token load-bearing.
 		expect(isReclaimOf(session, { sessionId: session.id, fencingToken: 3 })).toBe(false);
 		expect(isReclaimOf(session, { sessionId: session.id, fencingToken: 5 })).toBe(false);
+	});
+});
+
+describe('isReclaimedSession (the acquire branch the handshake reads back — issue #719)', () => {
+	const SESSION_ID = '11111111-1111-4111-8111-111111111111';
+	const OTHER_ID = '22222222-2222-4222-8222-222222222222';
+	// What the replace branch returns for a reclaim of the lease at token 6.
+	const acquired = { id: SESSION_ID, fencingToken: 7 };
+
+	it('accepts the daemon’s own lease handed back with the token bumped by one', () => {
+		expect(isReclaimedSession(acquired, { sessionId: SESSION_ID, fencingToken: 6 })).toBe(true);
+	});
+
+	it('refuses an acquire that presented no proof — a restarted daemon or a takeover', () => {
+		expect(isReclaimedSession(acquired, undefined)).toBe(false);
+	});
+
+	it('refuses a superseded holder’s stale proof, however close', () => {
+		// The row moved on twice while that daemon was away, so the bump is not one.
+		expect(isReclaimedSession(acquired, { sessionId: SESSION_ID, fencingToken: 5 })).toBe(false);
+		// A proof naming the token the row already carries is not a reclaim either: the
+		// reclaim branch bumps, so a matching token means the acquire took another path.
+		expect(isReclaimedSession(acquired, { sessionId: SESSION_ID, fencingToken: 7 })).toBe(false);
+	});
+
+	it('refuses a proof naming another session, whatever its token', () => {
+		expect(isReclaimedSession(acquired, { sessionId: OTHER_ID, fencingToken: 6 })).toBe(false);
+	});
+
+	it('refuses the insert branch’s brand-new session against any proof', () => {
+		// A first-ever acquire mints a fresh row id, so no remembered pair can name it.
+		const inserted = { id: OTHER_ID, fencingToken: INITIAL_FENCING_TOKEN };
+		expect(isReclaimedSession(inserted, { sessionId: SESSION_ID, fencingToken: 6 })).toBe(false);
+		expect(isReclaimedSession(inserted, undefined)).toBe(false);
 	});
 });
 

@@ -4,9 +4,12 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
 	claimDispatch,
+	claimWorkerForDispatch,
 	createDispatch,
 	getActiveDispatchByRunId,
 	getDispatchById,
+	getWorkerDispatchClaimState,
+	markDispatchRunning,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import { createProjectInDb } from '../../../src/db/repositories/projectsRepository.js';
 import {
@@ -15,7 +18,14 @@ import {
 	getRunByIdFromDb,
 	updateReviewMergeOutcome,
 } from '../../../src/db/repositories/runsRepository.js';
-import { reconcileDispatchesAtStartup } from '../../../src/dispatch/reconciler.js';
+import { createUser } from '../../../src/db/repositories/usersRepository.js';
+import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
+import { acquireLease } from '../../../src/db/repositories/workerSessionsRepository.js';
+import { createWorker } from '../../../src/db/repositories/workersRepository.js';
+import {
+	reconcileDispatchesAtStartup,
+	reconcileSupersededWorkerClaims,
+} from '../../../src/dispatch/reconciler.js';
 import { QUEUE_NAME, type SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
 import { createMockProjectRecord, createMockScmWebhookJob } from '../../helpers/factories.js';
@@ -240,6 +250,124 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 
 			expect(second?.id).toBe(first?.id);
 			expect(await pendingJobIds()).toHaveLength(1);
+		});
+
+		/**
+		 * The signal-driven repair (issue #719): a claim bound to a fencing token the
+		 * worker's session has moved past belongs to a generation that is gone, and the
+		 * handshake that minted the new one settles it there and then rather than leaving
+		 * it to the back-channel timer.
+		 */
+		describe('reconcileSupersededWorkerClaims', () => {
+			/** A worker with an active enrollment, its session lease, and a claimed dispatch. */
+			async function seedClaimedDispatch() {
+				const owner = await createUser({
+					identifier: 'superseded-owner@example.com',
+					displayName: 'Owner',
+				});
+				const worker = await createWorker({
+					ownerUserId: owner.id,
+					displayName: 'm3_pro_karolina',
+					capabilities: ['claude'],
+					credentialHash: 'hash-superseded',
+				});
+				await createEnrollment({
+					workerId: worker.id,
+					projectId: PROJECT_ID,
+					status: 'active',
+					allowedClis: ['claude'],
+					allowedPhases: ['implementation'],
+					concurrencyAllocation: 1,
+					sharingConsent: true,
+				});
+				const session = await acquireLease(worker.id, 60_000);
+				const runId = await createRun({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: '719',
+					phase: 'implementation',
+				});
+				const { dispatch } = await createDispatch({
+					projectId: PROJECT_ID,
+					jobPayload: job({ runId }),
+					source: 'webhook',
+					runId,
+					taskId: '719',
+					phase: 'implementation',
+				});
+				// A long lease, as a real agent-timeout dispatch has: the whole point is that
+				// this settles without waiting for it to expire.
+				const leased = await claimDispatch(dispatch.id, 'host-a:1', 3_000_000);
+				if (!leased) throw new Error('test dispatch was not leased');
+				const claim = await claimWorkerForDispatch({
+					dispatchId: dispatch.id,
+					dispatchLeaseOwner: leased.leaseOwner ?? '',
+					projectId: PROJECT_ID,
+					selectedWorkerId: worker.id,
+					executionWorkerId: worker.id,
+					workerSessionId: session.id,
+					workerFencingToken: session.fencingToken,
+					cli: 'claude',
+					heartbeatTtlMs: 60_000,
+				});
+				expect(claim.claimed).toBe(true);
+				// The reproduction's shape: the phase is executing, on a lease that will not
+				// expire for another 50 minutes.
+				await markDispatchRunning(
+					dispatch.id,
+					runId,
+					new Date(Date.now() + 3_000_000),
+					'719',
+					'implementation',
+				);
+				return { worker, session, runId, dispatchId: dispatch.id };
+			}
+
+			it('settles the claim and its running run, and frees the worker’s capacity', async () => {
+				const { worker, session, runId, dispatchId } = await seedClaimedDispatch();
+
+				const failed = await reconcileSupersededWorkerClaims(worker.id, session.fencingToken + 1);
+
+				// The rows are returned, not counted: each one's control-plane result wait is
+				// keyed by dispatch id and has to end with it.
+				expect(failed.map((row) => row.id)).toEqual([dispatchId]);
+				const settled = await getDispatchById(dispatchId);
+				expect(settled).toMatchObject({ state: 'failed', leaseOwner: null, leaseExpiresAt: null });
+				// The reason says which of the two things happened — not the timer's "did not
+				// report a result within the lease window" (AC 4).
+				expect(settled?.lastError).toContain('superseded');
+				expect(settled?.lastError).not.toContain('did not report a result');
+				// The run row settles with it, on the same reason, rather than staying
+				// `running` behind a dispatch nothing is executing.
+				const run = await getRunByIdFromDb(runId);
+				expect(run?.status).toBe('failed');
+				expect(run?.error).toBe(settled?.lastError);
+				// The durable half of "the freed capacity is usable immediately" (AC 2).
+				expect((await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).activeRuns).toBe(0);
+			});
+
+			it('leaves a claim bound to the current generation alone (AC 3)', async () => {
+				const { worker, session, runId, dispatchId } = await seedClaimedDispatch();
+
+				// The same daemon reclaiming its own lease never reaches this call, but the
+				// SQL guard is the second line of defence: a phase still executing under the
+				// active token is not this reap's business.
+				const failed = await reconcileSupersededWorkerClaims(worker.id, session.fencingToken);
+
+				expect(failed).toEqual([]);
+				expect((await getDispatchById(dispatchId))?.state).toBe('running');
+				expect((await getRunByIdFromDb(runId))?.status).toBe('running');
+			});
+
+			it('is idempotent — a second pass finds nothing left to settle', async () => {
+				const { worker, session } = await seedClaimedDispatch();
+
+				await reconcileSupersededWorkerClaims(worker.id, session.fencingToken + 1);
+
+				expect(await reconcileSupersededWorkerClaims(worker.id, session.fencingToken + 1)).toEqual(
+					[],
+				);
+			});
 		});
 	},
 );

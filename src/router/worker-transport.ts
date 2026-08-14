@@ -15,8 +15,9 @@
  *   - `POST /worker/session` — the handshake (request/response): authenticate the
  *     credential, acquire the fenced lease — reclaiming the daemon's *own* live lease
  *     when it presents the proof (issue #608) — declare the daemon's CLIs and its
- *     checkout's repository, suspend any enrollment that declaration contradicts
- *     (issue #690), return the session.
+ *     checkout's repository, settle the execution claims of the generation this
+ *     acquire superseded when it was *not* such a reclaim (issue #719), suspend any
+ *     enrollment that declaration contradicts (issue #690), return the session.
  *   - `GET /worker/stream` — a WebSocket carrying periodic heartbeat frames that
  *     keep the lease live, releasing it on disconnect — and, since issue #723,
  *     recording that disconnect against the dispatches this router is awaiting on
@@ -40,6 +41,7 @@ import type { Hono } from 'hono';
 import type { WSContext } from 'hono/ws';
 
 import { promoteAvailabilityWaitsForWorker } from '../dispatch/dispatcher.js';
+import { reconcileSupersededWorkerClaims } from '../dispatch/reconciler.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '../identity/worker.js';
 import {
@@ -51,6 +53,7 @@ import {
 	resolveWorkerByCredential,
 	WorkerCapabilityReductionError,
 } from '../identity/worker-service.js';
+import { isReclaimedSession } from '../identity/worker-session.js';
 import {
 	type AcquiredSession,
 	acquireSession,
@@ -80,6 +83,7 @@ import {
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
+	failDispatchResultWait,
 	noteWorkerTransportLost,
 	noteWorkerTransportRestored,
 	resolveDispatchStreamTarget,
@@ -108,6 +112,15 @@ type UpgradeWebSocket = ReturnType<typeof createNodeWebSocket>['upgradeWebSocket
 /** Human-readable disconnect reason when a heartbeat can no longer refresh the lease. */
 const LEASE_LOST_REASON =
 	'session lease is no longer live (lost, expired, or superseded by a newer daemon)';
+
+/**
+ * Fallback settle reason for a reaped claim whose row carries no `lastError`. The
+ * reap writes one on every row it returns, so this is defensive only — but it must
+ * still read as the supersede and never as the back-channel timer's "did not report
+ * a result within the lease window" (issue #719).
+ */
+const SUPERSEDED_CLAIM_REASON =
+	"The worker's session was superseded by a newer one while this phase was executing";
 
 /**
  * Collaborators the transport depends on, defaulted to the real session service
@@ -141,6 +154,16 @@ export interface WorkerTransportDeps {
 		workerId: string,
 		declaredRepository: string,
 	) => Promise<SuspendedMismatchedEnrollment[]>;
+	/**
+	 * A *new* session generation just took this worker's lease (issue #719) — settle
+	 * the execution claims the previous generation left behind, and the control-plane
+	 * result waits parked behind them, instead of leaving both to the back-channel
+	 * timer. Called only when the acquire was **not** a reclaim, so a reconnecting
+	 * daemon whose phase is still executing (and which, since #718, still holds its
+	 * terminal result) is never reaped underneath itself. Never throws and never
+	 * blocks the handshake.
+	 */
+	reapSupersededWorkerClaims: (workerId: string, activeFencingToken: number) => Promise<void>;
 	resolveHeartbeatTtlMs: () => number;
 	validateFencingToken: (workerId: string, token: number, ttlMs?: number) => Promise<boolean>;
 	/**
@@ -194,6 +217,7 @@ function defaultDeps(): WorkerTransportDeps {
 		releaseSession,
 		refreshWorkerCapabilities,
 		suspendEnrollmentsForMismatchedRepository,
+		reapSupersededWorkerClaims,
 		resolveHeartbeatTtlMs,
 		validateFencingToken,
 		deliverDispatchResult,
@@ -225,13 +249,14 @@ export interface HandshakeResult {
 
 /**
  * The handshake, as a pure function of its deps and the raw request body:
- * validate → authenticate → acquire lease → declare CLIs and repository → police
- * enrollments against that repository → return the session.
+ * validate → authenticate → acquire lease → declare CLIs and repository → reap the
+ * superseded generation's claims → police enrollments against that repository →
+ * return the session.
  * Returns the status/body for the route to send; never throws for an expected
  * failure (bad request, bad credential, lease held, capability reduction), and
- * never reflects the credential in the body. The enrollment-policing pass is the
- * one step whose failure is swallowed rather than reported: it is housekeeping on
- * the control plane's side of the connection, not a condition of connecting.
+ * never reflects the credential in the body. The last two steps are the ones whose
+ * failure is swallowed rather than reported: both are housekeeping on the control
+ * plane's side of the connection, not conditions of connecting.
  */
 export async function handleHandshake(
 	deps: WorkerTransportDeps,
@@ -338,6 +363,13 @@ export async function handleHandshake(
 		throw err;
 	}
 
+	// A reclaim is the same daemon coming back, so its in-flight assignment — and the
+	// terminal result #718 holds for it — must survive. Anything else is a *new*
+	// generation, and the claims bound to the old one are settled here, from the
+	// supersede itself, rather than at the end of the lease window (issue #719).
+	if (!isReclaimedSession(session.session, request.reclaim)) {
+		await reapClaimsOfSupersededSession(deps, worker.id, session.fencingToken);
+	}
 	// Only now that the declaration is persisted — the pass acts on what the row says.
 	await policeEnrollmentsAgainstDeclaration(deps, worker.id, request.repository);
 
@@ -384,6 +416,72 @@ async function policeEnrollmentsAgainstDeclaration(
 			workerId,
 			repository: declaredRepository,
 			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
+ * Settle the execution claims a superseded session generation left behind (issue
+ * #719), the way `policeEnrollmentsAgainstDeclaration` polices enrollments:
+ * **never throws, never blocks the handshake**. A Postgres hiccup here logs and the
+ * session still comes back — connecting must not depend on housekeeping, and the
+ * back-channel timer remains the (slow) backstop it always was.
+ */
+async function reapClaimsOfSupersededSession(
+	deps: WorkerTransportDeps,
+	workerId: string,
+	activeFencingToken: number,
+): Promise<void> {
+	try {
+		await deps.reapSupersededWorkerClaims(workerId, activeFencingToken);
+	} catch (err) {
+		logger.warn('worker handshake: reaping the superseded session’s dispatch claims failed', {
+			workerId,
+			activeFencingToken,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
+ * The default reap: fail the durable claims still bound to a superseded fencing
+ * token (`../dispatch/reconciler.ts`, which settles their `running` run rows with
+ * them), then end each one's control-plane result wait so the awaiting job unwinds
+ * now instead of at `timeoutMs + RESULT_WAIT_MARGIN_MS`.
+ *
+ * Both halves are load-bearing. The rows are what `claimWorkerForDispatch` counts
+ * this worker's and the project's capacity from; the parked job is what holds the
+ * project slot (`../worker/project-concurrency.ts`) and a BullMQ concurrency slot —
+ * so failing the rows alone would free the claim and none of the capacity, and the
+ * job would later settle the same run a *second* time when its own timer fired.
+ *
+ * Nothing is promoted from here on purpose: the unwind's own `finally` releases the
+ * slot and then runs both existing promotions (`../worker/consumer.ts`), and a wake
+ * issued while the slot is still held only makes the woken dispatch re-defer.
+ */
+async function reapSupersededWorkerClaims(
+	workerId: string,
+	activeFencingToken: number,
+): Promise<void> {
+	const failed = await reconcileSupersededWorkerClaims(workerId, activeFencingToken);
+	for (const dispatch of failed) {
+		// The reap's own reason, so the dispatch row, the run row and the synthetic
+		// terminal result all say the same thing.
+		const awaited = failDispatchResultWait(
+			dispatch.id,
+			dispatch.lastError ?? SUPERSEDED_CLAIM_REASON,
+		);
+		logger.warn('worker handshake: settled a superseded worker dispatch claim', {
+			workerId,
+			dispatchId: dispatch.id,
+			runId: dispatch.runId,
+			taskId: dispatch.taskId,
+			phase: dispatch.phase,
+			boundFencingToken: dispatch.workerFencingToken,
+			activeFencingToken,
+			// `false` is the "no dispatcher here was awaiting it" reading — this router
+			// restarted since the push, so only the durable row needed settling.
+			resultWaitEnded: awaited,
 		});
 	}
 }

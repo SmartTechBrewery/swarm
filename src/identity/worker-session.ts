@@ -26,9 +26,10 @@
  * This is the persisted-row read model; `src/db/schema/workerSessions.ts` is its
  * table and `src/db/repositories/workerSessionsRepository.ts` owns the atomic
  * acquire/heartbeat/release transitions. The domain-level helpers here
- * (`isSessionLive`, `nextFencingToken`, `isReclaimOf`) stay dependency-free so
- * both the repository and the service share one definition of "live", "next
- * token", and "the caller's own lease".
+ * (`isSessionLive`, `nextFencingToken`, `isReclaimOf`, `isReclaimedSession`) stay
+ * dependency-free so the repository, the service, and the transport share one
+ * definition of "live", "next token", "the caller's own lease", and "the acquire
+ * that handed that lease back".
  */
 
 import { z } from 'zod';
@@ -106,6 +107,33 @@ export function isReclaimOf(
  */
 export function nextFencingToken(current: number): number {
 	return current + 1;
+}
+
+/**
+ * Whether `session` is the lease `reclaim` proved possession of, re-acquired —
+ * i.e. whether the acquire that produced it took {@link isReclaimOf}'s reclaim
+ * branch (issue #719). The replace branch keeps the row's own `id` and bumps the
+ * token by exactly one ({@link nextFencingToken}), so the returned session plus
+ * the proof the caller presented identify the branch without the repository
+ * having to report it.
+ *
+ * The one thing a caller needs this for is telling "the same daemon is back, and
+ * its phase may still be executing" apart from "a new generation took this worker
+ * over", so a reap of the previous generation's execution claims can never fire on
+ * a reconnecting daemon. `undefined` (no proof) and a stale proof are both
+ * `false`: a *restarted* daemon lost the pair with its memory, and a superseded
+ * holder's remembered token is more than one behind. A first-ever insert is
+ * `false` too — it mints a fresh row `id`, which no proof can name.
+ */
+export function isReclaimedSession(
+	session: { id: string; fencingToken: number },
+	reclaim: WorkerSessionReclaim | undefined,
+): boolean {
+	return (
+		reclaim !== undefined &&
+		reclaim.sessionId === session.id &&
+		session.fencingToken === nextFencingToken(reclaim.fencingToken)
+	);
 }
 
 /**

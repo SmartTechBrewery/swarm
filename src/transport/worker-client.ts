@@ -578,7 +578,11 @@ export interface WorkerTransportClient {
  *   2. A result flushed after the control plane has disposed its waiter is dropped
  *      router-side (bounded by `timeoutMs + RESULT_WAIT_MARGIN_MS`,
  *      `../router/dispatcher.ts`). Phase 2 of issue #718 makes that case say so;
- *      issue #719 shortens it.
+ *      issue #719 shortened it for the one shape that is knowable early — a session
+ *      *superseded* by a newer generation, whose claims the next handshake settles
+ *      at once (`../router/worker-transport.ts`). A flush racing that settle is the
+ *      residual: the daemon holding it is, by definition, one whose reclaim was
+ *      refused.
  *
  * "Re-send until acked" was rejected: there is no result ack, and `dispatchId` is
  * stable across a re-dispatch (`reopenDispatchForManualRetry`, `../api/routers/runs.ts`),

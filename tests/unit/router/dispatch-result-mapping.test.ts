@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
-import type { TransportInterruptions } from '@/router/dispatch-results.js';
+import {
+	awaitDispatchResult,
+	failDispatchResultWait,
+	type TransportInterruptions,
+} from '@/router/dispatch-results.js';
 import { adaptResultToPhaseRun, awaitResultWithGuards } from '@/router/dispatcher.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
@@ -112,6 +116,39 @@ describe('adaptResultToPhaseRun', () => {
 		expect(() =>
 			adaptResultToPhaseRun(base({ status: 'failed', error: 'agent exited 1' }), SELECTION),
 		).toThrow('agent exited 1');
+	});
+
+	it('settles a superseded worker session terminally, on the reap’s own reason (issue #719)', async () => {
+		const REASON =
+			"The worker's session was superseded by a newer one while this phase was executing — settled from that signal, not from the lease window";
+		// The frame the reap actually produces, not a hand-built one — the two halves of
+		// the seam asserted against each other, as the dependency case below does.
+		const awaiting = awaitDispatchResult(DISPATCH, {
+			workerId: 'w-1',
+			runId: 'run-719',
+			phase: 'implementation',
+			taskId: '719',
+		});
+		expect(failDispatchResultWait(DISPATCH, REASON)).toBe(true);
+		const frame = await awaiting.result;
+
+		try {
+			adaptResultToPhaseRun(frame, SELECTION);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect(err).toBeInstanceOf(AgentRunError);
+			const failed = err as AgentRunError;
+			// `error`, not one of the deferrable kinds: the reap already wrote the dispatch
+			// and run rows terminally, and a deferral would flip that run back to
+			// `deferred` with a retry date while the dispatch stayed `failed`.
+			expect(failed.failure.kind).toBe('error');
+			// The reason is what the run row and the dispatch's `last_error` record, so it
+			// must survive the round trip — and must not read as the lease-window timeout.
+			expect(failed.message).toBe(REASON);
+			expect(failed.message).not.toContain('did not report a result within the lease window');
+		}
+
+		awaiting.dispose();
 	});
 
 	it('rebuilds DependencyBlockedError for a dependency deferral (issue #438)', () => {
