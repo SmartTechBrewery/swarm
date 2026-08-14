@@ -19,7 +19,12 @@
  *      reset path alone may ask to release a *stale* lease and — with `force`
  *      only — to discard dirty/unpushed work;
  *   4. clear the recovery record and captured session id;
- *   5. create the replacement dispatch, last, so a failure part-way through
+ *   5. compose the replacement payload as a *first attempt* — no session to resume,
+ *      no branch checkpoint, no delivery progress, no inherited recovery mode
+ *      (`reconstructResetJob`, issue #741) — and write it back onto the run row,
+ *      whose `job_payload` column latches the same resume state the `recovery`
+ *      column does and is what a *second* reset (and `runs.retryNow`) reads;
+ *   6. create the replacement dispatch, last, so a failure part-way through
  *      leaves the run terminal-and-idle: exactly the state a second `resetRun`
  *      call retries from. The operation is idempotent in that sense.
  *
@@ -64,10 +69,12 @@ import {
 	clearRunRecovery,
 	getRunByIdFromDb,
 	hasLiveRunForTask,
+	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { clearRunCancellation } from '../queue/cancellation.js';
+import type { SwarmJob } from '../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
@@ -76,7 +83,7 @@ import {
 	type TerminationCleanupResult,
 } from '../worktree/termination-cleanup.js';
 import { cancelDispatchAndWake, createAndPublishDispatch, wakeJobId } from './dispatcher.js';
-import { reconstructRetryJob } from './retry-payload.js';
+import { reconstructResetJob } from './retry-payload.js';
 
 /** Why a reset was refused, machine-readable so each surface maps it to its own error shape. */
 export type RunResetRefusal =
@@ -168,6 +175,29 @@ async function cancelActiveDispatch(
 	await cancelClaimedDispatch(active.id, reason);
 	await removePendingJobById(wakeJobId(active)).catch(() => false);
 	return 'force-cancelled-claimed';
+}
+
+/**
+ * Write the reset's clean payload back onto the run row (issue #741). The dispatch
+ * payload is authoritative at claim time, but the row's own `job_payload` keeps
+ * whatever resume latches the wedged attempt stored until a worker claims this
+ * restart and `resetRunToRunning` overwrites it — and that column is what a
+ * *second* reset and `runs.retryNow`'s reconstruct-from-row path read. So it is
+ * sanitised here, before the replacement dispatch exists, or the state the reset
+ * was called to clear survives its own fix.
+ *
+ * Best-effort on purpose: the restart itself is already clean, so a failed write
+ * must never turn a reset — the last-resort action — into a refusal.
+ */
+async function sanitizeStoredJobPayload(runId: string, job: SwarmJob): Promise<void> {
+	try {
+		await updateRunJobPayload(runId, job);
+	} catch (err) {
+		logger.warn('run reset: could not sanitise the run row’s stored payload', {
+			runId,
+			error: describeError(err),
+		});
+	}
 }
 
 /**
@@ -273,16 +303,13 @@ export async function resetRun(
 	// checkout (see the module header); a plain one carries none, so the worker's
 	// ordinary reclaim gate applies its unchanged protections.
 	const worktreeIntent: ResetRunResult['worktreeIntent'] = force ? 'discard' : 'reclaim';
-	const job = reconstructRetryJob(
-		run.jobPayload,
-		run.id,
-		run.phase,
-		undefined,
-		undefined,
-		undefined,
-		true,
-		force ? 'discard' : undefined,
-	);
+	// A *first attempt*, not a retry (issue #741): the stored payload's resume latches
+	// — a session to re-enter, delivery progress, a provisioned task branch, a recovery
+	// mode an earlier attempt chose — are all dropped, and the only mode carried is this
+	// reset's own. Inheriting them is what made every reset of a run whose payload held
+	// `implementationBranchProvisioned` re-provision against a branch that did not exist.
+	const job = reconstructResetJob(run.jobPayload, run.id, run.phase, force ? 'discard' : undefined);
+	await sanitizeStoredJobPayload(run.id, job);
 	let dispatchId: string;
 	try {
 		const created = await createAndPublishDispatch({

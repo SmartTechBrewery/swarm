@@ -4,6 +4,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	getRunByIdFromDb: vi.fn(),
 	clearRunRecovery: vi.fn(),
 	hasLiveRunForTask: vi.fn(),
+	updateRunJobPayload: vi.fn(),
 }));
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
@@ -47,6 +48,7 @@ import {
 	clearRunRecovery,
 	getRunByIdFromDb,
 	hasLiveRunForTask,
+	updateRunJobPayload,
 } from '@/db/repositories/runsRepository.js';
 import type { runs } from '@/db/schema/runs.js';
 import { cancelDispatchAndWake, createAndPublishDispatch } from '@/dispatch/dispatcher.js';
@@ -167,6 +169,7 @@ describe('resetRun', () => {
 		vi.mocked(clearRunCancellation).mockReset().mockResolvedValue(undefined);
 		vi.mocked(clearRunRecovery).mockReset().mockResolvedValue(undefined);
 		vi.mocked(hasLiveRunForTask).mockReset().mockResolvedValue(false);
+		vi.mocked(updateRunJobPayload).mockReset().mockResolvedValue(undefined);
 		vi.mocked(removePendingJobById).mockClear();
 		vi.mocked(reconcileTerminatedWorktree).mockReset().mockResolvedValue({ outcome: 'removed' });
 		vi.mocked(createAndPublishDispatch)
@@ -253,6 +256,84 @@ describe('resetRun', () => {
 		expect(jobPayload.agentSessionId).toEqual(expect.any(String));
 		expect(jobPayload.agentSessionId).not.toBe('stale-session');
 		expect(jobPayload.resumeSession).toBeUndefined();
+	});
+
+	// Issue #741 — the reported failure, end to end. Reset was built by the *manual retry*
+	// payload builder, which inherits recovery intent on purpose, so run 2d3df9b3's stored
+	// `implementationBranchProvisioned: true` survived every reset and each restart
+	// re-provisioned with `createBranch: false` against a branch that no longer existed
+	// (`fatal: invalid reference: issue-719`), while a fresh dispatch of the same task ran fine.
+	describe('the replacement dispatch carries no resumption state', () => {
+		const STORED_SESSION = '92340ec7-709e-4ffa-9297-3899caca4830';
+
+		/** The reported run: a stored payload holding every resume latch at once. */
+		const latchedRun = () =>
+			makeRun({
+				jobPayload: {
+					...JOB_PAYLOAD,
+					agentSessionId: STORED_SESSION,
+					resumeSession: true,
+					resumeDelivery: true,
+					implementationBranchProvisioned: true,
+					recoveryMode: 'resume',
+				},
+			});
+
+		it('provisions as a first attempt would after a plain reset', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
+
+			await resetRun('run-1');
+
+			const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
+			expect(jobPayload.implementationBranchProvisioned).toBeUndefined();
+			expect(jobPayload.resumeSession).toBeUndefined();
+			expect(jobPayload.resumeDelivery).toBeUndefined();
+			expect(jobPayload.recoveryMode).toBeUndefined();
+			expect(jobPayload.agentSessionId).not.toBe(STORED_SESSION);
+			expect(jobPayload.agentSessionId).toEqual(expect.any(String));
+		});
+
+		// A forced reset strips the same latches, but keeps the mode it chose itself —
+		// the only way the checkout is reached when it lives on another worker (issue #592).
+		it("keeps the forced reset's own discard intent while dropping the stored one", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
+
+			await resetRun('run-1', { force: true });
+
+			const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
+			expect(jobPayload.recoveryMode).toBe('discard');
+			expect(jobPayload.implementationBranchProvisioned).toBeUndefined();
+			expect(jobPayload.resumeSession).toBeUndefined();
+			expect(jobPayload.resumeDelivery).toBeUndefined();
+		});
+
+		// The row's own `job_payload` keeps the latch until a worker claims the restart, and
+		// it is what a *second* reset and `runs.retryNow`'s reconstruct-from-row path read —
+		// so leaving it poisoned would let the wedged state outlive its own fix.
+		it('sanitises the run row’s stored payload before creating the dispatch', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
+
+			await resetRun('run-1');
+
+			const [runId, persisted] = vi.mocked(updateRunJobPayload).mock.calls[0];
+			expect(runId).toBe('run-1');
+			expect(persisted.implementationBranchProvisioned).toBeUndefined();
+			expect(persisted.resumeSession).toBeUndefined();
+			expect(persisted.resumeDelivery).toBeUndefined();
+			expect(persisted.recoveryMode).toBeUndefined();
+			expect(persisted).toEqual(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload);
+			expect(vi.mocked(updateRunJobPayload).mock.invocationCallOrder[0]).toBeLessThan(
+				vi.mocked(createAndPublishDispatch).mock.invocationCallOrder[0],
+			);
+		});
+
+		it('still resets when the row could not be sanitised', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
+			vi.mocked(updateRunJobPayload).mockRejectedValue(new Error('db down'));
+
+			await expect(resetRun('run-1')).resolves.toMatchObject({ dispatchId: 'dispatch-2' });
+			expect(createAndPublishDispatch).toHaveBeenCalled();
+		});
 	});
 
 	it('reports an idempotent no-op reset when nothing is left to tear down', async () => {

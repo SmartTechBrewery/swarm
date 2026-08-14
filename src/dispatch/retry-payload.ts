@@ -7,17 +7,26 @@
  * between settle and wake-up publication, instead of living only inside a
  * fire-and-forget BullMQ handler.
  *
- * It also owns {@link reconstructRetryJob}, the *manual* counterpart: the
- * payload an operator-driven attempt runs with. It lives here rather than in
- * the tRPC router so both operator paths — "Retry now" (`runs.retryNow`) and
- * "Reset & restart" (`src/dispatch/run-reset.ts`, issue #424) — rebuild an
- * attempt the same way.
+ * It also owns the two *manual* counterparts — the payloads an operator-driven
+ * attempt runs with — which live here rather than in the tRPC router so both
+ * operator paths are built in one place. They are deliberately **not** the same
+ * builder (issue #741): {@link reconstructRetryJob} serves "Retry now"
+ * (`runs.retryNow`) and inherits recovery intent, because a retry's whole purpose
+ * can be to re-enter a session or adopt a preserved checkout;
+ * {@link reconstructResetJob} serves "Reset & restart"
+ * (`src/dispatch/run-reset.ts`, issue #424) and inherits none of it, because a
+ * reset's contract is that the phase runs as if it had never run.
  */
 
 import { randomUUID } from 'node:crypto';
 import type { AgentCli } from '../harness/agent-cli.js';
 import type { ReasoningLevel } from '../harness/models.js';
-import { normalizeStoredJobPayload, type RecoveryMode, type SwarmJob } from '../queue/jobs.js';
+import {
+	normalizeStoredJobPayload,
+	type RecoveryMode,
+	type SwarmJob,
+	stripRecoveryIntent,
+} from '../queue/jobs.js';
 import type { TriggerPhase } from '../triggers/types.js';
 
 /** The slice of a `phase-deferred` outcome the payload derivation needs. */
@@ -272,6 +281,60 @@ export function reconstructRetryJob(
 	if (model) job.modelOverride = model;
 	if (reasoning) job.reasoningOverride = reasoning;
 	applyManualRecoveryIntent(job, freshSession, recoveryMode, expectedSessionId);
+	return job;
+}
+
+/**
+ * Rebuild a **reset's** replacement payload from a stored one (issue #741): the
+ * phase's dispatch intent and bookkeeping are carried, and every piece of
+ * resumption state is dropped, so the restart is composed exactly as a first
+ * attempt is.
+ *
+ * This is not a flag on {@link reconstructRetryJob} because the two builders now
+ * disagree on purpose. A manual retry *may* re-enter a session, adopt a preserved
+ * checkout, and inherit a stored `'resume'`/`'fresh'`/`'checkpoint'`; a reset may do
+ * none of that — "Reset & restart" promises the operator that the phase starts over.
+ * Building it on the retry helper is what produced the reported failure: a stored
+ * `implementationBranchProvisioned: true` survived every reset of run 2d3df9b3, so
+ * each restart re-provisioned with `createBranch: false` against a branch that no
+ * longer existed and died on `fatal: invalid reference: issue-719`, while an ordinary
+ * fresh dispatch of the same task ran fine.
+ *
+ * What *is* carried is dispatch intent rather than resumption: `runId` (so the reset
+ * reuses that row), a zeroed rate-limit budget (a manual action bypasses the
+ * automatic cap), and `resumePmPhase` for a board phase — which records only *which
+ * phase this dispatch is*, after the card already moved to In progress, and makes the
+ * run adopt no checkout, branch, or session.
+ *
+ * `recoveryMode` is the reset's **own** intent and nothing else: `'discard'` for a
+ * forced reset, whose worker-side teardown is the only way a checkout on another host
+ * is reached (issue #592), and absent for a plain one, which leaves the worker's
+ * ordinary reclaim gate and its protections in place. It is applied *after* the strip,
+ * so the mode the caller asks for is never removed along with the stored one.
+ *
+ * The stored payload is normalized first, exactly as the retry path does it: a reset
+ * reads a raw `run.jobPayload` straight out of `jsonb`, so a pre-#385/#297 row heals
+ * here instead of being re-persisted in its legacy envelope.
+ */
+export function reconstructResetJob(
+	jobPayload: SwarmJob,
+	runId: string,
+	phase: string,
+	recoveryMode?: RecoveryMode,
+): SwarmJob {
+	const job = stripRecoveryIntent(normalizeStoredJobPayload(jobPayload));
+	job.runId = runId;
+	job.rateLimitRetryAttempt = 0;
+	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
+		job.resumePmPhase = phase;
+	}
+	// A fresh id is *assigned*, never resumed — the strip above removed the stored one,
+	// and an id `claude` has already opened a session under cannot be assigned a second
+	// time. Minted rather than left absent for the same reason `deriveRetryJobPayload`
+	// mints one: it is what lets Tier 1 name a run that dies before emitting a
+	// parseable `session_id`.
+	job.agentSessionId = randomUUID();
+	if (recoveryMode) job.recoveryMode = recoveryMode;
 	return job;
 }
 

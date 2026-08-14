@@ -45,7 +45,8 @@ concurrent workers (`SWARM_WORKER_CONCURRENCY > 1`). SWARM always resumes by exp
   output's `session_id`; the harness reads that (falling back to the assigned id). The run id
   is assigned by a *first* attempt only: `claude` refuses to open a second session under an id
   it already used, so an attempt that is not resuming assigns a freshly minted uuid instead —
-  automatically in `deriveRetryJobPayload` and manually in `reconstructRetryJob`
+  automatically in `deriveRetryJobPayload`, and manually in `reconstructRetryJob` (a retry) or
+  `reconstructResetJob` (a reset, which always mints one)
   (`src/dispatch/retry-payload.ts`). Because the flag, not the column, says which meaning the
   id carries, the worker restores a run row's stored session onto a retry only when that retry
   is resuming it (`reuseRunRow`, `src/worker/consumer.ts`).
@@ -163,6 +164,16 @@ start-over `'fresh'`, and — since issue #592 — `'discard'`, the forced-reset
 removes a wedged checkout on whichever worker holds it. **Tier 1 still wins whenever a
 session id is resumable**: `'checkpoint'` is only for the cases it cannot serve
 (§ "When Tier 2 takes over").
+
+A reset carries **no** mode it did not choose itself (issue #741). It restarts the phase as if
+it had never run, so its replacement dispatch is built by `reconstructResetJob`
+(`src/dispatch/retry-payload.ts`), which drops every member of `RecoveryIntentSchema` — the
+session to re-enter, the delivery progress, the provisioned branch, and any stored mode — and
+then sets only `'discard'` for a forced reset. That is keyed on the schema, so a latch added to
+the intent is dropped with no edit there. It also sanitises the run row's stored `job_payload`,
+because a reset discards resume intent held in that column as well as in the `recovery` one:
+the two latch the same state, and leaving the payload alone let a second reset (or a later
+"Retry now") replay it.
 
 The recovery gate (`executeRecoveryGate`, `src/pipeline/resume.ts`) adopts the preserved
 checkout for a continuation only after `validateCheckpointForContinuation`

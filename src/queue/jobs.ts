@@ -123,6 +123,31 @@ export function recoveryIntentFromJob(job: SwarmJob): RecoveryIntent {
 	return RecoveryIntentSchema.parse(job);
 }
 
+/** Every member of {@link RecoveryIntentSchema}, read off the schema rather than restated. */
+const RECOVERY_INTENT_MEMBERS = Object.keys(RecoveryIntentSchema.shape) as (keyof RecoveryIntent)[];
+
+/**
+ * The counterpart to {@link recoveryIntentFromJob}: the job with **every** member
+ * of {@link RecoveryIntentSchema} removed — an attempt that treats nothing a prior
+ * attempt left behind as its premise, and therefore provisions, sessions, and
+ * delivers exactly as a first attempt would.
+ *
+ * Keyed on the schema for the same reason the extraction is (issue #741): a resume
+ * latch that nothing ever clears is how a stored `implementationBranchProvisioned`
+ * came to survive every "Reset & restart" of run 2d3df9b3 and re-provision with
+ * `createBranch: false` against a branch that did not exist. A member added to the
+ * intent is dropped here with no edit, so the next latch cannot repeat that.
+ *
+ * The cast is confined to this helper: deleting keys off the `SwarmJob`
+ * discriminated union is not expressible on the union's own type, and the spread
+ * above means the caller's job is never mutated.
+ */
+export function stripRecoveryIntent<T extends SwarmJob>(job: T): T {
+	const stripped: Record<string, unknown> = { ...job };
+	for (const member of RECOVERY_INTENT_MEMBERS) delete stripped[member];
+	return stripped as T;
+}
+
 /**
  * The recovery intent **resolved for one phase run** — what the executor hands a
  * phase orchestrator, as a single required value rather than a handful of
