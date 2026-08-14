@@ -1270,7 +1270,13 @@ async function claimTaskForPhase(
 ): Promise<{ claimed: true } | { claimed: false; holdingPhase: string | null }> {
 	let selected: { id: string; phase: string | null } | undefined;
 	try {
-		selected = await selectTaskPhaseForExecution(projectId, trigger.taskId);
+		selected = await selectTaskPhaseForExecution(
+			projectId,
+			trigger.taskId,
+			trigger.phase === 'planning' || trigger.phase === 'implementation'
+				? trigger.workItem.id
+				: undefined,
+		);
 	} catch (err) {
 		logger.warn('Could not select the executing dispatch for this task (assuming none)', {
 			projectId,

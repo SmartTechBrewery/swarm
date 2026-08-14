@@ -875,24 +875,41 @@ export async function findExecutingDispatchForTask(
 export async function selectTaskPhaseForExecution(
 	projectId: string,
 	taskId: string,
+	pmItemId?: string,
 ): Promise<{ id: string; phase: string | null } | undefined> {
 	return getDb().transaction(async (tx) => {
 		await tx.execute(
 			sql`select pg_advisory_xact_lock(hashtextextended(${`${projectId}:${taskId}`}, 0))`,
 		);
+		// A Planning delivery can still be resolving its task id while a later
+		// Implementation delivery for the same board item reaches this guard. Keep
+		// that earlier leased row ahead of Implementation rather than letting the
+		// latter claim the checkout during the resolution window.
+		const unresolvedPmItem = pmItemId
+			? and(
+					eq(dispatches.projectId, projectId),
+					isNull(dispatches.taskId),
+					inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
+					sql`${dispatches.jobPayload} ->> 'type' = 'pm'`,
+					sql`${dispatches.jobPayload} -> 'event' ->> 'itemId' = ${pmItemId}`,
+				)
+			: undefined;
 		const rows = await tx
 			.select({ id: dispatches.id, phase: dispatches.phase })
 			.from(dispatches)
 			.where(
-				and(
-					eq(dispatches.projectId, projectId),
-					eq(dispatches.taskId, taskId),
-					inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
-					sql`${dispatches.phase} IS DISTINCT FROM 'merge-automation'`,
+				or(
+					and(
+						eq(dispatches.projectId, projectId),
+						eq(dispatches.taskId, taskId),
+						inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
+						sql`${dispatches.phase} IS DISTINCT FROM 'merge-automation'`,
+					),
+					unresolvedPmItem,
 				),
 			)
 			.orderBy(
-				sql`CASE ${dispatches.phase} WHEN 'planning' THEN 0 WHEN 'implementation' THEN 1 ELSE 2 END`,
+				sql`CASE WHEN ${dispatches.phase} IS NULL THEN 0 WHEN ${dispatches.phase} = 'planning' THEN 1 WHEN ${dispatches.phase} = 'implementation' THEN 2 ELSE 3 END`,
 				asc(dispatches.createdAt),
 			)
 			.limit(1);

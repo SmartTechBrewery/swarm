@@ -236,6 +236,7 @@ const selectTaskPhaseForExecution = vi.fn(
 	async (
 		_projectId: string,
 		_taskId: string,
+		_pmItemId?: string,
 	): Promise<{ id: string; phase: string | null } | undefined> => ({
 		id: 'dispatch-1',
 		phase: 'review',
@@ -274,8 +275,8 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		recordDispatchResolution(id, taskId, phase),
 	findExecutingDispatchForTask: (projectId: string, taskId: string, excludeDispatchId?: string) =>
 		findExecutingDispatchForTask(projectId, taskId, excludeDispatchId),
-	selectTaskPhaseForExecution: (projectId: string, taskId: string) =>
-		selectTaskPhaseForExecution(projectId, taskId),
+	selectTaskPhaseForExecution: (projectId: string, taskId: string, pmItemId?: string) =>
+		selectTaskPhaseForExecution(projectId, taskId, pmItemId),
 	deferDispatchToPending: (id: string, input: unknown) => deferDispatchToPending(id, input),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
@@ -3860,6 +3861,24 @@ describe('processJob', () => {
 			await planning;
 		});
 
+		it('defers Implementation behind an earlier Planning delivery that is still resolving', async () => {
+			selectTaskPhaseForExecution.mockResolvedValue({ id: 'planning-delivery', phase: null });
+			claimDispatchForJob.mockImplementation(async (job: Record<string, unknown>) => ({
+				claimed: true,
+				dispatch: { ...mockDispatchRow(job), id: String(job.deliveryId) },
+			}));
+
+			const workItem = createMockWorkItem();
+			const outcome = await processJob(
+				createMockPmWebhookJob({ deliveryId: 'implementation-delivery' }),
+				registryReturning({ phase: 'implementation', taskId: '17', workItem }),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', phase: 'implementation' });
+			expect(phaseCalls).toHaveLength(0);
+			expect(selectTaskPhaseForExecution).toHaveBeenCalledWith(PROJECT.id, '17', workItem.id);
+		});
+
 		it('wakes the task-in-flight waits when the holding phase fails or defers, not only on success', async () => {
 			phaseImpl = async () => {
 				throw new Error('boom');
@@ -3933,7 +3952,11 @@ describe('processJob', () => {
 					'dispatch-1',
 					expect.objectContaining({ waitReason: 'task-in-flight' }),
 				);
-				expect(selectTaskPhaseForExecution).toHaveBeenCalledWith(PROJECT.id, '17');
+				expect(selectTaskPhaseForExecution).toHaveBeenCalledWith(
+					PROJECT.id,
+					'17',
+					expect.any(String),
+				);
 			});
 
 			it('drops it as a duplicate when the executing phase is the same one', async () => {
