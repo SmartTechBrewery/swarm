@@ -117,7 +117,7 @@ describe('handleHandshake', () => {
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
 		// `validBody()` presents no proof of possession, so the acquire is the plain one.
-		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, undefined);
+		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, undefined, undefined);
 		// `validBody()` declares no `supportedPhases` — the older-daemon shape — so the
 		// handshake records every phase, the behaviour that pre-dated the field (#467).
 		// It declares no `repository` either, which records NULL (issue #687): the
@@ -296,7 +296,7 @@ describe('handleHandshake', () => {
 
 			expect(result.status).toBe(200);
 			expect(result.json).toMatchObject({ sessionId: SESSION_ID, fencingToken: 7 });
-			expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, reclaim);
+			expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, reclaim, undefined);
 		});
 
 		// The AC's "a different daemon is still refused" case at this seam: the acquire
@@ -366,6 +366,7 @@ describe('handleHandshake', () => {
 
 		it('does not reap a current daemon after a lost response made its proof stale or absent', async () => {
 			const acquired = makeAcquired();
+			const instanceId = '44444444-4444-4444-8444-444444444444';
 			const deps = makeDeps({
 				acquireSession: vi.fn().mockResolvedValue({
 					...acquired,
@@ -375,14 +376,28 @@ describe('handleHandshake', () => {
 
 			await handleHandshake(deps, {
 				...validBody(),
-				instanceId: '44444444-4444-4444-8444-444444444444',
+				instanceId,
 				reclaim: { sessionId: SESSION_ID, fencingToken: 3 },
 			});
 			await handleHandshake(deps, {
 				...validBody(),
-				instanceId: '44444444-4444-4444-8444-444444444444',
+				instanceId,
 			});
 
+			expect(deps.acquireSession).toHaveBeenNthCalledWith(
+				1,
+				CREDENTIAL,
+				60_000,
+				{ sessionId: SESSION_ID, fencingToken: 3 },
+				instanceId,
+			);
+			expect(deps.acquireSession).toHaveBeenNthCalledWith(
+				2,
+				CREDENTIAL,
+				60_000,
+				undefined,
+				instanceId,
+			);
 			expect(deps.reapSupersededWorkerClaims).not.toHaveBeenCalled();
 		});
 

@@ -63,6 +63,7 @@ import {
 	UnknownWorkerCredentialError,
 	validateFencingToken,
 	WorkerSessionHeldError,
+	type WorkerSessionInstanceId,
 	type WorkerSessionReclaim,
 } from '../identity/worker-session-service.js';
 import { logger } from '../lib/logger.js';
@@ -133,6 +134,7 @@ export interface WorkerTransportDeps {
 		rawCredential: string,
 		ttlMs: number,
 		reclaim?: WorkerSessionReclaim,
+		instanceId?: WorkerSessionInstanceId,
 	) => Promise<AcquiredSession>;
 	heartbeat: (rawCredential: string, fencingToken: number, ttlMs: number) => Promise<boolean>;
 	releaseSession: (rawCredential: string, fencingToken: number) => Promise<boolean>;
@@ -305,7 +307,12 @@ export async function handleHandshake(
 		//     the new socket registers. One live session per worker survives;
 		//   - the new socket's upgrade check (`validateFencingToken` → `getLiveSession`)
 		//     passes immediately, since the row is unreleased with a just-written heartbeat.
-		session = await deps.acquireSession(request.credential, ttlMs, request.reclaim);
+		session = await deps.acquireSession(
+			request.credential,
+			ttlMs,
+			request.reclaim,
+			request.instanceId,
+		);
 	} catch (err) {
 		// A live lease held by *another* daemon for this worker — the caller either
 		// presented no proof of possession or one that no longer matches the row.
