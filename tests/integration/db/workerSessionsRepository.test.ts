@@ -115,6 +115,31 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(rows).toHaveLength(1);
 			});
 
+			it('reports the same daemon process when it re-acquires after a lost response', async () => {
+				const instanceId = '11111111-1111-4111-8111-111111111111';
+				const first = await acquireLease(workerA, TTL, undefined, instanceId);
+				expect(first.reclaimedBySameInstance).toBe(false);
+
+				await expireSession(workerA);
+				const resumed = await acquireLease(
+					workerA,
+					TTL,
+					{ sessionId: first.id, fencingToken: first.fencingToken },
+					instanceId,
+				);
+				expect(resumed.fencingToken).toBe(2);
+				expect(resumed.reclaimedBySameInstance).toBe(true);
+
+				await expireSession(workerA);
+				const takeover = await acquireLease(
+					workerA,
+					TTL,
+					undefined,
+					'22222222-2222-4222-8222-222222222222',
+				);
+				expect(takeover.reclaimedBySameInstance).toBe(false);
+			});
+
 			it('re-acquires after a graceful release, bumping the fencing token to 2 and reusing one row', async () => {
 				const first = await acquireLease(workerA, TTL);
 				expect(first.fencingToken).toBe(1);

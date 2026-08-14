@@ -49,10 +49,12 @@ function makeAcquired(overrides: Partial<AcquiredSession['session']> = {}): Acqu
 		session: {
 			id: SESSION_ID,
 			workerId: WORKER_ID,
+			instanceId: null,
 			fencingToken: 7,
 			lastHeartbeatAt: new Date('2026-01-01T00:00:00Z'),
 			currentRunId: null,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
+			reclaimedBySameInstance: false,
 			...overrides,
 		},
 		fencingToken: 7,
@@ -359,6 +361,28 @@ describe('handleHandshake', () => {
 			});
 
 			expect(result.status).toBe(200);
+			expect(deps.reapSupersededWorkerClaims).not.toHaveBeenCalled();
+		});
+
+		it('does not reap a current daemon after a lost response made its proof stale or absent', async () => {
+			const acquired = makeAcquired();
+			const deps = makeDeps({
+				acquireSession: vi.fn().mockResolvedValue({
+					...acquired,
+					session: { ...acquired.session, reclaimedBySameInstance: true },
+				}),
+			});
+
+			await handleHandshake(deps, {
+				...validBody(),
+				instanceId: '44444444-4444-4444-8444-444444444444',
+				reclaim: { sessionId: SESSION_ID, fencingToken: 3 },
+			});
+			await handleHandshake(deps, {
+				...validBody(),
+				instanceId: '44444444-4444-4444-8444-444444444444',
+			});
+
 			expect(deps.reapSupersededWorkerClaims).not.toHaveBeenCalled();
 		});
 

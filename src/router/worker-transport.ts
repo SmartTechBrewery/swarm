@@ -363,11 +363,14 @@ export async function handleHandshake(
 		throw err;
 	}
 
-	// A reclaim is the same daemon coming back, so its in-flight assignment — and the
-	// terminal result #718 holds for it — must survive. Anything else is a *new*
-	// generation, and the claims bound to the old one are settled here, from the
-	// supersede itself, rather than at the end of the lease window (issue #719).
-	if (!isReclaimedSession(session.session, request.reclaim)) {
+	// A matching process instance is the same daemon coming back, so its in-flight
+	// assignment — and the terminal result #718 holds for it — must survive even if a
+	// successful handshake response was lost. Older daemons fall back to the exact
+	// reclaim proof; only a different instance/generation settles the old claims here.
+	const sameDaemon = request.instanceId
+		? session.session.reclaimedBySameInstance
+		: isReclaimedSession(session.session, request.reclaim);
+	if (!sameDaemon) {
 		await reapClaimsOfSupersededSession(deps, worker.id, session.fencingToken);
 	}
 	// Only now that the declaration is persisted — the pass acts on what the row says.

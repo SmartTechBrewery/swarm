@@ -31,11 +31,16 @@ import {
 } from '../db/repositories/workerSessionsRepository.js';
 import { optionalEnv } from '../lib/env.js';
 import { resolveWorkerByCredential } from './worker-service.js';
-import type { WorkerSession, WorkerSessionReclaim } from './worker-session.js';
+import type {
+	WorkerSession,
+	WorkerSessionInstanceId,
+	WorkerSessionReclaim,
+} from './worker-session.js';
 
 export {
 	type WorkerSession,
 	WorkerSessionHeldError,
+	type WorkerSessionInstanceId,
 	type WorkerSessionReclaim,
 } from './worker-session.js';
 
@@ -78,7 +83,7 @@ async function authenticateWorker(rawCredential: string): Promise<string> {
 
 /** A freshly acquired lease plus its fencing token — the token the daemon carries thereafter. */
 export interface AcquiredSession {
-	session: WorkerSession;
+	session: Awaited<ReturnType<typeof acquireLease>>;
 	fencingToken: number;
 }
 
@@ -99,9 +104,12 @@ export async function acquireSession(
 	rawCredential: string,
 	ttlMs = resolveHeartbeatTtlMs(),
 	reclaim?: WorkerSessionReclaim,
+	instanceId?: WorkerSessionInstanceId,
 ): Promise<AcquiredSession> {
 	const workerId = await authenticateWorker(rawCredential);
-	const session = await acquireLease(workerId, ttlMs, reclaim);
+	const session = instanceId
+		? await acquireLease(workerId, ttlMs, reclaim, instanceId)
+		: await acquireLease(workerId, ttlMs, reclaim);
 	return { session, fencingToken: session.fencingToken };
 }
 

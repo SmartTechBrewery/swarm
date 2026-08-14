@@ -47,6 +47,7 @@ export const INITIAL_FENCING_TOKEN = 1;
 export const WorkerSessionSchema = z.object({
 	id: z.string().uuid(),
 	workerId: z.string().uuid(),
+	instanceId: z.string().uuid().nullable(),
 	fencingToken: z.number().int().positive(),
 	lastHeartbeatAt: z.date(),
 	currentRunId: z.string().uuid().nullable(),
@@ -54,6 +55,10 @@ export const WorkerSessionSchema = z.object({
 });
 
 export type WorkerSession = z.infer<typeof WorkerSessionSchema>;
+
+/** A memory-only daemon identity carried across its handshakes (issue #719). */
+export const WorkerSessionInstanceIdSchema = z.string().uuid();
+export type WorkerSessionInstanceId = z.infer<typeof WorkerSessionInstanceIdSchema>;
 
 /**
  * Proof that the caller already holds the lease it is acquiring — the `sessionId`

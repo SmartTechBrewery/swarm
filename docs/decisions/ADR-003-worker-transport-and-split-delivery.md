@@ -405,13 +405,15 @@ server-side store) it needs:
    The reap already existed (`failSupersededWorkerDispatchClaims`,
    `reconcileSupersededWorkerClaims`) with no caller in `src/`; it is now called from
    the handshake, gated on the acquire's own branch. **The handshake is the only place
-   the distinction the fix needs exists**: the reclaim proof (#608) separates "the same
-   daemon is back, and its phase — plus the terminal result #718 holds for it — must
-   survive" from "a different generation took over", and the derived
-   `isReclaimedSession` reads that branch off the returned session (same row id, token
-   bumped by exactly one) without widening the repository's return type. The 5-minute
-   reconciler tick cannot do it: a dispatch's token is never re-bound, so a tick keying
-   on the mismatch would reap the live phase of a daemon that legitimately reclaimed.
+   the distinction the fix needs exists**: a daemon now carries one memory-only
+   `instanceId` on every handshake, persisted with the session row, and the acquire
+   reports whether it replaced that same process. That keeps the phase — plus the
+   terminal result #718 holds for it — alive after a successful handshake response was
+   lost, even if the later request carries a stale reclaim proof or none after a 409.
+   An older daemon omitting the additive field falls back to `isReclaimedSession`'s
+   exact proof (same row id, token bumped by exactly one). The 5-minute reconciler tick
+   cannot do it: a dispatch's token is never re-bound, so a tick keying on the mismatch
+   would reap the live phase of a daemon that legitimately reclaimed.
 
    Both halves of the claim are settled, because they are two representations of the
    same capacity: the durable rows (which `claimWorkerForDispatch` counts against) and

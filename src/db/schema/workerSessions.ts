@@ -33,6 +33,8 @@ export const workerSessions = pgTable(
 		workerId: uuid('worker_id')
 			.notNull()
 			.references(() => workers.id, { onDelete: 'cascade' }),
+		/** The current daemon process identity, null for daemons that predate issue #719. */
+		instanceId: uuid('instance_id'),
 		/** Per-worker monotonic fencing token; bumped on each re-acquire (`worker-session.ts`). */
 		fencingToken: bigint('fencing_token', { mode: 'number' }).notNull(),
 		lastHeartbeatAt: timestamp('last_heartbeat_at').notNull().defaultNow(),

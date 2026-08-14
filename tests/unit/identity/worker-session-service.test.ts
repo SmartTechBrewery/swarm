@@ -63,6 +63,7 @@ function makeSession(overrides: Partial<WorkerSession> = {}): WorkerSession {
 	return {
 		id: '33333333-3333-4333-8333-333333333333',
 		workerId: WORKER_ID,
+		instanceId: null,
 		fencingToken: 1,
 		lastHeartbeatAt: new Date('2026-01-01T00:00:00Z'),
 		currentRunId: null,

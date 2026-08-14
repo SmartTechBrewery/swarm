@@ -49,6 +49,7 @@ describe('WorkerSessionSchema', () => {
 	const valid = {
 		id: '11111111-1111-4111-8111-111111111111',
 		workerId: '22222222-2222-4222-8222-222222222222',
+		instanceId: null,
 		fencingToken: 1,
 		lastHeartbeatAt: BASE,
 		currentRunId: null,
@@ -62,6 +63,15 @@ describe('WorkerSessionSchema', () => {
 	it('accepts a uuid current run reference', () => {
 		const runId = '33333333-3333-4333-8333-333333333333';
 		expect(WorkerSessionSchema.parse({ ...valid, currentRunId: runId }).currentRunId).toBe(runId);
+	});
+
+	it('accepts a nullable daemon process identity', () => {
+		expect(
+			WorkerSessionSchema.parse({
+				...valid,
+				instanceId: '33333333-3333-4333-8333-333333333333',
+			}).instanceId,
+		).toBe('33333333-3333-4333-8333-333333333333');
 	});
 
 	it('rejects a non-positive or non-integer fencing token', () => {

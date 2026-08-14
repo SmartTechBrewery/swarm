@@ -26,7 +26,10 @@ import { z } from 'zod';
 import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js';
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
-import { WorkerSessionReclaimSchema } from '../identity/worker-session.js';
+import {
+	WorkerSessionInstanceIdSchema,
+	WorkerSessionReclaimSchema,
+} from '../identity/worker-session.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { RecoveryIntentSchema } from '../queue/jobs.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
@@ -142,6 +145,13 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * needs no protocol-version bump. It carries **no secret** — the credential contract
  * above is untouched, and like every other handshake field it is never reflected in
  * an error body.
+ *
+ * `instanceId` is an optional random UUID minted once by a daemon process (issue
+ * #719). The control plane persists it with the lease so a process whose successful
+ * handshake response was lost is still recognised on its next acquire, even if its
+ * reclaim proof has become stale or was discarded after a 409. Older daemons omit it
+ * and retain the exact `reclaim` behaviour above, so this additive field also needs no
+ * protocol-version bump.
  */
 export const HandshakeRequestSchema = z.object({
 	credential: z.string().min(1),
@@ -151,6 +161,7 @@ export const HandshakeRequestSchema = z.object({
 	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
 	repository: RepoSlugSchema.optional(),
 	reclaim: WorkerSessionReclaimSchema.optional(),
+	instanceId: WorkerSessionInstanceIdSchema.optional(),
 	protocolVersion: z.number().int(),
 });
 export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
