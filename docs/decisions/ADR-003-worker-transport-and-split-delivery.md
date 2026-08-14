@@ -63,7 +63,10 @@ service verbatim:
   `reclaim` — the `sessionId`/`fencingToken` this daemon already holds (issue
   #608) — which lets it take its *own* live lease back (token still bumped, run
   pointer still cleared) instead of being refused; a caller that presents no
-  matching proof still gets `worker session already held`.
+  matching proof still gets `worker session already held`. An acquire that was
+  **not** such a reclaim also settles the execution claims the generation it
+  superseded left behind, instead of leaving them to the back-channel timer (issue
+  #719, item 13).
 - **`GET /worker/stream`** — a WebSocket (via `@hono/node-ws`) carrying periodic
   worker→cloud `heartbeat` frames that refresh the lease (`heartbeat`), and
   releasing the lease on disconnect (`releaseSession`). An ungraceful drop still
@@ -92,7 +95,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -386,6 +389,52 @@ server-side store) it needs:
    so the answer can never settle an unrelated attempt. What still waits out the lease
    window is a worker whose transport is down — nothing can be pushed to it and its
    phase may genuinely still be running, which is issue #719's problem, not this one's.
+
+13. **#719** — **a superseded claim is settled from the supersede, not from a timer.**
+   One case of the above is knowable immediately: not "the transport is down" but "a
+   *new session generation* took this worker's lease". `worker_sessions.fencing_token`
+   advances the instant that happens, and nothing consumed the transition —
+   `dispatches.worker_fencing_token` was compared exactly once, pre-execution, so the
+   dispatch the old generation was executing stayed `leased`/`running`, holding that
+   worker's allocation and a project slot, until `timeoutMs + RESULT_WAIT_MARGIN_MS`
+   fired. Measured on 2026-08-13: the mismatch was queryable at 19:27:04 and the run
+   settled at 20:00:03, ~33 minutes later, on the timer — and while two such phantom
+   dispatches held both workers, three `pm` dispatches sat `pending` behind an empty
+   queue for over half an hour.
+
+   The reap already existed (`failSupersededWorkerDispatchClaims`,
+   `reconcileSupersededWorkerClaims`) with no caller in `src/`; it is now called from
+   the handshake, gated on the acquire's own branch. **The handshake is the only place
+   the distinction the fix needs exists**: a daemon now carries one memory-only
+   `instanceId` on every handshake, persisted with the session row, and the acquire
+   reports whether it replaced that same process. That keeps the phase — plus the
+   terminal result #718 holds for it — alive after a successful handshake response was
+   lost, even if the later request carries a stale reclaim proof or none after a 409.
+   An older daemon omitting the additive field falls back to `isReclaimedSession`'s
+   exact proof (same row id, token bumped by exactly one). The 5-minute reconciler tick
+   cannot do it: a dispatch's token is never re-bound, so a tick keying on the mismatch
+   would reap the live phase of a daemon that legitimately reclaimed.
+
+   Both halves of the claim are settled, because they are two representations of the
+   same capacity: the durable rows (which `claimWorkerForDispatch` counts against) and
+   the parked control-plane job (which holds the Redis project slot and a BullMQ
+   concurrency slot). Failing only the rows would free neither slot — and the parked job
+   would later settle the same run *again*, as a deferral over a terminal row, re-creating
+   #269's orphan shape through `completeRun`'s unconditional update. So the reap also
+   resolves that dispatch's result wait with a synthetic **terminal** `failed` frame
+   carrying the row's own reason (`failDispatchResultWait`,
+   `src/router/dispatch-results.ts`), which unwinds through the existing settle path:
+   `adaptResultToPhaseRun` → a non-deferrable `AgentRunError` → `completeRun` writes the
+   same terminal state and message the reap wrote → the job's `finally` releases the slot
+   and runs both existing promotions. No new settle path, no new writer, and no promotion
+   issued from the reap itself (one raised while the slot is still held only makes the
+   woken dispatch re-defer). The reason names the supersede rather than "did not report a
+   result within the lease window", so run history distinguishes the two. Consequences
+   taken deliberately: a reaped run is **terminal** — matching what that SQL always did,
+   and what the sibling dead-lease reclaim does — so work the timer used to retry ~40
+   minutes later now stops and needs Retry now; and the settle is best-effort
+   housekeeping on the handshake, never a condition of connecting, with the lease
+   reconciler still the backstop when no handshake ever comes.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

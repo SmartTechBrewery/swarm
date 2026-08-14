@@ -51,6 +51,7 @@
  * router transport uses (`../router/worker-transport.ts`).
  */
 
+import { randomUUID } from 'node:crypto';
 import { WebSocket } from 'ws';
 
 import type { AgentCli } from '../harness/agent-cli.js';
@@ -203,6 +204,7 @@ export function buildHandshakeRequest(input: {
 	capabilities: AgentCli[];
 	supportedPhases: readonly TaskPhase[];
 	repository?: string;
+	instanceId?: string;
 }): HandshakeRequest {
 	return HandshakeRequestSchema.parse({
 		credential: input.credential,
@@ -211,6 +213,7 @@ export function buildHandshakeRequest(input: {
 		capabilities: input.capabilities,
 		supportedPhases: [...input.supportedPhases],
 		...(input.repository ? { repository: input.repository } : {}),
+		...(input.instanceId ? { instanceId: input.instanceId } : {}),
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
 }
@@ -578,7 +581,11 @@ export interface WorkerTransportClient {
  *   2. A result flushed after the control plane has disposed its waiter is dropped
  *      router-side (bounded by `timeoutMs + RESULT_WAIT_MARGIN_MS`,
  *      `../router/dispatcher.ts`). Phase 2 of issue #718 makes that case say so;
- *      issue #719 shortens it.
+ *      issue #719 shortened it for the one shape that is knowable early — a session
+ *      *superseded* by a newer generation, whose claims the next handshake settles
+ *      at once (`../router/worker-transport.ts`). A flush racing that settle is the
+ *      residual: the daemon holding it belongs to a different process generation,
+ *      or is an older daemon that cannot state its process identity.
  *
  * "Re-send until acked" was rejected: there is no result ack, and `dispatchId` is
  * stable across a re-dispatch (`reopenDispatchForManualRetry`, `../api/routers/runs.ts`),
@@ -844,7 +851,8 @@ export function connectWorkerTransport(
 	const backoff: BackoffConfig = { ...DEFAULT_BACKOFF, ...options.backoff };
 	// Validated once up front so a bad capability set fails loudly before any I/O.
 	// Rebuilt only when a re-probe widens the declared set (see `reprobeRequest`).
-	let request = buildHandshakeRequest(options);
+	const instanceId = randomUUID();
+	let request = buildHandshakeRequest({ ...options, instanceId });
 
 	let stopped = false;
 	let activeSocket: TransportSocket | undefined;
@@ -980,7 +988,7 @@ export function connectWorkerTransport(
 			gained,
 			capabilities: refreshed,
 		});
-		return buildHandshakeRequest({ ...options, capabilities: refreshed });
+		return buildHandshakeRequest({ ...options, capabilities: refreshed, instanceId });
 	}
 
 	const ladders = createReconnectLadders(backoff, deps.random);

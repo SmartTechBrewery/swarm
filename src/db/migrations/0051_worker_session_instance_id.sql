@@ -1,0 +1,1 @@
+ALTER TABLE "worker_sessions" ADD COLUMN "instance_id" uuid;

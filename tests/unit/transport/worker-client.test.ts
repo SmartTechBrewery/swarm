@@ -850,6 +850,11 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		await vi.advanceTimersByTimeAsync(1_000);
 		expect(fetch).toHaveBeenCalledTimes(3);
 		expect(JSON.parse(String(fetch.mock.calls[2][1].body))).not.toHaveProperty('reclaim');
+		const instanceIds = fetch.mock.calls.map(
+			([, init]) => JSON.parse(String(init.body)).instanceId as string,
+		);
+		expect(instanceIds[0]).toMatch(/^[0-9a-f-]{36}$/);
+		expect(new Set(instanceIds)).toEqual(new Set([instanceIds[0]]));
 		expect(sockets).toHaveLength(2);
 
 		await client.stop();

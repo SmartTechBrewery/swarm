@@ -4,6 +4,7 @@ import {
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
+	failDispatchResultWait,
 	noteWorkerTransportLost,
 	noteWorkerTransportRestored,
 	resolveDispatchStreamTarget,
@@ -116,6 +117,74 @@ describe('dispatch result correlation registry', () => {
 		await expect(second.result).resolves.toMatchObject({ status: 'succeeded' });
 		first.dispose();
 		second.dispose();
+	});
+});
+
+/**
+ * Ending the wait for a claim the handshake just reaped (issue #719). Without it
+ * the durable rows are settled while the awaiting job keeps the project slot for the
+ * rest of the lease window — and then settles the same run a second time.
+ */
+describe('failDispatchResultWait', () => {
+	const REASON = "The worker's session was superseded by a newer one";
+
+	it('resolves the waiter with a terminal failure carrying the reap’s reason', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		expect(failDispatchResultWait(DISPATCH_A, REASON)).toBe(true);
+
+		// `failed`, not `deferred`: the dispatcher maps this to a non-deferrable error, so
+		// the shared settle writes the same terminal run row the reap wrote rather than
+		// flipping it back to `deferred` with a retry date (the #269 orphan shape).
+		await expect(awaiting.result).resolves.toEqual({
+			type: 'task-execution-result',
+			dispatchId: DISPATCH_A,
+			status: 'failed',
+			// The phase and task the registration recorded (issue #724), not placeholders.
+			phase: 'implementation',
+			taskId: '407',
+			error: REASON,
+			reason: REASON,
+		});
+
+		awaiting.dispose();
+	});
+
+	it('consumes the registration, so a late real result and the run index find nothing', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		expect(failDispatchResultWait(DISPATCH_A, REASON)).toBe(true);
+
+		// A frame the superseded daemon somehow still delivers is dropped, exactly as a
+		// duplicate result is — the settle is already under way on the reap's reason.
+		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(false);
+		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
+		expect(resolveDispatchStreamTarget(DISPATCH_A)).toBeUndefined();
+
+		awaiting.dispose();
+	});
+
+	it('leaves every other dispatch’s wait registered and deliverable', async () => {
+		const onA = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const onB = awaitDispatchResult(DISPATCH_B, TARGET_B);
+
+		expect(failDispatchResultWait(DISPATCH_A, REASON)).toBe(true);
+
+		expect(deliverDispatchResult(result(DISPATCH_B))).toBe(true);
+		await expect(onB.result).resolves.toMatchObject({ status: 'succeeded' });
+
+		onA.dispose();
+		onB.dispose();
+	});
+
+	it('answers false for a dispatch nobody here is awaiting, without throwing', () => {
+		// The ordinary reading when this router restarted since the push: the durable
+		// dispatch row is then the whole story.
+		expect(failDispatchResultWait('unknown-dispatch', REASON)).toBe(false);
+
+		const disposed = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		disposed.dispose();
+		expect(failDispatchResultWait(DISPATCH_A, REASON)).toBe(false);
 	});
 });
 

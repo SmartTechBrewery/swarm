@@ -1044,7 +1044,9 @@ export const runsRouter = router({
 	//    The one case that still waits it out is a worker whose transport is down:
 	//    nothing can be pushed to it, and the phase may genuinely still be executing
 	//    there, so writing the row from here would take the terminal state away from
-	//    its owner. Issue #719 is what shortens that.
+	//    its owner. Issue #719 settles the narrower, knowable case where a different
+	//    daemon process succeeds a session; this remains the lease reconciler's
+	//    backstop when no successor handshakes.
 	//
 	//  - `deferred`: no agent is running; a delayed BullMQ retry job is waiting.
 	//    Remove that job so nothing resurrects the run, then atomically flip the

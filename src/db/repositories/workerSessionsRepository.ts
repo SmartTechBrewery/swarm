@@ -33,6 +33,7 @@ import {
 	nextFencingToken,
 	type WorkerSession,
 	WorkerSessionHeldError,
+	type WorkerSessionInstanceId,
 	type WorkerSessionReclaim,
 } from '../../identity/worker-session.js';
 import { getDb } from '../client.js';
@@ -40,16 +41,29 @@ import { workerSessions } from '../schema/workerSessions.js';
 
 type WorkerSessionRow = typeof workerSessions.$inferSelect;
 
+/** The acquired lease plus whether it replaced the same daemon process (issue #719). */
+export interface AcquiredWorkerSession extends WorkerSession {
+	reclaimedBySameInstance: boolean;
+}
+
 /** Re-assemble a `WorkerSession` from a persisted `worker_sessions` row. */
 function rowToSession(row: WorkerSessionRow): WorkerSession {
 	return {
 		id: row.id,
 		workerId: row.workerId,
+		instanceId: row.instanceId,
 		fencingToken: row.fencingToken,
 		lastHeartbeatAt: row.lastHeartbeatAt,
 		currentRunId: row.currentRunId,
 		createdAt: row.createdAt,
 	};
+}
+
+function acquiredRowToSession(
+	row: WorkerSessionRow,
+	reclaimedBySameInstance: boolean,
+): AcquiredWorkerSession {
+	return { ...rowToSession(row), reclaimedBySameInstance };
 }
 
 /** True for a pg `23505` unique-violation, whether the code is on the error or its `cause`. */
@@ -96,7 +110,8 @@ export async function acquireLease(
 	workerId: string,
 	ttlMs: number,
 	reclaim?: WorkerSessionReclaim,
-): Promise<WorkerSession> {
+	instanceId?: WorkerSessionInstanceId,
+): Promise<AcquiredWorkerSession> {
 	try {
 		return await getDb().transaction(async (tx) => {
 			const now = new Date();
@@ -123,6 +138,7 @@ export async function acquireLease(
 				const [replaced] = await tx
 					.update(workerSessions)
 					.set({
+						instanceId: instanceId ?? null,
 						fencingToken: nextFencingToken(existing.fencingToken),
 						lastHeartbeatAt: now,
 						currentRunId: null,
@@ -130,14 +146,22 @@ export async function acquireLease(
 					})
 					.where(eq(workerSessions.id, existing.id))
 					.returning();
-				return rowToSession(replaced);
+				return acquiredRowToSession(
+					replaced,
+					instanceId !== undefined && existing.instanceId === instanceId,
+				);
 			}
 
 			const [inserted] = await tx
 				.insert(workerSessions)
-				.values({ workerId, fencingToken: INITIAL_FENCING_TOKEN, lastHeartbeatAt: now })
+				.values({
+					workerId,
+					instanceId: instanceId ?? null,
+					fencingToken: INITIAL_FENCING_TOKEN,
+					lastHeartbeatAt: now,
+				})
 				.returning();
-			return rowToSession(inserted);
+			return acquiredRowToSession(inserted, false);
 		});
 	} catch (err) {
 		if (isUniqueViolation(err)) throw new WorkerSessionHeldError(workerId);
