@@ -118,6 +118,16 @@ export const QueuedReviewGateSchema = z.object({
 	headSha: z.string(),
 	/** Deferred aggregate-check recheck attempt count, when this job is a coalesced recheck. */
 	recheckAttempt: z.number().int().nonnegative().optional(),
+	/**
+	 * Deferred *read-failure* recheck attempt count (issue #742) — the second,
+	 * separate budget a defer can draw on (`SwarmJob.readFailureRecheckAttempt`,
+	 * issue #720). Surfaced beside {@link recheckAttempt} rather than folded into
+	 * it so a waiting recheck reads honestly while it is still waiting: a row
+	 * showing `recheck #0 · provider retry #9` is a source-control outage being
+	 * outlasted, not CI taking its time, and the two are told apart here instead
+	 * of in the worker log.
+	 */
+	readFailureRecheckAttempt: z.number().int().nonnegative().optional(),
 });
 export type QueuedReviewGate = z.infer<typeof QueuedReviewGateSchema>;
 
@@ -238,6 +248,7 @@ export function deriveReviewGate(job: SwarmJob): QueuedReviewGate | undefined {
 		sourceAction: event.action,
 		headSha: event.headSha,
 		recheckAttempt: job.recheckAttempt,
+		readFailureRecheckAttempt: job.readFailureRecheckAttempt,
 	});
 }
 

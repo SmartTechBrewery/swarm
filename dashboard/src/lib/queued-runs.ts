@@ -120,6 +120,8 @@ export interface QueuedReviewGateSourceEventDisplay {
 	sourceEvent: QueuedReviewGateSourceEvent;
 	sourceAction?: string;
 	recheckAttempt?: number;
+	/** The read-failure recheck budget's own counter (issue #742), shown beside `recheckAttempt`. */
+	readFailureRecheckAttempt?: number;
 }
 
 /**
@@ -180,6 +182,7 @@ function toSourceEventDisplay(item: QueuedRun): QueuedReviewGateSourceEventDispl
 		sourceEvent: gate.sourceEvent,
 		sourceAction: gate.sourceAction,
 		recheckAttempt: gate.recheckAttempt,
+		readFailureRecheckAttempt: gate.readFailureRecheckAttempt,
 	};
 }
 
@@ -294,12 +297,22 @@ const REVIEW_GATE_SOURCE_LABELS: Record<QueuedReviewGateSourceEvent, string> = {
 	checks: 'Checks',
 };
 
-/** Compact diagnostic label for one source event folded into a review-gate group. */
+/**
+ * Compact diagnostic label for one source event folded into a review-gate group.
+ * The two recheck budgets (issue #742) are shown as separate counters rather
+ * than one number: `recheck #N` is CI still settling, `provider retry #N` is a
+ * source-control read that never answered being outlasted, and an operator
+ * watching a row wait needs to know which of the two it is.
+ */
 export function reviewGateSourceEventLabel(event: QueuedReviewGateSourceEventDisplay): string {
 	const base = REVIEW_GATE_SOURCE_LABELS[event.sourceEvent];
 	const action = event.sourceAction ? ` · ${event.sourceAction}` : '';
 	const recheck = event.recheckAttempt !== undefined ? ` · recheck #${event.recheckAttempt}` : '';
-	return `${base}${action}${recheck}`;
+	const providerRetry =
+		event.readFailureRecheckAttempt !== undefined
+			? ` · provider retry #${event.readFailureRecheckAttempt}`
+			: '';
+	return `${base}${action}${recheck}${providerRetry}`;
 }
 
 /** The wording a grouped review-gate row uses instead of claiming a Review agent is queued. */

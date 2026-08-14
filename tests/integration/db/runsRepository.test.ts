@@ -14,6 +14,7 @@ import {
 	cancelDeferredRunInDb,
 	clearRunRecovery,
 	completeRun,
+	createFailedRun,
 	createRun as createRunRow,
 	failOrphanedRunningRuns,
 	failStaleRunningRuns,
@@ -1680,6 +1681,68 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await completeRun(id, { status: 'failed', engine: 'claude', agentSessionId: null });
 			const row = await getRunByIdFromDb(id);
 			expect(row?.agentSessionId).toBeNull();
+		});
+	});
+
+	// Issue #742 — the durable trace a terminally abandoned Review leaves. It is
+	// the record an operator finds instead of a worker log, so what matters is that
+	// it lands terminal in one write and cannot be mistaken for live or resumable
+	// work by the retention/liveness readers above.
+	describe('createFailedRun', () => {
+		const jobPayload = createMockScmWebhookJob() as SwarmJob;
+
+		it('inserts one already-terminal row carrying its reason and payload', async () => {
+			const id = await createFailedRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '42',
+				phase: 'review',
+				prNumber: '42',
+				jobPayload,
+				error: 'Review abandoned: the source-control provider never answered.',
+			});
+
+			const row = await getRunByIdFromDb(id);
+			expect(row).toMatchObject({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '42',
+				phase: 'review',
+				prNumber: '42',
+				status: 'failed',
+				error: 'Review abandoned: the source-control provider never answered.',
+			});
+			expect(row?.completedAt).toBeInstanceOf(Date);
+			// No agent ran, so there is no session to resume and no board card to link.
+			expect(row?.agentSessionId).toBeNull();
+			expect(row?.workItemId).toBeNull();
+			expect(row?.jobPayload).toMatchObject({ type: 'scm' });
+		});
+
+		it('is neither live nor resumable, so it pins no worktree and blocks no later run', async () => {
+			await createFailedRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '43',
+				phase: 'review',
+				error: 'Review abandoned.',
+			});
+
+			expect(await hasLiveRunForTask(PROJECT_ID, '43')).toBe(false);
+			expect(await hasResumableDeferredRun(PROJECT_ID, '43')).toBe(false);
+		});
+
+		it('is listed in the runs read model an operator actually looks at', async () => {
+			await createFailedRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '44',
+				phase: 'review',
+				error: 'Review abandoned.',
+			});
+
+			const { data } = await listRunsFromDb({ projectId: PROJECT_ID, limit: 10, offset: 0 });
+			expect(data.map((row) => row.taskId)).toContain('44');
 		});
 	});
 

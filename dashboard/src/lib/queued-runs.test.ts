@@ -447,6 +447,31 @@ describe('reviewGateSourceEventLabel', () => {
 		).toBe('Checks · completed · recheck #3');
 	});
 
+	// Issue #742 — the read-failure budget is a separate counter, so a row waiting
+	// out an unreachable provider must not read as CI still settling.
+	it('labels the read-failure recheck attempt as a provider retry', () => {
+		expect(
+			reviewGateSourceEventLabel({
+				jobId: 'j1',
+				sourceEvent: 'checks',
+				sourceAction: 'completed',
+				readFailureRecheckAttempt: 9,
+			}),
+		).toBe('Checks · completed · provider retry #9');
+	});
+
+	it('shows both recheck counters when a job carries each budget', () => {
+		expect(
+			reviewGateSourceEventLabel({
+				jobId: 'j1',
+				sourceEvent: 'checks',
+				sourceAction: 'completed',
+				recheckAttempt: 3,
+				readFailureRecheckAttempt: 9,
+			}),
+		).toBe('Checks · completed · recheck #3 · provider retry #9');
+	});
+
 	it('omits the action/recheck segments when absent', () => {
 		expect(reviewGateSourceEventLabel({ jobId: 'j1', sourceEvent: 'pull-request' })).toBe(
 			'Pull request',

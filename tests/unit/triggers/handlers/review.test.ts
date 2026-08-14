@@ -80,11 +80,17 @@ vi.mock('@/lib/logger.js', () => ({
 // The work-item origin gate (issue #397) reads run history; mock just that read
 // (keeping the real `isSwarmManagedPullRequest`, so the PR's head branch really
 // has to decode under the project's `branchPrefix`). Defaults to "SWARM ran
-// Implementation for this item" — the common path.
-const { hasRunForTask } = vi.hoisted(() => ({ hasRunForTask: vi.fn() }));
+// Implementation for this item" — the common path. `createFailedRun` is the
+// durable trace a terminal give-up writes (issue #742), mocked from the same
+// partial so these tests need no database.
+const { hasRunForTask, createFailedRun } = vi.hoisted(() => ({
+	hasRunForTask: vi.fn(),
+	createFailedRun: vi.fn(),
+}));
 vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
 	hasRunForTask,
+	createFailedRun,
 }));
 
 // The `review` disposition reserves a durable safety-cap slot before
@@ -119,6 +125,8 @@ beforeEach(() => {
 	// run-history lookup failure.
 	hasRunForTask.mockReset();
 	hasRunForTask.mockResolvedValue(true);
+	createFailedRun.mockReset();
+	createFailedRun.mockResolvedValue('run-abandoned');
 	reserveReviewVerdict.mockReset();
 	reserveReviewVerdict.mockResolvedValue({ status: 'reserved', id: 'v1', ordinal: 1 });
 	hasPersonaToken.mockReset();
@@ -1039,8 +1047,8 @@ describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)
 			expect.stringContaining('giving up on deferred recheck'),
 			expect.objectContaining({ budget: 'read-failed', cap: 15 }),
 		);
-		// Best-effort and expected to fail during a real outage (the durable trace
-		// is issue #720's phase 2), but its wording must match the reason.
+		// Best-effort and expected to fail during a real outage — an extra on top of
+		// the durable record (issue #742) — but its wording must match the reason.
 		expect(commentOnPullRequest).toHaveBeenCalledWith(
 			expect.any(Object),
 			42,
@@ -1114,6 +1122,158 @@ describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)
 			headSha: 'cafe',
 		});
 		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A durable trace when a review is abandoned (issue #742).
+ *
+ * Before this, a terminal give-up's only notice was a best-effort pull-request
+ * comment on the mergeability path and nothing at all on the aggregate-check one
+ * — and in the incident behind issue #720 that comment failed against the very
+ * provider whose unreachability caused the give-up, so the abandoned review left
+ * no trace anywhere and the dispatch settled as an ordinary no-trigger. What is
+ * pinned here is that the record is written to SWARM's own database, on both
+ * give-up paths, independently of whether the provider can be reached.
+ */
+describe('review trigger — durable trace when a review is abandoned (issue #742)', () => {
+	const checks = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
+	const updated = {
+		kind: 'pull-request',
+		action: 'updated',
+		workItemId: '42',
+		headSha: 'abc123',
+		isDraft: false,
+		isCrossRepo: false,
+		prAuthorLogin: 'operator-human',
+	} as const;
+
+	/** The single record the give-up wrote. */
+	function recorded(): {
+		projectId: string;
+		repository: string;
+		taskId: string;
+		phase: string;
+		prNumber?: string;
+		error: string;
+		jobPayload?: Record<string, unknown>;
+	} {
+		expect(createFailedRun).toHaveBeenCalledTimes(1);
+		return createFailedRun.mock.calls[0][0];
+	}
+
+	it('records one failed Review run when the mergeability path gives up', async () => {
+		getPullRequest.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+
+		expect(await handler.handle(ctx(updated, { readFailureRecheckAttempt: 15 }))).toBeNull();
+
+		const record = recorded();
+		expect(record).toMatchObject({
+			projectId: PROJECT.id,
+			repository: PROJECT.repo,
+			taskId: '42',
+			phase: 'review',
+			prNumber: '42',
+		});
+		// Which budget ran out, how many attempts it spent, the head SHA, and the
+		// last underlying error — the four things an operator asks after.
+		expect(record.error).toContain('read-failed');
+		expect(record.error).toContain('15/15 attempts');
+		expect(record.error).toContain('abc123');
+		expect(record.error).toContain('getaddrinfo ENOTFOUND api.github.com');
+	});
+
+	it('records one failed Review run when the aggregate-check path gives up', async () => {
+		// The path that had no notice at all before: it posts no comment, so the
+		// record is the only thing standing between an abandoned review and silence.
+		getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+
+		expect(
+			await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { readFailureRecheckAttempt: 15 })),
+		).toBeNull();
+
+		const record = recorded();
+		expect(record).toMatchObject({ taskId: '9', phase: 'review', prNumber: '9' });
+		expect(record.error).toContain('read-failed');
+		expect(record.error).toContain('cafe');
+		expect(record.error).toContain('502 Bad Gateway');
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+	});
+
+	it('names the CI-lag budget when that is the one that ran out', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		expect(
+			await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20 })),
+		).toBeNull();
+
+		const record = recorded();
+		expect(record.error).toContain('state-pending');
+		expect(record.error).toContain('20/20 attempts');
+		expect(record.error).toContain('test');
+	});
+
+	it('stores a payload a dashboard retry re-decides from, with both budgets reset', async () => {
+		getPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+
+		await handler.handle(
+			ctx(updated, { readFailureRecheckAttempt: 15, recheckAttempt: 4, deliveryId: 'd-7' }),
+		);
+
+		const payload = recorded().jobPayload;
+		expect(payload).toMatchObject({
+			type: 'scm',
+			providerId: 'github',
+			projectId: PROJECT.id,
+			deliveryId: 'd-7',
+		});
+		// Without this a "Retry now" would re-enter the handler already at its cap
+		// and give up again without reading anything.
+		expect(payload).not.toHaveProperty('recheckAttempt');
+		expect(payload).not.toHaveProperty('readFailureRecheckAttempt');
+	});
+
+	it('still records the give-up when the pull-request comment cannot be posted', async () => {
+		// The incident's actual shape: the comment goes through the same unreachable
+		// provider, so the record is what survives.
+		getPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+		commentOnPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+
+		expect(await handler.handle(ctx(updated, { readFailureRecheckAttempt: 15 }))).toBeNull();
+
+		expect(createFailedRun).toHaveBeenCalledTimes(1);
+		expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
+	});
+
+	it('swallows a failed record write and still attempts the comment', async () => {
+		// Bookkeeping must never throw out of `handle`: that lands outside
+		// `processJob`'s `runPhase`-only try/catch and burns the job's BullMQ retries.
+		getPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+		createFailedRun.mockRejectedValue(new Error('database is down too'));
+
+		expect(await handler.handle(ctx(updated, { readFailureRecheckAttempt: 15 }))).toBeNull();
+
+		expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
+	});
+
+	it('records nothing on a defer that reschedules', async () => {
+		getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+
+		expect(
+			await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { readFailureRecheckAttempt: 2 })),
+		).toBeNull();
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+
+	it('records nothing on a review that dispatches normally', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['build', 'completed', 'success']]));
+
+		await expect(handler.handle(ctx({ ...checks, headSha: 'cafe' }))).resolves.toMatchObject({
+			phase: 'review',
+		});
+		expect(createFailedRun).not.toHaveBeenCalled();
 	});
 });
 
