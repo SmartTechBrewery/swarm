@@ -170,12 +170,28 @@ const jobBase = z.object({
 	/** The provider's per-delivery id — stable per webhook delivery. */
 	deliveryId: z.string().min(1).optional(),
 	/**
-	 * How many times this job has already been re-enqueued as a deferred
-	 * incomplete-check recheck (`src/triggers/handlers/review.ts`). Absent on a
-	 * fresh webhook; incremented each time the `pr-review` handler reschedules a
-	 * coalesced recheck, so it can cap the loop when the Actions API stays stale.
+	 * How many times this job has already been re-enqueued because a read the
+	 * handler needed *answered, but not finally*
+	 * (`src/triggers/handlers/review.ts`): a check still incomplete, no checks
+	 * registered on the head yet, or a `mergeable` still unknown. Absent on a
+	 * fresh webhook; incremented on each such recheck, so the handler can cap the
+	 * loop when the provider's checks API stays stale. A read that *failed
+	 * outright* spends {@link readFailureRecheckAttempt} instead (issue #720), so
+	 * a source-control outage can no longer draw this allowance down.
 	 */
 	recheckAttempt: z.number().int().nonnegative().optional(),
+	/**
+	 * How many times this job has already been re-enqueued because a read the
+	 * `pr-review` handler needed *failed outright* (issue #720): the SCM provider
+	 * threw (unreachable, 5xx, rate-limited, no resolvable reviewer token) or the
+	 * run-history lookup threw. A **separate budget** from {@link recheckAttempt},
+	 * with its own capped exponential backoff — one shared counter let a transient
+	 * provider outage spend the allowance reserved for CI that is still running,
+	 * which dropped a synthetic follow-up Review (`src/pipeline/follow-up-review.ts`)
+	 * that had no later webhook to fall back on. Cleared by any defer that *did*
+	 * get an answer. Absent on a fresh webhook.
+	 */
+	readFailureRecheckAttempt: z.number().int().nonnegative().optional(),
 	/**
 	 * How many times this job has already been re-enqueued as a deferred retry
 	 * (on a `phase-deferred` outcome) — either a rate-limit

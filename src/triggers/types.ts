@@ -45,11 +45,19 @@ export type TriggerContext = {
 	/** The provider's per-delivery webhook id, when the job carried one. */
 	deliveryId?: string;
 	/**
-	 * How many times this job has already been re-enqueued as a deferred
-	 * incomplete-check recheck (`SwarmJob.recheckAttempt`). 0/absent on a fresh
-	 * webhook; the `pr-review` handler reads it to cap the recheck loop.
+	 * How many times this job has already been re-enqueued because a read the
+	 * handler needed answered, but not finally — an incomplete check, an unknown
+	 * mergeability (`SwarmJob.recheckAttempt`). 0/absent on a fresh webhook; the
+	 * `pr-review` and `resolve-conflicts` handlers read it to cap that loop.
 	 */
 	recheckAttempt?: number;
+	/**
+	 * How many times this job has already been re-enqueued because a read *failed*
+	 * rather than answered (`SwarmJob.readFailureRecheckAttempt`, issue #720) — its
+	 * own budget, so a source-control outage cannot spend the CI-lag allowance
+	 * above. 0/absent on a fresh webhook; read by the `pr-review` handler.
+	 */
+	readFailureRecheckAttempt?: number;
 	/** A deferred PM phase that must resume even though its card is now In progress. */
 	resumePmPhase?: Extract<TriggerPhase, 'planning' | 'implementation'>;
 	/**
