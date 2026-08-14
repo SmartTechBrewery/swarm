@@ -232,6 +232,15 @@ const findExecutingDispatchForTask = vi.fn(
 		_excludeDispatchId?: string,
 	): Promise<{ id: string; phase: string | null } | undefined> => undefined,
 );
+const selectTaskPhaseForExecution = vi.fn(
+	async (
+		_projectId: string,
+		_taskId: string,
+	): Promise<{ id: string; phase: string | null } | undefined> => ({
+		id: 'dispatch-1',
+		phase: 'review',
+	}),
+);
 const deferDispatchToPending = vi.fn(async (_id: string, _input: unknown) => mockDispatchRow({}));
 const scheduleDispatchRetry = vi.fn(
 	async (_id: string, input: { jobPayload: Record<string, unknown> }) => ({
@@ -265,6 +274,8 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		recordDispatchResolution(id, taskId, phase),
 	findExecutingDispatchForTask: (projectId: string, taskId: string, excludeDispatchId?: string) =>
 		findExecutingDispatchForTask(projectId, taskId, excludeDispatchId),
+	selectTaskPhaseForExecution: (projectId: string, taskId: string) =>
+		selectTaskPhaseForExecution(projectId, taskId),
 	deferDispatchToPending: (id: string, input: unknown) => deferDispatchToPending(id, input),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
@@ -709,6 +720,8 @@ describe('processJob', () => {
 		recordDispatchResolution.mockClear();
 		findExecutingDispatchForTask.mockClear();
 		findExecutingDispatchForTask.mockResolvedValue(undefined);
+		selectTaskPhaseForExecution.mockClear();
+		selectTaskPhaseForExecution.mockResolvedValue({ id: 'dispatch-1', phase: 'review' });
 		deferDispatchToPending.mockClear();
 		scheduleDispatchRetry.mockClear();
 		claimWorkerForDispatch.mockClear();
@@ -3801,6 +3814,52 @@ describe('processJob', () => {
 			expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17');
 		});
 
+		it('runs Planning first when simultaneous contenders both select it over Implementation', async () => {
+			let release: (() => void) | undefined;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			phaseImpl = async () => {
+				await gate;
+				return { agent: agentResult() };
+			};
+			claimDispatchForJob.mockImplementation(async (job: Record<string, unknown>) => ({
+				claimed: true,
+				dispatch: { ...mockDispatchRow(job), id: String(job.deliveryId) },
+			}));
+			// This models the advisory-locked repository result after both leased rows
+			// recorded their task/phase: every contender receives the same earliest phase.
+			selectTaskPhaseForExecution.mockResolvedValue({
+				id: 'planning-delivery',
+				phase: 'planning',
+			});
+
+			const workItem = createMockWorkItem();
+			const planning = processJob(
+				createMockPmWebhookJob({ deliveryId: 'planning-delivery' }),
+				registryReturning({ phase: 'planning', taskId: '17', workItem }),
+			);
+			const implementation = processJob(
+				createMockPmWebhookJob({ deliveryId: 'implementation-delivery' }),
+				registryReturning({ phase: 'implementation', taskId: '17', workItem }),
+			);
+
+			expect(await implementation).toMatchObject({
+				status: 'phase-deferred',
+				phase: 'implementation',
+				taskId: '17',
+			});
+			expect(phaseCalls).toHaveLength(1);
+			expect(phaseCalls[0]?.phase).toBe('planning');
+			expect(deferDispatchToPending).toHaveBeenCalledWith(
+				'implementation-delivery',
+				expect.objectContaining({ waitReason: 'task-in-flight' }),
+			);
+
+			release?.();
+			await planning;
+		});
+
 		it('wakes the task-in-flight waits when the holding phase fails or defers, not only on success', async () => {
 			phaseImpl = async () => {
 				throw new Error('boom');
@@ -3855,9 +3914,9 @@ describe('processJob', () => {
 		// The durable leg: the verdict must not depend on which worker the dispatch was
 		// routed to, so a collision recorded on the dispatch table counts even when this
 		// process's own map knows nothing about the task.
-		describe('durable collision read (routing-independent)', () => {
+		describe('durable task-phase selection (routing-independent)', () => {
 			it('defers when another worker is executing a different phase of the task', async () => {
-				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'planning' });
+				selectTaskPhaseForExecution.mockResolvedValue({ id: 'other', phase: 'planning' });
 
 				const outcome = await processJob(
 					createMockPmWebhookJob(),
@@ -3874,13 +3933,11 @@ describe('processJob', () => {
 					'dispatch-1',
 					expect.objectContaining({ waitReason: 'task-in-flight' }),
 				);
-				// The asking dispatch is excluded — it is already `leased` with its own
-				// task/phase recorded and would otherwise find itself.
-				expect(findExecutingDispatchForTask).toHaveBeenCalledWith(PROJECT.id, '17', 'dispatch-1');
+				expect(selectTaskPhaseForExecution).toHaveBeenCalledWith(PROJECT.id, '17');
 			});
 
 			it('drops it as a duplicate when the executing phase is the same one', async () => {
-				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+				selectTaskPhaseForExecution.mockResolvedValue({ id: 'other', phase: 'review' });
 
 				const outcome = await processJob(
 					createMockScmWebhookJob(),
@@ -3892,7 +3949,7 @@ describe('processJob', () => {
 			});
 
 			it('defers rather than drops when the executing row recorded no phase', async () => {
-				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: null });
+				selectTaskPhaseForExecution.mockResolvedValue({ id: 'other', phase: null });
 
 				const outcome = await processJob(
 					createMockScmWebhookJob(),
@@ -3903,14 +3960,15 @@ describe('processJob', () => {
 				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
 			});
 
-			it('dispatches normally when the durable read finds nothing or fails', async () => {
+			it('dispatches normally when durable selection finds nothing or fails', async () => {
+				selectTaskPhaseForExecution.mockResolvedValue(undefined);
 				const outcome = await processJob(
 					createMockScmWebhookJob(),
 					registryReturning(REVIEW_TRIGGER),
 				);
 				expect(outcome.status).toBe('phase-succeeded');
 
-				findExecutingDispatchForTask.mockRejectedValue(new Error('db down'));
+				selectTaskPhaseForExecution.mockRejectedValue(new Error('db down'));
 				const afterFailure = await processJob(
 					createMockScmWebhookJob(),
 					registryReturning(REVIEW_TRIGGER),

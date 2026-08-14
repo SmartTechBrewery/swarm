@@ -38,6 +38,7 @@ import {
 	markDispatchRunning,
 	recordDispatchResolution,
 	scheduleDispatchRetry,
+	selectTaskPhaseForExecution,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import { abandonReviewVerdict } from '../db/repositories/reviewVerdictsRepository.js';
@@ -1249,10 +1250,10 @@ const inFlightPhaseByTask = new Map<string, TriggerPhase>();
  *
  * Two legs, in this order, because both are load-bearing:
  *
- * 1. The **durable** record ({@link findExecutingDispatchForTask}) — awaited first
- *    so the in-memory pair below stays synchronous. It is what makes the verdict
- *    independent of which worker the dispatch was routed to, which the in-memory
- *    map alone never was ("already running in *this* worker").
+ * 1. The **durable** selection ({@link selectTaskPhaseForExecution}) — awaited
+ *    first so the in-memory pair below stays synchronous. Its transaction-scoped
+ *    task lock makes simultaneous Planning and Implementation contenders choose
+ *    Planning deterministically, independent of which worker received either job.
  * 2. The **in-process** map, read and written with nothing awaited in between,
  *    which is what closes the same-process BullMQ-concurrency window the durable
  *    read cannot: two jobs claimed milliseconds apart are both `leased` with no
@@ -1267,21 +1268,23 @@ async function claimTaskForPhase(
 	trigger: TriggerResult,
 	dispatchId: string,
 ): Promise<{ claimed: true } | { claimed: false; holdingPhase: string | null }> {
-	let executing: { id: string; phase: string | null } | undefined;
+	let selected: { id: string; phase: string | null } | undefined;
 	try {
-		executing = await findExecutingDispatchForTask(projectId, trigger.taskId, dispatchId);
+		selected = await selectTaskPhaseForExecution(projectId, trigger.taskId);
 	} catch (err) {
-		logger.warn('Could not read the executing dispatch for this task (assuming none)', {
+		logger.warn('Could not select the executing dispatch for this task (assuming none)', {
 			projectId,
 			taskId: trigger.taskId,
 			phase: trigger.phase,
 			error: describeError(err),
 		});
 	}
+	if (selected && selected.id !== dispatchId) {
+		return { claimed: false, holdingPhase: selected.phase };
+	}
 	// Synchronous from here to the `set` below.
 	const holding = inFlightPhaseByTask.get(trigger.taskId);
 	if (holding !== undefined) return { claimed: false, holdingPhase: holding };
-	if (executing) return { claimed: false, holdingPhase: executing.phase };
 	inFlightPhaseByTask.set(trigger.taskId, trigger.phase);
 	return { claimed: true };
 }
