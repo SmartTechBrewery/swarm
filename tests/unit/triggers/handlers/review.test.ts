@@ -147,6 +147,7 @@ function ctx(
 	overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {},
 	extra: {
 		recheckAttempt?: number;
+		readFailureRecheckAttempt?: number;
 		deliveryId?: string;
 		continuationDispatchClaimed?: boolean;
 	} = {},
@@ -272,7 +273,8 @@ describe('review trigger', () => {
 
 		it('degrades to a bounded recheck when the ownership lookup throws', async () => {
 			// A transient DB blip must not silently drop a legitimate review — it
-			// defers, like a failed mergeability fetch.
+			// defers, like a failed mergeability fetch. The lookup *failed*, so it
+			// spends the read-failure budget, not the CI-lag one (issue #720).
 			hasRunForTask.mockRejectedValue(new Error('connection reset'));
 			const result = await handler.handle(
 				ctx({ ...base, headSha: 'abc', isCrossRepo: false }, { deliveryId: 'd-7' }),
@@ -281,9 +283,10 @@ describe('review trigger', () => {
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 			expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({
-				recheckAttempt: 1,
+				readFailureRecheckAttempt: 1,
 				deliveryId: 'd-7',
 			});
+			expect(scheduleCoalescedJob.mock.calls[0][0]).not.toHaveProperty('recheckAttempt');
 		});
 
 		it('skips when no head SHA is present', async () => {
@@ -446,7 +449,7 @@ describe('review trigger', () => {
 
 		it('degrades to a bounded recheck when the ownership lookup throws', async () => {
 			// A transient error determining ownership must not drop a legit review;
-			// it defers, like a failed aggregate query.
+			// it defers, like a failed aggregate query — on the read-failure budget.
 			hasRunForTask.mockRejectedValue(new Error('connection reset'));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { deliveryId: 'd-2' })),
@@ -454,7 +457,7 @@ describe('review trigger', () => {
 			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 			expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({
-				recheckAttempt: 1,
+				readFailureRecheckAttempt: 1,
 				deliveryId: 'd-2',
 			});
 		});
@@ -585,7 +588,7 @@ describe('review trigger', () => {
 		it('degrades to a bounded recheck when the aggregate query throws', async () => {
 			// A transient Actions-API error (or an unresolvable reviewer token) must
 			// not escape the handler — that would fail the job and burn its BullMQ
-			// retries. It defers a recheck instead.
+			// retries. It defers a recheck instead, on the read-failure budget.
 			getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { deliveryId: 'd-9' })),
@@ -594,7 +597,7 @@ describe('review trigger', () => {
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 			const [job, coalesceKey] = scheduleCoalescedJob.mock.calls[0];
 			expect(coalesceKey).toBe(`check-suite:${PROJECT.repo}:9:cafe`);
-			expect(job).toMatchObject({ recheckAttempt: 1, deliveryId: 'd-9' });
+			expect(job).toMatchObject({ readFailureRecheckAttempt: 1, deliveryId: 'd-9' });
 		});
 
 		it('degrades to a bounded recheck when the reviewer token cannot be resolved', async () => {
@@ -605,13 +608,17 @@ describe('review trigger', () => {
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
 		});
 
-		it('gives up (no reschedule) when the query keeps failing past the cap', async () => {
+		it('gives up (no reschedule) when the query keeps failing past the read-failure cap', async () => {
 			getAggregateCheckStatus.mockRejectedValue(new Error('still 502'));
 			expect(
-				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { recheckAttempt: 20 })),
+				await handler.handle(ctx({ ...base, headSha: 'cafe' }, { readFailureRecheckAttempt: 15 })),
 			).toBeNull();
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(loggerWarn).toHaveBeenCalledWith(
+				expect.stringContaining('giving up on deferred recheck'),
+				expect.objectContaining({ budget: 'read-failed', cap: 15 }),
+			);
 		});
 
 		it('skips a suite with no associated PR (no query)', async () => {
@@ -897,6 +904,216 @@ describe('review trigger', () => {
 				expect.stringContaining('SWARM conflict check needs attention'),
 			);
 		});
+	});
+});
+
+/**
+ * Separate CI-lag and read-failure recheck budgets (issue #720).
+ *
+ * The two defer reasons used to share one 20-attempt allowance, so a transient
+ * source-control outage drew down the budget reserved for CI that is still
+ * running: on PR #694 seventeen of twenty attempts went to a DNS failure, the cap
+ * was reached, and the synthetic follow-up Review (`src/pipeline/follow-up-review.ts`)
+ * — which has no later webhook to fall back on — was dropped. What is pinned here
+ * is the classification: a defer spends the budget its *reason* names, whichever
+ * scheduler runs.
+ */
+describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)', () => {
+	const checks = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
+	const updated = {
+		kind: 'pull-request',
+		action: 'updated',
+		workItemId: '42',
+		headSha: 'abc123',
+		isDraft: false,
+		isCrossRepo: false,
+		prAuthorLogin: 'operator-human',
+	} as const;
+
+	/** The payload of the most recent coalesced reschedule. */
+	function lastScheduledJob(): {
+		recheckAttempt?: number;
+		readFailureRecheckAttempt?: number;
+	} {
+		const { calls } = scheduleCoalescedJob.mock;
+		return calls[calls.length - 1][0];
+	}
+
+	/** The delay (third argument) of the most recent coalesced reschedule. */
+	function lastScheduledDelay(): number {
+		const { calls } = scheduleCoalescedJob.mock;
+		return calls[calls.length - 1][2];
+	}
+
+	it('still defers a failed read once the CI-lag budget is spent, carrying it through untouched', async () => {
+		// The regression: sharing one counter, a spent CI-lag allowance stopped the
+		// reschedule outright even though nothing had answered to spend it.
+		getPullRequest.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+
+		expect(await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20 }))).toBe(
+			null,
+		);
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		expect(lastScheduledJob()).toMatchObject({
+			recheckAttempt: 20,
+			readFailureRecheckAttempt: 1,
+		});
+	});
+
+	it('spends the read-failure budget when the aggregate query fails, leaving the CI-lag one alone', async () => {
+		getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+
+		expect(
+			await handler.handle(
+				ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 7, readFailureRecheckAttempt: 2 }),
+			),
+		).toBeNull();
+
+		expect(lastScheduledJob()).toMatchObject({
+			recheckAttempt: 7,
+			readFailureRecheckAttempt: 3,
+		});
+	});
+
+	it('clears the read-failure counter on a defer that did get an answer', async () => {
+		// An incomplete check is the provider *answering* — the outage is over, so
+		// the read-failure allowance is handed back in full.
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		expect(
+			await handler.handle(
+				ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 2, readFailureRecheckAttempt: 6 }),
+			),
+		).toBeNull();
+
+		const job = lastScheduledJob();
+		expect(job).toMatchObject({ recheckAttempt: 3 });
+		expect(job).not.toHaveProperty('readFailureRecheckAttempt');
+		expect(lastScheduledDelay()).toBe(30_000);
+	});
+
+	it('clears it on an unknown-mergeability defer too', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+		});
+
+		expect(await handler.handle(ctx(updated, { readFailureRecheckAttempt: 4 }))).toBeNull();
+
+		const job = lastScheduledJob();
+		expect(job).toMatchObject({ recheckAttempt: 1 });
+		expect(job).not.toHaveProperty('readFailureRecheckAttempt');
+	});
+
+	it('backs off exponentially, capped at 5 minutes, while the read keeps failing', async () => {
+		getPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+
+		for (const [attemptsSpent, expectedDelay] of [
+			[0, 30_000],
+			[3, 240_000],
+			[9, 300_000],
+		] as const) {
+			scheduleCoalescedJob.mockClear();
+			expect(
+				await handler.handle(
+					ctx({ ...checks, headSha: 'cafe' }, { readFailureRecheckAttempt: attemptsSpent }),
+				),
+			).toBeNull();
+			expect(lastScheduledDelay()).toBe(expectedDelay);
+		}
+	});
+
+	it('gives up on the mergeability path once the read-failure budget is spent, naming the outage', async () => {
+		getPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+
+		expect(await handler.handle(ctx(updated, { readFailureRecheckAttempt: 15 }))).toBeNull();
+
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(loggerWarn).toHaveBeenCalledWith(
+			expect.stringContaining('giving up on deferred recheck'),
+			expect.objectContaining({ budget: 'read-failed', cap: 15 }),
+		);
+		// Best-effort and expected to fail during a real outage (the durable trace
+		// is issue #720's phase 2), but its wording must match the reason.
+		expect(commentOnPullRequest).toHaveBeenCalledWith(
+			expect.any(Object),
+			42,
+			expect.stringContaining('could not reach the source-control provider'),
+		);
+	});
+
+	it('keeps the unknown-mergeability wording when the CI-lag budget is what ran out', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+		});
+
+		expect(await handler.handle(ctx(updated, { recheckAttempt: 20 }))).toBeNull();
+
+		expect(commentOnPullRequest).toHaveBeenCalledWith(
+			expect.any(Object),
+			42,
+			expect.stringContaining('SWARM conflict check needs attention'),
+		);
+	});
+
+	it('carries a follow-up Review through an outage and reviews once the provider answers', async () => {
+		// The incident end to end: a synthetic follow-up Review (no later webhook to
+		// fall back on) that already spent three CI-lag attempts, then five failed
+		// reads, then a provider that comes back with green checks.
+		const followUp = { ...checks, headSha: 'newsha', prBranch: 'issue-9' } as const;
+		getPullRequest.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+
+		let carried: { recheckAttempt?: number; readFailureRecheckAttempt?: number } = {
+			recheckAttempt: 3,
+		};
+		for (let attempt = 0; attempt < 5; attempt++) {
+			expect(await handler.handle(ctx(followUp, carried))).toBeNull();
+			carried = {
+				recheckAttempt: lastScheduledJob().recheckAttempt,
+				readFailureRecheckAttempt: lastScheduledJob().readFailureRecheckAttempt,
+			};
+		}
+		expect(carried).toEqual({ recheckAttempt: 3, readFailureRecheckAttempt: 5 });
+
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'newsha',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: true,
+			authorLogin: 'operator-human',
+		});
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['build', 'completed', 'success']]));
+
+		await expect(handler.handle(ctx(followUp, carried))).resolves.toMatchObject({
+			phase: 'review',
+			prNumber: '9',
+			headSha: 'newsha',
+		});
+	});
+
+	it('leaves a fresh webhook carrying neither counter driving the decision as before', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['build', 'completed', 'success']]));
+
+		await expect(handler.handle(ctx({ ...checks, headSha: 'cafe' }))).resolves.toMatchObject({
+			phase: 'review',
+			prNumber: '9',
+			headSha: 'cafe',
+		});
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 	});
 });
 

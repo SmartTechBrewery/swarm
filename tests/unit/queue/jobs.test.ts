@@ -39,6 +39,16 @@ describe('SwarmJobSchema', () => {
 		expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
 	});
 
+	it('carries the read-failure recheck count as its own counter (issue #720)', () => {
+		// Both budgets travel together: a read-failure recheck must not disturb the
+		// CI-lag count it is re-enqueued beside.
+		const job = { ...createMockScmWebhookJob(), recheckAttempt: 3, readFailureRecheckAttempt: 2 };
+		expect(SwarmJobSchema.parse(roundTrip(job))).toMatchObject({
+			recheckAttempt: 3,
+			readFailureRecheckAttempt: 2,
+		});
+	});
+
 	it('parses a job carrying a rateLimitRetryAttempt count', () => {
 		const job = { ...createMockScmWebhookJob(), rateLimitRetryAttempt: 4 };
 		expect(SwarmJobSchema.parse(roundTrip(job))).toMatchObject({ rateLimitRetryAttempt: 4 });

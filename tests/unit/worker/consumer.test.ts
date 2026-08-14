@@ -1193,11 +1193,14 @@ describe('processJob', () => {
 		// that attempt in the ctx so the review handler re-matches and can enforce
 		// its recheck cap rather than looping forever.
 		const seen: TriggerContext[] = [];
-		const job = createMockScmWebhookJob({ recheckAttempt: 5 });
+		const job = createMockScmWebhookJob({ recheckAttempt: 5, readFailureRecheckAttempt: 2 });
 
 		await processJob(job, registryReturning(REVIEW_TRIGGER, seen));
 
 		expect(seen[0].recheckAttempt).toBe(5);
+		// Its own budget travels beside it (issue #720) — a handler that saw only one
+		// of the two would resume the outage wait against the wrong allowance.
+		expect(seen[0].readFailureRecheckAttempt).toBe(2);
 		expect(phaseCalls[0].phase).toBe('review');
 	});
 

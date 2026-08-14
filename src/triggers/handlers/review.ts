@@ -44,17 +44,30 @@
  * that winds a never-sticking fix down to a warn-and-drop, mirroring Cascade's
  * `MAX_ATTEMPTS`.
  *
- * **Deferred recheck.** A defer schedules a coalesced re-enqueue of this same
- * event ~30s out (`scheduleCoalescedDispatch`). This guards the case where the
- * provider's checks API lags webhook delivery — the suite reports complete over
- * the webhook, but a query moments later still shows it `in_progress`, and no
- * further webhook will arrive to wake us. The recheck re-queries fresh API
- * state; `recheckAttempt` caps the loop so a permanently-stale API can't
- * reschedule forever (a genuinely slow CI run is re-triggered by its own later
- * `checks` webhook, so the cap can't drop a legitimate review). A *failed*
- * aggregate query (transient checks-API error, or an unresolvable reviewer
- * token) degrades to the same bounded recheck rather than throwing out of the
- * handler and burning the job's retries — see `resolveAggregateCheckReview`.
+ * **Deferred recheck, on two separate budgets** (issue #720). A defer schedules
+ * a coalesced re-enqueue of this same event (`scheduleCoalescedDispatch`), and
+ * which allowance it spends is decided by *why* the handler could not decide —
+ * not by which scheduler ran:
+ *  - `state-pending` — the provider answered and its answer is not final yet: a
+ *    check still `in_progress`, no checks registered on the head, `mergeable`
+ *    still `null`. Guards the case where the provider's checks API lags webhook
+ *    delivery (the suite reports complete over the webhook, but a query moments
+ *    later still shows it running, and no further webhook will arrive to wake
+ *    us). Fixed ~30s cadence, capped by `recheckAttempt`/{@link MAX_CHECK_RECHECKS}.
+ *  - `read-failed` — the read never answered at all: the provider threw (a
+ *    transient checks-API error, a 5xx/rate-limit, an unresolvable reviewer
+ *    token) or the run-history lookup threw. Degrading to a defer keeps the
+ *    throw from escaping `handle` and burning the job's BullMQ retries; it draws
+ *    on `readFailureRecheckAttempt`/{@link MAX_READ_FAILURE_RECHECKS} with its
+ *    own capped exponential backoff, so a provider that is not there is
+ *    outlasted rather than hammered.
+ *
+ * Keeping them apart is the point: one shared counter let a source-control
+ * outage spend the allowance reserved for CI that is still running, and the
+ * synthetic follow-up Review (`src/pipeline/follow-up-review.ts`), which has no
+ * later webhook to fall back on, was dropped. A `read-failed` defer therefore
+ * carries `recheckAttempt` through untouched, and a defer that *did* get an
+ * answer clears the read-failure count.
  *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
@@ -138,13 +151,121 @@ function isDispositionDisabled(
 const RECHECK_DELAY_MS = 30_000;
 
 /**
- * Cap on deferred rechecks per job. ~10 min of checks-API lag at
- * {@link RECHECK_DELAY_MS} — well beyond any real lag, and past it a fresh
- * `checks` webhook (which every completing suite emits) re-triggers anyway,
- * so the cap can only stop a pathological self-reschedule loop, never drop a
- * legitimate review.
+ * Cap on deferred rechecks per job for a `state-pending` defer — the provider
+ * answered, its answer is not final yet. ~10 min of checks-API lag at
+ * {@link RECHECK_DELAY_MS}, well beyond any real lag.
+ *
+ * Past it a *webhook-driven* review is re-triggered anyway by the fresh `checks`
+ * webhook every completing suite emits, so there the cap only stops a
+ * pathological self-reschedule loop. That argument does **not** cover the
+ * synthetic follow-up Review a `fixed` Respond-to-review enqueues
+ * (`src/pipeline/follow-up-review.ts`, issue #241): SWARM enqueues that one
+ * itself and no later webhook is guaranteed, so exhausting this budget there
+ * does drop a legitimate review. Which is exactly why a *failed read* no longer
+ * spends it (issue #720) — it draws on {@link MAX_READ_FAILURE_RECHECKS}.
  */
 const MAX_CHECK_RECHECKS = 20;
+
+/**
+ * Cap on deferred rechecks per job for a `read-failed` defer — the read never
+ * answered (issue #720). Its own budget, so a source-control outage can no
+ * longer draw down the CI-lag allowance above: on PR #694 seventeen of twenty
+ * attempts went to a DNS failure and the follow-up Review was dropped with it.
+ * Still bounded — a provider that never comes back must wind down to one warn
+ * rather than reschedule forever.
+ */
+const MAX_READ_FAILURE_RECHECKS = 15;
+
+/** First read-failure backoff step; doubles per attempt up to {@link READ_FAILURE_MAX_DELAY_MS}. */
+const READ_FAILURE_BASE_DELAY_MS = 30_000;
+const READ_FAILURE_MAX_DELAY_MS = 300_000;
+
+/**
+ * Capped exponential backoff for a read-failure recheck: 30s, 1m, 2m, 4m, then
+ * 5m — about 62 minutes of provider unavailability outlasted over the full
+ * {@link MAX_READ_FAILURE_RECHECKS} budget, at 15 cheap single reads rather than
+ * a fixed-cadence hammering of a provider that is not answering.
+ */
+function readFailureRecheckDelayMs(attemptsSpent: number): number {
+	return Math.min(READ_FAILURE_BASE_DELAY_MS * 2 ** attemptsSpent, READ_FAILURE_MAX_DELAY_MS);
+}
+
+/**
+ * Which allowance a defer draws on, classified by *why* the handler could not
+ * decide rather than by which scheduler runs (issue #720).
+ */
+type DeferBudget =
+	/** The provider answered; the answer is not final yet — a check still running, `mergeable` unknown. */
+	| 'state-pending'
+	/** The read never answered — the provider threw, or the run-history lookup threw. */
+	| 'read-failed';
+
+/**
+ * Schedule a coalesced re-enqueue of this event on `budget`'s allowance, or
+ * report that the allowance is spent. Returns `false` (already logged) on the
+ * latter, so each caller keeps its own terminal handling.
+ *
+ * Both counters travel on the replacement payload and only the chosen budget's
+ * advances: a `read-failed` defer carries `recheckAttempt` through **untouched**
+ * — the whole point of the split — while a `state-pending` defer omits the
+ * read-failure count entirely, clearing it because the provider demonstrably
+ * answered. As before, the payload deliberately carries no `runId` or
+ * `continuationDispatchClaimed`: the recheck re-enters the handler as a fresh
+ * decision.
+ */
+async function scheduleReviewRecheck(
+	ctx: ScmTriggerContext,
+	budget: DeferBudget,
+	coalesceKey: string,
+	prNumber: string,
+	headSha: string,
+	details: Record<string, unknown>,
+): Promise<boolean> {
+	const readFailed = budget === 'read-failed';
+	const checkAttempt = ctx.recheckAttempt ?? 0;
+	const readFailureAttempt = ctx.readFailureRecheckAttempt ?? 0;
+	const attemptsSpent = readFailed ? readFailureAttempt : checkAttempt;
+	const cap = readFailed ? MAX_READ_FAILURE_RECHECKS : MAX_CHECK_RECHECKS;
+	if (attemptsSpent >= cap) {
+		logger.warn('review: giving up on deferred recheck (cap reached)', {
+			budget,
+			prNumber,
+			headSha,
+			attemptsSpent,
+			cap,
+			coalesceKey,
+			...details,
+		});
+		return false;
+	}
+
+	const nextCheckAttempt = readFailed ? checkAttempt : checkAttempt + 1;
+	const delayMs = readFailed ? readFailureRecheckDelayMs(readFailureAttempt) : RECHECK_DELAY_MS;
+	await scheduleCoalescedDispatch(
+		{
+			type: 'scm',
+			providerId: ctx.providerId,
+			projectId: ctx.project.id,
+			...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
+			...(nextCheckAttempt > 0 ? { recheckAttempt: nextCheckAttempt } : {}),
+			...(readFailed ? { readFailureRecheckAttempt: readFailureAttempt + 1 } : {}),
+			event: ctx.event,
+		},
+		coalesceKey,
+		delayMs,
+	);
+	logger.debug('review: scheduled deferred recheck', {
+		budget,
+		prNumber,
+		headSha,
+		recheckAttempt: nextCheckAttempt,
+		readFailureRecheckAttempt: readFailed ? readFailureAttempt + 1 : 0,
+		delayMs,
+		coalesceKey,
+		...details,
+	});
+	return true;
+}
 
 /**
  * True when the event is a review entry point by *shape* — an opened/updated PR
@@ -183,53 +304,23 @@ function isReviewablePullRequest(event: ScmEvent, prNumber: string): ReviewDispo
 }
 
 /**
- * Schedule a bounded, coalesced recheck of this `checks` event, or give up
- * once {@link MAX_CHECK_RECHECKS} is reached. Always returns `{ kind: 'none' }`
- * — the event is fully handled here whether a recheck was queued or the cap
- * stopped the loop. Shared by the two defer paths in
- * {@link resolveAggregateCheckReview}: some check still incomplete, and a failed
- * aggregate query. `details` is merged into the log line so each caller records
- * why it deferred.
+ * Schedule a bounded, coalesced recheck of this `checks` event on `budget`'s
+ * allowance, or give up once that allowance is spent. Always returns
+ * `{ kind: 'none' }` — the event is fully handled here whether a recheck was
+ * queued or the cap stopped the loop. Shared by the two defer paths in
+ * {@link resolveAggregateCheckReview}: some check still incomplete
+ * (`state-pending`), and a failed aggregate query (`read-failed`). `details` is
+ * merged into the log line so each caller records why it deferred.
  */
 async function scheduleCheckRecheck(
 	ctx: ScmTriggerContext,
-	recheckAttempt: number,
+	budget: DeferBudget,
 	prNumber: string,
 	headSha: string,
 	details: Record<string, unknown>,
 ): Promise<ReviewDisposition> {
-	const { project } = ctx;
-	if (recheckAttempt >= MAX_CHECK_RECHECKS) {
-		logger.warn('review: giving up on aggregate-check recheck (cap reached)', {
-			prNumber,
-			headSha,
-			recheckAttempt,
-			...details,
-		});
-		return { kind: 'none' };
-	}
-
-	const coalesceKey = `check-suite:${project.repo}:${prNumber}:${headSha}`;
-	await scheduleCoalescedDispatch(
-		{
-			type: 'scm',
-			providerId: ctx.providerId,
-			projectId: project.id,
-			...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
-			recheckAttempt: recheckAttempt + 1,
-			event: ctx.event,
-		},
-		coalesceKey,
-		RECHECK_DELAY_MS,
-	);
-	logger.debug('review: scheduled deferred aggregate-check recheck', {
-		prNumber,
-		headSha,
-		recheckAttempt: recheckAttempt + 1,
-		delayMs: RECHECK_DELAY_MS,
-		coalesceKey,
-		...details,
-	});
+	const coalesceKey = `check-suite:${ctx.project.repo}:${prNumber}:${headSha}`;
+	await scheduleReviewRecheck(ctx, budget, coalesceKey, prNumber, headSha, details);
 	return { kind: 'none' };
 }
 
@@ -249,11 +340,11 @@ async function scheduleCheckRecheck(
  * project would fail+retry on *every* `checks` event). We degrade to a
  * bounded recheck instead — Cascade skips on error; we defer so a transient blip
  * can't silently drop a legitimate review, and the cap winds a persistent
- * failure down to one warn+drop rather than a retry storm.
+ * failure down to one warn+drop rather than a retry storm. That degrade spends
+ * the `read-failed` budget, not the CI-lag one (issue #720).
  */
 async function resolveAggregateCheckReview(
 	ctx: ScmTriggerContext,
-	recheckAttempt: number,
 	prNumber: string,
 	headSha: string,
 ): Promise<ReviewDisposition> {
@@ -263,7 +354,7 @@ async function resolveAggregateCheckReview(
 	try {
 		checkStatus = await ctx.scm.getAggregateCheckStatus(project, headSha);
 	} catch (err) {
-		return scheduleCheckRecheck(ctx, recheckAttempt, prNumber, headSha, {
+		return scheduleCheckRecheck(ctx, 'read-failed', prNumber, headSha, {
 			reason: 'aggregate query failed',
 			error: err instanceof Error ? err.message : String(err),
 		});
@@ -278,7 +369,7 @@ async function resolveAggregateCheckReview(
 	}
 
 	// defer — some check is still incomplete; re-query fresh API state shortly.
-	return scheduleCheckRecheck(ctx, recheckAttempt, prNumber, headSha, {
+	return scheduleCheckRecheck(ctx, 'state-pending', prNumber, headSha, {
 		incompleteChecks: decision.incompleteChecks,
 	});
 }
@@ -291,14 +382,13 @@ async function resolveAggregateCheckReview(
  */
 function resolveDisposition(
 	ctx: ScmTriggerContext,
-	recheckAttempt: number,
 	prNumber: string,
 	headSha: string,
 ): ReviewDisposition | Promise<ReviewDisposition> {
 	if (ctx.event.kind === 'pull-request') {
 		return isReviewablePullRequest(ctx.event, prNumber);
 	}
-	return resolveAggregateCheckReview(ctx, recheckAttempt, prNumber, headSha);
+	return resolveAggregateCheckReview(ctx, prNumber, headSha);
 }
 
 /**
@@ -467,20 +557,33 @@ function validateReviewEvent(ctx: TriggerContext): {
 	return { event, project, prNumber, headSha: event.headSha };
 }
 
-async function scmCommentUnknownMergeability(
+/**
+ * The terminal notice posted when the mergeability path exhausts a budget,
+ * worded for the budget that ran out: an unknown mergeability is the provider
+ * declining to answer a question, an exhausted read-failure budget is the
+ * provider not answering at all.
+ *
+ * Best-effort by nature — and on the `read-failed` path it is *expected* to
+ * fail, since it posts through the very provider that stopped answering. The
+ * durable, provider-independent trace that survives that is issue #720's
+ * phase 2.
+ */
+async function scmCommentReviewGaveUp(
 	scm: SCMProvider,
 	project: ProjectConfig,
 	prNumber: number,
+	budget: DeferBudget,
 ): Promise<void> {
+	const body =
+		budget === 'read-failed'
+			? `## ⚠️ SWARM could not reach the source-control provider\n\nRepeated attempts to read this pull request failed, so SWARM stopped waiting and abandoned the queued review. No branch changes were made. Please re-run the review once the provider is reachable again.\n\n---\n${SWARM_GENERATED_FOOTER}`
+			: `## ⚠️ SWARM conflict check needs attention\n\nThe source-control provider did not produce a mergeability result after repeated checks. No branch changes were made. Please inspect this PR manually and retry after the provider reports its mergeability.\n\n---\n${SWARM_GENERATED_FOOTER}`;
 	try {
-		await scm.commentOnPullRequest(
-			project,
-			prNumber,
-			`## ⚠️ SWARM conflict check needs attention\n\nThe source-control provider did not produce a mergeability result after repeated checks. No branch changes were made. Please inspect this PR manually and retry after the provider reports its mergeability.\n\n---\n${SWARM_GENERATED_FOOTER}`,
-		);
+		await scm.commentOnPullRequest(project, prNumber, body);
 	} catch (error) {
-		logger.error('review: failed to post terminal mergeability comment', {
+		logger.error('review: failed to post terminal review give-up comment', {
 			prNumber,
+			budget,
 			error: String(error),
 		});
 	}
@@ -488,46 +591,26 @@ async function scmCommentUnknownMergeability(
 
 async function scheduleMergeabilityRecheck(
 	ctx: ScmTriggerContext,
+	budget: DeferBudget,
 	prNumber: string,
 	headSha: string,
 	details: Record<string, unknown>,
 ): Promise<null> {
-	const recheckAttempt = ctx.recheckAttempt ?? 0;
-	if (recheckAttempt >= MAX_CHECK_RECHECKS) {
-		logger.warn('review: giving up on mergeability recheck (cap reached)', {
-			prNumber,
-			headSha,
-			recheckAttempt,
-			...details,
-		});
-		await scmCommentUnknownMergeability(ctx.scm, ctx.project, Number(prNumber));
-		return null;
-	}
-
 	// A PR-updated event intentionally never dispatches Review; a completed
 	// checks event can. Keep their rechecks separate so a later PR-updated
 	// delivery cannot replace the follow-up Review's dispatch-capable recheck.
 	const coalesceKey = `review-mergeability:${ctx.project.repo}:${prNumber}:${headSha}:${ctx.event.kind}`;
-	await scheduleCoalescedDispatch(
-		{
-			type: 'scm',
-			providerId: ctx.providerId,
-			projectId: ctx.project.id,
-			...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
-			recheckAttempt: recheckAttempt + 1,
-			event: ctx.event,
-		},
+	const scheduled = await scheduleReviewRecheck(
+		ctx,
+		budget,
 		coalesceKey,
-		RECHECK_DELAY_MS,
-	);
-	logger.debug('review: scheduled deferred mergeability recheck', {
 		prNumber,
 		headSha,
-		recheckAttempt: recheckAttempt + 1,
-		delayMs: RECHECK_DELAY_MS,
-		coalesceKey,
-		...details,
-	});
+		details,
+	);
+	if (!scheduled) {
+		await scmCommentReviewGaveUp(ctx.scm, ctx.project, Number(prNumber), budget);
+	}
 	return null;
 }
 
@@ -609,7 +692,7 @@ async function checkMergeabilityAndConflicts(
 	try {
 		prDetails = await scm.getPullRequest(project, Number(prNumber), persona);
 	} catch (err) {
-		return scheduleMergeabilityRecheck(ctx, prNumber, headSha, {
+		return scheduleMergeabilityRecheck(ctx, 'read-failed', prNumber, headSha, {
 			reason: 'fetch PR failed',
 			error: err instanceof Error ? err.message : String(err),
 		});
@@ -627,7 +710,7 @@ async function checkMergeabilityAndConflicts(
 	// aggregate checks-API query.
 	const isSwarm = await resolveSwarmManagedPr(project, prDetails.headBranch);
 	if (isSwarm === 'error') {
-		return scheduleMergeabilityRecheck(ctx, prNumber, headSha, {
+		return scheduleMergeabilityRecheck(ctx, 'read-failed', prNumber, headSha, {
 			reason: 'ownership gate resolution failed',
 		});
 	}
@@ -637,7 +720,7 @@ async function checkMergeabilityAndConflicts(
 	}
 
 	if (prDetails.mergeable === null) {
-		return scheduleMergeabilityRecheck(ctx, prNumber, headSha, {
+		return scheduleMergeabilityRecheck(ctx, 'state-pending', prNumber, headSha, {
 			reason: 'mergeable is null (unknown)',
 		});
 	}
@@ -722,7 +805,7 @@ export function createReviewTrigger(): TriggerHandler {
 			// (`null`) or a Resolve-conflicts dispatch.
 			if (!mergeCheck || !('cleared' in mergeCheck)) return mergeCheck;
 
-			const disposition = await resolveDisposition(ctx, ctx.recheckAttempt ?? 0, prNumber, headSha);
+			const disposition = await resolveDisposition(ctx, prNumber, headSha);
 			if (disposition.kind === 'none') return null;
 			if (isDispositionDisabled(project, disposition, prNumber, headSha)) return null;
 

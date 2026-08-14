@@ -2561,6 +2561,7 @@ function buildTriggerContext(
 				project,
 				deliveryId: job.deliveryId,
 				recheckAttempt: job.recheckAttempt,
+				readFailureRecheckAttempt: job.readFailureRecheckAttempt,
 				rateLimitRetryAttempt: job.rateLimitRetryAttempt,
 				runId: job.runId,
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
