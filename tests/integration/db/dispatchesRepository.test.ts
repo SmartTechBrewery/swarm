@@ -32,7 +32,6 @@ import {
 	reopenDispatchForManualRetry,
 	scheduleDispatchRetry,
 	selectNextCapacityDispatch,
-	selectTaskPhaseForExecution,
 	supersedeDispatchesByCoalesceKey,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import {
@@ -311,21 +310,6 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			await seedDispatchInState(TASK, 'running', undefined, 'planning');
 			expect(await findExecutingDispatchForTask(PROJECT_ID, '755')).toBeUndefined();
 			expect(await findExecutingDispatchForTask('proj-other', TASK)).toBeUndefined();
-		});
-	});
-
-	describe('selectTaskPhaseForExecution (issue #759)', () => {
-		const TASK = '754-ordering';
-
-		it('selects Planning before a concurrently leased Implementation dispatch', async () => {
-			const implementation = await seedDispatchInState(TASK, 'leased', undefined, 'implementation');
-			const planning = await seedDispatchInState(TASK, 'leased', undefined, 'planning');
-
-			expect(await selectTaskPhaseForExecution(PROJECT_ID, TASK)).toEqual({
-				id: planning,
-				phase: 'planning',
-			});
-			expect(implementation).not.toBe(planning);
 		});
 	});
 

@@ -863,44 +863,6 @@ export async function findExecutingDispatchForTask(
 }
 
 /**
- * Select the phase that may take a shared task checkout when several dispatches
- * have reached the in-flight guard together (issue #759). The transaction-scoped
- * lock makes concurrent consumers agree on one answer; Planning sorts ahead of
- * Implementation because the two deliberately share a checkout and branch.
- *
- * The caller has already recorded its own task/phase before this read. Other
- * phases do not share a task id by design, so their stable creation order keeps
- * the duplicate guard deterministic without imposing an invented pipeline order.
- */
-export async function selectTaskPhaseForExecution(
-	projectId: string,
-	taskId: string,
-): Promise<{ id: string; phase: string | null } | undefined> {
-	return getDb().transaction(async (tx) => {
-		await tx.execute(
-			sql`select pg_advisory_xact_lock(hashtextextended(${`${projectId}:${taskId}`}, 0))`,
-		);
-		const rows = await tx
-			.select({ id: dispatches.id, phase: dispatches.phase })
-			.from(dispatches)
-			.where(
-				and(
-					eq(dispatches.projectId, projectId),
-					eq(dispatches.taskId, taskId),
-					inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
-					sql`${dispatches.phase} IS DISTINCT FROM 'merge-automation'`,
-				),
-			)
-			.orderBy(
-				sql`CASE ${dispatches.phase} WHEN 'planning' THEN 0 WHEN 'implementation' THEN 1 ELSE 2 END`,
-				asc(dispatches.createdAt),
-			)
-			.limit(1);
-		return rows[0];
-	});
-}
-
-/**
  * The dispatches waiting for this task's checkout to free (issue #759) — what a
  * settling phase wakes, the task-level twin of {@link selectNextCapacityDispatch}.
  *
