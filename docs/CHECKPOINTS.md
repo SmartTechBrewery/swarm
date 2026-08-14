@@ -160,7 +160,7 @@ from being cleaned up. The prompt tells the agent not to `git add` it either.
 
 A continuation is the third value of the recovery mode a run carries
 (`RecoveryModeSchema`, `src/queue/jobs.ts`), alongside Tier 1's `'resume'`, the
-start-over `'fresh'`, and — since issue #592 — `'discard'`, the forced-reset intent that
+start-over `'fresh'`, and — since issue #592 — `'discard'`, the reset intent that
 removes a wedged checkout on whichever worker holds it. **Tier 1 still wins whenever a
 session id is resumable**: `'checkpoint'` is only for the cases it cannot serve
 (§ "When Tier 2 takes over").
@@ -169,8 +169,9 @@ A reset carries **no** mode it did not choose itself (issue #741). It restarts t
 it had never run, so its replacement dispatch is built by `reconstructResetJob`
 (`src/dispatch/retry-payload.ts`), which drops every member of `RecoveryIntentSchema` — the
 session to re-enter, the delivery progress, the provisioned branch, and any stored mode — and
-then sets only `'discard'` for a forced reset. That is keyed on the schema, so a latch added to
-the intent is dropped with no edit there. It also sanitises the run row's stored `job_payload`,
+then sets `'discard'`, which since issue #744 is **every** reset's mode rather than a forced
+variant's. That is keyed on the schema, so a latch added to the intent is dropped with no edit
+there. It also sanitises the run row's stored `job_payload`,
 because a reset discards resume intent held in that column as well as in the `recovery` one:
 the two latch the same state, and leaving the payload alone let a second reset (or a later
 "Retry now") replay it.

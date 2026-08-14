@@ -156,7 +156,7 @@ Requires `DATABASE_URL` and `REDIS_URL`. Wrapper: `npm run queue:clear`.
 ### `swarm run`
 
 ```bash
-swarm run reset <runId> [--force]
+swarm run reset <runId>
 ```
 
 - **`reset`** — the last-resort recovery for a single **wedged** run: one whose
@@ -164,35 +164,44 @@ swarm run reset <runId> [--force]
   badly enough that neither "Retry now" nor "Terminate" can move it. It performs
   one sequence and prints one line per step:
   1. **dispatch** — cancels the run's active dispatch (`none` when there wasn't
-     one, `force-cancelled` when a worker had already claimed it);
+     one, `a dispatch a worker had already claimed was cancelled` when one had been
+     picked up — with a warning that an agent process it already spawned keeps
+     running);
   2. **cancellation flag** — clears the Redis user-termination flag, or the worker
      would kill the fresh attempt at its start-check;
   3. **checkout** — settles the checkout and worktree lease **on this host**,
-     releasing a *stale* lease no live run owns (the marker a wedged run leaves
-     behind). Reports `removed`, `retained` with its reason (`uncommitted changes`,
+     discarding uncommitted changes and unpushed commits and releasing a *stale*
+     lease no live run owns (the marker a wedged run leaves behind). Reports
+     `removed`, `retained` with its reason (`uncommitted changes`,
      `unpushed commits`, a lease held by another live run), or
      `none on this host` — which says the checkout is settled by whichever worker
      holds it, not that there was nothing to remove. A reset never keeps a checkout
-     for a saved agent session — restarting from scratch is the point of it;
+     for a saved agent session — restarting from scratch is the point of it. A
+     teardown that *throws* is reported and stepped over rather than stopping the
+     reset, since the checkout in the way may not even be on this host;
   4. **restart intent** — what the *restart* will do to the checkout wherever it
      lives (issue #592), which is the half of the answer step 3 cannot give:
-     `discards it — dirty and unpushed work included` with `--force`, or
-     `reclaims it only if it is safe to` without;
+     `discards it — dirty and unpushed work included`;
   5. **recovery record** — clears it plus any captured session id;
   6. **restarted** — re-dispatches the phase from scratch and prints the new
-     dispatch id.
-- **`--force`** — also resets a run still marked `running`, cancels a dispatch a
-  worker has already claimed, and **discards** uncommitted changes and unpushed
-  commits instead of retaining the checkout — on whichever worker holds that
-  checkout, since the discard travels to it as the restart's recovery intent
-  rather than being performed here. It prints a warning before acting and
-  **cannot stop an already-spawned agent process** — only Terminate can, so a
-  forced reset of a live run is a deliberate operator choice.
+     dispatch id. A run that cannot be re-dispatched at all — no stored job
+     payload, or a project that no longer exists — prints `not restarted` with the
+     reason instead: everything above still happened and the run was settled as
+     `failed`, so it ends idle rather than wedged. That is a normal exit **0**.
 
-A refused reset (a healthy `running` run without `--force`, a dispatch a worker
-just claimed, a run with no stored job payload, a concurrent reset) changes
-nothing: the command prints the refusal and exits **1**. Every guard runs before
-the first mutation, and a failure part-way through leaves the run
+**A reset always discards and never refuses** (issue #744). There is no `--force`:
+it cancels a dispatch a worker claimed a moment ago, removes the checkout with any
+uncommitted changes and unpushed commits — permanently, and on whichever worker
+holds it, since the discard travels there as the restart's recovery intent rather
+than being performed here — and resets a run still marked `running` without it
+being terminated first. It prints a warning before acting and **cannot stop an
+already-spawned agent process** — only Terminate can, so terminate a genuinely
+live run first if you need its agent stopped.
+
+Only two answers are not a restart, and neither leaves the run un-reset: an
+unknown run id, and a reset that is already under way (a concurrent reset or
+retry already created the run's dispatch). Both print the refusal and exit **1**
+without a second dispatch. A failure part-way through leaves the run
 terminal-and-idle — exactly the state a second `swarm run reset` retries from.
 
 Requires `DATABASE_URL` and `REDIS_URL`. Works with the worker **and** the API
@@ -202,11 +211,9 @@ you reach it when the services that serve it are down.
 
 **It can be run from anywhere** (issue #592). Step 3 inspects and removes a
 checkout on *this* machine's disk; a checkout on another worker is settled by that
-worker when it provisions the restart, following the intent step 4 reports —
-`--force` discards it there, a plain reset leaves the worker's ordinary reclaim
-gate and its dirty/unpushed protections in charge. Running it on the host that
-owns the worktree still settles that checkout one step sooner, but it is no longer
-required to free a wedged one.
+worker when it provisions the restart, following the discard intent step 4
+reports. Running it on the host that owns the worktree still settles that checkout
+one step sooner, but it is no longer required to free a wedged one.
 
 ### `swarm users`
 

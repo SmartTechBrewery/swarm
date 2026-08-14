@@ -33,11 +33,21 @@ describe('recoveryChoices', () => {
 		});
 	});
 
-	it('offers nothing for a run in no recovery state at all', () => {
+	it('offers nothing for a completed run, which has nothing to recover', () => {
 		const choices = recoveryChoices({ status: 'completed', agentSessionId: null });
 		expect(choices).toEqual({ retry: null, reset: false });
 		expect(canRecoverRun(choices)).toBe(false);
-		expect(canRecoverRun(recoveryChoices({ status: 'running', agentSessionId: null }))).toBe(false);
+	});
+
+	// Issue #744: the server no longer refuses to reset a live row, and these rules
+	// mirror the server rather than deciding anything. Which control an operator
+	// actually sees is the route's call — the unified Recover trigger is still scoped
+	// to the error states, so a running run keeps offering Terminate alone.
+	it('reports reset as eligible for a running run, mirroring the server', () => {
+		expect(recoveryChoices({ status: 'running', agentSessionId: null })).toEqual({
+			retry: null,
+			reset: true,
+		});
 	});
 
 	it('is recoverable whenever at least one choice is eligible', () => {

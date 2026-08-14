@@ -15,7 +15,7 @@
  * the pair `queue clear` closes).
  *
  * Subcommands:
- *   swarm run reset <runId> [--force]
+ *   swarm run reset <runId>
  */
 
 import { parseArgs } from 'node:util';
@@ -32,7 +32,7 @@ import * as out from '../_shared/output.js';
 
 const USAGE = `swarm run — operator recovery for a single run
 
-Usage: swarm run reset <runId> [--force]
+Usage: swarm run reset <runId>
 
   reset    Reset one *wedged* run and restart its phase from scratch: cancel its
            active dispatch, clear its Redis cancellation flag, settle its
@@ -41,23 +41,21 @@ Usage: swarm run reset <runId> [--force]
            fresh agent session. This is the last resort — try "Retry now" or
            "Terminate" from the dashboard first.
 
-  --force  Also reset a run still marked running, cancel a dispatch a worker has
-           already claimed, and DISCARD uncommitted changes and unpushed commits
-           in the checkout instead of retaining it — on whichever worker holds
-           that checkout, not only this host. It cannot stop an already-spawned
-           agent process — only Terminate can.
-
-Without --force a checkout holding uncommitted changes or unpushed commits is
-retained (reported with its reason) rather than removed, and a healthy running
-run is refused.
+A reset ALWAYS DISCARDS and never refuses. It cancels a dispatch a worker has
+already claimed, removes the checkout together with any uncommitted changes and
+unpushed commits — permanently, and on whichever worker holds it — and resets a
+run still marked running without it being terminated first. It cannot stop an
+agent process that was already spawned; terminate a genuinely live run first if
+you need it stopped. A run that cannot be re-dispatched at all (no stored job
+payload, or a project that no longer exists) is settled as failed with the
+reason rather than left wedged.
 
 Requires DATABASE_URL and REDIS_URL in the environment — run via
 \`npm run swarm -- run reset <runId>\` (loads .env) or export them yourself
 first. Works with the worker and the API stopped: it goes straight to Postgres
 and Redis. It settles a checkout on *this* host's disk directly; one on another
 worker is settled by that worker when it provisions the restart, following the
-intent the restart carries (--force discards it, a plain reset reclaims it only
-if it is safe to), so this can be run from anywhere.`;
+discard intent the restart carries, so this can be run from anywhere.`;
 
 /** `runs.id` is a uuid column (`src/db/schema/runs.ts`). */
 const RunIdSchema = z.string().uuid();
@@ -113,25 +111,12 @@ function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
 				: 'checkout: removed and its lease released';
 		}
 		case 'blocked':
+			// Since issue #744 a reset discards, so a retained checkout is one the
+			// settlement could not free at all — not one the operator declined to.
 			return (
 				`checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}; the restarted run re-checks it before provisioning ` +
-				'— push or discard that work, or re-run with --force, to actually free it'
+				'— the worker holding it discards it when it provisions the restart'
 			);
-	}
-}
-
-/**
- * The line naming what the *restart* will do to the checkout (issue #592) — the
- * half of the answer the local settlement above cannot give, because the checkout
- * may be on a worker this process cannot see. Typed against the service's union so
- * a new intent is a compile error here rather than an unreported one.
- */
-function describeWorktreeIntent(intent: ResetRunResult['worktreeIntent']): string {
-	switch (intent) {
-		case 'discard':
-			return 'restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning';
-		case 'reclaim':
-			return 'restart intent: the worker holding the checkout reclaims it only if it is safe to; dirty or unpushed work is retained';
 	}
 }
 
@@ -148,11 +133,11 @@ function reportReset(result: ResetRunResult): void {
 		case 'cancelled':
 			out.step('dispatch: the active dispatch was cancelled');
 			break;
-		case 'force-cancelled-claimed':
+		case 'cancelled-claimed':
 			// The step belongs on stdout with every other report line (so a redirected
 			// report is complete); the live-agent caveat is warned separately because
 			// the operator must not miss it.
-			out.step('dispatch: a worker-claimed dispatch was force-cancelled');
+			out.step('dispatch: a dispatch a worker had already claimed was cancelled');
 			out.warn(
 				'an agent process that dispatch already spawned is not stopped by a reset — terminate it if it is still running',
 			);
@@ -163,8 +148,25 @@ function reportReset(result: ResetRunResult): void {
 		out.step('cancellation flag: cleared, so the fresh attempt is not killed at startup');
 	}
 
-	out.step(describeWorktreeOutcome(result.worktree));
-	out.step(describeWorktreeIntent(result.worktreeIntent));
+	if (result.worktree) {
+		out.step(describeWorktreeOutcome(result.worktree));
+	}
+	// A local teardown throw no longer stops the reset (issue #744) — it is reported
+	// so the operator knows this host's checkout still needs a look, while the
+	// restart's own discard intent settles the one that was actually in the way.
+	if (result.worktreeError) {
+		out.warn(
+			`checkout: this host's teardown failed — ${result.worktreeError}; the reset continued, and the worker holding the checkout discards it when it provisions the restart`,
+		);
+	}
+	// The other half of the checkout answer (issue #592): what the *restart* does to a
+	// checkout this host cannot see. There is no restart to carry it on a terminated
+	// reset, so the line is only true for the restarted ending.
+	if (result.outcome === 'restarted') {
+		out.step(
+			'restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning',
+		);
+	}
 
 	if (result.recoveryCleared) {
 		out.step('recovery record: cleared');
@@ -179,13 +181,20 @@ function reportReset(result: ResetRunResult): void {
 		);
 	}
 
+	// A stated terminal ending is a *reported outcome*, not a failure (issue #744):
+	// the run was cleared and settled rather than left wedged, so it exits 0 with the
+	// reason on stdout like every other step.
+	if (result.outcome === 'terminated') {
+		out.step(`not restarted: ${result.reason}`);
+		return;
+	}
 	out.step(`restarted: re-dispatched from scratch as dispatch ${result.dispatchId}`);
 }
 
 async function resetOneRun(argv: string[]): Promise<number> {
 	const { values, positionals } = parseArgs({
 		args: argv,
-		options: { force: { type: 'boolean' }, help: { type: 'boolean', short: 'h' } },
+		options: { help: { type: 'boolean', short: 'h' } },
 		allowPositionals: true,
 	});
 	if (values.help) {
@@ -208,16 +217,15 @@ async function resetOneRun(argv: string[]): Promise<number> {
 		return 1;
 	}
 
-	const force = values.force ?? false;
-	if (force) {
-		out.warn(
-			'--force: uncommitted changes and unpushed commits in the checkout may be discarded permanently, and an agent already spawned for this run keeps running',
-		);
-	}
+	// Stated before anything is touched, because there is no opt-in left to decline
+	// (issue #744): the operator's only choice is not to run the command.
+	out.warn(
+		'a reset discards: uncommitted changes and unpushed commits in the checkout are removed permanently, wherever it lives, and an agent already spawned for this run keeps running',
+	);
 
 	try {
 		out.step(`resetting run '${runId}'…`);
-		const result = await resetRun(runId, { force });
+		const result = await resetRun(runId);
 		reportReset(result);
 		return 0;
 	} catch (err) {
