@@ -10,6 +10,7 @@ import {
 	getEnrollmentById,
 	listEnrollmentsForProject,
 	listEnrollmentsForWorker,
+	moveEnrollmentInProjectOrder,
 	removeEnrollment,
 	setEnrollmentSharingConsent,
 	updateEnrollmentConstraints,
@@ -28,6 +29,7 @@ import { workerSessions } from '../../../src/db/schema/workerSessions.js';
 import { workers } from '../../../src/db/schema/workers.js';
 import {
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
+	DEFAULT_ENROLLMENT_ORDER_INDEX,
 	isRoutable,
 } from '../../../src/identity/worker-enrollment.js';
 import { suspendEnrollmentsForMismatchedRepository } from '../../../src/identity/worker-enrollment-service.js';
@@ -114,6 +116,140 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const rosterB = await listEnrollmentsForProject(PROJECT_B);
 				expect(rosterA.map((e) => e.workerId)).toEqual([workerA]);
 				expect(rosterB).toEqual([]);
+			});
+		});
+
+		// Issue #750 — the project's persisted worker order, against a real database:
+		// where it comes from on a new row, what the roster read does with it, and what a
+		// move actually writes.
+		describe('project worker order', () => {
+			let workerC: string;
+
+			beforeEach(async () => {
+				workerC = (
+					await createWorker({
+						ownerUserId: adaId,
+						displayName: 'ada-server',
+						capabilities: ['claude'],
+						credentialHash: 'hash-c',
+					})
+				).id;
+			});
+
+			/** The project's worker ids in the order the roster (and the dispatch gate) read. */
+			async function orderOf(projectId: string): Promise<string[]> {
+				const enrollments = await listEnrollmentsForProject(projectId);
+				return enrollments.map((enrollment) => enrollment.workerId);
+			}
+
+			/** The stored positions, in the same read order — what a move normalizes. */
+			async function positionsOf(projectId: string): Promise<number[]> {
+				const enrollments = await listEnrollmentsForProject(projectId);
+				return enrollments.map((enrollment) => enrollment.orderIndex);
+			}
+
+			it('appends a new enrollment after the project’s current last worker', async () => {
+				const first = await enroll(workerA, PROJECT_A);
+				const second = await enroll(workerB, PROJECT_A);
+				const third = await enroll(workerC, PROJECT_A);
+
+				expect([first.orderIndex, second.orderIndex, third.orderIndex]).toEqual([0, 1, 2]);
+				// Each project counts from zero of its own: the append is project-scoped.
+				expect((await enroll(workerA, PROJECT_B)).orderIndex).toBe(0);
+			});
+
+			it('lists a project in its stored order, not in creation order', async () => {
+				await enroll(workerA, PROJECT_A);
+				await enroll(workerB, PROJECT_A);
+				await enroll(workerC, PROJECT_A);
+
+				await moveEnrollmentInProjectOrder(PROJECT_A, workerC, 'up');
+
+				expect(await orderOf(PROJECT_A)).toEqual([workerA, workerC, workerB]);
+			});
+
+			// The migration's whole backfill: every pre-existing row is 0, and the
+			// (order_index, created_at, id) read has to give back exactly what an
+			// installation saw before the column existed.
+			it('reads rows that all share the migrated position in creation order', async () => {
+				await enroll(workerA, PROJECT_A);
+				await enroll(workerB, PROJECT_A);
+				await enroll(workerC, PROJECT_A);
+				await getDb()
+					.update(workerProjectEnrollments)
+					.set({ orderIndex: 0 })
+					.where(eq(workerProjectEnrollments.projectId, PROJECT_A));
+
+				expect(await orderOf(PROJECT_A)).toEqual([workerA, workerB, workerC]);
+			});
+
+			it('swaps with the neighbour and normalizes an all-zero project to a dense order', async () => {
+				await enroll(workerA, PROJECT_A);
+				await enroll(workerB, PROJECT_A);
+				await enroll(workerC, PROJECT_A);
+				// The legacy state a migrated installation is in on its first-ever reorder.
+				await getDb()
+					.update(workerProjectEnrollments)
+					.set({ orderIndex: 0 })
+					.where(eq(workerProjectEnrollments.projectId, PROJECT_A));
+
+				const moved = await moveEnrollmentInProjectOrder(PROJECT_A, workerB, 'up');
+
+				expect(moved).toEqual([workerB, workerA, workerC]);
+				expect(await orderOf(PROJECT_A)).toEqual([workerB, workerA, workerC]);
+				expect(await positionsOf(PROJECT_A)).toEqual([0, 1, 2]);
+			});
+
+			it('moves a worker down, and survives a reload', async () => {
+				await enroll(workerA, PROJECT_A);
+				await enroll(workerB, PROJECT_A);
+				await enroll(workerC, PROJECT_A);
+
+				expect(await moveEnrollmentInProjectOrder(PROJECT_A, workerA, 'down')).toEqual([
+					workerB,
+					workerA,
+					workerC,
+				]);
+				// Read back through a fresh query — the order is persisted, not in-memory.
+				expect(await orderOf(PROJECT_A)).toEqual([workerB, workerA, workerC]);
+				expect(await positionsOf(PROJECT_A)).toEqual([0, 1, 2]);
+			});
+
+			it('treats a move off either end as a no-op that still reports the order', async () => {
+				await enroll(workerA, PROJECT_A);
+				await enroll(workerB, PROJECT_A);
+
+				expect(await moveEnrollmentInProjectOrder(PROJECT_A, workerA, 'up')).toEqual([
+					workerA,
+					workerB,
+				]);
+				expect(await moveEnrollmentInProjectOrder(PROJECT_A, workerB, 'down')).toEqual([
+					workerA,
+					workerB,
+				]);
+				expect(await orderOf(PROJECT_A)).toEqual([workerA, workerB]);
+			});
+
+			it('leaves another project’s order untouched', async () => {
+				await enroll(workerA, PROJECT_A);
+				await enroll(workerB, PROJECT_A);
+				await enroll(workerA, PROJECT_B);
+				await enroll(workerB, PROJECT_B);
+
+				await moveEnrollmentInProjectOrder(PROJECT_A, workerB, 'up');
+
+				expect(await orderOf(PROJECT_A)).toEqual([workerB, workerA]);
+				expect(await orderOf(PROJECT_B)).toEqual([workerA, workerB]);
+			});
+
+			it('reports a worker that holds no enrollment in that project as undefined', async () => {
+				await enroll(workerA, PROJECT_A);
+				// Enrolled, but elsewhere — indistinguishable from an unknown worker here.
+				await enroll(workerB, PROJECT_B);
+
+				expect(await moveEnrollmentInProjectOrder(PROJECT_A, workerB, 'up')).toBeUndefined();
+				expect(await moveEnrollmentInProjectOrder(PROJECT_A, workerC, 'down')).toBeUndefined();
+				expect(await orderOf(PROJECT_A)).toEqual([workerA]);
 			});
 		});
 
@@ -331,7 +467,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			// The migration backfills existing rows with this default, so a row written
 			// without a phase selection must permit every phase — which is what keeps
 			// dispatch behaviour identical for enrollments that predate issue #509.
-			it('defaults allowed_phases to every phase when the insert names none', async () => {
+			// `order_index` is the same story for issue #750: an unnamed position is the
+			// first one, which is what every migrated row carries.
+			it('defaults allowed_phases to every phase and order_index to the first position', async () => {
 				const [row] = await getDb()
 					.insert(workerProjectEnrollments)
 					.values({
@@ -344,6 +482,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					})
 					.returning();
 				expect(row.allowedPhases).toEqual([...DEFAULT_ENROLLMENT_ALLOWED_PHASES]);
+				expect(row.orderIndex).toBe(DEFAULT_ENROLLMENT_ORDER_INDEX);
 			});
 		});
 	},

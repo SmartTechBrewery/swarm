@@ -4,13 +4,16 @@ import {
 	ConcurrencyAllocationSchema,
 	DEFAULT_CONCURRENCY_ALLOCATION,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
+	DEFAULT_ENROLLMENT_ORDER_INDEX,
 	ENROLLMENT_STATUSES,
 	EnrollmentAllowedClisSchema,
 	EnrollmentAllowedPhasesSchema,
+	EnrollmentOrderIndexSchema,
 	EnrollmentStatusSchema,
 	isRoutable,
 	permitsPhase,
 	WorkerEnrollmentSchema,
+	WorkerOrderDirectionSchema,
 } from '@/identity/worker-enrollment.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
@@ -22,6 +25,7 @@ const validEnrollment = {
 	allowedClis: ['claude', 'codex'],
 	allowedPhases: ['implementation', 'review'],
 	concurrencyAllocation: 2,
+	orderIndex: 1,
 	sharingConsent: true,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -108,6 +112,36 @@ describe('ConcurrencyAllocationSchema', () => {
 	});
 });
 
+// Issue #750 — the project's worker order, stored per enrollment.
+describe('EnrollmentOrderIndexSchema', () => {
+	it('accepts zero and any positive integer position', () => {
+		expect(EnrollmentOrderIndexSchema.parse(0)).toBe(0);
+		expect(EnrollmentOrderIndexSchema.parse(7)).toBe(7);
+	});
+
+	it('rejects a negative or non-integer position', () => {
+		expect(() => EnrollmentOrderIndexSchema.parse(-1)).toThrow();
+		expect(() => EnrollmentOrderIndexSchema.parse(1.5)).toThrow();
+	});
+
+	// Zero is the whole migration backfill, so it has to be a legal stored value —
+	// an existing installation reads back in creation order because of it.
+	it('defaults to the first position', () => {
+		expect(DEFAULT_ENROLLMENT_ORDER_INDEX).toBe(0);
+		expect(EnrollmentOrderIndexSchema.parse(DEFAULT_ENROLLMENT_ORDER_INDEX)).toBe(0);
+	});
+});
+
+describe('WorkerOrderDirectionSchema', () => {
+	it('accepts the two directions and nothing else', () => {
+		expect(WorkerOrderDirectionSchema.parse('up')).toBe('up');
+		expect(WorkerOrderDirectionSchema.parse('down')).toBe('down');
+		expect(() => WorkerOrderDirectionSchema.parse('top')).toThrow();
+		// A reorder states a direction, never a position a stale client read.
+		expect(() => WorkerOrderDirectionSchema.parse(0)).toThrow();
+	});
+});
+
 describe('WorkerEnrollmentSchema', () => {
 	it('round-trips a valid enrollment', () => {
 		expect(WorkerEnrollmentSchema.parse(validEnrollment)).toEqual(validEnrollment);
@@ -142,6 +176,12 @@ describe('WorkerEnrollmentSchema', () => {
 		).toThrow();
 		const { concurrencyAllocation: _omitted, ...withoutAllocation } = validEnrollment;
 		expect(() => WorkerEnrollmentSchema.parse(withoutAllocation)).toThrow();
+	});
+
+	it('rejects a negative or missing order index (issue #750)', () => {
+		expect(() => WorkerEnrollmentSchema.parse({ ...validEnrollment, orderIndex: -1 })).toThrow();
+		const { orderIndex: _omitted, ...withoutOrder } = validEnrollment;
+		expect(() => WorkerEnrollmentSchema.parse(withoutOrder)).toThrow();
 	});
 
 	it('has no secret field in the read model', () => {

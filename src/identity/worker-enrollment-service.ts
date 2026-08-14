@@ -9,7 +9,8 @@
  *
  * It owns both the enrollment write operations (`enrollWorker` /
  * `approveEnrollment` / `setSharingConsent` / `updateEnrollmentConstraints` /
- * `setEnrollmentStatus` / `suspendEnrollmentsForMismatchedRepository`) and the two
+ * `setEnrollmentStatus` / `moveProjectWorkerOrder` /
+ * `suspendEnrollmentsForMismatchedRepository`) and the two
  * provider-neutral read models:
  *
  * - `listProjectRoster(projectId)` — every worker enrolled in a project, with
@@ -26,8 +27,12 @@
  *   for the Workers screen's per-worker detail view.
  * - `listProjectDispatchCandidates(projectId)` — the same project scope in the
  *   shape the #130 dispatch gate judges (`src/worker/eligibility-gate.ts`):
- *   worker + enrollment + resolved availability, in the deterministic
- *   enrollment-creation order the scheduler selects by.
+ *   worker + enrollment + resolved availability, in the project's configured
+ *   worker order (issue #750) — the deterministic sequence the scheduler selects
+ *   by, which on a project nobody has reordered is still enrollment-creation
+ *   order.
+ * - `listProjectWorkerIdsInOrder(projectId)` — that same order as bare worker
+ *   ids, for a caller that already holds the rows and only needs to sort them.
  *
  * **A worker is only ever enrolled in a project for the repository its own
  * checkout is** (issue #690). Both moments the pairing becomes knowable are
@@ -65,6 +70,7 @@ import {
 	getEnrollmentById,
 	listEnrollmentsForProject,
 	listEnrollmentsForWorker,
+	moveEnrollmentInProjectOrder,
 	setEnrollmentSharingConsent,
 	updateEnrollmentConstraints as updateEnrollmentConstraintsRow,
 	updateEnrollmentStatus,
@@ -91,6 +97,7 @@ import {
 	type EnrollmentStatus,
 	isRoutable,
 	type WorkerEnrollment,
+	type WorkerOrderDirection,
 } from './worker-enrollment.js';
 import { getLiveSessionForWorker, getRetainedSessionForWorker } from './worker-session-service.js';
 
@@ -99,15 +106,19 @@ export {
 	ConcurrencyAllocationSchema,
 	DEFAULT_CONCURRENCY_ALLOCATION,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
+	DEFAULT_ENROLLMENT_ORDER_INDEX,
 	ENROLLMENT_STATUSES,
 	EnrollmentAllowedClisSchema,
 	EnrollmentAllowedPhasesSchema,
+	EnrollmentOrderIndexSchema,
 	EnrollmentRepositoryMismatchError,
 	type EnrollmentStatus,
 	EnrollmentStatusSchema,
 	isRoutable,
 	permitsPhase,
 	type WorkerEnrollment,
+	type WorkerOrderDirection,
+	WorkerOrderDirectionSchema,
 } from './worker-enrollment.js';
 
 /**
@@ -292,10 +303,17 @@ export interface WorkerDispatchCandidate {
 
 /**
  * Every worker enrolled in `projectId`, in the scheduler's **deterministic
- * order**: enrollment creation time, then enrollment id as the tie-break
- * (`listEnrollmentsForProject`). That order is the documented "first free
- * eligible worker" sequence — stable across dispatches, so two re-checks of the
- * same roster select the same worker.
+ * order**: the project's configured worker order, then enrollment creation time
+ * and enrollment id as the tie-breaks (`listEnrollmentsForProject`, issue #750).
+ * That order is the documented "first free eligible worker" sequence — stable
+ * across dispatches, so two re-checks of the same roster select the same worker,
+ * and on a project nobody has reordered it is exactly the enrollment-creation
+ * order it has always been.
+ *
+ * Ordering is a *preference between* workers, never a grant: the gate still judges
+ * every candidate with `evaluateWorkerEligibility`, so an unavailable,
+ * over-capacity, unapproved or otherwise ineligible worker is skipped in favour of
+ * the next eligible one however early it sits in the order.
  *
  * Ineligible workers are **not** filtered here: judging them is
  * `evaluateWorkerEligibility`'s job (it needs the enrollment and
@@ -320,6 +338,22 @@ export async function listProjectDispatchCandidates(
 		});
 	}
 	return candidates;
+}
+
+/**
+ * The ids of the workers enrolled in `projectId`, in the project's configured
+ * order (issue #750). The same order {@link listProjectDispatchCandidates} and
+ * {@link listProjectRoster} come back in, reduced to what a caller that already
+ * holds its rows needs to sort them — the dashboard roster read
+ * ({@link listDashboardWorkers}) is keyed on the *worker*, so it carries no
+ * enrollment position of its own.
+ *
+ * Includes every enrollment regardless of status: this states the project's order,
+ * not who may take work. Empty for a project with no enrollments.
+ */
+export async function listProjectWorkerIdsInOrder(projectId: string): Promise<string[]> {
+	const enrollments = await listEnrollmentsForProject(projectId);
+	return enrollments.map((enrollment) => enrollment.workerId);
 }
 
 /**
@@ -870,6 +904,39 @@ export async function setEnrollmentStatus(
 	status: EnrollmentStatus,
 ): Promise<WorkerEnrollment | undefined> {
 	return updateEnrollmentStatus(id, status);
+}
+
+/** What a caller supplies to move one worker through a project's order (issue #750). */
+export interface MoveProjectWorkerOrderInput {
+	projectId: string;
+	/** The worker to move — the project-scoped identity the roster renders, not an enrollment id. */
+	workerId: string;
+	/** One step towards the front (`up`) or the back (`down`). */
+	direction: WorkerOrderDirection;
+}
+
+/**
+ * Move one worker one step through its project's configured worker order (issue
+ * #750) — a `projectAdmin` action, gated by the caller. Returns the project's
+ * worker ids in the new order, or `undefined` when that worker holds no
+ * enrollment in that project (the caller turns that into the same `NOT_FOUND` an
+ * unknown project gets, so nothing leaks).
+ *
+ * Keyed on `(projectId, workerId)` rather than an enrollment id because the order
+ * is a project-scoped fact and the roster rows that offer the move carry the worker
+ * id. A move off either end is a no-op that still reports the current order, and
+ * every move normalizes the project's positions to a dense `0..n-1` — see
+ * `moveEnrollmentInProjectOrder` (`src/db/repositories/workerEnrollmentsRepository.ts`).
+ *
+ * It changes *preference only*. Nothing here approves an enrollment, grants
+ * consent, or routes work: the dispatch gate still judges eligibility for every
+ * candidate, and a reorder takes effect on the **next** dispatch — it never touches
+ * a phase already running.
+ */
+export async function moveProjectWorkerOrder(
+	input: MoveProjectWorkerOrderInput,
+): Promise<string[] | undefined> {
+	return moveEnrollmentInProjectOrder(input.projectId, input.workerId, input.direction);
 }
 
 /**

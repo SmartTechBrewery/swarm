@@ -5,6 +5,7 @@ const {
 	getEnrollmentById,
 	listEnrollmentsForProject,
 	listEnrollmentsForWorker,
+	moveEnrollmentInProjectOrder,
 	setEnrollmentSharingConsent,
 	updateEnrollmentConstraintsRow,
 	updateEnrollmentStatus,
@@ -13,6 +14,7 @@ const {
 	getEnrollmentById: vi.fn(),
 	listEnrollmentsForProject: vi.fn(),
 	listEnrollmentsForWorker: vi.fn(),
+	moveEnrollmentInProjectOrder: vi.fn(),
 	setEnrollmentSharingConsent: vi.fn(),
 	updateEnrollmentConstraintsRow: vi.fn(),
 	updateEnrollmentStatus: vi.fn(),
@@ -39,6 +41,7 @@ vi.mock('@/db/repositories/workerEnrollmentsRepository.js', () => ({
 	getEnrollmentById,
 	listEnrollmentsForProject,
 	listEnrollmentsForWorker,
+	moveEnrollmentInProjectOrder,
 	setEnrollmentSharingConsent,
 	updateEnrollmentConstraints: updateEnrollmentConstraintsRow,
 	updateEnrollmentStatus,
@@ -74,7 +77,10 @@ import {
 	getDashboardWorkerDetail,
 	listDashboardWorkers,
 	listOwnerWorkers,
+	listProjectDispatchCandidates,
 	listProjectRoster,
+	listProjectWorkerIdsInOrder,
+	moveProjectWorkerOrder,
 	setSharingConsent,
 	suspendEnrollmentsForMismatchedRepository,
 	updateEnrollmentConstraints,
@@ -121,6 +127,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		allowedClis: ['claude'],
 		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
+		orderIndex: 0,
 		sharingConsent: true,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -143,6 +150,7 @@ beforeEach(() => {
 		getEnrollmentById,
 		listEnrollmentsForProject,
 		listEnrollmentsForWorker,
+		moveEnrollmentInProjectOrder,
 		setEnrollmentSharingConsent,
 		updateEnrollmentConstraintsRow,
 		updateEnrollmentStatus,
@@ -999,6 +1007,87 @@ describe('status / consent write delegation', () => {
 		setEnrollmentSharingConsent.mockResolvedValue(makeEnrollment({ sharingConsent: false }));
 		await setSharingConsent(ENROLLMENT_ID, false);
 		expect(setEnrollmentSharingConsent).toHaveBeenCalledWith(ENROLLMENT_ID, false);
+	});
+});
+
+// Issue #750 — the project's worker order. The repository read is already ordered;
+// what these assert is that the two surfaces built on it hand that order through
+// untouched, and that the reorder write is a pass-through with no policy of its own.
+describe('the project worker order (issue #750)', () => {
+	const SECOND_WORKER_ID = '66666666-6666-4666-8666-666666666666';
+	const THIRD_WORKER_ID = '77777777-7777-4777-8777-777777777777';
+
+	it('listProjectWorkerIdsInOrder returns the ids in the repository’s order', async () => {
+		listEnrollmentsForProject.mockResolvedValue([
+			makeEnrollment({ id: 'e2', workerId: SECOND_WORKER_ID, orderIndex: 0 }),
+			makeEnrollment({ id: 'e1', workerId: WORKER_ID, orderIndex: 1 }),
+			makeEnrollment({ id: 'e3', workerId: THIRD_WORKER_ID, orderIndex: 2 }),
+		]);
+
+		expect(await listProjectWorkerIdsInOrder('proj-a')).toEqual([
+			SECOND_WORKER_ID,
+			WORKER_ID,
+			THIRD_WORKER_ID,
+		]);
+		expect(listEnrollmentsForProject).toHaveBeenCalledWith('proj-a');
+	});
+
+	// `workers.roster` is this read, so the tab and the CLI show the project order too.
+	it('listProjectRoster keeps the repository’s order', async () => {
+		listEnrollmentsForProject.mockResolvedValue([
+			makeEnrollment({ id: 'e2', workerId: SECOND_WORKER_ID, orderIndex: 0 }),
+			makeEnrollment({ id: 'e1', workerId: WORKER_ID, orderIndex: 1 }),
+		]);
+		getWorkerById.mockImplementation(async (id: string) => makeWorker({ id }));
+		getUserById.mockResolvedValue(makeOwner());
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+
+		const roster = await listProjectRoster('proj-a');
+
+		expect(roster.map((entry) => entry.workerId)).toEqual([SECOND_WORKER_ID, WORKER_ID]);
+	});
+
+	// The scheduling guarantee at the service seam: the gate walks these in order, so
+	// the candidate list must not re-sort what the project configured.
+	it('listProjectDispatchCandidates keeps the repository’s order', async () => {
+		listEnrollmentsForProject.mockResolvedValue([
+			makeEnrollment({ id: 'e2', workerId: SECOND_WORKER_ID, orderIndex: 0 }),
+			makeEnrollment({ id: 'e1', workerId: WORKER_ID, orderIndex: 1 }),
+		]);
+		getWorkerById.mockImplementation(async (id: string) => makeWorker({ id }));
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+
+		const candidates = await listProjectDispatchCandidates('proj-a');
+
+		expect(candidates.map((candidate) => candidate.worker.id)).toEqual([
+			SECOND_WORKER_ID,
+			WORKER_ID,
+		]);
+	});
+
+	it('moveProjectWorkerOrder delegates the move and returns the new order', async () => {
+		moveEnrollmentInProjectOrder.mockResolvedValue([WORKER_ID, SECOND_WORKER_ID]);
+
+		const order = await moveProjectWorkerOrder({
+			projectId: 'proj-a',
+			workerId: WORKER_ID,
+			direction: 'up',
+		});
+
+		expect(moveEnrollmentInProjectOrder).toHaveBeenCalledWith('proj-a', WORKER_ID, 'up');
+		expect(order).toEqual([WORKER_ID, SECOND_WORKER_ID]);
+	});
+
+	it('propagates “this worker holds no enrollment here” as undefined', async () => {
+		moveEnrollmentInProjectOrder.mockResolvedValue(undefined);
+
+		expect(
+			await moveProjectWorkerOrder({
+				projectId: 'proj-a',
+				workerId: WORKER_ID,
+				direction: 'down',
+			}),
+		).toBeUndefined();
 	});
 });
 

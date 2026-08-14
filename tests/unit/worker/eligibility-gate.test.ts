@@ -86,6 +86,10 @@ function makeCandidate(
 			allowedClis: overrides.capabilities ?? ['claude'],
 			allowedPhases: [...ALL_TRIGGER_PHASES],
 			concurrencyAllocation: 1,
+			// The gate reads the project's worker order as the *candidate list's* order
+			// (issue #750) — `listProjectDispatchCandidates` has already applied it — so
+			// the stored position is irrelevant here and every candidate carries the same.
+			orderIndex: 0,
 			sharingConsent: true,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -217,8 +221,49 @@ describe('evaluateDispatchEligibility', () => {
 		expect(resolveAssignedUser).not.toHaveBeenCalled();
 	});
 
+	// Issue #750 — `listProjectDispatchCandidates` hands the gate the project's
+	// configured worker order, so preferring workers in that order is the candidate
+	// walk itself. What matters here is the boundary: the order decides *between*
+	// eligible workers and never promotes an ineligible one.
+	describe('the project’s configured worker order (issue #750)', () => {
+		it('prefers the earliest worker in the project order when several are eligible', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-first'),
+				makeCandidate('w-second'),
+				makeCandidate('w-third'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-first' } });
+		});
+
+		// The same three-worker project with the front-runner ineligible for each of the
+		// reasons an operator can actually produce: the next eligible worker takes it,
+		// rather than the dispatch waiting for the preferred machine.
+		it.each([
+			['disconnected', { connected: false }],
+			['at its allocated capacity', { activeRuns: 1 }],
+			['suspended', { enrollment: { status: 'suspended' as const } }],
+			['awaiting approval', { enrollment: { status: 'pending' as const } }],
+			['without sharing consent', { enrollment: { sharingConsent: false } }],
+			['not allowed the phase here', { enrollment: { allowedPhases: ['review' as const] } }],
+			['unable to run any configured CLI', { capabilities: ['codex' as const] }],
+		])('skips the first worker when it is %s, taking the next eligible one', async (_why, ineligible) => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-first', ineligible),
+				makeCandidate('w-second'),
+				makeCandidate('w-third'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-second' } });
+		});
+	});
+
 	describe('unassigned items', () => {
-		it('routes to the first free eligible worker in enrollment order', async () => {
+		it('routes to the first free eligible worker in the project’s worker order', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
 				makeCandidate('w-busy', { activeRuns: 1 }),
 				makeCandidate('w-free'),

@@ -16,13 +16,15 @@
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
  */
 
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, eq, max } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
 	AllowedClisNotCapableError,
+	DEFAULT_ENROLLMENT_ORDER_INDEX,
 	type EnrollmentStatus,
 	type WorkerEnrollment,
+	type WorkerOrderDirection,
 } from '../../identity/worker-enrollment.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
@@ -41,6 +43,7 @@ function rowToEnrollment(row: EnrollmentRow): WorkerEnrollment {
 		allowedClis: row.allowedClis as AgentCli[],
 		allowedPhases: row.allowedPhases as TriggerPhase[],
 		concurrencyAllocation: row.concurrencyAllocation,
+		orderIndex: row.orderIndex,
 		sharingConsent: row.sharingConsent,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
@@ -65,6 +68,14 @@ export interface CreateEnrollmentInput {
  * worker already has an enrollment for this project (at most one per
  * `(worker, project)`). Locks the worker row FOR UPDATE inside a transaction and
  * throws {@link AllowedClisNotCapableError} if any allowed CLI is not a declared capability of the worker.
+ *
+ * The new row **appends** to the project's worker order (issue #750):
+ * `max(order_index) + 1` for that project, so enrolling a machine never drops it
+ * into the middle of an order somebody configured. That is the repository's own
+ * rule rather than a caller's choice, which is why {@link CreateEnrollmentInput}
+ * carries no position. A concurrent pair of enrollments can compute the same
+ * value; the project read's `(created_at, id)` tie-break keeps that deterministic,
+ * and the first reorder normalizes it away.
  */
 export async function createEnrollment(input: CreateEnrollmentInput): Promise<WorkerEnrollment> {
 	return await getDb().transaction(async (tx) => {
@@ -83,6 +94,17 @@ export async function createEnrollment(input: CreateEnrollmentInput): Promise<Wo
 			}
 		}
 
+		const [lastPosition] = await tx
+			.select({ orderIndex: max(workerProjectEnrollments.orderIndex) })
+			.from(workerProjectEnrollments)
+			.where(eq(workerProjectEnrollments.projectId, input.projectId));
+		// `max` is null for the project's first enrollment, which then takes the
+		// default position rather than an arbitrary one.
+		const orderIndex =
+			lastPosition?.orderIndex === null || lastPosition?.orderIndex === undefined
+				? DEFAULT_ENROLLMENT_ORDER_INDEX
+				: lastPosition.orderIndex + 1;
+
 		const [row] = await tx
 			.insert(workerProjectEnrollments)
 			.values({
@@ -92,6 +114,7 @@ export async function createEnrollment(input: CreateEnrollmentInput): Promise<Wo
 				allowedClis: input.allowedClis,
 				allowedPhases: input.allowedPhases,
 				concurrencyAllocation: input.concurrencyAllocation,
+				orderIndex,
 				sharingConsent: input.sharingConsent,
 			})
 			.returning();
@@ -129,13 +152,31 @@ export async function getEnrollment(
 	return row ? rowToEnrollment(row) : undefined;
 }
 
-/** List every enrollment of a project, oldest first — the roster read. Empty if none. */
+/**
+ * List every enrollment of a project **in the project's configured worker
+ * order** (issue #750): `order_index` ascending, with creation time and then the
+ * enrollment id as the tie-break. Empty if none.
+ *
+ * The tie-break is not decoration — it is what makes the order behaviour-preserving
+ * for an installation that has never reordered anything: every migrated row shares
+ * `order_index = 0`, so the read falls straight back to the creation order this
+ * query used before the column existed. It also keeps two concurrently appended
+ * enrollments deterministic.
+ *
+ * This is the one read the project roster (`listProjectRoster`) and the dispatch
+ * gate's candidate list (`listProjectDispatchCandidates`) are both built on, so
+ * ordering it here is what makes the gate prefer workers in the project's order.
+ */
 export async function listEnrollmentsForProject(projectId: string): Promise<WorkerEnrollment[]> {
 	const rows = await getDb()
 		.select()
 		.from(workerProjectEnrollments)
 		.where(eq(workerProjectEnrollments.projectId, projectId))
-		.orderBy(asc(workerProjectEnrollments.createdAt), asc(workerProjectEnrollments.id));
+		.orderBy(
+			asc(workerProjectEnrollments.orderIndex),
+			asc(workerProjectEnrollments.createdAt),
+			asc(workerProjectEnrollments.id),
+		);
 	return rows.map(rowToEnrollment);
 }
 
@@ -250,6 +291,67 @@ export async function updateEnrollmentConstraints(
 			.where(eq(workerProjectEnrollments.id, id))
 			.returning();
 		return row ? rowToEnrollment(row) : undefined;
+	});
+}
+
+/**
+ * Move one worker one step through its project's configured order (issue #750),
+ * swapping it with the neighbour it passes, and **normalize** the project's
+ * positions to a dense `0..n-1`. Returns the project's worker ids in the new
+ * order, or `undefined` when no enrollment pairs that worker with that project
+ * (a not-found, not an error — the caller translates it).
+ *
+ * Three things it deliberately does:
+ *
+ * - **Reads the whole project `FOR UPDATE`** in the order the roster reads, so
+ *   two concurrent reorders of the same project serialize instead of writing over
+ *   each other's positions. The rows are locked in a deterministic order, so the
+ *   pair cannot deadlock either.
+ * - **Normalizes every time**, not only when the swap happened. That is what makes
+ *   the first move on a migrated project work at all — every row there shares
+ *   `order_index = 0`, so without densifying, the swap would have nothing to swap.
+ *   Normalizing preserves the read order exactly (positions are assigned in the
+ *   order the rows were just read), so it is invisible on its own.
+ * - **Treats a move off either end as a no-op** rather than an error: the first
+ *   worker cannot move up and the last cannot move down, and the caller still gets
+ *   the current order back.
+ */
+export async function moveEnrollmentInProjectOrder(
+	projectId: string,
+	workerId: string,
+	direction: WorkerOrderDirection,
+): Promise<string[] | undefined> {
+	return await getDb().transaction(async (tx) => {
+		const rows = await tx
+			.select()
+			.from(workerProjectEnrollments)
+			.where(eq(workerProjectEnrollments.projectId, projectId))
+			.orderBy(
+				asc(workerProjectEnrollments.orderIndex),
+				asc(workerProjectEnrollments.createdAt),
+				asc(workerProjectEnrollments.id),
+			)
+			.for('update');
+
+		const current = rows.findIndex((row) => row.workerId === workerId);
+		if (current === -1) return undefined;
+
+		const target = direction === 'up' ? current - 1 : current + 1;
+		const neighbour = rows[target];
+		const moving = rows[current];
+		if (neighbour && moving) {
+			rows[current] = neighbour;
+			rows[target] = moving;
+		}
+
+		for (const [position, row] of rows.entries()) {
+			if (row.orderIndex === position) continue;
+			await tx
+				.update(workerProjectEnrollments)
+				.set({ orderIndex: position })
+				.where(eq(workerProjectEnrollments.id, row.id));
+		}
+		return rows.map((row) => row.workerId);
 	});
 }
 

@@ -16,9 +16,12 @@ import {
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
+	listProjectWorkerIdsInOrder,
+	moveProjectWorkerOrder,
 	setEnrollmentStatus,
 	setSharingConsent,
 	updateEnrollmentConstraints,
+	WorkerOrderDirectionSchema,
 } from '../../identity/worker-enrollment-service.js';
 import { getWorker, renameWorker, type Worker } from '../../identity/worker-service.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
@@ -42,8 +45,10 @@ import { authedProcedure, router } from '../trpc.js';
  *   (`assertInstanceAdmin`, issue #647). Given a `projectId` (#574) the same query
  *   serves **one project's** roster instead — the project detail page's Workers
  *   tab, the view an enrolled worker owner keeps — under the project roster's own
- *   access rule. Either way the caller's own machines are listed first (#657),
- *   which is ordering alone and no change to what is visible. `getById` (#477)
+ *   access rule. The two order differently since issue #750, which is ordering
+ *   alone and no change to what is visible: the project-scoped list follows the
+ *   project's configured worker order, the unscoped one still lists the caller's
+ *   own machines first (#657). `getById` (#477)
  *   returns that same row for one worker, widened with per-project enrollment
  *   detail and with what the *viewer* may change, so the detail screen offers only
  *   controls that would succeed; it stays bounded by `accessibleProjectScope`,
@@ -62,9 +67,10 @@ import { authedProcedure, router } from '../trpc.js';
  *   worker/enrollment existence never leaks across owners.
  * - **Project roster**, gated by `assertProjectAccess` exactly like
  *   `routers/projects.ts`: a `contributor` reads the roster (`roster`); only a
- *   `projectAdmin` approves an enrollment (`approveEnrollment`) or revokes/
- *   reactivates one (`setStatus`). A non-member gets `NOT_FOUND` (existence
- *   hidden), a member below the required role `FORBIDDEN`.
+ *   `projectAdmin` approves an enrollment (`approveEnrollment`), revokes/
+ *   reactivates one (`setStatus`), or moves a worker through the project's
+ *   configured order (`reorderProjectWorker`, issue #750). A non-member gets
+ *   `NOT_FOUND` (existence hidden), a member below the required role `FORBIDDEN`.
  *
  * Read models here expose **no secrets** (the service assembles secret-free
  * views) and derive busy/current-run from run lifecycle, never from the client.
@@ -159,12 +165,17 @@ async function resolveRosterScope(
 }
 
 /**
- * The viewer's own machines first (issue #657) — presentation order only. It
- * reorders the rows `listDashboardWorkers` already decided are visible and
- * changes nothing about visibility, project scoping, ownership, or
- * authorization; both worker lists the dashboard renders (the global `/workers`
- * screen and a project's Workers tab) read this one procedure, so ordering here
- * covers both.
+ * The viewer's own machines first (issue #657) — presentation order only, and
+ * since issue #750 the **unscoped** global `/workers` list alone. It reorders the
+ * rows `listDashboardWorkers` already decided are visible and changes nothing
+ * about visibility, project scoping, ownership, or authorization.
+ *
+ * A project's Workers tab deliberately does *not* read it any more: that list has
+ * a configured order of its own ({@link inProjectOrder}), which is also the order
+ * the dispatch gate prefers, so sorting the viewer's own machines to the top there
+ * would show every operator a different sequence from the one the project is
+ * actually scheduled in. The global list has no such order — it spans projects —
+ * so viewer-first stays exactly as #657 left it.
  *
  * The sort is **stable** (per spec), so the read model's own oldest-first order
  * is preserved within each group and a viewer who owns no visible worker sees it
@@ -178,6 +189,26 @@ function viewerWorkersFirst(
 ): DashboardWorkerView[] {
 	const isViewers = (worker: DashboardWorkerView) => worker.owner?.userId === viewerUserId;
 	return [...workers].sort((a, b) => Number(isViewers(b)) - Number(isViewers(a)));
+}
+
+/**
+ * The project's configured worker order (issue #750) — presentation order for the
+ * project-scoped list, exactly as {@link viewerWorkersFirst} is for the global
+ * one, and the same order `workers.roster` and the dispatch gate already read.
+ *
+ * `workerIdsInOrder` is the project's own enrollment order; the sort is stable and
+ * places a worker the order does not name **last**, which is defensive rather than
+ * meaningful — a project-scoped read only returns workers enrolled there, so every
+ * row is named.
+ */
+function inProjectOrder(
+	workers: DashboardWorkerView[],
+	workerIdsInOrder: string[],
+): DashboardWorkerView[] {
+	const position = new Map(workerIdsInOrder.map((workerId, index) => [workerId, index]));
+	const rank = (worker: DashboardWorkerView) =>
+		position.get(worker.workerId) ?? Number.MAX_SAFE_INTEGER;
+	return [...workers].sort((a, b) => rank(a) - rank(b));
 }
 
 const AllowedClisInput = z.array(AgentCliSchema).min(1);
@@ -202,14 +233,21 @@ export const workersRouter = router({
 	// machines), which an `instanceAdmin` alone may read (issue #647); with a
 	// `projectId` (#574) it is that one project, authorized like `roster`.
 	// Read-only — no mutation, no path/credential/token, and no routing or
-	// approval affordance. The caller's own machines are ordered first (#657,
-	// `viewerWorkersFirst`) — a presentation-order concern, applied after scoping
-	// decided what is visible.
+	// approval affordance. Ordering is a presentation concern applied after scoping
+	// decided what is visible, and the two lists order differently (issue #750): a
+	// project-scoped read comes back in that project's *configured* worker order —
+	// the same order `roster` and the dispatch gate read — while the unscoped
+	// installation roster keeps the caller's own machines first (#657), having no
+	// project order to speak of.
 	list: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }).optional())
 		.query(async ({ ctx, input }) => {
 			const scope = await resolveRosterScope(ctx.user, input?.projectId);
-			const workers = viewerWorkersFirst(await listDashboardWorkers(scope), ctx.user.id);
+			const visible = await listDashboardWorkers(scope);
+			const projectId = input?.projectId;
+			const workers = projectId
+				? inProjectOrder(visible, await listProjectWorkerIdsInOrder(projectId))
+				: viewerWorkersFirst(visible, ctx.user.id);
 			// The service already assembled a secret-free view; the only wire-shape
 			// concern here is giving the browser an explicit ISO timestamp.
 			return workers.map((worker) => ({
@@ -439,6 +477,39 @@ export const workersRouter = router({
 			const updated = await setEnrollmentStatus(input.enrollmentId, input.status);
 			if (!updated) throw enrollmentNotFound(input.enrollmentId);
 			return updated;
+		}),
+
+	// Move one worker one step through the project's configured worker order (issue
+	// #750) — a `projectAdmin` action, gated exactly like approval/suspension, so a
+	// contributor is refused and a non-member cannot learn the project exists. The
+	// server computes the new positions from the stored order and returns the
+	// project's worker ids in it: a client states only *which* worker and *which
+	// direction*, never a list of positions it may have read before someone else
+	// changed them.
+	//
+	// The order is a scheduling preference, not an authorization: the dispatch gate
+	// still judges every candidate, so reordering can never route work to a worker
+	// that is not eligible for it, and the change applies from the next dispatch —
+	// nothing already running is touched.
+	reorderProjectWorker: authedProcedure
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				workerId: z.string().uuid(),
+				direction: WorkerOrderDirectionSchema,
+			}),
+		)
+		.mutation(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
+			const workerIds = await moveProjectWorkerOrder({
+				projectId: input.projectId,
+				workerId: input.workerId,
+				direction: input.direction,
+			});
+			// No enrollment pairs this worker with this project — the same NOT_FOUND an
+			// unknown worker gets, since the caller already cleared the project.
+			if (!workerIds) throw workerNotFound(input.workerId);
+			return { projectId: input.projectId, workerIds };
 		}),
 });
 

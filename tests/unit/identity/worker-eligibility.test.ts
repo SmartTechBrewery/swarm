@@ -46,6 +46,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		allowedClis: ['claude', 'codex'],
 		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
+		orderIndex: 0,
 		sharingConsent: true,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),

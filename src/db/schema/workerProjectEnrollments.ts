@@ -13,6 +13,7 @@ import type { AgentCli } from '../../harness/agent-cli.js';
 import {
 	DEFAULT_CONCURRENCY_ALLOCATION,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
+	DEFAULT_ENROLLMENT_ORDER_INDEX,
 } from '../../identity/worker-enrollment.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { projects } from './projects.js';
@@ -51,7 +52,16 @@ import { workers } from './workers.js';
  * was a second way of saying a number, and on a default install already resolved
  * to an effective 1 (both limits it deferred to, `SWARM_WORKER_CONCURRENCY` and
  * `max_concurrent_jobs`, default to 1). A larger integer widens this one
- * project's share of the worker. `sharing_consent` defaults to `false` (a fresh
+ * project's share of the worker. `order_index` is this worker's rank **within
+ * its project's configured order** (issue #750): `NOT NULL`, defaulting to
+ * `DEFAULT_ENROLLMENT_ORDER_INDEX` (`0`), read ascending with `(created_at, id)`
+ * as the tie-break — which is what makes the all-zero migrated state read back in
+ * exactly the creation order it read in before the column existed. Duplicates are
+ * therefore legal and carry **no** unique constraint: the migration produces a
+ * whole project of them, and two concurrent enrollments can compute the same
+ * append position. A new row appends (`max(order_index) + 1` for the project) so
+ * enrolling a machine never lands it mid-order; a reorder rewrites that project's
+ * positions to a dense `0..n-1`. `sharing_consent` defaults to `false` (a fresh
  * enrollment is never routable until the owner opts in), so revoking consent is
  * the owner's explicit lever for flipping the routability predicate
  * (`isRoutable`).
@@ -94,6 +104,14 @@ export const workerProjectEnrollments = pgTable(
 		concurrencyAllocation: integer('concurrency_allocation')
 			.notNull()
 			.default(DEFAULT_CONCURRENCY_ALLOCATION),
+		/**
+		 * This worker's rank within its project's configured order (issue #750),
+		 * defaulting to `DEFAULT_ENROLLMENT_ORDER_INDEX`
+		 * (`src/identity/worker-enrollment.ts`, the source of truth for the shape).
+		 * See the table doc-comment for the tie-break, the append rule, and why
+		 * duplicates are legal.
+		 */
+		orderIndex: integer('order_index').notNull().default(DEFAULT_ENROLLMENT_ORDER_INDEX),
 		/** Owner-controlled, revocable; defaults false so a fresh enrollment is not routable until the owner opts in. */
 		sharingConsent: boolean('sharing_consent').notNull().default(false),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

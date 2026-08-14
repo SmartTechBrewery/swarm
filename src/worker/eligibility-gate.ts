@@ -10,7 +10,12 @@
  *
  * 1. **Candidates** — `listProjectDispatchCandidates` (#337, `src/identity/worker-enrollment-service.ts`)
  *    returns the project's enrolled workers with their enrollment and resolved
- *    availability, in the deterministic enrollment-creation order.
+ *    availability, in the project's **configured worker order** (issue #750 — the
+ *    order a project administrator arranged, which on a project nobody reordered is
+ *    the enrollment-creation order it always was). The gate reads that order as a
+ *    *preference between* otherwise-eligible workers and nothing more: an
+ *    ineligible one is still skipped for the next eligible one, however early it
+ *    sits.
  * 2. **Affinity** — `resolveAssignedUser` (#130 Phase 1, `src/identity/assignee-resolver.ts`)
  *    maps the item's first linked assignee to a SWARM user; the permitted set is
  *    then *only* that user's workers. There is **no cross-user fallback**: an
@@ -39,7 +44,7 @@
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes an
- * eligible worker in the deterministic order. So a higher-priority Codex target
+ * eligible worker in the project's worker order. So a higher-priority Codex target
  * wins whenever *some* enrolled worker can run Codex, even if a Claude-only
  * worker is free for a lower-priority Claude target; and a lower-priority target
  * is chosen only when no worker can serve any higher-priority one. It never
