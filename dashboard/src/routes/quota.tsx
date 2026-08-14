@@ -191,6 +191,17 @@ export function QuotaRouteComponent() {
 				</div>
 			</div>
 
+			{/* The page reads stored snapshots (`quota.getQuotas`), never live figures, so the
+			    freshness limitation is stated once here — unconditionally, so a populated card
+			    carries the same caveat as an empty one — rather than repeated per placeholder. */}
+			<div className="p-3 bg-zinc-900/50 border border-zinc-800 rounded flex items-start gap-3">
+				<Info className="h-5 w-5 text-zinc-500 shrink-0 mt-0.5" aria-hidden="true" />
+				<p className="text-sm text-zinc-300">
+					Quota data is read from the last stored snapshot for each host, so it may be out of date.
+					Use Refresh to request fresh data.
+				</p>
+			</div>
+
 			{quotasQuery.isError && (
 				<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex flex-col gap-2">
 					<h3 className="text-sm font-semibold text-red-200">Error Loading Quotas</h3>
@@ -201,11 +212,7 @@ export function QuotaRouteComponent() {
 			{hostGroups.length === 0 ? (
 				<div className="border border-zinc-850 rounded-lg p-6 bg-zinc-900/20 text-center space-y-2">
 					<ShieldAlert className="h-8 w-8 text-zinc-650 mx-auto" />
-					<p className="text-sm text-zinc-400">No host has reported its agent CLIs yet.</p>
-					<p className="text-xs text-zinc-500">
-						Check that the agent binaries are installed and logged in on the host, then click
-						Refresh.
-					</p>
+					<p className="text-sm text-zinc-400">No quota data is available for any host.</p>
 				</div>
 			) : (
 				hostGroups.map((group) => (
@@ -232,13 +239,7 @@ export function QuotaRouteComponent() {
 							{group.available.length === 0 ? (
 								<div className="border border-zinc-850 rounded-lg p-6 bg-zinc-900/20 text-center space-y-2">
 									<ShieldAlert className="h-8 w-8 text-zinc-650 mx-auto" />
-									<p className="text-sm text-zinc-400">
-										No active, usable agent CLIs on this host.
-									</p>
-									<p className="text-xs text-zinc-500">
-										Check that the agent binaries are installed and logged in there, then click
-										Refresh.
-									</p>
+									<p className="text-sm text-zinc-400">No quota data is available for this host.</p>
 								</div>
 							) : (
 								<div className="grid gap-6 md:grid-cols-2">
@@ -330,10 +331,7 @@ export function QuotaRouteComponent() {
 														) : (
 															<div className="p-3 bg-zinc-900/20 border border-zinc-850 rounded-md text-xs text-zinc-400 flex items-start gap-2">
 																<Info className="h-4 w-4 text-zinc-500 shrink-0 mt-0.5" />
-																<div>
-																	No recent rate limits or live quota data available. Usage is
-																	tracked dynamically from run outcomes.
-																</div>
+																<div>No usage window data is available for this CLI.</div>
 															</div>
 														)}
 													</div>
@@ -365,8 +363,11 @@ export function QuotaRouteComponent() {
 														</span>
 														<span className="text-[10px] font-mono text-zinc-500">({q.cli})</span>
 													</div>
+													{/* The badge beside this row already says the CLI is unavailable; with no
+													    reported detail the row states that absence rather than asserting a
+													    cause the snapshot never gave (issue #754). */}
 													<p className="text-xs text-zinc-500 font-mono max-w-xl">
-														{q.error || 'Executable is missing or unauthenticated.'}
+														{q.error || 'No error detail is available for this CLI.'}
 													</p>
 												</div>
 												<div className="flex items-center gap-2 shrink-0">
