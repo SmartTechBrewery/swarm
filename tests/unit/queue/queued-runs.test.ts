@@ -203,6 +203,29 @@ describe('deriveReviewGate', () => {
 		});
 	});
 
+	it('carries the read-failure recheck counter separately from the CI-lag one', () => {
+		// The two budgets are independent (issue #720), so a recheck waiting out an
+		// unreachable provider must read as such rather than borrow `recheckAttempt`.
+		const job = createMockScmWebhookJob({
+			recheckAttempt: 3,
+			readFailureRecheckAttempt: 9,
+			event: {
+				...createMockScmWebhookJob().event,
+				kind: 'checks',
+				action: 'completed',
+				workItemId: '42',
+				headSha: 'abc123',
+			},
+		});
+		expect(deriveReviewGate(job)).toEqual({
+			sourceEvent: 'checks',
+			sourceAction: 'completed',
+			headSha: 'abc123',
+			recheckAttempt: 3,
+			readFailureRecheckAttempt: 9,
+		});
+	});
+
 	it('is undefined for a pm job', () => {
 		expect(deriveReviewGate(createMockPmWebhookJob())).toBeUndefined();
 	});

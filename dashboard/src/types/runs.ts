@@ -176,6 +176,13 @@ export const queuedReviewGateSchema = z.object({
 	headSha: z.string(),
 	/** Deferred aggregate-check recheck attempt count, when this job is a coalesced recheck. */
 	recheckAttempt: z.number().int().nonnegative().optional(),
+	/**
+	 * Deferred *read-failure* recheck attempt count (issue #742) — the separate
+	 * budget a defer draws on when the read never answered at all, so a waiting
+	 * recheck shows a source-control outage being outlasted rather than passing it
+	 * off as CI still running.
+	 */
+	readFailureRecheckAttempt: z.number().int().nonnegative().optional(),
 });
 export type QueuedReviewGate = z.infer<typeof queuedReviewGateSchema>;
 

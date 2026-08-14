@@ -148,6 +148,63 @@ export async function createRun(input: CreateRunInput): Promise<string> {
 }
 
 /**
+ * The narrow input for {@link createFailedRun} — deliberately not
+ * {@link CreateRunInput}: a run that never launched an agent has no engine,
+ * model, reasoning, timeout, or worker to record, and stating them would invite
+ * a caller to invent them.
+ */
+export interface CreateFailedRunInput {
+	projectId: string;
+	/** The repository this abandoned work was for (`owner/repo`) — see {@link CreateRunInput.repository}. */
+	repository: string;
+	taskId: string;
+	phase: TriggerPhase;
+	/** Why the work was abandoned — the operator-facing text the runs list renders. */
+	error: string;
+	prNumber?: string;
+	/** The payload a "Retry now" on this row rebuilds its dispatch from. */
+	jobPayload?: SwarmJob;
+}
+
+/**
+ * Insert a run row that is **terminal from the start** (issue #742): one `failed`
+ * row recording work SWARM abandoned before any agent ran, so an operator asking
+ * "why did this stop?" finds the answer in the runs list rather than in worker
+ * logs — and finds it in SWARM's own Postgres, which survives the source-control
+ * provider that caused the give-up being unreachable.
+ *
+ * Deliberately one write rather than {@link createRun} + {@link failRunFromStatus}:
+ * that pair passes through a `running` row holding an `agentSessionId`, and losing
+ * its second half to the same outage that caused the give-up would strand a task
+ * that looks live ({@link hasLiveRunForTask}) and resumable
+ * ({@link hasResumableDeferredRun}) with nothing behind it. The column is left null
+ * here for the same reason: there is no session to resume.
+ *
+ * `work_item_id` is deliberately never written — it is the *board card* link
+ * ({@link findBoardItemIdForTask}), and a PR number recorded there would answer a
+ * later phase's card lookup with a value no board ever issued.
+ *
+ * Returns the new row's id.
+ */
+export async function createFailedRun(input: CreateFailedRunInput): Promise<string> {
+	const rows = await getDb()
+		.insert(runs)
+		.values({
+			projectId: input.projectId,
+			repository: input.repository,
+			taskId: input.taskId,
+			phase: input.phase,
+			prNumber: input.prNumber,
+			jobPayload: input.jobPayload,
+			status: 'failed',
+			error: input.error,
+			completedAt: new Date(),
+		})
+		.returning({ id: runs.id });
+	return rows[0].id;
+}
+
+/**
  * Whether retention must pin this task's checkout for a resumable deferred run —
  * any phase, any engine (cross-CLI resume). A deferred row that still holds an
  * `agentSessionId` is one the worker intends to resume; pruning its worktree

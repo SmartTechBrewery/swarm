@@ -69,6 +69,14 @@
  * carries `recheckAttempt` through untouched, and a defer that *did* get an
  * answer clears the read-failure count.
  *
+ * **Exhausting either budget leaves a durable trace** (issue #742). Whichever
+ * path gives up — mergeability or aggregate-check — writes one `failed` Review
+ * run to SWARM's own Postgres naming the PR, head SHA, exhausted budget,
+ * attempts spent and last read (`recordAbandonedReview`). It is written there
+ * rather than posted to the provider because the give-up is usually caused by
+ * that provider being unreachable; the pull-request comment stays a best-effort
+ * extra, and the row is retryable from the dashboard.
+ *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
  * refs, so a fork's head SHA is unreachable and the detached checkout would
@@ -107,8 +115,10 @@ import {
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../db/repositories/reviewVerdictsRepository.js';
+import { createFailedRun } from '../../db/repositories/runsRepository.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { logger } from '../../lib/logger.js';
+import type { SwarmJob } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
@@ -200,6 +210,85 @@ type DeferBudget =
 	/** The read never answered — the provider threw, or the run-history lookup threw. */
 	| 'read-failed';
 
+/** How each exhausted budget reads to an operator in the durable give-up record. */
+const ABANDONED_REVIEW_REASONS: Record<DeferBudget, string> = {
+	'read-failed': 'the source-control provider never answered',
+	'state-pending': 'the source-control provider never reported a final state',
+};
+
+/**
+ * This event's job payload carrying **no recheck counters** — the shape the
+ * recheck scheduler extends, and the one the abandonment record below stores, so
+ * that a "Retry now" on that record re-enters this handler with a clean budget
+ * rather than one already at its cap.
+ */
+function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
+	return {
+		type: 'scm',
+		providerId: ctx.providerId,
+		projectId: ctx.project.id,
+		...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
+		event: ctx.event,
+	};
+}
+
+/**
+ * Record a terminal give-up as a durable `failed` Review run (issue #742) — the
+ * notice an operator actually finds when asking why an item stopped.
+ *
+ * It is written to SWARM's own Postgres rather than posted to the provider
+ * precisely because the give-up that produces it is usually *caused* by that
+ * provider being unreachable: in the incident behind issue #720 the give-up
+ * comment failed against the same DNS failure that had exhausted the budget, the
+ * dispatch settled as an ordinary `no-trigger`, and the abandoned review left no
+ * trace anywhere. The pull-request comment ({@link scmCommentReviewGaveUp}) stays
+ * a best-effort extra on top of this.
+ *
+ * The row carries the repository, PR, phase and head SHA already, names which
+ * budget ran out, how many attempts it spent and what the last read reported —
+ * and, because it stores this event's payload, `runs.retryNow` re-runs the
+ * review decision from the dashboard on a fresh budget.
+ *
+ * Bookkeeping, so it swallows and logs its own failures: a throw here would
+ * escape `handle` into `processJob`'s untried region and fail the job.
+ */
+async function recordAbandonedReview(
+	ctx: ScmTriggerContext,
+	budget: DeferBudget,
+	prNumber: string,
+	headSha: string,
+	attemptsSpent: number,
+	cap: number,
+	details: Record<string, unknown>,
+): Promise<void> {
+	const lastRead = Object.entries(details)
+		.map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+		.join('; ');
+	try {
+		await createFailedRun({
+			projectId: ctx.project.id,
+			repository: ctx.project.repo,
+			// The Review phase's own task id, so the record sits with the rest of this
+			// PR's history rather than under an id nothing else uses.
+			taskId: prNumber,
+			phase: 'review',
+			prNumber,
+			jobPayload: baseReviewJobPayload(ctx),
+			error:
+				`Review abandoned: ${ABANDONED_REVIEW_REASONS[budget]}. ` +
+				`PR #${prNumber} at ${headSha}; the ${budget} recheck budget is spent (${attemptsSpent}/${cap} attempts).` +
+				(lastRead ? ` Last read — ${lastRead}.` : ''),
+		});
+	} catch (err) {
+		logger.error('review: failed to record the abandoned review run', {
+			budget,
+			prNumber,
+			headSha,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 /**
  * Schedule a coalesced re-enqueue of this event on `budget`'s allowance, or
  * report that the allowance is spent. Returns `false` (already logged) on the
@@ -236,6 +325,10 @@ async function scheduleReviewRecheck(
 			coalesceKey,
 			...details,
 		});
+		// Both terminal give-up paths — the mergeability one and the aggregate-check
+		// one — funnel through this branch, so the durable trace is written once,
+		// here, rather than repeated at (and forgettable from) each caller.
+		await recordAbandonedReview(ctx, budget, prNumber, headSha, attemptsSpent, cap, details);
 		return false;
 	}
 
@@ -243,13 +336,9 @@ async function scheduleReviewRecheck(
 	const delayMs = readFailed ? readFailureRecheckDelayMs(readFailureAttempt) : RECHECK_DELAY_MS;
 	await scheduleCoalescedDispatch(
 		{
-			type: 'scm',
-			providerId: ctx.providerId,
-			projectId: ctx.project.id,
-			...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
+			...baseReviewJobPayload(ctx),
 			...(nextCheckAttempt > 0 ? { recheckAttempt: nextCheckAttempt } : {}),
 			...(readFailed ? { readFailureRecheckAttempt: readFailureAttempt + 1 } : {}),
-			event: ctx.event,
 		},
 		coalesceKey,
 		delayMs,
@@ -564,9 +653,10 @@ function validateReviewEvent(ctx: TriggerContext): {
  * provider not answering at all.
  *
  * Best-effort by nature — and on the `read-failed` path it is *expected* to
- * fail, since it posts through the very provider that stopped answering. The
- * durable, provider-independent trace that survives that is issue #720's
- * phase 2.
+ * fail, since it posts through the very provider that stopped answering. An
+ * extra, therefore, not the notice: the record an operator is meant to find is
+ * the durable `failed` run {@link recordAbandonedReview} has already written
+ * (issue #742), which survives exactly that.
  */
 async function scmCommentReviewGaveUp(
 	scm: SCMProvider,
