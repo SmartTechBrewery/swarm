@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	getRunByIdFromDb: vi.fn(),
@@ -26,6 +26,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 
 vi.mock('@/queue/cancellation.js', () => ({
 	clearRunCancellation: vi.fn(),
+	requestRunCancellation: vi.fn(),
 }));
 
 vi.mock('@/queue/producer.js', () => ({
@@ -54,8 +55,13 @@ import {
 } from '@/db/repositories/runsRepository.js';
 import type { runs } from '@/db/schema/runs.js';
 import { cancelDispatchAndWake, createAndPublishDispatch } from '@/dispatch/dispatcher.js';
-import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
-import { clearRunCancellation } from '@/queue/cancellation.js';
+import {
+	AGENT_STOP_POLL_INTERVAL_MS,
+	AGENT_STOP_WAIT_MS,
+	RunResetError,
+	resetRun,
+} from '@/dispatch/run-reset.js';
+import { clearRunCancellation, requestRunCancellation } from '@/queue/cancellation.js';
 import type { SwarmJob } from '@/queue/jobs.js';
 import { removePendingJobById } from '@/queue/producer.js';
 import { reconcileTerminatedWorktree } from '@/worktree/termination-cleanup.js';
@@ -169,6 +175,7 @@ describe('resetRun', () => {
 		vi.mocked(cancelDispatchAndWake).mockReset().mockResolvedValue(makeDispatch());
 		vi.mocked(cancelClaimedDispatch).mockReset().mockResolvedValue(true);
 		vi.mocked(clearRunCancellation).mockReset().mockResolvedValue(undefined);
+		vi.mocked(requestRunCancellation).mockReset().mockResolvedValue(undefined);
 		vi.mocked(clearRunRecovery).mockReset().mockResolvedValue(undefined);
 		vi.mocked(failRunFromStatus).mockReset().mockResolvedValue(true);
 		vi.mocked(hasLiveRunForTask).mockReset().mockResolvedValue(false);
@@ -213,6 +220,8 @@ describe('resetRun', () => {
 		expect(result).toEqual({
 			outcome: 'restarted',
 			runId: 'run-1',
+			// Nothing to stop on a `failed` row — and nothing asked of the worker either.
+			agentStop: 'not-running',
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
@@ -411,19 +420,145 @@ describe('resetRun', () => {
 
 	// Issue #744: a live row is the state operators reach for reset in, and refusing it
 	// until Terminate had settled it was the refusal that made reset useless there.
-	it('resets a running run without it being terminated first', async () => {
-		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ status: 'running' }));
+	// Issue #745 finished the job — the agent that row spawned is stopped too, so the
+	// whole of this suite's `running` behaviour lives in its own block below.
+	it('never asks a non-running run to stop, and reports that it had nothing to stop', async () => {
+		const result = await resetRun('run-1');
 
-		await expect(resetRun('run-1')).resolves.toMatchObject({ outcome: 'restarted' });
-		expect(reconcileTerminatedWorktree).toHaveBeenCalledWith(
-			expect.anything(),
-			'p1',
-			'424',
-			null,
-			false,
-			expect.objectContaining({ discardProtectedWork: true }),
-		);
-		expect(createAndPublishDispatch).toHaveBeenCalled();
+		expect(requestRunCancellation).not.toHaveBeenCalled();
+		expect(result.agentStop).toBe('not-running');
+	});
+
+	// Issue #745 — the last gap that forced "Terminate, then Reset": only Terminate
+	// could stop a spawned agent, so resetting a `running` run left it writing into a
+	// checkout the reset was tearing down.
+	describe('stopping the live agent of a running run', () => {
+		beforeEach(() => {
+			vi.useFakeTimers();
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		/**
+		 * The run row as the poll sees it over time: the first read is `resetRun`'s own,
+		 * every later one is a poll of the bounded wait.
+		 */
+		function runReads(...statuses: RunRow['status'][]): void {
+			const mock = vi.mocked(getRunByIdFromDb).mockReset();
+			for (const status of statuses) mock.mockResolvedValueOnce(makeRun({ status }));
+			mock.mockResolvedValue(makeRun({ status: statuses[statuses.length - 1] }));
+		}
+
+		it('records the cancellation once, then restarts only after the run has stopped', async () => {
+			runReads('running', 'running', 'failed');
+
+			const pending = resetRun('run-1');
+			await vi.advanceTimersByTimeAsync(AGENT_STOP_POLL_INTERVAL_MS * 2);
+			const result = await pending;
+
+			expect(requestRunCancellation).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ source: 'api', requestedAt: expect.any(String) }),
+			);
+			expect(result).toMatchObject({ outcome: 'restarted', agentStop: 'stopped' });
+			// Ordering is the whole point: the dying attempt's terminal result settles the
+			// *old* dispatch id rather than landing on top of the restart.
+			expect(createAndPublishDispatch).toHaveBeenCalledOnce();
+			expect(vi.mocked(requestRunCancellation).mock.invocationCallOrder[0]).toBeLessThan(
+				vi.mocked(createAndPublishDispatch).mock.invocationCallOrder[0],
+			);
+			// And the marker is cleared between the two, or the worker's own start-check
+			// would kill the fresh attempt with the stop we just asked for.
+			const cleared = vi.mocked(clearRunCancellation).mock.invocationCallOrder[0];
+			expect(cleared).toBeGreaterThan(
+				vi.mocked(requestRunCancellation).mock.invocationCallOrder[0],
+			);
+			expect(cleared).toBeLessThan(vi.mocked(createAndPublishDispatch).mock.invocationCallOrder[0]);
+		});
+
+		it('treats a run row that disappeared as stopped rather than waiting it out', async () => {
+			vi.mocked(getRunByIdFromDb)
+				.mockReset()
+				.mockResolvedValueOnce(makeRun({ status: 'running' }))
+				.mockResolvedValue(undefined);
+
+			const pending = resetRun('run-1');
+			await vi.advanceTimersByTimeAsync(AGENT_STOP_POLL_INTERVAL_MS);
+
+			await expect(pending).resolves.toMatchObject({ agentStop: 'stopped' });
+		});
+
+		// Never a refusal: the operator's checkout is discarded and the phase restarts
+		// regardless, which is the whole point of the action.
+		it('restarts anyway when the agent never confirms the stop', async () => {
+			runReads('running');
+
+			const pending = resetRun('run-1');
+			await vi.advanceTimersByTimeAsync(AGENT_STOP_WAIT_MS);
+			const result = await pending;
+
+			expect(result).toMatchObject({
+				outcome: 'restarted',
+				agentStop: 'timed-out',
+				dispatchId: 'dispatch-2',
+			});
+			expect(reconcileTerminatedWorktree).toHaveBeenCalledWith(
+				expect.anything(),
+				'p1',
+				'424',
+				null,
+				false,
+				expect.objectContaining({ discardProtectedWork: true }),
+			);
+			expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+			expect(createAndPublishDispatch).toHaveBeenCalledOnce();
+		});
+
+		it('keeps waiting through an unreadable run row rather than claiming a stop', async () => {
+			vi.mocked(getRunByIdFromDb)
+				.mockReset()
+				.mockResolvedValueOnce(makeRun({ status: 'running' }))
+				.mockRejectedValue(new Error('db down'));
+
+			const pending = resetRun('run-1');
+			await vi.advanceTimersByTimeAsync(AGENT_STOP_WAIT_MS);
+
+			await expect(pending).resolves.toMatchObject({ agentStop: 'timed-out' });
+		});
+
+		// A failed durable write means nothing was delivered — but reset never refuses,
+		// so the wait decides the reported outcome and the restart happens either way.
+		it('still resets when the cancellation could not be recorded', async () => {
+			runReads('running');
+			vi.mocked(requestRunCancellation).mockRejectedValue(new Error('redis down'));
+
+			const pending = resetRun('run-1');
+			await vi.advanceTimersByTimeAsync(AGENT_STOP_WAIT_MS);
+
+			await expect(pending).resolves.toMatchObject({
+				outcome: 'restarted',
+				agentStop: 'timed-out',
+			});
+		});
+
+		// A run nothing can be re-dispatched from still has an agent to stop.
+		it('stops the agent of a running run it can only settle terminally', async () => {
+			vi.mocked(getRunByIdFromDb)
+				.mockReset()
+				.mockResolvedValueOnce(makeRun({ status: 'running', jobPayload: null }))
+				.mockResolvedValue(makeRun({ status: 'failed', jobPayload: null }));
+
+			const pending = resetRun('run-1');
+			await vi.advanceTimersByTimeAsync(AGENT_STOP_POLL_INTERVAL_MS);
+
+			await expect(pending).resolves.toMatchObject({
+				outcome: 'terminated',
+				agentStop: 'stopped',
+			});
+			expect(requestRunCancellation).toHaveBeenCalledOnce();
+		});
 	});
 
 	it('cancels a dispatch a worker claimed first, with no opt-in, and removes its wake-up', async () => {

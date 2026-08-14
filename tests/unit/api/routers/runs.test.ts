@@ -1951,6 +1951,7 @@ describe('runsRouter', () => {
 		const RESET_RESULT = {
 			outcome: 'restarted' as const,
 			runId: 'run-1',
+			agentStop: 'not-running' as const,
 			dispatch: 'cancelled' as const,
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' as const },
@@ -1982,6 +1983,7 @@ describe('runsRouter', () => {
 			const terminated = {
 				outcome: 'terminated' as const,
 				runId: 'run-1',
+				agentStop: 'not-running' as const,
 				dispatch: 'cancelled' as const,
 				cancellationCleared: true,
 				worktree: null,

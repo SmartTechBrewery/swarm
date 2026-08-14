@@ -163,13 +163,18 @@ swarm run reset <runId>
   dispatch, Redis cancellation flag, worktree lease, and recovery record disagree
   badly enough that neither "Retry now" nor "Terminate" can move it. It performs
   one sequence and prints one line per step:
-  1. **dispatch** — cancels the run's active dispatch (`none` when there wasn't
+  1. **agent** — for a run still marked `running`, records the same cancellation
+     "Terminate" records (which the router turns into a `task-cancel` frame to the
+     worker executing the run) and waits, bounded, for the row to leave `running`
+     before anything below is torn down (issue #745). Prints nothing for a run that
+     had no agent to stop, and warns — without stopping — when the stop was asked
+     for and never confirmed within the wait;
+  2. **dispatch** — cancels the run's active dispatch (`none` when there wasn't
      one, `a dispatch a worker had already claimed was cancelled` when one had been
-     picked up — with a warning that an agent process it already spawned keeps
-     running);
-  2. **cancellation flag** — clears the Redis user-termination flag, or the worker
+     picked up);
+  3. **cancellation flag** — clears the Redis user-termination flag, or the worker
      would kill the fresh attempt at its start-check;
-  3. **checkout** — settles the checkout and worktree lease **on this host**,
+  4. **checkout** — settles the checkout and worktree lease **on this host**,
      discarding uncommitted changes and unpushed commits and releasing a *stale*
      lease no live run owns (the marker a wedged run leaves behind). Reports
      `removed`, `retained` with its reason (`uncommitted changes`,
@@ -179,11 +184,11 @@ swarm run reset <runId>
      for a saved agent session — restarting from scratch is the point of it. A
      teardown that *throws* is reported and stepped over rather than stopping the
      reset, since the checkout in the way may not even be on this host;
-  4. **restart intent** — what the *restart* will do to the checkout wherever it
-     lives (issue #592), which is the half of the answer step 3 cannot give:
+  5. **restart intent** — what the *restart* will do to the checkout wherever it
+     lives (issue #592), which is the half of the answer step 4 cannot give:
      `discards it — dirty and unpushed work included`;
-  5. **recovery record** — clears it plus any captured session id;
-  6. **restarted** — re-dispatches the phase from scratch and prints the new
+  6. **recovery record** — clears it plus any captured session id;
+  7. **restarted** — re-dispatches the phase from scratch and prints the new
      dispatch id. A run that cannot be re-dispatched at all — no stored job
      payload, or a project that no longer exists — prints `not restarted` with the
      reason instead: everything above still happened and the run was settled as
@@ -194,9 +199,13 @@ it cancels a dispatch a worker claimed a moment ago, removes the checkout with a
 uncommitted changes and unpushed commits — permanently, and on whichever worker
 holds it, since the discard travels there as the restart's recovery intent rather
 than being performed here — and resets a run still marked `running` without it
-being terminated first. It prints a warning before acting and **cannot stop an
-already-spawned agent process** — only Terminate can, so terminate a genuinely
-live run first if you need its agent stopped.
+being terminated first. It prints a warning before acting. **It also stops an
+agent process that dispatch already spawned** (issue #745), over the same
+cancellation Terminate uses, and waits for the run to leave `running` before it
+tears the checkout down — so there is no "terminate, then reset" to do, and that
+attempt's uncommitted work is lost along with the checkout. An agent that never
+confirms the stop is reported and the restart happens anyway: a reset still never
+refuses.
 
 Only two answers are not a restart, and neither leaves the run un-reset: an
 unknown run id, and a reset that is already under way (a concurrent reset or

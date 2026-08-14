@@ -43,6 +43,7 @@ function resetResult(overrides: Partial<RestartedResult> = {}): RestartedResult 
 	return {
 		outcome: 'restarted',
 		runId: RUN_ID,
+		agentStop: 'not-running',
 		dispatch: 'cancelled',
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
@@ -87,6 +88,8 @@ describe('run command', () => {
 		const report = logged.join('\n');
 		// Stated up front, since there is no opt-in left to decline.
 		expect(report).toContain('a reset discards');
+		// A run that had no agent to stop claims no step for it.
+		expect(report).not.toContain('agent:');
 		expect(report).toContain('dispatch: the active dispatch was cancelled');
 		expect(report).toContain('cancellation flag: cleared');
 		expect(report).toContain('checkout: removed and its lease released');
@@ -107,10 +110,34 @@ describe('run command', () => {
 
 		const report = logged.join('\n');
 		expect(report).toContain('a dispatch a worker had already claimed was cancelled');
-		// The live-agent caveat is the one thing a reset still cannot do (phase 3).
-		expect(report).toContain('is not stopped by a reset');
+		// The caveat this used to carry is gone with issue #745 — a reset stops the
+		// agent that dispatch spawned, so there is nothing left to terminate by hand.
+		expect(report).not.toContain('is not stopped by a reset');
 		expect(report).toContain('uncommitted changes discarded as requested');
 		expect(report).toContain('a stale worktree lease no live run owned was released');
+	});
+
+	// Issue #745 — the step that ended the two-step "Terminate, then Reset" dance.
+	it('reports the live agent it stopped before tearing anything down', async () => {
+		resetRun.mockResolvedValue(resetResult({ agentStop: 'stopped' }));
+
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
+
+		const report = logged.join('\n');
+		expect(report).toContain('agent: the running agent was asked to stop');
+		expect(report).toContain('before anything was torn down');
+	});
+
+	it('warns when the agent never confirmed the stop, and still reports the restart', async () => {
+		resetRun.mockResolvedValue(resetResult({ agentStop: 'timed-out' }));
+
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
+
+		const report = logged.join('\n');
+		expect(report).toContain('had not confirmed within the wait');
+		// Never a refusal: the checkout went and the phase restarted regardless.
+		expect(report).toContain('re-dispatched from scratch as dispatch dispatch-9');
+		expect(errored).toEqual([]);
 	});
 
 	// Issue #744: this teardown reaches only the control-plane host, so a throw is
@@ -131,6 +158,7 @@ describe('run command', () => {
 		resetRun.mockResolvedValue({
 			outcome: 'terminated',
 			runId: RUN_ID,
+			agentStop: 'not-running',
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: null,

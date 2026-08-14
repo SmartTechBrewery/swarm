@@ -9,6 +9,17 @@
  * the run's phase from its stored `jobPayload`. It composes existing helpers
  * only — it is a *sequence*, not a new lifecycle — in this order:
  *
+ *   0. stop the run's live agent, when it has one (issue #745), by recording the
+ *      same run-id-keyed cancellation "Terminate" records (`requestRunCancellation`,
+ *      `../queue/cancellation.ts`) — which the router's own bridge
+ *      (`../router/dispatch-cancellation.ts`, issue #549) turns into a pushed
+ *      `task-cancel` frame to the worker actually executing the run, the only
+ *      channel a DB-free worker has — and then **waiting**, bounded, for the row to
+ *      leave `running`. The wait is the load-bearing half: every step below tears
+ *      down state the dying attempt is still writing to, and the replacement
+ *      dispatch is created *after* it, so that attempt's terminal result settles the
+ *      *old* dispatch id instead of landing on top of the restart. A wait that
+ *      expires proceeds anyway and says so ({@link ResetAgentStop});
  *   1. cancel the run's active dispatch — claimed or not — so nothing can claim
  *      the run while its checkout is being torn down (the same "cancel before you
  *      touch shared state" ordering `runs.putBack` uses);
@@ -32,10 +43,11 @@
  * worthless: there is one button and one command, with no opt-in to forget. It
  * cancels a dispatch a worker claimed a moment ago, tears the checkout down
  * whether it is dirty, unpushed, pinned, or holding a stale `live-leased` marker,
- * and resets a `running` row without it being terminated first. What it still
- * cannot do is stop an already-spawned agent process — both report surfaces say
- * so, and that is the next phase's job. The only two answers that are *not* a
- * restart are the two where restarting is meaningless: an unknown run, and a
+ * and resets a `running` row without it being terminated first. Since issue #745
+ * it also **stops the agent that row's dispatch already spawned** — step 0 above —
+ * so the two-step "Terminate, then Reset" dance is gone and no live agent is left
+ * writing into a checkout the reset is tearing down. The only two answers that are
+ * *not* a restart are the two where restarting is meaningless: an unknown run, and a
  * reset that is already under way ({@link RunResetRefusal}). A run that cannot
  * produce a dispatch at all — no stored payload, or a project that no longer
  * exists — is not refused either: its dispatch, flag and recovery record are
@@ -88,7 +100,7 @@ import {
 } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { clearRunCancellation } from '../queue/cancellation.js';
+import { clearRunCancellation, requestRunCancellation } from '../queue/cancellation.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
@@ -99,6 +111,27 @@ import {
 } from '../worktree/termination-cleanup.js';
 import { cancelDispatchAndWake, createAndPublishDispatch, wakeJobId } from './dispatcher.js';
 import { reconstructResetJob } from './retry-payload.js';
+
+/**
+ * How long a reset waits between re-reads of the run row while its agent stops
+ * (issue #745), and the total it waits before giving up and restarting anyway.
+ *
+ * Exported so the tests can drive the wait against the real numbers rather than
+ * a copy of them. Deliberately not configurable: this is the last-resort action's
+ * own courtesy pause, not a policy — an operator who wanted to wait longer would
+ * simply not have reached for reset.
+ */
+export const AGENT_STOP_POLL_INTERVAL_MS = 500;
+export const AGENT_STOP_WAIT_MS = 15_000;
+
+/**
+ * What happened to the run's live agent (issue #745). `'not-running'` is a run
+ * that had none to stop; `'stopped'` is one that left `running` within the wait;
+ * `'timed-out'` is one that was asked and had not confirmed — which is reported,
+ * never refused, because discarding the checkout and restarting the phase is the
+ * whole point of a reset.
+ */
+export type ResetAgentStop = 'not-running' | 'stopped' | 'timed-out';
 
 /**
  * Why a reset was refused, machine-readable so each surface maps it to its own
@@ -124,6 +157,12 @@ export class RunResetError extends Error {
 /** The steps every reset performs, whatever it ends in. */
 interface ResetRunSteps {
 	runId: string;
+	/**
+	 * What happened to the run's live agent, the reset's first step (issue #745).
+	 * Reported rather than acted on: every ending below happens whichever of the
+	 * three this is.
+	 */
+	agentStop: ResetAgentStop;
 	/** What happened to the run's active dispatch. */
 	dispatch: 'none' | 'cancelled' | 'cancelled-claimed';
 	cancellationCleared: boolean;
@@ -164,6 +203,68 @@ interface ResetRunSteps {
 export type ResetRunResult =
 	| (ResetRunSteps & { outcome: 'restarted'; dispatchId: string })
 	| (ResetRunSteps & { outcome: 'terminated'; reason: string });
+
+const delay = (ms: number): Promise<void> =>
+	new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+
+/**
+ * Stop the agent a `running` run's dispatch already spawned, and wait for it to
+ * actually stop (issue #745) — the step that ends the two-step "Terminate, then
+ * Reset" dance.
+ *
+ * Delivery reuses "Terminate"'s path exactly, because it is the only one there is:
+ * the durable, run-id-keyed marker is what a worker's own start-check reads, and
+ * the publish riding with it is what the router's bridge turns into a pushed
+ * `task-cancel` frame for the worker executing the run — a DB-free worker can be
+ * reached no other way. Neither is a guarantee, which is why this waits rather than
+ * assuming: a worker whose socket is gone never answers, and the caller must not
+ * hand that case a refusal.
+ *
+ * The wait polls the run row rather than listening for anything, since the worker
+ * reports the stop by settling the row — the same fact `runs.terminate`'s own
+ * "terminating" answer is resolved from. Never throws: a failed request and an
+ * unreadable row are both logged and folded into the reported outcome, so the
+ * restart below happens either way.
+ */
+async function stopLiveAgent(runId: string): Promise<ResetAgentStop> {
+	try {
+		// Neutral origin: this service is called by the dashboard mutation *and* the
+		// CLI, and there is no caller identity at either boundary to record.
+		await requestRunCancellation(runId, {
+			source: 'api',
+			requestedAt: new Date().toISOString(),
+		});
+	} catch (err) {
+		// The durable write failed, so nothing was delivered — but a reset never
+		// refuses, and the run may still settle on its own while we wait, so the
+		// outcome is decided by the poll below rather than by this throw.
+		logger.warn('run reset: could not record the cancellation that stops the live agent', {
+			runId,
+			error: describeError(err),
+		});
+	}
+
+	const polls = Math.max(1, Math.ceil(AGENT_STOP_WAIT_MS / AGENT_STOP_POLL_INTERVAL_MS));
+	for (let poll = 0; poll < polls; poll += 1) {
+		await delay(AGENT_STOP_POLL_INTERVAL_MS);
+		try {
+			const latest = await getRunByIdFromDb(runId);
+			// A row that is gone cannot have an agent writing on its behalf either.
+			if (!latest || latest.status !== 'running') return 'stopped';
+		} catch (err) {
+			// Keep waiting rather than declaring the agent stopped on a read that failed:
+			// the pessimistic answer is the one that expires into `'timed-out'` and is
+			// reported, while the optimistic one would silently claim a stop.
+			logger.warn('run reset: could not re-read the run while waiting for its agent to stop', {
+				runId,
+				error: describeError(err),
+			});
+		}
+	}
+	return 'timed-out';
+}
 
 /**
  * Cancel whatever dispatch is currently active for the run, claimed or not
@@ -322,15 +423,20 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 				? `Reset could not restart run "${runId}": its project "${run.projectId}" no longer exists, so there is nothing to re-dispatch it against. Its dispatch, cancellation flag and recovery record were cleared and the run was settled as failed.`
 				: null;
 
-	if (run.status === 'running') {
-		logger.warn(
-			'run reset: resetting a live running run — its agent process may still be writing',
-			{
-				runId,
-				projectId: run.projectId,
-				taskId: run.taskId,
-			},
-		);
+	// Step 0 (issue #745), before anything is torn down: ask the worker executing the
+	// run to abort its agent, and wait for the row to say it did. Everything below
+	// destroys state that agent is still writing to, and the replacement dispatch is
+	// created after this returns, so a stop that lands settles the *old* dispatch id
+	// rather than the restart. A stop that never confirms is reported, not refused.
+	const agentStop =
+		run.status === 'running' ? await stopLiveAgent(run.id) : ('not-running' as const);
+	if (agentStop === 'timed-out') {
+		logger.warn('run reset: the run’s agent did not confirm the stop — restarting anyway', {
+			runId,
+			projectId: run.projectId,
+			taskId: run.taskId,
+			waitMs: AGENT_STOP_WAIT_MS,
+		});
 	}
 
 	const dispatch = await cancelActiveDispatch(run.id);
@@ -360,6 +466,7 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 
 	const steps: ResetRunSteps = {
 		runId: run.id,
+		agentStop,
 		dispatch,
 		cancellationCleared: true,
 		worktree,
@@ -378,6 +485,7 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 			projectId: run.projectId,
 			taskId: run.taskId,
 			phase: run.phase,
+			agentStop,
 			dispatch,
 			reason,
 		});
@@ -399,6 +507,7 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 		projectId: run.projectId,
 		taskId: run.taskId,
 		phase: run.phase,
+		agentStop,
 		dispatch,
 		worktree: worktree?.outcome ?? 'not-attempted',
 		worktreeError,

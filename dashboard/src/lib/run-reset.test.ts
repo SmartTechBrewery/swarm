@@ -15,6 +15,7 @@ function makeReport(overrides: Partial<RestartedReport> = {}): RestartedReport {
 	return {
 		outcome: 'restarted',
 		runId: 'run-1',
+		agentStop: 'not-running',
 		dispatch: 'cancelled',
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
@@ -115,10 +116,20 @@ describe('resetConfirmMessage', () => {
 		expect(message).not.toContain('are kept');
 	});
 
-	it('states that a just-claimed dispatch is cancelled without stopping its agent', () => {
+	it('states that a just-claimed dispatch is cancelled', () => {
 		const message = resetConfirmMessage('failed');
 		expect(message).toContain('just claimed is cancelled');
-		expect(message).toContain('already spawned');
+	});
+
+	// Issue #745: the reset stops the agent itself now, so the copy has to state the
+	// consequence that became — the in-progress work of a live attempt is lost.
+	it('says a running run’s agent is stopped and its in-progress work lost', () => {
+		const message = resetConfirmMessage('running');
+		expect(message).toContain('agent process is stopped first');
+		expect(message).toContain('has not committed is lost');
+		// The caveat it replaced is gone from every status.
+		expect(message).not.toContain('already spawned');
+		expect(resetConfirmMessage('failed')).not.toContain('agent process is stopped first');
 	});
 
 	// Issue #567: this is the action that abandons a pinned machine's work, and the
@@ -141,6 +152,7 @@ describe('describeResetResult', () => {
 	it('reports one line per step, ending with the new dispatch', () => {
 		const lines = describeResetResult(makeReport());
 		expect(lines).toEqual([
+			// No agent line: a run with none to stop claims no step for it.
 			'Dispatch: the active dispatch was cancelled.',
 			'Cancellation flag: cleared, so the fresh attempt is not killed at startup.',
 			'Checkout: removed and its lease released.',
@@ -162,10 +174,28 @@ describe('describeResetResult', () => {
 		);
 	});
 
-	it('warns that a cancelled claimed dispatch may leave its agent running', () => {
-		expect(describeResetResult(makeReport({ dispatch: 'cancelled-claimed' }))[0]).toContain(
-			'agent process it already spawned is not stopped',
+	it('reports a cancelled claimed dispatch without the caveat issue #745 removed', () => {
+		const lines = describeResetResult(makeReport({ dispatch: 'cancelled-claimed' }));
+		expect(lines[0]).toBe('Dispatch: a dispatch a worker had already claimed was cancelled.');
+		expect(lines.some((line) => line.includes('already spawned'))).toBe(false);
+	});
+
+	// Issue #745: the stop is the reset's first step, so it is reported first — and a
+	// stop that never confirmed is reported rather than refused.
+	it('reports the live agent it stopped, before the dispatch line', () => {
+		const lines = describeResetResult(makeReport({ agentStop: 'stopped' }));
+		expect(lines[0]).toBe(
+			'Agent: the running agent was asked to stop, and the run left running before anything was torn down.',
 		);
+		expect(lines[1]).toBe('Dispatch: the active dispatch was cancelled.');
+	});
+
+	it('reports an agent that never confirmed the stop, and still reports the restart', () => {
+		const lines = describeResetResult(makeReport({ agentStop: 'timed-out' }));
+		expect(lines[0]).toBe(
+			'Agent: the running agent was asked to stop but had not confirmed within the wait. The reset continued and discarded its checkout anyway.',
+		);
+		expect(lines).toContain('Restarted: re-dispatched from scratch as dispatch dispatch-9.');
 	});
 
 	// Issue #744: the local teardown reaches only the control-plane host, so a throw is
@@ -187,6 +217,7 @@ describe('describeResetResult', () => {
 		const lines = describeResetResult({
 			outcome: 'terminated',
 			runId: 'run-1',
+			agentStop: 'not-running',
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: null,
