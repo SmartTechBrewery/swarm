@@ -10,6 +10,13 @@
 export type ResetDispatchOutcome = 'none' | 'cancelled' | 'cancelled-claimed';
 
 /**
+ * What happened to the run's live agent — mirrors `ResetAgentStop` (issue #745).
+ * A reset stops it and waits for the run to leave `running`; `'timed-out'` is the
+ * ask that was never confirmed, which the reset reports and restarts through.
+ */
+export type ResetAgentStopOutcome = 'not-running' | 'stopped' | 'timed-out';
+
+/**
  * The checkout/lease settlement the mutation reports back, mirroring
  * `TerminationCleanupResult` (`src/worktree/termination-cleanup.ts`). Declared
  * structurally here rather than imported, the same way `dashboard/src/types/runs.ts`
@@ -27,6 +34,8 @@ export type ResetWorktreeReport =
 /** The steps every reset reports, whatever it ends in — mirrors `ResetRunSteps`. */
 interface ResetRunSteps {
 	runId: string;
+	/** What the reset did about a live agent, its first step (issue #745). */
+	agentStop: ResetAgentStopOutcome;
 	dispatch: ResetDispatchOutcome;
 	cancellationCleared: boolean;
 	/** `null` when no local teardown was attempted (the run's project is gone). */
@@ -103,8 +112,13 @@ export function describeRestartWait(): string {
  * longer offers a choice (issue #744) — a reset always discards — so it *states*
  * the two consequences an operator has to weigh before confirming: the checkout
  * goes with any uncommitted changes and unpushed commits, wherever it lives, and a
- * dispatch a worker claimed a moment ago is cancelled without stopping the agent
- * that dispatch may already have spawned.
+ * dispatch a worker claimed a moment ago is cancelled.
+ *
+ * A `running` run gets the sentence that consequence became once a reset could
+ * stop its agent (issue #745): the process is stopped before anything is torn
+ * down, and whatever it had not committed goes with the checkout. It is stated
+ * here rather than left to the report, because it is the one thing confirming this
+ * modal destroys that was still being produced when the operator clicked.
  *
  * A `checkpointed` run gets the extra sentence its state earns (issue #503): reset
  * is the only action that discards the recorded checkpoint and returns the spent
@@ -128,12 +142,16 @@ export function resetConfirmMessage(status: string, preservedMachine?: string | 
 			? ' Its checkpoint and spent continuation count are cleared too, so the remainder it recorded is not carried over.'
 			: '';
 	const sequence = `${scope}, removes its checkout and releases the worktree lease, clears its recovery record, and restarts this phase from scratch with a fresh agent session.${checkpoint}`;
+	const live =
+		status === 'running'
+			? ' Its agent process is stopped first — the reset waits for the run to stop before tearing anything down — so whatever that attempt has not committed is lost with the checkout.'
+			: '';
 	const pinned = preservedMachine
 		? ` The work preserved on ${preservedMachine} is abandoned: this run stops waiting for that machine and restarts on any available worker, and that earlier attempt's progress is lost. This works whether or not ${preservedMachine} is currently reachable.`
 		: '';
 	const work =
-		'Uncommitted changes and unpushed commits in the checkout are discarded permanently, on whichever worker holds it — they cannot be recovered. A dispatch a worker has just claimed is cancelled too, and that does not stop an agent process it already spawned.';
-	return `${sequence}${pinned} ${work}`;
+		'Uncommitted changes and unpushed commits in the checkout are discarded permanently, on whichever worker holds it — they cannot be recovered. A dispatch a worker has just claimed is cancelled too.';
+	return `${sequence}${live}${pinned} ${work}`;
 }
 
 /** Operator-facing wording for a protected-checkout reason (dirty/unpushed/leased). */
@@ -193,6 +211,23 @@ function describeWorktreeOutcome(worktree: ResetWorktreeReport): string {
 export function describeResetResult(result: ResetRunReport): string[] {
 	const lines: string[] = [];
 
+	// The reset's first step (issue #745). A run with no agent to stop says nothing,
+	// the same way a step the server did not perform is not claimed below.
+	switch (result.agentStop) {
+		case 'not-running':
+			break;
+		case 'stopped':
+			lines.push(
+				'Agent: the running agent was asked to stop, and the run left running before anything was torn down.',
+			);
+			break;
+		case 'timed-out':
+			lines.push(
+				'Agent: the running agent was asked to stop but had not confirmed within the wait. The reset continued and discarded its checkout anyway.',
+			);
+			break;
+	}
+
 	switch (result.dispatch) {
 		case 'none':
 			lines.push('Dispatch: none was active.');
@@ -201,9 +236,7 @@ export function describeResetResult(result: ResetRunReport): string[] {
 			lines.push('Dispatch: the active dispatch was cancelled.');
 			break;
 		case 'cancelled-claimed':
-			lines.push(
-				'Dispatch: a dispatch a worker had already claimed was cancelled — an agent process it already spawned is not stopped by a reset.',
-			);
+			lines.push('Dispatch: a dispatch a worker had already claimed was cancelled.');
 			break;
 	}
 

@@ -764,6 +764,7 @@ describe('ResetRunButton (issue #428)', () => {
 		resetMutate.mockResolvedValue({
 			outcome: 'restarted',
 			runId: 'run-1',
+			agentStop: 'not-running',
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'blocked', blockedReason: 'dirty' },
@@ -825,6 +826,7 @@ describe('ResetRunButton (issue #428)', () => {
 		resetMutate.mockResolvedValue({
 			outcome: 'restarted',
 			runId: 'run-1',
+			agentStop: 'not-running',
 			dispatch: 'cancelled-claimed',
 			cancellationCleared: true,
 			worktree: { outcome: 'blocked', blockedReason: 'live-leased' },
@@ -864,6 +866,7 @@ describe('ResetRunButton (issue #428)', () => {
 		resetMutate.mockResolvedValue({
 			outcome: 'restarted',
 			runId: 'run-1',
+			agentStop: 'not-running',
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
@@ -1064,6 +1067,7 @@ describe('RecoverRunButton (issue #593)', () => {
 	const RESET_REPORT = {
 		outcome: 'restarted' as const,
 		runId: 'run-1',
+		agentStop: 'not-running' as const,
 		dispatch: 'cancelled' as const,
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' as const },

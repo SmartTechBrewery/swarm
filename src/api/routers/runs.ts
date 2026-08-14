@@ -1148,9 +1148,12 @@ export const runsRouter = router({
 	// changes and unpushed commits — including one on another worker, which honours
 	// the `'discard'` intent the replacement dispatch carries — releases a **stale**
 	// `live-leased` lease, and resets a `running` row without it being terminated
-	// first. The one thing it still cannot do is stop an already-spawned agent
-	// process, which the report says plainly. A run that cannot be re-dispatched at
-	// all comes back `outcome: 'terminated'` with the reason, not as a refusal.
+	// first — since issue #745 by stopping that row's agent itself, over the same
+	// cancellation `terminate` records, and waiting for the run to leave `running`
+	// before it tears anything down. A stop that never confirms is reported
+	// (`agentStop: 'timed-out'`) and the restart happens anyway. A run that cannot be
+	// re-dispatched at all comes back `outcome: 'terminated'` with the reason, not as
+	// a refusal.
 	//
 	// The sequence itself lives in `src/dispatch/run-reset.ts` so the CLI can call
 	// it without tRPC context; this procedure only authorizes and maps refusals.

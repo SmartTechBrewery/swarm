@@ -44,11 +44,12 @@ Usage: swarm run reset <runId>
 A reset ALWAYS DISCARDS and never refuses. It cancels a dispatch a worker has
 already claimed, removes the checkout together with any uncommitted changes and
 unpushed commits — permanently, and on whichever worker holds it — and resets a
-run still marked running without it being terminated first. It cannot stop an
-agent process that was already spawned; terminate a genuinely live run first if
-you need it stopped. A run that cannot be re-dispatched at all (no stored job
-payload, or a project that no longer exists) is settled as failed with the
-reason rather than left wedged.
+run still marked running without it being terminated first: a running run's agent
+process is asked to stop and waited for before anything is torn down, so there is
+no "terminate, then reset" to do. An agent that never confirms the stop is
+reported and the restart happens anyway. A run that cannot be re-dispatched at
+all (no stored job payload, or a project that no longer exists) is settled as
+failed with the reason rather than left wedged.
 
 Requires DATABASE_URL and REDIS_URL in the environment — run via
 \`npm run swarm -- run reset <runId>\` (loads .env) or export them yourself
@@ -126,6 +127,25 @@ function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
  * restarted the run but left protected work behind.
  */
 function reportReset(result: ResetRunResult): void {
+	// The reset's first step (issue #745). A run that had no agent to stop says
+	// nothing, the same way a step the service did not perform is not claimed below.
+	switch (result.agentStop) {
+		case 'not-running':
+			break;
+		case 'stopped':
+			out.step(
+				'agent: the running agent was asked to stop, and the run left running before anything was torn down',
+			);
+			break;
+		case 'timed-out':
+			// Warned rather than stepped: the restart went ahead against a run that never
+			// confirmed the stop, which is the one thing here an operator must not miss.
+			out.warn(
+				'agent: the running agent was asked to stop but had not confirmed within the wait; the reset continued and discarded its checkout anyway',
+			);
+			break;
+	}
+
 	switch (result.dispatch) {
 		case 'none':
 			out.step('dispatch: none was active');
@@ -134,13 +154,7 @@ function reportReset(result: ResetRunResult): void {
 			out.step('dispatch: the active dispatch was cancelled');
 			break;
 		case 'cancelled-claimed':
-			// The step belongs on stdout with every other report line (so a redirected
-			// report is complete); the live-agent caveat is warned separately because
-			// the operator must not miss it.
 			out.step('dispatch: a dispatch a worker had already claimed was cancelled');
-			out.warn(
-				'an agent process that dispatch already spawned is not stopped by a reset — terminate it if it is still running',
-			);
 			break;
 	}
 
@@ -220,7 +234,7 @@ async function resetOneRun(argv: string[]): Promise<number> {
 	// Stated before anything is touched, because there is no opt-in left to decline
 	// (issue #744): the operator's only choice is not to run the command.
 	out.warn(
-		'a reset discards: uncommitted changes and unpushed commits in the checkout are removed permanently, wherever it lives, and an agent already spawned for this run keeps running',
+		'a reset discards: uncommitted changes and unpushed commits in the checkout are removed permanently, wherever it lives, and an agent still running for this run is stopped and its work lost',
 	);
 
 	try {
