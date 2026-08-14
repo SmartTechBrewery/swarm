@@ -1949,12 +1949,12 @@ describe('runsRouter', () => {
 
 	describe('reset', () => {
 		const RESET_RESULT = {
+			outcome: 'restarted' as const,
 			runId: 'run-1',
-			forced: false,
 			dispatch: 'cancelled' as const,
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' as const },
-			worktreeIntent: 'reclaim' as const,
+			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-2',
@@ -1965,16 +1965,34 @@ describe('runsRouter', () => {
 			vi.mocked(resetRun).mockResolvedValue(RESET_RESULT);
 
 			await expect(caller.reset({ runId: 'run-1' })).resolves.toEqual(RESET_RESULT);
-			expect(resetRun).toHaveBeenCalledWith('run-1', { force: false });
+			// Issue #744: the run id is the whole input — there is no flag to thread.
+			expect(resetRun).toHaveBeenCalledWith('run-1');
 		});
 
-		it('passes the force flag through', async () => {
+		it('resets a running run, which the service no longer refuses', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'running' }));
-			vi.mocked(resetRun).mockResolvedValue({ ...RESET_RESULT, forced: true });
+			vi.mocked(resetRun).mockResolvedValue(RESET_RESULT);
 
-			await caller.reset({ runId: 'run-1', force: true });
+			await expect(caller.reset({ runId: 'run-1' })).resolves.toEqual(RESET_RESULT);
+			expect(resetRun).toHaveBeenCalledWith('run-1');
+		});
 
-			expect(resetRun).toHaveBeenCalledWith('run-1', { force: true });
+		it("returns the service's terminal settlement as a result, not an error", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			const terminated = {
+				outcome: 'terminated' as const,
+				runId: 'run-1',
+				dispatch: 'cancelled' as const,
+				cancellationCleared: true,
+				worktree: null,
+				worktreeError: null,
+				recoveryCleared: true,
+				abandonedPreservedWorkerId: null,
+				reason: 'Reset could not restart run "run-1": its project "p1" no longer exists.',
+			};
+			vi.mocked(resetRun).mockResolvedValue(terminated);
+
+			await expect(caller.reset({ runId: 'run-1' })).resolves.toEqual(terminated);
 		});
 
 		it('throws NOT_FOUND for an unknown run without calling the service', async () => {
@@ -1986,14 +2004,10 @@ describe('runsRouter', () => {
 			expect(resetRun).not.toHaveBeenCalled();
 		});
 
+		// Only two refusals survive issue #744; every other state is an outcome.
 		it.each([
 			['run-not-found', 'NOT_FOUND'],
 			['already-resetting', 'CONFLICT'],
-			['project-not-found', 'PRECONDITION_FAILED'],
-			['missing-job-payload', 'PRECONDITION_FAILED'],
-			['running-not-forced', 'PRECONDITION_FAILED'],
-			['dispatch-claimed', 'PRECONDITION_FAILED'],
-			['worktree-teardown-failed', 'PRECONDITION_FAILED'],
 		] as const)('maps the %s refusal to %s, keeping its message', async (reason, code) => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
 			vi.mocked(resetRun).mockRejectedValue(new RunResetError(reason, `refused: ${reason}`));

@@ -758,25 +758,29 @@ describe('ResetRunButton (issue #428)', () => {
 		fireEvent.click(buttons[buttons.length - 1]);
 	}
 
-	it('resets without force until the discard opt-in is ticked', async () => {
+	// Issue #744: one button, no opt-in — the confirmation states what is destroyed
+	// instead of offering the operator a way to keep it.
+	it('confirms once and resets with the run id alone', async () => {
 		resetMutate.mockResolvedValue({
+			outcome: 'restarted',
 			runId: 'run-1',
-			forced: false,
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'blocked', blockedReason: 'dirty' },
-			worktreeIntent: 'reclaim',
+			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
-		expect(screen.getByText(/are kept/i)).toBeDefined();
+		expect(screen.queryByRole('checkbox')).toBeNull();
+		expect(screen.getByText(/discarded permanently/i)).toBeDefined();
+		expect(screen.getByText(/just claimed is cancelled/i)).toBeDefined();
 
 		confirm();
 
 		await waitFor(() => {
-			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1', force: false });
+			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1' });
 		});
 	});
 
@@ -817,38 +821,14 @@ describe('ResetRunButton (issue #428)', () => {
 		expect(screen.queryByText(/is abandoned/i)).toBeNull();
 	});
 
-	it('maps the discard opt-in to the force variant and warns it is unrecoverable', async () => {
-		resetMutate.mockResolvedValue({
-			runId: 'run-1',
-			forced: true,
-			dispatch: 'cancelled',
-			cancellationCleared: true,
-			worktree: { outcome: 'removed', discarded: 'dirty' },
-			worktreeIntent: 'discard',
-			recoveryCleared: true,
-			abandonedPreservedWorkerId: null,
-			dispatchId: 'dispatch-9',
-		});
-		openConfirm();
-
-		fireEvent.click(screen.getByRole('checkbox'));
-		expect(screen.getByText(/discarded permanently/i)).toBeDefined();
-
-		confirm();
-
-		await waitFor(() => {
-			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1', force: true });
-		});
-	});
-
 	it('renders the per-step report on success', async () => {
 		resetMutate.mockResolvedValue({
+			outcome: 'restarted',
 			runId: 'run-1',
-			forced: false,
-			dispatch: 'force-cancelled-claimed',
+			dispatch: 'cancelled-claimed',
 			cancellationCleared: true,
 			worktree: { outcome: 'blocked', blockedReason: 'live-leased' },
-			worktreeIntent: 'reclaim',
+			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
@@ -859,13 +839,13 @@ describe('ResetRunButton (issue #428)', () => {
 		await waitFor(() => {
 			expect(screen.getByRole('heading', { name: 'Reset complete' })).toBeDefined();
 		});
-		expect(screen.getByText(/worker-claimed dispatch was force-cancelled/i)).toBeDefined();
+		expect(screen.getByText(/dispatch a worker had already claimed was cancelled/i)).toBeDefined();
 		expect(
 			screen.getByText(/Checkout: retained — a lease held by another live run/i),
 		).toBeDefined();
 		expect(screen.getByText(/dispatch dispatch-9/i)).toBeDefined();
-		// The modal closed, so its confirm button is gone.
-		expect(screen.queryByRole('checkbox')).toBeNull();
+		// The modal closed with the success, so its copy is gone.
+		expect(screen.queryByRole('heading', { name: /reset & restart run\?/i })).toBeNull();
 	});
 
 	it("renders the server's refusal message inline", async () => {
@@ -876,18 +856,18 @@ describe('ResetRunButton (issue #428)', () => {
 		await waitFor(() => {
 			expect(screen.getByText('Run "run-1" is already being restarted.')).toBeDefined();
 		});
-		// A refused reset keeps the modal open so the operator can adjust and retry.
-		expect(screen.getByRole('checkbox')).toBeDefined();
+		// A refused reset keeps the modal open so the operator can retry from it.
+		expect(screen.getByRole('heading', { name: /reset & restart run\?/i })).toBeDefined();
 	});
 
 	it('preserves the success report in RunDetailHeader post-invalidation when status transitions to running', async () => {
 		resetMutate.mockResolvedValue({
+			outcome: 'restarted',
 			runId: 'run-1',
-			forced: false,
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
-			worktreeIntent: 'reclaim',
+			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-9',
@@ -1082,12 +1062,12 @@ describe('RecoverRunButton (issue #593)', () => {
 	const neverSettles = () => new Promise<never>(() => {});
 
 	const RESET_REPORT = {
+		outcome: 'restarted' as const,
 		runId: 'run-1',
-		forced: false,
 		dispatch: 'cancelled' as const,
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' as const },
-		worktreeIntent: 'reclaim' as const,
+		worktreeError: null,
 		recoveryCleared: true,
 		abandonedPreservedWorkerId: null,
 		dispatchId: 'dispatch-9',
@@ -1210,12 +1190,11 @@ describe('RecoverRunButton (issue #593)', () => {
 		expect(screen.queryByRole('button', { name: /retry now/i })).toBeNull();
 		expect(resetMutate).not.toHaveBeenCalled();
 
-		fireEvent.click(screen.getByRole('checkbox'));
 		const confirms = screen.getAllByRole('button', { name: /reset & restart/i });
 		fireEvent.click(confirms[confirms.length - 1]);
 
 		await waitFor(() => {
-			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1', force: true });
+			expect(resetMutate).toHaveBeenCalledWith({ runId: 'run-1' });
 		});
 		expect(retryMutate).not.toHaveBeenCalled();
 	});
@@ -1338,8 +1317,8 @@ describe('RecoverRunButton (issue #593)', () => {
 		await waitFor(() => {
 			expect(screen.getByText('Run "run-1" is already being restarted.')).toBeDefined();
 		});
-		// The operator can adjust and retry from the still-open modal.
-		expect(screen.getByRole('checkbox')).toBeDefined();
+		// The operator can retry from the still-open modal.
+		expect(screen.getByRole('heading', { name: /reset & restart run\?/i })).toBeDefined();
 	});
 
 	it('re-enables once the outstanding restart resolves', () => {

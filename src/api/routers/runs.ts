@@ -333,15 +333,14 @@ function wakeJobId(dispatch: { id: string; wakeSeq: number }): string {
 	return `dispatch_${dispatch.id}_w${dispatch.wakeSeq}`;
 }
 
-/** How each reset refusal (`src/dispatch/run-reset.ts`) surfaces over tRPC. */
+/**
+ * How each reset refusal (`src/dispatch/run-reset.ts`) surfaces over tRPC. Only
+ * two exist since issue #744 — nothing to reset, and a reset already under way —
+ * because no other state may leave a run un-reset.
+ */
 const RESET_REFUSAL_CODES: Record<RunResetRefusal, TRPCError['code']> = {
 	'run-not-found': 'NOT_FOUND',
 	'already-resetting': 'CONFLICT',
-	'project-not-found': 'PRECONDITION_FAILED',
-	'missing-job-payload': 'PRECONDITION_FAILED',
-	'running-not-forced': 'PRECONDITION_FAILED',
-	'dispatch-claimed': 'PRECONDITION_FAILED',
-	'worktree-teardown-failed': 'PRECONDITION_FAILED',
 };
 
 /** How each force refusal (`src/dispatch/force-re-review.ts`) surfaces over tRPC. */
@@ -1142,18 +1141,21 @@ export const runsRouter = router({
 	// recovery record disagree — the state that today needs manual DB and git
 	// surgery. It cancels the active dispatch, clears the cancellation flag, tears
 	// down the checkout and its lease, clears the recovery record, and re-dispatches
-	// the same row from its stored payload with a fresh agent session. It is the
-	// only action able to release a **stale** `live-leased` lease (one no live run
-	// owns) and, with `force`, to discard a dirty/unpushed checkout.
+	// the same row from its stored payload with a fresh agent session.
 	//
-	// `force` additionally allows resetting a `running` run and cancelling a
-	// dispatch a worker already claimed. It cannot stop an already-spawned agent
-	// process (only Terminate does), so it stays an explicit operator choice.
+	// It takes no options (issue #744): a reset always discards. It cancels a
+	// dispatch a worker just claimed, removes the checkout with any uncommitted
+	// changes and unpushed commits — including one on another worker, which honours
+	// the `'discard'` intent the replacement dispatch carries — releases a **stale**
+	// `live-leased` lease, and resets a `running` row without it being terminated
+	// first. The one thing it still cannot do is stop an already-spawned agent
+	// process, which the report says plainly. A run that cannot be re-dispatched at
+	// all comes back `outcome: 'terminated'` with the reason, not as a refusal.
 	//
 	// The sequence itself lives in `src/dispatch/run-reset.ts` so the CLI can call
 	// it without tRPC context; this procedure only authorizes and maps refusals.
 	reset: authedProcedure
-		.input(z.object({ runId: z.string().min(1), force: z.boolean().default(false) }))
+		.input(z.object({ runId: z.string().min(1) }))
 		.mutation(async ({ ctx, input }) => {
 			// Resolved here for authorization only — the service re-reads the row.
 			const run = await getRunByIdFromDb(input.runId);
@@ -1172,7 +1174,7 @@ export const runsRouter = router({
 			);
 
 			try {
-				return await resetRun(input.runId, { force: input.force });
+				return await resetRun(input.runId);
 			} catch (error) {
 				if (error instanceof RunResetError) {
 					throw new TRPCError({ code: RESET_REFUSAL_CODES[error.reason], message: error.message });

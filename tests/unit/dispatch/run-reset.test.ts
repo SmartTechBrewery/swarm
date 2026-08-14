@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	getRunByIdFromDb: vi.fn(),
 	clearRunRecovery: vi.fn(),
+	failRunFromStatus: vi.fn(),
 	hasLiveRunForTask: vi.fn(),
 	updateRunJobPayload: vi.fn(),
 }));
@@ -46,6 +47,7 @@ import {
 import { getProjectByIdFromDb } from '@/db/repositories/projectsRepository.js';
 import {
 	clearRunRecovery,
+	failRunFromStatus,
 	getRunByIdFromDb,
 	hasLiveRunForTask,
 	updateRunJobPayload,
@@ -168,6 +170,7 @@ describe('resetRun', () => {
 		vi.mocked(cancelClaimedDispatch).mockReset().mockResolvedValue(true);
 		vi.mocked(clearRunCancellation).mockReset().mockResolvedValue(undefined);
 		vi.mocked(clearRunRecovery).mockReset().mockResolvedValue(undefined);
+		vi.mocked(failRunFromStatus).mockReset().mockResolvedValue(true);
 		vi.mocked(hasLiveRunForTask).mockReset().mockResolvedValue(false);
 		vi.mocked(updateRunJobPayload).mockReset().mockResolvedValue(undefined);
 		vi.mocked(removePendingJobById).mockClear();
@@ -177,7 +180,7 @@ describe('resetRun', () => {
 			.mockResolvedValue({ dispatch: makeDispatch({ id: 'dispatch-2' }), created: true });
 	});
 
-	it('cancels, clears, tears down, and re-dispatches a wedged failed run', async () => {
+	it('cancels, clears, discards, and re-dispatches a wedged failed run', async () => {
 		vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
 
 		const result = await resetRun('run-1');
@@ -187,13 +190,14 @@ describe('resetRun', () => {
 			expect.stringContaining('run-1'),
 		);
 		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		// Issue #744: the discard is unconditional — there is no opt-in left to pass.
 		expect(reconcileTerminatedWorktree).toHaveBeenCalledWith(
 			expect.anything(),
 			'p1',
 			'424',
 			null,
 			false,
-			expect.objectContaining({ discardProtectedWork: false }),
+			expect.objectContaining({ discardProtectedWork: true }),
 		);
 		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
 		expect(createAndPublishDispatch).toHaveBeenCalledWith(
@@ -207,12 +211,12 @@ describe('resetRun', () => {
 			}),
 		);
 		expect(result).toEqual({
+			outcome: 'restarted',
 			runId: 'run-1',
-			forced: false,
 			dispatch: 'cancelled',
 			cancellationCleared: true,
 			worktree: { outcome: 'removed' },
-			worktreeIntent: 'reclaim',
+			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
 			dispatchId: 'dispatch-2',
@@ -244,7 +248,7 @@ describe('resetRun', () => {
 		const result = await resetRun('run-1');
 
 		expect(result.abandonedPreservedWorkerId).toBe('w-offline');
-		expect(result.dispatchId).toBe('dispatch-2');
+		expect(result).toMatchObject({ outcome: 'restarted', dispatchId: 'dispatch-2' });
 	});
 
 	it('re-dispatches with a fresh agent session and a reset rate-limit budget', async () => {
@@ -279,32 +283,20 @@ describe('resetRun', () => {
 				},
 			});
 
-		it('provisions as a first attempt would after a plain reset', async () => {
+		// The reset keeps the mode it chose itself — the only way the checkout is reached
+		// when it lives on another worker (issue #592) — while dropping the stored one.
+		it('provisions as a first attempt would, carrying only its own discard intent', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
 
 			await resetRun('run-1');
-
-			const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
-			expect(jobPayload.implementationBranchProvisioned).toBeUndefined();
-			expect(jobPayload.resumeSession).toBeUndefined();
-			expect(jobPayload.resumeDelivery).toBeUndefined();
-			expect(jobPayload.recoveryMode).toBeUndefined();
-			expect(jobPayload.agentSessionId).not.toBe(STORED_SESSION);
-			expect(jobPayload.agentSessionId).toEqual(expect.any(String));
-		});
-
-		// A forced reset strips the same latches, but keeps the mode it chose itself —
-		// the only way the checkout is reached when it lives on another worker (issue #592).
-		it("keeps the forced reset's own discard intent while dropping the stored one", async () => {
-			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
-
-			await resetRun('run-1', { force: true });
 
 			const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
 			expect(jobPayload.recoveryMode).toBe('discard');
 			expect(jobPayload.implementationBranchProvisioned).toBeUndefined();
 			expect(jobPayload.resumeSession).toBeUndefined();
 			expect(jobPayload.resumeDelivery).toBeUndefined();
+			expect(jobPayload.agentSessionId).not.toBe(STORED_SESSION);
+			expect(jobPayload.agentSessionId).toEqual(expect.any(String));
 		});
 
 		// The row's own `job_payload` keeps the latch until a worker claims the restart, and
@@ -320,7 +312,6 @@ describe('resetRun', () => {
 			expect(persisted.implementationBranchProvisioned).toBeUndefined();
 			expect(persisted.resumeSession).toBeUndefined();
 			expect(persisted.resumeDelivery).toBeUndefined();
-			expect(persisted.recoveryMode).toBeUndefined();
 			expect(persisted).toEqual(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload);
 			expect(vi.mocked(updateRunJobPayload).mock.invocationCallOrder[0]).toBeLessThan(
 				vi.mocked(createAndPublishDispatch).mock.invocationCallOrder[0],
@@ -331,7 +322,10 @@ describe('resetRun', () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(latchedRun());
 			vi.mocked(updateRunJobPayload).mockRejectedValue(new Error('db down'));
 
-			await expect(resetRun('run-1')).resolves.toMatchObject({ dispatchId: 'dispatch-2' });
+			await expect(resetRun('run-1')).resolves.toMatchObject({
+				outcome: 'restarted',
+				dispatchId: 'dispatch-2',
+			});
 			expect(createAndPublishDispatch).toHaveBeenCalled();
 		});
 	});
@@ -355,13 +349,40 @@ describe('resetRun', () => {
 		expect(clearRunCancellation).not.toHaveBeenCalled();
 	});
 
-	it('refuses a run whose project no longer exists', async () => {
+	// Issue #744 — the two states nothing can be re-dispatched from. Refusing them left
+	// the wedged run exactly as it was, which is the thing reset exists to end, so they
+	// clear the run's state like any other reset and then settle the row terminally.
+	it('settles a run whose project no longer exists instead of refusing it', async () => {
+		vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
 		vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
 
-		await expect(resetRun('run-1')).rejects.toThrowError(
-			expect.objectContaining({ reason: 'project-not-found' }),
-		);
+		const result = await resetRun('run-1');
+
+		expect(result).toMatchObject({ outcome: 'terminated', dispatch: 'cancelled' });
+		expect(result.outcome === 'terminated' && result.reason).toContain('no longer exists');
+		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
+		// No project means no `GitWorktreeManager` to settle this host's checkout with.
 		expect(reconcileTerminatedWorktree).not.toHaveBeenCalled();
+		expect(result.worktree).toBeNull();
+		expect(failRunFromStatus).toHaveBeenCalledWith('run-1', expect.stringContaining('run-1'));
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('settles a run with no stored job payload instead of refusing it', async () => {
+		vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ jobPayload: null }));
+
+		const result = await resetRun('run-1');
+
+		expect(result).toMatchObject({ outcome: 'terminated', dispatch: 'cancelled' });
+		expect(result.outcome === 'terminated' && result.reason).toContain('without a job payload');
+		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
+		// The checkout is still settled here — only the re-dispatch is impossible.
+		expect(reconcileTerminatedWorktree).toHaveBeenCalled();
+		expect(failRunFromStatus).toHaveBeenCalledWith('run-1', expect.stringContaining('run-1'));
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
 	});
 
 	// issue #684 phase 2 — the checkout a reset tears down belongs to the repository the
@@ -388,60 +409,12 @@ describe('resetRun', () => {
 		expect(reconcileTerminatedWorktree).not.toHaveBeenCalled();
 	});
 
-	it('refuses a running run without force and mutates nothing', async () => {
+	// Issue #744: a live row is the state operators reach for reset in, and refusing it
+	// until Terminate had settled it was the refusal that made reset useless there.
+	it('resets a running run without it being terminated first', async () => {
 		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ status: 'running' }));
 
-		await expect(resetRun('run-1')).rejects.toThrowError(
-			expect.objectContaining({ reason: 'running-not-forced' }),
-		);
-		expect(cancelDispatchAndWake).not.toHaveBeenCalled();
-		expect(clearRunCancellation).not.toHaveBeenCalled();
-		expect(reconcileTerminatedWorktree).not.toHaveBeenCalled();
-		expect(clearRunRecovery).not.toHaveBeenCalled();
-		expect(createAndPublishDispatch).not.toHaveBeenCalled();
-	});
-
-	it('resets a running run when forced', async () => {
-		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ status: 'running' }));
-
-		await expect(resetRun('run-1', { force: true })).resolves.toMatchObject({ forced: true });
-		expect(createAndPublishDispatch).toHaveBeenCalled();
-	});
-
-	it('refuses a run with no stored job payload before cancelling anything', async () => {
-		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ jobPayload: null }));
-
-		await expect(resetRun('run-1')).rejects.toThrowError(
-			expect.objectContaining({ reason: 'missing-job-payload' }),
-		);
-		expect(cancelDispatchAndWake).not.toHaveBeenCalled();
-	});
-
-	it('aborts when the dispatch was claimed between the read and the cancel', async () => {
-		vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
-		vi.mocked(cancelDispatchAndWake).mockResolvedValue(null);
-
-		await expect(resetRun('run-1')).rejects.toThrowError(
-			expect.objectContaining({ reason: 'dispatch-claimed' }),
-		);
-		expect(cancelClaimedDispatch).not.toHaveBeenCalled();
-		expect(clearRunCancellation).not.toHaveBeenCalled();
-	});
-
-	it('cancels a claimed dispatch and removes its wake-up when forced', async () => {
-		vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
-		vi.mocked(cancelDispatchAndWake).mockResolvedValue(null);
-
-		await expect(resetRun('run-1', { force: true })).resolves.toMatchObject({
-			dispatch: 'force-cancelled-claimed',
-		});
-		expect(cancelClaimedDispatch).toHaveBeenCalledWith('dispatch-1', expect.any(String));
-		expect(removePendingJobById).toHaveBeenCalledWith('dispatch_dispatch-1_w3');
-	});
-
-	it('threads the discard-protected-work flag into the teardown when forced', async () => {
-		await resetRun('run-1', { force: true });
-
+		await expect(resetRun('run-1')).resolves.toMatchObject({ outcome: 'restarted' });
 		expect(reconcileTerminatedWorktree).toHaveBeenCalledWith(
 			expect.anything(),
 			'p1',
@@ -450,35 +423,33 @@ describe('resetRun', () => {
 			false,
 			expect.objectContaining({ discardProtectedWork: true }),
 		);
+		expect(createAndPublishDispatch).toHaveBeenCalled();
 	});
 
-	// Issue #592: the local teardown above only reaches the control-plane host, so a
-	// forced reset also has to tell the worker that actually holds the checkout to
-	// destroy it — otherwise the replacement dispatch fails on the same collision.
-	it("carries a 'discard' recovery mode to the worker holding the checkout when forced", async () => {
-		const result = await resetRun('run-1', { force: true });
+	it('cancels a dispatch a worker claimed first, with no opt-in, and removes its wake-up', async () => {
+		vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+		vi.mocked(cancelDispatchAndWake).mockResolvedValue(null);
+
+		await expect(resetRun('run-1')).resolves.toMatchObject({ dispatch: 'cancelled-claimed' });
+		expect(cancelClaimedDispatch).toHaveBeenCalledWith('dispatch-1', expect.any(String));
+		expect(removePendingJobById).toHaveBeenCalledWith('dispatch_dispatch-1_w3');
+	});
+
+	// Issue #592: the local teardown only reaches the control-plane host, so the reset
+	// also has to tell the worker that actually holds the checkout to destroy it —
+	// otherwise the replacement dispatch fails on the same collision.
+	it("carries a 'discard' recovery mode to the worker holding the checkout", async () => {
+		await resetRun('run-1');
 
 		const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
 		expect(jobPayload.recoveryMode).toBe('discard');
 		expect(jobPayload.resumeSession).toBeUndefined();
-		expect(result.worktreeIntent).toBe('discard');
-	});
-
-	it('sends no recovery mode on a plain reset, leaving the reclaim gate’s protections', async () => {
-		const result = await resetRun('run-1');
-
-		const { jobPayload } = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
-		expect(jobPayload.recoveryMode).toBeUndefined();
-		expect(result.worktreeIntent).toBe('reclaim');
 	});
 
 	it('delegates the discard even when nothing was on this host to tear down', async () => {
 		vi.mocked(reconcileTerminatedWorktree).mockResolvedValue({ outcome: 'absent' });
 
-		await expect(resetRun('run-1', { force: true })).resolves.toMatchObject({
-			worktree: { outcome: 'absent' },
-			worktreeIntent: 'discard',
-		});
+		await expect(resetRun('run-1')).resolves.toMatchObject({ worktree: { outcome: 'absent' } });
 		expect(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload.recoveryMode).toBe(
 			'discard',
 		);
@@ -514,16 +485,24 @@ describe('resetRun', () => {
 		expect(createAndPublishDispatch).toHaveBeenCalled();
 	});
 
-	it('stops without re-dispatching when the teardown throws', async () => {
+	// Issue #744: this teardown only reaches the control-plane host, and the checkout the
+	// restart has to clear may be on another worker — one that honours the discard intent
+	// the replacement dispatch carries. So a local throw is reported and stepped over.
+	it('reports a teardown that threw and still re-dispatches the run', async () => {
 		vi.mocked(reconcileTerminatedWorktree).mockRejectedValue(new Error('git exploded'));
 
-		await expect(resetRun('run-1')).rejects.toThrowError(
-			expect.objectContaining({ reason: 'worktree-teardown-failed' }),
-		);
-		expect(clearRunRecovery).not.toHaveBeenCalled();
-		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		const result = await resetRun('run-1');
+
+		expect(result).toMatchObject({ outcome: 'restarted', dispatchId: 'dispatch-2' });
+		expect(result.worktree).toBeNull();
+		expect(result.worktreeError).toContain('git exploded');
+		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
+		expect(createAndPublishDispatch).toHaveBeenCalled();
 	});
 
+	// The one refusal a *successful* reset can still produce, and the reason it survives
+	// issue #744: the unique index means a reset really is under way, so the answer is
+	// idempotency rather than a second dispatch for the same run.
 	it('reports a concurrent reset that already created the run’s dispatch', async () => {
 		vi.mocked(createAndPublishDispatch).mockRejectedValue(
 			new Error('duplicate key value violates unique constraint "uq_dispatches_active_run"'),
@@ -532,6 +511,7 @@ describe('resetRun', () => {
 		await expect(resetRun('run-1')).rejects.toThrowError(
 			expect.objectContaining({ reason: 'already-resetting' }),
 		);
+		expect(createAndPublishDispatch).toHaveBeenCalledOnce();
 	});
 
 	it('propagates an unrelated dispatch-creation failure as-is', async () => {

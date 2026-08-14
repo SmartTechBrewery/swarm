@@ -8,14 +8,17 @@ import {
 	resetConfirmMessage,
 } from './run-reset.js';
 
-function makeReport(overrides: Partial<ResetRunReport> = {}): ResetRunReport {
+/** The ordinary ending; the terminal one (issue #744) is built inline by its own test. */
+type RestartedReport = Extract<ResetRunReport, { outcome: 'restarted' }>;
+
+function makeReport(overrides: Partial<RestartedReport> = {}): RestartedReport {
 	return {
+		outcome: 'restarted',
 		runId: 'run-1',
-		forced: false,
 		dispatch: 'cancelled',
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
-		worktreeIntent: 'reclaim',
+		worktreeError: null,
 		recoveryCleared: true,
 		dispatchId: 'dispatch-9',
 		...overrides,
@@ -29,13 +32,16 @@ describe('canResetRun', () => {
 	});
 
 	it('allows reset for a checkpointed run (issue #503)', () => {
-		// `resetRun` refuses only a `running` row unless forced, so withholding the
-		// button here would hide an action the server accepts.
+		// `resetRun` accepts every non-completed status, so withholding the button here
+		// would hide an action the server accepts.
 		expect(canResetRun('checkpointed')).toBe(true);
 	});
 
-	it('disallows reset for running and completed runs', () => {
-		expect(canResetRun('running')).toBe(false);
+	it('allows reset for a running run, which the server no longer refuses (issue #744)', () => {
+		expect(canResetRun('running')).toBe(true);
+	});
+
+	it('disallows reset for a completed run, which has nothing to restart', () => {
 		expect(canResetRun('completed')).toBe(false);
 	});
 
@@ -71,14 +77,14 @@ describe('describeRestartWait (issue #561)', () => {
 
 	it('names the CLI escape for a restart no worker ever picks up', () => {
 		expect(describeRestartWait()).toContain('swarm run reset <runId>');
-		expect(describeRestartWait()).not.toContain('"swarm run reset <runId> --force"');
-		expect(describeRestartWait()).toContain('discard dirty or unpushed work');
+		// The flag it used to send operators back with is gone (issue #744).
+		expect(describeRestartWait()).not.toContain('--force');
 	});
 });
 
 describe('resetConfirmMessage', () => {
 	it('names every step the reset performs', () => {
-		const message = resetConfirmMessage('failed', false);
+		const message = resetConfirmMessage('failed');
 		expect(message).toContain('active dispatch');
 		expect(message).toContain('worktree lease');
 		expect(message).toContain('recovery record');
@@ -86,35 +92,40 @@ describe('resetConfirmMessage', () => {
 	});
 
 	it('mentions the scheduled retry for a deferred run', () => {
-		expect(resetConfirmMessage('deferred', false)).toContain('scheduled retry');
-		expect(resetConfirmMessage('failed', false)).not.toContain('scheduled retry');
+		expect(resetConfirmMessage('deferred')).toContain('scheduled retry');
+		expect(resetConfirmMessage('failed')).not.toContain('scheduled retry');
 	});
 
 	it('says a checkpointed reset discards the checkpoint and its spent budget (issue #503)', () => {
-		const message = resetConfirmMessage('checkpointed', false);
+		const message = resetConfirmMessage('checkpointed');
 		expect(message).toContain('scheduled continuation');
 		expect(message).toContain('checkpoint');
 		expect(message).toContain('continuation count');
 		// The remainder is given up, not carried into the restarted phase.
 		expect(message).toContain('not carried over');
-		expect(resetConfirmMessage('failed', false)).not.toContain('checkpoint');
+		expect(resetConfirmMessage('failed')).not.toContain('checkpoint');
 	});
 
-	it('says protected work is kept when force is off', () => {
-		expect(resetConfirmMessage('failed', false)).toContain('are kept');
-	});
-
-	it('warns that discarded work cannot be recovered when force is on', () => {
-		const message = resetConfirmMessage('failed', true);
+	// Issue #744: there is no opt-in to describe, so the copy states the consequences
+	// the operator is confirming rather than offering a choice.
+	it('states that the discarded work cannot be recovered', () => {
+		const message = resetConfirmMessage('failed');
 		expect(message).toContain('discarded permanently');
 		expect(message).toContain('cannot be recovered');
+		expect(message).not.toContain('are kept');
+	});
+
+	it('states that a just-claimed dispatch is cancelled without stopping its agent', () => {
+		const message = resetConfirmMessage('failed');
+		expect(message).toContain('just claimed is cancelled');
+		expect(message).toContain('already spawned');
 	});
 
 	// Issue #567: this is the action that abandons a pinned machine's work, and the
 	// only one available while that machine is unreachable — so the copy has to say
 	// both, rather than let "restarts this phase" read as a free retry.
 	it('names the machine whose preserved work a restart abandons', () => {
-		const message = resetConfirmMessage('checkpointed', false, 'm3_pro_tp');
+		const message = resetConfirmMessage('checkpointed', 'm3_pro_tp');
 
 		expect(message).toContain('m3_pro_tp');
 		expect(message).toContain('abandoned');
@@ -122,7 +133,7 @@ describe('resetConfirmMessage', () => {
 	});
 
 	it('says nothing about a machine for a run pinned to none', () => {
-		expect(resetConfirmMessage('failed', false, null)).not.toContain('abandoned');
+		expect(resetConfirmMessage('failed', null)).not.toContain('abandoned');
 	});
 });
 
@@ -133,7 +144,7 @@ describe('describeResetResult', () => {
 			'Dispatch: the active dispatch was cancelled.',
 			'Cancellation flag: cleared, so the fresh attempt is not killed at startup.',
 			'Checkout: removed and its lease released.',
-			'Restart intent: the worker holding the checkout reclaims it only if it is safe to; dirty or unpushed work is retained.',
+			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
 			'Recovery record: cleared.',
 			'Restarted: re-dispatched from scratch as dispatch dispatch-9.',
 		]);
@@ -151,10 +162,44 @@ describe('describeResetResult', () => {
 		);
 	});
 
-	it('warns that a force-cancelled claimed dispatch may leave its agent running', () => {
-		expect(describeResetResult(makeReport({ dispatch: 'force-cancelled-claimed' }))[0]).toContain(
+	it('warns that a cancelled claimed dispatch may leave its agent running', () => {
+		expect(describeResetResult(makeReport({ dispatch: 'cancelled-claimed' }))[0]).toContain(
 			'agent process it already spawned is not stopped',
 		);
+	});
+
+	// Issue #744: the local teardown reaches only the control-plane host, so a throw is
+	// reported instead of refusing — the restart's own discard intent settles the rest.
+	it('reports a local teardown that failed and still reports the restart', () => {
+		const lines = describeResetResult(
+			makeReport({ worktree: null, worktreeError: 'git exploded' }),
+		);
+
+		expect(lines).toContain(
+			"Checkout: this host's teardown failed — git exploded. The reset continued.",
+		);
+		expect(lines).toContain('Restarted: re-dispatched from scratch as dispatch dispatch-9.');
+	});
+
+	// A run nothing can be re-dispatched from is settled rather than refused, so the
+	// report names the ending and claims no restart intent.
+	it('reports a terminally settled run with the stated reason', () => {
+		const lines = describeResetResult({
+			outcome: 'terminated',
+			runId: 'run-1',
+			dispatch: 'cancelled',
+			cancellationCleared: true,
+			worktree: null,
+			worktreeError: null,
+			recoveryCleared: true,
+			reason: 'Reset could not restart this run: it was created without a job payload.',
+		});
+
+		expect(lines).toContain(
+			'Not restarted: Reset could not restart this run: it was created without a job payload.',
+		);
+		expect(lines.some((line) => line.startsWith('Restart intent:'))).toBe(false);
+		expect(lines).toContain('Recovery record: cleared.');
 	});
 
 	// Issue #592: "nothing to remove" was the reset's whole answer even when the
@@ -167,10 +212,8 @@ describe('describeResetResult', () => {
 		);
 	});
 
-	it('names the delegated intent of a forced reset (issue #592)', () => {
-		const lines = describeResetResult(
-			makeReport({ forced: true, worktreeIntent: 'discard', worktree: { outcome: 'absent' } }),
-		);
+	it('names the delegated discard intent every restart carries (issue #592)', () => {
+		const lines = describeResetResult(makeReport({ worktree: { outcome: 'absent' } }));
 		expect(lines).toContain(
 			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
 		);
@@ -183,9 +226,9 @@ describe('describeResetResult', () => {
 		expect(lines.some((line) => line.includes('stale worktree lease'))).toBe(true);
 	});
 
-	it('names what a forced reset discarded', () => {
+	it('names what the reset discarded', () => {
 		const lines = describeResetResult(
-			makeReport({ forced: true, worktree: { outcome: 'removed', discarded: 'dirty' } }),
+			makeReport({ worktree: { outcome: 'removed', discarded: 'dirty' } }),
 		);
 		expect(lines).toContain('Checkout: removed — uncommitted changes discarded as requested.');
 	});
@@ -193,7 +236,6 @@ describe('describeResetResult', () => {
 	it('names both discarded work and a released stale lease when both are present', () => {
 		const lines = describeResetResult(
 			makeReport({
-				forced: true,
 				worktree: { outcome: 'removed', discarded: 'dirty', staleLeaseReleased: true },
 			}),
 		);
@@ -202,12 +244,12 @@ describe('describeResetResult', () => {
 		);
 	});
 
-	it('names the blocked reason when the checkout was retained', () => {
+	it('names the blocked reason when the checkout was retained, and who settles it', () => {
 		const lines = describeResetResult(
 			makeReport({ worktree: { outcome: 'blocked', blockedReason: 'unpushed' } }),
 		);
 		expect(lines).toContain(
-			'Checkout: retained — unpushed commits. The restarted run re-checks it before provisioning.',
+			'Checkout: retained — unpushed commits. The worker holding it discards it when it provisions the restart.',
 		);
 	});
 

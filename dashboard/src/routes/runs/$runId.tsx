@@ -640,9 +640,14 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 /**
  * The "Reset & restart" confirmation, extracted from `ResetRunButton` (issue
  * #593) so the unified Recover control confirms exactly the same way rather than
- * re-stating the copy: the step-by-step message the run's own state shapes, the
- * explicit default-off opt-in that maps to the destructive `force` variant, and
+ * re-stating the copy: the step-by-step message the run's own state shapes, and
  * the refusal message the server returns.
+ *
+ * It confirms but no longer *offers a choice* (issue #744). A reset always
+ * discards, so the opt-in checkbox that used to map to the destructive `force`
+ * variant is gone and its warning is stated instead: the checkout is destroyed
+ * with any uncommitted and unpushed work in it, and a just-claimed dispatch is
+ * cancelled.
  *
  * `blocked` guards the confirm separately from `isPending`, so a modal left open
  * across a background refetch that surfaces an accepted restart can't queue a
@@ -651,8 +656,6 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 function ResetConfirmModal({
 	run,
 	open,
-	discardWork,
-	onDiscardWorkChange,
 	onClose,
 	onConfirm,
 	isPending,
@@ -662,8 +665,6 @@ function ResetConfirmModal({
 }: {
 	run: RunRow;
 	open: boolean;
-	discardWork: boolean;
-	onDiscardWorkChange: (value: boolean) => void;
 	onClose: () => void;
 	onConfirm: () => void;
 	isPending: boolean;
@@ -682,7 +683,6 @@ function ResetConfirmModal({
 			<p className="text-sm text-zinc-300">
 				{resetConfirmMessage(
 					run.status,
-					discardWork,
 					// Named only while the work is still there to lose: an already
 					// abandoned record must not read as a second warning.
 					run.preservedWorker?.state === 'preserved'
@@ -690,26 +690,6 @@ function ResetConfirmModal({
 						: null,
 				)}
 			</p>
-
-			<label className="flex items-start gap-3 mt-4 p-3 border border-red-900/50 rounded-md bg-red-950/20 cursor-pointer hover:bg-red-950/30 transition-colors">
-				<input
-					type="checkbox"
-					checked={discardWork}
-					onChange={(event) => onDiscardWorkChange(event.target.checked)}
-					disabled={isPending}
-					className="mt-0.5 h-4 w-4 accent-red-600 disabled:opacity-50"
-				/>
-				<span>
-					<span className="block text-sm font-medium text-red-200">
-						Also discard uncommitted / unpushed work in the checkout
-					</span>
-					<span className="block text-xs text-red-400/80 mt-1">
-						Without this, a checkout holding uncommitted changes or unpushed commits is kept and the
-						restarted run may block on it again. With it, that work is deleted and cannot be
-						recovered.
-					</span>
-				</span>
-			</label>
 
 			{errorMessage && (
 				<div className="mt-3 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
@@ -749,12 +729,12 @@ function ResetConfirmModal({
  * "Reset & restart" action (issue #428) for a wedged `failed`/`deferred` run —
  * the last resort when neither "Retry now" nor "Terminate" can move it because
  * its dispatch, cancellation flag, worktree lease, and recovery record disagree.
- * The modal names every step `runs.reset` performs and carries the explicit,
- * default-off opt-in for the destructive `force` variant (discard uncommitted /
- * unpushed work); success renders the per-step report the mutation returns, so
- * an operator can tell a reset that freed the checkout from one that restarted
- * the run but kept protected work. Pending state disables both the trigger and
- * the confirm button so a double-click can't fire two resets.
+ * The modal names every step `runs.reset` performs and states what the reset
+ * destroys — since issue #744 there is nothing to opt into; success renders the
+ * per-step report the mutation returns, so an operator can tell a reset that
+ * freed the checkout from one that restarted the run but left the checkout for
+ * the holding worker to clear. Pending state disables both the trigger and the
+ * confirm button so a double-click can't fire two resets.
  *
  * That guard extends past the mutation itself (issue #561): `runs.reset` returns
  * as soon as the replacement dispatch exists, while the run row keeps its old
@@ -771,16 +751,11 @@ export function ResetRunButton({
 }) {
 	const queryClient = useQueryClient();
 	const [confirmOpen, setConfirmOpen] = useState(false);
-	const [discardWork, setDiscardWork] = useState(false);
 
-	/** Close the modal and drop the force opt-in, so reopening never starts armed. */
-	const closeConfirm = () => {
-		setConfirmOpen(false);
-		setDiscardWork(false);
-	};
+	const closeConfirm = () => setConfirmOpen(false);
 
 	const mutation = useMutation({
-		mutationFn: (force: boolean) => trpcClient.runs.reset.mutate({ runId: run.id, force }),
+		mutationFn: () => trpcClient.runs.reset.mutate({ runId: run.id }),
 		// The detail refetch is awaited for the same reason Terminate's is (issue #561):
 		// the row's status doesn't change here at all, so without it the button reads
 		// "Reset & restart" again before the queued restart becomes visible.
@@ -836,10 +811,8 @@ export function ResetRunButton({
 			<ResetConfirmModal
 				run={run}
 				open={confirmOpen}
-				discardWork={discardWork}
-				onDiscardWorkChange={setDiscardWork}
 				onClose={closeConfirm}
-				onConfirm={() => mutation.mutate(discardWork)}
+				onConfirm={() => mutation.mutate()}
 				isPending={mutation.isPending}
 				blocked={blocked}
 				errorMessage={mutation.isError ? mutation.error.message : undefined}
@@ -983,13 +956,8 @@ export function RecoverRunButton({
 	const queryClient = useQueryClient();
 	const [isOpen, setIsOpen] = useState(false);
 	const [confirmOpen, setConfirmOpen] = useState(false);
-	const [discardWork, setDiscardWork] = useState(false);
 
-	/** Close the modal and drop the force opt-in, so reopening never starts armed. */
-	const closeConfirm = () => {
-		setConfirmOpen(false);
-		setDiscardWork(false);
-	};
+	const closeConfirm = () => setConfirmOpen(false);
 
 	// The detail refetch is awaited for the reason issue #561 documents on
 	// Terminate/Reset: each mutation returns as soon as the replacement dispatch
@@ -1015,7 +983,7 @@ export function RecoverRunButton({
 	});
 
 	const resetMutation = useMutation({
-		mutationFn: (force: boolean) => trpcClient.runs.reset.mutate({ runId: run.id, force }),
+		mutationFn: () => trpcClient.runs.reset.mutate({ runId: run.id }),
 		onSuccess: async (data) => {
 			closeConfirm();
 			onResetSuccess?.(data);
@@ -1108,10 +1076,8 @@ export function RecoverRunButton({
 			<ResetConfirmModal
 				run={run}
 				open={confirmOpen}
-				discardWork={discardWork}
-				onDiscardWorkChange={setDiscardWork}
 				onClose={closeConfirm}
-				onConfirm={() => resetMutation.mutate(discardWork)}
+				onConfirm={() => resetMutation.mutate()}
 				isPending={resetMutation.isPending}
 				blocked={blocked}
 				errorMessage={resetMutation.isError ? resetMutation.error.message : undefined}

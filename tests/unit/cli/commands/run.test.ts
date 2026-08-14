@@ -15,7 +15,7 @@ const { resetRun, closeQueue, closeDb, closeCancellationRedis, RunResetError } =
 		}
 	}
 	return {
-		resetRun: vi.fn<(runId: string, options?: { force?: boolean }) => Promise<ResetRunResult>>(),
+		resetRun: vi.fn<(runId: string) => Promise<ResetRunResult>>(),
 		closeQueue: vi.fn<() => Promise<void>>(),
 		closeDb: vi.fn<() => Promise<void>>(),
 		closeCancellationRedis: vi.fn<() => Promise<void>>(),
@@ -36,14 +36,17 @@ import { run } from '@/cli/commands/run.js';
 const RUN_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_RUN_ID = '22222222-2222-4222-8222-222222222222';
 
-function resetResult(overrides: Partial<ResetRunResult> = {}): ResetRunResult {
+/** The ordinary ending; the terminal one (issue #744) is built inline by its own test. */
+type RestartedResult = Extract<ResetRunResult, { outcome: 'restarted' }>;
+
+function resetResult(overrides: Partial<RestartedResult> = {}): RestartedResult {
 	return {
+		outcome: 'restarted',
 		runId: RUN_ID,
-		forced: false,
 		dispatch: 'cancelled',
 		cancellationCleared: true,
 		worktree: { outcome: 'removed' },
-		worktreeIntent: 'reclaim',
+		worktreeError: null,
 		recoveryCleared: true,
 		abandonedPreservedWorkerId: null,
 		dispatchId: 'dispatch-9',
@@ -73,42 +76,78 @@ describe('run command', () => {
 		});
 	});
 
-	it('resets the run unforced, reports each step, and closes the connections', async () => {
+	it('resets the run, reports each step, and closes the connections', async () => {
 		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
-		expect(resetRun).toHaveBeenCalledExactlyOnceWith(RUN_ID, { force: false });
+		// Issue #744: the run id is the whole call — there is no flag to thread.
+		expect(resetRun).toHaveBeenCalledExactlyOnceWith(RUN_ID);
 		expect(closeQueue).toHaveBeenCalledOnce();
 		expect(closeDb).toHaveBeenCalledOnce();
 		expect(closeCancellationRedis).toHaveBeenCalledOnce();
 
 		const report = logged.join('\n');
+		// Stated up front, since there is no opt-in left to decline.
+		expect(report).toContain('a reset discards');
 		expect(report).toContain('dispatch: the active dispatch was cancelled');
 		expect(report).toContain('cancellation flag: cleared');
 		expect(report).toContain('checkout: removed and its lease released');
-		expect(report).toContain('restart intent: the worker holding the checkout reclaims it only');
+		expect(report).toContain('restart intent: the worker holding the checkout discards it');
 		expect(report).toContain('recovery record: cleared');
 		expect(report).toContain('re-dispatched from scratch as dispatch dispatch-9');
 	});
 
-	it('threads --force through and warns before acting', async () => {
+	it('reports a cancelled claimed dispatch and the work it discarded', async () => {
 		resetRun.mockResolvedValue(
 			resetResult({
-				forced: true,
-				dispatch: 'force-cancelled-claimed',
+				dispatch: 'cancelled-claimed',
 				worktree: { outcome: 'removed', discarded: 'dirty', staleLeaseReleased: true },
-				worktreeIntent: 'discard',
 			}),
 		);
 
-		await expect(run(['reset', RUN_ID, '--force'])).resolves.toBe(0);
-		expect(resetRun).toHaveBeenCalledExactlyOnceWith(RUN_ID, { force: true });
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
 
 		const report = logged.join('\n');
-		expect(report).toContain('discarded permanently');
-		expect(report).toContain('a worker-claimed dispatch was force-cancelled');
+		expect(report).toContain('a dispatch a worker had already claimed was cancelled');
+		// The live-agent caveat is the one thing a reset still cannot do (phase 3).
+		expect(report).toContain('is not stopped by a reset');
 		expect(report).toContain('uncommitted changes discarded as requested');
 		expect(report).toContain('a stale worktree lease no live run owned was released');
-		// The delegated half of the answer: what the worker holding the checkout will do.
-		expect(report).toContain('restart intent: the worker holding the checkout discards it');
+	});
+
+	// Issue #744: this teardown reaches only the control-plane host, so a throw is
+	// reported rather than fatal — the restart's own discard intent settles the rest.
+	it('reports a local teardown that failed and still reports the restart', async () => {
+		resetRun.mockResolvedValue(resetResult({ worktree: null, worktreeError: 'git exploded' }));
+
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
+
+		const report = logged.join('\n');
+		expect(report).toContain("checkout: this host's teardown failed — git exploded");
+		expect(report).toContain('re-dispatched from scratch as dispatch dispatch-9');
+	});
+
+	// A run nothing can be re-dispatched from is settled rather than refused, so the
+	// command reports it as an ordinary outcome and exits 0.
+	it('reports a terminally settled run as a normal outcome', async () => {
+		resetRun.mockResolvedValue({
+			outcome: 'terminated',
+			runId: RUN_ID,
+			dispatch: 'cancelled',
+			cancellationCleared: true,
+			worktree: null,
+			worktreeError: null,
+			recoveryCleared: true,
+			abandonedPreservedWorkerId: null,
+			reason: 'Reset could not restart this run: it was created without a job payload.',
+		});
+
+		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
+
+		const report = logged.join('\n');
+		expect(report).toContain('not restarted: Reset could not restart this run');
+		expect(report).toContain('recovery record: cleared');
+		// Nothing carries a restart intent when nothing restarted.
+		expect(report).not.toContain('restart intent:');
+		expect(errored).toEqual([]);
 	});
 
 	it('reports a retained checkout with its reason', async () => {
@@ -128,8 +167,10 @@ describe('run command', () => {
 		await expect(run(['reset', RUN_ID])).resolves.toBe(0);
 		const report = logged.join('\n');
 		expect(report).toContain('checkout: retained — a lease held by another live run');
-		// The operator needs the way out, not just the diagnosis.
-		expect(report).toContain('--force');
+		// The operator needs to know who settles it, not to be sent back with a flag
+		// that no longer exists (issue #744).
+		expect(report).toContain('the worker holding it discards it');
+		expect(report).not.toContain('--force');
 	});
 
 	it('reports an absent checkout and a dispatch that was not active', async () => {
@@ -159,12 +200,14 @@ describe('run command', () => {
 		// `parseArgs` throws on an unknown option rather than returning a code; the
 		// mapping to exit 1 belongs to `src/cli/index.ts`, which catches it.
 		await expect(run(['reset', RUN_ID, '--nope'])).rejects.toThrow();
+		// The removed opt-in is now one of those unknown options (issue #744).
+		await expect(run(['reset', RUN_ID, '--force'])).rejects.toThrow();
 		expect(resetRun).not.toHaveBeenCalled();
 	});
 
 	it('prints a refusal verbatim and exits 1', async () => {
-		const refusal = `Run "${RUN_ID}" is still running — terminate it first.`;
-		resetRun.mockRejectedValue(new RunResetError('running-not-forced', refusal));
+		const refusal = `Run "${RUN_ID}" is already being restarted.`;
+		resetRun.mockRejectedValue(new RunResetError('already-resetting', refusal));
 
 		await expect(run(['reset', RUN_ID])).resolves.toBe(1);
 		expect(errored.join('\n')).toContain(refusal);

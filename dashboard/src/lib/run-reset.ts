@@ -7,7 +7,7 @@
  */
 
 /** What happened to the run's active dispatch — mirrors `ResetRunResult['dispatch']`. */
-export type ResetDispatchOutcome = 'none' | 'cancelled' | 'force-cancelled-claimed';
+export type ResetDispatchOutcome = 'none' | 'cancelled' | 'cancelled-claimed';
 
 /**
  * The checkout/lease settlement the mutation reports back, mirroring
@@ -24,22 +24,15 @@ export type ResetWorktreeReport =
 	| { outcome: 'removed'; discarded?: string; staleLeaseReleased?: true }
 	| { outcome: 'blocked'; blockedReason: string };
 
-/**
- * What the replacement dispatch tells the worker holding the checkout to do with
- * it — mirrors `ResetRunResult['worktreeIntent']`. The server's own teardown only
- * reaches the control-plane host, so on a federated deployment this is what
- * actually settles the checkout.
- */
-export type ResetWorktreeIntent = 'reclaim' | 'discard';
-
-/** The per-step report `runs.reset` returns — mirrors `ResetRunResult`. */
-export interface ResetRunReport {
+/** The steps every reset reports, whatever it ends in — mirrors `ResetRunSteps`. */
+interface ResetRunSteps {
 	runId: string;
-	forced: boolean;
 	dispatch: ResetDispatchOutcome;
 	cancellationCleared: boolean;
-	worktree: ResetWorktreeReport;
-	worktreeIntent: ResetWorktreeIntent;
+	/** `null` when no local teardown was attempted (the run's project is gone). */
+	worktree: ResetWorktreeReport | null;
+	/** Why this host's teardown failed, if it did — it no longer stops the reset. */
+	worktreeError?: string | null;
 	recoveryCleared: boolean;
 	/**
 	 * The machine whose preserved checkout this reset gave up (issue #567), or null
@@ -47,21 +40,34 @@ export interface ResetRunReport {
 	 * wait, so the report says which machine's work was discarded.
 	 */
 	abandonedPreservedWorkerId?: string | null;
-	dispatchId: string;
 }
 
 /**
- * Whether a run can be reset. Reset is the last resort for a *wedged* run, so it
- * is offered exactly where the run is stuck but no longer live: a `failed` run
- * (including one whose recovery is `blocked`) and either retry-pending status —
- * `deferred`, or `checkpointed` (issue #503) — whose waiting dispatch can't get
- * it moving. A `running` run should be terminated first and a `completed` one has
- * nothing to restart — mirroring the server's own guard (`resetRun` refuses a
- * `running` run unless forced, and nothing else) so the button never offers an
- * action the router would reject, nor withholds one it would accept.
+ * The per-step report `runs.reset` returns — mirrors `ResetRunResult`. Two
+ * endings since issue #744: the ordinary restart, and the terminal settlement a
+ * run that cannot be re-dispatched at all gets instead of a refusal.
+ */
+export type ResetRunReport =
+	| (ResetRunSteps & { outcome: 'restarted'; dispatchId: string })
+	| (ResetRunSteps & { outcome: 'terminated'; reason: string });
+
+/**
+ * Whether a run can be reset. Reset is the last resort for a *wedged* run, and
+ * since issue #744 the server refuses none of them: a `failed` run (including one
+ * whose recovery is `blocked`), either retry-pending status — `deferred`, or
+ * `checkpointed` (issue #503) — and a `running` row, which no longer has to be
+ * terminated first. Only `completed` is excluded, because a finished run has
+ * nothing to restart. This mirrors the server rather than deciding anything, so
+ * the button never offers an action the router would reject nor withholds one it
+ * would accept.
  */
 export function canResetRun(status: string): boolean {
-	return status === 'failed' || status === 'deferred' || status === 'checkpointed';
+	return (
+		status === 'failed' ||
+		status === 'deferred' ||
+		status === 'checkpointed' ||
+		status === 'running'
+	);
 }
 
 /**
@@ -88,14 +94,17 @@ export function resetButtonLabel(isPending: boolean, requestOutstanding = false)
  * dead-looking control.
  */
 export function describeRestartWait(): string {
-	return 'The restart was accepted and queued as a fresh dispatch. It takes effect when a worker claims it and the run turns Running — this page updates as soon as it does. If no worker ever picks it up, re-issue it from the CLI with "swarm run reset <runId>". Use "--force" only if you intend to discard dirty or unpushed work in the run’s checkout.';
+	return 'The restart was accepted and queued as a fresh dispatch. It takes effect when a worker claims it and the run turns Running — this page updates as soon as it does. If no worker ever picks it up, re-issue it from the CLI with "swarm run reset <runId>", which discards the checkout and restarts the phase exactly as this button does.';
 }
 
 /**
  * The confirmation-modal copy. It names every step the mutation performs, since
- * this is the one action that throws away state no other button touches, and
- * changes its second half with the `force` opt-in: without it a dirty/unpushed
- * checkout is retained rather than removed, with it that work is gone for good.
+ * this is the one action that throws away state no other button touches. It no
+ * longer offers a choice (issue #744) — a reset always discards — so it *states*
+ * the two consequences an operator has to weigh before confirming: the checkout
+ * goes with any uncommitted changes and unpushed commits, wherever it lives, and a
+ * dispatch a worker claimed a moment ago is cancelled without stopping the agent
+ * that dispatch may already have spawned.
  *
  * A `checkpointed` run gets the extra sentence its state earns (issue #503): reset
  * is the only action that discards the recorded checkpoint and returns the spent
@@ -107,11 +116,7 @@ export function describeRestartWait(): string {
  * — and works — whether or not the machine is reachable, so the copy has to say what
  * is being given up rather than let "restarts this phase" imply a free retry.
  */
-export function resetConfirmMessage(
-	status: string,
-	discardWork: boolean,
-	preservedMachine?: string | null,
-): string {
+export function resetConfirmMessage(status: string, preservedMachine?: string | null): string {
 	const scope =
 		status === 'checkpointed'
 			? "This cancels the run's scheduled continuation and its active dispatch"
@@ -126,9 +131,8 @@ export function resetConfirmMessage(
 	const pinned = preservedMachine
 		? ` The work preserved on ${preservedMachine} is abandoned: this run stops waiting for that machine and restarts on any available worker, and that earlier attempt's progress is lost. This works whether or not ${preservedMachine} is currently reachable.`
 		: '';
-	const work = discardWork
-		? 'Uncommitted changes and unpushed commits in the checkout are discarded permanently, on whichever worker holds it — they cannot be recovered.'
-		: 'Uncommitted changes and unpushed commits are kept: a checkout holding either is retained instead of removed.';
+	const work =
+		'Uncommitted changes and unpushed commits in the checkout are discarded permanently, on whichever worker holds it — they cannot be recovered. A dispatch a worker has just claimed is cancelled too, and that does not stop an agent process it already spawned.';
 	return `${sequence}${pinned} ${work}`;
 }
 
@@ -175,20 +179,10 @@ function describeWorktreeOutcome(worktree: ResetWorktreeReport): string {
 			return 'Checkout: removed and its lease released.';
 		}
 		case 'blocked':
-			return `Checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}. The restarted run re-checks it before provisioning.`;
+			// Since issue #744 a reset discards, so a retained checkout is one this host's
+			// settlement could not free — not one the operator declined to free.
+			return `Checkout: retained — ${describeWorktreeReason(worktree.blockedReason)}. The worker holding it discards it when it provisions the restart.`;
 	}
-}
-
-/**
- * The line naming what the *restart itself* will do to the checkout (issue #592) —
- * the half of the answer the server-side settlement cannot give, because the
- * checkout may be on a worker the control plane cannot reach. It always follows the
- * settlement line, since the intent rides every replacement dispatch.
- */
-function describeWorktreeIntent(intent: ResetWorktreeIntent): string {
-	return intent === 'discard'
-		? 'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.'
-		: 'Restart intent: the worker holding the checkout reclaims it only if it is safe to; dirty or unpushed work is retained.';
 }
 
 /**
@@ -206,9 +200,9 @@ export function describeResetResult(result: ResetRunReport): string[] {
 		case 'cancelled':
 			lines.push('Dispatch: the active dispatch was cancelled.');
 			break;
-		case 'force-cancelled-claimed':
+		case 'cancelled-claimed':
 			lines.push(
-				'Dispatch: a worker-claimed dispatch was force-cancelled — an agent process it already spawned is not stopped by a reset.',
+				'Dispatch: a dispatch a worker had already claimed was cancelled — an agent process it already spawned is not stopped by a reset.',
 			);
 			break;
 	}
@@ -217,8 +211,26 @@ export function describeResetResult(result: ResetRunReport): string[] {
 		lines.push('Cancellation flag: cleared, so the fresh attempt is not killed at startup.');
 	}
 
-	lines.push(describeWorktreeOutcome(result.worktree));
-	lines.push(describeWorktreeIntent(result.worktreeIntent));
+	if (result.worktree) {
+		lines.push(describeWorktreeOutcome(result.worktree));
+	}
+	// A teardown throw no longer stops the reset (issue #744), so it is reported: this
+	// host's checkout still wants a look, while the restart's own discard intent
+	// settles the one that was actually in the way.
+	if (result.worktreeError) {
+		lines.push(
+			`Checkout: this host's teardown failed — ${result.worktreeError}. The reset continued.`,
+		);
+	}
+	// The half of the checkout answer the server-side settlement cannot give (issue
+	// #592), because the checkout may be on a worker the control plane cannot reach.
+	// Every replacement dispatch carries the discard intent — but a reset that did not
+	// restart has no dispatch to carry it.
+	if (result.outcome === 'restarted') {
+		lines.push(
+			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
+		);
+	}
 
 	if (result.recoveryCleared) {
 		lines.push('Recovery record: cleared.');
@@ -232,7 +244,11 @@ export function describeResetResult(result: ResetRunReport): string[] {
 		);
 	}
 
-	lines.push(`Restarted: re-dispatched from scratch as dispatch ${result.dispatchId}.`);
+	lines.push(
+		result.outcome === 'terminated'
+			? `Not restarted: ${result.reason}`
+			: `Restarted: re-dispatched from scratch as dispatch ${result.dispatchId}.`,
+	);
 
 	return lines;
 }
