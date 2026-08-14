@@ -316,6 +316,15 @@ describe('toQueuedRuns', () => {
 		expect(item.runsAt).toBeUndefined();
 	});
 
+	// Issue #759: the second event-woken pending wait. It is eligible now but nothing
+	// picks it up until the task's current phase settles, so it must read as `blocked`
+	// rather than `waiting`.
+	it('maps a task-in-flight wait to the blocked state with its wait reason', () => {
+		const [item] = toQueuedRuns([makeDispatch({ waitReason: 'task-in-flight' })]);
+		expect(item).toMatchObject({ state: 'blocked', waitReason: 'task-in-flight' });
+		expect(item.runsAt).toBeUndefined();
+	});
+
 	it('carries the dispatch continuation flag and exact availability timestamp through', () => {
 		const [continuationItem] = toQueuedRuns([
 			makeDispatch({ continuation: true, availableAt: new Date(1_700_000_030_000) }),

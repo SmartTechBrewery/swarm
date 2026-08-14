@@ -132,8 +132,9 @@ export type QueuedBoardOutcome = z.infer<typeof queuedBoardOutcomeSchema>;
 /**
  * The queue-facing state of a waiting dispatch (mirrors
  * `PendingJobStateSchema`, issue #284): `waiting`/`prioritized` for
- * eligible-now work, `blocked` for a dispatch waiting on a free project slot,
- * `delayed` for a scheduled retry/recheck.
+ * eligible-now work, `blocked` for a dispatch an event has to wake — a free
+ * project slot, or the task's own checkout freeing (issue #759) — `delayed` for a
+ * scheduled retry/recheck.
  */
 export const queuedRunStateSchema = z.enum(['waiting', 'prioritized', 'delayed', 'blocked']);
 export type QueuedRunState = z.infer<typeof queuedRunStateSchema>;
@@ -152,6 +153,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'worker-eligibility',
 	'worker-authorization',
 	'preserved-worker',
+	'task-in-flight',
 	'manual-retry',
 	'recovered',
 ]);

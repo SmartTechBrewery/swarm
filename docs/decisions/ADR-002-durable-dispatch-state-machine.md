@@ -27,9 +27,10 @@ locks and queue transport but is never the only durable record of dispatch inten
 ```
                        ┌──────────────────────────────┐
    create (outbox) ───▶│           pending            │◀────────┐
-                       └──────────────┬───────────────┘         │
-                          claim       │                         │ capacity re-defer /
-                          (worker)    ▼                         │ manual retry
+                       └──────────────┬───────────────┘         │ capacity /
+                          claim       │                         │ task-in-flight
+                          (worker)    │                         │ re-defer /
+                                      ▼                         │ manual retry
                        ┌──────────────────────────────┐         │
               ┌────────│            leased            │         │
               │        └──────────────┬───────────────┘         │
@@ -42,8 +43,9 @@ locks and queue transport but is never the only durable record of dispatch inten
               ▼               ▼           ▼    (rate-limit,     │
         completed          failed     retry-scheduled ──────────┘
         (also: no-trigger,            (delayed wake-up;          wake-up claims again
-        skipped-duplicate,             reconciler repairs
-        superseded)                    a lost delayed job)
+        skipped-duplicate —            reconciler repairs
+        the same phase twice,          a lost delayed job)
+        superseded)
 
         pending | retry-scheduled ──cancel──▶ cancelled   (terminal; claims refuse it)
 ```
@@ -77,6 +79,18 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   'project-capacity'`), not a separate Redis registry. A freed slot selects the next
   eligible dispatch under the existing continuation-priority policy and publishes its
   wake-up; the worker re-checks the slot on claim and re-defers if it lost the race.
+- **Phase sequencing within one task** is the second such pending wait (`wait_reason =
+  'task-in-flight'`, issue #759). Two phases must never hold the same `task-<id>`
+  checkout, and the board-driven pair deliberately share a task id (issue #498), so a
+  dispatch whose task is still executing an *earlier* phase is re-deferred to `pending`
+  and woken when that phase settles — instead of being discarded as a duplicate, which
+  is what the `taskId`-only guard used to do to the ordinary Planning → Implementation
+  progression. Same shape as the capacity wait (no attempt spent, event-woken, the
+  reconciler's republish underneath); the *same* phase arriving twice remains the
+  `skipped-duplicate` outcome, so the row never spells the two with one value. The
+  collision is read from this table (`leased`/`running` for that task, excluding the
+  asking dispatch and the worktree-less `merge-automation` kind) rather than only from
+  a worker's memory, so the verdict is not a property of where the dispatch landed.
 - **Retries.** Rate-limit/capacity/timeout/abort/delivery deferrals derive the next
   attempt's payload (session resume, PM dispatch intent, attempt counter) **inside the
   worker's settle path** and persist it on the dispatch as `retry-scheduled` before any

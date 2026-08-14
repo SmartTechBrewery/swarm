@@ -34,6 +34,7 @@ import {
 	type DispatchWaitReason,
 	deferDispatchToPending,
 	failDispatch,
+	findExecutingDispatchForTask,
 	markDispatchRunning,
 	recordDispatchResolution,
 	scheduleDispatchRetry,
@@ -61,6 +62,7 @@ import {
 	parseDispatchPayload,
 	promoteAvailabilityWaitsForWorker,
 	promoteNextCapacityDispatch,
+	promoteTaskInFlightWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
 import { jobContinuesPreservedCheckout } from '../dispatch/preserved-worker.js';
@@ -1000,18 +1002,18 @@ async function settleDispatchRetry(
 	}
 }
 
-function deferForConcurrencyLimit(
+/**
+ * The `phase-deferred` outcome shared by `processJob`'s **pre-run** waits: a
+ * claimed dispatch handed back to `pending`, eligible immediately, woken by an
+ * event rather than a timer — a freed project slot (issue #284) or the task's own
+ * checkout freeing (issue #759) — and spending no attempt, since waiting for one of
+ * those is not a failure.
+ */
+function buildPendingDeferral(
 	job: SwarmJob,
 	trigger: TriggerResult,
-	projectId: string,
-): Extract<JobOutcome, { status: 'phase-deferred' }> | undefined {
-	const reason = `Project '${projectId}' is at its concurrent-job limit`;
-
-	logger.warn(`Phase deferred - ${phaseLabel(trigger.phase)} — project at concurrency limit`, {
-		projectId,
-		phase: trigger.phase,
-		taskId: trigger.taskId,
-	});
+	reason: string,
+): Extract<JobOutcome, { status: 'phase-deferred' }> {
 	return {
 		status: 'phase-deferred',
 		phase: trigger.phase,
@@ -1029,25 +1031,36 @@ function deferForConcurrencyLimit(
 }
 
 /**
- * Handle a job blocked by the project's concurrency limit — `processJob`'s
- * pre-run deferral path, split out so that function stays within the complexity
- * budget (the file already splits helpers this way).
+ * Hand a claimed dispatch back to `pending` under one of the two **pre-run**
+ * waits — `processJob`'s deferral path, split out so that function stays within
+ * the complexity budget (the file already splits helpers this way), and shared by
+ * both callers so a task-in-flight wait behaves exactly like a capacity wait
+ * (issue #759) rather than re-deriving half of it.
  *
- * The claimed dispatch is returned to `pending` (wait reason
- * `project-capacity`) with its exact dispatch intent persisted — PM jobs carry
- * `resumePmPhase` so a stale board status cannot deduplicate the resumed
- * phase — and is woken by a freed slot, not a timer (issue #284). Its run row
- * becomes visible immediately. SCM continuations retain their dispatch dedup
- * claim and optionally receive priority over board work.
+ * The dispatch is returned to `pending` with the caller's `waitReason` and its
+ * exact dispatch intent persisted — PM jobs carry `resumePmPhase` so a stale board
+ * status cannot deduplicate the resumed phase — and is woken by an event, not a
+ * timer (issue #284). Its run row becomes visible immediately. SCM continuations
+ * retain their dispatch dedup claim and optionally receive priority over board
+ * work; retaining that claim matters for *both* waits, since a `review` /
+ * `respond-to-ci` / `resolve-conflicts` dispatch that let its claim lapse would be
+ * refused by it on waking (issue #214) — dropped for a second reason.
+ *
+ * Returns the deferred outcome plus the now-`pending` row, so a caller that has to
+ * close a wake-up race can publish it (null when the dispatch settled elsewhere
+ * first — a cancellation, say).
  */
-async function handleConcurrencyDeferral(
+async function deferBeforeRun(
 	dispatch: DispatchRow,
 	job: SwarmJob,
 	trigger: TriggerResult,
 	project: ProjectConfig,
-): Promise<JobOutcome> {
-	const deferred = deferForConcurrencyLimit(job, trigger, project.id);
-	if (!deferred) throw new Error('Concurrency deferral must always produce a pending dispatch');
+	wait: { waitReason: DispatchWaitReason; reason: string },
+): Promise<{
+	outcome: Extract<JobOutcome, { status: 'phase-deferred' }>;
+	pending: DispatchRow | null;
+}> {
+	const deferred = buildPendingDeferral(job, trigger, wait.reason);
 
 	// Every blocked phase gets a run row now. This makes new Planning and
 	// Implementation work visible while it waits, rather than creating a row only
@@ -1065,8 +1078,7 @@ async function handleConcurrencyDeferral(
 	);
 	if (runId) deferred.runId = runId;
 
-	// Retain a concurrency-blocked SCM phase as a prioritized continuation once
-	// a slot frees.
+	// Retain a blocked SCM phase as a prioritized continuation once it can run.
 	if (isPrioritizedContinuationPhase(trigger.phase)) {
 		deferred.continuationDispatchClaimed = true;
 		deferred.pendingContinuation = project.pipeline?.prioritizeContinuations !== false;
@@ -1089,8 +1101,8 @@ async function handleConcurrencyDeferral(
 		}
 	}
 
-	// Persist the durable capacity wait *before* settling the visible run: the
-	// dispatch row is the retry intent, so a crash after this line loses nothing.
+	// Persist the durable wait *before* settling the visible run: the dispatch row
+	// is the retry intent, so a crash after this line loses nothing.
 	const pendingPayload = deriveCapacityPendingPayload(job, {
 		phase: trigger.phase,
 		runId: deferred.runId,
@@ -1098,22 +1110,106 @@ async function handleConcurrencyDeferral(
 		continuationDispatchClaimed: deferred.continuationDispatchClaimed,
 	});
 	await persistRetryPayloadOnRun(deferred.runId, pendingPayload);
-	await deferDispatchToPending(dispatch.id, {
+	const pending = await deferDispatchToPending(dispatch.id, {
 		jobPayload: pendingPayload,
-		waitReason: 'project-capacity',
+		waitReason: wait.waitReason,
 		continuation: deferred.pendingContinuation === true,
 		runId: deferred.runId,
 	});
 
-	// This pre-try/catch path must settle the visible run now. A slot deferral has
-	// no scheduled timestamp: a release, not polling, wakes it.
+	// This pre-try/catch path must settle the visible run now. Neither pre-run wait
+	// has a scheduled timestamp: an event, not polling, wakes it.
 	await finalizeFailedRun(deferred.runId, deferred, undefined);
-	return deferred;
+	return { outcome: deferred, pending };
 }
 
 /**
- * Task IDs whose phase is currently running in *this* worker process, keyed by
- * the worktree task id a phase provisions (`task-<id>`, `src/worker/git-worktree-manager.ts`).
+ * Handle a job blocked by the project's concurrency limit — woken by a freed slot
+ * (issue #284).
+ */
+async function handleConcurrencyDeferral(
+	dispatch: DispatchRow,
+	job: SwarmJob,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<JobOutcome> {
+	logger.warn(`Phase deferred - ${phaseLabel(trigger.phase)} — project at concurrency limit`, {
+		projectId: project.id,
+		phase: trigger.phase,
+		taskId: trigger.taskId,
+	});
+	const { outcome } = await deferBeforeRun(dispatch, job, trigger, project, {
+		waitReason: 'project-capacity',
+		reason: `Project '${project.id}' is at its concurrent-job limit`,
+	});
+	return outcome;
+}
+
+/**
+ * Handle a phase whose task is still executing an **earlier** phase (issue #759) —
+ * the ordinary board-driven progression "Planning finished, the card moved to
+ * ToDo", arriving while Planning is still in flight. It waits for that checkout
+ * instead of being discarded, which is what keeps the pipeline moving without an
+ * operator: two phases still never hold `task-<id>` at once, because a deferred
+ * dispatch holds no checkout and only starts once nothing is executing for the task.
+ *
+ * The wake-up comes from the settling phase itself ({@link promoteTaskInFlightWaits},
+ * in `processJob`'s `finally`). The re-check here closes the one window that ordering
+ * leaves open: the holding phase can settle — and promote — between the collision
+ * read and this row becoming `pending`, so its promotion would find nothing. Re-read
+ * after the defer, and publish our own wake-up when the task turned out to be free.
+ * That also breaks the mutual defer of two processes claiming two phases of one task
+ * within the same few milliseconds, where each sees the other's `leased` row. Either
+ * way the reconciler's idempotent republish stays underneath (a `pending` row is
+ * wakeable unless it waits on project capacity), so the wait is bounded even if this
+ * publish is lost.
+ */
+async function handleTaskInFlightDeferral(
+	dispatch: DispatchRow,
+	job: SwarmJob,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+	holdingPhase: string | null,
+): Promise<JobOutcome> {
+	// A holding dispatch whose `phase` was never recorded reads as "another phase",
+	// which is exactly what it is known to be: not this one.
+	const holding = holdingPhase ? `its ${holdingPhase} phase` : 'another phase';
+	logger.info(`Phase deferred - ${phaseLabel(trigger.phase)} — the task is running ${holding}`, {
+		projectId: project.id,
+		phase: trigger.phase,
+		holdingPhase,
+		taskId: trigger.taskId,
+	});
+	const { outcome, pending } = await deferBeforeRun(dispatch, job, trigger, project, {
+		waitReason: 'task-in-flight',
+		reason: `Task '${trigger.taskId}' is running ${holding} — waiting for that checkout to free`,
+	});
+	if (pending) {
+		try {
+			const stillExecuting = await findExecutingDispatchForTask(
+				project.id,
+				trigger.taskId,
+				dispatch.id,
+			);
+			if (!stillExecuting && !inFlightPhaseByTask.has(trigger.taskId)) {
+				await publishDispatchWakeUp(pending);
+			}
+		} catch (err) {
+			logger.warn('Could not re-check a task-in-flight wait after deferring it', {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				taskId: trigger.taskId,
+				error: describeError(err),
+			});
+		}
+	}
+	return outcome;
+}
+
+/**
+ * Which phase currently holds each task's checkout in *this* worker process,
+ * keyed by the worktree task id a phase provisions (`task-<id>`,
+ * `src/worker/git-worktree-manager.ts`).
  *
  * A single drag of a board card fires two `projects_v2_item` webhooks
  * (`reordered` + `edited`), which arrive as two jobs. The Redis dedup
@@ -1125,17 +1221,70 @@ async function handleConcurrencyDeferral(
  * existing `task-<id>` worktree and fails the (redundant) job with a hard
  * "worktree already exists" error, even though the original run completes fine.
  *
- * This in-process guard closes that window at the worktree's own granularity:
- * if a phase's worktree task id is already running here, the duplicate is
- * skipped as a no-op instead of dispatched into a collision. The check-and-add
- * is synchronous — no `await` between {@link Set.has} and {@link Set.add} — so
- * BullMQ concurrency can't interleave two callers past it. It intentionally does
- * *not* touch a stale worktree left by a previous crashed process (that's not in
- * this set); reclaiming those is issue #99's job, and surfacing the collision
- * they still cause is issue #98's. Single-worker MVP, so in-memory suffices; a
- * multi-worker deployment would need a Redis lease keyed the same way.
+ * This guard closes that window at the worktree's own granularity: nothing is
+ * dispatched into a task another phase is executing against. The check-and-set is
+ * synchronous — no `await` between {@link Map.get} and {@link Map.set}, which is
+ * why the durable leg beside it ({@link findExecutingDispatchForTask}) is awaited
+ * *before* that pair — so BullMQ concurrency can't interleave two callers past it.
+ * It intentionally does *not* touch a stale worktree left by a previous crashed
+ * process (that's not in this map); reclaiming those is issue #99's job, and
+ * surfacing the collision they still cause is issue #98's.
+ *
+ * **It records the phase, not just the task, because a shared `taskId` across
+ * sequential phases is expected rather than a smell** (issue #759). Planning and
+ * Implementation *must* share one id: they work in the same `task-<id>` checkout on
+ * the same `issue-<n>` branch, so giving Planning its own would put the plan
+ * somewhere Implementation does not read (issue #498, ai/RULES.md §2). The
+ * PR-driven phases suffix theirs (`<pr>-respond`, `<pr>-conflicts`, `<pr>-ci` —
+ * `src/triggers/handlers/respond-to-review.ts`) for the opposite reason: they run
+ * *alongside* a Review holding `task-<pr>`. So same task + same phase is a repeated
+ * delivery and is dropped; same task + a *different* phase is the pipeline
+ * advancing, and waits (`task-in-flight`) until the checkout frees.
  */
-const inFlightTaskIds = new Set<string>();
+const inFlightPhaseByTask = new Map<string, TriggerPhase>();
+
+/**
+ * Claim this task's checkout for the phase about to run, or report the phase
+ * already holding it (issue #759).
+ *
+ * Two legs, in this order, because both are load-bearing:
+ *
+ * 1. The **durable** record ({@link findExecutingDispatchForTask}) — awaited first
+ *    so the in-memory pair below stays synchronous. It is what makes the verdict
+ *    independent of which worker the dispatch was routed to, which the in-memory
+ *    map alone never was ("already running in *this* worker").
+ * 2. The **in-process** map, read and written with nothing awaited in between,
+ *    which is what closes the same-process BullMQ-concurrency window the durable
+ *    read cannot: two jobs claimed milliseconds apart are both `leased` with no
+ *    `phase` recorded yet.
+ *
+ * A failed durable read is logged and treated as *no* collision: failing closed
+ * would turn a DB hiccup back into the drop-or-stall this guard exists to remove,
+ * and the provision-time worktree-lease gate (issues #367/#427) is still underneath.
+ */
+async function claimTaskForPhase(
+	projectId: string,
+	trigger: TriggerResult,
+	dispatchId: string,
+): Promise<{ claimed: true } | { claimed: false; holdingPhase: string | null }> {
+	let executing: { id: string; phase: string | null } | undefined;
+	try {
+		executing = await findExecutingDispatchForTask(projectId, trigger.taskId, dispatchId);
+	} catch (err) {
+		logger.warn('Could not read the executing dispatch for this task (assuming none)', {
+			projectId,
+			taskId: trigger.taskId,
+			phase: trigger.phase,
+			error: describeError(err),
+		});
+	}
+	// Synchronous from here to the `set` below.
+	const holding = inFlightPhaseByTask.get(trigger.taskId);
+	if (holding !== undefined) return { claimed: false, holdingPhase: holding };
+	if (executing) return { claimed: false, holdingPhase: executing.phase };
+	inFlightPhaseByTask.set(trigger.taskId, trigger.phase);
+	return { claimed: true };
+}
 
 /**
  * Resolve the model for a phase, walking a four-tier fallback chain (most to
@@ -3275,19 +3424,39 @@ export async function processJob(
 		};
 	}
 
-	// A duplicate webhook (or a delayed retry) that resolved to a phase whose
-	// worktree task is already running here would collide on `task-<id>`; skip it
-	// rather than dispatch into that collision. See `inFlightTaskIds`.
-	if (inFlightTaskIds.has(trigger.taskId)) {
-		logger.debug('Skipping phase — its worktree task is already running in this worker', {
+	// Nothing may be dispatched into a task another phase is executing against: the
+	// two would collide on the `task-<id>` checkout. Which of the two collisions this
+	// is decides what happens (issue #759, see `claimTaskForPhase`):
+	//
+	// - **The same phase** — a duplicate webhook, or a delayed retry that outlived
+	//   the status dedup's TTL. The work is genuinely redundant, so it is dropped as
+	//   `skipped-duplicate`, exactly as before.
+	// - **A different phase** — the pipeline advancing through one shared checkout.
+	//   `taskId` is deliberately shared by the sequential board-driven pair (issue
+	//   #498), so "Planning finished, the operator moved the card to ToDo" lands here
+	//   while Planning may still be in flight — queued *and* executing time, which on
+	//   issue #754 was over twelve minutes. That waits for the checkout and then runs.
+	const taskClaim = await claimTaskForPhase(project.id, trigger, dispatch.id);
+	if (!taskClaim.claimed) {
+		if (taskClaim.holdingPhase !== trigger.phase) {
+			return handleTaskInFlightDeferral(dispatch, job, trigger, project, taskClaim.holdingPhase);
+		}
+		const reason = `The ${phaseLabel(trigger.phase)} phase is already in flight for task '${trigger.taskId}'`;
+		logger.info('Skipping phase — the same phase is already in flight for this task', {
 			projectId: project.id,
 			phase: trigger.phase,
 			taskId: trigger.taskId,
 		});
+		// A dispatch that already waited as `task-in-flight` carries a run row; leaving
+		// it `deferred` behind a terminal dispatch would have the startup backfill
+		// resurrect it, so settle it with the same stated reason the automation-label
+		// gate above uses.
+		if (job.runId) {
+			await finalizeRun(job.runId, { status: 'failed', error: reason });
+		}
 		await tryCompleteDispatch(dispatch.id, 'skipped-duplicate');
 		return { status: 'skipped-in-flight', phase: trigger.phase, taskId: trigger.taskId };
 	}
-	inFlightTaskIds.add(trigger.taskId);
 	let slot: SlotAcquisition = { acquired: true, tracked: false };
 
 	let runId: string | undefined;
@@ -3530,6 +3699,16 @@ export async function processJob(
 		if (claimedWorkerId) {
 			await promoteAvailabilityWaitsForWorker(claimedWorkerId, 'capacity-freed');
 		}
-		inFlightTaskIds.delete(trigger.taskId);
+		// The task's checkout is free again — success, failure, cancellation, or
+		// deferral alike — so start whatever was waiting for exactly that (issue #759).
+		// Order matters both ways: delete first, so a woken dispatch cannot read a stale
+		// holder out of the map; and promote from the `finally`, because by now every
+		// settle path (`tryCompleteDispatch`, `failDispatch`, `cancelClaimedDispatch`,
+		// `settleDispatchRetry`, and the capacity `deferDispatchToPending`) has already
+		// left `leased`/`running`, so the woken dispatch's durable read no longer sees
+		// this one. Fully swallowed inside the promotion — a queue hiccup must never fail
+		// a settled run.
+		inFlightPhaseByTask.delete(trigger.taskId);
+		await promoteTaskInFlightWaits(project.id, trigger.taskId);
 	}
 }

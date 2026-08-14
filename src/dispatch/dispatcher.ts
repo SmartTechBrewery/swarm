@@ -21,6 +21,7 @@ import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
+	listTaskInFlightWaits,
 	promoteDispatchToImmediateWake,
 	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
@@ -221,6 +222,47 @@ export async function promoteNextCapacityDispatch(
 			projectId,
 			error: describeError(err),
 		});
+	}
+}
+
+/**
+ * After a phase settles, wake whatever was waiting for *that task's* checkout to
+ * free (issue #759) — the task-level sibling of {@link promoteNextCapacityDispatch},
+ * and the wake-up that turns the in-flight collision guard from a silent drop into
+ * a sequenced hand-off.
+ *
+ * No re-dating is needed (unlike {@link promoteAvailabilityWaitsForWorker}): these
+ * are `pending` rows already eligible now, whose wake-up was never published, so
+ * one delay-0 publish under the row's deterministic wake id is enough and a repeat
+ * is a queue no-op. A woken dispatch re-runs the guard on claim and re-defers if it
+ * lost the race.
+ *
+ * Best-effort and fully swallowed, exactly like the capacity promotion: it runs off
+ * a settled run, which a queue hiccup must never fail — the reconciler's periodic
+ * republish (`pending` rows are wakeable unless they wait on project capacity) is
+ * the safety net.
+ */
+export async function promoteTaskInFlightWaits(projectId: string, taskId: string): Promise<number> {
+	try {
+		const waiting = await listTaskInFlightWaits(projectId, taskId);
+		if (waiting.length === 0) return 0;
+		for (const dispatch of waiting) {
+			await publishDispatchWakeUp(dispatch);
+		}
+		logger.debug('dispatch: task freed — woke phases waiting for its checkout', {
+			projectId,
+			taskId,
+			promoted: waiting.length,
+			phases: waiting.map((row) => row.phase ?? row.id),
+		});
+		return waiting.length;
+	} catch (err) {
+		logger.warn('dispatch: task-in-flight promotion failed', {
+			projectId,
+			taskId,
+			error: describeError(err),
+		});
+		return 0;
 	}
 }
 

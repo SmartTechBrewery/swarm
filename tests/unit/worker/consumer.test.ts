@@ -197,6 +197,7 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 }));
 const promoteNextCapacityDispatch = vi.fn(async (_projectId: string, _prioritize?: boolean) => {});
 const promoteAvailabilityWaitsForWorker = vi.fn(async (_workerId: string, _cause: string) => 0);
+const promoteTaskInFlightWaits = vi.fn(async (_projectId: string, _taskId: string) => 0);
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	DISPATCH_LEASE_OWNER: 'test-host:1',
@@ -211,6 +212,8 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 		promoteAvailabilityWaitsForWorker(workerId, cause),
 	promoteNextCapacityDispatch: (projectId: string, prioritize?: boolean) =>
 		promoteNextCapacityDispatch(projectId, prioritize),
+	promoteTaskInFlightWaits: (projectId: string, taskId: string) =>
+		promoteTaskInFlightWaits(projectId, taskId),
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
 }));
 
@@ -222,6 +225,13 @@ const markDispatchRunning = vi.fn(
 		true,
 );
 const recordDispatchResolution = vi.fn(async (_id: string, _taskId: string, _phase: string) => {});
+const findExecutingDispatchForTask = vi.fn(
+	async (
+		_projectId: string,
+		_taskId: string,
+		_excludeDispatchId?: string,
+	): Promise<{ id: string; phase: string | null } | undefined> => undefined,
+);
 const deferDispatchToPending = vi.fn(async (_id: string, _input: unknown) => mockDispatchRow({}));
 const scheduleDispatchRetry = vi.fn(
 	async (_id: string, input: { jobPayload: Record<string, unknown> }) => ({
@@ -253,6 +263,8 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	) => markDispatchRunning(id, runId, leaseUntil, t, p),
 	recordDispatchResolution: (id: string, taskId: string, phase: string) =>
 		recordDispatchResolution(id, taskId, phase),
+	findExecutingDispatchForTask: (projectId: string, taskId: string, excludeDispatchId?: string) =>
+		findExecutingDispatchForTask(projectId, taskId, excludeDispatchId),
 	deferDispatchToPending: (id: string, input: unknown) => deferDispatchToPending(id, input),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
@@ -688,12 +700,15 @@ describe('processJob', () => {
 		createAndPublishDispatch.mockResolvedValue({ dispatch: mockDispatchRow({}), created: true });
 		promoteNextCapacityDispatch.mockClear();
 		promoteAvailabilityWaitsForWorker.mockClear();
+		promoteTaskInFlightWaits.mockClear();
 		publishDispatchWakeUp.mockClear();
 		completeDispatch.mockClear();
 		failDispatch.mockClear();
 		cancelClaimedDispatch.mockClear();
 		markDispatchRunning.mockClear();
 		recordDispatchResolution.mockClear();
+		findExecutingDispatchForTask.mockClear();
+		findExecutingDispatchForTask.mockResolvedValue(undefined);
 		deferDispatchToPending.mockClear();
 		scheduleDispatchRetry.mockClear();
 		claimWorkerForDispatch.mockClear();
@@ -3647,6 +3662,12 @@ describe('processJob', () => {
 		// while the first run still holds the `task-<id>` worktree — the second
 		// `provision()` then failed with "worktree already exists". The guard skips
 		// the duplicate instead.
+		//
+		// Issue #759 split that verdict in two. A collision on the *same* phase is
+		// still the duplicate above; a collision on a *different* phase is the pipeline
+		// advancing through the checkout the board-driven pair deliberately shares
+		// (Planning → Implementation, one `task-<id>` and one `issue-<n>` branch), so it
+		// waits as `task-in-flight` and runs when the checkout frees.
 
 		it('skips a duplicate dispatch for a task already running here, without running the phase twice', async () => {
 			// Park the first run's phase on a gate so it stays "in flight" while the
@@ -3725,6 +3746,177 @@ describe('processJob', () => {
 
 			release?.();
 			await first;
+		});
+
+		// Issue #759's regression: the board-driven pair share one `taskId` on purpose,
+		// so this collision is the pipeline advancing, not a repeated delivery.
+		it('defers a different phase of the same task instead of dropping it as a duplicate', async () => {
+			let release: (() => void) | undefined;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			phaseImpl = async () => {
+				await gate;
+				return { agent: agentResult() };
+			};
+
+			const workItem = createMockWorkItem();
+			const planning = processJob(
+				createMockPmWebhookJob(),
+				registryReturning({ phase: 'planning', taskId: '17', workItem }),
+			);
+			await new Promise((r) => setTimeout(r, 0));
+
+			const implementation = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning({ phase: 'implementation', taskId: '17', workItem }),
+			);
+
+			expect(implementation).toMatchObject({
+				status: 'phase-deferred',
+				phase: 'implementation',
+				taskId: '17',
+			});
+			// It waited rather than running into Planning's checkout.
+			expect(phaseCalls).toHaveLength(1);
+			expect(deferDispatchToPending).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({ waitReason: 'task-in-flight' }),
+			);
+			// `skipped-duplicate` stays reserved for a repeated delivery of one phase.
+			expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
+			// The wait is visible while it waits, not silently terminal.
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'deferred',
+					error: expect.stringContaining('planning'),
+				}),
+			);
+
+			release?.();
+			await planning;
+
+			// Planning settling is what wakes it — no operator action, no timer.
+			expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17');
+		});
+
+		it('wakes the task-in-flight waits when the holding phase fails or defers, not only on success', async () => {
+			phaseImpl = async () => {
+				throw new Error('boom');
+			};
+			const failed = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			expect(failed.status).toBe('phase-failed');
+			expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17');
+
+			promoteTaskInFlightWaits.mockClear();
+			acquireProjectSlot.mockResolvedValue({ acquired: false });
+			const deferred = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+			expect(deferred.status).toBe('phase-deferred');
+			expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17');
+		});
+
+		it('finalizes a run row carried by a dropped duplicate instead of leaving it deferred', async () => {
+			let release: (() => void) | undefined;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			phaseImpl = async () => {
+				await gate;
+				return { agent: agentResult() };
+			};
+
+			const first = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+			await new Promise((r) => setTimeout(r, 0));
+
+			// A dispatch that already waited once carries the run row of that wait.
+			const second = await processJob(
+				createMockScmWebhookJob({ runId: 'run-9' }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(second.status).toBe('skipped-in-flight');
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-9',
+				expect.objectContaining({
+					status: 'failed',
+					error: expect.stringContaining('already in flight'),
+				}),
+			);
+
+			release?.();
+			await first;
+		});
+
+		// The durable leg: the verdict must not depend on which worker the dispatch was
+		// routed to, so a collision recorded on the dispatch table counts even when this
+		// process's own map knows nothing about the task.
+		describe('durable collision read (routing-independent)', () => {
+			it('defers when another worker is executing a different phase of the task', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'planning' });
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning({
+						phase: 'implementation',
+						taskId: '17',
+						workItem: createMockWorkItem(),
+					}),
+				);
+
+				expect(outcome.status).toBe('phase-deferred');
+				expect(phaseCalls).toHaveLength(0);
+				expect(deferDispatchToPending).toHaveBeenCalledWith(
+					'dispatch-1',
+					expect.objectContaining({ waitReason: 'task-in-flight' }),
+				);
+				// The asking dispatch is excluded — it is already `leased` with its own
+				// task/phase recorded and would otherwise find itself.
+				expect(findExecutingDispatchForTask).toHaveBeenCalledWith(PROJECT.id, '17', 'dispatch-1');
+			});
+
+			it('drops it as a duplicate when the executing phase is the same one', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+			});
+
+			it('defers rather than drops when the executing row recorded no phase', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: null });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-deferred');
+				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
+			});
+
+			it('dispatches normally when the durable read finds nothing or fails', async () => {
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+				expect(outcome.status).toBe('phase-succeeded');
+
+				findExecutingDispatchForTask.mockRejectedValue(new Error('db down'));
+				const afterFailure = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+				expect(afterFailure.status).toBe('phase-succeeded');
+			});
 		});
 	});
 

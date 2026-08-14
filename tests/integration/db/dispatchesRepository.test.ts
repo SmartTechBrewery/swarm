@@ -16,6 +16,7 @@ import {
 	failDispatch,
 	failExpiredDispatchLeases,
 	failSupersededWorkerDispatchClaims,
+	findExecutingDispatchForTask,
 	getActiveDispatchByRunId,
 	getDispatchById,
 	getWorkerDispatchClaimState,
@@ -23,6 +24,7 @@ import {
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
 	listRunnableDispatchesForPool,
+	listTaskInFlightWaits,
 	listWaitingDispatches,
 	listWakeablePendingDispatches,
 	markDispatchRunning,
@@ -46,6 +48,7 @@ import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { projects } from '../../../src/db/schema/projects.js';
 import { describeError } from '../../../src/lib/errors.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
+import type { TriggerPhase } from '../../../src/triggers/types.js';
 import { createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
@@ -61,12 +64,16 @@ function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
 /** States only reachable by actually executing the dispatch. */
 const EXECUTED_STATES: readonly DispatchState[] = ['running', 'completed', 'failed'];
 
-/** A review dispatch for `taskId`, driven to `state` through the real transitions. */
+/**
+ * A dispatch for `taskId` (a review one unless `phase` says otherwise), driven to
+ * `state` through the real transitions. Returns its id so a caller can exclude it.
+ */
 async function seedDispatchInState(
 	taskId: string,
 	state: DispatchState,
 	runId: string | undefined,
-): Promise<void> {
+	phase: TriggerPhase = 'review',
+): Promise<string> {
 	// `createDispatch` can start a row directly in any waiting/leased state;
 	// everything past that is reached through the real lifecycle calls.
 	const { dispatch } = await createDispatch({
@@ -74,17 +81,18 @@ async function seedDispatchInState(
 		jobPayload: job({ runId }),
 		source: 'manual',
 		taskId,
-		phase: 'review',
+		phase,
 		runId,
 		state: state === 'leased' || state === 'retry-scheduled' ? state : 'pending',
 	});
 	if (state === 'cancelled') await cancelWaitingDispatch(dispatch.id, 'cleared the queue');
 	if (EXECUTED_STATES.includes(state)) {
 		await claimDispatch(dispatch.id, OWNER, 60_000);
-		await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), taskId, 'review');
+		await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), taskId, phase);
 	}
 	if (state === 'completed') await completeDispatch(dispatch.id, 'phase-succeeded');
 	if (state === 'failed') await failDispatch(dispatch.id, 'boom');
+	return dispatch.id;
 }
 
 describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (integration)', () => {
@@ -233,6 +241,119 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			await seedDispatchInState(TASK, 'running', runId);
 			expect(await hasExecutingDispatchForTask(PROJECT_ID, '78')).toBe(false);
 			expect(await hasExecutingDispatchForTask('proj-other', TASK)).toBe(false);
+		});
+	});
+
+	// Issue #759. The guard needs *which* phase holds the task, not merely whether one
+	// does: the board-driven pair share a task id on purpose, so a same-phase collision
+	// is a repeated delivery while a different-phase one is the pipeline advancing.
+	describe('findExecutingDispatchForTask (issue #759)', () => {
+		const TASK = '754';
+
+		it.each([
+			'leased',
+			'running',
+		] as const)('reports a %s dispatch together with the phase it holds', async (state) => {
+			await seedDispatchInState(TASK, state, undefined, 'planning');
+			expect(await findExecutingDispatchForTask(PROJECT_ID, TASK)).toMatchObject({
+				phase: 'planning',
+			});
+		});
+
+		it.each([
+			'pending',
+			'retry-scheduled',
+			'completed',
+			'failed',
+			'cancelled',
+		] as const)('ignores a %s dispatch — it owns no checkout', async (state) => {
+			await seedDispatchInState(TASK, state, undefined, 'planning');
+			expect(await findExecutingDispatchForTask(PROJECT_ID, TASK)).toBeUndefined();
+		});
+
+		it('ignores the asking dispatch, which is already leased with its own phase recorded', async () => {
+			const own = await seedDispatchInState(TASK, 'leased', undefined, 'implementation');
+			expect(await findExecutingDispatchForTask(PROJECT_ID, TASK, own)).toBeUndefined();
+			expect(await findExecutingDispatchForTask(PROJECT_ID, TASK)).toMatchObject({ id: own });
+		});
+
+		it('ignores a merge-automation dispatch — it carries a taskId but provisions no worktree', async () => {
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'synthetic',
+				taskId: TASK,
+				phase: 'merge-automation',
+				state: 'leased',
+			});
+			expect(await findExecutingDispatchForTask(PROJECT_ID, TASK)).toBeUndefined();
+		});
+
+		it('still reports an executing row whose phase was never recorded', async () => {
+			// `IS DISTINCT FROM` rather than `ne`: SQL `NULL <> 'merge-automation'` is
+			// unknown, which would drop exactly the row the caller must treat as "some
+			// other phase" and therefore defer behind.
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: TASK,
+				state: 'leased',
+			});
+			expect(await findExecutingDispatchForTask(PROJECT_ID, TASK)).toEqual({
+				id: dispatch.id,
+				phase: null,
+			});
+		});
+
+		it('scopes to the given project and task', async () => {
+			await seedDispatchInState(TASK, 'running', undefined, 'planning');
+			expect(await findExecutingDispatchForTask(PROJECT_ID, '755')).toBeUndefined();
+			expect(await findExecutingDispatchForTask('proj-other', TASK)).toBeUndefined();
+		});
+	});
+
+	describe('listTaskInFlightWaits (issue #759)', () => {
+		const TASK = '754';
+
+		async function seedWait(overrides: Partial<Parameters<typeof createDispatch>[0]> = {}) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: TASK,
+				phase: 'implementation',
+				waitReason: 'task-in-flight',
+				...overrides,
+			});
+			return dispatch;
+		}
+
+		it('returns the pending task-in-flight waits for the task, oldest availability first', async () => {
+			const later = await seedWait({ availableAt: new Date(Date.now() - 1_000) });
+			const earlier = await seedWait({ availableAt: new Date(Date.now() - 10_000) });
+
+			const waits = await listTaskInFlightWaits(PROJECT_ID, TASK);
+			expect(waits.map((row) => row.id)).toEqual([earlier.id, later.id]);
+		});
+
+		it('excludes other wait reasons, other tasks, other projects, and non-pending rows', async () => {
+			const wanted = await seedWait();
+			await seedWait({ waitReason: 'project-capacity' });
+			await seedWait({ taskId: '755' });
+			await seedWait({ state: 'leased' });
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other' });
+			await createDispatch({
+				projectId: 'proj-other',
+				jobPayload: job({ projectId: 'proj-other' }),
+				source: 'webhook',
+				taskId: TASK,
+				phase: 'implementation',
+				waitReason: 'task-in-flight',
+			});
+
+			const waits = await listTaskInFlightWaits(PROJECT_ID, TASK);
+			expect(waits.map((row) => row.id)).toEqual([wanted.id]);
 		});
 	});
 
