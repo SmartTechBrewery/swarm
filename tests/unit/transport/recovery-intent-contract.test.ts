@@ -17,10 +17,12 @@
  * a deliberately preserved checkout and re-doing work from zero — a 0% recovery
  * rate against 162/168 ordinary runs completing the same week.
  *
- * So this file walks that path and asserts the intent survives it, with two cases
+ * So this file walks that path and asserts the intent survives it, with three cases
  * driven by `Object.keys(RecoveryIntentSchema.shape)` rather than a hand-written
  * list: a member added to the intent and *not* carried through fails here rather
- * than degrading to "this attempt has no recovery intent".
+ * than degrading to "this attempt has no recovery intent" — and, since issue #741,
+ * a member that cannot be *dropped* fails here too, because the one operation whose
+ * contract is to carry none of the intent (a reset) had been inheriting it.
  *
  * **What it does and does not span.** It calls `phaseRecoveryFromAssignment`
  * directly, which is the whole of what `buildDbFreePhaseInputs` does with the
@@ -41,6 +43,7 @@ import {
 	RecoveryIntentSchema,
 	recoveryIntentFromJob,
 	type SwarmJob,
+	stripRecoveryIntent,
 } from '@/queue/jobs.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import { type TaskAssignment, TaskAssignmentSchema } from '@/transport/protocol.js';
@@ -170,6 +173,28 @@ describe('recovery intent: job → assignment → wire → phase inputs', () => 
 				`TaskAssignmentSchema drops '${member}' — spread RecoveryIntentSchema.shape rather than restating members`,
 			).toHaveProperty(member, intent[member as keyof RecoveryIntent]);
 		}
+	});
+
+	/**
+	 * The mirror of that gate, for the one operation whose contract is that it carries
+	 * **none** of the intent (issue #741). "Reset & restart" restarts a phase as if it
+	 * had never run, and it was built by the manual-retry builder, which inherits the
+	 * intent on purpose — so a stored `implementationBranchProvisioned` survived every
+	 * reset and each restart re-provisioned against a branch that did not exist. Driven
+	 * by the schema's own keys for the same reason as the case above: the next latch
+	 * added to the intent has to be droppable by Reset too.
+	 */
+	it('lets a reset drop every member of RecoveryIntentSchema', () => {
+		const stripped = stripRecoveryIntent(FULLY_POPULATED_JOB);
+
+		const retained = Object.keys(RecoveryIntentSchema.shape).filter((m) => m in stripped);
+		expect(
+			retained,
+			`stripRecoveryIntent keeps ${retained.join(', ')} — a member added to the intent must also be dropped by a reset, or a stored latch outlives the restart meant to clear it`,
+		).toEqual([]);
+		// Only the intent goes: the job it belongs to is otherwise carried through.
+		expect(stripped.projectId).toBe(FULLY_POPULATED_JOB.projectId);
+		expect(stripped.type).toBe(FULLY_POPULATED_JOB.type);
 	});
 
 	/**

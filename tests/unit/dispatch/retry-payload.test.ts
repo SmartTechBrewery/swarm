@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	deriveCapacityPendingPayload,
 	deriveRetryJobPayload,
+	reconstructResetJob,
 	reconstructRetryJob,
 } from '@/dispatch/retry-payload.js';
 import type { SwarmJob } from '@/queue/jobs.js';
@@ -428,5 +429,116 @@ describe('reconstructRetryJob', () => {
 		);
 
 		expect(job.recoveryMode).toBe('fresh');
+	});
+});
+
+// Issue #741. Reset used to be built by `reconstructRetryJob`, which inherits recovery
+// intent on purpose — so a stored `implementationBranchProvisioned` survived every reset
+// of run 2d3df9b3 and each restart re-provisioned with `createBranch: false` against a
+// branch that no longer existed. A reset's payload is a *first attempt*.
+describe('reconstructResetJob', () => {
+	const STORED_SESSION = '92340ec7-709e-4ffa-9297-3899caca4830';
+	const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+	/** The reported run's stored payload: every resume latch set at once. */
+	const latched = () =>
+		createMockScmWebhookJob({
+			agentSessionId: STORED_SESSION,
+			resumeSession: true,
+			resumeDelivery: true,
+			implementationBranchProvisioned: true,
+			recoveryMode: 'resume',
+		});
+
+	it('drops every resume latch the stored payload carried', () => {
+		const job = reconstructResetJob(latched(), 'run-1', 'implementation');
+
+		expect(job.resumeSession).toBeUndefined();
+		expect(job.resumeDelivery).toBeUndefined();
+		// The reported failure: kept, this provisions with `createBranch: false`.
+		expect(job.implementationBranchProvisioned).toBeUndefined();
+		expect(job.recoveryMode).toBeUndefined();
+		// A fresh session is *assigned*, so the id `claude` already opened one under is
+		// never handed back to it.
+		expect(job.agentSessionId).toMatch(UUID);
+		expect(job.agentSessionId).not.toBe(STORED_SESSION);
+	});
+
+	// The difference between the two builders, stated as a test: `reconstructRetryJob`
+	// deliberately keeps a stored `'checkpoint'`/`'fresh'` (a retry may adopt a preserved
+	// checkout); a reset restarts the phase, so it inherits neither.
+	it('inherits no stored recovery mode, including the ones a manual retry keeps', () => {
+		for (const stored of ['checkpoint', 'fresh', 'resume', 'discard'] as const) {
+			const job = reconstructResetJob(
+				createMockScmWebhookJob({ recoveryMode: stored }),
+				'run-2',
+				'implementation',
+			);
+
+			expect(job.recoveryMode, `a reset inherited a stored '${stored}'`).toBeUndefined();
+		}
+	});
+
+	// The mode is applied after the strip, so the forced reset's own discard intent —
+	// the only way a checkout on another worker is reached (issue #592) — survives.
+	it("sets the reset's own 'discard' intent when the caller asks for one", () => {
+		const job = reconstructResetJob(latched(), 'run-3', 'implementation', 'discard');
+
+		expect(job.recoveryMode).toBe('discard');
+		expect(job.resumeSession).toBeUndefined();
+		expect(job.implementationBranchProvisioned).toBeUndefined();
+	});
+
+	it('carries the run row and zeroes the rate-limit budget', () => {
+		const job = reconstructResetJob(
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 4 }),
+			'run-4',
+			'review',
+		);
+
+		expect(job.runId).toBe('run-4');
+		expect(job.rateLimitRetryAttempt).toBe(0);
+	});
+
+	// Dispatch intent, not resumption: the card has already moved to In progress, so
+	// without this the restart would not be recognised as that phase's dispatch. It makes
+	// the run adopt no checkout, branch, or session.
+	it('keeps the board dispatch intent for a pm phase', () => {
+		const job = reconstructResetJob(
+			createMockPmWebhookJob({ implementationBranchProvisioned: true }),
+			'run-5',
+			'implementation',
+		);
+
+		expect(job.resumePmPhase).toBe('implementation');
+		expect(job.implementationBranchProvisioned).toBeUndefined();
+	});
+
+	it('upgrades a legacy pre-#385 envelope rather than re-persisting it', () => {
+		const legacy = {
+			type: 'github',
+			projectId: 'swarm',
+			event: {
+				eventType: 'issues',
+				action: 'labeled',
+				repoFullName: 'SmartTechBrewery/swarm',
+				workItemId: '42',
+				isCommentEvent: false,
+				labelName: 'swarm-replan',
+			},
+		} as unknown as SwarmJob;
+
+		const job = reconstructResetJob(legacy, 'run-6', 'planning');
+
+		expect(job).toMatchObject({ type: 'scm', providerId: 'github', event: { kind: 'work-item' } });
+	});
+
+	it('leaves the stored payload it was handed untouched', () => {
+		const stored = latched();
+
+		reconstructResetJob(stored, 'run-7', 'implementation', 'discard');
+
+		expect(stored.implementationBranchProvisioned).toBe(true);
+		expect(stored.agentSessionId).toBe(STORED_SESSION);
 	});
 });
