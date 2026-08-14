@@ -12,6 +12,24 @@ interface QuotaWindowProps {
 	resetsAt?: string;
 }
 
+/**
+ * Urgency thresholds for the remaining-quota bar, both inclusive (issue #753).
+ *
+ * The bar reads *remaining* allowance rather than usage, so the colour steps
+ * down as the number falls: amber once 30% or less is left, rose once 10% or
+ * less is. They are named constants because the boundaries themselves are the
+ * behaviour operators read the bar by.
+ */
+const QUOTA_WARNING_REMAINING_PERCENT = 30;
+const QUOTA_CRITICAL_REMAINING_PERCENT = 10;
+
+/** The bar's curated colour for a remaining-quota percentage. */
+function quotaBarColor(remainingPercent: number): string {
+	if (remainingPercent <= QUOTA_CRITICAL_REMAINING_PERCENT) return 'bg-rose-500';
+	if (remainingPercent <= QUOTA_WARNING_REMAINING_PERCENT) return 'bg-amber-500';
+	return 'bg-emerald-500';
+}
+
 export function QuotaWindowCard({
 	name,
 	usedPercent = 0,
@@ -27,13 +45,7 @@ export function QuotaWindowCard({
 				: `${durationMins}m`
 		: '';
 
-	// Curated HSL colors matching styling rules
-	const progressColor =
-		remainingPercent > 50
-			? 'bg-emerald-500'
-			: remainingPercent > 20
-				? 'bg-amber-500'
-				: 'bg-rose-500';
+	const progressColor = quotaBarColor(remainingPercent);
 
 	const formatResetTime = (isoString?: string) => {
 		if (!isoString) return '';
@@ -58,6 +70,7 @@ export function QuotaWindowCard({
 
 			<div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
 				<div
+					data-testid="quota-bar"
 					className={`h-full ${progressColor} transition-all duration-550`}
 					style={{ width: `${remainingPercent}%` }}
 				/>

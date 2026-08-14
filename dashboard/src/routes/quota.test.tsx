@@ -11,7 +11,18 @@ vi.mock('@/lib/trpc.js', () => ({
 	trpcClient: { quota: { refreshQuotas: { mutate: vi.fn() } } },
 }));
 
-import { QuotaRouteComponent } from './quota.js';
+import { QuotaRouteComponent, QuotaWindowCard } from './quota.js';
+
+/** The colour class of every quota bar rendered, in document order. */
+function barColors(container: HTMLElement): string[] {
+	const bars = container.querySelectorAll<HTMLElement>('[data-testid="quota-bar"]');
+	if (bars.length === 0) throw new Error('no quota bar was rendered');
+	return Array.from(bars).map((bar) => {
+		const color = Array.from(bar.classList).find((name) => name.startsWith('bg-'));
+		if (!color) throw new Error(`quota bar carries no colour class: ${bar.className}`);
+		return color;
+	});
+}
 
 function renderQuotaScreen(quotas: unknown[]) {
 	quotaQueryOptions.mockReturnValue({
@@ -171,5 +182,55 @@ describe('quota route', () => {
 		renderQuotaScreen([]);
 
 		expect(await screen.findByText('No host has reported its agent CLIs yet.')).toBeTruthy();
+	});
+
+	// Issue #753: the bar reads *remaining* allowance, so both boundaries are
+	// inclusive and are asserted at the exact percentage rather than around it —
+	// 30% remaining is already a warning, 10% remaining is already critical.
+	describe('quota bar urgency thresholds', () => {
+		it.each([
+			{ remaining: 100, usedPercent: 0, color: 'bg-emerald-500' },
+			{ remaining: 31, usedPercent: 69, color: 'bg-emerald-500' },
+			{ remaining: 30, usedPercent: 70, color: 'bg-amber-500' },
+			{ remaining: 11, usedPercent: 89, color: 'bg-amber-500' },
+			{ remaining: 10, usedPercent: 90, color: 'bg-rose-500' },
+			{ remaining: 0, usedPercent: 100, color: 'bg-rose-500' },
+		])('paints $color at $remaining% remaining', ({ remaining, usedPercent, color }) => {
+			const { container } = render(<QuotaWindowCard name="Weekly" usedPercent={usedPercent} />);
+
+			expect(screen.getByText(`${remaining}% remaining`)).toBeTruthy();
+			expect(barColors(container)).toEqual([color]);
+		});
+
+		it('applies the same thresholds to every window on the page', async () => {
+			const { container } = renderQuotaScreen([
+				{
+					host: 'builder-01',
+					cli: 'claude',
+					status: 'available',
+					source: 'live',
+					lastUpdated: '2026-08-13T08:00:00.000Z',
+					windows: [
+						{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 69 },
+						{ name: 'Session', sourceSlot: 'secondary', durationMins: 300, usedPercent: 70 },
+					],
+				},
+				{
+					host: 'builder-02',
+					cli: 'codex',
+					status: 'available',
+					source: 'live',
+					lastUpdated: '2026-08-13T09:00:00.000Z',
+					windows: [
+						{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 90 },
+					],
+				},
+			]);
+
+			await screen.findByText('Session (5h)');
+			// Every window is coloured by its own remaining percentage, whichever host
+			// or CLI reported it: 31% green, 30% amber, 10% red.
+			expect(barColors(container)).toEqual(['bg-emerald-500', 'bg-amber-500', 'bg-rose-500']);
+		});
 	});
 });
