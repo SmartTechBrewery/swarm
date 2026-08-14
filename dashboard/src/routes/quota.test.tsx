@@ -37,6 +37,22 @@ function renderQuotaScreen(quotas: unknown[]) {
 	);
 }
 
+/** The screen with a failing `getQuotas` read, so the error branch renders. */
+function renderFailedQuotaScreen(message: string) {
+	quotaQueryOptions.mockReturnValue({
+		queryKey: ['quota.getQuotas'],
+		queryFn: async () => {
+			throw new Error(message);
+		},
+	});
+	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	return render(
+		<QueryClientProvider client={queryClient}>
+			<QuotaRouteComponent />
+		</QueryClientProvider>,
+	);
+}
+
 describe('quota route', () => {
 	it('preserves non-integral durations in the window suffix', async () => {
 		renderQuotaScreen([
@@ -175,13 +191,112 @@ describe('quota route', () => {
 		expect(screen.getByText('claude binary not found on PATH')).toBeTruthy();
 		// The reporting host with nothing usable says so for itself, rather than the
 		// page reporting "no CLIs discovered" for the whole installation.
-		expect(screen.getByText('No active, usable agent CLIs on this host.')).toBeTruthy();
+		expect(screen.getByText('No quota data is available for this host.')).toBeTruthy();
 	});
 
-	it('states that no host has reported when nothing is persisted', async () => {
+	it('reports no data for any host when nothing is persisted', async () => {
 		renderQuotaScreen([]);
 
-		expect(await screen.findByText('No host has reported its agent CLIs yet.')).toBeTruthy();
+		expect(await screen.findByText('No quota data is available for any host.')).toBeTruthy();
+	});
+
+	// Issue #754: the screen reads persisted snapshots, so the freshness caveat and the
+	// refresh instruction are stated once for the page — and stated whether or not any
+	// quota data is present — instead of being repeated by each empty placeholder.
+	describe('freshness notice', () => {
+		it('shows the notice alongside populated cards', async () => {
+			renderQuotaScreen([
+				{
+					host: 'builder-01',
+					cli: 'claude',
+					status: 'available',
+					source: 'live',
+					lastUpdated: '2026-08-13T08:00:00.000Z',
+					windows: [
+						{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 40 },
+					],
+				},
+			]);
+
+			expect(await screen.findByText('Weekly (7d)')).toBeTruthy();
+			expect(screen.getByText(/may be out of date/i)).toBeTruthy();
+			expect(screen.getByText(/Use Refresh to request fresh data/i)).toBeTruthy();
+		});
+
+		it('shows the notice when there is no quota data at all', async () => {
+			renderQuotaScreen([]);
+
+			expect(await screen.findByText('No quota data is available for any host.')).toBeTruthy();
+			expect(screen.getByText(/may be out of date/i)).toBeTruthy();
+		});
+
+		it('shows the notice beside a load error, which stays distinguishable', async () => {
+			renderFailedQuotaScreen('quota read failed');
+
+			expect(await screen.findByText('Error Loading Quotas')).toBeTruthy();
+			expect(screen.getByText('quota read failed')).toBeTruthy();
+			expect(screen.getByText(/may be out of date/i)).toBeTruthy();
+		});
+	});
+
+	// Issue #754: a placeholder states only the absence — no claim that usage is tracked
+	// from run outcomes, and no second copy of the page-level refresh instruction.
+	describe('empty placeholders', () => {
+		it('states the absence for a CLI reporting no usage windows', async () => {
+			renderQuotaScreen([
+				{
+					host: 'builder-01',
+					cli: 'claude',
+					status: 'available',
+					source: 'fallback',
+					lastUpdated: '2026-08-13T08:00:00.000Z',
+					windows: [],
+				},
+			]);
+
+			expect(
+				await screen.findByText('No usage window data is available for this CLI.'),
+			).toBeTruthy();
+			expect(screen.queryByText(/tracked dynamically/i)).toBeNull();
+			expect(screen.queryByText(/from run outcomes/i)).toBeNull();
+			// The page-level notice owns the refresh instruction; the placeholders don't repeat it.
+			expect(screen.queryByText(/then click Refresh/i)).toBeNull();
+			expect(screen.queryByText(/installed and logged in/i)).toBeNull();
+		});
+
+		it('keeps an unavailable CLI marked unavailable when it reports no error detail', async () => {
+			renderQuotaScreen([
+				{
+					host: 'builder-01',
+					cli: 'codex',
+					status: 'unavailable',
+					source: 'fallback',
+					lastUpdated: '2026-08-13T08:00:00.000Z',
+				},
+			]);
+
+			expect(await screen.findByText('Unavailable')).toBeTruthy();
+			expect(screen.getByText('No error detail is available for this CLI.')).toBeTruthy();
+			// The snapshot named no cause, so the row no longer invents one.
+			expect(screen.queryByText(/missing or unauthenticated/i)).toBeNull();
+		});
+
+		it('keeps rate-limit exhaustion distinct from an ordinary absence of data', async () => {
+			renderQuotaScreen([
+				{
+					host: 'builder-01',
+					cli: 'claude',
+					status: 'available',
+					source: 'fallback',
+					lastUpdated: '2026-08-13T08:00:00.000Z',
+					resetTime: '2026-08-13T12:00:00.000Z',
+					windows: [],
+				},
+			]);
+
+			expect(await screen.findByText('Rate Limit Exhaustion Detected')).toBeTruthy();
+			expect(screen.queryByText('No usage window data is available for this CLI.')).toBeNull();
+		});
 	});
 
 	// Issue #753: the bar reads *remaining* allowance, so both boundaries are
