@@ -134,6 +134,47 @@ export const ConcurrencyAllocationSchema = z.number().int().positive();
 export const DEFAULT_CONCURRENCY_ALLOCATION = 1;
 
 /**
+ * This worker's position in the **project's** configured worker order (issue
+ * #750) — a non-negative integer read ascending, so `0` comes first. It is
+ * meaningful only *relative to the other enrollments of the same project*: it is
+ * not an identity, not a count, and comparing it across projects says nothing.
+ *
+ * Duplicates are legal rather than a defect, which is why the column carries no
+ * unique constraint. Every row an installation already had migrates to
+ * {@link DEFAULT_ENROLLMENT_ORDER_INDEX}, and two concurrent enrollments can
+ * compute the same append position; the project read
+ * (`listEnrollmentsForProject`) therefore orders by `(order_index, created_at,
+ * id)`, so a tie falls back to exactly the creation order it used before this
+ * column existed and stays deterministic.
+ */
+export const EnrollmentOrderIndexSchema = z.number().int().nonnegative();
+
+/**
+ * The position every existing enrollment migrates to, and the
+ * `worker_project_enrollments.order_index` column default. Zero for the whole
+ * table is deliberately the entire backfill: with the `(order_index, created_at,
+ * id)` read ordering, an all-zero project reads back in precisely the creation
+ * order it read in before, so an installation sees no behaviour change until
+ * somebody reorders a project (a reorder then normalizes that project's
+ * positions to a dense `0..n-1`). A *new* enrollment does not take this value —
+ * `createEnrollment` appends it after the project's current last worker, so
+ * enrolling a machine never jumps it into the middle of a configured order.
+ */
+export const DEFAULT_ENROLLMENT_ORDER_INDEX = 0;
+
+/**
+ * Which way a reorder moves a worker within its project's order (issue #750) —
+ * one step towards the front (`up`) or the back (`down`), swapping it with the
+ * neighbour it passes. Deliberately a direction rather than a target position: a
+ * client that sent an index would be stating an order it may have read before
+ * somebody else changed it, whereas a direction is re-resolved server-side
+ * against the stored order every time.
+ */
+export const WorkerOrderDirectionSchema = z.enum(['up', 'down']);
+
+export type WorkerOrderDirection = z.infer<typeof WorkerOrderDirectionSchema>;
+
+/**
  * A single worker-project enrollment. `workerId` is a `workers.id` (`uuid`);
  * `projectId` is a `projects.id` (`text`, externally supplied); `id` is the
  * enrollment row's own generated `uuid`. Unique per `(workerId, projectId)` — a
@@ -154,6 +195,8 @@ export const WorkerEnrollmentSchema = z.object({
 	allowedClis: z.array(AgentCliSchema),
 	allowedPhases: z.array(TriggerPhaseSchema),
 	concurrencyAllocation: ConcurrencyAllocationSchema,
+	/** This worker's rank within its project's order (issue #750) — see {@link EnrollmentOrderIndexSchema}. */
+	orderIndex: EnrollmentOrderIndexSchema,
 	sharingConsent: z.boolean(),
 	createdAt: z.date(),
 	updatedAt: z.date(),

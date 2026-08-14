@@ -1,0 +1,14 @@
+-- Issue #750: an enrollment now also states this worker's position in the project's
+-- configured worker order — the sequence the project roster shows and the dispatch
+-- gate prefers between otherwise-eligible workers. The column default is the whole
+-- backfill: every existing row becomes 0, and because the project read orders by
+-- (order_index, created_at, id) an all-zero project comes back in exactly the
+-- enrollment-creation order it came back in before this column existed. So no
+-- installation changes dispatch or roster behaviour until somebody actually reorders
+-- a project, which normalizes that one project's positions to a dense 0..n-1.
+--
+-- Deliberately no UNIQUE (project_id, order_index): this migration produces a whole
+-- project of duplicates, and two concurrent enrollments can compute the same append
+-- position (max(order_index) + 1). The (created_at, id) tie-break is what keeps the
+-- read deterministic instead.
+ALTER TABLE "worker_project_enrollments" ADD COLUMN "order_index" integer DEFAULT 0 NOT NULL;

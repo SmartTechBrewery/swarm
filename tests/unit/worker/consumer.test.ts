@@ -2217,6 +2217,7 @@ describe('processJob', () => {
 					allowedClis: capabilities,
 					allowedPhases: [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
 					concurrencyAllocation: 1,
+					orderIndex: 0,
 					sharingConsent: overrides.sharingConsent ?? true,
 					createdAt: new Date('2026-01-01T00:00:00Z'),
 					updatedAt: new Date('2026-01-01T00:00:00Z'),

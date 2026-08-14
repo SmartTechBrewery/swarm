@@ -10,6 +10,8 @@ const {
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
+	listProjectWorkerIdsInOrder,
+	moveProjectWorkerOrder,
 	setEnrollmentStatus,
 	setSharingConsent,
 	updateEnrollmentConstraints,
@@ -43,6 +45,8 @@ const {
 		listDashboardWorkers: vi.fn(),
 		listOwnerWorkers: vi.fn(),
 		listProjectRoster: vi.fn(),
+		listProjectWorkerIdsInOrder: vi.fn(),
+		moveProjectWorkerOrder: vi.fn(),
 		setEnrollmentStatus: vi.fn(),
 		setSharingConsent: vi.fn(),
 		updateEnrollmentConstraints: vi.fn(),
@@ -57,7 +61,7 @@ const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	listAccessibleProjectIds: vi.fn(),
 }));
 
-vi.mock('@/identity/worker-enrollment-service.js', () => ({
+vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	AllowedClisNotCapableError,
 	approveEnrollment,
 	enrollWorker,
@@ -67,9 +71,18 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	listDashboardWorkers,
 	listOwnerWorkers,
 	listProjectRoster,
+	listProjectWorkerIdsInOrder,
+	moveProjectWorkerOrder,
 	setEnrollmentStatus,
 	setSharingConsent,
 	updateEnrollmentConstraints,
+	// The router validates the reorder direction with the domain's own enum, so the
+	// mock re-exports the real schema rather than a stand-in that could drift from it.
+	WorkerOrderDirectionSchema: (
+		await vi.importActual<typeof import('@/identity/worker-enrollment.js')>(
+			'@/identity/worker-enrollment.js',
+		)
+	).WorkerOrderDirectionSchema,
 }));
 vi.mock('@/identity/worker-service.js', () => ({ getWorker, renameWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
@@ -120,6 +133,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		allowedClis: ['claude'],
 		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
+		orderIndex: 0,
 		sharingConsent: false,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
@@ -142,6 +156,8 @@ beforeEach(() => {
 		listDashboardWorkers,
 		listOwnerWorkers,
 		listProjectRoster,
+		listProjectWorkerIdsInOrder,
+		moveProjectWorkerOrder,
 		setEnrollmentStatus,
 		setSharingConsent,
 		updateEnrollmentConstraints,
@@ -152,6 +168,9 @@ beforeEach(() => {
 	]) {
 		m.mockReset();
 	}
+	// Every project-scoped list read resolves the project's worker order (issue
+	// #750); a suite that asserts on ordering states its own.
+	listProjectWorkerIdsInOrder.mockResolvedValue([]);
 });
 
 describe('workers.list (installation roster, issue #133)', () => {
@@ -191,22 +210,22 @@ describe('workers.list (installation roster, issue #133)', () => {
 	});
 });
 
-describe('workers.list ordering — the viewer’s own machines first (issue #657)', () => {
-	/** A roster row as `listDashboardWorkers` returns it, reduced to the fields ordering reads. */
-	function rosterRow(workerId: string, ownerUserId: string | null) {
-		return {
-			workerId,
-			lastSeenAt: null,
-			owner: ownerUserId
-				? {
-						userId: ownerUserId,
-						identifier: `${ownerUserId}@example.com`,
-						displayName: ownerUserId,
-					}
-				: null,
-		};
-	}
+/** A roster row as `listDashboardWorkers` returns it, reduced to the fields ordering reads. */
+function rosterRow(workerId: string, ownerUserId: string | null) {
+	return {
+		workerId,
+		lastSeenAt: null,
+		owner: ownerUserId
+			? {
+					userId: ownerUserId,
+					identifier: `${ownerUserId}@example.com`,
+					displayName: ownerUserId,
+				}
+			: null,
+	};
+}
 
+describe('workers.list ordering — the viewer’s own machines first (issue #657)', () => {
 	it('lists the caller’s workers first, keeping each group’s existing order', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		listDashboardWorkers.mockResolvedValue([
@@ -219,18 +238,6 @@ describe('workers.list ordering — the viewer’s own machines first (issue #65
 		const rows = await admin.list();
 
 		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'mine-2', 'other-1', 'other-2']);
-	});
-
-	it('applies the same ordering to a project-scoped roster', async () => {
-		getMembership.mockResolvedValue(membershipFor('contributor'));
-		listDashboardWorkers.mockResolvedValue([
-			rosterRow('other-1', OTHER_ID),
-			rosterRow('mine-1', OWNER_ID),
-		]);
-
-		const rows = await owner.list({ projectId: 'p1' });
-
-		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'other-1']);
 	});
 
 	it('leaves the order untouched for a viewer who owns no visible worker', async () => {
@@ -246,6 +253,50 @@ describe('workers.list ordering — the viewer’s own machines first (issue #65
 		const rows = await admin.list();
 
 		expect(rows.map((row) => row.workerId)).toEqual(['other-1', 'other-2', 'orphaned']);
+	});
+
+	// Issue #750 — viewer-first is now the *global* list's rule alone: a project has a
+	// configured order that the dispatch gate also schedules by, and showing every
+	// operator a different sequence from that one would misdescribe the project.
+	it('does not apply to a project-scoped roster, which follows the project order', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listProjectWorkerIdsInOrder.mockResolvedValue(['other-1', 'mine-1']);
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('mine-1', OWNER_ID),
+			rosterRow('other-1', OTHER_ID),
+		]);
+
+		const rows = await owner.list({ projectId: 'p1' });
+
+		expect(rows.map((row) => row.workerId)).toEqual(['other-1', 'mine-1']);
+	});
+});
+
+// Issue #750 — the project's persisted worker order is what its Workers tab shows,
+// so an operator reads the same sequence the dispatch gate prefers.
+describe('workers.list ordering — the project’s configured order (issue #750)', () => {
+	it('returns a project-scoped roster in the persisted order', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listProjectWorkerIdsInOrder.mockResolvedValue(['w3', 'w1', 'w2']);
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('w1', OTHER_ID),
+			rosterRow('w2', OTHER_ID),
+			rosterRow('w3', OTHER_ID),
+		]);
+
+		const rows = await owner.list({ projectId: 'p1' });
+
+		expect(rows.map((row) => row.workerId)).toEqual(['w3', 'w1', 'w2']);
+		expect(listProjectWorkerIdsInOrder).toHaveBeenCalledWith('p1');
+	});
+
+	it('does not read a project order for the unscoped installation roster', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listDashboardWorkers.mockResolvedValue([]);
+
+		await admin.list();
+
+		expect(listProjectWorkerIdsInOrder).not.toHaveBeenCalled();
 	});
 });
 
@@ -476,6 +527,61 @@ describe('workers.setStatus (projectAdmin revoke/reactivate)', () => {
 		const result = await owner.setStatus({ enrollmentId: ENROLLMENT_ID, status: 'suspended' });
 		expect(result.status).toBe('suspended');
 		expect(setEnrollmentStatus).toHaveBeenCalledWith(ENROLLMENT_ID, 'suspended');
+	});
+});
+
+// Issue #750 — reordering is a project administrator's act, gated exactly like
+// approval and suspension, and existence-hiding the same way.
+describe('workers.reorderProjectWorker (projectAdmin only)', () => {
+	const reorder = { projectId: 'p1', workerId: WORKER_ID, direction: 'up' as const };
+
+	it('hides the project from a non-member (NOT_FOUND)', async () => {
+		getMembership.mockResolvedValue(undefined);
+
+		await expect(owner.reorderProjectWorker(reorder)).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(moveProjectWorkerOrder).not.toHaveBeenCalled();
+	});
+
+	it('forbids a contributor from reordering', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		await expect(owner.reorderProjectWorker(reorder)).rejects.toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+		expect(moveProjectWorkerOrder).not.toHaveBeenCalled();
+	});
+
+	it('lets a projectAdmin move a worker and returns the new order', async () => {
+		getMembership.mockResolvedValue(membershipFor('projectAdmin'));
+		moveProjectWorkerOrder.mockResolvedValue([WORKER_ID, 'w2']);
+
+		const result = await owner.reorderProjectWorker({ ...reorder, direction: 'down' });
+
+		expect(moveProjectWorkerOrder).toHaveBeenCalledWith({
+			projectId: 'p1',
+			workerId: WORKER_ID,
+			direction: 'down',
+		});
+		expect(result).toEqual({ projectId: 'p1', workerIds: [WORKER_ID, 'w2'] });
+	});
+
+	it('is NOT_FOUND when the worker holds no enrollment in that project', async () => {
+		getMembership.mockResolvedValue(membershipFor('projectAdmin'));
+		moveProjectWorkerOrder.mockResolvedValue(undefined);
+
+		await expect(owner.reorderProjectWorker(reorder)).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+	});
+
+	it('rejects a direction outside the vocabulary before any authorization read', async () => {
+		await expect(
+			// biome-ignore lint/suspicious/noExplicitAny: exercising the input schema itself.
+			owner.reorderProjectWorker({ ...reorder, direction: 'top' as any }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+		expect(getMembership).not.toHaveBeenCalled();
 	});
 });
 
