@@ -112,6 +112,22 @@ export type DispatchWaitReason =
 	 * waiting reason with no budget behind it.
 	 */
 	| 'preserved-worker'
+	/**
+	 * A **later phase of a task whose earlier phase is still executing** (issue
+	 * #759). The two board-driven phases deliberately share one `taskId` — Planning
+	 * and Implementation work in the same `task-<id>` checkout on the same branch
+	 * (issue #498, ai/RULES.md §2) — so "Planning finished, the card moved to ToDo"
+	 * arrives while Planning may still be in flight. Such a dispatch holds no
+	 * checkout, consumes no attempt budget, and is woken when the holding phase
+	 * settles rather than by a timer, exactly like `project-capacity`.
+	 *
+	 * Distinct from two neighbours on purpose. `worktree-exists` is a *failed*
+	 * provision retrying on a timer; this one never provisioned. And the
+	 * `skipped-duplicate` **outcome** is the other half of the same collision — the
+	 * *same* phase arriving twice — which stays terminal, so an operator can tell a
+	 * dropped redelivery from a sequenced phase.
+	 */
+	| 'task-in-flight'
 	| 'manual-retry'
 	| 'recovered';
 
@@ -132,6 +148,11 @@ export type DispatchPhase = TriggerPhase | 'merge-automation';
  * phase, but the work item is not opted into automation (it lacks the project's
  * `pipeline.automationLabel` — issue #131). The worker-authorization gate will
  * settle through the same value with its own reason (issue #339).
+ *
+ * `skipped-duplicate` is narrower than it reads and deliberately so (issue #759):
+ * the **same** phase of a task that is already executing that phase — a repeated
+ * delivery. A *different* phase of the same task is the pipeline advancing through
+ * one shared checkout, and waits as `task-in-flight` instead of settling here.
  */
 export type DispatchOutcome =
 	| 'phase-succeeded'
@@ -788,6 +809,84 @@ export async function hasExecutingDispatchForTask(
 		.where(and(...conditions))
 		.limit(1);
 	return rows.length > 0;
+}
+
+/**
+ * The attempt currently executing against this task's checkout, and **which
+ * phase** it is running — the worker-independent half of the in-flight collision
+ * guard (issue #759). `inFlightPhaseByTask` (`src/worker/consumer.ts`) answers the
+ * same question for one process only, which is why the guard's verdict used to
+ * depend on which worker a dispatch happened to be routed to.
+ *
+ * Three legs carry the meaning:
+ *
+ * - Only {@link EXECUTING_DISPATCH_STATES}, for the same reason
+ *   {@link hasExecutingDispatchForTask} counts only those: a `pending` or
+ *   `retry-scheduled` attempt holds no checkout, and treating a queued one as an
+ *   owner would make the wait it feeds unwakeable.
+ * - `excludeDispatchId` skips **the asking dispatch**, which is already `leased`
+ *   with its own `taskId`/`phase` recorded (`recordDispatchResolution`) by the time
+ *   the guard runs and would otherwise find itself.
+ * - `merge-automation` never counts: that dispatch kind carries a `taskId` but
+ *   provisions no worktree and takes no slot (issue #292), so an approving Review's
+ *   merge dispatch must not hold up the task's next phase. Written as `IS DISTINCT
+ *   FROM` because SQL `NULL <> 'x'` is unknown, not true — `ne` alone would drop
+ *   the null-`phase` rows this read exists to report.
+ *
+ * A row whose `phase` is null (the best-effort resolution write failed) is
+ * returned with `phase: null`, which the caller must treat as *some other* phase:
+ * only a known phase match may justify discarding work.
+ *
+ * One indexed row at most, on `(project_id, state)` — the same read cost the
+ * lease-liveness gate above already pays on the dispatch path.
+ */
+export async function findExecutingDispatchForTask(
+	projectId: string,
+	taskId: string,
+	excludeDispatchId?: string,
+): Promise<{ id: string; phase: string | null } | undefined> {
+	const rows = await getDb()
+		.select({ id: dispatches.id, phase: dispatches.phase })
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.taskId, taskId),
+				inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
+				sql`${dispatches.phase} IS DISTINCT FROM 'merge-automation'`,
+				...(excludeDispatchId ? [ne(dispatches.id, excludeDispatchId)] : []),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt))
+		.limit(1);
+	return rows[0];
+}
+
+/**
+ * The dispatches waiting for this task's checkout to free (issue #759) — what a
+ * settling phase wakes, the task-level twin of {@link selectNextCapacityDispatch}.
+ *
+ * Returns every waiter rather than only the first: realistically a task has at
+ * most one (the next phase in its sequence), and a second would otherwise sit
+ * until the reconciler's next pass. Whichever loses the resulting race re-defers
+ * under the same reason. Ordered on `availableAt` so the answer is deterministic.
+ */
+export async function listTaskInFlightWaits(
+	projectId: string,
+	taskId: string,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.taskId, taskId),
+				eq(dispatches.state, 'pending'),
+				eq(dispatches.waitReason, 'task-in-flight'),
+			),
+		)
+		.orderBy(asc(dispatches.availableAt), asc(dispatches.createdAt));
 }
 
 /**

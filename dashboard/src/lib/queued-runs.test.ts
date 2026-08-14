@@ -75,6 +75,14 @@ describe('queuedWaitReasonLabel', () => {
 			'waiting for a worker to be authorized',
 		);
 	});
+
+	// Issue #759: the wait is on the *task*, so the copy must not read as another
+	// worker/slot wait — nothing but that task's current phase finishing ends it.
+	it('names the task for a phase waiting on its own checkout', () => {
+		expect(queuedWaitReasonLabel('task-in-flight')).toBe(
+			"waiting for the task's current phase to finish",
+		);
+	});
 });
 
 describe('queuedWorkItemLabel', () => {

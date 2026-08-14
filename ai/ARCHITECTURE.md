@@ -353,6 +353,8 @@ That lookup is resolved **control-plane side**, where the DB is — by the assig
 
 Rejected alternative: stamping a `<!-- swarm:work-item id=… -->` marker into the PR body. It would need `PullRequestDetails` (`src/scm/types.ts`) to carry `body`, implemented by all three SCM providers — a wider blast radius for the same result — and it would still not help a PR created before the marker existed.
 
+**Two sequential phases sharing one `taskId` is required, not a smell** (issue #759). Planning and Implementation both resolve their id from the same card (`src/triggers/handlers/pm-status.ts`, one handler serving both board-driven phases), because they work in the same `task-<id>` checkout on the same `issue-<n>` branch — giving Planning its own would put the plan somewhere Implementation does not read. The PR-driven phases suffix theirs (`<pr>-respond`, `<pr>-conflicts`, `<pr>-ci`) for the opposite reason: they run *alongside* a Review holding `task-<pr>`, so they need distinct checkouts. **Serialising the shared pair is therefore the dispatch layer's job, not the id's** — it admits one phase to `task-<id>` at a time and does *not* choose which of two never-started deliveries goes first (see the ordering caveat below): the in-flight guard (`processJob`, `src/worker/consumer.ts`) keys on `(taskId, phase)` to tell a repeated delivery from the next phase, and makes the next phase *wait* for the checkout (`task-in-flight`, "Durable dispatch state machine" above) instead of dropping it. It had keyed on `taskId` alone, which made the ordinary progression "Planning finished → the operator moves the card to ToDo" indistinguishable from a duplicate webhook and dropped both — issue #754's Implementation dispatch was discarded 71 seconds before Planning finished, leaving the card in ToDo with both workers idle until a transition was produced by hand hours later. **The ordering caveat:** when *neither* delivery has started, whichever claims first runs first, so an Implementation that overtakes a not-yet-started Planning still runs without a plan. That predates this change and is strictly better than before — the overtaken phase now waits and runs rather than being discarded — and closing it belongs to a plan-existence check in Implementation, not to claim-time ordering in the dispatch table.
+
 ## Worktree lifecycle
 
 Unchanged from `PROJECT.md` §4 — this part of the original spec is SWARM-specific and already correct:
@@ -394,7 +396,21 @@ user/operator cancellation. Wake-up job ids are deterministic per
 (dispatch, wake sequence), so the reconciler's re-publish is a queue no-op when
 the wake-up already exists. Project-capacity waits are `pending` dispatches with
 wait reason `project-capacity`, woken by slot releases under the
-continuation-priority policy — there is no separate Redis registry. A worker
+continuation-priority policy — there is no separate Redis registry. **A second
+event-woken `pending` wait sequences the phases of one task** (issue #759): a
+dispatch whose task is still executing an *earlier* phase waits as
+`task-in-flight` and is woken by that phase settling
+(`promoteTaskInFlightWaits`, from `processJob`'s `finally` — every settle path,
+success or not), rather than being discarded. The *same* phase arriving twice is
+still completed `skipped-duplicate`, so the two halves of that collision stay
+distinguishable on the row; and the collision is read from the dispatch table
+(`findExecutingDispatchForTask`, `leased`/`running`, excluding the asking
+dispatch and `merge-automation`) as well as from the worker's in-process map, so
+the verdict does not depend on which worker the dispatch was routed to. Both
+pre-run waits share one deferral (`deferBeforeRun`): no attempt spent, the run
+row visible while it waits, continuation dedup claims retained, and the
+reconciler's republish underneath (a `pending` row is wakeable unless it waits on
+project capacity). A worker
 startup + periodic reconciler (`src/dispatch/reconciler.ts`) reclaims expired
 leases (failing the dispatch and its still-`running` run together), re-publishes
 lost wake-ups, and — once, at startup — imports legacy shapes (Redis

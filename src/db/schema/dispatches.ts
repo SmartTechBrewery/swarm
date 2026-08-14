@@ -46,13 +46,17 @@ export const dispatches = pgTable(
 		 * Why a non-terminal dispatch is waiting: `project-capacity`, `rate-limit`,
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
 		 * `worktree-exists`, `stalled`, `recheck`, `worker-eligibility`,
-		 * `worker-authorization`, `preserved-worker`, `manual-retry`, `recovered`.
-		 * Null while leased/running and for terminal states.
+		 * `worker-authorization`, `preserved-worker`, `task-in-flight` (a later phase
+		 * of a task whose earlier phase is still executing — issue #759),
+		 * `manual-retry`, `recovered`. Null while leased/running and for terminal
+		 * states.
 		 */
 		waitReason: text('wait_reason'),
 		/**
 		 * Terminal detail for `completed`: `phase-succeeded`, `no-trigger`,
-		 * `skipped-duplicate`, `skipped-not-eligible` (the work item is not opted
+		 * `skipped-duplicate` (a repeated delivery of the *same* phase already
+		 * executing for this task — a *different* phase waits as `task-in-flight`
+		 * instead, issue #759), `skipped-not-eligible` (the work item is not opted
 		 * into automation — issue #131), or `superseded` (a coalesced recheck
 		 * replaced it).
 		 */

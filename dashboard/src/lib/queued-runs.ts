@@ -70,6 +70,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// the project may be free and it changes nothing, because this dispatch continues
 	// work preserved on one specific machine (issue #567).
 	'preserved-worker': 'waiting for the machine holding its preserved work',
+	// Names the *task*, not a worker or a slot: this phase is next in the task's own
+	// sequence and shares its checkout, so nothing but that checkout freeing ends the
+	// wait (issue #759).
+	'task-in-flight': "waiting for the task's current phase to finish",
 	'manual-retry': 'manual retry',
 	recovered: 'recovered after a restart',
 };

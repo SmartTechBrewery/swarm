@@ -70,9 +70,9 @@ export type QueuedBoardOutcome = z.infer<typeof QueuedBoardOutcomeSchema>;
 
 /**
  * The queue-facing view of a dispatch's state: `waiting`/`prioritized` for an
- * eligible-now pending dispatch (by queue priority), `blocked` for one waiting
- * on project capacity (woken by a freed slot, not a timer), and `delayed` for
- * a scheduled retry.
+ * eligible-now pending dispatch (by queue priority), `blocked` for one an *event*
+ * has to wake rather than a timer — a freed project slot, or the task's own
+ * checkout freeing (issue #759) — and `delayed` for a scheduled retry.
  */
 export const PendingJobStateSchema = z.enum(['waiting', 'prioritized', 'delayed', 'blocked']);
 export type PendingJobState = z.infer<typeof PendingJobStateSchema>;
@@ -91,6 +91,7 @@ export const QueuedWaitReasonSchema = z.enum([
 	'worker-eligibility',
 	'worker-authorization',
 	'preserved-worker',
+	'task-in-flight',
 	'manual-retry',
 	'recovered',
 ]);
@@ -255,7 +256,11 @@ export function deriveReviewGate(job: SwarmJob): QueuedReviewGate | undefined {
 /** The queue-facing state of a waiting dispatch (see {@link PendingJobStateSchema}). */
 export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 	if (dispatch.state === 'retry-scheduled') return 'delayed';
-	if (dispatch.waitReason === 'project-capacity') return 'blocked';
+	// The two event-woken pending waits read as `blocked` rather than `waiting`: both
+	// are eligible *now* and neither will be picked up until something frees — a
+	// project slot, or the task's own checkout (issue #759).
+	if (dispatch.waitReason === 'project-capacity' || dispatch.waitReason === 'task-in-flight')
+		return 'blocked';
 	if (dispatch.availableAt.getTime() > Date.now()) return 'delayed';
 	return dispatch.priority > 0 ? 'prioritized' : 'waiting';
 }
@@ -330,7 +335,10 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
  * `selectNextCapacityDispatch` (`continuation desc, availableAt asc`), so a
  * prioritized SCM continuation wins the freed slot ahead of new work regardless
  * of queue priority. This mirrors that ordering exactly so the displayed order
- * matches the real wake order (issue #374).
+ * matches the real wake order (issue #374). A `task-in-flight` row shares the
+ * bucket (it is event-woken too) and is ordered on `availableAt` within it, which
+ * is `listTaskInFlightWaits`' own order — its wake-up doesn't compete for a slot
+ * with the capacity rows, it waits on one specific task.
  */
 export function sortQueuedRuns(items: QueuedRun[]): QueuedRun[] {
 	const stateRank = (state: PendingJobState): number =>
