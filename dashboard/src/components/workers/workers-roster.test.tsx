@@ -12,6 +12,7 @@ const {
 	listMineQueryFn,
 	rosterQueryFn,
 	workersQueryOptions,
+	reorderMutate,
 	navigate,
 } = vi.hoisted(() => ({
 	workersListQueryFn: vi.fn(),
@@ -19,6 +20,7 @@ const {
 	listMineQueryFn: vi.fn(),
 	rosterQueryFn: vi.fn(),
 	workersQueryOptions: vi.fn(),
+	reorderMutate: vi.fn(),
 	navigate: vi.fn(),
 }));
 
@@ -47,7 +49,10 @@ vi.mock('@/lib/trpc.js', () => ({
 		},
 	},
 	trpcClient: {
-		workers: { setConsent: { mutate: vi.fn() } },
+		workers: {
+			setConsent: { mutate: vi.fn() },
+			reorderProjectWorker: { mutate: reorderMutate },
+		},
 	},
 }));
 
@@ -85,6 +90,7 @@ beforeEach(() => {
 		workersQueryOptions,
 		listMineQueryFn,
 		rosterQueryFn,
+		reorderMutate,
 		navigate,
 	]) {
 		m.mockReset();
@@ -170,5 +176,68 @@ describe('WorkersRoster states', () => {
 			to: '/workers/$workerId',
 			params: { workerId: 'worker-1' },
 		});
+	});
+});
+
+describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
+	const PAIR = [makeWorker(), makeWorker({ workerId: 'worker-2', displayName: 'grace-box' })];
+
+	it('offers no control to a viewer who may not administer the project', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', { name: /^Move / })).toBeNull();
+	});
+
+	it('offers none on the global screen either, whatever the caller asks for', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		renderRoster(<WorkersRoster canReorder />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', { name: /^Move / })).toBeNull();
+	});
+
+	it('moves a worker with the project, worker, and direction, then renders the returned order', async () => {
+		// The reconcile refetch is left pending so the assertion targets the order the
+		// mutation's own response put in the cache.
+		workersListQueryFn.mockResolvedValueOnce(PAIR).mockReturnValue(new Promise(() => {}));
+		reorderMutate.mockResolvedValue({
+			projectId: 'proj-a',
+			workerIds: ['worker-2', 'worker-1'],
+		});
+		renderRoster(<WorkersRoster projectId="proj-a" canReorder />);
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Move grace-box up' }));
+
+		await vi.waitFor(() => {
+			expect(
+				screen
+					.getAllByRole('row')
+					.slice(1)
+					.map((row) => row.querySelector('td')?.textContent),
+			).toEqual(['grace-box', 'ada-laptop']);
+		});
+		expect(reorderMutate).toHaveBeenCalledWith({
+			projectId: 'proj-a',
+			workerId: 'worker-2',
+			direction: 'up',
+		});
+	});
+
+	it('surfaces a rejected move and leaves the order alone', async () => {
+		workersListQueryFn.mockResolvedValueOnce(PAIR).mockReturnValue(new Promise(() => {}));
+		reorderMutate.mockRejectedValue(new Error('Worker with ID "worker-2" not found'));
+		renderRoster(<WorkersRoster projectId="proj-a" canReorder />);
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Move grace-box up' }));
+
+		expect(await screen.findByText('Worker with ID "worker-2" not found')).toBeDefined();
+		expect(
+			screen
+				.getAllByRole('row')
+				.slice(1)
+				.map((row) => row.querySelector('td')?.textContent),
+		).toEqual(['ada-laptop', 'grace-box']);
 	});
 });

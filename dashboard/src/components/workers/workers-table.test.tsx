@@ -737,19 +737,36 @@ describe('WorkersTable row navigation (issue #477)', () => {
 		const onSelectWorker = vi.fn();
 		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={onSelectWorker} />);
 
-		fireEvent.click(screen.getByText('ada-laptop'));
+		// A cell carrying no control of its own, so this exercises the row handler
+		// rather than the Machine cell's button.
+		fireEvent.click(screen.getByText('Ada Lovelace'));
 
 		expect(onSelectWorker).toHaveBeenCalledWith('worker-1');
 	});
 
-	it('gives keyboard/AT users an explicitly named control in the trailing cell', () => {
+	// Issue #752 removed the trailing chevron cell this control used to live in.
+	// The guarantee it carried did not move out of the table, only into the
+	// Machine cell: keyboard/AT users still have one explicitly named control.
+	it('gives keyboard/AT users an explicitly named control on the machine name', () => {
 		const onSelectWorker = vi.fn();
 		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={onSelectWorker} />);
 
-		fireEvent.click(screen.getByRole('button', { name: 'Open ada-laptop details' }));
+		const control = screen.getByRole('button', { name: 'Open ada-laptop details' });
+		expect(control.textContent).toBe('ada-laptop');
+		fireEvent.click(control);
 
+		// Once, not twice: the button stops the click from also reaching the row.
 		expect(onSelectWorker).toHaveBeenCalledTimes(1);
 		expect(onSelectWorker).toHaveBeenCalledWith('worker-1');
+	});
+
+	it('renders no trailing arrow column at all', () => {
+		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={vi.fn()} />);
+
+		// The row's last cell is Available (the consent switch's), not a chevron's.
+		const cells = screen.getAllByRole('row')[1].querySelectorAll('td');
+		expect(cells).toHaveLength(6);
+		expect(screen.queryByText('Open')).toBeNull();
 	});
 
 	it('keeps the Available toggle working without navigating', async () => {
@@ -788,6 +805,103 @@ describe('WorkersTable row navigation (issue #477)', () => {
 		renderTable(<WorkersTable workers={[makeWorker()]} />);
 
 		expect(screen.queryByRole('button', { name: /Open ada-laptop/ })).toBeNull();
+		// …but the machine is still named, as plain text.
+		expect(screen.getByText('ada-laptop')).toBeDefined();
+	});
+});
+
+describe('WorkersTable reorder controls (issue #750 phase 2)', () => {
+	const THREE = [
+		makeWorker(),
+		makeWorker({ workerId: 'worker-2', displayName: 'grace-box' }),
+		makeWorker({ workerId: 'worker-3', displayName: 'linus-rack' }),
+	];
+
+	it('renders no reorder control at all without the prop (the global screen, a non-admin)', () => {
+		renderTable(<WorkersTable workers={THREE} onSelectWorker={vi.fn()} />);
+
+		expect(screen.queryByRole('button', { name: /^Move / })).toBeNull();
+		expect(screen.queryByText('Reorder')).toBeNull();
+	});
+
+	it('gives every row both arrows, each naming its machine', () => {
+		renderTable(<WorkersTable workers={THREE} reorder={{ onMove: vi.fn() }} />);
+
+		for (const name of ['ada-laptop', 'grace-box', 'linus-rack']) {
+			expect(screen.getByRole('button', { name: `Move ${name} up` })).toBeDefined();
+			expect(screen.getByRole('button', { name: `Move ${name} down` })).toBeDefined();
+		}
+	});
+
+	it('disables the first row’s up and the last row’s down, and nothing in between', () => {
+		renderTable(<WorkersTable workers={THREE} reorder={{ onMove: vi.fn() }} />);
+
+		const disabled = (name: string) =>
+			(screen.getByRole('button', { name }) as HTMLButtonElement).disabled;
+		expect(disabled('Move ada-laptop up')).toBe(true);
+		expect(disabled('Move ada-laptop down')).toBe(false);
+		expect(disabled('Move grace-box up')).toBe(false);
+		expect(disabled('Move grace-box down')).toBe(false);
+		expect(disabled('Move linus-rack up')).toBe(false);
+		expect(disabled('Move linus-rack down')).toBe(true);
+	});
+
+	it('reports the move by worker id and direction, without navigating', () => {
+		const onMove = vi.fn();
+		const onSelectWorker = vi.fn();
+		renderTable(
+			<WorkersTable workers={THREE} onSelectWorker={onSelectWorker} reorder={{ onMove }} />,
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Move grace-box up' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Move grace-box down' }));
+
+		expect(onMove.mock.calls).toEqual([
+			['worker-2', 'up'],
+			['worker-2', 'down'],
+		]);
+		// The arrows stop propagation, so a reorder never opens the detail view.
+		expect(onSelectWorker).not.toHaveBeenCalled();
+	});
+
+	it('renders the rows in the order it was handed, never re-sorting them itself', () => {
+		renderTable(<WorkersTable workers={THREE} reorder={{ onMove: vi.fn() }} />);
+
+		const names = screen
+			.getAllByRole('row')
+			.slice(1)
+			.map((row) => row.querySelector('td')?.textContent);
+		expect(names).toEqual(['ada-laptop', 'grace-box', 'linus-rack']);
+	});
+
+	it('disables the whole column while a move is in flight, not just its own row', () => {
+		renderTable(
+			<WorkersTable workers={THREE} reorder={{ onMove: vi.fn(), pendingWorkerId: 'worker-2' }} />,
+		);
+
+		for (const name of ['ada-laptop', 'grace-box', 'linus-rack']) {
+			expect(
+				(screen.getByRole('button', { name: `Move ${name} up` }) as HTMLButtonElement).disabled,
+			).toBe(true);
+			expect(
+				(screen.getByRole('button', { name: `Move ${name} down` }) as HTMLButtonElement).disabled,
+			).toBe(true);
+		}
+	});
+
+	it('surfaces a rejected move inline on the row it was attempted from', () => {
+		renderTable(
+			<WorkersTable
+				workers={THREE}
+				reorder={{
+					onMove: vi.fn(),
+					error: { workerId: 'worker-2', message: 'Project with ID "proj-a" not found' },
+				}}
+			/>,
+		);
+
+		const message = screen.getByText('Project with ID "proj-a" not found');
+		expect(message.closest('tr')).toBe(screen.getAllByRole('row')[2]);
 	});
 });
 

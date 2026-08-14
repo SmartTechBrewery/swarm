@@ -1,5 +1,5 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronRight } from 'lucide-react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
@@ -42,7 +42,44 @@ import type {
  * **Capabilities** as a cross-project union ({@link effectiveClis}) rather than
  * broken out per project — a per-project breakdown is what the detail view is
  * for.
+ *
+ * Navigation to that detail view is the **row** plus a named control on the
+ * Machine cell (issue #752). It used to be a trailing `ChevronRight` cell of its
+ * own, which spent a column on an arrow that only repeated what the whole
+ * clickable row already did; the machine name — the row's identifying text — is
+ * the affordance an operator aims at anyway, so it became the button. A
+ * `role="button"` `<tr>` was not the alternative: it trips Biome a11y and is
+ * worse for AT than a real control.
+ *
+ * The one *other* operable affordance is optional and belongs to the project
+ * tab: with {@link WorkersTableProps.reorder} supplied, each row gains up/down
+ * controls for the project's configured worker order (issue #750 phase 2).
+ * Absent the prop there is no column at all, which is how `/workers` and a
+ * non-administrator's project tab render — the order is still the server's
+ * either way, and this table never re-sorts what it was handed.
  */
+
+/**
+ * The reorder affordance for the project-scoped tab (issue #750 phase 2), passed
+ * whole or not at all: the table renders the column only when a caller offers
+ * one, so the global `/workers` screen and a non-administrator's project tab get
+ * no controls rather than disabled ones for a thing they may not do.
+ *
+ * The table stays presentational — it neither mutates nor re-sorts. `onMove`
+ * reports the intent; the order it renders next is whatever the server's response
+ * put in the cache.
+ */
+export interface WorkersTableReorder {
+	onMove: (workerId: string, direction: 'up' | 'down') => void;
+	/**
+	 * The worker a move is in flight for. Every control in the column is disabled
+	 * while one is set, not just this row's: a second move would be computed
+	 * against an order the server is in the middle of changing.
+	 */
+	pendingWorkerId?: string;
+	/** A rejected move, surfaced inline on the row it was attempted from. */
+	error?: { workerId: string; message: string } | null;
+}
 
 interface WorkersTableProps {
 	workers: WorkerRow[];
@@ -53,6 +90,8 @@ interface WorkersTableProps {
 	 * callback, exactly as the Agent Configuration summary hands its phase rows one.
 	 */
 	onSelectWorker?: (workerId: string) => void;
+	/** Present ⇒ each row can be moved in the project's worker order (issue #750 phase 2). */
+	reorder?: WorkersTableReorder;
 }
 
 /**
@@ -62,17 +101,27 @@ interface WorkersTableProps {
  * content. Status needs little: `Online` is two words and an offline row's
  * last-seen time wraps under it, so half its former width goes to Capabilities,
  * whose CLI chips otherwise wrap one-per-line for a three-CLI machine.
+ *
+ * Active job is also where the reorder column takes its width from and where the
+ * removed row-open chevron's went (issue #752): the prose cell absorbs and gives
+ * back spare width without any other column changing size, so the two variants of
+ * the table read identically column-for-column.
  */
 const COLUMN_WIDTHS = {
 	machine: 'w-[16%]',
 	owner: 'w-[14%]',
 	status: 'w-[9%]',
 	capabilities: 'w-[20%]',
-	activeJob: 'w-[27%]',
+	activeJob: 'w-[31%]',
+	activeJobWithReorder: 'w-[24%]',
 	available: 'w-[10%]',
-	// Just the chevron that opens the detail view — the narrowest column that fits it.
-	open: 'w-[4%]',
+	// The two stacked-side-by-side reorder arrows — the narrowest column that fits them.
+	reorder: 'w-[7%]',
 };
+
+/** Icon-button recipe for a row's reorder actions (ai/DESIGN_SYSTEM.md §4). */
+const ROW_ACTION_CLASS =
+	'p-1.5 rounded text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
 
 /** A stable key for one `(worker, project)` enrollment across the roster/owner read models. */
 function enrollmentKey(workerId: string, projectId: string): string {
@@ -282,6 +331,62 @@ function AvailabilityCell({
 	);
 }
 
+/**
+ * One row's position in the project's worker order (issue #750 phase 2). The
+ * controls name the machine rather than its rank — a rank read out of a cell is
+ * ambiguous the moment the row moves, and the roster's rows are already told
+ * apart by their machine names everywhere else on this screen.
+ *
+ * Both arrows are rendered on every row and *disabled* at the boundaries rather
+ * than omitted, so the column keeps one shape and a control never disappears out
+ * from under a pointer mid-reorder.
+ */
+function ReorderCell({
+	worker,
+	index,
+	total,
+	reorder,
+}: {
+	worker: WorkerRow;
+	index: number;
+	total: number;
+	reorder: WorkersTableReorder;
+}) {
+	const moving = reorder.pendingWorkerId !== undefined;
+	const error = reorder.error?.workerId === worker.workerId ? reorder.error.message : null;
+	return (
+		<>
+			<div className="flex items-center justify-end gap-1">
+				<button
+					type="button"
+					onClick={(event) => {
+						event.stopPropagation();
+						reorder.onMove(worker.workerId, 'up');
+					}}
+					disabled={moving || index === 0}
+					aria-label={`Move ${worker.displayName} up`}
+					className={ROW_ACTION_CLASS}
+				>
+					<ChevronUp className="h-4 w-4" aria-hidden="true" />
+				</button>
+				<button
+					type="button"
+					onClick={(event) => {
+						event.stopPropagation();
+						reorder.onMove(worker.workerId, 'down');
+					}}
+					disabled={moving || index === total - 1}
+					aria-label={`Move ${worker.displayName} down`}
+					className={ROW_ACTION_CLASS}
+				>
+					<ChevronDown className="h-4 w-4" aria-hidden="true" />
+				</button>
+			</div>
+			{error ? <div className="mt-1 text-right text-[10px] text-red-400">{error}</div> : null}
+		</>
+	);
+}
+
 interface ConfirmTarget {
 	enrollmentId: string;
 	projectId: string;
@@ -289,7 +394,12 @@ interface ConfirmTarget {
 	projectName: string;
 }
 
-export function WorkersTable({ workers, refetchInterval, onSelectWorker }: WorkersTableProps) {
+export function WorkersTable({
+	workers,
+	refetchInterval,
+	onSelectWorker,
+	reorder,
+}: WorkersTableProps) {
 	const queryClient = useQueryClient();
 
 	// Resolve projects the same way RunsTable does — names for the consent switches'
@@ -447,9 +557,9 @@ export function WorkersTable({ workers, refetchInterval, onSelectWorker }: Worke
 					<col className={COLUMN_WIDTHS.owner} />
 					<col className={COLUMN_WIDTHS.status} />
 					<col className={COLUMN_WIDTHS.capabilities} />
-					<col className={COLUMN_WIDTHS.activeJob} />
+					<col className={reorder ? COLUMN_WIDTHS.activeJobWithReorder : COLUMN_WIDTHS.activeJob} />
 					<col className={COLUMN_WIDTHS.available} />
-					<col className={COLUMN_WIDTHS.open} />
+					{reorder ? <col className={COLUMN_WIDTHS.reorder} /> : null}
 				</colgroup>
 				<thead>
 					<tr className="bg-zinc-800/30 border-b border-zinc-800">
@@ -471,19 +581,20 @@ export function WorkersTable({ workers, refetchInterval, onSelectWorker }: Worke
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
 							Available
 						</th>
-						<th className="px-3 py-3">
-							<span className="sr-only">Open</span>
-						</th>
+						{reorder ? (
+							<th className="px-3 py-3">
+								<span className="sr-only">Reorder</span>
+							</th>
+						) : null}
 					</tr>
 				</thead>
 				<tbody className="divide-y divide-zinc-800/60">
-					{workers.map((worker) => (
+					{workers.map((worker, index) => (
 						// Mouse users can click anywhere on the row; keyboard/AT users reach
-						// the explicit button in the trailing cell, which carries the
-						// accessible name and focus (the same shape the Agent Configuration
-						// summary uses — a role="button" <tr> trips Biome a11y and is worse
-						// for AT than a real control). The in-row controls and links stop
-						// propagation, so they still do their own thing.
+						// the explicit button on the Machine cell, which carries the
+						// accessible name and focus (a role="button" <tr> trips Biome a11y
+						// and is worse for AT than a real control). The in-row controls and
+						// links stop propagation, so they still do their own thing.
 						<tr
 							key={worker.workerId}
 							onClick={() => onSelectWorker?.(worker.workerId)}
@@ -492,7 +603,21 @@ export function WorkersTable({ workers, refetchInterval, onSelectWorker }: Worke
 							}`}
 						>
 							<td className="px-3 py-3 align-top text-sm font-medium text-zinc-100 break-words">
-								{worker.displayName}
+								{onSelectWorker ? (
+									<button
+										type="button"
+										onClick={(event) => {
+											event.stopPropagation();
+											onSelectWorker(worker.workerId);
+										}}
+										aria-label={`Open ${worker.displayName} details`}
+										className="text-left break-words rounded hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
+									>
+										{worker.displayName}
+									</button>
+								) : (
+									worker.displayName
+								)}
 							</td>
 							<td className="px-3 py-3 align-top text-sm text-zinc-300 break-words">
 								{worker.owner ? (
@@ -534,21 +659,16 @@ export function WorkersTable({ workers, refetchInterval, onSelectWorker }: Worke
 									onToggle={handleToggle}
 								/>
 							</td>
-							<td className="px-3 py-3 align-top text-right">
-								{onSelectWorker ? (
-									<button
-										type="button"
-										onClick={(event) => {
-											event.stopPropagation();
-											onSelectWorker(worker.workerId);
-										}}
-										aria-label={`Open ${worker.displayName} details`}
-										className="inline-flex items-center justify-center rounded p-1 text-zinc-500 hover:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
-									>
-										<ChevronRight className="h-4 w-4" aria-hidden="true" />
-									</button>
-								) : null}
-							</td>
+							{reorder ? (
+								<td className="px-3 py-3 align-top">
+									<ReorderCell
+										worker={worker}
+										index={index}
+										total={workers.length}
+										reorder={reorder}
+									/>
+								</td>
+							) : null}
 						</tr>
 					))}
 				</tbody>

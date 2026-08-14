@@ -2385,8 +2385,13 @@ function ProjectDetailRouteComponent() {
 			{activeTab === 'runs' && <ProjectRunsPanel projectId={projectId} />}
 
 			{/* This project's worker roster (issue #574) — the same component `/workers`
-			    renders, scoped server-side to the machines enrolled here. */}
-			{activeTab === 'workers' && <WorkersRoster projectId={projectId} />}
+			    renders, scoped server-side to the machines enrolled here. An
+			    administrator additionally reorders the project's dispatch preference
+			    here (issue #750 phase 2); `canAdminister` fails closed while
+			    `projects.viewerAccess` loads, and the mutation re-checks it server-side. */}
+			{activeTab === 'workers' && (
+				<WorkersRoster projectId={projectId} canReorder={canAdminister} />
+			)}
 
 			<ProjectAdminOnly tab={activeTab} canAdminister={canAdminister}>
 				{/* Form Card - General Settings. Project identity and host layout; the
