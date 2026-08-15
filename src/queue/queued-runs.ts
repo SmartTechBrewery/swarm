@@ -258,7 +258,7 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 	if (dispatch.state === 'retry-scheduled') return 'delayed';
 	// The two event-woken pending waits read as `blocked` rather than `waiting`: both
 	// are eligible *now* and neither will be picked up until something frees — a
-	// project slot, or the task's own checkout (issue #759).
+	// project slot, or the task's own earlier phase settling (issues #759 and #761).
 	if (dispatch.waitReason === 'project-capacity' || dispatch.waitReason === 'task-in-flight')
 		return 'blocked';
 	if (dispatch.availableAt.getTime() > Date.now()) return 'delayed';

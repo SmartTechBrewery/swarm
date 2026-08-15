@@ -340,9 +340,10 @@ export function reconstructResetJob(
 
 /**
  * The payload an event-woken **pre-run** wait defers with — a project-capacity
- * block, or a task whose earlier phase is still executing (`task-in-flight`, issue
- * #759): the attempt counter is *not* consumed (waiting on a slot or on a sibling
- * phase isn't a failure), but PM dispatch intent and the held dedup claim are
+ * block, or a task whose earlier phase has not settled (`task-in-flight`: still
+ * executing, issue #759, or a Planning dispatch an Implementation must not overtake,
+ * issue #761): the attempt counter is *not* consumed (waiting on a slot or on a
+ * sibling phase isn't a failure), but PM dispatch intent and the held dedup claim are
  * recorded so the eventual wake-up re-enters its original phase unambiguously even
  * after status-dedup TTLs expire.
  */

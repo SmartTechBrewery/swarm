@@ -232,6 +232,13 @@ const findExecutingDispatchForTask = vi.fn(
 		_excludeDispatchId?: string,
 	): Promise<{ id: string; phase: string | null } | undefined> => undefined,
 );
+const findActivePlanningDispatchForTask = vi.fn(
+	async (
+		_projectId: string,
+		_taskId: string,
+		_excludeDispatchId?: string,
+	): Promise<{ id: string; state: string } | undefined> => undefined,
+);
 const deferDispatchToPending = vi.fn(async (_id: string, _input: unknown) => mockDispatchRow({}));
 const scheduleDispatchRetry = vi.fn(
 	async (_id: string, input: { jobPayload: Record<string, unknown> }) => ({
@@ -265,6 +272,11 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		recordDispatchResolution(id, taskId, phase),
 	findExecutingDispatchForTask: (projectId: string, taskId: string, excludeDispatchId?: string) =>
 		findExecutingDispatchForTask(projectId, taskId, excludeDispatchId),
+	findActivePlanningDispatchForTask: (
+		projectId: string,
+		taskId: string,
+		excludeDispatchId?: string,
+	) => findActivePlanningDispatchForTask(projectId, taskId, excludeDispatchId),
 	deferDispatchToPending: (id: string, input: unknown) => deferDispatchToPending(id, input),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
@@ -709,6 +721,8 @@ describe('processJob', () => {
 		recordDispatchResolution.mockClear();
 		findExecutingDispatchForTask.mockClear();
 		findExecutingDispatchForTask.mockResolvedValue(undefined);
+		findActivePlanningDispatchForTask.mockClear();
+		findActivePlanningDispatchForTask.mockResolvedValue(undefined);
 		deferDispatchToPending.mockClear();
 		scheduleDispatchRetry.mockClear();
 		claimWorkerForDispatch.mockClear();
@@ -3916,6 +3930,116 @@ describe('processJob', () => {
 					registryReturning(REVIEW_TRIGGER),
 				);
 				expect(afterFailure.status).toBe('phase-succeeded');
+			});
+		});
+
+		// Issue #761. The executing read above cannot see a Planning dispatch that is
+		// merely *queued* — it owns no checkout — so an Implementation delivery that
+		// arrived while Planning still sat in the queue used to claim first and run
+		// without the plan it was dispatched to consume. Implementation now asks a
+		// second, one-directional question.
+		describe('queued-planning yield (issue #761)', () => {
+			const workItem = createMockWorkItem();
+			const implementation = () =>
+				registryReturning({ phase: 'implementation', taskId: '17', workItem });
+
+			it('defers Implementation while a Planning dispatch for the task has not settled', async () => {
+				findActivePlanningDispatchForTask.mockResolvedValue({ id: 'planning-1', state: 'pending' });
+
+				const outcome = await processJob(createMockPmWebhookJob(), implementation());
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					phase: 'implementation',
+					taskId: '17',
+				});
+				expect(phaseCalls).toHaveLength(0);
+				expect(deferDispatchToPending).toHaveBeenCalledWith(
+					'dispatch-1',
+					expect.objectContaining({ waitReason: 'task-in-flight' }),
+				);
+				// Visible with its reason, not silently dropped — and the reason must say
+				// *queued*, since claiming "waiting for that checkout to free" would be a
+				// lie about a Planning that has not started.
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-1',
+					expect.objectContaining({
+						status: 'deferred',
+						error: expect.stringContaining('planning phase queued'),
+					}),
+				);
+				// The asking dispatch is excluded — it is already leased with its own
+				// task/phase recorded and would otherwise find itself.
+				expect(findActivePlanningDispatchForTask).toHaveBeenCalledWith(
+					PROJECT.id,
+					'17',
+					'dispatch-1',
+				);
+			});
+
+			// The constraint that shapes the fix: most tasks never run Planning at all, so
+			// the ordinary Backlog → ToDo path must gain no gate and no delay.
+			it('runs Implementation immediately when the task has no Planning dispatch', async () => {
+				const outcome = await processJob(createMockPmWebhookJob(), implementation());
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(phaseCalls).toHaveLength(1);
+				expect(deferDispatchToPending).not.toHaveBeenCalled();
+			});
+
+			// One-directional by construction: nothing asks the mirror question, so no
+			// pair of dispatches can defer to each other.
+			it.each([
+				'planning',
+				'review',
+			] as const)('never asks the question for a %s dispatch, so Planning cannot yield to Implementation', async (phase) => {
+				findActivePlanningDispatchForTask.mockResolvedValue({
+					id: 'planning-1',
+					state: 'pending',
+				});
+
+				const outcome =
+					phase === 'planning'
+						? await processJob(
+								createMockPmWebhookJob(),
+								registryReturning({ phase: 'planning', taskId: '17', workItem }),
+							)
+						: await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(findActivePlanningDispatchForTask).not.toHaveBeenCalled();
+			});
+
+			it('dispatches normally when the planning read fails — a DB hiccup must not stall the pipeline', async () => {
+				findActivePlanningDispatchForTask.mockRejectedValue(new Error('db down'));
+
+				const outcome = await processJob(createMockPmWebhookJob(), implementation());
+
+				expect(outcome.status).toBe('phase-succeeded');
+			});
+
+			// The wait self-heals: Planning can settle between the read and this row
+			// becoming `pending`, so its own promotion would find nothing to wake.
+			it('publishes its own wake-up when the Planning dispatch settled while it was deferring', async () => {
+				// Only the claim-time read sees it; the post-defer re-check finds it gone.
+				findActivePlanningDispatchForTask.mockResolvedValueOnce({
+					id: 'planning-1',
+					state: 'pending',
+				});
+
+				await processJob(createMockPmWebhookJob(), implementation());
+
+				expect(publishDispatchWakeUp).toHaveBeenCalledWith(
+					expect.objectContaining({ id: 'dispatch-1' }),
+				);
+			});
+
+			it('does not publish a wake-up while the Planning dispatch is still non-terminal', async () => {
+				findActivePlanningDispatchForTask.mockResolvedValue({ id: 'planning-1', state: 'running' });
+
+				await processJob(createMockPmWebhookJob(), implementation());
+
+				expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 			});
 		});
 	});

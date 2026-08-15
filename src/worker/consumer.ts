@@ -34,6 +34,7 @@ import {
 	type DispatchWaitReason,
 	deferDispatchToPending,
 	failDispatch,
+	findActivePlanningDispatchForTask,
 	findExecutingDispatchForTask,
 	markDispatchRunning,
 	recordDispatchResolution,
@@ -1146,52 +1147,64 @@ async function handleConcurrencyDeferral(
 }
 
 /**
- * Handle a phase whose task is still executing an **earlier** phase (issue #759) —
- * the ordinary board-driven progression "Planning finished, the card moved to
- * ToDo", arriving while Planning is still in flight. It waits for that checkout
- * instead of being discarded, which is what keeps the pipeline moving without an
- * operator: two phases still never hold `task-<id>` at once, because a deferred
- * dispatch holds no checkout and only starts once nothing is executing for the task.
+ * Handle a phase whose task has an **earlier** phase that has not settled — the
+ * ordinary board-driven progression "Planning finished, the card moved to ToDo".
+ * It waits instead of being discarded, which is what keeps the pipeline moving
+ * without an operator.
+ *
+ * Two holds arrive here under one wait reason. A phase *executing* against the
+ * shared checkout (issue #759): two phases still never hold `task-<id>` at once,
+ * because a deferred dispatch holds no checkout and starts only once nothing is
+ * executing for the task. And a Planning dispatch that is merely *queued* (issue
+ * #761), which only Implementation waits behind, so it cannot overtake the plan it
+ * was dispatched to consume. The stated reason distinguishes the two, since
+ * "waiting for that checkout to free" would be a lie about a queued Planning.
  *
  * The wake-up comes from the settling phase itself ({@link promoteTaskInFlightWaits},
- * in `processJob`'s `finally`). The re-check here closes the one window that ordering
- * leaves open: the holding phase can settle — and promote — between the collision
- * read and this row becoming `pending`, so its promotion would find nothing. Re-read
- * after the defer, and publish our own wake-up when the task turned out to be free.
- * That also breaks the mutual defer of two processes claiming two phases of one task
- * within the same few milliseconds, where each sees the other's `leased` row. Either
- * way the reconciler's idempotent republish stays underneath (a `pending` row is
- * wakeable unless it waits on project capacity), so the wait is bounded even if this
- * publish is lost.
+ * in `processJob`'s `finally`) — every settle path, success or not, so a Planning
+ * that fails or defers releases the waiter just as a successful one does. The
+ * re-check here closes the one window that ordering leaves open: the holding phase
+ * can settle — and promote — between the collision read and this row becoming
+ * `pending`, so its promotion would find nothing. Re-read the same composite
+ * question after the defer, and publish our own wake-up when the task turned out to
+ * be free. That also breaks the mutual defer of two processes claiming two phases of
+ * one task within the same few milliseconds, where each sees the other's `leased`
+ * row. Either way the reconciler's idempotent republish stays underneath (a
+ * `pending` row is wakeable unless it waits on project capacity), so the wait is
+ * bounded even if this publish is lost and even if the hold is cancelled rather than
+ * settled.
  */
 async function handleTaskInFlightDeferral(
 	dispatch: DispatchRow,
 	job: SwarmJob,
 	trigger: TriggerResult,
 	project: ProjectConfig,
-	holdingPhase: string | null,
+	hold: TaskHold,
 ): Promise<JobOutcome> {
 	// A holding dispatch whose `phase` was never recorded reads as "another phase",
 	// which is exactly what it is known to be: not this one.
-	const holding = holdingPhase ? `its ${holdingPhase} phase` : 'another phase';
-	logger.info(`Phase deferred - ${phaseLabel(trigger.phase)} — the task is running ${holding}`, {
-		projectId: project.id,
-		phase: trigger.phase,
-		holdingPhase,
-		taskId: trigger.taskId,
-	});
+	const holding = hold.phase ? `its ${hold.phase} phase` : 'another phase';
+	const reason = hold.executing
+		? `Task '${trigger.taskId}' is running ${holding} — waiting for that checkout to free`
+		: `Task '${trigger.taskId}' has ${holding} queued — waiting for it to settle`;
+	logger.info(
+		`Phase deferred - ${phaseLabel(trigger.phase)} — the task ${hold.executing ? 'is running' : 'has queued'} ${holding}`,
+		{
+			projectId: project.id,
+			phase: trigger.phase,
+			holdingPhase: hold.phase,
+			holdingExecuting: hold.executing,
+			taskId: trigger.taskId,
+		},
+	);
 	const { outcome, pending } = await deferBeforeRun(dispatch, job, trigger, project, {
 		waitReason: 'task-in-flight',
-		reason: `Task '${trigger.taskId}' is running ${holding} — waiting for that checkout to free`,
+		reason,
 	});
 	if (pending) {
 		try {
-			const stillExecuting = await findExecutingDispatchForTask(
-				project.id,
-				trigger.taskId,
-				dispatch.id,
-			);
-			if (!stillExecuting && !inFlightPhaseByTask.has(trigger.taskId)) {
+			const stillHeld = await findTaskHold(project.id, trigger, dispatch.id);
+			if (!stillHeld && !inFlightPhaseByTask.has(trigger.taskId)) {
 				await publishDispatchWakeUp(pending);
 			}
 		} catch (err) {
@@ -1243,33 +1256,48 @@ async function handleTaskInFlightDeferral(
  */
 const inFlightPhaseByTask = new Map<string, TriggerPhase>();
 
+/** What is keeping a phase out of this task's shared checkout, if anything. */
+interface TaskHold {
+	/** The holding phase — `null` when that row recorded none, which reads as "some other phase". */
+	phase: string | null;
+	/** False when the holding phase is merely *queued* rather than executing (issue #761). */
+	executing: boolean;
+}
+
 /**
- * Claim this task's checkout for the phase about to run, or report the phase
- * already holding it (issue #759).
+ * The durable half of the in-flight guard: what the dispatch table says is holding
+ * this task, independent of which worker the dispatch was routed to. Shared by the
+ * claim and by the post-defer re-check so both ask exactly the same question.
  *
- * Two legs, in this order, because both are load-bearing:
+ * Two reads, in this order:
  *
- * 1. The **durable** record ({@link findExecutingDispatchForTask}) — awaited first
- *    so the in-memory pair below stays synchronous. It is what makes the verdict
- *    independent of which worker the dispatch was routed to, which the in-memory
- *    map alone never was ("already running in *this* worker").
- * 2. The **in-process** map, read and written with nothing awaited in between,
- *    which is what closes the same-process BullMQ-concurrency window the durable
- *    read cannot: two jobs claimed milliseconds apart are both `leased` with no
- *    `phase` recorded yet.
+ * 1. **A phase executing against the shared checkout** (issue #759) — any phase
+ *    waits behind that, because two of them would collide on `task-<id>`.
+ * 2. **A non-terminal Planning dispatch** (issue #761) — asked *only* by
+ *    Implementation. A queued Planning owns no checkout, so leg 1 cannot see it,
+ *    but Implementation was dispatched to consume the plan it has not produced yet
+ *    and must not overtake it. Every other phase returns at the guard on the line
+ *    below and pays nothing.
  *
- * A failed durable read is logged and treated as *no* collision: failing closed
- * would turn a DB hiccup back into the drop-or-stall this guard exists to remove,
- * and the provision-time worktree-lease gate (issues #367/#427) is still underneath.
+ * The asymmetry is the whole design: Planning never asks whether an Implementation
+ * is queued, so the relationship has no mirror and no order over the pair has to be
+ * derived at claim time (which is what PR #760's symmetric attempts could not do).
+ * A yielding Implementation lands back in `pending`, which leg 1 does not count, so
+ * two dispatches can never defer to each other.
+ *
+ * Both reads **fail open**: a read error is logged and treated as *no* hold, because
+ * failing closed would turn a DB hiccup back into the drop-or-stall this guard
+ * exists to remove, and the provision-time worktree-lease gate (issues #367/#427) is
+ * still underneath.
  */
-async function claimTaskForPhase(
+async function findTaskHold(
 	projectId: string,
 	trigger: TriggerResult,
 	dispatchId: string,
-): Promise<{ claimed: true } | { claimed: false; holdingPhase: string | null }> {
-	let executing: { id: string; phase: string | null } | undefined;
+): Promise<TaskHold | undefined> {
 	try {
-		executing = await findExecutingDispatchForTask(projectId, trigger.taskId, dispatchId);
+		const executing = await findExecutingDispatchForTask(projectId, trigger.taskId, dispatchId);
+		if (executing) return { phase: executing.phase, executing: true };
 	} catch (err) {
 		logger.warn('Could not read the executing dispatch for this task (assuming none)', {
 			projectId,
@@ -1278,10 +1306,46 @@ async function claimTaskForPhase(
 			error: describeError(err),
 		});
 	}
+	if (trigger.phase !== 'implementation') return undefined;
+	try {
+		const planning = await findActivePlanningDispatchForTask(projectId, trigger.taskId, dispatchId);
+		if (planning) return { phase: 'planning', executing: false };
+	} catch (err) {
+		logger.warn('Could not read the queued planning dispatch for this task (assuming none)', {
+			projectId,
+			taskId: trigger.taskId,
+			error: describeError(err),
+		});
+	}
+	return undefined;
+}
+
+/**
+ * Claim this task's checkout for the phase about to run, or report what is already
+ * holding it (issue #759).
+ *
+ * Two legs, in this order, because both are load-bearing:
+ *
+ * 1. The **durable** record ({@link findTaskHold}) — awaited first so the in-memory
+ *    pair below stays synchronous. It is what makes the verdict independent of which
+ *    worker the dispatch was routed to, which the in-memory map alone never was
+ *    ("already running in *this* worker").
+ * 2. The **in-process** map, read and written with nothing awaited in between,
+ *    which is what closes the same-process BullMQ-concurrency window the durable
+ *    read cannot: two jobs claimed milliseconds apart are both `leased` with no
+ *    `phase` recorded yet. A hit there is always an executing phase — this process
+ *    records the map entry as it starts running the phase.
+ */
+async function claimTaskForPhase(
+	projectId: string,
+	trigger: TriggerResult,
+	dispatchId: string,
+): Promise<{ claimed: true } | { claimed: false; hold: TaskHold }> {
+	const durableHold = await findTaskHold(projectId, trigger, dispatchId);
 	// Synchronous from here to the `set` below.
 	const holding = inFlightPhaseByTask.get(trigger.taskId);
-	if (holding !== undefined) return { claimed: false, holdingPhase: holding };
-	if (executing) return { claimed: false, holdingPhase: executing.phase };
+	if (holding !== undefined) return { claimed: false, hold: { phase: holding, executing: true } };
+	if (durableHold) return { claimed: false, hold: durableHold };
 	inFlightPhaseByTask.set(trigger.taskId, trigger.phase);
 	return { claimed: true };
 }
@@ -3425,21 +3489,29 @@ export async function processJob(
 	}
 
 	// Nothing may be dispatched into a task another phase is executing against: the
-	// two would collide on the `task-<id>` checkout. Which of the two collisions this
-	// is decides what happens (issue #759, see `claimTaskForPhase`):
+	// two would collide on the `task-<id>` checkout. And nothing may overtake the
+	// Planning dispatch it exists to consume. Which collision this is decides what
+	// happens (issues #759 and #761, see `claimTaskForPhase`):
 	//
 	// - **The same phase** — a duplicate webhook, or a delayed retry that outlived
 	//   the status dedup's TTL. The work is genuinely redundant, so it is dropped as
 	//   `skipped-duplicate`, exactly as before.
-	// - **A different phase** — the pipeline advancing through one shared checkout.
-	//   `taskId` is deliberately shared by the sequential board-driven pair (issue
-	//   #498), so "Planning finished, the operator moved the card to ToDo" lands here
-	//   while Planning may still be in flight — queued *and* executing time, which on
-	//   issue #754 was over twelve minutes. That waits for the checkout and then runs.
+	// - **A different phase, executing** — the pipeline advancing through one shared
+	//   checkout. `taskId` is deliberately shared by the sequential board-driven pair
+	//   (issue #498), so "Planning finished, the operator moved the card to ToDo"
+	//   lands here while Planning may still be in flight. That waits for the checkout
+	//   and then runs.
+	// - **A Planning dispatch that has not settled, queued or executing** — asked only
+	//   by Implementation (issue #761). The window is queue time *plus* execution time,
+	//   which on issue #754 was over twelve minutes, the first 6.5 of them spent
+	//   waiting for a worker with nothing running; an operator moving the card to ToDo
+	//   in that window produced two deliveries racing to claim. A task with **no**
+	//   Planning dispatch — the ordinary Backlog → ToDo path — finds no hold here and
+	//   starts immediately.
 	const taskClaim = await claimTaskForPhase(project.id, trigger, dispatch.id);
 	if (!taskClaim.claimed) {
-		if (taskClaim.holdingPhase !== trigger.phase) {
-			return handleTaskInFlightDeferral(dispatch, job, trigger, project, taskClaim.holdingPhase);
+		if (taskClaim.hold.phase !== trigger.phase) {
+			return handleTaskInFlightDeferral(dispatch, job, trigger, project, taskClaim.hold);
 		}
 		const reason = `The ${phaseLabel(trigger.phase)} phase is already in flight for task '${trigger.taskId}'`;
 		logger.info('Skipping phase — the same phase is already in flight for this task', {

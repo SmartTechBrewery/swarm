@@ -77,10 +77,12 @@ describe('queuedWaitReasonLabel', () => {
 	});
 
 	// Issue #759: the wait is on the *task*, so the copy must not read as another
-	// worker/slot wait — nothing but that task's current phase finishing ends it.
+	// worker/slot wait — nothing but the phase ahead of it settling ends it. Issue
+	// #761 made that phase possibly *queued* rather than running, so the copy says
+	// "earlier" rather than "current".
 	it('names the task for a phase waiting on its own checkout', () => {
 		expect(queuedWaitReasonLabel('task-in-flight')).toBe(
-			"waiting for the task's current phase to finish",
+			"waiting for the task's earlier phase to finish",
 		);
 	});
 });

@@ -47,9 +47,10 @@ export const dispatches = pgTable(
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
 		 * `worktree-exists`, `stalled`, `recheck`, `worker-eligibility`,
 		 * `worker-authorization`, `preserved-worker`, `task-in-flight` (a later phase
-		 * of a task whose earlier phase is still executing — issue #759),
-		 * `manual-retry`, `recovered`. Null while leased/running and for terminal
-		 * states.
+		 * of a task whose earlier phase is still executing — issue #759 — or an
+		 * Implementation behind a Planning dispatch it must not overtake, queued or
+		 * executing — issue #761), `manual-retry`, `recovered`. Null while
+		 * leased/running and for terminal states.
 		 */
 		waitReason: text('wait_reason'),
 		/**

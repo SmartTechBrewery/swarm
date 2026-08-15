@@ -16,6 +16,7 @@ import {
 	failDispatch,
 	failExpiredDispatchLeases,
 	failSupersededWorkerDispatchClaims,
+	findActivePlanningDispatchForTask,
 	findExecutingDispatchForTask,
 	getActiveDispatchByRunId,
 	getDispatchById,
@@ -310,6 +311,66 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			await seedDispatchInState(TASK, 'running', undefined, 'planning');
 			expect(await findExecutingDispatchForTask(PROJECT_ID, '755')).toBeUndefined();
 			expect(await findExecutingDispatchForTask('proj-other', TASK)).toBeUndefined();
+		});
+	});
+
+	// Issue #761. The executing read above deliberately cannot see a *queued* Planning
+	// dispatch — it owns no checkout — but that is exactly the dispatch an
+	// Implementation must not overtake, since it was dispatched to consume its plan.
+	describe('findActivePlanningDispatchForTask (issue #761)', () => {
+		const TASK = '754';
+
+		it.each([
+			'pending',
+			'leased',
+			'running',
+			'retry-scheduled',
+		] as const)('reports a %s planning dispatch — it has not settled', async (state) => {
+			await seedDispatchInState(TASK, state, undefined, 'planning');
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, TASK)).toMatchObject({ state });
+		});
+
+		it.each([
+			'completed',
+			'failed',
+			'cancelled',
+		] as const)('ignores a %s planning dispatch — a settled plan holds nobody up', async (state) => {
+			await seedDispatchInState(TASK, state, undefined, 'planning');
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, TASK)).toBeUndefined();
+		});
+
+		it.each([
+			'implementation',
+			'review',
+		] as const)('ignores an active %s dispatch — only Planning is waited for', async (phase) => {
+			await seedDispatchInState(TASK, 'pending', undefined, phase);
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, TASK)).toBeUndefined();
+		});
+
+		it('ignores a dispatch whose phase was never recorded — the documented blind spot', async () => {
+			// A never-claimed dispatch carries a null `task_id`/`phase`, so it matches
+			// nothing here. Matching on `phase IS NULL` instead would make two duplicate
+			// Implementation deliveries defer to each other — the mirror case this read
+			// exists to avoid.
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: TASK,
+			});
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, TASK)).toBeUndefined();
+		});
+
+		it('ignores the asking dispatch when it is excluded', async () => {
+			const own = await seedDispatchInState(TASK, 'leased', undefined, 'planning');
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, TASK, own)).toBeUndefined();
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, TASK)).toMatchObject({ id: own });
+		});
+
+		it('scopes to the given project and task', async () => {
+			await seedDispatchInState(TASK, 'pending', undefined, 'planning');
+			expect(await findActivePlanningDispatchForTask(PROJECT_ID, '755')).toBeUndefined();
+			expect(await findActivePlanningDispatchForTask('proj-other', TASK)).toBeUndefined();
 		});
 	});
 
