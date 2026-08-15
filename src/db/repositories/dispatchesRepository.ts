@@ -113,13 +113,21 @@ export type DispatchWaitReason =
 	 */
 	| 'preserved-worker'
 	/**
-	 * A **later phase of a task whose earlier phase is still executing** (issue
-	 * #759). The two board-driven phases deliberately share one `taskId` — Planning
-	 * and Implementation work in the same `task-<id>` checkout on the same branch
-	 * (issue #498, ai/RULES.md §2) — so "Planning finished, the card moved to ToDo"
-	 * arrives while Planning may still be in flight. Such a dispatch holds no
+	 * A **later phase of a task whose earlier phase has not settled** (issues #759
+	 * and #761). The two board-driven phases deliberately share one `taskId` —
+	 * Planning and Implementation work in the same `task-<id>` checkout on the same
+	 * branch (issue #498, ai/RULES.md §2) — so "Planning finished, the card moved to
+	 * ToDo" arrives while Planning may still be in flight. Such a dispatch holds no
 	 * checkout, consumes no attempt budget, and is woken when the holding phase
 	 * settles rather than by a timer, exactly like `project-capacity`.
+	 *
+	 * Two holds settle under this one reason. #759's is a phase *executing* against
+	 * the shared checkout ({@link findExecutingDispatchForTask}), which any phase
+	 * waits behind. #761's is a Planning dispatch that is merely *queued*
+	 * ({@link findActivePlanningDispatchForTask}), which only **Implementation**
+	 * waits behind — so it cannot run without the plan it was dispatched to consume.
+	 * That second hold is one-directional by design: Planning never waits on a
+	 * queued Implementation, so no pair of dispatches can defer to each other.
 	 *
 	 * Distinct from two neighbours on purpose. `worktree-exists` is a *failed*
 	 * provision retrying on a timer; this one never provisioned. And the
@@ -854,6 +862,57 @@ export async function findExecutingDispatchForTask(
 				eq(dispatches.taskId, taskId),
 				inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
 				sql`${dispatches.phase} IS DISTINCT FROM 'merge-automation'`,
+				...(excludeDispatchId ? [ne(dispatches.id, excludeDispatchId)] : []),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt))
+		.limit(1);
+	return rows[0];
+}
+
+/**
+ * A **non-terminal Planning dispatch** for this task — the read that stops an
+ * Implementation from overtaking the plan it was dispatched to consume (issue
+ * #761). {@link findExecutingDispatchForTask} cannot answer this: a *queued*
+ * Planning owns no checkout, which is exactly why that read excludes it, and yet
+ * it is still the plan Implementation must wait for. Issue #754 measured the
+ * window — 6.5 minutes between a Planning dispatch being created and starting,
+ * during which an operator moving the card to ToDo produces a second delivery
+ * that would claim first.
+ *
+ * Four things this read is, deliberately:
+ *
+ * - **All of {@link ACTIVE_DISPATCH_STATES}**, not just the executing pair. A
+ *   Planning waiting for a worker, a project slot, a rate-limit reset, or its own
+ *   `task-in-flight` turn has not settled, so its plan has not landed yet.
+ * - **Keyed on `task_id`/`phase`**, columns the record already normalises when a
+ *   claim resolves the trigger. Reaching into `jobPayload` for a board item id
+ *   would put a provider-shaped path in shared code (ai/RULES.md §2).
+ * - **One-directional.** Nothing asks the mirror question — no phase ever waits on
+ *   a queued *Implementation* — so this read cannot participate in a cycle. It is
+ *   an existence check, not a selector or a priority rule over the table.
+ * - **Blind to a never-claimed dispatch**, whose `task_id`/`phase` are still null
+ *   (`src/db/schema/dispatches.ts`). That is a queue hop rather than a wait, and
+ *   matching on `phase IS NULL` instead would make two duplicate Implementation
+ *   deliveries defer to each other.
+ *
+ * One indexed row at most, on `(project_id, state)` — the same read cost as the
+ * executing lookup above, and paid only by an Implementation dispatch.
+ */
+export async function findActivePlanningDispatchForTask(
+	projectId: string,
+	taskId: string,
+	excludeDispatchId?: string,
+): Promise<{ id: string; state: string } | undefined> {
+	const rows = await getDb()
+		.select({ id: dispatches.id, state: dispatches.state })
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.taskId, taskId),
+				eq(dispatches.phase, 'planning'),
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
 				...(excludeDispatchId ? [ne(dispatches.id, excludeDispatchId)] : []),
 			),
 		)

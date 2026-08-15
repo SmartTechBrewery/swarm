@@ -71,9 +71,11 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// work preserved on one specific machine (issue #567).
 	'preserved-worker': 'waiting for the machine holding its preserved work',
 	// Names the *task*, not a worker or a slot: this phase is next in the task's own
-	// sequence and shares its checkout, so nothing but that checkout freeing ends the
-	// wait (issue #759).
-	'task-in-flight': "waiting for the task's current phase to finish",
+	// sequence and shares its checkout, so nothing but the phase ahead of it settling
+	// ends the wait (issue #759). "Earlier" rather than "current" because since issue
+	// #761 that phase may be *queued* rather than running — an Implementation waiting
+	// on a Planning dispatch that has not started yet.
+	'task-in-flight': "waiting for the task's earlier phase to finish",
 	'manual-retry': 'manual retry',
 	recovered: 'recovered after a restart',
 };

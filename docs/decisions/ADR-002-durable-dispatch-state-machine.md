@@ -80,17 +80,24 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   eligible dispatch under the existing continuation-priority policy and publishes its
   wake-up; the worker re-checks the slot on claim and re-defers if it lost the race.
 - **Phase sequencing within one task** is the second such pending wait (`wait_reason =
-  'task-in-flight'`, issue #759). Two phases must never hold the same `task-<id>`
-  checkout, and the board-driven pair deliberately share a task id (issue #498), so a
-  dispatch whose task is still executing an *earlier* phase is re-deferred to `pending`
-  and woken when that phase settles — instead of being discarded as a duplicate, which
-  is what the `taskId`-only guard used to do to the ordinary Planning → Implementation
-  progression. Same shape as the capacity wait (no attempt spent, event-woken, the
-  reconciler's republish underneath); the *same* phase arriving twice remains the
-  `skipped-duplicate` outcome, so the row never spells the two with one value. The
-  collision is read from this table (`leased`/`running` for that task, excluding the
-  asking dispatch and the worktree-less `merge-automation` kind) rather than only from
-  a worker's memory, so the verdict is not a property of where the dispatch landed.
+  'task-in-flight'`, issues #759 and #761). Two phases must never hold the same
+  `task-<id>` checkout, and the board-driven pair deliberately share a task id (issue
+  #498), so a dispatch whose task has an *earlier* phase that has not settled is
+  re-deferred to `pending` and woken when that phase settles — instead of being
+  discarded as a duplicate, which is what the `taskId`-only guard used to do to the
+  ordinary Planning → Implementation progression. Same shape as the capacity wait (no
+  attempt spent, event-woken, the reconciler's republish underneath); the *same* phase
+  arriving twice remains the `skipped-duplicate` outcome, so the row never spells the
+  two with one value. The collision is read from this table rather than only from a
+  worker's memory, so the verdict is not a property of where the dispatch landed: a
+  phase *executing* against the checkout (`leased`/`running` for that task, excluding
+  the asking dispatch and the worktree-less `merge-automation` kind), which any phase
+  waits behind, and — asked by **Implementation only** — a `planning` dispatch for that
+  task in any non-terminal state (issue #761), so Implementation cannot overtake the
+  plan it was dispatched to consume while that plan is still queued. The second read is
+  one-directional and needs no new state, value, or migration: a yielding Implementation
+  returns to `pending`, which the executing read does not count, so two dispatches can
+  never defer to each other.
 - **Retries.** Rate-limit/capacity/timeout/abort/delivery deferrals derive the next
   attempt's payload (session resume, PM dispatch intent, attempt counter) **inside the
   worker's settle path** and persist it on the dispatch as `retry-scheduled` before any
