@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const {
 	AllowedClisNotCapableError,
 	approveEnrollment,
+	deriveWorkerRunState,
 	enrollWorker,
 	EnrollmentRepositoryMismatchError,
 	getDashboardWorkerDetail,
@@ -39,6 +40,7 @@ const {
 		AllowedClisNotCapableError,
 		EnrollmentRepositoryMismatchError,
 		approveEnrollment: vi.fn(),
+		deriveWorkerRunState: vi.fn(),
 		enrollWorker: vi.fn(),
 		getDashboardWorkerDetail: vi.fn(),
 		getEnrollment: vi.fn(),
@@ -56,6 +58,7 @@ const { getWorker, renameWorker } = vi.hoisted(() => ({
 	getWorker: vi.fn(),
 	renameWorker: vi.fn(),
 }));
+const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
@@ -64,6 +67,7 @@ const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	AllowedClisNotCapableError,
 	approveEnrollment,
+	deriveWorkerRunState,
 	enrollWorker,
 	EnrollmentRepositoryMismatchError,
 	getDashboardWorkerDetail,
@@ -85,6 +89,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	).WorkerOrderDirectionSchema,
 }));
 vi.mock('@/identity/worker-service.js', () => ({ getWorker, renameWorker }));
+vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
 
 import { workersRouter } from '@/api/routers/workers.js';
@@ -166,8 +171,10 @@ beforeEach(() => {
 		setEnrollmentStatus,
 		setSharingConsent,
 		updateEnrollmentConstraints,
+		deriveWorkerRunState,
 		getWorker,
 		renameWorker,
+		removeWorker,
 		getMembership,
 		listAccessibleProjectIds,
 	]) {
@@ -176,6 +183,10 @@ beforeEach(() => {
 	// Every project-scoped list read resolves the project's worker order (issue
 	// #750); a suite that asserts on ordering states its own.
 	listProjectWorkerIdsInOrder.mockResolvedValue([]);
+	// An idle machine unless a case says otherwise — `workers.remove` reads this to
+	// decide whether the machine is mid-run (issue #789).
+	deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
+	removeWorker.mockResolvedValue(true);
 });
 
 describe('workers.list (installation roster, issue #133)', () => {
@@ -1012,5 +1023,75 @@ describe('workers.rename (owner-only, no instanceAdmin override)', () => {
 
 		await expect(owner.rename({ workerId: WORKER_ID, displayName: '  ' })).rejects.toThrow();
 		expect(renameWorker).not.toHaveBeenCalled();
+	});
+});
+
+describe('workers.remove (owner-only deregistration, issue #789)', () => {
+	it('is NOT_FOUND for an unknown worker', async () => {
+		getWorker.mockResolvedValue(undefined);
+
+		await expect(owner.remove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(owner.remove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	it('hides another owner’s worker from an instanceAdmin too — no override', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		await expect(admin.remove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	it('lets the owner delete their own worker', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+
+		const result = await owner.remove({ workerId: WORKER_ID });
+
+		expect(result).toEqual({ workerId: WORKER_ID });
+		expect(removeWorker).toHaveBeenCalledWith(WORKER_ID);
+	});
+
+	it('refuses while the machine is executing a run (CONFLICT), without deleting', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-1' });
+
+		await expect(owner.remove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'CONFLICT' }),
+		);
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	// Merely being connected is not a reason to refuse: the session row cascades and
+	// the daemon's next reconnect fails on a credential that no longer resolves,
+	// which is exactly what retiring a machine means.
+	it('deletes a connected but idle machine', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
+
+		await owner.remove({ workerId: WORKER_ID });
+
+		expect(removeWorker).toHaveBeenCalledWith(WORKER_ID);
+	});
+
+	it('translates a row that vanished under it to NOT_FOUND', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		removeWorker.mockResolvedValue(false);
+
+		await expect(owner.remove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
 	});
 });

@@ -100,10 +100,13 @@ Notes:
   itself). `swarm workers set-cli <worker-id> --auto` clears the declaration and
   returns the worker to plain auto-discovery.
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
-  it again). Copy it immediately; if you lose it, `workers remove` +
-  `workers register` again is the only recovery.
+  it again). Copy it immediately; if you lose it, `workers remove` (or
+  `/workers/<worker-id>` → **Delete worker**, its owner-only dashboard equivalent
+  since issue #789) + `workers register` again is the only recovery.
 - **Step 4 has a dashboard equivalent** (issue #764): the owner of a registered
-  worker can do it themselves — including before its first enrollment — at
+  worker can do it themselves — but **only before its first enrollment** (issue
+  #789), since the machine's checkout pairs it with one repository for its whole
+  connected life and no second project would be accepted — at
   `/workers/<worker-id>` → **Enroll in a project**, picking any project they are at
   least a `contributor` on. It calls the same `workers.enroll` this command does,
   so no CLI or DB access is needed — and it creates the

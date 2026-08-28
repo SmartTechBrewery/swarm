@@ -339,7 +339,13 @@ swarm workers consent <worker-id> <project-id> <on|off>
   back. A worker with none stored for the provider a dispatch needs fails that
   dispatch immediately, naming the worker and the provider. It replaces the
   worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any more.
-- **`remove`** — deregister a worker by worker id.
+- **`remove`** — deregister a worker by worker id. Unconditional: it deregisters a
+  machine that is connected or mid-run alike. Its dashboard equivalent since issue
+  #789 is `/workers/<worker-id>` → **Delete worker**, which is owner-only (no
+  `instanceAdmin` override) and is refused while the machine is executing a run —
+  this command stays the escape hatch for a stuck one. Either way the removal
+  cascades to the worker's enrollments, its operator SCM credentials and its
+  session, while runs it produced stay in history.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

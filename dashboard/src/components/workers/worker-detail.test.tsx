@@ -13,6 +13,7 @@ const {
 	setStatusMutate,
 	renameMutate,
 	enrollMutate,
+	removeMutate,
 	projectsListQueryFn,
 	scmCredentialsListQueryFn,
 	scmCredentialsSetMutate,
@@ -23,6 +24,7 @@ const {
 	setStatusMutate: vi.fn(),
 	renameMutate: vi.fn(),
 	enrollMutate: vi.fn(),
+	removeMutate: vi.fn(),
 	projectsListQueryFn: vi.fn(),
 	scmCredentialsListQueryFn: vi.fn(),
 	scmCredentialsSetMutate: vi.fn(),
@@ -59,6 +61,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			setStatus: { mutate: setStatusMutate },
 			rename: { mutate: renameMutate },
 			enroll: { mutate: enrollMutate },
+			remove: { mutate: removeMutate },
 			scmCredentials: { set: { mutate: scmCredentialsSetMutate } },
 		},
 	},
@@ -123,6 +126,7 @@ function confirmButton(name: string): HTMLElement {
 const PROJECT_NAMES = new Map([['proj-a', 'Widgets']]);
 
 const onChanged = vi.fn();
+const onDeleted = vi.fn();
 
 function renderDetail(ui: ReactElement) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -139,6 +143,7 @@ function renderWorker(
 			projectNames={PROJECT_NAMES}
 			projectDisabledPhases={disabledPhases}
 			onChanged={onChanged}
+			onDeleted={onDeleted}
 		/>,
 	);
 }
@@ -164,12 +169,15 @@ beforeEach(() => {
 	setStatusMutate.mockReset();
 	renameMutate.mockReset();
 	enrollMutate.mockReset();
+	removeMutate.mockReset();
+	removeMutate.mockResolvedValue({ workerId: 'worker-1' });
 	projectsListQueryFn.mockReset();
 	projectsListQueryFn.mockResolvedValue([]);
 	scmCredentialsListQueryFn.mockReset();
 	scmCredentialsListQueryFn.mockResolvedValue({ providers: [] });
 	scmCredentialsSetMutate.mockReset();
 	onChanged.mockReset();
+	onDeleted.mockReset();
 	vi.useFakeTimers({ toFake: ['Date'] });
 	vi.setSystemTime(NOW);
 });
@@ -300,25 +308,73 @@ describe('WorkerDetailView sections (issue #477)', () => {
 
 describe('WorkerDetailView enroll entry point (issue #764)', () => {
 	it('offers the worker’s owner an Enroll in a project action', () => {
-		renderWorker();
+		renderWorker({ enrollments: [] });
 		expect(
 			within(section('Project enrollments')).getByRole('button', { name: 'Enroll in a project' }),
 		).toBeDefined();
 	});
 
 	it('withholds it from a viewer who does not own the machine', () => {
-		renderWorker({ viewerIsOwner: false });
+		renderWorker({ enrollments: [], viewerIsOwner: false });
 		expect(screen.queryByRole('button', { name: 'Enroll in a project' })).toBeNull();
 	});
 
 	it('opens the enrollment form, which names the machine and starts closed', () => {
-		renderWorker();
+		renderWorker({ enrollments: [] });
 
 		expect(screen.queryByRole('button', { name: 'Enroll worker' })).toBeNull();
 		fireEvent.click(screen.getByRole('button', { name: 'Enroll in a project' }));
 
 		expect(screen.getByRole('heading', { name: 'Enroll ada-laptop in a project' })).toBeDefined();
 		expect(screen.getByRole('button', { name: 'Enroll worker' })).toBeDefined();
+	});
+
+	// issue #789 — the machine's checkout pairs it with one repository for life, so
+	// once it holds any enrollment there is no second project the server would accept
+	// and the affordance is withdrawn rather than left to be refused.
+	it('withholds the action once the machine holds an enrollment', () => {
+		renderWorker();
+		expect(screen.queryByRole('button', { name: 'Enroll in a project' })).toBeNull();
+	});
+
+	it.each([
+		'pending',
+		'suspended',
+	] as const)('withholds it for a %s enrollment too — any enrollment is the pairing', (status) => {
+		renderWorker({ enrollments: [makeEnrollment({ status })] });
+
+		expect(screen.queryByRole('button', { name: 'Enroll in a project' })).toBeNull();
+		expect(screen.queryByRole('heading', { name: 'Enroll ada-laptop in a project' })).toBeNull();
+	});
+
+	it('keeps offering it to an owner whose machine is enrolled nowhere', () => {
+		renderWorker({ enrollments: [] });
+		expect(screen.getByRole('button', { name: 'Enroll in a project' })).toBeDefined();
+	});
+});
+
+describe('WorkerDetailView delete worker (issue #789)', () => {
+	it('renders the section for the worker’s owner', () => {
+		renderWorker();
+		expect(screen.getByRole('heading', { name: 'Delete worker' })).toBeDefined();
+	});
+
+	it('omits it for a viewer who does not own the machine', () => {
+		renderWorker({ viewerIsOwner: false });
+		expect(screen.queryByRole('heading', { name: 'Delete worker' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Delete worker' })).toBeNull();
+	});
+
+	it('reports the deletion to the caller once it lands', async () => {
+		renderWorker();
+
+		fireEvent.click(
+			within(section('Delete worker')).getByRole('button', { name: 'Delete worker' }),
+		);
+		fireEvent.click(confirmButton('Delete worker'));
+
+		await waitFor(() => expect(removeMutate).toHaveBeenCalledWith({ workerId: 'worker-1' }));
+		await waitFor(() => expect(onDeleted).toHaveBeenCalled());
 	});
 });
 

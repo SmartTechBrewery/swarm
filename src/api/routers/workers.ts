@@ -1,6 +1,7 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
+import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
 import { WorkerDisplayNameSchema } from '../../identity/worker.js';
@@ -9,6 +10,7 @@ import {
 	approveEnrollment,
 	type DashboardProjectScope,
 	type DashboardWorkerView,
+	deriveWorkerRunState,
 	EnrollmentRepositoryMismatchError,
 	enrollWorker,
 	getDashboardWorkerDetail,
@@ -58,13 +60,15 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   create its first enrollment.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
- *   (`enroll`), renames a machine (`rename`), and controls the revocable
- *   sharing consent (`setConsent`) and execution constraints
- *   (`updateConstraints`). Ownership is checked per call. `enroll` alone lets
- *   an `instanceAdmin` act on any worker (layer-1 override, `resolveOwnedWorker`)
- *   — offering a worker to a project reads as administering the project side
- *   of that offer; `rename`, `setConsent`, and `updateConstraints` are the
- *   machine owner's own call about their own machine and admit no such
+ *   (`enroll`), renames a machine (`rename`), retires one for good (`remove`,
+ *   issue #789 — the dashboard-reachable twin of `swarm workers remove`), and
+ *   controls the revocable sharing consent (`setConsent`) and execution
+ *   constraints (`updateConstraints`). Ownership is checked per call. `enroll`
+ *   alone lets an `instanceAdmin` act on any worker (layer-1 override,
+ *   `resolveOwnedWorker`) — offering a worker to a project reads as
+ *   administering the project side of that offer; `rename`, `remove`,
+ *   `setConsent`, and `updateConstraints` are the machine owner's own call about
+ *   their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
  *   worker/enrollment existence never leaks across owners. The nested
@@ -314,6 +318,40 @@ export const workersRouter = router({
 				}
 				throw error;
 			}
+		}),
+
+	// Deregister one of the caller's own workers — the dashboard-reachable twin of
+	// `swarm workers remove`, and the retirement half of "a worker is paired with one
+	// repository, for life" (issue #789). Gated by strict ownership exactly like
+	// `rename`: the machine is the owner's, so an `instanceAdmin` gets the same
+	// NOT_FOUND a stranger does and their path to someone else's machine stays the CLI.
+	//
+	// Refused while the machine is executing a run: `runs.worker_id` is
+	// ON DELETE SET NULL, so deleting mid-run would silently detach a live run from the
+	// machine still running it. Merely being connected is fine — `worker_sessions`
+	// cascades, and the daemon's next reconnect fails on a credential that no longer
+	// resolves, which is what retiring a machine means. The check is advisory, not a
+	// lock: a dispatch claimed between it and the delete still slips through, and the
+	// CLI's own `workers remove` keeps its unconditional behaviour as the escape hatch.
+	//
+	// Everything else the worker carries goes with it through existing FK constraints —
+	// its enrollments, its operator SCM credentials, and its session — while its runs
+	// stay in history with `worker_user_id` preserving the attribution.
+	remove: authedProcedure
+		.input(z.object({ workerId: z.string().uuid() }))
+		.mutation(async ({ ctx, input }) => {
+			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			const runState = await deriveWorkerRunState(input.workerId);
+			if (runState.busy) {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						'This worker is running a job right now. Wait for it to finish, or stop the run, before deleting the worker.',
+				});
+			}
+			const removed = await removeWorker(input.workerId);
+			if (!removed) throw workerNotFound(input.workerId);
+			return { workerId: input.workerId };
 		}),
 
 	// Offer one of the caller's workers to a project. The caller must own the
