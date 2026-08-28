@@ -79,7 +79,7 @@ Early implementation. Summary by area:
 - A genuinely-interrupted wall-clock timeout and an agent response stall (`stalled` kind, e.g. "timeout waiting for response") are deferred and resumed on the same shared retry budget (see the "Agent session resume" bullet above); only a timeout that still exited 0 (worktree already gone) is a terminal failure. For those terminal cases on PM-driven phases (planning/implementation), `reportPhaseFailureToBoard` appends a splitting suggestion to the failure comment, advising that the task's scope may be too large and should be split by hand.
 - PM retries preserve their original phase dispatch separately from branch reuse: Implementation records an explicit checkpoint only after its task worktree is acquired, so an early failed/manual retry can re-enter the phase without falsely trying to check out a branch that was never created.
 - Job-priority split: SCM jobs (`kind !== 'work-item'`) always dequeue ahead of PM-driven jobs (`kind === 'work-item'`), via `src/queue/producer.ts`'s `priorityFor`.
-- Worker-global concurrency is configurable (`SWARM_WORKER_CONCURRENCY`, default 1), with an enforced per-project `maxConcurrentJobs` cap layered on top.
+- Concurrency is governed by the per-project `maxConcurrentJobs` and the per-enrollment `concurrencyAllocation`, both enforced at claim time; the former process-wide env cap is gone (issue #811).
 - Jobs older than 24 hours are discarded at worker pickup (`SWARM_MAX_JOB_AGE_MS` overrides this), so restarting a worker after an extended offline period cannot replay stale board activity.
 
 ### Cross-cutting

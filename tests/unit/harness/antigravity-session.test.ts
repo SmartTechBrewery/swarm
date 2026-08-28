@@ -41,7 +41,8 @@ describe('antigravity-session', () => {
 	});
 
 	it('returns undefined when multiple new conversations are ambiguous (never guesses)', () => {
-		// Under SWARM_WORKER_CONCURRENCY > 1 a concurrent agy run can create its own
+		// When two agy runs overlap on one machine (an enrollment whose
+		// concurrencyAllocation is above 1) the concurrent run can create its own
 		// conversation in the window; guessing would risk resuming a sibling task's
 		// session, so capture is skipped and the retry starts fresh instead.
 		const before = snapshotConversationIds(dir);

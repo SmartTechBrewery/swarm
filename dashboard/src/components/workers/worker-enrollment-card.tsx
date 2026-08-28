@@ -498,7 +498,7 @@ export function WorkerEnrollmentCard({
 				<div className="space-y-2">
 					<ControlHeading title="Concurrency allocation">
 						How many of this project's jobs run on this machine at once — 1 unless it was raised.
-						The machine's own concurrency and the project cap still apply on top.
+						The project's Maximum Concurrent Jobs cap still applies on top.
 					</ControlHeading>
 					<ConcurrencyControl
 						enrollmentId={enrollment.enrollmentId}

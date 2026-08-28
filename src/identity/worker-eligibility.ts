@@ -191,9 +191,8 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 		return { eligible: false, reason: 'missing-consent' };
 	}
 	// Every enrollment states this worker's share of the project (issue #480), so
-	// the capacity test is unconditional: the worker's process-wide
-	// `SWARM_WORKER_CONCURRENCY` and the project's cap bound it further, they never
-	// stand in for a missing allocation.
+	// the capacity test is unconditional: the project's `maxConcurrentJobs` bounds
+	// it further, it never stands in for a missing allocation.
 	const atCapacity = availability.activeRuns >= enrollment.concurrencyAllocation;
 	if (!availability.connected || atCapacity) {
 		return { eligible: false, reason: 'worker-unavailable' };

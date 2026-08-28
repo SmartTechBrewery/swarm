@@ -346,7 +346,7 @@ export function WorkerEnrollDialog({
 					) : (
 						<p className="text-xs text-zinc-500 mt-1">
 							How many of this project's jobs may run here at once. Leave it blank for 1; the
-							machine's own concurrency and the project cap still apply on top.
+							project's Maximum Concurrent Jobs cap still applies on top.
 						</p>
 					)}
 				</div>

@@ -34,8 +34,8 @@ CLI's `--help` and by an end-to-end resume:
 | `codex` | `codex exec resume <id> <prompt>` | yes: positional `SESSION_ID` | no upfront flag |
 
 The "most recent" shortcuts (`codex --last`, `agy -c`/`--continue`) are deliberately **not**
-used: they resolve to the host's most-recent session globally, which is racy under
-concurrent workers (`SWARM_WORKER_CONCURRENCY > 1`). SWARM always resumes by explicit id.
+used: they resolve to the host's most-recent session globally, which is racy whenever
+two runs overlap on one machine. SWARM always resumes by explicit id.
 
 ### (a) Capturing the session id — `src/harness/agent-cli.ts`, `usage.ts`, `antigravity-session.ts`
 
