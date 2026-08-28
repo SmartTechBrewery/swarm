@@ -21,6 +21,12 @@
  * machine (issue #765) read without echo, and prints no preview of it. No
  * subcommand prints a credential or its hash.
  *
+ * `register` *points at* that second secret's write surfaces rather than taking
+ * it (issue #767): a worker's SCM provider is a property of its enrollments and
+ * is not known at registration time, so prompting here would have to guess one
+ * provider — exactly the GitHub assumption `ai/RULES.md` §2 keeps out of the SCM
+ * layer. It therefore gains no token flag and no prompt of any kind.
+ *
  * Subcommands:
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
  *   swarm workers list [<owner-identifier>]
@@ -86,7 +92,13 @@ Usage:
   register   Register a worker for an owner (by login handle) with a display
              name and declared CLIs (--cli, comma-separated, one or more of
              ${AGENT_CLIS.join(' | ')}). Prints a worker credential ONCE — store
-             it then, it is never shown again.
+             it then, it is never shown again. Registration gives the machine no
+             SCM identity: it cannot run a phase until its operator
+             source-control credential is set for the provider its projects use.
+             Its owner does that in the dashboard at /workers/<worker-id> →
+             "Operator source-control credential"; for someone else's machine,
+             run set-scm-credential below. This command asks for no token of any
+             kind — the provider is not known at registration time.
   list       List workers ('<id>\\t<displayName>\\t<clis>' per line). With an
              owner identifier, only that owner's; without, all owners' (prefixed
              with the owner identifier). Never prints a credential or its hash.
@@ -232,6 +244,20 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 		});
 		out.info(
 			`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
+		);
+		// Registration issues the worker's *connection* credential and nothing else, so
+		// the machine still has no source-control identity and every dispatch to it
+		// fails until one is stored (issue #765). Name both write surfaces and no
+		// provider: which one a worker ends up on is decided by its enrollments, so the
+		// hand-off goes to a surface that offers the right field per provider rather
+		// than prompting here for one provider's secret. The credential stays the last
+		// line printed — that "copy the last line" affordance is what
+		// docs/onboarding-worker.md tells operators to do.
+		out.info(
+			'this worker has no operator source-control credential yet and cannot run a phase until it does — one per SCM provider its projects use',
+		);
+		out.info(
+			`  its owner sets it in the dashboard at /workers/${worker.id} → "Operator source-control credential"; for someone else's machine: swarm workers set-scm-credential ${worker.id} <scm-provider-id>`,
 		);
 		out.info('worker credential (store it now — it will not be shown again):');
 		out.info(credential);

@@ -194,6 +194,36 @@ describe('swarm workers', () => {
 			expect(closeDb).toHaveBeenCalledOnce();
 		});
 
+		it('hands the operator off to the dashboard for the SCM credential, naming no provider and reading no secret', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(
+				await run(['register', 'ada@example.com', '--name', 'ada-laptop', '--cli', 'claude']),
+			).toBe(0);
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines.some((line) => line.includes('cannot run a phase'))).toBe(true);
+			expect(
+				lines.some(
+					(line) =>
+						line.includes(`/workers/${WORKER_ID}`) &&
+						line.includes('Operator source-control credential'),
+				),
+			).toBe(true);
+			// Provider-agnostic and non-interactive: no provider is named, and nothing is read.
+			expect(lines.some((line) => /github|gitlab|bitbucket/i.test(line))).toBe(false);
+			expect(promptHidden).not.toHaveBeenCalled();
+			expect(readStdin).not.toHaveBeenCalled();
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
+		it('describes the hand-off in --help without registering anything', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['register', '--help'])).toBe(0);
+			expect(log).toHaveBeenCalledWith(
+				expect.stringContaining('Operator source-control credential'),
+			);
+			expect(registerWorker).not.toHaveBeenCalled();
+		});
+
 		it('requires an owner identifier, a name, and a cli list', async () => {
 			expect(await run(['register'])).toBe(1);
 			expect(await run(['register', 'ada@example.com'])).toBe(1);
