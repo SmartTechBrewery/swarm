@@ -20,8 +20,8 @@ import { authedProcedure, router } from '../trpc.js';
  * **Credentials**.
  *
  * One value per `(provider, role)` slot the provider declares eligible
- * (`ScmCredentialRoleSpec.instanceDefault` — today exactly GitHub's `reviewer`), stored
- * encrypted in `instance_scm_credentials`. Its own table rather than a key in the
+ * (`ScmCredentialRoleSpec.instanceDefault` — every runtime-ready provider's `reviewer`
+ * since issue #778), stored encrypted in `instance_scm_credentials`. Its own table rather than a key in the
  * `app_settings` blob, because `settings.get` returns that whole object to any
  * authenticated caller and a secret there would be echoed back verbatim.
  *
@@ -30,7 +30,9 @@ import { authedProcedure, router } from '../trpc.js';
  * their no-fallback-chain rule is untouched — and setting or clearing a default has no
  * effect on any existing project, whose own credential stays editable on its Source
  * Control tab. Copying the default into a *new* project's own row at creation is phase
- * 2/2.
+ * 2/2 — and since issue #778 a *missing* one refuses that creation outright
+ * (`requireInstanceScmDefaults`, `./projects.ts`), which is what makes this the surface
+ * an operator must visit before creating a project on a provider.
  *
  * **Authorization is enforced here, not on the screen.** Every procedure, reads
  * included, is instance-administrator only. That is the difference from the `agents`

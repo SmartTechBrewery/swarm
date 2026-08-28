@@ -228,16 +228,24 @@ describe('SCM provider conformance', () => {
 			}
 		});
 
-		// A deliberate tripwire rather than a description: a provider opting its reviewer
-		// role in is a decision made in that provider's own issue, which then updates this
-		// list — never a side effect of unrelated work (issue #769).
-		it('offers exactly the instance-default pairs expected today', () => {
-			expect(
-				listInstanceDefaultScmRoles().map((eligible) => ({
-					providerId: eligible.providerId,
-					role: eligible.role,
-				})),
-			).toEqual([{ providerId: 'github', role: 'reviewer' }]);
+		// Issue #769 pinned this to exactly `[{ github, reviewer }]` as a tripwire, because
+		// opting a reviewer role in was then a per-provider decision made in that provider's
+		// own issue. Issue #778 made it installation-wide policy instead — the reviewer
+		// identity is a requirement of the installation, not a per-provider convenience — so
+		// the assertion is now the rule rather than an enumeration, and a fourth provider
+		// inherits it instead of editing a list.
+		it('offers every runtime-ready provider’s reviewer role as an instance default', () => {
+			const eligible = listInstanceDefaultScmRoles();
+
+			expect(eligible.map((entry) => ({ providerId: entry.providerId, role: entry.role }))).toEqual(
+				manifests
+					.filter(isRuntimeReadySCMProvider)
+					.map((manifest) => ({ providerId: manifest.id, role: 'reviewer' as const })),
+			);
+			for (const manifest of manifests.filter(isRuntimeReadySCMProvider)) {
+				const spec = manifest.credentialRoles.find((entry) => entry.role === 'reviewer');
+				expect(spec?.instanceDefault, `${manifest.id}.reviewer`).toBe(true);
+			}
 		});
 	});
 });

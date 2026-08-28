@@ -66,8 +66,15 @@ export const gitlabScmManifest: SCMProviderManifest = {
 	// token GitLab echoes in `X-Gitlab-Token` (see `./webhook.ts`), not an HMAC key —
 	// and now that it is per provider, the per-provider secret reference GitLab 19.0's
 	// Standard-Webhooks signing tokens would need is no longer a blocker on its own.
+	//
+	// `instanceDefault` on `reviewer` (issue #778): the reviewer identity is an
+	// installation-wide *requirement*, not a per-provider convenience — SWARM's
+	// loop-prevention model wants one reviewer account distinct from the implementer
+	// (ai/RULES.md §3), and an installation normally runs that one account across every
+	// GitLab project, so an instance administrator records it once. The webhook secret
+	// stays ineligible: it is tied to each project's own webhook endpoint.
 	credentialRoles: [
-		{ role: 'reviewer', envVarKey: 'GITLAB_TOKEN_REVIEWER' },
+		{ role: 'reviewer', envVarKey: 'GITLAB_TOKEN_REVIEWER', instanceDefault: true },
 		{ role: 'webhookSecret', envVarKey: 'GITLAB_WEBHOOK_SECRET' },
 	],
 	// One shared instance: the integration is stateless and takes `project` per

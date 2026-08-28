@@ -35,7 +35,7 @@ const ORDINARY_USER: SwarmUser = {
 	instanceAdmin: false,
 };
 
-describe('instanceCredentialsRouter (issue #769)', () => {
+describe('instanceCredentialsRouter (issues #769, #778)', () => {
 	const caller = instanceCredentialsRouter.createCaller({ user: ADMIN_USER });
 	const ordinaryCaller = instanceCredentialsRouter.createCaller({ user: ORDINARY_USER });
 
@@ -53,6 +53,9 @@ describe('instanceCredentialsRouter (issue #769)', () => {
 
 			const result = await caller.list();
 
+			// Every registered provider's reviewer slot, in registration order (issue #778):
+			// the AC's "the Credentials tab offers a field for each provider", asserted at the
+			// API boundary the tab renders from rather than in the dashboard.
 			expect(result.roles).toEqual([
 				{
 					providerId: 'github',
@@ -61,6 +64,20 @@ describe('instanceCredentialsRouter (issue #769)', () => {
 					envVarKey: 'GITHUB_TOKEN_REVIEWER',
 					isConfigured: true,
 				},
+				{
+					providerId: 'bitbucket',
+					providerLabel: 'Bitbucket',
+					role: 'reviewer',
+					envVarKey: 'BITBUCKET_TOKEN_REVIEWER',
+					isConfigured: false,
+				},
+				{
+					providerId: 'gitlab',
+					providerLabel: 'GitLab',
+					role: 'reviewer',
+					envVarKey: 'GITLAB_TOKEN_REVIEWER',
+					isConfigured: false,
+				},
 			]);
 		});
 
@@ -68,8 +85,8 @@ describe('instanceCredentialsRouter (issue #769)', () => {
 			vi.mocked(listConfiguredInstanceScmCredentials).mockResolvedValue([]);
 
 			const result = await caller.list();
-			expect(result.roles).toHaveLength(1);
-			expect(result.roles[0]?.isConfigured).toBe(false);
+			expect(result.roles).toHaveLength(3);
+			expect(result.roles.every((entry) => entry.isConfigured)).toBe(false);
 		});
 
 		// The assertion that pins the eligibility rule at the API boundary: the webhook
@@ -122,13 +139,27 @@ describe('instanceCredentialsRouter (issue #769)', () => {
 			expect(writeInstanceScmCredential).not.toHaveBeenCalled();
 		});
 
-		// Bitbucket and GitLab are registered and runtime-ready, but neither opts its
-		// reviewer role in — so the answer is about the role, not the provider's existence.
-		it('refuses a runtime-ready provider that has not opted in', async () => {
+		// Issue #778: the reviewer slot is installation-wide policy for *every* registered
+		// provider, so all three are writable rather than GitHub's alone — which is what
+		// makes the refusal in `projects.create` fixable for a Bitbucket or GitLab project.
+		it("writes through for every provider's reviewer slot, not just GitHub's", async () => {
+			await caller.set({ providerId: 'bitbucket', role: 'reviewer', value: 'bb_app_password' });
+			await caller.set({ providerId: 'gitlab', role: 'reviewer', value: 'glpat_instance' });
+
+			expect(vi.mocked(writeInstanceScmCredential).mock.calls).toEqual([
+				['bitbucket', 'reviewer', 'bb_app_password'],
+				['gitlab', 'reviewer', 'glpat_instance'],
+			]);
+		});
+
+		// The refusal is about the *role*, not the provider's existence: a registered,
+		// runtime-ready provider's `webhookSecret` is still refused, since it is tied to one
+		// project's own endpoint and no provider may ever opt it in.
+		it("refuses another provider's webhookSecret, not only GitHub's", async () => {
 			await expect(
-				caller.set({ providerId: 'gitlab', role: 'reviewer', value: 'glpat' }),
+				caller.set({ providerId: 'gitlab', role: 'webhookSecret', value: 'shh' }),
 			).rejects.toThrow(
-				/SCM provider 'gitlab' declares no instance-level default for credential role 'reviewer'/,
+				/SCM provider 'gitlab' declares no instance-level default for credential role 'webhookSecret'/,
 			);
 			expect(writeInstanceScmCredential).not.toHaveBeenCalled();
 		});
