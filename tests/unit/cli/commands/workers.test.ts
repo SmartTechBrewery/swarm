@@ -80,6 +80,21 @@ function lines(): string[] {
 	return vi.mocked(console.log).mock.calls.map(([line]) => String(line));
 }
 
+/**
+ * Run a body with stdin looking like a terminal, so the commands prompt instead of
+ * reading a pipe. A test process is not a TTY, which is why this has to be faked —
+ * and restored, since it is a property of the shared `process.stdin`.
+ */
+async function onATTY(body: () => Promise<void>): Promise<void> {
+	const isTTY = process.stdin.isTTY;
+	Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+	try {
+		await body();
+	} finally {
+		Object.defineProperty(process.stdin, 'isTTY', { value: isTTY, configurable: true });
+	}
+}
+
 describe('swarm workers', () => {
 	beforeEach(() => {
 		delete process.env.INIT_CWD;
@@ -464,6 +479,31 @@ describe('swarm workers', () => {
 			expect(inputFor('workers.scmCredentials.set')).toMatchObject({ providerId: 'bitbucket' });
 		});
 
+		// …and so it names that provider's own credential type in the prompt (#807),
+		// rather than the one the project it is being enrolled into does not use.
+		it('names the resolved provider’s credential type in the prompt', async () => {
+			answers.set('workers.projectScmProvider', () => ({ providerId: 'bitbucket' }));
+			await onATTY(async () => {
+				expect(await run(ARGV)).toBe(0);
+				expect(promptHidden).toHaveBeenCalledWith(
+					"Operator bitbucket credential (App Password) for 'ada-laptop': ",
+				);
+			});
+		});
+
+		// The id is resolved through the *control plane's* registry, so a provider this
+		// CLI's copy catalogue does not name can reach the prompt. It then says less
+		// rather than describing somebody else's secret in GitHub's words (#807).
+		it('omits the credential type for a provider it has no wording for', async () => {
+			answers.set('workers.projectScmProvider', () => ({ providerId: 'perforce' }));
+			await onATTY(async () => {
+				expect(await run(ARGV)).toBe(0);
+				expect(promptHidden).toHaveBeenCalledWith(
+					"Operator perforce credential for 'ada-laptop': ",
+				);
+			});
+		});
+
 		// The ordering guarantee, restated for the networked calls: everything that can
 		// fail without writing runs before `workers.register`.
 		it('refuses a project whose SCM provider does not resolve, before writing anything', async () => {
@@ -779,18 +819,22 @@ describe('swarm workers', () => {
 			expect(printed).not.toContain('piped-secret');
 		});
 
-		// The prompt names the machine, which is why the detail is read before it.
-		it('names the worker in the prompt on a TTY', async () => {
-			const isTTY = process.stdin.isTTY;
-			Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-			try {
-				expect(await run(['set-scm-credential', WORKER_ID, 'github'])).toBe(0);
+		// The prompt names the machine, which is why the detail is read before it — and
+		// since issue #807 it also names the *kind* of secret the provider expects,
+		// which the bare provider id left an operator to know or guess. The wording is
+		// projected off the one catalogue the dashboard's operator-credential card names
+		// it in (`SCM_OPERATOR_CREDENTIAL_COPY`), so the two cannot diverge.
+		it.each([
+			['github', 'Personal Access Token'],
+			['bitbucket', 'App Password'],
+			['gitlab', 'Access Token'],
+		])('names the worker and %s’s own credential type in the prompt on a TTY', async (providerId, credentialType) => {
+			await onATTY(async () => {
+				expect(await run(['set-scm-credential', WORKER_ID, providerId])).toBe(0);
 				expect(promptHidden).toHaveBeenCalledWith(
-					expect.stringContaining("Operator github credential for 'ada-laptop'"),
+					`Operator ${providerId} credential (${credentialType}) for 'ada-laptop': `,
 				);
-			} finally {
-				Object.defineProperty(process.stdin, 'isTTY', { value: isTTY, configurable: true });
-			}
+			});
 		});
 
 		it('rejects an unknown SCM provider id without a round trip', async () => {

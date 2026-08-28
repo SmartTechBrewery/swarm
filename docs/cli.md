@@ -556,9 +556,13 @@ unchanged.
   rest and resolved at dispatch, so a rotation takes effect on the next phase with no
   worker restart. The secret is prompted for without echo on a TTY and otherwise read
   from stdin — never taken as an argument (shell history, `ps`) and never printed
-  back — and it is verified against the provider before anything is stored. A worker
-  with none stored for the provider a dispatch needs fails that
-  dispatch immediately, naming the worker and the provider. It replaces the
+  back — and it is verified against the provider before anything is stored. The prompt
+  names the kind of secret that provider expects (a GitHub personal access token, a
+  Bitbucket app password, a GitLab access token) in the same words the worker page's
+  **Operator source-control credential** card uses, from one shared catalogue
+  (`src/scm/operator-credential-copy.ts`, issue #807). A worker with none stored for
+  the provider a dispatch needs fails that dispatch immediately, naming the worker
+  and the provider. It replaces the
   worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any more. Owner-only
   (narrowing 1).
 - **`remove`** — deregister a worker by worker id. Owner-only, and refused while the

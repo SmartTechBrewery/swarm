@@ -6,6 +6,7 @@
  * `dashboard/vitest.config.ts`), mirroring the `board-mapping.ts`/`.test.ts` split.
  */
 
+import { SCM_OPERATOR_CREDENTIAL_COPY } from '../../../src/scm/operator-credential-copy.js';
 import type { ScmCredentialRole, ScmType } from '../../../src/scm/types.js';
 
 /**
@@ -125,6 +126,11 @@ export interface ScmProviderCopy {
 	 * so it is deliberately outside the project-scoped role pair above. Per provider
 	 * for the same reason the role labels are — GitHub's PAT is Bitbucket's app
 	 * password.
+	 *
+	 * Unlike everything else here it is **not** hand-kept per screen: it is projected
+	 * off `SCM_OPERATOR_CREDENTIAL_COPY` (`src/scm/operator-credential-copy.ts`), the
+	 * one catalogue `swarm workers set-scm-credential` names the same secret from
+	 * (issue #807), so the two surfaces cannot describe it differently.
 	 */
 	operatorLabel: string;
 	operatorDescription: string;
@@ -179,7 +185,7 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 		roleLabels: GITHUB_ROLE_LABELS,
 		roleDescriptions: GITHUB_ROLE_DESCRIPTIONS,
 		verifyFailureMessage: 'Token did not resolve to a GitHub account. Check it and try again.',
-		operatorLabel: 'Operator PAT',
+		operatorLabel: SCM_OPERATOR_CREDENTIAL_COPY.github.label,
 		operatorDescription:
 			'GitHub personal access token this machine acts as. Needs repo scope, and must resolve to a different GitHub account than any project\u2019s reviewer PAT for loop prevention to work.',
 	},
@@ -190,7 +196,7 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 		roleDescriptions: BITBUCKET_ROLE_DESCRIPTIONS,
 		verifyFailureMessage:
 			'Credential did not resolve to a Bitbucket account. It must be a "username:app_password" pair — a workspace or repository access token cannot resolve an identity.',
-		operatorLabel: 'Operator App Password',
+		operatorLabel: SCM_OPERATOR_CREDENTIAL_COPY.bitbucket.label,
 		operatorDescription:
 			'Bitbucket app password this machine acts as, as "username:app_password" — the only form that resolves an account. Must resolve to a different Bitbucket account than any project\u2019s reviewer credential for loop prevention to work. Grant it the email scope so its commits are attributed rather than landing on a noreply address.',
 	},
@@ -201,7 +207,7 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 		roleDescriptions: GITLAB_ROLE_DESCRIPTIONS,
 		verifyFailureMessage:
 			'Token did not resolve to a GitLab account. It needs the api scope, and only gitlab.com is supported — a self-managed host cannot be verified.',
-		operatorLabel: 'Operator Access Token',
+		operatorLabel: SCM_OPERATOR_CREDENTIAL_COPY.gitlab.label,
 		operatorDescription:
 			'GitLab access token (personal, group, or project) this machine acts as, needing the api scope. Must resolve to a different GitLab account than any project\u2019s reviewer token for loop prevention to work. A token whose scope withholds the account email still delivers, but its commits stay unlinked.',
 	},
