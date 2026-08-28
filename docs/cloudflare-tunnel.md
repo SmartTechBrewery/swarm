@@ -147,6 +147,16 @@ terminal window:
    > inside the network) — not `${ROUTER_PORT}`, which is only the *host*-published
    > port Paths A/B use because they run `cloudflared` on the host itself.
 
+   > **If the same hostname also fronts the dashboard/API** (a second Public
+   > Hostname entry with a path prefix, routing everything else to the API server
+   > instead of one catch-all `service: http://router:3000`), every top-level path
+   > the **router** serves needs its own explicit rule *above* that catch-all, or it
+   > 404s at the Cloudflare edge before ever reaching your machine — a path-scoped
+   > setup like this doesn't discover new router routes on its own. As of issue #800
+   > that's three prefixes: `^/github/webhook`, `^/worker/`, and **`^/operator/`**
+   > (the CLI's `swarm login` + `swarm workers` network path — see below). Add each
+   > as `service: http://router:3000`, ordered before the catch-all.
+
 3. **Set the token** in `.env` (copy from `.env.docker.example` if you haven't already)
    and activate the service's Compose profile:
    ```bash
@@ -266,6 +276,32 @@ time, just as with the webhook.
 
 ---
 
+## The operator CLI (`/operator/*`)
+
+Since issue #796 the same tunnel also fronts a second authenticated surface: the
+one `swarm login` and every `swarm workers` subcommand use to onboard and manage a
+worker with no `DATABASE_URL` at all — see
+[`docs/onboarding-worker.md`](./onboarding-worker.md)'s three-command path. Point
+`SWARM_CONTROL_PLANE_URL` at the tunnel the same way as for a remote worker:
+
+```bash
+SWARM_CONTROL_PLANE_URL=https://swarm.example.com swarm login --identifier <email>
+```
+
+This calls `POST https://swarm.example.com/operator/session` for the login itself
+and `https://swarm.example.com/operator/trpc/*` for every `swarm workers` call
+that follows — both under the `/operator/*` prefix, alongside `/worker/*` and
+`/github/webhook`.
+
+A **single catch-all Public Hostname** (`service: http://router:3000`, Path B/C as
+documented above) already covers this — nothing to add. A tunnel configured with
+**path-scoped rules instead** (see the callout under Path C) needs `^/operator/`
+added explicitly, same as `^/worker/`; without it, `swarm login` fails with `the
+control plane refused the login (HTTP 404)` — a response from Cloudflare's own
+catch-all, before the request ever reaches your router.
+
+---
+
 ## Verify it works
 
 1. **Tunnel reachable** — hit the router's health check *through* the tunnel:
@@ -289,6 +325,7 @@ time, just as with the webhook.
 | `curl https://<tunnel>/health` times out | `cloudflared` not running, or pointed at the wrong port — confirm it forwards to the same port the router publishes (`ROUTER_PORT`). |
 | Health check works locally but not via tunnel | Router is bound inside Docker but the host port isn't published, or `cloudflared` targets `localhost` on a machine where the port isn't mapped. Check `docker compose ps` and the `ROUTER_PORT` mapping. |
 | GitHub delivery shows `couldn't connect` | Quick-tunnel URL changed after a restart (Path A) — grab the new URL and update the Payload URL, or switch to a named tunnel (Path B/C). |
+| `swarm login` says `the control plane refused the login (HTTP 404)`, or a `swarm workers` command 404s | A path-scoped tunnel is missing the `^/operator/` rule (see [The operator CLI](#the-operator-cli-operator) above) — confirm with `curl -X POST https://<tunnel>/operator/session -d '{}'`: a `400`/`401` means the route exists and something else is wrong; a `404` with no `service` field in the response body means the tunnel itself never forwarded it. |
 | Deliveries arrive but signature checks fail (post-SWARM-9) | Webhook **Secret** in GitHub doesn't match the secret the router is configured with. |
 | No `projects_v2_item` deliveries when moving cards | That event never rides the repo webhook — it comes via a **GitHub App** (user-owned board) or an **org** webhook, not a user-account webhook (which GitHub doesn't offer) — see above. |
 | Path C: `cloudflared` container exits immediately / restarts in a loop | `CLOUDFLARE_TUNNEL_TOKEN` is unset or wrong — check `docker compose logs cloudflared`. Also confirm `COMPOSE_PROFILES=tunnel` is set in `.env`, otherwise the service never starts at all (`docker compose ps` won't list it). |
