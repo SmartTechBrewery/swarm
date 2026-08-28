@@ -386,6 +386,12 @@ npm run swarm -- config apply
 # After `git pull` — sync deps, rebuild the dashboard, apply migrations
 npm run reload
 
+# Operator identity — sign this CLI in to the control plane over the network
+# (needs SWARM_CONTROL_PLANE_URL, not DATABASE_URL, so it works off the host)
+npm run swarm -- login
+npm run swarm -- login --status
+npm run swarm -- login --logout
+
 # Queue and worktrees
 npm run queue:clear
 npm run worktrees:prune

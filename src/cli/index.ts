@@ -14,6 +14,7 @@ import * as out from './_shared/output.js';
 import * as config from './commands/config.js';
 import * as identities from './commands/identities.js';
 import * as init from './commands/init.js';
+import * as login from './commands/login.js';
 import * as logs from './commands/logs.js';
 import * as members from './commands/members.js';
 import * as pm from './commands/pm.js';
@@ -43,6 +44,7 @@ const COMMANDS: Record<string, Command> = {
 	// database-backed dispatch-repair command with nothing in common with starting
 	// the host's worker.
 	'run:worker': runWorker,
+	login,
 	users,
 	members,
 	identities,
@@ -66,6 +68,7 @@ Commands:
   queue clear      Remove all pending queue jobs (not active runs)
   run reset <id>   Reset a wedged run and restart its phase (last resort)
   run:worker       Start this checkout's registered worker (credential from the local cache)
+  login            Sign this CLI in to the control plane (--status, --logout)
   users            Manage SWARM users and the installation admin
   members          Manage project membership (who belongs to a project)
   identities       Link a SWARM user to the handles they own on a provider
