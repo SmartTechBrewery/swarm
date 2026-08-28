@@ -293,7 +293,13 @@ swarm workers consent <worker-id> <project-id> <on|off>
   name and declared CLIs (`--cli`, comma-separated, one or more of
   `claude | antigravity | codex`). **Prints a worker credential ONCE** — store it
   then (it is never shown again) and put it in `.env` as `SWARM_WORKER_CREDENTIAL`;
-  the host worker authenticates its session with it at startup.
+  the host worker authenticates its session with it at startup. The command also
+  states what registration does *not* do (issue #767): the machine has no SCM
+  identity until its **operator source-control credential** is stored for the
+  provider its projects use, and every dispatch to it fails until then. Its owner
+  sets that at `/workers/<worker-id>` → **Operator source-control credential**; for
+  someone else's machine, use `set-scm-credential` below. `register` itself never
+  asks for a token — the provider isn't known at registration time.
 - **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line). With an owner
   identifier, only that owner's; without, all owners'. Never prints a credential.
 - **`set-cli`** — replace a worker's declared CLIs by worker id.
