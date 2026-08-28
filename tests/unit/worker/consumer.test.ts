@@ -2495,6 +2495,115 @@ describe('processJob', () => {
 				});
 				expect(phaseCalls).toEqual([]);
 			});
+
+			// Issue #780. The one wait with no budget must not be the one that lets a
+			// held claim lapse — nothing else would ever refresh it again.
+			it('keeps a pinned Review continuation’s dedup claim alive while it waits', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-preserved', { activeRuns: 1 }),
+				]);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					preservedWorkerWait: true,
+					continuationDispatchClaimed: true,
+				});
+				expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(
+					`${PROJECT.repo}:17:deadbeef`,
+					expect.any(Number),
+				);
+			});
+		});
+
+		// Issue #780. The gate refuses *after* the trigger handler took this phase's
+		// dispatch dedup claim, and the wait releases nothing — so it has to hold that
+		// claim open and mark the retry as the claim's own owner. Without the flag the
+		// woken dispatch re-enters the handler, collides with its still-live claim, is
+		// dropped as a duplicate, and settles `completed` with no run row and no error
+		// (reproduced live on PR #779, woken by the fast availability path of #610).
+		describe('a prioritized continuation retains its dispatch dedup claim (issue #780)', () => {
+			/** Settle one eligibility wait for `trigger` against a busy capable worker. */
+			async function waitOn(trigger: TriggerResult) {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-1', { activeRuns: 1 })]);
+				const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				return { outcome, input };
+			}
+
+			it('persists the reuse flag on the payload every wake path reads back', async () => {
+				const { outcome, input } = await waitOn(REVIEW_TRIGGER);
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					phase: 'review',
+					workerEligibilityRecheck: true,
+					continuationDispatchClaimed: true,
+				});
+				// The durable row's payload is what both the timer and the fast availability
+				// wake republish, so the flag has to live *there*, not on the outcome alone.
+				expect(input).toMatchObject({
+					waitReason: 'worker-eligibility',
+					jobPayload: expect.objectContaining({ continuationDispatchClaimed: true }),
+				});
+			});
+
+			it('holds the claim rather than freeing it, so a sibling PR+SHA event still cannot take the slot', async () => {
+				const { outcome } = await waitOn(REVIEW_TRIGGER);
+
+				expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(
+					`${PROJECT.repo}:17:deadbeef`,
+					expect.any(Number),
+				);
+				// Outlives the wait it is held across, so the slot is never briefly free
+				// mid-wait for an `opened`/`checks completed` sibling to claim.
+				const [, ttlSec] = refreshReviewDispatchClaim.mock.calls[0] as [string, number];
+				const retryDelayMs = (outcome as { retryDelayMs: number }).retryDelayMs;
+				expect(ttlSec).toBeGreaterThan(retryDelayMs / 1000);
+			});
+
+			it.each([
+				['Respond-to-CI', RESPOND_TO_CI_TRIGGER],
+				['Resolve-conflicts', RESOLVE_CONFLICTS_TRIGGER],
+			] as const)('carries the flag for a deferred %s dispatch too', async (_label, trigger) => {
+				const { outcome, input } = await waitOn(trigger);
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					phase: trigger.phase,
+					continuationDispatchClaimed: true,
+				});
+				expect(input.jobPayload).toMatchObject({ continuationDispatchClaimed: true });
+			});
+
+			it('refreshes the Resolve-conflicts head/base claim, whose TTL nothing else reaps', async () => {
+				await waitOn(RESOLVE_CONFLICTS_TRIGGER);
+
+				expect(refreshConflictResolutionClaim).toHaveBeenCalledWith(
+					`${PROJECT.repo}:17:deadbeef:cafebabe`,
+					expect.any(Number),
+				);
+			});
+
+			it('leaves a board phase untouched — it holds no claim to reuse', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-1', { activeRuns: 1 })]);
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(planningTrigger()),
+				);
+
+				if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+				expect(outcome.continuationDispatchClaimed).toBeUndefined();
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				expect(input.jobPayload).not.toMatchObject({ continuationDispatchClaimed: true });
+				expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+				expect(refreshConflictResolutionClaim).not.toHaveBeenCalled();
+			});
 		});
 
 		// Issue #610. The settle is the capacity-freed signal — including for a
