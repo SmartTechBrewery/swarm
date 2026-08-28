@@ -64,12 +64,16 @@ Notes:
   worker can do it themselves — including before its first enrollment — at
   `/workers/<worker-id>` → **Enroll in a project**, picking any project they are at
   least a `contributor` on. It calls the same `workers.enroll` this command does,
-  so no CLI or DB access is needed — but it creates the
+  so no CLI or DB access is needed — and it creates the
   enrollment `pending` and **without** sharing consent, i.e. the CLI's behaviour
   with neither `--active` nor `--consent`. A project administrator then approves it
-  and the owner flips sharing on, both on the same screen. The one-shot
+  and the owner flips sharing on, both on the same screen. **Unless you administer
+  the project yourself** (issue #784): when the enroller is both the worker's owner
+  and a `projectAdmin` on the target, both of those approvals are already theirs, so
+  the enrollment is created `active` with sharing on and is routable immediately —
+  no second step. Everyone else is unchanged. The one-shot
   `--active --consent` form below stays the CLI's own, and is what an installation
-  admin bootstrapping a machine for someone else wants.
+  admin bootstrapping a machine for *someone else* wants.
 - `--active --consent` at enroll time (rather than the separate `approve` /
   `consent` commands, [`docs/cli.md`](./cli.md#swarm-workers)) is safe to do
   immediately, before the new machine has connected anything: a `transport`-mode

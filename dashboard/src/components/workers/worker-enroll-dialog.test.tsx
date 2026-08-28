@@ -225,11 +225,15 @@ describe('WorkerEnrollDialog submission', () => {
 		expect(enrollMutate).toHaveBeenCalledTimes(1);
 	});
 
-	it('says the enrollment starts pending with sharing off', () => {
+	// The dialog cannot tell which of the two outcomes it will get (issue #784 is
+	// decided server-side and `projects.list` carries no viewer role), so the copy
+	// has to name both rather than promise the pending one.
+	it('says which of the two outcomes an enrollment gets', () => {
 		renderDialog();
 
 		expect(screen.getByText(/awaiting approval/)).toBeDefined();
 		expect(screen.getByText(/sharing off/)).toBeDefined();
+		expect(screen.getByText(/sharing on/)).toBeDefined();
 	});
 });
 
