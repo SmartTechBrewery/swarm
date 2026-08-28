@@ -67,6 +67,7 @@ vi.mock('@/lib/trpc.js', () => ({
 		workers: {
 			enroll: { mutate: enrollMutate },
 			setConsent: { mutate: vi.fn() },
+			setDeclaredCapabilities: { mutate: vi.fn() },
 			updateConstraints: { mutate: vi.fn() },
 			approveEnrollment: { mutate: vi.fn() },
 			setStatus: { mutate: vi.fn() },
@@ -121,6 +122,10 @@ function makeDetail(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		...makeRow(),
 		ownerUserId: 'u1',
 		viewerIsOwner: false,
+		// The two raw halves of the CLI axis the detail view's declaration control
+		// reads (issue #787): nothing declared, so the effective set is the probe.
+		declaredCapabilities: null,
+		probedCapabilities: ['claude'],
 		enrollments: [
 			{
 				enrollmentId: 'enr-1',
@@ -225,6 +230,30 @@ describe('worker detail navigation (issue #477)', () => {
 				allowedClis: ['claude'],
 			}),
 		);
+	});
+
+	// Issue #787: the control offers one checkbox per *probed* CLI, so a route that
+	// dropped either new field would render the wrong options — the same way the
+	// operator-credential card's mount proves `viewerIsOwner` arrives.
+	it('passes the declared and probed CLI sets through to the detail view', async () => {
+		getByIdQueryFn.mockResolvedValue(
+			makeDetail({
+				viewerIsOwner: true,
+				capabilities: ['claude'],
+				declaredCapabilities: ['claude'],
+				probedCapabilities: ['claude', 'codex'],
+			}),
+		);
+
+		renderAt('/workers/worker-1');
+
+		// `codex` is offered because the machine reported it, though it is not in force.
+		expect(await screen.findByRole('checkbox', { name: 'Declare codex' })).toBeDefined();
+		expect(
+			(screen.getByRole('checkbox', { name: 'Declare claude' }) as HTMLInputElement).checked,
+		).toBe(true);
+		// ...and a declaration exists, so clearing it is offered.
+		expect(screen.getByRole('button', { name: 'Use auto-detected CLIs' })).toBeDefined();
 	});
 
 	it('links back to the index from the breadcrumb', async () => {

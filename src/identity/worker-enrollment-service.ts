@@ -23,8 +23,10 @@
  *   the dashboard's Workers screen renders (#133), scoped to what the viewer may
  *   see.
  * - `getDashboardWorkerDetail(workerId, projectScope)` — that same row for **one**
- *   worker (#477), widened with the full enrollment detail per visible project,
- *   for the Workers screen's per-worker detail view.
+ *   worker (#477), widened with the full enrollment detail per visible project and
+ *   with the two raw halves of the CLI axis (issue #783: the owner's
+ *   `declaredCapabilities` and the daemon's `probedCapabilities`), for the Workers
+ *   screen's per-worker detail view.
  * - `listProjectDispatchCandidates(projectId)` — the same project scope in the
  *   shape the #130 dispatch gate judges (`src/worker/eligibility-gate.ts`):
  *   worker + enrollment + resolved availability, in the project's configured
@@ -522,6 +524,26 @@ export interface DashboardWorkerDetailView extends DashboardWorkerView {
 	 * this rather than performing a second worker read.
 	 */
 	ownerUserId: string;
+	/**
+	 * The owner's **durable CLI declaration** (issue #783), or `null` when none has
+	 * been made. Not the same fact as the row's `capabilities`, which is the
+	 * *effective* set (`effectiveCapabilities`, `./worker.ts`): a declaration the
+	 * machine's latest probe no longer backs has already been intersected away
+	 * there, so the detail view carries the declaration itself to say the machine
+	 * stopped reporting it rather than silently showing a narrower set.
+	 *
+	 * Here rather than on the roster row because it is the fact the detail view's
+	 * owner-only CLI control writes (`workers.setDeclaredCapabilities`, issue #787);
+	 * the rosters keep rendering the effective set they already render.
+	 */
+	declaredCapabilities: AgentCli[] | null;
+	/**
+	 * What the machine's daemon last reported finding on its own PATH — the raw
+	 * probe, rewritten at every handshake (issue #783). The detail view offers one
+	 * checkbox per entry, because a declaration naming anything else is refused
+	 * server-side (`WorkerCapabilityNotProbedError`).
+	 */
+	probedCapabilities: AgentCli[];
 	enrollments: DashboardWorkerEnrollmentDetail[];
 }
 
@@ -580,7 +602,10 @@ export async function listDashboardWorkers(
  *
  * Where the roster row carries only `(projectId, status)` per enrollment, this
  * carries the full per-project enrollment detail, so the detail screen can
- * explain routability without a roster query per project.
+ * explain routability without a roster query per project. It also carries the two
+ * raw CLI facts the row's effective set is derived from (issue #783), which is what
+ * lets the detail screen offer the owner's declaration as a control instead of a
+ * badge.
  */
 export async function getDashboardWorkerDetail(
 	workerId: string,
@@ -603,6 +628,11 @@ export async function getDashboardWorkerDetail(
 	return {
 		...row,
 		ownerUserId: worker.ownerUserId,
+		// The two raw halves of the CLI axis (issue #783), widened onto the detail view
+		// alone: the row's own `capabilities` stays the effective set every roster
+		// renders, and this is the pair the owner's declaration control reads.
+		declaredCapabilities: worker.declaredCapabilities,
+		probedCapabilities: worker.probedCapabilities,
 		enrollments: await Promise.all(visible.map(assembleEnrollmentDetail)),
 	};
 }

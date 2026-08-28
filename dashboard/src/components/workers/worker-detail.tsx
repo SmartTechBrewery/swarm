@@ -10,6 +10,7 @@ import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpcClient } from '@/lib/trpc.js';
 import { useDraftSync } from '@/lib/use-draft-sync.js';
 import type { WorkerDetail } from '@/types/workers.js';
+import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 
 /**
  * One machine in full (issue #477) — where the Workers table is the scannable
@@ -19,13 +20,22 @@ import type { WorkerDetail } from '@/types/workers.js';
  * project the machine is enrolled in ({@link WorkerEnrollmentCard}, which owns the
  * editable values and their authorization).
  *
- * **Self-declared facts are read-only.** A daemon declares its `capabilities`,
- * `supportedPhases` and its checkout's `repository` (issue #687) at handshake and
- * re-declares them on every reconnect, so the view reports them and never offers to
- * edit them — an edit here would only make the dashboard disagree with the machine
- * until its next heartbeat. The checkout repository is here because it is the fact
- * an enrollment for a *different* repository is refused or suspended against (issue
- * #690), which the enrollment blocks below then name in full.
+ * **The daemon's `supportedPhases` and `repository` are read-only; its CLI set is
+ * not.** A daemon declares all three at handshake and re-declares them on every
+ * reconnect, so a phase repertoire and a checkout repository are reported here and
+ * never offered as an edit — editing either would only make the dashboard disagree
+ * with the machine until its next heartbeat. The checkout repository is here because
+ * it is the fact an enrollment for a *different* repository is refused or suspended
+ * against (issue #690), which the enrollment blocks below then name in full.
+ *
+ * The CLI set is the exception, because since issue #783 it is two facts rather than
+ * one: the daemon's probe, and the owner's **durable declaration** over it, which no
+ * reconnect overwrites. So the owner may state it here ({@link DeclaredClisControl},
+ * issue #787) — a narrowing of what the machine reported, never a widening, and
+ * clearable back to plain auto-detection. Gated by `viewerIsOwner` exactly like the
+ * rename field, and by the same strict-ownership check server-side
+ * (`workers.setDeclaredCapabilities`, no `instanceAdmin` override); a non-owner sees
+ * the effective set as badges.
  *
  * **The machine's own name is the one Identity-card fact that *is* editable** —
  * unlike the self-declared facts above, `displayName` is the owner's own label,
@@ -137,6 +147,180 @@ function WorkerNameField({
 				<p className="text-xs text-red-400">{renameMutation.error.message}</p>
 			) : null}
 		</div>
+	);
+}
+
+/** Order-insensitive comparison of two CLI selections. */
+function sameClis(a: string[], b: string[]): boolean {
+	return a.length === b.length && [...a].sort().join(',') === [...b].sort().join(',');
+}
+
+/**
+ * The machine's agent CLIs, as the owner's **durable declaration** over the
+ * daemon's probe (issue #787 over issue #783's seam). One checkbox per CLI the
+ * machine actually reported (`probedCapabilities`) — never per *effective* CLI —
+ * because the server refuses a declaration naming anything else
+ * (`WorkerCapabilityNotProbedError`), so offering it would be offering a control
+ * that fails. The last checked CLI can't be unchecked for the same reason the
+ * enrollment card pins its last allowed one: an empty declaration is rejected, and
+ * a disabled checkbox reads better than a round trip that comes back invalid.
+ *
+ * Draft-and-save rather than save-per-click, unlike the enrollment card's CLI
+ * control: a declaration is one whole set, and the page polls, so a half-made
+ * selection must not be clobbered mid-edit — {@link useDraftSync} keyed on the set
+ * currently in force resyncs only when the server's own answer changes.
+ *
+ * Both server guards are surfaced verbatim rather than pre-empted here: dropping a
+ * CLI an active enrollment still requires is a `CONFLICT` whose message names the
+ * offending CLIs, and neither this control nor its "Use auto-detected CLIs" reset
+ * decides anything about routability on its own.
+ */
+function DeclaredClisControl({
+	workerId,
+	declaredCapabilities,
+	probedCapabilities,
+	effectiveCapabilities,
+	editable,
+	ownerName,
+	onChanged,
+}: {
+	workerId: string;
+	declaredCapabilities: string[] | null;
+	probedCapabilities: string[];
+	/** The set actually in force — the declaration intersected with the probe. */
+	effectiveCapabilities: string[];
+	editable: boolean;
+	ownerName: string;
+	onChanged: () => void;
+}) {
+	// Keyed on a joined string rather than the array: a poll hands back a fresh
+	// array, and the draft must only resync when the *value* changed.
+	const [draft, setDraft] = useDraftSync(effectiveCapabilities.join(','), (joined) =>
+		joined.length === 0 ? [] : joined.split(','),
+	);
+
+	const declareMutation = useMutation({
+		mutationFn: (capabilities: AgentCli[] | null) =>
+			trpcClient.workers.setDeclaredCapabilities.mutate({ workerId, capabilities }),
+		onSuccess: onChanged,
+	});
+
+	// A declared CLI the machine's latest probe no longer reports: the gate has
+	// already intersected it out of the effective set, so say so rather than letting
+	// the screen look like the declaration simply changed on its own.
+	const drifted = (declaredCapabilities ?? []).filter((cli) => !probedCapabilities.includes(cli));
+
+	if (!editable) {
+		return (
+			<div className="space-y-1.5">
+				<div
+					className="flex flex-wrap gap-1"
+					title={`Only ${ownerName} can declare which CLIs this machine runs`}
+				>
+					{effectiveCapabilities.length === 0
+						? EM_DASH
+						: effectiveCapabilities.map((cli) => <Badge key={cli}>{cli}</Badge>)}
+				</div>
+				<DriftedClisNote drifted={drifted} />
+			</div>
+		);
+	}
+
+	const isLastSelected = (cli: string) => draft.length === 1 && draft[0] === cli;
+	// The edit starts at the currently usable intersection, but a durable declaration
+	// can be wider after a later probe drifts. Compare a declared draft to its stored
+	// declaration so the owner can persist that visible, valid intersection; with no
+	// declaration, the probe remains the auto-detection baseline.
+	const unchanged = sameClis(draft, declaredCapabilities ?? effectiveCapabilities);
+
+	return (
+		<div className="space-y-2">
+			{probedCapabilities.length === 0 ? (
+				<p className="text-xs text-zinc-500">
+					This machine has reported no agent CLI, so there is nothing to declare yet.
+				</p>
+			) : (
+				<div className="flex flex-wrap gap-x-4 gap-y-2">
+					{probedCapabilities.map((cli) => {
+						const checked = draft.includes(cli);
+						return (
+							<label key={cli} className="inline-flex items-center gap-2 text-sm text-zinc-300">
+								<input
+									type="checkbox"
+									// An explicit name, so this control and the enrollment blocks' own
+									// per-CLI checkboxes below stay tellable apart — they answer two
+									// different questions about the same CLI.
+									aria-label={`Declare ${cli}`}
+									checked={checked}
+									disabled={declareMutation.isPending || isLastSelected(cli)}
+									title={
+										isLastSelected(cli)
+											? 'At least one CLI must stay selected — to stop declaring a set at all, use Use auto-detected CLIs'
+											: undefined
+									}
+									onChange={() =>
+										setDraft(
+											checked
+												? draft.filter((one) => one !== cli)
+												: probedCapabilities.filter((one) => draft.includes(one) || one === cli),
+										)
+									}
+									className="h-4 w-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:cursor-not-allowed"
+								/>
+								<span className="font-mono">{cli}</span>
+							</label>
+						);
+					})}
+				</div>
+			)}
+			<div className="flex flex-wrap items-center gap-2">
+				<button
+					type="button"
+					// Cast at the boundary, as the enrollment card's own CLI control does: the
+					// read model mirrors CLIs as plain strings, and the procedure's input
+					// re-validates them against `AgentCliSchema` server-side regardless.
+					onClick={() => declareMutation.mutate(draft as AgentCli[])}
+					disabled={declareMutation.isPending || unchanged || draft.length === 0}
+					className={SECONDARY_BUTTON_CLASS}
+				>
+					{declareMutation.isPending ? 'Saving…' : 'Save CLIs'}
+				</button>
+				{/* Only when there is a declaration to clear — with none, auto-detection is
+				    already what is in force. */}
+				{declaredCapabilities !== null ? (
+					<button
+						type="button"
+						onClick={() => declareMutation.mutate(null)}
+						disabled={declareMutation.isPending}
+						className={SECONDARY_BUTTON_CLASS}
+					>
+						Use auto-detected CLIs
+					</button>
+				) : null}
+			</div>
+			<DriftedClisNote drifted={drifted} />
+			{declareMutation.isError ? (
+				<p className="text-xs text-red-400">{declareMutation.error.message}</p>
+			) : null}
+		</div>
+	);
+}
+
+/**
+ * The one thing the effective set cannot say for itself: a declaration naming a CLI
+ * the machine's latest probe no longer reports. The control plane logs that drift
+ * server-side (issue #783) and routes on the intersection; this is the same fact on
+ * the screen, so nobody has to explain a machine that declares `codex` and never
+ * gets `codex` work.
+ */
+function DriftedClisNote({ drifted }: { drifted: string[] }) {
+	if (drifted.length === 0) return null;
+	return (
+		<p className="text-xs text-amber-200">
+			Declared but no longer reported by this machine: {drifted.join(', ')} — work for{' '}
+			{drifted.length === 1 ? 'it' : 'them'} is not routed here until the machine reports{' '}
+			{drifted.length === 1 ? 'it' : 'them'} again.
+		</p>
 	);
 }
 
@@ -258,15 +442,15 @@ export function WorkerDetailView({
 				<h2 className={SECTION_HEADING_CLASS}>Declared by the daemon</h2>
 				<div className="grid gap-4 grid-cols-1 md:grid-cols-2">
 					<Field label="Agent CLIs">
-						{worker.capabilities.length === 0 ? (
-							EM_DASH
-						) : (
-							<div className="flex flex-wrap gap-1">
-								{worker.capabilities.map((cli) => (
-									<Badge key={cli}>{cli}</Badge>
-								))}
-							</div>
-						)}
+						<DeclaredClisControl
+							workerId={worker.workerId}
+							declaredCapabilities={worker.declaredCapabilities}
+							probedCapabilities={worker.probedCapabilities}
+							effectiveCapabilities={worker.capabilities}
+							editable={worker.viewerIsOwner}
+							ownerName={ownerName}
+							onChanged={onChanged}
+						/>
 					</Field>
 					<Field label="Pipeline phases">
 						<SupportedPhases phases={worker.supportedPhases} />
@@ -276,12 +460,20 @@ export function WorkerDetailView({
 					</Field>
 				</div>
 				<p className="text-xs text-zinc-500 mt-4">
-					Declared by the machine's own daemon at handshake. Reported here, never editable — editing
-					any of it would make this screen disagree with the machine. A daemon on an older build can
+					Declared by the machine's own daemon at handshake, and re-declared on every reconnect. The
+					pipeline phases and the checkout repository are reported here and never editable — editing
+					either would make this screen disagree with the machine. A daemon on an older build can
 					declare fewer phases than this one runs; which of them a project may actually give this
 					machine is the enrollment's Allowed pipeline phases, below. The checkout repository is the
 					single repository this machine works in: a project for any other one cannot run here, and
 					an unidentifiable checkout declares nothing.
+				</p>
+				<p className="text-xs text-zinc-500 mt-2">
+					The <strong>agent CLIs are the one fact the machine's owner may pin.</strong> Left alone,
+					the list is whatever the daemon last found on the machine's own PATH. Declaring a narrower
+					set is durable — it survives every reconnect and is what dispatch routes on — and can only
+					narrow that list: to add a CLI, install it on the machine. <em>Use auto-detected CLIs</em>{' '}
+					clears the declaration and hands the list back to auto-detection.
 				</p>
 			</div>
 
