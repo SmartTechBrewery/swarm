@@ -32,6 +32,8 @@ import {
 	mayAccessProject,
 } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
+import { resolveStrictlyOwnedWorker, workerNotFound } from '../worker-access.js';
+import { workerScmCredentialsRouter } from './workerScmCredentials.js';
 
 /**
  * The tRPC **workers** router (#337 Phase 3) — the enrollment-side companion to
@@ -65,7 +67,10 @@ import { authedProcedure, router } from '../trpc.js';
  *   machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
- *   worker/enrollment existence never leaks across owners.
+ *   worker/enrollment existence never leaks across owners. The nested
+ *   `scmCredentials` router (issue #766) is owner self-service too — the
+ *   machine's own operator SCM credential per provider — and applies the same
+ *   strict rule to *every* procedure, its read included (`./workerScmCredentials.ts`).
  * - **Project roster**, gated by `assertProjectAccess` exactly like
  *   `routers/projects.ts`: a `contributor` reads the roster (`roster`); only a
  *   `projectAdmin` approves an enrollment (`approveEnrollment`), revokes/
@@ -79,11 +84,6 @@ import { authedProcedure, router } from '../trpc.js';
  * `isRoutable` predicate the #130 gate consumes — it never terminates a running
  * agent (out of scope).
  */
-
-/** The `NOT_FOUND` a non-owner (or anyone querying an unknown id) receives for a worker. */
-function workerNotFound(workerId: string): TRPCError {
-	return new TRPCError({ code: 'NOT_FOUND', message: `Worker with ID "${workerId}" not found` });
-}
 
 /** The `NOT_FOUND` a non-owner/non-member (or anyone querying an unknown id) receives for an enrollment. */
 function enrollmentNotFound(enrollmentId: string): TRPCError {
@@ -103,23 +103,6 @@ function enrollmentNotFound(enrollmentId: string): TRPCError {
 async function resolveOwnedWorker(user: SwarmUser, workerId: string): Promise<Worker> {
 	const worker = await getWorker(workerId);
 	if (!worker || (!isInstanceAdmin(user) && worker.ownerUserId !== user.id)) {
-		throw workerNotFound(workerId);
-	}
-	return worker;
-}
-
-/**
- * Resolve a worker the caller **strictly** owns — no `instanceAdmin` override.
- * Used for acts that are the machine owner's own call about their machine
- * (its display name; an enrollment's sharing consent and execution
- * constraints, via {@link resolveOwnedEnrollment}), as opposed to
- * {@link resolveOwnedWorker}'s `enroll`, which reads as administering the
- * *project* side of the offer. A missing worker and one owned by someone else
- * both surface the same `NOT_FOUND`.
- */
-async function resolveStrictlyOwnedWorker(user: SwarmUser, workerId: string): Promise<Worker> {
-	const worker = await getWorker(workerId);
-	if (!worker || worker.ownerUserId !== user.id) {
 		throw workerNotFound(workerId);
 	}
 	return worker;
@@ -225,6 +208,12 @@ const AllowedPhasesInput = z.array(TriggerPhaseSchema).min(1);
 const ConcurrencyInput = z.number().int().positive();
 
 export const workersRouter = router({
+	// The worker owner's own operator SCM credential per provider (issue #766),
+	// nested here the way `credentialsRouter` nests under `projectsRouter`: it is
+	// worker-scoped state and belongs under the worker's own namespace. Every
+	// procedure there is strictly-owner-only, reads included.
+	scmCredentials: workerScmCredentialsRouter,
+
 	// --- Installation roster (cross-project, read-only) ---
 
 	// Every worker the caller may see, with connectivity, last-seen, capabilities,

@@ -11,7 +11,7 @@
  * only ever handle plaintext and ciphertext never leaves this module.
  */
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 
 import type { ScmType } from '../../scm/types.js';
 import { getDb } from '../client.js';
@@ -79,4 +79,27 @@ export async function writeWorkerScmCredential(
 			target: [workerScmCredentials.workerId, workerScmCredentials.scmProviderId],
 			set: { value: encryptedValue, updatedAt: new Date() },
 		});
+}
+
+/**
+ * Which providers this worker currently holds a credential for, and when each was
+ * last written — the **key columns and `updated_at` only**, never `value`, so the
+ * dashboard read that reports presence never decrypts a secret merely to mask it.
+ *
+ * The `worker_scm_credentials` twin of `listConfiguredInstanceScmCredentials`
+ * (`./instanceCredentialsRepository.ts`), including its `ne(value, '')` filter: an
+ * empty stored value is reported as *absent* for the same reason it resolves as
+ * absent there — nothing could authenticate with it, so calling it configured would
+ * have the form claim a credential is set that every dispatch then fails on.
+ */
+export async function listWorkerScmCredentialStates(
+	workerId: string,
+): Promise<Array<{ scmProviderId: string; updatedAt: Date }>> {
+	return await getDb()
+		.select({
+			scmProviderId: workerScmCredentials.scmProviderId,
+			updatedAt: workerScmCredentials.updatedAt,
+		})
+		.from(workerScmCredentials)
+		.where(and(eq(workerScmCredentials.workerId, workerId), ne(workerScmCredentials.value, '')));
 }

@@ -1,8 +1,6 @@
 import { z } from 'zod';
 
-import { getBitbucketUserForCredential } from '../../integrations/scm/bitbucket/client.js';
-import { getGitHubUserForToken } from '../../integrations/scm/github/client.js';
-import { getGitLabUserForToken } from '../../integrations/scm/gitlab/client.js';
+import { verifyScmCredentialSecret } from '../scm-verification.js';
 import { authedProcedure, router } from '../trpc.js';
 
 /**
@@ -21,14 +19,17 @@ import { authedProcedure, router } from '../trpc.js';
  * `SCMProvider` from — `hasIntegration`/`resolvePersonaIdentities` both take a
  * `ProjectConfig`. Bitbucket joined GitHub with issue #618 and GitLab with issue
  * #619, each when it became runtime-selectable.
+ *
+ * The provider-id → identity-lookup mapping itself moved to
+ * `../scm-verification.ts` with issue #766, so the worker operator credential's own
+ * write path verifies through the same one branch per provider rather than a second
+ * copy of it. The three procedures below are unchanged in input, output, and
+ * behaviour — the per-provider surface is still what a client addresses.
  */
 export const scmRouter = router({
 	verifyGithubToken: authedProcedure
 		.input(z.object({ token: z.string().min(1) }))
-		.mutation(async ({ input }) => {
-			const login = await getGitHubUserForToken(input.token);
-			return login ? { valid: true as const, login } : { valid: false as const };
-		}),
+		.mutation(async ({ input }) => await verifyScmCredentialSecret('github', input.token)),
 
 	/**
 	 * Bitbucket Cloud's twin. The credential is the `username:app_password` pair
@@ -40,10 +41,7 @@ export const scmRouter = router({
 	 */
 	verifyBitbucketCredential: authedProcedure
 		.input(z.object({ credential: z.string().min(1) }))
-		.mutation(async ({ input }) => {
-			const login = await getBitbucketUserForCredential(input.credential);
-			return login ? { valid: true as const, login } : { valid: false as const };
-		}),
+		.mutation(async ({ input }) => await verifyScmCredentialSecret('bitbucket', input.credential)),
 
 	/**
 	 * GitLab's twin (issue #619). A single input rather than Bitbucket's pair, because
@@ -55,8 +53,5 @@ export const scmRouter = router({
 	 */
 	verifyGitLabToken: authedProcedure
 		.input(z.object({ token: z.string().min(1) }))
-		.mutation(async ({ input }) => {
-			const login = await getGitLabUserForToken(input.token);
-			return login ? { valid: true as const, login } : { valid: false as const };
-		}),
+		.mutation(async ({ input }) => await verifyScmCredentialSecret('gitlab', input.token)),
 });

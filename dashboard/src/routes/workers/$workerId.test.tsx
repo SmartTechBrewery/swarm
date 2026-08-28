@@ -19,6 +19,7 @@ const {
 	listMineQueryFn,
 	rosterQueryFn,
 	enrollMutate,
+	scmCredentialsListQueryFn,
 } = vi.hoisted(() => ({
 	workersListQueryFn: vi.fn(),
 	getByIdQueryFn: vi.fn(),
@@ -26,6 +27,7 @@ const {
 	listMineQueryFn: vi.fn(),
 	rosterQueryFn: vi.fn(),
 	enrollMutate: vi.fn(),
+	scmCredentialsListQueryFn: vi.fn(),
 }));
 
 vi.mock('@/lib/trpc.js', () => ({
@@ -47,6 +49,15 @@ vi.mock('@/lib/trpc.js', () => ({
 					queryFn: () => rosterQueryFn(input),
 				}),
 			},
+			// The operator-credential card (issue #766) mounts for an owner.
+			scmCredentials: {
+				list: {
+					queryOptions: (input: { workerId: string }) => ({
+						queryKey: ['workers.scmCredentials.list', input],
+						queryFn: () => scmCredentialsListQueryFn(input),
+					}),
+				},
+			},
 		},
 		projects: {
 			list: { queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }) },
@@ -59,6 +70,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			updateConstraints: { mutate: vi.fn() },
 			approveEnrollment: { mutate: vi.fn() },
 			setStatus: { mutate: vi.fn() },
+			scmCredentials: { set: { mutate: vi.fn() } },
 		},
 	},
 }));
@@ -149,6 +161,7 @@ beforeEach(() => {
 		projectsListQueryFn,
 		listMineQueryFn,
 		rosterQueryFn,
+		scmCredentialsListQueryFn,
 	]) {
 		mock.mockReset();
 	}
@@ -157,6 +170,7 @@ beforeEach(() => {
 	projectsListQueryFn.mockResolvedValue([{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' }]);
 	listMineQueryFn.mockResolvedValue([]);
 	rosterQueryFn.mockResolvedValue([]);
+	scmCredentialsListQueryFn.mockResolvedValue({ providers: [] });
 	enrollMutate.mockReset();
 	enrollMutate.mockResolvedValue({});
 });

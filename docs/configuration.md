@@ -111,6 +111,7 @@ The **implementer** persona is no longer a project credential (issue #396), and 
 - **Resolved at dispatch, on the control plane, and carried on the assignment.** The worker is DB-free (ADR-003 §2) and cannot read the store, so the router resolves the pair and puts the credential on the `TaskAssignment` frame — over TLS, on a socket already authenticated by that worker's own `SWARM_WORKER_CREDENTIAL`. A rotation therefore takes effect on the **next dispatch**, with no worker restart.
 - **Encrypted with the same primitive `project_credentials` uses** (`src/db/crypto.ts`, AES-256-GCM under `CREDENTIAL_MASTER_KEY`), with `<workerId>:<scmProviderId>` as the AAD — so a ciphertext copied onto another worker's row, or onto the same worker's row for a different provider, fails authentication instead of resolving.
 - **A missing or invalid credential fails the dispatch immediately and attributably**, naming the worker and the provider, before anything is pushed — rather than a few seconds into a run under the provider's own generic identity error.
+- **Two write surfaces, one store**: the CLI command below, and the worker owner's own dashboard form (issue #766, see after the command).
 
 Set or rotate it with:
 
@@ -119,6 +120,8 @@ swarm workers set-scm-credential <worker-id> <github|bitbucket|gitlab>
 ```
 
 It prompts without echo on a TTY and otherwise reads the secret from stdin; it never takes the value as an argument and never prints it back. `swarm workers list` shows the worker ids.
+
+Since issue #766 the worker's **owner** can also set and rotate it from the dashboard, at `/workers/<worker-id>` → **Operator source-control credential**, one field per provider that machine's enrollments actually resolve to. The dashboard verifies the value against the provider before storing it, so an invalid one is refused with nothing written rather than failing at the next dispatch; the stored value is never shown again, only that it is set and when. That form is strictly the owner's — an instance administrator managing someone else's machine uses the command above.
 
 ### Project config (`swarm.config.json`)
 

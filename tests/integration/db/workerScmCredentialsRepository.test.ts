@@ -5,6 +5,7 @@ import { getDb } from '../../../src/db/client.js';
 import { isEncryptedValue } from '../../../src/db/crypto.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import {
+	listWorkerScmCredentialStates,
 	resolveWorkerScmCredential,
 	writeWorkerScmCredential,
 } from '../../../src/db/repositories/workerScmCredentialsRepository.js';
@@ -83,6 +84,53 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				.from(workerScmCredentials)
 				.where(eq(workerScmCredentials.workerId, workerId));
 			expect(rows).toHaveLength(0);
+		});
+
+		// The read behind phase 2/3's dashboard form (issue #766): presence and a
+		// last-updated time, reported without ever decrypting the value.
+		describe('listWorkerScmCredentialStates', () => {
+			it('reports each stored provider with a plausible updatedAt, and no value', async () => {
+				const before = new Date(Date.now() - 1000);
+				await writeWorkerScmCredential(workerId, 'github', 'ghp_secret');
+				await writeWorkerScmCredential(workerId, 'bitbucket', 'user:app-password');
+
+				const states = await listWorkerScmCredentialStates(workerId);
+
+				expect(states.map((state) => state.scmProviderId).sort()).toEqual(['bitbucket', 'github']);
+				for (const state of states) {
+					expect(Object.keys(state).sort()).toEqual(['scmProviderId', 'updatedAt']);
+					expect(state.updatedAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+				}
+			});
+
+			it("reports nothing for another worker's credentials", async () => {
+				await writeWorkerScmCredential(workerId, 'github', 'ghp_secret');
+				expect(await listWorkerScmCredentialStates(otherWorkerId)).toEqual([]);
+			});
+
+			// Rotation moves the timestamp forward on the one row rather than adding a
+			// second — which is what makes "Set <relative time>" mean the last write.
+			it('moves updatedAt forward on a rotation without adding a row', async () => {
+				await writeWorkerScmCredential(workerId, 'github', 'ghp_old');
+				const [first] = await listWorkerScmCredentialStates(workerId);
+
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				await writeWorkerScmCredential(workerId, 'github', 'ghp_new');
+				const after = await listWorkerScmCredentialStates(workerId);
+
+				expect(after).toHaveLength(1);
+				expect(after[0].updatedAt.getTime()).toBeGreaterThan(first.updatedAt.getTime());
+			});
+
+			// An empty stored value is reported as absent, so the form never claims a
+			// credential is set that no dispatch could authenticate with.
+			it('treats an empty stored value as absent', async () => {
+				await getDb()
+					.insert(workerScmCredentials)
+					.values({ workerId, scmProviderId: 'gitlab', value: '' });
+
+				expect(await listWorkerScmCredentialStates(workerId)).toEqual([]);
+			});
 		});
 
 		describe('encryption at rest', () => {

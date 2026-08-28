@@ -118,6 +118,16 @@ export interface ScmProviderCopy {
 	roleDescriptions: Record<CredentialRole, string>;
 	/** Shown under a verifiable field when the provider's verify procedure resolves invalid. */
 	verifyFailureMessage: string;
+	/**
+	 * What this provider calls the **worker operator's own** credential — the identity
+	 * a machine commits, pushes and comments as (issue #766). Not a `CredentialRole`:
+	 * the operator credential is per `(worker, provider)` and lives in its own store,
+	 * so it is deliberately outside the project-scoped role pair above. Per provider
+	 * for the same reason the role labels are — GitHub's PAT is Bitbucket's app
+	 * password.
+	 */
+	operatorLabel: string;
+	operatorDescription: string;
 }
 
 /** Bitbucket Cloud's name for each role — an app password, not a PAT. */
@@ -165,26 +175,35 @@ const GITLAB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	github: {
 		intro:
-			"The reviewer persona authenticates to GitHub with this project-scoped token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GH_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Verify the PAT to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+			"The reviewer persona authenticates to GitHub with this project-scoped token. The implementer persona uses the worker operator's own token, which is set per worker on that worker's own page — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Verify the PAT to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
 		roleLabels: GITHUB_ROLE_LABELS,
 		roleDescriptions: GITHUB_ROLE_DESCRIPTIONS,
 		verifyFailureMessage: 'Token did not resolve to a GitHub account. Check it and try again.',
+		operatorLabel: 'Operator PAT',
+		operatorDescription:
+			'GitHub personal access token this machine acts as. Needs repo scope, and must resolve to a different GitHub account than any project\u2019s reviewer PAT for loop prevention to work.',
 	},
 	bitbucket: {
 		intro:
-			"The reviewer persona authenticates to Bitbucket Cloud with this project-scoped app password. The implementer persona uses the worker operator's own credential, configured on each host as the SWARM_OPERATOR_BITBUCKET_TOKEN environment variable — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Point the repository's webhook at /bitbucket/webhook and give it the secret below. Verify the app password to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+			"The reviewer persona authenticates to Bitbucket Cloud with this project-scoped app password. The implementer persona uses the worker operator's own credential, which is set per worker on that worker's own page — not here — so its pull requests are attributed to the operator's account, distinct from the reviewer. Point the repository's webhook at /bitbucket/webhook and give it the secret below. Verify the app password to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
 		roleLabels: BITBUCKET_ROLE_LABELS,
 		roleDescriptions: BITBUCKET_ROLE_DESCRIPTIONS,
 		verifyFailureMessage:
 			'Credential did not resolve to a Bitbucket account. It must be a "username:app_password" pair — a workspace or repository access token cannot resolve an identity.',
+		operatorLabel: 'Operator App Password',
+		operatorDescription:
+			'Bitbucket app password this machine acts as, as "username:app_password" — the only form that resolves an account. Must resolve to a different Bitbucket account than any project\u2019s reviewer credential for loop prevention to work. Grant it the email scope so its commits are attributed rather than landing on a noreply address.',
 	},
 	gitlab: {
 		intro:
-			"The reviewer persona authenticates to gitlab.com with this project-scoped access token. The implementer persona uses the worker operator's own token, configured on each host as the SWARM_OPERATOR_GITLAB_TOKEN environment variable — not here — so its merge requests are attributed to the operator's account, distinct from the reviewer. Point the project's webhook at /gitlab/webhook, enable its merge request, comment, and pipeline events, and give it the secret token below. Verify the token to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+			"The reviewer persona authenticates to gitlab.com with this project-scoped access token. The implementer persona uses the worker operator's own token, which is set per worker on that worker's own page — not here — so its merge requests are attributed to the operator's account, distinct from the reviewer. Point the project's webhook at /gitlab/webhook, enable its merge request, comment, and pipeline events, and give it the secret token below. Verify the token to confirm the account it resolves to before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
 		roleLabels: GITLAB_ROLE_LABELS,
 		roleDescriptions: GITLAB_ROLE_DESCRIPTIONS,
 		verifyFailureMessage:
 			'Token did not resolve to a GitLab account. It needs the api scope, and only gitlab.com is supported — a self-managed host cannot be verified.',
+		operatorLabel: 'Operator Access Token',
+		operatorDescription:
+			'GitLab access token (personal, group, or project) this machine acts as, needing the api scope. Must resolve to a different GitLab account than any project\u2019s reviewer token for loop prevention to work. A token whose scope withholds the account email still delivers, but its commits stay unlinked.',
 	},
 };
 
