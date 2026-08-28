@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { createRoute, Link } from '@tanstack/react-router';
+import { createRoute, Link, useNavigate } from '@tanstack/react-router';
 import { Server } from 'lucide-react';
 import { WorkerDetailView } from '@/components/workers/worker-detail.js';
 import { trpc } from '@/lib/trpc.js';
@@ -30,6 +30,7 @@ import { rootRoute } from '../__root.js';
 export function WorkerDetailRouteComponent() {
 	const { workerId } = workerDetailRoute.useParams();
 	const queryClient = useQueryClient();
+	const navigate = useNavigate();
 
 	const workerQueryOptions = trpc.workers.getById.queryOptions({ workerId });
 	const workerQuery = useQuery({ ...workerQueryOptions, refetchInterval: WORKERS_REFETCH_MS });
@@ -91,6 +92,14 @@ export function WorkerDetailRouteComponent() {
 					projectNames={projectNames}
 					projectDisabledPhases={disabledPhasesByProject}
 					onChanged={() => queryClient.invalidateQueries({ queryKey: workerQueryOptions.queryKey })}
+					onDeleted={() => {
+						// The row is gone, so this screen's polling query would only refetch a
+						// NOT_FOUND — drop it rather than invalidate it, and let the roster
+						// refetch without this machine.
+						queryClient.removeQueries({ queryKey: workerQueryOptions.queryKey });
+						queryClient.invalidateQueries({ queryKey: trpc.workers.list.queryKey() });
+						navigate({ to: '/workers' });
+					}}
 				/>
 			) : workerQuery.isLoading ? (
 				<div className="text-sm text-zinc-400">Loading worker…</div>

@@ -109,17 +109,21 @@ Notes:
   owner's alone — no installation admin override. It also names a declared CLI the
   machine has stopped reporting, which is otherwise only a server-side log line.
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
-  it again). Copy it immediately; if you lose it, `workers remove` +
-  `workers register` again is the only recovery. Step 3 **also caches it for the
-  directory where the command was invoked**, on the machine it was run on (issue
-  #788; `npm run swarm -- …` reads that directory from `INIT_CWD`):
+<<<<<<< HEAD
+  it again). Copy it immediately; if you lose it, `workers remove` (or
+  `/workers/<worker-id>` → **Delete worker**, its owner-only dashboard equivalent
+  since issue #789) + `workers register` again is the only recovery. Step 3 **also
+  caches it for the directory where the command was invoked**, on the machine it
+  was run on (issue #788; `npm run swarm -- …` reads that directory from `INIT_CWD`):
   `~/.swarm/worker-credentials/<hash>/credential.json`, owner-only, outside every
   checkout. That is what lets `swarm run:worker` start this worker without the
   credential being pasted anywhere — but only where the registering machine *is*
   the running machine. Registering on an admin machine for somebody else's still
   hands the value over by copy.
 - **Step 4 has a dashboard equivalent** (issue #764): the owner of a registered
-  worker can do it themselves — including before its first enrollment — at
+  worker can do it themselves — but **only before its first enrollment** (issue
+  #789), since the machine's checkout pairs it with one repository for its whole
+  connected life and no second project would be accepted — at
   `/workers/<worker-id>` → **Enroll in a project**, picking any project they are at
   least a `contributor` on. It calls the same `workers.enroll` this command does,
   so no CLI or DB access is needed — and it creates the

@@ -54,9 +54,9 @@
  * credentials or worktree paths.
  *
  * **Busy/current-run is derived from run lifecycle, never client-supplied**:
- * `deriveWorkerRunState` reads the worker's *live* Phase-2 session
- * (`getLiveSessionForWorker`) and, only when that session points at a run that
- * is actually `running` in the `runs` table, reports the worker busy. A stale
+ * `deriveWorkerRunState` reads the worker's unexpired durable dispatch claims
+ * independently of its live Phase-2 session (`getLiveSessionForWorker`), then
+ * falls back to the session pointer when no claim exists. A stale
  * `current_run_id` left over from a completed/failed run reads as idle.
  */
 
@@ -184,26 +184,26 @@ export interface OwnerWorkerView {
 }
 
 /**
- * Read a worker's live-session state once: whether it holds a live lease
- * (connection/health) and, when that session points at a run, whether that run
- * is *actually* `running` in `runs`. Both derived read models below need the
- * same two facts, so they share one pass rather than each re-reading the
- * session.
+ * Read a worker's execution state once: whether it holds a live lease
+ * (connection/health), whether it has an unexpired durable dispatch claim, and,
+ * when its session points at a run without a claim, whether that run is
+ * *actually* `running` in `runs`. Both derived read models below need the same
+ * facts, so they share one pass rather than each re-reading the session.
  */
 async function readWorkerExecutionState(
 	workerId: string,
 	projectId?: string,
 ): Promise<{ connected: boolean; activeRuns: number; runningRunId: string | null }> {
 	const session = await getLiveSessionForWorker(workerId);
-	if (!session) return { connected: false, activeRuns: 0, runningRunId: null };
 	const claims = await getWorkerDispatchClaimState(workerId, projectId);
 	if (claims.activeRuns > 0) {
 		return {
-			connected: true,
+			connected: Boolean(session),
 			activeRuns: claims.activeRuns,
 			runningRunId: claims.currentRunId,
 		};
 	}
+	if (!session) return { connected: false, activeRuns: 0, runningRunId: null };
 	if (!session.currentRunId) return { connected: true, activeRuns: 0, runningRunId: null };
 	const run = await getRunByIdFromDb(session.currentRunId);
 	const runningRunId = run?.status === 'running' ? run.id : null;
@@ -212,12 +212,11 @@ async function readWorkerExecutionState(
 
 /**
  * Derive a worker's busy/current-run state from the run lifecycle. Reads the
- * worker's *live* Phase-2 session; a worker with no live session (never
- * acquired, expired, or released) is idle. When the live session points at a
- * `current_run_id`, the run is looked up in `runs` and the worker is `busy`
- * **only if** that run's status is `running` — a stale pointer to a
- * completed/failed run reads as idle. The status is read from `runs`, never
- * trusted from a caller.
+ * worker's unexpired durable dispatch claims, independently of its live
+ * Phase-2 session. When there is no claim, the live session's `current_run_id`
+ * remains a compatibility fallback and the worker is `busy` **only if** that
+ * run's status is `running` — a stale pointer to a completed/failed run reads
+ * as idle. The status is read from `runs`, never trusted from a caller.
  */
 export async function deriveWorkerRunState(workerId: string): Promise<WorkerRunState> {
 	const { activeRuns, runningRunId } = await readWorkerExecutionState(workerId);

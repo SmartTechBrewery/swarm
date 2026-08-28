@@ -186,6 +186,13 @@ describe('deriveWorkerRunState (busy/current-run from run lifecycle)', () => {
 		expect(getRunByIdFromDb).not.toHaveBeenCalled();
 	});
 
+	it('is busy for an unexpired dispatch claim after the live session expires', async () => {
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getWorkerDispatchClaimState.mockResolvedValue({ activeRuns: 1, currentRunId: RUN_ID });
+
+		expect(await deriveWorkerRunState(WORKER_ID)).toEqual({ busy: true, currentRunId: RUN_ID });
+	});
+
 	it('is idle when the live session has no current run', async () => {
 		getLiveSessionForWorker.mockResolvedValue({ currentRunId: null });
 		expect(await deriveWorkerRunState(WORKER_ID)).toEqual({ busy: false, currentRunId: null });

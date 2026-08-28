@@ -2,6 +2,7 @@ import { useMutation } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
+import { WorkerDeleteCard } from '@/components/workers/worker-delete-card.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { WorkerOperatorCredentialsCard } from '@/components/workers/worker-operator-credentials-card.js';
@@ -60,6 +61,15 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * administrator's approval and the owner's consent remain exactly where they were
  * — unless the owner also administers the chosen project, in which case both
  * approvals were already theirs and the server grants them at once (issue #784).
+ * It is offered **only before the machine's first enrollment** (issue #789): the
+ * checkout binds the machine to one repository for its whole connected life, so
+ * an already-enrolled machine has no second project the server would accept.
+ *
+ * **Retiring the machine is therefore a deletion, not a re-enrollment**
+ * ({@link WorkerDeleteCard}, issue #789). Since the pairing is permanent, freeing
+ * the operator up for a new machine/repository pairing means removing this
+ * registration — owner-only behind a confirmation that names everything the
+ * removal cascades to.
  */
 
 const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm';
@@ -382,6 +392,8 @@ interface WorkerDetailViewProps {
 	projectDisabledPhases: Map<string, string[]>;
 	/** Called after a mutation lands, so the caller refetches the authoritative view. */
 	onChanged: () => void;
+	/** Called once the worker is deleted, so the caller drops the query and navigates away. */
+	onDeleted: () => void;
 }
 
 export function WorkerDetailView({
@@ -389,9 +401,19 @@ export function WorkerDetailView({
 	projectNames,
 	projectDisabledPhases,
 	onChanged,
+	onDeleted,
 }: WorkerDetailViewProps) {
 	const ownerName = worker.owner?.displayName ?? 'the owner';
 	const [enrollOpen, setEnrollOpen] = useState(false);
+
+	// A worker's SWARM_WORKER_REPO_ROOT checkout binds it to one repository for its
+	// whole connected life, and `enrollWorker` refuses a project for any other one, so
+	// a machine that already holds an enrollment — pending, active, or suspended alike
+	// — has no second project it could realistically be offered to (issue #789).
+	// Offering the action anyway only ever produced a repository-mismatch rejection.
+	// Retiring the machine to free the pairing is the Delete worker card below, not a
+	// second enrollment.
+	const canEnroll = worker.viewerIsOwner && worker.enrollments.length === 0;
 
 	return (
 		<div className="space-y-6">
@@ -513,7 +535,7 @@ export function WorkerDetailView({
 				{/* Kept a sibling of the heading rather than wrapped around it: the heading
 				    stays the section's own accessible name, and the action reads as one of
 				    the section's contents. */}
-				{worker.viewerIsOwner ? (
+				{canEnroll ? (
 					<div className="mb-4">
 						<button
 							type="button"
@@ -526,7 +548,7 @@ export function WorkerDetailView({
 				) : null}
 				{worker.enrollments.length === 0 ? (
 					<p className="text-sm text-zinc-400">
-						{worker.viewerIsOwner
+						{canEnroll
 							? 'This machine is not enrolled in any project yet. Offer it to one with Enroll in a project — it then waits for that project’s administrator to approve it.'
 							: 'This machine is not enrolled in any project you can see. Offering it to a project is its owner’s action.'}
 					</p>
@@ -551,9 +573,25 @@ export function WorkerDetailView({
 				)}
 			</div>
 
+			{/* The machine's own retirement, so it sits last — after everything the
+			    confirmation says will go with it. Owner-only, and the server applies the
+			    same strict-ownership rule to `workers.remove`. */}
+			{worker.viewerIsOwner ? (
+				<div className={CARD_CLASS}>
+					<h2 className={SECTION_HEADING_CLASS}>Delete worker</h2>
+					<WorkerDeleteCard
+						workerId={worker.workerId}
+						workerName={worker.displayName}
+						enrollmentCount={worker.enrollments.length}
+						currentRunTitle={worker.currentRun?.workItemTitle ?? null}
+						onDeleted={onDeleted}
+					/>
+				</div>
+			) : null}
+
 			{/* Last child of the page rather than inside the enrollments card, so an open
 			    modal's DOM doesn't land inside that section's subtree. */}
-			{worker.viewerIsOwner ? (
+			{canEnroll ? (
 				<WorkerEnrollDialog
 					open={enrollOpen}
 					onOpenChange={setEnrollOpen}

@@ -8,7 +8,7 @@ import {
 	Outlet,
 	RouterProvider,
 } from '@tanstack/react-router';
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerDetail, WorkerRow } from '@/types/workers.js';
 
@@ -19,6 +19,7 @@ const {
 	listMineQueryFn,
 	rosterQueryFn,
 	enrollMutate,
+	removeMutate,
 	scmCredentialsListQueryFn,
 } = vi.hoisted(() => ({
 	workersListQueryFn: vi.fn(),
@@ -27,13 +28,19 @@ const {
 	listMineQueryFn: vi.fn(),
 	rosterQueryFn: vi.fn(),
 	enrollMutate: vi.fn(),
+	removeMutate: vi.fn(),
 	scmCredentialsListQueryFn: vi.fn(),
 }));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
 		workers: {
-			list: { queryOptions: () => ({ queryKey: ['workers.list'], queryFn: workersListQueryFn }) },
+			list: {
+				queryOptions: () => ({ queryKey: ['workers.list'], queryFn: workersListQueryFn }),
+				// The delete path invalidates the roster by path key, not by one input's
+				// options (issue #789).
+				queryKey: () => ['workers.list'],
+			},
 			getById: {
 				queryOptions: (input: { workerId: string }) => ({
 					queryKey: ['workers.getById', input],
@@ -66,6 +73,7 @@ vi.mock('@/lib/trpc.js', () => ({
 	trpcClient: {
 		workers: {
 			enroll: { mutate: enrollMutate },
+			remove: { mutate: removeMutate },
 			setConsent: { mutate: vi.fn() },
 			setDeclaredCapabilities: { mutate: vi.fn() },
 			updateConstraints: { mutate: vi.fn() },
@@ -178,6 +186,8 @@ beforeEach(() => {
 	scmCredentialsListQueryFn.mockResolvedValue({ providers: [] });
 	enrollMutate.mockReset();
 	enrollMutate.mockResolvedValue({});
+	removeMutate.mockReset();
+	removeMutate.mockResolvedValue({ workerId: 'worker-1' });
 });
 
 describe('/workers/$workerId route registration', () => {
@@ -230,6 +240,20 @@ describe('worker detail navigation (issue #477)', () => {
 				allowedClis: ['claude'],
 			}),
 		);
+	});
+
+	it('returns to the workers index once the machine is deleted (issue #789)', async () => {
+		getByIdQueryFn.mockResolvedValue(makeDetail({ viewerIsOwner: true }));
+
+		const router = renderAt('/workers/worker-1');
+		const deleteSection = (await screen.findByRole('heading', { name: 'Delete worker' }))
+			.parentElement as HTMLElement;
+		fireEvent.click(within(deleteSection).getByRole('button', { name: 'Delete worker' }));
+		const confirms = screen.getAllByRole('button', { name: 'Delete worker' });
+		fireEvent.click(confirms[confirms.length - 1]);
+
+		await waitFor(() => expect(removeMutate).toHaveBeenCalledWith({ workerId: 'worker-1' }));
+		await waitFor(() => expect(router.state.location.pathname).toBe('/workers'));
 	});
 
 	// Issue #787: the control offers one checkbox per *probed* CLI, so a route that
