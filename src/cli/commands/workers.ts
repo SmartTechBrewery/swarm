@@ -138,10 +138,11 @@ Usage:
              machine is routable as soon as it connects. It does NOT start the
              worker: the daemon is a foreground, operator-owned process, so the
              final line is a command to run on that machine yourself. The
-             printed SWARM_WORKER_REPO_ROOT is the project's configured checkout
-             unless --repo-root names the one on the target machine. The worker
-             credential is shown ONCE, in that final line — and cached for
-             the checkout this runs in, exactly as register does.
+             printed SWARM_WORKER_REPO_ROOT (and the checkout the credential is
+             cached for) is the directory you run this in, exactly like register;
+             pass --repo-root when you are onboarding a machine from somewhere
+             else. The worker credential is shown ONCE, in that final line — and
+             cached for that same checkout, exactly as register does.
   list       List workers ('<id>\\t<displayName>\\t<clis>' per line). With an
              owner identifier, only that owner's; without, all owners' (prefixed
              with the owner identifier). Never prints a credential or its hash.
@@ -247,14 +248,31 @@ function parseClis(raw: string) {
 }
 
 /**
+ * The checkout the operator is standing in — what both registration paths key the
+ * credential cache to, and what `register-and-enroll` prints as
+ * `SWARM_WORKER_REPO_ROOT`. npm resets its script's cwd to the package root but
+ * preserves the caller's directory in `INIT_CWD`; the global binary has no
+ * `INIT_CWD`, so cwd is already its invocation checkout. The same expression
+ * `swarm run:worker` resolves its own checkout with, so a worker registered here
+ * starts there. Never ambient `SWARM_WORKER_REPO_ROOT` (see
+ * `cacheCredentialForCheckout`), and no canonicalisation here:
+ * `writeWorkerCredentialCache` already routes the path through
+ * `canonicalCheckoutPath`.
+ */
+function invokingCheckout(): string {
+	return process.env.INIT_CWD ?? process.cwd();
+}
+
+/**
  * Cache the freshly issued credential for a checkout,
  * and print the path — never the value (issue #788). Both registration paths call
  * this, so `swarm run:worker` finds a worker made either way.
  *
- * The caller chooses the checkout explicitly: `register` uses npm's `INIT_CWD`
- * when available, while `register-and-enroll` uses the resolved worker checkout.
- * Neither trusts ambient `SWARM_WORKER_REPO_ROOT`, which could name a different
- * worker than the one being registered.
+ * The caller chooses the checkout explicitly: both paths default to the checkout
+ * this command is being run in (`invokingCheckout`), and `register-and-enroll`
+ * additionally honours an explicit `--repo-root` for onboarding a machine from
+ * somewhere else. Neither trusts ambient `SWARM_WORKER_REPO_ROOT`, which could name
+ * a different worker than the one being registered.
  *
  * Best-effort by design. The credential is already issued and is about to be
  * printed, so a cache the operator can re-create by re-registering must never be
@@ -330,7 +348,7 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 		out.info(
 			`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 		);
-		cacheCredentialForCheckout(worker.id, credential, process.env.INIT_CWD ?? process.cwd());
+		cacheCredentialForCheckout(worker.id, credential, invokingCheckout());
 		// Registration issues the worker's *connection* credential and nothing else, so
 		// the machine still has no source-control identity and every dispatch to it
 		// fails until one is stored (issue #765). Name both write surfaces and no
@@ -679,7 +697,11 @@ interface RegisterAndEnrollPlan {
 	/** The provider the target project runs on — never assumed. */
 	readonly providerId: ScmType;
 	readonly operatorCredential: string;
-	/** The checkout to print in the start command: `--repo-root`, else the project's. */
+	/**
+	 * The checkout to print in the start command and cache the credential for:
+	 * `--repo-root`, else the checkout this command is run in — the machine being
+	 * onboarded, not whichever machine last registered the project.
+	 */
 	readonly repoRoot: string;
 }
 
@@ -756,7 +778,7 @@ async function planRegisterAndEnroll(
 			capabilities,
 			providerId,
 			operatorCredential,
-			repoRoot: values['repo-root'] ?? project.repoRoot,
+			repoRoot: values['repo-root'] ?? invokingCheckout(),
 		},
 	};
 }
