@@ -1224,6 +1224,35 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		expect(detail?.ownerUserId).toBe(OWNER_ID);
 	});
 
+	// Issue #787: the detail view is the one read model carrying the two raw halves of
+	// the CLI axis, because it is the one that offers the declaration as a control.
+	it('carries the owner’s declaration and the daemon’s probe beside the effective set', async () => {
+		getWorkerById.mockResolvedValue(
+			makeWorker({
+				capabilities: ['claude'],
+				declaredCapabilities: ['claude'],
+				probedCapabilities: ['claude', 'codex'],
+			}),
+		);
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.capabilities).toEqual(['claude']);
+		expect(detail?.declaredCapabilities).toEqual(['claude']);
+		expect(detail?.probedCapabilities).toEqual(['claude', 'codex']);
+	});
+
+	it('reports no declaration as null, so the screen can tell it from a declared probe', async () => {
+		getWorkerById.mockResolvedValue(makeWorker({ capabilities: ['claude', 'codex'] }));
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.declaredCapabilities).toBeNull();
+		expect(detail?.probedCapabilities).toEqual(['claude', 'codex']);
+	});
+
 	it('reports an unapproved or unshared enrollment as not routable', async () => {
 		getWorkerById.mockResolvedValue(makeWorker());
 		listEnrollmentsForWorker.mockResolvedValue([

@@ -11,8 +11,12 @@
  * (#282); the per-worker detail view (#477) adds the enrollment's execution
  * constraints (owner) and its approval/suspension (project administrator), each
  * offered only where the server-declared capability flag says the viewer may
- * change it. Self-declared facts — `capabilities` and `supportedPhases`, which a
- * daemon states at handshake — stay read-only everywhere.
+ * change it. Facts a daemon states at handshake stay read-only everywhere —
+ * `supportedPhases` and the checkout `repository` — but the CLI axis is no longer
+ * one of them: since issue #787 the worker's *owner* may declare which of the CLIs
+ * their machine reported it should run (`declaredCapabilities` on
+ * {@link WorkerDetail}, written by `workers.setDeclaredCapabilities`), and
+ * `capabilities` is the effective set that declaration resolves to.
  */
 
 /** Whether the worker's lease is live under the heartbeat TTL right now. */
@@ -60,7 +64,13 @@ export interface WorkerRow {
 	workerId: string;
 	displayName: string;
 	owner: WorkerOwner | null;
-	/** Declared agent CLIs (`claude` | `antigravity` | `codex`). */
+	/**
+	 * The agent CLIs this machine is routable on (`claude` | `antigravity` |
+	 * `codex`) — the **effective** set since issue #783: the owner's declaration
+	 * intersected with the daemon's own probe, or just the probe when nothing has
+	 * been declared. The detail view is the one surface that also carries the two
+	 * halves separately ({@link WorkerDetail}).
+	 */
 	capabilities: string[];
 	/**
 	 * Pipeline phases the machine's daemon declared it can execute (issue #467) —
@@ -147,6 +157,21 @@ export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
 	 * as `rename`/`setConsent`/`updateConstraints` resolve it.
 	 */
 	viewerIsOwner: boolean;
+	/**
+	 * The owner's **durable CLI declaration** (issue #783), or `null` when none has
+	 * been made and the machine's own probe stands alone. Distinct from
+	 * `capabilities`, which stays the *effective* set (declaration ∩ probe) every
+	 * other surface reads: a declared CLI the machine stopped reporting is already
+	 * gone from that set, and this field is what lets the detail view say so.
+	 * Written by `workers.setDeclaredCapabilities` (issue #787).
+	 */
+	declaredCapabilities: string[] | null;
+	/**
+	 * What the machine's daemon last reported finding on its own PATH — the raw
+	 * probe, rewritten at every handshake. The declaration control offers exactly
+	 * these as options, since the server refuses a declaration naming anything else.
+	 */
+	probedCapabilities: string[];
 	enrollments: WorkerDetailEnrollment[];
 }
 

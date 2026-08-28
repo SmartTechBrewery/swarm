@@ -4,7 +4,11 @@ import { z } from 'zod';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
-import { WorkerDisplayNameSchema } from '../../identity/worker.js';
+import {
+	WorkerCapabilityNotProbedError,
+	WorkerCapabilityReductionError,
+	WorkerDisplayNameSchema,
+} from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
@@ -25,7 +29,12 @@ import {
 	updateEnrollmentConstraints,
 	WorkerOrderDirectionSchema,
 } from '../../identity/worker-enrollment-service.js';
-import { getWorker, renameWorker, type Worker } from '../../identity/worker-service.js';
+import {
+	declareWorkerCapabilities,
+	getWorker,
+	renameWorker,
+	type Worker,
+} from '../../identity/worker-service.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import {
 	accessibleProjectScope,
@@ -60,15 +69,17 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   create its first enrollment.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
- *   (`enroll`), renames a machine (`rename`), retires one for good (`remove`,
- *   issue #789 — the dashboard-reachable twin of `swarm workers remove`), and
- *   controls the revocable sharing consent (`setConsent`) and execution
- *   constraints (`updateConstraints`). Ownership is checked per call. `enroll`
- *   alone lets an `instanceAdmin` act on any worker (layer-1 override,
- *   `resolveOwnedWorker`) — offering a worker to a project reads as
- *   administering the project side of that offer; `rename`, `remove`,
- *   `setConsent`, and `updateConstraints` are the machine owner's own call about
- *   their own machine and admit no such
+ *   (`enroll`), renames a machine (`rename`), declares which agent CLIs it should
+ *   run (`setDeclaredCapabilities`, issue #787 — the durable declaration issue
+ *   #783 made survive a reconnect, cleared by passing `capabilities: null`),
+ *   retires one for good (`remove`, issue #789 — the dashboard-reachable twin of
+ *   `swarm workers remove`), and controls the revocable sharing consent
+ *   (`setConsent`) and execution constraints (`updateConstraints`). Ownership is
+ *   checked per call. `enroll` alone lets an `instanceAdmin` act on any worker
+ *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
+ *   reads as administering the project side of that offer; `rename`,
+ *   `setDeclaredCapabilities`, `remove`, `setConsent`, and `updateConstraints`
+ *   are the machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
  *   worker/enrollment existence never leaks across owners. The nested
@@ -352,6 +363,43 @@ export const workersRouter = router({
 			const removed = await removeWorker(input.workerId);
 			if (!removed) throw workerNotFound(input.workerId);
 			return { workerId: input.workerId };
+		}),
+
+	// State (or clear) the owner's durable declaration of which agent CLIs this
+	// machine should run (issue #787, over issue #783's service seam). The
+	// declaration is the machine's own fact, not a project-scoped one, so it is
+	// gated by strict ownership exactly like `rename` — no `instanceAdmin`
+	// override — and a caller who does not own the worker gets `NOT_FOUND`.
+	//
+	// `capabilities: null` clears the declaration and returns the worker to plain
+	// auto-discovery; a non-empty set narrows what the machine's daemon reported.
+	// Both of the service's guards are surfaced verbatim rather than pre-checked
+	// here: a set dropping a CLI an active enrollment still requires is `CONFLICT`
+	// (the same 409 the handshake answers the same rule with), and a set naming a
+	// CLI the daemon never probed is `BAD_REQUEST` — the code
+	// `AllowedClisNotCapableError` already uses for the enrollment-side twin.
+	setDeclaredCapabilities: authedProcedure
+		.input(
+			z.object({
+				workerId: z.string().uuid(),
+				capabilities: z.array(AgentCliSchema).min(1).nullable(),
+			}),
+		)
+		.mutation(async ({ ctx, input }) => {
+			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			try {
+				const updated = await declareWorkerCapabilities(input.workerId, input.capabilities);
+				if (!updated) throw workerNotFound(input.workerId);
+				return updated;
+			} catch (error) {
+				if (error instanceof WorkerCapabilityReductionError) {
+					throw new TRPCError({ code: 'CONFLICT', message: error.message });
+				}
+				if (error instanceof WorkerCapabilityNotProbedError) {
+					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
+				}
+				throw error;
+			}
 		}),
 
 	// Offer one of the caller's workers to a project. The caller must own the

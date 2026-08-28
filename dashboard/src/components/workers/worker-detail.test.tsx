@@ -12,6 +12,7 @@ const {
 	approveMutate,
 	setStatusMutate,
 	renameMutate,
+	setDeclaredCapabilitiesMutate,
 	enrollMutate,
 	removeMutate,
 	projectsListQueryFn,
@@ -23,6 +24,7 @@ const {
 	approveMutate: vi.fn(),
 	setStatusMutate: vi.fn(),
 	renameMutate: vi.fn(),
+	setDeclaredCapabilitiesMutate: vi.fn(),
 	enrollMutate: vi.fn(),
 	removeMutate: vi.fn(),
 	projectsListQueryFn: vi.fn(),
@@ -60,6 +62,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			approveEnrollment: { mutate: approveMutate },
 			setStatus: { mutate: setStatusMutate },
 			rename: { mutate: renameMutate },
+			setDeclaredCapabilities: { mutate: setDeclaredCapabilitiesMutate },
 			enroll: { mutate: enrollMutate },
 			remove: { mutate: removeMutate },
 			scmCredentials: { set: { mutate: scmCredentialsSetMutate } },
@@ -97,7 +100,11 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 			displayName: 'Ada Lovelace',
 		},
 		ownerUserId: 'u1',
+		// The effective set and the two facts it derives from (issue #783): nothing
+		// declared, so it is the machine's own probe verbatim.
 		capabilities: ['claude', 'codex'],
+		declaredCapabilities: null,
+		probedCapabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
 		repository: 'acme/frontend',
 		connection: 'online',
@@ -148,6 +155,11 @@ function renderWorker(
 	);
 }
 
+/** The declared-CLI checkbox for one CLI, by the control's own accessible name. */
+function declaredCliCheckbox(cli: string): HTMLInputElement {
+	return screen.getByRole('checkbox', { name: `Declare ${cli}` }) as HTMLInputElement;
+}
+
 /** The Allowed-pipeline-phases checkbox for one phase, by its rendered label. */
 function phaseCheckbox(phase: string): HTMLInputElement {
 	return screen.getByRole('checkbox', { name: phase }) as HTMLInputElement;
@@ -168,6 +180,7 @@ beforeEach(() => {
 	approveMutate.mockReset();
 	setStatusMutate.mockReset();
 	renameMutate.mockReset();
+	setDeclaredCapabilitiesMutate.mockReset();
 	enrollMutate.mockReset();
 	removeMutate.mockReset();
 	removeMutate.mockResolvedValue({ workerId: 'worker-1' });
@@ -257,11 +270,13 @@ describe('WorkerDetailView sections (issue #477)', () => {
 		expect(declaredPhaseBadges()).toEqual(['implementation', 'resolve conflicts']);
 	});
 
-	it('offers no control for the self-declared capabilities, and says why', () => {
-		renderWorker({ enrollments: [] });
+	it('offers no control for the facts the daemon states, and says why', () => {
+		// The CLI axis is the owner's to pin (issue #787) and has its own suite below;
+		// the phase repertoire and the checkout repository stay reported-only.
+		renderWorker({ enrollments: [], viewerIsOwner: false });
 
 		expect(screen.getByText(/never editable/)).toBeDefined();
-		// Nothing editable at all on a machine with no visible enrollment.
+		// Nothing editable at all for a non-owner on a machine with no visible enrollment.
 		expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
 		expect(screen.queryAllByRole('switch')).toHaveLength(0);
 		expect(screen.queryAllByRole('spinbutton')).toHaveLength(0);
@@ -825,6 +840,172 @@ describe('WorkerDetailView machine name (owner-only rename)', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
 		expect(await screen.findByText('You already have a worker with this name.')).toBeDefined();
+	});
+});
+
+/**
+ * The owner's durable CLI declaration (issue #787 over issue #783's seam) — the one
+ * fact in the "Declared by the daemon" card that is not the daemon's alone. The
+ * server's two guards are what decide a save; nothing here pre-empts them beyond
+ * refusing to *express* a declaration it already knows would be refused.
+ */
+describe('WorkerDetailView declared agent CLIs (owner-only, issue #787)', () => {
+	it('shows a non-owner the effective set as badges, with no control', () => {
+		renderWorker({ viewerIsOwner: false, enrollments: [] });
+
+		const declared = within(section('Declared by the daemon'));
+		expect(declared.getByText('claude')).toBeDefined();
+		expect(declared.getByText('codex')).toBeDefined();
+		expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
+		expect(screen.queryByRole('button', { name: 'Save CLIs' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Use auto-detected CLIs' })).toBeNull();
+	});
+
+	// One checkbox per *probed* CLI, never per effective one: the server refuses a
+	// declaration naming a CLI the machine never reported, so an unprobed option
+	// would be an option that fails.
+	it('offers the owner one checkbox per CLI the machine reported', () => {
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude'],
+			probedCapabilities: ['claude', 'codex'],
+		});
+
+		expect(declaredCliCheckbox('claude').checked).toBe(true);
+		expect(declaredCliCheckbox('codex').checked).toBe(false);
+		expect(screen.queryByRole('checkbox', { name: 'Declare antigravity' })).toBeNull();
+	});
+
+	it('refuses to leave the machine with no declared CLI, instead of a request that must fail', () => {
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude'],
+			probedCapabilities: ['claude', 'codex'],
+		});
+
+		const onlyDeclared = declaredCliCheckbox('claude');
+		expect(onlyDeclared.disabled).toBe(true);
+		expect(onlyDeclared.getAttribute('title')).toMatch(/At least one CLI/);
+		fireEvent.click(onlyDeclared);
+		expect(setDeclaredCapabilitiesMutate).not.toHaveBeenCalled();
+	});
+
+	it('saves the selected set on demand rather than per click', async () => {
+		setDeclaredCapabilitiesMutate.mockResolvedValue({});
+		renderWorker();
+
+		fireEvent.click(declaredCliCheckbox('codex'));
+		expect(setDeclaredCapabilitiesMutate).not.toHaveBeenCalled();
+
+		fireEvent.click(screen.getByRole('button', { name: 'Save CLIs' }));
+
+		await waitFor(() =>
+			expect(setDeclaredCapabilitiesMutate).toHaveBeenCalledWith({
+				workerId: 'worker-1',
+				capabilities: ['claude'],
+			}),
+		);
+		await waitFor(() => expect(onChanged).toHaveBeenCalled());
+	});
+
+	it('disables Save until the selection differs from what is in force', () => {
+		renderWorker();
+
+		expect((screen.getByRole('button', { name: 'Save CLIs' }) as HTMLButtonElement).disabled).toBe(
+			true,
+		);
+	});
+
+	it('clears the declaration back to auto-detection, and offers that only when there is one', async () => {
+		setDeclaredCapabilitiesMutate.mockResolvedValue({});
+		const { unmount } = renderWorker();
+		// Nothing declared — auto-detection is already what is in force.
+		expect(screen.queryByRole('button', { name: 'Use auto-detected CLIs' })).toBeNull();
+		unmount();
+
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude'],
+			probedCapabilities: ['claude', 'codex'],
+		});
+		fireEvent.click(screen.getByRole('button', { name: 'Use auto-detected CLIs' }));
+
+		await waitFor(() =>
+			expect(setDeclaredCapabilitiesMutate).toHaveBeenCalledWith({
+				workerId: 'worker-1',
+				capabilities: null,
+			}),
+		);
+	});
+
+	it('shows the server’s rejection verbatim — a CLI an enrollment still requires', async () => {
+		setDeclaredCapabilitiesMutate.mockRejectedValue(
+			new Error('existing enrollment(s) require CLIs not in updated capabilities: codex'),
+		);
+		renderWorker();
+
+		fireEvent.click(declaredCliCheckbox('codex'));
+		fireEvent.click(screen.getByRole('button', { name: 'Save CLIs' }));
+
+		expect(
+			await screen.findByText(
+				'existing enrollment(s) require CLIs not in updated capabilities: codex',
+			),
+		).toBeDefined();
+	});
+
+	// Issue #783 logs the drift server-side and routes on the intersection; the card
+	// says so rather than showing a set that quietly lost a CLI.
+	it('flags a declaration the machine’s latest probe no longer backs', () => {
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude', 'codex'],
+			probedCapabilities: ['claude'],
+		});
+
+		expect(screen.getByText(/Declared but no longer reported/).textContent).toContain('codex');
+	});
+
+	it('lets the owner save the probed subset to correct a drifted declaration', async () => {
+		setDeclaredCapabilitiesMutate.mockResolvedValue({});
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude', 'codex'],
+			probedCapabilities: ['claude'],
+		});
+
+		const save = screen.getByRole('button', { name: 'Save CLIs' }) as HTMLButtonElement;
+		expect(save.disabled).toBe(false);
+		fireEvent.click(save);
+
+		await waitFor(() =>
+			expect(setDeclaredCapabilitiesMutate).toHaveBeenCalledWith({
+				workerId: 'worker-1',
+				capabilities: ['claude'],
+			}),
+		);
+	});
+
+	it('says nothing about drift when every declared CLI is still reported', () => {
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude'],
+			probedCapabilities: ['claude', 'codex'],
+		});
+
+		expect(screen.queryByText(/Declared but no longer reported/)).toBeNull();
+	});
+
+	it('states the drift to a non-owner too, who has no control to fix it with', () => {
+		renderWorker({
+			viewerIsOwner: false,
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude', 'codex'],
+			probedCapabilities: ['claude'],
+		});
+
+		expect(screen.getByText(/Declared but no longer reported/).textContent).toContain('codex');
+		expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
 	});
 });
 

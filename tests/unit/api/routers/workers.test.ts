@@ -54,7 +54,8 @@ const {
 		updateEnrollmentConstraints: vi.fn(),
 	};
 });
-const { getWorker, renameWorker } = vi.hoisted(() => ({
+const { declareWorkerCapabilities, getWorker, renameWorker } = vi.hoisted(() => ({
+	declareWorkerCapabilities: vi.fn(),
 	getWorker: vi.fn(),
 	renameWorker: vi.fn(),
 }));
@@ -88,14 +89,23 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 		)
 	).WorkerOrderDirectionSchema,
 }));
-vi.mock('@/identity/worker-service.js', () => ({ getWorker, renameWorker }));
+vi.mock('@/identity/worker-service.js', () => ({
+	declareWorkerCapabilities,
+	getWorker,
+	renameWorker,
+}));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
 
 import { workersRouter } from '@/api/routers/workers.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import type { SwarmUser } from '@/identity/schema.js';
-import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
+import {
+	DEFAULT_WORKER_SUPPORTED_PHASES,
+	type Worker,
+	WorkerCapabilityNotProbedError,
+	WorkerCapabilityReductionError,
+} from '@/identity/worker.js';
 import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
@@ -172,6 +182,7 @@ beforeEach(() => {
 		setSharingConsent,
 		updateEnrollmentConstraints,
 		deriveWorkerRunState,
+		declareWorkerCapabilities,
 		getWorker,
 		renameWorker,
 		removeWorker,
@@ -967,6 +978,122 @@ describe('workers.setConsent (owner controls sharing consent)', () => {
 		const result = await owner.setConsent({ enrollmentId: ENROLLMENT_ID, sharingConsent: false });
 		expect(result.sharingConsent).toBe(false);
 		expect(setSharingConsent).toHaveBeenCalledWith(ENROLLMENT_ID, false);
+	});
+});
+
+describe('workers.setDeclaredCapabilities (owner-only, no instanceAdmin override, issue #787)', () => {
+	it('is NOT_FOUND for an unknown worker', async () => {
+		getWorker.mockResolvedValue(undefined);
+
+		await expect(
+			owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: ['claude'] }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(declareWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(
+			owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: ['claude'] }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(declareWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	// The declaration is a statement about someone's own machine, so it admits no
+	// layer-1 override — exactly like `rename`, unlike `enroll`.
+	it('hides another owner’s worker from an instanceAdmin too', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		await expect(
+			admin.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: ['claude'] }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(declareWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	it('lets the owner declare a CLI set on their own worker', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		declareWorkerCapabilities.mockResolvedValue(
+			makeWorker({ capabilities: ['claude'], declaredCapabilities: ['claude'] }),
+		);
+
+		const result = await owner.setDeclaredCapabilities({
+			workerId: WORKER_ID,
+			capabilities: ['claude'],
+		});
+
+		expect(result.declaredCapabilities).toEqual(['claude']);
+		expect(declareWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['claude']);
+	});
+
+	it('clears the declaration when passed null', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		declareWorkerCapabilities.mockResolvedValue(makeWorker({ declaredCapabilities: null }));
+
+		await owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: null });
+
+		expect(declareWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, null);
+	});
+
+	it('is NOT_FOUND when the worker disappears between the check and the write', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		declareWorkerCapabilities.mockResolvedValue(undefined);
+
+		await expect(
+			owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: ['claude'] }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+	});
+
+	// The same status the handshake answers this rule with.
+	it('translates a set an active enrollment still needs to CONFLICT', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		declareWorkerCapabilities.mockRejectedValue(
+			new WorkerCapabilityReductionError(WORKER_ID, ['codex']),
+		);
+
+		await expect(
+			owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: ['claude'] }),
+		).rejects.toThrowError(
+			expect.objectContaining({ code: 'CONFLICT', message: expect.stringContaining('codex') }),
+		);
+	});
+
+	it('translates a set naming an unprobed CLI to BAD_REQUEST', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		declareWorkerCapabilities.mockRejectedValue(
+			new WorkerCapabilityNotProbedError(WORKER_ID, ['antigravity'], ['claude']),
+		);
+
+		await expect(
+			owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: ['antigravity'] }),
+		).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'BAD_REQUEST',
+				message: expect.stringContaining('antigravity'),
+			}),
+		);
+	});
+
+	it('rejects an empty set before it reaches the service — clearing is `null`, not `[]`', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(
+			owner.setDeclaredCapabilities({ workerId: WORKER_ID, capabilities: [] }),
+		).rejects.toThrow();
+		expect(declareWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	it('rejects a CLI outside the harness vocabulary before it reaches the service', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(
+			owner.setDeclaredCapabilities({
+				workerId: WORKER_ID,
+				capabilities: ['gemini'] as unknown as ['claude'],
+			}),
+		).rejects.toThrow();
+		expect(declareWorkerCapabilities).not.toHaveBeenCalled();
 	});
 });
 
