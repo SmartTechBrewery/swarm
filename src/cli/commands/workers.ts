@@ -54,6 +54,7 @@
  *   swarm workers consent <worker-id> <project-id> <on|off>
  */
 
+import { existsSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { closeDb } from '../../db/client.js';
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
@@ -246,32 +247,36 @@ function parseClis(raw: string) {
 }
 
 /**
- * Cache the freshly issued credential for the checkout this command was run in,
+ * Cache the freshly issued credential for a checkout,
  * and print the path — never the value (issue #788). Both registration paths call
  * this, so `swarm run:worker` finds a worker made either way.
  *
- * `process.cwd()` deliberately, not `SWARM_WORKER_REPO_ROOT`: the CLI is usually
- * invoked through `npm run swarm --`, which loads SWARM's own `.env`, and an
- * ambient value there would key the cache to a checkout the operator is not
- * standing in.
+ * The caller chooses the checkout explicitly: `register` uses npm's `INIT_CWD`
+ * when available, while `register-and-enroll` uses the resolved worker checkout.
+ * Neither trusts ambient `SWARM_WORKER_REPO_ROOT`, which could name a different
+ * worker than the one being registered.
  *
  * Best-effort by design. The credential is already issued and is about to be
  * printed, so a cache the operator can re-create by re-registering must never be
  * the reason registration reports failure — that would strand a registered worker
  * whose credential was never shown.
  */
-function cacheCredentialForCheckout(workerId: string, credential: string): void {
+function cacheCredentialForCheckout(workerId: string, credential: string, repoRoot: string): void {
 	try {
 		const cachePath = writeWorkerCredentialCache({
-			repoRoot: process.cwd(),
+			repoRoot,
 			workerId,
 			credential,
 		});
-		out.info(
-			`also cached for this checkout — start this worker from here with: swarm run:worker (${cachePath})`,
-		);
+		if (existsSync(repoRoot)) {
+			out.info(
+				`also cached for ${repoRoot} — start this worker there with: swarm run:worker (${cachePath})`,
+			);
+		} else {
+			out.info(`also cached for checkout ${repoRoot}: ${cachePath}`);
+		}
 	} catch (err) {
-		out.warn(`could not cache the credential for this checkout: ${describeError(err)}`);
+		out.warn(`could not cache the credential for ${repoRoot}: ${describeError(err)}`);
 	}
 }
 
@@ -325,7 +330,7 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 		out.info(
 			`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 		);
-		cacheCredentialForCheckout(worker.id, credential);
+		cacheCredentialForCheckout(worker.id, credential, process.env.INIT_CWD ?? process.cwd());
 		// Registration issues the worker's *connection* credential and nothing else, so
 		// the machine still has no source-control identity and every dispatch to it
 		// fails until one is stored (issue #765). Name both write surfaces and no
@@ -838,7 +843,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	out.info(
 		`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 	);
-	cacheCredentialForCheckout(worker.id, credential);
+	cacheCredentialForCheckout(worker.id, credential, repoRoot);
 
 	// From here the worker row exists and its credential is a one-time value held
 	// only in memory, so a later failure must still hand it over — losing it means

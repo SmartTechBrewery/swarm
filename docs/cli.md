@@ -237,10 +237,13 @@ swarm run:worker
 
 Start **this checkout's** registered worker (issue #788) — the daemon
 `npm run dev:worker` runs, with its two host-local values supplied for you:
-`SWARM_WORKER_REPO_ROOT` is the current directory, and `SWARM_WORKER_CREDENTIAL`
+`SWARM_WORKER_REPO_ROOT` is the directory where you invoked the command, and `SWARM_WORKER_CREDENTIAL`
 comes out of the per-checkout cache `swarm workers register` /
 `register-and-enroll` wrote on this machine. Nothing is printed and nothing has to
 be pasted; the command names the worker id and the checkout, never the credential.
+For `npm run swarm -- run:worker`, npm exposes that directory through `INIT_CWD`;
+the global `swarm run:worker` form uses its current directory. Both forms therefore
+select the same checkout you invoked them from.
 
 This is an **additional** start path, not a replacement. It is for the case where
 the machine that registered the worker is the machine running it; for a remote
@@ -335,9 +338,10 @@ swarm workers consent <worker-id> <project-id> <on|off>
   `claude | antigravity | codex`). **Prints a worker credential ONCE** — store it
   then (it is never printed again) and put it in `.env` as `SWARM_WORKER_CREDENTIAL`;
   the host worker authenticates its session with it at startup. It is *also* written
-  to this machine's per-checkout cache
+  to this machine's per-checkout cache, keyed to the directory where the command
+  was invoked (`INIT_CWD` for `npm run swarm -- workers register …`)
   (`~/.swarm/worker-credentials/<hash>/credential.json`, issue #788), so
-  [`swarm run:worker`](#swarm-runworker) can start this worker from this checkout with
+  [`swarm run:worker`](#swarm-runworker) can start this worker from that checkout with
   nothing to paste; the command names that file (never the value). Printing stays,
   because a remote machine or a process supervisor still needs the value. The command also
   states what registration does *not* do (issue #767): the machine has no SCM
@@ -362,7 +366,9 @@ swarm workers consent <worker-id> <project-id> <on|off>
   to run on the target machine yourself (its `.env` must already carry
   `SWARM_CONTROL_PLANE_URL`). `--repo-root` overrides the printed
   `SWARM_WORKER_REPO_ROOT`, which otherwise defaults to the project's configured
-  checkout — pass it when the machine's checkout path differs. Everything each step
+  checkout — pass it when the machine's checkout path differs. The credential cache
+  uses that same resolved checkout; it offers `swarm run:worker` only when that
+  checkout exists on the machine running this command. Everything each step
   refuses today is still refused, with nothing written before the refusal wherever
   that is possible: a bad `--cli`, an unknown owner or project, a project whose `scm`
   resolves no provider, and an empty or aborted secret all fail **before** the worker

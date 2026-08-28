@@ -75,8 +75,8 @@ export function writeWorkerCredentialCache(input: WriteWorkerCredentialCacheInpu
 
 	// `~/.swarm/worker-credentials/` is created owner-only and then chmod'ed
 	// explicitly, so the result does not depend on the process umask or on a
-	// pre-existing directory's mode. `~/.swarm` itself is deliberately left alone —
-	// `checkout-locks/` shares it, and its mode is not this module's to decide.
+	// pre-existing directory's mode. This never chmods an existing `~/.swarm`, but
+	// the recursive mkdir creates it at 0700 when this module creates it first.
 	mkdirSync(dirname(dir), { recursive: true, mode: 0o700 });
 	chmodSync(dirname(dir), 0o700);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });

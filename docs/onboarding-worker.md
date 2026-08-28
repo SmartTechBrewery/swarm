@@ -52,11 +52,11 @@ That is the whole hand-off: **it does not start the worker** — Part 2 is where
 that line is run, on the machine itself, with `SWARM_CONTROL_PLANE_URL` already in
 its `.env`. The printed `SWARM_WORKER_REPO_ROOT` is the *project's* configured
 checkout, so a different machine substitutes its own path (or pass `--repo-root
-<path>` to have the right one printed). The worker credential appears in that one
-printed line and nowhere else, so copy it before the terminal scrolls — **unless
-you ran this in the target checkout on the target machine**, in which case it was
-also cached there (issue #788) and `swarm run:worker` starts the worker with
-nothing to paste (Part 2). Every refusal the
+<path>` to have the right one printed). The cache uses that same resolved checkout:
+when it exists on the machine running this command, the credential is cached there
+and `swarm run:worker` starts the worker with nothing to paste (Part 2). The worker
+credential appears in that one printed line and nowhere else, so copy it before the
+terminal scrolls. Every refusal the
 three commands it replaces produce still applies, unchanged — see
 [`docs/cli.md`](./cli.md#swarm-workers).
 
@@ -105,7 +105,8 @@ Notes:
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
   it again). Copy it immediately; if you lose it, `workers remove` +
   `workers register` again is the only recovery. Step 3 **also caches it for the
-  checkout it was run in**, on the machine it was run on (issue #788):
+  directory where the command was invoked**, on the machine it was run on (issue
+  #788; `npm run swarm -- …` reads that directory from `INIT_CWD`):
   `~/.swarm/worker-credentials/<hash>/credential.json`, owner-only, outside every
   checkout. That is what lets `swarm run:worker` start this worker without the
   credential being pasted anywhere — but only where the registering machine *is*

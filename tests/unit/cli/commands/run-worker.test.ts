@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { runCommand } = vi.hoisted(() => ({ runCommand: vi.fn() }));
 const { readWorkerCredentialCache, workerCredentialCachePath } = vi.hoisted(() => ({
@@ -17,14 +17,16 @@ import { REPO_ROOT } from '@/cli/_shared/paths.js';
 import { run } from '@/cli/commands/run-worker.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
-/** What the command derives from `process.cwd()` — the same canonicalization the cache keys on. */
+/** What the command derives from its invocation directory — the same canonicalization the cache keys on. */
 const CWD = realpathSync(process.cwd());
+const ORIGINAL_INIT_CWD = process.env.INIT_CWD;
 
 describe('swarm run:worker', () => {
 	let log: ReturnType<typeof vi.spyOn>;
 	let error: ReturnType<typeof vi.spyOn>;
 
 	beforeEach(() => {
+		delete process.env.INIT_CWD;
 		log = vi.spyOn(console, 'log').mockImplementation(() => {});
 		error = vi.spyOn(console, 'error').mockImplementation(() => {});
 		runCommand.mockReset().mockResolvedValue(0);
@@ -39,6 +41,11 @@ describe('swarm run:worker', () => {
 			.mockReturnValue('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
 	});
 
+	afterEach(() => {
+		if (ORIGINAL_INIT_CWD === undefined) delete process.env.INIT_CWD;
+		else process.env.INIT_CWD = ORIGINAL_INIT_CWD;
+	});
+
 	/** Every line this command printed, on either stream. */
 	function printed(): string[] {
 		return [...log.mock.calls, ...error.mock.calls].map(([line]) => String(line));
@@ -50,6 +57,21 @@ describe('swarm run:worker', () => {
 		expect(runCommand).toHaveBeenCalledWith('npm', ['run', 'dev:worker'], {
 			cwd: REPO_ROOT,
 			env: { SWARM_WORKER_REPO_ROOT: CWD, SWARM_WORKER_CREDENTIAL: 'raw-credential-token' },
+		});
+	});
+
+	it("uses npm's caller directory when it differs from the script cwd", async () => {
+		const invocationDirectory = realpathSync('src');
+		process.env.INIT_CWD = invocationDirectory;
+
+		expect(await run([])).toBe(0);
+		expect(readWorkerCredentialCache).toHaveBeenCalledWith(invocationDirectory);
+		expect(runCommand).toHaveBeenCalledWith('npm', ['run', 'dev:worker'], {
+			cwd: REPO_ROOT,
+			env: {
+				SWARM_WORKER_REPO_ROOT: invocationDirectory,
+				SWARM_WORKER_CREDENTIAL: 'raw-credential-token',
+			},
 		});
 	});
 

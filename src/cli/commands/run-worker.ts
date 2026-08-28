@@ -6,7 +6,7 @@
  * `src/transport/connect-entry.ts` started by `npm run dev:worker`, with the same
  * env contract, the same handshake, and the same checkout lock. All this adds is
  * where its two host-local values come from — `SWARM_WORKER_REPO_ROOT` is the
- * current directory, and `SWARM_WORKER_CREDENTIAL` comes out of the per-checkout
+ * operator's invocation directory, and `SWARM_WORKER_CREDENTIAL` comes out of the
  * cache `swarm workers register` / `register-and-enroll` wrote on this machine
  * (`../_shared/worker-credential-cache.ts`). Neither is ever printed here.
  *
@@ -88,10 +88,10 @@ export async function run(argv: string[]): Promise<number> {
 		return 0;
 	}
 
-	// The cwd, not `SWARM_WORKER_REPO_ROOT`: the CLI is often invoked through
-	// `npm run swarm --`, which loads SWARM's own `.env`, and an ambient value there
-	// would start the worker for a checkout the operator is not standing in.
-	const repoRoot = canonicalCheckoutPath(process.cwd());
+	// npm resets its script's cwd to the package root, but preserves the caller's
+	// directory in INIT_CWD. The global binary has no INIT_CWD, so cwd remains its
+	// invocation checkout. Never use ambient SWARM_WORKER_REPO_ROOT here.
+	const repoRoot = canonicalCheckoutPath(process.env.INIT_CWD ?? process.cwd());
 	const cached = readWorkerCredentialCache(repoRoot);
 
 	if (cached === null) {

@@ -279,12 +279,16 @@ from inside that checkout:
 swarm run:worker
 ```
 
-starts the same daemon with `SWARM_WORKER_REPO_ROOT` set to the current directory
-and the credential read from that file — never printed, never pasted, with only
+starts the same daemon with `SWARM_WORKER_REPO_ROOT` set to the directory where the
+command was invoked and the credential read from that file — never printed, never pasted, with only
 `SWARM_CONTROL_PLANE_URL` left to `.env`. It is an *additional* launcher, not a
 second worker: the block above is unchanged and stays the path for a remote
 machine, a process supervisor, or any setup where the registering machine is not
 the running one.
+
+The global `swarm run:worker` form uses its current directory; `npm run swarm --
+run:worker` uses npm's caller directory (`INIT_CWD`), so both forms select the
+checkout you invoked them from.
 
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
