@@ -10,9 +10,10 @@
  * `rowToSwarmUser` (`role` is persisted as free `text`, so it is cast back to the
  * `ProjectRole` enum the writers here only ever store). Adding a membership that
  * already exists surfaces the raw pg `23505` unique violation on
- * `(project_id, user_id)`; the caller (the `swarm members` CLI) translates it to
- * a friendly message. Lookups that find nothing return `undefined`/`[]` — a
- * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
+ * `(project_id, user_id)`; the caller (the `swarm members` CLI, or the `members`
+ * tRPC router since issue #805) translates it to a friendly message. Lookups that
+ * find nothing return `undefined`/`[]` — a not-found, not an error
+ * (ai/CODING_STANDARDS.md "Error handling").
  */
 
 import { and, asc, eq } from 'drizzle-orm';
@@ -20,8 +21,27 @@ import { and, asc, eq } from 'drizzle-orm';
 import type { ProjectMembership, ProjectRole } from '../../identity/membership.js';
 import { getDb } from '../client.js';
 import { projectMembers } from '../schema/projectMembers.js';
+import { users } from '../schema/users.js';
 
 type ProjectMemberRow = typeof projectMembers.$inferSelect;
+
+/**
+ * A membership joined to the identity a human recognises the member by — the read
+ * model behind `members.list` (`src/api/routers/members.ts`, issue #805), which
+ * renders a roster and cannot show raw uuids.
+ *
+ * Deliberately **not** a `ProjectMembership`: it carries no `id` and no
+ * `createdAt`. The membership row's own id addresses nothing a caller can use
+ * (`setRole`/`remove` are keyed on `(project, user)`), and a `Date` would cross
+ * the tRPC link untransformed — the roster shows who and in what role, so both
+ * are omitted rather than serialized.
+ */
+export interface ProjectMemberWithUser {
+	userId: string;
+	identifier: string;
+	displayName: string;
+	role: ProjectRole;
+}
 
 /** The fields a caller supplies to create a membership; `id`/`createdAt` are generated. */
 export interface AddMemberInput {
@@ -76,6 +96,33 @@ export async function listMembersForProject(projectId: string): Promise<ProjectM
 		.where(eq(projectMembers.projectId, projectId))
 		.orderBy(asc(projectMembers.createdAt), asc(projectMembers.id));
 	return rows.map(rowToMembership);
+}
+
+/**
+ * Every member of a project with the user behind each row, alphabetical by
+ * login handle — one joined query rather than the `swarm members list` CLI's
+ * `getUserById` per row, which is what makes this fit an API caller.
+ *
+ * The selected columns are listed explicitly and are exactly
+ * {@link ProjectMemberWithUser}: `users.passwordHash` is credential material
+ * that never leaves the DB layer (`src/db/schema/users.ts`), so a `select()`
+ * over the whole joined row is not an option here.
+ */
+export async function listMembersWithUsersForProject(
+	projectId: string,
+): Promise<ProjectMemberWithUser[]> {
+	const rows = await getDb()
+		.select({
+			userId: projectMembers.userId,
+			identifier: users.identifier,
+			displayName: users.displayName,
+			role: projectMembers.role,
+		})
+		.from(projectMembers)
+		.innerJoin(users, eq(users.id, projectMembers.userId))
+		.where(eq(projectMembers.projectId, projectId))
+		.orderBy(asc(users.identifier));
+	return rows.map((row) => ({ ...row, role: row.role as ProjectRole }));
 }
 
 /** List every project membership a user holds, oldest first. Empty if the user belongs to no project. */

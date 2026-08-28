@@ -1,5 +1,6 @@
 import '../integrations/entrypoint.js';
 import { authRouter } from './routers/auth.js';
+import { membersRouter } from './routers/members.js';
 import { pingRouter } from './routers/ping.js';
 import { pmRouter } from './routers/pm.js';
 import { projectsRouter } from './routers/projects.js';
@@ -12,6 +13,7 @@ import { router } from './trpc.js';
 
 export const appRouter = router({
 	auth: authRouter,
+	members: membersRouter,
 	ping: pingRouter,
 	pm: pmRouter,
 	projects: projectsRouter,
