@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trash2, Users } from 'lucide-react';
 import type React from 'react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { PROJECT_ROLE_COPY, PROJECT_ROLE_OPTIONS } from '@/lib/project-roles.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type { ProjectRole } from '../../../../src/identity/membership.js';
@@ -68,6 +68,9 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 	const [identifier, setIdentifier] = useState('');
 	const [role, setRole] = useState<ProjectRole>('member');
 	const [removeTarget, setRemoveTarget] = useState<ProjectMember | null>(null);
+	const [pendingRoleUserIds, setPendingRoleUserIds] = useState<Set<string>>(() => new Set());
+	const [roleErrors, setRoleErrors] = useState<Record<string, string>>({});
+	const pendingRoleUserIdsRef = useRef(new Set<string>());
 
 	const invalidateMembers = () =>
 		queryClient.invalidateQueries({ queryKey: membersQueryOptions.queryKey });
@@ -84,12 +87,6 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 		},
 	});
 
-	const setRoleMutation = useMutation({
-		mutationFn: (input: { userId: string; role: ProjectRole }) =>
-			trpcClient.members.setRole.mutate({ projectId, ...input }),
-		onSuccess: invalidateMembers,
-	});
-
 	const removeMutation = useMutation({
 		mutationFn: (input: { userId: string }) =>
 			trpcClient.members.remove.mutate({ projectId, userId: input.userId }),
@@ -99,22 +96,39 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 		},
 	});
 
-	// Row-scoped, from the mutation's own variables (the way `WorkersRoster` scopes a
-	// reorder): the spinner and any error attach to the row that caused them rather
-	// than to the whole table, and that row's select is the only one disabled.
-	const savingRoleUserId = setRoleMutation.isPending
-		? setRoleMutation.variables?.userId
-		: undefined;
-	const roleError =
-		setRoleMutation.isError && setRoleMutation.variables
-			? { userId: setRoleMutation.variables.userId, message: setRoleMutation.error.message }
-			: null;
-
 	const handleAdd = (e: React.FormEvent) => {
 		e.preventDefault();
 		const trimmed = identifier.trim();
 		if (trimmed.length === 0) return;
 		addMutation.mutate({ identifier: trimmed, role });
+	};
+
+	const handleRoleChange = async (userId: string, nextRole: ProjectRole) => {
+		if (pendingRoleUserIdsRef.current.has(userId)) return;
+
+		pendingRoleUserIdsRef.current.add(userId);
+		setPendingRoleUserIds((current) => new Set(current).add(userId));
+		setRoleErrors((current) => {
+			const { [userId]: _previousError, ...remaining } = current;
+			return remaining;
+		});
+
+		try {
+			await trpcClient.members.setRole.mutate({ projectId, userId, role: nextRole });
+			invalidateMembers();
+		} catch (error) {
+			setRoleErrors((current) => ({
+				...current,
+				[userId]: error instanceof Error ? error.message : 'Failed to change member role.',
+			}));
+		} finally {
+			pendingRoleUserIdsRef.current.delete(userId);
+			setPendingRoleUserIds((current) => {
+				const next = new Set(current);
+				next.delete(userId);
+				return next;
+			});
+		}
 	};
 
 	const closeRemoveDialog = () => {
@@ -191,13 +205,10 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 										<select
 											aria-label={`Role for ${member.identifier}`}
 											value={member.role}
-											disabled={savingRoleUserId === member.userId}
-											onChange={(e) =>
-												setRoleMutation.mutate({
-													userId: member.userId,
-													role: e.target.value as ProjectRole,
-												})
-											}
+											disabled={pendingRoleUserIds.has(member.userId)}
+											onChange={(e) => {
+												void handleRoleChange(member.userId, e.target.value as ProjectRole);
+											}}
 											className={SELECT_CLASS}
 										>
 											{PROJECT_ROLE_OPTIONS.map((option) => (
@@ -206,11 +217,11 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 												</option>
 											))}
 										</select>
-										{savingRoleUserId === member.userId && (
+										{pendingRoleUserIds.has(member.userId) && (
 											<p className="mt-1.5 text-xs text-zinc-400">Saving…</p>
 										)}
-										{roleError?.userId === member.userId && (
-											<p className="mt-1.5 text-xs text-red-400">{roleError.message}</p>
+										{roleErrors[member.userId] && (
+											<p className="mt-1.5 text-xs text-red-400">{roleErrors[member.userId]}</p>
 										)}
 									</td>
 									<td className="px-4 py-3 text-right">

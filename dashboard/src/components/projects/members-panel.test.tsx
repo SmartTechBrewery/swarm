@@ -142,6 +142,49 @@ describe('MembersPanel (issue #806 — the project Members tab)', () => {
 		);
 	});
 
+	it('keeps each role row disabled until its own write settles', async () => {
+		listFn.mockResolvedValue([ADA, GRACE]);
+		let resolveAda: () => void = () => {};
+		let resolveGrace: () => void = () => {};
+		setRoleMutate.mockImplementation(
+			({ userId }: { userId: string }) =>
+				new Promise<void>((resolve) => {
+					if (userId === ADA.userId) {
+						resolveAda = resolve;
+					} else {
+						resolveGrace = resolve;
+					}
+				}),
+		);
+
+		renderPanel(<MembersPanel projectId="proj-a" />);
+
+		const adaRole = (await waitFor(() =>
+			screen.getByLabelText('Role for ada'),
+		)) as HTMLSelectElement;
+		const graceRole = screen.getByLabelText('Role for grace') as HTMLSelectElement;
+		fireEvent.change(adaRole, { target: { value: 'member' } });
+		await waitFor(() => expect(setRoleMutate).toHaveBeenCalledTimes(1));
+		expect(adaRole.disabled).toBe(true);
+
+		fireEvent.change(graceRole, { target: { value: 'contributor' } });
+		await waitFor(() => expect(setRoleMutate).toHaveBeenCalledTimes(2));
+		// A second row's mutation must not replace Ada's pending state.
+		expect(adaRole.disabled).toBe(true);
+
+		// This is the request that previously could overtake Ada's first write. The
+		// ref guard also protects the handler if an event is dispatched programmatically.
+		fireEvent.change(adaRole, { target: { value: 'contributor' } });
+		expect(setRoleMutate).toHaveBeenCalledTimes(2);
+
+		resolveGrace();
+		await waitFor(() => expect(graceRole.disabled).toBe(false));
+		expect(adaRole.disabled).toBe(true);
+
+		resolveAda();
+		await waitFor(() => expect(adaRole.disabled).toBe(false));
+	});
+
 	it('attaches a failed role change to the row that caused it', async () => {
 		listFn.mockResolvedValue([ADA, GRACE]);
 		setRoleMutate.mockRejectedValue(new Error('User "u-2" is not a member of this project'));
