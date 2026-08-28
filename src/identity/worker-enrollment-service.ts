@@ -570,13 +570,13 @@ export async function listDashboardWorkers(
 
 /**
  * One worker's detail view (issue #477), or `null` when the viewer may not see
- * it — the same visibility rule {@link listDashboardWorkers} applies, so this
- * adds no second answer to "which machines may I see": an administrator
- * (`projectScope === null`) sees any registered worker including an un-enrolled
- * one, and any other viewer only a worker enrolled in a project they may access,
- * with the inaccessible enrollments stripped from the view. `null` is
+ * it. An administrator (`projectScope === null`) sees any registered worker,
+ * including an un-enrolled one. A restricted viewer sees only a worker enrolled
+ * in an accessible project, with inaccessible enrollments stripped from the view;
+ * the one exception is the worker's own owner, who may also read their
+ * registered-but-un-enrolled machine to create its first enrollment. `null` is
  * indistinguishable from "no such worker" on purpose — the caller turns both into
- * one `NOT_FOUND` so worker existence never leaks.
+ * one `NOT_FOUND` so worker existence never leaks to a non-owner.
  *
  * Where the roster row carries only `(projectId, status)` per enrollment, this
  * carries the full per-project enrollment detail, so the detail screen can
@@ -585,16 +585,18 @@ export async function listDashboardWorkers(
 export async function getDashboardWorkerDetail(
 	workerId: string,
 	projectScope: DashboardProjectScope,
+	viewerUserId?: string,
 ): Promise<DashboardWorkerDetailView | null> {
-	if (projectScope !== null && projectScope.length === 0) return null;
 	const worker = await getWorkerById(workerId);
 	if (!worker) return null;
+	const viewerIsOwner = worker.ownerUserId === viewerUserId;
+	if (projectScope !== null && projectScope.length === 0 && !viewerIsOwner) return null;
 	const accessible = projectScope === null ? null : new Set(projectScope);
 	const enrollments = await listEnrollmentsForWorker(worker.id);
 	const visible = accessible
 		? enrollments.filter((enrollment) => accessible.has(enrollment.projectId))
 		: enrollments;
-	if (accessible && visible.length === 0) return null;
+	if (accessible && visible.length === 0 && !viewerIsOwner) return null;
 	// Spreading the *assembled view* (not a row) keeps the one place that names
 	// the safe worker fields — `assembleDashboardWorker` — as the only assembler.
 	const row = await assembleDashboardWorker(worker, visible, accessible);

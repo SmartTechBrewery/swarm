@@ -366,7 +366,7 @@ describe('workers.getById (worker detail, issue #477)', () => {
 
 		const detail = await owner.getById({ workerId: WORKER_ID });
 
-		expect(getDashboardWorkerDetail).toHaveBeenCalledWith(WORKER_ID, ['p1']);
+		expect(getDashboardWorkerDetail).toHaveBeenCalledWith(WORKER_ID, ['p1'], OWNER_ID);
 		expect(detail.lastSeenAt).toBe('2026-07-01T12:00:00.000Z');
 	});
 

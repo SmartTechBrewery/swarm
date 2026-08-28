@@ -140,8 +140,8 @@ describe('MyWorkersPanel ownership (issue #660)', () => {
 });
 
 describe('MyWorkersPanel entries', () => {
-	it('links each machine to its existing detail screen', async () => {
-		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+	it('links an un-enrolled machine to its existing detail screen', async () => {
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker({ enrollments: [] })]);
 
 		renderPanel(<MyWorkersPanel />);
 
