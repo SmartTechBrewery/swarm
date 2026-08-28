@@ -149,6 +149,49 @@ describe('MyWorkersPanel entries', () => {
 		expect(link.getAttribute('href')).toBe('/workers/worker-1');
 	});
 
+	it('makes the whole card the link’s target, not only the name text (issue #781)', async () => {
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+
+		renderPanel(<MyWorkersPanel />);
+
+		const link = await screen.findByRole('link', { name: 'ada-laptop' });
+		const card = link.closest('li');
+		// The card is the overlay's containing block and the overlay spans it, so a
+		// pointer anywhere on the card activates this one link — while the link's
+		// accessible name stays the machine's name rather than the card's whole text.
+		expect(card?.className).toContain('relative');
+		expect(link.className).toContain('after:absolute');
+		expect(link.className).toContain('after:inset-0');
+	});
+
+	it('shows the hover and focus affordance on the card rather than on the name', async () => {
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+
+		renderPanel(<MyWorkersPanel />);
+
+		const link = await screen.findByRole('link', { name: 'ada-laptop' });
+		const card = link.closest('li');
+		// A card that navigates has to read as one from anywhere on it — the name's
+		// own `hover:` would only answer a pointer already on the text.
+		expect(card?.className).toContain('cursor-pointer');
+		expect(card?.className).toContain('hover:bg-zinc-800/40');
+		expect(card?.className).toContain('hover:border-zinc-700');
+		expect(card?.className).toContain('focus-within:ring-violet-500');
+		expect(link.className).toContain('group-hover:text-violet-300');
+	});
+
+	it('keeps the idle badge’s own explanation above the card-wide link', async () => {
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+
+		renderPanel(<MyWorkersPanel />);
+
+		// A covered element's `title` never resolves, so the badge has to sit above
+		// the overlay — otherwise making the card clickable silently drops the
+		// explanation this panel deliberately stamps beside the verdict.
+		const idle = await screen.findByText('Idle');
+		expect(idle.parentElement?.className).toContain('z-10');
+	});
+
 	it('lists every machine the owner operates, in the order the server returned them', async () => {
 		listMineQueryFn.mockResolvedValue([
 			makeOwnerWorker(),
@@ -216,7 +259,10 @@ describe('MyWorkersPanel availability', () => {
 		renderPanel(<MyWorkersPanel />);
 
 		expect(await screen.findByText('Project A')).toBeDefined();
-		expect(screen.getByText('Available')).toBeDefined();
+		const available = screen.getByText('Available');
+		expect(available.getAttribute('title')).toContain('dispatch gate');
+		// Above the card-wide link, for the same reason the idle badge is.
+		expect(available.parentElement?.className).toContain('z-10');
 	});
 
 	it('explains an unapproved enrollment in the worker detail view’s own words', async () => {
@@ -286,6 +332,9 @@ describe('MyWorkersPanel availability', () => {
 		expect(await screen.findByText('Not enrolled in any project yet.')).toBeDefined();
 		expect(screen.queryByText('Available')).toBeNull();
 		expect(screen.queryByText('Unavailable')).toBeNull();
+		// Both paths, since issue #764 put enrolling on the machine's own screen: the
+		// dashboard one this card now opens, and the CLI that was the only one before.
+		expect(screen.getByText(/Open it to enroll it in a project/)).toBeDefined();
 		expect(screen.getByText('swarm workers enroll')).toBeDefined();
 	});
 });

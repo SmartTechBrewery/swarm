@@ -25,7 +25,10 @@ import type { OwnerEnrollment, OwnerWorker } from '@/types/workers.js';
  * **It is read-only.** Naming a machine, granting sharing consent, and setting
  * execution constraints stay on the worker detail screen, where the server
  * declares per value who may change it — so this tab offers no control and each
- * entry simply links to `/workers/$workerId`. That link is scoped by project
+ * entry is simply a link to `/workers/$workerId` — the **whole** card of one
+ * (issue #781), since the name text alone was a target small enough that owners
+ * did not read it as a link at all, and this tab is the front door to the detail
+ * screen's own controls (its enroll action included). That link is scoped by project
  * membership (issue #647's deliberate choice), so a machine enrolled in no
  * project the owner can access resolves to `NOT_FOUND` there; a machine with no
  * enrollments at all says so here rather than only surfacing as an error one
@@ -35,7 +38,25 @@ import type { OwnerEnrollment, OwnerWorker } from '@/types/workers.js';
  * worker view uses, so activity and availability age out at the same rate here.
  */
 
-const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/20 p-4 shadow-sm';
+/**
+ * The card — and, since issue #781, the whole of the link's target. Hover and
+ * focus are stamped here rather than on the name so the affordance covers every
+ * pixel of the card; `relative` makes it the containing block the name link's
+ * `::after` overlay stretches to, and `group` is what lets the name follow the
+ * card's own hover rather than only the pointer sitting on the text.
+ */
+const CARD_CLASS =
+	'group relative border border-zinc-800 rounded-lg bg-panel/20 p-4 shadow-sm cursor-pointer transition-colors hover:bg-zinc-800/40 hover:border-zinc-700 focus-within:bg-zinc-800/40 focus-within:border-violet-500 focus-within:ring-1 focus-within:ring-violet-500';
+
+/**
+ * Anything inside the card that means something of its own sits *above* the
+ * stretched link. Two reasons, both load-bearing: a covered element's `title`
+ * never resolves — a browser looks *up* from whatever the pointer is actually
+ * over for a tooltip, never down at what it covers, so the availability and idle
+ * explanations would silently disappear — and this is the layer an in-card
+ * control would live in, above the link rather than nested inside an anchor.
+ */
+const ABOVE_CARD_LINK_CLASS = 'relative z-10';
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400';
 
 /**
@@ -69,9 +90,11 @@ function EnrollmentRow({
 		<li className="space-y-1">
 			<div className="flex flex-wrap items-center gap-2">
 				<span className="text-zinc-300 break-words">{projectName}</span>
-				<Badge tone={enrollment.isRoutable ? 'positive' : 'neutral'} title={AVAILABILITY_TITLE}>
-					{enrollment.isRoutable ? 'Available' : 'Unavailable'}
-				</Badge>
+				<span className={ABOVE_CARD_LINK_CLASS}>
+					<Badge tone={enrollment.isRoutable ? 'positive' : 'neutral'} title={AVAILABILITY_TITLE}>
+						{enrollment.isRoutable ? 'Available' : 'Unavailable'}
+					</Badge>
+				</span>
 			</div>
 			{blockers.length > 0 ? (
 				<ul className="space-y-1 text-zinc-500">
@@ -96,19 +119,27 @@ function WorkerCard({
 		<li className={CARD_CLASS}>
 			<div className="flex items-start justify-between gap-3">
 				<div className="min-w-0">
+					{/* Stretched over the card by its own `::after` overlay rather than
+					    wrapped around the card's contents (issue #781): the accessible name
+					    stays the machine's name instead of becoming a dump of every fact on
+					    the card, and nothing inside the card is nested inside an anchor.
+					    `focus:outline-none` is safe because the card draws the focus ring
+					    for it — a strictly larger target than this text. */}
 					<Link
 						to="/workers/$workerId"
 						params={{ workerId: worker.workerId }}
-						className="text-sm font-medium text-zinc-100 hover:text-violet-300 transition-colors break-words"
+						className="text-sm font-medium text-zinc-100 group-hover:text-violet-300 transition-colors break-words after:absolute after:inset-0 after:rounded-lg focus:outline-none"
 					>
 						{worker.displayName}
 					</Link>
 				</div>
-				{worker.runState.busy ? (
-					<Badge tone="positive">Running a job</Badge>
-				) : (
-					<Badge title={IDLE_TITLE}>Idle</Badge>
-				)}
+				<span className={ABOVE_CARD_LINK_CLASS}>
+					{worker.runState.busy ? (
+						<Badge tone="positive">Running a job</Badge>
+					) : (
+						<Badge title={IDLE_TITLE}>Idle</Badge>
+					)}
+				</span>
 			</div>
 
 			<div className="mt-3">
@@ -130,8 +161,9 @@ function WorkerCard({
 					<div className="mt-1 space-y-1">
 						<p className="text-zinc-400">Not enrolled in any project yet.</p>
 						<p className="text-zinc-500">
-							Enroll it with <span className="font-mono">swarm workers enroll</span> before a
-							project can dispatch work to it.
+							Open it to enroll it in a project — or run{' '}
+							<span className="font-mono">swarm workers enroll</span> — before a project can
+							dispatch work to it.
 						</p>
 					</div>
 				) : (
@@ -185,8 +217,8 @@ export function MyWorkersPanel() {
 				<p className="text-sm text-zinc-400">You don't operate any workers yet.</p>
 				<p className="text-xs text-zinc-500">
 					A machine appears here once you register it with{' '}
-					<span className="font-mono">swarm workers register</span>; enroll it with{' '}
-					<span className="font-mono">swarm workers enroll</span> to make it available to a project.
+					<span className="font-mono">swarm workers register</span>. Open it from this tab to enroll
+					it in a project and make it available.
 				</p>
 			</div>
 		);
