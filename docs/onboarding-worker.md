@@ -50,11 +50,14 @@ swarm: SWARM_WORKER_CREDENTIAL=<credential> SWARM_WORKER_REPO_ROOT=<checkout> np
 
 That is the whole hand-off: **it does not start the worker** — Part 2 is where
 that line is run, on the machine itself, with `SWARM_CONTROL_PLANE_URL` already in
-its `.env`. The printed `SWARM_WORKER_REPO_ROOT` is the *project's* configured
-checkout, so a different machine substitutes its own path (or pass `--repo-root
-<path>` to have the right one printed). The cache uses that same resolved checkout:
-when it exists on the machine running this command, the credential is cached there
-and `swarm run:worker` starts the worker with nothing to paste (Part 2). The worker
+its `.env`. The printed `SWARM_WORKER_REPO_ROOT` is the checkout you ran the command
+*in* — not the project record's stored `repoRoot`, which names whichever machine last
+ran `swarm config apply` (issue #796) — exactly as `workers register` behaves. So when
+the admin machine is also the worker's machine, nothing has to be substituted; pass
+`--repo-root <path>` when you are onboarding somebody else's machine, whose checkout
+path this one cannot know. The cache uses that same resolved checkout: when it exists
+on the machine running this command, the credential is cached there and
+`swarm run:worker` starts the worker with nothing to paste (Part 2). The worker
 credential appears in that one printed line and nowhere else, so copy it before the
 terminal scrolls. Every refusal the
 three commands it replaces produce still applies, unchanged — see

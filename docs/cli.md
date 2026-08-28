@@ -364,11 +364,16 @@ swarm workers consent <worker-id> <project-id> <on|off>
   exactly once**, in the final start-command line. It **does not start the worker**:
   that daemon is a foreground, operator-owned process, so the last line is a command
   to run on the target machine yourself (its `.env` must already carry
-  `SWARM_CONTROL_PLANE_URL`). `--repo-root` overrides the printed
-  `SWARM_WORKER_REPO_ROOT`, which otherwise defaults to the project's configured
-  checkout — pass it when the machine's checkout path differs. The credential cache
+  `SWARM_CONTROL_PLANE_URL`). The printed `SWARM_WORKER_REPO_ROOT` defaults to the
+  checkout you run the command in — `INIT_CWD` under `npm run swarm --`, the current
+  directory for the global binary, exactly like `register` (issue #796) — and **not**
+  the project record's stored `repoRoot`, host-local state written by whichever machine
+  last ran `swarm config apply`. So no flag is needed when the machine running this
+  command is the worker's own; `--repo-root` overrides it for onboarding somebody
+  else's machine, whose checkout path this one cannot know. The credential cache
   uses that same resolved checkout; it offers `swarm run:worker` only when that
-  checkout exists on the machine running this command. Everything each step
+  checkout exists on the machine running this command, which is normally the case
+  unless `--repo-root` names another machine's path. Everything each step
   refuses today is still refused, with nothing written before the refusal wherever
   that is possible: a bad `--cli`, an unknown owner or project, a project whose `scm`
   resolves no provider, and an empty or aborted secret all fail **before** the worker

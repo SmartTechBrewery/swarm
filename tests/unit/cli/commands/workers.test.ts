@@ -344,7 +344,13 @@ describe('swarm workers', () => {
 	// the exact command that starts the daemon. It composes the three commands above,
 	// so what is asserted here is the *ordering* and the credential handling.
 	describe('register-and-enroll', () => {
+		/** The checkout this test process is standing in — the command's own default. */
 		const REPO_ROOT = process.cwd();
+		/**
+		 * The project record's stored `repoRoot`: host-local state written by whichever
+		 * machine last ran `swarm config apply`, deliberately *not* this one (issue #796).
+		 */
+		const PROJECT_RECORD_REPO_ROOT = '/on/the/admin/machine/swarm';
 		const ARGV = [
 			'register-and-enroll',
 			'ada@example.com',
@@ -359,7 +365,11 @@ describe('swarm workers', () => {
 			// The suite's global fixture is a bare `{ id }` with no `scm`, which would
 			// exercise the registry's "selects no provider" throw in every case here.
 			findProjectByIdFromDb.mockResolvedValue(
-				createMockProjectConfig({ id: PROJECT_ID, scm: 'github', repoRoot: REPO_ROOT }),
+				createMockProjectConfig({
+					id: PROJECT_ID,
+					scm: 'github',
+					repoRoot: PROJECT_RECORD_REPO_ROOT,
+				}),
 			);
 		});
 
@@ -424,8 +434,11 @@ describe('swarm workers', () => {
 			expect(log).not.toHaveBeenCalledWith(expect.stringContaining('swarm run:worker'));
 		});
 
+		// `--repo-root` outranks the invoking checkout, which is otherwise the default
+		// (issue #796) — that is what makes onboarding a machine from elsewhere possible.
 		it('keys the cache to an explicit worker checkout', async () => {
 			const repoRoot = `${process.cwd()}/src`;
+			process.env.INIT_CWD = '/where/the/operator/is/standing';
 			expect(await run([...ARGV, '--repo-root', repoRoot])).toBe(0);
 			expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
 				repoRoot,
@@ -458,7 +471,11 @@ describe('swarm workers', () => {
 		// The provider comes from the project, never from a `?? 'github'` fallback.
 		it('stores the credential under the provider the project names, not GitHub', async () => {
 			findProjectByIdFromDb.mockResolvedValue(
-				createMockProjectConfig({ id: PROJECT_ID, scm: 'bitbucket', repoRoot: REPO_ROOT }),
+				createMockProjectConfig({
+					id: PROJECT_ID,
+					scm: 'bitbucket',
+					repoRoot: PROJECT_RECORD_REPO_ROOT,
+				}),
 			);
 			expect(await run(ARGV)).toBe(0);
 			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'bitbucket', 'piped-secret');
@@ -466,7 +483,11 @@ describe('swarm workers', () => {
 
 		it('refuses a project whose SCM provider does not resolve, before writing anything', async () => {
 			findProjectByIdFromDb.mockResolvedValue(
-				createMockProjectConfig({ id: PROJECT_ID, scm: undefined, repoRoot: REPO_ROOT }),
+				createMockProjectConfig({
+					id: PROJECT_ID,
+					scm: undefined,
+					repoRoot: PROJECT_RECORD_REPO_ROOT,
+				}),
 			);
 			const error = vi.spyOn(console, 'error');
 			expect(await run(ARGV)).toBe(1);
@@ -559,13 +580,51 @@ describe('swarm workers', () => {
 			expect(lines.some((line) => line.includes('workers enroll'))).toBe(true);
 		});
 
-		it('prints --repo-root instead of the project checkout when given', async () => {
+		it('prints --repo-root instead of the invoking checkout when given', async () => {
 			const log = vi.spyOn(console, 'log');
 			expect(await run([...ARGV, '--repo-root', '/opt/checkouts/swarm'])).toBe(0);
 			const lines = log.mock.calls.map(([line]) => String(line));
 			const last = lines[lines.length - 1] ?? '';
 			expect(last).toContain('SWARM_WORKER_REPO_ROOT=/opt/checkouts/swarm');
 			expect(last).not.toContain(REPO_ROOT);
+			expect(last).not.toContain(PROJECT_RECORD_REPO_ROOT);
+		});
+
+		// Issue #796: the default used to be the *project record's* stored `repoRoot`,
+		// host-local state written by whichever machine last ran `swarm config apply`.
+		// Both uses of it were wrong on the machine being onboarded — the credential
+		// cache `swarm run:worker` reads was keyed under the other machine's path, and
+		// the printed SWARM_WORKER_REPO_ROOT named it too.
+		it("defaults to npm's caller directory, never the project record's repoRoot", async () => {
+			const invocationDirectory = `${process.cwd()}/src`;
+			process.env.INIT_CWD = invocationDirectory;
+			const log = vi.spyOn(console, 'log');
+
+			expect(await run(ARGV)).toBe(0);
+			expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
+				repoRoot: invocationDirectory,
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+			});
+			const lines = log.mock.calls.map(([line]) => String(line));
+			const last = lines[lines.length - 1] ?? '';
+			expect(last).toContain(`SWARM_WORKER_REPO_ROOT=${invocationDirectory}`);
+			expect(lines.some((line) => line.includes(PROJECT_RECORD_REPO_ROOT))).toBe(false);
+		});
+
+		it('falls back to the current directory when there is no INIT_CWD', async () => {
+			delete process.env.INIT_CWD;
+			const log = vi.spyOn(console, 'log');
+
+			expect(await run(ARGV)).toBe(0);
+			expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
+				repoRoot: REPO_ROOT,
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+			});
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines[lines.length - 1] ?? '').toContain(`SWARM_WORKER_REPO_ROOT=${REPO_ROOT}`);
+			expect(lines.some((line) => line.includes(PROJECT_RECORD_REPO_ROOT))).toBe(false);
 		});
 
 		it('describes itself in --help without writing anything', async () => {
