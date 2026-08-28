@@ -5,6 +5,7 @@ import {
 	addMember,
 	getMembership,
 	listMembersForProject,
+	listMembersWithUsersForProject,
 	listProjectsForUser,
 	removeMember,
 	updateMemberRole,
@@ -78,6 +79,60 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			it('returns empty arrays for a project/user with no memberships', async () => {
 				expect(await listMembersForProject(PROJECT_A)).toEqual([]);
 				expect(await listProjectsForUser(adaId)).toEqual([]);
+			});
+		});
+
+		// The roster read the `members` tRPC router serves (issue #805): one joined
+		// query, so an API caller never fans out a `getUserById` per row.
+		describe('listMembersWithUsersForProject', () => {
+			it('returns each member with the identity a human recognises them by', async () => {
+				await addMember({ projectId: PROJECT_A, userId: adaId, role: 'projectAdmin' });
+				await addMember({ projectId: PROJECT_A, userId: graceId, role: 'contributor' });
+
+				expect(await listMembersWithUsersForProject(PROJECT_A)).toEqual([
+					{
+						userId: adaId,
+						identifier: 'ada@example.com',
+						displayName: 'Ada',
+						role: 'projectAdmin',
+					},
+					{
+						userId: graceId,
+						identifier: 'grace@example.com',
+						displayName: 'Grace',
+						role: 'contributor',
+					},
+				]);
+			});
+
+			it('orders by identifier rather than by insertion', async () => {
+				await addMember({ projectId: PROJECT_A, userId: graceId, role: 'member' });
+				await addMember({ projectId: PROJECT_A, userId: adaId, role: 'member' });
+
+				const members = await listMembersWithUsersForProject(PROJECT_A);
+				expect(members.map((member) => member.identifier)).toEqual([
+					'ada@example.com',
+					'grace@example.com',
+				]);
+			});
+
+			it('is scoped to the one project', async () => {
+				await addMember({ projectId: PROJECT_A, userId: adaId, role: 'member' });
+				await addMember({ projectId: PROJECT_B, userId: graceId, role: 'member' });
+
+				const members = await listMembersWithUsersForProject(PROJECT_A);
+				expect(members.map((member) => member.identifier)).toEqual(['ada@example.com']);
+			});
+
+			it('returns an empty array for a project with no members', async () => {
+				expect(await listMembersWithUsersForProject(PROJECT_A)).toEqual([]);
+			});
+
+			it('never carries the password hash off the users row', async () => {
+				await addMember({ projectId: PROJECT_A, userId: adaId, role: 'member' });
+
+				const [member] = await listMembersWithUsersForProject(PROJECT_A);
+				expect(Object.keys(member).sort()).toEqual(['displayName', 'identifier', 'role', 'userId']);
 			});
 		});
 

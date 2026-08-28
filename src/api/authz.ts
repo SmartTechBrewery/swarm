@@ -8,14 +8,14 @@
  * `docs/decisions/ADR-001-federated-workers-and-project-access.md`).
  *
  * The role → capability matrix, defined here once and referenced by every
- * project-scoped procedure (`routers/projects.ts`, `routers/runs.ts`, the nested
- * `routers/credentials.ts`):
+ * project-scoped procedure (`routers/projects.ts`, `routers/runs.ts`,
+ * `routers/members.ts`, the nested `routers/credentials.ts`):
  *
  * | Capability                                   | Min role      | Predicate            |
  * | -------------------------------------------- | ------------- | -------------------- |
  * | Read a project / its runs / its credentials  | `contributor` | `canReadProject`     |
  * | Drive a project's runs (retry/terminate/…)   | `member`      | `canWriteProject`    |
- * | Administer config / credentials / delete     | `projectAdmin`| `canAdministerProject`|
+ * | Administer config / credentials / members    | `projectAdmin`| `canAdministerProject`|
  * | Read an installation-wide view (runs/workers)| —             | `assertInstanceAdmin`|
  *
  * That last row is deliberately roleless: it is a **layer-1** check, decided by

@@ -379,8 +379,14 @@ swarm members remove <project-id> <user-identifier>
 Manage who belongs to a project and in what role. `--role` is one of
 `projectAdmin | member | contributor` (default: `member`). Roles, most to least
 privileged: **projectAdmin** (administer) > **member** (write) > **contributor**
-(read). Requires `DATABASE_URL`. Membership is the read model authorization will
-build on — it is not yet enforced by any router.
+(read). Requires `DATABASE_URL`. Membership is enforced by every project-keyed
+tRPC procedure (`src/api/authz.ts`).
+
+Since issue #805 the same four operations are also reachable over the API, as the
+`members` tRPC router (`members.list`/`add`/`setRole`/`remove`), each gated at
+`projectAdmin` — so a project administrator manages the roster without shell
+access to the host. This CLI is unchanged and stays the `DATABASE_URL`-side path,
+which is how you seed the *first* administrator of a project you did not create.
 
 ### `swarm identities`
 

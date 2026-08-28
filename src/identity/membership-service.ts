@@ -5,23 +5,26 @@
  * membership-side companion to the identity read model (`./service.ts`) and the
  * second slice of the multi-user foundation (ADR-001, issue #281).
  *
- * Reads only — creating/updating/removing memberships is an operator action
- * exposed through the `swarm members` CLI over `projectMembersRepository.ts`;
- * this service stays the read-side seam callers program against. The role
- * predicates (`canAdministerProject`/`canWriteProject`/`canReadProject`) are
- * re-exported from `./membership.ts` so a caller has one import for the whole
- * read model.
+ * Reads only — creating/updating/removing memberships goes straight to
+ * `projectMembersRepository.ts`, from the `swarm members` CLI and, since issue
+ * #805, the `members` tRPC router; this service stays the read-side seam callers
+ * program against. The role predicates
+ * (`canAdministerProject`/`canWriteProject`/`canReadProject`) are re-exported
+ * from `./membership.ts` so a caller has one import for the whole read model.
  */
 
 import {
 	getMembership as getMembershipRow,
 	listMembersForProject as listMembersForProjectRows,
+	listMembersWithUsersForProject as listMembersWithUsersForProjectRows,
 	listProjectsForUser as listProjectsForUserRows,
+	type ProjectMemberWithUser,
 } from '../db/repositories/projectMembersRepository.js';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import type { ProjectMembership } from './membership.js';
 import { isInstanceAdmin } from './service.js';
 
+export type { ProjectMemberWithUser } from '../db/repositories/projectMembersRepository.js';
 export {
 	canAdministerProject,
 	canReadProject,
@@ -41,6 +44,16 @@ export async function getMembership(
 /** Every membership of a project (empty if it has no members). */
 export async function listMembersForProject(projectId: string): Promise<ProjectMembership[]> {
 	return listMembersForProjectRows(projectId);
+}
+
+/**
+ * Every member of a project with the user behind each row, alphabetical by login
+ * handle (empty if it has no members) — the roster read model `members.list`
+ * serves (issue #805). One joined query, so a caller never fans out a
+ * `getUserById` per row to turn a `userId` into something a human recognises.
+ */
+export async function listMembersWithUsers(projectId: string): Promise<ProjectMemberWithUser[]> {
+	return listMembersWithUsersForProjectRows(projectId);
 }
 
 /** Every project membership a user holds (empty if they belong to no project). */
