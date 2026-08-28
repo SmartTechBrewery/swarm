@@ -360,6 +360,26 @@ describe('workers.list ordering — viewer first, then grouped by owner (issues 
 		expect(rows.map((row) => row.workerId)).toEqual(['w2', 'w1']);
 	});
 
+	it('uses case-sensitive identifier collation after a case-insensitive name tie', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		// Deliberately reverse the final order: base collation considers these
+		// identifiers equal, so retaining their source order would be incorrect.
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('capitalized', THIRD_ID, {
+				ownerName: 'Alex',
+				ownerIdentifier: 'Alex@example.com',
+			}),
+			rosterRow('lowercase', FOURTH_ID, {
+				ownerName: 'Alex',
+				ownerIdentifier: 'alex@example.com',
+			}),
+		]);
+
+		const rows = await admin.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['lowercase', 'capitalized']);
+	});
+
 	it('sorts a row whose owner no longer resolves last, after every owner group', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		// The ownerless rows are still not the viewer's, whose own user row resolved

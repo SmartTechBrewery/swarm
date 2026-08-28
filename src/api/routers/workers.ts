@@ -188,6 +188,20 @@ async function resolveRosterScope(
 const byLabel = (a: string, b: string) => a.localeCompare(b, undefined, { sensitivity: 'base' });
 
 /**
+ * Identifiers stay near case- and accent-equivalent labels, but identity needs a
+ * total tie-break: distinct database-unique strings must not inherit row order.
+ */
+const byIdentifier = (a: string, b: string) => {
+	const byBaseLabel = byLabel(a, b);
+	if (byBaseLabel) return byBaseLabel;
+
+	const byVariantLabel = a.localeCompare(b, undefined, { sensitivity: 'variant' });
+	if (byVariantLabel) return byVariantLabel;
+
+	return a < b ? -1 : a > b ? 1 : 0;
+};
+
+/**
  * The viewer's own machines first, then everyone else's grouped by owner (issues
  * #657 and #808) — presentation order only, and since issue #750 the **unscoped**
  * global `/workers` list alone. It reorders the rows `listDashboardWorkers`
@@ -245,7 +259,7 @@ function viewerWorkersFirstThenGroupedByOwner(
 			if (!a[0].owner || !b[0].owner) return Number(!a[0].owner) - Number(!b[0].owner);
 			return (
 				byLabel(a[0].owner.displayName, b[0].owner.displayName) ||
-				byLabel(a[0].owner.identifier, b[0].owner.identifier)
+				byIdentifier(a[0].owner.identifier, b[0].owner.identifier)
 			);
 		})
 		.flatMap((run) => [...run].sort((a, b) => byLabel(a.displayName, b.displayName)));
