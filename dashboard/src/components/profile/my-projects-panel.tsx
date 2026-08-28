@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { FolderGit2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge.js';
+import { PROJECT_ROLE_COPY } from '@/lib/project-roles.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
 import type { ProjectRole } from '../../../../src/identity/membership.js';
@@ -28,8 +29,9 @@ import type { ProjectRole } from '../../../../src/identity/membership.js';
  * installation role were removed, which they would not.
  *
  * **It is read-only.** Joining, leaving, and role changes stay with a project's
- * administrators and the `swarm members` CLI, so this tab offers no control and
- * each entry simply links to the existing `/projects/$projectId` screen.
+ * administrators — on the project's own Members tab since issue #806, or with the
+ * `swarm members` CLI — so this tab offers no control and each entry simply links
+ * to the existing `/projects/$projectId` screen.
  */
 
 /** One row of `projects.listMine` — the whole of what this panel reads. */
@@ -40,27 +42,7 @@ interface MyProject {
 }
 
 /**
- * The project roles in the viewer's own terms. A `Record` over the enum, so a role
- * added to `ProjectRoleSchema` is a compile error here rather than a silently
- * unlabelled badge (the pattern `account-panel.tsx` applies to installation roles).
- */
-const ROLE_COPY: Record<ProjectRole, { label: string; description: string }> = {
-	projectAdmin: {
-		label: 'Project administrator',
-		description: 'Administers this project’s configuration, credentials, and membership.',
-	},
-	member: {
-		label: 'Member',
-		description: 'Works on this project and may drive its runs.',
-	},
-	contributor: {
-		label: 'Contributor',
-		description: 'Read-only access to this project and its runs.',
-	},
-};
-
-/**
- * What a `null` role says. Deliberately not a fourth entry in {@link ROLE_COPY}:
+ * What a `null` role says. Deliberately not a fourth entry in `PROJECT_ROLE_COPY`:
  * this is the *absence* of a membership, and wording it as a project role would be
  * the invented membership the read model refuses to return.
  */
@@ -111,8 +93,8 @@ export function MyProjectsPanel() {
 		<div className="space-y-3">
 			<p className="text-xs text-zinc-400">
 				The projects you can open, and what you hold on each. Membership is granted by a project's
-				own administrators with the <span className="font-mono">swarm members</span> CLI — it is not
-				editable here.
+				own administrators, on that project's Members tab (or with the{' '}
+				<span className="font-mono">swarm members</span> CLI) — it is not editable here.
 			</p>
 			{currentUser.data?.instanceAdmin ? (
 				<p className="text-xs text-zinc-500">
@@ -137,7 +119,7 @@ export function MyProjectsPanel() {
 					</thead>
 					<tbody className="divide-y divide-zinc-800/60">
 						{projects.map((project) => {
-							const copy = project.role ? ROLE_COPY[project.role] : INSTALLATION_WIDE_COPY;
+							const copy = project.role ? PROJECT_ROLE_COPY[project.role] : INSTALLATION_WIDE_COPY;
 							return (
 								<tr key={project.id} className="hover:bg-zinc-800/40 transition-colors">
 									<td className="px-4 py-3">
