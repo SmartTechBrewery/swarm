@@ -55,6 +55,15 @@ Notes:
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
   it again). Copy it immediately; if you lose it, `workers remove` +
   `workers register` again is the only recovery.
+- **Step 4 has a dashboard equivalent** (issue #764): the worker's *owner* can do
+  it themselves at `/workers/<worker-id>` → **Enroll in a project**, picking any
+  project they are at least a `contributor` on. It calls the same `workers.enroll`
+  this command does, so no CLI or DB access is needed — but it creates the
+  enrollment `pending` and **without** sharing consent, i.e. the CLI's behaviour
+  with neither `--active` nor `--consent`. A project administrator then approves it
+  and the owner flips sharing on, both on the same screen. The one-shot
+  `--active --consent` form below stays the CLI's own, and is what an installation
+  admin bootstrapping a machine for someone else wants.
 - `--active --consent` at enroll time (rather than the separate `approve` /
   `consent` commands, [`docs/cli.md`](./cli.md#swarm-workers)) is safe to do
   immediately, before the new machine has connected anything: a `transport`-mode
