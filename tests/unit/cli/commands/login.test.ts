@@ -165,6 +165,51 @@ describe('swarm login', () => {
 		expect(writeOperatorSessionCache).not.toHaveBeenCalled();
 	});
 
+	it('revokes an unverified minted token after a verification transport failure', async () => {
+		const fetchMock = stubFetch(
+			{ status: 200, body: { token: TOKEN, expiresAt: EXPIRES_AT, user: USER } },
+			null,
+			{ status: 200, body: { ok: true } },
+		);
+
+		expect(await run(['--identifier', 'ada@example.com'])).toBe(1);
+		expect(writeOperatorSessionCache).not.toHaveBeenCalled();
+		const [, , revokeInit] = fetchMock.mock.calls as unknown as [
+			[string, RequestInit],
+			[string, RequestInit],
+			[string, RequestInit],
+		];
+		expect(revokeInit[1].method).toBe('DELETE');
+		expect((revokeInit[1].headers as Record<string, string>).authorization).toBe(`Bearer ${TOKEN}`);
+	});
+
+	it('revokes an unverified minted token after a rejected verification', async () => {
+		const fetchMock = stubFetch(
+			{ status: 200, body: { token: TOKEN, expiresAt: EXPIRES_AT, user: USER } },
+			{ status: 401, body: { error: 'Unauthorized' } },
+			{ status: 200, body: { ok: true } },
+		);
+
+		expect(await run(['--identifier', 'ada@example.com'])).toBe(1);
+		expect(writeOperatorSessionCache).not.toHaveBeenCalled();
+		const [, , revokeInit] = fetchMock.mock.calls as unknown as [
+			[string, RequestInit],
+			[string, RequestInit],
+			[string, RequestInit],
+		];
+		expect(revokeInit[1].method).toBe('DELETE');
+		expect((revokeInit[1].headers as Record<string, string>).authorization).toBe(`Bearer ${TOKEN}`);
+	});
+
+	it('identifies an unexpected successful login response as version skew', async () => {
+		stubFetch({ status: 200, body: { token: TOKEN } });
+
+		expect(await run(['--identifier', 'ada@example.com'])).toBe(1);
+		expect(printed()).toContain('unexpected response');
+		expect(printed()).not.toContain('HTTP 200');
+		expect(writeOperatorSessionCache).not.toHaveBeenCalled();
+	});
+
 	it('fails when SWARM_CONTROL_PLANE_URL is unset', async () => {
 		delete process.env.SWARM_CONTROL_PLANE_URL;
 		const fetchMock = stubFetch();
@@ -267,6 +312,15 @@ describe('swarm login --status', () => {
 
 		expect(await run(['--status'])).toBe(1);
 		expect(printed()).toContain('the cached session was rejected (expired or revoked)');
+	});
+
+	it('identifies an unexpected successful cached-session response as version skew', async () => {
+		readOperatorSessionCache.mockReturnValue(cachedSession());
+		stubFetch({ status: 200, body: { user: { identifier: USER.identifier } } });
+
+		expect(await run(['--status'])).toBe(1);
+		expect(printed()).toContain('unexpected response');
+		expect(printed()).not.toContain('HTTP 200');
 	});
 });
 

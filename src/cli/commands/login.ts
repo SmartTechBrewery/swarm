@@ -207,12 +207,18 @@ async function login(endpoint: { url: string; base: string }, flagIdentifier?: s
 		out.error('login failed — check the identifier and password');
 		return 1;
 	}
-	const minted =
-		response.status === 200 ? LoginResponseSchema.safeParse(response.body).data : undefined;
-	if (!minted) {
+	if (response.status !== 200) {
 		out.error(`the control plane refused the login (HTTP ${response.status})`);
 		return 1;
 	}
+	const parsed = LoginResponseSchema.safeParse(response.body);
+	if (!parsed.success) {
+		out.error(
+			'the control plane answered the login with an unexpected response (is it running a different version?)',
+		);
+		return 1;
+	}
+	const minted = parsed.data;
 
 	// Prove the minted token actually authenticates before caching it, so a broken
 	// session is a failed `login` rather than a puzzling `--status` later.
@@ -221,10 +227,12 @@ async function login(endpoint: { url: string; base: string }, flagIdentifier?: s
 		headers: { authorization: `Bearer ${minted.token}` },
 	});
 	if (!verified) {
+		await revokeMintedSession(endpoint.url, minted.token);
 		unreachable(endpoint.url);
 		return 1;
 	}
 	if (verified.status !== 200) {
+		await revokeMintedSession(endpoint.url, minted.token);
 		out.error(
 			`the control plane did not accept the session it just issued (HTTP ${verified.status})`,
 		);
@@ -263,12 +271,18 @@ async function status(endpoint: { url: string; base: string }) {
 		out.error('the cached session was rejected (expired or revoked) — run `swarm login`');
 		return 1;
 	}
-	const resolved =
-		response.status === 200 ? WhoamiResponseSchema.safeParse(response.body).data : undefined;
-	if (!resolved) {
+	if (response.status !== 200) {
 		out.error(`the control plane could not resolve the cached session (HTTP ${response.status})`);
 		return 1;
 	}
+	const parsed = WhoamiResponseSchema.safeParse(response.body);
+	if (!parsed.success) {
+		out.error(
+			'the control plane answered the cached-session check with an unexpected response (is it running a different version?)',
+		);
+		return 1;
+	}
+	const resolved = parsed.data;
 
 	out.info(
 		`signed in to ${endpoint.base} as '${resolved.user.identifier}' (${resolved.user.displayName})`,
@@ -277,6 +291,14 @@ async function status(endpoint: { url: string; base: string }) {
 	// the session is still live.
 	out.info(`session expires ${cached.expiresAt}`);
 	return 0;
+}
+
+/** Best-effort cleanup when the post-login verification cannot confirm the new session. */
+async function revokeMintedSession(url: string, token: string): Promise<void> {
+	await request(url, {
+		method: 'DELETE',
+		headers: { authorization: `Bearer ${token}` },
+	});
 }
 
 /**

@@ -90,6 +90,9 @@ services:
       # logger already defaults to JSON here; set these to tune level/format.
       SWARM_LOG_LEVEL: ${SWARM_LOG_LEVEL:-info}
       SWARM_LOG_FORMAT: ${SWARM_LOG_FORMAT:-json}
+      # The router mints `swarm login` sessions (issue #798), so it needs the
+      # configured session lifetime as well as the API server.
+      SWARM_SESSION_TTL_HOURS: ${SWARM_SESSION_TTL_HOURS:-}
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

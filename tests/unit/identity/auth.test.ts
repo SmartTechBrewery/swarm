@@ -202,6 +202,22 @@ describe('session lifecycle', () => {
 		expect(stored.tokenHash).not.toBe(token);
 	});
 
+	it('uses SWARM_SESSION_TTL_HOURS for the session expiry', async () => {
+		const original = process.env.SWARM_SESSION_TTL_HOURS;
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date('2026-08-28T12:00:00.000Z'));
+		process.env.SWARM_SESSION_TTL_HOURS = '1';
+
+		try {
+			const { expiresAt } = await createSession(user.id);
+			expect(expiresAt.toISOString()).toBe('2026-08-28T13:00:00.000Z');
+		} finally {
+			vi.useRealTimers();
+			if (original === undefined) delete process.env.SWARM_SESSION_TTL_HOURS;
+			else process.env.SWARM_SESSION_TTL_HOURS = original;
+		}
+	});
+
 	it('resolves a live session token to its user (looked up by hash)', async () => {
 		vi.mocked(findUserIdBySessionToken).mockResolvedValue(user.id);
 		vi.mocked(getUserById).mockResolvedValue(user);

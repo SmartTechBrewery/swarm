@@ -50,8 +50,9 @@ export type OperatorSessionCache = z.infer<typeof OperatorSessionCacheSchema>;
  * The installation's identity: its URL, spelled one way. `https://SWARM.example.com/`
  * and `https://swarm.example.com` are the same control plane, and a cache keyed on
  * the spelling would hand the second one "not signed in" right after the first
- * logged in. `new URL` already lowercases the scheme and host and supplies the
- * default port, so only the trailing slash is left to strip.
+ * logged in. `new URL` already lowercases the scheme and host and drops a default
+ * port (`https://swarm.example.com:443` serializes without `:443`), so only the
+ * trailing slash is left to strip.
  */
 export function normalizeControlPlaneUrl(controlPlaneUrl: string): string {
 	const trimmed = controlPlaneUrl.trim();
