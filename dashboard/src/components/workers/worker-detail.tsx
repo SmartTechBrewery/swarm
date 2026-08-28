@@ -227,7 +227,11 @@ function DeclaredClisControl({
 	}
 
 	const isLastSelected = (cli: string) => draft.length === 1 && draft[0] === cli;
-	const unchanged = sameClis(draft, effectiveCapabilities);
+	// The edit starts at the currently usable intersection, but a durable declaration
+	// can be wider after a later probe drifts. Compare a declared draft to its stored
+	// declaration so the owner can persist that visible, valid intersection; with no
+	// declaration, the probe remains the auto-detection baseline.
+	const unchanged = sameClis(draft, declaredCapabilities ?? effectiveCapabilities);
 
 	return (
 		<div className="space-y-2">

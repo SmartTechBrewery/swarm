@@ -910,6 +910,26 @@ describe('WorkerDetailView declared agent CLIs (owner-only, issue #787)', () => 
 		expect(screen.getByText(/Declared but no longer reported/).textContent).toContain('codex');
 	});
 
+	it('lets the owner save the probed subset to correct a drifted declaration', async () => {
+		setDeclaredCapabilitiesMutate.mockResolvedValue({});
+		renderWorker({
+			capabilities: ['claude'],
+			declaredCapabilities: ['claude', 'codex'],
+			probedCapabilities: ['claude'],
+		});
+
+		const save = screen.getByRole('button', { name: 'Save CLIs' }) as HTMLButtonElement;
+		expect(save.disabled).toBe(false);
+		fireEvent.click(save);
+
+		await waitFor(() =>
+			expect(setDeclaredCapabilitiesMutate).toHaveBeenCalledWith({
+				workerId: 'worker-1',
+				capabilities: ['claude'],
+			}),
+		);
+	});
+
 	it('says nothing about drift when every declared CLI is still reported', () => {
 		renderWorker({
 			capabilities: ['claude'],
