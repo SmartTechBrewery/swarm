@@ -26,6 +26,7 @@ import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
+import { registerOperatorApi } from './operator-api.js';
 import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
@@ -51,6 +52,10 @@ registerWorkerDelivery(app);
 // here because this is the process `SWARM_CONTROL_PLANE_URL` points at, and the
 // only one an operator off the control-plane host can reach.
 registerOperatorSession(app);
+// …and the operator API that token buys (issue #799): the `swarm workers`
+// operations at `/operator/trpc/*`, a strict subset of the dashboard's router —
+// the `workers` namespace alone, since this process is the internet-exposed one.
+registerOperatorApi(app);
 // Say so at startup rather than at the first Respond-to-review reply: without the
 // operator token this host cannot resolve the *implementer* persona, so
 // `/worker/delivery/pr-comment` answers 503 for it (issue #444). Only a warning —

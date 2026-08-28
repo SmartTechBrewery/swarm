@@ -54,15 +54,23 @@ const {
 		updateEnrollmentConstraints: vi.fn(),
 	};
 });
-const { declareWorkerCapabilities, getWorker, renameWorker } = vi.hoisted(() => ({
+const { declareWorkerCapabilities, getWorker, registerWorker, renameWorker } = vi.hoisted(() => ({
 	declareWorkerCapabilities: vi.fn(),
 	getWorker: vi.fn(),
+	registerWorker: vi.fn(),
 	renameWorker: vi.fn(),
 }));
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
+}));
+// Issue #799 — `register` resolves its owner and `projectScmProvider` its project
+// and that project's SCM provider.
+const { findUserByIdentifier } = vi.hoisted(() => ({ findUserByIdentifier: vi.fn() }));
+const { findProjectByIdFromDb } = vi.hoisted(() => ({ findProjectByIdFromDb: vi.fn() }));
+const { requireProjectSCMProviderId } = vi.hoisted(() => ({
+	requireProjectSCMProviderId: vi.fn(),
 }));
 
 vi.mock('@/identity/worker-enrollment-service.js', async () => ({
@@ -92,10 +100,28 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 vi.mock('@/identity/worker-service.js', () => ({
 	declareWorkerCapabilities,
 	getWorker,
+	registerWorker,
 	renameWorker,
 }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
+vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier }));
+// Spread the real modules and override one export each: both are imported
+// elsewhere in this router's module graph (`identity/worker-scm-credential.ts`
+// reads `requireProjectSCMProviderId` and `findProjectByIdFromDb` too), so a
+// factory returning only the stub would leave those imports undefined.
+vi.mock('@/db/repositories/projectsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/projectsRepository.js')>(
+		'@/db/repositories/projectsRepository.js',
+	)),
+	findProjectByIdFromDb,
+}));
+vi.mock('@/integrations/scm/registry.js', async () => ({
+	...(await vi.importActual<typeof import('@/integrations/scm/registry.js')>(
+		'@/integrations/scm/registry.js',
+	)),
+	requireProjectSCMProviderId,
+}));
 
 import { workersRouter } from '@/api/routers/workers.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
@@ -184,10 +210,14 @@ beforeEach(() => {
 		deriveWorkerRunState,
 		declareWorkerCapabilities,
 		getWorker,
+		registerWorker,
 		renameWorker,
 		removeWorker,
 		getMembership,
 		listAccessibleProjectIds,
+		findUserByIdentifier,
+		findProjectByIdFromDb,
+		requireProjectSCMProviderId,
 	]) {
 		m.mockReset();
 	}
@@ -464,6 +494,118 @@ describe('workers.getById (worker detail, issue #477)', () => {
 	});
 });
 
+// Issue #799 — the network equivalent of `swarm workers register`, and the one
+// procedure in the tree that returns a secret.
+describe('workers.register (issue #799)', () => {
+	const REGISTERED = { worker: makeWorker(), credential: 'one-time-worker-credential' };
+
+	it('registers a machine for the caller themselves and returns the one-time credential', async () => {
+		findUserByIdentifier.mockResolvedValue(OWNER_USER);
+		registerWorker.mockResolvedValue(REGISTERED);
+
+		const result = await owner.register({
+			ownerIdentifier: 'ada@example.com',
+			displayName: 'ada-laptop',
+			capabilities: ['claude'],
+		});
+
+		expect(result).toBe(REGISTERED);
+		expect(registerWorker).toHaveBeenCalledWith({
+			ownerUserId: OWNER_ID,
+			displayName: 'ada-laptop',
+			capabilities: ['claude'],
+		});
+	});
+
+	// Registering a machine for somebody else is an installation-administration act,
+	// matching how `swarm workers register <owner-identifier>` is used today.
+	it('lets an instanceAdmin register for another owner', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		findUserByIdentifier.mockResolvedValue(OWNER_USER);
+		registerWorker.mockResolvedValue(REGISTERED);
+
+		await admin.register({
+			ownerIdentifier: 'ada@example.com',
+			displayName: 'ada-laptop',
+			capabilities: ['claude'],
+		});
+
+		expect(registerWorker).toHaveBeenCalledWith(expect.objectContaining({ ownerUserId: OWNER_ID }));
+	});
+
+	it('refuses a non-admin acting for another owner, registering nothing', async () => {
+		findUserByIdentifier.mockResolvedValue({ ...OWNER_USER, id: OTHER_ID });
+
+		await expect(
+			owner.register({
+				ownerIdentifier: 'grace@example.com',
+				displayName: 'grace-laptop',
+				capabilities: ['claude'],
+			}),
+		).rejects.toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }));
+		expect(registerWorker).not.toHaveBeenCalled();
+	});
+
+	// The FORBIDDEN precedes the owner NOT_FOUND deliberately, so a caller who may
+	// not register for others cannot use this as a "does this identifier exist?"
+	// oracle on an internet-exposed mount.
+	it('answers a non-admin identically whether or not the named owner exists', async () => {
+		findUserByIdentifier.mockResolvedValue(undefined);
+
+		await expect(
+			owner.register({
+				ownerIdentifier: 'nobody@example.com',
+				displayName: 'ghost',
+				capabilities: ['claude'],
+			}),
+		).rejects.toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }));
+		expect(registerWorker).not.toHaveBeenCalled();
+	});
+
+	it('gives an instanceAdmin the honest NOT_FOUND for an unknown identifier', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		findUserByIdentifier.mockResolvedValue(undefined);
+
+		await expect(
+			admin.register({
+				ownerIdentifier: 'nobody@example.com',
+				displayName: 'ghost',
+				capabilities: ['claude'],
+			}),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(registerWorker).not.toHaveBeenCalled();
+	});
+
+	it('translates a duplicate (owner, displayName) to CONFLICT', async () => {
+		findUserByIdentifier.mockResolvedValue(OWNER_USER);
+		registerWorker.mockRejectedValue(Object.assign(new Error('dup'), { code: '23505' }));
+
+		await expect(
+			owner.register({
+				ownerIdentifier: 'ada@example.com',
+				displayName: 'ada-laptop',
+				capabilities: ['claude'],
+			}),
+		).rejects.toThrowError(expect.objectContaining({ code: 'CONFLICT' }));
+	});
+
+	it('rejects an empty capability set before it reaches the service', async () => {
+		findUserByIdentifier.mockResolvedValue(OWNER_USER);
+
+		await expect(
+			owner.register({
+				ownerIdentifier: 'ada@example.com',
+				displayName: 'ada-laptop',
+				// `WorkerCapabilitiesSchema` is non-empty at the type level too, so an
+				// empty set only ever arrives from a client tRPC never typed — which is
+				// exactly the hand-rolled CLI client this mount exists for.
+				capabilities: [] as unknown as ['claude'],
+			}),
+		).rejects.toThrow();
+		expect(registerWorker).not.toHaveBeenCalled();
+	});
+});
+
 describe('workers.listMine (owner self-service)', () => {
 	it('returns only the caller’s own workers', async () => {
 		const views = [{ workerId: WORKER_ID, displayName: 'ada-laptop' }];
@@ -491,6 +633,61 @@ describe('workers.roster (project-scoped read)', () => {
 
 		await expect(owner.roster({ projectId: 'p1' })).resolves.toBe(roster);
 		expect(listProjectRoster).toHaveBeenCalledWith('p1');
+	});
+});
+
+// Issue #799 — the one project fact a DB-free `register-and-enroll` cannot work
+// out for itself, since the operator SCM credential is stored per provider.
+describe('workers.projectScmProvider (issue #799)', () => {
+	const PROJECT = { id: 'p1', scm: 'bitbucket' } as never;
+
+	it('returns the provider the project’s own lookup resolves, for a contributor', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		findProjectByIdFromDb.mockResolvedValue(PROJECT);
+		requireProjectSCMProviderId.mockReturnValue('bitbucket');
+
+		await expect(owner.projectScmProvider({ projectId: 'p1' })).resolves.toEqual({
+			providerId: 'bitbucket',
+		});
+		expect(requireProjectSCMProviderId).toHaveBeenCalledWith(PROJECT);
+	});
+
+	it('denies a non-member with NOT_FOUND, without reading the project', async () => {
+		getMembership.mockResolvedValue(undefined);
+
+		await expect(owner.projectScmProvider({ projectId: 'p1' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(findProjectByIdFromDb).not.toHaveBeenCalled();
+		expect(requireProjectSCMProviderId).not.toHaveBeenCalled();
+	});
+
+	it('is NOT_FOUND for a project row that does not exist', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		findProjectByIdFromDb.mockResolvedValue(undefined);
+
+		await expect(admin.projectScmProvider({ projectId: 'gone' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requireProjectSCMProviderId).not.toHaveBeenCalled();
+	});
+
+	// The lookup's three throws already name the project and what it asked for, so
+	// the message travels verbatim: the project's configuration is what has to
+	// change, not the request.
+	it('surfaces an unresolvable provider as PRECONDITION_FAILED with the message verbatim', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		findProjectByIdFromDb.mockResolvedValue(PROJECT);
+		requireProjectSCMProviderId.mockImplementation(() => {
+			throw new Error("Cannot resolve the SCM provider for project 'p1': it selects 'bitbucket'");
+		});
+
+		await expect(owner.projectScmProvider({ projectId: 'p1' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'PRECONDITION_FAILED',
+				message: "Cannot resolve the SCM provider for project 'p1': it selects 'bitbucket'",
+			}),
+		);
 	});
 });
 

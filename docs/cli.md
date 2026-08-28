@@ -331,8 +331,15 @@ swarm users set-password localhost-admin
 swarm login --identifier localhost-admin
 ```
 
-Nothing consumes the token yet — the operator API it authorises is mounted by a
-later phase of the networked-workers CLI work.
+**What the token authorises.** Since issue #799 the router also serves the
+`swarm workers` operations at `/operator/trpc/*`, authenticated by this bearer — a
+deliberate strict subset of the dashboard's tRPC router (the `workers` namespace
+alone, never `appRouter`), because the router is the internet-exposed process. No
+procedure's authorization is relaxed for being reached that way: the same
+installation-admin, strict-ownership and project-membership rules apply as in the
+dashboard, and `SWARM_SINGLE_USER_MODE` is ignored there too. The `swarm workers`
+commands still reach Postgres directly today; routing them through that API is the
+next phase of the networked-workers CLI work.
 
 ### `swarm users`
 

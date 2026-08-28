@@ -1,10 +1,13 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
+import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
+import { findUserByIdentifier } from '../../db/repositories/usersRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
 import {
+	WorkerCapabilitiesSchema,
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 	WorkerDisplayNameSchema,
@@ -32,9 +35,11 @@ import {
 import {
 	declareWorkerCapabilities,
 	getWorker,
+	registerWorker,
 	renameWorker,
 	type Worker,
 } from '../../identity/worker-service.js';
+import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import {
 	accessibleProjectScope,
@@ -67,8 +72,10 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   controls that would succeed. It stays bounded by `accessibleProjectScope` for
  *   non-owners, while a strict owner may also open their own un-enrolled worker to
  *   create its first enrollment.
- * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
- *   workers and enrollments (`listMine`), offers a worker to a project
+ * - **Owner self-service**, scoped to `ctx.user`: an owner registers a new
+ *   machine (`register`, issue #799 — the network equivalent of `swarm workers
+ *   register`, and the only procedure here that returns a secret), lists *their
+ *   own* workers and enrollments (`listMine`), offers a worker to a project
  *   (`enroll`), renames a machine (`rename`), declares which agent CLIs it should
  *   run (`setDeclaredCapabilities`, issue #787 — the durable declaration issue
  *   #783 made survive a reconnect, cleared by passing `capabilities: null`),
@@ -87,11 +94,20 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   machine's own operator SCM credential per provider — and applies the same
  *   strict rule to *every* procedure, its read included (`./workerScmCredentials.ts`).
  * - **Project roster**, gated by `assertProjectAccess` exactly like
- *   `routers/projects.ts`: a `contributor` reads the roster (`roster`); only a
+ *   `routers/projects.ts`: a `contributor` reads the roster (`roster`) and the
+ *   SCM provider the project runs on (`projectScmProvider`, issue #799); only a
  *   `projectAdmin` approves an enrollment (`approveEnrollment`), revokes/
  *   reactivates one (`setStatus`), or moves a worker through the project's
  *   configured order (`reorderProjectWorker`, issue #750). A non-member gets
  *   `NOT_FOUND` (existence hidden), a member below the required role `FORBIDDEN`.
+ *
+ * Two of these procedures exist for the **networked CLI** rather than for the
+ * dashboard (issue #799): `register` and `projectScmProvider` are what let
+ * `swarm workers` run on a machine holding only `SWARM_CONTROL_PLANE_URL` and an
+ * operator token, with no `DATABASE_URL` of its own. They are reachable on the
+ * router's `/operator/trpc/*` mount (`../operator-router.ts`) and on the
+ * dashboard's `/trpc/*` alike — the same procedure, the same authorization, since
+ * neither mount is a privileged caller.
  *
  * Read models here expose **no secrets** (the service assembles secret-free
  * views) and derive busy/current-run from run lifecycle, never from the client.
@@ -300,6 +316,79 @@ export const workersRouter = router({
 		}),
 
 	// --- Owner self-service (scoped to ctx.user) ---
+
+	// Register a machine for an owner — the network equivalent of `swarm workers
+	// register` (issue #799). Until now no tRPC procedure wrapped `registerWorker`
+	// at all, so registering a worker meant holding `DATABASE_URL`; that is exactly
+	// what an operator on a remote machine does not have.
+	//
+	// **This is the one procedure in the tree that returns a secret.** The raw
+	// worker credential comes back in `credential` exactly *once*: only its SHA-256
+	// is persisted (`hashWorkerCredential`, `../../identity/worker-service.ts`), so
+	// the value is never re-readable, no procedure exists to read it back, and a lost
+	// one is replaced by registering the machine again. That is the same contract
+	// `swarm workers register` already prints under. Never log it, never persist it
+	// anywhere else, and do not add a read-back.
+	//
+	// Authorization states the CLI's own rule in tRPC terms: registering a machine
+	// for *yourself* needs nothing beyond a session, while registering one for
+	// somebody else is an installation-administration act — which is how
+	// `swarm workers register <owner-identifier>` is used today. The `FORBIDDEN`
+	// deliberately comes before the owner `NOT_FOUND`, so a caller who may not
+	// register for others cannot use this as a "does this identifier exist?" oracle;
+	// an `instanceAdmin` still gets the honest `NOT_FOUND` for a typo.
+	//
+	// It is the same layer-1 rule `assertInstanceAdmin` enforces, and the same
+	// `FORBIDDEN`, but stated here rather than borrowed: that helper's copy names an
+	// installation-wide *view* ("Open a project you are enrolled in to see its
+	// workers"), which would misdescribe a refused registration.
+	//
+	// A duplicate `(owner, displayName)` is `CONFLICT`. The copy names the owner
+	// rather than reusing `rename`'s "You already have a worker with this name" —
+	// the collision can be on somebody else's machine here, which that wording would
+	// misreport — and matches what `swarm workers register` already prints.
+	register: authedProcedure
+		.input(
+			z.object({
+				ownerIdentifier: z.string().min(1),
+				displayName: WorkerDisplayNameSchema,
+				// The machine's own declared repertoire, validated by the domain schema
+				// `registerWorker` re-parses (it de-dupes), not by the enrollment-side
+				// `AllowedClisInput` — a different constraint that happens to share a shape.
+				capabilities: WorkerCapabilitiesSchema,
+			}),
+		)
+		.mutation(async ({ ctx, input }) => {
+			const owner = await findUserByIdentifier(input.ownerIdentifier);
+			if ((!owner || owner.id !== ctx.user.id) && !isInstanceAdmin(ctx.user)) {
+				throw new TRPCError({
+					code: 'FORBIDDEN',
+					message:
+						'You may only register a worker for yourself. Registering one for another owner is available to instance administrators only.',
+				});
+			}
+			if (!owner) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `User with identifier "${input.ownerIdentifier}" not found`,
+				});
+			}
+			try {
+				return await registerWorker({
+					ownerUserId: owner.id,
+					displayName: input.displayName,
+					capabilities: input.capabilities,
+				});
+			} catch (error) {
+				if (isUniqueViolation(error)) {
+					throw new TRPCError({
+						code: 'CONFLICT',
+						message: `A worker named "${input.displayName}" already exists for "${input.ownerIdentifier}".`,
+					});
+				}
+				throw error;
+			}
+		}),
 
 	// The caller's own workers and their enrollments, with derived run state. A
 	// user who operates no workers gets an empty list.
@@ -533,6 +622,44 @@ export const workersRouter = router({
 		.query(async ({ ctx, input }) => {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			return await listProjectRoster(input.projectId);
+		}),
+
+	// The SCM provider id a project runs on (issue #799) — the one fact a DB-free
+	// `swarm workers register-and-enroll` cannot work out for itself. The worker
+	// operator's SCM credential is stored per `(worker, provider)` (issue #765), so
+	// the CLI has to name a provider before it can write one, and on a machine with
+	// no `DATABASE_URL` it holds no `ProjectConfig` to resolve one from.
+	//
+	// Resolved through `requireProjectSCMProviderId` — the same lookup the dispatcher
+	// uses — and never `project.scm ?? 'github'`, which would file a Bitbucket or
+	// GitLab project's credential under GitHub (ai/RULES.md §2). Its three throws
+	// (unregistered, registered-but-not-runtime-ready, and "selects none while zero
+	// or two-plus are ready") already name the project and what it asked for, so they
+	// are surfaced as `PRECONDITION_FAILED` with the message verbatim: the project's
+	// configuration is what has to change, not the request.
+	//
+	// A `contributor` read, exactly like `roster`, so a non-member gets `NOT_FOUND`
+	// and project existence never leaks. It returns `{ providerId }` and nothing
+	// else — no credential, no repository, no config.
+	projectScmProvider: authedProcedure
+		.input(z.object({ projectId: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			const project = await findProjectByIdFromDb(input.projectId);
+			if (!project) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Project with ID "${input.projectId}" not found`,
+				});
+			}
+			try {
+				return { providerId: requireProjectSCMProviderId(project) };
+			} catch (error) {
+				throw new TRPCError({
+					code: 'PRECONDITION_FAILED',
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}),
 
 	// Approve a pending enrollment → active (a `projectAdmin` action). Keyed on
