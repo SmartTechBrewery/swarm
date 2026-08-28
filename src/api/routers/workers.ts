@@ -51,8 +51,9 @@ import { authedProcedure, router } from '../trpc.js';
  *   own machines first (#657). `getById` (#477)
  *   returns that same row for one worker, widened with per-project enrollment
  *   detail and with what the *viewer* may change, so the detail screen offers only
- *   controls that would succeed; it stays bounded by `accessibleProjectScope`,
- *   because a worker owner reaches it from their project's roster.
+ *   controls that would succeed. It stays bounded by `accessibleProjectScope` for
+ *   non-owners, while a strict owner may also open their own un-enrolled worker to
+ *   create its first enrollment.
  * - **Owner self-service**, scoped to `ctx.user`: an owner lists *their own*
  *   workers and enrollments (`listMine`), offers a worker to a project
  *   (`enroll`), renames a machine (`rename`), and controls the revocable
@@ -260,16 +261,16 @@ export const workersRouter = router({
 	// full enrollment detail per visible project and with the two capability flags
 	// the detail screen needs to decide which controls to offer. Visibility is the
 	// caller's `accessibleProjectScope` — deliberately *not* the installation-admin
-	// rule the unscoped `list` now applies (issue #647), because a worker owner
-	// reaches this row by clicking through their own project's roster — and an
+	// rule the unscoped `list` now applies (issue #647). A strict owner can also
+	// open their own un-enrolled worker to create its first enrollment; every other
 	// invisible worker is `NOT_FOUND` exactly like a missing one, so existence never
-	// leaks. Read-only: the flags *report* the authorization each mutation
-	// re-checks for itself.
+	// leaks. Read-only: the flags *report* the authorization each mutation re-checks
+	// for itself.
 	getById: authedProcedure
 		.input(z.object({ workerId: z.string().uuid() }))
 		.query(async ({ ctx, input }) => {
 			const scope = await accessibleProjectScope(ctx.user);
-			const detail = await getDashboardWorkerDetail(input.workerId, scope);
+			const detail = await getDashboardWorkerDetail(input.workerId, scope, ctx.user.id);
 			if (!detail) throw workerNotFound(input.workerId);
 			// The owner-controlled values (display name, sharing consent, execution
 			// constraints) are gated by `resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`

@@ -1247,7 +1247,17 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		getWorkerById.mockResolvedValue(makeWorker());
 		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment({ projectId: 'proj-secret' })]);
 
-		expect(await getDashboardWorkerDetail(WORKER_ID, ['proj-a'])).toBeNull();
+		expect(await getDashboardWorkerDetail(WORKER_ID, ['proj-a'], 'other-user')).toBeNull();
+	});
+
+	it('shows an owner their un-enrolled worker so they can create its first enrollment', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([]);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, ['proj-a'], OWNER_ID);
+
+		expect(detail?.workerId).toBe(WORKER_ID);
+		expect(detail?.enrollments).toEqual([]);
 	});
 
 	it('shows an administrator a registered-but-un-enrolled machine', async () => {
@@ -1259,14 +1269,12 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		expect(detail?.enrollments).toEqual([]);
 	});
 
-	it('is null for an unknown worker and for a viewer with no accessible project', async () => {
+	it('is null for an unknown worker and a non-owner with no accessible project', async () => {
 		getWorkerById.mockResolvedValue(undefined);
 		expect(await getDashboardWorkerDetail(WORKER_ID, null)).toBeNull();
 
 		getWorkerById.mockResolvedValue(makeWorker());
-		expect(await getDashboardWorkerDetail(WORKER_ID, [])).toBeNull();
-		// A viewer with no accessible project is answered without a worker read at all.
-		expect(getWorkerById).toHaveBeenCalledTimes(1);
+		expect(await getDashboardWorkerDetail(WORKER_ID, [], 'other-user')).toBeNull();
 	});
 
 	it('leaks no secret from the worker, owner, or enrollment rows', async () => {

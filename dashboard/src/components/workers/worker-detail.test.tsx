@@ -6,17 +6,35 @@ import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerDetail, WorkerDetailEnrollment } from '@/types/workers.js';
 
-const { setConsentMutate, updateConstraintsMutate, approveMutate, setStatusMutate, renameMutate } =
-	vi.hoisted(() => ({
-		setConsentMutate: vi.fn(),
-		updateConstraintsMutate: vi.fn(),
-		approveMutate: vi.fn(),
-		setStatusMutate: vi.fn(),
-		renameMutate: vi.fn(),
-	}));
+const {
+	setConsentMutate,
+	updateConstraintsMutate,
+	approveMutate,
+	setStatusMutate,
+	renameMutate,
+	enrollMutate,
+	projectsListQueryFn,
+} = vi.hoisted(() => ({
+	setConsentMutate: vi.fn(),
+	updateConstraintsMutate: vi.fn(),
+	approveMutate: vi.fn(),
+	setStatusMutate: vi.fn(),
+	renameMutate: vi.fn(),
+	enrollMutate: vi.fn(),
+	projectsListQueryFn: vi.fn(),
+}));
 
+// The enroll dialog (issue #764) is mounted for an owner — with its projects query
+// disabled until it opens — so the mock carries `projects.list` and `workers.enroll`
+// even though this file only asserts the entry point's gating.
 vi.mock('@/lib/trpc.js', () => ({
-	trpc: {},
+	trpc: {
+		projects: {
+			list: {
+				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
+			},
+		},
+	},
 	trpcClient: {
 		workers: {
 			setConsent: { mutate: setConsentMutate },
@@ -24,6 +42,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			approveEnrollment: { mutate: approveMutate },
 			setStatus: { mutate: setStatusMutate },
 			rename: { mutate: renameMutate },
+			enroll: { mutate: enrollMutate },
 		},
 	},
 }));
@@ -127,6 +146,9 @@ beforeEach(() => {
 	approveMutate.mockReset();
 	setStatusMutate.mockReset();
 	renameMutate.mockReset();
+	enrollMutate.mockReset();
+	projectsListQueryFn.mockReset();
+	projectsListQueryFn.mockResolvedValue([]);
 	onChanged.mockReset();
 	vi.useFakeTimers({ toFake: ['Date'] });
 	vi.setSystemTime(NOW);
@@ -244,9 +266,39 @@ describe('WorkerDetailView sections (issue #477)', () => {
 		expect(screen.getByText(/Idle/)).toBeDefined();
 	});
 
-	it('keeps enrolling into a new project off the view, naming the flow that owns it', () => {
+	it('points an un-enrolled machine’s owner at the action that offers it (issue #764)', () => {
 		renderWorker({ enrollments: [] });
-		expect(screen.getByText('swarm workers enroll')).toBeDefined();
+		expect(screen.getByText(/Offer it to one with Enroll in a project/)).toBeDefined();
+	});
+
+	it('tells a non-owner whose action offering the machine is, with no button', () => {
+		renderWorker({ enrollments: [], viewerIsOwner: false });
+		expect(screen.getByText(/is its owner’s action/)).toBeDefined();
+		expect(screen.queryByRole('button', { name: 'Enroll in a project' })).toBeNull();
+	});
+});
+
+describe('WorkerDetailView enroll entry point (issue #764)', () => {
+	it('offers the worker’s owner an Enroll in a project action', () => {
+		renderWorker();
+		expect(
+			within(section('Project enrollments')).getByRole('button', { name: 'Enroll in a project' }),
+		).toBeDefined();
+	});
+
+	it('withholds it from a viewer who does not own the machine', () => {
+		renderWorker({ viewerIsOwner: false });
+		expect(screen.queryByRole('button', { name: 'Enroll in a project' })).toBeNull();
+	});
+
+	it('opens the enrollment form, which names the machine and starts closed', () => {
+		renderWorker();
+
+		expect(screen.queryByRole('button', { name: 'Enroll worker' })).toBeNull();
+		fireEvent.click(screen.getByRole('button', { name: 'Enroll in a project' }));
+
+		expect(screen.getByRole('heading', { name: 'Enroll ada-laptop in a project' })).toBeDefined();
+		expect(screen.getByRole('button', { name: 'Enroll worker' })).toBeDefined();
 	});
 });
 

@@ -12,14 +12,21 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerDetail, WorkerRow } from '@/types/workers.js';
 
-const { workersListQueryFn, getByIdQueryFn, projectsListQueryFn, listMineQueryFn, rosterQueryFn } =
-	vi.hoisted(() => ({
-		workersListQueryFn: vi.fn(),
-		getByIdQueryFn: vi.fn(),
-		projectsListQueryFn: vi.fn(),
-		listMineQueryFn: vi.fn(),
-		rosterQueryFn: vi.fn(),
-	}));
+const {
+	workersListQueryFn,
+	getByIdQueryFn,
+	projectsListQueryFn,
+	listMineQueryFn,
+	rosterQueryFn,
+	enrollMutate,
+} = vi.hoisted(() => ({
+	workersListQueryFn: vi.fn(),
+	getByIdQueryFn: vi.fn(),
+	projectsListQueryFn: vi.fn(),
+	listMineQueryFn: vi.fn(),
+	rosterQueryFn: vi.fn(),
+	enrollMutate: vi.fn(),
+}));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
@@ -47,6 +54,7 @@ vi.mock('@/lib/trpc.js', () => ({
 	},
 	trpcClient: {
 		workers: {
+			enroll: { mutate: enrollMutate },
 			setConsent: { mutate: vi.fn() },
 			updateConstraints: { mutate: vi.fn() },
 			approveEnrollment: { mutate: vi.fn() },
@@ -149,6 +157,8 @@ beforeEach(() => {
 	projectsListQueryFn.mockResolvedValue([{ id: 'proj-a', name: 'Widgets', repo: 'acme/widgets' }]);
 	listMineQueryFn.mockResolvedValue([]);
 	rosterQueryFn.mockResolvedValue([]);
+	enrollMutate.mockReset();
+	enrollMutate.mockResolvedValue({});
 });
 
 describe('/workers/$workerId route registration', () => {
@@ -180,6 +190,27 @@ describe('worker detail navigation (issue #477)', () => {
 		expect(await screen.findByRole('heading', { name: 'Project enrollments' })).toBeDefined();
 		const identity = screen.getByRole('heading', { name: 'Identity' }).parentElement as HTMLElement;
 		expect(within(identity).getByText('worker-1')).toBeDefined();
+	});
+
+	it('lets an owner enroll their un-enrolled worker from its detail route', async () => {
+		getByIdQueryFn.mockResolvedValue(makeDetail({ viewerIsOwner: true, enrollments: [] }));
+		projectsListQueryFn.mockResolvedValue([
+			{ id: 'proj-a', name: 'Widgets', repositories: [{ repo: 'acme/widgets' }] },
+		]);
+		enrollMutate.mockReturnValueOnce(new Promise(() => {}));
+
+		renderAt('/workers/worker-1');
+		fireEvent.click(await screen.findByRole('button', { name: 'Enroll in a project' }));
+		fireEvent.change(screen.getByLabelText(/^Project/), { target: { value: 'proj-a' } });
+		fireEvent.click(screen.getByRole('button', { name: 'Enroll worker' }));
+
+		await vi.waitFor(() =>
+			expect(enrollMutate).toHaveBeenCalledWith({
+				workerId: 'worker-1',
+				projectId: 'proj-a',
+				allowedClis: ['claude'],
+			}),
+		);
 	});
 
 	it('links back to the index from the breadcrumb', async () => {

@@ -1,7 +1,8 @@
 import { useMutation } from '@tanstack/react-query';
-import type { ReactNode } from 'react';
+import { type ReactNode, useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
+import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
@@ -35,10 +36,14 @@ import type { WorkerDetail } from '@/types/workers.js';
  * **Nothing secret is on this surface**, by construction rather than by filtering:
  * its only source is the `workers.getById` read model, which names each safe field
  * explicitly, so no machine path, worker credential, credential hash, or project
- * PAT exists to leak. Enrolling the machine into a *new* project is deliberately
- * not here: offering a machine to a project is a different act from administering
- * an existing enrollment, and it stays with `swarm workers enroll` / the owner's
- * own flow.
+ * PAT exists to leak.
+ *
+ * **Offering the machine to a *new* project is here too** (issue #764), as the
+ * owner's own action ({@link WorkerEnrollDialog}) over the same `workers.enroll`
+ * the CLI calls — no new procedure and no new authorization. It is still a
+ * different act from administering an existing enrollment, and it produces one:
+ * the new enrollment starts pending with sharing consent off, so a project
+ * administrator's approval and the owner's consent remain exactly where they were.
  */
 
 const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm';
@@ -196,6 +201,7 @@ export function WorkerDetailView({
 	onChanged,
 }: WorkerDetailViewProps) {
 	const ownerName = worker.owner?.displayName ?? 'the owner';
+	const [enrollOpen, setEnrollOpen] = useState(false);
 
 	return (
 		<div className="space-y-6">
@@ -295,10 +301,25 @@ export function WorkerDetailView({
 
 			<div className={CARD_CLASS}>
 				<h2 className={SECTION_HEADING_CLASS}>Project enrollments</h2>
+				{/* Kept a sibling of the heading rather than wrapped around it: the heading
+				    stays the section's own accessible name, and the action reads as one of
+				    the section's contents. */}
+				{worker.viewerIsOwner ? (
+					<div className="mb-4">
+						<button
+							type="button"
+							onClick={() => setEnrollOpen(true)}
+							className={SECONDARY_BUTTON_CLASS}
+						>
+							Enroll in a project
+						</button>
+					</div>
+				) : null}
 				{worker.enrollments.length === 0 ? (
 					<p className="text-sm text-zinc-400">
-						This machine is not enrolled in any project you can see. Offering it to a project is its
-						owner's action — <span className="font-mono">swarm workers enroll</span>.
+						{worker.viewerIsOwner
+							? 'This machine is not enrolled in any project yet. Offer it to one with Enroll in a project — it then waits for that project’s administrator to approve it.'
+							: 'This machine is not enrolled in any project you can see. Offering it to a project is its owner’s action.'}
 					</p>
 				) : (
 					<ul className="space-y-4">
@@ -320,6 +341,20 @@ export function WorkerDetailView({
 					</ul>
 				)}
 			</div>
+
+			{/* Last child of the page rather than inside the enrollments card, so an open
+			    modal's DOM doesn't land inside that section's subtree. */}
+			{worker.viewerIsOwner ? (
+				<WorkerEnrollDialog
+					open={enrollOpen}
+					onOpenChange={setEnrollOpen}
+					workerId={worker.workerId}
+					workerName={worker.displayName}
+					capabilities={worker.capabilities}
+					enrolledProjectIds={worker.enrollments.map((enrollment) => enrollment.projectId)}
+					onChanged={onChanged}
+				/>
+			) : null}
 		</div>
 	);
 }
