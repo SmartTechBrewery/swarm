@@ -66,7 +66,7 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   access rule. The two order differently since issue #750, which is ordering
  *   alone and no change to what is visible: the project-scoped list follows the
  *   project's configured worker order, the unscoped one still lists the caller's
- *   own machines first (#657). `getById` (#477)
+ *   own machines first (#657) and groups the rest by owner (#808). `getById` (#477)
  *   returns that same row for one worker, widened with per-project enrollment
  *   detail and with what the *viewer* may change, so the detail screen offers only
  *   controls that would succeed. It stays bounded by `accessibleProjectScope` for
@@ -180,36 +180,84 @@ async function resolveRosterScope(
 }
 
 /**
- * The viewer's own machines first (issue #657) — presentation order only, and
- * since issue #750 the **unscoped** global `/workers` list alone. It reorders the
- * rows `listDashboardWorkers` already decided are visible and changes nothing
- * about visibility, project scoping, ownership, or authorization.
+ * The one collation this router's alphabetical ordering uses — accent- and
+ * case-insensitive, the same `{ sensitivity: 'base' }` comparison the PM
+ * providers sort their board containers by, so "ana" and "Ana" land next to each
+ * other rather than in two separate stretches of the list.
+ */
+const byLabel = (a: string, b: string) => a.localeCompare(b, undefined, { sensitivity: 'base' });
+
+/**
+ * The viewer's own machines first, then everyone else's grouped by owner (issues
+ * #657 and #808) — presentation order only, and since issue #750 the **unscoped**
+ * global `/workers` list alone. It reorders the rows `listDashboardWorkers`
+ * already decided are visible and changes nothing about visibility, project
+ * scoping, ownership, or authorization.
  *
- * A project's Workers tab deliberately does *not* read it any more: that list has
- * a configured order of its own ({@link inProjectOrder}), which is also the order
+ * A project's Workers tab deliberately does *not* read it: that list has a
+ * configured order of its own ({@link inProjectOrder}), which is also the order
  * the dispatch gate prefers, so sorting the viewer's own machines to the top there
  * would show every operator a different sequence from the one the project is
  * actually scheduled in. The global list has no such order — it spans projects —
- * so viewer-first stays exactly as #657 left it.
+ * so it is ordered for scanning instead:
  *
- * The sort is **stable** (per spec), so the read model's own oldest-first order
- * is preserved within each group and a viewer who owns no visible worker sees it
- * unchanged. A row whose owner user row no longer resolves (`owner === null`)
- * groups with the others, which is correct: the signed-in viewer's own user row
- * resolved to produce `ctx.user`, so a missing one is never theirs.
+ * 1. **The viewer's own machines**, in the read model's own oldest-first order —
+ *    exactly what #657 shipped. Their order is untouched because it is the one
+ *    group an operator already knows by heart; re-alphabetising it would move
+ *    rows for no gain.
+ * 2. **Then one contiguous run per remaining owner**, the runs ordered by owner
+ *    display name and, for two owners labelled the same, by their unique
+ *    `identifier` — so a name collision is broken deterministically rather than
+ *    by whichever machine happened to register first.
+ * 3. **Within a run, by machine display name.** Registration order says nothing
+ *    an operator scanning for one machine can use.
+ *
+ * A row whose owner user row no longer resolves (`owner === null`) forms its own
+ * run and sorts **last**: it has no label to alphabetise by, and inventing one
+ * would interleave those rows through owners they have nothing to do with. It is
+ * never the viewer's own — the signed-in viewer's user row resolved to produce
+ * `ctx.user` — so this cannot displace group 1.
  */
-function viewerWorkersFirst(
+function viewerWorkersFirstThenGroupedByOwner(
 	workers: DashboardWorkerView[],
 	viewerUserId: string,
 ): DashboardWorkerView[] {
-	const isViewers = (worker: DashboardWorkerView) => worker.owner?.userId === viewerUserId;
-	return [...workers].sort((a, b) => Number(isViewers(b)) - Number(isViewers(a)));
+	const viewers: DashboardWorkerView[] = [];
+	// Keyed by owner id (the ownerless run under a key no uuid can collide with),
+	// and inserted in encounter order, so the grouping itself never depends on the
+	// sort below being total.
+	const byOwner = new Map<string, DashboardWorkerView[]>();
+	for (const worker of workers) {
+		if (worker.owner?.userId === viewerUserId) {
+			viewers.push(worker);
+			continue;
+		}
+		const key = worker.owner?.userId ?? '';
+		const run = byOwner.get(key);
+		if (run) run.push(worker);
+		else byOwner.set(key, [worker]);
+	}
+
+	const others = [...byOwner.values()]
+		.sort((a, b) => {
+			// An ownerless run has no label; it goes last rather than under some
+			// stand-in string that would sort it among real owners.
+			if (!a[0].owner || !b[0].owner) return Number(!a[0].owner) - Number(!b[0].owner);
+			return (
+				byLabel(a[0].owner.displayName, b[0].owner.displayName) ||
+				byLabel(a[0].owner.identifier, b[0].owner.identifier)
+			);
+		})
+		.flatMap((run) => [...run].sort((a, b) => byLabel(a.displayName, b.displayName)));
+
+	return [...viewers, ...others];
 }
 
 /**
  * The project's configured worker order (issue #750) — presentation order for the
- * project-scoped list, exactly as {@link viewerWorkersFirst} is for the global
- * one, and the same order `workers.roster` and the dispatch gate already read.
+ * project-scoped list, exactly as {@link viewerWorkersFirstThenGroupedByOwner} is
+ * for the global one, and the same order `workers.roster` and the dispatch gate
+ * already read.
  *
  * `workerIdsInOrder` is the project's own enrollment order; the sort is stable and
  * places a worker the order does not name **last**, which is defensive rather than
@@ -258,8 +306,9 @@ export const workersRouter = router({
 	// decided what is visible, and the two lists order differently (issue #750): a
 	// project-scoped read comes back in that project's *configured* worker order —
 	// the same order `roster` and the dispatch gate read — while the unscoped
-	// installation roster keeps the caller's own machines first (#657), having no
-	// project order to speak of.
+	// installation roster keeps the caller's own machines first (#657) and, having no
+	// project order to speak of, groups the rest by owner and alphabetises both the
+	// owner groups and the machines inside them (#808).
 	list: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }).optional())
 		.query(async ({ ctx, input }) => {
@@ -268,7 +317,7 @@ export const workersRouter = router({
 			const projectId = input?.projectId;
 			const workers = projectId
 				? inProjectOrder(visible, await listProjectWorkerIdsInOrder(projectId))
-				: viewerWorkersFirst(visible, ctx.user.id);
+				: viewerWorkersFirstThenGroupedByOwner(visible, ctx.user.id);
 			// The service already assembled a secret-free view; the only wire-shape
 			// concern here is giving the browser an explicit ISO timestamp.
 			return workers.map((worker) => ({

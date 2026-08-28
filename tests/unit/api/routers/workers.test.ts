@@ -255,9 +255,11 @@ describe('workers.list (installation roster, issue #133)', () => {
 
 	it('serializes last-seen to an ISO string (and keeps null for a never-connected worker)', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		// Named `a`/`b` so the ordering the unscoped list applies (issue #808) leaves
+		// them in this sequence — this test is about the timestamp, not the sort.
 		listDashboardWorkers.mockResolvedValue([
-			{ workerId: WORKER_ID, lastSeenAt: new Date('2026-07-01T12:00:00.000Z') },
-			{ workerId: 'w2', lastSeenAt: null },
+			{ workerId: WORKER_ID, displayName: 'a', lastSeenAt: new Date('2026-07-01T12:00:00.000Z') },
+			{ workerId: 'w2', displayName: 'b', lastSeenAt: null },
 		]);
 
 		const rows = await admin.list();
@@ -267,49 +269,112 @@ describe('workers.list (installation roster, issue #133)', () => {
 	});
 });
 
-/** A roster row as `listDashboardWorkers` returns it, reduced to the fields ordering reads. */
-function rosterRow(workerId: string, ownerUserId: string | null) {
+/**
+ * A roster row as `listDashboardWorkers` returns it, reduced to the fields
+ * ordering reads: the machine's own name and its owner identity. Both labels
+ * default off the ids, so a test that only cares *whose* a machine is invents
+ * nothing; `labels` overrides them where the alphabetical rules are the subject.
+ */
+function rosterRow(
+	workerId: string,
+	ownerUserId: string | null,
+	labels: { name?: string; ownerName?: string; ownerIdentifier?: string } = {},
+) {
 	return {
 		workerId,
+		displayName: labels.name ?? workerId,
 		lastSeenAt: null,
 		owner: ownerUserId
 			? {
 					userId: ownerUserId,
-					identifier: `${ownerUserId}@example.com`,
-					displayName: ownerUserId,
+					identifier: labels.ownerIdentifier ?? `${ownerUserId}@example.com`,
+					displayName: labels.ownerName ?? ownerUserId,
 				}
 			: null,
 	};
 }
 
-describe('workers.list ordering — the viewer’s own machines first (issue #657)', () => {
-	it('lists the caller’s workers first, keeping each group’s existing order', async () => {
+const THIRD_ID = '00000000-0000-4000-8000-0000000000cc';
+const FOURTH_ID = '00000000-0000-4000-8000-0000000000dd';
+
+describe('workers.list ordering — viewer first, then grouped by owner (issues #657, #808)', () => {
+	it('lists the caller’s workers first, in the read model’s own order', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		// The viewer's two machines are deliberately *not* alphabetical: their group
+		// keeps the order #657 shipped, which is the one an operator already knows.
 		listDashboardWorkers.mockResolvedValue([
 			rosterRow('other-1', OWNER_ID),
-			rosterRow('mine-1', OTHER_ID),
+			rosterRow('mine-zulu', OTHER_ID),
 			rosterRow('other-2', OWNER_ID),
-			rosterRow('mine-2', OTHER_ID),
+			rosterRow('mine-alpha', OTHER_ID),
 		]);
 
 		const rows = await admin.list();
 
-		expect(rows.map((row) => row.workerId)).toEqual(['mine-1', 'mine-2', 'other-1', 'other-2']);
+		expect(rows.map((row) => row.workerId)).toEqual([
+			'mine-zulu',
+			'mine-alpha',
+			'other-1',
+			'other-2',
+		]);
 	});
 
-	it('leaves the order untouched for a viewer who owns no visible worker', async () => {
+	// The point of issue #808: the remaining machines arrive interleaved in
+	// registration order, and an operator scanning for one teammate's machines
+	// should not have to read the whole roster to find them.
+	it('groups every other owner’s machines contiguously, owners and machines alphabetical', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
-		// The third row's owner user row no longer resolves; it is still not the
-		// viewer's, whose own row resolved to authenticate the request.
 		listDashboardWorkers.mockResolvedValue([
-			rosterRow('other-1', OWNER_ID),
-			rosterRow('other-2', OWNER_ID),
-			rosterRow('orphaned', null),
+			rosterRow('w1', THIRD_ID, { name: 'zeta', ownerName: 'Cleo' }),
+			rosterRow('w2', OWNER_ID, { name: 'delta', ownerName: 'Ada' }),
+			rosterRow('w3', THIRD_ID, { name: 'alpha', ownerName: 'Cleo' }),
+			rosterRow('w4', FOURTH_ID, { name: 'omega', ownerName: 'Bram' }),
+			rosterRow('w5', OWNER_ID, { name: 'beta', ownerName: 'Ada' }),
 		]);
 
 		const rows = await admin.list();
 
-		expect(rows.map((row) => row.workerId)).toEqual(['other-1', 'other-2', 'orphaned']);
+		expect(rows.map((row) => row.displayName)).toEqual([
+			// Ada's, alphabetical …
+			'beta',
+			'delta',
+			// … then Bram's …
+			'omega',
+			// … then Cleo's, also alphabetical.
+			'alpha',
+			'zeta',
+		]);
+	});
+
+	// Display names are not unique; the identifier is, so a collision resolves to a
+	// fixed order rather than to whichever machine happened to register first.
+	it('breaks a shared owner display name on the owner’s unique identifier', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('w1', THIRD_ID, { ownerName: 'Alex', ownerIdentifier: 'alex.zhu@example.com' }),
+			rosterRow('w2', FOURTH_ID, { ownerName: 'Alex', ownerIdentifier: 'alex.ng@example.com' }),
+		]);
+
+		const rows = await admin.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['w2', 'w1']);
+	});
+
+	it('sorts a row whose owner no longer resolves last, after every owner group', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		// The ownerless rows are still not the viewer's, whose own user row resolved
+		// to authenticate the request — and they have no label to alphabetise by, so
+		// they go last as their own run rather than among owners they are not part of.
+		listDashboardWorkers.mockResolvedValue([
+			rosterRow('orphan-b', null),
+			rosterRow('w1', OWNER_ID, { name: 'zeta', ownerName: 'Zoë' }),
+			rosterRow('orphan-a', null),
+			rosterRow('w2', OWNER_ID, { name: 'alpha', ownerName: 'Zoë' }),
+		]);
+
+		const rows = await admin.list();
+
+		expect(rows.map((row) => row.workerId)).toEqual(['w2', 'w1', 'orphan-a', 'orphan-b']);
 	});
 
 	// Issue #750 — viewer-first is now the *global* list's rule alone: a project has a
