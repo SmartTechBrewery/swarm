@@ -23,9 +23,12 @@
  *
  * The two personas resolve their tokens from different sources (issue #396): the
  * `implementer` identity is resolved from the worker operator's own token
- * (`SWARM_OPERATOR_GH_TOKEN`, via `getPersonaTokenOrNull`), the same token the
- * implementer phases open PRs with — so the resolved implementer login always
- * matches the PR author. The `reviewer` stays a project-scoped credential. The
+ * (`SWARM_OPERATOR_GH_TOKEN`, via `getPersonaTokenOrNull`). This runs on the
+ * **router**, which since issue #765 is the only side still reading that variable —
+ * the worker resolves the same operator identity from the per-`(worker, provider)`
+ * store instead, so on a multi-worker installation the login resolved here can
+ * differ from the account that authored the PR. Moving these readers onto that store
+ * is a follow-up. The `reviewer` stays a project-scoped credential. The
  * two must still resolve to two distinct accounts (operator ≠ reviewer) for loop
  * prevention to hold.
  */

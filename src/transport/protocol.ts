@@ -331,6 +331,28 @@ export const TaskAssignmentSchema = z.object({
 	repository: z.string().optional(),
 	baseBranch: z.string().optional(),
 	baseSha: z.string().optional(),
+	/**
+	 * The **worker operator's own** SCM credential for the provider this project runs
+	 * on, resolved control-plane side per `(worker, project.scm)` from the durable
+	 * store (issue #765) — the identity the phase's commits, push, pull request and
+	 * implementer-side comments are authored as.
+	 *
+	 * This is the one secret the frame deliberately carries, and it is *not* a hole in
+	 * the project secret boundary `./assignment.ts` enforces: it belongs to the worker
+	 * receiving it, not to the project, so it crosses no tenancy line. The worker is
+	 * DB-free by design (ADR-003 §2) and must hold it to push at all; it travels over
+	 * TLS on a socket already authenticated by that worker's own
+	 * `SWARM_WORKER_CREDENTIAL`. The project's own credentials — the reviewer PAT, the
+	 * PM credential — still never reach a worker.
+	 *
+	 * Optional on the wire despite being required to run, and `TRANSPORT_PROTOCOL_VERSION`
+	 * deliberately not bumped, on the same reasoning as `repository` and `boardItemId`
+	 * above: a bump rejects every frame from a mismatched daemon rather than only the
+	 * affected ones. An older router omits it and the worker settles the assignment
+	 * `failed` with an explicit reason; an older worker ignores it and keeps reading its
+	 * own `.env`. The rollout order that follows is in `docs/onboarding-worker.md`.
+	 */
+	operatorCredential: z.string().min(1).optional(),
 });
 export type TaskAssignment = z.infer<typeof TaskAssignmentSchema>;
 

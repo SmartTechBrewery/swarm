@@ -6,9 +6,10 @@
  *
  * A thin file/CLI shell over `usersRepository.ts` (`node:util` `parseArgs` +
  * `_shared/output.ts`, like `commands/config.ts`). The one secret it handles is
- * the login password (`set-password`, #281 task 2): it is read without echoing,
- * hashed via `identity/auth.ts`, and never printed or logged — only the scrypt
- * hash reaches the DB. The DB pool is closed in a `finally` (`closeDb()`).
+ * the login password (`set-password`, #281 task 2): it is read without echoing
+ * (`_shared/secret-input.ts`), hashed via `identity/auth.ts`, and never printed or
+ * logged — only the scrypt hash reaches the DB. The DB pool is closed in a
+ * `finally` (`closeDb()`).
  *
  * Subcommands:
  *   swarm users add <identifier> [--name <displayName>] [--admin]
@@ -29,6 +30,7 @@ import {
 } from '../../db/repositories/usersRepository.js';
 import { hashPassword } from '../../identity/auth.js';
 import * as out from '../_shared/output.js';
+import { promptHidden, readStdin } from '../_shared/secret-input.js';
 
 const USAGE = `swarm users — manage SWARM users, credentials, and the installation admin
 
@@ -52,65 +54,6 @@ Requires DATABASE_URL in the environment — run via a wrapper that loads .env, 
 export it yourself first.`;
 
 const SUBCOMMANDS = ['add', 'list', 'grant-admin', 'revoke-admin', 'set-password'];
-
-// Control characters handled while reading a hidden line, by char code.
-const ENTER = ['\n'.charCodeAt(0), '\r'.charCodeAt(0)];
-const CTRL_D = 4;
-const CTRL_C = 3;
-const BACKSPACE = [127, 8];
-
-/** Classify a raw-mode keystroke while reading a hidden line. */
-function classifyKey(ch: string): 'submit' | 'abort' | 'erase' | 'append' {
-	const code = ch.charCodeAt(0);
-	if (ENTER.includes(code) || code === CTRL_D) return 'submit';
-	if (code === CTRL_C) return 'abort';
-	if (BACKSPACE.includes(code)) return 'erase';
-	return 'append';
-}
-
-/**
- * Read a line from a TTY without echoing it, so a typed password never appears on
- * screen or in the terminal scrollback. Handles Enter (submit), Backspace, and
- * Ctrl-C/Ctrl-D. Dependency-free (raw mode over `process.stdin`).
- */
-function promptHidden(prompt: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const stdin = process.stdin;
-		process.stdout.write(prompt);
-		stdin.resume();
-		stdin.setRawMode?.(true);
-		stdin.setEncoding('utf8');
-		let input = '';
-		const finish = (aborted: boolean) => {
-			stdin.setRawMode?.(false);
-			stdin.pause();
-			stdin.removeListener('data', onData);
-			process.stdout.write('\n');
-			if (aborted) reject(new Error('aborted'));
-			else resolve(input);
-		};
-		const onData = (chunk: string) => {
-			for (const ch of chunk) {
-				const action = classifyKey(ch);
-				if (action === 'append') input += ch;
-				else if (action === 'erase') input = input.slice(0, -1);
-				else return finish(action === 'abort');
-			}
-		};
-		stdin.on('data', onData);
-	});
-}
-
-/** Read all of stdin (a piped/redirected password), stripping one trailing newline. */
-async function readStdin(): Promise<string> {
-	const chunks: Buffer[] = [];
-	for await (const chunk of process.stdin) {
-		chunks.push(Buffer.from(chunk));
-	}
-	return Buffer.concat(chunks)
-		.toString('utf8')
-		.replace(/\r?\n$/, '');
-}
 
 /**
  * A duplicate `identifier` surfaces the pg `23505` unique violation, which

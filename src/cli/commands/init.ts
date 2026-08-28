@@ -73,8 +73,8 @@ export const CONFIG_TEMPLATE = {
 			},
 			// References (env-var keys), never the secrets themselves — see CredentialsSchema.
 			// The implementer persona is NOT a project credential: it is the worker
-			// operator's own token, set as SWARM_OPERATOR_GH_TOKEN in `.env` on each host
-			// that runs implementer phases (issue #396).
+			// operator's own credential, stored per (worker, SCM provider) with
+			// `swarm workers set-scm-credential` (issues #396, #765).
 			//
 			// Both maps hold one reference per role, *per provider* — `scm` since issue
 			// #628 and `pm` since #631 — so a project can carry a second provider's

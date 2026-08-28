@@ -934,6 +934,9 @@ export function createMockTaskAssignmentInput(
 		systemPrompt: 'You are the SWARM planning agent. Do the thing.',
 		target: { cli: 'claude' },
 		workItem: createMockWorkItem(),
+		// Required on the input since issue #765 — the selected worker's own operator
+		// SCM credential, resolved control-plane side before the frame is built.
+		operatorCredential: 'operator-credential',
 		...overrides,
 	};
 }

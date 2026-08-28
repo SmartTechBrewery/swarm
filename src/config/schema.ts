@@ -105,8 +105,9 @@ export const PROJECT_DEFAULTS = {
  * DB rows — PROJECT.md §6.1 keeps secrets out of config on purpose.
  *
  * The `implementer` persona is deliberately **not** here (issue #396): it is the
- * worker operator's own token, a worker-local `SWARM_OPERATOR_GH_TOKEN` env var
- * (`./operator-token.ts`), never persisted and never in this config. The
+ * worker operator's own credential, stored per `(worker, scmProvider)` since issue
+ * #765 (`../db/repositories/workerScmCredentialsRepository.ts`) and never in this
+ * config. The
  * implementer/reviewer loop-prevention split (ai/CODING_STANDARDS.md "Loop
  * prevention") still holds — the two personas resolve to two distinct identities
  * (author = operator ≠ reviewer). This schema stays non-strict, so a legacy

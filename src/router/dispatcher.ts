@@ -52,9 +52,14 @@ import {
 import type { AgentCliResult, ReportedAgentResult } from '../harness/agent-cli.js';
 import { type AgentFailureKind, AgentRunError } from '../harness/agent-failure.js';
 import {
+	MissingWorkerScmCredentialError,
+	requireWorkerScmCredential,
+} from '../identity/worker-scm-credential.js';
+import {
 	getLiveSessionForWorker,
 	resolveHeartbeatTtlMs,
 } from '../identity/worker-session-service.js';
+import { requireProjectSCMProviderId } from '../integrations/scm/registry.js';
 import { optionalEnv, requireEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -458,6 +463,47 @@ async function persistBranchProvisioned(
 }
 
 /**
+ * Resolve the selected worker's own operator SCM credential for the provider this
+ * project actually targets (issue #765), re-raising a missing one so `processJob`
+ * settles the dispatch as a phase failure with a run-row reason and the usual
+ * board/PR failure comment. Making the cause board-visible is the whole point: the
+ * failure this replaces was a generic provider identity error a few seconds into a
+ * run, with nothing naming the machine.
+ *
+ * `kind: 'error'` deliberately, and it is the *only* kind that works here.
+ * `pushAndAwaitResult`'s two other pre-push throws are `aborted` and
+ * `DeliveryDeferredError`, and both are **deferrable** in `handlePhaseFailure`
+ * (`../worker/consumer.ts`) — correctly, since both describe a transient race. An
+ * unset credential is not transient: deferring it would retry until the budget ran
+ * out and only then surface the one message that says which worker and which
+ * provider to fix. `'error'` is the kind the shared path treats as terminal
+ * (`isDeferrable` excludes it), which is the same reason
+ * {@link adaptResultToPhaseRun} uses it for a worker's terminal frame.
+ *
+ * Exported for the same reason {@link awaitResultWithGuards} is: *which* provider it
+ * asks for and *what the failure says* are the whole point of the function, and
+ * asserting either through a live BullMQ consumer would cost far more than it proves.
+ */
+export async function resolveOperatorCredential(
+	project: DispatchPhaseContext['project'],
+	selection: DispatchSelection,
+): Promise<string> {
+	const scmProviderId = requireProjectSCMProviderId(project);
+	try {
+		return await requireWorkerScmCredential({
+			workerId: selection.workerId,
+			workerName: selection.workerName,
+			scmProviderId,
+		});
+	} catch (err) {
+		if (err instanceof MissingWorkerScmCredentialError) {
+			throw new AgentRunError(err.message, { kind: 'error' });
+		}
+		throw err;
+	}
+}
+
+/**
  * The control-plane `executePhase`: compose the assignment server-side, push it to
  * the selected worker, and await the worker's terminal result. Everything around
  * this — run-row lifecycle, dispatch settle, self-enqueue, merge automation — is
@@ -478,6 +524,13 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 	const phaseConfig = phaseAgentConfig(project, trigger.phase, implementationUnplanned);
 	const customPrompt = phaseConfig.prompt;
 	const timeoutMs = phaseConfig.timeoutMs ?? DEFAULT_PHASE_TIMEOUT_MS;
+
+	// The identity this phase will commit, push and comment as, resolved *here*
+	// because this is the only side that knows both which worker was selected and
+	// which SCM provider the project targets (issue #765). A worker with no stored
+	// credential for that provider fails now, naming both — rather than a few seconds
+	// into the run with the provider's own generic identity error.
+	const operatorCredential = await resolveOperatorCredential(project, selection);
 
 	const assignment = buildTaskAssignment({
 		dispatchId: dispatch.id,
@@ -511,6 +564,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		// disagree about which repository the phase ran against. Not read back off the
 		// run row — creation is best-effort, so `runId` can be undefined here.
 		repository: project.repo,
+		operatorCredential,
 	});
 
 	// Register the result wait *before* pushing so a fast worker's ack/progress/

@@ -5,11 +5,11 @@
  * The same-host delivery provider resolves a persona token from the secret store
  * (`getPersonaToken`) and scopes every GitHub call to it. A remote worker
  * (`../../../transport/connect-entry.ts`) has no secret store and no persona
- * references — it carries only the operator's own GitHub token
- * (`SWARM_OPERATOR_GH_TOKEN`, `../../../lib/env.ts`). This builds the identical
- * source-carrying delivery surface (commit identity, PR lookup/creation, push,
- * comment) sourced from that single token instead, per RULES §2 (GitHub
- * specifics stay under `src/integrations/scm/github/`).
+ * references — the operator's own GitHub token reaches it on the assignment frame,
+ * resolved control-plane side from the per-`(worker, provider)` store (issue #765).
+ * This builds the identical source-carrying delivery surface (commit identity, PR
+ * lookup/creation, push, comment) sourced from that single token instead, per
+ * RULES §2 (GitHub specifics stay under `src/integrations/scm/github/`).
  *
  * Shared code never imports this directly: it is GitHub's implementation of
  * `SCMProvider.operatorDeliveryProvider` (`../../../scm/types.ts`), which the

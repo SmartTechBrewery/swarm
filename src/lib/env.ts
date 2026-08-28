@@ -74,32 +74,6 @@ export function isSingleUserMode(): boolean {
 	return process.env.SWARM_SINGLE_USER_MODE === 'true';
 }
 
-/**
- * Resolve the worker operator's own GitHub token (`SWARM_OPERATOR_GH_TOKEN`).
- *
- * The DB-free remote worker (`../transport/connect-entry.ts`) has no persona
- * credentials — the assignment carries only the non-secret project slice, never
- * a token reference resolvable against a secret store. Instead, the
- * source-carrying operations (`commit`/`push`/`createPR`/`findPR`/`postComment`)
- * run as the **worker operator's own GitHub account** (ADR-003 §2: "the
- * implementer identity is the worker operator's own GitHub account … one token,
- * held only on their machine"). This reads that token from the operator's local
- * environment and never leaves the machine.
- *
- * Trimmed like the other worker env parsers; throws a clear config error when
- * unset or empty, so the remote worker fails fast at startup rather than
- * discovering the missing token mid-assignment.
- */
-export function resolveOperatorGitHubToken(raw = process.env.SWARM_OPERATOR_GH_TOKEN): string {
-	const value = (raw ?? '').trim();
-	if (value === '') {
-		throw new Error(
-			"Missing required environment variable: SWARM_OPERATOR_GH_TOKEN (the remote worker operator's own GitHub token, used for source-carrying delivery)",
-		);
-	}
-	return value;
-}
-
 /** Resolve the assigned repository checkout on the remote worker's own host. */
 export function resolveWorkerRepoRoot(
 	raw = process.env.SWARM_WORKER_REPO_ROOT,

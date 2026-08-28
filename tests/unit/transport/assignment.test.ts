@@ -29,6 +29,24 @@ describe('buildTaskAssignment', () => {
 			expect(serialized).not.toContain('SENTINEL_REVIEWER_TOKEN');
 			expect(serialized).not.toContain('SENTINEL_WEBHOOK_SECRET');
 		});
+
+		// The one secret that *does* travel, deliberately (issue #765): the receiving
+		// worker's own operator identity, without which it cannot commit or push. It is
+		// not a project credential, so the boundary above is unchanged — and the input
+		// field is required, so a frame cannot be assembled without one having been
+		// resolved.
+		it('carries the worker operator credential it was given', () => {
+			const assignment = buildTaskAssignment(
+				createMockTaskAssignmentInput({ operatorCredential: 'worker-operator-secret' }),
+			);
+			expect(assignment.operatorCredential).toBe('worker-operator-secret');
+		});
+
+		it('refuses to assemble a frame with an empty operator credential', () => {
+			expect(() =>
+				buildTaskAssignment(createMockTaskAssignmentInput({ operatorCredential: '' })),
+			).toThrow();
+		});
 	});
 
 	describe('per-phase inputs', () => {

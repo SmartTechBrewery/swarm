@@ -173,9 +173,9 @@ shortest path to a working checkout.
   `npm run swarm -- pm webhook create --project <id>` (see
   [`docs/cli.md`](docs/cli.md))
 - Two distinct source-control identities for loop prevention: the worker operator's
-  own credential (`SWARM_OPERATOR_GH_TOKEN` / `SWARM_OPERATOR_BITBUCKET_TOKEN` /
-  `SWARM_OPERATOR_GITLAB_TOKEN`, the implementer persona) set in `.env` on each host,
-  and a separate project-scoped reviewer credential
+  own credential (the implementer persona), stored per worker per SCM provider with
+  `swarm workers set-scm-credential`, and a separate project-scoped reviewer
+  credential
 - A project credential for the **board**, separate from the two above, held per PM
   provider under `credentials.pm.<provider>.<role>` so a project can carry two
   providers' credentials at once while only the one `pm.type` names is ever
@@ -259,23 +259,28 @@ Open <http://localhost:5173>. For a compiled self-hosted dashboard, run
 
 **There is one worker program and one command for it.** `npm run dev:worker` runs
 `src/transport/connect-entry.ts` on every machine, remote or the control-plane host
-itself. Point it at the router and give it the operator's own source-control token;
-on the control-plane host that URL is simply loopback:
+itself. Point it at the router; on the control-plane host that URL is simply
+loopback:
 
 ```bash
 # .env on the machine running the worker
 SWARM_CONTROL_PLANE_URL=http://localhost:3100      # remote worker: https://<your-tunnel>
 SWARM_WORKER_CREDENTIAL=<from `swarm workers register`>
-SWARM_OPERATOR_GH_TOKEN=<your own GitHub token>
 SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
 ```
+
+The operator's own source-control credential is **not** among them: it is stored
+server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
+<worker-id> <github|bitbucket|gitlab>` — and travels with each assignment, so
+rotating it needs no worker restart and a Bitbucket or GitLab project resolves its
+own credential rather than a GitHub-named one.
 
 It is intentionally host-run: it needs local Git worktrees, agent CLI
 authentication, and the developer's PATH.
 
-**What it holds — and what it deliberately doesn't.** Only the credential, the
-control-plane URL, and the operator's own source-control token; no
-`DATABASE_URL`/`REDIS_URL`, even on a host that has them. Its agent therefore
+**What it holds — and what it deliberately doesn't.** Only the credential and the
+control-plane URL; no `DATABASE_URL`/`REDIS_URL`, even on a host that has them, and
+no stored source-control secret. Its agent therefore
 authenticates as the *operator's own* account everywhere (ADR-004 §2), while the
 project-scoped reviewer PAT and the PM credential never leave the server — so a
 submitted review's identity is unchanged.
@@ -299,7 +304,7 @@ sharing consent stay human decisions, so nothing is ever enrolled or re-activate
 from a declaration alone.
 
 **How work is split.** Source-carrying delivery (commit / push / create-PR) runs
-under the operator token on the worker. Everything needing something the worker
+on the worker under the operator credential the assignment carried. Everything needing something the worker
 must not hold goes up to the control plane's delivery API: Implementation's board
 moves, comments and dependency lookup; Respond-to-review's card lookup and board
 moves; Review's submitted verdict under the reviewer PAT; and the two things

@@ -26,9 +26,9 @@
  * read the agent makes acts as that persona, not whatever `gh auth` session
  * happens to be ambient on the worker's host; the delivery that opens the PR runs
  * under the same persona's credential. Since issue #396 the implementer token is
- * the worker operator's own token (`SWARM_OPERATOR_GH_TOKEN`, resolved through
- * the same `getPersonaToken(project, 'implementer')` seam), so the PR is authored
- * by the operator's account. Review's ownership gate no longer reads that author
+ * the worker operator's own — since issue #765 resolved from the per-`(worker, SCM
+ * provider)` store and handed to this phase as `agentToken`/`delivery` rather than
+ * read from an env var — so the PR is authored by the operator's account. Review's ownership gate no longer reads that author
  * at all (issue #397): it recognises the PR from its **branch**
  * (`<branchPrefix><issueNumber>`, the branch this phase's worktree provisions)
  * plus this phase's own `runs` row — see `src/triggers/swarm-managed-pr.ts`.

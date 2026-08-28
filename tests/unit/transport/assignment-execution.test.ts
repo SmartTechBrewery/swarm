@@ -31,7 +31,8 @@ import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
 import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
 
-const OPERATOR_TOKEN = 'operator-token';
+/** The operator credential the assignment factory puts on every built frame. */
+const OPERATOR_CREDENTIAL = 'operator-credential';
 const CONTROL_PLANE = 'https://swarm.example';
 const WORKER_CREDENTIAL = 'raw-worker-credential-secret';
 /** The project id `createMockProjectConfig` carries — every delivery call is scoped to it. */
@@ -107,13 +108,12 @@ function depsWith(
 	};
 }
 
-/** The transport coordinates every run needs: the operator token + this worker's own credential. */
+/** The transport coordinates every run needs — the operator credential rides the frame. */
 /** A resumable session id — UUID-shaped for every CLI (`RecoveryIntentSchema`). */
 const SESSION_UUID = '11111111-1111-4111-8111-111111111111';
 
 const RUN_OPTIONS = {
 	repoRoot: '/worker-local/swarm',
-	operatorToken: OPERATOR_TOKEN,
 	controlPlaneUrl: CONTROL_PLANE,
 	workerCredential: WORKER_CREDENTIAL,
 } as const;
@@ -171,12 +171,13 @@ describe('runAssignmentDbFree', () => {
 			status: 'succeeded',
 			phase: 'respond-to-ci',
 		});
-		// Delivery was built from the reconstructed project's repo + the operator token.
-		expect(buildDelivery).toHaveBeenCalledWith('SmartTechBrewery/swarm', OPERATOR_TOKEN);
-		// The phase received the injected operator-token delivery + agent token, and no
+		// Delivery was built from the reconstructed project's repo + the operator
+		// credential the *frame* carried (issue #765) — never a worker-local env var.
+		expect(buildDelivery).toHaveBeenCalledWith('SmartTechBrewery/swarm', OPERATOR_CREDENTIAL);
+		// The phase received the injected operator delivery + agent token, and no
 		// PM provider — a source-only phase writes to no board.
 		const inputs = runPhase.mock.calls[0][0];
-		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
+		expect(inputs.agentToken).toBe(OPERATOR_CREDENTIAL);
 		expect(inputs.delivery).toBeDefined();
 		expect(inputs.pm).toBeUndefined();
 	});
@@ -206,7 +207,10 @@ describe('runAssignmentDbFree', () => {
 		// Resolved through the registry rather than by importing the GitHub
 		// operator-delivery builder, and handed the neutral `owner/repo` plus the
 		// operator's own credential.
-		expect(operatorDeliveryProvider).toHaveBeenCalledWith('SmartTechBrewery/swarm', OPERATOR_TOKEN);
+		expect(operatorDeliveryProvider).toHaveBeenCalledWith(
+			'SmartTechBrewery/swarm',
+			OPERATOR_CREDENTIAL,
+		);
 		expect(runPhase.mock.calls[0][0].delivery).toBe(operator);
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'respond-to-ci' });
 	});
@@ -227,6 +231,104 @@ describe('runAssignmentDbFree', () => {
 		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
 			/Cannot resolve the SCM provider for project/i,
 		);
+	});
+
+	// Issue #765's version skew case: a router that predates the field pushes a frame
+	// with no credential at all. The run cannot proceed, but it must still *settle* —
+	// every settlement on this path is a frame, and a throw here would leave the
+	// dispatch on the control plane's back-channel timer.
+	it('settles failed when the assignment carries no operator credential', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+		const { operatorCredential: _dropped, ...withoutCredential } = ciAssignment();
+
+		await runAssignmentDbFree(withoutCredential, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase),
+		});
+
+		expect(runPhase).not.toHaveBeenCalled();
+		expect(sink.sent.at(-1)).toMatchObject({ type: 'task-execution-result', status: 'failed' });
+		expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
+			/carried no operator SCM credential/,
+		);
+	});
+
+	// The *invalid* half of the same criterion: a stored credential that no longer
+	// authenticates. The provider's own message names neither the machine nor the
+	// provider ("Could not resolve GitHub identity for the operator token"), so the
+	// seam that knows it is a stored per-worker credential re-frames it.
+	it('names the SCM provider when the stored operator credential does not authenticate', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+		// Driven through the registry rather than the `buildDelivery` override, because
+		// the re-framing wraps the *production* path — the one that knows which provider
+		// rejected.
+		registerSCMProvider({
+			id: 'github',
+			label: 'GitHub',
+			category: 'scm',
+			webhookRoute: '/github/webhook',
+			credentialRoles: [
+				{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER' },
+				{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
+			],
+			provider: {
+				type: 'github',
+				category: 'scm',
+				operatorDeliveryProvider: vi.fn(async () => {
+					throw new Error('Could not resolve GitHub identity for the operator token');
+				}),
+			},
+		} as unknown as SCMProviderManifest);
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWithoutDeliveryOverride(runPhase),
+		});
+
+		expect(runPhase).not.toHaveBeenCalled();
+		const error = String((sink.sent.at(-1) as Record<string, unknown>).error);
+		expect(sink.sent.at(-1)).toMatchObject({ type: 'task-execution-result', status: 'failed' });
+		expect(error).toMatch(/stored operator credential for provider 'github' did not authenticate/);
+		// The provider's own wording is kept as the cause rather than swallowed.
+		expect(error).toMatch(/Could not resolve GitHub identity/);
+	});
+
+	// Identity resolution is a live API call, so a retryable stop can surface at the
+	// same seam. Re-framing that one as "your credential is bad" would turn a deferral
+	// into a terminal failure.
+	it('leaves a deferrable failure from the same seam classified as a deferral', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+		registerSCMProvider({
+			id: 'github',
+			label: 'GitHub',
+			category: 'scm',
+			webhookRoute: '/github/webhook',
+			credentialRoles: [
+				{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER' },
+				{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
+			],
+			provider: {
+				type: 'github',
+				category: 'scm',
+				operatorDeliveryProvider: vi.fn(async () => {
+					throw new AgentRunError('secondary rate limit', { kind: 'rate-limit' });
+				}),
+			},
+		} as unknown as SCMProviderManifest);
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWithoutDeliveryOverride(runPhase),
+		});
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			type: 'task-execution-result',
+			status: 'deferred',
+			failureKind: 'rate-limit',
+		});
 	});
 
 	it('injects the operator delivery into resolve-conflicts too', async () => {
@@ -572,7 +674,7 @@ describe('runAssignmentDbFree', () => {
 		// — the reply is the implementer answering, not the reviewer.
 		const inputs = runPhase.mock.calls[0][0];
 		expect(inputs.delivery).toBe(operator);
-		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
+		expect(inputs.agentToken).toBe(OPERATOR_CREDENTIAL);
 		expect(operator.pushBranch).toHaveBeenCalledWith('/tmp/wt', 'issue-17', 'fixsha');
 		expect(operator.postComment).toHaveBeenCalledTimes(1);
 	});
@@ -655,7 +757,7 @@ describe('runAssignmentDbFree', () => {
 		// the operator, so nothing about it rides the transport.
 		const inputs = runPhase.mock.calls[0][0];
 		expect(inputs.delivery).toBe(operator);
-		expect(inputs.agentToken).toBe(OPERATOR_TOKEN);
+		expect(inputs.agentToken).toBe(OPERATOR_CREDENTIAL);
 	});
 
 	it('reports the produced PR url on the result frame so the control plane can attribute it (issue #398)', async () => {
@@ -910,7 +1012,9 @@ describe('runAssignmentDbFree', () => {
 			inFlight,
 			deps: depsWith(runPhase),
 		});
-		await Promise.resolve();
+		// Wait for the first run to actually reach the phase rather than counting
+		// microtasks — how many the setup takes is an implementation detail.
+		await vi.waitFor(() => expect(runPhase).toHaveBeenCalledTimes(1));
 		await runAssignmentDbFree(frame, sink, {
 			...RUN_OPTIONS,
 			inFlight,

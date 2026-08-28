@@ -73,7 +73,9 @@ services:
       # resolves the PM provider's own credential (issue #537), comment gates key on
       # SWARM's own marker (issue #443), and persona-identity routing (personaForActor)
       # runs worker-side in the trigger handlers. The API server needs none either
-      # since #537 moved board discovery onto the project's PM credential. Note this
+      # since #537 moved board discovery onto the project's PM credential, and since
+      # issue #765 no *worker* reads it at all — a worker's operator identity is
+      # stored per (worker, SCM provider) and resolved at dispatch. Note this
       # is the *operator's own* account and the router holds one value for every
       # worker it serves, so a multi-operator deployment authors every implementer
       # reply under whichever account it names. Never persisted; passed through from

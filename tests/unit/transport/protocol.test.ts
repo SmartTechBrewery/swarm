@@ -530,6 +530,33 @@ describe('transport protocol schemas', () => {
 				expect(parsed.recoveryMode).toBeUndefined();
 			});
 		});
+
+		// The worker operator's own SCM credential (issue #765). Optional on the wire
+		// for the same skew reason as `recoveryMode` above, even though a run cannot
+		// proceed without one: the worker settles a frame carrying none with an
+		// explicit reason, which a rejected frame could not.
+		describe('operatorCredential', () => {
+			it('parses a frame from an older router that carries none', () => {
+				const parsed = TaskAssignmentSchema.parse(VALID_ASSIGNMENT);
+				expect(parsed.operatorCredential).toBeUndefined();
+			});
+
+			it('carries the credential when present', () => {
+				const parsed = TaskAssignmentSchema.parse({
+					...VALID_ASSIGNMENT,
+					operatorCredential: 'op-secret',
+				});
+				expect(parsed.operatorCredential).toBe('op-secret');
+			});
+
+			// An empty string is not "absent": it would reach the provider as a
+			// credential and fail there, losing the attributable reason.
+			it('rejects an empty credential', () => {
+				expect(
+					TaskAssignmentSchema.safeParse({ ...VALID_ASSIGNMENT, operatorCredential: '' }).success,
+				).toBe(false);
+			});
+		});
 	});
 
 	// The TaskExecutionResult settle-context enums (issue #407) are hand-authored

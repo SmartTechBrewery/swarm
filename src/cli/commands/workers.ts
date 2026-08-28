@@ -14,15 +14,18 @@
  * they know rather than raw uuids. The DB pool is closed in a `finally`
  * (`closeDb()`).
  *
- * The one secret it handles is the **worker credential**: `register` prints it
- * exactly once with a "store it now" note (analogous to `swarm users
- * set-password` never echoing a stored secret), and it is never shown again — no
+ * The secrets it handles are both write-only. `register` prints the **worker
+ * credential** exactly once with a "store it now" note (analogous to `swarm users
+ * set-password` never echoing a stored secret), and it is never shown again;
+ * `set-scm-credential` stores the **operator's own SCM credential** for this
+ * machine (issue #765) read without echo, and prints no preview of it. No
  * subcommand prints a credential or its hash.
  *
  * Subcommands:
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
  *   swarm workers list [<owner-identifier>]
  *   swarm workers set-cli <worker-id> --cli <c1,c2,...>
+ *   swarm workers set-scm-credential <worker-id> <scm-provider-id>
  *   swarm workers remove <worker-id>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
@@ -35,6 +38,7 @@ import { closeDb } from '../../db/client.js';
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
 import { findUserByIdentifier, listUsers } from '../../db/repositories/usersRepository.js';
 import { getEnrollment } from '../../db/repositories/workerEnrollmentsRepository.js';
+import { writeWorkerScmCredential } from '../../db/repositories/workerScmCredentialsRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { type AgentCli, AgentCliSchema } from '../../harness/agent-cli.js';
 import type { Worker } from '../../identity/worker.js';
@@ -53,9 +57,18 @@ import {
 	registerWorker,
 	WorkerCapabilityReductionError,
 } from '../../identity/worker-service.js';
+import { SCM_TYPES, type ScmType } from '../../scm/types.js';
 import * as out from '../_shared/output.js';
+import { promptHidden, readStdin } from '../_shared/secret-input.js';
 
 const AGENT_CLIS = AgentCliSchema.options;
+/**
+ * The provider ids `set-scm-credential` accepts. Taken from the closed value list
+ * rather than the SCM registry so validity does not depend on which provider
+ * modules this CLI process happened to import — the same reasoning
+ * `ProjectConfigSchema` applies to `scm`.
+ */
+const SCM_PROVIDER_IDS = SCM_TYPES;
 
 const USAGE = `swarm workers — register and manage local workers (identity + declared CLIs)
 
@@ -63,6 +76,7 @@ Usage:
   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
   swarm workers list [<owner-identifier>]
   swarm workers set-cli <worker-id> --cli <c1,c2,...>
+  swarm workers set-scm-credential <worker-id> <scm-provider-id>
   swarm workers remove <worker-id>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
@@ -77,6 +91,13 @@ Usage:
              owner identifier, only that owner's; without, all owners' (prefixed
              with the owner identifier). Never prints a credential or its hash.
   set-cli    Replace a worker's declared CLIs by worker id.
+  set-scm-credential
+             Store (or rotate) this worker's OPERATOR credential for one SCM
+             provider (${SCM_PROVIDER_IDS.join(' | ')}) — the account every phase
+             it runs against a project on that provider commits, pushes and
+             comments as. Prompts (no echo) on a TTY, otherwise reads the secret
+             from stdin; never takes it as an argument and never prints it back.
+             Takes effect on the next dispatch — no worker restart.
   remove     Deregister a worker by worker id.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
@@ -107,6 +128,7 @@ const SUBCOMMANDS = [
 	'register',
 	'list',
 	'set-cli',
+	'set-scm-credential',
 	'remove',
 	'enroll',
 	'update-enrollment',
@@ -306,6 +328,55 @@ async function setCliCommand(argv: string[]): Promise<number> {
 		}
 		throw err;
 	}
+}
+
+/**
+ * Store (or rotate) a worker's operator SCM credential for one provider — the
+ * write side of the per-`(worker, provider)` store the dispatcher resolves from
+ * (`src/identity/worker-scm-credential.ts`, issue #765).
+ *
+ * Structural validation only: the provider id must be a known one and the worker
+ * must exist (so an unknown id fails with a message rather than an FK violation),
+ * and the secret must be non-empty. Verifying it actually authenticates against the
+ * provider's API is phase 2/3's, with the dashboard form that pastes it.
+ */
+async function setScmCredentialCommand(argv: string[]): Promise<number> {
+	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
+	const [workerId, providerId] = positionals;
+	if (!workerId || !providerId) {
+		out.error('workers set-scm-credential: <worker-id> and <scm-provider-id> are required');
+		out.info(USAGE);
+		return 1;
+	}
+	if (!(SCM_PROVIDER_IDS as readonly string[]).includes(providerId)) {
+		out.error(
+			`invalid SCM provider '${providerId}' — must be one of: ${SCM_PROVIDER_IDS.join(', ')}`,
+		);
+		return 1;
+	}
+
+	const worker = await getWorker(workerId);
+	if (!worker) {
+		out.error(`no worker with id '${workerId}'`);
+		return 1;
+	}
+
+	// Read exactly as `users set-password` does — never from argv, where it would
+	// land in the shell history and in `ps` output.
+	const secret = process.stdin.isTTY
+		? await promptHidden(`Operator ${providerId} credential for '${worker.displayName}': `)
+		: await readStdin();
+	const credential = secret.trim();
+	if (credential.length === 0) {
+		out.error('the credential must not be empty');
+		return 1;
+	}
+
+	await writeWorkerScmCredential(workerId, providerId as ScmType, credential);
+	out.info(
+		`stored operator scm credential for worker '${worker.displayName}' (${workerId}) on provider '${providerId}'`,
+	);
+	return 0;
 }
 
 async function removeWorkerCommand(argv: string[]): Promise<number> {
@@ -590,6 +661,8 @@ export async function run(argv: string[]): Promise<number> {
 				return await listWorkersCommand(rest);
 			case 'set-cli':
 				return await setCliCommand(rest);
+			case 'set-scm-credential':
+				return await setScmCredentialCommand(rest);
 			case 'enroll':
 				return await enrollCommand(rest);
 			case 'update-enrollment':

@@ -10,5 +10,6 @@ export { userIdentities } from './userIdentities.js';
 export { userSessions } from './userSessions.js';
 export { users } from './users.js';
 export { workerProjectEnrollments } from './workerProjectEnrollments.js';
+export { workerScmCredentials } from './workerScmCredentials.js';
 export { workerSessions } from './workerSessions.js';
 export { workers } from './workers.js';
