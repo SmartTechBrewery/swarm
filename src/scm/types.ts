@@ -96,7 +96,8 @@ export type ScmCredentialRole = (typeof SCM_CREDENTIAL_ROLES)[number];
 /**
  * A pull/merge request's read state — everything shared code needs to route a
  * PR-driven phase or judge a conflict candidate, with no provider-native fields.
- * `mergeable` is `null` while the provider is still computing it.
+ * `mergeable` is `null` while the provider is still computing it — and stays
+ * `null` once the pull request closes, which is what `state` is for.
  */
 export interface PullRequestDetails {
 	number: number;
@@ -106,6 +107,15 @@ export interface PullRequestDetails {
 	baseSha: string;
 	mergeable: boolean | null;
 	authorLogin: string | null;
+	/**
+	 * The same neutral `open`/`closed` pair {@link CommitPullRequest.state} carries,
+	 * normalized by each provider from its own vocabulary so a *merged* pull request
+	 * — which GitHub, Bitbucket and GitLab all report as a flavour of closed — can
+	 * never read as open. Load-bearing because `mergeable` never becomes final on a
+	 * closed pull request: this is what tells a mergeability recheck it is polling
+	 * something that is already done (issue #772).
+	 */
+	state: 'open' | 'closed';
 }
 
 /** One CI check on a commit. */

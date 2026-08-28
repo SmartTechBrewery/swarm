@@ -57,6 +57,10 @@ const candidate = {
 	baseSha: 'base456',
 	mergeable: false,
 	authorLogin: 'swarm-impl',
+	// `listConflictCandidates` lists only open pull requests, which is why this
+	// trigger needs no closed-PR guard of its own (issue #772): a candidate that
+	// closes simply drops out of the list on the next recheck.
+	state: 'open' as const,
 };
 
 describe('resolve-conflicts trigger', () => {

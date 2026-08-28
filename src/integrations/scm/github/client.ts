@@ -251,6 +251,11 @@ export async function listOpenPullRequestsForBase(
 			baseSha: data.base.sha,
 			mergeable: data.mergeable,
 			authorLogin: data.user?.login ?? null,
+			// The list above is `state: 'open'`-filtered, but each candidate is then
+			// re-read individually, so report the *read's* state: a candidate that
+			// closed between the list and the read then says so instead of claiming to
+			// be open. Normalized the same way `listPullRequestsForCommit` does below.
+			state: data.state === 'open' ? ('open' as const) : ('closed' as const),
 		}));
 }
 
@@ -299,6 +304,11 @@ export async function getPullRequest(
 		baseSha: data.base.sha,
 		mergeable: data.mergeable,
 		authorLogin: data.user?.login ?? null,
+		// Normalized rather than cast, for the reason `listPullRequestsForCommit`
+		// states above: a merged PR, which GitHub also reports as `closed`, must not
+		// read as open. Load-bearing here because GitHub reports `mergeable: null`
+		// on a closed PR indefinitely (issue #772).
+		state: data.state === 'open' ? ('open' as const) : ('closed' as const),
 	};
 }
 

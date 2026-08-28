@@ -84,8 +84,23 @@ describe('gitlab merge-request reads', () => {
 				baseSha: BASE_SHA,
 				mergeable: true,
 				authorLogin: 'human-dev',
+				state: 'open',
 			});
 			expect(requestedUrl(fetchMock)).toBe(`${GITLAB_API_BASE}${PROJECT_PATH}/merge_requests/17`);
+		});
+
+		// The contract's neutral pair, so a mergeability recheck can see that the merge
+		// request it is polling is already done (issue #772).
+		it.each([
+			'merged',
+			'closed',
+			'locked',
+		])('reports a %s merge request as closed', async (state) => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockGitLabMergeRequestResponse({ state })));
+
+			await expect(scoped(() => getGitLabMergeRequest(REPO, 17))).resolves.toMatchObject({
+				state: 'closed',
+			});
 		});
 
 		it('reports the iid as the number, not the global id', async () => {
@@ -197,6 +212,16 @@ describe('gitlab merge-request reads', () => {
 				);
 			});
 		}
+
+		it('throws rather than defaulting a missing state to either side', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockGitLabMergeRequestResponse({ state: undefined })),
+			);
+
+			await expect(scoped(() => getGitLabMergeRequest(REPO, 17))).rejects.toThrow(
+				/missing required fields/,
+			);
+		});
 
 		it('surfaces a 404 as a GitLabApiError rather than an empty value', async () => {
 			fetchMock.mockResolvedValue(jsonResponse({ message: '404 Not found' }, 404));
@@ -456,6 +481,7 @@ describe('gitlab merge-request reads', () => {
 						baseSha: BASE_SHA,
 						mergeable: false,
 						authorLogin: 'human-dev',
+						state: 'open',
 					},
 				],
 			);
