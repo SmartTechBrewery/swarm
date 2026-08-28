@@ -85,6 +85,7 @@ import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../../harness/agent-cli.js';
 import { describeError } from '../../lib/errors.js';
+import { operatorCredentialCopyFor } from '../../scm/operator-credential-copy.js';
 import { SCM_TYPES } from '../../scm/types.js';
 import {
 	createOperatorClient,
@@ -172,8 +173,9 @@ Usage:
              Store (or rotate) this worker's OPERATOR credential for one SCM
              provider (${SCM_PROVIDER_IDS.join(' | ')}) — the account every phase
              it runs against a project on that provider commits, pushes and
-             comments as. Prompts (no echo) on a TTY, otherwise reads the secret
-             from stdin; never takes it as an argument and never prints it back.
+             comments as. Prompts (no echo) on a TTY, naming the kind of secret
+             that provider expects, otherwise reads the secret from stdin; never
+             takes it as an argument and never prints it back.
              The value is verified against the provider before it is stored, and
              the account it resolved to is named back. Takes effect on the next
              dispatch — no worker restart. The machine's owner alone may do it,
@@ -1016,13 +1018,27 @@ function missingArgument(
  * Read the operator's credential for one provider — never from argv, where it
  * would land in the shell history and in `ps` output. `undefined` (message already
  * printed) for an empty secret.
+ *
+ * The prompt names the **kind** of secret that provider expects (issue #807), from
+ * the same catalogue the dashboard's operator-credential card names it in
+ * (`SCM_OPERATOR_CREDENTIAL_COPY`, `src/scm/operator-credential-copy.ts`), so the
+ * two cannot say different things about one credential. The bare provider id it
+ * used to interpolate left an operator to know, or guess, that GitHub means a
+ * personal access token while Bitbucket means an app password. A provider this
+ * catalogue does not name — the control plane resolves the id through its *own*
+ * registry, so a fourth one can arrive here first — keeps the old wording rather
+ * than being described in GitHub's words.
  */
 async function readOperatorCredential(
 	providerId: string,
 	displayName: string,
 ): Promise<string | undefined> {
+	const copy = operatorCredentialCopyFor(providerId);
+	const credentialType = copy ? ` (${copy.credentialType})` : '';
 	const secret = process.stdin.isTTY
-		? await promptHidden(`Operator ${providerId} credential for '${displayName}': `)
+		? await promptHidden(
+				`Operator ${providerId} credential${credentialType} for '${displayName}': `,
+			)
 		: await readStdin();
 	const credential = secret.trim();
 	if (credential.length === 0) {

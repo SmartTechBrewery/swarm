@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { SCM_OPERATOR_CREDENTIAL_COPY } from '../../../src/scm/operator-credential-copy.js';
 import {
 	DEFAULT_SCM_PROVIDER_ID,
 	getScmProviderCopy,
@@ -201,6 +202,22 @@ describe('per-provider credential copy', () => {
 			for (const noun of FOREIGN_NOUNS[provider.id] ?? []) {
 				expect(labels, `${provider.id} labels use ${noun}`).not.toContain(noun);
 			}
+		}
+	});
+});
+
+/**
+ * The operator credential is the one label here that is *not* hand-kept per screen:
+ * `swarm workers set-scm-credential` names the same secret in its prompt, so both
+ * project off `SCM_OPERATOR_CREDENTIAL_COPY` (issue #807). This is the assertion that
+ * stops a future edit from re-inlining a string here and letting the two drift.
+ */
+describe('getScmProviderCopy — the operator credential label', () => {
+	it('is projected off the shared per-provider catalogue for every provider', () => {
+		for (const provider of SCM_PROVIDERS) {
+			expect(getScmProviderCopy(provider.id).operatorLabel).toBe(
+				SCM_OPERATOR_CREDENTIAL_COPY[provider.id].label,
+			);
 		}
 	});
 });
