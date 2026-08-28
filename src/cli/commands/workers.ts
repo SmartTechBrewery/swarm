@@ -30,7 +30,7 @@
  * Subcommands:
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
  *   swarm workers list [<owner-identifier>]
- *   swarm workers set-cli <worker-id> --cli <c1,c2,...>
+ *   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
  *   swarm workers set-scm-credential <worker-id> <scm-provider-id>
  *   swarm workers remove <worker-id>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
@@ -57,10 +57,11 @@ import {
 	updateEnrollmentConstraints,
 } from '../../identity/worker-enrollment-service.js';
 import {
+	declareWorkerCapabilities,
 	getWorker,
 	listWorkersForOwner,
-	refreshWorkerCapabilities,
 	registerWorker,
+	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } from '../../identity/worker-service.js';
 import { SCM_TYPES, type ScmType } from '../../scm/types.js';
@@ -81,7 +82,7 @@ const USAGE = `swarm workers — register and manage local workers (identity + d
 Usage:
   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
   swarm workers list [<owner-identifier>]
-  swarm workers set-cli <worker-id> --cli <c1,c2,...>
+  swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
   swarm workers set-scm-credential <worker-id> <scm-provider-id>
   swarm workers remove <worker-id>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
@@ -102,7 +103,14 @@ Usage:
   list       List workers ('<id>\\t<displayName>\\t<clis>' per line). With an
              owner identifier, only that owner's; without, all owners' (prefixed
              with the owner identifier). Never prints a credential or its hash.
-  set-cli    Replace a worker's declared CLIs by worker id.
+  set-cli    Declare which CLIs a worker should run (--cli), or hand it back to
+             auto-discovery (--auto); exactly one of the two. The declaration is
+             durable: unlike the CLIs a daemon probes on its own PATH, it survives
+             the machine's next reconnect. It may only narrow what that machine's
+             daemon last reported — naming a CLI it never reported is refused, and
+             installing one is the machine's own business (or declare it there with
+             SWARM_WORKER_TRANSPORT_CLIS). Dropping a CLI an active enrollment
+             requires is refused too. Takes effect on the next dispatch.
   set-scm-credential
              Store (or rotate) this worker's OPERATOR credential for one SCM
              provider (${SCM_PROVIDER_IDS.join(' | ')}) — the account every phase
@@ -311,10 +319,21 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 	return 0;
 }
 
+/**
+ * State the owner's durable CLI **declaration** for a worker, or clear it with
+ * `--auto` (issue #783). It writes through `declareWorkerCapabilities`, not the
+ * probe path a handshake uses, which is what makes the statement survive the
+ * machine's next reconnect — writing the probe column, as this used to, meant the
+ * next handshake silently overwrote it.
+ */
 async function setCliCommand(argv: string[]): Promise<number> {
 	const { values, positionals } = parseArgs({
 		args: argv,
-		options: { cli: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+		options: {
+			cli: { type: 'string' },
+			auto: { type: 'boolean' },
+			help: { type: 'boolean', short: 'h' },
+		},
 		allowPositionals: true,
 	});
 	if (values.help) {
@@ -328,27 +347,47 @@ async function setCliCommand(argv: string[]): Promise<number> {
 		out.info(USAGE);
 		return 1;
 	}
-	if (!values.cli) {
-		out.error('workers set-cli: --cli <c1,c2,...> is required');
+	// Exactly one of the two: `--cli` states a declaration and `--auto` withdraws it,
+	// so accepting both would leave which one won to argument order.
+	if (values.cli && values.auto) {
+		out.error('workers set-cli: --cli and --auto are mutually exclusive');
+		out.info(USAGE);
+		return 1;
+	}
+	if (!values.cli && !values.auto) {
+		out.error('workers set-cli: one of --cli <c1,c2,...> or --auto is required');
 		out.info(USAGE);
 		return 1;
 	}
 
-	const capabilities = parseClis(values.cli);
-	if (!capabilities) return 1;
+	let capabilities: AgentCli[] | null = null;
+	if (values.cli) {
+		const parsed = parseClis(values.cli);
+		if (!parsed) return 1;
+		capabilities = parsed;
+	}
 
 	try {
-		const updated = await refreshWorkerCapabilities(workerId, capabilities);
+		const updated = await declareWorkerCapabilities(workerId, capabilities);
 		if (!updated) {
 			out.error(`no worker with id '${workerId}'`);
 			return 1;
 		}
-		out.info(
-			`set CLIs for worker '${updated.displayName}' (${workerId}) to ${updated.capabilities.join(', ')}`,
-		);
+		if (capabilities === null) {
+			out.info(
+				`cleared the CLI declaration for worker '${updated.displayName}' (${workerId}) — it is back on auto-discovery, currently ${updated.capabilities.join(', ')}`,
+			);
+		} else {
+			out.info(
+				`declared CLIs for worker '${updated.displayName}' (${workerId}) as ${updated.capabilities.join(', ')} — this survives the machine's next reconnect`,
+			);
+		}
 		return 0;
 	} catch (err) {
-		if (err instanceof WorkerCapabilityReductionError) {
+		if (
+			err instanceof WorkerCapabilityReductionError ||
+			err instanceof WorkerCapabilityNotProbedError
+		) {
 			out.error(err.message);
 			return 1;
 		}

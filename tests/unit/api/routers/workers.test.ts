@@ -111,17 +111,22 @@ const OWNER_USER: SwarmUser = {
 const ADMIN_USER: SwarmUser = { ...OWNER_USER, id: OTHER_ID, instanceAdmin: true };
 
 function makeWorker(overrides: Partial<Worker> = {}): Worker {
-	return {
+	const worker: Worker = {
 		id: WORKER_ID,
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
+		// No declaration (issue #783), so the probe is the effective set.
+		probedCapabilities: ['claude'],
+		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,
 	};
+	// Keep the two CLI fields in step when a test overrides only `capabilities`.
+	return { ...worker, probedCapabilities: overrides.probedCapabilities ?? worker.capabilities };
 }
 
 function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnrollment {

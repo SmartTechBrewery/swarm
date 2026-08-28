@@ -28,6 +28,7 @@ import {
 	sql,
 } from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
+import { effectiveCapabilities } from '../../identity/worker.js';
 import { isSessionLive } from '../../identity/worker-session.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import type { TriggerPhase } from '../../triggers/types.js';
@@ -389,7 +390,10 @@ function eligibilityClaimRefusal(
 ): WorkerDispatchClaimRefusal | undefined {
 	if (!worker || !enrollment || enrollment.status !== 'active') return 'missing-enrollment';
 	if (!enrollment.sharingConsent) return 'missing-consent';
-	if (!worker.capabilities.includes(cli) || !enrollment.allowedClis.includes(cli)) {
+	// The row's `capabilities` column is only the daemon's last probe; the gate this
+	// re-checks routes on the *effective* set an owner's declaration resolves to
+	// (issue #783), so this must resolve it the same way rather than read the column.
+	if (!effectiveCapabilities(worker).includes(cli) || !enrollment.allowedClis.includes(cli)) {
 		return 'missing-cli-capability';
 	}
 	return undefined;

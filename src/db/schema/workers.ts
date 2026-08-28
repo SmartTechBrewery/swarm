@@ -12,10 +12,19 @@ import { users } from './users.js';
  * execution environment a user owns.
  *
  * `owner_user_id` is a `users.id` (`uuid`); the FK is `ON DELETE CASCADE`, so a
- * worker vanishes with its owner and never dangles. `capabilities` is the
- * declared set of agent CLIs, persisted as `jsonb` of `AgentCli[]` (the Zod
- * `WorkerCapabilitiesSchema` is the source of truth for the values), matching how
- * `runs.usage` persists a typed jsonb value.
+ * worker vanishes with its owner and never dangles.
+ *
+ * The agent-CLI set lives in **two** columns, deliberately not one (issue #783),
+ * because they record two different facts that used to be collapsed and so
+ * overwrote each other on every reconnect. `capabilities` is *the daemon's last
+ * self-probe* — what the program currently operating this row found on its PATH,
+ * rewritten verbatim at every handshake; `declared_capabilities` is *the owner's
+ * declared intent*, which no handshake touches. Both are `jsonb` of `AgentCli[]`
+ * (the Zod `WorkerCapabilitiesSchema` is the source of truth for the values),
+ * matching how `runs.usage` persists a typed jsonb value. What everything routes
+ * on is neither column alone but the effective set `effectiveCapabilities()`
+ * resolves from the pair (`src/identity/worker.ts`), which `rowToWorker` returns
+ * as `Worker.capabilities`.
  *
  * `credential_hash` is a SHA-256 of the worker credential — **never** the raw
  * token. It is deliberately **not** part of the `Worker` domain read model
@@ -34,8 +43,26 @@ export const workers = pgTable(
 			.notNull()
 			.references(() => users.id, { onDelete: 'cascade' }),
 		displayName: text('display_name').notNull(),
-		/** One of `AgentCliSchema` per element (source of truth in `worker.ts`). */
+		/**
+		 * The agent CLIs the daemon currently operating this row **last probed** on its
+		 * own PATH, one of `AgentCliSchema` per element (source of truth in
+		 * `worker.ts`). Rewritten verbatim at every handshake, so it always describes
+		 * the machine as the daemon last found it — never an operator's intention.
+		 */
 		capabilities: jsonb('capabilities').$type<AgentCli[]>().notNull(),
+		/**
+		 * The agent CLIs this worker's **owner declared** it should run (issue #783) —
+		 * the durable statement the daemon's re-probe must not talk over, which is
+		 * exactly what a single column could not express.
+		 *
+		 * Nullable with no default, and `NULL` is load-bearing: it means "no
+		 * declaration, use auto-discovery", which is what every row written before this
+		 * column existed says and is verbatim the pre-existing behaviour. Nothing is
+		 * backfilled. A non-null value never *widens* past `capabilities` — the
+		 * effective set is the intersection (`effectiveCapabilities`), so a CLI the
+		 * probe proved absent is never dispatched.
+		 */
+		declaredCapabilities: jsonb('declared_capabilities').$type<AgentCli[]>(),
 		/**
 		 * The pipeline phases this worker's daemon declared it can execute (issue
 		 * #467) — the second capability axis alongside `capabilities`, since a

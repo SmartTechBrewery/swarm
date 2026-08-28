@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	DEFAULT_WORKER_SUPPORTED_PHASES,
+	effectiveCapabilities,
 	WorkerCapabilitiesSchema,
+	WorkerCapabilityNotProbedError,
 	WorkerDisplayNameSchema,
 	WorkerSchema,
 	WorkerSupportedPhasesSchema,
@@ -13,6 +15,8 @@ const validWorker = {
 	ownerUserId: '22222222-2222-4222-8222-222222222222',
 	displayName: 'ada-laptop',
 	capabilities: ['claude', 'codex'],
+	probedCapabilities: ['claude', 'codex'],
+	declaredCapabilities: null,
 	supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 	repository: null,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
@@ -114,5 +118,72 @@ describe('WorkerSchema', () => {
 		const parsed = WorkerSchema.parse(validWorker);
 		expect(parsed).not.toHaveProperty('credentialHash');
 		expect(parsed).not.toHaveProperty('credential');
+	});
+});
+
+// Issue #783 — the one definition of the CLI set everything routes on, resolved
+// from the daemon's last probe and the owner's durable declaration.
+describe('effectiveCapabilities', () => {
+	it('is the probe verbatim when nothing has been declared', () => {
+		expect(
+			effectiveCapabilities({ capabilities: ['claude', 'codex'], declaredCapabilities: null }),
+		).toEqual(['claude', 'codex']);
+	});
+
+	it('is the declaration when the probe still reports every declared CLI', () => {
+		expect(
+			effectiveCapabilities({
+				capabilities: ['claude', 'codex', 'antigravity'],
+				declaredCapabilities: ['codex'],
+			}),
+		).toEqual(['codex']);
+	});
+
+	// The durability the split exists for: a re-probe that reports a *wider* set does
+	// not talk the owner's narrower statement back up.
+	it('does not widen a declaration when the probe reports more', () => {
+		expect(
+			effectiveCapabilities({
+				capabilities: ['claude', 'codex'],
+				declaredCapabilities: ['claude'],
+			}),
+		).toEqual(['claude']);
+	});
+
+	// ...and the other half: a CLI the probe proved absent (`ENOENT`, issue #559) is
+	// never dispatched, however firmly it was declared.
+	it('drops a declared CLI the probe no longer reports', () => {
+		expect(
+			effectiveCapabilities({
+				capabilities: ['claude'],
+				declaredCapabilities: ['claude', 'codex'],
+			}),
+		).toEqual(['claude']);
+	});
+
+	it('is empty when the declaration and the probe are disjoint', () => {
+		expect(
+			effectiveCapabilities({ capabilities: ['claude'], declaredCapabilities: ['codex'] }),
+		).toEqual([]);
+	});
+});
+
+describe('WorkerCapabilityNotProbedError', () => {
+	it('names the offending CLIs, the last probe, and how to widen it on the machine', () => {
+		const error = new WorkerCapabilityNotProbedError(
+			'worker-1',
+			['codex'],
+			['claude', 'antigravity'],
+		);
+		expect(error.name).toBe('WorkerCapabilityNotProbedError');
+		expect(error.message).toContain('codex');
+		expect(error.message).toContain('claude, antigravity');
+		expect(error.message).toContain('SWARM_WORKER_TRANSPORT_CLIS');
+	});
+
+	it('reads sensibly for a machine whose daemon reported nothing at all', () => {
+		expect(new WorkerCapabilityNotProbedError('worker-1', ['codex'], []).message).toContain(
+			'(none)',
+		);
 	});
 });

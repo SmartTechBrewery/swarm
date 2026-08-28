@@ -348,8 +348,15 @@ export async function handleHandshake(
 	// that cannot state one — must not leave the previous statement standing for the
 	// later guards to act on. For a row that never carried one that write is a no-op
 	// NULL, i.e. exactly today's behaviour.
+	//
+	// The CLI set written here is only the daemon's *probe* (issue #783). If the row
+	// carries an owner's declaration, that declaration outranks it and is what
+	// dispatch routes on — so this write neither honours nor overwrites the
+	// declaration, and the 409 below now fires on the effective set rather than the
+	// probe alone. Unchanged for a worker with no declaration.
+	let refreshed: Worker | undefined;
 	try {
-		await deps.refreshWorkerCapabilities(
+		refreshed = await deps.refreshWorkerCapabilities(
 			worker.id,
 			request.capabilities,
 			request.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
@@ -368,6 +375,23 @@ export async function handleHandshake(
 			};
 		}
 		throw err;
+	}
+
+	// A declaration the machine no longer backs is silently narrowed away by the
+	// intersection, so this warning is the operator's only signal that it has gone
+	// stale — the CLI is still declared but nothing will be dispatched on it until
+	// the machine reports it again. Guarded on a defined return so a caller (or a
+	// test double) that resolves `undefined` keeps working.
+	const droppedFromDeclaration = refreshed?.declaredCapabilities?.filter(
+		(cli) => !request.capabilities.includes(cli),
+	);
+	if (droppedFromDeclaration && droppedFromDeclaration.length > 0) {
+		logger.warn('worker handshake: a declared CLI is no longer reported by this machine’s probe', {
+			workerId: worker.id,
+			declared: refreshed?.declaredCapabilities,
+			probed: request.capabilities,
+			dropped: droppedFromDeclaration,
+		});
 	}
 
 	// A matching process instance is the same daemon coming back, so its in-flight

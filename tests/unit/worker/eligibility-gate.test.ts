@@ -70,6 +70,9 @@ function makeCandidate(
 			ownerUserId: overrides.ownerUserId ?? ALICE,
 			displayName: `worker-${id}`,
 			capabilities: overrides.capabilities ?? ['claude'],
+			// No declaration (issue #783), so the probe is the effective set.
+			probedCapabilities: overrides.capabilities ?? ['claude'],
+			declaredCapabilities: null,
 			supportedPhases: overrides.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
 			// A single-repository project, which is the regression bar for every case in this
 			// file that says nothing about repositories: the declared checkout always is the

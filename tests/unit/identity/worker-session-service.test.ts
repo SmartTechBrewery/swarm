@@ -46,17 +46,22 @@ const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
 
 function makeWorker(overrides: Partial<Worker> = {}): Worker {
-	return {
+	const worker: Worker = {
 		id: WORKER_ID,
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		// No declaration (issue #783), so the probe is the effective set.
+		probedCapabilities: ['claude'],
+		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
 	};
+	// Keep the two CLI fields in step when a test overrides only `capabilities`.
+	return { ...worker, probedCapabilities: overrides.probedCapabilities ?? worker.capabilities };
 }
 
 function makeSession(overrides: Partial<WorkerSession> = {}): WorkerSession {

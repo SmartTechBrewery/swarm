@@ -36,17 +36,22 @@ const RESOLVED_PAT = 'ghp-reviewer-pat-should-never-leak';
 const BOARD_OPTION_ID = '47fc9ee4';
 
 function makeWorker(overrides: Partial<Worker> = {}): Worker {
-	return {
+	const worker: Worker = {
 		id: WORKER_ID,
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		// No declaration (issue #783), so the probe is the effective set.
+		probedCapabilities: ['claude'],
+		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
 	};
+	// Keep the two CLI fields in step when a test overrides only `capabilities`.
+	return { ...worker, probedCapabilities: overrides.probedCapabilities ?? worker.capabilities };
 }
 
 /** A delivery provider whose metadata ops record their input and return fixed ids. */

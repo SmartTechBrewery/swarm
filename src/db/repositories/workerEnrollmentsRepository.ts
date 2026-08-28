@@ -19,6 +19,7 @@
 import { and, asc, eq, max } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
+import { effectiveCapabilities } from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
 	DEFAULT_ENROLLMENT_ORDER_INDEX,
@@ -87,7 +88,10 @@ export async function createEnrollment(input: CreateEnrollmentInput): Promise<Wo
 			.limit(1);
 
 		if (workerRow) {
-			const capabilitySet = new Set(workerRow.capabilities as AgentCli[]);
+			// The row's own `capabilities` column is only the daemon's last probe; what an
+			// enrollment may allow is the *effective* set the owner's declaration resolves
+			// to (issue #783), which is what dispatch will route on.
+			const capabilitySet = new Set(effectiveCapabilities(workerRow));
 			const offending = input.allowedClis.filter((cli) => !capabilitySet.has(cli));
 			if (offending.length > 0) {
 				throw new AllowedClisNotCapableError(input.workerId, offending);
@@ -278,7 +282,8 @@ export async function updateEnrollmentConstraints(
 			.limit(1);
 
 		if (patch.allowedClis !== undefined && workerRow) {
-			const capabilitySet = new Set(workerRow.capabilities as AgentCli[]);
+			// Again the effective set, not the raw probe column — see `createEnrollment`.
+			const capabilitySet = new Set(effectiveCapabilities(workerRow));
 			const offending = patch.allowedClis.filter((cli) => !capabilitySet.has(cli));
 			if (offending.length > 0) {
 				throw new AllowedClisNotCapableError(workerRow.id, offending);

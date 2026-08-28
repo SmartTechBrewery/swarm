@@ -14,6 +14,7 @@ import {
 	listAllWorkers,
 	listWorkersForOwner,
 	removeWorker,
+	setWorkerDeclaredCapabilities,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
@@ -21,7 +22,10 @@ import {
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
-import { WorkerCapabilityReductionError } from '../../../src/identity/worker.js';
+import {
+	WorkerCapabilityNotProbedError,
+	WorkerCapabilityReductionError,
+} from '../../../src/identity/worker.js';
 import { AllowedClisNotCapableError } from '../../../src/identity/worker-enrollment.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../../src/triggers/types.js';
 import { truncateAll } from '../helpers/db.js';
@@ -499,6 +503,135 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 					expect(workerCapSet.has(cli)).toBe(true);
 				}
 			}
+		});
+	});
+
+	// Issue #783 — the acceptance criteria, at the storage layer: a declaration is the
+	// owner's durable statement, and the probe a handshake writes no longer erases it.
+	describe('setWorkerDeclaredCapabilities', () => {
+		async function seedWorker(capabilities: AgentCli[], hash: string) {
+			return createWorker({
+				ownerUserId: adaId,
+				displayName: `ada-${hash}`,
+				capabilities,
+				credentialHash: hash,
+			});
+		}
+
+		it('survives a handshake that re-probes a different set — the whole point', async () => {
+			const worker = await seedWorker(['claude', 'codex'], 'hash-declare-durable');
+			await setWorkerDeclaredCapabilities(worker.id, ['claude']);
+
+			// The daemon reconnects and reports everything it found, as it always does.
+			const afterHandshake = await updateWorkerCapabilities(worker.id, [
+				'claude',
+				'codex',
+				'antigravity',
+			]);
+
+			// The probe is recorded honestly...
+			expect(afterHandshake?.probedCapabilities).toEqual(['claude', 'codex', 'antigravity']);
+			// ...and the declaration still decides what the worker is routable on.
+			expect(afterHandshake?.capabilities).toEqual(['claude']);
+			expect(afterHandshake?.declaredCapabilities).toEqual(['claude']);
+			expect((await getWorkerById(worker.id))?.capabilities).toEqual(['claude']);
+		});
+
+		it('refuses a declaration naming a CLI this machine has never probed, leaving the row alone', async () => {
+			const worker = await seedWorker(['claude'], 'hash-declare-unprobed');
+
+			await expect(setWorkerDeclaredCapabilities(worker.id, ['claude', 'codex'])).rejects.toThrow(
+				WorkerCapabilityNotProbedError,
+			);
+
+			const rechecked = await getWorkerById(worker.id);
+			expect(rechecked?.declaredCapabilities).toBeNull();
+			expect(rechecked?.capabilities).toEqual(['claude']);
+		});
+
+		it('refuses a declaration dropping a CLI an active enrollment requires, leaving the row alone', async () => {
+			await seedProject({ id: 'proj-declare-drop', repo: 'jkwiecien/declare-drop' });
+			const worker = await seedWorker(['claude', 'codex'], 'hash-declare-drop');
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: 'proj-declare-drop',
+				status: 'active',
+				allowedClis: ['codex'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+
+			await expect(setWorkerDeclaredCapabilities(worker.id, ['claude'])).rejects.toThrow(
+				WorkerCapabilityReductionError,
+			);
+
+			const rechecked = await getWorkerById(worker.id);
+			expect(rechecked?.declaredCapabilities).toBeNull();
+			expect(rechecked?.capabilities).toEqual(['claude', 'codex']);
+		});
+
+		it('clears the declaration with null, making the probe effective again', async () => {
+			const worker = await seedWorker(['claude', 'codex'], 'hash-declare-clear');
+			await setWorkerDeclaredCapabilities(worker.id, ['claude']);
+			expect((await getWorkerById(worker.id))?.capabilities).toEqual(['claude']);
+
+			const cleared = await setWorkerDeclaredCapabilities(worker.id, null);
+
+			expect(cleared?.declaredCapabilities).toBeNull();
+			expect(cleared?.capabilities).toEqual(['claude', 'codex']);
+		});
+
+		// The other half of the rule: a declaration outranks a re-probe, but a CLI the
+		// probe proved absent (`ENOENT`, issue #559) is still never dispatched.
+		it('intersects a declaration with a probe that narrows below it', async () => {
+			const worker = await seedWorker(['claude', 'codex'], 'hash-declare-narrow');
+			await setWorkerDeclaredCapabilities(worker.id, ['claude', 'codex']);
+
+			const afterHandshake = await updateWorkerCapabilities(worker.id, ['claude']);
+
+			expect(afterHandshake?.capabilities).toEqual(['claude']);
+			expect(afterHandshake?.declaredCapabilities).toEqual(['claude', 'codex']);
+		});
+
+		it('409s a narrowing probe only when an enrollment needed the CLI it dropped', async () => {
+			await seedProject({ id: 'proj-declare-409', repo: 'jkwiecien/declare-409' });
+			const worker = await seedWorker(['claude', 'codex'], 'hash-declare-409');
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: 'proj-declare-409',
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+			await setWorkerDeclaredCapabilities(worker.id, ['claude', 'codex']);
+
+			// Dropping `codex`: still effective for `claude`, which is all the enrollment needs.
+			expect((await updateWorkerCapabilities(worker.id, ['claude']))?.capabilities).toEqual([
+				'claude',
+			]);
+			// Dropping `claude` too: nothing effective is left for the enrollment.
+			await expect(updateWorkerCapabilities(worker.id, ['codex'])).rejects.toThrow(
+				WorkerCapabilityReductionError,
+			);
+		});
+
+		it('returns undefined for a missing id', async () => {
+			expect(
+				await setWorkerDeclaredCapabilities('00000000-0000-4000-8000-000000000000', ['claude']),
+			).toBeUndefined();
+		});
+
+		it('reports the raw probe column as probedCapabilities whether or not anything is declared', async () => {
+			const worker = await seedWorker(['claude', 'codex'], 'hash-declare-probed');
+			expect(worker.probedCapabilities).toEqual(['claude', 'codex']);
+			expect(worker.declaredCapabilities).toBeNull();
+
+			const declared = await setWorkerDeclaredCapabilities(worker.id, ['codex']);
+			expect(declared?.probedCapabilities).toEqual(['claude', 'codex']);
+			expect(declared?.capabilities).toEqual(['codex']);
 		});
 	});
 

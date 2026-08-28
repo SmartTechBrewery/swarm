@@ -31,17 +31,22 @@ const SESSION_ID = '33333333-3333-4333-8333-333333333333';
 const CREDENTIAL = 'raw-worker-credential-secret';
 
 function makeWorker(overrides: Partial<Worker> = {}): Worker {
-	return {
+	const worker: Worker = {
 		id: WORKER_ID,
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		// No declaration (issue #783), so the probe is the effective set.
+		probedCapabilities: ['claude'],
+		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
 	};
+	// Keep the two CLI fields in step when a test overrides only `capabilities`.
+	return { ...worker, probedCapabilities: overrides.probedCapabilities ?? worker.capabilities };
 }
 
 function makeAcquired(overrides: Partial<AcquiredSession['session']> = {}): AcquiredSession {
@@ -235,6 +240,54 @@ describe('handleHandshake', () => {
 
 		expect(result.status).toBe(409);
 		expect(deps.suspendEnrollmentsForMismatchedRepository).not.toHaveBeenCalled();
+	});
+
+	// Issue #783 — the handshake still writes the daemon's probe verbatim, and an
+	// owner's declaration is neither honoured nor overwritten here: it outranks the
+	// probe downstream, in the effective set `rowToWorker` resolves.
+	it('warns once when a stored declaration names a CLI this machine no longer probes', async () => {
+		const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			refreshWorkerCapabilities: vi.fn().mockResolvedValue(
+				makeWorker({
+					capabilities: ['claude'],
+					probedCapabilities: ['claude'],
+					declaredCapabilities: ['claude', 'codex'],
+				}),
+			),
+		});
+
+		const result = await handleHandshake(deps, validBody());
+
+		// The stale declaration is a warning, never a refusal — the intersection has
+		// already narrowed it away, so the daemon connects and simply runs less.
+		expect(result.status).toBe(200);
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining('no longer reported'),
+			expect.objectContaining({ workerId: WORKER_ID, dropped: ['codex'] }),
+		);
+		warn.mockRestore();
+	});
+
+	it('warns about no drift when the probe still reports every declared CLI', async () => {
+		const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			refreshWorkerCapabilities: vi
+				.fn()
+				.mockResolvedValue(makeWorker({ declaredCapabilities: ['claude'] })),
+		});
+
+		expect((await handleHandshake(deps, validBody())).status).toBe(200);
+		expect(warn).not.toHaveBeenCalled();
+		warn.mockRestore();
+	});
+
+	// The dependency's contract allows `undefined` (an unknown worker id), and existing
+	// callers/doubles resolve it — the drift check must not turn that into a crash.
+	it('completes the handshake when the capability refresh resolves undefined', async () => {
+		const deps = makeDeps({ refreshWorkerCapabilities: vi.fn().mockResolvedValue(undefined) });
+
+		expect((await handleHandshake(deps, validBody())).status).toBe(200);
 	});
 
 	it('rejects a malformed repository with 400, before touching the lease', async () => {

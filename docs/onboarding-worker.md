@@ -53,10 +53,18 @@ Notes:
 
 - `--cli` is a comma-separated subset of `claude,antigravity,codex` — **only
   list what's actually installed and authenticated on the target machine.**
-  `workers register` records the worker's *capabilities*; `workers enroll`'s own
-  `--cli` is the (possibly narrower) set allowed for *this* project. Mismatch
+  `workers register` seeds the worker's *probe* baseline, which the daemon then
+  re-declares from the machine's own PATH on every reconnect; `workers enroll`'s
+  own `--cli` is the (possibly narrower) set allowed for *this* project. Mismatch
   here just means the CLI it can't run never gets dispatched work — not a hard
   error — but there's no reason to overclaim.
+- `swarm workers set-cli <worker-id> --cli <c1,c2,...>` states a **durable
+  declaration** of which CLIs the machine should run (issue #783). Unlike the
+  probe, it survives the machine's next reconnect, and it is what dispatch routes
+  on. It may only *narrow* what the machine's daemon last reported — to widen
+  that, install the CLI there (or set `SWARM_WORKER_TRANSPORT_CLIS` on the machine
+  itself). `swarm workers set-cli <worker-id> --auto` clears the declaration and
+  returns the worker to plain auto-discovery.
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
   it again). Copy it immediately; if you lose it, `workers remove` +
   `workers register` again is the only recovery.
