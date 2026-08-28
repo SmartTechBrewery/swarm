@@ -64,8 +64,33 @@ describe('bitbucket pull-request reads', () => {
 				baseSha: 'ce5965ddd289',
 				mergeable: null,
 				authorLogin: 'human-dev',
+				state: 'open',
 			});
 			expect(requestedUrl(fetchMock)).toBe(`${REPO_PATH}/pullrequests/17`);
+		});
+
+		// The contract's neutral pair, so a mergeability recheck can see that the pull
+		// request it is polling is already done (issue #772).
+		it.each([
+			'MERGED',
+			'DECLINED',
+			'SUPERSEDED',
+		])('reports a %s pull request as closed', async (state) => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockBitbucketPullRequestResponse({ state })));
+
+			await expect(
+				scoped(() => getBitbucketPullRequest(WORKSPACE, SLUG, 17)),
+			).resolves.toMatchObject({ state: 'closed' });
+		});
+
+		it('throws rather than defaulting a missing state to either side', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockBitbucketPullRequestResponse({ state: undefined })),
+			);
+
+			await expect(scoped(() => getBitbucketPullRequest(WORKSPACE, SLUG, 17))).rejects.toThrow(
+				/missing required fields/,
+			);
 		});
 
 		it('reports mergeable as null — Bitbucket Cloud exposes no mergeability flag', async () => {

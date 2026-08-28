@@ -238,7 +238,9 @@ function toMergeable(mr: GitLabMergeRequest): boolean | null {
  * `headSha`/`baseSha` become part of that exact-match claim key, so a stand-in would
  * key a conflict claim on the wrong commit instead of failing. A merge request whose
  * `diff_refs` GitLab has not populated yet — it lands asynchronously after creation —
- * is one of the cases that throws.
+ * is one of the cases that throws. `state` refuses for its own reason: neither
+ * default is safe, since `closed` would silently skip a legitimate review and `open`
+ * would resume the recheck loop issue #772 removed.
  */
 function toPullRequestDetails(mr: GitLabMergeRequest): PullRequestDetails {
 	const number = mr.iid;
@@ -246,9 +248,9 @@ function toPullRequestDetails(mr: GitLabMergeRequest): PullRequestDetails {
 	const headSha = mr.sha;
 	const baseBranch = mr.target_branch;
 	const baseSha = mr.diff_refs?.base_sha;
-	if (number === undefined || !headBranch || !headSha || !baseBranch || !baseSha) {
+	if (number === undefined || !headBranch || !headSha || !baseBranch || !baseSha || !mr.state) {
 		throw new Error(
-			`GitLab merge-request response is missing required fields (iid=${number}, source=${headBranch}@${headSha}, target=${baseBranch}@${baseSha})`,
+			`GitLab merge-request response is missing required fields (iid=${number}, state=${mr.state}, source=${headBranch}@${headSha}, target=${baseBranch}@${baseSha})`,
 		);
 	}
 	return {
@@ -259,6 +261,9 @@ function toPullRequestDetails(mr: GitLabMergeRequest): PullRequestDetails {
 		baseSha,
 		mergeable: toMergeable(mr),
 		authorLogin: mr.author?.username ?? null,
+		// `opened` | `closed` | `locked` | `merged` collapsed onto the contract's
+		// neutral pair, the same mapping `getGitLabMergeRequestMergeState` applies.
+		state: mr.state === 'opened' ? ('open' as const) : ('closed' as const),
 	};
 }
 

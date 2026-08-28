@@ -69,6 +69,14 @@
  * carries `recheckAttempt` through untouched, and a defer that *did* get an
  * answer clears the read-failure count.
  *
+ * **A closed pull request stops a chain before either budget is touched**
+ * (issue #772). The mergeability gate reads `PullRequestDetails.state` and skips
+ * outright once the PR is closed or merged, because no provider reports a final
+ * `mergeable` for one — so a chain still in flight when the PR merges would
+ * otherwise poll to its cap and record a give-up for work that already finished.
+ * That is a plain skip, not an abandonment: the give-up records below exist for a
+ * provider that failed to answer, not for a question that stopped mattering.
+ *
  * **Exhausting either budget leaves a durable trace** (issue #742). Whichever
  * path gives up — mergeability or aggregate-check — writes one `failed` Review
  * run to SWARM's own Postgres naming the PR, head SHA, exhausted budget,
@@ -790,6 +798,25 @@ async function checkMergeabilityAndConflicts(
 
 	if (!prDetails) {
 		logger.debug('review: PR details not found — skipping', { prNumber });
+		return null;
+	}
+
+	// A closed (or merged) pull request is done, and no provider ever reports a
+	// final `mergeable` for one — so a recheck chain that reaches this point can
+	// never converge (issue #772: a stray `checks` chain on PR #768 polled a PR
+	// merged 16 minutes earlier until its 20-attempt cap wrote a spurious `failed`
+	// run). Not an error and not a budget exhaustion: the work this dispatch
+	// existed for already happened, so it is a plain skip with no durable trace
+	// and no give-up comment. Placed before the ownership gate so it covers every
+	// entry point — both `pull-request` and `checks` chains, the synthetic
+	// follow-up Review, and the ownership gate's own `read-failed` recheck — and
+	// costs no DB read or aggregate checks-API query.
+	if (prDetails.state === 'closed') {
+		logger.debug('review: PR is already closed — nothing left to review', {
+			prNumber,
+			headSha,
+			eventKind: event.kind,
+		});
 		return null;
 	}
 

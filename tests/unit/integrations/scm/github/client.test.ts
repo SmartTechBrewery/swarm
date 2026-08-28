@@ -36,6 +36,7 @@ vi.mock('@octokit/rest', () => ({
 import {
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
+	getPullRequest,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getScopedClient,
@@ -181,6 +182,46 @@ describe('github client', () => {
 			await expect(
 				withGitHubToken('tok', () => listPullRequestsForCommit('jkwiecien', 'swarm', 'deadbeef')),
 			).resolves.toEqual([]);
+		});
+	});
+
+	describe('getPullRequest', () => {
+		const pullData = (overrides: Record<string, unknown> = {}) => ({
+			number: 42,
+			state: 'open',
+			mergeable: true,
+			head: { ref: 'issue-42', sha: 'head-sha' },
+			base: { ref: 'main', sha: 'base-sha' },
+			user: { login: 'operator-human' },
+			...overrides,
+		});
+
+		it("maps the pull request onto the contract's neutral shape", async () => {
+			pullsGet.mockResolvedValue({ data: pullData() });
+
+			await expect(
+				withGitHubToken('tok', () => getPullRequest('jkwiecien', 'swarm', 42)),
+			).resolves.toEqual({
+				number: 42,
+				headBranch: 'issue-42',
+				headSha: 'head-sha',
+				baseBranch: 'main',
+				baseSha: 'base-sha',
+				mergeable: true,
+				authorLogin: 'operator-human',
+				state: 'open',
+			});
+			expect(pullsGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm', pull_number: 42 });
+		});
+
+		// A merged PR is `closed` with a permanently unknown `mergeable`, which is
+		// exactly the pair the mergeability recheck reads to stop polling (issue #772).
+		it('reports a merged pull request as closed rather than open', async () => {
+			pullsGet.mockResolvedValue({ data: pullData({ state: 'closed', mergeable: null }) });
+
+			await expect(
+				withGitHubToken('tok', () => getPullRequest('jkwiecien', 'swarm', 42)),
+			).resolves.toMatchObject({ state: 'closed', mergeable: null });
 		});
 	});
 

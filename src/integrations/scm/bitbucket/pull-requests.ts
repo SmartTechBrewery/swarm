@@ -146,6 +146,11 @@ function getPullRequestObject(
  * string: `headSha`/`baseSha` become part of an exact-match claim key
  * (`buildConflictResolutionKey`, `src/triggers/resolve-conflicts-dedup.ts`), so a
  * stand-in would key a conflict claim on the wrong commit instead of failing.
+ * `state` is treated the same way — and deliberately, since neither default is
+ * safe: read as `closed` it would silently skip a legitimate review, read as
+ * `open` it would resume the recheck loop issue #772 removed.
+ * {@link listBitbucketPullRequestsForCommit} already refuses a missing `state`
+ * for the same reason.
  */
 function toPullRequestDetails(pr: BitbucketPullRequest): PullRequestDetails {
 	const number = pr.id;
@@ -153,9 +158,9 @@ function toPullRequestDetails(pr: BitbucketPullRequest): PullRequestDetails {
 	const headSha = pr.source?.commit?.hash;
 	const baseBranch = pr.destination?.branch?.name;
 	const baseSha = pr.destination?.commit?.hash;
-	if (number === undefined || !headBranch || !headSha || !baseBranch || !baseSha) {
+	if (number === undefined || !headBranch || !headSha || !baseBranch || !baseSha || !pr.state) {
 		throw new Error(
-			`Bitbucket pull-request response is missing required fields (id=${number}, source=${headBranch}@${headSha}, destination=${baseBranch}@${baseSha})`,
+			`Bitbucket pull-request response is missing required fields (id=${number}, state=${pr.state}, source=${headBranch}@${headSha}, destination=${baseBranch}@${baseSha})`,
 		);
 	}
 	return {
@@ -174,6 +179,9 @@ function toPullRequestDetails(pr: BitbucketPullRequest): PullRequestDetails {
 		// being mislabelled as cleanly mergeable.
 		mergeable: null,
 		authorLogin: pr.author?.nickname ?? null,
+		// `OPEN` | `MERGED` | `DECLINED` | `SUPERSEDED` collapsed onto the contract's
+		// neutral pair, the same mapping `getBitbucketPullRequestMergeState` applies.
+		state: pr.state === 'OPEN' ? ('open' as const) : ('closed' as const),
 	};
 }
 

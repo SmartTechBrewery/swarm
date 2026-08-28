@@ -264,6 +264,7 @@ describe('BitbucketSCMIntegration', () => {
 			baseSha: 'ce5965ddd289',
 			mergeable: null,
 			authorLogin: 'human-dev',
+			state: 'open',
 		};
 
 		beforeEach(() => {

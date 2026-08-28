@@ -144,6 +144,7 @@ beforeEach(() => {
 		baseSha: 'base-sha-123',
 		mergeable: true,
 		authorLogin: 'operator-human',
+		state: 'open',
 	});
 	commentOnPullRequest.mockReset();
 });
@@ -264,6 +265,7 @@ describe('review trigger', () => {
 				baseSha: 'base-sha-123',
 				mergeable: true,
 				authorLogin: 'a-human',
+				state: 'open',
 			});
 			const result = await handler.handle(ctx({ ...base, headSha: 'abc', isCrossRepo: false }));
 			expect(result).toBeNull();
@@ -424,6 +426,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: true,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
 			expect(result).toBeNull();
@@ -446,6 +449,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: true,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 			const result = await handler.handle(ctx({ ...base, headSha: 'cafe' }));
 			expect(result).toBeNull();
@@ -800,6 +804,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: false,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 
 			const result = await handler.handle(ctx(synchronized));
@@ -824,6 +829,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: true,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 
 			const result = await handler.handle(ctx(synchronized));
@@ -839,6 +845,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: null,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 
 			const result = await handler.handle(ctx(synchronized));
@@ -865,6 +872,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: null,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 
 			await handler.handle(
@@ -901,6 +909,7 @@ describe('review trigger', () => {
 				baseSha: 'base123',
 				mergeable: null,
 				authorLogin: 'operator-human',
+				state: 'open',
 			});
 
 			const result = await handler.handle(ctx(synchronized, { recheckAttempt: 20 }));
@@ -910,6 +919,129 @@ describe('review trigger', () => {
 				expect.any(Object),
 				42,
 				expect.stringContaining('SWARM conflict check needs attention'),
+			);
+		});
+	});
+
+	/**
+	 * A recheck chain still in flight when its PR closes (issue #772).
+	 *
+	 * `mergeable` never becomes final on a closed pull request, so before this
+	 * guard such a chain polled every 30s until its 20-attempt cap and then wrote a
+	 * `failed` run — observed on PR #768, whose stray `checks` chain kept polling
+	 * for ~16 minutes after the PR had already been reviewed, approved and merged.
+	 * A closed PR is a plain skip: nothing left to review, and nothing went wrong.
+	 */
+	describe('handle — a closed pull request stops the chain (issue #772)', () => {
+		/** The merged PR the chain is unknowingly polling. */
+		const closedPr = {
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'closed',
+		};
+
+		const entryPoints = [
+			['a completed checks event', { kind: 'checks', action: 'completed' }],
+			['a PR updated event', { kind: 'pull-request', action: 'updated' }],
+			['a PR opened event', { kind: 'pull-request', action: 'opened' }],
+		] as const;
+
+		it.each(entryPoints)('skips without rescheduling on %s', async (_label, event) => {
+			getPullRequest.mockResolvedValue(closedPr);
+
+			const result = await handler.handle(
+				ctx({
+					...event,
+					workItemId: '42',
+					headSha: 'abc123',
+					prBranch: 'issue-42',
+					isDraft: false,
+					isCrossRepo: false,
+				}),
+			);
+
+			expect(result).toBeNull();
+			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+			expect(createFailedRun).not.toHaveBeenCalled();
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
+		});
+
+		// The PR #768 outcome exactly: at the cap, the give-up path would otherwise
+		// write the durable `failed` run and the give-up comment.
+		it('records no abandonment even at the state-pending cap', async () => {
+			getPullRequest.mockResolvedValue(closedPr);
+
+			const result = await handler.handle(
+				ctx(
+					{ kind: 'checks', action: 'completed', workItemId: '42', headSha: 'abc123' },
+					{ recheckAttempt: 20 },
+				),
+			);
+
+			expect(result).toBeNull();
+			expect(createFailedRun).not.toHaveBeenCalled();
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
+		});
+
+		// The guard precedes the ownership gate's DB read and the `checks` path's
+		// aggregate checks-API query, so a closed PR costs neither.
+		it('skips before the ownership gate and the aggregate check query', async () => {
+			getPullRequest.mockResolvedValue(closedPr);
+
+			await handler.handle(
+				ctx({ kind: 'checks', action: 'completed', workItemId: '42', headSha: 'abc123' }),
+			);
+
+			expect(hasRunForTask).not.toHaveBeenCalled();
+			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+		});
+
+		// It also precedes `handleConflictingPullRequest`, so a PR that closed while
+		// reporting a conflict does not dispatch Resolve-conflicts against it.
+		it('does not dispatch Resolve-conflicts for a closed PR reporting a conflict', async () => {
+			getPullRequest.mockResolvedValue({ ...closedPr, mergeable: false });
+
+			const result = await handler.handle(
+				ctx({
+					kind: 'pull-request',
+					action: 'updated',
+					workItemId: '42',
+					headSha: 'abc123',
+					isDraft: false,
+					isCrossRepo: false,
+				}),
+			);
+
+			expect(result).toBeNull();
+			expect(claimConflictResolution).not.toHaveBeenCalled();
+		});
+
+		// Issue #720's budgets are untouched for a PR that is genuinely still open
+		// and slow to report `mergeable`.
+		it('still spends the state-pending budget while the PR is open', async () => {
+			getPullRequest.mockResolvedValue({ ...closedPr, state: 'open' });
+
+			const result = await handler.handle(
+				ctx({
+					kind: 'pull-request',
+					action: 'updated',
+					workItemId: '42',
+					headSha: 'abc123',
+					isDraft: false,
+					isCrossRepo: false,
+				}),
+			);
+
+			expect(result).toBeNull();
+			expect(scheduleCoalescedJob).toHaveBeenCalledWith(
+				expect.objectContaining({ recheckAttempt: 1 }),
+				'review-mergeability:SmartTechBrewery/swarm:42:abc123:pull-request',
+				30000,
 			);
 		});
 	});
@@ -1010,6 +1142,7 @@ describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)
 			baseSha: 'base123',
 			mergeable: null,
 			authorLogin: 'operator-human',
+			state: 'open',
 		});
 
 		expect(await handler.handle(ctx(updated, { readFailureRecheckAttempt: 4 }))).toBeNull();
@@ -1065,6 +1198,7 @@ describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)
 			baseSha: 'base123',
 			mergeable: null,
 			authorLogin: 'operator-human',
+			state: 'open',
 		});
 
 		expect(await handler.handle(ctx(updated, { recheckAttempt: 20 }))).toBeNull();
@@ -1103,6 +1237,7 @@ describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)
 			baseSha: 'base123',
 			mergeable: true,
 			authorLogin: 'operator-human',
+			state: 'open',
 		});
 		getAggregateCheckStatus.mockResolvedValue(checkStatus([['build', 'completed', 'success']]));
 
