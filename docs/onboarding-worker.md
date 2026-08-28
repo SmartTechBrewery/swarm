@@ -24,10 +24,44 @@ admin machine itself — and needs nothing but the credential Part 1 prints.
 
 ## Part 1 — admin machine: register the user + worker
 
-For a **single-user install**, skip steps 1 and 2 and run steps 3 and 4 with
-`localhost-admin` as `<email>`: that is the bootstrapped account the API resolves
-every request to (created the first time it serves one), and being an
-installation admin it needs no project membership of its own.
+For a **single-user install**, skip the user and membership steps and pass
+`localhost-admin` as `<email>` (in either path below): that is the bootstrapped
+account the API resolves every request to (created the first time it serves one),
+and being an installation admin it needs no project membership of its own.
+
+### The one-command path (recommended)
+
+After the user exists and belongs to the project (steps 1–2 below), one command
+replaces steps 3–5 (issue #786):
+
+```bash
+npm run swarm -- workers register-and-enroll <email> swarm --name "<Display Name>" --cli <clis>
+```
+
+It registers the worker, prompts **once** (no echo; pipe the secret on stdin to
+script it) for the operator source-control credential of whichever provider the
+target project runs on, enrolls the machine in that project `active` with sharing
+consent on — and prints, as its **last** line, the exact command to start the
+daemon:
+
+```
+swarm: SWARM_WORKER_CREDENTIAL=<credential> SWARM_WORKER_REPO_ROOT=<checkout> npm run dev:worker
+```
+
+That is the whole hand-off: **it does not start the worker** — Part 2 is where
+that line is run, on the machine itself, with `SWARM_CONTROL_PLANE_URL` already in
+its `.env`. The printed `SWARM_WORKER_REPO_ROOT` is the *project's* configured
+checkout, so a different machine substitutes its own path (or pass `--repo-root
+<path>` to have the right one printed). The worker credential appears in that one
+line and nowhere else, so copy it before the terminal scrolls. Every refusal the
+three commands it replaces produce still applies, unchanged — see
+[`docs/cli.md`](./cli.md#swarm-workers).
+
+### The composable path (scriptable alternative)
+
+The same work, one command per step. Keep using these to script the steps
+separately, to enroll an **already-registered** worker into another project, or to
+rotate a credential — `register-and-enroll` covers the new-machine case only.
 
 ```bash
 # 1. Create the user and set their dashboard login password
@@ -80,7 +114,11 @@ Notes:
   dispatch only ever selects a worker that is both enrolled **and currently
   connected** (`isWorkerConnected`) — an enrolled-but-disconnected worker just
   can't be picked, so there's no window where work gets routed to a machine
-  that isn't there yet.
+  that isn't there yet. **`register-and-enroll` creates exactly this form** and
+  offers no flag to opt out, so this note covers it too: a pending,
+  non-consenting enrollment is not "ready to start", which is what that command
+  exists to deliver. Use the five commands above when you want the two approvals
+  kept as separate human decisions.
 - **Enroll the machine in a project for the repository its checkout actually is.**
   Step 4 is refused (naming both repositories) when the worker has already declared
   a checkout of a different one — a worker holds a single checkout, so work for any

@@ -27,8 +27,17 @@
  * provider — exactly the GitHub assumption `ai/RULES.md` §2 keeps out of the SCM
  * layer. It therefore gains no token flag and no prompt of any kind.
  *
+ * `register-and-enroll` (issue #786) is the recommended path for a *new* machine
+ * and the third write surface onto that per-`(worker, provider)` store: it
+ * composes `register` + `set-scm-credential` + `enroll` and ends with the exact
+ * command that starts the daemon. It may prompt where `register` may not,
+ * precisely because it is handed the target project and therefore *resolves* the
+ * provider (`requireProjectSCMProviderId`) instead of guessing one — the
+ * condition #767 recorded as missing at registration time.
+ *
  * Subcommands:
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
+ *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
  *   swarm workers list [<owner-identifier>]
  *   swarm workers set-cli <worker-id> --cli <c1,c2,...>
  *   swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -63,6 +72,10 @@ import {
 	registerWorker,
 	WorkerCapabilityReductionError,
 } from '../../identity/worker-service.js';
+// The SCM manifests must be registered before `requireProjectSCMProviderId` can
+// resolve the provider a project runs on (register-and-enroll).
+import '../../integrations/entrypoint.js';
+import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
 import { SCM_TYPES, type ScmType } from '../../scm/types.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
@@ -80,6 +93,7 @@ const USAGE = `swarm workers — register and manage local workers (identity + d
 
 Usage:
   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
+  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
   swarm workers list [<owner-identifier>]
   swarm workers set-cli <worker-id> --cli <c1,c2,...>
   swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -99,6 +113,21 @@ Usage:
              "Operator source-control credential"; for someone else's machine,
              run set-scm-credential below. This command asks for no token of any
              kind — the provider is not known at registration time.
+  register-and-enroll
+             The one-command path for a NEW machine: registers the worker,
+             stores its operator source-control credential, and enrolls it in
+             <project-id> — then prints the exact command that starts it. The
+             provider is resolved from the target project, so the credential
+             prompt names the provider that project actually runs on
+             (${SCM_PROVIDER_IDS.join(' | ')}); prompts without echo on a TTY and
+             otherwise reads the secret from stdin, and never prints it back.
+             The enrollment is created active with sharing consent on, so the
+             machine is routable as soon as it connects. It does NOT start the
+             worker: the daemon is a foreground, operator-owned process, so the
+             final line is a command to run on that machine yourself. The
+             printed SWARM_WORKER_REPO_ROOT is the project's configured checkout
+             unless --repo-root names the one on the target machine. The worker
+             credential is shown ONCE, in that final line.
   list       List workers ('<id>\\t<displayName>\\t<clis>' per line). With an
              owner identifier, only that owner's; without, all owners' (prefixed
              with the owner identifier). Never prints a credential or its hash.
@@ -138,6 +167,7 @@ active AND sharing consent is on.`;
 
 const SUBCOMMANDS = [
 	'register',
+	'register-and-enroll',
 	'list',
 	'set-cli',
 	'set-scm-credential',
@@ -552,6 +582,226 @@ async function enrollCommand(argv: string[]): Promise<number> {
 	);
 }
 
+/** Everything `register-and-enroll` resolves before it writes anything. */
+interface RegisterAndEnrollPlan {
+	readonly identifier: string;
+	readonly ownerUserId: string;
+	readonly projectId: string;
+	readonly displayName: string;
+	readonly capabilities: AgentCli[];
+	/** The provider the target project runs on — never assumed. */
+	readonly providerId: ScmType;
+	readonly operatorCredential: string;
+	/** The checkout to print in the start command: `--repo-root`, else the project's. */
+	readonly repoRoot: string;
+}
+
+/**
+ * Parse and resolve `register-and-enroll`'s whole input — arguments, owner,
+ * project, the project's SCM provider, and the operator's secret — printing the
+ * message and returning an exit code itself when any of it fails.
+ *
+ * Split out because the *ordering* is the design (see the command below): nothing
+ * here has written anything, so every one of these failures leaves no worker row
+ * and no half-configured machine behind.
+ */
+async function planRegisterAndEnroll(
+	argv: string[],
+): Promise<{ ok: true; plan: RegisterAndEnrollPlan } | { ok: false; code: number }> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		options: {
+			name: { type: 'string' },
+			cli: { type: 'string' },
+			'repo-root': { type: 'string' },
+			help: { type: 'boolean', short: 'h' },
+		},
+		allowPositionals: true,
+	});
+	if (values.help) {
+		out.info(USAGE);
+		return { ok: false, code: 0 };
+	}
+
+	const [identifier, projectId] = positionals;
+	const { name, cli } = values;
+	if (!identifier || !projectId || !name || !cli) {
+		out.error(`workers register-and-enroll: ${missingArgument(identifier, projectId, name)}`);
+		out.info(USAGE);
+		return { ok: false, code: 1 };
+	}
+
+	const capabilities = parseClis(cli);
+	if (!capabilities) return { ok: false, code: 1 };
+
+	const owner = await findUserByIdentifier(identifier);
+	if (!owner) {
+		out.error(`no user with identifier '${identifier}'`);
+		return { ok: false, code: 1 };
+	}
+	const project = await findProjectByIdFromDb(projectId);
+	if (!project) {
+		out.error(`no project with id '${projectId}'`);
+		return { ok: false, code: 1 };
+	}
+
+	// The provider is a property of the *project*, resolved through the same lookup
+	// the dispatcher uses so the credential is stored under the id a dispatch will
+	// ask for. Its three throws already name the project and what it asked for.
+	let providerId: ScmType;
+	try {
+		providerId = requireProjectSCMProviderId(project);
+	} catch (err) {
+		out.error(err instanceof Error ? err.message : String(err));
+		return { ok: false, code: 1 };
+	}
+
+	const operatorCredential = await readOperatorCredential(providerId, name);
+	if (!operatorCredential) return { ok: false, code: 1 };
+
+	return {
+		ok: true,
+		plan: {
+			identifier,
+			ownerUserId: owner.id,
+			projectId,
+			displayName: name,
+			capabilities,
+			providerId,
+			operatorCredential,
+			repoRoot: values['repo-root'] ?? project.repoRoot,
+		},
+	};
+}
+
+/**
+ * Which required argument `register-and-enroll` is missing, in the order it reads
+ * them — so `--cli` is what is left once the other three are present.
+ */
+function missingArgument(
+	identifier: string | undefined,
+	projectId: string | undefined,
+	name: string | undefined,
+): string {
+	if (!identifier || !projectId) return 'an <owner-identifier> and a <project-id> are required';
+	if (!name) return '--name <displayName> is required';
+	return '--cli <c1,c2,...> is required';
+}
+
+/**
+ * Read the operator's credential for one provider exactly as `set-scm-credential`
+ * does — never from argv, where it would land in the shell history and in `ps`
+ * output. `undefined` (message already printed) for an empty secret.
+ */
+async function readOperatorCredential(
+	providerId: ScmType,
+	displayName: string,
+): Promise<string | undefined> {
+	const secret = process.stdin.isTTY
+		? await promptHidden(`Operator ${providerId} credential for '${displayName}': `)
+		: await readStdin();
+	const credential = secret.trim();
+	if (credential.length === 0) {
+		out.error('the credential must not be empty');
+		return undefined;
+	}
+	return credential;
+}
+
+/**
+ * `register-and-enroll` — the one command that takes an operator from "no worker"
+ * to "registered, credentialed, enrolled, and here is what starts it" (issue #786).
+ *
+ * It adds no business logic: `registerWorker`, `writeWorkerScmCredential` and
+ * `performEnroll` are the same calls `register` / `set-scm-credential` / `enroll`
+ * make, with the same refusals. What it does add is **ordering** — everything that
+ * can fail without writing anything (the CLI list, the owner, the project, the
+ * project's SCM provider, an empty or aborted secret) is checked *before*
+ * `registerWorker` by `planRegisterAndEnroll`, so a mistyped argument never leaves
+ * an orphaned worker behind.
+ *
+ * It also prompts for a secret where `register` deliberately does not (issue #767).
+ * That is not a reversal: `register` has no project and so would have to *guess* a
+ * provider, while this command is handed one and resolves it through
+ * `requireProjectSCMProviderId` — never `project.scm ?? 'github'`.
+ *
+ * It does not start the daemon. That stays a foreground, operator-owned process on
+ * the worker's own machine, so the last thing printed is the command to run there.
+ */
+async function registerAndEnrollCommand(argv: string[]): Promise<number> {
+	const planned = await planRegisterAndEnroll(argv);
+	if (!planned.ok) return planned.code;
+	const {
+		identifier,
+		ownerUserId,
+		projectId,
+		displayName,
+		capabilities,
+		providerId,
+		operatorCredential,
+		repoRoot,
+	} = planned.plan;
+
+	let worker: Worker;
+	let credential: string;
+	try {
+		({ worker, credential } = await registerWorker({ ownerUserId, displayName, capabilities }));
+	} catch (err) {
+		if (isUniqueViolation(err)) {
+			out.error(`a worker named '${displayName}' already exists for '${identifier}'`);
+			return 1;
+		}
+		throw err;
+	}
+	out.info(
+		`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
+	);
+
+	// From here the worker row exists and its credential is a one-time value held
+	// only in memory, so a later failure must still hand it over — losing it means
+	// `workers remove` + `workers register` again. Each recovery path names only the
+	// step that did not complete, and prints the credential exactly once, last.
+	const reportUnfinished = (remaining: string[]): number => {
+		out.info('the worker is registered; finish it by hand with:');
+		for (const command of remaining) out.info(`  ${command}`);
+		out.info('worker credential (store it now — it will not be shown again):');
+		out.info(credential);
+		return 1;
+	};
+	const enrollByHand = `swarm workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
+
+	try {
+		await writeWorkerScmCredential(worker.id, providerId, operatorCredential);
+		out.info(
+			`stored operator scm credential for worker '${worker.displayName}' (${worker.id}) on provider '${providerId}'`,
+		);
+	} catch (err) {
+		out.error(err instanceof Error ? err.message : String(err));
+		return reportUnfinished([
+			`swarm workers set-scm-credential ${worker.id} ${providerId}`,
+			enrollByHand,
+		]);
+	}
+
+	// The same helper `enroll` uses, so the capability, repository-mismatch and
+	// duplicate refusals are surfaced unchanged. Active + consenting with no flag:
+	// an enrollment is routable only while both hold, and a pending, non-consenting
+	// one is not "ready to start" — the four-command path stays for anyone who wants
+	// the two human approvals kept separate.
+	const enrolled = await performEnroll(worker, projectId, capabilities, undefined, true, true);
+	if (enrolled !== 0) return reportUnfinished([enrollByHand]);
+
+	// The credential's one and only appearance, on the last line — the "copy the
+	// last line" affordance docs/onboarding-worker.md relies on.
+	out.info(
+		'start the worker on that machine — this command does not (its .env must already carry SWARM_CONTROL_PLANE_URL). Run:',
+	);
+	out.info(
+		`SWARM_WORKER_CREDENTIAL=${credential} SWARM_WORKER_REPO_ROOT=${repoRoot} npm run dev:worker`,
+	);
+	return 0;
+}
+
 async function updateEnrollmentCommand(argv: string[]): Promise<number> {
 	const { values, positionals } = parseArgs({
 		args: argv,
@@ -683,6 +933,8 @@ export async function run(argv: string[]): Promise<number> {
 		switch (subcommand) {
 			case 'register':
 				return await registerWorkerCommand(rest);
+			case 'register-and-enroll':
+				return await registerAndEnrollCommand(rest);
 			case 'list':
 				return await listWorkersCommand(rest);
 			case 'set-cli':
