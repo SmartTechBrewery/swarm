@@ -4,9 +4,9 @@ A step-by-step runbook for making a machine — **this one or somebody else's** 
 a worker. Every worker connects over the transport (ADR-003 §2 — see
 [`docs/configuration.md`](./configuration.md) and
 [`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#remote-worker-transport-worker));
-there is one worker program and one way to run it (issue #553). The admin-side
-prerequisites — the Cloudflare Tunnel `/worker/*` route in particular — are out
-of scope here; this doc assumes the router is healthy with its dispatch consumer
+there is one worker program (issue #553), with two ways to launch it (Part 2). The
+admin-side prerequisites — the Cloudflare Tunnel `/worker/*` route in particular —
+are out of scope here; this doc assumes the router is healthy with its dispatch consumer
 running, which it always is.
 
 **Every deployment does this, including a single-user install** (issue #552).
@@ -53,7 +53,10 @@ that line is run, on the machine itself, with `SWARM_CONTROL_PLANE_URL` already 
 its `.env`. The printed `SWARM_WORKER_REPO_ROOT` is the *project's* configured
 checkout, so a different machine substitutes its own path (or pass `--repo-root
 <path>` to have the right one printed). The worker credential appears in that one
-line and nowhere else, so copy it before the terminal scrolls. Every refusal the
+printed line and nowhere else, so copy it before the terminal scrolls — **unless
+you ran this in the target checkout on the target machine**, in which case it was
+also cached there (issue #788) and `swarm run:worker` starts the worker with
+nothing to paste (Part 2). Every refusal the
 three commands it replaces produce still applies, unchanged — see
 [`docs/cli.md`](./cli.md#swarm-workers).
 
@@ -101,7 +104,13 @@ Notes:
   returns the worker to plain auto-discovery.
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
   it again). Copy it immediately; if you lose it, `workers remove` +
-  `workers register` again is the only recovery.
+  `workers register` again is the only recovery. Step 3 **also caches it for the
+  checkout it was run in**, on the machine it was run on (issue #788):
+  `~/.swarm/worker-credentials/<hash>/credential.json`, owner-only, outside every
+  checkout. That is what lets `swarm run:worker` start this worker without the
+  credential being pasted anywhere — but only where the registering machine *is*
+  the running machine. Registering on an admin machine for somebody else's still
+  hands the value over by copy.
 - **Step 4 has a dashboard equivalent** (issue #764): the owner of a registered
   worker can do it themselves — including before its first enrollment — at
   `/workers/<worker-id>` → **Enroll in a project**, picking any project they are at
@@ -232,6 +241,22 @@ and authenticated on this machine (e.g. `claude` logged in), then:
 npm run dev:worker
 ```
 
+**If Part 1 was run on this machine, in this checkout**, there is a shorter form
+(issue #788):
+
+```bash
+swarm run:worker            # from inside the checkout
+```
+
+It starts the same daemon, reading `SWARM_WORKER_CREDENTIAL` from the per-checkout
+cache Part 1 wrote here and setting `SWARM_WORKER_REPO_ROOT` to the current
+directory — so `.env` only needs `SWARM_CONTROL_PLANE_URL`, and the credential is
+never typed, pasted, or printed. It is an *additional* start path: the `.env` +
+`npm run dev:worker` form above is unchanged and stays the one to use on a remote
+machine, under a process supervisor, or anywhere the machine that registered the
+worker is not the machine running it. A checkout with no cache entry says so and
+names both remedies rather than failing on a missing file.
+
 A successful connection logs two lines:
 
 ```
@@ -252,7 +277,11 @@ declares nothing suspends nothing.
 **One worker per checkout** (issue #689). Before it handshakes, the daemon takes a
 lock on the checkout it was pointed at, recorded under
 `~/.swarm/checkout-locks/<hash>/owner.json` on this machine — not on the control
-plane, which cannot see a checkout. A second daemon started against the same
+plane, which cannot see a checkout. (`<hash>` is `sha256` of the checkout's
+realpath; `~/.swarm/worker-credentials/<the same hash>/credential.json` is the
+sibling `swarm run:worker` reads, keyed the same way. Both live in the operator's
+home directory, outside every checkout, so no project needs a `.gitignore` entry
+for either.) A second daemon started against the same
 `SWARM_WORKER_REPO_ROOT` refuses to start and names the worker holding it, because
 both would drive git in the same repository and collide on its `index.lock`. Two
 *separate* checkouts on one machine are fine, and are the supported way to run two
@@ -285,6 +314,7 @@ to expire after `heartbeatTtlMs`.
 
 | Symptom | Cause |
 | --- | --- |
+| `swarm run:worker` says `no worker registered for this checkout` | No credential was cached for *this* directory's realpath — the worker was registered on another machine, in another checkout, or before issue #788. Register here, or start the daemon with `SWARM_WORKER_CREDENTIAL` + `SWARM_WORKER_REPO_ROOT` set explicitly, as above. A git *worktree* of the checkout has its own realpath and gets this message too; run the daemon against the main checkout. |
 | `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
 | `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the two variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
 | Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |

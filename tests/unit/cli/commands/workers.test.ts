@@ -47,6 +47,7 @@ const { findUserByIdentifier, listUsers } = vi.hoisted(() => ({
 	listUsers: vi.fn(),
 }));
 const { closeDb } = vi.hoisted(() => ({ closeDb: vi.fn() }));
+const { writeWorkerCredentialCache } = vi.hoisted(() => ({ writeWorkerCredentialCache: vi.fn() }));
 const { findProjectByIdFromDb } = vi.hoisted(() => ({ findProjectByIdFromDb: vi.fn() }));
 const { getEnrollment } = vi.hoisted(() => ({ getEnrollment: vi.fn() }));
 const {
@@ -111,6 +112,7 @@ vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier, l
 vi.mock('@/db/repositories/projectsRepository.js', () => ({ findProjectByIdFromDb }));
 vi.mock('@/db/repositories/workerEnrollmentsRepository.js', () => ({ getEnrollment }));
 vi.mock('@/db/client.js', () => ({ closeDb }));
+vi.mock('@/cli/_shared/worker-credential-cache.js', () => ({ writeWorkerCredentialCache }));
 
 // The real manifests, so `register-and-enroll` resolves the provider a dispatch
 // would actually resolve rather than a fixture's. Deliberately not a mock of
@@ -170,6 +172,9 @@ describe('swarm workers', () => {
 		findUserByIdentifier.mockReset().mockResolvedValue(makeUser());
 		listUsers.mockReset().mockResolvedValue([makeUser()]);
 		closeDb.mockReset().mockResolvedValue(undefined);
+		writeWorkerCredentialCache
+			.mockReset()
+			.mockReturnValue('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
 		getWorker.mockReset().mockResolvedValue(makeWorker());
 		findProjectByIdFromDb.mockReset().mockResolvedValue({ id: PROJECT_ID });
 		getEnrollment
@@ -212,7 +217,45 @@ describe('swarm workers', () => {
 				String(line).includes('raw-credential-token'),
 			);
 			expect(credentialLines).toHaveLength(1);
+			// Printing stays *and* the credential is cached for this checkout (issue #788).
+			expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
+				repoRoot: process.cwd(),
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+			});
 			expect(closeDb).toHaveBeenCalledOnce();
+		});
+
+		it('names the cache file it wrote without putting the credential on that line', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(
+				await run(['register', 'ada@example.com', '--name', 'ada-laptop', '--cli', 'claude']),
+			).toBe(0);
+			const lines = log.mock.calls.map(([line]) => String(line));
+			const cacheLine = lines.find((line) => line.includes('credential.json')) ?? '';
+			expect(cacheLine).toContain('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
+			expect(cacheLine).toContain('swarm run:worker');
+			expect(cacheLine).not.toContain('raw-credential-token');
+			// Still exactly one line carrying the secret, and still the last one.
+			expect(lines.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(lines[lines.length - 1]).toContain('raw-credential-token');
+		});
+
+		// The credential is issued and about to be printed; a cache the operator can
+		// re-create by re-registering must never strand a registered worker.
+		it('warns but still succeeds when the cache cannot be written', async () => {
+			writeWorkerCredentialCache.mockImplementation(() => {
+				throw new Error('EACCES: permission denied');
+			});
+			const log = vi.spyOn(console, 'log');
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			expect(
+				await run(['register', 'ada@example.com', '--name', 'ada-laptop', '--cli', 'claude']),
+			).toBe(0);
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not cache the credential'));
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(lines[lines.length - 1]).toContain('raw-credential-token');
 		});
 
 		it('hands the operator off to the dashboard for the SCM credential, naming no provider and reading no secret', async () => {
@@ -329,6 +372,37 @@ describe('swarm workers', () => {
 			expect(last).toContain('SWARM_WORKER_CREDENTIAL=raw-credential-token');
 			expect(last).toContain(`SWARM_WORKER_REPO_ROOT=${REPO_ROOT}`);
 			expect(last).toContain('npm run dev:worker');
+		});
+
+		// #786's command registers through its own code path, so it needs its own
+		// assertion that the cache is written — a worker made the recommended way must
+		// be findable by `run:worker` too.
+		it('caches the credential for this checkout and names the file, not the value', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(ARGV)).toBe(0);
+			expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
+				repoRoot: process.cwd(),
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+			});
+			const cacheLine =
+				log.mock.calls.map(([line]) => String(line)).find((line) => line.includes('run:worker')) ??
+				'';
+			expect(cacheLine).toContain('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
+			expect(cacheLine).not.toContain('raw-credential-token');
+		});
+
+		it('warns but still completes when the cache cannot be written', async () => {
+			writeWorkerCredentialCache.mockImplementation(() => {
+				throw new Error('EACCES: permission denied');
+			});
+			const log = vi.spyOn(console, 'log');
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			expect(await run(ARGV)).toBe(0);
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not cache the credential'));
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(lines[lines.length - 1]).toContain('npm run dev:worker');
 		});
 
 		it('prints the worker credential exactly once and never echoes the operator secret', async () => {

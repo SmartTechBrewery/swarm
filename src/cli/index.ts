@@ -20,6 +20,7 @@ import * as pm from './commands/pm.js';
 import * as queue from './commands/queue.js';
 // Namespaced as `runCommand` because this module's own dispatcher is `run`.
 import * as runCommand from './commands/run.js';
+import * as runWorker from './commands/run-worker.js';
 import * as start from './commands/start.js';
 import * as status from './commands/status.js';
 import * as stop from './commands/stop.js';
@@ -38,6 +39,10 @@ const COMMANDS: Record<string, Command> = {
 	logs,
 	queue,
 	run: runCommand,
+	// A distinct top-level key, not a subcommand of `run`: that one is a
+	// database-backed dispatch-repair command with nothing in common with starting
+	// the host's worker.
+	'run:worker': runWorker,
 	users,
 	members,
 	identities,
@@ -60,6 +65,7 @@ Commands:
   logs [svc] [-f]  Tail stack logs (optional service, -f/--follow to stream)
   queue clear      Remove all pending queue jobs (not active runs)
   run reset <id>   Reset a wedged run and restart its phase (last resort)
+  run:worker       Start this checkout's registered worker (credential from the local cache)
   users            Manage SWARM users and the installation admin
   members          Manage project membership (who belongs to a project)
   identities       Link a SWARM user to the handles they own on a provider
@@ -67,7 +73,10 @@ Commands:
   worktrees prune  Prune stale per-task worktrees
   pm webhook       Register/list/delete a project's Trello board webhook
 
-The worker is not managed here — it runs on the host: npm run dev:worker`;
+The worker still runs on the host, not in Compose. On the machine that registered
+it, \`swarm run:worker\` starts the one registered for the current directory; for a
+remote machine or a process supervisor, run \`npm run dev:worker\` with
+SWARM_WORKER_CREDENTIAL and SWARM_WORKER_REPO_ROOT set explicitly.`;
 }
 
 /**

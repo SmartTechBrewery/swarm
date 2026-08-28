@@ -12,13 +12,13 @@
  * *checkout*, and the guard has to be host-local.
  *
  * **Where the lock lives.** `~/.swarm/checkout-locks/<sha256(realpath(repoRoot))>/`
- * with an `owner.json` inside it. Not inside the checkout: the daemon holds no
+ * with an `owner.json` inside it — the per-checkout state convention `./checkout-key.ts`
+ * now states once for everything that keys on a checkout (the worker credential
+ * cache, issue #788, is the other). Not inside the checkout: the daemon holds no
  * project config at startup, so it does not know a project's `worktreeRoot` (which
  * is what makes `./host-local-runtime.ts`'s `<repoRoot>/<worktreeRoot>/.swarm-state`
  * reachable), and writing to `<repoRoot>/.swarm-state` would leave an untracked
- * directory in the operator's own repository. The key hashes the **realpath**, so
- * the lock is keyed to the checkout rather than to the spelling of the path that
- * reached it (the same reason `GitWorktreeManager.canonicalize` exists).
+ * directory in the operator's own repository.
  *
  * **Why it needs its own TTL.** `LEASE_TTL_MS` next door is 4h and never
  * refreshed, sized for one agent run; a worker process lives for days, so reusing
@@ -30,11 +30,11 @@
  * backstop for the recycled pid liveness cannot see (`./local-lock.ts`).
  */
 
-import { createHash } from 'node:crypto';
-import { mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
+import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
+import { canonicalCheckoutPath, checkoutStateDir } from './checkout-key.js';
 import { isExpired, pathOlderThan, pidIsLive, readJson } from './local-lock.js';
 
 /**
@@ -142,13 +142,8 @@ export function acquireCheckoutLock(options: AcquireCheckoutLockOptions): Checko
 	const isLive = options.isPidLive ?? pidIsLive;
 	const pid = options.pid ?? process.pid;
 	const host = options.hostname ?? hostname();
-	const repoRoot = canonicalRepoRoot(options.repoRoot);
-	const lockDir = resolve(
-		options.homeDir ?? homedir(),
-		'.swarm',
-		'checkout-locks',
-		createHash('sha256').update(repoRoot).digest('hex'),
-	);
+	const repoRoot = canonicalCheckoutPath(options.repoRoot);
+	const lockDir = checkoutStateDir('checkout-locks', repoRoot, options.homeDir);
 	const ownerPath = resolve(lockDir, 'owner.json');
 
 	/** Whether a record left in `lockDir` belongs to this very process. */
@@ -254,20 +249,4 @@ export function acquireCheckoutLock(options: AcquireCheckoutLockOptions): Checko
 			rmSync(lockDir, { recursive: true, force: true });
 		},
 	};
-}
-
-/**
- * The checkout's identity for locking purposes: its realpath, so a symlink, a
- * trailing slash, or a relative spelling all resolve to the same lock.
- */
-function canonicalRepoRoot(repoRoot: string): string {
-	const absolute = resolve(repoRoot);
-	try {
-		return realpathSync(absolute);
-	} catch {
-		// Unresolvable (not a directory yet, or unreadable): lock under the literal
-		// path instead. Two daemons pointed at the same bad path still collide, and
-		// whatever is actually wrong with it surfaces from the code that needs it.
-		return absolute;
-	}
 }
