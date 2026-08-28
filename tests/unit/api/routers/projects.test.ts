@@ -95,6 +95,7 @@ import {
 // deliberately runs on stubs (see its comment), so the two re-register per test.
 import { bitbucketScmManifest } from '@/integrations/scm/bitbucket/index.js';
 import { githubScmManifest } from '@/integrations/scm/github/index.js';
+import { gitlabScmManifest } from '@/integrations/scm/gitlab/index.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
 	_resetSCMProviderRegistryForTesting,
@@ -533,18 +534,20 @@ describe('projectsRouter', () => {
 			);
 		});
 
-		// Issue #769 phase 2/2: the installation's stored default for a `(provider, role)`
-		// pair the provider declares `instanceDefault` for is copied into the *new*
-		// project's own `project_credentials` row, so a dashboard-created project is
-		// routable for Review with nothing pasted by hand. A copy, not a resolution tier —
-		// `src/config/provider.ts` is untouched and existing projects are not seeded.
+		// Issue #769 phase 2/2, made a hard requirement for every provider by issue #778:
+		// the installation's stored default for a `(provider, role)` pair the provider
+		// declares `instanceDefault` for is *required* before a project may be created on
+		// that provider, and is then copied into the new project's own
+		// `project_credentials` row. Still a copy, not a resolution tier —
+		// `src/config/provider.ts` is untouched and existing projects are never touched.
 		describe('instance-default SCM credentials', () => {
-			// The real manifests, so which pairs opt in is the shipped answer rather than a
-			// stub's. Re-registered here because the outer `beforeEach` resets the registry.
+			// All three real manifests, so which pairs opt in is the shipped answer rather than
+			// a stub's. Re-registered here because the outer `beforeEach` resets the registry.
 			beforeEach(() => {
 				_resetSCMProviderRegistryForTesting();
 				registerSCMProvider(githubScmManifest);
 				registerSCMProvider(bitbucketScmManifest);
+				registerSCMProvider(gitlabScmManifest);
 				vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
 			});
 
@@ -561,30 +564,112 @@ describe('projectsRouter', () => {
 				]);
 			});
 
-			it('writes nothing and still succeeds when no default is stored', async () => {
+			// Issue #778: the value the guard resolved is threaded through to the write rather
+			// than read a second time, which closes the window where the default is cleared
+			// between check and seed.
+			it('resolves the stored default once rather than re-reading it for the write', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
+
+				await caller.create(validProjectInput);
+
+				expect(resolveInstanceScmCredential).toHaveBeenCalledTimes(1);
+			});
+
+			// The core of issue #778, replacing #769's silently-degraded creation: without a
+			// recorded default the project could not run Review, so creation is refused
+			// outright — and refused *before any row is written*.
+			it("refuses creation when the installation has no default for the project's provider", async () => {
 				vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
 
-				await expect(caller.create(validProjectInput)).resolves.toMatchObject({
-					id: 'new-proj',
-					scm: 'github',
-				});
+				await expect(caller.create(validProjectInput)).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'PRECONDITION_FAILED',
+						message: expect.stringContaining('GitHub'),
+					}),
+				);
+				await expect(caller.create(validProjectInput)).rejects.toThrowError(
+					/'reviewer'.*General Settings → Credentials \(GITHUB_TOKEN_REVIEWER\)/,
+				);
+				expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
 				expect(writeProjectCredential).not.toHaveBeenCalled();
 			});
 
-			// Only the provider the project actually runs on: Bitbucket's reviewer role does
-			// not opt in, so nothing is looked up for it and no GitHub secret leaks across.
-			it('seeds nothing for a provider whose roles do not opt in', async () => {
-				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
+			// The coverage half of issue #778: Bitbucket and GitLab now declare the same
+			// requirement, so each refuses naming *itself* rather than being created with no
+			// reviewer credential path at all. Also the regression guard against a future
+			// manifest quietly losing the flag.
+			it.each([
+				{ scm: 'bitbucket' as const, label: 'Bitbucket', key: 'BITBUCKET_TOKEN_REVIEWER' },
+				{ scm: 'gitlab' as const, label: 'GitLab', key: 'GITLAB_TOKEN_REVIEWER' },
+			])('refuses creation for a $scm project with no stored default', async ({
+				label,
+				scm,
+				key,
+			}) => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
 
-				await caller.create({ ...validProjectInput, scm: 'bitbucket' });
+				await expect(caller.create({ ...validProjectInput, scm })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'PRECONDITION_FAILED',
+						message: expect.stringContaining(`no ${label} 'reviewer' credential`),
+					}),
+				);
+				await expect(caller.create({ ...validProjectInput, scm })).rejects.toThrowError(
+					new RegExp(`General Settings → Credentials \\(${key}\\)`),
+				);
+				expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
+			});
+
+			it.each([
+				{ scm: 'bitbucket' as const, key: 'BITBUCKET_TOKEN_REVIEWER', secret: 'bb_instance' },
+				{ scm: 'gitlab' as const, key: 'GITLAB_TOKEN_REVIEWER', secret: 'glpat_instance' },
+			])('seeds a $scm project from its own provider’s stored default', async ({
+				scm,
+				key,
+				secret,
+			}) => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue(secret);
+
+				await caller.create({ ...validProjectInput, scm });
+
+				expect(resolveInstanceScmCredential).toHaveBeenCalledWith(scm, 'reviewer');
+				// The whole call list again: no `webhookSecret` may ride along, and no other
+				// provider's key may be written for this project.
+				expect(vi.mocked(writeProjectCredential).mock.calls).toEqual([
+					['new-proj', key, secret, null],
+				]);
+			});
+
+			// The AC's hypothetical-removed-role case: the check only fires for roles that
+			// actually opt in, so a provider declaring none creates exactly as it did before
+			// issue #778 — no lookup, no write, and above all no refusal.
+			it('creates as before for a provider whose roles do not opt in', async () => {
+				_resetSCMProviderRegistryForTesting();
+				registerSCMProvider({
+					id: 'bitbucket',
+					label: 'Stub Bitbucket',
+					category: 'scm',
+					webhookRoute: '/stub-bitbucket/webhook',
+					credentialRoles: [
+						{ role: 'reviewer', envVarKey: 'BB_STUB_TOKEN_REVIEWER' },
+						{ role: 'webhookSecret', envVarKey: 'BB_STUB_WEBHOOK_SECRET' },
+					],
+				} as unknown as SCMProviderManifest);
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
+
+				await expect(
+					caller.create({ ...validProjectInput, scm: 'bitbucket' }),
+				).resolves.toMatchObject({ id: 'new-proj', scm: 'bitbucket' });
 
 				expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
 				expect(writeProjectCredential).not.toHaveBeenCalled();
 			});
 
-			// Manifest-driven, not GitHub-hardcoded: a provider that declares the opt-in
-			// under its own key is seeded under *that* key, with no edit to the router.
+			// Manifest-driven, not hardcoded to any of the three shipped keys: a provider that
+			// declares the opt-in under its own key is seeded under *that* key, with no edit
+			// to the router.
 			it("uses the opting-in provider's own key rather than another provider's", async () => {
+				_resetSCMProviderRegistryForTesting();
 				registerSCMProvider({
 					id: 'gitlab',
 					label: 'Stub GitLab',
@@ -605,16 +690,22 @@ describe('projectsRouter', () => {
 				]);
 			});
 
-			// Best-effort: the project and its membership are already committed, and re-running
-			// `create` to recover the seed would only earn a CONFLICT.
-			it('still returns the created project when the lookup fails', async () => {
+			// Fails closed, deliberately inverting issue #769's behaviour: moving the resolve
+			// ahead of creation means a lookup failure creates nothing rather than leaving a
+			// project created-but-unseeded. We cannot claim the credential exists, and
+			// re-running `create` after the DB recovers is clean because nothing was written.
+			it('refuses creation when the lookup itself fails, writing nothing', async () => {
 				vi.mocked(resolveInstanceScmCredential).mockRejectedValue(new Error('db down'));
 
-				await expect(caller.create(validProjectInput)).resolves.toMatchObject({
-					id: 'new-proj',
-				});
+				await expect(caller.create(validProjectInput)).rejects.toThrowError('db down');
+				expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
+				expect(writeProjectCredential).not.toHaveBeenCalled();
 			});
 
+			// The one half that stays best-effort: the value demonstrably exists by now, so a
+			// write failure is a transient fault, the project and its membership are already
+			// committed, and re-running `create` to recover the seed would only earn a
+			// CONFLICT. The recovery is the Source Control tab.
 			it('still returns the created project when the write fails', async () => {
 				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
 				vi.mocked(writeProjectCredential).mockRejectedValue(new Error('encryption unavailable'));
@@ -1232,6 +1323,24 @@ describe('projectsRouter', () => {
 		});
 
 		describe('create', () => {
+			// These two are about authorization and transaction atomicity, so they must not
+			// also be about credential state: a stub manifest declaring no `instanceDefault`
+			// keeps issue #778's requirement out of their way (the outer suite's stubs are the
+			// same pattern, but the registry is whatever the preceding suite left registered).
+			beforeEach(() => {
+				_resetSCMProviderRegistryForTesting();
+				registerSCMProvider({
+					id: 'github',
+					label: 'Stub',
+					category: 'scm',
+					webhookRoute: '/stub/webhook',
+					credentialRoles: [
+						{ role: 'reviewer', envVarKey: 'SCM_STUB_TOKEN_REVIEWER' },
+						{ role: 'webhookSecret', envVarKey: 'SCM_STUB_WEBHOOK_SECRET' },
+					],
+				} as unknown as SCMProviderManifest);
+			});
+
 			it('records the creator as a projectAdmin member in the atomic transaction', async () => {
 				vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
 

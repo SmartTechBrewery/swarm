@@ -38,8 +38,15 @@ export const bitbucketScmManifest: SCMProviderManifest = {
 	// so a project can hold these alongside GitHub's or GitLab's instead of the three
 	// sharing (and overwriting) one pair. Spelled like the sibling operator variable
 	// `SWARM_OPERATOR_BITBUCKET_TOKEN`.
+	//
+	// `instanceDefault` on `reviewer` (issue #778): the reviewer identity is an
+	// installation-wide *requirement*, not a per-provider convenience — SWARM's
+	// loop-prevention model wants one reviewer account distinct from the implementer
+	// (ai/RULES.md §3), and an installation normally runs that one account across every
+	// Bitbucket project, so an instance administrator records it once. The webhook secret
+	// stays ineligible: it is tied to each project's own webhook endpoint.
 	credentialRoles: [
-		{ role: 'reviewer', envVarKey: 'BITBUCKET_TOKEN_REVIEWER' },
+		{ role: 'reviewer', envVarKey: 'BITBUCKET_TOKEN_REVIEWER', instanceDefault: true },
 		{ role: 'webhookSecret', envVarKey: 'BITBUCKET_WEBHOOK_SECRET' },
 	],
 	// One shared instance: the integration is stateless and takes `project` per

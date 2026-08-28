@@ -35,9 +35,10 @@ export const githubScmManifest: SCMProviderManifest = {
 		// `instanceDefault` (issue #769): SWARM's loop-prevention model wants one reviewer
 		// account distinct from the implementer (ai/RULES.md §3), and an installation
 		// normally runs that one account across every project — so a single value for this
-		// role is legitimately installation-wide and an instance administrator may record
-		// it once. The webhook secret is deliberately not eligible: it is tied to each
-		// project's own webhook endpoint.
+		// role is legitimately installation-wide and an instance administrator records it
+		// once. Since issue #778 that is a *requirement* rather than a convenience, and
+		// every registered provider declares it, not just this one. The webhook secret is
+		// deliberately not eligible: it is tied to each project's own webhook endpoint.
 		{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER', instanceDefault: true },
 		{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
 	],

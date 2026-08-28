@@ -37,7 +37,7 @@ import { getPMProvider } from '../../integrations/pm/registry.js';
 import { getSCMProvider, listInstanceDefaultScmRoles } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
-import type { ScmType } from '../../scm/types.js';
+import type { ScmCredentialRole, ScmType } from '../../scm/types.js';
 import {
 	accessibleProjectScope,
 	assertProjectAccess,
@@ -112,9 +112,80 @@ function defaultPmCredentialReferences(
 }
 
 /**
- * Copy the installation's stored defaults for the new project's **own** SCM provider
- * into its `project_credentials` rows (issue #769 phase 2/2), so a dashboard-created
- * project is routable for Review without an operator pasting the reviewer PAT by hand.
+ * One instance-level default already resolved for the project being created (issue
+ * #778) — the hand-off between the required check below and the best-effort write after
+ * it.
+ */
+interface ResolvedInstanceScmDefault {
+	readonly role: ScmCredentialRole;
+	readonly envVarKey: string;
+	readonly secret: string;
+}
+
+/**
+ * Resolve every instance-level default the new project's **own** SCM provider requires,
+ * refusing creation when the installation has recorded none (issue #778).
+ *
+ * The reviewer identity is an installation-wide *requirement*, not the best-effort
+ * convenience issue #769 shipped: a project whose provider declares an
+ * `instanceDefault`-eligible role with nothing stored has no way to run Review, so
+ * `create` refuses here — before any row is written — rather than logging a warning and
+ * leaving "this installation isn't fully configured" undetectable until Review fails on
+ * that project days later. The message names the provider, the role and the tab to fix
+ * it on, because whoever creates a project is usually not the `instanceAdmin` who can.
+ *
+ * Only the provider the project runs on, and only roles that declare `instanceDefault` —
+ * never every registered provider's block, which is the fallback shape
+ * `adoptLegacyScmCredentials` (`src/config/scm-credentials.ts`) refuses for the same
+ * reason. `webhookSecret` can never declare it, so it is never required and never seeded.
+ * A provider that declares no eligible role at all is untouched — the filtered loop is
+ * empty, so nothing is looked up and creation proceeds exactly as before — and so is a
+ * registered but not runtime-ready provider, which `listInstanceDefaultScmRoles()`
+ * already excludes.
+ *
+ * Two properties worth not re-deriving. It **fails closed** on a lookup error: the
+ * rejection propagates and nothing is created, where issue #769's post-commit seed left
+ * a project created-but-unseeded — we cannot claim the credential exists, and re-running
+ * `create` once the DB recovers is clean precisely because nothing was written. And it
+ * returns the resolved secret rather than a boolean, so the row is read **once**: a
+ * second read at write time would reopen the window where the default is cleared in
+ * between, recreating the silent degradation this replaces.
+ *
+ * Throws on the first missing role rather than aggregating: every provider declares at
+ * most one eligible role (`reviewer`), so an aggregate would be machinery for a list of
+ * length ≤ 1.
+ *
+ * `swarm config apply` (`src/config/apply.ts`) deliberately keeps the opposite
+ * philosophy — a missing referenced secret there is warned-and-skipped, because applying
+ * a config file before every secret is exported is a legitimate partial state for that
+ * path. This requirement is the dashboard's alone.
+ */
+async function requireInstanceScmDefaults(
+	scm: ScmType,
+): Promise<readonly ResolvedInstanceScmDefault[]> {
+	const resolved: ResolvedInstanceScmDefault[] = [];
+	for (const eligible of listInstanceDefaultScmRoles()) {
+		if (eligible.providerId !== scm) continue;
+		const secret = await resolveInstanceScmCredential(scm, eligible.role);
+		if (secret === null) {
+			throw new TRPCError({
+				code: 'PRECONDITION_FAILED',
+				message:
+					`This installation has recorded no ${eligible.providerLabel} '${eligible.role}' ` +
+					`credential, so a ${eligible.providerLabel} project could not run Review. An ` +
+					'instance administrator must set it in General Settings → Credentials ' +
+					`(${eligible.envVarKey}) before this project can be created.`,
+			});
+		}
+		resolved.push({ role: eligible.role, envVarKey: eligible.envVarKey, secret });
+	}
+	return resolved;
+}
+
+/**
+ * Copy the defaults {@link requireInstanceScmDefaults} resolved into the new project's
+ * `project_credentials` rows (issue #769 phase 2/2), so a dashboard-created project is
+ * routable for Review without an operator pasting the reviewer PAT by hand.
  *
  * A copy made once, at creation, into the project's *own* row — deliberately **not** a
  * resolution tier: `resolveScmCredentialOrNull` (`src/config/provider.ts`) still reads
@@ -124,11 +195,6 @@ function defaultPmCredentialReferences(
  * binds it to `projectId`), which leaves the project row self-contained: clearing or
  * rotating the instance default afterwards cannot break it, and cannot reach it.
  *
- * Only the provider the project runs on, and only roles that declare
- * `instanceDefault` — never every registered provider's block, which is the fallback
- * shape `adoptLegacyScmCredentials` (`src/config/scm-credentials.ts`) refuses for the
- * same reason. `webhookSecret` can never declare it, so it is never seeded.
- *
  * The destination key is the one the project *resolves* the role through, via the same
  * `scmCredentialReferenceFor(...) ?? envVarKey` rule `credentials.set` writes under
  * (`scmReferenceKeyFor`, `./credentials.ts`) — not a second derivation of it.
@@ -137,14 +203,15 @@ function defaultPmCredentialReferences(
  * holds no credentials yet (and `deleteProjectFromDb` cascades them, so a reused id
  * cannot leave one behind).
  */
-async function seedInstanceScmCredentials(project: ProjectRecord, scm: ScmType): Promise<void> {
-	for (const eligible of listInstanceDefaultScmRoles()) {
-		if (eligible.providerId !== scm) continue;
-		const secret = await resolveInstanceScmCredential(scm, eligible.role);
-		if (secret === null) continue;
-		const key = scmCredentialReferenceFor(project, scm, eligible.role) ?? eligible.envVarKey;
+async function seedInstanceScmCredentials(
+	project: ProjectRecord,
+	scm: ScmType,
+	defaults: readonly ResolvedInstanceScmDefault[],
+): Promise<void> {
+	for (const seed of defaults) {
+		const key = scmCredentialReferenceFor(project, scm, seed.role) ?? seed.envVarKey;
 		// No display name: nothing reads one for an SCM reference, matching `credentials.set`.
-		await writeProjectCredential(project.id, key, secret, null);
+		await writeProjectCredential(project.id, key, seed.secret, null);
 	}
 }
 
@@ -389,6 +456,13 @@ export const projectsRouter = router({
 		// always submits its explicit picker value, while non-dashboard callers remain
 		// routable instead of creating a project with no SCM provider.
 		const scm: ScmType = input.scm ?? 'github';
+		// Issue #778: the instance reviewer credential is an installation-wide requirement,
+		// so a provider declaring an `instanceDefault`-eligible role with nothing stored
+		// refuses creation here — before any row is written, and before the config below is
+		// even assembled, so a refused creation does no work at all. A request that would
+		// both be refused and conflict on id therefore reports the refusal, the more
+		// actionable of the two; the operator meets the conflict on the retry.
+		const instanceDefaults = await requireInstanceScmDefaults(scm);
 		const scmReferences = defaultScmCredentialReferences(scm);
 		const config = {
 			...input,
@@ -414,14 +488,15 @@ export const projectsRouter = router({
 			}
 			throw error;
 		}
-		// Best-effort, and outside the transaction above on purpose: the project and its
-		// membership are already committed atomically, and `writeProjectCredential` takes
-		// no transaction handle. A failing seed must not turn a successful creation into a
-		// client-visible error — the degraded outcome is exactly today's behaviour (set
-		// the credential on the Source Control tab), while re-running `create` to recover
-		// it would only earn a `CONFLICT`.
+		// The *write* half stays best-effort, and outside the transaction above on purpose:
+		// the project and its membership are already committed atomically, and
+		// `writeProjectCredential` takes no transaction handle. The value demonstrably
+		// exists by now — `requireInstanceScmDefaults` resolved it or refused — so a failure
+		// here is a transient encryption/DB fault, not a reason to have refused creation:
+		// the degraded outcome is settable on the Source Control tab, while re-running
+		// `create` to recover it would only earn a `CONFLICT`.
 		try {
-			await seedInstanceScmCredentials(config, scm);
+			await seedInstanceScmCredentials(config, scm, instanceDefaults);
 		} catch (error) {
 			logger.warn(
 				'projects.create: seeding the instance default SCM credentials failed; set them on the Source Control tab',
