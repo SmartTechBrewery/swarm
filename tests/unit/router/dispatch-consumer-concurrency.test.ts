@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PROJECT_DEFAULTS } from '@/config/schema.js';
 import { DEFAULT_CONCURRENCY_ALLOCATION } from '@/identity/worker-enrollment.js';
+import * as dispatcherModule from '@/router/dispatcher.js';
 import { DISPATCH_CONSUMER_CONCURRENCY } from '@/router/dispatcher.js';
 
 /**
@@ -30,6 +31,10 @@ describe('dispatch consumer concurrency', () => {
 		process.env.SWARM_WORKER_CONCURRENCY = '1';
 		vi.resetModules();
 		const reloaded = await import('@/router/dispatcher.js');
-		expect(reloaded.DISPATCH_CONSUMER_CONCURRENCY).toBe(DISPATCH_CONSUMER_CONCURRENCY);
+		// A distinct module namespace object proves resetModules() actually produced a
+		// fresh instance — without this, a silently-failed reload would still pass the
+		// value check below by comparing the cached module against itself.
+		expect(reloaded).not.toBe(dispatcherModule);
+		expect(reloaded.DISPATCH_CONSUMER_CONCURRENCY).toBe(100);
 	});
 });
