@@ -112,7 +112,13 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({ findProjectByIdFromD
 vi.mock('@/db/repositories/workerEnrollmentsRepository.js', () => ({ getEnrollment }));
 vi.mock('@/db/client.js', () => ({ closeDb }));
 
+// The real manifests, so `register-and-enroll` resolves the provider a dispatch
+// would actually resolve rather than a fixture's. Deliberately not a mock of
+// `@/integrations/scm/registry.js`: the entrypoint registers *into* that registry,
+// so mocking it would fight the import and assert nothing real.
+import '@/integrations/entrypoint.js';
 import { run } from '@/cli/commands/workers.js';
+import { createMockProjectConfig } from '../../../helpers/factories.js';
 
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
@@ -267,6 +273,191 @@ describe('swarm workers', () => {
 			).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('already exists'));
 			expect(closeDb).toHaveBeenCalledOnce();
+		});
+	});
+
+	// Issue #786 — the composite: register + operator credential + enroll, ending in
+	// the exact command that starts the daemon. It composes the three commands above,
+	// so what is asserted here is the *ordering* and the credential handling.
+	describe('register-and-enroll', () => {
+		const REPO_ROOT = '/Users/dev/swarm/swarm';
+		const ARGV = [
+			'register-and-enroll',
+			'ada@example.com',
+			PROJECT_ID,
+			'--name',
+			'ada-laptop',
+			'--cli',
+			'claude',
+		];
+
+		beforeEach(() => {
+			// The suite's global fixture is a bare `{ id }` with no `scm`, which would
+			// exercise the registry's "selects no provider" throw in every case here.
+			findProjectByIdFromDb.mockResolvedValue(
+				createMockProjectConfig({ id: PROJECT_ID, scm: 'github', repoRoot: REPO_ROOT }),
+			);
+		});
+
+		it('registers, stores the credential for the resolved provider, and enrolls active + consenting', async () => {
+			expect(await run(ARGV)).toBe(0);
+			expect(registerWorker).toHaveBeenCalledWith({
+				ownerUserId: OWNER_ID,
+				displayName: 'ada-laptop',
+				capabilities: ['claude'],
+			});
+			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'github', 'piped-secret');
+			expect(enrollWorker).toHaveBeenCalledWith(
+				expect.objectContaining({
+					projectId: PROJECT_ID,
+					allowedClis: ['claude'],
+					status: 'active',
+					sharingConsent: true,
+				}),
+			);
+			expect(closeDb).toHaveBeenCalledOnce();
+		});
+
+		// It prints the start command rather than running it: the daemon stays a
+		// foreground, operator-owned process, so the suite mocks no process spawner and
+		// the command must not need one.
+		it('ends with the ready-to-run start command', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(ARGV)).toBe(0);
+			const lines = log.mock.calls.map(([line]) => String(line));
+			const last = lines[lines.length - 1] ?? '';
+			expect(last).toContain('SWARM_WORKER_CREDENTIAL=raw-credential-token');
+			expect(last).toContain(`SWARM_WORKER_REPO_ROOT=${REPO_ROOT}`);
+			expect(last).toContain('npm run dev:worker');
+		});
+
+		it('prints the worker credential exactly once and never echoes the operator secret', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(ARGV)).toBe(0);
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(lines.some((line) => line.includes('piped-secret'))).toBe(false);
+		});
+
+		// The provider comes from the project, never from a `?? 'github'` fallback.
+		it('stores the credential under the provider the project names, not GitHub', async () => {
+			findProjectByIdFromDb.mockResolvedValue(
+				createMockProjectConfig({ id: PROJECT_ID, scm: 'bitbucket', repoRoot: REPO_ROOT }),
+			);
+			expect(await run(ARGV)).toBe(0);
+			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'bitbucket', 'piped-secret');
+		});
+
+		it('refuses a project whose SCM provider does not resolve, before writing anything', async () => {
+			findProjectByIdFromDb.mockResolvedValue(
+				createMockProjectConfig({ id: PROJECT_ID, scm: undefined, repoRoot: REPO_ROOT }),
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(ARGV)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining(PROJECT_ID));
+			expect(registerWorker).not.toHaveBeenCalled();
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+			expect(enrollWorker).not.toHaveBeenCalled();
+		});
+
+		it('requires an owner identifier, a project id, --name, and --cli', async () => {
+			expect(await run(['register-and-enroll'])).toBe(1);
+			expect(await run(['register-and-enroll', 'ada@example.com'])).toBe(1);
+			expect(
+				await run(['register-and-enroll', 'ada@example.com', PROJECT_ID, '--cli', 'claude']),
+			).toBe(1);
+			expect(
+				await run(['register-and-enroll', 'ada@example.com', PROJECT_ID, '--name', 'ada-laptop']),
+			).toBe(1);
+			expect(registerWorker).not.toHaveBeenCalled();
+			expect(readStdin).not.toHaveBeenCalled();
+		});
+
+		it('rejects an invalid CLI without hitting a service', async () => {
+			expect(
+				await run([
+					'register-and-enroll',
+					'ada@example.com',
+					PROJECT_ID,
+					'--name',
+					'ada-laptop',
+					'--cli',
+					'claude,vim',
+				]),
+			).toBe(1);
+			expect(registerWorker).not.toHaveBeenCalled();
+		});
+
+		it('fails for an unknown owner or project without reading the secret', async () => {
+			findUserByIdentifier.mockResolvedValue(undefined);
+			expect(await run(ARGV)).toBe(1);
+			findUserByIdentifier.mockResolvedValue(makeUser());
+			findProjectByIdFromDb.mockResolvedValue(undefined);
+			expect(await run(ARGV)).toBe(1);
+			expect(promptHidden).not.toHaveBeenCalled();
+			expect(readStdin).not.toHaveBeenCalled();
+			expect(registerWorker).not.toHaveBeenCalled();
+		});
+
+		// The ordering guarantee: the secret is read before the first write, so an
+		// empty (or aborted) one leaves no worker row behind.
+		it('rejects an empty secret before registering the worker', async () => {
+			readStdin.mockResolvedValue('   \n');
+			expect(await run(ARGV)).toBe(1);
+			expect(registerWorker).not.toHaveBeenCalled();
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
+		it('translates a duplicate worker name and stores no credential', async () => {
+			registerWorker.mockRejectedValue(Object.assign(new Error('dup'), { code: '23505' }));
+			const error = vi.spyOn(console, 'error');
+			expect(await run(ARGV)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('already exists'));
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
+		// An enroll refusal is surfaced verbatim, and the one-time worker credential is
+		// still handed over — losing it would mean remove + register again.
+		it('surfaces an enroll refusal and still hands over the credential once', async () => {
+			enrollWorker.mockRejectedValue(
+				new EnrollmentRepositoryMismatchError(WORKER_ID, 'acme/frontend', 'acme/backend'),
+			);
+			const log = vi.spyOn(console, 'log');
+			const error = vi.spyOn(console, 'error');
+			expect(await run(ARGV)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('acme/frontend'));
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('acme/backend'));
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(lines.some((line) => line.includes('workers enroll'))).toBe(true);
+		});
+
+		it('hands over the credential and the remaining steps when the credential write fails', async () => {
+			writeWorkerScmCredential.mockRejectedValue(new Error('CREDENTIAL_MASTER_KEY is not set'));
+			const log = vi.spyOn(console, 'log');
+			expect(await run(ARGV)).toBe(1);
+			expect(enrollWorker).not.toHaveBeenCalled();
+			const lines = log.mock.calls.map(([line]) => String(line));
+			expect(lines.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(lines.some((line) => line.includes('set-scm-credential'))).toBe(true);
+			expect(lines.some((line) => line.includes('workers enroll'))).toBe(true);
+		});
+
+		it('prints --repo-root instead of the project checkout when given', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run([...ARGV, '--repo-root', '/opt/checkouts/swarm'])).toBe(0);
+			const lines = log.mock.calls.map(([line]) => String(line));
+			const last = lines[lines.length - 1] ?? '';
+			expect(last).toContain('SWARM_WORKER_REPO_ROOT=/opt/checkouts/swarm');
+			expect(last).not.toContain(REPO_ROOT);
+		});
+
+		it('describes itself in --help without writing anything', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['register-and-enroll', '--help'])).toBe(0);
+			expect(log).toHaveBeenCalledWith(expect.stringContaining('register-and-enroll'));
+			expect(registerWorker).not.toHaveBeenCalled();
+			expect(readStdin).not.toHaveBeenCalled();
 		});
 	});
 
@@ -607,6 +798,7 @@ describe('swarm workers', () => {
 			expect(await run([])).toBe(1);
 			expect(await run(['--help'])).toBe(0);
 			expect(log).toHaveBeenCalledWith(expect.stringContaining('update-enrollment'));
+			expect(log).toHaveBeenCalledWith(expect.stringContaining('register-and-enroll'));
 			expect(registerWorker).not.toHaveBeenCalled();
 			expect(closeDb).not.toHaveBeenCalled();
 		});

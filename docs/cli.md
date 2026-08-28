@@ -279,6 +279,7 @@ pair is a no-op; a handle already linked to a different user is rejected. Requir
 
 ```bash
 swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
+swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
 swarm workers list [<owner-identifier>]
 swarm workers set-cli <worker-id> --cli <c1,c2,...>
 swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -300,6 +301,31 @@ swarm workers consent <worker-id> <project-id> <on|off>
   sets that at `/workers/<worker-id>` → **Operator source-control credential**; for
   someone else's machine, use `set-scm-credential` below. `register` itself never
   asks for a token — the provider isn't known at registration time.
+- **`register-and-enroll`** — the **recommended one-command path for a new machine**
+  (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
+  ending with the exact command that starts the daemon. It composes those three and
+  relaxes none of their checks. The **SCM provider is resolved from the target
+  project** (`requireProjectSCMProviderId` — never assumed to be GitHub), so the
+  credential prompt names the provider that project actually runs on and any of
+  `github | bitbucket | gitlab` works; the secret is prompted for without echo on a
+  TTY, otherwise read from stdin, and never printed back. The enrollment is created
+  **active with sharing consent on** — a pending, non-consenting enrollment isn't
+  "ready to start", and the four separate commands remain for anyone who wants those
+  two approvals kept as separate human decisions. **The worker credential is printed
+  exactly once**, in the final start-command line. It **does not start the worker**:
+  that daemon is a foreground, operator-owned process, so the last line is a command
+  to run on the target machine yourself (its `.env` must already carry
+  `SWARM_CONTROL_PLANE_URL`). `--repo-root` overrides the printed
+  `SWARM_WORKER_REPO_ROOT`, which otherwise defaults to the project's configured
+  checkout — pass it when the machine's checkout path differs. Everything each step
+  refuses today is still refused, with nothing written before the refusal wherever
+  that is possible: a bad `--cli`, an unknown owner or project, a project whose `scm`
+  resolves no provider, and an empty or aborted secret all fail **before** the worker
+  is registered, so a typo never leaves an orphaned worker behind; a duplicate
+  display name, a capability mismatch, and a repository mismatch (naming both
+  repositories) fail exactly as `register` / `enroll` do. If a step after
+  registration fails, the command prints what is left to run by hand *and* the worker
+  credential once, since that value is otherwise unrecoverable.
 - **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line). With an owner
   identifier, only that owner's; without, all owners'. Never prints a credential.
 - **`set-cli`** — replace a worker's declared CLIs by worker id.
