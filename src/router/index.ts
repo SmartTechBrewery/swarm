@@ -26,6 +26,7 @@ import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
+import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
 import { registerWorkerTransport } from './worker-transport.js';
@@ -46,6 +47,10 @@ registerWorkerTransport(app, upgradeWebSocket);
 // a federated worker POSTs review/comment content here and the router performs
 // the GitHub write under the per-project reviewer PAT, which never leaves it.
 registerWorkerDelivery(app);
+// …and the operator session API (issue #798): `swarm login` authenticates a human
+// here because this is the process `SWARM_CONTROL_PLANE_URL` points at, and the
+// only one an operator off the control-plane host can reach.
+registerOperatorSession(app);
 // Say so at startup rather than at the first Respond-to-review reply: without the
 // operator token this host cannot resolve the *implementer* persona, so
 // `/worker/delivery/pr-comment` answers 503 for it (issue #444). Only a warning —

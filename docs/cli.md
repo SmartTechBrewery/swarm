@@ -31,7 +31,10 @@ it is required.
 `identities`, `workers`, `queue`, `run`, `worktrees`, `pm`) need `DATABASE_URL` (and
 some also `REDIS_URL`) in the environment; `pm webhook` additionally needs
 `WEBHOOK_CALLBACK_BASE_URL`. `run:worker` is one of the few that needs **no**
-`DATABASE_URL` — it reads a host-local file and starts the DB-free daemon. `npm run swarm -- …` and the dedicated npm
+`DATABASE_URL` — it reads a host-local file and starts the DB-free daemon. So is
+`login`, which needs `SWARM_CONTROL_PLANE_URL` instead: it authenticates over the
+network rather than reaching Postgres, which is what makes it usable off the
+control-plane host. `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
 
@@ -54,6 +57,7 @@ print the authoritative usage.
 | [`queue clear`](#swarm-queue) | Cancel all pending queue work |
 | [`run reset`](#swarm-run) | Reset a wedged run and restart its phase (last resort) |
 | [`run:worker`](#swarm-runworker) | Start this checkout's registered worker (credential from the local cache) |
+| [`login`](#swarm-login) | Sign this CLI in to the control plane over the network |
 | [`users`](#swarm-users) | Manage SWARM users and the installation admin |
 | [`members`](#swarm-members) | Manage project membership |
 | [`identities`](#swarm-identities) | Link a user to the handles they own on a provider |
@@ -266,6 +270,69 @@ Needs **no** `DATABASE_URL` — the launcher reads a host-local file and the dae
 is DB-free. The SWARM installation's own `.env` still supplies
 `SWARM_CONTROL_PLANE_URL`; the two variables injected here take precedence over
 any stale copies of them there.
+
+### `swarm login`
+
+```bash
+swarm login [--identifier <id>]
+swarm login --status
+swarm login --logout
+```
+
+Authenticate **this machine's operator CLI** to the control plane over the network
+(issue #798). Every other database-touching `swarm` command reaches Postgres
+directly, which is only possible on the control-plane host; this one is the
+opposite by design — it holds **no** `DATABASE_URL` and talks to the router's
+`/operator/session` routes over `SWARM_CONTROL_PLANE_URL`, exactly as the worker
+daemon does. That is what makes it usable from a machine that is not the control
+plane.
+
+- **`swarm login`** — prompts for an identifier (echoed; it is not a secret) and a
+  password (never echoed), authenticates against the control plane, verifies the
+  session it was issued, and caches the opaque token locally. When stdin is a
+  **pipe** the password is read from it, so `--identifier <id>` is then required —
+  stdin is already spoken for.
+- **`--status`** — reports who the cached token resolves to by *asking* the control
+  plane, not by decoding a token it cannot read. Exits non-zero when nothing is
+  cached, when the entry is unreadable, and when the control plane rejects the
+  token (expired or revoked).
+- **`--logout`** — revokes the session server-side and deletes the local copy. The
+  local copy goes **either way**; if the revocation was not confirmed the command
+  says so and exits non-zero, because the token stays live on the control plane
+  until it expires.
+
+The password is never accepted as an argument (it would reach the shell history
+and `ps`), and **neither secret is ever printed, logged, or placed in a URL** — a
+successful login names the identifier the control plane resolved and the *path* the
+token was written to.
+
+**Where the token is cached.**
+`~/.swarm/operator-sessions/<sha256 of the normalised control-plane URL>/session.json`,
+`700` on the directory and `600` on the file — the same host-local convention and
+owner-only expectation as the per-checkout worker credential cache
+([`run:worker`](#swarm-runworker)). Keying on the URL rather than on a checkout is
+what lets one machine hold sessions for several installations at once.
+
+**A `swarm login` is an ordinary session**, an existing `user_sessions` row with no
+new credential type, table, or hashing behind it. It therefore lasts
+`SWARM_SESSION_TTL_HOURS` (7 days by default, see
+[`configuration.md`](./configuration.md)), and re-running `swarm login` is the
+renewal path.
+
+**A single-user installation is not exempt.** `SWARM_SINGLE_USER_MODE` lets the
+API server resolve a passwordless `localhost-admin` for every request precisely
+because that server binds `127.0.0.1`; the router is internet-reachable through the
+tunnel, so honouring the same flag there would be an open door for anyone who found
+the URL. These routes deliberately ignore it. Set a password once and sign in like
+anyone else:
+
+```bash
+swarm users set-password localhost-admin
+swarm login --identifier localhost-admin
+```
+
+Nothing consumes the token yet — the operator API it authorises is mounted by a
+later phase of the networked-workers CLI work.
 
 ### `swarm users`
 

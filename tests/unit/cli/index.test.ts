@@ -8,7 +8,9 @@ vi.mock('@/cli/commands/logs.js', () => ({ run: vi.fn(async () => 0) }));
 vi.mock('@/cli/commands/queue.js', () => ({ run: vi.fn(async () => 0) }));
 vi.mock('@/cli/commands/run.js', () => ({ run: vi.fn(async () => 0) }));
 vi.mock('@/cli/commands/run-worker.js', () => ({ run: vi.fn(async () => 0) }));
+vi.mock('@/cli/commands/login.js', () => ({ run: vi.fn(async () => 0) }));
 
+import { run as loginRun } from '@/cli/commands/login.js';
 import { run as queueRun } from '@/cli/commands/queue.js';
 import { run as runCommandRun } from '@/cli/commands/run.js';
 import { run as runWorkerRun } from '@/cli/commands/run-worker.js';
@@ -47,6 +49,11 @@ describe('cli dispatch', () => {
 
 		expect(await run(['run', 'reset', 'r1'])).toBe(0);
 		expect(runCommandRun).toHaveBeenCalledWith(['reset', 'r1']);
+	});
+
+	it('dispatches login with its flags', async () => {
+		expect(await run(['login', '--status'])).toBe(0);
+		expect(loginRun).toHaveBeenCalledWith(['--status']);
 	});
 
 	it('prints usage and exits 0 with no command', async () => {
