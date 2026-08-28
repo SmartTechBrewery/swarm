@@ -398,14 +398,14 @@ function SettingsRouteComponent() {
 		});
 	};
 
-	// Both states gate the **Agent Defaults** panel alone: it is the only tab that reads
-	// `AppSettings`, so a failing `settings.get` must not blank Credentials or Appearance,
-	// neither of which asks for it.
-	if (activeTab === 'agents' && settingsQuery.isLoading) {
+	// Credentials has its own query and remains usable if `settings.get` fails. Both other
+	// tabs depend on the full settings blob: Agent Defaults reads `agents`, while
+	// Appearance merges its theme update onto it.
+	if (activeTab !== 'credentials' && settingsQuery.isLoading) {
 		return <div className="text-sm text-zinc-400">Loading settings…</div>;
 	}
 
-	if (activeTab === 'agents' && settingsQuery.isError) {
+	if (activeTab !== 'credentials' && settingsQuery.isError) {
 		return (
 			<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex flex-col gap-2">
 				<h3 className="text-sm font-semibold text-red-200">Error Loading Settings</h3>

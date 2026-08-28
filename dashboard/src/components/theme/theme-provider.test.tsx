@@ -90,6 +90,15 @@ describe('ThemeProvider', () => {
 		expect(result.current.resolvedTheme).toBe('dark');
 	});
 
+	it('does not write a partial settings blob while settings are still loading', () => {
+		mockGetSettings.mockReturnValue(new Promise(() => {})); // never resolves
+		const { result } = renderTheme();
+
+		act(() => result.current.setTheme('light'));
+
+		expect(mockUpdateSettings).not.toHaveBeenCalled();
+	});
+
 	it('defaults to dark when the settings query errors', async () => {
 		mockGetSettings.mockRejectedValue(new Error('network down'));
 		const { result } = renderTheme();
@@ -203,10 +212,11 @@ describe('ThemeProvider', () => {
 	});
 
 	it('rolls back to the last persisted preference and surfaces an error on save failure', async () => {
-		mockGetSettings.mockResolvedValue({ appearance: { theme: 'dark' } } satisfies AppSettings);
+		const stored = { appearance: { theme: 'dark' } } satisfies AppSettings;
+		mockGetSettings.mockResolvedValue(stored);
 		mockUpdateSettings.mockRejectedValue(new Error('save failed'));
-		const { result } = renderTheme();
-		await waitFor(() => expect(result.current.preference).toBe('dark'));
+		const { result, queryClient } = renderTheme();
+		await waitForSettingsLoaded(queryClient, stored);
 
 		act(() => result.current.setTheme('light'));
 		expect(result.current.preference).toBe('light');

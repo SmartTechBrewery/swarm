@@ -91,10 +91,7 @@ export async function writeInstanceScmCredential(
  * Clear the default for one slot. Clearing a slot that was never set is a no-op, not an
  * error — the end state is the same either way.
  */
-export async function deleteInstanceScmCredential(
-	providerId: ScmType,
-	role: ScmCredentialRole,
-): Promise<void> {
+export async function deleteInstanceScmCredential(providerId: string, role: string): Promise<void> {
 	await getDb()
 		.delete(instanceScmCredentials)
 		.where(

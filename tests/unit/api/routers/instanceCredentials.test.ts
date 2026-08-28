@@ -140,11 +140,10 @@ describe('instanceCredentialsRouter (issue #769)', () => {
 			expect(deleteInstanceScmCredential).toHaveBeenCalledWith('github', 'reviewer');
 		});
 
-		it('refuses an ineligible role', async () => {
-			await expect(caller.delete({ providerId: 'github', role: 'webhookSecret' })).rejects.toThrow(
-				/declares no instance-level default/,
-			);
-			expect(deleteInstanceScmCredential).not.toHaveBeenCalled();
+		it('clears a stored slot even when its role is no longer eligible', async () => {
+			await caller.delete({ providerId: 'github', role: 'webhookSecret' });
+
+			expect(deleteInstanceScmCredential).toHaveBeenCalledWith('github', 'webhookSecret');
 		});
 	});
 

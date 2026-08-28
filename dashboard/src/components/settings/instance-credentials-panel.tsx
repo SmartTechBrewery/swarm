@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Pencil, Trash2, X } from 'lucide-react';
 import type React from 'react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
 	type CredentialRole,
 	getScmProviderCopy,
@@ -182,6 +182,10 @@ function InstanceCredentialField({
 	// A slot with no default opens straight into the input — there is nothing to collapse.
 	const [editing, setEditing] = useState(!entry.isConfigured);
 	const [value, setValue] = useState('');
+	useEffect(() => {
+		setEditing(!entry.isConfigured);
+		setValue('');
+	}, [entry.isConfigured]);
 
 	const saveMutation = useMutation({
 		mutationFn: (secret: string) =>

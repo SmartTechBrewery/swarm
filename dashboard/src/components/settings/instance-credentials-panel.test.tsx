@@ -125,7 +125,9 @@ describe('InstanceCredentialsPanel (issue #769 — instance default credentials)
 	});
 
 	it('clears a configured role through the confirmation modal', async () => {
-		listFn.mockResolvedValue({ roles: [{ ...GITHUB_REVIEWER, isConfigured: true }] });
+		listFn
+			.mockResolvedValueOnce({ roles: [{ ...GITHUB_REVIEWER, isConfigured: true }] })
+			.mockResolvedValue({ roles: [GITHUB_REVIEWER] });
 		deleteMutate.mockResolvedValue(undefined);
 
 		renderPanel(<InstanceCredentialsPanel />);
@@ -139,6 +141,8 @@ describe('InstanceCredentialsPanel (issue #769 — instance default credentials)
 		await waitFor(() =>
 			expect(deleteMutate).toHaveBeenCalledWith({ providerId: 'github', role: 'reviewer' }),
 		);
+		await waitFor(() => expect(screen.getByLabelText('Reviewer PAT value')).not.toBeNull());
+		expect(screen.queryByText('••••')).toBeNull();
 	});
 
 	it('names a provider the dashboard cannot narrow instead of borrowing GitHub copy', async () => {

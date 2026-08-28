@@ -151,15 +151,14 @@ export const instanceCredentialsRouter = router({
 		}),
 
 	/**
-	 * Clear the installation's default for one eligible slot. No project loses a
-	 * credential: nothing resolves through this value, so clearing it only stops a future
-	 * project from being seeded with it.
+	 * Clear an installation default, including a stored legacy slot that a manifest no
+	 * longer declares eligible. No project loses a credential: nothing resolves through
+	 * this value, so clearing it only stops a future project from being seeded with it.
 	 */
 	delete: authedProcedure
 		.input(z.object({ providerId: z.string().min(1), role: z.string().min(1) }))
 		.mutation(async ({ ctx, input }) => {
 			assertInstanceCredentialAdmin(ctx.user);
-			const eligible = requireInstanceDefaultRole(input.providerId, input.role);
-			await deleteInstanceScmCredential(eligible.providerId, eligible.role);
+			await deleteInstanceScmCredential(input.providerId, input.role);
 		}),
 });
