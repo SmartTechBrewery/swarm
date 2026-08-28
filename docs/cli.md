@@ -28,13 +28,17 @@ when present. The `--` separates npm's own args from the ones passed to the CLI 
 it is required.
 
 **Environment.** Commands that touch the database (`config`, `users`, `members`,
-`identities`, `workers`, `queue`, `run`, `worktrees`, `pm`) need `DATABASE_URL` (and
+`identities`, `queue`, `run`, `worktrees`, `pm`) need `DATABASE_URL` (and
 some also `REDIS_URL`) in the environment; `pm webhook` additionally needs
 `WEBHOOK_CALLBACK_BASE_URL`. `run:worker` is one of the few that needs **no**
 `DATABASE_URL` — it reads a host-local file and starts the DB-free daemon. So is
 `login`, which needs `SWARM_CONTROL_PLANE_URL` instead: it authenticates over the
 network rather than reaching Postgres, which is what makes it usable off the
-control-plane host. `npm run swarm -- …` and the dedicated npm
+control-plane host. **So is `workers`, since issue #800** — every one of its
+subcommands calls the control plane's operator API over that same
+`SWARM_CONTROL_PLANE_URL`, authenticated by a `swarm login` session, so onboarding
+a machine no longer needs a database on the machine being onboarded.
+`npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
 
@@ -337,9 +341,10 @@ deliberate strict subset of the dashboard's tRPC router (the `workers` namespace
 alone, never `appRouter`), because the router is the internet-exposed process. No
 procedure's authorization is relaxed for being reached that way: the same
 installation-admin, strict-ownership and project-membership rules apply as in the
-dashboard, and `SWARM_SINGLE_USER_MODE` is ignored there too. The `swarm workers`
-commands still reach Postgres directly today; routing them through that API is the
-next phase of the networked-workers CLI work.
+dashboard, and `SWARM_SINGLE_USER_MODE` is ignored there too. Since issue #800
+that API is what **every [`swarm workers`](#swarm-workers) subcommand calls**, so
+`swarm login` is now the prerequisite for the whole command group and none of it
+needs a `DATABASE_URL` any more.
 
 ### `swarm users`
 
@@ -398,7 +403,7 @@ pair is a no-op; a handle already linked to a different user is rejected. Requir
 swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
 swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
 swarm workers list [<owner-identifier>]
-swarm workers set-cli <worker-id> --cli <c1,c2,...>
+swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
 swarm workers set-scm-credential <worker-id> <scm-provider-id>
 swarm workers remove <worker-id>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
@@ -407,9 +412,74 @@ swarm workers approve <worker-id> <project-id>
 swarm workers consent <worker-id> <project-id> <on|off>
 ```
 
+**Requires `SWARM_CONTROL_PLANE_URL` and a [`swarm login`](#swarm-login) session —
+and no `DATABASE_URL`** (issue #800). Every subcommand calls the control plane's
+operator API (`/operator/trpc/*`) over the network, exactly as the worker daemon
+calls the transport, so the whole group runs from the machine being onboarded
+rather than only from the control-plane host. An absent or expired session is one
+actionable line and exit 1 ("not signed in — run `swarm login`"); so is an unset
+`SWARM_CONTROL_PLANE_URL`.
+
+A refusal is reported in the **control plane's own words**. The procedures already
+name what disagrees — the capability the machine never probed, the two
+repositories, the busy machine — so this command prints their message rather than
+re-wording it. What it still says for itself is what it checks before calling:
+the arguments, the `--cli` list, the SCM provider id, an empty secret, a worker id
+that is not a uuid, and which enrollment a `(worker, project)` pair names.
+
+**Four things narrowed when the command group moved onto that API**, because the
+tRPC layer enforces ownership the direct-DB CLI never did. All four are intended:
+
+1. **`set-scm-credential` is owner-only.** `workers.scmCredentials.set` is strictly
+   owner-only by design, with no `instanceAdmin` override — so you must
+   `swarm login` **as the worker's owner**. That is the intended onboarding shape
+   (you are standing on your own new machine, signed in as yourself). The
+   capability this loses is an installation admin storing a credential *on somebody
+   else's* machine from the control-plane host; widening it would be its own issue.
+   That secret is also **verified against the provider before it is stored** now,
+   and the account it resolved to is named back — a value that resolves to no
+   account is refused with nothing written.
+2. **`remove` is owner-only and refuses a busy worker.** `workers.remove` blocks
+   while the machine is executing a run, and its `CONFLICT` message is surfaced
+   as-is. The unconditional delete this command used to be — documented as the
+   escape hatch for a stuck machine — is gone; stop the run first.
+3. **`list` is an installation-admin read unless it names your own handle.** With
+   your own login handle it is served by `workers.listMine` and needs nothing but a
+   session. Without an identifier, or with somebody else's, it is the
+   installation-wide roster (`workers.list`), which is reserved to an
+   `instanceAdmin` (issue #647); an owner filter is applied client-side on the rows
+   that read returns. An identifier nobody owns a visible worker under reports
+   "no workers for …" rather than "no such user" — user lookup is deliberately not
+   on the operator API.
+4. **`consent` and `update-enrollment` are owner-only.** Both land on procedures
+   gated by strict worker ownership with no `instanceAdmin` override: sharing
+   consent and the execution constraints (allowed CLIs, concurrency) are the
+   machine owner's own call, not an administrative one. An installation admin
+   running either against somebody else's machine gets
+   `Enrollment with ID "…" not found` for an enrollment that plainly exists — the
+   same existence-hiding `NOT_FOUND` narrowings 1 and 2 produce. Sign in as the
+   worker's owner.
+
+One thing also stopped being **atomic**: `enroll`'s `--active` and `--consent` are
+applied as separate calls after the create (issue #784), so a refusal of either
+leaves the enrollment itself in place. That is reported — the command names the
+created row's status and consent, and then the approvals still outstanding —
+rather than swallowed, because re-running `enroll` from there can only answer
+`CONFLICT`.
+
+One more thing moved rather than narrowed: **`register-and-enroll` validates the
+owner identifier later than it used to.** The call order is
+`workers.projectScmProvider` → prompt for the secret → `workers.register`, and it
+is `register` that resolves the owner. A typo'd `<owner-identifier>` therefore
+costs a wasted secret entry instead of failing immediately. Nothing is written
+before `register` succeeds either way, so the no-orphaned-worker guarantee below is
+unchanged.
+
 - **`register`** — register a worker for an owner (by login handle) with a display
   name and declared CLIs (`--cli`, comma-separated, one or more of
-  `claude | antigravity | codex`). **Prints a worker credential ONCE** — store it
+  `claude | antigravity | codex`). Registering one **for yourself** needs nothing
+  beyond a session; registering one for another owner is an installation-admin act.
+  **Prints a worker credential ONCE** — store it
   then (it is never printed again) and put it in `.env` as `SWARM_WORKER_CREDENTIAL`;
   the host worker authenticates its session with it at startup. It is *also* written
   to this machine's per-checkout cache, keyed to the directory where the command
@@ -421,44 +491,57 @@ swarm workers consent <worker-id> <project-id> <on|off>
   states what registration does *not* do (issue #767): the machine has no SCM
   identity until its **operator source-control credential** is stored for the
   provider its projects use, and every dispatch to it fails until then. Its owner
-  sets that at `/workers/<worker-id>` → **Operator source-control credential**; for
-  someone else's machine, use `set-scm-credential` below. `register` itself never
+  sets that at `/workers/<worker-id>` → **Operator source-control credential**, or
+  with `set-scm-credential` below. `register` itself never
   asks for a token — the provider isn't known at registration time.
 - **`register-and-enroll`** — the **recommended one-command path for a new machine**
   (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
   ending with the exact command that starts the daemon. It composes those three and
   relaxes none of their checks. The **SCM provider is resolved from the target
-  project** (`requireProjectSCMProviderId` — never assumed to be GitHub), so the
+  project** server-side (`workers.projectScmProvider`, which resolves it through the
+  same lookup the dispatcher uses — never assumed to be GitHub), so the
   credential prompt names the provider that project actually runs on and any of
   `github | bitbucket | gitlab` works; the secret is prompted for without echo on a
-  TTY, otherwise read from stdin, and never printed back. The enrollment is created
+  TTY, otherwise read from stdin, and never printed back. The enrollment ends up
   **active with sharing consent on** — a pending, non-consenting enrollment isn't
   "ready to start", and the four separate commands remain for anyone who wants those
-  two approvals kept as separate human decisions. **The worker credential is printed
+  two approvals kept as separate human decisions. (When you own the machine *and*
+  administer the project, the enrollment already arrives that way and no extra
+  approval call is made; otherwise `approve` and `consent` are applied on top. A
+  refusal of either — approving is a project administrator's call, which a machine's
+  owner may well not have — is reported rather than silently ignored, and since the
+  enrollment itself was created, what the command prints as left to do is
+  `workers approve` / `workers consent`, not a second `workers enroll`.)
+  **The worker credential is printed
   exactly once**, in the final start-command line. It **does not start the worker**:
   that daemon is a foreground, operator-owned process, so the last line is a command
   to run on the target machine yourself (its `.env` must already carry
   `SWARM_CONTROL_PLANE_URL`). The printed `SWARM_WORKER_REPO_ROOT` defaults to the
   checkout you run the command in — `INIT_CWD` under `npm run swarm --`, the current
-  directory for the global binary, exactly like `register` (issue #796) — and **not**
-  the project record's stored `repoRoot`, host-local state written by whichever machine
-  last ran `swarm config apply`. So no flag is needed when the machine running this
-  command is the worker's own; `--repo-root` overrides it for onboarding somebody
+  directory for the global binary, exactly like `register` (issue #796). So no flag
+  is needed when the machine running this command is the worker's own, which since
+  issue #800 is the normal case; `--repo-root` overrides it for onboarding somebody
   else's machine, whose checkout path this one cannot know. The credential cache
   uses that same resolved checkout; it offers `swarm run:worker` only when that
-  checkout exists on the machine running this command, which is normally the case
-  unless `--repo-root` names another machine's path. Everything each step
-  refuses today is still refused, with nothing written before the refusal wherever
-  that is possible: a bad `--cli`, an unknown owner or project, a project whose `scm`
+  checkout exists on the machine running this command. Everything each step
+  refuses is still refused, with nothing written before the refusal wherever
+  that is possible: a bad `--cli`, an unknown or inaccessible project, a project whose `scm`
   resolves no provider, and an empty or aborted secret all fail **before** the worker
-  is registered, so a typo never leaves an orphaned worker behind; a duplicate
-  display name, a capability mismatch, and a repository mismatch (naming both
-  repositories) fail exactly as `register` / `enroll` do. If a step after
+  is registered, so a typo never leaves an orphaned worker behind; an unknown owner,
+  a duplicate display name, an unverifiable credential, a capability mismatch, and a
+  repository mismatch (naming both repositories) fail exactly as `register` /
+  `set-scm-credential` / `enroll` do. If a step after
   registration fails, the command prints what is left to run by hand *and* the worker
   credential once, since that value is otherwise unrecoverable.
-- **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line). With an owner
-  identifier, only that owner's; without, all owners'. Never prints a credential.
-- **`set-cli`** — replace a worker's declared CLIs by worker id.
+- **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line). With your own
+  owner identifier, your machines; without one, or with somebody else's, the
+  installation roster (prefixed with the owner identifier when unfiltered) — see
+  narrowing 3 above. Never prints a credential.
+- **`set-cli`** — replace a worker's declared CLIs by worker id, or hand it back to
+  auto-discovery with `--auto`; exactly one of the two. The declaration is durable:
+  unlike the CLIs a daemon probes on its own PATH, it survives the machine's next
+  reconnect, and it may only *narrow* what that machine's daemon last reported. The
+  machine's owner alone may do it.
 - **`set-scm-credential`** — store (or rotate) this worker's **operator** credential
   for one SCM provider (`github | bitbucket | gitlab`) — the account every phase it
   runs against a project on that provider commits, pushes, opens pull requests and
@@ -466,16 +549,16 @@ swarm workers consent <worker-id> <project-id> <on|off>
   rest and resolved at dispatch, so a rotation takes effect on the next phase with no
   worker restart. The secret is prompted for without echo on a TTY and otherwise read
   from stdin — never taken as an argument (shell history, `ps`) and never printed
-  back. A worker with none stored for the provider a dispatch needs fails that
+  back — and it is verified against the provider before anything is stored. A worker
+  with none stored for the provider a dispatch needs fails that
   dispatch immediately, naming the worker and the provider. It replaces the
-  worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any more.
-- **`remove`** — deregister a worker by worker id. Unconditional: it deregisters a
-  machine that is connected or mid-run alike. Its dashboard equivalent since issue
-  #789 is `/workers/<worker-id>` → **Delete worker**, which is owner-only (no
-  `instanceAdmin` override) and is refused while the machine is executing a run —
-  this command stays the escape hatch for a stuck one. Either way the removal
-  cascades to the worker's enrollments, its operator SCM credentials and its
-  session, while runs it produced stay in history.
+  worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any more. Owner-only
+  (narrowing 1).
+- **`remove`** — deregister a worker by worker id. Owner-only, and refused while the
+  machine is executing a run (narrowing 2) — the same rule its dashboard equivalent
+  at `/workers/<worker-id>` → **Delete worker** applies since issue #789. The removal
+  cascades to the worker's enrollments, its operator SCM credentials and its session,
+  while runs it produced stay in history.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's
@@ -483,8 +566,19 @@ swarm workers consent <worker-id> <project-id> <on|off>
   here at once, still bounded by the worker's launch `--concurrency` flag
   (`SWARM_WORKER_CONCURRENCY`) and the project's Maximum Concurrent Jobs. There is
   no value meaning "no per-worker limit" — every enrollment states its share.
-  Starts pending with sharing consent off; `--active` approves it and `--consent`
-  grants sharing consent at once (operator seeding). The enrollment's **allowed
+  **Enrolling your own machine in a project you administer creates it active and
+  consenting** (issue #784), since both approvals are already yours; otherwise it
+  starts pending with sharing consent off, and `--active` / `--consent` then approve
+  it and grant consent (operator seeding) — each applied only when the created
+  enrollment is not already in that state, and each refusal reported. Approval is a
+  project administrator's call, so `--active` can be refused on a project you do not
+  administer — and `--consent` is strictly the machine owner's, so it can be refused
+  when you are seeding somebody else's machine. Either refusal leaves the enrollment
+  **created**, so the command says so (its status and consent) and prints the steps
+  that really remain — `swarm workers approve <worker-id> <project-id>`, a project
+  administrator's call, and `swarm workers consent <worker-id> <project-id> on`, the
+  owner's — never "enroll it again", which from there can only answer `CONFLICT`.
+  The enrollment's **allowed
   pipeline phases** start as every phase — narrow them per project on the worker
   detail screen (`/workers/<id>`); there is no flag for them yet. **A project whose
   repository is not the worker's own checkout is refused** (exit 1, naming both
@@ -499,19 +593,29 @@ swarm workers consent <worker-id> <project-id> <on|off>
   flag leaves the stored value alone, and there is no value that clears either.
   Approval status and sharing consent are untouched (`approve` / `consent`). A
   change takes effect on the **next** dispatch and never interrupts a running agent.
-- **`approve`** — approve a pending enrollment (worker + project) → active.
+  The machine's owner alone may do it (narrowing 4).
+- **`approve`** — approve a pending enrollment (worker + project) → active. A
+  project administrator's call.
 - **`consent`** — turn an enrollment's owner-controlled sharing consent on or off.
-  Revoking it blocks future dispatch without stopping a running agent.
+  Revoking it blocks future dispatch without stopping a running agent. The
+  machine's owner alone may do it (narrowing 4), so sign in as them.
 
-Requires `DATABASE_URL`. A worker is a local execution environment owned by a
+The last three take a `(worker-id, project-id)` pair while the underlying mutations
+are keyed on an enrollment id, so they resolve the pair through `workers.getById`
+first; a pair naming no enrollment reports
+`no enrollment for worker '<id>' in '<project>'` as it always has. That read is
+scoped to the projects you can see, so an owner who is not a member of the project
+their machine is enrolled in cannot address the enrollment from here — join the
+project, or use the worker detail screen.
+
+A worker is a local execution environment owned by a
 SWARM user; an enrollment offers it to a project, and it is routable **only while
 active AND sharing consent is on**. A project with no enrolled workers is
 unfederated and runs locally.
 
 > **Known gap:** an enrollment's **allowed pipeline phases** still have no CLI
 > flag (`enroll` starts them at every phase, and `update-enrollment` does not
-> change them). Edit them on the worker detail screen (`/workers/<id>`), or from
-> the CLI with a direct `UPDATE` on `worker_project_enrollments.allowed_phases`.
+> change them). Edit them on the worker detail screen (`/workers/<id>`).
 
 ### `swarm worktrees`
 
