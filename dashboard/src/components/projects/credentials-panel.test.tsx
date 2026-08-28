@@ -204,7 +204,9 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		projectScm.current = 'github';
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 
-		await waitFor(() => expect(screen.getByText(/SWARM_OPERATOR_GH_TOKEN/)).not.toBeNull());
+		await waitFor(() =>
+			expect(screen.getByText(/uses the worker operator's own token/)).not.toBeNull(),
+		);
 		expect(screen.getByText(/GitHub personal access token the reviewer persona/)).not.toBeNull();
 	});
 
@@ -217,7 +219,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		await waitFor(() =>
 			expect((screen.getByLabelText('Provider') as HTMLSelectElement).value).toBe('bitbucket'),
 		);
-		expect(screen.getByText(/SWARM_OPERATOR_BITBUCKET_TOKEN/)).not.toBeNull();
+		expect(screen.getByText(/\/bitbucket\/webhook/)).not.toBeNull();
 	});
 
 	it('persists a picked provider to project.scm and switches the copy', async () => {
@@ -230,7 +232,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		await waitFor(() =>
 			expect(updateProject).toHaveBeenCalledWith({ id: 'proj-a', scm: 'bitbucket' }),
 		);
-		expect(screen.getByText(/SWARM_OPERATOR_BITBUCKET_TOKEN/)).not.toBeNull();
+		expect(screen.getByText(/\/bitbucket\/webhook/)).not.toBeNull();
 	});
 
 	// Issue #734: this write shares `projects.update` with the Source Control tab's
@@ -272,7 +274,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		projectScm.current = 'gitlab';
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 
-		await waitFor(() => expect(screen.getByText(/SWARM_OPERATOR_GITLAB_TOKEN/)).not.toBeNull());
+		await waitFor(() => expect(screen.getByText(/\/gitlab\/webhook/)).not.toBeNull());
 
 		fireEvent.change(screen.getByLabelText('Reviewer Access Token value'), {
 			target: { value: 'glpat-secret' },

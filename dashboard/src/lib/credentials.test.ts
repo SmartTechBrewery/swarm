@@ -81,8 +81,16 @@ describe('getScmProviderCopy', () => {
 		expect(copy.verifyFailureMessage).toMatch(/GitHub account/);
 	});
 
-	it('explains the implementer token is the operator env var, not a project credential', () => {
-		expect(copy.intro).toMatch(/SWARM_OPERATOR_GH_TOKEN/);
+	// Issue #766 retired the env var this used to name: the operator credential is now
+	// per worker, set on that worker's own page, so the intro must point there.
+	it('points the implementer identity at the worker’s own page, not an env var', () => {
+		expect(copy.intro).toMatch(/set per worker on that worker's own page/);
+		expect(copy.intro).not.toMatch(/SWARM_OPERATOR/);
+	});
+
+	it('names the operator credential in GitHub’s own vocabulary', () => {
+		expect(copy.operatorLabel).toBe('Operator PAT');
+		expect(copy.operatorDescription).toMatch(/personal access token this machine acts as/);
 	});
 });
 
@@ -103,9 +111,17 @@ describe('getScmProviderCopy — Bitbucket', () => {
 		});
 	});
 
-	it('points at Bitbucket’s own operator env var and ingress route', () => {
-		expect(copy.intro).toMatch(/SWARM_OPERATOR_BITBUCKET_TOKEN/);
+	it('points at the worker’s own page and Bitbucket’s ingress route', () => {
+		expect(copy.intro).toMatch(/set per worker on that worker's own page/);
+		expect(copy.intro).not.toMatch(/SWARM_OPERATOR/);
 		expect(copy.intro).toMatch(/\/bitbucket\/webhook/);
+	});
+
+	// The operator credential is an app password here too — and the pair form is what
+	// resolves an account, so the copy has to say so (issue #766).
+	it('names the operator credential an app password in pair form', () => {
+		expect(copy.operatorLabel).toBe('Operator App Password');
+		expect(copy.operatorDescription).toMatch(/username:app_password/);
 	});
 });
 
@@ -124,9 +140,15 @@ describe('getScmProviderCopy — GitLab', () => {
 		expect(copy.verifyFailureMessage).toMatch(/GitLab account/);
 	});
 
-	it('points at GitLab’s own operator env var and ingress route', () => {
-		expect(copy.intro).toMatch(/SWARM_OPERATOR_GITLAB_TOKEN/);
+	it('points at the worker’s own page and GitLab’s ingress route', () => {
+		expect(copy.intro).toMatch(/set per worker on that worker's own page/);
+		expect(copy.intro).not.toMatch(/SWARM_OPERATOR/);
 		expect(copy.intro).toMatch(/\/gitlab\/webhook/);
+	});
+
+	it('names the operator credential an access token needing the api scope', () => {
+		expect(copy.operatorLabel).toBe('Operator Access Token');
+		expect(copy.operatorDescription).toMatch(/api scope/);
 	});
 
 	// GitLab has neither a PAT nor a signing secret: an access token, and a secret token

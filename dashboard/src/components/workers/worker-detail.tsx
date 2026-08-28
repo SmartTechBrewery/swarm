@@ -4,6 +4,7 @@ import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
+import { WorkerOperatorCredentialsCard } from '@/components/workers/worker-operator-credentials-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpcClient } from '@/lib/trpc.js';
@@ -33,10 +34,13 @@ import type { WorkerDetail } from '@/types/workers.js';
  * enrollment card's owner-controlled values, and by the same strict-ownership
  * check server-side (`workers.rename`, no `instanceAdmin` override).
  *
- * **Nothing secret is on this surface**, by construction rather than by filtering:
- * its only source is the `workers.getById` read model, which names each safe field
- * explicitly, so no machine path, worker credential, credential hash, or project
- * PAT exists to leak.
+ * **Nothing secret is *read back* on this surface**, by construction rather than by
+ * filtering: `workers.getById` names each safe field explicitly, so no machine path,
+ * worker credential, credential hash, or project PAT exists to leak. Since issue #766
+ * it does host one **write-only** secret field — the operator source-control
+ * credential ({@link WorkerOperatorCredentialsCard}) — whose own read reports presence
+ * and a last-updated time and never a value or a masked echo of one, so there is still
+ * nothing here to reveal.
  *
  * **Offering the machine to a *new* project is here too** (issue #764), as the
  * owner's own action ({@link WorkerEnrollDialog}) over the same `workers.enroll`
@@ -298,6 +302,17 @@ export function WorkerDetailView({
 					<p className="text-sm text-zinc-400">Idle — no run assigned right now.</p>
 				)}
 			</div>
+
+			{/* Worker-scoped state, so it sits above the per-project blocks — which are also
+			    what decide which providers it lists. Owner-only, the same strict flag that
+			    gates the rename field and the enroll entry point, and the server re-checks
+			    the same rule on every procedure. */}
+			{worker.viewerIsOwner ? (
+				<div className={CARD_CLASS}>
+					<h2 className={SECTION_HEADING_CLASS}>Operator source-control credential</h2>
+					<WorkerOperatorCredentialsCard workerId={worker.workerId} />
+				</div>
+			) : null}
 
 			<div className={CARD_CLASS}>
 				<h2 className={SECTION_HEADING_CLASS}>Project enrollments</h2>

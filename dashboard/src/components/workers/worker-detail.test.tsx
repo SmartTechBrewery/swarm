@@ -14,6 +14,8 @@ const {
 	renameMutate,
 	enrollMutate,
 	projectsListQueryFn,
+	scmCredentialsListQueryFn,
+	scmCredentialsSetMutate,
 } = vi.hoisted(() => ({
 	setConsentMutate: vi.fn(),
 	updateConstraintsMutate: vi.fn(),
@@ -22,6 +24,8 @@ const {
 	renameMutate: vi.fn(),
 	enrollMutate: vi.fn(),
 	projectsListQueryFn: vi.fn(),
+	scmCredentialsListQueryFn: vi.fn(),
+	scmCredentialsSetMutate: vi.fn(),
 }));
 
 // The enroll dialog (issue #764) is mounted for an owner — with its projects query
@@ -34,6 +38,18 @@ vi.mock('@/lib/trpc.js', () => ({
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
 		},
+		// The operator-credential card (issue #766) is mounted for an owner and owns its
+		// own query, so every case in this file needs it stubbed.
+		workers: {
+			scmCredentials: {
+				list: {
+					queryOptions: ({ workerId }: { workerId: string }) => ({
+						queryKey: ['workers.scmCredentials.list', workerId],
+						queryFn: () => scmCredentialsListQueryFn(workerId),
+					}),
+				},
+			},
+		},
 	},
 	trpcClient: {
 		workers: {
@@ -43,6 +59,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			setStatus: { mutate: setStatusMutate },
 			rename: { mutate: renameMutate },
 			enroll: { mutate: enrollMutate },
+			scmCredentials: { set: { mutate: scmCredentialsSetMutate } },
 		},
 	},
 }));
@@ -149,6 +166,9 @@ beforeEach(() => {
 	enrollMutate.mockReset();
 	projectsListQueryFn.mockReset();
 	projectsListQueryFn.mockResolvedValue([]);
+	scmCredentialsListQueryFn.mockReset();
+	scmCredentialsListQueryFn.mockResolvedValue({ providers: [] });
+	scmCredentialsSetMutate.mockReset();
 	onChanged.mockReset();
 	vi.useFakeTimers({ toFake: ['Date'] });
 	vi.setSystemTime(NOW);
@@ -845,5 +865,27 @@ describe('WorkerDetailView project-administrator actions', () => {
 		fireEvent.click(confirmButton('Suspend enrollment'));
 
 		expect(await screen.findByText('Enrollment with ID "enr-1" not found')).toBeDefined();
+	});
+});
+
+/**
+ * The operator credential is worker-owner state, gated by the same strict
+ * `viewerIsOwner` flag as the rename field and the enroll entry point (issue #766).
+ * The card's own behaviour is covered in
+ * `worker-operator-credentials-card.test.tsx`; what matters here is the gate.
+ */
+describe('WorkerDetailView — operator source-control credential (issue #766)', () => {
+	it('renders the section for the worker’s owner', async () => {
+		renderWorker({ viewerIsOwner: true });
+
+		expect(screen.getByText('Operator source-control credential')).toBeDefined();
+		await waitFor(() => expect(scmCredentialsListQueryFn).toHaveBeenCalledWith('worker-1'));
+	});
+
+	it('omits the section, and its query, for a non-owner', () => {
+		renderWorker({ viewerIsOwner: false });
+
+		expect(screen.queryByText('Operator source-control credential')).toBeNull();
+		expect(scmCredentialsListQueryFn).not.toHaveBeenCalled();
 	});
 });

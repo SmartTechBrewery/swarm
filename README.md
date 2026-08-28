@@ -174,8 +174,8 @@ shortest path to a working checkout.
   [`docs/cli.md`](docs/cli.md))
 - Two distinct source-control identities for loop prevention: the worker operator's
   own credential (the implementer persona), stored per worker per SCM provider with
-  `swarm workers set-scm-credential`, and a separate project-scoped reviewer
-  credential
+  `swarm workers set-scm-credential` or from that worker's own page in the dashboard,
+  and a separate project-scoped reviewer credential
 - A project credential for the **board**, separate from the two above, held per PM
   provider under `credentials.pm.<provider>.<role>` so a project can carry two
   providers' credentials at once while only the one `pm.type` names is ever
@@ -271,9 +271,11 @@ SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
 
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
-<worker-id> <github|bitbucket|gitlab>` — and travels with each assignment, so
-rotating it needs no worker restart and a Bitbucket or GitLab project resolves its
-own credential rather than a GitHub-named one.
+<worker-id> <github|bitbucket|gitlab>`, or from that worker's own page in the
+dashboard (`/workers/<worker-id>`, which verifies the value against the provider
+before storing it) — and travels with each assignment, so rotating it needs no worker
+restart and a Bitbucket or GitLab project resolves its own credential rather than a
+GitHub-named one.
 
 It is intentionally host-run: it needs local Git worktrees, agent CLI
 authentication, and the developer's PATH.

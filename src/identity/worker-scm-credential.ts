@@ -17,7 +17,11 @@
  * effect on the next phase, with no worker restart.
  */
 
+import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import { listEnrollmentsForWorker } from '../db/repositories/workerEnrollmentsRepository.js';
 import { resolveWorkerScmCredential } from '../db/repositories/workerScmCredentialsRepository.js';
+import { requireProjectSCMProviderId } from '../integrations/scm/registry.js';
+import { logger } from '../lib/logger.js';
 import type { ScmType } from '../scm/types.js';
 
 /** Which worker, and which SCM provider, {@link requireWorkerScmCredential} is asked for. */
@@ -77,4 +81,51 @@ export async function requireWorkerScmCredential({
 			"commits, pushes and comments as the operator's own account, so it cannot start " +
 			`without one — set it with \`swarm workers set-scm-credential ${workerId} ${scmProviderId}\`.`,
 	);
+}
+
+/**
+ * Which SCM providers this worker actually needs an operator credential for — the
+ * providers of the projects it is enrolled in, de-duplicated and in enrollment
+ * order. The read behind phase 2/3's dashboard form (issue #766), so the slots it
+ * offers are the ones a dispatch would really ask a credential for rather than a
+ * fixed "GitHub PAT" field.
+ *
+ * It lives beside {@link requireWorkerScmCredential} rather than in the router
+ * because it is policy about *this* credential, and because it must resolve a
+ * project's provider **exactly the way the dispatcher does** —
+ * `requireProjectSCMProviderId`, never `project.scm ?? 'github'`, which would offer
+ * a Bitbucket-only worker a GitHub slot.
+ *
+ * Every enrollment counts regardless of status: a `pending` one is the acceptance
+ * criteria's "or is being enrolled in", and a suspended one still holds a
+ * credential worth rotating.
+ *
+ * A project whose provider does not resolve — unregistered, not runtime-ready, or
+ * naming none while two-plus are ready — is **skipped with a debug log** rather
+ * than surfaced as a slot or thrown out of the read: the fix there is that
+ * project's own `scm` config, not the worker owner's credential, and a dispatch for
+ * it fails with the registry's own specific message either way.
+ */
+export async function listWorkerScmProviders(workerId: string): Promise<ScmType[]> {
+	const enrollments = await listEnrollmentsForWorker(workerId);
+	const providerIds: ScmType[] = [];
+
+	for (const enrollment of enrollments) {
+		const project = await findProjectByIdFromDb(enrollment.projectId);
+		if (!project) continue;
+		let providerId: ScmType;
+		try {
+			providerId = requireProjectSCMProviderId(project);
+		} catch (error) {
+			logger.debug('skipping a worker enrollment whose project resolves no SCM provider', {
+				workerId,
+				projectId: enrollment.projectId,
+				reason: error instanceof Error ? error.message : String(error),
+			});
+			continue;
+		}
+		if (!providerIds.includes(providerId)) providerIds.push(providerId);
+	}
+
+	return providerIds;
 }

@@ -95,6 +95,17 @@ Notes:
   to this worker fails immediately with a message naming the worker and the provider.
   It replaces the worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any
   more; see the rollout order in Part 2.
+- **Step 5 has a dashboard equivalent too** (issue #766): the worker's owner can set
+  and rotate the same value at `/workers/<worker-id>` → **Operator source-control
+  credential**, with no CLI or DB access — one field per provider that machine's
+  enrollments actually resolve to. The dashboard **verifies the value against the
+  provider before storing it**, so a wrong paste is refused there and then rather than
+  failing at the next dispatch, and it confirms the account it resolved to. The stored
+  value is never shown again — only that it is set, when it was last written, and a
+  **Replace** control — and it applies to the next dispatch with no worker restart,
+  exactly as this command's does. Setting it for another operator's machine stays the
+  CLI's: the dashboard form is strictly the worker owner's, with no instance-admin
+  override.
 - Skip `swarm identities link` unless you already know which GitHub account
   should be the *assignee* that routes work to this specific machine — without
   it the worker still receives review / respond-to-review / respond-to-ci /
@@ -226,7 +237,7 @@ to expire after `heartbeatTtlMs`.
 | --- | --- |
 | `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
 | `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the two variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
-| Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>` — it takes effect on the next dispatch, with no worker restart. |
+| Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, step 4), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
