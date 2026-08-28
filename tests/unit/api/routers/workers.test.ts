@@ -1201,6 +1201,16 @@ describe('workers.remove (owner-only deregistration, issue #789)', () => {
 		expect(removeWorker).not.toHaveBeenCalled();
 	});
 
+	it('refuses an expired-session worker when it still has an unexpired dispatch claim', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-1' });
+
+		await expect(owner.remove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'CONFLICT' }),
+		);
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
 	// Merely being connected is not a reason to refuse: the session row cascades and
 	// the daemon's next reconnect fails on a credential that no longer resolves,
 	// which is exactly what retiring a machine means.
