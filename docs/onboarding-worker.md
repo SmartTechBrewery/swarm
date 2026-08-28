@@ -98,7 +98,13 @@ Notes:
   on. It may only *narrow* what the machine's daemon last reported — to widen
   that, install the CLI there (or set `SWARM_WORKER_TRANSPORT_CLIS` on the machine
   itself). `swarm workers set-cli <worker-id> --auto` clears the declaration and
-  returns the worker to plain auto-discovery.
+  returns the worker to plain auto-discovery. **This has a dashboard equivalent**
+  (issue #787): the worker's owner can do the same at `/workers/<worker-id>` →
+  **Declared by the daemon** → *Agent CLIs*, which offers one checkbox per CLI the
+  machine actually reported and a *Use auto-detected CLIs* button for `--auto`. It
+  calls the same seam this command does, needs no CLI or DB access, and is the
+  owner's alone — no installation admin override. It also names a declared CLI the
+  machine has stopped reporting, which is otherwise only a server-side log line.
 - Step 3's credential is shown exactly once (`swarm workers list` never prints
   it again). Copy it immediately; if you lose it, `workers remove` +
   `workers register` again is the only recovery.
