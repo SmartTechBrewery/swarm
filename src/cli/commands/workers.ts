@@ -16,10 +16,16 @@
  *
  * The secrets it handles are both write-only. `register` prints the **worker
  * credential** exactly once with a "store it now" note (analogous to `swarm users
- * set-password` never echoing a stored secret), and it is never shown again;
+ * set-password` never echoing a stored secret), and it is never printed again;
  * `set-scm-credential` stores the **operator's own SCM credential** for this
  * machine (issue #765) read without echo, and prints no preview of it. No
  * subcommand prints a credential or its hash.
+ *
+ * Both registration paths *also* write the worker credential to this machine's
+ * per-checkout cache (`_shared/worker-credential-cache.ts`, issue #788), so
+ * `swarm run:worker` can start the daemon from that checkout with nothing to
+ * paste. Printing stays: a remote machine, or a process supervisor, still needs
+ * the value, and this cache only ever answers for the checkout it was written in.
  *
  * `register` *points at* that second secret's write surfaces rather than taking
  * it (issue #767): a worker's SCM provider is a property of its enrollments and
@@ -48,6 +54,7 @@
  *   swarm workers consent <worker-id> <project-id> <on|off>
  */
 
+import { existsSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { closeDb } from '../../db/client.js';
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
@@ -73,6 +80,7 @@ import {
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } from '../../identity/worker-service.js';
+import { describeError } from '../../lib/errors.js';
 // The SCM manifests must be registered before `requireProjectSCMProviderId` can
 // resolve the provider a project runs on (register-and-enroll).
 import '../../integrations/entrypoint.js';
@@ -80,6 +88,7 @@ import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js'
 import { SCM_TYPES, type ScmType } from '../../scm/types.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
+import { writeWorkerCredentialCache } from '../_shared/worker-credential-cache.js';
 
 const AGENT_CLIS = AgentCliSchema.options;
 /**
@@ -113,7 +122,10 @@ Usage:
              Its owner does that in the dashboard at /workers/<worker-id> →
              "Operator source-control credential"; for someone else's machine,
              run set-scm-credential below. This command asks for no token of any
-             kind — the provider is not known at registration time.
+             kind — the provider is not known at registration time. The
+             credential is also cached for the checkout this runs in
+             (~/.swarm/worker-credentials/), so \`swarm run:worker\` can start
+             this worker from here with nothing to paste.
   register-and-enroll
              The one-command path for a NEW machine: registers the worker,
              stores its operator source-control credential, and enrolls it in
@@ -128,7 +140,8 @@ Usage:
              final line is a command to run on that machine yourself. The
              printed SWARM_WORKER_REPO_ROOT is the project's configured checkout
              unless --repo-root names the one on the target machine. The worker
-             credential is shown ONCE, in that final line.
+             credential is shown ONCE, in that final line — and cached for
+             the checkout this runs in, exactly as register does.
   list       List workers ('<id>\\t<displayName>\\t<clis>' per line). With an
              owner identifier, only that owner's; without, all owners' (prefixed
              with the owner identifier). Never prints a credential or its hash.
@@ -233,6 +246,40 @@ function parseClis(raw: string) {
 	return clis;
 }
 
+/**
+ * Cache the freshly issued credential for a checkout,
+ * and print the path — never the value (issue #788). Both registration paths call
+ * this, so `swarm run:worker` finds a worker made either way.
+ *
+ * The caller chooses the checkout explicitly: `register` uses npm's `INIT_CWD`
+ * when available, while `register-and-enroll` uses the resolved worker checkout.
+ * Neither trusts ambient `SWARM_WORKER_REPO_ROOT`, which could name a different
+ * worker than the one being registered.
+ *
+ * Best-effort by design. The credential is already issued and is about to be
+ * printed, so a cache the operator can re-create by re-registering must never be
+ * the reason registration reports failure — that would strand a registered worker
+ * whose credential was never shown.
+ */
+function cacheCredentialForCheckout(workerId: string, credential: string, repoRoot: string): void {
+	try {
+		const cachePath = writeWorkerCredentialCache({
+			repoRoot,
+			workerId,
+			credential,
+		});
+		if (existsSync(repoRoot)) {
+			out.info(
+				`also cached for ${repoRoot} — start this worker there with: swarm run:worker (${cachePath})`,
+			);
+		} else {
+			out.info(`also cached for checkout ${repoRoot}: ${cachePath}`);
+		}
+	} catch (err) {
+		out.warn(`could not cache the credential for ${repoRoot}: ${describeError(err)}`);
+	}
+}
+
 async function registerWorkerCommand(argv: string[]): Promise<number> {
 	const { values, positionals } = parseArgs({
 		args: argv,
@@ -283,6 +330,7 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 		out.info(
 			`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 		);
+		cacheCredentialForCheckout(worker.id, credential, process.env.INIT_CWD ?? process.cwd());
 		// Registration issues the worker's *connection* credential and nothing else, so
 		// the machine still has no source-control identity and every dispatch to it
 		// fails until one is stored (issue #765). Name both write surfaces and no
@@ -795,6 +843,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	out.info(
 		`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 	);
+	cacheCredentialForCheckout(worker.id, credential, repoRoot);
 
 	// From here the worker row exists and its credential is a one-time value held
 	// only in memory, so a later failure must still hand it over — losing it means

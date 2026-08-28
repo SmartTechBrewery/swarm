@@ -30,7 +30,8 @@ it is required.
 **Environment.** Commands that touch the database (`config`, `users`, `members`,
 `identities`, `workers`, `queue`, `run`, `worktrees`, `pm`) need `DATABASE_URL` (and
 some also `REDIS_URL`) in the environment; `pm webhook` additionally needs
-`WEBHOOK_CALLBACK_BASE_URL`. `npm run swarm -- …` and the dedicated npm
+`WEBHOOK_CALLBACK_BASE_URL`. `run:worker` is one of the few that needs **no**
+`DATABASE_URL` — it reads a host-local file and starts the DB-free daemon. `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
 
@@ -52,6 +53,7 @@ print the authoritative usage.
 | [`logs`](#swarm-logs) | Tail stack logs |
 | [`queue clear`](#swarm-queue) | Cancel all pending queue work |
 | [`run reset`](#swarm-run) | Reset a wedged run and restart its phase (last resort) |
+| [`run:worker`](#swarm-runworker) | Start this checkout's registered worker (credential from the local cache) |
 | [`users`](#swarm-users) | Manage SWARM users and the installation admin |
 | [`members`](#swarm-members) | Manage project membership |
 | [`identities`](#swarm-identities) | Link a user to the handles they own on a provider |
@@ -59,9 +61,12 @@ print the authoritative usage.
 | [`worktrees prune`](#swarm-worktrees) | Prune stale per-task worktrees |
 | [`pm webhook`](#swarm-pm) | Register/list/delete a project's Trello board webhook |
 
-> The worker is **not** managed by this CLI — it runs on the host, outside Docker
-> Compose (it needs the developer's PATH/auth for git and the agent CLIs). Start
-> it with `npm run dev:worker` (see [Process & dev scripts](#process--dev-scripts-npm-run)).
+> The worker runs on the host, outside Docker Compose (it needs the developer's
+> PATH/auth for git and the agent CLIs), and this CLI does not supervise it. On the
+> machine that registered it, [`swarm run:worker`](#swarm-runworker) starts the
+> worker registered for the current directory; anywhere else, start it with
+> `npm run dev:worker` and explicit env vars (see
+> [Process & dev scripts](#process--dev-scripts-npm-run)).
 
 ### `swarm init`
 
@@ -224,6 +229,44 @@ worker when it provisions the restart, following the discard intent step 4
 reports. Running it on the host that owns the worktree still settles that checkout
 one step sooner, but it is no longer required to free a wedged one.
 
+### `swarm run:worker`
+
+```bash
+swarm run:worker
+```
+
+Start **this checkout's** registered worker (issue #788) — the daemon
+`npm run dev:worker` runs, with its two host-local values supplied for you:
+`SWARM_WORKER_REPO_ROOT` is the directory where you invoked the command, and `SWARM_WORKER_CREDENTIAL`
+comes out of the per-checkout cache `swarm workers register` /
+`register-and-enroll` wrote on this machine. Nothing is printed and nothing has to
+be pasted; the command names the worker id and the checkout, never the credential.
+For `npm run swarm -- run:worker`, npm exposes that directory through `INIT_CWD`;
+the global `swarm run:worker` form uses its current directory. Both forms therefore
+select the same checkout you invoked them from.
+
+This is an **additional** start path, not a replacement. It is for the case where
+the machine that registered the worker is the machine running it; for a remote
+machine, a process supervisor, or anything else, keep using `npm run dev:worker`
+with both variables set explicitly — that path is unchanged.
+
+It adds no supervision and no daemonizing: the worker stays a foreground,
+operator-owned process and this command exits with its exit code. It also adds no
+locking — the daemon takes the checkout lock itself, so a second `run:worker` in
+the same checkout is refused by that lock exactly as a second `dev:worker` is.
+
+A checkout with no cache entry gets an actionable refusal naming the checkout and
+both remedies (register here, or start the daemon yourself), never a raw
+file-not-found; an entry that exists but cannot be read is reported separately,
+naming the file. A git *worktree* has its own realpath and so its own key — it has
+no entry and gets the first message, which is correct: the daemon runs against the
+main checkout.
+
+Needs **no** `DATABASE_URL` — the launcher reads a host-local file and the daemon
+is DB-free. The SWARM installation's own `.env` still supplies
+`SWARM_CONTROL_PLANE_URL`; the two variables injected here take precedence over
+any stale copies of them there.
+
 ### `swarm users`
 
 ```bash
@@ -293,8 +336,14 @@ swarm workers consent <worker-id> <project-id> <on|off>
 - **`register`** — register a worker for an owner (by login handle) with a display
   name and declared CLIs (`--cli`, comma-separated, one or more of
   `claude | antigravity | codex`). **Prints a worker credential ONCE** — store it
-  then (it is never shown again) and put it in `.env` as `SWARM_WORKER_CREDENTIAL`;
-  the host worker authenticates its session with it at startup. The command also
+  then (it is never printed again) and put it in `.env` as `SWARM_WORKER_CREDENTIAL`;
+  the host worker authenticates its session with it at startup. It is *also* written
+  to this machine's per-checkout cache, keyed to the directory where the command
+  was invoked (`INIT_CWD` for `npm run swarm -- workers register …`)
+  (`~/.swarm/worker-credentials/<hash>/credential.json`, issue #788), so
+  [`swarm run:worker`](#swarm-runworker) can start this worker from that checkout with
+  nothing to paste; the command names that file (never the value). Printing stays,
+  because a remote machine or a process supervisor still needs the value. The command also
   states what registration does *not* do (issue #767): the machine has no SCM
   identity until its **operator source-control credential** is stored for the
   provider its projects use, and every dispatch to it fails until then. Its owner
@@ -317,7 +366,9 @@ swarm workers consent <worker-id> <project-id> <on|off>
   to run on the target machine yourself (its `.env` must already carry
   `SWARM_CONTROL_PLANE_URL`). `--repo-root` overrides the printed
   `SWARM_WORKER_REPO_ROOT`, which otherwise defaults to the project's configured
-  checkout — pass it when the machine's checkout path differs. Everything each step
+  checkout — pass it when the machine's checkout path differs. The credential cache
+  uses that same resolved checkout; it offers `swarm run:worker` only when that
+  checkout exists on the machine running this command. Everything each step
   refuses today is still refused, with nothing written before the refusal wherever
   that is possible: a bad `--cli`, an unknown owner or project, a project whose `scm`
   resolves no provider, and an empty or aborted secret all fail **before** the worker
@@ -456,7 +507,7 @@ repo root.
 | `npm run dev:api` | Migrate the DB, free `API_PORT`, then start the API server (`:3101`) with `--watch`. In dev it serves the API only; it also serves the built dashboard SPA from `dashboard/dist` when that exists. It also runs the control-plane host maintenance loop — the orphaned-run reap, CLI quota discovery, and the worktree retention sweep (`src/api/maintenance.ts`, issue #550). |
 | `npm run start:api` | Build the dashboard, then run `dev:api` — the recommended **same-origin** mode where one process serves the SPA + API on `:3101` (used for public/tunnel access). |
 | `npm run reload` | After `git pull`: sync both dependency trees, rebuild the dashboard (`dist`, picked up live by a running `dev:api`/`start:api` since it serves `dist` from disk), and apply migrations. Does **not** restart the worker or rebuild the router — do those manually if their code changed (it prints the reminder). |
-| `npm run dev:worker` | Start the worker (`src/transport/connect-entry.ts`). **This is the worker** — the only one, on every machine, remote or the control-plane host itself, where it points `SWARM_CONTROL_PLANE_URL` at the router over loopback (issue #551). It is not in Docker Compose, holds no `DATABASE_URL`/`REDIS_URL`, and needs `SWARM_WORKER_CREDENTIAL` and `SWARM_CONTROL_PLANE_URL` in `.env` — no operator SCM credential since issue #765, which arrives per assignment (`swarm workers set-scm-credential`). |
+| `npm run dev:worker` | Start the worker (`src/transport/connect-entry.ts`). **This is the worker** — the only one, on every machine, remote or the control-plane host itself, where it points `SWARM_CONTROL_PLANE_URL` at the router over loopback (issue #551). It is not in Docker Compose, holds no `DATABASE_URL`/`REDIS_URL`, and needs `SWARM_WORKER_CREDENTIAL` and `SWARM_CONTROL_PLANE_URL` in `.env` — no operator SCM credential since issue #765, which arrives per assignment (`swarm workers set-scm-credential`). On the machine that *registered* the worker, [`swarm run:worker`](#swarm-runworker) starts this same script with both host-local values filled in from the per-checkout credential cache, so nothing has to be pasted (issue #788); this explicit form stays the path for a remote machine or a process supervisor. |
 | `npm run dev:worker:watch` | Same as `dev:worker`, with `--watch` auto-restart. |
 | `npm run dev:worker:seed` | Apply `swarm.config.json` (`db:seed`) then start the worker. Control-plane host only — `db:seed` needs `DATABASE_URL`. |
 | `npm run dev:dashboard` | Start the dashboard Vite dev server (`:5173`) — local development only; not what you expose publicly. |

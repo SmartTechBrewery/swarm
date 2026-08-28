@@ -7,9 +7,11 @@ vi.mock('@/cli/commands/status.js', () => ({ run: vi.fn(async () => 0) }));
 vi.mock('@/cli/commands/logs.js', () => ({ run: vi.fn(async () => 0) }));
 vi.mock('@/cli/commands/queue.js', () => ({ run: vi.fn(async () => 0) }));
 vi.mock('@/cli/commands/run.js', () => ({ run: vi.fn(async () => 0) }));
+vi.mock('@/cli/commands/run-worker.js', () => ({ run: vi.fn(async () => 0) }));
 
 import { run as queueRun } from '@/cli/commands/queue.js';
 import { run as runCommandRun } from '@/cli/commands/run.js';
+import { run as runWorkerRun } from '@/cli/commands/run-worker.js';
 import { run as startRun } from '@/cli/commands/start.js';
 import { run } from '@/cli/index.js';
 
@@ -35,6 +37,16 @@ describe('cli dispatch', () => {
 		const code = await run(['run', 'reset', 'r1']);
 		expect(runCommandRun).toHaveBeenCalledWith(['reset', 'r1']);
 		expect(code).toBe(0);
+	});
+
+	// `run:worker` is its own top-level key, so the two must not shadow each other.
+	it('dispatches run:worker without disturbing run', async () => {
+		expect(await run(['run:worker'])).toBe(0);
+		expect(runWorkerRun).toHaveBeenCalledWith([]);
+		expect(runCommandRun).not.toHaveBeenCalled();
+
+		expect(await run(['run', 'reset', 'r1'])).toBe(0);
+		expect(runCommandRun).toHaveBeenCalledWith(['reset', 'r1']);
 	});
 
 	it('prints usage and exits 0 with no command', async () => {
