@@ -427,8 +427,8 @@ re-wording it. What it still says for itself is what it checks before calling:
 the arguments, the `--cli` list, the SCM provider id, an empty secret, a worker id
 that is not a uuid, and which enrollment a `(worker, project)` pair names.
 
-**Three things narrowed when the command group moved onto that API**, because the
-tRPC layer enforces ownership the direct-DB CLI never did. All three are intended:
+**Four things narrowed when the command group moved onto that API**, because the
+tRPC layer enforces ownership the direct-DB CLI never did. All four are intended:
 
 1. **`set-scm-credential` is owner-only.** `workers.scmCredentials.set` is strictly
    owner-only by design, with no `instanceAdmin` override — so you must
@@ -451,6 +451,21 @@ tRPC layer enforces ownership the direct-DB CLI never did. All three are intende
    that read returns. An identifier nobody owns a visible worker under reports
    "no workers for …" rather than "no such user" — user lookup is deliberately not
    on the operator API.
+4. **`consent` and `update-enrollment` are owner-only.** Both land on procedures
+   gated by strict worker ownership with no `instanceAdmin` override: sharing
+   consent and the execution constraints (allowed CLIs, concurrency) are the
+   machine owner's own call, not an administrative one. An installation admin
+   running either against somebody else's machine gets
+   `Enrollment with ID "…" not found` for an enrollment that plainly exists — the
+   same existence-hiding `NOT_FOUND` narrowings 1 and 2 produce. Sign in as the
+   worker's owner.
+
+One thing also stopped being **atomic**: `enroll`'s `--active` and `--consent` are
+applied as separate calls after the create (issue #784), so a refusal of either
+leaves the enrollment itself in place. That is reported — the command names the
+created row's status and consent, and then the approvals still outstanding —
+rather than swallowed, because re-running `enroll` from there can only answer
+`CONFLICT`.
 
 One more thing moved rather than narrowed: **`register-and-enroll` validates the
 owner identifier later than it used to.** The call order is
@@ -492,8 +507,11 @@ unchanged.
   "ready to start", and the four separate commands remain for anyone who wants those
   two approvals kept as separate human decisions. (When you own the machine *and*
   administer the project, the enrollment already arrives that way and no extra
-  approval call is made; otherwise `approve` and `consent` are applied on top, and
-  a refusal of either is reported rather than silently ignored.)
+  approval call is made; otherwise `approve` and `consent` are applied on top. A
+  refusal of either — approving is a project administrator's call, which a machine's
+  owner may well not have — is reported rather than silently ignored, and since the
+  enrollment itself was created, what the command prints as left to do is
+  `workers approve` / `workers consent`, not a second `workers enroll`.)
   **The worker credential is printed
   exactly once**, in the final start-command line. It **does not start the worker**:
   that daemon is a foreground, operator-owned process, so the last line is a command
@@ -554,7 +572,13 @@ unchanged.
   it and grant consent (operator seeding) — each applied only when the created
   enrollment is not already in that state, and each refusal reported. Approval is a
   project administrator's call, so `--active` can be refused on a project you do not
-  administer. The enrollment's **allowed
+  administer — and `--consent` is strictly the machine owner's, so it can be refused
+  when you are seeding somebody else's machine. Either refusal leaves the enrollment
+  **created**, so the command says so (its status and consent) and prints the steps
+  that really remain — `swarm workers approve <worker-id> <project-id>`, a project
+  administrator's call, and `swarm workers consent <worker-id> <project-id> on`, the
+  owner's — never "enroll it again", which from there can only answer `CONFLICT`.
+  The enrollment's **allowed
   pipeline phases** start as every phase — narrow them per project on the worker
   detail screen (`/workers/<id>`); there is no flag for them yet. **A project whose
   repository is not the worker's own checkout is refused** (exit 1, naming both
@@ -569,10 +593,12 @@ unchanged.
   flag leaves the stored value alone, and there is no value that clears either.
   Approval status and sharing consent are untouched (`approve` / `consent`). A
   change takes effect on the **next** dispatch and never interrupts a running agent.
+  The machine's owner alone may do it (narrowing 4).
 - **`approve`** — approve a pending enrollment (worker + project) → active. A
   project administrator's call.
 - **`consent`** — turn an enrollment's owner-controlled sharing consent on or off.
-  Revoking it blocks future dispatch without stopping a running agent.
+  Revoking it blocks future dispatch without stopping a running agent. The
+  machine's owner alone may do it (narrowing 4), so sign in as them.
 
 The last three take a `(worker-id, project-id)` pair while the underlying mutations
 are keyed on an enrollment id, so they resolve the pair through `workers.getById`

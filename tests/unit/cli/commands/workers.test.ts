@@ -8,8 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * mock. The `parse` each call site passes is invoked for real, so a fixture whose
  * shape the command could not read fails here rather than in production.
  */
-const { query, mutate, createOperatorClient, requireOperatorSession, OperatorApiError } = vi.hoisted(
-	() => {
+const { query, mutate, createOperatorClient, requireOperatorSession, OperatorApiError } =
+	vi.hoisted(() => {
 		class OperatorApiError extends Error {
 			constructor(message: string) {
 				super(message);
@@ -23,8 +23,7 @@ const { query, mutate, createOperatorClient, requireOperatorSession, OperatorApi
 			requireOperatorSession: vi.fn(),
 			OperatorApiError,
 		};
-	},
-);
+	});
 const { promptHidden, readStdin } = vi.hoisted(() => ({
 	promptHidden: vi.fn(),
 	readStdin: vi.fn(),
@@ -174,7 +173,9 @@ describe('swarm workers', () => {
 
 			expect(await run(['list'])).toBe(1);
 			expect(await run(['remove', WORKER_ID])).toBe(1);
-			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(1);
+			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(
+				1,
+			);
 
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('swarm login'));
 			expect(calls).toHaveLength(0);
@@ -228,7 +229,9 @@ describe('swarm workers', () => {
 		});
 
 		it('names the cache file it wrote without putting the credential on that line', async () => {
-			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(0);
+			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(
+				0,
+			);
 			const printed = lines();
 			const cacheLine = printed.find((line) => line.includes('credential.json')) ?? '';
 			expect(cacheLine).toContain('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
@@ -243,7 +246,9 @@ describe('swarm workers', () => {
 			const invocationDirectory = `${process.cwd()}/src`;
 			process.env.INIT_CWD = invocationDirectory;
 
-			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(0);
+			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(
+				0,
+			);
 			expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
 				repoRoot: invocationDirectory,
 				workerId: WORKER_ID,
@@ -258,7 +263,9 @@ describe('swarm workers', () => {
 				throw new Error('EACCES: permission denied');
 			});
 			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(0);
+			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(
+				0,
+			);
 			expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not cache the credential'));
 			const printed = lines();
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
@@ -266,7 +273,9 @@ describe('swarm workers', () => {
 		});
 
 		it('hands the operator off to the SCM credential surfaces, naming no provider and reading no secret', async () => {
-			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(0);
+			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(
+				0,
+			);
 			const printed = lines();
 			expect(printed.some((line) => line.includes('cannot run a phase'))).toBe(true);
 			expect(
@@ -315,9 +324,14 @@ describe('swarm workers', () => {
 		});
 
 		it('surfaces a duplicate worker name and caches nothing', async () => {
-			refuse('workers.register', 'A worker named "ada-laptop" already exists for "ada@example.com".');
+			refuse(
+				'workers.register',
+				'A worker named "ada-laptop" already exists for "ada@example.com".',
+			);
 			const error = vi.spyOn(console, 'error');
-			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(1);
+			expect(await run(['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'])).toBe(
+				1,
+			);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('already exists'));
 			expect(writeWorkerCredentialCache).not.toHaveBeenCalled();
 		});
@@ -468,9 +482,9 @@ describe('swarm workers', () => {
 			expect(await run(['register-and-enroll'])).toBe(1);
 			expect(await run(['register-and-enroll', IDENTIFIER])).toBe(1);
 			expect(await run(['register-and-enroll', IDENTIFIER, PROJECT_ID, '--cli', 'claude'])).toBe(1);
-			expect(await run(['register-and-enroll', IDENTIFIER, PROJECT_ID, '--name', 'ada-laptop'])).toBe(
-				1,
-			);
+			expect(
+				await run(['register-and-enroll', IDENTIFIER, PROJECT_ID, '--name', 'ada-laptop']),
+			).toBe(1);
 			expect(calls).toHaveLength(0);
 			expect(readStdin).not.toHaveBeenCalled();
 		});
@@ -499,7 +513,10 @@ describe('swarm workers', () => {
 		});
 
 		it('surfaces a duplicate worker name and stores no credential', async () => {
-			refuse('workers.register', 'A worker named "ada-laptop" already exists for "ada@example.com".');
+			refuse(
+				'workers.register',
+				'A worker named "ada-laptop" already exists for "ada@example.com".',
+			);
 			const error = vi.spyOn(console, 'error');
 			expect(await run(ARGV)).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('already exists'));
@@ -520,6 +537,34 @@ describe('swarm workers', () => {
 			const printed = lines();
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
 			expect(printed.some((line) => line.includes('workers enroll'))).toBe(true);
+		});
+
+		// The other half of that: `workers.enroll` *succeeded* and only the projectAdmin
+		// approval on top of it was refused — the enrollment exists, so re-running
+		// `workers enroll` could only answer CONFLICT. Name the two approvals instead,
+		// and still hand the one-time credential over exactly once.
+		it('names the outstanding approvals, not another enroll, when --active is refused', async () => {
+			refuse(
+				'workers.approveEnrollment',
+				'You do not have permission to perform this action on project "proj-a".',
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(ARGV)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('do not have permission'));
+			const printed = lines();
+			const created = printed.find((line) => line.includes('the enrollment was created')) ?? '';
+			expect(created).toContain('status pending');
+			expect(created).toContain('sharing consent off');
+			expect(
+				printed.some((line) => line.endsWith(`swarm workers approve ${WORKER_ID} ${PROJECT_ID}`)),
+			).toBe(true);
+			expect(
+				printed.some((line) =>
+					line.endsWith(`swarm workers consent ${WORKER_ID} ${PROJECT_ID} on`),
+				),
+			).toBe(true);
+			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
+			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
 		});
 
 		it('hands over the credential and the remaining steps when the credential write fails', async () => {
@@ -642,7 +687,9 @@ describe('swarm workers', () => {
 		it('reports an owner with no visible workers rather than failing', async () => {
 			const log = vi.spyOn(console, 'log');
 			expect(await run(['list', 'nobody@example.com'])).toBe(0);
-			expect(log).toHaveBeenCalledWith(expect.stringContaining("no workers for 'nobody@example.com'"));
+			expect(log).toHaveBeenCalledWith(
+				expect.stringContaining("no workers for 'nobody@example.com'"),
+			);
 		});
 
 		it('reports an empty installation roster', async () => {
@@ -902,13 +949,56 @@ describe('swarm workers', () => {
 		});
 
 		// The approval is a projectAdmin's, so `--active` can be refused after the
-		// enrollment was created — that is reported rather than silently ignored.
+		// enrollment was created — that is reported rather than silently ignored. The
+		// row survives the refusal, so the report has to say so: an operator told only
+		// "not found" re-runs this command and gets CONFLICT.
 		it('reports a refused --active without claiming the enrollment is routable', async () => {
 			refuse('workers.approveEnrollment', `Enrollment with ID "${ENROLLMENT_ID}" not found`);
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--active'])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('not found'));
 			expect(lines().some((line) => line.includes('enrolled worker'))).toBe(false);
+			const created = lines().find((line) => line.includes('the enrollment was created')) ?? '';
+			expect(created).toContain('status pending');
+			expect(created).toContain('sharing consent off');
+		});
+
+		// The steps it names are the ones the refusal actually left outstanding —
+		// never `workers enroll`, which from here can only answer CONFLICT.
+		it('names the outstanding approvals after a refused --active, not another enroll', async () => {
+			refuse('workers.approveEnrollment', `Enrollment with ID "${ENROLLMENT_ID}" not found`);
+			expect(
+				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--active', '--consent']),
+			).toBe(1);
+			const printed = lines();
+			expect(
+				printed.some((line) => line.endsWith(`swarm workers approve ${WORKER_ID} ${PROJECT_ID}`)),
+			).toBe(true);
+			expect(
+				printed.some((line) =>
+					line.endsWith(`swarm workers consent ${WORKER_ID} ${PROJECT_ID} on`),
+				),
+			).toBe(true);
+			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
+		});
+
+		// `setConsent` is strictly the machine owner's — an installation admin seeding
+		// somebody else's machine is refused here, with the approval already applied.
+		it('reports a refused --consent and names only the consent step', async () => {
+			refuse('workers.setConsent', `Enrollment with ID "${ENROLLMENT_ID}" not found`);
+			expect(
+				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--active', '--consent']),
+			).toBe(1);
+			const printed = lines();
+			const created = printed.find((line) => line.includes('the enrollment was created')) ?? '';
+			expect(created).toContain('status active');
+			expect(created).toContain('sharing consent off');
+			expect(
+				printed.some((line) =>
+					line.endsWith(`swarm workers consent ${WORKER_ID} ${PROJECT_ID} on`),
+				),
+			).toBe(true);
+			expect(printed.some((line) => line.includes('swarm workers approve'))).toBe(false);
 		});
 	});
 

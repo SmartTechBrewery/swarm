@@ -61,6 +61,16 @@ and prints, as its **last** line, the exact command to start the daemon:
 swarm: SWARM_WORKER_CREDENTIAL=<credential> SWARM_WORKER_REPO_ROOT=<checkout> npm run dev:worker
 ```
 
+Approving the enrollment is a **project administration** act, so that last part
+holds when the owner you signed in as administers the project (`projectAdmin`, or
+an installation admin such as `localhost-admin`). A plain `member` gets the
+enrollment created and the approval refused: the command says so, names the
+remaining `swarm workers approve <worker-id> swarm` for a project administrator to
+run, and hands the worker credential over anyway — do **not** re-run
+`register-and-enroll` or `workers enroll`, which from there only reports the
+machine is already enrolled. Give the owner `--role projectAdmin` in step 2 below
+if you would rather they seed it themselves.
+
 That is the whole hand-off: **it does not start the worker** — Part 2 is where
 that line is run. Run from the worker's own checkout, though, you do not need it:
 the credential was cached for that checkout, so `swarm run:worker` starts the
@@ -73,8 +83,10 @@ elsewhere, whose checkout path this one cannot know; then hand the printed
 credential over out-of-band and let them run Part 2's explicit form. The worker
 credential appears in that one printed line and nowhere else, so copy it before the
 terminal scrolls. Every refusal the
-three commands it replaces produce still applies, unchanged — see
-[`docs/cli.md`](./cli.md#swarm-workers).
+three commands it replaces produce still applies, unchanged — with the one
+exception just named: `--active` is a project administrator's call made *after* the
+enrollment is created, so on a project the owner does not administer it is refused
+and the enrollment survives. See [`docs/cli.md`](./cli.md#swarm-workers).
 
 ### The composable path (scriptable alternative)
 
@@ -84,7 +96,12 @@ rotate a credential — `register-and-enroll` covers the new-machine case only.
 
 Steps 1–2 need `DATABASE_URL` and run on the **admin machine**; steps 3–5 are
 `swarm workers` and run on the **worker's own machine**, after `swarm login` as
-that worker's owner (issue #800).
+that worker's owner (issue #800). Step 4b is the one exception: approving an
+enrollment is a project administrator's call, so it is run by whoever holds
+`projectAdmin` on the project (from any machine with a session — it needs no
+`DATABASE_URL` either). Give the owner `--role projectAdmin` in step 2 if you would
+rather they collapse steps 4 and 4b back into a single
+`workers enroll … --active --consent` of their own.
 
 ```bash
 # --- admin machine (DATABASE_URL) ---
@@ -100,8 +117,12 @@ npm run swarm -- members add swarm <email> --role member
 swarm login --identifier <email>
 npm run swarm -- workers register <email> --name "<Display Name>" --cli <clis>
 
-# 4. Enroll the worker in the project
-npm run swarm -- workers enroll <worker-id> swarm --cli <clis> --concurrency 1 --active --consent
+# 4. Enroll the worker in the project — the owner's own call, consent included
+npm run swarm -- workers enroll <worker-id> swarm --cli <clis> --concurrency 1 --consent
+
+# 4b. Approve it — a PROJECT ADMINISTRATOR's call, so run it as one (any machine
+#     with a session; add --active to step 4 instead if the owner is one)
+npm run swarm -- workers approve <worker-id> swarm
 
 # 5. Store this worker's operator SCM credential — the account its commits,
 #    pushes, PRs and implementer comments will be authored as. Prompts without
@@ -157,8 +178,11 @@ Notes:
   and a `projectAdmin` on the target, both of those approvals are already theirs, so
   the enrollment is created `active` with sharing on and is routable immediately —
   no second step. Everyone else is unchanged. The one-shot
-  `--active --consent` form below stays the CLI's own, and is what an installation
-  admin bootstrapping a machine for *someone else* wants.
+  `--active --consent` form below stays the CLI's own, and is what a `projectAdmin`
+  bootstrapping **their own** machine wants. Note that `--consent` is strictly the
+  machine owner's since issue #800 — an installation admin seeding *someone else's*
+  machine gets it refused (the enrollment is still created and approved, and the
+  command names the `workers consent … on` its owner has to run).
 - `--active --consent` at enroll time (rather than the separate `approve` /
   `consent` commands, [`docs/cli.md`](./cli.md#swarm-workers)) is safe to do
   immediately, before the new machine has connected anything: a `transport`-mode
@@ -168,7 +192,7 @@ Notes:
   that isn't there yet. **`register-and-enroll` creates exactly this form** and
   offers no flag to opt out, so this note covers it too: a pending,
   non-consenting enrollment is not "ready to start", which is what that command
-  exists to deliver. Use the five commands above when you want the two approvals
+  exists to deliver. Use the composable path above when you want the two approvals
   kept as separate human decisions.
 - **Enroll the machine in a project for the repository its checkout actually is.**
   Step 4 is refused (naming both repositories) when the worker has already declared
@@ -367,7 +391,8 @@ to expire after `heartbeatTtlMs`.
 | --- | --- |
 | A `swarm workers` command says "not signed in — run `swarm login`" or "your control-plane session has expired" | Since issue #800 the whole command group authenticates over the network instead of holding `DATABASE_URL`. Run `swarm login` on that machine (`swarm login --status` says who the cached session is); the session lasts `SWARM_SESSION_TTL_HOURS`. |
 | A `swarm workers` command says `SWARM_CONTROL_PLANE_URL is unset` | Same cause: the command group needs the router base URL, not a database. Put it in this machine's `.env` (the same value the daemon uses) and re-run. |
-| `workers set-scm-credential` or `workers remove` says `Worker with ID "…" not found` for a worker that exists | Both are strictly the machine owner's since issue #800 — an installation admin gets the same `NOT_FOUND` a stranger does. Sign in as the worker's owner on that machine. |
+| `workers set-scm-credential`, `workers remove`, `workers consent` or `workers update-enrollment` says `Worker with ID "…" not found` / `Enrollment with ID "…" not found` for one that exists | All four are strictly the machine owner's since issue #800 — an installation admin gets the same `NOT_FOUND` a stranger does. Sign in as the worker's owner on that machine. |
+| `workers enroll --active` (or `register-and-enroll`) says `You do not have permission to perform this action on project "…"` | Approving an enrollment is a `projectAdmin` call, and it is made *after* the enrollment is created — so the enrollment now exists, pending. Do **not** enroll again (that reports `This worker is already enrolled in this project.`); the command prints exactly what is left, and a project administrator runs `swarm workers approve <worker-id> <project-id>`. |
 | `workers remove` says `This worker is running a job right now` | The machine is executing a run, and deleting it mid-run would detach that run from the machine still running it (issue #789). Wait for it, or stop the run from the dashboard, then retry. |
 | `workers list` says `Open a project you are enrolled in to see its workers.` | The unfiltered roster is an installation administrator's view (issue #647). Pass your own login handle — `workers list <email>` — for your own machines. |
 | `swarm run:worker` says `no worker registered for this checkout` | No credential was cached for *this* directory's realpath — the worker was registered on another machine, in another checkout, or before issue #788. Register here, or start the daemon with `SWARM_WORKER_CREDENTIAL` + `SWARM_WORKER_REPO_ROOT` set explicitly, as above. A git *worktree* of the checkout has its own realpath and gets this message too; run the daemon against the main checkout. |
@@ -376,7 +401,7 @@ to expire after `heartbeatTtlMs`.
 | Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
-| Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, step 4), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
+| Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, steps 4 and 4b), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
 | An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a different repository than the project's, so the control plane suspended the pairing (issue #690). `/workers/<id>` names both repositories on that enrollment block. Point `SWARM_WORKER_REPO_ROOT` at a checkout of the project's repository (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
 | `swarm workers enroll` exits 1 saying the worker's checkout is a different repository | Same mismatch, caught on the write path instead (issue #690) — the message names the machine's checkout and the project's repository. Enroll a worker whose checkout is that repository, or re-point this one. |
 | `refusing to start — another worker already holds this checkout` | Another daemon on this machine is already running against the same `SWARM_WORKER_REPO_ROOT` (issue #689) — the line names its worker id, or its pid when it has not handshaked yet. Stop that process, or give this worker its own checkout and point `SWARM_WORKER_REPO_ROOT` at it. A lock left by a crashed daemon is reclaimed automatically, so this message always means a live holder — unless its `owner.json` is unreadable, which resolves itself once the lock ages out (15 minutes). |

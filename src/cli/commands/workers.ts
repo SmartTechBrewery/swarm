@@ -16,12 +16,22 @@
  * procedures the dashboard calls, using `node:util` `parseArgs` +
  * `_shared/output.ts` like `commands/members.ts`.
  *
- * That re-pointing **narrows three things deliberately**, because the tRPC layer
+ * That re-pointing **narrows four things deliberately**, because the tRPC layer
  * enforces ownership the direct-DB CLI never did (see `docs/cli.md`):
  * `set-scm-credential` and `remove` are strictly owner-only — so sign in as the
- * worker's owner — `remove` refuses a machine that is running a job, and `list`
+ * worker's owner — `remove` refuses a machine that is running a job, `list`
  * is an installation-wide read unless it names the signed-in operator's own
- * handle, which is served by `workers.listMine` instead.
+ * handle, which is served by `workers.listMine` instead, and `consent` and
+ * `update-enrollment` are strictly the machine owner's too (sharing consent and
+ * execution constraints are the owner's call, not an administrative one), so an
+ * installation admin acting on somebody else's machine gets the same
+ * `Enrollment … not found` a stranger does.
+ *
+ * One thing also stopped being atomic: `--active` on `enroll` is a `projectAdmin`
+ * call made *after* the create, so an owner who does not administer the project
+ * gets a real, pending enrollment plus a refusal. Both paths report the created
+ * row and name the approvals still outstanding rather than telling anyone to
+ * enroll again (`performEnroll` / `remainingEnrollmentSteps` below).
  *
  * A refusal is reported in the **control plane's own words**: the procedures
  * already name what disagrees (the capability set, the two repositories, the
@@ -179,7 +189,10 @@ Usage:
              project's Maximum Concurrent Jobs. Enrolling your own machine in a
              project you administer creates it active and consenting; otherwise it
              starts pending with sharing consent off, and --active/--consent then
-             approve it and grant consent (operator seeding).
+             approve it and grant consent (operator seeding). --active is a
+             project administrator's call, so it can be refused on a project you
+             do not administer — the enrollment is still created, and the refusal
+             names what is left to run rather than asking you to enroll again.
   update-enrollment
              Change an existing enrollment's execution constraints: --cli (a
              subset of the worker's capabilities) replaces the allowed CLIs and
@@ -187,11 +200,12 @@ Usage:
              one is required; an omitted flag leaves the stored value alone.
              Approval status and sharing consent are untouched (see approve /
              consent). Takes effect on the next dispatch — a running agent is
-             never interrupted.
+             never interrupted. The machine's owner alone may do it.
   approve    Approve a pending enrollment (worker + project) → active. A project
              administrator's call.
   consent    Turn an enrollment's owner-controlled sharing consent on or off.
              Revoking it blocks future dispatch without stopping a running agent.
+             The machine's owner alone may do it, so sign in as them.
 
 Requires SWARM_CONTROL_PLANE_URL and a \`swarm login\` session — and no
 DATABASE_URL: every subcommand calls the control plane's operator API, so this
@@ -715,6 +729,51 @@ function parseConcurrencyFlag(
 }
 
 /**
+ * What {@link performEnroll} left behind, so a caller names only the steps that
+ * really remain. `enrollment` is present whenever `workers.enroll` succeeded —
+ * *including* when a later `--active` / `--consent` was refused — so its absence
+ * is what says nothing was written and re-running `workers enroll` is the way
+ * forward. Getting that backwards is how an operator ends up re-running a create
+ * that can only answer `CONFLICT`.
+ */
+interface EnrollOutcome {
+	readonly code: number;
+	readonly enrollment?: { readonly status: string; readonly sharingConsent: boolean };
+}
+
+/**
+ * The subcommands a created-but-not-routable enrollment still needs, in the order
+ * they are run. Kept copy-pastable — who may run which is said once by
+ * {@link performEnroll}'s refusal report, never glued onto the command itself.
+ */
+function remainingEnrollmentSteps(
+	workerId: string,
+	projectId: string,
+	enrollment: { status: string; sharingConsent: boolean },
+): string[] {
+	const steps: string[] = [];
+	if (enrollment.status !== 'active') {
+		steps.push(`swarm workers approve ${workerId} ${projectId}`);
+	}
+	if (!enrollment.sharingConsent) {
+		steps.push(`swarm workers consent ${workerId} ${projectId} on`);
+	}
+	return steps;
+}
+
+/** {@link remainingEnrollmentSteps}, printed — the standalone `enroll`'s half of the recovery. */
+function reportRemainingEnrollmentSteps(
+	workerId: string,
+	projectId: string,
+	enrollment: { status: string; sharingConsent: boolean },
+): void {
+	const steps = remainingEnrollmentSteps(workerId, projectId, enrollment);
+	if (steps.length === 0) return;
+	out.info('finish it by hand with:');
+	for (const command of steps) out.info(`  ${command}`);
+}
+
+/**
  * Perform the enrollment write and report it, surfacing a refusal as one line and
  * exit 1 — the allowed CLIs the machine does not declare, a project whose
  * repository is not the machine's checkout (issue #690), a duplicate enrollment,
@@ -727,6 +786,12 @@ function parseConcurrencyFlag(
  * both decisions in the act of enrolling, and gets an active, consenting
  * enrollment with no further call. Each flag is spent only when the created
  * enrollment is not already in that state.
+ *
+ * That makes the write non-atomic where the pre-#800 direct-DB one was, so a
+ * refused `--active` (a `projectAdmin` call) or `--consent` (strictly the owner's)
+ * leaves a *created* enrollment behind. It is reported as one extra line rather
+ * than swallowed: the operator has to know the row exists, or they will re-run
+ * `workers enroll` and get `CONFLICT` for their trouble.
  */
 async function performEnroll(
 	client: OperatorClient,
@@ -736,9 +801,10 @@ async function performEnroll(
 	concurrencyAllocation: number | undefined,
 	active: boolean,
 	consent: boolean,
-): Promise<number> {
+): Promise<EnrollOutcome> {
+	let enrollment: z.infer<typeof EnrollmentSchema> | undefined;
 	try {
-		let enrollment = await client.mutate(
+		enrollment = await client.mutate(
 			'workers.enroll',
 			{ workerId: worker.id, projectId, allowedClis, concurrencyAllocation },
 			parseWith(EnrollmentSchema),
@@ -760,13 +826,19 @@ async function performEnroll(
 		out.info(
 			`enrolled worker '${worker.displayName}' (${worker.id}) in '${projectId}' — status ${enrollment.status}, CLIs ${enrollment.allowedClis.join(', ')}, concurrency ${enrollment.concurrencyAllocation}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}`,
 		);
-		return 0;
+		return { code: 0, enrollment };
 	} catch (err) {
-		if (err instanceof OperatorApiError) {
-			out.error(err.message);
-			return 1;
+		if (!(err instanceof OperatorApiError)) throw err;
+		out.error(err.message);
+		if (enrollment) {
+			out.info(
+				`the enrollment was created — worker '${worker.displayName}' (${worker.id}) in '${projectId}': status ${enrollment.status}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}. Do not enroll it again.`,
+			);
+			out.info(
+				"it is routable only while active AND consenting — approving is a project administrator's call, consent the machine owner's own",
+			);
 		}
-		throw err;
+		return { code: 1, enrollment };
 	}
 }
 
@@ -816,7 +888,7 @@ async function enrollCommand(argv: string[]): Promise<number> {
 		parseWith(WorkerDetailSchema),
 	);
 
-	return performEnroll(
+	const outcome = await performEnroll(
 		operator.client,
 		{ id: worker.workerId, displayName: worker.displayName },
 		projectId,
@@ -825,6 +897,12 @@ async function enrollCommand(argv: string[]): Promise<number> {
 		values.active ?? false,
 		values.consent ?? false,
 	);
+	// A refused `--active`/`--consent` left a real enrollment behind, so the way
+	// forward is the one flag that did not land — never this command again.
+	if (outcome.enrollment && outcome.code !== 0) {
+		reportRemainingEnrollmentSteps(worker.workerId, projectId, outcome.enrollment);
+	}
+	return outcome.code;
 }
 
 /** Everything `register-and-enroll` resolves before it writes anything. */
@@ -1003,7 +1081,11 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	// `workers remove` + `workers register` again. Each recovery path names only the
 	// step that did not complete, and prints the credential exactly once, last.
 	const reportUnfinished = (remaining: string[]): number => {
-		out.info('the worker is registered; finish it by hand with:');
+		out.info(
+			remaining.length > 0
+				? 'the worker is registered; finish it by hand with:'
+				: 'the worker is registered.',
+		);
 		for (const command of remaining) out.info(`  ${command}`);
 		out.info('worker credential (store it now — it will not be shown again):');
 		out.info(credential);
@@ -1043,7 +1125,17 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 		true,
 		true,
 	);
-	if (enrolled !== 0) return reportUnfinished([enrollByHand]);
+	if (enrolled.code !== 0) {
+		// Which recovery is printed turns on whether the enrollment row exists: a
+		// refused `--active` (a `projectAdmin` call the machine's owner may well not
+		// have) already created it, so re-running `workers enroll` could only answer
+		// `CONFLICT`. Name the approvals that are actually outstanding instead.
+		return reportUnfinished(
+			enrolled.enrollment
+				? remainingEnrollmentSteps(worker.id, projectId, enrolled.enrollment)
+				: [enrollByHand],
+		);
+	}
 
 	// The credential's one and only appearance, on the last line — the "copy the
 	// last line" affordance docs/onboarding-worker.md relies on.

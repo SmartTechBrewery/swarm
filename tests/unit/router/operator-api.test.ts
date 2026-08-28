@@ -2,14 +2,17 @@ import { Hono } from 'hono';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The mount is what is under test, not the procedures behind it: `workers.listMine`
-// stands in for "a workers procedure was reached", and `projects.list` for "a
-// namespace this router deliberately does not carry". Both would otherwise need a
-// database.
-const { listOwnerWorkers, getEnrollment, setSharingConsent } = vi.hoisted(() => ({
-	listOwnerWorkers: vi.fn(),
-	getEnrollment: vi.fn(),
-	setSharingConsent: vi.fn(),
-}));
+// stands in for "a workers procedure was reached", `workers.getById` for "a query
+// that takes an input", and `projects.list` for "a namespace this router
+// deliberately does not carry". All would otherwise need a database.
+const { listOwnerWorkers, getEnrollment, setSharingConsent, getDashboardWorkerDetail } = vi.hoisted(
+	() => ({
+		listOwnerWorkers: vi.fn(),
+		getEnrollment: vi.fn(),
+		setSharingConsent: vi.fn(),
+		getDashboardWorkerDetail: vi.fn(),
+	}),
+);
 vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	...(await vi.importActual<typeof import('@/identity/worker-enrollment-service.js')>(
 		'@/identity/worker-enrollment-service.js',
@@ -17,6 +20,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	listOwnerWorkers,
 	getEnrollment,
 	setSharingConsent,
+	getDashboardWorkerDetail,
 }));
 // `workers.setConsent` is the mutation this suite round-trips the CLI client
 // through, and its ownership check reads the worker.
@@ -73,6 +77,14 @@ beforeEach(() => {
 	listOwnerWorkers.mockResolvedValue([]);
 	getEnrollment.mockReset();
 	getEnrollment.mockResolvedValue({ id: ENROLLMENT_ID, workerId: WORKER_ID, projectId: 'proj-a' });
+	getDashboardWorkerDetail.mockReset();
+	getDashboardWorkerDetail.mockResolvedValue({
+		workerId: WORKER_ID,
+		displayName: 'ada-laptop',
+		ownerUserId: USER_ID,
+		lastSeenAt: null,
+		enrollments: [],
+	});
 	getWorker.mockReset();
 	getWorker.mockResolvedValue({ id: WORKER_ID, ownerUserId: USER_ID, displayName: 'ada-laptop' });
 	setSharingConsent.mockReset();
@@ -182,7 +194,7 @@ describe('the operator CLI client against this mount', () => {
 		});
 	}
 
-	it('round-trips a query, input and all', async () => {
+	it('round-trips an input-less query and unwraps its result envelope', async () => {
 		listOwnerWorkers.mockResolvedValue([{ workerId: WORKER_ID }]);
 
 		const data = await clientFor(appWith(makeDeps())).query(
@@ -192,6 +204,21 @@ describe('the operator CLI client against this mount', () => {
 		);
 
 		expect(data).toEqual([{ workerId: WORKER_ID }]);
+	});
+
+	// The other half: `workers.listMine` takes no input, so it says nothing about
+	// *where* an input goes. `workers.getById` does take one, and this asserts the
+	// client's `?input=<encodeURIComponent(JSON)>` against @trpc/server's own parser
+	// rather than against the client's own mock — the argument actually arrives.
+	it('puts a query input where @trpc/server reads it', async () => {
+		const data = await clientFor(appWith(makeDeps())).query(
+			'workers.getById',
+			{ workerId: WORKER_ID },
+			(value) => value,
+		);
+
+		expect(getDashboardWorkerDetail).toHaveBeenCalledWith(WORKER_ID, null, USER_ID);
+		expect(data).toMatchObject({ workerId: WORKER_ID, displayName: 'ada-laptop' });
 	});
 
 	// The load-bearing one: `@hono/trpc-server`'s non-batch POST path answers
