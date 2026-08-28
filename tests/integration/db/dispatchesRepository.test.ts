@@ -44,9 +44,14 @@ import {
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
 import { acquireLease } from '../../../src/db/repositories/workerSessionsRepository.js';
-import { createWorker } from '../../../src/db/repositories/workersRepository.js';
+import {
+	createWorker,
+	setWorkerDeclaredCapabilities,
+} from '../../../src/db/repositories/workersRepository.js';
 import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { projects } from '../../../src/db/schema/projects.js';
+import { workers } from '../../../src/db/schema/workers.js';
+import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import { describeError } from '../../../src/lib/errors.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
 import type { TriggerPhase } from '../../../src/triggers/types.js';
@@ -747,6 +752,91 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			);
 			expect(failed.map((row) => row.id)).toEqual([dispatch.id]);
 			expect((await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).activeRuns).toBe(0);
+		});
+	});
+
+	// Issue #783: the under-lock re-check of the eligibility gate reads the same
+	// effective set the gate did — a declaration the row carries, not the raw probe
+	// column.
+	describe('claim re-check against a declared capability set', () => {
+		async function seedDeclarableWorker(suffix: string, allowedClis: AgentCli[]) {
+			const owner = await createUser({
+				identifier: `owner-${suffix}@example.com`,
+				displayName: 'Owner',
+			});
+			const worker = await createWorker({
+				ownerUserId: owner.id,
+				displayName: `worker-${suffix}`,
+				capabilities: ['claude', 'codex'],
+				credentialHash: `hash-${suffix}`,
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: PROJECT_ID,
+				status: 'active',
+				allowedClis,
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+			const session = await acquireLease(worker.id, 60_000);
+			return { worker, session };
+		}
+
+		async function claimInputFor(
+			worker: { id: string },
+			session: { id: string; fencingToken: number },
+			owner: string,
+		) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+			});
+			const leased = await claimDispatch(dispatch.id, owner, 60_000);
+			if (!leased) throw new Error('test dispatch was not leased');
+			return {
+				dispatchId: leased.id,
+				dispatchLeaseOwner: owner,
+				projectId: PROJECT_ID,
+				selectedWorkerId: worker.id,
+				executionWorkerId: worker.id,
+				workerSessionId: session.id,
+				workerFencingToken: session.fencingToken,
+				heartbeatTtlMs: 60_000,
+			};
+		}
+
+		it('still admits a claim for a CLI the declaration keeps', async () => {
+			const { worker, session } = await seedDeclarableWorker('declared-keeps', ['claude']);
+			await setWorkerDeclaredCapabilities(worker.id, ['claude']);
+
+			const input = await claimInputFor(worker, session, 'host-declared-keeps:1');
+			expect(await claimWorkerForDispatch({ ...input, cli: 'claude' })).toMatchObject({
+				claimed: true,
+			});
+		});
+
+		// The declaration write refuses to drop a CLI an enrollment requires, so this row
+		// state is unreachable through the service API — which is exactly the point: like
+		// the probe-column check it replaces, this re-check is the defence against the
+		// gate's read having gone stale between observing a worker and claiming it. Forced
+		// directly, the way the lease-expiry cases in this file force theirs.
+		it('refuses a claim for a CLI the declaration excludes, however the row got there', async () => {
+			const { worker, session } = await seedDeclarableWorker('declared-excludes', [
+				'claude',
+				'codex',
+			]);
+			await getDb()
+				.update(workers)
+				.set({ declaredCapabilities: ['claude'] })
+				.where(eq(workers.id, worker.id));
+
+			const input = await claimInputFor(worker, session, 'host-declared-excludes:1');
+			expect(await claimWorkerForDispatch({ ...input, cli: 'codex' })).toEqual({
+				claimed: false,
+				reason: 'missing-cli-capability',
+			});
 		});
 	});
 

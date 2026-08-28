@@ -12,6 +12,14 @@
  * the credential secret never enters the domain read model, mirroring how
  * `rowToSwarmUser` drops `password_hash`.
  *
+ * One field is a genuine *derivation* rather than a re-assembly, and the asymmetry
+ * is knowing (issue #783): the **column** `capabilities` is the daemon's last
+ * self-probe, while the **domain field** `Worker.capabilities` is the effective set
+ * `effectiveCapabilities()` resolves from that probe and the row's
+ * `declared_capabilities`. Renaming the column to `probed_capabilities` would remove
+ * the asymmetry at the cost of a rename migration and churn across every query here,
+ * for no behavioural gain, so it stays documented on both sides instead.
+ *
  * A duplicate `(owner, displayName)` or `credentialHash` surfaces the raw pg
  * `23505` unique violation; the caller (the `swarm workers` CLI) translates it to
  * a friendly message. Lookups that find nothing return `undefined`/`[]` — a
@@ -23,7 +31,9 @@ import { asc, eq, inArray } from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
 	DEFAULT_WORKER_SUPPORTED_PHASES,
+	effectiveCapabilities,
 	type Worker,
+	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } from '../../identity/worker.js';
 import type { TriggerPhase } from '../../triggers/types.js';
@@ -42,13 +52,30 @@ export interface CreateWorkerInput {
 	credentialHash: string;
 }
 
-/** Re-assemble a `Worker` from a persisted `workers` row, dropping `credentialHash`. */
+/**
+ * Re-assemble a `Worker` from a persisted `workers` row, dropping `credentialHash`.
+ *
+ * The one place that is not a plain re-assembly is the CLI axis (issue #783):
+ * `Worker.capabilities` is the **effective** set resolved from the row's two raw
+ * columns, not either column verbatim, with both raw facts carried alongside it.
+ * Resolving here rather than in each consumer is deliberate — the eligibility gate,
+ * the dispatch candidate list and both roster read models then honour a declaration
+ * with no edit of their own, and a reader nobody remembered fails *closed* (on the
+ * declaration) instead of silently routing on the probe.
+ */
 function rowToWorker(row: WorkerRow): Worker {
+	const probedCapabilities = row.capabilities as AgentCli[];
+	const declaredCapabilities = (row.declaredCapabilities as AgentCli[] | null) ?? null;
 	return {
 		id: row.id,
 		ownerUserId: row.ownerUserId,
 		displayName: row.displayName,
-		capabilities: row.capabilities as AgentCli[],
+		capabilities: effectiveCapabilities({
+			capabilities: probedCapabilities,
+			declaredCapabilities,
+		}),
+		probedCapabilities,
+		declaredCapabilities,
 		supportedPhases: row.supportedPhases as TriggerPhase[],
 		repository: row.repository ?? null,
 		createdAt: row.createdAt,
@@ -75,6 +102,11 @@ export async function createWorker(input: CreateWorkerInput): Promise<Worker> {
 			// machines that can run it. The runtime constant is the authority for new
 			// rows; the SQL default remains only as the backfill for rows predating it.
 			supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+			// `declaredCapabilities` is deliberately left to the column's NULL (issue
+			// #783): registering a machine seeds the *probe* baseline, it does not make
+			// a declaration. NULL means "no declaration, use auto-discovery", which is
+			// exactly how registration behaved before the column existed.
+			//
 			// `repository` is deliberately left to the column's NULL (issue #687):
 			// registering a worker is not declaring a checkout. An operator registers a
 			// machine from wherever they happen to be, and only the daemon that connects
@@ -145,10 +177,22 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
 }
 
 /**
- * Replace a worker's declared capabilities. Returns the updated worker, or
- * `undefined` if no worker has that id (nothing to update). Rejects with
+ * Record the CLI set a daemon just **probed** on its own PATH, replacing the
+ * `capabilities` column verbatim. Returns the updated worker, or `undefined` if no
+ * worker has that id (nothing to update). Rejects with
  * {@link WorkerCapabilityReductionError} if any existing enrollment for the worker
- * requires a CLI not present in the updated capabilities.
+ * requires a CLI the *effective* set would no longer provide.
+ *
+ * "Effective", not "probed", is the whole point of the split (issue #783): the probe
+ * is still written honestly, but what the reduction check judges is
+ * `effectiveCapabilities(probe, the row's existing declaration)` — the set dispatch
+ * will actually route on. The consequence is intended: with a declaration in force,
+ * a daemon whose probe transiently narrows no longer 409s the handshake, because the
+ * declaration is what dispatch reads. With no declaration the check is verbatim
+ * today's, on the incoming probe alone.
+ *
+ * A declaration is never written here. `swarm workers set-cli` states one through
+ * {@link setWorkerDeclaredCapabilities}; a handshake only ever refreshes the probe.
  *
  * `supportedPhases` (issue #467) is written in the **same transaction** when
  * given, because a handshake declares both axes at once and a partial write would
@@ -219,7 +263,15 @@ export async function updateWorkerCapabilities(
 			.from(workerProjectEnrollments)
 			.where(eq(workerProjectEnrollments.workerId, id));
 
-		const offending = clisRequiredByEnrollments(enrollments, capabilities);
+		// Judge what dispatch will route on, not the raw probe: an owner's standing
+		// declaration outranks this re-probe (issue #783).
+		const offending = clisRequiredByEnrollments(
+			enrollments,
+			effectiveCapabilities({
+				capabilities,
+				declaredCapabilities: (existingWorker.declaredCapabilities as AgentCli[] | null) ?? null,
+			}),
+		);
 		if (offending.length > 0) {
 			throw new WorkerCapabilityReductionError(id, offending);
 		}
@@ -233,6 +285,74 @@ export async function updateWorkerCapabilities(
 		const [updatedRow] = await tx
 			.update(workers)
 			.set(declaration)
+			.where(eq(workers.id, id))
+			.returning();
+
+		return updatedRow ? rowToWorker(updatedRow) : undefined;
+	});
+}
+
+/**
+ * State (or clear) the **owner's declaration** of which agent CLIs a worker should
+ * run — the durable half of the CLI axis (issue #783), which no handshake
+ * overwrites. `null` clears it, returning the worker to plain auto-discovery.
+ * Returns the updated worker, or `undefined` if no worker has that id.
+ *
+ * Both safety properties are checked under the same `FOR UPDATE` lock as the write,
+ * so neither can be raced by a concurrent handshake or enrollment change:
+ *
+ * - a declaration naming a CLI the machine's last probe never reported is refused
+ *   with {@link WorkerCapabilityNotProbedError}. Widening past what the machine can
+ *   run stays `SWARM_WORKER_TRANSPORT_CLIS`'s job, which sets the probe on the
+ *   machine itself and so composes with an intersecting declaration;
+ * - a declaration that would drop a CLI an existing enrollment still requires is
+ *   refused with {@link WorkerCapabilityReductionError} — the same invariant
+ *   ({@link updateWorkerCapabilities}) maintains on the probe path, judged here
+ *   against the set this write is about to make effective.
+ *
+ * For a worker registered but never connected, `capabilities` is the operator's
+ * registration set, so the first guard reads as "you may narrow what registration
+ * declared" — coherent, and the error names the set it compared against.
+ */
+export async function setWorkerDeclaredCapabilities(
+	id: string,
+	declared: AgentCli[] | null,
+): Promise<Worker | undefined> {
+	return await getDb().transaction(async (tx) => {
+		const existingWorkerRows = await tx
+			.select()
+			.from(workers)
+			.where(eq(workers.id, id))
+			.for('update')
+			.limit(1);
+		const existingWorker = existingWorkerRows[0];
+		if (!existingWorker) return undefined;
+
+		const probed = existingWorker.capabilities as AgentCli[];
+		if (declared !== null) {
+			const probedSet = new Set(probed);
+			const unprobed = declared.filter((cli) => !probedSet.has(cli));
+			if (unprobed.length > 0) {
+				throw new WorkerCapabilityNotProbedError(id, unprobed, probed);
+			}
+		}
+
+		const enrollments = await tx
+			.select()
+			.from(workerProjectEnrollments)
+			.where(eq(workerProjectEnrollments.workerId, id));
+
+		const offending = clisRequiredByEnrollments(
+			enrollments,
+			effectiveCapabilities({ capabilities: probed, declaredCapabilities: declared }),
+		);
+		if (offending.length > 0) {
+			throw new WorkerCapabilityReductionError(id, offending);
+		}
+
+		const [updatedRow] = await tx
+			.update(workers)
+			.set({ declaredCapabilities: declared })
 			.where(eq(workers.id, id))
 			.returning();
 

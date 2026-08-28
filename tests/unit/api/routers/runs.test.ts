@@ -405,6 +405,9 @@ describe('runsRouter', () => {
 					ownerUserId: 'user-1',
 					displayName: 'studio-mac',
 					capabilities: ['claude'],
+					// No declaration (issue #783), so the probe is the effective set.
+					probedCapabilities: ['claude'],
+					declaredCapabilities: null,
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 					repository: null,
 					createdAt: new Date(0),
@@ -980,6 +983,9 @@ describe('runsRouter', () => {
 				ownerUserId: 'user-1',
 				displayName: 'alice-macbook',
 				capabilities: ['claude' as const],
+				// No declaration (issue #783), so the probe is the effective set.
+				probedCapabilities: ['claude' as const],
+				declaredCapabilities: null,
 				supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 				repository: null,
 				createdAt: new Date(0),

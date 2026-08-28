@@ -93,17 +93,22 @@ const RUN_ID = '33333333-3333-4333-8333-333333333333';
 const ENROLLMENT_ID = '44444444-4444-4444-8444-444444444444';
 
 function makeWorker(overrides: Partial<Worker> = {}): Worker {
-	return {
+	const worker: Worker = {
 		id: WORKER_ID,
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude', 'codex'],
+		// No declaration (issue #783), so the probe is the effective set.
+		probedCapabilities: ['claude'],
+		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
 	};
+	// Keep the two CLI fields in step when a test overrides only `capabilities`.
+	return { ...worker, probedCapabilities: overrides.probedCapabilities ?? worker.capabilities };
 }
 
 function makeOwner(overrides: Partial<SwarmUser> = {}): SwarmUser {

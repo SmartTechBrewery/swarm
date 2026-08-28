@@ -22,12 +22,14 @@ import {
 } from '../../../src/db/repositories/workerSessionsRepository.js';
 import {
 	createWorker,
+	setWorkerDeclaredCapabilities,
 	updateWorkerCapabilities,
 } from '../../../src/db/repositories/workersRepository.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import { workerSessions } from '../../../src/db/schema/workerSessions.js';
 import { workers } from '../../../src/db/schema/workers.js';
 import {
+	AllowedClisNotCapableError,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	DEFAULT_ENROLLMENT_ORDER_INDEX,
 	isRoutable,
@@ -391,6 +393,35 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					status: 'active',
 					sharingConsent: true,
 				});
+			});
+		});
+
+		// Issue #783: `allowedClis ⊆ capabilities` is judged against the *effective* set,
+		// not the raw probe column — otherwise an owner's declaration could be routed
+		// around by enrolling a CLI it excludes.
+		describe('allowed CLIs against a declared capability set', () => {
+			it('refuses a new enrollment for a CLI the probe reports but the declaration excludes', async () => {
+				await setWorkerDeclaredCapabilities(workerA, ['claude']);
+
+				await expect(enroll(workerA, PROJECT_A, { allowedClis: ['codex'] })).rejects.toThrow(
+					AllowedClisNotCapableError,
+				);
+			});
+
+			it('refuses the same change on an existing enrollment', async () => {
+				const created = await enroll(workerA, PROJECT_A);
+				await setWorkerDeclaredCapabilities(workerA, ['claude']);
+
+				await expect(
+					updateEnrollmentConstraints(created.id, { allowedClis: ['claude', 'codex'] }),
+				).rejects.toThrow(AllowedClisNotCapableError);
+			});
+
+			it('accepts a CLI the declaration keeps', async () => {
+				await setWorkerDeclaredCapabilities(workerA, ['codex']);
+
+				const created = await enroll(workerA, PROJECT_A, { allowedClis: ['codex'] });
+				expect(created.allowedClis).toEqual(['codex']);
 			});
 		});
 

@@ -1,0 +1,12 @@
+-- Issue #783: a worker's agent-CLI set is now two facts in two columns, because one
+-- column collapsed them and so lost the operator's declaration at every reconnect.
+-- `capabilities` keeps its meaning verbatim — the daemon's last self-probe, rewritten
+-- by every handshake — and this column holds the owner's durable declaration.
+--
+-- Nullable with no default, and nothing is backfilled: NULL means "no declaration,
+-- use auto-discovery", which is exactly what every existing row already behaves like.
+-- The effective set every reader routes on is the probe when this is NULL and
+-- `declaration ∩ probe` otherwise (`effectiveCapabilities`, src/identity/worker.ts),
+-- so an unmigrated installation and a migrated one with no declarations are
+-- indistinguishable.
+ALTER TABLE "workers" ADD COLUMN "declared_capabilities" jsonb;

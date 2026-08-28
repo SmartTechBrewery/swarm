@@ -5,6 +5,7 @@ const {
 	createWorker,
 	findWorkerByCredentialHash,
 	getWorkerById,
+	setWorkerDeclaredCapabilities,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
@@ -12,6 +13,7 @@ const {
 	createWorker: vi.fn(),
 	findWorkerByCredentialHash: vi.fn(),
 	getWorkerById: vi.fn(),
+	setWorkerDeclaredCapabilities: vi.fn(),
 	updateWorkerCapabilities: vi.fn(),
 	updateWorkerDisplayName: vi.fn(),
 	updateWorkerSupportedPhases: vi.fn(),
@@ -23,6 +25,7 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 	createWorker,
 	findWorkerByCredentialHash,
 	getWorkerById,
+	setWorkerDeclaredCapabilities,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
@@ -31,6 +34,7 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import {
+	declareWorkerCapabilities,
 	declareWorkerSupportedPhases,
 	hashWorkerCredential,
 	issueWorkerCredential,
@@ -38,6 +42,7 @@ import {
 	registerWorker,
 	renameWorker,
 	resolveWorkerByCredential,
+	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } from '@/identity/worker-service.js';
 
@@ -46,23 +51,29 @@ const sha256 = (v: string) => createHash('sha256').update(v).digest('hex');
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
 
 function makeWorker(overrides: Partial<Worker> = {}): Worker {
-	return {
+	const worker: Worker = {
 		id: '11111111-1111-4111-8111-111111111111',
 		ownerUserId: OWNER_ID,
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],
+		// No declaration (issue #783), so the probe is the effective set.
+		probedCapabilities: ['claude'],
+		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
 	};
+	// Keep the two CLI fields in step when a test overrides only `capabilities`.
+	return { ...worker, probedCapabilities: overrides.probedCapabilities ?? worker.capabilities };
 }
 
 beforeEach(() => {
 	createWorker.mockReset();
 	findWorkerByCredentialHash.mockReset();
 	getWorkerById.mockReset();
+	setWorkerDeclaredCapabilities.mockReset();
 	updateWorkerCapabilities.mockReset();
 	updateWorkerDisplayName.mockReset();
 	updateWorkerSupportedPhases.mockReset();
@@ -221,6 +232,59 @@ describe('refreshWorkerCapabilities', () => {
 		);
 
 		await expect(refreshWorkerCapabilities('worker-1', ['codex'])).rejects.toThrow(
+			WorkerCapabilityReductionError,
+		);
+	});
+});
+
+// Issue #783: the owner's durable CLI declaration — the seam `swarm workers set-cli`
+// writes through, distinct from the probe a handshake refreshes.
+describe('declareWorkerCapabilities', () => {
+	it('validates and de-duplicates the declaration, then delegates to the declaration writer', async () => {
+		setWorkerDeclaredCapabilities.mockImplementation(async (id, declared) =>
+			makeWorker({ id, capabilities: declared ?? ['claude'] }),
+		);
+
+		const updated = await declareWorkerCapabilities('worker-1', ['codex', 'codex']);
+
+		expect(updated?.capabilities).toEqual(['codex']);
+		expect(setWorkerDeclaredCapabilities).toHaveBeenCalledWith('worker-1', ['codex']);
+		// The probe path is untouched: a declaration never rewrites what the daemon found.
+		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	it('passes null straight through, which returns the worker to auto-discovery', async () => {
+		setWorkerDeclaredCapabilities.mockResolvedValue(makeWorker());
+
+		await declareWorkerCapabilities('worker-1', null);
+
+		expect(setWorkerDeclaredCapabilities).toHaveBeenCalledWith('worker-1', null);
+	});
+
+	// An empty declaration would mean "routable for nothing", which is what revoking an
+	// enrollment's consent expresses — not a CLI set.
+	it('rejects an empty declaration without hitting the repository', async () => {
+		await expect(declareWorkerCapabilities('worker-1', [])).rejects.toThrow();
+		expect(setWorkerDeclaredCapabilities).not.toHaveBeenCalled();
+	});
+
+	it('returns undefined for an unknown worker id', async () => {
+		setWorkerDeclaredCapabilities.mockResolvedValue(undefined);
+		expect(await declareWorkerCapabilities('nope', ['claude'])).toBeUndefined();
+	});
+
+	it('surfaces both repository guards unchanged', async () => {
+		setWorkerDeclaredCapabilities.mockRejectedValue(
+			new WorkerCapabilityNotProbedError('worker-1', ['codex'], ['claude']),
+		);
+		await expect(declareWorkerCapabilities('worker-1', ['codex'])).rejects.toThrow(
+			WorkerCapabilityNotProbedError,
+		);
+
+		setWorkerDeclaredCapabilities.mockRejectedValue(
+			new WorkerCapabilityReductionError('worker-1', ['claude']),
+		);
+		await expect(declareWorkerCapabilities('worker-1', ['codex'])).rejects.toThrow(
 			WorkerCapabilityReductionError,
 		);
 	});

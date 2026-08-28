@@ -2233,6 +2233,9 @@ describe('processJob', () => {
 					ownerUserId: overrides.ownerUserId ?? ALICE,
 					displayName: `worker-${id}`,
 					capabilities,
+					// No declaration (issue #783), so the probe is the effective set.
+					probedCapabilities: capabilities,
+					declaredCapabilities: null,
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 					repository: overrides.repository ?? null,
 					createdAt: new Date('2026-01-01T00:00:00Z'),

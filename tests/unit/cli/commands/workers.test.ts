@@ -2,9 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
 	registerWorker,
-	refreshWorkerCapabilities,
+	declareWorkerCapabilities,
 	listWorkersForOwner,
 	getWorker,
+	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } = vi.hoisted(() => {
 	class WorkerCapabilityReductionError extends Error {
@@ -16,11 +17,22 @@ const {
 			this.name = 'WorkerCapabilityReductionError';
 		}
 	}
+	class WorkerCapabilityNotProbedError extends Error {
+		constructor(
+			public workerId: string,
+			public offending: string[],
+			public probed: string[],
+		) {
+			super(`Cannot declare CLIs: ${offending.join(', ')} (probed: ${probed.join(', ')})`);
+			this.name = 'WorkerCapabilityNotProbedError';
+		}
+	}
 	return {
 		registerWorker: vi.fn(),
-		refreshWorkerCapabilities: vi.fn(),
+		declareWorkerCapabilities: vi.fn(),
 		listWorkersForOwner: vi.fn(),
 		getWorker: vi.fn(),
+		WorkerCapabilityNotProbedError,
 		WorkerCapabilityReductionError,
 	};
 });
@@ -76,9 +88,10 @@ const {
 
 vi.mock('@/identity/worker-service.js', () => ({
 	registerWorker,
-	refreshWorkerCapabilities,
+	declareWorkerCapabilities,
 	listWorkersForOwner,
 	getWorker,
+	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 }));
 vi.mock('@/identity/worker-enrollment-service.js', () => ({
@@ -137,9 +150,11 @@ describe('swarm workers', () => {
 			worker: makeWorker({ displayName: input.displayName, capabilities: input.capabilities }),
 			credential: 'raw-credential-token',
 		}));
-		refreshWorkerCapabilities
+		declareWorkerCapabilities
 			.mockReset()
-			.mockImplementation(async (id, capabilities) => makeWorker({ id, capabilities }));
+			.mockImplementation(async (id, capabilities) =>
+				makeWorker({ id, capabilities: capabilities ?? ['claude', 'codex'] }),
+			);
 		listWorkersForOwner.mockReset().mockResolvedValue([]);
 		removeWorker.mockReset().mockResolvedValue(true);
 		writeWorkerScmCredential.mockReset().mockResolvedValue(undefined);
@@ -283,28 +298,51 @@ describe('swarm workers', () => {
 	});
 
 	describe('set-cli', () => {
-		it('refreshes a worker capability set by id', async () => {
+		// Issue #783: it writes the owner's *declaration*, not the probe a handshake
+		// refreshes — which is the whole reason the statement now survives a reconnect.
+		it('declares a worker CLI set by id', async () => {
+			const log = vi.spyOn(console, 'log');
 			expect(await run(['set-cli', WORKER_ID, '--cli', 'codex'])).toBe(0);
-			expect(refreshWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['codex']);
+			expect(declareWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, ['codex']);
+			expect(log.mock.calls.flat().join('\n')).toContain('survives the machine');
 		});
 
-		it('requires --cli', async () => {
+		it('clears the declaration with --auto', async () => {
+			expect(await run(['set-cli', WORKER_ID, '--auto'])).toBe(0);
+			expect(declareWorkerCapabilities).toHaveBeenCalledWith(WORKER_ID, null);
+		});
+
+		it('requires one of --cli or --auto', async () => {
 			expect(await run(['set-cli', WORKER_ID])).toBe(1);
-			expect(refreshWorkerCapabilities).not.toHaveBeenCalled();
+			expect(declareWorkerCapabilities).not.toHaveBeenCalled();
+		});
+
+		it('refuses --cli and --auto together rather than letting argument order decide', async () => {
+			expect(await run(['set-cli', WORKER_ID, '--cli', 'codex', '--auto'])).toBe(1);
+			expect(declareWorkerCapabilities).not.toHaveBeenCalled();
 		});
 
 		it('fails cleanly for a missing worker', async () => {
-			refreshWorkerCapabilities.mockResolvedValue(undefined);
+			declareWorkerCapabilities.mockResolvedValue(undefined);
 			expect(await run(['set-cli', WORKER_ID, '--cli', 'claude'])).toBe(1);
 		});
 
 		it('translates a capability reduction error to a friendly message and exits 1', async () => {
-			refreshWorkerCapabilities.mockRejectedValue(
+			declareWorkerCapabilities.mockRejectedValue(
 				new WorkerCapabilityReductionError(WORKER_ID, ['claude']),
 			);
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['set-cli', WORKER_ID, '--cli', 'codex'])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('Cannot update capabilities'));
+		});
+
+		it('translates a not-probed error to a friendly message and exits 1', async () => {
+			declareWorkerCapabilities.mockRejectedValue(
+				new WorkerCapabilityNotProbedError(WORKER_ID, ['codex'], ['claude']),
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['set-cli', WORKER_ID, '--cli', 'codex'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('Cannot declare CLIs'));
 		});
 	});
 

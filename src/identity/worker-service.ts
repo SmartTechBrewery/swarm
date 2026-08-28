@@ -29,6 +29,7 @@ import {
 	getWorkerById,
 	getWorkersByIds,
 	listWorkersForOwner as listWorkersForOwnerRows,
+	setWorkerDeclaredCapabilities,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
@@ -44,7 +45,7 @@ import {
 } from './worker.js';
 
 export type { Worker } from './worker.js';
-export { WorkerCapabilityReductionError } from './worker.js';
+export { WorkerCapabilityNotProbedError, WorkerCapabilityReductionError } from './worker.js';
 
 /**
  * Worker credential: 32 random bytes (256 bits) is well beyond guessing range,
@@ -111,9 +112,15 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
 }
 
 /**
- * Refresh a worker's declared capabilities. Validates the set (non-empty,
- * de-duplicated `AgentCli` values) and updates it. Returns the updated worker, or
- * `undefined` if no worker has that id.
+ * Record the CLI set a daemon just **probed** on its own PATH. Validates the set
+ * (non-empty, de-duplicated `AgentCli` values) and updates it. Returns the updated
+ * worker, or `undefined` if no worker has that id.
+ *
+ * This declares the *probe*, which an owner's stored declaration now outranks
+ * (issue #783): the write is unchanged and still honest about what the machine
+ * reported, but what the worker is routable on afterwards is
+ * `effectiveCapabilities(probe, declaration)`. Stating a durable declaration is
+ * {@link declareWorkerCapabilities}'s job, and no handshake reaches it.
  *
  * `supportedPhases` (issue #467) is the daemon's declared phase repertoire, written
  * in the same transaction when supplied. Omit it — as `swarm workers set-cli` does —
@@ -139,6 +146,31 @@ export async function refreshWorkerCapabilities(
 	const validatedRepository =
 		repository === undefined || repository === null ? repository : RepoSlugSchema.parse(repository);
 	return updateWorkerCapabilities(id, validated, validatedPhases, validatedRepository);
+}
+
+/**
+ * State (or clear) the **owner's declaration** of which agent CLIs a worker should
+ * run (issue #783) — the durable half of the CLI axis, and the seam `swarm workers
+ * set-cli` writes through so its statement survives the machine's next reconnect.
+ *
+ * A non-null set is validated exactly as a probe is ({@link WorkerCapabilitiesSchema}:
+ * non-empty, de-duplicated) — an empty declaration would mean "routable for
+ * nothing", which is what revoking an enrollment's consent expresses, not a CLI set.
+ * `null` passes straight through and clears the declaration, returning the worker to
+ * plain auto-discovery.
+ *
+ * Returns the updated worker, or `undefined` if no worker has that id. Rejects with
+ * {@link WorkerCapabilityNotProbedError} when the declaration names a CLI the
+ * machine's daemon has never reported, and with
+ * {@link WorkerCapabilityReductionError} when it would drop a CLI an existing
+ * enrollment still requires; both are checked under one lock in the repository.
+ */
+export async function declareWorkerCapabilities(
+	id: string,
+	capabilities: AgentCli[] | null,
+): Promise<Worker | undefined> {
+	const validated = capabilities === null ? null : WorkerCapabilitiesSchema.parse(capabilities);
+	return setWorkerDeclaredCapabilities(id, validated);
 }
 
 /**

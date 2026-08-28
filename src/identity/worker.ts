@@ -79,7 +79,7 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
 /**
  * A registered worker. `ownerUserId` is a `users.id` (`uuid`, the SWARM user who
  * operates the machine); `displayName` is its human-facing label, unique per
- * owner (`src/db/schema/workers.ts`); `capabilities` is the declared set of agent
+ * owner (`src/db/schema/workers.ts`); `capabilities` is the set of agent
  * CLIs it can run and `supportedPhases` the set of pipeline phases its daemon
  * declared it can execute (issue #467). The axis exists because a daemon's
  * repertoire is its own to state, not because the two daemon kinds differ: since
@@ -98,6 +98,18 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * two capability axes are — it guards against operator error (a daemon launched in
  * the wrong directory), not against an attacker.
  *
+ * The CLI axis is **three** fields since issue #783, because the one field used to
+ * collapse two facts that overwrite each other. `probedCapabilities` is the raw
+ * `workers.capabilities` column — what the daemon currently operating the row last
+ * found on its own PATH, rewritten at every handshake. `declaredCapabilities` is
+ * the owner's durable statement, which no handshake touches; `null` means none has
+ * been made. **`capabilities` is neither: it is the derived *effective* set**
+ * ({@link effectiveCapabilities}), and it is the one every consumer routes on — the
+ * eligibility gate, the dispatch candidate list, the rosters, the CLI's output.
+ * Note the deliberate asymmetry with storage: the *column* `capabilities` is the
+ * probe, the *domain field* `capabilities` is the effective set (see
+ * `src/db/repositories/workersRepository.ts`).
+ *
  * The worker credential hash is intentionally **not** a field here — it is a
  * secret that never leaves the DB layer (`rowToWorker` drops it), the same
  * treatment `users.password_hash` gets in `SwarmUser`.
@@ -106,7 +118,12 @@ export const WorkerSchema = z.object({
 	id: z.string().uuid(),
 	ownerUserId: z.string().uuid(),
 	displayName: WorkerDisplayNameSchema,
+	/** The **effective** CLI set — see {@link effectiveCapabilities}, not a raw column. */
 	capabilities: z.array(AgentCliSchema),
+	/** The raw `workers.capabilities` column: the daemon's last self-probe. */
+	probedCapabilities: z.array(AgentCliSchema),
+	/** The owner's durable declaration, or `null` when none has been made. */
+	declaredCapabilities: z.array(AgentCliSchema).nullable(),
 	supportedPhases: z.array(TriggerPhaseSchema),
 	repository: RepoSlugSchema.nullable(),
 	createdAt: z.date(),
@@ -114,6 +131,37 @@ export const WorkerSchema = z.object({
 });
 
 export type Worker = z.infer<typeof WorkerSchema>;
+
+/**
+ * The CLI set a worker is actually routable on, resolved from the two facts a
+ * `workers` row records (issue #783). Pure and dependency-free, and taking a
+ * structural shape rather than the drizzle row type so both a raw row and a domain
+ * `Worker` satisfy it — it is the single definition every reader goes through,
+ * which is what stops one of them silently routing on the probe alone.
+ *
+ * - **No declaration** (`null`) → the probe, verbatim. That is the behaviour that
+ *   pre-dated the column, so an installation where nobody has declared anything is
+ *   indistinguishable from one before the split.
+ * - **A declaration** → `declaration ∩ probe`. The declaration outranks a re-probe,
+ *   which is the durability the split exists for; but a CLI the probe *proved
+ *   absent* is still never dispatched. That intersection is well-founded rather
+ *   than paranoid: `discoverAvailableClis` (`src/transport/cli-discovery.ts`) drops
+ *   a CLI only on `ENOENT` and declares an unsettled probe anyway (issue #559), so
+ *   a CLI missing from the probe is evidence of absence, not of a slow machine.
+ *
+ * The result may be empty, and that is correct rather than a bug: the worker is
+ * simply eligible for nothing until its machine reports the declared CLI again.
+ * Every consumer already handles an empty list.
+ */
+export function effectiveCapabilities(declaration: {
+	capabilities: AgentCli[];
+	declaredCapabilities: AgentCli[] | null;
+}): AgentCli[] {
+	const { capabilities, declaredCapabilities } = declaration;
+	if (declaredCapabilities === null) return capabilities;
+	const probed = new Set(capabilities);
+	return declaredCapabilities.filter((cli) => probed.has(cli));
+}
 
 /**
  * Raised when updating a worker's capabilities to a set that excludes one or
@@ -128,5 +176,30 @@ export class WorkerCapabilityReductionError extends Error {
 			`Cannot update capabilities for worker ${workerId}: existing enrollment(s) require CLIs not in updated capabilities: ${offending.join(', ')}`,
 		);
 		this.name = 'WorkerCapabilityReductionError';
+	}
+}
+
+/**
+ * Raised when a *declaration* (issue #783) names a CLI the machine's daemon has
+ * never reported probing — the guard that keeps a declaration from widening past
+ * what the machine can actually run, where {@link WorkerCapabilityReductionError}
+ * keeps it from narrowing past what an enrollment needs.
+ *
+ * Refusing here rather than silently intersecting it away is deliberate: an
+ * operator who declares `codex` on a machine without `codex` has made a mistake
+ * they want told about, not a set they want quietly emptied. The message names the
+ * offending CLIs, what the daemon last reported, and the supported way to widen
+ * that set on the machine itself.
+ */
+export class WorkerCapabilityNotProbedError extends Error {
+	constructor(
+		public readonly workerId: string,
+		public readonly offending: AgentCli[],
+		public readonly probed: AgentCli[],
+	) {
+		super(
+			`Cannot declare CLIs for worker ${workerId}: ${offending.join(', ')} ${offending.length === 1 ? 'is' : 'are'} not among the CLIs this machine's daemon last reported (${probed.length > 0 ? probed.join(', ') : 'none'}). Install it on the machine and let it reconnect, or declare it on the machine itself with SWARM_WORKER_TRANSPORT_CLIS.`,
+		);
+		this.name = 'WorkerCapabilityNotProbedError';
 	}
 }

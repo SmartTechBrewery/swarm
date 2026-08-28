@@ -386,6 +386,13 @@
       "when": 1787906978462,
       "tag": "0054_instance_scm_credentials",
       "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1787921002302,
+      "tag": "0055_worker_declared_capabilities",
+      "breakpoints": true
     }
   ]
 }
