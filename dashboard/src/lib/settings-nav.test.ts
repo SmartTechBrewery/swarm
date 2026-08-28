@@ -29,10 +29,10 @@ describe('settingsSearchSchema', () => {
 
 describe('visibleSettingsTabs', () => {
 	it('gives an instance administrator every tab', () => {
-		expect(visibleSettingsTabs(ADMIN)).toEqual(['agents', 'appearance']);
+		expect(visibleSettingsTabs(ADMIN)).toEqual(['agents', 'credentials', 'appearance']);
 	});
 
-	it('hides Agent Defaults from a non-administrator', () => {
+	it('hides Agent Defaults and Credentials from a non-administrator', () => {
 		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['appearance']);
 	});
 
@@ -57,6 +57,17 @@ describe('resolveActiveSettingsTab', () => {
 
 	it('degrades a direct ?tab=agents link for a non-administrator', () => {
 		expect(resolveActiveSettingsTab({ tab: 'agents' }, NON_ADMIN)).toBe('appearance');
+	});
+
+	// The tab is hidden as a courtesy; `settings.credentials` refuses a non-administrator
+	// in the router regardless (issue #769).
+	it('degrades a direct ?tab=credentials link for a non-administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'credentials' }, NON_ADMIN)).toBe('appearance');
+		expect(resolveActiveSettingsTab({ tab: 'credentials' })).toBe('appearance');
+	});
+
+	it('honors ?tab=credentials for an administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'credentials' }, ADMIN)).toBe('credentials');
 	});
 
 	it('treats an unresolved viewer as a non-administrator, so the section never flashes', () => {

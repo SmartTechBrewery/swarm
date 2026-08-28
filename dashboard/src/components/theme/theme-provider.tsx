@@ -79,6 +79,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 	});
 
 	const setTheme = (next: AppearanceTheme) => {
+		// A theme change is a full settings-blob replacement, so there is no safe payload
+		// until the current blob has loaded. The settings route normally prevents the
+		// Appearance panel from rendering in this state; retain this guard at the write
+		// boundary so another caller cannot accidentally drop sibling settings.
+		if (!settings) return;
 		// A system change while an explicit preference is active produces no
 		// media-query event because there is intentionally no subscription. Read
 		// the current value before rendering `system`, rather than reusing that

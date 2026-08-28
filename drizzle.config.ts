@@ -9,6 +9,7 @@ export default defineConfig({
 		'./src/db/schema/cliQuotas.ts',
 		'./src/db/schema/reviewVerdicts.ts',
 		'./src/db/schema/dispatches.ts',
+		'./src/db/schema/instanceScmCredentials.ts',
 		'./src/db/schema/users.ts',
 		'./src/db/schema/userSessions.ts',
 		'./src/db/schema/userIdentities.ts',

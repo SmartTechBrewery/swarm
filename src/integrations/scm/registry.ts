@@ -27,8 +27,12 @@
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
-import type { SCMProvider, ScmType } from '../../scm/types.js';
-import { isRuntimeReadySCMProvider, type SCMProviderManifest } from './manifest.js';
+import type { SCMProvider, ScmCredentialRole, ScmType } from '../../scm/types.js';
+import {
+	isRuntimeReadySCMProvider,
+	type SCMProviderManifest,
+	type ScmCredentialRoleSpec,
+} from './manifest.js';
 
 const registry: SCMProviderManifest[] = [];
 const byId = new Map<string, SCMProviderManifest>();
@@ -170,6 +174,41 @@ function describeIds(manifests: readonly SCMProviderManifest[]): string {
 export function listSCMProviders(): readonly SCMProviderManifest[] {
 	// Return a shallow clone so callers can't splice the source array.
 	return registry.slice();
+}
+
+/** One `(provider, role)` pair eligible for an instance-level default (issue #769). */
+export interface InstanceDefaultScmRole {
+	readonly providerId: ScmType;
+	readonly providerLabel: string;
+	readonly role: ScmCredentialRole;
+	/** The provider's conventional key for the role — what the admin surface displays. */
+	readonly envVarKey: string;
+}
+
+/**
+ * Every `(provider, role)` pair whose spec declares
+ * {@link ScmCredentialRoleSpec.instanceDefault}, across the **runtime-ready**
+ * registered manifests, in registration order (issue #769).
+ *
+ * Runtime-readiness is part of eligibility, for `runtimeReadyScmProvider`'s reason
+ * (`src/api/routers/credentials.ts`): no project may route to a provider that is
+ * registered but not runtime-ready, so offering an instance default for it would only
+ * invite an operator to configure something that cannot run.
+ *
+ * The enumeration the admin surface offers — nothing here is consulted at credential
+ * resolution time.
+ */
+export function listInstanceDefaultScmRoles(): readonly InstanceDefaultScmRole[] {
+	return registry.filter(isRuntimeReadySCMProvider).flatMap((manifest) =>
+		manifest.credentialRoles
+			.filter((spec) => spec.instanceDefault === true)
+			.map((spec) => ({
+				providerId: manifest.id,
+				providerLabel: manifest.label,
+				role: spec.role,
+				envVarKey: spec.envVarKey,
+			})),
+	);
 }
 
 /**

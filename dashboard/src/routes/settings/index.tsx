@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute, useNavigate } from '@tanstack/react-router';
-import { Cpu, type LucideIcon, Monitor, Moon, Palette, Sun } from 'lucide-react';
+import { Cpu, KeyRound, type LucideIcon, Monitor, Moon, Palette, Sun } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
+import { InstanceCredentialsPanel } from '@/components/settings/instance-credentials-panel.js';
 import { useTheme } from '@/components/theme/theme-provider.js';
 import {
 	resolveActiveSettingsTab,
@@ -284,13 +285,14 @@ export function AppearancePanel() {
  */
 const SETTINGS_TAB_ITEMS: ReadonlyArray<{ tab: SettingsTab; label: string; icon: LucideIcon }> = [
 	{ tab: 'agents', label: 'Agent Defaults', icon: Cpu },
+	{ tab: 'credentials', label: 'Credentials', icon: KeyRound },
 	{ tab: 'appearance', label: 'Appearance', icon: Palette },
 ];
 
 /**
  * The horizontal tab bar, rendered from {@link SETTINGS_TAB_ITEMS} narrowed to the
- * tabs this viewer may see (`visibleSettingsTabs`) — a non-administrator is never
- * offered Agent Defaults (issue #666).
+ * tabs this viewer may see (`visibleSettingsTabs`) — a non-administrator is offered
+ * neither Agent Defaults (issue #666) nor Credentials (issue #769).
  */
 export function SettingsTabBar({
 	tabs,
@@ -328,9 +330,11 @@ function SettingsRouteComponent() {
 	const queryClient = useQueryClient();
 	const navigate = useNavigate();
 	const search = settingsRoute.useSearch();
-	// Agent defaults are installation-wide, so the section is shown only to an
-	// instance administrator (issue #666) — including on a direct `?tab=agents`
-	// link, which `resolveActiveSettingsTab` degrades to a tab the viewer may see.
+	// Agent defaults and the instance default credentials are installation-wide, so both
+	// sections are shown only to an instance administrator (issues #666, #769) —
+	// including on a direct `?tab=agents` / `?tab=credentials` link, which
+	// `resolveActiveSettingsTab` degrades to a tab the viewer may see. For the
+	// credentials tab that is courtesy on top of the router's own enforcement.
 	const viewer = useCurrentUser().data;
 	const tabs = visibleSettingsTabs(viewer);
 	const activeTab = resolveActiveSettingsTab(search, viewer);
@@ -394,11 +398,14 @@ function SettingsRouteComponent() {
 		});
 	};
 
-	if (settingsQuery.isLoading) {
+	// Credentials has its own query and remains usable if `settings.get` fails. Both other
+	// tabs depend on the full settings blob: Agent Defaults reads `agents`, while
+	// Appearance merges its theme update onto it.
+	if (activeTab !== 'credentials' && settingsQuery.isLoading) {
 		return <div className="text-sm text-zinc-400">Loading settings…</div>;
 	}
 
-	if (settingsQuery.isError) {
+	if (activeTab !== 'credentials' && settingsQuery.isError) {
 		return (
 			<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex flex-col gap-2">
 				<h3 className="text-sm font-semibold text-red-200">Error Loading Settings</h3>
@@ -431,6 +438,8 @@ function SettingsRouteComponent() {
 					errorMessage={updateMutation.error?.message}
 				/>
 			)}
+
+			{activeTab === 'credentials' && <InstanceCredentialsPanel />}
 
 			{activeTab === 'appearance' && <AppearancePanel />}
 		</div>

@@ -78,8 +78,9 @@ export async function runMigrations(): Promise<void> {
  * user_identities + project_members + project_membership_requests + workers from
  * users); every table is listed for
  * explicitness. `app_settings` (a standalone singleton), `cli_quotas` (keyed on
- * `(host, cli)` alone) and `users` are listed here too so a write in one test
- * doesn't leak into the next.
+ * `(host, cli)` alone), `instance_scm_credentials` (keyed on `(provider, role)` alone,
+ * with no project or worker to cascade from) and `users` are listed here too so a write
+ * in one test doesn't leak into the next.
  */
 export async function truncateAll(): Promise<void> {
 	await getDb().execute(`
@@ -95,6 +96,7 @@ export async function truncateAll(): Promise<void> {
 			project_membership_requests,
 			project_members,
 			project_credentials,
+			instance_scm_credentials,
 			projects,
 			app_settings,
 			cli_quotas,
