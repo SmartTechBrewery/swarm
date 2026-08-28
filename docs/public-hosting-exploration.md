@@ -8,6 +8,17 @@
   picking the idea back up does not mean re-deriving it. Nothing here is a
   commitment to build anything.
 
+> **Superseded in part by issue #765 (2026-08-28).** §3 and §4 below describe the
+> worker operator's SCM credential as an env var that never crosses the transport,
+> and argue against storing it server-side. For SWARM's own **private** instances
+> that has since changed: the credential is stored per `(worker, SCM provider)`,
+> encrypted at rest, and delivered on the assignment frame (ai/ARCHITECTURE.md,
+> "Per-worker operator SCM credential"). §4's objections were about a *public,
+> multi-tenant* deploy holding *contributors'* personal PATs, which is still not on
+> the table — but the "exactly zero secrets travel downward" fact it rests on is no
+> longer true, so re-read it with that in mind rather than as a current statement of
+> the code. The rest of the analysis is untouched.
+
 Each claim is marked by how it was established:
 **[code]** verified against this repository, **[docs]** from the provider's own
 current documentation, **[judgment]** reasoning that is not a verifiable fact.

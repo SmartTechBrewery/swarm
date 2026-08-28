@@ -42,6 +42,11 @@ npm run swarm -- workers register <email> --name "<Display Name>" --cli <clis>
 
 # 4. Enroll the worker in the project
 npm run swarm -- workers enroll <worker-id> swarm --cli <clis> --concurrency 1 --active --consent
+
+# 5. Store this worker's operator SCM credential — the account its commits,
+#    pushes, PRs and implementer comments will be authored as. Prompts without
+#    echo; pipe it on stdin to script this.
+npm run swarm -- workers set-scm-credential <worker-id> github
 ```
 
 Notes:
@@ -72,6 +77,14 @@ Notes:
   is an operator action — point the machine at the right checkout, or enroll it in
   the right project — and re-activating a suspended enrollment stays the project
   administrator's call (`swarm workers approve`).
+- **Step 5 is what the machine actually runs as** (issue #765). One credential per
+  `(worker, SCM provider)`, stored encrypted server-side and resolved at dispatch —
+  so a worker enrolled in projects on two providers needs one command per provider
+  (`github` | `bitbucket` | `gitlab`), and a rotation takes effect on the next phase
+  with no worker restart. Without it, every Planning/Implementation/Review dispatch
+  to this worker fails immediately with a message naming the worker and the provider.
+  It replaces the worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any
+  more; see the rollout order in Part 2.
 - Skip `swarm identities link` unless you already know which GitHub account
   should be the *assignee* that routes work to this specific machine — without
   it the worker still receives review / respond-to-review / respond-to-ci /
@@ -95,8 +108,9 @@ ORDER BY u.identifier, w.display_name;
 
 Hand the credential to the new person out-of-band (not pasted into a shared
 chat/ticket) along with the control-plane URL (the tunnel hostname from
-[`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md)) and a GitHub PAT for
-whichever account should author their commits/PRs.
+[`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md)). The account that authors
+their commits/PRs is the one whose credential step 5 stored — that value stays on
+the control plane and is never handed to the operator of the machine.
 
 ---
 
@@ -104,10 +118,13 @@ whichever account should author their commits/PRs.
 
 This machine is **DB-free** — no `DATABASE_URL`/`REDIS_URL`, no Postgres/Redis
 access at all. It needs the repo checked out (it runs the agent CLI locally and
-manages its own Git worktrees) and three environment variables in its `.env`.
+manages its own Git worktrees) and two environment variables in its `.env`. It
+holds **no source-control credential of its own** since issue #765: the operator
+identity it commits and pushes as is stored on the control plane (Part 1, step 5)
+and arrives with each assignment.
 
 > This is also how the **control-plane host's own** worker runs since issue #551 —
-> same command, same three variables, with `SWARM_CONTROL_PLANE_URL` pointing at
+> same command, same two variables, with `SWARM_CONTROL_PLANE_URL` pointing at
 > `http://localhost:<ROUTER_PORT>` instead of the tunnel. Everything in Part 2
 > applies there too.
 
@@ -122,8 +139,20 @@ npm ci
 # named file like .env.worker.local is never picked up automatically)
 SWARM_WORKER_CREDENTIAL=<the credential from Part 1, step 3>
 SWARM_CONTROL_PLANE_URL=<the control-plane base URL, e.g. https://swarm.example.com>
-SWARM_OPERATOR_GH_TOKEN=<a GitHub PAT for the account that should author commits/PRs from here>
 ```
+
+**Upgrading an installation that predates issue #765** — the order matters, because
+a new router pushes a credential an old worker ignores, while an old router pushes
+none and a new worker refuses to run:
+
+1. store every worker's operator credential (Part 1, step 5) on the control plane;
+2. deploy the router;
+3. deploy the workers.
+
+Only after step 3 may an operator delete `SWARM_OPERATOR_GH_TOKEN` from a worker's
+`.env` — it is inert there from that point on. (The **router**'s own
+`SWARM_OPERATOR_GH_TOKEN` stays: three control-plane call sites still read it, see
+[`docs/configuration.md`](./configuration.md).)
 
 Make sure every CLI declared in `--cli` back in Part 1 is actually installed
 and authenticated on this machine (e.g. `claude` logged in), then:
@@ -186,7 +215,10 @@ to expire after `heartbeatTtlMs`.
 | Symptom | Cause |
 | --- | --- |
 | `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
-| `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the three variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
+| `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the two variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
+| Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>` — it takes effect on the next dispatch, with no worker restart. |
+| A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
+| A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, step 4), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
 | An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a different repository than the project's, so the control plane suspended the pairing (issue #690). `/workers/<id>` names both repositories on that enrollment block. Point `SWARM_WORKER_REPO_ROOT` at a checkout of the project's repository (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
 | `swarm workers enroll` exits 1 saying the worker's checkout is a different repository | Same mismatch, caught on the write path instead (issue #690) — the message names the machine's checkout and the project's repository. Enroll a worker whose checkout is that repository, or re-point this one. |

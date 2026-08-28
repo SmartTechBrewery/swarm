@@ -281,6 +281,7 @@ pair is a no-op; a handle already linked to a different user is rejected. Requir
 swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
 swarm workers list [<owner-identifier>]
 swarm workers set-cli <worker-id> --cli <c1,c2,...>
+swarm workers set-scm-credential <worker-id> <scm-provider-id>
 swarm workers remove <worker-id>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
@@ -296,6 +297,16 @@ swarm workers consent <worker-id> <project-id> <on|off>
 - **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line). With an owner
   identifier, only that owner's; without, all owners'. Never prints a credential.
 - **`set-cli`** — replace a worker's declared CLIs by worker id.
+- **`set-scm-credential`** — store (or rotate) this worker's **operator** credential
+  for one SCM provider (`github | bitbucket | gitlab`) — the account every phase it
+  runs against a project on that provider commits, pushes, opens pull requests and
+  comments as (issue #765). One credential per `(worker, provider)`, encrypted at
+  rest and resolved at dispatch, so a rotation takes effect on the next phase with no
+  worker restart. The secret is prompted for without echo on a TTY and otherwise read
+  from stdin — never taken as an argument (shell history, `ps`) and never printed
+  back. A worker with none stored for the provider a dispatch needs fails that
+  dispatch immediately, naming the worker and the provider. It replaces the
+  worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any more.
 - **`remove`** — deregister a worker by worker id.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
@@ -413,7 +424,7 @@ repo root.
 | `npm run dev:api` | Migrate the DB, free `API_PORT`, then start the API server (`:3101`) with `--watch`. In dev it serves the API only; it also serves the built dashboard SPA from `dashboard/dist` when that exists. It also runs the control-plane host maintenance loop — the orphaned-run reap, CLI quota discovery, and the worktree retention sweep (`src/api/maintenance.ts`, issue #550). |
 | `npm run start:api` | Build the dashboard, then run `dev:api` — the recommended **same-origin** mode where one process serves the SPA + API on `:3101` (used for public/tunnel access). |
 | `npm run reload` | After `git pull`: sync both dependency trees, rebuild the dashboard (`dist`, picked up live by a running `dev:api`/`start:api` since it serves `dist` from disk), and apply migrations. Does **not** restart the worker or rebuild the router — do those manually if their code changed (it prints the reminder). |
-| `npm run dev:worker` | Start the worker (`src/transport/connect-entry.ts`). **This is the worker** — the only one, on every machine, remote or the control-plane host itself, where it points `SWARM_CONTROL_PLANE_URL` at the router over loopback (issue #551). It is not in Docker Compose, holds no `DATABASE_URL`/`REDIS_URL`, and needs `SWARM_WORKER_CREDENTIAL`, `SWARM_CONTROL_PLANE_URL` and `SWARM_OPERATOR_GH_TOKEN` in `.env`. |
+| `npm run dev:worker` | Start the worker (`src/transport/connect-entry.ts`). **This is the worker** — the only one, on every machine, remote or the control-plane host itself, where it points `SWARM_CONTROL_PLANE_URL` at the router over loopback (issue #551). It is not in Docker Compose, holds no `DATABASE_URL`/`REDIS_URL`, and needs `SWARM_WORKER_CREDENTIAL` and `SWARM_CONTROL_PLANE_URL` in `.env` — no operator SCM credential since issue #765, which arrives per assignment (`swarm workers set-scm-credential`). |
 | `npm run dev:worker:watch` | Same as `dev:worker`, with `--watch` auto-restart. |
 | `npm run dev:worker:seed` | Apply `swarm.config.json` (`db:seed`) then start the worker. Control-plane host only — `db:seed` needs `DATABASE_URL`. |
 | `npm run dev:dashboard` | Start the dashboard Vite dev server (`:5173`) — local development only; not what you expose publicly. |

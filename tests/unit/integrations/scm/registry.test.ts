@@ -7,6 +7,7 @@ import {
 	listSCMProviders,
 	registerSCMProvider,
 	requireProjectSCMProvider,
+	requireProjectSCMProviderId,
 	requireSCMProvider,
 } from '@/integrations/scm/registry.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
@@ -197,6 +198,54 @@ describe('requireProjectSCMProvider', () => {
 		registerSCMProvider(fakeManifest('bitbucket', false));
 		expect(() => requireProjectSCMProvider(project)).toThrow(
 			/it selects no provider and 0 of 1 registered are runtime-ready/,
+		);
+	});
+});
+
+/**
+ * The id half of the same lookup (issue #765) — what a caller needs when the
+ * provider is a *value*, not an instance: the operator credential a dispatch hands
+ * a worker is stored per `(worker, scmProviderId)`. It exists so no such caller
+ * writes `project.scm ?? 'github'`, so both halves are asserted: it selects the same
+ * manifest, and it refuses in the same three ways rather than defaulting.
+ */
+describe('requireProjectSCMProviderId', () => {
+	beforeEach(() => {
+		_resetSCMProviderRegistryForTesting();
+	});
+
+	it('returns the id of the manifest the project selects', () => {
+		registerSCMProvider(fakeManifest('github'));
+		registerSCMProvider(fakeManifest('bitbucket'));
+		expect(requireProjectSCMProviderId(createMockProjectConfig({ scm: 'bitbucket' }))).toBe(
+			'bitbucket',
+		);
+	});
+
+	it('returns the sole runtime-ready id when the project selects none', () => {
+		registerSCMProvider(fakeManifest('github'));
+		expect(requireProjectSCMProviderId(project)).toBe('github');
+	});
+
+	it('throws the same three ways requireProjectSCMProvider does', () => {
+		const onBitbucket = createMockProjectConfig({ id: 'bb-project', scm: 'bitbucket' });
+
+		// Selected but unregistered — never silently the one that *is* registered.
+		registerSCMProvider(fakeManifest('github'));
+		expect(() => requireProjectSCMProviderId(onBitbucket)).toThrow(
+			"Cannot resolve the SCM provider for project 'bb-project': it selects 'bitbucket', which is not registered",
+		);
+
+		// Registered but not runtime-ready.
+		registerSCMProvider(fakeManifest('bitbucket', false));
+		expect(() => requireProjectSCMProviderId(onBitbucket)).toThrow(
+			/registered but not runtime-ready/,
+		);
+
+		// Nothing selected while the runtime-ready count is not exactly one.
+		registerSCMProvider(fakeManifest('gitlab'));
+		expect(() => requireProjectSCMProviderId(project)).toThrow(
+			/it selects no provider and 2 of 3 registered are runtime-ready/,
 		);
 	});
 });

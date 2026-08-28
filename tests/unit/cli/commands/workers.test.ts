@@ -25,6 +25,11 @@ const {
 	};
 });
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
+const { writeWorkerScmCredential } = vi.hoisted(() => ({ writeWorkerScmCredential: vi.fn() }));
+const { promptHidden, readStdin } = vi.hoisted(() => ({
+	promptHidden: vi.fn(),
+	readStdin: vi.fn(),
+}));
 const { findUserByIdentifier, listUsers } = vi.hoisted(() => ({
 	findUserByIdentifier: vi.fn(),
 	listUsers: vi.fn(),
@@ -85,6 +90,10 @@ vi.mock('@/identity/worker-enrollment-service.js', () => ({
 	EnrollmentRepositoryMismatchError,
 }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
+vi.mock('@/db/repositories/workerScmCredentialsRepository.js', () => ({
+	writeWorkerScmCredential,
+}));
+vi.mock('@/cli/_shared/secret-input.js', () => ({ promptHidden, readStdin }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier, listUsers }));
 vi.mock('@/db/repositories/projectsRepository.js', () => ({ findProjectByIdFromDb }));
 vi.mock('@/db/repositories/workerEnrollmentsRepository.js', () => ({ getEnrollment }));
@@ -133,6 +142,10 @@ describe('swarm workers', () => {
 			.mockImplementation(async (id, capabilities) => makeWorker({ id, capabilities }));
 		listWorkersForOwner.mockReset().mockResolvedValue([]);
 		removeWorker.mockReset().mockResolvedValue(true);
+		writeWorkerScmCredential.mockReset().mockResolvedValue(undefined);
+		// Non-TTY is the shape a test process actually has, so the command reads stdin.
+		promptHidden.mockReset().mockResolvedValue('typed-secret');
+		readStdin.mockReset().mockResolvedValue('  piped-secret\n');
 		findUserByIdentifier.mockReset().mockResolvedValue(makeUser());
 		listUsers.mockReset().mockResolvedValue([makeUser()]);
 		closeDb.mockReset().mockResolvedValue(undefined);
@@ -262,6 +275,43 @@ describe('swarm workers', () => {
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['set-cli', WORKER_ID, '--cli', 'codex'])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('Cannot update capabilities'));
+		});
+	});
+
+	describe('set-scm-credential', () => {
+		it('stores the trimmed secret for the (worker, provider) pair, printing no preview', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['set-scm-credential', WORKER_ID, 'bitbucket'])).toBe(0);
+			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'bitbucket', 'piped-secret');
+			// It confirms the write and nothing else — a preview of an operator identity
+			// in a terminal scrollback is the thing this command exists to avoid.
+			const printed = log.mock.calls.flat().join('\n');
+			expect(printed).toContain("stored operator scm credential for worker 'ada-laptop'");
+			expect(printed).not.toContain('piped-secret');
+		});
+
+		it('rejects an unknown SCM provider id', async () => {
+			expect(await run(['set-scm-credential', WORKER_ID, 'perforce'])).toBe(1);
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
+		// Checked here rather than left to the FK, so the operator gets a message
+		// instead of a constraint violation.
+		it('fails cleanly for a missing worker', async () => {
+			getWorker.mockResolvedValue(undefined);
+			expect(await run(['set-scm-credential', WORKER_ID, 'github'])).toBe(1);
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
+		it('rejects an empty secret', async () => {
+			readStdin.mockResolvedValue('   \n');
+			expect(await run(['set-scm-credential', WORKER_ID, 'github'])).toBe(1);
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
+		it('requires both a worker id and a provider id', async () => {
+			expect(await run(['set-scm-credential', WORKER_ID])).toBe(1);
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
 		});
 	});
 

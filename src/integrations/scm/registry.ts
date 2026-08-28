@@ -27,7 +27,7 @@
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
-import type { SCMProvider } from '../../scm/types.js';
+import type { SCMProvider, ScmType } from '../../scm/types.js';
 import { isRuntimeReadySCMProvider, type SCMProviderManifest } from './manifest.js';
 
 const registry: SCMProviderManifest[] = [];
@@ -109,6 +109,25 @@ export function requireSCMProvider(id: string): SCMProvider {
  * must stay event-accurate.
  */
 export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
+	return requireProjectSCMManifest(project).provider;
+}
+
+/**
+ * The **id** of the manifest {@link requireProjectSCMProvider} would resolve — same
+ * selection rules, same three throws.
+ *
+ * Its own lookup because a caller that needs the provider a project runs on as a
+ * *value* — the worker operator's credential is stored per `(worker, provider)`
+ * (issue #765) — must not write `project.scm ?? 'github'`. That fallback is exactly
+ * the hardcoding the neutral contract exists to remove, and it would resolve a
+ * Bitbucket project's dispatch against a GitHub credential.
+ */
+export function requireProjectSCMProviderId(project: ProjectConfig): ScmType {
+	return requireProjectSCMManifest(project).id;
+}
+
+/** The shared body of the two project-scoped lookups above. */
+function requireProjectSCMManifest(project: ProjectConfig): SCMProviderManifest {
 	const selected = project.scm;
 	if (selected) {
 		const manifest = getSCMProvider(selected);
@@ -127,7 +146,7 @@ export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
 					`Runtime-ready: ${describeIds(registry.filter(isRuntimeReadySCMProvider))}.`,
 			);
 		}
-		return manifest.provider;
+		return manifest;
 	}
 
 	const runtimeReady = registry.filter(isRuntimeReadySCMProvider);
@@ -140,7 +159,7 @@ export function requireProjectSCMProvider(project: ProjectConfig): SCMProvider {
 				'(or did src/integrations/entrypoint.ts fail to load?).',
 		);
 	}
-	return only.provider;
+	return only;
 }
 
 /** Render manifest ids for an error message, so an empty list reads as words rather than as nothing. */

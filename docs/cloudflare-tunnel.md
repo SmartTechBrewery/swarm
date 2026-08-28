@@ -222,13 +222,15 @@ detail on this event's delivery scope.)
 The same tunnel that delivers webhooks also fronts SWARM's **worker transport**
 (ADR-003 §1) — the front door a worker running on a *different* machine uses to
 join the control plane. A remote worker holds only its
-`SWARM_WORKER_CREDENTIAL` and `SWARM_OPERATOR_GH_TOKEN`; it never gets
-`DATABASE_URL`/`REDIS_URL`. Point it at the tunnel and run the worker:
+`SWARM_WORKER_CREDENTIAL`; it never gets `DATABASE_URL`/`REDIS_URL`, and since issue
+#765 no source-control credential of its own either — the operator identity it
+commits as is stored server-side per `(worker, SCM provider)` and arrives with each
+assignment (`swarm workers set-scm-credential`). Point it at the tunnel and run the
+worker:
 
 ```bash
 SWARM_CONTROL_PLANE_URL=https://swarm.example.com \
 SWARM_WORKER_CREDENTIAL=<the credential from `swarm workers register`> \
-SWARM_OPERATOR_GH_TOKEN=<a GitHub token for the account that authors this host's commits> \
 npm run dev:worker
 ```
 

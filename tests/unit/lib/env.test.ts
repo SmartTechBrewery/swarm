@@ -3,7 +3,6 @@ import {
 	isSingleUserMode,
 	optionalEnv,
 	requireEnv,
-	resolveOperatorGitHubToken,
 	resolveWebhookCallbackBaseUrl,
 	resolveWorkerRepoRoot,
 } from '@/lib/env.js';
@@ -68,33 +67,6 @@ describe('resolveWebhookCallbackBaseUrl', () => {
 	it('trims trailing slashes so a route path concatenates cleanly', () => {
 		expect(resolveWebhookCallbackBaseUrl('https://swarm.example.com//')).toBe(
 			'https://swarm.example.com',
-		);
-	});
-});
-
-describe('resolveOperatorGitHubToken', () => {
-	it('returns the value when passed directly', () => {
-		expect(resolveOperatorGitHubToken('ghp_x')).toBe('ghp_x');
-	});
-
-	it('reads SWARM_OPERATOR_GH_TOKEN when no argument is given', () => {
-		vi.stubEnv('SWARM_OPERATOR_GH_TOKEN', 'ghp_env');
-		expect(resolveOperatorGitHubToken()).toBe('ghp_env');
-	});
-
-	it('trims surrounding whitespace', () => {
-		expect(resolveOperatorGitHubToken('  ghp_x  ')).toBe('ghp_x');
-	});
-
-	it('throws when unset (empty string)', () => {
-		expect(() => resolveOperatorGitHubToken('')).toThrow(
-			/Missing required environment variable: SWARM_OPERATOR_GH_TOKEN/,
-		);
-	});
-
-	it('throws for a whitespace-only value', () => {
-		expect(() => resolveOperatorGitHubToken('   ')).toThrow(
-			/Missing required environment variable: SWARM_OPERATOR_GH_TOKEN/,
 		);
 	});
 });

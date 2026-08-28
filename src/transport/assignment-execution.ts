@@ -15,14 +15,34 @@
  * (`./db-free-project.ts`), source-carrying delivery uses the operator's own
  * credential through the registered SCM provider
  * (`SCMProvider.operatorDeliveryProvider`, `../scm/types.ts`), and the two kinds of
- * metadata write the operator token *cannot* perform — a review under the
+ * metadata write that credential *cannot* perform — a review under the
  * project's reviewer PAT, a board write under its PM credential — ride the
- * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2). A
- * supported-phase gate cleanly fails any phase not yet runnable this way, so a
+ * control-plane delivery API instead (`./delivery-client.ts`, ADR-004 §2).
+ *
+ * **The operator credential arrives on the frame** (`TaskAssignment.operatorCredential`,
+ * issue #765), resolved control-plane side per `(worker, project.scm)` from the durable
+ * store — no longer read from this machine's environment, and with no env fallback left
+ * behind. Two facts about it are load-bearing wherever it is touched:
+ *
+ * - **It is the agent's identity on every worker, not a fallback for the ones without a
+ *   database** (ADR-004 §2; issue #551 made it universal by retiring the control-plane
+ *   host's own second executor). The implementer identity *is* the worker operator's own
+ *   account: it authors the branch, the commits, the pull request and the
+ *   implementer-side comments, and the loop-prevention split still holds because it is a
+ *   different account from the project's reviewer PAT. `credentials.implementer` is read
+ *   nowhere on this path and is not even in `ScmCredentialReferencesSchema` any more
+ *   (issue #396) — what changes with a project is the repository, not who commits to it.
+ * - **The identities that must stay per-project never reach a worker at all** — the
+ *   reviewer PAT and the PM credential ride the control-plane delivery API, so a
+ *   submitted review's author and a board write's actor are unchanged by which machine
+ *   ran the phase.
+ *
+ * A supported-phase gate cleanly fails any phase not yet runnable this way, so a
  * premature push fails with a clear result rather than crashing on a DB/Redis
  * access. A second pre-flight gate beside it refuses an assignment for a
  * repository this worker's checkout is not (issue #688), which enrollment being
- * per `(worker, project)` otherwise makes reachable.
+ * per `(worker, project)` otherwise makes reachable, and a third refuses one
+ * carrying no operator credential at all.
  *
  * Cancellation needs no Redis (issue #549): the in-flight registry below indexes
  * each running assignment by `dispatchId`, a pushed `task-cancel` frame aborts the
@@ -41,7 +61,10 @@
 import type { ProjectConfig } from '../config/schema.js';
 import { runAgentCli } from '../harness/agent-cli.js';
 import { AgentRunError, agentRunError } from '../harness/agent-failure.js';
-import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
+import {
+	requireProjectSCMProvider,
+	requireProjectSCMProviderId,
+} from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { tryReadCheckpoint } from '../pipeline/checkpoint.js';
@@ -718,14 +741,41 @@ function resolveDbFreeDeps(overrides: Partial<DbFreeAssignmentDeps> = {}): DbFre
  * able to log a duplicate ack without one. That also keeps
  * {@link DbFreeAssignmentDeps.buildDelivery} on its provider-free
  * `(repo, credential)` shape.
+ *
+ * A provider that rejects here has usually been handed a credential it could not
+ * authenticate — a rotated or revoked secret — and says so in its own vocabulary
+ * (GitHub's is "Could not resolve GitHub identity for the operator token"), naming
+ * neither the machine nor the provider. Re-framed at this seam, which is the side
+ * that knows the credential is a *stored, per-worker* one (issue #765); the
+ * provider's own module stays untouched, since it has no notion of where its
+ * credential came from.
+ *
+ * A failure that {@link classifyDeferrable} already recognises is re-thrown
+ * untouched: identity resolution is a live API call, so a rate limit or a delivery
+ * deferral can surface here too, and wrapping one in a plain `Error` would flatten a
+ * retryable stop into a terminal "your credential is bad".
  */
-function resolveOperatorDelivery(
+async function resolveOperatorDelivery(
 	project: ProjectConfig,
 	credential: string,
 	override: DbFreeAssignmentDeps['buildDelivery'],
 ): Promise<ScmDeliveryProvider> {
 	if (override) return override(project.repo, credential);
-	return requireProjectSCMProvider(project).operatorDeliveryProvider(project.repo, credential);
+	const providerId = requireProjectSCMProviderId(project);
+	try {
+		return await requireProjectSCMProvider(project).operatorDeliveryProvider(
+			project.repo,
+			credential,
+		);
+	} catch (err) {
+		if (classifyDeferrable(err)) throw err;
+		throw new Error(
+			`This worker's stored operator credential for provider '${providerId}' did not ` +
+				`authenticate — rotate it with \`swarm workers set-scm-credential <worker-id> ${providerId}\`. ` +
+				`Provider reported: ${describeError(err)}`,
+			{ cause: err },
+		);
+	}
 }
 
 /** Options {@link runAssignmentDbFree} reads. */
@@ -744,29 +794,6 @@ export interface RunAssignmentDbFreeOptions {
 	 * worker's two answers to differ.
 	 */
 	checkoutRepository?: string;
-	/**
-	 * The worker operator's own account credential for the project's SCM provider,
-	 * resolved from this machine's environment by `./connect-entry.ts`
-	 * (`SWARM_OPERATOR_GH_TOKEN` on GitHub) — never a project credential.
-	 *
-	 * **This is the agent's identity on every worker, not a fallback for the ones
-	 * without a database** (ADR-004 §2; issue #551 made it universal by retiring the
-	 * control-plane host's own second executor). The implementer identity *is* the
-	 * worker operator's own account: it authors the branch, the commits, the pull
-	 * request and the implementer-side comments, and the loop-prevention split still
-	 * holds because it is a different account from the project's reviewer PAT. Two
-	 * consequences worth stating where they bite:
-	 *
-	 * - `credentials.implementer` is not read anywhere on this path — it is not even
-	 *   in `ScmCredentialReferencesSchema` any more (issue #396), so there is no
-	 *   per-project persona token for the agent to resolve from Postgres, on any
-	 *   host. What changes with a project is the repository, not who commits to it.
-	 * - The identities that must stay per-project — the **reviewer** PAT and the
-	 *   **PM** credential — never reach a worker at all: those writes ride the
-	 *   control-plane delivery API (`./delivery-client.ts`), so a submitted review's
-	 *   author and a board write's actor are unchanged by which machine ran the phase.
-	 */
-	operatorToken: string;
 	/**
 	 * Base URL of the control plane (`SWARM_CONTROL_PLANE_URL`) — where the
 	 * metadata delivery calls this worker cannot perform itself are POSTed.
@@ -803,7 +830,8 @@ interface DbFreePhaseInputsParams {
 	 * ({@link resolveDbFreeFollowUpReview}).
 	 */
 	scheduleFollowUpReview: ScheduleFollowUpReview | undefined;
-	operatorToken: string;
+	/** The worker operator's own credential this assignment carried (`TaskAssignment.operatorCredential`). */
+	operatorCredential: string;
 	baseRunAgent: typeof runAgentCli;
 	worktrees: GitWorktreeManager;
 }
@@ -818,7 +846,7 @@ function buildDbFreePhaseInputs({
 	pm,
 	reviewLedger,
 	scheduleFollowUpReview,
-	operatorToken,
+	operatorCredential,
 	baseRunAgent,
 	worktrees,
 }: DbFreePhaseInputsParams): AssignedPhaseInputs {
@@ -870,14 +898,14 @@ function buildDbFreePhaseInputs({
 		baseBranch: assignment.baseBranch,
 		baseSha: assignment.baseSha,
 		// The DB-free injection seam: the phase's resolved delivery/PM providers plus
-		// the operator token as the agent's `getToken`, so no phase reaches the secret
-		// store or DB. Source ops run under the operator's own token; the metadata
-		// writes it cannot perform ride the control-plane delivery API.
+		// the operator credential as the agent's `getToken`, so no phase reaches the
+		// secret store or DB. Source ops run under the operator's own account; the
+		// metadata writes it cannot perform ride the control-plane delivery API.
 		delivery,
 		pm,
 		reviewLedger,
 		scheduleFollowUpReview,
-		agentToken: operatorToken,
+		agentToken: operatorCredential,
 	};
 }
 
@@ -974,6 +1002,32 @@ export async function runAssignmentDbFree(
 			return;
 		}
 
+		// The operator's own SCM credential for this project's provider, resolved
+		// control-plane side per (worker, provider) and carried on the frame (issue
+		// #765). It is not optional to *run* — every phase here commits, pushes and
+		// comments as that account — only optional on the wire, so a control plane
+		// predating the field can be told apart from a wiring bug.
+		//
+		// Terminal `failed` rather than a throw, for the same reason as the two gates
+		// above: every settlement on this path is a frame, and no retry on this worker
+		// can conjure a credential the control plane did not send.
+		const operatorCredential = assignment.operatorCredential;
+		if (!operatorCredential) {
+			sink.send({
+				type: 'task-execution-result',
+				dispatchId,
+				runId,
+				status: 'failed',
+				phase,
+				taskId,
+				error:
+					'this assignment carried no operator SCM credential — either the control plane ' +
+					"predates issue #765, or this worker's credential for the project's SCM provider " +
+					'is unset (`swarm workers set-scm-credential <worker-id> <scm-provider-id>`).',
+			});
+			return;
+		}
+
 		const project = reconstructProjectConfig(assignment.projectConfig, options.repoRoot);
 		const worktrees = new GitWorktreeManager(
 			project,
@@ -989,7 +1043,7 @@ export async function runAssignmentDbFree(
 		worktreePath = worktrees.worktreePath(taskId);
 		const operatorDelivery = await resolveOperatorDelivery(
 			project,
-			options.operatorToken,
+			operatorCredential,
 			deps.buildDelivery,
 		);
 		// Where a metadata write this worker cannot perform itself is delivered: the
@@ -1012,7 +1066,7 @@ export async function runAssignmentDbFree(
 			pm: resolveDbFreePm(phase, project, transport),
 			reviewLedger: resolveDbFreeReviewLedger(phase, project.id, transport),
 			scheduleFollowUpReview: resolveDbFreeFollowUpReview(phase, project.id, transport),
-			operatorToken: options.operatorToken,
+			operatorCredential,
 			baseRunAgent: deps.baseRunAgent,
 			worktrees,
 		});

@@ -12,16 +12,19 @@
  * a code path, and whatever works here works there.
  *
  * The process holds **only** `SWARM_WORKER_CREDENTIAL`,
- * `SWARM_CONTROL_PLANE_URL`, the operator's own `SWARM_OPERATOR_GH_TOKEN`, and
- * its host-local checkout path (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd) —
- * never `DATABASE_URL`/`REDIS_URL`, even on a host that has them. It connects to
+ * `SWARM_CONTROL_PLANE_URL`, and its host-local checkout path
+ * (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd) — never `DATABASE_URL`/`REDIS_URL`,
+ * even on a host that has them, and, since issue #765, no operator SCM credential
+ * either: that identity is stored per `(worker, scmProvider)` on the control plane
+ * and arrives on each assignment, so rotating it needs no restart here and
+ * `SWARM_OPERATOR_GH_TOKEN` is no longer read by any worker. It connects to
  * the control plane (over the Cloudflare tunnel from a remote machine, over
  * loopback on the control-plane host), declares the CLIs it can run, and
  * heartbeats to keep its `worker_sessions` lease live so the eligibility gate sees
  * it as connected. On each pushed
  * `TaskAssignment` it runs the phase **DB-free** (`./assignment-execution.ts`):
  * the project config comes from the assignment's non-secret slice, source-carrying
- * delivery uses the operator token through the registered SCM provider
+ * delivery uses that frame's operator credential through the registered SCM provider
  * (`SCMProvider.operatorDeliveryProvider`), the reviewer/PM metadata writes go up to the
  * control plane's delivery API (`./delivery-client.ts`) so those credentials stay
  * server-side, and results stream back over the transport back-channel. **Every
@@ -50,12 +53,7 @@ import { fileURLToPath } from 'node:url';
 // connects to neither.
 import '../integrations/entrypoint.js';
 import { resolveAgentContainment } from '../harness/containment.js';
-import {
-	optionalEnv,
-	requireEnv,
-	resolveOperatorGitHubToken,
-	resolveWorkerRepoRoot,
-} from '../lib/env.js';
+import { optionalEnv, requireEnv, resolveWorkerRepoRoot } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { addFileSink, configureLogger, logger } from '../lib/logger.js';
 import { resolveDeclarableOriginRepoSlug } from '../scm/repo-slug.js';
@@ -151,10 +149,6 @@ function resolveDaemonVersion(): string {
 async function main(): Promise<void> {
 	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
 	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
-	// The operator's own GitHub token, held only on this machine — the identity
-	// every source-carrying delivery op runs as (ADR-003 §2). Resolved up front so
-	// a missing token fails startup rather than mid-assignment.
-	const operatorToken = resolveOperatorGitHubToken();
 	const repoRoot = resolveWorkerRepoRoot();
 	// Claimed before anything else this daemon does with the checkout, so a second
 	// worker on it exits without ever handshaking. Refreshed below, and released on
@@ -228,7 +222,6 @@ async function main(): Promise<void> {
 				// checkout (issue #688) — passed from the one startup resolution above
 				// rather than re-read per assignment.
 				checkoutRepository: repository,
-				operatorToken,
 				// The delivery seam for the metadata writes this worker holds no
 				// credential for (a review, a board move/comment): POSTed to the control
 				// plane under this worker's own credential (ADR-004 §2).

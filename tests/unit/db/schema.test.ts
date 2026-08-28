@@ -7,6 +7,8 @@ import {
 	runLogs,
 	runs,
 	users,
+	workerScmCredentials,
+	workers,
 } from '@/db/schema/index.js';
 
 // These tests pin the persisted shape to SWARM's config model (src/config/schema.ts)
@@ -290,6 +292,40 @@ describe('db schema', () => {
 			expect(fk).toBeDefined();
 			expect(fk.reference().foreignTable).toBe(runs);
 			expect(fk.onDelete).toBe('cascade');
+		});
+	});
+
+	describe('worker_scm_credentials', () => {
+		const table = getTableConfig(workerScmCredentials);
+		const columns = new Map(table.columns.map((c) => [c.name, c]));
+
+		it('is named "worker_scm_credentials"', () => {
+			expect(table.name).toBe('worker_scm_credentials');
+		});
+
+		it('holds one required secret value per worker + SCM provider', () => {
+			expect(columns.get('worker_id')?.notNull).toBe(true);
+			expect(columns.get('scm_provider_id')?.notNull).toBe(true);
+			expect(columns.get('value')?.notNull).toBe(true);
+			// `text`, not a pg enum: `ScmProviderIdSchema` is the value list's source of
+			// truth and a fourth provider must not need a migration.
+			expect(columns.get('scm_provider_id')?.getSQLType()).toBe('text');
+		});
+
+		it('cascades from the owning worker, so a deregistered one keeps no secrets', () => {
+			const fk = table.foreignKeys[0];
+			expect(fk).toBeDefined();
+			expect(fk.reference().foreignTable).toBe(workers);
+			expect(fk.onDelete).toBe('cascade');
+		});
+
+		it('enforces one credential per (worker, SCM provider) — the rotation upsert target', () => {
+			const unique = table.indexes.find((i) => i.config.unique);
+			expect(unique).toBeDefined();
+			expect(unique?.config.columns.map((c) => (c as { name: string }).name)).toEqual([
+				'worker_id',
+				'scm_provider_id',
+			]);
 		});
 	});
 });

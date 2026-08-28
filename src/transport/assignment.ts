@@ -1,10 +1,17 @@
 /**
  * Pure builder for the `TaskAssignment` cloud→worker frame
  * (`./protocol.ts`). It assembles the frame from a resolved dispatch and is the
- * single place the **secret boundary** is enforced: it accepts the *full*
+ * single place the **project secret boundary** is enforced: it accepts the *full*
  * `ProjectConfig` and derives the non-secret slice itself
  * (`toNonSecretProjectConfig`), so no caller can route credential references
  * around it onto the wire.
+ *
+ * That boundary is the *project's* credentials, and since issue #765 it is worth
+ * stating as such: the frame also carries `operatorCredential`, the **worker's own**
+ * operator SCM identity, resolved per `(worker, project.scm)` from the durable store
+ * and required by the one machine that has to perform the commit and the push. It is
+ * required on this builder's input precisely so the control plane cannot assemble a
+ * frame without having resolved one.
  *
  * Everything is a pure function of its inputs — the target branch and system
  * prompt arrive already resolved/composed by the caller (the control plane —
@@ -86,6 +93,16 @@ export interface BuildTaskAssignmentInput {
 	 * (ADR-003 §2 / ADR-004 §3); omitted only by a router predating the field.
 	 */
 	repository?: string;
+	/**
+	 * The selected worker's own operator SCM credential for this project's provider,
+	 * resolved by the caller from the per-`(worker, provider)` store
+	 * (`requireWorkerScmCredential`, `../identity/worker-scm-credential.ts`).
+	 *
+	 * **Required**, unlike every other addition to this input: a frame built without
+	 * one describes a run that cannot commit or push, and making that a compile error
+	 * here is what keeps the resolution from being forgotten at a new call site.
+	 */
+	operatorCredential: string;
 }
 
 /** Map a PM `WorkItem` to the transport's serialization subset (`AssignedWorkItem`). */
@@ -114,9 +131,10 @@ function toAssignedWorkItem(workItem: WorkItem): AssignedWorkItem {
 }
 
 /**
- * Build a validated `TaskAssignment` from a resolved dispatch. The returned
- * frame carries the non-secret project-config slice only — never a persona token
- * or credential reference. Throws (via `TaskAssignmentSchema.parse`) if the
+ * Build a validated `TaskAssignment` from a resolved dispatch. Its
+ * `projectConfig` is the non-secret slice only — never a persona token or
+ * credential reference — beside the receiving worker's own `operatorCredential`
+ * (see the module header). Throws (via `TaskAssignmentSchema.parse`) if the
  * assembly is malformed, so a bad frame never reaches the wire.
  */
 export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssignment {
@@ -139,6 +157,7 @@ export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssign
 		...input.pr,
 		boardItemId: input.boardItemId,
 		repository: input.repository,
+		operatorCredential: input.operatorCredential,
 	};
 	// Validate before returning so a bad assembly fails at the seam, not on the wire.
 	return TaskAssignmentSchema.parse(assignment);

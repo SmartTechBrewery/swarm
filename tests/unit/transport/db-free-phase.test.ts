@@ -107,7 +107,6 @@ describe('real DB-free phase worktree lifecycle', () => {
 
 		await runAssignmentDbFree(assignment, sink, {
 			repoRoot,
-			operatorToken: 'operator-token',
 			controlPlaneUrl: 'https://swarm.example',
 			workerCredential: 'worker-credential',
 			deps: {
@@ -232,7 +231,6 @@ describe('real DB-free phase worktree lifecycle', () => {
 
 		await runAssignmentDbFree(assignment, sink, {
 			repoRoot,
-			operatorToken: 'operator-token',
 			controlPlaneUrl: 'https://swarm.example',
 			workerCredential: 'worker-credential',
 			deps: {

@@ -6,11 +6,12 @@
  *
  * The two personas resolve from *different* sources, exactly as GitHub's and
  * Bitbucket's do (issue #396): the **implementer** is the worker operator's own
- * token, a worker-local `SWARM_OPERATOR_GITLAB_TOKEN` env var that is never
- * persisted to `project_credentials`, never in `ProjectConfig` (so never in the
- * transport's non-secret project slice), and never sent over the transport; the
- * **reviewer** stays a project-scoped credential *reference* resolved from the
- * secret store. Two distinct accounts are what breaks the automation feedback
+ * token, read here from a `SWARM_OPERATOR_GITLAB_TOKEN` env var on the **control
+ * plane** and never in `ProjectConfig` (so never in the transport's non-secret
+ * project slice); the **reviewer** stays a project-scoped credential *reference*
+ * resolved from the secret store. A *worker* resolves the same operator identity
+ * from the per-`(worker, provider)` store instead, and it does travel on the
+ * assignment frame (issue #765) — the worker's own credential, not the project's. Two distinct accounts are what breaks the automation feedback
  * loop (ai/CODING_STANDARDS.md "Loop prevention").
  *
  * **Why this lives in the provider folder** rather than widening
