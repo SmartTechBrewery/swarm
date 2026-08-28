@@ -19,6 +19,15 @@
 > longer true, so re-read it with that in mind rather than as a current statement of
 > the code. The rest of the analysis is untouched.
 
+> **Superseded in part by issues #799/#800 (2026-08-28).** §2's item 5 says a worker
+> can only be registered from a shell on the control-plane host. `workers.register`
+> now exists on the tRPC router and is served to an operator CLI over the network at
+> `/operator/trpc/*`, authenticated by `swarm login`; `swarm workers` holds no
+> `DATABASE_URL` at all. That is still not *dashboard* self-service and still not
+> public registration — the missing piece item 5 names — but "a shell on the control
+> plane" is no longer the barrier, and the one-time-credential contract it asks for
+> is what that procedure already implements.
+
 Each claim is marked by how it was established:
 **[code]** verified against this repository, **[docs]** from the provider's own
 current documentation, **[judgment]** reasoning that is not a verifiable fact.

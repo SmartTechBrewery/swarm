@@ -5,14 +5,30 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // stands in for "a workers procedure was reached", and `projects.list` for "a
 // namespace this router deliberately does not carry". Both would otherwise need a
 // database.
-const { listOwnerWorkers } = vi.hoisted(() => ({ listOwnerWorkers: vi.fn() }));
+const { listOwnerWorkers, getEnrollment, setSharingConsent } = vi.hoisted(() => ({
+	listOwnerWorkers: vi.fn(),
+	getEnrollment: vi.fn(),
+	setSharingConsent: vi.fn(),
+}));
 vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	...(await vi.importActual<typeof import('@/identity/worker-enrollment-service.js')>(
 		'@/identity/worker-enrollment-service.js',
 	)),
 	listOwnerWorkers,
+	getEnrollment,
+	setSharingConsent,
+}));
+// `workers.setConsent` is the mutation this suite round-trips the CLI client
+// through, and its ownership check reads the worker.
+const { getWorker } = vi.hoisted(() => ({ getWorker: vi.fn() }));
+vi.mock('@/identity/worker-service.js', async () => ({
+	...(await vi.importActual<typeof import('@/identity/worker-service.js')>(
+		'@/identity/worker-service.js',
+	)),
+	getWorker,
 }));
 
+import { createOperatorClient, type FetchLike } from '@/cli/_shared/operator-client.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { type OperatorApiDeps, registerOperatorApi } from '@/router/operator-api.js';
 
@@ -49,9 +65,24 @@ function get(app: Hono, path: string, token?: string) {
 	});
 }
 
+const ENROLLMENT_ID = '22222222-2222-4222-8222-222222222222';
+const WORKER_ID = '33333333-3333-4333-8333-333333333333';
+
 beforeEach(() => {
 	listOwnerWorkers.mockReset();
 	listOwnerWorkers.mockResolvedValue([]);
+	getEnrollment.mockReset();
+	getEnrollment.mockResolvedValue({ id: ENROLLMENT_ID, workerId: WORKER_ID, projectId: 'proj-a' });
+	getWorker.mockReset();
+	getWorker.mockResolvedValue({ id: WORKER_ID, ownerUserId: USER_ID, displayName: 'ada-laptop' });
+	setSharingConsent.mockReset();
+	setSharingConsent.mockResolvedValue({
+		id: ENROLLMENT_ID,
+		status: 'active',
+		allowedClis: ['claude'],
+		concurrencyAllocation: 1,
+		sharingConsent: true,
+	});
 });
 
 describe('registerOperatorApi — bearer authentication', () => {
@@ -117,5 +148,81 @@ describe('registerOperatorApi — the exposed surface', () => {
 		const response = await get(appWith(makeDeps()), '/trpc/workers.listMine', TOKEN);
 
 		expect(response.status).toBe(404);
+	});
+});
+
+/**
+ * The CLI's own client (`src/cli/_shared/operator-client.ts`, issue #800) driven
+ * against this real mount, rather than against a hand-written fixture of what the
+ * mount is *believed* to answer. That is the point: the client hand-rolls tRPC's
+ * HTTP protocol to stay dependency-free, so every assumption it makes — where the
+ * input goes for a query, that a mutation POST needs an explicit content type,
+ * the `{result:{data}}` envelope, the `data.code` on a refusal — is only as good
+ * as a round trip through `@hono/trpc-server` itself.
+ */
+describe('the operator CLI client against this mount', () => {
+	/** Route the client's `fetch` into the in-process Hono app; nothing touches a network. */
+	function clientFor(app: Hono, token = TOKEN) {
+		const fetchImpl: FetchLike = async (url, init) => {
+			const response = await app.request(url, {
+				method: init.method,
+				headers: init.headers,
+				body: init.body,
+			});
+			return {
+				ok: response.ok,
+				status: response.status,
+				json: () => response.json(),
+			};
+		};
+		return createOperatorClient({
+			controlPlaneUrl: 'http://control-plane.test',
+			token,
+			fetchImpl,
+		});
+	}
+
+	it('round-trips a query, input and all', async () => {
+		listOwnerWorkers.mockResolvedValue([{ workerId: WORKER_ID }]);
+
+		const data = await clientFor(appWith(makeDeps())).query(
+			'workers.listMine',
+			undefined,
+			(value) => value,
+		);
+
+		expect(data).toEqual([{ workerId: WORKER_ID }]);
+	});
+
+	// The load-bearing one: `@hono/trpc-server`'s non-batch POST path answers
+	// UNSUPPORTED_MEDIA_TYPE for a body sent without `content-type: application/json`,
+	// so a client that omits it reaches no procedure at all.
+	it('round-trips a mutation, so its body actually reaches the procedure', async () => {
+		const data = await clientFor(appWith(makeDeps())).mutate(
+			'workers.setConsent',
+			{ enrollmentId: ENROLLMENT_ID, sharingConsent: true },
+			(value) => value,
+		);
+
+		expect(setSharingConsent).toHaveBeenCalledWith(ENROLLMENT_ID, true);
+		expect(data).toMatchObject({ id: ENROLLMENT_ID, sharingConsent: true });
+	});
+
+	it("turns this mount's UNAUTHORIZED into the `swarm login` hint", async () => {
+		await expect(
+			clientFor(appWith(makeDeps()), 'stale-token').query(
+				'workers.listMine',
+				undefined,
+				(value) => value,
+			),
+		).rejects.toThrow('your control-plane session has expired — run `swarm login`');
+	});
+
+	// A namespace this router deliberately does not carry reads to the CLI as
+	// version skew, which is what it is from the operator's side.
+	it('reports an unserved procedure as an older control plane', async () => {
+		await expect(
+			clientFor(appWith(makeDeps())).query('projects.list', undefined, (value) => value),
+		).rejects.toThrow(/older build than your CLI/);
 	});
 });

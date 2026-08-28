@@ -235,14 +235,24 @@ request (start `npm run dev:api` and open the dashboard first, or use a user you
 created with `swarm users add`):
 
 ```bash
+npm run swarm -- login --identifier localhost-admin                                  # once per machine
 npm run swarm -- workers register localhost-admin --name "this machine" --cli claude
 npm run swarm -- workers enroll <worker-id> <project-id> --cli claude --active --consent
 ```
 
+`swarm workers` reaches the control plane over `SWARM_CONTROL_PLANE_URL` rather
+than Postgres since issue #800, so it needs a [`swarm login`](docs/cli.md#swarm-login)
+session and **no `DATABASE_URL`** — which is what lets a second machine onboard
+itself. (`localhost-admin` has no password until you set one:
+`npm run swarm -- users set-password localhost-admin`.)
+
 `workers register` prints a credential **once** — put it in `.env` as
-`SWARM_WORKER_CREDENTIAL` before starting the worker. `swarm start` and `swarm
-status` warn when this host has no usable credential. The full runbook, including
-someone else's machine, is [`docs/onboarding-worker.md`](./docs/onboarding-worker.md).
+`SWARM_WORKER_CREDENTIAL` before starting the worker, or skip that by running
+`swarm run:worker` from the checkout you registered in. `swarm start` and `swarm
+status` warn when this host has no usable credential. On the machine being
+onboarded, `workers register-and-enroll` collapses the two commands above into
+one; the full runbook, including someone else's machine, is
+[`docs/onboarding-worker.md`](./docs/onboarding-worker.md).
 
 Start these processes in separate terminals:
 
