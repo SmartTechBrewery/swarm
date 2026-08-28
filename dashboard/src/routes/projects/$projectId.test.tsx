@@ -1215,6 +1215,8 @@ describe('ProjectTabBar', () => {
 			'Pipeline',
 			'Project Management',
 			'Source Control',
+			// Issue #806: the roster tab goes last, behind the configuration tabs.
+			'Members',
 		]);
 		// The rendered order and the `?tab=` vocabulary must not drift apart.
 		expect(labels).toHaveLength(PROJECT_TABS.length);

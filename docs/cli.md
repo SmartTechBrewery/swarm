@@ -384,8 +384,9 @@ tRPC procedure (`src/api/authz.ts`).
 
 Since issue #805 the same four operations are also reachable over the API, as the
 `members` tRPC router (`members.list`/`add`/`setRole`/`remove`), each gated at
-`projectAdmin` — so a project administrator manages the roster without shell
-access to the host. This CLI is unchanged and stays the `DATABASE_URL`-side path,
+`projectAdmin` — and since issue #806 they have a screen: the project detail
+page's **Members** tab (`/projects/$projectId?tab=members`), so a project
+administrator manages the roster without shell access to the host. This CLI is unchanged and stays the `DATABASE_URL`-side path,
 which is how you seed the *first* administrator of a project you did not create.
 
 ### `swarm identities`

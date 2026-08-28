@@ -16,11 +16,13 @@ import {
 	Settings,
 	SquareKanban,
 	Trash2,
+	Users,
 } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BoardMappingPanel } from '@/components/projects/board-mapping-panel.js';
 import { CredentialsPanel } from '@/components/projects/credentials-panel.js';
+import { MembersPanel } from '@/components/projects/members-panel.js';
 import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.js';
 import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
 import { PmProviderSwitchDialog } from '@/components/projects/pm-provider-switch-dialog.js';
@@ -1790,6 +1792,7 @@ const PROJECT_TAB_ITEMS: ReadonlyArray<{ tab: ProjectTab; label: string; icon: L
 	{ tab: 'pipeline', label: 'Pipeline', icon: GitMerge },
 	{ tab: 'projectManagement', label: 'Project Management', icon: SquareKanban },
 	{ tab: 'credentials', label: 'Source Control', icon: GitBranch },
+	{ tab: 'members', label: 'Members', icon: Users },
 ];
 
 /**
@@ -2569,6 +2572,15 @@ function ProjectDetailRouteComponent() {
 						/>
 					</div>
 				)}
+
+				{/*
+				 * Members (issue #806): the project's own roster, administered here instead of
+				 * only from the machine holding `DATABASE_URL`. The panel owns its query and
+				 * its three writes, so the route hands it nothing but the project id — and no
+				 * `canAdminister`, since this frame is already the boundary and every `members`
+				 * procedure re-asserts `projectAdmin` for itself.
+				 */}
+				{activeTab === 'members' && <MembersPanel projectId={projectId} />}
 			</ProjectAdminOnly>
 		</div>
 	);

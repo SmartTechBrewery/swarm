@@ -25,7 +25,9 @@ export type ProjectPhase = (typeof PROJECT_PHASES)[number];
  * before how it is set up. `projectManagement` was `boardMapping` until issue #537
  * widened that tab from a board mapping into the whole PM setup (provider,
  * credentials, board, status mapping); {@link LEGACY_TAB_ALIASES} keeps old links
- * working.
+ * working. `members` (issue #806) is the project's own roster and goes last, so the
+ * administrator block stays contiguous behind the two operational tabs and every
+ * existing tab keeps its position.
  */
 export const PROJECT_TABS = [
 	'runs',
@@ -35,6 +37,7 @@ export const PROJECT_TABS = [
 	'pipeline',
 	'projectManagement',
 	'credentials',
+	'members',
 ] as const;
 
 export type ProjectTab = (typeof PROJECT_TABS)[number];
@@ -53,6 +56,10 @@ export type ProjectTab = (typeof PROJECT_TABS)[number];
  * stops the dashboard from offering a dead-end screen; it grants nothing and relaxes
  * nothing. An `instanceAdmin` administers every project, so they see every tab —
  * `projects.viewerAccess` resolves that for the client.
+ *
+ * `members` (issue #806) belongs here for the same reason: every `members` procedure
+ * is gated by `assertProjectAccess(user, projectId, 'projectAdmin')`, so the roster is
+ * one more screen a non-administrator would meet a `FORBIDDEN` on.
  */
 export const PROJECT_ADMIN_TABS: readonly ProjectTab[] = [
 	'general',
@@ -60,6 +67,7 @@ export const PROJECT_ADMIN_TABS: readonly ProjectTab[] = [
 	'pipeline',
 	'projectManagement',
 	'credentials',
+	'members',
 ];
 
 const PROJECT_ADMIN_TAB_SET: ReadonlySet<ProjectTab> = new Set(PROJECT_ADMIN_TABS);

@@ -23,18 +23,22 @@ describe('PROJECT_TABS', () => {
 			'pipeline',
 			'projectManagement',
 			'credentials',
+			// Issue #806: the roster goes last, behind the existing configuration tabs.
+			'members',
 		]);
 	});
 });
 
 describe('PROJECT_ADMIN_TABS (issue #655)', () => {
-	it('covers every configuration and credential tab', () => {
+	it('covers every configuration, credential and membership tab', () => {
 		expect([...PROJECT_ADMIN_TABS]).toEqual([
 			'general',
 			'agents',
 			'pipeline',
 			'projectManagement',
 			'credentials',
+			// Issue #806: every `members` procedure asserts `projectAdmin` server-side.
+			'members',
 		]);
 		for (const tab of PROJECT_ADMIN_TABS) {
 			expect(isProjectAdminTab(tab)).toBe(true);
