@@ -22,6 +22,16 @@ vi.mock('@/db/repositories/projectMembersRepository.js', () => ({
 	addMember: vi.fn(),
 }));
 
+// The two halves of `create`'s instance-default seeding (issue #769 phase 2/2): the
+// value is read from the instance tier and written into the new project's own row.
+vi.mock('@/db/repositories/credentialsRepository.js', () => ({
+	writeProjectCredential: vi.fn(),
+}));
+
+vi.mock('@/db/repositories/instanceCredentialsRepository.js', () => ({
+	resolveInstanceScmCredential: vi.fn(),
+}));
+
 vi.mock('@/db/repositories/projectMembershipRequestsRepository.js', () => ({
 	createMembershipRequest: vi.fn(),
 	getPendingRequest: vi.fn(),
@@ -38,6 +48,8 @@ vi.mock('@/identity/membership-service.js', () => ({
 }));
 
 import { DEFAULT_PM_CONFIG, projectsRouter } from '@/api/routers/projects.js';
+import { writeProjectCredential } from '@/db/repositories/credentialsRepository.js';
+import { resolveInstanceScmCredential } from '@/db/repositories/instanceCredentialsRepository.js';
 import {
 	approveMembershipRequestInDb,
 	createMembershipRequest,
@@ -76,6 +88,13 @@ import {
 	_resetPMProviderRegistryForTesting,
 	registerPMProvider,
 } from '@/integrations/pm/registry.js';
+// The real manifests, for the instance-default suite below: the eligible `(provider,
+// role)` set is manifest data, so seeding is asserted against the providers SWARM
+// actually ships rather than against a stub that opted itself in. Importing them
+// registers them, which `create`'s own `beforeEach` immediately resets — that suite
+// deliberately runs on stubs (see its comment), so the two re-register per test.
+import { bitbucketScmManifest } from '@/integrations/scm/bitbucket/index.js';
+import { githubScmManifest } from '@/integrations/scm/github/index.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
 	_resetSCMProviderRegistryForTesting,
@@ -154,6 +173,11 @@ describe('projectsRouter', () => {
 		vi.mocked(listPendingRequestsForProject).mockReset();
 		vi.mocked(approveMembershipRequestInDb).mockReset();
 		vi.mocked(rejectMembershipRequestInDb).mockReset();
+		vi.mocked(writeProjectCredential).mockReset();
+		vi.mocked(resolveInstanceScmCredential).mockReset();
+		// Nothing stored is the default, so every suite but the seeding one below behaves
+		// exactly as it did before issue #769.
+		vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
 	});
 
 	describe('list', () => {
@@ -508,6 +532,98 @@ describe('projectsRouter', () => {
 				'Some DB transaction failure',
 			);
 		});
+
+		// Issue #769 phase 2/2: the installation's stored default for a `(provider, role)`
+		// pair the provider declares `instanceDefault` for is copied into the *new*
+		// project's own `project_credentials` row, so a dashboard-created project is
+		// routable for Review with nothing pasted by hand. A copy, not a resolution tier —
+		// `src/config/provider.ts` is untouched and existing projects are not seeded.
+		describe('instance-default SCM credentials', () => {
+			// The real manifests, so which pairs opt in is the shipped answer rather than a
+			// stub's. Re-registered here because the outer `beforeEach` resets the registry.
+			beforeEach(() => {
+				_resetSCMProviderRegistryForTesting();
+				registerSCMProvider(githubScmManifest);
+				registerSCMProvider(bitbucketScmManifest);
+				vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
+			});
+
+			it('copies the stored default into the new project under the key it resolves the role through', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
+
+				await caller.create(validProjectInput);
+
+				expect(resolveInstanceScmCredential).toHaveBeenCalledWith('github', 'reviewer');
+				// The whole call list, so a `webhookSecret` — which no provider may declare
+				// eligible — cannot start being seeded alongside it unnoticed.
+				expect(vi.mocked(writeProjectCredential).mock.calls).toEqual([
+					['new-proj', 'GITHUB_TOKEN_REVIEWER', 'ghp_instance_default', null],
+				]);
+			});
+
+			it('writes nothing and still succeeds when no default is stored', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
+
+				await expect(caller.create(validProjectInput)).resolves.toMatchObject({
+					id: 'new-proj',
+					scm: 'github',
+				});
+				expect(writeProjectCredential).not.toHaveBeenCalled();
+			});
+
+			// Only the provider the project actually runs on: Bitbucket's reviewer role does
+			// not opt in, so nothing is looked up for it and no GitHub secret leaks across.
+			it('seeds nothing for a provider whose roles do not opt in', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
+
+				await caller.create({ ...validProjectInput, scm: 'bitbucket' });
+
+				expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
+				expect(writeProjectCredential).not.toHaveBeenCalled();
+			});
+
+			// Manifest-driven, not GitHub-hardcoded: a provider that declares the opt-in
+			// under its own key is seeded under *that* key, with no edit to the router.
+			it("uses the opting-in provider's own key rather than another provider's", async () => {
+				registerSCMProvider({
+					id: 'gitlab',
+					label: 'Stub GitLab',
+					category: 'scm',
+					webhookRoute: '/stub-gitlab/webhook',
+					credentialRoles: [
+						{ role: 'reviewer', envVarKey: 'GL_STUB_TOKEN_REVIEWER', instanceDefault: true },
+						{ role: 'webhookSecret', envVarKey: 'GL_STUB_WEBHOOK_SECRET' },
+					],
+				} as unknown as SCMProviderManifest);
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('glpat_instance_default');
+
+				await caller.create({ ...validProjectInput, scm: 'gitlab' });
+
+				expect(resolveInstanceScmCredential).toHaveBeenCalledWith('gitlab', 'reviewer');
+				expect(vi.mocked(writeProjectCredential).mock.calls).toEqual([
+					['new-proj', 'GL_STUB_TOKEN_REVIEWER', 'glpat_instance_default', null],
+				]);
+			});
+
+			// Best-effort: the project and its membership are already committed, and re-running
+			// `create` to recover the seed would only earn a CONFLICT.
+			it('still returns the created project when the lookup fails', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockRejectedValue(new Error('db down'));
+
+				await expect(caller.create(validProjectInput)).resolves.toMatchObject({
+					id: 'new-proj',
+				});
+			});
+
+			it('still returns the created project when the write fails', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
+				vi.mocked(writeProjectCredential).mockRejectedValue(new Error('encryption unavailable'));
+
+				await expect(caller.create(validProjectInput)).resolves.toMatchObject({
+					id: 'new-proj',
+				});
+			});
+		});
 	});
 
 	describe('update', () => {
@@ -549,6 +665,19 @@ describe('projectsRouter', () => {
 
 			expect(result).toEqual(expectedConfig);
 			expect(upsertProjectToDb).toHaveBeenCalledWith(expectedConfig);
+		});
+
+		// Issue #769 phase 2/2 is a copy made once, at creation. Nothing re-seeds
+		// afterwards — least of all an ordinary config save, which would otherwise
+		// overwrite whatever the project's own Source Control tab has since stored.
+		it('never consults or writes an instance default', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+			await caller.update({ id: 'p1', name: 'Updated Name' });
+
+			expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
+			expect(writeProjectCredential).not.toHaveBeenCalled();
 		});
 
 		it('saves the maximum concurrent jobs setting', async () => {

@@ -68,16 +68,16 @@ describe('InstanceCredentialsPanel (issue #769 — instance default credentials)
 		).not.toBeNull();
 	});
 
-	// Phase 1 copy must not promise seeding — nothing consumes the value yet.
-	it('says a default changes nothing for an existing project', async () => {
+	// Phase 2/2 copy states both halves: a default *is* consumed now (new projects are
+	// seeded from it), and it is still only a copy made at creation, so an existing
+	// project is untouched.
+	it('says new projects are seeded while existing ones are unaffected', async () => {
 		listFn.mockResolvedValue({ roles: [GITHUB_REVIEWER] });
 
 		renderPanel(<InstanceCredentialsPanel />);
 
-		await waitFor(() =>
-			expect(screen.getByText(/changes nothing for an existing project/)).not.toBeNull(),
-		);
-		expect(screen.queryByText(/new projects are seeded/i)).toBeNull();
+		await waitFor(() => expect(screen.getByText(/new projects are seeded/i)).not.toBeNull());
+		expect(screen.getByText(/Existing projects are unaffected/)).not.toBeNull();
 	});
 
 	it('opens an unconfigured role straight into a password input', async () => {

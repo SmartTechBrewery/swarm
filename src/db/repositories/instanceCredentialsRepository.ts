@@ -12,9 +12,10 @@
  * **Nothing here is on a resolution path.** `resolveScmCredentialOrNull`
  * (`src/config/provider.ts`) keeps its no-fallback-chain rule, so a project with no
  * credential of its own still fails naming the project, provider and role rather than
- * quietly resolving this value. Phase 2/2 of issue #769 copies it into a *new*
- * project's own row at creation; setting or clearing it never affects an existing
- * project.
+ * quietly resolving this value. The one consumer is `seedInstanceScmCredentials`
+ * (`src/api/routers/projects.ts`), which copies the value into a *new* project's own
+ * row at creation (phase 2/2 of issue #769); setting or clearing it never affects an
+ * existing project.
  *
  * Writes encrypt and reads decrypt with {@link instanceScmCredentialAad}, so callers
  * only ever handle plaintext and ciphertext never leaves this module.
