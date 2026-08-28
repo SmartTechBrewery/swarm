@@ -257,7 +257,7 @@ Open <http://localhost:5173>. For a compiled self-hosted dashboard, run
 
 ## The worker
 
-**There is one worker program and one command for it.** `npm run dev:worker` runs
+**There is one worker program.** `npm run dev:worker` runs
 `src/transport/connect-entry.ts` on every machine, remote or the control-plane host
 itself. Point it at the router; on the control-plane host that URL is simply
 loopback:
@@ -268,6 +268,27 @@ SWARM_CONTROL_PLANE_URL=http://localhost:3100      # remote worker: https://<you
 SWARM_WORKER_CREDENTIAL=<from `swarm workers register`>
 SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
 ```
+
+**On the machine that registered it, there is a shorter way to start it.** Both
+registration commands also write the freshly issued credential to a per-checkout
+cache in the operator's home directory (`~/.swarm/worker-credentials/<hash>/`,
+owner-only, outside every checkout — no `.gitignore` entry needed anywhere), so
+from inside that checkout:
+
+```bash
+swarm run:worker
+```
+
+starts the same daemon with `SWARM_WORKER_REPO_ROOT` set to the directory where the
+command was invoked and the credential read from that file — never printed, never pasted, with only
+`SWARM_CONTROL_PLANE_URL` left to `.env`. It is an *additional* launcher, not a
+second worker: the block above is unchanged and stays the path for a remote
+machine, a process supervisor, or any setup where the registering machine is not
+the running one.
+
+The global `swarm run:worker` form uses its current directory; `npm run swarm --
+run:worker` uses npm's caller directory (`INIT_CWD`), so both forms select the
+checkout you invoked them from.
 
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
