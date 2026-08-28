@@ -24,7 +24,11 @@ import { describe, expect, it } from 'vitest';
 // so this registration is independent of registry.test.ts's resets.
 import '@/integrations/entrypoint.js';
 import { isRuntimeReadySCMProvider } from '@/integrations/scm/manifest.js';
-import { listSCMProviders, requireProjectSCMProvider } from '@/integrations/scm/registry.js';
+import {
+	listInstanceDefaultScmRoles,
+	listSCMProviders,
+	requireProjectSCMProvider,
+} from '@/integrations/scm/registry.js';
 import { SCM_CREDENTIAL_ROLES, type SCMProvider } from '@/scm/types.js';
 import { createMockProjectConfig } from '../../../helpers/factories.js';
 
@@ -209,6 +213,31 @@ describe('SCM provider conformance', () => {
 				manifest.credentialRoles.map((spec) => spec.envVarKey),
 			);
 			expect(new Set(keys).size).toBe(keys.length);
+		});
+
+		// The structural guard for issue #769, in the same spirit as the one above: a
+		// webhook secret is tied to *one project's* own webhook endpoint, so one
+		// installation-wide value for it would be wrong rather than merely redundant. No
+		// provider may opt it in, by accident or otherwise.
+		it('never declares an instance-level default for webhookSecret', () => {
+			for (const manifest of manifests) {
+				for (const spec of manifest.credentialRoles) {
+					if (spec.role !== 'webhookSecret') continue;
+					expect(spec.instanceDefault, `${manifest.id}.webhookSecret`).not.toBe(true);
+				}
+			}
+		});
+
+		// A deliberate tripwire rather than a description: a provider opting its reviewer
+		// role in is a decision made in that provider's own issue, which then updates this
+		// list — never a side effect of unrelated work (issue #769).
+		it('offers exactly the instance-default pairs expected today', () => {
+			expect(
+				listInstanceDefaultScmRoles().map((eligible) => ({
+					providerId: eligible.providerId,
+					role: eligible.role,
+				})),
+			).toEqual([{ providerId: 'github', role: 'reviewer' }]);
 		});
 	});
 });

@@ -32,7 +32,13 @@ export const githubScmManifest: SCMProviderManifest = {
 	// `SCM_TOKEN_REVIEWER` / `SCM_WEBHOOK_SECRET` references instead; these are only
 	// the conventional defaults for a project with no reference yet (see the spec).
 	credentialRoles: [
-		{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER' },
+		// `instanceDefault` (issue #769): SWARM's loop-prevention model wants one reviewer
+		// account distinct from the implementer (ai/RULES.md §3), and an installation
+		// normally runs that one account across every project — so a single value for this
+		// role is legitimately installation-wide and an instance administrator may record
+		// it once. The webhook secret is deliberately not eligible: it is tied to each
+		// project's own webhook endpoint.
+		{ role: 'reviewer', envVarKey: 'GITHUB_TOKEN_REVIEWER', instanceDefault: true },
 		{ role: 'webhookSecret', envVarKey: 'GITHUB_WEBHOOK_SECRET' },
 	],
 	// One shared instance: the integration is stateless and takes `project` per

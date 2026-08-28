@@ -4,6 +4,7 @@ import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
 	_resetSCMProviderRegistryForTesting,
 	getSCMProvider,
+	listInstanceDefaultScmRoles,
 	listSCMProviders,
 	registerSCMProvider,
 	requireProjectSCMProvider,
@@ -18,7 +19,12 @@ import { createMockProjectConfig } from '../../../helpers/factories.js';
  * the real integration — keeps these unit tests about the registry's bookkeeping,
  * not the provider's wiring.
  */
-function fakeManifest(id: string, runtimeReady?: boolean): SCMProviderManifest {
+function fakeManifest(
+	id: string,
+	runtimeReady?: boolean,
+	/** Whether the fake's `reviewer` role opts into an instance-level default (issue #769). */
+	instanceDefault = false,
+): SCMProviderManifest {
 	return {
 		id,
 		label: id,
@@ -27,7 +33,11 @@ function fakeManifest(id: string, runtimeReady?: boolean): SCMProviderManifest {
 		// validates its `credentials.scm[id]` roles against something (issue #628); the
 		// registry itself never reads them.
 		credentialRoles: [
-			{ role: 'reviewer', envVarKey: `${id.toUpperCase()}_TOKEN_REVIEWER` },
+			{
+				role: 'reviewer',
+				envVarKey: `${id.toUpperCase()}_TOKEN_REVIEWER`,
+				...(instanceDefault ? { instanceDefault: true } : {}),
+			},
 			{ role: 'webhookSecret', envVarKey: `${id.toUpperCase()}_WEBHOOK_SECRET` },
 		],
 		provider: { id },
@@ -247,5 +257,45 @@ describe('requireProjectSCMProviderId', () => {
 		expect(() => requireProjectSCMProviderId(project)).toThrow(
 			/it selects no provider and 2 of 3 registered are runtime-ready/,
 		);
+	});
+});
+
+describe('listInstanceDefaultScmRoles (issue #769)', () => {
+	beforeEach(() => {
+		_resetSCMProviderRegistryForTesting();
+	});
+
+	it('lists only the roles a provider opts in, in registration order', () => {
+		registerSCMProvider(fakeManifest('github', undefined, true));
+		registerSCMProvider(fakeManifest('bitbucket'));
+		registerSCMProvider(fakeManifest('gitlab', undefined, true));
+
+		expect(listInstanceDefaultScmRoles()).toEqual([
+			{
+				providerId: 'github',
+				providerLabel: 'github',
+				role: 'reviewer',
+				envVarKey: 'GITHUB_TOKEN_REVIEWER',
+			},
+			{
+				providerId: 'gitlab',
+				providerLabel: 'gitlab',
+				role: 'reviewer',
+				envVarKey: 'GITLAB_TOKEN_REVIEWER',
+			},
+		]);
+	});
+
+	// Runtime-readiness is part of eligibility: no project may route to a provider that
+	// is not ready, so offering an instance default for it would invite an operator to
+	// configure something that cannot run.
+	it('skips a provider that is registered but not runtime-ready', () => {
+		registerSCMProvider(fakeManifest('under-construction', false, true));
+		expect(listInstanceDefaultScmRoles()).toEqual([]);
+	});
+
+	it('is empty when no provider opts in', () => {
+		registerSCMProvider(fakeManifest('github'));
+		expect(listInstanceDefaultScmRoles()).toEqual([]);
 	});
 });

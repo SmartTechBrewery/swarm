@@ -1,6 +1,7 @@
 export { appSettings } from './appSettings.js';
 export { cliQuotas } from './cliQuotas.js';
 export { dispatches } from './dispatches.js';
+export { instanceScmCredentials } from './instanceScmCredentials.js';
 export { projectCredentials } from './projectCredentials.js';
 export { projectMembers } from './projectMembers.js';
 export { projects } from './projects.js';

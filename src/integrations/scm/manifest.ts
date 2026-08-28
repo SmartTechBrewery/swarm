@@ -61,6 +61,27 @@ export interface ScmCredentialRoleSpec {
 	 * the reference the role resolves through, not this.
 	 */
 	readonly envVarKey: string;
+	/**
+	 * Whether one value for this role may legitimately be shared by every project on
+	 * the installation, making it eligible for an **instance-level default** (issue
+	 * #769) — the value an instance administrator records once in General Settings →
+	 * Credentials, held in `instance_scm_credentials`.
+	 *
+	 * Declared as manifest data rather than branched on at the call site — the
+	 * `PmCredentialRoleSpec.inheritsSharedCredential` precedent (`../pm/manifest.ts`)
+	 * — so the admin surface offers exactly the roles a provider says are
+	 * installation-wide, and a fourth provider opts in without an edit to shared code.
+	 *
+	 * `webhookSecret` must never declare it: that secret is tied to *this project's*
+	 * own webhook endpoint, so one installation-wide value would be wrong rather than
+	 * merely redundant. Asserted in
+	 * `tests/unit/integrations/scm/scm-conformance.test.ts`.
+	 *
+	 * Eligibility is not resolution: nothing declaring this becomes a fallback for
+	 * `resolveScmCredentialOrNull` (`src/config/provider.ts`), whose no-fallback-chain
+	 * rule is untouched.
+	 */
+	readonly instanceDefault?: boolean;
 }
 
 export interface SCMProviderManifest {
