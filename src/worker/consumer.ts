@@ -418,6 +418,18 @@ const RETRY_BUFFER_MS = 60 * 1000;
 const PENDING_CONTINUATION_CLAIM_TTL_SEC = Math.ceil(MIN_RETRY_DELAY_MS / 1000) + 120;
 
 /**
+ * TTL the same claim is refreshed to while an **eligibility** wait holds it open
+ * (issue #780). Derived from that wait's own cadence rather than reusing
+ * {@link PENDING_CONTINUATION_CLAIM_TTL_SEC}, which is scaled to the retry floor:
+ * the two happen to be equal at the default 5-minute cadence, and only this one
+ * stays correct when `SWARM_DEPENDENCY_RECHECK_MS` is raised. Every re-check
+ * refreshes it again, so an unbounded `preserved-worker` wait keeps its claim for
+ * as long as it waits.
+ */
+const ELIGIBILITY_CONTINUATION_CLAIM_TTL_SEC =
+	Math.ceil(ELIGIBILITY_RECHECK_INTERVAL_MS / 1000) + 120;
+
+/**
  * Coded default wall-clock timeout applied to *every* phase/agent invocation
  * when a project sets no per-phase `agents.<phase>.timeoutMs` (issue #165).
  * Without it an agent that hangs — a model that never responds, a wedged CLI —
@@ -798,6 +810,41 @@ function deferDependencyBlock(
 }
 
 /**
+ * Hold a prioritized continuation's dispatch dedup claim open across a wait, so
+ * the eventual retry reuses it instead of colliding with it (issue #214). Returns
+ * whether this phase *is* such a continuation — i.e. whether the deferral must
+ * carry `continuationDispatchClaimed` so the woken handler skips re-claiming.
+ *
+ * Shared by every wait that defers an already-resolved phase *before it runs* —
+ * the two pre-run waits ({@link deferBeforeRun}) and the eligibility gate's
+ * ({@link deferWorkerIneligible}, issue #780) — because the claim is taken
+ * handler-side, ahead of all of them, and a wait that let it lapse (or that woke
+ * inside its TTL without the flag) is refused by its own claim on the way back
+ * in. Respond-to-review is a prioritized continuation with no claim of this
+ * shape, so it reports `true` and refreshes nothing.
+ */
+async function retainContinuationDispatchClaim(
+	project: ProjectConfig,
+	trigger: TriggerResult,
+	ttlSec: number,
+): Promise<boolean> {
+	if (!isPrioritizedContinuationPhase(trigger.phase)) return false;
+	if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
+		// Review and Respond-to-CI share the PR+SHA dispatch slot.
+		await refreshReviewDispatchClaim(
+			buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+			ttlSec,
+		);
+	} else if (trigger.phase === 'resolve-conflicts') {
+		await refreshConflictResolutionClaim(
+			buildConflictResolutionKey(project.repo, trigger.prNumber, trigger.headSha, trigger.baseSha),
+			ttlSec,
+		);
+	}
+	return true;
+}
+
+/**
  * Handle a {@link WorkerIneligibleError} (issue #339): no eligible worker may
  * take this dispatch. Like {@link deferDependencyBlock} this is a wait, not a
  * failure — the gate runs before any worktree or agent, so re-checking is
@@ -816,14 +863,15 @@ function deferDependencyBlock(
  * the phase to run anywhere. A *structural* refusal from that machine still expires
  * normally — the gate only frames "busy/offline" this way.
  */
-function deferWorkerIneligible(
+async function deferWorkerIneligible(
 	err: WorkerIneligibleError,
 	job: SwarmJob,
 	trigger: TriggerResult,
-	projectId: string,
+	project: ProjectConfig,
 	error: string,
 	runId: string | undefined,
-): Extract<JobOutcome, { status: 'phase-deferred' }> | undefined {
+): Promise<Extract<JobOutcome, { status: 'phase-deferred' }> | undefined> {
+	const projectId = project.id;
 	const attempt = job.workerEligibilityRecheckAttempt ?? 0;
 	const unbounded = err.reason === 'preserved-worker-unavailable';
 	if (!unbounded && attempt >= MAX_ELIGIBILITY_RECHECKS) {
@@ -849,7 +897,7 @@ function deferWorkerIneligible(
 			detail: err.message,
 		},
 	);
-	return {
+	const deferred: Extract<JobOutcome, { status: 'phase-deferred' }> = {
 		status: 'phase-deferred',
 		phase: trigger.phase,
 		taskId: trigger.taskId,
@@ -871,6 +919,23 @@ function deferWorkerIneligible(
 		// the same reason the concurrency deferral carries `job.runId`.
 		runId: runId ?? job.runId,
 	};
+	// The handler claimed this phase's dispatch dedup slot before the gate ran, and
+	// this wait releases nothing — so hold the claim open and tell the retry to
+	// reuse it (issue #780). Without the flag the woken dispatch collides with its
+	// own live claim, the handler drops it as a duplicate, and the dispatch settles
+	// `completed` with no run row and no error. The fast availability wake (issue
+	// #610) makes that certain rather than merely likely, since it fires seconds
+	// into the claim's TTL instead of just after it.
+	//
+	// `pendingContinuation` is deliberately *not* set: it orders project-slot
+	// promotion via `deferDispatchToPending`'s `continuation` column, and an
+	// eligibility wait is a timed re-check, not a slot wait.
+	if (
+		await retainContinuationDispatchClaim(project, trigger, ELIGIBILITY_CONTINUATION_CLAIM_TTL_SEC)
+	) {
+		deferred.continuationDispatchClaimed = true;
+	}
+	return deferred;
 }
 
 /** Map a classified deferrable failure onto the dispatch record's wait reason. */
@@ -1080,26 +1145,9 @@ async function deferBeforeRun(
 	if (runId) deferred.runId = runId;
 
 	// Retain a blocked SCM phase as a prioritized continuation once it can run.
-	if (isPrioritizedContinuationPhase(trigger.phase)) {
+	if (await retainContinuationDispatchClaim(project, trigger, PENDING_CONTINUATION_CLAIM_TTL_SEC)) {
 		deferred.continuationDispatchClaimed = true;
 		deferred.pendingContinuation = project.pipeline?.prioritizeContinuations !== false;
-		if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
-			// Review and Respond-to-CI share the PR+SHA dispatch slot.
-			await refreshReviewDispatchClaim(
-				buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
-				PENDING_CONTINUATION_CLAIM_TTL_SEC,
-			);
-		} else if (trigger.phase === 'resolve-conflicts') {
-			await refreshConflictResolutionClaim(
-				buildConflictResolutionKey(
-					project.repo,
-					trigger.prNumber,
-					trigger.headSha,
-					trigger.baseSha,
-				),
-				PENDING_CONTINUATION_CLAIM_TTL_SEC,
-			);
-		}
 	}
 
 	// Persist the durable wait *before* settling the visible run: the dispatch row
@@ -2979,7 +3027,7 @@ async function handlePhaseFailure(
 	// the actionable reason (grant consent, approve the enrollment, enroll a
 	// worker that can run the configured CLI) on the item.
 	if (err instanceof WorkerIneligibleError) {
-		const deferred = deferWorkerIneligible(err, job, trigger, project.id, error, runId);
+		const deferred = await deferWorkerIneligible(err, job, trigger, project, error, runId);
 		if (deferred) return deferred;
 	}
 

@@ -123,6 +123,24 @@ describe('promoteAvailabilityWaitsForWorker', () => {
 		expect(enqueueDispatchWakeUp).toHaveBeenCalledTimes(1);
 	});
 
+	// Issue #780. The promotion republishes the row's *stored* payload, so whatever a
+	// deferral persisted there is what the woken handler runs with — including the
+	// "reuse the dedup claim you already hold" flag a prioritized continuation needs
+	// to avoid being refused by its own live claim on the way back in.
+	it('republishes a held dispatch dedup claim, so a woken continuation reuses it', async () => {
+		const waiting = row({
+			phase: 'review',
+			jobPayload: createMockScmWebhookJob({ continuationDispatchClaimed: true }),
+		});
+		listAvailabilityWaitsForWorker.mockResolvedValue([waiting]);
+		promoteDispatchToImmediateWake.mockResolvedValue(promoted(waiting));
+
+		expect(await promoteAvailabilityWaitsForWorker(WORKER_ID, 'capacity-freed')).toBe(1);
+
+		const [payload] = enqueueDispatchWakeUp.mock.calls[0] as [SwarmJob, string, number];
+		expect(payload.continuationDispatchClaimed).toBe(true);
+	});
+
 	it('swallows a read failure rather than failing the settled run that triggered it', async () => {
 		listAvailabilityWaitsForWorker.mockRejectedValue(new Error('postgres is down'));
 
