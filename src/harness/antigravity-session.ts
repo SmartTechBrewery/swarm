@@ -83,9 +83,9 @@ export function snapshotConversationIds(dir = conversationsDir()): Set<string> {
  * id that appeared since the snapshot. Returns `undefined` when nothing new
  * appeared, the store can't be read, or the result is **ambiguous**.
  *
- * Ambiguity (more than one new `.db`) only arises at
- * `SWARM_WORKER_CONCURRENCY > 1`, when a concurrent `agy` run created its own
- * conversation in the same window. We deliberately give up rather than guess: an
+ * Ambiguity (more than one new `.db`) only arises when two `agy` runs overlap on
+ * one machine (an enrollment whose `concurrencyAllocation` is above 1), where a
+ * concurrent run created its own conversation in the same window. We deliberately give up rather than guess: an
  * `agy` `.db` is written throughout its run (not only at close), so "newest
  * mtime" does not reliably identify *this* run's conversation, and picking a
  * sibling task's id would resume the wrong session's context into this worktree.

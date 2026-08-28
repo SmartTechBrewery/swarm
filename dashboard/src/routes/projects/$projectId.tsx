@@ -445,9 +445,9 @@ export function GeneralSettingsForm({
 							) : (
 								<p className="text-xs text-zinc-500 mt-1">
 									Maximum jobs this project may run at once, across all enrolled workers. Each
-									worker also has its own limit (its <code>--concurrency</code> launch setting), so
-									the effective number running is the smaller of the two. Must be a positive whole
-									number.
+									enrolled worker also has its own share of this project (its concurrency
+									allocation), so the effective number running is the smaller of the two. Must be a
+									positive whole number.
 								</p>
 							)}
 						</div>

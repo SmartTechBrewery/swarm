@@ -91,7 +91,7 @@ import type { DispatchSelection } from '../worker/eligibility-gate.js';
 import type { WorkerExecutionIdentity } from '../worker/execution-identity.js';
 import { isJobStale, resolveMaxJobAgeMs } from '../worker/job-freshness.js';
 import { RunTerminatedError } from '../worker/run-cancellation.js';
-import { resolveWorkerConcurrency, resolveWorkerLockOptions } from '../worker/runtime-options.js';
+import { resolveWorkerLockOptions } from '../worker/runtime-options.js';
 import { phaseAgentConfig } from '../worker/target-policy.js';
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
@@ -114,6 +114,22 @@ const DEFAULT_PHASE_TIMEOUT_MS = resolveAgentTimeoutMs();
 
 /** Grace past the largest configured timeout before a `running` run row is judged stale. */
 const STALE_RUN_MARGIN_MS = 10 * 60 * 1000;
+
+/**
+ * How many dispatch wake-ups the consumer pulls off the queue at once. Not a
+ * business cap, and deliberately not configurable (issue #811): the caps an
+ * operator sets — a project's `maxConcurrentJobs` and an enrollment's
+ * `concurrencyAllocation` — are enforced transactionally by
+ * `claimWorkerForDispatch`, which returns an over-limit dispatch to a durable,
+ * event-woken `project-capacity` wait. A dispatch job holds only an awaited
+ * result promise here (the phase itself runs on the worker), so this exists
+ * solely to bound the router's own fan-out, and it sits far above any aggregate
+ * an installation configures so it can never be the tighter limit — which is
+ * what the removed `SWARM_WORKER_CONCURRENCY` silently was at its default of 1.
+ * Raising it is a code change, warranted only if an installation's aggregate
+ * configured concurrency ever approaches it.
+ */
+export const DISPATCH_CONSUMER_CONCURRENCY = 100;
 
 /**
  * How often the reconciliation loop runs — reclaiming expired dispatch leases and
@@ -715,7 +731,7 @@ export async function startControlPlaneDispatch(options: {
 		},
 		{
 			connection: parseRedisUrl(requireEnv('REDIS_URL')),
-			concurrency: resolveWorkerConcurrency(),
+			concurrency: DISPATCH_CONSUMER_CONCURRENCY,
 			lockDuration,
 			lockRenewTime,
 			// A pushed assignment is not idempotent for the worker's side effects, so a
@@ -767,7 +783,7 @@ export async function startControlPlaneDispatch(options: {
 
 	logger.info('swarm-router: control-plane dispatch consumer started', {
 		queue: QUEUE_NAME,
-		concurrency: resolveWorkerConcurrency(),
+		concurrency: DISPATCH_CONSUMER_CONCURRENCY,
 	});
 
 	return {

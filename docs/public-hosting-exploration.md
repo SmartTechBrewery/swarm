@@ -200,8 +200,8 @@ Four design consequences follow:
    destroy the predecessor on rotation, two concurrent refreshes for one user
    would leave one of them holding dead credentials. The control plane owns
    refresh, under a lock per `(user, provider)`, with an atomic write — and the
-   worker asks for a token rather than refreshing one. **[judgment]** With
-   `SWARM_WORKER_CONCURRENCY > 1` this is not hypothetical.
+   worker asks for a token rather than refreshing one. **[judgment]** With more
+   than one concurrent run this is not hypothetical.
 2. **Bitbucket needs an inactivity story.** A refresh token unused for three
    months is dead and the user must repeat the whole flow. That is a normal
    state to model (worker reports it, dashboard offers re-authorisation), not a

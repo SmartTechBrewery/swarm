@@ -350,9 +350,9 @@ worker-side; a split interrupted partway resumes from a per-child marker rather
 than creating that child twice. Results stream back over the transport (ADR-003
 §2).
 
-The **router** dequeues and dispatches; `SWARM_WORKER_CONCURRENCY` bounds how many
-dispatches it drives at once (default 1), and a project's **Maximum Concurrent
-Jobs** setting bounds it further per project. Dispatch always runs on the control
+The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
+setting and each enrolled worker's **concurrency allocation** are what bound how
+many of its runs happen at once. Dispatch always runs on the control
 plane (ADR-003 §2): there is no second arrangement — the in-process executor was
 deleted so that one path carries every run. A project with no enrolled, connected
 worker leaves its dispatch durably pending; a wait for a *machine* ends as soon

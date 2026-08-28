@@ -27,8 +27,8 @@ let queue: Queue<SwarmJob> | null = null;
  * highest, so review-lifecycle jobs need no override — only PM-driven jobs get
  * pushed down. Without this, a card dragged into Planning/In progress right as a
  * PR opens can leave that PR's review waiting out the whole implementation run
- * under `SWARM_WORKER_CONCURRENCY=1`, and even at 2 it still competes for the
- * same limited slots.
+ * in a project running one job at a time (`maxConcurrentJobs`), and even at 2 it
+ * still competes for the same limited slots.
  */
 export const PM_BOARD_JOB_PRIORITY = 10;
 

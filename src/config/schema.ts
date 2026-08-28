@@ -77,7 +77,7 @@ export { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt };
 export const PROJECT_DEFAULTS = {
 	baseBranch: 'main',
 	branchPrefix: 'issue-',
-	/** Mirrors the documented SWARM_WORKER_CONCURRENCY default. */
+	/** One job per project at a time until an operator raises it. */
 	maxConcurrentJobs: 1,
 	/** Relative to `repoRoot`; matches the worktree lifecycle in ai/ARCHITECTURE.md. */
 	worktreeRoot: '.swarm-workspaces',

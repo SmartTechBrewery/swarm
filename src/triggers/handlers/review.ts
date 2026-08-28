@@ -15,7 +15,7 @@
  * actions *inside* its still-running agent process, so GitHub delivers
  * a `pull-request` `opened` event — and this handler dispatches Review — a few
  * seconds before the Implementation phase logs its own `Phase finished` and moves
- * the board. In an interleaved worker log (`SWARM_WORKER_CONCURRENCY > 1`) that
+ * the board. In an interleaved log, when several phases run concurrently, that
  * reads as "Review started before Implementation finished", which looks like an
  * out-of-order pipeline but isn't: Review provisions its *own* detached worktree
  * at the head SHA and touches nothing the implementer owns, and if the implementer

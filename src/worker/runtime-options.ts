@@ -3,54 +3,6 @@ import { optionalEnv } from '../lib/env.js';
 export const DEFAULT_WORKER_LOCK_DURATION_MS = 15 * 60 * 1000;
 export const MAX_WORKER_LOCK_RENEW_TIME_MS = 30 * 1000;
 
-/** Dispatches driven at once when neither the flag nor the env var is set. */
-export const DEFAULT_WORKER_CONCURRENCY = 1;
-
-/**
- * Extract a `--concurrency <n>` / `--concurrency=<n>` launch flag from argv.
- * Returns the raw string (possibly empty, so a value-less `--concurrency` fails
- * validation rather than being silently ignored), or `undefined` when the flag
- * is absent.
- */
-function readConcurrencyFlag(argv: string[]): string | undefined {
-	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i];
-		if (arg === '--concurrency') return argv[i + 1] ?? '';
-		if (arg.startsWith('--concurrency=')) return arg.slice('--concurrency='.length);
-	}
-	return undefined;
-}
-
-/**
- * Resolve how many dispatch wake-ups the control plane drives at once (BullMQ's
- * `concurrency`). Since issue #553 the only consumer of that queue is the
- * router's dispatch consumer (`../router/dispatcher.ts`), so this bounds how
- * many dispatches the control plane gates and pushes concurrently — not how many
- * agents any one machine runs, which is the workers' own business.
- *
- * Precedence: the `--concurrency <n>` launch flag (so `npm run dev:router --
- * --concurrency 2` overrides without editing `.env`), then the
- * `SWARM_WORKER_CONCURRENCY` env var, then {@link DEFAULT_WORKER_CONCURRENCY}.
- * Must resolve to a positive integer — a typo throws rather than silently
- * falling back, naming whichever source supplied the bad value.
- *
- * A project's own `maxConcurrentJobs` and an enrollment's `concurrencyAllocation`
- * bound the result further (see `worker-eligibility.ts`).
- */
-export function resolveWorkerConcurrency(
-	argv: string[] = process.argv.slice(2),
-	rawEnv = optionalEnv('SWARM_WORKER_CONCURRENCY', String(DEFAULT_WORKER_CONCURRENCY)),
-): number {
-	const flag = readConcurrencyFlag(argv);
-	const raw = flag ?? rawEnv;
-	const value = Number(raw);
-	if (!Number.isInteger(value) || value < 1) {
-		const source = flag !== undefined ? '--concurrency' : 'SWARM_WORKER_CONCURRENCY';
-		throw new Error(`${source} must be a positive integer, got '${raw}'`);
-	}
-	return value;
-}
-
 export interface WorkerLockOptions {
 	lockDuration: number;
 	lockRenewTime: number;

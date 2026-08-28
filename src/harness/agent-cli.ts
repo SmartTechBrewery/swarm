@@ -244,8 +244,8 @@ export interface RunAgentCliOptions {
 	/**
 	 * Extra fields merged into this run's `agent run finished` log line. The
 	 * harness is generic — it doesn't know which task/phase it's serving — so a
-	 * caller that runs concurrently with other phases (the worker, with
-	 * `SWARM_WORKER_CONCURRENCY > 1`) passes `{ taskId, phase, … }` here so its
+	 * caller that runs concurrently with other phases (the worker, when several
+	 * phases run at once) passes `{ taskId, phase, … }` here so its
 	 * finish line is attributable in an interleaved log. Without it, two phases'
 	 * `agent run finished` lines are indistinguishable and read as an out-of-order
 	 * pipeline (the "review before implementation" false alarm this closes).
