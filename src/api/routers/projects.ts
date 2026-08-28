@@ -11,6 +11,9 @@ import {
 	ProjectRecordBaseSchema,
 	type ScmCredentialReferencesByProvider,
 } from '../../config/schema.js';
+import { scmCredentialReferenceFor } from '../../config/scm-credentials.js';
+import { writeProjectCredential } from '../../db/repositories/credentialsRepository.js';
+import { resolveInstanceScmCredential } from '../../db/repositories/instanceCredentialsRepository.js';
 import {
 	approveMembershipRequestInDb,
 	createMembershipRequest,
@@ -31,7 +34,9 @@ import {
 import { getMembership, listProjectsForUser } from '../../identity/membership-service.js';
 import { githubProjectsBlankPm } from '../../integrations/pm/github-projects/config-schema.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
-import { getSCMProvider } from '../../integrations/scm/registry.js';
+import { getSCMProvider, listInstanceDefaultScmRoles } from '../../integrations/scm/registry.js';
+import { describeError } from '../../lib/errors.js';
+import { logger } from '../../lib/logger.js';
 import type { ScmType } from '../../scm/types.js';
 import {
 	accessibleProjectScope,
@@ -104,6 +109,43 @@ function defaultPmCredentialReferences(
 			.map((role) => [role.role, role.envVarKey]),
 	);
 	return Object.keys(references).length > 0 ? { [pm.type]: references } : undefined;
+}
+
+/**
+ * Copy the installation's stored defaults for the new project's **own** SCM provider
+ * into its `project_credentials` rows (issue #769 phase 2/2), so a dashboard-created
+ * project is routable for Review without an operator pasting the reviewer PAT by hand.
+ *
+ * A copy made once, at creation, into the project's *own* row — deliberately **not** a
+ * resolution tier: `resolveScmCredentialOrNull` (`src/config/provider.ts`) still reads
+ * only what this project names, so the no-fallback-chain rule is intact and a project
+ * that later switches provider cannot resolve a stale secret. The value is decrypted
+ * under the instance AAD and re-encrypted under the project's (`writeProjectCredential`
+ * binds it to `projectId`), which leaves the project row self-contained: clearing or
+ * rotating the instance default afterwards cannot break it, and cannot reach it.
+ *
+ * Only the provider the project runs on, and only roles that declare
+ * `instanceDefault` — never every registered provider's block, which is the fallback
+ * shape `adoptLegacyScmCredentials` (`src/config/scm-credentials.ts`) refuses for the
+ * same reason. `webhookSecret` can never declare it, so it is never seeded.
+ *
+ * The destination key is the one the project *resolves* the role through, via the same
+ * `scmCredentialReferenceFor(...) ?? envVarKey` rule `credentials.set` writes under
+ * (`scmReferenceKeyFor`, `./credentials.ts`) — not a second derivation of it.
+ *
+ * Nothing can be overwritten here: the project row was created in this same call, so it
+ * holds no credentials yet (and `deleteProjectFromDb` cascades them, so a reused id
+ * cannot leave one behind).
+ */
+async function seedInstanceScmCredentials(project: ProjectRecord, scm: ScmType): Promise<void> {
+	for (const eligible of listInstanceDefaultScmRoles()) {
+		if (eligible.providerId !== scm) continue;
+		const secret = await resolveInstanceScmCredential(scm, eligible.role);
+		if (secret === null) continue;
+		const key = scmCredentialReferenceFor(project, scm, eligible.role) ?? eligible.envVarKey;
+		// No display name: nothing reads one for an SCM reference, matching `credentials.set`.
+		await writeProjectCredential(project.id, key, secret, null);
+	}
 }
 
 // Derived from the record base object (`.omit()` needs a bare `z.object`); credentials
@@ -371,6 +413,20 @@ export const projectsRouter = router({
 				});
 			}
 			throw error;
+		}
+		// Best-effort, and outside the transaction above on purpose: the project and its
+		// membership are already committed atomically, and `writeProjectCredential` takes
+		// no transaction handle. A failing seed must not turn a successful creation into a
+		// client-visible error — the degraded outcome is exactly today's behaviour (set
+		// the credential on the Source Control tab), while re-running `create` to recover
+		// it would only earn a `CONFLICT`.
+		try {
+			await seedInstanceScmCredentials(config, scm);
+		} catch (error) {
+			logger.warn(
+				'projects.create: seeding the instance default SCM credentials failed; set them on the Source Control tab',
+				{ projectId: config.id, scm, error: describeError(error) },
+			);
 		}
 		return config;
 	}),

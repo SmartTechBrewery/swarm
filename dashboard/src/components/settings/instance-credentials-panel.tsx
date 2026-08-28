@@ -306,17 +306,19 @@ export function InstanceCredentialsPanel() {
 				<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
 					Instance Default Credentials
 				</h2>
-				{/* Accurate for phase 1 and no further: nothing reads these values yet, so the
-				    copy must not promise that new projects are seeded from them — phase 2/2 is
-				    what makes that true, and it updates this paragraph. */}
+				{/* Both halves matter and neither may be dropped: a default *is* consumed now
+				    (phase 2/2 copies it into projects created from here on), and it is still
+				    only ever a copy made at creation — never a fallback an existing project
+				    silently starts resolving through. */}
 				<p className="text-xs text-zinc-400">
 					The installation's default identity for source-control roles one account normally serves
 					across every project. Only roles a provider declares installation-wide are offered here —
 					a project's webhook secret, for instance, is tied to that project's own endpoint and never
-					appears. Setting or clearing a default here changes nothing for an existing project: each
-					project's own credential stays authoritative and stays editable on its Source Control tab.
-					Secrets are stored encrypted and never returned to the browser, not even as a masked
-					preview.
+					appears. A default is copied into each new project created from the dashboard, so new
+					projects are seeded and ready to run without pasting the secret again. Existing projects
+					are unaffected: setting or clearing a default here changes nothing for one, whose own
+					credential stays authoritative and stays editable on its Source Control tab. Secrets are
+					stored encrypted and never returned to the browser, not even as a masked preview.
 				</p>
 			</div>
 
