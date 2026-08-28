@@ -698,6 +698,77 @@ describe('workers.enroll (owner offers a worker to a project)', () => {
 	});
 });
 
+// Issue #784: both approvals routability needs are the same person's when the
+// enroller owns the machine *and* administers the project, so the enrollment is
+// created already granted. The rule is joint standing, never elevated privilege.
+describe('workers.enroll self-administered fast path (issue #784)', () => {
+	it('creates an active, consenting enrollment for an owner who is also a projectAdmin', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('projectAdmin'));
+		enrollWorker.mockResolvedValue(makeEnrollment({ status: 'active', sharingConsent: true }));
+
+		await owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'active', sharingConsent: true }),
+		);
+	});
+
+	it('leaves a contributor owner on the pending, unconsented path', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		enrollWorker.mockResolvedValue(makeEnrollment());
+
+		await owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'pending', sharingConsent: false }),
+		);
+	});
+
+	// `member` is below `projectAdmin`, so it pins the threshold rather than
+	// merely re-testing the branch the contributor case already covers.
+	it('leaves a member owner on the pending, unconsented path', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		getMembership.mockResolvedValue(membershipFor('member'));
+		enrollWorker.mockResolvedValue(makeEnrollment());
+
+		await owner.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'pending', sharingConsent: false }),
+		);
+	});
+
+	// The case the acceptance criteria rule out: `mayAccessProject` alone would say
+	// yes here (an instanceAdmin always may), so the uncalled `getMembership` is what
+	// pins the ownership conjunct short-circuiting ahead of it.
+	it('does not fast-path an instanceAdmin enrolling someone else’s worker', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+		enrollWorker.mockResolvedValue(makeEnrollment());
+
+		await admin.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'pending', sharingConsent: false }),
+		);
+		expect(getMembership).not.toHaveBeenCalled();
+	});
+
+	it('fast-paths an instanceAdmin enrolling their own worker', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+		enrollWorker.mockResolvedValue(makeEnrollment({ status: 'active', sharingConsent: true }));
+
+		await admin.enroll({ workerId: WORKER_ID, projectId: 'p1', allowedClis: ['claude'] });
+
+		expect(enrollWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'active', sharingConsent: true }),
+		);
+	});
+});
+
 describe('workers concurrency inputs (issue #480)', () => {
 	it('rejects a null allocation on enroll — there is no "clear it" value', async () => {
 		getWorker.mockResolvedValue(makeWorker());

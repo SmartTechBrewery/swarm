@@ -22,6 +22,14 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * makes appear. Nothing here shortcuts the two human decisions ADR-001 makes of
  * them; the form only removes the need for a shell.
  *
+ * **Except when the caller is both parties** (issue #784): an owner who also holds
+ * `projectAdmin` on the chosen project gets an `active`, consenting enrollment
+ * straight away. That is not a shortcut around ADR-001 either — both decisions are
+ * still made by the humans it names, it is just that here they are one human, and
+ * they made both in the act of enrolling. The server decides this; the form sends
+ * no flag and the copy below covers both outcomes, because `projects.list` carries
+ * no viewer role for it to predict which one it will get.
+ *
  * **Its entry point is gated on the strict `viewerIsOwner`**, narrower than the
  * mutation, which permits an `instanceAdmin` acting on someone else's worker.
  * That is deliberate: administering a machine that is not yours stays on the CLI,
@@ -270,7 +278,10 @@ export function WorkerEnrollDialog({
 		<Modal open={open} onClose={handleClose} title={`Enroll ${workerName} in a project`}>
 			<form onSubmit={handleSubmit} className="space-y-4">
 				<p className="text-xs text-zinc-500 leading-relaxed">
-					Offers this machine to a project you belong to. The enrollment is created{' '}
+					Offers this machine to a project you belong to. If you administer that project it is
+					enrolled <span className="text-zinc-300">active</span> with{' '}
+					<span className="text-zinc-300">sharing on</span> and can take work straight away — both
+					approvals would be yours. Otherwise it is created{' '}
 					<span className="text-zinc-300">awaiting approval</span> with{' '}
 					<span className="text-zinc-300">sharing off</span> — a project administrator approves it
 					and you grant sharing consent below before any work is routed here. Which pipeline phases

@@ -316,10 +316,19 @@ export const workersRouter = router({
 			}
 		}),
 
-	// Offer one of the caller's workers to a project (a `pending` enrollment
-	// awaiting a projectAdmin's approval). The caller must own the worker
-	// (NOT_FOUND otherwise) and be able to see the project (`contributor`, so an
-	// unknown/inaccessible project is NOT_FOUND). Sharing consent starts off.
+	// Offer one of the caller's workers to a project. The caller must own the
+	// worker (NOT_FOUND otherwise) and be able to see the project (`contributor`,
+	// so an unknown/inaccessible project is NOT_FOUND).
+	//
+	// What the enrollment is created as depends on whether the caller is *both*
+	// parties to the two decisions routability needs (issue #784). Offering a
+	// machine you do not administer the project of stays a `pending` enrollment
+	// with sharing consent off, awaiting a projectAdmin's approval and the owner's
+	// own consent. When the caller owns the worker *and* holds `projectAdmin` on
+	// the target, both of those approvals are already theirs and were made in the
+	// act of enrolling, so it is created `active` and consenting — routable with no
+	// further step.
+	//
 	// A project whose repository is not the worker's declared checkout is refused
 	// as `BAD_REQUEST` naming both repositories (issue #690), exactly as allowed
 	// CLIs exceeding the machine's capabilities are.
@@ -340,6 +349,15 @@ export const workersRouter = router({
 		.mutation(async ({ ctx, input }) => {
 			const worker = await resolveOwnedWorker(ctx.user, input.workerId);
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			// The ownership conjunct is load-bearing, not redundant with the resolve
+			// above: `resolveOwnedWorker` admits an `instanceAdmin` acting on someone
+			// else's machine, and `mayAccessProject` says yes to an `instanceAdmin`
+			// unconditionally — so the predicate has to be *joint* owner-and-admin
+			// standing, never elevated privilege on its own. It short-circuits, so a
+			// caller who is not the owner pays no extra membership read.
+			const selfAdministered =
+				worker.ownerUserId === ctx.user.id &&
+				(await mayAccessProject(ctx.user, input.projectId, 'projectAdmin'));
 			try {
 				return await enrollWorker({
 					worker,
@@ -347,6 +365,11 @@ export const workersRouter = router({
 					allowedClis: input.allowedClis,
 					allowedPhases: input.allowedPhases,
 					concurrencyAllocation: input.concurrencyAllocation,
+					// Stated here rather than left to the service defaults: the router is
+					// now the thing deciding them. The `pending`/`false` pair is identical
+					// to what the defaults produce.
+					status: selfAdministered ? 'active' : 'pending',
+					sharingConsent: selfAdministered,
 				});
 			} catch (error) {
 				if (

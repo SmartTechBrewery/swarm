@@ -46,8 +46,10 @@ import type { WorkerDetail } from '@/types/workers.js';
  * owner's own action ({@link WorkerEnrollDialog}) over the same `workers.enroll`
  * the CLI calls — no new procedure and no new authorization. It is still a
  * different act from administering an existing enrollment, and it produces one:
- * the new enrollment starts pending with sharing consent off, so a project
- * administrator's approval and the owner's consent remain exactly where they were.
+ * the new enrollment starts pending with sharing consent off — so a project
+ * administrator's approval and the owner's consent remain exactly where they were
+ * — unless the owner also administers the chosen project, in which case both
+ * approvals were already theirs and the server grants them at once (issue #784).
  */
 
 const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm';
