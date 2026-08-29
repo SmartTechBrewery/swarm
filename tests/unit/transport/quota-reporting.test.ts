@@ -71,7 +71,10 @@ describe('startWorkerQuotaReporting', () => {
 		vi.useRealTimers();
 	});
 
-	it('runs a full probe at startup and a cheap one on each interval', async () => {
+	it('runs a full probe at startup and on every interval, never a cheap one', async () => {
+		// A cheap pass carries no windows and no remaining allowance, and the report
+		// is an upsert — one cheap tick would blank the stored live row for the life
+		// of the daemon, since nothing else re-fills it.
 		const { discover, post, handle } = start();
 
 		await settle();
@@ -80,11 +83,11 @@ describe('startWorkerQuotaReporting', () => {
 
 		await vi.advanceTimersByTimeAsync(WORKER_QUOTA_REPORT_INTERVAL_MS);
 		expect(discover).toHaveBeenCalledTimes(2);
-		expect(discover.mock.calls[1][0]).toBe(true);
+		expect(discover.mock.calls[1][0]).toBe(false);
 
 		await vi.advanceTimersByTimeAsync(WORKER_QUOTA_REPORT_INTERVAL_MS);
 		expect(discover).toHaveBeenCalledTimes(3);
-		expect(discover.mock.calls[2][0]).toBe(true);
+		expect(discover.mock.calls[2][0]).toBe(false);
 
 		handle.stop();
 	});

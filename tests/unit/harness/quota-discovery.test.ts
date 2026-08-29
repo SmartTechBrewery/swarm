@@ -828,6 +828,21 @@ describe('quota-discovery', () => {
 			}
 		});
 
+		it('carries no allowance at all when a cheap pass meets a null resolver', async () => {
+			// Why the worker's report is never cheap (issue #825): with no live probe and
+			// no run-derived hint there is nothing left to report, and the report is an
+			// upsert — such a row would blank a stored live one.
+			stubClaudeProbes(CAPTURED_CLAUDE_USAGE_ENVELOPE);
+
+			const snapshots = await discoverCliQuotas(true, { fallbackRateLimitInfo: async () => null });
+			const claude = snapshots.find((snapshot) => snapshot.cli === 'claude');
+
+			expect(claude?.source).toBe('fallback');
+			expect(claude?.windows).toBeUndefined();
+			expect(claude?.remainingPercentage).toBeUndefined();
+			expect(claude?.resetTime).toBeUndefined();
+		});
+
 		it('reads the DB-backed hint when no resolver is injected', async () => {
 			mockAgy();
 			vi.mocked(getDb).mockClear();

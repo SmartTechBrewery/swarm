@@ -73,12 +73,17 @@ export interface WorkerQuotaReportingHandle {
 /**
  * Start reporting this host's CLI quota to the control plane.
  *
- * The cadence matches the loop this replaces: one **full** probe shortly after
- * startup, so a freshly connected worker's card is live rather than empty, then a
- * **cheap** probe on the interval — a live probe spawns each CLI, which is not
- * something to do every few minutes in the background. The interval is `unref`'d,
- * so reporting never keeps the daemon alive; nothing is awaited here, so the
- * caller's own startup is not held up by a CLI spawn.
+ * **Every** report is a full, live probe: one shortly after startup, so a freshly
+ * connected worker's card is populated rather than empty, and one on each
+ * interval. A cheap pass would spawn no CLI and therefore carry no `windows` and
+ * no `remainingPercentage` — and since the report is an upsert, the first cheap
+ * tick would overwrite the startup allowance with an empty row that nothing can
+ * refill (the dashboard's Refresh only re-reads storage). Spawning each CLI once
+ * every six hours is not a hot path, so the cost the retired control-plane loop's
+ * `cheap` tick was avoiding does not apply here.
+ *
+ * The interval is `unref`'d, so reporting never keeps the daemon alive; nothing is
+ * awaited here, so the caller's own startup is not held up by a CLI spawn.
  */
 export function startWorkerQuotaReporting(
 	options: WorkerQuotaReportingOptions,
@@ -99,20 +104,20 @@ export function startWorkerQuotaReporting(
 	const intervalMs = options.intervalMs ?? WORKER_QUOTA_REPORT_INTERVAL_MS;
 
 	/** One probe-and-report. Swallows everything: reporting is not the daemon's job. */
-	async function reportOnce(cheap: boolean): Promise<void> {
+	async function reportOnce(): Promise<void> {
 		try {
-			const snapshots = await discover(cheap, { fallbackRateLimitInfo: NO_RUN_DERIVED_FALLBACK });
+			const snapshots = await discover(false, { fallbackRateLimitInfo: NO_RUN_DERIVED_FALLBACK });
 			const { stored } = await post(snapshots);
-			logger.debug('reported this host CLI quota to the control plane', { cheap, stored });
+			logger.debug('reported this host CLI quota to the control plane', { stored });
 		} catch (err) {
-			logger.warn('reporting this host CLI quota failed', { cheap, error: describeError(err) });
+			logger.warn('reporting this host CLI quota failed', { error: describeError(err) });
 		}
 	}
 
-	void reportOnce(false);
+	void reportOnce();
 
 	const timer = setInterval(() => {
-		void reportOnce(true);
+		void reportOnce();
 	}, intervalMs);
 	timer.unref();
 

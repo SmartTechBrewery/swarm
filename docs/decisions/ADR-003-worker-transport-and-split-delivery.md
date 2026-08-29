@@ -212,7 +212,7 @@ server-side store) it needs:
    now runs **all six** phases, so phase support no longer depends on which machine
    a worker happens to be. The delivery API grows five more PM routes
    (`POST /worker/delivery/pm/{find-comment,create-item,update-item,label,blocked-by}`,
-   for sixteen in total, seventeen once #543 added the split's resume lookup and eighteen once #639 added the dependency gate's reverse-edge read; see
+   for sixteen in total, seventeen once #543 added the split's resume lookup, eighteen once #639 added the dependency gate's reverse-edge read and nineteen once #825 added the worker's own CLI-quota report; see
    ADR-004 §2), each authenticated and authorized exactly
    as the existing PM routes are, and `createWriteOnlyTransportPmProvider` refuses
    only `getWorkItem` and `listWorkItems` — neither of which any DB-free phase calls.
