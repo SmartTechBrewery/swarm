@@ -79,6 +79,7 @@ import {
 	WS_CLOSE,
 } from '../transport/protocol.js';
 import type { TriggerPhase } from '../triggers/types.js';
+import { resendRunCancellationsToWorker } from './dispatch-cancellation.js';
 import {
 	type DispatchStreamTarget,
 	deliverDispatchAck,
@@ -209,6 +210,17 @@ export interface WorkerTransportDeps {
 	 */
 	onWorkerTransportLost: (workerId: string) => void;
 	onWorkerTransportRestored: (workerId: string) => void;
+	/**
+	 * A termination requested while this worker's socket was down never reached it
+	 * (issue #827): the push is best-effort and fires once, so the socket coming back
+	 * is the moment to re-state it from the durable marker
+	 * (`./dispatch-cancellation.ts`). Without it a worker whose transport merely
+	 * blipped keeps running an agent the operator asked to stop, since the bounded
+	 * offline settle only re-pushes from a wait it armed — and it arms none for a
+	 * worker that was still heartbeating when the terminate landed. Fire-and-forget
+	 * by contract, like the hooks above.
+	 */
+	resendRunCancellations: (workerId: string) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -240,6 +252,7 @@ function defaultDeps(): WorkerTransportDeps {
 				persistControlPlaneNote(dispatch.runId, TRANSPORT_RESTORED_NOTE);
 			}
 		},
+		resendRunCancellations: resendRunCancellationsToWorker,
 	};
 }
 
@@ -703,8 +716,9 @@ function runConnectionHook(what: string, workerId: string, hook: () => void): vo
 
 /**
  * An authenticated `/worker/stream` socket opened: record it as the worker's live
- * transport, wake the work that was only waiting for a machine like this one, and
- * annotate the runs whose output this session restores.
+ * transport, wake the work that was only waiting for a machine like this one,
+ * annotate the runs whose output this session restores, and hand it any
+ * cancellation that could not be pushed while it was away.
  *
  * Factored out of the socket glue for the same reason `handleHandshake` and
  * `handleWorkerStreamFrame` are — a test drives it with a fake `WSContext` and
@@ -715,8 +729,11 @@ function runConnectionHook(what: string, workerId: string, hook: () => void): vo
  * the other is a dispatch bound to it settling (`../worker/consumer.ts`). It is
  * also the moment a dropped transport comes back (issue #723) — which annotates
  * only the runs whose dispatch this router already saw interrupted, so an ordinary
- * first connection writes nothing. Both are fire-and-forget: the socket must open
- * regardless of what Postgres or Redis are doing.
+ * first connection writes nothing — and the moment a termination this router could
+ * not deliver is re-stated to the returning worker (issue #827), which reads the
+ * durable marker only for the dispatches actually awaited on it, so an ordinary
+ * first connection reads nothing either. All three are fire-and-forget: the socket
+ * must open regardless of what Postgres or Redis are doing.
  */
 export function handleWorkerStreamOpen(
 	deps: WorkerTransportDeps,
@@ -730,6 +747,11 @@ export function handleWorkerStreamOpen(
 	);
 	runConnectionHook('noting the restored transport session', workerId, () =>
 		deps.onWorkerTransportRestored(workerId),
+	);
+	// Last, and after registration specifically: the re-push addresses the socket
+	// this call just registered (issue #827).
+	runConnectionHook('re-pushing cancellations recorded while the worker was away', workerId, () =>
+		deps.resendRunCancellations(workerId),
 	);
 }
 

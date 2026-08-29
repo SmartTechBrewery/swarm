@@ -5,6 +5,7 @@ import {
 	deliverDispatchProgress,
 	deliverDispatchResult,
 	failDispatchResultWait,
+	listAwaitedDispatchesForWorker,
 	noteWorkerTransportLost,
 	noteWorkerTransportRestored,
 	resolveDispatchStreamTarget,
@@ -172,6 +173,24 @@ describe('failDispatchResultWait', () => {
 
 		expect(deliverDispatchResult(result(DISPATCH_B))).toBe(true);
 		await expect(onB.result).resolves.toMatchObject({ status: 'succeeded' });
+
+		onA.dispose();
+		onB.dispose();
+	});
+
+	it('marks the frame cancelled only when asked to (issue #827)', async () => {
+		const onA = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const onB = awaitDispatchResult(DISPATCH_B, TARGET_B);
+
+		// The router's own undeliverable user termination: `cancelled: true` is what
+		// makes the settle a `RunTerminatedError` rather than a plain terminal failure.
+		expect(failDispatchResultWait(DISPATCH_A, REASON, { cancelled: true })).toBe(true);
+		await expect(onA.result).resolves.toMatchObject({ status: 'failed', cancelled: true });
+
+		// The superseded-session caller passes no options, and its frame must carry no
+		// `cancelled` key at all — a cancelled settle is a different outcome entirely.
+		expect(failDispatchResultWait(DISPATCH_B, REASON)).toBe(true);
+		expect(await onB.result).not.toHaveProperty('cancelled');
 
 		onA.dispose();
 		onB.dispose();
@@ -381,5 +400,52 @@ describe('transport interruption bookkeeping', () => {
 		expect(awaiting.interruptions().count).toBe(1);
 
 		awaiting.dispose();
+	});
+});
+
+/**
+ * Issue #827 (review #5058049296 F1). The unfiltered view the interruption
+ * bookkeeping above narrows: a worker whose socket comes back has to be told about a
+ * termination recorded while it was down, and whether *this* router ever saw the
+ * transport drop is beside the point — the marker is durable, and the terminate may
+ * have been requested against a router that had already given up on the socket.
+ */
+describe('listAwaitedDispatchesForWorker', () => {
+	it('lists that worker’s dispatches with their runs, and no other worker’s', () => {
+		const onA = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const onB = awaitDispatchResult(DISPATCH_B, TARGET_B);
+
+		expect(listAwaitedDispatchesForWorker(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+		expect(listAwaitedDispatchesForWorker(WORKER_B)).toEqual([
+			{ dispatchId: DISPATCH_B, runId: 'run-b' },
+		]);
+
+		onA.dispose();
+		onB.dispose();
+	});
+
+	// Unlike `noteWorkerTransportRestored`, an undropped transport is not a reason to
+	// skip a dispatch: the push that missed may never have involved a drop this router
+	// observed at all.
+	it('lists a dispatch whose transport this router never saw drop', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		expect(listAwaitedDispatchesForWorker(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a' },
+		]);
+		// And it keeps listing it, however many times a socket opens — the marker read
+		// is what decides whether anything is pushed, not this list.
+		expect(listAwaitedDispatchesForWorker(WORKER_A)).toHaveLength(1);
+
+		awaiting.dispose();
+	});
+
+	it('lists nothing once the dispatch is no longer awaited here', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		awaiting.dispose();
+
+		expect(listAwaitedDispatchesForWorker(WORKER_A)).toEqual([]);
 	});
 });

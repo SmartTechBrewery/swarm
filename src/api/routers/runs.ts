@@ -1054,7 +1054,13 @@ export const runsRouter = router({
 	//    there, so writing the row from here would take the terminal state away from
 	//    its owner. Issue #719 settles the narrower, knowable case where a different
 	//    daemon process succeeds a session; this remains the lease reconciler's
-	//    backstop when no successor handshakes.
+	//    backstop when no successor handshakes. Since issue #827 the router bounds
+	//    the *quiet* end of that case on a liveness heuristic — a worker whose last
+	//    heartbeat is older than `max(2 × SWARM_WORKER_HEARTBEAT_TTL_MS, 2m)`, well
+	//    past its reconnect ladder — settling such a run about a minute later
+	//    (`SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS`) rather than at the phase's agent
+	//    timeout, and re-pushing the cancel instead if the worker turns up inside
+	//    that minute. Still not from here, and still through the shared settle.
 	//
 	//  - `deferred`: no agent is running; a delayed BullMQ retry job is waiting.
 	//    Remove that job so nothing resurrects the run, then atomically flip the

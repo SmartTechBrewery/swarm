@@ -9,6 +9,7 @@ import {
 import type { AcquiredSession } from '@/identity/worker-session-service.js';
 import { WorkerSessionHeldError } from '@/identity/worker-session-service.js';
 import { logger } from '@/lib/logger.js';
+import { resendRunCancellationsToWorker } from '@/router/dispatch-cancellation.js';
 import {
 	awaitDispatchResult,
 	noteWorkerTransportLost,
@@ -24,6 +25,17 @@ import {
 } from '@/router/worker-transport.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { TriggerPhase } from '@/triggers/types.js';
+
+// The only Redis this suite touches: the durable cancellation marker the
+// stream-open re-push consults (issue #827). Everything else the marker's module
+// exports is left as it really is, so a transitive importer keeps working.
+const { isRunCancellationRequested } = vi.hoisted(() => ({
+	isRunCancellationRequested: vi.fn<(runId: string) => Promise<boolean>>(),
+}));
+vi.mock('@/queue/cancellation.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/queue/cancellation.js')>()),
+	isRunCancellationRequested,
+}));
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
@@ -91,6 +103,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		onWorkerAvailable: vi.fn(),
 		onWorkerTransportLost: vi.fn(),
 		onWorkerTransportRestored: vi.fn(),
+		resendRunCancellations: vi.fn(),
 		...overrides,
 	};
 }
@@ -1191,5 +1204,133 @@ describe('GET /worker/stream transport-interruption hooks', () => {
 		expect(deps.releaseSession).toHaveBeenCalledWith(CREDENTIAL, 7);
 		expect(warnSpy).toHaveBeenCalled();
 		warnSpy.mockRestore();
+	});
+});
+
+/**
+ * Issue #827 (review #5058049296 F1). The bounded offline settle re-pushes a
+ * cancellation only from a wait it armed, and it arms one only for a worker already
+ * silent past its heartbeat and reconnect windows when the terminate landed. The
+ * ordinary shape is the other one — socket drops, operator terminates seconds later,
+ * daemon reconnects moments after that — and the only thing standing between it and
+ * an agent that keeps running is this hook. What the re-push *does* is
+ * `dispatch-cancellation.ts`'s business; what matters here is that the socket
+ * lifecycle really invokes it, against the socket it just registered, and never at
+ * the cost of the connection.
+ */
+describe('GET /worker/stream cancellation re-push on reconnect', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isRunCancellationRequested.mockResolvedValue(false);
+	});
+
+	async function connect(deps: WorkerTransportDeps) {
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+		handlers.onOpen?.({}, ws);
+		return { handlers, ws };
+	}
+
+	// The whole point of the finding: no silence wait was ever armed (the worker was
+	// still heartbeating when the terminate landed), so the reconnect is the only
+	// moment left at which the marker can reach it.
+	it('pushes task-cancel for an awaited run marked cancelled while the socket was down', async () => {
+		isRunCancellationRequested.mockResolvedValue(true);
+		const awaiting = awaitDispatchResult(DISPATCH, {
+			workerId: WORKER_ID,
+			runId: RUN_ID,
+			phase: 'implementation',
+			taskId: '407',
+		});
+		// The real re-push, wired to the real registries, so the assertion is about a
+		// frame actually reaching the socket rather than a mock being called.
+		const deps = makeDeps({ resendRunCancellations: resendRunCancellationsToWorker });
+
+		const { handlers, ws } = await connect(deps);
+
+		await vi.waitFor(() => expect(ws.send).toHaveBeenCalled());
+		expect(JSON.parse(String(ws.send.mock.calls[0][0]))).toMatchObject({
+			type: 'task-cancel',
+			dispatchId: DISPATCH,
+			runId: RUN_ID,
+			// From the registration, so the worker can answer a cancel it cannot apply
+			// with a terminal result naming both (issue #724).
+			phase: 'implementation',
+			taskId: '407',
+		});
+		expect(isRunCancellationRequested).toHaveBeenCalledWith(RUN_ID);
+
+		await handlers.onClose?.({}, ws);
+		awaiting.dispose();
+	});
+
+	// An ordinary connection: the run it is awaiting was never terminated, so the
+	// marker read answers `false` and the worker is left alone.
+	it('pushes nothing when the awaited run carries no cancellation marker', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH, {
+			workerId: WORKER_ID,
+			runId: RUN_ID,
+			phase: 'implementation',
+			taskId: '407',
+		});
+		const deps = makeDeps({ resendRunCancellations: resendRunCancellationsToWorker });
+
+		const { handlers, ws } = await connect(deps);
+
+		await vi.waitFor(() => expect(isRunCancellationRequested).toHaveBeenCalledWith(RUN_ID));
+		expect(ws.send).not.toHaveBeenCalled();
+
+		await handlers.onClose?.({}, ws);
+		awaiting.dispose();
+	});
+
+	// A first connection with nothing awaited on this worker reads no marker at all —
+	// the Redis round-trip is bounded by what this router is actually executing there.
+	it('reads no marker for a worker this router is awaiting nothing on', async () => {
+		const deps = makeDeps({ resendRunCancellations: resendRunCancellationsToWorker });
+
+		const { handlers, ws } = await connect(deps);
+
+		expect(isRunCancellationRequested).not.toHaveBeenCalled();
+		await handlers.onClose?.({}, ws);
+	});
+
+	// Same property the other two open hooks hold: registration is what connectivity
+	// depends on and it already happened.
+	it('keeps the socket registered when the re-push throws', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			resendRunCancellations: vi.fn(() => {
+				throw new Error('redis is down');
+			}),
+		});
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+
+		expect(() => handlers.onOpen?.({}, ws)).not.toThrow();
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(deps.onWorkerTransportRestored).toHaveBeenCalledWith(WORKER_ID);
+		expect(warnSpy).toHaveBeenCalled();
+
+		await handlers.onClose?.({}, ws);
+		warnSpy.mockRestore();
+	});
+
+	it('re-pushes nothing on an unauthenticated open', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+
+		handlers.onOpen?.({}, fakeWs());
+
+		expect(deps.resendRunCancellations).not.toHaveBeenCalled();
 	});
 });
