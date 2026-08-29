@@ -79,6 +79,7 @@ import {
 	toPipelineAutoAdvanceForm,
 	toPipelineEnabledForm,
 	toReviewChecksPolicyForm,
+	toVerifyPlanForm,
 } from '@/lib/pipeline-enabled.js';
 import {
 	agentConfigSearch,
@@ -607,7 +608,7 @@ export function PhaseEnabledCell({
  * paired with the flag it flips. Each such toggle auto-saves on its own (issue
  * #369), so the row shows its own spinner rather than the tab-wide Save button.
  */
-type ToggleKind = 'enabled' | 'autoAdvance';
+type ToggleKind = 'enabled' | 'autoAdvance' | 'verifyPlan';
 
 /** Stable key for one phase's interactive toggle, used to target its spinner. */
 export function toggleSaveKey(phase: string, kind: ToggleKind): string {
@@ -753,9 +754,60 @@ interface PhaseSettingsDetailProps extends TargetHandlers {
 	handleEnabledChange?: (phase: PipelineTogglePhase, enabled: boolean) => void;
 	autoAdvance?: boolean;
 	handleAutoAdvanceChange?: (phase: PipelineAutoAdvancePhase, enabled: boolean) => void;
+	/**
+	 * Planning's plan-verification state, or `undefined` for every other phase —
+	 * the setting is Planning's alone, so only its detail screen renders the row.
+	 */
+	verifyPlan?: boolean;
+	handleVerifyPlanChange?: (enabled: boolean) => void;
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
 	onBack: () => void;
+}
+
+/**
+ * Planning's **Verify plan** row in the phase-detail settings card, or nothing
+ * for a phase that has no such setting (`verifyPlan === undefined`). Behaves like
+ * the Auto-advance row above it: an immediate scoped save, its own spinner, and
+ * disabled while any toggle write is in flight. Kept out of
+ * {@link PhaseSettingsDetail} so that component's cognitive complexity stays
+ * within budget.
+ */
+export function PhaseVerifyPlanRow({
+	phaseLabel,
+	verifyPlan,
+	isPending,
+	savingToggleKey,
+	handleVerifyPlanChange,
+}: {
+	phaseLabel: string;
+	verifyPlan?: boolean;
+	isPending: boolean;
+	/** Key of the toggle whose immediate save is in flight, or undefined when idle. */
+	savingToggleKey?: string;
+	handleVerifyPlanChange?: (enabled: boolean) => void;
+}) {
+	if (verifyPlan === undefined) return null;
+	return (
+		<div className="flex items-start gap-3">
+			<span className="inline-flex items-center gap-2">
+				<ToggleSwitch
+					checked={verifyPlan}
+					label={`${phaseLabel} verify plan`}
+					disabled={isPending || savingToggleKey !== undefined}
+					onChange={() => handleVerifyPlanChange?.(!verifyPlan)}
+				/>
+				<ToggleSaveIndicator saving={savingToggleKey === toggleSaveKey('planning', 'verifyPlan')} />
+			</span>
+			<span>
+				<span className="block text-sm font-medium text-zinc-200">Verify plan</span>
+				<span className="block text-xs text-zinc-400 mt-1">
+					Run a second, independent agent to fact-check the plan against the codebase and correct it
+					before it is posted. Doubles this phase's agent cost.
+				</span>
+			</span>
+		</div>
+	);
 }
 
 /**
@@ -1034,6 +1086,8 @@ export function PhaseSettingsDetail({
 	handleEnabledChange,
 	autoAdvance,
 	handleAutoAdvanceChange,
+	verifyPlan,
+	handleVerifyPlanChange,
 	handleTargetChange,
 	handleAddTarget,
 	handleRemoveTarget,
@@ -1129,6 +1183,14 @@ export function PhaseSettingsDetail({
 							</span>
 						</div>
 					)}
+
+					<PhaseVerifyPlanRow
+						phaseLabel={phaseLabel.label}
+						verifyPlan={verifyPlan}
+						isPending={isPending}
+						savingToggleKey={savingToggleKey}
+						handleVerifyPlanChange={handleVerifyPlanChange}
+					/>
 				</div>
 
 				<PhaseTargetList
@@ -1196,12 +1258,14 @@ interface AgentConfigurationFormProps extends TargetHandlers {
 	agents: AgentsConfig;
 	pipelineEnabled: PipelineEnabledForm;
 	pipelineAutoAdvance: PipelineAutoAdvanceForm;
+	verifyPlan: boolean;
 	/** The phase whose detail screen is open, or `undefined` for the summary table. */
 	selectedPhase: (typeof PHASES)[number] | undefined;
 	onSelectPhase: (phase: (typeof PHASES)[number]) => void;
 	onBack: () => void;
 	handleEnabledChange: (phase: PipelineTogglePhase, enabled: boolean) => void;
 	handleAutoAdvanceChange: (phase: PipelineAutoAdvancePhase, enabled: boolean) => void;
+	handleVerifyPlanChange: (enabled: boolean) => void;
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
 	handleSubmit: (e: React.FormEvent) => void;
@@ -1226,8 +1290,9 @@ interface AgentConfigurationFormProps extends TargetHandlers {
 /**
  * Agent Configuration tab. Shows the per-phase summary table (each row navigates
  * to its detail screen), or — when a phase is
- * selected — that phase's detail screen. The Enabled/Auto-advance toggles save
- * immediately on their own scoped mutation with inline pending/error feedback
+ * selected — that phase's detail screen. The Enabled/Auto-advance/Verify-plan
+ * toggles save immediately on their own scoped mutation with inline
+ * pending/error feedback
  * (issue #369); the Save Changes / Reset controls and the route's `agents` state
  * govern only the non-toggle edits (target lists, timeouts, custom prompts), so
  * the two save paths never persist each other's in-progress edits (issue #135, #119).
@@ -1236,11 +1301,13 @@ function AgentConfigurationForm({
 	agents,
 	pipelineEnabled,
 	pipelineAutoAdvance,
+	verifyPlan,
 	selectedPhase,
 	onSelectPhase,
 	onBack,
 	handleEnabledChange,
 	handleAutoAdvanceChange,
+	handleVerifyPlanChange,
 	handleTargetChange,
 	handleAddTarget,
 	handleRemoveTarget,
@@ -1291,8 +1358,10 @@ function AgentConfigurationForm({
 					autoAdvance={
 						selectedAutoAdvancePhase ? pipelineAutoAdvance[selectedAutoAdvancePhase] : undefined
 					}
+					verifyPlan={selectedPhase === 'planning' ? verifyPlan : undefined}
 					handleEnabledChange={handleEnabledChange}
 					handleAutoAdvanceChange={handleAutoAdvanceChange}
+					handleVerifyPlanChange={handleVerifyPlanChange}
 					handleTargetChange={handleTargetChange}
 					handleAddTarget={handleAddTarget}
 					handleRemoveTarget={handleRemoveTarget}
@@ -1568,6 +1637,8 @@ interface UseToggleAutoSaveArgs {
 	setPipelineEnabled: React.Dispatch<React.SetStateAction<PipelineEnabledForm>>;
 	pipelineAutoAdvance: PipelineAutoAdvanceForm;
 	setPipelineAutoAdvance: React.Dispatch<React.SetStateAction<PipelineAutoAdvanceForm>>;
+	verifyPlan: boolean;
+	setVerifyPlan: React.Dispatch<React.SetStateAction<boolean>>;
 	/**
 	 * True while a *different* config write (a tab's Save Changes) is in flight.
 	 * A toggle flip is refused while it's set so the toggle's read-merge-upsert
@@ -1577,8 +1648,9 @@ interface UseToggleAutoSaveArgs {
 }
 
 /**
- * Wires the Agents-tab Enabled/Auto-advance toggles to immediate, scoped saves
- * (issue #369). A flip updates the pipeline form optimistically and fires a
+ * Wires the Agents-tab Enabled/Auto-advance/Verify-plan toggles to immediate,
+ * scoped saves (issue #369). A flip updates the pipeline form optimistically and
+ * fires a
  * `pipeline`-only mutation — never `agents`, so the tab's unsaved target/timeout/
  * prompt edits are left untouched (the issue's caveat: the two save paths stay
  * independent). While a save is in flight `savingToggleKey` names the toggle so it
@@ -1605,6 +1677,8 @@ export function useToggleAutoSave({
 	setPipelineEnabled,
 	pipelineAutoAdvance,
 	setPipelineAutoAdvance,
+	verifyPlan,
+	setVerifyPlan,
 	blocked,
 }: UseToggleAutoSaveArgs) {
 	const [savingToggleKey, setSavingToggleKey] = useState<string>();
@@ -1668,11 +1742,26 @@ export function useToggleAutoSave({
 		persist(toggleSaveKey(phase, 'autoAdvance'), patch, () => setPipelineAutoAdvance(prev));
 	};
 
+	// `projects.update` deep-merges the `planning` block, so this one-field patch
+	// leaves autoAdvance/autoSplit/maxConcerns as they were stored.
+	const handleVerifyPlanChange = (enabled: boolean) => {
+		if (blocked || savingToggleKey !== undefined) return;
+		const prev = verifyPlan;
+		setVerifyPlan(enabled);
+
+		const patch: PipelineConfig = {
+			planning: { verifyPlan: enabled },
+		};
+
+		persist(toggleSaveKey('planning', 'verifyPlan'), patch, () => setVerifyPlan(prev));
+	};
+
 	return {
 		savingToggleKey,
 		toggleErrorMessage: mutation.isError ? (mutation.error?.message ?? 'Unknown error') : undefined,
 		handleEnabledChange,
 		handleAutoAdvanceChange,
+		handleVerifyPlanChange,
 	};
 }
 
@@ -1902,6 +1991,7 @@ function ProjectDetailRouteComponent() {
 	const [pipelineAutoAdvance, setPipelineAutoAdvance] = useState<PipelineAutoAdvanceForm>(() =>
 		toPipelineAutoAdvanceForm(undefined),
 	);
+	const [verifyPlan, setVerifyPlan] = useState(() => toVerifyPlanForm(undefined));
 	const [autoMerge, setAutoMerge] = useState(false);
 	const [skipRespondToReviewOnMinors, setSkipRespondToReviewOnMinors] = useState(true);
 	const [reviewChecksPolicy, setReviewChecksPolicy] = useState<ReviewChecksPolicy>(() =>
@@ -1971,6 +2061,7 @@ function ProjectDetailRouteComponent() {
 		if (changed.pipeline) {
 			setPipelineEnabled(toPipelineEnabledForm(project.pipeline));
 			setPipelineAutoAdvance(toPipelineAutoAdvanceForm(project.pipeline));
+			setVerifyPlan(toVerifyPlanForm(project.pipeline));
 			setAutoMerge(project.pipeline?.respondToReview?.autoMerge ?? false);
 			setSkipRespondToReviewOnMinors(project.pipeline?.respondToReview?.skipOnMinors ?? true);
 			setReviewChecksPolicy(toReviewChecksPolicyForm(project.pipeline));
@@ -2005,18 +2096,25 @@ function ProjectDetailRouteComponent() {
 		},
 	});
 
-	// The Agents-tab Enabled/Auto-advance toggles persist immediately on their own
-	// scoped `pipeline`-only mutation, independent of the Save Changes flow above
-	// (issue #369). See {@link useToggleAutoSave}.
-	const { savingToggleKey, toggleErrorMessage, handleEnabledChange, handleAutoAdvanceChange } =
-		useToggleAutoSave({
-			projectId,
-			pipelineEnabled,
-			setPipelineEnabled,
-			pipelineAutoAdvance,
-			setPipelineAutoAdvance,
-			blocked: updateMutation.isPending,
-		});
+	// The Agents-tab Enabled/Auto-advance/Verify-plan toggles persist immediately on
+	// their own scoped `pipeline`-only mutation, independent of the Save Changes flow
+	// above (issue #369). See {@link useToggleAutoSave}.
+	const {
+		savingToggleKey,
+		toggleErrorMessage,
+		handleEnabledChange,
+		handleAutoAdvanceChange,
+		handleVerifyPlanChange,
+	} = useToggleAutoSave({
+		projectId,
+		pipelineEnabled,
+		setPipelineEnabled,
+		pipelineAutoAdvance,
+		setPipelineAutoAdvance,
+		verifyPlan,
+		setVerifyPlan,
+		blocked: updateMutation.isPending,
+	});
 
 	// CredentialsPanel's own `providerMutation` (the Source Control tab's SCM
 	// provider select) also writes `projects.update` directly, outside the Save-Changes
@@ -2427,11 +2525,13 @@ function ProjectDetailRouteComponent() {
 						agents={agents}
 						pipelineEnabled={pipelineEnabled}
 						pipelineAutoAdvance={pipelineAutoAdvance}
+						verifyPlan={verifyPlan}
 						selectedPhase={selectedPhase}
 						onSelectPhase={openPhase}
 						onBack={backToAgentConfig}
 						handleEnabledChange={handleEnabledChange}
 						handleAutoAdvanceChange={handleAutoAdvanceChange}
+						handleVerifyPlanChange={handleVerifyPlanChange}
 						handleTargetChange={handleTargetChange}
 						handleAddTarget={handleAddTarget}
 						handleRemoveTarget={handleRemoveTarget}

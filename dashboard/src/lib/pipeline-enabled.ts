@@ -37,6 +37,38 @@ export function toPipelineAutoAdvanceForm(
 }
 
 /**
+ * Project Planning's `verifyPlan` override onto the dashboard form; unset reads as
+ * off, matching the coded default. A plain boolean rather than a second
+ * phase-keyed record like {@link PipelineAutoAdvanceForm}, since the setting is
+ * Planning's alone and is rendered on that one detail screen.
+ */
+export function toVerifyPlanForm(pipeline: PipelineConfig | undefined): boolean {
+	return pipeline?.planning?.verifyPlan ?? false;
+}
+
+/** Whether the Verify-plan selection differs from its effective stored value. */
+export function isVerifyPlanDirty(form: boolean, pipeline: PipelineConfig | undefined): boolean {
+	return form !== toVerifyPlanForm(pipeline);
+}
+
+/**
+ * Merge the dashboard's Verify-plan value into a *complete* pipeline payload —
+ * the shape a caller sending the whole config needs, so Planning's
+ * autoAdvance/autoSplit/maxConcerns survive alongside the flipped flag. The
+ * toggle's own save doesn't go through here: it sends the one changed field,
+ * which `projects.update` merges into the stored `planning` block.
+ */
+export function buildVerifyPlanUpdate(
+	form: boolean,
+	existing: PipelineConfig | undefined,
+): PipelineConfig {
+	return {
+		...existing,
+		planning: { ...existing?.planning, verifyPlan: form },
+	};
+}
+
+/**
  * Project the stored pipeline config onto the flat form state. An unset `enabled`
  * defaults to `true` (the phase runs unless explicitly disabled — matching the
  * trigger handlers, which only skip on `enabled === false`).
@@ -77,7 +109,7 @@ export function isRespondToReviewLocked(form: PipelineEnabledForm): boolean {
 /**
  * Build the `pipeline` payload for `projects.update` from the form, preserving
  * every existing pipeline field the Agent Configuration screen doesn't edit
- * (Planning's autoAdvance/autoSplit, Respond-to-review's
+ * (Planning's autoAdvance/autoSplit/maxConcerns/verifyPlan, Respond-to-review's
  * autoMerge/skipOnMinors). `projects.update` shallow-merges, so an omitted field
  * here would be dropped — hence the spreads. Respond-to-review is forced off when
  * Review is off to satisfy the server-side refinement.
@@ -115,20 +147,24 @@ export function buildPipelineAutoAdvanceUpdate(
 
 /**
  * The complete `pipeline` payload carrying only the Agent Configuration toggles'
- * state (every phase's `enabled` flag and Planning's `autoAdvance`), layered over
- * the stored config so every field the toggles don't own — Respond-to-review's
- * autoMerge/skipOnMinors, Review's checks policy — survives the write. This is the
- * scoped payload the Agents tab sends when a toggle is flipped: it persists the
- * toggle immediately without dragging along the tab's unsaved non-toggle edits
- * (target lists, timeouts, custom prompts) that the Save Changes button owns
- * (issue #369).
+ * state (every phase's `enabled` flag, Planning's `autoAdvance` and its
+ * `verifyPlan`), layered over the stored config so every field the toggles don't
+ * own — Respond-to-review's autoMerge/skipOnMinors, Review's checks policy —
+ * survives the write. This is the scoped payload the Agents tab sends when a
+ * toggle is flipped: it persists the toggle immediately without dragging along
+ * the tab's unsaved non-toggle edits (target lists, timeouts, custom prompts)
+ * that the Save Changes button owns (issue #369).
  */
 export function buildPipelineToggleUpdate(
 	enabled: PipelineEnabledForm,
 	autoAdvance: PipelineAutoAdvanceForm,
+	verifyPlan: boolean,
 	existing: PipelineConfig | undefined,
 ): PipelineConfig {
-	return buildPipelineAutoAdvanceUpdate(autoAdvance, buildPipelineEnabledUpdate(enabled, existing));
+	return buildVerifyPlanUpdate(
+		verifyPlan,
+		buildPipelineAutoAdvanceUpdate(autoAdvance, buildPipelineEnabledUpdate(enabled, existing)),
+	);
 }
 
 /** Whether the form differs from the stored pipeline config. */
