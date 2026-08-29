@@ -155,14 +155,16 @@ export async function refreshReviewDispatchClaim(key: string, ttlSec: number): P
  * for the case where a dispatch is abandoned *before the review is submitted* so
  * the next legitimate trigger for the same PR+SHA needn't wait out the TTL. That
  * is Cascade's pre-run `onBlocked` case: a capacity/lock gate that rejects the
- * dispatch before the agent ever runs. SWARM's MVP has no such pre-dispatch gate
- * yet — the review handler relies on the claim + TTL alone — so nothing calls
- * this today; it is kept as the deliberate, documented counterpart to the claim
- * (issue #62 asked to port an equivalent claim/release). It must NOT be called on
- * a *failed* review run: the agent submits the formal `gh pr review` inside its
- * run (`src/pipeline/review.ts`), so a run that threw afterward may have already
- * posted the review, and releasing then would let a sibling event post a
- * duplicate — the exact incident this dedup exists to prevent.
+ * dispatch before the agent ever runs (issue #62 asked to port an equivalent
+ * claim/release). `src/worker/consumer.ts` calls it for the two dispatches that
+ * provably ran nothing: one the automation-label gate skipped, and one that
+ * re-evaluated to `no-trigger` *without* an already-submitted verdict behind it.
+ * It must NOT be called on a *failed* review run, nor on the no-trigger
+ * redelivery of a run whose verdict the ledger already records as submitted
+ * (issue #815): the agent submits the formal review inside its run
+ * (`src/pipeline/review.ts`), so in both cases the review may already be posted,
+ * and releasing then would let a sibling event post a duplicate — the exact
+ * incident this dedup exists to prevent.
  *
  * Best-effort: errors are logged, never thrown — the TTL is the safety net.
  */

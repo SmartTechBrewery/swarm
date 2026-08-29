@@ -274,7 +274,14 @@ export interface CompleteRunInput {
 	engine?: AgentCli;
 	exitCode?: number | null;
 	timedOut?: boolean;
-	error?: string;
+	/**
+	 * Pass explicit `null` to *clear* a previous attempt's message on a settle that
+	 * records success without going through {@link resetRunToRunning} first (issue
+	 * #815): an omitted field is dropped from the update, so a run finalized as
+	 * `completed` straight off a deferral would otherwise keep showing the
+	 * rate-limit text that deferral wrote.
+	 */
+	error?: string | null;
 	durationMs?: number;
 	nextRetryAt?: Date | null;
 	usage?: AgentUsage;
