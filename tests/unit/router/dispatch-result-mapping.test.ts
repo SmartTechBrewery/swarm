@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
+import { RUN_CANCELLED_MESSAGE } from '@/queue/cancellation.js';
 import {
 	awaitDispatchResult,
 	failDispatchResultWait,
@@ -146,6 +147,33 @@ describe('adaptResultToPhaseRun', () => {
 			// must survive the round trip — and must not read as the lease-window timeout.
 			expect(failed.message).toBe(REASON);
 			expect(failed.message).not.toContain('did not report a result within the lease window');
+		}
+
+		awaiting.dispose();
+	});
+
+	it('settles the router’s own undeliverable termination as a cancellation (issue #827)', async () => {
+		// Again the frame the router actually produces, not a hand-built one: the
+		// bounded offline wait ends through `failDispatchResultWait` with
+		// `cancelled: true`, which must reach the user-terminated branch rather than
+		// the terminal `AgentRunError` the superseded case above maps to.
+		const awaiting = awaitDispatchResult(DISPATCH, {
+			workerId: 'w-1',
+			runId: 'run-827',
+			phase: 'planning',
+			taskId: '827',
+		});
+		expect(failDispatchResultWait(DISPATCH, RUN_CANCELLED_MESSAGE, { cancelled: true })).toBe(true);
+		const frame = await awaiting.result;
+
+		try {
+			adaptResultToPhaseRun(frame, SELECTION);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect(err).toBeInstanceOf(RunTerminatedError);
+			// The neutral wording the run row records for every cancellation (issue #305) —
+			// why it settled early is a log line, not the run's message.
+			expect((err as Error).message).toBe(RUN_CANCELLED_MESSAGE);
 		}
 
 		awaiting.dispose();

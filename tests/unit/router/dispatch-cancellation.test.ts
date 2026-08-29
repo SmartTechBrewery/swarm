@@ -1,10 +1,12 @@
 import type { WSContext } from 'hono/ws';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	cancelRunOnWorker,
+	DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS,
+	resolveOfflineWorkerCancelTimeoutMs,
 	subscribeDispatchCancellations,
 } from '@/router/dispatch-cancellation.js';
-import { awaitDispatchResult } from '@/router/dispatch-results.js';
+import { awaitDispatchResult, deliverDispatchResult } from '@/router/dispatch-results.js';
 import { deregisterConnection, registerConnection } from '@/router/worker-connections.js';
 
 // The pub/sub half is Redis; mock it so the bridge from a cancellation
@@ -14,7 +16,24 @@ const { subscribeToRunCancellations } = vi.hoisted(() => ({
 	subscribeToRunCancellations:
 		vi.fn<(onCancel: (runId: string) => void) => { close: () => Promise<void> }>(),
 }));
-vi.mock('@/queue/cancellation.js', () => ({ subscribeToRunCancellations }));
+vi.mock('@/queue/cancellation.js', () => ({
+	subscribeToRunCancellations,
+	// The module now names the neutral terminal wording itself (issue #827).
+	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
+}));
+
+// The other half of the offline check (issue #827) is a Postgres read; mock it so
+// "does this worker hold a live session at all" is drivable from the test.
+const { getLiveSessionForWorker } = vi.hoisted(() => ({
+	getLiveSessionForWorker: vi.fn<(workerId: string) => Promise<unknown>>(),
+}));
+vi.mock('@/identity/worker-session-service.js', () => ({ getLiveSessionForWorker }));
+
+/** The neutral message the settled run records — the same string the mock exports. */
+const RUN_CANCELLED_MESSAGE = 'Run cancelled after a cancellation request.';
+
+/** Stand-in for a `worker_sessions` row that is still live. */
+const LIVE_SESSION = { id: 'session-1', workerId: 'w', fencingToken: 7 };
 
 /** WebSocket `readyState`: OPEN. */
 const OPEN = 1;
@@ -47,8 +66,19 @@ function framesOn(ws: FakeWs): Array<Record<string, unknown>> {
 	return ws.send.mock.calls.map((call) => JSON.parse(String(call[0])));
 }
 
+/** Whether `awaiting.result` is still unresolved — a settled wait wins the race. */
+async function stillPending(result: Promise<unknown>): Promise<boolean> {
+	const sentinel = Symbol('pending');
+	return (await Promise.race([result, Promise.resolve(sentinel)])) === sentinel;
+}
+
 describe('cancelRunOnWorker', () => {
-	beforeEach(() => vi.clearAllMocks());
+	beforeEach(() => {
+		vi.clearAllMocks();
+		// Default to a still-leased worker, which is the unchanged best-effort path.
+		getLiveSessionForWorker.mockResolvedValue(LIVE_SESSION);
+	});
+	afterEach(() => vi.useRealTimers());
 
 	it('pushes exactly one task-cancel to the worker executing the run', () => {
 		const ws = fakeWs();
@@ -120,6 +150,131 @@ describe('cancelRunOnWorker', () => {
 		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
 
 		awaiting.dispose();
+	});
+
+	it('settles a terminated run whose worker holds no live session (issue #827)', async () => {
+		vi.useFakeTimers();
+		// No socket registered *and* no `worker_sessions` row: the phase cannot be
+		// executing anywhere, so waiting out the phase's agent timeout settles nothing.
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
+
+		expect(getLiveSessionForWorker).toHaveBeenCalledWith(WORKER_ID);
+		// `cancelled: true` is what routes this to `RunTerminatedError` and so to the
+		// same settle a worker-reported cancellation gets; the phase and task come from
+		// the registration, as every synthetic terminal frame's do (issue #724).
+		await expect(awaiting.result).resolves.toEqual({
+			type: 'task-execution-result',
+			dispatchId: DISPATCH_ID,
+			status: 'failed',
+			phase: 'review',
+			taskId: '724',
+			error: RUN_CANCELLED_MESSAGE,
+			reason: RUN_CANCELLED_MESSAGE,
+			cancelled: true,
+		});
+
+		awaiting.dispose();
+	});
+
+	it('leaves the wait alone when the worker still holds a live session', async () => {
+		vi.useFakeTimers();
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS * 5);
+
+		// The push merely missed a leased worker: it may reconnect and report, and only
+		// it knows whether the phase is still executing there.
+		expect(await stillPending(awaiting.result)).toBe(true);
+
+		awaiting.dispose();
+	});
+
+	it('leaves the wait alone when the worker session cannot be read', async () => {
+		vi.useFakeTimers();
+		// Fail safe: an unreadable session is not proof of absence.
+		getLiveSessionForWorker.mockRejectedValue(new Error('connection terminated'));
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS * 5);
+
+		expect(await stillPending(awaiting.result)).toBe(true);
+
+		awaiting.dispose();
+	});
+
+	it('arms nothing when the push succeeded', async () => {
+		vi.useFakeTimers();
+		const ws = fakeWs();
+		registerConnection(WORKER_ID, ws);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(true);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS * 5);
+
+		// The worker owns the terminal state of a dispatch it acknowledged the cancel for.
+		expect(getLiveSessionForWorker).not.toHaveBeenCalled();
+		expect(await stillPending(awaiting.result)).toBe(true);
+
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, ws);
+	});
+
+	it('arms nothing for a run this router is not executing', async () => {
+		vi.useFakeTimers();
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
+
+		expect(getLiveSessionForWorker).not.toHaveBeenCalled();
+	});
+
+	it('lets a real result win, leaving the late timer a no-op', async () => {
+		vi.useFakeTimers();
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		expect(
+			deliverDispatchResult({
+				type: 'task-execution-result',
+				dispatchId: DISPATCH_ID,
+				status: 'succeeded',
+				phase: 'review',
+				taskId: '724',
+				exitCode: 0,
+			}),
+		).toBe(true);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
+
+		// Delivering consumed the registration, so the timer found nothing to settle.
+		await expect(awaiting.result).resolves.toMatchObject({ status: 'succeeded' });
+
+		awaiting.dispose();
+	});
+});
+
+describe('resolveOfflineWorkerCancelTimeoutMs', () => {
+	afterEach(() => vi.unstubAllEnvs());
+
+	it('defaults to one minute when the variable is unset', () => {
+		vi.stubEnv('SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS', '');
+		expect(resolveOfflineWorkerCancelTimeoutMs()).toBe(60_000);
+		expect(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS).toBe(60_000);
+	});
+
+	it('accepts a configured positive integer', () => {
+		expect(resolveOfflineWorkerCancelTimeoutMs('5000')).toBe(5000);
+	});
+
+	it.each(['0', '-1', 'abc', '1.5'])('rejects %s, naming the variable', (raw) => {
+		expect(() => resolveOfflineWorkerCancelTimeoutMs(raw)).toThrow(
+			'SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS',
+		);
 	});
 });
 

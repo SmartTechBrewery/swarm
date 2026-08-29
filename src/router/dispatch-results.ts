@@ -19,7 +19,10 @@
  * the handshake settles the old generation's durable claims, and the wait behind
  * each one has to end with them (`failDispatchResultWait`) — otherwise the rows are
  * settled while the capacity they occupy stays held for the rest of the window.
- * What *is* its concern since issue #723 is the transport
+ * The second such loss (issue #827) ends through the same seam: a user termination
+ * the router could not push because the worker holds no live session at all, which
+ * the same function settles as a *cancellation* rather than a plain failure
+ * (`./dispatch-cancellation.ts`). What *is* its concern since issue #723 is the transport
  * interruption itself: being the one place that knows who is awaiting a given
  * worker, it records a dropped `/worker/stream` against those dispatches, so an
  * undelivered result can be attributed to the drop rather than to a silent worker.
@@ -263,8 +266,19 @@ export function deliverDispatchResult(result: TaskExecutionResult): boolean {
  *
  * The frame reports the phase and task the *registration* named (issue #724), so a
  * synthetic terminal result is indistinguishable in shape from a real one.
+ *
+ * `cancelled: true` is the *other* reason a wait ends early (issue #827): a user
+ * termination this router could not deliver because the worker holds no live
+ * session at all, so the phase provably cannot still be executing there. That frame
+ * routes to a `RunTerminatedError` rather than the non-deferrable `AgentRunError`
+ * the superseded case maps to, which is what makes the run settle as the user's
+ * termination — same columns, same origin — instead of as a plain failure.
  */
-export function failDispatchResultWait(dispatchId: string, reason: string): boolean {
+export function failDispatchResultWait(
+	dispatchId: string,
+	reason: string,
+	options: { cancelled?: boolean } = {},
+): boolean {
 	const entry = pending.get(dispatchId);
 	// Answered here rather than by `deliverDispatchResult`'s miss branch: a dispatch
 	// nobody is awaiting is the ordinary reading on this path, not the anomaly that
@@ -278,6 +292,9 @@ export function failDispatchResultWait(dispatchId: string, reason: string): bool
 		taskId: entry.taskId,
 		error: reason,
 		reason,
+		// Spread rather than `cancelled: options.cancelled`: the superseded-session
+		// caller's frame must stay exactly the shape it is today, with no key at all.
+		...(options.cancelled ? { cancelled: true } : {}),
 	});
 }
 

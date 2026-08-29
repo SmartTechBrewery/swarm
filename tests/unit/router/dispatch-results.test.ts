@@ -177,6 +177,24 @@ describe('failDispatchResultWait', () => {
 		onB.dispose();
 	});
 
+	it('marks the frame cancelled only when asked to (issue #827)', async () => {
+		const onA = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		const onB = awaitDispatchResult(DISPATCH_B, TARGET_B);
+
+		// The router's own undeliverable user termination: `cancelled: true` is what
+		// makes the settle a `RunTerminatedError` rather than a plain terminal failure.
+		expect(failDispatchResultWait(DISPATCH_A, REASON, { cancelled: true })).toBe(true);
+		await expect(onA.result).resolves.toMatchObject({ status: 'failed', cancelled: true });
+
+		// The superseded-session caller passes no options, and its frame must carry no
+		// `cancelled` key at all — a cancelled settle is a different outcome entirely.
+		expect(failDispatchResultWait(DISPATCH_B, REASON)).toBe(true);
+		expect(await onB.result).not.toHaveProperty('cancelled');
+
+		onA.dispose();
+		onB.dispose();
+	});
+
 	it('answers false for a dispatch nobody here is awaiting, without throwing', () => {
 		// The ordinary reading when this router restarted since the push: the durable
 		// dispatch row is then the whole story.

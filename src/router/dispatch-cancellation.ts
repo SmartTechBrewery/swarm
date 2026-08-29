@@ -25,11 +25,30 @@
  * remains the source of truth for *whether* a run was cancelled — `processJob`
  * reads it when the phase fails — so a missed push costs promptness, never
  * correctness.
+ *
+ * Best-effort still, but no longer unbounded (issue #827). A failed push alone is
+ * ambiguous — the socket may have blipped and the worker may reconnect and report —
+ * so that case keeps waiting out the phase's own agent timeout. A failed push to a
+ * worker with **no active `worker_sessions` row** is strictly more information than
+ * "haven't heard back yet": the phase cannot be executing there, and nothing was
+ * ever going to settle the run. Such a run is settled after
+ * `SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS` (default 1 minute) instead. Live repro
+ * that prompted it: 2026-08-29, `rover` task 5's `planning` phase on worker
+ * `jacek_tp_rover`, whose transport session had been released minutes before the
+ * Terminate — the marker and origin were recorded, the push failed, and the run row
+ * stayed `running` until it was settled by hand in Postgres.
  */
 
+import { getLiveSessionForWorker } from '../identity/worker-session-service.js';
+import { optionalEnv } from '../lib/env.js';
+import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { subscribeToRunCancellations } from '../queue/cancellation.js';
-import { resolveDispatchTargetForRun } from './dispatch-results.js';
+import { RUN_CANCELLED_MESSAGE, subscribeToRunCancellations } from '../queue/cancellation.js';
+import {
+	failDispatchResultWait,
+	type RunDispatchTarget,
+	resolveDispatchTargetForRun,
+} from './dispatch-results.js';
 import { sendToWorker } from './worker-connections.js';
 
 /**
@@ -41,10 +60,110 @@ import { sendToWorker } from './worker-connections.js';
 const CANCEL_FRAME_REASON = 'a cancellation was requested for this run';
 
 /**
+ * Default wait before a terminated run whose worker holds no live session at all is
+ * settled here rather than at the phase's own agent timeout (issue #827). A minute
+ * is long enough for a worker that is merely mid-reconnect to re-handshake — which
+ * ends the wait through the superseded-claim reap instead — and short enough that a
+ * run nothing can possibly report on does not sit `running` for tens of minutes.
+ */
+export const DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS = 60_000;
+
+/** Resolve that wait from the environment, mirroring the sibling dispatch timeouts. */
+export function resolveOfflineWorkerCancelTimeoutMs(
+	raw = optionalEnv(
+		'SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS',
+		String(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS),
+	),
+): number {
+	const value = Number(raw);
+	if (!Number.isInteger(value) || value < 1) {
+		throw new Error(
+			`SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS must be a positive integer, got '${raw}'`,
+		);
+	}
+	return value;
+}
+
+/** Resolved once (validates the env var at load), like the sibling dispatch timeouts. */
+const OFFLINE_WORKER_CANCEL_TIMEOUT_MS = resolveOfflineWorkerCancelTimeoutMs();
+
+/**
+ * Bound the wait for a termination that could not be pushed, but only once the
+ * worker is *confirmed* to hold no live session (issue #827).
+ *
+ * The settle rides the seam this router already owns for a wait whose outcome can
+ * no longer arrive (`failDispatchResultWait`, issue #719): the synthetic terminal
+ * frame carries `cancelled: true`, so `adaptResultToPhaseRun` raises a
+ * `RunTerminatedError` and the run settles down the *same* path a worker-reported
+ * cancellation does — `failed`, the neutral reason, the recorded origin, a
+ * `user-terminated` diagnosis — releasing the parked BullMQ job and every capacity
+ * the dispatch holds along with the rows. No new settle path and no new policy.
+ *
+ * The timer needs neither cancelling nor a re-check. A real result arriving first
+ * consumes the registration, so the late timer finds nothing and is a silent no-op;
+ * a worker that reconnects inside the minute must re-acquire its session, which
+ * bumps the fencing token and ends the wait through the handshake's own superseded-
+ * claim reap. (The one path left — the same dispatch record being re-pushed inside
+ * the minute — is only reachable for a run the user has already terminated, whose
+ * fresh push `pushAndAwaitResult`'s post-push marker read cancels anyway.)
+ */
+async function settleWhenWorkerHoldsNoSession(
+	runId: string,
+	target: RunDispatchTarget,
+): Promise<void> {
+	let live: unknown;
+	try {
+		live = await getLiveSessionForWorker(target.workerId);
+	} catch (err) {
+		// Fail safe into today's behaviour: an unreadable session is not proof of
+		// absence, and the lease/agent-timeout window is still the backstop.
+		logger.warn(
+			'run cancellation: could not read the worker session — leaving the wait to the lease window',
+			{ runId, workerId: target.workerId, error: describeError(err) },
+		);
+		return;
+	}
+	if (live) {
+		// The push missed a worker that is still leased — it may reconnect and report,
+		// and only it knows whether the phase is still executing there. Unchanged.
+		logger.debug('run cancellation: the worker still holds a live session — leaving the wait', {
+			runId,
+			dispatchId: target.dispatchId,
+			workerId: target.workerId,
+		});
+		return;
+	}
+	logger.warn(
+		'run cancellation: the worker holds no live session — settling the run if it does not report',
+		{
+			runId,
+			dispatchId: target.dispatchId,
+			workerId: target.workerId,
+			timeoutMs: OFFLINE_WORKER_CANCEL_TIMEOUT_MS,
+		},
+	);
+	const timer = setTimeout(() => {
+		// `RUN_CANCELLED_MESSAGE` verbatim: this *is* the user's termination, so the run
+		// records the same neutral terminal message every other cancellation does
+		// (issue #305). Why it settled early is a log line, not the run's message.
+		if (failDispatchResultWait(target.dispatchId, RUN_CANCELLED_MESSAGE, { cancelled: true })) {
+			logger.warn('run cancellation: settled a terminated run whose worker never reported', {
+				runId,
+				dispatchId: target.dispatchId,
+				workerId: target.workerId,
+			});
+		}
+	}, OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
+	// A pending wait must never hold the process open at shutdown.
+	timer.unref();
+}
+
+/**
  * Push a `task-cancel` to the worker executing `runId` for this router, if any.
  * Returns whether a frame was actually sent; `false` covers both "not executing
  * here" and "its socket dropped", neither of which is an error — the dispatch is
- * then settled by the durable state as it would have been before this existed.
+ * then settled by the durable state as it would have been before this existed, or,
+ * when the worker is confirmed session-less, by the bounded wait above.
  */
 export function cancelRunOnWorker(runId: string): boolean {
 	const target = resolveDispatchTargetForRun(runId);
@@ -71,6 +190,8 @@ export function cancelRunOnWorker(runId: string): boolean {
 			dispatchId: target.dispatchId,
 			workerId: target.workerId,
 		});
+		// Fired and forgotten so this stays synchronous for the Redis subscriber below.
+		void settleWhenWorkerHoldsNoSession(runId, target);
 		return false;
 	}
 	logger.info('run cancellation: pushed task-cancel to the executing worker', {
