@@ -16,7 +16,7 @@
  * | Read a project / its runs / its credentials  | `contributor` | `canReadProject`     |
  * | Drive a project's runs (retry/terminate/…)   | `member`      | `canWriteProject`    |
  * | Administer config / credentials / members    | `projectAdmin`| `canAdministerProject`|
- * | Read an installation-wide view (runs/workers)| —             | `assertInstanceAdmin`|
+ * | Read an installation-wide view (queue/workers)| —            | `assertInstanceAdmin`|
  *
  * That last row is deliberately roleless: it is a **layer-1** check, decided by
  * the installation role alone (see {@link assertInstanceAdmin}), and no project
@@ -53,15 +53,21 @@ function projectNotFound(projectId: string, notFoundMessage?: string): TRPCError
 /**
  * Throw unless `user` is an installation administrator — the layer-1 gate the
  * **installation-wide** dashboard views run behind (issue #647). The global
- * `/runs` and `/workers` screens read across every project on the instance,
- * which is an operator's view of the installation rather than a member's view of
- * their own work, so the installation role decides it and project membership
- * does not enter into it.
+ * `/workers` screen and the unscoped run *queue* read across every project on
+ * the instance, which is an operator's view of the installation rather than a
+ * member's view of their own work, so the installation role decides it and
+ * project membership does not enter into it.
+ *
+ * The global `/runs` **list** left this gate with issue #821: it is now open to
+ * every signed-in user and bounded per caller by
+ * {@link accessibleProjectScope}, which is the pattern to prefer whenever a
+ * cross-project read has a membership answer. Reach for this helper only where
+ * there is genuinely nothing to scope by.
  *
  * `FORBIDDEN`, not the `NOT_FOUND` the project-scoped helpers use: there is no
  * existence to hide — the caller named no project id, only a fixed
  * installation-wide view — so the honest answer is that the view is not theirs.
- * `view` names it in the copy ("runs", "queue", "workers").
+ * `view` names it in the copy ("queue", "workers").
  *
  * Synchronous on purpose: it reads a flag already on `ctx.user` and must not
  * imply a database read. Project-scoped reads are untouched — an enrolled worker

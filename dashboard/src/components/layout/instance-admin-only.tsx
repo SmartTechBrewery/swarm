@@ -4,12 +4,13 @@ import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
 
 /**
- * The route-level gate on SWARM's two installation-wide screens — the global
- * `/runs` and `/workers` views (issue #647). It is a **wrapper**, not an early
- * return inside each screen, for two reasons: the guarded screen never mounts
- * when access is denied (so none of its cross-project queries is ever issued,
- * and a denial can't render as a wall of `FORBIDDEN` panels), and the screen
- * components keep their own hook order untouched.
+ * The route-level gate on SWARM's installation-wide screens — the global
+ * `/workers` view (issue #647; `/runs` left this gate with issue #821, which
+ * bounded its cross-project list to the reader's own projects instead). It is a
+ * **wrapper**, not an early return inside each screen, for two reasons: the
+ * guarded screen never mounts when access is denied (so none of its cross-project
+ * queries is ever issued, and a denial can't render as a wall of `FORBIDDEN`
+ * panels), and the screen components keep their own hook order untouched.
  *
  * Being the route's component is also what makes the boundary consistent: a
  * typed URL, a deep link carrying search params, and an in-app link all resolve
@@ -17,7 +18,7 @@ import { useCurrentUser } from '@/lib/use-current-user.js';
  * (`assertInstanceAdmin`, `src/api/authz.ts`) — this only stops the dashboard
  * from asking.
  *
- * `view` names the screen in the copy ("runs", "workers").
+ * `view` names the screen in the copy ("workers").
  */
 export function InstanceAdminOnly({ view, children }: { view: string; children: ReactNode }) {
 	const { data: user } = useCurrentUser();

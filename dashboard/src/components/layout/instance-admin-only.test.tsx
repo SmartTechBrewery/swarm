@@ -34,7 +34,7 @@ describe('InstanceAdminOnly (issue #647)', () => {
 		vi.mocked(useCurrentUser).mockReturnValue(session({ instanceAdmin: true }));
 
 		render(
-			<InstanceAdminOnly view="runs">
+			<InstanceAdminOnly view="workers">
 				<GuardedScreen />
 			</InstanceAdminOnly>,
 		);
@@ -76,7 +76,7 @@ describe('InstanceAdminOnly (issue #647)', () => {
 		vi.mocked(useCurrentUser).mockReturnValue(session(undefined));
 
 		render(
-			<InstanceAdminOnly view="runs">
+			<InstanceAdminOnly view="workers">
 				<GuardedScreen />
 			</InstanceAdminOnly>,
 		);
