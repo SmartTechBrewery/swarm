@@ -105,6 +105,33 @@ function makeManager(overrides = {}) {
 	return new GitWorktreeManager(createMockProjectConfig({ repoRoot: REPO_ROOT, ...overrides }));
 }
 
+/**
+ * A git world for the existing-branch (`createBranch: false`) path, described by
+ * where `refs/heads/issue-14` and `refs/remotes/origin/issue-14` point (issue
+ * #829). Both are read with the same `rev-parse --verify --quiet` argv, so the
+ * handler keys on the ref (`args[3]`) rather than the subcommand — as does the
+ * unrelated `refs/remotes/origin/main` read that resolves the base. `contains`
+ * is the answer `merge-base --is-ancestor <remote> <local>` gives: whether the
+ * local ref already holds the remote tip.
+ */
+function existingBranchWorld(refs: {
+	local?: string;
+	remote?: string;
+	contains?: boolean;
+}): (args: string[]) => GitOutcome {
+	const shas: Record<string, string | undefined> = {
+		'refs/heads/issue-14': refs.local,
+		'refs/remotes/origin/issue-14': refs.remote,
+	};
+	return (args) => {
+		if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+		if (args[0] === 'rev-parse' && args[1] === '--verify')
+			return { stdout: `${shas[args[3]] ?? ''}\n` };
+		if (args[0] === 'merge-base' && !refs.contains) throw new Error('fatal: not an ancestor');
+		return { stdout: '' };
+	};
+}
+
 describe('GitWorktreeManager', () => {
 	beforeEach(() => {
 		gitCalls.length = 0;
@@ -293,6 +320,90 @@ describe('GitWorktreeManager', () => {
 				`${REPO_ROOT}/.swarm-workspaces/task-99`,
 				'issue-14',
 			]);
+		});
+
+		// Issue #829. The remote is the authority for a branch a PR is open on — a rule
+		// #558 applied only when another worktree held the branch. A never-pushed local
+		// `issue-825` that was a *sibling* of the PR's real head was checked out as-is,
+		// so Respond-to-review started on content the PR never had, its own mandated
+		// `git pull --ff-only` correctly refused, and the phase died reporting a missing
+		// hand-off.
+		it('detaches at the remote tip when the local branch has diverged from origin', async () => {
+			gitHandler = existingBranchWorld({ local: 'e69ee045', remote: '33f9803f' });
+
+			const handle = await makeManager().provision('14', {
+				createBranch: false,
+				branch: 'issue-14',
+			});
+
+			expect(gitCalls).toContainEqual(['merge-base', '--is-ancestor', '33f9803f', 'e69ee045']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'--detach',
+				WORKTREE_14,
+				'origin/issue-14',
+			]);
+			// The handle still names the branch the delivery targets: commits are pushed
+			// as `<sha>:refs/heads/<branch>` off the detached HEAD.
+			expect(handle).toMatchObject({ branch: 'issue-14', detached: true });
+		});
+
+		// The state a #558 detached push leaves behind: `<sha>:refs/heads/<branch>`
+		// advances `origin`, never this host's local ref.
+		it('detaches at the remote tip when the local branch is merely behind origin', async () => {
+			gitHandler = existingBranchWorld({ local: 'aaa1111', remote: 'bbb2222' });
+
+			await makeManager().provision('14', { createBranch: false, branch: 'issue-14' });
+
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'--detach',
+				WORKTREE_14,
+				'origin/issue-14',
+			]);
+		});
+
+		it('checks the branch out as-is when local and origin already match', async () => {
+			gitHandler = existingBranchWorld({ local: '33f9803f', remote: '33f9803f' });
+
+			await makeManager().provision('14', { createBranch: false, branch: 'issue-14' });
+
+			expect(gitCalls.some((c) => c[0] === 'merge-base')).toBe(false);
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', WORKTREE_14, 'issue-14']);
+		});
+
+		// The deliberate carve-out: a local branch ahead of origin is not diverged. It
+		// pushes as a fast-forward and carries committed-but-unpushed work (an
+		// Implementation retry's), which detaching would silently drop.
+		it('keeps a local branch that is ahead of origin, rather than discarding unpushed work', async () => {
+			gitHandler = existingBranchWorld({ local: 'ccc3333', remote: 'bbb2222', contains: true });
+
+			await makeManager().provision('14', { createBranch: false, branch: 'issue-14' });
+
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', WORKTREE_14, 'issue-14']);
+		});
+
+		it('checks the branch out as-is when origin has no ref of that name', async () => {
+			gitHandler = existingBranchWorld({ local: 'e69ee045' });
+
+			await makeManager().provision('14', { createBranch: false, branch: 'issue-14' });
+
+			expect(gitCalls.some((c) => c[0] === 'merge-base')).toBe(false);
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', WORKTREE_14, 'issue-14']);
+		});
+
+		// A fresh clone / federated worker has no local ref yet, and `git worktree add
+		// <path> <branch>` DWIMs a tracking branch off `origin/<branch>` — already the
+		// remote's tip, so nothing to adapt.
+		it("leaves git's DWIM alone when no local branch exists yet", async () => {
+			gitHandler = existingBranchWorld({ remote: '33f9803f' });
+
+			await makeManager().provision('14', { createBranch: false, branch: 'issue-14' });
+
+			expect(gitCalls.some((c) => c[0] === 'merge-base')).toBe(false);
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', WORKTREE_14, 'issue-14']);
 		});
 
 		it('honours explicit branch and baseBranch overrides', async () => {

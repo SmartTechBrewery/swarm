@@ -92,8 +92,10 @@ export interface WorktreeHandle {
 	 * The branch checked out in the worktree. For a `detach`ed worktree there is no
 	 * branch — this holds the ref the detached HEAD was placed at: the base branch
 	 * for a deliberately detached checkout ({@link ProvisionOptions.detach}), or the
-	 * branch the delivery still targets when the checkout was detached only because
-	 * another worktree holds that branch (issue #558, see `resolveBranchCheckout`).
+	 * branch the delivery still targets when provisioning had to detach to reach the
+	 * right commit — because another worktree holds that branch (issue #558) or
+	 * because the local ref had diverged from `origin/<branch>` (issue #829). See
+	 * `resolveBranchCheckout`.
 	 */
 	branch: string;
 	/** True when the worktree is in detached HEAD (see {@link ProvisionOptions.detach}). */
@@ -476,6 +478,16 @@ export class GitWorktreeManager {
 	 *   the branch it is pinned to. The ref preferred is `origin/<branch>` — for a
 	 *   branch a PR is open on, the remote is the authority, and starting from the
 	 *   local ref is what would produce a push that can never fast-forward.
+	 * - **The branch exists locally but is not the remote's tip** (issue #829). Same
+	 *   authority rule as above, which used to be applied only in the holder case:
+	 *   `git worktree add <path> <branch>` checks out whatever `refs/heads/<branch>`
+	 *   happens to hold, and a Respond-to-review run started on a never-pushed
+	 *   *sibling* of the PR's real head — the agent's own mandated
+	 *   `git pull --ff-only origin <branch>` refused, the agent made no changes, and
+	 *   the phase died reporting a missing hand-off. Detach at `origin/<branch>` in
+	 *   that case too, so the remote is the authority for a branch a PR is open on in
+	 *   both sub-cases rather than one. See {@link localRefBehindRemote} for the
+	 *   deliberate carve-out that keeps a local branch merely *ahead* of origin.
 	 */
 	private async resolveBranchCheckout(
 		branch: string,
@@ -504,7 +516,49 @@ export class GitWorktreeManager {
 			});
 			return { mode: 'checkout' };
 		}
-		return { mode: createBranch ? 'create' : 'checkout' };
+		if (!createBranch) {
+			const stale = await this.localRefBehindRemote(branch);
+			if (stale) {
+				logger.warn(
+					'Local branch does not contain origin — provisioning a detached checkout at the remote tip',
+					{ branch, local: stale.local, remote: stale.remote },
+				);
+				return { mode: 'detach', ref: `origin/${branch}` };
+			}
+			return { mode: 'checkout' };
+		}
+		return { mode: 'create' };
+	}
+
+	/**
+	 * The local/remote pair when `refs/heads/<branch>` does **not** contain
+	 * `origin/<branch>` — a local ref behind the pushed tip, or a sibling of it — and
+	 * `null` when the local ref can be checked out as-is (issue #829).
+	 *
+	 * Asked of git rather than taken from `localBranchExists`: on the existing-branch
+	 * path that flag is the caller's premise, not an observation, and the premise is
+	 * false on a host that has never had the branch (a federated worker, a fresh
+	 * clone) — where git's own DWIM cuts the checkout from `origin/<branch>` correctly.
+	 *
+	 * "Contains" rather than "equals" on purpose. A local branch *ahead* of origin is
+	 * not diverged: it pushes as a fast-forward and carries unpushed work every other
+	 * gate here protects, so it is left alone. The question is the same one
+	 * `divergedRemoteHead` asks before classifying a rejected push
+	 * (`../scm/delivery.ts`), so the two cannot disagree about what "diverged" means.
+	 */
+	private async localRefBehindRemote(
+		branch: string,
+	): Promise<{ local: string; remote: string } | null> {
+		const remote = await this.resolveRef(`refs/remotes/origin/${branch}`);
+		if (!remote) return null;
+		const local = await this.resolveRef(`refs/heads/${branch}`);
+		if (!local || local === remote) return null;
+		try {
+			await this.git(['merge-base', '--is-ancestor', remote, local]);
+			return null;
+		} catch {
+			return { local, remote };
+		}
 	}
 
 	/** Whether a ref resolves in this repository — used for `origin/<branch>`. */
@@ -514,6 +568,19 @@ export class GitWorktreeManager {
 			return true;
 		} catch {
 			return false;
+		}
+	}
+
+	/**
+	 * The commit `ref` resolves to, or `null` when it does not resolve. Distinct from
+	 * {@link refExists} only in reading the SHA out rather than discarding it — the
+	 * divergence probe needs the two commits, both to compare and to log.
+	 */
+	private async resolveRef(ref: string): Promise<string | null> {
+		try {
+			return (await this.git(['rev-parse', '--verify', '--quiet', ref])).trim() || null;
+		} catch {
+			return null;
 		}
 	}
 
