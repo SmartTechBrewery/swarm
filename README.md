@@ -111,7 +111,7 @@ live CLI quota for every agent CLI on that machine.
 
 | Phase | Starts when | The agent does | SWARM then does |
 | --- | --- | --- | --- |
-| **Planning** | A card moves to *Planning* without already carrying `planned` | Reads the task in a read-only worktree and writes `proposed_plan.md` — and, when `verifyPlan` is on (off by default), a second independent agent fact-checks that plan against the repo first, correcting wrong paths, symbols and claims in place | Posts the plan on the item; advances the card only if `autoAdvance` is on (off by default) |
+| **Planning** | A card moves to *Planning* without already carrying `planned` | Reads the task in a read-only worktree and writes `proposed_plan.md` — and, when `verifyPlan` is on (off by default), a second independent agent fact-checks that plan against the repo first, correcting wrong paths, symbols and claims in place and noting on the plan that it was fact-checked | Posts the plan on the item; advances the card only if `autoAdvance` is on (off by default) |
 | **Implementation** | A card moves to *Ready* | Implements and verifies on a task branch, writes a structured hand-off | Validates, commits, pushes, opens/reuses the PR, links it on the card, moves it to *In review* |
 | **Review** | A SWARM-managed PR opens, or its checks complete | Reviews at the PR's head SHA and returns structured findings | Renders the review body itself, submits it under the reviewer identity, spends a ledger slot |
 | **Respond-to-review** | The reviewer requests changes | Addresses each point, writes a structured response | Commits/pushes the fix, posts the response, enqueues exactly one follow-up Review for the new head |

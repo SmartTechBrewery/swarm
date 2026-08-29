@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	appendPlanVerifiedNote,
 	buildPlanVerificationPrompt,
 	PLAN_CORRECTION_MARKER,
+	PLAN_VERIFIED_NOTE,
 } from '@/pipeline/prompts/plan-verification.js';
 import {
 	PROPOSED_PLAN_FILENAME,
@@ -76,5 +78,45 @@ describe('buildPlanVerificationPrompt', () => {
 		const prompt = buildPlanVerificationPrompt(true);
 		expect(prompt).not.toContain('--- WORK ITEM ---');
 		expect(prompt).not.toContain('PROJECT INSTRUCTIONS');
+	});
+});
+
+/**
+ * The record that the pass ran (issue #831). A clean pass corrects nothing, so
+ * this note is the only thing distinguishing a verified plan from an unverified
+ * one in the comment that gets posted.
+ */
+describe('appendPlanVerifiedNote', () => {
+	const PLAN = '# Plan\n\n1. Do the thing.';
+
+	it('states that nothing needed correcting when the pass corrected nothing', () => {
+		const annotated = appendPlanVerifiedNote(PLAN, false);
+
+		expect(annotated).toContain(PLAN);
+		expect(annotated).toContain(PLAN_VERIFIED_NOTE);
+		expect(annotated).toMatch(/no inaccuracies found/);
+		expect(annotated).not.toContain(PLAN_CORRECTION_MARKER);
+	});
+
+	it('points at the inline markers when the pass corrected something', () => {
+		const annotated = appendPlanVerifiedNote(PLAN, true);
+
+		expect(annotated).toContain(PLAN_VERIFIED_NOTE);
+		expect(annotated).toContain(PLAN_CORRECTION_MARKER);
+		expect(annotated).not.toMatch(/no inaccuracies found/);
+	});
+
+	it('trims the plan and separates the note with a blank line', () => {
+		expect(appendPlanVerifiedNote(`\n${PLAN}\n`, false)).toBe(
+			`${PLAN}\n\n_${PLAN_VERIFIED_NOTE} — no inaccuracies found._`,
+		);
+	});
+
+	it('never stacks a second note on an already-annotated plan', () => {
+		const once = appendPlanVerifiedNote(PLAN, false);
+
+		expect(appendPlanVerifiedNote(once, false)).toBe(once);
+		// Nor with the other wording: a re-run must not append a contradicting note.
+		expect(appendPlanVerifiedNote(once, true)).toBe(once);
 	});
 });

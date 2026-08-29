@@ -62,6 +62,10 @@ import {
 	evaluatePreplan,
 	isPreplanSkip,
 } from '@/pipeline/preplan.js';
+import {
+	appendPlanVerifiedNote,
+	PLAN_VERIFIED_NOTE,
+} from '@/pipeline/prompts/plan-verification.js';
 import { parseSplitTitle } from '@/pipeline/split-naming.js';
 import type { UpdateWorkItemPatch, WorkItem } from '@/pm/types.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
@@ -1624,7 +1628,7 @@ describe('runPlanningPhase', () => {
 			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
 
 			expect(deps.pm.addComment.mock.calls[0][1]).toContain('[plan-verify]');
-			expect(result.plan).toBe(CORRECTED_PLAN);
+			expect(result.plan).toBe(appendPlanVerifiedNote(CORRECTED_PLAN, true));
 			expect(result.verification).toEqual({ ran: true, corrected: true });
 		});
 
@@ -1652,9 +1656,88 @@ describe('runPlanningPhase', () => {
 
 			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
 
-			expect(result.plan).toBe(original);
+			expect(result.plan).toBe(appendPlanVerifiedNote(original, false));
 			expect(result.verification).toEqual({ ran: true, corrected: false });
 			expect(deps.pm.addComment.mock.calls[0][1]).toContain(original);
+		});
+
+		/**
+		 * Recording that the pass ran (issue #831). A clean pass corrects nothing, so
+		 * without this note a posted plan reads identically whether it was verified
+		 * and found accurate, never verified, or verified by a pass that failed.
+		 */
+		describe('fact-check note', () => {
+			it('states on the posted plan that a clean pass checked it', async () => {
+				const deps = makeDeps();
+				onVerification(deps);
+
+				await runPlanningPhase({ ...deps, verifyPlan: true });
+
+				const body = deps.pm.addComment.mock.calls[0][1];
+				expect(body).toContain(PLAN_VERIFIED_NOTE);
+				expect(body).toMatch(/no inaccuracies found/);
+				// The pass corrected nothing, so nothing is marked inline either.
+				expect(body).not.toContain('[plan-verify]');
+			});
+
+			it('keeps the inline correction markers and points at them', async () => {
+				const deps = makeDeps();
+				onVerification(deps, () => {
+					planContents = CORRECTED_PLAN;
+				});
+
+				await runPlanningPhase({ ...deps, verifyPlan: true });
+
+				const posted = deps.pm.addComment.mock.calls[0][1];
+				expect(posted).toContain('[plan-verify] the file is planning.ts');
+				expect(posted).toContain(PLAN_VERIFIED_NOTE);
+				expect(posted).not.toMatch(/no inaccuracies found/);
+			});
+
+			it("stamps every split child's preplan, corrected or not", async () => {
+				splitExists = true;
+				splitContents = splitFixture('# UI plan\n\n1. Build it.');
+				const deps = makeDeps();
+				onVerification(deps);
+
+				await runPlanningPhase({ ...deps, verifyPlan: true });
+
+				// Both the child's embedded (replayed) plan and the Preplan comment the
+				// operator actually reads come from the same annotated `subTasks[].plan`.
+				const embedded = deps.pm.updateWorkItem.mock.calls.find(
+					(call) => call[0] === 'PVTI_Second slice',
+				)?.[1].description;
+				expect(planFromMarker(embedded ?? '', 'Second slice')).toContain(PLAN_VERIFIED_NOTE);
+				const preplanComment = deps.pm.addComment.mock.calls.find(
+					(call) => call[0] === 'PVTI_Second slice',
+				)?.[1];
+				expect(preplanComment).toContain(PLAN_VERIFIED_NOTE);
+			});
+
+			it('leaves no note when the pass failed and the unverified plan was kept', async () => {
+				splitExists = true;
+				splitContents = splitFixture('# UI plan\n\n1. Build it.');
+				const deps = makeDeps();
+				onVerification(deps, () => {}, new Error('spawn ENOENT'));
+
+				const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+				expect(result.plan).not.toContain(PLAN_VERIFIED_NOTE);
+				expect(deps.pm.addComment.mock.calls[0][1]).not.toContain(PLAN_VERIFIED_NOTE);
+				expect(splitContents).not.toContain(PLAN_VERIFIED_NOTE);
+			});
+
+			it('leaves no note when verification was never asked for', async () => {
+				splitExists = true;
+				splitContents = splitFixture('# UI plan\n\n1. Build it.');
+				const deps = makeDeps();
+
+				const result = await runPlanningPhase(deps);
+
+				expect(result.plan).not.toContain(PLAN_VERIFIED_NOTE);
+				expect(deps.pm.addComment.mock.calls[0][1]).not.toContain(PLAN_VERIFIED_NOTE);
+				expect(splitContents).not.toContain(PLAN_VERIFIED_NOTE);
+			});
 		});
 
 		// Best-effort: the phase completes on the original plan whichever way the
@@ -1793,13 +1876,14 @@ describe('runPlanningPhase', () => {
 
 		it('keeps an unchanged verified plan normalized like the unverified path', async () => {
 			planContents = `\n${planContents}\n`;
+			const normalized = planContents.trim();
 			const deps = makeDeps();
 			onVerification(deps);
 
 			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
 
-			expect(result.plan).toBe(planContents.trim());
-			expect(deps.pm.addComment.mock.calls[0][1]).toContain(planContents.trim());
+			expect(result.plan).toBe(appendPlanVerifiedNote(normalized, false));
+			expect(deps.pm.addComment.mock.calls[0][1]).toContain(normalized);
 		});
 
 		it('runs no agent at all for a preplanned split child, even with verifyPlan on', async () => {

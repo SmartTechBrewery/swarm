@@ -19,8 +19,11 @@
  * the plan being written and anything being posted or applied to the board: it
  * fact-checks the plan's concrete claims against the repository and corrects
  * them in place, in `proposed_plan.md` and in every `subTasks[].plan` of
- * `proposed_split.json`. That pass is best-effort — a failure, timeout, or
- * throw is logged and Planning continues with the original, unverified plan.
+ * `proposed_split.json`, then notes on each of those plans that it ran — a
+ * clean pass corrects nothing, so the note is what makes it visible (issue
+ * #831). That pass is best-effort — a failure, timeout, or throw is logged and
+ * Planning continues with the original, unverified plan, which carries no such
+ * note.
  *
  * This is the phase's orchestration only. It composes the building blocks that
  * already exist — `GitWorktreeManager` (SWARM-14), `graftEnvironment` (SWARM-15),
@@ -56,7 +59,10 @@ import {
 	type PreplanContract,
 	SPLIT_CHILD_LABEL,
 } from '@/pipeline/preplan.js';
-import { buildPlanVerificationPrompt } from '@/pipeline/prompts/plan-verification.js';
+import {
+	appendPlanVerifiedNote,
+	buildPlanVerificationPrompt,
+} from '@/pipeline/prompts/plan-verification.js';
 import {
 	buildPlanningPrompt,
 	PROPOSED_PLAN_FILENAME,
@@ -1352,6 +1358,48 @@ function restorePlanningArtifacts(
 	}
 }
 
+/**
+ * Stamp every `subTasks[].plan` of {@link PROPOSED_SPLIT_FILENAME} with the note
+ * recording that the fact-check pass checked it (issue #831), so a split child's
+ * Preplan reads as verified even when nothing in it needed correcting.
+ *
+ * Written back to the worktree rather than returned, for the same reason the
+ * pass corrects those plans in place: the split is re-read from disk *inside*
+ * `verifyAndApplyPlanningResult`, so the children are built from the annotated
+ * bytes with no extra plumbing. The parsed JSON is mutated rather than a
+ * re-serialized `ProposedSplit`, so a field the schema does not model survives;
+ * the shape itself has already been validated by the caller.
+ *
+ * Best-effort like everything else in this pass: a failure here is logged and
+ * leaves the split exactly as the verifier wrote it, note or not.
+ */
+function annotateSplitPlans(
+	splitPath: string,
+	corrected: boolean,
+	taskId: string,
+	workItemId: string,
+): void {
+	if (!existsSync(splitPath)) return;
+	try {
+		const split = JSON.parse(readFileSync(splitPath, 'utf8')) as {
+			subTasks?: { plan?: unknown }[];
+		};
+		if (!Array.isArray(split.subTasks)) return;
+		for (const subTask of split.subTasks) {
+			if (typeof subTask?.plan === 'string') {
+				subTask.plan = appendPlanVerifiedNote(subTask.plan, corrected);
+			}
+		}
+		writeFileSync(splitPath, `${JSON.stringify(split, null, 2)}\n`);
+	} catch (error) {
+		logger.warn('Planning — failed to record the fact-check on the split-child plans', {
+			taskId,
+			workItemId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
 interface PlanVerificationOptions {
 	worktreePath: string;
 	cli: AgentCli;
@@ -1375,6 +1423,11 @@ interface PlanVerificationOptions {
  * — in `proposed_plan.md` and, when the run proposed a split, in every
  * `subTasks[].plan` of `proposed_split.json`, which is the only fact-check those
  * sibling plans will ever get (a split child's Planning run merely replays them).
+ *
+ * A completed pass also records itself on every plan it checked, whether or not
+ * it corrected anything ({@link appendPlanVerifiedNote}, issue #831): a clean
+ * pass corrects nothing by design, so the note is the only thing that tells a
+ * reader of the posted plan that it was fact-checked at all.
  *
  * Best-effort, following the swallow-and-log contract of the other post-plan
  * helpers here (`markSplitChildPlanned`, `linkBlockedBy`): a non-zero exit, a
@@ -1484,6 +1537,13 @@ async function runPlanVerification(
 		// allowed to end a *successful* run changed either, since the verifier is
 		// never allowed to touch it. Reverting it never counts as a correction.
 		restorePlanningArtifacts(scopeOnly, taskId, workItemId);
+		// Only now, once the run has really completed and its output survived
+		// validation, is the pass recorded on the plans it checked (issue #831) —
+		// after `corrected` is settled, so the note never counts as a correction of
+		// its own. Every rollback path above returns `ran: false` and leaves no note,
+		// which is what keeps "verified clean" distinguishable from "verification
+		// failed, unverified plan used" in the comment that gets posted.
+		annotateSplitPlans(splitPath, corrected, taskId, workItemId);
 		logger.info('Planning — plan verification finished', {
 			taskId,
 			workItemId,
@@ -1492,7 +1552,7 @@ async function runPlanVerification(
 		});
 		return {
 			verification: { ran: true, corrected },
-			plan: corrected ? verifiedPlan : plan,
+			plan: appendPlanVerifiedNote(corrected ? verifiedPlan : plan, corrected),
 		};
 	} catch (error) {
 		if (verificationAborted || signal?.aborted) throw error;
