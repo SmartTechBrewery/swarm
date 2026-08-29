@@ -26,20 +26,33 @@
  * reads it when the phase fails — so a missed push costs promptness, never
  * correctness.
  *
- * Best-effort still, but no longer unbounded (issue #827). A failed push alone is
- * ambiguous — the socket may have blipped and the worker may reconnect and report —
- * so that case keeps waiting out the phase's own agent timeout. A failed push to a
- * worker with **no active `worker_sessions` row** is strictly more information than
- * "haven't heard back yet": the phase cannot be executing there, and nothing was
- * ever going to settle the run. Such a run is settled after
- * `SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS` (default 1 minute) instead. Live repro
- * that prompted it: 2026-08-29, `rover` task 5's `planning` phase on worker
- * `jacek_tp_rover`, whose transport session had been released minutes before the
- * Terminate — the marker and origin were recorded, the push failed, and the run row
- * stayed `running` until it was settled by hand in Postgres.
+ * Best-effort still, but no longer unbounded (issue #827). A failed push on its own
+ * is ambiguous — the socket may merely have blipped — so that case keeps waiting out
+ * the phase's own agent timeout. The absence of a live `worker_sessions` row does
+ * *not* disambiguate it: this control plane releases a worker's session on **every**
+ * `/worker/stream` close (`./worker-transport.ts`), while a phase runs independently
+ * of the heartbeat loop and so routinely outlives the session it was pushed on
+ * (`../transport/worker-client.ts`, issue #718). What does carry information is
+ * **silence**: the retained session row survives release, and its `lastHeartbeatAt`
+ * is the worker's *last seen*. A daemon that is up heartbeats every third of the
+ * TTL and climbs a reconnect ladder capped at a jittered 30s, so a worker that has
+ * said nothing for longer than {@link offlineSilenceMs} is one nothing was going to
+ * settle this run for, and it is settled `SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS`
+ * later instead. That remains a **heuristic about liveness, not proof the phase
+ * stopped** — which is why the same test is re-run when the timer fires, and why a
+ * worker that comes back inside the wait is handed the cancellation (issue #724's
+ * path) rather than settled behind its back. Live repro that prompted it:
+ * 2026-08-29, `rover` task 5's `planning` phase on worker `jacek_tp_rover`, whose
+ * transport session had been released minutes before the Terminate — the marker and
+ * origin were recorded, the push failed, and the run row stayed `running` until it
+ * was settled by hand in Postgres.
  */
 
-import { getLiveSessionForWorker } from '../identity/worker-session-service.js';
+import {
+	getLiveSessionForWorker,
+	getRetainedSessionForWorker,
+	resolveHeartbeatTtlMs,
+} from '../identity/worker-session-service.js';
 import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -60,11 +73,12 @@ import { sendToWorker } from './worker-connections.js';
 const CANCEL_FRAME_REASON = 'a cancellation was requested for this run';
 
 /**
- * Default wait before a terminated run whose worker holds no live session at all is
- * settled here rather than at the phase's own agent timeout (issue #827). A minute
- * is long enough for a worker that is merely mid-reconnect to re-handshake — which
- * ends the wait through the superseded-claim reap instead — and short enough that a
- * run nothing can possibly report on does not sit `running` for tens of minutes.
+ * Default wait before a terminated run whose worker has gone silent is settled here
+ * rather than at the phase's own agent timeout (issue #827). A minute is long enough
+ * for a worker that is merely mid-reconnect to re-handshake — which is re-checked
+ * when the timer fires, so it takes the cancellation instead of the settle — and
+ * short enough that a run nothing is going to report on does not sit `running` for
+ * tens of minutes.
  */
 export const DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS = 60_000;
 
@@ -88,8 +102,53 @@ export function resolveOfflineWorkerCancelTimeoutMs(
 const OFFLINE_WORKER_CANCEL_TIMEOUT_MS = resolveOfflineWorkerCancelTimeoutMs();
 
 /**
- * Bound the wait for a termination that could not be pushed, but only once the
- * worker is *confirmed* to hold no live session (issue #827).
+ * Floor on how long a worker must have been silent before its missing live session
+ * reads as *gone* rather than as a socket that simply closed. A daemon that is up
+ * heartbeats every `heartbeatTtlMs / 3` (`heartbeatCadenceMs`) and, if its socket
+ * drops, reconnects on a ladder capped at a jittered 30s
+ * (`DEFAULT_BACKOFF.maxMs`) — both in `../transport/worker-client.ts`. Two minutes
+ * clears the wider of those by 4x, so an ordinary blip never qualifies.
+ */
+const OFFLINE_SILENCE_FLOOR_MS = 120_000;
+
+/**
+ * The silence that makes a worker *probably gone*: twice the configured heartbeat
+ * TTL — the window `getLiveSessionForWorker` itself measures liveness over — but
+ * never below {@link OFFLINE_SILENCE_FLOOR_MS}, so shortening the TTL cannot shrink
+ * this below the reconnect ladder and start settling live phases.
+ */
+function offlineSilenceMs(heartbeatTtlMs: number): number {
+	return Math.max(2 * heartbeatTtlMs, OFFLINE_SILENCE_FLOOR_MS);
+}
+
+/**
+ * Whether the worker has been silent long enough that nothing is going to report
+ * this dispatch's result (issue #827).
+ *
+ * Deliberately *not* "has no live session": `releaseSession` runs on every
+ * `/worker/stream` close (`./worker-transport.ts`), so `getLiveSessionForWorker`
+ * answers `undefined` the instant a socket drops — for a worker whose phase is
+ * still executing just as much as for a dead one. The retained row is what
+ * distinguishes them: it survives release precisely so `lastHeartbeatAt` can be
+ * read as *last seen* (`getRetainedSessionForWorker`), and only a worker silent
+ * past {@link offlineSilenceMs} qualifies. A worker that never handshook here at
+ * all has no silence to measure and never qualifies either.
+ *
+ * This is a liveness heuristic, not proof the phase stopped — so it is re-run
+ * before anything is settled, and it fails *safe*: an unreadable row throws to the
+ * caller, which leaves the wait to the lease window exactly as before.
+ */
+async function isWorkerConfirmedSilent(workerId: string): Promise<boolean> {
+	const ttlMs = resolveHeartbeatTtlMs();
+	if (await getLiveSessionForWorker(workerId, ttlMs)) return false;
+	const retained = await getRetainedSessionForWorker(workerId);
+	if (!retained) return false;
+	return Date.now() - retained.lastHeartbeatAt.getTime() >= offlineSilenceMs(ttlMs);
+}
+
+/**
+ * Bound the wait for a termination that could not be pushed, but only for a worker
+ * that has gone silent (issue #827).
  *
  * The settle rides the seam this router already owns for a wait whose outcome can
  * no longer arrive (`failDispatchResultWait`, issue #719): the synthetic terminal
@@ -99,34 +158,30 @@ const OFFLINE_WORKER_CANCEL_TIMEOUT_MS = resolveOfflineWorkerCancelTimeoutMs();
  * `user-terminated` diagnosis — releasing the parked BullMQ job and every capacity
  * the dispatch holds along with the rows. No new settle path and no new policy.
  *
- * The timer needs neither cancelling nor a re-check. A real result arriving first
- * consumes the registration, so the late timer finds nothing and is a silent no-op;
- * a worker that reconnects inside the minute must re-acquire its session, which
- * bumps the fencing token and ends the wait through the handshake's own superseded-
- * claim reap. (The one path left — the same dispatch record being re-pushed inside
- * the minute — is only reachable for a run the user has already terminated, whose
- * fresh push `pushAndAwaitResult`'s post-push marker read cancels anyway.)
+ * The timer is never cancelled; {@link settleIfStillSilent} decides on the facts as
+ * they stand when it fires instead.
  */
-async function settleWhenWorkerHoldsNoSession(
+async function settleWhenWorkerStaysSilent(
 	runId: string,
 	target: RunDispatchTarget,
 ): Promise<void> {
-	let live: unknown;
+	let silent: boolean;
 	try {
-		live = await getLiveSessionForWorker(target.workerId);
+		silent = await isWorkerConfirmedSilent(target.workerId);
 	} catch (err) {
-		// Fail safe into today's behaviour: an unreadable session is not proof of
-		// absence, and the lease/agent-timeout window is still the backstop.
+		// Fail safe into today's behaviour: an unreadable session is not evidence of
+		// anything, and the lease/agent-timeout window is still the backstop.
 		logger.warn(
 			'run cancellation: could not read the worker session — leaving the wait to the lease window',
 			{ runId, workerId: target.workerId, error: describeError(err) },
 		);
 		return;
 	}
-	if (live) {
-		// The push missed a worker that is still leased — it may reconnect and report,
-		// and only it knows whether the phase is still executing there. Unchanged.
-		logger.debug('run cancellation: the worker still holds a live session — leaving the wait', {
+	if (!silent) {
+		// The push missed a worker that is still heartbeating (or was, moments ago): it
+		// may reconnect and report, and only it knows whether the phase is still
+		// executing there. Unchanged.
+		logger.debug('run cancellation: the worker is not silent — leaving the wait', {
 			runId,
 			dispatchId: target.dispatchId,
 			workerId: target.workerId,
@@ -134,7 +189,7 @@ async function settleWhenWorkerHoldsNoSession(
 		return;
 	}
 	logger.warn(
-		'run cancellation: the worker holds no live session — settling the run if it does not report',
+		'run cancellation: the worker has gone silent — settling the run if it stays that way',
 		{
 			runId,
 			dispatchId: target.dispatchId,
@@ -143,19 +198,63 @@ async function settleWhenWorkerHoldsNoSession(
 		},
 	);
 	const timer = setTimeout(() => {
-		// `RUN_CANCELLED_MESSAGE` verbatim: this *is* the user's termination, so the run
-		// records the same neutral terminal message every other cancellation does
-		// (issue #305). Why it settled early is a log line, not the run's message.
-		if (failDispatchResultWait(target.dispatchId, RUN_CANCELLED_MESSAGE, { cancelled: true })) {
-			logger.warn('run cancellation: settled a terminated run whose worker never reported', {
-				runId,
-				dispatchId: target.dispatchId,
-				workerId: target.workerId,
-			});
-		}
+		void settleIfStillSilent(runId, target);
 	}, OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
 	// A pending wait must never hold the process open at shutdown.
 	timer.unref();
+}
+
+/**
+ * The armed wait, firing. Re-runs the whole test rather than trusting the one taken
+ * a minute ago — the wait was armed on a *heuristic*, and the two things that can
+ * have changed since are exactly the two that must not be settled through.
+ *
+ * A worker that came back is handed the cancellation instead: it is the only party
+ * that knows whether the phase is still executing there, and since issue #724 it
+ * answers either way — aborting the assignment, or re-reporting the real terminal
+ * result it held (issue #718). And because `scheduleDispatchRetry` reuses a dispatch
+ * id across attempts, the settle is gated on the run still resolving to *this*
+ * registration, so a later attempt's waiter can never be ended by an older wait.
+ */
+async function settleIfStillSilent(runId: string, target: RunDispatchTarget): Promise<void> {
+	let silent: boolean;
+	try {
+		silent = await isWorkerConfirmedSilent(target.workerId);
+	} catch (err) {
+		logger.warn(
+			'run cancellation: could not re-read the worker session — leaving the wait to the lease window',
+			{ runId, workerId: target.workerId, error: describeError(err) },
+		);
+		return;
+	}
+	if (!silent) {
+		logger.info('run cancellation: the worker returned inside the wait — re-pushing the cancel', {
+			runId,
+			dispatchId: target.dispatchId,
+			workerId: target.workerId,
+		});
+		cancelRunOnWorker(runId);
+		return;
+	}
+	const current = resolveDispatchTargetForRun(runId);
+	if (current?.dispatchId !== target.dispatchId) {
+		logger.info('run cancellation: the wait this bounded is gone — nothing to settle', {
+			runId,
+			dispatchId: target.dispatchId,
+			workerId: target.workerId,
+		});
+		return;
+	}
+	// `RUN_CANCELLED_MESSAGE` verbatim: this *is* the user's termination, so the run
+	// records the same neutral terminal message every other cancellation does
+	// (issue #305). Why it settled early is a log line, not the run's message.
+	if (failDispatchResultWait(target.dispatchId, RUN_CANCELLED_MESSAGE, { cancelled: true })) {
+		logger.warn('run cancellation: settled a terminated run whose worker never reported', {
+			runId,
+			dispatchId: target.dispatchId,
+			workerId: target.workerId,
+		});
+	}
 }
 
 /**
@@ -163,7 +262,7 @@ async function settleWhenWorkerHoldsNoSession(
  * Returns whether a frame was actually sent; `false` covers both "not executing
  * here" and "its socket dropped", neither of which is an error — the dispatch is
  * then settled by the durable state as it would have been before this existed, or,
- * when the worker is confirmed session-less, by the bounded wait above.
+ * when the worker is confirmed silent, by the bounded wait above.
  */
 export function cancelRunOnWorker(runId: string): boolean {
 	const target = resolveDispatchTargetForRun(runId);
@@ -191,7 +290,7 @@ export function cancelRunOnWorker(runId: string): boolean {
 			workerId: target.workerId,
 		});
 		// Fired and forgotten so this stays synchronous for the Redis subscriber below.
-		void settleWhenWorkerHoldsNoSession(runId, target);
+		void settleWhenWorkerStaysSilent(runId, target);
 		return false;
 	}
 	logger.info('run cancellation: pushed task-cancel to the executing worker', {

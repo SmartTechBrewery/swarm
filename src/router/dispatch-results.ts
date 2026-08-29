@@ -20,9 +20,10 @@
  * each one has to end with them (`failDispatchResultWait`) — otherwise the rows are
  * settled while the capacity they occupy stays held for the rest of the window.
  * The second such loss (issue #827) ends through the same seam: a user termination
- * the router could not push because the worker holds no live session at all, which
- * the same function settles as a *cancellation* rather than a plain failure
- * (`./dispatch-cancellation.ts`). What *is* its concern since issue #723 is the transport
+ * the router could not push to a worker that has since gone silent, which the same
+ * function settles as a *cancellation* rather than a plain failure — on that
+ * module's own liveness heuristic and its own re-check (`./dispatch-cancellation.ts`),
+ * not on anything decided here. What *is* its concern since issue #723 is the transport
  * interruption itself: being the one place that knows who is awaiting a given
  * worker, it records a dropped `/worker/stream` against those dispatches, so an
  * undelivered result can be attributed to the drop rather than to a silent worker.
@@ -268,8 +269,9 @@ export function deliverDispatchResult(result: TaskExecutionResult): boolean {
  * synthetic terminal result is indistinguishable in shape from a real one.
  *
  * `cancelled: true` is the *other* reason a wait ends early (issue #827): a user
- * termination this router could not deliver because the worker holds no live
- * session at all, so the phase provably cannot still be executing there. That frame
+ * termination this router could not deliver to a worker that then stayed silent
+ * past its heartbeat and reconnect windows, so nothing was going to report this
+ * dispatch. That frame
  * routes to a `RunTerminatedError` rather than the non-deferrable `AgentRunError`
  * the superseded case maps to, which is what makes the run settle as the user's
  * termination — same columns, same origin — instead of as a plain failure.

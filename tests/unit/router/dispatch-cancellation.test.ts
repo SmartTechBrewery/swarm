@@ -22,24 +22,53 @@ vi.mock('@/queue/cancellation.js', () => ({
 	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
 }));
 
-// The other half of the offline check (issue #827) is a Postgres read; mock it so
-// "does this worker hold a live session at all" is drivable from the test.
-const { getLiveSessionForWorker } = vi.hoisted(() => ({
+// The other half of the silence check (issue #827) is two Postgres reads; mock them
+// so "is this worker live, and if not how long has it been quiet?" is drivable from
+// the test. Both matter: a released session alone is what an ordinary socket close
+// looks like, so only the retained row's `lastHeartbeatAt` decides.
+const { getLiveSessionForWorker, getRetainedSessionForWorker } = vi.hoisted(() => ({
 	getLiveSessionForWorker: vi.fn<(workerId: string) => Promise<unknown>>(),
+	getRetainedSessionForWorker: vi.fn<(workerId: string) => Promise<unknown>>(),
 }));
-vi.mock('@/identity/worker-session-service.js', () => ({ getLiveSessionForWorker }));
+vi.mock('@/identity/worker-session-service.js', () => ({
+	getLiveSessionForWorker,
+	getRetainedSessionForWorker,
+	resolveHeartbeatTtlMs: () => HEARTBEAT_TTL_MS,
+}));
 
 /** The neutral message the settled run records — the same string the mock exports. */
 const RUN_CANCELLED_MESSAGE = 'Run cancelled after a cancellation request.';
 
+/** The TTL the mocked service reports, matching `DEFAULT_WORKER_HEARTBEAT_TTL_MS`. */
+const HEARTBEAT_TTL_MS = 60_000;
+
+/**
+ * The silence the module requires before it treats a missing live session as a gone
+ * worker: `max(2 × ttl, 2m)`. Kept here as the literal the production constant
+ * resolves to, so a change to either is caught rather than tracked.
+ */
+const OFFLINE_SILENCE_MS = 120_000;
+
 /** Stand-in for a `worker_sessions` row that is still live. */
 const LIVE_SESSION = { id: 'session-1', workerId: 'w', fencingToken: 7 };
+
+/** A retained (released or expired) row whose last heartbeat was `agoMs` ago. */
+function retainedSession(agoMs: number): Record<string, unknown> {
+	return { ...LIVE_SESSION, lastHeartbeatAt: new Date(Date.now() - agoMs) };
+}
+
+/** The worker is gone: no live session, and silent well past the offline margin. */
+function workerHasGoneSilent(): void {
+	getLiveSessionForWorker.mockResolvedValue(undefined);
+	getRetainedSessionForWorker.mockResolvedValue(retainedSession(OFFLINE_SILENCE_MS * 2));
+}
 
 /** WebSocket `readyState`: OPEN. */
 const OPEN = 1;
 
 const DISPATCH_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const RUN_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const OTHER_RUN_ID = 'dddddddd-dddd-4ddd-8ddd-ddddddddddde';
 const WORKER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const OTHER_WORKER_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
@@ -77,6 +106,7 @@ describe('cancelRunOnWorker', () => {
 		vi.clearAllMocks();
 		// Default to a still-leased worker, which is the unchanged best-effort path.
 		getLiveSessionForWorker.mockResolvedValue(LIVE_SESSION);
+		getRetainedSessionForWorker.mockResolvedValue(retainedSession(0));
 	});
 	afterEach(() => vi.useRealTimers());
 
@@ -152,17 +182,18 @@ describe('cancelRunOnWorker', () => {
 		awaiting.dispose();
 	});
 
-	it('settles a terminated run whose worker holds no live session (issue #827)', async () => {
+	it('settles a terminated run whose worker has gone silent (issue #827)', async () => {
 		vi.useFakeTimers();
-		// No socket registered *and* no `worker_sessions` row: the phase cannot be
-		// executing anywhere, so waiting out the phase's agent timeout settles nothing.
-		getLiveSessionForWorker.mockResolvedValue(undefined);
+		// No socket registered, no live session, and nothing heard from the worker for
+		// far longer than its heartbeat and reconnect windows: nothing was going to
+		// report this dispatch, so waiting out the phase's agent timeout settles nothing.
+		workerHasGoneSilent();
 		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
 		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
 
-		expect(getLiveSessionForWorker).toHaveBeenCalledWith(WORKER_ID);
+		expect(getLiveSessionForWorker).toHaveBeenCalledWith(WORKER_ID, HEARTBEAT_TTL_MS);
 		// `cancelled: true` is what routes this to `RunTerminatedError` and so to the
 		// same settle a worker-reported cancellation gets; the phase and task come from
 		// the registration, as every synthetic terminal frame's do (issue #724).
@@ -194,9 +225,88 @@ describe('cancelRunOnWorker', () => {
 		awaiting.dispose();
 	});
 
+	it('leaves the wait alone for a session released seconds ago (issue #827 review)', async () => {
+		vi.useFakeTimers();
+		// The router releases a worker's session on *every* `/worker/stream` close, so a
+		// missing live session is exactly what an ordinary blip looks like — and since
+		// issue #718 the phase routinely outlives the session it was pushed on. Only the
+		// retained row's silence decides, and seconds of it is not silence.
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getRetainedSessionForWorker.mockResolvedValue(retainedSession(OFFLINE_SILENCE_MS - 1_000));
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS * 5);
+
+		expect(await stillPending(awaiting.result)).toBe(true);
+
+		awaiting.dispose();
+	});
+
+	it('leaves the wait alone for a worker that never handshook here', async () => {
+		vi.useFakeTimers();
+		// No retained row at all: there is no "last seen" to measure silence against, so
+		// this stays the lease window's case rather than becoming evidence of anything.
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getRetainedSessionForWorker.mockResolvedValue(undefined);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS * 5);
+
+		expect(await stillPending(awaiting.result)).toBe(true);
+
+		awaiting.dispose();
+	});
+
+	it('re-pushes rather than settling when the worker returns inside the wait', async () => {
+		vi.useFakeTimers();
+		workerHasGoneSilent();
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		// The arming check is two awaited reads behind the synchronous push; let it land
+		// before the world changes under it, or the wait is never armed at all.
+		await vi.advanceTimersByTimeAsync(0);
+
+		// The worker comes back mid-wait: it re-handshakes and its socket re-registers.
+		// It is the only party that knows whether the phase is still executing there, so
+		// the cancel is handed back to it (issue #724) instead of settled behind its back.
+		const ws = fakeWs();
+		registerConnection(WORKER_ID, ws);
+		getLiveSessionForWorker.mockResolvedValue(LIVE_SESSION);
+		getRetainedSessionForWorker.mockResolvedValue(retainedSession(0));
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
+
+		expect(framesOn(ws)).toMatchObject([{ type: 'task-cancel', dispatchId: DISPATCH_ID }]);
+		expect(await stillPending(awaiting.result)).toBe(true);
+
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, ws);
+	});
+
+	it('never settles a dispatch re-registered for another run', async () => {
+		vi.useFakeTimers();
+		workerHasGoneSilent();
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
+		await vi.advanceTimersByTimeAsync(0);
+		// `scheduleDispatchRetry` reuses a dispatch id across attempts, so the same id can
+		// be awaited for a different run before the timer fires. That later waiter is not
+		// what this wait bounded.
+		const later = awaitDispatchResult(DISPATCH_ID, { ...REGISTRATION, runId: OTHER_RUN_ID });
+		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
+
+		expect(await stillPending(later.result)).toBe(true);
+
+		later.dispose();
+		awaiting.dispose();
+	});
+
 	it('leaves the wait alone when the worker session cannot be read', async () => {
 		vi.useFakeTimers();
-		// Fail safe: an unreadable session is not proof of absence.
+		// Fail safe: an unreadable session is not evidence of anything.
 		getLiveSessionForWorker.mockRejectedValue(new Error('connection terminated'));
 		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
@@ -235,7 +345,7 @@ describe('cancelRunOnWorker', () => {
 
 	it('lets a real result win, leaving the late timer a no-op', async () => {
 		vi.useFakeTimers();
-		getLiveSessionForWorker.mockResolvedValue(undefined);
+		workerHasGoneSilent();
 		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
