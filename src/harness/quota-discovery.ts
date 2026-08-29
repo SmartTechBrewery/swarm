@@ -475,7 +475,7 @@ export async function queryClaudeQuota(command = 'claude'): Promise<Partial<CliQ
 }
 
 /** What {@link getFallbackRateLimitInfo} recovered for a CLI, if anything. */
-type FallbackRateLimitInfo = Awaited<ReturnType<typeof getFallbackRateLimitInfo>>;
+export type FallbackRateLimitInfo = Awaited<ReturnType<typeof getFallbackRateLimitInfo>>;
 
 /**
  * Today's snapshot for an installed CLI with no live quota read: the only signal
@@ -523,10 +523,28 @@ function queryLiveQuota(
 	return Promise.resolve(undefined);
 }
 
+/** What a caller may substitute for one of discovery's collaborators. */
+export interface QuotaDiscoveryOptions {
+	/**
+	 * The run-derived exhaustion hint for a CLI, defaulting to
+	 * {@link getFallbackRateLimitInfo}.
+	 *
+	 * Injectable because that default reads `runs.next_retry_at` from Postgres and
+	 * the one caller that probes a *worker's* own machine holds no `DATABASE_URL`
+	 * (`../transport/quota-reporting.ts`, issue #825). It passes a resolver that
+	 * answers `null`, so discovery runs DB-free and reports live/absent only.
+	 */
+	fallbackRateLimitInfo?: (cli: AgentCli) => Promise<FallbackRateLimitInfo>;
+}
+
 /**
  * Discover CLI capabilities and build quota snapshots for all known agent CLIs.
  */
-export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot[]> {
+export async function discoverCliQuotas(
+	cheap = false,
+	options: QuotaDiscoveryOptions = {},
+): Promise<CliQuotaSnapshot[]> {
+	const fallbackRateLimitInfo = options.fallbackRateLimitInfo ?? getFallbackRateLimitInfo;
 	const clis: AgentCli[] = ['claude', 'antigravity', 'codex'];
 	const snapshots: CliQuotaSnapshot[] = [];
 	const now = new Date().toISOString();
@@ -547,7 +565,7 @@ export async function discoverCliQuotas(cheap = false): Promise<CliQuotaSnapshot
 		}
 
 		// Fallback signal from runs table
-		const fallbackInfo = await getFallbackRateLimitInfo(cli);
+		const fallbackInfo = await fallbackRateLimitInfo(cli);
 
 		// `cheap` keeps every live probe out of a hot path; a binary that doesn't
 		// support the live path it has yields `undefined` and drops through to the

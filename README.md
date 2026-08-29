@@ -104,8 +104,8 @@ local worker exactly like anyone else.
 
 **Operated from a dashboard**, not a log file: run history and per-run detail
 with failure diagnosis, project and board mapping, per-provider credential
-entry, worker registration/enrollment/approval, and live CLI quota for each
-agent CLI.
+entry, worker registration/enrollment/approval, and each of your own workers'
+live CLI quota for every agent CLI on that machine.
 
 ## The six phases
 

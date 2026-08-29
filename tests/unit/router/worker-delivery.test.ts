@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
+import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
@@ -19,6 +20,7 @@ import {
 	handleMoveWorkItem,
 	handlePostComment,
 	handlePriorReview,
+	handleReportCliQuota,
 	handleScheduleFollowUpReview,
 	handleSubmitReview,
 	handleUpdateWorkItem,
@@ -115,6 +117,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		buildPmProvider: vi.fn(() => makePmProvider()),
 		reviewLedger: makeReviewLedger(),
 		scheduleFollowUpReview: vi.fn().mockResolvedValue(undefined),
+		persistCliQuota: vi.fn().mockResolvedValue(undefined),
 		...overrides,
 	};
 }
@@ -1477,5 +1480,111 @@ describe('handleScheduleFollowUpReview', () => {
 			).status,
 		).toBe(400);
 		expect(deps.scheduleFollowUpReview).not.toHaveBeenCalled();
+	});
+});
+
+describe('handleReportCliQuota', () => {
+	function snapshot(overrides: Partial<CliQuotaSnapshot> = {}): CliQuotaSnapshot {
+		return {
+			cli: 'claude',
+			status: 'available',
+			source: 'live',
+			remainingPercentage: 66,
+			lastUpdated: '2026-08-29T09:00:00.000Z',
+			...overrides,
+		};
+	}
+
+	function quotaBody(overrides: Record<string, unknown> = {}) {
+		return {
+			snapshots: [snapshot()],
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('persists one row per snapshot under the authenticated worker', async () => {
+		const deps = makeDeps();
+		const snapshots = [snapshot(), snapshot({ cli: 'codex', status: 'unavailable' })];
+
+		const result = await handleReportCliQuota(deps, CREDENTIAL, quotaBody({ snapshots }));
+
+		expect(result).toEqual({ status: 200, json: { stored: 2 } });
+		expect(deps.persistCliQuota).toHaveBeenCalledTimes(2);
+		expect(deps.persistCliQuota).toHaveBeenNthCalledWith(
+			1,
+			WORKER_ID,
+			'claude',
+			'available',
+			snapshots[0],
+		);
+		expect(deps.persistCliQuota).toHaveBeenNthCalledWith(
+			2,
+			WORKER_ID,
+			'codex',
+			'unavailable',
+			snapshots[1],
+		);
+	});
+
+	it('keys every row on the credential rather than on any worker the body names', async () => {
+		const deps = makeDeps();
+
+		// The frame carries no worker id at all, so one smuggled in is dropped by the
+		// schema — and the row is still written under the authenticated worker.
+		await handleReportCliQuota(
+			deps,
+			CREDENTIAL,
+			quotaBody({ workerId: '99999999-9999-4999-8999-999999999999' }),
+		);
+
+		expect(deps.persistCliQuota).toHaveBeenCalledWith(
+			WORKER_ID,
+			'claude',
+			'available',
+			expect.anything(),
+		);
+	});
+
+	it('is 401 and persists nothing for an unknown credential', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+
+		const result = await handleReportCliQuota(deps, 'bogus', quotaBody());
+
+		expect(result).toEqual({ status: 401, json: { authenticated: false } });
+		expect(deps.persistCliQuota).not.toHaveBeenCalled();
+	});
+
+	it('needs no project enrollment — an allowance describes a machine', async () => {
+		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+
+		expect((await handleReportCliQuota(deps, CREDENTIAL, quotaBody())).status).toBe(200);
+		expect(deps.isWorkerEnrolled).not.toHaveBeenCalled();
+		expect(deps.persistCliQuota).toHaveBeenCalledTimes(1);
+	});
+
+	it('returns 400 for a malformed body or a protocol mismatch', async () => {
+		const deps = makeDeps();
+
+		expect((await handleReportCliQuota(deps, CREDENTIAL, { snapshots: 'nope' })).status).toBe(400);
+		expect(
+			(
+				await handleReportCliQuota(
+					deps,
+					CREDENTIAL,
+					quotaBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.persistCliQuota).not.toHaveBeenCalled();
+	});
+
+	it('accepts an empty report as a successful no-op', async () => {
+		const deps = makeDeps();
+
+		const result = await handleReportCliQuota(deps, CREDENTIAL, quotaBody({ snapshots: [] }));
+
+		expect(result).toEqual({ status: 200, json: { stored: 0 } });
+		expect(deps.persistCliQuota).not.toHaveBeenCalled();
 	});
 });
