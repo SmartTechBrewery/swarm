@@ -14,9 +14,24 @@ function fsFor(path: unknown): { exists: boolean; contents: string } {
 	if (p.endsWith('proposed_scope.json')) return { exists: scopeExists, contents: scopeContents };
 	return { exists: planExists, contents: planContents };
 }
+/** Writes go back through the same keying, so the verification pass (issue #818) can edit in place. */
+function setFsFor(path: unknown, contents: string): void {
+	const p = String(path);
+	if (p.endsWith('proposed_split.json')) {
+		splitExists = true;
+		splitContents = contents;
+	} else if (p.endsWith('proposed_scope.json')) {
+		scopeExists = true;
+		scopeContents = contents;
+	} else {
+		planExists = true;
+		planContents = contents;
+	}
+}
 vi.mock('node:fs', () => ({
 	existsSync: (path: unknown) => fsFor(path).exists,
 	readFileSync: (path: unknown) => fsFor(path).contents,
+	writeFileSync: (path: unknown, data: unknown) => setFsFor(path, String(data)),
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
@@ -1534,6 +1549,189 @@ describe('runPlanningPhase', () => {
 
 			expect(deps.pm.findWorkItemByDescriptionMarker).not.toHaveBeenCalled();
 			expect(board.items[0]?.description).not.toContain('swarm-split-child:');
+		});
+	});
+
+	/**
+	 * The opt-in autonomous fact-check pass (`verifyPlan`, issue #818): a second
+	 * `runAgent` call in the same read-only worktree, made after the plan is read
+	 * and before anything is posted or applied to the board.
+	 */
+	describe('plan verification', () => {
+		/**
+		 * Make the verification run (the second `runAgent` call) behave like a real
+		 * verifier: `edit` mutates the on-disk artifacts in place, then the run
+		 * settles as `outcome` — an `AgentCliResult` to resolve, or an `Error` to throw.
+		 */
+		function onVerification(
+			deps: ReturnType<typeof makeDeps>,
+			edit: () => void = () => {},
+			outcome: AgentCliResult | Error = agentResult(),
+		): void {
+			deps.runAgent.mockImplementation(async (opts) => {
+				if (opts.logContext?.step !== 'verify-plan') return agentResult();
+				edit();
+				if (outcome instanceof Error) throw outcome;
+				return outcome;
+			});
+		}
+
+		const CORRECTED_PLAN =
+			'## Scope gate\n- Why this is one task: cohesive change\n- Affected areas / files: planning.ts\n- Explicitly out of scope: none\n\n# Plan\n\n1. Do the thing in `src/pipeline/planning.ts` _([plan-verify] the file is planning.ts)_.';
+
+		const splitFixture = (plan: string) =>
+			JSON.stringify({
+				sharedName: SHARED_NAME,
+				mainTask: { title: 'First slice', description: 'Just the API' },
+				subTasks: [{ title: 'Second slice', description: 'The UI', plan }],
+			});
+
+		it('is off by default: one agent run, and no verification is reported', async () => {
+			const deps = makeDeps();
+			const result = await runPlanningPhase(deps);
+
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+			expect(result.verification).toBeUndefined();
+		});
+
+		it('runs a second, session-less agent in the same worktree when verifyPlan is on', async () => {
+			const deps = makeDeps();
+			await runPlanningPhase({ ...deps, verifyPlan: true, sessionId: 'sess-1' });
+
+			expect(deps.runAgent).toHaveBeenCalledTimes(2);
+			const verifyArgs = deps.runAgent.mock.calls[1][0];
+			expect(verifyArgs.cwd).toBe(WORKTREE_PATH);
+			expect(verifyArgs.args?.[0]).toContain(PROPOSED_PLAN_FILENAME);
+			expect(verifyArgs.args?.[0]).toMatch(/fact-check/i);
+			// A fresh process with no memory of how the plan was authored.
+			expect(verifyArgs.sessionId).toBeUndefined();
+			expect(verifyArgs.resumeSessionId).toBeUndefined();
+		});
+
+		it('posts the corrected plan, not the original', async () => {
+			const deps = makeDeps();
+			onVerification(deps, () => {
+				planContents = CORRECTED_PLAN;
+			});
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(deps.pm.addComment.mock.calls[0][1]).toContain('[plan-verify]');
+			expect(result.plan).toBe(CORRECTED_PLAN);
+			expect(result.verification).toEqual({ ran: true, corrected: true });
+		});
+
+		it('gives split children the corrected sibling plan', async () => {
+			splitExists = true;
+			splitContents = splitFixture('# UI plan\n\n1. Edit `src/wrong.ts`.');
+			const deps = makeDeps();
+			onVerification(deps, () => {
+				splitContents = splitFixture('# UI plan\n\n1. Edit `src/right.ts` _([plan-verify] path)_.');
+			});
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			const embedded = deps.pm.updateWorkItem.mock.calls.find(
+				(call) => call[0] === 'PVTI_Second slice',
+			)?.[1].description;
+			expect(planFromMarker(embedded ?? '', 'Second slice')).toContain('src/right.ts');
+			expect(result.verification).toEqual({ ran: true, corrected: true });
+		});
+
+		it('reports no correction when the verifier changed nothing', async () => {
+			const deps = makeDeps();
+			onVerification(deps);
+			const original = planContents;
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(result.plan).toBe(original);
+			expect(result.verification).toEqual({ ran: true, corrected: false });
+			expect(deps.pm.addComment.mock.calls[0][1]).toContain(original);
+		});
+
+		// Best-effort: the phase completes on the original plan whichever way the
+		// verification run fails.
+		const failures: [string, AgentCliResult | Error][] = [
+			['a non-zero exit', agentResult({ exitCode: 1 })],
+			['a timeout', agentResult({ exitCode: null, timedOut: true })],
+			['a throw', new Error('spawn ENOENT')],
+		];
+		for (const [label, outcome] of failures) {
+			it(`does not fail Planning on ${label}`, async () => {
+				const deps = makeDeps();
+				const original = planContents;
+				onVerification(deps, () => {}, outcome);
+
+				const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+				expect(result.plan).toBe(original);
+				expect(result.verification).toEqual({ ran: false, corrected: false });
+				expect(deps.pm.addComment).toHaveBeenCalledTimes(1);
+				expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', 'planned');
+			});
+		}
+
+		it('restores a half-written split file left behind by a failed verifier', async () => {
+			splitExists = true;
+			splitContents = splitFixture('# UI plan\n\n1. Build it.');
+			const deps = makeDeps();
+			// A killed verifier can leave malformed JSON behind; `readProposedSplit`
+			// would throw on it and fail an otherwise-complete Planning run.
+			onVerification(
+				deps,
+				() => {
+					splitContents = '{"subTasks": [';
+				},
+				new Error('killed'),
+			);
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(result.verification).toEqual({ ran: false, corrected: false });
+			// The restored split still applies — the original plan, unverified.
+			expect(deps.pm.createWorkItem).toHaveBeenCalledTimes(1);
+			expect(
+				planFromMarker(
+					deps.pm.updateWorkItem.mock.calls.find((call) => call[0] === 'PVTI_Second slice')?.[1]
+						.description ?? '',
+					'Second slice',
+				),
+			).toBe('# UI plan\n\n1. Build it.');
+		});
+
+		it('reverts the scope declaration the verifier is never allowed to touch', async () => {
+			const deps = makeDeps();
+			const original = scopeContents;
+			onVerification(deps, () => {
+				scopeContents = JSON.stringify({
+					whyOneTask: 'Rewritten by the verifier.',
+					independentConcerns: ['a', 'b'],
+					affectedAreas: [],
+					outOfScope: [],
+				});
+			});
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			// An edited scope file would otherwise flip the split gate; reverting it is
+			// not a "correction" either.
+			expect(scopeContents).toBe(original);
+			expect(result.planningScope?.independentConcerns).toEqual(['the planning phase']);
+			expect(result.verification).toEqual({ ran: true, corrected: false });
+		});
+
+		it('runs no agent at all for a preplanned split child, even with verifyPlan on', async () => {
+			const deps = makeDeps();
+			const result = await runPlanningPhase({
+				...deps,
+				workItem: preplannedChild('# Child plan\n\n1. Do it.'),
+				verifyPlan: true,
+			});
+
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(result.verification).toBeUndefined();
+			expect(result.preplanned).toBe(true);
 		});
 	});
 });

@@ -14,6 +14,14 @@
  * code — it's delivered as a comment and the worktree is thrown away, so the
  * checkout is detached and never commits.
  *
+ * When the project opts into `pipeline.planning.verifyPlan` (issue #818), a
+ * second, independent agent runs in the same still-read-only worktree between
+ * the plan being written and anything being posted or applied to the board: it
+ * fact-checks the plan's concrete claims against the repository and corrects
+ * them in place, in `proposed_plan.md` and in every `subTasks[].plan` of
+ * `proposed_split.json`. That pass is best-effort — a failure, timeout, or
+ * throw is logged and Planning continues with the original, unverified plan.
+ *
  * This is the phase's orchestration only. It composes the building blocks that
  * already exist — `GitWorktreeManager` (SWARM-14), `graftEnvironment` (SWARM-15),
  * `runAgentCli` (SWARM-16), the `PMProvider` contract (SWARM-11) — and takes them
@@ -25,7 +33,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { z } from 'zod';
@@ -48,6 +56,7 @@ import {
 	type PreplanContract,
 	SPLIT_CHILD_LABEL,
 } from '@/pipeline/preplan.js';
+import { buildPlanVerificationPrompt } from '@/pipeline/prompts/plan-verification.js';
 import {
 	buildPlanningPrompt,
 	PROPOSED_PLAN_FILENAME,
@@ -198,6 +207,14 @@ const DEFAULT_AUTO_SPLIT = true;
 const DEFAULT_MAX_CONCERNS = 1;
 
 /**
+ * `verifyPlan` default when `project.pipeline.planning.verifyPlan` is unset
+ * (issue #818). Off: the verification pass is a second, full agent run, so it
+ * roughly doubles the phase's agent-run cost and its worst-case wall clock —
+ * a project opts in deliberately.
+ */
+const DEFAULT_VERIFY_PLAN = false;
+
+/**
  * A sibling is first created in Backlog, so its validated preplan marker can be
  * written before its subsequent move to Planning emits a status event.
  */
@@ -282,6 +299,13 @@ export interface RunPlanningPhaseOptions {
 	 * Only consulted when `autoSplit` is on.
 	 */
 	maxConcerns?: number;
+	/**
+	 * Whether to run the opt-in autonomous fact-check pass over the finished plan
+	 * before anything is posted or applied to the board (issue #818). Defaults to
+	 * {@link DEFAULT_VERIFY_PLAN} (`false`) — it is a second full agent run. Always
+	 * best-effort: see {@link runPlanVerification}.
+	 */
+	verifyPlan?: boolean;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
 	timeoutMs?: number;
 	/** External cancellation — aborting kills the agent run. */
@@ -290,6 +314,19 @@ export interface RunPlanningPhaseOptions {
 	runAgent?: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	/** Injectable env-grafting step — defaults to {@link graftEnvironment}; overridden in tests. */
 	graft?: typeof graftEnvironment;
+}
+
+/**
+ * What the opt-in verification pass achieved, surfaced on the phase result the
+ * same way `split` and `planningScope` are (issue #818). Absent entirely when
+ * the project did not ask for verification; `{ ran: false, corrected: false }`
+ * when it was asked for but the pass failed and the original plan was kept.
+ */
+export interface PlanVerification {
+	/** The verification agent ran to completion (exit 0, not timed out, no throw). */
+	ran: boolean;
+	/** It changed `proposed_plan.md` and/or `proposed_split.json`. */
+	corrected: boolean;
 }
 
 export interface PlanningPhaseResult {
@@ -322,6 +359,12 @@ export interface PlanningPhaseResult {
 	 * preplanned split child has no local scope artifact, so it leaves this absent.
 	 */
 	planningScope?: ProposedScope;
+	/**
+	 * Outcome of the opt-in fact-check pass (`verifyPlan`, issue #818). Absent
+	 * when verification was not requested — including on a preplanned split
+	 * child, which runs no agent at all and so has nothing local to verify.
+	 */
+	verification?: PlanVerification;
 }
 
 /**
@@ -1268,6 +1311,170 @@ async function linkBlockedBy(
 	}
 }
 
+/** One planning artifact captured before the verification run, for restoration. */
+interface CapturedArtifact {
+	path: string;
+	/** Its bytes before the run, or `undefined` when the file did not exist. */
+	before: string | undefined;
+}
+
+/**
+ * Put captured planning artifacts back the way the planning agent left them
+ * (issue #818). This is what makes the verification pass genuinely best-effort:
+ * a killed verifier can leave `proposed_split.json` half-written, and
+ * `readProposedSplit` throws on malformed JSON — which would fail an otherwise
+ * complete Planning run. An entry that did not exist before the run is skipped
+ * rather than deleted; a restore failure is logged and swallowed, since a failed
+ * rollback must not become the exception that fails the phase.
+ */
+function restorePlanningArtifacts(
+	artifacts: readonly CapturedArtifact[],
+	taskId: string,
+	workItemId: string,
+): void {
+	for (const { path, before } of artifacts) {
+		if (before === undefined) continue;
+		try {
+			if (existsSync(path) && readFileSync(path, 'utf8') === before) continue;
+			writeFileSync(path, before);
+		} catch (error) {
+			logger.warn('Planning — failed to restore a planning artifact after verification', {
+				taskId,
+				workItemId,
+				path,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+}
+
+interface PlanVerificationOptions {
+	worktreePath: string;
+	cli: AgentCli;
+	model?: string;
+	reasoning?: ReasoningLevel;
+	taskId: string;
+	workItem: WorkItem;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	runAgent: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
+	/** The plan already read from disk, returned unchanged when nothing was corrected. */
+	plan: string;
+}
+
+/**
+ * The opt-in autonomous fact-check pass (`verifyPlan`, issue #818): a second,
+ * independent agent run in the same still-read-only planning worktree, launched
+ * after `proposed_plan.md` exists and before anything is posted as a comment or
+ * applied to the board. It corrects the plan's wrong concrete claims **in place**
+ * — in `proposed_plan.md` and, when the run proposed a split, in every
+ * `subTasks[].plan` of `proposed_split.json`, which is the only fact-check those
+ * sibling plans will ever get (a split child's Planning run merely replays them).
+ *
+ * Best-effort, following the swallow-and-log contract of the other post-plan
+ * helpers here (`markSplitChildPlanned`, `linkBlockedBy`): a non-zero exit, a
+ * timeout, or a throw is logged as a warning and Planning proceeds with the
+ * original, unverified plan — with every captured artifact rolled back, so a
+ * killed verifier can never fail the phase through `readProposedSplit`.
+ */
+async function runPlanVerification(
+	options: PlanVerificationOptions,
+): Promise<{ verification: PlanVerification; plan: string }> {
+	const {
+		worktreePath,
+		cli,
+		model,
+		reasoning,
+		taskId,
+		workItem,
+		timeoutMs,
+		signal,
+		runAgent,
+		plan,
+	} = options;
+	const workItemId = workItem.id;
+	const read = (path: string) => (existsSync(path) ? readFileSync(path, 'utf8') : undefined);
+
+	const planPath = join(worktreePath, PROPOSED_PLAN_FILENAME);
+	const splitPath = join(worktreePath, PROPOSED_SPLIT_FILENAME);
+	const scopePath = join(worktreePath, PROPOSED_SCOPE_FILENAME);
+	const planBefore = read(planPath);
+	const splitBefore = read(splitPath);
+	// Captured even though the prompt forbids the verifier from touching the scope
+	// file at all: nothing at the tool level enforces that instruction, and
+	// `readProposedScope` throws on a malformed file, so the rollback must not
+	// depend on the verifier actually obeying it.
+	const scopeBefore = read(scopePath);
+	const captured: CapturedArtifact[] = [
+		{ path: planPath, before: planBefore },
+		{ path: splitPath, before: splitBefore },
+		{ path: scopePath, before: scopeBefore },
+	];
+	const scopeOnly = captured.slice(2);
+
+	try {
+		const agent = await runAgent({
+			cli,
+			model,
+			reasoning,
+			// Deliberately no `sessionId`/`resumeSessionId`: the pass must be a fresh
+			// process with no memory of how the plan was authored, and reusing the
+			// planning run's assigned session id would collide with it anyway.
+			cwd: worktreePath,
+			args: [buildPlanVerificationPrompt(splitBefore !== undefined)],
+			maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
+			logContext: { taskId, phase: 'planning', step: 'verify-plan', workItemId },
+			timeoutMs,
+			signal,
+		});
+
+		if (agent.exitCode !== 0) {
+			// `runAgentCli` reports a timeout as a killed process rather than a throw,
+			// so this arm covers it too.
+			logger.warn(
+				'Planning — plan verification did not complete; continuing with the unverified plan',
+				{
+					taskId,
+					workItemId,
+					exitCode: agent.exitCode,
+					timedOut: agent.timedOut,
+				},
+			);
+			restorePlanningArtifacts(captured, taskId, workItemId);
+			return { verification: { ran: false, corrected: false }, plan };
+		}
+
+		const planAfter = read(planPath);
+		const splitAfter = read(splitPath);
+		const corrected = planAfter !== planBefore || splitAfter !== splitBefore;
+		// The plan/split files are left exactly as the verifier wrote them — that is
+		// the correction this whole pass exists to make — but the scope file is never
+		// allowed to end a *successful* run changed either, since the verifier is
+		// never allowed to touch it. Reverting it never counts as a correction.
+		restorePlanningArtifacts(scopeOnly, taskId, workItemId);
+		logger.info('Planning — plan verification finished', {
+			taskId,
+			workItemId,
+			corrected,
+			durationMs: agent.durationMs,
+		});
+		return {
+			verification: { ran: true, corrected },
+			// `|| plan` guards against a verifier that emptied the plan turning a
+			// successful Planning run into a failed one.
+			plan: planAfter?.trim() ? planAfter : plan,
+		};
+	} catch (error) {
+		logger.warn('Planning — plan verification failed; continuing with the unverified plan', {
+			taskId,
+			workItemId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		restorePlanningArtifacts(captured, taskId, workItemId);
+		return { verification: { ran: false, corrected: false }, plan };
+	}
+}
+
 /**
  * Run the Planning phase for one work item. Provisions a detached worktree, runs
  * the planning agent to produce `proposed_plan.md`, and posts it as a comment on
@@ -1290,6 +1497,12 @@ async function linkBlockedBy(
  * unsplit single task declaring more than `maxConcerns` (default `1`) independent
  * concerns fails Planning with an actionable request to narrow or split, rather
  * than auto-advancing an oversized plan to Implementation.
+ *
+ * When `verifyPlan` (default `false`, issue #818) is on, a second independent
+ * agent then fact-checks the plan against the repository in the same read-only
+ * worktree — before the plan is posted or the split applied — and corrects any
+ * wrong concrete claim in place. See {@link runPlanVerification}: that pass is
+ * best-effort and never fails the phase.
  *
  * Throws if the agent exits non-zero, produces no plan, or fails the scope gate —
  * a planning run that didn't yield a usable, right-sized plan is a failed job,
@@ -1595,6 +1808,7 @@ export async function runPlanningPhase(
 		autoAdvance = DEFAULT_AUTO_ADVANCE,
 		autoSplit = DEFAULT_AUTO_SPLIT,
 		maxConcerns = DEFAULT_MAX_CONCERNS,
+		verifyPlan = DEFAULT_VERIFY_PLAN,
 		timeoutMs,
 		signal,
 		runAgent = runAgentCli,
@@ -1670,6 +1884,28 @@ export async function runPlanningPhase(
 
 		const plan = readPlanOrThrow(handle.path, cli, taskId, workItem, agent);
 
+		// Opt-in autonomous fact-check (issue #818). Runs in the same still-read-only
+		// worktree, before anything is posted or applied to the board — and, like the
+		// split-child preparation below, best-effort: a failed verification leaves the
+		// original plan intact rather than failing an otherwise-complete Planning run.
+		// `proposed_split.json` is corrected in place, so the split children built from
+		// it below pick the corrections up with no extra plumbing.
+		const verified = verifyPlan
+			? await runPlanVerification({
+					worktreePath: handle.path,
+					cli,
+					model,
+					reasoning,
+					taskId,
+					workItem,
+					timeoutMs,
+					signal,
+					runAgent,
+					plan,
+				})
+			: undefined;
+		const finalPlan = verified?.plan ?? plan;
+
 		const result = await verifyAndApplyPlanningResult({
 			project,
 			workItem,
@@ -1678,7 +1914,7 @@ export async function runPlanningPhase(
 			autoSplit,
 			maxConcerns,
 			effectiveAutoAdvance,
-			plan,
+			plan: finalPlan,
 			agent,
 			handlePath: handle.path,
 			cli,
@@ -1691,15 +1927,18 @@ export async function runPlanningPhase(
 			commentId: result.commentId,
 			movedTo: result.movedTo,
 			splitInto: result.split?.subTaskItemIds.length,
+			verified: verified?.verification.ran,
+			corrected: verified?.verification.corrected,
 		});
 
 		return {
-			plan,
+			plan: finalPlan,
 			commentId: result.commentId,
 			agent,
 			movedTo: result.movedTo,
 			split: result.split,
 			planningScope: result.planningScope,
+			verification: verified?.verification,
 		};
 	} finally {
 		await cleanupUnlessPreserved(worktrees, taskId, preserveForResume, 'planning phase', runId);

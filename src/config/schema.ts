@@ -438,12 +438,23 @@ export const PipelineBaseSchema = z.object({
 	 * number of independent concerns an unsplit task may declare in
 	 * `proposed_scope.json` before Planning fails and asks for a split or a
 	 * narrower plan (issue #268). Raise it to loosen the guard.
+	 *
+	 * `verifyPlan` (default `false`, issue #818) runs a second, independent agent
+	 * after the plan is written and before anything is posted or applied to the
+	 * board: it fact-checks the plan's concrete, falsifiable claims (paths,
+	 * symbols, line numbers, "already shipped" dependency claims, described
+	 * existing behavior) against the repository and corrects them in place, in
+	 * `proposed_plan.md` and in every `subTasks[].plan` of `proposed_split.json`.
+	 * Best-effort: a failure or timeout is logged and Planning proceeds with the
+	 * original, unverified plan. Opt-in because it roughly doubles the phase's
+	 * agent-run cost.
 	 */
 	planning: z
 		.object({
 			autoAdvance: z.boolean().optional(),
 			autoSplit: z.boolean().optional(),
 			maxConcerns: z.number().int().positive().optional(),
+			verifyPlan: z.boolean().optional(),
 		})
 		.optional(),
 	review: z
