@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
 	listCliQuotasForOwner: vi.fn(),
-	upsertCliQuota: vi.fn(),
 }));
 
 import { quotaRouter } from '@/api/routers/quota.js';
