@@ -2533,15 +2533,44 @@ describe('runsRouter', () => {
 		const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
 
 		describe('list', () => {
-			// issue #647 — the unscoped list is the global /runs screen's read: an
-			// operator's view of the whole installation, not a member's of their work.
-			it('denies the installation-wide list to a non-admin, without querying', async () => {
-				await expect(ordinary.list({})).rejects.toThrowError(
-					expect.objectContaining({ code: 'FORBIDDEN' }),
-				);
+			// issue #821 — the unscoped list is the global /runs screen's read, open to
+			// every signed-in user and bounded to the projects they belong to.
+			it('bounds the cross-project list for a non-admin to their own projects', async () => {
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1', 'p2']);
+				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+
+				await expect(ordinary.list({})).resolves.toEqual({ data: [], total: 0 });
+
+				expect(listRunsFromDb).toHaveBeenCalledWith({
+					limit: 50,
+					offset: 0,
+					projectIds: ['p1', 'p2'],
+				});
+			});
+
+			it("carries the caller's own filters alongside the membership scope", async () => {
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+
+				await ordinary.list({ status: 'failed', phase: 'review', limit: 10, offset: 20 });
+
+				expect(listRunsFromDb).toHaveBeenCalledWith({
+					status: 'failed',
+					phase: 'review',
+					limit: 10,
+					offset: 20,
+					projectIds: ['p1'],
+				});
+			});
+
+			// An empty scope must never reach the repository, whose `projectIds` filter
+			// is skipped when empty — which would widen the query back to every project.
+			it('returns an empty page, without querying, for a member of no project', async () => {
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue([]);
+
+				await expect(ordinary.list({})).resolves.toEqual({ data: [], total: 0 });
+
 				expect(listRunsFromDb).not.toHaveBeenCalled();
-				// The gate is the installation role alone — no membership read at all.
-				expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 			});
 
 			it('lets an instanceAdmin read the installation-wide list unfiltered', async () => {
@@ -2550,6 +2579,8 @@ describe('runsRouter', () => {
 				await caller.list({});
 
 				expect(listRunsFromDb).toHaveBeenCalledWith({ limit: 50, offset: 0 });
+				// The installation role answers on its own — no membership read at all.
+				expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 			});
 
 			it('denies an explicit projectId filter the caller is not a member of', async () => {

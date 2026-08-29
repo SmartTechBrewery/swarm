@@ -68,7 +68,7 @@ import {
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
-import { assertInstanceAdmin, assertProjectAccess } from '../authz.js';
+import { accessibleProjectScope, assertInstanceAdmin, assertProjectAccess } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
 const QUEUED_WORK_ITEM_CACHE_TTL_MS = 30_000;
@@ -734,24 +734,33 @@ export const runsRouter = router({
 	// identity read.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
 	// access to that project, so a non-member never sees another project's runs.
-	// Without one this is the **installation-wide** list behind the global /runs
-	// screen, which is an instance administrator's view (issue #647) — a worker
-	// owner reads their runs per project instead, through the branch above.
+	// Without one this is the cross-project list behind the global /runs screen,
+	// open to **every** signed-in user since issue #821 and bounded to what each
+	// one may see: an instance administrator reads the whole installation
+	// unfiltered (`accessibleProjectScope` → `null`), and anyone else reads only
+	// the projects they are a member of. A user who belongs to no project gets an
+	// empty page rather than a denial — an empty scope would otherwise widen the
+	// query back to every project, so it short-circuits without querying at all.
 	list: authedProcedure.input(ListRunsInputSchema).query(async ({ ctx, input }) => {
 		if (input.projectId) {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			return await listRunsWithWorkerNames(input);
 		}
-		assertInstanceAdmin(ctx.user, 'runs');
-		return await listRunsWithWorkerNames(input);
+		const scope = await accessibleProjectScope(ctx.user);
+		if (scope === null) return await listRunsWithWorkerNames(input);
+		if (scope.length === 0) return { data: [], total: 0 };
+		return await listRunsWithWorkerNames({ ...input, projectIds: scope });
 	}),
 
 	// Every canonical waiting dispatch (pending / capacity-blocked /
 	// retry-scheduled) — the durable queue read model (issues #234, #284), never
 	// a BullMQ snapshot, so nothing pending can be invisible here. No pagination:
-	// the pending set is small and bounded by worker throughput. Scoped like
-	// `list`: a chosen `projectId` needs read access, and the unscoped,
-	// installation-wide queue is an instance administrator's view (issue #647).
+	// the pending set is small and bounded by worker throughput. A chosen
+	// `projectId` needs read access, exactly like `list`; the unscoped,
+	// installation-wide queue remains an instance administrator's view (issue
+	// #647) and was deliberately left there when issue #821 opened the unscoped
+	// `list` to every member — the queue is an operator's dispatch view, and
+	// giving it the same membership scoping is its own change.
 	//
 	// Returns the two-part {@link QueuedRunsPage}: the queue itself, and the board
 	// dispatches the enrichment's own board read proved cannot start a phase

@@ -79,35 +79,37 @@ export function Sidebar() {
 					</span>
 				</div>
 				<nav className="space-y-1 p-2">
-					{/* The two installation-wide screens, offered only to an instance
-					    administrator (issue #647) — a worker owner reaches the same runs
-					    and workers, scoped, through their project links below. */}
-					{canViewInstanceWide(currentUser.data) && (
-						<>
-							<Link
-								to="/runs"
-								className={
-									currentPath.startsWith('/runs')
-										? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-										: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-								}
-							>
-								<Play className="h-4 w-4" />
-								Runs
-							</Link>
+					{/* Runs is offered to everyone since issue #821: the cross-project list
+					    is bounded server-side to the reader's own projects, so a member
+					    reaching it here sees their work across every project rather than
+					    one project at a time. */}
+					<Link
+						to="/runs"
+						className={
+							currentPath.startsWith('/runs')
+								? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
+								: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
+						}
+					>
+						<Play className="h-4 w-4" />
+						Runs
+					</Link>
 
-							<Link
-								to="/workers"
-								className={
-									currentPath.startsWith('/workers')
-										? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-										: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-								}
-							>
-								<Server className="h-4 w-4" />
-								Workers
-							</Link>
-						</>
+					{/* Workers stays installation-wide, so it is still offered only to an
+					    instance administrator (issue #647) — a worker owner reaches their
+					    own machines, scoped, through their project links below. */}
+					{canViewInstanceWide(currentUser.data) && (
+						<Link
+							to="/workers"
+							className={
+								currentPath.startsWith('/workers')
+									? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
+									: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
+							}
+						>
+							<Server className="h-4 w-4" />
+							Workers
+						</Link>
 					)}
 
 					<div className="flex items-center justify-between px-3 pt-4 pb-1">

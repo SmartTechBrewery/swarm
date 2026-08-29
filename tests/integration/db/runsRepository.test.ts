@@ -1421,6 +1421,29 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(result).toEqual({ data: [], total: 0 });
 		});
 
+		// The authorization boundary the cross-project runs list is bounded by
+		// (issue #821): unlike `projectId`, `projectIds` is imposed by the API layer
+		// from the caller's memberships, so a run outside it must never come back —
+		// neither in the page nor in the count the pager reads. Callers pass a
+		// non-empty set; an empty one is short-circuited in the router, since an
+		// empty filter here means "no restriction".
+		it('restricts the result — page and total — to the accessible-project scope', async () => {
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other-repo' });
+			await seedRun({ startedAt: new Date('2026-01-01') });
+			await seedRun({ projectId: 'proj-other', startedAt: new Date('2026-01-02') });
+
+			const scoped = await listRunsFromDb({ projectIds: [PROJECT_ID], limit: 50, offset: 0 });
+			expect(scoped.total).toBe(1);
+			expect(scoped.data.map((run) => run.projectId)).toEqual([PROJECT_ID]);
+
+			const both = await listRunsFromDb({
+				projectIds: [PROJECT_ID, 'proj-other'],
+				limit: 50,
+				offset: 0,
+			});
+			expect(both.total).toBe(2);
+		});
+
 		it('hides deferred attempts with waiting dispatches and keeps settled attempts visible', async () => {
 			const rateLimitedRunId = await createRun({
 				projectId: PROJECT_ID,
