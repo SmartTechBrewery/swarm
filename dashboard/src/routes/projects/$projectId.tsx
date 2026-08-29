@@ -1254,6 +1254,94 @@ export function PhaseSettingsDetail({
 	);
 }
 
+/**
+ * The phases list's stand-in for the Save Changes / Reset controls, which are the
+ * phase detail screen's alone since issue #834.
+ *
+ * Going back to the list does **not** discard a phase's unsaved target/timeout/
+ * prompt edits — they live in the route's `agents` state, which outlives the
+ * `?phase=` navigation — but with no Save button here they would otherwise be
+ * pending and completely invisible. Naming each dirty phase, and linking back
+ * into it, is what keeps that state honest without putting a save affordance on
+ * a screen that displays none of the fields feeding it.
+ */
+function PendingPhaseEditsNotice({
+	phases,
+	onSelectPhase,
+}: {
+	phases: Array<(typeof PHASES)[number]>;
+	onSelectPhase: (phase: (typeof PHASES)[number]) => void;
+}) {
+	if (phases.length === 0) return null;
+	return (
+		<div className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded">
+			Unsaved changes are waiting on{' '}
+			{phases.map((phase, index) => (
+				<span key={phase}>
+					{index > 0 && ', '}
+					<button
+						type="button"
+						onClick={() => onSelectPhase(phase)}
+						className="font-semibold underline underline-offset-2 hover:text-amber-400 focus:outline-none focus:ring-1 focus:ring-amber-500 rounded transition-colors"
+					>
+						{PHASE_LABELS[phase].label}
+					</button>
+				</span>
+			))}
+			. Open the phase to save or reset them.
+		</div>
+	);
+}
+
+/**
+ * Save Changes / Reset for the Agent Configuration tab's non-toggle edits (target
+ * lists, timeouts, custom prompts).
+ *
+ * `visible` is what scopes them to a phase's detail screen (issue #834): the phases
+ * list holds none of the fields that feed `isDirty`/`handleSubmit` — its toggles
+ * autosave on their own scoped mutation — so a Save/Reset pair there would offer to
+ * persist edits made on a screen it isn't showing. It reports pending edits through
+ * {@link PendingPhaseEditsNotice} instead.
+ *
+ * `isDirty`/`hasValidationError` deliberately stay whole-config rather than becoming
+ * per-phase: Save Changes sends the whole `agents` config, so a per-phase gate would
+ * disagree with what the write actually does.
+ */
+function AgentConfigurationActions({
+	visible,
+	isDirty,
+	hasValidationError,
+	isPending,
+	handleReset,
+}: {
+	visible: boolean;
+	isDirty: boolean;
+	hasValidationError: boolean;
+	isPending: boolean;
+	handleReset: () => void;
+}) {
+	if (!visible) return null;
+	return (
+		<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
+			<button
+				type="submit"
+				disabled={isPending || !isDirty || hasValidationError}
+				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
+			>
+				{isPending ? 'Saving…' : 'Save Changes'}
+			</button>
+			<button
+				type="button"
+				onClick={handleReset}
+				disabled={isPending || !isDirty}
+				className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+			>
+				Reset
+			</button>
+		</div>
+	);
+}
+
 interface AgentConfigurationFormProps extends TargetHandlers {
 	agents: AgentsConfig;
 	pipelineEnabled: PipelineEnabledForm;
@@ -1271,6 +1359,13 @@ interface AgentConfigurationFormProps extends TargetHandlers {
 	handleSubmit: (e: React.FormEvent) => void;
 	handleReset: () => void;
 	isDirty: boolean;
+	/**
+	 * The phases holding unsaved non-toggle edits. Save Changes still writes every
+	 * phase at once (it sends the whole `agents` config), so this is not a second
+	 * dirty gate — it's what the phases list names in {@link PendingPhaseEditsNotice}
+	 * now that Save/Reset render only on a phase's own screen (issue #834).
+	 */
+	dirtyPhases: Array<(typeof PHASES)[number]>;
 	/**
 	 * True when a phase's custom prompt is over the bound, or two of its targets
 	 * name the same CLI — either would fail server-side validation, so Save is
@@ -1296,8 +1391,14 @@ interface AgentConfigurationFormProps extends TargetHandlers {
  * (issue #369); the Save Changes / Reset controls and the route's `agents` state
  * govern only the non-toggle edits (target lists, timeouts, custom prompts), so
  * the two save paths never persist each other's in-progress edits (issue #135, #119).
+ *
+ * Because those non-toggle fields exist only on a phase's detail screen, Save
+ * Changes / Reset render there and nowhere else (issue #834): the phases list
+ * offers only the autosaving toggles, and reports any pending edit through
+ * {@link PendingPhaseEditsNotice} instead of a save affordance for fields it does
+ * not display.
  */
-function AgentConfigurationForm({
+export function AgentConfigurationForm({
 	agents,
 	pipelineEnabled,
 	pipelineAutoAdvance,
@@ -1317,6 +1418,7 @@ function AgentConfigurationForm({
 	handleSubmit,
 	handleReset,
 	isDirty,
+	dirtyPhases,
 	hasValidationError,
 	isPending,
 	isSuccess,
@@ -1371,62 +1473,65 @@ function AgentConfigurationForm({
 					onBack={onBack}
 				/>
 			) : (
-				<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
-					<div>
-						<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
-							Phases Configuration
-						</h2>
-						<p className="text-xs text-zinc-400 mb-4">
-							Select a phase to configure its model targets in priority order and an optional custom
-							prompt. Unset values fall back to the pipeline's coded defaults.
-						</p>
+				<>
+					<PendingPhaseEditsNotice phases={dirtyPhases} onSelectPhase={onSelectPhase} />
+					<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
+						<div>
+							<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
+								Phases Configuration
+							</h2>
+							<p className="text-xs text-zinc-400 mb-4">
+								Select a phase to configure its model targets in priority order and an optional
+								custom prompt. Unset values fall back to the pipeline's coded defaults.
+							</p>
 
-						<div className="border border-zinc-800 rounded-md overflow-hidden bg-panel/20 shadow-sm">
-							<table className="w-full text-left border-collapse">
-								<thead>
-									<tr className="bg-zinc-800/30 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-400 font-semibold">
-										<th className="px-4 py-3">Phase</th>
-										<th className="px-4 py-3">Enabled</th>
-										<th className="px-4 py-3">Auto-advance</th>
-										<th className="px-4 py-3">Preferred model</th>
-										<th className="px-4 py-3">
-											<span className="sr-only">Open</span>
-										</th>
-									</tr>
-								</thead>
-								<tbody className="divide-y divide-zinc-800/60">
-									{PHASES.map((phase) => {
-										const autoAdvancePhase = autoAdvanceConfigPhase(phase);
-										return (
-											<PhaseConfigRow
-												key={phase}
-												phase={phase}
-												config={agents[phase] ?? {}}
-												projectDefaults={agents.defaults}
-												isPending={isPending}
-												enabled={
-													TOGGLEABLE_PHASES.has(phase)
-														? pipelineEnabled[phase as PipelineTogglePhase]
-														: undefined
-												}
-												enabledDisabled={
-													phase === 'respondToReview' && isRespondToReviewLocked(pipelineEnabled)
-												}
-												savingToggleKey={savingToggleKey}
-												autoAdvance={
-													autoAdvancePhase ? pipelineAutoAdvance[autoAdvancePhase] : undefined
-												}
-												handleEnabledChange={handleEnabledChange}
-												handleAutoAdvanceChange={handleAutoAdvanceChange}
-												onSelect={onSelectPhase}
-											/>
-										);
-									})}
-								</tbody>
-							</table>
+							<div className="border border-zinc-800 rounded-md overflow-hidden bg-panel/20 shadow-sm">
+								<table className="w-full text-left border-collapse">
+									<thead>
+										<tr className="bg-zinc-800/30 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-400 font-semibold">
+											<th className="px-4 py-3">Phase</th>
+											<th className="px-4 py-3">Enabled</th>
+											<th className="px-4 py-3">Auto-advance</th>
+											<th className="px-4 py-3">Preferred model</th>
+											<th className="px-4 py-3">
+												<span className="sr-only">Open</span>
+											</th>
+										</tr>
+									</thead>
+									<tbody className="divide-y divide-zinc-800/60">
+										{PHASES.map((phase) => {
+											const autoAdvancePhase = autoAdvanceConfigPhase(phase);
+											return (
+												<PhaseConfigRow
+													key={phase}
+													phase={phase}
+													config={agents[phase] ?? {}}
+													projectDefaults={agents.defaults}
+													isPending={isPending}
+													enabled={
+														TOGGLEABLE_PHASES.has(phase)
+															? pipelineEnabled[phase as PipelineTogglePhase]
+															: undefined
+													}
+													enabledDisabled={
+														phase === 'respondToReview' && isRespondToReviewLocked(pipelineEnabled)
+													}
+													savingToggleKey={savingToggleKey}
+													autoAdvance={
+														autoAdvancePhase ? pipelineAutoAdvance[autoAdvancePhase] : undefined
+													}
+													handleEnabledChange={handleEnabledChange}
+													handleAutoAdvanceChange={handleAutoAdvanceChange}
+													onSelect={onSelectPhase}
+												/>
+											);
+										})}
+									</tbody>
+								</table>
+							</div>
 						</div>
 					</div>
-				</div>
+				</>
 			)}
 
 			{/* Feedback Banners */}
@@ -1442,24 +1547,13 @@ function AgentConfigurationForm({
 				</div>
 			)}
 
-			{/* Action Buttons */}
-			<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
-				<button
-					type="submit"
-					disabled={isPending || !isDirty || hasValidationError}
-					className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
-				>
-					{isPending ? 'Saving…' : 'Save Changes'}
-				</button>
-				<button
-					type="button"
-					onClick={handleReset}
-					disabled={isPending || !isDirty}
-					className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
-				>
-					Reset
-				</button>
-			</div>
+			<AgentConfigurationActions
+				visible={selectedPhase !== undefined}
+				isDirty={isDirty}
+				hasValidationError={hasValidationError}
+				isPending={isPending}
+				handleReset={handleReset}
+			/>
 		</form>
 	);
 }
@@ -2161,21 +2255,26 @@ function ProjectDetailRouteComponent() {
 	// rendered by the repository card's own error banner.
 	const duplicateRepos = useMemo(() => duplicateRepositories(repositories), [repositories]);
 
+	// Only the non-toggle edits gate Save Changes — the Enabled/Auto-advance toggles
+	// auto-save on their own scoped mutation (issue #369), so they're deliberately
+	// excluded here and from `handleAgentsSubmit`. Named per phase because Save/Reset
+	// now render only on a phase's detail screen (issue #834), so the phases list
+	// reports which phases are still waiting rather than showing a save affordance.
+	const dirtyAgentPhases = useMemo(() => {
+		if (!project) return [];
+		const projectAgents = project.agents ?? {};
+		return PHASES.filter((phase) => isPhaseConfigDirty(agents[phase], projectAgents[phase]));
+	}, [project, agents]);
+
 	const isAgentsDirty = useMemo(() => {
 		if (!project) return false;
-		const projectAgents = project.agents ?? {};
 		const localDefaults = agents.defaults ?? {};
-		const dbDefaults = projectAgents.defaults ?? {};
+		const dbDefaults = project.agents?.defaults ?? {};
 		const hasDefaultChange = (['claude', 'antigravity', 'codex'] as const).some(
 			(cli) => (localDefaults[cli] ?? '') !== (dbDefaults[cli] ?? ''),
 		);
-		if (hasDefaultChange) return true;
-
-		// Only the non-toggle edits gate Save Changes now — the Enabled/Auto-advance
-		// toggles auto-save on their own scoped mutation (issue #369), so they're
-		// deliberately excluded here and from `handleAgentsSubmit`.
-		return PHASES.some((phase) => isPhaseConfigDirty(agents[phase], projectAgents[phase]));
-	}, [project, agents]);
+		return hasDefaultChange || dirtyAgentPhases.length > 0;
+	}, [project, agents, dirtyAgentPhases]);
 
 	// An over-limit custom prompt — or a duplicate target CLI, which the selectors
 	// don't offer but the schema also rejects — would only fail server-side; surface
@@ -2541,6 +2640,7 @@ function ProjectDetailRouteComponent() {
 						handleSubmit={handleAgentsSubmit}
 						handleReset={handleAgentsReset}
 						isDirty={isAgentsDirty}
+						dirtyPhases={dirtyAgentPhases}
 						hasValidationError={hasAgentValidationError}
 						isPending={configWriteInFlight}
 						isSuccess={updateMutation.isSuccess}
