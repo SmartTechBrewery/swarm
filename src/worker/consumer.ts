@@ -41,7 +41,11 @@ import {
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
-import { abandonReviewVerdict } from '../db/repositories/reviewVerdictsRepository.js';
+import {
+	abandonReviewVerdict,
+	getSubmittedReviewSlot,
+	isCapReachingRequestChanges,
+} from '../db/repositories/reviewVerdictsRepository.js';
 import {
 	type CompleteRunInput,
 	completeRun,
@@ -106,6 +110,7 @@ import { runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
 import { BlockedRecoveryError, checkpointFallbackApplies } from '../pipeline/resume.js';
 import {
+	REVIEW_VERDICTS,
 	type ReviewAutomationOutcome,
 	type ReviewVerdict,
 	runReviewPhase,
@@ -2570,13 +2575,116 @@ async function requestMergeAutomationIfEligible(
 		});
 		return;
 	}
-	await requestMergeAutomation({
+	await requestMergeAutomationForApproval(
 		project,
-		reviewRunId: runId,
-		taskId: trigger.taskId,
-		prNumber: trigger.prNumber,
-		approvedHeadSha: trigger.headSha,
-	});
+		runId,
+		trigger.taskId,
+		trigger.prNumber,
+		trigger.headSha,
+	);
+}
+
+/**
+ * The eligibility rule itself, split out of {@link requestMergeAutomationIfEligible}
+ * so it can be honoured for an approval read back off the review-verdict ledger
+ * rather than off a phase result (issue #815) — without inventing a `TriggerResult`
+ * to carry it. The decision (`pipeline.respondToReview.autoMerge`) therefore stays
+ * in one place whichever path establishes the approval.
+ */
+async function requestMergeAutomationForApproval(
+	project: ProjectConfig,
+	reviewRunId: string,
+	taskId: string,
+	prNumber: string,
+	approvedHeadSha: string,
+): Promise<void> {
+	if (project.pipeline?.respondToReview?.autoMerge !== true) return;
+	await requestMergeAutomation({ project, reviewRunId, taskId, prNumber, approvedHeadSha });
+}
+
+/**
+ * The outcome an already-finished run must be recorded with when its triggering
+ * event is redelivered and re-evaluates to no-trigger (issue #815).
+ */
+interface CompletedNoTriggerOutcome {
+	verdict: ReviewVerdict;
+	ordinal: number;
+	automationOutcome?: ReviewAutomationOutcome;
+	taskId: string;
+	prNumber: string;
+	headSha: string;
+}
+
+/**
+ * Resolve the *already-successful* outcome behind a `!trigger` redelivery, or
+ * `undefined` when the work genuinely never happened (issue #815).
+ *
+ * A rate-limit retry re-evaluates its original event through the trigger registry,
+ * and a Review whose verdict was already submitted is correctly declined by
+ * `reserveDurableReviewSlot` (`src/triggers/handlers/review.ts`) — the designed
+ * idempotency. Without this read, that case and "there was nothing to do" landed
+ * on the same hard-coded `failed`, so a genuinely approved PR was reported as an
+ * errored run *and* silently lost the merge automation its approval had earned
+ * (seen live on PR #809: approved and mergeable, run recorded `failed`, no
+ * `merge-automation` dispatch).
+ *
+ * Review is the only phase with a durable record of its own completion (the
+ * `review_verdicts` ledger, issue #235), so this answers for Review alone — see
+ * the per-phase note at the call site for why the others are unaffected or
+ * unanswerable today.
+ *
+ * Best-effort like the rest of run tracking: a failed read returns `undefined`
+ * and falls back to today's `failed` settle rather than throwing out of
+ * `processJob`.
+ */
+async function resolveCompletedNoTriggerOutcome(
+	job: SwarmJob,
+	project: ProjectConfig,
+): Promise<CompletedNoTriggerOutcome | undefined> {
+	if (job.type !== 'scm' || !job.runId) return undefined;
+	const prNumber = job.event.workItemId;
+	const headSha = job.event.headSha;
+	if (!prNumber || !headSha) return undefined;
+	try {
+		const run = await getRunByIdFromDb(job.runId);
+		// The phase check is what stops a Respond-to-review / Respond-to-CI
+		// continuation for the *same* PR+head from adopting the Review's verdict —
+		// the ledger slot exists for that head too, but it is not their record.
+		if (!run || run.phase !== 'review' || run.prNumber !== prNumber) return undefined;
+		// `project` is already scoped to the job's repository (`repositoryForJob`),
+		// so this is the same `(repo, PR, head)` triple the dedup key in
+		// {@link settleNoTriggerDelivery} is built from — two repositories of one
+		// project sharing a PR number cannot cross over.
+		const slot = await getSubmittedReviewSlot({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber,
+			headSha,
+		});
+		if (!slot) return undefined;
+		// Pre-#470 rows can still hold the retired `comment` value, which is not a
+		// `ReviewVerdict` and must not be written back onto the run.
+		const verdict = REVIEW_VERDICTS.find((candidate) => candidate === slot.verdict);
+		if (!verdict) return undefined;
+		return {
+			verdict,
+			ordinal: slot.ordinal,
+			// The same derivation `runReviewPhase` uses (`src/pipeline/review.ts`), so
+			// the row ends up identical to what the original completion would have written.
+			automationOutcome: isCapReachingRequestChanges(slot.ordinal, verdict)
+				? 'manual-intervention-required'
+				: undefined,
+			taskId: run.taskId,
+			prNumber,
+			headSha,
+		};
+	} catch (err) {
+		logger.debug('Could not resolve an already-completed outcome for a no-trigger redelivery', {
+			runId: job.runId,
+			error: describeError(err),
+		});
+		return undefined;
+	}
 }
 
 /**
@@ -3346,6 +3454,117 @@ async function bindSelectedWorker(
 	}
 }
 
+/**
+ * Settle a delivery no trigger claimed. The dispatch itself always completes as
+ * `no-trigger` — that delivery genuinely matched nothing — but a job carrying a
+ * `runId` is a *continuation*, and how its run settles depends on whether the
+ * work behind it was ever done.
+ *
+ * **Issue #815.** This branch used to write `failed` unconditionally, conflating
+ * two cases it could not tell apart: "the disposition changed and nothing ran"
+ * and "this event was redelivered because the work already succeeded". A Review
+ * that rate-limited *after* submitting its verdict hits the second: its retry
+ * re-evaluates the original `pull-request/opened` event, `reserveDurableReviewSlot`
+ * correctly declines a slot already `submitted`, and the run — genuinely approved
+ * and mergeable — was recorded as an errored no-op that also never reached the
+ * success path's merge automation.
+ *
+ * **Why only Review reads a completion record** (the per-phase investigation
+ * issue #815 asked for, verified against each handler):
+ *
+ * - **Review** — affected, and fixed here. `reserveDurableReviewSlot`
+ *   (`src/triggers/handlers/review.ts`) declines a `reused` + `submitted` slot,
+ *   which is a decline caused *by* the run's own success.
+ * - **Respond-to-review** — not affected. Every decline in
+ *   `src/triggers/handlers/respond-to-review.ts` is derived from the event itself
+ *   (phase disabled, the `skipOnMinors` verdict policy, the reviewer-persona gate,
+ *   missing coordinates) or from a ledger ordinal the run cannot change
+ *   (`stopsAtReviewCap`). A completed run flips none of them, so a redelivery
+ *   re-evaluates exactly as the first delivery did.
+ * - **Respond-to-CI** — not affected in the "already succeeded" sense. Its declines
+ *   are a spent per-PR fix-attempt budget (`claimRespondToCiAttempt`) or a
+ *   disposition re-derived from live aggregate check state; a fix that actually
+ *   landed produced a *new* head SHA, so what changes the answer is the stale
+ *   event's own head, not a completion record. There is no durable "this fix was
+ *   delivered" ledger to consult even if we wanted one.
+ * - **Resolve-conflicts** — same *class* of bug, deliberately not fixed here.
+ *   `src/triggers/handlers/resolve-conflicts.ts` returns `null` once
+ *   `candidate.mergeable` is true, so a run that rate-limited after pushing its
+ *   resolution is declined on retry and still settles `failed`. Unlike Review it
+ *   has no durable record distinguishing "this run resolved it" from "a human
+ *   resolved it meanwhile", so a correct fix needs its own ledger rather than a
+ *   guess — recorded here as a follow-up rather than built speculatively.
+ * - **Planning / Implementation** — not affected. `src/triggers/handlers/pm-status.ts`
+ *   already handles exactly this: a continuation carries `resumePmPhase`, which
+ *   makes `matches` return `true` unconditionally and exempts the run from both the
+ *   `planned`-label gate and the `statusChanged` dedup — the "already done" signals
+ *   a completed Planning run writes are deliberately stood down for its own retry.
+ */
+async function settleNoTriggerDelivery(
+	job: SwarmJob,
+	project: ProjectConfig,
+	dispatch: DispatchRow,
+): Promise<JobOutcome> {
+	const completed = job.runId ? await resolveCompletedNoTriggerOutcome(job, project) : undefined;
+	if (job.runId && completed) {
+		logger.info('No-trigger redelivery of an already-completed run — recording its outcome', {
+			projectId: project.id,
+			runId: job.runId,
+			prNumber: completed.prNumber,
+			headSha: completed.headSha,
+			verdict: completed.verdict,
+			reviewOrdinal: completed.ordinal,
+		});
+		await finalizeRun(job.runId, {
+			status: 'completed',
+			// Cleared explicitly: this settle does not go through `resetRunToRunning`,
+			// so omitting them would leave the deferral's rate-limit text and its
+			// next-retry time on a row now marked completed.
+			error: null,
+			nextRetryAt: null,
+			reviewVerdict: completed.verdict,
+			reviewOrdinal: completed.ordinal,
+			reviewAutomationOutcome: completed.automationOutcome,
+		});
+		// Deliberately no `releaseReviewDispatch` here. The claim's own contract
+		// (`src/triggers/review-dispatch-dedup.ts`) forbids handing it back once a
+		// review is known to have been submitted, because a sibling event for the
+		// same PR+SHA would then post a duplicate. The TTL reaps it instead, exactly
+		// as it does for a failed run.
+	} else if (job.runId) {
+		await finalizeRun(job.runId, {
+			status: 'failed',
+			error:
+				'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
+		});
+		if (job.type === 'scm' && job.event.workItemId && job.event.headSha) {
+			const dispatchKey = buildReviewDispatchKey(
+				project.repo,
+				job.event.workItemId,
+				job.event.headSha,
+			);
+			await releaseReviewDispatch(dispatchKey);
+		}
+	}
+	await tryCompleteDispatch(dispatch.id, 'no-trigger');
+	// Ordering matters exactly as on the ordinary Review success path (see the
+	// comment at the `phase-succeeded` settle): the merge dispatch is linked to this
+	// same run and `uq_dispatches_active_run` permits one non-terminal dispatch per
+	// run, so this dispatch has to be completed first. `requestMergeAutomation` is
+	// idempotent on `merge:<reviewRunId>`, so a further redelivery — or a run whose
+	// first attempt already created the dispatch — does not mint a second.
+	if (job.runId && completed?.verdict === 'approve') {
+		await requestMergeAutomationForApproval(
+			project,
+			job.runId,
+			completed.taskId,
+			completed.prNumber,
+			completed.headSha,
+		);
+	}
+	return { status: 'no-trigger' };
+}
+
 export async function processJob(
 	job: SwarmJob,
 	registry: TriggerRegistry,
@@ -3427,23 +3646,7 @@ export async function processJob(
 			event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
 			deliveryId: job.deliveryId,
 		});
-		if (job.runId) {
-			await finalizeRun(job.runId, {
-				status: 'failed',
-				error:
-					'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
-			});
-			if (job.type === 'scm' && job.event.workItemId && job.event.headSha) {
-				const dispatchKey = buildReviewDispatchKey(
-					project.repo,
-					job.event.workItemId,
-					job.event.headSha,
-				);
-				await releaseReviewDispatch(dispatchKey);
-			}
-		}
-		await tryCompleteDispatch(dispatch.id, 'no-trigger');
-		return { status: 'no-trigger' };
+		return settleNoTriggerDelivery(job, project, dispatch);
 	}
 
 	// Record the resolved task/phase on the dispatch so the Queue UI can name

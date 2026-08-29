@@ -138,6 +138,9 @@ vi.mock('@/pipeline/implementation.js', () => ({
 vi.mock('@/pipeline/review.js', () => ({
 	runReviewPhase: mockPhase('review'),
 	DEFAULT_REVIEW_CLI: 'claude',
+	// The real vocabulary, not a stand-in: the no-trigger settle narrows a ledger
+	// verdict against it before writing it back onto a run (issue #815).
+	REVIEW_VERDICTS: ['approve', 'request-changes'],
 }));
 vi.mock('@/pipeline/respond-to-review.js', () => ({
 	runRespondToReviewPhase: mockPhase('respond-to-review'),
@@ -299,8 +302,23 @@ vi.mock('@/triggers/respond-to-ci-attempts.js', () => ({
 }));
 
 const abandonReviewVerdict = vi.fn(async (_key: unknown) => {});
+/**
+ * The durable "this review really was delivered" record the no-trigger settle
+ * reads to tell an already-succeeded redelivery from a run that never did
+ * anything (issue #815). Defaults to "no submitted slot", which is the shape
+ * every pre-existing case expects.
+ */
+const getSubmittedReviewSlot = vi.fn(
+	async (_key: unknown) =>
+		undefined as { ordinal: number; verdict: string | null; reviewId: string | null } | undefined,
+);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	abandonReviewVerdict: (key: unknown) => abandonReviewVerdict(key),
+	getSubmittedReviewSlot: (key: unknown) => getSubmittedReviewSlot(key),
+	// The one-line rule itself, re-implemented rather than proxied: the real
+	// module is fully mocked here, and `REVIEW_VERDICT_CAP` is 3.
+	isCapReachingRequestChanges: (ordinal: number | undefined, verdict: string | null | undefined) =>
+		ordinal !== undefined && ordinal >= 3 && verdict === 'request-changes',
 }));
 
 const refreshReviewDispatchClaim = vi.fn(async (_key: string, _ttlSec: number) => {});
@@ -359,6 +377,11 @@ const getRunByIdFromDb = vi.fn(
 					agentSessionId?: string | null;
 					continuationCount?: number;
 					recovery?: { preservedWorkerId?: string | null } | null;
+					// Read by the no-trigger settle (issue #815) to establish that the
+					// redelivered run really is the Review the ledger slot belongs to.
+					phase?: string;
+					taskId?: string;
+					prNumber?: string | null;
 			  }
 			| undefined,
 );
@@ -776,6 +799,8 @@ describe('processJob', () => {
 		unregisterRunController.mockClear();
 		requestMergeAutomation.mockClear();
 		processMergeAutomationDispatch.mockClear();
+		getSubmittedReviewSlot.mockClear();
+		getSubmittedReviewSlot.mockResolvedValue(undefined);
 	});
 
 	// Restore any per-test environment stub (e.g. SWARM_SINGLE_USER_MODE) so a mode
@@ -1039,6 +1064,205 @@ describe('processJob', () => {
 				error: expect.stringContaining('no-trigger'),
 			});
 			expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+		});
+
+		// Issue #815: a rate-limit retry redelivers the Review's original event, the
+		// trigger correctly declines because the verdict slot is already `submitted`,
+		// and the branch above used to write `failed` over a run that had genuinely
+		// approved the PR — losing its merge automation with it.
+		describe('no-trigger redelivery of an already-completed Review run (issue #815)', () => {
+			const autoMergeProject = createMockProjectConfig({
+				pipeline: { respondToReview: { autoMerge: true } },
+			});
+			const redeliveredJob = () =>
+				createMockScmWebhookJob({
+					runId: 'run-123',
+					continuationDispatchClaimed: true,
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+				});
+			/** The run row behind the redelivery: the Review for the same PR. */
+			const completedReviewRun = (overrides: Record<string, unknown> = {}) =>
+				getRunByIdFromDb.mockResolvedValue({
+					phase: 'review',
+					taskId: '17',
+					prNumber: '17',
+					...overrides,
+				});
+
+			it('records the ledger outcome as completed and still requests the merge', async () => {
+				projectLookup = () => autoMergeProject;
+				completedReviewRun();
+				getSubmittedReviewSlot.mockResolvedValue({
+					ordinal: 1,
+					verdict: 'approve',
+					reviewId: '5054356757',
+				});
+
+				const outcome = await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(getSubmittedReviewSlot).toHaveBeenCalledWith({
+					projectId: autoMergeProject.id,
+					repository: autoMergeProject.repo,
+					prNumber: '17',
+					headSha: 'deadbeef',
+				});
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'completed',
+					error: null,
+					nextRetryAt: null,
+					reviewVerdict: 'approve',
+					reviewOrdinal: 1,
+					reviewAutomationOutcome: undefined,
+				});
+				// The claim stays held: the review really was submitted, so handing it
+				// back would let a sibling event post a duplicate.
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(requestMergeAutomation).toHaveBeenCalledExactlyOnceWith({
+					project: autoMergeProject,
+					reviewRunId: 'run-123',
+					taskId: '17',
+					prNumber: '17',
+					approvedHeadSha: 'deadbeef',
+				});
+			});
+
+			// `uq_dispatches_active_run` allows one non-terminal dispatch per run, so
+			// the merge dispatch can only be inserted once this one is terminal.
+			it('completes the no-trigger dispatch before requesting the merge', async () => {
+				projectLookup = () => autoMergeProject;
+				completedReviewRun();
+				getSubmittedReviewSlot.mockResolvedValue({
+					ordinal: 1,
+					verdict: 'approve',
+					reviewId: '5054356757',
+				});
+
+				await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(completeDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+					requestMergeAutomation.mock.invocationCallOrder[0] as number,
+				);
+			});
+
+			it('records the completed outcome but requests no merge when autoMerge is off', async () => {
+				completedReviewRun();
+				getSubmittedReviewSlot.mockResolvedValue({
+					ordinal: 1,
+					verdict: 'approve',
+					reviewId: '5054356757',
+				});
+
+				await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-123',
+					expect.objectContaining({ status: 'completed', reviewVerdict: 'approve' }),
+				);
+				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+
+			it('carries the cap-reaching request-changes automation outcome and merges nothing', async () => {
+				projectLookup = () => autoMergeProject;
+				completedReviewRun();
+				getSubmittedReviewSlot.mockResolvedValue({
+					ordinal: 3,
+					verdict: 'request-changes',
+					reviewId: '99',
+				});
+
+				await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-123',
+					expect.objectContaining({
+						status: 'completed',
+						reviewVerdict: 'request-changes',
+						reviewOrdinal: 3,
+						reviewAutomationOutcome: 'manual-intervention-required',
+					}),
+				);
+				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+
+			// The ledger slot exists for this PR+head, but it is the Review's record —
+			// a continuation of another phase must not adopt its verdict.
+			it('still fails a non-Review continuation for the same PR and head', async () => {
+				projectLookup = () => autoMergeProject;
+				completedReviewRun({ phase: 'respond-to-review' });
+				getSubmittedReviewSlot.mockResolvedValue({
+					ordinal: 1,
+					verdict: 'approve',
+					reviewId: '5054356757',
+				});
+
+				await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('no-trigger'),
+				});
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+
+			it('still fails when the run acted on a different pull request', async () => {
+				completedReviewRun({ prNumber: '999' });
+				getSubmittedReviewSlot.mockResolvedValue({
+					ordinal: 1,
+					verdict: 'approve',
+					reviewId: '5054356757',
+				});
+
+				await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('no-trigger'),
+				});
+			});
+
+			it('still fails when this head has no submitted verdict', async () => {
+				completedReviewRun();
+
+				await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('no-trigger'),
+				});
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+			});
+
+			// A board-driven continuation carries no PR/head, so the ledger has no key
+			// to answer with — and must not be read at all.
+			it('does not read the ledger for a board-driven continuation', async () => {
+				await processJob(
+					{ ...createMockPmWebhookJob(), runId: 'run-123' },
+					registryReturning(null),
+				);
+
+				expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('no-trigger'),
+				});
+			});
+
+			it('falls back to the failure settle when the ledger read throws', async () => {
+				projectLookup = () => autoMergeProject;
+				completedReviewRun();
+				getSubmittedReviewSlot.mockRejectedValue(new Error('db down'));
+
+				const outcome = await processJob(redeliveredJob(), registryReturning(null));
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('no-trigger'),
+				});
+				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
 		});
 	});
 
