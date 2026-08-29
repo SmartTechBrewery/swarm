@@ -101,8 +101,14 @@ describe('toggleSaveKey', () => {
 	it('builds a stable per-phase, per-kind key', () => {
 		expect(toggleSaveKey('review', 'enabled')).toBe('review:enabled');
 		expect(toggleSaveKey('planning', 'autoAdvance')).toBe('planning:autoAdvance');
-		// The two kinds never collide for the same phase.
+		expect(toggleSaveKey('planning', 'verifyPlan')).toBe('planning:verifyPlan');
+		// The kinds never collide for the same phase — each toggle addresses its own
+		// spinner, so Planning's three keys must stay distinct.
 		expect(toggleSaveKey('planning', 'enabled')).not.toBe(toggleSaveKey('planning', 'autoAdvance'));
+		expect(toggleSaveKey('planning', 'verifyPlan')).not.toBe(
+			toggleSaveKey('planning', 'autoAdvance'),
+		);
+		expect(toggleSaveKey('planning', 'verifyPlan')).not.toBe(toggleSaveKey('planning', 'enabled'));
 	});
 });
 
@@ -533,6 +539,77 @@ describe('PhaseSettingsDetail', () => {
 		expect(handleAutoAdvanceChange).toHaveBeenCalledWith('planning', false);
 	});
 
+	it('renders the Verify plan toggle switch when verifyPlan is defined', () => {
+		const handleVerifyPlanChange = vi.fn();
+		render(
+			<PhaseSettingsDetail
+				phase="planning"
+				config={mockConfig}
+				isPending={false}
+				enabled={undefined}
+				verifyPlan={false}
+				handleVerifyPlanChange={handleVerifyPlanChange}
+				{...targetHandlers()}
+				handleTimeoutChange={() => {}}
+				handlePromptChange={() => {}}
+				onBack={() => {}}
+			/>,
+		);
+
+		const verifyPlanSwitch = screen.getByLabelText('Planning verify plan') as HTMLButtonElement;
+		expect(verifyPlanSwitch.getAttribute('aria-checked')).toBe('false');
+		expect(screen.getByText('Verify plan')).toBeDefined();
+
+		fireEvent.click(verifyPlanSwitch);
+		expect(handleVerifyPlanChange).toHaveBeenCalledWith(true);
+	});
+
+	it('omits the Verify plan toggle for a phase that has no such setting', () => {
+		render(
+			<PhaseSettingsDetail
+				phase="review"
+				config={mockConfig}
+				isPending={false}
+				enabled={true}
+				verifyPlan={undefined}
+				{...targetHandlers()}
+				handleTimeoutChange={() => {}}
+				handlePromptChange={() => {}}
+				onBack={() => {}}
+			/>,
+		);
+
+		expect(screen.queryByLabelText('Review verify plan')).toBeNull();
+		expect(screen.queryByText('Verify plan')).toBeNull();
+	});
+
+	it('spins only the Verify plan toggle while its own save is in flight', () => {
+		render(
+			<PhaseSettingsDetail
+				phase="planning"
+				config={mockConfig}
+				isPending={false}
+				enabled={undefined}
+				autoAdvance={false}
+				verifyPlan={true}
+				savingToggleKey={toggleSaveKey('planning', 'verifyPlan')}
+				handleVerifyPlanChange={() => {}}
+				{...targetHandlers()}
+				handleTimeoutChange={() => {}}
+				handlePromptChange={() => {}}
+				onBack={() => {}}
+			/>,
+		);
+
+		// One spinner, and every toggle is disabled — writes stay serialized (#369).
+		expect(screen.getAllByLabelText('Saving')).toHaveLength(1);
+		const verifyPlanSwitch = screen.getByLabelText('Planning verify plan') as HTMLButtonElement;
+		expect(verifyPlanSwitch.disabled).toBe(true);
+		expect((screen.getByLabelText('Planning auto-advance') as HTMLButtonElement).disabled).toBe(
+			true,
+		);
+	});
+
 	it('renders locked state label for respondToReview when enabledDisabled is true', () => {
 		render(
 			<PhaseSettingsDetail
@@ -835,6 +912,8 @@ describe('useToggleAutoSave hook', () => {
 		const setPipelineEnabled = vi.fn();
 		const pipelineAutoAdvance = { planning: false };
 		const setPipelineAutoAdvance = vi.fn();
+		const verifyPlan = false;
+		const setVerifyPlan = vi.fn();
 
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
@@ -843,6 +922,8 @@ describe('useToggleAutoSave hook', () => {
 				setPipelineEnabled,
 				pipelineAutoAdvance,
 				setPipelineAutoAdvance,
+				verifyPlan,
+				setVerifyPlan,
 				blocked: false,
 			}),
 		);
@@ -889,6 +970,8 @@ describe('useToggleAutoSave hook', () => {
 		const setPipelineEnabled = vi.fn();
 		const pipelineAutoAdvance = { planning: false };
 		const setPipelineAutoAdvance = vi.fn();
+		const verifyPlan = false;
+		const setVerifyPlan = vi.fn();
 
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
@@ -897,6 +980,8 @@ describe('useToggleAutoSave hook', () => {
 				setPipelineEnabled,
 				pipelineAutoAdvance,
 				setPipelineAutoAdvance,
+				verifyPlan,
+				setVerifyPlan,
 				blocked: false,
 			}),
 		);
@@ -918,10 +1003,78 @@ describe('useToggleAutoSave hook', () => {
 		});
 	});
 
+	it('only sends the planning verifyPlan toggle patch, under its own save key', async () => {
+		mockMutateFn.mockResolvedValue({
+			id: 'p1',
+			pipeline: {
+				planning: { autoAdvance: true, autoSplit: false, verifyPlan: true },
+			},
+		});
+		mockMutateFn.mockClear();
+		mockSetQueryDataFn.mockClear();
+
+		const setVerifyPlan = vi.fn();
+
+		const { result } = renderHook(() =>
+			useToggleAutoSave({
+				projectId: 'p1',
+				pipelineEnabled: { review: true, respondToReview: true, respondToCi: true },
+				setPipelineEnabled: vi.fn(),
+				pipelineAutoAdvance: { planning: true },
+				setPipelineAutoAdvance: vi.fn(),
+				verifyPlan: false,
+				setVerifyPlan,
+				blocked: false,
+			}),
+		);
+
+		await act(async () => {
+			result.current.handleVerifyPlanChange(true);
+		});
+
+		// Only the flipped field goes over the wire — `projects.update` deep-merges
+		// the `planning` block, so the project's autoAdvance/autoSplit/maxConcerns
+		// survive without the dashboard resending them.
+		expect(mockMutateFn).toHaveBeenCalledWith({
+			id: 'p1',
+			pipeline: { planning: { verifyPlan: true } },
+		});
+		expect(setVerifyPlan).toHaveBeenCalledWith(true);
+	});
+
+	it('rolls the Verify plan flip back when its save fails', async () => {
+		mockMutateFn.mockClear();
+		mockMutateFn.mockRejectedValueOnce(new Error('nope'));
+
+		const setVerifyPlan = vi.fn();
+
+		const { result } = renderHook(() =>
+			useToggleAutoSave({
+				projectId: 'p1',
+				pipelineEnabled: { review: true, respondToReview: true, respondToCi: true },
+				setPipelineEnabled: vi.fn(),
+				pipelineAutoAdvance: { planning: false },
+				setPipelineAutoAdvance: vi.fn(),
+				verifyPlan: false,
+				setVerifyPlan,
+				blocked: false,
+			}),
+		);
+
+		await act(async () => {
+			result.current.handleVerifyPlanChange(true);
+		});
+
+		// Optimistic flip, then the rollback to the pre-flip value (#369).
+		expect(setVerifyPlan).toHaveBeenNthCalledWith(1, true);
+		expect(setVerifyPlan).toHaveBeenNthCalledWith(2, false);
+	});
+
 	it('refuses a toggle while a Save Changes mutation is in flight (blocked), leaving state untouched', () => {
 		mockMutateFn.mockClear();
 		const setPipelineEnabled = vi.fn();
 		const setPipelineAutoAdvance = vi.fn();
+		const setVerifyPlan = vi.fn();
 
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
@@ -930,6 +1083,8 @@ describe('useToggleAutoSave hook', () => {
 				setPipelineEnabled,
 				pipelineAutoAdvance: { planning: false },
 				setPipelineAutoAdvance,
+				verifyPlan: false,
+				setVerifyPlan,
 				// A tab's Save Changes mutation is running: `updateMutation.isPending`
 				// is wired into `blocked` by the route.
 				blocked: true,
@@ -939,12 +1094,14 @@ describe('useToggleAutoSave hook', () => {
 		act(() => {
 			result.current.handleEnabledChange('review', false);
 			result.current.handleAutoAdvanceChange('planning', true);
+			result.current.handleVerifyPlanChange(true);
 		});
 
 		// No write is fired and the optimistic state is not touched — the toggle
 		// auto-save cannot overlap the in-flight Save, so neither read-merge-upsert
 		// can clobber the other (#369).
 		expect(mockMutateFn).not.toHaveBeenCalled();
+		expect(setVerifyPlan).not.toHaveBeenCalled();
 		expect(setPipelineEnabled).not.toHaveBeenCalled();
 		expect(setPipelineAutoAdvance).not.toHaveBeenCalled();
 	});
@@ -973,6 +1130,8 @@ describe('useToggleAutoSave hook', () => {
 				setPipelineEnabled,
 				pipelineAutoAdvance: { planning: false },
 				setPipelineAutoAdvance: vi.fn(),
+				verifyPlan: false,
+				setVerifyPlan: vi.fn(),
 				blocked: false,
 			}),
 		);

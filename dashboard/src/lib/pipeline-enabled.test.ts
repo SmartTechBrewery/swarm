@@ -7,16 +7,19 @@ import {
 	buildPipelineEnabledUpdate,
 	buildPipelineToggleUpdate,
 	buildReviewChecksPolicyUpdate,
+	buildVerifyPlanUpdate,
 	isAutoAdvancePhase,
 	isPipelineAutoAdvanceDirty,
 	isPipelineEnabledDirty,
 	isRespondToReviewLocked,
 	isReviewChecksPolicyDirty,
+	isVerifyPlanDirty,
 	setAutoAdvanceEnabled,
 	setPhaseEnabled,
 	toPipelineAutoAdvanceForm,
 	toPipelineEnabledForm,
 	toReviewChecksPolicyForm,
+	toVerifyPlanForm,
 } from './pipeline-enabled.js';
 
 describe('auto-advance form mapping', () => {
@@ -65,6 +68,41 @@ describe('auto-advance form mapping', () => {
 			respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
 			respondToCi: { enabled: false },
 		});
+	});
+});
+
+describe('verify-plan form mapping', () => {
+	it('reads an unset override as off', () => {
+		expect(toVerifyPlanForm(undefined)).toBe(false);
+		expect(toVerifyPlanForm({})).toBe(false);
+		expect(toVerifyPlanForm({ planning: { autoAdvance: true } })).toBe(false);
+	});
+
+	it('reads the stored value and reports only a differing selection as dirty', () => {
+		const pipeline: PipelineConfig = { planning: { verifyPlan: true } };
+		expect(toVerifyPlanForm(pipeline)).toBe(true);
+		expect(isVerifyPlanDirty(true, pipeline)).toBe(false);
+		expect(isVerifyPlanDirty(false, pipeline)).toBe(true);
+		// An unset override reads as off, so selecting "on" against it is dirty.
+		expect(isVerifyPlanDirty(true, undefined)).toBe(true);
+		expect(isVerifyPlanDirty(false, undefined)).toBe(false);
+	});
+
+	it('updates only verifyPlan while preserving unrelated pipeline settings', () => {
+		const existing: PipelineConfig = {
+			planning: { autoAdvance: true, autoSplit: false, maxConcerns: 3 },
+			review: { enabled: false },
+			respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
+			respondToCi: { enabled: false },
+		};
+		expect(buildVerifyPlanUpdate(true, existing)).toEqual({
+			...existing,
+			planning: { autoAdvance: true, autoSplit: false, maxConcerns: 3, verifyPlan: true },
+		});
+	});
+
+	it('writes the flag onto a project with no stored pipeline at all', () => {
+		expect(buildVerifyPlanUpdate(true, undefined)).toEqual({ planning: { verifyPlan: true } });
 	});
 });
 
@@ -188,16 +226,18 @@ describe('buildPipelineEnabledUpdate', () => {
 });
 
 describe('buildPipelineToggleUpdate', () => {
-	it('carries both the enabled flags and Planning auto-advance in one payload', () => {
+	it('carries the enabled flags, Planning auto-advance and Verify plan in one payload', () => {
 		const result = buildPipelineToggleUpdate(
 			{ review: true, respondToReview: false, respondToCi: true },
 			{ planning: true },
+			true,
 			undefined,
 		);
 		expect(result.review?.enabled).toBe(true);
 		expect(result.respondToReview?.enabled).toBe(false);
 		expect(result.respondToCi?.enabled).toBe(true);
 		expect(result.planning?.autoAdvance).toBe(true);
+		expect(result.planning?.verifyPlan).toBe(true);
 	});
 
 	it('preserves every stored pipeline field the Agents-tab toggles do not own', () => {
@@ -211,9 +251,10 @@ describe('buildPipelineToggleUpdate', () => {
 		const result = buildPipelineToggleUpdate(
 			{ review: true, respondToReview: true, respondToCi: true },
 			{ planning: true },
+			false,
 			existing,
 		);
-		expect(result.planning).toEqual({ autoAdvance: true, autoSplit: true });
+		expect(result.planning).toEqual({ autoAdvance: true, autoSplit: true, verifyPlan: false });
 		expect(result.review?.checks).toBe('if-present');
 		expect(result.review?.enabled).toBe(true);
 		expect(result.respondToReview?.autoMerge).toBe(true);
@@ -224,6 +265,7 @@ describe('buildPipelineToggleUpdate', () => {
 		const result = buildPipelineToggleUpdate(
 			{ review: false, respondToReview: true, respondToCi: true },
 			{ planning: false },
+			false,
 			undefined,
 		);
 		expect(result.review?.enabled).toBe(false);
