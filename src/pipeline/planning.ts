@@ -33,7 +33,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { z } from 'zod';
@@ -1323,18 +1323,22 @@ interface CapturedArtifact {
  * (issue #818). This is what makes the verification pass genuinely best-effort:
  * a killed verifier can leave `proposed_split.json` half-written, and
  * `readProposedSplit` throws on malformed JSON — which would fail an otherwise
- * complete Planning run. An entry that did not exist before the run is skipped
- * rather than deleted; a restore failure is logged and swallowed, since a failed
- * rollback must not become the exception that fails the phase.
+ * complete Planning run. Full rollbacks also remove an artifact the verifier
+ * created; a restore failure is logged and swallowed, since a failed rollback
+ * must not become the exception that fails the phase.
  */
 function restorePlanningArtifacts(
 	artifacts: readonly CapturedArtifact[],
 	taskId: string,
 	workItemId: string,
+	removeCreated = false,
 ): void {
 	for (const { path, before } of artifacts) {
-		if (before === undefined) continue;
 		try {
+			if (before === undefined) {
+				if (removeCreated && existsSync(path)) unlinkSync(path);
+				continue;
+			}
 			if (existsSync(path) && readFileSync(path, 'utf8') === before) continue;
 			writeFileSync(path, before);
 		} catch (error) {
@@ -1357,6 +1361,7 @@ interface PlanVerificationOptions {
 	workItem: WorkItem;
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	autoSplit: boolean;
 	runAgent: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	/** The plan already read from disk, returned unchanged when nothing was corrected. */
 	plan: string;
@@ -1373,9 +1378,9 @@ interface PlanVerificationOptions {
  *
  * Best-effort, following the swallow-and-log contract of the other post-plan
  * helpers here (`markSplitChildPlanned`, `linkBlockedBy`): a non-zero exit, a
- * timeout, or a throw is logged as a warning and Planning proceeds with the
- * original, unverified plan — with every captured artifact rolled back, so a
- * killed verifier can never fail the phase through `readProposedSplit`.
+ * timeout, a throw, or invalid output is logged as a warning and Planning
+ * proceeds with the original, unverified plan. Cancellation is rethrown so it
+ * settles through the phase's existing cancellation path.
  */
 async function runPlanVerification(
 	options: PlanVerificationOptions,
@@ -1389,6 +1394,7 @@ async function runPlanVerification(
 		workItem,
 		timeoutMs,
 		signal,
+		autoSplit,
 		runAgent,
 		plan,
 	} = options;
@@ -1411,6 +1417,7 @@ async function runPlanVerification(
 		{ path: scopePath, before: scopeBefore },
 	];
 	const scopeOnly = captured.slice(2);
+	let verificationAborted = false;
 
 	try {
 		const agent = await runAgent({
@@ -1428,6 +1435,16 @@ async function runPlanVerification(
 			signal,
 		});
 
+		if (agent.aborted || signal?.aborted) {
+			verificationAborted = true;
+			restorePlanningArtifacts(captured, taskId, workItemId, true);
+			throw agentRunError(
+				agent,
+				`Plan verification agent (${cli}) was cancelled`,
+				` for task '${taskId}'`,
+			);
+		}
+
 		if (agent.exitCode !== 0) {
 			// `runAgentCli` reports a timeout as a killed process rather than a throw,
 			// so this arm covers it too.
@@ -1440,13 +1457,28 @@ async function runPlanVerification(
 					timedOut: agent.timedOut,
 				},
 			);
-			restorePlanningArtifacts(captured, taskId, workItemId);
+			restorePlanningArtifacts(captured, taskId, workItemId, true);
 			return { verification: { ran: false, corrected: false }, plan };
 		}
 
 		const planAfter = read(planPath);
 		const splitAfter = read(splitPath);
-		const corrected = planAfter !== planBefore || splitAfter !== splitBefore;
+		const verifiedPlan = planAfter?.trim() ? planAfter.trim() : plan;
+		try {
+			if (autoSplit && !/##\s*scope\s*gate/i.test(verifiedPlan)) {
+				throw new Error('Verifier removed the required "## Scope gate" section');
+			}
+			if (splitBefore !== undefined) readProposedSplit(worktreePath);
+		} catch (error) {
+			logger.warn('Planning — plan verification produced invalid output; continuing unverified', {
+				taskId,
+				workItemId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			restorePlanningArtifacts(captured, taskId, workItemId, true);
+			return { verification: { ran: false, corrected: false }, plan };
+		}
+		const corrected = verifiedPlan !== plan || splitAfter !== splitBefore;
 		// The plan/split files are left exactly as the verifier wrote them — that is
 		// the correction this whole pass exists to make — but the scope file is never
 		// allowed to end a *successful* run changed either, since the verifier is
@@ -1460,17 +1492,16 @@ async function runPlanVerification(
 		});
 		return {
 			verification: { ran: true, corrected },
-			// `|| plan` guards against a verifier that emptied the plan turning a
-			// successful Planning run into a failed one.
-			plan: planAfter?.trim() ? planAfter : plan,
+			plan: corrected ? verifiedPlan : plan,
 		};
 	} catch (error) {
+		if (verificationAborted || signal?.aborted) throw error;
 		logger.warn('Planning — plan verification failed; continuing with the unverified plan', {
 			taskId,
 			workItemId,
 			error: error instanceof Error ? error.message : String(error),
 		});
-		restorePlanningArtifacts(captured, taskId, workItemId);
+		restorePlanningArtifacts(captured, taskId, workItemId, true);
 		return { verification: { ran: false, corrected: false }, plan };
 	}
 }
@@ -1900,6 +1931,7 @@ export async function runPlanningPhase(
 					workItem,
 					timeoutMs,
 					signal,
+					autoSplit,
 					runAgent,
 					plan,
 				})

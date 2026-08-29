@@ -28,10 +28,17 @@ function setFsFor(path: unknown, contents: string): void {
 		planContents = contents;
 	}
 }
+function removeFsFor(path: unknown): void {
+	const p = String(path);
+	if (p.endsWith('proposed_split.json')) splitExists = false;
+	else if (p.endsWith('proposed_scope.json')) scopeExists = false;
+	else planExists = false;
+}
 vi.mock('node:fs', () => ({
 	existsSync: (path: unknown) => fsFor(path).exists,
 	readFileSync: (path: unknown) => fsFor(path).contents,
 	writeFileSync: (path: unknown, data: unknown) => setFsFor(path, String(data)),
+	unlinkSync: (path: unknown) => removeFsFor(path),
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
@@ -1672,6 +1679,17 @@ describe('runPlanningPhase', () => {
 			});
 		}
 
+		it('propagates cancellation during verification without applying the plan', async () => {
+			const deps = makeDeps();
+			onVerification(deps, () => {}, agentResult({ exitCode: null, aborted: true }));
+
+			await expect(runPlanningPhase({ ...deps, verifyPlan: true })).rejects.toThrow(/cancelled/);
+
+			expect(deps.pm.addComment).not.toHaveBeenCalled();
+			expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+			expect(deps.pm.addLabel).not.toHaveBeenCalled();
+		});
+
 		it('restores a half-written split file left behind by a failed verifier', async () => {
 			splitExists = true;
 			splitContents = splitFixture('# UI plan\n\n1. Build it.');
@@ -1700,6 +1718,58 @@ describe('runPlanningPhase', () => {
 			).toBe('# UI plan\n\n1. Build it.');
 		});
 
+		it('restores malformed split output from a successful verifier', async () => {
+			splitExists = true;
+			splitContents = splitFixture('# UI plan\n\n1. Build it.');
+			const deps = makeDeps();
+			onVerification(deps, () => {
+				splitContents = '{"subTasks": [';
+			});
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(result.verification).toEqual({ ran: false, corrected: false });
+			expect(deps.pm.createWorkItem).toHaveBeenCalledTimes(1);
+			expect(
+				planFromMarker(
+					deps.pm.updateWorkItem.mock.calls.find((call) => call[0] === 'PVTI_Second slice')?.[1]
+						.description ?? '',
+					'Second slice',
+				),
+			).toBe('# UI plan\n\n1. Build it.');
+		});
+
+		it('restores a scope gate removed by a successful verifier', async () => {
+			const deps = makeDeps();
+			const original = planContents;
+			onVerification(deps, () => {
+				planContents = '# Plan\n\n1. Broken correction.';
+			});
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(result.plan).toBe(original);
+			expect(result.verification).toEqual({ ran: false, corrected: false });
+			expect(deps.pm.addComment.mock.calls[0][1]).toContain(original);
+		});
+
+		it('removes a split file created by a failed verifier', async () => {
+			const deps = makeDeps();
+			onVerification(
+				deps,
+				() => {
+					splitExists = true;
+					splitContents = splitFixture('# Untrusted split plan');
+				},
+				new Error('killed'),
+			);
+
+			await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(splitExists).toBe(false);
+			expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+		});
+
 		it('reverts the scope declaration the verifier is never allowed to touch', async () => {
 			const deps = makeDeps();
 			const original = scopeContents;
@@ -1719,6 +1789,17 @@ describe('runPlanningPhase', () => {
 			expect(scopeContents).toBe(original);
 			expect(result.planningScope?.independentConcerns).toEqual(['the planning phase']);
 			expect(result.verification).toEqual({ ran: true, corrected: false });
+		});
+
+		it('keeps an unchanged verified plan normalized like the unverified path', async () => {
+			planContents = `\n${planContents}\n`;
+			const deps = makeDeps();
+			onVerification(deps);
+
+			const result = await runPlanningPhase({ ...deps, verifyPlan: true });
+
+			expect(result.plan).toBe(planContents.trim());
+			expect(deps.pm.addComment.mock.calls[0][1]).toContain(planContents.trim());
 		});
 
 		it('runs no agent at all for a preplanned split child, even with verifyPlan on', async () => {
