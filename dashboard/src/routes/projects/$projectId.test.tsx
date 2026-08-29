@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
+import type React from 'react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
 import type { RepositoryForm } from '@/lib/project-repository.js';
 import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
@@ -64,8 +65,10 @@ vi.mock('@/lib/trpc.js', () => ({
 	},
 }));
 
+import { toPipelineAutoAdvanceForm, toPipelineEnabledForm } from '@/lib/pipeline-enabled.js';
 import { PROJECT_TABS } from '@/lib/project-nav.js';
 import {
+	AgentConfigurationForm,
 	diffProjectForSync,
 	GeneralSettingsForm,
 	isConfigWriteInFlight,
@@ -1493,5 +1496,109 @@ describe('PipelineSettingsForm serialization', () => {
 		);
 
 		expect(screen.getByRole('button', { name: /Saving…/ })).toHaveProperty('disabled', true);
+	});
+});
+
+describe('AgentConfigurationForm — Save/Reset scoping', () => {
+	type FormProps = React.ComponentProps<typeof AgentConfigurationForm>;
+
+	/** Every prop the form needs; override only what a test asserts on (issue #834). */
+	function renderForm(overrides: Partial<FormProps> = {}) {
+		const handleSubmit = vi.fn((e: React.FormEvent) => e.preventDefault());
+		const handleReset = vi.fn();
+		const onSelectPhase = vi.fn();
+		const handleEnabledChange = vi.fn();
+		const handleAutoAdvanceChange = vi.fn();
+		render(
+			<AgentConfigurationForm
+				agents={{}}
+				pipelineEnabled={toPipelineEnabledForm(undefined)}
+				pipelineAutoAdvance={toPipelineAutoAdvanceForm(undefined)}
+				verifyPlan={false}
+				selectedPhase={undefined}
+				onSelectPhase={onSelectPhase}
+				onBack={() => {}}
+				handleEnabledChange={handleEnabledChange}
+				handleAutoAdvanceChange={handleAutoAdvanceChange}
+				handleVerifyPlanChange={() => {}}
+				handleTargetChange={() => {}}
+				handleAddTarget={() => {}}
+				handleRemoveTarget={() => {}}
+				handleMoveTarget={() => {}}
+				handleTimeoutChange={() => {}}
+				handlePromptChange={() => {}}
+				handleSubmit={handleSubmit}
+				handleReset={handleReset}
+				isDirty={true}
+				dirtyPhases={[]}
+				hasValidationError={false}
+				isPending={false}
+				isSuccess={false}
+				isError={false}
+				{...overrides}
+			/>,
+		);
+		return {
+			handleSubmit,
+			handleReset,
+			onSelectPhase,
+			handleEnabledChange,
+			handleAutoAdvanceChange,
+		};
+	}
+
+	it('offers no Save Changes / Reset on the phases list, even with unsaved edits', () => {
+		renderForm({ selectedPhase: undefined, isDirty: true, dirtyPhases: ['planning'] });
+
+		expect(screen.queryByRole('button', { name: 'Save Changes' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Reset' })).toBeNull();
+		// The list itself is unchanged — every phase still has its row.
+		expect(screen.getByRole('heading', { level: 2, name: 'Phases Configuration' })).toBeDefined();
+	});
+
+	it("offers Save Changes / Reset on a phase's detail screen, under the same isDirty gate", () => {
+		const { handleReset } = renderForm({ selectedPhase: 'planning', isDirty: true });
+		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', false);
+		fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+		expect(handleReset).toHaveBeenCalled();
+
+		cleanup();
+		renderForm({ selectedPhase: 'planning', isDirty: false });
+		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', true);
+	});
+
+	it('still blocks Save on a validation error, and only Save', () => {
+		renderForm({ selectedPhase: 'planning', isDirty: true, hasValidationError: true });
+
+		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', false);
+	});
+
+	it('keeps the autosaving toggles on the phases list', () => {
+		const { handleEnabledChange } = renderForm({ selectedPhase: undefined });
+
+		const reviewToggle = screen.getByLabelText('Review enabled') as HTMLButtonElement;
+		fireEvent.click(reviewToggle);
+		expect(handleEnabledChange).toHaveBeenCalledWith('review', false);
+	});
+
+	it('names the phases still holding unsaved edits, and opens the one that is clicked', () => {
+		const { onSelectPhase } = renderForm({
+			selectedPhase: undefined,
+			isDirty: true,
+			dirtyPhases: ['planning', 'review'],
+		});
+
+		expect(screen.getByText(/Unsaved changes are waiting on/)).toBeDefined();
+		fireEvent.click(screen.getByRole('button', { name: 'Planning' }));
+		expect(onSelectPhase).toHaveBeenCalledWith('planning');
+		expect(screen.getByRole('button', { name: 'Review' })).toBeDefined();
+	});
+
+	it('shows no pending-edits notice when nothing is unsaved', () => {
+		renderForm({ selectedPhase: undefined, isDirty: false, dirtyPhases: [] });
+
+		expect(screen.queryByText(/Unsaved changes are waiting on/)).toBeNull();
 	});
 });
