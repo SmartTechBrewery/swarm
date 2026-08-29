@@ -12,7 +12,10 @@
  *
  * Like `src/pipeline/prompts/planning.ts` this is a pure builder with no I/O; the
  * run itself, and the best-effort contract around it, live in
- * `src/pipeline/planning.ts`.
+ * `src/pipeline/planning.ts`. The two marks the pass leaves on a plan a human
+ * reads — the inline {@link PLAN_CORRECTION_MARKER} the prompt asks for, and the
+ * {@link PLAN_VERIFIED_NOTE} the phase appends once the pass has completed — are
+ * defined here too, so the pass's whole visible vocabulary is in one place.
  */
 
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
@@ -23,6 +26,44 @@ import { PROPOSED_PLAN_FILENAME, PROPOSED_SPLIT_FILENAME } from '@/pipeline/prom
  * corrected claim is auditable in the posted plan rather than a silent edit.
  */
 export const PLAN_CORRECTION_MARKER = '[plan-verify]';
+
+/**
+ * Lead sentence of the note appended to every plan a *completed* verification
+ * pass checked (issue #831).
+ *
+ * A pass that finds nothing wrong leaves no {@link PLAN_CORRECTION_MARKER}
+ * anywhere — the prompt's hard rule is to change nothing at all when every claim
+ * checks out — so without this note a posted plan reads identically whether it
+ * was verified and found accurate, was never verified (`verifyPlan` off), or was
+ * verified by a pass that failed and fell back to the unverified plan. The note
+ * is written only on the first of those three, which is what keeps the other two
+ * distinguishable from the comment alone.
+ *
+ * Exported as the lead alone so {@link appendPlanVerifiedNote} can recognise a
+ * note it has already written.
+ */
+export const PLAN_VERIFIED_NOTE =
+	'Fact-checked against the repository by an independent verification pass';
+
+/**
+ * Append {@link PLAN_VERIFIED_NOTE} to one plan — the main task's own, or a
+ * split child's `subTasks[].plan`, which is posted as that child's Preplan
+ * comment and replayed verbatim as its plan. `corrected` is the pass's own
+ * whole-run outcome, so the corrected wording claims only that corrections are
+ * marked *where they were made*: one artifact of a corrected run may itself have
+ * needed nothing.
+ *
+ * Idempotent — a resumed planning run can re-verify a plan this already
+ * annotated, and a second note would say nothing the first did not.
+ */
+export function appendPlanVerifiedNote(plan: string, corrected: boolean): string {
+	const trimmed = plan.trim();
+	if (trimmed.includes(PLAN_VERIFIED_NOTE)) return trimmed;
+	const detail = corrected
+		? `; any corrections are marked inline with \`${PLAN_CORRECTION_MARKER}\``
+		: ' — no inaccuracies found';
+	return `${trimmed}\n\n_${PLAN_VERIFIED_NOTE}${detail}._`;
+}
 
 /**
  * Build the prompt handed to the verification agent. `hasSplit` is whether the
