@@ -148,11 +148,14 @@ export interface AwaitingDispatchResult {
 	dispose: () => void;
 }
 
-/** One dispatch a transport interruption applies to, and the run whose output stream annotates it. */
-export interface InterruptedDispatch {
+/** One dispatch this router is awaiting, and the run row that dispatch's attempt opened. */
+export interface AwaitedDispatch {
 	dispatchId: string;
 	runId?: string;
 }
+
+/** One dispatch a transport interruption applies to, and the run whose output stream annotates it. */
+export type InterruptedDispatch = AwaitedDispatch;
 
 /**
  * Register interest in a dispatch's back-channel frames before the assignment is
@@ -344,6 +347,28 @@ export function noteWorkerTransportRestored(workerId: string): InterruptedDispat
 		restored.push({ dispatchId, runId: entry.runId });
 	}
 	return restored;
+}
+
+/**
+ * Every dispatch this router is currently awaiting on `workerId` — the unfiltered
+ * view `noteWorkerTransportRestored` narrows. It exists for the reconnect
+ * cancellation re-push (`./dispatch-cancellation.ts`, issue #827): a socket that
+ * opens has to be told about a termination recorded while it was down, and whether
+ * *this* router ever saw the transport drop says nothing about whether one was —
+ * the marker is durable and the terminate may have been requested against a router
+ * that had already given up on the socket, or none at all.
+ *
+ * Returns the same shape and keeps the same non-writing contract as the two note
+ * functions above: this module has no database or Redis dependency, so the caller
+ * is the side that reads the marker and pushes the frame.
+ */
+export function listAwaitedDispatchesForWorker(workerId: string): AwaitedDispatch[] {
+	const awaited: AwaitedDispatch[] = [];
+	for (const [dispatchId, entry] of pending) {
+		if (entry.workerId !== workerId) continue;
+		awaited.push({ dispatchId, runId: entry.runId });
+	}
+	return awaited;
 }
 
 /** Route a progress frame to the awaiting dispatcher, if any (a no-op otherwise). */

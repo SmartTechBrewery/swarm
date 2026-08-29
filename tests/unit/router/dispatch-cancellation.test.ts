@@ -1,8 +1,10 @@
 import type { WSContext } from 'hono/ws';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { logger } from '@/lib/logger.js';
 import {
 	cancelRunOnWorker,
 	DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS,
+	resendRunCancellationsToWorker,
 	resolveOfflineWorkerCancelTimeoutMs,
 	subscribeDispatchCancellations,
 } from '@/router/dispatch-cancellation.js';
@@ -12,12 +14,17 @@ import { deregisterConnection, registerConnection } from '@/router/worker-connec
 // The pub/sub half is Redis; mock it so the bridge from a cancellation
 // notification to a pushed frame is testable without a live datastore. The two
 // registries it reads are real — this test is about how they compose.
-const { subscribeToRunCancellations } = vi.hoisted(() => ({
+const { subscribeToRunCancellations, isRunCancellationRequested } = vi.hoisted(() => ({
 	subscribeToRunCancellations:
 		vi.fn<(onCancel: (runId: string) => void) => { close: () => Promise<void> }>(),
+	// The durable marker, read again when a worker's socket comes back (issue #827
+	// review): the notification fires once, so the reconnect is the second and last
+	// place a missed cancellation can be re-stated.
+	isRunCancellationRequested: vi.fn<(runId: string) => Promise<boolean>>(),
 }));
 vi.mock('@/queue/cancellation.js', () => ({
 	subscribeToRunCancellations,
+	isRunCancellationRequested,
 	// The module now names the neutral terminal wording itself (issue #827).
 	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
 }));
@@ -365,6 +372,93 @@ describe('cancelRunOnWorker', () => {
 		await expect(awaiting.result).resolves.toMatchObject({ status: 'succeeded' });
 
 		awaiting.dispose();
+	});
+});
+
+/**
+ * Issue #827, review #5058049296 F1. The silence wait above only re-pushes from a
+ * timer it armed, and it arms one only when the worker was *already* silent past
+ * `max(2 × ttl, 2m)` at the moment of the terminate. The everyday sequence is the
+ * other one — the socket drops, the operator terminates seconds later while the
+ * retained heartbeat is still fresh, the daemon reconnects moments after that — and
+ * nothing re-states the cancellation to it: the notification fired once and was
+ * missed. So the socket open reads the durable marker itself.
+ */
+describe('resendRunCancellationsToWorker', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		isRunCancellationRequested.mockResolvedValue(false);
+	});
+
+	it('pushes the cancellation an awaited run is marked with', async () => {
+		isRunCancellationRequested.mockResolvedValue(true);
+		const ws = fakeWs();
+		// The socket is already registered when the hook runs: `handleWorkerStreamOpen`
+		// registers first and re-pushes last, so the frame addresses this connection.
+		registerConnection(WORKER_ID, ws);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		resendRunCancellationsToWorker(WORKER_ID);
+		await vi.waitFor(() => expect(ws.send).toHaveBeenCalled());
+
+		expect(framesOn(ws)).toMatchObject([
+			{ type: 'task-cancel', dispatchId: DISPATCH_ID, runId: RUN_ID, phase: 'review' },
+		]);
+		expect(isRunCancellationRequested).toHaveBeenCalledWith(RUN_ID);
+
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, ws);
+	});
+
+	it('pushes nothing for an awaited run that was never terminated', async () => {
+		const ws = fakeWs();
+		registerConnection(WORKER_ID, ws);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		resendRunCancellationsToWorker(WORKER_ID);
+		await vi.waitFor(() => expect(isRunCancellationRequested).toHaveBeenCalledWith(RUN_ID));
+
+		expect(ws.send).not.toHaveBeenCalled();
+
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, ws);
+	});
+
+	it('reads no marker for a dispatch awaited on another worker', async () => {
+		isRunCancellationRequested.mockResolvedValue(true);
+		const bystander = fakeWs();
+		registerConnection(OTHER_WORKER_ID, bystander);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		resendRunCancellationsToWorker(OTHER_WORKER_ID);
+		// The pass over an empty list awaits nothing, so one flush settles it entirely.
+		await Promise.resolve();
+
+		expect(isRunCancellationRequested).not.toHaveBeenCalled();
+		expect(bystander.send).not.toHaveBeenCalled();
+
+		awaiting.dispose();
+		deregisterConnection(OTHER_WORKER_ID, bystander);
+	});
+
+	it('survives an unreadable marker without failing the socket that just opened', async () => {
+		// `isRunCancellationRequested` already fails safe to `false` on a Redis error, so
+		// a rejection here is the belt-and-braces case: the pass is caught and logged,
+		// and the caller — a connection hook — never sees it.
+		isRunCancellationRequested.mockRejectedValue(new Error('connection terminated'));
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const ws = fakeWs();
+		registerConnection(WORKER_ID, ws);
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		expect(() => resendRunCancellationsToWorker(WORKER_ID)).not.toThrow();
+		await vi.waitFor(() => expect(warnSpy).toHaveBeenCalled());
+
+		expect(ws.send).not.toHaveBeenCalled();
+
+		warnSpy.mockRestore();
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, ws);
 	});
 });
 

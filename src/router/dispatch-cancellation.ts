@@ -41,7 +41,11 @@
  * later instead. That remains a **heuristic about liveness, not proof the phase
  * stopped** — which is why the same test is re-run when the timer fires, and why a
  * worker that comes back inside the wait is handed the cancellation (issue #724's
- * path) rather than settled behind its back. Live repro that prompted it:
+ * path) rather than settled behind its back. A worker that comes back when no wait
+ * was ever armed — the socket dropped, the terminate landed while its heartbeat was
+ * still fresh, the daemon reconnected moments later — is handed it too, from the
+ * stream-open side ({@link resendRunCancellationsToWorker}), which is the second and
+ * last place the durable marker is consulted. Live repro that prompted it:
  * 2026-08-29, `rover` task 5's `planning` phase on worker `jacek_tp_rover`, whose
  * transport session had been released minutes before the Terminate — the marker and
  * origin were recorded, the push failed, and the run row stayed `running` until it
@@ -56,9 +60,14 @@ import {
 import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { RUN_CANCELLED_MESSAGE, subscribeToRunCancellations } from '../queue/cancellation.js';
+import {
+	isRunCancellationRequested,
+	RUN_CANCELLED_MESSAGE,
+	subscribeToRunCancellations,
+} from '../queue/cancellation.js';
 import {
 	failDispatchResultWait,
+	listAwaitedDispatchesForWorker,
 	type RunDispatchTarget,
 	resolveDispatchTargetForRun,
 } from './dispatch-results.js';
@@ -299,6 +308,56 @@ export function cancelRunOnWorker(runId: string): boolean {
 		workerId: target.workerId,
 	});
 	return true;
+}
+
+/**
+ * Hand a reconnected worker every cancellation it missed while its socket was down
+ * (issue #827 review).
+ *
+ * The silence wait above only re-pushes from a timer it armed, and it arms one only
+ * for a worker that was *already* silent past {@link offlineSilenceMs} when the
+ * termination arrived. The common case is the opposite order: the socket drops, the
+ * operator terminates seconds later, the push fails against a worker whose retained
+ * heartbeat is still fresh — so nothing is armed — and the daemon reconnects a
+ * moment afterwards with its agent still running. Nothing else re-states the
+ * cancellation to it: `subscribeToRunCancellations` fires once, and the stream open
+ * only registered the socket and promoted availability work. So the socket open is
+ * the second place the durable marker is consulted.
+ *
+ * Everything about it is best-effort, exactly like the push it repeats:
+ * `isRunCancellationRequested` already fails safe to `false` on an unreadable Redis,
+ * a run whose dispatch is no longer awaited here resolves to nothing, and the whole
+ * pass is caught and logged so a socket that just opened never fails on it. A worker
+ * that *did* receive the original cancel is simply told again — `deliverDispatchResult`
+ * consumes the registration, so the duplicate terminal result it may answer with
+ * (issue #724) is a no-op.
+ *
+ * Fire-and-forget: it returns `void` so the transport's connection hooks stay
+ * synchronous (`./worker-transport.ts`).
+ */
+export function resendRunCancellationsToWorker(workerId: string): void {
+	void resendRunCancellations(workerId).catch((err) => {
+		logger.warn('run cancellation: could not re-push cancellations for a reconnected worker', {
+			workerId,
+			error: describeError(err),
+		});
+	});
+}
+
+/** The awaited body of {@link resendRunCancellationsToWorker}. */
+async function resendRunCancellations(workerId: string): Promise<void> {
+	for (const dispatch of listAwaitedDispatchesForWorker(workerId)) {
+		// A dispatch with no run row has no durable marker to read: the marker is keyed
+		// by run id, and a cancellation names a run.
+		if (dispatch.runId === undefined) continue;
+		if (!(await isRunCancellationRequested(dispatch.runId))) continue;
+		logger.info('run cancellation: the worker reconnected with a terminated run — re-pushing', {
+			runId: dispatch.runId,
+			dispatchId: dispatch.dispatchId,
+			workerId,
+		});
+		cancelRunOnWorker(dispatch.runId);
+	}
 }
 
 /**
