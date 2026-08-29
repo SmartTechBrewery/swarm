@@ -1,107 +1,101 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/cliQuotasRepository.js', () => ({
-	getAllCliQuotas: vi.fn(),
+	listCliQuotasForOwner: vi.fn(),
 	upsertCliQuota: vi.fn(),
-}));
-
-vi.mock('@/harness/quota-discovery.js', () => ({
-	discoverCliQuotas: vi.fn(),
-	discoveryHost: vi.fn(() => 'control-plane.local'),
 }));
 
 import { quotaRouter } from '@/api/routers/quota.js';
 import {
-	getAllCliQuotas,
-	type HostCliQuotaSnapshot,
-	upsertCliQuota,
+	listCliQuotasForOwner,
+	type WorkerCliQuotaSnapshot,
 } from '@/db/repositories/cliQuotasRepository.js';
-import type { CliQuotaSnapshot } from '@/harness/quota.js';
-import { discoverCliQuotas } from '@/harness/quota-discovery.js';
+import type { SwarmUser } from '@/identity/schema.js';
 
-describe('quotaRouter', () => {
-	const AUTHED_USER = {
+function user(overrides: Partial<SwarmUser> = {}): SwarmUser {
+	return {
 		id: '00000000-0000-4000-8000-000000000000',
 		identifier: 'tester@example.com',
 		displayName: 'Tester',
-		instanceAdmin: true,
+		instanceAdmin: false,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
+		...overrides,
 	};
-	const caller = quotaRouter.createCaller({ user: AUTHED_USER });
+}
 
+function snapshot(overrides: Partial<WorkerCliQuotaSnapshot> = {}): WorkerCliQuotaSnapshot {
+	return {
+		workerId: '11111111-1111-4111-8111-111111111111',
+		workerName: 'm5_pro',
+		cli: 'codex',
+		status: 'available',
+		source: 'live',
+		lastUpdated: '2026-08-13T08:00:00.000Z',
+		...overrides,
+	};
+}
+
+describe('quotaRouter', () => {
 	beforeEach(() => {
-		vi.mocked(getAllCliQuotas).mockReset();
-		vi.mocked(upsertCliQuota).mockReset();
-		vi.mocked(discoverCliQuotas).mockReset();
+		vi.mocked(listCliQuotasForOwner).mockReset();
+		vi.mocked(listCliQuotasForOwner).mockResolvedValue([]);
 	});
 
 	describe('getQuotas', () => {
-		// Issue #703: two hosts can report the same CLI, and each row's host must
-		// survive the read — the page attributes an allowance with it.
-		it('passes host-attributed snapshots through unchanged', async () => {
-			const mockSnapshots: HostCliQuotaSnapshot[] = [
-				{
-					host: 'builder-01',
-					cli: 'codex',
-					status: 'available',
-					source: 'live',
-					lastUpdated: new Date().toISOString(),
-				},
-				{
-					host: 'builder-02',
-					cli: 'codex',
+		// Issue #823: two workers can report the same CLI, and each row's attribution
+		// must survive the read — the page groups an allowance by it.
+		it('reads the caller’s own workers and passes the rows through unchanged', async () => {
+			const rows = [
+				snapshot(),
+				snapshot({
+					workerId: '22222222-2222-4222-8222-222222222222',
+					workerName: 'mini',
 					status: 'unavailable',
 					source: 'fallback',
-					lastUpdated: new Date().toISOString(),
-				},
+				}),
 			];
-			vi.mocked(getAllCliQuotas).mockResolvedValue(mockSnapshots);
+			vi.mocked(listCliQuotasForOwner).mockResolvedValue(rows);
 
+			const caller = quotaRouter.createCaller({ user: user() });
 			const result = await caller.getQuotas();
-			expect(result).toEqual(mockSnapshots);
-			expect(getAllCliQuotas).toHaveBeenCalledTimes(1);
+
+			expect(result).toEqual(rows);
+			expect(listCliQuotasForOwner).toHaveBeenCalledTimes(1);
+			expect(listCliQuotasForOwner).toHaveBeenCalledWith(user().id);
+		});
+
+		// The regression guard for "no admin override" — the thing a future reader is
+		// most likely to "fix". An admin sees their own machines, like everyone else.
+		it('scopes an instanceAdmin caller by their own id too', async () => {
+			const admin = user({ id: '33333333-3333-4333-8333-333333333333', instanceAdmin: true });
+
+			await quotaRouter.createCaller({ user: admin }).getQuotas();
+
+			expect(listCliQuotasForOwner).toHaveBeenCalledWith(admin.id);
+		});
+
+		it('asks for each caller’s own owner id, never one taken off the input', async () => {
+			const ada = user({ id: '44444444-4444-4444-8444-444444444444' });
+			const grace = user({ id: '55555555-5555-4555-8555-555555555555' });
+
+			await quotaRouter.createCaller({ user: ada }).getQuotas();
+			await quotaRouter.createCaller({ user: grace }).getQuotas();
+
+			expect(vi.mocked(listCliQuotasForOwner).mock.calls).toEqual([[ada.id], [grace.id]]);
+		});
+
+		it('returns an empty list for a caller whose workers have reported nothing', async () => {
+			vi.mocked(listCliQuotasForOwner).mockResolvedValue([]);
+
+			await expect(quotaRouter.createCaller({ user: user() }).getQuotas()).resolves.toEqual([]);
 		});
 	});
 
-	describe('refreshQuotas', () => {
-		it('triggers a full CLI discovery, upserts each snapshot against this host, and returns the result', async () => {
-			const mockSnapshots: CliQuotaSnapshot[] = [
-				{
-					cli: 'claude',
-					status: 'available',
-					source: 'fallback',
-					lastUpdated: new Date().toISOString(),
-				},
-				{
-					cli: 'codex',
-					status: 'unavailable',
-					source: 'fallback',
-					lastUpdated: new Date().toISOString(),
-				},
-			];
-			vi.mocked(discoverCliQuotas).mockResolvedValue(mockSnapshots);
-
-			const result = await caller.refreshQuotas();
-
-			expect(discoverCliQuotas).toHaveBeenCalledWith(false); // cheap = false for manual refresh
-			expect(upsertCliQuota).toHaveBeenCalledTimes(2);
-			// The probing host is stamped on every row this refresh writes (issue #703),
-			// so it replaces only its own machine's snapshots.
-			expect(upsertCliQuota).toHaveBeenNthCalledWith(
-				1,
-				'control-plane.local',
-				mockSnapshots[0].cli,
-				mockSnapshots[0].status,
-				mockSnapshots[0],
-			);
-			expect(upsertCliQuota).toHaveBeenLastCalledWith(
-				'control-plane.local',
-				mockSnapshots[1].cli,
-				mockSnapshots[1].status,
-				mockSnapshots[1],
-			);
-			expect(result).toEqual(mockSnapshots);
-		});
+	// The removed mutation probed the API server's own host, which is precisely the
+	// machine whose data must stop being presented as everyone's (issue #823). Asserting
+	// on the procedure list keeps it from being reinstated silently.
+	it('exposes no refresh procedure', () => {
+		expect(Object.keys(quotaRouter._def.procedures)).toEqual(['getQuotas']);
 	});
 });
