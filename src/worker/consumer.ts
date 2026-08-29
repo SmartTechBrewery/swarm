@@ -1771,6 +1771,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				autoAdvance: project.pipeline?.planning?.autoAdvance,
 				autoSplit: project.pipeline?.planning?.autoSplit,
 				maxConcerns: project.pipeline?.planning?.maxConcerns,
+				verifyPlan: project.pipeline?.planning?.verifyPlan,
 				timeoutMs,
 				signal,
 				// The run-row id anchors the plan comment's per-delivery idempotency
