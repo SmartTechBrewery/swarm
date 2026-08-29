@@ -8,7 +8,6 @@ const { quotaQueryOptions } = vi.hoisted(() => ({ quotaQueryOptions: vi.fn() }))
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: { quota: { getQuotas: { queryOptions: quotaQueryOptions } } },
-	trpcClient: { quota: { refreshQuotas: { mutate: vi.fn() } } },
 }));
 
 import { QuotaRouteComponent, QuotaWindowCard } from './quota.js';
@@ -57,7 +56,8 @@ describe('quota route', () => {
 	it('preserves non-integral durations in the window suffix', async () => {
 		renderQuotaScreen([
 			{
-				host: 'builder-01',
+				workerId: 'worker-01',
+				workerName: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -78,7 +78,8 @@ describe('quota route', () => {
 	it('omits plan tier copy while keeping credits and usage', async () => {
 		renderQuotaScreen([
 			{
-				host: 'builder-01',
+				workerId: 'worker-01',
+				workerName: 'builder-01',
 				cli: 'claude',
 				status: 'available',
 				source: 'live',
@@ -88,7 +89,8 @@ describe('quota route', () => {
 				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 40 }],
 			},
 			{
-				host: 'builder-01',
+				workerId: 'worker-01',
+				workerName: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -110,7 +112,8 @@ describe('quota route', () => {
 		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 		renderQuotaScreen([
 			{
-				host: 'builder-01',
+				workerId: 'worker-01',
+				workerName: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -129,14 +132,16 @@ describe('quota route', () => {
 		consoleError.mockRestore();
 	});
 
-	// Issue #703: two hosts reporting the same CLI used to overwrite one another in
-	// storage; now both rows arrive, and each allowance must be shown under the
-	// machine it describes rather than collapsing into one unlabelled card.
-	it('names each host and renders both hosts’ cards for the same CLI', async () => {
+	// Issue #703: two machines reporting the same CLI used to overwrite one another
+	// in storage; now both rows arrive, and each allowance must be shown under the
+	// machine it describes rather than collapsing into one unlabelled card. The
+	// machine is named by its worker since issue #823.
+	it('names each worker and renders both workers’ cards for the same CLI', async () => {
 		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 		renderQuotaScreen([
 			{
-				host: 'builder-02',
+				workerId: 'worker-02',
+				workerName: 'builder-02',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -144,7 +149,8 @@ describe('quota route', () => {
 				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 80 }],
 			},
 			{
-				host: 'builder-01',
+				workerId: 'worker-01',
+				workerName: 'builder-01',
 				cli: 'codex',
 				status: 'available',
 				source: 'live',
@@ -155,22 +161,23 @@ describe('quota route', () => {
 
 		expect(await screen.findByText('builder-01')).toBeTruthy();
 		expect(screen.getByText('builder-02')).toBeTruthy();
-		// Both allowances survive: one card per host, not one card for the installation.
+		// Both allowances survive: one card per worker, not one card for the installation.
 		expect(screen.getAllByText('Codex')).toHaveLength(2);
 		expect(screen.getAllByText('Weekly (7d)')).toHaveLength(2);
 		expect(screen.getByText('90% remaining')).toBeTruthy();
 		expect(screen.getByText('20% remaining')).toBeTruthy();
-		// `cli` alone is no longer a unique React key across hosts.
+		// `cli` alone is no longer a unique React key across workers.
 		expect(consoleError.mock.calls.some(([message]) => String(message).includes('same key'))).toBe(
 			false,
 		);
 		consoleError.mockRestore();
 	});
 
-	it('reports a host’s own diagnostics under that host', async () => {
+	it('reports a worker’s own diagnostics under that worker', async () => {
 		renderQuotaScreen([
 			{
-				host: 'builder-01',
+				workerId: 'worker-01',
+				workerName: 'builder-01',
 				cli: 'claude',
 				status: 'available',
 				source: 'live',
@@ -178,7 +185,8 @@ describe('quota route', () => {
 				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 10 }],
 			},
 			{
-				host: 'builder-02',
+				workerId: 'worker-02',
+				workerName: 'builder-02',
 				cli: 'claude',
 				status: 'unavailable',
 				source: 'fallback',
@@ -189,15 +197,21 @@ describe('quota route', () => {
 
 		expect(await screen.findByText('builder-02')).toBeTruthy();
 		expect(screen.getByText('claude binary not found on PATH')).toBeTruthy();
-		// The reporting host with nothing usable says so for itself, rather than the
+		// The reporting worker with nothing usable says so for itself, rather than the
 		// page reporting "no CLIs discovered" for the whole installation.
-		expect(screen.getByText('No quota data is available for this host.')).toBeTruthy();
+		expect(screen.getByText('No quota data is available for this worker.')).toBeTruthy();
 	});
 
-	it('reports no data for any host when nothing is persisted', async () => {
+	// Issue #823: the read is scoped to the viewer's own workers, so an empty result
+	// means "nothing of yours" rather than "nothing anywhere" — and the same state
+	// covers owning no worker at all and owning one that has not reported.
+	it('states the owner-scoped empty case when nothing is persisted', async () => {
 		renderQuotaScreen([]);
 
-		expect(await screen.findByText('No quota data is available for any host.')).toBeTruthy();
+		expect(
+			await screen.findByText('No CLI quota has been reported for any worker you own.'),
+		).toBeTruthy();
+		expect(screen.getByText('This page shows only your own registered machines.')).toBeTruthy();
 	});
 
 	// Issue #754: the screen reads persisted snapshots, so the freshness caveat and the
@@ -207,7 +221,8 @@ describe('quota route', () => {
 		it('shows the notice alongside populated cards', async () => {
 			renderQuotaScreen([
 				{
-					host: 'builder-01',
+					workerId: 'worker-01',
+					workerName: 'builder-01',
 					cli: 'claude',
 					status: 'available',
 					source: 'live',
@@ -220,13 +235,15 @@ describe('quota route', () => {
 
 			expect(await screen.findByText('Weekly (7d)')).toBeTruthy();
 			expect(screen.getByText(/may be out of date/i)).toBeTruthy();
-			expect(screen.getByText(/Use Refresh to request fresh data/i)).toBeTruthy();
+			expect(screen.getByText(/Refresh re-reads the latest stored snapshot/i)).toBeTruthy();
 		});
 
 		it('shows the notice when there is no quota data at all', async () => {
 			renderQuotaScreen([]);
 
-			expect(await screen.findByText('No quota data is available for any host.')).toBeTruthy();
+			expect(
+				await screen.findByText('No CLI quota has been reported for any worker you own.'),
+			).toBeTruthy();
 			expect(screen.getByText(/may be out of date/i)).toBeTruthy();
 		});
 
@@ -245,7 +262,8 @@ describe('quota route', () => {
 		it('states the absence for a CLI reporting no usage windows', async () => {
 			renderQuotaScreen([
 				{
-					host: 'builder-01',
+					workerId: 'worker-01',
+					workerName: 'builder-01',
 					cli: 'claude',
 					status: 'available',
 					source: 'fallback',
@@ -267,7 +285,8 @@ describe('quota route', () => {
 		it('keeps an unavailable CLI marked unavailable when it reports no error detail', async () => {
 			renderQuotaScreen([
 				{
-					host: 'builder-01',
+					workerId: 'worker-01',
+					workerName: 'builder-01',
 					cli: 'codex',
 					status: 'unavailable',
 					source: 'fallback',
@@ -284,7 +303,8 @@ describe('quota route', () => {
 		it('keeps rate-limit exhaustion distinct from an ordinary absence of data', async () => {
 			renderQuotaScreen([
 				{
-					host: 'builder-01',
+					workerId: 'worker-01',
+					workerName: 'builder-01',
 					cli: 'claude',
 					status: 'available',
 					source: 'fallback',
@@ -320,7 +340,8 @@ describe('quota route', () => {
 		it('applies the same thresholds to every window on the page', async () => {
 			const { container } = renderQuotaScreen([
 				{
-					host: 'builder-01',
+					workerId: 'worker-01',
+					workerName: 'builder-01',
 					cli: 'claude',
 					status: 'available',
 					source: 'live',
@@ -331,7 +352,8 @@ describe('quota route', () => {
 					],
 				},
 				{
-					host: 'builder-02',
+					workerId: 'worker-02',
+					workerName: 'builder-02',
 					cli: 'codex',
 					status: 'available',
 					source: 'live',
@@ -343,7 +365,7 @@ describe('quota route', () => {
 			]);
 
 			await screen.findByText('Session (5h)');
-			// Every window is coloured by its own remaining percentage, whichever host
+			// Every window is coloured by its own remaining percentage, whichever worker
 			// or CLI reported it: 31% green, 30% amber, 10% red.
 			expect(barColors(container)).toEqual(['bg-emerald-500', 'bg-amber-500', 'bg-rose-500']);
 		});

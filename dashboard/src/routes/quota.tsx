@@ -1,8 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute } from '@tanstack/react-router';
 import { AlertCircle, Calendar, Gauge, Info, RefreshCw, Server, ShieldAlert } from 'lucide-react';
-import { trpc, trpcClient } from '@/lib/trpc.js';
-import type { HostCliQuotaSnapshot } from '../../../src/db/repositories/cliQuotasRepository.js';
+import { trpc } from '@/lib/trpc.js';
+import type { WorkerCliQuotaSnapshot } from '../../../src/db/repositories/cliQuotasRepository.js';
 import { rootRoute } from './__root.js';
 
 interface QuotaWindowProps {
@@ -86,31 +86,38 @@ export function QuotaWindowCard({
 	);
 }
 
-/** A host's own snapshots, gathered under the machine they describe (issue #703). */
-interface HostGroup {
-	host: string;
-	available: HostCliQuotaSnapshot[];
-	unavailable: HostCliQuotaSnapshot[];
+/** One worker's own snapshots, gathered under the machine they describe (issue #823). */
+interface WorkerGroup {
+	workerId: string;
+	workerName: string;
+	available: WorkerCliQuotaSnapshot[];
+	unavailable: WorkerCliQuotaSnapshot[];
 	lastUpdated: number | null;
 }
 
 /**
- * Gather snapshots under the host that reported them, hosts sorted by name.
+ * Gather snapshots under the worker that reported them, workers sorted by name.
  *
- * The page shows one section per host rather than one flat list: a row records
- * a *host-local* fact, so an allowance presented without its machine is one
- * host's answer read as the installation's (issue #703).
+ * The page shows one section per worker rather than one flat list: a row records
+ * a *machine-local* fact, so an allowance presented without its machine is one
+ * machine's answer read as the installation's (issue #703). Grouping on the
+ * worker rather than a hostname is what makes each section attributable to an
+ * owner (issue #823) — and there is no unattributed row to name a fallback for,
+ * since `worker_id` is `NOT NULL` and the read joins the worker in.
  */
-function groupByHost(quotas: HostCliQuotaSnapshot[]): HostGroup[] {
-	const groups = new Map<string, HostGroup>();
+function groupByWorker(quotas: WorkerCliQuotaSnapshot[]): WorkerGroup[] {
+	const groups = new Map<string, WorkerGroup>();
 	for (const quota of quotas) {
-		// A snapshot stored before the host column existed cannot be attributed,
-		// and neither can one from a future writer that omits it.
-		const host = quota.host || 'Unknown host';
-		let group = groups.get(host);
+		let group = groups.get(quota.workerId);
 		if (!group) {
-			group = { host, available: [], unavailable: [], lastUpdated: null };
-			groups.set(host, group);
+			group = {
+				workerId: quota.workerId,
+				workerName: quota.workerName,
+				available: [],
+				unavailable: [],
+				lastUpdated: null,
+			};
+			groups.set(quota.workerId, group);
 		}
 		if (quota.status === 'available') group.available.push(quota);
 		else group.unavailable.push(quota);
@@ -120,7 +127,7 @@ function groupByHost(quotas: HostCliQuotaSnapshot[]): HostGroup[] {
 			group.lastUpdated = updated;
 		}
 	}
-	return [...groups.values()].sort((a, b) => a.host.localeCompare(b.host));
+	return [...groups.values()].sort((a, b) => a.workerName.localeCompare(b.workerName));
 }
 
 /** The display name for a CLI identifier. */
@@ -134,15 +141,6 @@ export function QuotaRouteComponent() {
 	const queryClient = useQueryClient();
 	const quotasQuery = useQuery(trpc.quota.getQuotas.queryOptions());
 
-	const refreshMutation = useMutation({
-		mutationFn: () => trpcClient.quota.refreshQuotas.mutate(),
-		onSuccess: () => {
-			return queryClient.invalidateQueries({
-				queryKey: trpc.quota.getQuotas.queryOptions().queryKey,
-			});
-		},
-	});
-
 	const formatTime = (isoString?: string) => {
 		if (!isoString) return 'Never';
 		try {
@@ -152,10 +150,15 @@ export function QuotaRouteComponent() {
 		}
 	};
 
-	const hostGroups = groupByHost(quotasQuery.data || []);
+	const workerGroups = groupByWorker(quotasQuery.data || []);
 
+	// Re-reads the stored snapshots. There is no probe to trigger from here: a
+	// machine's allowance is discovered by the worker that runs on it, not by the
+	// process serving this page (issue #823).
 	const handleRefresh = () => {
-		refreshMutation.mutate();
+		void queryClient.invalidateQueries({
+			queryKey: trpc.quota.getQuotas.queryOptions().queryKey,
+		});
 	};
 
 	if (quotasQuery.isLoading) {
@@ -172,21 +175,20 @@ export function QuotaRouteComponent() {
 						CLI Quotas & Capabilities
 					</h1>
 					<p className="text-xs text-zinc-500 mt-1">
-						Status, rate limits, and remaining allowance for the agent CLIs installed on each
-						reporting host.
+						Status, rate limits, and remaining allowance for the agent CLIs on the workers you own.
 					</p>
 				</div>
 				<div className="flex items-center gap-3">
 					<button
 						type="button"
 						onClick={handleRefresh}
-						disabled={refreshMutation.isPending}
+						disabled={quotasQuery.isFetching}
 						className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-semibold text-zinc-200 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-md transition-colors disabled:opacity-50"
 					>
 						<RefreshCw
-							className={`h-4 w-4 ${refreshMutation.isPending ? 'animate-spin text-violet-400' : ''}`}
+							className={`h-4 w-4 ${quotasQuery.isFetching ? 'animate-spin text-violet-400' : ''}`}
 						/>
-						{refreshMutation.isPending ? 'Refreshing…' : 'Refresh'}
+						{quotasQuery.isFetching ? 'Refreshing…' : 'Refresh'}
 					</button>
 				</div>
 			</div>
@@ -197,8 +199,8 @@ export function QuotaRouteComponent() {
 			<div className="p-3 bg-zinc-900/50 border border-zinc-800 rounded flex items-start gap-3">
 				<Info className="h-5 w-5 text-zinc-500 shrink-0 mt-0.5" aria-hidden="true" />
 				<p className="text-sm text-zinc-300">
-					Quota data is read from the last stored snapshot for each host, so it may be out of date.
-					Use Refresh to request fresh data.
+					Quota data is read from the last stored snapshot for each worker, so it may be out of
+					date. Refresh re-reads the latest stored snapshot.
 				</p>
 			</div>
 
@@ -209,19 +211,27 @@ export function QuotaRouteComponent() {
 				</div>
 			)}
 
-			{hostGroups.length === 0 ? (
+			{workerGroups.length === 0 ? (
+				/* One state covers both cases — owning no worker, and owning a worker that has
+				   not reported — because the page has no way to tell an operator apart from
+				   the other and the remedy is the same. */
 				<div className="border border-zinc-850 rounded-lg p-6 bg-zinc-900/20 text-center space-y-2">
 					<ShieldAlert className="h-8 w-8 text-zinc-650 mx-auto" />
-					<p className="text-sm text-zinc-400">No quota data is available for any host.</p>
+					<p className="text-sm text-zinc-400">
+						No CLI quota has been reported for any worker you own.
+					</p>
+					<p className="text-xs text-zinc-500">
+						This page shows only your own registered machines.
+					</p>
 				</div>
 			) : (
-				hostGroups.map((group) => (
-					<div key={group.host} className="space-y-4">
-						{/* Host Header — every allowance below belongs to this machine alone. */}
+				workerGroups.map((group) => (
+					<div key={group.workerId} className="space-y-4">
+						{/* Worker Header — every allowance below belongs to this machine alone. */}
 						<div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-850 pb-2">
 							<h2 className="text-sm font-semibold text-zinc-200 flex items-center gap-2">
 								<Server className="h-4 w-4 text-zinc-500" />
-								<span className="font-mono">{group.host}</span>
+								<span className="font-mono">{group.workerName}</span>
 							</h2>
 							{group.lastUpdated !== null && (
 								<span className="text-[11px] text-zinc-500 font-mono">
@@ -239,13 +249,15 @@ export function QuotaRouteComponent() {
 							{group.available.length === 0 ? (
 								<div className="border border-zinc-850 rounded-lg p-6 bg-zinc-900/20 text-center space-y-2">
 									<ShieldAlert className="h-8 w-8 text-zinc-650 mx-auto" />
-									<p className="text-sm text-zinc-400">No quota data is available for this host.</p>
+									<p className="text-sm text-zinc-400">
+										No quota data is available for this worker.
+									</p>
 								</div>
 							) : (
 								<div className="grid gap-6 md:grid-cols-2">
 									{group.available.map((q) => (
 										<div
-											key={`${group.host}:${q.cli}`}
+											key={`${group.workerId}:${q.cli}`}
 											className="border border-zinc-800 rounded-lg bg-panel/45 p-6 space-y-6 flex flex-col justify-between"
 										>
 											<div className="space-y-4">
@@ -353,7 +365,7 @@ export function QuotaRouteComponent() {
 									<div className="divide-y divide-zinc-850">
 										{group.unavailable.map((q) => (
 											<div
-												key={`${group.host}:${q.cli}`}
+												key={`${group.workerId}:${q.cli}`}
 												className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-zinc-900/20 transition-colors"
 											>
 												<div className="space-y-1">

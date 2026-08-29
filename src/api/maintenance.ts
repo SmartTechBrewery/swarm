@@ -1,18 +1,19 @@
 /**
- * Control-plane host maintenance (issue #550) — the stated owner of three chores
+ * Control-plane host maintenance (issue #550) — the stated owner of two chores
  * that have nothing to do with executing a phase: the startup orphaned-`running`
- * reap, periodic CLI capability/quota discovery, and the background worktree
- * retention sweep.
+ * reap and the background worktree retention sweep.
  *
  * They used to run only as a side effect of a database-holding host worker's
  * BullMQ startup path, which no longer exists (issue #553 — every worker is the
  * DB-free `src/transport/connect-entry.ts`). They cannot move to the **router**
- * either: it runs in Docker (`docker-compose.yml`) with no agent CLIs on PATH and
- * no repository checkout, which is exactly what quota discovery probes and what
- * the sweep prunes. The **API server** is the process that has all three —
- * `DATABASE_URL`, the operator's PATH, and the checkout — and it already runs
- * host-local CLI discovery on demand (`quota.refreshQuotas`), so it owns the
- * periodic form too.
+ * either: it runs in Docker (`docker-compose.yml`) with no repository checkout,
+ * which is what the sweep prunes. The **API server** is the process that has
+ * both — `DATABASE_URL` and the checkout — so it owns them.
+ *
+ * Periodic CLI capability/quota discovery used to be a third chore here and is
+ * gone (issue #823): it could only ever describe *this* machine, which is nobody's
+ * worker, so the row it wrote was unattributable and was shown to every user as
+ * their own. A worker reports its own host's allowance instead.
  *
  * What stays elsewhere, deliberately: migrations and the dispatch/stale-run
  * reconcilers are the **router**'s (`src/router/index.ts`, `src/router/dispatcher.ts`),
@@ -25,20 +26,12 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
-import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failOrphanedRunningRuns } from '../db/repositories/runsRepository.js';
-import { discoverCliQuotas, discoveryHost } from '../harness/quota-discovery.js';
 import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { pruneStaleWorktrees } from '../worktree/retention.js';
-
-/**
- * How often CLI capability/quota discovery re-probes the host. Coded rather than
- * configurable, moved verbatim from the worker's `HEARTBEAT_INTERVAL_MS`.
- */
-const QUOTA_DISCOVERY_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 /** Default worktree retention sweep cadence when `SWARM_WORKTREE_SWEEP_INTERVAL_MS` is unset. */
 const DEFAULT_WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
@@ -46,14 +39,10 @@ const DEFAULT_WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 export interface HostMaintenanceOptions {
 	/** Worktree sweep cadence; defaults to `SWARM_WORKTREE_SWEEP_INTERVAL_MS`. */
 	worktreeSweepIntervalMs?: number;
-	/** Quota discovery cadence; defaults to {@link QUOTA_DISCOVERY_INTERVAL_MS}. */
-	quotaDiscoveryIntervalMs?: number;
 	/** Injectable collaborators so a unit test needs no database, git checkout, or agent CLI. */
 	failOrphanedRuns?: typeof failOrphanedRunningRuns;
 	listProjects?: typeof listAllProjectsFromDb;
 	pruneWorktrees?: (project: ProjectConfig) => Promise<unknown>;
-	discoverQuotas?: typeof discoverCliQuotas;
-	persistQuota?: typeof upsertCliQuota;
 }
 
 /** A running host-maintenance loop — closed on API server shutdown. */
@@ -80,18 +69,15 @@ function resolveWorktreeSweepIntervalMs(): number {
 /**
  * Start the control-plane host maintenance loop.
  *
- * The startup reap runs once; the sweep and quota discovery run once immediately
- * and then on their own interval. Nothing is awaited, so the API server binds its
- * port without waiting on a CLI probe.
+ * The startup reap runs once; the sweep runs once immediately and then on its own
+ * interval. Nothing is awaited, so the API server binds its port without waiting
+ * on a database round-trip or a filesystem walk.
  */
 export function startHostMaintenance(options: HostMaintenanceOptions = {}): HostMaintenanceHandle {
 	const sweepIntervalMs = options.worktreeSweepIntervalMs ?? resolveWorktreeSweepIntervalMs();
-	const quotaIntervalMs = options.quotaDiscoveryIntervalMs ?? QUOTA_DISCOVERY_INTERVAL_MS;
 	const failOrphanedRuns = options.failOrphanedRuns ?? failOrphanedRunningRuns;
 	const listProjects = options.listProjects ?? listAllProjectsFromDb;
 	const pruneWorktrees = options.pruneWorktrees ?? ((project) => pruneStaleWorktrees(project));
-	const discoverQuotas = options.discoverQuotas ?? discoverCliQuotas;
-	const persistQuota = options.persistQuota ?? upsertCliQuota;
 
 	/**
 	 * Reconcile zombie runs left `running` by a prior crash or watch restart that
@@ -119,27 +105,6 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 			}
 		} catch (err) {
 			logger.error('Failed to reconcile orphaned running runs at startup', {
-				error: describeError(err),
-			});
-		}
-	}
-
-	/**
-	 * Probe this host's agent CLIs and persist their capability/quota snapshots
-	 * against it — the snapshot describes one machine's installation, so it is
-	 * stored under that machine's name rather than the installation's (issue #703).
-	 */
-	async function runQuotaDiscovery(cheap: boolean): Promise<void> {
-		try {
-			const host = discoveryHost();
-			logger.debug('Starting CLI capability/quota discovery...', { cheap, host });
-			const snapshots = await discoverQuotas(cheap);
-			for (const snapshot of snapshots) {
-				await persistQuota(host, snapshot.cli, snapshot.status, snapshot);
-			}
-			logger.debug('CLI capability/quota discovery completed and persisted.', { host });
-		} catch (err) {
-			logger.error('Failed to run CLI capability/quota discovery', {
 				error: describeError(err),
 			});
 		}
@@ -174,7 +139,6 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 	}
 
 	void reapOrphanedRuns();
-	void runQuotaDiscovery(false);
 	void runWorktreeSweep();
 
 	const sweepInterval = setInterval(() => {
@@ -182,20 +146,11 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 	}, sweepIntervalMs);
 	sweepInterval.unref();
 
-	const quotaDiscoveryInterval = setInterval(() => {
-		void runQuotaDiscovery(true);
-	}, quotaIntervalMs);
-	quotaDiscoveryInterval.unref();
-
-	logger.debug('Control-plane host maintenance started', {
-		sweepIntervalMs,
-		quotaDiscoveryIntervalMs: quotaIntervalMs,
-	});
+	logger.debug('Control-plane host maintenance started', { sweepIntervalMs });
 
 	return {
 		close: () => {
 			clearInterval(sweepInterval);
-			clearInterval(quotaDiscoveryInterval);
 			return Promise.resolve();
 		},
 	};

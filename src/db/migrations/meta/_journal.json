@@ -393,6 +393,13 @@
       "when": 1787921002302,
       "tag": "0055_worker_declared_capabilities",
       "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1787990352464,
+      "tag": "0056_cli_quota_worker",
+      "breakpoints": true
     }
   ]
 }

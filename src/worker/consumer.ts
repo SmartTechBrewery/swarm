@@ -3089,10 +3089,9 @@ async function handlePhaseFailure(
 
 	// No recovery quota discovery here (issue #553): a launch/authentication failure
 	// describes the *worker's* PATH and logins, and this module now runs only on the
-	// control plane, which probing would record a bogus "unavailable" for. The
-	// dashboard's CLI/quota status is refreshed by the process that actually owns a
-	// host's CLIs — `startHostMaintenance` (`../api/maintenance.ts`, issue #550) on
-	// its schedule, or `quota.refreshQuotas` on demand.
+	// control plane, which probing would record a bogus "unavailable" for. Since issue
+	// #823 no process on the control plane probes at all — a `cli_quotas` row belongs
+	// to a worker, so only the worker that owns a host's CLIs can report one.
 
 	// A user asked to terminate this run (issue #166): its abort must settle as a
 	// terminal, user-initiated failure — never a deferral, which would re-enqueue

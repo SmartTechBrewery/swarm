@@ -1,28 +1,35 @@
-import { jsonb, pgTable, primaryKey, text, timestamp } from 'drizzle-orm/pg-core';
+import { jsonb, pgTable, primaryKey, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 import type { CliQuotaSnapshot } from '../../harness/quota.js';
+import { workers } from './workers.js';
 
 /**
- * Persisted capability and quota snapshot per **(host, CLI)** pair (issue #164,
- * keyed on the host by issue #703).
+ * Persisted capability and quota snapshot per **(worker, CLI)** pair (issue #164,
+ * keyed on the machine by issue #703, on the *worker* by issue #823).
  *
- * Stored in the DB so that the process running on the host (which has CLI
- * access) can populate/refresh it, and the dashboard API/UI can consume it
- * without probing the host.
- *
- * A row records a **host-local** fact — which agent CLIs are installed on one
- * machine and what allowance is left on them — so the host is part of the key
+ * A row records a **machine-local** fact — which agent CLIs are installed on one
+ * machine and what allowance is left on them — so the machine is part of the key
  * rather than an attribute. Keyed on `cli` alone, an installation had exactly
  * three rows and every writer overwrote the same ones, so the last discovery to
  * run presented its own machine's allowance as the installation's (issue #703).
- * `host` is the discovering process's `os.hostname()` — the same string a worker
- * daemon reports in its handshake (`src/transport/connect-entry.ts`), so a
- * future worker-reported snapshot keys on the same name.
+ *
+ * The machine is now named by `worker_id` rather than by a hostname string, and
+ * that is what makes a row **attributable**: a worker has an owner, so "whose
+ * allowance is this?" has an answer the control plane can authenticate, and the
+ * quota read can be scoped to the viewer (`listCliQuotasForOwner`). A hostname
+ * named no user at all — any process could claim any string — which is why every
+ * signed-in user was shown the same rows, describing whichever machine ran the
+ * discovering process.
+ *
+ * `ON DELETE CASCADE` mirrors `worker_scm_credentials`: a deregistered worker's
+ * snapshots vanish with it rather than dangling.
  */
 export const cliQuotas = pgTable(
 	'cli_quotas',
 	{
-		/** The machine the snapshot describes: the discovering process's `os.hostname()`. */
-		host: text('host').notNull(),
+		/** The worker whose machine the snapshot describes. */
+		workerId: uuid('worker_id')
+			.notNull()
+			.references(() => workers.id, { onDelete: 'cascade' }),
 		/** The agent CLI identifier: 'claude', 'antigravity', or 'codex' */
 		cli: text('cli').notNull(),
 		/** The overall availability status: 'available', 'unavailable', or 'error' */
@@ -34,5 +41,5 @@ export const cliQuotas = pgTable(
 			.defaultNow()
 			.$onUpdate(() => new Date()),
 	},
-	(table) => [primaryKey({ columns: [table.host, table.cli] })],
+	(table) => [primaryKey({ columns: [table.workerId, table.cli] })],
 );
