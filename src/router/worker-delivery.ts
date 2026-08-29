@@ -62,7 +62,17 @@
  * each write is idempotent at the provider, so a replayed request cannot fork the
  * board.
  *
- * Eighteen routes, all under `/worker/delivery`:
+ * The nineteenth route fronts the **`cli_quotas` table** (issue #825, phase 2 of
+ * #823). A worker daemon probes its own machine's agent CLIs — the only process
+ * that can, since the control plane is nobody's worker — and reports the snapshots
+ * here. Like the ledger routes it fronts a database rather than a credential, and
+ * unlike every other route it is **not project-scoped**: an allowance is a fact
+ * about a machine, not about a project, so it authenticates the worker alone
+ * ({@link authenticateWorker}) and persists each snapshot under the worker the
+ * credential resolved to — never a worker id the request names, which it cannot
+ * even carry (`../transport/protocol.ts`).
+ *
+ * Nineteen routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
@@ -81,6 +91,7 @@
  *   - `POST /worker/delivery/review-ledger/prior` — the PR's prior submitted verdict.
  *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
  *   - `POST /worker/delivery/review-ledger/abandon` — release a pending slot.
+ *   - `POST /worker/delivery/quota` — store this worker's own host's CLI quota snapshots.
  *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
@@ -88,17 +99,18 @@
  * `handleListBlockers`, `handleListDependents`, `handleFindWorkItem`, `handleFindWorkItemByMarker`,
  * `handleFindWorkItemForArtifact`, `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
  * `handleAddPmLabel`, `handleAddBlockedBy`, `handleScheduleFollowUpReview`,
- * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`) so
- * tests drive them with fake deps and never need a live router; collaborators
- * default to the real services and are overridden in tests. Credential handling
- * matches the handshake's contract — the raw credential appears only in the
- * `Authorization: Bearer` header, is never logged, never placed in a URL, and
- * never reflected in a response body.
+ * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`,
+ * `handleReportCliQuota`) so tests drive them with fake deps and never need a live
+ * router; collaborators default to the real services and are overridden in tests.
+ * Credential handling matches the handshake's contract — the raw credential
+ * appears only in the `Authorization: Bearer` header, is never logged, never
+ * placed in a URL, and never reflected in a response body.
  */
 
 import type { Context, Hono } from 'hono';
 
 import type { ProjectConfig } from '../config/schema.js';
+import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	abandonReviewVerdict,
@@ -143,6 +155,7 @@ import {
 	MoveWorkItemDeliveryRequestSchema,
 	PostCommentDeliveryRequestSchema,
 	PriorReviewLedgerRequestSchema,
+	ReportCliQuotaDeliveryRequestSchema,
 	SubmitReviewDeliveryRequestSchema,
 	TRANSPORT_PROTOCOL_VERSION,
 	UpdateWorkItemDeliveryRequestSchema,
@@ -174,6 +187,13 @@ export interface WorkerDeliveryDeps {
 	 * exact operation a DB-free worker cannot perform itself.
 	 */
 	scheduleFollowUpReview: ScheduleFollowUpReview;
+	/**
+	 * Store one worker's quota snapshot for one CLI, defaulted to the repository
+	 * this process reaches over `DATABASE_URL` — the write a DB-free worker cannot
+	 * perform itself. Injected so {@link handleReportCliQuota} is testable without a
+	 * database.
+	 */
+	persistCliQuota: typeof upsertCliQuota;
 }
 
 /** A worker may deliver to a project only via a routable enrollment (active + sharing consent). */
@@ -194,6 +214,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		buildPmProvider: requireProjectPMProvider,
 		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
+		persistCliQuota: upsertCliQuota,
 	};
 }
 
@@ -283,6 +304,25 @@ async function authenticateDelivery(
 		return { status: 403, json: { reason: 'worker is not enrolled in this project' } };
 
 	return { worker, project };
+}
+
+/**
+ * Authenticate a delivery request that targets **no project** — the prelude for a
+ * route whose subject is the worker itself rather than something it is enrolled
+ * in. Returns the authenticated worker, or a {@link DeliveryResult} to return
+ * verbatim. The credential is never reflected in a body.
+ *
+ * Deliberately *not* a relaxation of {@link authenticateDelivery}: the enrollment
+ * check there is what stops a worker delivering into a project it isn't enrolled
+ * in, and every project-scoped route keeps it.
+ */
+async function authenticateWorker(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+): Promise<{ worker: Worker } | DeliveryResult> {
+	const worker = credential ? await deps.resolveWorkerByCredential(credential) : undefined;
+	if (!worker) return { status: 401, json: { authenticated: false } };
+	return { worker };
 }
 
 /**
@@ -929,6 +969,44 @@ export async function handleAbandonReviewVerdict(
 	return { status: 200, json: {} };
 }
 
+/**
+ * Store the CLI quota snapshots a worker probed on its **own** host (issue #825).
+ *
+ * The attribution is the whole point of the route: every row is keyed on
+ * `worker.id` — the worker the *credential* resolved to — so a daemon can only
+ * ever overwrite its own machine's allowance. The request carries no worker id to
+ * honour or ignore (`../transport/protocol.ts`), which is what makes that
+ * unspoofable rather than merely unspoofed.
+ *
+ * Not project-scoped, so it runs {@link authenticateWorker} rather than
+ * {@link authenticateDelivery}: an allowance describes a machine, and a worker
+ * enrolled in no project still has one worth reporting. An empty `snapshots` array
+ * is a successful no-op — discovery answering nothing is not a failure to report.
+ */
+export async function handleReportCliQuota(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = ReportCliQuotaDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateWorker(deps, credential);
+	if ('status' in authed) return authed;
+
+	for (const snapshot of request.snapshots) {
+		await deps.persistCliQuota(authed.worker.id, snapshot.cli, snapshot.status, snapshot);
+	}
+	return { status: 200, json: { stored: request.snapshots.length } };
+}
+
 /** Extract the raw credential from an `Authorization: Bearer <credential>` header. */
 function extractBearerCredential(authorization: string | undefined): string | undefined {
 	if (!authorization) return undefined;
@@ -1060,6 +1138,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/review-ledger/abandon', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleAbandonReviewVerdict(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/quota', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleReportCliQuota(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 }

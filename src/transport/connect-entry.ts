@@ -39,6 +39,11 @@
  * issue #689), so a second daemon pointed at the same `SWARM_WORKER_REPO_ROOT`
  * refuses to start rather than driving git in the same repository as this one. It
  * never opens a database or queue connection.
+ *
+ * Besides executing phases it reports one background fact about its own machine:
+ * its agent CLIs' remaining allowance (`./quota-reporting.ts`, issue #825). No
+ * other process can — a snapshot describes this host's installation and logins —
+ * and it is best-effort, so a failed probe or report never touches a run.
  */
 
 import { readFileSync } from 'node:fs';
@@ -69,6 +74,11 @@ import {
 	SUPPORTED_DB_FREE_PHASES,
 } from './assignment-execution.js';
 import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discovery.js';
+import {
+	startWorkerQuotaReporting,
+	WORKER_QUOTA_REPORT_INTERVAL_MS,
+	type WorkerQuotaReportingHandle,
+} from './quota-reporting.js';
 import { connectWorkerTransport } from './worker-client.js';
 
 // Tag every line this process emits so it stays distinguishable from the router
@@ -92,6 +102,17 @@ addFileSink(optionalEnv('SWARM_LOG_FILE', 'logs/worker.log'));
  */
 let heldCheckoutLock: CheckoutLock | undefined;
 let checkoutRefreshTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * The CLI-quota reporter this process runs (issue #825). Module-scoped for the
+ * same reason the lock is: every exit path drops it, the fatal-error one included.
+ */
+let quotaReporting: WorkerQuotaReportingHandle | undefined;
+
+function stopQuotaReporting(): void {
+	quotaReporting?.stop();
+	quotaReporting = undefined;
+}
 
 function releaseCheckoutLock(): void {
 	if (checkoutRefreshTimer) clearInterval(checkoutRefreshTimer);
@@ -244,9 +265,17 @@ async function main(): Promise<void> {
 		},
 	});
 
+	// This host's own CLI allowance, reported to the control plane under this
+	// daemon's credential so the row is attributable to the worker it describes
+	// (issue #825). Started after the transport rather than before it because the
+	// same credential authenticates both, and best-effort either way — nothing here
+	// gates the session.
+	quotaReporting = startWorkerQuotaReporting({ controlPlaneUrl, workerCredential: credential });
+
 	logger.info('worker transport client starting', {
 		controlPlaneUrl,
 		hostname: host,
+		quotaReportIntervalMs: WORKER_QUOTA_REPORT_INTERVAL_MS,
 		capabilities,
 		supportedPhases,
 		repoRoot,
@@ -281,6 +310,7 @@ async function main(): Promise<void> {
 					// worker while its own aborted agent may still be writing there. Releasing
 					// it at all is what lets an operator restart immediately rather than wait
 					// for the next daemon's liveness check.
+					stopQuotaReporting();
 					releaseCheckoutLock();
 					process.exit(code);
 				});
@@ -289,11 +319,13 @@ async function main(): Promise<void> {
 
 	// Resolves on a graceful stop; rejects on a fatal, non-recoverable error.
 	await client.done;
+	stopQuotaReporting();
 	releaseCheckoutLock();
 	logger.info('worker transport client stopped');
 }
 
 main().catch((err) => {
+	stopQuotaReporting();
 	releaseCheckoutLock();
 	logger.error('worker transport client exited with a fatal error', { error: describeError(err) });
 	process.exit(1);

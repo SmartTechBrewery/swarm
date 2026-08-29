@@ -20,7 +20,9 @@ vi.mock('node:child_process', () => ({
 	execFile: (...args: any[]) => mockExecFile(...args),
 }));
 
+import { getDb } from '@/db/client.js';
 import { resetOutputFormatProbeCache } from '@/harness/antigravity-capabilities.js';
+import type { QuotaDiscoveryOptions } from '@/harness/quota-discovery.js';
 import {
 	discoverCliQuotas,
 	isBinaryRunnable,
@@ -795,6 +797,44 @@ describe('quota-discovery', () => {
 
 			expect(claudeUsageCall()).toBeUndefined();
 			expect(snapshots.find((snapshot) => snapshot.cli === 'claude')?.source).toBe('fallback');
+		});
+
+		it('resolves the run-derived hint through an injected resolver, reaching no database', async () => {
+			// What a DB-free worker passes (issue #825): it holds no `DATABASE_URL`,
+			// so nothing on its path may reach for Postgres.
+			mockAgy();
+			vi.mocked(getDb).mockClear();
+			const fallbackRateLimitInfo = vi.fn<
+				NonNullable<QuotaDiscoveryOptions['fallbackRateLimitInfo']>
+			>(async () => ({
+				error: undefined,
+				resetTime: '2026-08-29T12:00:00.000Z',
+				lastExhausted: undefined,
+			}));
+
+			const snapshots = await discoverCliQuotas(true, { fallbackRateLimitInfo });
+
+			expect(fallbackRateLimitInfo.mock.calls.map(([cli]) => cli)).toEqual([
+				'claude',
+				'antigravity',
+				'codex',
+			]);
+			expect(getDb).not.toHaveBeenCalled();
+			for (const snapshot of snapshots) {
+				expect(snapshot).toMatchObject({
+					source: 'fallback',
+					resetTime: '2026-08-29T12:00:00.000Z',
+				});
+			}
+		});
+
+		it('reads the DB-backed hint when no resolver is injected', async () => {
+			mockAgy();
+			vi.mocked(getDb).mockClear();
+
+			await discoverCliQuotas(true);
+
+			expect(getDb).toHaveBeenCalled();
 		});
 	});
 });

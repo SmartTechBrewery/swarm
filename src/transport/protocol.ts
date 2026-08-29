@@ -26,6 +26,7 @@ import { z } from 'zod';
 import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js';
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
+import { CliQuotaSnapshotSchema } from '../harness/quota.js';
 import {
 	WorkerSessionInstanceIdSchema,
 	WorkerSessionReclaimSchema,
@@ -1142,3 +1143,40 @@ export type AbandonReviewLedgerRequest = z.infer<typeof AbandonReviewLedgerReque
 /** `POST /worker/delivery/review-ledger/abandon` success body — the release carries no return value. */
 export const AbandonReviewLedgerResponseSchema = z.object({});
 export type AbandonReviewLedgerResponse = z.infer<typeof AbandonReviewLedgerResponseSchema>;
+
+/**
+ * Worker **CLI-quota report** frame (issue #825) — the writer for the
+ * `cli_quotas` table, now that a row belongs to a *worker* rather than to
+ * whichever host happened to probe (issue #823 phase 1). Each daemon probes its
+ * **own** machine's agent CLIs (`../transport/quota-reporting.ts`) and POSTs the
+ * snapshots to `POST /worker/delivery/quota`.
+ *
+ * The frame names **no worker**: identity comes from the credential the request
+ * authenticates with, so a daemon cannot report an allowance as another worker's.
+ * It fronts neither a credential nor a provider — what stays server-side is the
+ * **database** a DB-free worker holds no `DATABASE_URL` for, like the
+ * review-ledger frames above.
+ *
+ * An HTTP request/response frame carried by the router's delivery route, and so
+ * deliberately *not* a member of the WebSocket `WorkerStreamMessageSchema` union:
+ * `handleWorkerStreamFrame` closes the socket with `WS_CLOSE.MALFORMED_FRAME` on
+ * a frame it cannot parse, so a newer worker against an older router would put
+ * itself into a reconnect loop, where an unserved *route* is a 404 the client
+ * explains in one line and the daemon survives (`./delivery-client.ts`).
+ * `TRANSPORT_PROTOCOL_VERSION` is therefore deliberately **not** bumped.
+ *
+ * The payload is the domain's own validator (`../harness/quota.ts`) rather than a
+ * re-declaration of the same fields, the move `RepoSlugSchema` and
+ * `AgentCliSchema` make above.
+ */
+export const ReportCliQuotaDeliveryRequestSchema = z.object({
+	snapshots: z.array(CliQuotaSnapshotSchema),
+	protocolVersion: z.number().int(),
+});
+export type ReportCliQuotaDeliveryRequest = z.infer<typeof ReportCliQuotaDeliveryRequestSchema>;
+
+/** `POST /worker/delivery/quota` success body — how many snapshots were stored. */
+export const ReportCliQuotaDeliveryResponseSchema = z.object({
+	stored: z.number().int().nonnegative(),
+});
+export type ReportCliQuotaDeliveryResponse = z.infer<typeof ReportCliQuotaDeliveryResponseSchema>;
