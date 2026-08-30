@@ -312,6 +312,10 @@ export function succeededResult(
 		// worker→PR attribution this worker may have no DB to write (ADR-004 §4,
 		// issue #398). Absent for every phase that creates no PR.
 		prUrl: result.prUrl,
+		// The outcome a Respond-to-CI run reported, so the control plane can schedule
+		// the `no-fix` hand-back to Review this worker has no queue to enqueue onto
+		// (issue #841). Absent for every other phase.
+		ciOutcome: result.ciOutcome,
 	};
 }
 

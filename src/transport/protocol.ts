@@ -575,6 +575,16 @@ export const TaskExecutionResultSchema = z.object({
 	// an attribution nicety. Optional and additive in both directions, so it needs
 	// no `TRANSPORT_PROTOCOL_VERSION` bump: an older worker simply omits it.
 	prUrl: z.string().min(1).optional(),
+	// `succeeded` — the outcome a Respond-to-CI run reported (issue #841). Only that
+	// phase sends one, and only `no-fix` does anything: the control plane schedules
+	// one synthetic recovery dispatch that hands the pull request back to Review
+	// (`scheduleCiNoFixRecovery`, `../dispatch/ci-no-fix-recovery.ts`), which a
+	// DB-free worker cannot enqueue itself. Mirrors the `PhaseRunResult.ciOutcome`
+	// field the in-process path reads; the literals track `RespondCiOutcome`
+	// (`../pipeline/respond-to-ci.ts`). Optional and additive in both directions, so
+	// `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: an older worker
+	// simply omits it and its `no-fix` runs behave exactly as they do today.
+	ciOutcome: z.enum(['fixed', 'no-fix']).optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;
 

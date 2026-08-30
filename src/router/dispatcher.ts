@@ -297,6 +297,9 @@ export function adaptResultToPhaseRun(
 			// Feeds the shared settle path's attribution write (issue #398); absent
 			// from a phase that produced no PR, and from an older worker's frame.
 			prUrl: result.prUrl,
+			// Feeds the shared settle path's `no-fix` hand-back to Review (issue #841);
+			// absent from every phase but Respond-to-CI, and from an older worker's frame.
+			ciOutcome: result.ciOutcome,
 		};
 	}
 	if (result.status === 'failed') {

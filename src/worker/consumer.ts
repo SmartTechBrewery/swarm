@@ -60,6 +60,7 @@ import {
 	storeRunLogs,
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
+import { scheduleCiNoFixRecovery } from '../dispatch/ci-no-fix-recovery.js';
 import {
 	claimDispatchForJob,
 	createAndPublishDispatch,
@@ -106,7 +107,7 @@ import { runImplementationPhase } from '../pipeline/implementation.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import { type ProposedScope, runPlanningPhase } from '../pipeline/planning.js';
 import { runResolveConflictsPhase } from '../pipeline/resolve-conflicts.js';
-import { runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
+import { type RespondCiOutcome, runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
 import { BlockedRecoveryError, checkpointFallbackApplies } from '../pipeline/resume.js';
 import {
@@ -1592,6 +1593,14 @@ export interface PhaseRunResult {
 	 * phase that creates no PR.
 	 */
 	prUrl?: string;
+	/**
+	 * The outcome a Respond-to-CI run reported (issue #841) — only that phase
+	 * reports one. A `no-fix` schedules the hand-back to Review
+	 * (see {@link scheduleCiRecoveryIfNoFix}); `fixed` is untouched. Named apart
+	 * from the phase result's own `outcome` because `RespondToReviewPhaseResult`
+	 * already uses that name for a different union.
+	 */
+	ciOutcome?: RespondCiOutcome;
 }
 
 /**
@@ -2586,6 +2595,66 @@ async function requestMergeAutomationIfEligible(
 }
 
 /**
+ * Hand a `no-fix` Respond-to-CI run's pull request back to Review (issue #841).
+ *
+ * The phase pushes nothing when it concludes the red check is not this PR's
+ * fault, so no new `check_suite` event is ever produced and the `pr-review`
+ * trigger — which only re-enters on a green `checks` event — would leave the PR
+ * parked in review limbo. One synthetic recovery dispatch for the same
+ * (project, PR, head SHA) re-enters that handler carrying the marker that tells
+ * it this red was already adjudicated (`../dispatch/ci-no-fix-recovery.ts`,
+ * which also states why the recovery is bounded).
+ *
+ * Scheduled here rather than inside the phase, deliberately: queue work belongs
+ * at the composition root (`ai/RULES.md` §2, and see
+ * {@link requestMergeAutomationIfEligible}'s own comment), the DB-free worker
+ * has no queue to enqueue onto at all, and unlike the `fixed` Respond-to-review
+ * follow-up (`scheduleFollowUpReview`) this needs no new `/worker/delivery/*`
+ * route — the outcome rides back on the ordinary result frame.
+ *
+ * Best-effort, exactly like {@link selfEnqueueNextPhase}: a scheduling failure
+ * is logged, never thrown, so it cannot turn an already-succeeded phase into a
+ * failed job.
+ */
+async function scheduleCiRecoveryIfNoFix(
+	trigger: TriggerResult,
+	project: ProjectConfig,
+	result: PhaseRunResult,
+): Promise<void> {
+	if (trigger.phase !== 'respond-to-ci') return;
+	if (result.ciOutcome !== 'no-fix') return;
+	// Nothing to hand back to.
+	if (project.pipeline?.review?.enabled === false) {
+		logger.debug('respond-to-ci: no-fix recovery skipped — Review is disabled for this project', {
+			projectId: project.id,
+			prNumber: trigger.prNumber,
+			headSha: trigger.headSha,
+		});
+		return;
+	}
+	try {
+		await scheduleCiNoFixRecovery({
+			project,
+			prNumber: trigger.prNumber,
+			prBranch: trigger.prBranch,
+			headSha: trigger.headSha,
+		});
+		logger.info('respond-to-ci: no-fix — scheduled the hand-back to Review', {
+			projectId: project.id,
+			prNumber: trigger.prNumber,
+			headSha: trigger.headSha,
+		});
+	} catch (err) {
+		logger.error('Failed to schedule the no-fix hand-back to Review', {
+			projectId: project.id,
+			prNumber: trigger.prNumber,
+			headSha: trigger.headSha,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
  * The eligibility rule itself, split out of {@link requestMergeAutomationIfEligible}
  * so it can be honoured for an approval read back off the review-verdict ledger
  * rather than off a phase result (issue #815) — without inventing a `TriggerResult`
@@ -2936,6 +3005,7 @@ function buildTriggerContext(
 				runId: job.runId,
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
 				forcedReReview: job.forcedReReview,
+				ciNoFixRecovery: job.ciNoFixRecovery,
 				source: 'scm',
 				providerId: job.providerId,
 				event: job.event,
@@ -3947,6 +4017,11 @@ export async function processJob(
 		// only swallows, silently dropping the merge. Completing the Review dispatch
 		// first drops it out of that partial index, so the insert is safe.
 		await requestMergeAutomationIfEligible(trigger, project, runId, result.verdict);
+		// After `tryCompleteDispatch` for the same reason the merge dispatch is: the
+		// recovery it may enqueue is immediately claimable, and it re-enters the
+		// `pr-review` handler for the very PR+head this dispatch is settling — so
+		// this one is made terminal first rather than left racing its own successor.
+		await scheduleCiRecoveryIfNoFix(trigger, project, result);
 		return {
 			status: 'phase-succeeded',
 			phase: trigger.phase,

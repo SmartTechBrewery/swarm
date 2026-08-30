@@ -163,6 +163,7 @@ function ctx(
 		readFailureRecheckAttempt?: number;
 		deliveryId?: string;
 		continuationDispatchClaimed?: boolean;
+		ciNoFixRecovery?: boolean;
 	} = {},
 ): TriggerContext {
 	return createMockScmTriggerContext({
@@ -1585,5 +1586,168 @@ describe('review trigger — two repositories of one project (issue #685)', () =
 			{ projectId: 'acme', repository: 'acme/android', prNumber: '42', headSha: 'abc123' },
 			{ projectId: 'acme', repository: 'acme/backend', prNumber: '42', headSha: 'abc123' },
 		]);
+	});
+});
+
+describe('review trigger — the no-fix hand-back to Review (issue #841)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+
+	/** The state the recovery re-enters on: nothing re-ran the checks, so the head is still red. */
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+	});
+
+	it('dispatches Review on a still-red head, without spending a CI-fix attempt', async () => {
+		const result = await handler.handle(ctx(checks, { ciNoFixRecovery: true }));
+
+		expect(result).toEqual({
+			phase: 'review',
+			taskId: '9',
+			prNumber: '9',
+			// The fetched PR's head branch (the default mock's), not the event's.
+			prBranch: 'issue-42',
+			headSha: 'cafe',
+		});
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	// The bypass is opt-in: an ordinary red check suite is unaffected, so nothing
+	// about the `fixed` path or a genuine first CI failure changes.
+	it('still routes the identical event to Respond-to-CI without the marker', async () => {
+		const result = await handler.handle(ctx(checks));
+
+		expect(result).toEqual({
+			phase: 'respond-to-ci',
+			taskId: '9-ci',
+			prNumber: '9',
+			prBranch: 'issue-9',
+			headSha: 'cafe',
+		});
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+	});
+
+	it('still reserves the durable review-verdict slot, and a capped reservation still skips', async () => {
+		reserveReviewVerdict.mockResolvedValue({ status: 'capped', ordinal: 3 });
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+
+		expect(reserveReviewVerdict).toHaveBeenCalledWith({
+			projectId: PROJECT.id,
+			repository: PROJECT.repo,
+			prNumber: '9',
+			headSha: 'cafe',
+		});
+	});
+
+	it('still honours the PR+SHA dispatch dedup', async () => {
+		claimReviewDispatch.mockResolvedValue(false);
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+	});
+
+	it('does not short-circuit a state-pending defer — a still-running check still defers', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		// The marker rides the deferred payload: it states a fact about this head
+		// that a recheck does not change, and dropping it would send the recovery
+		// back to Respond-to-CI once the check finally reports red.
+		expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({ ciNoFixRecovery: true });
+	});
+
+	it('carries the marker on the durable give-up record, so a dashboard retry keeps the bypass', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		await handler.handle(ctx(checks, { ciNoFixRecovery: true, recheckAttempt: 20 }));
+
+		expect(createFailedRun.mock.calls[0][0].jobPayload).toMatchObject({
+			ciNoFixRecovery: true,
+		});
+	});
+
+	it('does not bypass the closed-PR skip', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'cafe',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'closed',
+		});
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+	});
+
+	it('does not bypass the work-item origin gate', async () => {
+		hasRunForTask.mockResolvedValue(false);
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+	});
+
+	it('does not bypass the conflicting-PR route to Resolve-conflicts', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'cafe',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: false,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+			phase: 'resolve-conflicts',
+			prNumber: '9',
+		});
+	});
+
+	it('does not bypass the draft skip on a pull-request event', async () => {
+		expect(
+			await handler.handle(
+				ctx(
+					{
+						kind: 'pull-request',
+						action: 'opened',
+						workItemId: '9',
+						headSha: 'cafe',
+						isDraft: true,
+					},
+					{ ciNoFixRecovery: true },
+				),
+			),
+		).toBeNull();
+	});
+
+	it('does not bypass the fork skip on a pull-request event', async () => {
+		expect(
+			await handler.handle(
+				ctx(
+					{
+						kind: 'pull-request',
+						action: 'opened',
+						workItemId: '9',
+						headSha: 'cafe',
+						isDraft: false,
+						isCrossRepo: true,
+					},
+					{ ciNoFixRecovery: true },
+				),
+			),
+		).toBeNull();
 	});
 });

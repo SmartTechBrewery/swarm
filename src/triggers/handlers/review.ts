@@ -94,6 +94,22 @@
  * that PR keeps the warn-and-drop, so a capped PR is noticed once per cycle
  * rather than once per check suite.
  *
+ * **A `no-fix` run hands the PR back here, not to Respond-to-CI** (issue #841).
+ * A CI-fix run that concludes the red check is not this PR's fault pushes
+ * nothing, so no further `checks` webhook ever arrives and the PR would sit in
+ * review limbo forever. The worker therefore enqueues one synthetic `checks`
+ * event for the same head carrying `ciNoFixRecovery`
+ * (`src/dispatch/ci-no-fix-recovery.ts`), and when that event's aggregate is —
+ * as expected — still red, the bypass in `resolveAggregateCheckReview` returns
+ * a `review` disposition instead of routing back to the phase that just
+ * declined. It is safe because the red was already adjudicated by SWARM's own
+ * CI agent rather than left unexamined, and reviewing without a green `checks`
+ * event is precedented: `pipeline.review.checks: 'if-present'` (issue #274)
+ * already does it for a project whose head carries no checks at all. The bypass
+ * is opt-in and narrow — it changes nothing for an ordinary red check, and every
+ * gate around it (closed-PR, work-item origin, draft/fork, mergeability, the
+ * `state-pending` defer, the PR+SHA dedup, the verdict reservation) still runs.
+ *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
  * refs, so a fork's head SHA is unreachable and the detached checkout would
@@ -242,6 +258,11 @@ const ABANDONED_REVIEW_REASONS: Record<DeferBudget, string> = {
  * recheck scheduler extends, and the one the abandonment record below stores, so
  * that a "Retry now" on that record re-enters this handler with a clean budget
  * rather than one already at its cap.
+ *
+ * `ciNoFixRecovery` *is* carried (issue #841): it states a fact about this head
+ * — SWARM's own CI agent adjudicated its red — that stays true across a recheck,
+ * and dropping it would turn a deferred recovery back into the Respond-to-CI
+ * dispatch the hand-back exists to avoid.
  */
 function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
 	return {
@@ -249,6 +270,7 @@ function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
 		providerId: ctx.providerId,
 		projectId: ctx.project.id,
 		...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
+		...(ctx.ciNoFixRecovery ? { ciNoFixRecovery: true } : {}),
 		event: ctx.event,
 	};
 }
@@ -529,6 +551,16 @@ async function resolveAggregateCheckReview(
 	if (decision.action === 'review') return { kind: 'review' };
 
 	if (decision.action === 'respond-to-ci') {
+		// The `no-fix` hand-back (issue #841) — see the module header. The red is
+		// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
+		if (ctx.ciNoFixRecovery === true) {
+			logger.info('review: CI agent adjudicated this red — reviewing instead of re-fixing', {
+				prNumber,
+				headSha,
+				failedChecks: decision.failedChecks,
+			});
+			return { kind: 'review' };
+		}
 		return { kind: 'respond-to-ci', failedChecks: decision.failedChecks };
 	}
 

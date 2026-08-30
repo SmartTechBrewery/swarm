@@ -82,6 +82,13 @@ export type TriggerContext = {
 	 * rather than failing closed on it.
 	 */
 	forcedReReview?: boolean;
+	/**
+	 * Set on the synthetic `checks` event SWARM's own `no-fix` recovery enqueues
+	 * (issue #841): the `pr-review` handler treats this head's still-red aggregate
+	 * as already adjudicated by the Respond-to-CI agent and dispatches Review
+	 * rather than routing back to Respond-to-CI.
+	 */
+	ciNoFixRecovery?: boolean;
 } & (
 	| { source: 'scm'; providerId: ScmType; event: ScmEvent; scm: SCMProvider }
 	| { source: 'pm'; providerId: PMType; event: PmEvent; pm: PMProvider }

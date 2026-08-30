@@ -194,6 +194,7 @@ describe('runRespondToCiPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 
 		expect(result.outcome).toBe('fixed');
+		expect(result.ciOutcome).toBe('fixed');
 		expect(result.agent.exitCode).toBe(0);
 	});
 
@@ -212,6 +213,9 @@ describe('runRespondToCiPhase', () => {
 		const result = await runRespondToCiPhase(deps);
 
 		expect(result.outcome).toBe('no-fix');
+		// The same value under the name the worker's shared `PhaseRunResult` reads,
+		// which is what schedules the hand-back to Review (issue #841).
+		expect(result.ciOutcome).toBe('no-fix');
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.delivery.postComment).toHaveBeenCalledTimes(1);
 	});
