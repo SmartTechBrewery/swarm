@@ -1645,11 +1645,57 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 		});
 	});
 
-	it('still honours the PR+SHA dispatch dedup', async () => {
-		claimReviewDispatch.mockResolvedValue(false);
+	// The recovery *owns* the PR+SHA slot rather than contending for it: the
+	// finished Respond-to-CI dispatch hands its claim over (refreshed, not
+	// released — `src/dispatch/ci-no-fix-recovery.ts`), so re-claiming here would
+	// see that still-live claim and drop the recovery as a duplicate, recreating
+	// the review limbo this whole path exists to remove.
+	it('reuses the held dispatch claim instead of re-claiming', async () => {
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+			phase: 'review',
+		});
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+	});
 
-		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
-		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+	// The delayed-sibling race the hand-over closes. The aggregate decision waits
+	// for *every* suite to complete, so a two-suite PR can have one suite's webhook
+	// decide the aggregate while the other's is still in flight — and that delayed
+	// sibling carries no marker. Were the claim released, it would take the freed
+	// slot, spend a second CI-fix attempt on a red SWARM already adjudicated, and
+	// leave the recovery to fail its own claim and settle `no-trigger`; the
+	// recovery's deterministic delivery id then absorbs the second run's recovery
+	// as a repeat, so no Review ever runs.
+	describe('with the claim held across the hand-over', () => {
+		// A stand-in for the Redis `SET NX` claim, so the two events below contend
+		// for one real slot rather than a canned boolean.
+		const claims = new Set<string>();
+
+		beforeEach(() => {
+			claims.clear();
+			claimReviewDispatch.mockImplementation(async (key: string) => {
+				if (claims.has(key)) return false;
+				claims.add(key);
+				return true;
+			});
+			// The claim the finished Respond-to-CI dispatch handed to the recovery.
+			claims.add(`${PROJECT.repo}:9:cafe`);
+		});
+
+		it('locks a delayed unmarked check event out of starting a second CI fix', async () => {
+			expect(await handler.handle(ctx(checks))).toBeNull();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		});
+
+		it('still dispatches exactly one Review for the marked recovery behind it', async () => {
+			await handler.handle(ctx(checks));
+
+			expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+				phase: 'review',
+				prNumber: '9',
+				headSha: 'cafe',
+			});
+			expect(reserveReviewVerdict).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	it('does not short-circuit a state-pending defer — a still-running check still defers', async () => {

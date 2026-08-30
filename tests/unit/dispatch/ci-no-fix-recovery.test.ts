@@ -10,11 +10,12 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	deliveryDedupKey: (deliveryId: string) => `delivery:${deliveryId}`,
 }));
 
-const releaseReviewDispatch = vi.fn(async (_key: string) => {});
+const refreshReviewDispatchClaim = vi.fn(async (_key: string, _ttlSec: number) => {});
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
-	releaseReviewDispatch: (key: string) => releaseReviewDispatch(key),
+	refreshReviewDispatchClaim: (key: string, ttlSec: number) =>
+		refreshReviewDispatchClaim(key, ttlSec),
 }));
 
 const requireProjectSCMProvider = vi.fn((_project?: unknown) => ({ type: 'github' as const }));
@@ -113,19 +114,38 @@ describe('scheduleCiNoFixRecovery', () => {
 		});
 	});
 
-	// The Respond-to-CI dispatch that just finished still holds this PR+SHA claim
-	// under its 5-minute TTL, so without the release the recovery would be dropped
-	// by the handler's own dedup as a duplicate.
-	it('releases the PR+SHA review-dispatch claim before enqueuing', async () => {
+	// The claim is handed *over*, not handed back: releasing it would let a
+	// delayed sibling check event for this same head take the freed slot and start
+	// a second CI fix on an already-adjudicated red, leaving the recovery to fail
+	// its own claim — and its deterministic delivery id then absorbs the second
+	// run's recovery, so no Review would ever run. Refreshing keeps the slot
+	// closed to every event but the marked recovery, which reuses it.
+	it('refreshes — never releases — the PR+SHA review-dispatch claim before enqueuing', async () => {
 		enqueueJob.mockClear();
-		releaseReviewDispatch.mockClear();
+		refreshReviewDispatchClaim.mockClear();
 
 		await scheduleCiNoFixRecovery(input);
 
-		expect(releaseReviewDispatch).toHaveBeenCalledExactlyOnceWith(`${PROJECT.repo}:42:abc123`);
-		expect(releaseReviewDispatch.mock.invocationCallOrder[0] as number).toBeLessThan(
+		expect(refreshReviewDispatchClaim).toHaveBeenCalledExactlyOnceWith(
+			`${PROJECT.repo}:42:abc123`,
+			expect.any(Number),
+		);
+		expect(refreshReviewDispatchClaim.mock.invocationCallOrder[0] as number).toBeLessThan(
 			enqueueJob.mock.invocationCallOrder[0] as number,
 		);
+	});
+
+	// A recovery that has to wait out a lagging checks/mergeability read re-enters
+	// the handler on the `state-pending` recheck cadence (20 × 30s), carrying the
+	// marker — and so still reusing this claim. A TTL shorter than that chain would
+	// hand the slot back to a delayed sibling mid-wait.
+	it("holds the claim long enough to outlast the handler's state-pending recheck chain", async () => {
+		refreshReviewDispatchClaim.mockClear();
+
+		await scheduleCiNoFixRecovery(input);
+
+		const [, ttlSec] = refreshReviewDispatchClaim.mock.calls[0] as [string, number];
+		expect(ttlSec).toBeGreaterThan((20 * 30_000) / 1000);
 	});
 
 	it('re-enqueuing the same (project, PR, head) reuses the same dedup identity — the dispatch layer absorbs the repeat', async () => {

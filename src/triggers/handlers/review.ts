@@ -108,7 +108,12 @@
  * already does it for a project whose head carries no checks at all. The bypass
  * is opt-in and narrow — it changes nothing for an ordinary red check, and every
  * gate around it (closed-PR, work-item origin, draft/fork, mergeability, the
- * `state-pending` defer, the PR+SHA dedup, the verdict reservation) still runs.
+ * `state-pending` defer, the verdict reservation) still runs. The one gate it
+ * *does* change is the PR+SHA dispatch dedup, and only in whose favour: the
+ * finished Respond-to-CI dispatch hands its claim over rather than releasing it,
+ * so a marked recovery reuses the held claim while a delayed ordinary
+ * completed-check event for the same head is locked out of starting a second
+ * CI fix.
  *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
@@ -262,7 +267,9 @@ const ABANDONED_REVIEW_REASONS: Record<DeferBudget, string> = {
  * `ciNoFixRecovery` *is* carried (issue #841): it states a fact about this head
  * — SWARM's own CI agent adjudicated its red — that stays true across a recheck,
  * and dropping it would turn a deferred recovery back into the Respond-to-CI
- * dispatch the hand-back exists to avoid.
+ * dispatch the hand-back exists to avoid. It also keeps the recovery's held
+ * PR+SHA claim reusable across the recheck, which is why that claim is refreshed
+ * to a TTL sized to outlast the whole `state-pending` chain.
  */
 function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
 	return {
@@ -1015,6 +1022,18 @@ async function handleConflictingPullRequest(
 	};
 }
 
+/**
+ * Name the held PR+SHA dispatch claim this job arrives already owning, or `null`
+ * when it has to claim the slot itself. Two kinds of job hold one, and the name
+ * is only for the log line — what matters to both is that re-claiming inside the
+ * claim's own TTL would see their *own* live claim and drop them as duplicates.
+ */
+function heldDispatchClaimReason(ctx: TriggerContext): string | null {
+	if (ctx.ciNoFixRecovery === true) return 'ci-no-fix-recovery';
+	if (ctx.continuationDispatchClaimed === true) return 'prioritized-continuation-retry';
+	return null;
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -1053,15 +1072,22 @@ export function createReviewTrigger(): TriggerHandler {
 			// so there is never a legitimate second dispatch for the same PR+SHA to
 			// contend for it.
 			const dispatchKey = buildReviewDispatchKey(ctx.project.repo, prNumber, headSha);
-			// A prioritized continuation retry (issue #214) already holds this PR+SHA
-			// claim from its original dispatch attempt — the concurrency deferral
-			// refreshed the claim's TTL and is holding it open. Re-claiming now (well
-			// within that TTL) would see the still-live claim and drop this Review as a
-			// duplicate, so reuse the held claim instead of re-claiming.
-			if (ctx.continuationDispatchClaimed) {
-				logger.debug('review: reusing held dispatch claim for a prioritized continuation retry', {
+			// Two kinds of job arrive here already *holding* this PR+SHA claim, and
+			// both must reuse it rather than re-claim: re-claiming within the TTL would
+			// see their own still-live claim and drop them as duplicates.
+			//  - a prioritized continuation retry (issue #214), whose concurrency
+			//    deferral refreshed the claim's TTL and is holding it open;
+			//  - a `no-fix` recovery (issue #841), to which the finished Respond-to-CI
+			//    dispatch handed its claim over — refreshed, deliberately not released,
+			//    so a *delayed* sibling check event for this same head cannot take the
+			//    slot in between and start a second CI fix on an already-adjudicated
+			//    red (`src/dispatch/ci-no-fix-recovery.ts` states the race in full).
+			const heldClaim = heldDispatchClaimReason(ctx);
+			if (heldClaim) {
+				logger.debug('review: reusing held dispatch claim', {
 					prNumber,
 					headSha,
+					heldFor: heldClaim,
 				});
 			} else {
 				const claimed = await claimReviewDispatch(dispatchKey, 'pr-review', {
