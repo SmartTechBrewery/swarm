@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	// `isRetryPendingStatus` is a pure predicate over the status vocabulary, so the
@@ -6,6 +6,7 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	// about which statuses are retry-pending.
 	...(await importOriginal<typeof import('@/db/repositories/runsRepository.js')>()),
 	listRunsFromDb: vi.fn(),
+	listTaskActivitySince: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
 	getRunOutputEvents: vi.fn(),
@@ -50,6 +51,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 	...(await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()),
 	getActiveDispatchByRunId: vi.fn(),
 	getDispatchById: vi.fn(),
+	listActiveDispatchTaskRefs: vi.fn(),
 	listWaitingDispatches: vi.fn(),
 	reopenDispatchForManualRetry: vi.fn(),
 }));
@@ -135,6 +137,7 @@ import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
+	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
 } from '@/db/repositories/dispatchesRepository.js';
@@ -148,8 +151,10 @@ import {
 	getRunLogsFromDb,
 	getRunOutputEvents,
 	listRunsFromDb,
+	listTaskActivitySince,
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
+	type TaskActivityRow,
 } from '@/db/repositories/runsRepository.js';
 import { getUserById } from '@/db/repositories/usersRepository.js';
 import type { runs } from '@/db/schema/runs.js';
@@ -160,6 +165,7 @@ import {
 	publishDispatchWakeUp,
 } from '@/dispatch/dispatcher.js';
 import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js';
+import { ITEM_ACTIVITY_LOOKBACK_MS, ITEM_STALL_AFTER_MS } from '@/dispatch/item-liveness.js';
 import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
@@ -352,6 +358,10 @@ describe('runsRouter', () => {
 		vi.mocked(getDispatchById).mockReset();
 		vi.mocked(listWaitingDispatches).mockReset();
 		vi.mocked(listWaitingDispatches).mockResolvedValue([]);
+		vi.mocked(listTaskActivitySince).mockReset();
+		vi.mocked(listTaskActivitySince).mockResolvedValue([]);
+		vi.mocked(listActiveDispatchTaskRefs).mockReset();
+		vi.mocked(listActiveDispatchTaskRefs).mockResolvedValue([]);
 		vi.mocked(reopenDispatchForManualRetry).mockReset();
 		vi.mocked(cancelDispatchAndWake).mockReset();
 		vi.mocked(cancelDispatchForRun).mockReset();
@@ -501,6 +511,118 @@ describe('runsRouter', () => {
 		it('rejects an invalid phase enum value at the boundary', async () => {
 			await expect(caller.list({ phase: 'deploy' as never })).rejects.toThrow();
 			expect(listRunsFromDb).not.toHaveBeenCalled();
+		});
+	});
+
+	// issue #840 — the item-centric liveness read model. The pure classifier
+	// (`@/dispatch/item-liveness.js`) is deliberately *not* mocked here: these
+	// exercise the wiring (which reads, which window, which policy) through the
+	// real decision, so the procedure and the read model cannot drift apart.
+	describe('stalled', () => {
+		const SILENT_AT = new Date('2026-08-31T00:00:00.000Z');
+
+		function activityRow(overrides: Partial<TaskActivityRow> = {}): TaskActivityRow {
+			return {
+				projectId: 'p1',
+				repository: 'acme/widgets',
+				taskId: '92',
+				runId: 'run-review',
+				phase: 'review',
+				status: 'completed',
+				prNumber: '92',
+				prTitle: 'Fix the widget',
+				workItemId: null,
+				workItemTitle: null,
+				workItemUrl: null,
+				producedPrUrl: null,
+				reviewVerdict: 'request-changes',
+				reviewAutomationOutcome: null,
+				reviewMergeOutcome: null,
+				lastActivityAt: SILENT_AT,
+				liveRunCount: 0,
+				...overrides,
+			};
+		}
+
+		beforeEach(() => {
+			vi.setSystemTime(new Date(SILENT_AT.getTime() + 2 * ITEM_STALL_AFTER_MS));
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it('reports a silent unit with no recorded hand-off', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
+
+			await expect(caller.stalled({})).resolves.toEqual([
+				{
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					unit: 'pull-request',
+					reference: '92',
+					taskId: '92',
+					phase: 'review',
+					runId: 'run-review',
+					runStatus: 'completed',
+					prNumber: '92',
+					prTitle: 'Fix the widget',
+					lastActivityAt: SILENT_AT.toISOString(),
+					stalledForMs: 2 * ITEM_STALL_AFTER_MS,
+				},
+			]);
+		});
+
+		it('reads both tables over the lookback window, unscoped, for an instanceAdmin', async () => {
+			await caller.stalled({});
+
+			expect(listTaskActivitySince).toHaveBeenCalledExactlyOnceWith({
+				since: new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS),
+			});
+			expect(listActiveDispatchTaskRefs).toHaveBeenCalledExactlyOnceWith();
+		});
+
+		it('scopes both reads to the requested project', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+			await caller.stalled({ projectId: 'p1' });
+
+			expect(listTaskActivitySince).toHaveBeenCalledExactlyOnceWith({
+				since: new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS),
+				projectIds: ['p1'],
+			});
+			expect(listActiveDispatchTaskRefs).toHaveBeenCalledExactlyOnceWith(['p1']);
+		});
+
+		it('does not report a unit an active dispatch still owes work to', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
+			vi.mocked(listActiveDispatchTaskRefs).mockResolvedValue([
+				{ projectId: 'p1', taskId: '92-ci', phase: 'respond-to-ci' },
+			]);
+
+			await expect(caller.stalled({})).resolves.toEqual([]);
+		});
+
+		// The policy map is read exactly as the pipeline reads it: `autoAdvance`
+		// is off unless set, so an unset project rests a completed plan.
+		it('passes each project’s own pipeline policy through', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([
+				activityRow({ projectId: 'p1', taskId: '103', phase: 'planning', prNumber: null }),
+				activityRow({ projectId: 'p2', taskId: '104', phase: 'planning', prNumber: null }),
+			]);
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
+				createMockProjectConfig({ id: 'p1' }),
+				createMockProjectConfig({
+					id: 'p2',
+					pipeline: { planning: { autoAdvance: true } },
+				}),
+			]);
+
+			const items = await caller.stalled({});
+
+			// p1 does not auto-advance, so its plan is awaiting a human; p2 does,
+			// so nothing explains its silence.
+			expect(items.map((item) => item.projectId)).toEqual(['p2']);
 		});
 	});
 
@@ -2636,6 +2758,33 @@ describe('runsRouter', () => {
 					noTrigger: [],
 				});
 				expect(listWaitingDispatches).toHaveBeenCalledWith('p1');
+			});
+		});
+
+		describe('stalled', () => {
+			it('denies the installation-wide view to a non-admin, without reading either table', async () => {
+				await expect(ordinary.stalled({})).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(listTaskActivitySince).not.toHaveBeenCalled();
+				expect(listActiveDispatchTaskRefs).not.toHaveBeenCalled();
+			});
+
+			it('denies a project the caller is not a member of, hiding its existence', async () => {
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.stalled({ projectId: 'p9' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'NOT_FOUND' }),
+				);
+				expect(listTaskActivitySince).not.toHaveBeenCalled();
+			});
+
+			it('still lets a contributor read the stalled items of their own project', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+
+				await expect(ordinary.stalled({ projectId: 'p1' })).resolves.toEqual([]);
+				expect(listActiveDispatchTaskRefs).toHaveBeenCalledWith(['p1']);
 			});
 		});
 

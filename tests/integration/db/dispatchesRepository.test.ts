@@ -22,6 +22,7 @@ import {
 	getDispatchById,
 	getWorkerDispatchClaimState,
 	hasExecutingDispatchForTask,
+	listActiveDispatchTaskRefs,
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
 	listRunnableDispatchesForPool,
@@ -1379,6 +1380,56 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			const waiting = await deferredDispatch('worker-authorization');
 
 			expect(await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq)).toBeNull();
+		});
+	});
+
+	// issue #840 — the dispatch-side half of the item-liveness read model: the
+	// "something is still due for this item" set.
+	describe('listActiveDispatchTaskRefs', () => {
+		it('returns every non-terminal state, with the resolved task and phase', async () => {
+			await seedDispatchInState('92', 'pending', undefined);
+			await seedDispatchInState('93', 'leased', undefined);
+			await seedDispatchInState('94', 'running', undefined);
+			await seedDispatchInState('95', 'retry-scheduled', undefined);
+
+			const refs = await listActiveDispatchTaskRefs();
+
+			expect(refs.map((ref) => ref.taskId).sort()).toEqual(['92', '93', '94', '95']);
+			expect(new Set(refs.map((ref) => ref.phase))).toEqual(new Set(['review']));
+			expect(new Set(refs.map((ref) => ref.projectId))).toEqual(new Set([PROJECT_ID]));
+		});
+
+		it('excludes terminal dispatches', async () => {
+			await seedDispatchInState('96', 'completed', undefined);
+			await seedDispatchInState('97', 'failed', undefined);
+			await seedDispatchInState('98', 'cancelled', undefined);
+
+			expect(await listActiveDispatchTaskRefs()).toEqual([]);
+		});
+
+		// A never-claimed dispatch is seconds old, so it can never be the
+		// explanation for a multi-hour silence.
+		it('excludes an active dispatch that has not resolved a task yet', async () => {
+			await createDispatch({ projectId: PROJECT_ID, jobPayload: job(), source: 'webhook' });
+
+			expect(await listActiveDispatchTaskRefs()).toEqual([]);
+		});
+
+		it('honours the accessible-project scope', async () => {
+			await seedProject({ id: 'proj-other-dispatches', repo: 'jkwiecien/other-repo' });
+			await seedDispatchInState('92', 'pending', undefined);
+			await createDispatch({
+				projectId: 'proj-other-dispatches',
+				jobPayload: job({ projectId: 'proj-other-dispatches' }),
+				source: 'manual',
+				taskId: '99',
+				phase: 'review',
+			});
+
+			const scoped = await listActiveDispatchTaskRefs([PROJECT_ID]);
+			expect(scoped.map((ref) => ref.taskId)).toEqual(['92']);
+
+			expect(await listActiveDispatchTaskRefs()).toHaveLength(2);
 		});
 	});
 });

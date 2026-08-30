@@ -19,6 +19,7 @@ import {
 	eq,
 	gt,
 	inArray,
+	isNotNull,
 	isNull,
 	lte,
 	ne,
@@ -969,6 +970,61 @@ export async function listWaitingDispatches(projectId?: string): Promise<Dispatc
 		.from(dispatches)
 		.where(where)
 		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt));
+}
+
+/**
+ * A non-terminal dispatch that has already resolved which task it is for — the
+ * dispatch-side half of the item-liveness read model (issue #840,
+ * `src/dispatch/item-liveness.ts`).
+ */
+export interface ActiveDispatchTaskRef {
+	projectId: string;
+	taskId: string;
+	/** Null until a claim resolves the trigger (`src/db/schema/dispatches.ts`). */
+	phase: string | null;
+}
+
+/**
+ * Every non-terminal dispatch that has resolved a task — the "something is still
+ * due for this item" set, which is what steps an item back from `stalled`.
+ *
+ * All of {@link ACTIVE_DISPATCH_STATES} rather than only the waiting pair: a
+ * capacity-blocked dispatch, a dependency-gated one, and a bounded retry inside
+ * its budget are all legitimate waiting, and so is one currently executing.
+ *
+ * Rows with a **null `task_id` are excluded**, deliberately: such a dispatch is
+ * seconds old (ingress writes it, the claim resolves it), so it cannot be the
+ * explanation for a multi-hour silence, and matching it to an item would mean
+ * reaching into `jobPayload` for a provider-shaped id (ai/RULES.md §2). No
+ * repository is returned because the row records none — the read model matches on
+ * `(project, task)` and documents that as conservative in the safe direction.
+ *
+ * `projectIds` is the authorization scope; an empty array is short-circuited to an
+ * empty result rather than widening the query back to every project.
+ */
+export async function listActiveDispatchTaskRefs(
+	projectIds?: readonly string[],
+): Promise<ActiveDispatchTaskRef[]> {
+	const conditions: SQL[] = [
+		inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+		isNotNull(dispatches.taskId),
+	];
+	if (projectIds && projectIds.length > 0) {
+		conditions.push(inArray(dispatches.projectId, [...projectIds]));
+	}
+	const rows = await getDb()
+		.select({
+			projectId: dispatches.projectId,
+			taskId: dispatches.taskId,
+			phase: dispatches.phase,
+		})
+		.from(dispatches)
+		.where(and(...conditions));
+	// `task_id IS NOT NULL` above is the real filter; this narrows the nullable
+	// column type without a non-null assertion.
+	return rows.flatMap((row) =>
+		row.taskId === null ? [] : [{ projectId: row.projectId, taskId: row.taskId, phase: row.phase }],
+	);
 }
 
 /**

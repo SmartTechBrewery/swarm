@@ -21,6 +21,7 @@ import {
 	desc,
 	eq,
 	gt,
+	gte,
 	inArray,
 	isNotNull,
 	isNull,
@@ -1179,6 +1180,122 @@ export async function listRunsFromDb(
 		.offset(filter.offset);
 	const totalRows = await db.select({ total: count() }).from(runs).where(where);
 	return { data, total: totalRows[0].total };
+}
+
+/**
+ * One row per `(project_id, repository, task_id)` — the latest run of each task
+ * plus the group's aggregates. The run-side half of the item-liveness read model
+ * (issue #840, `src/dispatch/item-liveness.ts`), which folds these onto the unit
+ * an operator recognises: a pull request, or a board card.
+ */
+export interface TaskActivityRow {
+	projectId: string;
+	repository: string;
+	taskId: string;
+	/** The group's latest run, by `coalesce(completed_at, started_at)` desc. */
+	runId: string;
+	phase: string;
+	status: string;
+	prNumber: string | null;
+	prTitle: string | null;
+	workItemId: string | null;
+	workItemTitle: string | null;
+	workItemUrl: string | null;
+	producedPrUrl: string | null;
+	reviewVerdict: string | null;
+	reviewAutomationOutcome: string | null;
+	reviewMergeOutcome: string | null;
+	/** `max(coalesce(completed_at, started_at))` across the group. */
+	lastActivityAt: Date;
+	/** How many runs in the group are still `running`. */
+	liveRunCount: number;
+}
+
+/**
+ * Every task with run activity since `since`, as {@link TaskActivityRow}s.
+ *
+ * Three things this read is, deliberately:
+ *
+ * - **Bounded by `since`.** That is what keeps it cheap and stops years of
+ *   finished history filling the view; `idx_runs_started_at` covers the predicate.
+ *   A task whose newest run started before the window ages out of the liveness
+ *   view rather than being reported forever.
+ * - **Grouped on the run's own `repository`** (issue #683), not on the project
+ *   alone: a project spanning several repositories answers per repository, so two
+ *   repos' identically-numbered work never folds together.
+ * - **Run activity only.** A dispatch that settled without producing a run — a
+ *   `no-trigger`, a `skipped-duplicate` — is deliberately not "movement": it *is*
+ *   the absence of forward progress, which is the thing being detected.
+ *
+ * `projectIds` is the authorization scope, same convention as
+ * {@link ListRunsFilter.projectIds}: callers pass a non-empty array, and an empty
+ * scope is short-circuited to an empty result without querying.
+ */
+export async function listTaskActivitySince(input: {
+	since: Date;
+	projectIds?: readonly string[];
+}): Promise<TaskActivityRow[]> {
+	const db = getDb();
+	const conditions: SQL[] = [gte(runs.startedAt, input.since)];
+	if (input.projectIds && input.projectIds.length > 0) {
+		conditions.push(inArray(runs.projectId, [...input.projectIds]));
+	}
+	const where = and(...conditions);
+
+	const activity = db
+		.select({
+			projectId: runs.projectId,
+			repository: runs.repository,
+			taskId: runs.taskId,
+			lastActivityAt: sql<Date>`max(coalesce(${runs.completedAt}, ${runs.startedAt}))`.as(
+				'last_activity_at',
+			),
+			liveRunCount: sql<number>`count(*) filter (where ${runs.status} = 'running')::int`.as(
+				'live_run_count',
+			),
+		})
+		.from(runs)
+		.where(where)
+		.groupBy(runs.projectId, runs.repository, runs.taskId)
+		.as('task_activity');
+
+	return db
+		.selectDistinctOn([runs.projectId, runs.repository, runs.taskId], {
+			projectId: runs.projectId,
+			repository: runs.repository,
+			taskId: runs.taskId,
+			runId: runs.id,
+			phase: runs.phase,
+			status: runs.status,
+			prNumber: runs.prNumber,
+			prTitle: runs.prTitle,
+			workItemId: runs.workItemId,
+			workItemTitle: runs.workItemTitle,
+			workItemUrl: runs.workItemUrl,
+			producedPrUrl: runs.producedPrUrl,
+			reviewVerdict: runs.reviewVerdict,
+			reviewAutomationOutcome: runs.reviewAutomationOutcome,
+			reviewMergeOutcome: runs.reviewMergeOutcome,
+			lastActivityAt: activity.lastActivityAt,
+			liveRunCount: activity.liveRunCount,
+		})
+		.from(runs)
+		.innerJoin(
+			activity,
+			and(
+				eq(runs.projectId, activity.projectId),
+				eq(runs.repository, activity.repository),
+				eq(runs.taskId, activity.taskId),
+			),
+		)
+		.where(where)
+		.orderBy(
+			runs.projectId,
+			runs.repository,
+			runs.taskId,
+			desc(sql`coalesce(${runs.completedAt}, ${runs.startedAt})`),
+			desc(runs.startedAt),
+		);
 }
 
 /** Resolve a single run by its id. Returns `undefined` when unknown. */

@@ -505,7 +505,7 @@ approving Review run) skips triggers, worktrees, and project slots entirely —
 settles the dispatch itself (`completed` with a `merge-*` outcome, `failed` on
 a provider error, or `retry-scheduled` while transiently `not-ready`).
 
-The dashboard deliberately exposes two complementary read models (issue #313):
+The dashboard deliberately exposes three complementary read models (issues #313, #840):
 
 - **Queue is dispatch-centric.** The Queue API/UI (`runs.queued`) reads every waiting
   dispatch from Postgres — state, wait reason, priority, and scheduled time — never a
@@ -524,6 +524,37 @@ The dashboard deliberately exposes two complementary read models (issue #313):
   attempts by their normal lifecycle, but hides a retry-pending (`deferred` or `checkpointed`) attempt linked to a pending
   or retry-scheduled dispatch to avoid displaying a duplicate row (issues #279/#316).
   Retry-pending attempts with no waiting dispatch remain visible in Runs as history and for operator recovery.
+- **Liveness is item-centric** (issue #840). `runs.stalled` folds *both* tables onto the
+  unit an operator recognises — a pull request (`pr:<n>`, the four SCM-driven phases of one
+  PR, which mint four different `task_id`s) or a board card — scoped by
+  `(projectId, repository)`, and answers which of those units have no forward path right
+  now. The whole decision is the pure `src/dispatch/item-liveness.ts`, fed by two bounded
+  reads (`listTaskActivitySince`, `listActiveDispatchTaskRefs`); the procedure itself
+  touches nothing but Postgres — no provider call, no cache, no enrichment.
+
+  The classification is **generic by construction**: `stalled` is the *default*, and a unit
+  steps back from it only for a hand-off SWARM actually recorded on a row — a non-terminal
+  dispatch, an Implementation carrying `produced_pr_url`, a `merged` merge outcome, a
+  `manual-intervention-required` review outcome, a completed Planning run on a project that
+  does not auto-advance, or an `approve` whose merge either recorded an outcome or was never
+  automated — or while it is still inside a two-hour grace window. So a stall from a cause
+  nobody has seen yet falls straight through to `stalled`, and the four kinds of legitimate
+  waiting do not register: capacity-blocked dispatches, dependency-gated items and bounded
+  retries inside budget are all non-terminal dispatch rows, and waiting on CI is the
+  `produced_pr_url` hand-off plus the grace window. Read the rule list that way — it is not
+  an enumeration of failure modes, and it must not become one.
+
+  **"Stalled" is a computed view and never a persisted status.** There is no column, no new
+  `dispatches.wait_reason` value, and no background sweep that writes one: the view is
+  derived on every read, so a unit stays reported until it actually moves or ages out of the
+  lookback window, and nothing has to be un-set when it recovers. Note the name collision
+  the read model deliberately does *not* reuse: `wait_reason: 'stalled'` already exists and
+  means something else entirely — one BullMQ wake-up stalled, so the dispatch is waiting to
+  be re-run. Such a dispatch is non-terminal, which makes its unit `active` here. One blind
+  spot is
+  deliberate and stated rather than fixed: a pull request that never produced a run of its
+  own is invisible here, because closing that needs the provider's open-pull-request list —
+  a different read with a different cost profile.
 
 ### Failure handling & rate-limit retries (issue #91)
 

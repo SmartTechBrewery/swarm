@@ -1,9 +1,11 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
+import type { ProjectConfig } from '../../config/schema.js';
 import {
 	getActiveDispatchByRunId,
 	getDispatchById,
+	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
 	WAITING_DISPATCH_STATES,
@@ -20,6 +22,7 @@ import {
 	isRetryPendingStatus,
 	type ListRunsFilter,
 	listRunsFromDb,
+	listTaskActivitySince,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
@@ -33,6 +36,12 @@ import {
 	type ForceReReviewRefusal,
 	forceReReview,
 } from '../../dispatch/force-re-review.js';
+import {
+	ITEM_ACTIVITY_LOOKBACK_MS,
+	type ItemLivenessPolicy,
+	type StalledItem,
+	toStalledItems,
+} from '../../dispatch/item-liveness.js';
 import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
@@ -726,6 +735,22 @@ async function resolvePendingRunRequest(run: {
 	}
 }
 
+/**
+ * The two project policies the liveness classification consults, read exactly as
+ * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
+ * unless set (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and merge
+ * automation is opt-in (`src/worker/consumer.ts`). A project that no longer
+ * resolves gets those same defaults rather than an exception — a stalled-work view
+ * that throws because one project row went missing is worse than one that reports
+ * that project under the pipeline's own defaults.
+ */
+function itemLivenessPolicyFor(project: ProjectConfig | undefined): ItemLivenessPolicy {
+	return {
+		planningAutoAdvance: project?.pipeline?.planning?.autoAdvance === true,
+		autoMerge: project?.pipeline?.respondToReview?.autoMerge === true,
+	};
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } from the repo, each row
 	// widened with the additive, server-resolved `workerName` naming the machine
@@ -786,6 +811,48 @@ export const runsRouter = router({
 				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
 			);
 			return partitionQueuedRuns(await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)));
+		}),
+
+	// The item-centric read model (issue #840) — the third one beside Queue
+	// (dispatch-centric) and Runs (run-centric). It folds `runs` and `dispatches`
+	// onto the unit an operator recognises (a pull request, a board card) and
+	// reports the units with no forward path. The whole decision lives in the pure
+	// `src/dispatch/item-liveness.ts`; this procedure only supplies the two bounded
+	// reads and the per-project policy map, and touches nothing but Postgres — no
+	// provider call, no cache, no enrichment, unlike `queued`.
+	//
+	// "Stalled" is a computed view, never a persisted status: nothing here writes,
+	// and a unit stays listed until it moves or ages out of the lookback window.
+	//
+	// Authorization is `queued`'s shape verbatim, so no new access decision is made
+	// here: a chosen `projectId` needs read access, and the unscoped,
+	// installation-wide view remains an instance administrator's.
+	stalled: authedProcedure
+		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
+		.query(async ({ ctx, input }): Promise<StalledItem[]> => {
+			const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
+			if (input?.projectId) {
+				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+				const project = await getProjectByIdFromDb(input.projectId);
+				const projectIds = [input.projectId];
+				const [activity, activeDispatches] = await Promise.all([
+					listTaskActivitySince({ since, projectIds }),
+					listActiveDispatchTaskRefs(projectIds),
+				]);
+				return toStalledItems(activity, activeDispatches, {
+					[input.projectId]: itemLivenessPolicyFor(project),
+				});
+			}
+			assertInstanceAdmin(ctx.user, 'stalled work');
+			const [activity, activeDispatches, projects] = await Promise.all([
+				listTaskActivitySince({ since }),
+				listActiveDispatchTaskRefs(),
+				listAllProjectsFromDb(),
+			]);
+			const policies = Object.fromEntries(
+				projects.map((project) => [project.id, itemLivenessPolicyFor(project)]),
+			);
+			return toStalledItems(activity, activeDispatches, policies);
 		}),
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member
