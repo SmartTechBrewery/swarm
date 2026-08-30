@@ -31,6 +31,7 @@ import {
 } from '../scm/delivery.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
+import { settleMergeResolution } from './merge-resolution.js';
 import {
 	buildMigrationJournalRepairPrompt,
 	buildResolveConflictsPrompt,
@@ -174,6 +175,38 @@ async function guardMigrationJournal(options: GuardMigrationJournalOptions): Pro
 	});
 }
 
+/**
+ * The phase's second deterministic backstop, behind
+ * {@link buildResolveConflictsPrompt}'s `INDEX_RESOLUTION_GUIDANCE` (issue
+ * #844): the agent verifies its merge by scanning the files for conflict
+ * markers, while `validatePreparedTree` asks the *index*. Those are different
+ * questions, and only the second gates delivery — so settle the index for
+ * whatever the agent really did resolve.
+ *
+ * Deliberately raises nothing of its own for a path left unmerged: that is a
+ * genuine ambiguity, and letting `validatePreparedTree` refuse it keeps one
+ * refusal message and one classification (issue #839's) rather than two
+ * competing ones. Anything staged is logged at `warn`, because the agent left
+ * drift and that should be attributable.
+ */
+async function settleResolvedPaths(
+	worktreePath: string,
+	context: { taskId: string; prNumber: string; headSha: string },
+): Promise<void> {
+	const settlement = await settleMergeResolution(worktreePath);
+	if (settlement.staged.length > 0)
+		logger.warn('resolve-conflicts: staged merge-resolved paths the agent left unmerged', {
+			...context,
+			staged: settlement.staged,
+			unresolved: settlement.unresolved,
+		});
+	else
+		logger.debug('resolve-conflicts: merge resolution left nothing to stage', {
+			...context,
+			unresolved: settlement.unresolved,
+		});
+}
+
 export async function runResolveConflictsPhase(
 	options: RunResolveConflictsPhaseOptions,
 ): Promise<{ agent: AgentCliResult; outcome: ResolveConflictsOutcome }> {
@@ -276,11 +309,11 @@ export async function runResolveConflictsPhase(
 			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
 			ConflictHandoffSchema,
 		);
-		// A resumed delivery already passed this gate in the attempt that first
-		// wrote `handoff` — delivery progress only exists past this point — so it
-		// is safe to skip here; only a fresh merge this call actually produced
-		// needs checking. See the module header and `validateMigrationJournal`'s
-		// own header for why this exists at all (issue #503/#508).
+		// A resumed delivery already passed both gates in the attempt that first
+		// wrote `handoff` — delivery progress only exists past this point — so they
+		// are safe to skip here; only a fresh merge this call actually produced
+		// needs checking. See `validateMigrationJournal`'s own header (issue
+		// #503/#508) and `settleResolvedPaths` above (issue #844) for why each exists.
 		if (!shouldResumeDelivery) {
 			await guardMigrationJournal({
 				worktreePath: handle.path,
@@ -295,6 +328,8 @@ export async function runResolveConflictsPhase(
 				signal,
 				runAgent,
 			});
+			// After the repair pass, which can still edit files.
+			await settleResolvedPaths(handle.path, { taskId, prNumber, headSha });
 		}
 		const delivery =
 			options.delivery ??

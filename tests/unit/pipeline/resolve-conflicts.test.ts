@@ -13,6 +13,14 @@ vi.mock('@/scm/delivery.js', async (importOriginal) => ({
 	assertRemoteHead: vi.fn(async () => {}),
 }));
 
+// The phase's other deterministic backstop (issue #844) shells out to real git
+// too, and these fixtures are bare temp directories that are never `git init`-ed
+// — its real behaviour is under test in `merge-resolution.test.ts` and
+// `resolve-conflicts-delivery.test.ts`, both of which use real repositories.
+vi.mock('@/pipeline/merge-resolution.js', () => ({
+	settleMergeResolution: vi.fn(async () => ({ staged: [], unresolved: [] })),
+}));
+
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { runResolveConflictsPhase } from '@/pipeline/resolve-conflicts.js';
 import {

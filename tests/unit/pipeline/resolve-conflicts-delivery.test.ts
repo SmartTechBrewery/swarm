@@ -172,12 +172,35 @@ function makeOptions(worktreePath: string, headSha: string, baseSha: string) {
 }
 
 describe('resolve-conflicts production delivery', () => {
-	// The incident: the agent overwrote both sides with clean text and never
-	// staged it, so the index is still unmerged. No retry re-runs the agent, so
-	// nothing between attempts could ever stage it.
-	it('settles an unstaged conflict resolution terminally and releases the checkout', async () => {
+	// The incident (issue #844's half of it): the agent overwrote both sides with
+	// clean text and never staged it. The index is still unmerged, and no retry
+	// re-runs the agent — but the content really is resolved, so the phase's own
+	// index-settling backstop stages it and the delivery goes through.
+	it('delivers a resolved merge the agent left unstaged', async () => {
 		const { worktreePath, headSha, baseSha } = makeConflictedCheckout();
 		writeFileSync(join(worktreePath, 'conflict.txt'), 'resolved by hand\n');
+		const options = makeOptions(worktreePath, headSha, baseSha);
+
+		const { outcome } = await runResolveConflictsPhase(options);
+
+		expect(outcome.status).toBe('resolved');
+		expect(options.pushBranch).toHaveBeenCalledTimes(1);
+		expect(options.postComment).toHaveBeenCalledTimes(1);
+		expect(options.cleanup).toHaveBeenCalledTimes(1);
+		expect(options.preserve).not.toHaveBeenCalled();
+		// One commit, and it really is the merge — both parents are recorded.
+		expect(git(worktreePath, 'rev-parse', 'HEAD^@').trim().split('\n')).toHaveLength(2);
+		expect(git(worktreePath, 'show', '-s', '--format=%s', 'HEAD').trim()).toBe(
+			`chore: merge main into ${PR_BRANCH}`,
+		);
+	});
+
+	// The residual failure mode, which phase 1/2 settles terminally: a conflict
+	// the agent did not actually resolve. The backstop leaves it unmerged on
+	// purpose rather than committing the markers.
+	it('settles a genuinely unresolved conflict terminally and releases the checkout', async () => {
+		// `conflict.txt` is left exactly as the failed merge wrote it — markers and all.
+		const { worktreePath, headSha, baseSha } = makeConflictedCheckout();
 		const options = makeOptions(worktreePath, headSha, baseSha);
 
 		const error = await runResolveConflictsPhase(options).catch((e) => e);
