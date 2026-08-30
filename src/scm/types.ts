@@ -227,14 +227,15 @@ export interface SCMProvider extends ScmMergeProvider {
 
 	/**
 	 * Whether an actor login matches one of SWARM's configured persona identities.
-	 * Used by the PM board's status-change gate and the conflict-candidate filter.
 	 *
 	 * Note: this is NOT SWARM's loop-prevention drop gate for events. Under the
 	 * federated model (ADR-004 §3), an implementer identity is the worker operator's
 	 * own account, so actor login alone cannot distinguish SWARM's output from human
 	 * actions. Event drop gates use SWARM-origin markers (`src/scm/swarm-origin.ts`,
-	 * issue #443) for comments and work-item origin (`src/triggers/swarm-managed-pr.ts`,
-	 * issue #397) for PR review ownership.
+	 * issue #443) for comments and work-item origin (`src/triggers/swarm-managed-pr.ts`)
+	 * for PR ownership on both `pr-review` (issue #397) and `resolve-conflicts`
+	 * (issue #836) — which is why no production call site is left, though the
+	 * contract still requires the method of every provider.
 	 */
 	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean;
 

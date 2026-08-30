@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { isSwarmManagedPullRequest } from '@/triggers/swarm-managed-pr.js';
+import { isSwarmManagedPullRequest, resolveSwarmManagedPr } from '@/triggers/swarm-managed-pr.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 // The run-history read is injected, so these tests need no database.
@@ -76,5 +76,20 @@ describe('isSwarmManagedPullRequest (issue #397)', () => {
 		await expect(isSwarmManagedPullRequest(PROJECT, 'issue-42', { hasRunForTask })).rejects.toThrow(
 			/connection reset/,
 		);
+	});
+});
+
+describe('resolveSwarmManagedPr (issue #836)', () => {
+	it('passes the underlying ownership result through', async () => {
+		await expect(
+			resolveSwarmManagedPr(PROJECT, 'issue-42', 'resolve-conflicts', { hasRunForTask }),
+		).resolves.toEqual({ managed: true, taskId: '42' });
+	});
+
+	it('classifies a run-history lookup failure as `error` rather than throwing', async () => {
+		hasRunForTask.mockRejectedValue(new Error('connection reset'));
+		await expect(
+			resolveSwarmManagedPr(PROJECT, 'issue-42', 'resolve-conflicts', { hasRunForTask }),
+		).resolves.toBe('error');
 	});
 });

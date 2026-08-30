@@ -133,7 +133,7 @@ import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../.
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import { buildRespondToCiAttemptKey, claimRespondToCiAttempt } from '../respond-to-ci-attempts.js';
 import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
-import { isSwarmManagedPullRequest, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
+import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
 
@@ -712,28 +712,6 @@ async function scheduleMergeabilityRecheck(
 	return null;
 }
 
-/**
- * The work-item origin gate, tri-state: `SwarmManagedPrResult` when ownership was
- * resolved, `'error'` when the run-history lookup failed. The caller degrades
- * `'error'` to a bounded mergeability recheck rather than a skip — a transient DB
- * blip must not silently drop a legitimate review.
- */
-async function resolveSwarmManagedPr(
-	project: ProjectConfig,
-	headBranch: string,
-): Promise<SwarmManagedPrResult | 'error'> {
-	try {
-		return await isSwarmManagedPullRequest(project, headBranch);
-	} catch (err) {
-		logger.error('review: ownership gate resolution failed', {
-			projectId: project.id,
-			prBranch: headBranch,
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return 'error';
-	}
-}
-
 function logOwnershipSkip(
 	projectId: string,
 	prNumber: string,
@@ -825,7 +803,7 @@ async function checkMergeabilityAndConflicts(
 	// Implementation for. Runs here because this is the one place both events
 	// already fetch the PR, and still *before* the `checks` path's heavier
 	// aggregate checks-API query.
-	const isSwarm = await resolveSwarmManagedPr(project, prDetails.headBranch);
+	const isSwarm = await resolveSwarmManagedPr(project, prDetails.headBranch, 'review');
 	if (isSwarm === 'error') {
 		return scheduleMergeabilityRecheck(ctx, 'read-failed', prNumber, headSha, {
 			reason: 'ownership gate resolution failed',

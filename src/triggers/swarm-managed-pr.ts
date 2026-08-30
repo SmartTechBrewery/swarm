@@ -1,6 +1,8 @@
 /**
- * "Is this PR one SWARM manages?" — the ownership gate the `pr-review` trigger
- * applies before it spends a review on a PR (`handlers/review.ts`).
+ * "Is this PR one SWARM manages?" — the ownership gate both PR-ownership
+ * triggers apply before they act on a PR: `pr-review` before it spends a review
+ * (`handlers/review.ts`) and `resolve-conflicts` before it schedules or
+ * dispatches a conflict check (`handlers/resolve-conflicts.ts`, issue #836).
  *
  * **Why not the PR's author.** SWARM used to answer this by matching the PR
  * author against its own persona logins (`isSwarmBot`). Under the federated
@@ -12,7 +14,9 @@
  * federated PR (auto-review silently stops firing) while *accepting* the same
  * operator's hand-written PRs. Author identity stopped carrying the signal.
  *
- * **What does.** SWARM opens every PR from a branch it named itself
+ * **What does.** Both triggers resolve through {@link resolveSwarmManagedPr}
+ * below, so neither the decision nor what counts as "could not decide" can drift
+ * between them. SWARM opens every PR from a branch it named itself
  * (`<branchPrefix><workItemNumber>`, `GitWorktreeManager.provision`) and leaves
  * a best-effort `runs` row for every phase it dispatched. So a PR is SWARM-managed iff its
  * head branch decodes to a work-item number under the project's `branchPrefix`
@@ -36,6 +40,7 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import { hasRunForTask as hasRunForTaskDefault } from '../db/repositories/runsRepository.js';
+import { logger } from '../lib/logger.js';
 import { issueNumberFromBranch } from '../pipeline/task-branch.js';
 
 export interface SwarmManagedPrDeps {
@@ -75,4 +80,39 @@ export async function isSwarmManagedPullRequest(
 	if (!hasRun) return { managed: false, reason: 'no-run', taskId };
 
 	return { managed: true, taskId };
+}
+
+/**
+ * {@link isSwarmManagedPullRequest}'s answer with its one failure mode
+ * classified rather than thrown.
+ */
+export type SwarmManagedPrDecision = SwarmManagedPrResult | 'error';
+
+/**
+ * {@link isSwarmManagedPullRequest}, tri-state: `'error'` when the run-history
+ * lookup did not answer. Both PR-ownership triggers resolve ownership through
+ * this one function, so a later change cannot fix the decision — or what counts
+ * as "could not decide" — on one trigger and leave the other behind (issue
+ * #836). Each caller still owns what to do with `'error'`: `pr-review` defers on
+ * its read-failure budget, `resolve-conflicts` on its recheck budget.
+ *
+ * `trigger` names the caller in the operational log line only; it never affects
+ * the decision.
+ */
+export async function resolveSwarmManagedPr(
+	project: ProjectConfig,
+	headBranch: string | undefined,
+	trigger: string,
+	deps: SwarmManagedPrDeps = {},
+): Promise<SwarmManagedPrDecision> {
+	try {
+		return await isSwarmManagedPullRequest(project, headBranch, deps);
+	} catch (err) {
+		logger.error(`${trigger}: ownership gate resolution failed`, {
+			projectId: project.id,
+			prBranch: headBranch,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return 'error';
+	}
 }
