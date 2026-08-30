@@ -1005,11 +1005,15 @@ export interface ActiveDispatchTaskRef {
 export async function listActiveDispatchTaskRefs(
 	projectIds?: readonly string[],
 ): Promise<ActiveDispatchTaskRef[]> {
+	// An empty scope means "no accessible project" — answered without a query, so
+	// the filter can never be dropped and the read silently widened to every project.
+	if (projectIds && projectIds.length === 0) return [];
+
 	const conditions: SQL[] = [
 		inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
 		isNotNull(dispatches.taskId),
 	];
-	if (projectIds && projectIds.length > 0) {
+	if (projectIds) {
 		conditions.push(inArray(dispatches.projectId, [...projectIds]));
 	}
 	const rows = await getDb()

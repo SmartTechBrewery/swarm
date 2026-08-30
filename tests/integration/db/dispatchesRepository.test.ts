@@ -1431,5 +1431,14 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			expect(await listActiveDispatchTaskRefs()).toHaveLength(2);
 		});
+
+		// A caller that narrowed to no accessible project must not be widened back
+		// to the installation — the distinction `undefined` makes.
+		it('answers an empty scope with no rows rather than every project', async () => {
+			await seedDispatchInState('92', 'pending', undefined);
+
+			expect(await listActiveDispatchTaskRefs([])).toEqual([]);
+			expect(await listActiveDispatchTaskRefs()).toHaveLength(1);
+		});
 	});
 });

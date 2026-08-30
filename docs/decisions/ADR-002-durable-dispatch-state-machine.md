@@ -118,7 +118,12 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   persisted attempt/audit rows by their normal lifecycle, but hides a `deferred` attempt
   linked to a pending or retry-scheduled dispatch to avoid displaying a duplicate row
   (issues #279/#316). A dispatch without a `runId` remains Queue-only because it has not
-  created an attempt yet.
+  created an attempt yet. Liveness (`runs.stalled`, issue #840) is item-centric and
+  the only one of the three that is **computed rather than read**: it folds a bounded
+  window of both canonical records onto the unit an operator recognises (a pull
+  request, a board card) and reports the units with no forward path. "Stalled" is
+  never persisted anywhere and is not the `dispatches.wait_reason: 'stalled'` of this
+  ADR — a unit stays listed until it actually moves or ages out of the window.
 - **PM board status** stays an external workflow signal: phases keep reporting card moves,
   but nothing infers dispatch existence from the board.
 

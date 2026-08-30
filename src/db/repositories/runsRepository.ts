@@ -1235,9 +1235,14 @@ export async function listTaskActivitySince(input: {
 	since: Date;
 	projectIds?: readonly string[];
 }): Promise<TaskActivityRow[]> {
+	// An empty scope is "no accessible project", not "every project": answer it
+	// before building a query, so a caller that narrowed to nothing can never be
+	// widened back to the whole installation by a missing `inArray` term.
+	if (input.projectIds && input.projectIds.length === 0) return [];
+
 	const db = getDb();
 	const conditions: SQL[] = [gte(runs.startedAt, input.since)];
-	if (input.projectIds && input.projectIds.length > 0) {
+	if (input.projectIds) {
 		conditions.push(inArray(runs.projectId, [...input.projectIds]));
 	}
 	const where = and(...conditions);
@@ -1247,9 +1252,15 @@ export async function listTaskActivitySince(input: {
 			projectId: runs.projectId,
 			repository: runs.repository,
 			taskId: runs.taskId,
-			lastActivityAt: sql<Date>`max(coalesce(${runs.completedAt}, ${runs.startedAt}))`.as(
-				'last_activity_at',
-			),
+			// `.mapWith` rather than a bare `sql<Date>`: drizzle's node-postgres driver
+			// hands raw SQL its own driver value, and a `timestamp` column arrives as
+			// the string `2026-02-02 00:10:00`. Decoding through the column the
+			// aggregate is built from is what makes the declared `Date` the runtime
+			// type too — the classifier does date arithmetic on it
+			// (`src/dispatch/item-liveness.ts`).
+			lastActivityAt: sql`max(coalesce(${runs.completedAt}, ${runs.startedAt}))`
+				.mapWith(runs.startedAt)
+				.as('last_activity_at'),
 			liveRunCount: sql<number>`count(*) filter (where ${runs.status} = 'running')::int`.as(
 				'live_run_count',
 			),

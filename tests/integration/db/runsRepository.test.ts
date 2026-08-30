@@ -2182,11 +2182,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			const rows = await listTaskActivitySince({ since: SINCE });
 
-			expect(rows.map((row) => `${row.repository}/${row.taskId}`).sort()).toEqual([
-				`${REPO}/92`,
-				`${REPO}/92-ci`,
-				'jkwiecien/other-repo/92',
-			]);
+			// Sorted on both sides: the read orders by `(project, repository, task)`, so
+			// `jkwiecien/other-repo` precedes `jkwiecien/runs-repo` — the assertion is
+			// about which groups exist, not about their order.
+			expect(rows.map((row) => `${row.repository}/${row.taskId}`).sort()).toEqual(
+				[`${REPO}/92`, `${REPO}/92-ci`, 'jkwiecien/other-repo/92'].sort(),
+			);
 		});
 
 		it('honours the since window', async () => {
@@ -2229,6 +2230,19 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				projectIds: [PROJECT_ID, 'proj-other'],
 			});
 			expect(both).toHaveLength(2);
+		});
+
+		// A caller that narrowed to no accessible project must not be widened back
+		// to the installation — the distinction `undefined` makes.
+		it('answers an empty scope with no rows rather than every project', async () => {
+			await seedActivityRun({
+				taskId: 'mine',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+
+			expect(await listTaskActivitySince({ since: SINCE, projectIds: [] })).toEqual([]);
+			expect(await listTaskActivitySince({ since: SINCE })).toHaveLength(1);
 		});
 
 		it('carries the hand-off columns the classification reads', async () => {
