@@ -85,6 +85,15 @@
  * that provider being unreachable; the pull-request comment stays a best-effort
  * extra, and the row is retryable from the dashboard.
  *
+ * **So does a spent CI-fix budget** (issue #838). The Respond-to-CI fix-attempt
+ * cap above used to wind down to a bare warn, leaving a capped pull request
+ * indistinguishable from one healthily waiting its turn. It now writes the same
+ * kind of trace — one `failed` `respond-to-ci` run (`recordAbandonedCiFix`) plus
+ * a best-effort comment — **once**, at the event that first crosses the cap
+ * (`claim.attempt === MAX_FIX_ATTEMPTS + 1`); every later red `checks` event on
+ * that PR keeps the warn-and-drop, so a capped PR is noticed once per cycle
+ * rather than once per check suite.
+ *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
  * refs, so a fork's head SHA is unreachable and the detached checkout would
@@ -131,7 +140,11 @@ import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
-import { buildRespondToCiAttemptKey, claimRespondToCiAttempt } from '../respond-to-ci-attempts.js';
+import {
+	buildRespondToCiAttemptKey,
+	claimRespondToCiAttempt,
+	MAX_FIX_ATTEMPTS,
+} from '../respond-to-ci-attempts.js';
 import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
 import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
@@ -292,6 +305,60 @@ async function recordAbandonedReview(
 			budget,
 			prNumber,
 			headSha,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
+ * The Respond-to-CI twin of {@link recordAbandonedReview} (issue #838): one
+ * durable `failed` run for a pull request whose per-PR fix-attempt cap is spent,
+ * so a build SWARM stopped trying to fix is something an operator finds in the
+ * runs list rather than a card sitting silently in **In review**.
+ *
+ * Same reasoning as the Review record, with two deliberate differences. The
+ * phase and task id are Respond-to-CI's own (`respond-to-ci`, `<pr>-ci` — the id
+ * `dispatchRespondToCi` already dispatches under), so the row sits with the rest
+ * of this PR's CI history rather than under an id nothing else uses. And the
+ * `error` names the failing checks rather than a last read, because here the
+ * provider answered perfectly well — what ran out is SWARM's own budget for
+ * fixing what it reported.
+ *
+ * The stored payload is the counter-free {@link baseReviewJobPayload}, so a
+ * dashboard "Retry now" re-enters `handle` as a fresh decision. The attempt
+ * counter itself lives in Redis under a 1-hour TTL: a retry after it ages out
+ * genuinely gets another cycle, and one inside the window hits the cap again and
+ * is dropped by the once-only guard in {@link dispatchRespondToCi}.
+ *
+ * Bookkeeping, so it swallows and logs its own failures, for the reason
+ * {@link recordAbandonedReview} states.
+ */
+async function recordAbandonedCiFix(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	failedChecks: string[],
+	attempt: number,
+): Promise<void> {
+	try {
+		await createFailedRun({
+			projectId: ctx.project.id,
+			repository: ctx.project.repo,
+			taskId: `${prNumber}-ci`,
+			phase: 'respond-to-ci',
+			prNumber,
+			jobPayload: baseReviewJobPayload(ctx),
+			error:
+				`CI fix abandoned: PR #${prNumber} at ${headSha} has used every permitted ` +
+				`Respond-to-CI attempt (${attempt}/${MAX_FIX_ATTEMPTS}).` +
+				(failedChecks.length > 0 ? ` Failing checks — ${failedChecks.join(', ')}.` : '') +
+				' SWARM will not attempt another automated fix for this pull request; it needs a human.',
+		});
+	} catch (err) {
+		logger.error('respond-to-ci: failed to record the abandoned CI-fix run', {
+			prNumber,
+			headSha,
+			attempt,
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}
@@ -495,15 +562,18 @@ function resolveDisposition(
  * can't provide, since each fix commit is a new SHA. A prioritized retry reuses
  * the attempt already counted before its concurrency deferral. Returns `null`
  * (not a dispatch) when the cap is hit or the PR branch is missing.
+ *
+ * The *first* event to cross the cap also leaves the durable give-up trace
+ * (issue #838) — see the guard below. A missing PR branch deliberately does not:
+ * that is a malformed `checks` payload, not a cycle SWARM gave up on.
  */
 async function dispatchRespondToCi(
-	project: ProjectConfig,
-	event: ScmEvent,
+	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
 	failedChecks: string[],
-	continuationDispatchClaimed: boolean,
 ): Promise<TriggerResult | null> {
+	const { project, event } = ctx;
 	if (!event.prBranch) {
 		// A `checks` payload should carry its PR's head ref; without it the
 		// fix phase has no branch to check out and push to.
@@ -515,10 +585,22 @@ async function dispatchRespondToCi(
 	}
 
 	let attempt: number | undefined;
-	if (!continuationDispatchClaimed) {
+	if (ctx.continuationDispatchClaimed !== true) {
 		const attemptKey = buildRespondToCiAttemptKey(project.repo, prNumber);
 		const claim = await claimRespondToCiAttempt(attemptKey, { prNumber, headSha });
-		if (!claim.allowed) return null;
+		if (!claim.allowed) {
+			// Record the give-up exactly once per cycle. `claimRespondToCiAttempt`
+			// INCRs on every call, so `MAX_FIX_ATTEMPTS + 1` is the single event that
+			// first crossed the line; later ones report 5, 6, … and keep the plain
+			// warn-and-drop the claim already logged, rather than adding a run row and
+			// a PR comment per red check suite. (Its fail-open path returns
+			// `allowed: true`, so a Redis outage never reaches this branch at all.)
+			if (claim.attempt === MAX_FIX_ATTEMPTS + 1) {
+				await recordAbandonedCiFix(ctx, prNumber, headSha, failedChecks, claim.attempt);
+				await scmCommentCiFixGaveUp(ctx.scm, project, Number(prNumber));
+			}
+			return null;
+		}
 		attempt = claim.attempt;
 	}
 
@@ -682,6 +764,31 @@ async function scmCommentReviewGaveUp(
 		logger.error('review: failed to post terminal review give-up comment', {
 			prNumber,
 			budget,
+			error: String(error),
+		});
+	}
+}
+
+/**
+ * The Respond-to-CI twin of {@link scmCommentReviewGaveUp} (issue #838): the
+ * notice on the pull request itself that SWARM has stopped trying to fix its
+ * build.
+ *
+ * Same posture — an *extra* on top of the durable row
+ * ({@link recordAbandonedCiFix}), never the notice, so a provider that cannot be
+ * reached costs the comment and not the record. Never throws.
+ */
+async function scmCommentCiFixGaveUp(
+	scm: SCMProvider,
+	project: ProjectConfig,
+	prNumber: number,
+): Promise<void> {
+	const body = `## ⚠️ SWARM has stopped trying to fix this build\n\nSWARM used every automated CI-fix attempt permitted for this pull request and the checks are still failing, so it will not try again. No branch changes were made by this attempt. This pull request needs a human.\n\n---\n${SWARM_GENERATED_FOOTER}`;
+	try {
+		await scm.commentOnPullRequest(project, prNumber, body);
+	} catch (error) {
+		logger.error('respond-to-ci: failed to post terminal CI-fix give-up comment', {
+			prNumber,
 			error: String(error),
 		});
 	}
@@ -933,14 +1040,7 @@ export function createReviewTrigger(): TriggerHandler {
 			}
 
 			if (disposition.kind === 'respond-to-ci') {
-				return dispatchRespondToCi(
-					ctx.project,
-					event,
-					prNumber,
-					headSha,
-					disposition.failedChecks,
-					ctx.continuationDispatchClaimed === true,
-				);
+				return dispatchRespondToCi(ctx, prNumber, headSha, disposition.failedChecks);
 			}
 
 			if (!(await reserveDurableReviewSlot(ctx.project, prNumber, headSha))) return null;

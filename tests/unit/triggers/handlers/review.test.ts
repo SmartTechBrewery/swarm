@@ -36,6 +36,10 @@ const { claimRespondToCiAttempt } = vi.hoisted(() => ({ claimRespondToCiAttempt:
 vi.mock('@/triggers/respond-to-ci-attempts.js', () => ({
 	claimRespondToCiAttempt,
 	buildRespondToCiAttemptKey: (repo: string, prNumber: string) => `${repo}:${prNumber}`,
+	// The handler reads the cap itself to spot the event that *first* crosses it
+	// (issue #838); omitting it here would leave that guard comparing against
+	// `undefined` and never firing.
+	MAX_FIX_ATTEMPTS: 3,
 }));
 
 // A `checks` event re-queries aggregate CI state and may schedule a coalesced
@@ -499,6 +503,9 @@ describe('review trigger', () => {
 				headSha: 'cafe',
 			});
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+			// An attempt still within the cap is not a give-up (issue #838).
+			expect(createFailedRun).not.toHaveBeenCalled();
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
 		});
 
 		it('reuses both held claims on a prioritized Respond-to-CI retry', async () => {
@@ -550,6 +557,9 @@ describe('review trigger', () => {
 			expect(
 				await handler.handle(ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' })),
 			).toBeNull();
+			// The drop is no longer silent — see the issue #838 suite below for what
+			// the crossing records.
+			expect(createFailedRun).toHaveBeenCalledTimes(1);
 		});
 
 		it('skips Respond-to-CI when the check suite carries no PR branch', async () => {
@@ -557,6 +567,9 @@ describe('review trigger', () => {
 			// prBranch absent — the fix phase would have no branch to check out.
 			expect(await handler.handle(ctx({ ...base, headSha: 'cafe' }))).toBeNull();
 			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			// A malformed `checks` payload is not a cycle SWARM gave up on, so it
+			// deliberately leaves no give-up trace (issue #838).
+			expect(createFailedRun).not.toHaveBeenCalled();
 		});
 
 		it('defers and schedules a coalesced recheck when a check is still running', async () => {
@@ -1409,6 +1422,104 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 			phase: 'review',
 		});
 		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A durable trace when a CI-fix cycle is abandoned (issue #838).
+ *
+ * The per-PR fix-attempt cap used to wind down to a bare warn: the card stayed in
+ * **In review**, the runs list showed nothing, and no dispatch was pending — the
+ * same silence issue #742 removed from the Review handler's give-up paths. What
+ * is pinned here is that the *first* event to cross the cap writes one durable
+ * `failed` Respond-to-CI run (plus a best-effort comment), and that every later
+ * red `checks` event on that capped PR keeps the plain warn-and-drop.
+ */
+describe('review trigger — durable trace when a CI fix is abandoned (issue #838)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+	});
+
+	it('records the give-up on the event that first crosses the cap', async () => {
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 4 });
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(createFailedRun).toHaveBeenCalledTimes(1);
+		const record = createFailedRun.mock.calls[0][0];
+		expect(record).toMatchObject({
+			projectId: PROJECT.id,
+			repository: PROJECT.repo,
+			// Respond-to-CI's own task id, so the row sits with the rest of this PR's
+			// CI history rather than under the Review phase's bare PR number.
+			taskId: '9-ci',
+			phase: 'respond-to-ci',
+			prNumber: '9',
+		});
+		// The PR, the commit, the budget that ran out, and what is still failing.
+		expect(record.error).toContain('#9');
+		expect(record.error).toContain('cafe');
+		expect(record.error).toContain('4/3');
+		expect(record.error).toContain('test');
+		expect(record.error).toContain('needs a human');
+
+		expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
+		expect(commentOnPullRequest.mock.calls[0][2]).toContain(
+			'SWARM has stopped trying to fix this build',
+		);
+	});
+
+	it('records it only once — a later red check suite on a capped PR stays quiet', async () => {
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 5 });
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+	});
+
+	it('stores a payload a dashboard retry re-decides from, with no recheck counters', async () => {
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 4 });
+
+		await handler.handle(ctx(checks, { recheckAttempt: 3, deliveryId: 'd-9' }));
+
+		const payload = createFailedRun.mock.calls[0][0].jobPayload;
+		expect(payload).toMatchObject({
+			type: 'scm',
+			providerId: 'github',
+			projectId: PROJECT.id,
+			deliveryId: 'd-9',
+		});
+		expect(payload).not.toHaveProperty('recheckAttempt');
+		expect(payload).not.toHaveProperty('readFailureRecheckAttempt');
+	});
+
+	it('still records the give-up when the pull-request comment cannot be posted', async () => {
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 4 });
+		commentOnPullRequest.mockRejectedValue(new Error('ENOTFOUND'));
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(createFailedRun).toHaveBeenCalledTimes(1);
+	});
+
+	it('swallows a failed record write rather than throwing out of handle', async () => {
+		// A throw here would land outside `processJob`'s `runPhase`-only try/catch
+		// and burn the job's BullMQ retries.
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 4 });
+		createFailedRun.mockRejectedValue(new Error('database is down too'));
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
 	});
 });
 

@@ -115,7 +115,7 @@ live CLI quota for every agent CLI on that machine.
 | **Implementation** | A card moves to *Ready* | Implements and verifies on a task branch, writes a structured hand-off | Validates, commits, pushes, opens/reuses the PR, links it on the card, moves it to *In review* |
 | **Review** | A SWARM-managed PR opens, or its checks complete | Reviews at the PR's head SHA and returns structured findings | Renders the review body itself, submits it under the reviewer identity, spends a ledger slot |
 | **Respond-to-review** | The reviewer requests changes | Addresses each point, writes a structured response | Commits/pushes the fix, posts the response, enqueues exactly one follow-up Review for the new head |
-| **Respond-to-CI** | A check fails on a task branch | Fixes the failure, or reports that it can't | Commits/pushes and explains on the PR, under a per-PR attempt cap |
+| **Respond-to-CI** | A check fails on a task branch | Fixes the failure, or reports that it can't | Commits/pushes and explains on the PR, under a per-PR attempt cap, which records a durable give-up when it is spent |
 | **Resolve conflicts** | A PR is confirmed conflicting with its base | Merges the current base and resolves | Commits and pushes; rechecks are coalesced, bounded, and deduplicated |
 
 All six run on any worker, over the same transport — which machine a worker
