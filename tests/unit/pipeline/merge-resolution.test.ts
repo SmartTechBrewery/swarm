@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { settleMergeResolution } from '@/pipeline/merge-resolution.js';
 import { UnretryableDeliveryError, validatePreparedTree } from '@/scm/delivery.js';
@@ -67,6 +67,37 @@ function textConflict(): string {
 		writeFileSync(join(root, 'b.txt'), `${side}\n`);
 	});
 }
+
+/** An absolute location built from raw bytes — `join` takes strings, so it would decode the name. */
+function at(root: string, name: Buffer): Buffer {
+	return Buffer.concat([Buffer.from(`${root}${sep}`), name]);
+}
+
+/** A valid git pathname that is not valid UTF-8: git stores bytes, not text. */
+const NON_UTF8_NAME = Buffer.concat([
+	Buffer.from('bad-'),
+	Buffer.from([0xff]),
+	Buffer.from('.txt'),
+]);
+
+/**
+ * Whether this filesystem will hold {@link NON_UTF8_NAME} at all.
+ *
+ * APFS/HFS+ reject a pathname that is not valid UTF-8 outright (`EILSEQ`), so
+ * the fixture below cannot be built on macOS however correct the code is. CI is
+ * Linux, where it runs; probing beats hard-coding a platform.
+ */
+const FILESYSTEM_HOLDS_NON_UTF8_NAMES = (() => {
+	const probe = mkdtempSync(join(tmpdir(), 'swarm-merge-resolution-probe-'));
+	try {
+		writeFileSync(at(probe, NON_UTF8_NAME), 'probe');
+		return true;
+	} catch {
+		return false;
+	} finally {
+		rmSync(probe, { recursive: true, force: true });
+	}
+})();
 
 describe('settleMergeResolution (issue #844)', () => {
 	// The incident: the agent wrote clean resolved text over both conflicted
@@ -164,6 +195,43 @@ describe('settleMergeResolution (issue #844)', () => {
 
 		expect(await settleMergeResolution(root)).toEqual({ staged: [], unresolved: [] });
 		expect(fixtureGit(root, ['status', '--porcelain'])).toBe(before);
+	});
+
+	// git pathnames are bytes; a Node string is not. Decoding the enumeration
+	// would replace the 0xff with U+FFFD, and the mangled name would then match
+	// neither the file on disk nor the index entry, so a merge already resolved
+	// in content would be refused as unmergeable.
+	it.skipIf(!FILESYSTEM_HOLDS_NON_UTF8_NAMES)(
+		'stages a resolved path whose name is not valid UTF-8',
+		async () => {
+			const root = repoMidMerge((repo, side) => {
+				writeFileSync(at(repo, NON_UTF8_NAME), `${side}\n`);
+			});
+			writeFileSync(at(root, NON_UTF8_NAME), 'resolved by hand\n');
+
+			const settlement = await settleMergeResolution(root);
+
+			// Reported lossily — the result is read by humans, never fed back to git.
+			expect(settlement).toEqual({ staged: [NON_UTF8_NAME.toString('utf8')], unresolved: [] });
+			expect(fixtureGit(root, ['diff', '--name-only', '--diff-filter=U'])).toBe('');
+			await expect(validatePreparedTree(root)).resolves.toBeUndefined();
+		},
+	);
+
+	// A git argument is pathspec syntax, not a filename: a leading `:` reads as
+	// pathspec magic and aborts the whole `git add`, and `[1]` reads as a glob.
+	it('stages a resolved path whose name reads as a pathspec pattern', async () => {
+		const name = Buffer.from(':weird[1]*.txt');
+		const root = repoMidMerge((repo, side) => {
+			writeFileSync(at(repo, name), `${side}\n`);
+		});
+		writeFileSync(at(root, name), 'resolved by hand\n');
+
+		const settlement = await settleMergeResolution(root);
+
+		expect(settlement).toEqual({ staged: [':weird[1]*.txt'], unresolved: [] });
+		expect(fixtureGit(root, ['diff', '--name-only', '--diff-filter=U'])).toBe('');
+		await expect(validatePreparedTree(root)).resolves.toBeUndefined();
 	});
 
 	// A repository with no merge in progress at all — every other phase's tree.

@@ -20,7 +20,7 @@
 
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { gitEnvironmentForCwd } from '@/scm/delivery.js';
 
@@ -48,10 +48,60 @@ const CONFLICT_MARKER = /^(?:<{7}|>{7}|\|{7})(?: |\r?$)/m;
 /** git's own binary test: a NUL byte in the first 8000 bytes. */
 const BINARY_SNIFF_BYTES = 8000;
 
-/** `git`, scoped to `cwd` alone — see {@link gitEnvironmentForCwd}. Output is returned raw (the NUL-delimited read must not be trimmed). */
-async function git(cwd: string, args: string[]): Promise<string> {
-	const { stdout } = await execFileAsync('git', args, { cwd, env: gitEnvironmentForCwd() });
+/**
+ * `git`, scoped to `cwd` alone — see {@link gitEnvironmentForCwd}.
+ *
+ * Output is returned raw **as bytes**: the NUL-delimited read must not be
+ * trimmed, and a git pathname is a byte string, not text. Decoding stdout as
+ * UTF-8 would turn any invalid byte into U+FFFD, and the mangled name then
+ * names neither the file on disk nor the entry in the index. `stdin`, when
+ * given, is written and closed, which is how a pathspec reaches git as bytes.
+ */
+async function git(cwd: string, args: string[], stdin?: Buffer): Promise<Buffer> {
+	const run = execFileAsync('git', args, {
+		cwd,
+		env: gitEnvironmentForCwd(),
+		encoding: 'buffer',
+	});
+	if (stdin) run.child.stdin?.end(stdin);
+	const { stdout } = await run;
 	return stdout;
+}
+
+/** The non-empty records of a `-z` git read, still bytes. */
+function splitNul(raw: Buffer): Buffer[] {
+	const records: Buffer[] = [];
+	for (let start = 0; start < raw.length; ) {
+		const end = raw.indexOf(0, start);
+		if (end === -1) {
+			records.push(raw.subarray(start));
+			break;
+		}
+		if (end > start) records.push(raw.subarray(start, end));
+		start = end + 1;
+	}
+	return records;
+}
+
+/**
+ * The absolute working-tree location of a git pathname, byte-for-byte.
+ *
+ * `join` takes strings, so it could only be reached by decoding the pathname
+ * first; `node:fs` accepts a Buffer path, so the bytes git printed are the
+ * bytes looked up.
+ */
+function worktreeLocation(cwd: string, path: Buffer): Buffer {
+	return Buffer.concat([Buffer.from(`${resolve(cwd)}${sep}`), path]);
+}
+
+/**
+ * The same pathname for humans — the log line and the settlement result.
+ *
+ * Lossy on purpose, and safe because it is only ever read: nothing here feeds a
+ * display form back to git.
+ */
+function displayPath(path: Buffer): string {
+	return path.toString('utf8');
 }
 
 /**
@@ -63,15 +113,34 @@ async function git(cwd: string, args: string[]): Promise<string> {
  * to interpret, and a binary conflict leaves one side's bytes in the working
  * tree, so staging it would silently pick that side.
  */
-async function isResolvedInWorkingTree(cwd: string, path: string): Promise<boolean> {
+async function isResolvedInWorkingTree(cwd: string, path: Buffer): Promise<boolean> {
 	let contents: Buffer;
 	try {
-		contents = await readFile(join(cwd, path));
+		contents = await readFile(worktreeLocation(cwd, path));
 	} catch {
 		return false;
 	}
 	if (contents.subarray(0, BINARY_SNIFF_BYTES).includes(0)) return false;
 	return !CONFLICT_MARKER.test(contents.toString('utf8'));
+}
+
+/** `:(literal)`: these are filenames git just printed, never patterns to re-match. */
+const LITERAL_PATHSPEC = Buffer.from(':(literal)');
+const NUL = Buffer.from([0]);
+
+/**
+ * Stage `paths` by handing git the exact bytes it printed.
+ *
+ * Not `git add -- <path>…`: an argument is a UTF-8 encoding of a JS string, so
+ * a pathname git can hold but Node cannot represent would arrive corrupted —
+ * and an argument is still *pathspec* syntax, so `:magic.txt` reads as pathspec
+ * magic and aborts the whole `git add`. `--pathspec-from-file=-` carries raw
+ * bytes over stdin and `:(literal)` turns off the pattern reading, so a path
+ * round-trips whatever it contains. (`git add --pathspec-from-file`: git 2.25+.)
+ */
+async function stageResolved(cwd: string, paths: Buffer[]): Promise<void> {
+	const pathspecs = Buffer.concat(paths.flatMap((path) => [LITERAL_PATHSPEC, path, NUL]));
+	await git(cwd, ['add', '--pathspec-from-file=-', '--pathspec-file-nul'], pathspecs);
 }
 
 /**
@@ -90,16 +159,15 @@ async function isResolvedInWorkingTree(cwd: string, path: string): Promise<boole
  * fails validation terminally, which is correct.
  */
 export async function settleMergeResolution(cwd: string): Promise<MergeResolutionSettlement> {
-	const raw = await git(cwd, ['diff', '--name-only', '-z', '--diff-filter=U']);
-	const unmerged = raw.split('\0').filter((path) => path.length > 0);
+	const unmerged = splitNul(await git(cwd, ['diff', '--name-only', '-z', '--diff-filter=U']));
 	if (unmerged.length === 0) return { staged: [], unresolved: [] };
 
-	const staged: string[] = [];
+	const resolved: Buffer[] = [];
 	const unresolved: string[] = [];
 	for (const path of unmerged) {
-		if (await isResolvedInWorkingTree(cwd, path)) staged.push(path);
-		else unresolved.push(path);
+		if (await isResolvedInWorkingTree(cwd, path)) resolved.push(path);
+		else unresolved.push(displayPath(path));
 	}
-	if (staged.length > 0) await git(cwd, ['add', '--', ...staged]);
-	return { staged, unresolved };
+	if (resolved.length > 0) await stageResolved(cwd, resolved);
+	return { staged: resolved.map(displayPath), unresolved };
 }
