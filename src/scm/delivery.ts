@@ -399,26 +399,69 @@ export class DeliveryDeferredError extends Error {
 }
 
 /**
- * A push that cannot succeed however many times it is retried: the delivered
- * commit is not a descendant of what `origin` already has on the branch (issue
- * #558).
+ * A delivery failure no retry can get past, because nothing that runs between
+ * attempts can change what it refused on (issue #839).
  *
  * Deliberately **not** a {@link DeliveryDeferredError}. A deferral preserves the
- * checkout and retries the delivery, which is right for a transient push/API
- * failure but wrong here — a diverged branch produces the identical
- * `! [rejected] (fetch first)` on every attempt, so the only thing retrying buys
- * is the retry budget (four attempts over ~35 minutes in the incident this comes
- * from). Every failure classifier keys deferral off `DeliveryDeferredError`
- * alone (`classifyDeferrable`, `src/transport/assignment-execution.ts`;
- * `handlePhaseFailure`, `src/worker/consumer.ts`), so being a plain `Error` is
- * what makes this terminal on the same-host and DB-free paths alike, with the
- * divergence named in the message the run, the board, and the logs all carry.
+ * checkout and resumes the delivery *without re-running the agent*
+ * ({@link resumedDeliveryAgent}), so the retry re-validates byte-identical state
+ * and fails identically — spending the whole `MAX_RATE_LIMIT_RETRIES` budget and
+ * its backoff while the preserved checkout keeps the branch away from the phase
+ * that could actually unblock the PR. Every failure classifier keys deferral off
+ * `DeliveryDeferredError` alone (`classifyDeferrable`,
+ * `src/transport/assignment-execution.ts`; `handlePhaseFailure`,
+ * `src/worker/consumer.ts`), so *not* being one is what makes this terminal on
+ * the same-host and DB-free paths alike.
+ *
+ * This is a **rule, not a list**: every refusal {@link validatePreparedTree} and
+ * {@link commitPreparedTree} can raise is thrown as one of these (see
+ * `refuseDelivery`), so the next refusal added there is terminal without anyone
+ * remembering to classify it. Because the error *class* does not survive the
+ * federated wire (the dispatcher rebuilds a remote worker's terminal failure as
+ * `AgentRunError{kind:'error'}`), the message is the whole report the operator
+ * gets — it must name the state that was refused and what clears it.
  */
-export class DeliveryDivergedError extends Error {
+export class UnretryableDeliveryError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = 'UnretryableDeliveryError';
+	}
+}
+
+/**
+ * The first member of the {@link UnretryableDeliveryError} rule (issue #558): a
+ * push that cannot succeed however many times it is retried, because the
+ * delivered commit is not a descendant of what `origin` already has on the
+ * branch. A diverged branch produces the identical `! [rejected] (fetch first)`
+ * on every attempt, so retrying buys nothing but the retry budget (four attempts
+ * over ~35 minutes in the incident this comes from).
+ *
+ * Kept as its own class — and its own `name` — because the divergence has two
+ * SHAs to name in the message the run, the board, and the logs all carry.
+ */
+export class DeliveryDivergedError extends UnretryableDeliveryError {
 	constructor(message: string, options?: ErrorOptions) {
 		super(message, options);
 		this.name = 'DeliveryDivergedError';
 	}
+}
+
+/**
+ * Refuse to deliver this tree, terminally. Every refusal
+ * {@link validatePreparedTree} and {@link commitPreparedTree} can raise goes
+ * through here — that funnel is what makes the classification a rule rather than
+ * a second hard-coded class beside {@link DeliveryDivergedError}: a new refusal
+ * added to either function cannot be a plain `Error` without going out of its
+ * way to be one.
+ *
+ * `remedy` is not decoration. This message is the whole report an operator gets:
+ * the terminal path posts it on the PR or board item
+ * (`reportPhaseFailureToBoardOrPr`, `src/worker/consumer.ts`), so it must say
+ * what state was refused and what clears it. The `Unsafe delivery:` prefix stays
+ * — operators key on it.
+ */
+function refuseDelivery(reason: string, remedy: string): never {
+	throw new UnretryableDeliveryError(`Unsafe delivery: ${reason}. ${remedy}`);
 }
 
 export function resumedDeliveryAgent(cli: AgentCli): AgentCliResult {
@@ -479,19 +522,38 @@ export function hasDeliveryProgress(cwd: string): boolean {
 }
 
 /**
+ * Whether this failure — or any failure it wraps — is one no retry can get past.
+ *
+ * Walks the `cause` chain (as `describeError` does) so wrapping a refusal on the
+ * way out of a phase cannot silently re-open the retry loop this closes.
+ */
+export function isUnretryableDeliveryFailure(error: unknown): boolean {
+	const seen = new Set<unknown>();
+	let current: unknown = error;
+	while (current instanceof Error && !seen.has(current)) {
+		if (current instanceof UnretryableDeliveryError) return true;
+		seen.add(current);
+		current = current.cause;
+	}
+	return false;
+}
+
+/**
  * Whether a failed delivery should be deferred for a retry that resumes from the
  * preserved checkout — the rule every pushing phase's failure path applies, in
  * one place so the four cannot drift.
  *
- * Two conditions, and the second is issue #558's: the attempt must have recorded
- * delivery progress, so there *is* something to resume, and the failure must be
- * one a retry could plausibly get past. A {@link DeliveryDivergedError} is not: the
- * remote already holds a commit the delivered one does not descend from, so every
- * retry repeats the identical rejection while the preserved checkout keeps the
- * branch away from the phase that could actually unblock the PR.
+ * Two conditions: the attempt must have recorded delivery progress, so there *is*
+ * something to resume, and the failure must be one a retry could plausibly get
+ * past. An {@link UnretryableDeliveryError} is not, and that class — not a named
+ * error — is the whole test (issue #839). Issue #558's {@link
+ * DeliveryDivergedError} is its first member: the remote already holds a commit
+ * the delivered one does not descend from, so every retry repeats the identical
+ * rejection. Every prepared-tree refusal is another: a retry resumes *without*
+ * re-running the agent, so it re-validates the same tree and refuses it again.
  */
 export function shouldDeferDeliveryFailure(error: unknown, cwd: string): boolean {
-	return !(error instanceof DeliveryDivergedError) && hasDeliveryProgress(cwd);
+	return !isUnretryableDeliveryFailure(error) && hasDeliveryProgress(cwd);
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -499,14 +561,37 @@ async function git(cwd: string, args: string[]): Promise<string> {
 	return stdout.trim();
 }
 
+/** Multi-path git output reads as one sentence rather than stray lines. */
+function joinPaths(output: string): string {
+	return output.split('\n').join(', ');
+}
+
+/**
+ * Refuse a prepared tree that must not be committed. Everything raised here is
+ * terminal by construction — it goes through `refuseDelivery`, so it is an
+ * {@link UnretryableDeliveryError} and `shouldDeferDeliveryFailure` will not spend
+ * the retry budget re-validating a tree nothing between attempts can change. A
+ * refusal added here inherits that; keep it going through the same helper.
+ */
 export async function validatePreparedTree(cwd: string): Promise<void> {
 	const unresolved = await git(cwd, ['diff', '--name-only', '--diff-filter=U']);
-	if (unresolved) throw new Error(`Unsafe delivery: unresolved conflicts in ${unresolved}`);
+	if (unresolved)
+		refuseDelivery(
+			`the index still holds unresolved conflicts in ${joinPaths(unresolved)}`,
+			"Nothing runs between delivery attempts that could stage them, so this was not retried. Mark each resolved path with 'git add' ('git rm' for a delete/delete conflict), then re-run this phase.",
+		);
 	const status = await git(cwd, ['status', '--porcelain']);
-	if (!status) throw new Error('Unsafe delivery: expected working-tree changes but found none');
+	if (!status)
+		refuseDelivery(
+			'the phase reported a deliverable result but the working tree holds no changes at all',
+			'Nothing was committed, pushed, or commented; re-run the phase.',
+		);
 	const trackedScratch = await git(cwd, ['ls-files', '--', ...SCRATCH_PATHSPECS]);
 	if (trackedScratch)
-		throw new Error(`Unsafe delivery: scratch artifact is tracked (${trackedScratch})`);
+		refuseDelivery(
+			`SWARM scratch artifact ${joinPaths(trackedScratch)} is tracked by the repository`,
+			"Untrack it ('git rm --cached <path>') and ignore it, then re-run this phase.",
+		);
 }
 
 export async function commitPreparedTree(
@@ -521,8 +606,9 @@ export async function commitPreparedTree(
 	await git(cwd, ['reset', '--quiet', '--', ...SCRATCH_PATHSPECS]);
 	const staged = await git(cwd, ['diff', '--cached', '--name-only']);
 	if (!staged)
-		throw new Error(
-			'Unsafe delivery: no deliverable changes remain after excluding hand-off artifacts',
+		refuseDelivery(
+			'every change in the working tree is a SWARM hand-off artifact, so there is nothing to deliver',
+			'Nothing was committed or pushed; re-run the phase.',
 		);
 	await git(cwd, [
 		'-c',
