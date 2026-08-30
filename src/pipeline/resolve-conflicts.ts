@@ -337,8 +337,10 @@ export async function runResolveConflictsPhase(
 		logger.info('Phase finished - Resolve-conflicts', { taskId, prNumber, ...outcome });
 		return { agent, outcome };
 	} catch (error) {
-		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
-		// settles terminally instead of retrying a push that can never succeed (#558).
+		// `shouldDeferDeliveryFailure` (not a bare progress check): a refusal that is a
+		// property of the prepared tree, or of a branch that cannot fast-forward, settles
+		// terminally rather than spending the retry budget re-validating identical state
+		// (#558, generalised by #839).
 		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Conflict-resolution delivery deferred for retry', {

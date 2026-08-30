@@ -613,8 +613,10 @@ export async function runRespondToReviewPhase(
 
 		return { outcome, movedTo, agent, pushedHeadSha };
 	} catch (error) {
-		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
-		// settles terminally instead of retrying a push that can never succeed (#558).
+		// `shouldDeferDeliveryFailure` (not a bare progress check): a refusal that is a
+		// property of the prepared tree, or of a branch that cannot fast-forward, settles
+		// terminally rather than spending the retry budget re-validating identical state
+		// (#558, generalised by #839).
 		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Review-response delivery deferred for retry', {

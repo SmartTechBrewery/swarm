@@ -647,11 +647,13 @@ export async function runImplementationPhase(
 			agent,
 		};
 	} catch (error) {
-		// `shouldDeferDeliveryFailure` (not a bare progress check) so a diverged branch
-		// settles terminally instead of retrying a push that can never succeed (#558):
-		// deferring would also preserve the checkout, denying the branch to the phase
-		// that could unblock the PR. The delivered commit survives on the local branch
-		// ref after the cleanup below, so nothing is lost to inspection.
+		// `shouldDeferDeliveryFailure` (not a bare progress check): a refusal that is a
+		// property of the prepared tree, or of a branch that cannot fast-forward,
+		// settles terminally rather than spending the retry budget re-validating
+		// identical state (#558, generalised by #839). Deferring would also preserve
+		// the checkout, denying the branch to the phase that could unblock the PR. For
+		// a divergence the delivered commit survives on the local branch ref after the
+		// cleanup below, so nothing is lost to inspection.
 		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Implementation delivery deferred for retry', {
