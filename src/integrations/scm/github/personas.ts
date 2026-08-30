@@ -13,13 +13,14 @@
  * largely retired, half. SWARM's *drop* gates stopped asking it: under the
  * federated model an implementer identity is the worker operator's own account, so
  * a login no longer distinguishes SWARM's output from that human's (ADR-004 §3).
- * The Review trigger keys on work-item origin instead (issue #397) and comment
- * loop prevention on the comment's own marker (issue #443,
- * `src/scm/swarm-origin.ts`), and the board's status-change gate stopped asking
- * these personas at all once board writes moved onto the PM provider's own
- * credential (issue #537 — `GitHubProjectsRouterAdapter` now resolves that
- * credential's identity instead). What still calls `isSwarmBot` is
- * `resolve-conflicts`' candidate filter.
+ * Both PR-ownership triggers key on work-item origin instead (`pr-review` since
+ * issue #397, `resolve-conflicts` since issue #836) and comment loop prevention on
+ * the comment's own marker (issue #443, `src/scm/swarm-origin.ts`), and the
+ * board's status-change gate stopped asking these personas at all once board
+ * writes moved onto the PM provider's own credential (issue #537 —
+ * `GitHubProjectsRouterAdapter` now resolves that credential's identity instead).
+ * Nothing in production calls `isSwarmBot` any more; it stays because the SCM
+ * contract still requires `isSwarmActor` of every provider.
  *
  * The two personas resolve their tokens from different sources (issue #396): the
  * `implementer` identity is resolved from the worker operator's own token

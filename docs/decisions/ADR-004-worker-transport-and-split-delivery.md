@@ -202,7 +202,7 @@ filesystem, and both are load-bearing rather than defensive polish:
 
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
 
-> **Status: implemented, in two phases.** Phase 1 (issue #397) — the **`pr-review`
+> **Status: implemented, in three phases.** Phase 1 (issue #397) — the **`pr-review`
 > trigger's ownership gate**: the three author checks in
 > `src/triggers/handlers/review.ts` collapsed into one work-item origin gate,
 > `isSwarmManagedPullRequest` (`src/triggers/swarm-managed-pr.ts`), evaluated once
@@ -215,11 +215,16 @@ filesystem, and both are load-bearing rather than defensive polish:
 > Implementation (issue #417): a federated PR is authored by the operator's own
 > account, so the persona-authorship gate skipped it and auto-review did not fire on
 > the federated path at all, while the comment gate dropped that same operator's
-> hand-written comments as SWARM's own. Two identity-based filters remain,
-> deliberately: the PM board's `GitHubProjectsRouterAdapter.isSelfAuthored` (a
-> status change carries no body to mark, and `selfEnqueueNextPhase` +
-> `pm-status-dedup.ts` already compensate) and `resolve-conflicts`' candidate
-> filter, tracked separately.
+> hand-written comments as SWARM's own. Phase 3 (issue #836) — **`resolve-conflicts`'
+> candidate filter**, the one left behind in phase 1: it still matched the PR
+> author against the project's persona identities, so on a project served by remote
+> workers no open PR was reachable by conflict resolution at all and an approved,
+> conflicting PR simply stopped. It now resolves through the same gate — both
+> triggers call one shared `resolveSwarmManagedPr`, so the decision and its
+> "could not decide" classification are defined once. One identity-based filter
+> remains, deliberately: the PM board's
+> `GitHubProjectsRouterAdapter.isSelfAuthored` (a status change carries no body to
+> mark, and `selfEnqueueNextPhase` + `pm-status-dedup.ts` already compensate).
 
 SWARM used to decide a PR should be auto-reviewed by checking that its **author
 is a SWARM persona**: `isSwarmAuthoredPr` → `isSwarmBot(authorLogin, identities)`
