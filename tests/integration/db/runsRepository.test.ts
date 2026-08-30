@@ -30,6 +30,7 @@ import {
 	hasResumableDeferredRun,
 	hasRunForTask,
 	listRunsFromDb,
+	listTaskActivitySince,
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
@@ -2069,6 +2070,207 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			const rows = await getPendingReviewMergeFollowUps();
 
 			expect(rows.map((r) => r.id)).toEqual([pending]);
+		});
+	});
+
+	// issue #840 — the run-side half of the item-liveness read model. One row per
+	// `(project, repository, task)` over a bounded window, carrying the group's
+	// latest run and its aggregates.
+	describe('listTaskActivitySince', () => {
+		const SINCE = new Date('2026-01-01T00:00:00Z');
+
+		/** A run row at an explicit time, so the grouping is not wall-clock dependent. */
+		async function seedActivityRun(input: {
+			projectId?: string;
+			repository?: string;
+			taskId: string;
+			phase: string;
+			status?: string;
+			startedAt: Date;
+			completedAt?: Date;
+			prNumber?: string;
+			producedPrUrl?: string;
+		}): Promise<string> {
+			const rows = await getDb()
+				.insert(runs)
+				.values({
+					projectId: input.projectId ?? PROJECT_ID,
+					repository: input.repository ?? REPO,
+					taskId: input.taskId,
+					phase: input.phase,
+					status: input.status ?? 'completed',
+					startedAt: input.startedAt,
+					completedAt: input.completedAt,
+					prNumber: input.prNumber,
+					producedPrUrl: input.producedPrUrl,
+				})
+				.returning({ id: runs.id });
+			return rows[0].id;
+		}
+
+		it('returns the group’s latest run by completion time, with its aggregates', async () => {
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+			});
+			const latest = await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				prNumber: '92',
+				startedAt: new Date('2026-02-02T00:00:00Z'),
+				completedAt: new Date('2026-02-02T00:10:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '92',
+				runId: latest,
+				phase: 'review',
+				prNumber: '92',
+				liveRunCount: 0,
+			});
+			expect(rows[0].lastActivityAt).toEqual(new Date('2026-02-02T00:10:00Z'));
+		});
+
+		// A `running` row has no `completed_at`, so its `started_at` is the activity
+		// time — and it must still be the group's latest.
+		it('counts running rows into liveRunCount and dates them by startedAt', async () => {
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+			});
+			const live = await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				status: 'running',
+				startedAt: new Date('2026-02-03T00:00:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+
+			expect(rows).toHaveLength(1);
+			expect(rows[0].runId).toBe(live);
+			expect(rows[0].liveRunCount).toBe(1);
+			expect(rows[0].lastActivityAt).toEqual(new Date('2026-02-03T00:00:00Z'));
+		});
+
+		it('groups separately per task and per repository of one project', async () => {
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+			await seedActivityRun({
+				taskId: '92-ci',
+				phase: 'respond-to-ci',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				repository: 'jkwiecien/other-repo',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+
+			// Sorted on both sides: the read orders by `(project, repository, task)`, so
+			// `jkwiecien/other-repo` precedes `jkwiecien/runs-repo` — the assertion is
+			// about which groups exist, not about their order.
+			expect(rows.map((row) => `${row.repository}/${row.taskId}`).sort()).toEqual(
+				[`${REPO}/92`, `${REPO}/92-ci`, 'jkwiecien/other-repo/92'].sort(),
+			);
+		});
+
+		it('honours the since window', async () => {
+			await seedActivityRun({
+				taskId: 'ancient',
+				phase: 'review',
+				startedAt: new Date('2025-12-01T00:00:00Z'),
+			});
+			await seedActivityRun({
+				taskId: 'recent',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+
+			expect(rows.map((row) => row.taskId)).toEqual(['recent']);
+		});
+
+		it('honours the accessible-project scope', async () => {
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other-repo' });
+			await seedActivityRun({
+				taskId: 'mine',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+			await seedActivityRun({
+				projectId: 'proj-other',
+				repository: 'jkwiecien/other-repo',
+				taskId: 'theirs',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+
+			const scoped = await listTaskActivitySince({ since: SINCE, projectIds: [PROJECT_ID] });
+			expect(scoped.map((row) => row.taskId)).toEqual(['mine']);
+
+			const both = await listTaskActivitySince({
+				since: SINCE,
+				projectIds: [PROJECT_ID, 'proj-other'],
+			});
+			expect(both).toHaveLength(2);
+		});
+
+		// A caller that narrowed to no accessible project must not be widened back
+		// to the installation — the distinction `undefined` makes.
+		it('answers an empty scope with no rows rather than every project', async () => {
+			await seedActivityRun({
+				taskId: 'mine',
+				phase: 'review',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+			});
+
+			expect(await listTaskActivitySince({ since: SINCE, projectIds: [] })).toEqual([]);
+			expect(await listTaskActivitySince({ since: SINCE })).toHaveLength(1);
+		});
+
+		it('carries the hand-off columns the classification reads', async () => {
+			await seedActivityRun({
+				taskId: '103',
+				phase: 'implementation',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+				producedPrUrl: 'https://github.com/acme/widgets/pull/92',
+			});
+			const reviewRun = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '92',
+				phase: 'review',
+				prNumber: '92',
+			});
+			await updateReviewMergeOutcome(reviewRun, {
+				status: 'merged',
+				message: 'done',
+				attempt: 0,
+				approvedHeadSha: 'sha-1',
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+			const byTask = Object.fromEntries(rows.map((row) => [row.taskId, row]));
+
+			expect(byTask['103'].producedPrUrl).toBe('https://github.com/acme/widgets/pull/92');
+			expect(byTask['92'].reviewMergeOutcome).toBe('merged');
 		});
 	});
 });
