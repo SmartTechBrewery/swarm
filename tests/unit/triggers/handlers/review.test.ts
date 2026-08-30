@@ -14,9 +14,13 @@ import {
 // The handler gates dispatch on a Redis-backed dedup claim; mock it so these
 // tests stay pure-in-memory. `claimReviewDispatch` defaults to granting the
 // claim (the common path); individual tests flip it to exercise a skip.
-const { claimReviewDispatch } = vi.hoisted(() => ({ claimReviewDispatch: vi.fn() }));
+const { claimReviewDispatch, refreshReviewDispatchClaim } = vi.hoisted(() => ({
+	claimReviewDispatch: vi.fn(),
+	refreshReviewDispatchClaim: vi.fn(),
+}));
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
+	refreshReviewDispatchClaim,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 }));
@@ -118,6 +122,8 @@ function checkStatus(runs: Array<[string, string, string | null]>): AggregateChe
 beforeEach(() => {
 	claimReviewDispatch.mockReset();
 	claimReviewDispatch.mockResolvedValue(true);
+	refreshReviewDispatchClaim.mockReset();
+	refreshReviewDispatchClaim.mockResolvedValue(undefined);
 	claimRespondToCiAttempt.mockReset();
 	claimRespondToCiAttempt.mockResolvedValue({ allowed: true, attempt: 1 });
 	claimConflictResolution.mockReset();
@@ -1586,6 +1592,95 @@ describe('review trigger — two repositories of one project (issue #685)', () =
 			{ projectId: 'acme', repository: 'acme/android', prNumber: '42', headSha: 'abc123' },
 			{ projectId: 'acme', repository: 'acme/backend', prNumber: '42', headSha: 'abc123' },
 		]);
+	});
+});
+
+/**
+ * The PR+SHA claim is a *lease*, and a dispatched CI fix takes it out for as long
+ * as its agent may run (issue #841). The claim's default five-minute TTL is sized
+ * for the gap between a PR opening and its checks completing, which an agent run
+ * readily outlives — and a lease that lapses mid-run leaves the slot free for a
+ * delayed sibling completed-check event to take, spending a second fix attempt on
+ * the red already being fixed and meeting the no-fix hand-over with a competing
+ * claimant rather than this dispatch's own live lease.
+ */
+describe('review trigger — the CI fix holds the PR+SHA lease for its run (issue #841)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+	const KEY = `${PROJECT.repo}:9:cafe`;
+	const CI_FIX_CLAIM_TTL_SEC = 35 * 60;
+
+	/**
+	 * A stand-in for the Redis claim with its TTL: key → seconds left. `claim` is
+	 * `SET NX EX 300`, `refresh` is a plain `SET EX`, and {@link elapse} reaps what
+	 * expired — so these tests contend for one real slot over real time rather than
+	 * a canned boolean.
+	 */
+	const leases = new Map<string, number>();
+	const elapse = (sec: number) => {
+		for (const [key, left] of leases) {
+			if (left <= sec) leases.delete(key);
+			else leases.set(key, left - sec);
+		}
+	};
+
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+		leases.clear();
+		claimReviewDispatch.mockImplementation(async (key: string) => {
+			if (leases.has(key)) return false;
+			leases.set(key, 5 * 60);
+			return true;
+		});
+		refreshReviewDispatchClaim.mockImplementation(async (key: string, ttlSec: number) => {
+			leases.set(key, ttlSec);
+		});
+	});
+
+	it('extends the claim to the fix run’s wall clock when it dispatches', async () => {
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+
+		expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, CI_FIX_CLAIM_TTL_SEC);
+	});
+
+	it('locks a sibling out past the point the ordinary five-minute lease would have lapsed', async () => {
+		await handler.handle(ctx(checks));
+		// Longer than the default TTL, well inside a 30-minute agent run.
+		elapse(6 * 60);
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		// The decisive assertion: exactly one fix attempt was spent on this red.
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+	});
+
+	// The honest bound, stated so the docs can't drift past it: this is a lease, not
+	// a lock. Beyond the extended TTL — a project that configures `respond-to-ci`
+	// past it, a Redis restart — the slot does fall free again, and the per-PR
+	// fix-attempt cap is what bounds a duplicate fix from there.
+	it('does not pretend to hold the slot beyond the extended lease', async () => {
+		await handler.handle(ctx(checks));
+		elapse(CI_FIX_CLAIM_TTL_SEC + 60);
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+	});
+
+	it('leaves the lease alone when the attempt cap drops the dispatch — nothing runs', async () => {
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 5 });
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+	});
+
+	it('leaves a Review dispatch on the ordinary TTL — only a CI fix extends it', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'review' });
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
 	});
 });
 

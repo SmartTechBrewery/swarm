@@ -33,6 +33,10 @@ import { parseRedisUrl } from '../lib/redis.js';
 
 // 5 minutes — long enough to cover the gap between a PR opening and its checks
 // completing, short enough that a wedged claim can't block re-review for long.
+// It is the TTL of a claim nobody has taken responsibility for yet; a holder
+// that needs the slot for longer than the gap it covers — a deferred
+// continuation, a running CI fix — extends it explicitly via
+// {@link refreshReviewDispatchClaim} rather than widening the default for all.
 const DEDUP_TTL_SEC = 5 * 60;
 
 const KEY_NS = 'swarm:review-dedup:';
@@ -125,12 +129,21 @@ export async function claimReviewDispatch(
 
 /**
  * Refresh (extend) a live claim's TTL without re-claiming — the counterpart used
- * to hold a claim open while its dispatch is deferred as a *pending continuation*
- * (issue #214). A Review blocked solely by project concurrency keeps its PR+SHA
- * claim so no sibling `opened`/`check_suite` event can steal it while it waits,
- * and its prioritized retry (fired well within this refreshed TTL) reuses the
- * held claim rather than re-claiming — so exactly one Review still runs per
- * PR/head SHA across the initial webhook and its retry.
+ * wherever the slot has to stay owned for longer than the default TTL, by a
+ * holder that will re-enter without re-claiming. Three callers:
+ *  - a dispatch deferred as a *pending continuation* (issue #214,
+ *    `retainContinuationDispatchClaim`). A Review blocked solely by project
+ *    concurrency keeps its PR+SHA claim so no sibling `opened`/`check_suite`
+ *    event can steal it while it waits, and its prioritized retry (fired well
+ *    within this refreshed TTL) reuses the held claim rather than re-claiming —
+ *    so exactly one Review still runs per PR/head SHA across the initial webhook
+ *    and its retry.
+ *  - a dispatched Respond-to-CI (`handlers/review.ts`), which extends the slot
+ *    to cover its own agent wall clock: the default five minutes is shorter than
+ *    a fix run, and a lapsed lease lets a delayed sibling completed-check event
+ *    start a second fix on the red already being fixed.
+ *  - a `no-fix` hand-over (`src/dispatch/ci-no-fix-recovery.ts`), which passes
+ *    that still-held lease from the finished fix to the recovery it enqueues.
  *
  * `SET key value EX ttl` (no `NX`): extends the existing claim, or re-establishes
  * it if it lapsed a moment ago, so the pending continuation is never dropped as a

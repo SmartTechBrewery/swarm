@@ -125,3 +125,27 @@ describe('releaseReviewDispatch', () => {
 		await expect(releaseReviewDispatch('acme/widgets:42:abc')).resolves.toBeUndefined();
 	});
 });
+
+/**
+ * The extend-without-re-claiming counterpart: a deferred continuation, a running
+ * CI fix, and the `no-fix` hand-over all hold the slot for longer than the
+ * default TTL and re-enter without re-claiming.
+ */
+describe('refreshReviewDispatchClaim', () => {
+	it('sets the namespaced key with the requested TTL and no NX', async () => {
+		const { refreshReviewDispatchClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await refreshReviewDispatchClaim('acme/widgets:42:abc', 2100);
+
+		// No `NX`: the point is to extend (or re-establish) the hold, not to lose it
+		// to a claim that already exists — including this holder's own.
+		expect(set).toHaveBeenCalledWith(`${NS}acme/widgets:42:abc`, 'pr-review-pending', 'EX', 2100);
+	});
+
+	it('swallows Redis errors (TTL is the safety net)', async () => {
+		set.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { refreshReviewDispatchClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(refreshReviewDispatchClaim('acme/widgets:42:abc', 2100)).resolves.toBeUndefined();
+	});
+});

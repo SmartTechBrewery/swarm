@@ -110,8 +110,10 @@
  * gate around it (closed-PR, work-item origin, draft/fork, mergeability, the
  * `state-pending` defer, the verdict reservation) still runs. The one gate it
  * *does* change is the PR+SHA dispatch dedup, and only in whose favour: the
- * finished Respond-to-CI dispatch hands its claim over rather than releasing it,
- * so a marked recovery reuses the held claim while a delayed ordinary
+ * dispatched CI fix extends that claim to cover its own run
+ * ({@link CI_FIX_CLAIM_TTL_SEC}) and the finished dispatch hands it over rather
+ * than releasing it, so the slot is continuously owned from the fix through the
+ * hand-over — a marked recovery reuses the held claim, and a delayed ordinary
  * completed-check event for the same head is locked out of starting a second
  * CI fix.
  *
@@ -166,7 +168,11 @@ import {
 	claimRespondToCiAttempt,
 	MAX_FIX_ATTEMPTS,
 } from '../respond-to-ci-attempts.js';
-import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
+import {
+	buildReviewDispatchKey,
+	claimReviewDispatch,
+	refreshReviewDispatchClaim,
+} from '../review-dispatch-dedup.js';
 import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
@@ -595,12 +601,39 @@ function resolveDisposition(
 }
 
 /**
+ * How long the PR+SHA dispatch claim is extended to once a Respond-to-CI
+ * dispatch is actually returned — long enough to cover the CI-fix agent's own
+ * wall clock (`SWARM_AGENT_TIMEOUT_MS`, 30 minutes by default) plus margin for
+ * the enqueue and pickup around it.
+ *
+ * The claim's ordinary five-minute TTL is sized for the gap between a PR opening
+ * and its checks completing, which a CI-fix *run* readily outlives. Letting it
+ * lapse mid-run leaves the slot free for a delayed sibling completed-check event
+ * on the same head to take — spending a second fix attempt on the red this run is
+ * already fixing, and, on a `no-fix` conclusion, meeting the hand-over in
+ * `src/dispatch/ci-no-fix-recovery.ts` with a competing claimant instead of this
+ * dispatch's own live lease. Holding the slot for the run's duration is what the
+ * dedup means in the first place: one dispatch per PR+SHA while one is in flight.
+ *
+ * Sized against the *default* wall clock: a project that raises
+ * `agents.respondToCi.timeoutMs` past this can still have a run outlive its
+ * lease, and a concurrency deferral in between re-shortens it to the
+ * continuation TTL until the retry re-enters here. Both are bounded by the
+ * per-PR fix-attempt cap rather than by this TTL.
+ */
+const CI_FIX_CLAIM_TTL_SEC = 35 * 60;
+
+/**
  * Turn a resolved `respond-to-ci` disposition into a dispatch. The PR+SHA dedup
  * slot is already claimed by the caller; a fresh dispatch adds the per-PR
  * fix-attempt cap (`claimRespondToCiAttempt`) — the guard the per-SHA dedup
  * can't provide, since each fix commit is a new SHA. A prioritized retry reuses
  * the attempt already counted before its concurrency deferral. Returns `null`
  * (not a dispatch) when the cap is hit or the PR branch is missing.
+ *
+ * A dispatch that *is* returned extends the shared PR+SHA claim to
+ * {@link CI_FIX_CLAIM_TTL_SEC} so it stays held for the whole fix run; the two
+ * `null` paths deliberately leave the ordinary TTL alone, since nothing runs.
  *
  * The *first* event to cross the cap also leaves the durable give-up trace
  * (issue #838) — see the guard below. A missing PR branch deliberately does not:
@@ -642,6 +675,14 @@ async function dispatchRespondToCi(
 		}
 		attempt = claim.attempt;
 	}
+
+	// Hold the shared PR+SHA slot for as long as this fix can run (see
+	// {@link CI_FIX_CLAIM_TTL_SEC}). Best-effort, like every other refresh: a
+	// Redis hiccup here only restores the pre-existing short lease.
+	await refreshReviewDispatchClaim(
+		buildReviewDispatchKey(project.repo, prNumber, headSha),
+		CI_FIX_CLAIM_TTL_SEC,
+	);
 
 	logger.debug('respond-to-ci: dispatching Respond-to-CI phase', {
 		prNumber,

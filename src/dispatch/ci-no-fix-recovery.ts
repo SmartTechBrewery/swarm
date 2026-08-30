@@ -113,9 +113,20 @@ export function ciNoFixRecoveryDeliveryId(
  * `src/worker/consumer.ts`) rather than deleted: it stays held across the
  * enqueue, no ordinary event can take it, and the synthetic job's own
  * `ciNoFixRecovery` marker is what tells `pr-review` to *reuse* the held claim
- * instead of re-claiming and dropping itself as a duplicate. Refreshing (a plain
- * `SET … EX`, no `NX`) also re-establishes the claim if the CI-fix run outlived
- * its original five-minute TTL, which a long agent run readily does.
+ * instead of re-claiming and dropping itself as a duplicate.
+ *
+ * The lease it extends is the one the CI fix has been holding all along: the
+ * claim's default five-minute TTL is shorter than an agent run, so `pr-review`
+ * extends it to cover the fix's wall clock at the moment it dispatches
+ * (`CI_FIX_CLAIM_TTL_SEC`, `src/triggers/handlers/review.ts`). That is what makes
+ * the hand-over a *transfer* rather than a re-take — without it the slot would
+ * fall free mid-run and a delayed sibling could already have started a second
+ * fix by the time this refresh ran. Refreshing is a plain `SET … EX` (no `NX`)
+ * so it also re-establishes the claim in the residual case where even the
+ * extended lease lapsed — a project whose `respond-to-ci` timeout is configured
+ * beyond it, or a Redis restart. There the per-PR fix-attempt cap
+ * (`src/triggers/respond-to-ci-attempts.ts`) is what bounds a duplicate fix, and
+ * the recovery's own deterministic delivery id still keeps the Review single.
  */
 export async function scheduleCiNoFixRecovery({
 	project,
