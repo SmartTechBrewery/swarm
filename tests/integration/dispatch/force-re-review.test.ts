@@ -6,6 +6,7 @@ import '../../../src/integrations/entrypoint.js';
 import {
 	claimDispatch,
 	completeDispatch,
+	createDispatch,
 	getDispatchById,
 	listWakeablePendingDispatches,
 } from '../../../src/db/repositories/dispatchesRepository.js';
@@ -31,30 +32,51 @@ const PR = '508';
  * `tests/integration/db/reviewVerdictsRepository.test.ts`'s own build-up.
  */
 async function reachCapAt(headSha: string, reviewId: string): Promise<void> {
+	// Every reservation names the dispatch that took it (issue #857); these are all
+	// submitted immediately, so one live owner stands in for the real trigger's.
+	const owner = await seedReservingDispatch();
 	for (let i = 1; i < REVIEW_VERDICT_CAP; i++) {
 		const sha = `${headSha}-precap-${i}`;
-		await reserveReviewVerdict({
-			projectId: PROJECT_ID,
-			repository: REPO,
-			prNumber: PR,
-			headSha: sha,
-		});
+		await reserveReviewVerdict(
+			{
+				projectId: PROJECT_ID,
+				repository: REPO,
+				prNumber: PR,
+				headSha: sha,
+			},
+			owner,
+		);
 		await markReviewVerdictSubmitted(
 			{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha: sha },
 			{ verdict: 'request-changes', reviewId: `${reviewId}-${i}` },
 		);
 	}
-	await reserveReviewVerdict({ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha });
+	await reserveReviewVerdict(
+		{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha },
+		owner,
+	);
 	await markReviewVerdictSubmitted(
 		{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha },
 		{ verdict: 'request-changes', reviewId },
 	);
 }
 
-/** A capped, `manual-intervention-required` Review run — the state `forceReReview` recovers from. */
-async function seedCappedReviewRun(headSha: string, reviewId: string): Promise<string> {
-	await reachCapAt(headSha, reviewId);
-	const jobPayload: SwarmJob = {
+/** A leased review dispatch to own the reservations above — `review_verdicts.dispatch_id` FKs it. */
+async function seedReservingDispatch(): Promise<string> {
+	const { dispatch } = await createDispatch({
+		projectId: PROJECT_ID,
+		jobPayload: reviewJobPayload('sha-owner'),
+		source: 'manual',
+		taskId: PR,
+		phase: 'review',
+		state: 'leased',
+	});
+	return dispatch.id;
+}
+
+/** The `checks` job payload every dispatch/run in this file carries. */
+function reviewJobPayload(headSha: string): SwarmJob {
+	return {
 		type: 'scm',
 		providerId: 'github',
 		projectId: PROJECT_ID,
@@ -68,6 +90,12 @@ async function seedCappedReviewRun(headSha: string, reviewId: string): Promise<s
 			prBranch: `issue-${PR}`,
 		},
 	};
+}
+
+/** A capped, `manual-intervention-required` Review run — the state `forceReReview` recovers from. */
+async function seedCappedReviewRun(headSha: string, reviewId: string): Promise<string> {
+	await reachCapAt(headSha, reviewId);
+	const jobPayload = reviewJobPayload(headSha);
 	const runId = await createRun({
 		projectId: PROJECT_ID,
 		repository: REPO,

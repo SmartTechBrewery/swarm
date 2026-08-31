@@ -3239,10 +3239,12 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 function buildTriggerContext(
 	job: ScmWebhookJob | PmWebhookJob,
 	project: ProjectConfig,
+	dispatchId: string,
 ): TriggerContext {
 	return job.type === 'scm'
 		? {
 				project,
+				dispatchId,
 				deliveryId: job.deliveryId,
 				recheckAttempt: job.recheckAttempt,
 				readFailureRecheckAttempt: job.readFailureRecheckAttempt,
@@ -3260,6 +3262,7 @@ function buildTriggerContext(
 			}
 		: {
 				project,
+				dispatchId,
 				deliveryId: job.deliveryId,
 				recheckAttempt: job.recheckAttempt,
 				rateLimitRetryAttempt: job.rateLimitRetryAttempt,
@@ -3782,6 +3785,10 @@ async function bindSelectedWorker(
  * was silently unreviewable for the rest of its life (live on `rover#116`).
  * Hence: **not conditional on `job.runId`**.
  *
+ * Since issue #857 the reservation also expires with the dispatch that took it,
+ * so a hand-back missed here is a delay rather than a permanent block — this
+ * path is the prompt release, not the only one.
+ *
  * **The gate is the dispatch's own recorded phase, not the event.** An
  * unconditional hand-back keyed on repo + PR + head would be unsafe: a sibling
  * `checks completed` event for a PR whose Review is *in flight* is dropped by
@@ -4009,7 +4016,7 @@ export async function processJob(
 		return processMergeAutomationDispatch(dispatch, job, project);
 	}
 
-	const ctx = buildTriggerContext(job, project);
+	const ctx = buildTriggerContext(job, project, dispatch.id);
 
 	const trigger = await registry.dispatch(ctx);
 	if (!trigger) {

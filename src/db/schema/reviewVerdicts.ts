@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { dispatches } from './dispatches.js';
 import { projects } from './projects.js';
 
 /**
@@ -13,12 +14,14 @@ import { projects } from './projects.js';
  * `ordinal` numbers a PR's review slots (1 = the initial review, 2–3 = the two
  * permitted re-reviews); `reviewVerdictsRepository.ts` never creates a slot
  * past its `REVIEW_VERDICT_CAP`.
- * `state` starts `pending` (reserved, not yet known to have submitted),
- * flips to `submitted` once delivery confirms it, or `abandoned` when the
- * phase knows for certain the review was never submitted (freeing that
- * ordinal for a fresh attempt at the same head without "charging" the PR for
- * the failed retry — the cap counts only `submitted` slots, plus at most one
- * `pending` slot in flight at a time).
+ * `state` starts `pending` (reserved *by {@link reviewVerdicts.dispatchId}*, not
+ * yet known to have submitted), flips to `submitted` once delivery confirms it,
+ * or `abandoned` when the review is known never to have been submitted — either
+ * because the phase said so, or because the dispatch that reserved the slot has
+ * settled terminally without one (issue #857). Abandoning frees that ordinal for
+ * a fresh attempt at the same head without "charging" the PR for the failed
+ * retry — the cap counts only `submitted` slots, plus at most one `pending` slot
+ * in flight at a time.
  *
  * `repository` denormalizes the owning project's `repo` (rather than joining
  * `projects` for every lookup), matching `runs.prNumber`/`runs.prTitle`'s
@@ -43,6 +46,20 @@ export const reviewVerdicts = pgTable(
 		/** The submitted GitHub review's numeric id, once known. */
 		reviewId: text('review_id'),
 		reservedAt: timestamp('reserved_at').defaultNow().notNull(),
+		/**
+		 * The dispatch whose trigger evaluation took — or most recently reused — this
+		 * slot (issue #857). What gives a `pending` reservation an *owner*, so it
+		 * expires with the attempt it belongs to instead of blocking the pull request
+		 * for ever when a hand-back is missed: `reserveReviewVerdict` honours a
+		 * `pending` row only while this dispatch is still active, and abandons it
+		 * otherwise.
+		 *
+		 * `set null` on delete, mirroring `dispatches.runId` → `runs.id`: the ledger is
+		 * the permanent safety-cap record and must outlive any row it points at. A null
+		 * owner reads as "no live dispatch backs this", which is the same answer a
+		 * terminal one gives.
+		 */
+		dispatchId: uuid('dispatch_id').references(() => dispatches.id, { onDelete: 'set null' }),
 		submittedAt: timestamp('submitted_at'),
 		/**
 		 * When an operator deliberately forced the corrective cycle to continue past

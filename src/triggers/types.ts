@@ -42,6 +42,17 @@ import type { SCMProvider, ScmType } from '../scm/types.js';
  */
 export type TriggerContext = {
 	project: ProjectConfig;
+	/**
+	 * The **claimed dispatch row's** id — this evaluation's own attempt (issue
+	 * #857). Not `SwarmJob.dispatchId`, which is optional and absent on a legacy
+	 * job adopted into the dispatch model at claim time; by the time a context is
+	 * built the row always exists, so this is required.
+	 *
+	 * A handler that takes a durable claim before any run row exists records it as
+	 * that claim's owner, which is what lets the claim expire with the attempt
+	 * instead of outliving it (`reserveReviewVerdict`).
+	 */
+	dispatchId: string;
 	/** The provider's per-delivery webhook id, when the job carried one. */
 	deliveryId?: string;
 	/**

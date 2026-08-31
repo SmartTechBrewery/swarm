@@ -63,6 +63,7 @@ function ctx(
 ): PmTriggerContext {
 	return {
 		project: PROJECT,
+		dispatchId: 'dispatch-1',
 		source: 'pm',
 		providerId: 'github-projects',
 		event: createMockPmEvent(eventOverrides),

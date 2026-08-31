@@ -23,6 +23,29 @@
  * reached submission ({@link abandonReviewVerdict}) doesn't cost the PR its
  * slot.
  *
+ * **A `pending` slot lives exactly as long as the dispatch that took it (issue
+ * #857).** Every reservation records its owning dispatch (`dispatch_id`), and
+ * the `blocked` decision honours a `pending` row only while that dispatch is
+ * still in {@link ACTIVE_DISPATCH_STATES} — queued, deferred, leased, running,
+ * or inside its retry budget. A row whose owner has settled terminally, or
+ * whose owner is gone/never recorded (a null `dispatch_id`), is abandoned in
+ * the same locked transaction and the reservation proceeds. Terminal really is
+ * dead: `dispatchesRepository`'s conditional updates mean a `completed`,
+ * `failed` or `cancelled` dispatch can never be resurrected. This is the one
+ * reader a leaked `pending` row can harm, so putting the check here — rather
+ * than adding a hand-back to every terminal settle path — is what makes a
+ * missed hand-back a delay rather than a permanently unreviewable PR
+ * (`rover#116`; the specific leak was issue #856).
+ *
+ * Recovery costs the PR nothing and grants it nothing: an abandoned row never
+ * counted toward the cap, so freeing its *ordinal* is not freeing a verdict,
+ * and the operator override below is evaluated afterwards and is neither spent
+ * nor paid for by it. The one real loss is that
+ * {@link markReviewVerdictSubmitted}'s documented post-crash repair — a review
+ * that reached GitHub but never reached this ledger — can no longer land once
+ * recovery has abandoned that slot; a permanently dead PR is the worse of the
+ * two, so the trade is deliberate.
+ *
  * **Operator cap overrides (issue #511).** {@link REVIEW_VERDICT_CAP} is the
  * *automatic* cap: nothing SWARM does on its own raises it. An operator who
  * deliberately forces the corrective cycle to continue past a cap-reaching
@@ -35,9 +58,11 @@
  * cycle again rather than reopening it.
  */
 
-import { and, asc, desc, eq, isNull, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { getDb } from '../client.js';
+import { dispatches } from '../schema/dispatches.js';
 import { reviewVerdicts } from '../schema/reviewVerdicts.js';
+import { ACTIVE_DISPATCH_STATES } from './dispatchesRepository.js';
 
 /**
  * No PR may receive more than this many *automatically* submitted SWARM Review
@@ -59,21 +84,46 @@ export interface ReviewVerdictKey {
 	headSha: string;
 }
 
+/**
+ * A `pending` slot this reservation recovered (issue #857) — one whose owning
+ * dispatch had settled terminally without ever submitting a verdict, so it was
+ * abandoned to let the reservation through. Reported back rather than logged
+ * here (nothing else in the DB layer logs) because it is the one durable trace
+ * that a hand-back was missed: {@link reserveReviewVerdict}'s caller warns on it.
+ */
+export interface RecoveredReviewSlot {
+	ordinal: number;
+	headSha: string;
+	dispatchId: string | null;
+}
+
 export type ReviewVerdictReservation =
 	/** `capOverride` marks a slot that only exists because an operator forced it (issue #511). */
-	| { status: 'reserved'; id: string; ordinal: number; capOverride?: true }
+	| {
+			status: 'reserved';
+			id: string;
+			ordinal: number;
+			capOverride?: true;
+			recovered?: RecoveredReviewSlot;
+	  }
 	| { status: 'reused'; id: string; ordinal: number; state: 'pending' | 'submitted' }
 	| { status: 'blocked'; ordinal: number }
-	| { status: 'capped' };
+	| { status: 'capped'; recovered?: RecoveredReviewSlot };
 
 /**
- * Reserve (or reuse) this PR/head's review slot, serialized behind a
+ * Reserve (or reuse) this PR/head's review slot on behalf of `dispatchId` — the
+ * claimed dispatch row whose trigger evaluation is asking — serialized behind a
  * transaction-scoped Postgres advisory lock so concurrent reservations for
  * the same PR can't race past {@link REVIEW_VERDICT_CAP}. See the module header for
  * the full decision order.
+ *
+ * `dispatchId` is required and positional on purpose: a slot must be owned from
+ * the instant it exists, so a call site that cannot name its dispatch is a
+ * compile error rather than a row that blocks its PR for ever.
  */
 export async function reserveReviewVerdict(
 	key: ReviewVerdictKey,
+	dispatchId: string,
 ): Promise<ReviewVerdictReservation> {
 	const { projectId, repository, prNumber, headSha } = key;
 	return getDb().transaction(async (tx) => {
@@ -102,6 +152,16 @@ export async function reserveReviewVerdict(
 
 		const sameHead = active.find((row) => row.headSha === headSha);
 		if (sameHead) {
+			// Re-point a reused *pending* slot at the dispatch now asking for it: a
+			// manual retry mints a fresh dispatch row, and leaving the slot owned by
+			// the settled one would let the next different-head reservation recover a
+			// Review that is genuinely in flight. A `submitted` slot is never touched.
+			if (sameHead.state === 'pending' && sameHead.dispatchId !== dispatchId) {
+				await tx
+					.update(reviewVerdicts)
+					.set({ dispatchId })
+					.where(eq(reviewVerdicts.id, sameHead.id));
+			}
 			return {
 				status: 'reused',
 				id: sameHead.id,
@@ -110,9 +170,30 @@ export async function reserveReviewVerdict(
 			};
 		}
 
+		// One pending slot per PR — but only while the dispatch that took it is
+		// still due to run (issue #857). A slot whose owner settled terminally
+		// without submitting, or whose owner is gone/was never recorded, is a relic
+		// of a missed hand-back: abandon it here, in the same lock, so this
+		// reservation proceeds instead of the PR being unreviewable for ever.
+		let recovered: RecoveredReviewSlot | undefined;
 		const pendingOther = active.find((row) => row.state === 'pending');
 		if (pendingOther) {
-			return { status: 'blocked', ordinal: pendingOther.ordinal };
+			if (await isDispatchActive(tx, pendingOther.dispatchId)) {
+				return { status: 'blocked', ordinal: pendingOther.ordinal };
+			}
+			await tx
+				.update(reviewVerdicts)
+				.set({ state: 'abandoned' })
+				.where(eq(reviewVerdicts.id, pendingOther.id));
+			// Dropped from `active` too, so the ordinal it held is reused and the cap
+			// arithmetic below counts exactly what it counted before — an abandoned
+			// row was never a spent verdict.
+			active.splice(active.indexOf(pendingOther), 1);
+			recovered = {
+				ordinal: pendingOther.ordinal,
+				headSha: pendingOther.headSha,
+				dispatchId: pendingOther.dispatchId,
+			};
 		}
 
 		// Past the automatic cap, the PR proceeds only on an operator's explicit
@@ -125,7 +206,7 @@ export async function reserveReviewVerdict(
 			const grant = active.find(
 				(row) => row.capOverrideGrantedAt !== null && row.capOverrideConsumedAt === null,
 			);
-			if (!grant) return { status: 'capped' };
+			if (!grant) return { status: 'capped', ...(recovered ? { recovered } : {}) };
 			await tx
 				.update(reviewVerdicts)
 				.set({ capOverrideConsumedAt: new Date() })
@@ -136,15 +217,40 @@ export async function reserveReviewVerdict(
 		const ordinal = active.length + 1;
 		const inserted = await tx
 			.insert(reviewVerdicts)
-			.values({ projectId, repository, prNumber, headSha, ordinal, state: 'pending' })
+			.values({ projectId, repository, prNumber, headSha, ordinal, state: 'pending', dispatchId })
 			.returning({ id: reviewVerdicts.id });
 		return {
 			status: 'reserved',
 			id: inserted[0].id,
 			ordinal,
 			...(capOverride ? { capOverride: true as const } : {}),
+			...(recovered ? { recovered } : {}),
 		};
 	});
+}
+
+/**
+ * Whether the dispatch that owns a `pending` slot is still due to run — the one
+ * question that separates "a Review is in flight" from "the dispatch that
+ * reserved this died" (issue #857).
+ *
+ * A null owner answers `false` with no query: a dispatch that was never
+ * recorded, one whose row is gone (the FK nulls it on delete), and one that has
+ * settled terminally are all equally "nothing backs this slot".
+ */
+async function isDispatchActive(
+	tx: Pick<ReturnType<typeof getDb>, 'select'>,
+	dispatchId: string | null,
+): Promise<boolean> {
+	if (!dispatchId) return false;
+	const rows = await tx
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		.where(
+			and(eq(dispatches.id, dispatchId), inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES])),
+		)
+		.limit(1);
+	return rows.length > 0;
 }
 
 /** Whether an operator's cap override was recorded, or why it could not be. */
