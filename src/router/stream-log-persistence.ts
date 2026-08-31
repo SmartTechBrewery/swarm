@@ -129,15 +129,23 @@ export function persistStreamLog(frame: StreamLog, runId: string | undefined): v
 }
 
 /**
- * The two things the control plane has to say about a run whose output it stopped
- * receiving (issue #723). Kept here, next to the sink that writes them, so the
- * *user-visible* strings have one definition — the same reason `stillRunningLine`
- * lives in `../worker/live-output.ts` rather than at its emit site, and phrased in
- * the same plain register, since on the run page they sit in the same column.
+ * The three things the control plane has to say about a run whose output it stopped
+ * receiving (issue #723, extended by #859). Kept here, next to the sink that writes
+ * them, so the *user-visible* strings have one definition — the same reason
+ * `stillRunningLine` lives in `../worker/live-output.ts` rather than at its emit
+ * site, and phrased in the same plain register, since on the run page they sit in
+ * the same column.
+ *
+ * The third is the one that closes the pair: the drop note promises output resumes
+ * "when it reconnects", so a transport that never comes back has to correct that
+ * promise in the run's own stream rather than leave it standing
+ * (`./transport-loss-reaper.ts`).
  */
 export const TRANSPORT_LOST_NOTE =
 	'Transport session to the worker running this phase dropped — output is paused until it reconnects.';
 export const TRANSPORT_RESTORED_NOTE = 'Transport session restored — output resumes.';
+export const TRANSPORT_LOST_ORPHAN_NOTE =
+	'Transport session to the worker never returned — this phase was terminated and the pull request, task and capacity it held were released.';
 
 /**
  * Write one control-plane-authored line into a run's output stream. Unlike every

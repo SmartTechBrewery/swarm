@@ -72,6 +72,7 @@ import {
 	resolveDispatchTargetForRun,
 } from './dispatch-results.js';
 import { sendToWorker } from './worker-connections.js';
+import { offlineSilenceMs } from './worker-liveness.js';
 
 /**
  * The `reason` carried on the pushed frame. It is for the daemon's log only — the
@@ -109,26 +110,6 @@ export function resolveOfflineWorkerCancelTimeoutMs(
 
 /** Resolved once (validates the env var at load), like the sibling dispatch timeouts. */
 const OFFLINE_WORKER_CANCEL_TIMEOUT_MS = resolveOfflineWorkerCancelTimeoutMs();
-
-/**
- * Floor on how long a worker must have been silent before its missing live session
- * reads as *gone* rather than as a socket that simply closed. A daemon that is up
- * heartbeats every `heartbeatTtlMs / 3` (`heartbeatCadenceMs`) and, if its socket
- * drops, reconnects on a ladder capped at a jittered 30s
- * (`DEFAULT_BACKOFF.maxMs`) — both in `../transport/worker-client.ts`. Two minutes
- * clears the wider of those by 4x, so an ordinary blip never qualifies.
- */
-const OFFLINE_SILENCE_FLOOR_MS = 120_000;
-
-/**
- * The silence that makes a worker *probably gone*: twice the configured heartbeat
- * TTL — the window `getLiveSessionForWorker` itself measures liveness over — but
- * never below {@link OFFLINE_SILENCE_FLOOR_MS}, so shortening the TTL cannot shrink
- * this below the reconnect ladder and start settling live phases.
- */
-function offlineSilenceMs(heartbeatTtlMs: number): number {
-	return Math.max(2 * heartbeatTtlMs, OFFLINE_SILENCE_FLOOR_MS);
-}
 
 /**
  * Whether the worker has been silent long enough that nothing is going to report
