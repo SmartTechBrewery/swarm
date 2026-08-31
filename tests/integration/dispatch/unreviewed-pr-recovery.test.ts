@@ -66,6 +66,26 @@ async function seedImplementationRun(): Promise<void> {
 }
 
 /**
+ * A dispatch to own a review-verdict reservation. Issue #857 made the owner a
+ * required argument of `reserveReviewVerdict` and gave `review_verdicts` a
+ * foreign key to `dispatches`, so these cases cannot pass a synthetic id — they
+ * care about the ledger's *state*, not about who holds it, but the holder has to
+ * be a real row. Left in its default `pending` state, which is active, so a
+ * `pending` slot seeded here still blocks exactly as it did before #857.
+ */
+let verdictOwnerSeq = 0;
+async function seedVerdictOwner(): Promise<string> {
+	verdictOwnerSeq += 1;
+	const { dispatch } = await createDispatch({
+		projectId: PROJECT_ID,
+		jobPayload: { type: 'scm', providerId: 'github', projectId: PROJECT_ID } as SwarmJob,
+		dedupKey: `verdict-owner-${verdictOwnerSeq}`,
+		source: 'webhook',
+	});
+	return dispatch.id;
+}
+
+/**
  * Every recovery dispatch this project holds, terminal ones included — read
  * straight off the table because no repository read returns settled rows, and the
  * whole bound under test is about what a *spent* attempt permits next.
@@ -112,12 +132,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		describe('listActiveReviewSlotsForPullRequest', () => {
 			it('returns live slots in ordinal order and excludes abandoned ones', async () => {
 				const key = { projectId: PROJECT_ID, repository: REPO, prNumber: PR };
-				await reserveReviewVerdict({ ...key, headSha: 'sha-1' });
+				await reserveReviewVerdict({ ...key, headSha: 'sha-1' }, await seedVerdictOwner());
 				await markReviewVerdictSubmitted(
 					{ ...key, headSha: 'sha-1' },
 					{ verdict: 'request-changes', reviewId: 'review-1' },
 				);
-				await reserveReviewVerdict({ ...key, headSha: 'sha-2' });
+				await reserveReviewVerdict({ ...key, headSha: 'sha-2' }, await seedVerdictOwner());
 				await abandonReviewVerdict({ ...key, headSha: 'sha-2' });
 
 				const slots = await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR);
@@ -134,12 +154,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			});
 
 			it('does not bleed across two repositories of one project', async () => {
-				await reserveReviewVerdict({
-					projectId: PROJECT_ID,
-					repository: OTHER_REPO,
-					prNumber: PR,
-					headSha: 'sha-1',
-				});
+				await reserveReviewVerdict(
+					{ projectId: PROJECT_ID, repository: OTHER_REPO, prNumber: PR, headSha: 'sha-1' },
+					await seedVerdictOwner(),
+				);
 
 				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toEqual([]);
 				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, OTHER_REPO, PR)).toHaveLength(
@@ -215,7 +233,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			// abandoned its ledger slot, leaving the PR green, mergeable and unreviewed.
 			it('recovers a pull request whose Review died leaving an abandoned slot — exactly once', async () => {
 				const key = { projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha: HEAD };
-				await reserveReviewVerdict(key);
+				await reserveReviewVerdict(key, await seedVerdictOwner());
 				await abandonReviewVerdict(key);
 
 				await recoverUnreviewedPullRequests();
@@ -247,12 +265,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			// The #856/#857 boundary, asserted rather than assumed: freeing a leaked
 			// reservation is their job; this sweep must never step over a `pending` slot.
 			it('does not recover while a review is pending at an earlier head', async () => {
-				await reserveReviewVerdict({
-					projectId: PROJECT_ID,
-					repository: REPO,
-					prNumber: PR,
-					headSha: 'sha-earlier',
-				});
+				await reserveReviewVerdict(
+					{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha: 'sha-earlier' },
+					await seedVerdictOwner(),
+				);
 
 				await recoverUnreviewedPullRequests();
 
@@ -261,7 +277,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 
 			it('does not recover a pull request that already has a submitted verdict at this head', async () => {
 				const key = { projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha: HEAD };
-				await reserveReviewVerdict(key);
+				await reserveReviewVerdict(key, await seedVerdictOwner());
 				await markReviewVerdictSubmitted(key, { verdict: 'approve', reviewId: 'review-head' });
 
 				await recoverUnreviewedPullRequests();
