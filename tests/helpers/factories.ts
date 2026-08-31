@@ -993,6 +993,7 @@ export function createMockScmTriggerContext(
 ): Extract<TriggerContext, { source: 'scm' }> {
 	return {
 		project: createMockProjectConfig(),
+		dispatchId: 'dispatch-1',
 		source: 'scm',
 		providerId: 'github',
 		event: createMockScmEvent(),

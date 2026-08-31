@@ -744,12 +744,15 @@ describe('review trigger', () => {
 				prBranch: 'issue-42',
 				headSha: 'abc123',
 			});
-			expect(reserveReviewVerdict).toHaveBeenCalledWith({
-				projectId: PROJECT.id,
-				repository: PROJECT.repo,
-				prNumber: '42',
-				headSha: 'abc123',
-			});
+			expect(reserveReviewVerdict).toHaveBeenCalledWith(
+				{
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					prNumber: '42',
+					headSha: 'abc123',
+				},
+				'dispatch-1',
+			);
 		});
 
 		it('skips the dispatch when another head is still pending (blocked)', async () => {
@@ -1793,12 +1796,15 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 
 		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
 
-		expect(reserveReviewVerdict).toHaveBeenCalledWith({
-			projectId: PROJECT.id,
-			repository: PROJECT.repo,
-			prNumber: '9',
-			headSha: 'cafe',
-		});
+		expect(reserveReviewVerdict).toHaveBeenCalledWith(
+			{
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				prNumber: '9',
+				headSha: 'cafe',
+			},
+			'dispatch-1',
+		);
 	});
 
 	// The recovery *owns* the PR+SHA slot rather than contending for it: the
