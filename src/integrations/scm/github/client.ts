@@ -288,6 +288,25 @@ export async function listPullRequestsForCommit(
 	}));
 }
 
+/**
+ * The commit a branch currently points at, or `null` when GitHub answers without
+ * naming one.
+ *
+ * A 404 — an absent branch, or a token that cannot see the repository — throws,
+ * for the reason {@link SCMProvider.getBranchHead} states: the two are
+ * indistinguishable here, and reading either as an ordinary answer would hide a
+ * misconfiguration.
+ */
+export async function getBranchHead(
+	owner: string,
+	repo: string,
+	branch: string,
+): Promise<string | null> {
+	const client = getScopedClient();
+	const { data } = await client.repos.getBranch({ owner, repo, branch });
+	return data.commit.sha ?? null;
+}
+
 /** Retrieve pull request details by number, including mergeability status. */
 export async function getPullRequest(
 	owner: string,

@@ -5,6 +5,7 @@ import {
 	BitbucketApiError,
 	bitbucketGitBasicCredential,
 	bitbucketRequest,
+	getBitbucketBranchHead,
 	getBitbucketUserForCredential,
 	getScopedBitbucketUserEmail,
 	getScopedCredential,
@@ -236,6 +237,57 @@ describe('bitbucket client', () => {
 			await expect(
 				withBitbucketCredential('token-abc', () => paginateBitbucket('/things')),
 			).rejects.toThrow(/refusing to follow a cyclic next cursor/);
+		});
+	});
+
+	describe('getBitbucketBranchHead', () => {
+		it("returns the branch's head commit, narrowed to Bitbucket's 12-character spelling", async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ name: 'main', target: { hash: 'd'.repeat(40) } }));
+
+			await expect(
+				withBitbucketCredential('token-abc', () =>
+					getBitbucketBranchHead('acme', 'widgets', 'main'),
+				),
+			).resolves.toBe('d'.repeat(12));
+			expect(fetchMock.mock.calls[0]?.[0]).toBe(
+				`${BITBUCKET_API_BASE}/repositories/acme/widgets/refs/branches/main`,
+			);
+		});
+
+		it('URL-encodes a branch name with a slash in it', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ target: { hash: 'd'.repeat(40) } }));
+
+			await withBitbucketCredential('token-abc', () =>
+				getBitbucketBranchHead('acme', 'widgets', 'release/1.0'),
+			);
+
+			expect(fetchMock.mock.calls[0]?.[0]).toBe(
+				`${BITBUCKET_API_BASE}/repositories/acme/widgets/refs/branches/release%2F1.0`,
+			);
+		});
+
+		it('answers null when Bitbucket names no target commit', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ name: 'main' }));
+
+			await expect(
+				withBitbucketCredential('token-abc', () =>
+					getBitbucketBranchHead('acme', 'widgets', 'main'),
+				),
+			).resolves.toBeNull();
+		});
+
+		// The adapter's standing rule: an unreadable read is never flattened into an
+		// ordinary answer, so a 404 propagates rather than reading as "no head".
+		it('propagates a 404 rather than answering null', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({ type: 'error', error: { message: 'Branch not found' } }, 404),
+			);
+
+			await expect(
+				withBitbucketCredential('token-abc', () =>
+					getBitbucketBranchHead('acme', 'widgets', 'gone'),
+				),
+			).rejects.toBeInstanceOf(BitbucketApiError);
 		});
 	});
 

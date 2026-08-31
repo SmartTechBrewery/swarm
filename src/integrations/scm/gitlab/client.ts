@@ -229,6 +229,24 @@ export function projectPath(repo: string): string {
 }
 
 /**
+ * The commit a branch currently points at, or `null` when GitLab answers without
+ * naming one.
+ *
+ * A {@link GitLabApiError} **propagates**, including a 404: this adapter never
+ * flattens an unreadable read into an ordinary answer, and "no such branch" and
+ * "this token cannot see this project" are the same response
+ * ({@link SCMProvider.getBranchHead}). The SHA is GitLab's full 40-character
+ * spelling, like every other commit this adapter reports (`./pipelines.ts`).
+ */
+export async function getGitLabBranchHead(repo: string, branch: string): Promise<string | null> {
+	const ref = await gitlabRequest<{ commit?: { id?: string } }>(
+		'GET',
+		`${projectPath(repo)}/repository/branches/${encodeURIComponent(branch)}`,
+	);
+	return ref.commit?.id ?? null;
+}
+
+/**
  * Resolve the GitLab username a token authenticates as, or `null` when it is
  * absent or the lookup fails — the same contract as `getGitHubUserForToken` and
  * `getBitbucketUserForCredential`, for the same reason: one bad credential must

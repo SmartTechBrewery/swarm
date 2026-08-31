@@ -28,6 +28,8 @@ vi.mock('@/integrations/scm/bitbucket/client.js', async (importOriginal) => ({
 	withBitbucketCredential: vi.fn(
 		(_credential: string, fn: () => Promise<unknown>): Promise<unknown> => fn(),
 	),
+	getBitbucketBranchHead:
+		vi.fn<(workspace: string, slug: string, branch: string) => Promise<string | null>>(),
 	getBitbucketUserForCredential: vi.fn<(credential: string | null) => Promise<string | null>>(),
 	getScopedBitbucketUserEmail: vi.fn<() => Promise<string | null>>(),
 }));
@@ -65,6 +67,7 @@ vi.mock('@/integrations/scm/bitbucket/writes.js', () => ({
 
 import {
 	BitbucketApiError,
+	getBitbucketBranchHead,
 	getBitbucketUserForCredential,
 	getScopedBitbucketUserEmail,
 	withBitbucketCredential,
@@ -305,6 +308,21 @@ describe('BitbucketSCMIntegration', () => {
 				'SmartTechBrewery',
 				'swarm',
 				17,
+			);
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+		});
+
+		// The implementer rather than the reviewer the aggregate read below uses: a
+		// repository-level read, whose caller today is a router sweep holding only the
+		// operator's own credential.
+		it("reads the base branch's head commit as the implementer", async () => {
+			vi.mocked(getBitbucketBranchHead).mockResolvedValue('d3022fc0ca3d');
+
+			await expect(scm.getBranchHead(project, 'main')).resolves.toBe('d3022fc0ca3d');
+			expect(vi.mocked(getBitbucketBranchHead)).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				'main',
 			);
 			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
 		});
