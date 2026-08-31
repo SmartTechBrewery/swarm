@@ -27,7 +27,7 @@ import {
 	resolveContainmentPlan,
 } from './containment.js';
 import { type ReasoningLevel, resolveModelLaunch } from './models.js';
-import { type AgentUsage, parseAgentOutput } from './usage.js';
+import { type AgentUsage, parseAgentOutput, sessionIdFromLine } from './usage.js';
 
 /** Agent CLIs the harness knows how to launch. Source of truth for the set. */
 export const AgentCliSchema = z.enum(['claude', 'antigravity', 'codex']);
@@ -309,9 +309,13 @@ export interface AgentCliResult {
 	 * `--session-id`), `codex` emits it as its `thread.started` event, and
 	 * `antigravity` prints its `conversation_id` on its own stream — falling back
 	 * to a diff of its on-disk conversation store ({@link ./antigravity-session.ts})
-	 * when that stream is unavailable or was cut off. Absent when the CLI produced
-	 * no recoverable id — an unsupported/older CLI, malformed output, or a run
-	 * that never got far enough to create a session.
+	 * when that stream is unavailable or was cut off. For the two CLIs that mint
+	 * their own id, the primary source is the *live* line stream rather than the
+	 * captured text ({@link ./usage.ts}'s `sessionIdFromLine`): both announce it in
+	 * their opening event, which a run flooding `maxOutputBytes` drops from the
+	 * latched head and from the rolling tail alike. Absent when the CLI produced no
+	 * recoverable id — an unsupported/older CLI, malformed output, or a run that
+	 * never got far enough to create a session.
 	 */
 	sessionId?: string;
 	/**
@@ -647,7 +651,27 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 		let timeoutTimer: NodeJS.Timeout | undefined;
 		let graceTimer: NodeJS.Timeout | undefined;
 
+		// The session id of a CLI that mints its own, taken off the live line stream
+		// rather than out of either capture buffer. `codex` and `agy` announce it in
+		// their *first* event, while the head buffer latches once a chatty run floods
+		// `maxOutputBytes` and the rolling tail keeps only the last bytes — so on a
+		// truncated run the two windows never overlap and the opening event falls
+		// between them, losing the run's resume handle. The live line callback below
+		// sees every line exactly once, whichever buffer later truncates. It costs one
+		// `JSON.parse` per line only until the id is found, which is the first line on
+		// both CLIs; `claude` never matches and is answered from its assigned id.
+		let streamedSessionId: string | undefined;
+
+		/**
+		 * One-shot sniff of the raw protocol line, read before the normalizer
+		 * translates it — the readable transcript no longer carries the id.
+		 */
+		const sniffSessionId = (raw: string): void => {
+			if (streamedSessionId === undefined) streamedSessionId = sessionIdFromLine(cli, raw);
+		};
+
 		const forwardStdout = lineForwarder((raw) => {
+			sniffSessionId(raw);
 			for (const line of streamNormalizer ? streamNormalizer.translate(raw) : [raw]) {
 				if (streamNormalizer) display.add(`${line}\n`);
 				if (options.logLines) logger.debug('agent stdout', { cli, line });
@@ -784,23 +808,32 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 			return stdout.truncated ? stdout.text : (logText ?? stdout.text);
 		}
 
-		/** Per-CLI resolution of the id to resume this run with (see close handler). */
+		/**
+		 * Per-CLI resolution of the id to resume this run with (see close handler).
+		 * The captured output is asked first so a resume run's re-emitted id still
+		 * wins and nothing about the non-truncated path changes;
+		 * {@link streamedSessionId} — the live sniff — backs it for the two
+		 * self-minting CLIs, whose opening event a truncated run's buffers drop.
+		 */
 		function resolveSessionId(parsedSessionId?: string): string | undefined {
 			if (cli === 'claude') return parsedSessionId ?? resumeId ?? options.sessionId;
 			if (cli === 'antigravity') {
 				if (resumeId) return resumeId;
-				// The stream's own `conversation_id` first; the store diff only when it
-				// carried none — an `agy` predating `--output-format`, or a run killed
-				// before its opening event reached us.
+				// The stream's own `conversation_id` first, from the capture or from the
+				// live sniff; the store diff only when neither saw one — an `agy`
+				// predating `--output-format`, or a run killed before its opening event
+				// reached us.
 				return (
 					parsedSessionId ??
+					streamedSessionId ??
 					(antigravityBefore ? detectNewConversationId(antigravityBefore) : undefined)
 				);
 			}
 			// codex: `thread.started` re-emits the same id on resume, so the parsed
-			// value already reflects a resumed session; fall back to resumeId if the
-			// event was missed (e.g. truncated head with no tail recovery).
-			return parsedSessionId ?? resumeId;
+			// value already reflects a resumed session; the sniffed id covers a run
+			// whose flood pushed that event out of both buffers, and resumeId a run
+			// that never emitted it at all.
+			return parsedSessionId ?? streamedSessionId ?? resumeId;
 		}
 	});
 }

@@ -1342,6 +1342,91 @@ describe('runAgentCli', () => {
 		});
 	});
 
+	describe('session id capture under truncation (issue #867)', () => {
+		// The mirror image of the usage-from-the-tail cases above: a self-minting CLI
+		// announces its id in its *first* event, so a run that then floods
+		// `maxOutputBytes` has it in neither buffer — the head latched before the id
+		// could be re-read from it, and the rolling tail long since dropped it. The
+		// live line stream is the only window that saw it.
+		const CODEX_THREAD_ID = '019f57a7-cf1b-72d3-b887-63758a10f3a8';
+		const AGY_CONVERSATION_ID = 'd42f7419-1111-2222-3333-444455556666';
+
+		it('keeps the Codex thread id when later output floods the cap', async () => {
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ cli: 'codex', maxOutputBytes: 100 }),
+			);
+			const child = lastChild();
+			child.stdout.emit('data', `{"type":"thread.started","thread_id":"${CODEX_THREAD_ID}"}\n`);
+			child.stdout.emit('data', `${'x'.repeat(200)}\n`); // floods the head cap
+			child.stdout.emit(
+				'data',
+				'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}\n',
+			);
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.outputTruncated).toBe(true);
+			expect(result.sessionId).toBe(CODEX_THREAD_ID);
+			// The id and the usage come from opposite ends of the stream, so recovering
+			// one must not cost the other.
+			expect(result.usage).toEqual({ inputTokens: 1, outputTokens: 2 });
+		});
+
+		it('reports no Codex session id when the run emitted no opening event', async () => {
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ cli: 'codex', maxOutputBytes: 100 }),
+			);
+			const child = lastChild();
+			child.stdout.emit('data', `${'x'.repeat(200)}\n`);
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.outputTruncated).toBe(true);
+			// No id was ever minted, so none may be invented — an absent id means
+			// "start fresh", and a fabricated one would resume a session nobody owns.
+			expect(result.sessionId).toBeUndefined();
+		});
+
+		it('falls back to the id a cut-off Codex resume ran with', async () => {
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({
+					cli: 'codex',
+					resumeSessionId: CODEX_THREAD_ID,
+					args: ['continue'],
+				}),
+			);
+			const child = lastChild();
+			child.emit('close', 143, null);
+
+			const result = await promise;
+			expect(result.sessionId).toBe(CODEX_THREAD_ID);
+		});
+
+		it('keeps the Antigravity conversation id when later output floods the cap', async () => {
+			const dir = mkdtempSync(path.join(tmpdir(), 'agy-conversations-'));
+			const previous = process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR;
+			// An empty store, so a session id can only have come from the stream.
+			process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR = dir;
+			try {
+				const promise = runAgentCli(
+					createMockRunAgentCliOptions({ cli: 'antigravity', maxOutputBytes: 100 }),
+				);
+				const child = await spawnedChild(0);
+				child.stdout.emit('data', agyStream(agyInit(AGY_CONVERSATION_ID)));
+				child.stdout.emit('data', agyStream(agyTextDelta(2, `${'x'.repeat(200)}\n`)));
+				child.emit('close', 0, null);
+
+				const result = await promise;
+				expect(result.outputTruncated).toBe(true);
+				expect(result.sessionId).toBe(AGY_CONVERSATION_ID);
+			} finally {
+				if (previous === undefined) delete process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR;
+				else process.env.SWARM_ANTIGRAVITY_CONVERSATIONS_DIR = previous;
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	});
+
 	it('does not echo output lines to the logger by default, but does when logLines is set', async () => {
 		const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
 		try {
