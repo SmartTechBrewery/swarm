@@ -180,8 +180,18 @@ type MockDispatchRow = {
 	state: string;
 	priority: number;
 	attempt: number;
+	/**
+	 * What the dispatch's own trigger resolved on an earlier evaluation, as
+	 * `recordDispatchResolution` writes it. Null on a row whose delivery resolved
+	 * nothing — which is exactly what the no-trigger hand-back gate reads (issue
+	 * #856).
+	 */
+	phase: string | null;
 };
-function mockDispatchRow(job: Record<string, unknown>): MockDispatchRow {
+function mockDispatchRow(
+	job: Record<string, unknown>,
+	phase: string | null = null,
+): MockDispatchRow {
 	return {
 		id: 'dispatch-1',
 		wakeSeq: 0,
@@ -192,6 +202,7 @@ function mockDispatchRow(job: Record<string, unknown>): MockDispatchRow {
 		state: 'leased',
 		priority: 0,
 		attempt: 0,
+		phase,
 	};
 }
 /** What the two resolution writers now take — one object rather than positionals. */
@@ -722,6 +733,18 @@ function registryReturning(result: TriggerResult | null, seenContexts: TriggerCo
 	return registry;
 }
 
+/**
+ * Claim the next dispatch as a row whose earlier evaluation resolved `phase` —
+ * what `recordDispatchResolution` leaves behind, and the only thing the
+ * no-trigger hand-back gate keys on (issue #856).
+ */
+function claimDispatchWithPhase(phase: string) {
+	claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
+		claimed: true,
+		dispatch: mockDispatchRow(job, phase),
+	}));
+}
+
 // Narrowed to the `review` variant (rather than the whole union) so a test can
 // spread it into a variation — see the in-flight guard's second-taskId case.
 const REVIEW_TRIGGER: Extract<TriggerResult, { phase: 'review' }> = {
@@ -1108,6 +1131,7 @@ describe('processJob', () => {
 				continuationDispatchClaimed: true,
 				event: createMockScmEvent({ headSha: 'deadbeef' }),
 			});
+			claimDispatchWithPhase('review');
 
 			const outcome = await processJob(job, registryReturning(null));
 
@@ -1144,6 +1168,7 @@ describe('processJob', () => {
 
 			it('records the ledger outcome as completed and still requests the merge', async () => {
 				projectLookup = () => autoMergeProject;
+				claimDispatchWithPhase('review');
 				completedReviewRun();
 				getSubmittedReviewSlot.mockResolvedValue({
 					ordinal: 1,
@@ -1168,9 +1193,13 @@ describe('processJob', () => {
 					reviewOrdinal: 1,
 					reviewAutomationOutcome: undefined,
 				});
-				// The claim stays held: the review really was submitted, so handing it
-				// back would let a sibling event post a duplicate.
+				// Nothing is handed back: the review really was submitted, so releasing
+				// the claim would let a sibling event post a duplicate, and abandoning
+				// the ledger slot would discard that verdict's own record (issue #856
+				// hands back on every *other* no-trigger path, so this is the one
+				// exception it preserves).
 				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
 				expect(requestMergeAutomation).toHaveBeenCalledExactlyOnceWith({
 					project: autoMergeProject,
 					reviewRunId: 'run-123',
@@ -1242,6 +1271,7 @@ describe('processJob', () => {
 			// a continuation of another phase must not adopt its verdict.
 			it('still fails a non-Review continuation for the same PR and head', async () => {
 				projectLookup = () => autoMergeProject;
+				claimDispatchWithPhase('respond-to-review');
 				completedReviewRun({ phase: 'respond-to-review' });
 				getSubmittedReviewSlot.mockResolvedValue({
 					ordinal: 1,
@@ -1255,7 +1285,9 @@ describe('processJob', () => {
 					status: 'failed',
 					error: expect.stringContaining('no-trigger'),
 				});
-				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+				// A Respond-to-review dispatch never took the PR+SHA claim, so releasing
+				// it here could hand away a live Review's slot (issue #856).
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
 			});
 
@@ -1276,6 +1308,7 @@ describe('processJob', () => {
 			});
 
 			it('still fails when this head has no submitted verdict', async () => {
+				claimDispatchWithPhase('review');
 				completedReviewRun();
 
 				await processJob(redeliveredJob(), registryReturning(null));
@@ -1296,6 +1329,9 @@ describe('processJob', () => {
 				);
 
 				expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
+				// Nor written to: a delivery that was never a Review leaves the ledger
+				// exactly as it found it (issue #856).
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
 				expect(completeRun).toHaveBeenCalledWith('run-123', {
 					status: 'failed',
 					error: expect.stringContaining('no-trigger'),
@@ -1315,6 +1351,82 @@ describe('processJob', () => {
 					error: expect.stringContaining('no-trigger'),
 				});
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+		});
+
+		// Issue #856: the trigger takes the PR+SHA dedup claim and the durable
+		// review-verdict reservation in the router, before any run row exists, while
+		// every hand-back used to be keyed on `job.runId`. A dispatch deferred for
+		// worker capacity has no run, so a `no-trigger` re-evaluation leaked the
+		// `pending` ledger row — and one pending row per PR makes every later Review
+		// of that PR `blocked` at any head (live on `rover#116`).
+		describe('a no-trigger settle hands back what the trigger claimed (issue #856)', () => {
+			/** The live sequence's job: reserved and claimed, then deferred with no run. */
+			const deferredWithNoRun = () =>
+				createMockScmWebhookJob({
+					runId: undefined,
+					continuationDispatchClaimed: true,
+					event: createMockScmEvent({ headSha: 'b055cb7e' }),
+				});
+
+			it('hands back both claims when the dispatch never produced a run row', async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(deferredWithNoRun(), registryReturning(null));
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(abandonReviewVerdict).toHaveBeenCalledExactlyOnceWith({
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					prNumber: '17',
+					headSha: 'b055cb7e',
+				});
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:b055cb7e`);
+				// There is no run row to finalize — the gate that used to suppress the
+				// whole hand-back.
+				expect(completeRun).not.toHaveBeenCalled();
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
+			});
+
+			// Respond-to-CI shares the Review's PR+SHA slot but reserves no ledger slot.
+			it('hands back only the shared claim for a Respond-to-CI dispatch', async () => {
+				claimDispatchWithPhase('respond-to-ci');
+
+				await processJob(deferredWithNoRun(), registryReturning(null));
+
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:b055cb7e`);
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+			});
+
+			it('leaves both alone for a dispatch that resolved another phase', async () => {
+				claimDispatchWithPhase('resolve-conflicts');
+
+				await processJob(deferredWithNoRun(), registryReturning(null));
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+			});
+
+			// The sibling `checks completed` event the dedup claim drops: it resolved
+			// nothing, so its dispatch row carries no phase. Handing back on its behalf
+			// would release a live Review's claim and abandon its pending row.
+			it('leaves both alone for a delivery that resolved nothing at all', async () => {
+				await processJob(deferredWithNoRun(), registryReturning(null));
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+			});
+
+			// The hand-back is best-effort: a ledger hiccup must not fail a dispatch
+			// that is being settled deliberately.
+			it('still settles no-trigger when the ledger hand-back throws', async () => {
+				claimDispatchWithPhase('review');
+				abandonReviewVerdict.mockRejectedValueOnce(new Error('db down'));
+
+				const outcome = await processJob(deferredWithNoRun(), registryReturning(null));
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
 			});
 		});
 	});

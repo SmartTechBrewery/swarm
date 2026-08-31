@@ -99,9 +99,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				// the failed attempt isn't charged against the cap.
 				const retry = await reserveReviewVerdict(key('sha-1'));
 				expect(retry).toMatchObject({ status: 'reserved', ordinal: 1 });
-				// And a different head is no longer blocked behind the abandoned one.
+				// A different head is blocked behind that *retry* — the one-pending-slot
+				// rule, now held by the re-reservation rather than the abandoned row.
 				const other = await reserveReviewVerdict(key('sha-2'));
 				expect(other).toMatchObject({ status: 'blocked', ordinal: 1 });
+			});
+
+			// Issue #856's live sequence, ledger half: a Review reserved for one head
+			// was dropped as `no-trigger`, the PR moved to a new head, and until the
+			// leaked `pending` row was handed back every later Review answered
+			// `blocked`. With the hand-back, the new head reserves normally.
+			it('lets a new head reserve once the previous head’s reservation is abandoned', async () => {
+				await reserveReviewVerdict(key('sha-a'));
+				await abandonReviewVerdict(key('sha-a'));
+
+				const newHead = await reserveReviewVerdict(key('sha-b'));
+
+				expect(newHead).toMatchObject({ status: 'reserved', ordinal: 1 });
 			});
 		});
 

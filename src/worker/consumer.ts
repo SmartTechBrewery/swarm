@@ -3770,6 +3770,65 @@ async function bindSelectedWorker(
 }
 
 /**
+ * Hand back what *this dispatch's own trigger* already claimed, for a delivery
+ * that re-evaluated to `no-trigger` (issue #856). A Review takes two claims in
+ * the router before any run row exists — the PR+SHA dedup claim
+ * (`src/triggers/handlers/review.ts`) and a durable `pending` review-verdict
+ * reservation — and every other hand-back path is worker-side and keyed on
+ * `job.runId`. A dispatch deferred for worker capacity has no run, so it fell
+ * outside all of them: the reservation leaked, and because
+ * `reserveReviewVerdict` permits exactly one `pending` slot per pull request,
+ * every later Review of that PR — at any head — answered `blocked` and the PR
+ * was silently unreviewable for the rest of its life (live on `rover#116`).
+ * Hence: **not conditional on `job.runId`**.
+ *
+ * **The gate is the dispatch's own recorded phase, not the event.** An
+ * unconditional hand-back keyed on repo + PR + head would be unsafe: a sibling
+ * `checks completed` event for a PR whose Review is *in flight* is dropped by
+ * the dedup claim, resolves nothing, and settles here with no runId and a null
+ * `phase`. Handing back on its behalf would release the live Review's claim and
+ * abandon its `pending` row, after which a third sibling event reserves a fresh
+ * slot and a second Review runs on the same head, while the first Review's
+ * `markReviewVerdictSubmitted` lands on that new slot instead. `dispatch.phase`
+ * is written by `recordDispatchResolution` from the very evaluation that took
+ * the claims, and re-written by `markDispatchRunning`; the waits leave it alone,
+ * so it survives a defer with or without a run row.
+ *
+ * Only Review reserves a ledger slot; Respond-to-CI shares the same PR+SHA
+ * dedup slot and never takes one. Any other phase — or a null `phase` — took
+ * neither and is left strictly alone: a Respond-to-review or Resolve-conflicts
+ * continuation releasing a review dedup key it never claimed is the mirror image
+ * of this issue's own bug.
+ *
+ * The issue-#815 exception is expressed by the *call site*, not here: this runs
+ * only on the branch where the ledger does **not** already record a submitted
+ * verdict for the run, since a formal review that was posted must keep both its
+ * claim and its slot or a sibling event would post a duplicate.
+ */
+async function handBackNoTriggerClaims(
+	job: SwarmJob,
+	project: ProjectConfig,
+	dispatch: DispatchRow,
+): Promise<void> {
+	if (job.type !== 'scm') return;
+	const prNumber = job.event.workItemId;
+	const headSha = job.event.headSha;
+	if (!prNumber || !headSha) return;
+	if (dispatch.phase !== 'review' && dispatch.phase !== 'respond-to-ci') return;
+	logger.info('No-trigger settle — handing back the claims this dispatch took', {
+		projectId: project.id,
+		dispatchId: dispatch.id,
+		phase: dispatch.phase,
+		prNumber,
+		headSha,
+	});
+	await releaseReviewDispatch(buildReviewDispatchKey(project.repo, prNumber, headSha));
+	if (dispatch.phase === 'review') {
+		await abandonReviewReservation(project, prNumber, headSha);
+	}
+}
+
+/**
  * Settle a delivery no trigger claimed. The dispatch itself always completes as
  * `no-trigger` — that delivery genuinely matched nothing — but a job carrying a
  * `runId` is a *continuation*, and how its run settles depends on whether the
@@ -3841,25 +3900,24 @@ async function settleNoTriggerDelivery(
 			reviewOrdinal: completed.ordinal,
 			reviewAutomationOutcome: completed.automationOutcome,
 		});
-		// Deliberately no `releaseReviewDispatch` here. The claim's own contract
+		// Deliberately nothing is handed back here — neither the claim nor the
+		// verdict reservation. The claim's own contract
 		// (`src/triggers/review-dispatch-dedup.ts`) forbids handing it back once a
 		// review is known to have been submitted, because a sibling event for the
-		// same PR+SHA would then post a duplicate. The TTL reaps it instead, exactly
-		// as it does for a failed run.
-	} else if (job.runId) {
-		await finalizeRun(job.runId, {
-			status: 'failed',
-			error:
-				'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
-		});
-		if (job.type === 'scm' && job.event.workItemId && job.event.headSha) {
-			const dispatchKey = buildReviewDispatchKey(
-				project.repo,
-				job.event.workItemId,
-				job.event.headSha,
-			);
-			await releaseReviewDispatch(dispatchKey);
+		// same PR+SHA would then post a duplicate; the ledger slot is that submitted
+		// verdict's own record and must stay. The TTL reaps the claim instead,
+		// exactly as it does for a failed run.
+	} else {
+		if (job.runId) {
+			await finalizeRun(job.runId, {
+				status: 'failed',
+				error:
+					'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
+			});
 		}
+		// Issue #856: outside the `runId` gate deliberately — the leak this closes
+		// is a dispatch deferred for worker capacity, which never got a run row.
+		await handBackNoTriggerClaims(job, project, dispatch);
 	}
 	await tryCompleteDispatch(dispatch.id, 'no-trigger');
 	// Ordering matters exactly as on the ordinary Review success path (see the
