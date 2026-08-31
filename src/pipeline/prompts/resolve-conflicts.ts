@@ -4,7 +4,11 @@
  * `src/pipeline/resolve-conflicts.ts`, which re-exports this for its existing
  * callers. Unlike the other phases this prompt has no `GH_IDENTITY_GUARD` (the
  * agent performs no GitHub mutation — SWARM delivers the resolved merge) and
- * joins its lines with a blank line between them.
+ * joins its lines with a blank line between them. That omission holds for the
+ * migration-journal repair pass below too — `guardMigrationJournal` passes it no
+ * `env`/token either — but since issue #865 that pass can run in a *fresh*
+ * session, so it carries `pipelinePhaseGuard()` of its own rather than relying on
+ * the phase prompt having said it earlier in the same session.
  */
 
 import type { ProjectConfig } from '@/config/schema.js';
@@ -110,16 +114,24 @@ const INDEX_RESOLUTION_GUIDANCE = [
  * `buildReviewHandoffRepairPrompt`'s shape (`src/pipeline/prompts/review.ts`):
  * one paragraph naming the validator's own complaint, one naming the fix, and
  * the same repository-mutation floor as the original prompt.
+ *
+ * Written for **either** session (issue #865): the pass resumes the merge's own
+ * session where one is addressable, but on a self-minting CLI that reported no id
+ * it runs fresh (`repairSessionId` in `src/pipeline/resume.ts`). So it carries the
+ * phase guard itself, and names the hand-off file rather than saying "the hand-off
+ * file" to an agent that may never have written one.
  */
 export function buildMigrationJournalRepairPrompt(issues: readonly string[]): string {
 	return [
-		"The merge you just produced is NOT resolved: `src/db/migrations/` failed SWARM's deterministic post-merge check.",
+		...pipelinePhaseGuard(),
+		'',
+		"A merge produced in this worktree is NOT resolved: `src/db/migrations/` failed SWARM's deterministic post-merge check.",
 		'',
 		'The validator reported:',
 		issues.map((issue) => `- ${issue}`).join('\n'),
 		'',
-		"Fix only `src/db/migrations/` (the numbered `.sql` files and `meta/_journal.json`/its snapshot files) so every reported problem is gone. Do not touch any other file — every other conflict is already correctly resolved. Prefer `npx drizzle-kit generate` over hand-editing the journal or a snapshot: keep `main`'s existing migrations exactly as `main` has them, and let `drizzle-kit generate` produce one fresh, correctly-numbered migration (with its own journal entry and snapshot) for whatever schema change this branch still needs beyond `main`. Remove this branch's now-superseded migration file(s) and their orphaned journal entries if `drizzle-kit generate` replaces them.",
+		"Fix only `src/db/migrations/` (the numbered `.sql` files and `meta/_journal.json`/its snapshot files) so every reported problem is gone. Do not touch any other file — every other conflict in the merge is already correctly resolved. Prefer `npx drizzle-kit generate` over hand-editing the journal or a snapshot: keep `main`'s existing migrations exactly as `main` has them, and let `drizzle-kit generate` produce one fresh, correctly-numbered migration (with its own journal entry and snapshot) for whatever schema change this branch still needs beyond `main`. Remove this branch's now-superseded migration file(s) and their orphaned journal entries if `drizzle-kit generate` replaces them.",
 		'',
-		'Still do not commit, push, comment, or perform any GitHub mutation — leave the corrected tree in the working directory for SWARM, and rewrite the hand-off file only if the fix changes its `body` or `verification`.',
+		`Do not commit, push, comment, or perform any GitHub mutation — leave the corrected tree in the working directory for SWARM, and rewrite the hand-off "${RESOLVE_CONFLICTS_OUTCOME_FILENAME}" (already in this worktree) only if the fix changes its \`body\` or \`verification\`.`,
 	].join('\n');
 }

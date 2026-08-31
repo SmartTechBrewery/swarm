@@ -78,6 +78,7 @@ import { buildReviewHandoffRepairPrompt, buildReviewPrompt } from '@/pipeline/pr
 import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
+	repairSessionId,
 	sessionRunArgs,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
@@ -422,22 +423,35 @@ interface RepairReviewHandoffParams {
 }
 
 /**
+ * What one repair pass actually did — as opposed to what the hand-off looks like
+ * afterwards. `executed: false` is the case issue #865 was filed for: the pass
+ * never reached the model, and before that issue it settled identically to a
+ * model that re-read the contract and still got the shape wrong.
+ */
+export type ReviewRepairOutcome =
+	| { executed: true; resumedSession: boolean }
+	| { executed: false; reason: string };
+
+/**
  * Re-run the review agent once, in the same worktree, with nothing but the
  * validator's complaint and the hand-off contract — see {@link
  * readReviewSubmission} for why the failure is worth one pass rather than three
  * whole reviews.
  *
- * It resumes the session the review just ran (`AgentCliResult.sessionId`, captured
- * per CLI), so the agent still holds its own reasoning about the diff rather than
- * re-deriving it. Where no id was recoverable the pass is still not wasted: the
- * hand-off it must repair, and the checkout its evidence came from, are both
- * still on disk.
+ * It resumes the session the review just ran where one is addressable
+ * ({@link repairSessionId}), so the agent still holds its own reasoning about the
+ * diff rather than re-deriving it. Where no id was usable the pass runs in a
+ * fresh session and is still not wasted: the hand-off it must repair, and the
+ * checkout its evidence came from, are both still on disk.
  *
- * Never throws. A repair run that fails leaves the invalid hand-off in place, and
- * the caller rethrows the original validation error — which names the actual
- * defect, unlike whatever this pass may have gone wrong with.
+ * Never throws — it reports what it did as a {@link ReviewRepairOutcome} instead.
+ * A repair run that fails leaves the invalid hand-off in place, and the caller
+ * fails with the original validation error — which names the actual defect,
+ * unlike whatever this pass may have gone wrong with — carrying this outcome.
  */
-async function repairReviewHandoff(params: RepairReviewHandoffParams): Promise<void> {
+async function repairReviewHandoff(
+	params: RepairReviewHandoffParams,
+): Promise<ReviewRepairOutcome> {
 	const { cli, taskId, prNumber, headSha } = params;
 	try {
 		const agent = await params.runAgent({
@@ -455,7 +469,7 @@ async function repairReviewHandoff(params: RepairReviewHandoffParams): Promise<v
 			signal: params.signal,
 			env: { GH_TOKEN: params.agentToken },
 		});
-		if (agent.exitCode !== 0)
+		if (agent.exitCode !== 0) {
 			logger.warn('Review — the hand-off repair pass exited non-zero', {
 				taskId,
 				prNumber,
@@ -463,28 +477,23 @@ async function repairReviewHandoff(params: RepairReviewHandoffParams): Promise<v
 				cli,
 				exitCode: agent.exitCode,
 			});
+			return {
+				executed: false,
+				reason: `the ${cli} repair run exited ${agent.exitCode} after ${agent.durationMs} ms`,
+			};
+		}
+		return { executed: true, resumedSession: params.resumeSessionId !== undefined };
 	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
 		logger.warn('Review — the hand-off repair pass could not be run', {
 			taskId,
 			prNumber,
 			headSha,
 			cli,
-			error: error instanceof Error ? error.message : String(error),
+			error: message,
 		});
+		return { executed: false, reason: `the ${cli} repair run could not be started: ${message}` };
 	}
-}
-
-/**
- * The session a repair pass should continue: the id the run actually reported
- * ({@link AgentCliResult.sessionId}, captured per CLI), falling back to whichever
- * id this phase handed the agent when the CLI recovered none.
- */
-function repairSessionId(
-	agent: AgentCliResult,
-	session: { sessionId?: string; resumeSessionId?: string },
-	resumed: boolean,
-): string | undefined {
-	return agent.sessionId ?? (resumed ? session.resumeSessionId : session.sessionId);
 }
 
 /**
@@ -505,7 +514,7 @@ function minorsAreAnswered(project: ProjectConfig): boolean {
  */
 function reviewRepairStep(
 	params: Omit<RepairReviewHandoffParams, 'validationError'>,
-): (validationError: string) => Promise<void> {
+): (validationError: string) => Promise<ReviewRepairOutcome> {
 	return (validationError) => repairReviewHandoff({ ...params, validationError });
 }
 
@@ -524,7 +533,14 @@ interface ReviewSubmissionContext {
 	 * phase passes this unconditionally; only a caller with no agent to re-run
 	 * (a test) leaves it out.
 	 */
-	repair?: (validationError: string) => Promise<void>;
+	repair?: (validationError: string) => Promise<ReviewRepairOutcome>;
+	/**
+	 * Whether {@link repair} was bound to a session id at all — logged before the
+	 * pass runs, so a repair that dies on the resume is attributable without
+	 * waiting for its outcome (issue #865). Resolved by {@link repairSessionId},
+	 * which withholds an *assigned* id from a CLI that never received one.
+	 */
+	repairResumesSession?: boolean;
 }
 
 /** Parse the structured hand-off and render the body SWARM will post. Throws if it doesn't validate. */
@@ -588,6 +604,26 @@ function legacySubmission(
 }
 
 /**
+ * The error the phase fails with after a repair pass — carrying **what the pass
+ * did** as well as the original defect (issue #865). Both outcomes used to
+ * rethrow the validator's complaint verbatim, so a run whose repair never
+ * reached the model was indistinguishable in `runs.error` from one whose model
+ * re-read the contract and still got it wrong; the only record of the difference
+ * was `logs/worker.log`.
+ *
+ * The original message stays the *head* of the composed one — it names the actual
+ * defect, which is still what an operator reads first — and the original error
+ * travels on `cause` unchanged, so anything inspecting it is unaffected.
+ */
+function repairFailureError(original: unknown, outcome: ReviewRepairOutcome): Error {
+	const head = original instanceof Error ? original.message : String(original);
+	const tail = outcome.executed
+		? `the repair pass re-asked the agent ${outcome.resumedSession ? "in the review's own session" : 'in a fresh session'} and the hand-off was still invalid`
+		: `the repair pass never ran — ${outcome.reason}`;
+	return new Error(`${head} — ${tail}`, { cause: original });
+}
+
+/**
  * Read the review hand-off and produce what gets submitted: the verdict, and the
  * body **rendered by SWARM** from the hand-off's fields (issue #470) rather than
  * authored by the agent, so the review's structure is identical whichever CLI or
@@ -599,8 +635,10 @@ function legacySubmission(
  * full passes (`attempts`, `src/queue/producer.ts`) for a model that mis-shapes
  * the JSON the same way each time. Since #470 moved the format's enforcement into
  * the schema, this is the only feedback path that enforcement has. A second
- * failure rethrows the *first* error, so the logs name the original defect rather
- * than whatever the repair pass made of it.
+ * failure fails with the *first* error's message as the **head** of a composed one
+ * that also says what the repair pass did, carrying the original error on `cause`
+ * — so the logs still name the original defect rather than whatever the repair
+ * pass made of it (see {@link repairFailureError}).
  */
 async function readReviewSubmission(
 	worktreePath: string,
@@ -616,8 +654,9 @@ async function readReviewSubmission(
 			headSha: context.headSha,
 			cli: context.cli,
 			reason: validationError,
+			resumingSession: context.repairResumesSession,
 		});
-		await context.repair(validationError);
+		const outcome = await context.repair(validationError);
 		try {
 			return renderSubmission(worktreePath, context);
 		} catch (repairError) {
@@ -625,8 +664,10 @@ async function readReviewSubmission(
 				headSha: context.headSha,
 				cli: context.cli,
 				reason: repairError instanceof Error ? repairError.message : String(repairError),
+				repairExecuted: outcome.executed,
+				repairReason: outcome.executed ? undefined : outcome.reason,
 			});
-			throw error;
+			throw repairFailureError(error, outcome);
 		}
 	}
 }
@@ -737,6 +778,10 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			throw error;
 		}
 
+		// Resolved once: it is both what the repair pass resumes and what the
+		// pre-pass log line reports (issue #865). `undefined` means "run the pass,
+		// but do not resume" — see {@link repairSessionId}.
+		const repairResumeId = repairSessionId(cli, agent, { sessionId, resumeSessionId }, resumed);
 		const submission = await readReviewSubmission(handle.path, {
 			cli,
 			headSha,
@@ -744,12 +789,13 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			isReReview,
 			minorsAnswered: minorsAreAnswered(project),
 			allowLegacy: deliveryResumed,
+			repairResumesSession: repairResumeId !== undefined,
 			repair: reviewRepairStep({
 				isReReview,
 				cli,
 				model,
 				reasoning,
-				resumeSessionId: repairSessionId(agent, { sessionId, resumeSessionId }, resumed),
+				resumeSessionId: repairResumeId,
 				worktreePath: handle.path,
 				taskId,
 				prNumber,

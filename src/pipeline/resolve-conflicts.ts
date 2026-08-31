@@ -39,6 +39,7 @@ import {
 import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
+	repairSessionId,
 	sessionRunArgs,
 	shouldPreserveFailedCheckout,
 } from './resume.js';
@@ -320,7 +321,7 @@ export async function runResolveConflictsPhase(
 				cli,
 				model,
 				reasoning,
-				resumeSessionId: agent.sessionId ?? (resumed ? resumeSessionId : sessionId),
+				resumeSessionId: repairSessionId(cli, agent, { sessionId, resumeSessionId }, resumed),
 				taskId,
 				prNumber,
 				headSha,

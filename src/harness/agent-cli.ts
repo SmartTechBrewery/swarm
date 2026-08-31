@@ -518,6 +518,25 @@ function buildSessionArgs(
 	};
 }
 
+/**
+ * Whether a *fresh* run on this CLI can later be resumed with the id SWARM
+ * handed it. Only claude accepts one up front (`--session-id`, see
+ * {@link buildSessionArgs}); codex and antigravity mint their own
+ * thread/conversation id and never learn SWARM's, so resuming with an assigned
+ * id addresses a session that never existed on that side — `codex exec resume
+ * <swarm-id>` is refused with "no rollout found for thread id" and exits 1 in
+ * ~200 ms without ever reaching the model (issue #865, run 27b0dc2e-… on PR
+ * #860).
+ *
+ * The asymmetry itself is expressed above; this is the read side, for a caller
+ * deciding whether an *assigned* id is a usable resume handle at all.
+ * `buildSessionArgs` keeps its own branching, so a fourth CLI still has to state
+ * its resume shape there rather than inherit one from here.
+ */
+export function acceptsAssignedSessionId(cli: AgentCli): boolean {
+	return cli === 'claude';
+}
+
 export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCliResult> {
 	const cli = AgentCliSchema.parse(options.cli);
 	const command = options.command ?? DEFAULT_COMMAND[cli];

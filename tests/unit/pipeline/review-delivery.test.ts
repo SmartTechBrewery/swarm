@@ -17,7 +17,7 @@ afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function agentResult(): AgentCliResult {
+function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
 		cli: 'claude',
 		exitCode: 0,
@@ -29,6 +29,7 @@ function agentResult(): AgentCliResult {
 		aborted: false,
 		outputTruncated: false,
 		sessionId: 'session-1',
+		...overrides,
 	};
 }
 
@@ -49,9 +50,20 @@ function structuredHandoff(overrides: Record<string, unknown> = {}) {
  * Pass an array to give successive agent runs different hand-offs — that is how
  * the repair pass is exercised, since it is a second run against the same
  * worktree; the last entry repeats once the array is exhausted.
+ *
+ * `agentOverrides` shapes the {@link AgentCliResult} those runs report, with the
+ * same per-run array form. It is its own parameter rather than part of
+ * `overrides`, because `agentResult()` is called inside the default `runAgent`
+ * closure below: reaching it through `overrides` would mean replacing `runAgent`
+ * wholesale and losing the hand-off writing this helper exists to provide.
  */
-function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {}) {
+function deliveryDeps(
+	handoff: unknown,
+	overrides: Record<string, unknown> = {},
+	agentOverrides: Partial<AgentCliResult> | Partial<AgentCliResult>[] = {},
+) {
 	const handoffs = Array.isArray(handoff) ? [...handoff] : [handoff];
+	const agents = Array.isArray(agentOverrides) ? [...agentOverrides] : [agentOverrides];
 	const path = mkdtempSync(join(tmpdir(), 'swarm-review-render-'));
 	roots.push(path);
 	const handle: WorktreeHandle = { taskId: 'review-42', path, branch: 'abc', detached: true };
@@ -79,8 +91,9 @@ function deliveryDeps(handoff: unknown, overrides: Record<string, unknown> = {})
 			worktrees,
 			runAgent: vi.fn(async () => {
 				const next = handoffs.length > 1 ? handoffs.shift() : handoffs[0];
+				const agent = agents.length > 1 ? agents.shift() : agents[0];
 				writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(next));
-				return agentResult();
+				return agentResult(agent);
 			}),
 			graft: vi.fn(() => []),
 			getToken: vi.fn(async () => 'review-token'),
@@ -198,6 +211,122 @@ describe('review body rendering', () => {
 		await expect(runReviewPhase(options)).rejects.toThrow(/Invalid hand-off/);
 		expect(options.runAgent).toHaveBeenCalledTimes(2);
 		expect(submitReview).not.toHaveBeenCalled();
+	});
+
+	// Issue #865. Only `claude` is ever handed the id SWARM assigned (`--session-id`);
+	// codex and agy mint their own, so `codex exec resume <swarm-id>` addresses a
+	// thread that never existed and exits 1 in ~200 ms without reaching the model.
+	describe('the id the repair pass resumes (issue #865)', () => {
+		it('resumes the id the run reported, not the one SWARM assigned', async () => {
+			const { options } = deliveryDeps(
+				[structuredHandoff({ verdict: 'nonsense' }), structuredHandoff()],
+				{ cli: 'codex', sessionId: '27b0dc2e-2509-4644-b2db-3d2b6c863fab' },
+				{ cli: 'codex', sessionId: 'thread-9' },
+			);
+
+			await runReviewPhase(options);
+
+			const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+			expect(runAgent.mock.calls[1][0].resumeSessionId).toBe('thread-9');
+		});
+
+		it('resumes nothing on a self-minting CLI whose run reported no id', async () => {
+			const { submitReview, options } = deliveryDeps(
+				[structuredHandoff({ verdict: 'nonsense' }), structuredHandoff()],
+				{ cli: 'codex', sessionId: '27b0dc2e-2509-4644-b2db-3d2b6c863fab' },
+				{ cli: 'codex', sessionId: undefined },
+			);
+
+			await runReviewPhase(options);
+
+			const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+			// The pass still runs — the hand-off and the checkout its evidence came from
+			// are both on disk — it just starts a fresh session instead of addressing
+			// the run id, which is what died on PR #860.
+			expect(runAgent).toHaveBeenCalledTimes(2);
+			expect('resumeSessionId' in runAgent.mock.calls[1][0]).toBe(true);
+			expect(runAgent.mock.calls[1][0].resumeSessionId).toBeUndefined();
+			expect(submitReview).toHaveBeenCalledOnce();
+		});
+
+		// That fresh session is a *first* turn, holding the reviewer persona's
+		// `GH_TOKEN` in a checkout whose own `ai/RULES.md` §3 tells any agent to
+		// switch `gh` accounts — so the repair prompt must carry both guards itself
+		// rather than relying on the review prompt having said them earlier.
+		it('gives the fresh repair pass the phase and identity guards', async () => {
+			const { options } = deliveryDeps(
+				[structuredHandoff({ verdict: 'nonsense' }), structuredHandoff()],
+				{ cli: 'codex', sessionId: '27b0dc2e-2509-4644-b2db-3d2b6c863fab' },
+				{ cli: 'codex', sessionId: undefined },
+			);
+
+			await runReviewPhase(options);
+
+			const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+			const repairPrompt: string = runAgent.mock.calls[1][0].args[0];
+			expect(repairPrompt).toContain(
+				'You are a SWARM pipeline agent assigned to exactly one phase',
+			);
+			expect(repairPrompt).toContain(
+				'Do NOT run `gh auth login`, `gh auth switch`, or `gh auth logout`',
+			);
+		});
+
+		it('still offers claude the assigned id when its run reported none', async () => {
+			const { options } = deliveryDeps(
+				[structuredHandoff({ verdict: 'nonsense' }), structuredHandoff()],
+				{ cli: 'claude', sessionId: 'assigned-1' },
+				{ cli: 'claude', sessionId: undefined },
+			);
+
+			await runReviewPhase(options);
+
+			const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+			expect(runAgent.mock.calls[1][0].resumeSessionId).toBe('assigned-1');
+		});
+	});
+
+	// The two failures used to settle as the same string in `runs.error`, so an
+	// operator could not tell a repair that never reached the model from one whose
+	// model re-read the contract and still got the shape wrong (issue #865).
+	describe('what the failure says the repair pass did (issue #865)', () => {
+		it('says the pass never ran when the repair run exited non-zero', async () => {
+			const { options } = deliveryDeps(
+				structuredHandoff({ verdict: 'nonsense' }),
+				{ cli: 'codex' },
+				[{ cli: 'codex' }, { cli: 'codex', exitCode: 1, durationMs: 200 }],
+			);
+
+			const error = await runReviewPhase(options).catch((err: unknown) => err);
+
+			expect(error).toBeInstanceOf(Error);
+			const message = (error as Error).message;
+			// The original defect stays the head — it is what an operator reads first.
+			expect(message).toMatch(/Invalid hand-off/);
+			expect(message).toMatch(/the repair pass never ran/);
+			expect(message).toContain('the codex repair run exited 1 after 200 ms');
+		});
+
+		it('says the pass ran and failed when the repair run exited zero', async () => {
+			const { options } = deliveryDeps(structuredHandoff({ verdict: 'nonsense' }));
+
+			const error = await runReviewPhase(options).catch((err: unknown) => err);
+
+			const message = (error as Error).message;
+			expect(message).toMatch(/Invalid hand-off/);
+			expect(message).toMatch(/re-asked the agent in the review's own session/);
+			expect(message).not.toMatch(/never ran/);
+		});
+
+		it('carries the original validation error on `cause`', async () => {
+			const { options } = deliveryDeps(structuredHandoff({ verdict: 'nonsense' }));
+
+			const error = await runReviewPhase(options).catch((err: unknown) => err);
+
+			const cause = (error as Error).cause;
+			expect(cause).toBeInstanceOf(Error);
+			expect((cause as Error).message).toMatch(/Invalid hand-off/);
+		});
 	});
 
 	// Issue #861: the shape that cost a whole review on PR #860. A blocking finding
