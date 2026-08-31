@@ -104,6 +104,7 @@ type StubPhaseResult = {
 	verdict?: string;
 	reviewOrdinal?: number;
 	automationOutcome?: string;
+	ciOutcome?: string;
 };
 
 /**
@@ -478,6 +479,15 @@ vi.mock('@/worker/merge-automation.js', () => ({
 		processMergeAutomationDispatch(dispatch, job, project),
 }));
 
+// The `no-fix` hand-back to Review (issue #841), mocked at its own boundary for
+// the same reason: these tests assert that a `no-fix` Respond-to-CI run schedules
+// exactly one recovery with the right coordinates, not how that recovery is built
+// (which is `tests/unit/dispatch/ci-no-fix-recovery.test.ts`).
+const scheduleCiNoFixRecovery = vi.fn(async (_input: unknown) => {});
+vi.mock('@/dispatch/ci-no-fix-recovery.js', () => ({
+	scheduleCiNoFixRecovery: (input: unknown) => scheduleCiNoFixRecovery(input),
+}));
+
 // The federated dispatch gate (issue #339) reads the project's enrolled workers
 // and resolves an item's assignee to a SWARM user. Both are mocked at their
 // module boundary so these tests drive routing without Postgres; the default —
@@ -804,6 +814,8 @@ describe('processJob', () => {
 		unregisterRunController.mockClear();
 		requestMergeAutomation.mockClear();
 		processMergeAutomationDispatch.mockClear();
+		scheduleCiNoFixRecovery.mockClear();
+		scheduleCiNoFixRecovery.mockResolvedValue(undefined);
 		getSubmittedReviewSlot.mockClear();
 		getSubmittedReviewSlot.mockResolvedValue(undefined);
 	});
@@ -4657,6 +4669,76 @@ describe('processJob', () => {
 				);
 
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+		});
+
+		describe('the no-fix hand-back to Review (issue #841)', () => {
+			it('schedules exactly one recovery for the PR the no-fix run declined to fix', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+
+				expect(scheduleCiNoFixRecovery).toHaveBeenCalledExactlyOnceWith({
+					project: PROJECT,
+					prNumber: '17',
+					prBranch: 'issue-17',
+					headSha: 'deadbeef',
+				});
+			});
+
+			// The recovery re-enters `pr-review` for this very PR+head, so this
+			// dispatch is made terminal before its own successor can be claimed.
+			it('schedules it only after the dispatch is completed', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+
+				expect(completeDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+					scheduleCiNoFixRecovery.mock.invocationCallOrder[0] as number,
+				);
+			});
+
+			it('schedules nothing when the run fixed the build', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'fixed' });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+
+				expect(scheduleCiNoFixRecovery).not.toHaveBeenCalled();
+			});
+
+			it('schedules nothing for a phase that is not Respond-to-CI', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(scheduleCiNoFixRecovery).not.toHaveBeenCalled();
+			});
+
+			it('schedules nothing when Review is disabled — there is nothing to hand back to', async () => {
+				projectLookup = () =>
+					createMockProjectConfig({
+						pipeline: { review: { enabled: false }, respondToReview: { enabled: false } },
+					});
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+
+				expect(scheduleCiNoFixRecovery).not.toHaveBeenCalled();
+			});
+
+			// Best-effort, exactly like the next-phase self-enqueue: a scheduling
+			// failure must not turn an already-succeeded phase into a failed job.
+			it('logs a scheduling failure and still settles phase-succeeded', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
+				scheduleCiNoFixRecovery.mockRejectedValue(new Error('queue down'));
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_CI_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'phase-succeeded');
 			});
 		});
 

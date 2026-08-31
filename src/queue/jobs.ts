@@ -304,6 +304,14 @@ const jobBase = z.object({
 	 */
 	forcedReReview: z.boolean().optional(),
 	/**
+	 * Set on the synthetic `checks` job SWARM's own `no-fix` recovery enqueues
+	 * (issue #841): the Respond-to-CI agent already adjudicated this head's red
+	 * check as not the pull request's fault, so the `pr-review` handler dispatches
+	 * Review rather than routing the still-red aggregate back to Respond-to-CI.
+	 * Never set by an inbound webhook, so an ordinary red check is unaffected.
+	 */
+	ciNoFixRecovery: z.boolean().optional(),
+	/**
 	 * The durable dispatch record this job wakes up (issue #284, ADR-002). Every
 	 * queue job produced by the dispatch layer carries it; the worker acts only
 	 * after atomically claiming that record, so a cancelled/completed dispatch

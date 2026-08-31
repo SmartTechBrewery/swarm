@@ -104,6 +104,21 @@ describe('adaptResultToPhaseRun', () => {
 		expect(run.prUrl).toBeUndefined();
 	});
 
+	it('maps the reported CI outcome so the settle path can hand a no-fix back to Review (issue #841)', () => {
+		const run = adaptResultToPhaseRun(
+			base({ status: 'succeeded', exitCode: 0, ciOutcome: 'no-fix' }),
+			SELECTION,
+		);
+		expect(run.ciOutcome).toBe('no-fix');
+	});
+
+	// Additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` is not bumped:
+	// an older worker omits the field and its `no-fix` runs behave as they did.
+	it('tolerates a result frame from an older worker that reports no CI outcome', () => {
+		const run = adaptResultToPhaseRun(base({ status: 'succeeded', exitCode: 0 }), SELECTION);
+		expect(run.ciOutcome).toBeUndefined();
+	});
+
 	it('throws RunTerminatedError for a cancelled failure (never a deferral)', () => {
 		expect(() =>
 			adaptResultToPhaseRun(

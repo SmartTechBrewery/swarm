@@ -792,6 +792,31 @@ describe('runAssignmentDbFree', () => {
 		expect(sink.sent.at(-1)?.prUrl).toBeUndefined();
 	});
 
+	it('reports a Respond-to-CI run’s outcome so the control plane can hand a no-fix back to Review (issue #841)', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult(), ciOutcome: 'no-fix' as const }));
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase),
+		});
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', ciOutcome: 'no-fix' });
+	});
+
+	it('reports no CI outcome for a phase that produces none', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)?.ciOutcome).toBeUndefined();
+	});
+
 	it("keeps implementation's dependency gate working through the blockers read route", async () => {
 		const sink = recordingSink();
 		const blockers = [

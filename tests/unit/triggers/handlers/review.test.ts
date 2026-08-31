@@ -14,9 +14,13 @@ import {
 // The handler gates dispatch on a Redis-backed dedup claim; mock it so these
 // tests stay pure-in-memory. `claimReviewDispatch` defaults to granting the
 // claim (the common path); individual tests flip it to exercise a skip.
-const { claimReviewDispatch } = vi.hoisted(() => ({ claimReviewDispatch: vi.fn() }));
+const { claimReviewDispatch, refreshReviewDispatchClaim } = vi.hoisted(() => ({
+	claimReviewDispatch: vi.fn(),
+	refreshReviewDispatchClaim: vi.fn(),
+}));
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
+	refreshReviewDispatchClaim,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 }));
@@ -118,6 +122,8 @@ function checkStatus(runs: Array<[string, string, string | null]>): AggregateChe
 beforeEach(() => {
 	claimReviewDispatch.mockReset();
 	claimReviewDispatch.mockResolvedValue(true);
+	refreshReviewDispatchClaim.mockReset();
+	refreshReviewDispatchClaim.mockResolvedValue(undefined);
 	claimRespondToCiAttempt.mockReset();
 	claimRespondToCiAttempt.mockResolvedValue({ allowed: true, attempt: 1 });
 	claimConflictResolution.mockReset();
@@ -163,6 +169,7 @@ function ctx(
 		readFailureRecheckAttempt?: number;
 		deliveryId?: string;
 		continuationDispatchClaimed?: boolean;
+		ciNoFixRecovery?: boolean;
 	} = {},
 ): TriggerContext {
 	return createMockScmTriggerContext({
@@ -1585,5 +1592,364 @@ describe('review trigger — two repositories of one project (issue #685)', () =
 			{ projectId: 'acme', repository: 'acme/android', prNumber: '42', headSha: 'abc123' },
 			{ projectId: 'acme', repository: 'acme/backend', prNumber: '42', headSha: 'abc123' },
 		]);
+	});
+});
+
+/**
+ * The PR+SHA claim is a *lease*, and a dispatched CI fix takes it out for as long
+ * as its agent may run (issue #841). The claim's default five-minute TTL is sized
+ * for the gap between a PR opening and its checks completing, which an agent run
+ * readily outlives — and a lease that lapses mid-run leaves the slot free for a
+ * delayed sibling completed-check event to take, spending a second fix attempt on
+ * the red already being fixed and meeting the no-fix hand-over with a competing
+ * claimant rather than this dispatch's own live lease.
+ */
+describe('review trigger — the CI fix holds the PR+SHA lease for its run (issue #841)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+	const KEY = `${PROJECT.repo}:9:cafe`;
+	/** The lease a project on the coded 30-minute default gets: wall clock + 5 min margin. */
+	const DEFAULT_CI_FIX_CLAIM_TTL_SEC = 35 * 60;
+
+	/**
+	 * A stand-in for the Redis claim with its TTL: key → seconds left. `claim` is
+	 * `SET NX EX 300`, `refresh` is a plain `SET EX`, and {@link elapse} reaps what
+	 * expired — so these tests contend for one real slot over real time rather than
+	 * a canned boolean.
+	 */
+	const leases = new Map<string, number>();
+	const elapse = (sec: number) => {
+		for (const [key, left] of leases) {
+			if (left <= sec) leases.delete(key);
+			else leases.set(key, left - sec);
+		}
+	};
+
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+		leases.clear();
+		claimReviewDispatch.mockImplementation(async (key: string) => {
+			if (leases.has(key)) return false;
+			leases.set(key, 5 * 60);
+			return true;
+		});
+		refreshReviewDispatchClaim.mockImplementation(async (key: string, ttlSec: number) => {
+			leases.set(key, ttlSec);
+		});
+	});
+
+	it('extends the claim to the fix run’s wall clock when it dispatches', async () => {
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+
+		expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, DEFAULT_CI_FIX_CLAIM_TTL_SEC);
+	});
+
+	it('locks a sibling out past the point the ordinary five-minute lease would have lapsed', async () => {
+		await handler.handle(ctx(checks));
+		// Longer than the default TTL, well inside a 30-minute agent run.
+		elapse(6 * 60);
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		// The decisive assertion: exactly one fix attempt was spent on this red.
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+	});
+
+	// The honest bound, stated so the docs can't drift past it: this is a lease, not
+	// a lock. Past the whole configured wall clock plus its margin — a Redis restart
+	// is what is left once the lease tracks the timeout — the slot does fall free
+	// again, and the per-PR fix-attempt cap is what bounds a duplicate fix from there.
+	it('does not pretend to hold the slot beyond the extended lease', async () => {
+		await handler.handle(ctx(checks));
+		elapse(DEFAULT_CI_FIX_CLAIM_TTL_SEC + 60);
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+	});
+
+	/**
+	 * The lease is derived from the timeout the fix will actually run under, not
+	 * from the coded default: `agents.respondToCi.timeoutMs` is valid to 45 minutes
+	 * and `SWARM_AGENT_TIMEOUT_MS` moves the default under it, and a lease fixed at
+	 * the default's 35 minutes lapsed in the tail of either.
+	 */
+	describe('sized from the timeout the fix actually runs under', () => {
+		/** The same `checks` context, against a project with its own agent config. */
+		const projectCtx = (project: ProjectConfig) =>
+			createMockScmTriggerContext({
+				project,
+				scm: SCM,
+				event: createMockScmEvent(checks),
+			});
+
+		it('covers a Respond-to-CI timeout configured to the schema’s 45-minute maximum', async () => {
+			const project = createMockProjectConfig({
+				agents: { respondToCi: { timeoutMs: 45 * 60 * 1000 } },
+			});
+
+			expect(await handler.handle(projectCtx(project))).toMatchObject({
+				phase: 'respond-to-ci',
+			});
+			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 50 * 60);
+
+			// Minute 36 — where the old fixed lease had already lapsed — and a delayed
+			// sibling completed-check event for the same head is still locked out.
+			elapse(36 * 60);
+			expect(await handler.handle(projectCtx(project))).toBeNull();
+			// The decisive assertion: no second fix attempt was spent on this red.
+			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		});
+
+		it('follows the operator’s SWARM_AGENT_TIMEOUT_MS when the project sets no override', async () => {
+			vi.stubEnv('SWARM_AGENT_TIMEOUT_MS', String(40 * 60 * 1000));
+			try {
+				expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+				expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 45 * 60);
+			} finally {
+				vi.unstubAllEnvs();
+			}
+		});
+
+		it('prefers the project’s own override to the global default', async () => {
+			vi.stubEnv('SWARM_AGENT_TIMEOUT_MS', String(40 * 60 * 1000));
+			try {
+				const project = createMockProjectConfig({
+					agents: { respondToCi: { timeoutMs: 10 * 60 * 1000 } },
+				});
+
+				expect(await handler.handle(projectCtx(project))).toMatchObject({
+					phase: 'respond-to-ci',
+				});
+				expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 15 * 60);
+			} finally {
+				vi.unstubAllEnvs();
+			}
+		});
+	});
+
+	it('leaves the lease alone when the attempt cap drops the dispatch — nothing runs', async () => {
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 5 });
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+	});
+
+	it('leaves a Review dispatch on the ordinary TTL — only a CI fix extends it', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'review' });
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+	});
+});
+
+describe('review trigger — the no-fix hand-back to Review (issue #841)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+
+	/** The state the recovery re-enters on: nothing re-ran the checks, so the head is still red. */
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+	});
+
+	it('dispatches Review on a still-red head, without spending a CI-fix attempt', async () => {
+		const result = await handler.handle(ctx(checks, { ciNoFixRecovery: true }));
+
+		expect(result).toEqual({
+			phase: 'review',
+			taskId: '9',
+			prNumber: '9',
+			// The fetched PR's head branch (the default mock's), not the event's.
+			prBranch: 'issue-42',
+			headSha: 'cafe',
+		});
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	// The bypass is opt-in: an ordinary red check suite is unaffected, so nothing
+	// about the `fixed` path or a genuine first CI failure changes.
+	it('still routes the identical event to Respond-to-CI without the marker', async () => {
+		const result = await handler.handle(ctx(checks));
+
+		expect(result).toEqual({
+			phase: 'respond-to-ci',
+			taskId: '9-ci',
+			prNumber: '9',
+			prBranch: 'issue-9',
+			headSha: 'cafe',
+		});
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+	});
+
+	it('still reserves the durable review-verdict slot, and a capped reservation still skips', async () => {
+		reserveReviewVerdict.mockResolvedValue({ status: 'capped', ordinal: 3 });
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+
+		expect(reserveReviewVerdict).toHaveBeenCalledWith({
+			projectId: PROJECT.id,
+			repository: PROJECT.repo,
+			prNumber: '9',
+			headSha: 'cafe',
+		});
+	});
+
+	// The recovery *owns* the PR+SHA slot rather than contending for it: the
+	// finished Respond-to-CI dispatch hands its claim over (refreshed, not
+	// released — `src/dispatch/ci-no-fix-recovery.ts`), so re-claiming here would
+	// see that still-live claim and drop the recovery as a duplicate, recreating
+	// the review limbo this whole path exists to remove.
+	it('reuses the held dispatch claim instead of re-claiming', async () => {
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+			phase: 'review',
+		});
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+	});
+
+	// The delayed-sibling race the hand-over closes. The aggregate decision waits
+	// for *every* suite to complete, so a two-suite PR can have one suite's webhook
+	// decide the aggregate while the other's is still in flight — and that delayed
+	// sibling carries no marker. Were the claim released, it would take the freed
+	// slot, spend a second CI-fix attempt on a red SWARM already adjudicated, and
+	// leave the recovery to fail its own claim and settle `no-trigger`; the
+	// recovery's deterministic delivery id then absorbs the second run's recovery
+	// as a repeat, so no Review ever runs.
+	describe('with the claim held across the hand-over', () => {
+		// A stand-in for the Redis `SET NX` claim, so the two events below contend
+		// for one real slot rather than a canned boolean.
+		const claims = new Set<string>();
+
+		beforeEach(() => {
+			claims.clear();
+			claimReviewDispatch.mockImplementation(async (key: string) => {
+				if (claims.has(key)) return false;
+				claims.add(key);
+				return true;
+			});
+			// The claim the finished Respond-to-CI dispatch handed to the recovery.
+			claims.add(`${PROJECT.repo}:9:cafe`);
+		});
+
+		it('locks a delayed unmarked check event out of starting a second CI fix', async () => {
+			expect(await handler.handle(ctx(checks))).toBeNull();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		});
+
+		it('still dispatches exactly one Review for the marked recovery behind it', async () => {
+			await handler.handle(ctx(checks));
+
+			expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+				phase: 'review',
+				prNumber: '9',
+				headSha: 'cafe',
+			});
+			expect(reserveReviewVerdict).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	it('does not short-circuit a state-pending defer — a still-running check still defers', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		// The marker rides the deferred payload: it states a fact about this head
+		// that a recheck does not change, and dropping it would send the recovery
+		// back to Respond-to-CI once the check finally reports red.
+		expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({ ciNoFixRecovery: true });
+	});
+
+	it('carries the marker on the durable give-up record, so a dashboard retry keeps the bypass', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		await handler.handle(ctx(checks, { ciNoFixRecovery: true, recheckAttempt: 20 }));
+
+		expect(createFailedRun.mock.calls[0][0].jobPayload).toMatchObject({
+			ciNoFixRecovery: true,
+		});
+	});
+
+	it('does not bypass the closed-PR skip', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'cafe',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'closed',
+		});
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+	});
+
+	it('does not bypass the work-item origin gate', async () => {
+		hasRunForTask.mockResolvedValue(false);
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+	});
+
+	it('does not bypass the conflicting-PR route to Resolve-conflicts', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'cafe',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: false,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+			phase: 'resolve-conflicts',
+			prNumber: '9',
+		});
+	});
+
+	it('does not bypass the draft skip on a pull-request event', async () => {
+		expect(
+			await handler.handle(
+				ctx(
+					{
+						kind: 'pull-request',
+						action: 'opened',
+						workItemId: '9',
+						headSha: 'cafe',
+						isDraft: true,
+					},
+					{ ciNoFixRecovery: true },
+				),
+			),
+		).toBeNull();
+	});
+
+	it('does not bypass the fork skip on a pull-request event', async () => {
+		expect(
+			await handler.handle(
+				ctx(
+					{
+						kind: 'pull-request',
+						action: 'opened',
+						workItemId: '9',
+						headSha: 'cafe',
+						isDraft: false,
+						isCrossRepo: true,
+					},
+					{ ciNoFixRecovery: true },
+				),
+			),
+		).toBeNull();
 	});
 });

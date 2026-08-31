@@ -94,6 +94,29 @@
  * that PR keeps the warn-and-drop, so a capped PR is noticed once per cycle
  * rather than once per check suite.
  *
+ * **A `no-fix` run hands the PR back here, not to Respond-to-CI** (issue #841).
+ * A CI-fix run that concludes the red check is not this PR's fault pushes
+ * nothing, so no further `checks` webhook ever arrives and the PR would sit in
+ * review limbo forever. The worker therefore enqueues one synthetic `checks`
+ * event for the same head carrying `ciNoFixRecovery`
+ * (`src/dispatch/ci-no-fix-recovery.ts`), and when that event's aggregate is —
+ * as expected — still red, the bypass in `resolveAggregateCheckReview` returns
+ * a `review` disposition instead of routing back to the phase that just
+ * declined. It is safe because the red was already adjudicated by SWARM's own
+ * CI agent rather than left unexamined, and reviewing without a green `checks`
+ * event is precedented: `pipeline.review.checks: 'if-present'` (issue #274)
+ * already does it for a project whose head carries no checks at all. The bypass
+ * is opt-in and narrow — it changes nothing for an ordinary red check, and every
+ * gate around it (closed-PR, work-item origin, draft/fork, mergeability, the
+ * `state-pending` defer, the verdict reservation) still runs. The one gate it
+ * *does* change is the PR+SHA dispatch dedup, and only in whose favour: the
+ * dispatched CI fix extends that claim to cover its own run — this project's
+ * configured Respond-to-CI wall clock plus margin ({@link ciFixClaimTtlSec}) —
+ * and the finished dispatch hands it over rather than releasing it, so the slot
+ * is continuously owned from the fix through the hand-over: a marked recovery
+ * reuses the held claim, and a delayed ordinary completed-check event for the
+ * same head is locked out of starting a second CI fix.
+ *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
  * refs, so a fork's head SHA is unreachable and the detached checkout would
@@ -139,13 +162,18 @@ import type { SwarmJob } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
+import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import {
 	buildRespondToCiAttemptKey,
 	claimRespondToCiAttempt,
 	MAX_FIX_ATTEMPTS,
 } from '../respond-to-ci-attempts.js';
-import { buildReviewDispatchKey, claimReviewDispatch } from '../review-dispatch-dedup.js';
+import {
+	buildReviewDispatchKey,
+	claimReviewDispatch,
+	refreshReviewDispatchClaim,
+} from '../review-dispatch-dedup.js';
 import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
@@ -242,6 +270,13 @@ const ABANDONED_REVIEW_REASONS: Record<DeferBudget, string> = {
  * recheck scheduler extends, and the one the abandonment record below stores, so
  * that a "Retry now" on that record re-enters this handler with a clean budget
  * rather than one already at its cap.
+ *
+ * `ciNoFixRecovery` *is* carried (issue #841): it states a fact about this head
+ * — SWARM's own CI agent adjudicated its red — that stays true across a recheck,
+ * and dropping it would turn a deferred recovery back into the Respond-to-CI
+ * dispatch the hand-back exists to avoid. It also keeps the recovery's held
+ * PR+SHA claim reusable across the recheck, which is why that claim is refreshed
+ * to a TTL sized to outlast the whole `state-pending` chain.
  */
 function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
 	return {
@@ -249,6 +284,7 @@ function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
 		providerId: ctx.providerId,
 		projectId: ctx.project.id,
 		...(ctx.deliveryId ? { deliveryId: ctx.deliveryId } : {}),
+		...(ctx.ciNoFixRecovery ? { ciNoFixRecovery: true } : {}),
 		event: ctx.event,
 	};
 }
@@ -529,6 +565,16 @@ async function resolveAggregateCheckReview(
 	if (decision.action === 'review') return { kind: 'review' };
 
 	if (decision.action === 'respond-to-ci') {
+		// The `no-fix` hand-back (issue #841) — see the module header. The red is
+		// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
+		if (ctx.ciNoFixRecovery === true) {
+			logger.info('review: CI agent adjudicated this red — reviewing instead of re-fixing', {
+				prNumber,
+				headSha,
+				failedChecks: decision.failedChecks,
+			});
+			return { kind: 'review' };
+		}
 		return { kind: 'respond-to-ci', failedChecks: decision.failedChecks };
 	}
 
@@ -556,12 +602,63 @@ function resolveDisposition(
 }
 
 /**
+ * Margin added to the CI-fix agent's own wall clock when the PR+SHA dispatch
+ * claim is extended for it — headroom for the enqueue, the worker's pickup and
+ * worktree provisioning before the clock starts, and the settle afterwards.
+ *
+ * The claim's ordinary five-minute TTL is sized for the gap between a PR opening
+ * and its checks completing, which a CI-fix *run* readily outlives. Letting it
+ * lapse mid-run leaves the slot free for a delayed sibling completed-check event
+ * on the same head to take — spending a second fix attempt on the red this run is
+ * already fixing, and, on a `no-fix` conclusion, meeting the hand-over in
+ * `src/dispatch/ci-no-fix-recovery.ts` with a competing claimant instead of this
+ * dispatch's own live lease. Holding the slot for the run's duration is what the
+ * dedup means in the first place: one dispatch per PR+SHA while one is in flight.
+ */
+const CI_FIX_CLAIM_MARGIN_SEC = 5 * 60;
+
+/**
+ * How long the PR+SHA dispatch claim is extended to once a Respond-to-CI
+ * dispatch is actually returned: **this project's** effective Respond-to-CI wall
+ * clock plus {@link CI_FIX_CLAIM_MARGIN_SEC}.
+ *
+ * Derived rather than fixed, because the wall clock is configurable and the lease
+ * has to cover whatever it is set to. `agents.respondToCi.timeoutMs` is valid up
+ * to 45 minutes (`AgentConfigSchema`, `src/config/schema.ts`) and
+ * `SWARM_AGENT_TIMEOUT_MS` moves the default under it, so a constant sized for
+ * the 30-minute default lapsed ~10 minutes into the tail of a legitimately
+ * configured run — long enough for a delayed sibling completed-check event to
+ * take the freed slot and start a second fix on the red already being fixed.
+ * Reading the same `agents.<phase>.timeoutMs ?? SWARM_AGENT_TIMEOUT_MS` the
+ * worker applies when it invokes the agent (`resolveAgentOverride`,
+ * `src/worker/consumer.ts`) is what keeps the two from drifting apart again.
+ *
+ * A concurrency or eligibility deferral in between re-shortens the claim to the
+ * continuation TTL (`retainContinuationDispatchClaim`, `src/worker/consumer.ts`)
+ * — deliberately, and it costs nothing: those are *pre-run* waits, so no agent is
+ * running to outlive the shorter lease, that TTL is sized to outlast the wait
+ * itself, and the prioritized retry re-enters {@link dispatchRespondToCi} and
+ * re-extends to the full lease before the run starts. What remains outside the
+ * lease is a Redis restart, where the per-PR fix-attempt cap
+ * (`src/triggers/respond-to-ci-attempts.ts`) — not the claim — bounds a duplicate
+ * fix.
+ */
+function ciFixClaimTtlSec(project: ProjectConfig): number {
+	const timeoutMs = project.agents?.respondToCi?.timeoutMs ?? resolveAgentTimeoutMs();
+	return Math.ceil(timeoutMs / 1000) + CI_FIX_CLAIM_MARGIN_SEC;
+}
+
+/**
  * Turn a resolved `respond-to-ci` disposition into a dispatch. The PR+SHA dedup
  * slot is already claimed by the caller; a fresh dispatch adds the per-PR
  * fix-attempt cap (`claimRespondToCiAttempt`) — the guard the per-SHA dedup
  * can't provide, since each fix commit is a new SHA. A prioritized retry reuses
  * the attempt already counted before its concurrency deferral. Returns `null`
  * (not a dispatch) when the cap is hit or the PR branch is missing.
+ *
+ * A dispatch that *is* returned extends the shared PR+SHA claim to
+ * {@link ciFixClaimTtlSec} so it stays held for the whole fix run; the two
+ * `null` paths deliberately leave the ordinary TTL alone, since nothing runs.
  *
  * The *first* event to cross the cap also leaves the durable give-up trace
  * (issue #838) — see the guard below. A missing PR branch deliberately does not:
@@ -603,6 +700,14 @@ async function dispatchRespondToCi(
 		}
 		attempt = claim.attempt;
 	}
+
+	// Hold the shared PR+SHA slot for as long as this fix can run (see
+	// {@link ciFixClaimTtlSec}). Best-effort, like every other refresh: a
+	// Redis hiccup here only restores the pre-existing short lease.
+	await refreshReviewDispatchClaim(
+		buildReviewDispatchKey(project.repo, prNumber, headSha),
+		ciFixClaimTtlSec(project),
+	);
 
 	logger.debug('respond-to-ci: dispatching Respond-to-CI phase', {
 		prNumber,
@@ -983,6 +1088,18 @@ async function handleConflictingPullRequest(
 	};
 }
 
+/**
+ * Name the held PR+SHA dispatch claim this job arrives already owning, or `null`
+ * when it has to claim the slot itself. Two kinds of job hold one, and the name
+ * is only for the log line — what matters to both is that re-claiming inside the
+ * claim's own TTL would see their *own* live claim and drop them as duplicates.
+ */
+function heldDispatchClaimReason(ctx: TriggerContext): string | null {
+	if (ctx.ciNoFixRecovery === true) return 'ci-no-fix-recovery';
+	if (ctx.continuationDispatchClaimed === true) return 'prioritized-continuation-retry';
+	return null;
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -1021,15 +1138,22 @@ export function createReviewTrigger(): TriggerHandler {
 			// so there is never a legitimate second dispatch for the same PR+SHA to
 			// contend for it.
 			const dispatchKey = buildReviewDispatchKey(ctx.project.repo, prNumber, headSha);
-			// A prioritized continuation retry (issue #214) already holds this PR+SHA
-			// claim from its original dispatch attempt — the concurrency deferral
-			// refreshed the claim's TTL and is holding it open. Re-claiming now (well
-			// within that TTL) would see the still-live claim and drop this Review as a
-			// duplicate, so reuse the held claim instead of re-claiming.
-			if (ctx.continuationDispatchClaimed) {
-				logger.debug('review: reusing held dispatch claim for a prioritized continuation retry', {
+			// Two kinds of job arrive here already *holding* this PR+SHA claim, and
+			// both must reuse it rather than re-claim: re-claiming within the TTL would
+			// see their own still-live claim and drop them as duplicates.
+			//  - a prioritized continuation retry (issue #214), whose concurrency
+			//    deferral refreshed the claim's TTL and is holding it open;
+			//  - a `no-fix` recovery (issue #841), to which the finished Respond-to-CI
+			//    dispatch handed its claim over — refreshed, deliberately not released,
+			//    so a *delayed* sibling check event for this same head cannot take the
+			//    slot in between and start a second CI fix on an already-adjudicated
+			//    red (`src/dispatch/ci-no-fix-recovery.ts` states the race in full).
+			const heldClaim = heldDispatchClaimReason(ctx);
+			if (heldClaim) {
+				logger.debug('review: reusing held dispatch claim', {
 					prNumber,
 					headSha,
+					heldFor: heldClaim,
 				});
 			} else {
 				const claimed = await claimReviewDispatch(dispatchKey, 'pr-review', {

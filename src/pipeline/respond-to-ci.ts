@@ -184,6 +184,15 @@ export interface RunRespondToCiPhaseOptions {
 export interface RespondToCiPhaseResult {
 	/** The outcome the agent reported, read from {@link RESPOND_CI_OUTCOME_FILENAME}. */
 	outcome: RespondCiOutcome;
+	/**
+	 * The same value as {@link RespondToCiPhaseResult.outcome}, under the name the
+	 * worker's shared `PhaseRunResult` reads it by (issue #841) — a `no-fix` run
+	 * hands the pull request back to Review, which is scheduled at the composition
+	 * root (`scheduleCiRecoveryIfNoFix`, `src/worker/consumer.ts`) rather than here.
+	 * A distinct name is required: `PhaseRunResult` cannot reuse `outcome`, because
+	 * `RespondToReviewPhaseResult.outcome` is a different union.
+	 */
+	ciOutcome: RespondCiOutcome;
 	/** The agent run's result (exit code, duration, captured output). */
 	agent: AgentCliResult;
 }
@@ -362,7 +371,7 @@ export async function runRespondToCiPhase(
 
 		logger.info('Phase finished - Respond-to-CI', { taskId, prNumber, prBranch, outcome });
 
-		return { outcome, agent };
+		return { outcome, ciOutcome: outcome, agent };
 	} catch (error) {
 		// `shouldDeferDeliveryFailure` (not a bare progress check): a refusal that is a
 		// property of the prepared tree, or of a branch that cannot fast-forward, settles
