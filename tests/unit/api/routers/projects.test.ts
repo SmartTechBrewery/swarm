@@ -22,6 +22,12 @@ vi.mock('@/db/repositories/projectMembersRepository.js', () => ({
 	addMember: vi.fn(),
 }));
 
+// `delete`'s in-flight-run guard (issue #854) — the only thing the router reads from
+// the run side.
+vi.mock('@/db/repositories/runsRepository.js', () => ({
+	countRunningRunsForProject: vi.fn(),
+}));
+
 // The two halves of `create`'s instance-default seeding (issue #769 phase 2/2): the
 // value is read from the instance tier and written into the new project's own row.
 vi.mock('@/db/repositories/credentialsRepository.js', () => ({
@@ -69,6 +75,7 @@ import {
 	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '@/db/repositories/projectsRepository.js';
+import { countRunningRunsForProject } from '@/db/repositories/runsRepository.js';
 import {
 	canAdministerProject,
 	canReadProject,
@@ -161,6 +168,9 @@ describe('projectsRouter', () => {
 		vi.mocked(createProjectWithMemberInDb).mockReset();
 		vi.mocked(upsertProjectToDb).mockReset();
 		vi.mocked(deleteProjectFromDb).mockReset();
+		// Idle by default, so every suite but `delete`'s own reaches the row delete.
+		vi.mocked(countRunningRunsForProject).mockReset();
+		vi.mocked(countRunningRunsForProject).mockResolvedValue(0);
 		vi.mocked(addMember).mockReset();
 		vi.mocked(addMember).mockResolvedValue(membershipFor('projectAdmin'));
 		vi.mocked(getMembership).mockReset();
@@ -1112,6 +1122,42 @@ describe('projectsRouter', () => {
 
 			await expect(caller.delete({ id: 'p1' })).resolves.toBeUndefined();
 			expect(deleteProjectFromDb).toHaveBeenCalledWith('p1');
+		});
+
+		// Issue #854: the cascade would take `runs`/`dispatches` rows out from under a
+		// worker still executing them, so a busy project is refused rather than deleted —
+		// the same CONFLICT `workers.remove` answers a mid-run machine deletion with.
+		it('refuses with CONFLICT while the project has runs in flight', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(countRunningRunsForProject).mockResolvedValue(2);
+
+			await expect(caller.delete({ id: 'p1' })).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'CONFLICT',
+					message: expect.stringContaining('2 runs in flight'),
+				}),
+			);
+
+			expect(deleteProjectFromDb).not.toHaveBeenCalled();
+		});
+
+		it('says "1 run" rather than "1 runs" when exactly one is in flight', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(countRunningRunsForProject).mockResolvedValue(1);
+
+			await expect(caller.delete({ id: 'p1' })).rejects.toThrowError(
+				expect.objectContaining({ message: expect.stringContaining('1 run in flight') }),
+			);
+		});
+
+		it('does not reach the run check for a project that does not exist', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
+
+			await expect(caller.delete({ id: 'missing' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+
+			expect(countRunningRunsForProject).not.toHaveBeenCalled();
 		});
 	});
 

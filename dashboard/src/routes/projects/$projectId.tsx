@@ -27,6 +27,7 @@ import { PmCredentialsPanel } from '@/components/projects/pm-credentials-panel.j
 import { PmProviderPanel } from '@/components/projects/pm-provider-panel.js';
 import { PmProviderSwitchDialog } from '@/components/projects/pm-provider-switch-dialog.js';
 import { ProjectAdminOnly } from '@/components/projects/project-admin-only.js';
+import { ProjectDeleteCard } from '@/components/projects/project-delete-card.js';
 import { RepositoriesPanel } from '@/components/projects/repositories-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
@@ -2536,6 +2537,23 @@ function ProjectDetailRouteComponent() {
 		updateMutation.mutate(update);
 	};
 
+	/**
+	 * The project is gone (issue #854), so this screen is a dead route: its two reads
+	 * would only refetch a NOT_FOUND. Drop them rather than invalidate them, refresh the
+	 * lists this project has just left, and leave for `/projects`.
+	 */
+	const handleProjectDeleted = () => {
+		queryClient.removeQueries({
+			queryKey: trpc.projects.getById.queryOptions({ id: projectId }).queryKey,
+		});
+		queryClient.removeQueries({
+			queryKey: trpc.projects.viewerAccess.queryOptions({ projectId }).queryKey,
+		});
+		queryClient.invalidateQueries({ queryKey: trpc.projects.list.queryOptions().queryKey });
+		queryClient.invalidateQueries({ queryKey: trpc.projects.listMine.queryOptions().queryKey });
+		navigate({ to: '/projects' });
+	};
+
 	// Both loads gate the screen: rendering before the viewer's access resolves would
 	// show the tab bar and the resolved tab as a non-administrator's for a frame, then
 	// swap them (issue #655). The two queries run in parallel, so this costs no round trip.
@@ -2597,25 +2615,42 @@ function ProjectDetailRouteComponent() {
 				{/* Form Card - General Settings. Project identity and host layout; the
 				    repository list is on the Source Control tab (issue #729). */}
 				{activeTab === 'general' && (
-					<GeneralSettingsForm
-						name={name}
-						repoRoot={repoRoot}
-						worktreeRoot={worktreeRoot}
-						maxConcurrentJobs={maxConcurrentJobs}
-						maxConcurrentJobsError={maxConcurrentJobsError}
-						setName={setName}
-						setRepoRoot={setRepoRoot}
-						setWorktreeRoot={setWorktreeRoot}
-						setMaxConcurrentJobs={setMaxConcurrentJobs}
-						handleInputChange={handleInputChange}
-						handleSubmit={handleSubmit}
-						handleReset={handleReset}
-						isDirty={isDirty}
-						isPending={configWriteInFlight}
-						isSuccess={updateMutation.isSuccess}
-						isError={updateMutation.isError}
-						errorMessage={updateMutation.error?.message}
-					/>
+					<div className="space-y-6">
+						<GeneralSettingsForm
+							name={name}
+							repoRoot={repoRoot}
+							worktreeRoot={worktreeRoot}
+							maxConcurrentJobs={maxConcurrentJobs}
+							maxConcurrentJobsError={maxConcurrentJobsError}
+							setName={setName}
+							setRepoRoot={setRepoRoot}
+							setWorktreeRoot={setWorktreeRoot}
+							setMaxConcurrentJobs={setMaxConcurrentJobs}
+							handleInputChange={handleInputChange}
+							handleSubmit={handleSubmit}
+							handleReset={handleReset}
+							isDirty={isDirty}
+							isPending={configWriteInFlight}
+							isSuccess={updateMutation.isSuccess}
+							isError={updateMutation.isError}
+							errorMessage={updateMutation.error?.message}
+						/>
+						{/* The project's own removal (issue #854), last on the tab and in a card of
+						    its own — well clear of the identity/host-layout fields above, which are a
+						    separate write. It needs no gate of its own: this whole frame is already
+						    `ProjectAdminOnly`, the same `projectAdmin` boundary `projects.delete`
+						    asserts server-side. */}
+						<div className={CARD_CLASS}>
+							<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
+								Delete project
+							</h2>
+							<ProjectDeleteCard
+								projectId={projectId}
+								projectName={project?.name ?? projectId}
+								onDeleted={handleProjectDeleted}
+							/>
+						</div>
+					</div>
 				)}
 
 				{/* Form Card - Agent Configuration */}

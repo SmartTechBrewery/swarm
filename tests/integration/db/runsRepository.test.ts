@@ -14,6 +14,7 @@ import {
 	cancelDeferredRunInDb,
 	clearRunRecovery,
 	completeRun,
+	countRunningRunsForProject,
 	createFailedRun,
 	createRun as createRunRow,
 	failOrphanedRunningRuns,
@@ -1018,6 +1019,42 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createRun({ projectId: PROJECT_ID, taskId: '424d', phase: 'implementation' });
 
 			await expect(hasLiveRunForTask(PROJECT_ID, '424c', resetting)).resolves.toBe(false);
+		});
+	});
+
+	// The guard `projects.delete` refuses on (issue #854), which is why the count has
+	// to be the project's alone and has to fall back to zero once its runs settle.
+	describe('countRunningRunsForProject (issue #854)', () => {
+		it('counts only this project’s runs that are still running', async () => {
+			await seedProject({ id: 'proj-854-other', repo: 'jkwiecien/other-854-repo' });
+
+			await expect(countRunningRunsForProject(PROJECT_ID)).resolves.toBe(0);
+
+			const first = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '854a',
+				phase: 'implementation',
+			});
+			await createRun({ projectId: PROJECT_ID, taskId: '854b', phase: 'review' });
+			await createRunRow({
+				projectId: 'proj-854-other',
+				repository: 'jkwiecien/other-854-repo',
+				taskId: '854c',
+				phase: 'implementation',
+			});
+
+			await expect(countRunningRunsForProject(PROJECT_ID)).resolves.toBe(2);
+			await expect(countRunningRunsForProject('proj-854-other')).resolves.toBe(1);
+
+			// A settled run is not in flight, whichever way it settled.
+			await completeRun(first, { status: 'completed' });
+			await expect(countRunningRunsForProject(PROJECT_ID)).resolves.toBe(1);
+		});
+
+		it('reports nothing in flight for a project with no runs at all', async () => {
+			await seedProject({ id: 'proj-854-empty', repo: 'jkwiecien/empty-854-repo' });
+
+			await expect(countRunningRunsForProject('proj-854-empty')).resolves.toBe(0);
 		});
 	});
 
