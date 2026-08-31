@@ -492,6 +492,64 @@ export async function getSubmittedReviewSlot(
 }
 
 /**
+ * One PR's live review slots, projected for the unreviewed-pull-request recovery
+ * sweep's read-only pre-check (`src/dispatch/unreviewed-pr-recovery.ts`, issue
+ * #862): "does this pull request already have a review, or one in flight, or has
+ * it spent its allowance?"
+ *
+ * The projection deliberately mirrors exactly what {@link reserveReviewVerdict}
+ * itself reads inside its advisory lock — the same-head slot, another head's
+ * `pending` one, the `submitted` count, and the unconsumed cap-override grant —
+ * so the sweep's judgement cannot drift from the writer's. `abandoned` slots are
+ * excluded here for the same reason they are filtered there: they free their
+ * ordinal without costing the PR a slot.
+ *
+ * **A pre-check, never a substitute for the reservation.** Only
+ * {@link reserveReviewVerdict} decides whether a review may proceed, and only it
+ * consumes a cap-override grant. Nothing read here is held under a lock, so a
+ * caller may act on a slot that changed a moment later — which is safe precisely
+ * because the reservation runs again, authoritatively, inside the phase the
+ * caller re-enters.
+ *
+ * Keyed on `(projectId, repository, prNumber)`: the repository is part of the
+ * natural key since issue #684, and omitting it would answer a second
+ * repository's PR #42 with the first's slots.
+ */
+export interface PullRequestReviewSlot {
+	ordinal: number;
+	state: ReviewVerdictState;
+	headSha: string;
+	capOverrideGrantedAt: Date | null;
+	capOverrideConsumedAt: Date | null;
+}
+
+export async function listActiveReviewSlotsForPullRequest(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<PullRequestReviewSlot[]> {
+	const rows = await getDb()
+		.select({
+			ordinal: reviewVerdicts.ordinal,
+			state: reviewVerdicts.state,
+			headSha: reviewVerdicts.headSha,
+			capOverrideGrantedAt: reviewVerdicts.capOverrideGrantedAt,
+			capOverrideConsumedAt: reviewVerdicts.capOverrideConsumedAt,
+		})
+		.from(reviewVerdicts)
+		.where(
+			and(
+				eq(reviewVerdicts.projectId, projectId),
+				eq(reviewVerdicts.repository, repository),
+				eq(reviewVerdicts.prNumber, prNumber),
+				ne(reviewVerdicts.state, 'abandoned'),
+			),
+		)
+		.orderBy(asc(reviewVerdicts.ordinal));
+	return rows as PullRequestReviewSlot[];
+}
+
+/**
  * Whether `ordinal`/`verdict` together are the cap-reaching final
  * `request-changes` verdict — the one condition both the Review phase
  * (recording its own run's automation outcome, `src/pipeline/review.ts`) and

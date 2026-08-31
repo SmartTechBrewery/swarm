@@ -49,6 +49,10 @@ import {
 	reconcileDispatchesAtStartup,
 	reconcileDispatchesPeriodically,
 } from '../dispatch/reconciler.js';
+import {
+	recoverUnreviewedPullRequests,
+	UNREVIEWED_PR_SWEEP_INTERVAL_MS,
+} from '../dispatch/unreviewed-pr-recovery.js';
 import type { AgentCliResult, ReportedAgentResult } from '../harness/agent-cli.js';
 import { type AgentFailureKind, AgentRunError } from '../harness/agent-failure.js';
 import {
@@ -779,6 +783,20 @@ export async function startControlPlaneDispatch(options: {
 	const reconcileInterval = setInterval(() => void reconcile(), resolveStaleRunSweepIntervalMs());
 	reconcileInterval.unref();
 
+	// Hand a ready-but-unreviewed pull request back to Review (issue #862). Its own
+	// interval rather than a step inside `reconcile()`: the two cadences differ by
+	// design — this one costs a provider read per repository, the reconciler's pass
+	// is bounded `UPDATE`s — so folding it in would either multiply this sweep's
+	// provider cost or slow lease reclamation. Deliberately not run from
+	// `reconcileDispatchesAtStartup` either: that runs before the consumer serves,
+	// and issuing provider reads for every repository during boot buys at most one
+	// interval's latency.
+	const reviewRecoveryInterval = setInterval(
+		() => void recoverUnreviewedPullRequests(),
+		UNREVIEWED_PR_SWEEP_INTERVAL_MS,
+	);
+	reviewRecoveryInterval.unref();
+
 	// Deliver user terminations to the worker running the run (issue #549). A
 	// dispatched run is otherwise unstoppable until its wall-clock timeout, and a
 	// DB-free worker has no Redis to read the durable marker with either.
@@ -792,6 +810,7 @@ export async function startControlPlaneDispatch(options: {
 	return {
 		close: async () => {
 			clearInterval(reconcileInterval);
+			clearInterval(reviewRecoveryInterval);
 			// Drain the consumer first: an in-flight dispatch still reads the durable
 			// cancellation marker on this client, so closing it underneath would only
 			// make that read fail safe into "not cancelled".
