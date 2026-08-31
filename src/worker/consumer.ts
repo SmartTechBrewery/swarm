@@ -166,6 +166,7 @@ import {
 	type TriggerResult,
 } from '../triggers/types.js';
 import { reconcileTerminatedWorktree } from '../worktree/termination-cleanup.js';
+import { DEFAULT_AGENT_TIMEOUT_MS, resolveAgentTimeoutMs } from './agent-timeout.js';
 import {
 	maxDependencyRechecks,
 	resolveDependencyMaxWaitMs,
@@ -436,20 +437,6 @@ const ELIGIBILITY_CONTINUATION_CLAIM_TTL_SEC =
 	Math.ceil(ELIGIBILITY_RECHECK_INTERVAL_MS / 1000) + 120;
 
 /**
- * Coded default wall-clock timeout applied to *every* phase/agent invocation
- * when a project sets no per-phase `agents.<phase>.timeoutMs` (issue #165).
- * Without it an agent that hangs — a model that never responds, a wedged CLI —
- * runs forever, holding a worker slot and leaving its run row stuck `running`
- * (confirmed live on run `dd0ad860-…`). Chosen as a 30-minute default: long
- * enough for a focused phase, while bounding a runaway run's quota use and
- * occupied worker slot. Override the
- * default globally with the `SWARM_AGENT_TIMEOUT_MS` env var
- * (README § Configuration); a per-phase `timeoutMs` in `swarm.config.json`
- * still wins over both.
- */
-export const DEFAULT_AGENT_TIMEOUT_MS = 30 * 60 * 1000;
-
-/**
  * The coded default agent CLI — used when neither a per-job override nor a phase
  * config names one. Every pipeline phase's own coded default (`DEFAULT_*_CLI` in
  * `src/pipeline/*.ts`) is `claude`, so this is the CLI a defaulted run actually
@@ -461,23 +448,10 @@ export const DEFAULT_AGENT_TIMEOUT_MS = 30 * 60 * 1000;
  */
 export const DEFAULT_ENGINE: AgentCli = 'claude';
 
-/**
- * Resolve the effective default agent timeout: `SWARM_AGENT_TIMEOUT_MS` when it
- * is set to a positive integer, else {@link DEFAULT_AGENT_TIMEOUT_MS}. Exported
- * so the control-plane host's maintenance loop reuses the exact same value for
- * its stale-run reconciliation cutoff (`src/api/maintenance.ts`). Throws on a
- * non-integer / <1
- * value so a typo surfaces at startup rather than silently disabling the safety
- * net.
- */
-export function resolveAgentTimeoutMs(raw = process.env.SWARM_AGENT_TIMEOUT_MS): number {
-	if (raw === undefined || raw === '') return DEFAULT_AGENT_TIMEOUT_MS;
-	const parsed = Number(raw);
-	if (!Number.isInteger(parsed) || parsed < 1) {
-		throw new Error(`SWARM_AGENT_TIMEOUT_MS must be a positive integer, got '${raw}'`);
-	}
-	return parsed;
-}
+// The default agent wall clock now lives in its own module so a trigger can size
+// a lease against it without importing this composition root — re-exported here
+// because this is where every existing caller looks for it.
+export { DEFAULT_AGENT_TIMEOUT_MS, resolveAgentTimeoutMs };
 
 /** The effective default agent timeout, resolved once at module load. */
 const AGENT_TIMEOUT_MS = resolveAgentTimeoutMs();

@@ -110,12 +110,12 @@
  * gate around it (closed-PR, work-item origin, draft/fork, mergeability, the
  * `state-pending` defer, the verdict reservation) still runs. The one gate it
  * *does* change is the PR+SHA dispatch dedup, and only in whose favour: the
- * dispatched CI fix extends that claim to cover its own run
- * ({@link CI_FIX_CLAIM_TTL_SEC}) and the finished dispatch hands it over rather
- * than releasing it, so the slot is continuously owned from the fix through the
- * hand-over — a marked recovery reuses the held claim, and a delayed ordinary
- * completed-check event for the same head is locked out of starting a second
- * CI fix.
+ * dispatched CI fix extends that claim to cover its own run — this project's
+ * configured Respond-to-CI wall clock plus margin ({@link ciFixClaimTtlSec}) —
+ * and the finished dispatch hands it over rather than releasing it, so the slot
+ * is continuously owned from the fix through the hand-over: a marked recovery
+ * reuses the held claim, and a delayed ordinary completed-check event for the
+ * same head is locked out of starting a second CI fix.
  *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
@@ -162,6 +162,7 @@ import type { SwarmJob } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
+import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import {
 	buildRespondToCiAttemptKey,
@@ -601,10 +602,9 @@ function resolveDisposition(
 }
 
 /**
- * How long the PR+SHA dispatch claim is extended to once a Respond-to-CI
- * dispatch is actually returned — long enough to cover the CI-fix agent's own
- * wall clock (`SWARM_AGENT_TIMEOUT_MS`, 30 minutes by default) plus margin for
- * the enqueue and pickup around it.
+ * Margin added to the CI-fix agent's own wall clock when the PR+SHA dispatch
+ * claim is extended for it — headroom for the enqueue, the worker's pickup and
+ * worktree provisioning before the clock starts, and the settle afterwards.
  *
  * The claim's ordinary five-minute TTL is sized for the gap between a PR opening
  * and its checks completing, which a CI-fix *run* readily outlives. Letting it
@@ -614,14 +614,39 @@ function resolveDisposition(
  * `src/dispatch/ci-no-fix-recovery.ts` with a competing claimant instead of this
  * dispatch's own live lease. Holding the slot for the run's duration is what the
  * dedup means in the first place: one dispatch per PR+SHA while one is in flight.
- *
- * Sized against the *default* wall clock: a project that raises
- * `agents.respondToCi.timeoutMs` past this can still have a run outlive its
- * lease, and a concurrency deferral in between re-shortens it to the
- * continuation TTL until the retry re-enters here. Both are bounded by the
- * per-PR fix-attempt cap rather than by this TTL.
  */
-const CI_FIX_CLAIM_TTL_SEC = 35 * 60;
+const CI_FIX_CLAIM_MARGIN_SEC = 5 * 60;
+
+/**
+ * How long the PR+SHA dispatch claim is extended to once a Respond-to-CI
+ * dispatch is actually returned: **this project's** effective Respond-to-CI wall
+ * clock plus {@link CI_FIX_CLAIM_MARGIN_SEC}.
+ *
+ * Derived rather than fixed, because the wall clock is configurable and the lease
+ * has to cover whatever it is set to. `agents.respondToCi.timeoutMs` is valid up
+ * to 45 minutes (`AgentConfigSchema`, `src/config/schema.ts`) and
+ * `SWARM_AGENT_TIMEOUT_MS` moves the default under it, so a constant sized for
+ * the 30-minute default lapsed ~10 minutes into the tail of a legitimately
+ * configured run — long enough for a delayed sibling completed-check event to
+ * take the freed slot and start a second fix on the red already being fixed.
+ * Reading the same `agents.<phase>.timeoutMs ?? SWARM_AGENT_TIMEOUT_MS` the
+ * worker applies when it invokes the agent (`resolveAgentOverride`,
+ * `src/worker/consumer.ts`) is what keeps the two from drifting apart again.
+ *
+ * A concurrency or eligibility deferral in between re-shortens the claim to the
+ * continuation TTL (`retainContinuationDispatchClaim`, `src/worker/consumer.ts`)
+ * — deliberately, and it costs nothing: those are *pre-run* waits, so no agent is
+ * running to outlive the shorter lease, that TTL is sized to outlast the wait
+ * itself, and the prioritized retry re-enters {@link dispatchRespondToCi} and
+ * re-extends to the full lease before the run starts. What remains outside the
+ * lease is a Redis restart, where the per-PR fix-attempt cap
+ * (`src/triggers/respond-to-ci-attempts.ts`) — not the claim — bounds a duplicate
+ * fix.
+ */
+function ciFixClaimTtlSec(project: ProjectConfig): number {
+	const timeoutMs = project.agents?.respondToCi?.timeoutMs ?? resolveAgentTimeoutMs();
+	return Math.ceil(timeoutMs / 1000) + CI_FIX_CLAIM_MARGIN_SEC;
+}
 
 /**
  * Turn a resolved `respond-to-ci` disposition into a dispatch. The PR+SHA dedup
@@ -632,7 +657,7 @@ const CI_FIX_CLAIM_TTL_SEC = 35 * 60;
  * (not a dispatch) when the cap is hit or the PR branch is missing.
  *
  * A dispatch that *is* returned extends the shared PR+SHA claim to
- * {@link CI_FIX_CLAIM_TTL_SEC} so it stays held for the whole fix run; the two
+ * {@link ciFixClaimTtlSec} so it stays held for the whole fix run; the two
  * `null` paths deliberately leave the ordinary TTL alone, since nothing runs.
  *
  * The *first* event to cross the cap also leaves the durable give-up trace
@@ -677,11 +702,11 @@ async function dispatchRespondToCi(
 	}
 
 	// Hold the shared PR+SHA slot for as long as this fix can run (see
-	// {@link CI_FIX_CLAIM_TTL_SEC}). Best-effort, like every other refresh: a
+	// {@link ciFixClaimTtlSec}). Best-effort, like every other refresh: a
 	// Redis hiccup here only restores the pre-existing short lease.
 	await refreshReviewDispatchClaim(
 		buildReviewDispatchKey(project.repo, prNumber, headSha),
-		CI_FIX_CLAIM_TTL_SEC,
+		ciFixClaimTtlSec(project),
 	);
 
 	logger.debug('respond-to-ci: dispatching Respond-to-CI phase', {

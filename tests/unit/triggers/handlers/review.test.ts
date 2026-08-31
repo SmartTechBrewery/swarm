@@ -1613,7 +1613,8 @@ describe('review trigger — the CI fix holds the PR+SHA lease for its run (issu
 		prBranch: 'issue-9',
 	} as const;
 	const KEY = `${PROJECT.repo}:9:cafe`;
-	const CI_FIX_CLAIM_TTL_SEC = 35 * 60;
+	/** The lease a project on the coded 30-minute default gets: wall clock + 5 min margin. */
+	const DEFAULT_CI_FIX_CLAIM_TTL_SEC = 35 * 60;
 
 	/**
 	 * A stand-in for the Redis claim with its TTL: key → seconds left. `claim` is
@@ -1645,7 +1646,7 @@ describe('review trigger — the CI fix holds the PR+SHA lease for its run (issu
 	it('extends the claim to the fix run’s wall clock when it dispatches', async () => {
 		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
 
-		expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, CI_FIX_CLAIM_TTL_SEC);
+		expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, DEFAULT_CI_FIX_CLAIM_TTL_SEC);
 	});
 
 	it('locks a sibling out past the point the ordinary five-minute lease would have lapsed', async () => {
@@ -1659,14 +1660,74 @@ describe('review trigger — the CI fix holds the PR+SHA lease for its run (issu
 	});
 
 	// The honest bound, stated so the docs can't drift past it: this is a lease, not
-	// a lock. Beyond the extended TTL — a project that configures `respond-to-ci`
-	// past it, a Redis restart — the slot does fall free again, and the per-PR
-	// fix-attempt cap is what bounds a duplicate fix from there.
+	// a lock. Past the whole configured wall clock plus its margin — a Redis restart
+	// is what is left once the lease tracks the timeout — the slot does fall free
+	// again, and the per-PR fix-attempt cap is what bounds a duplicate fix from there.
 	it('does not pretend to hold the slot beyond the extended lease', async () => {
 		await handler.handle(ctx(checks));
-		elapse(CI_FIX_CLAIM_TTL_SEC + 60);
+		elapse(DEFAULT_CI_FIX_CLAIM_TTL_SEC + 60);
 
 		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+	});
+
+	/**
+	 * The lease is derived from the timeout the fix will actually run under, not
+	 * from the coded default: `agents.respondToCi.timeoutMs` is valid to 45 minutes
+	 * and `SWARM_AGENT_TIMEOUT_MS` moves the default under it, and a lease fixed at
+	 * the default's 35 minutes lapsed in the tail of either.
+	 */
+	describe('sized from the timeout the fix actually runs under', () => {
+		/** The same `checks` context, against a project with its own agent config. */
+		const projectCtx = (project: ProjectConfig) =>
+			createMockScmTriggerContext({
+				project,
+				scm: SCM,
+				event: createMockScmEvent(checks),
+			});
+
+		it('covers a Respond-to-CI timeout configured to the schema’s 45-minute maximum', async () => {
+			const project = createMockProjectConfig({
+				agents: { respondToCi: { timeoutMs: 45 * 60 * 1000 } },
+			});
+
+			expect(await handler.handle(projectCtx(project))).toMatchObject({
+				phase: 'respond-to-ci',
+			});
+			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 50 * 60);
+
+			// Minute 36 — where the old fixed lease had already lapsed — and a delayed
+			// sibling completed-check event for the same head is still locked out.
+			elapse(36 * 60);
+			expect(await handler.handle(projectCtx(project))).toBeNull();
+			// The decisive assertion: no second fix attempt was spent on this red.
+			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		});
+
+		it('follows the operator’s SWARM_AGENT_TIMEOUT_MS when the project sets no override', async () => {
+			vi.stubEnv('SWARM_AGENT_TIMEOUT_MS', String(40 * 60 * 1000));
+			try {
+				expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+				expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 45 * 60);
+			} finally {
+				vi.unstubAllEnvs();
+			}
+		});
+
+		it('prefers the project’s own override to the global default', async () => {
+			vi.stubEnv('SWARM_AGENT_TIMEOUT_MS', String(40 * 60 * 1000));
+			try {
+				const project = createMockProjectConfig({
+					agents: { respondToCi: { timeoutMs: 10 * 60 * 1000 } },
+				});
+
+				expect(await handler.handle(projectCtx(project))).toMatchObject({
+					phase: 'respond-to-ci',
+				});
+				expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 15 * 60);
+			} finally {
+				vi.unstubAllEnvs();
+			}
+		});
 	});
 
 	it('leaves the lease alone when the attempt cap drops the dispatch — nothing runs', async () => {
