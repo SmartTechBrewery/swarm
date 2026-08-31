@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAgentOutput } from '@/harness/usage.js';
+import { parseAgentOutput, sessionIdFromLine } from '@/harness/usage.js';
 
 /** One `claude -p --output-format stream-json` transcript. */
 const claudeStream = (...events: unknown[]): string =>
@@ -345,5 +345,50 @@ describe('parseAgentOutput', () => {
 				logText: 'done',
 			});
 		});
+	});
+});
+
+describe('sessionIdFromLine', () => {
+	// The one-line sniff the harness runs over the live stdout stream, for the ids
+	// a truncated run loses from both of its capture buffers (issue #867).
+	it('reads a codex thread id off its opening event', () => {
+		expect(
+			sessionIdFromLine(
+				'codex',
+				'{"type":"thread.started","thread_id":"019f57a7-cf1b-72d3-b887-63758a10f3a8"}',
+			),
+		).toBe('019f57a7-cf1b-72d3-b887-63758a10f3a8');
+	});
+
+	it('reads an antigravity conversation id off any record that names one', () => {
+		expect(sessionIdFromLine('antigravity', JSON.stringify(agyInit('conv-1')))).toBe('conv-1');
+		expect(
+			sessionIdFromLine(
+				'antigravity',
+				JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'conv-1' } }),
+			),
+		).toBe('conv-1');
+		// The empty id a failed run reports must never become a resume handle.
+		expect(
+			sessionIdFromLine(
+				'antigravity',
+				JSON.stringify({ event: 'result', result: { conversation_id: '', status: 'ERROR' } }),
+			),
+		).toBeUndefined();
+	});
+
+	it('answers undefined for claude, whose id SWARM assigns up front', () => {
+		expect(
+			sessionIdFromLine('claude', JSON.stringify({ type: 'system', session_id: 'sess-1' })),
+		).toBeUndefined();
+	});
+
+	it('answers undefined for a non-matching or malformed line, on every CLI', () => {
+		for (const cli of ['claude', 'antigravity', 'codex'] as const) {
+			expect(sessionIdFromLine(cli, '{"type":"turn.completed","usage":{}}')).toBeUndefined();
+			expect(sessionIdFromLine(cli, '{"type":"thread.started","thread_id":')).toBeUndefined();
+			expect(sessionIdFromLine(cli, 'plain text, not protocol')).toBeUndefined();
+			expect(sessionIdFromLine(cli, '')).toBeUndefined();
+		}
 	});
 });

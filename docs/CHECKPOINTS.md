@@ -65,6 +65,21 @@ two runs overlap on one machine. SWARM always resumes by explicit id.
   than one new `.db` makes the diff ambiguous and capture deliberately gives up rather than
   guess, since resuming a sibling task's session is worse than starting fresh.
 
+For the two CLIs that mint their own id, that id is read off the **live** stdout line stream
+rather than out of the harness's captured text (`sessionIdFromLine`, `src/harness/usage.ts`,
+issue #867), so it survives a run that floods its own output cap. Both announce the id in their
+*first* event, while the harness's head buffer stops growing the moment `maxOutputBytes` is hit
+and the rolling tail it parses instead — where a trailing usage summary lives — retains only the
+*last* bytes: on a truncated run the two windows never overlap and the opening event falls
+between them. Every line reaches the live callback exactly once whichever buffer later
+truncates, so it is the only window guaranteed to see it; a codex run that logged a large test
+suite therefore keeps its thread id instead of losing every downstream resume (the Review
+hand-off repair pass, `resolve-conflicts`' migration-journal repair pass, and the
+`agent_session_id` a deferred run persists for its retry). The captured text is still asked
+first, so a resume run's re-emitted id wins and the non-truncated path is unchanged; a run that
+genuinely emitted no opening event still reports **no** id rather than an invented one. `claude`
+needs none of this — SWARM assigns its id up front.
+
 ### (b) Per-CLI resume-arg shape — `buildSessionArgs` in `agent-cli.ts`
 
 The CLIs don't share flag semantics (`ai/RULES.md §6`), so resume is shaped per CLI:

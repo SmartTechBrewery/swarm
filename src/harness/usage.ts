@@ -63,6 +63,19 @@ function codexAgentMessage(event: Record<string, unknown>): string | undefined {
 	return item.type === 'agent_message' && typeof item.text === 'string' ? item.text : undefined;
 }
 
+/**
+ * The thread id a `thread.started` event names, or `undefined` for any other
+ * event. `codex exec --json` emits `{"type":"thread.started","thread_id":"…"}`
+ * as its first event; the thread id is what `codex exec resume <id>` takes to
+ * continue the same session (verified live). A resume run re-emits the same id,
+ * so reading it on every run keeps the row's session handle current.
+ */
+function codexThreadId(event: Record<string, unknown>): string | undefined {
+	return event.type === 'thread.started' && typeof event.thread_id === 'string'
+		? event.thread_id
+		: undefined;
+}
+
 function collectCodexEvents(stdout: string): {
 	rawUsage?: z.infer<typeof CodexUsageSchema>;
 	messages: string[];
@@ -74,13 +87,7 @@ function collectCodexEvents(stdout: string): {
 	for (const line of stdout.split('\n')) {
 		const event = parseJsonLine(line);
 		if (!event) continue;
-		// `codex exec --json` emits `{"type":"thread.started","thread_id":"…"}` as
-		// its first event; the thread id is what `codex exec resume <id>` takes to
-		// continue the same session (verified live). A resume run re-emits the same
-		// id, so capturing it on every run keeps the row's session handle current.
-		if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
-			sessionId = event.thread_id;
-		}
+		sessionId = codexThreadId(event) ?? sessionId;
 		if (event.type === 'turn.completed') {
 			const parsedUsage = CodexUsageSchema.safeParse(event.usage);
 			if (parsedUsage.success) rawUsage = parsedUsage.data;
@@ -104,9 +111,11 @@ export interface ParsedAgentOutput {
 	 * The CLI session/thread id recovered from this run's output, to resume it
 	 * later. All three CLIs report one on stdout when running structured:
 	 * `claude`'s `session_id`, `codex`'s `thread.started`, and Antigravity's
-	 * `conversation_id`. Absent when the stream carried none — an `agy` too old
-	 * for `--output-format`, malformed output, or a run killed before it got
-	 * that far (`./antigravity-session.ts` is the fallback for those).
+	 * `conversation_id`. Absent when the *captured* text carried none — an `agy`
+	 * too old for `--output-format`, malformed output, a run killed before it got
+	 * that far, or a truncated run whose opening event fell outside the retained
+	 * window ({@link sessionIdFromLine} backs that last case off the live stream,
+	 * and `./antigravity-session.ts` the rest).
 	 */
 	sessionId?: string;
 	/**
@@ -258,5 +267,37 @@ export function parseAgentOutput(cli: AgentCli, stdout: string): ParsedAgentOutp
 			return parseAntigravityOutput(stdout);
 		case 'codex':
 			return parseCodexOutput(stdout);
+	}
+}
+
+/**
+ * The session id a *single* raw stdout line names, or `undefined` when it names
+ * none. Dispatches per `cli` and recognizes nothing itself: each CLI's event
+ * shapes stay defined in its own decoder (ai/RULES.md §6), so this only routes.
+ *
+ * It exists because neither of the harness's capture buffers can be relied on
+ * for the id of a CLI that mints its own: `codex` and `agy` announce it in their
+ * *first* event, the head buffer stops growing the moment a chatty run floods
+ * `maxOutputBytes`, and the rolling tail that survives such a run holds only its
+ * *last* bytes — on a truncated run the two windows never overlap and the
+ * opening event falls between them. The harness therefore sniffs each line as it
+ * streams (`./agent-cli.ts`), the one window guaranteed to see every line
+ * exactly once.
+ *
+ * `claude` is deliberately `undefined`: SWARM assigns its session id up front
+ * with `--session-id` and the harness already falls back to it, so there is
+ * nothing here to recover. An unparseable or non-matching line is `undefined`
+ * too — never throws, on any CLI.
+ */
+export function sessionIdFromLine(cli: AgentCli, line: string): string | undefined {
+	switch (cli) {
+		case 'claude':
+			return undefined;
+		case 'antigravity':
+			return findAntigravityConversationId(line);
+		case 'codex': {
+			const event = parseJsonLine(line);
+			return event ? codexThreadId(event) : undefined;
+		}
 	}
 }
