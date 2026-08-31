@@ -379,6 +379,28 @@ describe('GitLabSCMIntegration', () => {
 		});
 	});
 
+	// A pure grammar, so it is asserted as one: no credential, no request. GitLab
+	// spells a merge request `/-/merge_requests/<iid>`, which is the whole reason
+	// shared code must not derive `github.com/<repo>/pull/<n>` for itself.
+	describe('pullRequestUrl', () => {
+		it('spells GitLab’s own merge-request web path', () => {
+			expect(scm.pullRequestUrl('team/app', 42)).toBe(
+				'https://gitlab.com/team/app/-/merge_requests/42',
+			);
+			expect(scm.pullRequestUrl('team/app', '42')).toBe(
+				'https://gitlab.com/team/app/-/merge_requests/42',
+			);
+		});
+
+		// The repository is the caller's, not `project.repo`: a stalled row records
+		// the repository its run actually acted on (issue #683).
+		it('uses the repository it is handed rather than the project’s', () => {
+			expect(scm.pullRequestUrl('other/repo', 7)).toBe(
+				'https://gitlab.com/other/repo/-/merge_requests/7',
+			);
+		});
+	});
+
 	describe('commentOnPullRequest', () => {
 		beforeEach(() => {
 			vi.mocked(getGitLabToken).mockImplementation(async (_p, persona) => `token-${persona}`);

@@ -5,8 +5,13 @@ import { EmptyRunsState } from '@/components/runs/empty-runs-state.js';
 import { QueuedRunsSection } from '@/components/runs/queued-runs-section.js';
 import { RunFilters } from '@/components/runs/run-filters.js';
 import { RunsTable } from '@/components/runs/runs-table.js';
+import { StalledItemsSection } from '@/components/runs/stalled-items-section.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
-import { queuedListRefetchInterval, runsListRefetchInterval } from '@/lib/runs-refresh.js';
+import {
+	queuedListRefetchInterval,
+	runsListRefetchInterval,
+	stalledListRefetchInterval,
+} from '@/lib/runs-refresh.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
 import { type RunRow, runPhaseFilterSchema, runStatusFilterSchema } from '@/types/runs.js';
@@ -33,7 +38,9 @@ type RunsSearch = z.infer<typeof runsSearchSchema>;
  *
  * The queue below it did *not* move: `runs.queued` is still installation-wide and
  * instance-admin-only, so the section is rendered — and its query issued — only
- * for an administrator. Scoping the queue the same way is a separate change.
+ * for an administrator. Scoping the queue the same way is a separate change. The
+ * Stalled section above it (issue #847) shares that gate exactly, because
+ * `runs.stalled` copied `runs.queued`'s authorization verbatim.
  */
 export function RunsRouteComponent() {
 	const search = runsIndexRoute.useSearch() as RunsSearch;
@@ -88,6 +95,20 @@ export function RunsRouteComponent() {
 		refetchInterval: (query) => queuedListRefetchInterval(query.state.data?.items),
 	});
 
+	// Work items with no forward path (issue #847), rendered above the queue. Like
+	// the queue it ignores the runs table's status/phase filters — only the project
+	// scope applies — and it never gates the table below.
+	//
+	// Gated exactly as the queued query is: without a `projectId` `runs.stalled` is
+	// instance-admin-only, so a member opening this screen would otherwise poll a
+	// guaranteed `FORBIDDEN`; picking a project makes it a read their membership
+	// already covers.
+	const stalledQuery = useQuery({
+		...trpc.runs.stalled.queryOptions({ projectId: search.projectId || undefined }),
+		enabled: canReadQueue || !!search.projectId,
+		refetchInterval: stalledListRefetchInterval(),
+	});
+
 	const hasActiveFilters = !!(search.projectId || search.status || search.phase);
 
 	return (
@@ -105,6 +126,12 @@ export function RunsRouteComponent() {
 				onPhaseChange={(phase) => handleFilterChange({ phase: phase as RunsSearch['phase'] })}
 				onClear={handleClearFilters}
 			/>
+
+			{/*
+			 * Renders nothing at all when nothing is stalled, and a gated-off query
+			 * has no data, so this needs no visibility condition of its own.
+			 */}
+			<StalledItemsSection items={stalledQuery.data ?? []} />
 
 			{(canReadQueue || search.projectId) && (
 				<QueuedRunsSection

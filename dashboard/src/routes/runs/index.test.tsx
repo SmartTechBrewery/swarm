@@ -5,16 +5,20 @@ import { render, screen } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runsListQueryOptions, runsQueuedQueryOptions } = vi.hoisted(() => ({
-	runsListQueryOptions: vi.fn(),
-	runsQueuedQueryOptions: vi.fn(),
-}));
+const { runsListQueryOptions, runsQueuedQueryOptions, runsStalledQueryOptions, stalledQueryFn } =
+	vi.hoisted(() => ({
+		runsListQueryOptions: vi.fn(),
+		runsQueuedQueryOptions: vi.fn(),
+		runsStalledQueryOptions: vi.fn(),
+		stalledQueryFn: vi.fn(),
+	}));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
 		runs: {
 			list: { queryOptions: runsListQueryOptions },
 			queued: { queryOptions: runsQueuedQueryOptions },
+			stalled: { queryOptions: runsStalledQueryOptions },
 		},
 	},
 	trpcClient: {},
@@ -27,6 +31,9 @@ vi.mock('@/lib/use-current-user.js', () => ({ useCurrentUser: vi.fn() }));
 vi.mock('@/components/runs/run-filters.js', () => ({ RunFilters: () => <div>filters</div> }));
 vi.mock('@/components/runs/queued-runs-section.js', () => ({
 	QueuedRunsSection: () => <div>queued section</div>,
+}));
+vi.mock('@/components/runs/stalled-items-section.js', () => ({
+	StalledItemsSection: () => <div>stalled section</div>,
 }));
 vi.mock('@/components/runs/runs-table.js', () => ({ RunsTable: () => <div>runs table</div> }));
 vi.mock('@/components/runs/empty-runs-state.js', () => ({
@@ -58,6 +65,10 @@ beforeEach(() => {
 	runsListQueryOptions.mockReturnValue({ queryKey: ['runs.list'], queryFn: async () => null });
 	runsQueuedQueryOptions.mockReset();
 	runsQueuedQueryOptions.mockReturnValue({ queryKey: ['runs.queued'], queryFn: async () => null });
+	runsStalledQueryOptions.mockReset();
+	stalledQueryFn.mockReset();
+	stalledQueryFn.mockResolvedValue([]);
+	runsStalledQueryOptions.mockReturnValue({ queryKey: ['runs.stalled'], queryFn: stalledQueryFn });
 	vi.mocked(useCurrentUser).mockReset();
 	// The route's search params come from the router the screen is mounted in;
 	// these tests render the screen directly, so the read is stubbed.
@@ -115,5 +126,38 @@ describe('/runs is open to every signed-in user (issue #821)', () => {
 		renderScreen(<RunsRouteComponent />);
 
 		expect(screen.getByText('queued section')).toBeDefined();
+	});
+});
+
+// `runs.stalled` copied `runs.queued`'s authorization verbatim (issue #847), so
+// the unscoped read is instance-admin-only and must not be issued by a member who
+// has chosen no project — the section itself is always mounted, since it renders
+// nothing at all when there is nothing stalled.
+describe('the Stalled section (issue #847)', () => {
+	it('does not issue the unscoped stalled read for a non-admin with no project chosen', () => {
+		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(false));
+
+		renderScreen(<RunsRouteComponent />);
+
+		expect(screen.getByText('stalled section')).toBeDefined();
+		expect(stalledQueryFn).not.toHaveBeenCalled();
+	});
+
+	it('issues the unscoped stalled read for an instance admin', () => {
+		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(true));
+
+		renderScreen(<RunsRouteComponent />);
+
+		expect(stalledQueryFn).toHaveBeenCalled();
+	});
+
+	it('issues the project-scoped stalled read once a non-admin filters to a project', () => {
+		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(false));
+		vi.mocked(runsIndexRoute.useSearch).mockReturnValue({ projectId: 'p1' } as never);
+
+		renderScreen(<RunsRouteComponent />);
+
+		expect(runsStalledQueryOptions).toHaveBeenCalledWith({ projectId: 'p1' });
+		expect(stalledQueryFn).toHaveBeenCalled();
 	});
 });

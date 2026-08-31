@@ -81,6 +81,19 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 	getPMProvider: vi.fn(),
 }));
 
+// The SCM registry the `stalled` procedure resolves a project's own pull-request
+// URL grammar through (`SCMProvider.pullRequestUrl`). Mocked at the registry
+// boundary rather than importing the integrations entrypoint, so these tests stay
+// a wiring check: *which* provider is asked, and what happens when none resolves.
+// Only the project-scoped lookup `stalled` resolves a pull-request URL grammar
+// through is stubbed; the rest of the registry stays real, because the config
+// schema's own credential-reference refinement (`src/config/schema.ts`) reads the
+// registered manifests and `createMockProjectConfig` parses through it.
+vi.mock('@/integrations/scm/registry.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/integrations/scm/registry.js')>()),
+	requireProjectSCMProvider: vi.fn(),
+}));
+
 vi.mock('@/queue/producer.js', () => ({
 	priorityFor: (job: { type: string }) => (job.type === 'pm' ? 10 : undefined),
 	removePendingJobById: vi.fn().mockResolvedValue(true),
@@ -173,6 +186,7 @@ import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { getWorker, getWorkers } from '@/identity/worker-service.js';
 import { getPMProvider } from '@/integrations/pm/registry.js';
+import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { type Checkpoint, DEFAULT_MAX_CONTINUATIONS } from '@/pipeline/checkpoint.js';
 import {
 	clearRunCancellation,
@@ -546,11 +560,24 @@ describe('runsRouter', () => {
 
 		beforeEach(() => {
 			vi.setSystemTime(new Date(SILENT_AT.getTime() + 2 * ITEM_STALL_AFTER_MS));
+			// The registry's own behaviour for a project naming no registered,
+			// runtime-ready provider: it throws (`src/integrations/scm/registry.ts`).
+			// The default here, so a test that says nothing about the provider
+			// exercises the unlinked path rather than a convenient fake.
+			vi.mocked(requireProjectSCMProvider).mockReset();
+			vi.mocked(requireProjectSCMProvider).mockImplementation(() => {
+				throw new Error('no runtime-ready SCM provider');
+			});
 		});
 
 		afterEach(() => {
 			vi.useRealTimers();
 		});
+
+		/** A provider stub carrying nothing but the pure URL grammar under test. */
+		function scmProviderSpelling(pullRequestUrl: (repo: string, pr: number | string) => string) {
+			return { pullRequestUrl } as unknown as ReturnType<typeof requireProjectSCMProvider>;
+		}
 
 		it('reports a silent unit with no recorded hand-off', async () => {
 			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
@@ -571,6 +598,70 @@ describe('runsRouter', () => {
 					stalledForMs: 2 * ITEM_STALL_AFTER_MS,
 				},
 			]);
+		});
+
+		// The link has to be the *project's own* provider's, spelled against the
+		// row's own repository (issue #683) — deriving `github.com/<repo>/pull/<n>`
+		// client-side is what sent a GitLab project's operators to a GitHub URL.
+		it.each([
+			[
+				'gitlab',
+				(repo: string, pr: number | string) => `https://gitlab.com/${repo}/-/merge_requests/${pr}`,
+				'https://gitlab.com/acme/widgets/-/merge_requests/92',
+			],
+			[
+				'bitbucket',
+				(repo: string, pr: number | string) => `https://bitbucket.org/${repo}/pull-requests/${pr}`,
+				'https://bitbucket.org/acme/widgets/pull-requests/92',
+			],
+		])('resolves a stalled pull request’s URL through the %s provider', async (_id, spelling, expected) => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
+			const project = createMockProjectConfig({ id: 'p1' });
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([project]);
+			vi.mocked(requireProjectSCMProvider).mockReturnValue(scmProviderSpelling(spelling));
+
+			const [item] = await caller.stalled({});
+
+			expect(requireProjectSCMProvider).toHaveBeenCalledWith(project);
+			expect(item.prUrl).toBe(expected);
+		});
+
+		// A board card links to its own card URL; asking a provider to spell a pull
+		// request it has no number for would only invent one.
+		it('leaves a work-item row unlinked to any pull request', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([
+				activityRow({
+					taskId: '103',
+					phase: 'implementation',
+					prNumber: null,
+					prTitle: null,
+					reviewVerdict: null,
+					workItemId: 'PVTI_abc',
+				}),
+			]);
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([createMockProjectConfig({ id: 'p1' })]);
+			vi.mocked(requireProjectSCMProvider).mockReturnValue(
+				scmProviderSpelling((repo, pr) => `https://example.test/${repo}/${pr}`),
+			);
+
+			const [item] = await caller.stalled({});
+
+			expect(item.unit).toBe('work-item');
+			expect(item.prUrl).toBeUndefined();
+			expect(requireProjectSCMProvider).not.toHaveBeenCalled();
+		});
+
+		// The whole point of the view is reporting work nobody is looking at, so one
+		// project whose provider does not resolve must cost that project's links —
+		// never the report.
+		it('still reports a row whose project resolves no provider', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
+			vi.mocked(listAllProjectsFromDb).mockResolvedValue([createMockProjectConfig({ id: 'p1' })]);
+
+			const [item] = await caller.stalled({});
+
+			expect(item.reference).toBe('92');
+			expect(item.prUrl).toBeUndefined();
 		});
 
 		it('reads both tables over the lookback window, unscoped, for an instanceAdmin', async () => {

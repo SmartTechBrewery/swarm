@@ -194,6 +194,22 @@ describe('GitHubSCMIntegration', () => {
 		});
 	});
 
+	// A pure grammar, so it is asserted as one: no credential, no request. The other
+	// two providers spell the same thing differently, which is why shared code asks
+	// the provider instead of deriving this URL itself.
+	describe('pullRequestUrl', () => {
+		it('spells GitHub’s own pull-request web path', () => {
+			expect(scm.pullRequestUrl('team/app', 42)).toBe('https://github.com/team/app/pull/42');
+			expect(scm.pullRequestUrl('team/app', '42')).toBe('https://github.com/team/app/pull/42');
+		});
+
+		// The repository is the caller's, not `project.repo`: a stalled row records
+		// the repository its run actually acted on (issue #683).
+		it('uses the repository it is handed rather than the project’s', () => {
+			expect(scm.pullRequestUrl('other/repo', 7)).toBe('https://github.com/other/repo/pull/7');
+		});
+	});
+
 	describe('getAggregateCheckStatus', () => {
 		const aggregate = {
 			totalCount: 1,

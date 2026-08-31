@@ -321,6 +321,15 @@ export class GitHubSCMIntegration implements SCMProvider {
 	}
 
 	/**
+	 * {@link SCMProvider.pullRequestUrl} — GitHub's `/pull/<number>` web path.
+	 * Pure and github.com-only, exactly like the clone URL this adapter builds
+	 * below: this integration targets github.com, not GitHub Enterprise.
+	 */
+	pullRequestUrl(repo: string, prNumber: number | string): string {
+		return `https://github.com/${repo}/pull/${prNumber}`;
+	}
+
+	/**
 	 * {@link SCMProvider.getAggregateCheckStatus} — every check on `ref`,
 	 * aggregated. Reads under the **reviewer** persona by default, the same scope
 	 * the review handler's aggregate query uses today.

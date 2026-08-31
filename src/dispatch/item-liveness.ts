@@ -108,6 +108,17 @@ export const StalledItemSchema = z.object({
 	runId: z.string(),
 	runStatus: z.string(),
 	prNumber: z.string().optional(),
+	/**
+	 * That pull request's **web** URL in the project's own source-control
+	 * provider's grammar (`SCMProvider.pullRequestUrl`), resolved by the API layer
+	 * (`src/api/routers/runs.ts`) — never assembled by a caller, which is how a
+	 * GitLab or Bitbucket project's stalled row would otherwise be linked to
+	 * `github.com`. Optional, and absent for exactly three reasons: the unit is a
+	 * `work-item` (which links to its board card instead), the row carries no
+	 * `prNumber`, or the project resolves no registered, runtime-ready provider —
+	 * a view of stalled work must not fail over an unlinkable row.
+	 */
+	prUrl: z.string().optional(),
 	prTitle: z.string().optional(),
 	workItemId: z.string().optional(),
 	workItemTitle: z.string().optional(),
