@@ -107,27 +107,35 @@ export function baseBranchRedDeliveryId(project: ProjectConfig, headSha: string)
 }
 
 /**
- * Read one repository's base-branch health. Never throws — every failure comes
- * back as `unknown` carrying the provider's own diagnostic.
+ * Read the health of **one named branch** of one repository. Never throws —
+ * every failure comes back as `unknown` carrying the provider's own diagnostic.
  *
- * Exported separately from the sweep because issue #873 reuses it to decide
- * whether a pull request's red CI is its own fault: it is a pure provider read
- * with no reporting side effects, and the reporting lives in the sweep.
+ * The branch is a parameter rather than `project.baseBranch` because the two are
+ * not always the same branch: the sweep below asks about the project's
+ * configured base, while issue #873's per-pull-request attribution must ask
+ * about the base *that pull request actually targets* — a retargeted pull
+ * request (say, moved from `main` onto `release/1.0`) would otherwise be judged
+ * against a branch it does not build against at all.
+ *
+ * Exported separately from the sweep because that attribution reuses it to
+ * decide whether a pull request's red CI is its own fault: it is a pure provider
+ * read with no reporting side effects, and the reporting lives in the sweep.
  */
 export async function readBaseBranchHealth(
 	project: ProjectConfig,
 	provider: SCMProvider,
+	baseBranch: string,
 ): Promise<BaseBranchHealth> {
 	let headSha: string | null;
 	try {
-		headSha = await provider.getBranchHead(project, project.baseBranch, SWEEP_PERSONA);
+		headSha = await provider.getBranchHead(project, baseBranch, SWEEP_PERSONA);
 	} catch (err) {
 		return { status: 'unknown', reason: `branch head read failed: ${describeError(err)}` };
 	}
 	if (headSha === null) {
 		return {
 			status: 'unknown',
-			reason: `the provider named no head commit for ${project.baseBranch}`,
+			reason: `the provider named no head commit for ${baseBranch}`,
 		};
 	}
 
@@ -146,7 +154,7 @@ export async function readBaseBranchHealth(
 	// number this read has none of.
 	const decision = decideAggregateCheckOutcome(
 		checkStatus,
-		project.baseBranch,
+		baseBranch,
 		project.pipeline?.review?.checks ?? 'required',
 	);
 	if (decision.action === 'respond-to-ci') {
@@ -264,7 +272,10 @@ async function sweepRepository(project: ProjectConfig): Promise<void> {
 	// `pipeline.review.enabled`, because base-branch health is not Review, and
 	// there is no automation-label gate either — that label is per work item, and
 	// this asks about a branch.
-	const health = await readBaseBranchHealth(project, provider);
+	// The project's configured base, which is the only branch this periodic sweep
+	// is about — per-pull-request attribution passes the pull request's own base
+	// instead (issue #873).
+	const health = await readBaseBranchHealth(project, provider, project.baseBranch);
 	if (health.status === 'unknown') {
 		logger.warn('base branch health: could not read the base branch this pass', {
 			...context,

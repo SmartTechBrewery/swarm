@@ -2154,6 +2154,62 @@ describe('review trigger — a red the base branch explains (issue #873)', () =>
 		});
 	});
 
+	// A pull request retargeted off the project's configured base still builds
+	// against the base it now names, so that is the branch the attribution asks
+	// about — reading `project.baseBranch` instead would both invent an
+	// explanation the PR never built against and withhold its CI fix.
+	describe('when the pull request targets a base other than the project default', () => {
+		const RELEASE_HEAD = 'release-head-sha';
+
+		beforeEach(() => {
+			getPullRequest.mockResolvedValue({
+				number: 9,
+				headBranch: 'issue-42',
+				headSha: 'cafe',
+				baseBranch: 'release/1.0',
+				baseSha: 'release-base-sha',
+				mergeable: true,
+				authorLogin: 'operator-human',
+				state: 'open',
+			});
+			getBranchHead.mockImplementation(async (_project: ProjectConfig, branch: string) =>
+				branch === 'release/1.0' ? RELEASE_HEAD : BASE_HEAD,
+			);
+		});
+
+		it('routes to Respond-to-CI when the project base is red but its own base is green', async () => {
+			aggregateByCommit({
+				cafe: PR_RED,
+				[RELEASE_HEAD]: checkStatus([['unit', 'completed', 'success']]),
+				[BASE_HEAD]: checkStatus([['unit', 'completed', 'failure']]),
+			});
+
+			expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+			expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'implementer');
+			expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, 'main', 'implementer');
+			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
+
+		it('blocks and names its own base when that base is red on the shared check', async () => {
+			aggregateByCommit({
+				cafe: PR_RED,
+				[RELEASE_HEAD]: checkStatus([['unit', 'completed', 'failure']]),
+			});
+
+			expect(await handler.handle(ctx(checks))).toBeNull();
+
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			const posted = deliveryPostComment.mock.calls[0][0];
+			expect(posted.body).toContain('`release/1.0`');
+			expect(posted.body).not.toContain('`main`');
+			expect(posted.body).toContain(RELEASE_HEAD.slice(0, 7));
+			expect(loggerInfo).toHaveBeenCalledWith(
+				expect.stringContaining('attributed to the base branch'),
+				expect.objectContaining({ baseBranch: 'release/1.0', baseHeadSha: RELEASE_HEAD }),
+			);
+		});
+	});
+
 	// The cost contract: the base is only ever read on an already-red aggregate.
 	it('never reads the base branch when the pull request is green', async () => {
 		aggregateByCommit({ cafe: checkStatus([['unit', 'completed', 'success']]) });

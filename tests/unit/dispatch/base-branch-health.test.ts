@@ -122,7 +122,7 @@ describe('baseBranchRedDeliveryId', () => {
 
 describe('readBaseBranchHealth', () => {
 	it('reports green when every check completed and none failed', async () => {
-		await expect(readBaseBranchHealth(PROJECT, SCM)).resolves.toEqual({
+		await expect(readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch)).resolves.toEqual({
 			status: 'green',
 			headSha: 'base-head-sha',
 		});
@@ -130,10 +130,20 @@ describe('readBaseBranchHealth', () => {
 		expect(getAggregateCheckStatus).toHaveBeenCalledWith(PROJECT, 'base-head-sha', 'implementer');
 	});
 
+	// The branch is a parameter, not `project.baseBranch`: issue #873 asks about
+	// the base a *pull request* targets, which a retarget can move off the
+	// project's configured one.
+	it('reads the branch it is given rather than the project base', async () => {
+		await readBaseBranchHealth(PROJECT, SCM, 'release/1.0');
+
+		expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'implementer');
+		expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, PROJECT.baseBranch, 'implementer');
+	});
+
 	it('reports red with exactly the failing check names', async () => {
 		getAggregateCheckStatus.mockResolvedValue(RED);
 
-		await expect(readBaseBranchHealth(PROJECT, SCM)).resolves.toEqual({
+		await expect(readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch)).resolves.toEqual({
 			status: 'red',
 			headSha: 'base-head-sha',
 			failedChecks: ['unit'],
@@ -145,7 +155,7 @@ describe('readBaseBranchHealth', () => {
 			checks([{ name: 'build', status: 'in_progress', conclusion: null }]),
 		);
 
-		await expect(readBaseBranchHealth(PROJECT, SCM)).resolves.toEqual({
+		await expect(readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch)).resolves.toEqual({
 			status: 'unsettled',
 			headSha: 'base-head-sha',
 		});
@@ -156,7 +166,7 @@ describe('readBaseBranchHealth', () => {
 	it('reports unsettled for zero checks under the default `required` policy', async () => {
 		getAggregateCheckStatus.mockResolvedValue(checks([]));
 
-		await expect(readBaseBranchHealth(PROJECT, SCM)).resolves.toEqual({
+		await expect(readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch)).resolves.toEqual({
 			status: 'unsettled',
 			headSha: 'base-head-sha',
 		});
@@ -171,7 +181,7 @@ describe('readBaseBranchHealth', () => {
 			},
 		});
 
-		await expect(readBaseBranchHealth(project, SCM)).resolves.toEqual({
+		await expect(readBaseBranchHealth(project, SCM, project.baseBranch)).resolves.toEqual({
 			status: 'green',
 			headSha: 'base-head-sha',
 		});
@@ -180,7 +190,7 @@ describe('readBaseBranchHealth', () => {
 	it('reports unknown when the branch head read throws, without reading checks', async () => {
 		getBranchHead.mockRejectedValue(new Error('404 not found'));
 
-		const health = await readBaseBranchHealth(PROJECT, SCM);
+		const health = await readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch);
 
 		expect(health.status).toBe('unknown');
 		expect(health).toMatchObject({ reason: expect.stringContaining('404 not found') });
@@ -190,7 +200,7 @@ describe('readBaseBranchHealth', () => {
 	it('reports unknown when the provider names no head commit, without reading checks', async () => {
 		getBranchHead.mockResolvedValue(null);
 
-		const health = await readBaseBranchHealth(PROJECT, SCM);
+		const health = await readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch);
 
 		expect(health.status).toBe('unknown');
 		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
@@ -199,7 +209,7 @@ describe('readBaseBranchHealth', () => {
 	it('reports unknown when the aggregate check read throws', async () => {
 		getAggregateCheckStatus.mockRejectedValue(new Error('provider unreachable'));
 
-		const health = await readBaseBranchHealth(PROJECT, SCM);
+		const health = await readBaseBranchHealth(PROJECT, SCM, PROJECT.baseBranch);
 
 		expect(health.status).toBe('unknown');
 		expect(health).toMatchObject({ reason: expect.stringContaining('provider unreachable') });
