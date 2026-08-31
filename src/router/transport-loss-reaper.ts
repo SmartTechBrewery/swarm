@@ -26,7 +26,10 @@
  * (`./dispatch-cancellation.ts`, issue #827). A worker with a live socket here again
  * is a blip that reconnected and is left alone; a worker still absent has its
  * dispatches ended through the seam both precedents already use,
- * `failDispatchResultWait`.
+ * `failDispatchResultWait`. The grace is measured from the **most recent** drop for
+ * each dispatch, not from whichever drop armed the firing timer: every drop arms its
+ * own grace and carries the generation that identifies it, so a timer that fires
+ * while a newer drop's grace is still running steps aside for it.
  *
  * Why connectivity here and not #827's `worker_sessions` silence heuristic: that
  * module never observed a close — its trigger is a *failed push*, which is ambiguous
@@ -48,8 +51,9 @@
 import { resolveHeartbeatTtlMs } from '../identity/worker-session-service.js';
 import { logger } from '../lib/logger.js';
 import {
+	countDispatchInterruptions,
+	type DispatchTransportLoss,
 	failDispatchResultWait,
-	type InterruptedDispatch,
 	resolveDispatchStreamTarget,
 } from './dispatch-results.js';
 import { persistControlPlaneNote, TRANSPORT_LOST_ORPHAN_NOTE } from './stream-log-persistence.js';
@@ -77,7 +81,7 @@ export const TRANSPORT_LOST_ORPHAN_REASON =
  */
 export function reapDispatchesIfTransportStaysLost(
 	workerId: string,
-	interrupted: InterruptedDispatch[],
+	interrupted: DispatchTransportLoss[],
 ): void {
 	// The ordinary case: a worker with nothing in flight here. Nothing to bound.
 	if (interrupted.length === 0) return;
@@ -103,10 +107,19 @@ export function reapDispatchesIfTransportStaysLost(
  * grace (its real result arrived, or something else ended the wait), or its id was
  * re-pushed elsewhere — `scheduleDispatchRetry` reuses dispatch ids across attempts,
  * so a later attempt's waiter must never be ended by an older drop's timer.
+ *
+ * The third way is time rather than identity, and it is why each loss carries its
+ * generation (review #5069436530, F1). Connectivity alone answers "is the worker here
+ * *now*?", not "has it been gone for the grace" — a worker that dropped, reconnected,
+ * and dropped again a moment before this timer fires is absent on both readings, so
+ * this timer would settle a dispatch whose real absence is milliseconds old and whose
+ * daemon is still climbing its reconnect ladder. Each drop arms its own grace, so
+ * deferring to the newest one loses no coverage: the later timer settles the dispatch
+ * a full grace after the later drop, which is the guarantee the docs state.
  */
 function settleIfTransportStayedLost(
 	workerId: string,
-	interrupted: InterruptedDispatch[],
+	interrupted: DispatchTransportLoss[],
 	graceMs: number,
 ): void {
 	if (isWorkerConnected(workerId)) {
@@ -116,9 +129,20 @@ function settleIfTransportStayedLost(
 		});
 		return;
 	}
-	for (const { dispatchId } of interrupted) {
+	for (const { dispatchId, interruptions } of interrupted) {
 		const target = resolveDispatchStreamTarget(dispatchId);
 		if (!target || target.workerId !== workerId) continue;
+		// A drop after the one this timer was armed for restarts the grace, and armed a
+		// timer of its own to enforce it. Ordering makes the comparison sufficient: a
+		// later drop can only have raised the count, and a re-push resets it to 0.
+		if (countDispatchInterruptions(dispatchId) !== interruptions) {
+			logger.info('worker transport lost: the transport dropped again — the later grace decides', {
+				workerId,
+				dispatchId,
+				graceMs,
+			});
+			continue;
+		}
 		// Before the settle, so the run's own stream corrects the note that promised
 		// output would resume "when it reconnects" — it never did.
 		persistControlPlaneNote(target.runId, TRANSPORT_LOST_ORPHAN_NOTE);

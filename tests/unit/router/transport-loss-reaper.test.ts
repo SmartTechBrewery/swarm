@@ -136,6 +136,66 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 		deregisterConnection(WORKER_ID, reconnected);
 	});
 
+	it('restarts the grace on a second drop: the earlier timer defers to the later one', async () => {
+		// Review #5069436530 F1. A flapping daemon: drop, reconnect, drop again just
+		// before the first grace expires. The first timer finds no live socket, but the
+		// dispatch's real absence is 1ms old — settling there would kill a phase whose
+		// worker is still climbing its reconnect ladder.
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		transportLost(WORKER_ID);
+		await vi.advanceTimersByTimeAsync(GRACE_MS / 2);
+		const reconnected = fakeWs();
+		registerConnection(WORKER_ID, reconnected);
+		await vi.advanceTimersByTimeAsync(GRACE_MS / 2 - 1);
+		// The replacement socket drops, 1ms before the first drop's grace elapses.
+		deregisterConnection(WORKER_ID, reconnected);
+		transportLost(WORKER_ID);
+
+		// The first timer fires here and must step aside for the second drop's grace.
+		await vi.advanceTimersByTimeAsync(1);
+		expect(await stillPending(awaiting.result)).toBe(true);
+		expect(persistControlPlaneNote).not.toHaveBeenCalled();
+
+		// Still pending right up to a full grace after the *second* drop, which landed
+		// 1ms before the first grace elapsed.
+		await vi.advanceTimersByTimeAsync(GRACE_MS - 2);
+		expect(await stillPending(awaiting.result)).toBe(true);
+		expect(persistControlPlaneNote).not.toHaveBeenCalled();
+
+		// And then the second drop's own timer settles it — the worker never returned.
+		await vi.advanceTimersByTimeAsync(1);
+		await expect(awaiting.result).resolves.toMatchObject({
+			status: 'failed',
+			reason: TRANSPORT_LOST_ORPHAN_REASON,
+		});
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
+	});
+
+	it('leaves a re-dropped dispatch alone when the worker is back by the later grace', async () => {
+		// The same sequence, except the daemon's ladder succeeds: nothing may be reaped,
+		// by either timer.
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+
+		transportLost(WORKER_ID);
+		await vi.advanceTimersByTimeAsync(GRACE_MS / 2);
+		const reconnected = fakeWs();
+		registerConnection(WORKER_ID, reconnected);
+		await vi.advanceTimersByTimeAsync(GRACE_MS / 2 - 1);
+		deregisterConnection(WORKER_ID, reconnected);
+		transportLost(WORKER_ID);
+
+		await vi.advanceTimersByTimeAsync(GRACE_MS / 2);
+		const settled = fakeWs();
+		registerConnection(WORKER_ID, settled);
+		await vi.advanceTimersByTimeAsync(GRACE_MS * 4);
+
+		expect(await stillPending(awaiting.result)).toBe(true);
+		expect(persistControlPlaneNote).not.toHaveBeenCalled();
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, settled);
+	});
+
 	it('touches only the dispatches that drop interrupted', async () => {
 		const orphan = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 		const elsewhere = awaitDispatchResult(OTHER_DISPATCH_ID, {

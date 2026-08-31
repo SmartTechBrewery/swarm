@@ -158,6 +158,23 @@ export interface AwaitedDispatch {
 export type InterruptedDispatch = AwaitedDispatch;
 
 /**
+ * An interrupted dispatch plus *which* of its drops this entry describes: the
+ * dispatch's `interruptions` count as of that drop, which is the only thing that
+ * distinguishes one loss for a dispatch from the next.
+ *
+ * It exists for the transport-loss reap (`./transport-loss-reaper.ts`, issue #859),
+ * whose grace is armed per observed loss and never cancelled. A worker that drops,
+ * reconnects, and drops again leaves two graces armed over the same dispatch, and the
+ * earlier one must not settle a dispatch whose latest drop is still well inside its
+ * own grace — so the reaper carries this generation and compares it, at fire time,
+ * against {@link countDispatchInterruptions} (review #5069436530, F1).
+ */
+export interface DispatchTransportLoss extends InterruptedDispatch {
+	/** The dispatch's `interruptions` count as of the drop this entry describes. */
+	interruptions: number;
+}
+
+/**
  * Register interest in a dispatch's back-channel frames before the assignment is
  * pushed, so a fast worker's ack/progress/result can never race ahead of the
  * registration. A second registration for the same `dispatchId` (a re-push of an
@@ -313,17 +330,35 @@ export function failDispatchResultWait(
  * Returning the entries rather than writing anything is deliberate: this module has
  * no database dependency and must keep none — the socket handler is what owns the
  * fire-and-forget note (`./stream-log-persistence.ts`).
+ *
+ * Each entry names the drop it came from ({@link DispatchTransportLoss}), so a caller
+ * that acts on this loss *later* can tell whether the dispatch has dropped again
+ * since — what the transport-loss reap's grace is measured from.
  */
-export function noteWorkerTransportLost(workerId: string): InterruptedDispatch[] {
+export function noteWorkerTransportLost(workerId: string): DispatchTransportLoss[] {
 	const at = new Date();
-	const interrupted: InterruptedDispatch[] = [];
+	const interrupted: DispatchTransportLoss[] = [];
 	for (const [dispatchId, entry] of pending) {
 		if (entry.workerId !== workerId) continue;
 		entry.interruptions += 1;
 		entry.lastInterruptedAt = at;
-		interrupted.push({ dispatchId, runId: entry.runId });
+		interrupted.push({ dispatchId, runId: entry.runId, interruptions: entry.interruptions });
 	}
 	return interrupted;
+}
+
+/**
+ * How many transport drops the dispatch awaited here under `dispatchId` has been
+ * through, or `undefined` when this router is awaiting no such dispatch.
+ *
+ * The read half of {@link DispatchTransportLoss}: a deferred decision compares the
+ * generation it recorded against this to learn whether the loss it was armed for is
+ * still the dispatch's most recent one. A re-pushed dispatch id starts a fresh
+ * registration at `0`, so a stale generation reads as "not the current loss" there
+ * too — the same conclusion, by the same comparison.
+ */
+export function countDispatchInterruptions(dispatchId: string): number | undefined {
+	return pending.get(dispatchId)?.interruptions;
 }
 
 /**

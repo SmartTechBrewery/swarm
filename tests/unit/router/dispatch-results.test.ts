@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
 	awaitDispatchResult,
+	countDispatchInterruptions,
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
@@ -305,7 +306,9 @@ describe('transport interruption bookkeeping', () => {
 		const onA = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		const onB = awaitDispatchResult(DISPATCH_B, TARGET_B);
 
-		expect(noteWorkerTransportLost(WORKER_A)).toEqual([{ dispatchId: DISPATCH_A, runId: 'run-a' }]);
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a', interruptions: 1 },
+		]);
 
 		expect(onA.interruptions()).toMatchObject({ count: 1 });
 		expect(onA.interruptions().lastAt).toBeInstanceOf(Date);
@@ -324,11 +327,31 @@ describe('transport interruption bookkeeping', () => {
 		expect(noteWorkerTransportRestored(WORKER_A)).toEqual([
 			{ dispatchId: DISPATCH_A, runId: 'run-a' },
 		]);
-		noteWorkerTransportLost(WORKER_A);
+		// Each loss names itself by the count as of that drop, so a caller that acts on
+		// one later can tell it apart from the next (review #5069436530, F1).
+		expect(noteWorkerTransportLost(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, runId: 'run-a', interruptions: 2 },
+		]);
 
 		expect(awaiting.interruptions().count).toBe(2);
+		expect(countDispatchInterruptions(DISPATCH_A)).toBe(2);
 
 		awaiting.dispose();
+	});
+
+	it('counts no interruptions for a dispatch this router is not awaiting', () => {
+		expect(countDispatchInterruptions(DISPATCH_A)).toBeUndefined();
+
+		// A re-push under the same id starts a fresh registration at zero, which is what
+		// makes an older drop's recorded generation read as stale there too.
+		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		noteWorkerTransportLost(WORKER_A);
+		expect(countDispatchInterruptions(DISPATCH_A)).toBe(1);
+		const second = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		expect(countDispatchInterruptions(DISPATCH_A)).toBe(0);
+
+		first.dispose();
+		second.dispose();
 	});
 
 	it('restores nothing for a worker whose transport never dropped', () => {
@@ -395,7 +418,7 @@ describe('transport interruption bookkeeping', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, runId: undefined });
 
 		expect(noteWorkerTransportLost(WORKER_A)).toEqual([
-			{ dispatchId: DISPATCH_A, runId: undefined },
+			{ dispatchId: DISPATCH_A, runId: undefined, interruptions: 1 },
 		]);
 		expect(awaiting.interruptions().count).toBe(1);
 

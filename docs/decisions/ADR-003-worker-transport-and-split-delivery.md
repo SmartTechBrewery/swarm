@@ -454,8 +454,9 @@ server-side store) it needs:
 
    The hook now also arms a bounded reap (`src/router/transport-loss-reaper.ts`). If the
    worker has no live socket here again after `max(2 × SWARM_WORKER_HEARTBEAT_TTL_MS,
-   2m)` — #827's worker-liveness window, extracted to `src/router/worker-liveness.ts` so
-   the two definitions cannot drift — each dispatch still awaited on it is ended through
+   2m)` measured from its latest drop — #827's worker-liveness window, extracted to
+   `src/router/worker-liveness.ts` so the two definitions cannot drift — each dispatch
+   still awaited on it is ended through
    the same `failDispatchResultWait` seam items 13 and #827 already use, with its own
    reason naming the transport, so run history tells it apart from a lease-window expiry
    and from an operator termination. Nothing new settles: the synthetic frame is a plain
@@ -468,13 +469,20 @@ server-side store) it needs:
    this signal comes from a socket this router owns and dispatches out of its own pending
    map, so writing them here would only duplicate what the unwind is about to write.
 
-   Two decisions worth recording. The grace is re-checked rather than cancelled — a blip
-   that reconnects inside it is left alone, and a dispatch that settled or whose id was
-   re-pushed elsewhere is skipped — and the test is **connectivity**, not #827's
+   Three decisions worth recording. The grace is re-checked rather than cancelled — a
+   blip that reconnects inside it is left alone, and a dispatch that settled or whose id
+   was re-pushed elsewhere is skipped. Because it is never cancelled, every drop arms a
+   grace of its own, and the one a dispatch is judged by is the **latest** one: each
+   recorded loss carries the interruption generation that identifies it
+   (`DispatchTransportLoss`), and a timer whose dispatch has dropped again since it was
+   armed defers to the newer drop's grace instead of settling a worker whose real
+   absence is a moment old and whose daemon is still climbing its reconnect ladder
+   (review #5069436530). Deferring costs no coverage — the later timer enforces the same
+   window from the later loss. Next, the test is **connectivity**, not #827's
    `worker_sessions` silence heuristic: #827 never observed a close (its trigger is an
    ambiguous failed push), whereas here the close was observed and the note only fires
    when no replacement socket is registered, so "is there a live socket for this worker
-   here again?" is the direct question and needs no Postgres read. And **no re-dispatch
+   here again?" is the direct question and needs no Postgres read. Last, **no re-dispatch
    follows**, by construction: `kind: 'error'` is not a deferrable kind. That is a policy
    choice, not an oversight — a Respond-to-review that had already pushed must not be
    replayed blindly — so re-running such a phase stays `swarm run reset`. A router
