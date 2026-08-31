@@ -700,9 +700,25 @@ describe('buildReviewHandoffRepairPrompt', () => {
 	it('scopes itself to reformatting, and keeps the read-only guard', () => {
 		const prompt = buildReviewHandoffRepairPrompt('verification: Array must contain at least 1');
 		expect(prompt).toContain('this is a formatting repair, not a re-review');
-		expect(prompt).toContain('Keep your findings, your severities, and your verdict as they are');
+		expect(prompt).toContain(
+			'Keep the findings, the severities, and the verdict it already records as they are',
+		);
 		expect(prompt).toContain('REVIEW ONLY');
 		expect(prompt).toContain('do not submit a review or perform any GitHub mutation');
+	});
+
+	// Issue #865 made the pass reachable in a *fresh* session on a self-minting CLI,
+	// so this prompt can no longer lean on the review prompt having been said first:
+	// it must carry both guards, and point at the hand-off on disk rather than at
+	// what the agent remembers.
+	it('stands alone for a fresh session: both guards, and the hand-off read off disk', () => {
+		const prompt = buildReviewHandoffRepairPrompt('summary: Required');
+		expect(prompt).toContain('You are a SWARM pipeline agent assigned to exactly one phase');
+		expect(prompt).toContain('Do NOT run `gh auth login`, `gh auth switch`, or `gh auth logout`');
+		expect(prompt).toContain(
+			`Read "${REVIEW_VERDICT_FILENAME}" first — it holds the findings, severities and verdict this pass must preserve`,
+		);
+		expect(prompt).not.toContain('as before');
 	});
 
 	it('asks a re-review to repair its `carried` list too', () => {

@@ -195,6 +195,43 @@ describe('runResolveConflictsPhase — migration-journal gate (issue #503/#508)'
 		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
 	});
 
+	// The other half of the same rule (issue #865). `codex`/`agy` mint their own
+	// thread id, so SWARM's assigned one names a session harness never created and
+	// `codex exec resume <assigned>` would exit 1 without reaching the model — the
+	// pass has to run fresh instead. This is the migration-journal call site's guard
+	// against someone reverting it to the old inline `?? sessionId` expression.
+	it('runs the repair pass fresh on a self-minting CLI whose merge reported no session id', async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ cli: 'codex' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			return agentResult({ cli: 'codex' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase({
+			...deps,
+			cli: 'codex',
+			sessionId: 'assigned-run-id',
+		});
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		const repairCall = deps.runAgent.mock.calls[1]?.[0];
+		expect(repairCall).toBeDefined();
+		expect('resumeSessionId' in (repairCall as object)).toBe(true);
+		expect(repairCall?.resumeSessionId).toBeUndefined();
+		// A fresh turn is a first turn, so the repair prompt has to carry the phase
+		// guard itself rather than inheriting it from the merge prompt.
+		expect(repairCall?.args?.[0]).toContain(
+			'You are a SWARM pipeline agent assigned to exactly one phase',
+		);
+		expect(repairCall?.args?.[0]).toContain(HANDOFF_FILENAMES.resolveConflicts);
+		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
+	});
+
 	it('fails the phase without delivering anything when the repair pass does not fix it', async () => {
 		const worktreePath = makeWorktree();
 		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);

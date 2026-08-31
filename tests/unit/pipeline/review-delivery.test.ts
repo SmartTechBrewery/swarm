@@ -244,8 +244,32 @@ describe('review body rendering', () => {
 			// are both on disk — it just starts a fresh session instead of addressing
 			// the run id, which is what died on PR #860.
 			expect(runAgent).toHaveBeenCalledTimes(2);
+			expect('resumeSessionId' in runAgent.mock.calls[1][0]).toBe(true);
 			expect(runAgent.mock.calls[1][0].resumeSessionId).toBeUndefined();
 			expect(submitReview).toHaveBeenCalledOnce();
+		});
+
+		// That fresh session is a *first* turn, holding the reviewer persona's
+		// `GH_TOKEN` in a checkout whose own `ai/RULES.md` §3 tells any agent to
+		// switch `gh` accounts — so the repair prompt must carry both guards itself
+		// rather than relying on the review prompt having said them earlier.
+		it('gives the fresh repair pass the phase and identity guards', async () => {
+			const { options } = deliveryDeps(
+				[structuredHandoff({ verdict: 'nonsense' }), structuredHandoff()],
+				{ cli: 'codex', sessionId: '27b0dc2e-2509-4644-b2db-3d2b6c863fab' },
+				{ cli: 'codex', sessionId: undefined },
+			);
+
+			await runReviewPhase(options);
+
+			const runAgent = options.runAgent as ReturnType<typeof vi.fn>;
+			const repairPrompt: string = runAgent.mock.calls[1][0].args[0];
+			expect(repairPrompt).toContain(
+				'You are a SWARM pipeline agent assigned to exactly one phase',
+			);
+			expect(repairPrompt).toContain(
+				'Do NOT run `gh auth login`, `gh auth switch`, or `gh auth logout`',
+			);
 		});
 
 		it('still offers claude the assigned id when its run reported none', async () => {

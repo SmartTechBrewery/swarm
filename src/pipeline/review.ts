@@ -635,8 +635,10 @@ function repairFailureError(original: unknown, outcome: ReviewRepairOutcome): Er
  * full passes (`attempts`, `src/queue/producer.ts`) for a model that mis-shapes
  * the JSON the same way each time. Since #470 moved the format's enforcement into
  * the schema, this is the only feedback path that enforcement has. A second
- * failure rethrows the *first* error, so the logs name the original defect rather
- * than whatever the repair pass made of it.
+ * failure fails with the *first* error's message as the **head** of a composed one
+ * that also says what the repair pass did, carrying the original error on `cause`
+ * — so the logs still name the original defect rather than whatever the repair
+ * pass made of it (see {@link repairFailureError}).
  */
 async function readReviewSubmission(
 	worktreePath: string,

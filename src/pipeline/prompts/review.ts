@@ -197,20 +197,41 @@ export function buildReviewPrompt(
  * stand. This asks for the hand-off file to be rewritten, not re-judged — a
  * repair that quietly changes the verdict to satisfy a slot rule would be worse
  * than the failure it replaces.
+ *
+ * Written for **either** session (issue #865). The pass resumes the review's own
+ * session where one is addressable, but on a self-minting CLI that reported no id
+ * it runs fresh (`repairSessionId` in `src/pipeline/resume.ts`), so this
+ * text may reach an agent that never saw the review. Two consequences it has to
+ * keep satisfying:
+ *
+ *  - It carries `pipelinePhaseGuard()` and `GH_IDENTITY_GUARD` itself rather than
+ *    relying on {@link buildReviewPrompt} having said them earlier in the session.
+ *    The pass runs with the reviewer persona's `GH_TOKEN` inside a checkout whose
+ *    own `CLAUDE.md` → `ai/RULES.md` §3 tells any agent to switch `gh` accounts;
+ *    a fresh turn not told to ignore that is the misattribution `agent-auth.ts`
+ *    documents. Both are idempotent for a resumed session that already saw them.
+ *  - It points at the hand-off **on disk** for the findings, severities and
+ *    verdict to preserve, never at what the agent remembers. A fresh pass has no
+ *    memory of the review, and the file is the only place that state now lives.
  */
 export function buildReviewHandoffRepairPrompt(
 	validationError: string,
 	isReReview = false,
 ): string {
 	return [
-		`The review you just completed is NOT submitted: the hand-off you wrote to "${REVIEW_VERDICT_FILENAME}" failed SWARM's validation.`,
+		...pipelinePhaseGuard(),
+		...GH_IDENTITY_GUARD,
+		'',
+		`A review of this checkout is NOT submitted: the hand-off written to "${REVIEW_VERDICT_FILENAME}" in this worktree failed SWARM's validation.`,
 		'',
 		'The validator reported:',
 		validationError,
 		'',
-		`Rewrite "${REVIEW_VERDICT_FILENAME}" so it satisfies every rule below. Keep your findings, your severities, and your verdict as they are — this is a formatting repair, not a re-review. Change a severity or the verdict only where the validator says they contradict each other, and where a required slot is missing, fill it from the evidence you already gathered (re-read the checkout if you must; never invent one).`,
+		`Read "${REVIEW_VERDICT_FILENAME}" first — it holds the findings, severities and verdict this pass must preserve, whether or not you remember writing them.`,
 		'',
-		'REVIEW ONLY, as before: do not edit any other file, do not commit, do not push, do not submit a review or perform any GitHub mutation. SWARM submits the decision after you exit.',
+		`Then rewrite "${REVIEW_VERDICT_FILENAME}" so it satisfies every rule below. Keep the findings, the severities, and the verdict it already records as they are — this is a formatting repair, not a re-review. Change a severity or the verdict only where the validator says they contradict each other, and where a required slot is missing, fill it from the evidence in that file, re-reading the checkout where the file is silent; never invent one.`,
+		'',
+		'REVIEW ONLY: do not edit any other file, do not commit, do not push, do not submit a review or perform any GitHub mutation. SWARM submits the decision after you exit.',
 		'',
 		...SEVERITY_RUBRIC,
 		'',
