@@ -19,7 +19,7 @@ const BLOCKING_SLOTS = {
 	failureScenario: 'Two events for one commit claim different keys, so Review runs twice.',
 	impact: 'A duplicate reviewer run per commit.',
 	fixPlan: ['Abbreviate at the boundary.'],
-	tests: 'Assert both kinds yield an equal headSha.',
+	tests: ['Assert both kinds yield an equal headSha.'],
 };
 
 function finding(overrides: Record<string, unknown> = {}) {
@@ -145,7 +145,7 @@ describe('ReviewHandoffSchema', () => {
 						category: 'consistency',
 						evidence: '`webhook.ts:337`.',
 						suggestion: 'Rename for symmetry.',
-						[field]: field === 'fixPlan' ? ['do it'] : 'text',
+						[field]: field === 'fixPlan' || field === 'tests' ? ['do it'] : 'text',
 					},
 				],
 			});
@@ -255,6 +255,106 @@ describe('ReviewHandoffSchema', () => {
 			});
 			expect(result.success).toBe(false);
 			expect(errorFor(result)).toContain('duplicate finding id F1');
+		});
+	});
+
+	// Issue #861: the schema and the prompt disagreed about `tests`'s cardinality —
+	// `fixPlan` said "an array" one clause earlier and `tests`'s only signal was an
+	// incidental string in an example. A model that continued the array pattern had
+	// its entire review discarded. Shape is now normalized; semantics are not.
+	describe('a coercible shape mismatch is normalized, not fatal', () => {
+		// The exact hand-off shape that failed live on SmartTechBrewery/swarm#860
+		// (dispatch 6b8aa8f3-7498-432a-bd1a-55b8bd3fc195, settled `failed` at attempt
+		// 0): a blocking finding whose `tests` is an array. It cost a complete review.
+		it('accepts the array-valued tests that discarded the review on PR #860', () => {
+			const result = parse({
+				verdict: 'request-changes',
+				findings: [finding({ tests: ['Assert the grace is measured from the latest drop.'] })],
+			});
+			expect(result.success).toBe(true);
+			expect(result.success && result.data.findings[0].tests).toEqual([
+				'Assert the grace is measured from the latest drop.',
+			]);
+		});
+
+		it('reads a bare string in a list slot as a one-element list', () => {
+			const result = parse({
+				verdict: 'request-changes',
+				preExisting: 'a pre-existing lint warning',
+				findings: [finding({ fixPlan: 'One step.', tests: 'Assert equality.' })],
+			});
+			expect(result.success).toBe(true);
+			if (!result.success) return;
+			expect(result.data.preExisting).toEqual(['a pre-existing lint warning']);
+			expect(result.data.findings[0].fixPlan).toEqual(['One step.']);
+			expect(result.data.findings[0].tests).toEqual(['Assert equality.']);
+		});
+
+		// Joined with a space rather than a newline: `compactFinding` renders
+		// `evidence` and `suggestion` inline in one Markdown line.
+		it('reads a list in a text slot back as one line of prose', () => {
+			const result = parse({
+				summary: ['Adds a normalization helper.', 'No behavior change.'],
+				findings: [
+					{
+						id: 'F1',
+						title: 'naming',
+						severity: 'nit',
+						category: 'consistency',
+						evidence: ['`a.ts:1`', 'and `b.ts:2`'],
+						suggestion: 'Rename for symmetry.',
+					},
+				],
+			});
+			expect(result.success).toBe(true);
+			if (!result.success) return;
+			expect(result.data.summary).toBe('Adds a normalization helper. No behavior change.');
+			expect(result.data.findings[0].evidence).toBe('`a.ts:1` and `b.ts:2`');
+			expect(result.data.summary).not.toContain('\n');
+		});
+
+		it('wraps a single object written bare into the array its slot wants', () => {
+			const result = parse({
+				verification: { command: 'npm run typecheck', outcome: 'passed' },
+				docsChecked: { path: 'README.md', status: 'accurate' },
+			});
+			expect(result.success).toBe(true);
+			if (!result.success) return;
+			expect(result.data.verification).toHaveLength(1);
+			expect(result.data.docsChecked).toHaveLength(1);
+		});
+
+		it.each([
+			['an empty list', { tests: [] }],
+			['a blank entry', { tests: [''] }],
+			['a non-string entry', { tests: [123] }],
+			['an empty evidence list', { evidence: [] }],
+			['a list of objects', { evidence: [{}] }],
+		])('still fails closed on %s', (_label, overrides) => {
+			expect(parse({ verdict: 'request-changes', findings: [finding(overrides)] }).success).toBe(
+				false,
+			);
+		});
+
+		// The rule that keeps normalization from becoming a loophole: the tier
+		// refinement runs after field parsing, so it sees the normalized value and
+		// judges it exactly as before.
+		it('still forbids a normalized tests slot on a nit', () => {
+			const result = parse({
+				findings: [
+					{
+						id: 'F1',
+						title: 'naming',
+						severity: 'nit',
+						category: 'consistency',
+						evidence: '`webhook.ts:337`.',
+						suggestion: 'Rename for symmetry.',
+						tests: 'Assert equality.',
+					},
+				],
+			});
+			expect(result.success).toBe(false);
+			expect(errorFor(result)).toContain('so tests must be omitted');
 		});
 	});
 
