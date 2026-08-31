@@ -154,6 +154,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'worker-authorization',
 	'preserved-worker',
 	'task-in-flight',
+	'pr-in-flight',
 	'manual-retry',
 	'recovered',
 ]);

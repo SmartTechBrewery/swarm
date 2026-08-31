@@ -76,6 +76,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// #761 that phase may be *queued* rather than running — an Implementation waiting
 	// on a Planning dispatch that has not started yet.
 	'task-in-flight': "waiting for the task's earlier phase to finish",
+	// Names the *pull request*, not a checkout: the phases that contend for a PR's head
+	// branch run in separate worktrees on purpose (issue #850), so "waiting for that
+	// checkout to free" would describe something that is not happening.
+	'pr-in-flight': 'waiting for another phase of its pull request to finish',
 	'manual-retry': 'manual retry',
 	recovered: 'recovered after a restart',
 };

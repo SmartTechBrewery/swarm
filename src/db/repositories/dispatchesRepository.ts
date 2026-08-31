@@ -138,8 +138,44 @@ export type DispatchWaitReason =
 	 * dropped redelivery from a sequenced phase.
 	 */
 	| 'task-in-flight'
+	/**
+	 * A **branch-writing phase behind another one executing against the same pull
+	 * request** (issue #850). What contends here is the PR's *head branch*, not a
+	 * checkout: Respond-to-review, Respond-to-CI and Resolve-conflicts each commit
+	 * and push to it, and they deliberately carry distinct suffixed task ids
+	 * (`<pr>-respond`, `<pr>-conflicts`, `<pr>-ci`) so they can run alongside a
+	 * Review — which is exactly why `task-in-flight` cannot see the collision. Two
+	 * of them at once meant the second one's push could not fast-forward and its
+	 * whole agent run was discarded (~18 minutes, live on `rover#101`).
+	 *
+	 * Only the three writing phases wait under this reason, and only behind an
+	 * *executing* writer ({@link findExecutingWritingDispatchForPullRequest}); a
+	 * deferred one lands back in `pending`, which that read does not count, so no
+	 * pair of dispatches can defer to each other. A **Review** neither holds the
+	 * pull request nor waits for it: it is pinned to a head SHA, so a deferred
+	 * Review would wake and review the wrong commit, and it is dropped as the
+	 * `skipped-pr-in-flight` outcome instead.
+	 *
+	 * Distinct from `task-in-flight` on purpose, and the copy must stay distinct
+	 * too: the two phases hold *different* checkouts, so "waiting for that checkout
+	 * to free" would be a lie about what this dispatch is waiting for.
+	 */
+	| 'pr-in-flight'
 	| 'manual-retry'
 	| 'recovered';
+
+/**
+ * The phases that commit and push to a pull request's head branch — the only
+ * ones that can contend for it (issue #850). `review` is absent deliberately:
+ * it checks the head out detached and read-only, so it never holds the PR and
+ * nothing ever waits behind it. `merge-automation` is absent for the reason it
+ * is absent from {@link findExecutingDispatchForTask}: it provisions nothing.
+ */
+export const BRANCH_WRITING_PHASES = [
+	'respond-to-review',
+	'respond-to-ci',
+	'resolve-conflicts',
+] as const satisfies readonly TriggerPhase[];
 
 /**
  * What a dispatch runs: a pipeline phase, or the agent-less merge-automation
@@ -163,12 +199,20 @@ export type DispatchPhase = TriggerPhase | 'merge-automation';
  * the **same** phase of a task that is already executing that phase — a repeated
  * delivery. A *different* phase of the same task is the pipeline advancing through
  * one shared checkout, and waits as `task-in-flight` instead of settling here.
+ *
+ * `skipped-pr-in-flight` is just as narrow (issue #850): a **Review** dropped
+ * because a writing phase of the same pull request is executing and about to
+ * replace the head it is pinned to. It is not a duplicate — no other Review ran —
+ * and not an eligibility refusal; the writer's own follow-up covers the new head,
+ * and the dropped Review hands back its dedup claim and its verdict reservation so
+ * it spends no ledger slot.
  */
 export type DispatchOutcome =
 	| 'phase-succeeded'
 	| 'no-trigger'
 	| 'skipped-duplicate'
 	| 'skipped-not-eligible'
+	| 'skipped-pr-in-flight'
 	| 'superseded'
 	| 'merged'
 	| 'merge-not-eligible'
@@ -281,24 +325,45 @@ export async function claimDispatch(
 }
 
 /**
+ * What a claim resolved the trigger to — one shape for both writers below, so the
+ * columns they normalize cannot drift apart.
+ */
+export interface DispatchResolution {
+	taskId: string;
+	phase: TriggerPhase;
+	/**
+	 * The pull request this phase acts on, keyed as the PR-scoped hold reads it
+	 * (issue #850). Absent for a board-driven phase, which acts on a card.
+	 */
+	pullRequest?: { repository: string; prNumber: string };
+}
+
+/**
  * Mark a claimed dispatch `running` against its run row, renewing the lease to
  * cover the phase's effective wall-clock timeout (plus the caller's margin) so
  * a live run is never reclaimed mid-flight.
+ *
+ * It re-writes the resolution columns {@link recordDispatchResolution} already
+ * wrote, deliberately: that write is best-effort (a DB hiccup is logged and the
+ * phase continues), and a row missing them is invisible to the guards keyed on
+ * them — so writing them again here narrows that blind spot to the gap before the
+ * run starts.
  */
 export async function markDispatchRunning(
 	id: string,
 	runId: string | undefined,
 	leaseUntil: Date,
-	taskId: string,
-	phase: TriggerPhase,
+	resolution: DispatchResolution,
 ): Promise<boolean> {
 	const rows = await getDb()
 		.update(dispatches)
 		.set({
 			state: 'running',
 			runId,
-			taskId,
-			phase,
+			taskId: resolution.taskId,
+			phase: resolution.phase,
+			repository: resolution.pullRequest?.repository,
+			prNumber: resolution.pullRequest?.prNumber,
 			leaseExpiresAt: leaseUntil,
 			updatedAt: new Date(),
 		})
@@ -307,15 +372,24 @@ export async function markDispatchRunning(
 	return rows.length > 0;
 }
 
-/** Record the resolved task/phase on a claimed dispatch (before a run row exists). */
+/**
+ * Record what the trigger resolved on a claimed dispatch (before a run row
+ * exists): the task and phase the Queue UI names a waiting dispatch by, plus the
+ * pull request the PR-scoped hold is keyed on (issue #850).
+ */
 export async function recordDispatchResolution(
 	id: string,
-	taskId: string,
-	phase: TriggerPhase,
+	resolution: DispatchResolution,
 ): Promise<void> {
 	await getDb()
 		.update(dispatches)
-		.set({ taskId, phase, updatedAt: new Date() })
+		.set({
+			taskId: resolution.taskId,
+			phase: resolution.phase,
+			repository: resolution.pullRequest?.repository,
+			prNumber: resolution.pullRequest?.prNumber,
+			updatedAt: new Date(),
+		})
 		.where(eq(dispatches.id, id));
 }
 
@@ -924,6 +998,87 @@ export async function findActivePlanningDispatchForTask(
 		.orderBy(asc(dispatches.createdAt))
 		.limit(1);
 	return rows[0];
+}
+
+/**
+ * The attempt currently executing a phase that **writes to this pull request's
+ * head branch**, and which phase it is — the PR-scoped half of the in-flight
+ * guard (issue #850). {@link findExecutingDispatchForTask} cannot answer this: it
+ * keys on the worktree task id, and the four PR-driven phases carry deliberately
+ * distinct suffixed ids, so no two phases of one pull request ever match there.
+ *
+ * Four legs carry the meaning:
+ *
+ * - Only {@link EXECUTING_DISPATCH_STATES}, for the same reason the task reads
+ *   count only those: a queued attempt has pushed nothing, and treating one as a
+ *   holder would make the wait it feeds unwakeable and admit a mutual defer.
+ * - Only {@link BRANCH_WRITING_PHASES}. A `review` holds nothing (it checks the
+ *   head out detached and read-only) and neither does `merge-automation`, so
+ *   nothing ever waits behind either.
+ * - **Keyed on the normalized `repository`/`pr_number` columns**, written when a
+ *   claim resolves the trigger. Reaching into `jobPayload` for a PR number would
+ *   put a provider-shaped path in shared code (ai/RULES.md §2). `repository` is in
+ *   the key because a project spans several repositories (issue #684) and PR `42`
+ *   in one is not PR `42` in another.
+ * - `excludeDispatchId` skips **the asking dispatch**, which is already `leased`
+ *   with its own coordinates recorded and would otherwise find itself.
+ *
+ * One deliberate difference from {@link findExecutingDispatchForTask}: a **null
+ * `phase` does not match**. That read treats null as "some other phase" because
+ * only a *known* match may justify discarding work; here the verdict turns on
+ * *which* phase holds the pull request, so an unrecorded phase cannot be assumed
+ * to be a writer — assuming it would defer a Review behind a Review.
+ *
+ * One indexed row at most, on `(project_id, state)` — the same read cost the task
+ * guard beside it already pays on the dispatch path.
+ */
+export async function findExecutingWritingDispatchForPullRequest(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+	excludeDispatchId?: string,
+): Promise<{ id: string; phase: string | null } | undefined> {
+	const rows = await getDb()
+		.select({ id: dispatches.id, phase: dispatches.phase })
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.repository, repository),
+				eq(dispatches.prNumber, prNumber),
+				inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
+				inArray(dispatches.phase, [...BRANCH_WRITING_PHASES]),
+				...(excludeDispatchId ? [ne(dispatches.id, excludeDispatchId)] : []),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt))
+		.limit(1);
+	return rows[0];
+}
+
+/**
+ * The dispatches waiting for this pull request's head branch to free (issue #850)
+ * — what a settling writing phase wakes, the exact twin of
+ * {@link listTaskInFlightWaits} over the PR key.
+ */
+export async function listPullRequestInFlightWaits(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.repository, repository),
+				eq(dispatches.prNumber, prNumber),
+				eq(dispatches.state, 'pending'),
+				eq(dispatches.waitReason, 'pr-in-flight'),
+			),
+		)
+		.orderBy(asc(dispatches.availableAt), asc(dispatches.createdAt));
 }
 
 /**

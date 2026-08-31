@@ -1,0 +1,22 @@
+-- Issue #850: a dispatch now records the pull request its phase acts on, so the
+-- claim point can serialize the phases that contend for one PR's head branch. The
+-- in-flight guard from #759 is keyed on the worktree task id, and the PR-driven
+-- phases deliberately carry distinct suffixed ids (`<pr>`, `<pr>-respond`,
+-- `<pr>-conflicts`, `<pr>-ci`), so nothing held the artifact they actually share.
+--
+-- `repository` is denormalized beside `project_id` in `ProjectConfig.repo`'s
+-- `owner/repo` form, exactly as `runs.repository` (issue #683) and
+-- `review_verdicts.repository` already are: a project id alone stopped identifying a
+-- repository at issue #684.
+--
+-- Both columns are nullable with **no backfill**, unlike `runs.repository`. They are
+-- written when a claim resolves the trigger (`recordDispatchResolution` /
+-- `markDispatchRunning`), and only an *executing* dispatch can hold a pull request —
+-- so every row that could ever hold one passes through those writers first. Existing
+-- rows are either terminal or will be re-resolved when they are next claimed, and the
+-- board-driven phases act on a card rather than a PR and leave both null for ever.
+--
+-- No new index: both reads filter on `(project_id, state)` first, which
+-- `idx_dispatches_project_state` already covers.
+ALTER TABLE "dispatches" ADD COLUMN "repository" text;--> statement-breakpoint
+ALTER TABLE "dispatches" ADD COLUMN "pr_number" text;

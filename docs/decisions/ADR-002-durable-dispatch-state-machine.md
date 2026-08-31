@@ -98,6 +98,25 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   one-directional and needs no new state, value, or migration: a yielding Implementation
   returns to `pending`, which the executing read does not count, so two dispatches can
   never defer to each other.
+- **Phase sequencing within one pull request** is the third (`wait_reason =
+  'pr-in-flight'`, issue #850). The wait above cannot see it: it keys on the worktree
+  task id, and the four PR-driven phases carry deliberately distinct suffixed ids
+  (`<pr>`, `<pr>-respond`, `<pr>-conflicts`, `<pr>-ci`) precisely so they can hold
+  separate checkouts. What they contend for is the pull request's **head branch**, which
+  the row now records as normalized `repository` + `pr_number` columns written when a
+  claim resolves the trigger — never read out of `jobPayload` (`ai/RULES.md` §2). Only
+  the three *branch-writing* phases (`respond-to-review`, `respond-to-ci`,
+  `resolve-conflicts`) hold it, and the verdict depends on who is asking: a writing
+  phase **defers** and is woken by the holder settling, while a **Review is dropped**
+  (completed `skipped-pr-in-flight`, its PR+SHA dedup claim released and its verdict
+  reservation abandoned so no ledger slot is spent) because it is pinned to a head SHA
+  and would otherwise wake to review a commit the writer has already replaced — the
+  re-review of the new head is already covered by the writer's own follow-up. This
+  cannot deadlock for the same reasons the task waits cannot: only *executing* rows
+  hold, so a deferred writer back in `pending` is not counted, and a Review is neither a
+  holder nor a waiter, so no pair of dispatches of one pull request can defer to each
+  other. Both new reads fail open — a DB hiccup must never turn into a dropped or
+  stalled dispatch.
 - **Retries.** Rate-limit/capacity/timeout/abort/delivery deferrals derive the next
   attempt's payload (session resume, PM dispatch intent, attempt counter) **inside the
   worker's settle path** and persist it on the dispatch as `retry-scheduled` before any

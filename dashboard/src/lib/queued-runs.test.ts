@@ -85,6 +85,15 @@ describe('queuedWaitReasonLabel', () => {
 			"waiting for the task's earlier phase to finish",
 		);
 	});
+
+	// Issue #850: the wait is on the *pull request*, and the phases that contend for it
+	// run in separate worktrees on purpose — so this copy must not borrow the checkout
+	// wording above, which would describe something that is not happening.
+	it('names the pull request for a phase waiting on its head branch', () => {
+		expect(queuedWaitReasonLabel('pr-in-flight')).toBe(
+			'waiting for another phase of its pull request to finish',
+		);
+	});
 });
 
 describe('queuedWorkItemLabel', () => {

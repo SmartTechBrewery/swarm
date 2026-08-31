@@ -313,13 +313,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				expect(claim.claimed).toBe(true);
 				// The reproduction's shape: the phase is executing, on a lease that will not
 				// expire for another 50 minutes.
-				await markDispatchRunning(
-					dispatch.id,
-					runId,
-					new Date(Date.now() + 3_000_000),
-					'719',
-					'implementation',
-				);
+				await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 3_000_000), {
+					taskId: '719',
+					phase: 'implementation',
+				});
 				return { worker, session, runId, dispatchId: dispatch.id };
 			}
 

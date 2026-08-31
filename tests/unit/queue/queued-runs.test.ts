@@ -18,6 +18,8 @@ function makeDispatch(overrides: Partial<DispatchRow> = {}): DispatchRow {
 		projectId: 'p1',
 		taskId: null,
 		phase: null,
+		repository: null,
+		prNumber: null,
 		state: 'pending',
 		waitReason: null,
 		outcome: null,

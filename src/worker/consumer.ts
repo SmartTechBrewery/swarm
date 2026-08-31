@@ -27,15 +27,18 @@
 import type { AgentDefaults, ProjectConfig } from '../config/schema.js';
 import { getAppSettings } from '../db/repositories/appSettingsRepository.js';
 import {
+	BRANCH_WRITING_PHASES,
 	cancelClaimedDispatch,
 	claimWorkerForDispatch,
 	completeDispatch,
+	type DispatchResolution,
 	type DispatchRow,
 	type DispatchWaitReason,
 	deferDispatchToPending,
 	failDispatch,
 	findActivePlanningDispatchForTask,
 	findExecutingDispatchForTask,
+	findExecutingWritingDispatchForPullRequest,
 	markDispatchRunning,
 	recordDispatchResolution,
 	scheduleDispatchRetry,
@@ -68,6 +71,7 @@ import {
 	parseDispatchPayload,
 	promoteAvailabilityWaitsForWorker,
 	promoteNextCapacityDispatch,
+	promotePullRequestInFlightWaits,
 	promoteTaskInFlightWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
@@ -1248,6 +1252,152 @@ async function handleTaskInFlightDeferral(
 }
 
 /**
+ * Hand back the review-verdict reservation a Review took before it ran (issue
+ * #235), so a phase that reviewed nothing spends no ledger slot. Shared by the two
+ * gates that drop a Review before it runs — the automation-label opt-out, and the
+ * PR-scoped hold (issue #850) — so the two cannot drift on what a dropped Review
+ * owes back.
+ *
+ * Best-effort and logged rather than thrown: the reservation is keyed on the head
+ * SHA, so a failed hand-back costs at worst one slot on a commit nothing is going
+ * to review again, while throwing here would fail a dispatch that is being settled
+ * deliberately.
+ */
+async function abandonReviewReservation(
+	project: ProjectConfig,
+	prNumber: string,
+	headSha: string,
+): Promise<void> {
+	try {
+		await abandonReviewVerdict({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber,
+			headSha,
+		});
+	} catch (error) {
+		logger.warn('Could not abandon skipped Review verdict reservation', {
+			projectId: project.id,
+			prNumber,
+			headSha,
+			error: describeError(error),
+		});
+	}
+}
+
+/**
+ * Handle a phase whose **pull request** already has a phase mid-flight writing to
+ * its head branch (issue #850). The contended artifact here is the pull request,
+ * not a checkout: the four PR-driven phases carry deliberately distinct suffixed
+ * task ids so they can run alongside each other, which is exactly why
+ * `task-in-flight` cannot see this collision — and three of them commit and push to
+ * the same branch, so the second one's push cannot fast-forward and its whole agent
+ * run is discarded (~18 minutes, live on `rover#101`).
+ *
+ * The verdict depends on the asking phase, because the two are not the same
+ * problem:
+ *
+ * - **A writing phase defers** as `pr-in-flight` and is woken when the holder
+ *   settles ({@link promotePullRequestInFlightWaits}, from `processJob`'s `finally`
+ *   — every settle path, success or not). Its work is still wanted; it just has to
+ *   push onto the head the holder leaves behind. The stated reason names the *pull
+ *   request*, since "waiting for that checkout to free" would be a lie — the two
+ *   phases hold different checkouts.
+ * - **A Review is dropped.** It is pinned to a head SHA, so deferring it would wake
+ *   it to review a commit the writer has already replaced. The re-review for the
+ *   commit the writer actually pushes is already covered — `scheduleFollowUpReview`
+ *   for Respond-to-review, the new head's own `checks` event for Respond-to-CI and
+ *   Resolve-conflicts, `src/dispatch/ci-no-fix-recovery.ts` for a `no-fix`
+ *   conclusion — so nothing is lost, while a Review that ran here would review a
+ *   head about to vanish, announce itself as a re-review, and spend one of the three
+ *   permitted verdict slots (issue #235) doing it.
+ *
+ * Only writers hold and only while executing, so this can never deadlock: a Review
+ * neither holds nor waits, and a deferred writer lands back in `pending`, which the
+ * read does not count. The post-defer re-check closes the same-instant window
+ * exactly as {@link handleTaskInFlightDeferral}'s does.
+ */
+async function handlePullRequestInFlight(
+	dispatch: DispatchRow,
+	job: SwarmJob,
+	trigger: PullRequestTrigger,
+	project: ProjectConfig,
+	hold: PullRequestHold,
+): Promise<JobOutcome> {
+	const holding = `its ${hold.phase} phase`;
+
+	if (trigger.phase === 'review') {
+		const reason = `Pull request #${trigger.prNumber} has ${holding} writing to branch '${trigger.prBranch}', which replaces the head '${trigger.headSha}' this review is pinned to`;
+		logger.info('Phase skipped — a writing phase holds this pull request', {
+			projectId: project.id,
+			phase: trigger.phase,
+			holdingPhase: hold.phase,
+			taskId: trigger.taskId,
+			prNumber: trigger.prNumber,
+			headSha: trigger.headSha,
+		});
+		// Hand back every handler-side claim this dispatch took, exactly as the
+		// automation-label gate does for a phase that consumed nothing. Releasing the
+		// PR+SHA dispatch slot re-opens *this* head to a later Review — deliberately:
+		// no review was submitted for it, so the claim's "never hand it back once a
+		// verdict landed" rule does not apply, and a writing phase that ends up pushing
+		// nothing (a failed Resolve-conflicts, a `pushed-back` response) leaves this head
+		// as the PR's real one, which a retained claim would make unreviewable until its
+		// TTL lapsed.
+		await releaseReviewDispatch(
+			buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+		);
+		// The acceptance criterion this whole branch exists for: no ledger slot spent.
+		await abandonReviewReservation(project, trigger.prNumber, trigger.headSha);
+		// A dispatch that already waited for something else (project capacity, a worker)
+		// carries the run row of that wait; leaving it `deferred` behind a terminal
+		// dispatch would have the startup backfill resurrect it, so it is finalized with
+		// the stated reason — the same trade-off the `skipped-duplicate` branch makes,
+		// and the reason text is what tells an operator this was a deliberate skip
+		// rather than a broken run.
+		if (job.runId) {
+			await finalizeRun(job.runId, { status: 'failed', error: reason });
+		}
+		await tryCompleteDispatch(dispatch.id, 'skipped-pr-in-flight');
+		return { status: 'skipped-in-flight', phase: trigger.phase, taskId: trigger.taskId };
+	}
+
+	const reason = `Pull request #${trigger.prNumber} has ${holding} writing to branch '${trigger.prBranch}' — waiting for it to settle`;
+	logger.info(
+		`Phase deferred - ${phaseLabel(trigger.phase)} — the pull request has ${holding} writing to it`,
+		{
+			projectId: project.id,
+			phase: trigger.phase,
+			holdingPhase: hold.phase,
+			taskId: trigger.taskId,
+			prNumber: trigger.prNumber,
+		},
+	);
+	const { outcome, pending } = await deferBeforeRun(dispatch, job, trigger, project, {
+		waitReason: 'pr-in-flight',
+		reason,
+	});
+	if (pending) {
+		try {
+			const stillHeld = await findPullRequestHold(
+				project.id,
+				pullRequestRefForTrigger(project, trigger),
+				dispatch.id,
+			);
+			if (!stillHeld) await publishDispatchWakeUp(pending);
+		} catch (err) {
+			logger.warn('Could not re-check a pr-in-flight wait after deferring it', {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				prNumber: trigger.prNumber,
+				error: describeError(err),
+			});
+		}
+	}
+	return outcome;
+}
+
+/**
  * Which phase currently holds each task's checkout in *this* worker process,
  * keyed by the worktree task id a phase provisions (`task-<id>`,
  * `src/worker/git-worktree-manager.ts`).
@@ -1349,31 +1499,152 @@ async function findTaskHold(
 }
 
 /**
- * Claim this task's checkout for the phase about to run, or report what is already
- * holding it (issue #759).
+ * The pull request a phase acts on, keyed exactly as the PR-scoped hold reads it
+ * (issue #850).
+ */
+interface PullRequestRef {
+	repository: string;
+	prNumber: string;
+}
+
+/** The trigger results that carry a pull request — the four PR-driven phases. */
+type PullRequestTrigger = Extract<TriggerResult, { prNumber: string }>;
+
+/** The PR-driven half of a trigger, or `undefined` for a board-driven phase. */
+function pullRequestTrigger(trigger: TriggerResult): PullRequestTrigger | undefined {
+	return 'prNumber' in trigger ? trigger : undefined;
+}
+
+/**
+ * The pull request this dispatch acts on, or `undefined` for a board-driven phase
+ * (issue #850). `project.repo` is the **job-scoped** repository (see `processJob`'s
+ * own comment on that read), which is what `runs.repository` records too, so the
+ * hold key and the phase's actual repository cannot drift.
+ */
+function pullRequestRefForTrigger(
+	project: ProjectConfig,
+	trigger: TriggerResult,
+): PullRequestRef | undefined {
+	const pr = pullRequestTrigger(trigger);
+	return pr ? { repository: project.repo, prNumber: pr.prNumber } : undefined;
+}
+
+/** What a claim resolved, for the two writers that normalize it onto the row. */
+function dispatchResolutionFor(project: ProjectConfig, trigger: TriggerResult): DispatchResolution {
+	return {
+		taskId: trigger.taskId,
+		phase: trigger.phase,
+		pullRequest: pullRequestRefForTrigger(project, trigger),
+	};
+}
+
+/** What is keeping a phase off this pull request's head branch, if anything. */
+interface PullRequestHold {
+	/**
+	 * The holding phase — always one of {@link BRANCH_WRITING_PHASES}, unlike
+	 * {@link TaskHold}'s, which may be null. The read matches a *named* writing phase
+	 * only: the verdict here turns on which phase holds the pull request, so a row
+	 * whose phase was never recorded cannot be assumed to be a writer.
+	 */
+	phase: string;
+}
+
+/**
+ * The durable PR-scoped hold beside the task one: which phase is mid-flight
+ * writing to this pull request's head branch (issue #850). Shared by the claim and
+ * by the post-defer re-check so both ask exactly the same question, and answering
+ * `undefined` with no read at all for a board-driven phase, which carries no pull
+ * request and pays nothing.
  *
- * Two legs, in this order, because both are load-bearing:
+ * **Fails open**, exactly as {@link findTaskHold} does: a read error is logged and
+ * treated as *no* hold, because failing closed would turn a DB hiccup into the
+ * dropped or stalled dispatch this guard exists to remove — and phase 2/2's
+ * delivery-time report of a branch that moved is still underneath it.
+ */
+async function findPullRequestHold(
+	projectId: string,
+	ref: PullRequestRef | undefined,
+	dispatchId: string,
+): Promise<PullRequestHold | undefined> {
+	if (!ref) return undefined;
+	try {
+		const writing = await findExecutingWritingDispatchForPullRequest(
+			projectId,
+			ref.repository,
+			ref.prNumber,
+			dispatchId,
+		);
+		// `writing.phase` is non-null by construction (the read filters on the writing
+		// phases by name); the guard is what that guarantee looks like against a column
+		// the schema types nullable, and it fails open like everything else here.
+		if (writing?.phase) return { phase: writing.phase };
+	} catch (err) {
+		logger.warn('Could not read the writing dispatch for this pull request (assuming none)', {
+			projectId,
+			repository: ref.repository,
+			prNumber: ref.prNumber,
+			error: describeError(err),
+		});
+	}
+	return undefined;
+}
+
+/**
+ * Claim what the phase about to run needs — this task's checkout (issue #759) and
+ * the pull request it writes to (issue #850) — or report what is already holding
+ * one of them.
  *
- * 1. The **durable** record ({@link findTaskHold}) — awaited first so the in-memory
- *    pair below stays synchronous. It is what makes the verdict independent of which
- *    worker the dispatch was routed to, which the in-memory map alone never was
- *    ("already running in *this* worker").
- * 2. The **in-process** map, read and written with nothing awaited in between,
+ * Three legs. Both **durable** reads are awaited first, so the in-memory pair
+ * below stays synchronous:
+ *
+ * 1. The task record ({@link findTaskHold}) — what makes the verdict independent of
+ *    which worker the dispatch was routed to, which the in-memory map alone never
+ *    was ("already running in *this* worker").
+ * 2. The pull request ({@link findPullRequestHold}) — the artifact the four
+ *    PR-driven phases contend for, which the task key cannot see because those
+ *    phases carry deliberately distinct suffixed ids. Read only when the task is
+ *    free, since a task hold already defers this dispatch and keeps reporting
+ *    today's reason.
+ * 3. The **in-process** map, read and written with nothing awaited in between,
  *    which is what closes the same-process BullMQ-concurrency window the durable
- *    read cannot: two jobs claimed milliseconds apart are both `leased` with no
+ *    reads cannot: two jobs claimed milliseconds apart are both `leased` with no
  *    `phase` recorded yet. A hit there is always an executing phase — this process
  *    records the map entry as it starts running the phase.
+ *
+ * The map deliberately keeps winning over the durable holds, exactly as before
+ * #850: it is the most specific answer this process has ("that phase is running
+ * here, now"), and both orders defer either way — only the reported reason differs.
+ * The task hold in turn keeps precedence over the PR hold, so today's
+ * `skipped-duplicate` verdict is untouched.
+ *
+ * The verdict is discriminated rather than a bare hold because the two kinds settle
+ * differently, and because both refusals return *before* the map entry is taken —
+ * which is what keeps a refusal from leaking an entry `processJob`'s `finally` would
+ * never clear.
  */
 async function claimTaskForPhase(
-	projectId: string,
+	project: ProjectConfig,
 	trigger: TriggerResult,
 	dispatchId: string,
-): Promise<{ claimed: true } | { claimed: false; hold: TaskHold }> {
-	const durableHold = await findTaskHold(projectId, trigger, dispatchId);
+): Promise<
+	| { claimed: true }
+	| { claimed: false; kind: 'task'; hold: TaskHold }
+	| { claimed: false; kind: 'pull-request'; hold: PullRequestHold; trigger: PullRequestTrigger }
+> {
+	const durableHold = await findTaskHold(project.id, trigger, dispatchId);
+	const prTrigger = pullRequestTrigger(trigger);
+	const prHold = durableHold
+		? undefined
+		: await findPullRequestHold(project.id, pullRequestRefForTrigger(project, trigger), dispatchId);
 	// Synchronous from here to the `set` below.
 	const holding = inFlightPhaseByTask.get(trigger.taskId);
-	if (holding !== undefined) return { claimed: false, hold: { phase: holding, executing: true } };
-	if (durableHold) return { claimed: false, hold: durableHold };
+	if (holding !== undefined)
+		return { claimed: false, kind: 'task', hold: { phase: holding, executing: true } };
+	if (durableHold) return { claimed: false, kind: 'task', hold: durableHold };
+	// `prHold` is resolved only from a trigger carrying a pull request, so the
+	// narrowed trigger the PR verdict needs necessarily exists here.
+	if (prHold && prTrigger)
+		return { claimed: false, kind: 'pull-request', hold: prHold, trigger: prTrigger };
 	inFlightPhaseByTask.set(trigger.taskId, trigger.phase);
 	return { claimed: true };
 }
@@ -3693,10 +3964,16 @@ export async function processJob(
 		return settleNoTriggerDelivery(job, project, dispatch);
 	}
 
-	// Record the resolved task/phase on the dispatch so the Queue UI can name
-	// what a waiting dispatch will run, even before a run row exists.
+	// The pull request this phase acts on, resolved once: it is the key the PR-scoped
+	// hold is read and promoted under (issue #850), and `undefined` for the two
+	// board-driven phases, which act on a card rather than a PR.
+	const prRef = pullRequestRefForTrigger(project, trigger);
+
+	// Record what the trigger resolved on the dispatch so the Queue UI can name what
+	// a waiting dispatch will run, even before a run row exists — and so the
+	// PR-scoped hold can see this dispatch at all (issue #850).
 	try {
-		await recordDispatchResolution(dispatch.id, trigger.taskId, trigger.phase);
+		await recordDispatchResolution(dispatch.id, dispatchResolutionFor(project, trigger));
 	} catch (err) {
 		logger.debug('Failed to record dispatch resolution (continuing)', {
 			dispatchId: dispatch.id,
@@ -3745,21 +4022,7 @@ export async function processJob(
 			);
 		}
 		if (trigger.phase === 'review') {
-			try {
-				await abandonReviewVerdict({
-					projectId: project.id,
-					repository: project.repo,
-					prNumber: trigger.prNumber,
-					headSha: trigger.headSha,
-				});
-			} catch (error) {
-				logger.warn('Could not abandon skipped Review verdict reservation', {
-					projectId: project.id,
-					prNumber: trigger.prNumber,
-					headSha: trigger.headSha,
-					error: describeError(error),
-				});
-			}
+			await abandonReviewReservation(project, trigger.prNumber, trigger.headSha);
 		}
 		if (trigger.phase === 'resolve-conflicts') {
 			await releaseConflictResolution(
@@ -3784,9 +4047,10 @@ export async function processJob(
 	}
 
 	// Nothing may be dispatched into a task another phase is executing against: the
-	// two would collide on the `task-<id>` checkout. And nothing may overtake the
-	// Planning dispatch it exists to consume. Which collision this is decides what
-	// happens (issues #759 and #761, see `claimTaskForPhase`):
+	// two would collide on the `task-<id>` checkout. Nothing may overtake the Planning
+	// dispatch it exists to consume. And nothing may write to a pull request another
+	// phase is writing to. Which collision this is decides what happens (issues #759,
+	// #761 and #850, see `claimTaskForPhase`):
 	//
 	// - **The same phase** — a duplicate webhook, or a delayed retry that outlived
 	//   the status dedup's TTL. The work is genuinely redundant, so it is dropped as
@@ -3803,8 +4067,16 @@ export async function processJob(
 	//   in that window produced two deliveries racing to claim. A task with **no**
 	//   Planning dispatch — the ordinary Backlog → ToDo path — finds no hold here and
 	//   starts immediately.
-	const taskClaim = await claimTaskForPhase(project.id, trigger, dispatch.id);
+	// - **A phase writing to this dispatch's pull request** (issue #850) — the
+	//   collision the task key cannot see, because the four PR-driven phases carry
+	//   deliberately distinct suffixed ids. A writing phase waits for the head branch;
+	//   a Review, which is pinned to a head SHA that phase is about to replace, is
+	//   dropped instead ({@link handlePullRequestInFlight}).
+	const taskClaim = await claimTaskForPhase(project, trigger, dispatch.id);
 	if (!taskClaim.claimed) {
+		if (taskClaim.kind === 'pull-request') {
+			return handlePullRequestInFlight(dispatch, job, taskClaim.trigger, project, taskClaim.hold);
+		}
 		if (taskClaim.hold.phase !== trigger.phase) {
 			return handleTaskInFlightDeferral(dispatch, job, trigger, project, taskClaim.hold);
 		}
@@ -3914,8 +4186,7 @@ export async function processJob(
 			dispatch.id,
 			runId,
 			new Date(Date.now() + effectiveTimeoutMs + DISPATCH_LEASE_MARGIN_MS),
-			trigger.taskId,
-			trigger.phase,
+			dispatchResolutionFor(project, trigger),
 		);
 
 		// Make this run cancellable by id and honour a cancellation that already
@@ -4082,5 +4353,13 @@ export async function processJob(
 		// a settled run.
 		inFlightPhaseByTask.delete(trigger.taskId);
 		await promoteTaskInFlightWaits(project.id, trigger.taskId);
+		// The same move for the pull request's head branch (issue #850), placed here for
+		// the same reason: by now every settle path has left `leased`/`running`, so a
+		// woken writer's own read no longer sees this one. Only a *writing* phase can be
+		// held behind, so only its settle has waiters to wake — a Review neither holds
+		// the pull request nor is waited for.
+		if (prRef && BRANCH_WRITING_PHASES.some((phase) => phase === trigger.phase)) {
+			await promotePullRequestInFlightWaits(project.id, prRef.repository, prRef.prNumber);
+		}
 	}
 }
