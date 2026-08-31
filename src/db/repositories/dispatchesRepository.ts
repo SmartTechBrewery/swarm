@@ -1057,6 +1057,56 @@ export async function findExecutingWritingDispatchForPullRequest(
 }
 
 /**
+ * Whether **anything** is still due for this pull request — the cost gate the
+ * unreviewed-pull-request recovery sweep applies before it spends a provider
+ * read (`src/dispatch/unreviewed-pr-recovery.ts`, issue #862).
+ *
+ * Deliberately broader than {@link findExecutingWritingDispatchForPullRequest}
+ * beside it, in both legs. All of {@link ACTIVE_DISPATCH_STATES}, not just the
+ * executing pair: a capacity-blocked attempt, a dependency-gated one and a
+ * bounded retry inside its budget are all legitimate waiting, exactly as rule 1
+ * of `classifyItemLiveness` (`src/dispatch/item-liveness.ts`) reads them. And
+ * every phase, not just the branch-writing ones: a Review already in flight is
+ * the single most important thing this must not disturb.
+ *
+ * **One blind spot, inherited and documented on {@link listActiveDispatchTaskRefs}:**
+ * `repository`/`pr_number` are written only when a claim resolves the trigger
+ * (`recordDispatchResolution`), so a dispatch seconds old is invisible here. That
+ * window is covered by the PR+SHA Redis claim and the durable ledger reservation
+ * the re-entered handler still takes — which is why this is a cost gate rather
+ * than a correctness gate.
+ *
+ * **No index of its own, deliberately.** Migration `0057` added none for the PR
+ * columns, and this read does not warrant one either: `(project_id, state)` —
+ * covered by `idx_dispatches_project_state` — already narrows to a project's
+ * *non-terminal* dispatches, a set bounded by concurrency plus queue backlog
+ * rather than by table size, and the sweep issues at most one probe per candidate
+ * pull request that already cleared its open/mergeable/SWARM-managed gates, once
+ * per sweep interval. An index on `(project_id, repository, pr_number)` would tax
+ * every insert and claim on the largest table in the schema to save a handful of
+ * cheap probes per quarter hour.
+ */
+export async function hasActiveDispatchForPullRequest(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<boolean> {
+	const rows = await getDb()
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.repository, repository),
+				eq(dispatches.prNumber, prNumber),
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+			),
+		)
+		.limit(1);
+	return rows.length > 0;
+}
+
+/**
  * The dispatches waiting for this pull request's head branch to free (issue #850)
  * — what a settling writing phase wakes, the exact twin of
  * {@link listTaskInFlightWaits} over the PR key.

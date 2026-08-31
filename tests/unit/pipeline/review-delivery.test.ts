@@ -152,7 +152,7 @@ describe('review body rendering', () => {
 						failureScenario: 'Two keys for one commit.',
 						impact: 'A duplicate reviewer run.',
 						fixPlan: ['Abbreviate at the boundary.'],
-						tests: 'Assert equality.',
+						tests: ['Assert equality.'],
 					},
 				],
 			}),
@@ -303,6 +303,41 @@ describe('review body rendering', () => {
 			expect(cause).toBeInstanceOf(Error);
 			expect((cause as Error).message).toMatch(/Invalid hand-off/);
 		});
+	});
+
+	// Issue #861: the shape that cost a whole review on PR #860. A blocking finding
+	// whose `tests` is an array is the canonical shape now, and a bare string is
+	// coerced — either way the run delivers on the first pass, with no repair turn
+	// and no discarded review.
+	it.each([
+		['an array of named tests', ['Assert equality.', 'Assert the grace window.']],
+		['a bare string the schema coerces', 'Assert equality.'],
+	])('delivers a blocking finding carrying %s, with no repair pass', async (_label, tests) => {
+		const { submitReview, options } = deliveryDeps(
+			structuredHandoff({
+				verdict: 'request-changes',
+				findings: [
+					{
+						id: 'F1',
+						title: 'Still wrong',
+						severity: 'blocker',
+						category: 'correctness',
+						evidence: '`webhook.ts:245`.',
+						failureScenario: 'Two keys for one commit.',
+						impact: 'A duplicate reviewer run.',
+						fixPlan: ['Abbreviate at the boundary.'],
+						tests,
+					},
+				],
+			}),
+		);
+
+		await runReviewPhase(options);
+
+		expect(options.runAgent).toHaveBeenCalledOnce();
+		expect(submitReview).toHaveBeenCalledOnce();
+		expect(options.markReviewVerdictSubmitted).toHaveBeenCalled();
+		expect(submitReview.mock.calls[0][0].body).toContain('- Assert equality.');
 	});
 
 	// The body must not promise a follow-up that a disabled Respond-to-review will

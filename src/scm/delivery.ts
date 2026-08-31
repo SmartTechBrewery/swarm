@@ -100,42 +100,94 @@ export function isBlockingSeverity(severity: ReviewFindingSeverity): boolean {
 /** What a re-review concluded about a finding an earlier pass raised. */
 export const REVIEW_CARRIED_STATUSES = ['resolved', 'partial', 'outstanding', 'regressed'] as const;
 
-const ReviewFindingSchema = z.object({
+/**
+ * A single value, read as the one-element list a list slot wants.
+ *
+ * Normalizing the *shape* of a prose slot is deliberately not the latitude the
+ * semantic rules refuse to give (see {@link checkVerdictMatchesSeverities}): what
+ * a verdict means has to be identical whichever model produced the review, whereas
+ * whether one named test arrived as `"x"` or `["x"]` is a JSON accident with a
+ * single correct reading — and issue #861 threw away a complete review, every
+ * finding traced through the checkout, over exactly that. `undefined`/`null` pass
+ * through so `.optional()`/`.default()` still decide an absent slot, and every
+ * element is still validated, so an empty or blank list still fails closed.
+ *
+ * `z.preprocess` is the established mechanism here (`src/scm/events.ts`,
+ * `src/pm/events.ts`, `src/queue/jobs.ts`), though those are all whole-envelope
+ * legacy upgraders — per-slot shape tolerance is a new usage of it.
+ */
+function asList(value: unknown): unknown {
+	if (value === undefined || value === null || Array.isArray(value)) return value;
+	return [value];
+}
+
+/**
+ * A list of strings, read back as the single block of prose a text slot wants —
+ * {@link asList}'s mirror, for a slot whose shape went the other way. Joined with
+ * a space, never a newline: `compactFinding` (`src/pipeline/review-body.ts`)
+ * renders `evidence` and `suggestion` inline in one Markdown line, which a newline
+ * would break. Anything that is not a list of strings passes through untouched, so
+ * Zod reports the real defect instead of a stringified object.
+ */
+function asText(value: unknown): unknown {
+	if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) return value;
+	return value.join(' ');
+}
+
+/** A free-text slot, tolerant of a model that split it across a list. */
+const textSlot = () => z.preprocess(asText, z.string().min(1));
+/** A list-of-strings slot, tolerant of a model that wrote a single entry bare. */
+const textListSlot = () => z.preprocess(asList, z.array(z.string().min(1)).min(1));
+
+/**
+ * One review finding. Every prose slot is shape-normalized; `id`, `severity` and
+ * `category` deliberately are not, because an enum's shape *is* its semantics and
+ * a joined id is a corrupted value rather than a recovered one.
+ *
+ * Exported so the prompt-contract audit (`tests/unit/pipeline/review.test.ts`)
+ * derives the slot names it checks from the schema rather than a hand-kept list.
+ */
+export const ReviewFindingSchema = z.object({
 	/** `F<n>`, minted by the pass that first raised it and carried by every later pass. */
 	id: z.string().regex(/^F\d+$/, 'finding id must be F<n>'),
-	title: z.string().min(1),
+	title: textSlot(),
 	severity: z.enum(REVIEW_FINDING_SEVERITIES),
 	category: z.enum(REVIEW_FINDING_CATEGORIES),
 	/** Required at every severity: the `file:line` anchors the claim rests on. */
-	evidence: z.string().min(1),
-	// Blocking tier (blocker/major) — required there, forbidden below it.
-	failureScenario: z.string().min(1).optional(),
-	impact: z.string().min(1).optional(),
-	fixPlan: z.array(z.string().min(1)).min(1).optional(),
-	tests: z.string().min(1).optional(),
+	evidence: textSlot(),
+	// Blocking tier (blocker/major) — required there, forbidden below it. `tests`
+	// is a list like `fixPlan` rather than a bare string (issue #861): two adjacent
+	// slots of the same tier disagreeing on cardinality is what a model continuing
+	// the pattern kept getting wrong, and there was never a reason for them to.
+	failureScenario: textSlot().optional(),
+	impact: textSlot().optional(),
+	fixPlan: textListSlot().optional(),
+	tests: textListSlot().optional(),
 	// Compact tier (minor/nit) — one paragraph instead of five slots, because the
 	// suggestion *is* the plan and the full treatment turns a naming nit into 200
 	// words. `downgradeRationale` is the pressure valve: it lets a reviewer justify
 	// calling something minor rather than quietly parking a real defect there.
-	suggestion: z.string().min(1).optional(),
-	downgradeRationale: z.string().min(1).optional(),
+	suggestion: textSlot().optional(),
+	downgradeRationale: textSlot().optional(),
 });
 
 export type ReviewFinding = z.infer<typeof ReviewFindingSchema>;
 
 const ReviewDocCheckSchema = z.object({
+	// `path` stays a plain string: joining a list of path fragments would produce a
+	// path naming no document, which is a corrupted value rather than a recovered one.
 	path: z.string().min(1),
 	status: z.enum(['accurate', 'updated', 'not-applicable', 'stale']),
-	note: z.string().optional(),
+	note: z.preprocess(asText, z.string()).optional(),
 });
 
 export type ReviewDocCheck = z.infer<typeof ReviewDocCheckSchema>;
 
 const ReviewCarriedSchema = z.object({
 	id: z.string().regex(/^F\d+$/, 'carried finding id must be F<n>'),
-	title: z.string().min(1),
+	title: textSlot(),
 	status: z.enum(REVIEW_CARRIED_STATUSES),
-	detail: z.string().min(1),
+	detail: textSlot(),
 });
 
 export type ReviewCarriedFinding = z.infer<typeof ReviewCarriedSchema>;
@@ -254,30 +306,38 @@ function checkVerdictMatchesSeverities(
  * `manual-intervention-required` signal — so the PR looked reviewed and was
  * silently terminal. A reviewer that cannot reach a verdict must fail its run,
  * which retries, rather than post a terminal non-verdict.
+ *
+ * The **shape** of every prose slot is normalized before validation
+ * ({@link asList}/{@link asText}) — a single entry read as a one-element list, a
+ * list of strings read back as one string. That is not a weakening of the
+ * enforcement {@link checkVerdictMatchesSeverities} exists for: every semantic
+ * rule below still fails closed, and a slot whose type carries meaning (a
+ * verdict, a severity, a category, an `F<n>` id, a document path, a command
+ * line) is normalized nowhere.
  */
 export const ReviewHandoffSchema = z
 	.object({
 		verdict: z.enum(['approve', 'request-changes']),
 		/** The `## Scope` paragraph: what the change is and what was confirmed. */
-		summary: z.string().min(1),
-		verification: z.array(ReviewVerificationSchema).min(1),
+		summary: textSlot(),
+		verification: z.preprocess(asList, z.array(ReviewVerificationSchema).min(1)),
 		/**
 		 * One row per document the reviewed repository requires to stay current —
 		 * its README plus whatever its own contributor/agent guide names. Which
 		 * documents those are is the repository's business, not SWARM's: this phase
 		 * reviews any project SWARM manages, so nothing here names a path.
 		 */
-		docsChecked: z.array(ReviewDocCheckSchema).min(1),
+		docsChecked: z.preprocess(asList, z.array(ReviewDocCheckSchema).min(1)),
 		/** Conditions the reviewer found but that predate this PR, so they aren't charged to it. */
-		preExisting: z.array(z.string().min(1)).default([]),
-		findings: z.array(ReviewFindingSchema).default([]),
+		preExisting: z.preprocess(asList, z.array(z.string().min(1))).default([]),
+		findings: z.preprocess(asList, z.array(ReviewFindingSchema)).default([]),
 		/**
 		 * Re-review only: what became of each finding an earlier pass raised. Anything
 		 * not `resolved` must also be reported in `findings` under the same id
 		 * ({@link checkCarriedItemsAreReported}), which is what keeps the disposition
 		 * table and the verdict from contradicting each other.
 		 */
-		carried: z.array(ReviewCarriedSchema).default([]),
+		carried: z.preprocess(asList, z.array(ReviewCarriedSchema)).default([]),
 	})
 	.superRefine((handoff, ctx) => {
 		checkFindingTiers(handoff.findings, ctx);

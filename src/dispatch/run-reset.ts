@@ -19,7 +19,16 @@
  *      down state the dying attempt is still writing to, and the replacement
  *      dispatch is created *after* it, so that attempt's terminal result settles the
  *      *old* dispatch id instead of landing on top of the restart. A wait that
- *      expires proceeds anyway and says so ({@link ResetAgentStop});
+ *      expires proceeds anyway and says so ({@link ResetAgentStop}) — and since
+ *      issue #858 the replacement dispatch created after an expired wait no longer
+ *      collides with the dying attempt's *in-process* claim. An unreachable worker's
+ *      job stays parked in the router well past this wait, holding
+ *      `inFlightPhaseByTask` (`../worker/consumer.ts`) — a map this service cannot
+ *      see, let alone clear, from the API server or the CLI. The router now treats a
+ *      same-phase hold whose own dispatch has settled as *releasing* and makes the
+ *      replacement wait as `task-in-flight` until the parked job settles, rather than
+ *      dropping it as a duplicate and settling the run `failed` on a restart this
+ *      service had just reported;
  *   1. cancel the run's active dispatch — claimed or not — so nothing can claim
  *      the run while its checkout is being torn down (the same "cancel before you
  *      touch shared state" ordering `runs.putBack` uses);

@@ -62,10 +62,7 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
-import {
-	ACTIVE_DISPATCH_STATES,
-	type DispatchRow,
-} from '../db/repositories/dispatchesRepository.js';
+import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
 import { getProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	getSubmittedReviewSlot,
@@ -78,6 +75,7 @@ import { logger } from '../lib/logger.js';
 import { normalizeStoredJobPayload, type SwarmJob } from '../queue/jobs.js';
 import { deliveryIdentity } from '../scm/delivery.js';
 import type { ScmEvent } from '../scm/events.js';
+import { isDeadDispatch } from './dead-dispatch.js';
 import { createAndPublishDispatch, deliveryDedupKey } from './dispatcher.js';
 
 /** Why a force was refused, machine-readable so each surface maps it to its own error shape. */
@@ -163,32 +161,6 @@ function reviewCoordinates(run: {
  * function throws past this rather than inventing a plausible-looking result.
  */
 const MAX_DISPATCH_CHAIN_ATTEMPTS = 5;
-
-/**
- * Whether a dispatch's outcome means the corrective cycle it was meant to run
- * never actually happened (see the module header). A non-terminal dispatch is
- * never dead — it may yet succeed, and forcing past one still in flight would
- * race the attempt already running. A `completed` dispatch is dead unless its
- * outcome is `phase-succeeded`: every other completion (`no-trigger`,
- * `skipped-not-eligible`, `skipped-duplicate`, `superseded`) means the trigger
- * refused the event or the worker decided against a run, not that Respond-to-review
- * actually started.
- *
- * `DispatchOutcome` also names merge-automation-only completions (`merged`,
- * `merge-not-eligible`, …), which this would likewise call dead. That's outside
- * what a Respond-to-review dispatch can ever actually record — this module
- * always creates one with `phase: 'respond-to-review'`, never `merge-automation`
- * — so it's a harmless breadth mismatch, not a bug: the check is scoped to
- * "is this a real outcome", and no code path here ever produces a merge one.
- */
-function isDeadDispatch(dispatch: Pick<DispatchRow, 'state' | 'outcome'>): boolean {
-	if (ACTIVE_DISPATCH_STATES.includes(dispatch.state as (typeof ACTIVE_DISPATCH_STATES)[number])) {
-		return false;
-	}
-	if (dispatch.state === 'completed') return dispatch.outcome !== 'phase-succeeded';
-	// 'cancelled' or 'failed'.
-	return true;
-}
 
 /**
  * Publish the forced Respond-to-review dispatch under its deterministic

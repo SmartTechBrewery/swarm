@@ -219,7 +219,11 @@ function blockingFinding(finding: ReviewFinding): string[] {
 		// string slots above need no equivalent — they interpolate as-is.
 		...(finding.fixPlan ?? []).map((step, index) => `${index + 1}. ${step}`),
 		'',
-		`**Tests.** ${finding.tests}`,
+		'**Tests.**',
+		'',
+		// Bulleted rather than numbered, unlike the fix plan above: tests to add are
+		// a set, not ordered steps. Same `??` for the same reason.
+		...(finding.tests ?? []).map((test) => `- ${test}`),
 		'',
 	];
 }

@@ -37,7 +37,7 @@ const blocker = {
 	failureScenario: 'Two events for one commit claim different dedup keys, so Review runs twice.',
 	impact: 'Duplicate worktrees and a Respond-to-review path that never fires.',
 	fixPlan: ['Abbreviate both spellings at the boundary.', 'Rewrite the module header.'],
-	tests: 'Assert both event kinds yield an equal headSha.',
+	tests: ['Assert both event kinds yield an equal headSha.', 'Assert the dedup key is stable.'],
 };
 
 const nit = {
@@ -116,6 +116,9 @@ describe('renderReviewBody', () => {
 			expect(body).toContain('1. Abbreviate both spellings at the boundary.');
 			expect(body).toContain('2. Rewrite the module header.');
 			expect(body).toContain('**Tests.**');
+			// Bulleted rather than numbered (issue #861): tests are a set, not steps.
+			expect(body).toContain('- Assert both event kinds yield an equal headSha.');
+			expect(body).toContain('- Assert the dedup key is stable.');
 		});
 
 		// A naming nit run through five slots turns one line into 200 words, so the
