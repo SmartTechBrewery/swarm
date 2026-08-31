@@ -194,6 +194,13 @@ function mockDispatchRow(job: Record<string, unknown>): MockDispatchRow {
 		attempt: 0,
 	};
 }
+/** What the two resolution writers now take — one object rather than positionals. */
+type MockDispatchResolution = {
+	taskId: string;
+	phase: string;
+	pullRequest?: { repository: string; prNumber: string };
+};
+
 const claimDispatchForJob = vi.fn(
 	async (job: Record<string, unknown>, _leaseMs: number) =>
 		({ claimed: true, dispatch: mockDispatchRow(job) }) as
@@ -207,6 +214,9 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 const promoteNextCapacityDispatch = vi.fn(async (_projectId: string, _prioritize?: boolean) => {});
 const promoteAvailabilityWaitsForWorker = vi.fn(async (_workerId: string, _cause: string) => 0);
 const promoteTaskInFlightWaits = vi.fn(async (_projectId: string, _taskId: string) => 0);
+const promotePullRequestInFlightWaits = vi.fn(
+	async (_projectId: string, _repository: string, _prNumber: string) => 0,
+);
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	DISPATCH_LEASE_OWNER: 'test-host:1',
@@ -223,6 +233,8 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 		promoteNextCapacityDispatch(projectId, prioritize),
 	promoteTaskInFlightWaits: (projectId: string, taskId: string) =>
 		promoteTaskInFlightWaits(projectId, taskId),
+	promotePullRequestInFlightWaits: (projectId: string, repository: string, prNumber: string) =>
+		promotePullRequestInFlightWaits(projectId, repository, prNumber),
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
 }));
 
@@ -230,10 +242,24 @@ const completeDispatch = vi.fn(async (_id: string, _outcome: string) => true);
 const failDispatch = vi.fn(async (_id: string, _error: string) => true);
 const cancelClaimedDispatch = vi.fn(async (_id: string, _reason: string) => true);
 const markDispatchRunning = vi.fn(
-	async (_id: string, _runId: string | undefined, _leaseUntil: Date, _t: string, _p: string) =>
-		true,
+	async (
+		_id: string,
+		_runId: string | undefined,
+		_leaseUntil: Date,
+		_resolution: MockDispatchResolution,
+	) => true,
 );
-const recordDispatchResolution = vi.fn(async (_id: string, _taskId: string, _phase: string) => {});
+const recordDispatchResolution = vi.fn(
+	async (_id: string, _resolution: MockDispatchResolution) => {},
+);
+const findExecutingWritingDispatchForPullRequest = vi.fn(
+	async (
+		_projectId: string,
+		_repository: string,
+		_prNumber: string,
+		_excludeDispatchId?: string,
+	): Promise<{ id: string; phase: string | null } | undefined> => undefined,
+);
 const findExecutingDispatchForTask = vi.fn(
 	async (
 		_projectId: string,
@@ -274,11 +300,18 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		id: string,
 		runId: string | undefined,
 		leaseUntil: Date,
-		t: string,
-		p: string,
-	) => markDispatchRunning(id, runId, leaseUntil, t, p),
-	recordDispatchResolution: (id: string, taskId: string, phase: string) =>
-		recordDispatchResolution(id, taskId, phase),
+		resolution: MockDispatchResolution,
+	) => markDispatchRunning(id, runId, leaseUntil, resolution),
+	recordDispatchResolution: (id: string, resolution: MockDispatchResolution) =>
+		recordDispatchResolution(id, resolution),
+	BRANCH_WRITING_PHASES: ['respond-to-review', 'respond-to-ci', 'resolve-conflicts'],
+	findExecutingWritingDispatchForPullRequest: (
+		projectId: string,
+		repository: string,
+		prNumber: string,
+		excludeDispatchId?: string,
+	) =>
+		findExecutingWritingDispatchForPullRequest(projectId, repository, prNumber, excludeDispatchId),
 	findExecutingDispatchForTask: (projectId: string, taskId: string, excludeDispatchId?: string) =>
 		findExecutingDispatchForTask(projectId, taskId, excludeDispatchId),
 	findActivePlanningDispatchForTask: (
@@ -751,6 +784,9 @@ describe('processJob', () => {
 		promoteNextCapacityDispatch.mockClear();
 		promoteAvailabilityWaitsForWorker.mockClear();
 		promoteTaskInFlightWaits.mockClear();
+		promotePullRequestInFlightWaits.mockClear();
+		findExecutingWritingDispatchForPullRequest.mockReset();
+		findExecutingWritingDispatchForPullRequest.mockResolvedValue(undefined);
 		publishDispatchWakeUp.mockClear();
 		completeDispatch.mockClear();
 		failDispatch.mockClear();
@@ -3747,7 +3783,11 @@ describe('processJob', () => {
 			expect(createRun).not.toHaveBeenCalled();
 			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
 			// Still resolved on the dispatch first, so the Queue UI can name what was skipped.
-			expect(recordDispatchResolution).toHaveBeenCalledWith('dispatch-1', '216', 'implementation');
+			expect(recordDispatchResolution).toHaveBeenCalledWith('dispatch-1', {
+				taskId: '216',
+				phase: 'implementation',
+				pullRequest: undefined,
+			});
 			expect(info).toHaveBeenCalledWith(
 				expect.stringContaining('missing the automation label'),
 				expect.objectContaining({ label: 'swarm', taskId: '216' }),
@@ -4393,6 +4433,258 @@ describe('processJob', () => {
 				await processJob(createMockPmWebhookJob(), implementation());
 
 				expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+			});
+		});
+		// Issue #850. Neither read above can see two phases of one *pull request*: they
+		// key on the worktree task id, and the four PR-driven phases carry deliberately
+		// distinct suffixed ids so they can hold separate checkouts. What they contend for
+		// is the PR's head branch — three of them push to it, and a Review reads a head one
+		// of them is about to replace.
+		describe('pull-request in-flight guard (issue #850)', () => {
+			const writingHold = { id: 'other', phase: 'resolve-conflicts' };
+
+			it('defers a writing phase behind another writing phase of the same pull request', async () => {
+				findExecutingWritingDispatchForPullRequest.mockResolvedValue(writingHold);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+
+				expect(outcome).toMatchObject({
+					status: 'phase-deferred',
+					phase: 'respond-to-review',
+					taskId: '17-respond',
+				});
+				// It waited rather than pushing onto a branch the holder is about to move.
+				expect(phaseCalls).toHaveLength(0);
+				expect(deferDispatchToPending).toHaveBeenCalledWith(
+					'dispatch-1',
+					expect.objectContaining({ waitReason: 'pr-in-flight' }),
+				);
+				// Visible while it waits, naming the *pull request* — the two phases hold
+				// different checkouts, so "waiting for that checkout to free" would be a lie.
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-1',
+					expect.objectContaining({
+						status: 'deferred',
+						error: expect.stringContaining('Pull request #17'),
+					}),
+				);
+				// The asking dispatch is excluded — it recorded its own PR on claim and would
+				// otherwise find itself.
+				expect(findExecutingWritingDispatchForPullRequest).toHaveBeenCalledWith(
+					PROJECT.id,
+					PROJECT.repo,
+					'17',
+					'dispatch-1',
+				);
+			});
+
+			it.each([
+				['Respond-to-review', RESPOND_TO_REVIEW_TRIGGER],
+				['Respond-to-CI', RESPOND_TO_CI_TRIGGER],
+				['Resolve-conflicts', RESOLVE_CONFLICTS_TRIGGER],
+			] as const)('defers %s behind the holder', async (_label, trigger) => {
+				findExecutingWritingDispatchForPullRequest.mockResolvedValue(writingHold);
+
+				const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+
+				expect(outcome.status).toBe('phase-deferred');
+				expect(phaseCalls).toHaveLength(0);
+			});
+
+			it('drops a Review behind a writing phase, spending no verdict-ledger slot', async () => {
+				findExecutingWritingDispatchForPullRequest.mockResolvedValue(writingHold);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				// Dropped, not deferred: a Review is pinned to a head SHA, so waking it later
+				// would have it review the commit the writer has already replaced.
+				expect(outcome).toEqual({
+					status: 'skipped-in-flight',
+					phase: 'review',
+					taskId: '17',
+				});
+				expect(phaseCalls).toHaveLength(0);
+				expect(deferDispatchToPending).not.toHaveBeenCalled();
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-pr-in-flight');
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+				// The acceptance criterion: the reservation is handed back, so none of the
+				// three permitted verdict slots (issue #235) is consumed by a review that
+				// never ran.
+				expect(abandonReviewVerdict).toHaveBeenCalledWith({
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					prNumber: '17',
+					headSha: 'deadbeef',
+				});
+			});
+
+			it('finalizes a run row carried by a dropped Review rather than leaving it deferred', async () => {
+				findExecutingWritingDispatchForPullRequest.mockResolvedValue(writingHold);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob({ runId: 'run-9' }),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-9',
+					expect.objectContaining({
+						status: 'failed',
+						error: expect.stringContaining('Pull request #17'),
+					}),
+				);
+			});
+
+			it('wakes the pr-in-flight waits when a writing phase settles — success, failure, or deferral', async () => {
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+				expect(promotePullRequestInFlightWaits).toHaveBeenCalledWith(
+					PROJECT.id,
+					PROJECT.repo,
+					'17',
+				);
+
+				promotePullRequestInFlightWaits.mockClear();
+				phaseImpl = async () => {
+					throw new Error('boom');
+				};
+				const failed = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_CI_TRIGGER),
+				);
+				expect(failed.status).toBe('phase-failed');
+				expect(promotePullRequestInFlightWaits).toHaveBeenCalledWith(
+					PROJECT.id,
+					PROJECT.repo,
+					'17',
+				);
+
+				promotePullRequestInFlightWaits.mockClear();
+				phaseImpl = async () => ({ agent: agentResult() });
+				acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+				const deferred = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESOLVE_CONFLICTS_TRIGGER),
+				);
+				expect(deferred.status).toBe('phase-deferred');
+				expect(promotePullRequestInFlightWaits).toHaveBeenCalledWith(
+					PROJECT.id,
+					PROJECT.repo,
+					'17',
+				);
+			});
+
+			it('does not wake pr-in-flight waits after a Review settles — a Review is never waited for', async () => {
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(promotePullRequestInFlightWaits).not.toHaveBeenCalled();
+			});
+
+			// The wait self-heals: the holder can settle between the read and this row
+			// becoming `pending`, so its own promotion would find nothing to wake.
+			it('publishes its own wake-up when the holder settled while it was deferring', async () => {
+				// Only the claim-time read sees the hold; the post-defer re-check finds it gone.
+				findExecutingWritingDispatchForPullRequest.mockResolvedValueOnce(writingHold);
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+
+				expect(publishDispatchWakeUp).toHaveBeenCalledWith(
+					expect.objectContaining({ id: 'dispatch-1' }),
+				);
+			});
+
+			it('does not publish a wake-up while the holder is still executing', async () => {
+				findExecutingWritingDispatchForPullRequest.mockResolvedValue(writingHold);
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+
+				expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+			});
+
+			// The asymmetry that makes the relation acyclic: a Review is not in the filtered
+			// set, so nothing ever waits behind one. Exercised against the real in-process
+			// map here, with a Review genuinely mid-flight; the durable half of the same
+			// claim (a `review` row not matching the read) is asserted in
+			// `tests/integration/db/dispatchesRepository.test.ts`.
+			it('lets a writing phase run while a Review of the same pull request is mid-flight', async () => {
+				let release: (() => void) | undefined;
+				const gate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				phaseImpl = async (_phase, context) => {
+					if (context.trigger.phase === 'review') await gate;
+					return { agent: agentResult() };
+				};
+
+				const review = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+				await new Promise((r) => setTimeout(r, 0));
+
+				const conflicts = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESOLVE_CONFLICTS_TRIGGER),
+				);
+
+				expect(conflicts.status).toBe('phase-succeeded');
+
+				release?.();
+				await review;
+			});
+
+			it.each([
+				'planning',
+				'implementation',
+			] as const)('never asks the question for a %s dispatch, which carries no pull request', async (phase) => {
+				findExecutingWritingDispatchForPullRequest.mockResolvedValue(writingHold);
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning({ phase, taskId: '17', workItem: createMockWorkItem() }),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(findExecutingWritingDispatchForPullRequest).not.toHaveBeenCalled();
+				expect(promotePullRequestInFlightWaits).not.toHaveBeenCalled();
+			});
+
+			it('dispatches normally when the pull-request read fails — a DB hiccup must not stall or drop', async () => {
+				findExecutingWritingDispatchForPullRequest.mockRejectedValue(new Error('db down'));
+
+				const writer = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+				expect(writer.status).toBe('phase-succeeded');
+
+				const review = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+				expect(review.status).toBe('phase-succeeded');
+			});
+
+			it('records the pull request on the dispatch, which is what makes the hold visible', async () => {
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+
+				const resolution = {
+					taskId: '17-respond',
+					phase: 'respond-to-review',
+					pullRequest: { repository: PROJECT.repo, prNumber: '17' },
+				};
+				expect(recordDispatchResolution).toHaveBeenCalledWith('dispatch-1', resolution);
+				// Re-written when the run starts too, so a row whose best-effort resolution
+				// write failed cannot become an invisible holder.
+				expect(markDispatchRunning).toHaveBeenCalledWith(
+					'dispatch-1',
+					'run-1',
+					expect.any(Date),
+					resolution,
+				);
 			});
 		});
 	});

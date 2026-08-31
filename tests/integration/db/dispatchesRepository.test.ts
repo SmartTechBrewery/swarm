@@ -18,6 +18,7 @@ import {
 	failSupersededWorkerDispatchClaims,
 	findActivePlanningDispatchForTask,
 	findExecutingDispatchForTask,
+	findExecutingWritingDispatchForPullRequest,
 	getActiveDispatchByRunId,
 	getDispatchById,
 	getWorkerDispatchClaimState,
@@ -25,12 +26,14 @@ import {
 	listActiveDispatchTaskRefs,
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
+	listPullRequestInFlightWaits,
 	listRunnableDispatchesForPool,
 	listTaskInFlightWaits,
 	listWaitingDispatches,
 	listWakeablePendingDispatches,
 	markDispatchRunning,
 	promoteDispatchToImmediateWake,
+	recordDispatchResolution,
 	reopenDispatchForManualRetry,
 	scheduleDispatchRetry,
 	selectNextCapacityDispatch,
@@ -56,7 +59,10 @@ import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import { describeError } from '../../../src/lib/errors.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
 import type { TriggerPhase } from '../../../src/triggers/types.js';
-import { createMockScmWebhookJob } from '../../helpers/factories.js';
+import {
+	createMockProjectRepositoryPair,
+	createMockScmWebhookJob,
+} from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -74,12 +80,19 @@ const EXECUTED_STATES: readonly DispatchState[] = ['running', 'completed', 'fail
 /**
  * A dispatch for `taskId` (a review one unless `phase` says otherwise), driven to
  * `state` through the real transitions. Returns its id so a caller can exclude it.
+ *
+ * `pullRequest` seeds the PR coordinates the same way production does (issue #850):
+ * through `recordDispatchResolution` on claim, and again through
+ * `markDispatchRunning` for a state that actually executes — so a `pending` row
+ * carrying them is the real shape of a writer that resolved and then deferred, not
+ * a row the read could never have matched anyway.
  */
 async function seedDispatchInState(
 	taskId: string,
 	state: DispatchState,
 	runId: string | undefined,
 	phase: TriggerPhase = 'review',
+	pullRequest?: { repository: string; prNumber: string },
 ): Promise<string> {
 	// `createDispatch` can start a row directly in any waiting/leased state;
 	// everything past that is reached through the real lifecycle calls.
@@ -92,10 +105,15 @@ async function seedDispatchInState(
 		runId,
 		state: state === 'leased' || state === 'retry-scheduled' ? state : 'pending',
 	});
+	if (pullRequest) await recordDispatchResolution(dispatch.id, { taskId, phase, pullRequest });
 	if (state === 'cancelled') await cancelWaitingDispatch(dispatch.id, 'cleared the queue');
 	if (EXECUTED_STATES.includes(state)) {
 		await claimDispatch(dispatch.id, OWNER, 60_000);
-		await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), taskId, phase);
+		await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), {
+			taskId,
+			phase,
+			pullRequest,
+		});
 	}
 	if (state === 'completed') await completeDispatch(dispatch.id, 'phase-succeeded');
 	if (state === 'failed') await failDispatch(dispatch.id, 'boom');
@@ -377,6 +395,176 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			await seedDispatchInState(TASK, 'pending', undefined, 'planning');
 			expect(await findActivePlanningDispatchForTask(PROJECT_ID, '755')).toBeUndefined();
 			expect(await findActivePlanningDispatchForTask('proj-other', TASK)).toBeUndefined();
+		});
+	});
+
+	// Issue #850. Neither task read above can see two phases of one pull request: the
+	// PR-driven phases carry deliberately distinct suffixed task ids, so the artifact
+	// they actually contend for — the PR's head branch — had no key at all.
+	describe('findExecutingWritingDispatchForPullRequest (issue #850)', () => {
+		const PR = { repository: REPO, prNumber: '101' };
+
+		it.each([
+			'leased',
+			'running',
+		] as const)('reports a %s writing dispatch together with the phase it holds', async (state) => {
+			await seedDispatchInState('101-conflicts', state, undefined, 'resolve-conflicts', PR);
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toMatchObject({ phase: 'resolve-conflicts' });
+		});
+
+		it.each([
+			'pending',
+			'retry-scheduled',
+			'completed',
+			'failed',
+			'cancelled',
+		] as const)('ignores a %s dispatch — it is pushing nothing', async (state) => {
+			await seedDispatchInState('101-conflicts', state, undefined, 'resolve-conflicts', PR);
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toBeUndefined();
+		});
+
+		it.each([
+			'respond-to-review',
+			'respond-to-ci',
+			'resolve-conflicts',
+		] as const)('reports an executing %s dispatch — the three phases that push', async (phase) => {
+			await seedDispatchInState(`101-${phase}`, 'running', undefined, phase, PR);
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toMatchObject({ phase });
+		});
+
+		it('ignores an executing review dispatch — it checks the head out read-only', async () => {
+			await seedDispatchInState('101', 'running', undefined, 'review', PR);
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toBeUndefined();
+		});
+
+		it('ignores a merge-automation dispatch on the same pull request — it pushes nothing', async () => {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'synthetic',
+				taskId: '101',
+				phase: 'merge-automation',
+				state: 'leased',
+			});
+			await getDb()
+				.update(dispatches)
+				.set({ repository: REPO, prNumber: '101' })
+				.where(eq(dispatches.id, dispatch.id));
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toBeUndefined();
+		});
+
+		it('ignores an executing row whose phase was never recorded', async () => {
+			// The one deliberate difference from `findExecutingDispatchForTask`, which
+			// reports such a row as "some other phase": here the verdict turns on *which*
+			// phase holds the pull request, so an unrecorded one cannot be assumed to be a
+			// writer — assuming it would defer a Review behind a Review.
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: '101',
+				state: 'leased',
+			});
+			await getDb()
+				.update(dispatches)
+				.set({ repository: REPO, prNumber: '101' })
+				.where(eq(dispatches.id, dispatch.id));
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toBeUndefined();
+		});
+
+		it('ignores the asking dispatch, which already recorded its own pull request', async () => {
+			const own = await seedDispatchInState(
+				'101-respond',
+				'leased',
+				undefined,
+				'respond-to-review',
+				PR,
+			);
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101', own),
+			).toBeUndefined();
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, REPO, '101'),
+			).toMatchObject({ id: own });
+		});
+
+		// A project spans several repositories (issue #684), so PR 42 in one is not PR 42
+		// in the other — ai/TESTING.md "Two repositories of one project".
+		it('scopes to the repository, the pull request, and the project', async () => {
+			const [android, backend] = createMockProjectRepositoryPair();
+			await seedDispatchInState('42-ci', 'running', undefined, 'respond-to-ci', {
+				repository: android.repo,
+				prNumber: '42',
+			});
+
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, android.repo, '42'),
+			).toMatchObject({ phase: 'respond-to-ci' });
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, backend.repo, '42'),
+			).toBeUndefined();
+			expect(
+				await findExecutingWritingDispatchForPullRequest(PROJECT_ID, android.repo, '43'),
+			).toBeUndefined();
+			expect(
+				await findExecutingWritingDispatchForPullRequest('proj-other', android.repo, '42'),
+			).toBeUndefined();
+		});
+	});
+
+	describe('listPullRequestInFlightWaits (issue #850)', () => {
+		async function seedWait(overrides: Partial<Parameters<typeof createDispatch>[0]> = {}) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: '101-respond',
+				phase: 'respond-to-review',
+				waitReason: 'pr-in-flight',
+				...overrides,
+			});
+			await recordDispatchResolution(dispatch.id, {
+				taskId: '101-respond',
+				phase: 'respond-to-review',
+				pullRequest: { repository: REPO, prNumber: '101' },
+			});
+			return dispatch;
+		}
+
+		it('returns the pending pr-in-flight waits for the pull request, oldest availability first', async () => {
+			const later = await seedWait({ availableAt: new Date(Date.now() - 1_000) });
+			const earlier = await seedWait({ availableAt: new Date(Date.now() - 10_000) });
+
+			const waits = await listPullRequestInFlightWaits(PROJECT_ID, REPO, '101');
+			expect(waits.map((row) => row.id)).toEqual([earlier.id, later.id]);
+		});
+
+		it('excludes other wait reasons, other pull requests, other repositories, and non-pending rows', async () => {
+			const wanted = await seedWait();
+			await seedWait({ waitReason: 'task-in-flight' });
+			await seedWait({ state: 'leased' });
+			const other = await seedWait();
+			await getDb().update(dispatches).set({ prNumber: '102' }).where(eq(dispatches.id, other.id));
+			const otherRepo = await seedWait();
+			await getDb()
+				.update(dispatches)
+				.set({ repository: 'jkwiecien/second-repo' })
+				.where(eq(dispatches.id, otherRepo.id));
+
+			const waits = await listPullRequestInFlightWaits(PROJECT_ID, REPO, '101');
+			expect(waits.map((row) => row.id)).toEqual([wanted.id]);
 		});
 	});
 
@@ -1015,7 +1203,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				runId,
 			});
 			await claimDispatch(dispatch.id, OWNER, -1_000);
-			await markDispatchRunning(dispatch.id, runId, new Date(Date.now() - 1_000), '17', 'review');
+			await markDispatchRunning(dispatch.id, runId, new Date(Date.now() - 1_000), {
+				taskId: '17',
+				phase: 'review',
+			});
 
 			const reclaimed = await failExpiredDispatchLeases('dead worker', new Date());
 			expect(reclaimed.map((d) => d.id)).toEqual([dispatch.id]);

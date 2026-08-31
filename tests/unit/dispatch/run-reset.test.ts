@@ -139,6 +139,8 @@ function makeDispatch(overrides: Partial<DispatchRow> = {}): DispatchRow {
 		projectId: 'p1',
 		taskId: '424',
 		phase: 'implementation',
+		repository: null,
+		prNumber: null,
 		state: 'retry-scheduled',
 		waitReason: 'rate-limit',
 		outcome: null,

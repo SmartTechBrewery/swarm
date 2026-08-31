@@ -41,6 +41,21 @@ export const dispatches = pgTable(
 		taskId: text('task_id'),
 		/** Resolved pipeline phase; null until the trigger registry resolves it. */
 		phase: text('phase'),
+		/**
+		 * The repository this dispatch acts on, in `ProjectConfig.repo`'s `owner/repo`
+		 * form — denormalized beside `project_id` exactly as `runs.repository` (issue
+		 * #683) and `review_verdicts.repository` are, because a project id alone stopped
+		 * identifying a repository at issue #684. Null until the trigger registry
+		 * resolves the phase; null for ever on a dispatch that never was claimed.
+		 */
+		repository: text('repository'),
+		/**
+		 * The pull request this phase acts on — the artifact the PR-scoped hold is keyed
+		 * on (issue #850). Written with `repository` when the trigger resolves; null for
+		 * the board-driven phases, which act on a card rather than a PR, and for the
+		 * agent-less `merge-automation` kind, which never contends for the branch.
+		 */
+		prNumber: text('pr_number'),
 		state: text('state').notNull().default('pending'),
 		/**
 		 * Why a non-terminal dispatch is waiting: `project-capacity`, `rate-limit`,
@@ -49,8 +64,10 @@ export const dispatches = pgTable(
 		 * `worker-authorization`, `preserved-worker`, `task-in-flight` (a later phase
 		 * of a task whose earlier phase is still executing — issue #759 — or an
 		 * Implementation behind a Planning dispatch it must not overtake, queued or
-		 * executing — issue #761), `manual-retry`, `recovered`. Null while
-		 * leased/running and for terminal states.
+		 * executing — issue #761), `pr-in-flight` (a branch-writing phase behind
+		 * another one executing against the same pull request's head branch — issue
+		 * #850), `manual-retry`, `recovered`. Null while leased/running and for
+		 * terminal states.
 		 */
 		waitReason: text('wait_reason'),
 		/**
@@ -58,8 +75,9 @@ export const dispatches = pgTable(
 		 * `skipped-duplicate` (a repeated delivery of the *same* phase already
 		 * executing for this task — a *different* phase waits as `task-in-flight`
 		 * instead, issue #759), `skipped-not-eligible` (the work item is not opted
-		 * into automation — issue #131), or `superseded` (a coalesced recheck
-		 * replaced it).
+		 * into automation — issue #131), `skipped-pr-in-flight` (a Review a writing
+		 * phase of the same pull request made moot — issue #850), or `superseded` (a
+		 * coalesced recheck replaced it).
 		 */
 		outcome: text('outcome'),
 		/**

@@ -21,6 +21,7 @@ import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
+	listPullRequestInFlightWaits,
 	listTaskInFlightWaits,
 	promoteDispatchToImmediateWake,
 	selectNextCapacityDispatch,
@@ -260,6 +261,50 @@ export async function promoteTaskInFlightWaits(projectId: string, taskId: string
 		logger.warn('dispatch: task-in-flight promotion failed', {
 			projectId,
 			taskId,
+			error: describeError(err),
+		});
+		return 0;
+	}
+}
+
+/**
+ * After a branch-writing phase settles, wake whatever was waiting for *that pull
+ * request's* head branch (issue #850) — the PR-level sibling of
+ * {@link promoteTaskInFlightWaits}, and the wake-up that turns the PR-scoped hold
+ * from a discarded run into a sequenced hand-off.
+ *
+ * Same shape as its task twin, for the same reasons: no re-dating (these are
+ * `pending` rows already eligible now, whose wake-up was simply never published,
+ * so one delay-0 publish under the row's deterministic wake id is enough and a
+ * repeat is a queue no-op), every waiter woken rather than only the first, and
+ * best-effort with the failure fully swallowed — it runs off a settled run, which a
+ * queue hiccup must never fail, and the reconciler's periodic republish is
+ * underneath.
+ */
+export async function promotePullRequestInFlightWaits(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<number> {
+	try {
+		const waiting = await listPullRequestInFlightWaits(projectId, repository, prNumber);
+		if (waiting.length === 0) return 0;
+		for (const dispatch of waiting) {
+			await publishDispatchWakeUp(dispatch);
+		}
+		logger.debug('dispatch: pull request freed — woke phases waiting for its head branch', {
+			projectId,
+			repository,
+			prNumber,
+			promoted: waiting.length,
+			phases: waiting.map((row) => row.phase ?? row.id),
+		});
+		return waiting.length;
+	} catch (err) {
+		logger.warn('dispatch: pr-in-flight promotion failed', {
+			projectId,
+			repository,
+			prNumber,
 			error: describeError(err),
 		});
 		return 0;

@@ -71,8 +71,9 @@ export type QueuedBoardOutcome = z.infer<typeof QueuedBoardOutcomeSchema>;
 /**
  * The queue-facing view of a dispatch's state: `waiting`/`prioritized` for an
  * eligible-now pending dispatch (by queue priority), `blocked` for one an *event*
- * has to wake rather than a timer — a freed project slot, or the task's own
- * checkout freeing (issue #759) — and `delayed` for a scheduled retry.
+ * has to wake rather than a timer — a freed project slot, the task's own checkout
+ * freeing (issue #759), or a pull request's head branch freeing (issue #850) — and
+ * `delayed` for a scheduled retry.
  */
 export const PendingJobStateSchema = z.enum(['waiting', 'prioritized', 'delayed', 'blocked']);
 export type PendingJobState = z.infer<typeof PendingJobStateSchema>;
@@ -92,6 +93,7 @@ export const QueuedWaitReasonSchema = z.enum([
 	'worker-authorization',
 	'preserved-worker',
 	'task-in-flight',
+	'pr-in-flight',
 	'manual-retry',
 	'recovered',
 ]);
@@ -256,10 +258,15 @@ export function deriveReviewGate(job: SwarmJob): QueuedReviewGate | undefined {
 /** The queue-facing state of a waiting dispatch (see {@link PendingJobStateSchema}). */
 export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 	if (dispatch.state === 'retry-scheduled') return 'delayed';
-	// The two event-woken pending waits read as `blocked` rather than `waiting`: both
-	// are eligible *now* and neither will be picked up until something frees — a
-	// project slot, or the task's own earlier phase settling (issues #759 and #761).
-	if (dispatch.waitReason === 'project-capacity' || dispatch.waitReason === 'task-in-flight')
+	// The three event-woken pending waits read as `blocked` rather than `waiting`: all
+	// are eligible *now* and none will be picked up until something frees — a project
+	// slot, the task's own earlier phase settling (issues #759 and #761), or a writing
+	// phase of the same pull request settling (issue #850).
+	if (
+		dispatch.waitReason === 'project-capacity' ||
+		dispatch.waitReason === 'task-in-flight' ||
+		dispatch.waitReason === 'pr-in-flight'
+	)
 		return 'blocked';
 	if (dispatch.availableAt.getTime() > Date.now()) return 'delayed';
 	return dispatch.priority > 0 ? 'prioritized' : 'waiting';
@@ -338,7 +345,9 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
  * matches the real wake order (issue #374). A `task-in-flight` row shares the
  * bucket (it is event-woken too) and is ordered on `availableAt` within it, which
  * is `listTaskInFlightWaits`' own order — its wake-up doesn't compete for a slot
- * with the capacity rows, it waits on one specific task.
+ * with the capacity rows, it waits on one specific task. A `pr-in-flight` row
+ * (issue #850) shares it on exactly the same terms, ordered on `availableAt`, which
+ * is `listPullRequestInFlightWaits`' own order.
  */
 export function sortQueuedRuns(items: QueuedRun[]): QueuedRun[] {
 	const stateRank = (state: PendingJobState): number =>
