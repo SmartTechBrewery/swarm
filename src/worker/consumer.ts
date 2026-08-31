@@ -4182,12 +4182,33 @@ export async function processJob(
 		const effectiveTimeoutMs =
 			agentOverrideFor(project, resolution, trigger.phase, job, implementationUnplanned)
 				.timeoutMs ?? AGENT_TIMEOUT_MS;
-		await markDispatchRunning(
+		const stillClaimed = await markDispatchRunning(
 			dispatch.id,
 			runId,
 			new Date(Date.now() + effectiveTimeoutMs + DISPATCH_LEASE_MARGIN_MS),
 			dispatchResolutionFor(project, trigger),
 		);
+		// The conditional update matched nothing, so this dispatch row is no longer a
+		// claim of ours: it was cancelled, reclaimed by the lease sweep, or deleted
+		// outright — the project it belongs to was removed and the cascade took it
+		// (issue #854). Whatever the cause, nothing durable would record this phase,
+		// settle it, or cancel it any more, so it must not start. `projects.delete`
+		// already refuses while a dispatch is executing and holds the locks that keep a
+		// claim from slipping into its window ({@link deleteIdleProjectFromDb}); this is
+		// the worker-side half of that, and the general answer to a claim that stopped
+		// being ours between claiming and running. The run row, if one was written, is
+		// left to the orphan/stale sweeps that already own exactly this case, rather
+		// than overwriting a status a cancellation may have just set.
+		if (!stillClaimed) {
+			const reason = 'The dispatch was cancelled, reclaimed, or deleted before the phase started';
+			logger.warn("Abandoning phase — the dispatch is no longer this worker's claim", {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				phase: trigger.phase,
+				taskId: trigger.taskId,
+			});
+			return { status: 'dispatch-refused', reason };
+		}
 
 		// Make this run cancellable by id and honour a cancellation that already
 		// landed (a deferred run terminated as its retry was dequeued).

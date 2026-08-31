@@ -782,9 +782,17 @@ export async function hasLiveRunForTask(
  * (issue #854), because deleting the project cascades those very `runs` and
  * `dispatches` rows out from under a worker still executing them. It is a count
  * rather than a boolean so the refusal can say how many.
+ *
+ * Takes an executor so the delete guard can read it inside the same transaction
+ * that locked the project and its dispatches (`deleteIdleProjectFromDb`): a row
+ * this count is compared against must not be able to appear between the read and
+ * the `DELETE`.
  */
-export async function countRunningRunsForProject(projectId: string): Promise<number> {
-	const rows = await getDb()
+export async function countRunningRunsForProject(
+	projectId: string,
+	db: Pick<ReturnType<typeof getDb>, 'select'> = getDb(),
+): Promise<number> {
+	const rows = await db
 		.select({ total: count() })
 		.from(runs)
 		.where(and(eq(runs.projectId, projectId), eq(runs.status, 'running')));

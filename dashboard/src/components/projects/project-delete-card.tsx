@@ -25,8 +25,10 @@ import { trpcClient } from '@/lib/trpc.js';
  * takes with it (the entire run history included), and stays disabled until the
  * operator types the project id back — a delete that destroys history should be
  * deliberate, not a reflex. Whatever the server refuses with — `FORBIDDEN`,
- * `NOT_FOUND`, or the `CONFLICT` it answers a project with runs in flight — is
- * rendered verbatim in the confirmation, which stays open.
+ * `NOT_FOUND`, or the `CONFLICT` it answers a project with work in flight — is
+ * rendered verbatim in the confirmation, which stays open — including the `CONFLICT`
+ * it answers a project with work in flight (a dispatch a worker is executing, or a
+ * run row still `running`), which the server decides under a lock rather than here.
  */
 
 const DANGER_ENTRY_BUTTON_CLASS =

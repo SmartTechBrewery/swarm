@@ -24,14 +24,13 @@ import {
 } from '../../db/repositories/projectMembershipRequestsRepository.js';
 import {
 	createProjectWithMemberInDb,
-	deleteProjectFromDb,
+	deleteIdleProjectFromDb,
 	findProjectRecordByIdFromDb,
 	listAllProjectRecordsFromDb,
 	listDiscoverableProjectsFromDb,
 	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
-import { countRunningRunsForProject } from '../../db/repositories/runsRepository.js';
 import { getMembership, listProjectsForUser } from '../../identity/membership-service.js';
 import { githubProjectsBlankPm } from '../../integrations/pm/github-projects/config-schema.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
@@ -559,35 +558,55 @@ export const projectsRouter = router({
 	// `project_membership_requests`, `review_verdicts` and `worker_project_enrollments`
 	// with it, none of it recoverable.
 	//
-	// That cascade is why this refuses while the project has runs in flight, the same
+	// That cascade is why this refuses while the project has work in flight, the same
 	// `CONFLICT` `workers.remove` answers a mid-run machine deletion with — and
 	// deliberately *unlike* a PM provider switch (issue #642), which is not refused
 	// because it leaves every row intact and only re-points what they mean. Here the
 	// rows a worker is mid-way through executing would be deleted underneath it, so the
 	// operator waits or stops the run first. The guard is on the server rather than in
 	// the dashboard, so it holds for any caller; the dashboard renders the refusal.
+	//
+	// The existence check, the in-flight check and the delete are one transaction in
+	// `deleteIdleProjectFromDb`, which is what makes the refusal race-free rather than
+	// a read a dispatch claim can slip past — see its own doc comment for the two locks
+	// that serialize deletion against dispatching. This procedure only maps its outcome
+	// onto the wire.
 	delete: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.mutation(async ({ ctx, input }) => {
 			// Deleting a project is `projectAdmin`-only (same boundary as `update`).
 			await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
-			const existing = await findProjectRecordByIdFromDb(input.id);
-			if (!existing) {
+			const outcome = await deleteIdleProjectFromDb(input.id);
+			if (outcome.deleted) return;
+			if (outcome.reason === 'not-found') {
 				throw new TRPCError({
 					code: 'NOT_FOUND',
 					message: `Project with ID "${input.id}" not found`,
 				});
 			}
-			const runningRuns = await countRunningRunsForProject(input.id);
-			if (runningRuns > 0) {
-				const noun = runningRuns === 1 ? 'run' : 'runs';
-				const pronoun = runningRuns === 1 ? 'it' : 'them';
+			if (outcome.reason === 'contended') {
+				// A claim of one of this project's dispatches was landing as this ran, so
+				// the guard refused rather than waiting on it (which is what keeps the two
+				// lock orders from deadlocking). Work is starting, so this is the same
+				// refusal with a shorter horizon: retry and it resolves either way.
 				throw new TRPCError({
 					code: 'CONFLICT',
-					message: `This project has ${runningRuns} ${noun} in flight. Wait for ${pronoun} to finish, or stop ${pronoun} from the Runs screen, before deleting the project.`,
+					message:
+						'A run is being claimed for this project right now. Try deleting it again in a moment.',
 				});
 			}
-			await deleteProjectFromDb(input.id);
+			// The two counts are two views of the same work — a dispatch a worker is
+			// executing normally has a `running` run row too — so the greater of them is
+			// how many pieces of work are in flight, not their sum. They differ only at
+			// the edges: an executing dispatch whose run row does not exist yet, and a
+			// zombie `running` row whose dispatch the lease sweep already reclaimed.
+			const inFlight = Math.max(outcome.executingDispatches, outcome.runningRuns);
+			const noun = inFlight === 1 ? 'run' : 'runs';
+			const pronoun = inFlight === 1 ? 'it' : 'them';
+			throw new TRPCError({
+				code: 'CONFLICT',
+				message: `This project has ${inFlight} ${noun} in flight. Wait for ${pronoun} to finish, or stop ${pronoun} from the Runs screen, before deleting the project.`,
+			});
 		}),
 
 	// --- Open-project discovery & join flow (#281 task 5) ---

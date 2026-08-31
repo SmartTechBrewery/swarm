@@ -4689,6 +4689,48 @@ describe('processJob', () => {
 		});
 	});
 
+	describe('a claim that stopped being ours before the phase started (issue #854)', () => {
+		// `markDispatchRunning` is a *conditional* update — it matches only a `leased`/
+		// `running` row with this id. Matching nothing means the dispatch this job is
+		// executing under is no longer our claim: cancelled, reclaimed by the lease sweep,
+		// or deleted outright because its project was removed and the FK cascade took it.
+		// From there nothing durable would record, settle or cancel the phase, so it must
+		// not start — the worker-side half of `projects.delete`'s guard.
+		it('abandons the phase instead of running it when the dispatch no longer matches', async () => {
+			markDispatchRunning.mockResolvedValueOnce(false);
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'dispatch-refused' });
+			expect(phaseCalls).toEqual([]);
+		});
+
+		// The row is gone (or terminal) already, so re-settling it would either write
+		// nothing or resurrect a state something else deliberately set.
+		it('does not settle the dispatch it just found unclaimed', async () => {
+			markDispatchRunning.mockResolvedValueOnce(false);
+
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+			expect(completeDispatch).not.toHaveBeenCalled();
+			expect(failDispatch).not.toHaveBeenCalled();
+			expect(cancelClaimedDispatch).not.toHaveBeenCalled();
+		});
+
+		it('still runs the phase on the ordinary path, where the claim is still ours', async () => {
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(phaseCalls).toHaveLength(1);
+		});
+	});
+
 	describe('run-history tracking', () => {
 		it('creates a run row then finalizes it completed with the agent result on success', async () => {
 			phaseImpl = async () => ({

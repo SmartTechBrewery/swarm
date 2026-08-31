@@ -31,7 +31,13 @@ import type { ScmType } from '../../scm/types.js';
 import { getDb } from '../client.js';
 import { projectMembers } from '../schema/projectMembers.js';
 import { projects } from '../schema/projects.js';
+import {
+	DispatchLockContendedError,
+	EXECUTING_DISPATCH_STATES,
+	lockActiveDispatchStatesForProject,
+} from './dispatchesRepository.js';
 import type { AddMemberInput } from './projectMembersRepository.js';
+import { countRunningRunsForProject } from './runsRepository.js';
 
 type ProjectRow = typeof projects.$inferSelect;
 
@@ -351,9 +357,95 @@ export async function createProjectWithMemberInDb(
  * Delete a project from the DB by its ID.
  * Because of the `ON DELETE CASCADE` foreign key on `project_credentials.project_id`,
  * this will also automatically delete all related credentials.
+ *
+ * Unguarded — the caller is responsible for whatever the cascade takes with it.
+ * The dashboard/API route is {@link deleteIdleProjectFromDb}, which refuses while
+ * work is in flight.
  */
 export async function deleteProjectFromDb(id: string): Promise<void> {
 	await getDb().delete(projects).where(eq(projects.id, id));
+}
+
+/** What {@link deleteIdleProjectFromDb} did, and why it did not delete. */
+export type ProjectDeletionOutcome =
+	| { deleted: true }
+	| { deleted: false; reason: 'not-found' }
+	| {
+			deleted: false;
+			reason: 'in-flight';
+			/** Dispatches a worker is executing right now (`leased`/`running`). */
+			executingDispatches: number;
+			/** `runs` rows still marked `running`, zombies included. */
+			runningRuns: number;
+	  }
+	/**
+	 * A claim of one of this project's dispatches was in progress and holding the
+	 * row, so the guard refused rather than waiting on it (see
+	 * {@link lockActiveDispatchStatesForProject}). Work is starting; retrying resolves
+	 * it either way — into a deletion, or into a plain `in-flight` refusal.
+	 */
+	| { deleted: false; reason: 'contended' };
+
+/**
+ * Delete a project **only while nothing is executing against it** (issue #854),
+ * checking and deleting in one transaction so the answer cannot go stale between
+ * the two.
+ *
+ * The cascade on `projects.id` takes the project's `dispatches` and `runs` with it,
+ * so deleting a busy project would remove the durable records a worker mid-phase is
+ * executing *against* — the rows that record it, that a cancellation would settle,
+ * and that the lease sweep would reclaim. The guard therefore refuses, the same
+ * `CONFLICT` `workers.remove` answers a mid-run machine deletion with.
+ *
+ * Being race-free is the whole point of the transaction, and it takes two locks:
+ *
+ * - `SELECT … FOR UPDATE` on the **project row** blocks any *new* `dispatches` or
+ *   `runs` row for it, because inserting a child takes the FK's conflicting
+ *   `FOR KEY SHARE` lock on that parent row. It is also the existence check.
+ * - `FOR UPDATE` on every **non-terminal dispatch**
+ *   ({@link lockActiveDispatchStatesForProject}) blocks a *claim* of an already
+ *   queued dispatch, which touches no `projects` row at all. Without it a `pending`
+ *   dispatch could be claimed and start executing between the count and the
+ *   `DELETE` — the window in which a worker holds a project snapshot but has not yet
+ *   written its run row, so counting `running` runs alone would have seen nothing.
+ *
+ * A queued (`pending`/`retry-scheduled`) dispatch is deliberately *not* a refusal:
+ * nothing is executing it, and once this transaction commits its row is gone and the
+ * claim that was blocking on the lock updates zero rows, so the wake-up is dropped
+ * rather than run against a deleted project. Only work actually in flight —
+ * `leased`/`running` dispatches, plus `running` run rows, the same two views of it
+ * the reconciler reaps separately — holds a deletion off.
+ */
+export async function deleteIdleProjectFromDb(id: string): Promise<ProjectDeletionOutcome> {
+	try {
+		return await getDb().transaction(async (tx) => {
+			const [locked] = await tx
+				.select({ id: projects.id })
+				.from(projects)
+				.where(eq(projects.id, id))
+				.for('update')
+				.limit(1);
+			if (!locked) return { deleted: false, reason: 'not-found' };
+
+			const dispatchStates = await lockActiveDispatchStatesForProject(id, tx);
+			const executingDispatches = dispatchStates.filter((state) =>
+				EXECUTING_DISPATCH_STATES.some((executing) => executing === state),
+			).length;
+			const runningRuns = await countRunningRunsForProject(id, tx);
+			if (executingDispatches > 0 || runningRuns > 0) {
+				return { deleted: false, reason: 'in-flight', executingDispatches, runningRuns };
+			}
+
+			await tx.delete(projects).where(eq(projects.id, id));
+			return { deleted: true };
+		});
+	} catch (err) {
+		// Rethrown out of the transaction on purpose, so the rollback releases the
+		// project lock the contending claim may itself be waiting on before this
+		// answers the caller.
+		if (err instanceof DispatchLockContendedError) return { deleted: false, reason: 'contended' };
+		throw err;
+	}
 }
 
 /**
