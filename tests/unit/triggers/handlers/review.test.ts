@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
-import type { AggregateCheckStatus } from '@/scm/types.js';
+import type { ScmDeliveryProvider } from '@/scm/delivery.js';
+import type { AggregateCheckStatus, ScmPersona } from '@/scm/types.js';
 import { createReviewTrigger } from '@/triggers/handlers/review.js';
 import type { TriggerContext } from '@/triggers/types.js';
 import {
@@ -56,32 +57,47 @@ const {
 	hasPersonaToken,
 	getPullRequest,
 	commentOnPullRequest,
+	getBranchHead,
+	deliveryPostComment,
 } = vi.hoisted(() => ({
 	getAggregateCheckStatus: vi.fn(),
 	scheduleCoalescedJob: vi.fn(),
 	hasPersonaToken: vi.fn(),
 	getPullRequest: vi.fn(),
 	commentOnPullRequest: vi.fn(),
+	// The base-branch health read the red path takes before attributing a failure
+	// (issue #873), and the delivery seam its notice is posted through.
+	getBranchHead: vi.fn(),
+	deliveryPostComment: vi.fn(),
 }));
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
+
+const deliveryProvider = vi.fn(
+	async (_project: ProjectConfig, _persona: ScmPersona) =>
+		({ postComment: deliveryPostComment }) as unknown as ScmDeliveryProvider,
+);
 
 const SCM = createFakeScmProvider({
 	getAggregateCheckStatus,
 	hasPersonaToken,
 	getPullRequest,
 	commentOnPullRequest,
+	getBranchHead,
+	deliveryProvider,
 });
 
-const { loggerWarn, loggerDebug } = vi.hoisted(() => ({
+const { loggerWarn, loggerDebug, loggerInfo, loggerError } = vi.hoisted(() => ({
 	loggerWarn: vi.fn(),
 	loggerDebug: vi.fn(),
+	loggerInfo: vi.fn(),
+	loggerError: vi.fn(),
 }));
 vi.mock('@/lib/logger.js', () => ({
 	logger: {
 		warn: loggerWarn,
 		debug: loggerDebug,
-		info: vi.fn(),
-		error: vi.fn(),
+		info: loggerInfo,
+		error: loggerError,
 	},
 }));
 
@@ -157,6 +173,15 @@ beforeEach(() => {
 		state: 'open',
 	});
 	commentOnPullRequest.mockReset();
+	// Base-branch attribution default (issue #873): the provider names no head for
+	// the base branch, which `readBaseBranchHealth` reports as `unknown` — the
+	// fail-open answer, so every suite that does not care about the base keeps the
+	// pre-#873 routing and costs no second aggregate read. Suites that do care set
+	// a head and answer for it.
+	getBranchHead.mockReset();
+	getBranchHead.mockResolvedValue(null);
+	deliveryPostComment.mockReset();
+	deliveryPostComment.mockResolvedValue(1);
 });
 
 const PROJECT = createMockProjectConfig();
@@ -1957,5 +1982,249 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 				),
 			),
 		).toBeNull();
+	});
+});
+
+describe('review trigger — a red the base branch explains (issue #873)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+
+	const BASE_HEAD = 'base-head-sha';
+
+	/**
+	 * Answer the aggregate query per commit, so the pull request's head and the
+	 * base branch's head can disagree — which is the whole question this path asks.
+	 */
+	function aggregateByCommit(byRef: Record<string, AggregateCheckStatus>): void {
+		getAggregateCheckStatus.mockImplementation(async (_project: ProjectConfig, ref: string) => {
+			const status = byRef[ref];
+			if (!status) throw new Error(`unexpected aggregate read for ${ref}`);
+			return status;
+		});
+	}
+
+	const PR_RED = checkStatus([
+		['build', 'completed', 'success'],
+		['unit', 'completed', 'failure'],
+	]);
+
+	beforeEach(() => {
+		getBranchHead.mockResolvedValue(BASE_HEAD);
+	});
+
+	it('routes to Respond-to-CI when the base branch is green', async () => {
+		aggregateByCommit({
+			cafe: PR_RED,
+			[BASE_HEAD]: checkStatus([['unit', 'completed', 'success']]),
+		});
+
+		expect(await handler.handle(ctx(checks))).toEqual({
+			phase: 'respond-to-ci',
+			taskId: '9-ci',
+			prNumber: '9',
+			prBranch: 'issue-9',
+			headSha: 'cafe',
+		});
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		expect(deliveryPostComment).not.toHaveBeenCalled();
+	});
+
+	// Fails open: never withhold a legitimate fix because the base could not be read.
+	it('routes to Respond-to-CI when the base branch head cannot be read', async () => {
+		getBranchHead.mockRejectedValue(new Error('rate limited'));
+		aggregateByCommit({ cafe: PR_RED });
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		expect(deliveryPostComment).not.toHaveBeenCalled();
+	});
+
+	// The intersection requirement: a coincidentally red base is not a hiding place.
+	it('routes to Respond-to-CI when the red base fails on other checks', async () => {
+		aggregateByCommit({
+			cafe: PR_RED,
+			[BASE_HEAD]: checkStatus([['lint', 'completed', 'failure']]),
+		});
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		expect(deliveryPostComment).not.toHaveBeenCalled();
+		expect(loggerInfo).toHaveBeenCalledWith(
+			expect.stringContaining('red on other checks'),
+			expect.objectContaining({ baseFailedChecks: ['lint'], failedChecks: ['unit'] }),
+		);
+	});
+
+	describe('when the base branch is red on the same checks', () => {
+		beforeEach(() => {
+			aggregateByCommit({
+				cafe: PR_RED,
+				[BASE_HEAD]: checkStatus([
+					['unit', 'completed', 'failure'],
+					['lint', 'completed', 'failure'],
+				]),
+			});
+		});
+
+		it('dispatches nothing and spends no fix attempt, verdict slot or dedup claim', async () => {
+			expect(await handler.handle(ctx(checks))).toBeNull();
+
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			expect(reserveReviewVerdict).not.toHaveBeenCalled();
+			// The slot has to stay free: a human re-running CI against a fixed base is
+			// what produces the Review this PR is still owed.
+			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(createFailedRun).not.toHaveBeenCalled();
+			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		});
+
+		it('comments once, naming the base branch, its head and the shared checks', async () => {
+			await handler.handle(ctx(checks));
+
+			expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'implementer');
+			expect(deliveryPostComment).toHaveBeenCalledTimes(1);
+			const posted = deliveryPostComment.mock.calls[0][0];
+			expect(posted.prNumber).toBe(9);
+			expect(posted.body).toContain('`main`');
+			expect(posted.body).toContain(BASE_HEAD.slice(0, 7));
+			expect(posted.body).toContain('`unit`');
+			// Only the shared failure is named — `lint` is the base's alone.
+			expect(posted.body).not.toContain('`lint`');
+			expect(loggerInfo).toHaveBeenCalledWith(
+				expect.stringContaining('attributed to the base branch'),
+				expect.objectContaining({
+					prNumber: '9',
+					headSha: 'cafe',
+					baseBranch: 'main',
+					baseHeadSha: BASE_HEAD,
+					sharedChecks: ['unit'],
+				}),
+			);
+		});
+
+		it('reuses one delivery id across sibling check events at the same base head', async () => {
+			await handler.handle(ctx(checks));
+			await handler.handle(ctx(checks));
+
+			expect(deliveryPostComment).toHaveBeenCalledTimes(2);
+			expect(deliveryPostComment.mock.calls[0][0].deliveryId).toBe(
+				deliveryPostComment.mock.calls[1][0].deliveryId,
+			);
+		});
+
+		it('mints a new delivery id once the base head advances', async () => {
+			await handler.handle(ctx(checks));
+
+			const nextBase = 'base-head-sha-2';
+			getBranchHead.mockResolvedValue(nextBase);
+			aggregateByCommit({
+				cafe: PR_RED,
+				[nextBase]: checkStatus([['unit', 'completed', 'failure']]),
+			});
+			await handler.handle(ctx(checks));
+
+			expect(deliveryPostComment.mock.calls[0][0].deliveryId).not.toBe(
+				deliveryPostComment.mock.calls[1][0].deliveryId,
+			);
+		});
+
+		it('keeps the attribution when the comment cannot be posted', async () => {
+			deliveryPostComment.mockRejectedValue(new Error('502 from the provider'));
+
+			expect(await handler.handle(ctx(checks))).toBeNull();
+
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			expect(loggerError).toHaveBeenCalledWith(
+				expect.stringContaining('failed to post the base-blocked notice'),
+				expect.objectContaining({ prNumber: '9', baseHeadSha: BASE_HEAD }),
+			);
+		});
+
+		it('says nothing at all when the CI-fix phase is disabled for the project', async () => {
+			const project = createMockProjectConfig({ pipeline: { respondToCi: { enabled: false } } });
+
+			expect(await handler.handle({ ...ctx(checks), project })).toBeNull();
+
+			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
+	});
+
+	// A pull request retargeted off the project's configured base still builds
+	// against the base it now names, so that is the branch the attribution asks
+	// about — reading `project.baseBranch` instead would both invent an
+	// explanation the PR never built against and withhold its CI fix.
+	describe('when the pull request targets a base other than the project default', () => {
+		const RELEASE_HEAD = 'release-head-sha';
+
+		beforeEach(() => {
+			getPullRequest.mockResolvedValue({
+				number: 9,
+				headBranch: 'issue-42',
+				headSha: 'cafe',
+				baseBranch: 'release/1.0',
+				baseSha: 'release-base-sha',
+				mergeable: true,
+				authorLogin: 'operator-human',
+				state: 'open',
+			});
+			getBranchHead.mockImplementation(async (_project: ProjectConfig, branch: string) =>
+				branch === 'release/1.0' ? RELEASE_HEAD : BASE_HEAD,
+			);
+		});
+
+		it('routes to Respond-to-CI when the project base is red but its own base is green', async () => {
+			aggregateByCommit({
+				cafe: PR_RED,
+				[RELEASE_HEAD]: checkStatus([['unit', 'completed', 'success']]),
+				[BASE_HEAD]: checkStatus([['unit', 'completed', 'failure']]),
+			});
+
+			expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+			expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'implementer');
+			expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, 'main', 'implementer');
+			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
+
+		it('blocks and names its own base when that base is red on the shared check', async () => {
+			aggregateByCommit({
+				cafe: PR_RED,
+				[RELEASE_HEAD]: checkStatus([['unit', 'completed', 'failure']]),
+			});
+
+			expect(await handler.handle(ctx(checks))).toBeNull();
+
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			const posted = deliveryPostComment.mock.calls[0][0];
+			expect(posted.body).toContain('`release/1.0`');
+			expect(posted.body).not.toContain('`main`');
+			expect(posted.body).toContain(RELEASE_HEAD.slice(0, 7));
+			expect(loggerInfo).toHaveBeenCalledWith(
+				expect.stringContaining('attributed to the base branch'),
+				expect.objectContaining({ baseBranch: 'release/1.0', baseHeadSha: RELEASE_HEAD }),
+			);
+		});
+	});
+
+	// The cost contract: the base is only ever read on an already-red aggregate.
+	it('never reads the base branch when the pull request is green', async () => {
+		aggregateByCommit({ cafe: checkStatus([['unit', 'completed', 'success']]) });
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'review' });
+		expect(getBranchHead).not.toHaveBeenCalled();
+	});
+
+	// The #841 bypass runs first and answers the same event without a base read.
+	it('never reads the base branch on a no-fix recovery', async () => {
+		aggregateByCommit({ cafe: PR_RED });
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+			phase: 'review',
+		});
+		expect(getBranchHead).not.toHaveBeenCalled();
 	});
 });

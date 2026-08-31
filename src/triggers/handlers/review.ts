@@ -117,6 +117,30 @@
  * reuses the held claim, and a delayed ordinary completed-check event for the
  * same head is locked out of starting a second CI fix.
  *
+ * **A red the base branch already explains is attributed to the base, not to
+ * the PR** (issue #873). Beside the bypass above — the same branch, a second
+ * judgement about *whose* red this is — `resolveAggregateCheckReview` reads the
+ * health of the base branch **this pull request targets**, as the mergeability
+ * gate's own PR read reported it rather than as the project configured it
+ * (`readBaseBranchHealth`, `src/dispatch/base-branch-health.ts`, issue #872), and
+ * when that base is red
+ * with checks that overlap this PR's failing ones, resolves `blocked-by-base`
+ * instead of `respond-to-ci`: no dispatch, no fix attempt spent, no review-verdict
+ * slot reserved, and one idempotent comment naming the base branch, its head and
+ * the shared checks. The intersection requirement is what stops a genuinely
+ * self-broken PR from hiding behind a coincidentally red base, and the read
+ * happens only on an *already red* aggregate, so the healthy path costs nothing
+ * extra. It fails **open** in both directions that matter: a base that cannot be
+ * read (`unknown`) and a red base whose failures are disjoint both route to
+ * Respond-to-CI exactly as before — SWARM never withholds a legitimate fix
+ * because it could not see the base.
+ *
+ * **A blocked PR is not re-dispatched when the base recovers** — deliberately,
+ * and it is the known limitation of this half. Nothing here waits for the base:
+ * the PR is left where it is, and what unblocks it is a fresh head and a fresh
+ * CI run, which issue #874's base-update path is what produces. Until then a
+ * human re-running CI works exactly as it does today.
+ *
  * **Same-repo gate.** Fork PRs are dropped (`pull-request` events, via
  * `isCrossRepo`): the Review phase's `provision` fetches only the base repo's
  * refs, so a fork's head SHA is unreachable and the detached checkout would
@@ -156,9 +180,11 @@ import {
 	reserveReviewVerdict,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import { createFailedRun } from '../../db/repositories/runsRepository.js';
+import { readBaseBranchHealth } from '../../dispatch/base-branch-health.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { logger } from '../../lib/logger.js';
 import type { SwarmJob } from '../../queue/jobs.js';
+import { deliveryIdentity } from '../../scm/delivery.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
@@ -181,12 +207,16 @@ import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
 /**
  * What a shape-matched event resolves to once its per-event-kind gate has run.
  * A `checks` event whose checks all passed → `review`; one where a check failed →
- * `respond-to-ci` (carrying the failing run names for the dispatch log); a
+ * `respond-to-ci` (carrying the failing run names for the dispatch log) or
+ * `blocked-by-base` when the base branch's own red already explains it (issue
+ * #873, carrying that base branch, its head and the checks the two have in
+ * common); a
  * draft/fork PR or an incomplete/deferred suite → `none`.
  */
 type ReviewDisposition =
 	| { kind: 'review' }
 	| { kind: 'respond-to-ci'; failedChecks: string[] }
+	| { kind: 'blocked-by-base'; baseBranch: string; baseHeadSha: string; sharedChecks: string[] }
 	| { kind: 'none' };
 
 function isDispositionDisabled(
@@ -199,7 +229,14 @@ function isDispositionDisabled(
 		logger.debug('review: phase disabled — skipping', { prNumber, headSha });
 		return true;
 	}
-	if (disposition.kind === 'respond-to-ci' && project.pipeline?.respondToCi?.enabled === false) {
+	// `blocked-by-base` is the other outcome of the *same* red-check path (issue
+	// #873), so the same switch silences it: a project that turned the CI-fix
+	// phase off has opted out of SWARM speaking about its failing checks at all,
+	// and a comment attributing them elsewhere is still SWARM speaking about them.
+	if (
+		(disposition.kind === 'respond-to-ci' || disposition.kind === 'blocked-by-base') &&
+		project.pipeline?.respondToCi?.enabled === false
+	) {
 		logger.debug('respond-to-ci: phase disabled — skipping', { prNumber, headSha });
 		return true;
 	}
@@ -525,9 +562,82 @@ async function scheduleCheckRecheck(
 }
 
 /**
+ * Ask whether this pull request's red belongs to the **base branch** rather than
+ * to its own diff, and say so when it plainly does (issue #873).
+ *
+ * Called only from the `respond-to-ci` branch below, on an aggregate that is
+ * already red — which is what makes the read free on the healthy path: a green
+ * pull request never reaches here and costs no extra provider call.
+ *
+ * The rule is deliberately narrow, and every way it can be wrong falls **open**:
+ *
+ *  - anything but `red` — including `unknown`, which is the base read having
+ *    *failed* — routes to Respond-to-CI unchanged. Withholding a legitimate fix
+ *    because the base could not be read would be a worse failure than spending
+ *    one fix attempt on a red the base did explain.
+ *  - `red` with a failure set that does not intersect this pull request's own is
+ *    also the pull request's problem. Two repositories can be red at once for
+ *    unrelated reasons, and without the intersection every self-broken pull
+ *    request would hide behind a coincidentally red base.
+ *
+ * {@link readBaseBranchHealth} reads the base branch's **current** head, while
+ * these checks were built against the base as of their own CI run — so the two
+ * commits need not be the same one. That approximation is exactly what the
+ * check-name intersection makes robust: a base that has since been fixed reads
+ * green and attributes nothing, and a base broken *after* this run reads red but
+ * only claims the failures the two actually share.
+ *
+ * `baseBranch` is the branch **this pull request actually targets**, carried
+ * from the details the mergeability gate already fetched — not
+ * `project.baseBranch`. They usually agree, and when they do not it is the pull
+ * request that is right: a pull request retargeted onto `release/1.0` builds
+ * against `release/1.0`, so a red `main` neither explains its failures nor may
+ * be allowed to withhold its CI fix.
+ */
+async function resolveBaseBranchAttribution(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	baseBranch: string,
+	failedChecks: string[],
+): Promise<Extract<ReviewDisposition, { kind: 'blocked-by-base' }> | null> {
+	const { project } = ctx;
+	const health = await readBaseBranchHealth(project, ctx.scm, baseBranch);
+	if (health.status !== 'red') {
+		logger.debug('review: base branch does not explain this red — routing to Respond-to-CI', {
+			prNumber,
+			headSha,
+			baseBranch,
+			baseHealth: health.status,
+			...(health.status === 'unknown' ? { baseReadFailure: health.reason } : {}),
+		});
+		return null;
+	}
+
+	// Compared by check name exactly as the provider reports it — no case folding
+	// or normalization, because a check's name *is* its identity to the provider
+	// and two differently-cased names are two different checks.
+	const failed = new Set(failedChecks);
+	const sharedChecks = [...new Set(health.failedChecks.filter((name) => failed.has(name)))];
+	if (sharedChecks.length === 0) {
+		logger.info('review: base branch is red on other checks — this red belongs to the PR', {
+			prNumber,
+			headSha,
+			baseBranch,
+			baseHeadSha: health.headSha,
+			baseFailedChecks: health.failedChecks,
+			failedChecks,
+		});
+		return null;
+	}
+	return { kind: 'blocked-by-base', baseBranch, baseHeadSha: health.headSha, sharedChecks };
+}
+
+/**
  * Decide a `checks` event's fate from the head SHA's *aggregate* check state.
  * Returns `review` to proceed to review, `respond-to-ci` when a check failed
- * (routing the PR to the build-fix phase), or `none` when the event is handled
+ * (routing the PR to the build-fix phase), `blocked-by-base` when that failure is
+ * the base branch's own (issue #873), or `none` when the event is handled
  * here (an incomplete suite's recheck scheduled, or a bounded give-up). The
  * aggregate query runs as the provider's default read persona — the reviewer,
  * read-only, and the persona whose review follows.
@@ -547,6 +657,7 @@ async function resolveAggregateCheckReview(
 	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
+	baseBranch: string,
 ): Promise<ReviewDisposition> {
 	const { project } = ctx;
 
@@ -575,6 +686,16 @@ async function resolveAggregateCheckReview(
 			});
 			return { kind: 'review' };
 		}
+		// Beside the bypass above, and the same shape: a second judgement about
+		// *whose* red this is, taken before any fix attempt is spent (issue #873).
+		const blockedByBase = await resolveBaseBranchAttribution(
+			ctx,
+			prNumber,
+			headSha,
+			baseBranch,
+			decision.failedChecks,
+		);
+		if (blockedByBase) return blockedByBase;
 		return { kind: 'respond-to-ci', failedChecks: decision.failedChecks };
 	}
 
@@ -587,18 +708,20 @@ async function resolveAggregateCheckReview(
 /**
  * What a shape-matched event resolves to, routing to the per-event-kind gate: a
  * `pull-request`'s draft/fork check (`review`/`none`), or a `checks` event's
- * aggregate-CI decision (`review`/`respond-to-ci`/`none`, and it may defer a
- * recheck in place).
+ * aggregate-CI decision (`review`/`respond-to-ci`/`blocked-by-base`/`none`, and
+ * it may defer a recheck in place). `baseBranch` is the pull request's own base,
+ * carried from the mergeability gate for the base-attribution read.
  */
 function resolveDisposition(
 	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
+	baseBranch: string,
 ): ReviewDisposition | Promise<ReviewDisposition> {
 	if (ctx.event.kind === 'pull-request') {
 		return isReviewablePullRequest(ctx.event, prNumber);
 	}
-	return resolveAggregateCheckReview(ctx, prNumber, headSha);
+	return resolveAggregateCheckReview(ctx, prNumber, headSha, baseBranch);
 }
 
 /**
@@ -919,6 +1042,117 @@ async function scmCommentCiFixGaveUp(
 	}
 }
 
+/**
+ * The deterministic once-only identity of the base-blocked notice, keyed on the
+ * **(pull-request head, base head)** pair rather than on the event: a red pull
+ * request emits one `checks` event per CI workflow, and the same attribution
+ * holds for all of them, so a per-event id would post the same paragraph several
+ * times over. A base head that advances *is* a new fact — the base broke again,
+ * or broke differently — and gets its own comment.
+ *
+ * `project.repo` is in the hash for the reason `baseBranchRedDeliveryId`
+ * (`src/dispatch/base-branch-health.ts`) states: a project spans repositories
+ * (issue #685), so a shared key would let one repository's report absorb
+ * another's as an already-delivered repeat. The base branch's *name* is in it
+ * for the same reason at a finer grain: a pull request retargeted onto another
+ * base is a different attribution, and must not be silenced as a repeat of the
+ * one already posted for the base it left.
+ */
+function baseBlockedDeliveryId(
+	project: ProjectConfig,
+	prNumber: string,
+	headSha: string,
+	baseBranch: string,
+	baseHeadSha: string,
+): string {
+	return deliveryIdentity([
+		'base-blocked',
+		project.repo,
+		prNumber,
+		headSha,
+		baseBranch,
+		baseHeadSha,
+	]);
+}
+
+/** The notice posted on a pull request whose red CI the base branch already explains. */
+function baseBlockedCommentBody(
+	baseBranch: string,
+	baseHeadSha: string,
+	sharedChecks: string[],
+): string {
+	const checks = sharedChecks.map((name) => `\`${name}\``).join(', ');
+	return [
+		`## ⚠️ Blocked by \`${baseBranch}\` being red`,
+		'',
+		`\`${baseBranch}\` is itself failing at \`${baseHeadSha.slice(0, 7)}\`, on the same checks that are failing here: ${checks}.`,
+		'',
+		"This pull request's checks build the merge of its head with that base, so this",
+		'failure is not attributed to its own diff. SWARM attempted no automated CI fix',
+		"and spent none of this pull request's fix attempts.",
+		'',
+		`Once \`${baseBranch}\` is green again, a fresh run of these checks is what clears`,
+		'this pull request.',
+		'',
+		'---',
+		// Load-bearing, not decoration: ingress drops an inbound comment event whose
+		// body carries `SWARM_GENERATED_SIGNATURE` (`isSwarmGeneratedBody`), which is
+		// what stops this comment from waking a trigger.
+		SWARM_GENERATED_FOOTER,
+	].join('\n');
+}
+
+/**
+ * Report a `blocked-by-base` disposition (issue #873): the structured `info` log
+ * that makes the attribution auditable, and the once-per-(head, base head)
+ * comment on the pull request itself.
+ *
+ * Posted through the **delivery seam** rather than `commentOnPullRequest`,
+ * unlike the two give-up notices above, because those are terminal one-shots
+ * while this one is reached again by every sibling `checks` event for the same
+ * head — the per-delivery marker is what makes it land once with no new durable
+ * state to keep.
+ *
+ * Best-effort, on {@link scmCommentCiFixGaveUp}'s posture: the log line above it
+ * already carries every fact, so a provider that cannot be reached costs the
+ * comment and not the judgement. Never throws — a throw here would escape
+ * `handle` into `processJob`'s untried region and fail the job.
+ */
+async function reportBaseBlockedPullRequest(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	disposition: Extract<ReviewDisposition, { kind: 'blocked-by-base' }>,
+): Promise<void> {
+	const { project } = ctx;
+	const { baseBranch, baseHeadSha, sharedChecks } = disposition;
+	logger.info('review: red checks attributed to the base branch — no CI fix dispatched', {
+		prNumber,
+		headSha,
+		baseBranch,
+		baseHeadSha,
+		sharedChecks,
+	});
+
+	try {
+		// Implementer, the persona `readBaseBranchHealth` just read the base with, so
+		// one attribution does not speak as two different accounts.
+		const delivery = await ctx.scm.deliveryProvider(project, 'implementer');
+		await delivery.postComment({
+			prNumber: Number(prNumber),
+			body: baseBlockedCommentBody(baseBranch, baseHeadSha, sharedChecks),
+			deliveryId: baseBlockedDeliveryId(project, prNumber, headSha, baseBranch, baseHeadSha),
+		});
+	} catch (error) {
+		logger.error('review: failed to post the base-blocked notice', {
+			prNumber,
+			headSha,
+			baseHeadSha,
+			error: String(error),
+		});
+	}
+}
+
 async function scheduleMergeabilityRecheck(
 	ctx: ScmTriggerContext,
 	budget: DeferBudget,
@@ -974,9 +1208,13 @@ function logOwnershipSkip(
 /**
  * The mergeability gate's "carry on to the disposition" answer. It carries the PR
  * head branch the gate already fetched, so the Review dispatch can name it
- * (`TriggerResult`'s `prBranch`) without a second provider round-trip.
+ * (`TriggerResult`'s `prBranch`) without a second provider round-trip — and, for
+ * the same reason, the **base** branch that pull request targets, which is what
+ * base attribution (issue #873) must judge a red against rather than
+ * `project.baseBranch`: an open pull request can be retargeted at any time, and
+ * the provider's answer is the one that says what its checks actually built.
  */
-type MergeabilityCleared = { cleared: true; prBranch: string };
+type MergeabilityCleared = { cleared: true; prBranch: string; baseBranch: string };
 
 async function checkMergeabilityAndConflicts(
 	ctx: ScmTriggerContext,
@@ -1064,7 +1302,7 @@ async function checkMergeabilityAndConflicts(
 		return null;
 	}
 
-	return { cleared: true, prBranch: prDetails.headBranch };
+	return { cleared: true, prBranch: prDetails.headBranch, baseBranch: prDetails.baseBranch };
 }
 
 async function handleConflictingPullRequest(
@@ -1144,9 +1382,20 @@ export function createReviewTrigger(): TriggerHandler {
 			// (`null`) or a Resolve-conflicts dispatch.
 			if (!mergeCheck || !('cleared' in mergeCheck)) return mergeCheck;
 
-			const disposition = await resolveDisposition(ctx, prNumber, headSha);
+			const disposition = await resolveDisposition(ctx, prNumber, headSha, mergeCheck.baseBranch);
 			if (disposition.kind === 'none') return null;
 			if (isDispositionDisabled(project, disposition, prNumber, headSha)) return null;
+
+			// A red the base branch already explains (issue #873) is reported and
+			// dropped here — deliberately *before* the PR+SHA dedup claim below, and so
+			// before both the fix-attempt claim and the review-verdict reservation.
+			// Nothing is dispatched, so nothing may consume a slot: taking the dedup
+			// claim would lock this same head out of the Review that a human re-running
+			// CI against a fixed base is meant to produce.
+			if (disposition.kind === 'blocked-by-base') {
+				await reportBaseBlockedPullRequest(ctx, prNumber, headSha, disposition);
+				return null;
+			}
 
 			// Cross-process dedup: claim this PR+SHA before dispatching so a sibling
 			// event for the same commit (PR opened → check suite passed, or one
