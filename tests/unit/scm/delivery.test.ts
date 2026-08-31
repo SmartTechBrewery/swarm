@@ -348,6 +348,15 @@ describe('assertCheckoutHoldsHead', () => {
 		);
 	});
 
+	// Fails open: the ref is unresolvable, which is no evidence at all that the branch
+	// was rewritten — only a name git resolved and found missing is that.
+	it('reports an unchanged head when the dispatched ref is not an object name', async () => {
+		const { clone } = makeRemoteAndClone();
+		commitOn(clone, 'issue-1', 'the branch as it stands now\n');
+
+		await expect(assertCheckoutHoldsHead(clone, 'issue-1', 'not-a-sha')).resolves.toBe('unchanged');
+	});
+
 	// Fails open: a blip must not fail a phase that would otherwise have succeeded.
 	it('reports an unchanged head when git cannot answer at all', async () => {
 		const root = mkdtempSync(join(tmpdir(), 'swarm-no-repo-'));

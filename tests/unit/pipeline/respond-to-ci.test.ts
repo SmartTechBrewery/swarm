@@ -519,6 +519,18 @@ describe('runRespondToCiPhase', () => {
 			expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 		});
 
+		// An unresolvable dispatched ref proves nothing about the branch, so the check
+		// stands aside and the agent still fixes the red build.
+		it('runs the agent anyway when the checked head is not a resolvable ref', async () => {
+			const deps = makeDeps();
+
+			const result = await runRespondToCiPhase({ ...deps, headSha: 'not-a-sha' });
+
+			expect(result.outcome).toBe('fixed');
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+			expect(movedHeadWarnings()).toHaveLength(0);
+		});
+
 		it('refuses to commit at all once origin has moved past the checkout', async () => {
 			const deps = makeDeps();
 			const coPushed = coPushToOrigin(deps.path);

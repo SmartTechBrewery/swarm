@@ -672,16 +672,24 @@ async function isAncestor(
 }
 
 /**
- * Whether this checkout actually holds `sha` as a commit. Absence is the answer on
- * any failure: `cat-file -e` exits 1 for a well-formed sha that is missing and 128
- * for one git cannot even parse, and the caller has already proved git runs here.
+ * Whether this checkout holds `sha` at all: `true`, a confirmed `false`, or `null`
+ * when git could not answer the question.
+ *
+ * The object is deliberately *not* peeled to `^{commit}`. `cat-file -e` exits **1**
+ * only for an object name it resolved and found missing, and peeling turns that
+ * missing object into the same **128** git reports for a string that is no object
+ * name at all — which would make an unresolvable dispatched ref (`'not-a-sha'`) as
+ * terminal as a force-push. Unpeeled, exit 1 *is* the force-pushed commit and 128 is
+ * "ask someone else", which is the split {@link assertCheckoutHoldsHead} needs.
+ * Whether the object is a commit is a question `merge-base --is-ancestor` asks next,
+ * and fails open on.
  */
-async function commitPresent(cwd: string, sha: string): Promise<boolean> {
+async function commitPresent(cwd: string, sha: string): Promise<boolean | null> {
 	try {
-		await git(cwd, ['cat-file', '-e', `${sha}^{commit}`]);
+		await git(cwd, ['cat-file', '-e', sha]);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		return gitExitCode(error) === 1 ? false : null;
 	}
 }
 
@@ -719,11 +727,14 @@ function rewrittenHeadMessage(branch: string, expectedSha: string, head: string)
  *
  * Fails **open** on git failing to answer — logged and reported `'unchanged'`,
  * because a blip must not fail a phase that would otherwise have succeeded and
- * {@link pushDeliveredBranch} still classifies a real divergence. Absence of the
- * commit from the object store is the one thing deliberately *not* read as
- * unanswerable: `merge-base --is-ancestor` cannot tell it from a broken repository
- * (both exit 128), and a force-pushed branch is exactly where that object is gone,
- * so presence is probed separately and its absence is the terminal answer.
+ * {@link pushDeliveredBranch} still classifies a real divergence. That covers a head
+ * that cannot be read, an ancestry git will not evaluate, and a dispatched ref git
+ * cannot resolve as an object name at all: none of the three is evidence the branch
+ * was rewritten. Only a *confirmed* absence is terminal — `merge-base --is-ancestor`
+ * cannot tell that from a broken repository (both exit 128) and a force-pushed branch
+ * is exactly where the object is gone, so presence is probed separately by
+ * {@link commitPresent}, which reports absence only when git resolved the name and
+ * found nothing.
  */
 export async function assertCheckoutHoldsHead(
 	cwd: string,
@@ -742,8 +753,16 @@ export async function assertCheckoutHoldsHead(
 		return 'unchanged';
 	}
 	if (head === expectedSha) return 'unchanged';
-	if (!(await commitPresent(cwd, expectedSha)))
-		throw new UnretryableDeliveryError(rewrittenHeadMessage(branch, expectedSha, head));
+	const present = await commitPresent(cwd, expectedSha);
+	if (present === null) {
+		logger.warn('Git could not resolve the dispatched head — proceeding without the check', {
+			branch,
+			expectedSha,
+			head,
+		});
+		return 'unchanged';
+	}
+	if (!present) throw new UnretryableDeliveryError(rewrittenHeadMessage(branch, expectedSha, head));
 	const contains = await isAncestor(cwd, expectedSha, head);
 	if (contains === null) {
 		logger.warn('Git could not compare the checkout head with the dispatched head — proceeding', {
