@@ -19,6 +19,7 @@ import type { ProposedScope } from '@/pipeline/planning.js';
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
+import { TRANSPORT_LOST_ORPHAN_REASON } from '@/router/transport-loss-reaper.js';
 import { DeliveryDeferredError, HANDOFF_FILENAMES, validatePreparedTree } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import {
@@ -4689,6 +4690,31 @@ describe('processJob', () => {
 					PROJECT.id,
 					PROJECT.repo,
 					'17',
+				);
+
+				// …and when the settle is the transport-loss reap's (issue #859). The
+				// orphaned Respond-to-review of the live incident unwinds as this same
+				// non-deferrable failure, so the pull request it was holding is released and
+				// the phase queued behind it is woken — inside the reap's grace rather than
+				// at the end of the phase's own lease window.
+				promotePullRequestInFlightWaits.mockClear();
+				failDispatch.mockClear();
+				phaseImpl = async () => {
+					throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'error' });
+				};
+				const orphaned = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+				expect(orphaned.status).toBe('phase-failed');
+				expect(promotePullRequestInFlightWaits).toHaveBeenCalledWith(
+					PROJECT.id,
+					PROJECT.repo,
+					'17',
+				);
+				expect(failDispatch).toHaveBeenCalledWith(
+					'dispatch-1',
+					expect.stringContaining(TRANSPORT_LOST_ORPHAN_REASON),
 				);
 			});
 

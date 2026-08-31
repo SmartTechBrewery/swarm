@@ -96,6 +96,7 @@ import {
 	TRANSPORT_LOST_NOTE,
 	TRANSPORT_RESTORED_NOTE,
 } from './stream-log-persistence.js';
+import { reapDispatchesIfTransportStaysLost } from './transport-loss-reaper.js';
 import {
 	deregisterConnection,
 	isWorkerConnected,
@@ -207,6 +208,13 @@ export interface WorkerTransportDeps {
 	 * reaching the control plane reads exactly like one that stopped progressing.
 	 * Fire-and-forget by contract, like `onWorkerAvailable`: both return `void` so a
 	 * socket's lifecycle never waits on Postgres.
+	 *
+	 * Since issue #859 the *lost* half also arms the bounded reap of those same
+	 * dispatches (`./transport-loss-reaper.ts`), so a worker that never comes back
+	 * stops holding its pull request, task and capacity for the rest of the phase's
+	 * lease window. That is part of what the **default** hook does rather than a new
+	 * dep on this interface, so a test that overrides it still gets today's behaviour;
+	 * it is fire-and-forget on the same terms — the grace is a timer, not an await.
 	 */
 	onWorkerTransportLost: (workerId: string) => void;
 	onWorkerTransportRestored: (workerId: string) => void;
@@ -243,9 +251,11 @@ function defaultDeps(): WorkerTransportDeps {
 			void promoteAvailabilityWaitsForWorker(workerId, 'connected');
 		},
 		onWorkerTransportLost: (workerId) => {
-			for (const dispatch of noteWorkerTransportLost(workerId)) {
+			const interrupted = noteWorkerTransportLost(workerId);
+			for (const dispatch of interrupted) {
 				persistControlPlaneNote(dispatch.runId, TRANSPORT_LOST_NOTE);
 			}
+			reapDispatchesIfTransportStaysLost(workerId, interrupted);
 		},
 		onWorkerTransportRestored: (workerId) => {
 			for (const dispatch of noteWorkerTransportRestored(workerId)) {

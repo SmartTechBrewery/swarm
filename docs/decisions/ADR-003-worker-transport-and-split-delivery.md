@@ -95,7 +95,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -386,9 +386,11 @@ server-side store) it needs:
    than sending a malformed frame. No new settle path and no new router policy: the
    answer rides `deliverDispatchResult` → `adaptResultToPhaseRun` → `RunTerminatedError`
    → the shared settle, and a dispatch the router is no longer awaiting drops the frame,
-   so the answer can never settle an unrelated attempt. What still waits out the lease
-   window is a worker whose transport is down — nothing can be pushed to it and its
-   phase may genuinely still be running, which is issue #719's problem, not this one's.
+   so the answer can never settle an unrelated attempt. What this one cannot answer is a
+   worker whose transport is down — nothing can be pushed to it and its phase may
+   genuinely still be running. That used to mean waiting out the lease window; it is now
+   bounded from the control-plane side instead, by #827 when a termination was requested
+   and by #859 (item 14) when none was.
 
 13. **#719** — **a superseded claim is settled from the supersede, not from a timer.**
    One case of the above is knowable immediately: not "the transport is down" but "a
@@ -435,6 +437,57 @@ server-side store) it needs:
    minutes later now stops and needs Retry now; and the settle is best-effort
    housekeeping on the handshake, never a condition of connecting, with the lease
    reconciler still the backstop when no handshake ever comes.
+
+14. **#859** — **a worker that leaves and stays gone is reaped from the transport
+   signal.** Item 13 closes the case where the worker *comes back*; the mirror — it
+   never does — had no path at all, which is the worse of the two, because nothing but
+   the clock ever ends it. `onWorkerTransportLost` (issue #723) already fires within
+   seconds of the socket closing and already knows which dispatches this router is
+   awaiting on that worker; it wrote one note into each of their runs and discarded the
+   rest. So the dispatch sat `running` until `timeoutMs + RESULT_WAIT_MARGIN_MS` or the
+   5-minute reconciler's expired lease — 34–38 minutes live on 2026-08-31 (`rover` run
+   `3279e913`, a Respond-to-review orphaned at 15:30) — holding the PR-scoped hold
+   (issue #850), its task's checkout, and a project capacity slot, so a follower phase
+   on the same pull request deferred every five minutes behind work that would never
+   happen. The lease is simply the wrong bound: it is sized to the *phase's* budget, not
+   to worker liveness.
+
+   The hook now also arms a bounded reap (`src/router/transport-loss-reaper.ts`). If the
+   worker has no live socket here again after `max(2 × SWARM_WORKER_HEARTBEAT_TTL_MS,
+   2m)` measured from its latest drop — #827's worker-liveness window, extracted to
+   `src/router/worker-liveness.ts` so the two definitions cannot drift — each dispatch
+   still awaited on it is ended through
+   the same `failDispatchResultWait` seam items 13 and #827 already use, with its own
+   reason naming the transport, so run history tells it apart from a lease-window expiry
+   and from an operator termination. Nothing new settles: the synthetic frame is a plain
+   `failed` (no `cancelled`), so it unwinds through `adaptResultToPhaseRun` → a
+   non-deferrable `AgentRunError` → the shared settle, whose `finally` releases the
+   project slot, the task claim, and — for a branch-writing phase, the only kind that can
+   hold one — the PR-scoped hold, waking everything queued behind them. The durable rows
+   are deliberately *not* written first as item 13 writes them: item 13 has to, because a
+   handshake can reach a router that restarted since the push and is awaiting nothing;
+   this signal comes from a socket this router owns and dispatches out of its own pending
+   map, so writing them here would only duplicate what the unwind is about to write.
+
+   Three decisions worth recording. The grace is re-checked rather than cancelled — a
+   blip that reconnects inside it is left alone, and a dispatch that settled or whose id
+   was re-pushed elsewhere is skipped. Because it is never cancelled, every drop arms a
+   grace of its own, and the one a dispatch is judged by is the **latest** one: each
+   recorded loss carries the interruption generation that identifies it
+   (`DispatchTransportLoss`), and a timer whose dispatch has dropped again since it was
+   armed defers to the newer drop's grace instead of settling a worker whose real
+   absence is a moment old and whose daemon is still climbing its reconnect ladder
+   (review #5069436530). Deferring costs no coverage — the later timer enforces the same
+   window from the later loss. Next, the test is **connectivity**, not #827's
+   `worker_sessions` silence heuristic: #827 never observed a close (its trigger is an
+   ambiguous failed push), whereas here the close was observed and the note only fires
+   when no replacement socket is registered, so "is there a live socket for this worker
+   here again?" is the direct question and needs no Postgres read. Last, **no re-dispatch
+   follows**, by construction: `kind: 'error'` is not a deferrable kind. That is a policy
+   choice, not an oversight — a Respond-to-review that had already pushed must not be
+   replayed blindly — so re-running such a phase stays `swarm run reset`. A router
+   restart inside the grace loses the timer, with the lease reconciler the backstop, the
+   same limit item 13 accepts.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.
