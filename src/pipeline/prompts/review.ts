@@ -18,6 +18,15 @@
  *    refinement already rejects a nit carrying a fix plan, a blocker missing its
  *    failure scenario, and a verdict that disagrees with the severities. Prose
  *    duplicating those rules is noise; prose *contradicting* them is a bug.
+ *  - **State every slot's JSON type.** Issue #861: `tests`'s only cardinality
+ *    signal was an incidental string in an example, sitting beside a `fixPlan`
+ *    that said "an array" — so a model continued the array pattern and a complete
+ *    review was discarded over the shape of one free-text field. Naming a *type*
+ *    is not restating a refinement, so rule 2 does not forbid it; nor is it the
+ *    layout second-source-of-truth rule 1 warns about, which is about headings and
+ *    section order the renderer owns. The drift rule 1 fears is instead caught by
+ *    the audit in `tests/unit/pipeline/review.test.ts`, which fails when a schema
+ *    slot's bullet here names no type.
  */
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
@@ -43,36 +52,38 @@ interface ReviewPromptContext {
  * remove.
  */
 const SEVERITY_RUBRIC: readonly string[] = [
-	'SEVERITY — pick from exactly these four, by what the defect *does*, never by how confident or polite you feel:',
+	'SEVERITY — `severity` is a string, exactly one of these four. Pick it by what the defect *does*, never by how confident or polite you feel:',
 	'  - `blocker`: it produces wrong behavior, data loss, a security hole, or a broken contract on a path this PR makes reachable. You can name the inputs and the wrong result.',
 	'  - `major`: the same kind of defect, but on a path that is currently unreachable, gated behind a non-default setting, or only reachable once planned work lands. Latent, not theoretical — you can still name the trigger.',
 	'  - `minor`: no defect. A real maintainability, consistency, or missing-test problem a maintainer would want fixed, but which changes no behavior today.',
 	'  - `nit`: a naming, wording, or comment-accuracy remark. If it is only your preference, do not report it at all.',
 	'`blocker` and `major` block the PR; `minor` and `nit` do not. If you cannot name a concrete failure, it is not a blocker or a major — downgrade it rather than hedging the wording.',
-	'When a finding could plausibly have been major and you call it `minor`/`nit`, say why in `downgradeRationale`, so a real defect cannot be quietly parked among the nits.',
+	'When a finding could plausibly have been major and you call it `minor`/`nit`, say why in `downgradeRationale` — a single string — so a real defect cannot be quietly parked among the nits.',
 ];
 
 /** What each hand-off field must contain. Shared by both passes; the renderer owns the shape. */
 function handoffContract(isReReview: boolean): readonly string[] {
 	return [
 		`Write "${REVIEW_VERDICT_FILENAME}" as JSON with these fields. SWARM renders the review from them — do not write a review body, headings, or a prose summary of your findings anywhere; anything you format yourself is discarded.`,
-		'  - `verdict`: `approve` or `request-changes`. Those are the only two. It follows mechanically from your severities — any `blocker`/`major` means `request-changes`, otherwise `approve` — and the hand-off is rejected if it disagrees, so the verdict is not a separate judgement call. There is no comment-only or no-opinion verdict: if you could not verify the change at all (a command you needed is blocked, the diff is unreadable), stop and fail rather than submitting a verdict you cannot support.',
-		'  - `summary`: at most three sentences. What the change does, and what you confirmed about its shape. No praise, and do not restate your findings here.',
-		'  - `verification`: every command you actually ran, as `{command, outcome}` with outcome `passed` or `failed`. At least one entry is required — the commands you read the PR with count. Report a failing command, and report one that was blocked or unavailable the same way with outcome `failed`: both are evidence, not something to hide. Do not list commands you did not run.',
-		"  - `docsChecked`: one entry per document THIS repository requires to stay current — its README, plus whatever its own contributor/agent guide (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, or equivalent) says must not go stale. Read that guide to find out; do not assume another project's layout. Each entry is `{path, status, note?}` with status `accurate`, `updated`, `not-applicable`, or `stale`. Judge every one you identify — `not-applicable` is a real answer when the PR changes nothing that document describes. A `stale` document is itself a defect: also report it in `findings`.",
-		'  - `preExisting`: conditions you noticed that predate this PR (pre-existing lint warnings, unrelated failures), so they are not charged to it. Empty array if none.',
-		'  - `findings`: see below. Empty array when there is nothing to report.',
+		'Every field below states its JSON type. Write exactly that type: a string slot is ONE string even when you have several things to say, and an array slot is an array even when you have one entry.',
+		'  - `verdict`: a string, `approve` or `request-changes`. Those are the only two. It follows mechanically from your severities — any `blocker`/`major` means `request-changes`, otherwise `approve` — and the hand-off is rejected if it disagrees, so the verdict is not a separate judgement call. There is no comment-only or no-opinion verdict: if you could not verify the change at all (a command you needed is blocked, the diff is unreadable), stop and fail rather than submitting a verdict you cannot support.',
+		'  - `summary`: a single string, at most three sentences. What the change does, and what you confirmed about its shape. No praise, and do not restate your findings here.',
+		'  - `verification`: an array of `{command, outcome}` objects, one per command you actually ran; `command` is one command line as a string and `outcome` is `passed` or `failed`. At least one entry is required — the commands you read the PR with count. Report a failing command, and report one that was blocked or unavailable the same way with outcome `failed`: both are evidence, not something to hide. Do not list commands you did not run.',
+		"  - `docsChecked`: an array of `{path, status, note?}` objects, one per document THIS repository requires to stay current — its README, plus whatever its own contributor/agent guide (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, or equivalent) says must not go stale. Read that guide to find out; do not assume another project's layout. `path` and the optional `note` are strings; `status` is `accurate`, `updated`, `not-applicable`, or `stale`. Judge every one you identify — `not-applicable` is a real answer when the PR changes nothing that document describes. A `stale` document is itself a defect: also report it in `findings`.",
+		'  - `preExisting`: an array of strings, one per condition you noticed that predates this PR (pre-existing lint warnings, unrelated failures), so they are not charged to it. Empty array if none.',
+		'  - `findings`: an array of finding objects — see below. Empty array when there is nothing to report.',
 		...(isReReview
 			? [
-					"  - `carried`: one entry per finding the previous review raised, as `{id, title, status, detail}` with status `resolved`, `partial`, `outstanding`, or `regressed`. Reuse the previous review's finding ids (`F1`, `F2`, …) exactly — they are how SWARM tracks an item across passes. `detail` is your evidence for that status, traced in this checkout. Every entry that is NOT `resolved` must also appear in `findings` under that same id, so it carries a severity and a fix plan; the hand-off is rejected if one does not.",
+					"  - `carried`: an array of `{id, title, status, detail}` objects, one per finding the previous review raised; `id`, `title` and `detail` are strings and `status` is `resolved`, `partial`, `outstanding`, or `regressed`. Reuse the previous review's finding ids (`F1`, `F2`, …) exactly — they are how SWARM tracks an item across passes. `detail` is your evidence for that status, traced in this checkout. Every entry that is NOT `resolved` must also appear in `findings` under that same id, so it carries a severity and a fix plan; the hand-off is rejected if one does not.",
 				]
 			: []),
 		'Each finding is `{id, title, severity, category, evidence, …}`:',
-		`  - \`id\`: \`F1\`, \`F2\`, … numbered in the order you report them.${isReReview ? " Re-reporting an item from `carried` KEEPS that item's original id — that is what lets SWARM follow one problem across passes. Mint a new id only for a problem no earlier pass raised, continuing past the highest id the previous review used; never reuse an id for a different problem." : ''}`,
-		'  - `category`: one of `correctness`, `security`, `contract`, `performance`, `test-coverage`, `docs`, `consistency`.',
-		'  - `evidence`: the `file:line` references the claim rests on, and what is there. Required at every severity. Quote the offending code only when it is under ten lines.',
-		'  - For a `blocker` or `major`, additionally: `failureScenario` (concrete inputs or sequence of events → the wrong outcome, traced through this checkout), `impact` (what it costs when it happens), `fixPlan` (an array of steps naming the files or components to change), and `tests` (the tests to add or change, named specifically; `"None — doc-only."` is a valid answer).',
-		'  - For a `minor` or `nit`, instead: `suggestion` — one paragraph carrying the whole point, because at this severity the suggestion is the plan. Optionally `downgradeRationale`. Do not write `failureScenario`, `impact`, `fixPlan`, or `tests` for these; the hand-off is rejected if you do.',
+		`  - \`id\`: a string, \`F1\`, \`F2\`, … numbered in the order you report them.${isReReview ? " Re-reporting an item from `carried` KEEPS that item's original id — that is what lets SWARM follow one problem across passes. Mint a new id only for a problem no earlier pass raised, continuing past the highest id the previous review used; never reuse an id for a different problem." : ''}`,
+		'  - `title`: a single string — one short line naming the defect, not a sentence about it.',
+		'  - `category`: a string, exactly one of `correctness`, `security`, `contract`, `performance`, `test-coverage`, `docs`, `consistency`.',
+		'  - `evidence`: a single string — the `file:line` references the claim rests on, and what is there; keep several references inside that one string. Required at every severity. Quote the offending code only when it is under ten lines.',
+		'  - For a `blocker` or `major`, additionally: `failureScenario` (a single string: concrete inputs or sequence of events → the wrong outcome, traced through this checkout), `impact` (a single string: what it costs when it happens), `fixPlan` (an array of strings, one per step, naming the files or components to change), and `tests` (an array of strings, one per test to add or change, named specifically; `["None — doc-only."]` is a valid answer).',
+		'  - For a `minor` or `nit`, instead: `suggestion` — a single string, one paragraph carrying the whole point, because at this severity the suggestion is the plan. Optionally `downgradeRationale`, also a single string. Do not write `failureScenario`, `impact`, `fixPlan`, or `tests` for these; the hand-off is rejected if you do.',
 		'Do not implement any fix yourself. Do NOT `git add`/commit the hand-off.',
 	];
 }

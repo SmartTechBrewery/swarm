@@ -9,7 +9,11 @@ import {
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { buildReviewHandoffRepairPrompt } from '@/pipeline/prompts/review.js';
 import { buildReviewPrompt, REVIEW_VERDICT_FILENAME, runReviewPhase } from '@/pipeline/review.js';
-import type { ScmDeliveryProvider } from '@/scm/delivery.js';
+import {
+	ReviewFindingSchema,
+	ReviewHandoffSchema,
+	type ScmDeliveryProvider,
+} from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
@@ -37,7 +41,7 @@ const BLOCKING_FINDING = {
 	failureScenario: 'A rejected promise crashes the worker mid-phase.',
 	impact: 'The run never settles.',
 	fixPlan: ['Await the promise.'],
-	tests: 'Assert the rejection is handled.',
+	tests: ['Assert the rejection is handled.'],
 };
 
 /** A valid structured hand-off; `overrides` merge over a `request-changes` default. */
@@ -503,7 +507,7 @@ describe('buildReviewPrompt', () => {
 	// one's layout — `docs/status.md` does not exist in someone else's repo.
 	it('asks for docs by role, never by SWARM’s own paths', () => {
 		const prompt = buildReviewPrompt(context);
-		expect(prompt).toContain('one entry per document THIS repository requires to stay current');
+		expect(prompt).toContain('one per document THIS repository requires to stay current');
 		expect(prompt).toContain('its own contributor/agent guide');
 		for (const path of ['docs/configuration.md', 'docs/status.md', 'ai/*.md'])
 			expect(prompt).not.toContain(path);
@@ -511,9 +515,32 @@ describe('buildReviewPrompt', () => {
 
 	it('offers no comment-only verdict and tells the agent to fail instead', () => {
 		const prompt = buildReviewPrompt(context);
-		expect(prompt).toContain('`verdict`: `approve` or `request-changes`. Those are the only two.');
+		expect(prompt).toContain(
+			'`verdict`: a string, `approve` or `request-changes`. Those are the only two.',
+		);
 		expect(prompt).toContain('There is no comment-only or no-opinion verdict');
 		expect(prompt).toContain('stop and fail rather than submitting a verdict you cannot support');
+	});
+
+	// Issue #861: `fixPlan` said "an array" and `tests`, one clause later and in the
+	// same tier, said nothing but showed a bare string in its example — so a model
+	// continued the array pattern and the whole review was discarded. The two now
+	// agree, and the example points the same way as the type.
+	it('states `tests` as an array, like the `fixPlan` beside it', () => {
+		const prompt = buildReviewPrompt(context);
+		expect(prompt).toContain('`fixPlan` (an array of strings, one per step');
+		expect(prompt).toContain('`tests` (an array of strings, one per test to add or change');
+		expect(prompt).toContain('`["None — doc-only."]` is a valid answer');
+		expect(prompt).not.toContain('`"None — doc-only."` is a valid answer');
+		// The general rule the per-slot types hang off.
+		expect(prompt).toContain('Every field below states its JSON type');
+	});
+
+	// `title` was named in the finding's field list and described nowhere.
+	it('describes `title`, which the field list only ever named', () => {
+		expect(buildReviewPrompt(context)).toContain(
+			'`title`: a single string — one short line naming the defect',
+		);
 	});
 
 	it('pins the review to the head SHA and forbids modifying the repository', () => {
@@ -586,6 +613,73 @@ describe('buildReviewPrompt', () => {
 			expect(buildReviewPrompt(context, undefined, false)).not.toContain('This is a RE-REVIEW');
 		});
 	});
+
+	/**
+	 * Issue #861 as a standing rule rather than a one-off audit: a slot whose type
+	 * the prompt leaves implicit is a slot a model guesses at, and `tests` cost a
+	 * complete review that way. The names come from the schemas, so a slot added
+	 * there fails this until the prompt says what shape it wants.
+	 */
+	describe('every hand-off slot’s JSON type is stated', () => {
+		/** From the severity rubric to the end: the rubric plus the field contract. */
+		function contractRegion(prompt: string): string {
+			const at = prompt.indexOf('SEVERITY —');
+			expect(at).toBeGreaterThan(-1);
+			return prompt.slice(at);
+		}
+
+		/**
+		 * Whether a JSON type is named in a clause that *introduces* the slot —
+		 * ``​`slot`: …``, ``​`slot` (…``, ``​`slot` — …`` or ``​`slot`, …`` — and on that
+		 * same line. A bare mention in another slot's prose (`docsChecked` ends by
+		 * pointing at `findings`) must not count, or the audit passes on a type the
+		 * neighbouring bullet happened to state.
+		 */
+		function statesType(region: string, slot: string): boolean {
+			const introduces = new RegExp(`\`${slot}\`(: | \\(| — |, )`);
+			return region.split('\n').some((line) => {
+				const at = line.search(introduces);
+				return (
+					at !== -1 &&
+					/\ba (single )?string\b|\bare strings\b|\ban array\b/.test(line.slice(at, at + 80))
+				);
+			});
+		}
+
+		// `severity` has no bullet in the field contract at all — its whole
+		// description is the rubric, which the next test holds to the same standard.
+		// Everything else must state its type where it is introduced.
+		const DESCRIBED_ELSEWHERE = new Set(['severity']);
+		const SLOTS = [
+			...Object.keys(ReviewHandoffSchema.innerType().shape),
+			...Object.keys(ReviewFindingSchema.shape),
+		].filter((slot) => !DESCRIBED_ELSEWHERE.has(slot));
+
+		it.each(SLOTS)('states the JSON type of `%s`', (slot) => {
+			expect(statesType(contractRegion(buildReviewPrompt(context, undefined, true)), slot)).toBe(
+				true,
+			);
+		});
+
+		it('states `severity`’s type in the rubric that actually describes it', () => {
+			expect(buildReviewPrompt(context)).toContain(
+				'`severity` is a string, exactly one of these four',
+			);
+		});
+
+		// An initial pass has nothing to carry, so `carried` is deliberately absent
+		// from it — every other slot is still typed. This is also what pins the
+		// finding's own `id`/`title` bullets: in the re-review prompt above, the
+		// `carried` bullet types those two names as well.
+		it('covers every slot but `carried` on an initial review', () => {
+			const region = contractRegion(buildReviewPrompt(context));
+			for (const slot of SLOTS)
+				expect({ slot, typed: statesType(region, slot) }).toEqual({
+					slot,
+					typed: slot !== 'carried',
+				});
+		});
+	});
 });
 
 /**
@@ -597,8 +691,8 @@ describe('buildReviewHandoffRepairPrompt', () => {
 		const prompt = buildReviewHandoffRepairPrompt('F1 is nit, so fixPlan must be omitted');
 		expect(prompt).toContain('F1 is nit, so fixPlan must be omitted');
 		expect(prompt).toContain(REVIEW_VERDICT_FILENAME);
-		expect(prompt).toContain('SEVERITY — pick from exactly these four');
-		expect(prompt).toContain('`verdict`: `approve` or `request-changes`');
+		expect(prompt).toContain('SEVERITY — `severity` is a string, exactly one of these four');
+		expect(prompt).toContain('`verdict`: a string, `approve` or `request-changes`');
 	});
 
 	// A repair that quietly re-judged the PR to satisfy a slot rule would be worse
