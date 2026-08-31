@@ -971,6 +971,7 @@ export function createFakeScmProvider(overrides: Partial<SCMProvider> = {}): SCM
 		isSwarmGeneratedEvent: unstubbed('isSwarmGeneratedEvent'),
 		getPullRequest: unstubbed('getPullRequest'),
 		getPullRequestTitle: unstubbed('getPullRequestTitle'),
+		pullRequestUrl: unstubbed('pullRequestUrl'),
 		getAggregateCheckStatus: unstubbed('getAggregateCheckStatus'),
 		listPullRequestsForCommit: unstubbed('listPullRequestsForCommit'),
 		listConflictCandidates: unstubbed('listConflictCandidates'),

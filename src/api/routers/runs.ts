@@ -1,9 +1,11 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
+import type { ProjectConfig } from '../../config/schema.js';
 import {
 	getActiveDispatchByRunId,
 	getDispatchById,
+	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
 	WAITING_DISPATCH_STATES,
@@ -20,6 +22,7 @@ import {
 	isRetryPendingStatus,
 	type ListRunsFilter,
 	listRunsFromDb,
+	listTaskActivitySince,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
@@ -33,12 +36,19 @@ import {
 	type ForceReReviewRefusal,
 	forceReReview,
 } from '../../dispatch/force-re-review.js';
+import {
+	ITEM_ACTIVITY_LOOKBACK_MS,
+	type ItemLivenessPolicy,
+	type StalledItem,
+	toStalledItems,
+} from '../../dispatch/item-liveness.js';
 import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { getWorker, getWorkers } from '../../identity/worker-service.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
+import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
@@ -65,6 +75,7 @@ import {
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
+import type { SCMProvider } from '../../scm/types.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
@@ -726,6 +737,74 @@ async function resolvePendingRunRequest(run: {
 	}
 }
 
+/**
+ * The two project policies the liveness classification consults, read exactly as
+ * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
+ * unless set (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and merge
+ * automation is opt-in (`src/worker/consumer.ts`). A project that no longer
+ * resolves gets those same defaults rather than an exception — a stalled-work view
+ * that throws because one project row went missing is worse than one that reports
+ * that project under the pipeline's own defaults.
+ */
+function itemLivenessPolicyFor(project: ProjectConfig | undefined): ItemLivenessPolicy {
+	return {
+		planningAutoAdvance: project?.pipeline?.planning?.autoAdvance === true,
+		autoMerge: project?.pipeline?.respondToReview?.autoMerge === true,
+	};
+}
+
+/**
+ * Fill each `pull-request` stalled row's `prUrl` with the **provider's own** web
+ * URL for that pull request, so the dashboard links a stalled PR out without
+ * assembling a URL of its own — which is how a GitLab or Bitbucket project's rows
+ * ended up pointing at `github.com`.
+ *
+ * The repository is the row's own (issue #683), not `project.repo`: a project may
+ * span several repositories, and the stalled row already records which one the run
+ * acted on. The lookup is a registry lookup on `project.scm`
+ * (`requireProjectSCMProvider`) and the method it calls is pure, so this adds no
+ * request and no per-row I/O to a procedure that deliberately touches nothing but
+ * Postgres.
+ *
+ * A project that resolves no runtime-ready provider — unregistered id, or an
+ * unmigrated project naming no `scm` — leaves `prUrl` unset and is logged once per
+ * project rather than throwing: the stalled view's job is to report work nobody is
+ * looking at, and losing the whole report over one project's configuration would
+ * hide exactly the rows an operator needs.
+ */
+function withPullRequestUrls(
+	items: StalledItem[],
+	projects: Map<string, ProjectConfig>,
+): StalledItem[] {
+	const urlForProject = new Map<string, SCMProvider['pullRequestUrl'] | null>();
+	const resolve = (projectId: string): SCMProvider['pullRequestUrl'] | null => {
+		const cached = urlForProject.get(projectId);
+		if (cached !== undefined) return cached;
+		const project = projects.get(projectId);
+		let resolved: SCMProvider['pullRequestUrl'] | null = null;
+		if (project) {
+			try {
+				const provider = requireProjectSCMProvider(project);
+				resolved = provider.pullRequestUrl.bind(provider);
+			} catch (error) {
+				logger.warn(
+					'runs.stalled: no source-control provider resolved; listing that project’s pull requests unlinked',
+					{ projectId, error: describeError(error) },
+				);
+			}
+		}
+		urlForProject.set(projectId, resolved);
+		return resolved;
+	};
+
+	return items.map((item) => {
+		if (item.unit !== 'pull-request' || !item.prNumber) return item;
+		const pullRequestUrl = resolve(item.projectId);
+		if (!pullRequestUrl) return item;
+		return { ...item, prUrl: pullRequestUrl(item.repository, item.prNumber) };
+	});
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } from the repo, each row
 	// widened with the additive, server-resolved `workerName` naming the machine
@@ -786,6 +865,54 @@ export const runsRouter = router({
 				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
 			);
 			return partitionQueuedRuns(await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)));
+		}),
+
+	// The item-centric read model (issue #840) — the third one beside Queue
+	// (dispatch-centric) and Runs (run-centric). It folds `runs` and `dispatches`
+	// onto the unit an operator recognises (a pull request, a board card) and
+	// reports the units with no forward path. The whole decision lives in the pure
+	// `src/dispatch/item-liveness.ts`; this procedure only supplies the two bounded
+	// reads and the per-project policy map, and touches nothing but Postgres — no
+	// provider call, no cache, no enrichment, unlike `queued`.
+	//
+	// "Stalled" is a computed view, never a persisted status: nothing here writes,
+	// and a unit stays listed until it moves or ages out of the lookback window.
+	//
+	// Authorization is `queued`'s shape verbatim, so no new access decision is made
+	// here: a chosen `projectId` needs read access, and the unscoped,
+	// installation-wide view remains an instance administrator's.
+	stalled: authedProcedure
+		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
+		.query(async ({ ctx, input }): Promise<StalledItem[]> => {
+			const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
+			if (input?.projectId) {
+				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+				const project = await getProjectByIdFromDb(input.projectId);
+				const projectIds = [input.projectId];
+				const [activity, activeDispatches] = await Promise.all([
+					listTaskActivitySince({ since, projectIds }),
+					listActiveDispatchTaskRefs(projectIds),
+				]);
+				return withPullRequestUrls(
+					toStalledItems(activity, activeDispatches, {
+						[input.projectId]: itemLivenessPolicyFor(project),
+					}),
+					new Map(project ? [[project.id, project]] : []),
+				);
+			}
+			assertInstanceAdmin(ctx.user, 'stalled work');
+			const [activity, activeDispatches, projects] = await Promise.all([
+				listTaskActivitySince({ since }),
+				listActiveDispatchTaskRefs(),
+				listAllProjectsFromDb(),
+			]);
+			const policies = Object.fromEntries(
+				projects.map((project) => [project.id, itemLivenessPolicyFor(project)]),
+			);
+			return withPullRequestUrls(
+				toStalledItems(activity, activeDispatches, policies),
+				new Map(projects.map((project) => [project.id, project])),
+			);
 		}),
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member

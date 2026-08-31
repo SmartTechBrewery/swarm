@@ -10,11 +10,13 @@ import {
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	ImplementationHandoffSchema,
+	isUnretryableDeliveryFailure,
 	loadDeliveryProgress,
 	pushDeliveredBranch,
 	readHandoff,
 	saveDeliveryProgress,
 	shouldDeferDeliveryFailure,
+	UnretryableDeliveryError,
 	validatePreparedTree,
 } from '@/scm/delivery.js';
 
@@ -151,9 +153,12 @@ describe('SCM delivery hand-offs', () => {
 		writeFileSync(join(root, HANDOFF_FILENAMES.checkpoint), '{"phase":"implementation"}\n');
 		fixtureGit(root, ['add', '--force', '--', HANDOFF_FILENAMES.checkpoint]);
 
-		await expect(validatePreparedTree(root)).rejects.toThrow(
-			`scratch artifact is tracked (${HANDOFF_FILENAMES.checkpoint})`,
-		);
+		// Asserted on the `Unsafe delivery: ` prefix operators key on plus the
+		// distinctive clause, not the full sentence, so the remedy can be reworded
+		// without churning this test.
+		const error = await validatePreparedTree(root).catch((e) => e);
+		expect(error.message).toContain('Unsafe delivery: ');
+		expect(error.message).toContain(`scratch artifact ${HANDOFF_FILENAMES.checkpoint} is tracked`);
 	});
 });
 
@@ -256,6 +261,14 @@ describe('pushDeliveredBranch', () => {
 
 		expect(error).not.toBeInstanceOf(DeliveryDivergedError);
 		expect(error.message).toContain('[rejected]');
+		// ...and it keeps its retry: with progress recorded, it still defers.
+		saveDeliveryProgress(clone, {
+			deliveryId: 'd1',
+			commitSha: sha,
+			pushed: false,
+			followUpEnqueued: false,
+		});
+		expect(shouldDeferDeliveryFailure(error, clone)).toBe(true);
 	});
 
 	it('rethrows a push failure that is not a rejection at all', async () => {
@@ -269,5 +282,174 @@ describe('pushDeliveredBranch', () => {
 		await expect(pushDeliveredBranch(failing, clone, 'issue-1', 'deadbeef')).rejects.toThrow(
 			'could not read from remote repository',
 		);
+	});
+});
+
+/**
+ * The classification rule (issue #839). Real git fixtures rather than stubs,
+ * because the question is what git actually reports about an index — and the
+ * regression this guards is that *every* prepared-tree refusal is raised while
+ * the delivery sidecar already exists, which is what used to turn it into a
+ * deferral.
+ */
+describe('unretryable delivery refusals (issue #839)', () => {
+	/** A repository whose index holds two unresolved conflicts. */
+	function repoWithUnmergedIndex(): string {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-refusal-'));
+		roots.push(root);
+		fixtureGit(root, ['init', '-b', 'main']);
+		fixtureGit(root, ['config', 'user.email', 't@e.com']);
+		fixtureGit(root, ['config', 'user.name', 'T']);
+		writeFileSync(join(root, 'a.txt'), 'base\n');
+		writeFileSync(join(root, 'b.txt'), 'base\n');
+		fixtureGit(root, ['add', '.']);
+		fixtureGit(root, ['commit', '-m', 'base']);
+		fixtureGit(root, ['checkout', '-q', '-b', 'feature']);
+		writeFileSync(join(root, 'a.txt'), 'feature\n');
+		writeFileSync(join(root, 'b.txt'), 'feature\n');
+		fixtureGit(root, ['commit', '-am', 'feature']);
+		fixtureGit(root, ['checkout', '-q', 'main']);
+		writeFileSync(join(root, 'a.txt'), 'main\n');
+		writeFileSync(join(root, 'b.txt'), 'main\n');
+		fixtureGit(root, ['commit', '-am', 'main']);
+		fixtureGit(root, ['checkout', '-q', 'feature']);
+		try {
+			fixtureGit(root, ['merge', 'main']);
+		} catch {
+			// Expected: the merge conflicts, which is the state under test.
+		}
+		return root;
+	}
+
+	/** Record delivery progress, the condition that used to force a deferral. */
+	function withSidecar(root: string): string {
+		saveDeliveryProgress(root, {
+			deliveryId: 'd1',
+			pushed: false,
+			followUpEnqueued: false,
+		});
+		return root;
+	}
+
+	// The incident's exact tree: the agent wrote clean resolved text over both
+	// conflicted files and never staged them, so nothing is left of the conflict
+	// markers but the index is still unmerged.
+	it('refuses an unstaged conflict resolution terminally, sidecar or not', async () => {
+		const root = repoWithUnmergedIndex();
+		writeFileSync(join(root, 'a.txt'), 'resolved by hand\n');
+		writeFileSync(join(root, 'b.txt'), 'resolved by hand\n');
+		expect(fixtureGit(root, ['diff', '--name-only', '--diff-filter=U']).trim().split('\n')).toEqual(
+			['a.txt', 'b.txt'],
+		);
+
+		const error = await validatePreparedTree(root).catch((e) => e);
+
+		expect(error).toBeInstanceOf(UnretryableDeliveryError);
+		// Both paths on one line, comma-joined — the raw git newlines used to render
+		// the operator's comment as two stray lines.
+		expect(error.message).toContain('unresolved conflicts in a.txt, b.txt');
+		expect(error.message).toContain("'git add'");
+		// The sidecar exists by the time this is raised in every pushing phase, which
+		// is what makes this a regression test rather than a tautology.
+		expect(shouldDeferDeliveryFailure(error, withSidecar(root))).toBe(false);
+	});
+
+	// The guard on "a rule the next such refusal falls under": a fifth refusal
+	// added to either function as a plain `Error` fails here.
+	describe('every prepared-tree refusal is terminal', () => {
+		const cases: { name: string; clause: string; prepare: (root: string) => void }[] = [
+			{
+				name: 'an unresolved index',
+				clause: 'unresolved conflicts in',
+				prepare: () => {},
+			},
+			{
+				name: 'a working tree with no changes at all',
+				clause: 'working tree holds no changes at all',
+				prepare: (root) => {
+					fixtureGit(root, ['merge', '--abort']);
+				},
+			},
+			{
+				name: 'a tracked scratch artifact',
+				clause: `scratch artifact ${HANDOFF_FILENAMES.checkpoint} is tracked`,
+				prepare: (root) => {
+					fixtureGit(root, ['merge', '--abort']);
+					writeFileSync(join(root, HANDOFF_FILENAMES.checkpoint), '{}\n');
+					fixtureGit(root, ['add', '--force', '--', HANDOFF_FILENAMES.checkpoint]);
+				},
+			},
+			{
+				name: 'a tree holding nothing but hand-off artifacts',
+				clause: 'nothing to deliver',
+				prepare: (root) => {
+					fixtureGit(root, ['merge', '--abort']);
+					writeFileSync(join(root, HANDOFF_FILENAMES.implementation), '{}\n');
+				},
+			},
+		];
+
+		for (const { name, clause, prepare } of cases) {
+			it(`refuses ${name}`, async () => {
+				const root = repoWithUnmergedIndex();
+				prepare(root);
+
+				// `commitPreparedTree` runs `validatePreparedTree` first, so one call
+				// covers refusals raised by either function.
+				const error = await commitPreparedTree(root, 'feat: deliver', {
+					name: 'swarm-implementer',
+					email: 'swarm-implementer@users.noreply.github.com',
+				}).catch((e) => e);
+
+				expect(error).toBeInstanceOf(UnretryableDeliveryError);
+				expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+				expect(error.message).toContain('Unsafe delivery: ');
+				// Each case reaches its *own* refusal, so the four are really covered.
+				expect(error.message).toContain(clause);
+				// Each message says what clears it — it is the whole report the
+				// operator gets, since the error class does not survive the wire.
+				expect(error.message).toMatch(/re-run (this|the) phase\./);
+				expect(shouldDeferDeliveryFailure(error, withSidecar(root))).toBe(false);
+			});
+		}
+	});
+
+	// #558's carve-out is now one member of the rule rather than beside it.
+	it('classifies a diverged push under the same rule', () => {
+		expect(new DeliveryDivergedError('diverged')).toBeInstanceOf(UnretryableDeliveryError);
+		expect(isUnretryableDeliveryFailure(new DeliveryDivergedError('diverged'))).toBe(true);
+		expect(isUnretryableDeliveryFailure(new Error('502 from the API'))).toBe(false);
+		expect(isUnretryableDeliveryFailure('not an error at all')).toBe(false);
+	});
+
+	it('still defers a transient failure with progress recorded', () => {
+		const root = withSidecar(repoWithUnmergedIndex());
+
+		expect(shouldDeferDeliveryFailure(new Error('502 from the API'), root)).toBe(true);
+		expect(shouldDeferDeliveryFailure(new Error('secondary rate limit'), root)).toBe(true);
+	});
+
+	// Wrapping a refusal on the way out of a phase must not re-open the retry loop.
+	it('sees a refusal through a wrapping error', async () => {
+		const root = repoWithUnmergedIndex();
+		const refusal = await validatePreparedTree(root).catch((e) => e);
+		withSidecar(root);
+
+		expect(shouldDeferDeliveryFailure(new Error('wrapped', { cause: refusal }), root)).toBe(false);
+		expect(
+			shouldDeferDeliveryFailure(
+				new Error('outer', { cause: new Error('inner', { cause: refusal }) }),
+				root,
+			),
+		).toBe(false);
+	});
+
+	// A `cause` cycle must not hang the walk.
+	it('terminates on a self-referential cause chain', () => {
+		const root = withSidecar(repoWithUnmergedIndex());
+		const looping = new Error('loops');
+		looping.cause = looping;
+
+		expect(shouldDeferDeliveryFailure(looping, root)).toBe(true);
 	});
 });

@@ -333,8 +333,19 @@ export function toGitLabMergeRequestReference(
 	}
 	return {
 		number: mr.iid,
-		url: mr.web_url ?? `https://gitlab.com/${repo}/-/merge_requests/${mr.iid}`,
+		url: mr.web_url ?? gitLabMergeRequestUrl(repo, mr.iid),
 	};
+}
+
+/**
+ * GitLab's canonical **web** URL for one merge request — the grammar behind both
+ * the derivation above and {@link GitLabSCMIntegration.pullRequestUrl}, so the
+ * two cannot drift into different spellings of the same path. Safe to derive for
+ * the same reason the client's base URL is a constant: this adapter is
+ * GitLab.com-only.
+ */
+export function gitLabMergeRequestUrl(repo: string, iid: number | string): string {
+	return `https://gitlab.com/${repo}/-/merge_requests/${iid}`;
 }
 
 /**

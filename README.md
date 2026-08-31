@@ -103,9 +103,11 @@ restart". One rule for every deployment — a single-user install enrolls its on
 local worker exactly like anyone else.
 
 **Operated from a dashboard**, not a log file: run history and per-run detail
-with failure diagnosis, project and board mapping, per-provider credential
-entry, worker registration/enrollment/approval, and each of your own workers'
-live CLI quota for every agent CLI on that machine.
+with failure diagnosis, a **Stalled** section on both Runs surfaces naming the
+work items that have stopped moving — the phase each one stopped in and how long
+it has been silent — project and board mapping, per-provider credential entry,
+worker registration/enrollment/approval, and each of your own workers' live CLI
+quota for every agent CLI on that machine.
 
 ## The six phases
 

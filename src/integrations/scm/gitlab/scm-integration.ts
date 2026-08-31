@@ -53,6 +53,7 @@ import {
 	getGitLabMergeRequestApprovals,
 	getGitLabMergeRequestMergeState,
 	getGitLabMergeRequestTitle,
+	gitLabMergeRequestUrl,
 	listGitLabMergeRequestsForCommit,
 	listOpenGitLabMergeRequestsForBase,
 } from './merge-requests.js';
@@ -340,6 +341,15 @@ export class GitLabSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getGitLabMergeRequestTitle(project.repo, prNumber),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.pullRequestUrl} — GitLab's `/-/merge_requests/<iid>` web
+	 * path, not GitHub's `/pull/<n>`. Shares {@link gitLabMergeRequestUrl} with the
+	 * merge-request reference derivation so there is one spelling of the grammar.
+	 */
+	pullRequestUrl(repo: string, prNumber: number | string): string {
+		return gitLabMergeRequestUrl(repo, prNumber);
 	}
 
 	/**

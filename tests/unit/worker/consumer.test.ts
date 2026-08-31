@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
 import type { AgentCli, AgentCliResult } from '@/harness/agent-cli.js';
@@ -8,13 +12,14 @@ import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { DEFAULT_ENROLLMENT_ALLOWED_PHASES } from '@/identity/worker-enrollment.js';
 import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-service.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
+import { describeError } from '@/lib/errors.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
-import { DeliveryDeferredError } from '@/scm/delivery.js';
+import { DeliveryDeferredError, HANDOFF_FILENAMES, validatePreparedTree } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import {
 	createMockPhaseRecovery,
@@ -5684,5 +5689,27 @@ describe("the worker's out-of-band comments", () => {
 	it('carry a SWARM-origin marker', () => {
 		expect(isSwarmGeneratedBody(phaseFailureCommentBody('implementation', 'boom'))).toBe(true);
 		expect(isSwarmGeneratedBody(interruptedRunCommentBody('stalled'))).toBe(true);
+	});
+
+	// A terminal delivery refusal reports itself through this body and nothing else
+	// (issue #839): the error *class* does not survive the federated wire, so the
+	// refusal's own message — state refused plus what clears it — is the whole
+	// report the operator gets.
+	it('carry a terminal delivery refusal verbatim, remedy included', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-refusal-comment-'));
+		try {
+			execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+			writeFileSync(join(root, HANDOFF_FILENAMES.checkpoint), '{}\n');
+			execFileSync('git', ['add', '--force', '--', HANDOFF_FILENAMES.checkpoint], { cwd: root });
+			const refusal = await validatePreparedTree(root).catch((e: unknown) => e);
+
+			const body = phaseFailureCommentBody('resolve-conflicts', describeError(refusal));
+
+			expect(body).toContain('Unsafe delivery: ');
+			expect(body).toContain(`scratch artifact ${HANDOFF_FILENAMES.checkpoint} is tracked`);
+			expect(body).toContain("'git rm --cached <path>'");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

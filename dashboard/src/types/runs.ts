@@ -246,6 +246,60 @@ export const queuedRunSchema = z.object({
 export type QueuedRun = z.infer<typeof queuedRunSchema>;
 
 /**
+ * The liveness unit one stalled item names (mirrors `ItemLivenessUnitKindSchema`,
+ * `src/dispatch/item-liveness.ts`, issue #840): the four SCM-driven phases of one
+ * pull request folded onto the PR itself, or the two board-driven phases of one
+ * card.
+ */
+export const stalledItemUnitSchema = z.enum(['pull-request', 'work-item']);
+export type StalledItemUnit = z.infer<typeof stalledItemUnitSchema>;
+
+/**
+ * Mirrors the server `runs.stalled` contract (`StalledItemSchema`,
+ * `src/dispatch/item-liveness.ts`, issue #840) — a work item with no forward
+ * path: no live run, no non-terminal dispatch, and no recorded hand-off
+ * explaining the silence. The dashboard package doesn't import server modules, so
+ * this re-declares the shape here the same way {@link queuedRunSchema} mirrors
+ * `src/queue/queued-runs.ts` — keep it exactly in step with the server schema.
+ *
+ * "Stalled" is a computed view, never a persisted status: the server derives it
+ * on every read and sorts longest-silent first, so nothing on the client re-sorts
+ * or caches a verdict.
+ */
+export const stalledItemSchema = z.object({
+	projectId: z.string(),
+	/** `owner/repo` — the run's own recorded repository (issue #683). */
+	repository: z.string(),
+	unit: stalledItemUnitSchema,
+	/** The PR number for a `pull-request` unit, the task id for a `work-item` one. */
+	reference: z.string(),
+	/** The latest run's own `task_id` — what a worktree/branch is named for. */
+	taskId: z.string(),
+	/** The phase the unit stopped in. */
+	phase: z.string(),
+	runId: z.string(),
+	runStatus: z.string(),
+	prNumber: z.string().optional(),
+	/**
+	 * That pull request's web URL, already resolved **server-side** through the
+	 * project's own SCM provider (`SCMProvider.pullRequestUrl`) — so a GitLab merge
+	 * request and a Bitbucket pull request link to their own hosts instead of the
+	 * `github.com/<repo>/pull/<n>` the client would otherwise assemble. Optional:
+	 * absent for a `work-item` unit, for a row with no `prNumber`, and for a project
+	 * whose provider does not resolve.
+	 */
+	prUrl: z.string().optional(),
+	prTitle: z.string().optional(),
+	workItemId: z.string().optional(),
+	workItemTitle: z.string().optional(),
+	workItemUrl: z.string().optional(),
+	/** ISO 8601 — when the unit last moved. */
+	lastActivityAt: z.string(),
+	stalledForMs: z.number().int().nonnegative(),
+});
+export type StalledItem = z.infer<typeof stalledItemSchema>;
+
+/**
  * Mirrors `AgentUsage` (`src/harness/usage.ts`) — the dashboard package doesn't
  * import server modules, so this hand-mirrors the shape the same way `RunRow`
  * hand-mirrors the DB row.

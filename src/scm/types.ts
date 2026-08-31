@@ -301,6 +301,27 @@ export interface SCMProvider extends ScmMergeProvider {
 	): Promise<string | null>;
 
 	/**
+	 * The provider's own **web** URL for a pull request, from a repository slug and
+	 * a number alone — a pure URL grammar, so it makes no request and needs no
+	 * credential.
+	 *
+	 * Exists because a read model that has already loaded a PR reference still has
+	 * to *link* it, and assembling `https://github.com/${repo}/pull/${n}` at the
+	 * call site sends a GitLab or Bitbucket project's operators to a GitHub URL
+	 * that names a different repository or none at all. GitLab spells the same
+	 * thing `/-/merge_requests/${n}` and Bitbucket `/pull-requests/${n}`, so the
+	 * grammar belongs to the provider (ai/RULES.md §2 "widen the interface, don't
+	 * special-case").
+	 *
+	 * `repo` is passed explicitly rather than read off a `ProjectConfig`, because
+	 * the caller's PR reference carries the repository it actually belongs to — the
+	 * run's own `repository` (issue #683), not whichever repo the project happens
+	 * to name. `prNumber` is generic for {@link SCMProvider.getPullRequest}'s
+	 * reason: GitLab calls it an IID, and a read model holds it as a string.
+	 */
+	pullRequestUrl(repo: string, prNumber: number | string): string;
+
+	/**
 	 * Aggregate the state of every check on `ref` (a commit SHA), so a caller
 	 * decides whether CI is finished from the whole picture rather than trusting
 	 * one webhook's own conclusion.

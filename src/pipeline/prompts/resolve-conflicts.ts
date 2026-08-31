@@ -57,7 +57,8 @@ export function buildResolveConflictsPrompt(
 			'; if not, stop and fail without pushing.',
 		`Merge origin/${input.baseBranch} into the checked-out PR branch with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent.`,
 		...MIGRATION_CONFLICT_GUIDANCE,
-		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge in the working tree for SWARM.',
+		...INDEX_RESOLUTION_GUIDANCE,
+		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge staged in the working tree for SWARM.',
 		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", body (the concise result comment), and verification [{command,outcome:"passed"}].`,
 		...checkpointInstructions('resolve-conflicts'),
 		...(input.checkpoint ? checkpointContinuationSection(input.checkpoint) : []),
@@ -82,6 +83,22 @@ export function buildResolveConflictsPrompt(
  */
 const MIGRATION_CONFLICT_GUIDANCE = [
 	"If the merge conflicts inside `src/db/migrations/` (a numbered `.sql` file, or `src/db/migrations/meta/_journal.json`/its snapshot files), do not hand-resolve the conflict markers in those generated files. Instead: finish resolving every *other* conflict first and commit nothing yet; keep `main`'s migrations exactly as `main` has them (do not renumber or edit any migration `main` already has); then run `npx drizzle-kit generate` from the repo root, which reads the merged `src/db/schema/*.ts` and this branch's already-merged schema changes to generate one fresh, correctly-numbered migration (and its matching journal entry and snapshot) for whatever this branch's schema changes still need beyond what `main` already has. If this branch's own migration file(s) are now superseded by the freshly generated one, remove them (and their now-orphaned snapshot/journal entry) rather than keeping both. Verify afterward that `src/db/migrations/meta/_journal.json` has exactly one entry per `.sql` file in that folder and that every entry's `when` is strictly greater than the previous one's.",
+];
+
+/**
+ * Standing guidance for the gap between the two definitions of "resolved"
+ * (issue #844). The agent verifies its merge by scanning the files for conflict
+ * markers; SWARM's delivery gate asks the *index*
+ * (`validatePreparedTree`, `src/scm/delivery.ts`). On PR #98 both files were
+ * resolved correctly and neither was staged, so delivery refused a tree that
+ * was, by content, perfectly deliverable. `settleMergeResolution`
+ * (`src/pipeline/merge-resolution.ts`) is the deterministic backstop that now
+ * guarantees this; this paragraph is the first-pass hint, so a genuinely
+ * ambiguous conflict is the only thing that ever reaches the refusal.
+ */
+const INDEX_RESOLUTION_GUIDANCE = [
+	'Git considers a conflict resolved when the path leaves the unmerged index, not when its conflict markers are gone: mark every path you resolved with `git add -- <path>` (`git rm -- <path>` when the resolution is to delete it). Staging is not committing — SWARM still makes the commit and the push, so the "do not commit, push, or comment" floor is unchanged.',
+	'Verify with `git diff --name-only --diff-filter=U`, which must print nothing. That is the exact command SWARM’s delivery gate runs, and it will refuse the whole merge on anything it still lists; grepping the files for `<<<<<<<` markers answers a different question and is not enough.',
 ];
 
 /**

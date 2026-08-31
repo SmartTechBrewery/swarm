@@ -55,6 +55,7 @@ const SCM_CONTRACT_METHODS = [
 	'isSwarmGeneratedEvent',
 	'getPullRequest',
 	'getPullRequestTitle',
+	'pullRequestUrl',
 	'getAggregateCheckStatus',
 	'listPullRequestsForCommit',
 	'listConflictCandidates',
