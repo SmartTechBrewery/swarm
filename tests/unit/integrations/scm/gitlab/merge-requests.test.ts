@@ -274,6 +274,7 @@ describe('gitlab merge-request reads', () => {
 					draft: false,
 					headSha: HEAD_SHA,
 					changesRequested: false,
+					behindBase: null,
 				});
 			});
 		}
@@ -302,6 +303,32 @@ describe('gitlab merge-request reads', () => {
 
 			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).resolves.toMatchObject({
 				changesRequested: true,
+			});
+		});
+
+		// Base freshness (issue #874). GitLab computes the count only when asked, so
+		// the request has to carry the opt-in — and a response without it means
+		// "cannot say", never "up to date".
+		it('asks GitLab for the divergence count and reports a behind head', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockGitLabMergeRequestResponse({ diverged_commits_count: 3 })),
+			);
+
+			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).resolves.toMatchObject({
+				behindBase: true,
+			});
+			const url = new URL(requestedUrl(fetchMock));
+			expect(url.pathname).toBe(`/api/v4${PROJECT_PATH}/merge_requests/17`);
+			expect(url.searchParams.get('include_diverged_commits_count')).toBe('true');
+		});
+
+		it('reports a zero divergence count as up to date', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockGitLabMergeRequestResponse({ diverged_commits_count: 0 })),
+			);
+
+			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).resolves.toMatchObject({
+				behindBase: false,
 			});
 		});
 

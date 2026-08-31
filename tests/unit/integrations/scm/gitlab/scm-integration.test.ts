@@ -448,6 +448,7 @@ describe('GitLabSCMIntegration', () => {
 				draft: false,
 				headSha,
 				changesRequested: false,
+				behindBase: false,
 			};
 		}
 
@@ -623,6 +624,57 @@ describe('GitLabSCMIntegration', () => {
 				message: 'No GitLab implementer token configured',
 			});
 		});
+
+		// Issue #874: a merge request whose pipeline never built the target branch it
+		// would land on is refused rather than merged.
+		it('refuses a head GitLab reports as diverged from its target branch', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				...openAt(APPROVED_SHA),
+				behindBase: true,
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'stale-base',
+			});
+			expect(mergeGitLabMergeRequestDirect).not.toHaveBeenCalled();
+		});
+
+		// "GitLab did not say" is not "behind": an unanswerable divergence count
+		// merges exactly as it did before base freshness existed.
+		it('merges when GitLab reports no divergence count at all', async () => {
+			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+				...openAt(APPROVED_SHA),
+				behindBase: null,
+			});
+			vi.mocked(mergeGitLabMergeRequestDirect).mockResolvedValue({
+				merged: true,
+				message: 'merge request merged',
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'merged',
+			});
+		});
+	});
+
+	// Issue #874. A *declared* answer rather than a stub: GitLab's only comparable
+	// operation is a rebase, which rewrites the reviewed commits and pins to no
+	// expected head, so the merge dispatch refuses the stale head visibly instead.
+	describe('updatePullRequestBranch', () => {
+		it('declares the capability unsupported, naming the merge request', async () => {
+			const outcome = await scm.updatePullRequestBranch(project, 17, APPROVED_SHA);
+
+			expect(outcome.status).toBe('unsupported');
+			expect(outcome).toMatchObject({ message: expect.stringContaining('!17') });
+		});
+
+		it('needs no credential to answer, so it never throws', async () => {
+			vi.mocked(getGitLabToken).mockRejectedValue(new Error('No GitLab implementer token'));
+
+			await expect(scm.updatePullRequestBranch(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'unsupported',
+			});
+		});
 	});
 
 	describe('deliveryProvider', () => {
@@ -672,6 +724,7 @@ describe('GitLabSCMIntegration', () => {
 				draft: false,
 				headSha: APPROVED_SHA,
 				changesRequested: false,
+				behindBase: false,
 			});
 			vi.mocked(submitGitLabReview).mockResolvedValue(55);
 			vi.mocked(postIdempotentGitLabMergeRequestNote).mockResolvedValue(42);

@@ -380,8 +380,25 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	 */
 	repo: z.string().min(1),
 	prNumber: z.string().min(1),
-	/** The reviewed head SHA the approval covers; re-checked fresh on every attempt. */
+	/**
+	 * The head SHA the approval covers; re-checked fresh on every attempt.
+	 *
+	 * Normally the exact commit the Review approved. It is **re-written** by the
+	 * dispatch itself when it brings a stale head up to date with its base (issue
+	 * #874): the approval is deliberately carried onto the commit the provider's
+	 * own update produced, and this field is how that head travels to the next
+	 * attempt. See `src/scm/merge.ts`'s header for why that carry-forward is
+	 * sound, and `baseUpdates` below for the bound on it.
+	 */
 	approvedHeadSha: z.string().min(1),
+	/**
+	 * How many times this dispatch has advanced `approvedHeadSha` by updating the
+	 * pull request's branch (issue #874) — the counter `MAX_BASE_UPDATES`
+	 * (`src/worker/merge-automation.ts`) bounds, so a pull request that keeps
+	 * losing the race to a faster-moving base gives up visibly instead of looping.
+	 * Absent on every row written before that existed, which reads as none.
+	 */
+	baseUpdates: z.number().int().min(0).optional(),
 });
 
 const swarmJobVariants = z.discriminatedUnion('type', [

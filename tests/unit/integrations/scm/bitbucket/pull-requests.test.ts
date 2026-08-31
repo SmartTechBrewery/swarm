@@ -185,7 +185,12 @@ describe('bitbucket pull-request reads', () => {
 
 				await expect(
 					scoped(() => getBitbucketPullRequestMergeState(WORKSPACE, SLUG, 17)),
-				).resolves.toEqual({ ...expected, draft: false, headSha: 'd3022fc0ca3d' });
+				).resolves.toEqual({
+					...expected,
+					draft: false,
+					headSha: 'd3022fc0ca3d',
+					behindBase: null,
+				});
 			});
 		}
 
@@ -197,6 +202,17 @@ describe('bitbucket pull-request reads', () => {
 			await expect(
 				scoped(() => getBitbucketPullRequestMergeState(WORKSPACE, SLUG, 17)),
 			).resolves.toMatchObject({ draft: true });
+		});
+
+		// Bitbucket Cloud exposes no behind/ahead state at all, so base freshness is
+		// permanently "cannot determine" here (issue #874) — which the merge path
+		// treats exactly as it did before the concept existed.
+		it('never claims to know whether the head is behind its base', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockBitbucketPullRequestResponse({})));
+
+			await expect(
+				scoped(() => getBitbucketPullRequestMergeState(WORKSPACE, SLUG, 17)),
+			).resolves.toMatchObject({ behindBase: null });
 		});
 	});
 

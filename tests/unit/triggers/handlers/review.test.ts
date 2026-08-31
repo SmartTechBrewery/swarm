@@ -717,9 +717,13 @@ describe('review trigger', () => {
 			});
 		});
 
+		// Also what keeps a merge dispatch's own base update off the verdict ledger
+		// (issue #874): it claims this slot for the head it produces, so that head's
+		// `checks completed` event finds it taken and spends no Review.
 		it('skips dispatch when the slot is already claimed (or Redis is down)', async () => {
 			claimReviewDispatch.mockResolvedValue(false);
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
+			expect(reserveReviewVerdict).not.toHaveBeenCalled();
 		});
 
 		it('does not claim for an unreviewable event', async () => {

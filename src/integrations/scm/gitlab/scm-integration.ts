@@ -33,7 +33,10 @@ import { promisify } from 'node:util';
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
-import type { MergePullRequestOutcome } from '../../../scm/merge.js';
+import type {
+	MergePullRequestOutcome,
+	UpdatePullRequestBranchOutcome,
+} from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
@@ -214,6 +217,18 @@ async function mergeReadyGitLabMergeRequest(
 		return {
 			status: 'not-eligible',
 			message: 'the approving review is no longer in effect — it has since been dismissed',
+		};
+
+	// The approval holds and the merge request is otherwise ready — but its
+	// pipeline ran against a target branch that has since moved, so nothing has
+	// verified the tree this merge would produce (issue #874). Last, after every
+	// eligibility check above, for GitHub's reason: an approval that no longer
+	// holds must report that rather than be brought up to date for nothing. A
+	// `null` count is "GitLab did not say", which merges exactly as before.
+	if (state.behindBase === true)
+		return {
+			status: 'stale-base',
+			message: `merge request head ${state.headSha} is behind its target branch, so its pipeline did not build the tree this merge would produce`,
 		};
 
 	try {
@@ -475,6 +490,32 @@ export class GitLabSCMIntegration implements SCMProvider {
 			// capability throws.
 			return { status: 'provider-error', message: errorMessage(error) };
 		}
+	}
+
+	/**
+	 * {@link ScmMergeProvider.updatePullRequestBranch} for GitLab — a **declared**
+	 * `unsupported`, not a gap (issue #874).
+	 *
+	 * GitLab has no equivalent of GitHub's update-branch endpoint. What it offers
+	 * is `PUT .../rebase`, and a rebase is the wrong operation for this contract in
+	 * two ways: it rewrites every commit on the source branch, so the head SWARM
+	 * carries an approval onto would no longer contain the commit that was
+	 * reviewed, and it takes no expected-head parameter, so nothing would stop it
+	 * rewriting a head somebody else had just pushed. Answering `unsupported`
+	 * makes the merge dispatch refuse a stale head visibly instead — the safe half
+	 * of the guarantee — and leaves adopting rebase (with its own review
+	 * implications) to a GitLab-specific decision rather than smuggling it in
+	 * behind a provider-neutral method name.
+	 */
+	async updatePullRequestBranch(
+		project: ProjectConfig,
+		prNumber: number,
+		_expectedHeadSha: string,
+	): Promise<UpdatePullRequestBranchOutcome> {
+		return {
+			status: 'unsupported',
+			message: `GitLab exposes no way to merge the target branch into merge request !${prNumber} of ${project.repo} while preserving its reviewed commits, so its head cannot be brought up to date automatically`,
+		};
 	}
 
 	/**
