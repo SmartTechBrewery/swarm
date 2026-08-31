@@ -14,6 +14,7 @@ const listJobsForWorkflowRun = vi.fn();
 const pullsGet = vi.fn();
 const pullsMerge = vi.fn();
 const listPullRequestsAssociatedWithCommit = vi.fn();
+const reposGetBranch = vi.fn();
 const paginate = vi.fn();
 const graphql = vi.fn();
 
@@ -23,7 +24,7 @@ vi.mock('@octokit/rest', () => ({
 		users = { getAuthenticated };
 		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun };
 		pulls = { get: pullsGet, merge: pullsMerge };
-		repos = { listPullRequestsAssociatedWithCommit };
+		repos = { listPullRequestsAssociatedWithCommit, getBranch: reposGetBranch };
 		paginate = paginate;
 		graphql = graphql;
 		constructor(opts: { auth: unknown }) {
@@ -34,6 +35,7 @@ vi.mock('@octokit/rest', () => ({
 }));
 
 import {
+	getBranchHead,
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
 	getPullRequest,
@@ -52,6 +54,7 @@ describe('github client', () => {
 		listWorkflowRunsForRepo.mockReset();
 		listJobsForWorkflowRun.mockReset();
 		pullsGet.mockReset();
+		reposGetBranch.mockReset();
 		pullsMerge.mockReset();
 		paginate.mockReset();
 		graphql.mockReset();
@@ -182,6 +185,34 @@ describe('github client', () => {
 			await expect(
 				withGitHubToken('tok', () => listPullRequestsForCommit('jkwiecien', 'swarm', 'deadbeef')),
 			).resolves.toEqual([]);
+		});
+	});
+
+	describe('getBranchHead', () => {
+		it("returns the branch's current head commit", async () => {
+			reposGetBranch.mockResolvedValue({ data: { commit: { sha: 'base-head-sha' } } });
+
+			await expect(
+				withGitHubToken('tok', () => getBranchHead('jkwiecien', 'swarm', 'main')),
+			).resolves.toBe('base-head-sha');
+			expect(reposGetBranch).toHaveBeenCalledWith({
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				branch: 'main',
+			});
+		});
+
+		// A 404 is never flattened into an ordinary answer: GitHub cannot tell an
+		// absent branch from a repository this token cannot see, and reading either
+		// as "no head" would hide a misconfiguration behind a healthy-looking silence.
+		it('propagates a failed read rather than answering null', async () => {
+			reposGetBranch.mockRejectedValue(
+				Object.assign(new Error('Branch not found'), { status: 404 }),
+			);
+
+			await expect(
+				withGitHubToken('tok', () => getBranchHead('jkwiecien', 'swarm', 'missing')),
+			).rejects.toThrow(/Branch not found/);
 		});
 	});
 

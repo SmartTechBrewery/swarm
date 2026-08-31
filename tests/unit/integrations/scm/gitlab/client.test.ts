@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	GITLAB_API_BASE,
 	GitLabApiError,
+	getGitLabBranchHead,
 	getGitLabUserForToken,
 	getScopedToken,
 	gitlabRequest,
@@ -262,6 +263,49 @@ describe('gitlab client', () => {
 	describe('projectPath', () => {
 		it('URL-encodes the namespace/project path GitLab addresses a project by', () => {
 			expect(projectPath('my-group/my-project')).toBe('/projects/my-group%2Fmy-project');
+		});
+	});
+
+	describe('getGitLabBranchHead', () => {
+		it("reads the branch under the project's own path and returns its commit id", async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ name: 'main', commit: { id: 'a'.repeat(40) } }));
+
+			await expect(
+				withGitLabToken('token-abc', () => getGitLabBranchHead('my-group/my-project', 'main')),
+			).resolves.toBe('a'.repeat(40));
+			expect(fetchMock.mock.calls[0]?.[0]).toBe(
+				`${GITLAB_API_BASE}/projects/my-group%2Fmy-project/repository/branches/main`,
+			);
+		});
+
+		it('URL-encodes a branch name with a slash in it', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ commit: { id: 'a'.repeat(40) } }));
+
+			await withGitLabToken('token-abc', () =>
+				getGitLabBranchHead('my-group/my-project', 'release/1.0'),
+			);
+
+			expect(fetchMock.mock.calls[0]?.[0]).toBe(
+				`${GITLAB_API_BASE}/projects/my-group%2Fmy-project/repository/branches/release%2F1.0`,
+			);
+		});
+
+		it('answers null when GitLab names no head commit', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ name: 'main' }));
+
+			await expect(
+				withGitLabToken('token-abc', () => getGitLabBranchHead('my-group/my-project', 'main')),
+			).resolves.toBeNull();
+		});
+
+		// The adapter's standing rule: an unreadable read is never flattened into an
+		// ordinary answer, so a 404 propagates rather than reading as "no head".
+		it('propagates a 404 rather than answering null', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ message: '404 Branch Not Found' }, 404));
+
+			await expect(
+				withGitLabToken('token-abc', () => getGitLabBranchHead('my-group/my-project', 'gone')),
+			).rejects.toBeInstanceOf(GitLabApiError);
 		});
 	});
 

@@ -42,6 +42,7 @@ import type {
 import {
 	createPullRequest,
 	findOpenPullRequest,
+	getBranchHead,
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
 	getPullRequest,
@@ -327,6 +328,23 @@ export class GitHubSCMIntegration implements SCMProvider {
 	 */
 	pullRequestUrl(repo: string, prNumber: number | string): string {
 		return `https://github.com/${repo}/pull/${prNumber}`;
+	}
+
+	/**
+	 * {@link SCMProvider.getBranchHead} — the branch's current head commit, read
+	 * with `repos.getBranch`. Defaults to the **implementer** persona rather than
+	 * the reviewer its two neighbours below default to: this is a repository-level
+	 * read like {@link GitHubSCMIntegration.listConflictCandidates}, and its caller
+	 * today is a router sweep holding only the operator's own credential
+	 * (`SWARM_OPERATOR_GH_TOKEN`).
+	 */
+	async getBranchHead(
+		project: ProjectConfig,
+		branch: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		const [owner, repo] = project.repo.split('/');
+		return this.withPersonaCredentials(project, persona, () => getBranchHead(owner, repo, branch));
 	}
 
 	/**

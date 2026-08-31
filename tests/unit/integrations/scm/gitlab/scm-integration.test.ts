@@ -315,6 +315,19 @@ describe('GitLabSCMIntegration', () => {
 			expect(tokenOnTheWire()).toBe('token-implementer');
 		});
 
+		// The implementer rather than the reviewer the aggregate read below uses: a
+		// repository-level read, whose caller today is a router sweep holding only the
+		// operator's own credential.
+		it("reads the base branch's head commit as the implementer", async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ name: 'main', commit: { id: 'a'.repeat(40) } }));
+
+			await expect(scm.getBranchHead(project, 'main')).resolves.toBe('a'.repeat(40));
+			expect(tokenOnTheWire()).toBe('token-implementer');
+			expect(requestedPath()).toBe(
+				'/api/v4/projects/SmartTechBrewery%2Fswarm/repository/branches/main',
+			);
+		});
+
 		it('aggregates commit statuses as the reviewer', async () => {
 			fetchMock.mockResolvedValue(jsonResponse([createMockGitLabCommitStatusResponse()]));
 

@@ -43,6 +43,10 @@
 import { Worker } from 'bullmq';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failStaleRunningRuns, updateRunJobPayload } from '../db/repositories/runsRepository.js';
+import {
+	BASE_BRANCH_HEALTH_SWEEP_INTERVAL_MS,
+	sweepBaseBranchHealth,
+} from '../dispatch/base-branch-health.js';
 import { resolveBoardItemIdForPrBranch } from '../dispatch/board-card.js';
 import { cancelDispatchAndWake } from '../dispatch/dispatcher.js';
 import {
@@ -797,6 +801,18 @@ export async function startControlPlaneDispatch(options: {
 	);
 	reviewRecoveryInterval.unref();
 
+	// Detect and report a red base branch (issue #872 phase 1). Its own interval
+	// again, and a shorter one than the review-recovery sweep's: a healthy pass is
+	// two provider reads per repository rather than a list read plus one read per
+	// candidate, and a base that stays red silently costs every open pull request a
+	// full round of CI. Deliberately not run from `reconcileDispatchesAtStartup`,
+	// for the reason the comment beside the review sweep already gives.
+	const baseHealthInterval = setInterval(
+		() => void sweepBaseBranchHealth(),
+		BASE_BRANCH_HEALTH_SWEEP_INTERVAL_MS,
+	);
+	baseHealthInterval.unref();
+
 	// Deliver user terminations to the worker running the run (issue #549). A
 	// dispatched run is otherwise unstoppable until its wall-clock timeout, and a
 	// DB-free worker has no Redis to read the durable marker with either.
@@ -811,6 +827,7 @@ export async function startControlPlaneDispatch(options: {
 		close: async () => {
 			clearInterval(reconcileInterval);
 			clearInterval(reviewRecoveryInterval);
+			clearInterval(baseHealthInterval);
 			// Drain the consumer first: an in-flight dispatch still reads the durable
 			// cancellation marker on this client, so closing it underneath would only
 			// make that read fail safe into "not cancelled".

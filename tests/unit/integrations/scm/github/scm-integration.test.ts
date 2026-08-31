@@ -22,6 +22,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	// Pass-through so we can assert the token that would be scoped without a real Octokit.
 	withGitHubToken: vi.fn((_token: string, fn: () => Promise<unknown>) => fn()),
 	getGitHubUserForToken: vi.fn(),
+	getBranchHead: vi.fn(),
 	getCheckSuiteStatus: vi.fn(),
 	getPullRequestMergeState: vi.fn(),
 	getPullRequestReviewDecision: vi.fn(),
@@ -31,6 +32,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 
 import { getPersonaToken, getPersonaTokenOrNull } from '@/config/provider.js';
 import {
+	getBranchHead,
 	getCheckSuiteStatus,
 	getGitHubUserForToken,
 	getPullRequestMergeState,
@@ -207,6 +209,31 @@ describe('GitHubSCMIntegration', () => {
 		// the repository its run actually acted on (issue #683).
 		it('uses the repository it is handed rather than the project’s', () => {
 			expect(scm.pullRequestUrl('other/repo', 7)).toBe('https://github.com/other/repo/pull/7');
+		});
+	});
+
+	describe('getBranchHead', () => {
+		beforeEach(() => {
+			vi.mocked(getBranchHead).mockReset();
+			vi.mocked(getBranchHead).mockResolvedValue('base-head-sha');
+		});
+
+		// The implementer rather than `getAggregateCheckStatus`'s reviewer: a
+		// repository-level read, whose caller today is a router sweep holding only
+		// the operator's own credential.
+		it('reads under the implementer persona by default, with owner/repo split from project.repo', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			await expect(scm.getBranchHead(project, 'main')).resolves.toBe('base-head-sha');
+
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
+			expect(withGitHubToken).toHaveBeenCalledWith('tok-impl', expect.any(Function));
+			expect(getBranchHead).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 'main');
+		});
+
+		it('honours an explicit persona override', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
+			await scm.getBranchHead(project, 'main', 'reviewer');
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
 		});
 	});
 

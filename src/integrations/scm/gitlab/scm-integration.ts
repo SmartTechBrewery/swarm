@@ -44,7 +44,7 @@ import type {
 	ScmWebhookRequest,
 	WebhookHeaderReader,
 } from '../../../scm/types.js';
-import { getScopedGitLabUser, withGitLabToken } from './client.js';
+import { getGitLabBranchHead, getScopedGitLabUser, withGitLabToken } from './client.js';
 import { getGitLabToken, getGitLabTokenOrNull } from './credentials.js';
 import {
 	findOpenGitLabMergeRequest,
@@ -350,6 +350,23 @@ export class GitLabSCMIntegration implements SCMProvider {
 	 */
 	pullRequestUrl(repo: string, prNumber: number | string): string {
 		return gitLabMergeRequestUrl(repo, prNumber);
+	}
+
+	/**
+	 * {@link SCMProvider.getBranchHead} — the branch's current head commit, from
+	 * GitLab's repository-branches read. Defaults to the **implementer** persona
+	 * for the reason GitHub's adapter states: it is a repository-level read, and
+	 * its caller today is a router sweep holding only the operator's own
+	 * credential.
+	 */
+	async getBranchHead(
+		project: ProjectConfig,
+		branch: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getGitLabBranchHead(project.repo, branch),
+		);
 	}
 
 	/**

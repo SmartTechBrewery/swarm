@@ -46,6 +46,7 @@ import type {
 } from '../../../scm/types.js';
 import {
 	bitbucketGitBasicCredential,
+	getBitbucketBranchHead,
 	getBitbucketUserForCredential,
 	getScopedBitbucketUserEmail,
 	withBitbucketCredential,
@@ -339,6 +340,24 @@ export class BitbucketSCMIntegration implements SCMProvider {
 	 */
 	pullRequestUrl(repo: string, prNumber: number | string): string {
 		return bitbucketPullRequestUrl(repo, prNumber);
+	}
+
+	/**
+	 * {@link SCMProvider.getBranchHead} — the branch's current head commit, from
+	 * Bitbucket's branch-ref read, narrowed to the adapter's 12-character SHA
+	 * spelling. Defaults to the **implementer** persona for the reason GitHub's
+	 * adapter states: it is a repository-level read, and its caller today is a
+	 * router sweep holding only the operator's own credential.
+	 */
+	async getBranchHead(
+		project: ProjectConfig,
+		branch: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		const [workspace, slug] = repoCoordinates(project);
+		return this.withPersonaCredentials(project, persona, () =>
+			getBitbucketBranchHead(workspace, slug, branch),
+		);
 	}
 
 	/**

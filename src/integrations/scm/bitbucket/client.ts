@@ -20,6 +20,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { logger } from '../../../lib/logger.js';
+import { abbreviateBitbucketSha } from './commits.js';
 
 /** Bitbucket Cloud's REST base — every path below is relative to it. */
 export const BITBUCKET_API_BASE = 'https://api.bitbucket.org/2.0';
@@ -199,6 +200,32 @@ export async function paginateBitbucket<T>(path: string): Promise<T[]> {
 	}
 
 	return collected;
+}
+
+/**
+ * The commit a branch currently points at, or `null` when Bitbucket answers
+ * without naming one.
+ *
+ * A {@link BitbucketApiError} **propagates**, including a 404: this adapter never
+ * flattens an unreadable read into an ordinary answer, and "no such branch" and
+ * "this credential cannot see this repository" are the same response
+ * ({@link SCMProvider.getBranchHead}).
+ *
+ * The hash is narrowed to Bitbucket's 12-character spelling (`./commits.ts`)
+ * because `target.hash` on this endpoint is the full 40-character form, and every
+ * SHA this adapter emits has to be the one spelling its exact-match consumers
+ * compare against — an unnarrowed value would silently split one commit into two.
+ */
+export async function getBitbucketBranchHead(
+	workspace: string,
+	slug: string,
+	branch: string,
+): Promise<string | null> {
+	const ref = await bitbucketRequest<{ target?: { hash?: string } }>(
+		'GET',
+		`/repositories/${encodeURIComponent(workspace)}/${encodeURIComponent(slug)}/refs/branches/${encodeURIComponent(branch)}`,
+	);
+	return abbreviateBitbucketSha(ref.target?.hash) ?? null;
 }
 
 /**

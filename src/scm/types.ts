@@ -322,6 +322,41 @@ export interface SCMProvider extends ScmMergeProvider {
 	pullRequestUrl(repo: string, prNumber: number | string): string;
 
 	/**
+	 * The commit `branch` currently points at — the head SHA a branch-level
+	 * question has to resolve before it can ask anything about that commit.
+	 *
+	 * Exists because {@link SCMProvider.getAggregateCheckStatus} takes a **commit
+	 * SHA**, so nothing could ask "what does CI say about the base branch right
+	 * now?" without resolving the branch first (issue #872). The only other way to
+	 * obtain it was `listConflictCandidates(...)[n].baseSha`, which needs at least
+	 * one open pull request to exist and answers nothing when the repository is
+	 * quiet — exactly when a red base sits unnoticed longest. Widening the contract
+	 * is the required move rather than reaching for a provider client in shared
+	 * code (ai/RULES.md §2).
+	 *
+	 * `branch` is a plain branch name, not a provider's ref grammar — no
+	 * `refs/heads/` prefix and no pre-encoding; the adapter builds whatever its own
+	 * API needs from `project` + `branch`.
+	 *
+	 * **A failed read throws rather than answering `null`.** That is the rule the
+	 * GitLab and Bitbucket read modules already state in the same words ("an
+	 * unreadable commit must not read as 'CI is green'"), and it covers a 404 as
+	 * much as a 5xx: no provider distinguishes "no such branch" from "this
+	 * credential cannot see this repository", and flattening either into an
+	 * ordinary answer would hide a misconfiguration behind a healthy-looking
+	 * silence. The caller (`src/dispatch/base-branch-health.ts`) classifies the
+	 * throw as *unknown* with the provider's own diagnostic attached. `null` is
+	 * reserved for the one genuinely ordinary non-answer: the provider replied
+	 * without naming a head commit at all. Omitting `persona` uses the provider's
+	 * documented default for the read.
+	 */
+	getBranchHead(
+		project: ProjectConfig,
+		branch: string,
+		persona?: ScmPersona,
+	): Promise<string | null>;
+
+	/**
 	 * Aggregate the state of every check on `ref` (a commit SHA), so a caller
 	 * decides whether CI is finished from the whole picture rather than trusting
 	 * one webhook's own conclusion.
