@@ -280,6 +280,15 @@ export const stalledItemSchema = z.object({
 	runId: z.string(),
 	runStatus: z.string(),
 	prNumber: z.string().optional(),
+	/**
+	 * That pull request's web URL, already resolved **server-side** through the
+	 * project's own SCM provider (`SCMProvider.pullRequestUrl`) — so a GitLab merge
+	 * request and a Bitbucket pull request link to their own hosts instead of the
+	 * `github.com/<repo>/pull/<n>` the client would otherwise assemble. Optional:
+	 * absent for a `work-item` unit, for a row with no `prNumber`, and for a project
+	 * whose provider does not resolve.
+	 */
+	prUrl: z.string().optional(),
 	prTitle: z.string().optional(),
 	workItemId: z.string().optional(),
 	workItemTitle: z.string().optional(),

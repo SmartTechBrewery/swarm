@@ -48,6 +48,7 @@ import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { getWorker, getWorkers } from '../../identity/worker-service.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
+import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
@@ -74,6 +75,7 @@ import {
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
+import type { SCMProvider } from '../../scm/types.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
@@ -751,6 +753,58 @@ function itemLivenessPolicyFor(project: ProjectConfig | undefined): ItemLiveness
 	};
 }
 
+/**
+ * Fill each `pull-request` stalled row's `prUrl` with the **provider's own** web
+ * URL for that pull request, so the dashboard links a stalled PR out without
+ * assembling a URL of its own — which is how a GitLab or Bitbucket project's rows
+ * ended up pointing at `github.com`.
+ *
+ * The repository is the row's own (issue #683), not `project.repo`: a project may
+ * span several repositories, and the stalled row already records which one the run
+ * acted on. The lookup is a registry lookup on `project.scm`
+ * (`requireProjectSCMProvider`) and the method it calls is pure, so this adds no
+ * request and no per-row I/O to a procedure that deliberately touches nothing but
+ * Postgres.
+ *
+ * A project that resolves no runtime-ready provider — unregistered id, or an
+ * unmigrated project naming no `scm` — leaves `prUrl` unset and is logged once per
+ * project rather than throwing: the stalled view's job is to report work nobody is
+ * looking at, and losing the whole report over one project's configuration would
+ * hide exactly the rows an operator needs.
+ */
+function withPullRequestUrls(
+	items: StalledItem[],
+	projects: Map<string, ProjectConfig>,
+): StalledItem[] {
+	const urlForProject = new Map<string, SCMProvider['pullRequestUrl'] | null>();
+	const resolve = (projectId: string): SCMProvider['pullRequestUrl'] | null => {
+		const cached = urlForProject.get(projectId);
+		if (cached !== undefined) return cached;
+		const project = projects.get(projectId);
+		let resolved: SCMProvider['pullRequestUrl'] | null = null;
+		if (project) {
+			try {
+				const provider = requireProjectSCMProvider(project);
+				resolved = provider.pullRequestUrl.bind(provider);
+			} catch (error) {
+				logger.warn(
+					'runs.stalled: no source-control provider resolved; listing that project’s pull requests unlinked',
+					{ projectId, error: describeError(error) },
+				);
+			}
+		}
+		urlForProject.set(projectId, resolved);
+		return resolved;
+	};
+
+	return items.map((item) => {
+		if (item.unit !== 'pull-request' || !item.prNumber) return item;
+		const pullRequestUrl = resolve(item.projectId);
+		if (!pullRequestUrl) return item;
+		return { ...item, prUrl: pullRequestUrl(item.repository, item.prNumber) };
+	});
+}
+
 export const runsRouter = router({
 	// Paginated, filtered list; returns { data, total } from the repo, each row
 	// widened with the additive, server-resolved `workerName` naming the machine
@@ -839,9 +893,12 @@ export const runsRouter = router({
 					listTaskActivitySince({ since, projectIds }),
 					listActiveDispatchTaskRefs(projectIds),
 				]);
-				return toStalledItems(activity, activeDispatches, {
-					[input.projectId]: itemLivenessPolicyFor(project),
-				});
+				return withPullRequestUrls(
+					toStalledItems(activity, activeDispatches, {
+						[input.projectId]: itemLivenessPolicyFor(project),
+					}),
+					new Map(project ? [[project.id, project]] : []),
+				);
 			}
 			assertInstanceAdmin(ctx.user, 'stalled work');
 			const [activity, activeDispatches, projects] = await Promise.all([
@@ -852,7 +909,10 @@ export const runsRouter = router({
 			const policies = Object.fromEntries(
 				projects.map((project) => [project.id, itemLivenessPolicyFor(project)]),
 			);
-			return toStalledItems(activity, activeDispatches, policies);
+			return withPullRequestUrls(
+				toStalledItems(activity, activeDispatches, policies),
+				new Map(projects.map((project) => [project.id, project])),
+			);
 		}),
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member

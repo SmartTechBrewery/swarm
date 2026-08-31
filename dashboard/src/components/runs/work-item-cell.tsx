@@ -26,6 +26,20 @@ export interface WorkItemCellRun {
 	workItemTitle: string | null;
 	workItemUrl: string | null;
 	prNumber: string | null;
+	/**
+	 * The pull request's web URL, resolved **server-side** through the project's own
+	 * SCM provider (`SCMProvider.pullRequestUrl`, `src/scm/types.ts`). Supply it
+	 * whenever the read model behind a caller can: GitLab spells a pull request
+	 * `/-/merge_requests/<n>` and Bitbucket `/pull-requests/<n>`, so the
+	 * `github.com/<repo>/pull/<n>` fallback below sends those projects' operators
+	 * to a repository that may not exist.
+	 *
+	 * Optional because only the `runs.stalled` read model resolves it so far
+	 * (issue #847); the runs list and the Workers screen still carry only
+	 * `repository` + `prNumber` and keep the fallback until their own read models
+	 * carry a resolved URL too.
+	 */
+	prUrl?: string | null;
 	prTitle: string | null;
 }
 
@@ -89,9 +103,12 @@ function WorkItemReference({ run, isPrDriven }: { run: WorkItemCellRun; isPrDriv
 	const workItemRef = parseWorkItemRef(run.workItemUrl);
 
 	if (isPrDriven && run.prNumber) {
+		// Prefer the provider-resolved URL; the GitHub derivation is only the
+		// fallback for a caller whose read model does not carry one yet (see
+		// `WorkItemCellRun.prUrl`).
 		return (
 			<a
-				href={`https://github.com/${run.repository}/pull/${run.prNumber}`}
+				href={run.prUrl || `https://github.com/${run.repository}/pull/${run.prNumber}`}
 				target="_blank"
 				rel="noopener noreferrer"
 				onClick={stopPropagation}

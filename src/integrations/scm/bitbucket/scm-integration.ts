@@ -59,6 +59,7 @@ import {
 	resolveBitbucketPersonaIdentities,
 } from './personas.js';
 import {
+	bitbucketPullRequestUrl,
 	findOpenBitbucketPullRequest,
 	getBitbucketCommitBuildStatus,
 	getBitbucketPullRequest,
@@ -329,6 +330,15 @@ export class BitbucketSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getBitbucketPullRequestTitle(workspace, slug, prNumber),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.pullRequestUrl} — Bitbucket's `/pull-requests/<id>` web
+	 * path, not GitHub's `/pull/<n>`. Shares {@link bitbucketPullRequestUrl} with
+	 * the pull-request reference derivation so there is one spelling of the grammar.
+	 */
+	pullRequestUrl(repo: string, prNumber: number | string): string {
+		return bitbucketPullRequestUrl(repo, prNumber);
 	}
 
 	/**

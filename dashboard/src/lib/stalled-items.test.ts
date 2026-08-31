@@ -14,6 +14,7 @@ function pullRequestItem(overrides: Partial<StalledItem> = {}): StalledItem {
 		runId: 'run-1',
 		runStatus: 'completed',
 		prNumber: '92',
+		prUrl: 'https://github.com/acme/widgets/pull/92',
 		prTitle: 'Add the widget',
 		lastActivityAt: '2026-08-30T09:00:00.000Z',
 		stalledForMs: 10_800_000,
@@ -101,8 +102,32 @@ describe('stalledItemRun', () => {
 			workItemTitle: null,
 			workItemUrl: null,
 			prNumber: '92',
+			prUrl: 'https://github.com/acme/widgets/pull/92',
 			prTitle: 'Add the widget',
 		});
+	});
+
+	// The server resolved this URL through the project's own SCM provider, so the
+	// adapter has to carry it through verbatim — deriving one here is exactly what
+	// sends a GitLab or Bitbucket project's operators to github.com.
+	it('carries a provider-resolved pull-request URL through unchanged', () => {
+		const gitlab = stalledItemRun(
+			pullRequestItem({
+				repository: 'team/app',
+				prNumber: '42',
+				prUrl: 'https://gitlab.com/team/app/-/merge_requests/42',
+			}),
+		);
+		expect(gitlab.prUrl).toBe('https://gitlab.com/team/app/-/merge_requests/42');
+
+		const bitbucket = stalledItemRun(
+			pullRequestItem({
+				repository: 'team/app',
+				prNumber: '7',
+				prUrl: 'https://bitbucket.org/team/app/pull-requests/7',
+			}),
+		);
+		expect(bitbucket.prUrl).toBe('https://bitbucket.org/team/app/pull-requests/7');
 	});
 
 	it('maps a work-item item onto the shared run description', () => {
@@ -114,6 +139,7 @@ describe('stalledItemRun', () => {
 			workItemTitle: 'Fix the widget',
 			workItemUrl: 'https://github.com/acme/widgets/issues/85',
 			prNumber: null,
+			prUrl: null,
 			prTitle: null,
 		});
 	});
@@ -123,5 +149,6 @@ describe('stalledItemRun', () => {
 	it('reports every omitted field as null', () => {
 		const run = stalledItemRun(workItemItem({ workItemUrl: undefined }));
 		expect(run.workItemUrl).toBeNull();
+		expect(stalledItemRun(pullRequestItem({ prUrl: undefined })).prUrl).toBeNull();
 	});
 });

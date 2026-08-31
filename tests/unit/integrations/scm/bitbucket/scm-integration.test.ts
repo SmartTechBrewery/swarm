@@ -41,7 +41,11 @@ vi.mock('@/integrations/scm/bitbucket/personas.js', () => ({
 	isSwarmBitbucketActor: vi.fn(),
 	getBitbucketPersonaForLogin: vi.fn(),
 }));
-vi.mock('@/integrations/scm/bitbucket/pull-requests.js', () => ({
+// The reads are stubbed; `bitbucketPullRequestUrl` is kept real, because it is a
+// pure URL grammar and a stubbed copy could drift from the one the module's own
+// reference derivation uses.
+vi.mock('@/integrations/scm/bitbucket/pull-requests.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/integrations/scm/bitbucket/pull-requests.js')>()),
 	findOpenBitbucketPullRequest: vi.fn(),
 	getBitbucketPullRequest: vi.fn(),
 	getBitbucketPullRequestApprovals: vi.fn(),
@@ -354,6 +358,28 @@ describe('BitbucketSCMIntegration', () => {
 				'main',
 			);
 			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+		});
+	});
+
+	// A pure grammar, so it is asserted as one: no credential, no request. Bitbucket
+	// spells a pull request `/pull-requests/<id>`, which is the whole reason shared
+	// code must not derive `github.com/<repo>/pull/<n>` for itself.
+	describe('pullRequestUrl', () => {
+		it('spells Bitbucket’s own pull-request web path', () => {
+			expect(scm.pullRequestUrl('team/app', 42)).toBe(
+				'https://bitbucket.org/team/app/pull-requests/42',
+			);
+			expect(scm.pullRequestUrl('team/app', '42')).toBe(
+				'https://bitbucket.org/team/app/pull-requests/42',
+			);
+		});
+
+		// The repository is the caller's, not `project.repo`: a stalled row records
+		// the repository its run actually acted on (issue #683).
+		it('uses the repository it is handed rather than the project’s', () => {
+			expect(scm.pullRequestUrl('other/repo', 7)).toBe(
+				'https://bitbucket.org/other/repo/pull-requests/7',
+			);
 		});
 	});
 

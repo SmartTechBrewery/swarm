@@ -47,6 +47,11 @@ export function stalledPhaseLabel(phase: string): string {
  * reference line rather than a URL assembled here. The read model reports absent
  * fields as `undefined` while a run row reports `null`; that is the whole
  * difference.
+ *
+ * `prUrl` is the one field this shape carries that a run row does not: the server
+ * resolved it through the project's own SCM provider, so a stalled GitLab or
+ * Bitbucket pull request links to its own host rather than to the GitHub URL
+ * `WorkItemCell` would otherwise derive from `repository` + `prNumber`.
  */
 export function stalledItemRun(item: StalledItem): WorkItemCellRun {
 	return {
@@ -57,6 +62,7 @@ export function stalledItemRun(item: StalledItem): WorkItemCellRun {
 		workItemTitle: item.workItemTitle ?? null,
 		workItemUrl: item.workItemUrl ?? null,
 		prNumber: item.prNumber ?? null,
+		prUrl: item.prUrl ?? null,
 		prTitle: item.prTitle ?? null,
 	};
 }

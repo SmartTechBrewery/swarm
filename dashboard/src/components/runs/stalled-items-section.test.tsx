@@ -39,6 +39,7 @@ function pullRequestItem(overrides: Partial<StalledItem> = {}): StalledItem {
 		runId: 'run-1',
 		runStatus: 'completed',
 		prNumber: '92',
+		prUrl: 'https://github.com/acme/widgets/pull/92',
 		prTitle: 'Add the widget',
 		lastActivityAt: hoursAgo(3),
 		stalledForMs: 3 * HOUR_MS,
@@ -100,6 +101,47 @@ describe('StalledItemsSection', () => {
 		expect(link.getAttribute('href')).toBe('https://github.com/acme/widgets/pull/92');
 		expect(within(row).getByText('Respond to review')).not.toBeNull();
 		expect(within(row).getByText('3h ago')).not.toBeNull();
+	});
+
+	// The link is the server's, spelled in the project's own provider's grammar
+	// (`SCMProvider.pullRequestUrl`): a GitLab merge request lives at
+	// `/-/merge_requests/<n>` and a Bitbucket pull request at `/pull-requests/<n>`,
+	// so a client-derived `github.com/<repo>/pull/<n>` would point at a repository
+	// that need not even exist.
+	it.each([
+		[
+			'gitlab',
+			'https://gitlab.com/team/app/-/merge_requests/42',
+			{ repository: 'team/app', reference: '42', prNumber: '42' },
+		],
+		[
+			'bitbucket',
+			'https://bitbucket.org/team/app/pull-requests/42',
+			{ repository: 'team/app', reference: '42', prNumber: '42' },
+		],
+	])('links a stalled %s pull request to its provider-resolved URL', (_provider, prUrl, fields) => {
+		renderSection(<StalledItemsSection items={[pullRequestItem({ ...fields, prUrl })]} />);
+
+		const link = within(rows()[0]).getByRole('link', { name: /PR #42/ });
+		expect(link.getAttribute('href')).toBe(prUrl);
+	});
+
+	// The mobile card renders through the same helpers, so it must resolve the same
+	// link rather than falling back to a derived one.
+	it('links the mobile card to the same provider-resolved URL', () => {
+		const prUrl = 'https://gitlab.com/team/app/-/merge_requests/42';
+		renderSection(
+			<StalledItemsSection
+				items={[pullRequestItem({ repository: 'team/app', prNumber: '42', prUrl })]}
+			/>,
+		);
+
+		const card = screen.getAllByTestId('stalled-item-card')[0];
+		expect(
+			within(card)
+				.getByRole('link', { name: /PR #42/ })
+				.getAttribute('href'),
+		).toBe(prUrl);
 	});
 
 	// Relative on the face, absolute on hover — an operator triaging a stall needs

@@ -296,9 +296,18 @@ export function toBitbucketPullRequestReference(
 	}
 	return {
 		number: pr.id,
-		url:
-			pr.links?.html?.href ?? `https://bitbucket.org/${workspace}/${slug}/pull-requests/${pr.id}`,
+		url: pr.links?.html?.href ?? bitbucketPullRequestUrl(`${workspace}/${slug}`, pr.id),
 	};
+}
+
+/**
+ * Bitbucket Cloud's canonical **web** URL for one pull request, from the
+ * `workspace/slug` coordinates — the grammar behind both the derivation above and
+ * {@link BitbucketSCMIntegration.pullRequestUrl}, so the two cannot drift into
+ * different spellings of the same path.
+ */
+export function bitbucketPullRequestUrl(repo: string, id: number | string): string {
+	return `https://bitbucket.org/${repo}/pull-requests/${id}`;
 }
 
 /**
