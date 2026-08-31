@@ -28,6 +28,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	getPullRequestReviewDecision: vi.fn(),
 	getPullRequestReviews: vi.fn(),
 	mergePullRequestDirect: vi.fn(),
+	updatePullRequestBranchDirect: vi.fn(),
 }));
 
 import { getPersonaToken, getPersonaTokenOrNull } from '@/config/provider.js';
@@ -39,6 +40,7 @@ import {
 	getPullRequestReviewDecision,
 	getPullRequestReviews,
 	mergePullRequestDirect,
+	updatePullRequestBranchDirect,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
 import {
@@ -295,6 +297,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'closed',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			await scm.mergePullRequest(project, 42, 'reviewed-head');
 			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
@@ -306,6 +309,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'closed',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 
 			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
@@ -321,6 +325,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'new-head-after-push',
+				behindBase: false,
 			});
 
 			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
@@ -337,6 +342,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: true,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 
 			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
@@ -352,6 +358,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'closed',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 
 			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
@@ -367,6 +374,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(getPullRequestReviewDecision).mockResolvedValue('CHANGES_REQUESTED');
 
@@ -386,6 +394,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(getPullRequestReviewDecision).mockResolvedValue('REVIEW_REQUIRED');
 			vi.mocked(mergePullRequestDirect).mockResolvedValue({
@@ -407,6 +416,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(getPullRequestReviewDecision).mockResolvedValue('REVIEW_REQUIRED');
 			vi.mocked(getPullRequestReviews).mockResolvedValue([
@@ -426,6 +436,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(getPullRequestReviewDecision).mockResolvedValue(null);
 			vi.mocked(mergePullRequestDirect).mockResolvedValue({
@@ -447,6 +458,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(getPullRequestReviewDecision).mockRejectedValue(new Error('502 Bad Gateway'));
 
@@ -473,6 +485,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockResolvedValue({
 				merged: true,
@@ -499,6 +512,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockResolvedValue({
 				merged: false,
@@ -517,6 +531,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockRejectedValue(
 				Object.assign(new Error('Pull Request is not mergeable'), { status: 405 }),
@@ -534,6 +549,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockRejectedValue(
 				Object.assign(new Error('Head branch was modified. Review and try the merge again.'), {
@@ -553,6 +569,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockRejectedValue(
 				Object.assign(
@@ -575,6 +592,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockRejectedValue(
 				Object.assign(new Error('This branch must be merged via the merge queue'), {
@@ -594,6 +612,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockRejectedValue(
 				Object.assign(new Error('Protected branch update failed'), { status: 403 }),
@@ -611,6 +630,7 @@ describe('GitHubSCMIntegration', () => {
 				state: 'open',
 				draft: false,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			vi.mocked(mergePullRequestDirect).mockRejectedValue(
 				Object.assign(new Error('Internal Server Error'), { status: 500 }),
@@ -619,6 +639,143 @@ describe('GitHubSCMIntegration', () => {
 			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
 				status: 'provider-error',
 				message: 'Internal Server Error',
+			});
+		});
+
+		// Issue #874: an approved, otherwise-ready head whose checks never built the
+		// base it would land on is refused rather than merged, so the dispatch can
+		// bring it up to date and wait for the fresh CI.
+		it('refuses a head that is behind its base instead of merging it', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue({
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha: 'reviewed-head',
+				behindBase: true,
+			});
+
+			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toMatchObject({
+				status: 'stale-base',
+			});
+			expect(mergePullRequestDirect).not.toHaveBeenCalled();
+		});
+
+		// Ordering matters: an approval that no longer holds must report *that*,
+		// rather than sending the dispatch off to update a branch nobody may merge.
+		it('reports a lost approval ahead of base staleness', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue({
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha: 'pushed-since',
+				behindBase: true,
+			});
+
+			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toMatchObject({
+				status: 'not-eligible',
+			});
+		});
+	});
+
+	// Issue #874. The endpoint answers 202 with no SHA, so the new head is read
+	// back — and the approval the dispatch carries forward is pinned to it.
+	describe('updatePullRequestBranch', () => {
+		beforeEach(() => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			vi.mocked(getPullRequestMergeState).mockReset();
+			vi.mocked(updatePullRequestBranchDirect).mockReset();
+			vi.mocked(updatePullRequestBranchDirect).mockResolvedValue(undefined);
+		});
+
+		function mergeStateAt(headSha: string, behindBase = false) {
+			return { merged: false, state: 'open', draft: false, headSha, behindBase };
+		}
+
+		it('updates as the implementer, pinned to the expected head, and reports the new one', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue(mergeStateAt('merged-base-head'));
+
+			vi.useFakeTimers();
+			const outcome = scm.updatePullRequestBranch(project, 42, 'reviewed-head');
+			await vi.advanceTimersByTimeAsync(1_000);
+			await expect(outcome).resolves.toEqual({
+				status: 'updated',
+				headSha: 'merged-base-head',
+			});
+			vi.useRealTimers();
+
+			expect(updatePullRequestBranchDirect).toHaveBeenCalledExactlyOnceWith(
+				'SmartTechBrewery',
+				'swarm',
+				42,
+				'reviewed-head',
+			);
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
+		});
+
+		// A 422 is GitHub's answer both to "the head is not that commit any more"
+		// and to "the base does not merge cleanly"; either way there is nothing to
+		// retry, and the merge dispatch settles the pull request terminally.
+		it('is a conflict for a 422', async () => {
+			vi.mocked(updatePullRequestBranchDirect).mockRejectedValue(
+				Object.assign(new Error('merge conflict between base and head'), { status: 422 }),
+			);
+
+			await expect(scm.updatePullRequestBranch(project, 42, 'reviewed-head')).resolves.toEqual({
+				status: 'conflict',
+				message: 'merge conflict between base and head',
+			});
+		});
+
+		it('is up-to-date when GitHub says the branch already contains the base', async () => {
+			vi.mocked(updatePullRequestBranchDirect).mockRejectedValue(
+				Object.assign(new Error('This branch is already up to date'), { status: 422 }),
+			);
+
+			await expect(scm.updatePullRequestBranch(project, 42, 'reviewed-head')).resolves.toEqual({
+				status: 'up-to-date',
+			});
+		});
+
+		it('is unsupported when the credential may not write the branch', async () => {
+			vi.mocked(updatePullRequestBranchDirect).mockRejectedValue(
+				Object.assign(new Error('Resource not accessible by integration'), { status: 403 }),
+			);
+
+			await expect(scm.updatePullRequestBranch(project, 42, 'reviewed-head')).resolves.toEqual({
+				status: 'unsupported',
+				message: 'Resource not accessible by integration',
+			});
+		});
+
+		// The head never moving is not "updated with the old SHA": re-pinning the
+		// approval to a commit the background job is about to replace would make the
+		// next attempt read a moved head and refuse the merge outright.
+		it('reports a provider error rather than an unchanged head when the job never publishes', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue(mergeStateAt('reviewed-head', true));
+
+			vi.useFakeTimers();
+			const outcome = scm.updatePullRequestBranch(project, 42, 'reviewed-head');
+			await vi.advanceTimersByTimeAsync(10_000);
+			await expect(outcome).resolves.toMatchObject({ status: 'provider-error' });
+			vi.useRealTimers();
+		});
+
+		it('reports up-to-date when the head never moves and is no longer behind', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue(mergeStateAt('reviewed-head', false));
+
+			vi.useFakeTimers();
+			const outcome = scm.updatePullRequestBranch(project, 42, 'reviewed-head');
+			await vi.advanceTimersByTimeAsync(10_000);
+			await expect(outcome).resolves.toEqual({ status: 'up-to-date' });
+			vi.useRealTimers();
+		});
+
+		it('never throws — an unresolvable credential comes back as provider-error', async () => {
+			vi.mocked(getPersonaToken).mockRejectedValue(new Error('no implementer token'));
+
+			await expect(scm.updatePullRequestBranch(project, 42, 'reviewed-head')).resolves.toEqual({
+				status: 'provider-error',
+				message: 'no implementer token',
 			});
 		});
 	});

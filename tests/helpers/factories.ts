@@ -978,6 +978,7 @@ export function createFakeScmProvider(overrides: Partial<SCMProvider> = {}): SCM
 		listConflictCandidates: unstubbed('listConflictCandidates'),
 		commentOnPullRequest: unstubbed('commentOnPullRequest'),
 		mergePullRequest: unstubbed('mergePullRequest'),
+		updatePullRequestBranch: unstubbed('updatePullRequestBranch'),
 		deliveryProvider: unstubbed('deliveryProvider'),
 		operatorDeliveryProvider: unstubbed('operatorDeliveryProvider'),
 		...overrides,

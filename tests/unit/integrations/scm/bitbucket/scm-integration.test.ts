@@ -435,7 +435,7 @@ describe('BitbucketSCMIntegration', () => {
 		const FULL_SHA = 'd3022fc0ca3d65c7f6654eea129d6bf0cf0ee08e';
 
 		function openAt(headSha: string) {
-			return { merged: false, state: 'open', draft: false, headSha };
+			return { merged: false, state: 'open', draft: false, headSha, behindBase: null };
 		}
 
 		beforeEach(() => {
@@ -472,6 +472,7 @@ describe('BitbucketSCMIntegration', () => {
 				state: 'closed',
 				draft: false,
 				headSha: APPROVED_SHA,
+				behindBase: null,
 			});
 
 			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
@@ -623,6 +624,42 @@ describe('BitbucketSCMIntegration', () => {
 			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
 				status: 'provider-error',
 				message: 'No Bitbucket implementer credential configured',
+			});
+		});
+
+		// Issue #874: Bitbucket cannot say whether a head is behind its base, and a
+		// "cannot determine" merges exactly as it did before base freshness existed.
+		it('still merges, since Bitbucket never reports a behind head', async () => {
+			vi.mocked(getBitbucketPullRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+			vi.mocked(mergeBitbucketPullRequestDirect).mockResolvedValue({
+				merged: true,
+				message: 'pull request merged',
+			});
+
+			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'merged',
+			});
+		});
+	});
+
+	// Issue #874. A *declared* answer rather than a stub: Bitbucket Cloud exposes no
+	// operation that merges a destination branch into a pull request's source
+	// branch, so the merge dispatch refuses a stale head visibly instead.
+	describe('updatePullRequestBranch', () => {
+		const APPROVED_SHA = 'd3022fc0ca3d';
+
+		it('declares the capability unsupported, naming the pull request', async () => {
+			const outcome = await scm.updatePullRequestBranch(project, 17, APPROVED_SHA);
+
+			expect(outcome.status).toBe('unsupported');
+			expect(outcome).toMatchObject({ message: expect.stringContaining('#17') });
+		});
+
+		it('needs no credential to answer, so it never throws', async () => {
+			vi.mocked(getBitbucketCredential).mockRejectedValue(new Error('no credential'));
+
+			await expect(scm.updatePullRequestBranch(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'unsupported',
 			});
 		});
 	});

@@ -259,7 +259,13 @@ describe('github client', () => {
 	describe('getPullRequestMergeState', () => {
 		it('resolves merged/state/draft/head SHA from the PR', async () => {
 			pullsGet.mockResolvedValue({
-				data: { merged: false, state: 'open', draft: true, head: { sha: 'reviewed-head' } },
+				data: {
+					merged: false,
+					state: 'open',
+					draft: true,
+					head: { sha: 'reviewed-head' },
+					mergeable_state: 'clean',
+				},
 			});
 
 			await expect(
@@ -269,6 +275,7 @@ describe('github client', () => {
 				state: 'open',
 				draft: true,
 				headSha: 'reviewed-head',
+				behindBase: false,
 			});
 			expect(pullsGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm', pull_number: 42 });
 		});
@@ -285,7 +292,43 @@ describe('github client', () => {
 				state: 'closed',
 				draft: false,
 				headSha: 'merged-head',
+				behindBase: false,
 			});
+		});
+
+		// Base freshness rides on the read the merge path already performs (issue
+		// #874) — `behindBase` is GitHub's own `mergeable_state`, not a second call.
+		it('reports a head GitHub calls behind as behind its base', async () => {
+			pullsGet.mockResolvedValue({
+				data: {
+					merged: false,
+					state: 'open',
+					draft: false,
+					head: { sha: 'reviewed-head' },
+					mergeable_state: 'behind',
+				},
+			});
+
+			await expect(
+				withGitHubToken('tok', () => getPullRequestMergeState('jkwiecien', 'swarm', 42)),
+			).resolves.toMatchObject({ behindBase: true });
+			expect(pullsGet).toHaveBeenCalledTimes(1);
+		});
+
+		it('reports a still-computing mergeable state as not behind', async () => {
+			pullsGet.mockResolvedValue({
+				data: {
+					merged: false,
+					state: 'open',
+					draft: false,
+					head: { sha: 'reviewed-head' },
+					mergeable_state: 'unknown',
+				},
+			});
+
+			await expect(
+				withGitHubToken('tok', () => getPullRequestMergeState('jkwiecien', 'swarm', 42)),
+			).resolves.toMatchObject({ behindBase: false });
 		});
 	});
 

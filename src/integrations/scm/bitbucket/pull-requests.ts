@@ -98,6 +98,18 @@ export interface BitbucketPullRequestMergeState {
 	draft: boolean;
 	/** The exact head commit a merge attempt is allowed to merge. */
 	headSha: string;
+	/**
+	 * Whether the head has not been built against the base it would land on
+	 * (issue #874) — always `null` here, meaning "cannot determine".
+	 *
+	 * Bitbucket Cloud exposes no such state, the same way it reports no
+	 * mergeability at all (`toPullRequestDetails`'s `mergeable: null` below): a
+	 * pull request response carries neither a divergence count nor a
+	 * behind/ahead flag, and deriving one would take a separate commit
+	 * comparison per merge attempt. The merge path treats a `null` exactly as it
+	 * did before base freshness existed, so Bitbucket's behaviour is unchanged.
+	 */
+	behindBase: null;
 }
 
 /**
@@ -231,6 +243,7 @@ export async function getBitbucketPullRequestMergeState(
 		state: pr.state === 'OPEN' ? 'open' : 'closed',
 		draft: Boolean(pr.draft),
 		headSha: abbreviateBitbucketSha(headSha),
+		behindBase: null,
 	};
 }
 

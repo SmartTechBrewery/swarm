@@ -33,7 +33,10 @@ import { promisify } from 'node:util';
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
-import type { MergePullRequestOutcome } from '../../../scm/merge.js';
+import type {
+	MergePullRequestOutcome,
+	UpdatePullRequestBranchOutcome,
+} from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
@@ -471,6 +474,32 @@ export class BitbucketSCMIntegration implements SCMProvider {
 			// capability throws.
 			return { status: 'provider-error', message: errorMessage(error) };
 		}
+	}
+
+	/**
+	 * {@link ScmMergeProvider.updatePullRequestBranch} for Bitbucket — a
+	 * **declared** `unsupported`, not a gap (issue #874).
+	 *
+	 * Bitbucket Cloud's REST API offers no operation that merges a destination
+	 * branch into a pull request's source branch: the closest thing is pushing a
+	 * merge commit to the source branch over git, which this contract deliberately
+	 * does not do — it takes no expected-head parameter, so nothing would keep the
+	 * approval SWARM carries forward pinned to a head SWARM itself produced.
+	 * Bitbucket cannot say whether a head is behind its base either
+	 * ({@link getBitbucketPullRequestMergeState}'s `behindBase`), so in practice this
+	 * answer is only ever reached by a dispatch that learnt of the staleness some
+	 * other way; either way the merge dispatch refuses visibly rather than merging
+	 * on stale evidence.
+	 */
+	async updatePullRequestBranch(
+		project: ProjectConfig,
+		prNumber: number,
+		_expectedHeadSha: string,
+	): Promise<UpdatePullRequestBranchOutcome> {
+		return {
+			status: 'unsupported',
+			message: `Bitbucket Cloud exposes no API for merging the destination branch into pull request #${prNumber} of ${project.repo}, so its head cannot be brought up to date automatically`,
+		};
 	}
 
 	/**

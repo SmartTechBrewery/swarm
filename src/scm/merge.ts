@@ -24,6 +24,29 @@
  * no dispatch or worker changes. Bitbucket's endpoint takes no expected-head
  * parameter, so that re-read is the whole of its protection; GitHub and GitLab
  * also pin the merge to the approved SHA.
+ *
+ * **Base freshness, and the one place the reviewed-commit invariant is relaxed
+ * (issue #874).** A head that passed its checks against an older base proves
+ * nothing about the tree it would land on, which is how two independently green
+ * pull requests combine into a red base branch. So the merge capability answers
+ * {@link MergePullRequestOutcome} `stale-base` for a head that is behind its
+ * base, and the dispatch answers *that* with
+ * {@link ScmMergeProvider.updatePullRequestBranch}, waits for the fresh CI on
+ * the head it produced, and merges only then.
+ *
+ * Carrying the approval across that new commit is deliberate, and it is the only
+ * relaxation of "merge exactly the commit that was reviewed". Three things make
+ * it sound, and all three have to hold:
+ *
+ *  1. the new commit is the reviewed diff plus the provider's **own** merge of
+ *     the base — no human authored anything in it, and the reviewed diff is
+ *     unchanged, so re-running the *review* would re-read the same code;
+ *  2. what the update invalidates is the *verification*, not the review, and the
+ *     dispatch replaces exactly that by waiting for the new head's CI;
+ *  3. the update is pinned with `expectedHeadSha`, so the dispatch can only
+ *     carry the approval onto a commit **it asked the provider to create** — a
+ *     head somebody pushed still reports `not-eligible` and still needs a fresh
+ *     review.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -53,6 +76,14 @@ import type { ProjectConfig } from '../config/schema.js';
  *   a repository configuration this adapter doesn't implement (e.g. a
  *   required merge queue), or a provider that hasn't implemented the
  *   capability at all.
+ * - `stale-base` — the approval still holds and the request is otherwise
+ *   ready, but its head has never been built against the base it would land
+ *   on: the base has advanced since these checks passed (issue #874). Merging
+ *   would land a commit whose CI verified a tree that no longer exists, which
+ *   is how two independently green pull requests combine into a red base
+ *   branch. Not a refusal the *provider* can clear — the head has to be
+ *   brought up to date and re-verified first, which is the merge dispatch's
+ *   job ({@link ScmMergeProvider.updatePullRequestBranch}).
  * - `provider-error` — an unexpected API, authentication, rate-limit, or
  *   transport failure. Distinct from every refusal above: it reflects the
  *   provider being unreachable/misbehaving, not the request's own readiness
@@ -63,6 +94,36 @@ export type MergePullRequestOutcome =
 	| { status: 'not-ready'; message: string }
 	| { status: 'not-eligible'; message: string }
 	| { status: 'policy-blocked'; message: string }
+	| { status: 'unsupported'; message: string }
+	| { status: 'stale-base'; message: string }
+	| { status: 'provider-error'; message: string };
+
+/**
+ * Terminal outcome of one attempt to bring a pull request's head up to date
+ * with its base. Like {@link MergePullRequestOutcome}, every status is a normal
+ * answer rather than a thrown error.
+ *
+ * - `updated` — the provider produced a **new head commit** that merges the
+ *   current base into the pull request's branch. `headSha` is that commit, read
+ *   back from the provider rather than guessed, because it is what the dispatch
+ *   re-pins its approval and its merge to.
+ * - `up-to-date` — there was nothing to do: the head already contains the base.
+ *   A race, in practice — something else advanced the branch between the merge
+ *   attempt that reported `stale-base` and this call.
+ * - `conflict` — the base cannot be merged into the head without human
+ *   intervention. Terminal here: resolving conflicts is the Resolve-conflicts
+ *   phase's job, not merge automation's.
+ * - `unsupported` — this provider exposes no way to update a pull request's
+ *   branch. A *declared* answer, not a stub: the capability genuinely does not
+ *   exist in the provider's API, so the dispatch refuses the merge visibly
+ *   instead of merging on stale evidence.
+ * - `provider-error` — an unexpected API, authentication, rate-limit, or
+ *   transport failure, exactly as on the merge side.
+ */
+export type UpdatePullRequestBranchOutcome =
+	| { status: 'updated'; headSha: string }
+	| { status: 'up-to-date' }
+	| { status: 'conflict'; message: string }
 	| { status: 'unsupported'; message: string }
 	| { status: 'provider-error'; message: string };
 
@@ -81,7 +142,33 @@ export interface ScmMergeProvider {
 		prNumber: number,
 		approvedHeadSha: string,
 	): Promise<MergePullRequestOutcome>;
+
+	/**
+	 * Provider-neutral capability: merge the current base into a pull request's
+	 * head, producing a new head commit whose CI builds the tree the request
+	 * would actually land on (issue #874). The answer to a `stale-base` merge
+	 * outcome, and the *only* place SWARM's "merge exactly the commit that was
+	 * reviewed" invariant is relaxed — see this module's header for why that is
+	 * sound, and `src/worker/merge-automation.ts` for the bound on how often it
+	 * may happen.
+	 *
+	 * `expectedHeadSha` is what keeps the relaxation honest: the provider must
+	 * refuse the update when the pull request's head is not that commit, so the
+	 * dispatch can only ever carry the approval across a commit **it asked for**,
+	 * never across one somebody else pushed in the meantime.
+	 *
+	 * Never throws — every refusal, including "this provider cannot do this at
+	 * all", comes back as an {@link UpdatePullRequestBranchOutcome}.
+	 */
+	updatePullRequestBranch(
+		project: ProjectConfig,
+		prNumber: number,
+		expectedHeadSha: string,
+	): Promise<UpdatePullRequestBranchOutcome>;
 }
 
 /** Injectable function type mirroring {@link ScmMergeProvider.mergePullRequest} for phase options. */
 export type MergePullRequest = ScmMergeProvider['mergePullRequest'];
+
+/** Injectable function type mirroring {@link ScmMergeProvider.updatePullRequestBranch}. */
+export type UpdatePullRequestBranch = ScmMergeProvider['updatePullRequestBranch'];

@@ -69,6 +69,8 @@ interface GitLabMergeRequest {
 	merge_status?: string;
 	/** The successor to `merge_status`, which also reports *policy* blockers. */
 	detailed_merge_status?: string;
+	/** How many commits the target branch is ahead — only present when the read asks for it. */
+	diverged_commits_count?: number;
 	diff_refs?: { base_sha?: string } | null;
 	web_url?: string;
 }
@@ -115,6 +117,17 @@ export interface GitLabMergeRequestMergeState {
 	 * dispatch would retry even though a reviewer decision cannot clear on its own.
 	 */
 	changesRequested: boolean;
+	/**
+	 * Whether the source branch is missing commits the target branch has, i.e. the
+	 * head has not been built against the base it would land on (issue #874).
+	 *
+	 * `diverged_commits_count`, which GitLab computes only when the read asks for it
+	 * (`include_diverged_commits_count=true` — see {@link getGitLabMergeRequestMergeState}).
+	 * `null` when the response carries no count at all: GitLab omits the field for a
+	 * merge request it cannot compute one for (a closed or merged one, most often),
+	 * and "cannot say" must not read as "up to date".
+	 */
+	behindBase: boolean | null;
 }
 
 /**
@@ -293,12 +306,22 @@ export async function getGitLabMergeRequestTitle(
  * has `state` + `merged`, so both are derived from it: `merged` is the only state
  * that merged, and everything but `opened` — `merged`, `closed`, `locked` — is
  * closed.
+ *
+ * The one read in this module that passes a query parameter:
+ * `include_diverged_commits_count` is opt-in, and GitLab omits
+ * `diverged_commits_count` entirely without it. Asked for here alone rather than in
+ * the shared {@link getMergeRequestObject}, because only the merge path needs base
+ * freshness and the count costs GitLab a commit walk the other readers would pay
+ * for nothing.
  */
 export async function getGitLabMergeRequestMergeState(
 	repo: string,
 	iid: number,
 ): Promise<GitLabMergeRequestMergeState> {
-	const mr = await getMergeRequestObject(repo, iid);
+	const mr = await gitlabRequest<GitLabMergeRequest>(
+		'GET',
+		`${mergeRequestPath(repo, iid)}?include_diverged_commits_count=true`,
+	);
 	if (!mr.sha) {
 		throw new Error(`GitLab merge request ${repo}!${iid} response carries no sha`);
 	}
@@ -308,6 +331,7 @@ export async function getGitLabMergeRequestMergeState(
 		draft: Boolean(mr.draft),
 		headSha: mr.sha,
 		changesRequested: mr.detailed_merge_status === 'requested_changes',
+		behindBase: mr.diverged_commits_count === undefined ? null : mr.diverged_commits_count > 0,
 	};
 }
 

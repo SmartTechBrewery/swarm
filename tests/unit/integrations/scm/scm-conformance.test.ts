@@ -64,6 +64,7 @@ const SCM_CONTRACT_METHODS = [
 	'deliveryProvider',
 	'operatorDeliveryProvider',
 	'mergePullRequest',
+	'updatePullRequestBranch',
 ] as const satisfies ReadonlyArray<SCMContractMethod>;
 
 type AssertNever<T extends never> = T;

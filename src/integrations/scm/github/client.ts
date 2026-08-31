@@ -144,6 +144,22 @@ export interface PullRequestMergeState {
 	draft: boolean;
 	/** The exact head commit this merge attempt is allowed to merge. */
 	headSha: string;
+	/**
+	 * Whether the head has *not* been built against the base it would land on
+	 * (issue #874) — read from the same `pulls.get` as everything else here, so
+	 * base freshness costs no extra request.
+	 *
+	 * `mergeable_state === 'behind'` is GitHub's own word for it. Two properties
+	 * of that field are worth stating rather than rediscovering: it is computed
+	 * asynchronously alongside `mergeable` (so `unknown` right after a push is an
+	 * ordinary answer, not staleness), and GitHub only *reports* `behind` where
+	 * being behind actually blocks the merge — a repository that does not require
+	 * branches to be up to date reports `clean`/`unstable` for the same commit.
+	 * So this is a conservative signal: `false` never means "provably up to
+	 * date", only "GitHub is not refusing over it", which is why the merge path
+	 * treats anything but `true` exactly as it did before.
+	 */
+	behindBase: boolean;
 }
 
 /** Resolve a PR's merge-relevant state, including its head SHA for a safe direct merge. */
@@ -159,7 +175,36 @@ export async function getPullRequestMergeState(
 		state: data.state,
 		draft: Boolean(data.draft),
 		headSha: data.head.sha,
+		behindBase: data.mergeable_state === 'behind',
 	};
+}
+
+/**
+ * Ask GitHub to merge the base branch into a pull request's head, pinned to
+ * `expectedHeadSha` (issue #874).
+ *
+ * `PUT .../update-branch` answers **202 Accepted** with a message and no SHA:
+ * the merge commit is produced by a background job, so the new head is not
+ * observable in the response and has to be read back afterwards — which is why
+ * this primitive returns nothing and {@link GitHubSCMIntegration.updatePullRequestBranch}
+ * owns the read-back. A 422 means GitHub refused: either the head is not
+ * `expectedHeadSha` any more, or the base does not merge cleanly. Classifying
+ * that is the adapter's job, as with `mergePullRequestDirect` above; this only
+ * performs the call.
+ */
+export async function updatePullRequestBranchDirect(
+	owner: string,
+	repo: string,
+	prNumber: number,
+	expectedHeadSha: string,
+): Promise<void> {
+	const client = getScopedClient();
+	await client.pulls.updateBranch({
+		owner,
+		repo,
+		pull_number: prNumber,
+		expected_head_sha: expectedHeadSha,
+	});
 }
 
 /** GitHub's aggregate review-decision states for a pull request (GraphQL `reviewDecision`). */

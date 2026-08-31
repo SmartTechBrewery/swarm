@@ -936,6 +936,14 @@ export interface ReviewMergeOutcomeUpdate {
 	attempt: number;
 	/** The head SHA this outcome generation's approval covers. */
 	approvedHeadSha: string;
+	/**
+	 * The head SHA this write *replaces*, when the dispatch itself advanced the
+	 * approved head by bringing the pull request up to date with its base (issue
+	 * #874). Widens the generation guard below by exactly one value, so the one
+	 * write that legitimately changes the generation lands while a superseded
+	 * review's leftover attempt — which names neither head — still no-ops.
+	 */
+	advancedFrom?: string;
 }
 
 /**
@@ -950,6 +958,11 @@ export interface ReviewMergeOutcomeUpdate {
  * a different head in the meantime): its write simply no-ops instead of
  * overwriting the newer generation's outcome. Returns whether the row was
  * updated.
+ *
+ * `input.advancedFrom` is the one way the generation itself moves on: the merge
+ * dispatch that brought a stale head up to date with its base names the head it
+ * replaced, so that single write lands and every write after it belongs to the
+ * new generation (issue #874).
  */
 export async function updateReviewMergeOutcome(
 	runId: string,
@@ -969,6 +982,7 @@ export async function updateReviewMergeOutcome(
 				or(
 					isNull(runs.reviewMergeApprovedHeadSha),
 					eq(runs.reviewMergeApprovedHeadSha, input.approvedHeadSha),
+					...(input.advancedFrom ? [eq(runs.reviewMergeApprovedHeadSha, input.advancedFrom)] : []),
 				),
 			),
 		)

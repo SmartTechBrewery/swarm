@@ -1096,6 +1096,61 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect((await getRunByIdFromDb(id))?.status).toBe('failed');
 		});
 
+		// The merge dispatch that brings a stale head up to date with its base is the
+		// one writer that legitimately changes the generation (issue #874), so it
+		// names the head it replaces; every write after it belongs to the new head.
+		it('accepts the write that advances the approved head onto a base update', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '93', phase: 'review' });
+			await updateReviewMergeOutcome(id, {
+				status: 'not-ready',
+				message: 'waiting on checks',
+				attempt: 1,
+				approvedHeadSha: 'sha-reviewed',
+			});
+
+			const advanced = await updateReviewMergeOutcome(id, {
+				status: 'stale-base',
+				message: 'brought the head up to date: sha-reviewed → sha-updated',
+				attempt: 2,
+				approvedHeadSha: 'sha-updated',
+				advancedFrom: 'sha-reviewed',
+			});
+			const afterAdvance = await updateReviewMergeOutcome(id, {
+				status: 'merged',
+				message: 'merged the re-verified head',
+				attempt: 0,
+				approvedHeadSha: 'sha-updated',
+			});
+
+			expect(advanced).toBe(true);
+			expect(afterAdvance).toBe(true);
+			const row = await getRunByIdFromDb(id);
+			expect(row?.reviewMergeOutcome).toBe('merged');
+			expect(row?.reviewMergeApprovedHeadSha).toBe('sha-updated');
+		});
+
+		it('still rejects an unrelated generation that names the wrong replaced head', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '94', phase: 'review' });
+			await updateReviewMergeOutcome(id, {
+				status: 'not-ready',
+				message: 'current generation',
+				attempt: 0,
+				approvedHeadSha: 'sha-current',
+			});
+
+			const stale = await updateReviewMergeOutcome(id, {
+				status: 'stale-base',
+				message: 'an advance from a head this row never carried',
+				attempt: 0,
+				approvedHeadSha: 'sha-other-new',
+				advancedFrom: 'sha-other-old',
+			});
+
+			expect(stale).toBe(false);
+			const row = await getRunByIdFromDb(id);
+			expect(row?.reviewMergeMessage).toBe('current generation');
+		});
+
 		it('returns false for an unknown run id', async () => {
 			expect(await markRunUserTerminated('00000000-0000-0000-0000-000000000000', 'x')).toBe(false);
 		});
