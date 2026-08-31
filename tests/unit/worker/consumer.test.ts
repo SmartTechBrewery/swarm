@@ -286,6 +286,15 @@ const findActivePlanningDispatchForTask = vi.fn(
 		_excludeDispatchId?: string,
 	): Promise<{ id: string; state: string } | undefined> => undefined,
 );
+/**
+ * The row behind an in-process in-flight claim, which the guard reads to tell a live
+ * claim from one whose dispatch has already settled (issue #858). Defaults to the
+ * harness's own `leased` row — an *active* state — so every pre-existing collision case
+ * keeps today's verdict.
+ */
+const getDispatchById = vi.fn(
+	async (_id: string): Promise<MockDispatchRow | undefined> => mockDispatchRow({}),
+);
 const deferDispatchToPending = vi.fn(async (_id: string, _input: unknown) => mockDispatchRow({}));
 const scheduleDispatchRetry = vi.fn(
 	async (_id: string, input: { jobPayload: Record<string, unknown> }) => ({
@@ -317,6 +326,8 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	recordDispatchResolution: (id: string, resolution: MockDispatchResolution) =>
 		recordDispatchResolution(id, resolution),
 	BRANCH_WRITING_PHASES: ['respond-to-review', 'respond-to-ci', 'resolve-conflicts'],
+	ACTIVE_DISPATCH_STATES: ['pending', 'leased', 'running', 'retry-scheduled'],
+	getDispatchById: (id: string) => getDispatchById(id),
 	findExecutingWritingDispatchForPullRequest: (
 		projectId: string,
 		repository: string,
@@ -821,6 +832,8 @@ describe('processJob', () => {
 		findExecutingDispatchForTask.mockResolvedValue(undefined);
 		findActivePlanningDispatchForTask.mockClear();
 		findActivePlanningDispatchForTask.mockResolvedValue(undefined);
+		getDispatchById.mockReset();
+		getDispatchById.mockImplementation(async (_id: string) => mockDispatchRow({}));
 		deferDispatchToPending.mockClear();
 		scheduleDispatchRetry.mockClear();
 		claimWorkerForDispatch.mockClear();
@@ -4370,6 +4383,178 @@ describe('processJob', () => {
 
 			release?.();
 			await first;
+		});
+
+		// Issue #858. The in-process entry is cleared in `processJob`'s `finally`, which
+		// for a control-plane dispatch is only when the awaited worker result arrives —
+		// so a dispatch cancelled while its job is parked (every "Reset & restart" of a
+		// run whose worker is gone) leaves the entry standing for as long as the router
+		// takes to give up. `resetRun` runs in another process and cannot see or clear
+		// it, so the replacement dispatch it creates inside that window was dropped as
+		// `skipped-duplicate` and the run settled `failed` on the restart Reset had just
+		// reported. The holder's own dispatch row is what tells the two apart.
+		describe('a replacement dispatch racing a parked job (issue #858)', () => {
+			/** The harness hands every job `dispatch-1`; the *asker* is a different row. */
+			const claimNextDispatchAs = (id: string) => {
+				claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
+					claimed: true,
+					dispatch: { ...mockDispatchRow(job), id },
+				}));
+			};
+			/** Park a phase so its task stays claimed in this process's map. */
+			const parkFirstJob = (trigger: TriggerResult) => {
+				let release: (() => void) | undefined;
+				const gate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				phaseImpl = async () => {
+					await gate;
+					return { agent: agentResult() };
+				};
+				const parked = processJob(createMockScmWebhookJob(), registryReturning(trigger));
+				return {
+					parked,
+					settle: async () => {
+						release?.();
+						await parked;
+					},
+				};
+			};
+			/** What `resetRun`'s `cancelActiveDispatch` leaves behind on the holder. */
+			const holderState = (state: string) => {
+				getDispatchById.mockImplementation(async (id: string) =>
+					id === 'dispatch-1' ? { ...mockDispatchRow({}), state } : mockDispatchRow({}),
+				);
+			};
+
+			it('defers the replacement as task-in-flight instead of dropping it as a duplicate', async () => {
+				const { settle } = parkFirstJob(RESPOND_TO_REVIEW_TRIGGER);
+				await new Promise((r) => setTimeout(r, 0));
+
+				holderState('cancelled');
+				claimNextDispatchAs('dispatch-2');
+				const replacement = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+
+				expect(replacement).toMatchObject({
+					status: 'phase-deferred',
+					phase: 'respond-to-review',
+					taskId: '17-respond',
+				});
+				expect(deferDispatchToPending).toHaveBeenCalledWith(
+					'dispatch-2',
+					expect.objectContaining({ waitReason: 'task-in-flight' }),
+				);
+				// The whole defect: this is the drop that made Reset's report a lie.
+				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
+				// A deferred dispatch holds no checkout, so the parked attempt is still the
+				// only one against `task-17-respond`.
+				expect(phaseCalls).toHaveLength(1);
+				// The run is visibly waiting rather than terminal-and-un-restarted.
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-1',
+					expect.objectContaining({
+						status: 'deferred',
+						error: expect.stringContaining('releasing'),
+					}),
+				);
+
+				promoteTaskInFlightWaits.mockClear();
+				await settle();
+
+				// The parked job settling is what wakes it — no operator action, no timer.
+				expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17-respond');
+			});
+
+			it('still drops a genuine duplicate while the holding dispatch is live', async () => {
+				const { settle } = parkFirstJob(RESPOND_TO_REVIEW_TRIGGER);
+				await new Promise((r) => setTimeout(r, 0));
+
+				holderState('running');
+				claimNextDispatchAs('dispatch-2');
+				const duplicate = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+
+				expect(duplicate.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-2', 'skipped-duplicate');
+				expect(phaseCalls).toHaveLength(1);
+				// The verdict is the read's, not an accident of the default.
+				expect(getDispatchById).toHaveBeenCalledWith('dispatch-1');
+
+				await settle();
+			});
+
+			it('defers when the holding dispatch row is gone entirely', async () => {
+				const { settle } = parkFirstJob(RESPOND_TO_REVIEW_TRIGGER);
+				await new Promise((r) => setTimeout(r, 0));
+
+				// The project was deleted and the cascade took the row: it holds nothing
+				// either, and the work must not be dropped on its behalf.
+				getDispatchById.mockResolvedValue(undefined);
+				claimNextDispatchAs('dispatch-2');
+				const replacement = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+
+				expect(replacement.status).toBe('phase-deferred');
+				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
+
+				await settle();
+			});
+
+			it('keeps the duplicate verdict when the holder read fails', async () => {
+				const { settle } = parkFirstJob(RESPOND_TO_REVIEW_TRIGGER);
+				await new Promise((r) => setTimeout(r, 0));
+
+				// Fails closed, unlike the durable hold reads: a DB hiccup must not license
+				// a second attempt against a checkout a phase may genuinely be executing in.
+				getDispatchById.mockRejectedValue(new Error('db down'));
+				claimNextDispatchAs('dispatch-2');
+				const duplicate = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+
+				expect(duplicate.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-2', 'skipped-duplicate');
+
+				await settle();
+			});
+
+			it('reads nothing at all for a different phase of the same task', async () => {
+				let release: (() => void) | undefined;
+				const gate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				phaseImpl = async () => {
+					await gate;
+					return { agent: agentResult() };
+				};
+				const workItem = createMockWorkItem();
+				const planning = processJob(
+					createMockPmWebhookJob(),
+					registryReturning({ phase: 'planning', taskId: '17', workItem }),
+				);
+				await new Promise((r) => setTimeout(r, 0));
+
+				claimNextDispatchAs('dispatch-2');
+				const implementation = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning({ phase: 'implementation', taskId: '17', workItem }),
+				);
+
+				// A different phase already defers, so it is not worth a row read.
+				expect(implementation.status).toBe('phase-deferred');
+				expect(getDispatchById).not.toHaveBeenCalled();
+
+				release?.();
+				await planning;
+			});
 		});
 
 		// The durable leg: the verdict must not depend on which worker the dispatch was
