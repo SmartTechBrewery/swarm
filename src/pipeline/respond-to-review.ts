@@ -105,6 +105,8 @@ import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider } from '@/pm/types.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
 import {
+	assertCheckoutHoldsHead,
+	assertRemoteFastForwardable,
 	commitPreparedTree,
 	DeliveryDeferredError,
 	type DeliveryProgress,
@@ -495,6 +497,29 @@ export async function runRespondToReviewPhase(
 	try {
 		graft(project.repoRoot, handle.path);
 
+		// The dispatch was pinned to `headSha`, and the PR-scoped hold that keeps another
+		// phase off this branch can still be outrun — a fail-open hold read, a human
+		// pushing mid-run (issue #850). A branch that *advanced* is that hold's own
+		// wake-up (a Resolve-conflicts merge landing while this dispatch waited), so the
+		// response belongs on the newer tip and must not fail; a branch that no longer
+		// contains the reviewed commit fails here, before an agent token is spent.
+		// Skipped on a resumed delivery: it re-runs no agent, and the attempt that
+		// prepared the checkout it resumes already asked this.
+		if (!deliveryResumed) {
+			const held = await assertCheckoutHoldsHead(handle.path, prBranch, headSha);
+			if (held !== 'unchanged')
+				logger.warn(
+					'respond-to-review: the PR branch advanced past the reviewed head — responding on the newer tip',
+					{
+						taskId,
+						prNumber,
+						prBranch,
+						reviewedHeadSha: headSha,
+						checkoutHead: held.advancedTo,
+					},
+				);
+		}
+
 		const agent = deliveryResumed
 			? resumedDeliveryAgent(cli)
 			: await runAgent({
@@ -553,6 +578,10 @@ export async function runRespondToReviewPhase(
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);
 		if (handoff.outcome === 'fixed' && !progress.commitSha) {
+			// Never build a commit that can never be pushed (issue #850): origin may have
+			// moved since the checkout was provisioned, and asking before the commit exists
+			// is what makes the report replace the doomed commit rather than follow it.
+			await assertRemoteFastForwardable(handle.path, prBranch);
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
 				handoff.commitSubject as string,

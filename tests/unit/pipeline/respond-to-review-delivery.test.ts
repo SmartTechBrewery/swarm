@@ -19,6 +19,7 @@ afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+/** Stands in for a reviewed head in the fixtures that initialize no repository. */
 const REVIEWED_HEAD_SHA = 'reviewed0000000000000000000000000000000';
 
 function agentResult(): AgentCliResult {
@@ -54,6 +55,24 @@ function initGitRepo(path: string): void {
 	writeFileSync(join(path, 'README.md'), 'initial\n');
 	git('add', '.');
 	git('commit', '-q', '--no-verify', '-m', 'initial commit');
+}
+
+/**
+ * The reviewed head a dispatch would be pinned to: this checkout's own tip, since
+ * issue #850 has the phase ask git whether the checkout still holds it. Falls back
+ * to the constant for the fixtures that never initialize a repository at all — where
+ * the check has nothing to read and fails open.
+ */
+function reviewedHead(path: string): string {
+	try {
+		return execFileSync('git', ['rev-parse', 'HEAD'], {
+			cwd: path,
+			env: testGitEnvironment,
+			encoding: 'utf8',
+		}).trim();
+	} catch {
+		return REVIEWED_HEAD_SHA;
+	}
 }
 
 /** A real, uncommitted working-tree change for `commitPreparedTree` to pick up. */
@@ -110,7 +129,7 @@ function makeOptions(path: string, handle: WorktreeHandle, project = createMockP
 		prNumber: '42',
 		prBranch: 'issue-42',
 		reviewId: '9001',
-		headSha: REVIEWED_HEAD_SHA,
+		headSha: reviewedHead(path),
 		taskId: 'respond-42',
 		worktrees,
 		runAgent,

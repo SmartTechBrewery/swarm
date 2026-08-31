@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
 // release, blocked reasons) is covered in `resume.test.ts` against real fixtures;
@@ -18,13 +18,19 @@ vi.mock('@/pipeline/resume.js', async (importOriginal) => {
 });
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import { logger } from '@/lib/logger.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import {
 	buildRespondToCiPrompt,
 	RESPOND_CI_OUTCOME_FILENAME,
 	runRespondToCiPhase,
 } from '@/pipeline/respond-to-ci.js';
-import type { ScmDeliveryProvider } from '@/scm/delivery.js';
+import {
+	DeliveryDeferredError,
+	DeliveryDivergedError,
+	type ScmDeliveryProvider,
+	UnretryableDeliveryError,
+} from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
@@ -33,6 +39,7 @@ import {
 } from '../../helpers/factories.js';
 
 const PR_BRANCH = 'issue-64';
+/** A stand-in head for the prompt builder, which asks git nothing. */
 const HEAD_SHA = 'deadbeef';
 
 const roots: string[] = [];
@@ -44,21 +51,64 @@ const testGitEnvironment = Object.fromEntries(
 	Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
 );
 
+function fixtureGit(path: string, ...args: string[]): string {
+	return execFileSync('git', args, { cwd: path, env: testGitEnvironment, encoding: 'utf8' });
+}
+
 /**
- * A minimal real git repo — deterministic delivery's `commitPreparedTree` shells
- * out to `git` (`src/scm/delivery.ts`), so a `fixed` outcome needs an actual
- * checkout with an uncommitted change to deliver.
+ * A minimal real git repo on the PR branch, with a real `origin` behind it —
+ * deterministic delivery's `commitPreparedTree` shells out to `git`
+ * (`src/scm/delivery.ts`), and since issue #850 the phase also asks git whether the
+ * checkout still holds the dispatched head and whether `origin/<branch>` can still
+ * be fast-forwarded, so a bare repo with no remote would only ever exercise those
+ * two checks' fail-open paths. Returns the commit the branch is at: the head the
+ * failing check suite would have been reported for.
  */
-function initGitRepo(path: string): void {
-	const git = (...args: string[]) =>
-		execFileSync('git', args, { cwd: path, env: testGitEnvironment });
-	git('init', '-q');
+function initGitRepo(path: string): string {
+	const origin = mkdtempSync(join(tmpdir(), 'swarm-respond-ci-origin-'));
+	roots.push(origin);
+	execFileSync('git', ['init', '--bare', '-q', '-b', PR_BRANCH, origin], {
+		env: testGitEnvironment,
+	});
+	const git = (...args: string[]) => fixtureGit(path, ...args);
+	git('init', '-q', '-b', PR_BRANCH);
 	git('config', 'user.email', 'test@example.com');
 	git('config', 'user.name', 'Test');
+	git('remote', 'add', 'origin', origin);
 	writeFileSync(join(path, 'README.md'), 'initial\n');
 	git('add', '.');
 	git('commit', '-q', '--no-verify', '-m', 'initial commit');
+	git('push', '-q', 'origin', PR_BRANCH);
 	writeFileSync(join(path, 'fix.txt'), 'fixed the build\n');
+	return git('rev-parse', 'HEAD').trim();
+}
+
+/** Commit `content` on the checked-out branch, advancing its head past the dispatch. */
+function commitOnBranch(path: string, name: string, content: string): string {
+	writeFileSync(join(path, name), content);
+	fixtureGit(path, 'add', name);
+	fixtureGit(path, 'commit', '-q', '--no-verify', '-m', content);
+	return fixtureGit(path, 'rev-parse', 'HEAD').trim();
+}
+
+/**
+ * A commit this checkout holds but its branch does not contain — what is left of the
+ * checked head after the branch was rebased or force-pushed over it.
+ */
+function commitOffBranch(path: string): string {
+	fixtureGit(path, 'checkout', '-q', '--detach');
+	const sha = commitOnBranch(path, 'rewritten.txt', 'rewritten out of the branch\n');
+	fixtureGit(path, 'checkout', '-q', PR_BRANCH);
+	return sha;
+}
+
+/** A commit pushed to `origin/<branch>` that this checkout does not have — a human co-pushing. */
+function coPushToOrigin(path: string): string {
+	fixtureGit(path, 'checkout', '-q', '--detach');
+	const sha = commitOnBranch(path, 'co-push.txt', 'pushed by a human mid-run\n');
+	fixtureGit(path, 'push', '-q', 'origin', `${sha}:refs/heads/${PR_BRANCH}`);
+	fixtureGit(path, 'checkout', '-q', PR_BRANCH);
+	return sha;
 }
 
 /** The hand-off a CI-fix run leaves behind; `overrides` merge over a `fixed` default. */
@@ -111,7 +161,7 @@ const CONTINUATION: Checkpoint = {
 function makeDeps(project = createMockProjectConfig()) {
 	const path = mkdtempSync(join(tmpdir(), 'swarm-respond-ci-'));
 	roots.push(path);
-	initGitRepo(path);
+	const headSha = initGitRepo(path);
 	writeHandoff(path, ciHandoff());
 	// The PR's existing task branch — not detached, SWARM pushes the fix here.
 	const handle: WorktreeHandle = {
@@ -130,7 +180,8 @@ function makeDeps(project = createMockProjectConfig()) {
 		project,
 		prNumber: '99',
 		prBranch: PR_BRANCH,
-		headSha: HEAD_SHA,
+		// The head the failing check suite was reported for: this checkout's own tip.
+		headSha,
 		taskId: 'respond-ci-64',
 		worktrees: worktrees as unknown as GitWorktreeManager,
 		runAgent: vi.fn<(opts: RunAgentCliOptions) => Promise<AgentCliResult>>(async () =>
@@ -175,7 +226,7 @@ describe('runRespondToCiPhase', () => {
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.cli).toBe('claude');
 		expect(runArgs.cwd).toBe(deps.path);
-		expect(runArgs.args?.[0]).toContain(HEAD_SHA);
+		expect(runArgs.args?.[0]).toContain(deps.headSha);
 		expect(runArgs.env).toEqual({ GH_TOKEN: 'implementer-token' });
 
 		// Env is grafted into the worktree before the agent runs.
@@ -384,6 +435,163 @@ describe('runRespondToCiPhase', () => {
 		);
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
+	});
+
+	/**
+	 * A branch that moved under the fix (issue #850). Phase 1/2's PR-scoped hold is
+	 * what prevents the concurrency; these cover what the hold cannot — a fail-open
+	 * hold read, a human pushing mid-run, or a rewritten branch — so they run against
+	 * the fixture's real git repository and its real `origin`.
+	 */
+	describe('a branch that moved under the fix (issue #850)', () => {
+		let warn: ReturnType<typeof vi.spyOn>;
+
+		beforeEach(() => {
+			warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		});
+
+		afterEach(() => {
+			warn.mockRestore();
+		});
+
+		/** The warnings this phase logs about a head that moved, and nothing else. */
+		function movedHeadWarnings(): unknown[][] {
+			return warn.mock.calls.filter(([message]) =>
+				/advanced past the checked head/.test(String(message)),
+			);
+		}
+
+		it('says nothing and changes nothing when the checkout still holds the checked head', async () => {
+			const deps = makeDeps();
+
+			const result = await runRespondToCiPhase(deps);
+
+			expect(result.outcome).toBe('fixed');
+			expect(movedHeadWarnings()).toHaveLength(0);
+			expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		});
+
+		// Exactly what phase 1/2's hold produces when it wakes a CI fix behind a
+		// Resolve-conflicts merge: the fix belongs on the newer tip.
+		it('warns with both SHAs and fixes on the newer tip when the branch advanced', async () => {
+			const deps = makeDeps();
+			const advanced = commitOnBranch(deps.path, 'merged.txt', 'a merge landed while we waited\n');
+
+			const result = await runRespondToCiPhase(deps);
+
+			expect(result.outcome).toBe('fixed');
+			expect(movedHeadWarnings()).toHaveLength(1);
+			expect(movedHeadWarnings()[0][1]).toMatchObject({
+				prBranch: PR_BRANCH,
+				checkedHeadSha: deps.headSha,
+				checkoutHead: advanced,
+			});
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+			expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		});
+
+		// The checked commit was rewritten out of the branch, so nothing the agent could
+		// write against this checkout answers the red build that dispatched it — whether
+		// the commit is merely off the branch or has been collected entirely.
+		const rewritten: [string, (path: string) => string][] = [
+			['the checked commit is off the branch', (path) => commitOffBranch(path)],
+			['the checked commit is gone entirely', () => 'f'.repeat(40)],
+		];
+
+		it.each(
+			rewritten,
+		)('fails terminally before the agent runs when %s', async (_label, checkedHead) => {
+			const deps = makeDeps();
+			const headSha = checkedHead(deps.path);
+
+			const error = await runRespondToCiPhase({ ...deps, headSha }).catch((e) => e);
+
+			expect(error).toBeInstanceOf(UnretryableDeliveryError);
+			// Not a deferral: there is no delivery progress to resume, and a retry would
+			// re-validate identical state (issue #839).
+			expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+			expect(error.message).toContain(PR_BRANCH);
+			expect(error.message).toContain(headSha);
+			expect(error.message).toContain(deps.headSha);
+			// Before a single agent token is spent.
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+			expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
+		});
+
+		// An unresolvable dispatched ref proves nothing about the branch, so the check
+		// stands aside and the agent still fixes the red build.
+		it('runs the agent anyway when the checked head is not a resolvable ref', async () => {
+			const deps = makeDeps();
+
+			const result = await runRespondToCiPhase({ ...deps, headSha: 'not-a-sha' });
+
+			expect(result.outcome).toBe('fixed');
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+			expect(movedHeadWarnings()).toHaveLength(0);
+		});
+
+		it('refuses to commit at all once origin has moved past the checkout', async () => {
+			const deps = makeDeps();
+			const coPushed = coPushToOrigin(deps.path);
+
+			const error = await runRespondToCiPhase(deps).catch((e) => e);
+
+			expect(error).toBeInstanceOf(DeliveryDivergedError);
+			expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+			expect(error.message).toContain(coPushed);
+			// The refusal replaces the doomed commit rather than following it: nothing was
+			// committed on top of the stale checkout, and nothing was pushed.
+			expect(fixtureGit(deps.path, 'rev-parse', 'HEAD').trim()).toBe(deps.headSha);
+			expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		});
+
+		// A resumed delivery re-runs no agent, and the attempt that prepared the checkout
+		// it resumes already asked this question.
+		it('skips the pre-agent check entirely on a resumed delivery', async () => {
+			const deps = makeDeps();
+			const headSha = commitOffBranch(deps.path);
+			acquireResumableWorktreeMock.mockResolvedValueOnce({
+				handle: { taskId: 'respond-ci-64', path: deps.path, branch: PR_BRANCH, detached: false },
+				resumed: true,
+				deliveryResumed: true,
+				checkpoint: undefined,
+			});
+
+			const result = await runRespondToCiPhase({ ...deps, headSha, resumeDelivery: true });
+
+			expect(result.outcome).toBe('fixed');
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		});
+
+		// A blip must never fail a fix that would otherwise have succeeded —
+		// `pushDeliveredBranch` stays the backstop for a real divergence.
+		it('proceeds when git cannot say where the checkout is', async () => {
+			const deps = makeDeps();
+			writeHandoff(
+				deps.path,
+				ciHandoff({ outcome: 'no-fix', commitSubject: undefined, verification: [] }),
+			);
+			// An unborn HEAD: `rev-parse HEAD` has no answer to give.
+			fixtureGit(deps.path, 'checkout', '-q', '--orphan', 'unborn');
+
+			const result = await runRespondToCiPhase(deps);
+
+			expect(result.outcome).toBe('no-fix');
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+			expect(deps.delivery.postComment).toHaveBeenCalledTimes(1);
+		});
+
+		it('proceeds when the remote cannot be reached before committing', async () => {
+			const deps = makeDeps();
+			fixtureGit(deps.path, 'remote', 'remove', 'origin');
+
+			const result = await runRespondToCiPhase(deps);
+
+			expect(result.outcome).toBe('fixed');
+			expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	// Two repositories of one project (issue #685), same PR number and same failing

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { AgentCli, AgentCliResult } from '../harness/agent-cli.js';
+import { logger } from '../lib/logger.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -635,6 +636,148 @@ export async function assertRemoteHead(
 }
 
 /**
+ * The exit code git reported, or `null` when the failure was not git answering at
+ * all (a spawn failure, a killed process). Only the codes git documents are
+ * actionable: everything else has to be read as "no answer".
+ */
+function gitExitCode(error: unknown): number | null {
+	if (typeof error !== 'object' || error === null || !('code' in error)) return null;
+	const code = (error as { code: unknown }).code;
+	return typeof code === 'number' ? code : null;
+}
+
+/**
+ * Whether `descendant` contains `ancestor` — the module's one spelling of the
+ * "contains, not equals" rule, and the same question `localRefBehindRemote` asks in
+ * `src/worker/git-worktree-manager.ts`, so nothing here can grow a second
+ * definition of "diverged".
+ *
+ * `null` when git could not evaluate the question at all. `merge-base
+ * --is-ancestor` exits **1** for a clean "no" and **128** for a question it could
+ * not answer (an absent or unresolvable commit), and collapsing the two is what
+ * would let a git blip read as a rewritten branch — so the distinction is kept here
+ * and each caller decides which way to fail.
+ */
+async function isAncestor(
+	cwd: string,
+	ancestor: string,
+	descendant: string,
+): Promise<boolean | null> {
+	try {
+		await git(cwd, ['merge-base', '--is-ancestor', ancestor, descendant]);
+		return true;
+	} catch (error) {
+		return gitExitCode(error) === 1 ? false : null;
+	}
+}
+
+/**
+ * Whether this checkout holds `sha` at all: `true`, a confirmed `false`, or `null`
+ * when git could not answer the question.
+ *
+ * The object is deliberately *not* peeled to `^{commit}`. `cat-file -e` exits **1**
+ * only for an object name it resolved and found missing, and peeling turns that
+ * missing object into the same **128** git reports for a string that is no object
+ * name at all — which would make an unresolvable dispatched ref (`'not-a-sha'`) as
+ * terminal as a force-push. Unpeeled, exit 1 *is* the force-pushed commit and 128 is
+ * "ask someone else", which is the split {@link assertCheckoutHoldsHead} needs.
+ * Whether the object is a commit is a question `merge-base --is-ancestor` asks next,
+ * and fails open on.
+ */
+async function commitPresent(cwd: string, sha: string): Promise<boolean | null> {
+	try {
+		await git(cwd, ['cat-file', '-e', sha]);
+		return true;
+	} catch (error) {
+		return gitExitCode(error) === 1 ? false : null;
+	}
+}
+
+/**
+ * The report for a branch whose dispatched head is gone. The error class does not
+ * survive the federated wire, so this message is the whole thing an operator gets
+ * (see {@link UnretryableDeliveryError}): it names the branch, the commit the
+ * dispatch was pinned to, and what is on the branch instead.
+ */
+function rewrittenHeadMessage(branch: string, expectedSha: string, head: string): string {
+	return (
+		`Branch '${branch}' no longer contains ${expectedSha}, the head this phase was dispatched ` +
+		`for: it is now at ${head}, which does not descend from it, so that commit was rewritten ` +
+		`out of the branch by a force-push or a rebase. Nothing an agent wrote against this ` +
+		`checkout could answer the event that dispatched it, so no agent was run and nothing was ` +
+		`committed or pushed. Re-run this phase for ${head} once the branch has settled.`
+	);
+}
+
+/**
+ * Whether the checkout still holds the commit this dispatch was pinned to (issue
+ * #850), asked *before* the agent runs — so a branch that moved under a writing
+ * phase is reported as what it is, rather than as a rejected push an entire agent
+ * run later.
+ *
+ * `'unchanged'` when HEAD *is* that commit — no network call and no log, so the
+ * ordinary case behaves exactly as it did. `{ advancedTo }` when HEAD contains it:
+ * the branch moved on legitimately — a Resolve-conflicts merge landing while this
+ * dispatch waited on the PR-scoped hold (issue #850 phase 1/2) is the routine
+ * case — and the response belongs on the newer tip, so the caller warns and carries
+ * on rather than failing. Throws an {@link UnretryableDeliveryError} when HEAD does
+ * not contain it at all: the reviewed/checked commit was rewritten out of the
+ * branch, so nothing the agent writes against this tree answers the event that
+ * dispatched it, and a retry would only re-validate identical state (issue #839).
+ *
+ * Fails **open** on git failing to answer — logged and reported `'unchanged'`,
+ * because a blip must not fail a phase that would otherwise have succeeded and
+ * {@link pushDeliveredBranch} still classifies a real divergence. That covers a head
+ * that cannot be read, an ancestry git will not evaluate, and a dispatched ref git
+ * cannot resolve as an object name at all: none of the three is evidence the branch
+ * was rewritten. Only a *confirmed* absence is terminal — `merge-base --is-ancestor`
+ * cannot tell that from a broken repository (both exit 128) and a force-pushed branch
+ * is exactly where the object is gone, so presence is probed separately by
+ * {@link commitPresent}, which reports absence only when git resolved the name and
+ * found nothing.
+ */
+export async function assertCheckoutHoldsHead(
+	cwd: string,
+	branch: string,
+	expectedSha: string,
+): Promise<'unchanged' | { advancedTo: string }> {
+	let head: string;
+	try {
+		head = await git(cwd, ['rev-parse', 'HEAD']);
+	} catch (error) {
+		logger.warn('Could not read the checkout head — proceeding without the dispatched-head check', {
+			branch,
+			expectedSha,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return 'unchanged';
+	}
+	if (head === expectedSha) return 'unchanged';
+	const present = await commitPresent(cwd, expectedSha);
+	if (present === null) {
+		logger.warn('Git could not resolve the dispatched head — proceeding without the check', {
+			branch,
+			expectedSha,
+			head,
+		});
+		return 'unchanged';
+	}
+	if (!present) throw new UnretryableDeliveryError(rewrittenHeadMessage(branch, expectedSha, head));
+	const contains = await isAncestor(cwd, expectedSha, head);
+	if (contains === null) {
+		logger.warn('Git could not compare the checkout head with the dispatched head — proceeding', {
+			branch,
+			expectedSha,
+			head,
+		});
+		return 'unchanged';
+	}
+	if (!contains)
+		throw new UnretryableDeliveryError(rewrittenHeadMessage(branch, expectedSha, head));
+	return { advancedTo: head };
+}
+
+/**
  * What git says when it refuses a non-fast-forward update. Matched against both
  * the error message and its captured `stderr`, because `execFile` surfaces the
  * output in one, the other, or both depending on how the provider spawns `git`.
@@ -674,15 +817,70 @@ async function divergedRemoteHead(
 		await git(cwd, ['fetch', 'origin', branch]);
 		const remote = await git(cwd, ['rev-parse', `origin/${branch}`]);
 		if (!remote || remote === expectedSha) return null;
-		try {
-			await git(cwd, ['merge-base', '--is-ancestor', remote, expectedSha]);
-			return null;
-		} catch {
-			return remote;
-		}
+		// An unanswerable ancestry check keeps this classifier's existing verdict: it is
+		// only ever consulted about a push git *already* rejected, so the rejection is
+		// the evidence and `isAncestor` only has to confirm the direction.
+		return (await isAncestor(cwd, remote, expectedSha)) === true ? null : remote;
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The one wording for a branch that cannot fast-forward, so an operator reads the
+ * same report whichever side catches it (issue #850) — the push git rejected, or the
+ * pre-commit assert that got there first. Only the subject differs: once the commit
+ * exists there is a delivered commit to reconcile or discard, and before it does
+ * there is only the checkout it would have been built on.
+ */
+function divergedBranchMessage(
+	branch: string,
+	remote: string,
+	local: { sha: string; committed: boolean },
+): string {
+	const subject = local.committed
+		? `the delivered commit ${local.sha}`
+		: `this phase's checkout, which is at ${local.sha}`;
+	const remedy = local.committed
+		? `The delivered commit stays on the local '${branch}' ref for inspection; reconcile it ` +
+			`with origin/${branch} (or discard it) before re-running this phase.`
+		: `Nothing was committed or pushed; re-run this phase against the branch's current head.`;
+	return (
+		`Branch '${branch}' has diverged: origin/${branch} is at ${remote}, which is not an ` +
+		`ancestor of ${subject}, so this push can never fast-forward. ${remedy}`
+	);
+}
+
+/**
+ * Refuse to build a commit that can never be pushed (issue #850) — the pre-commit
+ * assert Resolve-conflicts already makes ({@link assertRemoteHead}), asked as the
+ * question a push actually refuses on: is `origin/<branch>` still an ancestor of
+ * what we are about to commit on top of? Asked *before* the commit exists, so the
+ * honest report replaces the doomed commit rather than following it a push
+ * round-trip later.
+ *
+ * Same {@link DeliveryDivergedError} and the same wording as {@link
+ * pushDeliveredBranch}, so an operator reads one report whichever side catches it.
+ * Fails **open** on a git error, exactly as `divergedRemoteHead` already does: a
+ * failed fetch must not fail a phase, and the push still classifies a real
+ * divergence.
+ */
+export async function assertRemoteFastForwardable(cwd: string, branch: string): Promise<void> {
+	let head: string;
+	try {
+		head = await git(cwd, ['rev-parse', 'HEAD']);
+	} catch (error) {
+		logger.warn('Could not read the checkout head — proceeding without the fast-forward check', {
+			branch,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return;
+	}
+	const remote = await divergedRemoteHead(cwd, branch, head);
+	if (remote)
+		throw new DeliveryDivergedError(
+			divergedBranchMessage(branch, remote, { sha: head, committed: false }),
+		);
 }
 
 /**
@@ -709,10 +907,7 @@ export async function pushDeliveredBranch(
 		const remote = await divergedRemoteHead(cwd, branch, expectedSha);
 		if (!remote) throw error;
 		throw new DeliveryDivergedError(
-			`Branch '${branch}' has diverged: origin/${branch} is at ${remote}, which is not an ` +
-				`ancestor of the delivered commit ${expectedSha}, so this push can never fast-forward. ` +
-				`The delivered commit stays on the local '${branch}' ref for inspection; reconcile it ` +
-				`with origin/${branch} (or discard it) before re-running this phase.`,
+			divergedBranchMessage(branch, remote, { sha: expectedSha, committed: true }),
 			{ cause: error },
 		);
 	}

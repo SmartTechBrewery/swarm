@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+	assertCheckoutHoldsHead,
+	assertRemoteFastForwardable,
 	commitPreparedTree,
 	DeliveryDeferredError,
 	DeliveryDivergedError,
@@ -167,44 +169,54 @@ describe('SCM delivery hand-offs', () => {
  * git, because the whole question is what git *actually* reports for a rejected
  * push and whether the two histories really have diverged.
  */
+/** A bare origin plus a clone of it, both with one shared commit on `main`. */
+function makeRemoteAndClone(): { origin: string; clone: string } {
+	const root = mkdtempSync(join(tmpdir(), 'swarm-push-'));
+	roots.push(root);
+	const origin = join(root, 'origin.git');
+	const seed = join(root, 'seed');
+	const clone = join(root, 'clone');
+	execFileSync('git', ['init', '--bare', '-b', 'main', origin], { env: fixtureGitEnvironment });
+	execFileSync('git', ['clone', origin, seed], { env: fixtureGitEnvironment });
+	writeFileSync(join(seed, 'README.md'), 'seed\n');
+	fixtureGit(seed, ['add', '.']);
+	fixtureGit(seed, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-m', 'seed']);
+	fixtureGit(seed, ['push', 'origin', 'main']);
+	execFileSync('git', ['clone', origin, clone], { env: fixtureGitEnvironment });
+	return { origin, clone };
+}
+
+/** Commit `content` on `branch` in `cwd` and return the new sha. */
+function commitOn(cwd: string, branch: string, content: string): string {
+	fixtureGit(cwd, ['checkout', '-q', '-B', branch]);
+	writeFileSync(join(cwd, 'work.txt'), content);
+	fixtureGit(cwd, ['add', '.']);
+	fixtureGit(cwd, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-m', content]);
+	return fixtureGit(cwd, ['rev-parse', 'HEAD']).trim();
+}
+
+/** A second clone of `origin` that pushes `branch`, so the first one's is diverged. */
+function pushFromAnotherClone(origin: string, branch: string, content: string): string {
+	const other = mkdtempSync(join(tmpdir(), 'swarm-push-other-'));
+	roots.push(other);
+	execFileSync('git', ['clone', origin, other], { env: fixtureGitEnvironment });
+	const sha = commitOn(other, branch, content);
+	fixtureGit(other, ['push', 'origin', branch]);
+	return sha;
+}
+
+/** A delivery whose `pushBranch` is a real `git push` of `<sha>:refs/heads/<branch>`. */
+const realPush = {
+	pushBranch: async (cwd: string, branch: string, expectedSha: string) => {
+		execFileSync('git', ['push', 'origin', `${expectedSha}:refs/heads/${branch}`], {
+			cwd,
+			env: fixtureGitEnvironment,
+			stdio: 'pipe',
+		});
+	},
+};
+
 describe('pushDeliveredBranch', () => {
-	/** A bare origin plus a clone of it, both with one shared commit on `main`. */
-	function makeRemoteAndClone(): { origin: string; clone: string } {
-		const root = mkdtempSync(join(tmpdir(), 'swarm-push-'));
-		roots.push(root);
-		const origin = join(root, 'origin.git');
-		const seed = join(root, 'seed');
-		const clone = join(root, 'clone');
-		execFileSync('git', ['init', '--bare', '-b', 'main', origin], { env: fixtureGitEnvironment });
-		execFileSync('git', ['clone', origin, seed], { env: fixtureGitEnvironment });
-		writeFileSync(join(seed, 'README.md'), 'seed\n');
-		fixtureGit(seed, ['add', '.']);
-		fixtureGit(seed, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-m', 'seed']);
-		fixtureGit(seed, ['push', 'origin', 'main']);
-		execFileSync('git', ['clone', origin, clone], { env: fixtureGitEnvironment });
-		return { origin, clone };
-	}
-
-	/** Commit `content` on `branch` in `cwd` and return the new sha. */
-	function commitOn(cwd: string, branch: string, content: string): string {
-		fixtureGit(cwd, ['checkout', '-q', '-B', branch]);
-		writeFileSync(join(cwd, 'work.txt'), content);
-		fixtureGit(cwd, ['add', '.']);
-		fixtureGit(cwd, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-m', content]);
-		return fixtureGit(cwd, ['rev-parse', 'HEAD']).trim();
-	}
-
-	/** A delivery whose `pushBranch` is a real `git push` of `<sha>:refs/heads/<branch>`. */
-	const realPush = {
-		pushBranch: async (cwd: string, branch: string, expectedSha: string) => {
-			execFileSync('git', ['push', 'origin', `${expectedSha}:refs/heads/${branch}`], {
-				cwd,
-				env: fixtureGitEnvironment,
-				stdio: 'pipe',
-			});
-		},
-	};
-
 	it('pushes a fast-forward delivery unchanged', async () => {
 		const { clone } = makeRemoteAndClone();
 		const sha = commitOn(clone, 'issue-1', 'first\n');
@@ -216,11 +228,7 @@ describe('pushDeliveredBranch', () => {
 	// so this push is rejected identically however many times it is retried.
 	it('names the divergence and fails terminally when the branch cannot fast-forward', async () => {
 		const { origin, clone } = makeRemoteAndClone();
-		const other = mkdtempSync(join(tmpdir(), 'swarm-push-other-'));
-		roots.push(other);
-		execFileSync('git', ['clone', origin, other], { env: fixtureGitEnvironment });
-		const remoteSha = commitOn(other, 'issue-1', 'delivered by the first attempt\n');
-		fixtureGit(other, ['push', 'origin', 'issue-1']);
+		const remoteSha = pushFromAnotherClone(origin, 'issue-1', 'delivered by the first attempt\n');
 		const localSha = commitOn(clone, 'issue-1', 'a second implementation of the same task\n');
 
 		const error = await pushDeliveredBranch(realPush, clone, 'issue-1', localSha).catch((e) => e);
@@ -282,6 +290,138 @@ describe('pushDeliveredBranch', () => {
 		await expect(pushDeliveredBranch(failing, clone, 'issue-1', 'deadbeef')).rejects.toThrow(
 			'could not read from remote repository',
 		);
+	});
+});
+
+/**
+ * The two pre-flight asserts for a branch that moved under a writing phase (issue
+ * #850) — the report phase 1/2's PR-scoped hold cannot cover. Real repositories
+ * again: the whole question is what git says about ancestry, and about a commit its
+ * object store no longer has.
+ */
+describe('assertCheckoutHoldsHead', () => {
+	it('reports an unchanged head without asking git anything else', async () => {
+		const { clone } = makeRemoteAndClone();
+		const dispatched = commitOn(clone, 'issue-1', 'the commit the reviewer saw\n');
+
+		await expect(assertCheckoutHoldsHead(clone, 'issue-1', dispatched)).resolves.toBe('unchanged');
+	});
+
+	// Phase 1/2's own wake-up: a Resolve-conflicts merge landed while this dispatch
+	// waited on the hold, so the response belongs on the newer tip.
+	it('reports the newer tip when the branch advanced past the dispatched head', async () => {
+		const { clone } = makeRemoteAndClone();
+		const dispatched = commitOn(clone, 'issue-1', 'the commit the reviewer saw\n');
+		const advanced = commitOn(clone, 'issue-1', 'a merge that landed while we waited\n');
+
+		await expect(assertCheckoutHoldsHead(clone, 'issue-1', dispatched)).resolves.toEqual({
+			advancedTo: advanced,
+		});
+	});
+
+	it('refuses terminally when the dispatched commit was rewritten off the branch', async () => {
+		const { clone } = makeRemoteAndClone();
+		const dispatched = commitOn(clone, 'issue-1', 'the commit the reviewer saw\n');
+		fixtureGit(clone, ['reset', '-q', '--hard', 'HEAD~1']);
+		const rebased = commitOn(clone, 'issue-1', 'a rebased replacement for it\n');
+
+		const error = await assertCheckoutHoldsHead(clone, 'issue-1', dispatched).catch((e) => e);
+
+		expect(error).toBeInstanceOf(UnretryableDeliveryError);
+		expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+		// The message is the whole report an operator gets, so it names the branch, what
+		// the dispatch was pinned to, and what is there instead.
+		expect(error.message).toContain("Branch 'issue-1'");
+		expect(error.message).toContain(dispatched);
+		expect(error.message).toContain(rebased);
+	});
+
+	// The likelier shape of the same failure: a force-pushed commit this checkout was
+	// never given. `merge-base --is-ancestor` cannot tell that from a broken
+	// repository, which is why presence is probed on its own.
+	it('refuses terminally when the dispatched commit is not in the object store at all', async () => {
+		const { clone } = makeRemoteAndClone();
+		commitOn(clone, 'issue-1', 'the branch as it stands now\n');
+
+		await expect(assertCheckoutHoldsHead(clone, 'issue-1', 'f'.repeat(40))).rejects.toBeInstanceOf(
+			UnretryableDeliveryError,
+		);
+	});
+
+	// Fails open: the ref is unresolvable, which is no evidence at all that the branch
+	// was rewritten — only a name git resolved and found missing is that.
+	it('reports an unchanged head when the dispatched ref is not an object name', async () => {
+		const { clone } = makeRemoteAndClone();
+		commitOn(clone, 'issue-1', 'the branch as it stands now\n');
+
+		await expect(assertCheckoutHoldsHead(clone, 'issue-1', 'not-a-sha')).resolves.toBe('unchanged');
+	});
+
+	// Fails open: a blip must not fail a phase that would otherwise have succeeded.
+	it('reports an unchanged head when git cannot answer at all', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-no-repo-'));
+		roots.push(root);
+
+		await expect(assertCheckoutHoldsHead(root, 'issue-1', 'f'.repeat(40))).resolves.toBe(
+			'unchanged',
+		);
+	});
+});
+
+describe('assertRemoteFastForwardable', () => {
+	it('passes a checkout the remote branch is still an ancestor of', async () => {
+		const { clone } = makeRemoteAndClone();
+		const pushed = commitOn(clone, 'issue-1', 'first\n');
+		fixtureGit(clone, ['push', '-q', 'origin', `${pushed}:refs/heads/issue-1`]);
+		commitOn(clone, 'issue-1', 'and the fix on top of it\n');
+
+		await expect(assertRemoteFastForwardable(clone, 'issue-1')).resolves.toBeUndefined();
+	});
+
+	it('refuses before any commit exists once origin has moved past the checkout', async () => {
+		const { origin, clone } = makeRemoteAndClone();
+		const remoteSha = pushFromAnotherClone(origin, 'issue-1', 'pushed by a human mid-run\n');
+		const head = commitOn(clone, 'issue-1', 'the tree this phase would have committed\n');
+
+		const error = await assertRemoteFastForwardable(clone, 'issue-1').catch((e) => e);
+
+		expect(error).toBeInstanceOf(DeliveryDivergedError);
+		expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+		expect(error.message).toContain(remoteSha);
+		expect(error.message).toContain(head);
+	});
+
+	// One wording whichever side catches it: an operator reading the PR comment should
+	// not have to tell the pre-commit refusal from the rejected push.
+	it('reports the divergence in the same words a rejected push does', async () => {
+		const { origin, clone } = makeRemoteAndClone();
+		const remoteSha = pushFromAnotherClone(origin, 'issue-1', 'pushed by a human mid-run\n');
+		const head = commitOn(clone, 'issue-1', 'a delivery that can never fast-forward\n');
+		const shared =
+			`Branch 'issue-1' has diverged: origin/issue-1 is at ${remoteSha}, which is not an ` +
+			'ancestor of ';
+
+		const refused = await assertRemoteFastForwardable(clone, 'issue-1').catch((e) => e);
+		const rejected = await pushDeliveredBranch(realPush, clone, 'issue-1', head).catch((e) => e);
+
+		expect(refused.message).toContain(shared);
+		expect(rejected.message).toContain(shared);
+		for (const message of [refused.message, rejected.message]) {
+			expect(message).toContain('so this push can never fast-forward.');
+			expect(message).toContain(head);
+		}
+	});
+
+	// Fails open on both halves of "git could not answer": an unfetchable branch and a
+	// directory that is no repository at all.
+	it('passes when the remote branch cannot be read', async () => {
+		const { clone } = makeRemoteAndClone();
+		commitOn(clone, 'issue-1', 'never pushed anywhere\n');
+		const root = mkdtempSync(join(tmpdir(), 'swarm-no-repo-'));
+		roots.push(root);
+
+		await expect(assertRemoteFastForwardable(clone, 'issue-1')).resolves.toBeUndefined();
+		await expect(assertRemoteFastForwardable(root, 'issue-1')).resolves.toBeUndefined();
 	});
 });
 
