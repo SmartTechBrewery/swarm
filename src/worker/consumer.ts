@@ -27,6 +27,7 @@
 import type { AgentDefaults, ProjectConfig } from '../config/schema.js';
 import { getAppSettings } from '../db/repositories/appSettingsRepository.js';
 import {
+	ACTIVE_DISPATCH_STATES,
 	BRANCH_WRITING_PHASES,
 	cancelClaimedDispatch,
 	claimWorkerForDispatch,
@@ -39,6 +40,7 @@ import {
 	findActivePlanningDispatchForTask,
 	findExecutingDispatchForTask,
 	findExecutingWritingDispatchForPullRequest,
+	getDispatchById,
 	markDispatchRunning,
 	recordDispatchResolution,
 	scheduleDispatchRetry,
@@ -1184,13 +1186,17 @@ async function handleConcurrencyDeferral(
  * It waits instead of being discarded, which is what keeps the pipeline moving
  * without an operator.
  *
- * Two holds arrive here under one wait reason. A phase *executing* against the
+ * Three holds arrive here under one wait reason. A phase *executing* against the
  * shared checkout (issue #759): two phases still never hold `task-<id>` at once,
  * because a deferred dispatch holds no checkout and starts only once nothing is
- * executing for the task. And a Planning dispatch that is merely *queued* (issue
+ * executing for the task. A Planning dispatch that is merely *queued* (issue
  * #761), which only Implementation waits behind, so it cannot overtake the plan it
- * was dispatched to consume. The stated reason distinguishes the two, since
- * "waiting for that checkout to free" would be a lie about a queued Planning.
+ * was dispatched to consume. And an in-process holder whose own dispatch has already
+ * settled while its job stays parked (issue #858) — the replacement dispatch a "Reset
+ * & restart" creates for a run whose worker is gone, which is the *same* phase and so
+ * used to be dropped as a duplicate. The stated reason distinguishes the three, since
+ * "waiting for that checkout to free" would be a lie about a queued Planning and
+ * "already in flight" was a lie about a dispatch nothing is coming back to run.
  *
  * The wake-up comes from the settling phase itself ({@link promoteTaskInFlightWaits},
  * in `processJob`'s `finally`) — every settle path, success or not, so a Planning
@@ -1216,16 +1222,24 @@ async function handleTaskInFlightDeferral(
 	// A holding dispatch whose `phase` was never recorded reads as "another phase",
 	// which is exactly what it is known to be: not this one.
 	const holding = hold.phase ? `its ${hold.phase} phase` : 'another phase';
-	const reason = hold.executing
-		? `Task '${trigger.taskId}' is running ${holding} — waiting for that checkout to free`
-		: `Task '${trigger.taskId}' has ${holding} queued — waiting for it to settle`;
+	const reason = hold.releasing
+		? `Task '${trigger.taskId}' has a settled ${holding} still releasing its checkout — waiting for it to finish`
+		: hold.executing
+			? `Task '${trigger.taskId}' is running ${holding} — waiting for that checkout to free`
+			: `Task '${trigger.taskId}' has ${holding} queued — waiting for it to settle`;
+	const holdingState = hold.releasing
+		? 'is still releasing'
+		: hold.executing
+			? 'is running'
+			: 'has queued';
 	logger.info(
-		`Phase deferred - ${phaseLabel(trigger.phase)} — the task ${hold.executing ? 'is running' : 'has queued'} ${holding}`,
+		`Phase deferred - ${phaseLabel(trigger.phase)} — the task ${holdingState} ${holding}`,
 		{
 			projectId: project.id,
 			phase: trigger.phase,
 			holdingPhase: hold.phase,
 			holdingExecuting: hold.executing,
+			holdingReleasing: hold.releasing,
 			taskId: trigger.taskId,
 		},
 	);
@@ -1236,6 +1250,10 @@ async function handleTaskInFlightDeferral(
 	if (pending) {
 		try {
 			const stillHeld = await findTaskHold(project.id, trigger, dispatch.id);
+			// The map check covers the `releasing` hold too, and needs no liveness read to
+			// do it: the entry is either still there — so the parked job's own `finally`
+			// still owes the promotion — or already gone, which is the settled-in-the-window
+			// case this publish exists for.
 			if (!stillHeld && !inFlightPhaseByTask.has(trigger.taskId)) {
 				await publishDispatchWakeUp(pending);
 			}
@@ -1431,8 +1449,27 @@ async function handlePullRequestInFlight(
  * *alongside* a Review holding `task-<pr>`. So same task + same phase is a repeated
  * delivery and is dropped; same task + a *different* phase is the pipeline
  * advancing, and waits (`task-in-flight`) until the checkout frees.
+ *
+ * **It records the holding dispatch too, because the entry can outlive it** (issue
+ * #858). This map is only a *supplement* to the durable reads beside it, covering the
+ * window in which a freshly `leased` dispatch has no task/phase recorded yet — and it
+ * is cleared in `processJob`'s `finally`, which for a control-plane dispatch is only
+ * when the awaited worker result arrives. A dispatch cancelled while its job is parked
+ * — every "Reset & restart" of a run whose worker is gone
+ * (`src/dispatch/run-reset.ts`) — therefore leaves the entry standing long after the
+ * dispatch it describes went terminal, and the replacement dispatch created inside
+ * that window was misread as a repeated delivery and dropped. Recording the id is what
+ * lets {@link claimTaskForPhase} tell a live claim from one nothing is coming back to
+ * release.
  */
-const inFlightPhaseByTask = new Map<string, TriggerPhase>();
+const inFlightPhaseByTask = new Map<string, InFlightPhase>();
+
+/** The in-process holder of one task's checkout: which phase, and on which dispatch. */
+interface InFlightPhase {
+	phase: TriggerPhase;
+	/** The dispatch this entry was taken for — see the map's own note (issue #858). */
+	dispatchId: string;
+}
 
 /** What is keeping a phase out of this task's shared checkout, if anything. */
 interface TaskHold {
@@ -1440,6 +1477,14 @@ interface TaskHold {
 	phase: string | null;
 	/** False when the holding phase is merely *queued* rather than executing (issue #761). */
 	executing: boolean;
+	/**
+	 * True when the hold comes from an in-process entry whose own dispatch has already
+	 * settled (issue #858): the phase is no longer claimable there, so a same-phase
+	 * collision is a *replacement* waiting for the parked job to release the checkout,
+	 * not a repeated delivery to drop. Never true for a durable hold, which reads
+	 * `leased`/`running` rows only — a cancelled dispatch already stops holding those.
+	 */
+	releasing: boolean;
 }
 
 /**
@@ -1475,7 +1520,7 @@ async function findTaskHold(
 ): Promise<TaskHold | undefined> {
 	try {
 		const executing = await findExecutingDispatchForTask(projectId, trigger.taskId, dispatchId);
-		if (executing) return { phase: executing.phase, executing: true };
+		if (executing) return { phase: executing.phase, executing: true, releasing: false };
 	} catch (err) {
 		logger.warn('Could not read the executing dispatch for this task (assuming none)', {
 			projectId,
@@ -1487,7 +1532,7 @@ async function findTaskHold(
 	if (trigger.phase !== 'implementation') return undefined;
 	try {
 		const planning = await findActivePlanningDispatchForTask(projectId, trigger.taskId, dispatchId);
-		if (planning) return { phase: 'planning', executing: false };
+		if (planning) return { phase: 'planning', executing: false, releasing: false };
 	} catch (err) {
 		logger.warn('Could not read the queued planning dispatch for this task (assuming none)', {
 			projectId,
@@ -1496,6 +1541,43 @@ async function findTaskHold(
 		});
 	}
 	return undefined;
+}
+
+/**
+ * Whether the in-process entry holding this task still describes a *live* claim
+ * (issue #858).
+ *
+ * `processJob`'s `finally` clears the entry, and for a control-plane dispatch that is
+ * only when the awaited worker result arrives — so a dispatch cancelled while its job
+ * is parked (a "Reset & restart" of a run whose worker is gone) leaves the entry
+ * standing for as long as the router takes to give up on the parked job
+ * (`src/router/dispatch-cancellation.ts`, `src/router/transport-loss-reaper.ts`). The
+ * replacement dispatch created inside that window is not a repeated delivery, and
+ * dropping it as one left the run terminal after Reset had already reported a restart.
+ *
+ * Fails **closed**, unlike the two durable hold reads beside it. They fail open because
+ * a phantom hold would stall a dispatch this guard exists to keep moving; here the
+ * asymmetry runs the other way — a phantom *release* would let a phase that genuinely
+ * is executing be re-run, which is what issue #759's guard exists to prevent. An
+ * unreadable row therefore keeps today's verdict.
+ */
+async function isInFlightHolderLive(holder: InFlightPhase): Promise<boolean> {
+	try {
+		const dispatch = await getDispatchById(holder.dispatchId);
+		// A row that is gone — its project was deleted and the cascade took it — holds
+		// nothing either.
+		if (!dispatch) return false;
+		return ACTIVE_DISPATCH_STATES.includes(
+			dispatch.state as (typeof ACTIVE_DISPATCH_STATES)[number],
+		);
+	} catch (err) {
+		logger.warn('Could not read the dispatch holding this task in flight (assuming it is live)', {
+			dispatchId: holder.dispatchId,
+			phase: holder.phase,
+			error: describeError(err),
+		});
+		return true;
+	}
 }
 
 /**
@@ -1594,8 +1676,8 @@ async function findPullRequestHold(
  * the pull request it writes to (issue #850) — or report what is already holding
  * one of them.
  *
- * Three legs. Both **durable** reads are awaited first, so the in-memory pair
- * below stays synchronous:
+ * Three legs. Every read that needs an `await` is done first, so the in-memory
+ * check-and-set pair below stays synchronous:
  *
  * 1. The task record ({@link findTaskHold}) — what makes the verdict independent of
  *    which worker the dispatch was routed to, which the in-memory map alone never
@@ -1608,14 +1690,20 @@ async function findPullRequestHold(
  * 3. The **in-process** map, read and written with nothing awaited in between,
  *    which is what closes the same-process BullMQ-concurrency window the durable
  *    reads cannot: two jobs claimed milliseconds apart are both `leased` with no
- *    `phase` recorded yet. A hit there is always an executing phase — this process
- *    records the map entry as it starts running the phase.
+ *    `phase` recorded yet.
  *
  * The map deliberately keeps winning over the durable holds, exactly as before
  * #850: it is the most specific answer this process has ("that phase is running
  * here, now"), and both orders defer either way — only the reported reason differs.
  * The task hold in turn keeps precedence over the PR hold, so today's
  * `skipped-duplicate` verdict is untouched.
+ *
+ * What *is* no longer assumed is that a map hit is necessarily a live claim (issue
+ * #858). The entry outlives its own dispatch whenever that dispatch is cancelled under
+ * a parked job, so a same-phase hit whose holding dispatch has already settled reports
+ * `releasing` and the caller makes the collision **wait** instead of dropping it. The
+ * hold itself is not weakened: it still refuses the claim, so two attempts can never
+ * run against one checkout.
  *
  * The verdict is discriminated rather than a bare hold because the two kinds settle
  * differently, and because both refusals return *before* the map entry is taken —
@@ -1631,21 +1719,41 @@ async function claimTaskForPhase(
 	| { claimed: false; kind: 'task'; hold: TaskHold }
 	| { claimed: false; kind: 'pull-request'; hold: PullRequestHold; trigger: PullRequestTrigger }
 > {
+	// Peeked *before* the durable reads so the holder verification rides awaits this
+	// function already pays for; the authoritative map read is the one inside the
+	// synchronous window below.
+	const peeked = inFlightPhaseByTask.get(trigger.taskId);
 	const durableHold = await findTaskHold(project.id, trigger, dispatchId);
 	const prTrigger = pullRequestTrigger(trigger);
 	const prHold = durableHold
 		? undefined
 		: await findPullRequestHold(project.id, pullRequestRefForTrigger(project, trigger), dispatchId);
+	// Only the *same*-phase collision is dropped rather than deferred, so only it is
+	// worth one row read (issue #858); every other caller pays nothing.
+	const peekedReleasing =
+		peeked !== undefined && peeked.phase === trigger.phase
+			? !(await isInFlightHolderLive(peeked))
+			: false;
 	// Synchronous from here to the `set` below.
 	const holding = inFlightPhaseByTask.get(trigger.taskId);
-	if (holding !== undefined)
-		return { claimed: false, kind: 'task', hold: { phase: holding, executing: true } };
+	if (holding !== undefined) {
+		// The verdict above belongs to the entry we peeked. A different entry now means
+		// the holder changed under us, which is a live claim by definition — and an entry
+		// that appeared between the peek and here is the same-process concurrency window
+		// this map exists for, so it stays a live claim too.
+		const releasing = peekedReleasing && holding.dispatchId === peeked?.dispatchId;
+		return {
+			claimed: false,
+			kind: 'task',
+			hold: { phase: holding.phase, executing: !releasing, releasing },
+		};
+	}
 	if (durableHold) return { claimed: false, kind: 'task', hold: durableHold };
 	// `prHold` is resolved only from a trigger carrying a pull request, so the
 	// narrowed trigger the PR verdict needs necessarily exists here.
 	if (prHold && prTrigger)
 		return { claimed: false, kind: 'pull-request', hold: prHold, trigger: prTrigger };
-	inFlightPhaseByTask.set(trigger.taskId, trigger.phase);
+	inFlightPhaseByTask.set(trigger.taskId, { phase: trigger.phase, dispatchId });
 	return { claimed: true };
 }
 
@@ -4120,6 +4228,13 @@ export async function processJob(
 	// - **The same phase** — a duplicate webhook, or a delayed retry that outlived
 	//   the status dedup's TTL. The work is genuinely redundant, so it is dropped as
 	//   `skipped-duplicate`, exactly as before.
+	// - **The same phase, behind an in-process holder whose dispatch has settled** —
+	//   the replacement dispatch a "Reset & restart" creates for a run whose worker is
+	//   gone (issue #858), racing the parked job the router has not given up on yet.
+	//   The work is wanted and nothing is coming back to run it, so it waits for the
+	//   parked job to release the checkout instead of being dropped as a duplicate —
+	//   which is what used to settle the run `failed` on the restart Reset had just
+	//   reported.
 	// - **A different phase, executing** — the pipeline advancing through one shared
 	//   checkout. `taskId` is deliberately shared by the sequential board-driven pair
 	//   (issue #498), so "Planning finished, the operator moved the card to ToDo"
@@ -4142,7 +4257,7 @@ export async function processJob(
 		if (taskClaim.kind === 'pull-request') {
 			return handlePullRequestInFlight(dispatch, job, taskClaim.trigger, project, taskClaim.hold);
 		}
-		if (taskClaim.hold.phase !== trigger.phase) {
+		if (taskClaim.hold.phase !== trigger.phase || taskClaim.hold.releasing) {
 			return handleTaskInFlightDeferral(dispatch, job, trigger, project, taskClaim.hold);
 		}
 		const reason = `The ${phaseLabel(trigger.phase)} phase is already in flight for task '${trigger.taskId}'`;

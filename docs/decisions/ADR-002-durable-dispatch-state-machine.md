@@ -88,7 +88,12 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   ordinary Planning → Implementation progression. Same shape as the capacity wait (no
   attempt spent, event-woken, the reconciler's republish underneath); the *same* phase
   arriving twice remains the `skipped-duplicate` outcome, so the row never spells the
-  two with one value. The collision is read from this table rather than only from a
+  two with one value — **except behind a worker's in-process claim whose own dispatch
+  has already gone terminal** (issue #858), where the collision is a replacement racing
+  a parked job rather than a repeated delivery and waits under the same reason. That
+  in-process supplement is read as a hold only while the dispatch it was taken for is
+  non-terminal; this table stays the authority on which of the two it is. The collision
+  is read from this table rather than only from a
   worker's memory, so the verdict is not a property of where the dispatch landed: a
   phase *executing* against the checkout (`leased`/`running` for that task, excluding
   the asking dispatch and the worktree-less `merge-automation` kind), which any phase
