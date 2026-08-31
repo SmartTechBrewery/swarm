@@ -4,7 +4,12 @@ import { EmptyRunsState } from '@/components/runs/empty-runs-state.js';
 import { QueuedRunsSection } from '@/components/runs/queued-runs-section.js';
 import { RunFilters } from '@/components/runs/run-filters.js';
 import { RunsTable } from '@/components/runs/runs-table.js';
-import { queuedListRefetchInterval, runsListRefetchInterval } from '@/lib/runs-refresh.js';
+import { StalledItemsSection } from '@/components/runs/stalled-items-section.js';
+import {
+	queuedListRefetchInterval,
+	runsListRefetchInterval,
+	stalledListRefetchInterval,
+} from '@/lib/runs-refresh.js';
 import { trpc } from '@/lib/trpc.js';
 import type { RunPhaseFilter, RunRow, RunStatusFilter } from '@/types/runs.js';
 
@@ -49,6 +54,14 @@ export function ProjectRunsPanel({ projectId }: ProjectRunsPanelProps) {
 		refetchInterval: (query) => queuedListRefetchInterval(query.state.data?.items),
 	});
 
+	// This project's work items with no forward path (issue #847). Always
+	// project-scoped, which `runs.stalled` grants on membership alone, so unlike the
+	// cross-project screen there is no admin gate to apply here.
+	const stalledQuery = useQuery({
+		...trpc.runs.stalled.queryOptions({ projectId }),
+		refetchInterval: stalledListRefetchInterval(),
+	});
+
 	const hasActiveFilters = !!(status || phase);
 
 	// Any filter change resets to the first page, matching the global Runs view.
@@ -77,6 +90,9 @@ export function ProjectRunsPanel({ projectId }: ProjectRunsPanelProps) {
 				onPhaseChange={handlePhaseChange}
 				onClear={handleClearFilters}
 			/>
+
+			{/* Renders nothing at all when nothing in this project is stalled. */}
+			<StalledItemsSection items={stalledQuery.data ?? []} showProject={false} />
 
 			<QueuedRunsSection
 				items={queuedQuery.data?.items ?? []}

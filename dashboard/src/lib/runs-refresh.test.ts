@@ -4,6 +4,7 @@ import {
 	RUNS_ACTIVE_REFETCH_MS,
 	RUNS_IDLE_REFETCH_MS,
 	runsListRefetchInterval,
+	stalledListRefetchInterval,
 } from './runs-refresh.js';
 
 describe('runsListRefetchInterval', () => {
@@ -75,5 +76,20 @@ describe('queuedListRefetchInterval', () => {
 			expect(interval).toBeGreaterThan(0);
 			expect(Number.isFinite(interval)).toBe(true);
 		}
+	});
+});
+
+describe('stalledListRefetchInterval', () => {
+	// A stall is hours of silence, so there is no live work to pace against — but
+	// the same never-stop-polling contract still holds: an empty list has to notice
+	// a new stall, and a listed one has to disappear once the item moves.
+	it('polls on the idle baseline, with no active cadence to switch to', () => {
+		expect(stalledListRefetchInterval()).toBe(RUNS_IDLE_REFETCH_MS);
+	});
+
+	it('never stops polling (always a positive, finite interval)', () => {
+		const interval = stalledListRefetchInterval();
+		expect(interval).toBeGreaterThan(0);
+		expect(Number.isFinite(interval)).toBe(true);
 	});
 });

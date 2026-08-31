@@ -41,3 +41,18 @@ export function queuedListRefetchInterval(items?: { length: number } | null): nu
 	const hasQueued = (items?.length ?? 0) > 0;
 	return hasQueued ? RUNS_ACTIVE_REFETCH_MS : RUNS_IDLE_REFETCH_MS;
 }
+
+/**
+ * Poll cadence for the Stalled section (issue #847). Same never-stop-polling
+ * contract as the two above — the section must notice a *new* stall without a
+ * manual refresh, and must notice an existing one recovering — but the interval
+ * is the idle baseline unconditionally, with no active cadence to switch to.
+ * A stall is defined by hours of silence (`ITEM_STALL_AFTER_MS`,
+ * `src/dispatch/item-liveness.ts`), so there is no live work here to pace
+ * against: polling a listed item faster would only re-fetch the same verdict, and
+ * an item leaves the list by *moving*, which the runs list is already watching at
+ * its own cadence. Returns a positive number in all cases (never `false`/0).
+ */
+export function stalledListRefetchInterval(): number {
+	return RUNS_IDLE_REFETCH_MS;
+}

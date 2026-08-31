@@ -544,6 +544,19 @@ The dashboard deliberately exposes three complementary read models (issues #313,
   `produced_pr_url` hand-off plus the grace window. Read the rule list that way — it is not
   an enumeration of failure modes, and it must not become one.
 
+  **Where it surfaces (issue #847).** The report is rendered as a collapsible
+  **Stalled** section above the Queued section on the two Runs surfaces an operator
+  already looks at — the cross-project `/runs` screen and a project's own Runs panel
+  (`dashboard/src/components/runs/stalled-items-section.tsx`) — so a stall is visible
+  without opening the database. There is no `/stalled` route and no nav entry. The
+  section renders *nothing at all* when the list is empty, carries no per-row action
+  (a row links out to the pull request or board card through the shared
+  `WorkItemCell`; acting on it stays the Runs table's job), and never notifies: it
+  reports on render, so an item stays listed until it actually moves rather than
+  re-announcing on a timer. The cross-project screen gates its query exactly as the
+  queue's is gated — unscoped is instance-admin-only — so a member who has chosen no
+  project never polls a guaranteed `FORBIDDEN`.
+
   **"Stalled" is a computed view and never a persisted status.** There is no column, no new
   `dispatches.wait_reason` value, and no background sweep that writes one: the view is
   derived on every read, so a unit stays reported until it actually moves or ages out of the
