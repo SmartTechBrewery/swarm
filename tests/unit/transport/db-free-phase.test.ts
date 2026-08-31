@@ -59,6 +59,14 @@ describe('real DB-free phase worktree lifecycle', () => {
 		execFileSync('git', args, { cwd: repoRoot, env: isolatedGitEnv });
 	}
 
+	function gitOut(args: string[]): string {
+		return execFileSync('git', args, {
+			cwd: repoRoot,
+			env: isolatedGitEnv,
+			encoding: 'utf8',
+		}).trim();
+	}
+
 	afterEach(() => {
 		vi.unstubAllEnvs();
 		if (repoRoot) rmSync(repoRoot, { recursive: true, force: true });
@@ -85,7 +93,9 @@ describe('real DB-free phase worktree lifecycle', () => {
 				project: createMockProjectConfig({ repoRoot: '/control-plane/swarm' }),
 				phase: 'respond-to-ci',
 				workItem: undefined,
-				pr: { prNumber: '17', prBranch: 'issue-17', headSha: 'deadbeef' },
+				// The branch's real tip: since issue #850 the phase asks git whether the
+				// checkout still holds the head the dispatch was pinned to.
+				pr: { prNumber: '17', prBranch: 'issue-17', headSha: gitOut(['rev-parse', 'issue-17']) },
 			}),
 		);
 		const sent: Array<Record<string, unknown>> = [];
