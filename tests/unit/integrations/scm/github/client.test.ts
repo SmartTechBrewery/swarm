@@ -15,6 +15,8 @@ const pullsGet = vi.fn();
 const pullsMerge = vi.fn();
 const listPullRequestsAssociatedWithCommit = vi.fn();
 const reposGetBranch = vi.fn();
+const reposGetCommit = vi.fn();
+const compareCommitsWithBasehead = vi.fn();
 const paginate = vi.fn();
 const graphql = vi.fn();
 
@@ -24,7 +26,12 @@ vi.mock('@octokit/rest', () => ({
 		users = { getAuthenticated };
 		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun };
 		pulls = { get: pullsGet, merge: pullsMerge };
-		repos = { listPullRequestsAssociatedWithCommit, getBranch: reposGetBranch };
+		repos = {
+			listPullRequestsAssociatedWithCommit,
+			getBranch: reposGetBranch,
+			getCommit: reposGetCommit,
+			compareCommitsWithBasehead,
+		};
 		paginate = paginate;
 		graphql = graphql;
 		constructor(opts: { auth: unknown }) {
@@ -37,11 +44,13 @@ vi.mock('@octokit/rest', () => ({
 import {
 	getBranchHead,
 	getCheckSuiteStatus,
+	getCommitProvenance,
 	getGitHubUserForToken,
 	getPullRequest,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getScopedClient,
+	isContainedInBranch,
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
 	withGitHubToken,
@@ -55,6 +64,8 @@ describe('github client', () => {
 		listJobsForWorkflowRun.mockReset();
 		pullsGet.mockReset();
 		reposGetBranch.mockReset();
+		reposGetCommit.mockReset();
+		compareCommitsWithBasehead.mockReset();
 		pullsMerge.mockReset();
 		paginate.mockReset();
 		graphql.mockReset();
@@ -264,6 +275,7 @@ describe('github client', () => {
 					state: 'open',
 					draft: true,
 					head: { sha: 'reviewed-head' },
+					base: { ref: 'main' },
 					mergeable_state: 'clean',
 				},
 			});
@@ -276,13 +288,19 @@ describe('github client', () => {
 				draft: true,
 				headSha: 'reviewed-head',
 				behindBase: false,
+				baseRef: 'main',
 			});
 			expect(pullsGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm', pull_number: 42 });
 		});
 
 		it('normalizes a missing draft flag to false', async () => {
 			pullsGet.mockResolvedValue({
-				data: { merged: true, state: 'closed', head: { sha: 'merged-head' } },
+				data: {
+					merged: true,
+					state: 'closed',
+					head: { sha: 'merged-head' },
+					base: { ref: 'release/1.x' },
+				},
 			});
 
 			await expect(
@@ -293,6 +311,7 @@ describe('github client', () => {
 				draft: false,
 				headSha: 'merged-head',
 				behindBase: false,
+				baseRef: 'release/1.x',
 			});
 		});
 
@@ -305,6 +324,7 @@ describe('github client', () => {
 					state: 'open',
 					draft: false,
 					head: { sha: 'reviewed-head' },
+					base: { ref: 'main' },
 					mergeable_state: 'behind',
 				},
 			});
@@ -322,6 +342,7 @@ describe('github client', () => {
 					state: 'open',
 					draft: false,
 					head: { sha: 'reviewed-head' },
+					base: { ref: 'main' },
 					mergeable_state: 'unknown',
 				},
 			});
@@ -329,6 +350,86 @@ describe('github client', () => {
 			await expect(
 				withGitHubToken('tok', () => getPullRequestMergeState('jkwiecien', 'swarm', 42)),
 			).resolves.toMatchObject({ behindBase: false });
+		});
+	});
+
+	// Issue #874: what makes a read-back head safe to carry an approval onto is
+	// proof that GitHub built it, from the reviewed head and base code.
+	describe('getCommitProvenance', () => {
+		function commit(overrides: Record<string, unknown>) {
+			return {
+				data: {
+					parents: [{ sha: 'reviewed-head' }, { sha: 'base-head' }],
+					commit: {
+						committer: { email: 'noreply@github.com' },
+						verification: { verified: true },
+						...overrides,
+					},
+				},
+			};
+		}
+
+		it('reports the parents in order and a GitHub-signed commit as GitHub-created', async () => {
+			reposGetCommit.mockResolvedValue(commit({}));
+
+			await expect(
+				withGitHubToken('tok', () => getCommitProvenance('jkwiecien', 'swarm', 'merge-sha')),
+			).resolves.toEqual({ parents: ['reviewed-head', 'base-head'], signedByGitHub: true });
+			expect(reposGetCommit).toHaveBeenCalledWith({
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				ref: 'merge-sha',
+			});
+		});
+
+		// An unverified signature is what a pushed commit has, whatever it claims
+		// its committer to be.
+		it('does not call an unverified commit GitHub-created', async () => {
+			reposGetCommit.mockResolvedValue(
+				commit({ verification: { verified: false, reason: 'unsigned' } }),
+			);
+
+			await expect(
+				withGitHubToken('tok', () => getCommitProvenance('jkwiecien', 'swarm', 'pushed-sha')),
+			).resolves.toMatchObject({ signedByGitHub: false });
+		});
+
+		// A signature GitHub verifies but that is not GitHub's own web-flow key —
+		// a contributor's verified GPG key — is not GitHub authoring the tree.
+		it('does not call a commit signed by somebody else GitHub-created', async () => {
+			reposGetCommit.mockResolvedValue(commit({ committer: { email: 'dev@example.com' } }));
+
+			await expect(
+				withGitHubToken('tok', () => getCommitProvenance('jkwiecien', 'swarm', 'pushed-sha')),
+			).resolves.toMatchObject({ signedByGitHub: false });
+		});
+
+		it('treats a commit with no verification block as not GitHub-created', async () => {
+			reposGetCommit.mockResolvedValue(commit({ verification: undefined }));
+
+			await expect(
+				withGitHubToken('tok', () => getCommitProvenance('jkwiecien', 'swarm', 'pushed-sha')),
+			).resolves.toMatchObject({ signedByGitHub: false });
+		});
+	});
+
+	describe('isContainedInBranch', () => {
+		it.each([
+			['identical', true],
+			['behind', true],
+			['ahead', false],
+			['diverged', false],
+		])('reads a %s comparison as contained=%s', async (status, contained) => {
+			compareCommitsWithBasehead.mockResolvedValue({ data: { status } });
+
+			await expect(
+				withGitHubToken('tok', () => isContainedInBranch('jkwiecien', 'swarm', 'main', 'some-sha')),
+			).resolves.toBe(contained);
+			expect(compareCommitsWithBasehead).toHaveBeenCalledWith({
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				basehead: 'main...some-sha',
+			});
 		});
 	});
 

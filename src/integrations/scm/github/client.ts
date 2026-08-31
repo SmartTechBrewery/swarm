@@ -160,6 +160,13 @@ export interface PullRequestMergeState {
 	 * treats anything but `true` exactly as it did before.
 	 */
 	behindBase: boolean;
+	/**
+	 * The branch the pull request targets, as the provider reports it *now* —
+	 * not the project's configured base, which a retargeted pull request no
+	 * longer merges into. Read from the same `pulls.get`; the branch-update
+	 * attribution below needs it to decide whether a commit is base code.
+	 */
+	baseRef: string;
 }
 
 /** Resolve a PR's merge-relevant state, including its head SHA for a safe direct merge. */
@@ -176,7 +183,66 @@ export async function getPullRequestMergeState(
 		draft: Boolean(data.draft),
 		headSha: data.head.sha,
 		behindBase: data.mergeable_state === 'behind',
+		baseRef: data.base.ref,
 	};
+}
+
+/**
+ * The provenance of a single commit — everything needed to decide whether
+ * GitHub built it, and from what (issue #874).
+ *
+ * `signedByGitHub` is the load-bearing part. GitHub signs every commit it
+ * creates on a user's behalf (web UI, `pulls.merge`, `repos.merge`,
+ * `pulls.updateBranch`) with its own `web-flow` key, so a *verified* signature
+ * over a commit committed as `noreply@github.com` is something a push cannot
+ * forge: it says GitHub composed this tree, from these parents, rather than
+ * accepting one that arrived over the wire. Both halves are required —
+ * `verified` alone would pass a commit signed by any key GitHub trusts for the
+ * repository, and the committer identity alone is just a string anyone can set.
+ */
+export interface CommitProvenance {
+	/** Parent commits, in order — a merge's first parent is the branch it merged *into*. */
+	parents: string[];
+	/** Whether GitHub itself created this commit, proven by a valid `web-flow` signature. */
+	signedByGitHub: boolean;
+}
+
+/** Read one commit's parents and signature provenance. */
+export async function getCommitProvenance(
+	owner: string,
+	repo: string,
+	sha: string,
+): Promise<CommitProvenance> {
+	const client = getScopedClient();
+	const { data } = await client.repos.getCommit({ owner, repo, ref: sha });
+	const verification = data.commit.verification;
+	return {
+		parents: data.parents.map((parent) => parent.sha),
+		signedByGitHub:
+			verification?.verified === true && data.commit.committer?.email === 'noreply@github.com',
+	};
+}
+
+/**
+ * Whether `sha` is already contained in `branch` — the commit is the branch's
+ * head, or an ancestor of it. `GET /compare/{branch}...{sha}` answers with
+ * `identical` for the former and `behind` for the latter (`behind` reads from
+ * the *head* side: `sha` is behind `branch`). Anything else — `ahead`,
+ * `diverged` — means `sha` carries code the branch does not have.
+ */
+export async function isContainedInBranch(
+	owner: string,
+	repo: string,
+	branch: string,
+	sha: string,
+): Promise<boolean> {
+	const client = getScopedClient();
+	const { data } = await client.repos.compareCommitsWithBasehead({
+		owner,
+		repo,
+		basehead: `${branch}...${sha}`,
+	});
+	return data.status === 'identical' || data.status === 'behind';
 }
 
 /**

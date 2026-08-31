@@ -47,12 +47,14 @@ import {
 	findOpenPullRequest,
 	getBranchHead,
 	getCheckSuiteStatus,
+	getCommitProvenance,
 	getGitHubUserForToken,
 	getPullRequest,
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getPullRequestReviews,
 	getPullRequestTitle,
+	isContainedInBranch,
 	listOpenPullRequestsForBase,
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
@@ -240,6 +242,50 @@ function classifyUpdateBranchError(error: unknown): UpdatePullRequestBranchOutco
 	return { status: 'provider-error', message };
 }
 
+/**
+ * Whether `candidateSha` is the commit **GitHub produced for this update**, and
+ * not merely some commit that showed up on the branch afterwards (issue #874).
+ *
+ * The pin on the request is not enough to answer that. `PUT .../update-branch`
+ * validates `expected_head_sha` and then merges in the background, so the head
+ * read back a moment later is whatever the branch points at by then — and
+ * anyone who may push to a pull request's branch can land a commit in that
+ * window. Reporting *any* moved head as `updated` would re-pin the approval to
+ * it and suppress the fresh review that push would otherwise get, which is the
+ * whole invariant this capability exists to preserve.
+ *
+ * Three properties together attribute the commit, and all three are needed:
+ *
+ *  1. it is a **merge of exactly two commits, the reviewed head first** — the
+ *     shape `update-branch` always produces (base merged *into* the head).
+ *     Ordinary work pushed on top of the reviewed head fails this outright;
+ *  2. its other parent is **already contained in the base branch**, so the only
+ *     code it adds to the reviewed diff is code the merge would land on anyway.
+ *     Without this, a merge of the reviewed head with an arbitrary branch would
+ *     pass (1) while carrying anything at all;
+ *  3. **GitHub signed it** — so the *tree* is GitHub's own merge of those two
+ *     parents rather than a tree hand-composed to match them. Without this,
+ *     (1) and (2) constrain a commit's inputs but say nothing about its content,
+ *     and a fabricated merge commit pushed into the read-back window would
+ *     satisfy both.
+ *
+ * Any failure is an honest `false`: the dispatch then refuses to advance and the
+ * pull request takes the ordinary path for a moved head — a fresh review.
+ */
+async function isRequestedUpdateCommit(
+	owner: string,
+	repo: string,
+	baseRef: string,
+	expectedHeadSha: string,
+	candidateSha: string,
+): Promise<boolean> {
+	const provenance = await getCommitProvenance(owner, repo, candidateSha);
+	if (provenance.parents.length !== 2) return false;
+	if (provenance.parents[0] !== expectedHeadSha) return false;
+	if (!provenance.signedByGitHub) return false;
+	return isContainedInBranch(owner, repo, baseRef, provenance.parents[1]);
+}
+
 /** The credential-scoped body of {@link GitHubSCMIntegration.updatePullRequestBranch}. */
 async function updateGitHubPullRequestBranch(
 	owner: string,
@@ -261,7 +307,29 @@ async function updateGitHubPullRequestBranch(
 		} catch (error) {
 			return { status: 'provider-error', message: errorMessage(error) };
 		}
-		if (last.headSha !== expectedHeadSha) return { status: 'updated', headSha: last.headSha };
+		if (last.headSha === expectedHeadSha) continue;
+		// The head moved — but *what* it moved to is the question, and the answer
+		// decides whether an approval travels. Reading it once and settling is
+		// deliberate: no further read can turn a pushed head back into this
+		// update's commit, since GitHub validated `expectedHeadSha` before the
+		// push and will not produce a second merge of it.
+		let requested: boolean;
+		try {
+			requested = await isRequestedUpdateCommit(
+				owner,
+				repo,
+				last.baseRef,
+				expectedHeadSha,
+				last.headSha,
+			);
+		} catch (error) {
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
+		if (requested) return { status: 'updated', headSha: last.headSha };
+		return {
+			status: 'head-moved',
+			message: `The head of #${prNumber} is ${last.headSha}, which GitHub did not produce by merging ${last.baseRef} into the reviewed head ${expectedHeadSha}; SWARM will not carry the approval onto a commit it did not ask for`,
+		};
 	}
 	// The head never moved. Either the base was already contained in it — GitHub
 	// accepts the request and produces no commit — or the background job has not
@@ -508,14 +576,20 @@ export class GitHubSCMIntegration implements SCMProvider {
 	/**
 	 * {@link ScmMergeProvider.updatePullRequestBranch} for GitHub (issue #874):
 	 * merge the base into the pull request's branch as the implementer, through
-	 * `PUT .../update-branch` pinned to `expectedHeadSha`. The pin is what lets
-	 * the merge dispatch carry the approval onto the resulting commit — GitHub
-	 * refuses with 422 if the head is not the commit SWARM believes it is, so an
-	 * externally pushed head can never be swept into an approved merge.
+	 * `PUT .../update-branch` pinned to `expectedHeadSha`. GitHub refuses with
+	 * 422 if the head is not the commit SWARM believes it is, so the update
+	 * itself can only ever be computed from the reviewed head.
 	 *
 	 * The new head is read back rather than derived, because the endpoint answers
-	 * 202 with no SHA ({@link updateGitHubPullRequestBranch}). Never throws:
-	 * every refusal or unexpected failure comes back as an
+	 * 202 with no SHA ({@link updateGitHubPullRequestBranch}) — and read back is
+	 * not the same as *attributed*: the pin guards the request, not the branch
+	 * afterwards. What lets the merge dispatch carry an approval onto the
+	 * resulting commit is {@link isRequestedUpdateCommit}, which proves GitHub
+	 * built that commit by merging the base into the reviewed head. A head
+	 * somebody pushed into that window reports `head-moved` and gets a fresh
+	 * review, exactly as a pushed head always did.
+	 *
+	 * Never throws: every refusal or unexpected failure comes back as an
 	 * {@link UpdatePullRequestBranchOutcome}, credential resolution included.
 	 */
 	async updatePullRequestBranch(

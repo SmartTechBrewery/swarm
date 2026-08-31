@@ -497,10 +497,11 @@ async function reactToStaleBase(
 
 	if (update.status === 'updated') {
 		// The approval is carried onto a commit the *provider* built from the
-		// reviewed diff plus the base, at SWARM's request and pinned to the head
-		// SWARM believed in (`src/scm/merge.ts`'s header states why that is sound).
-		// What the advance invalidates is the verification, and the reset budget
-		// below is this dispatch waiting for the replacement.
+		// reviewed diff plus the base, at SWARM's request and attributed to that
+		// request before it was reported (`src/scm/merge.ts`'s header states why
+		// that is sound, and `head-moved` below is what an unattributable head gets
+		// instead). What the advance invalidates is the verification, and the reset
+		// budget below is this dispatch waiting for the replacement.
 		const advanced: MergeAutomationJob = {
 			...job,
 			approvedHeadSha: update.headSha,
@@ -533,6 +534,32 @@ async function reactToStaleBase(
 		// reported `stale-base` and this call. Nothing to settle — the ordinary
 		// backoff re-reads and merges.
 		return { kind: 'not-ready', message: `${staleMessage}, but it is already up to date now` };
+	}
+
+	if (update.status === 'head-moved') {
+		// The branch's head is not the reviewed commit and not this update's
+		// commit either — somebody pushed. `approvedHeadSha` deliberately stays
+		// where it is: this is the same `not-eligible` a pushed head has always
+		// produced, and the push's own Review is what clears it.
+		await persistMergeOutcome(job, 'not-eligible', update.message, attempt);
+		await commentOnMergeRefusal(
+			job,
+			project,
+			capabilities,
+			mergeRefusalCommentBody(
+				`Its head is behind the base, and while SWARM was bringing it up to date the branch moved to a commit SWARM did not ask for: ${update.message}`,
+				'SWARM will pick the pull request up again from the review of the head that is there now.',
+			),
+		);
+		logger.warn('Merge automation: the head moved while it was being updated', {
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			approvedHeadSha: job.approvedHeadSha,
+			message: update.message,
+		});
+		await completeDispatch(dispatch.id, 'merge-not-eligible');
+		return settle('not-eligible');
 	}
 
 	if (update.status === 'conflict') {

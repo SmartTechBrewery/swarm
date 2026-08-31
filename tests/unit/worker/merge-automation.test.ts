@@ -627,6 +627,40 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		expect(outcome.result).toBe('not-eligible');
 	});
 
+	// A head the provider could not attribute to *its own* update is the case the
+	// pin alone never covered: `update-branch` merges in the background, so the
+	// head read back afterwards may be one somebody pushed. Advancing onto it
+	// would carry the approval — and the claimed review slot — onto unreviewed
+	// code, so this settles exactly as a pushed head has always settled.
+	it('never advances onto a head the provider could not attribute to its update', async () => {
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({
+				status: 'head-moved',
+				message: 'The head of #17 is pushed-head, which GitHub did not produce',
+			}),
+			commentOnPullRequest,
+		});
+
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: 'not-eligible',
+			message: 'The head of #17 is pushed-head, which GitHub did not produce',
+			attempt: 0,
+			// The approval stays pinned to the reviewed commit, and no advance is recorded.
+			approvedHeadSha: 'deadbeef',
+			advancedFrom: undefined,
+		});
+		// No retry, and above all no pre-claimed review slot: the pushed head is
+		// owed the Review this would otherwise have suppressed.
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
 	it('settles a provider that cannot update a branch terminally, with a comment', async () => {
 		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
 

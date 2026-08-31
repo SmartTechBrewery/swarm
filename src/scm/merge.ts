@@ -43,10 +43,15 @@
  *     unchanged, so re-running the *review* would re-read the same code;
  *  2. what the update invalidates is the *verification*, not the review, and the
  *     dispatch replaces exactly that by waiting for the new head's CI;
- *  3. the update is pinned with `expectedHeadSha`, so the dispatch can only
- *     carry the approval onto a commit **it asked the provider to create** — a
- *     head somebody pushed still reports `not-eligible` and still needs a fresh
- *     review.
+ *  3. the adapter *proves* property 1 of the head it reports, rather than
+ *     inferring it from the head having changed. Pinning the request with
+ *     `expectedHeadSha` is not enough on its own: the request is accepted
+ *     asynchronously, so the head observed afterwards is not necessarily the
+ *     commit the request produced — anyone who may push to the branch can land
+ *     one in that window. So a provider reports `updated` only for a commit it
+ *     has attributed to its own update of the reviewed head onto the base, and
+ *     reports {@link UpdatePullRequestBranchOutcome} `head-moved` for anything
+ *     else, which needs a fresh review exactly as a pushed head always did.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -106,10 +111,18 @@ export type MergePullRequestOutcome =
  * - `updated` — the provider produced a **new head commit** that merges the
  *   current base into the pull request's branch. `headSha` is that commit, read
  *   back from the provider rather than guessed, because it is what the dispatch
- *   re-pins its approval and its merge to.
+ *   re-pins its approval and its merge to — and *attributed* to this very
+ *   update before it is reported, because re-pinning an approval is the one
+ *   thing this outcome authorizes.
  * - `up-to-date` — there was nothing to do: the head already contains the base.
  *   A race, in practice — something else advanced the branch between the merge
  *   attempt that reported `stale-base` and this call.
+ * - `head-moved` — the branch's head is no longer the reviewed commit, and what
+ *   it *is* cannot be attributed to this update: somebody pushed to the branch,
+ *   or the provider offers no way to prove the commit it produced. Terminal, and
+ *   deliberately not `updated`: the approval must not travel onto a commit the
+ *   provider did not build from the reviewed diff, so this needs a fresh review
+ *   exactly as any other pushed head does.
  * - `conflict` — the base cannot be merged into the head without human
  *   intervention. Terminal here: resolving conflicts is the Resolve-conflicts
  *   phase's job, not merge automation's.
@@ -123,6 +136,7 @@ export type MergePullRequestOutcome =
 export type UpdatePullRequestBranchOutcome =
 	| { status: 'updated'; headSha: string }
 	| { status: 'up-to-date' }
+	| { status: 'head-moved'; message: string }
 	| { status: 'conflict'; message: string }
 	| { status: 'unsupported'; message: string }
 	| { status: 'provider-error'; message: string };
@@ -152,10 +166,12 @@ export interface ScmMergeProvider {
 	 * sound, and `src/worker/merge-automation.ts` for the bound on how often it
 	 * may happen.
 	 *
-	 * `expectedHeadSha` is what keeps the relaxation honest: the provider must
-	 * refuse the update when the pull request's head is not that commit, so the
-	 * dispatch can only ever carry the approval across a commit **it asked for**,
-	 * never across one somebody else pushed in the meantime.
+	 * `expectedHeadSha` is what keeps the relaxation honest, on both sides of the
+	 * call: the provider must refuse the update when the pull request's head is
+	 * not that commit, **and** must report `updated` only for a resulting head it
+	 * can attribute to that update — a head somebody pushed in the meantime is
+	 * `head-moved`, never `updated`. So the dispatch can only ever carry the
+	 * approval across a commit the provider built from the reviewed one.
 	 *
 	 * Never throws — every refusal, including "this provider cannot do this at
 	 * all", comes back as an {@link UpdatePullRequestBranchOutcome}.
