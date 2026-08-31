@@ -741,19 +741,39 @@ async function dispatchRespondToCi(
  * does a persistence error — a re-review the ledger can't currently account
  * for must not run ahead of it. A `reserved`/`reused` result (the common
  * case, including a same-head retry) proceeds.
+ *
+ * The slot is owned by `dispatchId` — this evaluation's own dispatch (issue
+ * #857) — so it stops blocking the PR once that dispatch settles without a
+ * verdict, whether or not some later drop path remembers to hand it back.
  */
 async function reserveDurableReviewSlot(
 	project: ProjectConfig,
 	prNumber: string,
 	headSha: string,
+	dispatchId: string,
 ): Promise<boolean> {
 	try {
-		const reservation = await reserveReviewVerdict({
-			projectId: project.id,
-			repository: project.repo,
-			prNumber,
-			headSha,
-		});
+		const reservation = await reserveReviewVerdict(
+			{
+				projectId: project.id,
+				repository: project.repo,
+				prNumber,
+				headSha,
+			},
+			dispatchId,
+		);
+		// The one durable trace that a hand-back was missed (issue #857): the slot
+		// this reservation just recovered was still `pending` while the dispatch
+		// that took it had already settled without a verdict.
+		if ('recovered' in reservation && reservation.recovered) {
+			logger.warn('review: recovered a review-verdict slot whose dispatch had settled', {
+				prNumber,
+				headSha,
+				staleOrdinal: reservation.recovered.ordinal,
+				staleHeadSha: reservation.recovered.headSha,
+				staleDispatchId: reservation.recovered.dispatchId,
+			});
+		}
 		if (reservation.status === 'blocked') {
 			logger.debug('review: another review for this PR is still pending — skipping', {
 				prNumber,
@@ -1167,7 +1187,8 @@ export function createReviewTrigger(): TriggerHandler {
 				return dispatchRespondToCi(ctx, prNumber, headSha, disposition.failedChecks);
 			}
 
-			if (!(await reserveDurableReviewSlot(ctx.project, prNumber, headSha))) return null;
+			if (!(await reserveDurableReviewSlot(ctx.project, prNumber, headSha, ctx.dispatchId)))
+				return null;
 
 			logger.debug('review: dispatching Review phase', { prNumber, headSha });
 			return {
