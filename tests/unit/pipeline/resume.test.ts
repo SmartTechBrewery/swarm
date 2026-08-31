@@ -38,6 +38,7 @@ import {
 	acquireResumableWorktree,
 	checkpointFallbackApplies,
 	executeRecoveryGate,
+	repairSessionId,
 	sessionRunArgs,
 	shouldPreserveFailedCheckout,
 	shouldPreserveForCheckpoint,
@@ -761,5 +762,35 @@ describe('sessionRunArgs', () => {
 			sessionId: 'fresh-19',
 			resumeSessionId: undefined,
 		});
+	});
+});
+
+describe('repairSessionId (issue #865)', () => {
+	const session = { sessionId: 'assigned-19', resumeSessionId: 'prior-19' };
+
+	it('withholds the assigned id from a CLI that never received one', () => {
+		// codex/agy mint their own thread id; `codex exec resume <assigned>` is
+		// refused with "no rollout found for thread id" and never reaches the model.
+		for (const cli of ['codex', 'antigravity'] as const)
+			expect(repairSessionId(cli, mockAgentResult(undefined), session, false)).toBeUndefined();
+	});
+
+	it('offers claude the assigned id, which it does accept (`--session-id`)', () => {
+		expect(repairSessionId('claude', mockAgentResult(undefined), session, false)).toBe(
+			'assigned-19',
+		);
+	});
+
+	it('prefers the id the run actually reported, on every CLI', () => {
+		for (const cli of ['claude', 'codex', 'antigravity'] as const)
+			for (const resumed of [false, true])
+				expect(repairSessionId(cli, mockAgentResult('reported-19'), session, resumed)).toBe(
+					'reported-19',
+				);
+	});
+
+	it('falls back to the id this phase resumed with, on every CLI', () => {
+		for (const cli of ['claude', 'codex', 'antigravity'] as const)
+			expect(repairSessionId(cli, mockAgentResult(undefined), session, true)).toBe('prior-19');
 	});
 });

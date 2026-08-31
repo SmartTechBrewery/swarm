@@ -15,7 +15,10 @@
  * reuse a preserved checkout, how to thread the session id into the run, and how
  * to skip cleanup when a checkout must survive for the retry. It is CLI-agnostic
  * — the id a run created is captured into {@link AgentCliResult.sessionId} by the
- * harness for all three CLIs, so this code never special-cases one.
+ * harness for all three CLIs, so this code never special-cases one. Where a CLI
+ * difference does bear on the decision ({@link repairSessionId}, which may only
+ * offer an *assigned* id to a CLI that accepts one), it asks the harness rather
+ * than naming a CLI itself.
  *
  * It also owns both halves of Tier 2's *selection* (`docs/CHECKPOINTS.md`, issue
  * #503): the recovery gate's `'checkpoint'` branch ({@link RecoveryMode}), which
@@ -27,7 +30,11 @@
  * resumable session cannot serve.
  */
 
-import type { AgentCliResult } from '@/harness/agent-cli.js';
+import {
+	type AgentCli,
+	type AgentCliResult,
+	acceptsAssignedSessionId,
+} from '@/harness/agent-cli.js';
 import type { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
 import {
@@ -506,6 +513,34 @@ export function sessionRunArgs(
 		sessionId: resumed ? undefined : session.sessionId,
 		resumeSessionId: resumed ? session.resumeSessionId : undefined,
 	};
+}
+
+/**
+ * The session a *second* run against the same worktree may resume — a phase's
+ * repair pass, re-running the agent against a validator's own complaint.
+ *
+ * Three candidates, in order: the id the first run actually reported
+ * ({@link AgentCliResult.sessionId}, captured per CLI by the harness), then the
+ * id this phase resumed with, and — only on a CLI that accepts one
+ * ({@link acceptsAssignedSessionId}) — the id SWARM *assigned*. An assigned id
+ * on a self-minting CLI names a session that harness never created, so offering
+ * it does not continue the review, it kills the pass: `codex exec resume` exits
+ * 1 on "no rollout found for thread id" without reaching the model (issue #865).
+ *
+ * `undefined` therefore means "run the pass, but do not resume": the hand-off to
+ * repair and the checkout its evidence came from are both still on disk, so the
+ * pass is not wasted, and a fresh session is strictly better than a resume
+ * certain to be refused.
+ */
+export function repairSessionId(
+	cli: AgentCli,
+	agent: AgentCliResult,
+	session: PhaseSessionOptions,
+	resumed: boolean,
+): string | undefined {
+	if (agent.sessionId) return agent.sessionId;
+	if (resumed) return session.resumeSessionId;
+	return acceptsAssignedSessionId(cli) ? session.sessionId : undefined;
 }
 
 export async function cleanupUnlessPreserved(

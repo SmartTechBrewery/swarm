@@ -58,7 +58,11 @@ structured hand-off validated against a Zod schema. Commits, pushes, pull
 requests, review submissions, and board moves are then performed *by SWARM* from
 that hand-off — never by the agent shelling out on its own. A hand-off that
 fails validation gets exactly one repair pass, re-run against the validator's
-own complaint, and then the run fails loudly instead of half-delivering.
+own complaint — resuming the review's own session where the harness reported
+one, and otherwise running fresh against the same checkout rather than
+addressing a session id that harness never minted — and then the run fails
+loudly, saying which of the two happened (or that the pass never ran at all),
+instead of half-delivering.
 
 **Two identities, so the review means something.** Implementation runs under an
 implementer persona; Review submits under a separate, project-scoped reviewer
