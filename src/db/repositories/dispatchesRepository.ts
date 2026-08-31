@@ -1196,6 +1196,73 @@ export async function listActiveDispatchTaskRefs(
  */
 export const POOL_DEMAND_LIMIT = 50;
 
+/** Thrown by {@link lockActiveDispatchStatesForProject} when a claim holds the row. */
+export class DispatchLockContendedError extends Error {
+	constructor(projectId: string) {
+		super(`A dispatch of project '${projectId}' is being claimed right now`);
+		this.name = 'DispatchLockContendedError';
+	}
+}
+
+/** True for a pg `55P03` lock-not-available, whether the code is on the error or its `cause`. */
+function isLockUnavailable(err: unknown): boolean {
+	if (typeof err !== 'object' || err === null) return false;
+	if ((err as { code?: string }).code === '55P03') return true;
+	const cause = (err as { cause?: unknown }).cause;
+	return (
+		typeof cause === 'object' && cause !== null && (cause as { code?: string }).code === '55P03'
+	);
+}
+
+/**
+ * Lock every non-terminal dispatch this project has and report the states found —
+ * the dispatch half of the `projects.delete` guard (issue #854), and the reason that
+ * guard is race-free rather than a read that a claim can slip past.
+ *
+ * `FOR UPDATE` over the `ACTIVE_DISPATCH_STATES` rows is what serializes deletion
+ * against dispatching: every claim path takes a row lock on the dispatch it is
+ * claiming (the conditional `UPDATE` in {@link claimDispatch}, the explicit
+ * `SELECT … FOR UPDATE` in {@link claimWorkerForDispatch}), so a claim racing the
+ * delete either commits first — and is then seen here as `leased`, refusing the
+ * delete — or finds its row cascaded away once the delete's transaction commits,
+ * updating zero rows and claiming nothing. A *new* dispatch cannot appear in the
+ * window either: inserting one takes the FK's `FOR KEY SHARE` lock on the `projects`
+ * row the same transaction holds `FOR UPDATE`.
+ *
+ * `NOWAIT`, not a wait, and that is deliberate: {@link claimWorkerForDispatch} locks
+ * the dispatch row *before* the project row, the opposite order to the delete's, so a
+ * delete that waited here could sit in a lock cycle with a claim waiting on the
+ * project row — an ABBA deadlock Postgres would break by aborting one of them at
+ * random. Failing fast instead turns that into a plain, explainable refusal: a claim
+ * is in progress, so there *is* work in flight, and the operator retries.
+ *
+ * Must be called inside a transaction that already locked the project row, or the
+ * locks it takes are released immediately and prove nothing.
+ *
+ * @throws DispatchLockContendedError when a concurrent claim holds one of the rows.
+ */
+export async function lockActiveDispatchStatesForProject(
+	projectId: string,
+	tx: Pick<ReturnType<typeof getDb>, 'select'>,
+): Promise<DispatchState[]> {
+	try {
+		const rows = await tx
+			.select({ state: dispatches.state })
+			.from(dispatches)
+			.where(
+				and(
+					eq(dispatches.projectId, projectId),
+					inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+				),
+			)
+			.for('update', { noWait: true });
+		return rows.map((row) => row.state as DispatchState);
+	} catch (err) {
+		if (isLockUnavailable(err)) throw new DispatchLockContendedError(projectId);
+		throw err;
+	}
+}
+
 /**
  * The project's runnable dispatches that still need a worker — the demand side of
  * pool-aware scheduling (issue #533). A dispatch qualifies when it is non-terminal,

@@ -773,6 +773,33 @@ export async function hasLiveRunForTask(
 }
 
 /**
+ * How many runs this project has in flight, using the same liveness notion as
+ * {@link hasLiveRunForTask}: a `running` row, zombies included, since
+ * `failOrphanedRunningRuns` / `failStaleRunningRuns` are what reap those.
+ *
+ * The project-scoped twin of the worker-side `deriveWorkerRunState().busy`, and read
+ * for the same reason — `projects.delete` refuses while the answer is non-zero
+ * (issue #854), because deleting the project cascades those very `runs` and
+ * `dispatches` rows out from under a worker still executing them. It is a count
+ * rather than a boolean so the refusal can say how many.
+ *
+ * Takes an executor so the delete guard can read it inside the same transaction
+ * that locked the project and its dispatches (`deleteIdleProjectFromDb`): a row
+ * this count is compared against must not be able to appear between the read and
+ * the `DELETE`.
+ */
+export async function countRunningRunsForProject(
+	projectId: string,
+	db: Pick<ReturnType<typeof getDb>, 'select'> = getDb(),
+): Promise<number> {
+	const rows = await db
+		.select({ total: count() })
+		.from(runs)
+		.where(and(eq(runs.projectId, projectId), eq(runs.status, 'running')));
+	return rows[0].total;
+}
+
+/**
  * Resolve the most recent run for one project task and phase. Fresh webhook
  * reruns use this to find a deferred or failed row that can be reused.
  */

@@ -3,10 +3,19 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
 import { writeProjectCredential } from '../../../src/db/repositories/credentialsRepository.js';
+import {
+	cancelWaitingDispatch,
+	claimDispatch,
+	completeDispatch,
+	createDispatch,
+	getDispatchById,
+	markDispatchRunning,
+} from '../../../src/db/repositories/dispatchesRepository.js';
 import { getMembership } from '../../../src/db/repositories/projectMembersRepository.js';
 import {
 	createProjectInDb,
 	createProjectWithMemberInDb,
+	deleteIdleProjectFromDb,
 	deleteProjectFromDb,
 	findProjectByBoardFromDb,
 	findProjectByIdFromDb,
@@ -19,13 +28,17 @@ import {
 	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '../../../src/db/repositories/projectsRepository.js';
+import { completeRun, createRun } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
+import { dispatches as dispatchesTable } from '../../../src/db/schema/dispatches.js';
 import { projectCredentials } from '../../../src/db/schema/projectCredentials.js';
+import type { SwarmJob } from '../../../src/queue/jobs.js';
 import {
 	createMockLinearConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
 	createMockProjectRecord,
+	createMockScmWebhookJob,
 	toProjectRecord,
 } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
@@ -291,6 +304,183 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 
 		it('does not throw when deleting a project ID that does not exist', async () => {
 			await expect(deleteProjectFromDb('non-existent')).resolves.toBeUndefined();
+		});
+	});
+
+	// The guard `projects.delete` goes through (issue #854). What matters here is not
+	// only *that* it refuses, but that the refusal cannot be raced: the review of that
+	// PR found the window where a worker has claimed a dispatch and read the project but
+	// has not written its run row yet, so a `running`-runs count alone saw nothing and
+	// the cascade removed a dispatch out from under an executing agent.
+	describe('deleteIdleProjectFromDb (issue #854)', () => {
+		const GUARD_PROJECT = 'proj-guard';
+		const GUARD_REPO = 'jkwiecien/guard-repo';
+		const OWNER = 'test-worker:1';
+
+		function guardJob(): SwarmJob {
+			return { ...createMockScmWebhookJob(), projectId: GUARD_PROJECT } as SwarmJob;
+		}
+
+		async function seedGuardProject() {
+			await seedProject({ id: GUARD_PROJECT, repo: GUARD_REPO });
+		}
+
+		async function seedDispatch(taskId: string) {
+			const { dispatch } = await createDispatch({
+				projectId: GUARD_PROJECT,
+				jobPayload: guardJob(),
+				source: 'manual',
+				taskId,
+				phase: 'review',
+				state: 'pending',
+			});
+			return dispatch;
+		}
+
+		it('deletes an idle project', async () => {
+			await seedGuardProject();
+
+			await expect(deleteIdleProjectFromDb(GUARD_PROJECT)).resolves.toEqual({ deleted: true });
+			await expect(findProjectByIdFromDb(GUARD_PROJECT)).resolves.toBeUndefined();
+		});
+
+		it('reports not-found rather than deleting nothing silently', async () => {
+			await expect(deleteIdleProjectFromDb('never-existed')).resolves.toEqual({
+				deleted: false,
+				reason: 'not-found',
+			});
+		});
+
+		// The exact window the review named: claimed, executing, no run row yet.
+		it('refuses while a claimed dispatch has not written its run row yet', async () => {
+			await seedGuardProject();
+			const dispatch = await seedDispatch('854-claimed');
+			await claimDispatch(dispatch.id, OWNER, 60_000);
+
+			await expect(deleteIdleProjectFromDb(GUARD_PROJECT)).resolves.toEqual({
+				deleted: false,
+				reason: 'in-flight',
+				executingDispatches: 1,
+				runningRuns: 0,
+			});
+			await expect(findProjectByIdFromDb(GUARD_PROJECT)).resolves.toBeDefined();
+			await expect(getDispatchById(dispatch.id)).resolves.toBeDefined();
+		});
+
+		it('refuses while a dispatch is running against its run row', async () => {
+			await seedGuardProject();
+			const dispatch = await seedDispatch('854-running');
+			await claimDispatch(dispatch.id, OWNER, 60_000);
+			const runId = await createRun({
+				projectId: GUARD_PROJECT,
+				repository: GUARD_REPO,
+				taskId: '854-running',
+				phase: 'review',
+			});
+			await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), {
+				taskId: '854-running',
+				phase: 'review',
+			});
+
+			await expect(deleteIdleProjectFromDb(GUARD_PROJECT)).resolves.toEqual({
+				deleted: false,
+				reason: 'in-flight',
+				executingDispatches: 1,
+				runningRuns: 1,
+			});
+		});
+
+		// The other edge: the worker died, the sweep settled its dispatch, and the run
+		// row is still `running` until the orphan reaper gets to it.
+		it('refuses on a still-running run row whose dispatch already settled', async () => {
+			await seedGuardProject();
+			const dispatch = await seedDispatch('854-zombie');
+			await claimDispatch(dispatch.id, OWNER, 60_000);
+			const runId = await createRun({
+				projectId: GUARD_PROJECT,
+				repository: GUARD_REPO,
+				taskId: '854-zombie',
+				phase: 'review',
+			});
+			await markDispatchRunning(dispatch.id, runId, new Date(Date.now() + 60_000), {
+				taskId: '854-zombie',
+				phase: 'review',
+			});
+			await completeDispatch(dispatch.id, 'phase-succeeded');
+
+			await expect(deleteIdleProjectFromDb(GUARD_PROJECT)).resolves.toEqual({
+				deleted: false,
+				reason: 'in-flight',
+				executingDispatches: 0,
+				runningRuns: 1,
+			});
+
+			// …and stops refusing once that row settles.
+			await completeRun(runId, { status: 'failed', error: 'reaped' });
+			await expect(deleteIdleProjectFromDb(GUARD_PROJECT)).resolves.toEqual({ deleted: true });
+		});
+
+		// A queued dispatch is not executing anything, so it is not a refusal — the
+		// delete drops it, and the lock it was taken under is what stops a claim from
+		// turning it into an executing one inside the window.
+		it('deletes past queued and settled dispatches, cascading them away', async () => {
+			await seedGuardProject();
+			const queued = await seedDispatch('854-queued');
+			const cancelled = await seedDispatch('854-cancelled');
+			await cancelWaitingDispatch(cancelled.id, 'cleared the queue');
+
+			await expect(deleteIdleProjectFromDb(GUARD_PROJECT)).resolves.toEqual({ deleted: true });
+			await expect(getDispatchById(queued.id)).resolves.toBeUndefined();
+			await expect(getDispatchById(cancelled.id)).resolves.toBeUndefined();
+		});
+
+		// The race itself, run against the real database on two connections: a claim of a
+		// queued dispatch against the delete of its project. Whichever order the two land
+		// in, they must not *both* succeed — that is the outcome in which an agent starts
+		// executing a dispatch the cascade has already removed.
+		it('never lets a dispatch claim and the delete both win', async () => {
+			await seedGuardProject();
+			const dispatch = await seedDispatch('854-race');
+
+			const [deletion, claim] = await Promise.all([
+				deleteIdleProjectFromDb(GUARD_PROJECT),
+				claimDispatch(dispatch.id, OWNER, 60_000),
+			]);
+
+			expect(deletion.deleted && claim !== null).toBe(false);
+			if (deletion.deleted) {
+				// The delete won: the dispatch row is gone, so nothing can execute it.
+				await expect(getDispatchById(dispatch.id)).resolves.toBeUndefined();
+			} else {
+				// The claim won, either by getting there first (`in-flight`) or by holding
+				// the row as the delete looked (`contended`). Either way the project is
+				// still here to record whatever now executes.
+				expect(deletion.deleted).toBe(false);
+				expect(['in-flight', 'contended']).toContain((deletion as { reason: string }).reason);
+				await expect(findProjectByIdFromDb(GUARD_PROJECT)).resolves.toBeDefined();
+			}
+		});
+
+		// Deliberately *not* a wait: `claimWorkerForDispatch` locks the dispatch row
+		// before the project row, the delete does it the other way round, so a delete
+		// that waited could sit in an ABBA cycle with a claim. It fails fast instead —
+		// which is a refusal, never a deletion.
+		it('refuses as contended rather than waiting on a dispatch row a claim holds', async () => {
+			await seedGuardProject();
+			const dispatch = await seedDispatch('854-contended');
+
+			const outcome = await getDb().transaction(async (tx) => {
+				// Hold the dispatch row exactly as a claim in progress would.
+				await tx
+					.select({ id: dispatchesTable.id })
+					.from(dispatchesTable)
+					.where(eq(dispatchesTable.id, dispatch.id))
+					.for('update');
+				return await deleteIdleProjectFromDb(GUARD_PROJECT);
+			});
+
+			expect(outcome).toEqual({ deleted: false, reason: 'contended' });
+			await expect(findProjectByIdFromDb(GUARD_PROJECT)).resolves.toBeDefined();
 		});
 	});
 
