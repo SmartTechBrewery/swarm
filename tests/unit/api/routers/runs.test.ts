@@ -20,6 +20,13 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	listAllProjectsFromDb: vi.fn(),
 }));
 
+// The `stalled_dismissals` read `stalled` folds in and the upsert `dismissStalled`
+// makes (issue #880).
+vi.mock('@/db/repositories/stalledDismissalsRepository.js', () => ({
+	listStalledDismissals: vi.fn(),
+	recordStalledDismissal: vi.fn(),
+}));
+
 // The GitWorktreeManager constructor is harmless (stores config), but its methods
 // touch git/Redis — the settlement decision is mocked at its own boundary.
 vi.mock('@/worktree/termination-cleanup.js', () => ({
@@ -169,6 +176,10 @@ import {
 	recordRunCleanupBlocked,
 	type TaskActivityRow,
 } from '@/db/repositories/runsRepository.js';
+import {
+	listStalledDismissals,
+	recordStalledDismissal,
+} from '@/db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '@/db/repositories/usersRepository.js';
 import type { runs } from '@/db/schema/runs.js';
 import {
@@ -378,6 +389,10 @@ describe('runsRouter', () => {
 		vi.mocked(listTaskActivitySince).mockResolvedValue([]);
 		vi.mocked(listActiveDispatchTaskRefs).mockReset();
 		vi.mocked(listActiveDispatchTaskRefs).mockResolvedValue([]);
+		vi.mocked(listStalledDismissals).mockReset();
+		vi.mocked(listStalledDismissals).mockResolvedValue([]);
+		vi.mocked(recordStalledDismissal).mockReset();
+		vi.mocked(recordStalledDismissal).mockResolvedValue({ dismissedAt: new Date(0) });
 		vi.mocked(reopenDispatchForManualRetry).mockReset();
 		vi.mocked(cancelDispatchAndWake).mockReset();
 		vi.mocked(cancelDispatchForRun).mockReset();
@@ -667,16 +682,19 @@ describe('runsRouter', () => {
 			expect(item.prUrl).toBeUndefined();
 		});
 
-		it('reads both tables over the lookback window, unscoped, for an instanceAdmin', async () => {
+		it('reads all three tables over the lookback window, unscoped, for an instanceAdmin', async () => {
 			await caller.stalled({});
 
 			expect(listTaskActivitySince).toHaveBeenCalledExactlyOnceWith({
 				since: new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS),
 			});
 			expect(listActiveDispatchTaskRefs).toHaveBeenCalledExactlyOnceWith();
+			expect(listStalledDismissals).toHaveBeenCalledExactlyOnceWith({
+				since: new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS),
+			});
 		});
 
-		it('scopes both reads to the requested project', async () => {
+		it('scopes all three reads to the requested project', async () => {
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 
 			await caller.stalled({ projectId: 'p1' });
@@ -686,6 +704,50 @@ describe('runsRouter', () => {
 				projectIds: ['p1'],
 			});
 			expect(listActiveDispatchTaskRefs).toHaveBeenCalledExactlyOnceWith(['p1']);
+			expect(listStalledDismissals).toHaveBeenCalledExactlyOnceWith({
+				since: new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS),
+				projectIds: ['p1'],
+			});
+		});
+
+		// issue #880 — one dismissal removes exactly its own row.
+		it('omits a dismissed unit and leaves its neighbours reported', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([
+				activityRow(),
+				activityRow({ taskId: '95', prNumber: '95', runId: 'run-other' }),
+			]);
+			vi.mocked(listStalledDismissals).mockResolvedValue([
+				{
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					unit: 'pull-request',
+					reference: '92',
+					lastActivityAt: SILENT_AT,
+				},
+			]);
+
+			const items = await caller.stalled({});
+
+			expect(items.map((item) => item.reference)).toEqual(['95']);
+		});
+
+		// `stalled_dismissals.unit` is `text`, so a row naming a kind this build does
+		// not know must be dropped rather than suppressing on an unreadable key.
+		it('ignores a dismissal whose stored unit kind is not a known one', async () => {
+			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
+			vi.mocked(listStalledDismissals).mockResolvedValue([
+				{
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					unit: 'epic',
+					reference: '92',
+					lastActivityAt: SILENT_AT,
+				},
+			]);
+
+			const items = await caller.stalled({});
+
+			expect(items.map((item) => item.reference)).toEqual(['92']);
 		});
 
 		it('does not report a unit an active dispatch still owes work to', async () => {
@@ -2330,6 +2392,68 @@ describe('runsRouter', () => {
 		});
 	});
 
+	// issue #880 — the operator's forced age-out of one stalled liveness unit.
+	describe('dismissStalled', () => {
+		const DISMISSAL = {
+			projectId: 'p1',
+			repository: 'acme/widgets',
+			unit: 'pull-request' as const,
+			reference: '92',
+			lastActivityAt: '2026-08-31T00:00:00.000Z',
+		};
+
+		it('records the unit key, the parsed instant, and the acting user', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			const dismissedAt = new Date('2026-09-05T09:00:00.000Z');
+			vi.mocked(recordStalledDismissal).mockResolvedValue({ dismissedAt });
+
+			await expect(caller.dismissStalled(DISMISSAL)).resolves.toEqual({
+				dismissedAt: dismissedAt.toISOString(),
+			});
+			expect(recordStalledDismissal).toHaveBeenCalledExactlyOnceWith({
+				projectId: 'p1',
+				repository: 'acme/widgets',
+				unit: 'pull-request',
+				reference: '92',
+				lastActivityAt: new Date(DISMISSAL.lastActivityAt),
+				dismissedBy: ADMIN_USER.id,
+			});
+		});
+
+		// The row carries an FK to `projects`, so a bogus id must be refused here
+		// rather than reaching Postgres as a constraint violation.
+		it('refuses an unknown project without writing', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+
+			await expect(caller.dismissStalled({ ...DISMISSAL, projectId: 'p9' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(recordStalledDismissal).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['a non-ISO lastActivityAt', { lastActivityAt: 'yesterday' }],
+			['an unknown unit kind', { unit: 'epic' as never }],
+			['an empty reference', { reference: '' }],
+		])('rejects %s at the input schema', async (_case, overrides) => {
+			await expect(caller.dismissStalled({ ...DISMISSAL, ...overrides })).rejects.toThrow();
+			expect(recordStalledDismissal).not.toHaveBeenCalled();
+		});
+
+		// A future instant is well-formed ISO but nothing could ever advance past it,
+		// so storing one would suppress the unit's later stalled work for as long as
+		// it named. The `<= now` bound is what makes the reappearance the classifier's
+		// comparison promises always reachable.
+		it('refuses a future lastActivityAt without writing', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+			await expect(
+				caller.dismissStalled({ ...DISMISSAL, lastActivityAt: '2100-01-01T00:00:00.000Z' }),
+			).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+			expect(recordStalledDismissal).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('putBack', () => {
 		// A fresh (unclaimed) board dispatch for a specific card.
 		const boardJobForCard = (itemId: string) =>
@@ -2879,6 +3003,47 @@ describe('runsRouter', () => {
 
 				await expect(ordinary.stalled({ projectId: 'p1' })).resolves.toEqual([]);
 				expect(listActiveDispatchTaskRefs).toHaveBeenCalledWith(['p1']);
+			});
+		});
+
+		// issue #880 — dismissing writes a durable row, so it is gated at `member`
+		// like every other mutation on this router, never at the `contributor` the
+		// read it mirrors permits.
+		describe('dismissStalled', () => {
+			const DISMISSAL = {
+				projectId: 'p1',
+				repository: 'acme/widgets',
+				unit: 'pull-request' as const,
+				reference: '92',
+				lastActivityAt: '2026-08-31T00:00:00.000Z',
+			};
+
+			it('hides the project’s existence from a non-member, without writing', async () => {
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.dismissStalled(DISMISSAL)).rejects.toThrowError(
+					expect.objectContaining({ code: 'NOT_FOUND' }),
+				);
+				expect(recordStalledDismissal).not.toHaveBeenCalled();
+			});
+
+			it('refuses a contributor, who may read the view but not write to it', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+
+				await expect(ordinary.dismissStalled(DISMISSAL)).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(recordStalledDismissal).not.toHaveBeenCalled();
+			});
+
+			it('lets a member of the project dismiss', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+				await expect(ordinary.dismissStalled(DISMISSAL)).resolves.toEqual({
+					dismissedAt: new Date(0).toISOString(),
+				});
+				expect(recordStalledDismissal).toHaveBeenCalledOnce();
 			});
 		});
 

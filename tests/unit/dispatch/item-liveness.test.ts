@@ -5,6 +5,7 @@ import {
 	classifyItemLiveness,
 	foldLivenessUnits,
 	ITEM_STALL_AFTER_MS,
+	type ItemLivenessDismissal,
 	type ItemLivenessPolicy,
 	livenessUnitKeyForRun,
 	livenessUnitKeysForDispatch,
@@ -52,16 +53,30 @@ function stateOf(
 	row: Partial<TaskActivityRow>,
 	policy: ItemLivenessPolicy = NO_AUTOMATION,
 	dispatches: ActiveDispatchTaskRef[] = [],
+	dismissals: ItemLivenessDismissal[] = [],
 ) {
-	const units = foldLivenessUnits([makeActivity(row)], dispatches);
+	const units = foldLivenessUnits([makeActivity(row)], dispatches, dismissals);
 	expect(units).toHaveLength(1);
 	return classifyItemLiveness(units[0], policy, NOW);
+}
+
+/** A dismissal of the default `makeActivity` unit, at the instant it last moved. */
+function makeDismissal(overrides: Partial<ItemLivenessDismissal> = {}): ItemLivenessDismissal {
+	return {
+		projectId: 'p1',
+		repository: 'acme/widgets',
+		unit: 'work-item',
+		reference: '103',
+		lastActivityAt: LONG_AGO,
+		...overrides,
+	};
 }
 
 /** Classify one unit folded from several activity rows, with no active dispatch. */
 function stateOfUnit(rows: Partial<TaskActivityRow>[], policy: ItemLivenessPolicy = NO_AUTOMATION) {
 	const units = foldLivenessUnits(
 		rows.map((row) => makeActivity(row)),
+		[],
 		[],
 	);
 	expect(units).toHaveLength(1);
@@ -152,7 +167,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 2 — Implementation handed off to a pull request', () => {
+	describe('rule 3 — Implementation handed off to a pull request', () => {
 		it('is handed-off once the run recorded produced_pr_url', () => {
 			const state = stateOf({
 				phase: 'implementation',
@@ -167,7 +182,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 3 — a merge is terminal for the whole unit', () => {
+	describe('rule 4 — a merge is terminal for the whole unit', () => {
 		/** The Review run that recorded the merge, older than everything below it. */
 		const mergedReview = {
 			taskId: '92',
@@ -249,7 +264,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	it('rule 4 — is awaiting-human at the review-cap stop', () => {
+	it('rule 5 — is awaiting-human at the review-cap stop', () => {
 		const state = stateOf({
 			phase: 'review',
 			status: 'completed',
@@ -259,7 +274,7 @@ describe('classifyItemLiveness', () => {
 		expect(state).toBe('awaiting-human');
 	});
 
-	describe('rule 5 — a plan awaiting a greenlight', () => {
+	describe('rule 6 — a plan awaiting a greenlight', () => {
 		it('is awaiting-human on a project that does not auto-advance', () => {
 			expect(stateOf({ phase: 'planning', status: 'completed' })).toBe('awaiting-human');
 		});
@@ -276,7 +291,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 6 — an approval whose merge is accounted for', () => {
+	describe('rule 7 — an approval whose merge is accounted for', () => {
 		const approved = { phase: 'review', status: 'completed', reviewVerdict: 'approve' } as const;
 
 		it('is awaiting-human when merge was never automated', () => {
@@ -301,7 +316,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 7 — the grace window', () => {
+	describe('rule 8 — the grace window', () => {
 		it('is settling one millisecond inside the window', () => {
 			const lastActivityAt = new Date(NOW.getTime() - ITEM_STALL_AFTER_MS + 1);
 			expect(stateOf({ lastActivityAt })).toBe('settling');
@@ -313,8 +328,99 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	it('rule 8 — a deferred run with no active dispatch falls through to stalled', () => {
+	it('rule 9 — a deferred run with no active dispatch falls through to stalled', () => {
 		expect(stateOf({ status: 'deferred' })).toBe('stalled');
+	});
+});
+
+// issue #880 — an operator's dismissal is a recorded hand-off like any other, and
+// the record is a *comparison* rather than a status: the unit is suppressed only
+// while its own activity has not advanced past the instant that was dismissed.
+describe('operator dismissal', () => {
+	it('suppresses a unit dismissed at the instant it last moved', () => {
+		expect(stateOf({}, NO_AUTOMATION, [], [makeDismissal()])).toBe('dismissed');
+	});
+
+	it('reports a dismissed unit again once its activity advances past the dismissal', () => {
+		const moved = new Date(LONG_AGO.getTime() + ITEM_STALL_AFTER_MS);
+
+		expect(stateOf({ lastActivityAt: moved }, NO_AUTOMATION, [], [makeDismissal()])).toBe(
+			'stalled',
+		);
+	});
+
+	// The reappearance above is only reachable because `runs.dismissStalled` refuses a
+	// dismissal instant later than server time: even a dismissal taken at the very
+	// latest instant it admits is overtaken by activity recorded after it.
+	it('reports a unit dismissed at the newest admissible instant once it moves again', () => {
+		const dismissal = makeDismissal({ lastActivityAt: NOW });
+		const moved = new Date(NOW.getTime() + ITEM_STALL_AFTER_MS);
+		const later = new Date(moved.getTime() + ITEM_STALL_AFTER_MS);
+
+		const units = foldLivenessUnits([makeActivity({ lastActivityAt: moved })], [], [dismissal]);
+		expect(classifyItemLiveness(units[0], NO_AUTOMATION, later)).toBe('stalled');
+	});
+
+	// `<=`, not `<`: the record stores the instant the operator saw, so equality is
+	// "it has not moved since".
+	it('still suppresses at exactly the dismissed instant', () => {
+		const dismissal = makeDismissal({ lastActivityAt: LONG_AGO });
+
+		expect(stateOf({ lastActivityAt: LONG_AGO }, NO_AUTOMATION, [], [dismissal])).toBe('dismissed');
+	});
+
+	// The dismissal key is the full unit key, deliberately *not* the
+	// repository-blind dispatch key: an explicit operator statement about one row
+	// must not leak across a multi-repository project.
+	it.each([
+		['project', { projectId: 'p2' }],
+		['repository', { repository: 'acme/gadgets' }],
+		['unit kind', { unit: 'pull-request' as const }],
+		['reference', { reference: '104' }],
+	])('suppresses nothing when the dismissal differs in %s', (_field, overrides) => {
+		expect(stateOf({}, NO_AUTOMATION, [], [makeDismissal(overrides)])).toBe('stalled');
+	});
+
+	// Rule order: `active` wins, because a unit with work still due is genuinely
+	// active whatever an operator said earlier.
+	it.each([
+		['a live run', { liveRunCount: 1, status: 'running' }, [] as ActiveDispatchTaskRef[]],
+		['an active dispatch', {}, [makeDispatchRef({ taskId: '103', phase: 'implementation' })]],
+	])('reports a dismissed unit as active while it has %s', (_case, row, dispatches) => {
+		expect(stateOf(row, NO_AUTOMATION, dispatches, [makeDismissal()])).toBe('active');
+	});
+
+	// The fold key is the unit, so one dismissal of the pull request covers every
+	// task id belonging to it.
+	it('suppresses a whole pull-request unit across all four of its task ids', () => {
+		const rows = ['92', '92-respond', '92-ci', '92-conflicts'].map((taskId) =>
+			makeActivity({ taskId, prNumber: '92', phase: 'review' }),
+		);
+
+		const items = toStalledItems(
+			rows,
+			[],
+			{ p1: NO_AUTOMATION },
+			[makeDismissal({ unit: 'pull-request', reference: '92' })],
+			NOW,
+		);
+
+		expect(items).toEqual([]);
+	});
+
+	it('omits a dismissed unit from the report and keeps its neighbours', () => {
+		const dismissed = makeActivity({ taskId: '103', runId: 'run-dismissed' });
+		const other = makeActivity({ taskId: '104', runId: 'run-other' });
+
+		const items = toStalledItems(
+			[dismissed, other],
+			[],
+			{ p1: NO_AUTOMATION },
+			[makeDismissal()],
+			NOW,
+		);
+
+		expect(items.map((item) => item.reference)).toEqual(['104']);
 	});
 });
 
@@ -354,6 +460,7 @@ describe('toStalledItems', () => {
 			[respondToCi, exhaustedDelivery, quietPr, waiting],
 			[makeDispatchRef({ taskId: '99', phase: 'implementation' })],
 			{ p1: NO_AUTOMATION },
+			[],
 			NOW,
 		);
 
@@ -380,7 +487,7 @@ describe('toStalledItems', () => {
 			lastActivityAt: new Date(NOW.getTime() - 3 * ITEM_STALL_AFTER_MS),
 		});
 
-		const items = toStalledItems([older, newer], [], { p1: NO_AUTOMATION }, NOW);
+		const items = toStalledItems([older, newer], [], { p1: NO_AUTOMATION }, [], NOW);
 
 		expect(items).toHaveLength(1);
 		expect(items[0]).toMatchObject({
@@ -449,6 +556,7 @@ describe('toStalledItems', () => {
 			],
 			[],
 			{ p1: NO_AUTOMATION },
+			[],
 			NOW,
 		);
 
@@ -466,13 +574,13 @@ describe('toStalledItems', () => {
 			lastActivityAt: new Date(NOW.getTime() - 5 * ITEM_STALL_AFTER_MS),
 		});
 
-		expect(toStalledItems([review, respond], [], { p1: NO_AUTOMATION }, NOW)).toEqual([]);
+		expect(toStalledItems([review, respond], [], { p1: NO_AUTOMATION }, [], NOW)).toEqual([]);
 	});
 
 	it('falls back to the pipeline’s own defaults for a project with no policy entry', () => {
 		// Neither auto-advance nor auto-merge: a completed plan rests as awaiting-human.
 		const planning = makeActivity({ taskId: '103', phase: 'planning', status: 'completed' });
 
-		expect(toStalledItems([planning], [], {}, NOW)).toEqual([]);
+		expect(toStalledItems([planning], [], {}, [], NOW)).toEqual([]);
 	});
 });

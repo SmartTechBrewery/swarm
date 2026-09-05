@@ -76,7 +76,7 @@ export async function runMigrations(): Promise<void> {
  * project_membership_requests from projects, run_logs from runs, worker_sessions
  * from runs + workers, worker_scm_credentials + cli_quotas from workers, user_sessions +
  * user_identities + project_members + project_membership_requests + workers from
- * users); every table is listed for
+ * users, stalled_dismissals from projects *and* users); every table is listed for
  * explicitness. `app_settings` (a standalone singleton), `instance_scm_credentials`
  * (keyed on `(provider, role)` alone, with no project or worker to cascade from) and
  * `users` are listed here too so a write in one test doesn't leak into the next.
@@ -92,6 +92,7 @@ export async function truncateAll(): Promise<void> {
 			worker_sessions,
 			runs,
 			review_verdicts,
+			stalled_dismissals,
 			project_membership_requests,
 			project_members,
 			project_credentials,

@@ -1,12 +1,19 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StalledItem } from '@/types/runs.js';
 
 vi.mock('@/lib/trpc.js', () => ({
+	trpcClient: {
+		runs: {
+			dismissStalled: {
+				mutate: vi.fn(),
+			},
+		},
+	},
 	trpc: {
 		projects: {
 			list: {
@@ -16,9 +23,15 @@ vi.mock('@/lib/trpc.js', () => ({
 				}),
 			},
 		},
+		runs: {
+			stalled: {
+				queryKey: () => ['runs.stalled'],
+			},
+		},
 	},
 }));
 
+import { trpcClient } from '@/lib/trpc.js';
 import { StalledItemsSection } from './stalled-items-section.js';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -83,6 +96,13 @@ function rows() {
 }
 
 describe('StalledItemsSection', () => {
+	beforeEach(() => {
+		vi.mocked(trpcClient.runs.dismissStalled.mutate).mockReset();
+		vi.mocked(trpcClient.runs.dismissStalled.mutate).mockResolvedValue({
+			dismissedAt: new Date().toISOString(),
+		});
+	});
+
 	// The section must add nothing at all to a healthy installation — not a header,
 	// not a count, not an empty state.
 	it('renders nothing at all when nothing is stalled', () => {
@@ -231,5 +251,74 @@ describe('StalledItemsSection', () => {
 
 		expect(container.querySelector('.md\\:hidden')).not.toBeNull();
 		expect(container.querySelector('.hidden.md\\:block')).not.toBeNull();
+	});
+
+	// issue #880 — the one per-row action. These depend on the section being
+	// expanded by default: the rows are only rendered while it is.
+	describe('Dismiss', () => {
+		it('renders one Dismiss control per desktop row and per mobile card', () => {
+			renderSection(<StalledItemsSection items={[pullRequestItem(), workItem()]} />);
+
+			for (const row of rows()) {
+				expect(within(row).getAllByRole('button', { name: 'Dismiss' })).toHaveLength(1);
+			}
+			for (const card of screen.getAllByTestId('stalled-item-card')) {
+				expect(within(card).getAllByRole('button', { name: 'Dismiss' })).toHaveLength(1);
+			}
+		});
+
+		// The unit key plus the instant the operator actually saw — never a run id.
+		it('dismisses the clicked row by its liveness unit and last-moved instant', async () => {
+			const item = pullRequestItem();
+			renderSection(<StalledItemsSection items={[item, workItem()]} />);
+
+			fireEvent.click(within(rows()[0]).getByRole('button', { name: 'Dismiss' }));
+
+			await waitFor(() => {
+				expect(trpcClient.runs.dismissStalled.mutate).toHaveBeenCalledExactlyOnceWith({
+					projectId: item.projectId,
+					repository: item.repository,
+					unit: item.unit,
+					reference: item.reference,
+					lastActivityAt: item.lastActivityAt,
+				});
+			});
+		});
+
+		// Greying out every row would misreport which one the operator acted on.
+		it('disables only the clicked row’s button while the dismissal is in flight', () => {
+			vi.mocked(trpcClient.runs.dismissStalled.mutate).mockReturnValue(new Promise(() => {}));
+			renderSection(<StalledItemsSection items={[pullRequestItem(), workItem()]} />);
+			const [first, second] = rows();
+
+			fireEvent.click(within(first).getByRole('button', { name: 'Dismiss' }));
+
+			expect(within(first).getByRole('button', { name: 'Dismiss' })).toHaveProperty(
+				'disabled',
+				true,
+			);
+			expect(within(second).getByRole('button', { name: 'Dismiss' })).toHaveProperty(
+				'disabled',
+				false,
+			);
+		});
+
+		it('renders the server’s own refusal and leaves the row in place', async () => {
+			vi.mocked(trpcClient.runs.dismissStalled.mutate).mockRejectedValue(
+				new Error('Project with ID "p1" not found'),
+			);
+			renderSection(<StalledItemsSection items={[pullRequestItem()]} />);
+
+			fireEvent.click(within(rows()[0]).getByRole('button', { name: 'Dismiss' }));
+
+			await waitFor(() => {
+				expect(screen.getByText('Project with ID "p1" not found')).not.toBeNull();
+			});
+			expect(rows()).toHaveLength(1);
+			expect(within(rows()[0]).getByRole('button', { name: 'Dismiss' })).toHaveProperty(
+				'disabled',
+				false,
+			);
+		});
 	});
 });

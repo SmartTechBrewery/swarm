@@ -1,5 +1,5 @@
-import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { AlertTriangle, ChevronDown, ChevronRight, X } from 'lucide-react';
 import { useState } from 'react';
 import { formatRelativeTime } from '@/lib/format.js';
 import { runTableColumnWidths } from '@/lib/run-table-layout.js';
@@ -9,7 +9,7 @@ import {
 	stalledItemRun,
 	stalledPhaseLabel,
 } from '@/lib/stalled-items.js';
-import { trpc } from '@/lib/trpc.js';
+import { trpc, trpcClient } from '@/lib/trpc.js';
 import type { StalledItem } from '@/types/runs.js';
 import { WorkItemCell } from './work-item-cell.js';
 
@@ -65,8 +65,21 @@ interface StalledItemsSectionProps {
  * - Attention-toned rather than error-toned (`ai/DESIGN_SYSTEM.md`'s warning
  *   amber): a stall needs a look, which is not the same as something having
  *   crashed — and is what sets it apart from the neutral Queued section below.
- * - No per-row action. A stalled row links *out* to the pull request or board
- *   card; retrying, cancelling, or forcing a re-review stays the Runs table's job.
+ * - **One** per-row action: **Dismiss** (issue #880). Retrying, cancelling, or
+ *   forcing a re-review stays the Runs table's job; a stalled row still links
+ *   *out* to the pull request or board card for everything else. Dismiss exists
+ *   because `stalled` is the deliberate default when no *recorded* hand-off
+ *   explains a unit's silence, so a pull request a human merged is reported until
+ *   it ages out of the 30-day lookback — and an operator can see at a glance that
+ *   it is done. It writes a `stalled_dismissals` row keyed on the liveness unit
+ *   (`runs.dismissStalled`), never a status on the unit, and a unit that genuinely
+ *   moves again is reported normally.
+ * - **A dismissal is auditable in the record, not in this view.** The durable row
+ *   names the unit, the activity instant it was dismissed at, the wall-clock time
+ *   and the user. Surfacing dismissed items here — a collapsed count, an undo —
+ *   would be a feature with its own read and its own authorization question, and
+ *   is deliberately not part of #880; recording who and when is what keeps it
+ *   cheap to add later.
  */
 export function StalledItemsSection({ items, showProject = true }: StalledItemsSectionProps) {
 	// Expanded by default — the whole point is that it is noticed without being
@@ -81,6 +94,42 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 	});
 	const projectsMap = new Map(projectsQuery.data?.map((p) => [p.id, p]) ?? []);
 	const columnWidths = runTableColumnWidths(showProject);
+
+	// The row a dismissal is in flight for, so only *that* button disables. The
+	// section can list a dozen rows, and greying out all of them would misreport
+	// which one the operator acted on.
+	const [dismissingKey, setDismissingKey] = useState<string | null>(null);
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
+	const queryClient = useQueryClient();
+	const dismissMutation = useMutation({
+		mutationFn: (item: StalledItem) =>
+			trpcClient.runs.dismissStalled.mutate({
+				projectId: item.projectId,
+				repository: item.repository,
+				unit: item.unit,
+				reference: item.reference,
+				// Verbatim, so the server records the instant the operator actually saw.
+				// A run that landed between render and click leaves the unit past this
+				// instant, and the row is simply reported again — a stale client can only
+				// ever under-suppress.
+				lastActivityAt: item.lastActivityAt,
+			}),
+		onSuccess: () => {
+			setErrorMessage(null);
+			// No success toast: the row disappearing *is* the confirmation.
+			queryClient.invalidateQueries({ queryKey: trpc.runs.stalled.queryKey() });
+		},
+		onError: (error: Error) => {
+			setErrorMessage(error.message || 'Failed to dismiss the stalled item.');
+		},
+		onSettled: () => setDismissingKey(null),
+	});
+
+	const handleDismiss = (item: StalledItem) => {
+		setDismissingKey(stalledItemKey(item));
+		setErrorMessage(null);
+		dismissMutation.mutate(item);
+	};
 
 	if (items.length === 0) return null;
 
@@ -109,6 +158,8 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 				</button>
 			</h2>
 			<p className="text-xs text-amber-200/70">{STALLED_SECTION_EXPLANATION}</p>
+			{/* The server's own message, verbatim; cleared on the next attempt. */}
+			{errorMessage && <p className="text-xs text-red-400">{errorMessage}</p>}
 
 			{expanded && (
 				<>
@@ -141,6 +192,22 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 										<ProjectContent item={item} projectName={projectNameFor(item)} />
 									</div>
 								)}
+								{/*
+								 * The same action as the table's Dismiss column, in a separated
+								 * action row: `ai/DESIGN_SYSTEM.md`'s responsive-list rule drops
+								 * no field and no action below `md`.
+								 */}
+								<div className="flex flex-wrap items-center gap-2 border-t border-zinc-800/60 pt-2">
+									<button
+										type="button"
+										onClick={() => handleDismiss(item)}
+										disabled={dismissingKey === stalledItemKey(item)}
+										className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-3 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+									>
+										<X className="h-3.5 w-3.5" />
+										Dismiss
+									</button>
+								</div>
 							</div>
 						))}
 					</div>
@@ -154,6 +221,8 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 								<col className={columnWidths.phase} />
 								<col className={columnWidths.started} />
 								{showProject && <col className={columnWidths.project} />}
+								{/* Matches QueuedRunsSection's action column, so the two cannot drift. */}
+								<col className="w-[120px]" />
 							</colgroup>
 							<thead>
 								<tr className="border-b border-zinc-800 bg-zinc-800/30">
@@ -171,6 +240,9 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 											Project
 										</th>
 									)}
+									<th className="px-2 py-2 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+										Dismiss
+									</th>
 								</tr>
 							</thead>
 							<tbody className="divide-y divide-zinc-800/60">
@@ -190,6 +262,17 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 												<ProjectContent item={item} projectName={projectNameFor(item)} />
 											</td>
 										)}
+										<td className="px-2 py-2 text-xs">
+											<button
+												type="button"
+												onClick={() => handleDismiss(item)}
+												disabled={dismissingKey === stalledItemKey(item)}
+												className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+											>
+												<X className="w-3.5 h-3.5" />
+												Dismiss
+											</button>
+										</td>
 									</tr>
 								))}
 							</tbody>
