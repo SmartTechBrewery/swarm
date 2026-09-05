@@ -665,6 +665,11 @@ The dashboard deliberately exposes three complementary read models (issues #313,
   job, the durable `runs` rows are never modified or deleted (the write touches neither that
   table nor `dispatches`), and the write is gated at project `member` — this router's
   uniform mutation gate, never weaker than the `contributor` the read it mirrors permits.
+  The instant is the client's, **bounded at server time**: a stale one is harmless (it
+  under-suppresses, and the row returns on the next poll), but a *future* one is refused
+  outright rather than clamped, because no activity could ever advance past it and the
+  unit's later stalled work would stay hidden for as long as that instant named — the
+  reappearance the comparison exists for is a property of that bound, not of the caller.
   Dismissed items are *not* surfaced anywhere: the record names the unit, the instant, the
   wall-clock time and the user, which is where auditability lands, and a collapsed count or
   an undo would be its own feature with its own read.

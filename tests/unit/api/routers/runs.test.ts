@@ -2439,6 +2439,19 @@ describe('runsRouter', () => {
 			await expect(caller.dismissStalled({ ...DISMISSAL, ...overrides })).rejects.toThrow();
 			expect(recordStalledDismissal).not.toHaveBeenCalled();
 		});
+
+		// A future instant is well-formed ISO but nothing could ever advance past it,
+		// so storing one would suppress the unit's later stalled work for as long as
+		// it named. The `<= now` bound is what makes the reappearance the classifier's
+		// comparison promises always reachable.
+		it('refuses a future lastActivityAt without writing', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+			await expect(
+				caller.dismissStalled({ ...DISMISSAL, lastActivityAt: '2100-01-01T00:00:00.000Z' }),
+			).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+			expect(recordStalledDismissal).not.toHaveBeenCalled();
+		});
 	});
 
 	describe('putBack', () => {

@@ -1441,12 +1441,18 @@ export const runsRouter = router({
 	// acceptance criterion, because `contributor` is documented read-only and a
 	// dismissal writes a durable row.
 	//
-	// **`lastActivityAt` is the client's, verbatim, and that is safe by construction.**
-	// If a run landed between render and click, the stored instant is the *older* one,
-	// the unit's current activity is already past it, and the row is reported again on
-	// the next poll: a stale client under-suppresses and can never over-suppress.
-	// Recomputing it server-side would cost a second `listTaskActivitySince` to reach
-	// the same or a worse answer.
+	// **`lastActivityAt` is the client's, but only up to server time.** A *stale*
+	// client is safe by construction: if a run landed between render and click, the
+	// stored instant is the *older* one, the unit's current activity is already past
+	// it, and the row is reported again on the next poll — it under-suppresses and
+	// can never over-suppress. Recomputing it server-side would cost a second
+	// `listTaskActivitySince` to reach the same or a worse answer. What that argument
+	// does not cover is a value the dashboard would never send: a *future* instant no
+	// activity can ever advance past suppresses the unit's later stalled work for as
+	// long as it names, defeating the reappearance the comparison exists for. So the
+	// one bound that has to be enforced here is `<= now`, which is where the "later
+	// activity always wins" property comes from; anything at or before it is the
+	// client's to choose, and the worst it can do is show the row again.
 	dismissStalled: authedProcedure
 		.input(
 			z.object({
@@ -1473,12 +1479,26 @@ export const runsRouter = router({
 				});
 			}
 
+			// The bound the comparison in `classifyItemLiveness` rests on: a stored
+			// instant at or before now can always be overtaken by later activity, so
+			// the unit reappears the moment it moves again. Refused rather than
+			// clamped, because a future instant is not a stale row the operator saw —
+			// it is a request the dashboard cannot produce, and silently rewriting it
+			// would report a dismissal of something other than what was asked.
+			const lastActivityAt = new Date(input.lastActivityAt);
+			if (lastActivityAt.getTime() > Date.now()) {
+				throw new TRPCError({
+					code: 'BAD_REQUEST',
+					message: `Cannot dismiss at a future activity instant "${input.lastActivityAt}"`,
+				});
+			}
+
 			const { dismissedAt } = await recordStalledDismissal({
 				projectId: input.projectId,
 				repository: input.repository,
 				unit: input.unit,
 				reference: input.reference,
-				lastActivityAt: new Date(input.lastActivityAt),
+				lastActivityAt,
 				dismissedBy: ctx.user.id,
 			});
 			return { dismissedAt: dismissedAt.toISOString() };

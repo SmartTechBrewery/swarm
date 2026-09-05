@@ -349,6 +349,18 @@ describe('operator dismissal', () => {
 		);
 	});
 
+	// The reappearance above is only reachable because `runs.dismissStalled` refuses a
+	// dismissal instant later than server time: even a dismissal taken at the very
+	// latest instant it admits is overtaken by activity recorded after it.
+	it('reports a unit dismissed at the newest admissible instant once it moves again', () => {
+		const dismissal = makeDismissal({ lastActivityAt: NOW });
+		const moved = new Date(NOW.getTime() + ITEM_STALL_AFTER_MS);
+		const later = new Date(moved.getTime() + ITEM_STALL_AFTER_MS);
+
+		const units = foldLivenessUnits([makeActivity({ lastActivityAt: moved })], [], [dismissal]);
+		expect(classifyItemLiveness(units[0], NO_AUTOMATION, later)).toBe('stalled');
+	});
+
 	// `<=`, not `<`: the record stores the instant the operator saw, so equality is
 	// "it has not moved since".
 	it('still suppresses at exactly the dismissed instant', () => {
