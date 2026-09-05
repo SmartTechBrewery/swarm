@@ -6,11 +6,16 @@ import {
 	listActiveDispatchTaskRefs,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import { listTaskActivitySince } from '../../../src/db/repositories/runsRepository.js';
+import {
+	listStalledDismissals,
+	recordStalledDismissal,
+} from '../../../src/db/repositories/stalledDismissalsRepository.js';
 import { runs } from '../../../src/db/schema/runs.js';
 import {
 	ITEM_ACTIVITY_LOOKBACK_MS,
 	ITEM_STALL_AFTER_MS,
 	type ItemLivenessPolicy,
+	ItemLivenessUnitKindSchema,
 	toStalledItems,
 } from '../../../src/dispatch/item-liveness.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
@@ -71,11 +76,18 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('item liveness (integratio
 	const since = new Date(NOW.getTime() - ITEM_ACTIVITY_LOOKBACK_MS);
 
 	async function stalledNow() {
-		const [activity, activeDispatches] = await Promise.all([
+		const [activity, activeDispatches, dismissals] = await Promise.all([
 			listTaskActivitySince({ since, projectIds: [PROJECT_ID] }),
 			listActiveDispatchTaskRefs([PROJECT_ID]),
+			listStalledDismissals({ since, projectIds: [PROJECT_ID] }),
 		]);
-		return toStalledItems(activity, activeDispatches, { [PROJECT_ID]: DEFAULT_POLICY }, NOW);
+		return toStalledItems(
+			activity,
+			activeDispatches,
+			{ [PROJECT_ID]: DEFAULT_POLICY },
+			dismissals.map((row) => ({ ...row, unit: ItemLivenessUnitKindSchema.parse(row.unit) })),
+			NOW,
+		);
 	}
 
 	beforeEach(async () => {
@@ -178,6 +190,46 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('item liveness (integratio
 		});
 
 		expect(await stalledNow()).toEqual([]);
+	});
+
+	// issue #880 — an operator's dismissal, over real Postgres. The suppression is a
+	// comparison against a stored `timestamp`, so only a real driver value proves
+	// `last_activity_at` reaches the classifier as a `Date` its arithmetic can use —
+	// the same concern this file's header names for `lastActivityAt`.
+	it('drops a dismissed unit and reports it again once it moves', async () => {
+		await seedRun({
+			taskId: '99',
+			phase: 'review',
+			prNumber: '99',
+			startedAt: new Date(NOW.getTime() - 6 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 5 * HOUR_MS),
+		});
+		const [reported] = await stalledNow();
+		expect(reported.reference).toBe('99');
+
+		await recordStalledDismissal({
+			projectId: PROJECT_ID,
+			repository: REPO,
+			unit: reported.unit,
+			reference: reported.reference,
+			lastActivityAt: new Date(reported.lastActivityAt),
+			dismissedBy: null,
+		});
+
+		expect(await stalledNow()).toEqual([]);
+
+		// A newer run for the same unit advances its activity past the dismissal.
+		await seedRun({
+			taskId: '99-respond',
+			phase: 'respond-to-review',
+			prNumber: '99',
+			startedAt: new Date(NOW.getTime() - 4 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 3 * HOUR_MS),
+		});
+
+		const again = await stalledNow();
+		expect(again.map((item) => item.reference)).toEqual(['99']);
+		expect(again[0].taskId).toBe('99-respond');
 	});
 
 	// A hand-off SWARM actually recorded explains the silence, so the unit is not

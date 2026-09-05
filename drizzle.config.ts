@@ -5,6 +5,7 @@ export default defineConfig({
 		'./src/db/schema/projects.ts',
 		'./src/db/schema/projectCredentials.ts',
 		'./src/db/schema/runs.ts',
+		'./src/db/schema/stalledDismissals.ts',
 		'./src/db/schema/appSettings.ts',
 		'./src/db/schema/cliQuotas.ts',
 		'./src/db/schema/reviewVerdicts.ts',

@@ -625,11 +625,13 @@ The dashboard deliberately exposes three complementary read models (issues #313,
   already looks at — the cross-project `/runs` screen and a project's own Runs panel
   (`dashboard/src/components/runs/stalled-items-section.tsx`) — so a stall is visible
   without opening the database. There is no `/stalled` route and no nav entry. The
-  section renders *nothing at all* when the list is empty, carries no per-row action
-  (a row links out to the pull request or board card through the shared
-  `WorkItemCell`; acting on it stays the Runs table's job), and never notifies: it
-  reports on render, so an item stays listed until it actually moves rather than
-  re-announcing on a timer. The cross-project screen gates its query exactly as the
+  section renders *nothing at all* when the list is empty, carries exactly one
+  per-row action (**Dismiss**, below — a row otherwise links out to the pull request
+  or board card through the shared `WorkItemCell`, and retrying, cancelling or
+  forcing a re-review stays the Runs table's job), and never notifies: it reports on
+  render, so an item stays listed until it actually moves, is dismissed, or ages out
+  of the lookback window, rather than re-announcing on a timer. The cross-project
+  screen gates its query exactly as the
   queue's is gated — unscoped is instance-admin-only — so a member who has chosen no
   project never polls a guaranteed `FORBIDDEN`.
 
@@ -646,10 +648,29 @@ The dashboard deliberately exposes three complementary read models (issues #313,
   card as before, and a project resolving no runtime-ready provider simply carries no
   `prUrl` rather than failing the report.
 
+  **An operator can force one row's age-out** (issue #880). `stalled` is the deliberate
+  default when no *recorded* hand-off explains a unit's silence, so a pull request a human
+  merged or a card a human closed is reported until the 30-day window expires — even when
+  the operator can see at a glance that it is done. The Stalled table therefore carries a
+  trailing **Dismiss** column, one button per row, calling `runs.dismissStalled`. That
+  writes one row to `stalled_dismissals`, keyed on the **liveness unit** (a unit folds
+  several runs, and the row the operator sees is the unit) and carrying the
+  `last_activity_at` it was dismissed at; the classification gains a `dismissed` state that
+  holds only while the unit's own activity has not advanced past that instant. So a unit
+  that genuinely moves again is reported normally with nothing to un-set and no background
+  job, the durable `runs` rows are never modified or deleted (the write touches neither that
+  table nor `dispatches`), and the write is gated at project `member` — this router's
+  uniform mutation gate, never weaker than the `contributor` the read it mirrors permits.
+  Dismissed items are *not* surfaced anywhere: the record names the unit, the instant, the
+  wall-clock time and the user, which is where auditability lands, and a collapsed count or
+  an undo would be its own feature with its own read.
+
   **"Stalled" is a computed view and never a persisted status.** There is no column, no new
-  `dispatches.wait_reason` value, and no background sweep that writes one: the view is
-  derived on every read, so a unit stays reported until it actually moves or ages out of the
-  lookback window, and nothing has to be un-set when it recovers. Note the name collision
+  `dispatches.wait_reason` value, and no background sweep that writes one — including for a
+  dismissal, whose record is its own row and whose suppression is a *comparison* the view
+  re-derives on every read. The view is derived on every read, so a unit stays reported
+  until it actually moves, is dismissed, or ages out of the lookback window, and nothing has
+  to be un-set when it recovers. Note the name collision
   the read model deliberately does *not* reuse: `wait_reason: 'stalled'` already exists and
   means something else entirely — one BullMQ wake-up stalled, so the dispatch is waiting to
   be re-run. Such a dispatch is non-terminal, which makes its unit `active` here. One blind

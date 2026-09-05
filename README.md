@@ -108,8 +108,9 @@ local worker exactly like anyone else.
 
 **Operated from a dashboard**, not a log file: run history and per-run detail
 with failure diagnosis, a **Stalled** section on both Runs surfaces naming the
-work items that have stopped moving — the phase each one stopped in and how long
-it has been silent — project and board mapping, per-provider credential entry,
+work items that have stopped moving — the phase each one stopped in, how long
+it has been silent, and a per-row **Dismiss** for a unit an operator can see is
+finished — project and board mapping, per-provider credential entry,
 worker registration/enrollment/approval, and each of your own workers' live CLI
 quota for every agent CLI on that machine.
 

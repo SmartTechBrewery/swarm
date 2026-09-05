@@ -25,6 +25,10 @@ import {
 	listTaskActivitySince,
 	recordRunCleanupBlocked,
 } from '../../db/repositories/runsRepository.js';
+import {
+	listStalledDismissals,
+	recordStalledDismissal,
+} from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
 import {
 	cancelDispatchAndWake,
@@ -38,7 +42,9 @@ import {
 } from '../../dispatch/force-re-review.js';
 import {
 	ITEM_ACTIVITY_LOOKBACK_MS,
+	type ItemLivenessDismissal,
 	type ItemLivenessPolicy,
+	ItemLivenessUnitKindSchema,
 	type StalledItem,
 	toStalledItems,
 } from '../../dispatch/item-liveness.js';
@@ -754,6 +760,31 @@ function itemLivenessPolicyFor(project: ProjectConfig | undefined): ItemLiveness
 }
 
 /**
+ * Narrow the stored dismissal rows onto the read model's own input shape (issue
+ * #880). `stalled_dismissals.unit` is `text` — the enum lives in
+ * `ItemLivenessUnitKindSchema`, not in Postgres — so a row naming a kind this build
+ * does not know is dropped rather than handed on: it can only ever *suppress* a
+ * row, and suppressing on an unreadable key is worse than reporting the unit.
+ */
+function toLivenessDismissals(
+	rows: readonly {
+		projectId: string;
+		repository: string;
+		unit: string;
+		reference: string;
+		lastActivityAt: Date;
+	}[],
+): ItemLivenessDismissal[] {
+	const dismissals: ItemLivenessDismissal[] = [];
+	for (const row of rows) {
+		const unit = ItemLivenessUnitKindSchema.safeParse(row.unit);
+		if (!unit.success) continue;
+		dismissals.push({ ...row, unit: unit.data });
+	}
+	return dismissals;
+}
+
+/**
  * Fill each `pull-request` stalled row's `prUrl` with the **provider's own** web
  * URL for that pull request, so the dashboard links a stalled PR out without
  * assembling a URL of its own — which is how a GitLab or Bitbucket project's rows
@@ -871,12 +902,14 @@ export const runsRouter = router({
 	// (dispatch-centric) and Runs (run-centric). It folds `runs` and `dispatches`
 	// onto the unit an operator recognises (a pull request, a board card) and
 	// reports the units with no forward path. The whole decision lives in the pure
-	// `src/dispatch/item-liveness.ts`; this procedure only supplies the two bounded
+	// `src/dispatch/item-liveness.ts`; this procedure only supplies the three bounded
 	// reads and the per-project policy map, and touches nothing but Postgres — no
 	// provider call, no cache, no enrichment, unlike `queued`.
 	//
 	// "Stalled" is a computed view, never a persisted status: nothing here writes,
-	// and a unit stays listed until it moves or ages out of the lookback window.
+	// and a unit stays listed until it moves, is dismissed by an operator
+	// ({@link runsRouter.dismissStalled}, issue #880), or ages out of the lookback
+	// window.
 	//
 	// Authorization is `queued`'s shape verbatim, so no new access decision is made
 	// here: a chosen `projectId` needs read access, and the unscoped,
@@ -889,28 +922,33 @@ export const runsRouter = router({
 				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 				const project = await getProjectByIdFromDb(input.projectId);
 				const projectIds = [input.projectId];
-				const [activity, activeDispatches] = await Promise.all([
+				const [activity, activeDispatches, dismissals] = await Promise.all([
 					listTaskActivitySince({ since, projectIds }),
 					listActiveDispatchTaskRefs(projectIds),
+					listStalledDismissals({ since, projectIds }),
 				]);
 				return withPullRequestUrls(
-					toStalledItems(activity, activeDispatches, {
-						[input.projectId]: itemLivenessPolicyFor(project),
-					}),
+					toStalledItems(
+						activity,
+						activeDispatches,
+						{ [input.projectId]: itemLivenessPolicyFor(project) },
+						toLivenessDismissals(dismissals),
+					),
 					new Map(project ? [[project.id, project]] : []),
 				);
 			}
 			assertInstanceAdmin(ctx.user, 'stalled work');
-			const [activity, activeDispatches, projects] = await Promise.all([
+			const [activity, activeDispatches, projects, dismissals] = await Promise.all([
 				listTaskActivitySince({ since }),
 				listActiveDispatchTaskRefs(),
 				listAllProjectsFromDb(),
+				listStalledDismissals({ since }),
 			]);
 			const policies = Object.fromEntries(
 				projects.map((project) => [project.id, itemLivenessPolicyFor(project)]),
 			);
 			return withPullRequestUrls(
-				toStalledItems(activity, activeDispatches, policies),
+				toStalledItems(activity, activeDispatches, policies, toLivenessDismissals(dismissals)),
 				new Map(projects.map((project) => [project.id, project])),
 			);
 		}),
@@ -1384,6 +1422,68 @@ export const runsRouter = router({
 		}),
 
 	// Put back action for queued work items (issues #251, #284).
+	// Dismiss one stalled liveness unit from the Stalled view (issue #880) — the
+	// operator's way of forcing the age-out of a unit that is finished but whose
+	// finish SWARM never recorded (a human merged the pull request, a human closed
+	// the card), instead of waiting out the 30-day lookback window.
+	//
+	// The write is a record of the *dismissal*, never a status on the unit: it lands
+	// in `stalled_dismissals`, keyed on the unit the operator sees, and `runs.stalled`
+	// re-derives the suppression by comparison on every read. No `runs` row is
+	// modified or deleted — this touches neither that table nor `dispatches`.
+	//
+	// **Authorization** is project-scoped at `member`, this router's uniform gate for
+	// every mutation (`retryNow`, `terminate`, `reset`, `forceReReview`, `putBack`)
+	// and the "drive a project's runs" row of the `src/api/authz.ts` matrix. It is
+	// never weaker than the read it mirrors — viewing a project's stalled work is
+	// `contributor` on that project, and the unscoped view an instance
+	// administrator's — and deliberately stricter than a literal reading of the
+	// acceptance criterion, because `contributor` is documented read-only and a
+	// dismissal writes a durable row.
+	//
+	// **`lastActivityAt` is the client's, verbatim, and that is safe by construction.**
+	// If a run landed between render and click, the stored instant is the *older* one,
+	// the unit's current activity is already past it, and the row is reported again on
+	// the next poll: a stale client under-suppresses and can never over-suppress.
+	// Recomputing it server-side would cost a second `listTaskActivitySince` to reach
+	// the same or a worse answer.
+	dismissStalled: authedProcedure
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				/** The row's own `owner/repo` — the unit key's second component. */
+				repository: z.string().min(1),
+				unit: ItemLivenessUnitKindSchema,
+				/** The PR number for a `pull-request` unit, the task id for a `work-item` one. */
+				reference: z.string().min(1),
+				/** The `lastActivityAt` of the row the operator dismissed, verbatim. */
+				lastActivityAt: z.string().datetime(),
+			}),
+		)
+		.mutation(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'member');
+			// Resolved for its existence alone: the row carries an FK to `projects`, so
+			// an instance administrator naming a bogus id gets a clear refusal here
+			// rather than a raw constraint violation from Postgres.
+			const project = await getProjectByIdFromDb(input.projectId);
+			if (!project) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Project with ID "${input.projectId}" not found`,
+				});
+			}
+
+			const { dismissedAt } = await recordStalledDismissal({
+				projectId: input.projectId,
+				repository: input.repository,
+				unit: input.unit,
+				reference: input.reference,
+				lastActivityAt: new Date(input.lastActivityAt),
+				dismissedBy: ctx.user.id,
+			});
+			return { dismissedAt: dismissedAt.toISOString() };
+		}),
+
 	// Cancels a waiting dispatch (the canonical record — nothing can resurrect
 	// it afterwards) and moves its linked card back to backlog.
 	putBack: authedProcedure
