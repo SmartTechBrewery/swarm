@@ -2182,6 +2182,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			completedAt?: Date;
 			prNumber?: string;
 			producedPrUrl?: string;
+			reviewMergeOutcome?: string;
 		}): Promise<string> {
 			const rows = await getDb()
 				.insert(runs)
@@ -2195,6 +2196,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 					completedAt: input.completedAt,
 					prNumber: input.prNumber,
 					producedPrUrl: input.producedPrUrl,
+					reviewMergeOutcome: input.reviewMergeOutcome,
 				})
 				.returning({ id: runs.id });
 			return rows[0].id;
@@ -2228,6 +2230,48 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				liveRunCount: 0,
 			});
 			expect(rows[0].lastActivityAt).toEqual(new Date('2026-02-02T00:10:00Z'));
+		});
+
+		// The merge is a terminal fact of the whole group, so it must survive being
+		// hidden behind a later run of the same task id (issue #879) — which is
+		// exactly what the `DISTINCT ON` above would do to the column itself.
+		it('counts merged runs into mergedRunCount, even behind a later run', async () => {
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				reviewMergeOutcome: 'merged',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+			});
+			const later = await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				status: 'failed',
+				startedAt: new Date('2026-02-02T00:00:00Z'),
+				completedAt: new Date('2026-02-02T00:10:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+
+			expect(rows).toHaveLength(1);
+			expect(rows[0].runId).toBe(later);
+			expect(rows[0].reviewMergeOutcome).toBeNull();
+			expect(rows[0].mergedRunCount).toBe(1);
+		});
+
+		it('leaves mergedRunCount at zero for a non-merged outcome', async () => {
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				reviewMergeOutcome: 'policy-blocked',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+
+			expect(rows).toHaveLength(1);
+			expect(rows[0].mergedRunCount).toBe(0);
 		});
 
 		// A `running` row has no `completed_at`, so its `started_at` is the activity
