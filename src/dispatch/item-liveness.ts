@@ -181,6 +181,14 @@ export interface ItemLivenessUnit {
 	lastActivityAt: Date;
 	/** How many runs across the whole unit are still `running`. */
 	liveRunCount: number;
+	/**
+	 * How many runs across the whole unit recorded `review_merge_outcome =
+	 * 'merged'`. A merge is terminal for the *unit*, so it is aggregated here
+	 * rather than read off {@link latest}: a later `respond-to-ci`, or a failed
+	 * re-review sharing the Review's own `task_id`, must not un-merge a pull
+	 * request (issue #879).
+	 */
+	mergedRunCount: number;
 	/** Whether a non-terminal dispatch resolved a task id belonging to this unit. */
 	hasActiveDispatch: boolean;
 	/**
@@ -311,7 +319,11 @@ export function livenessUnitKeysForDispatch(ref: ActiveDispatchTaskRef): string[
  *    Review continue from, so the fourth kind — *waiting on CI* — is a recorded
  *    hand-off rather than a timer guess. (Rule 8 absorbs an ordinary check-suite
  *    wait on the pull-request unit itself.)
- * 4. `review_merge_outcome = 'merged'` → `merged`.
+ * 4. **Any** run folded into the unit recorded `review_merge_outcome = 'merged'`
+ *    → `merged`. Read across the unit rather than off `latest`, because a merge
+ *    is terminal for the pull request: a later `respond-to-ci`, or a failed
+ *    re-review sharing the Review's own `task_id`, used to become `latest` and
+ *    report a merged PR as stalled for the rest of the lookback (issue #879).
  * 5. `review_automation_outcome = 'manual-intervention-required'` → the review-cap
  *    stop (issues #235/#328): SWARM's own design stops here and asks for a person.
  * 6. A `completed` Planning run on a project that does not auto-advance → the plan
@@ -338,7 +350,7 @@ export function classifyItemLiveness(
 	const latest = unit.latest;
 	const completed = latest.status === 'completed';
 	if (completed && latest.phase === 'implementation' && latest.producedPrUrl) return 'handed-off';
-	if (latest.reviewMergeOutcome === 'merged') return 'merged';
+	if (unit.mergedRunCount > 0) return 'merged';
 	if (latest.reviewAutomationOutcome === 'manual-intervention-required') return 'awaiting-human';
 	if (completed && latest.phase === 'planning' && !policy.planningAutoAdvance) {
 		return 'awaiting-human';
@@ -359,7 +371,7 @@ export function classifyItemLiveness(
 /**
  * Fold the per-`task_id` activity rows onto liveness units: a pull-request unit
  * takes the latest run across its up-to-four task ids and sums their live-run
- * counts, and a board card takes its own.
+ * and merged-run counts, and a board card takes its own.
  */
 export function foldLivenessUnits(
 	activity: readonly TaskActivityRow[],
@@ -405,12 +417,14 @@ export function foldLivenessUnits(
 				latest: row,
 				lastActivityAt: row.lastActivityAt,
 				liveRunCount: row.liveRunCount,
+				mergedRunCount: row.mergedRunCount,
 				hasActiveDispatch: activeKeys.has(dispatchKey(row.projectId, unit, reference)),
 				dismissedThrough: dismissedThrough.get(key) ?? null,
 			});
 			continue;
 		}
 		existing.liveRunCount += row.liveRunCount;
+		existing.mergedRunCount += row.mergedRunCount;
 		if (row.lastActivityAt.getTime() > existing.lastActivityAt.getTime()) {
 			existing.latest = row;
 			existing.lastActivityAt = row.lastActivityAt;

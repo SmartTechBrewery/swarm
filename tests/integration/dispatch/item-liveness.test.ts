@@ -247,4 +247,76 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('item liveness (integratio
 
 		expect(await stalledNow()).toEqual([]);
 	});
+
+	// PR #733's ordering (issue #879): the merge is on the Review run and a later
+	// Respond-to-CI run on `<pr>-ci` folds in as the unit's latest.
+	it('keeps a merged pull request unreported when a later respond-to-ci lands on it', async () => {
+		await seedRun({
+			taskId: '733',
+			phase: 'review',
+			prNumber: '733',
+			reviewVerdict: 'approve',
+			reviewMergeOutcome: 'merged',
+			startedAt: new Date(NOW.getTime() - 48 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 47 * HOUR_MS),
+		});
+		await seedRun({
+			taskId: '733-ci',
+			phase: 'respond-to-ci',
+			prNumber: '733',
+			startedAt: new Date(NOW.getTime() - 6 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 5 * HOUR_MS),
+		});
+
+		expect(await stalledNow()).toEqual([]);
+	});
+
+	// PR #768's ordering (issue #879), and the case the unit tests cannot reach:
+	// both Review runs share `task_id = '768'`, so `listTaskActivitySince`'s
+	// `DISTINCT ON` returns only the later, failed one. Only a real driver value
+	// proves the merge survives that read as a group aggregate.
+	it('keeps a merged pull request unreported when a later failed review shares its task id', async () => {
+		await seedRun({
+			taskId: '768',
+			phase: 'review',
+			prNumber: '768',
+			reviewVerdict: 'approve',
+			reviewMergeOutcome: 'merged',
+			startedAt: new Date(NOW.getTime() - 48 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 47 * HOUR_MS),
+		});
+		await seedRun({
+			taskId: '768',
+			phase: 'review',
+			status: 'failed',
+			prNumber: '768',
+			startedAt: new Date(NOW.getTime() - 6 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 5 * HOUR_MS),
+		});
+
+		expect(await stalledNow()).toEqual([]);
+	});
+
+	// The control for the two above: the same two-Review shape with no merge
+	// recorded is still reported, so the new aggregate cannot silence a real stall.
+	it('still reports a two-review pull request that never recorded a merge', async () => {
+		await seedRun({
+			taskId: '769',
+			phase: 'review',
+			prNumber: '769',
+			reviewVerdict: 'request-changes',
+			startedAt: new Date(NOW.getTime() - 48 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 47 * HOUR_MS),
+		});
+		await seedRun({
+			taskId: '769',
+			phase: 'review',
+			status: 'failed',
+			prNumber: '769',
+			startedAt: new Date(NOW.getTime() - 6 * HOUR_MS),
+			completedAt: new Date(NOW.getTime() - 5 * HOUR_MS),
+		});
+
+		expect((await stalledNow()).map((item) => item.reference)).toEqual(['769']);
+	});
 });

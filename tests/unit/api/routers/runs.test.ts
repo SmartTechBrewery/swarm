@@ -571,6 +571,7 @@ describe('runsRouter', () => {
 				reviewMergeOutcome: null,
 				lastActivityAt: SILENT_AT,
 				liveRunCount: 0,
+				mergedRunCount: 0,
 				...overrides,
 			};
 		}

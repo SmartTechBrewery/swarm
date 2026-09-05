@@ -610,7 +610,11 @@ The dashboard deliberately exposes three complementary read models (issues #313,
 
   The classification is **generic by construction**: `stalled` is the *default*, and a unit
   steps back from it only for a hand-off SWARM actually recorded on a row — a non-terminal
-  dispatch, an Implementation carrying `produced_pr_url`, a `merged` merge outcome, a
+  dispatch, an Implementation carrying `produced_pr_url`, a `merged` merge outcome recorded
+  by **any** run in the unit (aggregated over the fold rather than read off its latest row:
+  a merge is terminal for the pull request, and a later `respond-to-ci` or a failed
+  re-review sharing the Review's own `task_id` used to hide it and report a merged PR as
+  stalled for the rest of the lookback — issue #879), a
   `manual-intervention-required` review outcome, a completed Planning run on a project that
   does not auto-advance, or an `approve` whose merge either recorded an outcome or was never
   automated — or while it is still inside a two-hour grace window. So a stall from a cause

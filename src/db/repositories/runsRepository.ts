@@ -1250,12 +1250,20 @@ export interface TaskActivityRow {
 	lastActivityAt: Date;
 	/** How many runs in the group are still `running`. */
 	liveRunCount: number;
+	/**
+	 * How many runs in the group recorded `review_merge_outcome = 'merged'`. A
+	 * group aggregate rather than the selected row's own column because this read
+	 * returns only the group's *latest* run: a pull request's Review runs all share
+	 * `task_id = <pr>`, so a later failed re-review would otherwise hide the merge
+	 * an earlier one recorded (issue #879).
+	 */
+	mergedRunCount: number;
 }
 
 /**
  * Every task with run activity since `since`, as {@link TaskActivityRow}s.
  *
- * Three things this read is, deliberately:
+ * Four things this read is, deliberately:
  *
  * - **Bounded by `since`.** That is what keeps it cheap and stops years of
  *   finished history filling the view; `idx_runs_started_at` covers the predicate.
@@ -1267,6 +1275,10 @@ export interface TaskActivityRow {
  * - **Run activity only.** A dispatch that settled without producing a run — a
  *   `no-trigger`, a `skipped-duplicate` — is deliberately not "movement": it *is*
  *   the absence of forward progress, which is the thing being detected.
+ * - **One row per group, so a terminal fact is aggregated, never read off the
+ *   selected row.** The row this returns is the group's *latest* run; any fact the
+ *   classifier rests a whole unit on — `mergedRunCount` today — has to be computed
+ *   over the group, or a later run of the same task id hides it (issue #879).
  *
  * `projectIds` is the authorization scope, same convention as
  * {@link ListRunsFilter.projectIds}: callers pass a non-empty array, and an empty
@@ -1305,6 +1317,10 @@ export async function listTaskActivitySince(input: {
 			liveRunCount: sql<number>`count(*) filter (where ${runs.status} = 'running')::int`.as(
 				'live_run_count',
 			),
+			mergedRunCount:
+				sql<number>`count(*) filter (where ${runs.reviewMergeOutcome} = 'merged')::int`.as(
+					'merged_run_count',
+				),
 		})
 		.from(runs)
 		.where(where)
@@ -1330,6 +1346,7 @@ export async function listTaskActivitySince(input: {
 			reviewMergeOutcome: runs.reviewMergeOutcome,
 			lastActivityAt: activity.lastActivityAt,
 			liveRunCount: activity.liveRunCount,
+			mergedRunCount: activity.mergedRunCount,
 		})
 		.from(runs)
 		.innerJoin(

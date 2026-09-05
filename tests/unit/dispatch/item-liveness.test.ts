@@ -37,6 +37,7 @@ function makeActivity(overrides: Partial<TaskActivityRow> = {}): TaskActivityRow
 		reviewMergeOutcome: null,
 		lastActivityAt: LONG_AGO,
 		liveRunCount: 0,
+		mergedRunCount: 0,
 		...overrides,
 	};
 }
@@ -69,6 +70,17 @@ function makeDismissal(overrides: Partial<ItemLivenessDismissal> = {}): ItemLive
 		lastActivityAt: LONG_AGO,
 		...overrides,
 	};
+}
+
+/** Classify one unit folded from several activity rows, with no active dispatch. */
+function stateOfUnit(rows: Partial<TaskActivityRow>[], policy: ItemLivenessPolicy = NO_AUTOMATION) {
+	const units = foldLivenessUnits(
+		rows.map((row) => makeActivity(row)),
+		[],
+		[],
+	);
+	expect(units).toHaveLength(1);
+	return classifyItemLiveness(units[0], policy, NOW);
 }
 
 describe('liveness unit identity', () => {
@@ -155,7 +167,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 2 — Implementation handed off to a pull request', () => {
+	describe('rule 3 — Implementation handed off to a pull request', () => {
 		it('is handed-off once the run recorded produced_pr_url', () => {
 			const state = stateOf({
 				phase: 'implementation',
@@ -170,13 +182,89 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	it('rule 3 — is merged once merge automation recorded it', () => {
-		expect(stateOf({ phase: 'review', status: 'completed', reviewMergeOutcome: 'merged' })).toBe(
-			'merged',
-		);
+	describe('rule 4 — a merge is terminal for the whole unit', () => {
+		/** The Review run that recorded the merge, older than everything below it. */
+		const mergedReview = {
+			taskId: '92',
+			phase: 'review',
+			status: 'completed',
+			prNumber: '92',
+			runId: 'run-review',
+			reviewVerdict: 'approve',
+			reviewMergeOutcome: 'merged',
+			mergedRunCount: 1,
+			lastActivityAt: new Date(NOW.getTime() - 5 * ITEM_STALL_AFTER_MS),
+		} as const;
+
+		it('is merged once merge automation recorded it', () => {
+			expect(
+				stateOf({
+					phase: 'review',
+					status: 'completed',
+					reviewMergeOutcome: 'merged',
+					mergedRunCount: 1,
+				}),
+			).toBe('merged');
+		});
+
+		// PR #733's ordering (issue #879): the merge is on the Review row, and a
+		// later Respond-to-CI run on `<pr>-ci` folds in as the unit's latest.
+		it('stays merged when a later respond-to-ci run becomes the latest row', () => {
+			const state = stateOfUnit([
+				mergedReview,
+				{
+					taskId: '92-ci',
+					phase: 'respond-to-ci',
+					status: 'completed',
+					prNumber: '92',
+					runId: 'run-ci',
+					lastActivityAt: new Date(NOW.getTime() - 3 * ITEM_STALL_AFTER_MS),
+				},
+			]);
+			expect(state).toBe('merged');
+		});
+
+		// PR #768's ordering (issue #879): the later row is a `failed` Review
+		// sharing the merged Review's own task id.
+		it('stays merged when a later failed review becomes the latest row', () => {
+			const state = stateOfUnit([
+				mergedReview,
+				{
+					taskId: '92',
+					phase: 'review',
+					status: 'failed',
+					prNumber: '92',
+					runId: 'run-review-failed',
+					lastActivityAt: new Date(NOW.getTime() - 3 * ITEM_STALL_AFTER_MS),
+				},
+			]);
+			expect(state).toBe('merged');
+		});
+
+		// The aggregate counts `merged` alone: a terminal refusal is not a merge.
+		it('does not sweep up a non-merged outcome recorded on an earlier row', () => {
+			const blocked = {
+				...mergedReview,
+				reviewVerdict: 'request-changes',
+				reviewMergeOutcome: 'policy-blocked',
+				mergedRunCount: 0,
+			};
+			const state = stateOfUnit([
+				blocked,
+				{
+					taskId: '92-ci',
+					phase: 'respond-to-ci',
+					status: 'completed',
+					prNumber: '92',
+					runId: 'run-ci',
+					lastActivityAt: new Date(NOW.getTime() - 3 * ITEM_STALL_AFTER_MS),
+				},
+			]);
+			expect(state).toBe('stalled');
+		});
 	});
 
-	it('rule 4 — is awaiting-human at the review-cap stop', () => {
+	it('rule 5 — is awaiting-human at the review-cap stop', () => {
 		const state = stateOf({
 			phase: 'review',
 			status: 'completed',
@@ -186,7 +274,7 @@ describe('classifyItemLiveness', () => {
 		expect(state).toBe('awaiting-human');
 	});
 
-	describe('rule 5 — a plan awaiting a greenlight', () => {
+	describe('rule 6 — a plan awaiting a greenlight', () => {
 		it('is awaiting-human on a project that does not auto-advance', () => {
 			expect(stateOf({ phase: 'planning', status: 'completed' })).toBe('awaiting-human');
 		});
@@ -203,7 +291,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 6 — an approval whose merge is accounted for', () => {
+	describe('rule 7 — an approval whose merge is accounted for', () => {
 		const approved = { phase: 'review', status: 'completed', reviewVerdict: 'approve' } as const;
 
 		it('is awaiting-human when merge was never automated', () => {
@@ -228,7 +316,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	describe('rule 7 — the grace window', () => {
+	describe('rule 8 — the grace window', () => {
 		it('is settling one millisecond inside the window', () => {
 			const lastActivityAt = new Date(NOW.getTime() - ITEM_STALL_AFTER_MS + 1);
 			expect(stateOf({ lastActivityAt })).toBe('settling');
@@ -240,7 +328,7 @@ describe('classifyItemLiveness', () => {
 		});
 	});
 
-	it('rule 8 — a deferred run with no active dispatch falls through to stalled', () => {
+	it('rule 9 — a deferred run with no active dispatch falls through to stalled', () => {
 		expect(stateOf({ status: 'deferred' })).toBe('stalled');
 	});
 });
@@ -401,6 +489,66 @@ describe('toStalledItems', () => {
 			lastActivityAt: newer.lastActivityAt.toISOString(),
 			stalledForMs: NOW.getTime() - newer.lastActivityAt.getTime(),
 		});
+	});
+
+	it('does not report a merged pull request whatever lands on it next', () => {
+		// The merge, on a Review run older than both later rows below (issue #879).
+		const mergedReview = (taskId: string, runId: string) =>
+			makeActivity({
+				taskId,
+				phase: 'review',
+				status: 'completed',
+				prNumber: taskId,
+				runId,
+				reviewVerdict: 'approve',
+				reviewMergeOutcome: 'merged',
+				mergedRunCount: 1,
+				lastActivityAt: new Date(NOW.getTime() - 5 * ITEM_STALL_AFTER_MS),
+			});
+		// PR #733: a later respond-to-ci on the unit's `-ci` task id.
+		const laterRespondToCi = makeActivity({
+			taskId: '92-ci',
+			phase: 'respond-to-ci',
+			status: 'completed',
+			prNumber: '92',
+			runId: 'run-733-ci',
+			lastActivityAt: new Date(NOW.getTime() - 3 * ITEM_STALL_AFTER_MS),
+		});
+		// PR #768: a later failed review sharing the merged review's task id.
+		const laterFailedReview = makeActivity({
+			taskId: '93',
+			phase: 'review',
+			status: 'failed',
+			prNumber: '93',
+			runId: 'run-768-failed',
+			lastActivityAt: new Date(NOW.getTime() - 3 * ITEM_STALL_AFTER_MS),
+		});
+		// A genuinely stalled unit, so the assertion is not vacuously empty.
+		const stalled = makeActivity({
+			taskId: '98',
+			phase: 'review',
+			status: 'completed',
+			prNumber: '98',
+			runId: 'run-quiet',
+			reviewVerdict: 'request-changes',
+			lastActivityAt: new Date(NOW.getTime() - 4 * ITEM_STALL_AFTER_MS),
+		});
+
+		const items = toStalledItems(
+			[
+				mergedReview('92', 'run-733'),
+				laterRespondToCi,
+				mergedReview('93', 'run-768'),
+				laterFailedReview,
+				stalled,
+			],
+			[],
+			{ p1: NO_AUTOMATION },
+			[],
+			NOW,
+		);
+
+		expect(items.map((item) => item.reference)).toEqual(['98']);
 	});
 
 	it('sums live runs across a folded unit, so one running phase keeps it active', () => {
