@@ -6,6 +6,7 @@ import {
 	bitbucketGitBasicCredential,
 	bitbucketRequest,
 	getBitbucketBranchHead,
+	getBitbucketRepositoryDefaultBranch,
 	getBitbucketUserForCredential,
 	getScopedBitbucketUserEmail,
 	getScopedCredential,
@@ -314,6 +315,40 @@ describe('bitbucket client', () => {
 		it('returns null for an absent credential without calling the API', async () => {
 			await expect(getBitbucketUserForCredential(null)).resolves.toBeNull();
 			expect(fetchMock).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #884: the pre-project read the New Project dialog pre-fills its Base Branch
+	// input from. The credential comes in as an argument and is scoped here, because
+	// there is no project to resolve one from yet.
+	describe('getBitbucketRepositoryDefaultBranch', () => {
+		it("returns the repository's main branch", async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ mainbranch: { name: 'develop' } }));
+
+			await expect(getBitbucketRepositoryDefaultBranch('team/swarm', 'token-abc')).resolves.toBe(
+				'develop',
+			);
+			expect(fetchMock.mock.calls[0]?.[0]).toBe(`${BITBUCKET_API_BASE}/repositories/team/swarm`);
+			expect(headersOf(fetchMock).authorization).toBe('Bearer token-abc');
+		});
+
+		it('returns null when Bitbucket names no main branch', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ slug: 'swarm' }));
+
+			await expect(
+				getBitbucketRepositoryDefaultBranch('team/swarm', 'token-abc'),
+			).resolves.toBeNull();
+		});
+
+		// Unlike `getBitbucketBranchHead`, a rejected read is an ordinary answer here: the
+		// dialog's degraded outcome is to keep the branch already in the field and say so,
+		// so an absent repository must not fail project creation.
+		it('returns null — never throws — when the read is rejected', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ error: { message: 'Not Found' } }, 404));
+
+			await expect(
+				getBitbucketRepositoryDefaultBranch('team/missing', 'token-abc'),
+			).resolves.toBeNull();
 		});
 	});
 

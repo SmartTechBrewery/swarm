@@ -4,6 +4,7 @@ import {
 	GITLAB_API_BASE,
 	GitLabApiError,
 	getGitLabBranchHead,
+	getGitLabRepositoryDefaultBranch,
 	getGitLabUserForToken,
 	getScopedToken,
 	gitlabRequest,
@@ -344,6 +345,40 @@ describe('gitlab client', () => {
 		it('returns null for an absent token without calling the API', async () => {
 			await expect(getGitLabUserForToken(null)).resolves.toBeNull();
 			expect(fetchMock).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #884: the pre-project read the New Project dialog pre-fills its Base Branch
+	// input from. The token comes in as an argument and is scoped here, because there is
+	// no project to resolve one from yet.
+	describe('getGitLabRepositoryDefaultBranch', () => {
+		it("returns the project's default branch", async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ id: 1, default_branch: 'develop' }));
+
+			await expect(getGitLabRepositoryDefaultBranch('team/swarm', 'token-abc')).resolves.toBe(
+				'develop',
+			);
+			expect(fetchMock.mock.calls[0]?.[0]).toBe(
+				`${GITLAB_API_BASE}/projects/${encodeURIComponent('team/swarm')}`,
+			);
+			expect(headersOf(fetchMock)['private-token']).toBe('token-abc');
+		});
+
+		it('returns null when GitLab names no default branch', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ id: 1 }));
+
+			await expect(getGitLabRepositoryDefaultBranch('team/swarm', 'token-abc')).resolves.toBeNull();
+		});
+
+		// Unlike `getGitLabBranchHead`, a rejected read is an ordinary answer here: the
+		// dialog's degraded outcome is to keep the branch already in the field and say so,
+		// so an absent project must not fail project creation.
+		it('returns null — never throws — when the read is rejected', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ message: '404 Project Not Found' }, 404));
+
+			await expect(
+				getGitLabRepositoryDefaultBranch('team/missing', 'token-abc'),
+			).resolves.toBeNull();
 		});
 	});
 });

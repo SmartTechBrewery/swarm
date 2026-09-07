@@ -15,6 +15,7 @@ const pullsGet = vi.fn();
 const pullsMerge = vi.fn();
 const listPullRequestsAssociatedWithCommit = vi.fn();
 const reposGetBranch = vi.fn();
+const reposGet = vi.fn();
 const reposGetCommit = vi.fn();
 const compareCommitsWithBasehead = vi.fn();
 const paginate = vi.fn();
@@ -28,6 +29,7 @@ vi.mock('@octokit/rest', () => ({
 		pulls = { get: pullsGet, merge: pullsMerge };
 		repos = {
 			listPullRequestsAssociatedWithCommit,
+			get: reposGet,
 			getBranch: reposGetBranch,
 			getCommit: reposGetCommit,
 			compareCommitsWithBasehead,
@@ -45,6 +47,7 @@ import {
 	getBranchHead,
 	getCheckSuiteStatus,
 	getCommitProvenance,
+	getGitHubRepositoryDefaultBranch,
 	getGitHubUserForToken,
 	getPullRequest,
 	getPullRequestMergeState,
@@ -64,6 +67,7 @@ describe('github client', () => {
 		listJobsForWorkflowRun.mockReset();
 		pullsGet.mockReset();
 		reposGetBranch.mockReset();
+		reposGet.mockReset();
 		reposGetCommit.mockReset();
 		compareCommitsWithBasehead.mockReset();
 		pullsMerge.mockReset();
@@ -119,6 +123,38 @@ describe('github client', () => {
 		it('returns null (not throw) when the lookup fails', async () => {
 			getAuthenticated.mockRejectedValue(new Error('401'));
 			expect(await getGitHubUserForToken('bad-tok')).toBeNull();
+		});
+	});
+
+	// Issue #884: the pre-project read the New Project dialog pre-fills its Base Branch
+	// input from. Authenticates from its argument rather than the async scope, because
+	// there is no project to resolve a scoped client from yet.
+	describe('getGitHubRepositoryDefaultBranch', () => {
+		it("returns the repository's default branch", async () => {
+			reposGet.mockResolvedValue({ data: { default_branch: 'develop' } });
+
+			await expect(getGitHubRepositoryDefaultBranch('jkwiecien/swarm', 'tok')).resolves.toBe(
+				'develop',
+			);
+			expect(reposGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm' });
+			expect(octokitInstances[0].auth).toBe('tok');
+		});
+
+		it('returns null when GitHub names no default branch', async () => {
+			reposGet.mockResolvedValue({ data: {} });
+
+			await expect(getGitHubRepositoryDefaultBranch('jkwiecien/swarm', 'tok')).resolves.toBeNull();
+		});
+
+		// Unlike `getBranchHead`, a rejected read is an ordinary answer here: the dialog's
+		// degraded outcome is to keep the branch already in the field and say so, so an
+		// absent repository must not fail project creation.
+		it('returns null (not throw) when the read is rejected', async () => {
+			reposGet.mockRejectedValue(Object.assign(new Error('Not Found'), { status: 404 }));
+
+			await expect(
+				getGitHubRepositoryDefaultBranch('jkwiecien/missing', 'tok'),
+			).resolves.toBeNull();
 		});
 	});
 

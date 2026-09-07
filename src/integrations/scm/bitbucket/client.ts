@@ -257,6 +257,42 @@ export async function getBitbucketUserForCredential(
 	}
 }
 
+/**
+ * The branch Bitbucket reports as `repo`'s main branch, or `null` when it cannot be
+ * read (issue #884) — GitHub's `getGitHubRepositoryDefaultBranch` twin. `repo` is
+ * the `workspace/repo_slug` pair Bitbucket reads a project's `owner/repo` as, split
+ * here because the credential-scoped call is made from the argument rather than from
+ * a project this caller does not have.
+ *
+ * Failures flatten to `null` rather than throwing, unlike {@link
+ * getBitbucketBranchHead}: the caller's degraded outcome is "keep the branch already
+ * in the field and say the read failed", so an absent repository, a credential that
+ * cannot see it and an unreachable API are all the same ordinary answer. As with
+ * {@link getBitbucketUserForCredential}, `BitbucketApiError` is built from
+ * method/path/status/response body only, so the log cannot leak the credential.
+ */
+export async function getBitbucketRepositoryDefaultBranch(
+	repo: string,
+	credential: string,
+): Promise<string | null> {
+	const [workspace, slug] = repo.split('/');
+	try {
+		const repository = await withBitbucketCredential(credential, () =>
+			bitbucketRequest<{ mainbranch?: { name?: string } }>(
+				'GET',
+				`/repositories/${encodeURIComponent(workspace)}/${encodeURIComponent(slug)}`,
+			),
+		);
+		return repository.mainbranch?.name ?? null;
+	} catch (err) {
+		logger.warn('Failed to read the Bitbucket default branch for a repository', {
+			repo,
+			error: String(err),
+		});
+		return null;
+	}
+}
+
 /** One address from `GET /2.0/user/emails`. */
 interface BitbucketUserEmail {
 	email?: string;
