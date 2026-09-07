@@ -462,6 +462,37 @@ export async function getGitHubUserForToken(token: string | null): Promise<strin
 }
 
 /**
+ * The branch GitHub reports as `repo`'s default, or `null` when it cannot be read
+ * (issue #884). `repo` is an `owner/repo` slug and `token` authenticates the read
+ * directly, so this is callable *before* a project exists to scope a client from —
+ * the New Project dialog's pre-fill is its only caller.
+ *
+ * Failures flatten to `null` rather than throwing, unlike `getBranchHead` above:
+ * the caller's degraded outcome is "keep the branch already in the field and say
+ * the read failed", so an absent repository, a token that cannot see it and an
+ * unreachable API are all the same ordinary answer. As with
+ * {@link getGitHubUserForToken}, the Octokit error is built from
+ * method/path/status/body only, so the log cannot leak the token.
+ */
+export async function getGitHubRepositoryDefaultBranch(
+	repo: string,
+	token: string,
+): Promise<string | null> {
+	const [owner, repoName] = repo.split('/');
+	try {
+		const client = new Octokit({ auth: token });
+		const { data } = await client.repos.get({ owner, repo: repoName });
+		return data.default_branch ?? null;
+	} catch (err) {
+		logger.warn('Failed to read the GitHub default branch for a repository', {
+			repo,
+			error: String(err),
+		});
+		return null;
+	}
+}
+
+/**
  * Post a top-level comment on an issue *or* a pull request — GitHub models both
  * as issues, so `issues.createComment` works for a PR number too. Returns the
  * created comment's id. Runs against whatever token is in scope (wrap in

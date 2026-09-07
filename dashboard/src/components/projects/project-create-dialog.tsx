@@ -1,12 +1,15 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Info, RefreshCw } from 'lucide-react';
 import type React from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { DEFAULT_SCM_PROVIDER_ID, SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
 import { parseRepoUrl } from '@/lib/parse-repo-url.js';
 import { DEFAULT_BASE_BRANCH } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
+
+/** `owner/repo` — the shape both the Repo input's own `pattern` and `scm.defaultBranch` require. */
+const REPO_SLUG = /^[^/]+\/[^/]+$/;
 
 interface ProjectCreateDialogProps {
 	open: boolean;
@@ -23,7 +26,17 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	const [scm, setScm] = useState<ScmProviderId>(DEFAULT_SCM_PROVIDER_ID);
 	const [repoUrl, setRepoUrl] = useState('');
 	const [urlError, setUrlError] = useState('');
+	const [baseBranchNote, setBaseBranchNote] = useState('');
+	const [baseBranchDetectionFailed, setBaseBranchDetectionFailed] = useState(false);
 	const [showPathHelp, setShowPathHelp] = useState(false);
+
+	/**
+	 * Whether the operator has typed in the Base Branch field. A ref rather than state
+	 * because nothing renders it and {@link detectBaseBranch} reads it *after* an await:
+	 * a detection that started before the first keystroke must still not overwrite what
+	 * was typed while it was in flight (issue #884).
+	 */
+	const baseBranchTouched = useRef(false);
 
 	// Close the path-help popover on Escape without also dismissing the whole
 	// Modal. The Modal registers a bubble-phase window keydown listener that
@@ -58,6 +71,9 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			setName('');
 			setRepo('');
 			setBaseBranch(DEFAULT_BASE_BRANCH);
+			baseBranchTouched.current = false;
+			setBaseBranchNote('');
+			setBaseBranchDetectionFailed(false);
 			setRepoRoot('');
 			setScm(DEFAULT_SCM_PROVIDER_ID);
 			setRepoUrl('');
@@ -84,8 +100,48 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		mutation.reset();
 		setRepoUrl('');
 		setUrlError('');
+		setBaseBranchNote('');
+		setBaseBranchDetectionFailed(false);
 		setShowPathHelp(false);
 		onOpenChange(false);
+	};
+
+	/**
+	 * Pre-fill Base Branch with the repository's *real* default branch (issue #884), so
+	 * a project created for a repository whose default is `develop` operates on
+	 * `develop` from the start instead of on the `main` this field starts with.
+	 *
+	 * Never blocks or fails creation: a repository the installation's credential cannot
+	 * read — and a transport failure, which takes the same path as `{ branch: null }` —
+	 * leaves the field's current value alone and says so, because the operator can fix
+	 * a wrong branch and cannot fix a refused dialog.
+	 *
+	 * `repoSlug` and `provider` are arguments rather than state reads: `handleAutofill`
+	 * calls this in the same tick it sets `repo`, before that state has re-rendered.
+	 */
+	const detectBaseBranch = async (repoSlug: string, provider: ScmProviderId) => {
+		if (!REPO_SLUG.test(repoSlug) || baseBranchTouched.current) return;
+		setBaseBranchDetectionFailed(false);
+		setBaseBranchNote(`Reading ${repoSlug}'s default branch…`);
+		try {
+			const { branch } = await trpcClient.scm.defaultBranch.query({
+				scm: provider,
+				repo: repoSlug,
+			});
+			if (baseBranchTouched.current) return;
+			if (branch) {
+				setBaseBranch(branch);
+				setBaseBranchNote(`Detected ${repoSlug}'s default branch.`);
+				return;
+			}
+		} catch {
+			// Same degraded outcome as an answer naming no branch — see above.
+		}
+		if (baseBranchTouched.current) return;
+		setBaseBranchDetectionFailed(true);
+		setBaseBranchNote(
+			`Couldn't read ${repoSlug}'s default branch — using ${baseBranch}. Change it if that's wrong.`,
+		);
 	};
 
 	const handleAutofill = () => {
@@ -99,6 +155,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			setName(parsed.name);
 			setRepo(parsed.repo);
 			setUrlError('');
+			void detectBaseBranch(parsed.repo, scm);
 		} else {
 			setUrlError('Invalid repository URL format.');
 		}
@@ -173,6 +230,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							id="project-repo"
 							value={repo}
 							onChange={(e) => setRepo(e.target.value)}
+							onBlur={() => void detectBaseBranch(repo, scm)}
 							required
 							pattern="[^/]+/[^/]+"
 							placeholder="owner/repo"
@@ -190,7 +248,10 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							type="text"
 							id="project-base-branch"
 							value={baseBranch}
-							onChange={(e) => setBaseBranch(e.target.value)}
+							onChange={(e) => {
+								baseBranchTouched.current = true;
+								setBaseBranch(e.target.value);
+							}}
 							required
 							placeholder="main"
 							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
@@ -199,6 +260,13 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							Task branches are cut from this branch and pull requests target it. Editable later on
 							the project's Source Control tab.
 						</p>
+						{baseBranchNote && (
+							<p
+								className={`mt-1 text-xs ${baseBranchDetectionFailed ? 'text-amber-300/80' : 'text-zinc-400'}`}
+							>
+								{baseBranchNote}
+							</p>
+						)}
 					</div>
 					<div>
 						<label htmlFor="project-scm" className="block text-xs font-medium text-zinc-400 mb-1">
@@ -207,7 +275,13 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 						<select
 							id="project-scm"
 							value={scm}
-							onChange={(e) => setScm(e.target.value as ScmProviderId)}
+							onChange={(e) => {
+								// A repo slug means different things to different providers, so a
+								// provider change invalidates a detection made under the old one.
+								const next = e.target.value as ScmProviderId;
+								setScm(next);
+								void detectBaseBranch(repo, next);
+							}}
 							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
 						>
 							{SCM_PROVIDERS.map((provider) => (

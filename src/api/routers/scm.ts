@@ -1,10 +1,21 @@
 import { z } from 'zod';
 
+import { resolveInstanceScmCredential } from '../../db/repositories/instanceCredentialsRepository.js';
+import { listInstanceDefaultScmRoles } from '../../integrations/scm/registry.js';
+import { ScmProviderIdSchema } from '../../scm/events.js';
+import { resolveScmDefaultBranch } from '../scm-default-branch.js';
 import { verifyScmCredentialSecret } from '../scm-verification.js';
 import { authedProcedure, router } from '../trpc.js';
 
 /**
- * SCM verification API — lets the dashboard confirm a pasted credential resolves
+ * The **pre-project** SCM API — the reads the dashboard makes before a project
+ * exists to resolve an `SCMProvider` from, each dispatching over a provider *id*
+ * with one branch per provider instead (ai/RULES.md §2 names this as the deliberate
+ * exception). Two of them since issue #884: credential verification
+ * (`../scm-verification.ts`) and the repository default-branch read
+ * (`../scm-default-branch.ts`).
+ *
+ * SCM verification lets the dashboard confirm a pasted credential resolves
  * to a real identity before it is persisted via `credentials.set` (#79); these
  * procedures store nothing themselves. Mirrors Cascade's
  * `integrationsDiscovery.verifyGithubToken`, but returns a `{ valid }` result
@@ -54,4 +65,53 @@ export const scmRouter = router({
 	verifyGitLabToken: authedProcedure
 		.input(z.object({ token: z.string().min(1) }))
 		.mutation(async ({ input }) => await verifyScmCredentialSecret('gitlab', input.token)),
+
+	/**
+	 * The branch a repository reports as its default, so the New Project dialog can
+	 * pre-fill its Base Branch input with the repository's *real* one instead of a
+	 * plain `main` (issue #884). A **query**: it reads and stores nothing.
+	 *
+	 * Authenticated with the **installation's default SCM credential** for the
+	 * selected provider — the same secret `projects.create` already requires and then
+	 * seeds into the new project's own row (`requireInstanceScmDefaults`,
+	 * `./projects.ts`, issue #778). At creation time there is no project credential
+	 * yet, and this is the one credential that is guaranteed to exist for a provider a
+	 * project can be created on, so no new configuration, env var or role is
+	 * introduced. Which role is resolved comes off the manifests rather than a
+	 * hardcoded `'reviewer'`, so a fourth provider needs no edit here.
+	 *
+	 * `{ branch: null }` covers every way the read can fail to answer — no instance
+	 * credential recorded, an unreachable provider, a repository the credential cannot
+	 * see, a provider naming no default branch — because the dialog's response to all
+	 * of them is identical: keep the value already in the field and say the read
+	 * failed. Nothing here throws for a repository it cannot read, since creation must
+	 * never fail on a pre-fill.
+	 *
+	 * **Accepted trade-off:** any authenticated user may create a project, so any
+	 * authenticated user may ask this for an arbitrary `owner/repo`'s default branch as
+	 * read by the installation credential. That is the same capability creating a
+	 * project already grants — it seeds that credential into a project the caller
+	 * administers — and the answer is a branch name, not repository content, so
+	 * `authedProcedure` matches the `verify…` gating above rather than adding an
+	 * `instanceAdmin` check the create path itself does not have.
+	 */
+	defaultBranch: authedProcedure
+		.input(
+			z.object({
+				scm: ScmProviderIdSchema,
+				repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
+			}),
+		)
+		.query(async ({ input }): Promise<{ branch: string | null }> => {
+			// The first role the selected provider declares eligible for an instance
+			// default — every provider declares at most one (`reviewer`), so "first" is
+			// "the one" today without this having to assume it.
+			const eligible = listInstanceDefaultScmRoles().find((role) => role.providerId === input.scm);
+			if (!eligible) return { branch: null };
+
+			const secret = await resolveInstanceScmCredential(input.scm, eligible.role);
+			if (secret === null) return { branch: null };
+
+			return { branch: await resolveScmDefaultBranch(input.scm, input.repo, secret) };
+		}),
 });

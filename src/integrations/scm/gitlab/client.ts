@@ -272,6 +272,38 @@ export async function getGitLabUserForToken(token: string | null): Promise<strin
 	}
 }
 
+/**
+ * The branch GitLab reports as `repo`'s default, or `null` when it cannot be read
+ * (issue #884) — the GitLab twin of `getGitHubRepositoryDefaultBranch` and
+ * `getBitbucketRepositoryDefaultBranch`. `repo` is the `namespace/project` path
+ * {@link projectPath} encodes whole, and `token` authenticates the read directly, so
+ * this is callable *before* a project exists to scope one from.
+ *
+ * Failures flatten to `null` rather than throwing, unlike {@link
+ * getGitLabBranchHead}: the caller's degraded outcome is "keep the branch already in
+ * the field and say the read failed", so an absent project, a token that cannot see
+ * it and an unreachable API are all the same ordinary answer. As with {@link
+ * getGitLabUserForToken}, `GitLabApiError` is built from method/path/status/response
+ * body only, so the log cannot leak the token.
+ */
+export async function getGitLabRepositoryDefaultBranch(
+	repo: string,
+	token: string,
+): Promise<string | null> {
+	try {
+		const project = await withGitLabToken(token, () =>
+			gitlabRequest<{ default_branch?: string }>('GET', projectPath(repo)),
+		);
+		return project.default_branch ?? null;
+	} catch (err) {
+		logger.warn('Failed to read the GitLab default branch for a repository', {
+			repo,
+			error: String(err),
+		});
+		return null;
+	}
+}
+
 /** The `GET /user` fields a delivery's commit identity is built from. */
 export interface GitLabScopedUser {
 	username: string | null;
