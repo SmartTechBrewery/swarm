@@ -60,7 +60,7 @@ export function buildResolveConflictsPrompt(
 			input.headSha +
 			'; if not, stop and fail without pushing.',
 		`Merge origin/${input.baseBranch} into the checked-out PR branch with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent.`,
-		...MIGRATION_CONFLICT_GUIDANCE,
+		...migrationConflictGuidance(input.baseBranch),
 		...INDEX_RESOLUTION_GUIDANCE,
 		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge staged in the working tree for SWARM.',
 		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", body (the concise result comment), and verification [{command,outcome:"passed"}].`,
@@ -80,14 +80,16 @@ export function buildResolveConflictsPrompt(
  * silently skips the entry instead of erroring (confirmed live, issue #503/#508:
  * three merges into one long-lived branch left the journal naming a `.sql`
  * file that was never committed, and gave the branch's own migration a `when`
- * earlier than the one main had already moved ahead to). SWARM still runs
- * `validateMigrationJournal` (`src/db/migration-journal.ts`) as a
+ * earlier than the one the base branch had already moved ahead to). SWARM still
+ * runs `validateMigrationJournal` (`src/db/migration-journal.ts`) as a
  * deterministic backstop after this — this paragraph is to get it right on
  * the first pass instead of spending that one repair chance.
  */
-const MIGRATION_CONFLICT_GUIDANCE = [
-	"If the merge conflicts inside `src/db/migrations/` (a numbered `.sql` file, or `src/db/migrations/meta/_journal.json`/its snapshot files), do not hand-resolve the conflict markers in those generated files. Instead: finish resolving every *other* conflict first and commit nothing yet; keep `main`'s migrations exactly as `main` has them (do not renumber or edit any migration `main` already has); then run `npx drizzle-kit generate` from the repo root, which reads the merged `src/db/schema/*.ts` and this branch's already-merged schema changes to generate one fresh, correctly-numbered migration (and its matching journal entry and snapshot) for whatever this branch's schema changes still need beyond what `main` already has. If this branch's own migration file(s) are now superseded by the freshly generated one, remove them (and their now-orphaned snapshot/journal entry) rather than keeping both. Verify afterward that `src/db/migrations/meta/_journal.json` has exactly one entry per `.sql` file in that folder and that every entry's `when` is strictly greater than the previous one's.",
-];
+function migrationConflictGuidance(baseBranch: string): string[] {
+	return [
+		`If the merge conflicts inside \`src/db/migrations/\` (a numbered \`.sql\` file, or \`src/db/migrations/meta/_journal.json\`/its snapshot files), do not hand-resolve the conflict markers in those generated files. Instead: finish resolving every *other* conflict first and commit nothing yet; keep \`${baseBranch}\`'s migrations exactly as \`${baseBranch}\` has them (do not renumber or edit any migration \`${baseBranch}\` already has); then run \`npx drizzle-kit generate\` from the repo root, which reads the merged \`src/db/schema/*.ts\` and this branch's already-merged schema changes to generate one fresh, correctly-numbered migration (and its matching journal entry and snapshot) for whatever this branch's schema changes still need beyond what \`${baseBranch}\` already has. If this branch's own migration file(s) are now superseded by the freshly generated one, remove them (and their now-orphaned snapshot/journal entry) rather than keeping both. Verify afterward that \`src/db/migrations/meta/_journal.json\` has exactly one entry per \`.sql\` file in that folder and that every entry's \`when\` is strictly greater than the previous one's.`,
+	];
+}
 
 /**
  * Standing guidance for the gap between the two definitions of "resolved"
@@ -121,7 +123,10 @@ const INDEX_RESOLUTION_GUIDANCE = [
  * phase guard itself, and names the hand-off file rather than saying "the hand-off
  * file" to an agent that may never have written one.
  */
-export function buildMigrationJournalRepairPrompt(issues: readonly string[]): string {
+export function buildMigrationJournalRepairPrompt(
+	issues: readonly string[],
+	baseBranch: string,
+): string {
 	return [
 		...pipelinePhaseGuard(),
 		'',
@@ -130,7 +135,7 @@ export function buildMigrationJournalRepairPrompt(issues: readonly string[]): st
 		'The validator reported:',
 		issues.map((issue) => `- ${issue}`).join('\n'),
 		'',
-		"Fix only `src/db/migrations/` (the numbered `.sql` files and `meta/_journal.json`/its snapshot files) so every reported problem is gone. Do not touch any other file — every other conflict in the merge is already correctly resolved. Prefer `npx drizzle-kit generate` over hand-editing the journal or a snapshot: keep `main`'s existing migrations exactly as `main` has them, and let `drizzle-kit generate` produce one fresh, correctly-numbered migration (with its own journal entry and snapshot) for whatever schema change this branch still needs beyond `main`. Remove this branch's now-superseded migration file(s) and their orphaned journal entries if `drizzle-kit generate` replaces them.",
+		`Fix only \`src/db/migrations/\` (the numbered \`.sql\` files and \`meta/_journal.json\`/its snapshot files) so every reported problem is gone. Do not touch any other file — every other conflict in the merge is already correctly resolved. Prefer \`npx drizzle-kit generate\` over hand-editing the journal or a snapshot: keep \`${baseBranch}\`'s existing migrations exactly as \`${baseBranch}\` has them, and let \`drizzle-kit generate\` produce one fresh, correctly-numbered migration (with its own journal entry and snapshot) for whatever schema change this branch still needs beyond \`${baseBranch}\`. Remove this branch's now-superseded migration file(s) and their orphaned journal entries if \`drizzle-kit generate\` replaces them.`,
 		'',
 		`Do not commit, push, comment, or perform any GitHub mutation — leave the corrected tree in the working directory for SWARM, and rewrite the hand-off "${RESOLVE_CONFLICTS_OUTCOME_FILENAME}" (already in this worktree) only if the fix changes its \`body\` or \`verification\`.`,
 	].join('\n');
