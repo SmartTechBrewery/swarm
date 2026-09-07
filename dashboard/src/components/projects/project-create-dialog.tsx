@@ -4,6 +4,7 @@ import type React from 'react';
 import { useEffect, useState } from 'react';
 import { DEFAULT_SCM_PROVIDER_ID, SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
 import { parseRepoUrl } from '@/lib/parse-repo-url.js';
+import { DEFAULT_BASE_BRANCH } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
 
@@ -17,6 +18,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	const [id, setId] = useState('');
 	const [name, setName] = useState('');
 	const [repo, setRepo] = useState('');
+	const [baseBranch, setBaseBranch] = useState(DEFAULT_BASE_BRANCH);
 	const [repoRoot, setRepoRoot] = useState('');
 	const [scm, setScm] = useState<ScmProviderId>(DEFAULT_SCM_PROVIDER_ID);
 	const [repoUrl, setRepoUrl] = useState('');
@@ -44,7 +46,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		mutationFn: (newProject: {
 			id: string;
 			name: string;
-			repositories: Array<{ repo: string }>;
+			repositories: Array<{ repo: string; baseBranch: string }>;
 			repoRoot: string;
 			scm: ScmProviderId;
 		}) => trpcClient.projects.create.mutate(newProject),
@@ -55,6 +57,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			setId('');
 			setName('');
 			setRepo('');
+			setBaseBranch(DEFAULT_BASE_BRANCH);
 			setRepoRoot('');
 			setScm(DEFAULT_SCM_PROVIDER_ID);
 			setRepoUrl('');
@@ -68,9 +71,13 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		e.preventDefault();
 		// A new project starts on one repository; further ones are added afterwards on the
 		// Source Control tab's repository list (issues #684 phase 3, #729), so this stays
-		// single-entry rather than growing a second form. Its branch settings default per
-		// entry, so the dialog still asks for none.
-		mutation.mutate({ id, name, repositories: [{ repo }], repoRoot, scm });
+		// single-entry rather than growing a second form. Its base branch is submitted
+		// explicitly (issue #883): the create schema would otherwise fill in
+		// `PROJECT_DEFAULTS.baseBranch` unseen, so a repository whose default branch is not
+		// `main` was silently configured against a branch nobody chose. `branchPrefix` keeps
+		// taking that default — a task branch prefix is SWARM's own naming convention rather
+		// than a property of the repository, so nothing about it can be silently wrong.
+		mutation.mutate({ id, name, repositories: [{ repo, baseBranch }], repoRoot, scm });
 	};
 
 	const handleClose = () => {
@@ -171,6 +178,27 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							placeholder="owner/repo"
 							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
 						/>
+					</div>
+					<div>
+						<label
+							htmlFor="project-base-branch"
+							className="block text-xs font-medium text-zinc-400 mb-1"
+						>
+							Base Branch <span className="text-red-500">*</span>
+						</label>
+						<input
+							type="text"
+							id="project-base-branch"
+							value={baseBranch}
+							onChange={(e) => setBaseBranch(e.target.value)}
+							required
+							placeholder="main"
+							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
+						/>
+						<p className="mt-1 text-xs text-zinc-500">
+							Task branches are cut from this branch and pull requests target it. Editable later on
+							the project's Source Control tab.
+						</p>
 					</div>
 					<div>
 						<label htmlFor="project-scm" className="block text-xs font-medium text-zinc-400 mb-1">

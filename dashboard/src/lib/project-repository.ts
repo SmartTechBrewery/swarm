@@ -77,13 +77,26 @@ export interface RepositoryForm {
 }
 
 /**
+ * The base branch a repository the dashboard creates or adds starts on — the same value
+ * `PROJECT_DEFAULTS.baseBranch` (`src/config/schema.ts`) applies to an entry naming
+ * none, restated here for the reason {@link NEW_REPOSITORY} states. Exported because
+ * the New Project dialog now submits it explicitly (issue #883) instead of letting the
+ * create schema fill it in unseen, so the dialog and this screen cannot drift.
+ */
+export const DEFAULT_BASE_BRANCH = 'main';
+
+/**
  * What a row added here starts on — the same values `PROJECT_DEFAULTS`
  * (`src/config/schema.ts`) applies to an entry stating neither, so a repository added
  * on this screen and one added to `swarm.config.json` land identically. Spelled out
  * rather than imported, because that module's own imports reach the node-only agent-CLI
  * harness — the same reason `agent-targets.ts` restates `AGENT_CLIS`.
  */
-const NEW_REPOSITORY = { repo: '', baseBranch: 'main', branchPrefix: 'issue-' } as const;
+const NEW_REPOSITORY = {
+	repo: '',
+	baseBranch: DEFAULT_BASE_BRANCH,
+	branchPrefix: 'issue-',
+} as const;
 
 /** A row id no row in `rows` already uses, so keys stay unique across adds and removes. */
 function nextRowId(rows: RepositoryForm[]): string {
