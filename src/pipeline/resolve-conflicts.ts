@@ -104,6 +104,8 @@ interface GuardMigrationJournalOptions {
 	taskId: string;
 	prNumber: string;
 	headSha: string;
+	/** The run's real base branch, which the repair prompt tells the agent to leave alone. */
+	baseBranch: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	runAgent: typeof runAgentCli;
@@ -111,7 +113,7 @@ interface GuardMigrationJournalOptions {
 
 /**
  * Deterministic backstop behind {@link buildResolveConflictsPrompt}'s migration
- * guidance (see that prompt's `MIGRATION_CONFLICT_GUIDANCE` and this module's
+ * guidance (see that prompt's `migrationConflictGuidance` and this module's
  * header — issue #503/#508's own incident): validate the merge this call just
  * produced against drizzle's own migration-journal invariants, and — mirroring
  * `readReviewSubmission`/`repairReviewHandoff`'s one-repair-pass shape in
@@ -140,7 +142,7 @@ async function guardMigrationJournal(options: GuardMigrationJournalOptions): Pro
 			reasoning: options.reasoning,
 			resumeSessionId: options.resumeSessionId,
 			cwd: worktreePath,
-			args: [buildMigrationJournalRepairPrompt(issues)],
+			args: [buildMigrationJournalRepairPrompt(issues, options.baseBranch)],
 			maxOutputBytes: 1_000_000,
 			logContext: { taskId, phase: 'resolve-conflicts-migration-repair', prNumber, headSha },
 			timeoutMs: options.timeoutMs,
@@ -325,6 +327,7 @@ export async function runResolveConflictsPhase(
 				taskId,
 				prNumber,
 				headSha,
+				baseBranch,
 				timeoutMs,
 				signal,
 				runAgent,

@@ -22,7 +22,10 @@ vi.mock('@/pipeline/merge-resolution.js', () => ({
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
-import { runResolveConflictsPhase } from '@/pipeline/resolve-conflicts.js';
+import {
+	buildResolveConflictsPrompt,
+	runResolveConflictsPhase,
+} from '@/pipeline/resolve-conflicts.js';
 import {
 	assertRemoteHead,
 	commitPreparedTree,
@@ -195,6 +198,29 @@ describe('runResolveConflictsPhase — migration-journal gate (issue #503/#508)'
 		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
 	});
 
+	// The repair prompt tells the agent which side's migrations to leave alone, so on a
+	// project whose base branch is not `main` it has to name the real one (issue #885).
+	it("names the run's own base branch in the repair prompt", async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		await runResolveConflictsPhase({ ...deps, baseBranch: 'develop' });
+
+		const repairPrompt = deps.runAgent.mock.calls[1]?.[0]?.args?.[0];
+		expect(repairPrompt).toContain(
+			"keep `develop`'s existing migrations exactly as `develop` has them",
+		);
+		expect(repairPrompt).toContain('beyond `develop`');
+		expect(repairPrompt).not.toContain('`main`');
+	});
+
 	// The other half of the same rule (issue #865). `codex`/`agy` mint their own
 	// thread id, so SWARM's assigned one names a session harness never created and
 	// `codex exec resume <assigned>` would exit 1 without reaching the model — the
@@ -276,5 +302,25 @@ describe('runResolveConflictsPhase — migration-journal gate (issue #503/#508)'
 		for (const { deps } of runs) await runResolveConflictsPhase(deps);
 
 		expect(readDeliveryId(runs[1].worktreePath)).not.toBe(readDeliveryId(runs[0].worktreePath));
+	});
+});
+
+describe('buildResolveConflictsPrompt — migration guidance (issue #885)', () => {
+	// The phase already interpolates the run's base branch two paragraphs earlier, so the
+	// migration paragraph's literal `main` was wrong copy on any project based elsewhere.
+	it("names the run's own base branch instead of `main`", () => {
+		const prompt = buildResolveConflictsPrompt({
+			project: { repo: 'o/r' },
+			prNumber: '7',
+			prBranch: 'issue-7',
+			headSha: 'abc123',
+			baseBranch: 'develop',
+			baseSha: 'def456',
+		});
+
+		expect(prompt).toContain("keep `develop`'s migrations exactly as `develop` has them");
+		expect(prompt).toContain('do not renumber or edit any migration `develop` already has');
+		expect(prompt).toContain('beyond what `develop` already has');
+		expect(prompt).not.toContain('`main`');
 	});
 });
