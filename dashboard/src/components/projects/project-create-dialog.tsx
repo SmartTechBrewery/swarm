@@ -38,6 +38,25 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	 */
 	const baseBranchTouched = useRef(false);
 
+	/**
+	 * Which detection the Base Branch field and its note currently belong to. Detections
+	 * are independent requests that can complete out of order — a slow one for the repo
+	 * or provider that *was* selected must not overwrite the answer for the one that is
+	 * (issue #884) — so each start claims the next number and writes back only while it
+	 * still holds the claim.
+	 */
+	const activeDetection = useRef(0);
+
+	/**
+	 * Abandon whatever detection is in flight, along with the note describing it: its
+	 * answer is about a repository or provider that is no longer the selected one.
+	 */
+	const invalidateBaseBranchDetection = () => {
+		activeDetection.current += 1;
+		setBaseBranchNote('');
+		setBaseBranchDetectionFailed(false);
+	};
+
 	// Close the path-help popover on Escape without also dismissing the whole
 	// Modal. The Modal registers a bubble-phase window keydown listener that
 	// closes it on Escape (ui/modal.tsx); registering here in the capture phase
@@ -72,8 +91,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			setRepo('');
 			setBaseBranch(DEFAULT_BASE_BRANCH);
 			baseBranchTouched.current = false;
-			setBaseBranchNote('');
-			setBaseBranchDetectionFailed(false);
+			invalidateBaseBranchDetection();
 			setRepoRoot('');
 			setScm(DEFAULT_SCM_PROVIDER_ID);
 			setRepoUrl('');
@@ -100,8 +118,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		mutation.reset();
 		setRepoUrl('');
 		setUrlError('');
-		setBaseBranchNote('');
-		setBaseBranchDetectionFailed(false);
+		invalidateBaseBranchDetection();
 		setShowPathHelp(false);
 		onOpenChange(false);
 	};
@@ -120,15 +137,20 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	 * calls this in the same tick it sets `repo`, before that state has re-rendered.
 	 */
 	const detectBaseBranch = async (repoSlug: string, provider: ScmProviderId) => {
+		// Claimed before the guards below so a start that declines to read — an
+		// incomplete slug, or a field the operator has taken over — still abandons the
+		// detection it supersedes.
+		invalidateBaseBranchDetection();
+		const detection = activeDetection.current;
+		const superseded = () => activeDetection.current !== detection || baseBranchTouched.current;
 		if (!REPO_SLUG.test(repoSlug) || baseBranchTouched.current) return;
-		setBaseBranchDetectionFailed(false);
 		setBaseBranchNote(`Reading ${repoSlug}'s default branch…`);
 		try {
 			const { branch } = await trpcClient.scm.defaultBranch.query({
 				scm: provider,
 				repo: repoSlug,
 			});
-			if (baseBranchTouched.current) return;
+			if (superseded()) return;
 			if (branch) {
 				setBaseBranch(branch);
 				setBaseBranchNote(`Detected ${repoSlug}'s default branch.`);
@@ -137,7 +159,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		} catch {
 			// Same degraded outcome as an answer naming no branch — see above.
 		}
-		if (baseBranchTouched.current) return;
+		if (superseded()) return;
 		setBaseBranchDetectionFailed(true);
 		setBaseBranchNote(
 			`Couldn't read ${repoSlug}'s default branch — using ${baseBranch}. Change it if that's wrong.`,
@@ -229,7 +251,12 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							type="text"
 							id="project-repo"
 							value={repo}
-							onChange={(e) => setRepo(e.target.value)}
+							onChange={(e) => {
+								// Editing the slug abandons a detection for the previous one, which
+								// the next blur re-starts — nothing in flight describes this repo yet.
+								setRepo(e.target.value);
+								invalidateBaseBranchDetection();
+							}}
 							onBlur={() => void detectBaseBranch(repo, scm)}
 							required
 							pattern="[^/]+/[^/]+"

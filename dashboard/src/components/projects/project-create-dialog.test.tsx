@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -32,6 +32,18 @@ function renderDialog(ui: ReactElement) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
 }
+
+/** A branch answer the test resolves by hand, so two detections can complete out of order. */
+function deferredBranch() {
+	let resolve!: (answer: { branch: string | null }) => void;
+	const promise = new Promise<{ branch: string | null }>((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
+/** Let a just-resolved detection's `await` continuation run (or be dropped). */
+const flush = () => act(async () => {});
 
 /** Fill everything the form requires, leaving the pre-filled base branch alone. */
 function fillRequiredFields() {
@@ -198,6 +210,94 @@ describe('ProjectCreateDialog', () => {
 					repo: 'team/new-project',
 				}),
 			);
+		});
+
+		// Detections are independent requests and can complete out of order, so the
+		// field must belong to the *selected* repo and provider rather than to whichever
+		// answer arrives last.
+		it("ignores the previous provider's answer when it lands after the new one", async () => {
+			createProject.mockResolvedValue({});
+			const github = deferredBranch();
+			const gitlab = deferredBranch();
+			defaultBranchQuery.mockImplementation(({ scm }: { scm: string }) =>
+				scm === 'github' ? github.promise : gitlab.promise,
+			);
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+			fillRequiredFields();
+			fireEvent.blur(screen.getByPlaceholderText('owner/repo'));
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({
+					scm: 'github',
+					repo: 'team/new-project',
+				}),
+			);
+
+			fireEvent.change(screen.getByRole('combobox'), { target: { value: 'gitlab' } });
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({
+					scm: 'gitlab',
+					repo: 'team/new-project',
+				}),
+			);
+
+			gitlab.resolve({ branch: 'develop' });
+			await waitFor(() =>
+				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+			);
+
+			github.resolve({ branch: 'main' });
+			await flush();
+
+			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop');
+			expect(screen.getByText(/Detected team\/new-project's default branch/)).toBeTruthy();
+
+			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+
+			await waitFor(() =>
+				expect(createProject).toHaveBeenCalledWith(
+					expect.objectContaining({
+						repositories: [{ repo: 'team/new-project', baseBranch: 'develop' }],
+						scm: 'gitlab',
+					}),
+				),
+			);
+		});
+
+		it("ignores a previous repository's late answer and its note", async () => {
+			const stale = deferredBranch();
+			const current = deferredBranch();
+			defaultBranchQuery.mockImplementation(({ repo }: { repo: string }) =>
+				repo === 'team/old' ? stale.promise : current.promise,
+			);
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+			const repoInput = screen.getByPlaceholderText('owner/repo');
+			fireEvent.change(repoInput, { target: { value: 'team/old' } });
+			fireEvent.blur(repoInput);
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({ scm: 'github', repo: 'team/old' }),
+			);
+
+			fireEvent.change(repoInput, { target: { value: 'team/new' } });
+			fireEvent.blur(repoInput);
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({ scm: 'github', repo: 'team/new' }),
+			);
+
+			current.resolve({ branch: 'develop' });
+			await waitFor(() =>
+				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+			);
+
+			// The stale detection answering nothing would otherwise replace the current
+			// detection's note with a failure naming the repository nobody selected.
+			stale.resolve({ branch: null });
+			await flush();
+
+			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop');
+			expect(screen.queryByText(/Couldn't read team\/old's default branch/)).toBeNull();
+			expect(screen.getByText(/Detected team\/new's default branch/)).toBeTruthy();
 		});
 
 		it('does not query for a repo that is not owner/repo yet', async () => {
