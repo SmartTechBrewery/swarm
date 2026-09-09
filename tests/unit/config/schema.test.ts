@@ -642,6 +642,89 @@ describe('ProjectRecordSchema', () => {
 		expect(project.agents?.defaults).toEqual({ antigravity: 'gemini-3.5-flash' });
 	});
 
+	it('accepts the new GPT-6 codex model at its full range, ultra included', () => {
+		const project = createMockProjectConfig({
+			agents: { planning: { cli: 'codex', model: 'gpt-6-astra', reasoning: 'ultra' } },
+		});
+		expect(project.agents?.planning).toEqual({
+			cli: 'codex',
+			model: 'gpt-6-astra',
+			reasoning: 'ultra',
+			targets: [{ cli: 'codex', model: 'gpt-6-astra', reasoning: 'ultra' }],
+		});
+	});
+
+	it('rejects ultra on a model that does not accept it (issue #893)', () => {
+		// `ultra` is a codex level, and not one every codex model has: GPT-5.5 tops
+		// out at xhigh and claude's `--effort` has no such value at all.
+		expect(() =>
+			createMockProjectConfig({
+				agents: { planning: { cli: 'codex', model: 'gpt-5.5', reasoning: 'ultra' } },
+			}),
+		).toThrow(/reasoning/);
+		expect(() =>
+			createMockProjectConfig({
+				agents: { planning: { cli: 'codex', model: 'gpt-5.6-luna', reasoning: 'ultra' } },
+			}),
+		).toThrow(/reasoning/);
+		expect(() =>
+			createMockProjectConfig({
+				agents: { planning: { cli: 'claude', model: 'opus', reasoning: 'ultra' } },
+			}),
+		).toThrow(/reasoning/);
+	});
+
+	it('keeps a config stored on a retired codex model loading, on its replacement', () => {
+		// GPT-5.4 and its mini were retired 2026-08-31 and the API now 400s on both
+		// (issue #893). Rejecting the stored value would take the whole project config
+		// — and the dashboard's Agent Configuration with it — down.
+		for (const stored of ['gpt-5.4', 'gpt-5.4-mini']) {
+			const project = createMockProjectConfig({
+				agents: { planning: { cli: 'codex', model: stored, reasoning: 'high' } },
+			});
+			// The stored level rides along: GPT-5.5 accepts every level either retired
+			// model did, so nothing has to be re-derived or dropped.
+			expect(project.agents?.planning).toEqual({
+				cli: 'codex',
+				model: 'gpt-5.5',
+				reasoning: 'high',
+				targets: [{ cli: 'codex', model: 'gpt-5.5', reasoning: 'high' }],
+			});
+		}
+	});
+
+	it('pins codex on a stored target that names a retired codex model but no cli', () => {
+		// Same defect as the antigravity pin above: the coded default CLI is claude
+		// for every phase, so an unpinned target both skipped the migration and took
+		// the withdrawn id to `claude --model gpt-5.4`.
+		for (const stored of ['gpt-5.4', 'gpt-5.4-mini']) {
+			const planning = createMockProjectConfig({ agents: { planning: { model: stored } } }).agents
+				?.planning;
+			expect(planning).toEqual({
+				cli: 'codex',
+				model: 'gpt-5.5',
+				targets: [{ cli: 'codex', model: 'gpt-5.5' }],
+			});
+			// The far end of the path: the launch resolved from the mirror dispatch
+			// reads runs on a live model, and the substitution already happened on parse.
+			const launch = resolveModelLaunch(planning?.cli ?? 'claude', planning?.model, undefined);
+			expect(launch.model).toBe('gpt-5.5');
+			expect(launch.retiredModel).toBeUndefined();
+		}
+	});
+
+	it('keeps a per-CLI default stored on a retired codex model loading', () => {
+		// `AgentDefaultsSchema` stores the string as-is, so `isKnownModel` has to
+		// accept it; `resolveModelLaunch` is what migrates it.
+		const project = createMockProjectConfig({ agents: { defaults: { codex: 'gpt-5.4-mini' } } });
+		expect(project.agents?.defaults).toEqual({ codex: 'gpt-5.4-mini' });
+		expect(resolveModelLaunch('codex', 'gpt-5.4-mini', 'high')).toEqual({
+			model: 'gpt-5.5',
+			providerArgs: ['-c', 'model_reasoning_effort="high"'],
+			retiredModel: 'gpt-5.4-mini',
+		});
+	});
+
 	it('accepts an explicit per-phase reasoning level supported by the model', () => {
 		const project = createMockProjectConfig({
 			agents: { planning: { cli: 'claude', model: 'sonnet', reasoning: 'high' } },

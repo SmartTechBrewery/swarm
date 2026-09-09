@@ -18,7 +18,9 @@
  *    is a short alias (`sonnet`, `opus`, …) that always resolves to the current
  *    model in that tier.
  *  - `codex`: a separate `model_reasoning_effort` config value passed as
- *    `-c model_reasoning_effort="<level>"`; models are short identifiers.
+ *    `-c model_reasoning_effort="<level>"`; models are short identifiers. Its
+ *    range runs one level *above* claude's — `ultra`, which the GPT-6 and
+ *    GPT-5.6 Sol/Terra entries accept and nothing on claude does (issue #893).
  *  - `antigravity` (agy 1.1.5+): the reasoning effort is part of the model
  *    *slug* `agy models` prints (`gemini-3.6-flash-high`) — the string `--model`
  *    pins reliably — so a logical model + reasoning maps back to that exact slug.
@@ -33,10 +35,12 @@
  * that provider catalogs never change — hence the legacy back-compat sets
  * (§below) and `resolveModelLaunch`'s fail-visibly behavior. A provider that
  * *withdraws* a model is the same drift arriving from the other side, and it is
- * not cosmetic: `agy` rejects an unknown `--model` outright, so a config still
- * naming a retired model fails every launch before a turn runs. Retirements are
- * therefore recorded as data too ({@link RETIRED_ANTIGRAVITY_MODELS}), which is
- * what keeps those configs loading and re-points them at a model that exists.
+ * not cosmetic: `agy` rejects an unknown `--model` outright and the Codex API
+ * answers a retired id with a `400 … not supported`, so a config still naming a
+ * retired model fails every launch before a turn runs. Retirements are therefore
+ * recorded as data too ({@link RETIRED_ANTIGRAVITY_MODELS},
+ * {@link RETIRED_CODEX_MODELS}), which is what keeps those configs loading and
+ * re-points them at a model that exists.
  */
 
 import { z } from 'zod';
@@ -44,10 +48,24 @@ import type { AgentCli } from './agent-cli.js';
 
 /**
  * Normalized reasoning levels shown in the UI, ordered lightest → heaviest.
- * Claude's `--effort` enum verbatim; a superset the other CLIs draw a subset
- * from per-model. Not a claim that a level costs the same compute across CLIs.
+ *
+ * A genuine **union** across the CLIs, not any one CLI's own enum: it was
+ * claude's `--effort` list verbatim until `codex` turned out to accept a sixth
+ * level above `max` — `ultra`, on GPT-6 and GPT-5.6 Sol/Terra, which `codex`
+ * honours as `-c model_reasoning_effort="ultra"` (issue #893). So the enum is now
+ * wider than every individual CLI, and *which* levels are real is decided
+ * per-model by {@link ModelCapability.reasoningChoices} rather than per-CLI —
+ * `ultra` is offered on those Codex models alone and rejected everywhere else
+ * (claude's `--effort` has no such level; nor do GPT-5.6 Luna and GPT-5.5).
+ *
+ * That per-model narrowing is the whole normalization contract from issue #180,
+ * unchanged: one enum at the config/UI boundary, per-CLI launch mapping in
+ * `resolveModelLaunch`, and no claim that a level costs the same compute across
+ * CLIs. What adding `ultra` costs is only the shorthand of reading the widest
+ * range off the enum — a level's existence here was never a per-CLI promise, and
+ * is now visibly not one.
  */
-export const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 /** Zod enum for a normalized reasoning level — the boundary validator (issue #180). */
@@ -88,7 +106,13 @@ export interface ModelCapability {
 	fixedVariant?: string;
 }
 
-const CLAUDE_EFFORTS = REASONING_LEVELS;
+/**
+ * Claude's `--effort` enum — spelled out rather than aliased to
+ * {@link REASONING_LEVELS}, which stopped being claude's list when `ultra`
+ * joined it for Codex (issue #893). `--effort ultra` is not a flag value claude
+ * accepts, so no claude model may offer it.
+ */
+const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 /**
  * Per-model reasoning support is a **hand-maintained catalog**, not something the
@@ -98,13 +122,18 @@ const CLAUDE_EFFORTS = REASONING_LEVELS;
  * schema rejects a reasoning level for it and the dashboard shows the selector
  * disabled ("Fixed"), the same as an antigravity single-variant model.
  *
- * Sources (verified 2026-07, links in PR): Claude effort matrix
- * (platform.claude.com/docs/build-with-claude/effort — effort supported by
+ * Sources: Claude effort matrix (verified 2026-07 —
+ * platform.claude.com/docs/build-with-claude/effort — effort supported by
  * Fable 5 / Opus 4.8 / Sonnet 5, default `high`; **Haiku 4.5 does NOT support
  * the effort parameter** — it only does budget-based thinking, which SWARM's
- * `--effort` harness can't drive, so it is non-reasoning here); Codex effort
- * levels (OpenAI GPT-5.6 Sol/Terra/Luna expose none→max; GPT-5.5/5.4 up to
- * xhigh; GPT-5.4 mini caps at high).
+ * `--effort` harness can't drive, so it is non-reasoning here). The Codex
+ * entries were re-verified against `codex-cli` 0.153.4 on 2026-09-09 (issue
+ * #893) — each id probed with `codex exec --model <id> --sandbox read-only`, and
+ * every level/default read off the catalog the binary embeds
+ * (`supported_reasoning_levels` / `default_reasoning_level`). Note that being in
+ * that bundled catalog is *not* on its own proof a model is usable: it lists ids
+ * a given account cannot call (`gpt-5.2` 400s on a ChatGPT-account login), so
+ * only ids that answered a live probe are here.
  */
 
 /** `claude --model <alias> --effort <level>`. Effort defaults to `high` where supported. */
@@ -123,23 +152,33 @@ const CLAUDE_CAPABILITIES: readonly ModelCapability[] = [
 }));
 
 /**
- * `codex --model <id> -c model_reasoning_effort="<level>"`. Codex defaults to
- * `medium`; supported sets are model-specific (the GPT-5.6 family exposes the
- * widest range up to `max`, GPT-5.5/5.4 up to `xhigh`, mini caps at `high`).
+ * `codex --model <id> -c model_reasoning_effort="<level>"`.
+ *
+ * Both the range *and* the default are per model — there is no blanket Codex
+ * default. GPT-6 Astra and GPT-5.6 Sol default to `low`, and hardcoding `medium`
+ * for them (as SWARM did until issue #893) silently ran them heavier than the CLI
+ * would have. `ultra` is real on GPT-6 Astra and GPT-5.6 Sol/Terra and on nothing
+ * else here; GPT-5.6 Luna stops at `max` and GPT-5.5 at `xhigh`.
+ *
+ * Listed newest first, which is also the order the dashboard's Model selector
+ * offers. GPT-5.4 and GPT-5.4 Mini were retired on 2026-08-31 and now 400 —
+ * they live on only in {@link RETIRED_CODEX_MODELS}.
  */
+/** The two Codex ranges narrower than the full enum, named so the table reads as one. */
+const CODEX_TO_MAX = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+const CODEX_TO_XHIGH = ['low', 'medium', 'high', 'xhigh'] as const;
 const CODEX_CAPABILITIES: readonly ModelCapability[] = [
-	{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', choices: REASONING_LEVELS },
-	{ id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', choices: REASONING_LEVELS },
-	{ id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', choices: REASONING_LEVELS },
-	{ id: 'gpt-5.5', label: 'GPT-5.5', choices: ['low', 'medium', 'high', 'xhigh'] },
-	{ id: 'gpt-5.4', label: 'GPT-5.4', choices: ['low', 'medium', 'high', 'xhigh'] },
-	{ id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', choices: ['low', 'medium', 'high'] },
-].map(({ id, label, choices }) => ({
+	{ id: 'gpt-6-astra', label: 'GPT-6-Astra', choices: REASONING_LEVELS, default: 'low' },
+	{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', choices: REASONING_LEVELS, default: 'low' },
+	{ id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', choices: REASONING_LEVELS, default: 'medium' },
+	{ id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', choices: CODEX_TO_MAX, default: 'medium' },
+	{ id: 'gpt-5.5', label: 'GPT-5.5', choices: CODEX_TO_XHIGH, default: 'medium' },
+].map(({ id, label, choices, default: def }) => ({
 	cli: 'codex' as const,
 	id,
 	label,
 	reasoningChoices: choices as readonly ReasoningLevel[],
-	defaultReasoning: 'medium' as const,
+	defaultReasoning: def as ReasoningLevel,
 }));
 
 /**
@@ -306,12 +345,13 @@ export const LEGACY_ANTIGRAVITY_DISPLAY_STRINGS: Readonly<
 };
 
 /**
- * A stored antigravity model value resolved to a *live* logical selection.
+ * A stored model value resolved to a *live* logical selection — an antigravity
+ * combined string decomposed, or a retired model (either CLI's) re-pointed.
  * `retiredFrom` names the retired model the value came from, when it named one —
  * present so a caller can report the substitution instead of silently running a
  * different model.
  */
-export interface AntigravitySelection {
+export interface ModelSelection {
 	model: string;
 	reasoning?: ReasoningLevel;
 	retiredFrom?: string;
@@ -378,7 +418,7 @@ export const RETIRED_ANTIGRAVITY_MODELS: readonly RetiredAntigravityModel[] = [
  * value names nothing retired, which is every current model and every unknown
  * string.
  */
-export function migrateRetiredAntigravityModel(model: string): AntigravitySelection | null {
+export function migrateRetiredAntigravityModel(model: string): ModelSelection | null {
 	for (const retired of RETIRED_ANTIGRAVITY_MODELS) {
 		if (retired.id === model || retired.fixedVariant === model) {
 			return { model: retired.replacedBy, retiredFrom: retired.id };
@@ -393,6 +433,67 @@ export function migrateRetiredAntigravityModel(model: string): AntigravitySelect
 		}
 	}
 	return null;
+}
+
+/**
+ * One codex model OpenAI has retired, plus the live model a stored selection
+ * naming it migrates onto.
+ *
+ * Deliberately thinner than {@link RetiredAntigravityModel}: codex has no
+ * combined slug and no legacy display string, so `id` is both what config stored
+ * and what used to reach `--model`, and a retirement is a single id → id hop.
+ * `reasoningChoices` records the range the retired model *offered*, which is the
+ * range a stored config may still carry into the hop — recorded so the
+ * "replacement keeps every level" invariant is checkable rather than assumed
+ * (the antigravity set gets that from its per-level slugs).
+ */
+export interface RetiredCodexModel {
+	id: string;
+	/** The live logical model this selection resolves to instead. */
+	replacedBy: string;
+	/** The reasoning levels the retired model itself accepted. */
+	reasoningChoices: readonly ReasoningLevel[];
+}
+
+/**
+ * Codex models the *provider* has retired — the codex twin of
+ * {@link RETIRED_ANTIGRAVITY_MODELS}, and the same failure mode arriving from a
+ * second provider (issue #893). Both entries were withdrawn on 2026-08-31 and
+ * the API now answers them outright: `400 … The 'gpt-5.4' model is not supported
+ * when using Codex with a ChatGPT account`. Anyone whose config still selects one
+ * gets a phase that dies before a turn runs.
+ *
+ * Deleting the entries instead was not an option, for exactly the reason #892
+ * recorded: `isKnownModel` (`src/config/schema.ts`) rejects a model outside the
+ * catalog, so a project, phase, or global default still storing one would stop
+ * the whole stored config from parsing — taking the dashboard's Agent
+ * Configuration down with it. Recording the retirement keeps those configs
+ * loading *and* lands them on a model that works, with the substitution reported
+ * rather than silent ({@link ModelLaunch.retiredModel}).
+ *
+ * `replacedBy` is the nearest surviving model, so the reasoning level a config
+ * already stores survives the hop: GPT-5.5 covers `gpt-5.4`'s low…xhigh range
+ * and, being a superset, `gpt-5.4-mini`'s low…high as well. Not a GPT-5.6 or
+ * GPT-6 entry — those are a tier up in cost and behavior, and a retirement
+ * should not quietly promote a phase to a heavier model.
+ * `tests/unit/harness/models.test.ts` holds the range requirement as a catalog
+ * invariant so a future retirement can't be pointed at a narrower model and
+ * reintroduce a rejected effort.
+ */
+export const RETIRED_CODEX_MODELS: readonly RetiredCodexModel[] = [
+	{ id: 'gpt-5.4', replacedBy: 'gpt-5.5', reasoningChoices: ['low', 'medium', 'high', 'xhigh'] },
+	{ id: 'gpt-5.4-mini', replacedBy: 'gpt-5.5', reasoningChoices: ['low', 'medium', 'high'] },
+];
+
+/**
+ * The live selection a retired codex model id migrates to, or `null` when the
+ * value names nothing retired — which is every current model and every unknown
+ * string. The stored reasoning level is not touched: it rides along on the target
+ * unchanged, and the replacement is chosen to still accept it.
+ */
+export function migrateRetiredCodexModel(model: string): ModelSelection | null {
+	const retired = RETIRED_CODEX_MODELS.find((entry) => entry.id === model);
+	return retired ? { model: retired.replacedBy, retiredFrom: retired.id } : null;
 }
 
 /**
@@ -422,6 +523,33 @@ export function isAntigravityModelValue(model: string): boolean {
 	);
 }
 
+/**
+ * The CLI a stored model value pins when it omits `cli`, or `undefined` when it
+ * pins none. The single place the config boundary (`AgentTargetSchema`,
+ * `src/config/schema.ts`) and the dashboard's selectors agree on the pin, so the
+ * screen shows the CLI the worker will actually run.
+ *
+ * A target that omits `cli` runs on the phase's coded default, which is `claude`
+ * for every phase (`src/pipeline/*.ts`), so a pin matters exactly where that
+ * default is wrong:
+ *
+ * - **antigravity**, for any of its forms — logical id, combined slug, legacy
+ *   display string, retired id. No other catalog contains them, so the value can
+ *   only have meant antigravity, and unpinned it reached `claude --model
+ *   gemini-3.…-flash` (issue #892).
+ * - **codex**, for a *retired* codex id. That is the value whose whole point is
+ *   being migrated: unpinned it would skip both the hop onto the live replacement
+ *   and the substitution warning, and dispatch to `claude` the very id the Codex
+ *   API answers with a 400 (issue #893). A **live** codex id is deliberately left
+ *   unpinned — it has always run on the phase's coded default CLI and still does;
+ *   changing that is its own question, not one a retirement answers.
+ */
+export function pinnedCliForModel(model: string): AgentCli | undefined {
+	if (isAntigravityModelValue(model)) return 'antigravity';
+	if (migrateRetiredCodexModel(model)) return 'codex';
+	return undefined;
+}
+
 /** Look up a logical model's capability, or `undefined` if unknown for that CLI. */
 export function capabilityFor(cli: AgentCli, model: string): ModelCapability | undefined {
 	return MODEL_CAPABILITIES[cli]?.find((m) => m.id === model);
@@ -446,7 +574,7 @@ export function reasoningChoicesFor(cli: AgentCli, model: string): readonly Reas
  * schema's parse-time migration, the dashboard's selectors, `resolveModelLaunch`)
  * precisely so no call site can forget one of these hops.
  */
-export function splitAntigravityModel(model: string): AntigravitySelection | null {
+export function splitAntigravityModel(model: string): ModelSelection | null {
 	for (const cap of ANTIGRAVITY_CAPABILITIES) {
 		if (cap.fixedVariant === model) return { model: cap.id };
 		for (const [level, variant] of Object.entries(cap.variantByReasoning ?? {})) {
@@ -474,17 +602,20 @@ export function splitAntigravityModel(model: string): AntigravitySelection | nul
 /**
  * Normalize a stored `(cli, model)` selection into `{ model: logicalId, reasoning? }`.
  * For antigravity this decomposes a legacy combined string and re-points a retired
- * model at its live replacement; for every other case the model passes through
- * unchanged and no reasoning is inferred. Used by the config schema and the
- * dashboard so old blobs and new selections share one shape.
+ * model at its live replacement; for codex it re-points a retired id
+ * ({@link RETIRED_CODEX_MODELS}) the same way, with no string to decompose. For
+ * every other case the model passes through unchanged and no reasoning is
+ * inferred. Used by the config schema and the dashboard so old blobs and new
+ * selections share one shape.
  */
-export function normalizeModelSelection(
-	cli: AgentCli | undefined,
-	model: string,
-): AntigravitySelection {
+export function normalizeModelSelection(cli: AgentCli | undefined, model: string): ModelSelection {
 	if (cli === 'antigravity') {
 		const split = splitAntigravityModel(model);
 		if (split) return split;
+	}
+	if (cli === 'codex') {
+		const migrated = migrateRetiredCodexModel(model);
+		if (migrated) return migrated;
 	}
 	return { model };
 }
@@ -496,11 +627,11 @@ export interface ModelLaunch {
 	/** Extra provider args (`--effort …`, `-c model_reasoning_effort=…`), possibly empty. */
 	providerArgs: string[];
 	/**
-	 * The retired antigravity model the requested selection named, when it named
-	 * one — this launch runs its replacement instead
-	 * (`RETIRED_ANTIGRAVITY_MODELS`). Set so the harness logs the substitution:
-	 * a config left on a withdrawn model is a configuration problem the operator
-	 * has to fix, not something to bury.
+	 * The retired model the requested selection named, when it named one — this
+	 * launch runs its replacement instead (`RETIRED_ANTIGRAVITY_MODELS`,
+	 * `RETIRED_CODEX_MODELS`). Set so the harness logs the substitution: a config
+	 * left on a withdrawn model is a configuration problem the operator has to
+	 * fix, not something to bury.
 	 */
 	retiredModel?: string;
 }
@@ -539,11 +670,33 @@ function resolveAntigravityLaunch(
 }
 
 /**
+ * The codex half of {@link resolveModelLaunch}. Reasoning is a plain config
+ * override rather than part of the model id, so the only resolution here is the
+ * retirement hop: a stored id OpenAI has withdrawn launches its live replacement
+ * and reports the substitution, because the API answers the withdrawn id with a
+ * `400 … not supported` rather than running anything (issue #893).
+ *
+ * The requested level rides along unchanged — each replacement still accepts
+ * every level the model it replaces did, asserted as a catalog invariant in
+ * `tests/unit/harness/models.test.ts`. An unknown id falls through verbatim so
+ * `codex` itself fails visibly rather than us silently substituting, the same
+ * choice the antigravity half makes.
+ */
+function resolveCodexLaunch(model: string, reasoning: ReasoningLevel | undefined): ModelLaunch {
+	const providerArgs = reasoning ? ['-c', `model_reasoning_effort="${reasoning}"`] : [];
+	const retired = migrateRetiredCodexModel(model);
+	if (!retired) return { model, providerArgs };
+	return { model: retired.model, providerArgs, retiredModel: retired.retiredFrom };
+}
+
+/**
  * Resolve how a `(cli, model, reasoning)` selection launches — the per-CLI
  * boundary where the normalized reasoning level becomes provider-specific argv.
  *
  * - claude → `{ model, providerArgs: reasoning ? ['--effort', level] : [] }`
- * - codex  → `{ model, providerArgs: reasoning ? ['-c', 'model_reasoning_effort="level"'] : [] }`
+ * - codex  → `{ model, providerArgs: reasoning ? ['-c', 'model_reasoning_effort="level"'] : [] }`,
+ *   with a selection naming a model the *provider* has retired resolved to that
+ *   model's live replacement and reported as `retiredModel` (issue #893).
  * - antigravity → the combined `agy models` slug in `model`, no provider args.
  *   A combined string already in `model` — today's slug, or a retired pre-1.1.5
  *   display string a legacy config carries — is decomposed and re-resolved to the
@@ -570,10 +723,7 @@ export function resolveModelLaunch(
 		return { model, providerArgs: reasoning ? ['--effort', reasoning] : [] };
 	}
 	if (cli === 'codex') {
-		return {
-			model,
-			providerArgs: reasoning ? ['-c', `model_reasoning_effort="${reasoning}"`] : [],
-		};
+		return resolveCodexLaunch(model, reasoning);
 	}
 	return resolveAntigravityLaunch(model, reasoning);
 }

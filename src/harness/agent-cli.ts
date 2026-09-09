@@ -550,8 +550,9 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	// resume — so a continued session keeps its original effective model/reasoning.
 	const launch = resolveModelLaunch(cli, options.model, options.reasoning);
 	// The configured model was withdrawn by its provider and this run is on the
-	// replacement (`RETIRED_ANTIGRAVITY_MODELS`, issue #892). Say so: the run is
-	// not on the model the config names, and the config is what has to be fixed.
+	// replacement (`RETIRED_ANTIGRAVITY_MODELS`, issue #892; `RETIRED_CODEX_MODELS`,
+	// issue #893). Say so: the run is not on the model the config names, and the
+	// config is what has to be fixed.
 	if (launch.retiredModel) {
 		logger.warn('configured model is retired; launching its replacement', {
 			...options.logContext,

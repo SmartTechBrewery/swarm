@@ -17,6 +17,8 @@ import {
 	ALL_AGENT_MODELS,
 	capabilityFor,
 	isAntigravityModelValue,
+	migrateRetiredCodexModel,
+	pinnedCliForModel,
 	ReasoningLevelSchema,
 	splitAntigravityModel,
 } from '../harness/models.js';
@@ -56,7 +58,8 @@ import {
  * (`"Gemini 3.6 Flash (High)"`) previous configs stored, and the id/slugs of a
  * model the *provider* has since retired (`gemini-3.5-flash`, issue #892) — so
  * all three validate unchanged and are normalized to a live logical id +
- * reasoning on parse.
+ * reasoning on parse. Codex accepts the ids of the models *it* has retired
+ * (`gpt-5.4`, `gpt-5.4-mini`, issue #893), normalized the same way.
  *
  * The retired values have to be accepted here, not only migrated by the parse
  * transform below: every `agents.defaults` entry (`AgentDefaultsSchema`, which
@@ -70,7 +73,10 @@ function isKnownModel(cli: AgentCli | undefined, model: string): boolean {
 	// The antigravity forms that aren't logical ids — combined slugs, legacy
 	// display strings, retired ids — recognized through the one predicate the
 	// target transform below and the dashboard's selectors also use.
-	if (cli === 'antigravity' || cli === undefined) return isAntigravityModelValue(model);
+	if ((cli === 'antigravity' || cli === undefined) && isAntigravityModelValue(model)) return true;
+	// A codex id the provider has retired: absent from `CODEX_MODELS`, still
+	// stored by configs written before the retirement.
+	if (cli === 'codex' || cli === undefined) return migrateRetiredCodexModel(model) !== null;
 	return false;
 }
 
@@ -181,14 +187,16 @@ export const CredentialsSchema = z
  * `AGENT_MODELS` (`src/harness/models.ts`) — `claude`'s aliases (`sonnet`, …),
  * `codex`'s short ids (`gpt-5.6-sol`, …), or an antigravity logical id
  * (`gemini-3.6-flash`, …). When `cli` is omitted, `model` is checked against the
- * union of all lists — and an *antigravity* value pins `cli: 'antigravity'` on
- * parse, since no other catalog contains it and the coded default CLI it would
- * otherwise run on is `claude` (issue #892). A legacy combined antigravity string
- * (`"Gemini 3.6 Flash (High)"`) from a pre-#180 config is accepted and normalized
- * on parse into the logical id plus its `reasoning` level, so it keeps launching
- * that exact variant; a stored antigravity model the provider has retired
- * (`gemini-3.5-flash`) is likewise accepted and normalized onto the live
- * replacement, keeping its reasoning level (issue #892).
+ * union of all lists — and a value only one non-default catalog can claim pins
+ * that CLI on parse, since the coded default CLI it would otherwise run on is
+ * `claude` (`pinnedCliForModel`, `src/harness/models.ts`: every antigravity value
+ * per issue #892, and a retired codex id per issue #893). A legacy combined
+ * antigravity string (`"Gemini 3.6 Flash (High)"`) from a pre-#180 config is
+ * accepted and normalized on parse into the logical id plus its `reasoning`
+ * level, so it keeps launching that exact variant; a stored model the provider
+ * has retired — antigravity's `gemini-3.5-flash` (issue #892) or codex's
+ * `gpt-5.4`/`gpt-5.4-mini` (issue #893) — is likewise accepted and normalized
+ * onto the live replacement, keeping its reasoning level.
  *
  * `reasoning`, when given, must be a level the effective `(cli, model)` supports
  * (`ModelCapability.reasoningChoices`) — validated against the model, never as a
@@ -203,19 +211,21 @@ export const AgentTargetSchema = z
 		reasoning: ReasoningLevelSchema.optional(),
 	})
 	.transform((target) => {
-		// A target may omit `cli` while its `model` can only have meant one: every
-		// antigravity model value — logical id, combined slug, legacy display string,
-		// retired id — is absent from the claude and codex catalogs, and `isKnownModel`
-		// above accepts one here. Pin that CLI before the migration below, because an
-		// unpinned target runs on the phase's coded default CLI (`claude` for every
-		// phase, `src/pipeline/*.ts`), which would launch `claude --model
-		// gemini-3.…-flash` — for a *retired* value, dispatching the very string this
-		// retirement exists to keep out of a launch, and skipping the substitution
-		// warning with it. Pinning also lets the reasoning recovered from a combined
-		// string survive the `reasoning` refine below, which needs a concrete
-		// `(cli, model)` to validate against.
-		if (!target.cli && target.model && isAntigravityModelValue(target.model)) {
-			target.cli = 'antigravity';
+		// A target may omit `cli` while its `model` can only have meant one — every
+		// antigravity model value, and every *retired* codex id, is absent from the
+		// other catalogs, and `isKnownModel` above accepts one here. Pin that CLI
+		// before the migrations below, because an unpinned target runs on the phase's
+		// coded default CLI (`claude` for every phase, `src/pipeline/*.ts`), which
+		// would launch `claude --model gemini-3.…-flash` / `claude --model gpt-5.4` —
+		// for a retired value, dispatching the very id the retirement exists to keep
+		// out of a launch, and skipping the substitution warning with it. Which values
+		// pin, and why a live codex id deliberately does not, is stated once in
+		// `pinnedCliForModel` (`src/harness/models.ts`) so the dashboard's selectors
+		// resolve the same CLI this does. Pinning also lets the reasoning recovered
+		// from a combined string survive the `reasoning` refine below, which needs a
+		// concrete `(cli, model)` to validate against.
+		if (!target.cli && target.model) {
+			target.cli = pinnedCliForModel(target.model);
 		}
 		// Migrate a pre-#180 combined antigravity model string losslessly into
 		// logical model + reasoning, and a retired model onto its live replacement
@@ -230,6 +240,13 @@ export const AgentTargetSchema = z
 				target.model = split.model;
 				target.reasoning = target.reasoning ?? split.reasoning;
 			}
+		}
+		// The codex twin (issue #893): a retired id becomes its live replacement,
+		// which by construction still accepts whatever level the target already
+		// carries — so `reasoning` is left exactly as stored rather than re-derived.
+		if (target.cli === 'codex' && target.model) {
+			const migrated = migrateRetiredCodexModel(target.model);
+			if (migrated) target.model = migrated.model;
 		}
 		return target;
 	})
