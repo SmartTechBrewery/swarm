@@ -85,8 +85,15 @@ import {
 } from '@/pipeline/resume.js';
 import { resolveSplitNaming } from '@/pipeline/split-naming.js';
 import { resolveAutomationLabel } from '@/pm/automation-label.js';
+import { partitionBlockersBySource, partitionCyclicDependents } from '@/pm/dependencies.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
-import type { PMProvider, UpdateWorkItemPatch, WorkItem } from '@/pm/types.js';
+import type {
+	PMProvider,
+	UpdateWorkItemPatch,
+	WorkItem,
+	WorkItemBlocker,
+	WorkItemDependent,
+} from '@/pm/types.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	SWARM_GENERATED_FOOTER,
@@ -895,6 +902,20 @@ function readPlanOrThrow(
  *
  * The board *writes* keep their order exactly (issues #431, #436, #536); the only new
  * call is the lookup that precedes each creation.
+ *
+ * **Guard 3 — the outward direction (issue #890).** {@link linkBlockedBy} is only the
+ * *inward* half of the split's dependency wiring: it chains the phases behind each
+ * other and looks no further than the cards this split just made. An item entering
+ * Planning can already be a recorded prerequisite for other board work
+ * (`ai/RULES.md` §5), and those dependents are blocked by the *original* — which the
+ * split re-scopes into phase 1 while moving the rest of its substance into fresh
+ * children. Left alone, closing phase 1 reads as unblocked while phases 2..N are
+ * still open, and the dependency gate then starts dependent work out of order: the
+ * failure issue #330 exists to prevent, reached through the split path. So the item's
+ * dependents are read once *before* the first child exists
+ * ({@link readSplitDependents}) and handed an edge on every spawned child once the
+ * last one does ({@link carryDependentsForward}), on the same best-effort
+ * swallow-and-log contract as the inward half.
  */
 async function applySplit(
 	pm: PMProvider,
@@ -931,6 +952,9 @@ async function applySplit(
 	const firstTask: WorkItem = mainPatch ? { ...parent, ...mainPatch } : parent;
 	const totalPhases = split.subTasks.length + 1;
 	const predecessors: WorkItem[] = [firstTask];
+	// Read before the loop, so the clean run's reverse read cannot see the children
+	// this split is about to chain behind the parent (guard 3, issue #890).
+	const incomingDependents = await readSplitDependents(pm, parent);
 	for (const [childIndex, sub] of split.subTasks.entries()) {
 		const sibling = await spawnSplitChild(pm, {
 			parent,
@@ -948,6 +972,14 @@ async function applySplit(
 		subTaskItemIds.push(sibling.id);
 		predecessors.push(sibling);
 	}
+	// `predecessors` is now every phase in order — phase 1 plus each spawned child —
+	// which is what the dependents have to end up blocked by (guard 3, issue #890).
+	await carryDependentsForward(pm, {
+		parent,
+		phases: predecessors,
+		dependents: incomingDependents,
+		splitId,
+	});
 	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined };
 }
 
@@ -1301,6 +1333,10 @@ async function publishPreplanComment(
  * provider can't model dependencies; per-link failures are logged and swallowed
  * so one bad link never aborts the split mid-loop (a retry would duplicate the
  * siblings) — the split comment still lists the blockers.
+ *
+ * This is the **inward** half of the split's dependency wiring: it looks only at the
+ * phases this split created. The outward half — the work that was already waiting on
+ * the item being split — is {@link carryDependentsForward} (issue #890).
  */
 async function linkBlockedBy(
 	pm: PMProvider,
@@ -1323,6 +1359,235 @@ async function linkBlockedBy(
 			});
 		}
 	}
+}
+
+/**
+ * Read the items the item being split already blocks (issue #890) — `[]` for a
+ * provider that models no dependencies, and `[]` with a logged warning when the read
+ * fails, on the same swallow-and-log contract as {@link linkBlockedBy}.
+ *
+ * **Called before the first child is created, and that ordering is load-bearing.**
+ * Every child is recorded as blocked by phase 1, so once the child loop has run the
+ * split's own children are dependents of the parent too — and carrying *those*
+ * forward would hand child 2 an edge on child 3, a permanent deadlock inside the
+ * split. Reading first makes a clean run structurally incapable of seeing them;
+ * {@link carryDependentsForward}'s phase filter is what covers a *resumed* run, whose
+ * children an earlier attempt already created and chained.
+ */
+async function readSplitDependents(pm: PMProvider, parent: WorkItem): Promise<WorkItemDependent[]> {
+	if (!pm.supportsDependencies) return [];
+	try {
+		return await pm.listDependents(parent.id);
+	} catch (error) {
+		logger.warn('Planning — could not read the split item dependents; carrying none forward', {
+			parentId: parent.id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return [];
+	}
+}
+
+/** What {@link carryDependentsForward} needs for one split's outward pass. */
+interface CarryDependentsForwardOptions {
+	parent: WorkItem;
+	/** Every phase in order — phase 1 (the re-scoped original) first, then each child. */
+	phases: readonly WorkItem[];
+	/** The parent's dependents, as {@link readSplitDependents} read them. */
+	dependents: readonly WorkItemDependent[];
+	splitId: string;
+}
+
+/**
+ * Drop any dependent that is one of the split's own phases. A clean run never sees
+ * one ({@link readSplitDependents} runs first), but a **resumed** delivery does: the
+ * children an earlier attempt created already carry their blocked-by edge on the
+ * parent, so the parent's reverse read reports them. The failure this prevents is a
+ * phase blocked by its own sibling — a deadlock no re-run can unpick — which is why
+ * it is checked here as well as avoided by the ordering.
+ */
+function withoutSplitPhases(
+	dependents: readonly WorkItemDependent[],
+	phases: readonly WorkItem[],
+): WorkItemDependent[] {
+	const phaseUrls = new Set(phases.map((phase) => phase.url).filter(Boolean));
+	const phaseIds = new Set(phases.map((phase) => phase.id));
+	return dependents.filter(
+		(dependent) =>
+			!(dependent.url && phaseUrls.has(dependent.url)) &&
+			!(dependent.id && phaseIds.has(dependent.id)),
+	);
+}
+
+/**
+ * The dependents that may be handed an edge, with any half of a **pre-existing
+ * cycle** removed: an item the split's phases are themselves blocked by must not be
+ * pointed back at them (issue #890, mirroring the gate's own backstop, issue #639).
+ * Only recorded relationships are consulted — prose never decides a board write
+ * (issue #643).
+ *
+ * `undefined` when the blocker read failed, which the caller treats as "carry
+ * nothing". Deliberately the one *conservative* failure in this pass: a failed read
+ * is not evidence that there is no cycle, and a spurious cycle edge is a durable
+ * board defect a human has to unpick, whereas skipping leaves exactly today's
+ * behaviour for the next delivery to redo.
+ */
+async function withoutCyclicDependents(
+	pm: PMProvider,
+	parent: WorkItem,
+	dependents: readonly WorkItemDependent[],
+): Promise<WorkItemDependent[] | undefined> {
+	let blockers: WorkItemBlocker[];
+	try {
+		blockers = await pm.listBlockers(parent.id);
+	} catch (error) {
+		logger.warn(
+			'Planning — could not read the split item blockers; carrying no dependents forward',
+			{
+				parentId: parent.id,
+				error: error instanceof Error ? error.message : String(error),
+			},
+		);
+		return undefined;
+	}
+	const { carried, suppressed } = partitionCyclicDependents(
+		dependents,
+		partitionBlockersBySource(blockers).gating,
+	);
+	for (const dependent of suppressed) {
+		logger.warn(
+			'Planning — dependent is itself a recorded blocker of the split item; not pointing it at the new phases',
+			{ parentId: parent.id, reference: dependent.reference },
+		);
+	}
+	return carried;
+}
+
+/**
+ * The dependent's provider-native work-item id, which {@link PMProvider.addBlockedBy}
+ * takes on both sides. Linear and Jira fill {@link WorkItemDependent.id} from their
+ * own reverse read; GitHub Projects cannot — its reverse read answers with *issues*,
+ * not board items — so the card is resolved from the dependent's `url` through the
+ * narrow one-card lookup both the same-host and DB-free paths serve
+ * (`findWorkItemByUrlSuffix`, `src/pm/transport-delivery.ts`).
+ *
+ * The **whole** URL is passed rather than a trimmed tail: every provider parses that
+ * argument against its own URL grammar and confirms the match against the card's own
+ * url, so the owner/repo (or site, or workspace) it carries is what stops a
+ * same-numbered card from another repository on a shared org board from answering.
+ *
+ * `undefined` when the dependent is on no board card at all — an `ai/RULES.md` §5
+ * anomaly: the issue-level dependency is real, but no contract method can record an
+ * edge without a card on both sides, so the caller logs it and moves on.
+ */
+async function resolveDependentItemId(
+	pm: PMProvider,
+	dependent: WorkItemDependent,
+): Promise<string | undefined> {
+	if (dependent.id) return dependent.id;
+	if (!dependent.url) return undefined;
+	return (await pm.findWorkItemByUrlSuffix(dependent.url))?.id;
+}
+
+/**
+ * Record one dependent as blocked by every phase the split *spawned*. Phase 1 is
+ * skipped deliberately: every dependent in this list is already recorded as blocked
+ * by the original item, which is what put it in the list, so re-adding that edge
+ * would be an idempotent no-op board write per dependent — and leaving it exactly as
+ * it stands is what "the pre-existing edge is left in place" means.
+ *
+ * Best-effort throughout, like {@link linkBlockedBy}: a failed identity resolution or
+ * a failed single write is logged and swallowed, so the remaining phases and the
+ * remaining dependents are still processed and the split still completes.
+ */
+async function linkDependentToPhases(
+	pm: PMProvider,
+	dependent: WorkItemDependent,
+	options: CarryDependentsForwardOptions,
+): Promise<void> {
+	const { parent, phases, splitId } = options;
+	let dependentId: string | undefined;
+	try {
+		dependentId = await resolveDependentItemId(pm, dependent);
+	} catch (error) {
+		logger.warn('Planning — could not resolve a dependent board card; skipping it', {
+			parentId: parent.id,
+			splitId,
+			reference: dependent.reference,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return;
+	}
+	if (!dependentId) {
+		logger.warn('Planning — a dependent is not on the board, so its edges cannot be recorded', {
+			parentId: parent.id,
+			splitId,
+			reference: dependent.reference,
+			url: dependent.url,
+			action: 'add the issue to the board so its blocked-by relationships can be recorded',
+		});
+		return;
+	}
+	// A dependent that resolves to one of the split's own phases is dropped whole, not
+	// merely spared a self-edge: an edge on any *sibling* would be as much of a
+	// deadlock as an edge on itself.
+	if (phases.some((phase) => phase.id === dependentId)) {
+		logger.debug('Planning — a dependent resolved to one of the split phases; skipping it', {
+			parentId: parent.id,
+			splitId,
+			reference: dependent.reference,
+		});
+		return;
+	}
+	for (const phase of phases.slice(1)) {
+		try {
+			await pm.addBlockedBy(dependentId, phase.id);
+		} catch (error) {
+			logger.warn('Planning — failed to carry a dependent forward onto a split phase', {
+				dependentId,
+				reference: dependent.reference,
+				phaseId: phase.id,
+				splitId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+}
+
+/**
+ * Carry the split item's **incoming** dependencies forward: every issue recorded as
+ * blocked by the item being split ends up blocked by every phase the split produced,
+ * so work that was waiting for the whole of the original keeps waiting for all of it
+ * instead of being released the moment phase 1 closes (issue #890). Guard 3 on
+ * {@link applySplit}; run once, after the last child exists, since the edges cannot
+ * be recorded before their targets do.
+ *
+ * Provider-agnostic and best-effort, exactly like {@link linkBlockedBy}: a provider
+ * that models no dependencies does nothing, an item with no dependents costs nothing
+ * beyond the one read that established that, and every failure is logged and
+ * swallowed rather than aborting a split mid-loop. Idempotent by construction — every
+ * write is an `addBlockedBy`, which the contract makes a no-op on repeat, and nothing
+ * here posts a comment or applies a label — so a retried delivery leaves the
+ * dependents in exactly the state a single clean run does.
+ */
+async function carryDependentsForward(
+	pm: PMProvider,
+	options: CarryDependentsForwardOptions,
+): Promise<void> {
+	const { parent, phases, dependents, splitId } = options;
+	if (!pm.supportsDependencies || dependents.length === 0) return;
+	const external = withoutSplitPhases(dependents, phases);
+	if (external.length === 0) return;
+	const carried = await withoutCyclicDependents(pm, parent, external);
+	if (!carried || carried.length === 0) return;
+	for (const dependent of carried) {
+		await linkDependentToPhases(pm, dependent, options);
+	}
+	logger.info('Planning — carried the split item dependents forward onto every phase', {
+		parentId: parent.id,
+		splitId,
+		dependents: carried.length,
+		phases: phases.length - 1,
+	});
 }
 
 /** One planning artifact captured before the verification run, for restoration. */

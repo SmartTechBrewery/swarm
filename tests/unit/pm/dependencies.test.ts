@@ -8,6 +8,7 @@ import {
 	openBlockers,
 	partitionBlockersBySource,
 	partitionCyclicBlockers,
+	partitionCyclicDependents,
 	proseAdvisoryCommentBody,
 	proseAdvisoryMarker,
 } from '@/pm/dependencies.js';
@@ -272,6 +273,76 @@ describe('partitionCyclicBlockers', () => {
 		);
 		expect(gating.map((b) => b.reference)).toEqual(['#700']);
 		expect(suppressed).toEqual([]);
+	});
+});
+
+// Issue #890: the write-side mirror. A dependent that is *also* a recorded blocker
+// of the item is one half of a cycle already on the board, so pointing the item's new
+// split phases at it would deepen that cycle rather than record a real prerequisite.
+describe('partitionCyclicDependents', () => {
+	it('suppresses a dependent that is also a recorded blocker, matched by URL', () => {
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+			[blocker({ reference: 'ENG-631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(carried).toEqual([]);
+		expect(suppressed.map((d) => d.reference)).toEqual(['#631']);
+	});
+
+	it('falls back to the reference when the two reads carry no URL', () => {
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent({ reference: '#631', url: '' })],
+			[blocker({ reference: '#631', url: '' })],
+		);
+		expect(carried).toEqual([]);
+		expect(suppressed.map((d) => d.reference)).toEqual(['#631']);
+	});
+
+	it('never matches two entries that are merely both blank', () => {
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent({ reference: '', url: '' })],
+			[blocker({ reference: '', url: '' })],
+		);
+		expect(carried).toHaveLength(1);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('carries everything when the item is blocked by nothing', () => {
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent(), dependent({ reference: '#5', url: 'https://github.com/o/r/issues/5' })],
+			[],
+		);
+		expect(carried.map((d) => d.reference)).toEqual(['#319', '#5']);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('carries everything when the blockers are unrelated to the dependents', () => {
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent()],
+			[blocker({ reference: '#900', url: 'https://github.com/o/r/issues/900' })],
+		);
+		expect(carried.map((d) => d.reference)).toEqual(['#319']);
+		expect(suppressed).toEqual([]);
+	});
+
+	it('suppresses only the cyclic dependent, leaving an unrelated one carried', () => {
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' }), dependent()],
+			[blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+		);
+		expect(carried.map((d) => d.reference)).toEqual(['#319']);
+		expect(suppressed.map((d) => d.reference)).toEqual(['#631']);
+	});
+
+	it('is state-independent — a closed blocker still suppresses its dependent', () => {
+		// A closed prerequisite can be reopened, so the cycle is a property of the
+		// recorded graph rather than of today's states.
+		const { carried, suppressed } = partitionCyclicDependents(
+			[dependent({ reference: '#631', url: 'https://github.com/o/r/issues/631' })],
+			[blocker({ reference: '#631', url: 'https://github.com/o/r/issues/631', open: false })],
+		);
+		expect(carried).toEqual([]);
+		expect(suppressed.map((d) => d.reference)).toEqual(['#631']);
 	});
 });
 
