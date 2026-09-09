@@ -514,7 +514,7 @@ describe('ProjectRecordSchema', () => {
 		const project = createMockProjectConfig({
 			agents: {
 				planning: { cli: 'claude', model: 'sonnet' },
-				implementation: { cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' },
+				implementation: { cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' },
 				review: { cli: 'codex', model: 'gpt-5.6-sol' },
 			},
 		});
@@ -526,9 +526,9 @@ describe('ProjectRecordSchema', () => {
 			// model + reasoning (issue #180).
 			implementation: {
 				cli: 'antigravity',
-				model: 'gemini-3.5-flash',
+				model: 'gemini-3.6-flash',
 				reasoning: 'high',
-				targets: [{ cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' }],
+				targets: [{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' }],
 			},
 			review: {
 				cli: 'codex',
@@ -538,16 +538,52 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
-	it('accepts the gemini-3.6-flash antigravity model via the normal cli/model/reasoning path', () => {
+	it('accepts every live Flash tier via the normal cli/model/reasoning path', () => {
+		for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash']) {
+			const project = createMockProjectConfig({
+				agents: { planning: { cli: 'antigravity', model, reasoning: 'high' } },
+			});
+			expect(project.agents?.planning).toEqual({
+				cli: 'antigravity',
+				model,
+				reasoning: 'high',
+				targets: [{ cli: 'antigravity', model, reasoning: 'high' }],
+			});
+		}
+	});
+
+	it('keeps a config stored on the retired antigravity model loading, on its replacement', () => {
+		// `gemini-3.5-flash` was SWARM's coded default when agy withdrew it (issue
+		// #892). Rejecting the stored value would take the whole project config —
+		// and the dashboard's Agent Configuration with it — down.
+		for (const stored of ['gemini-3.5-flash', 'gemini-3.5-flash-high', 'Gemini 3.5 Flash (High)']) {
+			const project = createMockProjectConfig({
+				agents: { planning: { cli: 'antigravity', model: stored } },
+			});
+			expect(project.agents?.planning).toEqual({
+				cli: 'antigravity',
+				model: 'gemini-3.6-flash',
+				// Only the combined strings carried a level; the bare id keeps none, so
+				// it lands on the replacement's own default.
+				...(stored === 'gemini-3.5-flash' ? {} : { reasoning: 'high' }),
+				targets: [
+					{
+						cli: 'antigravity',
+						model: 'gemini-3.6-flash',
+						...(stored === 'gemini-3.5-flash' ? {} : { reasoning: 'high' }),
+					},
+				],
+			});
+		}
+	});
+
+	it('keeps a per-CLI default stored on the retired antigravity model loading', () => {
+		// `AgentDefaultsSchema` stores the string as-is, so this one is accepted by
+		// `isKnownModel` rather than migrated on parse; the launch migrates it.
 		const project = createMockProjectConfig({
-			agents: { planning: { cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' } },
+			agents: { defaults: { antigravity: 'gemini-3.5-flash' } },
 		});
-		expect(project.agents?.planning).toEqual({
-			cli: 'antigravity',
-			model: 'gemini-3.6-flash',
-			reasoning: 'high',
-			targets: [{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' }],
-		});
+		expect(project.agents?.defaults).toEqual({ antigravity: 'gemini-3.5-flash' });
 	});
 
 	it('accepts an explicit per-phase reasoning level supported by the model', () => {
@@ -599,7 +635,7 @@ describe('ProjectRecordSchema', () => {
 		).toThrow();
 		expect(() =>
 			createMockProjectConfig({
-				agents: { review: { cli: 'claude', model: 'Gemini 3.5 Flash (High)' } },
+				agents: { review: { cli: 'claude', model: 'Gemini 3.6 Flash (High)' } },
 			}),
 		).toThrow();
 	});
@@ -619,7 +655,7 @@ describe('ProjectRecordSchema', () => {
 		).not.toThrow();
 		expect(() =>
 			createMockProjectConfig({
-				agents: { planning: { model: 'Gemini 3.5 Flash (High)' } },
+				agents: { planning: { model: 'Gemini 3.6 Flash (High)' } },
 			}),
 		).not.toThrow();
 		expect(() =>
@@ -778,14 +814,14 @@ describe('AgentConfigSchema targets (issue #342)', () => {
 	it('migrates a legacy antigravity combined string into its sole target', () => {
 		const agent = AgentConfigSchema.parse({
 			cli: 'antigravity',
-			model: 'Gemini 3.5 Flash (High)',
+			model: 'Gemini 3.6 Flash (High)',
 		});
 		expect(agent.targets).toEqual([
-			{ cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' },
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' },
 		]);
 		expect(agent).toMatchObject({
 			cli: 'antigravity',
-			model: 'gemini-3.5-flash',
+			model: 'gemini-3.6-flash',
 			reasoning: 'high',
 		});
 	});
@@ -894,7 +930,7 @@ describe('AgentsConfigSchema', () => {
 			AgentsConfigSchema.safeParse({
 				defaults: {
 					claude: 'sonnet',
-					antigravity: 'Gemini 3.5 Flash (Medium)',
+					antigravity: 'Gemini 3.6 Flash (Medium)',
 					codex: 'gpt-5.6-terra',
 				},
 			}).success,
@@ -905,7 +941,7 @@ describe('AgentsConfigSchema', () => {
 		expect(
 			AgentsConfigSchema.safeParse({
 				defaults: {
-					claude: 'Gemini 3.5 Flash (Medium)',
+					claude: 'Gemini 3.6 Flash (Medium)',
 				},
 			}).success,
 		).toBe(false);

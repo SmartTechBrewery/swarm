@@ -51,9 +51,11 @@ export function modelLabel(cli: AgentCli, model: string): string {
 
 /**
  * A stored target normalized for display: a legacy combined antigravity model
- * string (`"Gemini 3.5 Flash (High)"`) becomes its logical id + reasoning so the
- * Model and Reasoning selectors render the right selections. Other values pass
- * through untouched.
+ * string (`"Gemini 3.6 Flash (High)"`) becomes its logical id + reasoning so the
+ * Model and Reasoning selectors render the right selections, and a model the
+ * provider has retired reads as the live replacement it will actually launch on
+ * (issue #892) rather than as an empty Model selector. Other values pass through
+ * untouched.
  */
 function normalizeTarget(target: AgentTarget): AgentTarget {
 	if (!target.model) return { ...target };

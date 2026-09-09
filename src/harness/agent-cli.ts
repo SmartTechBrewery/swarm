@@ -35,7 +35,7 @@ export type AgentCli = z.infer<typeof AgentCliSchema>;
 
 /**
  * Human-readable "cli (model, reasoning)" label for a phase's start-of-run log
- * line, e.g. `antigravity (gemini-3.5-flash, high)` or `claude (sonnet)`. Omits
+ * line, e.g. `antigravity (gemini-3.6-flash, high)` or `claude (sonnet)`. Omits
  * the parens entirely when no model override is set, rather than naming the
  * CLI's own default — the harness never queries what that default resolves to
  * (see `model` on {@link RunAgentCliOptions}), so there's nothing accurate to
@@ -172,7 +172,7 @@ export interface RunAgentCliOptions {
 	providerArgs?: string[];
 	/**
 	 * Logical model for this session (`src/harness/models.ts`) — `claude`/`codex`
-	 * aliases/ids, or an antigravity logical id (`gemini-3.5-flash`). The harness
+	 * aliases/ids, or an antigravity logical id (`gemini-3.6-flash`). The harness
 	 * resolves it plus {@link reasoning} into the concrete launch args via
 	 * `resolveModelLaunch`: `claude`/`codex` get `--model <id>`, antigravity gets
 	 * `--model "<combined variant>"`. Omit to run on the CLI's own default.
@@ -549,6 +549,17 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	// antigravity's combined variant string). Re-computed every run — including a
 	// resume — so a continued session keeps its original effective model/reasoning.
 	const launch = resolveModelLaunch(cli, options.model, options.reasoning);
+	// The configured model was withdrawn by its provider and this run is on the
+	// replacement (`RETIRED_ANTIGRAVITY_MODELS`, issue #892). Say so: the run is
+	// not on the model the config names, and the config is what has to be fixed.
+	if (launch.retiredModel) {
+		logger.warn('configured model is retired; launching its replacement', {
+			...options.logContext,
+			cli,
+			retiredModel: launch.retiredModel,
+			model: launch.model,
+		});
+	}
 	const modelArgs = launch.model ? ['--model', launch.model] : [];
 	const resumeId = options.resumeSessionId;
 	const { baseArgs, sessionArgs } = buildSessionArgs(cli, resumeId, options.sessionId);

@@ -25,8 +25,17 @@ describe('toTargetList', () => {
 	});
 
 	it('splits a legacy combined antigravity model into a logical id plus reasoning', () => {
-		expect(toTargetList({ cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' })).toEqual([
-			{ cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' },
+		expect(toTargetList({ cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' },
+		]);
+	});
+
+	it('reads a retired antigravity model as its live replacement (issue #892)', () => {
+		expect(toTargetList({ cli: 'antigravity', model: 'gemini-3.5-flash' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash' },
+		]);
+		expect(toTargetList({ cli: 'antigravity', model: 'gemini-3.5-flash-low' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'low' },
 		]);
 	});
 
@@ -203,9 +212,9 @@ describe('areTargetsDirty', () => {
 	});
 
 	it('compares a legacy single selection against its one-element list', () => {
-		const legacy: AgentConfig = { cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' };
+		const legacy: AgentConfig = { cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' };
 		expect(areTargetsDirty(toTargetList(legacy), legacy)).toBe(false);
-		expect(areTargetsDirty([{ cli: 'antigravity', model: 'gemini-3.5-flash' }], legacy)).toBe(true);
+		expect(areTargetsDirty([{ cli: 'antigravity', model: 'gemini-3.6-flash' }], legacy)).toBe(true);
 	});
 
 	it('ignores rows that select nothing on either side', () => {

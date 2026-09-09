@@ -118,6 +118,7 @@ import type {
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 import {
 	capabilityFor,
+	DEFAULT_MODEL_PER_CLI,
 	MODEL_CAPABILITIES,
 	type ReasoningLevel,
 	reasoningChoicesFor,
@@ -181,17 +182,17 @@ const PHASE_DESCRIPTIONS: Partial<Record<(typeof PHASES)[number], string>> = {
 		'Used only when Implementation was not preceded by a Planning run for this item; otherwise the Implementation configuration applies.',
 };
 
-const CODED_DEFAULT_MODEL: Record<string, string> = {
-	claude: 'sonnet',
-	codex: 'gpt-5.6-terra',
-	antigravity: 'gemini-3.5-flash',
-};
-
+/**
+ * The "Default (…)" label for a phase's Model selector: the project's own
+ * per-CLI default when it sets one, else the coded default. Read straight from
+ * `DEFAULT_MODEL_PER_CLI` rather than restated here — a hand-kept copy silently
+ * kept naming a model the provider had retired (issue #892).
+ */
 function getModelDefaultLabel(
 	cli: AgentCli,
 	projectDefaults?: Record<string, string | undefined>,
 ): string {
-	const defaultModel = projectDefaults?.[cli] || CODED_DEFAULT_MODEL[cli] || 'Unset';
+	const defaultModel = projectDefaults?.[cli] || DEFAULT_MODEL_PER_CLI[cli] || 'Unset';
 	return `Default (${modelLabel(cli, defaultModel)})`;
 }
 

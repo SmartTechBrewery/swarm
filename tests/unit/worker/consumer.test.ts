@@ -1957,7 +1957,7 @@ describe('processJob', () => {
 	it("resolves the project's per-phase agent override (cli/model/reasoning) for the dispatch", async () => {
 		const projectWithAgents = createMockProjectConfig({
 			// Legacy combined string migrates to logical model + reasoning (issue #180).
-			agents: { planning: { cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' } },
+			agents: { planning: { cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' } },
 		});
 		projectLookup = () => projectWithAgents;
 		const workItem = createMockWorkItem({ statusId: '61e4505c' });
@@ -1967,7 +1967,7 @@ describe('processJob', () => {
 
 		expect(resolvedTarget()).toMatchObject({
 			engine: 'antigravity',
-			model: 'gemini-3.5-flash',
+			model: 'gemini-3.6-flash',
 			reasoning: 'high',
 		});
 	});
@@ -5445,7 +5445,7 @@ describe('processJob', () => {
 
 		it('records the work item metadata and requested model/reasoning for a PM-driven phase', async () => {
 			const projectWithAgents = createMockProjectConfig({
-				agents: { planning: { cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' } },
+				agents: { planning: { cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' } },
 			});
 			projectLookup = () => projectWithAgents;
 			const workItem = createMockWorkItem({ statusId: '61e4505c' });
@@ -5466,7 +5466,7 @@ describe('processJob', () => {
 					workItemUrl: workItem.url,
 					prNumber: undefined,
 					// Legacy combined string normalized to logical model + reasoning (issue #180).
-					model: 'gemini-3.5-flash',
+					model: 'gemini-3.6-flash',
 					reasoning: 'high',
 					jobPayload: expect.any(Object),
 				}),

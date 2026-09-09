@@ -5,7 +5,7 @@ import { selectTarget } from '@/worker/target-selection.js';
 
 const CLAUDE: AgentTarget = { cli: 'claude', model: 'opus', reasoning: 'high' };
 const CODEX: AgentTarget = { cli: 'codex', model: 'gpt-5.6-terra' };
-const ANTIGRAVITY: AgentTarget = { cli: 'antigravity', model: 'gemini-3.5-flash' };
+const ANTIGRAVITY: AgentTarget = { cli: 'antigravity', model: 'gemini-3.6-flash' };
 
 function available(...clis: AgentCli[]): ReadonlySet<AgentCli> {
 	return new Set(clis);
