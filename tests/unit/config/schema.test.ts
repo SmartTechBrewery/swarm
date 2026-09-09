@@ -12,6 +12,7 @@ import {
 	validateConfig,
 	type WorktreeRetentionConfig,
 } from '@/config/schema.js';
+import { ANTIGRAVITY_MODEL_SLUGS, resolveModelLaunch } from '@/harness/models.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import {
 	createMockJiraProjectConfig,
@@ -575,6 +576,61 @@ describe('ProjectRecordSchema', () => {
 				],
 			});
 		}
+	});
+
+	it('pins antigravity on a stored target that names one of its models but no cli', () => {
+		// A phase may store `model` without `cli` (every pre-`targets` config could).
+		// The coded default CLI is claude for every phase, so leaving it unset used to
+		// dispatch `claude --model <an antigravity model>` — for a retired value, the
+		// very string the retirement exists to keep out of a launch, with no
+		// substitution warning. Only antigravity has these ids, so the CLI is pinned.
+		const cases: [stored: string, model: string, reasoning?: string][] = [
+			['gemini-3.5-flash', 'gemini-3.6-flash'],
+			['gemini-3.5-flash-high', 'gemini-3.6-flash', 'high'],
+			['Gemini 3.5 Flash (Medium)', 'gemini-3.6-flash', 'medium'],
+			// A live value takes the same pin — the misroute was never specific to a
+			// retired model, only most damaging there.
+			['gemini-3.8-flash', 'gemini-3.8-flash'],
+			['gemini-3.6-flash-low', 'gemini-3.6-flash', 'low'],
+			['claude-sonnet-4-6', 'claude-sonnet-4.6'],
+		];
+		for (const [stored, model, reasoning] of cases) {
+			const project = createMockProjectConfig({
+				agents: { planning: { model: stored } },
+			});
+			const expected = { cli: 'antigravity', model, ...(reasoning ? { reasoning } : {}) };
+			expect(project.agents?.planning).toEqual({ ...expected, targets: [expected] });
+		}
+	});
+
+	it('resolves a cli-less retired value into an antigravity launch, never a claude one', () => {
+		// The far end of the path: parse the stored phase config, then resolve the
+		// launch from the mirror dispatch reads (`agentOverrideFor`,
+		// `src/worker/consumer.ts`). Without the pin, `cli` stayed undefined and every
+		// phase's coded default — `claude` — took the withdrawn string to `--model`.
+		for (const stored of ['gemini-3.5-flash', 'gemini-3.5-flash-high', 'Gemini 3.5 Flash (High)']) {
+			const planning = createMockProjectConfig({ agents: { planning: { model: stored } } }).agents
+				?.planning;
+			// The coded default every phase applies to a target that names no CLI.
+			const cli = planning?.cli ?? 'claude';
+			expect(cli).toBe('antigravity');
+			const launch = resolveModelLaunch(cli, planning?.model, planning?.reasoning);
+			expect(launch.model).not.toMatch(/^gemini-3\.5-flash/);
+			expect(ANTIGRAVITY_MODEL_SLUGS).toContain(launch.model);
+			// The substitution already happened on parse, so the launch itself sees a
+			// live model and reports none — the same as for a target that names `cli`.
+			expect(launch.retiredModel).toBeUndefined();
+		}
+	});
+
+	it('leaves a cli-less claude model on the phase’s coded default CLI', () => {
+		// The pin above keys on the model catalog, so a claude alias must still read as
+		// "no cli named" — the phase's own default applies, exactly as before.
+		const project = createMockProjectConfig({ agents: { planning: { model: 'sonnet' } } });
+		expect(project.agents?.planning).toEqual({
+			model: 'sonnet',
+			targets: [{ model: 'sonnet' }],
+		});
 	});
 
 	it('keeps a per-CLI default stored on the retired antigravity model loading', () => {

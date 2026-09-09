@@ -8,6 +8,8 @@ import {
 	CODEX_MODELS,
 	capabilityFor,
 	DEFAULT_MODEL_PER_CLI,
+	isAntigravityModelValue,
+	LEGACY_ANTIGRAVITY_DISPLAY_STRINGS,
 	migrateRetiredAntigravityModel,
 	normalizeModelSelection,
 	RETIRED_ANTIGRAVITY_MODELS,
@@ -289,5 +291,39 @@ describe('RETIRED_ANTIGRAVITY_MODELS', () => {
 			resolveModelLaunch('antigravity', 'gemini-3.8-flash', 'high').retiredModel,
 		).toBeUndefined();
 		expect(resolveModelLaunch('claude', 'sonnet', 'high').retiredModel).toBeUndefined();
+	});
+});
+
+describe('isAntigravityModelValue', () => {
+	it('recognizes every antigravity form a config can store', () => {
+		// The predicate a `cli`-less target is pinned by: logical ids, today's
+		// combined slugs, the pre-1.1.5 display strings, and a retired model's id and
+		// slugs must all be recognized, or such a target falls through to the coded
+		// default CLI (claude) and fails on spawn.
+		for (const value of [
+			...ANTIGRAVITY_MODELS,
+			...ANTIGRAVITY_MODEL_SLUGS,
+			...Object.keys(LEGACY_ANTIGRAVITY_DISPLAY_STRINGS),
+			...RETIRED_ANTIGRAVITY_MODELS.flatMap((retired) => [
+				retired.id,
+				...(retired.fixedVariant ? [retired.fixedVariant] : []),
+				...Object.values(retired.variantByReasoning ?? {}),
+			]),
+		]) {
+			expect(isAntigravityModelValue(value), value).toBe(true);
+		}
+	});
+
+	it('claims no claude or codex model, and no unknown string', () => {
+		// The pin is only safe because the catalogs are disjoint (asserted above for
+		// `AGENT_MODELS`), so a claude alias or a codex id must never match.
+		for (const value of [...CLAUDE_MODELS, ...CODEX_MODELS]) {
+			expect(isAntigravityModelValue(value), value).toBe(false);
+		}
+		expect(isAntigravityModelValue('gemini-9.9-flash')).toBe(false);
+		expect(isAntigravityModelValue('')).toBe(false);
+		// An inherited `Object.prototype` name must not read as a display string.
+		expect(isAntigravityModelValue('toString')).toBe(false);
+		expect(isAntigravityModelValue('constructor')).toBe(false);
 	});
 });

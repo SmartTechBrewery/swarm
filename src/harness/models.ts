@@ -395,6 +395,33 @@ export function migrateRetiredAntigravityModel(model: string): AntigravitySelect
 	return null;
 }
 
+/**
+ * Whether a stored model value can *only* be an antigravity selection — a live
+ * logical id (`gemini-3.6-flash`), one of today's combined slugs
+ * (`gemini-3.6-flash-high`), a pre-1.1.5 display string, or a model the provider
+ * has retired. The three CLI catalogs share no id, so a value this recognizes
+ * names no claude or codex model.
+ *
+ * That disjointness is what lets a stored target which omits `cli` be pinned to
+ * antigravity instead of falling through to the phase's coded default CLI (which
+ * is `claude` for every phase): the config schema accepts such a value on a
+ * `cli`-less target (`isKnownModel`, `src/config/schema.ts`), and without the pin
+ * it would reach `claude --model gemini-3.6-flash` — a launch that can never
+ * succeed, and, for a retired value, one that dispatches the withdrawn string the
+ * retirement exists to keep out of a launch (issue #892).
+ */
+export function isAntigravityModelValue(model: string): boolean {
+	return (
+		(ANTIGRAVITY_MODELS as readonly string[]).includes(model) ||
+		(ANTIGRAVITY_MODEL_SLUGS as readonly string[]).includes(model) ||
+		// `Object.hasOwn` rather than a bare lookup for the same reason
+		// `splitAntigravityModel` uses it: an inherited `Object.prototype` name in a
+		// config value must not masquerade as a known display string.
+		Object.hasOwn(LEGACY_ANTIGRAVITY_DISPLAY_STRINGS, model) ||
+		migrateRetiredAntigravityModel(model) !== null
+	);
+}
+
 /** Look up a logical model's capability, or `undefined` if unknown for that CLI. */
 export function capabilityFor(cli: AgentCli, model: string): ModelCapability | undefined {
 	return MODEL_CAPABILITIES[cli]?.find((m) => m.id === model);

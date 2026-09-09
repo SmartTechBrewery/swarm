@@ -718,6 +718,21 @@ describe('PhaseSettingsDetail — model targets', () => {
 		expect((screen.getByLabelText('Reasoning, target 1') as HTMLSelectElement).value).toBe('high');
 	});
 
+	it('shows a retired Antigravity model stored without a cli on its pinned CLI', () => {
+		// The shape a pre-`targets` config could hold: `model` with no `cli`. The row
+		// must read as Antigravity on the replacement — an unpinned CLI would render
+		// the Model selector disabled, for a phase the worker runs on Antigravity.
+		renderDetail({ model: 'gemini-3.5-flash-high' });
+
+		const model = screen.getByLabelText('Model, target 1') as HTMLSelectElement;
+		expect((screen.getByLabelText('Agent CLI, target 1') as HTMLSelectElement).value).toBe(
+			'antigravity',
+		);
+		expect(model.disabled).toBe(false);
+		expect(model.value).toBe('gemini-3.6-flash');
+		expect((screen.getByLabelText('Reasoning, target 1') as HTMLSelectElement).value).toBe('high');
+	});
+
 	it('offers each row only the CLIs no other row claims', () => {
 		renderDetail(twoTargets);
 

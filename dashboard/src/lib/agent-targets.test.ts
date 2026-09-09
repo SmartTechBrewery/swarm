@@ -39,6 +39,27 @@ describe('toTargetList', () => {
 		]);
 	});
 
+	it('reads a stored antigravity model with no cli as an antigravity target', () => {
+		// A pre-`targets` config could store `model` alone. The schema pins the CLI on
+		// parse (issue #892); mirror it here, or the screen shows no CLI chosen and a
+		// disabled Model selector for a phase that runs on antigravity.
+		expect(toTargetList({ model: 'gemini-3.5-flash' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash' },
+		]);
+		expect(toTargetList({ model: 'Gemini 3.5 Flash (High)' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' },
+		]);
+		expect(toTargetList({ model: 'gemini-3.8-flash' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.8-flash' },
+		]);
+	});
+
+	it('leaves a stored claude model with no cli unpinned', () => {
+		// Only antigravity values are pinned — a claude alias keeps reading as "no CLI
+		// named", the phase's coded default.
+		expect(toTargetList({ model: 'sonnet' })).toEqual([{ model: 'sonnet' }]);
+	});
+
 	it('normalizes every target of a stored list and keeps its order', () => {
 		const config: AgentConfig = {
 			cli: 'antigravity',

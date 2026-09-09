@@ -15,10 +15,8 @@ import { type AgentCli, AgentCliSchema } from '../harness/agent-cli.js';
 import {
 	AGENT_MODELS,
 	ALL_AGENT_MODELS,
-	ANTIGRAVITY_MODEL_SLUGS,
 	capabilityFor,
-	LEGACY_ANTIGRAVITY_DISPLAY_STRINGS,
-	migrateRetiredAntigravityModel,
+	isAntigravityModelValue,
 	ReasoningLevelSchema,
 	splitAntigravityModel,
 } from '../harness/models.js';
@@ -61,22 +59,18 @@ import {
  * reasoning on parse.
  *
  * The retired values have to be accepted here, not only migrated by the parse
- * transform below: that transform runs only for a target that names
- * `cli: 'antigravity'`, while a bare `model` and every `agents.defaults` entry
- * (`AgentDefaultsSchema`, which stores the string as-is) reach this check
- * un-migrated. Rejecting them would take a whole stored config — and with it the
- * dashboard's Agent Configuration — down over a model the provider withdrew.
+ * transform below: every `agents.defaults` entry (`AgentDefaultsSchema`, which
+ * stores the string as-is) reaches this check un-migrated. Rejecting them would
+ * take a whole stored config — and with it the dashboard's Agent Configuration —
+ * down over a model the provider withdrew.
  */
 function isKnownModel(cli: AgentCli | undefined, model: string): boolean {
 	const allowed = cli ? AGENT_MODELS[cli] : ALL_AGENT_MODELS;
 	if ((allowed as readonly string[]).includes(model)) return true;
-	if (cli === 'antigravity' || cli === undefined) {
-		return (
-			(ANTIGRAVITY_MODEL_SLUGS as readonly string[]).includes(model) ||
-			Object.hasOwn(LEGACY_ANTIGRAVITY_DISPLAY_STRINGS, model) ||
-			migrateRetiredAntigravityModel(model) !== null
-		);
-	}
+	// The antigravity forms that aren't logical ids — combined slugs, legacy
+	// display strings, retired ids — recognized through the one predicate the
+	// target transform below and the dashboard's selectors also use.
+	if (cli === 'antigravity' || cli === undefined) return isAntigravityModelValue(model);
 	return false;
 }
 
@@ -187,10 +181,12 @@ export const CredentialsSchema = z
  * `AGENT_MODELS` (`src/harness/models.ts`) — `claude`'s aliases (`sonnet`, …),
  * `codex`'s short ids (`gpt-5.6-sol`, …), or an antigravity logical id
  * (`gemini-3.6-flash`, …). When `cli` is omitted, `model` is checked against the
- * union of all lists. A legacy combined antigravity string (`"Gemini 3.6 Flash
- * (High)"`) from a pre-#180 config is accepted and normalized on parse into the
- * logical id plus its `reasoning` level, so it keeps launching that exact
- * variant; a stored antigravity model the provider has retired
+ * union of all lists — and an *antigravity* value pins `cli: 'antigravity'` on
+ * parse, since no other catalog contains it and the coded default CLI it would
+ * otherwise run on is `claude` (issue #892). A legacy combined antigravity string
+ * (`"Gemini 3.6 Flash (High)"`) from a pre-#180 config is accepted and normalized
+ * on parse into the logical id plus its `reasoning` level, so it keeps launching
+ * that exact variant; a stored antigravity model the provider has retired
  * (`gemini-3.5-flash`) is likewise accepted and normalized onto the live
  * replacement, keeping its reasoning level (issue #892).
  *
@@ -207,6 +203,20 @@ export const AgentTargetSchema = z
 		reasoning: ReasoningLevelSchema.optional(),
 	})
 	.transform((target) => {
+		// A target may omit `cli` while its `model` can only have meant one: every
+		// antigravity model value — logical id, combined slug, legacy display string,
+		// retired id — is absent from the claude and codex catalogs, and `isKnownModel`
+		// above accepts one here. Pin that CLI before the migration below, because an
+		// unpinned target runs on the phase's coded default CLI (`claude` for every
+		// phase, `src/pipeline/*.ts`), which would launch `claude --model
+		// gemini-3.…-flash` — for a *retired* value, dispatching the very string this
+		// retirement exists to keep out of a launch, and skipping the substitution
+		// warning with it. Pinning also lets the reasoning recovered from a combined
+		// string survive the `reasoning` refine below, which needs a concrete
+		// `(cli, model)` to validate against.
+		if (!target.cli && target.model && isAntigravityModelValue(target.model)) {
+			target.cli = 'antigravity';
+		}
 		// Migrate a pre-#180 combined antigravity model string losslessly into
 		// logical model + reasoning, and a retired model onto its live replacement
 		// (issue #892) — both hops live in `splitAntigravityModel`. An explicit
