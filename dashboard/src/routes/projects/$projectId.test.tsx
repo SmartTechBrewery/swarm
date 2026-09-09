@@ -751,6 +751,43 @@ describe('PhaseSettingsDetail — model targets', () => {
 		expect(options).not.toContain('sonnet');
 	});
 
+	it('offers the live Codex models and none the provider retired (issue #893)', () => {
+		renderDetail(twoTargets);
+
+		const model = screen.getByLabelText('Model, target 2') as HTMLSelectElement;
+		const options = [...model.options].map((option) => option.value);
+		expect(options).toContain('gpt-6-astra');
+		// Both 400 on every launch, so offering them is offering a dead phase.
+		expect(options).not.toContain('gpt-5.4');
+		expect(options).not.toContain('gpt-5.4-mini');
+	});
+
+	it('offers ultra only for a Codex model that accepts it (issue #893)', () => {
+		const reasoningOptions = (label: string) =>
+			[...(screen.getByLabelText(label) as HTMLSelectElement).options].map(
+				(option) => option.value,
+			);
+		renderDetail({
+			targets: [
+				{ cli: 'codex', model: 'gpt-6-astra' },
+				{ cli: 'claude', model: 'opus' },
+			],
+		});
+
+		expect(reasoningOptions('Reasoning, target 1')).toContain('ultra');
+		// claude's `--effort` has no `ultra`, so the level must not be offered there.
+		expect(reasoningOptions('Reasoning, target 2')).not.toContain('ultra');
+	});
+
+	it("shows a Codex model's own default level as the Reasoning placeholder", () => {
+		// GPT-6 Astra defaults to `low`, not the blanket `medium` SWARM used to
+		// assume for every Codex model (issue #893).
+		renderDetail({ targets: [{ cli: 'codex', model: 'gpt-6-astra' }] });
+
+		const reasoning = screen.getByLabelText('Reasoning, target 1') as HTMLSelectElement;
+		expect(reasoning.options[0]?.textContent).toBe('Default (Low)');
+	});
+
 	it("disables a row's Reasoning selector for a model with no reasoning control", () => {
 		// Haiku has no `--effort` control, so the level isn't selectable for it.
 		renderDetail({ targets: [{ cli: 'claude', model: 'haiku' }] });

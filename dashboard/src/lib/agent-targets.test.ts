@@ -54,9 +54,19 @@ describe('toTargetList', () => {
 		]);
 	});
 
+	it('reads a retired codex model as its live replacement (issue #893)', () => {
+		expect(toTargetList({ cli: 'codex', model: 'gpt-5.4', reasoning: 'xhigh' })).toEqual([
+			{ cli: 'codex', model: 'gpt-5.5', reasoning: 'xhigh' },
+		]);
+		// And with no `cli` stored, mirroring the pin the schema applies on parse —
+		// otherwise the screen shows an empty Model selector for a phase that in fact
+		// runs on codex.
+		expect(toTargetList({ model: 'gpt-5.4-mini' })).toEqual([{ cli: 'codex', model: 'gpt-5.5' }]);
+	});
+
 	it('leaves a stored claude model with no cli unpinned', () => {
-		// Only antigravity values are pinned — a claude alias keeps reading as "no CLI
-		// named", the phase's coded default.
+		// Only values the phase's coded default CLI can't run are pinned — a claude
+		// alias keeps reading as "no CLI named", which is that default.
 		expect(toTargetList({ model: 'sonnet' })).toEqual([{ model: 'sonnet' }]);
 	});
 
@@ -160,15 +170,17 @@ describe('patchTarget', () => {
 
 	it('keeps a reasoning level the new model still supports', () => {
 		const targets: AgentTarget[] = [{ cli: 'codex', model: 'gpt-5.6-sol', reasoning: 'high' }];
-		expect(patchTarget(targets, 0, { model: 'gpt-5.4' })).toEqual([
-			{ cli: 'codex', model: 'gpt-5.4', reasoning: 'high' },
+		expect(patchTarget(targets, 0, { model: 'gpt-5.5' })).toEqual([
+			{ cli: 'codex', model: 'gpt-5.5', reasoning: 'high' },
 		]);
 	});
 
 	it('clears a reasoning level the new model does not support', () => {
-		const targets: AgentTarget[] = [{ cli: 'codex', model: 'gpt-5.6-sol', reasoning: 'max' }];
-		expect(patchTarget(targets, 0, { model: 'gpt-5.4-mini' })).toEqual([
-			{ cli: 'codex', model: 'gpt-5.4-mini', reasoning: undefined },
+		// `ultra` is real on GPT-5.6 Sol and not on GPT-5.5 (issue #893), so switching
+		// model has to drop it rather than send codex an effort it rejects.
+		const targets: AgentTarget[] = [{ cli: 'codex', model: 'gpt-5.6-sol', reasoning: 'ultra' }];
+		expect(patchTarget(targets, 0, { model: 'gpt-5.5' })).toEqual([
+			{ cli: 'codex', model: 'gpt-5.5', reasoning: undefined },
 		]);
 	});
 

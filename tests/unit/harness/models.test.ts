@@ -11,8 +11,12 @@ import {
 	isAntigravityModelValue,
 	LEGACY_ANTIGRAVITY_DISPLAY_STRINGS,
 	migrateRetiredAntigravityModel,
+	migrateRetiredCodexModel,
 	normalizeModelSelection,
+	pinnedCliForModel,
+	REASONING_LEVELS,
 	RETIRED_ANTIGRAVITY_MODELS,
+	RETIRED_CODEX_MODELS,
 	reasoningChoicesFor,
 	resolveModelLaunch,
 	splitAntigravityModel,
@@ -48,6 +52,28 @@ describe('ALL_AGENT_MODELS', () => {
 	});
 });
 
+describe('REASONING_LEVELS', () => {
+	it('is the union across CLIs, with ultra above max', () => {
+		expect(REASONING_LEVELS).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+	});
+
+	it('offers ultra only on the codex models that accept it (issue #893)', () => {
+		// `ultra` is a codex level; claude's `--effort` has no such value, so a claude
+		// model offering it would launch a flag value the CLI rejects. The two codex
+		// entries below cap lower than their siblings and must not gain it either.
+		for (const model of CLAUDE_MODELS) {
+			expect(reasoningChoicesFor('claude', model), model).not.toContain('ultra');
+		}
+		for (const model of ANTIGRAVITY_MODELS) {
+			expect(reasoningChoicesFor('antigravity', model), model).not.toContain('ultra');
+		}
+		const withUltra = CODEX_MODELS.filter((model) =>
+			reasoningChoicesFor('codex', model).includes('ultra'),
+		);
+		expect(withUltra).toEqual(['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra']);
+	});
+});
+
 describe('reasoningChoicesFor', () => {
 	it('exposes claude effort levels for effort-capable models', () => {
 		expect(reasoningChoicesFor('claude', 'sonnet')).toEqual([
@@ -57,6 +83,26 @@ describe('reasoningChoicesFor', () => {
 			'xhigh',
 			'max',
 		]);
+	});
+
+	it('exposes each codex model’s own range and default (issue #893)', () => {
+		// Verified against codex-cli 0.153.4's embedded catalog. Both halves are
+		// per-model: SWARM used to hardcode `medium` for every entry, running Astra
+		// and Sol heavier than the CLI itself would.
+		const expected = {
+			'gpt-6-astra': { choices: REASONING_LEVELS, default: 'low' },
+			'gpt-5.6-sol': { choices: REASONING_LEVELS, default: 'low' },
+			'gpt-5.6-terra': { choices: REASONING_LEVELS, default: 'medium' },
+			'gpt-5.6-luna': { choices: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'medium' },
+			'gpt-5.5': { choices: ['low', 'medium', 'high', 'xhigh'], default: 'medium' },
+		} as const;
+		// The catalog offers exactly these ids, so a retirement or an addition that
+		// forgets this table fails here rather than in a 400 at launch.
+		expect(CODEX_MODELS).toEqual(Object.keys(expected));
+		for (const [model, { choices, default: def }] of Object.entries(expected)) {
+			expect(reasoningChoicesFor('codex', model), model).toEqual(choices);
+			expect(capabilityFor('codex', model)?.defaultReasoning, model).toBe(def);
+		}
 	});
 
 	it('exposes no reasoning for Haiku (no --effort support)', () => {
@@ -97,6 +143,15 @@ describe('resolveModelLaunch', () => {
 		expect(resolveModelLaunch('codex', 'gpt-5.6-terra', 'xhigh')).toEqual({
 			model: 'gpt-5.6-terra',
 			providerArgs: ['-c', 'model_reasoning_effort="xhigh"'],
+		});
+	});
+
+	it('carries ultra through to codex as its own effort value (issue #893)', () => {
+		// The level codex accepts above `max`, and the reason `REASONING_LEVELS` is no
+		// longer claude's enum. It must reach the CLI verbatim, not clamp to `max`.
+		expect(resolveModelLaunch('codex', 'gpt-6-astra', 'ultra')).toEqual({
+			model: 'gpt-6-astra',
+			providerArgs: ['-c', 'model_reasoning_effort="ultra"'],
 		});
 	});
 
@@ -187,10 +242,14 @@ describe('splitAntigravityModel / normalizeModelSelection', () => {
 		}
 	});
 
-	it('normalizes only antigravity legacy strings, leaving other selections untouched', () => {
+	it('normalizes legacy/retired values, leaving live selections untouched', () => {
 		expect(normalizeModelSelection('antigravity', 'Gemini 3.6 Flash (Low)')).toEqual({
 			model: 'gemini-3.6-flash',
 			reasoning: 'low',
+		});
+		expect(normalizeModelSelection('codex', 'gpt-5.4')).toEqual({
+			model: 'gpt-5.5',
+			retiredFrom: 'gpt-5.4',
 		});
 		expect(normalizeModelSelection('claude', 'sonnet')).toEqual({ model: 'sonnet' });
 		expect(normalizeModelSelection('codex', 'gpt-5.6-sol')).toEqual({ model: 'gpt-5.6-sol' });
@@ -200,6 +259,7 @@ describe('splitAntigravityModel / normalizeModelSelection', () => {
 describe('capabilityFor', () => {
 	it('reports the known/default reasoning per model', () => {
 		expect(capabilityFor('claude', 'sonnet')?.defaultReasoning).toBe('high');
+		expect(capabilityFor('codex', 'gpt-6-astra')?.defaultReasoning).toBe('low');
 		expect(capabilityFor('codex', 'gpt-5.6-terra')?.defaultReasoning).toBe('medium');
 		expect(capabilityFor('antigravity', 'gemini-3.8-flash')?.defaultReasoning).toBe('medium');
 		expect(capabilityFor('antigravity', 'gemini-3.7-flash')?.defaultReasoning).toBe('medium');
@@ -294,6 +354,99 @@ describe('RETIRED_ANTIGRAVITY_MODELS', () => {
 	});
 });
 
+describe('RETIRED_CODEX_MODELS', () => {
+	it('covers both GPT-5.4 entries, retired 2026-08-31', () => {
+		expect(RETIRED_CODEX_MODELS.map((m) => m.id)).toEqual(['gpt-5.4', 'gpt-5.4-mini']);
+		// Retired means gone from every list SWARM can select or launch from — the API
+		// answers either id with a 400, so offering one is offering a dead phase.
+		for (const retired of RETIRED_CODEX_MODELS) {
+			expect(CODEX_MODELS).not.toContain(retired.id);
+			expect(ALL_AGENT_MODELS).not.toContain(retired.id);
+			expect(capabilityFor('codex', retired.id)).toBeUndefined();
+		}
+	});
+
+	it('replaces each retired model with a live one that still accepts its levels', () => {
+		// A replacement with a narrower range would send codex an effort it rejects —
+		// i.e. the same failing launch this set exists to prevent.
+		for (const retired of RETIRED_CODEX_MODELS) {
+			const replacement = capabilityFor('codex', retired.replacedBy);
+			expect(replacement, retired.replacedBy).toBeDefined();
+			for (const level of retired.reasoningChoices) {
+				expect(replacement?.reasoningChoices, `${retired.id} → ${level}`).toContain(level);
+			}
+		}
+	});
+
+	it('migrates a retired id and leaves a live one alone', () => {
+		expect(migrateRetiredCodexModel('gpt-5.4')).toEqual({
+			model: 'gpt-5.5',
+			retiredFrom: 'gpt-5.4',
+		});
+		expect(migrateRetiredCodexModel('gpt-5.4-mini')).toEqual({
+			model: 'gpt-5.5',
+			retiredFrom: 'gpt-5.4-mini',
+		});
+		expect(migrateRetiredCodexModel('gpt-5.5')).toBeNull();
+		expect(migrateRetiredCodexModel('gpt-6-astra')).toBeNull();
+	});
+
+	it('launches the replacement for every retired id, reporting the substitution', () => {
+		for (const retired of RETIRED_CODEX_MODELS) {
+			const launch = resolveModelLaunch('codex', retired.id, 'high');
+			// Nothing SWARM dispatches may put a withdrawn id on `--model`.
+			expect(launch.model).toBe(retired.replacedBy);
+			expect(CODEX_MODELS).toContain(launch.model);
+			expect(launch.retiredModel).toBe(retired.id);
+			// The stored level survives the hop rather than resetting to a default.
+			expect(launch.providerArgs).toEqual(['-c', 'model_reasoning_effort="high"']);
+		}
+	});
+
+	it('reports no substitution for a live codex selection', () => {
+		expect(resolveModelLaunch('codex', 'gpt-6-astra', 'ultra').retiredModel).toBeUndefined();
+		expect(resolveModelLaunch('codex', 'gpt-5.5', undefined).retiredModel).toBeUndefined();
+	});
+
+	it('passes an unknown codex id through so codex itself fails visibly', () => {
+		expect(resolveModelLaunch('codex', 'gpt-9.9-nonsense', undefined)).toEqual({
+			model: 'gpt-9.9-nonsense',
+			providerArgs: [],
+		});
+	});
+});
+
+describe('pinnedCliForModel', () => {
+	it('pins antigravity for every form it can store', () => {
+		for (const value of [
+			...ANTIGRAVITY_MODELS,
+			...ANTIGRAVITY_MODEL_SLUGS,
+			...Object.keys(LEGACY_ANTIGRAVITY_DISPLAY_STRINGS),
+			...RETIRED_ANTIGRAVITY_MODELS.map((retired) => retired.id),
+		]) {
+			expect(pinnedCliForModel(value), value).toBe('antigravity');
+		}
+	});
+
+	it('pins codex for a retired codex id, so the migration is not bypassed', () => {
+		// Without the pin the value runs on the phase's coded default CLI (`claude`
+		// for every phase), which both skips the hop onto the replacement and takes
+		// the withdrawn id to `claude --model`.
+		for (const retired of RETIRED_CODEX_MODELS) {
+			expect(pinnedCliForModel(retired.id), retired.id).toBe('codex');
+		}
+	});
+
+	it('pins nothing for a claude alias, a live codex id, or an unknown string', () => {
+		// claude is already every phase's coded default, so its aliases need no pin;
+		// a live codex id keeps running on that default exactly as it did before
+		// issue #893 — the pin is scoped to the values a retirement has to migrate.
+		for (const value of [...CLAUDE_MODELS, ...CODEX_MODELS, 'gemini-9.9-flash', '', 'toString']) {
+			expect(pinnedCliForModel(value), value).toBeUndefined();
+		}
+	});
+});
+
 describe('isAntigravityModelValue', () => {
 	it('recognizes every antigravity form a config can store', () => {
 		// The predicate a `cli`-less target is pinned by: logical ids, today's
@@ -316,8 +469,13 @@ describe('isAntigravityModelValue', () => {
 
 	it('claims no claude or codex model, and no unknown string', () => {
 		// The pin is only safe because the catalogs are disjoint (asserted above for
-		// `AGENT_MODELS`), so a claude alias or a codex id must never match.
-		for (const value of [...CLAUDE_MODELS, ...CODEX_MODELS]) {
+		// `AGENT_MODELS`), so a claude alias or a codex id — retired ones included,
+		// which are still stored by configs and pin `codex` instead — must never match.
+		for (const value of [
+			...CLAUDE_MODELS,
+			...CODEX_MODELS,
+			...RETIRED_CODEX_MODELS.map((retired) => retired.id),
+		]) {
 			expect(isAntigravityModelValue(value), value).toBe(false);
 		}
 		expect(isAntigravityModelValue('gemini-9.9-flash')).toBe(false);
