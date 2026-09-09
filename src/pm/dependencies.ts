@@ -315,6 +315,41 @@ export function partitionBlockersBySource(blockers: readonly WorkItemBlocker[]):
 }
 
 /**
+ * The identity of a related item, as the two cycle partitions below match it: the
+ * `url`, with the `reference` as the fallback — the same identity
+ * {@link dedupeBlockers} uses. Both fields are keyed independently so a provider
+ * whose forward and reverse reads populate them differently still matches. Empty
+ * values are never keys: an entry carrying neither is not "the same item" as
+ * anything.
+ */
+interface RelatedItemIdentity {
+	readonly url: string;
+	readonly reference: string;
+}
+
+/** The `url`/`reference` key sets one side of a cycle check is matched against. */
+function identityKeys(items: readonly RelatedItemIdentity[]): {
+	urls: Set<string>;
+	references: Set<string>;
+} {
+	return {
+		urls: new Set(items.map((i) => i.url).filter(Boolean)),
+		references: new Set(items.map((i) => i.reference).filter(Boolean)),
+	};
+}
+
+/** Whether `item` is one of the items {@link identityKeys} was built from. */
+function matchesIdentity(
+	item: RelatedItemIdentity,
+	keys: ReturnType<typeof identityKeys>,
+): boolean {
+	return (
+		(Boolean(item.url) && keys.urls.has(item.url)) ||
+		(Boolean(item.reference) && keys.references.has(item.reference))
+	);
+}
+
+/**
  * Split gating blockers into the ones that can actually resolve and the ones that
  * *cannot*, because the item being gated natively blocks them (issue #639).
  *
@@ -331,10 +366,8 @@ export function partitionBlockersBySource(blockers: readonly WorkItemBlocker[]):
  * further would need each dependent's provider-native item id, which a provider's
  * reverse read need not yield (GitHub's answers with issues, not board items).
  *
- * Identity is the same one {@link dedupeBlockers} uses — the `url`, with the
- * `reference` as the fallback — matched on **either** side independently, so a
- * provider whose two reads populate the fields differently still matches. Empty
- * values never match: a blocker with neither is not "the same item" as anything.
+ * Identity is {@link RelatedItemIdentity}'s — the `url`, with the `reference` as
+ * the fallback.
  */
 export function partitionCyclicBlockers(
 	blockers: readonly WorkItemBlocker[],
@@ -345,17 +378,54 @@ export function partitionCyclicBlockers(
 	/** Blockers the item itself blocks — dropped, and logged by the caller. */
 	suppressed: WorkItemBlocker[];
 } {
-	const urls = new Set(dependents.map((d) => d.url).filter(Boolean));
-	const references = new Set(dependents.map((d) => d.reference).filter(Boolean));
+	const keys = identityKeys(dependents);
 	const gating: WorkItemBlocker[] = [];
 	const suppressed: WorkItemBlocker[] = [];
 	for (const blocker of blockers) {
-		const cyclic =
-			(Boolean(blocker.url) && urls.has(blocker.url)) ||
-			(Boolean(blocker.reference) && references.has(blocker.reference));
-		(cyclic ? suppressed : gating).push(blocker);
+		(matchesIdentity(blocker, keys) ? suppressed : gating).push(blocker);
 	}
 	return { gating, suppressed };
+}
+
+/**
+ * The **write-side mirror** of {@link partitionCyclicBlockers}: split an item's
+ * dependents into the ones that may be handed a new blocked-by edge and the ones
+ * that must not, because they are *also* recorded blockers of that same item
+ * (issue #890).
+ *
+ * Planning's split carries the original item's incoming dependencies forward onto
+ * every phase it produced, so work that waited for the whole of the original keeps
+ * waiting for all of it. A dependent that already blocks the item is one half of a
+ * cycle the board is carrying today — the exact item {@link
+ * partitionCyclicBlockers} suppresses so the gate can start the run at all — and
+ * giving it an edge on the item's new phases would deepen that cycle into
+ * relationships nobody recorded.
+ *
+ * Deliberately **state-independent**: a closed blocker can be reopened, so the
+ * cycle is a property of the recorded graph rather than of today's states. And the
+ * caller passes only *recorded* relationships (`partitionBlockersBySource(...)
+ * .gating`), because prose must not decide a board write any more than it decides
+ * a gate (issue #643) — a sentence that mentions an issue is not a reason to
+ * withhold an edge from it.
+ *
+ * Only the direct edge is checked, for the same reason as its read-side mirror.
+ */
+export function partitionCyclicDependents(
+	dependents: readonly WorkItemDependent[],
+	blockers: readonly WorkItemBlocker[],
+): {
+	/** Dependents the split's phases may be recorded as blocking. */
+	carried: WorkItemDependent[];
+	/** Dependents that already block the item — skipped, and logged by the caller. */
+	suppressed: WorkItemDependent[];
+} {
+	const keys = identityKeys(blockers);
+	const carried: WorkItemDependent[] = [];
+	const suppressed: WorkItemDependent[] = [];
+	for (const dependent of dependents) {
+		(matchesIdentity(dependent, keys) ? suppressed : carried).push(dependent);
+	}
+	return { carried, suppressed };
 }
 
 /**

@@ -167,7 +167,9 @@ function makeDeps() {
 		type: 'github-projects' as const,
 		getWorkItem: vi.fn(),
 		listWorkItems: vi.fn(),
-		findWorkItemByUrlSuffix: vi.fn(async () => undefined),
+		findWorkItemByUrlSuffix: vi.fn<(urlSuffix: string) => Promise<WorkItem | undefined>>(
+			async () => undefined,
+		),
 		findWorkItemForArtifact: vi.fn(async () => undefined),
 		findWorkItemByDescriptionMarker: vi.fn<(marker: string) => Promise<WorkItem | undefined>>(
 			async () => undefined,
@@ -190,8 +192,8 @@ function makeDeps() {
 		addLabel: vi.fn<(id: string, name: string) => Promise<void>>(async () => {}),
 		supportsDependencies: true,
 		supportsAssignees: true,
-		listBlockers: vi.fn<() => Promise<WorkItemBlocker[]>>(async () => []),
-		listDependents: vi.fn<() => Promise<WorkItemDependent[]>>(async () => []),
+		listBlockers: vi.fn<(id: string) => Promise<WorkItemBlocker[]>>(async () => []),
+		listDependents: vi.fn<(id: string) => Promise<WorkItemDependent[]>>(async () => []),
 		addBlockedBy: vi.fn<(id: string, blockerId: string) => Promise<void>>(async () => {}),
 		resolveItemRepository: vi.fn(async () => ({ status: 'unrouted' }) as const),
 	};
@@ -1503,6 +1505,258 @@ describe('runPlanningPhase', () => {
 	 * real failure: two attempts of the *same* delivery against one board, with the
 	 * provider throwing partway through the first.
 	 */
+	/**
+	 * Guard 3 (issue #890): the split's *outward* dependency direction. An item
+	 * entering Planning may already be a recorded prerequisite for other board work
+	 * (`ai/RULES.md` §5); the split re-scopes it into phase 1 and moves the rest of
+	 * its substance into fresh children, so a dependent left blocked only by phase 1
+	 * reads as unblocked while phases 2..N are still open.
+	 */
+	describe('a split carries its dependents forward (issue #890)', () => {
+		const TWO_CHILD_SPLIT = JSON.stringify({
+			sharedName: SHARED_NAME,
+			mainTask: { title: 'First slice', description: 'Just the API' },
+			subTasks: [
+				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Build it.' },
+				{ title: 'Third slice', description: 'The docs', plan: '# Docs plan\n\n1. Write it.' },
+			],
+		});
+
+		/** The three inward edges every one of these splits records (issue #330). */
+		const CHAINING_PAIRS = [
+			['PVTI_Second slice', 'PVTI_item18'],
+			['PVTI_Third slice', 'PVTI_item18'],
+			['PVTI_Third slice', 'PVTI_Second slice'],
+		];
+
+		/**
+		 * A dependent in the GitHub Projects shape — no `id`, because that provider's
+		 * reverse read answers with *issues* rather than board items, so its board
+		 * identity has to be resolved from the `url`.
+		 */
+		function dependent(overrides: Partial<WorkItemDependent> = {}): WorkItemDependent {
+			return {
+				reference: '#901',
+				url: 'https://github.com/o/r/issues/901',
+				title: 'Waiting work',
+				open: true,
+				...overrides,
+			};
+		}
+
+		const blockedByPairs = (deps: ReturnType<typeof makeDeps>) =>
+			deps.pm.addBlockedBy.mock.calls.map(([id, blockerId]) => [id, blockerId]);
+
+		beforeEach(() => {
+			splitExists = true;
+			splitContents = TWO_CHILD_SPLIT;
+		});
+
+		it('records every spawned phase as a blocker of the dependent, leaving its existing edge alone', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([dependent()]);
+			deps.pm.findWorkItemByUrlSuffix.mockResolvedValue(
+				createMockWorkItem({ id: 'PVTI_dep', url: 'https://github.com/o/r/issues/901' }),
+			);
+
+			await runPlanningPhase(deps);
+
+			const pairs = blockedByPairs(deps);
+			expect(pairs).toEqual([
+				...CHAINING_PAIRS,
+				['PVTI_dep', 'PVTI_Second slice'],
+				['PVTI_dep', 'PVTI_Third slice'],
+			]);
+			// Phase 1 is the re-scoped original, which the dependent is *already*
+			// recorded as blocked by — that is what put it in the list — so no
+			// redundant write re-asserts it.
+			expect(pairs).not.toContainEqual(['PVTI_dep', 'PVTI_item18']);
+			// The whole URL is the lookup key, so the owner/repo it carries keeps a
+			// same-numbered card in another repository from answering.
+			expect(deps.pm.findWorkItemByUrlSuffix).toHaveBeenCalledWith(
+				'https://github.com/o/r/issues/901',
+			);
+		});
+
+		it('does not look up a dependent that already carries its own board id', async () => {
+			// Linear and Jira fill `WorkItemDependent.id` from their own reverse read.
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([dependent({ id: 'PVTI_dep' })]);
+
+			await runPlanningPhase(deps);
+
+			expect(deps.pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
+			expect(blockedByPairs(deps)).toEqual([
+				...CHAINING_PAIRS,
+				['PVTI_dep', 'PVTI_Second slice'],
+				['PVTI_dep', 'PVTI_Third slice'],
+			]);
+		});
+
+		it('is a no-op for an item nothing is waiting on, beyond the read that established that', async () => {
+			const deps = makeDeps();
+
+			await runPlanningPhase(deps);
+
+			expect(blockedByPairs(deps)).toEqual(CHAINING_PAIRS);
+			// One `listBlockers` call only — the phase-start dependency gate's. With no
+			// dependent to carry, the cycle read is never worth a board call.
+			expect(deps.pm.listBlockers).toHaveBeenCalledTimes(1);
+			expect(deps.pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
+		});
+
+		it('writes no dependency at all for a provider that models none, and still splits', async () => {
+			const deps = makeDeps();
+			deps.pm.supportsDependencies = false;
+			deps.pm.listDependents.mockResolvedValue([dependent()]);
+
+			const result = await runPlanningPhase(deps);
+
+			expect(deps.pm.listDependents).not.toHaveBeenCalled();
+			expect(deps.pm.addBlockedBy).not.toHaveBeenCalled();
+			expect(result.split?.subTaskItemIds).toEqual(['PVTI_Second slice', 'PVTI_Third slice']);
+			expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Second slice', PLANNED_LABEL);
+			expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Third slice', 'planning');
+		});
+
+		it('completes the split when the dependents read fails', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockRejectedValue(new Error('dependents read failed: 502'));
+
+			const result = await runPlanningPhase(deps);
+
+			expect(result.split?.subTaskItemIds).toEqual(['PVTI_Second slice', 'PVTI_Third slice']);
+			expect(blockedByPairs(deps)).toEqual(CHAINING_PAIRS);
+			expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
+			expect(deps.pm.addComment).toHaveBeenCalledWith('PVTI_item18', expect.any(String));
+		});
+
+		it('keeps processing the remaining dependents when one dependent write fails', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([
+				dependent({ id: 'PVTI_dep1', reference: '#901' }),
+				dependent({ id: 'PVTI_dep2', reference: '#902' }),
+			]);
+			deps.pm.addBlockedBy.mockImplementation(async (id) => {
+				if (id === 'PVTI_dep1') throw new Error('blocked-by write failed: 502');
+			});
+
+			await expect(runPlanningPhase(deps)).resolves.toBeTruthy();
+
+			expect(blockedByPairs(deps)).toEqual([
+				...CHAINING_PAIRS,
+				['PVTI_dep1', 'PVTI_Second slice'],
+				['PVTI_dep1', 'PVTI_Third slice'],
+				['PVTI_dep2', 'PVTI_Second slice'],
+				['PVTI_dep2', 'PVTI_Third slice'],
+			]);
+		});
+
+		it('skips a dependent that is on no board card and still processes the others', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([
+				dependent({ reference: '#901', url: 'https://github.com/o/r/issues/901' }),
+				dependent({ id: 'PVTI_dep2', reference: '#902' }),
+			]);
+			// No card wraps the first dependent's issue — a real issue-level edge, but
+			// nothing the contract can record without a card on both sides.
+			deps.pm.findWorkItemByUrlSuffix.mockResolvedValue(undefined);
+
+			await runPlanningPhase(deps);
+
+			expect(blockedByPairs(deps)).toEqual([
+				...CHAINING_PAIRS,
+				['PVTI_dep2', 'PVTI_Second slice'],
+				['PVTI_dep2', 'PVTI_Third slice'],
+			]);
+		});
+
+		it('creates no cycle: a dependent the item is itself blocked by gets no new edge', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([
+				dependent({ id: 'PVTI_cyclic', reference: '#901' }),
+				dependent({
+					id: 'PVTI_dep2',
+					reference: '#902',
+					url: 'https://github.com/o/r/issues/902',
+				}),
+			]);
+			// The gate reads the blockers first (and a *closed* blocker does not defer
+			// it); the carry-forward's own read is the second call.
+			deps.pm.listBlockers.mockResolvedValue([
+				{
+					reference: '#901',
+					url: 'https://github.com/o/r/issues/901',
+					title: 'Waiting work',
+					open: false,
+					source: 'dependency',
+				},
+			]);
+
+			await runPlanningPhase(deps);
+
+			expect(blockedByPairs(deps)).toEqual([
+				...CHAINING_PAIRS,
+				['PVTI_dep2', 'PVTI_Second slice'],
+				['PVTI_dep2', 'PVTI_Third slice'],
+			]);
+		});
+
+		it('does not let a prose-only blocker withhold a dependent edge (issue #643)', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([dependent({ id: 'PVTI_dep', reference: '#901' })]);
+			deps.pm.listBlockers.mockResolvedValue([
+				{
+					reference: '#901',
+					url: 'https://github.com/o/r/issues/901',
+					title: 'Waiting work',
+					open: false,
+					source: 'mention',
+				},
+			]);
+
+			await runPlanningPhase(deps);
+
+			expect(blockedByPairs(deps)).toEqual([
+				...CHAINING_PAIRS,
+				['PVTI_dep', 'PVTI_Second slice'],
+				['PVTI_dep', 'PVTI_Third slice'],
+			]);
+		});
+
+		it("never hands one of the split's own phases an edge on its siblings", async () => {
+			// What a *resumed* attempt reads: the children the previous attempt created
+			// already carry their blocked-by edge on the parent, so the parent's reverse
+			// read reports them.
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([
+				dependent({ reference: '#2', url: 'Second slice', title: 'Second slice' }),
+				dependent({ reference: '#3', url: 'Third slice', title: 'Third slice' }),
+			]);
+
+			await runPlanningPhase(deps);
+
+			expect(blockedByPairs(deps)).toEqual(CHAINING_PAIRS);
+			expect(deps.pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
+		});
+
+		it('skips the carry-forward rather than risking a cycle when the blocker read fails', async () => {
+			const deps = makeDeps();
+			deps.pm.listDependents.mockResolvedValue([dependent({ id: 'PVTI_dep' })]);
+			// The gate's own read succeeds; the carry-forward's fails, and a failed read
+			// is not evidence that there is no cycle.
+			deps.pm.listBlockers
+				.mockResolvedValueOnce([])
+				.mockRejectedValueOnce(new Error('blockers read failed: 502'));
+
+			const result = await runPlanningPhase(deps);
+
+			expect(result.split?.subTaskItemIds).toEqual(['PVTI_Second slice', 'PVTI_Third slice']);
+			expect(blockedByPairs(deps)).toEqual(CHAINING_PAIRS);
+			expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_Third slice', PLANNED_LABEL);
+		});
+	});
+
 	describe('an interrupted split resumes instead of duplicating', () => {
 		const THREE_PHASES = JSON.stringify({
 			sharedName: SHARED_NAME,
@@ -1519,6 +1773,18 @@ describe('runPlanningPhase', () => {
 		interface Board {
 			items: WorkItem[];
 			comments: Array<{ itemId: string; body: string }>;
+			/**
+			 * The native dependency graph, `dependent id → the ids blocking it`. Modelled
+			 * rather than counted because the *reverse* read is what a resumed attempt sees:
+			 * the children the first attempt chained behind the parent come back as
+			 * dependents of it (issue #890).
+			 */
+			blockedBy: Map<string, Set<string>>;
+			/**
+			 * Cards that were already on the board — not created by the split, so they do
+			 * not shift the ids `createWorkItem` mints for the children below.
+			 */
+			externals: WorkItem[];
 		}
 
 		/**
@@ -1554,6 +1820,35 @@ describe('runPlanningPhase', () => {
 					? 'existing-comment'
 					: undefined,
 			);
+			deps.pm.addBlockedBy.mockImplementation(async (id, blockerId) => {
+				const blockers = board.blockedBy.get(id) ?? new Set<string>();
+				blockers.add(blockerId);
+				board.blockedBy.set(id, blockers);
+			});
+			deps.pm.listBlockers.mockImplementation(async (id) =>
+				[...(board.blockedBy.get(id) ?? [])].map((blockerId) => ({
+					reference: blockerId,
+					url: `https://example.test/${blockerId}`,
+					title: blockerId,
+					open: true,
+					source: 'dependency' as const,
+				})),
+			);
+			// The reverse edge, read off the same map — and with no `id`, the shape a
+			// provider whose reverse read answers with issues rather than cards returns.
+			deps.pm.listDependents.mockImplementation(async (id) =>
+				[...board.blockedBy.entries()]
+					.filter(([, blockers]) => blockers.has(id))
+					.map(([dependentId]) => ({
+						reference: dependentId,
+						url: `https://example.test/${dependentId}`,
+						title: dependentId,
+						open: true,
+					})),
+			);
+			deps.pm.findWorkItemByUrlSuffix.mockImplementation(async (urlSuffix) =>
+				[...board.items, ...board.externals].find((item) => item.url.endsWith(urlSuffix)),
+			);
 			return deps;
 		}
 
@@ -1577,7 +1872,7 @@ describe('runPlanningPhase', () => {
 		beforeEach(() => {
 			splitExists = true;
 			splitContents = THREE_PHASES;
-			board = { items: [], comments: [] };
+			board = { items: [], comments: [], blockedBy: new Map(), externals: [] };
 		});
 
 		it('creates each child exactly once when the first attempt died between children', async () => {
@@ -1679,6 +1974,51 @@ describe('runPlanningPhase', () => {
 
 			expect(deps.pm.findWorkItemByDescriptionMarker).not.toHaveBeenCalled();
 			expect(board.items[0]?.description).not.toContain('swarm-split-child:');
+		});
+
+		it("leaves the dependents' blocked-by lists exactly as a single clean run does (issue #890)", async () => {
+			/** One board seeded with an external issue recorded as blocked by the parent. */
+			function withExternalDependent(): Board {
+				return {
+					items: [],
+					comments: [],
+					blockedBy: new Map([['PVTI_dep', new Set(['PVTI_item18'])]]),
+					externals: [
+						createMockWorkItem({
+							id: 'PVTI_dep',
+							title: 'Waiting work',
+							url: 'https://example.test/PVTI_dep',
+						}),
+					],
+				};
+			}
+			const snapshot = (b: Board) =>
+				Object.fromEntries(
+					[...b.blockedBy.entries()]
+						.sort(([a], [c]) => a.localeCompare(c))
+						.map(([id, ids]) => [id, [...ids].sort()]),
+				);
+
+			const cleanBoard = withExternalDependent();
+			await runPlanningPhase({ ...onBoard(makeDeps(), cleanBoard), runId: 'run-clean' });
+
+			const retriedBoard = withExternalDependent();
+			const first = onBoard(makeDeps(), retriedBoard);
+			failCreateOnCall(first, 2);
+			await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
+				'create-item failed: 502',
+			);
+			await runPlanningPhase({ ...onBoard(makeDeps(), retriedBoard), runId: 'run-A' });
+
+			// The dependent waits for the whole original scope — every phase — and each
+			// child is still blocked by its own predecessors and by nothing else, so the
+			// resumed delivery neither double-applies nor invents a sibling edge.
+			expect(snapshot(cleanBoard)).toEqual({
+				PVTI_child1: ['PVTI_item18'],
+				PVTI_child2: ['PVTI_child1', 'PVTI_item18'],
+				PVTI_dep: ['PVTI_child1', 'PVTI_child2', 'PVTI_item18'],
+			});
+			expect(snapshot(retriedBoard)).toEqual(snapshot(cleanBoard));
 		});
 	});
 

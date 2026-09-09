@@ -259,19 +259,23 @@ describe('real DB-free phase worktree lifecycle', () => {
 
 		// The whole split, in the order the phase performs it: read the item's own
 		// blockers for the dependency gate (issue #889 — the gate is the phase's first
-		// board call, ahead of the worktree and the agent, and its `/pm/listDependents`
+		// board call, ahead of the worktree and the agent, and its `/pm/dependents`
 		// twin is only reached when something would otherwise gate), check this
-		// delivery's own marker, re-scope the parent, look for a child this delivery
-		// already created (issue #543), create it, publish its preplan, embed the
-		// marker, mark it planned, move it to Planning, chain its dependency edge,
-		// explain the split, post the parent's plan, mark the parent planned. Ordering
-		// is load-bearing (issues #431, #436, #737 — the label goes on *before* the
-		// move, because that move is the event the Planning dispatch keys on), so it is
-		// asserted rather than just the set of calls.
+		// delivery's own marker, re-scope the parent, read what the item being split
+		// already blocks (issue #890 — once, before the first child exists, so the
+		// split's own children can never be carried forward; this board has no
+		// dependents, so it costs exactly that read and no write), look for a child
+		// this delivery already created (issue #543), create it, publish its preplan,
+		// embed the marker, mark it planned, move it to Planning, chain its dependency
+		// edge, explain the split, post the parent's plan, mark the parent planned.
+		// Ordering is load-bearing (issues #431, #436, #737 — the label goes on
+		// *before* the move, because that move is the event the Planning dispatch keys
+		// on), so it is asserted rather than just the set of calls.
 		expect(boardCalls.map((call) => call.route)).toEqual([
 			'/pm/blockers',
 			'/pm/find-comment',
 			'/pm/update-item',
+			'/pm/dependents',
 			'/pm/find-item-by-marker',
 			'/pm/create-item',
 			'/pm/comment',
