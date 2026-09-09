@@ -2514,6 +2514,50 @@ describe('processJob', () => {
 		expect(addComment).not.toHaveBeenCalled();
 	});
 
+	// The Planning half of the same gate (issue #889). The deferral path is keyed on
+	// the error type rather than the phase, so this pins that it stays that way.
+	it('defers a dependency-blocked Planning run on the same budget, then fails once it is exhausted', async () => {
+		const workItem = createMockWorkItem({ statusId: '3fe662f4' });
+		phaseImpl = async () => {
+			throw new DependencyBlockedError(workItem, [
+				{
+					reference: '#319',
+					url: 'https://github.com/o/r/issues/319',
+					title: 'Session auth',
+					open: true,
+					source: 'dependency',
+				},
+			]);
+		};
+
+		const deferred = await processJob(
+			createMockPmWebhookJob(),
+			registryReturning({ phase: 'planning', taskId: '100', workItem }),
+		);
+
+		// Deferred on the dependency-recheck cadence, with the board dispatch intent
+		// preserved so the re-check re-enters Planning even though the card never moved.
+		expect(deferred).toMatchObject({
+			status: 'phase-deferred',
+			dependencyRecheck: true,
+			pmPhaseStarted: true,
+		});
+		if (deferred.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+		expect(deferred.reason).toContain('#319');
+		expect(addComment).not.toHaveBeenCalled();
+
+		const exhausted = await processJob(
+			createMockPmWebhookJob({ dependencyRecheckAttempt: 1_000_000 }),
+			registryReturning({ phase: 'planning', taskId: '100', workItem }),
+		);
+
+		expect(exhausted.status).toBe('phase-failed');
+		expect(addComment).toHaveBeenCalledOnce();
+		const [, body] = addComment.mock.calls[0];
+		expect(body).toContain('#319');
+		expect(body).toMatch(/must be done first/i);
+	});
+
 	it('does not consume the rate-limit budget while waiting on a dependency', async () => {
 		const workItem = createMockWorkItem({ statusId: '61e4505c' });
 		phaseImpl = async () => {

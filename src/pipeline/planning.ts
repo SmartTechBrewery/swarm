@@ -14,6 +14,13 @@
  * code — it's delivered as a comment and the worktree is thrown away, so the
  * checkout is detached and never commits.
  *
+ * Before any of that, the run is gated on the item's own unfinished prerequisites
+ * (`assertDependenciesSatisfied`, issue #889) — the gate Implementation has run
+ * since issue #330, applied here because a plan written against a base branch that
+ * does not yet carry the blocker's implementation is stale as soon as it is
+ * published. A preplanned split child is the one deliberate exception; see the
+ * call site in {@link runPlanningPhase}.
+ *
  * When the project opts into `pipeline.planning.verifyPlan` (issue #818), a
  * second, independent agent runs in the same still-read-only worktree between
  * the plan being written and anything being posted or applied to the board: it
@@ -50,6 +57,7 @@ import {
 import { agentRunError } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { logger } from '@/lib/logger.js';
+import { assertDependenciesSatisfied } from '@/pipeline/dependency-guard.js';
 import {
 	buildPreplanContract,
 	embedPreplanMarker,
@@ -1923,6 +1931,24 @@ export async function runPlanningPhase(
 	if (preplannedResult) {
 		return preplannedResult;
 	}
+
+	// Dependency gate (issue #889 — the same gate Implementation has run since #330):
+	// never plan a task whose prerequisites are unfinished. Planning reads the tree at
+	// the run's base branch, so a plan written while the blocker's PR is unmerged names
+	// files, signatures and migrations the blocker is about to change — it is stale the
+	// moment it is published, and nothing re-plans it. Checked before the worktree, the
+	// graft and the agent (and Planning moves no status of its own until it has a plan),
+	// so a blocked run defers having spent zero model tokens; the worker re-checks it
+	// cheaply until the blocker closes. Provider-agnostic, recorded-relationships-only
+	// and cycle-safe — all three are properties of the shared gate.
+	//
+	// Deliberately *after* the preplanned short-circuit above: that path replays a plan
+	// the parent Planning run already wrote and published, reading no repository and
+	// spending no agent, and every split child is natively blocked by its predecessors
+	// — so gating it would defer (and eventually fail) the very dispatch that re-applies
+	// a `planned` label whose write failed (see `markSplitChildPlanned`). A human who
+	// removes `planned` to force a genuine re-plan does hit the gate, which is right.
+	await assertDependenciesSatisfied(pm, workItem);
 
 	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
 

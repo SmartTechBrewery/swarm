@@ -349,9 +349,11 @@ must not hold goes up to the control plane's delivery API: Implementation's boar
 moves, comments and dependency lookup; Respond-to-review's card lookup and board
 moves; Review's submitted verdict under the reviewer PAT; and the two things
 backed by the control plane's database — Review's verdict-ledger reads/writes and
-the follow-up Review a pushed fix enqueues. Planning's board surface (creating a
-split's sibling cards, chaining their dependency edges, re-scoping the parent,
-labelling what finished, finding its own plan comment on a retry) rides five more
+the follow-up Review a pushed fix enqueues. Planning's board surface (its own
+blocker/dependent lookup for the dependency gate it has run since issue #889 —
+which rides the routes Implementation's already uses — plus creating a split's
+sibling cards, chaining their dependency edges, re-scoping the parent, labelling
+what finished, and finding its own plan comment on a retry) rides five more
 PM delivery routes, while its agent run, plan file, and scope gate stay
 worker-side; a split interrupted partway resumes from a per-child marker rather
 than creating that child twice. Results stream back over the transport (ADR-003

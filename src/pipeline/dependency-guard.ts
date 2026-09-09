@@ -1,10 +1,12 @@
 /**
- * Provider-agnostic dependency gate for the pipeline (issue #330).
+ * Provider-agnostic dependency gate for the pipeline (issues #330, #889).
  *
  * Given a {@link PMProvider} and a work item, returns the still-open prerequisites
- * that should defer the item's Implementation run — so a phase never starts while
- * a task it depends on is unfinished (the out-of-order build that produced the
- * PR #326 ⁄ #327 conflict). It speaks only the PMProvider interface (no GitHub
+ * that should defer the item's run of a gated phase — Implementation since issue
+ * #330, Planning since issue #889 — so a phase never starts while a task it
+ * depends on is unfinished (the out-of-order build that produced the
+ * PR #326 ⁄ #327 conflict, and the plan written against a tree missing its
+ * prerequisite's implementation). It speaks only the PMProvider interface (no GitHub
  * specifics, ai/RULES.md §2), so it works for any provider and no-ops for one
  * that can't model dependencies (`supportsDependencies === false`) — there the
  * human-readable split comment remains the guard.
@@ -68,7 +70,7 @@ export class DependencyBlockedError extends Error {
  * prerequisite still gets its own.
  *
  * Best-effort: every failure here is logged and swallowed. This is a notice about
- * something that is deliberately not gating, so failing the Implementation run
+ * something that is deliberately not gating, so failing the gated run
  * over a board write would be strictly worse than the missed comment — the log
  * line still carries the same information.
  */
@@ -148,7 +150,7 @@ async function withoutCyclicBlockers(
  *
  * Best-effort by design: if the provider can't model dependencies, or the blocker
  * lookup fails transiently, this returns `[]` (proceed) rather than gating — a
- * spurious network error must not wedge every Implementation run. The native
+ * spurious network error must not wedge every gated run. The native
  * relationship plus the human-readable comment are the durable guards; this is
  * the automated convenience on top.
  *
@@ -182,4 +184,30 @@ export async function findGatingBlockers(
 	// suppress, the check could only cost a board call per dispatch.
 	if (gating.length === 0) return gating;
 	return withoutCyclicBlockers(pm, workItem, gating);
+}
+
+/**
+ * Gate a phase on its work item's unfinished prerequisites: throw
+ * {@link DependencyBlockedError} when {@link findGatingBlockers} finds any, and
+ * return so the phase proceeds when it does not.
+ *
+ * Both gated phases call this as their **first** real statement — before the board
+ * status report, the worktree, credentials, and the agent. That placement is what
+ * makes the deferral token-free, and it is a property each call site owes rather
+ * than one this function can enforce.
+ *
+ * Issue #330 gated Implementation; issue #889 gated Planning the same way, because
+ * planning against a tree that does not yet contain the prerequisite's
+ * implementation publishes a plan that is stale from the moment it is written —
+ * the same out-of-order-work failure, one phase earlier. The pairing lives here
+ * rather than being copied per phase so the two can never drift.
+ */
+export async function assertDependenciesSatisfied(
+	pm: PMProvider,
+	workItem: WorkItem,
+): Promise<void> {
+	const gatingBlockers = await findGatingBlockers(pm, workItem);
+	if (gatingBlockers.length > 0) {
+		throw new DependencyBlockedError(workItem, gatingBlockers);
+	}
 }

@@ -118,17 +118,18 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  * needs, and the two remaining reads refuse via {@link unavailableRead}. The
  * phases a DB-free worker runs need exactly that surface — Implementation moves
  * the card, posts its comment and gates on dependencies; Respond-to-review
- * resolves its card and moves it; Planning posts its plan, re-scopes the parent,
- * creates and prepares each split child, chains the dependency edges and labels
- * what it finished — so a call to anything else is a wiring bug, and the thrown
- * message says so.
+ * resolves its card and moves it; Planning gates on dependencies too (issue #889),
+ * then posts its plan, re-scopes the parent, creates and prepares each split child,
+ * chains the dependency edges and labels what it finished — so a call to anything
+ * else is a wiring bug, and the thrown message says so.
  *
  * `listBlockers` is transported rather than stubbed because the alternative is
- * unsafe: with `supportsDependencies: false`, Implementation's dependency gate
- * (`../pipeline/dependency-guard.ts`) short-circuits, and a work item whose
- * prerequisites are still open would be built out of order — the failure issue
- * #330 exists to prevent. Nothing else gates it: `findGatingBlockers` is called
- * only inside the phase, never by the dispatcher or the eligibility gate. So the
+ * unsafe: with `supportsDependencies: false`, the dependency gate both board
+ * phases run (`../pipeline/dependency-guard.ts`) short-circuits, and a work item
+ * whose prerequisites are still open would be planned and built out of order —
+ * the failure issues #330 and #889 exist to prevent. Nothing else gates it:
+ * `findGatingBlockers` is called only inside the phase, never by the dispatcher or
+ * the eligibility gate. So the
  * capability is declared **on** and the read runs server-side under the PM
  * credential. That read still carries both blocker sources, because the gate needs
  * the prose-only ones to *surface* them even though it no longer defers on them
@@ -136,8 +137,8 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  *
  * `listDependents` is transported for the mirror reason (issue #639). The gate's
  * cycle backstop runs inside the phase, so it runs *here*: refusing the read would
- * leave every federated Implementation deferring on a blocker it natively blocks
- * until the wait budget ran out — the deadlock the backstop exists to prevent, and
+ * leave every federated Planning and Implementation deferring on a blocker it
+ * natively blocks until the wait budget ran out — the deadlock the backstop exists to prevent, and
  * the one that was actually observed. Failing the read is safe-by-construction
  * (the gate keeps its blockers), but it is safe in the direction that keeps the
  * bug, which is why the route exists rather than an `unavailableRead`.
