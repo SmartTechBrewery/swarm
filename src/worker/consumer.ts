@@ -788,7 +788,8 @@ function deferDependencyBlock(
 		resumable: false,
 		dependencyRecheck: true,
 		// The phase was entered (its gate ran) — preserve board dispatch intent so the
-		// re-check re-enters Implementation even though the card never moved.
+		// re-check re-enters the same board-driven phase (Planning since issue #889,
+		// Implementation since #330) even though the card never moved.
 		pmPhaseStarted:
 			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
 		runId,

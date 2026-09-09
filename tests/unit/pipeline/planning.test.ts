@@ -67,7 +67,12 @@ import {
 	PLAN_VERIFIED_NOTE,
 } from '@/pipeline/prompts/plan-verification.js';
 import { parseSplitTitle } from '@/pipeline/split-naming.js';
-import type { UpdateWorkItemPatch, WorkItem } from '@/pm/types.js';
+import type {
+	UpdateWorkItemPatch,
+	WorkItem,
+	WorkItemBlocker,
+	WorkItemDependent,
+} from '@/pm/types.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
@@ -185,8 +190,8 @@ function makeDeps() {
 		addLabel: vi.fn<(id: string, name: string) => Promise<void>>(async () => {}),
 		supportsDependencies: true,
 		supportsAssignees: true,
-		listBlockers: vi.fn(async () => []),
-		listDependents: vi.fn(async () => []),
+		listBlockers: vi.fn<() => Promise<WorkItemBlocker[]>>(async () => []),
+		listDependents: vi.fn<() => Promise<WorkItemDependent[]>>(async () => []),
 		addBlockedBy: vi.fn<(id: string, blockerId: string) => Promise<void>>(async () => {}),
 		resolveItemRepository: vi.fn(async () => ({ status: 'unrouted' }) as const),
 	};
@@ -235,6 +240,120 @@ describe('runPlanningPhase', () => {
 			independentConcerns: ['the planning phase'],
 			affectedAreas: ['src/pipeline/planning.ts'],
 			outOfScope: ['unrelated dashboard work'],
+		});
+	});
+
+	// The dependency gate Planning has run since issue #889 — the same shared gate
+	// Implementation has run since #330. Planning reads the tree at the run's base
+	// branch, so a plan written while the prerequisite's PR is unmerged is stale the
+	// moment it is published.
+	describe('dependency gate (issue #889)', () => {
+		const OPEN_BLOCKER: WorkItemBlocker = {
+			reference: '#319',
+			url: 'https://github.com/o/r/issues/319',
+			title: 'Session auth',
+			open: true,
+			source: 'dependency',
+		};
+
+		it('defers (throws DependencyBlockedError) when the item is blocked by an open recorded prerequisite', async () => {
+			const deps = makeDeps();
+			deps.pm.listBlockers.mockResolvedValueOnce([OPEN_BLOCKER]);
+
+			await expect(runPlanningPhase(deps)).rejects.toMatchObject({
+				name: 'DependencyBlockedError',
+			});
+
+			// Nothing was started: no worktree, no graft, no agent, and no board write of
+			// any kind — so the deferral spends zero model tokens and leaves no trace.
+			expect(deps.worktrees.provision).not.toHaveBeenCalled();
+			expect(deps.worktrees.reuse).not.toHaveBeenCalled();
+			expect(deps.graft).not.toHaveBeenCalled();
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(deps.pm.moveWorkItem).not.toHaveBeenCalled();
+			expect(deps.pm.addComment).not.toHaveBeenCalled();
+			expect(deps.pm.addLabel).not.toHaveBeenCalled();
+		});
+
+		it('plans normally when the recorded prerequisite is closed (its implementation merged)', async () => {
+			const deps = makeDeps();
+			deps.pm.listBlockers.mockResolvedValueOnce([{ ...OPEN_BLOCKER, open: false }]);
+
+			await expect(runPlanningPhase(deps)).resolves.toBeDefined();
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+		});
+
+		it('does not defer on a prose-only prerequisite, but surfaces it once on the item (issue #643)', async () => {
+			const deps = makeDeps();
+			deps.pm.listBlockers.mockResolvedValueOnce([{ ...OPEN_BLOCKER, source: 'mention' }]);
+
+			await expect(runPlanningPhase(deps)).resolves.toBeDefined();
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+
+			// The advisory notice is posted alongside the plan comment, not instead of it.
+			const advisory = deps.pm.addComment.mock.calls.find(([, body]) =>
+				body.includes('Possible unrecorded prerequisite'),
+			);
+			expect(advisory?.[0]).toBe('PVTI_item18');
+			expect(advisory?.[1]).toContain('#319');
+		});
+
+		it('does not re-post the prose notice when one is already on the item', async () => {
+			const deps = makeDeps();
+			deps.pm.listBlockers.mockResolvedValueOnce([{ ...OPEN_BLOCKER, source: 'mention' }]);
+			// The advisory marker resolves; the plan-delivery marker does not (no runId here).
+			deps.pm.findComment.mockResolvedValueOnce('existing-advisory');
+
+			await expect(runPlanningPhase(deps)).resolves.toBeDefined();
+			expect(
+				deps.pm.addComment.mock.calls.filter(([, body]) =>
+					body.includes('Possible unrecorded prerequisite'),
+				),
+			).toHaveLength(0);
+		});
+
+		it('does not defer on a blocker this item itself natively blocks (issue #639)', async () => {
+			const deps = makeDeps();
+			deps.pm.listBlockers.mockResolvedValueOnce([OPEN_BLOCKER]);
+			deps.pm.listDependents.mockResolvedValueOnce([
+				{
+					reference: OPEN_BLOCKER.reference,
+					url: OPEN_BLOCKER.url,
+					title: OPEN_BLOCKER.title,
+					open: true,
+				},
+			]);
+
+			await expect(runPlanningPhase(deps)).resolves.toBeDefined();
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+		});
+
+		it('gates on nothing for a provider that cannot model dependencies', async () => {
+			const deps = makeDeps();
+			deps.pm.supportsDependencies = false;
+			deps.pm.listBlockers.mockResolvedValueOnce([OPEN_BLOCKER]);
+
+			await expect(runPlanningPhase(deps)).resolves.toBeDefined();
+			expect(deps.pm.listBlockers).not.toHaveBeenCalled();
+			expect(deps.runAgent).toHaveBeenCalledTimes(1);
+		});
+
+		// The one deliberate exception: a preplanned split child replays the plan its
+		// parent's Planning run already wrote and published, and every split child is
+		// natively blocked by its predecessors — so gating it would defer, and finally
+		// fail, the dispatch that re-applies a `planned` label whose write failed.
+		it('publishes a preplanned split child’s plan rather than deferring it', async () => {
+			const deps = makeDeps();
+			deps.workItem = preplannedChild('# Reused plan\n\nImplement the UI slice.');
+			deps.pm.listBlockers.mockResolvedValueOnce([OPEN_BLOCKER]);
+
+			const result = await runPlanningPhase(deps);
+
+			expect(result).toMatchObject({ preplanned: true });
+			expect(deps.pm.listBlockers).not.toHaveBeenCalled();
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(deps.pm.addComment.mock.calls[0][1]).toContain('Implement the UI slice.');
+			expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_child', 'planned');
 		});
 	});
 

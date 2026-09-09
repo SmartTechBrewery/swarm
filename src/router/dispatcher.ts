@@ -344,8 +344,9 @@ export function adaptResultToPhaseRun(
 	// same "must be done first" message once it is exhausted. Both the item and a
 	// non-empty blocker list are needed for that message and the deferral log line to
 	// name the prerequisites, so a frame missing either stays terminal — today's
-	// behaviour — rather than deferring with a message that names nothing. Only
-	// Implementation gates on dependencies and its trigger always carries the work item
+	// behaviour — rather than deferring with a message that names nothing. Both phases
+	// that gate on dependencies (Implementation since issue #330, Planning since #889)
+	// share the one `TriggerResult` member carrying the work item
 	// (`../triggers/types.ts`), so that is a wiring bug, never a real case.
 	if (result.failureKind === 'dependency') {
 		if (workItem && result.blockers?.length) {

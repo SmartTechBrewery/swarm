@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { logger } from '@/lib/logger.js';
-import { DependencyBlockedError, findGatingBlockers } from '@/pipeline/dependency-guard.js';
+import {
+	assertDependenciesSatisfied,
+	DependencyBlockedError,
+	findGatingBlockers,
+} from '@/pipeline/dependency-guard.js';
 import type { PMProvider, WorkItem, WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import { createMockWorkItem } from '../../helpers/factories.js';
 
@@ -252,5 +256,27 @@ describe('DependencyBlockedError', () => {
 		expect(err.message).toContain('#319');
 		expect(err.blockers).toHaveLength(1);
 		expect(err.workItem.id).toBe('PVTI_1');
+	});
+});
+
+describe('assertDependenciesSatisfied', () => {
+	it('throws a DependencyBlockedError carrying the gating blockers', async () => {
+		const pm = pmWith({ listBlockers: vi.fn(async () => [blocker()]) });
+		await expect(assertDependenciesSatisfied(pm, workItem)).rejects.toMatchObject({
+			name: 'DependencyBlockedError',
+			blockers: [expect.objectContaining({ reference: '#319' })],
+		});
+	});
+
+	it('resolves silently when every recorded prerequisite is closed', async () => {
+		const pm = pmWith({ listBlockers: vi.fn(async () => [blocker({ open: false })]) });
+		await expect(assertDependenciesSatisfied(pm, workItem)).resolves.toBeUndefined();
+	});
+
+	it('resolves silently for a provider that cannot model dependencies', async () => {
+		const listBlockers = vi.fn(async () => [blocker()]);
+		const pm = pmWith({ supportsDependencies: false, listBlockers });
+		await expect(assertDependenciesSatisfied(pm, workItem)).resolves.toBeUndefined();
+		expect(listBlockers).not.toHaveBeenCalled();
 	});
 });

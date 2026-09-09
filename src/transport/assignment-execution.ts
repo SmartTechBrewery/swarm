@@ -581,9 +581,10 @@ export function deferrableOrFailedResult(
  * - `planning` — the agent run, the plan file it writes and the deterministic
  *   scope gate are all worker-side; every board operation rides the delivery API
  *   under the project's PM credential. That is a wider PM surface than any other
- *   phase's (post the plan, re-scope the parent, create each split child, embed its
- *   preplan marker, move it, label it, chain its dependency edges, and find its own
- *   plan comment on a replay), which is why ADR-003 originally deferred it — but
+ *   phase's (read its own blockers and dependents for the dependency gate it has
+ *   run since issue #889, post the plan, re-scope the parent, create each split
+ *   child, embed its preplan marker, move it, label it, chain its dependency edges,
+ *   and find its own plan comment on a replay), which is why ADR-003 originally deferred it — but
  *   width alone was never a boundary violation: no project credential crosses the
  *   wire, every write is idempotent or best-effort at the provider, and the split's
  *   replay guard (`findComment` on the plan-delivery marker) is one of the calls
@@ -645,9 +646,10 @@ const BOARD_DRIVEN_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
  * takes none (review / respond-to-ci / resolve-conflicts — `runAssignedPhase`
  * then constructs nothing). Every board-driven phase gets the same delegate-less
  * transport writer: its board writes ride the delivery API under the server-held
- * PM credential, as do the four narrow reads it serves — Implementation's
- * `listBlockers`, Respond-to-review's card lookups, and Planning's `findComment`
- * replay guard. The two enumerating reads still refuse, because the control plane
+ * PM credential, as do the four narrow reads it serves — the `listBlockers` /
+ * `listDependents` pair both board phases' dependency gate makes (issues #330,
+ * #889), Respond-to-review's card lookups, and Planning's `findComment` replay
+ * guard. The two enumerating reads still refuse, because the control plane
  * performed the reads this assignment was composed from.
  */
 function resolveDbFreePm(

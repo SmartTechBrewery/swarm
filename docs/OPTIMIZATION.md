@@ -106,13 +106,18 @@ source for preplan validation — for whether a run that *was* dispatched may re
 of spending an agent. Since issue #737 it is no longer what suppresses the dispatch; the `planned`
 label is (below).
 
-The Preplan comment carries the plan as ordinary prose, which the Implementation dependency gate
-also reads when it scans an item for prerequisites named in text. That scan therefore skips every
+The Preplan comment carries the plan as ordinary prose, which the dependency gate both board-driven
+phases run also reads when it scans an item for prerequisites named in text. That scan therefore skips every
 comment SWARM itself wrote (`isSwarmGeneratedBody`): a plan phrased as "this phase requires #266 to
 land first" is the agent describing its own work, not an operator declaring a blocker. Prose the
 gate does read — the item's description and comments written by people — no longer *defers* anything
 either (issue #643): a prerequisite found only in prose is surfaced on the item for a human to
 record natively, and only a recorded relationship gates the run.
+
+A dispatched preplanned child publishes its plan rather than being gated on the predecessors it is
+chained to (issue #889): that plan was written by the parent's Planning run against the same tree,
+so the child reads no repository and spends no agent, and gating it would defer the one dispatch
+that repairs a `planned` label whose write failed.
 
 SWARM creates the card in Backlog only long enough to write that marker **and apply the `planned`
 label**, then moves it to Planning. That ordering means both the Planning-move webhook and a delayed
