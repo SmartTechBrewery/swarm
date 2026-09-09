@@ -39,7 +39,7 @@ describe('AppSettingsSchema', () => {
 			agents: {
 				defaults: {
 					claude: 'opus',
-					antigravity: 'Gemini 3.5 Flash (Medium)',
+					antigravity: 'Gemini 3.6 Flash (Medium)',
 					codex: 'gpt-5.6-terra',
 				},
 			},

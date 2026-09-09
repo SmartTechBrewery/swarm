@@ -25,9 +25,39 @@ describe('toTargetList', () => {
 	});
 
 	it('splits a legacy combined antigravity model into a logical id plus reasoning', () => {
-		expect(toTargetList({ cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' })).toEqual([
-			{ cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' },
+		expect(toTargetList({ cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' },
 		]);
+	});
+
+	it('reads a retired antigravity model as its live replacement (issue #892)', () => {
+		expect(toTargetList({ cli: 'antigravity', model: 'gemini-3.5-flash' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash' },
+		]);
+		expect(toTargetList({ cli: 'antigravity', model: 'gemini-3.5-flash-low' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'low' },
+		]);
+	});
+
+	it('reads a stored antigravity model with no cli as an antigravity target', () => {
+		// A pre-`targets` config could store `model` alone. The schema pins the CLI on
+		// parse (issue #892); mirror it here, or the screen shows no CLI chosen and a
+		// disabled Model selector for a phase that runs on antigravity.
+		expect(toTargetList({ model: 'gemini-3.5-flash' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash' },
+		]);
+		expect(toTargetList({ model: 'Gemini 3.5 Flash (High)' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' },
+		]);
+		expect(toTargetList({ model: 'gemini-3.8-flash' })).toEqual([
+			{ cli: 'antigravity', model: 'gemini-3.8-flash' },
+		]);
+	});
+
+	it('leaves a stored claude model with no cli unpinned', () => {
+		// Only antigravity values are pinned — a claude alias keeps reading as "no CLI
+		// named", the phase's coded default.
+		expect(toTargetList({ model: 'sonnet' })).toEqual([{ model: 'sonnet' }]);
 	});
 
 	it('normalizes every target of a stored list and keeps its order', () => {
@@ -203,9 +233,9 @@ describe('areTargetsDirty', () => {
 	});
 
 	it('compares a legacy single selection against its one-element list', () => {
-		const legacy: AgentConfig = { cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' };
+		const legacy: AgentConfig = { cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' };
 		expect(areTargetsDirty(toTargetList(legacy), legacy)).toBe(false);
-		expect(areTargetsDirty([{ cli: 'antigravity', model: 'gemini-3.5-flash' }], legacy)).toBe(true);
+		expect(areTargetsDirty([{ cli: 'antigravity', model: 'gemini-3.6-flash' }], legacy)).toBe(true);
 	});
 
 	it('ignores rows that select nothing on either side', () => {

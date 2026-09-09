@@ -7,7 +7,12 @@ import {
 	CLAUDE_MODELS,
 	CODEX_MODELS,
 	capabilityFor,
+	DEFAULT_MODEL_PER_CLI,
+	isAntigravityModelValue,
+	LEGACY_ANTIGRAVITY_DISPLAY_STRINGS,
+	migrateRetiredAntigravityModel,
 	normalizeModelSelection,
+	RETIRED_ANTIGRAVITY_MODELS,
 	reasoningChoicesFor,
 	resolveModelLaunch,
 	splitAntigravityModel,
@@ -60,16 +65,9 @@ describe('reasoningChoicesFor', () => {
 	});
 
 	it('exposes the per-model antigravity tiers, empty for single-variant models', () => {
-		expect(reasoningChoicesFor('antigravity', 'gemini-3.5-flash')).toEqual([
-			'low',
-			'medium',
-			'high',
-		]);
-		expect(reasoningChoicesFor('antigravity', 'gemini-3.6-flash')).toEqual([
-			'low',
-			'medium',
-			'high',
-		]);
+		for (const flash of ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash']) {
+			expect(reasoningChoicesFor('antigravity', flash)).toEqual(['low', 'medium', 'high']);
+		}
 		expect(reasoningChoicesFor('antigravity', 'gemini-3.1-pro')).toEqual(['low', 'high']);
 		expect(reasoningChoicesFor('antigravity', 'claude-sonnet-4.6')).toEqual([]);
 		expect(reasoningChoicesFor('antigravity', 'gpt-oss-120b')).toEqual([]);
@@ -103,25 +101,28 @@ describe('resolveModelLaunch', () => {
 	});
 
 	it('folds antigravity reasoning into the combined --model slug, no flag', () => {
-		expect(resolveModelLaunch('antigravity', 'gemini-3.5-flash', 'high')).toEqual({
-			model: 'gemini-3.5-flash-high',
+		expect(resolveModelLaunch('antigravity', 'gemini-3.8-flash', 'high')).toEqual({
+			model: 'gemini-3.8-flash-high',
 			providerArgs: [],
 		});
 	});
 
-	it('folds gemini-3.6-flash reasoning into the exact agy --model slug', () => {
-		expect(resolveModelLaunch('antigravity', 'gemini-3.6-flash', 'high')).toEqual({
-			model: 'gemini-3.6-flash-high',
-			providerArgs: [],
-		});
-		expect(resolveModelLaunch('antigravity', 'gemini-3.6-flash', undefined).model).toBe(
-			'gemini-3.6-flash-medium',
-		);
+	it('folds each live Flash tier’s reasoning into its exact agy --model slug', () => {
+		// 3.7 and 3.8 Flash are the tiers agy 1.1.28 added (issue #892); 3.6 is the
+		// one that was already here, re-checked against the same `agy models`.
+		for (const version of ['3.8', '3.7', '3.6']) {
+			expect(resolveModelLaunch('antigravity', `gemini-${version}-flash`, 'low').model).toBe(
+				`gemini-${version}-flash-low`,
+			);
+			expect(resolveModelLaunch('antigravity', `gemini-${version}-flash`, 'high').model).toBe(
+				`gemini-${version}-flash-high`,
+			);
+		}
 	});
 
 	it('falls back to the antigravity model default slug when reasoning is omitted', () => {
-		expect(resolveModelLaunch('antigravity', 'gemini-3.5-flash', undefined).model).toBe(
-			'gemini-3.5-flash-medium',
+		expect(resolveModelLaunch('antigravity', 'gemini-3.6-flash', undefined).model).toBe(
+			'gemini-3.6-flash-medium',
 		);
 	});
 
@@ -160,10 +161,6 @@ describe('splitAntigravityModel / normalizeModelSelection', () => {
 		expect(splitAntigravityModel('claude-opus-4-6-thinking')).toEqual({
 			model: 'claude-opus-4.6',
 		});
-		expect(splitAntigravityModel('Gemini 3.5 Flash (High)')).toEqual({
-			model: 'gemini-3.5-flash',
-			reasoning: 'high',
-		});
 		expect(splitAntigravityModel('Gemini 3.6 Flash (Low)')).toEqual({
 			model: 'gemini-3.6-flash',
 			reasoning: 'low',
@@ -171,7 +168,8 @@ describe('splitAntigravityModel / normalizeModelSelection', () => {
 		expect(splitAntigravityModel('Claude Opus 4.6 (Thinking)')).toEqual({
 			model: 'claude-opus-4.6',
 		});
-		expect(splitAntigravityModel('gemini-3.5-flash')).toBeNull();
+		// A live logical id is already the shape callers want — nothing to resolve.
+		expect(splitAntigravityModel('gemini-3.6-flash')).toBeNull();
 	});
 
 	it('does not treat an Object.prototype name as a recognized display string', () => {
@@ -190,8 +188,8 @@ describe('splitAntigravityModel / normalizeModelSelection', () => {
 	});
 
 	it('normalizes only antigravity legacy strings, leaving other selections untouched', () => {
-		expect(normalizeModelSelection('antigravity', 'Gemini 3.5 Flash (Low)')).toEqual({
-			model: 'gemini-3.5-flash',
+		expect(normalizeModelSelection('antigravity', 'Gemini 3.6 Flash (Low)')).toEqual({
+			model: 'gemini-3.6-flash',
 			reasoning: 'low',
 		});
 		expect(normalizeModelSelection('claude', 'sonnet')).toEqual({ model: 'sonnet' });
@@ -203,7 +201,129 @@ describe('capabilityFor', () => {
 	it('reports the known/default reasoning per model', () => {
 		expect(capabilityFor('claude', 'sonnet')?.defaultReasoning).toBe('high');
 		expect(capabilityFor('codex', 'gpt-5.6-terra')?.defaultReasoning).toBe('medium');
-		expect(capabilityFor('antigravity', 'gemini-3.5-flash')?.defaultReasoning).toBe('medium');
+		expect(capabilityFor('antigravity', 'gemini-3.8-flash')?.defaultReasoning).toBe('medium');
+		expect(capabilityFor('antigravity', 'gemini-3.7-flash')?.defaultReasoning).toBe('medium');
 		expect(capabilityFor('antigravity', 'gemini-3.6-flash')?.defaultReasoning).toBe('medium');
+	});
+});
+
+describe('DEFAULT_MODEL_PER_CLI', () => {
+	it('names a model the CLI’s own catalog still lists', () => {
+		// The defect behind issue #892: the coded antigravity default outlived the
+		// model it named, so every phase falling through to it failed on spawn.
+		for (const [cli, model] of Object.entries(DEFAULT_MODEL_PER_CLI)) {
+			expect(capabilityFor(cli as keyof typeof DEFAULT_MODEL_PER_CLI, model)).toBeDefined();
+		}
+	});
+});
+
+describe('RETIRED_ANTIGRAVITY_MODELS', () => {
+	it('covers Gemini 3.5 Flash, which agy 1.1.28 withdrew', () => {
+		expect(RETIRED_ANTIGRAVITY_MODELS.map((m) => m.id)).toContain('gemini-3.5-flash');
+		// Retired means gone from every list SWARM can select or launch from.
+		expect(ANTIGRAVITY_MODELS).not.toContain('gemini-3.5-flash');
+		expect(capabilityFor('antigravity', 'gemini-3.5-flash')).toBeUndefined();
+		for (const slug of ANTIGRAVITY_MODEL_SLUGS) {
+			expect(slug).not.toMatch(/^gemini-3\.5-flash/);
+		}
+	});
+
+	it('replaces each retired model with a live one that keeps its reasoning tiers', () => {
+		// A replacement with narrower tiers would make a stored level resolve to no
+		// variant, which `resolveModelLaunch` throws on — i.e. the same failing
+		// launch this set exists to prevent.
+		for (const retired of RETIRED_ANTIGRAVITY_MODELS) {
+			const replacement = capabilityFor('antigravity', retired.replacedBy);
+			expect(replacement).toBeDefined();
+			for (const level of Object.keys(retired.variantByReasoning ?? {})) {
+				expect(replacement?.reasoningChoices).toContain(level);
+			}
+		}
+	});
+
+	it('migrates the retired id, its slugs, and its legacy display strings alike', () => {
+		expect(migrateRetiredAntigravityModel('gemini-3.5-flash')).toEqual({
+			model: 'gemini-3.6-flash',
+			retiredFrom: 'gemini-3.5-flash',
+		});
+		expect(splitAntigravityModel('gemini-3.5-flash-low')).toEqual({
+			model: 'gemini-3.6-flash',
+			reasoning: 'low',
+			retiredFrom: 'gemini-3.5-flash',
+		});
+		expect(splitAntigravityModel('Gemini 3.5 Flash (High)')).toEqual({
+			model: 'gemini-3.6-flash',
+			reasoning: 'high',
+			retiredFrom: 'gemini-3.5-flash',
+		});
+		expect(migrateRetiredAntigravityModel('gemini-3.6-flash')).toBeNull();
+	});
+
+	it('launches the replacement for every retired value, and reports the substitution', () => {
+		const retiredValues = [
+			'gemini-3.5-flash',
+			'gemini-3.5-flash-low',
+			'gemini-3.5-flash-medium',
+			'gemini-3.5-flash-high',
+			'Gemini 3.5 Flash (Low)',
+			'Gemini 3.5 Flash (Medium)',
+			'Gemini 3.5 Flash (High)',
+		];
+		for (const value of retiredValues) {
+			const launch = resolveModelLaunch('antigravity', value, undefined);
+			// Nothing SWARM dispatches may emit a withdrawn slug on `--model`.
+			expect(launch.model).not.toMatch(/^gemini-3\.5-flash/);
+			expect(ANTIGRAVITY_MODEL_SLUGS).toContain(launch.model);
+			expect(launch.retiredModel).toBe('gemini-3.5-flash');
+		}
+		// The stored reasoning level survives the hop rather than resetting to the
+		// replacement's default.
+		expect(resolveModelLaunch('antigravity', 'gemini-3.5-flash-low', undefined).model).toBe(
+			'gemini-3.6-flash-low',
+		);
+		expect(resolveModelLaunch('antigravity', 'gemini-3.5-flash', 'high').model).toBe(
+			'gemini-3.6-flash-high',
+		);
+	});
+
+	it('reports no substitution for a live selection', () => {
+		expect(
+			resolveModelLaunch('antigravity', 'gemini-3.8-flash', 'high').retiredModel,
+		).toBeUndefined();
+		expect(resolveModelLaunch('claude', 'sonnet', 'high').retiredModel).toBeUndefined();
+	});
+});
+
+describe('isAntigravityModelValue', () => {
+	it('recognizes every antigravity form a config can store', () => {
+		// The predicate a `cli`-less target is pinned by: logical ids, today's
+		// combined slugs, the pre-1.1.5 display strings, and a retired model's id and
+		// slugs must all be recognized, or such a target falls through to the coded
+		// default CLI (claude) and fails on spawn.
+		for (const value of [
+			...ANTIGRAVITY_MODELS,
+			...ANTIGRAVITY_MODEL_SLUGS,
+			...Object.keys(LEGACY_ANTIGRAVITY_DISPLAY_STRINGS),
+			...RETIRED_ANTIGRAVITY_MODELS.flatMap((retired) => [
+				retired.id,
+				...(retired.fixedVariant ? [retired.fixedVariant] : []),
+				...Object.values(retired.variantByReasoning ?? {}),
+			]),
+		]) {
+			expect(isAntigravityModelValue(value), value).toBe(true);
+		}
+	});
+
+	it('claims no claude or codex model, and no unknown string', () => {
+		// The pin is only safe because the catalogs are disjoint (asserted above for
+		// `AGENT_MODELS`), so a claude alias or a codex id must never match.
+		for (const value of [...CLAUDE_MODELS, ...CODEX_MODELS]) {
+			expect(isAntigravityModelValue(value), value).toBe(false);
+		}
+		expect(isAntigravityModelValue('gemini-9.9-flash')).toBe(false);
+		expect(isAntigravityModelValue('')).toBe(false);
+		// An inherited `Object.prototype` name must not read as a display string.
+		expect(isAntigravityModelValue('toString')).toBe(false);
+		expect(isAntigravityModelValue('constructor')).toBe(false);
 	});
 });

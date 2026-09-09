@@ -18,6 +18,7 @@ import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import {
 	AGENT_MODELS,
 	capabilityFor,
+	isAntigravityModelValue,
 	normalizeModelSelection,
 	reasoningChoicesFor,
 } from '../../../src/harness/models.js';
@@ -51,14 +52,22 @@ export function modelLabel(cli: AgentCli, model: string): string {
 
 /**
  * A stored target normalized for display: a legacy combined antigravity model
- * string (`"Gemini 3.5 Flash (High)"`) becomes its logical id + reasoning so the
- * Model and Reasoning selectors render the right selections. Other values pass
- * through untouched.
+ * string (`"Gemini 3.6 Flash (High)"`) becomes its logical id + reasoning so the
+ * Model and Reasoning selectors render the right selections, and a model the
+ * provider has retired reads as the live replacement it will actually launch on
+ * (issue #892) rather than as an empty Model selector. Other values pass through
+ * untouched.
+ *
+ * A target that omits `cli` while naming an antigravity model reads as
+ * antigravity, mirroring the pin `AgentTargetSchema` applies on parse — without
+ * it the CLI selector would show nothing chosen and the Model selector would be
+ * disabled, for a phase the worker in fact runs on antigravity.
  */
 function normalizeTarget(target: AgentTarget): AgentTarget {
 	if (!target.model) return { ...target };
-	const { model, reasoning } = normalizeModelSelection(target.cli, target.model);
-	return { ...target, model, reasoning: target.reasoning ?? reasoning };
+	const cli = target.cli ?? (isAntigravityModelValue(target.model) ? 'antigravity' : undefined);
+	const { model, reasoning } = normalizeModelSelection(cli, target.model);
+	return { ...target, cli, model, reasoning: target.reasoning ?? reasoning };
 }
 
 /** Whether a target selects anything at all — an untouched row selects nothing. */

@@ -395,7 +395,7 @@ describe('PhaseConfigRow', () => {
 				<tbody>
 					<PhaseConfigRow
 						phase="planning"
-						config={{ cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' }}
+						config={{ cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' }}
 						isPending={false}
 						onSelect={() => {}}
 					/>
@@ -403,7 +403,7 @@ describe('PhaseConfigRow', () => {
 			</table>,
 		);
 
-		expect(screen.getByText('Antigravity • Gemini 3.5 Flash')).toBeDefined();
+		expect(screen.getByText('Antigravity • Gemini 3.6 Flash')).toBeDefined();
 	});
 
 	it('falls back to "Coded default" when the phase overrides nothing', () => {
@@ -690,14 +690,46 @@ describe('PhaseSettingsDetail — model targets', () => {
 	});
 
 	it('renders a config written before targets existed as its single target', () => {
-		renderDetail({ cli: 'antigravity', model: 'Gemini 3.5 Flash (High)' });
+		renderDetail({ cli: 'antigravity', model: 'Gemini 3.6 Flash (High)' });
 
 		expect((screen.getByLabelText('Agent CLI, target 1') as HTMLSelectElement).value).toBe(
 			'antigravity',
 		);
 		expect((screen.getByLabelText('Model, target 1') as HTMLSelectElement).value).toBe(
-			'gemini-3.5-flash',
+			'gemini-3.6-flash',
 		);
+		expect((screen.getByLabelText('Reasoning, target 1') as HTMLSelectElement).value).toBe('high');
+	});
+
+	it('offers the live Antigravity models, and shows a retired one as its replacement', () => {
+		renderDetail({ cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' });
+
+		const models = Array.from(
+			(screen.getByLabelText('Model, target 1') as HTMLSelectElement).options,
+		).map((option) => option.text);
+		expect(models).toContain('Gemini 3.8 Flash');
+		expect(models).toContain('Gemini 3.7 Flash');
+		// Retired by the provider (issue #892) — never offered, and the stored
+		// selection reads as the replacement rather than as an empty selector.
+		expect(models).not.toContain('Gemini 3.5 Flash');
+		expect((screen.getByLabelText('Model, target 1') as HTMLSelectElement).value).toBe(
+			'gemini-3.6-flash',
+		);
+		expect((screen.getByLabelText('Reasoning, target 1') as HTMLSelectElement).value).toBe('high');
+	});
+
+	it('shows a retired Antigravity model stored without a cli on its pinned CLI', () => {
+		// The shape a pre-`targets` config could hold: `model` with no `cli`. The row
+		// must read as Antigravity on the replacement — an unpinned CLI would render
+		// the Model selector disabled, for a phase the worker runs on Antigravity.
+		renderDetail({ model: 'gemini-3.5-flash-high' });
+
+		const model = screen.getByLabelText('Model, target 1') as HTMLSelectElement;
+		expect((screen.getByLabelText('Agent CLI, target 1') as HTMLSelectElement).value).toBe(
+			'antigravity',
+		);
+		expect(model.disabled).toBe(false);
+		expect(model.value).toBe('gemini-3.6-flash');
 		expect((screen.getByLabelText('Reasoning, target 1') as HTMLSelectElement).value).toBe('high');
 	});
 

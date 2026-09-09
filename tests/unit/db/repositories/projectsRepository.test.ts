@@ -529,12 +529,12 @@ describe('projectsRepository', () => {
 			// at the config-schema boundary (issue #180); the repo then writes that
 			// normalized shape verbatim.
 			const agents = {
-				planning: { cli: 'antigravity' as const, model: 'Gemini 3.5 Flash (High)' },
+				planning: { cli: 'antigravity' as const, model: 'Gemini 3.6 Flash (High)' },
 			};
 			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1', agents }));
 			expect(values.mock.calls[0][0]).toMatchObject({
 				agents: {
-					planning: { cli: 'antigravity', model: 'gemini-3.5-flash', reasoning: 'high' },
+					planning: { cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' },
 				},
 			});
 		});

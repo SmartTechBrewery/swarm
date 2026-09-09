@@ -611,7 +611,7 @@ describe('runAgentCli', () => {
 		const promise = runAgentCli(
 			createMockRunAgentCliOptions({
 				cli: 'antigravity',
-				model: 'gemini-3.5-flash',
+				model: 'gemini-3.8-flash',
 				reasoning: 'high',
 				args: ['implement the thing'],
 			}),
@@ -621,9 +621,34 @@ describe('runAgentCli', () => {
 
 		const args = spawnMock.mock.calls[0][1] as string[];
 		expect(args).toContain('--model');
-		expect(args[args.indexOf('--model') + 1]).toBe('gemini-3.5-flash-high');
+		expect(args[args.indexOf('--model') + 1]).toBe('gemini-3.8-flash-high');
 		expect(args).not.toContain('--effort');
 		expect(args.some((a) => a.startsWith('model_reasoning_effort'))).toBe(false);
+	});
+
+	it('launches a retired antigravity model as its replacement, and warns (issue #892)', async () => {
+		const warn = vi.spyOn(logger, 'warn');
+		const promise = runAgentCli(
+			createMockRunAgentCliOptions({
+				cli: 'antigravity',
+				model: 'gemini-3.5-flash',
+				reasoning: 'high',
+				args: ['implement the thing'],
+			}),
+		);
+		(await spawnedChild(0)).emit('close', 0, null);
+		await promise;
+
+		// agy rejects the withdrawn slug outright, so the run must not carry it.
+		const args = spawnMock.mock.calls[0][1] as string[];
+		expect(args[args.indexOf('--model') + 1]).toBe('gemini-3.6-flash-high');
+		expect(warn).toHaveBeenCalledWith(
+			'configured model is retired; launching its replacement',
+			expect.objectContaining({
+				retiredModel: 'gemini-3.5-flash',
+				model: 'gemini-3.6-flash-high',
+			}),
+		);
 	});
 
 	it('forwards output line-by-line, including partial and CRLF lines', async () => {

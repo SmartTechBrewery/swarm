@@ -1690,7 +1690,7 @@ describe('runsRouter', () => {
 			await caller.retryNow({
 				runId: 'run-1',
 				cli: 'antigravity',
-				model: 'gemini-3.5-flash',
+				model: 'gemini-3.6-flash',
 				reasoning: 'high',
 			});
 
@@ -1698,7 +1698,7 @@ describe('runsRouter', () => {
 				'dispatch-1',
 				expect.objectContaining({
 					cliOverride: 'antigravity',
-					modelOverride: 'gemini-3.5-flash',
+					modelOverride: 'gemini-3.6-flash',
 					reasoningOverride: 'high',
 				}),
 			);
@@ -1717,7 +1717,7 @@ describe('runsRouter', () => {
 			const result = await caller.retryNow({
 				runId: 'run-1',
 				cli: 'antigravity',
-				model: 'gemini-3.5-flash',
+				model: 'gemini-3.6-flash',
 				reasoning: 'high',
 			});
 
@@ -1730,7 +1730,7 @@ describe('runsRouter', () => {
 					runId: 'run-1',
 					jobPayload: expect.objectContaining({
 						cliOverride: 'antigravity',
-						modelOverride: 'gemini-3.5-flash',
+						modelOverride: 'gemini-3.6-flash',
 						reasoningOverride: 'high',
 						runId: 'run-1',
 						rateLimitRetryAttempt: 0,
