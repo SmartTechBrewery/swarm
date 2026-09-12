@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -123,6 +123,16 @@ describe('validateMigrationJournal', () => {
 		]);
 	});
 
+	// Issue #907: three of five live projects keep no `src/db/migrations/` at
+	// all, and the resolve-conflicts guard failed their whole phase on a
+	// violation no agent could repair. An absent directory is clean; the case
+	// above — directory present, journal missing — is the one that keeps failing.
+	it('is clean for a repository with no migrations directory at all', () => {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-migration-journal-'));
+		roots.push(root);
+		expect(validateMigrationJournal(join(root, 'src/db/migrations'))).toEqual([]);
+	});
+
 	it('reports invalid JSON rather than throwing', () => {
 		const root = mkdtempSync(join(tmpdir(), 'swarm-migration-journal-'));
 		roots.push(root);
@@ -140,6 +150,9 @@ describe('validateMigrationJournal', () => {
 	// later.
 	it("is clean against this repo's own committed migrations", () => {
 		const repoMigrationsDir = join(THIS_DIR, '../../../src/db/migrations');
+		// Since issue #907 an absent directory validates clean, so a moved or
+		// renamed folder would pass this tripwire vacuously without the check.
+		expect(existsSync(repoMigrationsDir)).toBe(true);
 		expect(validateMigrationJournal(repoMigrationsDir)).toEqual([]);
 	});
 });

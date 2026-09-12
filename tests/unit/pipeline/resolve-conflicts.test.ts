@@ -176,6 +176,21 @@ describe('runResolveConflictsPhase — migration-journal gate (issue #503/#508)'
 		expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
 	});
 
+	// Issue #907: a repository that does not carry SWARM's own drizzle layout at
+	// all. The phase has to complete, and the guard must not spend its repair
+	// pass on a repository with nothing to validate — hence exactly one agent run.
+	it('delivers without a repair pass when the repository has no migrations directory', async () => {
+		const worktreePath = makeWorktree();
+		const deps = makeDeps(worktreePath);
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.runAgent).toHaveBeenCalledTimes(1);
+		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+	});
+
 	it('runs one repair pass and delivers once the repair fixes the journal', async () => {
 		const worktreePath = makeWorktree();
 		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
