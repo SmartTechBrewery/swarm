@@ -241,3 +241,105 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 		).toEqual(['ada-laptop', 'grace-box']);
 	});
 });
+
+describe('WorkersRoster search (issue #897)', () => {
+	const ADA = makeWorker();
+	const GRACE = makeWorker({
+		workerId: 'worker-2',
+		displayName: 'grace-box',
+		owner: { userId: 'u2', identifier: 'grace@example.com', displayName: 'Grace Hopper' },
+		repository: 'acme/backend',
+	});
+
+	const searchBox = () => screen.getByRole('searchbox', { name: 'Search workers' });
+	const machineNames = () =>
+		screen
+			.getAllByRole('row')
+			.slice(1)
+			.map((row) => row.querySelector('td')?.textContent);
+
+	it('offers the search box on the global screen and the project tab alike', async () => {
+		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
+		const { unmount } = renderRoster(<WorkersRoster />);
+		await screen.findByText('ada-laptop');
+		expect(searchBox()).toBeDefined();
+		unmount();
+
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+		await screen.findByText('ada-laptop');
+		expect(searchBox()).toBeDefined();
+	});
+
+	it('narrows the rows to the machines matching what was typed', async () => {
+		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+		await screen.findByText('ada-laptop');
+
+		fireEvent.change(searchBox(), { target: { value: 'grace-b' } });
+
+		expect(machineNames()).toEqual(['grace-box']);
+	});
+
+	it('matches the owner and the declared repository too', async () => {
+		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+		await screen.findByText('ada-laptop');
+
+		fireEvent.change(searchBox(), { target: { value: 'Lovelace' } });
+		expect(machineNames()).toEqual(['ada-laptop']);
+
+		fireEvent.change(searchBox(), { target: { value: 'acme/backend' } });
+		expect(machineNames()).toEqual(['grace-box']);
+	});
+
+	it('restores the full list when the input is cleared', async () => {
+		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+		await screen.findByText('ada-laptop');
+
+		fireEvent.change(searchBox(), { target: { value: 'grace' } });
+		expect(machineNames()).toEqual(['grace-box']);
+
+		fireEvent.change(searchBox(), { target: { value: '' } });
+		expect(machineNames()).toEqual(['ada-laptop', 'grace-box']);
+	});
+
+	it('distinguishes a search with no matches from an empty roster', async () => {
+		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+		await screen.findByText('ada-laptop');
+
+		fireEvent.change(searchBox(), { target: { value: 'turing' } });
+
+		expect(screen.getByText(/No workers match/)).toBeDefined();
+		// The roster itself is not empty, so its "nothing is enrolled" copy must not appear.
+		expect(screen.queryByText('No workers to show.')).toBeNull();
+		expect(screen.queryByRole('row')).toBeNull();
+
+		fireEvent.click(screen.getByRole('button', { name: 'Clear search' }));
+		expect(machineNames()).toEqual(['ada-laptop', 'grace-box']);
+	});
+
+	it('offers nothing to type into when the roster is empty', async () => {
+		workersListQueryFn.mockResolvedValue([]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+
+		await screen.findByText('No workers to show.');
+		expect(screen.queryByRole('searchbox')).toBeNull();
+	});
+
+	it('withholds the reorder controls while a search narrows the list', async () => {
+		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
+		renderRoster(<WorkersRoster projectId="proj-a" canReorder />);
+		await screen.findByText('ada-laptop');
+		expect(screen.getAllByRole('button', { name: /^Move / }).length).toBeGreaterThan(0);
+
+		// A move is relative to the project's whole order, which a filtered list
+		// no longer shows.
+		fireEvent.change(searchBox(), { target: { value: 'acme' } });
+		expect(screen.queryByRole('button', { name: /^Move / })).toBeNull();
+
+		fireEvent.change(searchBox(), { target: { value: '' } });
+		expect(screen.getAllByRole('button', { name: /^Move / }).length).toBeGreaterThan(0);
+	});
+});
