@@ -1,13 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
 	isMissingPmCredentialError,
-	isPmRoleEditable,
 	missingRequiredPmRoles,
 	type PmCredentialEntry,
 	type PmCredentialsView,
-	pmRoleInheritanceNote,
 	pmRoleKeyOriginNote,
 	pmRoleStatusLabel,
+	visiblePmRoles,
 } from './pm-credentials.js';
 
 function entry(overrides: Partial<PmCredentialEntry> = {}): PmCredentialEntry {
@@ -32,39 +31,30 @@ function view(roles: PmCredentialEntry[]): PmCredentialsView {
 	};
 }
 
-describe('isPmRoleEditable', () => {
-	it('allows editing a role the provider owns outright', () => {
-		expect(isPmRoleEditable(entry())).toBe(true);
+describe('visiblePmRoles', () => {
+	it('keeps the roles a provider owns outright, in declaration order', () => {
+		const roles = [entry(), entry({ role: 'secondThing' })];
+		expect(visiblePmRoles(view(roles)).map((role) => role.role)).toEqual([
+			'apiToken',
+			'secondThing',
+		]);
 	});
 
-	// A role that inherits a shared SCM credential *is* that credential, so it is
-	// configured on the Source Control tab (the API refuses the write too).
-	it('refuses a role that inherits a shared SCM credential', () => {
-		expect(isPmRoleEditable(entry({ inheritsSharedCredential: 'webhookSecret' }))).toBe(false);
-	});
-});
-
-describe('pmRoleInheritanceNote', () => {
-	// The reported defect (issue #630): the role inherits the shared SCM reference, so
-	// it resolves through `GITHUB_WEBHOOK_SECRET` while the provider's declared key is
-	// the neutral `SCM_WEBHOOK_SECRET`. The note must name the key that is actually
-	// read — never the unread default, and never SWARM's internal role name.
-	it('names the key an inherited role resolves through, and where it is configured', () => {
-		const note = pmRoleInheritanceNote(
-			entry({
-				role: 'webhookSecret',
-				envVarKey: 'SCM_WEBHOOK_SECRET',
-				referenceKey: 'GITHUB_WEBHOOK_SECRET',
-				inheritsSharedCredential: 'webhookSecret',
-			}),
-		);
-		expect(note).toContain('GITHUB_WEBHOOK_SECRET');
-		expect(note).toContain('Source Control');
-		expect(note).not.toContain('SCM_WEBHOOK_SECRET');
+	// Issue #902: a role that inherits a shared SCM credential *is* that credential, so
+	// it is configured — and inspected — on the Source Control tab alone. The rule is
+	// keyed on the flag, never on the `webhookSecret` role name, so a future inheriting
+	// role drops out the same way.
+	it('drops a role declaring inheritsSharedCredential, whatever it is named', () => {
+		const roles = [
+			entry(),
+			entry({ role: 'webhookSecret', inheritsSharedCredential: 'webhookSecret' }),
+			entry({ role: 'sharedThing', inheritsSharedCredential: 'reviewer' }),
+		];
+		expect(visiblePmRoles(view(roles)).map((role) => role.role)).toEqual(['apiToken']);
 	});
 
-	it('is absent for a role of the provider’s own', () => {
-		expect(pmRoleInheritanceNote(entry())).toBeUndefined();
+	it('renders nothing while the view is still loading', () => {
+		expect(visiblePmRoles(undefined)).toEqual([]);
 	});
 });
 
@@ -81,8 +71,8 @@ describe('pmRoleKeyOriginNote', () => {
 		expect(note).toContain('PM_GITHUB_PROJECTS_TOKEN');
 	});
 
-	// An inherited role's own note already names the resolved key, so this one stays
-	// silent rather than putting two key lines on the same card.
+	// An inherited role is not rendered on this tab at all (issue #902), so the helper
+	// stays silent rather than describing a credential that is the Source Control tab's.
 	it('is absent for an inherited role even when the keys diverge', () => {
 		expect(
 			pmRoleKeyOriginNote(

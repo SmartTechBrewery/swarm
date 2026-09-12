@@ -46,33 +46,11 @@ export interface PmCredentialsView {
 }
 
 /**
- * Whether this screen may write the role. A role that inherits a shared SCM
- * credential is that credential — editing it here would fork one secret into two
- * places — so it renders read-only with a pointer to where it lives (the API
- * refuses the write for the same reason).
- */
-export function isPmRoleEditable(entry: PmCredentialEntry): boolean {
-	return !entry.inheritsSharedCredential;
-}
-
-/**
- * Where a non-editable role is actually configured, as a sentence for the UI —
- * naming the store key it resolves through (issue #630) rather than the shared
- * role's name: `webhookSecret` is SWARM's internal vocabulary and told the operator
- * nothing about what to set, and for a project predating the neutral `SCM_*`
- * defaults the resolved key is not the provider's declared `envVarKey` either. *Why*
- * the secret is shared at all stays the provider's own copy (`description`).
- */
-export function pmRoleInheritanceNote(entry: PmCredentialEntry): string | undefined {
-	if (!entry.inheritsSharedCredential) return undefined;
-	return `Shared with source control — this project resolves it through ${entry.referenceKey}, configured on the Source Control tab.`;
-}
-
-/**
  * Note for a role whose resolved store key is not the provider's declared
  * `envVarKey` — a reference this project configured for itself. Undefined when the
- * two coincide (the common case, left noise-free), and for an inherited role, whose
- * own note above already names the key it resolves through.
+ * two coincide (the common case, left noise-free), and for an inherited role, which
+ * this screen does not render at all (see {@link visiblePmRoles}) — the guard stays
+ * so the helper cannot describe a credential that is not this tab's to describe.
  */
 export function pmRoleKeyOriginNote(entry: PmCredentialEntry): string | undefined {
 	if (entry.inheritsSharedCredential) return undefined;
@@ -108,4 +86,17 @@ export function missingRequiredPmRoles(view: PmCredentialsView | undefined): PmC
 	return (view?.roles ?? []).filter(
 		(entry) => !entry.isConfigured && !entry.optional && !entry.inheritsSharedCredential,
 	);
+}
+
+/**
+ * The roles this screen renders. A role that inherits a shared SCM credential *is*
+ * that credential, so it is configured — and inspected — on the Source Control tab
+ * alone (issue #902): rendering an inert mirror of it here was a second place an
+ * operator read a secret they could only change elsewhere, and a wrong value showed
+ * as "configured" on a tab that cannot fix it (issue #900). Keyed on the manifest's
+ * `inheritsSharedCredential` rather than on the role name, so any future inheriting
+ * role drops out the same way.
+ */
+export function visiblePmRoles(view: PmCredentialsView | undefined): PmCredentialEntry[] {
+	return (view?.roles ?? []).filter((entry) => !entry.inheritsSharedCredential);
 }

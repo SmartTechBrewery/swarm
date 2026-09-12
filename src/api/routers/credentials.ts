@@ -378,10 +378,12 @@ export const credentialsRouter = router({
 	 * SCM `list` uses, and the same answer this procedure has always given for an
 	 * unregistered persisted `pm.type`.
 	 *
-	 * A role that inherits a shared SCM credential is reported with
-	 * `inheritsSharedCredential` set and is not editable here (see
-	 * {@link requirePmRoleSpec}); its resolved state is still shown, because "is the
-	 * board's webhook secret set?" is a question this screen should answer.
+	 * A role that inherits a shared SCM credential is still *reported*, with
+	 * `inheritsSharedCredential` set — the flag is what lets a client exclude it, as
+	 * `missingRequiredPmRoles` already does — but it is not editable here (see
+	 * {@link requirePmRoleSpec}) and since issue #902 the Project Management tab does
+	 * not render it at all: it *is* the Source Control tab's credential, and is shown
+	 * and configured there alone.
 	 */
 	listPm: authedProcedure
 		.input(

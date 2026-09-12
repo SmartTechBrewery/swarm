@@ -51,9 +51,10 @@ const API_TOKEN_ROLE = {
 	maskedValue: 'not set',
 };
 
-// The shape issue #630 reports: the role inherits the shared SCM reference, so it
-// resolves through the project's `GITHUB_WEBHOOK_SECRET` rather than the neutral
-// `SCM_WEBHOOK_SECRET` the manifest declares. The description is the provider's own.
+// An inherited role as the server still reports it: it resolves through the project's
+// shared `GITHUB_WEBHOOK_SECRET` rather than the neutral `SCM_WEBHOOK_SECRET` the
+// manifest declares. Kept in the default `view()` so the omission below (issue #902) is
+// asserted against the real response shape rather than against an empty one.
 const WEBHOOK_ROLE = {
 	role: 'webhookSecret',
 	label: 'Webhook Secret',
@@ -100,25 +101,6 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		expect(screen.queryByText(/not the provider's default/)).toBeNull();
 		// Provider terminology comes from the server, not from a table in the dashboard.
 		expect(screen.getByText(/GitHub Projects authenticates/)).not.toBeNull();
-	});
-
-	// Issue #630: the panel used to print the manifest's declared `envVarKey`, telling
-	// the operator to set a variable nothing in the installation reads.
-	it('names the key an inherited role actually resolves through', async () => {
-		listPmFn.mockResolvedValue(view());
-
-		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
-
-		await waitFor(() => expect(screen.getByText('GITHUB_WEBHOOK_SECRET')).not.toBeNull());
-		expect(screen.queryByText('SCM_WEBHOOK_SECRET')).toBeNull();
-		// The resolved key and where it lives, plus the provider's own rationale for the
-		// sharing — which stays manifest copy rather than entering this component.
-		expect(
-			screen.getByText(
-				/resolves it through GITHUB_WEBHOOK_SECRET, configured on the Source Control/,
-			),
-		).not.toBeNull();
-		expect(screen.getByText(/HMAC secret GitHub signs board deliveries with/)).not.toBeNull();
 	});
 
 	it('explains a non-inherited role whose resolved key diverges from the default', async () => {
@@ -172,13 +154,19 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		);
 	});
 
-	it('renders an inherited role read-only, pointing at where it is configured', async () => {
+	// Issue #902: the response still carries the inherited role (the server reports it,
+	// with `inheritsSharedCredential` set) — nothing about it may reach this tab. It *is*
+	// the Source Control tab's credential, and mirroring it here was the second place an
+	// operator read a value only that tab can fix (the confusion traced in issue #900).
+	it('omits an inherited role entirely rather than mirroring it read-only', async () => {
 		listPmFn.mockResolvedValue(view());
 
 		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
-		await waitFor(() => expect(screen.getByText('Webhook Secret')).not.toBeNull());
-		expect(screen.getByText(/configured on the Source Control tab/)).not.toBeNull();
+		await waitFor(() => expect(screen.getByText('GitHub Projects API Token')).not.toBeNull());
+		expect(screen.queryByText('Webhook Secret')).toBeNull();
+		expect(screen.queryByText('GITHUB_WEBHOOK_SECRET')).toBeNull();
+		expect(screen.queryByText(/configured on the Source Control tab/)).toBeNull();
 		expect(screen.queryByLabelText('Webhook Secret value')).toBeNull();
 		expect(screen.queryByLabelText('Remove Webhook Secret')).toBeNull();
 	});
