@@ -31,7 +31,10 @@
  * call made *after* the create, so an owner who does not administer the project
  * gets a real, pending enrollment plus a refusal. Both paths report the created
  * row and name the approvals still outstanding rather than telling anyone to
- * enroll again (`performEnroll` / `remainingEnrollmentSteps` below).
+ * enroll again (`performEnroll` / `remainingEnrollmentSteps` below). Since issue
+ * #901 the two flags are applied independently of each other, so that refusal no
+ * longer costs the caller the `--consent` they were entitled to grant: what is
+ * left outstanding is the administrator's approval alone.
  *
  * A refusal is reported in the **control plane's own words**: the procedures
  * already name what disagrees (the capability set, the two repositories, the
@@ -145,9 +148,12 @@ Usage:
              prompt names the provider that project actually runs on
              (${SCM_PROVIDER_IDS.join(' | ')}); prompts without echo on a TTY and
              otherwise reads the secret from stdin, and never prints it back. The
-             secret is verified against the provider before it is stored. The
-             enrollment ends up active with sharing consent on, so the machine is
-             routable as soon as it connects. It does NOT start the worker: the
+             secret is verified against the provider before it is stored. Sharing
+             consent is always recorded; on a project you administer the
+             enrollment also ends up active, so the machine is routable as soon as
+             it connects, and on one you do not it stays pending until an
+             administrator approves it — routable from that moment, with nothing
+             further from you. It does NOT start the worker: the
              daemon is a foreground, operator-owned process, so the final line is
              a command to run on that machine yourself. The printed
              SWARM_WORKER_REPO_ROOT (and the checkout the credential is cached
@@ -193,7 +199,9 @@ Usage:
              approve it and grant consent (operator seeding). --active is a
              project administrator's call, so it can be refused on a project you
              do not administer — the enrollment is still created, and the refusal
-             names what is left to run rather than asking you to enroll again.
+             names what is left to run rather than asking you to enroll again. The
+             two flags are applied independently, so a --consent you are entitled
+             to grant is still recorded when --active is refused.
   update-enrollment
              Change an existing enrollment's execution constraints: --cli (a
              subset of the worker's capabilities) replaces the allowed CLIs and
@@ -775,6 +783,35 @@ function reportRemainingEnrollmentSteps(
 }
 
 /**
+ * Apply one of {@link performEnroll}'s two post-create flags, so a refusal of it
+ * cannot suppress the other flag's call (issue #901). Returns the updated
+ * enrollment, or `undefined` with the control plane's own words pushed onto
+ * `refusals`.
+ *
+ * The two flags are separate decisions by separate people — `--active` is a
+ * `projectAdmin`'s call, `--consent` strictly the machine owner's (ADR-001) — over
+ * two independent columns, so neither's authorization depends on the other's
+ * outcome. Running both inside one `try` meant the ordinary federated case, an
+ * owner enrolling into a project they administer nothing on, jumped from the
+ * pending-approval refusal straight past the `setConsent` this command had already
+ * been asked to make: the administrator's later approval then landed on a row with
+ * no consent on it, and the owner had to grant it by hand afterwards.
+ */
+async function applyEnrollmentFlag(
+	apply: () => Promise<z.infer<typeof EnrollmentSchema>>,
+	refusals: string[],
+): Promise<z.infer<typeof EnrollmentSchema> | undefined> {
+	try {
+		return await apply();
+	} catch (err) {
+		// A non-API failure is a programming error, not an operator-facing line.
+		if (!(err instanceof OperatorApiError)) throw err;
+		refusals.push(err.message);
+		return undefined;
+	}
+}
+
+/**
  * Perform the enrollment write and report it, surfacing a refusal as one line and
  * exit 1 — the allowed CLIs the machine does not declare, a project whose
  * repository is not the machine's checkout (issue #690), a duplicate enrollment,
@@ -792,7 +829,9 @@ function reportRemainingEnrollmentSteps(
  * refused `--active` (a `projectAdmin` call) or `--consent` (strictly the owner's)
  * leaves a *created* enrollment behind. It is reported as one extra line rather
  * than swallowed: the operator has to know the row exists, or they will re-run
- * `workers enroll` and get `CONFLICT` for their trouble.
+ * `workers enroll` and get `CONFLICT` for their trouble. Since issue #901 the two
+ * flags are also spent and refused *independently* of each other, so one refusal
+ * neither skips the other call nor hides its message — a run may report two.
  */
 async function performEnroll(
 	client: OperatorClient,
@@ -803,44 +842,63 @@ async function performEnroll(
 	active: boolean,
 	consent: boolean,
 ): Promise<EnrollOutcome> {
-	let enrollment: z.infer<typeof EnrollmentSchema> | undefined;
+	let enrollment: z.infer<typeof EnrollmentSchema>;
 	try {
 		enrollment = await client.mutate(
 			'workers.enroll',
 			{ workerId: worker.id, projectId, allowedClis, concurrencyAllocation },
 			parseWith(EnrollmentSchema),
 		);
-		if (active && enrollment.status !== 'active') {
-			enrollment = await client.mutate(
-				'workers.approveEnrollment',
-				{ enrollmentId: enrollment.id },
-				parseWith(EnrollmentSchema),
-			);
-		}
-		if (consent && !enrollment.sharingConsent) {
-			enrollment = await client.mutate(
-				'workers.setConsent',
-				{ enrollmentId: enrollment.id, sharingConsent: true },
-				parseWith(EnrollmentSchema),
-			);
-		}
+	} catch (err) {
+		// Nothing was created, so there is no row to report and the caller's own
+		// recovery — `workers enroll …` again — is still the way forward.
+		if (!(err instanceof OperatorApiError)) throw err;
+		out.error(err.message);
+		return { code: 1 };
+	}
+
+	// One id for all three responses, so neither call below reads a reassigned binding.
+	const enrollmentId = enrollment.id;
+	const refusals: string[] = [];
+	if (active && enrollment.status !== 'active') {
+		enrollment =
+			(await applyEnrollmentFlag(
+				() =>
+					client.mutate('workers.approveEnrollment', { enrollmentId }, parseWith(EnrollmentSchema)),
+				refusals,
+			)) ?? enrollment;
+	}
+	// Reached whether or not the approval above was refused: this call is the
+	// owner's own and was authorized independently of it (issue #901).
+	if (consent && !enrollment.sharingConsent) {
+		enrollment =
+			(await applyEnrollmentFlag(
+				() =>
+					client.mutate(
+						'workers.setConsent',
+						{ enrollmentId, sharingConsent: true },
+						parseWith(EnrollmentSchema),
+					),
+				refusals,
+			)) ?? enrollment;
+	}
+
+	if (refusals.length === 0) {
 		out.info(
 			`enrolled worker '${worker.displayName}' (${worker.id}) in '${projectId}' — status ${enrollment.status}, CLIs ${enrollment.allowedClis.join(', ')}, concurrency ${enrollment.concurrencyAllocation}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}`,
 		);
 		return { code: 0, enrollment };
-	} catch (err) {
-		if (!(err instanceof OperatorApiError)) throw err;
-		out.error(err.message);
-		if (enrollment) {
-			out.info(
-				`the enrollment was created — worker '${worker.displayName}' (${worker.id}) in '${projectId}': status ${enrollment.status}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}. Do not enroll it again.`,
-			);
-			out.info(
-				"it is routable only while active AND consenting — approving is a project administrator's call, consent the machine owner's own",
-			);
-		}
-		return { code: 1, enrollment };
 	}
+	// Every refusal, not just the first: the flags are applied independently, so a
+	// caller entitled to neither decision can be refused twice in one run.
+	for (const message of refusals) out.error(message);
+	out.info(
+		`the enrollment was created — worker '${worker.displayName}' (${worker.id}) in '${projectId}': status ${enrollment.status}, sharing consent ${enrollment.sharingConsent ? 'on' : 'off'}. Do not enroll it again.`,
+	);
+	out.info(
+		"it is routable only while active AND consenting — approving is a project administrator's call, consent the machine owner's own",
+	);
+	return { code: 1, enrollment };
 }
 
 async function enrollCommand(argv: string[]): Promise<number> {
