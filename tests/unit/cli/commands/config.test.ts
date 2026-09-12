@@ -21,7 +21,12 @@ describe('swarm config', () => {
 		vi.mocked(readFile).mockReset().mockResolvedValue(CONFIG_JSON);
 		vi.mocked(applyConfig)
 			.mockReset()
-			.mockResolvedValue({ projects: ['proj-1'], credentialsWritten: 3, credentialsSkipped: [] });
+			.mockResolvedValue({
+				projects: ['proj-1'],
+				credentialsWritten: 3,
+				credentialsSkipped: [],
+				credentialsHeldBack: [],
+			});
 		vi.mocked(closeDb).mockClear();
 	});
 
@@ -48,10 +53,32 @@ describe('swarm config', () => {
 			projects: ['proj-1'],
 			credentialsWritten: 1,
 			credentialsSkipped: ['proj-1/REV_KEY'],
+			credentialsHeldBack: [],
 		});
 		const warn = vi.spyOn(console, 'warn');
 		expect(await configRun(['apply'])).toBe(0);
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining('proj-1/REV_KEY'));
+	});
+
+	// Held-back webhook secrets are the designed steady state (issue #900), so this warns
+	// loudly — naming where to enter each — and still exits 0, because `npm run db:seed`
+	// runs this on every worker start-up.
+	it('warns loudly for each held-back webhook secret without failing', async () => {
+		vi.mocked(applyConfig).mockResolvedValue({
+			projects: ['proj-1'],
+			credentialsWritten: 1,
+			credentialsSkipped: [],
+			credentialsHeldBack: ['proj-1/HOOK_KEY (credentials.scm.github.webhookSecret)'],
+		});
+		const warn = vi.spyOn(console, 'warn');
+
+		expect(await configRun(['apply'])).toBe(0);
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("never applied from this host's environment"),
+		);
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining('proj-1/HOOK_KEY (credentials.scm.github.webhookSecret)'),
+		);
 	});
 
 	it('closes the db even when applyConfig throws', async () => {

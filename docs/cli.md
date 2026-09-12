@@ -97,7 +97,11 @@ swarm config apply [--config <path>]
 - **`apply`** — upsert the config's projects and referenced credentials into the
   DB. Credential *values* are read from the environment by the reference (env-var
   key) named in each project's `credentials` block; a reference whose env var is
-  unset is skipped with a warning, not written.
+  unset is skipped with a warning, not written. A reference named only by a
+  `webhookSecret` role is never read from the environment at all (issue #900) —
+  that secret must match the one set on that project's own webhook, so it is
+  entered per project in the dashboard; each one held back is named in a warning,
+  and the command still exits 0.
 - **`--config <path>`** — path to the config file (default:
   `<repo-root>/swarm.config.json`).
 
@@ -478,7 +482,10 @@ applied as separate calls after the create (issue #784), so a refusal of either
 leaves the enrollment itself in place. That is reported — the command names the
 created row's status and consent, and then the approvals still outstanding —
 rather than swallowed, because re-running `enroll` from there can only answer
-`CONFLICT`.
+`CONFLICT`. The two are also applied and refused **independently of each other**
+(issue #901): they are separate decisions by separate people over two independent
+columns, so a refused `--active` no longer costs the caller the `--consent` they
+were entitled to grant, and a run refused both decisions reports both messages.
 
 One more thing moved rather than narrowed: **`register-and-enroll` validates the
 owner identifier later than it used to.** The call order is
@@ -529,8 +536,12 @@ unchanged.
   approval call is made; otherwise `approve` and `consent` are applied on top. A
   refusal of either — approving is a project administrator's call, which a machine's
   owner may well not have — is reported rather than silently ignored, and since the
-  enrollment itself was created, what the command prints as left to do is
-  `workers approve` / `workers consent`, not a second `workers enroll`.)
+  enrollment itself was created, what the command prints as left to do is the step
+  that did not land, not a second `workers enroll`. On a project you do not
+  administer that is `workers approve` **alone**: the sharing consent this command
+  was asked to grant is the machine owner's own to give, so it is recorded even
+  while the approval is pending (issue #901), and the administrator's approval makes
+  the machine routable with nothing further from you.)
   **The worker credential is printed
   exactly once**, in the final start-command line. It **does not start the worker**:
   that daemon is a foreground, operator-owned process, so the last line is a command

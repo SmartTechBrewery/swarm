@@ -95,7 +95,24 @@ async function onATTY(body: () => Promise<void>): Promise<void> {
 	}
 }
 
+/**
+ * The enrollment row the control plane holds, so the three mutations that touch it
+ * compose the way the real ones do: `approveEnrollment` moves only `status`,
+ * `setConsent` only `sharingConsent`. Issue #901 turns on exactly that
+ * independence — a pending row that is already consenting — which a fixture
+ * answering a fixed `status: 'active'` from `setConsent` could never show.
+ */
+interface EnrollmentRow {
+	id: string;
+	status: string;
+	allowedClis: string[];
+	concurrencyAllocation: number;
+	sharingConsent: boolean;
+}
+
 describe('swarm workers', () => {
+	let enrollmentRow: EnrollmentRow;
+
 	beforeEach(() => {
 		delete process.env.INIT_CWD;
 		vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -143,27 +160,26 @@ describe('swarm workers', () => {
 		}));
 		answers.set('workers.scmCredentials.set', () => ({ login: 'ada-bot' }));
 		answers.set('workers.remove', (input) => ({ workerId: input.workerId }));
-		answers.set('workers.enroll', (input) => ({
+		enrollmentRow = {
 			id: ENROLLMENT_ID,
 			status: 'pending',
-			allowedClis: input.allowedClis,
-			concurrencyAllocation: input.concurrencyAllocation ?? 1,
-			sharingConsent: false,
-		}));
-		answers.set('workers.approveEnrollment', () => ({
-			id: ENROLLMENT_ID,
-			status: 'active',
 			allowedClis: ['claude'],
 			concurrencyAllocation: 1,
 			sharingConsent: false,
-		}));
-		answers.set('workers.setConsent', (input) => ({
-			id: ENROLLMENT_ID,
-			status: 'active',
-			allowedClis: ['claude'],
-			concurrencyAllocation: 1,
-			sharingConsent: input.sharingConsent,
-		}));
+		};
+		answers.set('workers.enroll', (input) => {
+			enrollmentRow.allowedClis = input.allowedClis as string[];
+			enrollmentRow.concurrencyAllocation = (input.concurrencyAllocation as number) ?? 1;
+			return { ...enrollmentRow };
+		});
+		answers.set('workers.approveEnrollment', () => {
+			enrollmentRow.status = 'active';
+			return { ...enrollmentRow };
+		});
+		answers.set('workers.setConsent', (input) => {
+			enrollmentRow.sharingConsent = input.sharingConsent as boolean;
+			return { ...enrollmentRow };
+		});
 		answers.set('workers.updateConstraints', (input) => ({
 			id: input.enrollmentId,
 			status: 'active',
@@ -611,9 +627,15 @@ describe('swarm workers', () => {
 
 		// The other half of that: `workers.enroll` *succeeded* and only the projectAdmin
 		// approval on top of it was refused — the enrollment exists, so re-running
-		// `workers enroll` could only answer CONFLICT. Name the two approvals instead,
-		// and still hand the one-time credential over exactly once.
-		it('names the outstanding approvals, not another enroll, when --active is refused', async () => {
+		// `workers enroll` could only answer CONFLICT.
+		//
+		// This is issue #901's headline scenario: the federated machine, whose owner
+		// administers nothing on the target project. The consent this command was asked
+		// for is the owner's own to grant, so it is still recorded, and the one step
+		// left is the administrator's approval — after which the machine is routable
+		// with nothing further from its owner. The one-time credential still appears
+		// exactly once.
+		it('records consent and names only the approval when --active is refused', async () => {
 			refuse(
 				'workers.approveEnrollment',
 				'You do not have permission to perform this action on project "proj-a".',
@@ -621,10 +643,15 @@ describe('swarm workers', () => {
 			const error = vi.spyOn(console, 'error');
 			expect(await run(ARGV)).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('do not have permission'));
+			expect(pathsCalled().slice(-3)).toEqual([
+				'workers.enroll',
+				'workers.approveEnrollment',
+				'workers.setConsent',
+			]);
 			const printed = lines();
 			const created = printed.find((line) => line.includes('the enrollment was created')) ?? '';
 			expect(created).toContain('status pending');
-			expect(created).toContain('sharing consent off');
+			expect(created).toContain('sharing consent on');
 			expect(
 				printed.some((line) => line.endsWith(`swarm workers approve ${WORKER_ID} ${PROJECT_ID}`)),
 			).toBe(true);
@@ -632,7 +659,7 @@ describe('swarm workers', () => {
 				printed.some((line) =>
 					line.endsWith(`swarm workers consent ${WORKER_ID} ${PROJECT_ID} on`),
 				),
-			).toBe(true);
+			).toBe(false);
 			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
 		});
@@ -1037,14 +1064,72 @@ describe('swarm workers', () => {
 			expect(created).toContain('sharing consent off');
 		});
 
-		// The steps it names are the ones the refusal actually left outstanding —
-		// never `workers enroll`, which from here can only answer CONFLICT.
-		it('names the outstanding approvals after a refused --active, not another enroll', async () => {
+		// Issue #901: the two flags are separate decisions by separate people, so a
+		// refused approval must not swallow the consent the same call was asked to
+		// grant — the owner running this is authorized to grant it either way. What is
+		// left outstanding is the approval alone, never `workers enroll`, which from
+		// here can only answer CONFLICT.
+		it('records the consent it was asked for even when --active is refused', async () => {
 			refuse('workers.approveEnrollment', `Enrollment with ID "${ENROLLMENT_ID}" not found`);
 			expect(
 				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--active', '--consent']),
 			).toBe(1);
 			const printed = lines();
+			const created = printed.find((line) => line.includes('the enrollment was created')) ?? '';
+			expect(created).toContain('status pending');
+			expect(created).toContain('sharing consent on');
+			expect(
+				printed.some((line) => line.endsWith(`swarm workers approve ${WORKER_ID} ${PROJECT_ID}`)),
+			).toBe(true);
+			expect(
+				printed.some((line) =>
+					line.endsWith(`swarm workers consent ${WORKER_ID} ${PROJECT_ID} on`),
+				),
+			).toBe(false);
+			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
+		});
+
+		// The regression tripwire for #901: the call itself, not just the state it
+		// printed — `setConsent` has to be *reached* after the refused approval, with
+		// the enrollment id the create returned.
+		it('still calls setConsent after a refused approval, with the created enrollment id', async () => {
+			refuse(
+				'workers.approveEnrollment',
+				'You do not have permission to perform this action on project "proj-a".',
+			);
+			expect(
+				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--active', '--consent']),
+			).toBe(1);
+			expect(pathsCalled()).toEqual([
+				'workers.getById',
+				'workers.enroll',
+				'workers.approveEnrollment',
+				'workers.setConsent',
+			]);
+			expect(inputFor('workers.setConsent')).toEqual({
+				enrollmentId: ENROLLMENT_ID,
+				sharingConsent: true,
+			});
+		});
+
+		// Applying the flags independently means neither refusal can hide the other:
+		// a caller entitled to neither decision hears both, and the row's real state.
+		it('reports both refusals when neither flag may be applied', async () => {
+			refuse(
+				'workers.approveEnrollment',
+				'You do not have permission to perform this action on project "proj-a".',
+			);
+			refuse('workers.setConsent', `Enrollment with ID "${ENROLLMENT_ID}" not found`);
+			const error = vi.spyOn(console, 'error');
+			expect(
+				await run(['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude', '--active', '--consent']),
+			).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('do not have permission'));
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('not found'));
+			const printed = lines();
+			const created = printed.find((line) => line.includes('the enrollment was created')) ?? '';
+			expect(created).toContain('status pending');
+			expect(created).toContain('sharing consent off');
 			expect(
 				printed.some((line) => line.endsWith(`swarm workers approve ${WORKER_ID} ${PROJECT_ID}`)),
 			).toBe(true);
@@ -1053,7 +1138,6 @@ describe('swarm workers', () => {
 					line.endsWith(`swarm workers consent ${WORKER_ID} ${PROJECT_ID} on`),
 				),
 			).toBe(true);
-			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
 		});
 
 		// `setConsent` is strictly the machine owner's — an installation admin seeding

@@ -299,6 +299,20 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const regranted = await setEnrollmentSharingConsent(created.id, true);
 				expect(regranted && isRoutable(regranted)).toBe(true);
 			});
+
+			// The other direction, and issue #901's end state: `register-and-enroll` on a
+			// project the caller does not administer now leaves a *pending but consenting*
+			// row, so the administrator's later approval is the last step — the owner has
+			// nothing more to do. That holds only because approval moves `status` alone.
+			it('approving a pending enrollment that already consents makes it routable', async () => {
+				const created = await enroll(workerA, PROJECT_A, { status: 'pending' });
+				expect(created.sharingConsent).toBe(true);
+				expect(isRoutable(created)).toBe(false);
+
+				const approved = await updateEnrollmentStatus(created.id, 'active');
+				expect(approved?.sharingConsent).toBe(true);
+				expect(approved && isRoutable(approved)).toBe(true);
+			});
 		});
 
 		// Issue #690 — the declaration path, against a real database: what a reconnecting

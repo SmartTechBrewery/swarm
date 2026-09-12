@@ -66,7 +66,11 @@ holds when the owner you signed in as administers the project (`projectAdmin`, o
 an installation admin such as `localhost-admin`). A plain `member` gets the
 enrollment created and the approval refused: the command says so, names the
 remaining `swarm workers approve <worker-id> swarm` for a project administrator to
-run, and hands the worker credential over anyway — do **not** re-run
+run, and hands the worker credential over anyway. That approval really is the only
+thing left — the sharing consent this command was asked to grant is the machine
+owner's own to give, so it is recorded even while the approval is pending (issue
+#901), and the machine is routable the moment the administrator approves, with
+nothing further from its owner. Do **not** re-run
 `register-and-enroll` or `workers enroll`, which from there only reports the
 machine is already enrolled. Give the owner `--role projectAdmin` in step 2 below
 if you would rather they seed it themselves.
@@ -192,7 +196,9 @@ Notes:
   that isn't there yet. **`register-and-enroll` creates exactly this form** and
   offers no flag to opt out, so this note covers it too: a pending,
   non-consenting enrollment is not "ready to start", which is what that command
-  exists to deliver. Use the composable path above when you want the two approvals
+  exists to deliver. On a project the caller does not administer it creates the
+  consenting half immediately and the pending approval is the only thing left
+  (issue #901). Use the composable path above when you want the two approvals
   kept as separate human decisions.
 - **Enroll the machine in a project for the repository its checkout actually is.**
   Step 4 is refused (naming both repositories) when the worker has already declared
@@ -399,7 +405,7 @@ to expire after `heartbeatTtlMs`.
 | `workers set-scm-credential`, `workers remove`, `workers consent` or `workers update-enrollment` says `Worker with ID "…" not found` / `Enrollment with ID "…" not found` for one that exists | All four are strictly the machine owner's since issue #800 — an installation admin gets the same `NOT_FOUND` a stranger does. Sign in as the worker's owner on that machine. |
 | `register-and-enroll` says `You are not a member of project "…"` | The project id is **right** and the enrollment has nothing to do with it — the calling operator simply has no membership row for that project (issue #899; before it, this arrived as an indistinguishable `Project with ID "…" not found` and read as a typo). An instance administrator runs `swarm members add <project-id> <your login handle>` on the control-plane host — that command needs `DATABASE_URL` — then re-run. |
 | `register-and-enroll` says `Project with ID "…" not found` | Since issue #899 this one means what it says: no project on this control plane carries that id. Check it against the dashboard's Projects list — a project id is not the repository name. |
-| `workers enroll --active` (or `register-and-enroll`) says `You do not have permission to perform this action on project "…"` | Approving an enrollment is a `projectAdmin` call, and it is made *after* the enrollment is created — so the enrollment now exists, pending. Do **not** enroll again (that reports `This worker is already enrolled in this project.`); the command prints exactly what is left, and a project administrator runs `swarm workers approve <worker-id> <project-id>`. |
+| `workers enroll --active` (or `register-and-enroll`) says `You do not have permission to perform this action on project "…"` | Approving an enrollment is a `projectAdmin` call, and it is made *after* the enrollment is created — so the enrollment now exists, pending, **with sharing consent already recorded** (that half is the machine owner's own decision and is applied independently of the approval, issue #901). Do **not** enroll again (that reports `This worker is already enrolled in this project.`); the command prints exactly what is left, and a project administrator runs `swarm workers approve <worker-id> <project-id>` — the last step, after which the machine is routable. |
 | `workers remove` says `This worker is running a job right now` | The machine is executing a run, and deleting it mid-run would detach that run from the machine still running it (issue #789). Wait for it, or stop the run from the dashboard, then retry. |
 | `workers list` says `Open a project you are enrolled in to see its workers.` | The unfiltered roster is an installation administrator's view (issue #647). Pass your own login handle — `workers list <email>` — for your own machines. |
 | `swarm run:worker` says `no worker registered for this checkout` | No credential was cached for *this* directory's realpath — the worker was registered on another machine, in another checkout, or before issue #788. Register here, or start the daemon with `SWARM_WORKER_CREDENTIAL` + `SWARM_WORKER_REPO_ROOT` set explicitly, as above. A git *worktree* of the checkout has its own realpath and gets this message too; run the daemon against the main checkout. |

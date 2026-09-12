@@ -393,12 +393,18 @@ describe('the pure reference lookups', () => {
 	});
 
 	// `swarm config apply` reads every block, so a retained provider's secrets are applied
-	// too. Deduping is the caller's, which is why the repeated key is listed twice.
-	it('lists every reference across all providers, undeduped', () => {
-		expect(listPmCredentialReferences(twoBoards).sort()).toEqual([
-			'JIRA_EMAIL_KEY',
-			'PM_TOKEN_KEY',
-			'PM_TOKEN_KEY',
+	// too. Deduping is the caller's, which is why the repeated key is listed twice — and
+	// each entry names the `(provider, role)` behind it, because the caller decides per
+	// role what it may seed (issue #900).
+	it('lists every reference across all providers, undeduped, with its provider and role', () => {
+		expect(
+			[...listPmCredentialReferences(twoBoards)].sort((a, b) =>
+				`${a.providerId}.${a.role}`.localeCompare(`${b.providerId}.${b.role}`),
+			),
+		).toEqual([
+			{ providerId: 'github-projects', role: 'apiToken', reference: 'PM_TOKEN_KEY' },
+			{ providerId: 'jira', role: 'apiToken', reference: 'PM_TOKEN_KEY' },
+			{ providerId: 'jira', role: 'email', reference: 'JIRA_EMAIL_KEY' },
 		]);
 		expect(listPmCredentialReferences({ credentials: {} })).toEqual([]);
 	});

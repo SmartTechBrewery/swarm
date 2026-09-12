@@ -162,17 +162,29 @@ export function pmCredentialReferenceFor(
 	return project.credentials.pm?.[providerId]?.[role];
 }
 
+/** One reference a project names, with the `(provider, role)` pair that names it. */
+export interface PmCredentialReference {
+	/** The provider id the reference is filed under — see the SCM twin on why `string`. */
+	readonly providerId: string;
+	/** The provider's own declared role name (`PmCredentialRoleSpec.role`), so free-form. */
+	readonly role: string;
+	readonly reference: string;
+}
+
 /**
  * Every reference a project names across all providers — what `swarm config apply`
- * reads out of the environment and stores. Deduping is the caller's (references for
- * two roles or two providers may legitimately name the same key).
+ * reads out of the environment, and which of them it may seed. Each entry carries the
+ * role that names it because the caller decides *per role* what to seed: a
+ * `webhookSecret` is never seeded from a shared host environment (issue #900, see
+ * `./apply.ts`). Deduping is the caller's too (references for two roles or two
+ * providers may legitimately name the same key).
  *
  * All providers, not just `pm.type`'s: a project retaining an outgoing provider's
  * references still has its secrets applied, which is what makes switching back to it
  * a config change rather than a re-entry of every credential.
  */
-export function listPmCredentialReferences(project: PmCredentialsProject): string[] {
-	return Object.values(project.credentials.pm ?? {}).flatMap((perProvider) =>
-		Object.values(perProvider),
+export function listPmCredentialReferences(project: PmCredentialsProject): PmCredentialReference[] {
+	return Object.entries(project.credentials.pm ?? {}).flatMap(([providerId, perProvider]) =>
+		Object.entries(perProvider).map(([role, reference]) => ({ providerId, role, reference })),
 	);
 }

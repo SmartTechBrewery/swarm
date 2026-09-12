@@ -36,7 +36,9 @@ Usage: swarm config apply [--config <path>]
 
 Credential values are read from the environment by the reference (env-var key)
 named in each project's "credentials" block — a reference whose env var is unset
-is skipped with a warning, not written.`;
+is skipped with a warning, not written. A "webhookSecret" reference is never read
+from the environment at all: that secret must match the one set on that project's
+own webhook, so it is entered per project in the dashboard.`;
 
 export async function run(argv: string[]): Promise<number> {
 	const [subcommand, ...rest] = argv;
@@ -72,6 +74,20 @@ export async function run(argv: string[]): Promise<number> {
 		out.info(`stored ${result.credentialsWritten} credential(s) from the environment`);
 		for (const skipped of result.credentialsSkipped) {
 			out.warn(`credential reference not set in environment, skipped: ${skipped}`);
+		}
+		// Held-back webhook secrets are the designed steady state, not a failure, so this
+		// warns and still exits 0 — `npm run db:seed` runs this on every worker start-up
+		// (issue #900).
+		if (result.credentialsHeldBack.length > 0) {
+			out.warn(
+				"webhook secrets are never applied from this host's environment — a webhook " +
+					"secret must match the one set on that project's own webhook. Enter each of " +
+					'these in the dashboard: the Source Control tab for an SCM webhook, Project ' +
+					'Management → Credentials for a board webhook.',
+			);
+			for (const heldBack of result.credentialsHeldBack) {
+				out.warn(`  not seeded: ${heldBack}`);
+			}
 		}
 		return 0;
 	} finally {
