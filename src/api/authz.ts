@@ -30,6 +30,16 @@
  * project exists). The three named roles and their ordering are the source of
  * truth in `../identity/membership.ts`; this module only maps procedures onto
  * them.
+ *
+ * **One procedure is deliberately exempt from the existence-hiding half**:
+ * `workers.projectScmProvider` (`routers/workers.ts`, issue #899) looks the
+ * project row up before checking access and answers a non-member of a real
+ * project with `FORBIDDEN` naming `swarm members add`, because its sole caller is
+ * `swarm workers register-and-enroll` — an operator provisioning their own
+ * machine, for whom the collapsed `NOT_FOUND` read as "wrong project id" and cost
+ * a live investigation. It does that by calling {@link mayAccessProject} rather
+ * than {@link assertProjectAccess}; don't route it back through this helper, and
+ * don't generalise the exemption to any other project-keyed procedure.
  */
 
 import { TRPCError } from '@trpc/server';

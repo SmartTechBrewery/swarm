@@ -932,7 +932,10 @@ interface RegisterAndEnrollPlan {
  * here has written anything, so every one of these failures leaves no worker row
  * and no half-configured machine behind. `workers.projectScmProvider` is what now
  * validates the project — it is a `contributor` read, so an unknown or
- * inaccessible project is refused here, before the secret is asked for. The
+ * inaccessible project is refused here, before the secret is asked for; since
+ * issue #899 it says which of the two it was, and the operator sees that line
+ * unchanged because every refusal here is printed in the control plane's own
+ * words. The
  * **owner identifier** is the one input that moved later: `workers.register`
  * resolves it, so a typo there costs an operator a wasted secret entry rather than
  * failing immediately. Nothing is written either way.

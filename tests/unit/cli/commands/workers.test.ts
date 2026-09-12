@@ -518,6 +518,36 @@ describe('swarm workers', () => {
 			expect(readStdin).not.toHaveBeenCalled();
 		});
 
+		// Issue #899 — the operator-visible half. The control plane now refuses an
+		// unknown project id and an unjoined-but-real project with two different
+		// lines, and this command prints whichever it is handed, verbatim. What this
+		// pins is the *relay*: both reach the operator intact, and neither writes
+		// anything or asks for the secret. That the two refusals genuinely differ is
+		// the router suite's to prove — this suite drives the operator client and
+		// holds no `DATABASE_URL`, so it cannot produce the server's branch itself.
+		it('relays the two project refusals as two different lines', async () => {
+			refuse(
+				'workers.projectScmProvider',
+				`You are not a member of project "${PROJECT_ID}". The project id is right — the membership is missing: ask an instance administrator to run \`swarm members add ${PROJECT_ID} ${IDENTIFIER}\`, then run this again.`,
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(ARGV)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('swarm members add'));
+			expect(pathsCalled()).toEqual(['workers.projectScmProvider']);
+			expect(readStdin).not.toHaveBeenCalled();
+
+			error.mockClear();
+			calls.length = 0;
+			refuse('workers.projectScmProvider', `Project with ID "${PROJECT_ID}" not found`);
+			expect(await run(ARGV)).toBe(1);
+			expect(error).toHaveBeenCalledWith(
+				expect.stringContaining(`Project with ID "${PROJECT_ID}" not found`),
+			);
+			expect(error).not.toHaveBeenCalledWith(expect.stringContaining('members add'));
+			expect(pathsCalled()).toEqual(['workers.projectScmProvider']);
+			expect(readStdin).not.toHaveBeenCalled();
+		});
+
 		it('requires an owner identifier, a project id, --name, and --cli', async () => {
 			expect(await run(['register-and-enroll'])).toBe(1);
 			expect(await run(['register-and-enroll', IDENTIFIER])).toBe(1);
