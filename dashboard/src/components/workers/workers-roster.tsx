@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
-import { Server } from 'lucide-react';
+import { Search, SearchX, Server } from 'lucide-react';
+import { useState } from 'react';
 import { WorkersTable } from '@/components/workers/workers-table.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
+import { filterWorkersBySearch } from '@/lib/worker-search.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { WorkerRow } from '@/types/workers.js';
 
@@ -39,6 +41,12 @@ interface WorkersRosterProps {
  * because this is the component that already knows the project and owns the
  * `workers.list` cache the new order lands in.
  *
+ * The search box (issue #897) lives here for the same reason: this is the
+ * component holding the rows, so both surfaces get it from one place and the
+ * table stays presentational. It is a filter over an already-fetched list —
+ * `workers.list` returns the whole visible roster in one response — so typing
+ * issues no request and clearing restores the full list.
+ *
  * Polling, not realtime — {@link WORKERS_REFETCH_MS} is comfortably below the
  * default 60s heartbeat TTL. Authorization lives entirely on the server
  * (`workers.list`/`roster`/`listMine`/`setConsent`/`reorderProjectWorker`); this
@@ -47,6 +55,8 @@ interface WorkersRosterProps {
 export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterProps) {
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
+	const [search, setSearch] = useState('');
+	const query = search.trim();
 	// `undefined` rather than a no-argument call: the two variants stay on distinct
 	// query keys, so a project tab never reads the global roster out of the cache.
 	const workersQueryOptions = trpc.workers.list.queryOptions(projectId ? { projectId } : undefined);
@@ -77,10 +87,13 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 		},
 	});
 
-	// Withheld unless both hold: the global screen has no project order, and a
-	// non-administrator may not change one.
+	// Withheld unless all three hold: the global screen has no project order, a
+	// non-administrator may not change one, and a *filtered* list is the wrong
+	// thing to reorder against — a move is relative to the project's whole order,
+	// so on a narrowed list the boundary arrows would disable against the wrong
+	// rows and a move would step over a machine the viewer cannot see.
 	const reorder =
-		canReorder && projectId
+		canReorder && projectId && query === ''
 			? {
 					onMove: (workerId: string, direction: 'up' | 'down') =>
 						reorderMutation.mutate({ workerId, direction }),
@@ -108,13 +121,22 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 		);
 	}
 	if (workersQuery.data && workersQuery.data.length > 0) {
+		const workers = workersQuery.data as WorkerRow[];
+		const visible = filterWorkersBySearch(workers, query);
 		return (
-			<WorkersTable
-				workers={workersQuery.data as WorkerRow[]}
-				refetchInterval={WORKERS_REFETCH_MS}
-				onSelectWorker={openWorker}
-				reorder={reorder}
-			/>
+			<div className="space-y-4">
+				<WorkersSearchBox value={search} onChange={setSearch} />
+				{visible.length > 0 ? (
+					<WorkersTable
+						workers={visible}
+						refetchInterval={WORKERS_REFETCH_MS}
+						onSelectWorker={openWorker}
+						reorder={reorder}
+					/>
+				) : (
+					<NoMatchingWorkers query={query} onClear={() => setSearch('')} />
+				)}
+			</div>
 		);
 	}
 	return (
@@ -126,6 +148,65 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 				<span className="font-mono">swarm workers register</span> and enrolled in{' '}
 				{projectId ? 'this project' : 'a project you can access'}.
 			</p>
+		</div>
+	);
+}
+
+/**
+ * The roster's search box (issue #897) — rendered only once the roster has rows,
+ * so the "no workers at all" state stays a plain explanation with nothing to type
+ * into. The query is component state rather than a route search param: it is
+ * transient, and the project detail page's own `?tab=` search already owns that
+ * URL.
+ */
+function WorkersSearchBox({
+	value,
+	onChange,
+}: {
+	value: string;
+	onChange: (next: string) => void;
+}) {
+	return (
+		<div className="relative max-w-sm">
+			<Search
+				className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+				aria-hidden="true"
+			/>
+			{/* The design-system Input recipe with its left padding widened for the icon. */}
+			<input
+				type="search"
+				value={value}
+				onChange={(event) => onChange(event.target.value)}
+				aria-label="Search workers"
+				placeholder="Search machine, owner, or repository…"
+				className="block w-full py-2 pl-9 pr-3 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
+			/>
+		</div>
+	);
+}
+
+/**
+ * A search that matched nothing, deliberately distinct from the empty-roster
+ * state above: that one means no machine is enrolled and tells the operator how
+ * one gets here, while this one means the roster is populated and the query is
+ * what hid it — so it names the query, says what is matched, and offers the way
+ * back to the full list.
+ */
+function NoMatchingWorkers({ query, onClear }: { query: string; onClear: () => void }) {
+	return (
+		<div className="border border-zinc-800 rounded-lg bg-panel/20 p-8 text-center space-y-2">
+			<SearchX className="w-12 h-12 stroke-1 text-zinc-700 mx-auto" />
+			<p className="text-sm text-zinc-400">No workers match “{query}”.</p>
+			<p className="text-xs text-zinc-500">
+				Search matches a machine’s name, its owner, and the repository it declared.
+			</p>
+			<button
+				type="button"
+				onClick={onClear}
+				className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors mt-2 cursor-pointer"
+			>
+				Clear search
+			</button>
 		</div>
 	);
 }
