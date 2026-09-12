@@ -97,7 +97,11 @@ swarm config apply [--config <path>]
 - **`apply`** — upsert the config's projects and referenced credentials into the
   DB. Credential *values* are read from the environment by the reference (env-var
   key) named in each project's `credentials` block; a reference whose env var is
-  unset is skipped with a warning, not written.
+  unset is skipped with a warning, not written. A reference named only by a
+  `webhookSecret` role is never read from the environment at all (issue #900) —
+  that secret must match the one set on that project's own webhook, so it is
+  entered per project in the dashboard; each one held back is named in a warning,
+  and the command still exits 0.
 - **`--config <path>`** — path to the config file (default:
   `<repo-root>/swarm.config.json`).
 

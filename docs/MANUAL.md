@@ -284,7 +284,10 @@ Configuration has three layers:
   credential references (the SCM reviewer/webhook pair per SCM provider under
   `credentials.scm[<providerId>]`, plus each PM provider's own roles under
   `credentials.pm[<providerId>]`), agent, and pipeline settings.
-  Apply changes with `npm run db:seed` or `swarm config apply`.
+  Apply changes with `npm run db:seed` or `swarm config apply` — which seeds every
+  credential value from this host's environment *except* a `webhookSecret`, since
+  that one must match the secret on the project's own webhook and so is entered per
+  project in the dashboard instead.
 - Dashboard global settings — app-wide settings stored in Postgres and edited
   through the dashboard API.
 

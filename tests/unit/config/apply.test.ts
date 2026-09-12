@@ -44,18 +44,36 @@ describe('applyConfig', () => {
 		delete process.env.HOOK_KEY;
 	});
 
-	it('upserts each project and stores every referenced credential from the environment', async () => {
+	it('upserts each project and stores every seedable referenced credential', async () => {
 		const result = await applyConfig(config);
 
 		expect(upsertProjectToDb).toHaveBeenCalledWith(project);
 		expect(result.projects).toEqual(['proj-1']);
 		// The implementer persona is worker-local (SWARM_OPERATOR_GH_TOKEN), never a
-		// project credential, so only reviewer + webhookSecret are stored (issue #396).
-		expect(result.credentialsWritten).toBe(2);
+		// project credential (issue #396), and the webhook secret is never seeded from a
+		// shared host environment (issue #900) — so only `reviewer` is stored.
+		expect(result.credentialsWritten).toBe(1);
 		expect(result.credentialsSkipped).toEqual([]);
 		expect(writeProjectCredential).toHaveBeenCalledWith('proj-1', 'REV_KEY', 'test-token-reviewer');
-		expect(writeProjectCredential).toHaveBeenCalledWith('proj-1', 'HOOK_KEY', 'whsec');
+		expect(writeProjectCredential).not.toHaveBeenCalledWith(
+			'proj-1',
+			'HOOK_KEY',
+			expect.anything(),
+		);
 		expect(discoverCliQuotas).not.toHaveBeenCalled();
+	});
+
+	// A webhook secret must match the one set on *that project's own* webhook, so it is
+	// never seeded from a value some other project may already use — even when the env
+	// var is exported and would have resolved (issue #900).
+	it('holds back a webhookSecret reference instead of seeding it, and says where to fix it', async () => {
+		const result = await applyConfig(config);
+
+		expect(result.credentialsHeldBack).toEqual([
+			'proj-1/HOOK_KEY (credentials.scm.github.webhookSecret)',
+		]);
+		// Held back is not "your env var is unset" — the two warnings must stay distinct.
+		expect(result.credentialsSkipped).toEqual([]);
 	});
 
 	it('writes the project row before its credentials (FK-safety ordering)', async () => {
@@ -73,19 +91,26 @@ describe('applyConfig', () => {
 
 		const result = await applyConfig(config);
 
-		expect(result.credentialsWritten).toBe(1);
+		// Nothing left to write: the only other reference is the held-back webhook secret.
+		expect(result.credentialsWritten).toBe(0);
 		expect(result.credentialsSkipped).toEqual(['proj-1/REV_KEY']);
 		expect(writeProjectCredential).not.toHaveBeenCalledWith('proj-1', 'REV_KEY', expect.anything());
 	});
 
 	it('treats an empty-string env var as unset', async () => {
-		process.env.HOOK_KEY = '';
+		// `REV_KEY` rather than `HOOK_KEY`: a held-back webhook secret is never read from
+		// the environment, so it can no longer be skipped for being unset (issue #900).
+		process.env.REV_KEY = '';
 
 		const result = await applyConfig(config);
 
-		expect(result.credentialsSkipped).toEqual(['proj-1/HOOK_KEY']);
+		expect(result.credentialsSkipped).toEqual(['proj-1/REV_KEY']);
 	});
 
+	// `project_credentials` is keyed by `(projectId, envVarKey)`, not by role, so a config
+	// pointing `reviewer` *and* `webhookSecret` at one key has already collapsed them into
+	// a single row. Seeding it for `reviewer` is therefore the honest outcome — the
+	// webhook-secret rule (issue #900) holds back a key *only* a webhook secret names.
 	it('dedupes references so a key shared by two credentials is written once', async () => {
 		const shared = createMockProjectRecord({
 			id: 'proj-2',
@@ -99,6 +124,7 @@ describe('applyConfig', () => {
 		expect(
 			vi.mocked(writeProjectCredential).mock.calls.filter(([, key]) => key === 'SHARED'),
 		).toHaveLength(1);
+		expect(result.credentialsHeldBack).toEqual([]);
 		delete process.env.SHARED;
 	});
 
@@ -111,16 +137,50 @@ describe('applyConfig', () => {
 			credentials: {
 				reviewer: 'REV_KEY',
 				webhookSecret: 'HOOK_KEY',
-				pm: { 'github-projects': { webhookSecret: 'PM_HOOK_KEY' } },
+				pm: { 'github-projects': { apiToken: 'PM_TOKEN_KEY' } },
 			},
 		});
-		process.env.PM_HOOK_KEY = 'pm-whsec';
+		process.env.PM_TOKEN_KEY = 'pm-token';
 
 		const result = await applyConfig(SwarmConfigSchema.parse({ projects: [withPmReferences] }));
 
-		expect(result.credentialsWritten).toBe(3);
-		expect(writeProjectCredential).toHaveBeenCalledWith('proj-4', 'PM_HOOK_KEY', 'pm-whsec');
-		delete process.env.PM_HOOK_KEY;
+		expect(result.credentialsWritten).toBe(2);
+		expect(writeProjectCredential).toHaveBeenCalledWith('proj-4', 'PM_TOKEN_KEY', 'pm-token');
+		delete process.env.PM_TOKEN_KEY;
+	});
+
+	// The rule is not GitHub-shaped: `webhookSecret` is the receiver's own vocabulary on
+	// the PM side too, so a board webhook's secret is held back exactly like an SCM one
+	// while the same provider's other roles are still seeded (issue #900).
+	it("holds back a PM provider's webhookSecret while seeding its other roles", async () => {
+		const linearBoard = createMockProjectRecord({
+			id: 'proj-7',
+			repositories: [{ repo: 'owner/linear' }],
+			credentials: {
+				reviewer: 'REV_KEY',
+				webhookSecret: 'HOOK_KEY',
+				pm: { linear: { apiKey: 'LINEAR_KEY', webhookSecret: 'LINEAR_HOOK' } },
+			},
+		});
+		process.env.LINEAR_KEY = 'lin_api';
+		process.env.LINEAR_HOOK = 'lin_whsec';
+
+		try {
+			const result = await applyConfig(SwarmConfigSchema.parse({ projects: [linearBoard] }));
+
+			expect(writeProjectCredential).toHaveBeenCalledWith('proj-7', 'LINEAR_KEY', 'lin_api');
+			expect(writeProjectCredential).not.toHaveBeenCalledWith(
+				'proj-7',
+				'LINEAR_HOOK',
+				expect.anything(),
+			);
+			expect(result.credentialsHeldBack).toContain(
+				'proj-7/LINEAR_HOOK (credentials.pm.linear.webhookSecret)',
+			);
+		} finally {
+			delete process.env.LINEAR_KEY;
+			delete process.env.LINEAR_HOOK;
+		}
 	});
 
 	// Issue #628: `credentials.scm` is a nested record too, one block per provider, so
@@ -147,9 +207,22 @@ describe('applyConfig', () => {
 		try {
 			const result = await applyConfig(SwarmConfigSchema.parse({ projects: [multiProvider] }));
 
-			expect(result.credentialsWritten).toBe(5);
-			expect(writeProjectCredential).toHaveBeenCalledWith('proj-5', 'GH_HOOK', 'value-of-GH_HOOK');
-			expect(writeProjectCredential).toHaveBeenCalledWith('proj-5', 'GL_HOOK', 'value-of-GL_HOOK');
+			// Both reviewers and the board token, but neither provider's webhook secret.
+			expect(result.credentialsWritten).toBe(3);
+			expect(result.credentialsHeldBack).toEqual([
+				'proj-5/GH_HOOK (credentials.scm.github.webhookSecret)',
+				'proj-5/GL_HOOK (credentials.scm.gitlab.webhookSecret)',
+			]);
+			expect(writeProjectCredential).not.toHaveBeenCalledWith(
+				'proj-5',
+				'GH_HOOK',
+				expect.anything(),
+			);
+			expect(writeProjectCredential).not.toHaveBeenCalledWith(
+				'proj-5',
+				'GL_HOOK',
+				expect.anything(),
+			);
 		} finally {
 			for (const key of ['GH_REVIEWER', 'GH_HOOK', 'GL_REVIEWER', 'GL_HOOK']) {
 				delete process.env[key];
@@ -183,8 +256,9 @@ describe('applyConfig', () => {
 		try {
 			const result = await applyConfig(SwarmConfigSchema.parse({ projects: [twoBoards] }));
 
-			// Two legacy SCM references + two distinct PM keys, not three PM writes.
-			expect(result.credentialsWritten).toBe(4);
+			// The legacy reviewer + two distinct PM keys (not three PM writes); the legacy
+			// webhook secret is held back.
+			expect(result.credentialsWritten).toBe(3);
 			expect(
 				vi
 					.mocked(writeProjectCredential)
@@ -210,7 +284,9 @@ describe('applyConfig', () => {
 			reviewer: 'REV_KEY',
 			webhookSecret: 'HOOK_KEY',
 		});
-		expect(result.credentialsWritten).toBe(2);
+		expect(result.credentialsWritten).toBe(1);
+		// The doubly-named webhook secret is reported once, not once per naming.
+		expect(result.credentialsHeldBack).toHaveLength(1);
 	});
 
 	it('applies every project in the config', async () => {
