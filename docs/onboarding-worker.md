@@ -332,6 +332,10 @@ machine, under a process supervisor, or anywhere the machine that registered the
 worker is not the machine running it. A checkout with no cache entry says so and
 names both remedies rather than failing on a missing file.
 
+Either form holds the terminal for as long as the machine is meant to accept work.
+On macOS, [`swarm-worker-agent`](./launchd-worker-autostart.md) wraps the shorter
+form in a per-checkout launchd agent so the daemon starts at login instead.
+
 A successful connection logs two lines:
 
 ```

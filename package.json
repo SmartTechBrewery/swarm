@@ -5,7 +5,8 @@
 	"type": "module",
 	"main": "dist/index.js",
 	"bin": {
-		"swarm": "./bin/swarm.js"
+		"swarm": "./bin/swarm.js",
+		"swarm-worker-agent": "./bin/swarm-worker-agent"
 	},
 	"scripts": {
 		"swarm": "node --env-file-if-exists=.env --import tsx/esm src/cli/index.ts",

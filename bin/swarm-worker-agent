@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# `swarm-worker-agent` — run a checkout's worker as a launchd LaunchAgent, so it
+# starts at login instead of occupying a terminal tab (docs/launchd-worker-autostart.md).
+#
+# It is a wrapper around `swarm run:worker`, not a second launcher: the agent runs
+# that command with the checkout as its working directory, which is what lets the
+# credential stay in the per-checkout cache instead of being written into a plist.
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+swarm-worker-agent -- launchd autostart for a SWARM worker checkout (macOS)
+
+Usage:
+  swarm-worker-agent install   [<checkout>]   write the agent and start it
+  swarm-worker-agent uninstall [<checkout>]   stop it and remove the agent
+  swarm-worker-agent status    [<checkout>]   show whether it is loaded/running
+  swarm-worker-agent logs      [<checkout>]   tail this checkout's worker log
+
+<checkout> is the repository checkout the worker was registered for, and defaults
+to the current directory. Each checkout gets its own agent, so a machine running
+workers for several repositories installs one per checkout.
+EOF
+}
+
+die() { printf 'swarm-worker-agent: %s\n' "$1" >&2; exit 1; }
+
+# The checkout's realpath is the credential cache's key, the plist's
+# WorkingDirectory, and the seed for a label unique per checkout.
+resolve() {
+	[ -d "${1:-$PWD}" ] || die "no such directory: ${1:-$PWD}"
+	CHECKOUT=$(cd "${1:-$PWD}" && pwd -P)
+	local hash
+	hash=$(printf '%s' "$CHECKOUT" | shasum -a 256 | cut -d' ' -f1)
+	CACHE="$HOME/.swarm/worker-credentials/$hash/credential.json"
+	LABEL="pl.smarttechbrewery.swarm.worker.$(basename "$CHECKOUT").${hash:0:8}"
+	PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+	LOG="$HOME/Library/Logs/$LABEL.log"
+	TARGET="gui/$(id -u)/$LABEL"
+}
+
+# launchd starts a job with a minimal PATH and none of the login shell's rc files,
+# while the worker spawns npm, git, gh and the agent CLIs by name. Resolving each
+# here rather than hard-coding a prefix is what makes the agent portable across
+# Macs: an Intel Homebrew (/usr/local), an Apple Silicon one (/opt/homebrew) and a
+# node under nvm/asdf/fnm all land on their real directories.
+agent_path() {
+	local dirs=() bin resolved dir seen
+	for bin in node npm git gh claude codex agy; do
+		resolved=$(command -v "$bin" 2>/dev/null) || continue
+		dirs+=("$(dirname "$resolved")")
+	done
+	dirs+=("$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin /usr/bin /bin /usr/sbin /sbin)
+
+	seen=""
+	for dir in "${dirs[@]}"; do
+		case ":$seen:" in *":$dir:"*) continue ;; esac
+		seen="${seen:+$seen:}$dir"
+	done
+	printf '%s' "$seen"
+}
+
+cmd_install() {
+	# A worker checkout is a git checkout of the *project* repository (the daemon
+	# declares its `origin` at handshake); it is not necessarily a Node project, so
+	# .git is the invariant to check, not package.json.
+	[ -e "$CHECKOUT/.git" ] || die "not a git checkout: $CHECKOUT"
+	# Without a cached credential the agent would start, fail, and be restarted by
+	# launchd forever.
+	[ -f "$CACHE" ] || die "no worker registered for $CHECKOUT
+  register one from that checkout first:
+    swarm workers register-and-enroll <owner-identifier> <project-id> --name <name> --cli <clis>"
+
+	local node swarm
+	node=$(command -v node) || die 'node not found on PATH'
+	swarm=$(command -v swarm) || die 'swarm not found on PATH'
+
+	# A worker already running by hand holds the checkout lock; a second one would
+	# lose the race and then crash-loop under KeepAlive.
+	local pid cwd
+	for pid in $(pgrep -f 'src/transport/connect-entry' 2>/dev/null || true); do
+		cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
+		[ "$cwd" = "$CHECKOUT" ] || continue
+		die "a worker (pid $pid) is already running for $CHECKOUT -- stop it first, then re-run install"
+	done
+
+	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+	cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>$node</string>
+		<string>$swarm</string>
+		<string>run:worker</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>$CHECKOUT</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>$(agent_path)</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<key>StandardOutPath</key>
+	<string>$LOG</string>
+	<key>StandardErrorPath</key>
+	<string>${LOG%.log}.error.log</string>
+</dict>
+</plist>
+EOF
+	plutil -lint "$PLIST" >/dev/null || die "generated plist is invalid: $PLIST"
+
+	launchctl bootout "$TARGET" 2>/dev/null || true
+	launchctl bootstrap "gui/$(id -u)" "$PLIST"
+	printf 'swarm-worker-agent: installed %s\n  checkout: %s\n  log:      %s\n' "$LABEL" "$CHECKOUT" "$LOG"
+}
+
+cmd_uninstall() {
+	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
+	launchctl bootout "$TARGET" 2>/dev/null || true
+	rm -f "$PLIST"
+	printf 'swarm-worker-agent: removed %s (logs kept at %s)\n' "$LABEL" "$LOG"
+}
+
+cmd_status() {
+	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
+	printf 'label:    %s\ncheckout: %s\n' "$LABEL" "$CHECKOUT"
+	launchctl print "$TARGET" 2>/dev/null | grep -E '^[[:space:]]+(state|pid|last exit code) ' ||
+		echo 'state = not loaded'
+}
+
+cmd_logs() {
+	[ -f "$LOG" ] || die "no log yet at $LOG"
+	tail -f "$LOG" "${LOG%.log}.error.log"
+}
+
+[ "$(uname -s)" = 'Darwin' ] || die 'launchd is macOS-only; on Linux use a systemd --user unit running `swarm run:worker`'
+
+case "${1:-}" in
+	install | uninstall | status | logs)
+		action=$1
+		shift
+		resolve "${1:-$PWD}"
+		"cmd_$action"
+		;;
+	-h | --help | help | '') usage ;;
+	*)
+		usage
+		exit 1
+		;;
+esac

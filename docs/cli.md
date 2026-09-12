@@ -263,6 +263,12 @@ operator-owned process and this command exits with its exit code. It also adds n
 locking — the daemon takes the checkout lock itself, so a second `run:worker` in
 the same checkout is refused by that lock exactly as a second `dev:worker` is.
 
+On macOS, `swarm-worker-agent` (shipped in this package's `bin`, see
+[`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md)) wraps this
+command in a per-checkout launchd agent, so the machine keeps a worker running
+from login without a terminal tab. It is a wrapper, not a second launcher: the
+daemon, the env contract and that same checkout lock are unchanged.
+
 A checkout with no cache entry gets an actionable refusal naming the checkout and
 both remedies (register here, or start the daemon yourself), never a raw
 file-not-found; an entry that exists but cannot be read is reported separately,
