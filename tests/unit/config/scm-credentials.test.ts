@@ -140,7 +140,9 @@ describe('scmCredentialReferenceFor', () => {
 });
 
 describe('listScmCredentialReferences', () => {
-	it('lists every reference across every provider, for `swarm config apply` to store', () => {
+	// Each entry carries the `(provider, role)` that names it, because `swarm config
+	// apply` decides per role what it may seed (issue #900).
+	it('lists every reference across every provider, with the provider and role naming it', () => {
 		const references = listScmCredentialReferences(
 			project('gitlab', {
 				scm: {
@@ -150,7 +152,12 @@ describe('listScmCredentialReferences', () => {
 			}),
 		);
 
-		expect(references.sort()).toEqual(['GH_HOOK', 'GH_REVIEWER', 'GL_HOOK', 'GL_REVIEWER']);
+		expect([...references].sort((a, b) => a.reference.localeCompare(b.reference))).toEqual([
+			{ providerId: 'github', role: 'webhookSecret', reference: 'GH_HOOK' },
+			{ providerId: 'github', role: 'reviewer', reference: 'GH_REVIEWER' },
+			{ providerId: 'gitlab', role: 'webhookSecret', reference: 'GL_HOOK' },
+			{ providerId: 'gitlab', role: 'reviewer', reference: 'GL_REVIEWER' },
+		]);
 	});
 
 	it('is empty for a project with no per-provider references', () => {

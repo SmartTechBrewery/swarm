@@ -149,17 +149,35 @@ export function scmCredentialReferenceFor(
 	return project.credentials.scm?.[providerId]?.[role];
 }
 
+/** One reference a project names, with the `(provider, role)` pair that names it. */
+export interface ScmCredentialReference {
+	/**
+	 * The provider id the reference is filed under. Typed `string` rather than
+	 * `ScmType` because {@link ScmCredentialReferencesByProviderSchema} is a
+	 * `z.record(z.string(), …)` whose keys `./schema.ts` validates separately — this
+	 * module is a leaf and does not narrow what it never checked.
+	 */
+	readonly providerId: string;
+	readonly role: ScmCredentialRole;
+	readonly reference: string;
+}
+
 /**
  * Every reference a project names across all providers — what `swarm config apply`
- * reads out of the environment and stores. Deduping is the caller's (references for
- * two roles or two providers may legitimately name the same key).
+ * reads out of the environment, and which of them it may seed. Each entry carries the
+ * role that names it because the caller decides *per role* what to seed: a
+ * `webhookSecret` is never seeded from a shared host environment (issue #900, see
+ * `./apply.ts`). Deduping is the caller's too (references for two roles or two
+ * providers may legitimately name the same key).
  */
-export function listScmCredentialReferences(project: ScmCredentialsProject): string[] {
-	const references: string[] = [];
-	for (const perProvider of Object.values(project.credentials.scm ?? {})) {
+export function listScmCredentialReferences(
+	project: ScmCredentialsProject,
+): ScmCredentialReference[] {
+	const references: ScmCredentialReference[] = [];
+	for (const [providerId, perProvider] of Object.entries(project.credentials.scm ?? {})) {
 		for (const role of SCM_CREDENTIAL_ROLES) {
 			const reference = perProvider[role];
-			if (reference) references.push(reference);
+			if (reference) references.push({ providerId, role, reference });
 		}
 	}
 	return references;
