@@ -702,11 +702,17 @@ describe('workers.listMine (owner self-service)', () => {
 });
 
 describe('workers.roster (project-scoped read)', () => {
+	// The guard on issue #899's blast radius: `projectScmProvider` next door now
+	// separates "no such project" from "not a member", and its sibling here must not
+	// — so the message is pinned, not just the code.
 	it('denies a non-member with NOT_FOUND, hiding existence', async () => {
 		getMembership.mockResolvedValue(undefined);
 
 		await expect(owner.roster({ projectId: 'p1' })).rejects.toThrowError(
-			expect.objectContaining({ code: 'NOT_FOUND' }),
+			expect.objectContaining({
+				code: 'NOT_FOUND',
+				message: 'Project with ID "p1" not found',
+			}),
 		);
 		expect(listProjectRoster).not.toHaveBeenCalled();
 	});
@@ -737,13 +743,19 @@ describe('workers.projectScmProvider (issue #799)', () => {
 		expect(requireProjectSCMProviderId).toHaveBeenCalledWith(PROJECT);
 	});
 
-	it('denies a non-member with NOT_FOUND, without reading the project', async () => {
+	// Issue #899 — the carve-out. A non-member of a project that *is* there gets the
+	// membership answer and the command that fixes it, not the roster's
+	// existence-hiding NOT_FOUND. Costs one project row read, which is the trade.
+	it('tells a non-member of a real project it is the membership that is missing', async () => {
 		getMembership.mockResolvedValue(undefined);
+		findProjectByIdFromDb.mockResolvedValue(PROJECT);
 
 		await expect(owner.projectScmProvider({ projectId: 'p1' })).rejects.toThrowError(
-			expect.objectContaining({ code: 'NOT_FOUND' }),
+			expect.objectContaining({
+				code: 'FORBIDDEN',
+				message: expect.stringContaining('swarm members add p1 ada@example.com'),
+			}),
 		);
-		expect(findProjectByIdFromDb).not.toHaveBeenCalled();
 		expect(requireProjectSCMProviderId).not.toHaveBeenCalled();
 	});
 
@@ -755,6 +767,39 @@ describe('workers.projectScmProvider (issue #799)', () => {
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
 		expect(requireProjectSCMProviderId).not.toHaveBeenCalled();
+	});
+
+	// …and the same honest NOT_FOUND for an ordinary non-member, whose message is
+	// kept byte-identical because it is the half the operator can now trust.
+	it('is NOT_FOUND for a non-member naming an id no project carries', async () => {
+		getMembership.mockResolvedValue(undefined);
+		findProjectByIdFromDb.mockResolvedValue(undefined);
+
+		await expect(owner.projectScmProvider({ projectId: 'gone' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'NOT_FOUND',
+				message: 'Project with ID "gone" not found',
+			}),
+		);
+	});
+
+	// The acceptance criterion of issue #899, as one test: the same caller, the two
+	// causes, and a caller-visible signal that actually differs. Written together so
+	// a change that re-collapses them fails here rather than in two places at once.
+	it('gives one caller two different signals for the two causes', async () => {
+		getMembership.mockResolvedValue(undefined);
+
+		findProjectByIdFromDb.mockResolvedValue(PROJECT);
+		const notAMember = await owner.projectScmProvider({ projectId: 'p1' }).catch((e) => e);
+
+		findProjectByIdFromDb.mockResolvedValue(undefined);
+		const noSuchProject = await owner.projectScmProvider({ projectId: 'p1' }).catch((e) => e);
+
+		expect(notAMember.code).toBe('FORBIDDEN');
+		expect(noSuchProject.code).toBe('NOT_FOUND');
+		expect(notAMember.message).not.toBe(noSuchProject.message);
+		expect(notAMember.message).toContain('members add');
+		expect(noSuchProject.message).not.toContain('members add');
 	});
 
 	// The lookup's three throws already name the project and what it asked for, so

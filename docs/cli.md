@@ -521,7 +521,13 @@ unchanged.
   project** server-side (`workers.projectScmProvider`, which resolves it through the
   same lookup the dispatcher uses — never assumed to be GitHub), so the
   credential prompt names the provider that project actually runs on and any of
-  `github | bitbucket | gitlab` works; the secret is prompted for without echo on a
+  `github | bitbucket | gitlab` works. That lookup is also the one place in the API
+  where a refused project says *which* of the two things went wrong (issue #899):
+  `Project with ID "…" not found` means no project carries that id, while
+  `You are not a member of project "…"` means the id is right and the membership is
+  what is missing — the message names the `swarm members add <project-id> <your login
+  handle>` an instance administrator runs on the control-plane host. Everywhere else
+  in the API the two stay deliberately indistinguishable. The secret is prompted for without echo on a
   TTY, otherwise read from stdin, and never printed back. The enrollment ends up
   **active with sharing consent on** — a pending, non-consenting enrollment isn't
   "ready to start", and the four separate commands remain for anyone who wants those

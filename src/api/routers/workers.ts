@@ -99,7 +99,13 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   `projectAdmin` approves an enrollment (`approveEnrollment`), revokes/
  *   reactivates one (`setStatus`), or moves a worker through the project's
  *   configured order (`reorderProjectWorker`, issue #750). A non-member gets
- *   `NOT_FOUND` (existence hidden), a member below the required role `FORBIDDEN`.
+ *   `NOT_FOUND` (existence hidden), a member below the required role `FORBIDDEN`
+ *   — with one deliberate exception, `projectScmProvider`, which since issue #899
+ *   answers a non-member of a *real* project with `FORBIDDEN` naming the
+ *   `swarm members add` remedy instead, because its only caller is an operator
+ *   provisioning their own machine and the collapsed refusal sent one chasing a
+ *   project id that was correct all along. See the procedure's own comment for
+ *   the existence-oracle that buys and why it stays there.
  *
  * Two of these procedures exist for the **networked CLI** rather than for the
  * dashboard (issue #799): `register` and `projectScmProvider` are what let
@@ -701,18 +707,53 @@ export const workersRouter = router({
 	// are surfaced as `PRECONDITION_FAILED` with the message verbatim: the project's
 	// configuration is what has to change, not the request.
 	//
-	// A `contributor` read, exactly like `roster`, so a non-member gets `NOT_FOUND`
-	// and project existence never leaks. It returns `{ providerId }` and nothing
-	// else — no credential, no repository, no config.
+	// Still a `contributor` read, but the **one** project-keyed procedure in the tree
+	// that does not collapse "no such project" into "not yours" (issue #899). It looks
+	// the row up *first*, so it makes two distinct refusals: `NOT_FOUND` when no
+	// project carries the id, and `FORBIDDEN` naming `swarm members add` when the
+	// project is real and the caller simply has no membership row for it. Live, an
+	// operator read the collapsed `NOT_FOUND` as "wrong project id", spent the
+	// investigation querying Postgres for rows that were there all along, and the fix
+	// turned out to be a membership.
+	//
+	// Why the carve-out is affordable here and nowhere else: this procedure has one
+	// caller in the repo (`planRegisterAndEnroll`, `src/cli/commands/workers.ts`), it
+	// is an operator provisioning their *own* machine, and its entire payload is a
+	// provider id — no name, repo, config, credential, board mapping or run. What it
+	// costs is stated plainly: an authenticated caller can now use it to learn whether
+	// a project id exists on the installation, which for a `private` project is a real
+	// weakening of the existence-hiding property (`discoverable` ones are already
+	// published by `projects.listDiscoverable`). That is accepted deliberately and
+	// scoped to this path. **Do not copy it to `roster`** or to any other
+	// project-keyed procedure: `assertProjectAccess` keeps its collapsing semantics
+	// for all of them, and `roster` next door is the contrast case.
+	//
+	// `mayAccessProject(…, 'contributor')` replaces `assertProjectAccess` faithfully:
+	// `contributor` is the lowest role, so that helper's member-below-`minRole`
+	// `FORBIDDEN` branch was unreachable here and the non-member `NOT_FOUND` was the
+	// only refusal it ever produced. An `instanceAdmin` still passes straight through.
+	// The reorder means a non-member now costs one project row read — the intended
+	// trade for telling the two apart.
+	//
+	// It returns `{ providerId }` and nothing else — no credential, no repository, no
+	// config.
 	projectScmProvider: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
-			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			const project = await findProjectByIdFromDb(input.projectId);
 			if (!project) {
 				throw new TRPCError({
 					code: 'NOT_FOUND',
 					message: `Project with ID "${input.projectId}" not found`,
+				});
+			}
+			if (!(await mayAccessProject(ctx.user, input.projectId, 'contributor'))) {
+				throw new TRPCError({
+					code: 'FORBIDDEN',
+					message:
+						`You are not a member of project "${input.projectId}". The project id is right — ` +
+						`the membership is missing: ask an instance administrator to run ` +
+						`\`swarm members add ${input.projectId} ${ctx.user.identifier}\`, then run this again.`,
 				});
 			}
 			try {
