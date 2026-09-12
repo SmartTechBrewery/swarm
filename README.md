@@ -184,6 +184,14 @@ npm run dev:dashboard             # dashboard on localhost:5173
 npm run dev:worker                # the worker
 ```
 
+The worker holds that terminal for as long as the machine is meant to accept
+work. **On macOS** it can run from a launchd agent instead, started at login —
+from the checkout it was registered for:
+
+```bash
+swarm-worker-agent install        # then: status · logs · uninstall
+```
+
 A local install is single-user by default: no account to create, no password, no
 `/login`. The prerequisites, the multi-user alternative, and the full worker
 runbook are in [`docs/MANUAL.md`](docs/MANUAL.md).
