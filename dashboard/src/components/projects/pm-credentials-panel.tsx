@@ -1,16 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Lock, Pencil, Trash2, X } from 'lucide-react';
+import { Pencil, Trash2, X } from 'lucide-react';
 import type React from 'react';
 import { useState } from 'react';
 import type { PmProviderId } from '@/lib/board-mapping.js';
 import { maskedPreview } from '@/lib/credentials.js';
 import {
-	isPmRoleEditable,
 	missingRequiredPmRoles,
 	type PmCredentialEntry,
-	pmRoleInheritanceNote,
 	pmRoleKeyOriginNote,
 	pmRoleStatusLabel,
+	visiblePmRoles,
 } from '@/lib/pm-credentials.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
@@ -29,7 +28,11 @@ import { Modal, ModalFooter } from '../ui/modal.js';
  * its permission guidance all come from the manifest, and the key each role is shown
  * under is the one the *project* resolves it through (issue #630 — `referenceKey`,
  * not the manifest's conventional default), so a second provider's different
- * credential shape renders without a change to this component.
+ * credential shape renders without a change to this component. A role the provider
+ * declares `inheritsSharedCredential` for is omitted entirely (issue #902): it *is*
+ * the Source Control tab's credential, so it is configured and inspected there, and
+ * mirroring it here was the second place an operator read a value only that tab can
+ * fix — the confusion traced in issue #900.
  *
  * Every query and write is addressed to a **named** provider (issue #641's parameter),
  * which the tab supplies as the *draft* provider while a switch is open (issue #642):
@@ -176,14 +179,11 @@ function PmCredentialField({
 	onSaved,
 	onRequestRemove,
 }: PmCredentialFieldProps) {
-	const editable = isPmRoleEditable(entry);
-	const inheritanceNote = pmRoleInheritanceNote(entry);
-	// Only set when the resolved key diverges from the provider's declared default —
-	// the two notes are mutually exclusive, so a card never carries two key lines.
+	// Only set when the resolved key diverges from the provider's declared default.
 	const keyOriginNote = pmRoleKeyOriginNote(entry);
 	// An unconfigured credential opens straight into the input — there is no masked
-	// value to collapse to. A read-only (inherited) role never opens one.
-	const [editing, setEditing] = useState(editable && !entry.isConfigured);
+	// value to collapse to.
+	const [editing, setEditing] = useState(!entry.isConfigured);
 	const [value, setValue] = useState('');
 
 	const saveMutation = useMutation({
@@ -228,17 +228,10 @@ function PmCredentialField({
 					</span>
 				</div>
 				{entry.description && <p className="text-xs text-zinc-500 mt-1">{entry.description}</p>}
-				{inheritanceNote && (
-					<p className="text-xs text-zinc-400 mt-1 flex items-center gap-1.5">
-						<Lock className="w-3.5 h-3.5 shrink-0" />
-						{inheritanceNote}
-					</p>
-				)}
-				{/* No Lock icon: this role *is* editable here — the icon stays the read-only marker. */}
 				{keyOriginNote && <p className="text-xs text-zinc-500 mt-1">{keyOriginNote}</p>}
 			</div>
 
-			{!editable ? null : editing ? (
+			{editing ? (
 				<PmCredentialEditor
 					entry={entry}
 					value={value}
@@ -248,7 +241,7 @@ function PmCredentialField({
 					// Trim: pasted tokens routinely carry a stray newline or space, and every
 					// PM credential declared so far is a token/key rather than an HMAC secret
 					// whose surrounding bytes matter (the one such role — the inherited webhook
-					// secret — is not editable here).
+					// secret — is not rendered here, issue #902).
 					onSave={() => saveMutation.mutate(value.trim())}
 					onCancel={() => {
 						setEditing(false);
@@ -364,7 +357,7 @@ export function PmCredentialsPanel({
 			)}
 
 			<div className="space-y-4">
-				{(view?.roles ?? []).map((entry) => (
+				{visiblePmRoles(view).map((entry) => (
 					<PmCredentialField
 						key={entry.role}
 						projectId={projectId}
