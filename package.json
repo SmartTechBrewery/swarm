@@ -7,6 +7,7 @@
 	"bin": {
 		"swarm": "./bin/swarm.js",
 		"swarm-worker-agent": "./bin/swarm-worker-agent",
+		"swarm-api-agent": "./bin/swarm-api-agent",
 		"swarm-repo-renamed": "./bin/swarm-repo-renamed"
 	},
 	"scripts": {

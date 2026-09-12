@@ -738,6 +738,34 @@ repo root.
 | `npm run dev:router` | Free `ROUTER_PORT`, then run the router (webhook receiver) on the host with `--watch` — for router development (in normal operation the router runs in Compose). |
 | `npm run dev` | Run `src/index.ts` (combined entry) with `--watch`. |
 
+### Autostart on macOS
+
+The two host processes — the API server and the worker — are foreground processes
+that otherwise occupy a terminal tab each. On **macOS only**, each has a launchd
+wrapper shipped in this package's `bin`, so they start at login instead. Both take
+an optional `<checkout>` argument that defaults to the current directory. (On
+Linux the equivalent is a `systemd --user` unit running the same command with
+`WorkingDirectory=` set to the checkout; the scripts say so rather than
+half-working.)
+
+| Command | Description |
+| --- | --- |
+| `swarm-api-agent install` | Write and start the API server's LaunchAgent for this installation checkout, then wait for `/health`. Refuses while a `dev:api` you started by hand is running for that checkout. |
+| `swarm-api-agent uninstall` | Stop the agent and remove it (logs are kept). |
+| `swarm-api-agent status` | Loaded? pid? last exit code? plus a live `/health` answer, which `launchctl` alone cannot distinguish from a `KeepAlive` restart loop. |
+| `swarm-api-agent restart` | `launchctl kickstart -k`, then wait for `/health`. For an `.env` change, a migration, or a wedged server — pulled *source* changes are already picked up by `dev:api`'s `--watch`. |
+| `swarm-api-agent reload [--all]` | Run [`npm run reload`](#services) (`--all`: `reload:all`) in the foreground, then restart and wait for `/health`. A failed migration or build stops the chain before the restart. Workers are still yours to restart. |
+| `swarm-api-agent logs` | Tail this installation's stdout + stderr logs. |
+| `swarm-worker-agent install` | Write and start the worker's LaunchAgent for a registered worker checkout — a wrapper around [`swarm run:worker`](#swarm-runworker). Refuses while a worker is already running for that checkout. |
+| `swarm-worker-agent uninstall` | Stop that agent and remove it (logs are kept). |
+| `swarm-worker-agent status` | Show whether that checkout's agent is loaded and running. |
+| `swarm-worker-agent logs` | Tail that checkout's worker logs. |
+| `swarm-repo-renamed <old> <new> [--dry-run]` | Re-point every worker checkout on this machine whose `origin` is `<old-owner/repo>`, then restart its agent. Run it **after** the control plane knows the new name. |
+
+Full detail, including what the generated plists do and why:
+[`docs/launchd-api-autostart.md`](./launchd-api-autostart.md) and
+[`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md).
+
 ### Build & production start
 
 | Script | Description |

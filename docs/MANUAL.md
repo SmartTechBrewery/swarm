@@ -108,7 +108,10 @@ on macOS, [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) ru
 it from a launchd agent instead of a terminal tab.
 
 For a compiled self-hosted dashboard, run `npm run start:api` and open
-<http://localhost:3101> instead of the Vite dev server.
+<http://localhost:3101> instead of the Vite dev server. That same process serves the
+API, so on macOS one launchd agent replaces both terminal tabs — the API and the
+panel — and starts them at login:
+[`docs/launchd-api-autostart.md`](./launchd-api-autostart.md).
 
 ## The worker
 
@@ -255,6 +258,10 @@ npm run swarm -- config apply
 # After `git pull` — sync deps, rebuild the dashboard, apply migrations
 npm run reload
 
+# The same from the API's launchd agent (macOS), which restarts it afterwards
+# and waits for /health — see docs/launchd-api-autostart.md
+swarm-api-agent reload --all
+
 # The same, then rebuild the Compose router and wait for it to report healthy
 # (restart each worker yourself — see the script's own reminder)
 npm run reload:all
@@ -327,6 +334,9 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) — running a
   worker from a launchd agent on macOS instead of a terminal tab, and the
   `swarm-repo-renamed` runbook for a renamed project repository
+- [`docs/launchd-api-autostart.md`](./launchd-api-autostart.md) — the same for the
+  API server (which also serves the dashboard), its `reload`/`restart` update flow,
+  and why the API is a host process rather than a Compose service
 - [`docs/github-projects-v2-api.md`](./github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./decisions/) — architecture decision records

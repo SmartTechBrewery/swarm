@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# `swarm-api-agent` — run this installation's API server as a launchd LaunchAgent,
+# so the dashboard and the tRPC surface start at login instead of occupying a
+# terminal tab (docs/launchd-api-autostart.md).
+#
+# It is a wrapper around `npm run dev:api`, not a second launcher: the agent runs
+# that script with the checkout as its working directory, which is what keeps the
+# migrate → free-the-port → serve chain and the `.env` contract identical to the
+# interactive one. The API server is deliberately a *host* process and stays one —
+# it owns the worktree retention sweep and the orphaned-run reap, which read the
+# checkouts and the lease store this machine's worker writes (src/api/maintenance.ts,
+# issue #550) — so this is the launchd twin of `swarm-worker-agent`, not a step
+# towards putting it in Compose.
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+swarm-api-agent -- launchd autostart for this SWARM installation's API server (macOS)
+
+Usage:
+  swarm-api-agent install   [<checkout>]        write the agent and start it
+  swarm-api-agent uninstall [<checkout>]        stop it and remove the agent
+  swarm-api-agent status    [<checkout>]        show whether it is loaded/running
+  swarm-api-agent restart   [<checkout>]        restart it, then wait for /health
+  swarm-api-agent reload [--all] [<checkout>]   npm run reload[:all], then restart
+  swarm-api-agent logs      [<checkout>]        tail this installation's API log
+
+<checkout> is the SWARM installation the API serves -- the checkout holding
+`swarm.config.json` and `.env` -- and defaults to the current directory.
+
+`reload` runs the update chain in the foreground so a failed migration or build is
+visible and stops before the restart; `--all` picks `reload:all`, which also rebuilds
+the Compose router. Workers are never restarted for you: they run phase code from
+their own checkouts, so that stays your own call (`swarm-worker-agent`).
+EOF
+}
+
+die() { printf 'swarm-api-agent: %s\n' "$1" >&2; exit 1; }
+
+# The checkout's realpath is the plist's WorkingDirectory and the seed for a label
+# unique per installation, so two checkouts on one Mac (a spare clone, a second
+# instance) get their own agent rather than fighting over one.
+resolve() {
+	[ -d "${1:-$PWD}" ] || die "no such directory: ${1:-$PWD}"
+	CHECKOUT=$(cd "${1:-$PWD}" && pwd -P)
+	local hash
+	hash=$(printf '%s' "$CHECKOUT" | shasum -a 256 | cut -d' ' -f1)
+	LABEL="pl.smarttechbrewery.swarm.api.$(basename "$CHECKOUT").${hash:0:8}"
+	PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+	LOG="$HOME/Library/Logs/$LABEL.log"
+	TARGET="gui/$(id -u)/$LABEL"
+	PORT=$(api_port)
+}
+
+# `dev:api` binds API_PORT (`docs/configuration.md`, default 3101) on 127.0.0.1, and
+# `.env` is where this installation states it -- the same file the server itself
+# reads, so nothing here can disagree with what the process actually listens on.
+api_port() {
+	local port=''
+	if [ -f "$CHECKOUT/.env" ]; then
+		port=$(sed -n 's/^[[:space:]]*API_PORT[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9]\{1,\}\).*/\1/p' "$CHECKOUT/.env" | tail -1)
+	fi
+	printf '%s' "${port:-3101}"
+}
+
+# launchd starts a job with a minimal PATH and none of the login shell's rc files,
+# while the API spawns npm (the migrate step) and git (the retention sweep's reclaim
+# gate) by name. Resolving each here rather than hard-coding a prefix is what makes
+# the agent portable across Macs: an Intel Homebrew (/usr/local), an Apple Silicon
+# one (/opt/homebrew) and a node under nvm/asdf/fnm all land on their real
+# directories.
+agent_path() {
+	local dirs=() bin resolved dir seen
+	for bin in node npm git; do
+		resolved=$(command -v "$bin" 2>/dev/null) || continue
+		dirs+=("$(dirname "$resolved")")
+	done
+	dirs+=("$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin /usr/bin /bin /usr/sbin /sbin)
+
+	seen=''
+	for dir in "${dirs[@]}"; do
+		case ":$seen:" in *":$dir:"*) continue ;; esac
+		seen="${seen:+$seen:}$dir"
+	done
+	printf '%s' "$seen"
+}
+
+# Homebrew's `npm` is a symlink to npm-cli.js, whose `#!/usr/bin/env node` shebang
+# would resolve `node` against the plist's own PATH. Naming the interpreter and the
+# script outright skips that indirection where we can see through it, and falls back
+# to exec'ing the wrapper where we cannot (an older readlink, an npm shim).
+npm_argv() {
+	local npm_bin node_bin real
+	npm_bin=$(command -v npm) || die 'npm not found on PATH'
+	node_bin=$(command -v node) || die 'node not found on PATH'
+	real=$(readlink -f "$npm_bin" 2>/dev/null || true)
+	case "$real" in
+		*.js) printf '%s\n%s\n' "$node_bin" "$real" ;;
+		*) printf '%s\n' "$npm_bin" ;;
+	esac
+}
+
+# A server already running by hand holds API_PORT, and `dev:api`'s kill-port step
+# would take it out from under the terminal it is printing to.
+refuse_if_running_by_hand() {
+	local pid cwd
+	for pid in $(pgrep -f 'src/api/server.ts' 2>/dev/null || true); do
+		cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
+		[ "$cwd" = "$CHECKOUT" ] || continue
+		die "an API server (pid $pid) is already running for $CHECKOUT -- stop it first, then re-run install"
+	done
+}
+
+# The restart paths report what the process did rather than what launchctl accepted:
+# a server that dies on a bad migration or an unreachable Postgres is restarted by
+# KeepAlive every 30s forever, which looks identical to a healthy one from launchctl.
+wait_healthy() {
+	local deadline=$((SECONDS + 90))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/health" 2>/dev/null; then
+			printf 'swarm-api-agent: healthy on http://127.0.0.1:%s\n' "$PORT"
+			return 0
+		fi
+		sleep 1
+	done
+	printf 'swarm-api-agent: no /health answer on 127.0.0.1:%s after 90s -- last log lines:\n' "$PORT" >&2
+	tail -n 20 "$LOG" "${LOG%.log}.error.log" 2>/dev/null >&2 || true
+	return 1
+}
+
+cmd_install() {
+	# The API serves *this* installation: it needs the npm script, and `dev:api`
+	# passes `--env-file=.env` unconditionally, so a missing .env is an immediate
+	# crash-loop rather than a degraded start.
+	[ -f "$CHECKOUT/package.json" ] || die "not a SWARM installation checkout: $CHECKOUT"
+	grep -q '"dev:api"' "$CHECKOUT/package.json" || die "no dev:api script in $CHECKOUT/package.json -- is this the SWARM checkout?"
+	[ -f "$CHECKOUT/.env" ] || die "no .env in $CHECKOUT -- dev:api reads it for API_PORT, DATABASE_URL and the rest"
+	refuse_if_running_by_hand
+
+	local argv=()
+	while IFS= read -r line; do argv+=("$line"); done < <(npm_argv)
+	argv+=(run dev:api)
+
+	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+	{
+		cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+
+	<key>ProgramArguments</key>
+	<array>
+EOF
+		for arg in "${argv[@]}"; do printf '\t\t<string>%s</string>\n' "$arg"; done
+		cat <<EOF
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>$CHECKOUT</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>$(agent_path)</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<key>StandardOutPath</key>
+	<string>$LOG</string>
+	<key>StandardErrorPath</key>
+	<string>${LOG%.log}.error.log</string>
+</dict>
+</plist>
+EOF
+	} >"$PLIST"
+	plutil -lint "$PLIST" >/dev/null || die "generated plist is invalid: $PLIST"
+
+	launchctl bootout "$TARGET" 2>/dev/null || true
+	launchctl bootstrap "gui/$(id -u)" "$PLIST"
+	printf 'swarm-api-agent: installed %s\n  checkout: %s\n  log:      %s\n' "$LABEL" "$CHECKOUT" "$LOG"
+	# The SPA is served from disk, so an installation that never built it starts a
+	# perfectly healthy API answering 404 for the dashboard itself.
+	[ -f "$CHECKOUT/dashboard/dist/index.html" ] ||
+		printf 'swarm-api-agent: no dashboard/dist yet -- run `npm run build:dashboard` for the panel on 127.0.0.1:%s\n' "$PORT"
+	wait_healthy
+}
+
+cmd_uninstall() {
+	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
+	launchctl bootout "$TARGET" 2>/dev/null || true
+	rm -f "$PLIST"
+	printf 'swarm-api-agent: removed %s (logs kept at %s)\n' "$LABEL" "$LOG"
+}
+
+cmd_status() {
+	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
+	printf 'label:    %s\ncheckout: %s\nurl:      http://127.0.0.1:%s\n' "$LABEL" "$CHECKOUT" "$PORT"
+	launchctl print "$TARGET" 2>/dev/null | grep -E '^[[:space:]]+(state|pid|last exit code) ' ||
+		echo 'state = not loaded'
+	if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/health" 2>/dev/null; then
+		echo 'health = ok'
+	else
+		echo 'health = no answer'
+	fi
+}
+
+cmd_restart() {
+	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT -- run: swarm-api-agent install"
+	# `kickstart -k` kills the running job and starts it again in one step, which is
+	# what makes this safe to run while the server is wedged rather than merely stale.
+	launchctl kickstart -k "$TARGET" >/dev/null ||
+		die "launchctl could not restart $LABEL -- it may not be loaded; re-run install"
+	printf 'swarm-api-agent: restarted %s\n' "$LABEL"
+	wait_healthy
+}
+
+cmd_reload() {
+	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT -- run: swarm-api-agent install"
+	local script='reload'
+	if [ "$RELOAD_ALL" = 1 ]; then script='reload:all'; fi
+	# Deliberately in the foreground: a failed migration, a failed dashboard build or
+	# a router that comes back unhealthy must stop the chain *before* the restart,
+	# with its own output on screen, rather than disappear into the agent's log.
+	printf 'swarm-api-agent: npm run %s in %s\n' "$script" "$CHECKOUT"
+	(cd "$CHECKOUT" && npm run "$script") ||
+		die "npm run $script failed -- the API was left running on the old build"
+	cmd_restart
+}
+
+cmd_logs() {
+	[ -f "$LOG" ] || die "no log yet at $LOG"
+	tail -f "$LOG" "${LOG%.log}.error.log"
+}
+
+[ "$(uname -s)" = 'Darwin' ] || die 'launchd is macOS-only; on Linux use a systemd --user unit running `npm run dev:api` with WorkingDirectory= set to the checkout'
+
+action=${1:-}
+if [ $# -gt 0 ]; then shift; fi
+RELOAD_ALL=0
+args=()
+for arg in "$@"; do
+	case "$arg" in
+		--all) RELOAD_ALL=1 ;;
+		-*) die "unknown option: $arg" ;;
+		*) args+=("$arg") ;;
+	esac
+done
+
+case "$action" in
+	install | uninstall | status | logs | restart | reload)
+		[ "$RELOAD_ALL" = 0 ] || [ "$action" = 'reload' ] || die "--all is only meaningful for reload"
+		resolve "${args[0]:-$PWD}"
+		"cmd_$action"
+		;;
+	-h | --help | help | '') usage ;;
+	*)
+		usage
+		exit 1
+		;;
+esac
