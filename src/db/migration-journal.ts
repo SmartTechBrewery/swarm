@@ -19,6 +19,12 @@
  * that point, the branch's own schema change would silently never apply. A
  * generic "resolve every conflict" merge prompt has no way to know these
  * invariants exist; this validator is the deterministic backstop.
+ *
+ * The directory and the journal mean different things (issue #907): an absent
+ * `migrationsDir` is "this repository keeps no drizzle migrations here" and
+ * validates clean, while a directory that exists with a missing or
+ * inconsistent journal beside it is a real inconsistency and still reports
+ * violations.
  */
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -37,11 +43,19 @@ interface Journal {
 /**
  * Validate `<migrationsDir>/meta/_journal.json` against the `.sql` files
  * beside it. Returns one human-readable problem per violation, or `[]` when
- * the journal is internally consistent — never throws for a malformed
+ * the journal is internally consistent — or when `migrationsDir` does not
+ * exist at all, per the module header — never throws for a malformed
  * journal, so a caller (a repair-loop gate, a unit test) can report every
  * problem at once rather than stopping at the first.
  */
 export function validateMigrationJournal(migrationsDir: string): string[] {
+	// No migrations directory at all is nothing to validate, not a violation:
+	// the resolve-conflicts guard hardcodes this repo's `src/db/migrations`, so
+	// treating its absence as a complaint failed the whole phase — and burned a
+	// repair pass with nothing to repair — on every project not carrying that
+	// layout (issue #907, three of five live projects).
+	if (!existsSync(migrationsDir)) return [];
+
 	const journalPath = join(migrationsDir, 'meta', '_journal.json');
 	if (!existsSync(journalPath)) {
 		return [`No migration journal found at ${journalPath}.`];
