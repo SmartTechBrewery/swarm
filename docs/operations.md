@@ -2,7 +2,8 @@
 
 This guide covers local setup, dashboard access, operator commands, ports,
 database migrations, and webhook exposure. The short setup path remains in the
-root [README](../README.md); this is the detailed operational reference.
+root [README](../README.md) and the long one in [`docs/MANUAL.md`](./MANUAL.md);
+this is the detailed operational reference.
 
 ## Running the stack (local)
 

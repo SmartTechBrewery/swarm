@@ -56,13 +56,9 @@ credentials, not the same agent asked nicely.
 **The agent writes code; SWARM does the delivery.** Every phase ends with a
 structured hand-off validated against a Zod schema. Commits, pushes, pull
 requests, review submissions, and board moves are then performed *by SWARM* from
-that hand-off — never by the agent shelling out on its own. A hand-off that
-fails validation gets exactly one repair pass, re-run against the validator's
-own complaint — resuming the review's own session where the harness reported
-one, and otherwise running fresh against the same checkout rather than
-addressing a session id that harness never minted — and then the run fails
-loudly, saying which of the two happened (or that the pass never ran at all),
-instead of half-delivering.
+that hand-off — never by the agent shelling out on its own. A hand-off that fails
+validation gets exactly one repair pass, and then the run fails loudly instead of
+half-delivering.
 
 **Two identities, so the review means something.** Implementation runs under an
 implementer persona; Review submits under a separate, project-scoped reviewer
@@ -97,22 +93,15 @@ a `failed` run row an operator can see and retry.
 
 **A real dispatch gate.** Before any worktree or agent exists, SWARM confirms an
 *eligible* worker may take the phase: active enrollment, the owner's sharing
-consent, a live connection, free capacity, the phase (both the machine's
-repertoire and what the enrollment permits), the configured CLI, and that the
-host's checkout is actually the right repository. Assigned work runs on its
-assignee's own machine and nobody else's; Planning is deliberately *not*
-affinity-gated, so it takes any capable worker; and a run that preserved a
-checkout is pinned to the machine holding it until an operator chooses "Reset &
-restart". One rule for every deployment — a single-user install enrolls its one
-local worker exactly like anyone else.
+consent, a live connection, free capacity, the phase, the configured CLI, and
+that the host's checkout is actually the right repository. Assigned work runs on
+its assignee's own machine and nobody else's. One rule for every deployment — a
+single-user install enrolls its one local worker exactly like anyone else.
 
 **Operated from a dashboard**, not a log file: run history and per-run detail
-with failure diagnosis, a **Stalled** section on both Runs surfaces naming the
-work items that have stopped moving — the phase each one stopped in, how long
-it has been silent, and a per-row **Dismiss** for a unit an operator can see is
-finished — project and board mapping, per-provider credential entry,
-worker registration/enrollment/approval, and each of your own workers' live CLI
-quota for every agent CLI on that machine.
+with failure diagnosis, a **Stalled** section naming the work items that have
+stopped moving, project and board mapping, per-provider credential entry, worker
+registration and approval, and each of your own workers' live CLI quota.
 
 ## The six phases
 
@@ -161,14 +150,13 @@ The interesting parts are written down as ADRs rather than left in the code:
 
 [`ai/ARCHITECTURE.md`](./ai/ARCHITECTURE.md) is the architecture as actually
 built; [`docs/pipeline.md`](./docs/pipeline.md) covers phase lifecycle, the
-security model, and the provider boundaries. The rest of this README is the
-shortest path to a working checkout.
+security model, and the provider boundaries.
 
 ---
 
 ## Quick start
 
-Run the following from the repository root:
+From the repository root:
 
 ```bash
 npm install
@@ -179,65 +167,26 @@ npm run db:migrate
 npm run db:seed                   # loads swarm.config.json into Postgres
 ```
 
-> **Local single-user mode is on by default.** The `.env.docker.example` template
-> sets `SWARM_SINGLE_USER_MODE=true`, so this local install needs **no dashboard
-> user, no password, no `/login`, and no session cookie**: the API bootstraps a
-> passwordless `localhost-admin` and signs you straight into the dashboard. Skip
-> the account commands below.
->
-> **It is an authentication policy, and nothing more.** It does *not* change how
-> work is dispatched: this install registers and enrolls its one local worker
-> exactly as a multi-user one does (the commands under **Register this machine
-> as a worker** below), because worker selection has a single rule for every
-> deployment. Without that worker, phases queue up with nothing to run them —
-> `swarm start` and `swarm status` say so.
->
-> **Multi-user alternative.** Set `SWARM_SINGLE_USER_MODE=false` in `.env` (or
-> remove the line) to require per-user session auth instead. Then create your
-> dashboard user and set its login password before signing in at `/login`:
->
-> ```bash
-> npm run swarm -- users add you@example.com --admin    # create your dashboard user, then
-> npm run swarm -- users set-password you@example.com   # set its login password (prompts, no echo)
-> ```
-
-**Register this machine as a worker.** Every deployment does this — a
-single-user install runs the same commands as a multi-user one, because a phase
-runs on an enrolled worker or it waits. In single-user mode the owner is the
-bootstrapped `localhost-admin` account, which exists once the API has served a
-request (start `npm run dev:api` and open the dashboard first, or use a user you
-created with `swarm users add`):
+Register this machine as a worker. Every deployment does — a phase runs on an
+enrolled worker or it waits:
 
 ```bash
-npm run swarm -- login --identifier localhost-admin                                  # once per machine
-npm run swarm -- workers register localhost-admin --name "this machine" --cli claude
-npm run swarm -- workers enroll <worker-id> <project-id> --cli claude --active --consent
+npm run swarm -- login --identifier localhost-admin
+npm run swarm -- workers register-and-enroll localhost-admin <project-id> \
+  --name "this machine" --cli claude
 ```
 
-`swarm workers` reaches the control plane over `SWARM_CONTROL_PLANE_URL` rather
-than Postgres since issue #800, so it needs a [`swarm login`](docs/cli.md#swarm-login)
-session and **no `DATABASE_URL`** — which is what lets a second machine onboard
-itself. (`localhost-admin` has no password until you set one:
-`npm run swarm -- users set-password localhost-admin`.)
-
-`workers register` prints a credential **once** — put it in `.env` as
-`SWARM_WORKER_CREDENTIAL` before starting the worker, or skip that by running
-`swarm run:worker` from the checkout you registered in. `swarm start` and `swarm
-status` warn when this host has no usable credential. On the machine being
-onboarded, `workers register-and-enroll` collapses the two commands above into
-one; the full runbook, including someone else's machine, is
-[`docs/onboarding-worker.md`](./docs/onboarding-worker.md).
-
-Start these processes in separate terminals:
+Then start the processes and open <http://localhost:5173>:
 
 ```bash
-npm run dev:api                   # API server on 127.0.0.1:3101
-npm run dev:dashboard             # Vite dashboard on localhost:5173
-npm run dev:worker                # the worker — see below
+npm run dev:api                   # API on 127.0.0.1:3101
+npm run dev:dashboard             # dashboard on localhost:5173
+npm run dev:worker                # the worker
 ```
 
-Open <http://localhost:5173>. For a compiled self-hosted dashboard, run
-`npm run start:api` and open <http://localhost:3101> instead.
+A local install is single-user by default: no account to create, no password, no
+`/login`. The prerequisites, the multi-user alternative, and the full worker
+runbook are in [`docs/MANUAL.md`](docs/MANUAL.md).
 
 ## Documentation
 

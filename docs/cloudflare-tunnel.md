@@ -2,7 +2,7 @@
 
 GitHub delivers webhooks by making an HTTPS request to a **public** URL. SWARM's
 router (`src/router`, port `3000` by default) runs on your own machine inside the
-Docker Compose stack (see [`README.md`](../README.md) → "Running the stack"), so it
+Docker Compose stack (see [`docs/MANUAL.md`](./MANUAL.md) → "Common commands"), so it
 has no public address of its own. A **Cloudflare Tunnel** bridges that gap: it opens
 an outbound-only connection from your machine to Cloudflare's edge and gives you a
 public HTTPS URL that forwards straight to `http://localhost:3000`. No inbound ports,

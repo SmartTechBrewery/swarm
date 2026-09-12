@@ -13,6 +13,7 @@ their own subjects; this manual is the operator's path through them.
 ## Contents
 
 - [Prerequisites](#prerequisites)
+- [Quick start, beyond the README](#quick-start-beyond-the-readme)
 - [The worker](#the-worker)
 - [Failure diagnosis](#failure-diagnosis)
 - [Common commands](#common-commands)
@@ -54,6 +55,60 @@ their own subjects; this manual is the operator's path through them.
   Every board read, write, and dashboard discovery authenticates with the
   selected provider's credential, configurable from the dashboard's **Project
   Management** tab. See [`docs/configuration.md`](./configuration.md).
+
+## Quick start, beyond the README
+
+The README's quick start is the shortest path that works. This is what it leaves out.
+
+**Local single-user mode is on by default.** The `.env.docker.example` template
+sets `SWARM_SINGLE_USER_MODE=true`, so a local install needs **no dashboard user,
+no password, no `/login`, and no session cookie**: the API bootstraps a
+passwordless `localhost-admin` and signs you straight into the dashboard.
+
+**It is an authentication policy, and nothing more.** It does *not* change how
+work is dispatched: this install registers and enrolls its one local worker
+exactly as a multi-user one does, because worker selection has a single rule for
+every deployment. Without that worker, phases queue up with nothing to run them —
+`swarm start` and `swarm status` say so.
+
+**Multi-user alternative.** Set `SWARM_SINGLE_USER_MODE=false` in `.env` (or
+remove the line) to require per-user session auth instead. Then create your
+dashboard user and set its login password before signing in at `/login`:
+
+```bash
+npm run swarm -- users add you@example.com --admin    # create your dashboard user, then
+npm run swarm -- users set-password you@example.com   # set its login password (prompts, no echo)
+```
+
+**Registering the worker, one step at a time.** `workers register-and-enroll`
+collapses two commands; either half can be run on its own, which is what you want
+when the two approvals are separate human decisions:
+
+```bash
+npm run swarm -- workers register localhost-admin --name "this machine" --cli claude
+npm run swarm -- workers enroll <worker-id> <project-id> --cli claude --active --consent
+```
+
+In single-user mode the owner is the bootstrapped `localhost-admin` account, which
+exists once the API has served a request (start `npm run dev:api` and open the
+dashboard first, or use a user you created with `swarm users add`). It has no
+password until you set one: `npm run swarm -- users set-password localhost-admin`.
+
+`swarm workers` reaches the control plane over `SWARM_CONTROL_PLANE_URL` rather
+than Postgres since issue #800, so it needs a [`swarm login`](./cli.md#swarm-login)
+session and **no `DATABASE_URL`** — which is what lets a second machine onboard
+itself.
+
+`workers register` prints a credential **once** — put it in `.env` as
+`SWARM_WORKER_CREDENTIAL` before starting the worker, or skip that by running
+`swarm run:worker` from the checkout you registered in. `swarm start` and `swarm
+status` warn when this host has no usable credential. The full runbook, including
+someone else's machine, is [`docs/onboarding-worker.md`](./onboarding-worker.md);
+on macOS, [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) runs
+it from a launchd agent instead of a terminal tab.
+
+For a compiled self-hosted dashboard, run `npm run start:api` and open
+<http://localhost:3101> instead of the Vite dev server.
 
 ## The worker
 
@@ -257,6 +312,8 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
   local router to GitHub
 - [`docs/onboarding-worker.md`](./onboarding-worker.md) — adding a new
   user + worker, local or remote
+- [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) — running a
+  worker from a launchd agent on macOS instead of a terminal tab
 - [`docs/github-projects-v2-api.md`](./github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./decisions/) — architecture decision records
