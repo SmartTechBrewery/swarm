@@ -227,6 +227,15 @@ provider-oriented diagnosis. Quota, model-capacity, launch/authentication,
 worker-shutdown, and user-termination conditions take precedence and retain
 their specific recovery guidance in both the board comment and run detail.
 
+**A renamed repository produces no failure at all.** Cards stop dispatching and
+nothing is marked failed: the router logs `pm-status: work item has no backing SCM
+artifact reference` and completes the job as a no-op, because the card's repository
+no longer matches the project's. Fix the project's repository first, then re-point
+each worker machine's checkout — see
+[`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md#a-repository-was-renamed),
+which carries the `swarm-repo-renamed` runbook and the ordering constraint that
+keeps worker enrollments from being suspended.
+
 ## Common commands
 
 ```bash
@@ -316,7 +325,8 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`docs/onboarding-worker.md`](./onboarding-worker.md) — adding a new
   user + worker, local or remote
 - [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) — running a
-  worker from a launchd agent on macOS instead of a terminal tab
+  worker from a launchd agent on macOS instead of a terminal tab, and the
+  `swarm-repo-renamed` runbook for a renamed project repository
 - [`docs/github-projects-v2-api.md`](./github-projects-v2-api.md) —
   Projects v2 API and webhook details
 - [`docs/decisions/`](./decisions/) — architecture decision records

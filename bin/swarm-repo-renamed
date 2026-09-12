@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# `swarm-repo-renamed` — re-point this machine's worker checkouts after a project
+# repository was renamed, and restart the agents that declared the old name
+# (docs/launchd-worker-autostart.md, "A repository was renamed").
+#
+# A worker declares which repository its checkout is by reading `origin` **once, at
+# startup** (`resolveDeclarableOriginRepoSlug`, src/scm/repo-slug.ts — "Resolved
+# once, because the process holds exactly one checkout for its whole life"), and the
+# control plane stores that declaration at handshake. So a rename leaves two stale
+# copies on every machine: the checkout's remote URL, and the declaration a
+# long-running daemon is still holding in memory. Neither heals on its own — a
+# reconnect re-sends the same in-memory value — and the symptom is silent: the
+# eligibility gate simply refuses the machine with `repository-mismatch` and the
+# board card waits.
+#
+# Order matters, and this script enforces it. Update the **project's** repository on
+# the control plane FIRST (dashboard, or `swarm.config.json` + `swarm config apply`),
+# and only then run this on each worker machine. A daemon that handshakes declaring a
+# repository the project does not name gets its enrollments **suspended**
+# (`suspendEnrollmentsForMismatchedRepository`, src/router/worker-transport.ts), and
+# re-activation is a project administrator's act — a machine may not restore its own
+# routability. Restarting before the control plane knows the new name is therefore
+# the one move that turns a five-minute fix into an admin round trip.
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+swarm-repo-renamed -- re-point worker checkouts after a repository rename (macOS)
+
+Usage:
+  swarm-repo-renamed <old-owner/repo> <new-owner/repo> [--dry-run]
+
+Scans every worker LaunchAgent installed on this machine (see
+`swarm-worker-agent`), and for each whose checkout's `origin` is <old-owner/repo>:
+rewrites the remote to <new-owner/repo>, verifies the new URL is reachable, and
+restarts that checkout's agent so it re-declares. A checkout already on the new
+name is restarted too, since its running daemon may still be declaring the old one.
+Every other checkout is left alone.
+
+  --dry-run   report what would change, touch nothing
+
+Update the project's repository on the control plane BEFORE running this: a daemon
+that declares a repository its project does not name has its enrollments suspended,
+and only a project administrator can re-activate them.
+
+Slugs are compared host-lessly and case-insensitively, exactly as SWARM compares
+them, so the remote's scheme, host alias, and `.git` suffix are preserved as-is.
+EOF
+}
+
+die() { printf 'swarm-repo-renamed: %s\n' "$1" >&2; exit 1; }
+
+# The host-less `owner/repo` a clone URL points at, lower-cased — the shell twin of
+# `repoSlugFromRemoteUrl` (src/scm/repo-slug.ts). Handles `scp`-style
+# (`git@host:owner/repo`, including an SSH host alias from ~/.ssh/config), `ssh://`
+# and `https://`, and keeps the whole path so a nested namespace compares whole
+# rather than being truncated to two segments.
+slug_of() {
+	local url=$1 path
+	case "$url" in
+		*://*) path=${url#*://}; path=${path#*/} ;;
+		*@*:*) path=${url#*:} ;;
+		*) path=$url ;;
+	esac
+	path=${path%.git}
+	path=${path#/}
+	path=${path%/}
+	printf '%s' "$path" | tr '[:upper:]' '[:lower:]'
+}
+
+# The same URL with its trailing `owner/repo` swapped for `$new`, preserving
+# everything in front of it (scheme, host or host alias, port, any parent path) and
+# the `.git` suffix if there was one. It strips by the *length* of the old slug
+# rather than pattern-matching a two-segment tail, so a nested namespace survives
+# and the URL's own casing of the prefix is never rewritten.
+retarget_url() {
+	local url=$1 old=$2 new=$3 suffix='' base
+	case "$url" in
+		*.git) suffix='.git'; base=${url%.git} ;;
+		*) base=$url ;;
+	esac
+	base=${base%/}
+	printf '%s%s%s' "${base:0:${#base}-${#old}}" "$new" "$suffix"
+}
+
+[ "$(uname -s)" = 'Darwin' ] || die 'launchd is macOS-only; on Linux restart the equivalent `systemd --user` unit after fixing the remote'
+
+DRY_RUN=false
+ARGS=()
+for arg in "$@"; do
+	case "$arg" in
+		--dry-run) DRY_RUN=true ;;
+		-h | --help | help) usage; exit 0 ;;
+		-*) usage; die "unknown option: $arg" ;;
+		*) ARGS+=("$arg") ;;
+	esac
+done
+
+[ "${#ARGS[@]}" -eq 2 ] || { usage; exit 1; }
+OLD_SLUG=$(slug_of "${ARGS[0]}")
+NEW_SLUG=${ARGS[1]}
+NEW_SLUG_NORM=$(slug_of "$NEW_SLUG")
+
+[ "$OLD_SLUG" != "$NEW_SLUG_NORM" ] || die 'the old and new repository are the same'
+case "$OLD_SLUG" in */*) ;; *) die "not an \"owner/repo\" slug: ${ARGS[0]}" ;; esac
+case "$NEW_SLUG_NORM" in */*) ;; *) die "not an \"owner/repo\" slug: ${ARGS[1]}" ;; esac
+
+matched=0
+restarted=0
+for plist in "$HOME"/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.*.plist; do
+	[ -f "$plist" ] || continue
+	checkout=$(plutil -extract WorkingDirectory raw "$plist" 2>/dev/null) || continue
+	url=$(git -C "$checkout" remote get-url origin 2>/dev/null) || continue
+	slug=$(slug_of "$url")
+
+	case "$slug" in
+		"$OLD_SLUG") ;;
+		"$NEW_SLUG_NORM")
+			matched=$((matched + 1))
+			printf '%s\n  remote already %s — restarting so the daemon re-declares\n' "$checkout" "$NEW_SLUG"
+			if [ "$DRY_RUN" = false ]; then
+				launchctl kickstart -k "gui/$(id -u)/$(basename "$plist" .plist)"
+				restarted=$((restarted + 1))
+			fi
+			continue
+			;;
+		*) continue ;;
+	esac
+
+	matched=$((matched + 1))
+	new_url=$(retarget_url "$url" "$OLD_SLUG" "$NEW_SLUG")
+	printf '%s\n  remote: %s\n      ->  %s\n' "$checkout" "$url" "$new_url"
+	if [ "$DRY_RUN" = true ]; then
+		printf '  (dry run — not changed, not restarted)\n'
+		continue
+	fi
+
+	git -C "$checkout" remote set-url origin "$new_url"
+	# Restarting onto a remote that cannot be fetched would leave the daemon running
+	# against a checkout it can no longer provision a worktree from, so prove the new
+	# URL first and put the old one back if it does not answer.
+	if ! git -C "$checkout" ls-remote --heads origin >/dev/null 2>&1; then
+		git -C "$checkout" remote set-url origin "$url"
+		printf '  FAILED: %s is not reachable — remote restored, agent not restarted\n' "$new_url" >&2
+		continue
+	fi
+	launchctl kickstart -k "gui/$(id -u)/$(basename "$plist" .plist)"
+	restarted=$((restarted + 1))
+	printf '  restarted\n'
+done
+
+if [ "$matched" -eq 0 ]; then
+	printf 'swarm-repo-renamed: no worker checkout on this machine is %s\n' "${ARGS[0]}"
+	exit 0
+fi
+printf 'swarm-repo-renamed: %d checkout(s) matched, %d agent(s) restarted\n' "$matched" "$restarted"

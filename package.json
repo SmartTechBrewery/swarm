@@ -6,7 +6,8 @@
 	"main": "dist/index.js",
 	"bin": {
 		"swarm": "./bin/swarm.js",
-		"swarm-worker-agent": "./bin/swarm-worker-agent"
+		"swarm-worker-agent": "./bin/swarm-worker-agent",
+		"swarm-repo-renamed": "./bin/swarm-repo-renamed"
 	},
 	"scripts": {
 		"swarm": "node --env-file-if-exists=.env --import tsx/esm src/cli/index.ts",

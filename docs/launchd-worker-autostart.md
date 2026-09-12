@@ -79,6 +79,12 @@ sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
   still connected as the old one — until that process is stopped and the agent
   installed. This is the usual explanation for "the worker I just registered never
   connects".
+- **A running daemon also keeps the *repository* it declared at startup.** Same
+  mechanism, different field: `origin` is read once
+  (`resolveDeclarableOriginRepoSlug`, `src/scm/repo-slug.ts`), so re-pointing the
+  checkout's remote under a live daemon changes nothing the control plane sees, and
+  neither does a reconnect — it re-sends the value it still holds in memory. See
+  "A repository was renamed" below.
 - **`swarm` runs the built CLI.** The `swarm` binary resolves to `dist/`, so a stale
   build affects the agent exactly as it affects an interactive call: run
   `npm run build` after changing CLI source.
@@ -87,3 +93,45 @@ sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
   approved enrollment still needs the daemon running. The dashboard's
   `/workers/<worker-id>` shows both; see
   [`docs/onboarding-worker.md`](./onboarding-worker.md), which this does not replace.
+
+## A repository was renamed
+
+Renaming a project's repository on the SCM host breaks dispatch **silently**, and
+the two halves have to be fixed in a fixed order.
+
+What goes stale: the project's own `repo` on the control plane, and — on every
+worker machine — the checkout's `origin` URL plus the declaration the running
+daemon read from it at startup. Nothing here heals on its own. The board card is
+simply skipped, with `pm-status: work item has no backing SCM artifact reference`
+in the router log, because the card's repository no longer matches the project's
+(`repoSlugsMatch`, `src/triggers/handlers/pm-status.ts`); once the project *is*
+fixed, dispatch moves on to waiting with `worker-authorization` instead, because
+every machine still declares the old name.
+
+1. **Control plane first.** Update the project's repository — the dashboard's
+   project settings, or `swarm.config.json` + `swarm config apply`.
+2. **Then each worker machine**, with the package's `swarm-repo-renamed`:
+
+   ```bash
+   swarm-repo-renamed <old-owner/repo> <new-owner/repo> [--dry-run]
+   ```
+
+   It walks every worker agent installed on the machine, and for each checkout
+   whose `origin` is the old repository it rewrites the remote, proves the new URL
+   answers (restoring the old one and skipping the restart if it does not), and
+   restarts that agent so the daemon re-declares. Checkouts for other repositories
+   are untouched — a machine running several workers needs one invocation, not one
+   per checkout. Only the trailing `owner/repo` of the URL is rewritten, so an SSH
+   host alias from `~/.ssh/config`, an `https://` remote, a port, and a nested
+   namespace all survive.
+
+**The order is not cosmetic.** A daemon that handshakes declaring a repository its
+project does not name has its enrollments *suspended*
+(`suspendEnrollmentsForMismatchedRepository`, `src/router/worker-transport.ts`), and
+re-activation is a project administrator's act — a machine may not restore its own
+routability. Restarting workers before the control plane knows the new name turns a
+five-minute fix into an admin round trip.
+
+Afterwards every worker should declare the new repository and keep an `active`
+enrollment; a card that was queued meanwhile resumes on its own at the next
+eligibility re-check (five minutes by default) with no need to move it again.
