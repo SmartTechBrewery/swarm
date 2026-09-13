@@ -1396,6 +1396,31 @@ describe('cancelling an in-flight assignment', () => {
 		expect(result.retryDelayMs).toBeUndefined();
 	});
 
+	it('never runs the phase for an assignment cancelled before it started (issue #912)', async () => {
+		// `trackAssignment` runs synchronously before the executor's first await, so a
+		// cancel issued on the very next line lands in the window this guard closes:
+		// before the phase — and so before the board move that used to report a pickup
+		// for a run that never ran.
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }) as PhaseRunResult);
+		const frame = ciAssignment();
+		const run = runAssignmentDbFree(frame, sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
+
+		expect(cancelAssignment(frame.dispatchId)).toBe(true);
+		await run;
+
+		expect(runPhase).not.toHaveBeenCalled();
+		// The worker never claimed to be running what it refused to start.
+		expect(sink.sent.some((frame) => frame.state === 'running')).toBe(false);
+		// …and settles the same terminal frame an in-flight cancellation produces.
+		expect(sink.sent.at(-1)).toMatchObject({
+			type: 'task-execution-result',
+			status: 'failed',
+			cancelled: true,
+			dispatchId: frame.dispatchId,
+		});
+	});
+
 	it('is a no-op for a dispatch this worker is not running', () => {
 		expect(cancelAssignment(UNKNOWN_DISPATCH_ID)).toBe(false);
 	});
