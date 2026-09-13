@@ -3,12 +3,17 @@
  * exactly as it was and saying why (issue #920).
  *
  * This is the host-local half of worker self-update and nothing else: it never
- * exits the process, and it never decides *when* an update is safe. Its caller does
- * (`../transport/worker-update.ts`, issue #933) — the opt-in, the wait for an idle
- * daemon, and the restart all live there. A machine where several daemons share one
- * install root can still have its code swapped underneath a running phase; the lock
- * that makes that impossible is a later phase's job, which is why such a machine
- * must not set `SWARM_WORKER_SELF_UPDATE` until it lands.
+ * exits the process, and it never decides *when* an update is safe for this daemon.
+ * Its caller does (`../transport/worker-update.ts`, issue #933) — the opt-in, the
+ * wait for an idle daemon, and the restart all live there.
+ *
+ * What it *does* decide is whether the update is safe for the **machine** (issue
+ * #935), because that question belongs to the install root rather than to any one
+ * daemon. Several daemons sharing one npm-linked checkout is the control-plane
+ * host's real shape, so before it fetches, this module takes the machine-local
+ * exclusive lock on the install root and refuses outright while a peer daemon is
+ * mid-phase (`../worktree/install-lock.ts`). A daemon that cannot take the lock
+ * re-reads the commit: the winner may have landed the very build it was asked for.
  *
  * **What it operates on.** `swarmInstallRoot()` (`../lib/build-identity.ts`) —
  * never `process.cwd()` and never `SWARM_WORKER_REPO_ROOT`. On the control-plane
@@ -63,8 +68,22 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import { swarmInstallRoot, WorkerUpdateTargetSchema } from '../lib/build-identity.js';
 import { logger } from '../lib/logger.js';
-import { checkoutStateDir } from '../worktree/checkout-key.js';
+import {
+	acquireInstallLock,
+	describeInstallParticipant,
+	findBusyInstallPeer,
+	InstallHeldError,
+	type InstallHostOptions,
+	type InstallLock,
+	installUpdateStateDir,
+} from '../worktree/install-lock.js';
 import { readJson } from '../worktree/local-lock.js';
+
+// Re-exported from where the lock and the participant registry also derive it, so the
+// three things that live under one install root's state directory cannot disagree
+// about which directory that is (the reason `../worktree/checkout-key.ts` exists one
+// scope down). Callers still ask this module for it.
+export { installUpdateStateDir };
 
 const execFileAsync = promisify(execFile);
 
@@ -200,9 +219,23 @@ export const InstallUpdateStateSchema = z.object({
 });
 export type InstallUpdateState = z.infer<typeof InstallUpdateStateSchema>;
 
-/** Where one install root's update state lives — the `checkoutStateDir` convention, reused. */
-export function installUpdateStateDir(installRoot: string, homeDir?: string): string {
-	return checkoutStateDir('install-updates', installRoot, homeDir);
+/**
+ * How long a daemon that cannot take the install lock waits before it gives up and
+ * re-reads the commit. Brief on purpose: the point of the wait is to let a *just*
+ * finishing update land, not to queue behind a thirty-minute `npm ci` — the loser has
+ * an answer for the control plane either way, and an operator who wants it applied
+ * re-issues.
+ */
+export const INSTALL_LOCK_WAIT_MS = 5_000;
+
+/** How often that wait re-tries the lock. */
+const INSTALL_LOCK_POLL_MS = 500;
+
+/** What this process is, on the machine whose install root it is about to move. */
+export interface InstallHostIdentity {
+	hostname?: string;
+	pid?: number;
+	isPidLive?: (pid: number) => boolean;
 }
 
 export interface ApplyUpdateTargetOptions {
@@ -214,18 +247,34 @@ export interface ApplyUpdateTargetOptions {
 	homeDir?: string;
 	run?: CommandRunner;
 	now?: () => Date;
+	/** Injectable so a test can stand in for a second daemon sharing this install root. */
+	host?: InstallHostIdentity;
+	/** Defaults to {@link INSTALL_LOCK_WAIT_MS}; `0` concedes the lock immediately. */
+	lockWaitMs?: number;
 }
 
-/** One install root, and the two injectable things every step here needs. */
+/** One install root, and the injectable things every step here needs. */
 interface InstallContext {
 	installRoot: string;
 	stateDir: string;
 	run: CommandRunner;
+	/** Everything the lock and the participant registry are addressed with. */
+	host: InstallHostOptions;
+	lockWaitMs: number;
 }
 
 interface UpdateContext extends InstallContext {
 	target: string;
 	now: () => Date;
+}
+
+/** The one options bag both the lock and the participant registry take. */
+function hostOptionsFor(options: {
+	homeDir?: string;
+	host?: InstallHostIdentity;
+	now: () => Date;
+}): InstallHostOptions {
+	return { ...options.host, homeDir: options.homeDir, now: () => options.now().getTime() };
 }
 
 /**
@@ -235,12 +284,15 @@ interface UpdateContext extends InstallContext {
  */
 export async function applyUpdateTarget(options: ApplyUpdateTargetOptions): Promise<UpdateOutcome> {
 	const installRoot = options.installRoot ?? swarmInstallRoot();
+	const now = options.now ?? (() => new Date());
 	const ctx: UpdateContext = {
 		target: options.target,
 		installRoot,
 		stateDir: installUpdateStateDir(installRoot, options.homeDir),
 		run: options.run ?? runCommand,
-		now: options.now ?? (() => new Date()),
+		now,
+		host: hostOptionsFor({ homeDir: options.homeDir, host: options.host, now }),
+		lockWaitMs: options.lockWaitMs ?? INSTALL_LOCK_WAIT_MS,
 	};
 	try {
 		return await update(ctx);
@@ -307,6 +359,91 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 		);
 	}
 	recordTracking(ctx, stored, tracking, currentCommit);
+
+	// From here on this daemon is about to touch the install root itself, which on a
+	// shared install is the machine's rather than its own (issue #935). Everything
+	// above was a read.
+	let lock: InstallLock;
+	try {
+		lock = await takeInstallLock(ctx);
+	} catch (error) {
+		if (!(error instanceof InstallHeldError)) throw error;
+		return await concedeToHolder(ctx, tracking, target, error);
+	}
+	try {
+		return await updateLocked(ctx, tracking, target, currentCommit);
+	} finally {
+		lock.release();
+	}
+}
+
+/**
+ * Take the machine-local lock, re-trying for {@link InstallContext.lockWaitMs} before
+ * conceding. The wait is what turns "two operators asked at the same second" into one
+ * update rather than into a refusal nobody expected.
+ */
+async function takeInstallLock(ctx: InstallContext): Promise<InstallLock> {
+	// Wall clock, not the injected one: this is a real pause, not a judgement about a
+	// record's age.
+	const deadline = Date.now() + ctx.lockWaitMs;
+	for (;;) {
+		try {
+			return acquireInstallLock(ctx.installRoot, ctx.host);
+		} catch (error) {
+			if (!(error instanceof InstallHeldError) || Date.now() >= deadline) throw error;
+			await sleep(INSTALL_LOCK_POLL_MS);
+		}
+	}
+}
+
+/**
+ * What a daemon that lost the lock answers: `already-current` when the holder has
+ * already landed the build this one was asked for, and the holder's own refusal
+ * otherwise.
+ *
+ * The target resolves with **no fetch of our own** — the holder's fetch already
+ * updated this checkout's remote-tracking refs, since it is the same checkout — so
+ * this costs two reads and cannot race the holder's network access.
+ */
+async function concedeToHolder(
+	ctx: UpdateContext,
+	tracking: { remote: string; branch: string },
+	target: string,
+	held: InstallHeldError,
+): Promise<UpdateOutcome> {
+	const head = await gitRead(ctx, ['rev-parse', 'HEAD'], GIT_READ_TIMEOUT_MS);
+	const commit = head ? await resolveTargetCommit(ctx, tracking.remote, target) : null;
+	if (head && commit === head) return { status: 'already-current', commit: head };
+	logger.warn('conceding a SWARM install update to the daemon holding the install root', {
+		installRoot: ctx.installRoot,
+		target,
+		lockDir: held.lockDir,
+		holderPid: held.holder?.pid ?? null,
+		holderWorkerId: held.holder?.workerId ?? null,
+	});
+	return refuse(held.message);
+}
+
+/** The half of an update that runs with the machine-local lock held. */
+async function updateLocked(
+	ctx: UpdateContext,
+	tracking: { remote: string; branch: string },
+	target: string,
+	currentCommit: string,
+): Promise<UpdateOutcome> {
+	// Before anything is fetched, let alone checked out: a peer daemon loaded from this
+	// same install root and running a phase would have its code swapped underneath it.
+	// The remedy is an operator act by design (`swarm workers drain`), so the refusal
+	// names the worker to drain rather than waiting for it.
+	const busy = findBusyInstallPeer(ctx.installRoot, ctx.host);
+	if (busy) {
+		return refuse(
+			`${describeInstallParticipant(busy)} is running a phase from the SWARM install root ` +
+				`'${ctx.installRoot}', which this daemon shares with it, so nothing was changed. ` +
+				'Updating it now would swap the code under that run. Drain that worker, wait for it ' +
+				'to go idle, and re-issue this update.',
+		);
+	}
 
 	// No refspec and no URL: what is fetched is whatever this remote's own config
 	// already says, which is the literal form of "only its own configured remote".
@@ -592,10 +729,18 @@ export interface InstallStateOptions {
 
 export interface ReturnToLastKnownGoodOptions extends InstallStateOptions {
 	run?: CommandRunner;
+	now?: () => Date;
+	/** Injectable so a test can stand in for a second daemon sharing this install root. */
+	host?: InstallHostIdentity;
+	/** Defaults to {@link INSTALL_LOCK_WAIT_MS}; `0` gives up on the lock immediately. */
+	lockWaitMs?: number;
 }
 
-/** Which step of a return failed — an apply's three, plus clearing the record afterwards. */
-export type ReturnFailureStage = UpdateFailureStage | 'record';
+/**
+ * Which step of a return failed — an apply's three, plus clearing the record
+ * afterwards, plus the machine-local lock a shared install root is moved under.
+ */
+export type ReturnFailureStage = UpdateFailureStage | 'record' | 'lock';
 
 /** What became of a return to the last known good build. Never thrown, like {@link UpdateOutcome}. */
 export type ReturnOutcome =
@@ -673,17 +818,46 @@ export function recordSuccessfulHandshake(options: InstallStateOptions = {}): st
  * commit the machine was last *proved* on, because promotion is what moves it. The
  * record is cleared only once the build succeeds: a return that failed halfway must
  * not leave the next start believing the abandoned build is worth promoting.
+ *
+ * It moves the install root, so it takes the same machine-local lock an apply does
+ * (issue #935): on a shared install root every daemon meets the same unproved build,
+ * so without it four of them would run four checkouts and four `npm ci`s over each
+ * other. It does **not** check for a busy peer — a machine that cannot connect has to
+ * recover, and blocking that on a peer's phase would leave it down for good. The
+ * daemon that loses the lock stays down and says so; by its next start the winner has
+ * cleared the record, so it simply starts on the good build.
  */
 export async function returnToLastKnownGood(
 	options: ReturnToLastKnownGoodOptions = {},
 ): Promise<ReturnOutcome> {
 	const installRoot = options.installRoot ?? swarmInstallRoot();
 	const stateDir = installUpdateStateDir(installRoot, options.homeDir);
-	const ctx: InstallContext = { installRoot, stateDir, run: options.run ?? runCommand };
+	const now = options.now ?? (() => new Date());
+	const ctx: InstallContext = {
+		installRoot,
+		stateDir,
+		run: options.run ?? runCommand,
+		host: hostOptionsFor({ homeDir: options.homeDir, host: options.host, now }),
+		lockWaitMs: options.lockWaitMs ?? INSTALL_LOCK_WAIT_MS,
+	};
+	let lock: InstallLock | undefined;
 	try {
 		const state = readState(stateDir);
 		if (!state?.pendingVerification) return { status: 'nothing-pending' };
 		const { lastKnownGood, pendingVerification } = state;
+		try {
+			lock = await takeInstallLock(ctx);
+		} catch (error) {
+			if (!(error instanceof InstallHeldError)) throw error;
+			return {
+				status: 'failed',
+				stage: 'lock',
+				reason:
+					`${error.message} This daemon is going down rather than returning the install root ` +
+					'underneath it; start it again once that update has finished.',
+				outputTail: '',
+			};
+		}
 		logger.warn('returning the SWARM install root to its last known good build', {
 			installRoot,
 			commit: lastKnownGood,
@@ -723,6 +897,8 @@ export async function returnToLastKnownGood(
 				'install root by hand.',
 			outputTail: '',
 		};
+	} finally {
+		lock?.release();
 	}
 }
 
@@ -795,6 +971,14 @@ function describeTarget(target: string): string {
 
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** A pause between two attempts at the install lock — never the reason a process stays alive. */
+function sleep(ms: number): Promise<void> {
+	return new Promise((done) => {
+		const timer = setTimeout(done, ms);
+		timer.unref?.();
+	});
 }
 
 function tailOf(result: UpdateCommandResult): string {

@@ -41,8 +41,11 @@
  * repository is refused before the checkout is touched (issue #688). Before any of
  * that it takes a host-local lock on that checkout (`../worktree/checkout-lock.ts`,
  * issue #689), so a second daemon pointed at the same `SWARM_WORKER_REPO_ROOT`
- * refuses to start rather than driving git in the same repository as this one. It
- * never opens a database or queue connection.
+ * refuses to start rather than driving git in the same repository as this one, and
+ * it registers as a **participant** of the SWARM install root it is loaded from
+ * (`../worktree/install-lock.ts`, issue #935) — which, unlike the checkout, several
+ * daemons legitimately share, so that record refuses nothing and is read by a
+ * self-update on this machine instead. It never opens a database or queue connection.
  *
  * Besides executing phases it reports one background fact about its own machine:
  * its agent CLIs' remaining allowance (`./quota-reporting.ts`, issue #825). No
@@ -52,7 +55,8 @@
  * It also answers one thing asked *of* its machine rather than of a dispatch: a
  * pushed request to move the SWARM install root to a build and restart into it
  * (`./worker-update.ts`, issue #933). It acts only if this host opted in
- * (`SWARM_WORKER_SELF_UPDATE`), only once it holds no in-flight phase, and on
+ * (`SWARM_WORKER_SELF_UPDATE`), only once it holds no in-flight phase, only while no
+ * *peer* daemon on this machine holds one either (issue #935), and on
  * success takes the same graceful teardown a SIGTERM does before exiting 0 — so
  * launchd `KeepAlive` / systemd `Restart=always` starts it again on the new build,
  * whose identity reaches the control plane through the `build` field above. Every
@@ -80,7 +84,7 @@ import { fileURLToPath } from 'node:url';
 // connects to neither.
 import '../integrations/entrypoint.js';
 import { resolveAgentContainment } from '../harness/containment.js';
-import { resolveOwnBuildIdentity } from '../lib/build-identity.js';
+import { resolveOwnBuildIdentity, swarmInstallRoot } from '../lib/build-identity.js';
 import { requireEnv, resolveWorkerRepoRoot } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -91,6 +95,7 @@ import {
 	CheckoutHeldError,
 	type CheckoutLock,
 } from '../worktree/checkout-lock.js';
+import { type InstallParticipation, registerInstallParticipant } from '../worktree/install-lock.js';
 import {
 	handleTaskCancel,
 	runAssignmentDbFree,
@@ -107,13 +112,15 @@ import { connectWorkerTransport } from './worker-client.js';
 import { createWorkerUpdateHandler, selfUpdateEnabled } from './worker-update.js';
 
 /**
- * The checkout lock this process holds (issue #689), with the timer that keeps it
- * fresh. Module-scoped so every exit path can drop it — a released lock is
- * immediately re-acquirable, where a lock left behind waits for the next daemon to
- * find its pid dead.
+ * The two host-local records this process leaves on its own machine: the checkout
+ * lock (issue #689) and its participation in the SWARM install root it is loaded
+ * from (issue #935), with the one timer that keeps both fresh. Module-scoped so every
+ * exit path can drop them — a released record is immediately reclaimable, where one
+ * left behind waits for the next daemon to find its pid dead.
  */
 let heldCheckoutLock: CheckoutLock | undefined;
-let checkoutRefreshTimer: ReturnType<typeof setInterval> | undefined;
+let installParticipation: InstallParticipation | undefined;
+let hostStateRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
 /**
  * The CLI-quota reporter this process runs (issue #825). Module-scoped for the
@@ -126,9 +133,20 @@ function stopQuotaReporting(): void {
 	quotaReporting = undefined;
 }
 
-function releaseCheckoutLock(): void {
-	if (checkoutRefreshTimer) clearInterval(checkoutRefreshTimer);
-	checkoutRefreshTimer = undefined;
+function releaseHostLocalState(): void {
+	if (hostStateRefreshTimer) clearInterval(hostStateRefreshTimer);
+	hostStateRefreshTimer = undefined;
+	try {
+		// Dropped before the checkout lock only because it is the cheaper of the two to
+		// lose: an update on this machine reads it to decide whether a peer is mid-phase,
+		// and this process no longer is one.
+		installParticipation?.release();
+	} catch (err) {
+		logger.warn('releasing this install root participation failed', {
+			error: describeError(err),
+		});
+	}
+	installParticipation = undefined;
 	try {
 		heldCheckoutLock?.release();
 	} catch (err) {
@@ -188,17 +206,26 @@ async function main(): Promise<void> {
 	// every exit path.
 	const checkoutLock = acquireCheckoutLockOrExit(repoRoot);
 	heldCheckoutLock = checkoutLock;
-	// An unref'd interval: it keeps the lock alive but must never be the reason this
-	// process stays alive. The cadence is what lets the TTL stay short — a lapsed
-	// `refreshedAt` then means a departed daemon rather than a long-running one.
-	checkoutRefreshTimer = setInterval(() => {
+	// Say, on this machine, that a daemon is running from this SWARM install root
+	// (issue #935). Not a lock and never a reason to refuse a start: several daemons
+	// sharing one npm-linked checkout is the control-plane host's ordinary shape. It is
+	// what a self-update on this machine reads to refuse before it swaps the code under
+	// a peer that is mid-phase, and a write it cannot make is swallowed there rather
+	// than raised here — a daemon is worth more than a record under `~/.swarm`.
+	installParticipation = registerInstallParticipant(swarmInstallRoot());
+	// An unref'd interval: it keeps both records alive but must never be the reason this
+	// process stays alive. The cadence is what lets their TTL stay short — a lapsed
+	// `refreshedAt` then means a departed daemon rather than a long-running one — and
+	// one timer serves both, which is why they share that TTL.
+	hostStateRefreshTimer = setInterval(() => {
+		installParticipation?.refresh();
 		if (checkoutLock.refresh()) return;
 		logger.warn('this checkout lock is no longer held by this process', {
 			repoRoot,
 			lockDir: checkoutLock.lockDir,
 		});
 	}, CHECKOUT_LOCK_REFRESH_MS);
-	checkoutRefreshTimer.unref();
+	hostStateRefreshTimer.unref();
 	// Which repository that one checkout actually is, read from its `origin` remote
 	// (issue #687) — the fact the control plane cannot otherwise learn, since
 	// `repoRoot` is host-local and never travels. Resolved once, because the process
@@ -234,6 +261,14 @@ async function main(): Promise<void> {
 	// re-pushed dispatch is deduplicated across pushes. The shutdown signal kills
 	// any in-flight agent CLI on a graceful stop before the session is released.
 	const inFlight = new Set<string>();
+	/**
+	 * Publish that set's emptiness to the rest of this machine (issue #935). A peer
+	 * daemon sharing this SWARM install root reads it before it updates, so a run here
+	 * never has its code swapped underneath it. Written at the two moments the set
+	 * can change rather than polled, and always derived from the set itself so a
+	 * concurrent dispatch cannot clear the flag for the one still running.
+	 */
+	const publishBusy = (): void => installParticipation?.setBusy(inFlight.size > 0);
 	const shutdownSignal = new AbortController();
 	// Declared up here rather than beside the signal handlers below, because a
 	// self-update restart (issue #933) takes the same teardown and must not race a
@@ -242,7 +277,7 @@ async function main(): Promise<void> {
 	/**
 	 * The graceful teardown both exits share: release the session so the control plane
 	 * frees the lease promptly instead of waiting out the TTL, stop reporting this
-	 * host's quota, then drop the checkout lock — last, so a departing daemon never
+	 * host's quota, then drop the host-local records — last, so a departing daemon never
 	 * hands the checkout to another worker while its own aborted agent may still be
 	 * writing there, and at all so an operator (or a supervisor restarting this
 	 * process) can re-acquire it immediately.
@@ -254,7 +289,7 @@ async function main(): Promise<void> {
 			await client.stop();
 		} finally {
 			stopQuotaReporting();
-			releaseCheckoutLock();
+			releaseHostLocalState();
 		}
 	};
 	// Declare *which phases* this daemon can execute, not just which CLIs it has
@@ -295,7 +330,11 @@ async function main(): Promise<void> {
 				workerCredential: credential,
 				shutdownSignal: shutdownSignal.signal,
 				inFlight,
-			});
+				// Both ends of the dispatch: `runAssignmentDbFree` adds to `inFlight` before
+				// its first await and removes in a `finally`, so the flag this machine's peers
+				// read is accurate from the moment the phase starts to the moment it settles.
+			}).finally(publishBusy);
+			publishBusy();
 		},
 		// The only channel a user termination has to this daemon (issue #549): it
 		// holds no `REDIS_URL`, so it cannot read the durable cancellation marker the
@@ -319,8 +358,12 @@ async function main(): Promise<void> {
 		// The handshake is the only place this daemon learns which worker it
 		// authenticates as, so it is where the checkout lock stops naming a bare pid:
 		// a second daemon's refusal can then name the *worker* holding it (issue #689).
+		// The participant record is annotated for the same reason (issue #935): an update
+		// refused because this daemon is mid-phase has to name a worker an operator can
+		// drain, not a pid they would have to map back themselves.
 		onSession: (session) => {
 			checkoutLock.annotate(session.workerId);
+			installParticipation?.annotate(session.workerId);
 			promoteBuild();
 		},
 	});
@@ -384,23 +427,23 @@ async function main(): Promise<void> {
 		throw err;
 	}
 	stopQuotaReporting();
-	releaseCheckoutLock();
+	releaseHostLocalState();
 	logger.info('worker transport client stopped');
 }
 
 /**
  * Run the daemon. `./connect-entry.ts` awaits this and owns the fatal log line and
  * the exit code; what belongs here is releasing what *this* module holds — the
- * quota reporter and the checkout lock are module-scoped, so the entrypoint cannot
- * reach them, and a checkout lock left behind waits for the next daemon to find its
- * pid dead.
+ * quota reporter, the checkout lock and this machine's participant record are
+ * module-scoped, so the entrypoint cannot reach them, and a record left behind waits
+ * for the next daemon to find its pid dead.
  */
 export async function runWorkerDaemon(): Promise<void> {
 	try {
 		await main();
 	} catch (err) {
 		stopQuotaReporting();
-		releaseCheckoutLock();
+		releaseHostLocalState();
 		throw err;
 	}
 }

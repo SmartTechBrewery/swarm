@@ -212,8 +212,11 @@ Usage:
              it first: the daemon waits for the phases it is already running to
              finish before it applies anything, and only draining stops new work
              arriving into that wait. The machine acts only if its host opted in
-             with SWARM_WORKER_SELF_UPDATE=true, and only a host whose SWARM
-             install root is NOT shared with another daemon may set that. Every
+             with SWARM_WORKER_SELF_UPDATE=true. On a host where several daemons
+             share one SWARM install root, the first to act does the fetch and
+             build and the rest report already-current; an update is refused
+             outright while a peer daemon there is mid-phase, naming the worker
+             to drain. Every
              outcome — applied, already-current, declined, refused, failed — is
              reported back and shown by 'list'; anything but 'applied' leaves the
              machine working on the build it has. Requesting again replaces a

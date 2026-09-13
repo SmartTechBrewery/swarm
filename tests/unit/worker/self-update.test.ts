@@ -11,8 +11,9 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	type ApplyUpdateTargetOptions,
 	applyUpdateTarget,
 	type CommandRunner,
 	InstallUpdateStateSchema,
@@ -119,6 +120,7 @@ async function apply(
 	home: string,
 	run: CommandRunner,
 	target = BRANCH,
+	extra: Partial<ApplyUpdateTargetOptions> = {},
 ): ReturnType<typeof applyUpdateTarget> {
 	return applyUpdateTarget({
 		target,
@@ -126,6 +128,7 @@ async function apply(
 		homeDir: home,
 		run,
 		now: () => new Date('2026-02-01T00:00:00.000Z'),
+		...extra,
 	});
 }
 
@@ -734,6 +737,235 @@ describe('the pending verification', () => {
 			// Kept: clearing it would send the next start back into the build that could
 			// not start, with nothing left to notice that it had.
 			expect(readState(home)).toMatchObject({ pendingVerification: { commit: APPLIED_COMMIT } });
+		});
+	});
+});
+
+/**
+ * Several daemons on one install root (issue #935) — the control-plane host's real
+ * shape. The peer daemons here are records on disk, since that is all one daemon can
+ * ever see of another: `../worktree/install-lock.ts` is where those records are
+ * written, and this is where the update's behaviour around them is pinned.
+ */
+describe('applyUpdateTarget — a shared install root', () => {
+	const OUR_PID = 5001;
+	const PEER_PID = 5002;
+	const TEST_HOST = 'ada-laptop';
+	const PEER_WORKER = '22222222-2222-4222-8222-222222222222';
+	const NOW_ISO = '2026-02-01T00:00:00.000Z';
+
+	/** Which pids the fake host considers alive — every case's second daemon, unless it says otherwise. */
+	let live: Set<number>;
+
+	beforeEach(() => {
+		live = new Set([OUR_PID, PEER_PID]);
+	});
+
+	/** This process, on a machine whose other daemons are written by hand below. */
+	function sharedHost(): Partial<ApplyUpdateTargetOptions> {
+		return {
+			host: {
+				hostname: TEST_HOST,
+				pid: OUR_PID,
+				isPidLive: (pid: number) => live.has(pid),
+			},
+			// The wait is a real pause; every case here is about what happens after it.
+			lockWaitMs: 0,
+		};
+	}
+
+	function lockDir(home: string): string {
+		return join(installUpdateStateDir(INSTALL_ROOT, home), 'update-lock');
+	}
+
+	/** A peer daemon holding the update lock. */
+	function writePeerLock(home: string, overrides: Record<string, unknown> = {}): void {
+		mkdirSync(lockDir(home), { recursive: true });
+		writeFileSync(
+			join(lockDir(home), 'owner.json'),
+			JSON.stringify({
+				installRoot: INSTALL_ROOT,
+				pid: PEER_PID,
+				hostname: TEST_HOST,
+				workerId: PEER_WORKER,
+				createdAt: NOW_ISO,
+				refreshedAt: NOW_ISO,
+				...overrides,
+			}),
+		);
+	}
+
+	/** A peer daemon running from the same install root. */
+	function writePeerParticipant(home: string, overrides: Record<string, unknown> = {}): void {
+		const dir = join(installUpdateStateDir(INSTALL_ROOT, home), 'participants');
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, `${PEER_PID}.json`),
+			JSON.stringify({
+				installRoot: INSTALL_ROOT,
+				pid: PEER_PID,
+				hostname: TEST_HOST,
+				workerId: PEER_WORKER,
+				busy: false,
+				startedAt: NOW_ISO,
+				refreshedAt: NOW_ISO,
+				...overrides,
+			}),
+		);
+	}
+
+	describe('two daemons asked at once', () => {
+		it('refuses, naming the holder, while it has not landed the target yet', async () => {
+			const home = makeHome();
+			writePeerLock(home);
+			const { run, argv } = scriptedRunner();
+
+			const outcome = await apply(home, run, BRANCH, sharedHost());
+
+			expect(outcome.status).toBe('refused');
+			if (outcome.status !== 'refused') return;
+			expect(outcome.reason).toContain(PEER_WORKER);
+			// Nothing was fetched, let alone checked out: the holder owns the tree.
+			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+		});
+
+		it('reports already-current once the holder has landed the target', async () => {
+			const home = makeHome();
+			writePeerLock(home);
+			// What the holder's own checkout left behind — the target, on this same tree.
+			const { run, argv } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
+
+			const outcome = await apply(home, run, BRANCH, sharedHost());
+
+			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
+			// Resolved off the refs the holder's own fetch already updated.
+			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+		});
+
+		it('takes over a lock left behind by a daemon that is gone', async () => {
+			const home = makeHome();
+			writePeerLock(home);
+			live.delete(PEER_PID);
+			const { run } = scriptedRunner();
+
+			const outcome = await apply(home, run, BRANCH, sharedHost());
+
+			expect(outcome.status).toBe('applied');
+		});
+
+		it('releases the lock on the way out, whatever the outcome', async () => {
+			const home = makeHome();
+
+			const applied = await apply(home, scriptedRunner().run, BRANCH, sharedHost());
+			expect(applied.status).toBe('applied');
+			expect(existsSync(lockDir(home))).toBe(false);
+
+			const fetchFailed = await apply(
+				home,
+				scriptedRunner({ [`git fetch ${REMOTE}`]: fail('no route to host') }).run,
+				BRANCH,
+				sharedHost(),
+			);
+			expect(fetchFailed.status).toBe('refused');
+			expect(existsSync(lockDir(home))).toBe(false);
+
+			const buildFailed = await apply(
+				home,
+				scriptedRunner({ 'npm run build': [fail('TS2322')] }).run,
+				BRANCH,
+				sharedHost(),
+			);
+			expect(buildFailed.status).toBe('failed');
+			expect(existsSync(lockDir(home))).toBe(false);
+		});
+	});
+
+	describe('a peer daemon mid-phase', () => {
+		it('refuses before anything is fetched, naming the worker to drain', async () => {
+			const home = makeHome();
+			writePeerParticipant(home, { busy: true });
+			const { run, argv } = scriptedRunner();
+
+			const outcome = await apply(home, run, BRANCH, sharedHost());
+
+			expect(outcome.status).toBe('refused');
+			if (outcome.status !== 'refused') return;
+			expect(outcome.reason).toContain(PEER_WORKER);
+			expect(outcome.reason).toContain('Drain that worker');
+			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+			expect(argv()).not.toContain(`git checkout --detach ${TARGET_COMMIT}`);
+		});
+
+		it('proceeds past an idle peer', async () => {
+			const home = makeHome();
+			writePeerParticipant(home, { busy: false });
+			const { run } = scriptedRunner();
+
+			expect((await apply(home, run, BRANCH, sharedHost())).status).toBe('applied');
+		});
+
+		it('proceeds past a departed peer whose record still says it was busy', async () => {
+			const home = makeHome();
+			writePeerParticipant(home, { busy: true });
+			live.delete(PEER_PID);
+			const { run } = scriptedRunner();
+
+			expect((await apply(home, run, BRANCH, sharedHost())).status).toBe('applied');
+		});
+	});
+
+	describe('returning to the last known good build', () => {
+		const PENDING = {
+			commit: TARGET_COMMIT,
+			previousCommit: HEAD,
+			failedStarts: 3,
+			startedAt: NOW_ISO,
+		};
+
+		function writePending(home: string): void {
+			writeStoredState(home, {
+				lastKnownGood: HEAD,
+				target: BRANCH,
+				targetCommit: TARGET_COMMIT,
+				appliedAt: NOW_ISO,
+				pendingVerification: PENDING,
+			});
+		}
+
+		function returnOptions(home: string, run: CommandRunner) {
+			return {
+				installRoot: INSTALL_ROOT,
+				homeDir: home,
+				run,
+				now: () => new Date(NOW_ISO),
+				...sharedHost(),
+			};
+		}
+
+		it('gives up rather than rebuilding under another daemon that is updating', async () => {
+			const home = makeHome();
+			writePending(home);
+			writePeerLock(home);
+			const { run, calls } = scriptedRunner();
+
+			const outcome = await returnToLastKnownGood(returnOptions(home, run));
+
+			expect(outcome.status).toBe('failed');
+			if (outcome.status !== 'failed') return;
+			expect(outcome.stage).toBe('lock');
+			expect(outcome.reason).toContain(PEER_WORKER);
+			expect(calls).toHaveLength(0);
+			// Kept, so the start after this one returns instead of promoting a bad build.
+			expect(readState(home)).toMatchObject({ pendingVerification: { commit: TARGET_COMMIT } });
+		});
+
+		it('returns anyway while a peer is mid-phase — a machine that cannot connect must recover', async () => {
+			const home = makeHome();
+			writePending(home);
+			writePeerParticipant(home, { busy: true });
+			const { run } = scriptedRunner();
+
+			expect((await returnToLastKnownGood(returnOptions(home, run))).status).toBe('returned');
 		});
 	});
 });
