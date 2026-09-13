@@ -77,6 +77,7 @@ import {
 } from '@/pipeline/prompts/plan-verification.js';
 import {
 	buildPlanningPrompt,
+	MAX_SPLIT_CHILDREN,
 	PROPOSED_PLAN_FILENAME,
 	PROPOSED_SCOPE_FILENAME,
 	PROPOSED_SPLIT_FILENAME,
@@ -113,6 +114,7 @@ export { PLANNED_LABEL, SPLIT_CHILD_LABEL } from '@/pipeline/preplan.js';
 // importers of `@/pipeline/planning.js` keep resolving them unchanged.
 export {
 	buildPlanningPrompt,
+	MAX_SPLIT_CHILDREN,
 	PROPOSED_PLAN_FILENAME,
 	PROPOSED_SCOPE_FILENAME,
 	PROPOSED_SPLIT_FILENAME,
@@ -151,11 +153,24 @@ const SplitSubTaskSchema = z.object({
  * (`resolveSplitNaming`, `src/pipeline/split-naming.ts`), so a response that omits
  * it falls back to a name derived from the split's own titles rather than failing a
  * Planning run over wording.
+ *
+ * `subTasks` is capped at {@link MAX_SPLIT_CHILDREN} — the one split-size contract the
+ * planner's prompt states and {@link recoverAdvancedSplitChildren} scans to. Enforcing it
+ * *here* is what makes the two agree: the cap is applied when the file is read, before a
+ * single child card exists, so no board write can ever produce a split whose later
+ * children the recovery scan would not reach (issue #911). An over-cap file is a failed
+ * run like any other malformed one, not a silently truncated split.
  */
 const ProposedSplitSchema = z.object({
 	sharedName: z.string().trim().min(1).optional(),
 	mainTask: MainTaskSchema.optional(),
-	subTasks: z.array(SplitSubTaskSchema).default([]),
+	subTasks: z
+		.array(SplitSubTaskSchema)
+		.max(
+			MAX_SPLIT_CHILDREN,
+			`A proposed split may name at most ${MAX_SPLIT_CHILDREN} subTasks; split the work across fewer, larger phases.`,
+		)
+		.default([]),
 });
 
 export type ProposedSplit = z.infer<typeof ProposedSplitSchema>;
@@ -411,7 +426,9 @@ export interface PlanningPhaseResult {
  * `undefined` when the agent chose not to split (file absent, or present with no
  * `subTasks`). A malformed file throws — the agent was asked for an exact shape,
  * so a broken one is a failed run, not a silent "no split" (ai/CODING_STANDARDS.md
- * "Error handling").
+ * "Error handling"). That includes a split naming more than {@link MAX_SPLIT_CHILDREN}
+ * subTasks: this is the one place the cap can be applied while nothing has been written
+ * to the board yet, so it rejects rather than truncates.
  */
 export function readProposedSplit(worktreePath: string): ProposedSplit | undefined {
 	const splitPath = join(worktreePath, PROPOSED_SPLIT_FILENAME);
@@ -1413,16 +1430,6 @@ async function advanceSplitChild(
 }
 
 /**
- * The largest number of children {@link recoverAdvancedSplitChildren} will look up
- * before it stops. The scan's real exit is the first index with no card, which on the
- * path it runs from is always the split's own child count, so this is a bound on a
- * read loop rather than the normal end of one — and it is stated (and logged when it
- * bites) because a lookup loop with no explicit bound is exactly what the cost
- * contract on `PMProvider` forbids. No split SWARM has produced comes near it.
- */
-const MAX_RECOVERED_SPLIT_CHILDREN = 64;
-
-/**
  * Recover the children an *earlier attempt of this same delivery* already advanced to
  * {@link NEXT_STATUS}, for the one path that would otherwise lose them.
  *
@@ -1447,14 +1454,19 @@ const MAX_RECOVERED_SPLIT_CHILDREN = 64;
  *
  * Both reads are the *narrow* form served on the DB-free path as well
  * ({@link acquireSplitChild}), and the request count is a function of the split's own
- * size, never the board's. A failed lookup **fails the phase**, like
- * {@link acquireSplitChild}'s and unlike the best-effort preparation writes: swallowing
- * it returns the stranded child this exists to prevent, permanently, where a retry
- * costs only a retry.
+ * size, never the board's — bounded for good by {@link MAX_SPLIT_CHILDREN}, the same cap
+ * {@link ProposedSplitSchema} enforces before any child is created, so the scan covers
+ * *every* index a split can legally hold rather than a prefix of one. A failed lookup
+ * **fails the phase**, like {@link acquireSplitChild}'s and unlike the best-effort
+ * preparation writes: swallowing it returns the stranded child this exists to prevent,
+ * permanently, where a retry costs only a retry. A split that somehow runs past the cap
+ * fails the phase for the same reason, rather than reporting the prefix it did read as a
+ * complete answer — a partial success here is indistinguishable, to the worker, from a
+ * split whose later children were never advanced.
  */
 async function recoverAdvancedSplitChildren(pm: PMProvider, deliveryId: string): Promise<string[]> {
 	const advancedItemIds: string[] = [];
-	for (let childIndex = 0; childIndex < MAX_RECOVERED_SPLIT_CHILDREN; childIndex++) {
+	for (let childIndex = 0; childIndex < MAX_SPLIT_CHILDREN; childIndex++) {
 		const child = await pm.findWorkItemByDescriptionMarker(
 			splitChildMarker(deliveryId, childIndex),
 		);
@@ -1466,11 +1478,16 @@ async function recoverAdvancedSplitChildren(pm: PMProvider, deliveryId: string):
 			advancedItemIds.push(child.id);
 		}
 	}
-	logger.warn('Planning — stopped recovering advanced split children at the scan bound', {
-		deliveryId,
-		bound: MAX_RECOVERED_SPLIT_CHILDREN,
-		recovered: advancedItemIds.length,
-	});
+	// Every legal index held a card, so the gap that normally ends the scan is one index
+	// past the cap. One extra lookup — reached only by a split of exactly the maximum
+	// size, which is to say never in practice — separates "the largest legal split,
+	// completely recovered" from "a split this build's contract says cannot exist".
+	if (await pm.findWorkItemByDescriptionMarker(splitChildMarker(deliveryId, MAX_SPLIT_CHILDREN))) {
+		throw new Error(
+			`Planning delivery ${deliveryId} has more than ${MAX_SPLIT_CHILDREN} split children; ` +
+				`cannot recover which of them were advanced without leaving one parked in "${NEXT_STATUS}".`,
+		);
+	}
 	return advancedItemIds;
 }
 

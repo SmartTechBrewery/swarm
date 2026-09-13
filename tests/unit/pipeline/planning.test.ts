@@ -44,6 +44,7 @@ vi.mock('node:fs', () => ({
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import {
 	buildPlanningPrompt,
+	MAX_SPLIT_CHILDREN,
 	PLANNED_LABEL,
 	PREPLAN_COMMENT_MARKER_PREFIX,
 	PROPOSED_PLAN_FILENAME,
@@ -55,6 +56,7 @@ import {
 	runPlanningPhase,
 	SPLIT_CHILD_LABEL,
 	splitChildCommentBody,
+	splitChildMarker,
 } from '@/pipeline/planning.js';
 import {
 	buildPreplanContract,
@@ -2141,6 +2143,93 @@ describe('runPlanningPhase', () => {
 				// walking the board: two children plus the gap that ends the split.
 				expect(retry.pm.findWorkItemByDescriptionMarker).toHaveBeenCalledTimes(3);
 			});
+
+			// The recovery scan covers a fixed number of child indices, so the split's
+			// own size is capped at that same number — one constant, enforced when the
+			// proposal is read, before a single card exists. These three cover the seam
+			// between the two: the cap refusing an over-sized proposal, the scan
+			// recovering a split that sits exactly on it, and the scan refusing to call
+			// a prefix a complete answer.
+			describe('the split size and the recovery scan share one bound', () => {
+				/** A proposed split naming `count` siblings, in the planner's own shape. */
+				const splitOf = (count: number) =>
+					JSON.stringify({
+						sharedName: SHARED_NAME,
+						mainTask: { title: 'First slice', description: 'The first slice' },
+						subTasks: Array.from({ length: count }, (_, index) => ({
+							title: `Slice ${index + 2}`,
+							description: `The slice ${index + 2}`,
+							plan: `# Plan ${index + 2}\n\nBuild it.`,
+						})),
+					});
+
+				/** Advance every child of a maximum-sized split, then fail the parent's label. */
+				async function advanceMaxSizedSplit(): Promise<string[]> {
+					splitContents = splitOf(MAX_SPLIT_CHILDREN);
+					const first = failingParentWrite(onBoard(makeDeps(), board), 'label');
+					await expect(
+						runPlanningPhase({ ...first, runId: 'run-A', autoAdvance: true }),
+					).rejects.toThrow('label write failed: 502');
+					const childIds = board.items.map((item) => item.id);
+					expect(childIds).toHaveLength(MAX_SPLIT_CHILDREN);
+					for (const childId of childIds) {
+						expect(first.pm.moveWorkItem).toHaveBeenCalledWith(childId, 'todo');
+					}
+					return childIds;
+				}
+
+				it('refuses a proposal naming more children than the scan covers, before any board write', async () => {
+					splitContents = splitOf(MAX_SPLIT_CHILDREN + 1);
+					const deps = onBoard(makeDeps(), board);
+
+					await expect(
+						runPlanningPhase({ ...deps, runId: 'run-A', autoAdvance: true }),
+					).rejects.toThrow(`at most ${MAX_SPLIT_CHILDREN} subTasks`);
+
+					// Rejected while it is still only a file: no card, no plan comment, and
+					// the source task neither advanced nor marked planned — so there is no
+					// half-applied split for a retry to have to reason about.
+					expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+					expect(deps.pm.addComment).not.toHaveBeenCalled();
+					expect(deps.pm.moveWorkItem).not.toHaveBeenCalled();
+					expect(deps.pm.addLabel).not.toHaveBeenCalled();
+				});
+
+				it('recovers every child of a split sitting exactly on the bound', async () => {
+					const childIds = await advanceMaxSizedSplit();
+
+					const retry = onBoard(makeDeps(), board);
+					const result = await runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true });
+
+					// The largest split the cap allows is still recovered whole — the scan
+					// reaching its last legal index is the normal end of a maximum-sized
+					// split, not a truncation.
+					expect(result.advancedItemIds).toEqual(childIds);
+					expect(retry.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', PLANNED_LABEL);
+				});
+
+				it('fails the phase rather than reporting a prefix when a delivery runs past the bound', async () => {
+					const childIds = await advanceMaxSizedSplit();
+					// A card one index past the last legal one — the state only a split that
+					// escaped the cap could leave. Reporting the 64 already read would tell
+					// the worker "this is all of them", stranding the last child for good;
+					// failing keeps the delivery retryable.
+					board.items.push(
+						createMockWorkItem({
+							id: 'PVTI_overflow',
+							title: 'One phase too many',
+							description: `A slice too far. ${splitChildMarker('run-A', MAX_SPLIT_CHILDREN)}`,
+							url: 'https://example.test/PVTI_overflow',
+						}),
+					);
+
+					const retry = onBoard(makeDeps(), board);
+					await expect(
+						runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true }),
+					).rejects.toThrow(`more than ${MAX_SPLIT_CHILDREN} split children`);
+					expect(childIds).toHaveLength(MAX_SPLIT_CHILDREN);
+				});
+			});
 		});
 
 		it('still performs its own split for a genuine replan — a new run, hence a new identity', async () => {
@@ -2624,6 +2713,13 @@ describe('buildPlanningPrompt', () => {
 		// is what made every split's cards read alike in the Planning column.
 		expect(prompt).toMatch(/never a\n {4}bare "Phase 2\/3: …"/);
 		expect(prompt).not.toContain('"Phase 1/3: <title>"');
+	});
+
+	it('states the split-size cap the split file is validated against', () => {
+		const prompt = buildPlanningPrompt(createMockWorkItem(), true);
+		// The planner is told the limit rather than discovering it as a failed run:
+		// the same constant rejects an over-sized split file when it is read.
+		expect(prompt).toContain(`Name AT MOST ${MAX_SPLIT_CHILDREN} "subTasks" entries`);
 	});
 
 	it('asks for a reusable per-child plan when splitting', () => {
