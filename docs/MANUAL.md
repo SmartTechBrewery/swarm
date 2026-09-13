@@ -203,6 +203,28 @@ worker-side; a split interrupted partway resumes from a per-child marker rather
 than creating that child twice. Results stream back over the transport (ADR-003
 §2).
 
+**How to restart one safely.** Stopping a worker mid-phase kills the agent CLI it
+is running, and the restarted daemon's handshake settles that session's dispatch
+and run terminally `failed` — there is no retry after that. So take the machine
+out of the dispatch pool first and let it finish what it has:
+
+```bash
+swarm workers drain <worker-id>      # no new work; the current run is untouched
+# …re-run it until it prints "draining and idle — safe to restart"
+# restart the daemon (swarm run:worker / npm run dev:worker)
+swarm workers undrain <worker-id>    # back in the pool
+```
+
+`drain` is machine-wide, reversible, and takes effect from the next dispatch;
+everything the machine is already running is left alone. Work that would have gone
+there is deferred rather than failed and runs on another eligible machine on the
+next re-check — a project whose *only* machine is drained waits with a message
+naming the drain. The state is **sticky across the restart it was taken for**: a
+reconnecting daemon does not rejoin the pool (the router logs that it is draining
+at each handshake), nothing expires it, and only `undrain` ends it. It is the
+machine owner's own call, so sign in as them; `swarm workers list` marks every
+machine currently out of the pool.
+
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
 many of its runs happen at once. Dispatch always runs on the control
@@ -210,8 +232,8 @@ plane (ADR-003 §2): there is no second arrangement — the in-process executor 
 deleted so that one path carries every run. A project with no enrolled, connected
 worker leaves its dispatch durably pending; a wait for a *machine* ends as soon
 as one turns up (a worker connecting, or finishing a run and freeing its slot),
-while a wait for a *human* (consent, an enrollment, a permitted phase) keeps the
-timed cadence, since nothing a machine does can clear it.
+while a wait for a *human* (consent, an enrollment, a permitted phase, a drained
+machine) keeps the timed cadence, since nothing a machine does can clear it.
 
 The control-plane host's own worker runs this identical program over loopback, so
 a remote worker and a local one are the same code path rather than two that have

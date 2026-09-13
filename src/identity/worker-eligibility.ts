@@ -8,12 +8,12 @@
  * It combines ADR-001's routing prerequisites — "an eligible, connected worker
  * with active owner sharing consent, project enrollment, required CLI
  * capability, and available capacity" — in that order: active enrollment →
- * active sharing consent → connection/health → free capacity → the repository
- * the machine's checkout is (issue #714) → declared phase support (issue #467) →
- * the enrollment's own allowed phases (issue #509) →
- * declared CLI capability. The first missing signal wins, so a caller always gets *the* reason
- * to show rather than a set to prioritize itself. The first two checks together
- * are exactly `isRoutable` (`./worker-enrollment.ts`, #337's named seam); they are
+ * active sharing consent → draining (issue #919) → connection/health → free
+ * capacity → the repository the machine's checkout is (issue #714) → declared
+ * phase support (issue #467) → the enrollment's own allowed phases (issue #509) →
+ * declared CLI capability. The first missing signal wins, so a caller always gets
+ * *the* reason to show rather than a set to prioritize itself. The first two
+ * checks together are exactly `isRoutable` (`./worker-enrollment.ts`, #337's named seam); they are
  * evaluated separately only so a revoked consent is reported as `missing-consent`
  * rather than as a suspended enrollment.
  *
@@ -52,6 +52,13 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
  *   `active` (still `pending` approval, or `suspended`).
  * - `missing-consent` — enrolled and active, but the worker's owner has not
  *   granted (or has revoked) sharing consent for this project.
+ * - `worker-draining` — the machine's operator took it **out of the pool** so it
+ *   can be restarted (issue #919). Judged before the connection/capacity check and
+ *   kept distinct from `worker-unavailable` for the same reason `missing-consent`
+ *   is: nothing the machine does clears it — a drained machine that reconnects or
+ *   frees a slot is still drained — and the fix belongs to whoever operates it
+ *   (`swarm workers undrain <worker-id>`). Work refused for it is deferred, never
+ *   failed, and goes to another eligible worker on the next re-check.
  * - `worker-unavailable` — the worker is disconnected/unhealthy (no live
  *   session) or already at its enrolled concurrency allocation. One value, since
  *   both resolve the same way: wait for the worker to come back or free a slot.
@@ -93,6 +100,7 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
 export const IneligibilityReasonSchema = z.enum([
 	'missing-enrollment',
 	'missing-consent',
+	'worker-draining',
 	'worker-unavailable',
 	'repository-mismatch',
 	'missing-phase-capability',
@@ -134,10 +142,11 @@ export interface WorkerAvailability {
 /** Everything {@link evaluateWorkerEligibility} judges — one worker, one target. */
 export interface WorkerEligibilityInput {
 	/**
-	 * The worker's declared CLI and phase capabilities, plus the repository its one
-	 * local checkout is (`./worker.ts`) — `null` when it has declared none.
+	 * The worker's declared CLI and phase capabilities, the repository its one local
+	 * checkout is (`./worker.ts`) — `null` when it has declared none — and whether
+	 * its operator has taken it out of the pool (`drainingSince`, issue #919).
 	 */
-	worker: Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository'>;
+	worker: Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository' | 'drainingSince'>;
 	/** Its enrollment for the project, or `undefined` when it has none. */
 	enrollment: WorkerEnrollment | undefined;
 	availability: WorkerAvailability;
@@ -178,9 +187,9 @@ export function resolveTargetCli(target: AgentTarget, phaseDefaultCli: AgentCli)
 
 /**
  * Judge one worker against one candidate target, returning the first missing
- * signal in ADR-001's order (enrollment → consent → connection → capacity →
- * repository → phase capability → phase permission → CLI capability). Pure: it
- * reads only what it is given.
+ * signal in ADR-001's order (enrollment → consent → draining → connection →
+ * capacity → repository → phase capability → phase permission → CLI capability).
+ * Pure: it reads only what it is given.
  */
 export function evaluateWorkerEligibility(input: WorkerEligibilityInput): EligibilityResult {
 	const { worker, enrollment, availability, target, phaseDefaultCli, phase, repository } = input;
@@ -189,6 +198,17 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	}
 	if (!enrollment.sharingConsent) {
 		return { eligible: false, reason: 'missing-consent' };
+	}
+	// The machine's operator took it out of the pool so it can be restarted (issue
+	// #919). Judged here, beside sharing consent and *ahead* of connectivity, because
+	// both are a standing statement that this machine takes no work — and because a
+	// drained machine is usually also offline (it was drained *in order to* be
+	// restarted), so judging it after the connection check would report
+	// `worker-unavailable` and tell an operator to wait for something waiting cannot
+	// fix. What it is already running is untouched: this predicate runs only before a
+	// phase starts.
+	if (worker.drainingSince) {
+		return { eligible: false, reason: 'worker-draining' };
 	}
 	// Every enrollment states this worker's share of the project (issue #480), so
 	// the capacity test is unconditional: the project's `maxConcurrentJobs` bounds

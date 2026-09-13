@@ -160,6 +160,13 @@ describe('swarm workers', () => {
 		}));
 		answers.set('workers.scmCredentials.set', () => ({ login: 'ada-bot' }));
 		answers.set('workers.remove', (input) => ({ workerId: input.workerId }));
+		answers.set('workers.setDraining', (input) => ({
+			workerId: input.workerId,
+			displayName: 'ada-laptop',
+			drainingSince: input.draining ? '2026-09-13T10:00:00.000Z' : null,
+			busy: false,
+			currentRunId: null,
+		}));
 		enrollmentRow = {
 			id: ENROLLMENT_ID,
 			status: 'pending',
@@ -781,6 +788,29 @@ describe('swarm workers', () => {
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('Open a project'));
 		});
 
+		// Issue #919: a drain expires on nothing, so the roster has to say which machines
+		// are out of the pool — otherwise one left drained is silently idle forever.
+		it('marks a machine that has been taken out of the pool', async () => {
+			answers.set('workers.listMine', () => [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					capabilities: ['claude'],
+					drainingSince: '2026-09-13T10:00:00.000Z',
+				},
+				{
+					workerId: '22222222-2222-4222-8222-222222222222',
+					displayName: 'grace-desktop',
+					capabilities: ['codex'],
+					drainingSince: null,
+				},
+			]);
+			expect(await run(['list', IDENTIFIER])).toBe(0);
+			const printed = lines();
+			expect(printed.find((line) => line.includes('ada-laptop'))).toContain('draining');
+			expect(printed.find((line) => line.includes('grace-desktop'))).not.toContain('draining');
+		});
+
 		it('reports an owner with no visible workers rather than failing', async () => {
 			const log = vi.spyOn(console, 'log');
 			expect(await run(['list', 'nobody@example.com'])).toBe(0);
@@ -951,6 +981,66 @@ describe('swarm workers', () => {
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['remove', WORKER_ID])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('running a job right now'));
+		});
+	});
+
+	// Issue #919. The operator front door onto the draining state: one machine-wide
+	// flag, two subcommands, and — because a drain does not stop what is already
+	// running — a printed answer to "has it gone idle yet?".
+	describe('drain / undrain', () => {
+		it.each(['drain', 'undrain'])('%s requires a worker id', async (subcommand) => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run([subcommand])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('<worker-id> is required'));
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it.each(['drain', 'undrain'])('%s rejects a non-uuid worker id before calling', async (sub) => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run([sub, 'ada-laptop'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining("no worker with id 'ada-laptop'"));
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it('drain sends draining: true and reports the machine is safe to restart when idle', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['drain', WORKER_ID])).toBe(0);
+			expect(inputFor('workers.setDraining')).toEqual({ workerId: WORKER_ID, draining: true });
+			expect(log).toHaveBeenCalledWith(
+				expect.stringContaining('draining and idle — safe to restart'),
+			);
+			// The one action that ends it, since nothing else does.
+			expect(lines().join('\n')).toContain('swarm workers undrain');
+		});
+
+		// A machine drained mid-run is the normal case: the answer an operator needs is
+		// which run they are waiting on, and that re-running the command checks again.
+		it('drain names the in-flight run while the machine is still busy', async () => {
+			answers.set('workers.setDraining', () => ({
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				drainingSince: '2026-09-13T10:00:00.000Z',
+				busy: true,
+				currentRunId: 'run-7',
+			}));
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['drain', WORKER_ID])).toBe(0);
+			expect(log).toHaveBeenCalledWith(expect.stringContaining('still running run-7'));
+			expect(lines().join('\n')).toContain('re-run this command');
+		});
+
+		it('undrain sends draining: false and reports the machine is back in the pool', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['undrain', WORKER_ID])).toBe(0);
+			expect(inputFor('workers.setDraining')).toEqual({ workerId: WORKER_ID, draining: false });
+			expect(log).toHaveBeenCalledWith(expect.stringContaining('back in the pool'));
+		});
+
+		it('surfaces the owner-only refusal as the control plane words it', async () => {
+			refuse('workers.setDraining', `Worker with ID "${WORKER_ID}" not found`);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['drain', WORKER_ID])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('not found'));
 		});
 	});
 

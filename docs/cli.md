@@ -423,6 +423,8 @@ swarm workers list [<owner-identifier>]
 swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
 swarm workers set-scm-credential <worker-id> <scm-provider-id>
 swarm workers remove <worker-id>
+swarm workers drain <worker-id>
+swarm workers undrain <worker-id>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -563,7 +565,8 @@ unchanged.
   `set-scm-credential` / `enroll` do. If a step after
   registration fails, the command prints what is left to run by hand *and* the worker
   credential once, since that value is otherwise unrecoverable.
-- **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line). With your own
+- **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line, with a trailing
+  `draining` on a machine that has been taken out of the dispatch pool). With your own
   owner identifier, your machines; without one, or with somebody else's, the
   installation roster (prefixed with the owner identifier when unfiltered) — see
   narrowing 3 above. Never prints a credential.
@@ -593,6 +596,21 @@ unchanged.
   at `/workers/<worker-id>` → **Delete worker** applies since issue #789. The removal
   cascades to the worker's enrollments, its operator SCM credentials and its session,
   while runs it produced stay in history.
+- **`drain` / `undrain`** — take a machine **out of the dispatch pool** so it can be
+  restarted, and put it back (issue #919). Draining is not an interruption: the
+  machine keeps running whatever it already started and is simply given no new work
+  from the next dispatch on, so restarting it no longer means racing the dispatcher.
+  Work that would have gone there is **deferred, never failed** — it runs on another
+  eligible machine on the very next re-check, and a project whose only machine is
+  drained waits with a message naming the drain rather than stalling silently.
+  Because the old work has to finish before a restart is safe, `drain` prints the
+  machine's *current* state: either the run it is still executing, or "draining and
+  idle — safe to restart". Re-running it is how you check again — the write is
+  idempotent and keeps the original "draining since" instant. The drain is
+  **machine-wide and sticky across the restart it was taken for**: a reconnecting
+  daemon does not rejoin the pool (the router logs that it is draining at every
+  handshake), nothing expires it, and only `undrain` ends it. Owner-only, exactly
+  like `remove` — sign in as the machine's owner.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

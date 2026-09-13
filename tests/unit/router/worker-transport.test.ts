@@ -53,6 +53,8 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		// In the pool (issue #919) unless a case overrides it.
+		drainingSince: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -253,6 +255,40 @@ describe('handleHandshake', () => {
 
 		expect(result.status).toBe(409);
 		expect(deps.suspendEnrollmentsForMismatchedRepository).not.toHaveBeenCalled();
+	});
+
+	// Issue #919 — a drain is the operator's statement, so nothing the handshake
+	// writes clears it and a machine rejoining while drained takes no work. That is
+	// intended; the log line is what keeps it from being silent.
+	it('logs that a machine rejoining while drained will be given no new work', async () => {
+		const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+		const drainingSince = new Date('2026-09-13T10:00:00Z');
+		const deps = makeDeps({
+			refreshWorkerCapabilities: vi.fn().mockResolvedValue(makeWorker({ drainingSince })),
+		});
+
+		const result = await handleHandshake(deps, validBody());
+
+		// Non-blocking: the daemon still connects, it is simply given nothing to run.
+		expect(result.status).toBe(200);
+		expect(info).toHaveBeenCalledWith(
+			expect.stringContaining('this machine is draining'),
+			expect.objectContaining({ workerId: WORKER_ID, drainingSince }),
+		);
+		info.mockRestore();
+	});
+
+	it('says nothing about draining for a machine in the pool', async () => {
+		const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+
+		const result = await handleHandshake(makeDeps(), validBody());
+
+		expect(result.status).toBe(200);
+		expect(info).not.toHaveBeenCalledWith(
+			expect.stringContaining('this machine is draining'),
+			expect.anything(),
+		);
+		info.mockRestore();
 	});
 
 	// Issue #783 — the handshake still writes the daemon's probe verbatim, and an

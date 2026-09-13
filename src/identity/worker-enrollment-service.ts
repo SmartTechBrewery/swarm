@@ -179,6 +179,13 @@ export interface OwnerWorkerView {
 	workerId: string;
 	displayName: string;
 	capabilities: AgentCli[];
+	/**
+	 * When the machine's operator took it out of the dispatch pool (issue #919), or
+	 * `null` while it is in it. Surfaced beside the run state because the two
+	 * together are the "is it safe to restart yet?" answer: draining means no new
+	 * work is given, `runState.busy` whether the old work has finished.
+	 */
+	drainingSince: Date | null;
 	runState: WorkerRunState;
 	enrollments: OwnerEnrollmentView[];
 }
@@ -372,6 +379,7 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
 			workerId: worker.id,
 			displayName: worker.displayName,
 			capabilities: worker.capabilities,
+			drainingSince: worker.drainingSince,
 			runState,
 			enrollments: enrollments.map(assembleOwnerEnrollmentView),
 		});
@@ -462,6 +470,13 @@ export interface DashboardWorkerView {
 	 * travels) and not a credential.
 	 */
 	repository: string | null;
+	/**
+	 * When the machine's operator took it **out of the dispatch pool** (issue #919),
+	 * or `null` while it is in it. Read alongside `connection`, not in place of it: a
+	 * draining machine may be perfectly online and merely given no new work, and a
+	 * reconnect does not clear this — only an operator does.
+	 */
+	drainingSince: Date | null;
 	connection: WorkerConnectionState;
 	/** When the worker was last heard from, or `null` if it never connected. */
 	lastSeenAt: Date | null;
@@ -682,6 +697,7 @@ async function assembleDashboardWorker(
 		capabilities: worker.capabilities,
 		supportedPhases: worker.supportedPhases,
 		repository: worker.repository,
+		drainingSince: worker.drainingSince,
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
 		currentRun: await resolveVisibleRun(worker.id, liveSession?.currentRunId ?? null, accessible),

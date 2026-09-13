@@ -77,6 +77,8 @@
  *   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
  *   swarm workers set-scm-credential <worker-id> <scm-provider-id>
  *   swarm workers remove <worker-id>
+ *   swarm workers drain <worker-id>
+ *   swarm workers undrain <worker-id>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
@@ -121,6 +123,8 @@ Usage:
   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
   swarm workers set-scm-credential <worker-id> <scm-provider-id>
   swarm workers remove <worker-id>
+  swarm workers drain <worker-id>
+  swarm workers undrain <worker-id>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
@@ -188,6 +192,18 @@ Usage:
              so sign in as them.
   remove     Deregister a worker by worker id. The machine's owner alone may do
              it, and it is refused while that machine is running a job.
+  drain      Take a machine OUT of the dispatch pool so it can be restarted: it
+             is given no new work from the next dispatch on, while whatever it is
+             already running is left alone. Work that would have gone there is
+             deferred, never failed, and runs on another eligible machine on the
+             next re-check. Prints whether the machine has gone idle yet, so
+             re-running this is how you check when it is safe to restart —
+             re-draining keeps the original 'draining since' instant. The drain
+             survives the restart: a reconnecting machine does NOT rejoin the
+             pool, only undrain puts it back. The machine's owner alone may do
+             it, so sign in as them.
+  undrain    Put a drained machine back in the pool — it may be given work again
+             from the next re-check. The machine's owner alone may do it.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -229,6 +245,8 @@ const SUBCOMMANDS = [
 	'set-cli',
 	'set-scm-credential',
 	'remove',
+	'drain',
+	'undrain',
 	'enroll',
 	'update-enrollment',
 	'approve',
@@ -267,6 +285,9 @@ const RosterSchema = z.array(
 		workerId: z.string().min(1),
 		displayName: z.string().min(1),
 		capabilities: CapabilityListSchema,
+		// Optional per this file's own rule: a control plane answering with fewer
+		// fields than these is not a failure, so an older one simply marks nothing.
+		drainingSince: z.string().nullable().optional(),
 		owner: z.object({ identifier: z.string().min(1) }).nullable(),
 	}),
 );
@@ -276,6 +297,7 @@ const OwnWorkersSchema = z.array(
 		workerId: z.string().min(1),
 		displayName: z.string().min(1),
 		capabilities: CapabilityListSchema,
+		drainingSince: z.string().nullable().optional(),
 	}),
 );
 
@@ -295,6 +317,20 @@ const EnrollmentSchema = z.object({
 });
 
 const RemovedWorkerSchema = z.object({ workerId: z.string().min(1) });
+
+/**
+ * `workers.setDraining` (issue #919), which answers with the flag *and* the
+ * server-derived run state — so this one call is also the "has it gone idle, is it
+ * safe to restart yet?" check, with no second read.
+ */
+const DrainStateSchema = z.object({
+	workerId: z.string().min(1),
+	displayName: z.string().min(1),
+	drainingSince: z.string().nullable(),
+	busy: z.boolean(),
+	currentRunId: z.string().nullable(),
+});
+
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
 const ProjectScmProviderSchema = z.object({ providerId: z.string().min(1) });
 
@@ -480,15 +516,25 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 	return 0;
 }
 
-/** Print one worker line, optionally prefixed with its owner identifier. Never prints the credential. */
+/**
+ * Print one worker line, optionally prefixed with its owner identifier. Never
+ * prints the credential.
+ *
+ * A machine that has been taken out of the dispatch pool is marked with a trailing
+ * `draining` (issue #919), so an operator scanning the list can see at a glance
+ * which machines are taking no work — a drain is sticky and expires on nothing, so
+ * without the marker a machine left drained is silently idle forever.
+ */
 function printWorker(
 	workerId: string,
 	displayName: string,
 	capabilities: string[],
 	ownerIdentifier?: string,
+	drainingSince?: string | null,
 ): void {
 	const prefix = ownerIdentifier ? `${ownerIdentifier}\t` : '';
-	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}`);
+	const suffix = drainingSince ? '\tdraining' : '';
+	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}${suffix}`);
 }
 
 /**
@@ -521,7 +567,13 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 			return 0;
 		}
 		for (const worker of mine) {
-			printWorker(worker.workerId, worker.displayName, worker.capabilities);
+			printWorker(
+				worker.workerId,
+				worker.displayName,
+				worker.capabilities,
+				undefined,
+				worker.drainingSince,
+			);
 		}
 		return 0;
 	}
@@ -536,7 +588,13 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 			return 0;
 		}
 		for (const worker of owned) {
-			printWorker(worker.workerId, worker.displayName, worker.capabilities);
+			printWorker(
+				worker.workerId,
+				worker.displayName,
+				worker.capabilities,
+				undefined,
+				worker.drainingSince,
+			);
 		}
 		return 0;
 	}
@@ -546,7 +604,13 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 		return 0;
 	}
 	for (const worker of roster) {
-		printWorker(worker.workerId, worker.displayName, worker.capabilities, worker.owner?.identifier);
+		printWorker(
+			worker.workerId,
+			worker.displayName,
+			worker.capabilities,
+			worker.owner?.identifier,
+			worker.drainingSince,
+		);
 	}
 	return 0;
 }
@@ -694,6 +758,54 @@ async function removeWorkerCommand(argv: string[]): Promise<number> {
 
 	await operator.client.mutate('workers.remove', { workerId }, parseWith(RemovedWorkerSchema));
 	out.info(`removed worker '${workerId}'`);
+	return 0;
+}
+
+/**
+ * Take a machine out of the dispatch pool, or put it back (issue #919) — one
+ * function for both subcommands, which differ only in the boolean they send and
+ * the line they print.
+ *
+ * A drain is not an interruption: the machine keeps running whatever it already
+ * started, and only the *next* dispatch is refused. So the useful answer is not
+ * "done" but "has the old work finished yet", which is why `workers.setDraining`
+ * returns the server-derived run state and why re-running this command is the
+ * supported way to poll — the write is idempotent and keeps the instant the first
+ * drain recorded.
+ */
+async function drainCommand(argv: string[], draining: boolean): Promise<number> {
+	const subcommand = draining ? 'drain' : 'undrain';
+	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
+	const workerId = positionals[0];
+	if (!workerId) {
+		out.error(`workers ${subcommand}: a <worker-id> is required`);
+		out.info(USAGE);
+		return 1;
+	}
+	if (!requireWorkerId(workerId)) return 1;
+
+	const operator = requireOperator();
+	if (!operator) return 1;
+
+	const state = await operator.client.mutate(
+		'workers.setDraining',
+		{ workerId, draining },
+		parseWith(DrainStateSchema),
+	);
+	const machine = `worker '${state.displayName}' (${workerId})`;
+	if (!draining) {
+		out.info(`${machine} is back in the pool — it may be given work again`);
+		return 0;
+	}
+	if (state.busy) {
+		out.info(
+			`${machine} is draining — it will be given no new work. It is still running ${state.currentRunId ?? 'a job'}; wait for that to finish before restarting it, and re-run this command to check.`,
+		);
+		return 0;
+	}
+	out.info(
+		`${machine} is draining and idle — safe to restart. It stays out of the pool until 'swarm workers undrain ${workerId}'.`,
+	);
 	return 0;
 }
 
@@ -1364,6 +1476,10 @@ export async function run(argv: string[]): Promise<number> {
 				return await setCliCommand(rest);
 			case 'set-scm-credential':
 				return await setScmCredentialCommand(rest);
+			case 'drain':
+				return await drainCommand(rest, true);
+			case 'undrain':
+				return await drainCommand(rest, false);
 			case 'enroll':
 				return await enrollCommand(rest);
 			case 'update-enrollment':

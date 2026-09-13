@@ -103,6 +103,8 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		// In the pool (issue #919) — every case here that says nothing about draining.
+		drainingSince: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -310,6 +312,19 @@ describe('listOwnerWorkers', () => {
 		listWorkersForOwner.mockResolvedValue([]);
 		expect(await listOwnerWorkers(OWNER_ID)).toEqual([]);
 	});
+
+	// Issue #919: the owner's own view is where they read whether their machine is
+	// out of the pool, beside the run state that says whether it has gone idle.
+	it('carries the drain instant for a machine taken out of the pool', async () => {
+		const drainedAt = new Date('2026-09-13T10:00:00Z');
+		listWorkersForOwner.mockResolvedValue([makeWorker({ drainingSince: drainedAt })]);
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+
+		const [view] = await listOwnerWorkers(OWNER_ID);
+
+		expect(view.drainingSince).toEqual(drainedAt);
+	});
 });
 
 describe('listDashboardWorkers (issue #133)', () => {
@@ -373,6 +388,32 @@ describe('listDashboardWorkers (issue #133)', () => {
 			// An offline worker is running nothing, whatever its stale row still points at.
 			expect(view.currentRun).toBeNull();
 			expect(getRunByIdFromDb).not.toHaveBeenCalled();
+		});
+
+		// Issue #919: draining and offline are independent facts — a drained machine may
+		// be perfectly online and merely given no new work — so the roster carries both.
+		it('carries the drain instant beside an online connection', async () => {
+			const drainedAt = new Date('2026-09-13T10:00:00Z');
+			listAllWorkers.mockResolvedValue([makeWorker({ drainingSince: drainedAt })]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(liveSession(null));
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(view).toMatchObject({ connection: 'online', drainingSince: drainedAt });
+		});
+
+		it('reports a machine in the pool with a null drain instant', async () => {
+			listAllWorkers.mockResolvedValue([makeWorker()]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(undefined);
+			getRetainedSessionForWorker.mockResolvedValue(undefined);
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(view.drainingSince).toBeNull();
 		});
 
 		it('reports a never-connected worker offline with no last-seen value', async () => {
@@ -664,6 +705,9 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'connection',
 				'currentRun',
 				'displayName',
+				// Non-secret: an operator's statement that the machine is out of the pool
+				// (issue #919), not a path or a credential.
+				'drainingSince',
 				'enrollments',
 				'lastSeenAt',
 				'owner',

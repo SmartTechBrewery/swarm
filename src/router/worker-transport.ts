@@ -417,6 +417,18 @@ export async function handleHandshake(
 		});
 	}
 
+	// A drain is the operator's statement, not the daemon's, so nothing above
+	// rewrites it and a machine rejoining while drained takes no work (issue #919).
+	// That is the intended behaviour — a drain outlives the restart it was taken for
+	// — but it must not be *silent*, so the router says so once per handshake.
+	const drainingSince = refreshed?.drainingSince ?? worker.drainingSince;
+	if (drainingSince) {
+		logger.info(
+			'worker handshake: this machine is draining — it will be given no new work until it is returned to the pool',
+			{ workerId: worker.id, drainingSince },
+		);
+	}
+
 	// A matching process instance is the same daemon coming back, so its in-flight
 	// assignment — and the terminal result #718 holds for it — must survive even if a
 	// successful handshake response was lost. Older daemons fall back to the exact

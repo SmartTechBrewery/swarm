@@ -37,10 +37,10 @@
  *    silently discards the earlier attempt's work. Giving that work up is an
  *    operator action ("Reset & restart"), never a timer.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
- *    worker against one target: active enrollment → sharing consent →
- *    connection/health → free capacity → the repository its checkout is (issue
- *    #714) → declared phase support (issue #467) → the enrollment's allowed phases
- *    (issue #509) → declared/allowed CLI.
+ *    worker against one target: active enrollment → sharing consent → draining
+ *    (issue #919) → connection/health → free capacity → the repository its checkout
+ *    is (issue #714) → declared phase support (issue #467) → the enrollment's
+ *    allowed phases (issue #509) → declared/allowed CLI.
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes an
@@ -355,6 +355,12 @@ const REASON_PRIORITY: readonly IneligibilityReason[] = [
 	// repository *before* either, so a candidate that reported a phase reason had
 	// already cleared the repository check and came nearer to eligible.
 	'repository-mismatch',
+	// Draining sits immediately above `missing-consent` by the same rule (issue
+	// #919): the predicate judges it right after consent, so a candidate reporting
+	// any reason below came no further. The consequence is worth having — a project
+	// with one drained machine and one merely-busy one still aggregates to
+	// `worker-unavailable`, because the busy one really will free up.
+	'worker-draining',
 	'missing-consent',
 	'missing-enrollment',
 ];
@@ -399,6 +405,11 @@ const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
 	// but is offline never reaches here — the connection check runs earlier and reports
 	// `worker-unavailable`, which is the availability wait it really is.
 	'repository-mismatch': false,
+	// A drain is reversed by a human and by nothing else (issue #919) — a machine
+	// reconnecting does not undrain, so promoting such a row on its reconnect would
+	// spend the dispatch's re-check budget faster while changing nothing. The next
+	// timed re-check is what picks an undrain up.
+	'worker-draining': false,
 };
 
 /** Every reason the gate can refuse with — the domain of {@link isAvailabilityRefusal}. */
@@ -447,6 +458,10 @@ function ineligibilityMessage(
 			return `No eligible worker is free for ${owner} — an assigned item waits for its assignee's own worker and is never routed to another user's. Waiting for one to become available.`;
 		case 'worker-unavailable':
 			return `No enrolled worker for ${owner} is currently connected with free capacity. Waiting for one to become available.`;
+		// Names the state, that no machine clears it, and the one command that ends it
+		// — the drain was taken deliberately, so the message must not read as a fault.
+		case 'worker-draining':
+			return `No enrolled worker for ${owner} is in the pool — every one is draining: an operator took the machine out of the pool so it can be restarted, and a draining worker is given no new work. Nothing a machine does clears this; return one to the pool ('swarm workers undrain <worker-id>') and this work runs on the next re-check.`;
 		case 'missing-consent':
 			return `No enrolled worker for ${owner} has its owner's sharing consent for this project. A worker owner must grant sharing consent before SWARM may route work to it.`;
 		case 'missing-enrollment':

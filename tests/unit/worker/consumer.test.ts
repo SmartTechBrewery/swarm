@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
+import type { WorkerDispatchClaimRefusal } from '@/db/repositories/dispatchesRepository.js';
 import type { AgentCli, AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError, agentRunError } from '@/harness/agent-failure.js';
 import type { ResolvedAssignee } from '@/identity/assignee-resolver.js';
@@ -307,7 +308,10 @@ const claimWorkerForDispatch = vi.fn(
 	async (
 		_input: unknown,
 	): Promise<
-		{ claimed: true; dispatch: MockDispatchRow } | { claimed: false; reason: 'wrong-worker-host' }
+		| { claimed: true; dispatch: MockDispatchRow }
+		// The whole refusal vocabulary, so a case can force any of them the way the real
+		// under-lock re-check would (issues #607, #919).
+		| { claimed: false; reason: WorkerDispatchClaimRefusal }
 	> => ({
 		claimed: true,
 		dispatch: mockDispatchRow({}),
@@ -2772,6 +2776,7 @@ describe('processJob', () => {
 				sharingConsent?: boolean;
 				activeRuns?: number;
 				repository?: string | null;
+				drainingSince?: Date | null;
 			} = {},
 		): WorkerDispatchCandidate {
 			const capabilities = overrides.capabilities ?? ['claude'];
@@ -2786,6 +2791,7 @@ describe('processJob', () => {
 					declaredCapabilities: null,
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 					repository: overrides.repository ?? null,
+					drainingSince: overrides.drainingSince ?? null,
 					createdAt: new Date('2026-01-01T00:00:00Z'),
 					updatedAt: new Date('2026-01-01T00:00:00Z'),
 				},
@@ -3242,6 +3248,51 @@ describe('processJob', () => {
 			expect(phaseCalls).toEqual([]);
 			expect(createRun).not.toHaveBeenCalled();
 			expect(markDispatchRunning).not.toHaveBeenCalled();
+		});
+
+		// Issue #919. The half of the drain gate that cannot be raced: an operator may
+		// drain the machine between the gate selecting it and the claim committing, and
+		// the fenced claim re-checks the flag under the worker row's lock. The work is
+		// deferred, never failed, and the row records the wait only a human clears.
+		it('defers as a worker-authorization wait when the claim finds the machine drained', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([candidate('w-1')]);
+			claimWorkerForDispatch.mockResolvedValue({ claimed: false, reason: 'worker-draining' });
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(planningTrigger()),
+				undefined,
+				executionIdentity('w-1'),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', workerEligibilityRecheck: true });
+			// Nothing ran and nothing was recorded as a run: the claim is what gates entry.
+			expect(phaseCalls).toEqual([]);
+			expect(createRun).not.toHaveBeenCalled();
+			const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+			expect(input.waitReason).toBe('worker-authorization');
+			expect(input.lastError).toContain('worker-draining');
+		});
+
+		// The gate's own half of the same rule, on the read side: a drained machine is
+		// simply not selected, so the work goes to whichever machine is still in the pool.
+		it('routes around a machine drained before selection', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				candidate('w-draining', { drainingSince: new Date('2026-09-13T10:00:00Z') }),
+				candidate('w-free'),
+			]);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(planningTrigger()),
+				undefined,
+				executionIdentity('w-free'),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+				expect.objectContaining({ selectedWorkerId: 'w-free' }),
+			);
 		});
 
 		it('re-checks on every dispatch, so a revocation blocks the next attempt only', async () => {

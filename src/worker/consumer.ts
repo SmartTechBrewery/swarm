@@ -3893,6 +3893,10 @@ async function bindSelectedWorker(
 			);
 		case 'missing-enrollment':
 		case 'missing-consent':
+		// A drain (issue #919) belongs with the three structural refusals rather than
+		// with the availability ones: the message below already reads correctly, and
+		// the reason it carries is what records the deferral as `worker-authorization`.
+		case 'worker-draining':
 		case 'missing-cli-capability':
 			throw new WorkerIneligibleError(
 				claim.reason,

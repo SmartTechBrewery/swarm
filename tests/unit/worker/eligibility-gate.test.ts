@@ -59,6 +59,7 @@ function makeCandidate(
 		capabilities?: Worker['capabilities'];
 		supportedPhases?: Worker['supportedPhases'];
 		repository?: Worker['repository'];
+		drainingSince?: Worker['drainingSince'];
 		enrollment?: Partial<WorkerEnrollment>;
 		connected?: boolean;
 		activeRuns?: number;
@@ -78,6 +79,8 @@ function makeCandidate(
 			// file that says nothing about repositories: the declared checkout always is the
 			// task's, so the #714 check is satisfied rather than merely skipped.
 			repository: overrides.repository === undefined ? REPOSITORY : overrides.repository,
+			// In the pool (issue #919) for every case that says nothing about draining.
+			drainingSince: overrides.drainingSince ?? null,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
 		},
@@ -188,6 +191,9 @@ describe('isAvailabilityRefusal', () => {
 		// Issue #714: a checkout is re-declared only at handshake, so no machine coming
 		// online clears this — somebody has to point a worker at the repository.
 		'repository-mismatch',
+		// Issue #919: reconnecting does not undrain, so a machine coming back must not
+		// wake a dispatch a drain refused — only an operator's undrain clears it.
+		'worker-draining',
 	];
 
 	it('classifies every reason in the union, and no reason twice', () => {
@@ -759,6 +765,51 @@ describe('evaluateDispatchEligibility', () => {
 			);
 
 			expect(decision).toMatchObject({ status: 'selected', selection: { cli: 'codex' } });
+		});
+	});
+
+	// Issue #919. A drained machine is one an operator took out of the pool so it can be
+	// restarted; the gate must route around it rather than fail the work, and must not
+	// report the wait as one that clears by itself.
+	describe('a drained machine (issue #919)', () => {
+		it('selects another eligible machine instead of the drained one', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-draining', { drainingSince: new Date('2026-09-13T10:00:00Z') }),
+				makeCandidate('w-free'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-free' } });
+		});
+
+		it('refuses with worker-draining, as an authorization wait, when every machine is drained', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-draining', { drainingSince: new Date('2026-09-13T10:00:00Z') }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-draining' });
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			// A machine reconnecting cannot undrain itself, so the deferral must record
+			// `worker-authorization` rather than the self-clearing `worker-eligibility`.
+			expect(isAvailabilityRefusal(decision.reason)).toBe(false);
+			// …and the message names the one action that ends the wait.
+			expect(decision.message).toContain('swarm workers undrain');
+		});
+
+		it('still reports worker-unavailable while another machine is merely busy', async () => {
+			// The best news available wins: the busy machine really will free up, whereas
+			// the drained one waits on a human.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-draining', { drainingSince: new Date('2026-09-13T10:00:00Z') }),
+				makeCandidate('w-busy', { activeRuns: 1 }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
 		});
 	});
 

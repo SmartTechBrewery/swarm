@@ -98,6 +98,13 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * two capability axes are — it guards against operator error (a daemon launched in
  * the wrong directory), not against an attacker.
  *
+ * `drainingSince` (issue #919) is the one routability fact on the row that is
+ * neither a capability nor daemon-declared: it is the operator's own statement
+ * that the machine is **out of the pool** so it can be restarted, recorded as the
+ * instant they made it and `null` while the machine is in the pool. The dispatch
+ * gate refuses a draining worker before it even looks at connectivity, and nothing
+ * the machine does — reconnecting included — clears it; only an operator does.
+ *
  * The CLI axis is **three** fields since issue #783, because the one field used to
  * collapse two facts that overwrite each other. `probedCapabilities` is the raw
  * `workers.capabilities` column — what the daemon currently operating the row last
@@ -126,6 +133,12 @@ export const WorkerSchema = z.object({
 	declaredCapabilities: z.array(AgentCliSchema).nullable(),
 	supportedPhases: z.array(TriggerPhaseSchema),
 	repository: RepoSlugSchema.nullable(),
+	/**
+	 * When an operator took this machine out of the dispatch pool (issue #919), or
+	 * `null` while it is in it — see the block above for why it is neither a
+	 * capability nor daemon-declared.
+	 */
+	drainingSince: z.date().nullable(),
 	createdAt: z.date(),
 	updatedAt: z.date(),
 });

@@ -37,6 +37,7 @@ import {
 	getWorker,
 	registerWorker,
 	renameWorker,
+	setWorkerDraining,
 	type Worker,
 } from '../../identity/worker-service.js';
 import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
@@ -80,12 +81,17 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   run (`setDeclaredCapabilities`, issue #787 — the durable declaration issue
  *   #783 made survive a reconnect, cleared by passing `capabilities: null`),
  *   retires one for good (`remove`, issue #789 — the dashboard-reachable twin of
- *   `swarm workers remove`), and controls the revocable sharing consent
+ *   `swarm workers remove`), takes a machine out of the dispatch pool so it can be
+ *   restarted and puts it back (`setDraining`, issue #919 — reversible, sticky
+ *   across the machine's reconnect, and answering with the machine's derived run
+ *   state so the caller can tell when restarting is safe), and controls the
+ *   revocable sharing consent
  *   (`setConsent`) and execution constraints (`updateConstraints`). Ownership is
  *   checked per call. `enroll` alone lets an `instanceAdmin` act on any worker
  *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
  *   reads as administering the project side of that offer; `rename`,
- *   `setDeclaredCapabilities`, `remove`, `setConsent`, and `updateConstraints`
+ *   `setDeclaredCapabilities`, `remove`, `setDraining`, `setConsent`, and
+ *   `updateConstraints`
  *   are the machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
@@ -343,6 +349,7 @@ export const workersRouter = router({
 			return workers.map((worker) => ({
 				...worker,
 				lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
+				drainingSince: worker.drainingSince?.toISOString() ?? null,
 			}));
 		}),
 
@@ -379,6 +386,7 @@ export const workersRouter = router({
 			return {
 				...detail,
 				lastSeenAt: detail.lastSeenAt?.toISOString() ?? null,
+				drainingSince: detail.drainingSince?.toISOString() ?? null,
 				viewerIsOwner,
 				enrollments,
 			};
@@ -558,6 +566,45 @@ export const workersRouter = router({
 				}
 				throw error;
 			}
+		}),
+
+	// Take one of the caller's own machines OUT of the dispatch pool, or return it
+	// to the pool (issue #919). Draining is what makes restarting a worker safe: the
+	// machine is given no new work from the next dispatch onward, while whatever it
+	// is already running is left completely alone — the gate runs only before a phase
+	// starts, and the fenced claim re-checks the same flag under the worker row's
+	// lock, so an assignment already in flight is never disturbed.
+	//
+	// Strictly owner-only, exactly like `rename`, `setDeclaredCapabilities` and
+	// `remove`: taking your own machine out of the pool so you can restart it is the
+	// machine operator's call, not an administrative one, so an `instanceAdmin` who
+	// does not own it gets the same NOT_FOUND a stranger does.
+	//
+	// Idempotent — a second drain keeps the instant the first recorded, so re-running
+	// it does not restart the "draining since" clock. Deliberately **not** refused
+	// while the machine is busy (unlike `remove`): being busy is the normal reason to
+	// drain. That is why the server-derived run state comes back alongside the flag —
+	// this one call doubles as the "has it gone idle, is it safe to restart yet?"
+	// check, read from the run lifecycle exactly as `remove`'s refusal is, never
+	// trusted from the caller.
+	//
+	// The flag is machine-wide and sticky across a reconnect: the handshake writes
+	// only the daemon-declared columns, so a machine coming back does not quietly
+	// rejoin the pool. Only `draining: false` returns it.
+	setDraining: authedProcedure
+		.input(z.object({ workerId: z.string().uuid(), draining: z.boolean() }))
+		.mutation(async ({ ctx, input }) => {
+			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			const updated = await setWorkerDraining(input.workerId, input.draining);
+			if (!updated) throw workerNotFound(input.workerId);
+			const runState = await deriveWorkerRunState(input.workerId);
+			return {
+				workerId: updated.id,
+				displayName: updated.displayName,
+				drainingSince: updated.drainingSince?.toISOString() ?? null,
+				busy: runState.busy,
+				currentRunId: runState.currentRunId,
+			};
 		}),
 
 	// Offer one of the caller's workers to a project. The caller must own the

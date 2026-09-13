@@ -51,6 +51,7 @@ import { acquireLease } from '../../../src/db/repositories/workerSessionsReposit
 import {
 	createWorker,
 	setWorkerDeclaredCapabilities,
+	setWorkerDraining,
 } from '../../../src/db/repositories/workersRepository.js';
 import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { projects } from '../../../src/db/schema/projects.js';
@@ -1026,6 +1027,104 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				claimed: false,
 				reason: 'missing-cli-capability',
 			});
+		});
+	});
+
+	// Issue #919: the half of the drain gate that cannot be raced. An operator may
+	// drain a machine *after* the gate selected it, so the claim re-checks the flag
+	// under the worker row's own `FOR UPDATE` lock — the claim is then refused and the
+	// dispatch stays unclaimed for another machine, rather than the phase starting on a
+	// machine somebody is about to restart.
+	describe('claim re-check against the draining flag', () => {
+		async function seedDrainableWorker(suffix: string) {
+			const owner = await createUser({
+				identifier: `owner-${suffix}@example.com`,
+				displayName: 'Owner',
+			});
+			const worker = await createWorker({
+				ownerUserId: owner.id,
+				displayName: `worker-${suffix}`,
+				capabilities: ['claude'],
+				credentialHash: `hash-${suffix}`,
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: PROJECT_ID,
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['implementation'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+			const session = await acquireLease(worker.id, 60_000);
+			return { worker, session };
+		}
+
+		async function drainClaimInput(
+			worker: { id: string },
+			session: { id: string; fencingToken: number },
+			owner: string,
+		) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+			});
+			const leased = await claimDispatch(dispatch.id, owner, 60_000);
+			if (!leased) throw new Error('test dispatch was not leased');
+			return {
+				dispatchId: leased.id,
+				dispatchLeaseOwner: owner,
+				projectId: PROJECT_ID,
+				selectedWorkerId: worker.id,
+				executionWorkerId: worker.id,
+				workerSessionId: session.id,
+				workerFencingToken: session.fencingToken,
+				cli: 'claude' as AgentCli,
+				heartbeatTtlMs: 60_000,
+			};
+		}
+
+		it('refuses a claim for a machine drained after it was selected, leaving the dispatch unclaimed', async () => {
+			const { worker, session } = await seedDrainableWorker('drained');
+			const input = await drainClaimInput(worker, session, 'host-drained:1');
+
+			await setWorkerDraining(worker.id, true);
+
+			expect(await claimWorkerForDispatch(input)).toEqual({
+				claimed: false,
+				reason: 'worker-draining',
+			});
+			// Nothing was bound, so the dispatch is free to go to another eligible machine
+			// on the next re-check rather than being failed here.
+			const row = await getDispatchById(input.dispatchId);
+			expect(row?.selectedWorkerId).toBeNull();
+			expect(await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).toEqual({
+				activeRuns: 0,
+				currentRunId: null,
+			});
+		});
+
+		it('still admits a claim for a machine in the pool', async () => {
+			const { worker, session } = await seedDrainableWorker('in-pool');
+			const input = await drainClaimInput(worker, session, 'host-in-pool:1');
+
+			expect(await claimWorkerForDispatch(input)).toMatchObject({ claimed: true });
+		});
+
+		it('admits a claim again once the machine is undrained', async () => {
+			const { worker, session } = await seedDrainableWorker('undrained');
+			await setWorkerDraining(worker.id, true);
+			const refused = await drainClaimInput(worker, session, 'host-undrained:1');
+			expect(await claimWorkerForDispatch(refused)).toEqual({
+				claimed: false,
+				reason: 'worker-draining',
+			});
+
+			await setWorkerDraining(worker.id, false);
+
+			const input = await drainClaimInput(worker, session, 'host-undrained:2');
+			expect(await claimWorkerForDispatch(input)).toMatchObject({ claimed: true });
 		});
 	});
 
