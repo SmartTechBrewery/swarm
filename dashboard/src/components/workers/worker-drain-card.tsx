@@ -22,10 +22,16 @@ import { trpcClient } from '@/lib/trpc.js';
  * a modal would dress a reversible operator state up as a danger.
  *
  * It answers "is it safe to restart *yet*?" from the two facts that decide it: this
- * machine is given no new work (it is draining), and `currentRunTitle` says whether
- * the old work has finished. That is a read of the detail view's own active job —
- * the server derives busy state from run lifecycle and is the authority, which is
- * also why a mutation error is rendered verbatim rather than pre-empted here.
+ * machine is given no new work (it is draining), and `isRunning` says whether the
+ * old work has finished. That is a read of the detail view's own active job — the
+ * server derives busy state from run lifecycle and is the authority, which is also
+ * why a mutation error is rendered verbatim rather than pre-empted here.
+ *
+ * **Busy-ness is the run's presence, never its title.** A PR-driven phase (review,
+ * respond-to-review, respond-to-ci, resolve-conflicts) has no backing board card and
+ * so no work-item title, so a card that read busy-ness off a title called an actively
+ * running machine idle and invited the restart that fails its run. The title is copy
+ * alone: when it is unavailable the card still says to wait, just without a name.
  */
 
 const DRAIN_PANEL_CLASS =
@@ -34,11 +40,31 @@ const DRAIN_PANEL_CLASS =
 const SECONDARY_BUTTON_CLASS =
 	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
+/**
+ * What the draining panel says about the work the machine started before the drain.
+ * Three cases, in the order they must be decided: still running and named, still
+ * running with no title resolved — which is every PR-driven phase, and reads as a
+ * wait rather than as idleness — and genuinely idle.
+ */
+function restartReadiness(isRunning: boolean, currentRunTitle: string | null): string {
+	if (!isRunning) return 'Idle — safe to restart now.';
+	if (currentRunTitle) {
+		return `Still running “${currentRunTitle}” — wait for it to finish before restarting.`;
+	}
+	return 'Still running a job — wait for it to finish before restarting.';
+}
+
 interface WorkerDrainCardProps {
 	workerId: string;
 	/** ISO 8601 when an operator drained the machine; `null` while it is in the pool. */
 	drainingSince: string | null;
-	/** The job this machine is running right now, so the card can say what to wait for. */
+	/**
+	 * Whether the machine is executing a job right now — the one fact that decides
+	 * whether restarting it is safe. Read from the *presence* of the detail view's
+	 * active run, never from the title below, which a PR-driven run does not have.
+	 */
+	isRunning: boolean;
+	/** What that job is, when it has a resolved title — copy for the wait message only. */
 	currentRunTitle: string | null;
 	/** Called once the flag is flipped — the detail route refetches the authoritative view. */
 	onChanged: () => void;
@@ -47,6 +73,7 @@ interface WorkerDrainCardProps {
 export function WorkerDrainCard({
 	workerId,
 	drainingSince,
+	isRunning,
 	currentRunTitle,
 	onChanged,
 }: WorkerDrainCardProps) {
@@ -64,11 +91,7 @@ export function WorkerDrainCard({
 						<p className="font-semibold" title={new Date(drainingSince).toLocaleString()}>
 							Draining since {formatRelativeTime(drainingSince)}
 						</p>
-						<p>
-							{currentRunTitle
-								? `Still running “${currentRunTitle}” — wait for it to finish before restarting.`
-								: 'Idle — safe to restart now.'}
-						</p>
+						<p>{restartReadiness(isRunning, currentRunTitle)}</p>
 					</div>
 					<p className="text-sm text-zinc-400 leading-relaxed">
 						This machine is out of the dispatch pool and is given no new work. It stays out across

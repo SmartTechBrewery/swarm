@@ -430,6 +430,57 @@ describe('WorkerDetailView pool membership (issue #926)', () => {
 			within(section('Pool membership')).getByRole('button', { name: 'Return to the pool' }),
 		).toBeDefined();
 	});
+
+	// The regression this card exists to avoid: a PR-driven phase (review,
+	// respond-to-review, respond-to-ci, resolve-conflicts) has no backing board card,
+	// so `workItemTitle` is null while the machine is very much running. Restart
+	// safety must come from the run's *presence*, or the card invites the restart
+	// that kills the agent and fails the run.
+	it('says to wait for a running PR-driven run that has no work-item title', () => {
+		renderWorker({
+			drainingSince: NOW.toISOString(),
+			currentRun: {
+				runId: 'run-9',
+				projectId: 'proj-a',
+				repository: 'acme/widgets',
+				taskId: '42',
+				phase: 'respond-to-review',
+				workItemId: null,
+				workItemTitle: null,
+				workItemUrl: null,
+				prNumber: '77',
+				prTitle: null,
+			},
+		});
+
+		const pool = within(section('Pool membership'));
+		expect(pool.getByText(/Still running a job/)).toBeDefined();
+		expect(pool.queryByText(/safe to restart now/)).toBeNull();
+	});
+
+	// And when the PR-driven run *does* carry a title it is the PR's, named exactly
+	// as the Active job section above names it.
+	it('names a running PR-driven run by its pull-request title', () => {
+		renderWorker({
+			drainingSince: NOW.toISOString(),
+			currentRun: {
+				runId: 'run-9',
+				projectId: 'proj-a',
+				repository: 'acme/widgets',
+				taskId: '42',
+				phase: 'review',
+				workItemId: null,
+				workItemTitle: null,
+				workItemUrl: null,
+				prNumber: '77',
+				prTitle: 'Teach the dispatcher to count',
+			},
+		});
+
+		expect(
+			within(section('Pool membership')).getByText(/Still running “Teach the dispatcher to count”/),
+		).toBeDefined();
+	});
 });
 
 describe('WorkerDetailView delete worker (issue #789)', () => {

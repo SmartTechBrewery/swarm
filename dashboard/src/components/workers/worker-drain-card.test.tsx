@@ -17,7 +17,11 @@ const NOW = new Date('2026-07-01T12:00:00.000Z');
 const onChanged = vi.fn();
 
 function renderCard(
-	overrides: { drainingSince?: string | null; currentRunTitle?: string | null } = {},
+	overrides: {
+		drainingSince?: string | null;
+		isRunning?: boolean;
+		currentRunTitle?: string | null;
+	} = {},
 ) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	return render(
@@ -25,6 +29,7 @@ function renderCard(
 			<WorkerDrainCard
 				workerId="worker-1"
 				drainingSince={overrides.drainingSince ?? null}
+				isRunning={overrides.isRunning ?? false}
 				currentRunTitle={overrides.currentRunTitle ?? null}
 				onChanged={onChanged}
 			/>
@@ -84,9 +89,25 @@ describe('WorkerDrainCard while draining (issue #926)', () => {
 	});
 
 	it('names the job still running, so restarting waits for it', () => {
-		renderCard({ drainingSince, currentRunTitle: 'Teach the dispatcher to count' });
+		renderCard({
+			drainingSince,
+			isRunning: true,
+			currentRunTitle: 'Teach the dispatcher to count',
+		});
 
 		expect(screen.getByText(/Still running “Teach the dispatcher to count”/)).toBeDefined();
+		expect(screen.queryByText(/safe to restart now/)).toBeNull();
+	});
+
+	// Busy-ness is the run's presence, never its title: a PR-driven phase carries no
+	// work-item title at all, and reading one as idleness invited the restart that
+	// kills the agent and fails the run.
+	it('still says to wait when the running job has no title to name', () => {
+		renderCard({ drainingSince, isRunning: true, currentRunTitle: null });
+
+		expect(
+			screen.getByText('Still running a job — wait for it to finish before restarting.'),
+		).toBeDefined();
 		expect(screen.queryByText(/safe to restart now/)).toBeNull();
 	});
 

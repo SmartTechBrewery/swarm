@@ -613,7 +613,10 @@ unchanged.
   like `remove` — sign in as the machine's owner. The same two actions are on the
   machine's own page in the dashboard since issue #926 (`/workers/<worker-id>` →
   **Pool membership** → **Drain worker** / **Return to the pool**), which states the
-  same "still running …" / "idle — safe to restart now" answer this command prints.
+  same "still running …" / "idle — safe to restart now" answer this command prints —
+  derived there from the machine's active job, so a run whose title has not resolved
+  (a PR-driven phase has no board card to take one from) still reads as "still
+  running a job" rather than as an idle machine.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

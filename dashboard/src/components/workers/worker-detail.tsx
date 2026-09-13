@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
-import { WorkItemCell } from '@/components/runs/work-item-cell.js';
+import { resolveRunTitle, WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { formatWorkerBuild, WorkerBuildBadge } from '@/components/workers/worker-build.js';
 import { WorkerDeleteCard } from '@/components/workers/worker-delete-card.js';
@@ -449,6 +449,64 @@ function BuildComparisonNote({
 	);
 }
 
+/**
+ * **Pool membership** (issue #926) — the drain control, directly after Active job,
+ * which is the other half of "is it safe to restart this machine yet?". Owner-only
+ * behind the same strict flag as the other owner cards, and the server re-checks it
+ * on `workers.setDraining`.
+ *
+ * A section of its own rather than another conditional inline in `WorkerDetailView`,
+ * which keeps that component within the repository's cognitive-complexity limit and
+ * puts the run-reading below beside the card it feeds.
+ *
+ * **The card is told the run's presence, not just its title.** `currentRun` is the
+ * authoritative "this machine is executing something" fact — the server derives it
+ * from run lifecycle — while a title is optional prose a PR-driven phase never
+ * carries, so only the former may decide whether restarting is safe. The title is
+ * resolved exactly as Active job above resolves it ({@link resolveRunTitle}), so the
+ * two sections name the same job in the same words.
+ */
+function PoolMembershipSection({
+	worker,
+	onChanged,
+}: {
+	worker: WorkerDetail;
+	onChanged: () => void;
+}) {
+	if (!worker.viewerIsOwner) return null;
+	return (
+		<div className={CARD_CLASS}>
+			<h2 className={SECTION_HEADING_CLASS}>Pool membership</h2>
+			<WorkerDrainCard
+				workerId={worker.workerId}
+				drainingSince={worker.drainingSince}
+				isRunning={worker.currentRun !== null}
+				currentRunTitle={worker.currentRun ? resolveRunTitle(worker.currentRun) : null}
+				onChanged={onChanged}
+			/>
+		</div>
+	);
+}
+
+/**
+ * **Operator source-control credential** (issue #766) — worker-scoped state, so it
+ * sits above the per-project blocks, which are also what decide which providers it
+ * lists. Owner-only, the same strict flag that gates the rename field and the enroll
+ * entry point, and the server re-checks the same rule on every procedure including
+ * the read. Extracted alongside {@link PoolMembershipSection} for the same reason:
+ * one owner-only section per component keeps `WorkerDetailView` within the
+ * repository's cognitive-complexity limit.
+ */
+function OperatorCredentialSection({ worker }: { worker: WorkerDetail }) {
+	if (!worker.viewerIsOwner) return null;
+	return (
+		<div className={CARD_CLASS}>
+			<h2 className={SECTION_HEADING_CLASS}>Operator source-control credential</h2>
+			<WorkerOperatorCredentialsCard workerId={worker.workerId} />
+		</div>
+	);
+}
+
 interface WorkerDetailViewProps {
 	worker: WorkerDetail;
 	/** Project id → display name, so an enrollment block names its project. */
@@ -600,31 +658,9 @@ export function WorkerDetailView({
 				)}
 			</div>
 
-			{/* Directly after Active job, which is the other half of "is it safe to restart
-			    this machine yet?" (issue #926). Owner-only behind the same strict flag as
-			    the cards below, and the server re-checks it on `workers.setDraining`. */}
-			{worker.viewerIsOwner ? (
-				<div className={CARD_CLASS}>
-					<h2 className={SECTION_HEADING_CLASS}>Pool membership</h2>
-					<WorkerDrainCard
-						workerId={worker.workerId}
-						drainingSince={worker.drainingSince}
-						currentRunTitle={worker.currentRun?.workItemTitle ?? null}
-						onChanged={onChanged}
-					/>
-				</div>
-			) : null}
+			<PoolMembershipSection worker={worker} onChanged={onChanged} />
 
-			{/* Worker-scoped state, so it sits above the per-project blocks — which are also
-			    what decide which providers it lists. Owner-only, the same strict flag that
-			    gates the rename field and the enroll entry point, and the server re-checks
-			    the same rule on every procedure. */}
-			{worker.viewerIsOwner ? (
-				<div className={CARD_CLASS}>
-					<h2 className={SECTION_HEADING_CLASS}>Operator source-control credential</h2>
-					<WorkerOperatorCredentialsCard workerId={worker.workerId} />
-				</div>
-			) : null}
+			<OperatorCredentialSection worker={worker} />
 
 			<div className={CARD_CLASS}>
 				<h2 className={SECTION_HEADING_CLASS}>Project enrollments</h2>

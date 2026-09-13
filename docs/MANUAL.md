@@ -228,9 +228,12 @@ machine currently out of the pool.
 The same two steps are on the machine's own page in the dashboard
 (`/workers/<id>`), under **Pool membership**: **Drain worker** / **Return to the
 pool**, with the card saying whether the machine has gone idle and is therefore safe
-to restart right now. The Workers table marks every drained machine in its **Status**
-column, beside — never instead of — Online/Offline, since a drained machine that is
-online is still online.
+to restart right now. It reads that from the machine's **active job** — the section
+directly above it — so it says to wait for as long as a run is in flight, naming the
+job when the run carries a resolved title and saying only "still running a job" when
+it does not (a PR-driven phase has no board card to take a title from). The Workers
+table marks every drained machine in its **Status** column, beside — never instead
+of — Online/Offline, since a drained machine that is online is still online.
 
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
