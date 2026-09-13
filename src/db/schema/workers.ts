@@ -1,4 +1,13 @@
-import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import {
+	boolean,
+	index,
+	jsonb,
+	pgTable,
+	text,
+	timestamp,
+	uniqueIndex,
+	uuid,
+} from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../triggers/types.js';
 import { users } from './users.js';
@@ -94,6 +103,27 @@ export const workers = pgTable(
 		 * against `projects.repo` must normalise that side too.
 		 */
 		repository: text('repository'),
+		/**
+		 * The commit the **SWARM install root** of the daemon currently operating this
+		 * row is on (issue #918), declared at handshake. It answers what
+		 * `HandshakeRequestSchema.daemonVersion` cannot: that resolves to
+		 * `package.json`'s `version`, which never moves, so it is the same string on
+		 * every daemon whatever code it runs.
+		 *
+		 * Nullable with no default, on `repository`'s exact contract: NULL means "this
+		 * daemon declared no build" — what every row written before this column says,
+		 * what a daemon too old to send the field keeps saying, and what a daemon whose
+		 * install root is not a git checkout says. Nothing is backfilled; no index,
+		 * since nothing queries by it.
+		 */
+		buildCommit: text('build_commit'),
+		/**
+		 * Whether the code that daemon runs is not exactly {@link buildCommit} — an
+		 * uncommitted change in the install root, or a `dist/` build older than HEAD.
+		 * Only meaningful alongside a non-null `build_commit`; the pair is always
+		 * written together (`updateWorkerCapabilities`), so it is never half-set.
+		 */
+		buildDirty: boolean('build_dirty'),
 		/** SHA-256 of the worker credential — never the raw token; dropped by `rowToWorker`. */
 		credentialHash: text('credential_hash').notNull().unique(),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

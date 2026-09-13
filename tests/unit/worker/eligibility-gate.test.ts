@@ -78,6 +78,7 @@ function makeCandidate(
 			// file that says nothing about repositories: the declared checkout always is the
 			// task's, so the #714 check is satisfied rather than merely skipped.
 			repository: overrides.repository === undefined ? REPOSITORY : overrides.repository,
+			build: null,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
 		},

@@ -101,6 +101,35 @@ describe('transport protocol schemas', () => {
 			}
 		});
 
+		// Issue #918: the daemon declares the SWARM build it is running. Additive and
+		// optional on exactly the same terms as `repository` above — the shape above,
+		// with no `build`, is the older daemon's and stays valid.
+		it('accepts a declared build, normalising the commit to lower-case hex', () => {
+			expect(
+				HandshakeRequestSchema.parse({
+					...valid,
+					build: { commit: '9F3A1B2C4D5E6F70819A2B3C4D5E6F7081920A3B', dirty: false },
+				}),
+			).toEqual({
+				...valid,
+				build: { commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: false },
+			});
+		});
+
+		it('rejects a non-hex, too-short, or absent commit', () => {
+			for (const commit of ['zzzzzzz', 'abc123', '']) {
+				expect(
+					HandshakeRequestSchema.safeParse({ ...valid, build: { commit, dirty: true } }).success,
+				).toBe(false);
+			}
+		});
+
+		it('rejects a build that omits the dirty flag', () => {
+			expect(
+				HandshakeRequestSchema.safeParse({ ...valid, build: { commit: 'abc1234' } }).success,
+			).toBe(false);
+		});
+
 		// Issue #608: a reconnecting daemon presents the lease it already holds. The
 		// field is additive and optional in both directions, which is why
 		// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped for it — the shape

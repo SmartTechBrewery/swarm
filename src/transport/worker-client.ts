@@ -56,6 +56,7 @@ import { WebSocket } from 'ws';
 
 import type { AgentCli } from '../harness/agent-cli.js';
 import type { WorkerSessionReclaim } from '../identity/worker-session.js';
+import type { WorkerBuild } from '../lib/build-identity.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import {
 	type ControlPlaneMessage,
@@ -196,6 +197,10 @@ const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
  * when the caller could not identify it — the key is left off the body rather than
  * sent as null, so the request a daemon with an unidentifiable checkout sends is
  * byte-identical to the one a daemon predating the field sends.
+ *
+ * `build` is the SWARM build this daemon runs (issue #918) and is omitted the same
+ * way, for the same reason: a daemon whose install root is not a git checkout sends
+ * exactly what a daemon predating the field sends.
  */
 export function buildHandshakeRequest(input: {
 	credential: string;
@@ -204,6 +209,7 @@ export function buildHandshakeRequest(input: {
 	capabilities: AgentCli[];
 	supportedPhases: readonly TaskPhase[];
 	repository?: string;
+	build?: WorkerBuild;
 	instanceId?: string;
 }): HandshakeRequest {
 	return HandshakeRequestSchema.parse({
@@ -213,6 +219,7 @@ export function buildHandshakeRequest(input: {
 		capabilities: input.capabilities,
 		supportedPhases: [...input.supportedPhases],
 		...(input.repository ? { repository: input.repository } : {}),
+		...(input.build ? { build: input.build } : {}),
 		...(input.instanceId ? { instanceId: input.instanceId } : {}),
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
@@ -768,6 +775,14 @@ export interface WorkerTransportOptions {
 	 * cannot be identified, which declares nothing rather than failing.
 	 */
 	repository?: string;
+	/**
+	 * The SWARM build this daemon is running (issue #918) — the commit its install
+	 * root is on plus a dirty/unbuilt flag, declared at handshake so the control
+	 * plane can answer "is this worker running the fix?", which `daemonVersion`
+	 * cannot. `./connect-entry.ts` resolves it once at startup; omitted when the
+	 * install root is not a git checkout, which declares nothing rather than failing.
+	 */
+	build?: WorkerBuild;
 	/**
 	 * Re-run capability discovery after the control plane rejects the declared set
 	 * (issue #559). A PATH probe can miss a CLI that is installed — a loaded
