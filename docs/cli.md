@@ -426,7 +426,8 @@ swarm workers remove <worker-id>
 swarm workers drain <worker-id>
 swarm workers undrain <worker-id>
 swarm workers update <worker-id> <ref>
-swarm workers update --all <ref>
+swarm workers update --all <ref> [--wave <n>]
+swarm workers update --status
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -650,35 +651,45 @@ unchanged.
   command that changes *which code* runs on somebody's hardware, so an
   `instanceAdmin` who does not own the machine gets the same `NOT_FOUND` a stranger
   does. No dashboard equivalent yet; the CLI is the operator surface for now.
-- **`update --all <ref>`** — the same request, asked of **every machine you own
-  that is eligible for one**, in one action (issue #921), with one line per machine
-  saying what became of it — the machines it deliberately did not ask included. It
-  reaches only machines that are **already draining**, so it cannot take a fleet's
-  capacity down by itself: draining is still your own step, per machine. A worker id
-  alongside `--all` is a usage error naming both forms.
-  No machine's state refuses the call — one un-drained machine out of twelve would
-  otherwise abort the request and tell you nothing about the other eleven — so each
-  line carries a **disposition** instead:
-  `requested` (recorded, and the machine has a live session, so the push is on its
-  way), `queued-offline` (recorded; no live session, so the router states it again
-  on the machine's next connection), `in-pool` (not asked — the machine is not
-  draining; the line under the table names `swarm workers drain <worker-id>` for
-  each one), `already-asked` (an unanswered request for **this same ref** is
-  outstanding and is left exactly as it is, request id and all) and `answered` (the
-  machine already reported an outcome for this same ref, shown beside the
-  disposition rather than the machine being re-asked). A tally line counts them.
-  **Re-running it is the readout**: an answered machine is never asked twice, so no
-  machine is sent back through an apply it has already done, and an outstanding
-  request keeps its id so no second push is made. A pending request for a
-  *different* ref is overwritten and reported as `requested` — a stale request for
-  some other build must not survive a fleet action. Retrying one machine that
-  reported `failed` stays `swarm workers update <worker-id> <ref>`, which overwrites
-  unconditionally; there is no `--retry`. **Exit code 0 whenever the call
-  succeeded**, however many machines were skipped: this is a report, not a
-  pass/fail. Strictly owner-scoped, deliberately — it fans out over your own
-  machines and nothing wider, and whether an installation administrator may signal
-  machines they do not own is a separate question this does not answer. Waves,
-  staging and halting are not here: this asks, once, and reports.
+- **`update --all <ref> [--wave <n>]`** — move **every machine you own** to `<ref>`
+  as a **staged rollout** (issue #940). Where the single-machine form asks one
+  machine an operator has already drained, this owns the whole sequence: it drains
+  at most `--wave` machines (one by default), waits for each to go idle, asks it,
+  waits for it to come back **on the new build**, returns it to the dispatch pool,
+  and only then starts the next wave. So a fleet update never takes the fleet's
+  capacity down at once, and draining/undraining stops being a per-machine step you
+  do yourself. A worker id alongside `--all` is a usage error naming both forms.
+  **Re-running the same command is how a rollout is advanced** — exactly as
+  re-running `drain` is how you check whether a machine has gone idle — and each run
+  prints the whole member table: `queued` (not reached yet, still in the pool),
+  `draining` (out of the pool, waiting to go idle — draining never interrupts a
+  run), `signalled` (asked, awaiting its report), `verifying` (it applied; waiting
+  for a daemon on the new build to take a fresh lease), `done`, `skipped` (settled
+  without being moved — the rollout halted first, or another session re-targeted the
+  machine) and `failed`. A tally line counts them.
+  **A bad build halts the rollout.** A machine that reports `failed`, `refused` or
+  `declined`, that comes back still on the build it was asked to leave (which is what
+  a machine returning itself to its last known good build looks like — issue #934),
+  or that applies and never comes back within ten minutes, stops the whole thing: no
+  further machine is drained or signalled, the reason is recorded verbatim and
+  printed under the table, and every machine the rollout had not committed to yet
+  stays in the pool. The one machine that failed is deliberately left **drained**, so
+  you can look at it before it is given work again; `swarm workers undrain` is still
+  yours to run. A halt is final — fix the build and start a new rollout; there is no
+  resume and no cancel, exactly as there is none for a single request.
+  **One rollout at a time per operator.** Asking for a *different* ref while one is
+  under way is refused naming `--status` rather than re-targeting a fleet mid-move;
+  asking for the *same* ref simply advances it. A halted or completed rollout no
+  longer blocks a new one, which is what makes "start a new one" the way past a halt.
+  **Exit code 0 whenever the call succeeded**, halted rollouts included: this is a
+  report, not a pass/fail. Strictly owner-scoped, deliberately — it moves your own
+  machines and nothing wider, and whether an installation administrator may stage a
+  rollout over machines they do not own is a separate question this does not answer.
+  Advancing with nobody watching is a later phase; today an operator advances it.
+- **`update --status`** — the same member table with nothing moved (issue #940), for
+  looking at a rollout without advancing it. It reads your **latest** rollout
+  whatever its status, so a halted one stays readable after it stopped, with the
+  reason it stopped. Takes no ref, no `--wave` and no `--all`.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

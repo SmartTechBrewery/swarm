@@ -249,29 +249,40 @@ swarm workers list                       # read what it reported
 swarm workers undrain <worker-id>        # back in the pool
 ```
 
-**Or all of them at once.** `swarm workers update --all <ref>` (issue #921) asks
-every machine you own that is eligible for one, in a single action, and prints one
-line per machine saying what became of it:
+**Or the whole fleet, staged.** `swarm workers update --all <ref>` (issue #940) moves
+every machine you own in one operator action — but a bounded wave at a time, so the
+fleet's capacity is never down at once and the drain/undrain per machine stops being
+yours to do:
 
 ```bash
-swarm workers drain <worker-id>          # once per machine, still your own step
-swarm workers update --all main          # every machine you own that is draining
-swarm workers list                       # read what they reported
-swarm workers undrain <worker-id>        # once per machine
+swarm workers update --all main          # start it: drains and asks the first wave
+swarm workers update --all main          # re-run to advance it, and to read it
+swarm workers update --status            # read it without advancing
 ```
 
-It reaches only machines that are **already draining** — the same precondition as
-the single-machine form — so it cannot take the fleet's capacity down by itself. No
-machine's state refuses the call: a machine still in the pool is reported as
-`in-pool` with the drain named for it rather than aborting the request for
-everything else, and the other four words are `requested` (asked, and the machine
-is connected), `queued-offline` (recorded; stated again on its next connection),
-`already-asked` (an unanswered request for this same ref, left as it is) and
-`answered` (it already reported for this same ref, shown beside the disposition).
-Re-running it is the readout — an answered machine is never asked twice, and an
-outstanding request keeps its id — and it exits 0 whatever the dispositions say,
-because it is a report rather than a pass/fail. It is strictly owner-scoped: your
-own machines and nothing wider.
+Each run drains at most `--wave` machines (one by default), waits for each to go
+idle, asks it, waits for it to come back **on the new build**, puts it back in the
+dispatch pool, and only then starts the next wave. Re-running the same command is how
+you advance it — the same contract `drain` already has — and every run prints where
+each machine stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped`
+or `failed`.
+
+**A bad build stops it.** A machine that reports `failed`, `refused` or `declined`,
+one that comes back still on the build it was asked to leave (what a machine
+returning itself to its last known good build looks like — issue #934), or one that
+applies and never comes back inside ten minutes, halts the rollout: nothing further is
+drained or signalled, the reason is recorded and printed, and every machine it had not
+reached stays in the pool. The machine that failed is deliberately left drained so you
+can look at it. A halt is final — fix the build and start a new rollout; there is no
+resume and no cancel. Only one rollout runs per operator at a time, so asking for a
+different ref mid-move is refused rather than silently re-targeting the fleet.
+
+`swarm workers update --all` exits 0 whatever the table says, because it is a report
+rather than a pass/fail, and it is strictly owner-scoped: your own machines and
+nothing wider. Advancing it with nobody watching is a later phase; today you advance
+it by re-running the command. The unstaged one-shot fan-out issue #921 shipped is
+still there on the API (`workers.requestUpdateForMine`), which asks every machine you
+have *already* drained, all at once, and reports a disposition per machine.
 
 Nothing about the restart differs from the one above — the daemon waits until it
 holds no in-flight phase, applies the update, releases its session and exits 0, and

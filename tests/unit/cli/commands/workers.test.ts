@@ -45,6 +45,7 @@ const PROJECT_ID = 'proj-a';
 const IDENTIFIER = 'ada@example.com';
 const OTHER_WORKER_ID = '22222222-2222-4222-8222-222222222222';
 const ENROLLMENT_ID = '33333333-3333-4333-8333-333333333333';
+const ROLLOUT_ID = '99999999-9999-4999-8999-999999999999';
 const ORIGINAL_INIT_CWD = process.env.INIT_CWD;
 
 type Answer = (input: Record<string, unknown>) => unknown;
@@ -176,24 +177,29 @@ describe('swarm workers', () => {
 			requestedAt: '2026-09-13T10:05:00.000Z',
 			drainingSince: '2026-09-13T10:00:00.000Z',
 		}));
-		// Issue #921 — the fleet form. One entry per machine, dispositions and all;
-		// a test that cares about the report replaces this wholesale.
-		answers.set('workers.requestUpdateForMine', (input) => ({
+		// Issue #940 — the staged fleet form. One member per machine; a test that cares
+		// about the table replaces this wholesale through `fleet()`.
+		answers.set('workers.startFleetUpdate', (input) => ({
+			action: 'started',
 			target: input.target,
-			workers: [
-				{
-					workerId: WORKER_ID,
-					displayName: 'ada-laptop',
-					disposition: 'requested',
-					update: {
-						requestId: '66666666-6666-4666-8666-666666666666',
-						target: input.target,
-						status: null,
+			rollout: {
+				id: ROLLOUT_ID,
+				target: input.target,
+				waveSize: (input.waveSize as number) ?? 1,
+				status: 'in_progress',
+				haltReason: null,
+				members: [
+					{
+						workerId: WORKER_ID,
+						displayName: 'ada-laptop',
+						state: 'signalled',
+						outcome: null,
 						message: null,
 					},
-				},
-			],
+				],
+			},
 		}));
+		answers.set('workers.fleetUpdateStatus', () => ({ rollout: null }));
 		enrollmentRow = {
 			id: ENROLLMENT_ID,
 			status: 'pending',
@@ -1163,6 +1169,17 @@ describe('swarm workers', () => {
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('swarm workers drain'));
 		});
 
+		// A wave sizes a rollout, so on the one-machine form it means nothing — refused
+		// rather than silently ignored, since an operator who typed it meant to stage.
+		it('refuses --wave on the single-machine form, without calling', async () => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', WORKER_ID, 'main', '--wave', '2'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(
+				expect.stringContaining('--wave sizes a staged fleet rollout'),
+			);
+			expect(pathsCalled()).toEqual([]);
+		});
+
 		it('surfaces a malformed target as the control plane words it', async () => {
 			refuse('workers.requestUpdate', 'must be a branch name, tag, or commit id');
 			const error = vi.spyOn(console, 'error');
@@ -1171,23 +1188,55 @@ describe('swarm workers', () => {
 		});
 	});
 
-	// Issue #921. The fleet form of the same subcommand: a different *selection*, the
-	// same per-machine request, and a report that never turns one machine's state into
-	// a refusal of the whole call.
+	// Issue #940. The staged form of the same subcommand: the same per-machine request,
+	// scheduled a bounded wave at a time, with the whole member table printed every run
+	// because re-running it is how a rollout is advanced.
 	describe('update --all', () => {
-		/** Replace the fleet answer with one entry per given machine. */
-		function fleet(...workers: Record<string, unknown>[]): void {
-			answers.set('workers.requestUpdateForMine', (input) => ({
+		/** Replace the rollout answer with one of a given shape. */
+		function fleet(rollout: Record<string, unknown> | null, action = 'started'): void {
+			answers.set('workers.startFleetUpdate', (input) => ({
+				action,
 				target: input.target,
-				workers,
+				rollout: rollout
+					? {
+							id: ROLLOUT_ID,
+							target: input.target,
+							waveSize: 1,
+							status: 'in_progress',
+							haltReason: null,
+							members: [],
+							...rollout,
+						}
+					: null,
 			}));
 		}
 
-		it('asks for the whole fleet with the ref alone', async () => {
+		it('stages the whole fleet from the ref alone', async () => {
 			expect(await run(['update', '--all', 'main'])).toBe(0);
-			expect(inputFor('workers.requestUpdateForMine')).toEqual({ target: 'main' });
-			// The per-worker mutation is not spent as well — one call, one fan-out.
-			expect(pathsCalled()).toEqual(['workers.requestUpdateForMine']);
+			expect(inputFor('workers.startFleetUpdate')).toEqual({ target: 'main', waveSize: undefined });
+			// The per-worker mutation is not spent as well — one call, one rollout.
+			expect(pathsCalled()).toEqual(['workers.startFleetUpdate']);
+		});
+
+		it('sends --wave as the wave size', async () => {
+			expect(await run(['update', '--all', 'main', '--wave', '3'])).toBe(0);
+			expect(inputFor('workers.startFleetUpdate')).toEqual({ target: 'main', waveSize: 3 });
+		});
+
+		// `--wave=-2` rather than `--wave -2`: node's own `parseArgs` refuses the spaced
+		// form as ambiguous before this command ever sees the value.
+		it.each([
+			['zero', '0'],
+			['negative', '=-2'],
+			['not a number', 'two'],
+		])('refuses a %s --wave without calling', async (_what, wave) => {
+			const error = vi.spyOn(console, 'error');
+			const flag = wave.startsWith('=') ? [`--wave${wave}`] : ['--wave', wave];
+			expect(await run(['update', '--all', 'main', ...flag])).toBe(1);
+			expect(error).toHaveBeenCalledWith(
+				expect.stringContaining('--wave must be a positive integer'),
+			);
+			expect(pathsCalled()).toEqual([]);
 		});
 
 		// Two different requests typed as one: refused naming both forms rather than
@@ -1209,75 +1258,160 @@ describe('swarm workers', () => {
 		});
 
 		// One line per machine plus a tally, so a fleet is read without counting rows —
-		// and a machine that was skipped is on the table rather than missing from it.
-		it('prints one line per machine, a summary, and the follow-up hints', async () => {
-			fleet(
-				{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'requested', update: null },
-				{
-					workerId: OTHER_WORKER_ID,
-					displayName: 'ada-desktop',
-					disposition: 'queued-offline',
-					update: null,
-				},
+		// and a machine the rollout has not reached is on the table rather than missing.
+		it('prints one line per machine, a summary, and how to advance it', async () => {
+			fleet({
+				waveSize: 2,
+				members: [
+					{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'signalled' },
+					{ workerId: OTHER_WORKER_ID, displayName: 'ada-desktop', state: 'queued' },
+				],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain(`${WORKER_ID}\tada-laptop\tsignalled`);
+			expect(joined).toContain(`${OTHER_WORKER_ID}\tada-desktop\tqueued`);
+			expect(joined).toContain('2 machines: 1 queued, 1 signalled');
+			expect(joined).toContain('2 machines per wave');
+			// Re-running it is the advance, and the line under the table says so.
+			expect(joined).toContain('swarm workers update --all main');
+		});
+
+		// The one thing the table cannot show: a machine only acts if its own host opted
+		// in, and one that has not reports `declined` — which halts the rollout.
+		it('names the host opt-in while machines are waiting on their answer', async () => {
+			fleet({
+				members: [{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'signalled' }],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(lines().join('\n')).toContain('SWARM_WORKER_SELF_UPDATE=true');
+		});
+
+		it('does not name the opt-in when nothing is waiting on an answer', async () => {
+			fleet({ members: [{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'queued' }] });
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(lines().join('\n')).not.toContain('SWARM_WORKER_SELF_UPDATE=true');
+		});
+
+		it('shows the reported outcome beside a machine that answered', async () => {
+			fleet({
+				members: [
+					{
+						workerId: WORKER_ID,
+						displayName: 'ada-laptop',
+						state: 'verifying',
+						outcome: 'applied',
+						message: 'restarting into 1a2b3c4\nsee the host log',
+					},
+				],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(lines().join('\n')).toContain(
+				`${WORKER_ID}\tada-laptop\tverifying\tapplied: restarting into 1a2b3c4`,
 			);
+		});
+
+		// A halt is the whole point of staging, so it gets the reason verbatim and the
+		// one sentence that says what to do about it — and still exits 0, because this
+		// is a report rather than a pass/fail.
+		it('prints the halt reason and says there is no resume, still exiting 0', async () => {
+			fleet({
+				status: 'halted',
+				haltReason: "worker 'ada-laptop' reported failed: npm ci exited 1",
+				members: [
+					{
+						workerId: WORKER_ID,
+						displayName: 'ada-laptop',
+						state: 'failed',
+						outcome: 'failed',
+						message: 'npm ci exited 1',
+					},
+					{ workerId: OTHER_WORKER_ID, displayName: 'ada-desktop', state: 'skipped' },
+				],
+			});
 
 			expect(await run(['update', '--all', 'main'])).toBe(0);
 
 			const joined = lines().join('\n');
-			expect(joined).toContain(`${WORKER_ID}\tada-laptop\trequested`);
-			expect(joined).toContain(`${OTHER_WORKER_ID}\tada-desktop\tqueued-offline`);
-			expect(joined).toContain('2 machines: 1 requested, 1 queued-offline');
-			expect(joined).toContain('SWARM_WORKER_SELF_UPDATE=true');
-			expect(joined).toContain('swarm workers undrain');
+			expect(joined).toContain('HALTED');
+			expect(joined).toContain("halted: worker 'ada-laptop' reported failed: npm ci exited 1");
+			expect(joined).toContain('there is no resume');
+			// The failed machine is left out of the pool on purpose, so the undrain that
+			// ends that is named rather than left to be remembered.
+			expect(joined).toContain(`swarm workers undrain ${WORKER_ID}`);
+			expect(joined).not.toContain(`swarm workers undrain ${OTHER_WORKER_ID}`);
+			// Advancing is no longer on offer.
+			expect(joined).not.toContain('to advance it');
 		});
 
-		// The remedy the per-worker CONFLICT names, printed here because the fan-out
-		// reports a machine still in the pool instead of refusing the call.
-		it('names the drain for a machine reported in-pool, and still exits 0', async () => {
+		it('says the fleet is done when the rollout completed', async () => {
 			fleet({
-				workerId: WORKER_ID,
-				displayName: 'ada-laptop',
-				disposition: 'in-pool',
-				update: null,
+				status: 'completed',
+				members: [{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'done' }],
 			});
 
 			expect(await run(['update', '--all', 'main'])).toBe(0);
-			expect(lines().join('\n')).toContain(`swarm workers drain ${WORKER_ID}`);
-		});
-
-		// Re-running is the readout: an answered machine reports what it answered.
-		it('shows the reported outcome for an answered machine', async () => {
-			fleet({
-				workerId: WORKER_ID,
-				displayName: 'ada-laptop',
-				disposition: 'answered',
-				update: {
-					requestId: null,
-					target: 'main',
-					status: 'failed',
-					message: 'npm ci exited 1\nsee the host log',
-				},
-			});
-
-			expect(await run(['update', '--all', 'main'])).toBe(0);
-			const joined = lines().join('\n');
-			expect(joined).toContain(`${WORKER_ID}\tada-laptop\tanswered\tfailed: npm ci exited 1`);
-			// Nothing was asked, so the undrain/opt-in hints would be untrue here.
-			expect(joined).not.toContain('SWARM_WORKER_SELF_UPDATE=true');
-			expect(joined).toContain('nothing was asked to move');
+			expect(lines().join('\n')).toContain("every machine is on 'main'");
 		});
 
 		it('says so plainly when the caller owns no machines, and exits 0', async () => {
-			fleet();
+			fleet(null, 'no-machines');
 			expect(await run(['update', '--all', 'main'])).toBe(0);
 			expect(lines().join('\n')).toContain('you operate no machines');
 		});
 
-		it('surfaces a malformed target as the control plane words it', async () => {
-			refuse('workers.requestUpdateForMine', 'must be a branch name, tag, or commit id');
+		it.each([
+			['a malformed target', 'must be a branch name, tag, or commit id'],
+			[
+				'a rollout already moving elsewhere',
+				"A fleet update to 'main' is already in progress, so it cannot be re-targeted",
+			],
+		])('surfaces %s as the control plane words it', async (_what, message) => {
+			refuse('workers.startFleetUpdate', message);
 			const error = vi.spyOn(console, 'error');
-			expect(await run(['update', '--all', 'https://example.com/evil.git'])).toBe(1);
-			expect(error).toHaveBeenCalledWith(expect.stringContaining('branch name, tag, or commit id'));
+			expect(await run(['update', '--all', 'fix/hotfix'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining(message));
+		});
+	});
+
+	describe('update --status', () => {
+		it('reads the rollout without advancing anything', async () => {
+			answers.set('workers.fleetUpdateStatus', () => ({
+				rollout: {
+					id: ROLLOUT_ID,
+					target: 'main',
+					waveSize: 1,
+					status: 'in_progress',
+					haltReason: null,
+					members: [{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'verifying' }],
+				},
+			}));
+
+			expect(await run(['update', '--status'])).toBe(0);
+			// Reading never moves the fleet on: the mutation is not called at all.
+			expect(pathsCalled()).toEqual(['workers.fleetUpdateStatus']);
+			expect(lines().join('\n')).toContain(`${WORKER_ID}\tada-laptop\tverifying`);
+		});
+
+		it('says so plainly when there has never been one', async () => {
+			expect(await run(['update', '--status'])).toBe(0);
+			expect(lines().join('\n')).toContain('you have never started a fleet update');
+		});
+
+		it.each([
+			['a ref', ['update', '--status', 'main']],
+			['--all', ['update', '--status', '--all']],
+			['--wave', ['update', '--status', '--wave', '2']],
+		])('refuses %s alongside --status, without calling', async (_what, argv) => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(argv)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('--status only reads'));
+			expect(pathsCalled()).toEqual([]);
 		});
 	});
 

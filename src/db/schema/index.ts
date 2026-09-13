@@ -15,3 +15,7 @@ export { workerProjectEnrollments } from './workerProjectEnrollments.js';
 export { workerScmCredentials } from './workerScmCredentials.js';
 export { workerSessions } from './workerSessions.js';
 export { workers } from './workers.js';
+export {
+	workerUpdateRolloutMembers,
+	workerUpdateRollouts,
+} from './workerUpdateRollouts.js';
