@@ -162,6 +162,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		build: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,

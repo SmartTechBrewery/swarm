@@ -31,6 +31,7 @@ import {
 	WorkerSessionInstanceIdSchema,
 	WorkerSessionReclaimSchema,
 } from '../identity/worker-session.js';
+import { WorkerBuildSchema } from '../lib/build-identity.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { RecoveryIntentSchema } from '../queue/jobs.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
@@ -134,6 +135,29 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * Nothing is gated on it here — refusing a mismatched assignment, a second daemon on
  * one checkout, and a dishonest enrollment are the follow-on phases of issue #687.
  *
+ * `build` is the SWARM build this daemon is actually running (issue #918): the
+ * commit its **install root** is on, plus a flag for a dirty or unbuilt checkout.
+ * It is what `daemonVersion` above cannot be — that resolves to `package.json`'s
+ * `version`, which never moves, so every daemon in the fleet reports the same
+ * string whatever code it runs, and "is this worker running the fix?" has no
+ * answer from the control plane at all. The install root is anchored on the
+ * daemon's own module path, never its repo root: one npm-linked SWARM checkout
+ * serves daemons whose `cwd` is a different project repository each
+ * (`WorkerBuildSchema`, `../lib/build-identity.js` — the shared definition rather
+ * than a re-declaration, the same move `repository` and `reclaim` make).
+ *
+ * **Optional on purpose, and like `repository` it is persisted.** A daemon built
+ * before this field simply omits it and the columns record NULL — exactly today's
+ * behaviour — and an older router ignores a key it does not know, so this too is
+ * additive in both directions and needs no protocol-version bump. An install root
+ * that is not a git checkout declares nothing rather than failing to start. It
+ * carries **no secret**: a commit id is public coordinates, not a credential, and
+ * like every handshake field it is never reflected in an error body. An omitted
+ * field **clears** the stored build, the same asymmetry `repository` makes — the
+ * row states the build of the program currently operating it, and a
+ * stale-but-wrong build is worse than an absent one. Nothing is gated on it:
+ * reading it back on the roster is the follow-on phase of issue #918.
+ *
  * `reclaim` is what lets a daemon say *"this is me, taking my own lease back"*
  * (issue #608). It carries the `sessionId`/`fencingToken` the control plane already
  * minted for this daemon — it *is* the identity module's validator
@@ -161,6 +185,7 @@ export const HandshakeRequestSchema = z.object({
 	capabilities: z.array(AgentCliSchema).nonempty(),
 	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
 	repository: RepoSlugSchema.optional(),
+	build: WorkerBuildSchema.optional(),
 	reclaim: WorkerSessionReclaimSchema.optional(),
 	instanceId: WorkerSessionInstanceIdSchema.optional(),
 	protocolVersion: z.number().int(),

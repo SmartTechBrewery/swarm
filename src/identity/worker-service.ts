@@ -35,6 +35,7 @@ import {
 	updateWorkerSupportedPhases,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import { type WorkerBuild, WorkerBuildSchema } from '../lib/build-identity.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
@@ -133,19 +134,32 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * exactly as the repository layer documents: omit it to leave the stored value alone
  * (again the `set-cli` path), pass `null` when the connecting daemon declared none,
  * which clears a previous daemon's statement.
+ *
+ * `build` (issue #918) is the SWARM build that daemon is running, three-valued and
+ * validated on exactly the same terms — so the service seam, not only the wire, is a
+ * boundary that cannot store a commit id no reader would recognise.
  */
 export async function refreshWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
 	supportedPhases?: TriggerPhase[],
 	repository?: string | null,
+	build?: WorkerBuild | null,
 ): Promise<Worker | undefined> {
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
 	const validatedPhases =
 		supportedPhases === undefined ? undefined : WorkerSupportedPhasesSchema.parse(supportedPhases);
 	const validatedRepository =
 		repository === undefined || repository === null ? repository : RepoSlugSchema.parse(repository);
-	return updateWorkerCapabilities(id, validated, validatedPhases, validatedRepository);
+	const validatedBuild =
+		build === undefined || build === null ? build : WorkerBuildSchema.parse(build);
+	return updateWorkerCapabilities(
+		id,
+		validated,
+		validatedPhases,
+		validatedRepository,
+		validatedBuild,
+	);
 }
 
 /**

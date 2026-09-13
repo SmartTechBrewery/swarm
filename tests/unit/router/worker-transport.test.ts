@@ -53,6 +53,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -145,6 +146,7 @@ describe('handleHandshake', () => {
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
 			null,
+			null,
 		);
 	});
 
@@ -159,6 +161,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			declared,
+			null,
 			null,
 		);
 	});
@@ -180,8 +183,62 @@ describe('handleHandshake', () => {
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
 			'smarttechbrewery/swarm',
+			null,
 		);
 		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
+	});
+
+	// Issue #918 — the fourth declaration, persisted on the same terms and normalised
+	// at the same boundary, so the roster records one canonical lower-case commit.
+	it('records the declared build', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			build: { commit: '9F3A1B2C4D5E6F70819A2B3C4D5E6F7081920A3B', dirty: true },
+		});
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
+			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true },
+		);
+	});
+
+	// The clearing rule: the row states the build of the program currently operating
+	// it, so an older daemon's commit must not outlive the daemon that declared it.
+	it('clears the stored build when the daemon declares none', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, validBody());
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
+			null,
+		);
+	});
+
+	it('rejects a malformed build with 400 before the lease is touched', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			build: { commit: 'not-a-commit', dirty: false },
+		});
+
+		expect(result).toEqual({
+			status: 400,
+			json: { authenticated: false, reason: 'invalid handshake request' },
+		});
+		expect(deps.acquireSession).not.toHaveBeenCalled();
+		expect(deps.refreshWorkerCapabilities).not.toHaveBeenCalled();
 	});
 
 	// Issue #690 — the declaration's second consumer: enrollments written against

@@ -370,6 +370,49 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 		});
 	});
 
+	// Issue #918 — the build declaration, which is one domain value across two
+	// columns. Only a real database catches the pair going half-set.
+	describe('build', () => {
+		it('leaves a newly registered worker with no declaration', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-fresh-build',
+				capabilities: ['claude'],
+				credentialHash: 'hash-fresh-build',
+			});
+
+			// Registering a machine is not declaring a build — only the program that
+			// connects knows its own.
+			expect(created.build).toBeNull();
+			expect((await getWorkerById(created.id))?.build).toBeNull();
+		});
+
+		it('persists both columns, leaves them alone when omitted, and clears both on null', async () => {
+			const build = { commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true };
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-declares-build',
+				capabilities: ['claude'],
+				credentialHash: 'hash-declares-build',
+			});
+
+			await updateWorkerCapabilities(created.id, ['claude'], undefined, undefined, build);
+			expect((await getWorkerById(created.id))?.build).toEqual(build);
+
+			// The `swarm workers set-cli` shape again: a caller that knows nothing about
+			// builds must not clear one.
+			await updateWorkerCapabilities(created.id, ['claude', 'codex']);
+			const after = await getWorkerById(created.id);
+			expect(after?.capabilities).toEqual(['claude', 'codex']);
+			expect(after?.build).toEqual(build);
+
+			// A handshake from a daemon that declared none clears *both* columns, so the
+			// pair is never left half-set.
+			await updateWorkerCapabilities(created.id, ['claude', 'codex'], undefined, undefined, null);
+			expect((await getWorkerById(created.id))?.build).toBeNull();
+		});
+	});
+
 	describe('updateWorkerCapabilities', () => {
 		it('changes the capability set', async () => {
 			const created = await createWorker({

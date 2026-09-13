@@ -66,6 +66,7 @@ import {
 	type WorkerSessionInstanceId,
 	type WorkerSessionReclaim,
 } from '../identity/worker-session-service.js';
+import type { WorkerBuild } from '../lib/build-identity.js';
 import { logger } from '../lib/logger.js';
 import {
 	type ControlPlaneMessage,
@@ -145,6 +146,7 @@ export interface WorkerTransportDeps {
 		capabilities: AgentCli[],
 		supportedPhases: TriggerPhase[],
 		repository: string | null,
+		build: WorkerBuild | null,
 	) => Promise<Worker | undefined>;
 	/**
 	 * Police the worker's existing enrollments against the repository it just
@@ -370,7 +372,9 @@ export async function handleHandshake(
 	// it, so a daemon re-pointed at a checkout it cannot identify — or an older build
 	// that cannot state one — must not leave the previous statement standing for the
 	// later guards to act on. For a row that never carried one that write is a no-op
-	// NULL, i.e. exactly today's behaviour.
+	// NULL, i.e. exactly today's behaviour. `build` (issue #918) is normalized on that
+	// same clearing rule and for the same reason — the row states the build of the
+	// program currently operating it, so an older daemon's commit must not outlive it.
 	//
 	// The CLI set written here is only the daemon's *probe* (issue #783). If the row
 	// carries an owner's declaration, that declaration outranks it and is what
@@ -384,6 +388,7 @@ export async function handleHandshake(
 			request.capabilities,
 			request.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
 			request.repository ?? null,
+			request.build ?? null,
 		);
 	} catch (err) {
 		if (err instanceof WorkerCapabilityReductionError) {
