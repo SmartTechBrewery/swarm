@@ -101,7 +101,8 @@
  *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
  *   - `POST /worker/delivery/review-ledger/abandon` — release a pending slot.
  *   - `POST /worker/delivery/quota` — store this worker's own host's CLI quota snapshots.
- *   - `POST /worker/delivery/update-report` — record what became of a requested self-update.
+ *   - `POST /worker/delivery/update-report` — record what became of a requested
+ *     self-update, and advance the fleet rollout that was waiting for the answer.
  *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
@@ -171,6 +172,7 @@ import {
 	TRANSPORT_PROTOCOL_VERSION,
 	UpdateWorkItemDeliveryRequestSchema,
 } from '../transport/protocol.js';
+import { advanceWorkerRollout } from './worker-rollout-advance.js';
 
 /**
  * Collaborators the delivery API depends on, defaulted to the real services so
@@ -212,6 +214,18 @@ export interface WorkerDeliveryDeps {
 	 * back means the report answers no outstanding request.
 	 */
 	recordWorkerUpdateReport: typeof recordWorkerUpdateReport;
+	/**
+	 * Move on the fleet rollout the reporting machine belongs to, if its operator has
+	 * one under way (issue #941, `./worker-rollout-advance.ts`). A report *is* the
+	 * answer the advance's first step reads off the `workers` row, so it landing here
+	 * is the moment that answer became readable — without this hook a rollout moves
+	 * only when the operator re-runs the command.
+	 *
+	 * Fire-and-forget by contract, like the transport's connection hooks: it returns
+	 * `void` and swallows its own failures, so a rollout can never fail a machine's
+	 * report.
+	 */
+	advanceWorkerRollout: (workerId: string) => void;
 }
 
 /** A worker may deliver to a project only via a routable enrollment (active + sharing consent). */
@@ -234,6 +248,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
 		persistCliQuota: upsertCliQuota,
 		recordWorkerUpdateReport,
+		advanceWorkerRollout,
 	};
 }
 
@@ -1073,6 +1088,11 @@ export async function handleReportWorkerUpdate(
 		status: request.status,
 		recorded: updated !== undefined,
 	});
+	// The outcome is now on the row, so a rollout waiting on this machine can read it
+	// (issue #941). Deliberately not gated on `recorded`: the outcome is written either
+	// way, and the advance decides everything from durable state, so a report that
+	// closed no pending request is still a reason to look again.
+	deps.advanceWorkerRollout(authed.worker.id);
 	return { status: 200, json: { recorded: updated !== undefined } };
 }
 

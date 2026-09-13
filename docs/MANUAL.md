@@ -256,16 +256,17 @@ yours to do:
 
 ```bash
 swarm workers update --all main          # start it: drains and asks the first wave
-swarm workers update --all main          # re-run to advance it, and to read it
-swarm workers update --status            # read it without advancing
+swarm workers update --status            # read where it has got to
 ```
 
-Each run drains at most `--wave` machines (one by default), waits for each to go
-idle, asks it, waits for it to come back **on the new build**, puts it back in the
-dispatch pool, and only then starts the next wave. Re-running the same command is how
-you advance it — the same contract `drain` already has — and every run prints where
-each machine stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped`
-or `failed`.
+It drains at most `--wave` machines (one by default), waits for each to go idle, asks
+it, waits for it to come back **on the new build**, puts it back in the dispatch pool,
+and only then starts the next wave — and it does all of that **on its own** (issue
+#941), off each machine's report, off its reconnect, and off a periodic check in the
+control plane for the machine that applied and never came back. So the command above
+is one operator action, not one to re-run until the fleet has moved. Re-running it is
+still legal and is a nudge as well as a read; either form prints where each machine
+stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped` or `failed`.
 
 **A bad build stops it.** A machine that reports `failed`, `refused` or `declined`,
 one that comes back still on the build it was asked to leave (what a machine
@@ -279,10 +280,9 @@ different ref mid-move is refused rather than silently re-targeting the fleet.
 
 `swarm workers update --all` exits 0 whatever the table says, because it is a report
 rather than a pass/fail, and it is strictly owner-scoped: your own machines and
-nothing wider. Advancing it with nobody watching is a later phase; today you advance
-it by re-running the command. The unstaged one-shot fan-out issue #921 shipped is
-still there on the API (`workers.requestUpdateForMine`), which asks every machine you
-have *already* drained, all at once, and reports a disposition per machine.
+nothing wider. The unstaged one-shot fan-out issue #921 shipped is still there on the
+API (`workers.requestUpdateForMine`), which asks every machine you have *already*
+drained, all at once, and reports a disposition per machine.
 
 Nothing about the restart differs from the one above — the daemon waits until it
 holds no in-flight phase, applies the update, releases its session and exits 0, and

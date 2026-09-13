@@ -109,6 +109,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		onWorkerTransportRestored: vi.fn(),
 		resendRunCancellations: vi.fn(),
 		resendPendingWorkerUpdate: vi.fn(),
+		advanceWorkerRollout: vi.fn(),
 		...overrides,
 	};
 }
@@ -1428,6 +1429,7 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 
 		expect(deps.resendRunCancellations).not.toHaveBeenCalled();
 		expect(deps.resendPendingWorkerUpdate).not.toHaveBeenCalled();
+		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
 	});
 
 	// Issue #933 — the same window, and for this feature the *ordinary* case rather
@@ -1449,6 +1451,42 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
 		const deps = makeDeps({
 			resendPendingWorkerUpdate: vi.fn(() => {
+				throw new Error('database is down');
+			}),
+		});
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+
+		expect(() => handlers.onOpen?.({}, ws)).not.toThrow();
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(warnSpy).toHaveBeenCalled();
+
+		await handlers.onClose?.({}, ws);
+		warnSpy.mockRestore();
+	});
+
+	// Issue #941 — a reconnect is the event the come-back verdict waits for, and the
+	// only one it has: by now the daemon has taken its fenced lease and declared the
+	// build it is running, which are the two facts that verdict is reached against.
+	it('advances the fleet rollout beside the pending-update re-push', async () => {
+		const deps = makeDeps();
+
+		const { handlers, ws } = await connect(deps);
+
+		expect(deps.advanceWorkerRollout).toHaveBeenCalledWith(WORKER_ID);
+		expect(deps.resendPendingWorkerUpdate).toHaveBeenCalledWith(WORKER_ID);
+		await handlers.onClose?.({}, ws);
+	});
+
+	// A rollout must never be able to refuse a handshake — the machine coming back is
+	// the very thing the rollout is waiting for.
+	it('keeps the socket registered when the rollout advance throws', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			advanceWorkerRollout: vi.fn(() => {
 				throw new Error('database is down');
 			}),
 		});

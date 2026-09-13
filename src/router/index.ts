@@ -30,6 +30,7 @@ import { registerOperatorApi } from './operator-api.js';
 import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
+import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
 import { registerWorkerTransport } from './worker-transport.js';
 import { subscribeWorkerUpdateDispatch } from './worker-update-dispatch.js';
 
@@ -79,6 +80,16 @@ injectWebSocket(server);
 // whatever the consumer is doing.
 const workerUpdates = subscribeWorkerUpdateDispatch();
 
+// Keep a staged fleet update moving with nobody watching (issue #941). The report
+// route and the socket-open hook cover every move a machine announces; this timer
+// covers the two it cannot — a machine that applied and never came back, and a wave
+// whose members were still mid-phase when they were drained. Started here for
+// `subscribeWorkerUpdateDispatch`'s reason: this is the process that holds worker
+// sockets and already runs migrations, so a control-plane timer belongs here. Ahead
+// of those migrations is safe — the first sweep is a minute away, by which time they
+// have either run or this process has exited over them.
+const rolloutAdvance = startRolloutAdvanceTicker();
+
 // Control-plane dispatch (ADR-003 §2): host the BullMQ consumer + eligibility
 // gate here and push assignments to connected workers. There is no alternative
 // consumer any more (issue #553), so this is unconditional.
@@ -112,6 +123,10 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 		// accepting requests, then drain the BullMQ producer so the process exits
 		// instead of hanging on an open Redis socket.
 		dispatchShutdown.abort();
+		// Stop the rollout tick first, and synchronously: it is a bare timer with
+		// nothing to drain, and a sweep started during shutdown would only open a
+		// transaction against a database this process is about to stop using.
+		rolloutAdvance.close();
 		server.close(() => {
 			void (async () => {
 				try {

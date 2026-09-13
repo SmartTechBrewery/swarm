@@ -123,6 +123,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		scheduleFollowUpReview: vi.fn().mockResolvedValue(undefined),
 		persistCliQuota: vi.fn().mockResolvedValue(undefined),
 		recordWorkerUpdateReport: vi.fn().mockResolvedValue(makeWorker()),
+		advanceWorkerRollout: vi.fn(),
 		...overrides,
 	};
 }
@@ -1662,6 +1663,30 @@ describe('handleReportWorkerUpdate', () => {
 
 		expect(result).toEqual({ status: 401, json: { authenticated: false } });
 		expect(deps.recordWorkerUpdateReport).not.toHaveBeenCalled();
+		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
+	});
+
+	// Issue #941 — the report is the answer a rollout's first step reads off the
+	// `workers` row, so it landing here is what moves the rollout on. Once, and for
+	// the machine the *credential* resolved to, exactly like the write above it.
+	it('advances the rollout once, for the reporting machine', async () => {
+		const deps = makeDeps();
+
+		await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody());
+
+		expect(deps.advanceWorkerRollout).toHaveBeenCalledTimes(1);
+		expect(deps.advanceWorkerRollout).toHaveBeenCalledWith(WORKER_ID);
+	});
+
+	// `recorded: false` still wrote the outcome, and the advance decides everything
+	// from durable state, so a report that closed no pending request is still a reason
+	// to look again.
+	it('advances the rollout even when the report closed no pending request', async () => {
+		const deps = makeDeps({ recordWorkerUpdateReport: vi.fn().mockResolvedValue(undefined) });
+
+		await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody());
+
+		expect(deps.advanceWorkerRollout).toHaveBeenCalledWith(WORKER_ID);
 	});
 
 	it('needs no project enrollment — an update describes a machine', async () => {
@@ -1691,6 +1716,7 @@ describe('handleReportWorkerUpdate', () => {
 			).status,
 		).toBe(400);
 		expect(deps.recordWorkerUpdateReport).not.toHaveBeenCalled();
+		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
 	});
 
 	it('records every outcome the daemon can report, not only the applied one', async () => {
