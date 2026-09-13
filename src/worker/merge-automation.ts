@@ -4,8 +4,21 @@
  * merge intent is persisted as one ADR-002 dispatch (`merge-automation`
  * payload, dedup key `merge:<reviewRunId>`) and executed through the normal
  * dispatch lifecycle — claim, bounded `retry-scheduled` backoff for transient
- * `not-ready` outcomes, terminal completion/failure, reconciler recovery, and
- * cancellation via the standard queue surfaces.
+ * outcomes, terminal completion, reconciler recovery, and cancellation via the
+ * standard queue surfaces.
+ *
+ * **The backoff covers a failing forge too (issue #923).** A `provider-error`
+ * used to fail the dispatch on its first occurrence, so a single 502 during a
+ * forge incident stranded an approved, clean pull request permanently: this
+ * dispatch is deduped on `merge:<reviewRunId>` and the review-verdict ledger
+ * already holds a `submitted` slot for that head, so nothing re-created it and
+ * a human had to merge by hand. It now shares the one bounded budget
+ * `not-ready` already owned, and the two give-ups stay distinguishable by the
+ * outcome recorded on the Review run — {@link MERGE_RETRY_EXHAUSTED} means the
+ * pull request never became ready, {@link MERGE_PROVIDER_ERROR_EXHAUSTED} means
+ * the provider kept failing. Both complete the dispatch as
+ * `merge-retry-exhausted`: this executor no longer marks a dispatch `failed` at
+ * all.
  *
  * A merge dispatch runs entirely outside the agent pipeline: it only invokes
  * the provider-neutral `ScmMergeProvider` (`src/scm/merge.ts`) under the
@@ -41,7 +54,6 @@ import {
 	completeDispatch,
 	type DispatchOutcome,
 	type DispatchRow,
-	failDispatch,
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { updateReviewMergeOutcome } from '../db/repositories/runsRepository.js';
@@ -65,13 +77,28 @@ import {
 	refreshReviewDispatchClaim,
 } from '../triggers/review-dispatch-dedup.js';
 
-/** Terminal outcome recorded once the bounded retry budget is spent without merging. */
+/**
+ * Terminal outcome recorded once the bounded retry budget is spent while the
+ * pull request itself never became ready.
+ */
 export const MERGE_RETRY_EXHAUSTED = 'retry-exhausted' as const;
+
+/**
+ * Terminal outcome recorded once that *same* bounded budget is spent against a
+ * source-control provider that kept failing (issue #923). Distinct from
+ * {@link MERGE_RETRY_EXHAUSTED} on purpose: run history has to tell "the forge
+ * kept failing" apart from a refusal SWARM decided on its own, and both
+ * complete the dispatch through the one `merge-retry-exhausted` outcome — the
+ * same "same dispatch outcome, distinguishable run outcome" split issue #874
+ * settled on for `stale-base`.
+ */
+export const MERGE_PROVIDER_ERROR_EXHAUSTED = 'provider-error-exhausted' as const;
 
 /** Every value the `runs.review_merge_outcome` column can hold. */
 export type ReviewMergeOutcomeStatus =
 	| MergePullRequestOutcome['status']
-	| typeof MERGE_RETRY_EXHAUSTED;
+	| typeof MERGE_RETRY_EXHAUSTED
+	| typeof MERGE_PROVIDER_ERROR_EXHAUSTED;
 
 /**
  * Bounded backoff, coded constants — merge retry policy is intentionally not
@@ -206,6 +233,52 @@ const TERMINAL_MERGE_OUTCOMES: Partial<Record<MergePullRequestOutcome['status'],
 		'policy-blocked': 'merge-policy-blocked',
 		unsupported: 'merge-unsupported',
 	};
+
+/**
+ * Map a *retryable* outcome onto the run outcome recorded once its bounded
+ * budget is spent — the counterpart of {@link TERMINAL_MERGE_OUTCOMES}, so the
+ * whole settlement policy reads as one pair of tables.
+ *
+ * `provider-error` belongs here (issue #923) because every refusal an adapter
+ * can *name* already leaves through a terminal status of its own — GitHub's
+ * `classifyDirectMergeError` routes 403 to `policy-blocked`, 405/409 to
+ * `not-ready`, a required merge queue to `unsupported` — so what reaches this
+ * module as `provider-error` is the residue: 5xx, transport failures, and the
+ * occasional unusable credential. That residue is exactly as retryable as
+ * `not-ready`, and it was getting one attempt instead of seven.
+ *
+ * What still settles a genuinely non-retryable provider error terminally is the
+ * *bound*, not a predicate: sniffing HTTP status or message text here would put
+ * provider-specific shapes into shared worker code (`ai/RULES.md` §2), and the
+ * honest place for that split is the adapters' own classifiers. A permanently
+ * broken credential therefore costs the budget and then settles as
+ * {@link MERGE_PROVIDER_ERROR_EXHAUSTED}, carrying the provider's own last
+ * message — and the *first* failed attempt already persists `provider-error`
+ * onto the Review run, so the dashboard names the reason from second one.
+ */
+const RETRYABLE_MERGE_OUTCOMES = {
+	'not-ready': MERGE_RETRY_EXHAUSTED,
+	'provider-error': MERGE_PROVIDER_ERROR_EXHAUSTED,
+} as const satisfies Partial<Record<MergePullRequestOutcome['status'], ReviewMergeOutcomeStatus>>;
+
+/** The exhaustion outcome for a retryable status, or `undefined` when it is terminal. */
+function retryableExhaustion(
+	status: MergePullRequestOutcome['status'],
+): ReviewMergeOutcomeStatus | undefined {
+	return (RETRYABLE_MERGE_OUTCOMES as Partial<Record<string, ReviewMergeOutcomeStatus>>)[status];
+}
+
+/**
+ * What the Review run records once the budget is spent. The `not-ready` wording
+ * is unchanged byte-for-byte — it is already in run history — while the
+ * provider-error one names the forge, the attempts spent, and the provider's own
+ * last error, which is the only place that detail would otherwise be lost.
+ */
+function exhaustionMessage(exhaustion: ReviewMergeOutcomeStatus, lastMessage: string): string {
+	return exhaustion === MERGE_PROVIDER_ERROR_EXHAUSTED
+		? `Merge automation gave up after ${MAX_MERGE_RETRIES + 1} attempts against a source-control provider that kept failing; the pull request is approved but was left open for a manual merge. Last provider error: ${lastMessage}`
+		: 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
+}
 
 /**
  * Persist an attempt's outcome onto the Review run row — best-effort, logged.
@@ -434,11 +507,14 @@ async function scheduleMergeRetry(
 
 /**
  * What the `stale-base` branch decided: either the dispatch is settled, or the
- * attempt should carry on down the ordinary `not-ready` backoff.
+ * attempt carries on down the ordinary bounded backoff with the outcome handed
+ * back here — which is how the update call's own `provider-error` reaches the
+ * same shared budget as the merge call's (issue #923) rather than adding a
+ * second policy.
  */
 type StaleBaseReaction =
 	| { kind: 'settled'; outcome: MergeAutomationSettledOutcome }
-	| { kind: 'not-ready'; message: string };
+	| { kind: 'retry'; outcome: MergePullRequestOutcome };
 
 /**
  * React to a head that is behind its base: bring it up to date, re-pin the
@@ -533,7 +609,13 @@ async function reactToStaleBase(
 		// A race: something advanced the branch between the merge attempt that
 		// reported `stale-base` and this call. Nothing to settle — the ordinary
 		// backoff re-reads and merges.
-		return { kind: 'not-ready', message: `${staleMessage}, but it is already up to date now` };
+		return {
+			kind: 'retry',
+			outcome: {
+				status: 'not-ready',
+				message: `${staleMessage}, but it is already up to date now`,
+			},
+		};
 	}
 
 	if (update.status === 'head-moved') {
@@ -604,15 +686,18 @@ async function reactToStaleBase(
 		return settle('unsupported');
 	}
 
-	await persistMergeOutcome(job, 'provider-error', update.message, attempt);
-	logger.error('Merge automation: provider failure while updating the head', {
-		dispatchId: dispatch.id,
-		runId: job.reviewRunId,
-		prNumber: job.prNumber,
-		message: update.message,
-	});
-	await failDispatch(dispatch.id, update.message);
-	return settle('provider-error');
+	// The same transient class the merge call itself can meet, in the same
+	// dispatch during the same merge — so it is handed back to the one shared
+	// bounded budget instead of stranding the pull request here. Which call
+	// failed travels in the message, preserving the diagnostic the removed
+	// `logger.error` carried without logging the same failure twice.
+	return {
+		kind: 'retry',
+		outcome: {
+			status: 'provider-error',
+			message: `failed to bring the head up to date with the base: ${update.message}`,
+		},
+	};
 }
 
 /** What one merge attempt came back with, before any of it is settled. */
@@ -684,10 +769,12 @@ async function attemptMerge(
  * Execute one claimed merge-automation dispatch: invoke the provider-neutral
  * merge capability (fresh PR state and approval re-checked from scratch),
  * persist the outcome on the originating Review run, and settle the dispatch —
- * `completed` for a merge or a terminal functional refusal, `failed` for an
- * unexpected provider failure, or `retry-scheduled` (bounded, doubling
- * backoff) while the PR is transiently `not-ready` or while the head this
- * dispatch itself brought up to date is still being verified (issue #874).
+ * `completed` for a merge or a terminal functional refusal, or
+ * `retry-scheduled` (bounded, doubling backoff) while the PR is transiently
+ * `not-ready`, while the provider is failing (issue #923), or while the head
+ * this dispatch itself brought up to date is still being verified (issue #874).
+ * Never `failed`: a spent budget completes as `merge-retry-exhausted` with the
+ * reason on the Review run.
  */
 export async function processMergeAutomationDispatch(
 	dispatch: DispatchRow,
@@ -741,15 +828,17 @@ export async function processMergeAutomationDispatch(
 			capabilities,
 		);
 		if (reaction.kind === 'settled') return reaction.outcome;
-		outcome = { status: 'not-ready', message: reaction.message };
+		outcome = reaction.outcome;
 	}
 
-	// A `not-ready` is persisted inside its branch below — but only when a retry
-	// is actually scheduled. On the attempt that spends the budget it would be
-	// immediately overwritten by `retry-exhausted`, so we skip the fleeting write
-	// and let that branch record the terminal outcome directly. Every other status
-	// is terminal here, so persist it once now.
-	if (outcome.status !== 'not-ready') {
+	const retryExhaustion = retryableExhaustion(outcome.status);
+
+	// A retryable outcome is persisted inside its branch below — but only when a
+	// retry is actually scheduled. On the attempt that spends the budget it would
+	// be immediately overwritten by the exhaustion status, so we skip the fleeting
+	// write and let that branch record the terminal outcome directly. Every other
+	// status is terminal here, so persist it once now.
+	if (!retryExhaustion) {
 		await persistMergeOutcome(job, outcome.status, outcome.message, attempt);
 	}
 
@@ -764,52 +853,50 @@ export async function processMergeAutomationDispatch(
 		return { status: 'merge-automation-settled', result: 'merged', prNumber: job.prNumber };
 	}
 
-	if (outcome.status === 'not-ready') {
+	if (retryExhaustion) {
 		const nextAttempt = attempt + 1;
 		if (nextAttempt > MAX_MERGE_RETRIES) {
 			await persistMergeOutcome(
 				job,
-				MERGE_RETRY_EXHAUSTED,
-				'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.',
+				retryExhaustion,
+				exhaustionMessage(retryExhaustion, outcome.message),
 				attempt,
 			);
 			logger.warn('Merge automation: retry budget exhausted, leaving the PR open', {
 				dispatchId: dispatch.id,
 				runId: job.reviewRunId,
 				prNumber: job.prNumber,
+				outcome: retryExhaustion,
+				reason: outcome.message,
 			});
 			await completeDispatch(dispatch.id, 'merge-retry-exhausted');
 			return {
 				status: 'merge-automation-settled',
-				result: MERGE_RETRY_EXHAUSTED,
+				result: retryExhaustion,
 				prNumber: job.prNumber,
 			};
 		}
-		await persistMergeOutcome(job, 'not-ready', outcome.message, attempt);
+		await persistMergeOutcome(job, outcome.status, outcome.message, attempt);
 		await scheduleMergeRetry(dispatch.id, job, nextAttempt, mergeRetryDelayMs(nextAttempt));
-		logger.info('Merge automation: pull request not ready — retry scheduled', {
+		const scheduled = {
 			dispatchId: dispatch.id,
 			runId: job.reviewRunId,
 			prNumber: job.prNumber,
 			attempt: nextAttempt,
 			reason: outcome.message,
-		});
+		};
+		// A failing forge keeps the severity its terminal settle used to carry;
+		// a pull request that is simply not ready yet is ordinary progress.
+		if (outcome.status === 'provider-error') {
+			logger.error('Merge automation: provider failure — retry scheduled', scheduled);
+		} else {
+			logger.info('Merge automation: pull request not ready — retry scheduled', scheduled);
+		}
 		return {
 			status: 'merge-automation-settled',
 			result: 'retry-scheduled',
 			prNumber: job.prNumber,
 		};
-	}
-
-	if (outcome.status === 'provider-error') {
-		logger.error('Merge automation: provider failure', {
-			dispatchId: dispatch.id,
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			message: outcome.message,
-		});
-		await failDispatch(dispatch.id, outcome.message);
-		return { status: 'merge-automation-settled', result: 'provider-error', prNumber: job.prNumber };
 	}
 
 	logger.warn('Merge automation: terminal non-merge outcome', {

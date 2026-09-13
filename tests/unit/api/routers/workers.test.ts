@@ -167,6 +167,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
+		build: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,

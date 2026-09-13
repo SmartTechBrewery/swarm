@@ -452,6 +452,7 @@ describe('runsRouter', () => {
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 					repository: null,
 					drainingSince: null,
+					build: null,
 					createdAt: new Date(0),
 					updatedAt: new Date(0),
 				},
@@ -1268,6 +1269,7 @@ describe('runsRouter', () => {
 				supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 				repository: null,
 				drainingSince: null,
+				build: null,
 				createdAt: new Date(0),
 				updatedAt: new Date(0),
 			};

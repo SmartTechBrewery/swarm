@@ -1,6 +1,6 @@
 {
-  "id": "c4d4387c-ea38-4c45-bf01-1a4126b2283d",
-  "prevId": "9d2335c3-976a-4665-b4c9-588a7e937982",
+  "id": "0a044cf6-a47c-4e3c-84bf-cd5772f9985b",
+  "prevId": "c4d4387c-ea38-4c45-bf01-1a4126b2283d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2124,6 +2124,12 @@
         "repository": {
           "name": "repository",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "draining_since": {
+          "name": "draining_since",
+          "type": "timestamp",
           "primaryKey": false,
           "notNull": false
         },

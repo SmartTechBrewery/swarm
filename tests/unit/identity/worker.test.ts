@@ -22,6 +22,7 @@ const validWorker = {
 	// In the pool (issue #919) — nullable, not optional, for the same reason
 	// `repository` is: no reader gets an "absent" case to interpret.
 	drainingSince: null,
+	build: null,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };
@@ -114,6 +115,29 @@ describe('WorkerSchema', () => {
 				...validWorker,
 				repository: 'https://github.com/SmartTechBrewery/swarm',
 			}).success,
+		).toBe(false);
+	});
+
+	// Issue #918 — the daemon-declared build. Nullable on the same terms, and one
+	// value rather than two fields so a reader cannot take the commit without the flag.
+	it('accepts a declared build and normalises the commit to lower-case hex', () => {
+		expect(
+			WorkerSchema.parse({
+				...validWorker,
+				build: { commit: '9F3A1B2C4D5E6F70819A2B3C4D5E6F7081920A3B', dirty: false },
+			}),
+		).toEqual({
+			...validWorker,
+			build: { commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: false },
+		});
+	});
+
+	it('rejects an omitted build, and a commit that is not hex', () => {
+		const { build, ...withoutBuild } = validWorker;
+		expect(WorkerSchema.safeParse(withoutBuild).success).toBe(false);
+		expect(
+			WorkerSchema.safeParse({ ...validWorker, build: { commit: 'nothex!', dirty: false } })
+				.success,
 		).toBe(false);
 	});
 

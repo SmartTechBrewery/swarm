@@ -36,6 +36,7 @@ import {
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } from '../../identity/worker.js';
+import type { WorkerBuild } from '../../lib/build-identity.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
@@ -79,6 +80,10 @@ function rowToWorker(row: WorkerRow): Worker {
 		supportedPhases: row.supportedPhases as TriggerPhase[],
 		repository: row.repository ?? null,
 		drainingSince: row.drainingSince ?? null,
+		// Reassembled as one value so a consumer cannot read a commit without its flag
+		// (issue #918). The pair is always written together, so a non-null commit with a
+		// null flag can only be a row hand-edited in `psql`; read that as not dirty.
+		build: row.buildCommit ? { commit: row.buildCommit, dirty: row.buildDirty ?? false } : null,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -112,6 +117,9 @@ export async function createWorker(input: CreateWorkerInput): Promise<Worker> {
 			// registering a worker is not declaring a checkout. An operator registers a
 			// machine from wherever they happen to be, and only the daemon that connects
 			// can state which repository the machine actually holds.
+			//
+			// `buildCommit`/`buildDirty` likewise (issue #918): registering a machine is
+			// not declaring a build, and only the program that connects knows its own.
 			credentialHash: input.credentialHash,
 		})
 		.returning();
@@ -211,6 +219,11 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * currently operating it, and a stale-but-wrong checkout is worse than an absent
  * one.
  *
+ * `build` (issue #918) is the SWARM build that daemon is running, written in the
+ * same transaction on the same three-valued rule — with the one divergence that it
+ * spans **two** columns: `null` sets both `build_commit` and `build_dirty` to null,
+ * and a value writes both, so the pair is never half-set.
+ *
  * Note the asymmetry with the CLI check above: phases are deliberately *not*
  * validated against enrollments, even though an enrollment does now constrain them
  * (`allowedPhases`, issue #509). The two constraints are maintained differently on
@@ -248,6 +261,7 @@ export async function updateWorkerCapabilities(
 	capabilities: AgentCli[],
 	supportedPhases?: TriggerPhase[],
 	repository?: string | null,
+	build?: WorkerBuild | null,
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -282,6 +296,10 @@ export async function updateWorkerCapabilities(
 		const declaration: Partial<typeof workers.$inferInsert> = { capabilities };
 		if (supportedPhases) declaration.supportedPhases = supportedPhases;
 		if (repository !== undefined) declaration.repository = repository;
+		if (build !== undefined) {
+			declaration.buildCommit = build?.commit ?? null;
+			declaration.buildDirty = build?.dirty ?? null;
+		}
 
 		const [updatedRow] = await tx
 			.update(workers)

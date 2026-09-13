@@ -214,6 +214,35 @@ describe('buildHandshakeRequest', () => {
 		expect(request).not.toHaveProperty('repository');
 	});
 
+	// Issue #918 — the SWARM build this daemon runs, carried and omitted on exactly the
+	// same terms, so a daemon whose install root is not a git checkout sends the request
+	// a daemon predating the field does. The whole-object `toEqual` above is the
+	// compatibility proof: it passes unchanged.
+	it('carries the declared build', () => {
+		const build = { commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true };
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			build,
+		});
+		expect(request.build).toEqual(build);
+	});
+
+	it('omits the build key entirely when the install root could not be read', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			build: undefined,
+		});
+		expect(request).not.toHaveProperty('build');
+	});
+
 	it('rejects an empty capability set (the protocol requires at least one CLI)', () => {
 		expect(() =>
 			buildHandshakeRequest({

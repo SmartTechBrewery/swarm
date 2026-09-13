@@ -62,6 +62,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		drainingSince: null,
+		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -148,11 +149,13 @@ describe('refreshWorkerCapabilities', () => {
 		// No phases passed through: the caller declared none, so the stored repertoire is
 		// left untouched rather than reset to the every-phase default (issue #467) — the
 		// `swarm workers set-cli` path, which knows nothing about phases.
-		// The fourth argument is `undefined` for the same reason (issue #687): a caller
-		// that knows nothing about checkouts must not clear the stored declaration.
+		// The fourth and fifth arguments are `undefined` for the same reason (issues #687
+		// and #918): a caller that knows nothing about checkouts or builds must not clear
+		// a declaration it cannot make.
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['codex'],
+			undefined,
 			undefined,
 			undefined,
 		);
@@ -174,6 +177,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			['implementation', 'review'],
+			undefined,
 			undefined,
 		);
 	});
@@ -197,6 +201,7 @@ describe('refreshWorkerCapabilities', () => {
 			['claude'],
 			undefined,
 			'smarttechbrewery/swarm',
+			undefined,
 		);
 	});
 
@@ -207,12 +212,62 @@ describe('refreshWorkerCapabilities', () => {
 
 		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null);
 
-		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['claude'], undefined, null);
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			undefined,
+		);
 	});
 
 	it('rejects a malformed repository without hitting the repository layer', async () => {
 		await expect(
 			refreshWorkerCapabilities('worker-1', ['claude'], undefined, 'not-a-slug'),
+		).rejects.toThrow();
+		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	// Issue #918 — the daemon's build declaration, three-valued at this seam for the
+	// same reason, and validated here so the service is a boundary too.
+	it('validates and forwards a declared build, normalised', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, {
+			commit: '9F3A1B2C4D5E6F70819A2B3C4D5E6F7081920A3B',
+			dirty: false,
+		});
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['claude'], undefined, null, {
+			commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b',
+			dirty: false,
+		});
+	});
+
+	it('forwards a null build unchanged, which clears an earlier daemon’s build', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, null);
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			null,
+		);
+	});
+
+	it('rejects a malformed build without hitting the repository layer', async () => {
+		await expect(
+			refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, {
+				commit: 'not-a-commit',
+				dirty: false,
+			}),
 		).rejects.toThrow();
 		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
 	});

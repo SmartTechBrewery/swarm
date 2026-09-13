@@ -127,9 +127,12 @@ export const runs = pgTable(
 		 * (`src/scm/merge.ts`; written by the durable merge dispatch,
 		 * `src/worker/merge-automation.ts`, issue #292) — one of
 		 * `MergePullRequestOutcome['status']` (`merged`/`not-ready`/`not-eligible`/
-		 * `policy-blocked`/`unsupported`/`provider-error`) or `retry-exhausted`
-		 * once the dispatch's bounded retry budget is spent while still
-		 * `not-ready`. Nullable: only a Review run whose verdict was `approve`
+		 * `policy-blocked`/`unsupported`/`provider-error`) or one of the two
+		 * budget exhaustions — `retry-exhausted` once the dispatch's bounded retry
+		 * budget is spent while still `not-ready`, `provider-error-exhausted` once it
+		 * is spent against a provider that kept failing (issue #923). A bare
+		 * `provider-error` is a *transient* record since then: an attempt failed and a
+		 * retry is scheduled. Nullable: only a Review run whose verdict was `approve`
 		 * with merge automation enabled ever sets it. Cleared on a retry
 		 * alongside `reviewVerdict`.
 		 */

@@ -29,6 +29,7 @@
 
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../harness/agent-cli.js';
+import { WorkerBuildSchema } from '../lib/build-identity.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase, TriggerPhaseSchema } from '../triggers/types.js';
 
@@ -105,6 +106,19 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * gate refuses a draining worker before it even looks at connectivity, and nothing
  * the machine does — reconnecting included — clears it; only an operator does.
  *
+ * `build` is the **fourth** self-declared fact (issue #918), and the second that is
+ * not a capability: the commit the daemon's SWARM *install root* is on, plus a flag
+ * for a dirty or unbuilt checkout (`WorkerBuildSchema`, `../lib/build-identity.ts`),
+ * re-declared on every reconnect. It is what `daemonVersion` cannot answer — that
+ * resolves to `package.json`'s `version`, which never moves — so this is the only
+ * way to tell from the control plane whether a worker is running a given fix. Note
+ * that the install root is *not* the machine's `repository` above: one npm-linked
+ * SWARM checkout can serve daemons each working in a different project repository.
+ * `null` means no declaration: a worker registered but never connected, a daemon too
+ * old to send the field, or an install root that is not a git checkout. Trusted
+ * exactly as the other declarations are — it guards against operator error (a stale
+ * daemon), not against an attacker.
+ *
  * The CLI axis is **three** fields since issue #783, because the one field used to
  * collapse two facts that overwrite each other. `probedCapabilities` is the raw
  * `workers.capabilities` column — what the daemon currently operating the row last
@@ -139,6 +153,7 @@ export const WorkerSchema = z.object({
 	 * capability nor daemon-declared.
 	 */
 	drainingSince: z.date().nullable(),
+	build: WorkerBuildSchema.nullable(),
 	createdAt: z.date(),
 	updatedAt: z.date(),
 });

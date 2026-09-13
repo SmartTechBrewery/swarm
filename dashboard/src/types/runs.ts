@@ -448,8 +448,11 @@ export interface RunRow {
 	 * Provider-neutral merge-automation outcome for a completed Review run's
 	 * `approve` verdict (issue #278): one of `merged`/`not-ready`/
 	 * `not-eligible`/`policy-blocked`/`unsupported`/`provider-error`/
-	 * `retry-exhausted`. Null when merge automation never ran (disabled, or the
-	 * verdict wasn't an approval) and for pre-existing rows.
+	 * `retry-exhausted`/`provider-error-exhausted`. `provider-error` is transient
+	 * since issue #923 — an attempt failed and a retry is scheduled — while
+	 * `provider-error-exhausted` is the terminal "the forge kept failing". Null
+	 * when merge automation never ran (disabled, or the verdict wasn't an
+	 * approval) and for pre-existing rows.
 	 */
 	reviewMergeOutcome: string | null;
 	/** Human-readable detail for `reviewMergeOutcome`; null alongside it. */

@@ -58,6 +58,7 @@ import { fileURLToPath } from 'node:url';
 // connects to neither.
 import '../integrations/entrypoint.js';
 import { resolveAgentContainment } from '../harness/containment.js';
+import { resolveOwnBuildIdentity } from '../lib/build-identity.js';
 import { optionalEnv, requireEnv, resolveWorkerRepoRoot } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { addFileSink, configureLogger, logger } from '../lib/logger.js';
@@ -194,6 +195,12 @@ async function main(): Promise<void> {
 	// would only invite the two answers to differ. A checkout with no identifiable
 	// `origin` resolves to `undefined` and declares nothing rather than failing startup.
 	const repository = await resolveDeclarableOriginRepoSlug(repoRoot);
+	// Which SWARM build this daemon is actually running (issue #918) — the commit of
+	// the *install root*, which is anchored on this module's own path and is not
+	// `repoRoot`: one npm-linked checkout serves daemons whose `cwd` is a different
+	// project repository each. Resolved once at startup for the same reason as the
+	// repository above, and `undefined` when the install root is not a git checkout.
+	const build = await resolveOwnBuildIdentity();
 	// Same reason: a typo in SWARM_AGENT_CONTAINMENT should fail this daemon at
 	// startup, not once per dispatched phase (issue #614). The resolved value is
 	// not held — `runAgentCli` reads it per run — this is validation only, and
@@ -233,6 +240,7 @@ async function main(): Promise<void> {
 		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
 		supportedPhases,
 		repository,
+		build,
 		hostname: host,
 		daemonVersion: resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {
@@ -284,6 +292,9 @@ async function main(): Promise<void> {
 		// declaration, since the logger drops an undefined field and "nothing declared" is
 		// precisely what an operator debugging a later phase's refusal needs to see.
 		repository: repository ?? null,
+		// Explicitly null for the same reason, and the field an operator reads first when
+		// asking whether this daemon carries a fix (issue #918).
+		build: build ?? null,
 	});
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session
