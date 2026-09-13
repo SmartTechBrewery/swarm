@@ -357,6 +357,24 @@ describe('createWebhookApp', () => {
 			expect(errorSpy).toHaveBeenCalled();
 			errorSpy.mockRestore();
 		});
+
+		it('still identifies an error whose message is empty', async () => {
+			// The 2026-09-13 shape: the message said nothing, so the log said nothing.
+			// A name and a stack survive an empty message; assert we record them.
+			const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+			const nameless = new Error('');
+			nameless.name = 'HttpError';
+			const { app } = makeApp({
+				enqueue: vi.fn<WebhookReceiverDeps['enqueue']>().mockRejectedValue(nameless),
+			});
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(500);
+			const logged = errorSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+			expect(logged.errorName).toBe('HttpError');
+			expect(logged.stack).toContain('HttpError');
+			errorSpy.mockRestore();
+		});
 	});
 
 	// GitHub delivers `projects_v2_item` to the same URL and secret as its SCM

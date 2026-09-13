@@ -80,6 +80,7 @@ import {
 	type SCMProviderManifest,
 } from '../integrations/scm/manifest.js';
 import { listSCMProviders } from '../integrations/scm/registry.js';
+import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { PmEvent } from '../pm/events.js';
 import { resolveCardRepository } from '../pm/repository-routing.js';
@@ -589,10 +590,18 @@ export function createWebhookApp(overrides: Partial<WebhookReceiverDeps> = {}): 
 	// right behavior for a transient collaborator failure. Mirrors Cascade's
 	// `app.onError` in `src/router/index.ts`.
 	app.onError((err, c) => {
+		// Log the cause chain, the error's own name, and the stack — not `err.message`
+		// alone. An `Error` whose message is the empty string is not hypothetical: on
+		// 2026-09-13 one made every failing `POST /worker/delivery/review` log
+		// `"error": ""`, so ten review deliveries deferred over an hour with nothing
+		// in the record to say why, and the cause could not be recovered afterwards.
+		// A message can be empty; a name and a stack cannot.
 		logger.error('Unhandled error in webhook receiver', {
 			path: c.req.path,
 			method: c.req.method,
-			error: err instanceof Error ? err.message : String(err),
+			error: describeError(err),
+			errorName: err instanceof Error ? err.name : typeof err,
+			stack: err instanceof Error ? err.stack : undefined,
 		});
 		return c.json({ ok: false, reason: 'internal error' }, 500);
 	});
