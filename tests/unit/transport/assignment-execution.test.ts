@@ -1396,6 +1396,31 @@ describe('cancelling an in-flight assignment', () => {
 		expect(result.retryDelayMs).toBeUndefined();
 	});
 
+	it('never runs the phase for an assignment cancelled before it started (issue #912)', async () => {
+		// The `Cancelling a just-pushed assignment` path: the router re-reads the
+		// cancellation marker straight after pushing, and `trackAssignment` runs before
+		// the executor's first `await`, so the cancel lands while the plumbing is still
+		// being resolved. Aborting the controller alone was not enough — the signal only
+		// reaches the agent subprocess, so the phase still did its pre-agent work,
+		// including the board pickup that stranded the card in the phase's column.
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+		const frame = ciAssignment();
+		const run = runAssignmentDbFree(frame, sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
+		expect(cancelAssignment(frame.dispatchId)).toBe(true);
+		await run;
+
+		expect(runPhase).not.toHaveBeenCalled();
+		// Never claimed to be running it, either.
+		expect(sink.sent).not.toContainEqual(expect.objectContaining({ state: 'running' }));
+		expect(sink.sent.at(-1)).toMatchObject({
+			type: 'task-execution-result',
+			status: 'failed',
+			cancelled: true,
+			dispatchId: frame.dispatchId,
+		});
+	});
+
 	it('is a no-op for a dispatch this worker is not running', () => {
 		expect(cancelAssignment(UNKNOWN_DISPATCH_ID)).toBe(false);
 	});

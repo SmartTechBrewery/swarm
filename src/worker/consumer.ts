@@ -4409,7 +4409,30 @@ export async function processJob(
 
 		// Make this run cancellable by id and honour a cancellation that already
 		// landed (a deferred run terminated as its retry was dequeued).
-		await beginRunCancellationTracking(runId, runAbort);
+		//
+		// A cancellation found here means the run must not start at all (issue #912).
+		// Handing the executor an already-aborted signal — which is what this used to
+		// do — still pushed the assignment, and the phase then did everything that
+		// precedes spawning the agent, including reporting its board pickup: the card
+		// landed in the phase's column seconds *after* the dispatch had settled
+		// `phase-failed`/`cancelled`, with no run left to move it out again and no
+		// dependency recheck to notice (the card's status already matched the phase).
+		// So refuse before `executePhase` instead. The settlement is unchanged —
+		// `handlePhaseFailure`'s first branch turns this into the same terminal
+		// user-termination outcome the marker check below produces — only the work
+		// that outlives it is gone. The *returned* flag is the test, not
+		// `runAbort.signal.aborted`: the controller is also linked to the process's
+		// shutdown signal, which must keep deferring.
+		if (await beginRunCancellationTracking(runId, runAbort)) {
+			logger.info('Refusing to start a phase whose run was already cancelled', {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				phase: trigger.phase,
+				taskId: trigger.taskId,
+				runId,
+			});
+			throw new RunTerminatedError(RUN_CANCELLED_MESSAGE);
+		}
 
 		// Run the resolved phase — the control-plane transport executor pushes a
 		// `TaskAssignment` to the selected worker and awaits its result (issue #407).

@@ -953,7 +953,10 @@ export async function runAssignmentDbFree(
 
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
 	// Registered synchronously, before the first await, so a `task-cancel` pushed
-	// straight after the assignment can never arrive ahead of the registration.
+	// straight after the assignment can never arrive ahead of the registration. The
+	// cancel it records is honoured twice: by the pre-phase refusal below, which
+	// stops the run before any of the phase's pre-agent work (issue #912), and by the
+	// controller, which kills an agent already spawned.
 	trackAssignment(dispatchId, controller);
 	// Resolved as soon as the project is, so the failure path below can read the Tier 2
 	// checkpoint out of this host's checkout (issue #503). Still unset for a failure
@@ -1060,6 +1063,33 @@ export async function runAssignmentDbFree(
 			workerCredential: options.workerCredential,
 			fetchImpl: deps.fetchImpl,
 		};
+
+		// A `task-cancel` that landed while the plumbing above was being resolved kills
+		// the run before it does anything, so don't enter the phase (issue #912).
+		// Aborting the controller alone was not enough: the signal only ever reaches
+		// the agent subprocess, so everything the phase does *before* spawning it —
+		// the dependency gate, the "In progress" board pickup — still ran, and that
+		// pickup left the card in the phase's column with no run behind it. This is
+		// the `Cancelling a just-pushed assignment` path in particular: the router
+		// re-reads the marker straight after the push, and `trackAssignment` above runs
+		// before the first `await`, so the cancel is already recorded by the time we
+		// get here.
+		//
+		// `isAssignmentCancelled` rather than `controller.signal.aborted`, the mirror
+		// of the control plane's test: the controller is also linked to
+		// `options.shutdownSignal`, and a shutdown abort must keep deferring. The frame
+		// is the one `settleAssignmentFailure` sends for an in-flight cancel, so the
+		// control plane settles it through exactly the same path.
+		if (isAssignmentCancelled(dispatchId)) {
+			deps.logger.info('refusing to start an assignment already cancelled', {
+				dispatchId,
+				runId,
+				phase,
+				taskId,
+			});
+			sink.send(cancelledResult(assignment));
+			return;
+		}
 
 		sink.send({ type: 'task-progress', dispatchId, runId, phase, taskId, state: 'running' });
 

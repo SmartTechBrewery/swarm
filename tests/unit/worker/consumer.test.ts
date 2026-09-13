@@ -593,6 +593,16 @@ vi.mock('@/queue/cancellation.js', () => ({
 	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
 }));
 
+/**
+ * Record the cancellation *after* the run started: `processJob`'s pre-start check
+ * must find nothing (or it refuses to dispatch the phase at all — issue #912), and
+ * every read after it finds the marker. This is the mid-flight termination the
+ * cases below are about, as opposed to a marker already present at pickup.
+ */
+function cancelAfterStart(): void {
+	isRunCancellationRequested.mockResolvedValueOnce(false).mockResolvedValue(true);
+}
+
 const registerRunController = vi.fn<(runId: string, controller: AbortController) => void>();
 const unregisterRunController = vi.fn<(runId: string) => void>();
 const linkRunAbortController = vi.fn((signal?: AbortSignal) => {
@@ -608,11 +618,13 @@ const linkRunAbortController = vi.fn((signal?: AbortSignal) => {
 	};
 });
 const beginRunCancellationTracking = vi.fn(async (runId?: string, controller?: AbortController) => {
-	if (!runId || !controller) return;
+	if (!runId || !controller) return false;
 	registerRunController(runId, controller);
 	if (await isRunCancellationRequested(runId)) {
 		controller.abort();
+		return true;
 	}
+	return false;
 });
 
 vi.mock('@/worker/run-cancellation.js', () => ({
@@ -623,7 +635,8 @@ vi.mock('@/worker/run-cancellation.js', () => ({
 	beginRunCancellationTracking: (runId?: string, controller?: AbortController) =>
 		beginRunCancellationTracking(runId, controller),
 	// Real class so `handlePhaseFailure`'s `instanceof RunTerminatedError` guard is
-	// a valid constructor check (the in-process path never throws it).
+	// a valid constructor check — and so `processJob`'s own pre-start cancellation
+	// refusal (issue #912) settles through that branch.
 	RunTerminatedError: class RunTerminatedError extends Error {},
 }));
 
@@ -3685,7 +3698,7 @@ describe('processJob', () => {
 		// A cancellation was requested: an aborted run that would normally defer must
 		// instead fail terminally with the neutral cancellation reason (issue #166,
 		// #305), flagged structurally rather than by comparing the error string.
-		isRunCancellationRequested.mockResolvedValue(true);
+		cancelAfterStart();
 		phaseImpl = async () => {
 			throw new AgentRunError('Review agent (claude) exited with code 143 (aborted)', {
 				kind: 'aborted',
@@ -3724,7 +3737,7 @@ describe('processJob', () => {
 	});
 
 	it('persists a recorded cancellation origin on the failed run (issue #308)', async () => {
-		isRunCancellationRequested.mockResolvedValue(true);
+		cancelAfterStart();
 		const origin: CancellationOrigin = {
 			source: 'dashboard',
 			requestedAt: '2026-07-19T00:00:00.000Z',
@@ -3749,7 +3762,7 @@ describe('processJob', () => {
 	});
 
 	it('reconciles a terminated run’s checkout and cleans it when there is no session (issue #361)', async () => {
-		isRunCancellationRequested.mockResolvedValue(true);
+		cancelAfterStart();
 		reconcileTerminatedWorktree.mockResolvedValue({ outcome: 'removed' });
 		phaseImpl = async () => {
 			throw new AgentRunError('Review agent (claude) exited with code 143 (aborted)', {
@@ -3776,7 +3789,7 @@ describe('processJob', () => {
 	});
 
 	it('preserves a terminated run’s checkout and session when reconciliation preserves it (issue #361)', async () => {
-		isRunCancellationRequested.mockResolvedValue(true);
+		cancelAfterStart();
 		getRunByIdFromDb.mockResolvedValue({ agentSessionId: 'sess-live' });
 		reconcileTerminatedWorktree.mockResolvedValue({
 			outcome: 'preserved',
@@ -3801,7 +3814,7 @@ describe('processJob', () => {
 	});
 
 	it('records a blocked recovery reason when protected work cannot be removed (issue #361)', async () => {
-		isRunCancellationRequested.mockResolvedValue(true);
+		cancelAfterStart();
 		reconcileTerminatedWorktree.mockResolvedValue({ outcome: 'blocked', blockedReason: 'dirty' });
 		phaseImpl = async () => {
 			throw new AgentRunError('Review agent (claude) exited with code 143 (aborted)', {
@@ -3821,20 +3834,31 @@ describe('processJob', () => {
 		);
 	});
 
-	it('aborts before running the agent when cancellation was requested at pickup', async () => {
+	it('never dispatches a phase whose cancellation was already recorded (issue #912)', async () => {
 		// A deferred run terminated in the window between its retry being dequeued and
-		// the phase starting: the start-check aborts the controller so the phase gets
-		// an already-aborted signal.
+		// the phase starting. This used to hand the phase an already-aborted signal and
+		// run it anyway — which pushed the assignment and let the phase report its
+		// board pickup, stranding the card in that phase's column with no run behind
+		// it. The phase must not be entered at all.
 		isRunCancellationRequested.mockResolvedValue(true);
-		let signalAborted = false;
-		phaseImpl = async (_phase, context) => {
-			signalAborted = context.signal.aborted;
-			return { agent: agentResult() };
-		};
 
-		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
-		expect(signalAborted).toBe(true);
+		expect(phaseCalls).toEqual([]);
+		// The settlement is unchanged from a cancellation observed mid-run.
+		expect(outcome).toMatchObject({
+			status: 'phase-failed',
+			phase: 'review',
+			taskId: '17',
+			error: 'Run cancelled after a cancellation request.',
+			failureDiagnosis: { kind: 'user-terminated' },
+			cancelled: true,
+		});
+		expect(cancelClaimedDispatch).toHaveBeenCalledWith(
+			expect.any(String),
+			'Run cancelled after a cancellation request.',
+		);
+		expect(failDispatch).not.toHaveBeenCalled();
 	});
 
 	it('terminally fails a blocked worktree collision without deferring, persisting the reason (issue #367)', async () => {

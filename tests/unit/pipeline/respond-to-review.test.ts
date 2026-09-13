@@ -668,6 +668,18 @@ describe('runRespondToReviewPhase', () => {
 			expect(result.movedTo).toBe('inReview');
 		});
 
+		it('does not report the In progress pickup for a run already aborted (issue #912)', async () => {
+			// Same guard as Implementation's pickup (issue #912): a card moved into this
+			// phase's column by a run that never worked on it is a card nothing moves
+			// out again.
+			const deps = makeDeps();
+			const pm = makePm();
+
+			await runRespondToReviewPhase({ ...deps, pm, signal: AbortSignal.abort() });
+
+			expect(pm.moveWorkItem).not.toHaveBeenCalledWith('ITEM_21', 'inProgress');
+		});
+
 		it('does not report to the board when no pm provider is injected', async () => {
 			const deps = makeDeps();
 			const result = await runRespondToReviewPhase(deps);

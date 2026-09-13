@@ -6,7 +6,8 @@
  * The registry serves the control plane's `processJob`: a cancellation the
  * operator recorded *before* the dispatch reached execution is caught by
  * {@link beginRunCancellationTracking}'s start-check against the durable Redis
- * set, which aborts the controller before an assignment is pushed. Delivering a
+ * set, which aborts the controller and reports the cancellation back so the
+ * phase is never entered and no assignment is pushed (issue #912). Delivering a
  * cancellation to a run already executing is the transport's job, not this map's
  * — `../router/dispatch-cancellation.ts` pushes a `task-cancel` frame to the
  * worker running it (issue #549), which is the only channel a worker with no
@@ -73,15 +74,23 @@ export function linkRunAbortController(signal?: AbortSignal): {
 /**
  * Register a run's abort controller and immediately abort if a user cancellation
  * was already requested (e.g. while the run was deferred).
+ *
+ * Returns whether it aborted *because of a cancellation* — which is the caller's
+ * test for "this run must not start" (issue #912), not `controller.signal.aborted`.
+ * The controller is also linked to the process's own shutdown signal
+ * ({@link linkRunAbortController}), so reading the raw signal would misclassify a
+ * shutdown abort — which still defers and re-runs — as a user termination.
  */
 export async function beginRunCancellationTracking(
 	runId: string | undefined,
 	controller: AbortController,
-): Promise<void> {
-	if (!runId) return;
+): Promise<boolean> {
+	if (!runId) return false;
 	registerRunController(runId, controller);
 	if (await isRunCancellationRequested(runId)) {
 		logger.info('Run cancellation requested before start, aborting immediately', { runId });
 		controller.abort();
+		return true;
 	}
+	return false;
 }
