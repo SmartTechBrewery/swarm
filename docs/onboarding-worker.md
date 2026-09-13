@@ -397,21 +397,13 @@ swarm workers undrain <worker-id>          # put it back in the pool
 **It is off unless this host opts in.** Set `SWARM_WORKER_SELF_UPDATE=true` in the
 same `.env` the daemon already reads and restart it; with the flag off the machine
 reports `declined` to any such request and carries on working, which is what every
-existing machine keeps doing. Two things have to be true of the host before you set
-it:
+existing machine keeps doing. One thing has to be true of the host before you set it:
 
 - **A process supervisor must be restarting the daemon.** On a successful update the
   daemon releases its session and exits 0; launchd `KeepAlive`
   ([`swarm-worker-agent`](./launchd-worker-autostart.md)) or systemd
   `Restart=always` is what brings it back on the new build. Without one, the machine
   simply stops.
-- **The install root must not be shared with another daemon.** That root is the SWARM
-  checkout this daemon's *own code* is loaded from — not `SWARM_WORKER_REPO_ROOT`,
-  which is the project checkout it works in. A host that runs several daemons from
-  one npm-linked SWARM checkout shares it between them, and an update would swap the
-  code under the others mid-phase. **Until the shared-install lock lands (issue #920
-  phase 4), such a host must not set the flag.** One daemon per install root is the
-  supported configuration for this feature.
 
 **Why the drain is required.** `swarm workers update` is refused unless the machine
 is already out of the dispatch pool, and names the drain as the remedy. The daemon
@@ -419,6 +411,30 @@ waits for the phases it is already running to finish before it applies anything 
 run is cancelled, deferred, or failed by an update — and draining is what stops new
 work arriving into that wait. Undraining is a separate step afterwards, on purpose:
 the machine stays out of the pool until you have read what it reported.
+
+**A host that runs several daemons from one SWARM checkout is supported (issue
+#935).** The install root is the SWARM checkout a daemon's *own code* is loaded from,
+which is not `SWARM_WORKER_REPO_ROOT` — that is the project checkout it works in — and
+on the control-plane host one npm-linked install root serves several daemons at once.
+Drain **every** worker on that machine, then update them, and read the reports:
+
+- The first daemon to act takes a machine-local lock on the install root and does the
+  fetch, the `npm ci` and the build. The others find it held, re-read the commit, and
+  report `already-current` once that build has landed — or `refused`, naming the
+  daemon that holds the lock, while it has not. Re-issuing after the first one has
+  reported is how a `refused` becomes an `already-current`.
+- An update is **refused outright while any other daemon on that machine is
+  mid-phase**, naming the worker to drain. Nothing is fetched or checked out, so a run
+  on a peer daemon never has its code swapped underneath it. Draining the peers is
+  what makes that check stable — it is a snapshot of the moment the update asked, and
+  nothing stops an undrained peer taking work a second later.
+- `already-current` means the **files** are on the target, not that the daemon
+  reporting it is *running* them — its modules were loaded at startup. Restart the
+  other daemons on that machine yourself once the first has applied; SWARM does not
+  drain or restart them for you, and `/workers` shows their old build until you do.
+- The lock is host-local and needs no cleanup: it is reclaimed once its holder's
+  process is gone (or its refresh has lapsed for 15 minutes), and every exit path
+  drops it.
 
 **The rollout order is the same one the #765 note above states, for the same reason:
 control plane first, workers after.** An older control plane does not serve the
@@ -494,7 +510,10 @@ will simply repeat the cycle; fix the build first.
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
-| `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon — but only if its SWARM install root is not shared with another daemon (see "Optional — let the control plane update this machine"). |
+| `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon (see "Optional — let the control plane update this machine"). |
+| `swarm workers list` shows `update <ref> refused` with "is already updating the SWARM install root" | Another daemon on that machine shares the install root and got there first (issue #935). Wait for *its* outcome, then re-issue this one: it will report `already-current` once that build has landed. Nothing was changed on this machine. |
+| `swarm workers list` shows `update <ref> refused` with "is running a phase from the SWARM install root" | A peer daemon on that machine is mid-phase, and updating would swap the code under its run. The message names the worker: `swarm workers drain <that-worker-id>`, wait for it to go idle, then re-issue. Nothing was fetched or checked out. |
+| Several daemons share one install root and only one of them came back on the new build | Expected: the others reported `already-current` because the *files* are on the target, but their own modules were loaded at startup. Restart them (their supervisor does it on a `SIGTERM`); `/workers` shows the new build once they reconnect. |
 | `swarm workers list` shows `update <ref> failed` | The install root could not be moved. The message beside it names the step (`git checkout`, `npm ci`, `npm run build`) and whether the checkout was returned to the build it was on; a failure that could **not** be rolled back leaves the machine on neither build and needs an operator on that host. |
 | A machine reports `update <ref> applied` but `/workers` shows its **old** build | It could not handshake on the new one and returned itself to its last known good build (issue #934) — three starts without once connecting, or a handshake the control plane rejected outright. Its log says which, on the line before `returned to the last known good SWARM build`. The build is what needs fixing; re-requesting the same ref repeats the cycle. |
 | A machine is down and its log says `returning to the last known good SWARM build failed` | The return could not be completed, so the install root is on neither build and needs an operator on that host: check out the commit the line names, then run `npm ci && npm run build` there. The daemon stays down on purpose rather than crash-looping; later starts retry the return, so fix the checkout rather than restarting the daemon at it. |

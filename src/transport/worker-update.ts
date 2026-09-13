@@ -7,11 +7,11 @@
  * "when", and it is three refusals and one wait:
  *
  * - **The machine must have opted in.** `SWARM_WORKER_SELF_UPDATE=true` on the host,
- *   read from its own environment and never from the wire. Until phase 4's
- *   shared-install lock lands, a machine whose install root is shared by several
- *   daemons must not set it — the other daemons' code would be swapped underneath
- *   them — so the flag is the operator stating that this host is not one of those
- *   (`docs/onboarding-worker.md`).
+ *   read from its own environment and never from the wire. A host whose install root
+ *   is shared by several daemons may set it since issue #935: the apply takes a
+ *   machine-local lock on that root and refuses outright while a peer daemon is
+ *   mid-phase (`../worktree/install-lock.ts`), so the flag is now only the operator
+ *   saying this machine may replace its own code (`docs/onboarding-worker.md`).
  * - **The target is re-validated here**, against the same grammar the frame already
  *   enforced. Not redundancy for its own sake: this value is about to be handed to
  *   `git` on an unattended machine, so it is checked at every seam it crosses rather
@@ -19,7 +19,10 @@
  * - **The daemon must hold no in-flight phase.** It waits for that rather than
  *   forcing it: no run is cancelled, deferred or failed by an update. The control
  *   plane's own precondition — the machine is already draining (issue #919) — is what
- *   makes the wait terminate, since no *new* work is dispatched while it waits.
+ *   makes the wait terminate, since no *new* work is dispatched while it waits. It
+ *   waits only for *its own* runs: a **peer** daemon sharing this install root is not
+ *   waited for but refused, because nothing here can drain somebody else's machine
+ *   role and a wait on it would not terminate (issue #935, in the mechanism).
  * - A **shutdown** abandons the attempt silently. The request is durable on the
  *   `workers` row, so the next connection is pushed it again; reporting a refusal
  *   nobody asked for would instead leave an operator reading "refused" for a machine
@@ -265,8 +268,7 @@ async function runUpdate(
 			status: 'declined',
 			message:
 				`This machine has not opted in to self-update, so nothing was attempted. Set ` +
-				`${SELF_UPDATE_ENV}=true in the daemon's environment and restart it — but only if ` +
-				'its SWARM install root is not shared with another daemon.',
+				`${SELF_UPDATE_ENV}=true in the daemon's environment and restart it.`,
 		});
 		return false;
 	}

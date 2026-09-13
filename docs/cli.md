@@ -629,10 +629,15 @@ unchanged.
   `swarm workers drain <worker-id>` as the remedy — draining is what stops new work
   arriving into that wait — so the sequence is `drain` → `update` → read `list` →
   `undrain`. The machine acts only if its host opted in with
-  `SWARM_WORKER_SELF_UPDATE=true`, and only a host whose install root is **not**
-  shared with another daemon may set that (see
-  [`docs/onboarding-worker.md`](./onboarding-worker.md)); with the flag off it
-  reports `declined` and keeps working. The outcome lands back on the row and is
+  `SWARM_WORKER_SELF_UPDATE=true`; with the flag off it reports `declined` and keeps
+  working. A host where several daemons share one SWARM install root may opt in
+  (issue #935): the first to act takes a machine-local lock and does the fetch and
+  build while the rest report `already-current` once it has landed, and an update is
+  refused before anything is checked out while a peer daemon there is mid-phase,
+  naming the worker to drain. Drain every daemon on such a machine before updating
+  it, and restart the peers afterwards — `already-current` says the files moved, not
+  that the daemon reporting it is running them (see
+  [`docs/onboarding-worker.md`](./onboarding-worker.md)). The outcome lands back on the row and is
   shown by `list` as `update <ref> pending` while it is outstanding and
   `update <ref> <outcome>` once answered — `applied`, `already-current`, `declined`,
   `refused`, or `failed`. Anything but `applied` leaves the machine working on the

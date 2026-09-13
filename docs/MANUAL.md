@@ -260,10 +260,14 @@ and anything but `applied` leaves the machine working on the build it had, with 
 one exception `failed` carries: a step that failed *and* could not be rolled back
 leaves the install root on neither build, which the reported message says outright.
 Read that message before moving on — it names the step and, when the rollback failed
-too, is the signal to repair that install root by hand on the host. **Until the
-shared-install lock lands (issue #920 phase 4), a host whose SWARM install root is
-shared by several daemons must not opt in**: the update would swap the code under the
-others mid-phase.
+too, is the signal to repair that install root by hand on the host. **A host whose
+SWARM install root is shared by several daemons may opt in (issue #935)**: the first
+daemon to act takes a machine-local lock on that root and does the fetch and build,
+the rest re-read the commit and report `already-current` once it has landed, and an
+update is refused before anything is checked out while a peer daemon there is
+mid-phase, naming the worker to drain. Drain every daemon on such a machine before
+updating it, and restart the peers afterwards — `already-current` says the files
+moved, not that the daemon reporting it is running them.
 
 An `applied` update that then cannot connect is recovered **by the machine**, not
 from here (issue #934): the build is only trusted once a daemon running it has
