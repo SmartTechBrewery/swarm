@@ -1512,6 +1512,11 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 		});
 	}
 
+	/** The write accepted the request — its `draining_since` predicate matched. */
+	function accepted(target: string) {
+		return { outcome: 'requested', worker: requested(target) };
+	}
+
 	it('is NOT_FOUND for an unknown worker', async () => {
 		getWorker.mockResolvedValue(undefined);
 
@@ -1543,9 +1548,14 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 	});
 
 	// The precondition that makes the rest safe: the daemon waits for its in-flight
-	// phases to finish, and only draining stops new work arriving into that wait.
+	// phases to finish, and only draining stops new work arriving into that wait. It is
+	// the *write* that tests it (issue #942 review, F1), so the refusal here is worded
+	// from the write's own `in-pool` outcome rather than from a read this handler makes
+	// first — which is what stops a concurrent `undrain` slipping between the two.
 	it('refuses a machine still in the dispatch pool, naming the remedy', async () => {
-		getWorker.mockResolvedValue(makeWorker({ drainingSince: null }));
+		const stillInPool = makeWorker({ drainingSince: null });
+		getWorker.mockResolvedValue(stillInPool);
+		requestWorkerUpdate.mockResolvedValue({ outcome: 'in-pool', worker: stillInPool });
 
 		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
 			expect.objectContaining({
@@ -1553,13 +1563,30 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 				message: expect.stringContaining(`swarm workers drain ${WORKER_ID}`),
 			}),
 		);
-		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	// The same refusal for a machine that *was* draining when this handler read it and
+	// was undrained before the write landed — the race the atomic predicate closes.
+	it('refuses a machine undrained between the read and the write', async () => {
+		getWorker.mockResolvedValue(drained());
+		requestWorkerUpdate.mockResolvedValue({
+			outcome: 'in-pool',
+			worker: makeWorker({ drainingSince: null }),
+		});
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'CONFLICT',
+				message: expect.stringContaining(`swarm workers drain ${WORKER_ID}`),
+			}),
+		);
 		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
 	});
 
 	it('records the request and publishes it for the router to push', async () => {
 		getWorker.mockResolvedValue(drained());
-		requestWorkerUpdate.mockResolvedValue(requested('main'));
+		requestWorkerUpdate.mockResolvedValue(accepted('main'));
 
 		const result = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
 
@@ -1577,7 +1604,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 	// close the request it actually answers.
 	it('mints the request id server-side and answers with it', async () => {
 		getWorker.mockResolvedValue(drained());
-		requestWorkerUpdate.mockResolvedValue(requested('main'));
+		requestWorkerUpdate.mockResolvedValue(accepted('main'));
 
 		const result = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
 
@@ -1602,7 +1629,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 
 	it('is NOT_FOUND when the worker disappears between the check and the write', async () => {
 		getWorker.mockResolvedValue(drained());
-		requestWorkerUpdate.mockResolvedValue(undefined);
+		requestWorkerUpdate.mockResolvedValue({ outcome: 'not-found' });
 
 		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
 			expect.objectContaining({ code: 'NOT_FOUND' }),
@@ -1613,9 +1640,9 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 	// Re-issuing overwrites, which is the only form of re-targeting this phase has.
 	it('overwrites an unanswered request with a fresh id', async () => {
 		getWorker.mockResolvedValue(drained());
-		requestWorkerUpdate.mockResolvedValueOnce(requested('main'));
+		requestWorkerUpdate.mockResolvedValueOnce(accepted('main'));
 		const first = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
-		requestWorkerUpdate.mockResolvedValueOnce(requested('v2'));
+		requestWorkerUpdate.mockResolvedValueOnce(accepted('v2'));
 		const second = await owner.requestUpdate({ workerId: WORKER_ID, target: 'v2' });
 
 		expect(second.requestId).not.toBe(first.requestId);

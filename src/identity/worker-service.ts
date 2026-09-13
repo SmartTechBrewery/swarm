@@ -36,6 +36,7 @@ import {
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
+	type WorkerUpdateRequestOutcome,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import {
@@ -53,6 +54,7 @@ import {
 	WorkerSupportedPhasesSchema,
 } from './worker.js';
 
+export type { WorkerUpdateRequestOutcome } from '../db/repositories/workersRepository.js';
 export type { Worker } from './worker.js';
 export { WorkerCapabilityNotProbedError, WorkerCapabilityReductionError } from './worker.js';
 
@@ -246,16 +248,19 @@ export async function setWorkerDraining(
  * `requestId` is minted by the caller, which is also what publishes the
  * notification, so the id it pushes and the id the row waits on are the same value.
  *
- * Returns the updated worker, or `undefined` if no worker has that id. It does not
- * check that the machine is draining — that is the API layer's refusal to make,
- * since it is a policy about when an operator may ask, not about what the row can
- * hold.
+ * **The draining precondition is decided by the write, not by the caller** (issue
+ * #921): the row write's own `WHERE` carries it, so the returned
+ * {@link WorkerUpdateRequestOutcome} tells `requested` from `in-pool` from
+ * `not-found` and no caller can record a request onto a machine a concurrent
+ * `undrain` has returned to the dispatch pool. How a refusal is *worded* is still the
+ * API layer's — a `CONFLICT` for the single-machine form, an `in-pool` disposition
+ * for the fleet one — but whether it is refused is settled here.
  */
 export async function requestWorkerUpdate(
 	id: string,
 	requestId: string,
 	target: string,
-): Promise<Worker | undefined> {
+): Promise<WorkerUpdateRequestOutcome> {
 	return requestWorkerUpdateRow(id, requestId, WorkerUpdateTargetSchema.parse(target));
 }
 

@@ -666,6 +666,14 @@ export const workersRouter = router({
 	// own idempotence, and doing it as a side effect would leave the operator with a
 	// drained machine they never asked for if the update is then refused downstream.
 	//
+	// That precondition is *tested by the durable write itself* (issue #921), not read
+	// here and trusted: `requestWorkerUpdate` carries `draining_since IS NOT NULL` in
+	// its `WHERE` and answers `in-pool` when it matched nothing, so a concurrent
+	// `swarm workers undrain` landing between this handler's read and its write leaves
+	// the machine unasked rather than queued for a restart it is no longer drained
+	// for. This handler only words the refusal; the fleet form words the same outcome
+	// as an `in-pool` disposition over the same single eligibility boundary.
+	//
 	// The target is validated against the shared grammar before anything is written,
 	// so a malformed one is `BAD_REQUEST` here rather than a `refused` report minutes
 	// later from a machine that had to be woken to say so.
@@ -677,19 +685,20 @@ export const workersRouter = router({
 	requestUpdate: authedProcedure
 		.input(z.object({ workerId: z.string().uuid(), target: WorkerUpdateTargetSchema }))
 		.mutation(async ({ ctx, input }) => {
-			const worker = await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
-			if (!worker.drainingSince) {
+			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			const requestId = randomUUID();
+			const result = await requestWorkerUpdate(input.workerId, requestId, input.target);
+			if (result.outcome === 'not-found') throw workerNotFound(input.workerId);
+			if (result.outcome === 'in-pool') {
 				throw new TRPCError({
 					code: 'CONFLICT',
 					message:
-						`Worker '${worker.displayName}' is still in the dispatch pool, so it cannot be ` +
+						`Worker '${result.worker.displayName}' is still in the dispatch pool, so it cannot be ` +
 						`asked to update: it would be given new work while it waits to restart. Run ` +
 						`\`swarm workers drain ${input.workerId}\` first, then request the update.`,
 				});
 			}
-			const requestId = randomUUID();
-			const updated = await requestWorkerUpdate(input.workerId, requestId, input.target);
-			if (!updated) throw workerNotFound(input.workerId);
+			const updated = result.worker;
 			// After the durable write, and never awaited for correctness: the request lives
 			// on the row, so a router that misses this notification pushes it the moment the
 			// machine next connects. The publish swallows its own failures for that reason.

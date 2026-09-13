@@ -31,6 +31,17 @@
  * action. Retrying one machine that reported `failed` stays
  * `swarm workers update <worker-id> <ref>`, which overwrites unconditionally.
  *
+ * **The draining precondition is enforced by the write, not by the snapshot.** A
+ * fleet action reads its machines once and then writes to them one at a time, so the
+ * `drainingSince` on the list it was handed is stale the moment another session runs
+ * `swarm workers undrain`. The eligibility test therefore lives in
+ * `requestWorkerUpdate`'s own `WHERE` (issue #921), which declines the write and
+ * reports `in-pool` — the same single boundary `workers.requestUpdate` refuses on —
+ * so a machine returned to the dispatch pool mid-fan-out is reported rather than
+ * queued for a restart it is no longer drained for. The snapshot check kept here is
+ * an optimisation: it saves a pointless write and session lookup for a machine that
+ * was already in the pool when the list was read.
+ *
  * **Authorization is the caller's**, which is why this takes an already-resolved
  * worker list rather than a user id: every other worker mutation makes that
  * decision in the router, and the administrator-facing selection issue #922 will
@@ -85,8 +96,9 @@ export interface WorkerUpdateFanoutEntry {
 	disposition: WorkerUpdateFanoutDisposition;
 	/**
 	 * The row's update state **after** the fan-out — the target, and the outcome
-	 * when one is recorded. `null` only for a machine nobody has ever asked, which
-	 * is what an `in-pool` row says until it is drained.
+	 * when one is recorded. `null` for a machine nobody has ever asked, which is what
+	 * a never-drained `in-pool` row says; an `in-pool` machine that was asked on some
+	 * earlier drain still carries that older request's state here.
 	 */
 	update: WorkerUpdateState | null;
 }
@@ -121,22 +133,41 @@ export async function fanOutWorkerUpdate(
 			continue;
 		}
 
-		// Connectivity is `getLiveSessionForWorker` — the same definition the rosters
-		// and the dispatch gate read, never `isWorkerConnected`, whose map is local to
-		// one router process and answers nothing at all from the API server. It decides
-		// only the *word* reported: the request is recorded and published either way, so
-		// a machine that goes offline between this read and the push loses nothing.
-		const live = await getLiveSessionForWorker(worker.id);
 		// One request id per machine, never one shared across the fan-out: a request id
 		// names one request to one machine, and `recordWorkerUpdateReport`'s
 		// `(worker_id, update_request_id)` match depends on that reading staying true.
 		const requestId = randomUUID();
-		const updated = await requestWorkerUpdate(worker.id, requestId, target);
+		const result = await requestWorkerUpdate(worker.id, requestId, target);
 		// The machine was deregistered between the caller's read and this write. It is
 		// left out of the report rather than given a disposition: there is no machine
 		// left to say anything about, and the operator's own list no longer carries it
 		// either.
-		if (!updated) continue;
+		if (result.outcome === 'not-found') continue;
+		// Undrained between the caller's read and this write — `swarm workers undrain`
+		// from another session, say. The write's own `draining_since IS NOT NULL`
+		// predicate declined it, so nothing was recorded and nothing is published, and
+		// the machine is reported exactly as the snapshot check above reports one that
+		// was already in the pool when the list was read. This is why the check above is
+		// an optimisation rather than the guarantee: a fleet action reads its machines
+		// once and then writes to them one at a time, so every machine after the first
+		// is being decided on a snapshot that a concurrent undrain can have invalidated.
+		if (result.outcome === 'in-pool') {
+			entries.push({
+				workerId: result.worker.id,
+				displayName: result.worker.displayName,
+				disposition: 'in-pool',
+				update: result.worker.update,
+			});
+			continue;
+		}
+		const updated = result.worker;
+		// Connectivity is `getLiveSessionForWorker` — the same definition the rosters
+		// and the dispatch gate read, never `isWorkerConnected`, whose map is local to
+		// one router process and answers nothing at all from the API server. It decides
+		// only the *word* reported: the request is recorded and published either way, so
+		// a machine that goes offline between this read and the push loses nothing. Read
+		// after the write, so a machine that was not asked costs no session lookup.
+		const live = await getLiveSessionForWorker(worker.id);
 		// After the durable write and never guarded: `publishWorkerUpdateRequest` swallows
 		// its own failures by contract, because the request lives on the row and a router
 		// that misses the notification pushes it the moment the machine next connects.
@@ -152,11 +183,16 @@ export async function fanOutWorkerUpdate(
 }
 
 /**
- * The disposition of a machine that is **not** asked, or `undefined` when it is.
+ * The disposition of a machine that is **not** asked on the strength of the caller's
+ * own snapshot, or `undefined` when it is asked.
  *
  * The draining check is issue #933's precondition, unrelaxed: the daemon waits for
  * its in-flight phases to finish before it applies anything, and only draining
- * stops new work being dispatched into that wait. The other two turn on the row
+ * stops new work being dispatched into that wait. It is repeated here only to skip
+ * the write and the session lookup for a machine already known to be in the pool —
+ * the *enforcing* copy is the `draining_since IS NOT NULL` predicate on
+ * `requestWorkerUpdate`'s own `WHERE`, which is the only one a concurrent undrain
+ * cannot get in front of. The other two turn on the row
  * already naming this exact target — `requestId` is the outstanding marker
  * (`recordWorkerUpdateReport` clears it), so a non-null one is a request nobody has
  * answered and a reported `status` beside a null one is an answer already given.

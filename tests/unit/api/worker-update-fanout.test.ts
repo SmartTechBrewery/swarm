@@ -94,10 +94,13 @@ beforeEach(() => {
 	for (const m of [requestWorkerUpdate, getLiveSessionForWorker, publishWorkerUpdateRequest]) {
 		m.mockReset();
 	}
-	// Connected unless a case says otherwise; the write echoes the row back.
+	// Connected unless a case says otherwise; the write lands and echoes the row back.
 	getLiveSessionForWorker.mockResolvedValue({ fencingToken: 1 });
-	requestWorkerUpdate.mockImplementation(async (id: string, _requestId: string, target: string) =>
-		afterWrite(makeWorker({ id }), target),
+	requestWorkerUpdate.mockImplementation(
+		async (id: string, _requestId: string, target: string) => ({
+			outcome: 'requested',
+			worker: afterWrite(makeWorker({ id }), target),
+		}),
 	);
 });
 
@@ -220,7 +223,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 	// Deregistered between the caller's read and the write: there is no machine left
 	// to report on, and nothing was published for it.
 	it('omits a machine that disappeared before its write landed', async () => {
-		requestWorkerUpdate.mockResolvedValueOnce(undefined);
+		requestWorkerUpdate.mockResolvedValueOnce({ outcome: 'not-found' });
 
 		const entries = await fanOutWorkerUpdate(
 			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
@@ -229,6 +232,54 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 
 		expect(entries.map((entry) => entry.workerId)).toEqual([OTHER_WORKER_ID]);
 		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(OTHER_WORKER_ID);
+	});
+
+	// The reason the snapshot check above is an optimisation and not the guarantee
+	// (issue #942 review, F1): a fleet action reads its machines once and then writes
+	// to them one at a time, so an `undrain` from another session can land in between.
+	// The write's own draining predicate is what declines it, and the machine is
+	// reported exactly as an already-in-pool one is.
+	it('reports a machine undrained between the read and its write as in-pool', async () => {
+		const stillInPool = makeWorker({ drainingSince: null });
+		requestWorkerUpdate.mockResolvedValueOnce({ outcome: 'in-pool', worker: stillInPool });
+
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main');
+
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(entries).toMatchObject([
+			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'in-pool', update: null },
+		]);
+		// Nothing was recorded, so nothing may be pushed: the daemon must not be told to
+		// restart a machine that is back in the dispatch pool.
+		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	// The raced machine must not take the rest of the fleet with it, exactly as a
+	// machine that was in the pool from the start does not.
+	it('carries on past a machine the write declined', async () => {
+		requestWorkerUpdate.mockResolvedValueOnce({
+			outcome: 'in-pool',
+			worker: makeWorker({ drainingSince: null }),
+		});
+
+		const entries = await fanOutWorkerUpdate(
+			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
+			'main',
+		);
+
+		expect(entries.map((entry) => [entry.workerId, entry.disposition])).toEqual([
+			[WORKER_ID, 'in-pool'],
+			[OTHER_WORKER_ID, 'requested'],
+		]);
+		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(OTHER_WORKER_ID);
+	});
+
+	// A machine that is not asked costs no session lookup — the liveness read decides
+	// only the *word* reported for a machine the write actually accepted.
+	it('reads no live session for a machine it does not ask', async () => {
+		await fanOutWorkerUpdate([makeWorker({ drainingSince: null })], 'main');
+
+		expect(getLiveSessionForWorker).not.toHaveBeenCalled();
 	});
 
 	it('answers an empty fleet with an empty report', async () => {
