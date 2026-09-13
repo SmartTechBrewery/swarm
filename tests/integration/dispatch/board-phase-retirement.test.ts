@@ -6,6 +6,7 @@ import type {
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import {
 	createDispatch,
+	deferDispatchToPending,
 	getDispatchById,
 	listDeferredRunsWithoutActiveDispatch,
 	listTaskInFlightWaits,
@@ -297,6 +298,100 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				}),
 			).toBe(0);
 			expect(await getDispatchById(dispatch.id)).toMatchObject({ state: 'pending' });
+		});
+
+		// The one interleaving where a retired phase could still come back. A pre-run
+		// wait makes its dispatch `pending` *before* settling the run it just created
+		// (`deferBeforeRun`, `src/worker/consumer.ts`), so a board move landing in
+		// between finds a `pending` dispatch paired with a `running` run. The three
+		// calls below are that sequence, in that order, through the same repository
+		// functions the worker uses.
+		it('retires a phase caught mid-deferral without letting its run come back', async () => {
+			// 1. `tryCreateRun` — the row is `running` from here until the settle.
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK_ID,
+				phase: 'implementation',
+				jobPayload: job(),
+			});
+			const claimed = await seedWaiting({
+				dedupKey: 'd-impl',
+				phase: 'implementation',
+				state: 'leased',
+			});
+
+			// 2. `deferDispatchToPending` — the dispatch is waiting, the run is not yet.
+			const pending = await deferDispatchToPending(claimed.id, {
+				jobPayload: job({ deliveryId: 'd-impl' }),
+				waitReason: 'task-in-flight',
+				continuation: false,
+				runId,
+			});
+			expect(pending).toMatchObject({ state: 'pending', runId });
+			expect(await getRunByIdFromDb(runId)).toMatchObject({ status: 'running' });
+
+			// 3. The newer board move lands in the window and retires the phase.
+			expect(
+				await retireSupersededBoardPhases({
+					projectId: PROJECT_ID,
+					taskId: TASK_ID,
+					keepPhase: 'planning',
+					excludeDispatchId: 'some-other-dispatch',
+				}),
+			).toBe(1);
+			// The still-`running` row is settled with its dispatch, not skipped.
+			expect(await getRunByIdFromDb(runId)).toMatchObject({
+				status: 'failed',
+				nextRetryAt: null,
+			});
+
+			// 4. The worker resumes and makes its guarded settle — which now loses.
+			const settled = await completeRun(runId, {
+				status: 'deferred',
+				error: 'waiting for the task checkout',
+				nextRetryAt: null,
+				fromStatus: 'running',
+			});
+			expect(settled).toBe(false);
+
+			expect(await getDispatchById(claimed.id)).toMatchObject({ state: 'cancelled' });
+			expect(await getRunByIdFromDb(runId)).toMatchObject({ status: 'failed' });
+			// The backfill is the path that would have re-dispatched the stale phase.
+			expect(await listDeferredRunsWithoutActiveDispatch()).toEqual([]);
+		});
+
+		// The same guard must not swallow the ordinary case: with no retirement in the
+		// window, the deferral settles exactly as it always did.
+		it('still settles a pre-run deferral’s run when nothing retires it', async () => {
+			const runId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK_ID,
+				phase: 'implementation',
+				jobPayload: job(),
+			});
+			const claimed = await seedWaiting({
+				dedupKey: 'd-impl',
+				phase: 'implementation',
+				state: 'leased',
+			});
+			await deferDispatchToPending(claimed.id, {
+				jobPayload: job({ deliveryId: 'd-impl' }),
+				waitReason: 'task-in-flight',
+				continuation: false,
+				runId,
+			});
+
+			expect(
+				await completeRun(runId, {
+					status: 'deferred',
+					error: 'waiting for the task checkout',
+					nextRetryAt: null,
+					fromStatus: 'running',
+				}),
+			).toBe(true);
+			expect(await getRunByIdFromDb(runId)).toMatchObject({ status: 'deferred' });
 		});
 
 		// A same-phase waiting sibling is a duplicate delivery, which the existing

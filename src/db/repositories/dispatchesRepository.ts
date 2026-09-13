@@ -41,7 +41,7 @@ import { runs } from '../schema/runs.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workerSessions } from '../schema/workerSessions.js';
 import { workers } from '../schema/workers.js';
-import { RETRY_PENDING_RUN_STATUSES } from './runsRepository.js';
+import { RETRY_PENDING_RUN_STATUSES, UNSETTLED_RUN_STATUSES } from './runsRepository.js';
 
 export type DispatchRow = typeof dispatches.$inferSelect;
 
@@ -722,6 +722,19 @@ export async function cancelWaitingDispatch(
  * on {@link cancelDeferredRunInDb}, which pairs the same two writes for
  * Terminate.
  *
+ * The run settle spans every {@link UNSETTLED_RUN_STATUSES} — `running` as well
+ * as the retry-pending pair — because a waiting dispatch and a `running` run is a
+ * real, reachable pairing rather than an inconsistency: `deferBeforeRun`
+ * (`src/worker/consumer.ts`) creates the run, hands its dispatch back to
+ * `pending`, and only *then* writes `deferred` on the run, so a retirement
+ * landing between those last two steps finds exactly that. Settling only the
+ * retry-pending pair would leave that row `running`, the worker would finish
+ * writing `deferred` over it, and the backfill would re-dispatch the phase the
+ * card had just retired. The other half of closing that window is the settle's
+ * own `fromStatus: 'running'` guard, which makes the worker's late write lose.
+ * Nothing is written over a `completed`/`failed` run: a run that already settled
+ * itself keeps its own outcome.
+ *
  * The dispatch cancel is **conditional** on the row still waiting, which is what
  * makes "only waiting dispatches are retired" free of extra locking: a dispatch a
  * worker claimed in the meantime simply loses the update and survives, and the
@@ -768,9 +781,7 @@ export async function retireWaitingBoardDispatch(
 				nextRetryAt: null,
 				completedAt: now,
 			})
-			.where(
-				and(eq(runs.id, dispatch.runId), inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES])),
-			)
+			.where(and(eq(runs.id, dispatch.runId), inArray(runs.status, [...UNSETTLED_RUN_STATUSES])))
 			.returning({ id: runs.id });
 		return { dispatch, runSettled: settled.length > 0 };
 	});

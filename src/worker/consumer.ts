@@ -60,6 +60,7 @@ import {
 	getRunByIdFromDb,
 	hasCompletedRunForTask,
 	isRetryPendingStatus,
+	type RunStatus,
 	recordRunPreservedWorker,
 	resetRunToRunning,
 	storeRunLogs,
@@ -1155,7 +1156,16 @@ async function deferBeforeRun(
 
 	// This pre-try/catch path must settle the visible run now. Neither pre-run wait
 	// has a scheduled timestamp: an event, not polling, wakes it.
-	await finalizeFailedRun(deferred.runId, deferred, undefined);
+	//
+	// Guarded on `running` — the status `tryCreateRun` left the row in a few lines
+	// above, whichever of create/reuse it took — so that this write *loses* to
+	// anyone who settled the run in between. The dispatch is already `pending` by
+	// now, which is exactly the state board-phase retirement (issue #909) cancels:
+	// a card moved again in this window settles the run as `failed` alongside its
+	// cancelled dispatch, and without the guard this line would write `deferred`
+	// back over it, leaving a retry-pending run with no active dispatch for the
+	// startup backfill to re-dispatch as the very phase the card retired.
+	await finalizeFailedRun(deferred.runId, deferred, undefined, undefined, 'running');
 	return { outcome: deferred, pending };
 }
 
@@ -2697,6 +2707,9 @@ async function finalizeFailedRun(
 	// on disk. Omitted for the pre-run concurrency deferral (a `phase-deferred`
 	// outcome that never provisioned a worktree).
 	reconcile?: { project: ProjectConfig; taskId: string; worktrees?: GitWorktreeManager },
+	// The settle's atomic guard ({@link CompleteRunInput.fromStatus}), supplied by
+	// the one caller whose write races another party's — see `deferBeforeRun`.
+	fromStatus?: RunStatus,
 ): Promise<void> {
 	const agent = err instanceof AgentRunError ? err.agent : undefined;
 	if (outcome.status === 'phase-deferred') {
@@ -2720,12 +2733,15 @@ async function finalizeFailedRun(
 				agentSessionId: outcome.resumable ? (agent?.sessionId ?? null) : null,
 				checkpoint: outcome.checkpoint,
 				continuationCount: outcome.continuationCount,
+				fromStatus,
 			},
 			agent,
 		);
 		// Every deferral that hands its retry a checkout to adopt records *where* that
 		// checkout is (issue #567), so the continuation is offered only to that machine
-		// instead of being started over on whichever worker is free.
+		// instead of being started over on whichever worker is free. Unreachable for a
+		// guarded settle: the one caller that passes `fromStatus` is the pre-run
+		// deferral, which preserves no checkout at all.
 		if (outcome.resumable || outcome.checkpoint || outcome.resumeDelivery) {
 			await recordPreservedWorker(runId);
 		}
