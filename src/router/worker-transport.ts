@@ -103,6 +103,7 @@ import {
 	isWorkerConnected,
 	registerConnection,
 } from './worker-connections.js';
+import { resendPendingWorkerUpdateToWorker } from './worker-update-dispatch.js';
 
 // The application-defined WebSocket close codes are part of the wire contract, so
 // they live in the protocol module (the single source of truth for every frame)
@@ -231,6 +232,16 @@ export interface WorkerTransportDeps {
 	 * by contract, like the hooks above.
 	 */
 	resendRunCancellations: (workerId: string) => void;
+	/**
+	 * A self-update requested while this worker's socket was down never reached it
+	 * either (issue #933), and for this feature that is the *ordinary* case rather
+	 * than a blip: the mutation refuses unless the machine is already draining, so an
+	 * operator typically asks while it is idle, restarting, or offline. The push fires
+	 * once, so the socket coming back is where the request is re-stated from the
+	 * `workers` row (`./worker-update-dispatch.ts`). Fire-and-forget by contract, like
+	 * the hooks above.
+	 */
+	resendPendingWorkerUpdate: (workerId: string) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -265,6 +276,7 @@ function defaultDeps(): WorkerTransportDeps {
 			}
 		},
 		resendRunCancellations: resendRunCancellationsToWorker,
+		resendPendingWorkerUpdate: resendPendingWorkerUpdateToWorker,
 	};
 }
 
@@ -779,6 +791,11 @@ export function handleWorkerStreamOpen(
 	// this call just registered (issue #827).
 	runConnectionHook('re-pushing cancellations recorded while the worker was away', workerId, () =>
 		deps.resendRunCancellations(workerId),
+	);
+	// Same window, same reason (issue #933): a request recorded while this machine was
+	// away reaches it here or not at all, since its notification fired once.
+	runConnectionHook('re-pushing a self-update recorded while the worker was away', workerId, () =>
+		deps.resendPendingWorkerUpdate(workerId),
 	);
 }
 

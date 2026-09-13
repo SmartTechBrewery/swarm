@@ -29,6 +29,8 @@ import {
 	getWorkerById,
 	getWorkersByIds,
 	listWorkersForOwner as listWorkersForOwnerRows,
+	recordWorkerUpdateReport as recordWorkerUpdateReportRow,
+	requestWorkerUpdate as requestWorkerUpdateRow,
 	setWorkerDeclaredCapabilities,
 	setWorkerDraining as setWorkerDrainingRow,
 	updateWorkerCapabilities,
@@ -36,7 +38,12 @@ import {
 	updateWorkerSupportedPhases,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
-import { type WorkerBuild, WorkerBuildSchema } from '../lib/build-identity.js';
+import {
+	type WorkerBuild,
+	WorkerBuildSchema,
+	type WorkerUpdateStatus,
+	WorkerUpdateTargetSchema,
+} from '../lib/build-identity.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
@@ -222,6 +229,52 @@ export async function setWorkerDraining(
 	draining: boolean,
 ): Promise<Worker | undefined> {
 	return setWorkerDrainingRow(id, draining);
+}
+
+/**
+ * Ask a machine to move its SWARM install root to `target` and restart into it
+ * (issue #933) — the service seam the API layer programs against, exactly as
+ * {@link setWorkerDraining} is.
+ *
+ * The target is validated here with the shared grammar
+ * ({@link WorkerUpdateTargetSchema}), so the service seam — not only the wire — is a
+ * boundary nothing but a branch, tag, or commit id crosses. That matters more here
+ * than for any other field on this row: the value ends up handed to `git` on a
+ * machine nobody is watching, so it is validated at every seam it passes rather than
+ * once at the edge.
+ *
+ * `requestId` is minted by the caller, which is also what publishes the
+ * notification, so the id it pushes and the id the row waits on are the same value.
+ *
+ * Returns the updated worker, or `undefined` if no worker has that id. It does not
+ * check that the machine is draining — that is the API layer's refusal to make,
+ * since it is a policy about when an operator may ask, not about what the row can
+ * hold.
+ */
+export async function requestWorkerUpdate(
+	id: string,
+	requestId: string,
+	target: string,
+): Promise<Worker | undefined> {
+	return requestWorkerUpdateRow(id, requestId, WorkerUpdateTargetSchema.parse(target));
+}
+
+/**
+ * Record what a machine reported became of the update it was asked for (issue
+ * #933). Returns the updated worker, or `undefined` when the report answers no
+ * outstanding request — a superseded request, a duplicate report, or an unknown
+ * worker (see {@link recordWorkerUpdateReportRow} for why those collapse).
+ *
+ * Nothing to validate beyond what the wire schema already did: the status is a
+ * closed vocabulary and the message is the machine's own prose.
+ */
+export async function recordWorkerUpdateReport(
+	id: string,
+	requestId: string,
+	status: WorkerUpdateStatus,
+	message: string,
+): Promise<Worker | undefined> {
+	return recordWorkerUpdateReportRow(id, requestId, status, message);
 }
 
 /**

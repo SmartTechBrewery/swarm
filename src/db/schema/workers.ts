@@ -9,6 +9,7 @@ import {
 	uuid,
 } from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
+import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../triggers/types.js';
 import { users } from './users.js';
 
@@ -142,6 +143,38 @@ export const workers = pgTable(
 		 * written together (`updateWorkerCapabilities`), so it is never half-set.
 		 */
 		buildDirty: boolean('build_dirty'),
+		/**
+		 * The self-update an operator asked this machine for (issue #933), in six
+		 * columns that split cleanly in two: the **request** still outstanding
+		 * (`update_request_id`, `update_target`, `update_requested_at`) and the **last
+		 * outcome** the machine reported (`update_status`, `update_message`,
+		 * `update_reported_at`).
+		 *
+		 * `update_request_id` is the pending marker: non-null means a push is owed an
+		 * answer, and the report route clears it only when the id matches — so a report
+		 * for a request an operator has since re-targeted is recorded as history
+		 * without un-pending the request now outstanding.
+		 *
+		 * `update_target` is deliberately **not** cleared by a report: it is the target
+		 * the outcome beside it concerns, and an outcome naming no build answers nothing.
+		 * Requesting again overwrites all six, so a fresh pending request never shows a
+		 * stale machine's verdict beside it.
+		 *
+		 * All nullable with no default and nothing backfilled, on `draining_since`'s
+		 * contract: NULL is what every row written before these columns says, and is
+		 * verbatim the pre-existing behaviour. Deliberately **not** rewritten by the
+		 * handshake, for that column's reason too — this is the operator's request and
+		 * the machine's answer to it, not a fact the daemon re-declares on connect. The
+		 * build a restarted machine came back on is `build_commit` above, which the
+		 * handshake does rewrite (issue #918), and that is the whole of the wiring the
+		 * restart needs.
+		 */
+		updateRequestId: uuid('update_request_id'),
+		updateTarget: text('update_target'),
+		updateRequestedAt: timestamp('update_requested_at'),
+		updateStatus: text('update_status').$type<WorkerUpdateStatus>(),
+		updateMessage: text('update_message'),
+		updateReportedAt: timestamp('update_reported_at'),
 		/** SHA-256 of the worker credential — never the raw token; dropped by `rowToWorker`. */
 		credentialHash: text('credential_hash').notNull().unique(),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

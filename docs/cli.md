@@ -425,6 +425,7 @@ swarm workers set-scm-credential <worker-id> <scm-provider-id>
 swarm workers remove <worker-id>
 swarm workers drain <worker-id>
 swarm workers undrain <worker-id>
+swarm workers update <worker-id> <ref>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -617,6 +618,29 @@ unchanged.
   derived there from the machine's active job, so a run whose title has not resolved
   (a PR-driven phase has no board card to take one from) still reads as "still
   running a job" rather than as an idle machine.
+- **`update`** — ask a machine to move its SWARM **install root** to `<ref>` — a
+  branch, a tag, or a commit id, never a command, a path, or a URL — and restart
+  into it (issue #933), so a fleet is updated from the control plane instead of by
+  hand on every host. What it prints is an **acknowledgement, not an outcome**: the
+  machine may be offline, and even when it is connected it waits for the phases it
+  is already running to finish before applying anything. No run is cancelled,
+  deferred, or failed by an update.
+  **Refused unless the machine is already draining**, naming
+  `swarm workers drain <worker-id>` as the remedy — draining is what stops new work
+  arriving into that wait — so the sequence is `drain` → `update` → read `list` →
+  `undrain`. The machine acts only if its host opted in with
+  `SWARM_WORKER_SELF_UPDATE=true`, and only a host whose install root is **not**
+  shared with another daemon may set that (see
+  [`docs/onboarding-worker.md`](./onboarding-worker.md)); with the flag off it
+  reports `declined` and keeps working. The outcome lands back on the row and is
+  shown by `list` as `update <ref> pending` while it is outstanding and
+  `update <ref> <outcome>` once answered — `applied`, `already-current`, `declined`,
+  `refused`, or `failed`. Anything but `applied` leaves the machine working on the
+  build it has. Re-issuing replaces a request that has not been answered yet; there
+  is no cancel. Owner-only, exactly like `drain` and `remove` — this is the one
+  command that changes *which code* runs on somebody's hardware, so an
+  `instanceAdmin` who does not own the machine gets the same `NOT_FOUND` a stranger
+  does. No dashboard equivalent yet; the CLI is the operator surface for now.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

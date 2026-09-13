@@ -72,7 +72,16 @@
  * credential resolved to — never a worker id the request names, which it cannot
  * even carry (`../transport/protocol.ts`).
  *
- * Nineteen routes, all under `/worker/delivery`:
+ * The twentieth route is the self-update report (issue #933) and shares every one of
+ * those properties: it fronts the `workers` row a DB-free worker cannot reach,
+ * it is about a machine rather than a project, and the row it writes is the one the
+ * credential resolved to. It is a *route* rather than a stream frame precisely
+ * because this feature is deployed control plane first, so a daemon newly restarted
+ * into a newer build talking to an older router is the expected skew — and an
+ * unserved route is a 404 the daemon survives where an unparseable stream frame
+ * closes the socket (`../transport/protocol.ts`).
+ *
+ * Twenty routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
@@ -92,6 +101,7 @@
  *   - `POST /worker/delivery/review-ledger/mark` — mark this PR/head's slot submitted.
  *   - `POST /worker/delivery/review-ledger/abandon` — release a pending slot.
  *   - `POST /worker/delivery/quota` — store this worker's own host's CLI quota snapshots.
+ *   - `POST /worker/delivery/update-report` — record what became of a requested self-update.
  *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
@@ -100,7 +110,7 @@
  * `handleFindWorkItemForArtifact`, `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
  * `handleAddPmLabel`, `handleAddBlockedBy`, `handleScheduleFollowUpReview`,
  * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`,
- * `handleReportCliQuota`) so tests drive them with fake deps and never need a live
+ * `handleReportCliQuota`, `handleReportWorkerUpdate`) so tests drive them with fake deps and never need a live
  * router; collaborators default to the real services and are overridden in tests.
  * Credential handling matches the handshake's contract — the raw credential
  * appears only in the `Authorization: Bearer` header, is never logged, never
@@ -120,7 +130,7 @@ import {
 import { listEnrollmentsForWorker } from '../db/repositories/workerEnrollmentsRepository.js';
 import type { Worker } from '../identity/worker.js';
 import { isRoutable } from '../identity/worker-enrollment.js';
-import { resolveWorkerByCredential } from '../identity/worker-service.js';
+import { recordWorkerUpdateReport, resolveWorkerByCredential } from '../identity/worker-service.js';
 // Side-effect import: registers every PM and SCM provider manifest into its
 // registry before defaultDeps() resolves the project's SCM provider below. This
 // module reads the registry at request time, so it must not rely on a sibling
@@ -156,6 +166,7 @@ import {
 	PostCommentDeliveryRequestSchema,
 	PriorReviewLedgerRequestSchema,
 	ReportCliQuotaDeliveryRequestSchema,
+	ReportWorkerUpdateDeliveryRequestSchema,
 	SubmitReviewDeliveryRequestSchema,
 	TRANSPORT_PROTOCOL_VERSION,
 	UpdateWorkItemDeliveryRequestSchema,
@@ -194,6 +205,13 @@ export interface WorkerDeliveryDeps {
 	 * database.
 	 */
 	persistCliQuota: typeof upsertCliQuota;
+	/**
+	 * Record what a machine reported became of the self-update it was asked for
+	 * (issue #933), defaulted to the service seam this process reaches over
+	 * `DATABASE_URL` — the write a DB-free worker cannot perform itself. `undefined`
+	 * back means the report answers no outstanding request.
+	 */
+	recordWorkerUpdateReport: typeof recordWorkerUpdateReport;
 }
 
 /** A worker may deliver to a project only via a routable enrollment (active + sharing consent). */
@@ -215,6 +233,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
 		persistCliQuota: upsertCliQuota,
+		recordWorkerUpdateReport,
 	};
 }
 
@@ -1007,6 +1026,56 @@ export async function handleReportCliQuota(
 	return { status: 200, json: { stored: request.snapshots.length } };
 }
 
+/**
+ * Record what a machine reported became of the self-update it was asked for (issue
+ * #933).
+ *
+ * Attribution works exactly as the quota route's does, and for the same reason: the
+ * row written is the one the *credential* resolved to, and the request carries no
+ * worker id to honour or ignore (`../transport/protocol.ts`), so a daemon can only
+ * ever report on itself. Not project-scoped either — being asked to update is a fact
+ * about a machine — so it runs {@link authenticateWorker}.
+ *
+ * `recorded: false` is a **success**, not a refusal: the report named a request the
+ * row is no longer waiting on — an operator re-targeted the machine, or this is a
+ * duplicate of one already recorded — so the pending request was left standing for
+ * the push that will answer it. The daemon treats it as information, never as a
+ * failure to retry.
+ */
+export async function handleReportWorkerUpdate(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = ReportWorkerUpdateDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const request = parsed.data;
+
+	if (request.protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateWorker(deps, credential);
+	if ('status' in authed) return authed;
+
+	const updated = await deps.recordWorkerUpdateReport(
+		authed.worker.id,
+		request.requestId,
+		request.status,
+		request.message,
+	);
+	logger.info('worker update: a machine reported the outcome of a requested update', {
+		workerId: authed.worker.id,
+		requestId: request.requestId,
+		target: request.target,
+		status: request.status,
+		recorded: updated !== undefined,
+	});
+	return { status: 200, json: { recorded: updated !== undefined } };
+}
+
 /** Extract the raw credential from an `Authorization: Bearer <credential>` header. */
 function extractBearerCredential(authorization: string | undefined): string | undefined {
 	if (!authorization) return undefined;
@@ -1144,6 +1213,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/quota', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleReportCliQuota(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/update-report', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleReportWorkerUpdate(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 }

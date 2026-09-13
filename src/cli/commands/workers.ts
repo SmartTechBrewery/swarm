@@ -79,6 +79,7 @@
  *   swarm workers remove <worker-id>
  *   swarm workers drain <worker-id>
  *   swarm workers undrain <worker-id>
+ *   swarm workers update <worker-id> <ref>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
@@ -125,6 +126,7 @@ Usage:
   swarm workers remove <worker-id>
   swarm workers drain <worker-id>
   swarm workers undrain <worker-id>
+  swarm workers update <worker-id> <ref>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
@@ -204,6 +206,19 @@ Usage:
              it, so sign in as them.
   undrain    Put a drained machine back in the pool — it may be given work again
              from the next re-check. The machine's owner alone may do it.
+  update     Ask a machine to move its SWARM install root to <ref> — a branch,
+             tag, or commit id, never a command, a path, or a URL — and restart
+             into it. Refused unless the machine is already draining, so drain
+             it first: the daemon waits for the phases it is already running to
+             finish before it applies anything, and only draining stops new work
+             arriving into that wait. The machine acts only if its host opted in
+             with SWARM_WORKER_SELF_UPDATE=true, and only a host whose SWARM
+             install root is NOT shared with another daemon may set that. Every
+             outcome — applied, already-current, declined, refused, failed — is
+             reported back and shown by 'list'; anything but 'applied' leaves the
+             machine working on the build it has. Requesting again replaces a
+             request that has not been answered yet. The machine's owner alone may
+             do it, so sign in as them. Remember to undrain it afterwards.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -247,6 +262,7 @@ const SUBCOMMANDS = [
 	'remove',
 	'drain',
 	'undrain',
+	'update',
 	'enroll',
 	'update-enrollment',
 	'approve',
@@ -280,6 +296,20 @@ const WorkerSchema = z.object({
 	capabilities: CapabilityListSchema,
 });
 
+/**
+ * The self-update state a row may carry (issue #933), read for the marker `list`
+ * prints. Optional and loosely typed on the same rule as everything else here: an
+ * older control plane simply answers without it, and `status` is read as a plain
+ * string because it is printed rather than acted on — a vocabulary this build has
+ * never heard of must not make `list` fail.
+ */
+const WorkerUpdateStateSchema = z.object({
+	requestId: z.string().nullable(),
+	target: z.string().min(1),
+	status: z.string().nullable(),
+});
+type WorkerUpdateState = z.infer<typeof WorkerUpdateStateSchema>;
+
 const RosterSchema = z.array(
 	z.object({
 		workerId: z.string().min(1),
@@ -288,6 +318,7 @@ const RosterSchema = z.array(
 		// Optional per this file's own rule: a control plane answering with fewer
 		// fields than these is not a failure, so an older one simply marks nothing.
 		drainingSince: z.string().nullable().optional(),
+		update: WorkerUpdateStateSchema.nullable().optional(),
 		owner: z.object({ identifier: z.string().min(1) }).nullable(),
 	}),
 );
@@ -298,6 +329,7 @@ const OwnWorkersSchema = z.array(
 		displayName: z.string().min(1),
 		capabilities: CapabilityListSchema,
 		drainingSince: z.string().nullable().optional(),
+		update: WorkerUpdateStateSchema.nullable().optional(),
 	}),
 );
 
@@ -329,6 +361,17 @@ const DrainStateSchema = z.object({
 	drainingSince: z.string().nullable(),
 	busy: z.boolean(),
 	currentRunId: z.string().nullable(),
+});
+
+/**
+ * `workers.requestUpdate` (issue #933) — the acknowledgement, not an outcome: the
+ * machine has been *asked*, and what it answers arrives later on its own route and
+ * is read back through `list`.
+ */
+const RequestedUpdateSchema = z.object({
+	workerId: z.string().min(1),
+	displayName: z.string().min(1),
+	target: z.string().min(1),
 });
 
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
@@ -531,10 +574,29 @@ function printWorker(
 	capabilities: string[],
 	ownerIdentifier?: string,
 	drainingSince?: string | null,
+	update?: WorkerUpdateState | null,
 ): void {
 	const prefix = ownerIdentifier ? `${ownerIdentifier}\t` : '';
-	const suffix = drainingSince ? '\tdraining' : '';
+	const suffix = `${drainingSince ? '\tdraining' : ''}${describeUpdate(update)}`;
 	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}${suffix}`);
+}
+
+/**
+ * The self-update marker on a `list` line (issue #933): the target the machine was
+ * asked for, and either that the request is still outstanding or the outcome it
+ * reported.
+ *
+ * Both halves are worth a column of their own. A request nobody has answered is the
+ * thing an operator is waiting on — a machine that is offline, or has not been
+ * restarted into the new build yet — and an outcome that is not `applied` is the
+ * one an operator would otherwise never see: nothing about the machine changes when
+ * an update is declined or fails, so without this it simply carries on looking
+ * normal on a build that is not the one asked for.
+ */
+function describeUpdate(update?: WorkerUpdateState | null): string {
+	if (!update) return '';
+	if (update.requestId) return `\tupdate ${update.target} pending`;
+	return `\tupdate ${update.target} ${update.status ?? 'unreported'}`;
 }
 
 /**
@@ -573,6 +635,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				worker.capabilities,
 				undefined,
 				worker.drainingSince,
+				worker.update,
 			);
 		}
 		return 0;
@@ -594,6 +657,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				worker.capabilities,
 				undefined,
 				worker.drainingSince,
+				worker.update,
 			);
 		}
 		return 0;
@@ -610,6 +674,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 			worker.capabilities,
 			worker.owner?.identifier,
 			worker.drainingSince,
+			worker.update,
 		);
 	}
 	return 0;
@@ -805,6 +870,53 @@ async function drainCommand(argv: string[], draining: boolean): Promise<number> 
 	}
 	out.info(
 		`${machine} is draining and idle — safe to restart. It stays out of the pool until 'swarm workers undrain ${workerId}'.`,
+	);
+	return 0;
+}
+
+/**
+ * Ask a machine to move its SWARM install root to a ref and restart into it (issue
+ * #933).
+ *
+ * What it prints is an **acknowledgement, not an outcome**, and says so: the machine
+ * may be offline, and even when it is connected it waits for the phases it is
+ * already running to finish before applying anything. The answer lands on the row
+ * later and is read back through `list`, which is why this command does not poll —
+ * unlike `drain`, whose useful answer (`has it gone idle yet?`) is server-derived and
+ * available immediately.
+ *
+ * The two refusals an operator will actually meet are both the control plane's own
+ * words, printed verbatim like every other refusal in this file: a machine still in
+ * the dispatch pool (`CONFLICT`, naming `swarm workers drain`) and a target that is
+ * not a well-formed ref (`BAD_REQUEST`). Validating the ref here as well would only
+ * let the two grammars drift.
+ */
+async function updateWorkerCommand(argv: string[]): Promise<number> {
+	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
+	const [workerId, target] = positionals;
+	if (!workerId || !target) {
+		out.error('workers update: a <worker-id> and a <ref> are required');
+		out.info(USAGE);
+		return 1;
+	}
+	if (!requireWorkerId(workerId)) return 1;
+
+	const operator = requireOperator();
+	if (!operator) return 1;
+
+	const requested = await operator.client.mutate(
+		'workers.requestUpdate',
+		{ workerId, target },
+		parseWith(RequestedUpdateSchema),
+	);
+	out.info(
+		`asked worker '${requested.displayName}' (${workerId}) to move to '${requested.target}' and restart`,
+	);
+	out.info(
+		'  it applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
+	);
+	out.info(
+		`  run 'swarm workers list' to read what it reported, then 'swarm workers undrain ${workerId}' to put it back in the pool`,
 	);
 	return 0;
 }
@@ -1480,6 +1592,8 @@ export async function run(argv: string[]): Promise<number> {
 				return await drainCommand(rest, true);
 			case 'undrain':
 				return await drainCommand(rest, false);
+			case 'update':
+				return await updateWorkerCommand(rest);
 			case 'enroll':
 				return await enrollCommand(rest);
 			case 'update-enrollment':

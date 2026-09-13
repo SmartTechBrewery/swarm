@@ -235,6 +235,32 @@ it does not (a PR-driven phase has no board card to take a title from). The Work
 table marks every drained machine in its **Status** column, beside — never instead
 of — Online/Offline, since a drained machine that is online is still online.
 
+**Updating one from the control plane.** A machine that has opted in
+(`SWARM_WORKER_SELF_UPDATE=true` — see
+[`docs/configuration.md`](./configuration.md) and
+[`docs/onboarding-worker.md`](./onboarding-worker.md)) can be asked to move its
+SWARM **install root** to a build and restart into it, instead of pulling by hand on
+every host (issue #933):
+
+```bash
+swarm workers drain <worker-id>          # required first, for the reason above
+swarm workers update <worker-id> main    # a branch, a tag, or a commit id
+swarm workers list                       # read what it reported
+swarm workers undrain <worker-id>        # back in the pool
+```
+
+Nothing about the restart differs from the one above — the daemon waits until it
+holds no in-flight phase, applies the update, releases its session and exits 0, and
+the host's process supervisor (launchd `KeepAlive` / systemd `Restart=always`) starts
+it again on the new build. That supervisor is a prerequisite: without one the machine
+simply stops. The request is refused while the machine is still in the pool, and with
+the opt-in flag off the machine reports `declined` and carries on working. `list`
+shows the outcome — `applied`, `already-current`, `declined`, `refused`, `failed` —
+and anything but `applied` leaves the machine on the build it had. **Until the
+shared-install lock lands (issue #920 phase 4), a host whose SWARM install root is
+shared by several daemons must not opt in**: the update would swap the code under the
+others mid-phase.
+
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
 many of its runs happen at once. Dispatch always runs on the control

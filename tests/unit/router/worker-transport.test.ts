@@ -55,6 +55,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
+		update: null,
 		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -107,6 +108,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		onWorkerTransportLost: vi.fn(),
 		onWorkerTransportRestored: vi.fn(),
 		resendRunCancellations: vi.fn(),
+		resendPendingWorkerUpdate: vi.fn(),
 		...overrides,
 	};
 }
@@ -1425,5 +1427,42 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 		handlers.onOpen?.({}, fakeWs());
 
 		expect(deps.resendRunCancellations).not.toHaveBeenCalled();
+		expect(deps.resendPendingWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	// Issue #933 — the same window, and for this feature the *ordinary* case rather
+	// than a blip: the mutation refuses unless the machine is draining, so an operator
+	// typically asks while it is idle, restarting, or offline.
+	it('re-states a pending self-update when the worker reconnects', async () => {
+		const deps = makeDeps();
+
+		const { handlers, ws } = await connect(deps);
+
+		expect(deps.resendPendingWorkerUpdate).toHaveBeenCalledWith(WORKER_ID);
+		await handlers.onClose?.({}, ws);
+	});
+
+	// Same property the sibling open hooks hold: registration is what connectivity
+	// depends on and it already happened, so a hook that throws costs the re-push and
+	// nothing else.
+	it('keeps the socket registered when the self-update re-push throws', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			resendPendingWorkerUpdate: vi.fn(() => {
+				throw new Error('database is down');
+			}),
+		});
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+
+		expect(() => handlers.onOpen?.({}, ws)).not.toThrow();
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(warnSpy).toHaveBeenCalled();
+
+		await handlers.onClose?.({}, ws);
+		warnSpy.mockRestore();
 	});
 });

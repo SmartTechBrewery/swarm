@@ -2,11 +2,13 @@
  * Moving one machine's SWARM **install root** to a requested build — or leaving it
  * exactly as it was and saying why (issue #920).
  *
- * This is the host-local half of worker self-update and nothing else: it is called
- * by nobody yet, it never exits the process, and it never decides *when* an update
- * is safe. A machine where several daemons share one install root can still have
- * its code swapped underneath a running phase; the lock that makes that impossible
- * is a later phase's job.
+ * This is the host-local half of worker self-update and nothing else: it never
+ * exits the process, and it never decides *when* an update is safe. Its caller does
+ * (`../transport/worker-update.ts`, issue #933) — the opt-in, the wait for an idle
+ * daemon, and the restart all live there. A machine where several daemons share one
+ * install root can still have its code swapped underneath a running phase; the lock
+ * that makes that impossible is a later phase's job, which is why such a machine
+ * must not set `SWARM_WORKER_SELF_UPDATE` until it lands.
  *
  * **What it operates on.** `swarmInstallRoot()` (`../lib/build-identity.ts`) —
  * never `process.cwd()` and never `SWARM_WORKER_REPO_ROOT`. On the control-plane

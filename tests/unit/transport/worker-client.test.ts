@@ -43,6 +43,8 @@ const SESSION_ID = '33333333-3333-4333-8333-333333333333';
 const CREDENTIAL = 'raw-worker-credential-secret';
 const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
 const RUN_ID = '55555555-5555-4555-8555-555555555555';
+/** The self-update request the `worker-update` frames below name (issue #933). */
+const UPDATE_REQUEST_ID = '66666666-6666-4666-8666-666666666666';
 const OTHER_DISPATCH_ID = '66666666-6666-4666-8666-666666666666';
 
 /** A recorded log line, so the abandonment/eviction levels can be asserted. */
@@ -1266,6 +1268,70 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		expect(written).toEqual([resultFrame()]);
 		expect(onCancel).not.toHaveBeenCalled();
 
+		await client.stop();
+	});
+
+	// Issue #933: the one pushed frame that concerns the machine rather than a
+	// dispatch. It is handed no sink — its answer takes a delivery route.
+	it('hands a worker-update frame to the registered onUpdate handler', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const onUpdate = vi.fn();
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onUpdate },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({
+			type: 'worker-update',
+			requestId: UPDATE_REQUEST_ID,
+			target: 'main',
+		});
+
+		expect(onUpdate).toHaveBeenCalledTimes(1);
+		expect(onUpdate).toHaveBeenCalledWith({
+			type: 'worker-update',
+			requestId: UPDATE_REQUEST_ID,
+			target: 'main',
+		});
+		await client.stop();
+	});
+
+	it('ignores a worker-update when no handler is registered, keeping the session live', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({ type: 'worker-update', requestId: UPDATE_REQUEST_ID, target: 'main' });
+		await flush();
+
+		expect(sockets[0].closedWith).toBeUndefined();
+		await client.stop();
+	});
+
+	// A target the grammar rejects never reaches the handler at all: the frame fails
+	// to parse, which is the same logged no-op an unrecognised frame gets.
+	it('never hands onUpdate a target that is not a well-formed ref', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const onUpdate = vi.fn();
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onUpdate },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({
+			type: 'worker-update',
+			requestId: UPDATE_REQUEST_ID,
+			target: 'main; rm -rf /',
+		});
+		await flush();
+
+		expect(onUpdate).not.toHaveBeenCalled();
+		expect(sockets[0].closedWith).toBeUndefined();
 		await client.stop();
 	});
 

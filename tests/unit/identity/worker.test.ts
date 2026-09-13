@@ -23,6 +23,9 @@ const validWorker = {
 	// `repository` is: no reader gets an "absent" case to interpret.
 	drainingSince: null,
 	build: null,
+	// Nobody has asked this machine to update (issue #933) — nullable for the same
+	// reason `build` is, so no reader gets an "absent" case to interpret.
+	update: null,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };

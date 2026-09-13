@@ -54,14 +54,25 @@ const {
 		updateEnrollmentConstraints: vi.fn(),
 	};
 });
-const { declareWorkerCapabilities, getWorker, registerWorker, renameWorker, setWorkerDraining } =
-	vi.hoisted(() => ({
-		declareWorkerCapabilities: vi.fn(),
-		getWorker: vi.fn(),
-		registerWorker: vi.fn(),
-		renameWorker: vi.fn(),
-		setWorkerDraining: vi.fn(),
-	}));
+const {
+	declareWorkerCapabilities,
+	getWorker,
+	registerWorker,
+	renameWorker,
+	requestWorkerUpdate,
+	setWorkerDraining,
+} = vi.hoisted(() => ({
+	declareWorkerCapabilities: vi.fn(),
+	getWorker: vi.fn(),
+	registerWorker: vi.fn(),
+	renameWorker: vi.fn(),
+	requestWorkerUpdate: vi.fn(),
+	setWorkerDraining: vi.fn(),
+}));
+// Issue #933 — the API server publishes; only the router holds worker sockets.
+const { publishWorkerUpdateRequest } = vi.hoisted(() => ({
+	publishWorkerUpdateRequest: vi.fn(),
+}));
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -104,8 +115,10 @@ vi.mock('@/identity/worker-service.js', () => ({
 	getWorker,
 	registerWorker,
 	renameWorker,
+	requestWorkerUpdate,
 	setWorkerDraining,
 }));
+vi.mock('@/queue/worker-updates.js', () => ({ publishWorkerUpdateRequest }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier }));
@@ -167,6 +180,8 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
+		// Nobody has asked this machine to update (issue #933).
+		update: null,
 		build: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
@@ -218,7 +233,9 @@ beforeEach(() => {
 		getWorker,
 		registerWorker,
 		renameWorker,
+		requestWorkerUpdate,
 		setWorkerDraining,
+		publishWorkerUpdateRequest,
 		removeWorker,
 		getMembership,
 		listAccessibleProjectIds,
@@ -504,7 +521,12 @@ describe('workers.list scoped to one project (issue #574)', () => {
 		const rows = await owner.list({ projectId: 'p1' });
 
 		expect(rows).toEqual([
-			{ workerId: WORKER_ID, lastSeenAt: '2026-07-01T12:00:00.000Z', drainingSince: null },
+			{
+				workerId: WORKER_ID,
+				lastSeenAt: '2026-07-01T12:00:00.000Z',
+				drainingSince: null,
+				update: null,
+			},
 		]);
 	});
 
@@ -1451,6 +1473,142 @@ describe('workers.setDraining (owner-only, no instanceAdmin override, issue #919
 		await expect(owner.setDraining({ workerId: WORKER_ID, draining: true })).rejects.toThrowError(
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
+	});
+});
+
+// Issue #933. The one mutation in this tree whose effect is to run *different
+// code* on somebody's hardware, so it is strictly owner-only and refuses unless
+// the machine is already out of the dispatch pool.
+describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => {
+	const DRAINED_AT = new Date('2026-09-13T10:00:00Z');
+	const REQUESTED_AT = new Date('2026-09-13T10:05:00Z');
+
+	/** A worker that is drained and so may be asked to update. */
+	function drained(overrides: Partial<Worker> = {}): Worker {
+		return makeWorker({ drainingSince: DRAINED_AT, ...overrides });
+	}
+
+	function requested(target: string): Worker {
+		return drained({
+			update: {
+				requestId: '66666666-6666-4666-8666-666666666666',
+				target,
+				requestedAt: REQUESTED_AT,
+				status: null,
+				message: null,
+				reportedAt: null,
+			},
+		});
+	}
+
+	it('is NOT_FOUND for an unknown worker', async () => {
+		getWorker.mockResolvedValue(undefined);
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(drained({ ownerUserId: OTHER_ID }));
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	// Replacing the code a machine runs is the machine operator's call, so it admits
+	// no layer-1 override — exactly like `setDraining`, unlike `enroll`.
+	it('hides another owner’s worker from an instanceAdmin too', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(drained({ ownerUserId: OWNER_ID }));
+
+		await expect(admin.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	// The precondition that makes the rest safe: the daemon waits for its in-flight
+	// phases to finish, and only draining stops new work arriving into that wait.
+	it('refuses a machine still in the dispatch pool, naming the remedy', async () => {
+		getWorker.mockResolvedValue(makeWorker({ drainingSince: null }));
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'CONFLICT',
+				message: expect.stringContaining(`swarm workers drain ${WORKER_ID}`),
+			}),
+		);
+		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	it('records the request and publishes it for the router to push', async () => {
+		getWorker.mockResolvedValue(drained());
+		requestWorkerUpdate.mockResolvedValue(requested('main'));
+
+		const result = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
+
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(publishWorkerUpdateRequest).toHaveBeenCalledWith(WORKER_ID);
+		expect(result).toMatchObject({
+			workerId: WORKER_ID,
+			target: 'main',
+			requestedAt: REQUESTED_AT.toISOString(),
+			drainingSince: DRAINED_AT.toISOString(),
+		});
+	});
+
+	// The id the row waits on is the id the push carries, so the report can only ever
+	// close the request it actually answers.
+	it('mints the request id server-side and answers with it', async () => {
+		getWorker.mockResolvedValue(drained());
+		requestWorkerUpdate.mockResolvedValue(requested('main'));
+
+		const result = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
+
+		expect(result.requestId).toBe(requestWorkerUpdate.mock.calls[0]?.[1]);
+	});
+
+	// Rejected at the API rather than minutes later by a machine that had to be woken
+	// to say so — and the grammar is the security boundary, not a nicety.
+	it.each([
+		['a URL', 'https://example.com/evil.git'],
+		['a shell fragment', 'main; rm -rf /'],
+		['a git option', '--upload-pack=curl'],
+		['a revision expression', 'main~2'],
+	])('rejects %s as a target with BAD_REQUEST', async (_what, target) => {
+		getWorker.mockResolvedValue(drained());
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target })).rejects.toThrowError(
+			expect.objectContaining({ code: 'BAD_REQUEST' }),
+		);
+		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('is NOT_FOUND when the worker disappears between the check and the write', async () => {
+		getWorker.mockResolvedValue(drained());
+		requestWorkerUpdate.mockResolvedValue(undefined);
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	// Re-issuing overwrites, which is the only form of re-targeting this phase has.
+	it('overwrites an unanswered request with a fresh id', async () => {
+		getWorker.mockResolvedValue(drained());
+		requestWorkerUpdate.mockResolvedValueOnce(requested('main'));
+		const first = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
+		requestWorkerUpdate.mockResolvedValueOnce(requested('v2'));
+		const second = await owner.requestUpdate({ workerId: WORKER_ID, target: 'v2' });
+
+		expect(second.requestId).not.toBe(first.requestId);
+		expect(requestWorkerUpdate).toHaveBeenLastCalledWith(WORKER_ID, second.requestId, 'v2');
 	});
 });
 

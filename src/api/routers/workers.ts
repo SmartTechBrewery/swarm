@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
@@ -11,6 +13,7 @@ import {
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 	WorkerDisplayNameSchema,
+	type WorkerUpdateState,
 } from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
@@ -37,10 +40,13 @@ import {
 	getWorker,
 	registerWorker,
 	renameWorker,
+	requestWorkerUpdate,
 	setWorkerDraining,
 	type Worker,
 } from '../../identity/worker-service.js';
 import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
+import { WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
+import { publishWorkerUpdateRequest } from '../../queue/worker-updates.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import {
 	accessibleProjectScope,
@@ -90,14 +96,18 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   `swarm workers remove`), takes a machine out of the dispatch pool so it can be
  *   restarted and puts it back (`setDraining`, issue #919 — reversible, sticky
  *   across the machine's reconnect, and answering with the machine's derived run
- *   state so the caller can tell when restarting is safe), and controls the
+ *   state so the caller can tell when restarting is safe), asks a *drained*
+ *   machine to move its SWARM install root to a build and restart into it
+ *   (`requestUpdate`, issue #933 — refused with `CONFLICT` while the machine is
+ *   still in the pool, since it would be given new work while it waits to
+ *   restart), and controls the
  *   revocable sharing consent
  *   (`setConsent`) and execution constraints (`updateConstraints`). Ownership is
  *   checked per call. `enroll` alone lets an `instanceAdmin` act on any worker
  *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
  *   reads as administering the project side of that offer; `rename`,
- *   `setDeclaredCapabilities`, `remove`, `setDraining`, `setConsent`, and
- *   `updateConstraints`
+ *   `setDeclaredCapabilities`, `remove`, `setDraining`, `requestUpdate`,
+ *   `setConsent`, and `updateConstraints`
  *   are the machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
@@ -306,6 +316,21 @@ function inProjectOrder(
 	return [...workers].sort((a, b) => rank(a) - rank(b));
 }
 
+/**
+ * The wire form of a worker's self-update state (issue #933) — the same explicit
+ * ISO-timestamp treatment `lastSeenAt` and `drainingSince` get above, applied to
+ * the two instants nested inside it, so a browser reads strings rather than
+ * whatever the serializer makes of a `Date`.
+ */
+function serializeWorkerUpdate(update: WorkerUpdateState | null) {
+	if (!update) return null;
+	return {
+		...update,
+		requestedAt: update.requestedAt.toISOString(),
+		reportedAt: update.reportedAt?.toISOString() ?? null,
+	};
+}
+
 const AllowedClisInput = z.array(AgentCliSchema).min(1);
 /**
  * The phases an enrollment may be given (issue #509). Non-empty for the same
@@ -356,6 +381,7 @@ export const workersRouter = router({
 				...worker,
 				lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
 				drainingSince: worker.drainingSince?.toISOString() ?? null,
+				update: serializeWorkerUpdate(worker.update),
 			}));
 		}),
 
@@ -393,6 +419,7 @@ export const workersRouter = router({
 				...detail,
 				lastSeenAt: detail.lastSeenAt?.toISOString() ?? null,
 				drainingSince: detail.drainingSince?.toISOString() ?? null,
+				update: serializeWorkerUpdate(detail.update),
 				viewerIsOwner,
 				enrollments,
 			};
@@ -610,6 +637,65 @@ export const workersRouter = router({
 				drainingSince: updated.drainingSince?.toISOString() ?? null,
 				busy: runState.busy,
 				currentRunId: runState.currentRunId,
+			};
+		}),
+
+	// Ask one of the caller's own machines to move its SWARM install root to a build
+	// and restart into it (issue #933). The request is recorded on the worker row and
+	// published; the router — the process that holds worker sockets — turns that into
+	// the push (`../../router/worker-update-dispatch.ts`), and the machine reports
+	// back on its own delivery route.
+	//
+	// Strictly owner-only, exactly like `setDraining` and `rename`: replacing the code
+	// a machine runs is the machine operator's call, so an `instanceAdmin` who does not
+	// own it gets the same NOT_FOUND a stranger does. That is not a formality here —
+	// this is the one mutation in the tree whose effect is to run different code on
+	// somebody's hardware.
+	//
+	// **Refused unless the machine is already draining** (issue #919), which is the
+	// precondition that makes the rest of this safe rather than a policy about
+	// tidiness: the daemon waits for its in-flight phases to finish before it applies
+	// anything, and only draining guarantees no *new* work is dispatched into that
+	// wait. The refusal names `swarm workers drain <id>` rather than draining the
+	// machine itself — taking a machine out of the pool is its own decision with its
+	// own idempotence, and doing it as a side effect would leave the operator with a
+	// drained machine they never asked for if the update is then refused downstream.
+	//
+	// The target is validated against the shared grammar before anything is written,
+	// so a malformed one is `BAD_REQUEST` here rather than a `refused` report minutes
+	// later from a machine that had to be woken to say so.
+	//
+	// Re-issuing overwrites: the row keeps one request, and the new one's id is what
+	// the next report must name. There is deliberately no cancel — a machine that has
+	// not acted is left with a request nothing pushes again until it reconnects, and
+	// one that has acted has already restarted.
+	requestUpdate: authedProcedure
+		.input(z.object({ workerId: z.string().uuid(), target: WorkerUpdateTargetSchema }))
+		.mutation(async ({ ctx, input }) => {
+			const worker = await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			if (!worker.drainingSince) {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						`Worker '${worker.displayName}' is still in the dispatch pool, so it cannot be ` +
+						`asked to update: it would be given new work while it waits to restart. Run ` +
+						`\`swarm workers drain ${input.workerId}\` first, then request the update.`,
+				});
+			}
+			const requestId = randomUUID();
+			const updated = await requestWorkerUpdate(input.workerId, requestId, input.target);
+			if (!updated) throw workerNotFound(input.workerId);
+			// After the durable write, and never awaited for correctness: the request lives
+			// on the row, so a router that misses this notification pushes it the moment the
+			// machine next connects. The publish swallows its own failures for that reason.
+			await publishWorkerUpdateRequest(input.workerId);
+			return {
+				workerId: updated.id,
+				displayName: updated.displayName,
+				requestId,
+				target: input.target,
+				requestedAt: updated.update?.requestedAt.toISOString() ?? null,
+				drainingSince: updated.drainingSince?.toISOString() ?? null,
 			};
 		}),
 

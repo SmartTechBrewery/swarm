@@ -13,7 +13,9 @@ import {
 	getWorkersByIds,
 	listAllWorkers,
 	listWorkersForOwner,
+	recordWorkerUpdateReport,
 	removeWorker,
+	requestWorkerUpdate,
 	setWorkerDeclaredCapabilities,
 	setWorkerDraining,
 	updateWorkerCapabilities,
@@ -446,6 +448,130 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			const after = await getWorkerById(id);
 			expect(after?.drainingSince).toEqual(drained?.drainingSince);
 			expect(after?.repository).toBe('acme/api');
+		});
+	});
+
+	// Issue #933 — the self-update request and its report, which are six columns
+	// read back as one value. Only a real database catches the id-matched `WHERE`
+	// silently matching nothing, or a report clearing the target it describes.
+	describe('requestWorkerUpdate / recordWorkerUpdateReport', () => {
+		const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+		const OTHER_REQUEST_ID = '77777777-7777-4777-8777-777777777777';
+
+		async function freshWorker(name: string): Promise<string> {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: name,
+				capabilities: ['claude'],
+				credentialHash: `hash-${name}`,
+			});
+			return created.id;
+		}
+
+		it('leaves a newly registered worker with no request and no outcome', async () => {
+			const id = await freshWorker('ada-no-update');
+			expect((await getWorkerById(id))?.update).toBeNull();
+		});
+
+		it('records a request as pending, with no outcome yet', async () => {
+			const id = await freshWorker('ada-update');
+
+			const requested = await requestWorkerUpdate(id, REQUEST_ID, 'main');
+
+			expect(requested?.update).toMatchObject({
+				requestId: REQUEST_ID,
+				target: 'main',
+				status: null,
+				message: null,
+				reportedAt: null,
+			});
+			expect(requested?.update?.requestedAt).toBeInstanceOf(Date);
+			expect((await getWorkerById(id))?.update).toEqual(requested?.update);
+		});
+
+		// The report clears the pending marker and keeps the target: an outcome naming
+		// no build answers nothing.
+		it('records an outcome, clears the pending marker, and keeps the target', async () => {
+			const id = await freshWorker('ada-report');
+			await requestWorkerUpdate(id, REQUEST_ID, 'main');
+
+			const reported = await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+
+			expect(reported?.update).toMatchObject({
+				requestId: null,
+				target: 'main',
+				status: 'applied',
+				message: 'Applied.',
+			});
+			expect(reported?.update?.reportedAt).toBeInstanceOf(Date);
+		});
+
+		// The id match is what stops a report for a superseded request from un-pending
+		// the one an operator has since made.
+		it('ignores a report naming a request the row has moved on from', async () => {
+			const id = await freshWorker('ada-superseded');
+			await requestWorkerUpdate(id, REQUEST_ID, 'main');
+			await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2');
+
+			const stale = await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+
+			expect(stale).toBeUndefined();
+			expect((await getWorkerById(id))?.update).toMatchObject({
+				requestId: OTHER_REQUEST_ID,
+				target: 'v2',
+				status: null,
+			});
+		});
+
+		it('ignores a duplicate report of a request already answered', async () => {
+			const id = await freshWorker('ada-duplicate');
+			await requestWorkerUpdate(id, REQUEST_ID, 'main');
+			await recordWorkerUpdateReport(id, REQUEST_ID, 'failed', "'npm ci' failed.");
+
+			const repeat = await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+
+			expect(repeat).toBeUndefined();
+			expect((await getWorkerById(id))?.update).toMatchObject({
+				status: 'failed',
+				message: "'npm ci' failed.",
+			});
+		});
+
+		// Re-targeting is the only form of cancel this phase has, so a fresh request
+		// must not leave the previous one's verdict standing beside it.
+		it('clears a previous outcome when the machine is asked again', async () => {
+			const id = await freshWorker('ada-retarget');
+			await requestWorkerUpdate(id, REQUEST_ID, 'main');
+			await recordWorkerUpdateReport(id, REQUEST_ID, 'refused', 'The install root is dirty.');
+
+			const again = await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2');
+
+			expect(again?.update).toMatchObject({
+				requestId: OTHER_REQUEST_ID,
+				target: 'v2',
+				status: null,
+				message: null,
+				reportedAt: null,
+			});
+		});
+
+		it('returns undefined for an unknown worker — a not-found, not an error', async () => {
+			const unknown = '99999999-9999-4999-8999-999999999999';
+			expect(await requestWorkerUpdate(unknown, REQUEST_ID, 'main')).toBeUndefined();
+			expect(
+				await recordWorkerUpdateReport(unknown, REQUEST_ID, 'applied', 'Applied.'),
+			).toBeUndefined();
+		});
+
+		// The same stickiness `draining_since` has, and for the same reason: this is the
+		// operator's request, not a fact the daemon re-declares on connect.
+		it('survives a handshake refreshing the daemon-declared columns', async () => {
+			const id = await freshWorker('ada-update-sticky');
+			const requested = await requestWorkerUpdate(id, REQUEST_ID, 'main');
+
+			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
+
+			expect((await getWorkerById(id))?.update).toEqual(requested?.update);
 		});
 	});
 

@@ -81,6 +81,7 @@ function makeCandidate(
 			repository: overrides.repository === undefined ? REPOSITORY : overrides.repository,
 			// In the pool (issue #919) for every case that says nothing about draining.
 			drainingSince: overrides.drainingSince ?? null,
+			update: null,
 			build: null,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),

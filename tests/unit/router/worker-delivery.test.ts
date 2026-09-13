@@ -21,6 +21,7 @@ import {
 	handlePostComment,
 	handlePriorReview,
 	handleReportCliQuota,
+	handleReportWorkerUpdate,
 	handleScheduleFollowUpReview,
 	handleSubmitReview,
 	handleUpdateWorkItem,
@@ -49,6 +50,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
 		drainingSince: null,
+		update: null,
 		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -120,6 +122,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		reviewLedger: makeReviewLedger(),
 		scheduleFollowUpReview: vi.fn().mockResolvedValue(undefined),
 		persistCliQuota: vi.fn().mockResolvedValue(undefined),
+		recordWorkerUpdateReport: vi.fn().mockResolvedValue(makeWorker()),
 		...overrides,
 	};
 }
@@ -1588,5 +1591,125 @@ describe('handleReportCliQuota', () => {
 
 		expect(result).toEqual({ status: 200, json: { stored: 0 } });
 		expect(deps.persistCliQuota).not.toHaveBeenCalled();
+	});
+});
+
+// Issue #933 — the answer to a pushed `worker-update`. Same attribution contract
+// as the quota route above (the credential names the row), and the one response
+// field an operator never sees: whether this report closed the request that was
+// actually pending.
+describe('handleReportWorkerUpdate', () => {
+	const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+
+	function updateBody(overrides: Record<string, unknown> = {}) {
+		return {
+			requestId: REQUEST_ID,
+			target: 'main',
+			status: 'applied',
+			message: 'Applied: the SWARM install root moved to abc1234 and was rebuilt there.',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('records the outcome against the authenticated worker', async () => {
+		const deps = makeDeps();
+
+		const result = await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody());
+
+		expect(result).toEqual({ status: 200, json: { recorded: true } });
+		expect(deps.recordWorkerUpdateReport).toHaveBeenCalledWith(
+			WORKER_ID,
+			REQUEST_ID,
+			'applied',
+			expect.stringContaining('Applied'),
+		);
+	});
+
+	it('keys the row on the credential rather than on any worker the body names', async () => {
+		const deps = makeDeps();
+
+		// The frame carries no worker id at all, so one smuggled in is dropped by the
+		// schema — and the row is still the authenticated worker's.
+		await handleReportWorkerUpdate(
+			deps,
+			CREDENTIAL,
+			updateBody({ workerId: '99999999-9999-4999-8999-999999999999' }),
+		);
+
+		expect(deps.recordWorkerUpdateReport).toHaveBeenCalledWith(
+			WORKER_ID,
+			REQUEST_ID,
+			'applied',
+			expect.anything(),
+		);
+	});
+
+	// `recorded: false` is a success, not a refusal: the outcome is still written,
+	// but the row has moved on to a request this report does not answer.
+	it('answers recorded:false when the report closes no pending request', async () => {
+		const deps = makeDeps({ recordWorkerUpdateReport: vi.fn().mockResolvedValue(undefined) });
+
+		const result = await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody());
+
+		expect(result).toEqual({ status: 200, json: { recorded: false } });
+	});
+
+	it('is 401 and records nothing for an unknown credential', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+
+		const result = await handleReportWorkerUpdate(deps, 'bogus', updateBody());
+
+		expect(result).toEqual({ status: 401, json: { authenticated: false } });
+		expect(deps.recordWorkerUpdateReport).not.toHaveBeenCalled();
+	});
+
+	it('needs no project enrollment — an update describes a machine', async () => {
+		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+
+		expect((await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody())).status).toBe(200);
+		expect(deps.isWorkerEnrolled).not.toHaveBeenCalled();
+	});
+
+	it('returns 400 for a malformed body, an unknown status, or a protocol mismatch', async () => {
+		const deps = makeDeps();
+
+		expect((await handleReportWorkerUpdate(deps, CREDENTIAL, { requestId: 'nope' })).status).toBe(
+			400,
+		);
+		expect(
+			(await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody({ status: 'in-progress' })))
+				.status,
+		).toBe(400);
+		expect(
+			(
+				await handleReportWorkerUpdate(
+					deps,
+					CREDENTIAL,
+					updateBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.recordWorkerUpdateReport).not.toHaveBeenCalled();
+	});
+
+	it('records every outcome the daemon can report, not only the applied one', async () => {
+		for (const status of ['already-current', 'refused', 'failed', 'declined']) {
+			const deps = makeDeps();
+
+			const result = await handleReportWorkerUpdate(
+				deps,
+				CREDENTIAL,
+				updateBody({ status, message: `reported ${status}` }),
+			);
+
+			expect(result.status).toBe(200);
+			expect(deps.recordWorkerUpdateReport).toHaveBeenCalledWith(
+				WORKER_ID,
+				REQUEST_ID,
+				status,
+				`reported ${status}`,
+			);
+		}
 	});
 });
