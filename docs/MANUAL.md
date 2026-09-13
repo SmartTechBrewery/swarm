@@ -265,6 +265,18 @@ shared-install lock lands (issue #920 phase 4), a host whose SWARM install root 
 shared by several daemons must not opt in**: the update would swap the code under the
 others mid-phase.
 
+An `applied` update that then cannot connect is recovered **by the machine**, not
+from here (issue #934): the build is only trusted once a daemon running it has
+handshaked once, so a machine that has started three times without once connecting
+— or that is rejected outright at the handshake — checks its last known good commit
+back out, rebuilds, and restarts on it. The start is counted before a line of the
+new build's own worker code is even loaded, so a build that dies on the way up —
+not only one that starts and then cannot connect — is counted and recovered too. It comes back reporting its *previous* build, which the
+Workers screen marks `OUTDATED` while `list` still reads `update <ref> applied`; that
+pairing is what says the update was tried and did not hold. It has to work this way
+because a build that cannot connect has taken away the only channel that could have
+told it to go back.
+
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
 many of its runs happen at once. Dispatch always runs on the control

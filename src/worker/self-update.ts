@@ -43,6 +43,17 @@
  * contract `resolveBuildIdentity` keeps next door: an install root that is not a git
  * checkout, a git that will not run, and a rejected subprocess are all answers, not
  * exceptions.
+ *
+ * **An applied build is not trusted until it has handshaked (issue #934).** Once the
+ * daemon on a new build cannot reach the control plane there is no channel left to
+ * tell it to go back, so the machine has to decide by itself — and it can only do
+ * that from something written down before the build it is judging started. That
+ * record is {@link PendingVerificationSchema}, and this module owns the three
+ * transitions on it: {@link recordFailedStart} at process start,
+ * {@link recordSuccessfulHandshake} on the first session, and
+ * {@link returnToLastKnownGood} once the machine has given up. *When* each of those
+ * happens stays the daemon's business (`../transport/build-verification.ts`) — the
+ * same split of mechanism from policy the apply above already keeps.
  */
 
 import { execFile } from 'node:child_process';
@@ -71,6 +82,18 @@ const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const OUTPUT_TAIL_CHARS = 4_000;
 
 const STATE_FILE = 'state.json';
+
+/**
+ * How many starts in a row may fail on a build being verified before the machine
+ * gives up on it and returns to the last known good one.
+ *
+ * Coded rather than configurable, like `IDLE_POLL_INTERVAL_MS` next door: the only
+ * thing a larger number buys is a longer outage on a machine nobody can reach, and
+ * the only thing a smaller one costs is a rollback on a build that would have
+ * connected on its third try. Three leaves room for a control plane that is itself
+ * restarting while still bounding the outage at a few supervisor restarts.
+ */
+export const MAX_FAILED_STARTS = 3;
 
 /** One subprocess this module wants run, fully described — never a shell string. */
 export interface UpdateCommand {
@@ -123,6 +146,29 @@ export type UpdateOutcome =
 	  };
 
 /**
+ * An applied update this machine has not proved yet: the build it moved to, the
+ * build it moved from, and how many starts in a row have failed since.
+ *
+ * It exists because the proof can only come from the *next* process — the one
+ * running the new code — and that process may not survive long enough to say
+ * anything. So the question "is this build any good?" is left on disk, phrased so
+ * that a machine which never gets a word in still answers it.
+ */
+export const PendingVerificationSchema = z.object({
+	/** The build that was applied and is being judged. */
+	commit: z.string().min(1),
+	/** The build it replaced — the same commit `lastKnownGood` still names until this one is proved. */
+	previousCommit: z.string().min(1),
+	/**
+	 * Counted at process start rather than on a failure, because the failure this
+	 * guards against can be a build that never reaches any code of its own.
+	 */
+	failedStarts: z.number().int().min(0),
+	startedAt: z.string().datetime(),
+});
+export type PendingVerification = z.infer<typeof PendingVerificationSchema>;
+
+/**
  * What this machine remembers about its own install root, at
  * `~/.swarm/install-updates/<sha256(realpath(installRoot))>/state.json`.
  *
@@ -130,7 +176,8 @@ export type UpdateOutcome =
  * **detached**, so git has no upstream to answer with on the second run; they are
  * recorded the first time an attached HEAD lets them be read. `lastKnownGood` is
  * written *before* a checkout, so a process killed mid-apply still leaves a readable
- * record of what to go back to.
+ * record of what to go back to, and it stays on the build that was running until a
+ * daemon on the new one has handshaked (issue #934).
  */
 export const InstallUpdateStateSchema = z.object({
 	/** The install root itself, recorded for whoever is reading an opaque `<sha256>` directory. */
@@ -142,6 +189,14 @@ export const InstallUpdateStateSchema = z.object({
 	target: z.string().min(1).nullable(),
 	targetCommit: z.string().min(1).nullable(),
 	appliedAt: z.string().datetime().nullable(),
+	/**
+	 * The applied update this machine is still proving, or `null` when there is
+	 * nothing outstanding. Defaulted rather than required so a state file written
+	 * before issue #934 parses as "nothing to verify": a state file this schema
+	 * refuses is a refused update (see `update` below), and every machine that has
+	 * ever been updated already has one.
+	 */
+	pendingVerification: PendingVerificationSchema.nullable().default(null),
 });
 export type InstallUpdateState = z.infer<typeof InstallUpdateStateSchema>;
 
@@ -161,11 +216,15 @@ export interface ApplyUpdateTargetOptions {
 	now?: () => Date;
 }
 
-interface UpdateContext {
-	target: string;
+/** One install root, and the two injectable things every step here needs. */
+interface InstallContext {
 	installRoot: string;
 	stateDir: string;
 	run: CommandRunner;
+}
+
+interface UpdateContext extends InstallContext {
+	target: string;
 	now: () => Date;
 }
 
@@ -230,7 +289,7 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 		);
 	}
 
-	const stored = readJson(join(ctx.stateDir, STATE_FILE), InstallUpdateStateSchema);
+	const stored = readState(ctx.stateDir);
 	if (stored === undefined) {
 		return refuse(
 			`The update state for the SWARM install root '${ctx.installRoot}' is unreadable ` +
@@ -285,7 +344,7 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 
 	// Written before the checkout on purpose: a process killed mid-apply must still
 	// leave behind the commit to go back to.
-	writeState(ctx.stateDir, {
+	const applying: InstallUpdateState = {
 		installRoot: ctx.installRoot,
 		remote: tracking.remote,
 		trackedBranch: tracking.branch,
@@ -293,7 +352,12 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 		target,
 		targetCommit: commit,
 		appliedAt: ctx.now().toISOString(),
-	});
+		// Nothing is being verified while an apply is in flight: this process was asked
+		// for an update over a socket it had handshaked on, which is precisely what
+		// promotes whatever was outstanding. A record surviving that is stale.
+		pendingVerification: null,
+	};
+	writeState(ctx.stateDir, applying);
 
 	logger.info('Applying SWARM install update', {
 		installRoot: ctx.installRoot,
@@ -301,7 +365,22 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 		commit,
 		previousCommit: currentCommit,
 	});
-	return applyCommit(ctx, currentCommit, commit);
+	const outcome = await applyCommit(ctx, currentCommit, commit);
+	if (outcome.status === 'applied') {
+		// The build is on disk but unproved: the daemon that will run it has not started
+		// yet, let alone handshaked. Recorded now so the *next* process finds the question
+		// already asked (issue #934).
+		writeState(ctx.stateDir, {
+			...applying,
+			pendingVerification: {
+				commit,
+				previousCommit: currentCommit,
+				failedStarts: 0,
+				startedAt: ctx.now().toISOString(),
+			},
+		});
+	}
+	return outcome;
 }
 
 /**
@@ -380,6 +459,7 @@ function recordTracking(
 		target: stored?.target ?? null,
 		targetCommit: stored?.targetCommit ?? null,
 		appliedAt: stored?.appliedAt ?? null,
+		pendingVerification: stored?.pendingVerification ?? null,
 	});
 }
 
@@ -403,24 +483,53 @@ async function resolveTargetCommit(
 	);
 }
 
+/**
+ * Put the install root on `commit` and make it runnable there — the three steps an
+ * apply, a rollback and a return to the last known good build all share, in the one
+ * order they may run in. Answers the first step that failed, or `null` when all
+ * three succeeded.
+ */
+async function buildAt(
+	ctx: InstallContext,
+	commit: string,
+): Promise<{ stage: UpdateFailureStage; result: UpdateCommandResult } | null> {
+	const checkout = await ctx.run(
+		git(ctx, ['checkout', '--detach', commit], GIT_CHECKOUT_TIMEOUT_MS),
+	);
+	if (checkout.exitCode !== 0) return { stage: 'checkout', result: checkout };
+	const install = await ctx.run(npm(ctx, ['ci']));
+	if (install.exitCode !== 0) return { stage: 'install', result: install };
+	const build = await ctx.run(npm(ctx, ['run', 'build']));
+	if (build.exitCode !== 0) return { stage: 'build', result: build };
+	return null;
+}
+
+/** What failed, in the words the operator-facing `reason` is built from. */
+function describeStage(stage: UpdateFailureStage, commit: string): string {
+	switch (stage) {
+		case 'checkout':
+			return `git could not check out ${commit}`;
+		case 'install':
+			return "'npm ci' failed";
+		case 'build':
+			return "'npm run build' failed";
+	}
+}
+
 async function applyCommit(
 	ctx: UpdateContext,
 	previousCommit: string,
 	commit: string,
 ): Promise<UpdateOutcome> {
-	const checkout = await ctx.run(
-		git(ctx, ['checkout', '--detach', commit], GIT_CHECKOUT_TIMEOUT_MS),
-	);
-	if (checkout.exitCode !== 0) {
-		return failure(ctx, 'checkout', previousCommit, checkout, `git could not check out ${commit}`);
-	}
-	const install = await ctx.run(npm(ctx, ['ci']));
-	if (install.exitCode !== 0) {
-		return failure(ctx, 'install', previousCommit, install, "'npm ci' failed");
-	}
-	const build = await ctx.run(npm(ctx, ['run', 'build']));
-	if (build.exitCode !== 0) {
-		return failure(ctx, 'build', previousCommit, build, "'npm run build' failed");
+	const failed = await buildAt(ctx, commit);
+	if (failed) {
+		return failure(
+			ctx,
+			failed.stage,
+			previousCommit,
+			failed.result,
+			describeStage(failed.stage, commit),
+		);
 	}
 	return { status: 'applied', commit, previousCommit };
 }
@@ -468,25 +577,198 @@ async function rollBack(
 		const head = await gitRead(ctx, ['rev-parse', 'HEAD'], GIT_READ_TIMEOUT_MS);
 		if (head === previousCommit) return true;
 	}
-	const checkout = await ctx.run(
-		git(ctx, ['checkout', '--detach', previousCommit], GIT_CHECKOUT_TIMEOUT_MS),
-	);
-	if (checkout.exitCode !== 0) return false;
-	if ((await ctx.run(npm(ctx, ['ci']))).exitCode !== 0) return false;
-	return (await ctx.run(npm(ctx, ['run', 'build']))).exitCode === 0;
+	return (await buildAt(ctx, previousCommit)) === null;
 }
 
-function git(ctx: UpdateContext, args: string[], timeoutMs: number): UpdateCommand {
+// --- Verifying an applied build (issue #934) -------------------------------
+
+/** Which install root a state transition is about. Both default the way an apply does. */
+export interface InstallStateOptions {
+	/** Defaults to {@link swarmInstallRoot} — see the module header for why that anchor. */
+	installRoot?: string;
+	/** Injectable so tests never touch the real home directory. */
+	homeDir?: string;
+}
+
+export interface ReturnToLastKnownGoodOptions extends InstallStateOptions {
+	run?: CommandRunner;
+}
+
+/** Which step of a return failed — an apply's three, plus clearing the record afterwards. */
+export type ReturnFailureStage = UpdateFailureStage | 'record';
+
+/** What became of a return to the last known good build. Never thrown, like {@link UpdateOutcome}. */
+export type ReturnOutcome =
+	| { status: 'returned'; commit: string; abandonedCommit: string }
+	/** There was no applied build awaiting proof, so there was nothing to return from. */
+	| { status: 'nothing-pending' }
+	| { status: 'failed'; stage: ReturnFailureStage; reason: string; outputTail: string };
+
+/**
+ * The applied build this machine is still proving, or `null` — including when the
+ * state file is missing or unreadable, since neither says anything about a build.
+ */
+export function readPendingVerification(
+	options: InstallStateOptions = {},
+): PendingVerification | null {
+	return readState(stateDirFor(options))?.pendingVerification ?? null;
+}
+
+/**
+ * Count one start of a build that has not handshaked yet, and answer with the record
+ * as it now stands — or `null` when nothing is being verified, which is the ordinary
+ * case on every machine that has not just been updated.
+ *
+ * Counting at *start* rather than on an observed failure is what makes this work at
+ * all: the failure being guarded against can be a build that dies before reaching
+ * any code that could report it. The count is therefore optimistic — it is undone by
+ * {@link recordSuccessfulHandshake} the moment the build proves itself — and it is
+ * on disk before the caller does anything else, so a process killed a millisecond
+ * later has still advanced it.
+ *
+ * Never throws: a state directory that cannot be written leaves the machine counting
+ * nothing rather than crash-looping on the write, which is the safe direction for a
+ * mechanism whose whole job is to end a crash loop.
+ */
+export function recordFailedStart(options: InstallStateOptions = {}): PendingVerification | null {
+	const stateDir = stateDirFor(options);
+	const state = readState(stateDir);
+	if (!state?.pendingVerification) return null;
+	const pendingVerification: PendingVerification = {
+		...state.pendingVerification,
+		failedStarts: state.pendingVerification.failedStarts + 1,
+	};
+	if (!tryWriteState(stateDir, { ...state, pendingVerification })) return null;
+	return pendingVerification;
+}
+
+/**
+ * Promote the build being verified: it handshaked, so it is this machine's last
+ * known good one and there is nothing left outstanding. Answers the commit promoted,
+ * or `null` when nothing was pending.
+ *
+ * Idempotent by construction — the record it consumes is gone afterwards — because
+ * the caller fires on every session a daemon establishes, not only the first.
+ */
+export function recordSuccessfulHandshake(options: InstallStateOptions = {}): string | null {
+	const stateDir = stateDirFor(options);
+	const state = readState(stateDir);
+	if (!state?.pendingVerification) return null;
+	const promoted = state.pendingVerification.commit;
+	if (!tryWriteState(stateDir, { ...state, lastKnownGood: promoted, pendingVerification: null }))
+		return null;
+	logger.info('SWARM install update verified — promoting it to last known good', {
+		installRoot: state.installRoot,
+		commit: promoted,
+		previousCommit: state.pendingVerification.previousCommit,
+	});
+	return promoted;
+}
+
+/**
+ * Put the install root back on the build it was updated from, and forget the one it
+ * was updated to.
+ *
+ * The same three steps an apply runs, aimed at `lastKnownGood` — which is still the
+ * commit the machine was last *proved* on, because promotion is what moves it. The
+ * record is cleared only once the build succeeds: a return that failed halfway must
+ * not leave the next start believing the abandoned build is worth promoting.
+ */
+export async function returnToLastKnownGood(
+	options: ReturnToLastKnownGoodOptions = {},
+): Promise<ReturnOutcome> {
+	const installRoot = options.installRoot ?? swarmInstallRoot();
+	const stateDir = installUpdateStateDir(installRoot, options.homeDir);
+	const ctx: InstallContext = { installRoot, stateDir, run: options.run ?? runCommand };
+	try {
+		const state = readState(stateDir);
+		if (!state?.pendingVerification) return { status: 'nothing-pending' };
+		const { lastKnownGood, pendingVerification } = state;
+		logger.warn('returning the SWARM install root to its last known good build', {
+			installRoot,
+			commit: lastKnownGood,
+			abandonedCommit: pendingVerification.commit,
+			failedStarts: pendingVerification.failedStarts,
+		});
+		const failed = await buildAt(ctx, lastKnownGood);
+		if (failed) {
+			return {
+				status: 'failed',
+				stage: failed.stage,
+				reason:
+					`${describeStage(failed.stage, lastKnownGood)} while returning the SWARM install ` +
+					`root '${installRoot}' to ${lastKnownGood}. It is on neither build and needs an ` +
+					'operator: check it out by hand and re-run `npm ci && npm run build`.',
+				outputTail: tailOf(failed.result),
+			};
+		}
+		writeState(stateDir, { ...state, pendingVerification: null });
+		return {
+			status: 'returned',
+			commit: lastKnownGood,
+			abandonedCommit: pendingVerification.commit,
+		};
+	} catch (error) {
+		// In production only the filesystem write can land here — every subprocess answers
+		// with an exit code rather than a rejection — so the likeliest reading is that the
+		// build is in place and the record that would send the next start back here again
+		// is what could not be cleared. The message says neither more than that nor less.
+		return {
+			status: 'failed',
+			stage: 'record',
+			reason:
+				`Returning the SWARM install root '${installRoot}' to its last known good build ` +
+				`(${describeError(error)}) did not complete, so the build it was abandoning is ` +
+				'still recorded as pending. Check that ~/.swarm is writable, then inspect the ' +
+				'install root by hand.',
+			outputTail: '',
+		};
+	}
+}
+
+function stateDirFor(options: InstallStateOptions): string {
+	return installUpdateStateDir(options.installRoot ?? swarmInstallRoot(), options.homeDir);
+}
+
+/**
+ * `null` when there is no record yet, `undefined` when there is one and it is
+ * unreadable — {@link readJson}'s two answers.
+ *
+ * The `pendingVerification` fallback restates the schema's own default for the type
+ * system rather than for the data: `readJson` takes its shape from the schema's
+ * *input* side, where a defaulted field is still optional, while the `parse` it just
+ * ran has already filled it in.
+ */
+function readState(stateDir: string): InstallUpdateState | null | undefined {
+	const stored = readJson(join(stateDir, STATE_FILE), InstallUpdateStateSchema);
+	return stored ? { ...stored, pendingVerification: stored.pendingVerification ?? null } : stored;
+}
+
+/** {@link writeState}, for the callers that answer a failed write rather than raise it. */
+function tryWriteState(stateDir: string, state: InstallUpdateState): boolean {
+	try {
+		writeState(stateDir, state);
+		return true;
+	} catch (error) {
+		logger.warn('recording the state of the SWARM install root failed', {
+			installRoot: state.installRoot,
+			error: describeError(error),
+		});
+		return false;
+	}
+}
+
+function git(ctx: InstallContext, args: string[], timeoutMs: number): UpdateCommand {
 	return { command: 'git', args, cwd: ctx.installRoot, timeoutMs };
 }
 
-function npm(ctx: UpdateContext, args: string[]): UpdateCommand {
+function npm(ctx: InstallContext, args: string[]): UpdateCommand {
 	return { command: 'npm', args, cwd: ctx.installRoot, timeoutMs: NPM_TIMEOUT_MS };
 }
 
 /** A git read's trimmed stdout, or `null` when it did not answer. */
 async function gitRead(
-	ctx: UpdateContext,
+	ctx: InstallContext,
 	args: string[],
 	timeoutMs: number,
 ): Promise<string | null> {

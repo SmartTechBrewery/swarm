@@ -1520,7 +1520,7 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 
 describe('worker transport client module boundary', () => {
 	it('imports nothing from the DB, queue, or dispatch layers', () => {
-		const files = ['worker-client.ts', 'cli-discovery.ts', 'connect-entry.ts'];
+		const files = ['worker-client.ts', 'cli-discovery.ts', 'connect-entry.ts', 'worker-main.ts'];
 		for (const file of files) {
 			const source = readFileSync(
 				fileURLToPath(new URL(`../../../src/transport/${file}`, import.meta.url)),

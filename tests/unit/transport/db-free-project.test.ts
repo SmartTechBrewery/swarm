@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 // A DB-free worker loads the integrations entrypoint at startup
-// (`src/transport/connect-entry.ts`), so the PM manifests are registered while it
+// (`src/transport/worker-main.ts`), so the PM manifests are registered while it
 // reconstructs a project config. Importing it here is what makes these tests
 // exercise the same validation path a real remote worker takes (issue #537).
 import '@/integrations/entrypoint.js';

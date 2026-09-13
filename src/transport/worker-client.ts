@@ -1140,11 +1140,29 @@ export function connectWorkerTransport(
  * probe agrees the CLI is not there (issue #559).
  */
 function isFatalHandshakeError(err: unknown, everConnected: boolean): boolean {
-	if (err instanceof WorkerTransportAuthError) return true;
-	if (err instanceof WorkerTransportProtocolError) return true;
-	if (err instanceof WorkerCapabilityConflictError) return true;
+	if (isFatalHandshakeRejection(err)) return true;
 	if (err instanceof WorkerSessionConflictError) return !everConnected;
 	return false;
+}
+
+/**
+ * Whether the control plane rejected this daemon outright — the subset of
+ * {@link isFatalHandshakeError} that says *this program cannot talk to that control
+ * plane*, rather than *somebody else is holding the lease*.
+ *
+ * Exported because it is what a build still awaiting verification is judged on
+ * (`./build-verification.ts`, issue #934): a daemon rejected for its protocol
+ * version, its capabilities, or its credential has just proved the build it is
+ * running cannot serve this control plane, and no amount of retrying changes that —
+ * whereas a session conflict is about the other daemon, and a build that returned
+ * itself over one would be discarding a perfectly good update.
+ */
+export function isFatalHandshakeRejection(err: unknown): boolean {
+	return (
+		err instanceof WorkerTransportAuthError ||
+		err instanceof WorkerTransportProtocolError ||
+		err instanceof WorkerCapabilityConflictError
+	);
 }
 
 /**

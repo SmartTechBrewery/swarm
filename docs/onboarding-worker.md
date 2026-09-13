@@ -435,6 +435,29 @@ once it has answered — `applied`, `already-current`, `declined`, `refused`, or
 restart the machine re-declares its build at handshake, so the `/workers` screen's
 build column is the independent confirmation that the new code is what is running.
 
+**A machine that cannot come back puts itself back (issue #934).** An applied update
+is not trusted until a daemon running it has connected once, because the update
+channel is the first thing a bad build takes away: with no socket there is nothing
+left to push a correction down. So the machine judges the new build itself. It counts
+every start on an unproved build before it loads a line of that build's own worker
+code — so a build that dies while it is still starting up is counted exactly like one
+that starts and then cannot connect — the first successful
+handshake promotes that build to *last known good*, and a machine that has started
+three times without once connecting — or that the control plane rejects outright at
+the handshake, which is the "this build cannot talk to this control plane" case and
+does not wait the count out — checks the last known good commit back out,
+reinstalls, rebuilds, and exits 0 for the supervisor to start it there. Nothing has to be asked of
+it and nothing can be: this is the one outcome in this feature that is recovered on
+the machine rather than from the control plane.
+
+What you see is a machine that went away and came back **on its previous build**:
+`swarm workers list` still reads `update <ref> applied` (that report was true when it
+was made), while the build column on `/workers` shows the older commit again, marked
+`OUTDATED`. That pairing — `applied` beside the build it moved *off* — is the signal
+to read the machine's own log, where the return is a single `returned to the last
+known good SWARM build` line preceded by why it gave up. Re-requesting the same ref
+will simply repeat the cycle; fix the build first.
+
 ---
 
 ## Verify from the admin side
@@ -473,6 +496,8 @@ build column is the independent confirmation that the new code is what is runnin
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
 | `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon — but only if its SWARM install root is not shared with another daemon (see "Optional — let the control plane update this machine"). |
 | `swarm workers list` shows `update <ref> failed` | The install root could not be moved. The message beside it names the step (`git checkout`, `npm ci`, `npm run build`) and whether the checkout was returned to the build it was on; a failure that could **not** be rolled back leaves the machine on neither build and needs an operator on that host. |
+| A machine reports `update <ref> applied` but `/workers` shows its **old** build | It could not handshake on the new one and returned itself to its last known good build (issue #934) — three starts without once connecting, or a handshake the control plane rejected outright. Its log says which, on the line before `returned to the last known good SWARM build`. The build is what needs fixing; re-requesting the same ref repeats the cycle. |
+| A machine is down and its log says `returning to the last known good SWARM build failed` | The return could not be completed, so the install root is on neither build and needs an operator on that host: check out the commit the line names, then run `npm ci && npm run build` there. The daemon stays down on purpose rather than crash-looping; later starts retry the return, so fix the checkout rather than restarting the daemon at it. |
 | A requested update never reports anything | Nothing pushed it: the machine has no socket on the router. It is re-stated automatically the next time that daemon connects, so start it (or wait for the supervisor to), and re-read `swarm workers list`. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, steps 4 and 4b), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
 | An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a different repository than the project's, so the control plane suspended the pairing (issue #690). `/workers/<id>` names both repositories on that enrollment block. Point `SWARM_WORKER_REPO_ROOT` at a checkout of the project's repository (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
