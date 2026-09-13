@@ -2,6 +2,7 @@ import { useMutation } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
+import { formatWorkerBuild, WorkerBuildBadge } from '@/components/workers/worker-build.js';
 import { WorkerDeleteCard } from '@/components/workers/worker-delete-card.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
@@ -21,13 +22,19 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * project the machine is enrolled in ({@link WorkerEnrollmentCard}, which owns the
  * editable values and their authorization).
  *
- * **The daemon's `supportedPhases` and `repository` are read-only; its CLI set is
- * not.** A daemon declares all three at handshake and re-declares them on every
- * reconnect, so a phase repertoire and a checkout repository are reported here and
- * never offered as an edit — editing either would only make the dashboard disagree
- * with the machine until its next heartbeat. The checkout repository is here because
- * it is the fact an enrollment for a *different* repository is refused or suspended
- * against (issue #690), which the enrollment blocks below then name in full.
+ * **The daemon's `supportedPhases`, `repository` and `build` are read-only; its CLI
+ * set is not.** A daemon declares them all at handshake and re-declares them on every
+ * reconnect, so a phase repertoire, a checkout repository and a SWARM build are
+ * reported here and never offered as an edit — editing any of them would only make
+ * the dashboard disagree with the machine until its next heartbeat. The checkout
+ * repository is here because it is the fact an enrollment for a *different*
+ * repository is refused or suspended against (issue #690), which the enrollment
+ * blocks below then name in full. The **SWARM build** is here (issue #925) because
+ * it is the only thing that answers "is this machine running the fix?": it is marked
+ * when it is not the control plane's own build, and this screen is the one surface
+ * that also *names* that build, so "differs from what" is readable rather than
+ * remembered. Nothing acts on the mark — a machine on a different build is dispatched
+ * to exactly as before.
  *
  * The CLI set is the exception, because since issue #783 it is two facts rather than
  * one: the daemon's probe, and the owner's **durable declaration** over it, which no
@@ -379,6 +386,55 @@ function SupportedPhases({ phases }: { phases: string[] }) {
 	);
 }
 
+/**
+ * The build the daemon declared (issue #925), with the mark when it is not the
+ * control plane's own: the short commit, a `+dirty` suffix when the running code is
+ * not exactly that commit, and `—` when the machine declared nothing.
+ */
+function DeclaredBuild({ worker }: { worker: WorkerDetail }) {
+	if (!worker.build) return EM_DASH;
+	return (
+		<span className="inline-flex items-center gap-2">
+			{formatWorkerBuild(worker.build)}
+			<WorkerBuildBadge
+				buildIsCurrent={worker.buildIsCurrent}
+				controlPlaneBuild={worker.controlPlaneBuild}
+			/>
+		</span>
+	);
+}
+
+/**
+ * What the build above is being compared against — the whole reason this screen
+ * carries the comparand (issue #925): a mark that names no other build leaves
+ * "outdated relative to what?" in the operator's head. A control plane that cannot
+ * read its own build says so, rather than letting an absent mark read as "all
+ * current".
+ */
+function BuildComparisonNote({
+	controlPlaneBuild,
+}: {
+	controlPlaneBuild: WorkerDetail['controlPlaneBuild'];
+}) {
+	if (!controlPlaneBuild) {
+		return (
+			<>
+				This control plane cannot read its own build, so nothing here is compared against it and no
+				machine is marked either way.
+			</>
+		);
+	}
+	return (
+		<>
+			This control plane is on{' '}
+			<span className="font-mono text-zinc-400">{formatWorkerBuild(controlPlaneBuild)}</span>, and a
+			machine whose build is not that one is marked <em>Outdated</em> — the two builds differ, which
+			is all an equality check can say. A worker keeps running whatever its checkout held when its
+			process last started, so the remedy is updating that checkout and restarting the daemon.
+		</>
+	);
+}
+
 interface WorkerDetailViewProps {
 	worker: WorkerDetail;
 	/** Project id → display name, so an enrollment block names its project. */
@@ -480,15 +536,26 @@ export function WorkerDetailView({
 					<Field label="Checkout repository" mono>
 						{worker.repository ?? EM_DASH}
 					</Field>
+					<Field label="SWARM build" mono>
+						<DeclaredBuild worker={worker} />
+					</Field>
 				</div>
 				<p className="text-xs text-zinc-500 mt-4">
 					Declared by the machine's own daemon at handshake, and re-declared on every reconnect. The
-					pipeline phases and the checkout repository are reported here and never editable — editing
-					either would make this screen disagree with the machine. A daemon on an older build can
-					declare fewer phases than this one runs; which of them a project may actually give this
-					machine is the enrollment's Allowed pipeline phases, below. The checkout repository is the
-					single repository this machine works in: a project for any other one cannot run here, and
-					an unidentifiable checkout declares nothing.
+					pipeline phases, the checkout repository and the SWARM build are reported here and never
+					editable — editing any of them would make this screen disagree with the machine. A daemon
+					on an older build can declare fewer phases than this one runs; which of them a project may
+					actually give this machine is the enrollment's Allowed pipeline phases, below. The
+					checkout repository is the single repository this machine works in: a project for any
+					other one cannot run here, and an unidentifiable checkout declares nothing.
+				</p>
+				<p className="text-xs text-zinc-500 mt-2">
+					The <strong>SWARM build is the commit this machine's daemon is actually running</strong> —
+					its own SWARM install root, which is not the checkout repository above: one installation
+					can serve several project repositories. A <span className="font-mono">+dirty</span> marker
+					means the running code is not exactly that commit (uncommitted changes, or a build older
+					than the commit it names).{' '}
+					<BuildComparisonNote controlPlaneBuild={worker.controlPlaneBuild} />
 				</p>
 				<p className="text-xs text-zinc-500 mt-2">
 					The <strong>agent CLIs are the one fact the machine's owner may pin.</strong> Left alone,
