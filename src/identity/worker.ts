@@ -92,6 +92,15 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * later one). `target` is always the build the request named and the outcome
  * concerns; `status`/`message`/`reportedAt` are `null` until one is reported.
  *
+ * `requestedByUserId` is the **audit** half (issue #922): the SWARM user whose word
+ * this machine's code was replaced on. It used to be inferable — every request came
+ * from the machine's own owner — and stopped being so when an installation
+ * administrator gained a command that asks machines they do not own
+ * (`workers.requestUpdateForInstallation`). It belongs to the request, so it is
+ * rewritten by the next request and left alone by a report, exactly as `target` is.
+ * `null` for a request made before the column existed, or one whose requester has
+ * since been deleted.
+ *
  * The whole value is `null` on `Worker.update` when nobody has ever asked this
  * machine to update — which, like `drainingSince`, is what every row says until an
  * operator acts.
@@ -100,6 +109,7 @@ export const WorkerUpdateStateSchema = z.object({
 	requestId: z.string().uuid().nullable(),
 	target: WorkerUpdateTargetSchema,
 	requestedAt: z.date(),
+	requestedByUserId: z.string().uuid().nullable(),
 	status: WorkerUpdateStatusSchema.nullable(),
 	message: z.string().nullable(),
 	reportedAt: z.date().nullable(),

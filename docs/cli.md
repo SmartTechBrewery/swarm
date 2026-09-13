@@ -428,6 +428,7 @@ swarm workers undrain <worker-id>
 swarm workers update <worker-id> <ref>
 swarm workers update --all <ref> [--wave <n>]
 swarm workers update --status
+swarm workers request-update <ref>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -481,6 +482,16 @@ tRPC layer enforces ownership the direct-DB CLI never did. All four are intended
    `Enrollment with ID "…" not found` for an enrollment that plainly exists — the
    same existence-hiding `NOT_FOUND` narrowings 1 and 2 produce. Sign in as the
    worker's owner.
+
+**One subcommand goes deliberately the other way** (issue #922): `request-update` is
+an installation administrator's, and asks every machine on the installation — other
+owners' included — to move to a build. It is not an exception to the four above but
+the other side of the same distinction: each of those *takes* something of the
+owner's and keeps it, while this only ever asks, and both switches that decide
+whether a machine moves stay the owner's (the host `SWARM_WORKER_SELF_UPDATE` opt-in,
+and the drain, which this command never performs). A non-administrator running it is
+refused outright rather than shown their own machines.
+[`docs/onboarding-worker.md`](./onboarding-worker.md) states the rule beside #800's.
 
 One thing also stopped being **atomic**: `enroll`'s `--active` and `--consent` are
 applied as separate calls after the create (issue #784), so a refusal of either
@@ -695,6 +706,36 @@ unchanged.
   It reads your **latest** rollout whatever its status, so a halted one stays
   readable after it stopped, with the reason it stopped. Takes no ref, no `--wave`
   and no `--all`.
+- **`request-update <ref>`** — ask **every machine on the installation**, other
+  people's included, to move to `<ref>`, with one line per machine saying what became
+  of it (issue #922). An **installation administrator's** command — the one write in
+  this group that is, where `set-scm-credential`, `remove`, `consent` and
+  `update-enrollment` are strictly the machine owner's (issue #800) and the unfiltered
+  roster read is an administrator's (issue #647). A caller who is not one is refused
+  outright and shown nothing; it never narrows to their own machines, which would read
+  as the whole installation.
+  **It asks, and that is all it does**, which is why it is allowed to span owners.
+  Both switches that decide whether a machine actually moves stay with the person who
+  owns it, and neither needs the administrator: the host opt-in
+  (`SWARM_WORKER_SELF_UPDATE=true`, read from the machine's own environment and never
+  from the wire — unset it and restart, and the machine declines every request), and
+  the **drain**, which is still strictly the owner's (issue #919) and is not widened
+  here. So a machine its owner has not drained comes back `in-pool`, untouched: this
+  command drains nothing, undrains nothing, and cannot take the installation's
+  capacity down.
+  Each line is `<worker-id>  <name>  <owner>  <disposition>`, with the same five
+  dispositions the owner-scoped fan-out reports (`requested`, `queued-offline`,
+  `in-pool`, `already-asked`, `answered`) and a trailing `owner opted out` for a
+  machine that last reported `declined`. Under the table, the machines that did not
+  move are counted with the owners to go and ask — a drain for the `in-pool` ones, the
+  opt-in for the opted-out ones. Lines are grouped by owner for that reason.
+  **Exit code 0 whenever the call succeeded**, however many machines were skipped: a
+  report, not a pass/fail. **Every request records who made it** on the machine's own
+  row (`workers.update_requested_by_user_id`, beside the build and the instant), and
+  the API server logs one `installation-wide worker update requested` line per call;
+  see [`docs/onboarding-worker.md`](./onboarding-worker.md) for both reads. This is
+  the one-shot request, not the staged rollout: waves, drains and halting stay
+  `update --all`, which is each owner's own.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

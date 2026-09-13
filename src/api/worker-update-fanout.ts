@@ -1,9 +1,9 @@
 /**
  * Fan the per-worker self-update request out to a **set** of machines and report
  * what became of each one (issue #921) — the control-plane policy
- * `workers.requestUpdateForMine` programs against, sitting beside the other
- * `src/api/` helper modules (`./worker-access.ts`, `./scm-verification.ts`) rather
- * than inside a router.
+ * `workers.requestUpdateForMine` and `workers.requestUpdateForInstallation` (issue
+ * #922) both program against, sitting beside the other `src/api/` helper modules
+ * (`./worker-access.ts`, `./scm-verification.ts`) rather than inside a router.
  *
  * Nothing about the per-worker lifecycle moves here: each machine that is asked
  * gets the same row write (`requestWorkerUpdate`), the same `swarm:worker-update`
@@ -44,9 +44,17 @@
  *
  * **Authorization is the caller's**, which is why this takes an already-resolved
  * worker list rather than a user id: every other worker mutation makes that
- * decision in the router, and the administrator-facing selection issue #922 will
- * decide on is then a different *selection* over this same fan-out rather than a
- * second copy of it.
+ * decision in the router, and the administrator-facing selection issue #922 decided
+ * on is a different *selection* over this same fan-out rather than a second copy of
+ * it. That is exactly how `workers.requestUpdateForInstallation` is built — it hands
+ * over `listAllWorkers()` where the owner-scoped caller hands over
+ * `listWorkersForOwner`, and nothing here knows or cares which it was given.
+ *
+ * `requestedByUserId` travels separately from that list for the same reason (issue
+ * #922): it is *who asked*, not *what was asked of*, and once those two can name
+ * different people the row has to record the asker rather than let a reader infer it
+ * from the machine's owner. It is threaded through to the durable write, so every
+ * disposition that records a request records who it was for.
  *
  * Waves, staging, halting and the drain/undrain automation around them are
  * deliberately **not** here — they are phases 2 and 3 of issue #921, with their own
@@ -60,6 +68,7 @@ import { z } from 'zod';
 import type { Worker, WorkerUpdateState } from '../identity/worker.js';
 import { requestWorkerUpdate } from '../identity/worker-service.js';
 import { getLiveSessionForWorker } from '../identity/worker-session-service.js';
+import type { WorkerUpdateStatus } from '../lib/build-identity.js';
 import { publishWorkerUpdateRequest } from '../queue/worker-updates.js';
 
 /**
@@ -95,6 +104,23 @@ export interface WorkerUpdateFanoutEntry {
 	displayName: string;
 	disposition: WorkerUpdateFanoutDisposition;
 	/**
+	 * The outcome this machine had last reported **before** this fan-out (issue
+	 * #922), or `null` when it had never answered one.
+	 *
+	 * It exists because asking a machine *destroys* the previous answer: a recorded
+	 * request resets `update_status` to NULL, so {@link WorkerUpdateFanoutEntry.update}
+	 * below carries no outcome for any machine that was just asked. The one an
+	 * operator most needs to keep is `declined` — the machine's own statement that its
+	 * host has not set `SWARM_WORKER_SELF_UPDATE`, which is the only place an opt-out
+	 * is visible from the control plane at all — so a report that dropped it would
+	 * leave an installation administrator unable to say which owners have opted out.
+	 *
+	 * It is a *report* annotation and deliberately not a disposition: a machine that
+	 * declined is still asked again, because its owner may have opted in since, and
+	 * the answer to that arrives later on the machine's own route.
+	 */
+	lastReportedStatus: WorkerUpdateStatus | null;
+	/**
 	 * The row's update state **after** the fan-out — the target, and the outcome
 	 * when one is recorded. `null` for a machine nobody has ever asked, which is what
 	 * a never-drained `in-pool` row says; an `in-pool` machine that was asked on some
@@ -119,15 +145,21 @@ export interface WorkerUpdateFanoutEntry {
 export async function fanOutWorkerUpdate(
 	workers: Worker[],
 	target: string,
+	requestedByUserId: string,
 ): Promise<WorkerUpdateFanoutEntry[]> {
 	const entries: WorkerUpdateFanoutEntry[] = [];
 	for (const worker of workers) {
+		// Read off the caller's snapshot, before the write below can reset it (issue
+		// #922) — see the field's own comment for why the pre-request answer is the one
+		// an operator needs kept.
+		const lastReportedStatus = worker.update?.status ?? null;
 		const skipped = dispositionWithoutAsking(worker, target);
 		if (skipped) {
 			entries.push({
 				workerId: worker.id,
 				displayName: worker.displayName,
 				disposition: skipped,
+				lastReportedStatus,
 				update: worker.update,
 			});
 			continue;
@@ -137,7 +169,7 @@ export async function fanOutWorkerUpdate(
 		// names one request to one machine, and `recordWorkerUpdateReport`'s
 		// `(worker_id, update_request_id)` match depends on that reading staying true.
 		const requestId = randomUUID();
-		const result = await requestWorkerUpdate(worker.id, requestId, target);
+		const result = await requestWorkerUpdate(worker.id, requestId, target, requestedByUserId);
 		// The machine was deregistered between the caller's read and this write. It is
 		// left out of the report rather than given a disposition: there is no machine
 		// left to say anything about, and the operator's own list no longer carries it
@@ -156,6 +188,7 @@ export async function fanOutWorkerUpdate(
 				workerId: result.worker.id,
 				displayName: result.worker.displayName,
 				disposition: 'in-pool',
+				lastReportedStatus,
 				update: result.worker.update,
 			});
 			continue;
@@ -176,6 +209,7 @@ export async function fanOutWorkerUpdate(
 			workerId: updated.id,
 			displayName: updated.displayName,
 			disposition: live ? 'requested' : 'queued-offline',
+			lastReportedStatus,
 			update: updated.update,
 		});
 	}

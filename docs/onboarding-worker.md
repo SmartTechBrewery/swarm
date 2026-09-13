@@ -500,6 +500,68 @@ to read the machine's own log, where the return is a single `returned to the las
 known good SWARM build` line preceded by why it gave up. Re-requesting the same ref
 will simply repeat the cycle; fix the build first.
 
+### Who may ask, and for whose machines (issue #922)
+
+**An installation administrator may ask a machine they do not own — and that is all
+they may do.** The rule is stated here rather than left to be inferred from the code,
+because the two rules already in this document point opposite ways: since issue #800
+`workers set-scm-credential`, `workers remove`, `workers consent` and
+`workers update-enrollment` are *strictly the machine owner's* (an installation admin
+gets the same `NOT_FOUND` a stranger does), while the unfiltered roster read is an
+*installation administrator's view* (issue #647). Requesting a build sits between
+them, and this is which side it landed on and why.
+
+```bash
+swarm workers request-update main          # every machine on the installation
+```
+
+What settles it is that each of #800's four **takes something of the owner's** and
+keeps it — a credential the administrator would then hold, the machine's existence,
+the owner's consent to share it, the constraints their machine runs under — whereas
+this takes nothing and decides nothing. Both of the switches that decide whether a
+machine actually moves stay with the person who owns it, and neither needs the
+administrator's cooperation:
+
+- **The host opt-in above** is read from the machine's own environment and never from
+  the wire. With `SWARM_WORKER_SELF_UPDATE` unset the daemon reports `declined` and
+  carries on working; unsetting it and restarting the daemon revokes it outright, at
+  any time, with nothing to ask anybody.
+- **Draining is still strictly the owner's** (issue #919) and is *not* widened by
+  this command. It asks only machines already out of the dispatch pool, so a machine
+  its owner has not drained comes back `in-pool` and untouched. An administrator
+  therefore cannot take the installation's capacity down with this, and cannot move a
+  machine whose owner has not made it askable in the first place.
+
+So the administrator may put the request; the owner keeps both vetoes. The report
+prints a line per machine with its owner, its disposition, and `owner opted out` for
+a machine that last reported `declined` — so the two things the administrator cannot
+do anything about themselves are named, with the person to ask. A caller who is *not*
+an installation administrator is refused outright and shown nothing: it never quietly
+narrows to their own machines, which would read as the whole installation.
+
+**Every request records who made it.** `workers.update_requested_by_user_id` sits
+beside the build and the instant on the machine's own row, so an owner whose machine
+restarted into a build they did not ask for can find out on whose word:
+
+```sql
+-- via: docker compose exec -T postgres psql -U swarm -d swarm -c "..."
+SELECT w.display_name, w.update_target, w.update_requested_at,
+       u.identifier AS requested_by, w.update_status, w.update_message
+FROM workers w
+LEFT JOIN users u ON u.id = w.update_requested_by_user_id
+WHERE w.update_target IS NOT NULL
+ORDER BY w.update_requested_at DESC;
+```
+
+The API server also logs one `installation-wide worker update requested` line per
+call, carrying the requester, the build and every machine's disposition — the same
+act seen as one fleet action rather than one machine's history.
+
+Note what this command is *not*: it is the one-shot fan-out, not the staged rollout
+`update --all` runs. It drains nothing, undrains nothing and stages nothing, because
+every one of those acts on a machine rather than asking it. Moving a fleet in waves
+stays each owner's own `swarm workers update --all <ref>`.
+
 ---
 
 ## Verify from the admin side
@@ -538,6 +600,10 @@ will simply repeat the cycle; fix the build first.
 | `swarm workers update --all <ref>` leaves a machine `queued` | The rollout moves a bounded wave at a time (issue #940) and has not reached it yet — that is what stops a fleet update taking the whole fleet's capacity down. It advances itself from there (issue #941), so nothing is owed: run `swarm workers update --status` again in a minute or two. A machine stuck `draining` is one still finishing a phase, which a rollout never interrupts. |
 | `swarm workers update --all <ref>` says the rollout is **HALTED** | A machine reported `failed`/`refused`/`declined`, came back on the build it was asked to leave, or applied and never came back — so nothing further is drained or signalled and the untouched machines stayed in the pool. The line under the table is the reason, in the machine's own words. Fix the build, then start a new rollout: a halt is final, there is no resume, and the machine that failed is left drained on purpose so you can look at it (`swarm workers undrain <worker-id>` when you are done). |
 | `swarm workers update --all <ref>` is refused because a fleet update is already in progress | Only one rollout runs per operator at a time, so a *different* ref mid-move is refused rather than silently re-targeting the fleet. Run `swarm workers update --status` to see where it stands and wait for it to finish; asking for the **same** ref is never refused, it just nudges and prints it. |
+| `swarm workers request-update <ref>` says it is "available to instance administrators only" | It is (issue #922) — asking machines across the installation is an installation-admin act, while `swarm workers update --all <ref>` moves the machines *you* own and needs no such role. Ask an instance administrator to run it, or run `update --all` for your own fleet. |
+| `swarm workers request-update <ref>` reports `in-pool` for most of the installation | Those machines are not draining, and draining stays strictly the machine owner's own call (issue #919) — this command asks, it never drains. The line under the table names the owners to ask for a `swarm workers drain <worker-id>`; run `request-update` again once they have. |
+| `swarm workers request-update <ref>` marks a machine `owner opted out` | That host last reported `declined`, which it only ever does when `SWARM_WORKER_SELF_UPDATE` is not `true` in its environment (issue #933). That is its owner's decision to make and unmake; nothing an administrator runs can override it. |
+| A machine restarted into a build its owner never asked for | Since issue #922 an installation administrator can request one. The machine's own row records who asked — see the `update_requested_by_user_id` query in "Who may ask, and for whose machines"; the API server's `installation-wide worker update requested` log line carries the same act for the whole fleet. |
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
 | `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon (see "Optional — let the control plane update this machine"). |
 | `swarm workers list` shows `update <ref> refused` with "is already updating the SWARM install root" | Another daemon on that machine shares the install root and got there first (issue #935). Wait for *its* outcome, then re-issue this one: it will report `already-current` once that build has landed. Nothing was changed on this machine. |

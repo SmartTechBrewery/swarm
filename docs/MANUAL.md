@@ -284,6 +284,29 @@ nothing wider. The unstaged one-shot fan-out issue #921 shipped is still there o
 API (`workers.requestUpdateForMine`), which asks every machine you have *already*
 drained, all at once, and reports a disposition per machine.
 
+**Or every machine on the installation — other people's included.** When the person
+shipping a fix is not the person who owns the machines that have to run it, an
+**installation administrator** asks them all in one command (issue #922):
+
+```bash
+swarm workers request-update main        # every machine on the installation
+```
+
+This is the one worker *write* that spans owners, and it is allowed to only because
+it asks and nothing more. Both switches that decide whether a machine actually moves
+stay with whoever owns it and need no cooperation from the administrator: the host
+opt-in (`SWARM_WORKER_SELF_UPDATE`, read from the machine's own environment — unset it
+and restart, and that machine declines every request), and the **drain**, which is
+still strictly the owner's and which this command never performs. So a machine its
+owner has not drained comes back `in-pool`, untouched. Each line names the machine,
+its owner and its disposition, with `owner opted out` for one that last reported
+`declined`; the counts under the table name the owners to go and ask. A caller who is
+not an installation administrator is refused outright rather than shown their own
+machines. Every request records **who made it** on the machine's own row, and the API
+server logs the fleet action as one line — see
+[`docs/onboarding-worker.md`](./onboarding-worker.md), which is also where the
+authorization rule itself is written down.
+
 Nothing about the restart differs from the one above — the daemon waits until it
 holds no in-flight phase, applies the update, releases its session and exits 0, and
 the host's process supervisor (launchd `KeepAlive` / systemd `Restart=always`) starts
