@@ -16,6 +16,7 @@ import { logger } from '../lib/logger.js';
 import type { RecoveryMode } from '../queue/jobs.js';
 import {
 	assertRemoteHead,
+	type ConflictHandoff,
 	ConflictHandoffSchema,
 	commitPreparedTree,
 	DeliveryDeferredError,
@@ -210,6 +211,40 @@ async function settleResolvedPaths(
 		});
 }
 
+/**
+ * The verification the agent reported, read for what it says about the merge
+ * (issue #924). A `pre-existing-failure` is delivered — refusing it would only
+ * teach the next agent to write `passed`, which is exactly what the old single
+ * literal did — but it is logged at `warn`, as `settleResolvedPaths` logs the
+ * drift it settles, so a merge delivered with failures stays attributable. A
+ * `failed` entry is the opposite claim — this merge broke it — so it stops the
+ * phase here: before the repair pass, the commit, the push and the comment.
+ *
+ * Deliberately a plain `Error`, not an `UnretryableDeliveryError`: that class is
+ * for refusals nothing between attempts can change, while a re-run resolves the
+ * merge from scratch and can genuinely produce a tree that builds. The message
+ * is what the phase-failure report posts, so it names the commands and the
+ * agent's own detail — a broken merge, not a schema complaint.
+ */
+function assertMergeVerified(
+	handoff: ConflictHandoff,
+	context: { taskId: string; prNumber: string; headSha: string },
+): void {
+	const describe = (entries: readonly ConflictHandoff['verification'][number][]) =>
+		entries.map((entry) => `\`${entry.command}\`: ${entry.detail}`).join('; ');
+	const preExisting = handoff.verification.filter((e) => e.outcome === 'pre-existing-failure');
+	if (preExisting.length > 0)
+		logger.warn(
+			'resolve-conflicts: delivering a merge whose failures the agent reports as pre-existing',
+			{ ...context, verification: describe(preExisting) },
+		);
+	const failed = handoff.verification.filter((e) => e.outcome === 'failed');
+	if (failed.length > 0)
+		throw new Error(
+			`resolve-conflicts: the merge for PR #${context.prNumber} fails verification the agent attributes to the merge itself — ${describe(failed)}. Nothing was committed or pushed; the pull request is still conflicted.`,
+		);
+}
+
 export async function runResolveConflictsPhase(
 	options: RunResolveConflictsPhaseOptions,
 ): Promise<{ agent: AgentCliResult; outcome: ResolveConflictsOutcome }> {
@@ -312,6 +347,9 @@ export async function runResolveConflictsPhase(
 			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
 			ConflictHandoffSchema,
 		);
+		// Before the repair pass and every delivery step, so a merge we are going to
+		// refuse never spends an agent run or reaches the remote (issue #924).
+		assertMergeVerified(handoff, { taskId, prNumber, headSha });
 		// A resumed delivery already passed both gates in the attempt that first
 		// wrote `handoff` — delivery progress only exists past this point — so they
 		// are safe to skip here; only a fresh merge this call actually produced

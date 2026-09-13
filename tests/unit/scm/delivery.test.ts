@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
 	assertCheckoutHoldsHead,
 	assertRemoteFastForwardable,
+	ConflictHandoffSchema,
 	commitPreparedTree,
 	DeliveryDeferredError,
 	DeliveryDivergedError,
@@ -67,6 +68,73 @@ describe('SCM delivery hand-offs', () => {
 				readyForDelivery: true,
 			}),
 		).toThrow();
+	});
+
+	/**
+	 * Issue #924. Both incidents reached a *finished* merge and lost it to this
+	 * schema, so the fixtures are the hand-offs those two runs actually wrote.
+	 */
+	describe('the conflict hand-off can report a verification honestly', () => {
+		const resolved = (verification: unknown) => ({
+			status: 'resolved',
+			body: 'Merged main; resolved every conflict.',
+			verification,
+		});
+
+		it('accepts a failure the agent proved predates the merge', () => {
+			const handoff = ConflictHandoffSchema.parse(
+				resolved([
+					{ command: 'npm run lint', outcome: 'passed' },
+					{
+						command: 'npm test',
+						outcome: 'pre-existing-failure',
+						detail:
+							'5 pre-existing failures (sessions.test.ts x4, sign-in.test.ts x1), reproduced identically on unmerged pristine issue-54 head in a separate scratch clone; 674 of 679 tests pass',
+					},
+				]),
+			);
+			expect(handoff.verification[1]).toMatchObject({ outcome: 'pre-existing-failure' });
+		});
+
+		it('accepts a failure the agent attributes to the merge, so the phase can refuse it by name', () => {
+			expect(
+				ConflictHandoffSchema.parse(
+					resolved([
+						{ command: 'npm test', outcome: 'failed', detail: 'the merged tree does not build' },
+					]),
+				).verification[0],
+			).toMatchObject({ outcome: 'failed' });
+		});
+
+		it.each(['pre-existing-failure', 'failed'])('requires detail on a %s outcome', (outcome) => {
+			expect(() =>
+				ConflictHandoffSchema.parse(resolved([{ command: 'npm test', outcome }])),
+			).toThrow(/detail is required/);
+		});
+
+		// The literal defect of PR #56's hand-off. `outcome` is an enum, so its shape
+		// is its semantics and the prose belongs in `detail` — normalizing it here
+		// would make "passed" and "passed: but actually 4 tests fail" the same value.
+		it('still rejects prose written into outcome', () => {
+			expect(() =>
+				ConflictHandoffSchema.parse(
+					resolved([
+						{
+							command: 'npm test',
+							outcome:
+								'passed: reproduced the identical 4 sessions.test.ts failures, confirming they pre-exist on main',
+						},
+					]),
+				),
+			).toThrow();
+		});
+
+		it('still accepts an all-passed hand-off unchanged, with no detail', () => {
+			expect(
+				ConflictHandoffSchema.parse(resolved([{ command: 'npm test', outcome: 'passed' }]))
+					.verification,
+			).toEqual([{ command: 'npm test', outcome: 'passed' }]);
+		});
 	});
 
 	it('persists and reloads step-level progress under a stable identity', () => {

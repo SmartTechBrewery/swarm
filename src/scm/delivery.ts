@@ -384,11 +384,58 @@ export const CiResponseHandoffSchema = z.object({
 	verification: z.array(VerificationSchema).default([]),
 });
 
-export const ConflictHandoffSchema = z.object({
-	status: z.literal('resolved'),
-	body: z.string().min(1),
-	verification: z.array(VerificationSchema).min(1),
+/**
+ * What a command the conflict-resolver ran actually did. Wider than
+ * {@link VerificationSchema}'s single literal for the same reason
+ * {@link ReviewVerificationSchema} is (issue #470): an agent that ran the suite
+ * and *proved* its failures predate the merge has a result to report, and one
+ * literal left it only "claim it passed" or "lose the finished merge" — the
+ * schema violation discards the whole run (issue #924, hit twice in one day,
+ * both times after the resolution work was already done).
+ *
+ * - `passed` — the command succeeded on the merged tree.
+ * - `pre-existing-failure` — it failed, and the identical failure was
+ *   reproduced without this merge. Delivered: the merge did not break it.
+ * - `failed` — it failed because of this merge, or the agent could not
+ *   establish otherwise. Refused by the phase, nothing committed or pushed.
+ */
+export const CONFLICT_VERIFICATION_OUTCOMES = ['passed', 'pre-existing-failure', 'failed'] as const;
+export type ConflictVerificationOutcome = (typeof CONFLICT_VERIFICATION_OUTCOMES)[number];
+
+export const ConflictVerificationSchema = z.object({
+	command: z.string().min(1),
+	outcome: z.enum(CONFLICT_VERIFICATION_OUTCOMES),
+	/** Required for either failing outcome — see {@link ConflictHandoffSchema}'s refinement. */
+	detail: textSlot().optional(),
 });
+
+export type ConflictVerification = z.infer<typeof ConflictVerificationSchema>;
+
+/**
+ * The Resolve-conflicts phase's hand-off. `outcome` is deliberately *not*
+ * shape-normalized (an enum's shape is its semantics — the rule stated above
+ * {@link ReviewFindingSchema}), so the prose both live incidents crammed into it
+ * (`"passed: reproduced the identical 4 sessions.test.ts failures…"`) still
+ * fails; `detail` is the slot that prose belongs in, and the refinement below is
+ * what makes a failing outcome unreportable without it.
+ */
+export const ConflictHandoffSchema = z
+	.object({
+		status: z.literal('resolved'),
+		body: z.string().min(1),
+		verification: z.array(ConflictVerificationSchema).min(1),
+	})
+	.superRefine((handoff, ctx) => {
+		for (const [index, entry] of handoff.verification.entries())
+			if (entry.outcome !== 'passed' && entry.detail === undefined)
+				ctx.addIssue({
+					code: 'custom',
+					path: ['verification', index, 'detail'],
+					message: `'${entry.command}' is ${entry.outcome}, so detail is required: what failed, and — for pre-existing-failure — how you established this merge did not cause it`,
+				});
+	});
+
+export type ConflictHandoff = z.infer<typeof ConflictHandoffSchema>;
 
 export const DeliveryProgressSchema = z.object({
 	deliveryId: z.string(),
