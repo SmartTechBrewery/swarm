@@ -38,6 +38,7 @@ import {
 import {
 	declareWorkerCapabilities,
 	getWorker,
+	listWorkersForOwner,
 	registerWorker,
 	renameWorker,
 	requestWorkerUpdate,
@@ -56,6 +57,7 @@ import {
 } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { resolveStrictlyOwnedWorker, workerNotFound } from '../worker-access.js';
+import { fanOutWorkerUpdate } from '../worker-update-fanout.js';
 import { workerScmCredentialsRouter } from './workerScmCredentials.js';
 
 /**
@@ -100,14 +102,17 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   machine to move its SWARM install root to a build and restart into it
  *   (`requestUpdate`, issue #933 — refused with `CONFLICT` while the machine is
  *   still in the pool, since it would be given new work while it waits to
- *   restart), and controls the
+ *   restart), asks the same of *every* machine they own in one action
+ *   (`requestUpdateForMine`, issue #921 — the fan-out in
+ *   `../worker-update-fanout.ts`, which refuses no machine for its state and
+ *   reports a disposition per machine instead), and controls the
  *   revocable sharing consent
  *   (`setConsent`) and execution constraints (`updateConstraints`). Ownership is
  *   checked per call. `enroll` alone lets an `instanceAdmin` act on any worker
  *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
  *   reads as administering the project side of that offer; `rename`,
  *   `setDeclaredCapabilities`, `remove`, `setDraining`, `requestUpdate`,
- *   `setConsent`, and `updateConstraints`
+ *   `requestUpdateForMine`, `setConsent`, and `updateConstraints`
  *   are the machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
@@ -696,6 +701,41 @@ export const workersRouter = router({
 				target: input.target,
 				requestedAt: updated.update?.requestedAt.toISOString() ?? null,
 				drainingSince: updated.drainingSince?.toISOString() ?? null,
+			};
+		}),
+
+	// The same request, asked of **every machine the caller owns** in one action
+	// (issue #921), with a per-machine disposition saying what became of each —
+	// including the machines it deliberately did not ask, and why.
+	//
+	// Strictly owner-scoped, and named for that scope: the set is
+	// `listWorkersForOwner(ctx.user.id)` and nothing else, which inherits
+	// `requestUpdate`'s owner-only rule rather than restating it. Whether an
+	// `instanceAdmin` may signal machines they do not own is issue #922's question,
+	// and this procedure must not answer it by accident — hence `ForMine` (mirroring
+	// `listMine`), which also leaves the admin-facing name free.
+	//
+	// Unlike `requestUpdate` it refuses **no** machine for its state: a fleet action
+	// that aborted on one un-drained machine would tell the operator nothing about the
+	// other eleven. The dispositions and the reasoning behind them live in
+	// `../worker-update-fanout.ts`; what stays here is the authorization and the wire
+	// shape.
+	//
+	// The target is validated once, by the same `WorkerUpdateTargetSchema`
+	// `requestUpdate` uses, so a malformed ref is one `BAD_REQUEST` for the whole call
+	// rather than an identical refusal per machine. An operator who owns no machines
+	// gets `{ target, workers: [] }` — an honest empty answer, not an error.
+	requestUpdateForMine: authedProcedure
+		.input(z.object({ target: WorkerUpdateTargetSchema }))
+		.mutation(async ({ ctx, input }) => {
+			const workers = await listWorkersForOwner(ctx.user.id);
+			const entries = await fanOutWorkerUpdate(workers, input.target);
+			return {
+				target: input.target,
+				workers: entries.map((entry) => ({
+					...entry,
+					update: serializeWorkerUpdate(entry.update),
+				})),
 			};
 		}),
 

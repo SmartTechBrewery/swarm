@@ -80,6 +80,7 @@
  *   swarm workers drain <worker-id>
  *   swarm workers undrain <worker-id>
  *   swarm workers update <worker-id> <ref>
+ *   swarm workers update --all <ref>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
@@ -127,6 +128,7 @@ Usage:
   swarm workers drain <worker-id>
   swarm workers undrain <worker-id>
   swarm workers update <worker-id> <ref>
+  swarm workers update --all <ref>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
@@ -222,6 +224,15 @@ Usage:
              machine working on the build it has. Requesting again replaces a
              request that has not been answered yet. The machine's owner alone may
              do it, so sign in as them. Remember to undrain it afterwards.
+             With --all and no worker id, the same request goes to EVERY machine
+             you own that is eligible for it — so it reaches only the ones already
+             draining — and one line per machine says what became of it:
+             requested (asked, and the machine is connected), queued-offline
+             (recorded; stated again on its next connection), in-pool (not asked,
+             drain it first), already-asked (an unanswered request for this same
+             ref, left alone) or answered (it already reported for this same ref).
+             No machine's state refuses the call, so re-running it is how you read
+             the fleet: an answered machine is never asked twice.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -310,6 +321,9 @@ const WorkerUpdateStateSchema = z.object({
 	requestId: z.string().nullable(),
 	target: z.string().min(1),
 	status: z.string().nullable(),
+	// The machine's own prose beside the outcome, read only by the fleet report's
+	// detail column (issue #921) — optional on the same rule as everything else here.
+	message: z.string().nullable().optional(),
 });
 type WorkerUpdateState = z.infer<typeof WorkerUpdateStateSchema>;
 
@@ -376,6 +390,33 @@ const RequestedUpdateSchema = z.object({
 	displayName: z.string().min(1),
 	target: z.string().min(1),
 });
+
+/**
+ * `workers.requestUpdateForMine` (issue #921) — the fleet form of the same
+ * acknowledgement, one entry per machine the caller owns. `disposition` is read as
+ * a plain string for the reason every other vocabulary in this file is: it is
+ * printed rather than acted on, so a word a newer control plane reports and this
+ * build has never heard of must not make the command fail.
+ */
+const FleetUpdateSchema = z.object({
+	target: z.string().min(1),
+	workers: z.array(
+		z.object({
+			workerId: z.string().min(1),
+			displayName: z.string().min(1),
+			disposition: z.string().min(1),
+			update: WorkerUpdateStateSchema.nullable().optional(),
+		}),
+	),
+});
+type FleetUpdateEntry = z.infer<typeof FleetUpdateSchema>['workers'][number];
+
+/**
+ * The dispositions this build knows, in the order the summary counts them — the
+ * control plane's own vocabulary (`src/api/worker-update-fanout.ts`), restated here
+ * only to order a printed tally. Anything outside it is still counted, after these.
+ */
+const FANOUT_DISPOSITIONS = ['requested', 'queued-offline', 'in-pool', 'already-asked', 'answered'];
 
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
 const ProjectScmProviderSchema = z.object({ providerId: z.string().min(1) });
@@ -893,9 +934,21 @@ async function drainCommand(argv: string[], draining: boolean): Promise<number> 
  * the dispatch pool (`CONFLICT`, naming `swarm workers drain`) and a target that is
  * not a well-formed ref (`BAD_REQUEST`). Validating the ref here as well would only
  * let the two grammars drift.
+ *
+ * `--all` hands over to {@link updateFleetCommand} (issue #921) — the same request
+ * over every machine the operator owns, which reports per machine rather than
+ * refusing, so it answers in a different shape and cannot share this path's copy.
  */
 async function updateWorkerCommand(argv: string[]): Promise<number> {
-	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
+	const { values, positionals } = parseArgs({
+		args: argv,
+		allowPositionals: true,
+		options: { all: { type: 'boolean' } },
+	});
+	// `--all` is a different *selection*, not a different request: same mutation
+	// semantics per machine, run over every machine the operator owns (issue #921).
+	if (values.all) return await updateFleetCommand(positionals);
+
 	const [workerId, target] = positionals;
 	if (!workerId || !target) {
 		out.error('workers update: a <worker-id> and a <ref> are required');
@@ -922,6 +975,119 @@ async function updateWorkerCommand(argv: string[]): Promise<number> {
 		`  run 'swarm workers list' to read what it reported, then 'swarm workers undrain ${workerId}' to put it back in the pool`,
 	);
 	return 0;
+}
+
+/**
+ * `swarm workers update --all <ref>` (issue #921): ask every machine the operator
+ * owns that is eligible for it, in one call, and print what became of each.
+ *
+ * The report is the point. The control plane refuses no machine for its state — a
+ * fleet action that aborted on one machine still in the dispatch pool would say
+ * nothing about the others — so each line carries a **disposition** instead, the
+ * machines it did not ask included. That also makes re-running this the readout: a
+ * machine that has answered comes back `answered` rather than being asked again,
+ * and one with an outstanding request keeps it.
+ *
+ * **Exit 0 whenever the call succeeded**, however many machines were skipped: this
+ * is a report, not a pass/fail. Non-zero stays reserved for a usage error or a
+ * failed call, exactly as everywhere else in this file.
+ *
+ * It only ever reaches machines that are **already draining**, which is issue
+ * #933's precondition unrelaxed — so it cannot take a fleet's capacity down by
+ * itself. Draining them is still the operator's own step, named per machine below.
+ */
+async function updateFleetCommand(positionals: string[]): Promise<number> {
+	// A worker id alongside `--all` is two different requests typed as one, so it is
+	// refused naming both forms rather than resolved by guessing which was meant.
+	if (positionals.length > 1) {
+		out.error(
+			'workers update: --all asks every machine you own, so it takes a <ref> and nothing else — for one machine run `swarm workers update <worker-id> <ref>`',
+		);
+		out.info(USAGE);
+		return 1;
+	}
+	const target = positionals[0];
+	if (!target) {
+		out.error('workers update: a <ref> is required with --all');
+		out.info(USAGE);
+		return 1;
+	}
+
+	const operator = requireOperator();
+	if (!operator) return 1;
+
+	const fleet = await operator.client.mutate(
+		'workers.requestUpdateForMine',
+		{ target },
+		parseWith(FleetUpdateSchema),
+	);
+	if (fleet.workers.length === 0) {
+		out.info(`you operate no machines — nothing to ask to move to '${fleet.target}'`);
+		return 0;
+	}
+
+	for (const entry of fleet.workers) {
+		out.info(`${entry.workerId}\t${entry.displayName}\t${entry.disposition}${fanoutDetail(entry)}`);
+	}
+	out.info(summariseFanout(fleet.workers));
+
+	const asked = fleet.workers.filter(
+		(entry) => entry.disposition === 'requested' || entry.disposition === 'queued-offline',
+	);
+	if (asked.length > 0) {
+		out.info(
+			'  each asked machine applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
+		);
+		out.info(
+			"  run 'swarm workers list' to read what they reported, then 'swarm workers undrain <worker-id>' per machine to put them back in the pool",
+		);
+	} else {
+		out.info(`  nothing was asked to move to '${fleet.target}' — every machine above is as it was`);
+	}
+	// The remedy `workers.requestUpdate`'s CONFLICT names, printed here because the
+	// fan-out reports a machine in the pool rather than refusing the whole call.
+	const inPool = fleet.workers.filter((entry) => entry.disposition === 'in-pool');
+	if (inPool.length > 0) {
+		out.info(
+			`  still in the dispatch pool and so not asked — drain them, then run this again: ${inPool
+				.map((entry) => `swarm workers drain ${entry.workerId}`)
+				.join('; ')}`,
+		);
+	}
+	return 0;
+}
+
+/**
+ * The detail column on a fleet line. Only `answered` has anything to add — the
+ * outcome the machine reported and the first line of its own message — because
+ * that is the one disposition that stands for something already decided rather than
+ * something now in flight. The message is cut to its first line: it carries a
+ * bounded command tail for a failed build, which belongs in `swarm workers list`'s
+ * read of the row rather than in the middle of a per-machine table.
+ */
+function fanoutDetail(entry: FleetUpdateEntry): string {
+	if (entry.disposition !== 'answered' || !entry.update) return '';
+	const status = entry.update.status ?? 'unreported';
+	const firstLine = entry.update.message?.split('\n')[0]?.trim();
+	return firstLine ? `\t${status}: ${firstLine}` : `\t${status}`;
+}
+
+/** One tally line under the table, so a fleet is read without counting rows. */
+function summariseFanout(entries: FleetUpdateEntry[]): string {
+	const counts = new Map<string, number>();
+	for (const entry of entries) {
+		counts.set(entry.disposition, (counts.get(entry.disposition) ?? 0) + 1);
+	}
+	const known = FANOUT_DISPOSITIONS.filter((disposition) => counts.has(disposition));
+	// A disposition this build has never heard of is still counted, after the known
+	// ones — the same tolerance the schema above reads the word with.
+	const unknown = [...counts.keys()].filter(
+		(disposition) => !FANOUT_DISPOSITIONS.includes(disposition),
+	);
+	const tally = [...known, ...unknown.sort()]
+		.map((disposition) => `${counts.get(disposition)} ${disposition}`)
+		.join(', ');
+	return `${entries.length} machine${entries.length === 1 ? '' : 's'}: ${tally}`;
 }
 
 /**

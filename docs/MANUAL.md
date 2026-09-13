@@ -249,6 +249,30 @@ swarm workers list                       # read what it reported
 swarm workers undrain <worker-id>        # back in the pool
 ```
 
+**Or all of them at once.** `swarm workers update --all <ref>` (issue #921) asks
+every machine you own that is eligible for one, in a single action, and prints one
+line per machine saying what became of it:
+
+```bash
+swarm workers drain <worker-id>          # once per machine, still your own step
+swarm workers update --all main          # every machine you own that is draining
+swarm workers list                       # read what they reported
+swarm workers undrain <worker-id>        # once per machine
+```
+
+It reaches only machines that are **already draining** — the same precondition as
+the single-machine form — so it cannot take the fleet's capacity down by itself. No
+machine's state refuses the call: a machine still in the pool is reported as
+`in-pool` with the drain named for it rather than aborting the request for
+everything else, and the other four words are `requested` (asked, and the machine
+is connected), `queued-offline` (recorded; stated again on its next connection),
+`already-asked` (an unanswered request for this same ref, left as it is) and
+`answered` (it already reported for this same ref, shown beside the disposition).
+Re-running it is the readout — an answered machine is never asked twice, and an
+outstanding request keeps its id — and it exits 0 whatever the dispositions say,
+because it is a report rather than a pass/fail. It is strictly owner-scoped: your
+own machines and nothing wider.
+
 Nothing about the restart differs from the one above — the daemon waits until it
 holds no in-flight phase, applies the update, releases its session and exits 0, and
 the host's process supervisor (launchd `KeepAlive` / systemd `Restart=always`) starts

@@ -394,6 +394,21 @@ swarm workers list                         # read what it reported
 swarm workers undrain <worker-id>          # put it back in the pool
 ```
 
+Once you operate more than one machine, `--all` does the same for all of them in one
+action (issue #921) and prints a line per machine saying what became of it:
+
+```bash
+swarm workers update --all main            # every machine you own that is draining
+```
+
+It asks only the machines that are **already draining**, so draining (and undraining)
+stays a per-machine step you make yourself. Nothing refuses the call: a machine still
+in the pool comes back as `in-pool` with its drain command named, one that is offline
+as `queued-offline` (the request is on its row and is stated again on its next
+connection), one with an outstanding request for the same ref as `already-asked`, and
+one that has already reported for that ref as `answered`, with the outcome beside it.
+Re-running it is how you read the fleet — an answered machine is never asked twice.
+
 **It is off unless this host opts in.** Set `SWARM_WORKER_SELF_UPDATE=true` in the
 same `.env` the daemon already reads and restart it; with the flag off the machine
 reports `declined` to any such request and carries on working, which is what every
@@ -509,6 +524,7 @@ will simply repeat the cycle; fix the build first.
 | Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
+| `swarm workers update --all <ref>` reports `in-pool` for a machine you expected it to move | That machine is not draining, and the fan-out reports it rather than refusing the whole call (issue #921) — only already-drained machines are asked. Run the `swarm workers drain <worker-id>` the line under the table names, then run `update --all <ref>` again; the machines it already asked stay `already-asked` and are not asked twice. |
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
 | `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon (see "Optional — let the control plane update this machine"). |
 | `swarm workers list` shows `update <ref> refused` with "is already updating the SWARM install root" | Another daemon on that machine shares the install root and got there first (issue #935). Wait for *its* outcome, then re-issue this one: it will report `already-current` once that build has landed. Nothing was changed on this machine. |

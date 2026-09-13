@@ -57,6 +57,7 @@ const {
 const {
 	declareWorkerCapabilities,
 	getWorker,
+	listWorkersForOwner,
 	registerWorker,
 	renameWorker,
 	requestWorkerUpdate,
@@ -64,6 +65,8 @@ const {
 } = vi.hoisted(() => ({
 	declareWorkerCapabilities: vi.fn(),
 	getWorker: vi.fn(),
+	// Issue #921 — the owner-scoped selection `requestUpdateForMine` fans out over.
+	listWorkersForOwner: vi.fn(),
 	registerWorker: vi.fn(),
 	renameWorker: vi.fn(),
 	requestWorkerUpdate: vi.fn(),
@@ -73,6 +76,10 @@ const {
 const { publishWorkerUpdateRequest } = vi.hoisted(() => ({
 	publishWorkerUpdateRequest: vi.fn(),
 }));
+// Issue #921 — the fan-out is its own module with its own suite
+// (`tests/unit/api/worker-update-fanout.test.ts`); what this suite owns is the
+// authorization and the wire shape the router puts around it.
+const { fanOutWorkerUpdate } = vi.hoisted(() => ({ fanOutWorkerUpdate: vi.fn() }));
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -113,12 +120,14 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 vi.mock('@/identity/worker-service.js', () => ({
 	declareWorkerCapabilities,
 	getWorker,
+	listWorkersForOwner,
 	registerWorker,
 	renameWorker,
 	requestWorkerUpdate,
 	setWorkerDraining,
 }));
 vi.mock('@/queue/worker-updates.js', () => ({ publishWorkerUpdateRequest }));
+vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier }));
@@ -235,6 +244,8 @@ beforeEach(() => {
 		renameWorker,
 		requestWorkerUpdate,
 		setWorkerDraining,
+		listWorkersForOwner,
+		fanOutWorkerUpdate,
 		publishWorkerUpdateRequest,
 		removeWorker,
 		getMembership,
@@ -1609,6 +1620,124 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 
 		expect(second.requestId).not.toBe(first.requestId);
 		expect(requestWorkerUpdate).toHaveBeenLastCalledWith(WORKER_ID, second.requestId, 'v2');
+	});
+});
+
+// Issue #921. The fleet form of the same request: one action over every machine the
+// caller owns, refusing none of them for its state. The disposition table itself is
+// `tests/unit/api/worker-update-fanout.test.ts`; what this suite pins is the scope
+// the selection runs under and the shape it answers in.
+describe('workers.requestUpdateForMine (owner-scoped fan-out, issue #921)', () => {
+	const REQUESTED_AT = new Date('2026-09-13T10:05:00Z');
+	const REPORTED_AT = new Date('2026-09-13T10:09:00Z');
+
+	function entry(overrides: Record<string, unknown> = {}) {
+		return {
+			workerId: WORKER_ID,
+			displayName: 'ada-laptop',
+			disposition: 'requested',
+			update: {
+				requestId: '66666666-6666-4666-8666-666666666666',
+				target: 'main',
+				requestedAt: REQUESTED_AT,
+				status: null,
+				message: null,
+				reportedAt: null,
+			},
+			...overrides,
+		};
+	}
+
+	it('fans out over the caller’s own machines and nothing wider', async () => {
+		const workers = [makeWorker()];
+		listWorkersForOwner.mockResolvedValue(workers);
+		fanOutWorkerUpdate.mockResolvedValue([entry()]);
+
+		const result = await owner.requestUpdateForMine({ target: 'main' });
+
+		expect(listWorkersForOwner).toHaveBeenCalledExactlyOnceWith(OWNER_ID);
+		expect(fanOutWorkerUpdate).toHaveBeenCalledWith(workers, 'main');
+		expect(result.target).toBe('main');
+		expect(result.workers).toHaveLength(1);
+		// The installation roster is never read — this is owner self-service.
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	// The guard against this phase answering issue #922 by accident: an installation
+	// administrator gets their *own* machines here, exactly like anybody else.
+	it('gives an instanceAdmin their own machines and nobody else’s', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listWorkersForOwner.mockResolvedValue([]);
+		fanOutWorkerUpdate.mockResolvedValue([]);
+
+		await admin.requestUpdateForMine({ target: 'main' });
+
+		expect(listWorkersForOwner).toHaveBeenCalledExactlyOnceWith(ADMIN_USER.id);
+	});
+
+	// One refusal for the whole call rather than an identical one per machine — and
+	// the grammar is the security boundary, so it is checked before anything is read.
+	it.each([
+		['a URL', 'https://example.com/evil.git'],
+		['a shell fragment', 'main; rm -rf /'],
+		['a git option', '--upload-pack=curl'],
+	])('rejects %s as a target with BAD_REQUEST, reading nothing', async (_what, target) => {
+		await expect(owner.requestUpdateForMine({ target })).rejects.toThrowError(
+			expect.objectContaining({ code: 'BAD_REQUEST' }),
+		);
+		expect(listWorkersForOwner).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('answers an owner with no machines honestly, not with an error', async () => {
+		listWorkersForOwner.mockResolvedValue([]);
+		fanOutWorkerUpdate.mockResolvedValue([]);
+
+		await expect(owner.requestUpdateForMine({ target: 'main' })).resolves.toEqual({
+			target: 'main',
+			workers: [],
+		});
+	});
+
+	// The same explicit ISO treatment every other timestamp on this router gets, so a
+	// browser reads strings rather than whatever the serializer makes of a `Date`.
+	it('serialises the update state’s instants as ISO strings', async () => {
+		listWorkersForOwner.mockResolvedValue([makeWorker()]);
+		fanOutWorkerUpdate.mockResolvedValue([
+			entry({
+				disposition: 'answered',
+				update: {
+					requestId: null,
+					target: 'main',
+					requestedAt: REQUESTED_AT,
+					status: 'applied',
+					message: 'restarting',
+					reportedAt: REPORTED_AT,
+				},
+			}),
+		]);
+
+		const result = await owner.requestUpdateForMine({ target: 'main' });
+
+		expect(result.workers[0]).toMatchObject({
+			disposition: 'answered',
+			update: {
+				status: 'applied',
+				requestedAt: REQUESTED_AT.toISOString(),
+				reportedAt: REPORTED_AT.toISOString(),
+			},
+		});
+	});
+
+	// A machine that was skipped carries no update state at all, and that has to
+	// survive the serializer rather than becoming an empty object.
+	it('passes a null update state through as null', async () => {
+		listWorkersForOwner.mockResolvedValue([makeWorker({ drainingSince: null })]);
+		fanOutWorkerUpdate.mockResolvedValue([entry({ disposition: 'in-pool', update: null })]);
+
+		const result = await owner.requestUpdateForMine({ target: 'main' });
+
+		expect(result.workers[0]).toMatchObject({ disposition: 'in-pool', update: null });
 	});
 });
 

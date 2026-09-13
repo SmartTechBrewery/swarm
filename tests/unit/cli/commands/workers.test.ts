@@ -43,6 +43,7 @@ import { run } from '@/cli/commands/workers.js';
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const PROJECT_ID = 'proj-a';
 const IDENTIFIER = 'ada@example.com';
+const OTHER_WORKER_ID = '22222222-2222-4222-8222-222222222222';
 const ENROLLMENT_ID = '33333333-3333-4333-8333-333333333333';
 const ORIGINAL_INIT_CWD = process.env.INIT_CWD;
 
@@ -174,6 +175,24 @@ describe('swarm workers', () => {
 			target: input.target,
 			requestedAt: '2026-09-13T10:05:00.000Z',
 			drainingSince: '2026-09-13T10:00:00.000Z',
+		}));
+		// Issue #921 — the fleet form. One entry per machine, dispositions and all;
+		// a test that cares about the report replaces this wholesale.
+		answers.set('workers.requestUpdateForMine', (input) => ({
+			target: input.target,
+			workers: [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					disposition: 'requested',
+					update: {
+						requestId: '66666666-6666-4666-8666-666666666666',
+						target: input.target,
+						status: null,
+						message: null,
+					},
+				},
+			],
 		}));
 		enrollmentRow = {
 			id: ENROLLMENT_ID,
@@ -1148,6 +1167,116 @@ describe('swarm workers', () => {
 			refuse('workers.requestUpdate', 'must be a branch name, tag, or commit id');
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['update', WORKER_ID, 'https://example.com/evil.git'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('branch name, tag, or commit id'));
+		});
+	});
+
+	// Issue #921. The fleet form of the same subcommand: a different *selection*, the
+	// same per-machine request, and a report that never turns one machine's state into
+	// a refusal of the whole call.
+	describe('update --all', () => {
+		/** Replace the fleet answer with one entry per given machine. */
+		function fleet(...workers: Record<string, unknown>[]): void {
+			answers.set('workers.requestUpdateForMine', (input) => ({
+				target: input.target,
+				workers,
+			}));
+		}
+
+		it('asks for the whole fleet with the ref alone', async () => {
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(inputFor('workers.requestUpdateForMine')).toEqual({ target: 'main' });
+			// The per-worker mutation is not spent as well — one call, one fan-out.
+			expect(pathsCalled()).toEqual(['workers.requestUpdateForMine']);
+		});
+
+		// Two different requests typed as one: refused naming both forms rather than
+		// resolved by guessing which was meant.
+		it('refuses a worker id alongside --all, without calling', async () => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', '--all', WORKER_ID, 'main'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(
+				expect.stringContaining('swarm workers update <worker-id> <ref>'),
+			);
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it('requires a ref with --all', async () => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', '--all'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('<ref> is required'));
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		// One line per machine plus a tally, so a fleet is read without counting rows —
+		// and a machine that was skipped is on the table rather than missing from it.
+		it('prints one line per machine, a summary, and the follow-up hints', async () => {
+			fleet(
+				{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'requested', update: null },
+				{
+					workerId: OTHER_WORKER_ID,
+					displayName: 'ada-desktop',
+					disposition: 'queued-offline',
+					update: null,
+				},
+			);
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain(`${WORKER_ID}\tada-laptop\trequested`);
+			expect(joined).toContain(`${OTHER_WORKER_ID}\tada-desktop\tqueued-offline`);
+			expect(joined).toContain('2 machines: 1 requested, 1 queued-offline');
+			expect(joined).toContain('SWARM_WORKER_SELF_UPDATE=true');
+			expect(joined).toContain('swarm workers undrain');
+		});
+
+		// The remedy the per-worker CONFLICT names, printed here because the fan-out
+		// reports a machine still in the pool instead of refusing the call.
+		it('names the drain for a machine reported in-pool, and still exits 0', async () => {
+			fleet({
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				disposition: 'in-pool',
+				update: null,
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(lines().join('\n')).toContain(`swarm workers drain ${WORKER_ID}`);
+		});
+
+		// Re-running is the readout: an answered machine reports what it answered.
+		it('shows the reported outcome for an answered machine', async () => {
+			fleet({
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				disposition: 'answered',
+				update: {
+					requestId: null,
+					target: 'main',
+					status: 'failed',
+					message: 'npm ci exited 1\nsee the host log',
+				},
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			const joined = lines().join('\n');
+			expect(joined).toContain(`${WORKER_ID}\tada-laptop\tanswered\tfailed: npm ci exited 1`);
+			// Nothing was asked, so the undrain/opt-in hints would be untrue here.
+			expect(joined).not.toContain('SWARM_WORKER_SELF_UPDATE=true');
+			expect(joined).toContain('nothing was asked to move');
+		});
+
+		it('says so plainly when the caller owns no machines, and exits 0', async () => {
+			fleet();
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(lines().join('\n')).toContain('you operate no machines');
+		});
+
+		it('surfaces a malformed target as the control plane words it', async () => {
+			refuse('workers.requestUpdateForMine', 'must be a branch name, tag, or commit id');
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', '--all', 'https://example.com/evil.git'])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('branch name, tag, or commit id'));
 		});
 	});
