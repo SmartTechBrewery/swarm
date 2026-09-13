@@ -963,7 +963,11 @@ export async function hasRunForTask(
 }
 
 export interface ReviewMergeOutcomeUpdate {
-	/** `MergePullRequestOutcome['status']` or `'retry-exhausted'` (`src/worker/merge-automation.ts`). */
+	/**
+	 * `MergePullRequestOutcome['status']`, or one of the two budget exhaustions —
+	 * `'retry-exhausted'` / `'provider-error-exhausted'`
+	 * (`src/worker/merge-automation.ts`).
+	 */
 	status: string;
 	message: string;
 	/** The merge dispatch attempt this write reports (0 = the dispatch's first attempt). */

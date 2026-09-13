@@ -53,6 +53,7 @@ import type { AggregateCheckStatus } from '@/scm/types.js';
 import {
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
+	MERGE_PROVIDER_ERROR_EXHAUSTED,
 	MERGE_RETRY_EXHAUSTED,
 	mergeDispatchDedupKey,
 	mergeRetryDelayMs,
@@ -274,7 +275,7 @@ describe('processMergeAutomationDispatch', () => {
 		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
-	it('records retry exhaustion and completes the dispatch once the budget is spent', async () => {
+	it('records not-ready retry exhaustion and completes the dispatch once the budget is spent', async () => {
 		const outcome = await processMergeAutomationDispatch(
 			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
 			job,
@@ -316,21 +317,135 @@ describe('processMergeAutomationDispatch', () => {
 		});
 	});
 
-	it('fails the dispatch on an unexpected provider failure', async () => {
-		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
-			mergePullRequest: mergeReturning({ status: 'provider-error', message: '502 Bad Gateway' }),
-		});
+	// Issue #923: one transient 5xx used to settle the dispatch terminally, and
+	// nothing could ever re-create it — the dedup key and the review-verdict
+	// ledger both hold. It now rides the same bounded budget `not-ready` owns.
+	it('schedules a bounded retry on an unexpected provider failure', async () => {
+		const before = Date.now();
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 2 }),
+			job,
+			project,
+			{
+				mergePullRequest: mergeReturning({
+					status: 'provider-error',
+					message: '502 Bad Gateway',
+				}),
+			},
+		);
 
-		expect(failDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', '502 Bad Gateway');
+		expect(failDispatch).not.toHaveBeenCalled();
 		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
+		const input = lastRetryInput();
+		// The payload travels unchanged — a provider failure advances no head.
+		expect(input.jobPayload).toEqual(job);
+		expect(input.waitReason).toBe('recheck');
+		expect(input.attempt).toBe(3);
+		const delay = input.availableAt.getTime() - before;
+		expect(delay).toBeGreaterThanOrEqual(mergeRetryDelayMs(3) - 1000);
+		expect(delay).toBeLessThanOrEqual(mergeRetryDelayMs(3) + 1000);
+		// The reason is on the Review run from the first failed attempt, so the
+		// dashboard names it while the retries are still running.
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: 'provider-error',
+			message: '502 Bad Gateway',
+			attempt: 2,
+			approvedHeadSha: 'deadbeef',
+		});
 		expect(outcome).toEqual({
 			status: 'merge-automation-settled',
-			result: 'provider-error',
+			result: 'retry-scheduled',
 			prNumber: '17',
 		});
 	});
 
-	it('normalizes a thrown provider rejection to provider-error', async () => {
+	it('records provider-error exhaustion once that same budget is spent', async () => {
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			job,
+			project,
+			{
+				mergePullRequest: mergeReturning({
+					status: 'provider-error',
+					message: '502 Bad Gateway',
+				}),
+			},
+		);
+
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(failDispatch).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: MERGE_PROVIDER_ERROR_EXHAUSTED,
+			message: expect.stringContaining('502 Bad Gateway'),
+			attempt: MAX_MERGE_RETRIES,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: MERGE_PROVIDER_ERROR_EXHAUSTED,
+			prNumber: '17',
+		});
+	});
+
+	// Both give-ups complete the dispatch through one outcome; the Review run is
+	// what tells "the forge kept failing" apart from "it never became ready".
+	it('keeps the two budget exhaustions distinguishable on the run', async () => {
+		await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			job,
+			project,
+			{ mergePullRequest: mergeReturning({ status: 'not-ready', message: 'checks pending' }) },
+		);
+		const notReady = updateReviewMergeOutcome.mock.calls.at(-1)?.[1];
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			job,
+			project,
+			{ mergePullRequest: mergeReturning({ status: 'provider-error', message: '502' }) },
+		);
+		const providerError = updateReviewMergeOutcome.mock.calls.at(-1)?.[1];
+
+		expect(notReady).toMatchObject({ status: MERGE_RETRY_EXHAUSTED });
+		expect(providerError).toMatchObject({ status: MERGE_PROVIDER_ERROR_EXHAUSTED });
+		expect(MERGE_RETRY_EXHAUSTED).not.toBe(MERGE_PROVIDER_ERROR_EXHAUSTED);
+		expect(completeDispatch.mock.calls.map((call) => call[1])).toEqual([
+			'merge-retry-exhausted',
+			'merge-retry-exhausted',
+		]);
+	});
+
+	// The acceptance criterion the stranded pull requests were about: a retried
+	// merge needs no operator action at all.
+	it('merges on a later attempt after a transient provider failure, with no operator action', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'provider-error', message: '502 Bad Gateway' }),
+		});
+
+		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
+		expect(lastRetryInput().jobPayload).toEqual(job);
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 1 }),
+			job,
+			project,
+			{
+				mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+			},
+		);
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(failDispatch).not.toHaveBeenCalled();
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'merged',
+			prNumber: '17',
+		});
+	});
+
+	it('normalizes a thrown provider rejection to a retried provider-error', async () => {
 		const mergePullRequest = vi.fn(async () => {
 			throw new Error('provider unavailable');
 		});
@@ -339,10 +454,16 @@ describe('processMergeAutomationDispatch', () => {
 			mergePullRequest,
 		});
 
-		expect(failDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'provider unavailable');
+		expect(failDispatch).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: 'provider-error',
+			message: 'provider unavailable',
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
 		expect(outcome).toEqual({
 			status: 'merge-automation-settled',
-			result: 'provider-error',
+			result: 'retry-scheduled',
 			prNumber: '17',
 		});
 	});
@@ -367,20 +488,24 @@ describe('processMergeAutomationDispatch', () => {
 	// dispatch in flight until the reconciler's lease expiry with nothing recorded
 	// on the Review run. Hence the default is resolved inside the attempt's `try`,
 	// not in a default parameter (which binds before the body can catch anything).
-	it('settles the dispatch as provider-error when no provider is registered', async () => {
+	// Since issue #923 it settles as a *bounded retry*: a misconfigured project
+	// costs the budget and then exhausts terminally, with the reason on the run
+	// from the first attempt rather than a status-code predicate in shared code.
+	it('settles the dispatch as a retried provider-error when no provider is registered', async () => {
 		_resetSCMProviderRegistryForTesting();
 
 		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project);
 
-		expect(failDispatch).toHaveBeenCalledOnce();
-		expect(failDispatch.mock.calls[0]?.[1]).toMatch(/Cannot resolve the SCM provider/);
+		expect(failDispatch).not.toHaveBeenCalled();
 		expect(updateReviewMergeOutcome).toHaveBeenCalledOnce();
 		expect(updateReviewMergeOutcome.mock.calls[0]?.[1]).toMatchObject({
 			status: 'provider-error',
+			message: expect.stringMatching(/Cannot resolve the SCM provider/),
 		});
+		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
 		expect(outcome).toEqual({
 			status: 'merge-automation-settled',
-			result: 'provider-error',
+			result: 'retry-scheduled',
 			prNumber: '17',
 		});
 	});
@@ -678,7 +803,10 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		expect(outcome.result).toBe('unsupported');
 	});
 
-	it('fails the dispatch when the update itself fails unexpectedly', async () => {
+	// The update call's own provider error takes the same shared budget as the
+	// merge call's (issue #923) — leaving it terminal would half-fix the
+	// lifecycle, since an identical 502 would still strand the pull request.
+	it('retries when the update itself fails unexpectedly', async () => {
 		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
 			mergePullRequest: mergeReturning(STALE_BASE),
 			updatePullRequestBranch: updateReturning({
@@ -687,12 +815,21 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 			}),
 		});
 
-		expect(failDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', '502 Bad Gateway');
+		expect(failDispatch).not.toHaveBeenCalled();
 		expect(completeDispatch).not.toHaveBeenCalled();
-		expect(outcome.result).toBe('provider-error');
+		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
+		// Which call failed travels in the message, replacing the log line the
+		// terminal branch used to emit.
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: 'provider-error',
+			message: 'failed to bring the head up to date with the base: 502 Bad Gateway',
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(outcome.result).toBe('retry-scheduled');
 	});
 
-	it('normalizes a thrown update rejection to provider-error', async () => {
+	it('normalizes a thrown update rejection to a retried provider-error', async () => {
 		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
 			mergePullRequest: mergeReturning(STALE_BASE),
 			updatePullRequestBranch: vi.fn(async () => {
@@ -700,8 +837,14 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 			}),
 		});
 
-		expect(failDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'provider unavailable');
-		expect(outcome.result).toBe('provider-error');
+		expect(failDispatch).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: 'provider-error',
+			message: 'failed to bring the head up to date with the base: provider unavailable',
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(outcome.result).toBe('retry-scheduled');
 	});
 
 	// A comment is an extra on top of the durable outcome, never the notice itself.

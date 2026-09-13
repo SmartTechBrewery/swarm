@@ -188,8 +188,12 @@ export type DispatchPhase = TriggerPhase | 'merge-automation';
 /**
  * Terminal detail for a `completed` dispatch. The `merge-*` values (and
  * `merged`) settle merge-automation dispatches (issue #292): every functional
- * refusal the provider reports is a normal, visible completion — only an
- * unexpected provider failure marks the dispatch `failed`.
+ * refusal the provider reports is a normal, visible completion. Since issue
+ * #923 the merge executor never marks a dispatch `failed` at all — a provider
+ * error is retried on the same bounded budget `not-ready` uses, and a spent
+ * budget completes as `merge-retry-exhausted` with the reason recorded on the
+ * Review run. (A merge dispatch can still be failed from *outside* that
+ * executor, by the worker's unknown-project/unknown-repository guard.)
  *
  * `skipped-not-eligible` is the one eligibility outcome: the dispatch resolved a
  * phase, but the work item is not opted into automation (it lacks the project's
