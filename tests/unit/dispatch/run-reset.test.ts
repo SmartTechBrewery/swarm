@@ -29,6 +29,17 @@ vi.mock('@/queue/cancellation.js', () => ({
 	requestRunCancellation: vi.fn(),
 }));
 
+// A reset that throws part-way has to leave a line saying what it had already
+// done (issue #913), so the logger is asserted on rather than left to console.
+const { loggerInfo, loggerWarn, loggerError } = vi.hoisted(() => ({
+	loggerInfo: vi.fn(),
+	loggerWarn: vi.fn(),
+	loggerError: vi.fn(),
+}));
+vi.mock('@/lib/logger.js', () => ({
+	logger: { info: loggerInfo, warn: loggerWarn, error: loggerError, debug: vi.fn() },
+}));
+
 vi.mock('@/queue/producer.js', () => ({
 	priorityFor: (job: { type: string }) => (job.type === 'github-projects' ? 10 : undefined),
 	removePendingJobById: vi.fn().mockResolvedValue(true),
@@ -167,6 +178,15 @@ function makeDispatch(overrides: Partial<DispatchRow> = {}): DispatchRow {
 	};
 }
 
+// The audit context both cancellation calls carry (issue #913): the run they name,
+// plus the action that asked — `'reset'` from this service, never `'terminate'`.
+const RESET_CANCELLATION_CONTEXT = {
+	action: 'reset',
+	projectId: 'p1',
+	taskId: '424',
+	phase: 'implementation',
+} as const;
+
 describe('resetRun', () => {
 	beforeEach(() => {
 		vi.mocked(getRunByIdFromDb).mockReset().mockResolvedValue(makeRun());
@@ -176,6 +196,9 @@ describe('resetRun', () => {
 		vi.mocked(getActiveDispatchByRunId).mockReset().mockResolvedValue(undefined);
 		vi.mocked(cancelDispatchAndWake).mockReset().mockResolvedValue(makeDispatch());
 		vi.mocked(cancelClaimedDispatch).mockReset().mockResolvedValue(true);
+		loggerInfo.mockClear();
+		loggerWarn.mockClear();
+		loggerError.mockClear();
 		vi.mocked(clearRunCancellation).mockReset().mockResolvedValue(undefined);
 		vi.mocked(requestRunCancellation).mockReset().mockResolvedValue(undefined);
 		vi.mocked(clearRunRecovery).mockReset().mockResolvedValue(undefined);
@@ -198,7 +221,7 @@ describe('resetRun', () => {
 			'dispatch-1',
 			expect.stringContaining('run-1'),
 		);
-		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		expect(clearRunCancellation).toHaveBeenCalledWith('run-1', RESET_CANCELLATION_CONTEXT);
 		// Issue #744: the discard is unconditional — there is no opt-in left to pass.
 		expect(reconcileTerminatedWorktree).toHaveBeenCalledWith(
 			expect.anything(),
@@ -360,6 +383,73 @@ describe('resetRun', () => {
 		expect(clearRunCancellation).not.toHaveBeenCalled();
 	});
 
+	// Issue #913 — a reset records a cancellation marker as its first step and clears
+	// it three steps later, and `run reset complete` is only reached on the happy
+	// path, so a reset that died in between used to leave no trace of having run.
+	describe('a reset that does not complete', () => {
+		it('logs what it had already done before rethrowing', async () => {
+			vi.mocked(createAndPublishDispatch).mockRejectedValue(new Error('dispatch insert failed'));
+
+			await expect(resetRun('run-1')).rejects.toThrow('dispatch insert failed');
+
+			expect(loggerError).toHaveBeenCalledWith('run reset did not complete', {
+				runId: 'run-1',
+				projectId: 'p1',
+				taskId: '424',
+				phase: 'implementation',
+				refusal: undefined,
+				agentStop: 'not-running',
+				dispatch: 'none',
+				cancellationCleared: true,
+				worktree: 'removed',
+				worktreeError: null,
+				recoveryCleared: true,
+				abandonedPreservedWorkerId: null,
+				error: expect.stringContaining('dispatch insert failed'),
+			});
+			expect(loggerInfo).not.toHaveBeenCalledWith('run reset complete', expect.anything());
+		});
+
+		it('reports an already-resetting refusal as the ending that left the most behind', async () => {
+			vi.mocked(createAndPublishDispatch).mockRejectedValue(
+				new Error('duplicate key value violates unique constraint "uq_dispatches_active_run"'),
+			);
+
+			await expect(resetRun('run-1')).rejects.toThrowError(
+				expect.objectContaining({ reason: 'already-resetting' }),
+			);
+
+			expect(loggerWarn).toHaveBeenCalledWith(
+				'run reset did not complete',
+				expect.objectContaining({
+					runId: 'run-1',
+					refusal: 'already-resetting',
+					cancellationCleared: true,
+					recoveryCleared: true,
+				}),
+			);
+			expect(loggerError).not.toHaveBeenCalledWith('run reset did not complete', expect.anything());
+		});
+
+		it('says it ran even when it threw before doing anything', async () => {
+			vi.mocked(getProjectByIdFromDb).mockRejectedValue(new Error('project read failed'));
+
+			await expect(resetRun('run-1')).rejects.toThrow('project read failed');
+
+			expect(loggerError).toHaveBeenCalledWith(
+				'run reset did not complete',
+				expect.objectContaining({
+					runId: 'run-1',
+					agentStop: 'not-running',
+					dispatch: 'none',
+					cancellationCleared: false,
+					recoveryCleared: false,
+					worktree: 'not-attempted',
+				}),
+			);
+		});
+	});
+
 	// Issue #744 — the two states nothing can be re-dispatched from. Refusing them left
 	// the wedged run exactly as it was, which is the thing reset exists to end, so they
 	// clear the run's state like any other reset and then settle the row terminally.
@@ -371,7 +461,7 @@ describe('resetRun', () => {
 
 		expect(result).toMatchObject({ outcome: 'terminated', dispatch: 'cancelled' });
 		expect(result.outcome === 'terminated' && result.reason).toContain('no longer exists');
-		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		expect(clearRunCancellation).toHaveBeenCalledWith('run-1', RESET_CANCELLATION_CONTEXT);
 		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
 		// No project means no `GitWorktreeManager` to settle this host's checkout with.
 		expect(reconcileTerminatedWorktree).not.toHaveBeenCalled();
@@ -388,7 +478,7 @@ describe('resetRun', () => {
 
 		expect(result).toMatchObject({ outcome: 'terminated', dispatch: 'cancelled' });
 		expect(result.outcome === 'terminated' && result.reason).toContain('without a job payload');
-		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		expect(clearRunCancellation).toHaveBeenCalledWith('run-1', RESET_CANCELLATION_CONTEXT);
 		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
 		// The checkout is still settled here — only the re-dispatch is impossible.
 		expect(reconcileTerminatedWorktree).toHaveBeenCalled();
@@ -463,6 +553,7 @@ describe('resetRun', () => {
 			expect(requestRunCancellation).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
 				expect.objectContaining({ source: 'api', requestedAt: expect.any(String) }),
+				RESET_CANCELLATION_CONTEXT,
 			);
 			expect(result).toMatchObject({ outcome: 'restarted', agentStop: 'stopped' });
 			// Ordering is the whole point: the dying attempt's terminal result settles the
@@ -514,7 +605,7 @@ describe('resetRun', () => {
 				false,
 				expect.objectContaining({ discardProtectedWork: true }),
 			);
-			expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+			expect(clearRunCancellation).toHaveBeenCalledWith('run-1', RESET_CANCELLATION_CONTEXT);
 			expect(createAndPublishDispatch).toHaveBeenCalledOnce();
 		});
 

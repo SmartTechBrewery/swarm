@@ -22,6 +22,15 @@
  * `retryNow` mutation clears it before re-running), so a re-run of a terminated
  * run starts clean.
  *
+ * **Both writes are also the audit trail** (issue #913). The Redis records are
+ * designed to be short-lived — the worker clears the marker *and* the origin the
+ * moment it acts — so minutes after an incident nothing anywhere says a
+ * cancellation was ever asked for. Both mutating calls therefore log one line
+ * naming the run, its project, task and phase, the operator action behind the
+ * call, and the recorded origin, which is the only record that outlives the
+ * marker. Nothing secret goes on those lines, and `CancellationOrigin.actor` is
+ * logged only when one was genuinely recorded — never guessed (issue #308).
+ *
  * Own lazy ioredis client per process, mirroring `project-concurrency.ts` — the
  * dashboard publishes, the worker subscribes, both against the one shared Redis.
  */
@@ -49,6 +58,12 @@ const CANCELLATION_CHANNEL = 'swarm:run-cancel';
 // Redis EXEC reports individual command errors after preceding commands have
 // already run. Validate both key types inside one script before changing either
 // record, so a wrong-type companion key cannot leave a marker-only request.
+//
+// Both scripts return whether they actually *changed* the marker set (SADD/SREM's
+// own reply) rather than a constant 1, which is what lets the audit lines below
+// tell a cancellation that took effect from one that found nothing to cancel
+// (issue #913): a request landing on a run already marked is a repeat, and a clear
+// that removed nothing means the run settled with no cancellation pending.
 const RECORD_CANCELLATION_SCRIPT = `
 local setType = redis.call('TYPE', KEYS[1])['ok']
 if setType ~= 'none' and setType ~= 'set' then
@@ -60,9 +75,9 @@ if originType ~= 'none' and originType ~= 'hash' then
   return redis.error_reply('run-cancellation: cancellation origin key must be a hash')
 end
 
-redis.call('SADD', KEYS[1], ARGV[1])
+local added = redis.call('SADD', KEYS[1], ARGV[1])
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
-return 1
+return added
 `;
 
 const CLEAR_CANCELLATION_SCRIPT = `
@@ -76,9 +91,9 @@ if originType ~= 'none' and originType ~= 'hash' then
   return redis.error_reply('run-cancellation: cancellation origin key must be a hash')
 end
 
-redis.call('SREM', KEYS[1], ARGV[1])
+local removed = redis.call('SREM', KEYS[1], ARGV[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
-return 1
+return removed
 `;
 
 /**
@@ -98,6 +113,34 @@ export const CancellationOriginSchema = z.object({
 	requestId: z.string().optional(),
 });
 export type CancellationOrigin = z.infer<typeof CancellationOriginSchema>;
+
+/** The run a cancellation call concerns, named the way an incident review needs it. */
+interface RunCancellationSubject {
+	projectId: string;
+	taskId: string;
+	phase: string;
+}
+
+/**
+ * A cancellation request's audit context (issue #913) — the run it names plus the
+ * operator action behind it: `'terminate'` for the dashboard/API Terminate
+ * action, `'reset'` for the agent stop "Reset & restart" performs first. It is
+ * deliberately separate from {@link CancellationOrigin}, which is *stored* and
+ * shown in the UI: this describes the code path that asked, a fact the caller
+ * always knows, so it never has to stand in for an actor nobody established.
+ */
+export interface RunCancellationRequestContext extends RunCancellationSubject {
+	action: 'terminate' | 'reset';
+}
+
+/**
+ * The same for a clear: which lifecycle step dropped the marker — a run settling
+ * terminally, a manual retry of the same row, or a reset clearing it before it
+ * restarts the phase.
+ */
+export interface RunCancellationClearContext extends RunCancellationSubject {
+	action: 'run-settled' | 'retry' | 'reset';
+}
 
 /**
  * The `error`/message a cancelled run records — its terminal reason. Neutral by
@@ -133,20 +176,60 @@ function getRedis(): Redis {
  * `origin` is recorded atomically as a companion structure ({@link getRunCancellationOrigin})
  * alongside the durable set entry. The script validates both destination key
  * types before writing, so either both records are changed or the request fails.
+ *
+ * `context` is not stored — it is what the audit line says (issue #913). Both
+ * records here are cleared the moment the worker acts on them, so this log line
+ * is the only lasting answer to "what asked for this, and through which surface".
+ * A request that fails to record logs the same fields at `error` before it
+ * rethrows, because an asked-for cancellation that never landed is exactly as
+ * worth knowing about as one that did.
  */
 export async function requestRunCancellation(
 	runId: string,
 	origin: CancellationOrigin,
+	context: RunCancellationRequestContext,
 ): Promise<void> {
 	const redis = getRedis();
-	await redis.eval(
-		RECORD_CANCELLATION_SCRIPT,
-		2,
-		CANCELLATION_SET_KEY,
-		CANCELLATION_ORIGIN_KEY,
+	// `actor` and `requestId` are optional on the origin and stay `undefined` when
+	// none was recorded — both log formats drop an undefined value, so an absent
+	// actor reads as absent rather than as a guessed one.
+	const audit = {
 		runId,
-		JSON.stringify(origin),
-	);
+		projectId: context.projectId,
+		taskId: context.taskId,
+		phase: context.phase,
+		action: context.action,
+		originSource: origin.source,
+		originActor: origin.actor,
+		requestedAt: origin.requestedAt,
+		requestId: origin.requestId,
+	};
+
+	let recorded: unknown;
+	try {
+		recorded = await redis.eval(
+			RECORD_CANCELLATION_SCRIPT,
+			2,
+			CANCELLATION_SET_KEY,
+			CANCELLATION_ORIGIN_KEY,
+			runId,
+			JSON.stringify(origin),
+		);
+	} catch (err) {
+		logger.error('run cancellation requested but not recorded', {
+			...audit,
+			error: String(err),
+		});
+		throw err;
+	}
+
+	logger.info('run cancellation requested', {
+		...audit,
+		// `already-pending` is a repeat — a second Terminate click, or a reset of a
+		// run that is already terminating — which is otherwise indistinguishable
+		// from the request that actually created the marker once it is cleared.
+		marker: recorded === 1 ? 'recorded' : 'already-pending',
+	});
 
 	try {
 		await redis.publish(CANCELLATION_CHANNEL, runId);
@@ -207,20 +290,42 @@ export async function isRunCancellationRequested(runId: string): Promise<boolean
  * it), so a later re-run of the same row isn't terminated by a stale request and
  * doesn't inherit a stale origin. Best-effort: a failed clear only risks a
  * redundant no-op abort of an already-terminal run, so log and continue.
+ *
+ * This is where a cancellation's record is destroyed, so it is also where the
+ * fact that one *took effect* is put on the log instead (issue #913). Only a
+ * clear that actually removed a pending marker logs: the worker clears on every
+ * terminal outcome, so logging the no-ops too would bury the one line an incident
+ * review is looking for under a line per run.
  */
-export async function clearRunCancellation(runId: string): Promise<void> {
+export async function clearRunCancellation(
+	runId: string,
+	context: RunCancellationClearContext,
+): Promise<void> {
 	try {
 		const redis = getRedis();
-		await redis.eval(
+		const cleared = await redis.eval(
 			CLEAR_CANCELLATION_SCRIPT,
 			2,
 			CANCELLATION_SET_KEY,
 			CANCELLATION_ORIGIN_KEY,
 			runId,
 		);
+		if (cleared === 1) {
+			logger.info('run cancellation cleared', {
+				runId,
+				projectId: context.projectId,
+				taskId: context.taskId,
+				phase: context.phase,
+				action: context.action,
+			});
+		}
 	} catch (err) {
 		logger.warn('run-cancellation: failed to clear cancellation state', {
 			runId,
+			projectId: context.projectId,
+			taskId: context.taskId,
+			phase: context.phase,
+			action: context.action,
 			error: String(err),
 		});
 	}

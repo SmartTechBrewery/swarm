@@ -239,6 +239,26 @@ each worker machine's checkout — see
 which carries the `swarm-repo-renamed` runbook and the ordering constraint that
 keeps worker enrollments from being suspended.
 
+**A run that was cancelled leaves its trail in the log, not in Redis.** The
+cancellation marker and its recorded origin are deleted the moment the worker acts
+on them, so grep the log rather than Redis:
+
+- `run cancellation requested` — one line per request, naming the run, its project,
+  task and phase, the `action` that asked (`terminate` for the dashboard/API
+  Terminate button, `reset` for the agent stop "Reset & restart" performs first),
+  and the recorded origin (`originSource`, `requestedAt`, and `originActor` only
+  when an actor was genuinely recorded — it is never guessed). `marker=recorded` is
+  the request that created the cancellation; `marker=already-pending` is a repeat
+  landing on one that was already there. A request that could not be recorded at
+  all logs the same fields as `run cancellation requested but not recorded`.
+- `run cancellation cleared` — the cancellation *took effect*: a pending marker was
+  actually consumed, by the run settling (`action=run-settled`), a manual retry, or
+  a reset. A clear that found nothing pending logs nothing, so a `requested` line
+  with no `cleared` line is a cancellation nothing ever acted on.
+- `run reset did not complete` — a reset that threw part-way, reporting which of its
+  steps had already run (`cancellationCleared`, `recoveryCleared`, the worktree
+  outcome). `run reset complete` is only reached on the happy path.
+
 ## Common commands
 
 ```bash

@@ -163,7 +163,11 @@ export class RunResetError extends Error {
 	}
 }
 
-/** The steps every reset performs, whatever it ends in. */
+/**
+ * The steps every reset performs, whatever it ends in. Filled in as each one
+ * lands rather than assembled at the end (issue #913), so it also describes a
+ * reset that threw part-way — see {@link resetRun}.
+ */
 interface ResetRunSteps {
 	runId: string;
 	/**
@@ -237,14 +241,26 @@ const delay = (ms: number): Promise<void> =>
  * unreadable row are both logged and folded into the reported outcome, so the
  * restart below happens either way.
  */
-async function stopLiveAgent(runId: string): Promise<ResetAgentStop> {
+async function stopLiveAgent(run: {
+	id: string;
+	projectId: string;
+	taskId: string;
+	phase: string;
+}): Promise<ResetAgentStop> {
+	const runId = run.id;
 	try {
 		// Neutral origin: this service is called by the dashboard mutation *and* the
-		// CLI, and there is no caller identity at either boundary to record.
-		await requestRunCancellation(runId, {
-			source: 'api',
-			requestedAt: new Date().toISOString(),
-		});
+		// CLI, and there is no caller identity at either boundary to record. The
+		// audit line the request emits (issue #913) says `action: 'reset'`, so a
+		// marker written from here is still tellable apart from a Terminate's.
+		await requestRunCancellation(
+			runId,
+			{
+				source: 'api',
+				requestedAt: new Date().toISOString(),
+			},
+			{ action: 'reset', projectId: run.projectId, taskId: run.taskId, phase: run.phase },
+		);
 	} catch (err) {
 		// The durable write failed, so nothing was delivered — but a reset never
 		// refuses, and the run may still settle on its own while we wait, so the
@@ -401,18 +417,17 @@ async function createReplacementDispatch(
 	}
 }
 
+/** The run row a reset works from, named so the steps below can take it verbatim. */
+type ResetTargetRun = NonNullable<Awaited<ReturnType<typeof getRunByIdFromDb>>>;
+
 /**
- * Reset one wedged run and re-dispatch its phase. Throws {@link RunResetError}
- * for the two refusals a caller surfaces (an unknown run, a reset already under
- * way); anything else propagates as an internal failure. Every other ending is a
- * {@link ResetRunResult} — `'restarted'`, or `'terminated'` for a run nothing
- * could be re-dispatched from.
+ * Every step of a reset after its run row has been read. It reports into
+ * `progress` as each one lands rather than assembling the result at the end, so
+ * a throw part-way is still describable by {@link resetRun}'s own catch (issue
+ * #913) — the log line that says what the half-finished reset had already done.
  */
-export async function resetRun(runId: string): Promise<ResetRunResult> {
-	const run = await getRunByIdFromDb(runId);
-	if (!run) {
-		throw new RunResetError('run-not-found', `Run with ID "${runId}" not found`);
-	}
+async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promise<ResetRunResult> {
+	const runId = run.id;
 	// Scoped to the repository the *run* recorded, not the project's default entry
 	// (issue #684 phase 2): the `GitWorktreeManager` built from this below tears down
 	// the checkout the run actually held, whose branch names come from that
@@ -437,9 +452,8 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 	// destroys state that agent is still writing to, and the replacement dispatch is
 	// created after this returns, so a stop that lands settles the *old* dispatch id
 	// rather than the restart. A stop that never confirms is reported, not refused.
-	const agentStop =
-		run.status === 'running' ? await stopLiveAgent(run.id) : ('not-running' as const);
-	if (agentStop === 'timed-out') {
+	progress.agentStop = run.status === 'running' ? await stopLiveAgent(run) : 'not-running';
+	if (progress.agentStop === 'timed-out') {
 		logger.warn('run reset: the run’s agent did not confirm the stop — restarting anyway', {
 			runId,
 			projectId: run.projectId,
@@ -448,11 +462,17 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 		});
 	}
 
-	const dispatch = await cancelActiveDispatch(run.id);
+	progress.dispatch = await cancelActiveDispatch(run.id);
 
 	// A stale user-termination flag would make the worker terminate the fresh
 	// attempt at its start-check (issue #166); `clearRunCancellation` never throws.
-	await clearRunCancellation(run.id);
+	await clearRunCancellation(run.id, {
+		action: 'reset',
+		projectId: run.projectId,
+		taskId: run.taskId,
+		phase: run.phase,
+	});
+	progress.cancellationCleared = true;
 
 	// Skipped only when the project is gone, since the manager is built from it. The
 	// restart's own `'discard'` intent is what settles a checkout on another host
@@ -460,6 +480,8 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 	const { worktree, worktreeError } = project
 		? await settleLocalWorktree(run, project)
 		: { worktree: null, worktreeError: null };
+	progress.worktree = worktree;
+	progress.worktreeError = worktreeError;
 
 	// Always cleared, even when the checkout was retained: the run is restarting,
 	// and the fresh attempt's provisioning gate re-records a blocked reason if the
@@ -470,19 +492,9 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 	// cancelled control-plane side and the local checkout reconciliation is a no-op
 	// for a checkout that lives on another host. That is deliberate, since the whole
 	// point of the escape hatch is to work while that machine is unreachable.
-	const abandonedPreservedWorkerId = run.recovery?.preservedWorkerId ?? null;
+	progress.abandonedPreservedWorkerId = run.recovery?.preservedWorkerId ?? null;
 	await clearRunRecovery(run.id);
-
-	const steps: ResetRunSteps = {
-		runId: run.id,
-		agentStop,
-		dispatch,
-		cancellationCleared: true,
-		worktree,
-		worktreeError,
-		recoveryCleared: true,
-		abandonedPreservedWorkerId,
-	};
+	progress.recoveryCleared = true;
 
 	if (terminalReason !== null || jobPayload === null) {
 		// The second half is redundant — a null payload is already a terminal reason —
@@ -494,11 +506,11 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 			projectId: run.projectId,
 			taskId: run.taskId,
 			phase: run.phase,
-			agentStop,
-			dispatch,
+			agentStop: progress.agentStop,
+			dispatch: progress.dispatch,
 			reason,
 		});
-		return { ...steps, outcome: 'terminated', reason };
+		return { ...progress, outcome: 'terminated', reason };
 	}
 
 	// A *first attempt*, not a retry (issue #741): the stored payload's resume latches
@@ -516,13 +528,69 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 		projectId: run.projectId,
 		taskId: run.taskId,
 		phase: run.phase,
-		agentStop,
-		dispatch,
-		worktree: worktree?.outcome ?? 'not-attempted',
-		worktreeError,
-		abandonedPreservedWorkerId,
+		agentStop: progress.agentStop,
+		dispatch: progress.dispatch,
+		worktree: progress.worktree?.outcome ?? 'not-attempted',
+		worktreeError: progress.worktreeError,
+		abandonedPreservedWorkerId: progress.abandonedPreservedWorkerId,
 		dispatchId,
 	});
 
-	return { ...steps, outcome: 'restarted', dispatchId };
+	return { ...progress, outcome: 'restarted', dispatchId };
+}
+
+/**
+ * Reset one wedged run and re-dispatch its phase. Throws {@link RunResetError}
+ * for the two refusals a caller surfaces (an unknown run, a reset already under
+ * way); anything else propagates as an internal failure. Every other ending is a
+ * {@link ResetRunResult} — `'restarted'`, or `'terminated'` for a run nothing
+ * could be re-dispatched from.
+ *
+ * A reset that ends in a throw logs what it had already done (issue #913). It
+ * records a cancellation marker as its *first* step and clears it three steps
+ * later, and `run reset complete` is only reached on the happy path — so before
+ * this, a reset that died in between left a marker behind with nothing anywhere
+ * saying it had ever run.
+ */
+export async function resetRun(runId: string): Promise<ResetRunResult> {
+	const run = await getRunByIdFromDb(runId);
+	if (!run) {
+		throw new RunResetError('run-not-found', `Run with ID "${runId}" not found`);
+	}
+
+	const progress: ResetRunSteps = {
+		runId: run.id,
+		agentStop: 'not-running',
+		dispatch: 'none',
+		cancellationCleared: false,
+		worktree: null,
+		worktreeError: null,
+		recoveryCleared: false,
+		abandonedPreservedWorkerId: null,
+	};
+
+	try {
+		return await performReset(run, progress);
+	} catch (err) {
+		// `already-resetting` is a refusal rather than a fault, but it is raised by
+		// the very last step, so it is the ending that leaves the most behind — it
+		// reports at `warn` rather than passing silently.
+		const refusal = err instanceof RunResetError ? err.reason : undefined;
+		logger[refusal ? 'warn' : 'error']('run reset did not complete', {
+			runId: run.id,
+			projectId: run.projectId,
+			taskId: run.taskId,
+			phase: run.phase,
+			refusal,
+			agentStop: progress.agentStop,
+			dispatch: progress.dispatch,
+			cancellationCleared: progress.cancellationCleared,
+			worktree: progress.worktree?.outcome ?? 'not-attempted',
+			worktreeError: progress.worktreeError,
+			recoveryCleared: progress.recoveryCleared,
+			abandonedPreservedWorkerId: progress.abandonedPreservedWorkerId,
+			error: describeError(err),
+		});
+		throw err;
+	}
 }
