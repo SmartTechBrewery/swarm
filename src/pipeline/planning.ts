@@ -971,8 +971,15 @@ function readPlanOrThrow(
  * *before* the plan comment whose {@link planDeliveryMarker} short-circuits a replayed
  * delivery, so "the plan comment exists" already implies "every child was processed",
  * where advancing next to the parent's move would be skipped on a retry that had
- * already posted the comment. With `autoAdvance` off nothing changes: the children
- * stay in Planning, exactly as the source task stays where it is.
+ * already posted the comment. It also has to stay here for the split note to stay
+ * honest: {@link postSplitChildNote} reports the child's *real* final column, so an
+ * advance deferred past the parent's own writes would leave the note predicting one.
+ * What that ordering costs is that the two writes after the plan comment — the parent's
+ * move and its `planned` label — can fail with children already advanced, and the
+ * retry's short-circuit then skips this function and reports none of them; that gap is
+ * closed on the other side, by {@link recoverAdvancedSplitChildren}. With `autoAdvance`
+ * off nothing changes: the children stay in Planning, exactly as the source task stays
+ * where it is.
  */
 async function applySplit(
 	pm: PMProvider,
@@ -1403,6 +1410,68 @@ async function advanceSplitChild(
 		);
 		return false;
 	}
+}
+
+/**
+ * The largest number of children {@link recoverAdvancedSplitChildren} will look up
+ * before it stops. The scan's real exit is the first index with no card, which on the
+ * path it runs from is always the split's own child count, so this is a bound on a
+ * read loop rather than the normal end of one — and it is stated (and logged when it
+ * bites) because a lookup loop with no explicit bound is exactly what the cost
+ * contract on `PMProvider` forbids. No split SWARM has produced comes near it.
+ */
+const MAX_RECOVERED_SPLIT_CHILDREN = 64;
+
+/**
+ * Recover the children an *earlier attempt of this same delivery* already advanced to
+ * {@link NEXT_STATUS}, for the one path that would otherwise lose them.
+ *
+ * A retry that finds its own plan comment skips {@link applySplit} entirely
+ * ({@link planDeliveryMarker}), so it reports no child ids at all — while the parent's
+ * own move and `planned` label, the two writes that run *after* that comment, are
+ * precisely what such a retry exists to complete. A child the failed attempt had
+ * already moved is therefore sitting in "ToDo" with its self-enqueue riding on a result
+ * that no longer names it: `advancedItemIds` comes back empty, the worker synthesizes
+ * no job for it, and the move that would have produced a webhook was SWARM's own, so
+ * loop prevention drops it (`PMRouterAdapter.isSelfAuthored`). That is the parked card
+ * issue #911 exists to remove, re-created one column further along.
+ *
+ * **The advance is recovered from the split note's own outcome token, not from the
+ * card's status** ({@link splitChildNoteMarker}). Reading the status back would infer
+ * pipeline state from a card field the DB-free path's narrow frame does not carry
+ * (`src/pm/transport-delivery.ts`), which is the thing {@link applySplit} documents it
+ * must never do — and it could not tell SWARM's own advance from a human's. The note is
+ * written by the attempt that made the move, *after* it, so an `advanced` note exists
+ * only where the move really landed; a child whose advance was refused carries a
+ * `ready` note instead and is correctly left where it is.
+ *
+ * Both reads are the *narrow* form served on the DB-free path as well
+ * ({@link acquireSplitChild}), and the request count is a function of the split's own
+ * size, never the board's. A failed lookup **fails the phase**, like
+ * {@link acquireSplitChild}'s and unlike the best-effort preparation writes: swallowing
+ * it returns the stranded child this exists to prevent, permanently, where a retry
+ * costs only a retry.
+ */
+async function recoverAdvancedSplitChildren(pm: PMProvider, deliveryId: string): Promise<string[]> {
+	const advancedItemIds: string[] = [];
+	for (let childIndex = 0; childIndex < MAX_RECOVERED_SPLIT_CHILDREN; childIndex++) {
+		const child = await pm.findWorkItemByDescriptionMarker(
+			splitChildMarker(deliveryId, childIndex),
+		);
+		// Children are created in order with dense indices, so the first gap is the end
+		// of the split — and a delivery that never split has no child `0` to find, which
+		// costs this path exactly one lookup.
+		if (!child) return advancedItemIds;
+		if (await pm.findComment(child.id, splitChildNoteMarker(deliveryId, childIndex, 'advanced'))) {
+			advancedItemIds.push(child.id);
+		}
+	}
+	logger.warn('Planning — stopped recovering advanced split children at the scan bound', {
+		deliveryId,
+		bound: MAX_RECOVERED_SPLIT_CHILDREN,
+		recovered: advancedItemIds.length,
+	});
+	return advancedItemIds;
 }
 
 /**
@@ -2191,6 +2260,85 @@ interface VerifyAndApplyPlanningResultOptions {
 	deliveryId: string | undefined;
 }
 
+/** What {@link applySplitOrRecoverAdvanced} needs to settle this delivery's split. */
+interface ApplySplitOrRecoverAdvancedOptions {
+	pm: PMProvider;
+	project: ProjectConfig;
+	workItem: WorkItem;
+	/** The split the agent proposed, or `undefined` when it proposed none. */
+	split: ProposedSplit | undefined;
+	plan: string;
+	effectiveAutoAdvance: boolean;
+	/** This delivery's id, or `undefined` when the run has no run row to key markers on. */
+	deliveryId: string | undefined;
+}
+
+/**
+ * Settle the split half of a Planning run: apply this delivery's split and post its
+ * plan comment, or — when that comment is already there — recover what the attempt
+ * that posted it advanced. Extracted from {@link verifyAndApplyPlanningResult} for the
+ * same complexity-budget reason as {@link spawnSplitChild}, and as one function rather
+ * than two because the branches are the two answers to a single question.
+ *
+ * **The lookup is for *this* delivery's own comment, by its unique marker** — not any
+ * comment under the shared heading — so a retry of this delivery reuses its comment and
+ * skips the split it already performed, while a genuine replan (a fresh run row, hence
+ * a new marker) posts its new plan and runs its split. Skipped when no run row is
+ * available (direct/test invocations): then we always post.
+ *
+ * It covers only a delivery that got as far as posting. One that died *inside* the
+ * split has no comment to find, so it re-enters {@link applySplit} — which resumes from
+ * its own per-child markers rather than creating a second card per phase (issue #543).
+ *
+ * One that died *after* posting, on either of the parent writes the caller makes next,
+ * is the case {@link recoverAdvancedSplitChildren} exists for: the short-circuit is what
+ * keeps its children from being re-advanced, and that is exactly why this run would
+ * otherwise report none of the ones already sitting in "ToDo" (issue #911).
+ */
+async function applySplitOrRecoverAdvanced(options: ApplySplitOrRecoverAdvancedOptions): Promise<{
+	commentId: string;
+	splitResult: Awaited<ReturnType<typeof applySplit>> | undefined;
+	/** Only ever populated on the short-circuit path, where `splitResult` is not. */
+	recoveredItemIds: string[] | undefined;
+}> {
+	const { pm, project, workItem, split, plan, effectiveAutoAdvance, deliveryId } = options;
+	const existing = deliveryId
+		? await pm.findComment(workItem.id, planDeliveryMarker(deliveryId))
+		: undefined;
+	if (existing) {
+		return {
+			commentId: existing,
+			splitResult: undefined,
+			recoveredItemIds:
+				effectiveAutoAdvance && deliveryId
+					? await recoverAdvancedSplitChildren(pm, deliveryId)
+					: undefined,
+		};
+	}
+	const splitResult = split
+		? await applySplit(
+				pm,
+				workItem,
+				split,
+				resolveAutomationLabel(project.pipeline),
+				// The delivery's own identity, threaded in so the split's per-child
+				// markers match again on a retry that got this far (issue #543).
+				deliveryId,
+				// The same auto-advance policy the source task's move obeys, applied to
+				// every child the split prepared (issue #911).
+				effectiveAutoAdvance,
+			)
+		: undefined;
+	return {
+		commentId: await pm.addComment(
+			workItem.id,
+			planCommentBody(plan, effectiveAutoAdvance, deliveryId),
+		),
+		splitResult,
+		recoveredItemIds: undefined,
+	};
+}
+
 /**
  * Verify scope, process splits, post comments, advance status, and apply the planned label.
  */
@@ -2235,41 +2383,15 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 		enforceSingleTaskBudget(planningScope, maxConcerns, taskId, workItem);
 	}
 
-	// Look up *this* delivery's own comment by its unique marker (not any comment
-	// under the shared heading), so a retry of this delivery reuses its comment and
-	// skips the split it already performed, while a genuine replan — a fresh run row,
-	// hence a new marker — posts its new plan and runs its split. Skipped when no run
-	// row is available (direct/test invocations): then we always post.
-	//
-	// This covers only a delivery that got as far as posting. One that died *inside*
-	// the split has no comment to find, so it re-enters `applySplit` — which resumes
-	// from its own per-child markers rather than creating a second card per phase
-	// (issue #543).
-	let commentId = deliveryId
-		? await pm.findComment(workItem.id, planDeliveryMarker(deliveryId))
-		: undefined;
-	let splitResult: Awaited<ReturnType<typeof applySplit>> | undefined;
-
-	if (!commentId) {
-		splitResult = split
-			? await applySplit(
-					pm,
-					workItem,
-					split,
-					resolveAutomationLabel(project.pipeline),
-					// The delivery's own identity, threaded in so the split's per-child
-					// markers match again on a retry that got this far (issue #543).
-					deliveryId,
-					// The same auto-advance policy the source task's move below obeys,
-					// applied to every child the split prepared (issue #911).
-					effectiveAutoAdvance,
-				)
-			: undefined;
-		commentId = await pm.addComment(
-			workItem.id,
-			planCommentBody(plan, effectiveAutoAdvance, deliveryId),
-		);
-	}
+	const { commentId, splitResult, recoveredItemIds } = await applySplitOrRecoverAdvanced({
+		pm,
+		project,
+		workItem,
+		split,
+		plan,
+		effectiveAutoAdvance,
+		deliveryId,
+	});
 
 	const movedTo = effectiveAutoAdvance ? NEXT_STATUS : undefined;
 	if (movedTo) {
@@ -2281,6 +2403,12 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 	// remains marked as failed, and subsequent retries find this delivery's comment via its marker.
 	await applyPlannedLabel(pm, workItem, taskId);
 
+	// Exactly one of the two is ever populated: this run either applied the split (and
+	// knows what it advanced) or short-circuited on its own plan comment (and recovered
+	// what the earlier attempt advanced). Both are reported the same way, so the id of a
+	// child in "ToDo" reaches the worker on whichever attempt finally completes.
+	const advancedItemIds = splitResult?.advancedItemIds ?? recoveredItemIds ?? [];
+
 	return {
 		commentId,
 		movedTo,
@@ -2290,9 +2418,11 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 			subTaskItemIds: splitResult.subTaskItemIds,
 			mainTaskUpdated: splitResult.mainTaskUpdated,
 		},
-		// Only when non-empty, so a run that advanced nothing but its own item reports
-		// nothing rather than an empty array on the wire.
-		advancedItemIds: splitResult?.advancedItemIds.length ? splitResult.advancedItemIds : undefined,
+		// This run's own advances, or — when its split was short-circuited — the ones an
+		// earlier attempt of the same delivery made and could not report. Only when
+		// non-empty, so a run that advanced nothing but its own item reports nothing
+		// rather than an empty array on the wire.
+		advancedItemIds: advancedItemIds.length ? advancedItemIds : undefined,
 		planningScope,
 	};
 }

@@ -2036,6 +2036,113 @@ describe('runPlanningPhase', () => {
 			).toHaveLength(1);
 		});
 
+		// The plan comment is posted *before* the parent's own ToDo move and `planned`
+		// label, so a failure in either leaves children already advanced while the
+		// retry's short-circuit skips the split and would report none of them — advanced
+		// cards with no synthetic job and no webhook (the board move is SWARM's own, so
+		// loop prevention drops it). The retry recovers them instead.
+		describe('a retry recovers the children an earlier attempt advanced (issue #911)', () => {
+			const CHILD_IDS = ['PVTI_child1', 'PVTI_child2'];
+
+			/** Fail one of the parent's two post-comment writes, leaving the children advanced. */
+			function failingParentWrite(
+				deps: ReturnType<typeof makeDeps>,
+				write: 'move' | 'label',
+			): ReturnType<typeof makeDeps> {
+				if (write === 'move') {
+					deps.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(
+						async (id, status) => {
+							if (id === 'PVTI_item18' && status === 'todo') {
+								throw new Error('board rejected the move');
+							}
+						},
+					);
+				} else {
+					deps.pm.addLabel = vi.fn<(id: string, name: string) => Promise<void>>(async (id) => {
+						if (id === 'PVTI_item18') throw new Error('label write failed: 502');
+					});
+				}
+				return deps;
+			}
+
+			it.each([
+				['the source task’s ToDo move', 'move' as const, 'board rejected the move'],
+				['the source task’s planned label', 'label' as const, 'label write failed: 502'],
+			])('when %s failed after the children moved', async (_name, write, message) => {
+				const first = failingParentWrite(onBoard(makeDeps(), board), write);
+				await expect(
+					runPlanningPhase({ ...first, runId: 'run-A', autoAdvance: true }),
+				).rejects.toThrow(message);
+				// The failed attempt really did leave both children in ToDo — the state
+				// the retry has to finish the job for.
+				for (const childId of CHILD_IDS) {
+					expect(first.pm.moveWorkItem).toHaveBeenCalledWith(childId, 'todo');
+				}
+
+				const retry = onBoard(makeDeps(), board);
+				const result = await runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true });
+
+				// The retry short-circuits on its own plan comment, so it re-splits
+				// nothing and re-advances nothing — and still reports every child, which
+				// is the only thing that gets each one its synthetic next-phase job.
+				expect(retry.pm.createWorkItem).not.toHaveBeenCalled();
+				expect(result.split).toBeUndefined();
+				expect(result.advancedItemIds).toEqual(CHILD_IDS);
+				for (const childId of CHILD_IDS) {
+					expect(retry.pm.moveWorkItem).not.toHaveBeenCalledWith(childId, 'todo');
+				}
+				// And the write that failed is the one the retry completes.
+				expect(retry.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_item18', 'todo');
+				expect(retry.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', PLANNED_LABEL);
+			});
+
+			it('reports only the children whose advance really landed', async () => {
+				const first = onBoard(makeDeps(), board);
+				// Child 1's advance is refused — best-effort, so it stays in Planning with
+				// a `ready` note — and then the parent's move fails.
+				first.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(
+					async (id, status) => {
+						if (status !== 'todo') return;
+						if (id === 'PVTI_child1') throw new Error('board rejected the move');
+						if (id === 'PVTI_item18') throw new Error('board rejected the move');
+					},
+				);
+				await expect(
+					runPlanningPhase({ ...first, runId: 'run-A', autoAdvance: true }),
+				).rejects.toThrow('board rejected the move');
+
+				const result = await runPlanningPhase({
+					...onBoard(makeDeps(), board),
+					runId: 'run-A',
+					autoAdvance: true,
+				});
+
+				// The advance is read off each child's split-note outcome token, written
+				// by the attempt that made the move and only where it landed — never off
+				// the card's status, which the DB-free path's narrow frame does not carry.
+				expect(result.advancedItemIds).toEqual(['PVTI_child2']);
+			});
+
+			it('recovers nothing, at one lookup, when the delivery advanced no children', async () => {
+				const first = failingParentWrite(onBoard(makeDeps(), board), 'label');
+				// `autoAdvance` off: the children stay in Planning, so there is nothing
+				// for the retry to recover — and it must not invent a card id. The label
+				// is the write that fails here, since with no auto-advance the source
+				// task has no move to fail on.
+				await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
+					'label write failed: 502',
+				);
+
+				const retry = onBoard(makeDeps(), board);
+				const result = await runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true });
+
+				expect(result.advancedItemIds).toBeUndefined();
+				// The scan stops at the first child with no `advanced` note rather than
+				// walking the board: two children plus the gap that ends the split.
+				expect(retry.pm.findWorkItemByDescriptionMarker).toHaveBeenCalledTimes(3);
+			});
+		});
+
 		it('still performs its own split for a genuine replan — a new run, hence a new identity', async () => {
 			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
 			expect(titlesOn(board)).toEqual(CHILD_TITLES);

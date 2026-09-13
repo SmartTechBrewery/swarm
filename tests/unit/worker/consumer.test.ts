@@ -1965,6 +1965,29 @@ describe('processJob', () => {
 			}
 		});
 
+		it('self-enqueues recovered children on a retry that reports no split of its own', async () => {
+			const workItem = createMockWorkItem({ statusId: '3fe662f4' });
+			const trigger: TriggerResult = { phase: 'planning', taskId: '10', workItem };
+			// The shape a retry returns after its plan comment short-circuited the split
+			// (issue #911): no `split`, because this run applied none, but the children
+			// an earlier attempt advanced — recovered from the board — still need the
+			// synthetic job that attempt never got to report.
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				movedTo: 'todo',
+				advancedItemIds: ['PVTI_child-one', 'PVTI_child-two'],
+			});
+
+			await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+			expect(createAndPublishDispatch).toHaveBeenCalledTimes(3);
+			const itemIds = createAndPublishDispatch.mock.calls.map(
+				([input]) =>
+					(input as { jobPayload: { event: { itemId: string } } }).jobPayload.event.itemId,
+			);
+			expect(itemIds).toEqual([workItem.id, 'PVTI_child-one', 'PVTI_child-two']);
+		});
+
 		it('does not self-enqueue advanced children when the phase made no move', async () => {
 			const trigger: TriggerResult = {
 				phase: 'planning',
