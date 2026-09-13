@@ -51,6 +51,18 @@ export const PR_DRIVEN_PHASES = new Set([
 	'resolve-conflicts',
 ]);
 
+/**
+ * The prose naming a run's work — the PR title for a PR-driven phase, else the work
+ * item's. **`null` is "no title resolved yet", never "no run"**: a PR-driven run
+ * carries no `workItemTitle` at all (nothing writes one for a phase with no backing
+ * board card), so a caller deciding whether a machine is busy must read the run's
+ * presence and use this only for the words. Exported so a caller outside the cell
+ * describes a run in the identical way rather than re-deriving the PR-driven rule.
+ */
+export function resolveRunTitle(run: Pick<WorkItemCellRun, 'phase' | 'workItemTitle' | 'prTitle'>) {
+	return PR_DRIVEN_PHASES.has(run.phase) ? run.prTitle : run.workItemTitle;
+}
+
 /** The title line: prose naming the work, optionally linking to the run itself. */
 function WorkItemTitle({
 	title,
@@ -168,7 +180,7 @@ export function WorkItemCell({
 	phaseLabel?: string;
 }) {
 	const isPrDriven = PR_DRIVEN_PHASES.has(run.phase);
-	const title = isPrDriven ? run.prTitle : run.workItemTitle;
+	const title = resolveRunTitle(run);
 	// The reference line needs the run's repository to build a PR URL, and something
 	// to point at; without both there is nothing to reference.
 	const hasReference = !!run.repository && !!(run.workItemId || run.prNumber);

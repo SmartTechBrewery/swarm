@@ -115,6 +115,17 @@ export interface WorkerRow {
 	connection: WorkerConnectionState;
 	/** ISO 8601 — when the worker was last heard from; null if it never connected. */
 	lastSeenAt: string | null;
+	/**
+	 * ISO 8601 — when the machine's operator took it **out of the dispatch pool**
+	 * (issue #919), and `null` while it is in the pool. Read *alongside*
+	 * `connection`, never in place of it: draining is a deliberate operator state,
+	 * not an outage, so a drained machine that is online is still online — it is
+	 * merely given no new work while whatever it is already running finishes.
+	 *
+	 * Sticky across the machine's own restart: a reconnecting daemon does not rejoin
+	 * the pool, so only an operator clears this (`workers.setDraining`).
+	 */
+	drainingSince: string | null;
 	/** The job it is executing right now; null when idle or the run is out of scope. */
 	currentRun: WorkerActiveRun | null;
 	/** Only enrollments in projects the viewer may access; empty for an un-enrolled machine. */

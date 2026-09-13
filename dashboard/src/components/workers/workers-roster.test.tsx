@@ -75,6 +75,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
+		drainingSince: null,
 		currentRun: null,
 		enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] }],
 		...overrides,
