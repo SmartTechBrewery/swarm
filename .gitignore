@@ -74,6 +74,11 @@ logs/
 .claude/skills/
 .agents/skills/
 
+# Per-installation operator notes (ai/RULES.md §7) — how *this* SWARM deployment is
+# actually run: the machines, their launchd agents, where the live data is. Local by
+# definition, so it is never committed; a fresh clone simply has none.
+ai/LOCAL_CONFIG.md
+
 # SWARM agent hand-off/scratch artifacts (src/scm/delivery.ts's `HANDOFF_FILENAMES`,
 # `PROGRESS_FILENAME`, and delegation scratch) — written at the worktree root by a
 # phase's agent, read by deterministic delivery, and never meant to be committed;
