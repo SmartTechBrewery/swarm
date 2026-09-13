@@ -19,13 +19,16 @@
  * come back on the new build before starting the next, returns them to the pool,
  * and stops the whole thing when one of them says the build is bad.
  *
- * **Advancing happens when the operator asks.** Re-running `swarm workers update
- * --all <ref>` advances the rollout already in progress and prints where every
- * member stands — exactly as re-running `swarm workers drain` is already the
- * supported way to poll a drain, and for the same reason: the useful answer is not
- * "done" but "where is it now". Advancing with nobody watching is phase 3, which
- * hooks this same `advanceRollout` onto update reports, handshakes and a periodic
- * tick; it is deliberately not started here.
+ * **Advancing mostly happens with nobody watching.** Since issue #941 this same
+ * `advanceRollout` is hooked onto the events the control plane already sees — a
+ * machine's update report, its handshake, and a periodic tick
+ * (`../router/worker-rollout-advance.ts`) — so a started rollout finishes, or halts,
+ * without the operator running anything again. Re-running `swarm workers update
+ * --all <ref>` still advances it and prints where every member stands, exactly as
+ * re-running `swarm workers drain` is already the supported way to poll a drain; it
+ * is now the manual nudge and the readout rather than the only path forward. Which
+ * caller drove an advance changes nothing about it: every step is decided from
+ * durable state under the row lock, so the triggers and the operator cannot disagree.
  *
  * **The draining precondition is not relaxed, it is satisfied.** Phase 1 could only
  * ask machines an operator had already drained by hand, which is what kept it from
@@ -102,9 +105,9 @@ export interface RolloutView {
  *
  * - `started` — a new rollout, with its first wave already drained and signalled.
  * - `advanced` — one was already in progress **for this same target**, so this call
- *   advanced it. That is the issue's own contract: re-running the command is how an
- *   operator moves a rollout along, so asking for the build it is already moving to
- *   must never be an error.
+ *   advanced it. Asking for the build a rollout is already moving to must never be an
+ *   error: it is how an operator nudges and reads one, even though since issue #941
+ *   the rollout no longer needs the nudge to finish.
  * - `conflict` — one is in progress for a **different** target. Two rollouts over
  *   the same machines would drain and undrain each other's members, so this is
  *   refused naming the status command rather than silently re-targeting a fleet

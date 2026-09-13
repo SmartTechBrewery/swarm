@@ -1259,7 +1259,7 @@ describe('swarm workers', () => {
 
 		// One line per machine plus a tally, so a fleet is read without counting rows —
 		// and a machine the rollout has not reached is on the table rather than missing.
-		it('prints one line per machine, a summary, and how to advance it', async () => {
+		it('prints one line per machine, a summary, and how to watch it', async () => {
 			fleet({
 				waveSize: 2,
 				members: [
@@ -1275,7 +1275,10 @@ describe('swarm workers', () => {
 			expect(joined).toContain(`${OTHER_WORKER_ID}\tada-desktop\tqueued`);
 			expect(joined).toContain('2 machines: 1 queued, 1 signalled');
 			expect(joined).toContain('2 machines per wave');
-			// Re-running it is the advance, and the line under the table says so.
+			// It advances itself (issue #941), so the line under the table leads with that
+			// and names re-running as the nudge-and-read rather than the only way forward.
+			expect(joined).toContain('it advances on its own');
+			expect(joined).toContain('swarm workers update --status');
 			expect(joined).toContain('swarm workers update --all main');
 		});
 
@@ -1345,8 +1348,8 @@ describe('swarm workers', () => {
 			// ends that is named rather than left to be remembered.
 			expect(joined).toContain(`swarm workers undrain ${WORKER_ID}`);
 			expect(joined).not.toContain(`swarm workers undrain ${OTHER_WORKER_ID}`);
-			// Advancing is no longer on offer.
-			expect(joined).not.toContain('to advance it');
+			// A halt is terminal, so the self-advancing line is not on offer either.
+			expect(joined).not.toContain('it advances on its own');
 		});
 
 		it('says the fleet is done when the rollout completed', async () => {

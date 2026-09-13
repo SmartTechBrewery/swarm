@@ -103,6 +103,7 @@ import {
 	isWorkerConnected,
 	registerConnection,
 } from './worker-connections.js';
+import { advanceWorkerRollout } from './worker-rollout-advance.js';
 import { resendPendingWorkerUpdateToWorker } from './worker-update-dispatch.js';
 
 // The application-defined WebSocket close codes are part of the wire contract, so
@@ -242,6 +243,16 @@ export interface WorkerTransportDeps {
 	 * the hooks above.
 	 */
 	resendPendingWorkerUpdate: (workerId: string) => void;
+	/**
+	 * A machine coming back is the event a fleet rollout's come-back verdict waits for
+	 * (issue #941, `./worker-rollout-advance.ts`): by the time this fires the daemon
+	 * has already taken its fenced lease and declared the build it is running, which
+	 * are the two facts that verdict is reached against, and no other event announces
+	 * them. Without it a rollout only moves when the operator re-runs the command.
+	 * Fire-and-forget by contract, like the hooks above — a rollout must never be able
+	 * to refuse a handshake.
+	 */
+	advanceWorkerRollout: (workerId: string) => void;
 }
 
 function defaultDeps(): WorkerTransportDeps {
@@ -277,6 +288,7 @@ function defaultDeps(): WorkerTransportDeps {
 		},
 		resendRunCancellations: resendRunCancellationsToWorker,
 		resendPendingWorkerUpdate: resendPendingWorkerUpdateToWorker,
+		advanceWorkerRollout,
 	};
 }
 
@@ -756,8 +768,9 @@ function runConnectionHook(what: string, workerId: string, hook: () => void): vo
 /**
  * An authenticated `/worker/stream` socket opened: record it as the worker's live
  * transport, wake the work that was only waiting for a machine like this one,
- * annotate the runs whose output this session restores, and hand it any
- * cancellation that could not be pushed while it was away.
+ * annotate the runs whose output this session restores, hand it any cancellation
+ * that could not be pushed while it was away, and move on the fleet rollout that was
+ * waiting for exactly this machine to come back.
  *
  * Factored out of the socket glue for the same reason `handleHandshake` and
  * `handleWorkerStreamFrame` are — a test drives it with a fake `WSContext` and
@@ -771,8 +784,11 @@ function runConnectionHook(what: string, workerId: string, hook: () => void): vo
  * first connection writes nothing — and the moment a termination this router could
  * not deliver is re-stated to the returning worker (issue #827), which reads the
  * durable marker only for the dispatches actually awaited on it, so an ordinary
- * first connection reads nothing either. All three are fire-and-forget: the socket
- * must open regardless of what Postgres or Redis are doing.
+ * first connection reads nothing either. And since issue #941 it is the moment a
+ * fleet rollout verifies that a machine it asked to move came back on the new build
+ * — the one event that verdict has, and again a no-op when the operator has no
+ * rollout under way. All of them are fire-and-forget: the socket must open
+ * regardless of what Postgres or Redis are doing.
  */
 export function handleWorkerStreamOpen(
 	deps: WorkerTransportDeps,
@@ -796,6 +812,11 @@ export function handleWorkerStreamOpen(
 	// away reaches it here or not at all, since its notification fired once.
 	runConnectionHook('re-pushing a self-update recorded while the worker was away', workerId, () =>
 		deps.resendPendingWorkerUpdate(workerId),
+	);
+	// A machine that applied an update comes back through exactly this handshake, so
+	// this is where a fleet rollout waiting on it learns that it did (issue #941).
+	runConnectionHook('advancing the fleet rollout this worker belongs to', workerId, () =>
+		deps.advanceWorkerRollout(workerId),
 	);
 }
 

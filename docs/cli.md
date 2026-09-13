@@ -659,8 +659,12 @@ unchanged.
   and only then starts the next wave. So a fleet update never takes the fleet's
   capacity down at once, and draining/undraining stops being a per-machine step you
   do yourself. A worker id alongside `--all` is a usage error naming both forms.
-  **Re-running the same command is how a rollout is advanced** — exactly as
-  re-running `drain` is how you check whether a machine has gone idle — and each run
+  **One run moves the whole fleet.** The rollout advances itself from there (issue
+  #941) — off each machine's update report, off its reconnect, and off a periodic
+  check in the control plane for the machine that applied and never came back — so
+  there is nothing to re-run and nothing to sit and watch. Re-running the same
+  command is still how you *read* it, and nudges it along while it does, exactly as
+  re-running `drain` is how you check whether a machine has gone idle; each run
   prints the whole member table: `queued` (not reached yet, still in the pool),
   `draining` (out of the pool, waiting to go idle — draining never interrupts a
   run), `signalled` (asked, awaiting its report), `verifying` (it applied; waiting
@@ -685,11 +689,12 @@ unchanged.
   report, not a pass/fail. Strictly owner-scoped, deliberately — it moves your own
   machines and nothing wider, and whether an installation administrator may stage a
   rollout over machines they do not own is a separate question this does not answer.
-  Advancing with nobody watching is a later phase; today an operator advances it.
 - **`update --status`** — the same member table with nothing moved (issue #940), for
-  looking at a rollout without advancing it. It reads your **latest** rollout
-  whatever its status, so a halted one stays readable after it stopped, with the
-  reason it stopped. Takes no ref, no `--wave` and no `--all`.
+  looking at a rollout without advancing it. Since the rollout advances on its own
+  this is the ordinary way to follow one: it moves whether or not you are reading.
+  It reads your **latest** rollout whatever its status, so a halted one stays
+  readable after it stopped, with the reason it stopped. Takes no ref, no `--wave`
+  and no `--all`.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

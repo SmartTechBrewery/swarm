@@ -231,17 +231,19 @@ Usage:
              by default), waits for each to go idle, asks it, waits for it to come
              back on the new build, puts it back in the pool, and only then starts
              the next wave — so a fleet update never takes the whole fleet's
-             capacity down at once. Re-run the same command to advance it; each run
-             prints where every machine stands (queued, draining, signalled,
-             verifying, done, skipped, failed). A machine that reports failed,
-             refused or declined, or that applies and never comes back, HALTS the
-             rollout: nothing further is drained or signalled, the reason is
-             recorded, and the untouched machines stay in the pool. A halted
-             rollout is final — fix the build and start a new one; there is no
-             resume and no cancel. --status prints the same table without advancing
-             anything. One rollout at a time per operator: asking for a different
-             ref while one is under way is refused rather than re-targeting a fleet
-             mid-move.
+             capacity down at once. It advances itself from there — off each
+             machine's report, its reconnect, and a periodic check — so one run of
+             this command moves the whole fleet. Re-running it is how you read the
+             rollout, and nudges it along too; each run prints where every machine
+             stands (queued, draining, signalled, verifying, done, skipped,
+             failed). A machine that reports failed, refused or declined, or that
+             applies and never comes back, HALTS the rollout: nothing further is
+             drained or signalled, the reason is recorded, and the untouched
+             machines stay in the pool. A halted rollout is final — fix the build
+             and start a new one; there is no resume and no cancel. --status prints
+             the same table without advancing anything. One rollout at a time per
+             operator: asking for a different ref while one is under way is refused
+             rather than re-targeting a fleet mid-move.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -1173,8 +1175,10 @@ function printRollout(rollout: Rollout, action?: string): void {
 			'  each machine asked applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
 		);
 	}
+	// It advances itself (issue #941), so the line under the table says what will
+	// happen rather than what to type — the commands are how you *watch* it now.
 	out.info(
-		`  re-run 'swarm workers update --all ${rollout.target}' to advance it, or 'swarm workers update --status' to look without advancing`,
+		`  it advances on its own from here — read it with 'swarm workers update --status', or re-run 'swarm workers update --all ${rollout.target}' to nudge and read it`,
 	);
 }
 

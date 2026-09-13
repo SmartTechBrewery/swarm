@@ -17,8 +17,9 @@
  * one, taking twice the capacity the operator bounded. It therefore takes the
  * rollout row `FOR UPDATE` and hands the caller a snapshot read under that lock
  * plus the two writes it may make, so the policy module cannot accidentally decide
- * on a stale read. Phase 3 will drive the same call from two event sources at once,
- * which is what makes the lock load-bearing rather than defensive.
+ * on a stale read. Since issue #941 that call is driven from three event sources at
+ * once (`../../router/worker-rollout-advance.ts`), which is what makes the lock
+ * load-bearing rather than defensive.
  *
  * The *member* writes it hands over deliberately do not extend to the `workers`
  * table: draining a machine and asking it to update are single statements that
@@ -169,6 +170,26 @@ export async function findInProgressRolloutForOwner(
 		.limit(1);
 	const row = rows[0];
 	return row ? rowToRollout(row) : undefined;
+}
+
+/**
+ * Every rollout still moving, oldest first — the read behind the periodic advance
+ * (issue #941, `../../router/worker-rollout-advance.ts`), which has no operator to
+ * scope it by and so asks for the whole live set.
+ *
+ * Bounded by the same partial unique index the lookup above relies on: at most one
+ * row per operator can be `in_progress`, so this is "one row per operator with a
+ * fleet update under way" rather than a scan whose cost grows with the rollout
+ * history. Postgres serves it from that index too, since the predicate here is the
+ * index's own.
+ */
+export async function listInProgressRollouts(): Promise<WorkerUpdateRollout[]> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(eq(workerUpdateRollouts.status, 'in_progress'))
+		.orderBy(asc(workerUpdateRollouts.createdAt), asc(workerUpdateRollouts.id));
+	return rows.map(rowToRollout);
 }
 
 /** One rollout and its members, unlocked — the read behind the status surfaces. */
