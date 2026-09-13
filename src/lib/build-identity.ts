@@ -61,6 +61,43 @@ export const WorkerBuildSchema = z.object({
 export type WorkerBuild = z.infer<typeof WorkerBuildSchema>;
 
 /**
+ * A build a machine can be asked to move its install root to (`../worker/self-update.ts`,
+ * issue #920). It lives beside {@link WorkerBuildSchema} because it is the other
+ * half of the same vocabulary — one names the build a daemon *is* on, the other
+ * the build it is *asked for* — and because the control frame that will carry it
+ * must import this definition rather than re-declare its own, the way
+ * `HandshakeRequestSchema.build` imports the one above.
+ *
+ * **The grammar is the security boundary.** This is the only thing a request to
+ * change a machine's code is ever allowed to carry: a branch, a tag, or a commit
+ * id, and nothing that could be read as anything else. A ref starts with an
+ * alphanumeric — so it can never be taken for a git option — and the character
+ * class admits no colon, whitespace, scheme, `~`, `^`, `@`, `?`, `*`, `\`, or
+ * quote, which is what excludes a URL, a refspec, a revision expression, and a
+ * shell fragment by construction rather than by a reviewer noticing. The four
+ * remaining exclusions are git's own ref rules (`git check-ref-format`) for
+ * sequences the character class does permit.
+ */
+export const WorkerUpdateTargetSchema = z
+	.string()
+	.trim()
+	.max(200, 'must be at most 200 characters')
+	.pipe(
+		z
+			.string()
+			.regex(/^[0-9A-Za-z][0-9A-Za-z._/-]*$/, 'must be a branch name, tag, or commit id')
+			.refine(
+				(ref) =>
+					!ref.includes('..') &&
+					!ref.includes('//') &&
+					!ref.endsWith('/') &&
+					!ref.endsWith('.lock'),
+				'must be a well-formed ref: no "..", no "//", no trailing "/" or ".lock"',
+			),
+	);
+export type WorkerUpdateTarget = z.infer<typeof WorkerUpdateTargetSchema>;
+
+/**
  * The root of the SWARM install this module belongs to — `import.meta.url` two
  * levels up (`src/lib/` → the checkout, `dist/lib/` → the same checkout), never
  * `cwd` and never an env var. See the module header for why that distinction is
