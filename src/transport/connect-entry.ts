@@ -53,6 +53,15 @@
  * launchd `KeepAlive` / systemd `Restart=always` starts it again on the new build,
  * whose identity reaches the control plane through the `build` field above. Every
  * other outcome is reported and the daemon keeps taking work on the build it has.
+ *
+ * The other half of that is the only thing this program does *before* anything else
+ * (`./build-verification.ts`, issue #934): an applied update is not trusted until a
+ * daemon running it has handshaked once, so every start on an unproved build is
+ * counted before the transport is opened, the first session promotes the build, and
+ * a machine that keeps failing to start — or is rejected outright at the handshake —
+ * puts its install root back on the last known good build and exits for the
+ * supervisor to restart it there. Once a bad build has taken the socket, that is the
+ * only channel left.
  */
 
 import { readFileSync } from 'node:fs';
@@ -83,6 +92,11 @@ import {
 	runAssignmentDbFree,
 	SUPPORTED_DB_FREE_PHASES,
 } from './assignment-execution.js';
+import {
+	createHandshakePromotion,
+	returnAfterFatalHandshake,
+	verifyStartupBuild,
+} from './build-verification.js';
 import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discovery.js';
 import {
 	startWorkerQuotaReporting,
@@ -179,6 +193,13 @@ function resolveDaemonVersion(): string {
 }
 
 async function main(): Promise<void> {
+	// First, before this process reads its environment, locks a checkout or opens a
+	// socket: count this start against a SWARM build that was applied here and has
+	// never handshaked (issue #934). Once too many starts in a row have failed, this
+	// puts the install root back on the last known good build and ends the process for
+	// the supervisor to start it there — the only recovery left once a bad build has
+	// taken the socket the control plane would have corrected it over.
+	if (await verifyStartupBuild()) return;
 	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
 	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
 	const repoRoot = resolveWorkerRepoRoot();
@@ -263,6 +284,10 @@ async function main(): Promise<void> {
 	// reconnects — so stating it is what widens the row back. The gate in
 	// `runAssignmentDbFree` stays as the backstop.
 	const supportedPhases = [...SUPPORTED_DB_FREE_PHASES];
+	// A session is the proof an applied update was waiting for, so the first one this
+	// process establishes is what makes the build it is running this machine's last
+	// known good one (issue #934). Every reconnect after it is a no-op.
+	const promoteBuild = createHandshakePromotion();
 	const client = connectWorkerTransport({
 		controlPlaneUrl,
 		credential,
@@ -316,6 +341,7 @@ async function main(): Promise<void> {
 		// a second daemon's refusal can then name the *worker* holding it (issue #689).
 		onSession: (session) => {
 			checkoutLock.annotate(session.workerId);
+			promoteBuild();
 		},
 	});
 
@@ -365,7 +391,18 @@ async function main(): Promise<void> {
 	}
 
 	// Resolves on a graceful stop; rejects on a fatal, non-recoverable error.
-	await client.done;
+	try {
+		await client.done;
+	} catch (err) {
+		// A handshake the control plane rejects outright — its protocol version, its
+		// capabilities, its credential — is *this build* saying it cannot serve this
+		// control plane. On a build still awaiting proof that is the one failure no
+		// restart and no pushed update can fix, so the machine goes back to its last
+		// known good build by itself and ends here rather than dying on the new one
+		// (issue #934). Anything else is fatal exactly as it was.
+		if (await returnAfterFatalHandshake(err, { shutdown: releaseSessionAndResources })) return;
+		throw err;
+	}
 	stopQuotaReporting();
 	releaseCheckoutLock();
 	logger.info('worker transport client stopped');

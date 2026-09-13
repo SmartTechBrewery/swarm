@@ -17,6 +17,9 @@ import {
 	type CommandRunner,
 	InstallUpdateStateSchema,
 	installUpdateStateDir,
+	recordFailedStart,
+	recordSuccessfulHandshake,
+	returnToLastKnownGood,
 	type UpdateCommand,
 	type UpdateCommandResult,
 } from '@/worker/self-update.js';
@@ -448,6 +451,14 @@ describe('applyUpdateTarget — the state file', () => {
 			target: BRANCH,
 			targetCommit: TARGET_COMMIT,
 			appliedAt: '2026-02-01T00:00:00.000Z',
+			// `lastKnownGood` stays on the build that was running: the new one is only
+			// awaiting proof until a daemon on it handshakes (issue #934).
+			pendingVerification: {
+				commit: TARGET_COMMIT,
+				previousCommit: HEAD,
+				failedStarts: 0,
+				startedAt: '2026-02-01T00:00:00.000Z',
+			},
 		});
 	});
 
@@ -553,5 +564,176 @@ describe('applyUpdateTarget — failure and rollback', () => {
 		if (outcome.status !== 'failed') return;
 		expect(outcome.outputTail.length).toBeLessThanOrEqual(4_000);
 		expect(outcome.reason).not.toContain(noise);
+	});
+});
+
+/**
+ * The record an applied build is judged on, and the three transitions on it
+ * (issue #934). Every case drives the real state file in a temp home, because the
+ * whole point of the record is that it survives the process that wrote it.
+ */
+describe('the pending verification', () => {
+	const APPLIED_COMMIT = TARGET_COMMIT;
+	const PENDING = {
+		commit: APPLIED_COMMIT,
+		previousCommit: HEAD,
+		failedStarts: 0,
+		startedAt: '2026-02-01T00:00:00.000Z',
+	};
+
+	/** A state file describing an install root that was updated and has not proved it yet. */
+	function writePending(home: string, failedStarts = 0): void {
+		writeStoredState(home, {
+			lastKnownGood: HEAD,
+			target: BRANCH,
+			targetCommit: APPLIED_COMMIT,
+			appliedAt: '2026-02-01T00:00:00.000Z',
+			pendingVerification: { ...PENDING, failedStarts },
+		});
+	}
+
+	const at = (home: string) => ({ installRoot: INSTALL_ROOT, homeDir: home });
+
+	it('is not recorded when the apply failed and rolled back', async () => {
+		const home = makeHome();
+		const { run } = scriptedRunner({ 'npm run build': [fail('TS2322')] });
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('failed');
+		expect(readState(home)).toMatchObject({ lastKnownGood: HEAD, pendingVerification: null });
+	});
+
+	it('is cleared by an update applied on top of it', async () => {
+		const home = makeHome();
+		writePending(home);
+		const later = 'd'.repeat(40);
+		const { run } = scriptedRunner({
+			'git rev-parse HEAD': ok(APPLIED_COMMIT),
+			[`git rev-parse --verify refs/remotes/${REMOTE}/${BRANCH}^{commit}`]: ok(later),
+			[`git merge-base --is-ancestor ${later} refs/remotes/${REMOTE}/${BRANCH}`]: ok(''),
+		});
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('applied');
+		expect(readState(home)).toMatchObject({
+			lastKnownGood: APPLIED_COMMIT,
+			pendingVerification: { commit: later, previousCommit: APPLIED_COMMIT, failedStarts: 0 },
+		});
+	});
+
+	describe('recordFailedStart', () => {
+		it('counts up across restarts, leaving the rest of the record alone', () => {
+			const home = makeHome();
+			writePending(home);
+
+			expect(recordFailedStart(at(home))?.failedStarts).toBe(1);
+			expect(recordFailedStart(at(home))?.failedStarts).toBe(2);
+
+			expect(readState(home)).toMatchObject({
+				lastKnownGood: HEAD,
+				pendingVerification: { ...PENDING, failedStarts: 2 },
+			});
+		});
+
+		it('counts nothing when no build is awaiting proof', () => {
+			const home = makeHome();
+			writeStoredState(home);
+
+			expect(recordFailedStart(at(home))).toBeNull();
+			expect(readState(home)).toMatchObject({ pendingVerification: null });
+		});
+
+		it('counts nothing when this install root has no record at all', () => {
+			const home = makeHome();
+
+			expect(recordFailedStart(at(home))).toBeNull();
+			expect(existsSync(join(installUpdateStateDir(INSTALL_ROOT, home), 'state.json'))).toBe(false);
+		});
+
+		it('counts nothing when the record is unreadable', () => {
+			const home = makeHome();
+			mkdirSync(installUpdateStateDir(INSTALL_ROOT, home), { recursive: true });
+			writeFileSync(join(installUpdateStateDir(INSTALL_ROOT, home), 'state.json'), 'not json');
+
+			expect(recordFailedStart(at(home))).toBeNull();
+		});
+	});
+
+	describe('recordSuccessfulHandshake', () => {
+		it('promotes the build that handshaked and clears the record', () => {
+			const home = makeHome();
+			writePending(home, 2);
+
+			expect(recordSuccessfulHandshake(at(home))).toBe(APPLIED_COMMIT);
+
+			expect(readState(home)).toMatchObject({
+				lastKnownGood: APPLIED_COMMIT,
+				pendingVerification: null,
+			});
+		});
+
+		it('is a no-op once there is nothing left to promote', () => {
+			const home = makeHome();
+			writePending(home);
+
+			recordSuccessfulHandshake(at(home));
+			expect(recordSuccessfulHandshake(at(home))).toBeNull();
+
+			expect(readState(home)).toMatchObject({ lastKnownGood: APPLIED_COMMIT });
+		});
+	});
+
+	describe('returnToLastKnownGood', () => {
+		it('checks out, reinstalls and rebuilds the last known good build, then clears the record', async () => {
+			const home = makeHome();
+			writePending(home, 3);
+			const { run, argv, calls } = scriptedRunner();
+
+			const outcome = await returnToLastKnownGood({ ...at(home), run });
+
+			expect(outcome).toEqual({
+				status: 'returned',
+				commit: HEAD,
+				abandonedCommit: APPLIED_COMMIT,
+			});
+			expect(argv()).toEqual([`git checkout --detach ${HEAD}`, 'npm ci', 'npm run build']);
+			expect(calls.every((call) => call.cwd === INSTALL_ROOT)).toBe(true);
+			// Cleared, so the daemon the supervisor starts next counts nothing and — the
+			// failure that matters — does not promote the build it just abandoned.
+			expect(readState(home)).toMatchObject({
+				lastKnownGood: HEAD,
+				pendingVerification: null,
+			});
+		});
+
+		it('runs nothing when no build is awaiting proof', async () => {
+			const home = makeHome();
+			writeStoredState(home);
+			const { run, calls } = scriptedRunner();
+
+			expect(await returnToLastKnownGood({ ...at(home), run })).toEqual({
+				status: 'nothing-pending',
+			});
+			expect(calls).toHaveLength(0);
+		});
+
+		it('keeps the record when the return itself failed, and names the step', async () => {
+			const home = makeHome();
+			writePending(home, 3);
+			const { run } = scriptedRunner({ 'npm ci': fail('ERR! ENOSPC') });
+
+			const outcome = await returnToLastKnownGood({ ...at(home), run });
+
+			expect(outcome.status).toBe('failed');
+			if (outcome.status !== 'failed') return;
+			expect(outcome.stage).toBe('install');
+			expect(outcome.reason).toContain(INSTALL_ROOT);
+			expect(outcome.outputTail).toContain('ERR! ENOSPC');
+			// Kept: clearing it would send the next start back into the build that could
+			// not start, with nothing left to notice that it had.
+			expect(readState(home)).toMatchObject({ pendingVerification: { commit: APPLIED_COMMIT } });
+		});
 	});
 });
