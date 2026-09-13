@@ -394,20 +394,27 @@ swarm workers list                         # read what it reported
 swarm workers undrain <worker-id>          # put it back in the pool
 ```
 
-Once you operate more than one machine, `--all` does the same for all of them in one
-action (issue #921) and prints a line per machine saying what became of it:
+Once you operate more than one machine, `--all` moves all of them as a **staged
+rollout** (issue #940) and prints where each one stands:
 
 ```bash
-swarm workers update --all main            # every machine you own that is draining
+swarm workers update --all main            # start it, then re-run to advance it
+swarm workers update --status              # read it without advancing
 ```
 
-It asks only the machines that are **already draining**, so draining (and undraining)
-stays a per-machine step you make yourself. Nothing refuses the call: a machine still
-in the pool comes back as `in-pool` with its drain command named, one that is offline
-as `queued-offline` (the request is on its row and is stated again on its next
-connection), one with an outstanding request for the same ref as `already-asked`, and
-one that has already reported for that ref as `answered`, with the outcome beside it.
-Re-running it is how you read the fleet — an answered machine is never asked twice.
+The rollout owns the drains: it takes at most `--wave` machines out of the pool at a
+time (one by default), waits for each to go idle, asks it, waits for it to come back
+on the new build, puts it back in the pool, and only then starts the next wave — so
+the four steps above stop being yours to repeat per machine, and the fleet's capacity
+is never down at once. Re-running the same command is how you advance it, exactly as
+re-running `drain` is how you check a machine has gone idle.
+
+A machine that reports `failed`, `refused` or `declined`, that comes back still on the
+build it was asked to leave, or that applies and never comes back inside ten minutes
+**halts** the rollout: nothing further is drained or signalled, the reason is printed,
+and the machines it had not reached stay in the pool. The one that failed is left
+drained so you can look at it. A halt is final — fix the build and start a new
+rollout.
 
 **It is off unless this host opts in.** Set `SWARM_WORKER_SELF_UPDATE=true` in the
 same `.env` the daemon already reads and restart it; with the flag off the machine
@@ -425,7 +432,9 @@ is already out of the dispatch pool, and names the drain as the remedy. The daem
 waits for the phases it is already running to finish before it applies anything — no
 run is cancelled, deferred, or failed by an update — and draining is what stops new
 work arriving into that wait. Undraining is a separate step afterwards, on purpose:
-the machine stays out of the pool until you have read what it reported.
+the machine stays out of the pool until you have read what it reported. The staged
+`--all` form does not relax that precondition, it *satisfies* it — it drains each
+machine itself before asking it, and undrains the ones that came back cleanly.
 
 **A host that runs several daemons from one SWARM checkout is supported (issue
 #935).** The install root is the SWARM checkout a daemon's *own code* is loaded from,
@@ -524,7 +533,9 @@ will simply repeat the cycle; fix the build first.
 | Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
-| `swarm workers update --all <ref>` reports `in-pool` for a machine you expected it to move | That machine is not draining, and the fan-out reports it rather than refusing the whole call (issue #921) — only already-drained machines are asked. Run the `swarm workers drain <worker-id>` the line under the table names, then run `update --all <ref>` again; the machines it already asked stay `already-asked` and are not asked twice. |
+| `swarm workers update --all <ref>` leaves a machine `queued` | The rollout moves a bounded wave at a time (issue #940) and has not reached it yet — that is what stops a fleet update taking the whole fleet's capacity down. Re-run the same command to advance it, or `swarm workers update --status` to look without advancing. |
+| `swarm workers update --all <ref>` says the rollout is **HALTED** | A machine reported `failed`/`refused`/`declined`, came back on the build it was asked to leave, or applied and never came back — so nothing further is drained or signalled and the untouched machines stayed in the pool. The line under the table is the reason, in the machine's own words. Fix the build, then start a new rollout: a halt is final, there is no resume, and the machine that failed is left drained on purpose so you can look at it (`swarm workers undrain <worker-id>` when you are done). |
+| `swarm workers update --all <ref>` is refused because a fleet update is already in progress | Only one rollout runs per operator at a time, so a *different* ref mid-move is refused rather than silently re-targeting the fleet. Run `swarm workers update --status` to see where it stands; re-running it with the **same** ref advances it instead. |
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
 | `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon (see "Optional — let the control plane update this machine"). |
 | `swarm workers list` shows `update <ref> refused` with "is already updating the SWARM install root" | Another daemon on that machine shares the install root and got there first (issue #935). Wait for *its* outcome, then re-issue this one: it will report `already-current` once that build has landed. Nothing was changed on this machine. |

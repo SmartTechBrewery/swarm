@@ -20,6 +20,7 @@ export default defineConfig({
 		'./src/db/schema/workerSessions.ts',
 		'./src/db/schema/workerProjectEnrollments.ts',
 		'./src/db/schema/workerScmCredentials.ts',
+		'./src/db/schema/workerUpdateRollouts.ts',
 	],
 	out: './src/db/migrations',
 	dialect: 'postgresql',

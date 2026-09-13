@@ -80,7 +80,8 @@
  *   swarm workers drain <worker-id>
  *   swarm workers undrain <worker-id>
  *   swarm workers update <worker-id> <ref>
- *   swarm workers update --all <ref>
+ *   swarm workers update --all <ref> [--wave <n>]
+ *   swarm workers update --status
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
@@ -128,7 +129,8 @@ Usage:
   swarm workers drain <worker-id>
   swarm workers undrain <worker-id>
   swarm workers update <worker-id> <ref>
-  swarm workers update --all <ref>
+  swarm workers update --all <ref> [--wave <n>]
+  swarm workers update --status
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
@@ -224,15 +226,22 @@ Usage:
              machine working on the build it has. Requesting again replaces a
              request that has not been answered yet. The machine's owner alone may
              do it, so sign in as them. Remember to undrain it afterwards.
-             With --all and no worker id, the same request goes to EVERY machine
-             you own that is eligible for it — so it reaches only the ones already
-             draining — and one line per machine says what became of it:
-             requested (asked, and the machine is connected), queued-offline
-             (recorded; stated again on its next connection), in-pool (not asked,
-             drain it first), already-asked (an unanswered request for this same
-             ref, left alone) or answered (it already reported for this same ref).
-             No machine's state refuses the call, so re-running it is how you read
-             the fleet: an answered machine is never asked twice.
+             With --all and no worker id, every machine you own is moved to <ref>
+             as a STAGED ROLLOUT instead: SWARM drains at most --wave machines (one
+             by default), waits for each to go idle, asks it, waits for it to come
+             back on the new build, puts it back in the pool, and only then starts
+             the next wave — so a fleet update never takes the whole fleet's
+             capacity down at once. Re-run the same command to advance it; each run
+             prints where every machine stands (queued, draining, signalled,
+             verifying, done, skipped, failed). A machine that reports failed,
+             refused or declined, or that applies and never comes back, HALTS the
+             rollout: nothing further is drained or signalled, the reason is
+             recorded, and the untouched machines stay in the pool. A halted
+             rollout is final — fix the build and start a new one; there is no
+             resume and no cancel. --status prints the same table without advancing
+             anything. One rollout at a time per operator: asking for a different
+             ref while one is under way is refused rather than re-targeting a fleet
+             mid-move.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -392,31 +401,58 @@ const RequestedUpdateSchema = z.object({
 });
 
 /**
- * `workers.requestUpdateForMine` (issue #921) — the fleet form of the same
- * acknowledgement, one entry per machine the caller owns. `disposition` is read as
- * a plain string for the reason every other vocabulary in this file is: it is
- * printed rather than acted on, so a word a newer control plane reports and this
- * build has never heard of must not make the command fail.
+ * `workers.startFleetUpdate` / `workers.fleetUpdateStatus` (issue #940) — the whole
+ * staged rollout, one entry per machine.
+ *
+ * `status`, `state` and `outcome` are read as plain strings for the reason every
+ * other vocabulary in this file is: they are printed rather than acted on, so a word
+ * a newer control plane reports and this build has never heard of must not make the
+ * command fail.
  */
-const FleetUpdateSchema = z.object({
-	target: z.string().min(1),
-	workers: z.array(
-		z.object({
-			workerId: z.string().min(1),
-			displayName: z.string().min(1),
-			disposition: z.string().min(1),
-			update: WorkerUpdateStateSchema.nullable().optional(),
-		}),
-	),
+const RolloutMemberSchema = z.object({
+	workerId: z.string().min(1),
+	displayName: z.string().min(1),
+	state: z.string().min(1),
+	outcome: z.string().nullable().optional(),
+	message: z.string().nullable().optional(),
 });
-type FleetUpdateEntry = z.infer<typeof FleetUpdateSchema>['workers'][number];
+type RolloutMember = z.infer<typeof RolloutMemberSchema>;
+
+const RolloutSchema = z.object({
+	id: z.string().min(1),
+	target: z.string().min(1),
+	waveSize: z.number(),
+	status: z.string().min(1),
+	haltReason: z.string().nullable().optional(),
+	members: z.array(RolloutMemberSchema),
+});
+type Rollout = z.infer<typeof RolloutSchema>;
+
+/** `workers.startFleetUpdate` — the rollout it started or advanced, and which of the two it did. */
+const StartFleetUpdateSchema = z.object({
+	action: z.string().min(1),
+	target: z.string().min(1),
+	rollout: RolloutSchema.nullable(),
+});
+
+/** `workers.fleetUpdateStatus` — the same rollout, with nothing moved. */
+const FleetUpdateStatusSchema = z.object({ rollout: RolloutSchema.nullable() });
 
 /**
- * The dispositions this build knows, in the order the summary counts them — the
- * control plane's own vocabulary (`src/api/worker-update-fanout.ts`), restated here
- * only to order a printed tally. Anything outside it is still counted, after these.
+ * The member states this build knows, in the order the summary counts them — the
+ * control plane's own vocabulary (`src/identity/worker-update-rollout.ts`), restated
+ * here only to order a printed tally. Anything outside it is still counted, after
+ * these.
  */
-const FANOUT_DISPOSITIONS = ['requested', 'queued-offline', 'in-pool', 'already-asked', 'answered'];
+const ROLLOUT_MEMBER_STATES = [
+	'queued',
+	'draining',
+	'signalled',
+	'verifying',
+	'done',
+	'skipped',
+	'failed',
+];
 
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
 const ProjectScmProviderSchema = z.object({ providerId: z.string().min(1) });
@@ -935,23 +971,38 @@ async function drainCommand(argv: string[], draining: boolean): Promise<number> 
  * not a well-formed ref (`BAD_REQUEST`). Validating the ref here as well would only
  * let the two grammars drift.
  *
- * `--all` hands over to {@link updateFleetCommand} (issue #921) — the same request
- * over every machine the operator owns, which reports per machine rather than
- * refusing, so it answers in a different shape and cannot share this path's copy.
+ * `--all` and `--status` hand over to {@link rolloutCommand} (issue #940) — the
+ * staged form, which drains, signals, verifies and undrains a bounded wave at a time
+ * and so answers in an entirely different shape from this one machine's
+ * acknowledgement.
  */
 async function updateWorkerCommand(argv: string[]): Promise<number> {
 	const { values, positionals } = parseArgs({
 		args: argv,
 		allowPositionals: true,
-		options: { all: { type: 'boolean' } },
+		options: {
+			all: { type: 'boolean' },
+			status: { type: 'boolean' },
+			wave: { type: 'string' },
+		},
 	});
-	// `--all` is a different *selection*, not a different request: same mutation
-	// semantics per machine, run over every machine the operator owns (issue #921).
-	if (values.all) return await updateFleetCommand(positionals);
+	// `--all` is a staged rollout over every machine the operator owns, and `--status`
+	// reads the one already under way; both are the same per-machine request as below,
+	// scheduled rather than sent at once (issue #940).
+	if (values.all || values.status) return await rolloutCommand(values, positionals);
 
 	const [workerId, target] = positionals;
 	if (!workerId || !target) {
 		out.error('workers update: a <worker-id> and a <ref> are required');
+		out.info(USAGE);
+		return 1;
+	}
+	// A wave is a property of a rollout, so it means nothing here — refused rather
+	// than silently ignored, since an operator who typed it meant to stage something.
+	if (values.wave !== undefined) {
+		out.error(
+			'workers update: --wave sizes a staged fleet rollout, so it goes with --all — this form asks one machine',
+		);
 		out.info(USAGE);
 		return 1;
 	}
@@ -978,30 +1029,58 @@ async function updateWorkerCommand(argv: string[]): Promise<number> {
 }
 
 /**
- * `swarm workers update --all <ref>` (issue #921): ask every machine the operator
- * owns that is eligible for it, in one call, and print what became of each.
+ * `swarm workers update --all <ref> [--wave N]` and `swarm workers update --status`
+ * (issue #940): move every machine the operator owns to a build as a **staged
+ * rollout**, and read where that rollout stands.
  *
- * The report is the point. The control plane refuses no machine for its state — a
- * fleet action that aborted on one machine still in the dispatch pool would say
- * nothing about the others — so each line carries a **disposition** instead, the
- * machines it did not ask included. That also makes re-running this the readout: a
- * machine that has answered comes back `answered` rather than being asked again,
- * and one with an outstanding request keeps it.
+ * **Re-running it is how a rollout is advanced.** The first call drains and signals
+ * the first wave; each later one settles what the machines have reported, verifies
+ * the ones that applied, returns them to the pool and starts the next wave. That is
+ * the same contract `drain` already has — re-run it to see where the machine is now —
+ * and it is why this command prints the whole member table every time rather than an
+ * acknowledgement. Advancing with nobody watching is phase 3 of issue #921.
  *
- * **Exit 0 whenever the call succeeded**, however many machines were skipped: this
- * is a report, not a pass/fail. Non-zero stays reserved for a usage error or a
- * failed call, exactly as everywhere else in this file.
+ * **Exit 0 whenever the call succeeded**, halted rollouts included: this is a report,
+ * not a pass/fail, exactly as the fan-out it replaces was. Non-zero stays reserved
+ * for a usage error or a failed call.
  *
- * It only ever reaches machines that are **already draining**, which is issue
- * #933's precondition unrelaxed — so it cannot take a fleet's capacity down by
- * itself. Draining them is still the operator's own step, named per machine below.
+ * `--status` is the same table with nothing moved, so an operator can look without
+ * advancing anything.
  */
-async function updateFleetCommand(positionals: string[]): Promise<number> {
+async function rolloutCommand(
+	values: { all?: boolean; status?: boolean; wave?: string },
+	positionals: string[],
+): Promise<number> {
+	if (values.status) {
+		if (values.all || positionals.length > 0 || values.wave !== undefined) {
+			out.error(
+				'workers update: --status only reads the fleet update already under way, so it takes no <ref>, no --wave and no --all',
+			);
+			out.info(USAGE);
+			return 1;
+		}
+		const operator = requireOperator();
+		if (!operator) return 1;
+		const { rollout } = await operator.client.query(
+			'workers.fleetUpdateStatus',
+			undefined,
+			parseWith(FleetUpdateStatusSchema),
+		);
+		if (!rollout) {
+			out.info(
+				'you have never started a fleet update — `swarm workers update --all <ref>` starts one',
+			);
+			return 0;
+		}
+		printRollout(rollout);
+		return 0;
+	}
+
 	// A worker id alongside `--all` is two different requests typed as one, so it is
 	// refused naming both forms rather than resolved by guessing which was meant.
 	if (positionals.length > 1) {
 		out.error(
-			'workers update: --all asks every machine you own, so it takes a <ref> and nothing else — for one machine run `swarm workers update <worker-id> <ref>`',
+			'workers update: --all moves every machine you own, so it takes a <ref> and nothing else — for one machine run `swarm workers update <worker-id> <ref>`',
 		);
 		out.info(USAGE);
 		return 1;
@@ -1012,82 +1091,130 @@ async function updateFleetCommand(positionals: string[]): Promise<number> {
 		out.info(USAGE);
 		return 1;
 	}
+	const waveSize = parseWaveSize(values.wave);
+	if (waveSize === 'invalid') return 1;
 
 	const operator = requireOperator();
 	if (!operator) return 1;
 
-	const fleet = await operator.client.mutate(
-		'workers.requestUpdateForMine',
-		{ target },
-		parseWith(FleetUpdateSchema),
+	const result = await operator.client.mutate(
+		'workers.startFleetUpdate',
+		{ target, waveSize },
+		parseWith(StartFleetUpdateSchema),
 	);
-	if (fleet.workers.length === 0) {
-		out.info(`you operate no machines — nothing to ask to move to '${fleet.target}'`);
+	if (!result.rollout) {
+		out.info(`you operate no machines — nothing to move to '${result.target}'`);
 		return 0;
 	}
-
-	for (const entry of fleet.workers) {
-		out.info(`${entry.workerId}\t${entry.displayName}\t${entry.disposition}${fanoutDetail(entry)}`);
-	}
-	out.info(summariseFanout(fleet.workers));
-
-	const asked = fleet.workers.filter(
-		(entry) => entry.disposition === 'requested' || entry.disposition === 'queued-offline',
-	);
-	if (asked.length > 0) {
-		out.info(
-			'  each asked machine applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
-		);
-		out.info(
-			"  run 'swarm workers list' to read what they reported, then 'swarm workers undrain <worker-id>' per machine to put them back in the pool",
-		);
-	} else {
-		out.info(`  nothing was asked to move to '${fleet.target}' — every machine above is as it was`);
-	}
-	// The remedy `workers.requestUpdate`'s CONFLICT names, printed here because the
-	// fan-out reports a machine in the pool rather than refusing the whole call.
-	const inPool = fleet.workers.filter((entry) => entry.disposition === 'in-pool');
-	if (inPool.length > 0) {
-		out.info(
-			`  still in the dispatch pool and so not asked — drain them, then run this again: ${inPool
-				.map((entry) => `swarm workers drain ${entry.workerId}`)
-				.join('; ')}`,
-		);
-	}
+	printRollout(result.rollout, result.action);
 	return 0;
 }
 
 /**
- * The detail column on a fleet line. Only `answered` has anything to add — the
- * outcome the machine reported and the first line of its own message — because
- * that is the one disposition that stands for something already decided rather than
- * something now in flight. The message is cut to its first line: it carries a
- * bounded command tail for a failed build, which belongs in `swarm workers list`'s
- * read of the row rather than in the middle of a per-machine table.
+ * `--wave N` as a positive integer, or `undefined` when it was not given (the
+ * control plane then applies its own default). Checked here rather than left to the
+ * input schema only because "workers update: --wave must be a positive integer" is
+ * shorter and truer than a raw schema dump for a typo.
  */
-function fanoutDetail(entry: FleetUpdateEntry): string {
-	if (entry.disposition !== 'answered' || !entry.update) return '';
-	const status = entry.update.status ?? 'unreported';
-	const firstLine = entry.update.message?.split('\n')[0]?.trim();
-	return firstLine ? `\t${status}: ${firstLine}` : `\t${status}`;
+function parseWaveSize(raw: string | undefined): number | undefined | 'invalid' {
+	if (raw === undefined) return undefined;
+	const wave = Number(raw);
+	if (!Number.isInteger(wave) || wave < 1) {
+		out.error(`workers update: --wave must be a positive integer, got '${raw}'`);
+		return 'invalid';
+	}
+	return wave;
+}
+
+/**
+ * The whole rollout: a heading, one line per machine, a tally, and the one line that
+ * says what to do next.
+ *
+ * The member table is printed in the rollout's own order — the order it will reach
+ * the machines in, which is the order `swarm workers list` already prints — so an
+ * operator reads the two against each other rather than matching ids.
+ */
+function printRollout(rollout: Rollout, action?: string): void {
+	const wave = `${rollout.waveSize} machine${rollout.waveSize === 1 ? '' : 's'} per wave`;
+	const lead = action === 'started' ? 'started fleet update' : 'fleet update';
+	out.info(
+		`${lead} ${rollout.id} to '${rollout.target}' — ${describeRolloutStatus(rollout.status)}, ${wave}`,
+	);
+	for (const member of rollout.members) {
+		out.info(`${member.workerId}\t${member.displayName}\t${member.state}${memberDetail(member)}`);
+	}
+	out.info(summariseRollout(rollout.members));
+	if (rollout.status === 'halted') {
+		out.info(`  halted: ${rollout.haltReason ?? 'no reason recorded'}`);
+		out.info(
+			'  no further machine is drained or signalled. Fix the build, then start a new fleet update — there is no resume.',
+		);
+		// A machine that failed is left out of the pool on purpose, so the undrain that
+		// ends that is named here rather than left to be remembered.
+		const failed = rollout.members.filter((member) => member.state === 'failed');
+		if (failed.length > 0) {
+			out.info(
+				`  left drained so you can look at ${failed.length === 1 ? 'it' : 'them'}: ${failed
+					.map((member) => `swarm workers undrain ${member.workerId}`)
+					.join('; ')}`,
+			);
+		}
+		return;
+	}
+	if (rollout.status === 'completed') {
+		out.info(`  every machine is on '${rollout.target}' and back in the dispatch pool`);
+		return;
+	}
+	// The one thing an operator cannot see from the table: a machine only acts if its
+	// own host opted in, and a machine that has not reports `declined` — which halts
+	// the rollout, so it is worth naming before that happens rather than after.
+	if (rollout.members.some((member) => member.state === 'signalled')) {
+		out.info(
+			'  each machine asked applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
+		);
+	}
+	out.info(
+		`  re-run 'swarm workers update --all ${rollout.target}' to advance it, or 'swarm workers update --status' to look without advancing`,
+	);
+}
+
+/** The rollout status in the words an operator reads it in, not the stored token. */
+function describeRolloutStatus(status: string): string {
+	if (status === 'in_progress') return 'in progress';
+	if (status === 'halted') return 'HALTED';
+	if (status === 'completed') return 'completed';
+	// A status this build has never heard of is printed as it came, on the same
+	// tolerance every other vocabulary in this file is read with.
+	return status;
+}
+
+/**
+ * The detail column on a member line: what the machine reported, and the first line
+ * of its own message. The message is cut to its first line for the reason the fleet
+ * report already cut it — it carries a bounded command tail for a failed build, which
+ * belongs in the halt reason under the table rather than in the middle of it.
+ */
+function memberDetail(member: RolloutMember): string {
+	const firstLine = member.message?.split('\n')[0]?.trim();
+	if (member.outcome && firstLine) return `\t${member.outcome}: ${firstLine}`;
+	if (member.outcome) return `\t${member.outcome}`;
+	return firstLine ? `\t${firstLine}` : '';
 }
 
 /** One tally line under the table, so a fleet is read without counting rows. */
-function summariseFanout(entries: FleetUpdateEntry[]): string {
+function summariseRollout(members: RolloutMember[]): string {
 	const counts = new Map<string, number>();
-	for (const entry of entries) {
-		counts.set(entry.disposition, (counts.get(entry.disposition) ?? 0) + 1);
+	for (const member of members) {
+		counts.set(member.state, (counts.get(member.state) ?? 0) + 1);
 	}
-	const known = FANOUT_DISPOSITIONS.filter((disposition) => counts.has(disposition));
-	// A disposition this build has never heard of is still counted, after the known
-	// ones — the same tolerance the schema above reads the word with.
-	const unknown = [...counts.keys()].filter(
-		(disposition) => !FANOUT_DISPOSITIONS.includes(disposition),
-	);
+	const known = ROLLOUT_MEMBER_STATES.filter((state) => counts.has(state));
+	// A state this build has never heard of is still counted, after the known ones —
+	// the same tolerance the schema above reads the word with.
+	const unknown = [...counts.keys()].filter((state) => !ROLLOUT_MEMBER_STATES.includes(state));
 	const tally = [...known, ...unknown.sort()]
-		.map((disposition) => `${counts.get(disposition)} ${disposition}`)
+		.map((state) => `${counts.get(state)} ${state}`)
 		.join(', ');
-	return `${entries.length} machine${entries.length === 1 ? '' : 's'}: ${tally}`;
+	return `${members.length} machine${members.length === 1 ? '' : 's'}: ${tally}`;
 }
 
 /**

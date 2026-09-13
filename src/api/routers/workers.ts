@@ -45,6 +45,7 @@ import {
 	setWorkerDraining,
 	type Worker,
 } from '../../identity/worker-service.js';
+import { RolloutWaveSizeSchema } from '../../identity/worker-update-rollout.js';
 import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
 import { WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
 import { publishWorkerUpdateRequest } from '../../queue/worker-updates.js';
@@ -58,6 +59,12 @@ import {
 import { authedProcedure, router } from '../trpc.js';
 import { resolveStrictlyOwnedWorker, workerNotFound } from '../worker-access.js';
 import { fanOutWorkerUpdate } from '../worker-update-fanout.js';
+import {
+	getRolloutForOwner,
+	type RolloutMemberView,
+	type RolloutView,
+	startRollout,
+} from '../worker-update-rollout.js';
 import { workerScmCredentialsRouter } from './workerScmCredentials.js';
 
 /**
@@ -105,14 +112,21 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   restart), asks the same of *every* machine they own in one action
  *   (`requestUpdateForMine`, issue #921 — the fan-out in
  *   `../worker-update-fanout.ts`, which refuses no machine for its state and
- *   reports a disposition per machine instead), and controls the
+ *   reports a disposition per machine instead), stages that same move across the
+ *   whole fleet as a rollout that drains, signals, verifies and returns machines to
+ *   the pool a bounded wave at a time and halts on a bad build
+ *   (`startFleetUpdate` / `fleetUpdateStatus`, issue #940 — the state machine in
+ *   `../worker-update-rollout.ts`; re-calling `startFleetUpdate` for the target
+ *   already in progress *advances* it, and only a different target is `CONFLICT`),
+ *   and controls the
  *   revocable sharing consent
  *   (`setConsent`) and execution constraints (`updateConstraints`). Ownership is
  *   checked per call. `enroll` alone lets an `instanceAdmin` act on any worker
  *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
  *   reads as administering the project side of that offer; `rename`,
  *   `setDeclaredCapabilities`, `remove`, `setDraining`, `requestUpdate`,
- *   `requestUpdateForMine`, `setConsent`, and `updateConstraints`
+ *   `requestUpdateForMine`, `startFleetUpdate`, `fleetUpdateStatus`, `setConsent`,
+ *   and `updateConstraints`
  *   are the machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
  *   way, a caller who does not own the worker gets `NOT_FOUND`, so
@@ -333,6 +347,31 @@ function serializeWorkerUpdate(update: WorkerUpdateState | null) {
 		...update,
 		requestedAt: update.requestedAt.toISOString(),
 		reportedAt: update.reportedAt?.toISOString() ?? null,
+	};
+}
+
+/**
+ * The wire form of a staged fleet update (issue #940) — the same explicit
+ * ISO-timestamp treatment {@link serializeWorkerUpdate} applies, over the rollout's
+ * two instants and each member's two. `null` when the caller has never started one,
+ * which is an honest empty answer rather than an error.
+ */
+function serializeRollout(view: RolloutView | null) {
+	if (!view) return null;
+	return {
+		...view.rollout,
+		createdAt: view.rollout.createdAt.toISOString(),
+		updatedAt: view.rollout.updatedAt.toISOString(),
+		members: view.members.map(serializeRolloutMember),
+	};
+}
+
+/** One member's line on the wire — the row plus its machine's label, instants as ISO strings. */
+function serializeRolloutMember(member: RolloutMemberView) {
+	return {
+		...member,
+		signalledAt: member.signalledAt?.toISOString() ?? null,
+		settledAt: member.settledAt?.toISOString() ?? null,
 	};
 }
 
@@ -747,6 +786,80 @@ export const workersRouter = router({
 				})),
 			};
 		}),
+
+	// Move **every machine the caller owns** to a build as a staged rollout (issue
+	// #940) — the same per-machine request as `requestUpdateForMine`, but drained,
+	// signalled, verified and returned to the pool a bounded wave at a time, and
+	// stopped on its own when the build turns out to be bad. The state machine and
+	// its reasoning live in `../worker-update-rollout.ts`; what stays here is the
+	// authorization, the refusals and the wire shape.
+	//
+	// Strictly owner-scoped, inherited from `requestUpdateForMine` rather than
+	// restated: the set is the caller's own machines and nothing wider, and whether an
+	// installation administrator may stage a rollout over machines they do not own
+	// stays issue #922's question.
+	//
+	// **Calling it again is how a rollout is advanced**, not an error: re-running
+	// `swarm workers update --all <ref>` moves the rollout on and reports where every
+	// member stands, exactly as re-running `swarm workers drain` is already the
+	// supported way to poll a drain. Only a *different* target while one is in progress
+	// is `CONFLICT`, and it names the status command rather than a machine — two
+	// rollouts over the same machines would drain and undrain each other's members, so
+	// re-targeting a fleet mid-move is refused rather than done quietly.
+	//
+	// The target is validated once by the same `WorkerUpdateTargetSchema`
+	// `requestUpdate` uses, so a malformed ref is one `BAD_REQUEST` before any machine
+	// is drained. An operator who owns no machines gets `{ rollout: null }` — an honest
+	// empty answer, not an error, exactly as the fan-out gives them.
+	startFleetUpdate: authedProcedure
+		.input(
+			z.object({
+				target: WorkerUpdateTargetSchema,
+				// Omit for the default of one machine at a time. Ignored when this call
+				// advances a rollout already in progress: that rollout's bound is the one it
+				// was started with and lives on its own row, so a later call cannot widen how
+				// much capacity is down mid-move.
+				waveSize: RolloutWaveSizeSchema.optional(),
+			}),
+		)
+		.mutation(async ({ ctx, input }) => {
+			const result = await startRollout({
+				ownerUserId: ctx.user.id,
+				target: input.target,
+				waveSize: input.waveSize,
+			});
+			if (result.outcome === 'no-machines') {
+				return { action: 'no-machines' as const, target: input.target, rollout: null };
+			}
+			if (result.outcome === 'conflict') {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						`A fleet update to '${result.view.rollout.target}' is already in progress, so it ` +
+						`cannot be re-targeted at '${input.target}' mid-move. Run ` +
+						`\`swarm workers update --status\` to see where it stands; it has to finish or ` +
+						`halt before another can start.`,
+				});
+			}
+			return {
+				action: result.outcome,
+				target: input.target,
+				rollout: serializeRollout(result.view),
+			};
+		}),
+
+	// Where the caller's most recent staged fleet update stands (issue #940) — every
+	// member, its state, and whatever its machine reported, plus the halt reason when
+	// the rollout stopped itself. Owner-scoped exactly like `startFleetUpdate`, and
+	// read-only: it never drains, signals or advances anything, so an operator can look
+	// without moving the fleet on.
+	//
+	// It answers the caller's **latest** rollout whatever its status, not only a live
+	// one, because the state a halted rollout left behind is the whole point of
+	// recording it. `null` when they have never started one.
+	fleetUpdateStatus: authedProcedure.query(async ({ ctx }) => {
+		return { rollout: serializeRollout(await getRolloutForOwner(ctx.user.id)) };
+	}),
 
 	// Offer one of the caller's workers to a project. The caller must own the
 	// worker (NOT_FOUND otherwise) and be able to see the project (`contributor`,
