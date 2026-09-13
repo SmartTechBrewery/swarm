@@ -16,13 +16,18 @@
  *
  * Three moments, in the order a bad build meets them:
  *
- * - **Process start** — {@link verifyStartupBuild}, the first thing the daemon does,
- *   before it reads its environment, locks its checkout or opens the transport. It
- *   counts this start against the build being verified and, once too many in a row
- *   have failed, returns the install root to the last known good build and ends the
- *   process so the supervisor starts it there. Counting at *start* rather than on an
- *   observed failure is what makes a build that dies before reaching any code of its
- *   own recoverable: the count is already on disk by the time it dies.
+ * - **Process start** — {@link verifyStartupBuild}, the first thing the process does,
+ *   before it reads its environment, locks its checkout or opens the transport —
+ *   and, crucially, before the daemon's module graph is loaded at all. It counts this
+ *   start against the build being verified and, once too many in a row have failed,
+ *   returns the install root to the last known good build and ends the process so the
+ *   supervisor starts it there. Counting at *start* rather than on an observed failure
+ *   is what makes a build that dies before reaching any code of its own recoverable:
+ *   the count is already on disk by the time it dies. That guarantee is why
+ *   `./connect-entry.ts` is a bootstrap that reaches `./worker-main.ts` through a
+ *   dynamic import, and why this module keeps its own static imports down to the state
+ *   mechanism — ESM evaluates static imports before any module body, so anything
+ *   reachable from here is something a bad build could throw in *ahead* of the count.
  * - **The first handshake** — {@link createHandshakePromotion}. A session is the
  *   proof the record was waiting for, so it promotes the build and clears the record,
  *   and every start after that is an ordinary one. Guarded, because `onSession` fires
@@ -55,7 +60,6 @@ import {
 	recordSuccessfulHandshake,
 	returnToLastKnownGood,
 } from '../worker/self-update.js';
-import { isFatalHandshakeRejection } from './worker-client.js';
 import type { UpdateLogger } from './worker-update.js';
 
 export interface BuildVerificationOptions {
@@ -139,6 +143,13 @@ export async function returnAfterFatalHandshake(
 	err: unknown,
 	options: BuildVerificationOptions = {},
 ): Promise<boolean> {
+	// Loaded on demand, not at the top of the file, so this module carries none of the
+	// transport's own module graph: `./connect-entry.ts` imports it statically to count
+	// a start before the daemon exists, and every module reachable from here is one
+	// more place a bad build could throw at import time and bypass that counter. There
+	// is no cost — this function is only ever reached from a live transport, so
+	// `./worker-client.ts` is already evaluated and the import resolves from cache.
+	const { isFatalHandshakeRejection } = await import('./worker-client.js');
 	if (!isFatalHandshakeRejection(err)) return false;
 	const pending = readPendingVerification(options);
 	if (!pending) return false;

@@ -439,7 +439,9 @@ build column is the independent confirmation that the new code is what is runnin
 is not trusted until a daemon running it has connected once, because the update
 channel is the first thing a bad build takes away: with no socket there is nothing
 left to push a correction down. So the machine judges the new build itself. It counts
-every start on an unproved build before it opens the transport, the first successful
+every start on an unproved build before it loads a line of that build's own worker
+code — so a build that dies while it is still starting up is counted exactly like one
+that starts and then cannot connect — the first successful
 handshake promotes that build to *last known good*, and a machine that has started
 three times without once connecting — or that the control plane rejects outright at
 the handshake, which is the "this build cannot talk to this control plane" case and

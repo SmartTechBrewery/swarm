@@ -6,12 +6,21 @@
  * root, or `process.exit`. What is under test is the daemon's *decisions* — when it
  * counts, when it promotes, and when it gives up — since the mechanism each of them
  * drives is covered by phase 1's own suite next door.
+ *
+ * The last block is the exception, and has to be: the guarantee that a start is
+ * counted before the daemon's own module graph is evaluated is a property of a real
+ * process, so it launches one. It still keeps to a temp `HOME`, and it stops two
+ * starts short of the cap so the return — which rewrites a checkout — is never
+ * reached.
  */
 
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { swarmInstallRoot } from '@/lib/build-identity.js';
 import {
 	type BuildVerificationOptions,
 	createHandshakePromotion,
@@ -313,22 +322,132 @@ describe('returnAfterFatalHandshake', () => {
 });
 
 /**
- * The one property that cannot be asserted by calling anything: the guard is only
- * worth having if it runs *before* the transport is opened, and the entrypoint that
- * decides that starts a daemon on import, so the call site is read rather than run.
+ * The one property that cannot be asserted by calling anything: the count is only
+ * worth having if it is durable before *any* of the daemon's code — its static
+ * imports included — has been evaluated. ESM runs a module's imports before its own
+ * body, so a guard sitting at the top of the daemon's module runs last, not first,
+ * and a build that throws at import time would never be counted at all. The property
+ * therefore belongs to `connect-entry.ts`'s import list and to the process it starts,
+ * and both are checked here.
  */
 describe('the daemon entrypoint', () => {
-	it('counts the start before it constructs the transport', () => {
-		const source = readFileSync(
-			resolve(import.meta.dirname, '../../../src/transport/connect-entry.ts'),
-			'utf8',
+	const REPO_ROOT = swarmInstallRoot();
+	const ENTRY = join(REPO_ROOT, 'src/transport/connect-entry.ts');
+	const POISON = join(REPO_ROOT, 'tests/fixtures/poison-worker-main/register.mjs');
+
+	/** The entrypoint's state file, which is keyed on the *real* install root. */
+	function installRootStatePath(home: string): string {
+		return join(installUpdateStateDir(REPO_ROOT, home), 'state.json');
+	}
+
+	/**
+	 * A record awaiting proof for this checkout, so a launched entrypoint has something
+	 * to count against. `lastKnownGood` stays the unreachable `GOOD` sha on purpose: no
+	 * launch here may reach {@link MAX_FAILED_STARTS}, but if one ever did, the return's
+	 * first step is `git checkout --detach <that sha>` in this very checkout — and a sha
+	 * no object matches fails before anything is touched.
+	 */
+	function writeInstallRootState(home: string, failedStarts: number): void {
+		mkdirSync(installUpdateStateDir(REPO_ROOT, home), { recursive: true });
+		writeFileSync(
+			installRootStatePath(home),
+			JSON.stringify({
+				installRoot: REPO_ROOT,
+				remote: 'origin',
+				trackedBranch: 'main',
+				lastKnownGood: GOOD,
+				target: 'main',
+				targetCommit: APPLIED,
+				appliedAt: '2026-02-01T00:00:00.000Z',
+				pendingVerification: {
+					commit: APPLIED,
+					previousCommit: GOOD,
+					failedStarts,
+					startedAt: '2026-02-01T00:00:00.000Z',
+				},
+			}),
 		);
+	}
+
+	function countedStarts(home: string): number | undefined {
+		const state = InstallUpdateStateSchema.parse(
+			JSON.parse(readFileSync(installRootStatePath(home), 'utf8')),
+		);
+		return state.pendingVerification?.failedStarts;
+	}
+
+	/**
+	 * Start the real entrypoint the way a supervisor does, with `HOME` and the log file
+	 * pointed at a temp directory and the daemon's own two required variables stripped —
+	 * so a launch that gets past the bootstrap dies on a missing credential instead of
+	 * connecting to whatever the developer's environment names.
+	 */
+	function launch(home: string, options: { poison?: boolean } = {}) {
+		const args = ['--import', 'tsx/esm'];
+		if (options.poison) args.push('--import', pathToFileURL(POISON).href);
+		args.push(ENTRY);
+		const env: NodeJS.ProcessEnv = {
+			...process.env,
+			HOME: home,
+			SWARM_LOG_FILE: join(home, 'worker.log'),
+			// `spawn` drops an undefined value rather than passing the string "undefined",
+			// which is what makes these two genuinely absent in the child.
+			SWARM_WORKER_CREDENTIAL: undefined,
+			SWARM_CONTROL_PLANE_URL: undefined,
+		};
+		const result = spawnSync(process.execPath, args, {
+			cwd: REPO_ROOT,
+			encoding: 'utf8',
+			env,
+			timeout: 60_000,
+		});
+		return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+	}
+
+	it('statically imports only what counts a start, and reaches the daemon dynamically', () => {
+		const source = readFileSync(ENTRY, 'utf8');
+
+		const staticImports = [...source.matchAll(/^import\s[^;]*?from\s+'([^']+)';$/gm)].map(
+			(match) => match[1],
+		);
+		// Node builtins and `zod` are all that lies below these four. Adding anything the
+		// daemon needs but the counter does not re-opens the hole this file documents.
+		expect(staticImports.sort()).toEqual([
+			'../lib/env.js',
+			'../lib/errors.js',
+			'../lib/logger.js',
+			'./build-verification.js',
+		]);
 
 		const counted = source.indexOf('await verifyStartupBuild(');
-		const connected = source.indexOf('connectWorkerTransport({');
-
+		const loaded = source.indexOf("await import('./worker-main.js')");
 		expect(counted).toBeGreaterThan(-1);
-		expect(connected).toBeGreaterThan(-1);
-		expect(counted).toBeLessThan(connected);
+		expect(loaded).toBeGreaterThan(-1);
+		expect(counted).toBeLessThan(loaded);
+	});
+
+	it('counts a start whose daemon throws while ESM is still loading it, and one that runs', {
+		timeout: 120_000,
+	}, () => {
+		const home = makeHome();
+		writeInstallRootState(home, 0);
+
+		// The blocker case: this build's daemon module cannot even be evaluated. The
+		// process still ends with the start on disk, so the supervisor's next restart
+		// is the second of three rather than another uncounted one.
+		const died = launch(home, { poison: true });
+		expect(died.status).toBe(1);
+		expect(died.output).toContain('poisoned worker-main');
+		expect(countedStarts(home)).toBe(1);
+
+		// And the ordinary path still reaches the daemon: with the module loadable, the
+		// process gets all the way into `main()` — far enough to miss its credential —
+		// which is what proves the dynamic import actually resolves.
+		const ran = launch(home);
+		expect(ran.status).toBe(1);
+		expect(ran.output).toContain('Missing required environment variable: SWARM_WORKER_CREDENTIAL');
+		expect(countedStarts(home)).toBe(2);
+		// Neither launch may reach the cap: the third is the one that rewrites a checkout.
+		expect(MAX_FAILED_STARTS).toBeGreaterThan(2);
 	});
 });

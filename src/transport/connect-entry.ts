@@ -1,110 +1,37 @@
 /**
- * The worker entrypoint — runs the worker-side transport client
- * (`./worker-client.ts`) as a long-lived process (ADR-003 §1, Phase 2 of issue
- * #391). Run it via `npm run dev:worker`.
+ * The worker process entrypoint — and *only* that (issue #934). The daemon itself is
+ * `./worker-main.ts`; this module exists to do one thing before that one is loaded.
  *
- * **Every** worker runs this program — there is no second one (issue #553). The
- * control-plane host used to run a database-holding BullMQ executor of its own
- * (the deleted `../worker/index.ts`), so the same role shipped as two programs and
- * only one of them was exercised on a given run. That host now points
- * `SWARM_CONTROL_PLANE_URL` at its own router over loopback
- * (`http://localhost:<ROUTER_PORT>`), so "local" is a network distance rather than
- * a code path, and whatever works here works there.
+ * **Why the split.** An applied self-update is not trusted until a daemon running it
+ * has handshaked once, and the record that makes a machine able to give up on a bad
+ * build is written by {@link verifyStartupBuild} at process start
+ * (`./build-verification.ts`). ESM evaluates a module's *static imports before its own
+ * body*, so while the daemon and the counter lived in one module the counter ran after
+ * the whole worker dependency graph — every integration, the harness, the executor —
+ * had already been evaluated. A build whose bad code threw at import time therefore
+ * never reached the counter: `failedStarts` stayed where it was, the supervisor
+ * restarted the same build, and the machine crash-looped forever on precisely the
+ * failure this mechanism exists to recover from, with no socket left to correct it
+ * over.
  *
- * The process holds **only** `SWARM_WORKER_CREDENTIAL`,
- * `SWARM_CONTROL_PLANE_URL`, and its host-local checkout path
- * (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd) — never `DATABASE_URL`/`REDIS_URL`,
- * even on a host that has them, and, since issue #765, no operator SCM credential
- * either: that identity is stored per `(worker, scmProvider)` on the control plane
- * and arrives on each assignment, so rotating it needs no restart here and
- * `SWARM_OPERATOR_GH_TOKEN` is no longer read by any worker. It connects to
- * the control plane (over the Cloudflare tunnel from a remote machine, over
- * loopback on the control-plane host), declares the CLIs it can run, and
- * heartbeats to keep its `worker_sessions` lease live so the eligibility gate sees
- * it as connected. On each pushed
- * `TaskAssignment` it runs the phase **DB-free** (`./assignment-execution.ts`):
- * the project config comes from the assignment's non-secret slice, source-carrying
- * delivery uses that frame's operator credential through the registered SCM provider
- * (`SCMProvider.operatorDeliveryProvider`), the reviewer/PM metadata writes go up to the
- * control plane's delivery API (`./delivery-client.ts`) so those credentials stay
- * server-side, and results stream back over the transport back-channel. **Every
- * phase runs this way** — `respond-to-review` since issue #418 gave it the
- * `pm/find-item` card lookup and `follow-up-review` enqueue seams, and `planning`
- * since issue #536 routed its whole board surface through five more PM delivery
- * routes. The supported-phase gate in `runAssignmentDbFree` stays as the backstop
- * even though it now excludes nothing, and the repository this daemon declares at
- * handshake is handed to the same executor so an assignment for a *different*
- * repository is refused before the checkout is touched (issue #688). Before any of
- * that it takes a host-local lock on that checkout (`../worktree/checkout-lock.ts`,
- * issue #689), so a second daemon pointed at the same `SWARM_WORKER_REPO_ROOT`
- * refuses to start rather than driving git in the same repository as this one. It
- * never opens a database or queue connection.
+ * So the static graph here is deliberately minimal — the verification and state
+ * mechanism, the logger, and nothing else (node builtins and `zod` below that) — and
+ * the daemon arrives through a **dynamic** `import()` that cannot run until the count
+ * is durable. Keep it that way: a static import of anything the daemon needs but the
+ * counter does not re-opens the hole, which is why
+ * `tests/unit/transport/build-verification.test.ts` pins this module's import list and
+ * launches the real entrypoint with a poisoned `./worker-main.ts` to prove the count
+ * survives an import-time death.
  *
- * Besides executing phases it reports one background fact about its own machine:
- * its agent CLIs' remaining allowance (`./quota-reporting.ts`, issue #825). No
- * other process can — a snapshot describes this host's installation and logins —
- * and it is best-effort, so a failed probe or report never touches a run.
- *
- * It also answers one thing asked *of* its machine rather than of a dispatch: a
- * pushed request to move the SWARM install root to a build and restart into it
- * (`./worker-update.ts`, issue #933). It acts only if this host opted in
- * (`SWARM_WORKER_SELF_UPDATE`), only once it holds no in-flight phase, and on
- * success takes the same graceful teardown a SIGTERM does before exiting 0 — so
- * launchd `KeepAlive` / systemd `Restart=always` starts it again on the new build,
- * whose identity reaches the control plane through the `build` field above. Every
- * other outcome is reported and the daemon keeps taking work on the build it has.
- *
- * The other half of that is the only thing this program does *before* anything else
- * (`./build-verification.ts`, issue #934): an applied update is not trusted until a
- * daemon running it has handshaked once, so every start on an unproved build is
- * counted before the transport is opened, the first session promotes the build, and
- * a machine that keeps failing to start — or is rejected outright at the handshake —
- * puts its install root back on the last known good build and exits for the
- * supervisor to restart it there. Once a bad build has taken the socket, that is the
- * only channel left.
+ * The logger is configured here rather than there for the same ordering reason: the
+ * lines a giving-up machine emits are the ones an operator needs in the log file, and
+ * they are emitted before the daemon exists.
  */
 
-import { readFileSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { fileURLToPath } from 'node:url';
-
-// Register every integration, so the DB-free executor can resolve this project's
-// SCM provider from the registry instead of naming one (ai/RULES.md §2) — the same
-// side-effect import `../router/webhook-receiver.ts` and `../api/router.ts` do.
-// Safe on a DB-free worker: nothing in that module graph opens a Postgres or Redis
-// connection at load (`getDb()` is lazy, `src/db/client.ts`), so this process still
-// connects to neither.
-import '../integrations/entrypoint.js';
-import { resolveAgentContainment } from '../harness/containment.js';
-import { resolveOwnBuildIdentity } from '../lib/build-identity.js';
-import { optionalEnv, requireEnv, resolveWorkerRepoRoot } from '../lib/env.js';
+import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { addFileSink, configureLogger, logger } from '../lib/logger.js';
-import { resolveDeclarableOriginRepoSlug } from '../scm/repo-slug.js';
-import {
-	acquireCheckoutLock,
-	CHECKOUT_LOCK_REFRESH_MS,
-	CheckoutHeldError,
-	type CheckoutLock,
-} from '../worktree/checkout-lock.js';
-import {
-	handleTaskCancel,
-	runAssignmentDbFree,
-	SUPPORTED_DB_FREE_PHASES,
-} from './assignment-execution.js';
-import {
-	createHandshakePromotion,
-	returnAfterFatalHandshake,
-	verifyStartupBuild,
-} from './build-verification.js';
-import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discovery.js';
-import {
-	startWorkerQuotaReporting,
-	WORKER_QUOTA_REPORT_INTERVAL_MS,
-	type WorkerQuotaReportingHandle,
-} from './quota-reporting.js';
-import { connectWorkerTransport } from './worker-client.js';
-import { createWorkerUpdateHandler, selfUpdateEnabled } from './worker-update.js';
+import { verifyStartupBuild } from './build-verification.js';
 
 // Tag every line this process emits so it stays distinguishable from the router
 // and the API server in a shared log stream (ai/ARCHITECTURE.md "Observability").
@@ -119,298 +46,23 @@ configureLogger({ component: 'worker-transport' });
 // the agents, which is now only this one.
 addFileSink(optionalEnv('SWARM_LOG_FILE', 'logs/worker.log'));
 
-/**
- * The checkout lock this process holds (issue #689), with the timer that keeps it
- * fresh. Module-scoped so every exit path can drop it — a released lock is
- * immediately re-acquirable, where a lock left behind waits for the next daemon to
- * find its pid dead.
- */
-let heldCheckoutLock: CheckoutLock | undefined;
-let checkoutRefreshTimer: ReturnType<typeof setInterval> | undefined;
-
-/**
- * The CLI-quota reporter this process runs (issue #825). Module-scoped for the
- * same reason the lock is: every exit path drops it, the fatal-error one included.
- */
-let quotaReporting: WorkerQuotaReportingHandle | undefined;
-
-function stopQuotaReporting(): void {
-	quotaReporting?.stop();
-	quotaReporting = undefined;
-}
-
-function releaseCheckoutLock(): void {
-	if (checkoutRefreshTimer) clearInterval(checkoutRefreshTimer);
-	checkoutRefreshTimer = undefined;
-	try {
-		heldCheckoutLock?.release();
-	} catch (err) {
-		// Never let a filesystem hiccup turn a graceful shutdown into a crash: the lock
-		// is reclaimable on liveness grounds once this process is gone.
-		logger.warn('releasing the checkout lock failed', { error: describeError(err) });
-	}
-	heldCheckoutLock = undefined;
-}
-
-/**
- * Take the host-local lock on this checkout, or refuse to start (issue #689).
- *
- * Two daemons holding two *different* credentials can still be pointed at one
- * `SWARM_WORKER_REPO_ROOT`, and both would then run `git worktree add` against the
- * same main repository and contend on its `index.lock`. The control plane cannot
- * see that — `repoRoot` is host-local and never travels, and two checkouts of one
- * repository are legitimate capacity — so the guard is a filesystem lock and the
- * refusal happens here, before the handshake.
- */
-function acquireCheckoutLockOrExit(repoRoot: string): CheckoutLock {
-	try {
-		return acquireCheckoutLock({ repoRoot });
-	} catch (err) {
-		if (!(err instanceof CheckoutHeldError)) throw err;
-		// Names the holding worker (a pid, until that daemon's own handshake told it
-		// which worker it is) so an operator knows which process to stop.
-		logger.error('refusing to start — another worker already holds this checkout', {
-			repoRoot,
-			lockDir: err.lockDir,
-			holderWorkerId: err.holder?.workerId ?? null,
-			holderPid: err.holder?.pid ?? null,
-			reason: err.message,
-		});
-		process.exit(1);
-	}
-}
-
-/** The daemon version reported at handshake — diagnostic only. */
-function resolveDaemonVersion(): string {
-	if (process.env.npm_package_version) return process.env.npm_package_version;
-	try {
-		const pkgPath = fileURLToPath(new URL('../../package.json', import.meta.url));
-		const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: string };
-		return pkg.version ?? '0.0.0';
-	} catch {
-		return '0.0.0';
-	}
-}
-
-async function main(): Promise<void> {
-	// First, before this process reads its environment, locks a checkout or opens a
-	// socket: count this start against a SWARM build that was applied here and has
-	// never handshaked (issue #934). Once too many starts in a row have failed, this
-	// puts the install root back on the last known good build and ends the process for
-	// the supervisor to start it there — the only recovery left once a bad build has
-	// taken the socket the control plane would have corrected it over.
+async function bootstrap(): Promise<void> {
+	// First, before this process reads its environment, locks a checkout, opens a
+	// socket — or loads a single line of the daemon: count this start against a SWARM
+	// build that was applied here and has never handshaked. Once too many starts in a
+	// row have failed, this puts the install root back on the last known good build
+	// and ends the process for the supervisor to start it there — the only recovery
+	// left once a bad build has taken the socket the control plane would have
+	// corrected it over.
 	if (await verifyStartupBuild()) return;
-	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
-	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
-	const repoRoot = resolveWorkerRepoRoot();
-	// Claimed before anything else this daemon does with the checkout, so a second
-	// worker on it exits without ever handshaking. Refreshed below, and released on
-	// every exit path.
-	const checkoutLock = acquireCheckoutLockOrExit(repoRoot);
-	heldCheckoutLock = checkoutLock;
-	// An unref'd interval: it keeps the lock alive but must never be the reason this
-	// process stays alive. The cadence is what lets the TTL stay short — a lapsed
-	// `refreshedAt` then means a departed daemon rather than a long-running one.
-	checkoutRefreshTimer = setInterval(() => {
-		if (checkoutLock.refresh()) return;
-		logger.warn('this checkout lock is no longer held by this process', {
-			repoRoot,
-			lockDir: checkoutLock.lockDir,
-		});
-	}, CHECKOUT_LOCK_REFRESH_MS);
-	checkoutRefreshTimer.unref();
-	// Which repository that one checkout actually is, read from its `origin` remote
-	// (issue #687) — the fact the control plane cannot otherwise learn, since
-	// `repoRoot` is host-local and never travels. Resolved once, because the process
-	// holds exactly one checkout for its whole life and re-reading per assignment
-	// would only invite the two answers to differ. A checkout with no identifiable
-	// `origin` resolves to `undefined` and declares nothing rather than failing startup.
-	const repository = await resolveDeclarableOriginRepoSlug(repoRoot);
-	// Which SWARM build this daemon is actually running (issue #918) — the commit of
-	// the *install root*, which is anchored on this module's own path and is not
-	// `repoRoot`: one npm-linked checkout serves daemons whose `cwd` is a different
-	// project repository each. Resolved once at startup for the same reason as the
-	// repository above, and `undefined` when the install root is not a git checkout.
-	const build = await resolveOwnBuildIdentity();
-	// Same reason: a typo in SWARM_AGENT_CONTAINMENT should fail this daemon at
-	// startup, not once per dispatched phase (issue #614). The resolved value is
-	// not held — `runAgentCli` reads it per run — this is validation only, and
-	// it also logs which mode this host will actually launch agents under.
-	logger.info('agent containment', { mode: resolveAgentContainment() });
-
-	// Declare the CLIs this host can run: an explicit override if set, otherwise
-	// probe PATH. An empty set can't handshake (the protocol requires a non-empty
-	// capability list), so fail loudly with an actionable message.
-	const declaredOverride = parseDeclaredClisOverride(process.env.SWARM_WORKER_TRANSPORT_CLIS);
-	const capabilities = declaredOverride ?? (await discoverAvailableClis());
-	if (capabilities.length === 0) {
-		throw new Error(
-			'No agent CLIs found on PATH to declare (looked for claude, agy, codex). Install at least one, or set SWARM_WORKER_TRANSPORT_CLIS explicitly.',
-		);
-	}
-
-	const host = hostname();
-	// One in-flight set shared across every assignment on the session, so a
-	// re-pushed dispatch is deduplicated across pushes. The shutdown signal kills
-	// any in-flight agent CLI on a graceful stop before the session is released.
-	const inFlight = new Set<string>();
-	const shutdownSignal = new AbortController();
-	// Declared up here rather than beside the signal handlers below, because a
-	// self-update restart (issue #933) takes the same teardown and must not race a
-	// SIGTERM arriving mid-way through it.
-	let shuttingDown = false;
-	/**
-	 * The graceful teardown both exits share: release the session so the control plane
-	 * frees the lease promptly instead of waiting out the TTL, stop reporting this
-	 * host's quota, then drop the checkout lock — last, so a departing daemon never
-	 * hands the checkout to another worker while its own aborted agent may still be
-	 * writing there, and at all so an operator (or a supervisor restarting this
-	 * process) can re-acquire it immediately.
-	 */
-	const releaseSessionAndResources = async (): Promise<void> => {
-		shuttingDown = true;
-		shutdownSignal.abort();
-		try {
-			await client.stop();
-		} finally {
-			stopQuotaReporting();
-			releaseCheckoutLock();
-		}
-	};
-	// Declare *which phases* this daemon can execute, not just which CLIs it has
-	// (issue #467). Since issue #536 that is every phase, but the declaration is not
-	// therefore redundant: the control plane cannot infer a daemon's repertoire, and a
-	// worker row keeps whatever an older daemon last declared until this one
-	// reconnects — so stating it is what widens the row back. The gate in
-	// `runAssignmentDbFree` stays as the backstop.
-	const supportedPhases = [...SUPPORTED_DB_FREE_PHASES];
-	// A session is the proof an applied update was waiting for, so the first one this
-	// process establishes is what makes the build it is running this machine's last
-	// known good one (issue #934). Every reconnect after it is a no-op.
-	const promoteBuild = createHandshakePromotion();
-	const client = connectWorkerTransport({
-		controlPlaneUrl,
-		credential,
-		capabilities,
-		// Only a *discovered* set is worth re-probing when the control plane rejects
-		// it (issue #559); an explicit override is the operator's own declaration.
-		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
-		supportedPhases,
-		repository,
-		build,
-		hostname: host,
-		daemonVersion: resolveDaemonVersion(),
-		onAssignment: (assignment, sink) => {
-			void runAssignmentDbFree(assignment, sink, {
-				repoRoot,
-				// The same declaration the handshake carries, so the executor can refuse an
-				// assignment for a repository this checkout is not before it touches the
-				// checkout (issue #688) — passed from the one startup resolution above
-				// rather than re-read per assignment.
-				checkoutRepository: repository,
-				// The delivery seam for the metadata writes this worker holds no
-				// credential for (a review, a board move/comment): POSTed to the control
-				// plane under this worker's own credential (ADR-004 §2).
-				controlPlaneUrl,
-				workerCredential: credential,
-				shutdownSignal: shutdownSignal.signal,
-				inFlight,
-			});
-		},
-		// The only channel a user termination has to this daemon (issue #549): it
-		// holds no `REDIS_URL`, so it cannot read the durable cancellation marker the
-		// dashboard writes — the control plane pushes the frame instead. The sink is
-		// what lets the handler *answer* a cancel it cannot apply (issue #724).
-		onCancel: (cancel, sink) => handleTaskCancel(cancel, sink, logger),
-		// The one pushed frame that concerns this *machine* rather than a dispatch
-		// (issue #933): move the SWARM install root to a build and restart into it. The
-		// handler declines outright unless this host opted in, waits until `inFlight` is
-		// empty so no run is ever disturbed, and on a successful apply takes the same
-		// graceful teardown a SIGTERM does before exiting 0 for the supervisor to
-		// restart. Always wired, even with the opt-in off: a machine that will not act
-		// still owes the operator the reason.
-		onUpdate: createWorkerUpdateHandler({
-			controlPlaneUrl,
-			workerCredential: credential,
-			inFlight,
-			shutdownSignal: shutdownSignal.signal,
-			shutdown: releaseSessionAndResources,
-		}),
-		// The handshake is the only place this daemon learns which worker it
-		// authenticates as, so it is where the checkout lock stops naming a bare pid:
-		// a second daemon's refusal can then name the *worker* holding it (issue #689).
-		onSession: (session) => {
-			checkoutLock.annotate(session.workerId);
-			promoteBuild();
-		},
-	});
-
-	// This host's own CLI allowance, reported to the control plane under this
-	// daemon's credential so the row is attributable to the worker it describes
-	// (issue #825). Started after the transport rather than before it because the
-	// same credential authenticates both, and best-effort either way — nothing here
-	// gates the session.
-	quotaReporting = startWorkerQuotaReporting({ controlPlaneUrl, workerCredential: credential });
-
-	logger.info('worker transport client starting', {
-		controlPlaneUrl,
-		hostname: host,
-		quotaReportIntervalMs: WORKER_QUOTA_REPORT_INTERVAL_MS,
-		capabilities,
-		supportedPhases,
-		repoRoot,
-		// Printed beside `repoRoot` so an operator can see what this daemon declared its
-		// checkout to be. Explicitly `null` rather than left undefined when there is no
-		// declaration, since the logger drops an undefined field and "nothing declared" is
-		// precisely what an operator debugging a later phase's refusal needs to see.
-		repository: repository ?? null,
-		// Explicitly null for the same reason, and the field an operator reads first when
-		// asking whether this daemon carries a fix (issue #918).
-		build: build ?? null,
-		// Whether this host will act on a pushed update at all (issue #933). Logged at
-		// startup because the alternative is discovering it from a `declined` report
-		// after an operator has already asked.
-		selfUpdate: selfUpdateEnabled(),
-	});
-
-	// Graceful shutdown: abort any in-flight agent CLI, then release the session
-	// via a normal WS close so the control plane frees the lease promptly instead
-	// of waiting out the TTL, then drop the checkout lock and exit.
-	for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-		process.on(signal, () => {
-			if (shuttingDown) return;
-			logger.info(`received ${signal} — releasing worker session and exiting`);
-			void releaseSessionAndResources().then(
-				() => process.exit(0),
-				(err) => {
-					logger.error('worker transport shutdown failed', { error: describeError(err) });
-					process.exit(1);
-				},
-			);
-		});
-	}
-
-	// Resolves on a graceful stop; rejects on a fatal, non-recoverable error.
-	try {
-		await client.done;
-	} catch (err) {
-		// A handshake the control plane rejects outright — its protocol version, its
-		// capabilities, its credential — is *this build* saying it cannot serve this
-		// control plane. On a build still awaiting proof that is the one failure no
-		// restart and no pushed update can fix, so the machine goes back to its last
-		// known good build by itself and ends here rather than dying on the new one
-		// (issue #934). Anything else is fatal exactly as it was.
-		if (await returnAfterFatalHandshake(err, { shutdown: releaseSessionAndResources })) return;
-		throw err;
-	}
-	stopQuotaReporting();
-	releaseCheckoutLock();
-	logger.info('worker transport client stopped');
+	const { runWorkerDaemon } = await import('./worker-main.js');
+	await runWorkerDaemon();
 }
 
-main().catch((err) => {
-	stopQuotaReporting();
-	releaseCheckoutLock();
+bootstrap().catch((err) => {
+	// Reached by a daemon that failed *and* by a `./worker-main.ts` that could not be
+	// loaded at all — the import-time death above, which now lands here having already
+	// been counted, instead of killing the process before the counter ran.
 	logger.error('worker transport client exited with a fatal error', { error: describeError(err) });
 	process.exit(1);
 });
